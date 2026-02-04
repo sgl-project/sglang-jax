@@ -19,6 +19,7 @@ dependencies = [
     "modelscope~=1.28.2",
     "msgpack-python~=0.5.6",
     "numpy~=2.2.6",
+    "scipy>=1.11.0",
     "orjson~=3.11.1",
     "pillow~=11.3.0",
     "psutil~=7.0.0",
@@ -44,9 +45,6 @@ dependencies = [
     "pybase64",
     "omegaconf",
     "imageio[ffmpeg]",
-    # add torch and torchvision CPU version for multimodal's IMAGE/VIDEO/AUDIO processor within multimodal_tokenizer
-    "torch",
-    "torchvision",
 ]
 
 [project.optional-dependencies]
@@ -63,6 +61,10 @@ cpu = [
 ]
 all = [
     "jax[tpu]==0.8.1",
+]
+multimodal = [
+    "torch",
+    "torchvision",
 ]
 
 [tool.setuptools.packages.find]

@@ -19,12 +19,11 @@ from http import HTTPStatus
 from typing import Any
 
 import fastapi
-import jax
-import jax.numpy as jnp
 import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+from scipy.special import softmax
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
@@ -1247,7 +1246,7 @@ class TokenizerManager:
                 return_logprob=True,
                 token_ids_logprob=label_token_ids,
                 stream=False,
-                sampling_params={"max_new_tokens": 1},
+                sampling_params={"max_new_tokens": 0},  # Prefill-only: no generation needed
             )
         elif (
             isinstance(query, list)
@@ -1265,7 +1264,7 @@ class TokenizerManager:
                 return_logprob=True,
                 token_ids_logprob=label_token_ids,
                 stream=False,
-                sampling_params={"max_new_tokens": 1},
+                sampling_params={"max_new_tokens": 0},  # Prefill-only: no generation needed
             )
         else:
             raise ValueError("Invalid combination of query/items types for score_request.")
@@ -1274,9 +1273,18 @@ class TokenizerManager:
         scores = []
 
         for result in results:
+            # Validate output_token_ids_logprobs exists and is not empty
+            output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
+            if not output_logprobs or len(output_logprobs) == 0:
+                raise RuntimeError(
+                    f"output_token_ids_logprobs is empty for request "
+                    f"{result['meta_info'].get('id', '<unknown>')}. "
+                    "This indicates token_ids_logprobs were not computed properly."
+                )
+
             # Get logprobs for each token
             logprobs = {}
-            for logprob, token_id, _ in result["meta_info"].get("output_token_ids_logprobs", [])[0]:
+            for logprob, token_id, _ in output_logprobs[0]:
                 if token_id in label_token_ids:
                     logprobs[token_id] = logprob
 
@@ -1285,7 +1293,9 @@ class TokenizerManager:
 
             # Apply softmax to logprobs if needed
             if apply_softmax:
-                score_list = jax.nn.softmax(jnp.asarray(score_list), axis=0).tolist()
+                # Use scipy softmax to keep TokenizerManager device-agnostic (ADR-001)
+                # Matches PyTorch sglang: torch.softmax(torch.tensor(score_list), dim=0)
+                score_list = softmax(score_list).tolist()
             else:
                 # Convert logprobs to probabilities if not using softmax
                 score_list = [math.exp(x) if x != float("-inf") else 0.0 for x in score_list]

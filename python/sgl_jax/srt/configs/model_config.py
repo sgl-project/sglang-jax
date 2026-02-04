@@ -103,9 +103,15 @@ class ModelConfig:
             **kwargs,
         )
 
-        # Attach quantization config to hf_config so models can access it
-        if self.quantization_config is not None:
-            self.hf_config.quantization_config = self.quantization_config
+        # Unify quantization config handling:
+        # 1. User provided config path -> use it
+        # 2. HF model has fp8 dict config -> auto-convert to QuantizationConfig
+        # 3. Otherwise -> None
+        # After this, quantization_config is always QuantizationConfig or None
+        self.quantization_config = self._resolve_quantization_config()
+
+        # Attach unified quantization config to hf_config so models can access it
+        self.hf_config.quantization_config = self.quantization_config
 
         self.hf_generation_config = get_generation_config(
             config_path,
@@ -196,6 +202,134 @@ class ModelConfig:
         self.image_token_id = getattr(config, "image_token_id", None) or getattr(
             config, "image_token_index", None
         )
+
+    def _resolve_quantization_config(self) -> QuantizationConfig | None:
+        """Resolve and unify quantization config from multiple sources.
+
+        Priority:
+        1. User-provided quantization_config_path (highest)
+        2. HF model's quantization_config (auto-detect fp8)
+        3. None (no quantization)
+
+        Returns:
+            Unified QuantizationConfig object or None
+        """
+        # 1. If user provided a config path, use it (already loaded in __init__)
+        if self.quantization_config is not None:
+            logger.info("Using user-provided quantization config")
+            # Check if HF model also has fp8 config
+            hf_quant_config = getattr(self.hf_config, "quantization_config", None)
+            if isinstance(hf_quant_config, dict) and hf_quant_config.get("quant_method") == "fp8":
+                logger.info("Model has fp8 checkpoint, setting is_static_checkpoint=True")
+                self.quantization_config.is_static_checkpoint = True
+            return self.quantization_config
+
+        # 2. Check if HF model has quantization config
+        hf_quant_config = getattr(self.hf_config, "quantization_config", None)
+        # If it's already a QuantizationConfig object (from previous instantiation or cache)
+        if isinstance(hf_quant_config, QuantizationConfig):
+            return hf_quant_config
+
+        # If it's a dict (from HF config.json), try to convert it
+        if isinstance(hf_quant_config, dict):
+            quant_method = hf_quant_config.get("quant_method")
+
+            if quant_method == "fp8":
+                logger.info("Auto-detected FP8 model. Creating QuantizationConfig for static fp8.")
+                quant_config = QuantizationConfig(
+                    is_static_checkpoint=True,
+                    linear_rules=[
+                        {
+                            "module_path": ".*",
+                            "weight_dtype": "float8_e4m3fn",
+                            "activation_dtype": None,
+                        }
+                    ],
+                    moe_weight_dtype=jnp.float8_e4m3fn,
+                    moe_activation_dtype=None,
+                )
+                return quant_config
+
+            elif quant_method == "compressed-tensors":
+                # Check if it's float-quantized (fp8)
+                format_type = hf_quant_config.get("format")
+                if format_type == "float-quantized":
+                    logger.info(
+                        "Auto-detected compressed-tensors FP8 model. "
+                        "Creating QuantizationConfig for static fp8."
+                    )
+
+                    # Determine activation quantization from config
+                    activation_dtype_str = None
+                    moe_activation_dtype_jax = None
+
+                    def is_dynamic_fp8_act(cfg):
+                        if not cfg:
+                            return False
+                        dynamic = cfg.get("dynamic", False)
+                        type_ = cfg.get("type", "")
+                        num_bits = cfg.get("num_bits", 0)
+                        return dynamic is True and type_ == "float" and num_bits == 8
+
+                    # Check for 'input_activations' at the top level or in config_groups
+                    found_act_config = False
+
+                    # Direct check
+                    if "input_activations" in hf_quant_config and is_dynamic_fp8_act(
+                        hf_quant_config["input_activations"]
+                    ):
+                        found_act_config = True
+
+                    # Check config_groups
+                    if not found_act_config and "config_groups" in hf_quant_config:
+                        groups = hf_quant_config["config_groups"]
+                        if isinstance(groups, dict):
+                            for group in groups.values():
+                                if "input_activations" in group and is_dynamic_fp8_act(
+                                    group["input_activations"]
+                                ):
+                                    found_act_config = True
+                                    break
+
+                    if found_act_config:
+                        activation_dtype_str = "float8_e4m3fn"
+                        moe_activation_dtype_jax = jnp.float8_e4m3fn
+                        logger.info(
+                            "Enabling dynamic activation quantization (float8_e4m3fn) based on config."
+                        )
+
+                    quant_config = QuantizationConfig(
+                        is_static_checkpoint=True,
+                        linear_rules=[
+                            {
+                                "module_path": ".*",
+                                "weight_dtype": "float8_e4m3fn",
+                                "activation_dtype": activation_dtype_str,
+                            }
+                        ],
+                        moe_weight_dtype=jnp.float8_e4m3fn,
+                        moe_activation_dtype=moe_activation_dtype_jax,
+                    )
+                    return quant_config
+                else:
+                    logger.warning(
+                        "compressed-tensors format '%s' is not yet supported. "
+                        "Quantization will be disabled.",
+                        format_type,
+                    )
+                    return None
+
+            else:
+                logger.warning(
+                    "HF model has quantization method '%s' which is not yet supported. "
+                    "Quantization will be disabled.",
+                    quant_method,
+                )
+                return None
+
+        # 3. No quantization config found
+        logger.info("No quantization config found in HF config or user config")
+        return None
 
     @staticmethod
     def from_server_args(

@@ -68,6 +68,7 @@ class QuantizationConfig:
     linear_rules: list[dict] | None = None
     moe_weight_dtype: jnp.dtype | None = None
     moe_activation_dtype: jnp.dtype | None = None
+    is_static_checkpoint: bool = False
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "QuantizationConfig":
@@ -119,11 +120,13 @@ class QuantizationConfig:
             )
         moe_weight_dtype = _str_to_dtype(moe_section.get("weight_dtype"))
         moe_activation_dtype = _str_to_dtype(moe_section.get("activation_dtype"))
+        is_static_checkpoint = quant.get("is_static_checkpoint", False)
 
         return cls(
             linear_rules=linear_rules,
             moe_weight_dtype=moe_weight_dtype,
             moe_activation_dtype=moe_activation_dtype,
+            is_static_checkpoint=is_static_checkpoint,
         )
 
     @classmethod
