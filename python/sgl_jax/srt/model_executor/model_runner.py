@@ -523,6 +523,30 @@ class ModelRunner(BaseModelRunner):
         cache_miss_count = 0
         import jax._src.test_util as jtu
 
+        for key, value in forward_batch.__dict__.items():
+            if isinstance(value, jax.Array):
+                logger.debug(
+                    "forward_batch %s: shape=%s, sharding=%s, dtype=%s",
+                    key,
+                    value.shape,
+                    value.sharding,
+                    value.dtype,
+                )
+            else:
+                logger.debug("forward_batch %s: %s", key, value)
+
+        for key, value in logits_metadata.__dict__.items():
+            if isinstance(value, jax.Array):
+                logger.debug(
+                    "logits_metadata %s: shape=%s, sharding=%s, dtype=%s",
+                    key,
+                    value.shape,
+                    value.sharding,
+                    value.dtype,
+                )
+            else:
+                logger.debug("logits_metadata %s: %s", key, value)
+
         with jtu.count_pjit_cpp_cache_miss() as count:
             output, layers_kv_fused, _, layers_topk_ids = self.jitted_run_model(
                 forward_batch, logits_metadata

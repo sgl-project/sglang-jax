@@ -37,6 +37,7 @@ class VaeScheduler:
         mesh: jax.sharding.Mesh,
         model_class,
         stage_sub_dir: str | None = None,
+        precompile_params: dict | None = None,
         **kwargs,
     ):
         """Initialize the VaeScheduler.

@@ -128,6 +128,16 @@ class CaptureHiddenMode(IntEnum):
     def __lt__(self, other):
         return self.value < other.value
 
+    def parse(mode: int):
+        if mode == 0:
+            return CaptureHiddenMode.NULL
+        elif mode == 1:
+            return CaptureHiddenMode.LAST
+        elif mode == 2:
+            return CaptureHiddenMode.FULL
+        else:
+            raise ValueError(f"Unknown CaptureHiddenMode: {mode}")
+
 
 @register_pytree_node_class
 @dataclass
@@ -316,11 +326,13 @@ class ForwardBatch:
             (input_embedding,) = device_array(
                 (batch.input_embedding,),
                 sharding=(
-                    NamedSharding(model_runner.mesh, PartitionSpec())
+                    NamedSharding(model_runner.mesh, PartitionSpec(None, None))
                     if jax.process_count() == 1
                     else None
                 ),
             )
+        if input_embedding is not None:
+            input_embedding = input_embedding.astype(jnp.bfloat16)
 
         if batch.lora_scalings is not None:
             (
@@ -358,11 +370,13 @@ class ForwardBatch:
                     # batch.deepstack_visual_pos_mask
                 ),
                 sharding=(
-                    NamedSharding(model_runner.mesh, PartitionSpec())
+                    NamedSharding(model_runner.mesh, PartitionSpec(None, None))
                     if jax.process_count() == 1
                     else None
                 ),
             )
+        if deepstack_visual_embedding is not None:
+            deepstack_visual_embedding = deepstack_visual_embedding.astype(jnp.bfloat16)
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
