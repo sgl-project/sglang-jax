@@ -43,6 +43,22 @@ from sgl_jax.srt.layers.moe import FusedEPMoE
 DEFAULT_TPU_VMEM_BUDGET_MB = 60
 DEFAULT_TPU_VMEM_BUDGET_BYTES = DEFAULT_TPU_VMEM_BUDGET_MB * 1024 * 1024
 
+# ---------------------------------------------------------------------------
+# NOTE: skip some config kernel will crash when running.
+# Per-case block-config exclusion list.
+# Key:   (num_tokens, num_experts, top_k, hidden_size, intermediate_size, ep_size)
+# Value: set of config tuples (bt, bts, bf, bd1, bd2, btc, bfc, bd1c, bd2c, bse)
+#        that should be skipped during tuning for that case.
+# ---------------------------------------------------------------------------
+# fmt: off
+EXCLUDED_BLOCK_CONFIGS: dict[tuple[int, int, int, int, int, int], set[tuple[int, ...]]] = {
+    (32768, 256, 8, 8192, 2048, 64): {
+        (128, 128, 256, 4096, 4096, 128, 256, 4096, 4096, 128),
+        (128, 128, 256, 2048, 2048, 128, 256, 2048, 2048, 256),
+    },
+}
+# fmt: on
+
 
 def _tpu_log_recorder_compiler_options() -> dict[str, str] | None:
     enable = os.getenv("SGLANG_JAX_ENABLE_KERNEL_LOG_RECORDER", "0") in ("1", "true", "True")
@@ -307,6 +323,7 @@ def select_block_configs(
     max_configs: int,
     use_shared_expert: bool = False,
     subc_quant_wsz: int | None = None,
+    excluded_configs: set[tuple[int, ...]] | None = None,
 ) -> list[FusedMoEBlockConfig]:
     """Enumerate block configs from the explicit candidate lists."""
     t_packing = _dtype_packing(dtype)
@@ -439,6 +456,24 @@ def select_block_configs(
         )
         if key in seen:
             return
+        # Check against the per-case exclusion list.
+        # Exclusion tuple order: (bt, bts, bf, bd1, bd2, btc, bfc, bd1c, bd2c, bse)
+        if excluded_configs is not None:
+            excl_key = (
+                effective.bt,
+                effective.bts if effective.bts is not None else effective.bt,
+                effective.bf,
+                effective.bd1,
+                effective.bd2,
+                effective.btc,
+                effective.bfc,
+                effective.bd1c,
+                effective.bd2c,
+                effective.bse,
+            )
+            if excl_key in excluded_configs:
+                print(f"SKIP {effective.as_kwargs()}, reason: excluded by EXCLUDED_BLOCK_CONFIGS")
+                return
         seen.add(key)
         configs.append(effective)
 
@@ -709,6 +744,14 @@ def run_all(
 
         block_cfgs: list[FusedMoEBlockConfig | None]
         if tune_block_config:
+            case_excl_key = (
+                case.num_tokens,
+                case.num_experts,
+                case.top_k,
+                case.hidden_size,
+                case.intermediate_size,
+                case.ep_size,
+            )
             block_cfgs = select_block_configs(
                 case,
                 dtype,
@@ -723,6 +766,7 @@ def run_all(
                 max_configs=max_configs,
                 use_shared_expert=use_shared_expert,
                 subc_quant_wsz=subc_quant_wsz,
+                excluded_configs=EXCLUDED_BLOCK_CONFIGS.get(case_excl_key),
             )
         else:
             block_cfgs = [None]
