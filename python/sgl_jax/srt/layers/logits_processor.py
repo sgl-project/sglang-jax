@@ -205,7 +205,11 @@ class LogitsMetadata:
             ),
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=(
-                batch.extend_logprob_start_lens.tolist()
+                (
+                    batch.extend_logprob_start_lens.tolist()
+                    if hasattr(batch.extend_logprob_start_lens, "tolist")
+                    else batch.extend_logprob_start_lens
+                )
                 if batch.return_logprob and batch.extend_logprob_start_lens is not None
                 else None
             ),
