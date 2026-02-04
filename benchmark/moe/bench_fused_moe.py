@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import faulthandler
 import math
+import os
 import sys
 import traceback
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -40,6 +42,13 @@ from sgl_jax.srt.layers.moe import FusedEPMoE
 # Leave headroom for compiler padding/alignment and any unmodeled VMEM usage.
 DEFAULT_TPU_VMEM_BUDGET_MB = 60
 DEFAULT_TPU_VMEM_BUDGET_BYTES = DEFAULT_TPU_VMEM_BUDGET_MB * 1024 * 1024
+
+
+def _tpu_log_recorder_compiler_options() -> dict[str, str] | None:
+    enable = os.getenv("SGLANG_JAX_ENABLE_KERNEL_LOG_RECORDER", "0") in ("1", "true", "True")
+    if enable and jax.default_backend() == "tpu":
+        return {"xla_tpu_enable_log_recorder": "true"}
+    return None
 
 
 def _dtype_packing(dtype: jnp.dtype) -> int:
@@ -560,9 +569,18 @@ def run_all(
     hotspot_count: int = None,
     zero_expert_count: int = None,
     non_hotspot_alpha: float = None,
+    token_mask_mode: str = "none",
+    token_valid_ratio: float = 1.0,
+    token_mask_seed: int = 0,
 ) -> None:
     if use_grouped_topk is None:
         use_grouped_topk = bool(num_expert_group or topk_group)
+
+    token_mask_mode = (token_mask_mode or "none").lower()
+    if token_mask_mode not in ("none", "prefix", "random"):
+        raise ValueError(f"Unsupported {token_mask_mode=}. Expected none|prefix|random.")
+    if not (0.0 <= token_valid_ratio <= 1.0):
+        raise ValueError(f"Expected {token_valid_ratio=} to be within [0.0, 1.0].")
 
     token_list = DEFAULT_NUM_TOKENS if num_tokens is None else num_tokens
     raw_cases = make_moe_cases(
@@ -629,6 +647,8 @@ def run_all(
             f"  mesh: ep_size={case.ep_size}, tp_size={case.tp_size}, "
             f"devices_used={case.ep_size * case.tp_size}/{len(jax.devices())}"
         )
+        if token_mask_mode != "none":
+            print(f"  token_mask: mode={token_mask_mode}, valid_ratio={token_valid_ratio}")
         data = prepare_fused_moe_inputs(
             case,
             weight_dtype=weight_dtype,
@@ -657,6 +677,29 @@ def run_all(
         data["router_logits"] = jax.device_put(
             custom_logits, jax.sharding.NamedSharding(mesh, P("tensor", None))
         )
+        token_valid_mask: jax.Array | None = None
+        if token_mask_mode != "none":
+            num_valid = int(round(case.num_tokens * token_valid_ratio))
+            num_valid = max(0, min(case.num_tokens, num_valid))
+            mask_np = np.zeros((case.num_tokens,), dtype=np.int32)
+            if token_mask_mode == "prefix":
+                num_invalid = case.num_tokens - num_valid
+                if num_valid:
+                    mask_np[num_invalid:] = 1
+            else:
+                rng = np.random.default_rng(token_mask_seed + case.seed)
+                if num_valid:
+                    valid_idx = rng.choice(case.num_tokens, size=num_valid, replace=False)
+                    mask_np[valid_idx] = 1
+            token_valid_mask = jax.device_put(
+                jnp.asarray(mask_np),
+                jax.sharding.NamedSharding(
+                    mesh,
+                    P(
+                        "tensor",
+                    ),
+                ),
+            )
         # Determine subc_quant_wsz for FP8 quantization
         subc_quant_wsz = 256 if weight_dtype == jnp.float8_e4m3fn else None
 
@@ -716,11 +759,40 @@ def run_all(
             moe_def, moe_state = nnx.split(fused_layer)
             moe_state_leaves, moe_state_def = jax.tree_util.tree_flatten(moe_state)
 
-            @jax.jit(static_argnames=("moe_state_def", "block_config"))
-            def run(tokens, router_logits, *, moe_state_def, moe_state_leaves, block_config):
+            @partial(
+                jax.jit,
+                static_argnames=("moe_state_def", "block_config"),
+                compiler_options=_tpu_log_recorder_compiler_options(),
+            )
+            def run_no_mask(
+                tokens, router_logits, *, moe_state_def, moe_state_leaves, block_config
+            ):
                 moe_state = jax.tree_util.tree_unflatten(moe_state_def, moe_state_leaves)
                 moe = nnx.merge(moe_def, moe_state)
                 return moe(tokens, router_logits, block_config=block_config)
+
+            @partial(
+                jax.jit,
+                static_argnames=("moe_state_def", "block_config"),
+                compiler_options=_tpu_log_recorder_compiler_options(),
+            )
+            def run_with_mask(
+                tokens,
+                router_logits,
+                token_valid_mask,
+                *,
+                moe_state_def,
+                moe_state_leaves,
+                block_config,
+            ):
+                moe_state = jax.tree_util.tree_unflatten(moe_state_def, moe_state_leaves)
+                moe = nnx.merge(moe_def, moe_state)
+                return moe(
+                    tokens,
+                    router_logits,
+                    token_valid_mask=token_valid_mask,
+                    block_config=block_config,
+                )
 
             best: tuple[float, FusedMoEBlockConfig | None] | None = None
             for i, block_cfg in enumerate(block_cfgs):
@@ -752,9 +824,18 @@ def run_all(
                 task = "fused-moe-k_.*"
 
                 def _compute(block_cfg=block_cfg):
-                    return run(
+                    if token_valid_mask is None:
+                        return run_no_mask(
+                            data["tokens"],
+                            data["router_logits"],
+                            moe_state_def=moe_state_def,
+                            moe_state_leaves=moe_state_leaves,
+                            block_config=block_cfg,
+                        )
+                    return run_with_mask(
                         data["tokens"],
                         data["router_logits"],
+                        token_valid_mask,
                         moe_state_def=moe_state_def,
                         moe_state_leaves=moe_state_leaves,
                         block_config=block_cfg,
@@ -996,6 +1077,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hotspot-count", type=int, default=1, help="Number of hotspot experts.")
     parser.add_argument("--zero-expert-count", type=int, default=0)
     parser.add_argument("--non-hotspot-alpha", type=float, default=100.0)
+    parser.add_argument(
+        "--token-mask-mode",
+        type=str,
+        choices=["none", "prefix", "random"],
+        default="none",
+        help="Optional token_valid_mask pattern for exercising invalid-token logic.",
+    )
+    parser.add_argument(
+        "--token-valid-ratio",
+        type=float,
+        default=1.0,
+        help=(
+            "Fraction of tokens marked valid (0.0-1.0). "
+            "If < 1.0 and --token-mask-mode is not set, defaults to --token-mask-mode=random."
+        ),
+    )
+    parser.add_argument(
+        "--token-mask-seed",
+        type=int,
+        default=0,
+        help="RNG seed for --token-mask-mode=random (combined with case.seed).",
+    )
     return parser.parse_args()
 
 
@@ -1007,6 +1110,8 @@ if __name__ == "__main__":
     except Exception:
         pass
     args = parse_args()
+    if args.token_mask_mode == "none" and args.token_valid_ratio < 1.0:
+        args.token_mask_mode = "random"
     DTYPE_MAP = {
         "int8": jnp.int8,
         "float8_e4m3fn": jnp.float8_e4m3fn,
@@ -1055,6 +1160,9 @@ if __name__ == "__main__":
             hotspot_count=args.hotspot_count,
             zero_expert_count=args.zero_expert_count,
             non_hotspot_alpha=args.non_hotspot_alpha,
+            token_mask_mode=args.token_mask_mode,
+            token_valid_ratio=args.token_valid_ratio,
+            token_mask_seed=args.token_mask_seed,
         )
     except BaseException as e:
         print(f"FATAL: {type(e).__name__}: {e}", flush=True)
