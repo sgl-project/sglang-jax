@@ -240,6 +240,8 @@ lmms-eval
 #claude code
 CLAUDE.md
 
+debug_outputs/plots/
+
 #gemini code
 .gemini-clipboard
 .gemini/settings.json
