@@ -19,6 +19,7 @@ stage_args:
      max_batch_size: 1
    scheduler: auto_regressive
    scheduler_params: {}
+   precompile_params: {"input_embedding": True, "deepstack_visual_embedding": False}
    model_class: Qwen2_5_VL_Generation
    final_output: true
    # final_output_type: text

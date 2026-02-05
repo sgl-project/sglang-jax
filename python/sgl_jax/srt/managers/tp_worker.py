@@ -53,6 +53,7 @@ class ModelWorker:
         req_to_token_pool: ReqToTokenPool | None = None,
         is_draft_worker: bool = False,
         model_class=None,
+        precompile_params: dict | None = None,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
@@ -62,6 +63,9 @@ class ModelWorker:
             server_args.speculative_algorithm
         )
         self.server_args = server_args
+
+        # pre_precompile
+        self.precompile_params = precompile_params
 
         # LoRA configurations
         self.lora_paths = server_args.lora_paths
@@ -395,6 +399,16 @@ class ModelWorker:
         valid_cache_loc = np.arange(bs)
         invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
         lora_ids = ["0"] * bs
+        capture_hidden_mode = CaptureHiddenMode.NULL
+        has_input_embedding = False
+        has_deepstack_visual_embedding = False
+        if self.precompile_params is not None:
+            capture_hidden_mode_int = self.precompile_params.get("capture_hidden_mode", 0)
+            capture_hidden_mode = CaptureHiddenMode.parse(capture_hidden_mode_int)
+            has_input_embedding = self.precompile_params.get("input_embedding", False)
+            has_deepstack_visual_embedding = self.precompile_params.get(
+                "deepstack_visual_embedding", False
+            )
 
         return ModelWorkerBatch(
             bid=1,
@@ -424,18 +438,28 @@ class ModelWorker:
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_logprob_start_lens=None,
-            capture_hidden_mode=(
-                CaptureHiddenMode.FULL if self.server_args.multimodal else CaptureHiddenMode.NULL
-            ),
+            capture_hidden_mode=capture_hidden_mode,
             spec_algorithm=speculative_algotithm,
             lora_ids=lora_ids,  # Already set to [None] * bs above
-            # apply_for_deepstack=mode == ForwardMode.EXTEND,
-            # input_embedding=np.zeros(
-            # (num_tokens, self.model_config.hidden_size)
-            # ) if mode == ForwardMode.EXTEND else None ,  # todo: set input_embeds only for the embeds input for ar stage
-            # deepstack_visual_embedding=np.zeros(
-            # (3, num_tokens, self.model_config.hidden_size)
-            # ) if mode == ForwardMode.EXTEND else None,  # todo: set deepstack_visual_embeds only for need deepstak_visual_embed
+            apply_for_deepstack=(
+                mode == ForwardMode.EXTEND
+                and self.server_args.multimodal
+                and has_deepstack_visual_embedding
+            ),
+            input_embedding=(
+                np.zeros((num_tokens, self.model_config.hidden_size), dtype=np.float16)
+                if mode == ForwardMode.EXTEND
+                and self.server_args.multimodal
+                and has_input_embedding
+                else None
+            ),
+            deepstack_visual_embedding=(
+                np.zeros((3, num_tokens, self.model_config.hidden_size), dtype=np.float16)
+                if mode == ForwardMode.EXTEND
+                and self.server_args.multimodal
+                and has_deepstack_visual_embedding
+                else None
+            ),
         )
 
     def get_model_runner(self):
