@@ -4,7 +4,7 @@ import jax
 import numpy as np
 import torch
 from jax import numpy as jnp
-from transformers import AutoConfig, Qwen3OmniMoeForConditionalGeneration
+from transformers import Qwen3OmniMoeForConditionalGeneration
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeAudioEncoder,
 )
@@ -15,6 +15,9 @@ from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker_embedding i
     Qwen3OmniMoeThinkerEmbedding,
 )
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+
+# Ensure JAX uses float32 precision for matmul
+jax.config.update("jax_default_matmul_precision", "highest")
 
 
 class TestQwen3OmniMoeAudioEncoderPrecision(unittest.TestCase):
@@ -170,6 +173,12 @@ class TestQwen3OmniMoeThinkerEmbeddingPrecision(unittest.TestCase):
             devices=cpu_devices[: len(cpu_devices)],
         )
 
+        # Load PyTorch model to get config
+        pt_model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
+            model_path,
+            torch_dtype=torch.float32,
+        )
+
         model_loader = get_model_loader(
             load_config=LoadConfig(
                 model_class=Qwen3OmniMoeThinkerEmbedding,
@@ -177,9 +186,8 @@ class TestQwen3OmniMoeThinkerEmbeddingPrecision(unittest.TestCase):
             mesh=cls.mesh,
         )
 
-        # JAX float32 model
-        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        model_config_fp32 = config.thinker_config
+        # JAX float32 model - get config from PyTorch model
+        model_config_fp32 = pt_model.thinker.config
         model_config_fp32.model_path = model_path
         model_config_fp32.revision = None
         model_config_fp32.dtype = jnp.float32
@@ -221,25 +229,27 @@ class TestQwen3OmniMoeThinkerEmbeddingPrecision(unittest.TestCase):
         torch_visual_embeds_multiscale = tuple(
             data[f"visual_embeds_multiscale_{i}"] for i in range(num_multiscale)
         )
+
+        jax_arr = np.array(jax_input_embeds).astype(np.float32)
         data.close()
 
-        np.testing.assert_allclose(
-            np.array(jax_input_embeds).astype(np.float32), torch_input_embeds, rtol=1e-3, atol=1e-5
-        )
+        np.testing.assert_allclose(jax_arr, torch_input_embeds, rtol=1e-5, atol=1e-5)
         if torch_visual_pos_masks is not None:
             np.testing.assert_allclose(
                 np.array(jax_visual_pos_masks).astype(np.float32),
                 torch_visual_pos_masks,
-                rtol=1e-3,
+                rtol=1e-5,
                 atol=1e-5,
             )
 
         if num_multiscale > 0:
             for i in range(num_multiscale):
+                jax_feat = np.array(jax_visual_embeds_multiscale[i]).astype(np.float32)
+                torch_feat = torch_visual_embeds_multiscale[i]
                 np.testing.assert_allclose(
-                    np.array(jax_visual_embeds_multiscale[i]).astype(np.float32),
-                    torch_visual_embeds_multiscale[i],
-                    rtol=1e-3,
+                    jax_feat,
+                    torch_feat,
+                    rtol=1e-5,
                     atol=1e-5,
                 )
 

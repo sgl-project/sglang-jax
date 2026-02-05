@@ -15,8 +15,8 @@ class Vision3DPatchEmbed(nnx.Module):
     """
     3D Convolutional Patch Embedding for video/image input.
 
-    Converts flattened input (B, C*T*H*W) into patches (N_patches, embed_dim).
-    Input is assumed to be flattened in C-first order: (B, C, T, H, W) -> (B, C*T*H*W).
+    Converts pre-extracted patches (N_patches, C*t_patch*p*p) into embeddings (N_patches, embed_dim).
+    Input is assumed to be in spatial-merge order.
     """
 
     def __init__(
@@ -45,14 +45,13 @@ class Vision3DPatchEmbed(nnx.Module):
     def __call__(self, x: jax.Array) -> jax.Array:
         """
         Args:
-            x: (B, C*T*H*W) flattened video/image tensor in C-first order
+            x: (N_patches, C*t_patch*p*p) pre-extracted patches in spatial-merge order
 
         Returns:
-            patches: (total_patches, embed_dim)
+            patches: (N_patches, embed_dim)
         """
-        # x shape: (B, C*T*H*W)
-        # Reshape to patch blocks: (B*N_patches, C, t_patch, p, p)
-        # where N_patches = (T/t_patch) * (H/p) * (W/p)
+        # x shape: (N_patches, C*t_patch*p*p) = (N_patches, 1536) for default config
+        # Reshape to: (N_patches, C, t_patch, p, p)
         x = x.reshape(
             -1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size
         )
@@ -790,14 +789,14 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
 
     def __call__(
         self,
-        pixel_values: jax.Array,  # (B, C*T*H*W)
+        pixel_values: jax.Array,  # (N_patches, C*t_patch*p*p)
         grid_thw: jax.Array,  # (B, 3) - [T_out, H_patches, W_patches]
     ) -> dict[str, jax.Array]:
         """
         Forward pass of vision encoder.
 
         Args:
-            pixel_values: (B, C*T*H*W) flattened video/image tensor in C-first order
+            pixel_values: (N_patches, C*t_patch*p*p) pre-extracted patches in spatial-merge order
             grid_thw: (B, 3) containing [T_out, H_patches, W_patches] for each input
                 where T_out = T / temporal_patch_size
 
@@ -813,27 +812,20 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
         # 0. Validate input shapes
         self._validate_input_shapes(grid_thw)
 
-        # 1. Patch Embedding (handles flattened input internally)
+        # 1. Patch Embedding
         hidden_states = self.patch_embed(pixel_values)  # (total_patches, hidden_size)
 
-        # 2. Apply spatial merge permutation to match PyTorch order
-        hidden_states = self._apply_spatial_merge_permutation(hidden_states, grid_thw)
-
-        # 3. Add Position Embeddings (both in spatial-merge order)
+        # 2. Add Position Embeddings
         pos_embeds = self.interpolate_pos_embed(grid_thw)
         hidden_states = hidden_states + pos_embeds
 
-        # 4. Compute 2D position IDs for RoPE
+        # 3. Compute 2D position IDs for RoPE
         position_ids = self.compute_2d_position_ids(grid_thw)
 
-        # 5. Create attention mask to match PyTorch's cu_seqlens behavior
-        # Mask is needed when:
-        # - batch > 1 (multiple images) OR
-        # - any image has T > 1 (video with multiple temporal patches)
-        # This ensures each temporal frame attends only within itself
+        # 4. Create attention mask
         attention_mask = self._create_attention_mask(grid_thw)
 
-        # 6. Through Transformer Blocks
+        # 5. Through Transformer Blocks
         deepstack_features = []
         for layer_idx, block in enumerate(self.blocks):
             hidden_states = block(
@@ -848,7 +840,7 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
                 feature = self.deepstack_mergers[idx](hidden_states)
                 deepstack_features.append(feature)
 
-        # 7. Final projection (merger)
+        # 6. Final projection (merger)
         merged_hidden_states = self.merger(hidden_states)
 
         return {
