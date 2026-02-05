@@ -22,6 +22,7 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorO
 from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
+    ModelWorkerSamplingInfo,
     global_server_args_dict,
 )
 from sgl_jax.srt.managers.utils import resolve_future_token_ids, set_future_token_ids
@@ -56,6 +57,7 @@ class ModelWorker:
     ):
         # Parse args
         self.tp_size = server_args.tp_size
+        self.dp_size = server_args.dp_size
         from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -106,6 +108,7 @@ class ModelWorker:
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
             tp_size=server_args.tp_size,
+            dp_size=server_args.dp_size,
             server_args=server_args,
             mesh=self.mesh,
             is_draft_worker=is_draft_worker,
@@ -122,8 +125,12 @@ class ModelWorker:
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
 
         # Calculate max_running_requests from different constraints
-        attn_backend_limit = self.model_runner.attn_backend.get_max_running_reqests(
-            self.model_config.context_len, self.page_size
+        attn_backend_limit = (
+            self.model_runner.attn_backend.get_max_running_reqests(
+                self.model_config.context_len,
+                self.page_size,
+            )
+            * self.dp_size
         )
         server_limit = (
             self.max_total_num_tokens // 2
@@ -152,6 +159,24 @@ class ModelWorker:
             self.page_size,
         )
         logger.info("  → Final max_running_requests: %s", self.max_running_requests)
+
+        # Validate and adjust max_running_requests for Data Parallelism
+        dp_size = server_args.dp_size
+        if self.max_running_requests < dp_size:
+            raise ValueError(
+                f"max_running_requests ({self.max_running_requests}) is less than dp_size ({dp_size}). "
+                f"Please increase memory allocation or reduce dp_size."
+            )
+        if self.max_running_requests % dp_size != 0:
+            original_value = self.max_running_requests
+            self.max_running_requests = (self.max_running_requests // dp_size) * dp_size
+            logger.warning(
+                "Adjusted max_running_requests from %s to %s to be divisible by dp_size (%s)",
+                original_value,
+                self.max_running_requests,
+                dp_size,
+            )
+
         assert self.max_running_requests > 0, "max_running_request is zero"
 
         self.max_req_len = min(
@@ -184,8 +209,10 @@ class ModelWorker:
         )
         self.precompile_bs_paddings = []
         for bs in bs_padding_list:
-            if bs <= self.max_padded_batch_size and (
-                server_args.moe_backend != "fused" or bs >= self.tp_size * 2
+            if (
+                bs <= self.max_padded_batch_size
+                and (server_args.moe_backend != "fused" or bs >= self.tp_size * 2)
+                and bs >= self.dp_size
             ):
                 self.precompile_bs_paddings.append(bs)
         self.precompile_bs_paddings.sort()
@@ -198,7 +225,7 @@ class ModelWorker:
         # padding cache_loc_paddings
         # note: the length of following two cache_loc_paddings must keep the same to length of separate bs_paddings.
         self.precompile_cache_loc_paddings = [
-            (item * self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
+            item * ((self.max_req_len + self.page_size - 1) // self.page_size * self.page_size)
             for item in self.precompile_bs_paddings
         ]
 
@@ -225,11 +252,23 @@ class ModelWorker:
 
     def normalize_token_paddings(self):
         normalized_token_paddings = []
+        dp_size = self.dp_size
 
         if self.precompile_token_paddings is None:
-            self.precompile_token_paddings = PRECOMPILE_DEFAULT_TOKEN_PADDINGS
+            # Multiply default token paddings by dp_size for DP mode
+            self.precompile_token_paddings = [
+                item * dp_size for item in PRECOMPILE_DEFAULT_TOKEN_PADDINGS
+            ]
+
         for item in self.precompile_token_paddings:
-            if item >= self.max_padded_batch_size and item <= self.max_padded_num_tokens:
+            # Ensure item is divisible by dp_size
+            if item % dp_size != 0:
+                item = (item // dp_size) * dp_size
+            if (
+                item >= self.max_padded_batch_size
+                and item <= self.max_padded_num_tokens
+                and item >= dp_size
+            ):
                 normalized_token_paddings.append(item)
 
         normalized_token_paddings.sort()
@@ -237,6 +276,7 @@ class ModelWorker:
             len(normalized_token_paddings) == 0
             or normalized_token_paddings[-1] < self.max_padded_num_tokens
         ):
+            # max_padded_num_tokens is already multiplied by dp_size in get_max_padded_size
             normalized_token_paddings.append(self.max_padded_num_tokens)
 
         self.precompile_token_paddings = normalized_token_paddings
@@ -270,6 +310,8 @@ class ModelWorker:
                     ForwardMode.EXTEND,
                     self.precompile_cache_loc_paddings[-1],
                     enable_static_lora=self.server_args.enable_static_lora,
+                    dp_size=self.dp_size,
+                    per_dp_bs_size=bs // self.dp_size,
                 )
                 # Prepare LoRA batch if LoRA is enabled
                 if self.server_args.enable_lora:
@@ -287,6 +329,7 @@ class ModelWorker:
                     model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
                         model_worker_batch.forward_batch.input_ids,
                         future_token_ids_map,
+                        self.mesh,
                     )
 
                 self.forward_batch_generation(model_worker_batch, None, False, sampling_metadata)
@@ -300,19 +343,24 @@ class ModelWorker:
             self.precompile_bs_paddings,
         )
 
-        with tqdm(self.precompile_bs_paddings, desc="[DECODE] PRECOMPILE", leave=False) as pbar:
-            for bs in pbar:
+        with tqdm(
+            enumerate(self.precompile_bs_paddings),
+            desc="[DECODE] PRECOMPILE",
+            leave=False,
+            total=len(self.precompile_bs_paddings),
+        ) as pbar:
+            for i, bs in pbar:
                 pbar.set_postfix(bs=bs)
-                # use same page aligned with precompile cache_loc_paddings
-                aligned_cache_loc_size = (
-                    (bs * self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
-                )
+                # use precompile_cache_loc_paddings directly to ensure consistency
+                aligned_cache_loc_size = self.precompile_cache_loc_paddings[i]
                 model_worker_batch = self.generate_model_worker_batch(
                     bs,
                     bs,
                     ForwardMode.DECODE,
                     aligned_cache_loc_size,
                     enable_static_lora=self.server_args.enable_static_lora,
+                    dp_size=self.dp_size,
+                    per_dp_bs_size=bs // self.dp_size,
                 )
                 # Prepare LoRA batch if LoRA is enabled
                 if self.server_args.enable_lora:
@@ -327,12 +375,13 @@ class ModelWorker:
                     model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
                         model_worker_batch.forward_batch.input_ids,
                         future_token_ids_map,
+                        self.mesh,
                     )
                 _, next_token_ids, _ = self.forward_batch_generation(
                     model_worker_batch, None, False, sampling_metadata
                 )
                 if future_token_ids_map is not None:
-                    set_future_token_ids(future_token_ids_map, 0, next_token_ids)
+                    set_future_token_ids(future_token_ids_map, 0, next_token_ids, self.mesh)
 
         end_time = time.perf_counter()
         logger.info("[DECODE] Precompile finished in %.0f secs", end_time - start_time)
@@ -348,16 +397,24 @@ class ModelWorker:
         Returns:
             tuple: (max_padded_batch_size, max_padded_num_tokens)
                 - max_padded_batch_size: Maximum batch size, constrained by max_running_requests
-                - max_padded_num_tokens: Maximum tokens, using chunked_prefill_size if enabled
+                - max_padded_num_tokens: Maximum tokens for all DP ranks (multiplied by dp_size for prefill)
         """
         # Use chunked prefill size if enabled (> 0), otherwise use max prefill tokens
         # Take minimum with max_prefill_tokens as upper bound
-        max_padded_num_tokens = self.max_prefill_tokens
-        if self.chunked_prefill_size > 0 and max_padded_num_tokens > self.chunked_prefill_size:
-            max_padded_num_tokens = self.chunked_prefill_size
+        per_dp_num_tokens = self.max_prefill_tokens
+        if self.chunked_prefill_size > 0 and per_dp_num_tokens > self.chunked_prefill_size:
+            per_dp_num_tokens = self.chunked_prefill_size
+
+        # For prefill, total tokens = per_dp_tokens * dp_size
+        max_padded_num_tokens = per_dp_num_tokens * self.dp_size
 
         # Batch size is constrained by both max_running_requests and available tokens divide by page_size
         max_padded_batch_size = min(self.max_running_requests, max_padded_num_tokens)
+
+        assert max_padded_batch_size % self.dp_size == 0, (
+            "max_padded_batch_size must be divisible by dp_size, "
+            f"but got max_padded_batch_size={max_padded_batch_size}, dp_size={self.dp_size}"
+        )
 
         return max_padded_batch_size, max_padded_num_tokens
 
@@ -377,6 +434,8 @@ class ModelWorker:
         do_penalties: bool = False,
         speculative_algotithm=None,
         enable_static_lora: bool = None,
+        dp_size: int = 1,
+        per_dp_bs_size: int = 0,
     ) -> ModelWorkerBatch:
         valid_input_ids = np.array([1] * bs, dtype=jnp.int32)
         invalid_input_ids = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
@@ -395,6 +454,8 @@ class ModelWorker:
         valid_cache_loc = np.arange(bs)
         invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
         lora_ids = ["0"] * bs
+        extend_seq_lens = np.array([1] * bs) if mode == ForwardMode.EXTEND else None
+        logits_indices = np.array([0] * bs) if mode == ForwardMode.EXTEND else None
 
         return ModelWorkerBatch(
             bid=1,
@@ -408,7 +469,7 @@ class ModelWorker:
             return_logprob=False,
             return_output_logprob_only=True,
             sampling_info=(
-                SamplingBatchInfo.generate_for_precompile(bs, self.model_config.vocab_size)
+                ModelWorkerSamplingInfo.generate_for_precompile(bs, self.model_config.vocab_size)
                 if speculative_algotithm is None
                 else SamplingBatchInfo.generate_for_precompile_all_greedy(
                     bs, self.model_config.vocab_size
@@ -416,18 +477,20 @@ class ModelWorker:
             ),
             extend_input_logprob_token_ids=None,
             positions=np.concat([valid_positions, invalid_positions], axis=0),
-            extend_start_loc=np.arange(bs, dtype=np.int64),
             cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
             extend_prefix_lens=(np.array([0] * bs) if mode == ForwardMode.EXTEND else None),
-            extend_seq_lens=np.array([1] * bs) if mode == ForwardMode.EXTEND else None,
+            extend_seq_lens=extend_seq_lens,
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_logprob_start_lens=None,
+            logits_indices=logits_indices,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL if self.server_args.multimodal else CaptureHiddenMode.NULL
             ),
             spec_algorithm=speculative_algotithm,
             lora_ids=lora_ids,  # Already set to [None] * bs above
+            dp_size=dp_size,
+            per_dp_bs_size=per_dp_bs_size,
         )
 
     def get_model_runner(self):
@@ -521,7 +584,7 @@ class ModelWorker:
         if sampling_metadata is None:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,
-                len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
+                0,
                 self.mesh,
                 self.model_config.vocab_size,
             )
@@ -564,9 +627,11 @@ class ModelWorker:
                 self._update_grammar_vocab_mask(model_worker_batch, sampling_metadata)
 
             with jtu.count_pjit_cpp_cache_miss() as count:
-                next_token_ids_device, token_logprobs, new_logits_output = self.model_runner.sample(
-                    logits_output,
-                    sampling_metadata,
+                next_token_ids_device, token_logprobs, new_logits_output = (
+                    self.model_runner.sample(  # TODO @Brian: Data-Parallel sharding
+                        logits_output,
+                        sampling_metadata,
+                    )
                 )
                 cache_miss_count += count()
             if model_worker_batch.return_output_logprob_only:

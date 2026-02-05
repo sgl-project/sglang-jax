@@ -13,7 +13,11 @@ from sgl_jax.srt.utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import device_array
 
 if TYPE_CHECKING:
-    from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+    from sgl_jax.srt.managers.schedule_batch import (
+        ModelWorkerBatch,
+        ScheduleBatch,
+        ScheduleReqsInfo,
+    )
 
 import threading
 
@@ -110,7 +114,7 @@ class SamplingMetadata:
         mesh: Mesh = None,
         vocab_size: int = 32000,
     ) -> SamplingMetadata:
-        sharding = NamedSharding(mesh, PartitionSpec()) if jax.process_count() == 1 else None
+        sharding = NamedSharding(mesh, PartitionSpec("data")) if jax.process_count() == 1 else None
         if batch.sampling_info.sampling_seeds is not None:
             sampling_seeds_device = device_array(
                 batch.sampling_info.sampling_seeds, sharding=sharding
@@ -134,10 +138,13 @@ class SamplingMetadata:
         )
 
         # Extract penalty information from penalizer orchestrator
+        # TODO: @Brian fix penalty with DataParallel
         linear_penalty_device = None
         do_penalties = False
         linear_penalty_sharding = (
-            NamedSharding(mesh, PartitionSpec(None, "tensor")) if jax.process_count() == 1 else None
+            NamedSharding(mesh, PartitionSpec("data", "tensor"))
+            if jax.process_count() == 1
+            else None
         )
 
         # Handle linear penalty independently (created by update_penalties)
@@ -349,16 +356,17 @@ class SamplingBatchInfo:
     @classmethod
     def from_schedule_batch(
         cls,
-        batch: ScheduleBatch,
+        info: ScheduleReqsInfo,
         vocab_size: int,
+        batch: ScheduleBatch = None,  # Optional: needed for penalizer_orchestrator
     ):
         global_server_args_dict = cls._get_global_server_args_dict()
         enable_deterministic = global_server_args_dict["enable_deterministic_sampling"]
-        reqs = batch.reqs
+        reqs = info.reqs
         temperatures = np.array(
             [r.sampling_params.temperature for r in reqs],
             dtype=np.float32,
-        )
+        ).reshape(-1, 1)
         top_ps = np.array([r.sampling_params.top_p for r in reqs], dtype=np.float32)
         top_ks = np.array([r.sampling_params.top_k for r in reqs], dtype=np.int32)
         min_ps = np.array([r.sampling_params.min_p for r in reqs], dtype=np.float32)
@@ -373,9 +381,12 @@ class SamplingBatchInfo:
         )
 
         # Initialize penalty orchestrator
+        # Note: penalizer_orchestrator requires the full ScheduleBatch object to access
+        # global batch state for penalties (frequency, presence, min_new_tokens).
+        # In DP mode, pass the full batch; the orchestrator will handle per-request penalties.
         penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
             vocab_size=vocab_size,
-            batch=batch,
+            batch=batch,  # Full ScheduleBatch needed for global state
             penalizers={
                 penaltylib.BatchedFrequencyPenalizer,
                 penaltylib.BatchedMinNewTokensPenalizer,

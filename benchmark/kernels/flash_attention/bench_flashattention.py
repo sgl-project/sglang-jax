@@ -112,6 +112,7 @@ def benchmark_backend(
             cu_kv_lens,
             distribution,
             custom_mask=None,
+            decode_mode=0,
             causal=1,
             sm_scale=sm_scale,
         )
