@@ -134,7 +134,10 @@ class TopK(nnx.Module):
         # Create group mask using scatter
         group_mask = jnp.zeros_like(group_scores)  # [n, n_group]
         token_indices = jnp.arange(num_token)[:, None]
-        group_mask = group_mask.at[token_indices, group_idx].set(1)  # [n, n_group]
+        # Explicitly specify output sharding for DP compatibility
+        group_mask = group_mask.at[token_indices, group_idx].set(
+            1, out_sharding=group_mask.sharding
+        )  # [n, n_group]
 
         # Create score mask
         experts_per_group = router_logits.shape[-1] // self.num_expert_group
@@ -170,7 +173,10 @@ class TopK(nnx.Module):
         # Create group mask using scatter
         group_mask = jnp.zeros_like(group_scores)  # [n, n_group]
         token_indices = jnp.arange(num_token)[:, None]
-        group_mask = group_mask.at[token_indices, group_idx].set(1)  # [n, n_group]
+        # Explicitly specify output sharding for DP compatibility
+        group_mask = group_mask.at[token_indices, group_idx].set(
+            1, out_sharding=group_mask.sharding
+        )  # [n, n_group]
 
         # Create score mask
         experts_per_group = router_logits.shape[-1] // self.num_expert_group
