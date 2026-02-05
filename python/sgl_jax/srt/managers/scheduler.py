@@ -965,11 +965,8 @@ class Scheduler(
         )
         ret["prefill_decode_size"] = ret["waiting_queue_size"] + ret["running_batch_size"]
         ret["waiting_queue_rids"] = [req.rid for req in self.waiting_queue]
-        ret["running_batch_rids"] = (
-            [req.rid for req in self.running_batch.reqs]
-            if not self.running_batch.is_empty()
-            else []
-        )
+        all_reqs = [req for info in self.running_batch.reqs_info for req in info.reqs if info.reqs]
+        ret["running_batch_rids"] = [req.rid for req in all_reqs] if len(all_reqs) != 0 else []
 
         # scheduling state
         ret["cur_batch_is_none"] = self.cur_batch is None
@@ -1782,7 +1779,10 @@ class Scheduler(
 
         if recv_req.mode == "retract":
             self.running_batch.filter_batch()
-            if len(self.running_batch.reqs) != 0:
+            all_reqs = [
+                req for info in self.running_batch.reqs_info for req in info.reqs if info.reqs
+            ]
+            if len(all_reqs) != 0:
                 # clear the kv cache
                 retracted_reqs = self.running_batch.retract_all(self.server_args)
                 for req in retracted_reqs:

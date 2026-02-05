@@ -347,7 +347,15 @@ def select_block_configs(
             out.append(v)
         return sorted(set(out))
 
-    bt_candidates = _pick_candidates(candidates=bt_candidates, multiple_of=t_packing)
+    def _bt_allowed(v: int) -> bool:
+        # Allow 2/4/8, otherwise require alignment to 8.
+        return v in (2, 4, 8) or v % 8 == 0
+
+    bt_candidates = [
+        v
+        for v in _pick_candidates(candidates=bt_candidates, multiple_of=t_packing)
+        if _bt_allowed(v)
+    ]
     bts_candidates_i: list[int] | None
     if bts_candidates is None:
         bts_candidates_i = None
@@ -377,6 +385,8 @@ def select_block_configs(
             return False, f"bt({bt}) > local_num_tokens({local_num_tokens})"
         if bt % t_packing != 0:
             return False, f"bt({bt}) % t_packing({t_packing}) != 0"
+        if not _bt_allowed(bt):
+            return False, f"bt({bt}) must be 2, 4, 8, or a multiple of 8"
         if bt % router_tile0 != 0:
             return (
                 False,
