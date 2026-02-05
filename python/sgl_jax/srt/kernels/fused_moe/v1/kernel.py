@@ -221,6 +221,8 @@ def validate_fused_moe_block_config(
         raise ValueError(f"Expected {local_num_tokens=} to be aligned to {t_packing=}.")
     if bt % t_packing != 0:
         raise ValueError(f"Expected {bt=} to be aligned to {t_packing=}.")
+    if not (bt in (2, 4, 8) or bt % 8 == 0):
+        raise ValueError("Expected bt to be 2, 4, 8, or a multiple of 8.")
     if local_num_tokens % bt != 0:
         raise ValueError(f"Expected {local_num_tokens=} to be divisible by {bt=}.")
     # A local expert can receive up to `bt * ep_size` tokens (one per token across all devices).

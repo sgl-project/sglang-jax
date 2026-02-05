@@ -1779,6 +1779,7 @@ class ScheduleBatch:
         offset_bs = 0
         has_sampling_seeds = False
         vocab_size = 0
+        is_all_greedy = True
 
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
@@ -1791,6 +1792,9 @@ class ScheduleBatch:
             dp_sampling = info.sampling_info
             if vocab_size == 0:
                 vocab_size = dp_sampling.vocab_size
+
+            if not info.sampling_info.is_all_greedy:
+                is_all_greedy = False
 
             # Copy sampling parameters
             temperatures[offset_bs : offset_bs + dp_bs] = dp_sampling.temperatures[:dp_bs]
@@ -1813,6 +1817,7 @@ class ScheduleBatch:
             top_ks=top_ks,
             min_ps=min_ps,
             vocab_size=vocab_size,
+            is_all_greedy=is_all_greedy,
             sampling_seeds=sampling_seeds if has_sampling_seeds else None,
             grammars=[req.grammar for req in all_reqs] if self.has_grammar else None,
         )
