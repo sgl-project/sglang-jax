@@ -179,6 +179,8 @@ class ForwardBatch:
     deterministic: bool = True
     # Multimodal cached vision embeddings (prefill only)
     input_embedding: jax.Array | None = None
+    # MRoPE positions [3, total_tokens] for Qwen2.5-VL
+    mrope_positions: jax.Array | None = None
 
     def tree_flatten(self):
         children = (
@@ -198,6 +200,7 @@ class ForwardBatch:
             self.spec_info,
             self.attention_mask,
             self.input_embedding,
+            self.mrope_positions,
         )
 
         aux_data = {
@@ -235,10 +238,9 @@ class ForwardBatch:
         obj.lora_token_indices = children[11]
         obj.lora_ranks = children[12]
         obj.spec_info = children[13]
-
-        # Handle optional children for backward compatibility
         obj.attention_mask = children[14] if len(children) > 14 else None
         obj.input_embedding = children[15] if len(children) > 15 else None
+        obj.mrope_positions = children[16] if len(children) > 16 else None
 
         return obj
 
@@ -258,6 +260,7 @@ class ForwardBatch:
             "lora_scalings",
             "lora_token_indices",
             "lora_ranks",
+            "mrope_positions",
         ]:
             value = getattr(self, field_name, None)
             if value is not None and isinstance(value, jax.Array):
@@ -313,6 +316,16 @@ class ForwardBatch:
                 else None
             ),
         )
+        mrope_positions = None
+        if batch.mrope_positions is not None:
+            (mrope_positions,) = device_array(
+                (batch.mrope_positions,),
+                sharding=(
+                    NamedSharding(model_runner.mesh, PartitionSpec())
+                    if jax.process_count() == 1
+                    else None
+                ),
+            )
         input_embedding = None
         if batch.input_embedding is not None:
             (input_embedding,) = device_array(
@@ -356,6 +369,7 @@ class ForwardBatch:
             seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
             positions=positions,
+            mrope_positions=mrope_positions,
             extend_start_loc=extend_start_loc,
             req_pool_indices=req_pool_indices,
             cache_loc=cache_loc,

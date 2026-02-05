@@ -183,6 +183,8 @@ class Req:
         # Used for radix cache matching to differentiate different images/videos
         # If None, origin_input_ids is used for cache matching
         self.cache_input_ids: list[int] | None = None
+        # Multimodal inputs (e.g., mrope positions) from tokenizer
+        self.mm_inputs: dict | None = None
 
         # Each decode stage's output ids
         self.output_ids = []
@@ -1244,6 +1246,15 @@ class ScheduleBatch:
             # For decode, extend_start_loc is typically not used but we'll set it anyway
             extend_start_loc = np.arange(len(seq_lens_cpu), dtype=seq_lens_cpu.dtype)
 
+        mrope_positions_cpu = _compute_mrope_positions_for_batch(
+            self.reqs,
+            self.forward_mode,
+            seq_lens_cpu,
+            len(input_ids_cpu),
+            extend_prefix_lens,
+            extend_seq_lens,
+        )
+
         bs_padding_size = 0
         bs_paddings.sort()
         select_bs_index = -1
@@ -1390,8 +1401,9 @@ class ScheduleBatch:
         if self.forward_mode == ForwardMode.EXTEND:
             input_embedding_list = []
             for req, prefix_len, extend_len in zip(self.reqs, self.prefix_lens, self.extend_lens):
-                if hasattr(req, "multimodal_embedding") and req.multimodal_embedding is not None:
-                    mm_full = np.asarray(req.multimodal_embedding)
+                mm_embedding = req.mm_inputs.get("multimodal_embedding") if req.mm_inputs else None
+                if mm_embedding is not None:
+                    mm_full = np.asarray(mm_embedding)
                     start = int(prefix_len or 0)
                     end = start + int(extend_len or 0)
                     input_embedding_list.append(mm_full[start:end])
@@ -1418,6 +1430,7 @@ class ScheduleBatch:
             token_ids_logprobs=self.token_ids_logprobs,
             sampling_info=sampling_info,
             positions=positions_cpu,
+            mrope_positions=mrope_positions_cpu,
             extend_start_loc=extend_start_loc,
             cache_loc=cache_loc_cpu,
             extend_prefix_lens=(
@@ -1511,6 +1524,15 @@ class ScheduleBatch:
                 # For decode, extend_start_loc is typically not used but we'll set it anyway
             extend_start_loc = np.arange(len(seq_lens_cpu), dtype=seq_lens_cpu.dtype)
 
+        mrope_positions_cpu = _compute_mrope_positions_for_batch(
+            self.reqs,
+            self.forward_mode,
+            seq_lens_cpu,
+            len(input_ids_cpu),
+            extend_prefix_lens,
+            extend_seq_lens,
+        )
+
         cache_loc_flat = np.array([], dtype=np.int32)
 
         if len(seq_lens_cpu) > 0:
@@ -1594,6 +1616,7 @@ class ScheduleBatch:
             token_ids_logprobs=self.token_ids_logprobs,
             sampling_info=self.sampling_info,
             positions=positions_cpu,
+            mrope_positions=mrope_positions_cpu,
             extend_start_loc=extend_start_loc,
             cache_loc=cache_loc_flat,
             extend_prefix_lens=(extend_prefix_lens if self.forward_mode.is_extend() else None),
@@ -1711,6 +1734,103 @@ def align_to_size(lst: list, size: int, value: int = 0) -> list:
     return lst[:] + [value] * (align_len - len(lst))
 
 
+def _extract_mm_value(mm_inputs: Any, key: str):
+    if mm_inputs is None:
+        return None
+    if isinstance(mm_inputs, dict):
+        return mm_inputs.get(key)
+    return getattr(mm_inputs, key, None)
+
+
+def _as_int_scalar(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
+    if isinstance(value, (np.ndarray, jax.Array)):
+        arr = np.asarray(value)
+        if arr.size == 0:
+            return default
+        return int(arr.reshape(-1)[0])
+    return int(value)
+
+
+def _compute_mrope_positions_for_batch(
+    reqs: list[Req],
+    forward_mode: ForwardMode,
+    seq_lens_cpu: np.ndarray,
+    input_ids_len: int,
+    extend_prefix_lens: np.ndarray | None,
+    extend_seq_lens: np.ndarray | None,
+) -> np.ndarray | None:
+    mm_inputs_list = [getattr(req, "mm_inputs", None) for req in reqs]
+    has_mrope = any(
+        _extract_mm_value(mm, "mrope_positions") is not None
+        or _extract_mm_value(mm, "mrope_position_delta") is not None
+        for mm in mm_inputs_list
+    )
+    if not has_mrope:
+        return None
+
+    if forward_mode.is_decode():
+        mrope_positions_list = []
+        for batch_idx, mm_inputs in enumerate(mm_inputs_list):
+            base_pos = int(seq_lens_cpu[batch_idx]) - 1
+            delta = _extract_mm_value(mm_inputs, "mrope_position_delta")
+            if delta is not None:
+                base_pos += _as_int_scalar(delta)
+            mrope_positions_list.append(
+                np.full((3, 1), base_pos, dtype=np.int32),
+            )
+        mrope_positions = (
+            np.concatenate(mrope_positions_list, axis=1)
+            if mrope_positions_list
+            else np.zeros((3, 0), dtype=np.int32)
+        )
+    else:
+        if extend_prefix_lens is None or extend_seq_lens is None:
+            return None
+        mrope_positions_list = []
+        for batch_idx, mm_inputs in enumerate(mm_inputs_list):
+            extend_len = int(extend_seq_lens[batch_idx])
+            prefix_len = int(extend_prefix_lens[batch_idx])
+            if extend_len <= 0:
+                mrope_positions_list.append(np.zeros((3, 0), dtype=np.int32))
+                continue
+
+            mm_positions = _extract_mm_value(mm_inputs, "mrope_positions")
+            if mm_positions is None:
+                positions = np.arange(prefix_len, prefix_len + extend_len, dtype=np.int32)
+                mrope_positions_list.append(
+                    np.broadcast_to(positions.reshape(1, -1), (3, extend_len))
+                )
+                continue
+
+            mm_positions = np.asarray(mm_positions)
+            chunk = mm_positions[:, prefix_len : prefix_len + extend_len]
+            if chunk.size == 0:
+                delta = _extract_mm_value(mm_inputs, "mrope_position_delta")
+                if delta is not None:
+                    delta_val = _as_int_scalar(delta)
+                    positions = (
+                        np.arange(prefix_len, prefix_len + extend_len, dtype=np.int32) + delta_val
+                    )
+                else:
+                    positions = np.arange(prefix_len, prefix_len + extend_len, dtype=np.int32)
+                chunk = np.broadcast_to(positions.reshape(1, -1), (3, extend_len))
+            mrope_positions_list.append(chunk.astype(np.int32, copy=False))
+
+        mrope_positions = (
+            np.concatenate(mrope_positions_list, axis=1)
+            if mrope_positions_list
+            else np.zeros((3, 0), dtype=np.int32)
+        )
+
+    pad_len = input_ids_len - mrope_positions.shape[1]
+    if pad_len > 0:
+        pad = np.zeros((3, pad_len), dtype=mrope_positions.dtype)
+        mrope_positions = np.concatenate([mrope_positions, pad], axis=1)
+    return mrope_positions
+
+
 @dataclasses.dataclass
 class ModelWorkerBatch:
     # The batch id
@@ -1783,6 +1903,9 @@ class ModelWorkerBatch:
     tree_cache: BasePrefixCache = None
 
     input_embedding: np.ndarray | None = None
+
+    # MRoPE position information [3, total_tokens]
+    mrope_positions: np.ndarray | None = None
 
     def get_original_input_len(self):
         """
