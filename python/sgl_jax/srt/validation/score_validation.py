@@ -15,7 +15,7 @@ Usage:
         return create_error_response(e.message, e.error_type, e.param, e.code)
 """
 
-from typing import Any, List, Optional, Union
+from typing import Any
 
 
 class ValidationError(Exception):
@@ -43,8 +43,8 @@ class ValidationError(Exception):
         self,
         message: str,
         error_type: str = "invalid_request_error",
-        param: Optional[str] = None,
-        code: Optional[str] = None,
+        param: str | None = None,
+        code: str | None = None,
     ):
         self.message = message
         self.error_type = error_type
@@ -87,7 +87,7 @@ def validate_score_request(
     label_token_ids: Any,
     apply_softmax: Any = False,
     item_first: Any = False,
-    vocab_size: Optional[int] = None,
+    vocab_size: int | None = None,
 ) -> None:
     """Validate a Score API request.
 
