@@ -10,7 +10,6 @@ Usage:
     python -m pytest test/srt/test_score_test_utils.py -v
 """
 
-import math
 import unittest
 
 import pytest
@@ -57,6 +56,7 @@ class TestGetSingleTokenId:
 
     def test_raises_on_multi_token(self):
         """Test that multi-token text raises ValueError."""
+
         # Create a mock tokenizer
         class MockTokenizer:
             def encode(self, text, add_special_tokens=False):
@@ -73,6 +73,7 @@ class TestGetSingleTokenId:
 
     def test_raises_on_empty(self):
         """Test that empty tokenization raises ValueError."""
+
         class MockTokenizer:
             def encode(self, text, add_special_tokens=False):
                 return []  # Empty
@@ -85,6 +86,7 @@ class TestGetSingleTokenId:
 
     def test_returns_single_token(self):
         """Test that single-token text returns the token ID."""
+
         class MockTokenizer:
             def encode(self, text, add_special_tokens=False):
                 return [42]
@@ -99,6 +101,7 @@ class TestGetLabelTokenIds:
 
     def test_multiple_tokens(self):
         """Test getting IDs for multiple tokens."""
+
         class MockTokenizer:
             def encode(self, text, add_special_tokens=False):
                 return [ord(text.strip()[0])]  # Return ASCII of first char
@@ -109,6 +112,7 @@ class TestGetLabelTokenIds:
 
     def test_raises_on_any_multi_token(self):
         """Test that any multi-token text raises ValueError."""
+
         class MockTokenizer:
             def encode(self, text, add_special_tokens=False):
                 if text == " multi":
