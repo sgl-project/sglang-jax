@@ -131,12 +131,10 @@ class TopK(nnx.Module):
         # Get top group indices # [n, top_k_group]
         group_idx = jax.lax.top_k(group_scores, k=self.topk_group)[1]
 
-        # Create group mask using scatter
-        group_mask = jnp.zeros_like(group_scores)  # [n, n_group]
-        token_indices = jnp.arange(num_token)[:, None]
-        # Explicitly specify output sharding for DP compatibility
-        group_mask = group_mask.at[token_indices, group_idx].set(
-            1, out_sharding=group_mask.sharding
+        # Create group mask using one_hot instead of scatter (for DP compatibility)
+        # one_hot approach is more JAX-friendly and handles sharding automatically
+        group_mask = jnp.sum(
+            jax.nn.one_hot(group_idx, self.num_expert_group, dtype=group_scores.dtype), axis=1
         )  # [n, n_group]
 
         # Create score mask
@@ -170,12 +168,10 @@ class TopK(nnx.Module):
         # Get top group indices [n, top_k_group]
         group_idx = jax.lax.top_k(group_scores, k=self.topk_group)[1]
 
-        # Create group mask using scatter
-        group_mask = jnp.zeros_like(group_scores)  # [n, n_group]
-        token_indices = jnp.arange(num_token)[:, None]
-        # Explicitly specify output sharding for DP compatibility
-        group_mask = group_mask.at[token_indices, group_idx].set(
-            1, out_sharding=group_mask.sharding
+        # Create group mask using one_hot instead of scatter (for DP compatibility)
+        # one_hot approach is more JAX-friendly and handles sharding automatically
+        group_mask = jnp.sum(
+            jax.nn.one_hot(group_idx, self.num_expert_group, dtype=group_scores.dtype), axis=1
         )  # [n, n_group]
 
         # Create score mask
