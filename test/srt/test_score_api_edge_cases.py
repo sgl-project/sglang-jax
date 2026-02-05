@@ -20,12 +20,10 @@ Usage:
 """
 
 import os
-import unittest
 
 import pytest
 
 from sgl_jax.srt.validation import ValidationError, validate_score_request
-
 
 # =============================================================================
 # Validation Edge Case Tests (Fast, No Model Required)
