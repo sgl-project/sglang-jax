@@ -35,9 +35,9 @@ from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalData
 from sgl_jax.srt.multimodal.manager.io_struct import (
     DataType,
     GenerateMMReqInput,
-    GenerateVLMReqInput,
+    GenerateOmniReqInput,
     TokenizedGenerateMMReqInput,
-    TokenizedGenerateVLMReqInput,
+    TokenizedGenerateOmniReqInput,
 )
 from sgl_jax.srt.multimodal.manager.mrope_utils import compute_mrope_positions
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
@@ -179,7 +179,7 @@ class MultimodalTokenizer(TokenizerManager):
 
     async def generate_request(
         self,
-        obj: GenerateMMReqInput | GenerateVLMReqInput,
+        obj: GenerateMMReqInput | GenerateOmniReqInput,
         request: fastapi.Request | None = None,
     ):
         """High level API: accept a generation request and stream responses.
@@ -207,7 +207,7 @@ class MultimodalTokenizer(TokenizerManager):
         async for response in self._wait_one_response(obj, state, request):
             yield response
 
-    async def _tokenize_one_request(self, obj: GenerateMMReqInput | GenerateVLMReqInput):
+    async def _tokenize_one_request(self, obj: GenerateMMReqInput | GenerateOmniReqInput):
         """
         Converts text fields to token ids using the configured tokenizer.
         Image preprocessing / references are noted as TODO; when provided
@@ -309,6 +309,10 @@ class MultimodalTokenizer(TokenizerManager):
                         feature=np.asarray(audio_features),
                     )
                 )
+            audio_feature_lengths = self._to_audio_feature_lengths(
+                processor_out.get("feature_attention_mask")
+            )
+
             for item in mm_items:
                 item.set_pad_value()
 
@@ -327,6 +331,7 @@ class MultimodalTokenizer(TokenizerManager):
                 "image_grid_thw": image_grid_thw,
                 "video_grid_thw": video_grid_thw,
                 "second_per_grid_ts": second_per_grid_ts,
+                "audio_feature_lengths": audio_feature_lengths,
             }
         if input_ids is None and input_text is not None:
             if self.tokenizer is None:
@@ -343,9 +348,9 @@ class MultimodalTokenizer(TokenizerManager):
             encoded = self.tokenizer(neg_input_text)
             neg_input_ids = encoded["input_ids"]
 
-        is_vlm_req = isinstance(obj, GenerateVLMReqInput) or hasattr(obj, "sampling_params")
-        if is_vlm_req:
-            tokenized_obj = self._create_tokenized_vlm_object(obj, input_text, input_ids)
+        is_omni_req = isinstance(obj, GenerateOmniReqInput) or hasattr(obj, "sampling_params")
+        if is_omni_req:
+            tokenized_obj = self._create_tokenized_omni_object(obj, input_text, input_ids)
         else:
             tokenized_obj = self._create_tokenized_object(
                 obj, input_text, input_ids, neg_input_text, neg_input_ids
@@ -465,6 +470,14 @@ class MultimodalTokenizer(TokenizerManager):
             return array[0]
         return array
 
+    def _to_audio_feature_lengths(self, arr: Any) -> np.ndarray | None:
+        if arr is None:
+            return None
+        array = np.asarray(arr)
+        if array.ndim > 1:
+            return array.sum(axis=1)
+        return array
+
     def _create_tokenized_object(
         self, obj: GenerateMMReqInput, input_text, input_ids, neg_input_text, neg_input_ids
     ):
@@ -491,14 +504,14 @@ class MultimodalTokenizer(TokenizerManager):
         )
         return tokenized_obj
 
-    def _create_tokenized_vlm_object(
-        self, obj: GenerateVLMReqInput, input_text, input_ids
-    ) -> TokenizedGenerateVLMReqInput:
+    def _create_tokenized_omni_object(
+        self, obj: GenerateOmniReqInput, input_text, input_ids
+    ) -> TokenizedGenerateOmniReqInput:
         rid = getattr(obj, "rid", None)
         if rid is None:
             rid = uuid.uuid4().hex
 
-        return TokenizedGenerateVLMReqInput(
+        return TokenizedGenerateOmniReqInput(
             rid=rid,
             prompt=input_text,
             input_ids=input_ids,

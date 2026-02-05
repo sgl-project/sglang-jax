@@ -21,11 +21,11 @@ from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vit import Qwen2_5_VL_Visio
 from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vl_generation import (
     Qwen2_5_VL_Generation,
 )
-from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_embedding import (
-    Qwen3OmniEmbedding,
-)
 from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker import (
     Qwen3OmniMoeTinkerTextForConditionalGeneration,
+)
+from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker_embedding import (
+    Qwen3OmniMoeThinkerEmbedding,
 )
 from sgl_jax.srt.multimodal.models.wan.diffusion.wan_dit import (
     WanDualTransformer3DModel,
@@ -200,8 +200,8 @@ def get_model_class(name: str):
         return Qwen2_5_VL_VisionModel
     elif name == "Qwen2ForCausalLM":
         return Qwen2ForCausalLM
-    elif name == "Qwen3OmniEmbedding":
-        return Qwen3OmniEmbedding
+    elif name == "Qwen3OmniMoeThinkerEmbedding":
+        return Qwen3OmniMoeThinkerEmbedding
     elif name == "Qwen3OmniMoeTinkerTextForConditionalGeneration":
         return Qwen3OmniMoeTinkerTextForConditionalGeneration
 
