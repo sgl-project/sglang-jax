@@ -10,9 +10,8 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 from sgl_jax.srt.configs.load_config import LoadConfig
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_loader import get_model_loader
-from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_moe_encoder import (
+from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker_embedding import (
     Qwen3OmniMoeThinkerEmbedding,
 )
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -192,15 +191,6 @@ class TestQwen3OmniMoeThinkerEmbeddingPrecision(unittest.TestCase):
 
     def _test_model(self, data_path: str):
         data = np.load(data_path)
-        forward_batch = ForwardBatch(
-            bid=0,
-            forward_mode=ForwardMode.EXTEND,
-            batch_size=1,
-            input_ids=jnp.array(data["input_ids"]),
-            req_pool_indices=None,
-            seq_lens=None,
-            out_cache_loc=None,
-        )
 
         input_features = data.get("input_features")
         audio_feature_lengths = data.get("audio_feature_lengths")
@@ -210,7 +200,7 @@ class TestQwen3OmniMoeThinkerEmbeddingPrecision(unittest.TestCase):
         video_grid_thw = data.get("video_grid_thw")
 
         jax_output = self.jax_model_fp32(
-            forward_batch=forward_batch,
+            input_ids=jnp.array(data["input_ids"]),
             input_features=jnp.array(input_features) if input_features is not None else None,
             audio_feature_lengths=(
                 jnp.array(audio_feature_lengths) if audio_feature_lengths is not None else None
