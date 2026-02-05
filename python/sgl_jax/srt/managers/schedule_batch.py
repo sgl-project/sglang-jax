@@ -1401,8 +1401,9 @@ class ScheduleBatch:
         if self.forward_mode == ForwardMode.EXTEND:
             input_embedding_list = []
             for req, prefix_len, extend_len in zip(self.reqs, self.prefix_lens, self.extend_lens):
-                if hasattr(req, "multimodal_embedding") and req.multimodal_embedding is not None:
-                    mm_full = np.asarray(req.multimodal_embedding)
+                mm_embedding = req.mm_inputs.get("multimodal_embedding") if req.mm_inputs else None
+                if mm_embedding is not None:
+                    mm_full = np.asarray(mm_embedding)
                     start = int(prefix_len or 0)
                     end = start + int(extend_len or 0)
                     input_embedding_list.append(mm_full[start:end])
