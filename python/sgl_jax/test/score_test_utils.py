@@ -34,14 +34,14 @@ from transformers import AutoTokenizer
 
 from sgl_jax.srt.entrypoints.engine import Engine
 from sgl_jax.test.test_utils import (
-    CustomTestCase,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    CustomTestCase,
 )
-
 
 # =============================================================================
 # Configuration
 # =============================================================================
+
 
 @dataclass
 class ScoreTestConfig:
@@ -65,6 +65,7 @@ class ScoreTestConfig:
         config = ScoreTestConfig(model_name="meta-llama/Llama-2-7b")
         engine = build_engine(config)
     """
+
     model_name: str = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
     device: str = "tpu"
     tp_size: int = 1
@@ -83,6 +84,7 @@ class ScoreTestConfig:
 # =============================================================================
 # Engine and Tokenizer Factories
 # =============================================================================
+
 
 def build_engine(config: Optional[ScoreTestConfig] = None) -> Engine:
     """Build an Engine instance for Score API testing.
@@ -149,6 +151,7 @@ def get_tokenizer(model_name: Optional[str] = None):
 # Token ID Helpers
 # =============================================================================
 
+
 def get_single_token_id(tokenizer, text: str) -> int:
     """Get token ID for text that MUST tokenize to exactly one token.
 
@@ -174,8 +177,7 @@ def get_single_token_id(tokenizer, text: str) -> int:
     token_ids = tokenizer.encode(text, add_special_tokens=False)
     if len(token_ids) != 1:
         raise ValueError(
-            f"Text '{text}' tokenizes to {len(token_ids)} tokens "
-            f"(expected 1): {token_ids}"
+            f"Text '{text}' tokenizes to {len(token_ids)} tokens " f"(expected 1): {token_ids}"
         )
     return token_ids[0]
 
@@ -205,6 +207,7 @@ def get_label_token_ids(tokenizer, tokens: List[str]) -> List[int]:
 # Assertions
 # =============================================================================
 
+
 def assert_scores_shape(
     scores: List[List[float]],
     expected_items: int,
@@ -231,22 +234,20 @@ def assert_scores_shape(
     """
     if test_case:
         test_case.assertEqual(
-            len(scores),
-            expected_items,
-            f"Expected {expected_items} items, got {len(scores)}"
+            len(scores), expected_items, f"Expected {expected_items} items, got {len(scores)}"
         )
         for i, score_list in enumerate(scores):
             test_case.assertEqual(
                 len(score_list),
                 expected_labels,
-                f"Item {i}: expected {expected_labels} labels, got {len(score_list)}"
+                f"Item {i}: expected {expected_labels} labels, got {len(score_list)}",
             )
     else:
-        assert len(scores) == expected_items, \
-            f"Expected {expected_items} items, got {len(scores)}"
+        assert len(scores) == expected_items, f"Expected {expected_items} items, got {len(scores)}"
         for i, score_list in enumerate(scores):
-            assert len(score_list) == expected_labels, \
-                f"Item {i}: expected {expected_labels} labels, got {len(score_list)}"
+            assert (
+                len(score_list) == expected_labels
+            ), f"Item {i}: expected {expected_labels} labels, got {len(score_list)}"
 
 
 def assert_scores_valid(
@@ -279,29 +280,23 @@ def assert_scores_valid(
             # Check score is finite (no NaN or Inf)
             if test_case:
                 test_case.assertTrue(
-                    math.isfinite(score),
-                    f"Score[{i}][{j}] is not finite: {score}"
+                    math.isfinite(score), f"Score[{i}][{j}] is not finite: {score}"
                 )
             else:
-                assert math.isfinite(score), \
-                    f"Score[{i}][{j}] is not finite: {score}"
+                assert math.isfinite(score), f"Score[{i}][{j}] is not finite: {score}"
 
             if apply_softmax:
                 # Softmax mode: scores should be probabilities in [0, 1]
                 if test_case:
                     test_case.assertGreaterEqual(
-                        score, 0.0,
-                        f"Score[{i}][{j}] = {score} is negative (expected >= 0)"
+                        score, 0.0, f"Score[{i}][{j}] = {score} is negative (expected >= 0)"
                     )
                     test_case.assertLessEqual(
-                        score, 1.0,
-                        f"Score[{i}][{j}] = {score} exceeds 1 (expected <= 1)"
+                        score, 1.0, f"Score[{i}][{j}] = {score} exceeds 1 (expected <= 1)"
                     )
                 else:
-                    assert score >= 0.0, \
-                        f"Score[{i}][{j}] = {score} is negative (expected >= 0)"
-                    assert score <= 1.0, \
-                        f"Score[{i}][{j}] = {score} exceeds 1 (expected <= 1)"
+                    assert score >= 0.0, f"Score[{i}][{j}] = {score} is negative (expected >= 0)"
+                    assert score <= 1.0, f"Score[{i}][{j}] = {score} exceeds 1 (expected <= 1)"
             # For logprobs (apply_softmax=False), values are typically negative
             # but we don't enforce this as -inf is valid for impossible tokens
 
@@ -310,12 +305,12 @@ def assert_scores_valid(
             total = sum(score_list)
             if test_case:
                 test_case.assertAlmostEqual(
-                    total, 1.0, places=6,
-                    msg=f"Item {i}: scores sum to {total}, expected 1.0"
+                    total, 1.0, places=6, msg=f"Item {i}: scores sum to {total}, expected 1.0"
                 )
             else:
-                assert abs(total - 1.0) < tolerance, \
-                    f"Item {i}: scores sum to {total}, expected 1.0"
+                assert (
+                    abs(total - 1.0) < tolerance
+                ), f"Item {i}: scores sum to {total}, expected 1.0"
 
 
 def assert_scores_match(
@@ -343,22 +338,24 @@ def assert_scores_match(
 
     if test_case:
         test_case.assertEqual(
-            len(expected), len(actual),
-            f"{prefix}Expected {len(expected)} items, got {len(actual)}"
+            len(expected), len(actual), f"{prefix}Expected {len(expected)} items, got {len(actual)}"
         )
     else:
-        assert len(expected) == len(actual), \
-            f"{prefix}Expected {len(expected)} items, got {len(actual)}"
+        assert len(expected) == len(
+            actual
+        ), f"{prefix}Expected {len(expected)} items, got {len(actual)}"
 
     for i, (exp_list, act_list) in enumerate(zip(expected, actual)):
         if test_case:
             test_case.assertEqual(
-                len(exp_list), len(act_list),
-                f"{prefix}Item {i}: expected {len(exp_list)} scores, got {len(act_list)}"
+                len(exp_list),
+                len(act_list),
+                f"{prefix}Item {i}: expected {len(exp_list)} scores, got {len(act_list)}",
             )
         else:
-            assert len(exp_list) == len(act_list), \
-                f"{prefix}Item {i}: expected {len(exp_list)} scores, got {len(act_list)}"
+            assert len(exp_list) == len(
+                act_list
+            ), f"{prefix}Item {i}: expected {len(exp_list)} scores, got {len(act_list)}"
 
         for j, (exp, act) in enumerate(zip(exp_list, act_list)):
             diff = abs(exp - act)
@@ -375,6 +372,7 @@ def assert_scores_match(
 # =============================================================================
 # Test Decorators / Skip Conditions
 # =============================================================================
+
 
 def should_run_hf_reference() -> bool:
     """Check if HuggingFace reference tests should run.
@@ -400,6 +398,7 @@ def skip_if_no_hf_reference():
             # ... test code that uses HF reference ...
     """
     import pytest
+
     if not should_run_hf_reference():
         pytest.skip("Set SGLANG_JAX_RUN_HF_REFERENCE=1 to run HF reference tests")
 
@@ -415,6 +414,7 @@ def skip_if_no_multidevice():
             # ... test code that requires multiple devices ...
     """
     import pytest
+
     devices = jax.devices()
     if len(devices) < 2:
         pytest.skip(f"Test requires multiple devices, found {len(devices)}")
@@ -431,6 +431,7 @@ def skip_if_cpu():
             # ... performance test ...
     """
     import pytest
+
     devices = jax.devices()
     if devices and devices[0].platform == "cpu":
         pytest.skip("Test requires TPU or GPU, running on CPU")
@@ -439,6 +440,7 @@ def skip_if_cpu():
 # =============================================================================
 # HuggingFace Reference Helpers
 # =============================================================================
+
 
 def compute_hf_reference_scores(
     model_name: str,
@@ -497,6 +499,7 @@ def compute_hf_reference_scores(
 # Test Data Generators
 # =============================================================================
 
+
 def generate_test_items(count: int, prefix: str = " item") -> List[str]:
     """Generate test items for batch testing.
 
@@ -517,6 +520,7 @@ def generate_test_items(count: int, prefix: str = " item") -> List[str]:
 # =============================================================================
 # Base Test Class
 # =============================================================================
+
 
 class ScoreAPITestCase(CustomTestCase):
     """Base test class for Score API tests.
@@ -540,6 +544,7 @@ class ScoreAPITestCase(CustomTestCase):
                 scores = self.engine.score(...)
                 assert_scores_valid(scores, test_case=self)
     """
+
     config: ScoreTestConfig = None
     engine: Engine = None
     tokenizer = None
