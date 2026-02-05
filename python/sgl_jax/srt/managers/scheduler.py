@@ -698,6 +698,7 @@ class Scheduler(
         req.tokenizer = self.tokenizer
 
         if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
+            req.mm_inputs = recv_req.mm_inputs
             multimodal_embedding = recv_req.mm_inputs.get("multimodal_embedding")
             req.multimodal_embedding = multimodal_embedding
         # Validate prompt length

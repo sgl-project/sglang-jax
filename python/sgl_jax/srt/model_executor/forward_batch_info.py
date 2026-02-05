@@ -150,6 +150,8 @@ class ForwardBatch:
     out_cache_loc: jax.Array
     # Position information [total_tokens]
     positions: jax.Array = None
+    # MRoPE positions [3, total_tokens]
+    mrope_positions: jax.Array | None = None
     # Start position for each sequence in extend mode [batch_size]
     extend_start_loc: jax.Array = None
 
@@ -187,6 +189,7 @@ class ForwardBatch:
             self.seq_lens,
             self.out_cache_loc,
             self.positions,
+            self.mrope_positions,
             self.extend_start_loc,
             self.attn_backend,
             self.cache_loc,
@@ -226,19 +229,33 @@ class ForwardBatch:
         obj.seq_lens = children[2]
         obj.out_cache_loc = children[3]
         obj.positions = children[4]
-        obj.extend_start_loc = children[5]
-        obj.attn_backend = children[6]
-        obj.cache_loc = children[7]
-        obj.extend_prefix_lens = children[8]
-        obj.extend_seq_lens = children[9]
-        obj.lora_scalings = children[10]
-        obj.lora_token_indices = children[11]
-        obj.lora_ranks = children[12]
-        obj.spec_info = children[13]
-
-        # Handle optional children for backward compatibility
-        obj.attention_mask = children[14] if len(children) > 14 else None
-        obj.input_embedding = children[15] if len(children) > 15 else None
+        if len(children) >= 17:
+            obj.mrope_positions = children[5]
+            obj.extend_start_loc = children[6]
+            obj.attn_backend = children[7]
+            obj.cache_loc = children[8]
+            obj.extend_prefix_lens = children[9]
+            obj.extend_seq_lens = children[10]
+            obj.lora_scalings = children[11]
+            obj.lora_token_indices = children[12]
+            obj.lora_ranks = children[13]
+            obj.spec_info = children[14]
+            obj.attention_mask = children[15]
+            obj.input_embedding = children[16]
+        else:
+            # Backward compatibility: no mrope_positions in children
+            obj.mrope_positions = None
+            obj.extend_start_loc = children[5] if len(children) > 5 else None
+            obj.attn_backend = children[6] if len(children) > 6 else None
+            obj.cache_loc = children[7] if len(children) > 7 else None
+            obj.extend_prefix_lens = children[8] if len(children) > 8 else None
+            obj.extend_seq_lens = children[9] if len(children) > 9 else None
+            obj.lora_scalings = children[10] if len(children) > 10 else None
+            obj.lora_token_indices = children[11] if len(children) > 11 else None
+            obj.lora_ranks = children[12] if len(children) > 12 else None
+            obj.spec_info = children[13] if len(children) > 13 else None
+            obj.attention_mask = children[14] if len(children) > 14 else None
+            obj.input_embedding = children[15] if len(children) > 15 else None
 
         return obj
 
@@ -251,6 +268,7 @@ class ForwardBatch:
             "seq_lens",
             "out_cache_loc",
             "positions",
+            "mrope_positions",
             "extend_start_loc",
             "cache_loc",
             "extend_prefix_lens",
@@ -313,6 +331,16 @@ class ForwardBatch:
                 else None
             ),
         )
+        mrope_positions = None
+        if batch.mrope_positions is not None:
+            (mrope_positions,) = device_array(
+                (batch.mrope_positions,),
+                sharding=(
+                    NamedSharding(model_runner.mesh, PartitionSpec())
+                    if jax.process_count() == 1
+                    else None
+                ),
+            )
         input_embedding = None
         if batch.input_embedding is not None:
             (input_embedding,) = device_array(
@@ -356,6 +384,7 @@ class ForwardBatch:
             seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
             positions=positions,
+            mrope_positions=mrope_positions,
             extend_start_loc=extend_start_loc,
             req_pool_indices=req_pool_indices,
             cache_loc=cache_loc,
