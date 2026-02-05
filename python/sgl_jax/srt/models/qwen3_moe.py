@@ -270,7 +270,9 @@ class QWen3MoeDecoderLayer(nnx.Module):
             if self.use_fused:
                 token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
                 hidden_states = self.mlp(
-                    hidden_states, router_logits, token_valid_mask=token_valid_mask
+                    hidden_states,
+                    router_logits,
+                    token_valid_mask=token_valid_mask,
                 )
                 topk_ids = None
             else:

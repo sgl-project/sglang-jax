@@ -371,38 +371,43 @@ def build_mesh(ep_size: int = 1, tp_size: int = 1):
 
 class MoEImbalanceSimulator:
     @staticmethod
-    def generate_counts(num_tokens, top_k, num_experts, mode, **kwargs):
-        np.random.seed(42)
-        rng = np.random.default_rng(42)
-        total_picks = num_tokens * top_k
-
-        all_indices = np.arange(num_experts)
-        rng.shuffle(all_indices)
-        probs = np.zeros(num_experts)
+    def _expert_probs(
+        num_experts: int, mode: str, *, rng: np.random.Generator, **kwargs
+    ) -> np.ndarray:
+        """Return a probability vector over experts (shape: [num_experts])."""
+        total = float(num_experts)
+        probs = np.zeros(num_experts, dtype=np.float64)
 
         if mode == "balanced":
-            probs = np.full(num_experts, 1.0 / num_experts)
+            probs[:] = 1.0 / total
+            return probs
 
-        elif mode == "dirichlet":
-            alpha = kwargs.get("alpha", 1.0)
-            probs = rng.dirichlet([alpha] * num_experts)
+        if mode == "dirichlet":
+            alpha = float(kwargs.get("alpha", 1.0))
+            probs = rng.dirichlet([alpha] * num_experts).astype(np.float64)
+            return probs
 
-        elif mode == "zipf":
-            s = kwargs.get("zipf_s", 1.1)
-            ranks = np.arange(1, num_experts + 1)
-            weights = 1 / (ranks**s)
+        if mode == "zipf":
+            s = float(kwargs.get("zipf_s", 1.1))
+            ranks = np.arange(1, num_experts + 1, dtype=np.float64)
+            weights = 1.0 / (ranks**s)
             rng.shuffle(weights)
-            probs = weights / weights.sum()
+            probs = (weights / weights.sum()).astype(np.float64)
+            return probs
 
-        elif mode in ["hotspot", "sparse_hotspot"]:
-            hotspot_ratio = kwargs.get("hotspot_ratio", 0.5)
-            hotspot_count = kwargs.get("hotspot_count", 1)
-            alpha_base = kwargs.get("non_hotspot_alpha", 100.0)
+        if mode in ["hotspot", "sparse_hotspot"]:
+            hotspot_ratio = float(kwargs.get("hotspot_ratio", 0.5))
+            hotspot_count = int(kwargs.get("hotspot_count", 1))
+            alpha_base = float(kwargs.get("non_hotspot_alpha", 100.0))
+            zero_spot_count = int(
+                kwargs.get("zero_expert_count", 0) if mode == "sparse_hotspot" else 0
+            )
 
-            zero_spot_count = kwargs.get("zero_expert_count", 0) if mode == "sparse_hotspot" else 0
+            # Pick indices deterministically w.r.t rng.
+            all_indices = np.arange(num_experts)
+            rng.shuffle(all_indices)
 
             hotspot_count = max(1, min(hotspot_count, num_experts - zero_spot_count - 1))
-
             zero_indices = all_indices[:zero_spot_count]
             hot_indices = all_indices[zero_spot_count : zero_spot_count + hotspot_count]
             base_indices = all_indices[zero_spot_count + hotspot_count :]
@@ -411,12 +416,20 @@ class MoEImbalanceSimulator:
             probs[hot_indices] = hotspot_ratio / hotspot_count
             if len(base_indices) > 0:
                 base_dist = rng.dirichlet([alpha_base] * len(base_indices))
-                probs[base_indices] = base_dist * (1 - hotspot_ratio)
+                probs[base_indices] = base_dist * (1.0 - hotspot_ratio)
             else:
                 probs[hot_indices] = 1.0 / hotspot_count
+            return probs
 
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
+        raise ValueError(f"Unknown mode: {mode}")
+
+    @staticmethod
+    def generate_counts(num_tokens, top_k, num_experts, mode, **kwargs):
+        np.random.seed(42)
+        rng = np.random.default_rng(42)
+        total_picks = num_tokens * top_k
+
+        probs = MoEImbalanceSimulator._expert_probs(num_experts, mode, rng=rng, **kwargs)
 
         counts = np.floor(probs * total_picks).astype(int)
         diff = total_picks - counts.sum()
@@ -467,3 +480,151 @@ class MoEImbalanceSimulator:
         logits[row_indices, assignments] = 10.0
 
         return jnp.array(logits)
+
+    @staticmethod
+    def create_grouped_topk_logits(
+        num_tokens: int,
+        num_experts: int,
+        top_k: int,
+        *,
+        num_groups: int,
+        top_k_groups: int,
+        mode: str,
+        seed: int = 42,
+        **kwargs,
+    ) -> tuple[jax.Array, dict]:
+        """Create router logits that respect grouped-topk constraints.
+
+        Guarantee (best-effort): each token's selected experts are contained within
+        at most `top_k_groups` expert-groups, so the kernel's grouped-topk filtering
+        does not silently change the intended routing distribution.
+        """
+        if num_groups <= 0 or top_k_groups <= 0:
+            raise ValueError(f"Expected {num_groups=} and {top_k_groups=} to be > 0.")
+        if num_experts % num_groups != 0:
+            raise ValueError(f"Expected {num_experts=} divisible by {num_groups=}.")
+        experts_per_group = num_experts // num_groups
+        if top_k_groups > num_groups:
+            raise ValueError(f"Expected {top_k_groups=} <= {num_groups=}.")
+        if top_k > top_k_groups * experts_per_group:
+            raise ValueError(
+                f"Impossible grouped_topk: {top_k=} > {top_k_groups=} * {experts_per_group=}."
+            )
+
+        rng = np.random.default_rng(int(seed))
+
+        # For hotspot modes, we can make the hotspot set group-aware so that
+        # `top_k_groups` doesn't clip the distribution too aggressively.
+        if mode in ("hotspot", "sparse_hotspot"):
+            hotspot_ratio = float(kwargs.get("hotspot_ratio", 0.5))
+            hotspot_count = int(kwargs.get("hotspot_count", 1))
+            zero_spot_count = int(
+                kwargs.get("zero_expert_count", 0) if mode == "sparse_hotspot" else 0
+            )
+            hotspot_count = max(1, min(hotspot_count, num_experts - zero_spot_count - 1))
+
+            # Choose zero/hot experts; keep hotspots packed into as few groups as possible.
+            all_groups = np.arange(num_groups)
+            rng.shuffle(all_groups)
+
+            # Reserve some experts to be always-zero if requested.
+            zero_indices: np.ndarray
+            if zero_spot_count > 0:
+                all_experts = np.arange(num_experts)
+                rng.shuffle(all_experts)
+                zero_indices = all_experts[:zero_spot_count]
+            else:
+                zero_indices = np.array([], dtype=np.int64)
+
+            packed_group_count = int(np.ceil(hotspot_count / experts_per_group))
+            hot_group_ids = all_groups[: max(1, min(packed_group_count, num_groups))]
+
+            hot_pool = []
+            for g in hot_group_ids:
+                start = g * experts_per_group
+                hot_pool.extend(range(start, start + experts_per_group))
+            hot_pool = np.array(hot_pool, dtype=np.int64)
+            rng.shuffle(hot_pool)
+            # Remove zeros from the hotspot pool.
+            if zero_indices.size:
+                hot_pool = np.setdiff1d(hot_pool, zero_indices, assume_unique=False)
+            hot_indices = hot_pool[:hotspot_count]
+
+            probs = np.zeros(num_experts, dtype=np.float64)
+            probs[zero_indices] = 0.0
+            probs[hot_indices] = hotspot_ratio / hotspot_count
+
+            # Base distribution among non-hot/non-zero experts.
+            base_indices = np.setdiff1d(
+                np.arange(num_experts), np.concatenate([zero_indices, hot_indices])
+            )
+            base_mass = 1.0 - hotspot_ratio
+            if base_mass > 0 and base_indices.size:
+                alpha_base = float(kwargs.get("non_hotspot_alpha", 100.0))
+                base_dist = rng.dirichlet([alpha_base] * int(base_indices.size))
+                probs[base_indices] = base_dist * base_mass
+            elif base_indices.size:
+                probs[base_indices] = 0.0
+        else:
+            probs = MoEImbalanceSimulator._expert_probs(num_experts, mode, rng=rng, **kwargs)
+
+        probs = probs.astype(np.float64)
+        probs_sum = float(probs.sum())
+        if probs_sum <= 0:
+            probs[:] = 1.0 / num_experts
+        else:
+            probs /= probs_sum
+
+        # Group probabilities.
+        group_probs = probs.reshape(num_groups, experts_per_group).sum(axis=1)
+        group_probs_sum = float(group_probs.sum())
+        if group_probs_sum <= 0:
+            group_probs[:] = 1.0 / num_groups
+        else:
+            group_probs = group_probs / group_probs_sum
+
+        assignments = np.full((num_tokens, top_k), -1, dtype=np.int32)
+        used_groups_per_token = np.zeros((num_tokens, top_k_groups), dtype=np.int32)
+        used_group_counts = np.zeros((num_tokens,), dtype=np.int32)
+
+        for t in range(num_tokens):
+            # Choose groups.
+            # If too few nonzero-prob groups, fall back to uniform.
+            nz = int((group_probs > 0).sum())
+            if nz < top_k_groups:
+                groups = rng.choice(num_groups, size=top_k_groups, replace=False)
+            else:
+                groups = rng.choice(num_groups, size=top_k_groups, replace=False, p=group_probs)
+            used_groups_per_token[t, :] = groups.astype(np.int32)
+            used_group_counts[t] = top_k_groups
+
+            # Choose experts from selected groups.
+            candidate = []
+            cand_probs = []
+            for g in groups:
+                start = int(g) * experts_per_group
+                end = start + experts_per_group
+                candidate.extend(range(start, end))
+                cand_probs.extend(probs[start:end])
+            candidate = np.array(candidate, dtype=np.int32)
+            cand_probs = np.array(cand_probs, dtype=np.float64)
+            s = float(cand_probs.sum())
+            if s <= 0:
+                cand_probs[:] = 1.0 / len(cand_probs)
+            else:
+                cand_probs /= s
+
+            chosen = rng.choice(candidate, size=top_k, replace=False, p=cand_probs)
+            assignments[t, :] = chosen.astype(np.int32)
+
+        logits = np.full((num_tokens, num_experts), -10.0, dtype=np.float32)
+        row_indices = np.arange(num_tokens)[:, None]
+        logits[row_indices, assignments] = 10.0
+
+        stats = {
+            "active_experts": int(np.unique(assignments).size),
+            "num_groups": int(num_groups),
+            "top_k_groups": int(top_k_groups),
+            "experts_per_group": int(experts_per_group),
+        }
+        return jnp.asarray(logits), stats

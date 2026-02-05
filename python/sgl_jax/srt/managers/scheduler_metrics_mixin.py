@@ -122,6 +122,7 @@ class SchedulerMetricsMixin:
 
         msg += (
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
+            f"tps/req: {self.last_gen_throughput/num_running_reqs:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}, "
         )
 
