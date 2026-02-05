@@ -104,6 +104,19 @@ class TTSResponse(BaseModel):
     sample_rate: int = 24000
 
 
+class ASRRequest(BaseModel):
+    """Automatic Speech Recognition request."""
+    audio_data: str | bytes                     # base64 编码的音频数据 或 原始字节
+    sample_rate: int = 24000            # 采样率，默认 24kHz
+    prompt: str = "请转录这段音频"       # 指令/提示词，引导模型进行转录
+
+
+class ASRResponse(BaseModel):
+    """Automatic Speech Recognition response."""
+    id: str                             # 请求 ID
+    text: str                           # 转录的文本内容
+
+
 class DataType(Enum):
     IMAGE = auto()
     VIDEO = auto()

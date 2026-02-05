@@ -6,6 +6,7 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 import jax.sharding
+import numpy as np
 from jax import NamedSharding
 from jax.sharding import PartitionSpec
 
@@ -13,7 +14,13 @@ from sgl_jax.srt.managers.communication import CommunicationBackend
 from sgl_jax.srt.managers.io_struct import AbortReq
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.configs.audio.mimo_audio_backbone_config import MiMoSamplerConfig
-from sgl_jax.srt.multimodal.manager.schedule_batch import Req
+from sgl_jax.srt.multimodal.manager.schedule_batch import (
+    MIMO_AUDIO_CHANNELS,
+    MIMO_AUDIO_GROUP_SIZE,
+    MIMO_SPEECH_EMPTY_IDS,
+    MIMO_TEXT_PADDING,
+    Req,
+)
 from sgl_jax.srt.multimodal.model_executor.audio.audio_backbone_model_worker import (
     AudioBackboneModelWorker,
 )
@@ -106,40 +113,104 @@ class AudioBackboneScheduler:
 
         For each request:
         1. Forward through main transformer to get text logits and local hidden states.
-        2. Use patch decoder to generate audio tokens.
+        2. Use patch decoder to generate audio tokens (skip for ASR mode).
         3. Store generated tokens in request and send to next stage.
         """
         for req in batch:
             # Get sampler config from request or use defaults
             sampler_config = self._get_sampler_config(req)
 
-            # Forward through main transformer
-            (text_logits, local_hidden_states, cache), _ = self.backbone_worker.forward(
-                req, cache=req.backbone_cache
-            )
+            if req.audio_mode == "asr":
+                self._generate_asr_text(req, sampler_config)
+            else:
+                # Forward through main transformer
+                (text_logits, local_hidden_states, cache), _ = self.backbone_worker.forward(
+                    req, cache=req.backbone_cache
+                )
 
-            # Update cache for next iteration
-            req.backbone_cache = cache
+                # Update cache for next iteration
+                req.backbone_cache = cache
 
-            # Sample text token
-            text_token = self._sample_token(text_logits[:, -1, :], sampler_config)
-            req.generated_text_tokens = text_token
+                # Sample text token
+                text_token = self._sample_token(text_logits[:, -1, :], sampler_config)
+                req.generated_text_tokens = text_token
 
-            # Generate audio tokens using patch decoder
-            self.rng_key, subkey = jax.random.split(self.rng_key)
-            audio_tokens, _ = self.backbone_worker.patch_decode(
-                local_hidden_states, subkey, sampler_config
-            )
+                # Generate audio tokens using patch decoder
+                self.rng_key, subkey = jax.random.split(self.rng_key)
+                audio_tokens, _ = self.backbone_worker.patch_decode(
+                    local_hidden_states, subkey, sampler_config
+                )
+                req.generated_audio_tokens = jax.device_get(audio_tokens)
 
-            # Store results
-            req.generated_audio_tokens = jax.device_get(audio_tokens)
-            req.text_logits = jax.device_get(text_logits)
+                # Store results
+                req.text_logits = jax.device_get(text_logits)
+                req.generated_text_tokens = jax.device_get(text_token)
 
-            # Clear inputs to free memory
+            # Clear inputs and cache to free memory and avoid JAX arrays
+            # being pickled when sent to detokenizer
             req.input_ids = None
             req.audio_codes = None
+            req.backbone_cache = None
 
             self._comm_backend.send_pyobj(req)
+
+    def _generate_asr_text(self, req: Req, sampler_config: MiMoSamplerConfig):
+        """Autoregressive text generation for ASR mode."""
+        max_new_tokens = 256
+        generated_ids = []
+        cache = None
+        current_input_ids = req.input_ids
+
+        # We need sharding spec for creating new input arrays
+        sharding = NamedSharding(self.mesh, PartitionSpec())
+
+        for _ in range(max_new_tokens):
+            # Temporarily update request input_ids and cache for forward pass
+            req.input_ids = current_input_ids
+            
+            # Forward pass
+            (text_logits, _, new_cache), _ = self.backbone_worker.forward(
+                req, cache=cache
+            )
+            cache = new_cache
+
+            # Sample token
+            next_token = self._sample_token(text_logits[:, -1, :], sampler_config)
+            next_token_scalar = jax.device_get(next_token).item()
+            
+            # TODO: Handle EOS token properly (need access to tokenizer config)
+            # For now assume 151672 (MIMO_EOT_IDX) or 151643 (<|endoftext|>)
+            if next_token_scalar in (151672, 151643):
+                break
+                
+            generated_ids.append(next_token_scalar)
+
+            # Prepare input for next step
+            current_input_ids = self._build_next_step_input(next_token_scalar)
+            current_input_ids = device_array(current_input_ids, sharding=sharding)
+        
+        # Use numpy array to avoid JAX initialization in detokenizer process
+        req.generated_text_tokens = np.array(generated_ids, dtype=np.int32)
+        logger.info("ASR generated %d tokens for rid=%s", len(generated_ids), req.rid)
+        
+        # Clear inputs and cache to free memory and avoid JAX arrays in pickle
+        req.input_ids = None
+        req.backbone_cache = None
+
+    def _build_next_step_input(self, token_id: int) -> jax.Array:
+        """Build input_ids for a single text token step [1, 9, group_size]."""
+        # Text row: [token, -100, -100, -100]
+        text_row = [token_id] + [MIMO_TEXT_PADDING] * (MIMO_AUDIO_GROUP_SIZE - 1)
+        text_row = jnp.array(text_row, dtype=jnp.int32)
+
+        rows = [text_row]
+        # Audio rows: filled with speech_empty_ids
+        for ch in range(MIMO_AUDIO_CHANNELS):
+            row = jnp.full((MIMO_AUDIO_GROUP_SIZE,), MIMO_SPEECH_EMPTY_IDS[ch], dtype=jnp.int32)
+            rows.append(row)
+        
+        # Stack and add batch dim: [1, 9, group_size]
+        return jnp.stack(rows, axis=0)[None, :, :]
 
     def _get_sampler_config(self, req: Req) -> MiMoSamplerConfig:
         """Get sampler configuration from request."""

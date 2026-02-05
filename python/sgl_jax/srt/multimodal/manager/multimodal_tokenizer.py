@@ -29,6 +29,8 @@ from sgl_jax.srt.managers.io_struct import (
 from sgl_jax.srt.managers.tokenizer_manager import ReqState, TokenizerManager
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.manager.io_struct import (
+    ASRRequest,
+    ASRResponse,
     AudioDecodeRequest,
     AudioDecodeResponse,
     AudioEncodeRequest,
@@ -264,6 +266,27 @@ class MultimodalTokenizer(TokenizerManager):
                         out_data["codes"] = req.output.tolist() if hasattr(req.output, "tolist") else req.output
                     elif req.audio_mode == "decode" and req.output is not None:
                         out_data["audio_data"] = req.output
+                    elif req.audio_mode == "asr" and req.generated_text_tokens is not None:
+                        # Decode generated text tokens to string
+                        tokens = req.generated_text_tokens
+                        if hasattr(tokens, "tolist"):
+                            tokens = tokens.tolist()
+
+                        logger.info("ASR generated tokens: %s", tokens)
+
+                        if self.tokenizer:
+                            # Use tokenizer to decode
+                            decoded_text = self.tokenizer.decode(tokens, skip_special_tokens=True)
+                            if not decoded_text and tokens:
+                                # Debug info if decode results in empty string
+                                debug_tokens = tokens[:20]
+                                decoded_text = f"[DEBUG: Empty Decode. Tokens: {debug_tokens}...]"
+                            out_data["text"] = decoded_text
+                            logger.info("ASR decoded text: '%s'", out_data["text"])
+                        else:
+                            # Fallback if tokenizer not available (unlikely)
+                            out_data["text"] = str(tokens)
+                            logger.warning("Tokenizer not initialized, returning raw tokens for ASR")
 
                 self.rid_to_state[req.rid].out_list = [out_data]
             else:
@@ -966,6 +989,146 @@ class MultimodalTokenizer(TokenizerManager):
             audio_data=audio_data_b64,
             url=url,
             sample_rate=24000,
+        )
+
+    def _load_audio_from_bytes(self, audio_bytes: bytes, target_sr: int = 24000) -> np.ndarray:
+        """Load audio from bytes (wav, mp3, etc.) and resample to target_sr.
+
+        Falls back to raw float32 parsing if decoding fails.
+        """
+        # Try librosa (best for resampling and format support)
+        try:
+            import librosa
+            # librosa.load accepts file-like objects
+            with io.BytesIO(audio_bytes) as f:
+                audio_array, _ = librosa.load(f, sr=target_sr, mono=True)
+            return audio_array
+        except ImportError:
+            pass
+        except Exception as e:
+            # Only log warning if it looked like a file (header check) but failed
+            # If it's raw bytes, librosa will likely fail, which is expected
+            if len(audio_bytes) > 4 and audio_bytes[:4] in (b'RIFF', b'ID3\x03'):
+                 logger.warning("Failed to decode audio file with librosa: %s. Trying fallback.", e)
+
+        # Try soundfile
+        try:
+            import soundfile as sf
+            with io.BytesIO(audio_bytes) as f:
+                audio_array, sr = sf.read(f)
+                if sr != target_sr:
+                     logger.warning("Soundfile loaded audio with sr=%d, but target is %d. No resampling applied (install librosa for best results).", sr, target_sr)
+                audio_array = audio_array.astype(np.float32)
+                if audio_array.ndim > 1:
+                    audio_array = audio_array.mean(axis=1)
+            return audio_array
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+        # Fallback: Treat as raw PCM float32 (legacy behavior)
+        # Only warn if it looks like it shouldn't be raw
+        if len(audio_bytes) > 4 and audio_bytes[:4] in (b'RIFF', b'ID3\x03', b'fLaC'):
+             logger.warning("Input looks like an audio file (WAV/MP3/FLAC) but decoding libraries (librosa/soundfile) failed or are missing. Parsing as raw PCM, which will likely produce noise.")
+
+        return np.frombuffer(audio_bytes, dtype=np.float32)
+
+    async def asr(
+        self,
+        obj: ASRRequest,
+        request: fastapi.Request | None = None,
+    ):
+        """Automatic Speech Recognition: convert audio to text.
+
+        Args:
+            obj: ASRRequest containing audio data and optional prompt.
+            request: FastAPI request object for disconnect handling.
+
+        Returns:
+            ASRResponse containing the transcribed text.
+        """
+        created_time = time.time()
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._updating)
+
+        self.auto_create_handle_loop()
+
+        rid = uuid.uuid4().hex
+
+        # Decode audio data from base64 or use raw bytes
+        if obj.audio_data:
+            if isinstance(obj.audio_data, str):
+                try:
+                    audio_bytes = base64.b64decode(obj.audio_data)
+                except Exception:
+                    # If not base64, maybe it's a file path? For now assume base64 error
+                    raise ValueError("Invalid base64 string in audio_data")
+            else:
+                audio_bytes = obj.audio_data
+
+            # Use smart loader to handle WAV/MP3 or Raw PCM
+            audio_array = self._load_audio_from_bytes(audio_bytes, target_sr=obj.sample_rate)
+        else:
+            raise ValueError("audio_data is required for ASR")
+
+        # Preprocess audio to mel spectrogram
+        mel_input, mel_input_lens = self._preprocess_audio_to_mel(audio_array)
+
+        # Tokenize the prompt (instruction)
+        text_input_ids = None
+        if obj.prompt and self.tokenizer is not None:
+            encoded = self.tokenizer(obj.prompt)
+            text_input_ids = encoded["input_ids"]
+
+        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
+
+        asr_req = Req(
+            rid=rid,
+            mel_input=mel_input,
+            mel_input_lens=mel_input_lens,
+            audio_mode="asr",
+            sample_rate=obj.sample_rate,
+            data_type=DataType.AUDIO,
+            text_input_ids=text_input_ids,
+            prompt=obj.prompt,
+            n_q=8,
+        )
+
+        state = MMReqState(
+            rid=rid,
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            created_time=created_time,
+        )
+        self.rid_to_state[rid] = state
+
+        self.send_to_scheduler.send_pyobj(asr_req)
+
+        try:
+            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
+        except TimeoutError:
+            raise ValueError(f"ASR request timed out for rid={rid}") from None
+
+        del self.rid_to_state[rid]
+
+        out = state.out_list[-1] if state.out_list else {"success": True, "meta_info": {}}
+
+        # Decode the generated text tokens to text
+        text = ""
+        if out.get("text") is not None:
+            text = out["text"]
+        elif out.get("generated_text_tokens") is not None and self.tokenizer is not None:
+            tokens = out["generated_text_tokens"]
+            if hasattr(tokens, "tolist"):
+                tokens = tokens.tolist()
+            text = self.tokenizer.decode(tokens, skip_special_tokens=True)
+
+        return ASRResponse(
+            id=rid,
+            text=text,
         )
 
 

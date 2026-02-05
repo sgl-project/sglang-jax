@@ -365,6 +365,14 @@ class Req:
             if self.text_input_ids:
                 segments.append(self._build_text_segment(self.text_input_ids))
 
+        elif self.audio_mode == "asr":
+            # ASR (Automatic Speech Recognition): audio patches + instruction text
+            # The instruction (e.g., "请转录这段音频") guides the model to transcribe
+            if self.audio_codes is not None:
+                segments.append(self._build_audio_segment(self.audio_codes))
+            if self.text_input_ids:
+                segments.append(self._build_text_segment(self.text_input_ids))
+
         else:
             # Default: just use whatever is available
             if self.audio_codes is not None:

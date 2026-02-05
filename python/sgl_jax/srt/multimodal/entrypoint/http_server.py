@@ -8,7 +8,7 @@ from http import HTTPStatus
 
 import requests
 import uvicorn
-from fastapi import Request
+from fastapi import File, Form, Request, UploadFile
 from fastapi.responses import ORJSONResponse, Response
 
 from sgl_jax.srt.entrypoints.http_server import _GlobalState, app, set_global_state
@@ -19,6 +19,8 @@ from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.global_scheduler import run_global_scheduler_process
 from sgl_jax.srt.multimodal.manager.io_struct import (
+    ASRRequest,
+    ASRResponse,
     AudioDecodeRequest,
     AudioDecodeResponse,
     AudioEncodeRequest,
@@ -253,6 +255,35 @@ async def text_to_speech(obj: TTSRequest, request: Request):
         return ret
     except ValueError as e:
         logger.error("[http_server] tts error: %s", e)
+        return _create_error_response(e)
+
+
+@app.api_route("/api/v1/audio/asr", methods=["POST"])
+async def automatic_speech_recognition(
+    request: Request,
+    file: UploadFile = File(...),
+    prompt: str = Form("请转录这段音频"),
+    sample_rate: int = Form(24000),
+):
+    """Automatic Speech Recognition (ASR) endpoint.
+
+    Now accepts multipart/form-data with a file upload.
+    Note: The uploaded file MUST be raw PCM float32 bytes if the backend expects raw bytes.
+    """
+    try:
+        from sgl_jax.srt.entrypoints.http_server import _global_state
+
+        audio_bytes = await file.read()
+        obj = ASRRequest(
+            audio_data=audio_bytes,
+            prompt=prompt,
+            sample_rate=sample_rate
+        )
+
+        ret = await _global_state.tokenizer_manager.asr(obj, request)
+        return ret
+    except ValueError as e:
+        logger.error("[http_server] asr error: %s", e)
         return _create_error_response(e)
 
 
