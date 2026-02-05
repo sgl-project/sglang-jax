@@ -23,6 +23,7 @@ class EmbedScheduler:
         communication_backend: CommunicationBackend,
         model_class,
         stage_sub_dir: str | None = None,
+        precompile_params: dict | None = None,
     ):
         self.communication_backend = communication_backend
         self.mesh = mesh
