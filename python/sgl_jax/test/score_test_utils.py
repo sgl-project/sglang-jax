@@ -27,7 +27,6 @@ import math
 import os
 import unittest
 from dataclasses import dataclass, field
-from typing import List, Optional
 
 import jax
 from transformers import AutoTokenizer
@@ -76,8 +75,8 @@ class ScoreTestConfig:
     max_running_requests: int = 16
     tolerance: float = 0.01  # 1% tolerance for score comparison
     chunked_prefill_size: int = 1024
-    precompile_bs_paddings: List[int] = field(default_factory=lambda: [16])
-    precompile_token_paddings: List[int] = field(default_factory=lambda: [1024])
+    precompile_bs_paddings: list[int] = field(default_factory=lambda: [16])
+    precompile_token_paddings: list[int] = field(default_factory=lambda: [1024])
     page_size: int = 64
 
 
@@ -86,7 +85,7 @@ class ScoreTestConfig:
 # =============================================================================
 
 
-def build_engine(config: Optional[ScoreTestConfig] = None) -> Engine:
+def build_engine(config: ScoreTestConfig | None = None) -> Engine:
     """Build an Engine instance for Score API testing.
 
     This factory function creates a properly configured Engine with settings
@@ -128,7 +127,7 @@ def build_engine(config: Optional[ScoreTestConfig] = None) -> Engine:
     )
 
 
-def get_tokenizer(model_name: Optional[str] = None):
+def get_tokenizer(model_name: str | None = None):
     """Load tokenizer for Score API testing.
 
     Args:
@@ -182,7 +181,7 @@ def get_single_token_id(tokenizer, text: str) -> int:
     return token_ids[0]
 
 
-def get_label_token_ids(tokenizer, tokens: List[str]) -> List[int]:
+def get_label_token_ids(tokenizer, tokens: list[str]) -> list[int]:
     """Convert multiple label token strings to IDs.
 
     Convenience wrapper around get_single_token_id for multiple tokens.
@@ -209,10 +208,10 @@ def get_label_token_ids(tokenizer, tokens: List[str]) -> List[int]:
 
 
 def assert_scores_shape(
-    scores: List[List[float]],
+    scores: list[list[float]],
     expected_items: int,
     expected_labels: int,
-    test_case: Optional[unittest.TestCase] = None,
+    test_case: unittest.TestCase | None = None,
 ) -> None:
     """Assert that scores have the expected shape.
 
@@ -251,9 +250,9 @@ def assert_scores_shape(
 
 
 def assert_scores_valid(
-    scores: List[List[float]],
+    scores: list[list[float]],
     apply_softmax: bool = True,
-    test_case: Optional[unittest.TestCase] = None,
+    test_case: unittest.TestCase | None = None,
     tolerance: float = 1e-6,
 ) -> None:
     """Assert that scores are valid probabilities or logprobs.
@@ -314,10 +313,10 @@ def assert_scores_valid(
 
 
 def assert_scores_match(
-    expected: List[List[float]],
-    actual: List[List[float]],
+    expected: list[list[float]],
+    actual: list[list[float]],
     tolerance: float = 0.01,
-    test_case: Optional[unittest.TestCase] = None,
+    test_case: unittest.TestCase | None = None,
     case_name: str = "",
 ) -> None:
     """Assert that two score matrices match within tolerance.
@@ -445,10 +444,10 @@ def skip_if_cpu():
 def compute_hf_reference_scores(
     model_name: str,
     query: str,
-    items: List[str],
-    label_token_ids: List[int],
+    items: list[str],
+    label_token_ids: list[int],
     item_first: bool = False,
-) -> List[List[float]]:
+) -> list[list[float]]:
     """Compute reference scores using HuggingFace model.
 
     This function loads a HuggingFace model and computes scores for comparison
@@ -500,7 +499,7 @@ def compute_hf_reference_scores(
 # =============================================================================
 
 
-def generate_test_items(count: int, prefix: str = " item") -> List[str]:
+def generate_test_items(count: int, prefix: str = " item") -> list[str]:
     """Generate test items for batch testing.
 
     Args:
@@ -567,6 +566,6 @@ class ScoreAPITestCase(CustomTestCase):
         """Get single token ID for text. Convenience wrapper."""
         return get_single_token_id(self.tokenizer, text)
 
-    def get_token_ids(self, tokens: List[str]) -> List[int]:
+    def get_token_ids(self, tokens: list[str]) -> list[int]:
         """Get multiple token IDs. Convenience wrapper."""
         return get_label_token_ids(self.tokenizer, tokens)
