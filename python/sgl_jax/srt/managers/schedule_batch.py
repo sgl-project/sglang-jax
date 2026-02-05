@@ -1851,7 +1851,7 @@ class ModelWorkerBatch:
     # Position information [total_tokens]
     positions: np.ndarray
     # MRoPE position information [3, total_tokens]
-    mrope_positions: np.ndarray | None = None
+    mrope_positions: np.ndarray | None
     # Start position for each sequence in extend mode [batch_size]
     extend_start_loc: np.ndarray
     # cache_loc

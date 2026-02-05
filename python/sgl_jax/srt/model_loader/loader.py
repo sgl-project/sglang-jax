@@ -237,7 +237,10 @@ class JAXModelLoader(DefaultModelLoader):
 
         # Quantization config is already unified in model_config
         # No need for any conversion logic here
-        if model_config.quantization_config is not None:
+        if (
+            hasattr(model_config, "quantization_config")
+            and model_config.quantization_config is not None
+        ):
             is_static = model_config.quantization_config.is_static_checkpoint
 
             if is_static:
