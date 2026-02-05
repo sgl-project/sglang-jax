@@ -36,7 +36,6 @@ from sgl_jax.srt.entrypoints.engine import Engine
 from sgl_jax.test.test_utils import (
     CustomTestCase,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    is_in_ci,
 )
 
 
