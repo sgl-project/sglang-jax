@@ -158,6 +158,8 @@ class TokenizedGenerateReqInput:
     return_routed_experts: list[bool] | bool | None = None
     # whether to return hidden states
     return_hidden_states: bool = False
+    # multimodal inputs (e.g., mrope positions, embeddings)
+    mm_inputs: dict | None = None
 
 
 @dataclass

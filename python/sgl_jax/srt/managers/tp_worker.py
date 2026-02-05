@@ -416,6 +416,7 @@ class ModelWorker:
             ),
             extend_input_logprob_token_ids=None,
             positions=np.concat([valid_positions, invalid_positions], axis=0),
+            mrope_positions=None,
             extend_start_loc=np.arange(bs, dtype=np.int64),
             cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
             extend_prefix_lens=(np.array([0] * bs) if mode == ForwardMode.EXTEND else None),
