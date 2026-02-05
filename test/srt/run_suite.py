@@ -2,7 +2,6 @@ import argparse
 import glob
 import os
 import shutil
-import signal
 import subprocess
 import sys
 import threading
@@ -56,7 +55,7 @@ def cleanup_model_cache():
                     try:
                         print(f"\nCleaning up model cache at {model_path}...", flush=True)
                         shutil.rmtree(model_path)
-                        print(f"Model cache cleaned successfully.\n", flush=True)
+                        print("Model cache cleaned successfully.\n", flush=True)
                     except Exception as e:
                         print(f"Failed to clean model cache: {e}\n", flush=True)
 
@@ -441,7 +440,10 @@ suites = {
             "test/srt/test_moe_eval_accuracy_large.py", 40, ["TestMoEEvalAccuracyLarge.test_mmlu"]
         ),
     ],
-    "performance-test-tpu-v6e-1": [TestFile("test/srt/test_bench_serving_dense.py", 7)],
+    "performance-test-tpu-v6e-1": [
+        TestFile("test/srt/test_bench_serving_dense.py", 7),
+        TestFile("test/srt/test_bench_score.py", 3),  # Score API performance benchmark
+    ],
     "performance-test-tpu-v6e-4": [
         TestFile(
             "test/srt/test_bench_serving_dense_tp_4.py",
@@ -458,6 +460,7 @@ suites = {
         TestFile("test/srt/openai_server/basic/test_serving_chat.py", 0.1),
         TestFile("test/srt/openai_server/basic/test_serving_completions.py", 0.1),
         TestFile("test/srt/openai_server/basic/test_openai_server.py", 1),
+        TestFile("test/srt/test_score_api.py", 2),
         TestFile("test/srt/openai_server/features/test_ebnf.py", 2),
         TestFile("test/srt/openai_server/features/test_json_mode.py", 2),
         TestFile("test/srt/openai_server/features/test_structural_tag.py", 2),
