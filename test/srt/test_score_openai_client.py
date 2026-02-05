@@ -27,8 +27,7 @@ import pytest
 
 # Skip entire module if openai is not installed
 openai = pytest.importorskip("openai", reason="openai package required for these tests")
-from openai import OpenAI
-
+from openai import OpenAI  # noqa: E402
 
 # =============================================================================
 # Test Configuration
