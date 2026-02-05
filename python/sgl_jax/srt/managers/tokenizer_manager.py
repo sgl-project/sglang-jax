@@ -67,8 +67,8 @@ from sgl_jax.srt.utils import (
     get_zmq_socket,
     kill_process_tree,
 )
+from sgl_jax.srt.validation import validate_score_request
 from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
-from sgl_jax.srt.validation import ValidationError, validate_score_request
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
