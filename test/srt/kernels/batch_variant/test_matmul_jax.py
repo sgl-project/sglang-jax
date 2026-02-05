@@ -8,8 +8,13 @@ input_no_padding = jax.random.normal(key, shape=(1, 4096), dtype=jnp.bfloat16)
 weight = jax.random.normal(key, shape=(4096, 151936), dtype=jnp.bfloat16)
 
 
-batch_size_list = [1, 2, 4, 6, 8, 16, 32, 64, 128, 256]
+#batch_size_list = [1, 2, 4, 6, 8, 16, 32, 64, 128, 256]
+#batch_size_list = [1, 2, 4, 5, 8, 16, 32, 64, 100, 128, 256, 500, 1024, 2000, 4096, 8192, 10000, 35423]
+#batch_size_list = [1,2,4,16]
+batch_size_list = [1]
 batch_size_result = []
+
+print(f"Begin to prepare data",flush=True)
 
 for bs in batch_size_list:
     input_with_padding_tmp = jax.random.normal(key, shape=(bs - 1, 4096), dtype=jnp.bfloat16)
@@ -17,6 +22,8 @@ for bs in batch_size_list:
     result_with_padding = jnp.dot(input_with_padding, weight, preferred_element_type=jnp.float32)
     extracted_res = jax.device_get(result_with_padding[0, ...]).reshape(-1)
     batch_size_result.append(extracted_res)
+
+print(f"Complete preparing data",flush=True)
 
 # Compare all batch_size_results with each other
 print("\n" + "=" * 60)
