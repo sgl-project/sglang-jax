@@ -146,12 +146,14 @@ class Stage:
             comm_backend = QueueBackend(in_queue=self._in_queue, out_queue=self._out_queue)
             model_class = get_model_class(self.stage_config.model_class)
             stage_sub_dir = getattr(self.stage_config, "stage_sub_dir", None)
+            precompile_params = getattr(self.stage_config, "precompile_params", None)
             self._stage_scheduler = scheduler_class(
                 communication_backend=comm_backend,
                 mesh=self.mesh,
                 server_args=self.server_args,
                 model_class=model_class,
                 stage_sub_dir=stage_sub_dir,
+                precompile_params=precompile_params,
                 **self.stage_config.scheduler_params,
             )
             self._out_queue.put_nowait({"status": "ready"})

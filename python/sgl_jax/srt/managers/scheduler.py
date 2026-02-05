@@ -136,6 +136,7 @@ class Scheduler(
         mesh: jax.sharding.Mesh = None,
         model_class: None = None,
         stage_sub_dir: str | None = None,
+        precompile_params: dict | None = None,
     ):
         if stage_sub_dir is not None:
             server_args = dataclasses.replace(server_args)
@@ -281,6 +282,7 @@ class Scheduler(
             server_args=server_args,
             mesh=self.mesh,
             model_class=model_class,
+            precompile_params=precompile_params,
         )
 
         # launch draft worker
