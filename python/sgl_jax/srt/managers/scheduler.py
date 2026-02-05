@@ -162,6 +162,7 @@ class Scheduler(
         self.dp_size = server_args.dp_size
         self.tp_size = server_args.tp_size
         self.schedule_policy = server_args.schedule_policy
+        self.dp_schedule_policy = server_args.dp_schedule_policy
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.stream_interval = server_args.stream_interval
         self.max_seq_len = server_args.max_seq_len
@@ -330,6 +331,8 @@ class Scheduler(
 
         # Init running status
         self.waiting_queue: list[Req] = []
+        # Pending incoming generate requests waiting for dp assignment
+        self.pending_dp_reqs: list[TokenizedGenerateReqInput] = []
         # The aborted requests
         self.aborted_reqs: dict[str, Req] = {}
         # The running decoding batch for continuous batching
@@ -533,27 +536,98 @@ class Scheduler(
 
         self.decode_mem_cache_buf_multiplier = 1
 
-    def select_dp_for_request(self, recv_reqs: list[Req]) -> None:
-        """Assign dp_rank to request using round-robin strategy."""
+    def _select_round_robin_dp(self) -> int:
+        dp_rank = self.dp_round_robin_counter % self.dp_size
+        self.dp_round_robin_counter += 1
+        return dp_rank
+
+    def _select_min_running_dp(self, extra_counts: list[int] | None = None) -> int | None:
+        """Select a DP rank with the minimum running requests.
+
+        Returns None if all DP ranks are full.
+        """
         if self.dp_size == 1:
-            for req in recv_reqs:
+            return 0
+
+        if extra_counts is None:
+            extra_counts = [0] * self.dp_size
+
+        running_counts = [
+            len(info.reqs) if info.reqs else 0 for info in self.running_batch.reqs_info
+        ]
+        counts = [running_counts[i] + extra_counts[i] for i in range(self.dp_size)]
+
+        eligible = []
+        for dp_rank in range(self.dp_size):
+            if self.running_batch.reqs_info[dp_rank].batch_is_full:
+                continue
+            if counts[dp_rank] >= self.per_dp_max_running_requests:
+                continue
+            eligible.append(dp_rank)
+
+        if not eligible:
+            return None
+
+        min_count = min(counts[dp_rank] for dp_rank in eligible)
+        for dp_rank in eligible:
+            if counts[dp_rank] == min_count:
+                return dp_rank
+        return None
+
+    def select_dp_for_request(self, recv_reqs: list[Req]) -> list[Req]:
+        """Assign dp_rank to incoming requests using the configured DP policy.
+
+        Requests without a dp assignment (min-running + all full) are queued and
+        retried in the next loop to keep ordering deterministic across nodes.
+        """
+        if recv_reqs is None:
+            recv_reqs = []
+
+        # Preserve FIFO order: older pending requests first, then new arrivals.
+        combined_reqs = []
+        if self.pending_dp_reqs:
+            combined_reqs.extend(self.pending_dp_reqs)
+            self.pending_dp_reqs = []
+        if recv_reqs:
+            combined_reqs.extend(recv_reqs)
+
+        if self.dp_size == 1:
+            for req in combined_reqs:
                 # Only assign dp_rank to TokenizedGenerateReqInput
                 if isinstance(req, TokenizedGenerateReqInput):
                     req.dp_rank = 0
-            return
+            return combined_reqs
 
-        for req in recv_reqs:
+        pending_counts = [0] * self.dp_size
+        ready_reqs: list[Req] = []
+
+        for req in combined_reqs:
             # Only assign dp_rank to TokenizedGenerateReqInput
             if not isinstance(req, TokenizedGenerateReqInput):
+                ready_reqs.append(req)
                 continue
 
             # Skip if dp_rank already set (e.g., sticky sessions)
             if req.dp_rank is not None:
+                ready_reqs.append(req)
                 continue
 
-            # Round-robin assignment
-            req.dp_rank = self.dp_round_robin_counter % self.dp_size
-            self.dp_round_robin_counter += 1
+            if self.dp_schedule_policy == "round_robin":
+                req.dp_rank = self._select_round_robin_dp()
+                ready_reqs.append(req)
+                continue
+
+            dp_rank = self._select_min_running_dp(extra_counts=pending_counts)
+            if dp_rank is None:
+                # All DP ranks are full; keep the request pending.
+                self.pending_dp_reqs.append(req)
+                continue
+
+            req.dp_rank = dp_rank
+            pending_counts[dp_rank] += 1
+            ready_reqs.append(req)
+
+        return ready_reqs
 
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -564,7 +638,7 @@ class Scheduler(
                 else self.recv_requests()
             )
             # Assign DP rank to incoming requests
-            self.select_dp_for_request(recv_reqs)
+            recv_reqs = self.select_dp_for_request(recv_reqs)
             self.process_input_requests(recv_reqs)
 
             # Skip batch processing when engine is paused
@@ -600,7 +674,7 @@ class Scheduler(
                 else self.recv_requests()
             )
             # Assign DP rank to incoming requests
-            self.select_dp_for_request(recv_reqs)
+            recv_reqs = self.select_dp_for_request(recv_reqs)
             self.process_input_requests(recv_reqs)
 
             # Skip batch processing when engine is paused
@@ -1008,6 +1082,7 @@ class Scheduler(
             return 0 if batch.is_empty() else batch.batch_size()
 
         waiting_reqs = len(self.waiting_queue)
+        pending_dp_reqs = len(self.pending_dp_reqs)
         running_reqs = _batch_size(self.running_batch)
         current_batch_reqs = _batch_size(self.cur_batch)
         last_batch_reqs = _batch_size(self.last_batch)
@@ -1016,6 +1091,7 @@ class Scheduler(
 
         has_pending = (
             waiting_reqs > 0
+            or pending_dp_reqs > 0
             or running_reqs > 0
             or current_batch_reqs > 0
             or last_batch_reqs > 0
@@ -1026,7 +1102,7 @@ class Scheduler(
         if has_pending:
             msg = (
                 "Cache not flushed because there are pending requests. "
-                f"waiting={waiting_reqs}, running={running_reqs}, "
+                f"waiting={waiting_reqs}, pending_dp={pending_dp_reqs}, running={running_reqs}, "
                 f"cur_batch={current_batch_reqs}, last_batch={last_batch_reqs}, "
                 f"chunked={chunked_pending}, pending_results={pending_results}"
             )
@@ -1054,6 +1130,7 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             mesh=self.mesh,
         )
+        self.pending_dp_reqs = []
         self.chunked_reqs = [None] * self.dp_size
         if self.enable_overlap:
             self.result_queue = deque()
@@ -1286,7 +1363,10 @@ class Scheduler(
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             # Get DP rank for this request
-            dp_rank = req.dp_rank if req.dp_rank is not None else 0
+            dp_rank = req.dp_rank
+            assert (
+                dp_rank is not None
+            ), "dp_rank is None in waiting_queue; dp should be assigned before enqueue."
 
             # Check whether dp is full load
             if self.running_batch.reqs_info[dp_rank].batch_is_full or (
