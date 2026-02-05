@@ -1851,8 +1851,6 @@ class ModelWorkerBatch:
     sampling_info: SamplingBatchInfo
     # Position information [total_tokens]
     positions: np.ndarray
-    # MRoPE position information [3, total_tokens]
-    mrope_positions: np.ndarray | None
     # Start position for each sequence in extend mode [batch_size]
     extend_start_loc: np.ndarray
     # cache_loc
@@ -1905,6 +1903,9 @@ class ModelWorkerBatch:
     tree_cache: BasePrefixCache = None
 
     input_embedding: np.ndarray | None = None
+
+    # MRoPE position information [3, total_tokens]
+    mrope_positions: np.ndarray | None = None
 
     def get_original_input_len(self):
         """
