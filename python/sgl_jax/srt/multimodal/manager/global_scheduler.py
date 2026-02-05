@@ -136,6 +136,7 @@ class GlobalScheduler:
                 (TokenizedGenerateMMReqInput, self.convert_request),
                 (TokenizedGenerateVLMReqInput, self.convert_vlm_request),
                 (AbortReq, self.handle_abort_request),
+                (Req, self.handle_audio_request),
             ]
         )
 
@@ -225,6 +226,12 @@ class GlobalScheduler:
         if req.rid in self.req_store:
             raise RuntimeError(f"{req.rid} is already in req_store")
         # Store with tracking state, starting at stage 0
+        self.req_store[req.rid] = ReqTrackingState(req=req, current_stage=0)
+        return req
+
+    def handle_audio_request(self, req: Req):
+        if req.rid in self.req_store:
+            raise RuntimeError(f"{req.rid} is already in req_store")
         self.req_store[req.rid] = ReqTrackingState(req=req, current_stage=0)
         return req
 

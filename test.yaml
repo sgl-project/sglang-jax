@@ -1,0 +1,14 @@
+resources:
+  accelerators: tpu-v6e-4 #
+  accelerator_args:
+    tpu_vm: True
+    runtime_version: v2-alpha-tpuv6e # optional
+file_mounts:
+  ~/.ssh/id_rsa: ~/.ssh/id_rsa
+setup: |
+  chmod 600 ~/.ssh/id_rsa
+  rm ~/.ssh/config
+  GIT_SSH_COMMAND="ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no" git clone git@github.com:Mozoltov821/sglang-jax.git 
+  cd sgl-jax 
+  uv venv --python 3.12 && source .venv/bin/activate
+  uv pip install -e "python[all]"
