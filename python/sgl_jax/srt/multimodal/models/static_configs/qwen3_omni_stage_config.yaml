@@ -9,7 +9,7 @@ stage_args:
    scheduler: embedding
    final_output: false
    scheduler_params: {}
-   model_class: Qwen3OmniEmbedding
+   model_class: Qwen3OmniMoeThinkerEmbedding
 
  - stage_id: 1
    stage_sub_dir: ""

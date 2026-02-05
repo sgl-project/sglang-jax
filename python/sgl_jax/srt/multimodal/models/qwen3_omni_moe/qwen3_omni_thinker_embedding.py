@@ -11,7 +11,6 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.multimodal.models.qwen3_omni_moe.audio_encoder import (
     Qwen3OmniMoeAudioEncoder,
 )
@@ -311,7 +310,7 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
 
     def __call__(
         self,
-        forward_batch: ForwardBatch,
+        input_ids: jax.Array,
         input_features=None,
         audio_feature_lengths=None,
         pixel_values=None,
@@ -329,10 +328,8 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
                 The length of feature shape of each audio in LLM.
         """
 
-        input_embeds = forward_batch.input_embeds
-        if input_embeds is None:
-            # 1. Extract the input embeddings
-            input_embeds = self.text_embed_tokens(forward_batch.input_ids)
+        # 1. Extract the input embeddings
+        input_embeds = self.text_embed_tokens(input_ids)
 
         visual_embeds_multiscale = None
         visual_pos_masks = None
@@ -366,7 +363,7 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
                 visual_embeds_multiscale = video_embeds_multiscale
 
         image_mask, video_mask, audio_mask = self.get_placeholder_mask(
-            forward_batch.input_ids,
+            input_ids,
             input_embeds=input_embeds,
             image_features=image_embeds,
             video_features=video_embeds,
