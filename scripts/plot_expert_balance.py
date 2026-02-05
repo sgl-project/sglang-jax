@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Plot per-layer expert balance ratios over inference segments.
+Plot per-layer expert balance counts over inference segments.
 
 Input CSV is produced by expert balance debug (expert_balance_*.csv).
-Outputs one PNG per layer with multiple lines: max/mean, min/mean, hot_topk, cold_topk, std/mean.
-Also shades segments that look like Hotspot or Sparse Hotspot (heuristic).
+Outputs one PNG per layer with multiple lines derived from raw expert counts:
+max/min/mean/std plus hot/cold top-k means. Device subplot is derived by
+grouping experts per device.
+Optionally render heatmaps (experts × segments) to visualize balance.
 """
 
 from __future__ import annotations
@@ -42,6 +44,31 @@ def _read_rows(path: str):
     return rows
 
 
+def _decode_counts(row: dict, num_experts: int) -> "np.ndarray":
+    import numpy as np
+
+    counts_str = row.get("experts_count", "")
+    if counts_str:
+        parts = [p for p in counts_str.replace(" ", "").split(",") if p != ""]
+        arr = np.array([int(p) for p in parts], dtype=np.int64)
+    else:
+        b64 = row.get("experts_count_b64", "")
+        if not b64:
+            return np.zeros(num_experts, dtype=np.int64)
+        import base64
+
+        raw = base64.b64decode(b64)
+        arr = np.frombuffer(raw, dtype=np.int32).astype(np.int64)
+
+    if num_experts and arr.size != num_experts:
+        if arr.size > num_experts:
+            return arr[:num_experts]
+        out = np.zeros(num_experts, dtype=np.int64)
+        out[: arr.size] = arr
+        return out
+    return arr
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Plot per-layer expert balance metrics over segments."
@@ -51,6 +78,11 @@ def main():
         "--out-dir",
         default="expert_balance_plots",
         help="Output directory for PNGs.",
+    )
+    parser.add_argument(
+        "--out-prefix",
+        default="",
+        help="Filename prefix for outputs (e.g. 'expert_' or 'device_').",
     )
     parser.add_argument(
         "--layers",
@@ -69,22 +101,78 @@ def main():
         help="Skip segments with has_data=0.",
     )
     parser.add_argument(
-        "--hotspot-hot-multiple-threshold",
-        type=float,
-        default=3.0,
-        help="hot_topk/mean >= threshold => Hotspot.",
+        "--balance-topk",
+        type=int,
+        default=4,
+        help="Top-k size for hot/cold mean counts.",
     )
     parser.add_argument(
-        "--sparse-cold-multiple-threshold",
-        type=float,
-        default=0.1,
-        help="cold_topk/mean <= threshold => Sparse Hotspot (with active ratio check).",
+        "--heatmap",
+        action="store_true",
+        help="Generate per-layer heatmaps (experts × segments).",
     )
     parser.add_argument(
-        "--sparse-active-ratio-threshold",
+        "--heatmap-only",
+        action="store_true",
+        help="Only generate heatmaps (skip line plots).",
+    )
+    parser.add_argument(
+        "--heatmap-max-segments",
+        type=int,
+        default=300,
+        help="Max columns in heatmap; segments will be binned if exceeded.",
+    )
+    parser.add_argument(
+        "--heatmap-bin-size",
+        type=int,
+        default=0,
+        help="Fixed bin size for heatmap (overrides --heatmap-max-segments if >0).",
+    )
+    parser.add_argument(
+        "--heatmap-agg",
+        choices=["mean", "sum"],
+        default="mean",
+        help="Aggregation for binned segments in heatmap.",
+    )
+    parser.add_argument(
+        "--heatmap-normalize",
+        choices=["none", "mean"],
+        default="none",
+        help="Normalize counts by per-segment mean (ratio).",
+    )
+    parser.add_argument(
+        "--heatmap-experts-per-device",
+        type=int,
+        default=0,
+        help="Group experts by this size before heatmap (e.g. 4).",
+    )
+    parser.add_argument(
+        "--heatmap-log",
+        action="store_true",
+        help="Use log1p scale in heatmap.",
+    )
+    parser.add_argument(
+        "--heatmap-vmax-percentile",
         type=float,
-        default=0.9,
-        help="active_experts/num_experts <= threshold => Sparse Hotspot.",
+        default=99.5,
+        help="Clip heatmap vmax to this percentile for better contrast.",
+    )
+    parser.add_argument(
+        "--heatmap-vmin",
+        type=float,
+        default=0.0,
+        help="Heatmap vmin.",
+    )
+    parser.add_argument(
+        "--heatmap-cmap",
+        default="magma",
+        help="Colormap for heatmap.",
+    )
+    parser.add_argument(
+        "--heatmap-discrete-step",
+        type=float,
+        default=0.0,
+        help="If >0, bucket values >=1 by this step; values <1 share one color.",
     )
     parser.add_argument(
         "--dpi",
@@ -115,6 +203,7 @@ def main():
     layers = _parse_layers(args.layers, all_layers)
 
     os.makedirs(args.out_dir, exist_ok=True)
+    out_prefix = args.out_prefix or ""
 
     # Group rows by layer
     by_layer: dict[int, list[dict]] = {layer: [] for layer in layers}
@@ -122,20 +211,11 @@ def main():
         layer = int(r["layer"])
         if layer not in by_layer:
             continue
-        if args.skip_empty and r.get("has_data", "1") in ("0", 0, "false", "False"):
-            continue
+        if args.skip_empty:
+            total = r.get("total_assignments")
+            if total is not None and int(total) == 0:
+                continue
         by_layer[layer].append(r)
-
-    device_cols = {
-        "device_max_over_mean",
-        "device_min_over_mean",
-        "device_cv",
-    }
-    has_device_metrics = all(col in rows[0] for col in device_cols)
-    has_device_hotcold = (
-        "device_hot_topk_mean_multiple" in rows[0] and "device_cold_topk_mean_multiple" in rows[0]
-    )
-    has_device_mean = "device_mean_count" in rows[0]
 
     for layer, layer_rows in by_layer.items():
         if not layer_rows:
@@ -151,17 +231,141 @@ def main():
         else:
             x = [(idx * seg_tokens) if args.x_axis == "tokens" else idx for idx in seg_idx]
             x_label = "tokens" if args.x_axis == "tokens" else "segment_idx"
-        mean_count = [float(r["mean_count"]) for r in layer_rows]
-        min_count = [float(r["min_count"]) for r in layer_rows]
-        max_count = [float(r["max_count"]) for r in layer_rows]
-        hot_mult = [float(r["hot_topk_mean_multiple"]) for r in layer_rows]
-        cold_mult = [float(r["cold_topk_mean_multiple"]) for r in layer_rows]
-        active_experts = [int(r["active_experts"]) for r in layer_rows]
         num_experts = int(layer_rows[0]["num_experts"])
-
-        layer_has_device = has_device_metrics and any(
-            r.get("device_has_data", "0") not in ("0", 0, "false", "False") for r in layer_rows
+        ep_size = int(layer_rows[0].get("ep_size", "0") or 0)
+        experts_per_device = (
+            (num_experts // ep_size) if ep_size > 0 and num_experts % ep_size == 0 else None
         )
+
+        layer_has_device = experts_per_device is not None and experts_per_device > 0
+
+        if args.heatmap:
+            import numpy as np
+
+            seg_count = len(layer_rows)
+            bin_size = args.heatmap_bin_size if args.heatmap_bin_size > 0 else 0
+            if bin_size <= 0 and seg_count > args.heatmap_max_segments:
+                bin_size = int(np.ceil(seg_count / args.heatmap_max_segments))
+            if bin_size <= 0:
+                bin_size = 1
+
+            bins = []
+            group_size = args.heatmap_experts_per_device
+            grouped = False
+            num_groups = num_experts
+            if group_size and group_size > 0:
+                num_groups = num_experts // group_size
+                if num_groups == 0:
+                    num_groups = 1
+                if num_experts % group_size != 0:
+                    print(
+                        f"[heatmap] layer {layer}: num_experts={num_experts} "
+                        f"not divisible by group_size={group_size}, truncating."
+                    )
+                grouped = True
+
+            for i in range(0, seg_count, bin_size):
+                chunk = layer_rows[i : i + bin_size]
+                counts_list = [_decode_counts(r, num_experts) for r in chunk]
+                if not counts_list:
+                    continue
+                mat = np.stack(counts_list, axis=1)  # experts × steps
+                if grouped and group_size > 0:
+                    usable = num_groups * group_size
+                    mat = mat[:usable, :]
+                    mat = mat.reshape(num_groups, group_size, mat.shape[1]).sum(axis=1)
+                if args.heatmap_normalize == "mean":
+                    means = []
+                    for r in chunk:
+                        total = int(r.get("total_assignments", 0) or 0)
+                        denom = num_groups if grouped else num_experts
+                        means.append((total / denom) if denom > 0 else 0.0)
+                    mean_arr = np.array(means, dtype=np.float64)
+                    mean_arr[mean_arr <= 0] = 1.0
+                    mat = mat / mean_arr[None, :]
+                if args.heatmap_agg == "sum":
+                    agg = mat.sum(axis=1)
+                else:
+                    agg = mat.mean(axis=1)
+                bins.append(agg)
+
+            if bins:
+                heat = np.stack(bins, axis=1)  # experts × binned segments
+                use_log = args.heatmap_log
+                if args.heatmap_discrete_step > 0 and args.heatmap_normalize == "mean":
+                    use_log = False
+                if use_log:
+                    heat = np.log1p(heat)
+                vmax = None
+                if heat.size:
+                    vmax = float(np.percentile(heat, args.heatmap_vmax_percentile))
+                    if vmax <= args.heatmap_vmin:
+                        vmax = None
+
+                fig = plt.figure(figsize=(13, 6))
+                gs = fig.add_gridspec(nrows=1, ncols=2, width_ratios=[4, 1])
+                ax_hm = fig.add_subplot(gs[0, 0])
+                ax_note = fig.add_subplot(gs[0, 1])
+                if args.heatmap_discrete_step > 0 and args.heatmap_normalize == "mean":
+                    import numpy as np
+                    from matplotlib import colors
+
+                    step = args.heatmap_discrete_step
+                    upper = float(np.max(heat)) if heat.size else 1.0
+                    upper = max(upper, 1.0 + step)
+                    boundaries = [0.0, 1.0]
+                    val = 1.0 + step
+                    while val < upper + step * 0.5:
+                        boundaries.append(val)
+                        val += step
+                    cmap = plt.get_cmap(args.heatmap_cmap, len(boundaries) - 1)
+                    norm = colors.BoundaryNorm(boundaries, cmap.N, clip=True)
+                    im = ax_hm.imshow(
+                        heat,
+                        aspect="auto",
+                        origin="lower",
+                        interpolation="nearest",
+                        cmap=cmap,
+                        norm=norm,
+                    )
+                else:
+                    im = ax_hm.imshow(
+                        heat,
+                        aspect="auto",
+                        origin="lower",
+                        interpolation="nearest",
+                        vmin=args.heatmap_vmin,
+                        vmax=vmax,
+                        cmap=args.heatmap_cmap,
+                    )
+                ax_hm.set_title(f"Layer {layer} - expert heatmap")
+                ax_hm.set_xlabel("segment_bin")
+                ax_hm.set_ylabel("device_idx" if grouped else "expert_idx")
+                cbar = fig.colorbar(im, ax=ax_hm, fraction=0.046, pad=0.04)
+                if args.heatmap_normalize == "mean":
+                    cbar.set_label("x mean", rotation=90)
+                else:
+                    cbar.set_label("count", rotation=90)
+                ax_note.axis("off")
+                note = (
+                    f"segments={seg_count}\n"
+                    f"bin_size={bin_size}\n"
+                    f"agg={args.heatmap_agg}\n"
+                    f"normalize={args.heatmap_normalize}\n"
+                    f"log1p={use_log}\n"
+                    f"vmax_p={args.heatmap_vmax_percentile}\n"
+                    f"cmap={args.heatmap_cmap}\n"
+                    f"group_size={group_size if grouped else 1}\n"
+                    f"step={args.heatmap_discrete_step}"
+                )
+                ax_note.text(0.0, 1.0, note, ha="left", va="top", fontsize=8)
+                fig.tight_layout()
+                out_path = os.path.join(args.out_dir, f"{out_prefix}layer_{layer:03d}_heatmap.png")
+                fig.savefig(out_path, dpi=args.dpi)
+                plt.close(fig)
+
+            if args.heatmap_only:
+                continue
         if layer_has_device:
             fig = plt.figure(figsize=(13, 7))
             gs = fig.add_gridspec(nrows=2, ncols=2, width_ratios=[4, 1], height_ratios=[1, 1])
@@ -174,45 +378,66 @@ def main():
             ax_exp = fig.add_subplot(gs[0, 0])
             ax_dev = None
             ax_note = fig.add_subplot(gs[0, 1])
-        std_count = [float(r["std_count"]) for r in layer_rows]
-        hot_counts = [hm * mu for hm, mu in zip(hot_mult, mean_count)]
-        cold_counts = [cm * mu for cm, mu in zip(cold_mult, mean_count)]
+        mean_count = []
+        min_count = []
+        max_count = []
+        std_count = []
+        hot_counts = []
+        cold_counts = []
+        dev_mean = []
+        dev_min = []
+        dev_max = []
+        dev_std = []
+        dev_hot_counts = []
+        dev_cold_counts = []
+
+        k_exp = max(1, min(args.balance_topk, num_experts))
+        k_dev = (
+            max(1, min(args.balance_topk, ep_size)) if layer_has_device and ep_size > 0 else None
+        )
+
+        for r in layer_rows:
+            counts = _decode_counts(r, num_experts)
+            total = int(r.get("total_assignments", counts.sum()) or 0)
+            mu = (total / num_experts) if num_experts > 0 else 0.0
+            mean_count.append(mu)
+            min_count.append(float(counts.min()) if counts.size else 0.0)
+            max_count.append(float(counts.max()) if counts.size else 0.0)
+            std_count.append(float(counts.std()) if counts.size else 0.0)
+            if counts.size:
+                sorted_counts = counts if counts.size == 1 else counts.copy()
+                if counts.size > 1:
+                    sorted_counts.sort()
+                hot_counts.append(float(sorted_counts[-k_exp:].mean()))
+                cold_counts.append(float(sorted_counts[:k_exp].mean()))
+            else:
+                hot_counts.append(0.0)
+                cold_counts.append(0.0)
+
+            if layer_has_device and experts_per_device is not None:
+                dev_counts = counts.reshape(ep_size, experts_per_device).sum(axis=1)
+                dev_total = int(dev_counts.sum())
+                dev_mu = (dev_total / ep_size) if ep_size > 0 else 0.0
+                dev_mean.append(dev_mu)
+                dev_min.append(float(dev_counts.min()) if dev_counts.size else 0.0)
+                dev_max.append(float(dev_counts.max()) if dev_counts.size else 0.0)
+                dev_std.append(float(dev_counts.std()) if dev_counts.size else 0.0)
+                if dev_counts.size:
+                    dev_sorted = dev_counts if dev_counts.size == 1 else dev_counts.copy()
+                    if dev_counts.size > 1:
+                        dev_sorted.sort()
+                    dev_hot_counts.append(float(dev_sorted[-k_dev:].mean()))
+                    dev_cold_counts.append(float(dev_sorted[:k_dev].mean()))
+                else:
+                    dev_hot_counts.append(0.0)
+                    dev_cold_counts.append(0.0)
+
         ax_exp.plot(x, max_count, label="max_count")
         ax_exp.plot(x, min_count, label="min_count")
         ax_exp.plot(x, hot_counts, label="hot_topk_mean_count")
         ax_exp.plot(x, cold_counts, label="cold_topk_mean_count")
         ax_exp.plot(x, mean_count, label="mean_count")
         ax_exp.plot(x, std_count, label="std_count")
-
-        active_ratio = [ae / num_experts for ae in active_experts]
-        sparse_flags = [
-            (ar <= args.sparse_active_ratio_threshold)
-            and (cm <= args.sparse_cold_multiple_threshold)
-            for ar, cm in zip(active_ratio, cold_mult)
-        ]
-        hotspot_flags = [(hm >= args.hotspot_hot_multiple_threshold) for hm in hot_mult]
-
-        def _shade(flags, color, label):
-            if not any(flags):
-                return
-            start = None
-            for i, flag in enumerate(flags + [False]):
-                if flag and start is None:
-                    start = i
-                if start is not None and not flag:
-                    if args.x_axis == "tokens":
-                        x0 = seg_idx[start] * seg_tokens
-                        x1 = (seg_idx[i - 1] + 1) * seg_tokens
-                    else:
-                        x0 = seg_idx[start] - 0.5
-                        x1 = seg_idx[i - 1] + 0.5
-                    ax_exp.axvspan(x0, x1, color=color, alpha=0.12, label=label)
-                    start = None
-
-        enable_shading = False
-        if enable_shading:
-            _shade(hotspot_flags, "#f6a600", "Hotspot")
-            _shade(sparse_flags, "#d9534f", "Sparse Hotspot")
 
         ax_exp.set_title(f"Layer {layer} - expert level")
         ax_exp.set_ylabel("count")
@@ -230,21 +455,12 @@ def main():
         ax_exp.legend(uniq_handles, uniq_labels, loc="upper right")
 
         if ax_dev is not None:
-            dev_mean = [float(r["device_mean_count"]) for r in layer_rows]
-            dev_std = [float(r["device_std_count"]) for r in layer_rows]
-            dev_max = [float(r["device_max_count"]) for r in layer_rows]
-            dev_min = [float(r["device_min_count"]) for r in layer_rows]
             ax_dev.plot(x, dev_max, label="device max_count")
             ax_dev.plot(x, dev_min, label="device min_count")
             ax_dev.plot(x, dev_mean, label="device mean_count")
             ax_dev.plot(x, dev_std, label="device std_count")
-            if has_device_hotcold:
-                dev_hot_mult = [float(r["device_hot_topk_mean_multiple"]) for r in layer_rows]
-                dev_cold_mult = [float(r["device_cold_topk_mean_multiple"]) for r in layer_rows]
-                dev_hot_cnt = [m * mu for m, mu in zip(dev_hot_mult, dev_mean)]
-                dev_cold_cnt = [m * mu for m, mu in zip(dev_cold_mult, dev_mean)]
-                ax_dev.plot(x, dev_hot_cnt, label="device hot_topk_mean_count")
-                ax_dev.plot(x, dev_cold_cnt, label="device cold_topk_mean_count")
+            ax_dev.plot(x, dev_hot_counts, label="device hot_topk_mean_count")
+            ax_dev.plot(x, dev_cold_counts, label="device cold_topk_mean_count")
             ax_dev.set_title(f"Layer {layer} - device level")
             ax_dev.set_ylabel("count")
             ax_dev.grid(True, alpha=0.3)
@@ -253,15 +469,18 @@ def main():
         ax_exp.set_xlabel(x_label)
         ax_note.axis("off")
         note = (
-            "Counts:\n"
+            "Counts (derived from experts_count):\n"
             "max/min/mean/std counts\n"
             "hot_topk_mean_count = avg top‑k counts\n"
             "cold_topk_mean_count = avg coldest top‑k\n"
-            "Device subplot (if present):\n"
-            "device max/min/mean/std counts"
+            f"topk = {k_exp}\n"
         )
-        if has_device_hotcold:
-            note += "\n+ device hot/cold top‑k mean counts"
+        if layer_has_device:
+            note += (
+                "\nDevice subplot (derived by grouping experts):\n"
+                "device max/min/mean/std counts\n"
+                "device hot/cold top‑k mean counts"
+            )
         ax_note.text(
             0.0,
             1.0,
@@ -272,7 +491,7 @@ def main():
         )
         fig.tight_layout()
 
-        out_path = os.path.join(args.out_dir, f"layer_{layer:03d}.png")
+        out_path = os.path.join(args.out_dir, f"{out_prefix}layer_{layer:03d}.png")
         fig.savefig(out_path, dpi=args.dpi)
         plt.close(fig)
 

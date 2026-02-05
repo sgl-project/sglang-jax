@@ -229,7 +229,11 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
                 return
             if self._balance_analyzer.segment_by == "decode_steps":
                 if model_worker_batch.forward_mode.is_decode():
-                    self._balance_analyzer.add_decode_step(topk_ids_cpu, model_worker_batch.real_bs)
+                    self._balance_analyzer.add_decode_step(
+                        topk_ids_cpu,
+                        model_worker_batch.per_dp_real_bs,
+                        model_worker_batch.per_dp_bs_size,
+                    )
             else:
                 unpadded_input_len = model_worker_batch.get_original_input_len()
                 self._balance_analyzer.add_topk_ids(topk_ids_cpu, unpadded_input_len)
@@ -310,6 +314,8 @@ class _ExpertBalanceAnalyzer:
         self._segment_progress = 0
         self._segment_idx = 0
         self._lock = threading.Lock()
+        self._segment_decode_steps = 0
+        self._segment_padding_tokens_sum = 0
 
         self._device_metrics_enabled = False
         self._experts_per_device = None
@@ -331,34 +337,14 @@ class _ExpertBalanceAnalyzer:
             "segment_idx",
             "segment_tokens",
             "segment_by",
+            "segment_decode_steps",
+            "avg_padding_tokens",
             "layer",
             "num_experts",
             "topk",
+            "ep_size",
             "total_assignments",
-            "active_experts",
-            "mean_count",
-            "std_count",
-            "cv",
-            "min_count",
-            "max_count",
-            "entropy",
-            "gini",
-            "hot_topk_mean_multiple",
-            "cold_topk_mean_multiple",
-            "device_active",
-            "device_mean_count",
-            "device_std_count",
-            "device_cv",
-            "device_min_count",
-            "device_max_count",
-            "device_max_over_mean",
-            "device_min_over_mean",
-            "device_entropy",
-            "device_gini",
-            "device_hot_topk_mean_multiple",
-            "device_cold_topk_mean_multiple",
-            "device_has_data",
-            "has_data",
+            "experts_count",
         ]
         self._file = None
         self._writer = None
@@ -421,22 +407,34 @@ class _ExpertBalanceAnalyzer:
                     self._segment_progress = 0
                     self._segment_idx += 1
 
-    def add_decode_step(self, topk_ids_cpu: list[np.ndarray], valid_tokens: int):
+    def add_decode_step(
+        self, topk_ids_cpu: list[np.ndarray], valid_tokens: list[int], per_dp_bs_size: int
+    ):
         with self._lock:
+            self._segment_decode_steps += 1
+            if valid_tokens:
+                total_padded = int(per_dp_bs_size * len(valid_tokens))
+                self._segment_padding_tokens_sum += total_padded
+
             for layer_idx, ids_cpu in enumerate(topk_ids_cpu):
                 if ids_cpu is None:
                     continue
-                ids_chunk = ids_cpu[:valid_tokens, : self.topk]
-                if ids_chunk.size == 0:
-                    continue
-                flat = ids_chunk.reshape(-1)
-                if flat.size == 0:
-                    continue
-                valid = flat[flat >= 0]
-                if valid.size == 0:
-                    continue
-                counts = np.bincount(valid, minlength=self.num_experts)
-                self._counts[layer_idx] += counts
+                for dp_rank, dp_real_bs in enumerate(valid_tokens):
+                    if dp_real_bs <= 0:
+                        continue
+                    start = dp_rank * per_dp_bs_size
+                    end = start + min(dp_real_bs, per_dp_bs_size)
+                    ids_chunk = ids_cpu[start:end, : self.topk]
+                    if ids_chunk.size == 0:
+                        continue
+                    flat = ids_chunk.reshape(-1)
+                    if flat.size == 0:
+                        continue
+                    valid = flat[flat >= 0]
+                    if valid.size == 0:
+                        continue
+                    counts = np.bincount(valid, minlength=self.num_experts)
+                    self._counts[layer_idx] += counts
 
             self._segment_progress += 1
             if self._segment_progress >= self.segment_tokens:
@@ -444,6 +442,8 @@ class _ExpertBalanceAnalyzer:
                 self._counts.fill(0)
                 self._segment_progress = 0
                 self._segment_idx += 1
+                self._segment_decode_steps = 0
+                self._segment_padding_tokens_sum = 0
 
     def _flush_segment(self):
         timestamp = datetime.datetime.now().isoformat(timespec="seconds")
@@ -451,99 +451,24 @@ class _ExpertBalanceAnalyzer:
         for layer_idx in range(self.num_layers):
             counts = self._counts[layer_idx]
             total = int(counts.sum())
-            has_data = 1 if total > 0 else 0
-            if total > 0:
-                mean = total / self.num_experts
-                std = float(np.std(counts))
-                cv = float(std / mean) if mean > 0 else 0.0
-                min_count = int(counts.min())
-                max_count = int(counts.max())
-                active = int(np.count_nonzero(counts))
-                probs = counts.astype(np.float64) / float(total)
-                probs = probs[probs > 0]
-                entropy = float(-(probs * np.log(probs)).sum())
-                gini = float(_gini_from_counts(counts))
-                k = min(self.topk, self.num_experts)
-                if k <= 0 or mean <= 0:
-                    hot_multiple = 0.0
-                    cold_multiple = 0.0
-                else:
-                    hot = np.partition(counts, -k)[-k:]
-                    cold = np.partition(counts, k - 1)[:k]
-                    hot_multiple = float(hot.mean() / mean)
-                    cold_multiple = float(cold.mean() / mean)
-            else:
-                mean = std = cv = entropy = gini = 0.0
-                hot_multiple = cold_multiple = 0.0
-                min_count = max_count = active = 0
-
-            device_active = 0
-            device_mean = device_std = device_cv = 0.0
-            device_min = device_max = 0
-            device_max_over_mean = device_min_over_mean = 0.0
-            device_entropy = device_gini = 0.0
-            device_hot_multiple = device_cold_multiple = 0.0
-            device_has_data = 0
-            if self._device_metrics_enabled and total > 0:
-                device_counts = counts.reshape(self.ep_size, self._experts_per_device).sum(axis=1)
-                device_total = int(device_counts.sum())
-                if device_total > 0:
-                    device_has_data = 1
-                    device_mean = device_total / self.ep_size
-                    device_std = float(np.std(device_counts))
-                    device_cv = float(device_std / device_mean) if device_mean > 0 else 0.0
-                    device_min = int(device_counts.min())
-                    device_max = int(device_counts.max())
-                    device_active = int(np.count_nonzero(device_counts))
-                    device_max_over_mean = (
-                        float(device_max / device_mean) if device_mean > 0 else 0.0
-                    )
-                    device_min_over_mean = (
-                        float(device_min / device_mean) if device_mean > 0 else 0.0
-                    )
-                    probs = device_counts.astype(np.float64) / float(device_total)
-                    probs = probs[probs > 0]
-                    device_entropy = float(-(probs * np.log(probs)).sum())
-                    device_gini = float(_gini_from_counts(device_counts))
-                    k_dev = min(self.device_balance_topk, self.ep_size)
-                    if k_dev > 0 and device_mean > 0:
-                        hot_dev = np.partition(device_counts, -k_dev)[-k_dev:]
-                        cold_dev = np.partition(device_counts, k_dev - 1)[:k_dev]
-                        device_hot_multiple = float(hot_dev.mean() / device_mean)
-                        device_cold_multiple = float(cold_dev.mean() / device_mean)
+            experts_count = ",".join(map(str, counts.tolist()))
             row = [
                 timestamp,
                 self._segment_idx,
                 self.segment_tokens,
                 self.segment_by,
+                self._segment_decode_steps,
+                (
+                    self._segment_padding_tokens_sum / self._segment_decode_steps
+                    if self._segment_decode_steps > 0
+                    else 0
+                ),
                 layer_idx,
                 self.num_experts,
                 self.topk,
+                self.ep_size,
                 total,
-                active,
-                f"{mean:.6f}",
-                f"{std:.6f}",
-                f"{cv:.6f}",
-                min_count,
-                max_count,
-                f"{entropy:.6f}",
-                f"{gini:.6f}",
-                f"{hot_multiple:.6f}",
-                f"{cold_multiple:.6f}",
-                device_active,
-                f"{device_mean:.6f}",
-                f"{device_std:.6f}",
-                f"{device_cv:.6f}",
-                device_min,
-                device_max,
-                f"{device_max_over_mean:.6f}",
-                f"{device_min_over_mean:.6f}",
-                f"{device_entropy:.6f}",
-                f"{device_gini:.6f}",
-                f"{device_hot_multiple:.6f}",
-                f"{device_cold_multiple:.6f}",
-                device_has_data,
-                has_data,
+                experts_count,
             ]
             try:
                 self._writer.writerow(row)

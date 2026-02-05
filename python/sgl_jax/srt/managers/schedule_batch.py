@@ -1633,6 +1633,7 @@ class ScheduleBatch:
 
         offset_bs = 0
         real_bs = 0
+        per_dp_real_bs = [0] * self.dp_size
 
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
@@ -1645,6 +1646,7 @@ class ScheduleBatch:
             # Get data from this DP rank
             dp_bs = len(info.seq_lens)
             real_bs += dp_bs
+            per_dp_real_bs[dp_rank] = dp_bs
 
             # Copy batch metadata
             req_pool_indices_cpu[offset_bs : offset_bs + dp_bs] = info.req_pool_indices
@@ -1676,6 +1678,7 @@ class ScheduleBatch:
             extend_seq_lens,
             extend_logprob_start_lens,
             logits_indices,
+            per_dp_real_bs,
             real_bs,
         )
 
@@ -1857,6 +1860,7 @@ class ScheduleBatch:
             extend_seq_lens,
             extend_logprob_start_lens,
             logits_indices,
+            per_dp_real_bs,
             real_bs,
         ) = self._merge_batch_metadata(per_dp_bs_padding, total_bs)
 
@@ -1926,6 +1930,7 @@ class ScheduleBatch:
             logits_indices=logits_indices,
             lora_ids=lora_ids,
             real_bs=real_bs,
+            per_dp_real_bs=per_dp_real_bs,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL if self.return_hidden_states else CaptureHiddenMode.NULL
             ),
@@ -2473,6 +2478,7 @@ class ModelWorkerBatch:
 
     # For padding
     real_bs: int
+    per_dp_real_bs: list[int] | None
 
     # For Data Parallelism
     dp_size: int = 1

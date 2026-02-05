@@ -423,6 +423,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                 )
                 topk_ids = None
             else:
+                router_logits = jax.sharding.reshard(router_logits, P())
                 topk_weights, topk_ids = self.topk(router_logits, correction_bias)
                 hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
 
