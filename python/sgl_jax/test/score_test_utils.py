@@ -32,10 +32,7 @@ import jax
 from transformers import AutoTokenizer
 
 from sgl_jax.srt.entrypoints.engine import Engine
-from sgl_jax.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    CustomTestCase,
-)
+from sgl_jax.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
 # =============================================================================
 # Configuration
