@@ -8,6 +8,7 @@ from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import RMSNorm
@@ -246,6 +247,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
                 self.topk = TopK(
                     topk=num_experts_per_tok,
                     renormalize=config.norm_topk_prob,
+                    layer_id=layer_id,
                 )
                 self.mlp = EPMoE(
                     hidden_size=config.hidden_size,
@@ -279,6 +281,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
+        dispatch_info: ExpertLocationMetadata | None = None,
     ):
         if residual is None:
             residual = hidden_states
@@ -309,7 +312,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
                 )
                 topk_ids = None
             else:
-                topk_weights, topk_ids = self.topk(router_logits)
+                topk_weights, topk_ids = self.topk(router_logits, dispatch_info=dispatch_info)
                 hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
         else:
             hidden_states = self.mlp(hidden_states)
@@ -372,6 +375,7 @@ class QWen3MoeModel(nnx.Module):
                 forward_batch,
                 token_to_kv_pool,
                 residual,
+                dispatch_info=forward_batch.expert_location_metadata,
             )
             layers_kv_fused.append(kv_fused)
             layers_topk_ids.append(topk_ids)
@@ -558,6 +562,7 @@ class Qwen3MoeForCausalLM(nnx.Module):
                 moe_backend=moe_backend,
                 moe_path="mlp",
                 source_expert_pattern="experts.{i}",
+                layer_id=layer_idx,
             )
             mappings.update(moe_mappings)
 
@@ -596,7 +601,8 @@ class Qwen3MoeForCausalLM(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         hidden_states, layers_kv_fused, layers_topk_ids = self.model(
-            forward_batch, token_to_kv_pool
+            forward_batch,
+            token_to_kv_pool,
         )
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)

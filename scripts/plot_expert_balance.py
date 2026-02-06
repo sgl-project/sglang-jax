@@ -222,15 +222,9 @@ def main():
             continue
         layer_rows.sort(key=lambda x: int(x["segment_idx"]))
 
-        seg_tokens = int(layer_rows[0]["segment_tokens"])
-        seg_by = layer_rows[0].get("segment_by", "tokens")
         seg_idx = [int(r["segment_idx"]) for r in layer_rows]
-        if args.x_axis == "tokens" and seg_by != "tokens":
-            x = seg_idx
-            x_label = "segment_idx"
-        else:
-            x = [(idx * seg_tokens) if args.x_axis == "tokens" else idx for idx in seg_idx]
-            x_label = "tokens" if args.x_axis == "tokens" else "segment_idx"
+        x = seg_idx
+        x_label = "segment_idx"
         num_experts = int(layer_rows[0]["num_experts"])
         ep_size = int(layer_rows[0].get("ep_size", "0") or 0)
         experts_per_device = (
@@ -327,6 +321,8 @@ def main():
                         interpolation="nearest",
                         cmap=cmap,
                         norm=norm,
+                        vmin=None,
+                        vmax=None,
                     )
                 else:
                     im = ax_hm.imshow(

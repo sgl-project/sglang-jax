@@ -41,12 +41,14 @@ class RoutedExpertsCapturer(ABC):
         ep_size: int,
         *,
         enable_balance_debug: bool = False,
-        balance_segment_tokens: int = 100,
+        balance_segment_counter: int = 100,
         balance_output_file: str | None = None,
-        balance_segment_by: str = "decode_steps",
-        device_balance_topk: int = 4,
+        enable_dist_recorder: bool = False,
+        dist_recorder_buffer_size: int = 100,
+        dist_recorder_output_file: str | None = None,
+        physical_expert_counts: int = 256,
     ):
-        if enable or enable_balance_debug:
+        if enable or enable_balance_debug or enable_dist_recorder:
             return _RoutedExpertsCapturerReal(
                 model_config,
                 num_tokens=num_tokens,
@@ -54,10 +56,12 @@ class RoutedExpertsCapturer(ABC):
                 ep_size=ep_size,
                 enable_host_buffer=enable,
                 enable_balance_debug=enable_balance_debug,
-                balance_segment_tokens=balance_segment_tokens,
+                balance_segment_counter=balance_segment_counter,
                 balance_output_file=balance_output_file,
-                balance_segment_by=balance_segment_by,
-                device_balance_topk=device_balance_topk,
+                enable_dist_recorder=enable_dist_recorder,
+                dist_recorder_buffer_size=dist_recorder_buffer_size,
+                dist_recorder_output_file=dist_recorder_output_file,
+                physical_expert_counts=physical_expert_counts,
             )
         else:
             return _RoutedExpertsCapturerNoop()
@@ -84,6 +88,10 @@ class RoutedExpertsCapturer(ABC):
     def on_forward_end(self, topk_ids: list[jax.Array], model_worker_batch: ModelWorkerBatch):
         raise NotImplementedError
 
+    @abstractmethod
+    def reset(self):
+        raise NotImplementedError
+
 
 class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
     """Capturer for routed experts with host buffer"""
@@ -97,10 +105,12 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         *,
         enable_host_buffer: bool,
         enable_balance_debug: bool,
-        balance_segment_tokens: int,
+        balance_segment_counter: int,
         balance_output_file: str | None,
-        balance_segment_by: str,
-        device_balance_topk: int,
+        enable_dist_recorder: bool,
+        dist_recorder_buffer_size: int,
+        dist_recorder_output_file: str | None,
+        physical_expert_counts: int,
     ):
         self.enable_host_buffer = enable_host_buffer
         self.num_hidden_layers = model_config.hf_text_config.num_hidden_layers
@@ -127,15 +137,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
 
         self._balance_analyzer = None
         if enable_balance_debug:
-            num_experts = getattr(model_config.hf_text_config, "num_experts", None)
-            if num_experts is None:
-                num_experts = getattr(model_config.hf_text_config, "num_local_experts", None)
-            if num_experts is None:
-                logger.warning(
-                    "Expert balance debug enabled, but num_experts is missing in model config. "
-                    "Disabling expert balance debug."
-                )
-            elif not balance_output_file:
+            if not balance_output_file:
                 logger.warning(
                     "Expert balance debug enabled, but output file is not set. "
                     "Disabling expert balance debug."
@@ -143,14 +145,28 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             else:
                 self._balance_analyzer = _ExpertBalanceAnalyzer(
                     num_layers=self.num_hidden_layers,
-                    num_experts=num_experts,
+                    num_experts=physical_expert_counts,
                     topk=self.num_experts_per_tok,
                     ep_size=ep_size,
-                    segment_tokens=balance_segment_tokens,
+                    segment_counter=balance_segment_counter,
                     output_file=balance_output_file,
-                    segment_by=balance_segment_by,
-                    device_balance_topk=device_balance_topk,
                 )
+
+        self._dist_recorder = None
+        if enable_dist_recorder:
+            if not dist_recorder_output_file:
+                logger.warning(
+                    "Expert distribution recorder enabled, but output file is not set. "
+                    "Disabling recorder."
+                )
+            else:
+                self._dist_recorder = _ExpertDistributionRecorder(
+                    num_layers=self.num_hidden_layers,
+                    buffer_size=dist_recorder_buffer_size,
+                    output_file=dist_recorder_output_file,
+                    physical_expert_counts=physical_expert_counts,
+                )
+
         self._balance_missing_topk_warned = False
         self.bid = None
 
@@ -164,9 +180,8 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             )
         if self._balance_analyzer is not None:
             logger.info(
-                "Expert balance debug enabled. Segment size: %d (%s), output: %s",
-                self._balance_analyzer.segment_tokens,
-                self._balance_analyzer.segment_by,
+                "Expert balance debug enabled. Segment size: %d, output: %s",
+                self._balance_analyzer.segment_counter,
                 self._balance_analyzer.output_file,
             )
 
@@ -227,16 +242,26 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
                     )
                     self._balance_missing_topk_warned = True
                 return
-            if self._balance_analyzer.segment_by == "decode_steps":
-                if model_worker_batch.forward_mode.is_decode():
-                    self._balance_analyzer.add_decode_step(
-                        topk_ids_cpu,
-                        model_worker_batch.per_dp_real_bs,
-                        model_worker_batch.per_dp_bs_size,
-                    )
-            else:
-                unpadded_input_len = model_worker_batch.get_original_input_len()
-                self._balance_analyzer.add_topk_ids(topk_ids_cpu, unpadded_input_len)
+            if model_worker_batch.forward_mode.is_decode():
+                self._balance_analyzer.add_decode_step(
+                    topk_ids_cpu,
+                    model_worker_batch.per_dp_real_bs,
+                    model_worker_batch.per_dp_bs_size,
+                )
+        if self._dist_recorder is not None:
+            self._dist_recorder.add_topk_ids(
+                topk_ids_cpu,
+                model_worker_batch.per_dp_real_bs,
+                model_worker_batch.per_dp_bs_size,
+            )
+
+    def reset(self):
+        if self._balance_analyzer is not None:
+            # Note: _ExpertBalanceAnalyzer doesn't have a reset but it fills 0 on flush.
+            # We could add one if needed.
+            pass
+        if self._dist_recorder is not None:
+            self._dist_recorder.reset()
 
 
 class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
@@ -260,6 +285,9 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
         pass
 
     def on_forward_end(self, topk_ids: list[jax.Array], model_worker_batch: ModelWorkerBatch):
+        pass
+
+    def reset(self):
         pass
 
 
@@ -296,19 +324,15 @@ class _ExpertBalanceAnalyzer:
         num_experts: int,
         topk: int,
         ep_size: int,
-        segment_tokens: int,
+        segment_counter: int,
         output_file: str,
-        segment_by: str,
-        device_balance_topk: int,
     ):
         self.num_layers = num_layers
-        self.num_experts = num_experts
+        self.num_experts = num_experts  # use physical expert counts
         self.topk = topk
         self.ep_size = ep_size
-        self.segment_tokens = segment_tokens
-        self.segment_by = segment_by
+        self.segment_counter = segment_counter
         self.output_file = output_file
-        self.device_balance_topk = device_balance_topk
 
         self._counts = np.zeros((num_layers, num_experts), dtype=np.int64)
         self._segment_progress = 0
@@ -335,8 +359,7 @@ class _ExpertBalanceAnalyzer:
         self._header = [
             "timestamp",
             "segment_idx",
-            "segment_tokens",
-            "segment_by",
+            "segment_counter",
             "segment_decode_steps",
             "avg_padding_tokens",
             "layer",
@@ -374,39 +397,6 @@ class _ExpertBalanceAnalyzer:
             )
             self._open_writer(write_header=True)
 
-    def add_topk_ids(self, topk_ids_cpu: list[np.ndarray], num_tokens: int):
-        if num_tokens <= 0:
-            return
-        offset = 0
-        with self._lock:
-            while offset < num_tokens:
-                take = min(num_tokens - offset, self.segment_tokens - self._segment_progress)
-                if take <= 0:
-                    break
-                for layer_idx, ids_cpu in enumerate(topk_ids_cpu):
-                    if ids_cpu is None:
-                        continue
-                    ids_chunk = ids_cpu[offset : offset + take, : self.topk]
-                    if ids_chunk.size == 0:
-                        continue
-                    flat = ids_chunk.reshape(-1)
-                    if flat.size == 0:
-                        continue
-                    valid = flat[flat >= 0]
-                    if valid.size == 0:
-                        continue
-                    counts = np.bincount(valid, minlength=self.num_experts)
-                    self._counts[layer_idx] += counts
-
-                self._segment_progress += take
-                offset += take
-
-                if self._segment_progress >= self.segment_tokens:
-                    self._flush_segment()
-                    self._counts.fill(0)
-                    self._segment_progress = 0
-                    self._segment_idx += 1
-
     def add_decode_step(
         self, topk_ids_cpu: list[np.ndarray], valid_tokens: list[int], per_dp_bs_size: int
     ):
@@ -437,7 +427,7 @@ class _ExpertBalanceAnalyzer:
                     self._counts[layer_idx] += counts
 
             self._segment_progress += 1
-            if self._segment_progress >= self.segment_tokens:
+            if self._segment_progress >= self.segment_counter:
                 self._flush_segment()
                 self._counts.fill(0)
                 self._segment_progress = 0
@@ -455,8 +445,7 @@ class _ExpertBalanceAnalyzer:
             row = [
                 timestamp,
                 self._segment_idx,
-                self.segment_tokens,
-                self.segment_by,
+                self.segment_counter,
                 self._segment_decode_steps,
                 (
                     self._segment_padding_tokens_sum / self._segment_decode_steps
@@ -498,12 +487,96 @@ class _ExpertBalanceAnalyzer:
             self._open_writer(write_header=True)
 
 
-def _gini_from_counts(counts: np.ndarray) -> float:
-    total = counts.sum()
-    if total <= 0:
-        return 0.0
-    sorted_counts = np.sort(counts.astype(np.float64))
-    n = sorted_counts.size
-    cumulative = np.cumsum(sorted_counts)
-    gini = (n + 1 - 2 * np.sum(cumulative) / cumulative[-1]) / n
-    return float(max(0.0, min(1.0, gini)))
+class _ExpertDistributionRecorder:
+    def __init__(
+        self,
+        *,
+        num_layers: int,
+        buffer_size: int,
+        output_file: str,
+        physical_expert_counts: int,
+    ):
+        self.num_layers = num_layers
+        self.buffer_size = buffer_size
+        self.output_file = output_file
+        self.physical_expert_counts = physical_expert_counts
+
+        self._physical_counts = np.zeros(
+            (self.num_layers, self.physical_expert_counts), dtype=np.int64
+        )
+        self._steps_accumulated = 0
+        self._lock = threading.Lock()
+
+    def add_topk_ids(
+        self,
+        topk_ids_cpu: list[np.ndarray],
+        per_dp_real_bs: list[int],
+        per_dp_bs_size: int,
+    ):
+        if not topk_ids_cpu:
+            return
+
+        with self._lock:
+            for layer_idx, ids_cpu in enumerate(topk_ids_cpu):
+                if ids_cpu is None:
+                    continue
+
+                for dp_rank, real_bs in enumerate(per_dp_real_bs):
+                    if real_bs <= 0:
+                        continue
+                    # Extract the valid slice for this DP rank
+                    start = dp_rank * per_dp_bs_size
+                    end = start + real_bs
+                    ids_chunk = ids_cpu[start:end, :].flatten()
+
+                    # Count valid expert IDs (ignoring padding -1)
+                    valid_ids = ids_chunk[ids_chunk >= 0]
+                    if valid_ids.size > 0:
+                        counts = np.bincount(valid_ids, minlength=self.physical_expert_counts)
+                        self._physical_counts[layer_idx] += counts
+
+            self._steps_accumulated += 1
+            if self._steps_accumulated >= self.buffer_size:
+                self.dump()
+                self._physical_counts.fill(0)
+                self._steps_accumulated = 0
+
+    def reset(self):
+        with self._lock:
+            self._physical_counts.fill(0)
+            self._steps_accumulated = 0
+
+    def dump(self):
+        from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
+
+        metadata = get_global_expert_location_metadata()
+        if metadata is None:
+            logger.warning("No expert location metadata found. Dumping physical counts.")
+            logical_counts = self._physical_counts
+        else:
+            # Move JAX arrays to host once to avoid repeated D2H sync in loop
+            phy_to_log_map = jax.device_get(metadata.physical_to_logical_map)
+            num_logical = metadata.logical_to_all_physical_map.shape[1]
+            logical_counts = np.zeros((self.num_layers, num_logical), dtype=np.int64)
+
+            for layer_idx in range(self.num_layers):
+                phy_to_log = phy_to_log_map[layer_idx]
+                for p_idx, l_idx in enumerate(phy_to_log):
+                    if p_idx < self._physical_counts.shape[1]:
+                        logical_counts[layer_idx, l_idx] += self._physical_counts[layer_idx, p_idx]
+
+        # Only process 0 saves to file
+        if jax.process_index() == 0:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_path = self.output_file
+            if base_path.endswith(".npy"):
+                filename = base_path.replace(".npy", f"_{timestamp}.npy")
+            else:
+                filename = f"{base_path}_{timestamp}.npy"
+
+            output_data = {
+                "logical_count": logical_counts,
+                "timestamp": timestamp,
+            }
+            np.save(filename, output_data)
+            logger.info("Expert distribution dumped to %s", filename)

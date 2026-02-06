@@ -76,6 +76,8 @@ class ServerArgs:
     device_indexes: list[int] | None = None
     tp_size: int = 1
     ep_size: int = 1
+    ep_num_redundant_experts: int = 0
+    ep_dispatch_algorithm: str | None = None
     stream_interval: int = 1
     stream_output: bool = False
     random_seed: int | None = None
@@ -178,10 +180,12 @@ class ServerArgs:
 
     enable_return_routed_experts: bool = False
     enable_expert_balance_debug: bool = False
-    expert_balance_segment_tokens: int = 100
+    expert_balance_segment_counter: int = 100
     expert_balance_output_file: str | None = None
-    expert_balance_segment_by: str = "decode_steps"
-    device_balance_topk: int = 4
+    init_expert_location: str = "trivial"
+    enable_expert_distribution_recorder: bool = False
+    expert_distribution_recorder_buffer_size: int = 100
+    expert_distribution_recorder_output_file: str | None = None
 
     def __post_init__(self):
         # Set missing default values
@@ -261,12 +265,11 @@ class ServerArgs:
         if self.multimodal:
             self.model_path = download_from_hf(self.model_path, allow_patterns=None)
 
-        if self.enable_expert_balance_debug and self.expert_balance_segment_tokens <= 0:
-            raise ValueError("expert_balance_segment_tokens must be positive")
-        if self.expert_balance_segment_by not in ("tokens", "decode_steps"):
-            raise ValueError("expert_balance_segment_by must be 'tokens' or 'decode_steps'")
-        if self.device_balance_topk <= 0:
-            raise ValueError("device_balance_topk must be positive")
+        if self.ep_num_redundant_experts < 0:
+            raise ValueError("ep_num_redundant_experts must be non-negative")
+
+        if self.enable_expert_balance_debug and self.expert_balance_segment_counter <= 0:
+            raise ValueError("expert_balance_segment_counter must be positive")
 
         if self.enable_expert_balance_debug and not self.expert_balance_output_file:
             import datetime
@@ -589,6 +592,20 @@ class ServerArgs:
             help="The expert parallelism size",
         )
         parser.add_argument(
+            "--ep-num-redundant-experts",
+            type=int,
+            default=ServerArgs.ep_num_redundant_experts,
+            help="Number of redundant experts for EP load balancing. "
+            "Total physical experts = num_logical + this value.",
+        )
+        parser.add_argument(
+            "--ep-dispatch-algorithm",
+            type=str,
+            choices=["static", "dynamic", "fake"],
+            default=ServerArgs.ep_dispatch_algorithm,
+            help="Expert parallel dispatch algorithm.",
+        )
+        parser.add_argument(
             "--stream-interval",
             type=int,
             default=ServerArgs.stream_interval,
@@ -837,9 +854,9 @@ class ServerArgs:
             help="Enable expert balance debug stats output (segment-based).",
         )
         parser.add_argument(
-            "--expert-balance-segment-tokens",
+            "--expert-balance-segment-counter",
             type=int,
-            default=ServerArgs.expert_balance_segment_tokens,
+            default=ServerArgs.expert_balance_segment_counter,
             help="Segment size for expert balance stats (tokens or decode steps).",
         )
         parser.add_argument(
@@ -849,17 +866,26 @@ class ServerArgs:
             help="CSV output file path for expert balance stats.",
         )
         parser.add_argument(
-            "--expert-balance-segment-by",
+            "--init-expert-location",
             type=str,
-            choices=["tokens", "decode_steps"],
-            default=ServerArgs.expert_balance_segment_by,
-            help="Segment by tokens or by decode steps.",
+            default=ServerArgs.init_expert_location,
+            help="Initial expert location mapping ('trivial' or file path).",
         )
         parser.add_argument(
-            "--device-balance-topk",
+            "--enable-expert-distribution-recorder",
+            action="store_true",
+            help="Enable expert distribution recorder for EPLB.",
+        )
+        parser.add_argument(
+            "--expert-distribution-recorder-buffer-size",
             type=int,
-            default=ServerArgs.device_balance_topk,
-            help="Top-k devices used for device balance hot/cold metrics.",
+            default=ServerArgs.expert_distribution_recorder_buffer_size,
+            help="Number of steps to buffer before dumping expert distribution.",
+        )
+        parser.add_argument(
+            "--expert-distribution-recorder-output-file",
+            type=str,
+            help="Output file path for expert distribution recorder (.npy).",
         )
 
         parser.add_argument(
