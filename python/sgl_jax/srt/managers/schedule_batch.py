@@ -1445,7 +1445,7 @@ class ScheduleBatch:
                 mm_embedding = req.mm_inputs.get("multimodal_embedding") if req.mm_inputs else None
                 if mm_embedding is not None:
                     mm_full = np.asarray(mm_embedding)
-                    start = int(prefix_len or 0) # todo: when multi request, this maybe wrong.
+                    start = int(prefix_len or 0)  # todo: when multi request, this maybe wrong.
                     end = start + int(extend_len or 0)
                     input_embedding_list.append(mm_full[start:end])
                 if req.apply_for_deepstack:

@@ -1,8 +1,5 @@
-from functools import partial
-
 import jax
 import jax.numpy as jnp
-from flax import nnx
 from transformers import AutoConfig
 
 from sgl_jax.srt.configs.load_config import LoadConfig
@@ -49,17 +46,17 @@ class EmbedModelRunner(BaseModelRunner):
         )
 
     def initialize_jit(self):
-        model_def, model_state = nnx.split(self.model)
-        model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
+        # model_def, model_state = nnx.split(self.model)
+        # model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
 
-        @partial(
-            jax.jit,
-            static_argnames=["model_state_def"],
-        )
+        # @partial(
+        #     jax.jit,
+        #     static_argnames=["model_state_def"],
+        # )
         def forward_model(
-            model_def,
-            model_state_def,
-            model_state_leaves,
+            # model_def,
+            # model_state_def,
+            # model_state_leaves,
             input_ids,
             input_features,
             audio_feature_lengths,
@@ -68,9 +65,9 @@ class EmbedModelRunner(BaseModelRunner):
             image_grid_thw,
             video_grid_thw,
         ):
-            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
-            model = nnx.merge(model_def, model_state)
-            return model(
+            # model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            # model = nnx.merge(model_def, model_state)
+            return self.model(
                 input_ids=input_ids,
                 input_features=input_features,
                 audio_feature_lengths=audio_feature_lengths,
@@ -90,9 +87,9 @@ class EmbedModelRunner(BaseModelRunner):
             video_grid_thw: jax.Array | None = None,
         ):
             return forward_model(
-                model_def,
-                model_state_def,
-                model_state_leaves,
+                # model_def,
+                # model_state_def,
+                # model_state_leaves,
                 input_ids,
                 input_features,
                 audio_feature_lengths,
@@ -162,7 +159,6 @@ class EmbedModelRunner(BaseModelRunner):
             video_grid_thw = batch.video_grid_thw
             if video_grid_thw is not None:
                 video_grid_thw = jnp.array(video_grid_thw)
-
         return {
             "input_ids": input_ids,
             "input_features": audio_features,
@@ -185,5 +181,4 @@ class EmbedModelRunner(BaseModelRunner):
             mm_inputs["multimodal_embedding"] = input_embeds
             mm_inputs["deepstack_visual_embedding"] = visual_embeds_multiscale
             mm_inputs["deepstack_visual_pos_mask"] = visual_pos_masks
-
         return batch
