@@ -237,9 +237,7 @@ class Qwen3OmniMoeAudioEncoder(nnx.Module):
         feature_lens: mel length
         """
         chunk_num = (feature_lens + self.n_window * 2 - 1) // (self.n_window * 2)
-        chunk_lengths = jnp.full(
-            chunk_num.sum(), self.n_window * 2, dtype=jnp.int64, device=feature_lens.device
-        )
+        chunk_lengths = jnp.full(chunk_num.sum(), self.n_window * 2, dtype=jnp.int32)
 
         tail_chunk_index = jnp.pad(chunk_num, (1, 0), constant_values=-1).cumsum(0)[1:]
         chunk_lengths = chunk_lengths.at[tail_chunk_index].set(feature_lens % (self.n_window * 2))

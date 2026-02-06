@@ -341,12 +341,12 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
         # Merge text , audios , image and video
         if input_features is not None:
             audio_embeds = self.audio_tower(
-                input_features,
+                input_features.astype(self.dtype),
                 feature_lens=audio_feature_lengths,
             )
 
         if pixel_values is not None:
-            image_features = self.visual(pixel_values, image_grid_thw)
+            image_features = self.visual(pixel_values.astype(self.dtype), image_grid_thw)
             image_embeds, image_embeds_multiscale = (
                 image_features["pooler_output"],
                 image_features["deepstack_features"],
@@ -354,7 +354,7 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
             visual_embeds_multiscale = image_embeds_multiscale
 
         if pixel_values_videos is not None:
-            video_features = self.visual(pixel_values_videos, video_grid_thw)
+            video_features = self.visual(pixel_values_videos.astype(self.dtype), video_grid_thw)
             video_embeds, video_embeds_multiscale = (
                 video_features["pooler_output"],
                 video_features["deepstack_features"],
