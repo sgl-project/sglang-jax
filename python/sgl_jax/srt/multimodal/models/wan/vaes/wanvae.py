@@ -1146,20 +1146,40 @@ class AutoencoderKLWan(nnx.Module):
     def decode(self, z: jax.Array) -> jax.Array:
         if self.use_feature_cache:
             self.clear_cache()
-            iter_ = z.shape[1]
             x, _ = self.post_quant_conv(z)
             cache_list = self._feat_map
-            for i in range(iter_):
+
+            # Warmup frame 0: caches go from None -> small arrays
+            cache_idx = [0]
+            out, cache_list = self.decoder(
+                x[:, 0:1, :, :, :], cache_list=cache_list, cache_idx=cache_idx
+            )
+
+            if x.shape[1] > 1:
+                # Warmup frame 1: caches stabilize to full size [B,2,...]
                 cache_idx = [0]
-                if i == 0:
-                    out, cache_list = self.decoder(
-                        x[:, i : i + 1, :, :, :], cache_list=cache_list, cache_idx=cache_idx
+                out_1, cache_list = self.decoder(
+                    x[:, 1:2, :, :, :], cache_list=cache_list, cache_idx=cache_idx
+                )
+                out = jnp.concatenate([out, out_1], axis=1)
+
+            if x.shape[1] > 2:
+                # Scan over remaining frames — cache shapes are now stable
+                remaining = jnp.moveaxis(x[:, 2:, :, :, :], 1, 0)
+                remaining = jnp.expand_dims(remaining, 2)  # (T-2, B, 1, H, W, C)
+
+                def scan_step(cache_list, x_t):
+                    cache_idx = [0]
+                    out_t, cache_list = self.decoder(
+                        x_t, cache_list=cache_list, cache_idx=cache_idx
                     )
-                else:
-                    out_, cache_list = self.decoder(
-                        x[:, i : i + 1, :, :, :], cache_list=cache_list, cache_idx=cache_idx
-                    )
-                    out = jnp.concatenate([out, out_], 1)
+                    return cache_list, out_t
+
+                cache_list, out_rest = jax.lax.scan(scan_step, cache_list, remaining)
+                # out_rest: (T-2, B, T_out, H_out, W_out, C_out)
+                out_rest = jnp.moveaxis(out_rest, 0, 1)  # (B, T-2, T_out, H, W, C)
+                out_rest = out_rest.reshape(out_rest.shape[0], -1, *out_rest.shape[3:])
+                out = jnp.concatenate([out, out_rest], axis=1)
 
             out = jnp.clip(out, min=-1.0, max=1.0)
             self.clear_cache()
