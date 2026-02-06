@@ -326,12 +326,14 @@ class VisionTransformerBlock(nnx.Module):
             num_features=config.hidden_size,
             epsilon=1e-6,
             param_dtype=dtype,
+            use_fast_variance=False,
             rngs=rngs,
         )
         self.norm2 = nnx.LayerNorm(
             num_features=config.hidden_size,
             epsilon=1e-6,
             param_dtype=dtype,
+            use_fast_variance=False,
             rngs=rngs,
         )
 
@@ -412,6 +414,7 @@ class VisionPatchMerger(nnx.Module):
             num_features=norm_size,
             epsilon=1e-6,
             param_dtype=dtype,
+            use_fast_variance=False,
             rngs=rngs,
         )
 
