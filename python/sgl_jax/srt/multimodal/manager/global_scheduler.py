@@ -272,13 +272,13 @@ class GlobalScheduler:
                 if item.feature is not None:
                     pixel_values_list.append(np.asarray(item.feature))
 
-            if pixel_values_list:
+            if len(pixel_values_list) > 1:
                 req.pixel_values = np.concatenate(pixel_values_list, axis=0)
-            if image_items:
+            if len(image_items) > 1:
                 req.pixel_values_images = np.concatenate(image_items, axis=0)
-            if video_items:
+            if len(video_items) > 1:
                 req.pixel_values_videos = np.concatenate(video_items, axis=0)
-            if audio_items:
+            if len(audio_items) > 1:
                 req.audio_features = np.concatenate(audio_items, axis=0)
 
             image_grid_thw = input.mm_inputs.get("image_grid_thw")
