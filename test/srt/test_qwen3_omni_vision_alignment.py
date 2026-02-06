@@ -138,11 +138,12 @@ def create_video_input(config, temporal_frames, h_patches, w_patches):
     return pixel_values, grid_thw
 
 
-def prepare_pytorch_input(pixel_values, config, dtype):
+def prepare_pytorch_input(pixel_values, config, dtype=None):
     """
-    Convert pixel_values to PyTorch patch format with spatial-merge permutation.
+    Convert pixel_values to patch format with spatial-merge permutation.
 
-    Returns: (N_patches, C, T_patch, H_patch, W_patch) in spatial-merge order
+    Returns: (N_patches, C*T_patch*H_patch*W_patch) flattened in spatial-merge order
+             Returns torch.Tensor if dtype is provided, numpy array otherwise.
     """
     pt_input = torch.from_numpy(pixel_values).to(dtype)
     B, T, H, W, C = pt_input.shape
@@ -183,32 +184,9 @@ def prepare_pytorch_input(pixel_values, config, dtype):
         patch_size,
     )
     pt_input = pt_input.permute(0, 1, 2, 4, 3, 5, 6, 7, 8, 9)
-    return pt_input.reshape(-1, C, temporal_patch_size, patch_size, patch_size)
-
-
-def prepare_jax_input(pixel_values, config):
-    """Flatten to (B, C*T*H*W) so reshape(-1, C, t, p, p) preserves patch order."""
-    B, T, H, W, C = pixel_values.shape
-    t_patch = config.temporal_patch_size
-    p = config.patch_size
-    t_out, h_patches, w_patches = T // t_patch, H // p, W // p
-
-    # (B, T, H, W, C) -> (B, C, T, H, W)
-    patches = np.transpose(pixel_values, (0, 4, 1, 2, 3))
-    # (B, C, T, H, W) -> (B, C, T_out, t, H_patches, p, W_patches, p)
-    patches = patches.reshape(
-        B,
-        C,
-        t_out,
-        t_patch,
-        h_patches,
-        p,
-        w_patches,
-        p,
-    )
-    # (B, T_out, H_patches, W_patches, C, t, p, p)
-    patches = np.transpose(patches, (0, 2, 4, 6, 1, 3, 5, 7))
-    return patches.reshape(B, -1)
+    # Flatten to (N_patches, C*t*p*p) - same format for both PyTorch and JAX
+    result = pt_input.reshape(-1, C * temporal_patch_size * patch_size * patch_size)
+    return result if dtype is not None else result.numpy()
 
 
 # =============================================================================
@@ -427,7 +405,9 @@ class JAXForwardContext:
     def __init__(self, jax_model, pixel_values, grid_thw, mesh):
         self.model = jax_model
         self.mesh = mesh
-        self.pixel_values = jnp.array(prepare_jax_input(pixel_values, jax_model.config))
+        # Use same input format as PyTorch: (N_patches, C*t*p*p)
+        np_input = prepare_pytorch_input(pixel_values, jax_model.config, dtype=None)
+        self.pixel_values = jnp.array(np_input)
         self.grid = jnp.array(grid_thw)
 
         # Pre-computed values (lazy init)
@@ -441,12 +421,11 @@ class JAXForwardContext:
         return self._position_ids
 
     def get_initial_hidden(self):
-        """Get hidden states after patch_embed + pos_embed (with spatial-merge permutation)."""
+        """Get hidden states after patch_embed + pos_embed."""
         with jax.set_mesh(self.mesh):
             patch_out = self.model.patch_embed(self.pixel_values)
-            patch_permuted = self.model._apply_spatial_merge_permutation(patch_out, self.grid)
             pos_embeds = self.model.interpolate_pos_embed(self.grid)
-            return patch_permuted + pos_embeds
+            return patch_out + pos_embeds
 
     def run_blocks(self, hidden, block_idxs=None):
         """Run through transformer blocks, optionally capturing intermediate outputs."""
@@ -620,8 +599,7 @@ def test_layer_outputs(model_path, mesh, precision):
 
     jax_ctx = JAXForwardContext(jax_model, pixel_values, grid_thw, mesh)
     with jax.set_mesh(mesh):
-        jax_patch_raw = jax_model.patch_embed(jax_ctx.pixel_values)
-        jax_patch = jax_model._apply_spatial_merge_permutation(jax_patch_raw, jax_ctx.grid)
+        jax_patch = jax_model.patch_embed(jax_ctx.pixel_values)
         jax_pos = jax_model.interpolate_pos_embed(jax_ctx.grid)
         jax_hidden = jax_patch + jax_pos
 
@@ -922,8 +900,7 @@ def test_video_input(model_path, mesh, precision):
 
     jax_ctx = JAXForwardContext(jax_model, pixel_values, grid_thw, mesh)
     with jax.set_mesh(mesh):
-        jax_patch_raw = jax_model.patch_embed(jax_ctx.pixel_values)
-        jax_patch = jax_model._apply_spatial_merge_permutation(jax_patch_raw, jax_ctx.grid)
+        jax_patch = jax_model.patch_embed(jax_ctx.pixel_values)
         jax_pos = jax_model.interpolate_pos_embed(jax_ctx.grid)
 
     jax_output = jax_ctx.full_forward()
@@ -1059,7 +1036,9 @@ def test_batch_images(model_path, mesh, precision):
     with jax.set_mesh(mesh):
         jax_outputs = [
             jax_model(
-                pixel_values=jnp.array(prepare_jax_input(pixel_values[i : i + 1], config)),
+                pixel_values=jnp.array(
+                    prepare_pytorch_input(pixel_values[i : i + 1], config, dtype=None)
+                ),
                 grid_thw=jnp.array(grid_thw[i : i + 1]),
             )["pooler_output"]
             for i in range(2)
@@ -1259,7 +1238,7 @@ def test_tp_output_consistency(model_path, mesh, precision):
     # Run JAX forward
     with jax.set_mesh(mesh):
         jax_output = jax_model(
-            pixel_values=jnp.array(prepare_jax_input(pixel_values, config)),
+            pixel_values=jnp.array(prepare_pytorch_input(pixel_values, config, dtype=None)),
             grid_thw=jnp.array(grid_thw),
         )
 
@@ -1346,6 +1325,16 @@ def main():
     parser.add_argument("--tp_size", type=int, default=4)
     parser.add_argument("--precision", default="float32", choices=["float32", "bfloat16"])
     args = parser.parse_args()
+
+    # TPU must use float32 for numerical accuracy
+    backend = jax.default_backend()
+    if backend == "tpu" and args.precision != "float32":
+        logger.warning(
+            "TPU detected: overriding precision from '%s' to 'float32' "
+            "(bfloat16 is not supported on TPU for alignment tests)",
+            args.precision,
+        )
+        args.precision = "float32"
 
     precision_map = {"float32": "highest", "bfloat16": "default"}
     jax.config.update("jax_default_matmul_precision", precision_map[args.precision])

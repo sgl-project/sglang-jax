@@ -107,7 +107,7 @@ class TestQwen3OmniMoeAudioEncoderPrecision(unittest.TestCase):
 
         # JAX
         input_features_jax = jnp.array(input_features_np, dtype=jax_dtype)
-        feature_lens_jax = jnp.array(feature_lens_np, dtype=jnp.int64)
+        feature_lens_jax = jnp.array(feature_lens_np, dtype=jnp.int32)
 
         jax_output = jax_audio_tower(
             input_features=input_features_jax, feature_lens=feature_lens_jax
