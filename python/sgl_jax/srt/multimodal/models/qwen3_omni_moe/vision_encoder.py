@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.lax import Precision
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
@@ -15,8 +16,8 @@ class Vision3DPatchEmbed(nnx.Module):
     """
     3D Convolutional Patch Embedding for video/image input.
 
-    Converts flattened input (B, C*T*H*W) into patches (N_patches, embed_dim).
-    Input is assumed to be flattened in C-first order: (B, C, T, H, W) -> (B, C*T*H*W).
+    Converts pre-extracted patches (N_patches, C*t_patch*p*p) into embeddings (N_patches, embed_dim).
+    Input is assumed to be in spatial-merge order.
     """
 
     def __init__(
@@ -25,6 +26,7 @@ class Vision3DPatchEmbed(nnx.Module):
         embed_dim: int = 1152,
         patch_size: int = 16,
         temporal_patch_size: int = 2,
+        dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
     ):
         self.in_channels = in_channels
@@ -39,20 +41,21 @@ class Vision3DPatchEmbed(nnx.Module):
             kernel_size=(temporal_patch_size, patch_size, patch_size),
             strides=(temporal_patch_size, patch_size, patch_size),
             use_bias=True,
+            param_dtype=dtype,
             rngs=rngs,
+            precision=Precision.HIGHEST,
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
         """
         Args:
-            x: (B, C*T*H*W) flattened video/image tensor in C-first order
+            x: (N_patches, C*t_patch*p*p) pre-extracted patches in spatial-merge order
 
         Returns:
-            patches: (total_patches, embed_dim)
+            patches: (N_patches, embed_dim)
         """
-        # x shape: (B, C*T*H*W)
-        # Reshape to patch blocks: (B*N_patches, C, t_patch, p, p)
-        # where N_patches = (T/t_patch) * (H/p) * (W/p)
+        # x shape: (N_patches, C*t_patch*p*p) = (N_patches, 1536) for default config
+        # Reshape to: (N_patches, C, t_patch, p, p)
         x = x.reshape(
             -1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size
         )
@@ -111,9 +114,19 @@ def apply_rotary_pos_emb_vision(
     cos: jax.Array,  # (seq_len, head_dim)
     sin: jax.Array,  # (seq_len, head_dim)
 ) -> tuple[jax.Array, jax.Array]:
-    """Apply 2D rotary position embedding to query and key tensors."""
-    cos = cos[:, None, :]
-    sin = sin[:, None, :]
+    """Apply 2D rotary position embedding to query and key tensors.
+
+    Note: Computation is done in float32 for numerical stability.
+    """
+    # Save original dtypes
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+
+    # Convert to float32 for computation
+    q = q.astype(jnp.float32)
+    k = k.astype(jnp.float32)
+    cos = cos[:, None, :].astype(jnp.float32)
+    sin = sin[:, None, :].astype(jnp.float32)
 
     def rotate_half(x):
         """Rotate half the hidden dims of the input."""
@@ -123,7 +136,8 @@ def apply_rotary_pos_emb_vision(
     q_rot = q * cos + rotate_half(q) * sin
     k_rot = k * cos + rotate_half(k) * sin
 
-    return q_rot, k_rot
+    # Convert back to original dtype
+    return q_rot.astype(orig_q_dtype), k_rot.astype(orig_k_dtype)
 
 
 class VisionAttention(nnx.Module):
@@ -202,12 +216,28 @@ class VisionAttention(nnx.Module):
         cos, sin = jnp.cos(emb), jnp.sin(emb)
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
-        # Scaled dot-product attention
-        attn_weights = jnp.einsum("qhd,khd->hqk", q * self.scaling, k)
+        # Scaled dot-product attention (post-scaling to match PyTorch's eager_attention_forward)
+        q_t = jnp.transpose(q, (1, 0, 2))  # (heads, q_len, head_dim)
+        k_t = jnp.transpose(k, (1, 0, 2))  # (heads, k_len, head_dim)
+        attn_weights = jax.lax.dot_general(
+            q_t,
+            k_t,
+            (((2,), (2,)), ((0,), (0,))),
+            precision=Precision.HIGHEST,
+        )
+        attn_weights = attn_weights * self.scaling
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask
-        attn_weights = jax.nn.softmax(attn_weights, axis=-1)
-        attn_output = jnp.einsum("hqk,khd->qhd", attn_weights, v)
+        # Compute softmax in float32 for numerical stability
+        attn_weights = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(q.dtype)
+        v_t = jnp.transpose(v, (1, 0, 2))  # (heads, k_len, head_dim)
+        attn_output = jax.lax.dot_general(
+            attn_weights,
+            v_t,
+            (((2,), (1,)), ((0,), (0,))),
+            precision=Precision.HIGHEST,
+        )
+        attn_output = jnp.transpose(attn_output, (1, 0, 2))  # (q_len, heads, head_dim)
 
         # Reshape with explicit sharding for TP compatibility
         attn_output = jax.lax.reshape(
@@ -253,7 +283,7 @@ class VisionMLP(nnx.Module):
         )
 
         act_fns = {
-            "gelu": jax.nn.gelu,
+            "gelu": lambda x: jax.nn.gelu(x, approximate=False),
             "gelu_pytorch_tanh": lambda x: jax.nn.gelu(x, approximate=True),
             "relu": jax.nn.relu,
             "silu": jax.nn.silu,
@@ -295,11 +325,15 @@ class VisionTransformerBlock(nnx.Module):
         self.norm1 = nnx.LayerNorm(
             num_features=config.hidden_size,
             epsilon=1e-6,
+            param_dtype=dtype,
+            use_fast_variance=False,
             rngs=rngs,
         )
         self.norm2 = nnx.LayerNorm(
             num_features=config.hidden_size,
             epsilon=1e-6,
+            param_dtype=dtype,
+            use_fast_variance=False,
             rngs=rngs,
         )
 
@@ -379,6 +413,8 @@ class VisionPatchMerger(nnx.Module):
         self.ln_q = nnx.LayerNorm(
             num_features=norm_size,
             epsilon=1e-6,
+            param_dtype=dtype,
+            use_fast_variance=False,
             rngs=rngs,
         )
 
@@ -420,7 +456,7 @@ class VisionPatchMerger(nnx.Module):
             hidden_states = hidden_states.reshape(-1, merged_hidden_size)
 
         hidden_states, _ = self.mlp_fc1(hidden_states)
-        hidden_states = jax.nn.gelu(hidden_states)
+        hidden_states = jax.nn.gelu(hidden_states, approximate=False)
         hidden_states, _ = self.mlp_fc2(hidden_states)
 
         return hidden_states
@@ -458,6 +494,7 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
             embed_dim=config.hidden_size,
             patch_size=config.patch_size,
             temporal_patch_size=config.temporal_patch_size,
+            dtype=dtype,
             rngs=rngs,
         )
 
@@ -662,62 +699,14 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
 
         return jnp.concatenate(all_pos_ids, axis=0)
 
-    def _apply_spatial_merge_permutation(
-        self,
-        hidden_states: jax.Array,  # (total_patches, hidden_size)
-        grid_thw: jax.Array,  # (num_images, 3) - [T, H_patches, W_patches]
-    ) -> jax.Array:
+    def rot_pos_emb(self, grid_thw: jax.Array) -> jax.Array:
         """
-        Apply spatial merge permutation to hidden_states to match pos_embeds order.
+        Compatibility helper for PyTorch-style API.
 
-        The patch_embed outputs patches in row-major order (T, H, W flattened),
-        but position embeddings and position IDs use spatial-merge-permuted order.
-        This function reorders hidden_states to match.
-
-        Args:
-            hidden_states: (total_patches, hidden_size) in row-major order
-            grid_thw: (num_images, 3) containing [T, H_patches, W_patches]
-
-        Returns:
-            hidden_states: (total_patches, hidden_size) in spatial-merge-permuted order
+        Returns 2D position IDs in spatial-merge order. The VisionAttention block
+        computes rotary embeddings internally from these position IDs.
         """
-        merge_size = self.spatial_merge_size
-        all_permuted = []
-        offset = 0
-
-        for num_frames, height, width in grid_thw:
-            # Convert traced values to Python ints
-            num_frames_val = int(num_frames)
-            height_val = int(height)
-            width_val = int(width)
-
-            num_patches = num_frames_val * height_val * width_val
-            patches = hidden_states[offset : offset + num_patches]  # (t*h*w, hidden_size)
-
-            # Reshape to (t, h, w, hidden_size)
-            patches = patches.reshape(num_frames_val, height_val, width_val, -1)
-
-            # Apply spatial merge permutation
-            # (t, h, w, hidden_size) -> (t, h//merge_size, merge_size, w//merge_size, merge_size, hidden_size)
-            patches = patches.reshape(
-                num_frames_val,
-                height_val // merge_size,
-                merge_size,
-                width_val // merge_size,
-                merge_size,
-                -1,
-            )
-
-            # Transpose to (t, h//merge_size, w//merge_size, merge_size, merge_size, hidden_size)
-            patches = jnp.transpose(patches, (0, 1, 3, 2, 4, 5))
-
-            # Flatten back to (t*h*w, hidden_size)
-            patches = patches.reshape(-1, self.config.hidden_size)
-
-            all_permuted.append(patches)
-            offset += num_patches
-
-        return jnp.concatenate(all_permuted, axis=0)
+        return self.compute_2d_position_ids(grid_thw)
 
     def _create_attention_mask(self, grid_thw: jax.Array) -> jax.Array:
         """
@@ -757,7 +746,7 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
         if len(all_seq_lens) == 1:
             return None
 
-        # Create block diagonal mask matching PyTorch cu_seqlens behavior
+        # Create block diagonal mask based on cu_seqlens
         # Initialize with -inf (mask everything by default)
         mask = jnp.full((total_patches, total_patches), -1e10, dtype=jnp.float32)
 
@@ -790,14 +779,14 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
 
     def __call__(
         self,
-        pixel_values: jax.Array,  # (B, C*T*H*W)
+        pixel_values: jax.Array,  # (N_patches, C*t_patch*p*p)
         grid_thw: jax.Array,  # (B, 3) - [T_out, H_patches, W_patches]
     ) -> dict[str, jax.Array]:
         """
         Forward pass of vision encoder.
 
         Args:
-            pixel_values: (B, C*T*H*W) flattened video/image tensor in C-first order
+            pixel_values: (N_patches, C*t_patch*p*p) pre-extracted patches in spatial-merge order
             grid_thw: (B, 3) containing [T_out, H_patches, W_patches] for each input
                 where T_out = T / temporal_patch_size
 
@@ -813,27 +802,20 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
         # 0. Validate input shapes
         self._validate_input_shapes(grid_thw)
 
-        # 1. Patch Embedding (handles flattened input internally)
+        # 1. Patch Embedding
         hidden_states = self.patch_embed(pixel_values)  # (total_patches, hidden_size)
 
-        # 2. Apply spatial merge permutation to match PyTorch order
-        hidden_states = self._apply_spatial_merge_permutation(hidden_states, grid_thw)
-
-        # 3. Add Position Embeddings (both in spatial-merge order)
+        # 2. Add Position Embeddings
         pos_embeds = self.interpolate_pos_embed(grid_thw)
         hidden_states = hidden_states + pos_embeds
 
-        # 4. Compute 2D position IDs for RoPE
+        # 3. Compute 2D position IDs for RoPE
         position_ids = self.compute_2d_position_ids(grid_thw)
 
-        # 5. Create attention mask to match PyTorch's cu_seqlens behavior
-        # Mask is needed when:
-        # - batch > 1 (multiple images) OR
-        # - any image has T > 1 (video with multiple temporal patches)
-        # This ensures each temporal frame attends only within itself
+        # 4. Create attention mask
         attention_mask = self._create_attention_mask(grid_thw)
 
-        # 6. Through Transformer Blocks
+        # 5. Through Transformer Blocks
         deepstack_features = []
         for layer_idx, block in enumerate(self.blocks):
             hidden_states = block(
@@ -848,7 +830,7 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
                 feature = self.deepstack_mergers[idx](hidden_states)
                 deepstack_features.append(feature)
 
-        # 7. Final projection (merger)
+        # 6. Final projection (merger)
         merged_hidden_states = self.merger(hidden_states)
 
         return {
