@@ -166,6 +166,12 @@ class ModelRunner(BaseModelRunner):
                 model_config=self.model_config,
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_padding=self.max_padding,
+                ep_size=self.server_args.ep_size,
+                enable_balance_debug=self.server_args.enable_expert_balance_debug,
+                balance_segment_tokens=self.server_args.expert_balance_segment_tokens,
+                balance_output_file=self.server_args.expert_balance_output_file,
+                balance_segment_by=self.server_args.expert_balance_segment_by,
+                device_balance_topk=self.server_args.device_balance_topk,
             )
         )
 
