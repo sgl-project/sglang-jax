@@ -334,6 +334,8 @@ class Qwen3OmniMoeThinkerTextModel(nnx.Module):
         config.ep_size = getattr(config, "ep_size", 1)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        rope_scaling = getattr(config, "rope_scaling", None) or {}
+        self._mrope_section = rope_scaling.get("mrope_section")
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
@@ -370,9 +372,14 @@ class Qwen3OmniMoeThinkerTextModel(nnx.Module):
         residual = None
         layers_kv_fused = []
         layers_topk_ids = []
+        rope_positions = (
+            forward_batch.mrope_positions
+            if self._mrope_section and forward_batch.mrope_positions is not None
+            else forward_batch.positions
+        )
         for layer_id, layer in enumerate(self.layers):
             hidden_states, residual, kv_fused, topk_ids = layer(
-                forward_batch.positions,
+                rope_positions,
                 hidden_states,
                 forward_batch,
                 token_to_kv_pool,
