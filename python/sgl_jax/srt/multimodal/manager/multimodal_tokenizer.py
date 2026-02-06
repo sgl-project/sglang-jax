@@ -306,7 +306,9 @@ class MultimodalTokenizer(TokenizerManager):
                 mm_items.append(
                     MultimodalDataItem(
                         modality=Modality.AUDIO,
-                        feature=np.asarray(audio_features),
+                        feature=np.asarray(
+                            audio_features.transpose(0, 1).reshape(audio_features.shape[1], -1)
+                        ),
                     )
                 )
             audio_feature_lengths = self._to_audio_feature_lengths(
