@@ -84,15 +84,25 @@ def import_model_classes():
                 entry = module.EntryClass
                 if isinstance(entry, list):  # To support multiple model classes in one module
                     for tmp in entry:
-                        assert (
-                            tmp.__name__ not in model_arch_name_to_cls
-                        ), f"Duplicated model implementation for {tmp.__name__}"
+                        assert tmp.__name__ not in model_arch_name_to_cls, (
+                            f"Duplicated model implementation for {tmp.__name__}"
+                        )
                         model_arch_name_to_cls[tmp.__name__] = tmp
                 else:
-                    assert (
-                        entry.__name__ not in model_arch_name_to_cls
-                    ), f"Duplicated model implementation for {entry.__name__}"
+                    assert entry.__name__ not in model_arch_name_to_cls, (
+                        f"Duplicated model implementation for {entry.__name__}"
+                    )
                     model_arch_name_to_cls[entry.__name__] = entry
+
+    # Register Multimodal Qwen3-VL
+    try:
+        from sgl_jax.srt.multimodal.models.qwen3_VL import EntryClass as Qwen3VLEntry
+
+        entries = Qwen3VLEntry if isinstance(Qwen3VLEntry, list) else [Qwen3VLEntry]
+        for entry in entries:
+            model_arch_name_to_cls[entry.__name__] = entry
+    except ImportError:
+        pass
 
     return model_arch_name_to_cls
 
