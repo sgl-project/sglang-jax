@@ -1105,28 +1105,46 @@ class AutoencoderKLWan(nnx.Module):
     def encode(self, x: jax.Array) -> jax.Array:
         if self.use_feature_cache:
             self.clear_cache()
-            # if self.config.patch_size is not None:
-            #     x = patchify(x, patch_size=self.config.patch_size)
-            # with forward_context(
-            #     feat_cache_arg=self._enc_feat_map, feat_idx_arg=self._enc_conv_idx
-            # ):
             t = x.shape[1]
             iter_ = 1 + (t - 1) // 4
             cache_list = self._enc_feat_map
-            for i in range(iter_):
-                # feat_idx.set(0)
+
+            # Warmup chunk 0: 1 frame, caches go from None -> small arrays
+            cache_idx = [0]
+            out, cache_list = self.encoder(
+                x[:, :1, :, :, :], cache_list=cache_list, cache_idx=cache_idx
+            )
+
+            if iter_ > 1:
+                # Warmup chunk 1: 4 frames, caches stabilize to full size
                 cache_idx = [0]
-                if i == 0:
-                    out, cache_list = self.encoder(
-                        x[:, :1, :, :, :], cache_list=cache_list, cache_idx=cache_idx
+                out_1, cache_list = self.encoder(
+                    x[:, 1:5, :, :, :], cache_list=cache_list, cache_idx=cache_idx
+                )
+                out = jnp.concatenate([out, out_1], axis=1)
+
+            if iter_ > 2:
+                # Scan over remaining 4-frame chunks
+                # x[:, 5:] has (iter_-2)*4 frames, reshape to (iter_-2, B, 4, H, W, C)
+                remaining = x[:, 5 : 1 + 4 * (iter_ - 1), :, :, :]
+                remaining = remaining.reshape(
+                    remaining.shape[0], iter_ - 2, 4, *remaining.shape[2:]
+                )
+                remaining = jnp.moveaxis(remaining, 1, 0)  # (iter_-2, B, 4, H, W, C)
+
+                def scan_step(cache_list, x_chunk):
+                    cache_idx = [0]
+                    out_t, cache_list = self.encoder(
+                        x_chunk, cache_list=cache_list, cache_idx=cache_idx
                     )
-                else:
-                    out_, cache_list = self.encoder(
-                        x[:, 1 + 4 * (i - 1) : 1 + 4 * i, :, :, :],
-                        cache_list=cache_list,
-                        cache_idx=cache_idx,
-                    )
-                    out = jnp.concatenate([out, out_], 1)
+                    return cache_list, out_t
+
+                cache_list, out_rest = jax.lax.scan(scan_step, cache_list, remaining)
+                # out_rest: (iter_-2, B, T_out, H_out, W_out, C_out)
+                out_rest = jnp.moveaxis(out_rest, 0, 1)  # (B, iter_-2, T_out, H, W, C)
+                out_rest = out_rest.reshape(out_rest.shape[0], -1, *out_rest.shape[3:])
+                out = jnp.concatenate([out, out_rest], axis=1)
+
             enc, _ = self.quant_conv(out)
             mu, logvar = enc[:, :, :, :, : self.z_dim], enc[:, :, :, :, self.z_dim :]
             enc = jnp.concatenate([mu, logvar], axis=4)
@@ -1134,32 +1152,46 @@ class AutoencoderKLWan(nnx.Module):
             self.clear_cache()
         else:
             raise NotImplementedError
-            # for block in self.encoder.down_blocks:
-            #     if isinstance(block, WanResample) and block.mode == "downsample3d":
-            #         _padding = list(block.time_conv._padding)
-            #         _padding[4] = 2
-            #         block.time_conv._padding = tuple(_padding)
-            # enc = ParallelTiledVAE.encode(self, x)
 
         return enc
 
     def decode(self, z: jax.Array) -> jax.Array:
         if self.use_feature_cache:
             self.clear_cache()
-            iter_ = z.shape[1]
             x, _ = self.post_quant_conv(z)
             cache_list = self._feat_map
-            for i in range(iter_):
+
+            # Warmup frame 0: caches go from None -> small arrays
+            cache_idx = [0]
+            out, cache_list = self.decoder(
+                x[:, 0:1, :, :, :], cache_list=cache_list, cache_idx=cache_idx
+            )
+
+            if x.shape[1] > 1:
+                # Warmup frame 1: caches stabilize to full size [B,2,...]
                 cache_idx = [0]
-                if i == 0:
-                    out, cache_list = self.decoder(
-                        x[:, i : i + 1, :, :, :], cache_list=cache_list, cache_idx=cache_idx
+                out_1, cache_list = self.decoder(
+                    x[:, 1:2, :, :, :], cache_list=cache_list, cache_idx=cache_idx
+                )
+                out = jnp.concatenate([out, out_1], axis=1)
+
+            if x.shape[1] > 2:
+                # Scan over remaining frames — cache shapes are now stable
+                remaining = jnp.moveaxis(x[:, 2:, :, :, :], 1, 0)
+                remaining = jnp.expand_dims(remaining, 2)  # (T-2, B, 1, H, W, C)
+
+                def scan_step(cache_list, x_t):
+                    cache_idx = [0]
+                    out_t, cache_list = self.decoder(
+                        x_t, cache_list=cache_list, cache_idx=cache_idx
                     )
-                else:
-                    out_, cache_list = self.decoder(
-                        x[:, i : i + 1, :, :, :], cache_list=cache_list, cache_idx=cache_idx
-                    )
-                    out = jnp.concatenate([out, out_], 1)
+                    return cache_list, out_t
+
+                cache_list, out_rest = jax.lax.scan(scan_step, cache_list, remaining)
+                # out_rest: (T-2, B, T_out, H_out, W_out, C_out)
+                out_rest = jnp.moveaxis(out_rest, 0, 1)  # (B, T-2, T_out, H, W, C)
+                out_rest = out_rest.reshape(out_rest.shape[0], -1, *out_rest.shape[3:])
+                out = jnp.concatenate([out, out_rest], axis=1)
 
             out = jnp.clip(out, min=-1.0, max=1.0)
             self.clear_cache()
