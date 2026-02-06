@@ -38,7 +38,7 @@ from sgl_jax.srt.jinja_template_utils import process_content_for_template_format
 from sgl_jax.srt.managers.io_struct import GenerateReqInput
 from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
-from sgl_jax.srt.multimodal.manager.io_struct import GenerateVLMReqInput
+from sgl_jax.srt.multimodal.manager.io_struct import GenerateOmniReqInput
 from sgl_jax.srt.reasoning_parser import ReasoningParser
 from sgl_jax.utils import convert_json_schema_to_str
 
@@ -58,7 +58,7 @@ class OpenAIServingChat(OpenAIServingBase):
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
-    ) -> tuple[GenerateReqInput | GenerateVLMReqInput, ChatCompletionRequest]:
+    ) -> tuple[GenerateReqInput | GenerateOmniReqInput, ChatCompletionRequest]:
         """Convert OpenAI chat completion request to internal format"""
         model_config = getattr(self.tokenizer_manager, "model_config", None)
         is_multimodal = (

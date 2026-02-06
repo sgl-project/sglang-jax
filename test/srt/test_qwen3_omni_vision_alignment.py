@@ -21,7 +21,7 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 )
 
 from sgl_jax.srt.configs.model_config import _get_and_verify_dtype
-from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_moe_encoder import (
+from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker_embedding import (
     Qwen3OmniMoeThinkerEmbedding,
 )
 
