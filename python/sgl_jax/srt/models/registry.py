@@ -94,16 +94,6 @@ def import_model_classes():
                     )
                     model_arch_name_to_cls[entry.__name__] = entry
 
-    # Register Multimodal Qwen3-VL
-    try:
-        from sgl_jax.srt.multimodal.models.qwen3_VL import EntryClass as Qwen3VLEntry
-
-        entries = Qwen3VLEntry if isinstance(Qwen3VLEntry, list) else [Qwen3VLEntry]
-        for entry in entries:
-            model_arch_name_to_cls[entry.__name__] = entry
-    except ImportError:
-        pass
-
     return model_arch_name_to_cls
 
 
