@@ -469,6 +469,7 @@ def _fused_ep_moe_kernel(
     a2a_s_acc_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
     a2a_g_hbm,  # (num_experts, bt, t_packing, hidden_size // t_packing)
     a2a_s_q_x2_hbm,  # (2, align_to(bt * num_devices * top_k, bts), comm_packing, hidden_size // comm_packing)
+    a2a_g_q_hbm,  # (num_experts, bt, comm_packing, hidden_size // comm_packing)
     bias_hbm,  # None | F32(padded_num_experts,)
     w1_shared_hbm,  # None | (hidden_size, se_intermediate_size)
     w3_shared_hbm,  # None | (hidden_size, se_intermediate_size)
@@ -591,6 +592,8 @@ def _fused_ep_moe_kernel(
     assert hidden_size % comm_packing == 0
     assert a2a_s_q_x2_hbm.shape[-2] == comm_packing
     assert a2a_s_q_x2_hbm.shape[-1] == h_per_comm_packing
+    assert a2a_g_q_hbm.shape[-2] == comm_packing
+    assert a2a_g_q_hbm.shape[-1] == h_per_comm_packing
     bd1_per_t_packing = bd1 // t_packing
     bd2_per_t_packing = bd2 // t_packing
     bd1c_per_t_packing = bd1c // t_packing
@@ -614,6 +617,7 @@ def _fused_ep_moe_kernel(
     if w1_shared_hbm is not None:
         se_inter_size = w2_shared_hbm.shape[0]
         se_total_blocks = cdiv(se_inter_size, bse)
+    enable_comm_quant_gather = enable_comm_quant
 
     def get_mesh_device_id(ep_rank):
         dp_rank = ep_rank // tp_size
@@ -1074,11 +1078,35 @@ def _fused_ep_moe_kernel(
                 my_e_id=my_e_id,
                 e_sem_id=e_sem_id,
             ):
-                pltpu.make_async_copy(
-                    src_ref=src_ref.at[e_sem_id, pl.ds(start, local_sz)],
-                    dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, local_sz)],
-                    sem=a2a_gather_sem,
-                ).start()
+                if enable_comm_quant_gather:
+
+                    def _local_quant_one(i, _):
+                        src_i = start + i
+                        q_i = i
+                        in_copy = pltpu.make_async_copy(
+                            src_ref=src_ref.at[e_sem_id, pl.ds(src_i, 1)],
+                            dst_ref=comm_token_row_vmem,
+                            sem=local_sems.at[bt_sem_id, 13],
+                        )
+                        in_copy.start()
+                        in_copy.wait()
+                        comm_q_row_vmem[...] = _quantize_comm_rows(comm_token_row_vmem[...])
+                        out_copy = pltpu.make_async_copy(
+                            src_ref=comm_q_row_vmem,
+                            dst_ref=a2a_g_q_hbm.at[my_e_id, pl.ds(q_i, 1)],
+                            sem=local_sems.at[bt_sem_id, 13],
+                        )
+                        out_copy.start()
+                        out_copy.wait()
+                        return None
+
+                    lax.fori_loop(0, local_sz, _local_quant_one, None, unroll=False)
+                else:
+                    pltpu.make_async_copy(
+                        src_ref=src_ref.at[e_sem_id, pl.ds(start, local_sz)],
+                        dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, local_sz)],
+                        sem=a2a_gather_sem,
+                    ).start()
 
             @pl.when(remote_sz != 0)
             def _remote_copy(
@@ -1088,18 +1116,50 @@ def _fused_ep_moe_kernel(
                 e_sem_id=e_sem_id,
                 recv_id=recv_id,
             ):
-                pltpu.make_async_remote_copy(
-                    src_ref=src_ref.at[e_sem_id, pl.ds(start, remote_sz)],
-                    dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, remote_sz)],
-                    send_sem=send_x2_sems.at[e_sem_id],
-                    recv_sem=a2a_gather_sem,
-                    device_id=get_mesh_device_id(recv_id),
-                    device_id_type=pltpu.DeviceIdType.MESH,
-                ).start()
+                if enable_comm_quant_gather:
+
+                    def _remote_quant_one(i, _):
+                        src_i = start + i
+                        q_i = i
+                        in_copy = pltpu.make_async_copy(
+                            src_ref=src_ref.at[e_sem_id, pl.ds(src_i, 1)],
+                            dst_ref=comm_token_row_vmem,
+                            sem=local_sems.at[bt_sem_id, 13],
+                        )
+                        in_copy.start()
+                        in_copy.wait()
+                        comm_q_row_vmem[...] = _quantize_comm_rows(comm_token_row_vmem[...])
+                        pltpu.make_async_remote_copy(
+                            src_ref=comm_q_row_vmem,
+                            dst_ref=a2a_g_q_hbm.at[my_e_id, pl.ds(q_i, 1)],
+                            send_sem=send_x2_sems.at[e_sem_id],
+                            recv_sem=a2a_gather_sem,
+                            device_id=get_mesh_device_id(recv_id),
+                            device_id_type=pltpu.DeviceIdType.MESH,
+                        ).start()
+                        pltpu.make_async_copy(
+                            src_ref=comm_q_row_vmem,
+                            dst_ref=comm_q_row_vmem,
+                            sem=send_x2_sems.at[e_sem_id],
+                        ).wait()
+                        return None
+
+                    lax.fori_loop(0, remote_sz, _remote_quant_one, None, unroll=False)
+                else:
+                    pltpu.make_async_remote_copy(
+                        src_ref=src_ref.at[e_sem_id, pl.ds(start, remote_sz)],
+                        dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, remote_sz)],
+                        send_sem=send_x2_sems.at[e_sem_id],
+                        recv_sem=a2a_gather_sem,
+                        device_id=get_mesh_device_id(recv_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
 
             start += sz
 
     def wait_a2a_gather_send(*, bt_sem_id, e_sem_id, local_e_id):
+        if enable_comm_quant_gather:
+            return
         my_e_id = my_id * local_num_experts + local_e_id
         sz = expert_sizes_x2_smem[bt_sem_id, 0, my_e_id]
         local_sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, my_e_id]
@@ -1131,12 +1191,63 @@ def _fused_ep_moe_kernel(
 
             @pl.when(sz != 0)
             def _():
-                ref = a2a_g_hbm.at[e_id, pl.ds(0, sz)]
-                pltpu.make_async_copy(
-                    src_ref=ref,
-                    dst_ref=ref,
-                    sem=a2a_gather_sem,
-                ).wait()
+                if enable_comm_quant_gather:
+                    recv_id = e_id // local_num_experts
+                    is_local = recv_id == my_id
+
+                    def _deq_one(i, _):
+                        @pl.when(is_local != 0)
+                        def _local_row():
+                            q_copy = pltpu.make_async_copy(
+                                src_ref=a2a_g_q_hbm.at[e_id, pl.ds(i, 1)],
+                                dst_ref=comm_q_row_vmem,
+                                sem=local_sems.at[bt_sem_id, 13],
+                            )
+                            q_copy.start()
+                            q_copy.wait()
+                            comm_token_row_vmem[...] = _dequantize_comm_rows(comm_q_row_vmem[...])
+                            out_copy = pltpu.make_async_copy(
+                                src_ref=comm_token_row_vmem,
+                                dst_ref=a2a_g_hbm.at[e_id, pl.ds(i, 1)],
+                                sem=local_sems.at[bt_sem_id, 13],
+                            )
+                            out_copy.start()
+                            out_copy.wait()
+
+                        @pl.when(is_local == 0)
+                        def _remote_row():
+                            ref = a2a_g_q_hbm.at[e_id, pl.ds(i, 1)]
+                            pltpu.make_async_copy(
+                                src_ref=ref,
+                                dst_ref=ref,
+                                sem=a2a_gather_sem,
+                            ).wait()
+                            q_copy = pltpu.make_async_copy(
+                                src_ref=a2a_g_q_hbm.at[e_id, pl.ds(i, 1)],
+                                dst_ref=comm_q_row_vmem,
+                                sem=local_sems.at[bt_sem_id, 13],
+                            )
+                            q_copy.start()
+                            q_copy.wait()
+                            comm_token_row_vmem[...] = _dequantize_comm_rows(comm_q_row_vmem[...])
+                            out_copy = pltpu.make_async_copy(
+                                src_ref=comm_token_row_vmem,
+                                dst_ref=a2a_g_hbm.at[e_id, pl.ds(i, 1)],
+                                sem=local_sems.at[bt_sem_id, 13],
+                            )
+                            out_copy.start()
+                            out_copy.wait()
+
+                        return None
+
+                    lax.fori_loop(0, sz, _deq_one, None, unroll=False)
+                else:
+                    ref = a2a_g_hbm.at[e_id, pl.ds(0, sz)]
+                    pltpu.make_async_copy(
+                        src_ref=ref,
+                        dst_ref=ref,
+                        sem=a2a_gather_sem,
+                    ).wait()
 
             return None
 
@@ -3071,6 +3182,7 @@ def fused_ep_moe(
                     hbm_block_spec,  # a2a_s_acc_x2_hbm
                     hbm_block_spec,  # a2a_g_hbm
                     hbm_block_spec,  # a2a_s_q_x2_hbm
+                    hbm_block_spec,  # a2a_g_q_hbm
                     None if bias is None else hbm_block_spec,  # bias_hbm
                     None if w1_shared is None else hbm_block_spec,  # w1_shared_hbm
                     None if w3_shared is None else hbm_block_spec,  # w3_shared_hbm
@@ -3157,6 +3269,7 @@ def fused_ep_moe(
             P(),  # a2a_s_acc_x2_hbm
             P(),  # a2a_g_hbm
             P(),  # a2a_s_q_x2_hbm
+            P(),  # a2a_g_q_hbm
             None if bias is None else P(),
             None if w1_shared is None else P(),  # w1_shared
             None if w3_shared is None else P(),  # w3_shared
@@ -3184,6 +3297,7 @@ def fused_ep_moe(
         a2a_s_acc_x2_hbm_scratch,
         a2a_g_hbm_scratch,
         a2a_s_q_x2_hbm_scratch,
+        a2a_g_q_hbm_scratch,
         bias,
         w1_shared=None,
         w3_shared=None,
@@ -3222,6 +3336,7 @@ def fused_ep_moe(
             ),  # a2a_s_acc_x2_hbm
             pltpu.with_memory_space_constraint(a2a_g_hbm_scratch, pltpu.HBM),  # a2a_g_hbm
             pltpu.with_memory_space_constraint(a2a_s_q_x2_hbm_scratch, pltpu.HBM),  # a2a_s_q_x2_hbm
+            pltpu.with_memory_space_constraint(a2a_g_q_hbm_scratch, pltpu.HBM),  # a2a_g_q_hbm
             (None if bias is None else pltpu.with_memory_space_constraint(bias, pltpu.HBM)),
             (
                 None
@@ -3267,6 +3382,10 @@ def fused_ep_moe(
         (2, a2a_max_tokens_with_top_k, comm_packing, hidden_size // comm_packing),
         comm_q_dtype,
     )
+    a2a_g_q_hbm_scratch = pl.empty(
+        (num_experts, bt, comm_packing, hidden_size // comm_packing),
+        comm_q_dtype,
+    )
 
     return kernel(
         tokens,
@@ -3284,6 +3403,7 @@ def fused_ep_moe(
         a2a_s_acc_x2_hbm_scratch,
         a2a_g_hbm_scratch,
         a2a_s_q_x2_hbm_scratch,
+        a2a_g_q_hbm_scratch,
         bias,
         w1_shared,
         w3_shared,
