@@ -62,6 +62,8 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 GLOBAL_SERVER_ARGS_KEYS = [
     "device",
     "disable_radix_cache",
+    "multi_item_scoring_delimiter",
+    "max_multi_item_seq_len",
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
     "enable_deterministic_sampling",
@@ -168,6 +170,8 @@ class Req:
         vocab_size: int | None = None,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        is_multi_item_scoring: bool = False,
+        multi_item_scoring_delimiter: int | None = None,
     ):
         # Input and output info
         self.rid = rid
@@ -194,6 +198,8 @@ class Req:
         # Sampling info
         self.sampling_params = sampling_params
         self.return_hidden_states = return_hidden_states
+        self.is_multi_item_scoring = is_multi_item_scoring
+        self.multi_item_scoring_delimiter = multi_item_scoring_delimiter
 
         # Extra key for cache namespace isolation (e.g., cache_salt, lora_id)
         if lora_id is not None:
@@ -630,9 +636,9 @@ class ScheduleBatch:
         return_output_logprob_only = all(req.return_output_logprob_only for req in reqs)
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            assert tree_cache is None or isinstance(
-                tree_cache, (SWARadixCache, ChunkCache)
-            ), "SWARadixCache or ChunkCache is required for SWATokenToKVPoolAllocator"
+            assert tree_cache is None or isinstance(tree_cache, SWARadixCache | ChunkCache), (
+                "SWARadixCache or ChunkCache is required for SWATokenToKVPoolAllocator"
+            )
             is_hybrid = True
 
         return cls(
@@ -1211,14 +1217,23 @@ class ScheduleBatch:
 
         # Calculate positions and extend_start_loc after padding
         if self.forward_mode.is_extend():
-            # For prefill: create positions for each token in sequences
-            # Calculate total tokens without padding first
-            total_tokens_before_padding = sum([extend_len for extend_len in self.extend_lens])
-            positions_cpu = np.concatenate(
-                [
-                    np.arange(prefix_len, seq_len, dtype=seq_lens_cpu.dtype)
-                    for seq_len, prefix_len in zip(seq_lens_cpu, self.prefix_lens)
-                ]
+            # For prefill: create positions for each token in sequences.
+            # Multi-item scoring requests use delimiter-reset positions to remove
+            # length-coupled position drift across item blocks.
+            total_tokens_before_padding = sum(self.extend_lens)
+            position_chunks = [
+                _build_extend_positions_for_req(
+                    req=req,
+                    seq_len=int(seq_len),
+                    prefix_len=int(prefix_len),
+                    dtype=seq_lens_cpu.dtype,
+                )
+                for req, seq_len, prefix_len in zip(self.reqs, seq_lens_cpu, self.prefix_lens)
+            ]
+            positions_cpu = (
+                np.concatenate(position_chunks)
+                if position_chunks
+                else np.array([], dtype=seq_lens_cpu.dtype)
             )
 
             # If input_ids was padded, pad positions too
@@ -1416,6 +1431,14 @@ class ScheduleBatch:
                         dtype=input_embedding.dtype,
                     )
                     input_embedding = np.concatenate([input_embedding, pad], axis=0)
+        multi_item_scoring_flags = np.array(
+            [req.is_multi_item_scoring for req in self.reqs] + [False] * bs_padding_size,
+            dtype=np.bool_,
+        )
+        multi_item_scoring_delimiter = next(
+            (req.multi_item_scoring_delimiter for req in self.reqs if req.is_multi_item_scoring),
+            None,
+        )
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -1428,6 +1451,9 @@ class ScheduleBatch:
             return_output_logprob_only=self.return_output_logprob_only,
             top_logprobs_nums=self.top_logprobs_nums,
             token_ids_logprobs=self.token_ids_logprobs,
+            is_prefill_only=self.is_prefill_only,
+            multi_item_scoring_flags=multi_item_scoring_flags,
+            multi_item_scoring_delimiter=multi_item_scoring_delimiter,
             sampling_info=sampling_info,
             positions=positions_cpu,
             mrope_positions=mrope_positions_cpu,
@@ -1492,19 +1518,20 @@ class ScheduleBatch:
             # For prefill: create positions for each token in sequences
             # Calculate total tokens without padding first
             if positions_cpu is None:
-                lengths = seq_lens_cpu - self.prefix_lens
-                if len(lengths) > 0:
-                    repeats = lengths
-                    total_len = np.sum(repeats)
-                    # Generate range [0, 1, ... len-1] for each sequence
-                    block_starts = np.concatenate(([0], np.cumsum(repeats)[:-1]))
-                    shifts = np.repeat(block_starts, repeats)
-                    ranges = np.arange(total_len) - shifts
-                    # Add prefix_len to each range
-                    positions_cpu = np.repeat(self.prefix_lens, repeats) + ranges
-                    positions_cpu = positions_cpu.astype(seq_lens_cpu.dtype)
-                else:
-                    positions_cpu = np.array([], dtype=seq_lens_cpu.dtype)
+                position_chunks = [
+                    _build_extend_positions_for_req(
+                        req=req,
+                        seq_len=int(seq_len),
+                        prefix_len=int(prefix_len),
+                        dtype=seq_lens_cpu.dtype,
+                    )
+                    for req, seq_len, prefix_len in zip(self.reqs, seq_lens_cpu, self.prefix_lens)
+                ]
+                positions_cpu = (
+                    np.concatenate(position_chunks)
+                    if position_chunks
+                    else np.array([], dtype=seq_lens_cpu.dtype)
+                )
             # Start location of each sequence in the flattened array
             extend_start_loc = np.cumsum(
                 np.concatenate([np.array([0]), extend_seq_lens[:-1]]),
@@ -1601,6 +1628,13 @@ class ScheduleBatch:
             self._generate_trace_info(real_bs, bid)
         # Extract lora_ids from requests
         lora_ids = [req.lora_id for req in self.reqs]
+        multi_item_scoring_flags = np.array(
+            [req.is_multi_item_scoring for req in self.reqs], dtype=np.bool_
+        )
+        multi_item_scoring_delimiter = next(
+            (req.multi_item_scoring_delimiter for req in self.reqs if req.is_multi_item_scoring),
+            None,
+        )
 
         return ModelWorkerBatch(
             bid=bid,
@@ -1614,6 +1648,9 @@ class ScheduleBatch:
             return_output_logprob_only=self.return_output_logprob_only,
             top_logprobs_nums=self.top_logprobs_nums,
             token_ids_logprobs=self.token_ids_logprobs,
+            is_prefill_only=self.is_prefill_only,
+            multi_item_scoring_flags=multi_item_scoring_flags,
+            multi_item_scoring_delimiter=multi_item_scoring_delimiter,
             sampling_info=self.sampling_info,
             positions=positions_cpu,
             mrope_positions=mrope_positions_cpu,
@@ -1734,6 +1771,64 @@ def align_to_size(lst: list, size: int, value: int = 0) -> list:
     return lst[:] + [value] * (align_len - len(lst))
 
 
+def _build_multi_item_extend_positions(
+    tokens: np.ndarray, delimiter_token_id: int, dtype: np.dtype
+) -> np.ndarray:
+    """Build RoPE positions with per-item reset for multi-item scoring.
+
+    Layout:
+      query<d>item1<d>item2<d>...<d>
+
+    Query keeps standard causal positions [0..query_len-1].
+    For each item block, positions reset at the block delimiter:
+      delimiter -> query_len
+      first item token -> query_len + 1
+      ...
+    """
+    if tokens.size == 0:
+        return np.array([], dtype=dtype)
+
+    delimiter_indices = np.flatnonzero(tokens == delimiter_token_id)
+    if delimiter_indices.size == 0:
+        raise ValueError(
+            f"Multi-item scoring sequence must contain delimiter token {delimiter_token_id}."
+        )
+
+    query_len = int(delimiter_indices[0])
+    if query_len <= 0:
+        raise ValueError("Multi-item scoring requires a non-empty query prefix before delimiter.")
+
+    positions = np.empty(tokens.shape[0], dtype=dtype)
+    positions[:query_len] = np.arange(query_len, dtype=dtype)
+
+    suffix_idx = np.arange(query_len, tokens.shape[0], dtype=np.int32)
+    seg_ids = np.searchsorted(delimiter_indices, suffix_idx, side="right") - 1
+    seg_starts = delimiter_indices[seg_ids]
+    positions[suffix_idx] = query_len + (suffix_idx - seg_starts)
+    return positions
+
+
+def _build_extend_positions_for_req(req: Req, seq_len: int, prefix_len: int, dtype: np.dtype) -> np.ndarray:
+    if req.is_multi_item_scoring and req.multi_item_scoring_delimiter is not None:
+        if prefix_len != 0:
+            raise ValueError(
+                "Multi-item scoring requires extend mode without cached prefix "
+                f"(got prefix_len={prefix_len})."
+            )
+        req_tokens = np.asarray(req.fill_ids[prefix_len:seq_len], dtype=np.int32)
+        positions = _build_multi_item_extend_positions(
+            req_tokens, req.multi_item_scoring_delimiter, dtype
+        )
+        expected_len = seq_len - prefix_len
+        if len(positions) != expected_len:
+            raise ValueError(
+                f"Invalid multi-item position shape: expected {expected_len}, got {len(positions)}."
+            )
+        return positions
+
+    return np.arange(prefix_len, seq_len, dtype=dtype)
+
+
 def _extract_mm_value(mm_inputs: Any, key: str):
     if mm_inputs is None:
         return None
@@ -1745,7 +1840,7 @@ def _extract_mm_value(mm_inputs: Any, key: str):
 def _as_int_scalar(value: Any, default: int = 0) -> int:
     if value is None:
         return default
-    if isinstance(value, (np.ndarray, jax.Array)):
+    if isinstance(value, np.ndarray | jax.Array):
         arr = np.asarray(value)
         if arr.size == 0:
             return default
@@ -1861,6 +1956,9 @@ class ModelWorkerBatch:
     return_output_logprob_only: bool
     top_logprobs_nums: list[int] | None
     token_ids_logprobs: list[list[int]] | None
+    is_prefill_only: bool
+    multi_item_scoring_flags: np.ndarray | None
+    multi_item_scoring_delimiter: int | None
 
     # For extend
     # extend_num_tokens: Optional[int]

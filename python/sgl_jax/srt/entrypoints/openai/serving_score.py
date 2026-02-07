@@ -8,6 +8,7 @@ from sgl_jax.srt.entrypoints.openai.protocol import (
     ScoringResponse,
 )
 from sgl_jax.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sgl_jax.srt.validation import ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -56,5 +57,12 @@ class OpenAIServingScore(OpenAIServingBase):
             )
             return response
 
+        except ValidationError as e:
+            return self.create_error_response(
+                e.message,
+                err_type=e.error_type,
+                status_code=e.get_http_status(),
+                param=e.param,
+            )
         except ValueError as e:
             return self.create_error_response(str(e))

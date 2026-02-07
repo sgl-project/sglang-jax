@@ -12,7 +12,11 @@ Usage:
 
 import pytest
 
-from sgl_jax.srt.validation import ValidationError, validate_score_request
+from sgl_jax.srt.validation import (
+    ValidationError,
+    validate_multi_item_scoring_request,
+    validate_score_request,
+)
 
 
 class TestValidationError:
@@ -223,6 +227,78 @@ class TestValidateScoreRequest:
                 label_token_ids=[1, 2],
             )
         assert exc_info.value.code == "invalid_token_id_type"
+
+
+class TestValidateMultiItemScoringRequest:
+    """Tests for multi-item scoring specific validation."""
+
+    def test_valid_multi_item_request(self):
+        validate_multi_item_scoring_request(
+            query_tokens=[10, 11, 12],
+            item_tokens=[[20], [21, 22]],
+            delimiter_token_id=999,
+            max_items=8,
+            max_total_seq_len=64,
+        )
+
+    def test_empty_query_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            validate_multi_item_scoring_request(
+                query_tokens=[],
+                item_tokens=[[20]],
+                delimiter_token_id=999,
+            )
+        assert exc_info.value.code == "empty_query"
+
+    def test_item_count_limit_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            validate_multi_item_scoring_request(
+                query_tokens=[10],
+                item_tokens=[[i] for i in range(9)],
+                delimiter_token_id=999,
+                max_items=8,
+            )
+        assert exc_info.value.code == "too_many_items"
+
+    def test_delimiter_collision_in_query_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            validate_multi_item_scoring_request(
+                query_tokens=[10, 999],
+                item_tokens=[[20]],
+                delimiter_token_id=999,
+            )
+        assert exc_info.value.code == "delimiter_collision"
+        assert exc_info.value.param == "query"
+
+    def test_delimiter_collision_in_items_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            validate_multi_item_scoring_request(
+                query_tokens=[10],
+                item_tokens=[[20], [999, 21]],
+                delimiter_token_id=999,
+            )
+        assert exc_info.value.code == "delimiter_collision"
+        assert exc_info.value.param == "items"
+
+    def test_total_sequence_len_limit_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            validate_multi_item_scoring_request(
+                query_tokens=[1, 2, 3],
+                item_tokens=[[4] * 10, [5] * 10],
+                delimiter_token_id=999,
+                max_total_seq_len=20,
+            )
+        assert exc_info.value.code == "multi_item_sequence_too_long"
+
+    def test_total_sequence_len_check_can_be_disabled(self):
+        # Same inputs as the rejection case, but skip total-length check.
+        validate_multi_item_scoring_request(
+            query_tokens=[1, 2, 3],
+            item_tokens=[[4] * 10, [5] * 10],
+            delimiter_token_id=999,
+            max_total_seq_len=20,
+            enforce_total_seq_len=False,
+        )
 
     # =========================================================================
     # label_token_ids validation tests

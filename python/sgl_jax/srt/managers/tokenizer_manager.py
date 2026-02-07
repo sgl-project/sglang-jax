@@ -67,7 +67,11 @@ from sgl_jax.srt.utils import (
     get_zmq_socket,
     kill_process_tree,
 )
-from sgl_jax.srt.validation import validate_score_request
+from sgl_jax.srt.validation import (
+    ValidationError,
+    validate_multi_item_scoring_request,
+    validate_score_request,
+)
 from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -173,6 +177,7 @@ class TokenizerManager:
                 revision=server_args.revision,
                 sub_dir=tokenizer_subdir,
             )
+        self._validate_multi_item_delimiter_token()
 
         # Store states
         self.no_create_loop = False
@@ -252,6 +257,33 @@ class TokenizerManager:
             ]
         )
         self.wait_timeout = int(os.environ.get("SGLANG_WAIT_TIMEOUT", "4"))
+
+    def _validate_multi_item_delimiter_token(self):
+        delimiter_token_id = self.server_args.multi_item_scoring_delimiter
+        if delimiter_token_id is None or self.tokenizer is None:
+            return
+
+        try:
+            token_count = len(self.tokenizer)
+        except Exception:
+            return
+
+        if not (0 <= delimiter_token_id < token_count):
+            raise ValueError(
+                f"Invalid multi-item scoring delimiter token id {delimiter_token_id}: "
+                f"must be in [0, {token_count - 1}]"
+            )
+
+    @staticmethod
+    def _build_multi_item_token_sequence(
+        query_tokens: list[int], item_tokens: list[list[int]], delimiter_token_id: int
+    ) -> list[int]:
+        combined = query_tokens[:]
+        for tokens in item_tokens:
+            combined.append(delimiter_token_id)
+            combined.extend(tokens)
+        combined.append(delimiter_token_id)
+        return combined
 
     async def generate_request(
         self,
@@ -364,19 +396,21 @@ class TokenizerManager:
         # Build return object
 
         tokenized_obj = TokenizedGenerateReqInput(
-            obj.rid,
-            input_text,
-            input_ids,
-            sampling_params,
-            obj.return_logprob,
-            obj.return_output_logprob_only,
-            obj.logprob_start_len,
-            obj.top_logprobs_num,
-            obj.token_ids_logprob,
-            obj.stream,
-            obj.lora_id,
-            obj.extra_key,
-            obj.return_routed_experts,
+            rid=obj.rid,
+            text=input_text,
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_logprob=obj.return_logprob,
+            return_output_logprob_only=obj.return_output_logprob_only,
+            logprob_start_len=obj.logprob_start_len,
+            top_logprobs_num=obj.top_logprobs_num,
+            token_ids_logprob=obj.token_ids_logprob,
+            stream=obj.stream,
+            lora_id=obj.lora_id,
+            extra_key=obj.extra_key,
+            return_routed_experts=obj.return_routed_experts,
+            is_multi_item_scoring=bool(obj.is_multi_item_scoring),
+            multi_item_scoring_delimiter=obj.multi_item_scoring_delimiter,
         )
         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
         if (
@@ -1221,17 +1255,135 @@ class TokenizerManager:
         See Engine.score() for more details.
         """
         # Comprehensive validation per RFC-006
-        vocab_size = self.tokenizer.vocab_size if self.tokenizer is not None else None
-        validate_score_request(
-            query=query,
-            items=items,
-            label_token_ids=label_token_ids,
-            apply_softmax=apply_softmax,
-            item_first=item_first,
-            vocab_size=vocab_size,
-        )
+        vocab_size = len(self.tokenizer) if self.tokenizer is not None else None
+        try:
+            validate_score_request(
+                query=query,
+                items=items,
+                label_token_ids=label_token_ids,
+                apply_softmax=apply_softmax,
+                item_first=item_first,
+                vocab_size=vocab_size,
+            )
+        except ValidationError as e:
+            raise ValueError(e.message) from e
 
-        # Handle string or tokenized query/items
+        delimiter_token_id = self.server_args.multi_item_scoring_delimiter
+        use_multi_item_scoring = delimiter_token_id is not None
+
+        if use_multi_item_scoring and item_first:
+            logger.warning("Ignoring item_first=True in multi-item scoring mode.")
+
+        def _convert_logprobs(logprobs_data: list) -> list[float]:
+            logprobs = {}
+            for logprob, token_id, _ in logprobs_data:
+                if token_id in label_token_ids:
+                    logprobs[token_id] = logprob
+            score_list = [logprobs.get(token_id, float("-inf")) for token_id in label_token_ids]
+            if apply_softmax:
+                return softmax(score_list).tolist()
+            return [math.exp(x) if x != float("-inf") else 0.0 for x in score_list]
+
+        async def _score_multi_item_tokenized(
+            query_tokens: list[int], item_tokens: list[list[int]]
+        ) -> list[list[float]]:
+            item_count = len(item_tokens)
+            chunk_size = int(self.server_args.multi_item_scoring_chunk_size)
+            if chunk_size <= 0:
+                chunk_size = item_count
+            chunk_size = max(1, min(chunk_size, item_count))
+
+            try:
+                # Validate query/items constraints once. Sequence-length limit is checked per chunk.
+                validate_multi_item_scoring_request(
+                    query_tokens=query_tokens,
+                    item_tokens=item_tokens,
+                    delimiter_token_id=delimiter_token_id,
+                    max_items=128,
+                    max_total_seq_len=self.server_args.max_multi_item_seq_len,
+                    enforce_total_seq_len=False,
+                )
+            except ValidationError as e:
+                raise ValueError(e.message) from e
+
+            if chunk_size < item_count:
+                logger.info(
+                    "Multi-item scoring request split into %d chunks (items=%d, chunk_size=%d).",
+                    (item_count + chunk_size - 1) // chunk_size,
+                    item_count,
+                    chunk_size,
+                )
+
+            all_scores: list[list[float]] = []
+            for start in range(0, item_count, chunk_size):
+                chunk_tokens = item_tokens[start : start + chunk_size]
+                try:
+                    validate_multi_item_scoring_request(
+                        query_tokens=query_tokens,
+                        item_tokens=chunk_tokens,
+                        delimiter_token_id=delimiter_token_id,
+                        max_items=128,
+                        max_total_seq_len=self.server_args.max_multi_item_seq_len,
+                    )
+                except ValidationError as e:
+                    raise ValueError(e.message) from e
+
+                combined_input_ids = self._build_multi_item_token_sequence(
+                    query_tokens, chunk_tokens, delimiter_token_id
+                )
+                batch_request = GenerateReqInput(
+                    input_ids=[combined_input_ids],
+                    return_logprob=True,
+                    logprob_start_len=0,
+                    token_ids_logprob=label_token_ids,
+                    stream=False,
+                    sampling_params={"max_new_tokens": 0},
+                    is_multi_item_scoring=True,
+                    multi_item_scoring_delimiter=delimiter_token_id,
+                )
+                results = await self.generate_request(batch_request, request).__anext__()
+                result = results[0] if isinstance(results, list) else results
+                input_logprobs = result["meta_info"].get("input_token_ids_logprobs", [])
+                if not input_logprobs:
+                    raise RuntimeError(
+                        "input_token_ids_logprobs is empty for multi-item scoring request "
+                        f"{result['meta_info'].get('id', '<unknown>')}."
+                    )
+
+                expected_count = len(chunk_tokens) + 1
+                if len(input_logprobs) != expected_count:
+                    raise RuntimeError(
+                        f"Expected {expected_count} input_token_ids_logprobs entries for "
+                        f"{len(chunk_tokens)} items, got {len(input_logprobs)}."
+                    )
+
+                # Skip the query/item1 boundary and use one delimiter score per item.
+                all_scores.extend(
+                    [_convert_logprobs(input_logprobs[idx + 1]) for idx in range(len(chunk_tokens))]
+                )
+
+            return all_scores
+
+        if use_multi_item_scoring:
+            if isinstance(query, str) and isinstance(items, list) and (
+                not items or isinstance(items[0], str)
+            ):
+                if self.tokenizer is None:
+                    raise ValueError("Tokenizer is required for text multi-item scoring.")
+                query_tokens = self.tokenizer.encode(query, add_special_tokens=False)
+                item_tokens = [self.tokenizer.encode(item, add_special_tokens=False) for item in items]
+                return await _score_multi_item_tokenized(query_tokens, item_tokens)
+            elif (
+                isinstance(query, list)
+                and isinstance(items, list)
+                and items
+                and isinstance(items[0], list)
+            ):
+                return await _score_multi_item_tokenized(query, items)
+            else:
+                raise ValueError("Invalid combination of query/items types for score_request.")
+
+        # Handle string or tokenized query/items in single-item mode
         if isinstance(query, str) and (
             isinstance(items, str)
             or (isinstance(items, list) and (not items or isinstance(items[0], str)))
@@ -1248,6 +1400,7 @@ class TokenizerManager:
                 token_ids_logprob=label_token_ids,
                 stream=False,
                 sampling_params={"max_new_tokens": 0},  # Prefill-only: no generation needed
+                is_multi_item_scoring=False,
             )
         elif (
             isinstance(query, list)
@@ -1266,6 +1419,7 @@ class TokenizerManager:
                 token_ids_logprob=label_token_ids,
                 stream=False,
                 sampling_params={"max_new_tokens": 0},  # Prefill-only: no generation needed
+                is_multi_item_scoring=False,
             )
         else:
             raise ValueError("Invalid combination of query/items types for score_request.")
@@ -1274,7 +1428,6 @@ class TokenizerManager:
         scores = []
 
         for result in results:
-            # Validate output_token_ids_logprobs exists and is not empty
             output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
             if not output_logprobs or len(output_logprobs) == 0:
                 raise RuntimeError(
@@ -1282,26 +1435,7 @@ class TokenizerManager:
                     f"{result['meta_info'].get('id', '<unknown>')}. "
                     "This indicates token_ids_logprobs were not computed properly."
                 )
-
-            # Get logprobs for each token
-            logprobs = {}
-            for logprob, token_id, _ in output_logprobs[0]:
-                if token_id in label_token_ids:
-                    logprobs[token_id] = logprob
-
-            # Get scores in order of label_token_ids
-            score_list = [logprobs.get(token_id, float("-inf")) for token_id in label_token_ids]
-
-            # Apply softmax to logprobs if needed
-            if apply_softmax:
-                # Use scipy softmax to keep TokenizerManager device-agnostic (ADR-001)
-                # Matches PyTorch sglang: torch.softmax(torch.tensor(score_list), dim=0)
-                score_list = softmax(score_list).tolist()
-            else:
-                # Convert logprobs to probabilities if not using softmax
-                score_list = [math.exp(x) if x != float("-inf") else 0.0 for x in score_list]
-
-            scores.append(score_list)
+            scores.append(_convert_logprobs(output_logprobs[0]))
 
         return scores
 

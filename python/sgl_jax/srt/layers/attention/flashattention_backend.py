@@ -14,7 +14,7 @@ from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
 )
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import RadixAttention
-from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
+from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
@@ -97,6 +97,64 @@ class FlashAttention(AttentionBackend):
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
 
+    @staticmethod
+    def _build_causal_extend_mask(q_len: int, kv_len: int) -> np.ndarray:
+        """Build causal mask for extend requests where q corresponds to suffix tokens."""
+        mask = np.zeros((q_len, kv_len), dtype=np.int32)
+        prefix_len = kv_len - q_len
+        for q_pos in range(q_len):
+            mask[q_pos, : prefix_len + q_pos + 1] = 1
+        return mask
+
+    @staticmethod
+    def _build_multi_item_attention_mask(tokens: np.ndarray, delimiter_token_id: int) -> np.ndarray:
+        """Build shared-prefix + block-diagonal mask for a single multi-item sequence.
+
+        Layout: query<d1>item1<d2>item2<d3>...itemN<d{N+1}>
+
+        - Shared prefix is query + first delimiter d1.
+        - Each item block is isolated from other item blocks.
+        - Delimiter after each item belongs to the same block as that item.
+        """
+        q_len = tokens.shape[0]
+        kv_len = q_len
+        delimiter_indices = np.flatnonzero(tokens == delimiter_token_id)
+        if delimiter_indices.size == 0:
+            raise ValueError(
+                f"Multi-item scoring sequence must contain delimiter token {delimiter_token_id}."
+            )
+
+        query_len = int(delimiter_indices[0])
+        if query_len <= 0:
+            raise ValueError("Multi-item scoring requires a non-empty query prefix before delimiter.")
+        if delimiter_indices.size < 2:
+            raise ValueError("Multi-item scoring sequence must contain at least two delimiters.")
+
+        # Shared prefix includes query plus the first delimiter.
+        prefix_end = query_len + 1
+
+        mask = np.zeros((q_len, kv_len), dtype=np.int32)
+
+        # Causal attention in the shared prefix.
+        for q_pos in range(prefix_end):
+            mask[q_pos, : q_pos + 1] = 1
+
+        # For block i:
+        #   start = delimiter_indices[i] + 1         (first token of item i+1)
+        #   end_d = delimiter_indices[i + 1]         (delimiter after item i+1)
+        # Tokens in [start, end_d] attend to shared prefix + causal within [start, end_d].
+        for i in range(delimiter_indices.size - 1):
+            seg_start = int(delimiter_indices[i]) + 1
+            seg_end_delim = int(delimiter_indices[i + 1])
+            if seg_start > seg_end_delim:
+                raise ValueError("Invalid multi-item delimiter layout: empty item block boundary.")
+
+            for q_pos in range(seg_start, seg_end_delim + 1):
+                mask[q_pos, :prefix_end] = 1
+                mask[q_pos, seg_start : q_pos + 1] = 1
+
+        return mask
+
     def get_forward_metadata(
         self,
         batch: ModelWorkerBatch,
@@ -162,6 +220,72 @@ class FlashAttention(AttentionBackend):
             (num_seqs, cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
             sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
         )
+
+        # Multi-item scoring uses a custom attention mask to isolate item blocks.
+        # Use a fixed mask size based on the token-padding bucket (T^2) to keep
+        # the JAX shape static and avoid recompilation per request.
+        if (
+            batch.forward_mode == ForwardMode.EXTEND
+            and batch.multi_item_scoring_delimiter is not None
+            and batch.multi_item_scoring_flags is not None
+            and np.any(batch.multi_item_scoring_flags[: batch.real_bs])
+        ):
+            max_multi_item_seq_len = int(global_server_args_dict.get("max_multi_item_seq_len", 8192))
+            padded_token_len = int(batch.input_ids.shape[0])
+            if padded_token_len > max_multi_item_seq_len:
+                raise ValueError(
+                    f"Multi-item scoring padded token length {padded_token_len} exceeds "
+                    f"max_multi_item_seq_len={max_multi_item_seq_len}."
+                )
+
+            static_size = padded_token_len * padded_token_len
+            concatenated_mask = np.zeros(static_size, dtype=np.int32)
+            mask_write_pt = 0
+            token_pt = 0
+            for req_idx in range(batch.real_bs):
+                q_len = int(batch.extend_seq_lens[req_idx])
+                kv_len = int(batch.seq_lens[req_idx])
+                if q_len <= 0 or kv_len <= 0:
+                    continue
+
+                req_tokens = np.asarray(batch.input_ids[token_pt : token_pt + q_len], dtype=np.int32)
+                token_pt += q_len
+
+                if batch.multi_item_scoring_flags[req_idx]:
+                    # Radix cache is disabled for multi-item mode, so q_len == kv_len.
+                    if kv_len != q_len:
+                        raise ValueError(
+                            "Multi-item scoring requires extend mode without prefix cache "
+                            f"(got q_len={q_len}, kv_len={kv_len})."
+                        )
+                    req_mask = self._build_multi_item_attention_mask(
+                        req_tokens,
+                        batch.multi_item_scoring_delimiter,
+                    )
+                else:
+                    req_mask = self._build_causal_extend_mask(q_len=q_len, kv_len=kv_len)
+
+                req_mask_flat = req_mask.reshape(-1)
+                next_pt = mask_write_pt + req_mask_flat.size
+                if next_pt > static_size:
+                    raise ValueError(
+                        f"Constructed custom mask is too large ({next_pt}) "
+                        f"for static size {static_size}."
+                    )
+                concatenated_mask[mask_write_pt:next_pt] = req_mask_flat
+                mask_write_pt = next_pt
+
+            if mask_write_pt > static_size:
+                raise ValueError(
+                    f"Constructed custom mask is too large ({mask_write_pt}) "
+                    f"for static size {static_size}."
+                )
+            metadata.custom_mask = device_array(
+                concatenated_mask,
+                sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
+            )
+        else:
+            metadata.custom_mask = None
         return metadata
 
     def get_eagle_forward_metadata(self, batch: ModelWorkerBatch):

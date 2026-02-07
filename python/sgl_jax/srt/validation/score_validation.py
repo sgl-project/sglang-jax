@@ -304,3 +304,68 @@ def validate_score_request(
             param="item_first",
             code="invalid_item_first_type",
         )
+
+
+def validate_multi_item_scoring_request(
+    query_tokens: list[int],
+    item_tokens: list[list[int]],
+    delimiter_token_id: int,
+    max_items: int = 128,
+    max_total_seq_len: int = 8192,
+    enforce_total_seq_len: bool = True,
+) -> None:
+    """Validate additional constraints required by multi-item scoring mode."""
+    if len(query_tokens) < 1:
+        raise ValidationError(
+            message="query must have at least one token for multi-item scoring",
+            error_type="invalid_value_error",
+            param="query",
+            code="empty_query",
+        )
+
+    if len(item_tokens) > max_items:
+        raise ValidationError(
+            message=f"Too many items for multi-item scoring: {len(item_tokens)} > {max_items}",
+            error_type="invalid_value_error",
+            param="items",
+            code="too_many_items",
+        )
+
+    if delimiter_token_id in query_tokens:
+        raise ValidationError(
+            message=(
+                f"Delimiter token {delimiter_token_id} appears in query tokens. "
+                "Choose a different delimiter or modify the query."
+            ),
+            error_type="invalid_request_error",
+            param="query",
+            code="delimiter_collision",
+        )
+
+    for idx, tokens in enumerate(item_tokens):
+        if delimiter_token_id in tokens:
+            raise ValidationError(
+                message=(
+                    f"Delimiter token {delimiter_token_id} appears in items[{idx}]. "
+                    "Choose a different delimiter or modify the item."
+                ),
+                error_type="invalid_request_error",
+                param="items",
+                code="delimiter_collision",
+            )
+
+    # Combined format: query<d>item1<d>...<d>itemN<d>
+    if enforce_total_seq_len:
+        combined_len = (
+            len(query_tokens) + sum(len(tokens) for tokens in item_tokens) + len(item_tokens) + 1
+        )
+        if combined_len > max_total_seq_len:
+            raise ValidationError(
+                message=(
+                    f"Multi-item combined sequence too long: {combined_len} tokens exceeds "
+                    f"max_multi_item_seq_len={max_total_seq_len}."
+                ),
+                error_type="invalid_value_error",
+                param="items",
+                code="multi_item_sequence_too_long",
+            )

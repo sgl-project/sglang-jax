@@ -694,6 +694,8 @@ class Scheduler(
             vocab_size=self.model_config.vocab_size,
             return_routed_experts=recv_req.return_routed_experts,
             return_hidden_states=recv_req.return_hidden_states,
+            is_multi_item_scoring=recv_req.is_multi_item_scoring,
+            multi_item_scoring_delimiter=recv_req.multi_item_scoring_delimiter,
         )
         req.tokenizer = self.tokenizer
 

@@ -158,6 +158,19 @@ class ServerArgs:
     # For sampling
     use_sort_for_toppk_minp: bool = False
 
+    # Scoring configuration
+    # Delimiter token ID used to combine query and items into a single sequence for
+    # multi-item scoring:
+    # query<delimiter>item1<delimiter>item2<delimiter>...
+    multi_item_scoring_delimiter: int | None = None
+    # Maximum allowed total sequence length for multi-item scoring requests.
+    # This bounds O(seq^2) custom-mask memory usage in attention.
+    max_multi_item_seq_len: int = 8192
+    # Maximum number of items processed in a single multi-item scoring forward pass.
+    # Requests with more items are split into multiple multi-item chunks.
+    # Set to 0 to disable chunking and process all items in one pass.
+    multi_item_scoring_chunk_size: int = 2
+
     # LoRA
     enable_lora: bool | None = None
     max_lora_rank: int | None = None
@@ -927,6 +940,25 @@ class ServerArgs:
         )
 
         parser.add_argument(
+            "--multi-item-scoring-delimiter",
+            type=int,
+            default=ServerArgs.multi_item_scoring_delimiter,
+            help="Delimiter token ID for multi-item scoring. Used to combine query and items into a single sequence: query<delimiter>item1<delimiter>item2<delimiter>...",
+        )
+        parser.add_argument(
+            "--max-multi-item-seq-len",
+            type=int,
+            default=ServerArgs.max_multi_item_seq_len,
+            help="Maximum allowed total sequence length for multi-item scoring requests.",
+        )
+        parser.add_argument(
+            "--multi-item-scoring-chunk-size",
+            type=int,
+            default=ServerArgs.multi_item_scoring_chunk_size,
+            help="Maximum number of items per multi-item scoring chunk. Set 0 to disable chunking.",
+        )
+
+        parser.add_argument(
             "--multimodal",
             action="store_true",
             help="Enable multimodal HTTP server.",
@@ -1070,6 +1102,29 @@ class ServerArgs:
             raise ValueError(
                 "Speculative decoding does not support overlap scheduler. "
                 "Please pass --disable-overlap-schedule when using --speculative-algorithm."
+            )
+
+        # Check multi-item scoring constraints
+        if self.multi_item_scoring_delimiter is not None:
+            assert self.disable_radix_cache, (
+                "Multi-item scoring requires radix cache to be disabled. "
+                "Please set --disable-radix-cache when using --multi-item-scoring-delimiter."
+            )
+            assert self.chunked_prefill_size == -1, (
+                "Multi-item scoring requires chunked prefill to be disabled. "
+                "Please set --chunked-prefill-size -1 when using --multi-item-scoring-delimiter."
+            )
+            assert self.speculative_algorithm is None, (
+                "Multi-item scoring does not support speculative decoding. "
+                "Please unset --speculative-algorithm when using --multi-item-scoring-delimiter."
+            )
+            assert self.attention_backend == "fa", (
+                "Multi-item scoring requires flashattention backend. "
+                "Please set --attention-backend fa when using --multi-item-scoring-delimiter."
+            )
+            assert self.max_multi_item_seq_len > 0, "--max-multi-item-seq-len must be positive"
+            assert self.multi_item_scoring_chunk_size >= 0, (
+                "--multi-item-scoring-chunk-size must be non-negative"
             )
 
     def check_lora_server_args(self):

@@ -288,6 +288,9 @@ def create_test_data(
         return_output_logprob_only=False,
         top_logprobs_nums=None,
         token_ids_logprobs=None,
+        is_prefill_only=(forward_mode == ForwardMode.EXTEND),
+        multi_item_scoring_flags=np.array([False] * seq_lens.shape[0], dtype=np.bool_),
+        multi_item_scoring_delimiter=None,
         extend_logprob_start_lens=None,
         extend_input_logprob_token_ids=None,
         real_bs=seq_lens.shape[0],
@@ -847,6 +850,36 @@ class TestAttention(CustomTestCase):
 
     def test_gqa_decode_with_custom_mask(self):
         pass
+
+    def test_build_multi_item_attention_mask_isolation(self):
+        delimiter = 99
+        # query=[10,11], then <d>item1<d>item2<d>
+        tokens = np.array([10, 11, 99, 21, 99, 31, 99], dtype=np.int32)
+        mask = FlashAttention._build_multi_item_attention_mask(tokens, delimiter)
+
+        # Item1 token at position 3 should not attend to item2 block (positions >= 4).
+        self.assertTrue(np.all(mask[3, 4:] == 0))
+        # Item2 token at position 5 should attend to query prefix positions 0..1.
+        self.assertTrue(np.all(mask[5, :2] == 1))
+        # Shared prefix includes first delimiter at position 2.
+        self.assertEqual(mask[5, 2], 1)
+        # Item2 token should not attend to item1 token at position 3.
+        self.assertEqual(mask[5, 3], 0)
+        # Item2 token should not attend to delimiter after item1 (position 4).
+        self.assertEqual(mask[5, 4], 0)
+
+    def test_build_causal_extend_mask_with_prefix(self):
+        # kv has 2 prefix tokens + 3 extend tokens.
+        mask = FlashAttention._build_causal_extend_mask(q_len=3, kv_len=5)
+        expected = np.array(
+            [
+                [1, 1, 1, 0, 0],
+                [1, 1, 1, 1, 0],
+                [1, 1, 1, 1, 1],
+            ],
+            dtype=np.int32,
+        )
+        self.assertTrue(np.array_equal(mask, expected))
 
 
 if __name__ == "__main__":
