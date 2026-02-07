@@ -840,7 +840,7 @@ class FusedEPMoE(nnx.Module):
         self.w2_shared_scale = None
 
         self.subc_quant_wsz = None  # Use default sub channel quantization block size
-        self.enable_comm_quant = True
+        self.enable_comm_quant = False
 
     def quantize_weights(self, is_static: bool = False):
         """Quantize MoE weights in-place. Call once after model loading."""

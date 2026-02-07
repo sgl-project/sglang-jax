@@ -539,7 +539,7 @@ def _fused_ep_moe_kernel(
     dp_axis_name: str,
     tp_axis_name: str,
     act_fn: str,
-    enable_comm_quant: bool = True,
+    enable_comm_quant: bool = False,
     subc_quant_wsz: int | None = None,
     # Kernel tuning params.
     bt: int,  # Outer token tile size (output tiling).
@@ -2811,7 +2811,7 @@ def fused_ep_moe(
     block_config: FusedMoEBlockConfig | None = None,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
-    enable_comm_quant: bool = True,
+    enable_comm_quant: bool = False,
 ):
 
     ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
