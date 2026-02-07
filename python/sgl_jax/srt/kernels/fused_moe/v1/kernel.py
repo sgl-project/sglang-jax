@@ -517,6 +517,9 @@ def _fused_ep_moe_kernel(
     b_se_w3_scale_all,  # None | <sew_sem_id> (1, 1, se_inter_size)
     b_se_w2_scale_all,  # None | <sew_sem_id> (1, 1, hidden_size)
     b_se_acc_vmem,  # None | F32(2, bt, hidden_size)
+    comm_token_row_vmem,  # (1, t_packing, hidden_size // t_packing)
+    comm_q_row_vmem,  # (1, t_packing, hidden_size // t_packing)
+    comm_scale_row_vmem,  # (1,)
     ### Semaphores:
     token_stage_x2_sems,  # DMA(2,): <token_buf_id>
     acc_stage_x3_sems,  # DMA(3,): <acc_buf_id>
@@ -918,8 +921,14 @@ def _fused_ep_moe_kernel(
                     src_t_id=src_t_id, start=start, local_sz=local_sz, e_sem_id=e_sem_id
                 ):
                     if enable_comm_quant:
-                        src_rows = tokens_hbm.at[pl.ds(src_t_id, 1)][...]
-                        q_rows, scales = _quantize_comm_rows(src_rows)
+                        token_copy = pltpu.make_async_copy(
+                            src_ref=tokens_hbm.at[pl.ds(src_t_id, 1)],
+                            dst_ref=comm_token_row_vmem,
+                            sem=local_sems.at[bt_sem_id, 13],
+                        )
+                        token_copy.start()
+                        token_copy.wait()
+                        q_rows, scales = _quantize_comm_rows(comm_token_row_vmem[...])
                         a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, 1)][...] = q_rows
                         a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, 1)][...] = scales[:1]
                         pltpu.make_async_copy(
@@ -948,8 +957,14 @@ def _fused_ep_moe_kernel(
                     recv_id=recv_id,
                 ):
                     if enable_comm_quant:
-                        src_rows = tokens_hbm.at[pl.ds(src_t_id, 1)][...]
-                        q_rows, scales = _quantize_comm_rows(src_rows)
+                        token_copy = pltpu.make_async_copy(
+                            src_ref=tokens_hbm.at[pl.ds(src_t_id, 1)],
+                            dst_ref=comm_token_row_vmem,
+                            sem=local_sems.at[bt_sem_id, 13],
+                        )
+                        token_copy.start()
+                        token_copy.wait()
+                        q_rows, scales = _quantize_comm_rows(comm_token_row_vmem[...])
                         a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, 1)][...] = q_rows
                         a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, 1)][...] = scales[:1]
                         pltpu.make_async_remote_copy(
@@ -996,7 +1011,11 @@ def _fused_ep_moe_kernel(
         @pl.when(sz != 0)
         def _():
             # Dummy wait using the dynamic receive size.
-            ref = a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)]
+            ref = (
+                a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(0, sz)]
+                if enable_comm_quant
+                else a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)]
+            )
             pltpu.make_async_copy(
                 src_ref=ref,
                 dst_ref=ref,
@@ -1011,9 +1030,21 @@ def _fused_ep_moe_kernel(
                 ).wait()
 
                 def _deq_one(i, _):
-                    q_row = a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(i, 1)][...]
-                    s_row = a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(i, 1)][...]
-                    deq_row = _dequantize_comm_rows(q_row, s_row)
+                    q_copy = pltpu.make_async_copy(
+                        src_ref=a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(i, 1)],
+                        dst_ref=comm_q_row_vmem,
+                        sem=local_sems.at[bt_sem_id, 13],
+                    )
+                    q_copy.start()
+                    q_copy.wait()
+                    s_copy = pltpu.make_async_copy(
+                        src_ref=a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(i, 1)],
+                        dst_ref=comm_scale_row_vmem,
+                        sem=local_sems.at[bt_sem_id, 13],
+                    )
+                    s_copy.start()
+                    s_copy.wait()
+                    deq_row = _dequantize_comm_rows(comm_q_row_vmem[...], comm_scale_row_vmem[...])
                     a2a_s_x2_hbm.at[e_sem_id, pl.ds(i, 1)][...] = deq_row
                     return None
 
@@ -1026,7 +1057,11 @@ def _fused_ep_moe_kernel(
         @pl.when(should_wait)
         def _():
             # Dummy wait using the dynamic send size.
-            ref = a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, scatter_send_sz)]
+            ref = (
+                a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(0, scatter_send_sz)]
+                if enable_comm_quant
+                else a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, scatter_send_sz)]
+            )
             pltpu.make_async_copy(
                 src_ref=ref,
                 dst_ref=ref,
@@ -2811,7 +2846,7 @@ def fused_ep_moe(
     block_config: FusedMoEBlockConfig | None = None,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
-    enable_comm_quant: bool = False,
+    enable_comm_quant: bool = True,
 ):
 
     ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
@@ -2980,6 +3015,13 @@ def fused_ep_moe(
     b1_scratch = None if b1 is None else pltpu.VMEM((2, 1, block_config.bf), jnp.float32)
     b3_scratch = None if b3 is None else pltpu.VMEM((2, 1, block_config.bf), jnp.float32)
     b2_scratch = None if b2 is None else pltpu.VMEM((2, t_packing, 1, bd2_per_pack), jnp.float32)
+    comm_token_row_scratch = (
+        None if not enable_comm_quant else pltpu.VMEM((1, t_packing, hidden_per_pack), t_dtype)
+    )
+    comm_q_row_scratch = (
+        None if not enable_comm_quant else pltpu.VMEM((1, t_packing, hidden_per_pack), comm_q_dtype)
+    )
+    comm_scale_row_scratch = None if not enable_comm_quant else pltpu.VMEM((1,), comm_scale_dtype)
     scratch_shapes = (
         # Routing / metadata.
         pltpu.SMEM((2, bt, padded_top_k), jnp.int32),  # t2e_routing_x2_smem
@@ -3048,6 +3090,9 @@ def fused_ep_moe(
         (
             None if w1_shared is None else pltpu.VMEM((2, bt, hidden_size), jnp.float32)
         ),  # b_se_acc_vmem
+        comm_token_row_scratch,  # comm_token_row_vmem
+        comm_q_row_scratch,  # comm_q_row_vmem
+        comm_scale_row_scratch,  # comm_scale_row_vmem
         # Semaphores.
         pltpu.SemaphoreType.DMA((2,)),  # token_stage_x2_sems
         pltpu.SemaphoreType.DMA((3,)),  # acc_stage_x3_sems
