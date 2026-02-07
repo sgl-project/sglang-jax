@@ -468,11 +468,11 @@ def _fused_ep_moe_kernel(
     a2a_s_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
     a2a_s_acc_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
     a2a_g_hbm,  # (num_experts, bt, t_packing, hidden_size // t_packing)
-    a2a_s_q_x2_hbm,  # (2, align_to(bt * num_devices * top_k, bts), t_packing, hidden_size // t_packing)
+    a2a_s_q_x2_hbm,  # (2, align_to(bt * num_devices * top_k, bts), comm_packing, hidden_size // comm_packing)
     a2a_s_scale_x2_hbm,  # (2, align_to(bt * num_devices * top_k, bts))
-    a2a_s_acc_q_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
+    a2a_s_acc_q_x2_hbm,  # (2, align_to(bt * num_devices, bts), comm_packing, hidden_size // comm_packing)
     a2a_s_acc_scale_x2_hbm,  # (2, align_to(bt * num_devices, bts))
-    a2a_g_q_hbm,  # (num_experts, bt, t_packing, hidden_size // t_packing)
+    a2a_g_q_hbm,  # (num_experts, bt, comm_packing, hidden_size // comm_packing)
     a2a_g_scale_hbm,  # (num_experts, bt)
     bias_hbm,  # None | F32(padded_num_experts,)
     w1_shared_hbm,  # None | (hidden_size, se_intermediate_size)
@@ -518,7 +518,7 @@ def _fused_ep_moe_kernel(
     b_se_w2_scale_all,  # None | <sew_sem_id> (1, 1, hidden_size)
     b_se_acc_vmem,  # None | F32(2, bt, hidden_size)
     comm_token_row_vmem,  # (1, t_packing, hidden_size // t_packing)
-    comm_q_row_vmem,  # (1, t_packing, hidden_size // t_packing)
+    comm_q_row_vmem,  # (1, comm_packing, hidden_size // comm_packing)
     comm_scale_row_vmem,  # (1,)
     ### Semaphores:
     token_stage_x2_sems,  # DMA(2,): <token_buf_id>
@@ -576,6 +576,7 @@ def _fused_ep_moe_kernel(
 
     t_dtype = tokens_hbm.dtype
     t_packing = get_dtype_packing(t_dtype)
+    comm_packing = get_dtype_packing(jnp.float8_e4m3fn)
     assert a2a_g_hbm.dtype == t_dtype
     assert w1_hbm.dtype == w2_hbm.dtype
     assert w3_hbm.dtype == w2_hbm.dtype
@@ -594,7 +595,15 @@ def _fused_ep_moe_kernel(
     assert bts <= bt
 
     h_per_t_packing = hidden_size // t_packing
+    h_per_comm_packing = hidden_size // comm_packing
     assert tokens_hbm.shape[-1] == h_per_t_packing
+    assert hidden_size % comm_packing == 0
+    assert a2a_s_q_x2_hbm.shape[-2] == comm_packing
+    assert a2a_s_q_x2_hbm.shape[-1] == h_per_comm_packing
+    assert a2a_s_acc_q_x2_hbm.shape[-2] == comm_packing
+    assert a2a_s_acc_q_x2_hbm.shape[-1] == h_per_comm_packing
+    assert a2a_g_q_hbm.shape[-2] == comm_packing
+    assert a2a_g_q_hbm.shape[-1] == h_per_comm_packing
     bd1_per_t_packing = bd1 // t_packing
     bd2_per_t_packing = bd2 // t_packing
     bd1c_per_t_packing = bd1c // t_packing
@@ -641,15 +650,18 @@ def _fused_ep_moe_kernel(
         pltpu.semaphore_wait(barrier_sem, num_devices)
 
     def _quantize_comm_rows(x):
-        x_f32 = x.astype(jnp.float32)
-        row_absmax = jnp.max(jnp.abs(x_f32), axis=(1, 2), keepdims=True)
+        x_f32 = x.astype(jnp.float32).reshape((x.shape[0], hidden_size))
+        row_absmax = jnp.max(jnp.abs(x_f32), axis=1, keepdims=True)
         qmax = jnp.float32(jnp.finfo(jnp.float8_e4m3fn).max)
         scale = jnp.maximum(row_absmax / qmax, jnp.float32(1e-8))
-        x_q = jnp.clip(x_f32 / scale, -qmax, qmax).astype(jnp.float8_e4m3fn)
+        x_q_flat = jnp.clip(x_f32 / scale, -qmax, qmax).astype(jnp.float8_e4m3fn)
+        x_q = x_q_flat.reshape((x.shape[0], comm_packing, h_per_comm_packing))
         return x_q, scale.reshape((x.shape[0],)).astype(jnp.float32)
 
     def _dequantize_comm_rows(x_q, scale):
-        return (x_q.astype(jnp.float32) * scale[:, None, None]).astype(t_dtype)
+        x_f32 = x_q.astype(jnp.float32).reshape((x_q.shape[0], hidden_size))
+        x_f32 = x_f32 * scale[:, None]
+        return x_f32.astype(t_dtype).reshape((x_q.shape[0], t_packing, h_per_t_packing))
 
     def start_fetch_b_gating(*, bt_id, priority=0):
         bt_sem_id = bt_id & jnp.int32(1)
@@ -2929,7 +2941,9 @@ def fused_ep_moe(
     comm_q_dtype = jnp.float8_e4m3fn
     comm_scale_dtype = jnp.float32
     t_packing = get_dtype_packing(t_dtype)
+    comm_packing = get_dtype_packing(comm_q_dtype)
     hidden_per_pack = hidden_size // t_packing
+    hidden_per_comm_pack = hidden_size // comm_packing
     # With run_bt tiling in the pallas kernel, a2a scratch only needs to cover one bt tile.
     # TODO: FIXME(prayer): kernel Anomalies error temporary solution
     # After a detailed investigation of a2a, this topk multiplication needs to be removed
@@ -3026,7 +3040,9 @@ def fused_ep_moe(
         None if not enable_comm_quant else pltpu.VMEM((1, t_packing, hidden_per_pack), t_dtype)
     )
     comm_q_row_scratch = (
-        None if not enable_comm_quant else pltpu.VMEM((1, t_packing, hidden_per_pack), comm_q_dtype)
+        None
+        if not enable_comm_quant
+        else pltpu.VMEM((1, comm_packing, hidden_per_comm_pack), comm_q_dtype)
     )
     comm_scale_row_scratch = None if not enable_comm_quant else pltpu.VMEM((1,), comm_scale_dtype)
     scratch_shapes = (
@@ -3380,17 +3396,17 @@ def fused_ep_moe(
     )
     a2a_g_hbm_scratch = pl.empty((num_experts, bt, t_packing, hidden_size // t_packing), t_dtype)
     a2a_s_q_x2_hbm_scratch = pl.empty(
-        (2, a2a_max_tokens_with_top_k, t_packing, hidden_size // t_packing),
+        (2, a2a_max_tokens_with_top_k, comm_packing, hidden_size // comm_packing),
         comm_q_dtype,
     )
     a2a_s_scale_x2_hbm_scratch = pl.empty((2, a2a_max_tokens_with_top_k), comm_scale_dtype)
     a2a_s_acc_q_x2_hbm_scratch = pl.empty(
-        (2, a2a_max_tokens, t_packing, hidden_size // t_packing),
+        (2, a2a_max_tokens, comm_packing, hidden_size // comm_packing),
         comm_q_dtype,
     )
     a2a_s_acc_scale_x2_hbm_scratch = pl.empty((2, a2a_max_tokens), comm_scale_dtype)
     a2a_g_q_hbm_scratch = pl.empty(
-        (num_experts, bt, t_packing, hidden_size // t_packing),
+        (num_experts, bt, comm_packing, hidden_size // comm_packing),
         comm_q_dtype,
     )
     a2a_g_scale_hbm_scratch = pl.empty((num_experts, bt), comm_scale_dtype)
