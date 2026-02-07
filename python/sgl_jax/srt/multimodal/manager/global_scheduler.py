@@ -291,19 +291,27 @@ class GlobalScheduler:
                         audio_items.append(item_obj)
 
             pixel_values_list = []
+            pixel_values_images_list = []
+            pixel_values_videos_list = []
             audio_values_list = []
             for item in image_items:
                 if item.feature is not None:
                     pixel_values_list.append(np.asarray(item.feature))
+                    pixel_values_images_list.append(np.asarray(item.feature))
             for item in video_items:
                 if item.feature is not None:
                     pixel_values_list.append(np.asarray(item.feature))
+                    pixel_values_videos_list.append(np.asarray(item.feature))
             for item in audio_items:
                 if item.feature is not None:
                     audio_values_list.append(np.asarray(item.feature))
 
             if pixel_values_list:
                 req.pixel_values = np.concatenate(pixel_values_list, axis=0)
+            if pixel_values_images_list:
+                req.pixel_values_images = np.concatenate(pixel_values_images_list, axis=0)
+            if pixel_values_videos_list:
+                req.pixel_values_videos = np.concatenate(pixel_values_videos_list, axis=0)
             if audio_values_list:
                 req.audio_features = np.concatenate(audio_values_list, axis=0)
 
