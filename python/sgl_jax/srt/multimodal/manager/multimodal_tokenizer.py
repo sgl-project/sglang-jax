@@ -306,14 +306,13 @@ class MultimodalTokenizer(TokenizerManager):
                 mm_items.append(
                     MultimodalDataItem(
                         modality=Modality.AUDIO,
-                        feature=np.asarray(
-                            audio_features.transpose(0, 1).reshape(audio_features.shape[1], -1)
-                        ),
+                        feature=np.asarray(audio_features),
                     )
                 )
-            audio_feature_lengths = self._to_audio_feature_lengths(
-                processor_out.get("feature_attention_mask")
-            )
+
+            audio_feature_attention_mask = processor_out.get("feature_attention_mask")
+            if audio_feature_attention_mask is not None:
+                audio_feature_attention_mask = np.asarray(audio_feature_attention_mask)
 
             for item in mm_items:
                 item.set_pad_value()
@@ -333,7 +332,7 @@ class MultimodalTokenizer(TokenizerManager):
                 "image_grid_thw": image_grid_thw,
                 "video_grid_thw": video_grid_thw,
                 "second_per_grid_ts": second_per_grid_ts,
-                "audio_feature_lengths": audio_feature_lengths,
+                "audio_feature_attention_mask": audio_feature_attention_mask,
             }
         if input_ids is None and input_text is not None:
             if self.tokenizer is None:
@@ -470,14 +469,6 @@ class MultimodalTokenizer(TokenizerManager):
         array = np.asarray(arr)
         if array.ndim > 1 and array.shape[0] == 1:
             return array[0]
-        return array
-
-    def _to_audio_feature_lengths(self, arr: Any) -> np.ndarray | None:
-        if arr is None:
-            return None
-        array = np.asarray(arr)
-        if array.ndim > 1:
-            return array.sum(axis=1)
         return array
 
     def _create_tokenized_object(
