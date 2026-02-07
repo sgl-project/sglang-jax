@@ -469,8 +469,6 @@ def _fused_ep_moe_kernel(
     a2a_s_acc_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
     a2a_g_hbm,  # (num_experts, bt, t_packing, hidden_size // t_packing)
     a2a_s_q_x2_hbm,  # (2, align_to(bt * num_devices * top_k, bts), comm_packing, hidden_size // comm_packing)
-    a2a_s_scale0_hbm,  # (align_to(bt * num_devices * top_k, bts))
-    a2a_s_scale1_hbm,  # (align_to(bt * num_devices * top_k, bts))
     a2a_s_acc_q_x2_hbm,  # (2, align_to(bt * num_devices, bts), comm_packing, hidden_size // comm_packing)
     a2a_s_acc_scale_x2_hbm,  # (2, align_to(bt * num_devices, bts))
     a2a_g_q_hbm,  # (num_experts, bt, comm_packing, hidden_size // comm_packing)
@@ -520,7 +518,6 @@ def _fused_ep_moe_kernel(
     b_se_acc_vmem,  # None | F32(2, bt, hidden_size)
     comm_token_row_vmem,  # (1, t_packing, hidden_size // t_packing)
     comm_q_row_vmem,  # (1, comm_packing, hidden_size // comm_packing)
-    comm_scale_row_vmem,  # (1,)
     ### Semaphores:
     token_stage_x2_sems,  # DMA(2,): <token_buf_id>
     acc_stage_x3_sems,  # DMA(3,): <acc_buf_id>
@@ -664,7 +661,7 @@ def _fused_ep_moe_kernel(
         x_q = x_q_flat.reshape((x.shape[0], comm_packing, h_per_comm_packing))
         return x_q, scale.reshape((x.shape[0],)).astype(jnp.float32)
 
-    def _dequantize_comm_rows(x_q, scale):
+    def _dequantize_comm_rows(x_q):
         # Recover encoded log2(scale) from reserved element.
         enc_scale_log2 = x_q[:, 0, 0].astype(jnp.float32)
         enc_scale = jnp.exp2(enc_scale_log2).reshape((x_q.shape[0], 1))
@@ -1041,8 +1038,7 @@ def _fused_ep_moe_kernel(
                     )
                     q_copy.start()
                     q_copy.wait()
-                    comm_scale_row_vmem[...] = jnp.ones((1,), dtype=jnp.float32)
-                    deq_row = _dequantize_comm_rows(comm_q_row_vmem[...], comm_scale_row_vmem[...])
+                    deq_row = _dequantize_comm_rows(comm_q_row_vmem[...])
                     comm_token_row_vmem[...] = deq_row
                     out_copy = pltpu.make_async_copy(
                         src_ref=comm_token_row_vmem,
@@ -1211,10 +1207,7 @@ def _fused_ep_moe_kernel(
                         dst_ref=scale_ref,
                         sem=a2a_gather_scale_sem,
                     ).wait()
-                    deq_rows = _dequantize_comm_rows(
-                        a2a_g_q_hbm.at[e_id, pl.ds(0, sz)][...],
-                        a2a_g_scale_hbm.at[e_id, pl.ds(0, sz)][...],
-                    )
+                    deq_rows = _dequantize_comm_rows(a2a_g_q_hbm.at[e_id, pl.ds(0, sz)][...])
                     a2a_g_hbm.at[e_id, pl.ds(0, sz)][...] = deq_rows
 
             return None
@@ -3025,7 +3018,6 @@ def fused_ep_moe(
         if not enable_comm_quant
         else pltpu.VMEM((1, comm_packing, hidden_per_comm_pack), comm_q_dtype)
     )
-    comm_scale_row_scratch = None if not enable_comm_quant else pltpu.VMEM((1,), comm_scale_dtype)
     scratch_shapes = (
         # Routing / metadata.
         pltpu.SMEM((2, bt, padded_top_k), jnp.int32),  # t2e_routing_x2_smem
@@ -3096,7 +3088,6 @@ def fused_ep_moe(
         ),  # b_se_acc_vmem
         comm_token_row_scratch,  # comm_token_row_vmem
         comm_q_row_scratch,  # comm_q_row_vmem
-        comm_scale_row_scratch,  # comm_scale_row_vmem
         # Semaphores.
         pltpu.SemaphoreType.DMA((2,)),  # token_stage_x2_sems
         pltpu.SemaphoreType.DMA((3,)),  # acc_stage_x3_sems
@@ -3156,8 +3147,6 @@ def fused_ep_moe(
                     hbm_block_spec,  # a2a_s_acc_x2_hbm
                     hbm_block_spec,  # a2a_g_hbm
                     hbm_block_spec,  # a2a_s_q_x2_hbm
-                    hbm_block_spec,  # a2a_s_scale0_hbm
-                    hbm_block_spec,  # a2a_s_scale1_hbm
                     hbm_block_spec,  # a2a_s_acc_q_x2_hbm
                     hbm_block_spec,  # a2a_s_acc_scale_x2_hbm
                     hbm_block_spec,  # a2a_g_q_hbm
@@ -3248,8 +3237,6 @@ def fused_ep_moe(
             P(),  # a2a_s_acc_x2_hbm
             P(),  # a2a_g_hbm
             P(),  # a2a_s_q_x2_hbm
-            P(),  # a2a_s_scale0_hbm
-            P(),  # a2a_s_scale1_hbm
             P(),  # a2a_s_acc_q_x2_hbm
             P(),  # a2a_s_acc_scale_x2_hbm
             P(),  # a2a_g_q_hbm
@@ -3281,8 +3268,6 @@ def fused_ep_moe(
         a2a_s_acc_x2_hbm_scratch,
         a2a_g_hbm_scratch,
         a2a_s_q_x2_hbm_scratch,
-        a2a_s_scale0_hbm_scratch,
-        a2a_s_scale1_hbm_scratch,
         a2a_s_acc_q_x2_hbm_scratch,
         a2a_s_acc_scale_x2_hbm_scratch,
         a2a_g_q_hbm_scratch,
@@ -3325,12 +3310,6 @@ def fused_ep_moe(
             ),  # a2a_s_acc_x2_hbm
             pltpu.with_memory_space_constraint(a2a_g_hbm_scratch, pltpu.HBM),  # a2a_g_hbm
             pltpu.with_memory_space_constraint(a2a_s_q_x2_hbm_scratch, pltpu.HBM),  # a2a_s_q_x2_hbm
-            pltpu.with_memory_space_constraint(
-                a2a_s_scale0_hbm_scratch, pltpu.HBM
-            ),  # a2a_s_scale0_hbm
-            pltpu.with_memory_space_constraint(
-                a2a_s_scale1_hbm_scratch, pltpu.HBM
-            ),  # a2a_s_scale1_hbm
             pltpu.with_memory_space_constraint(
                 a2a_s_acc_q_x2_hbm_scratch, pltpu.HBM
             ),  # a2a_s_acc_q_x2_hbm
@@ -3386,8 +3365,6 @@ def fused_ep_moe(
         (2, a2a_max_tokens_with_top_k, comm_packing, hidden_size // comm_packing),
         comm_q_dtype,
     )
-    a2a_s_scale0_hbm_scratch = pl.empty((a2a_max_tokens_with_top_k,), comm_scale_dtype)
-    a2a_s_scale1_hbm_scratch = pl.empty((a2a_max_tokens_with_top_k,), comm_scale_dtype)
     a2a_s_acc_q_x2_hbm_scratch = pl.empty(
         (2, a2a_max_tokens, comm_packing, hidden_size // comm_packing),
         comm_q_dtype,
@@ -3415,8 +3392,6 @@ def fused_ep_moe(
         a2a_s_acc_x2_hbm_scratch,
         a2a_g_hbm_scratch,
         a2a_s_q_x2_hbm_scratch,
-        a2a_s_scale0_hbm_scratch,
-        a2a_s_scale1_hbm_scratch,
         a2a_s_acc_q_x2_hbm_scratch,
         a2a_s_acc_scale_x2_hbm_scratch,
         a2a_g_q_hbm_scratch,
