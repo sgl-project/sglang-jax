@@ -656,11 +656,12 @@ def _fused_ep_moe_kernel(
         qmax = jnp.float32(jnp.finfo(jnp.float8_e4m3fn).max)
         scale = jnp.maximum(row_absmax / qmax, jnp.float32(1e-8))
         x_q_flat = jnp.clip(x_f32 / scale, -qmax, qmax).astype(jnp.float8_e4m3fn)
-        x_q = x_q_flat.reshape((x.shape[0], comm_packing, h_per_comm_packing))
-        # Encode per-row scale as log2(scale) in one reserved FP8 element to avoid
-        # separate scale traffic and HBM scalar tiling constraints.
+        # Encode per-row scale as log2(scale) in one reserved FP8 header element.
+        # Use concat/slice (no `.at[].set`) because Pallas TC doesn't lower scatter.
         scale_log2 = jnp.clip(jnp.log2(scale), -30.0, 30.0).reshape((x.shape[0],))
-        x_q = x_q.at[:, 0, 0].set(scale_log2.astype(jnp.float8_e4m3fn))
+        scale_header = scale_log2[:, None].astype(jnp.float8_e4m3fn)
+        x_q_flat = jnp.concatenate((scale_header, x_q_flat[:, 1:]), axis=1)
+        x_q = x_q_flat.reshape((x.shape[0], comm_packing, h_per_comm_packing))
         return x_q, scale.reshape((x.shape[0],)).astype(jnp.float32)
 
     def _dequantize_comm_rows(x_q, scale):
@@ -669,7 +670,7 @@ def _fused_ep_moe_kernel(
         enc_scale = jnp.exp2(enc_scale_log2).reshape((x_q.shape[0], 1))
         x_f32 = x_q.astype(jnp.float32).reshape((x_q.shape[0], hidden_size))
         # Reserved header position does not map to activation value.
-        x_f32 = x_f32.at[:, 0].set(0.0)
+        x_f32 = jnp.concatenate((jnp.zeros_like(x_f32[:, :1]), x_f32[:, 1:]), axis=1)
         x_f32 = x_f32 * enc_scale
         return x_f32.astype(t_dtype).reshape((x_q.shape[0], t_packing, h_per_t_packing))
 
