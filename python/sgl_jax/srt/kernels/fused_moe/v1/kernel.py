@@ -588,12 +588,14 @@ def _fused_ep_moe_kernel(
 
     h_per_t_packing = hidden_size // t_packing
     h_per_comm_packing = hidden_size // comm_packing
+    enable_comm_quant_gather = False
     assert tokens_hbm.shape[-1] == h_per_t_packing
     assert hidden_size % comm_packing == 0
     assert a2a_s_q_x2_hbm.shape[-2] == comm_packing
     assert a2a_s_q_x2_hbm.shape[-1] == h_per_comm_packing
-    assert a2a_g_q_hbm.shape[-2] == comm_packing
-    assert a2a_g_q_hbm.shape[-1] == h_per_comm_packing
+    if enable_comm_quant_gather:
+        assert a2a_g_q_hbm.shape[-2] == comm_packing
+        assert a2a_g_q_hbm.shape[-1] == h_per_comm_packing
     bd1_per_t_packing = bd1 // t_packing
     bd2_per_t_packing = bd2 // t_packing
     bd1c_per_t_packing = bd1c // t_packing
@@ -617,7 +619,6 @@ def _fused_ep_moe_kernel(
     if w1_shared_hbm is not None:
         se_inter_size = w2_shared_hbm.shape[0]
         se_total_blocks = cdiv(se_inter_size, bse)
-    enable_comm_quant_gather = enable_comm_quant
 
     def get_mesh_device_id(ep_rank):
         dp_rank = ep_rank // tp_size
@@ -2913,6 +2914,7 @@ def fused_ep_moe(
     t_dtype = tokens.dtype
     gating_dtype = gating_output.dtype
     comm_q_dtype = jnp.float8_e4m3fn
+    enable_comm_quant_gather = False
     t_packing = get_dtype_packing(t_dtype)
     comm_packing = get_dtype_packing(comm_q_dtype)
     hidden_per_pack = hidden_size // t_packing
@@ -3343,10 +3345,17 @@ def fused_ep_moe(
         (2, a2a_max_tokens_with_top_k, comm_packing, hidden_size // comm_packing),
         comm_q_dtype,
     )
-    a2a_g_q_hbm_scratch = pl.empty(
-        (num_experts, bt, comm_packing, hidden_size // comm_packing),
-        comm_q_dtype,
-    )
+    if enable_comm_quant and enable_comm_quant_gather:
+        a2a_g_q_hbm_scratch = pl.empty(
+            (num_experts, bt, comm_packing, hidden_size // comm_packing),
+            comm_q_dtype,
+        )
+    else:
+        # Gather quant is currently disabled; keep a tiny placeholder to avoid
+        # allocating a large unused HBM buffer.
+        a2a_g_q_hbm_scratch = pl.empty(
+            (1, 1, comm_packing, hidden_size // comm_packing), comm_q_dtype
+        )
 
     return kernel(
         tokens,
