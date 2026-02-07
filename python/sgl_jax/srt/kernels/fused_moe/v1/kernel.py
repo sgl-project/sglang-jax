@@ -645,7 +645,7 @@ def _fused_ep_moe_kernel(
         scale_header = scale_log2[:, None].astype(jnp.float8_e4m3fn)
         x_q_flat = jnp.concatenate((scale_header, x_q_flat[:, 1:]), axis=1)
         x_q = x_q_flat.reshape((x.shape[0], comm_packing, h_per_comm_packing))
-        return x_q, scale.reshape((x.shape[0],)).astype(jnp.float32)
+        return x_q
 
     def _dequantize_comm_rows(x_q):
         # Recover encoded log2(scale) from reserved element.
@@ -934,7 +934,7 @@ def _fused_ep_moe_kernel(
                         )
                         token_copy.start()
                         token_copy.wait()
-                        q_rows, _ = _quantize_comm_rows(comm_token_row_vmem[...])
+                        q_rows = _quantize_comm_rows(comm_token_row_vmem[...])
                         comm_q_row_vmem[...] = q_rows
                         pltpu.make_async_copy(
                             src_ref=comm_q_row_vmem,
@@ -965,7 +965,7 @@ def _fused_ep_moe_kernel(
                         )
                         token_copy.start()
                         token_copy.wait()
-                        q_rows, _ = _quantize_comm_rows(comm_token_row_vmem[...])
+                        q_rows = _quantize_comm_rows(comm_token_row_vmem[...])
                         comm_q_row_vmem[...] = q_rows
                         pltpu.make_async_remote_copy(
                             src_ref=comm_q_row_vmem,
