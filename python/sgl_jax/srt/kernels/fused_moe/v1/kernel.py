@@ -937,28 +937,11 @@ def _fused_ep_moe_kernel(
                 def _local_copy(
                     src_t_id=src_t_id, start=start, local_sz=local_sz, e_sem_id=e_sem_id
                 ):
-                    if enable_comm_quant:
-                        token_copy = pltpu.make_async_copy(
-                            src_ref=tokens_hbm.at[pl.ds(src_t_id, 1)],
-                            dst_ref=comm_token_row_vmem,
-                            sem=local_sems.at[bt_sem_id, 13],
-                        )
-                        token_copy.start()
-                        token_copy.wait()
-                        q_rows = _quantize_comm_rows(comm_token_row_vmem[...])
-                        comm_q_row_vmem[...] = q_rows
-                        pltpu.make_async_copy(
-                            src_ref=comm_q_row_vmem,
-                            dst_ref=a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, 1)],
-                            sem=recv_x2_sems.at[e_sem_id],
-                        ).start()
-
-                    else:
-                        pltpu.make_async_copy(
-                            src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
-                            dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
-                            sem=recv_x2_sems.at[e_sem_id],
-                        ).start()
+                    pltpu.make_async_copy(
+                        src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
+                        dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
+                        sem=recv_x2_sems.at[e_sem_id],
+                    ).start()
 
                 @pl.when(remote_sz != 0)
                 def _remote_copy(
@@ -1015,38 +998,42 @@ def _fused_ep_moe_kernel(
         @pl.when(sz != 0)
         def _():
             # Dummy wait using the dynamic receive size.
-            ref = (
-                a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(0, sz)]
-                if enable_comm_quant
-                else a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)]
-            )
+            ref = a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)]
             pltpu.make_async_copy(
                 src_ref=ref,
                 dst_ref=ref,
                 sem=recv_x2_sems.at[e_sem_id],
             ).wait()
             if enable_comm_quant:
+                base = jnp.int32(0)
+                for dev_id in range(num_devices):
+                    seg_sz = d2e_count_x2_smem[bt_sem_id, dev_id, 0, e_id]
 
-                def _deq_one(i, _):
-                    q_copy = pltpu.make_async_copy(
-                        src_ref=a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(i, 1)],
-                        dst_ref=comm_q_row_vmem,
-                        sem=local_sems.at[bt_sem_id, 13],
-                    )
-                    q_copy.start()
-                    q_copy.wait()
-                    deq_row = _dequantize_comm_rows(comm_q_row_vmem[...])
-                    comm_token_row_vmem[...] = deq_row
-                    out_copy = pltpu.make_async_copy(
-                        src_ref=comm_token_row_vmem,
-                        dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(i, 1)],
-                        sem=local_sems.at[bt_sem_id, 13],
-                    )
-                    out_copy.start()
-                    out_copy.wait()
-                    return None
+                    @pl.when(jnp.logical_and(dev_id != my_id, seg_sz != 0))
+                    def _deq_remote_seg(base=base, seg_sz=seg_sz):
+                        def _deq_one(i, _):
+                            q_i = base + i
+                            q_copy = pltpu.make_async_copy(
+                                src_ref=a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(q_i, 1)],
+                                dst_ref=comm_q_row_vmem,
+                                sem=local_sems.at[bt_sem_id, 13],
+                            )
+                            q_copy.start()
+                            q_copy.wait()
+                            deq_row = _dequantize_comm_rows(comm_q_row_vmem[...])
+                            comm_token_row_vmem[...] = deq_row
+                            out_copy = pltpu.make_async_copy(
+                                src_ref=comm_token_row_vmem,
+                                dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(q_i, 1)],
+                                sem=local_sems.at[bt_sem_id, 13],
+                            )
+                            out_copy.start()
+                            out_copy.wait()
+                            return None
 
-                lax.fori_loop(0, sz, _deq_one, None, unroll=False)
+                        lax.fori_loop(0, seg_sz, _deq_one, None, unroll=False)
+
+                    base = base + seg_sz
 
     def wait_a2a_scatter_send(*, bt_sem_id, e_sem_id, local_e_id):
         scatter_send_sz = a2a_s_sends_x2_smem[e_sem_id]
