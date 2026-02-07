@@ -937,11 +937,13 @@ def _fused_ep_moe_kernel(
                 def _local_copy(
                     src_t_id=src_t_id, start=start, local_sz=local_sz, e_sem_id=e_sem_id
                 ):
-                    pltpu.make_async_copy(
+                    local_copy = pltpu.make_async_copy(
                         src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
                         dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
-                        sem=recv_x2_sems.at[e_sem_id],
-                    ).start()
+                        sem=local_sems.at[bt_sem_id, 13],
+                    )
+                    local_copy.start()
+                    local_copy.wait()
 
                 @pl.when(remote_sz != 0)
                 def _remote_copy(
