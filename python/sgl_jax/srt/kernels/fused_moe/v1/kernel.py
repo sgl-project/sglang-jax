@@ -615,6 +615,9 @@ def _fused_ep_moe_kernel(
     if w1_shared_hbm is not None:
         se_inter_size = w2_shared_hbm.shape[0]
         se_total_blocks = cdiv(se_inter_size, bse)
+    # Gather-side comm quantization is temporarily disabled because this stage
+    # uses dynamic segment sizes that need row-wise packing.
+    enable_comm_quant_gather = False
 
     def get_mesh_device_id(ep_rank):
         dp_rank = ep_rank // tp_size
@@ -915,18 +918,18 @@ def _fused_ep_moe_kernel(
                     src_t_id=src_t_id, start=start, local_sz=local_sz, e_sem_id=e_sem_id
                 ):
                     if enable_comm_quant:
-                        src_rows = tokens_hbm.at[pl.ds(src_t_id, local_sz)][...]
+                        src_rows = tokens_hbm.at[pl.ds(src_t_id, 1)][...]
                         q_rows, scales = _quantize_comm_rows(src_rows)
-                        a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)][...] = q_rows
-                        a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)][...] = scales
+                        a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, 1)][...] = q_rows
+                        a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, 1)][...] = scales[:1]
                         pltpu.make_async_copy(
-                            src_ref=a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
-                            dst_ref=a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
+                            src_ref=a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, 1)],
+                            dst_ref=a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, 1)],
                             sem=recv_x2_sems.at[e_sem_id],
                         ).start()
                         pltpu.make_async_copy(
-                            src_ref=a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
-                            dst_ref=a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
+                            src_ref=a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, 1)],
+                            dst_ref=a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, 1)],
                             sem=recv_scale_x2_sems.at[e_sem_id],
                         ).start()
                     else:
@@ -945,21 +948,21 @@ def _fused_ep_moe_kernel(
                     recv_id=recv_id,
                 ):
                     if enable_comm_quant:
-                        src_rows = tokens_hbm.at[pl.ds(src_t_id, remote_sz)][...]
+                        src_rows = tokens_hbm.at[pl.ds(src_t_id, 1)][...]
                         q_rows, scales = _quantize_comm_rows(src_rows)
-                        a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)][...] = q_rows
-                        a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)][...] = scales
+                        a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, 1)][...] = q_rows
+                        a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, 1)][...] = scales[:1]
                         pltpu.make_async_remote_copy(
-                            src_ref=a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
-                            dst_ref=a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
+                            src_ref=a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, 1)],
+                            dst_ref=a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, 1)],
                             send_sem=send_x2_sems.at[e_sem_id],
                             recv_sem=recv_x2_sems.at[e_sem_id],
                             device_id=get_mesh_device_id(recv_id),
                             device_id_type=pltpu.DeviceIdType.MESH,
                         ).start()
                         pltpu.make_async_remote_copy(
-                            src_ref=a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
-                            dst_ref=a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
+                            src_ref=a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, 1)],
+                            dst_ref=a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, 1)],
                             send_sem=send_scale_x2_sems.at[e_sem_id],
                             recv_sem=recv_scale_x2_sems.at[e_sem_id],
                             device_id=get_mesh_device_id(recv_id),
@@ -1006,11 +1009,15 @@ def _fused_ep_moe_kernel(
                     dst_ref=scale_ref,
                     sem=recv_scale_x2_sems.at[e_sem_id],
                 ).wait()
-                deq_rows = _dequantize_comm_rows(
-                    a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(0, sz)][...],
-                    a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(0, sz)][...],
-                )
-                a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)][...] = deq_rows
+
+                def _deq_one(i, _):
+                    q_row = a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(i, 1)][...]
+                    s_row = a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(i, 1)][...]
+                    deq_row = _dequantize_comm_rows(q_row, s_row)
+                    a2a_s_x2_hbm.at[e_sem_id, pl.ds(i, 1)][...] = deq_row
+                    return None
+
+                lax.fori_loop(0, sz, _deq_one, None, unroll=False)
 
     def wait_a2a_scatter_send(*, bt_sem_id, e_sem_id, local_e_id):
         scatter_send_sz = a2a_s_sends_x2_smem[e_sem_id]
@@ -1050,7 +1057,7 @@ def _fused_ep_moe_kernel(
                 my_e_id=my_e_id,
                 e_sem_id=e_sem_id,
             ):
-                if enable_comm_quant:
+                if enable_comm_quant_gather:
                     src_rows = src_ref.at[e_sem_id, pl.ds(start, local_sz)][...]
                     q_rows, scales = _quantize_comm_rows(src_rows)
                     a2a_s_acc_q_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)][...] = q_rows
@@ -1080,7 +1087,7 @@ def _fused_ep_moe_kernel(
                 e_sem_id=e_sem_id,
                 recv_id=recv_id,
             ):
-                if enable_comm_quant:
+                if enable_comm_quant_gather:
                     src_rows = src_ref.at[e_sem_id, pl.ds(start, remote_sz)][...]
                     q_rows, scales = _quantize_comm_rows(src_rows)
                     a2a_s_acc_q_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)][...] = q_rows
@@ -1131,7 +1138,7 @@ def _fused_ep_moe_kernel(
                 dst_ref=ref,
                 sem=send_x2_sems.at[e_sem_id],
             ).wait()
-            if enable_comm_quant:
+            if enable_comm_quant_gather:
                 scale_ref = a2a_s_acc_scale_x2_hbm.at[e_sem_id, pl.ds(0, remote_sz)]
                 pltpu.make_async_copy(
                     src_ref=scale_ref,
@@ -1154,7 +1161,7 @@ def _fused_ep_moe_kernel(
             def _():
                 ref = (
                     a2a_g_q_hbm.at[e_id, pl.ds(0, sz)]
-                    if enable_comm_quant
+                    if enable_comm_quant_gather
                     else a2a_g_hbm.at[e_id, pl.ds(0, sz)]
                 )
                 pltpu.make_async_copy(
@@ -1162,7 +1169,7 @@ def _fused_ep_moe_kernel(
                     dst_ref=ref,
                     sem=a2a_gather_sem,
                 ).wait()
-                if enable_comm_quant:
+                if enable_comm_quant_gather:
                     scale_ref = a2a_g_scale_hbm.at[e_id, pl.ds(0, sz)]
                     pltpu.make_async_copy(
                         src_ref=scale_ref,
