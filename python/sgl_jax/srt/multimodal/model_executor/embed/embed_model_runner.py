@@ -132,9 +132,12 @@ class EmbedModelRunner(BaseModelRunner):
             )
 
             # Audio feature lengths
-            audio_feature_lengths = omni_inputs.get("audio_feature_lengths")
-            if audio_feature_lengths is not None:
-                audio_feature_lengths = jnp.asarray(audio_feature_lengths)
+            feature_attention_mask = omni_inputs.get("audio_feature_attention_mask")
+            if feature_attention_mask is not None:
+                audio_feature_lengths = jnp.asarray(feature_attention_mask.sum(axis=1))
+                audio_features = audio_features.transpose(0, 2, 1)[
+                    feature_attention_mask.astype(jnp.bool)
+                ].transpose(1, 0)
 
             # Image pixel values
             pixel_values = (
@@ -159,6 +162,7 @@ class EmbedModelRunner(BaseModelRunner):
             video_grid_thw = batch.video_grid_thw
             if video_grid_thw is not None:
                 video_grid_thw = jnp.array(video_grid_thw)
+
         return {
             "input_ids": input_ids,
             "input_features": audio_features,
