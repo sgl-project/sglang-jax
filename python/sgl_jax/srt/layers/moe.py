@@ -840,6 +840,7 @@ class FusedEPMoE(nnx.Module):
         self.w2_shared_scale = None
 
         self.subc_quant_wsz = None  # Use default sub channel quantization block size
+        self.enable_comm_quant = True
 
     def quantize_weights(self, is_static: bool = False):
         """Quantize MoE weights in-place. Call once after model loading."""
@@ -1074,6 +1075,7 @@ class FusedEPMoE(nnx.Module):
             b3=None,
             dp_axis_name="data",
             tp_axis_name="tensor",
+            enable_comm_quant=self.enable_comm_quant,
         )
 
         output = jax.sharding.reshard(output, NamedSharding(self.mesh, P("data", None)))

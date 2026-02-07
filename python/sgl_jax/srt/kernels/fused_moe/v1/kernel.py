@@ -468,6 +468,12 @@ def _fused_ep_moe_kernel(
     a2a_s_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
     a2a_s_acc_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
     a2a_g_hbm,  # (num_experts, bt, t_packing, hidden_size // t_packing)
+    a2a_s_q_x2_hbm,  # (2, align_to(bt * num_devices * top_k, bts), t_packing, hidden_size // t_packing)
+    a2a_s_scale_x2_hbm,  # (2, align_to(bt * num_devices * top_k, bts))
+    a2a_s_acc_q_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
+    a2a_s_acc_scale_x2_hbm,  # (2, align_to(bt * num_devices, bts))
+    a2a_g_q_hbm,  # (num_experts, bt, t_packing, hidden_size // t_packing)
+    a2a_g_scale_hbm,  # (num_experts, bt)
     bias_hbm,  # None | F32(padded_num_experts,)
     w1_shared_hbm,  # None | (hidden_size, se_intermediate_size)
     w3_shared_hbm,  # None | (hidden_size, se_intermediate_size)
@@ -517,7 +523,10 @@ def _fused_ep_moe_kernel(
     local_sems,  # DMA(2, N): weight ping-pong semaphores (plus gating/output and shared-expert staging)
     send_x2_sems,  # <e_sem_id> (2,)
     recv_x2_sems,  # <e_sem_id> (2,)
+    send_scale_x2_sems,  # <e_sem_id> (2,)
+    recv_scale_x2_sems,  # <e_sem_id> (2,)
     a2a_gather_sem,
+    a2a_gather_scale_sem,
     a2a_acc_sems,  # DMA(1,)
     barrier_sem,
     *,
@@ -530,6 +539,7 @@ def _fused_ep_moe_kernel(
     dp_axis_name: str,
     tp_axis_name: str,
     act_fn: str,
+    enable_comm_quant: bool = True,
     subc_quant_wsz: int | None = None,
     # Kernel tuning params.
     bt: int,  # Outer token tile size (output tiling).
@@ -623,6 +633,17 @@ def _fused_ep_moe_kernel(
                 device_id_type=pltpu.DeviceIdType.MESH,
             )
         pltpu.semaphore_wait(barrier_sem, num_devices)
+
+    def _quantize_comm_rows(x):
+        x_f32 = x.astype(jnp.float32)
+        row_absmax = jnp.max(jnp.abs(x_f32), axis=(1, 2), keepdims=True)
+        qmax = jnp.float32(jnp.finfo(jnp.float8_e4m3fn).max)
+        scale = jnp.maximum(row_absmax / qmax, jnp.float32(1e-8))
+        x_q = jnp.clip(x_f32 / scale, -qmax, qmax).astype(jnp.float8_e4m3fn)
+        return x_q, scale.reshape((x.shape[0],)).astype(jnp.float32)
+
+    def _dequantize_comm_rows(x_q, scale):
+        return (x_q.astype(jnp.float32) * scale[:, None, None]).astype(t_dtype)
 
     def start_fetch_b_gating(*, bt_id, priority=0):
         bt_sem_id = bt_id & jnp.int32(1)
@@ -893,11 +914,27 @@ def _fused_ep_moe_kernel(
                 def _local_copy(
                     src_t_id=src_t_id, start=start, local_sz=local_sz, e_sem_id=e_sem_id
                 ):
-                    pltpu.make_async_copy(
-                        src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
-                        dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
-                        sem=recv_x2_sems.at[e_sem_id],
-                    ).start()
+                    if enable_comm_quant:
+                        src_rows = tokens_hbm.at[pl.ds(src_t_id, local_sz)][...]
+                        q_rows, scales = _quantize_comm_rows(src_rows)
+                        a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)][...] = q_rows
+                        a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)][...] = scales
+                        pltpu.make_async_copy(
+                            src_ref=a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
+                            dst_ref=a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
+                            sem=recv_x2_sems.at[e_sem_id],
+                        ).start()
+                        pltpu.make_async_copy(
+                            src_ref=a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
+                            dst_ref=a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
+                            sem=recv_scale_x2_sems.at[e_sem_id],
+                        ).start()
+                    else:
+                        pltpu.make_async_copy(
+                            src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
+                            dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
+                            sem=recv_x2_sems.at[e_sem_id],
+                        ).start()
 
                 @pl.when(remote_sz != 0)
                 def _remote_copy(
@@ -907,14 +944,36 @@ def _fused_ep_moe_kernel(
                     e_sem_id=e_sem_id,
                     recv_id=recv_id,
                 ):
-                    pltpu.make_async_remote_copy(
-                        src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
-                        dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
-                        send_sem=send_x2_sems.at[e_sem_id],
-                        recv_sem=recv_x2_sems.at[e_sem_id],
-                        device_id=get_mesh_device_id(recv_id),
-                        device_id_type=pltpu.DeviceIdType.MESH,
-                    ).start()
+                    if enable_comm_quant:
+                        src_rows = tokens_hbm.at[pl.ds(src_t_id, remote_sz)][...]
+                        q_rows, scales = _quantize_comm_rows(src_rows)
+                        a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)][...] = q_rows
+                        a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)][...] = scales
+                        pltpu.make_async_remote_copy(
+                            src_ref=a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
+                            dst_ref=a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
+                            send_sem=send_x2_sems.at[e_sem_id],
+                            recv_sem=recv_x2_sems.at[e_sem_id],
+                            device_id=get_mesh_device_id(recv_id),
+                            device_id_type=pltpu.DeviceIdType.MESH,
+                        ).start()
+                        pltpu.make_async_remote_copy(
+                            src_ref=a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
+                            dst_ref=a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
+                            send_sem=send_scale_x2_sems.at[e_sem_id],
+                            recv_sem=recv_scale_x2_sems.at[e_sem_id],
+                            device_id=get_mesh_device_id(recv_id),
+                            device_id_type=pltpu.DeviceIdType.MESH,
+                        ).start()
+                    else:
+                        pltpu.make_async_remote_copy(
+                            src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
+                            dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
+                            send_sem=send_x2_sems.at[e_sem_id],
+                            recv_sem=recv_x2_sems.at[e_sem_id],
+                            device_id=get_mesh_device_id(recv_id),
+                            device_id_type=pltpu.DeviceIdType.MESH,
+                        ).start()
 
             return send_sz
 
@@ -940,6 +999,18 @@ def _fused_ep_moe_kernel(
                 dst_ref=ref,
                 sem=recv_x2_sems.at[e_sem_id],
             ).wait()
+            if enable_comm_quant:
+                scale_ref = a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(0, sz)]
+                pltpu.make_async_copy(
+                    src_ref=scale_ref,
+                    dst_ref=scale_ref,
+                    sem=recv_scale_x2_sems.at[e_sem_id],
+                ).wait()
+                deq_rows = _dequantize_comm_rows(
+                    a2a_s_q_x2_hbm.at[e_sem_id, pl.ds(0, sz)][...],
+                    a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(0, sz)][...],
+                )
+                a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)][...] = deq_rows
 
     def wait_a2a_scatter_send(*, bt_sem_id, e_sem_id, local_e_id):
         scatter_send_sz = a2a_s_sends_x2_smem[e_sem_id]
@@ -954,6 +1025,13 @@ def _fused_ep_moe_kernel(
                 dst_ref=ref,
                 sem=send_x2_sems.at[e_sem_id],
             ).wait()
+            if enable_comm_quant:
+                scale_ref = a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(0, scatter_send_sz)]
+                pltpu.make_async_copy(
+                    src_ref=scale_ref,
+                    dst_ref=scale_ref,
+                    sem=send_scale_x2_sems.at[e_sem_id],
+                ).wait()
 
     def start_a2a_gather(*, bt_sem_id, e_sem_id, local_e_id):
         my_e_id = my_id * local_num_experts + local_e_id
@@ -972,11 +1050,27 @@ def _fused_ep_moe_kernel(
                 my_e_id=my_e_id,
                 e_sem_id=e_sem_id,
             ):
-                pltpu.make_async_copy(
-                    src_ref=src_ref.at[e_sem_id, pl.ds(start, local_sz)],
-                    dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, local_sz)],
-                    sem=a2a_gather_sem,
-                ).start()
+                if enable_comm_quant:
+                    src_rows = src_ref.at[e_sem_id, pl.ds(start, local_sz)][...]
+                    q_rows, scales = _quantize_comm_rows(src_rows)
+                    a2a_s_acc_q_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)][...] = q_rows
+                    a2a_s_acc_scale_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)][...] = scales
+                    pltpu.make_async_copy(
+                        src_ref=a2a_s_acc_q_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
+                        dst_ref=a2a_g_q_hbm.at[my_e_id, pl.ds(0, local_sz)],
+                        sem=a2a_gather_sem,
+                    ).start()
+                    pltpu.make_async_copy(
+                        src_ref=a2a_s_acc_scale_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
+                        dst_ref=a2a_g_scale_hbm.at[my_e_id, pl.ds(0, local_sz)],
+                        sem=a2a_gather_scale_sem,
+                    ).start()
+                else:
+                    pltpu.make_async_copy(
+                        src_ref=src_ref.at[e_sem_id, pl.ds(start, local_sz)],
+                        dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, local_sz)],
+                        sem=a2a_gather_sem,
+                    ).start()
 
             @pl.when(remote_sz != 0)
             def _remote_copy(
@@ -986,14 +1080,36 @@ def _fused_ep_moe_kernel(
                 e_sem_id=e_sem_id,
                 recv_id=recv_id,
             ):
-                pltpu.make_async_remote_copy(
-                    src_ref=src_ref.at[e_sem_id, pl.ds(start, remote_sz)],
-                    dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, remote_sz)],
-                    send_sem=send_x2_sems.at[e_sem_id],
-                    recv_sem=a2a_gather_sem,
-                    device_id=get_mesh_device_id(recv_id),
-                    device_id_type=pltpu.DeviceIdType.MESH,
-                ).start()
+                if enable_comm_quant:
+                    src_rows = src_ref.at[e_sem_id, pl.ds(start, remote_sz)][...]
+                    q_rows, scales = _quantize_comm_rows(src_rows)
+                    a2a_s_acc_q_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)][...] = q_rows
+                    a2a_s_acc_scale_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)][...] = scales
+                    pltpu.make_async_remote_copy(
+                        src_ref=a2a_s_acc_q_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
+                        dst_ref=a2a_g_q_hbm.at[my_e_id, pl.ds(0, remote_sz)],
+                        send_sem=send_x2_sems.at[e_sem_id],
+                        recv_sem=a2a_gather_sem,
+                        device_id=get_mesh_device_id(recv_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
+                    pltpu.make_async_remote_copy(
+                        src_ref=a2a_s_acc_scale_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
+                        dst_ref=a2a_g_scale_hbm.at[my_e_id, pl.ds(0, remote_sz)],
+                        send_sem=send_scale_x2_sems.at[e_sem_id],
+                        recv_sem=a2a_gather_scale_sem,
+                        device_id=get_mesh_device_id(recv_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
+                else:
+                    pltpu.make_async_remote_copy(
+                        src_ref=src_ref.at[e_sem_id, pl.ds(start, remote_sz)],
+                        dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, remote_sz)],
+                        send_sem=send_x2_sems.at[e_sem_id],
+                        recv_sem=a2a_gather_sem,
+                        device_id=get_mesh_device_id(recv_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
 
             start += sz
 
@@ -1015,6 +1131,13 @@ def _fused_ep_moe_kernel(
                 dst_ref=ref,
                 sem=send_x2_sems.at[e_sem_id],
             ).wait()
+            if enable_comm_quant:
+                scale_ref = a2a_s_acc_scale_x2_hbm.at[e_sem_id, pl.ds(0, remote_sz)]
+                pltpu.make_async_copy(
+                    src_ref=scale_ref,
+                    dst_ref=scale_ref,
+                    sem=send_scale_x2_sems.at[e_sem_id],
+                ).wait()
 
     def wait_a2a_gather_recv_all(*, bt_sem_id):
         # `a2a_gather_sem` is signaled once per (expert -> this device) copy in the
@@ -1029,12 +1152,28 @@ def _fused_ep_moe_kernel(
 
             @pl.when(sz != 0)
             def _():
-                ref = a2a_g_hbm.at[e_id, pl.ds(0, sz)]
+                ref = (
+                    a2a_g_q_hbm.at[e_id, pl.ds(0, sz)]
+                    if enable_comm_quant
+                    else a2a_g_hbm.at[e_id, pl.ds(0, sz)]
+                )
                 pltpu.make_async_copy(
                     src_ref=ref,
                     dst_ref=ref,
                     sem=a2a_gather_sem,
                 ).wait()
+                if enable_comm_quant:
+                    scale_ref = a2a_g_scale_hbm.at[e_id, pl.ds(0, sz)]
+                    pltpu.make_async_copy(
+                        src_ref=scale_ref,
+                        dst_ref=scale_ref,
+                        sem=a2a_gather_scale_sem,
+                    ).wait()
+                    deq_rows = _dequantize_comm_rows(
+                        a2a_g_q_hbm.at[e_id, pl.ds(0, sz)][...],
+                        a2a_g_scale_hbm.at[e_id, pl.ds(0, sz)][...],
+                    )
+                    a2a_g_hbm.at[e_id, pl.ds(0, sz)][...] = deq_rows
 
             return None
 
@@ -2623,6 +2762,7 @@ def _validate_fused_ep_moe_args(
         "block_config",
         "dp_axis_name",
         "tp_axis_name",
+        "enable_comm_quant",
     ],
 )
 def fused_ep_moe(
@@ -2664,6 +2804,7 @@ def fused_ep_moe(
     block_config: FusedMoEBlockConfig | None = None,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
+    enable_comm_quant: bool = True,
 ):
 
     ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
@@ -2736,6 +2877,8 @@ def fused_ep_moe(
     padded_top_k = align_to(top_k, 128)
     t_dtype = tokens.dtype
     gating_dtype = gating_output.dtype
+    comm_q_dtype = jnp.float8_e4m3fn
+    comm_scale_dtype = jnp.float32
     t_packing = get_dtype_packing(t_dtype)
     hidden_per_pack = hidden_size // t_packing
     # With run_bt tiling in the pallas kernel, a2a scratch only needs to cover one bt tile.
@@ -2904,7 +3047,10 @@ def fused_ep_moe(
         pltpu.SemaphoreType.DMA((2, 14)),  # local_sems
         pltpu.SemaphoreType.DMA((2,)),  # send_x2_sems
         pltpu.SemaphoreType.DMA((2,)),  # recv_x2_sems
+        pltpu.SemaphoreType.DMA((2,)),  # send_scale_x2_sems
+        pltpu.SemaphoreType.DMA((2,)),  # recv_scale_x2_sems
         pltpu.SemaphoreType.DMA,  # a2a_gather_sem
+        pltpu.SemaphoreType.DMA,  # a2a_gather_scale_sem
         pltpu.SemaphoreType.DMA((1,)),  # a2a_acc_sems
         pltpu.SemaphoreType.BARRIER,  # barrier_sem
     )
@@ -2922,6 +3068,7 @@ def fused_ep_moe(
                 dp_axis_name=dp_axis_name,
                 tp_axis_name=tp_axis_name,
                 act_fn=act_fn,
+                enable_comm_quant=enable_comm_quant,
                 subc_quant_wsz=subc_quant_wsz,
                 bt=bt,
                 bf=block_config.bf,
@@ -2952,6 +3099,12 @@ def fused_ep_moe(
                     hbm_block_spec,  # a2a_s_x2_hbm
                     hbm_block_spec,  # a2a_s_acc_x2_hbm
                     hbm_block_spec,  # a2a_g_hbm
+                    hbm_block_spec,  # a2a_s_q_x2_hbm
+                    hbm_block_spec,  # a2a_s_scale_x2_hbm
+                    hbm_block_spec,  # a2a_s_acc_q_x2_hbm
+                    hbm_block_spec,  # a2a_s_acc_scale_x2_hbm
+                    hbm_block_spec,  # a2a_g_q_hbm
+                    hbm_block_spec,  # a2a_g_scale_hbm
                     None if bias is None else hbm_block_spec,  # bias_hbm
                     None if w1_shared is None else hbm_block_spec,  # w1_shared_hbm
                     None if w3_shared is None else hbm_block_spec,  # w3_shared_hbm
@@ -3037,6 +3190,12 @@ def fused_ep_moe(
             P(),  # a2a_s_x2_hbm
             P(),  # a2a_s_acc_x2_hbm
             P(),  # a2a_g_hbm
+            P(),  # a2a_s_q_x2_hbm
+            P(),  # a2a_s_scale_x2_hbm
+            P(),  # a2a_s_acc_q_x2_hbm
+            P(),  # a2a_s_acc_scale_x2_hbm
+            P(),  # a2a_g_q_hbm
+            P(),  # a2a_g_scale_hbm
             None if bias is None else P(),
             None if w1_shared is None else P(),  # w1_shared
             None if w3_shared is None else P(),  # w3_shared
@@ -3063,6 +3222,12 @@ def fused_ep_moe(
         a2a_s_x2_hbm_scratch,
         a2a_s_acc_x2_hbm_scratch,
         a2a_g_hbm_scratch,
+        a2a_s_q_x2_hbm_scratch,
+        a2a_s_scale_x2_hbm_scratch,
+        a2a_s_acc_q_x2_hbm_scratch,
+        a2a_s_acc_scale_x2_hbm_scratch,
+        a2a_g_q_hbm_scratch,
+        a2a_g_scale_hbm_scratch,
         bias,
         w1_shared=None,
         w3_shared=None,
@@ -3100,6 +3265,20 @@ def fused_ep_moe(
                 a2a_s_acc_x2_hbm_scratch, pltpu.HBM
             ),  # a2a_s_acc_x2_hbm
             pltpu.with_memory_space_constraint(a2a_g_hbm_scratch, pltpu.HBM),  # a2a_g_hbm
+            pltpu.with_memory_space_constraint(a2a_s_q_x2_hbm_scratch, pltpu.HBM),  # a2a_s_q_x2_hbm
+            pltpu.with_memory_space_constraint(
+                a2a_s_scale_x2_hbm_scratch, pltpu.HBM
+            ),  # a2a_s_scale_x2_hbm
+            pltpu.with_memory_space_constraint(
+                a2a_s_acc_q_x2_hbm_scratch, pltpu.HBM
+            ),  # a2a_s_acc_q_x2_hbm
+            pltpu.with_memory_space_constraint(
+                a2a_s_acc_scale_x2_hbm_scratch, pltpu.HBM
+            ),  # a2a_s_acc_scale_x2_hbm
+            pltpu.with_memory_space_constraint(a2a_g_q_hbm_scratch, pltpu.HBM),  # a2a_g_q_hbm
+            pltpu.with_memory_space_constraint(
+                a2a_g_scale_hbm_scratch, pltpu.HBM
+            ),  # a2a_g_scale_hbm
             (None if bias is None else pltpu.with_memory_space_constraint(bias, pltpu.HBM)),
             (
                 None
@@ -3141,6 +3320,21 @@ def fused_ep_moe(
         (2, a2a_max_tokens, t_packing, hidden_size // t_packing), t_dtype
     )
     a2a_g_hbm_scratch = pl.empty((num_experts, bt, t_packing, hidden_size // t_packing), t_dtype)
+    a2a_s_q_x2_hbm_scratch = pl.empty(
+        (2, a2a_max_tokens_with_top_k, t_packing, hidden_size // t_packing),
+        comm_q_dtype,
+    )
+    a2a_s_scale_x2_hbm_scratch = pl.empty((2, a2a_max_tokens_with_top_k), comm_scale_dtype)
+    a2a_s_acc_q_x2_hbm_scratch = pl.empty(
+        (2, a2a_max_tokens, t_packing, hidden_size // t_packing),
+        comm_q_dtype,
+    )
+    a2a_s_acc_scale_x2_hbm_scratch = pl.empty((2, a2a_max_tokens), comm_scale_dtype)
+    a2a_g_q_hbm_scratch = pl.empty(
+        (num_experts, bt, t_packing, hidden_size // t_packing),
+        comm_q_dtype,
+    )
+    a2a_g_scale_hbm_scratch = pl.empty((num_experts, bt), comm_scale_dtype)
 
     return kernel(
         tokens,
@@ -3157,6 +3351,12 @@ def fused_ep_moe(
         a2a_s_x2_hbm_scratch,
         a2a_s_acc_x2_hbm_scratch,
         a2a_g_hbm_scratch,
+        a2a_s_q_x2_hbm_scratch,
+        a2a_s_scale_x2_hbm_scratch,
+        a2a_s_acc_q_x2_hbm_scratch,
+        a2a_s_acc_scale_x2_hbm_scratch,
+        a2a_g_q_hbm_scratch,
+        a2a_g_scale_hbm_scratch,
         bias,
         w1_shared,
         w3_shared,
