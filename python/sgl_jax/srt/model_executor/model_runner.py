@@ -14,6 +14,10 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
+from sgl_jax.srt.eplb.expert_location import (
+    init_expert_location_metadata,
+    set_global_server_args,
+)
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.layers.routed_experts_capturer import (
     RoutedExpertsCapturer,
@@ -172,6 +176,15 @@ class ModelRunner(BaseModelRunner):
                 model_config=self.model_config,
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_padding=self.max_padding,
+                ep_size=self.server_args.ep_size,
+                enable_balance_debug=self.server_args.enable_expert_balance_debug,
+                balance_segment_counter=self.server_args.expert_balance_segment_counter,
+                balance_output_file=self.server_args.expert_balance_output_file,
+                enable_dist_recorder=self.server_args.enable_expert_distribution_recorder,
+                dist_recorder_buffer_size=self.server_args.expert_distribution_recorder_buffer_size,
+                dist_recorder_output_file=self.server_args.expert_distribution_recorder_output_file,
+                physical_expert_counts=self.server_args.ep_num_redundant_experts
+                + getattr(self.model_config.hf_config, "num_experts", 0),
             )
         )
 
@@ -231,7 +244,6 @@ class ModelRunner(BaseModelRunner):
 
         def run_model_wrapper(forward_batch, logits_metadata):
             token_to_kv_pool = self.token_to_kv_pool
-
             return jitted_run_model(
                 model_def,
                 model_state_def,
@@ -277,11 +289,19 @@ class ModelRunner(BaseModelRunner):
         return min_available_device_memory
 
     def load_model(self):
+        set_global_server_args(self.server_args)
         self.model_config.validate_tensor_parallel_config(self.attention_tp_size)
         self.model_config.configure_for_tensor_parallel(self.attention_tp_size)
         self.model_config.log_kv_heads_info(self.attention_tp_size)
         self.model_config.hf_config.ep_size = self.ep_size
+        self.model_config.hf_config.ep_num_redundant_experts = (
+            self.server_args.ep_num_redundant_experts
+        )
         self.model_config.hf_config.moe_backend = self.model_config.moe_backend.value
+
+        if self.server_args.ep_dispatch_algorithm:
+            init_expert_location_metadata(self.server_args, self.model_config)
+
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
         )
