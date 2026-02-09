@@ -671,7 +671,10 @@ class Scheduler(
         for recv_req in recv_reqs:
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                self.send_to_tokenizer.send_pyobj(output)
+                if self._comm_backend is not None:
+                    self._comm_backend.send_pyobj(output)
+                else:
+                    self.send_to_tokenizer.send_pyobj(output)
 
     def handle_generate_request(
         self,
@@ -1468,7 +1471,11 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            self.send_to_tokenizer.send_pyobj(AbortReq(rid=req.rid))
+            abort_out = AbortReq(rid=req.rid)
+            if self._comm_backend is not None:
+                self._comm_backend.send_pyobj(abort_out)
+            else:
+                self.send_to_tokenizer.send_pyobj(abort_out)
             logger.debug("Abort queued request. rid=%s", req.rid)
 
         # Delete the requests in the grammar queue
