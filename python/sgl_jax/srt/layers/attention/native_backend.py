@@ -55,6 +55,7 @@ class NativeAttention(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        attention_sink: jax.Array | None = None,
     ):
         """
         Args:
@@ -96,6 +97,7 @@ class NativeAttention(AttentionBackend):
             forward_batch.forward_mode,
             self.kv_sharding,
             xai_temperature_len=xai_temp_len,
+            attention_sink=attention_sink,
         )
 
         # Return full fused KV buffer for this layer so that caller can persist it outside JIT
@@ -161,6 +163,7 @@ def forward_attention(
     mode=ForwardMode.DECODE,
     kv_sharding=None,
     xai_temperature_len: float | None = None,
+    attention_sink: jax.Array | None = None,
 ):
     """
     Forward pass using native JAX implementation with block-diagonal attention.
@@ -261,7 +264,16 @@ def forward_attention(
         attn_logits = _apply_decode_mask(attn_logits, seq_lengths)
 
     # Softmax
-    attn_weights = jax.nn.softmax(attn_logits, axis=-1)
+    if attention_sink is not None:
+        sink = jnp.asarray(attention_sink, dtype=attn_logits.dtype)
+        if sink.ndim == 0:
+            sink = jnp.full((num_heads,), sink, dtype=attn_logits.dtype)
+        sink = sink[:, None, None]
+        sink = jnp.repeat(sink, attn_logits.shape[1], axis=1)
+        attn_logits = jnp.concatenate([sink, attn_logits], axis=2)
+        attn_weights = jax.nn.softmax(attn_logits, axis=-1)[..., 1:]
+    else:
+        attn_weights = jax.nn.softmax(attn_logits, axis=-1)
 
     attn_output = jnp.matmul(attn_weights, v_t)
     attn_output = jnp.transpose(attn_output, (1, 0, 2))

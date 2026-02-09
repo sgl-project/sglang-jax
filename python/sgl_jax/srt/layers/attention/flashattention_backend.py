@@ -427,6 +427,7 @@ class FlashAttention(AttentionBackend):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         causal: int = 1,
+        attention_sink: jax.Array | None = None,
     ):
         """
         Args:
@@ -473,6 +474,7 @@ class FlashAttention(AttentionBackend):
             P(),  # cu_kv_lens
             P(),  # distribution
             P(),  # custom_mask
+            P(None),  # attention_sink
         )
         out_specs = (
             P(None, self.kv_partition_axis),  # attention output
@@ -481,20 +483,35 @@ class FlashAttention(AttentionBackend):
             ),  # updated kv_cache_fused (head interleaved) - 3D: [total_tokens, num_kv_heads*2, head_dim]
         )
 
-        def _ragged_paged_attention_with_fused_kv(*args):
-            queries, keys, values, kv_cache_fused = args[:4]
-            other_args = args[4:]
-
+        def _ragged_paged_attention_with_fused_kv(
+            queries,
+            keys,
+            values,
+            kv_cache_fused,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            distribution,
+            custom_mask,
+            attention_sink,
+        ):
             # Call fused KV kernel with head interleaving
             result, updated_kv_cache_fused = ragged_paged_attention(
                 queries,
                 keys,
                 values,
                 kv_cache_fused,
-                *other_args,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                cu_kv_lens,
+                distribution,
+                custom_mask,
                 causal=causal,
                 sm_scale=scale,
                 sliding_window=layer.sliding_window_size,
+                attention_sink=attention_sink,
                 soft_cap=layer.logit_cap,
                 xai_temperature_len=(
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
@@ -523,6 +540,7 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
             self.forward_metadata.custom_mask,
+            attention_sink,
         )
         pad_width = (self.head_dim + 127) // 128 * 128 - self.head_dim
         if pad_width > 0:

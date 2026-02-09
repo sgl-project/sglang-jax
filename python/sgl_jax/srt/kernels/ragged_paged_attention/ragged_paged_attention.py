@@ -42,6 +42,7 @@ def ref_ragged_paged_attention_fused(
     *,
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
+    attention_sink: jax.Array | None = None,
     soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
     k_scale: float | None = None,
@@ -105,7 +106,17 @@ def ref_ragged_paged_attention_fused(
             attn = attn * xai_temperature_reg[:, None]
 
         attn += jnp.where(mask, mask_value, 0.0)
-        attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
+        if attention_sink is not None:
+            sink = jnp.asarray(attention_sink, dtype=attn.dtype)
+            if sink.ndim == 0:
+                sink = jnp.full((num_q_heads,), sink, dtype=attn.dtype)
+            sink = sink[:, None, None]
+            sink = jnp.repeat(sink, attn.shape[1], axis=1)
+            attn = jnp.concatenate([sink, attn], axis=2)
+            attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
+            attn = attn[..., 1:]
+        else:
+            attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
         out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
         outputs.append(out)
 
@@ -125,6 +136,7 @@ def ref_ragged_paged_attention(
     causal: bool = True,
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
+    attention_sink: jax.Array | None = None,
     soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
     k_scale: float | None = None,
@@ -202,7 +214,17 @@ def ref_ragged_paged_attention(
             attn = attn * xai_temperature_reg[None, :, None]
 
         attn += jnp.where(mask, mask_value, 0.0)
-        attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
+        if attention_sink is not None:
+            sink = jnp.asarray(attention_sink, dtype=attn.dtype)
+            if sink.ndim == 0:
+                sink = jnp.full((num_q_heads,), sink, dtype=attn.dtype)
+            sink = sink[:, None, None]
+            sink = jnp.repeat(sink, attn.shape[1], axis=1)
+            attn = jnp.concatenate([sink, attn], axis=2)
+            attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
+            attn = attn[..., 1:]
+        else:
+            attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
         out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
         outputs.append(out)
 
@@ -301,6 +323,7 @@ def _ragged_paged_attention_kernel(
     kv_hbm_ref,  # [padded_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim] - Fused KV with interleaved [K1,V1,K2,V2,...]
     kv_cache_fused_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_interleaved // kv_packing, kv_packing, head_dim]
     custom_mask_ref,  # (flatten_total_kv_len, head_dim), int32, dma not support bool type
+    attention_sink_ref,  # [actual_num_q_heads_padded] or None
     zero_mask_ref,  # (bkv_sz, head_dim), int32, dma not support bool type
     # Output
     o_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
@@ -1024,6 +1047,21 @@ def _ragged_paged_attention_kernel(
                 if q_dtype == jnp.float32
                 else (acc * pl.reciprocal(l, approx=True)).astype(q_dtype)
             )
+            if attention_sink_ref is not None:
+                # Apply virtual sink token normalization: weights /= (exp(sink) + sum(exp(logits)))
+                l_scalar = l_ref[..., 0]
+                m_scalar = m_ref[..., 0]
+                logsumexp = jnp.log(l_scalar) + m_scalar
+
+                q_rows = l_scalar.shape[1]
+                row_ids = lax.broadcasted_iota(jnp.int32, (q_rows,), 0)
+                head_in_kv = row_ids % num_q_heads_per_kv_head
+                kv_head_ids = lax.broadcasted_iota(jnp.int32, (actual_num_kv_heads, 1), 0)
+                global_head = kv_head_ids * num_q_heads_per_kv_head + head_in_kv[None, :]
+
+                sink_logits = attention_sink_ref[global_head].astype(jnp.float32)
+                alpha = jnp.reciprocal(1.0 + jnp.exp(sink_logits - logsumexp))
+                out = (out.astype(jnp.float32) * alpha[..., None]).astype(q_dtype)
 
             # Wait for previous bo to be fully sent before storing new bo.
             bo_sem_idx = sem_ids_ref[2]
@@ -1232,6 +1270,7 @@ def static_validate_inputs_fused(
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     cu_kv_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
+    attention_sink: jax.Array | None = None,
     *,
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -1267,6 +1306,13 @@ def static_validate_inputs_fused(
         raise ValueError(
             f"Expected {actual_num_q_heads=} to be divisible by {actual_num_kv_heads=}."
         )
+    if attention_sink is not None:
+        if attention_sink.ndim == 0:
+            pass
+        elif attention_sink.shape != (actual_num_q_heads,):
+            raise ValueError(
+                f"Expected {attention_sink.shape=} to be scalar or {(actual_num_q_heads,)=}."
+            )
 
     # Validate fused KV cache
     if len(kv_cache_fused.shape) != 4:
@@ -1378,6 +1424,7 @@ def ragged_paged_attention(
     causal: int = 1,  # 1: True, 0: False
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
+    attention_sink: jax.Array | None = None,
     soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
     q_scale: float | None = None,
@@ -1439,6 +1486,7 @@ def ragged_paged_attention(
         cu_q_lens,
         cu_kv_lens,
         distribution,
+        attention_sink,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
@@ -1472,6 +1520,14 @@ def ragged_paged_attention(
     num_page_indices = page_indices.shape[0]
     pages_per_seq = num_page_indices // max_num_seqs
     num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_q_packing * q_packing
+    if attention_sink is not None:
+        sink = jnp.asarray(attention_sink, dtype=jnp.float32)
+        if sink.ndim == 0:
+            sink = jnp.full((actual_num_q_heads,), sink, dtype=jnp.float32)
+        padded_heads = actual_num_kv_heads * num_q_heads_per_kv_head
+        if sink.shape[0] < padded_heads:
+            sink = jnp.pad(sink, (0, padded_heads - sink.shape[0]))
+        attention_sink = sink
 
     bkv_p = num_kv_pages_per_block
     bq_sz = num_queries_per_block
@@ -1520,6 +1576,7 @@ def ragged_paged_attention(
         pl.BlockSpec(memory_space=pltpu.ANY),  # kv_fused
         pl.BlockSpec(memory_space=pltpu.ANY),  # kv_cache_fused
         pl.BlockSpec(memory_space=pltpu.ANY) if custom_mask is not None else None,  # custom_mask
+        pl.BlockSpec(memory_space=pltpu.ANY) if attention_sink is not None else None,  # attention_sink
         pl.BlockSpec(memory_space=pltpu.ANY),  # zero mask
     ]
 
@@ -1671,6 +1728,7 @@ def ragged_paged_attention(
         kv,
         kv_cache_fused_processed,
         custom_mask,
+        attention_sink,
         jnp.zeros((bkv_sz, head_dim), dtype=jnp.int32),
     )
     return (
