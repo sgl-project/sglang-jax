@@ -113,6 +113,7 @@ def benchmark_backend(
             distribution,
             custom_mask=None,
             causal=1,
+            decode_mode=0,
             sm_scale=sm_scale,
         )
 
@@ -178,6 +179,7 @@ def full_benchmark():
         2048,
         4096,
         8192,
+        16384,
     ]
     q_head_num_config = [2, 4, 8, 16, 32, 64]
     kv_head_num_config = [2, 4, 8, 16, 32, 64]

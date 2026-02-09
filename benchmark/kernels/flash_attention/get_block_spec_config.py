@@ -106,6 +106,7 @@ def benchmark_backend(
             distribution,
             None,
             sm_scale=sm_scale,
+            decode_mode=0,
             num_kv_pages_per_block=num_kv_pages_per_block,
             num_queries_per_block=num_queries_per_block,
         )
