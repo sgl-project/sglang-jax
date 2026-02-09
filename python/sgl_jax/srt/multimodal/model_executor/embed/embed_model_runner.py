@@ -8,7 +8,6 @@ from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 
-
 class EmbedModelRunner(BaseModelRunner):
     """Runner shell for Omni Embedding stage execution."""
 
@@ -187,6 +186,6 @@ class EmbedModelRunner(BaseModelRunner):
                 mm_inputs["deepstack_visual_embedding"] = jnp.zeros((3, 1, input_embeds.shape[-1]))
                 mm_inputs["deepstack_visual_pos_mask"] = jnp.array([0], dtype=jnp.int32)
             else:
-                mm_inputs["deepstack_visual_embedding"] = visual_embeds_multiscale
+                mm_inputs["deepstack_visual_embedding"] = jnp.array(visual_embeds_multiscale)
                 mm_inputs["deepstack_visual_pos_mask"] = visual_pos_masks
         return batch
