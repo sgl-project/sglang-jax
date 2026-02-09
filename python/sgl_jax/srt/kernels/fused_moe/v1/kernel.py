@@ -57,10 +57,17 @@ class FusedMoEBlockConfig:
         # `bt` is the outer token tile size used for routing/comm and output tiling.
         # It must not exceed the local token count and must evenly divide it.
         # `bts` is the token tile size used inside expert_ffn for HBM<->VMEM staging and
-        # inner GEMM batching. When unset, `bts` defaults to `bt`.
+        # inner GEMM batching, along the *per-expert* token dimension (dyn_sz after routing/A2A).
+        #
+        # Note: for ep_size>1 and top_k>1, a local expert can receive more than `bt` tokens
+        # in a single `bt` tile (up to `bt * ep_size` across all devices). Keeping `bts <= bt`
+        # forces small GEMM M-tiles in decode (where local_num_tokens can be tiny), which can
+        # significantly hurt performance. We therefore allow `bts` to exceed `bt`, up to the
+        # per-expert upper bound of `bt * ep_size`.
         bt = min(self.bt, local_num_tokens)
         bt = math.gcd(bt, local_num_tokens)
-        bts = bt if self.bts is None else min(self.bts, bt)
+        max_bts = bt * ep_size
+        bts = bt if self.bts is None else min(self.bts, max_bts)
         btc = min(self.btc, bts)
         if bts % btc != 0:
             raise ValueError(f"Expected {bts=} to be divisible by {btc=}.")
@@ -216,10 +223,10 @@ def validate_fused_moe_block_config(
         raise ValueError(f"Expected {bt=} to be aligned to {t_packing=}.")
     if local_num_tokens % bt != 0:
         raise ValueError(f"Expected {local_num_tokens=} to be divisible by {bt=}.")
-    if bts % t_packing != 0:
-        raise ValueError(f"Expected {bts=} to be aligned to {t_packing=}.")
-    if bts > bt:
-        raise ValueError(f"Expected {bts=} to be <= {bt=}.")
+    # A local expert can receive up to `bt * ep_size` tokens (one per token across all devices).
+    # `bts` tiles this per-expert token dimension and may exceed `bt`.
+    if bts > bt * ep_size:
+        raise ValueError(f"Expected {bts=} to be <= {bt * ep_size=} (per-expert upper bound).")
     if not (0 < btc <= bts):
         raise ValueError(f"Expected {btc=} to satisfy 0 < btc <= bts (got {bts=}).")
     if bts % btc != 0:
@@ -574,9 +581,8 @@ def _fused_ep_moe_kernel(
     assert bd1c % t_packing == 0
     assert bd2c % t_packing == 0
 
-    assert bts % t_packing == 0
     assert bts % btc == 0
-    assert bts <= bt
+    assert bts <= bt * num_devices
 
     h_per_t_packing = hidden_size // t_packing
     assert tokens_hbm.shape[-1] == h_per_t_packing
