@@ -1220,6 +1220,15 @@ class TokenizerManager:
         """
         See Engine.score() for more details.
         """
+        logger.debug(
+            "Score request: query_type=%s, items_len=%s, label_token_ids=%s, "
+            "apply_softmax=%s, item_first=%s",
+            type(query),
+            len(items) if items is not None else 0,
+            label_token_ids,
+            apply_softmax,
+            item_first,
+        )
         # Comprehensive validation per RFC-006
         vocab_size = self.tokenizer.vocab_size if self.tokenizer is not None else None
         validate_score_request(
@@ -1249,6 +1258,11 @@ class TokenizerManager:
                 stream=False,
                 sampling_params={"max_new_tokens": 0},  # Prefill-only: no generation needed
             )
+            logger.debug(
+                "Scoring text prompts: num_items=%d, first_prompt_len=%d",
+                len(prompts),
+                len(prompts[0]),
+            )
         elif (
             isinstance(query, list)
             and isinstance(items, list)
@@ -1266,6 +1280,11 @@ class TokenizerManager:
                 token_ids_logprob=label_token_ids,
                 stream=False,
                 sampling_params={"max_new_tokens": 0},  # Prefill-only: no generation needed
+            )
+            logger.debug(
+                "Scoring token IDs: num_items=%d, first_ids_len=%d",
+                len(input_ids_list),
+                len(input_ids_list[0]),
             )
         else:
             raise ValueError("Invalid combination of query/items types for score_request.")

@@ -31,11 +31,10 @@ Usage:
     python3 -m unittest test.srt.test_score_api.TestScoreAPI.test_score_batch_handling
     python3 -m unittest test.srt.test_score_api.TestScoreAPI.test_score_request_construction
 
-Requirements:
+    Requirements:
     - TPU or GPU access (tests use device="tpu")
-    - Model: Qwen/Qwen3-1.7B (downloaded to /dev/shm)
+    - Model: Qwen/Qwen3-0.6B (downloaded to /dev/shm)
     - Dependencies: transformers, torch (for HuggingFace reference validation)
-
 Example Output:
     $ python3 -m unittest test.srt.test_score_api.TestScoreAPI.test_score_consistency
 
@@ -70,6 +69,7 @@ Debugging Failed Tests:
         → Ensure token_ids_logprob parameter is populated
 """
 
+import os
 import unittest
 from unittest.mock import patch
 
@@ -80,7 +80,7 @@ from sgl_jax.srt.entrypoints.engine import Engine
 from sgl_jax.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
 # Use smaller model for faster tests
-TEST_MODEL_NAME = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+TEST_MODEL_NAME = os.getenv("SGLANG_TEST_MODEL", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 
 
 class TestScoreAPI(CustomTestCase):
@@ -123,7 +123,7 @@ class TestScoreAPI(CustomTestCase):
             device="tpu",
             random_seed=3,
             node_rank=0,
-            mem_fraction_static=0.6,
+            mem_fraction_static=0.7,
             chunked_prefill_size=1024,
             download_dir="/dev/shm",
             dtype="bfloat16",

@@ -1,0 +1,101 @@
+name: TPU Score API Test
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "python/sgl_jax/srt/entrypoints/openai/serving_score.py"
+      - "python/sgl_jax/srt/managers/tokenizer_manager.py"
+      - "test/srt/test_score_*.py"
+      - ".github/workflows/tpu-score-api-test.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "python/sgl_jax/srt/entrypoints/openai/serving_score.py"
+      - "python/sgl_jax/srt/managers/tokenizer_manager.py"
+      - "test/srt/test_score_*.py"
+      - ".github/workflows/tpu-score-api-test.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: score-api-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # =============================================== lint ====================================================
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pre-commit
+        run: pip install pre-commit
+      - name: Run pre-commit
+        run: pre-commit run --all-files --show-diff-on-failure
+
+  # =============================================== scoring =================================================
+  score-api-test-v6e-1:
+    needs: [lint]
+    runs-on: arc-runner-v6e-1
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Environment
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          uv pip install pytest
+          uv pip install torch --index-url https://download.pytorch.org/whl/cpu # Required for HF reference in test_score_api.py
+
+      - name: Run Score API Core Tests
+        timeout-minutes: 20
+        shell: bash
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DOWNLOAD_TIMEOUT: 300
+          SGLANG_TEST_MODEL: Qwen/Qwen3-0.6B
+        run: |
+          source .venv/bin/activate
+          bash scripts/killall_sglang.sh
+          python test/srt/run_suite.py --suite score-api-core-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
+
+  # =============================================== unit tests ==============================================
+  unit-test-v6e-1:
+    needs: [score-api-test-v6e-1] # Serial execution as requested
+    runs-on: arc-runner-v6e-1
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Run Unit Tests (Smoke)
+        timeout-minutes: 15
+        shell: bash
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          # Only run minimal smoke test for dev velocity
+          python test/srt/run_suite.py --suite minimal-smoke-test --auto-partition-id ${{ matrix.part }} --auto-partition-size 1

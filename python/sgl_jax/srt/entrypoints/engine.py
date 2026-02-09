@@ -6,6 +6,7 @@ This file implements python APIs for the inference engine.
 
 import asyncio
 import atexit
+import contextlib
 import dataclasses
 import json
 import logging
@@ -110,6 +111,7 @@ class Engine(EngineBase):
 
         # Allocate ports for inter-process communications
         self.port_args = PortArgs.init_new(server_args)
+        self.server_args = server_args
         logger.info("server_args=%s", server_args)
 
         # Launch subprocesses or threads
@@ -117,7 +119,6 @@ class Engine(EngineBase):
             server_args=server_args,
             port_args=self.port_args,
         )
-        self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
         self.scheduler_info = scheduler_info
@@ -297,9 +298,20 @@ class Engine(EngineBase):
 
     def shutdown(self):
         """Shutdown the engine"""
+        with contextlib.suppress(ValueError, RuntimeError):
+            logger.debug("Shutting down engine (pid=%d)...", os.getpid())
+
         kill_process_tree(os.getpid(), include_parent=False)
-        if self.server_args.enable_single_process:
+
+        if (
+            hasattr(self, "server_args")
+            and self.server_args.enable_single_process
+            and hasattr(self, "send_to_rpc")
+        ):
             self.send_to_rpc.close()
+
+        with contextlib.suppress(ValueError, RuntimeError):
+            logger.debug("Engine shutdown complete.")
 
     def __enter__(self):
         return self
