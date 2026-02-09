@@ -383,7 +383,7 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
             visual_embeds_multiscale_joint = ()
             image_mask_joint = image_mask[visual_pos_masks]
             video_mask_joint = video_mask[visual_pos_masks]
-            for img_embed, vid_embed in zip(visual_embeds_multiscale, video_embeds_multiscale):
+            for img_embed, vid_embed in zip(image_embeds_multiscale, video_embeds_multiscale):
                 embed_joint = jnp.zeros(
                     (visual_pos_masks.sum(), img_embed.shape[-1]), dtype=img_embed.dtype
                 )
