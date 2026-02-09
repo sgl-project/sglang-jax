@@ -293,23 +293,24 @@ class Grok1MoE(nnx.Module):
             router_logits = router_logits / self.router_logit_softcapping
             router_logits = jax.nn.tanh(router_logits) * self.router_logit_softcapping
 
+        # Compute top-k routing weights using sglang-style approach:
+        # 1. Compute global softmax over ALL experts (not just top-k)
+        # 2. Select top-k experts based on logits
+        # 3. Extract corresponding weights (no renormalization)
+        top_k_weights, top_k_indices = self._custom_topk(
+            router_logits,
+            self.top_k,
+            renormalize=False,
+            dispatch_info=dispatch_info,
+        )
+
         if self.use_fused:
-            # Fused kernel: pass router_logits directly
-            # Top-K selection is handled internally by the kernel
+            # Fused kernel: pass pre-computed topk_weights/indices
             assert isinstance(self.experts, FusedEPMoE)
-            return self.experts(hidden_states, router_logits), None
+            return self.experts(hidden_states, top_k_weights, top_k_indices), top_k_indices
         else:
-            # EPMoE: compute top-k routing weights using sglang-style approach:
-            # 1. Compute global softmax over ALL experts (not just top-k)
-            # 2. Select top-k experts based on logits
-            # 3. Extract corresponding weights (no renormalization)
+            # EPMoE: pass pre-computed topk_weights/indices
             assert isinstance(self.experts, EPMoE)
-            top_k_weights, top_k_indices = self._custom_topk(
-                router_logits,
-                self.top_k,
-                renormalize=False,
-                dispatch_info=dispatch_info,
-            )
             return self.experts(hidden_states, top_k_weights, top_k_indices), top_k_indices
 
     def _custom_topk(

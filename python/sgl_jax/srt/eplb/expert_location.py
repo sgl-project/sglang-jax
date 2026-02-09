@@ -203,20 +203,33 @@ class ExpertLocationMetadata:
         physical_to_logical_map: np.ndarray,
         logical_to_all_physical_map: np.ndarray,
     ):
+        # from jax.experimental import multihost_utils
+
+        # def sync_shape_and_data(data, name):
+        #     is_root = jax.process_index() == 0
+        #     ndim = np.array(data.ndim if is_root else 0, dtype=np.int32)
+        #     actual_ndim = int(multihost_utils.broadcast_one_to_all(ndim, is_source=is_root))
+
+        #     if is_root:
+        #         local_shape = np.array(data.shape, dtype=np.int32)
+        #     else:
+        #         local_shape = np.zeros((actual_ndim,), dtype=np.int32)
+        #     global_shape = multihost_utils.broadcast_one_to_all(local_shape, is_source=is_root)
+        #     global_shape = tuple(map(int, global_shape))
+
+        #     if not is_root:
+        #         data = np.zeros(global_shape, dtype=data.dtype)
+
+        #     return multihost_utils.broadcast_one_to_all(data, is_source=is_root)
+
+        # p2l_synced = sync_shape_and_data(physical_to_logical_map, "p2l")
+        # l2p_synced = sync_shape_and_data(logical_to_all_physical_map, "l2p")
+
+        # physical_to_logical_map = np.array(p2l_synced)
+        # logical_to_all_physical_map = np.array(l2p_synced)
+
         logical_to_all_physical_map_num_valid = np.sum(logical_to_all_physical_map != -1, axis=2)
-
-        # In static dispatch, we select the first replica for each logical expert
         logical_to_rank_dispatch_physical_map = logical_to_all_physical_map[:, :, 0]
-
-        logger.info(
-            "Initialized ExpertLocationMetadata raw. physical_to_logical_map shape: %s, sample (layer 0): %s",
-            physical_to_logical_map.shape,
-            (
-                physical_to_logical_map[0, :10]
-                if physical_to_logical_map.ndim > 1
-                else physical_to_logical_map[:10]
-            ),
-        )
 
         return ExpertLocationMetadata(
             ep_dispatch_algorithm=server_args.ep_dispatch_algorithm or "static",

@@ -478,6 +478,8 @@ class WeightLoader:
                 result = np.transpose(result)
             return result
 
+        MAX_WORKERS = 128
+
         def _load_stacked_slice(index):
             expert_slice = index[0]
             inner_slice = index[1:]
@@ -497,19 +499,42 @@ class WeightLoader:
             else:
                 logical_indices = physical_indices
 
-            unique_logical = sorted(list(set(logical_indices)))
-            logical_cache = {}
-            for log_idx in unique_logical:
+            # Build task list: (logical_idx, list of physical positions that need it)
+            logical_to_positions = {}
+            for phys_pos, log_idx in enumerate(logical_indices):
+                if log_idx not in logical_to_positions:
+                    logical_to_positions[log_idx] = []
+                logical_to_positions[log_idx].append(phys_pos)
+
+            # Pre-load first expert to determine shape
+            first_log_idx = logical_indices[0]
+            orig_inner = list(inner_slice)
+            if do_transpose and len(orig_inner) >= 2:
+                orig_inner[-1], orig_inner[-2] = orig_inner[-2], orig_inner[-1]
+            first_data = _load_single_expert_slice(first_log_idx, tuple(orig_inner))
+
+            out_array = np.empty((len(physical_indices), *first_data.shape), dtype=target_dtype)
+            for pos in logical_to_positions[first_log_idx]:
+                out_array[pos] = first_data
+
+            # Load remaining unique experts in parallel and fill positions
+            remaining_logical = [
+                log_idx for log_idx in logical_to_positions if log_idx != first_log_idx
+            ]
+
+            def load_and_fill_expert(log_idx):
                 orig_inner = list(inner_slice)
                 if do_transpose and len(orig_inner) >= 2:
                     orig_inner[-1], orig_inner[-2] = orig_inner[-2], orig_inner[-1]
-                logical_cache[log_idx] = _load_single_expert_slice(log_idx, tuple(orig_inner))
+                data = _load_single_expert_slice(log_idx, tuple(orig_inner))
+                # Directly fill all positions that need this expert
+                for pos in logical_to_positions[log_idx]:
+                    out_array[pos] = data
 
-            out_array = np.empty(
-                (len(physical_indices), *logical_cache[unique_logical[0]].shape), dtype=target_dtype
-            )
-            for i, log_idx in enumerate(logical_indices):
-                out_array[i] = logical_cache[log_idx]
+            if remaining_logical:
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                    list(executor.map(load_and_fill_expert, remaining_logical))
+
             return out_array
 
         return jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice).astype(
@@ -525,14 +550,8 @@ class WeightLoader:
         target_sharding: jax.sharding.NamedSharding = None,
         physical_to_logical_map: np.ndarray | None = None,
     ) -> jax.Array:
-        """
-        Lazy loader for MoE weights with support for redundant expert cloning.
-        """
-
-        # 1. Get base info from the first expert
         first_key = expected_hf_keys[0]
         info = weight_info[first_key][0]
-
         single_expert_shape = info["shape"]
         st_dtype = info["dtype"]
 
@@ -549,34 +568,27 @@ class WeightLoader:
         target_dtype = dtype_map.get(st_dtype, jnp.float32)
 
         num_logical_experts = len(expected_hf_keys)
-        num_physical_experts = (
-            len(physical_to_logical_map)
-            if physical_to_logical_map is not None
-            else num_logical_experts
-        )
 
-        # Determine the final stacked shape, considering optional transpose
-        if do_transpose:
-            if len(single_expert_shape) >= 2:
-                final_single_shape = list(single_expert_shape)
-                final_single_shape[-1], final_single_shape[-2] = (
-                    final_single_shape[-2],
-                    final_single_shape[-1],
-                )
-                final_single_shape = tuple(final_single_shape)
-            else:
-                final_single_shape = single_expert_shape
+        if physical_to_logical_map is not None:
+            physical_to_logical_map = np.array(physical_to_logical_map)
+            num_physical_experts = len(physical_to_logical_map)
+        else:
+            num_physical_experts = num_logical_experts
+
+        if do_transpose and len(single_expert_shape) >= 2:
+            final_single_shape = list(single_expert_shape)
+            final_single_shape[-1], final_single_shape[-2] = (
+                final_single_shape[-2],
+                final_single_shape[-1],
+            )
+            final_single_shape = tuple(final_single_shape)
         else:
             final_single_shape = single_expert_shape
 
         stacked_shape = (num_physical_experts, *final_single_shape)
+        sharding = target_sharding or jax.sharding.NamedSharding(self.mesh, P())
 
-        if target_sharding is None:
-            sharding = jax.sharding.NamedSharding(self.mesh, P())
-        else:
-            sharding = target_sharding
-
-        MAX_WORKERS = 128
+        LOAD_WORKERS = 8
 
         def _load_stacked_slice(index):
             expert_slice = index[0]
@@ -589,12 +601,10 @@ class WeightLoader:
             if sliced_num_physical == 0:
                 return np.zeros((0, *[1] * len(inner_slice)), dtype=target_dtype)
 
-            # Optimization: Load all required unique logical experts once
             if physical_to_logical_map is not None:
                 logical_indices_to_load = [
                     int(physical_to_logical_map[p]) for p in physical_indices
                 ]
-                # Log mapping for the first chunk to verify logic
                 if physical_indices[0] == 0:
                     sample_size = min(10, len(physical_indices))
                     sample_map = {
@@ -605,31 +615,52 @@ class WeightLoader:
             else:
                 logical_indices_to_load = physical_indices
 
-            unique_logical_needed = sorted(list(set(logical_indices_to_load)))
-            logical_cache = {}
+            first_log_idx = logical_indices_to_load[0]
+            first_hf_key = expected_hf_keys[first_log_idx]
+            first_fname = weight_info[first_hf_key][0]["file"]
+            first_f = file_manager.get_handle(first_fname)
 
-            def load_one_logical_expert(log_idx):
-                hf_key = expected_hf_keys[log_idx]
-                fname = weight_info[hf_key][0]["file"]
-                f = file_manager.get_handle(fname)
-                data = f.get_slice(hf_key)[:]
+            if not do_transpose:
+                first_chunk = first_f.get_slice(first_hf_key)[inner_slice]
+                first_chunk = _view_as_fp8_if_needed(first_chunk, target_dtype)
+            else:
+                data = first_f.get_slice(first_hf_key)[:]
                 data = _view_as_fp8_if_needed(data, target_dtype)
-                if do_transpose:
-                    data = np.transpose(data)
-                return log_idx, data[inner_slice]
+                first_chunk = np.transpose(data)[inner_slice]
 
-            if unique_logical_needed:
-                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                    results = list(executor.map(load_one_logical_expert, unique_logical_needed))
-                    for log_idx, data in results:
-                        logical_cache[log_idx] = data
+            out_shape = (sliced_num_physical, *first_chunk.shape)
+            out_array = np.empty(out_shape, dtype=first_chunk.dtype)
+            out_array[0] = first_chunk
 
-            # Construct the final array by picking from cache (handles reordering and duplication)
-            out_shape = (sliced_num_physical, *logical_cache[unique_logical_needed[0]].shape)
-            out_array = np.empty(out_shape, dtype=logical_cache[unique_logical_needed[0]].dtype)
+            logical_to_positions = {}
+            for phys_pos in range(1, sliced_num_physical):
+                log_idx = logical_indices_to_load[phys_pos]
+                if log_idx == first_log_idx:
+                    out_array[phys_pos] = first_chunk
+                else:
+                    logical_to_positions.setdefault(log_idx, []).append(phys_pos)
 
-            for i, log_idx in enumerate(logical_indices_to_load):
-                out_array[i] = logical_cache[log_idx]
+            def load_and_fill_expert(args):
+                l_idx, positions = args
+                hf_k = expected_hf_keys[l_idx]
+                fname = weight_info[hf_k][0]["file"]
+                f = file_manager.get_handle(fname)
+
+                if not do_transpose:
+                    chunk = f.get_slice(hf_k)[inner_slice]
+                    chunk = _view_as_fp8_if_needed(chunk, target_dtype)
+                else:
+                    data = f.get_slice(hf_k)[:]
+                    data = _view_as_fp8_if_needed(data, target_dtype)
+                    chunk = np.transpose(data)[inner_slice]
+
+                for pos in positions:
+                    out_array[pos] = chunk
+
+            if logical_to_positions:
+                tasks = list(logical_to_positions.items())
+                with ThreadPoolExecutor(max_workers=LOAD_WORKERS) as executor:
+                    list(executor.map(load_and_fill_expert, tasks))
 
             return out_array
 

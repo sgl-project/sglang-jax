@@ -566,17 +566,17 @@ class _ExpertDistributionRecorder:
                         logical_counts[layer_idx, l_idx] += self._physical_counts[layer_idx, p_idx]
 
         # Only process 0 saves to file
-        if jax.process_index() == 0:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            base_path = self.output_file
-            if base_path.endswith(".npy"):
-                filename = base_path.replace(".npy", f"_{timestamp}.npy")
-            else:
-                filename = f"{base_path}_{timestamp}.npy"
+        # if jax.process_index() == 0:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+        base_path = self.output_file
+        if base_path.endswith(".npy"):
+            filename = base_path.replace(".npy", f"_{timestamp}.npy")
+        else:
+            filename = f"{base_path}_{timestamp}.npy"
 
-            output_data = {
-                "logical_count": logical_counts,
-                "timestamp": timestamp,
-            }
-            np.save(filename, output_data)
-            logger.info("Expert distribution dumped to %s", filename)
+        output_data = {
+            "logical_count": logical_counts,
+            "timestamp": timestamp,
+        }
+        np.save(filename, output_data)
+        logger.info("Expert distribution dumped to %s", filename)
