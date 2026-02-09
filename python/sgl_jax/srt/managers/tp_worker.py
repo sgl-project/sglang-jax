@@ -402,6 +402,7 @@ class ModelWorker:
         capture_hidden_mode = CaptureHiddenMode.NULL
         has_input_embedding = False
         has_deepstack_visual_embedding = False
+        is_mrope_position = False
         if self.precompile_params is not None:
             capture_hidden_mode_int = self.precompile_params.get("capture_hidden_mode", 0)
             capture_hidden_mode = CaptureHiddenMode.parse(capture_hidden_mode_int)
@@ -409,6 +410,7 @@ class ModelWorker:
             has_deepstack_visual_embedding = self.precompile_params.get(
                 "deepstack_visual_embedding", False
             )
+            is_mrope_position = self.precompile_params.get("mrope", False)
 
         return ModelWorkerBatch(
             bid=1,
@@ -430,7 +432,11 @@ class ModelWorker:
             ),
             extend_input_logprob_token_ids=None,
             positions=np.concat([valid_positions, invalid_positions], axis=0),
-            mrope_positions=None,
+            mrope_positions=(
+                np.broadcast_to(np.arange(num_tokens, dtype=np.int32), (3, num_tokens))
+                if is_mrope_position
+                else None
+            ),
             extend_start_loc=np.arange(bs, dtype=np.int64),
             cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
             extend_prefix_lens=(np.array([0] * bs) if mode == ForwardMode.EXTEND else None),
