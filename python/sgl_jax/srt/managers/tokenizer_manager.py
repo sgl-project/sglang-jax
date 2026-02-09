@@ -608,6 +608,7 @@ class TokenizerManager:
         num_steps: int | None = None,
         host_tracer_level: int | None = None,
         python_tracer_level: int | None = None,
+        stage_id: int | None = None,
     ):
         self.auto_create_handle_loop()
         req = ProfileReq(
@@ -618,6 +619,7 @@ class TokenizerManager:
             host_tracer_level=host_tracer_level,
             python_tracer_level=python_tracer_level,
             profile_id=str(time.time()),
+            stage_id=stage_id,
         )
         return await self._execute_profile(req)
 

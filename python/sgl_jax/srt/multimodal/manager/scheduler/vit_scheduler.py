@@ -3,7 +3,8 @@ import logging
 import jax.sharding
 
 from sgl_jax.srt.managers.communication import CommunicationBackend
-from sgl_jax.srt.managers.io_struct import AbortReq
+from sgl_jax.srt.managers.io_struct import AbortReq, ProfileReq
+from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixin
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.model_executor.vit.vit_model_worker import VitModelWorker
@@ -11,7 +12,7 @@ from sgl_jax.srt.multimodal.model_executor.vit.vit_model_worker import VitModelW
 logger = logging.getLogger(__name__)
 
 
-class VitScheduler:
+class VitScheduler(SchedulerProfilerMixin):
     """Scheduler shell for ViT-stage feature extraction."""
 
     def __init__(
@@ -25,6 +26,8 @@ class VitScheduler:
         self.communication_backend = communication_backend
         self.mesh = mesh
         self.vit_worker = VitModelWorker(server_args, mesh=mesh, model_class=model_class)
+        self.forward_ct = 0
+        self.init_profier()
         self.aborted_rids: set[str] = set()
 
     def event_loop_normal(self):
@@ -35,6 +38,9 @@ class VitScheduler:
                     if isinstance(req, AbortReq):
                         logger.info("VitScheduler received abort for rid=%s", req.rid)
                         self.aborted_rids.add(req.rid)
+                    elif isinstance(req, ProfileReq):
+                        result = self.profile(req)
+                        self.communication_backend.send_pyobj(result)
                     elif isinstance(req, Req):
                         if req.rid in self.aborted_rids:
                             logger.info("VitScheduler skipping aborted request rid=%s", req.rid)
@@ -49,4 +55,6 @@ class VitScheduler:
     def run_vit_step(self, req: Req):
         """Placeholder: run ViT encoder and forward request to next stage."""
         self.vit_worker.forward(req, self.mesh)
+        self.forward_ct += 1
+        self._profile_batch_predicate(None)
         self.communication_backend.send_pyobj(req)

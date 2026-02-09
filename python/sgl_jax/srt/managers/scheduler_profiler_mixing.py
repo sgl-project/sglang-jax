@@ -100,13 +100,9 @@ class SchedulerProfilerMixin:
         if not Path(self.profiler_output_dir).exists():
             Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
 
-        logger.info("Stop profiling...")
+        print(f"[Profile] Stop profiling, saving to {self.profiler_output_dir} ...", flush=True)
         jax.profiler.stop_trace()
-
-        logger.info(
-            "Profiling done. Traces are saved to: %s",
-            self.profiler_output_dir,
-        )
+        print("[Profile] Profiling done. Traces saved.", flush=True)
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
 

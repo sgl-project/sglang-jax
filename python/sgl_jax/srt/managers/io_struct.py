@@ -648,6 +648,7 @@ class ProfileReqInput:
     # 0: Disables Python function call tracing.
     # 1: Enables Python tracing (this is the default).
     python_tracer_level: int | None = None
+    stage_id: int | None = None  # Which stage to count steps for (multimodal only)
 
 
 class ProfileReqType(Enum):
@@ -664,6 +665,7 @@ class ProfileReq:
     host_tracer_level: int | None = None
     python_tracer_level: int | None = None
     profile_id: str | None = None
+    stage_id: int | None = None
 
 
 @dataclass

@@ -383,6 +383,7 @@ async def start_profile_async(obj: ProfileReqInput | None = None):
         num_steps=obj.num_steps,
         host_tracer_level=obj.host_tracer_level,
         python_tracer_level=obj.python_tracer_level,
+        stage_id=obj.stage_id,
     )
     return Response(
         content="Start profiling.\n",

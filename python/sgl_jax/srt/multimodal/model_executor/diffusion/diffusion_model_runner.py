@@ -128,6 +128,7 @@ class DiffusionModelRunner(BaseModelRunner):
         batch: Req,
         mesh: jax.sharding.Mesh,
         abort_checker: Callable[[], bool] | None = None,
+        step_callback: Callable[[], None] | None = None,
     ) -> bool:
         """Run diffusion inference with optional abort checking.
 
@@ -136,6 +137,8 @@ class DiffusionModelRunner(BaseModelRunner):
             mesh: JAX device mesh for sharding.
             abort_checker: Optional callback that returns True if the request
                 should be aborted. Called between diffusion steps.
+            step_callback: Optional callback invoked after each denoising step
+                completes, used for profiling step counting.
 
         Returns:
             True if the request was aborted, False otherwise.
@@ -201,6 +204,7 @@ class DiffusionModelRunner(BaseModelRunner):
                 )
                 return True  # Aborted
 
+            jax.profiler.StepTraceAnnotation("diffusion_step", step_num=step)
             t_scalar = jnp.array(self.solver.timesteps, dtype=jnp.int32)[step]
             if do_classifier_free_guidance:
                 latents = jnp.concatenate([latents] * 2, axis=0)
@@ -232,6 +236,8 @@ class DiffusionModelRunner(BaseModelRunner):
             )[0]
 
             latents = latents.transpose(0, 2, 3, 4, 1)  # back to channel-last
+            if step_callback is not None:
+                step_callback()
 
         logger.info("Finished diffusion step %d in %.2f seconds", step, time.time() - start_time)
         batch.latents = jax.device_get(latents)

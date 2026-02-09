@@ -7,7 +7,7 @@ import psutil
 import setproctitle
 
 from sgl_jax.srt.managers.detokenizer_manager import DetokenizerManager
-from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
+from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut, ProfileReqOutput
 from sgl_jax.srt.multimodal.manager.io_struct import DataType
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
@@ -46,8 +46,13 @@ class MultimodalDetokenizer(DetokenizerManager):
                 (BatchTokenIDOut, self.handle_batch_token_id_out),
                 (Req, self.save_result),
                 (AbortReq, self._handle_abort_req),
+                (ProfileReqOutput, self._forward_profile_output),
             ]
         )
+
+    def _forward_profile_output(self, output: ProfileReqOutput):
+        """Forward ProfileReqOutput through to the tokenizer manager."""
+        return output
 
     def _handle_abort_req(self, abort_req: AbortReq):
         """Forward an AbortReq to the tokenizer manager.
