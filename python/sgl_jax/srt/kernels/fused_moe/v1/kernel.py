@@ -869,6 +869,14 @@ def _fused_ep_moe_kernel(
             # Ensure all peers completed their sends before using gathered sizes.
             sync_barrier()
 
+            # Kick off VMEM->SMEM copy early to overlap transfer with reduction.
+            # This does not change metadata arithmetic or dtype semantics.
+            d2e_count_copy = pltpu.async_copy(
+                src_ref=d2e_count_vmem,
+                dst_ref=d2e_count_x2_smem.at[bt_sem_id],
+                sem=send_sem,
+            )
+
             all_dev_sizes = d2e_count_vmem[:, 0, :]
             reduced_sizes = jnp.sum(all_dev_sizes, axis=0, keepdims=True)
 
@@ -887,11 +895,6 @@ def _fused_ep_moe_kernel(
             sizes_copy = pltpu.async_copy(
                 src_ref=sizes_vmem,
                 dst_ref=expert_sizes_x2_smem.at[bt_sem_id],
-                sem=send_sem,
-            )
-            d2e_count_copy = pltpu.async_copy(
-                src_ref=d2e_count_vmem,
-                dst_ref=d2e_count_x2_smem.at[bt_sem_id],
                 sem=send_sem,
             )
 
