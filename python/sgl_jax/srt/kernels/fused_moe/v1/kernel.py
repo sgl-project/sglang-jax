@@ -800,9 +800,6 @@ def _fused_ep_moe_kernel(
             d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
             d2e_count_vmem[my_id] = sizes
 
-            # Ensure all peers have entered this scope (VMEM allocated) before
-            # issuing remote puts.
-            sync_barrier()
             # Fast path for power-of-two device counts: recursive doubling
             # allgather in O(log2(num_devices)) rounds.
             if num_devices > 0 and (num_devices & (num_devices - 1)) == 0:
@@ -844,6 +841,9 @@ def _fused_ep_moe_kernel(
                     ]
                     pltpu.make_async_copy(src_ref=send_ref, dst_ref=send_ref, sem=send_sem).wait()
             else:
+                # Ensure all peers have entered this scope (VMEM allocated) before
+                # issuing remote puts.
+                sync_barrier()
                 for step in range(1, num_devices):
                     peer_id = (my_id + step) % num_devices
                     pltpu.make_async_remote_copy(
@@ -869,12 +869,12 @@ def _fused_ep_moe_kernel(
             # Ensure all peers completed their sends before using gathered sizes.
             sync_barrier()
 
-            reduced_sizes = jnp.zeros_like(sizes)
-            reduced_starts = jnp.zeros_like(starts)
-            for dev_id in range(num_devices):
-                dev_sizes = d2e_count_vmem[dev_id]
-                reduced_sizes += dev_sizes
-                reduced_starts += lax.select(dev_id < my_id, dev_sizes, jnp.zeros_like(dev_sizes))
+            all_dev_sizes = d2e_count_vmem[:, 0, :]
+            reduced_sizes = jnp.sum(all_dev_sizes, axis=0, keepdims=True)
+
+            dev_ids = lax.broadcasted_iota(jnp.int32, (num_devices, 1), 0)
+            start_mask = (dev_ids < my_id).astype(all_dev_sizes.dtype)
+            reduced_starts = jnp.sum(all_dev_sizes * start_mask, axis=0, keepdims=True)
 
             starts_vmem[...] = reduced_starts
             sizes_vmem[...] = reduced_sizes
