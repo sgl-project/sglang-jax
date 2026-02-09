@@ -798,28 +798,63 @@ def _fused_ep_moe_kernel(
             d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
             d2e_count_vmem[my_id] = sizes
 
-            # Ensure all peers have entered this scope (VMEM allocated) before
-            # issuing remote puts.
             sync_barrier()
-            for step in range(1, num_devices):
-                peer_id = (my_id + step) % num_devices
-                pltpu.make_async_remote_copy(
-                    src_ref=d2e_count_vmem.at[my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)],
-                    dst_ref=d2e_count_vmem.at[my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)],
-                    send_sem=send_sem,
-                    recv_sem=recv_sem,
-                    device_id=get_mesh_device_id(peer_id),
-                    device_id_type=pltpu.DeviceIdType.MESH,
-                ).start()
+            # Fast path for power-of-two device counts: recursive doubling
+            # allgather in O(log2(num_devices)) rounds.
+            if num_devices > 0 and (num_devices & (num_devices - 1)) == 0:
+                rounds = int(math.log2(num_devices))
+                for round_id in range(rounds):
+                    sync_barrier()
 
-                # Drain one incoming update for this step to guarantee forward
-                # progress (remote copies signal `recv_sem` on the receiver).
-                src_peer = (my_id + num_devices - step) % num_devices
-                recv_ref = d2e_count_vmem.at[src_peer, pl.ds(0, 1), pl.ds(0, padded_num_experts)]
-                pltpu.make_async_copy(src_ref=recv_ref, dst_ref=recv_ref, sem=recv_sem).wait()
+                    chunk = 1 << round_id
+                    chunk_i32 = jnp.int32(chunk)
+                    peer_id = my_id ^ chunk_i32
 
-                send_ref = d2e_count_vmem.at[my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)]
-                pltpu.make_async_copy(src_ref=send_ref, dst_ref=send_ref, sem=send_sem).wait()
+                    send_start = (my_id >> round_id) << round_id
+                    recv_start = (peer_id >> round_id) << round_id
+
+                    pltpu.make_async_remote_copy(
+                        src_ref=d2e_count_vmem.at[
+                            pl.ds(send_start, chunk), pl.ds(0, 1), pl.ds(0, padded_num_experts)
+                        ],
+                        dst_ref=d2e_count_vmem.at[
+                            pl.ds(send_start, chunk), pl.ds(0, 1), pl.ds(0, padded_num_experts)
+                        ],
+                        send_sem=send_sem,
+                        recv_sem=recv_sem,
+                        device_id=get_mesh_device_id(peer_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
+
+                    recv_ref = d2e_count_vmem.at[
+                        pl.ds(recv_start, chunk), pl.ds(0, 1), pl.ds(0, padded_num_experts)
+                    ]
+                    pltpu.make_async_copy(src_ref=recv_ref, dst_ref=recv_ref, sem=recv_sem).wait()
+
+                    send_ref = d2e_count_vmem.at[
+                        pl.ds(send_start, chunk), pl.ds(0, 1), pl.ds(0, padded_num_experts)
+                    ]
+                    pltpu.make_async_copy(src_ref=send_ref, dst_ref=send_ref, sem=send_sem).wait()
+            else:
+                for step in range(1, num_devices):
+                    peer_id = (my_id + step) % num_devices
+                    pltpu.make_async_remote_copy(
+                        src_ref=d2e_count_vmem.at[my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)],
+                        dst_ref=d2e_count_vmem.at[my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)],
+                        send_sem=send_sem,
+                        recv_sem=recv_sem,
+                        device_id=get_mesh_device_id(peer_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
+
+                    src_peer = (my_id + num_devices - step) % num_devices
+                    recv_ref = d2e_count_vmem.at[
+                        src_peer, pl.ds(0, 1), pl.ds(0, padded_num_experts)
+                    ]
+                    pltpu.make_async_copy(src_ref=recv_ref, dst_ref=recv_ref, sem=recv_sem).wait()
+
+                    send_ref = d2e_count_vmem.at[my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)]
+                    pltpu.make_async_copy(src_ref=send_ref, dst_ref=send_ref, sem=send_sem).wait()
 
             # Ensure all peers completed their sends before using gathered sizes.
             sync_barrier()
