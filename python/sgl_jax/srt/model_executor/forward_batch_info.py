@@ -343,7 +343,7 @@ class ForwardBatch:
             (mrope_positions,) = device_array(
                 (batch.mrope_positions,),
                 sharding=(
-                    NamedSharding(model_runner.mesh, PartitionSpec())
+                    NamedSharding(model_runner.mesh, PartitionSpec(None, None))
                     if jax.process_count() == 1
                     else None
                 ),

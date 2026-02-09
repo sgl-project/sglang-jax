@@ -183,6 +183,10 @@ class EmbedModelRunner(BaseModelRunner):
         mm_inputs = batch.omni_inputs if isinstance(batch.omni_inputs, dict) else None
         if mm_inputs is not None:
             mm_inputs["multimodal_embedding"] = input_embeds
-            mm_inputs["deepstack_visual_embedding"] = visual_embeds_multiscale
-            mm_inputs["deepstack_visual_pos_mask"] = visual_pos_masks
+            if visual_embeds_multiscale is None:
+                mm_inputs["deepstack_visual_embedding"] = jnp.zeros((3, 1, input_embeds.shape[-1]))
+                mm_inputs["deepstack_visual_pos_mask"] = jnp.array([0], dtype=jnp.int32)
+            else:
+                mm_inputs["deepstack_visual_embedding"] = visual_embeds_multiscale
+                mm_inputs["deepstack_visual_pos_mask"] = visual_pos_masks
         return batch
