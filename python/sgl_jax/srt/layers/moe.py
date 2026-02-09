@@ -148,8 +148,7 @@ class TopK(nnx.Module):
 
         # Create group mask using scatter
         group_mask = jnp.zeros_like(group_scores)  # [n, n_group]
-        token_indices = jnp.arange(num_token)[:, None]
-        group_mask = group_mask.at[token_indices, group_idx].set(1)  # [n, n_group]
+        group_mask = jax.nn.one_hot(group_idx, self.num_expert_group).sum(axis=1)  # [n, n_group]
 
         # Create score mask
         experts_per_group = router_logits.shape[-1] // self.num_expert_group
@@ -183,9 +182,7 @@ class TopK(nnx.Module):
         group_idx = jax.lax.top_k(group_scores, k=self.topk_group)[1]
 
         # Create group mask using scatter
-        group_mask = jnp.zeros_like(group_scores)  # [n, n_group]
-        token_indices = jnp.arange(num_token)[:, None]
-        group_mask = group_mask.at[token_indices, group_idx].set(1)  # [n, n_group]
+        group_mask = jax.nn.one_hot(group_idx, self.num_expert_group).sum(axis=1)
 
         # Create score mask
         experts_per_group = router_logits.shape[-1] // self.num_expert_group
@@ -1028,11 +1025,8 @@ class FusedEPMoE(nnx.Module):
     def __call__(
         self,
         hidden_states: jax.Array,
-        router_logits: jax.Array,
-        router_bias: jax.Array | None = None,
-        token_valid_mask: jax.Array | None = None,
-        l2p_map: jax.Array | None = None,
-        l2p_num_valid: jax.Array | None = None,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
         *,
         block_config: FusedMoEBlockConfig | None = None,
     ) -> jax.Array:
@@ -1042,16 +1036,13 @@ class FusedEPMoE(nnx.Module):
         Args:
             hidden_states: Input tokens, shape (num_tokens, hidden_size) or
                           (batch_size, seq_len, hidden_size)
-            router_logits: Router output logits, shape (num_tokens, num_experts)
-                          Note: Should be raw logits, not after softmax or top-k
+            topk_weights: Pre-computed top-k weights
+            topk_ids: Pre-computed top-k expert IDs
 
         Returns:
             MoE layer output, same shape as hidden_states
         """
         assert hidden_states.ndim == 2
-
-        if router_bias is not None:
-            router_bias = jax.sharding.reshard(router_bias, P())
 
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
@@ -1065,8 +1056,6 @@ class FusedEPMoE(nnx.Module):
         w2_shared_scale = self.w2_shared_scale.value if self.w2_shared_scale is not None else None
 
         subc_quant_wsz = self.subc_quant_wsz if self.subc_quant_wsz is not None else None
-        l2p_map_value = l2p_map[self.layer_id] if l2p_map is not None else None
-        l2p_num_valid_value = l2p_num_valid[self.layer_id] if l2p_num_valid is not None else None
 
         output = fused_ep_moe(
             mesh=self.mesh,
@@ -1074,8 +1063,8 @@ class FusedEPMoE(nnx.Module):
             w1=self.w1.value,
             w2=self.w2.value,
             w3=self.w3.value,
-            gating_output=router_logits,
-            bias=router_bias,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             top_k=self.num_experts_per_tok,
             use_grouped_topk=self.use_grouped_topk,
             num_groups=self.num_groups,
@@ -1084,7 +1073,6 @@ class FusedEPMoE(nnx.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             act_fn=self.activation,
             block_config=block_config,
-            token_valid_mask=token_valid_mask,
             # Optional parameters (not used in basic case)
             subc_quant_wsz=subc_quant_wsz,
             w1_scale=w1_scale,
@@ -1099,8 +1087,6 @@ class FusedEPMoE(nnx.Module):
             b1=None,
             b2=None,
             b3=None,
-            l2p_map=l2p_map_value,
-            l2p_num_valid=l2p_num_valid_value,
             dp_axis_name="data",
             tp_axis_name="tensor",
         )

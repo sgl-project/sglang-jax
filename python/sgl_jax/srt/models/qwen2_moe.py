@@ -257,6 +257,12 @@ class Qwen2MoeDecoderLayer(nnx.Module):
         self.moe_backend = getattr(config, "moe_backend", "epmoe")
         self.use_fused = self.moe_backend == "fused"
 
+        self.topk = TopK(
+            topk=num_experts_per_tok,
+            renormalize=getattr(config, "norm_topk_prob", True),
+            layer_id=layer_id,
+        )
+
         if self.use_fused:
             from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 
@@ -274,11 +280,6 @@ class Qwen2MoeDecoderLayer(nnx.Module):
                 quantization_config=getattr(config, "quantization_config", None),
             )
         else:
-            self.topk = TopK(
-                topk=num_experts_per_tok,
-                renormalize=getattr(config, "norm_topk_prob", True),
-                layer_id=layer_id,
-            )
             self.mlp = EPMoE(
                 hidden_size=config.hidden_size,
                 num_experts=num_experts,
@@ -365,12 +366,15 @@ class Qwen2MoeDecoderLayer(nnx.Module):
             shared_output = None
 
         router_logits = self.moe_gate(hidden_states)
+        router_logits = jax.sharding.reshard(router_logits, P())
+        topk_weights, topk_ids = self.topk(router_logits, dispatch_info=dispatch_info)
+
         if self.use_fused:
             token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
-            mlp_output = self.mlp(hidden_states, router_logits, token_valid_mask=token_valid_mask)
-            topk_ids = None
+            mlp_output = self.mlp(
+                hidden_states, topk_weights, topk_ids, token_valid_mask=token_valid_mask
+            )
         else:
-            topk_weights, topk_ids = self.topk(router_logits, dispatch_info=dispatch_info)
             mlp_output = self.mlp(hidden_states, topk_weights, topk_ids)
 
         hidden_states = mlp_output if shared_output is None else (mlp_output + shared_output)
