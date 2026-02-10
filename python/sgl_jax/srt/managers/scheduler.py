@@ -677,6 +677,14 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        if self.server_args.log_requests:
+            logger.debug(
+                "Handle request: rid=%s, max_new_tokens=%s, token_ids_logprob=%s",
+                recv_req.rid,
+                recv_req.sampling_params.max_new_tokens,
+                recv_req.token_ids_logprob,
+            )
+
         # Create a new request
         req = Req(
             recv_req.rid,
@@ -1302,6 +1310,14 @@ class Scheduler(
     def run_batch(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run a batch."""
         self.forward_ct += 1
+
+        if self.server_args.log_requests:
+            logger.debug(
+                "Run batch: mode=%s, bs=%d, return_logprob=%s",
+                batch.forward_mode,
+                batch.batch_size(),
+                batch.return_logprob,
+            )
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)

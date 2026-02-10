@@ -406,6 +406,25 @@ suites = {
             test_methods=["TestModelPerfTrace.test_qwen_7b_performance_trace_tp_1_daily"],
         ),
     ],
+    "score-api-test-tpu-v6e-1": [
+        TestFile("test/srt/test_score_api.py", 2),
+        TestFile("test/srt/test_score_api_core.py", 2),
+        TestFile("test/srt/test_score_api_edge_cases.py", 2),
+        TestFile("test/srt/test_score_openai_client.py", 2),
+        TestFile("test/srt/test_score_validation.py", 2),
+    ],
+    "score-api-core-test-tpu-v6e-1": [
+        TestFile("test/srt/test_score_api_core.py", 5),
+        TestFile("test/srt/test_score_api_edge_cases.py", 2),
+        TestFile("test/srt/test_score_api.py", 5),
+        TestFile("test/srt/test_score_validation.py", 2),
+    ],
+    "score-api-client-test-tpu-v6e-1": [
+        TestFile("test/srt/test_score_openai_client.py", 15),
+    ],
+    "minimal-smoke-test": [
+        TestFile("python/sgl_jax/test/test_utils.py", 0.2),
+    ],
     "sglang_dependency_test": [],
     "unit-test-tpu-v6e-1": [
         TestFile("python/sgl_jax/test/test_flashattention.py", 20),

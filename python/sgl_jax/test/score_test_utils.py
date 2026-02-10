@@ -62,13 +62,15 @@ class ScoreTestConfig:
         engine = build_engine(config)
     """
 
-    model_name: str = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+    model_name: str = field(
+        default_factory=lambda: os.getenv("SGLANG_TEST_MODEL", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+    )
     device: str = "tpu"
     tp_size: int = 1
     dtype: str = "bfloat16"
     download_dir: str = "/dev/shm"
     random_seed: int = 3
-    mem_fraction_static: float = 0.6
+    mem_fraction_static: float = 0.4
     max_running_requests: int = 16
     tolerance: float = 0.01  # 1% tolerance for score comparison
     chunked_prefill_size: int = 1024
