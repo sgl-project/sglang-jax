@@ -203,6 +203,7 @@ class EPMoE(nnx.Module):
         activation: str = "silu",
         layer_id: int = 0,
         quantization_config=None,
+        reduce_scatter: bool = False,
     ):
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
@@ -215,6 +216,7 @@ class EPMoE(nnx.Module):
         self.mesh = mesh
         self.activation = activation
         self.hidden_size = hidden_size
+        self.reduce_scatter = reduce_scatter
 
         # Get quantization settings from config
         self.quantized_dtype = (
@@ -363,9 +365,27 @@ class EPMoE(nnx.Module):
             )
 
     @named_scope
-    def __call__(self, hidden_states, topk_weights, topk_ids) -> jax.Array:
+    def __call__(
+        self,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        mlp_intermediate=None,
+        mlp_down_weight=None,
+        mlp_down_weight_q=None,
+        mlp_down_weight_scale=None,
+        mlp_quantize_activation=False,
+    ) -> jax.Array:
         # Activation quantization is now handled per-GEMM inside _gmm_compute
         # (aligned with sglang-gpu scheme: quantize before each GEMM, dequantize after)
+
+        fuse_mlp = mlp_intermediate is not None and (
+            mlp_down_weight is not None or mlp_down_weight_q is not None
+        )
+        fuse_quantized = mlp_down_weight_q is not None
+
+        # Store quantize_activation flag so _forward can access it inside shard_map
+        self._mlp_quantize_activation = mlp_quantize_activation
 
         # Run MoE computation on the expert-parallel mesh
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
@@ -377,29 +397,25 @@ class EPMoE(nnx.Module):
             w1_scale = self.wi_1_scale.value if self.wi_1_scale is not None else None
             wo_scale = self.wo_scale.value if self.wo_scale is not None else None
 
-            result = shard_map(
-                self._forward,
-                mesh=self.moe_mesh,
-                in_specs=(
-                    P(None),
-                    P(None),
-                    P(None),
-                    # weights
-                    P("expert", "tensor", None),
-                    P("expert", "tensor", None),
-                    P("expert", None, "tensor"),
-                    # scales
-                    P("expert", None, None, "tensor"),
-                    P("expert", None, None, "tensor"),
-                    P("expert", None, None, None),
-                    # biases (unused)
-                    P("expert", None, "tensor"),
-                    P("expert", None, "tensor"),
-                    P("expert", "tensor", None),
-                ),
-                out_specs=P(None),
-                check_vma=False,
-            )(
+            # Build in_specs and args lists, adding MLP inputs when fusing
+            base_in_specs = (
+                P(None),
+                P(None),
+                P(None),
+                # weights
+                P("expert", "tensor", None),
+                P("expert", "tensor", None),
+                P("expert", None, "tensor"),
+                # scales
+                P("expert", None, None, "tensor"),
+                P("expert", None, None, "tensor"),
+                P("expert", None, None, None),
+                # biases (unused)
+                P("expert", None, "tensor"),
+                P("expert", None, "tensor"),
+                P("expert", "tensor", None),
+            )
+            base_args = (
                 hidden_states_reshard,
                 topk_weights_reshard,
                 topk_ids_reshard,
@@ -414,9 +430,70 @@ class EPMoE(nnx.Module):
                 None,
             )
 
+            if fuse_mlp:
+                mlp_intermediate_reshard = jax.sharding.reshard(mlp_intermediate, P(None, "tensor"))
+                if fuse_quantized:
+                    # Quantized MLP down_proj:
+                    # weight_q is [output_size, input_size] with P(None, "tensor")
+                    # weight_scale is [output_size] with P(None)
+                    mlp_wq_reshard = jax.sharding.reshard(mlp_down_weight_q, P(None, "tensor"))
+                    mlp_ws_reshard = jax.sharding.reshard(mlp_down_weight_scale, P(None))
+                    in_specs = base_in_specs + (
+                        P(None, "tensor"),  # mlp_intermediate
+                        P(None, "tensor"),  # mlp_down_weight (unused placeholder)
+                        P(None, "tensor"),  # mlp_down_weight_q [output, input]
+                        P(None),  # mlp_down_weight_scale [output]
+                    )
+                    args = base_args + (
+                        mlp_intermediate_reshard,
+                        None,  # mlp_down_weight (not used in quantized path)
+                        mlp_wq_reshard,
+                        mlp_ws_reshard,
+                    )
+                else:
+                    # Non-quantized MLP down_proj
+                    mlp_down_weight_reshard = jax.sharding.reshard(
+                        mlp_down_weight, P("tensor", None)
+                    )
+                    in_specs = base_in_specs + (
+                        P(None, "tensor"),  # mlp_intermediate
+                        P("tensor", None),  # mlp_down_weight [input, output]
+                        P(None, "tensor"),  # mlp_down_weight_q (unused placeholder)
+                        P(None),  # mlp_down_weight_scale (unused placeholder)
+                    )
+                    args = base_args + (
+                        mlp_intermediate_reshard,
+                        mlp_down_weight_reshard,
+                        None,  # mlp_down_weight_q (not used)
+                        None,  # mlp_down_weight_scale (not used)
+                    )
+            else:
+                in_specs = base_in_specs
+                args = base_args
+
+            # When reduce_scatter is active, output is scattered along dim 0
+            out_specs = P("tensor") if self.reduce_scatter else P(None)
+
+            result = shard_map(
+                self._forward,
+                mesh=self.moe_mesh,
+                in_specs=in_specs,
+                out_specs=out_specs,
+                check_vma=False,
+            )(*args)
+
         # Reshard result back to original mesh
-        replicated_pspec = P(*([None] * result.ndim))
-        return jax.sharding.reshard(result, jax.sharding.NamedSharding(self.mesh, replicated_pspec))
+        if self.reduce_scatter:
+            # Output is scattered along token dim: P("tensor", None, ...)
+            scattered_pspec = P("tensor", *([None] * (result.ndim - 1)))
+            return jax.sharding.reshard(
+                result, jax.sharding.NamedSharding(self.mesh, scattered_pspec)
+            )
+        else:
+            replicated_pspec = P(*([None] * result.ndim))
+            return jax.sharding.reshard(
+                result, jax.sharding.NamedSharding(self.mesh, replicated_pspec)
+            )
 
     def _forward(
         self,
@@ -432,7 +509,17 @@ class EPMoE(nnx.Module):
         w0_kernel_bias=None,
         w1_kernel_bias=None,
         wo_kernel_bias=None,
+        mlp_intermediate=None,
+        mlp_down_weight=None,
+        mlp_down_weight_q=None,
+        mlp_down_weight_scale=None,
     ):
+        # When MLP args are provided, we fuse the MLP down_proj into this
+        # shard_map so we can combine partial sums and do a single collective.
+        fuse_mlp = mlp_intermediate is not None and (
+            mlp_down_weight is not None or mlp_down_weight_q is not None
+        )
+
         expert_shard_id = jax.lax.axis_index("expert")
 
         if hidden_states.ndim == 2:
@@ -463,6 +550,7 @@ class EPMoE(nnx.Module):
             w0_kernel_bias,
             w1_kernel_bias,
             wo_kernel_bias,
+            reduce_results=not fuse_mlp,  # skip psum when fusing with MLP
         )
 
         if self.ep_size > 1:
@@ -475,7 +563,65 @@ class EPMoE(nnx.Module):
             batch_size,
             seq_len,
         )
+
+        if fuse_mlp:
+            # Compute MLP down_proj partial sum locally (no collective)
+            if mlp_down_weight_q is not None:
+                # Quantized path: matches xla_quantized_matmul_local logic
+                mlp_partial = self._quantized_mlp_down(
+                    mlp_intermediate, mlp_down_weight_q, mlp_down_weight_scale
+                )
+            else:
+                # Non-quantized path: simple matmul
+                mlp_partial = jnp.dot(
+                    mlp_intermediate,
+                    mlp_down_weight,
+                )
+            mlp_partial = mlp_partial.astype(output.dtype)
+            # Combine MoE and MLP partial sums, scale by 1/sqrt(2)
+            output = (output + mlp_partial) / 1.4142135623730951
+            # Single reduction for the combined result
+            if self.tp_size > 1:
+                if self.reduce_scatter:
+                    output = jax.lax.psum_scatter(output, "tensor", scatter_dimension=0, tiled=True)
+                else:
+                    output = jax.lax.psum(output, "tensor")
+
         return output
+
+    def _quantized_mlp_down(self, x, w_q, w_scale):
+        """Quantized matmul for MLP down_proj inside shard_map (no reduction).
+
+        Matches the logic of xla_quantized_matmul_local but without the psum.
+        w_q shape: [output_size, input_size] (transposed from LinearBase convention).
+        """
+        out_dtype = x.dtype
+
+        if self._mlp_quantize_activation:
+            # Quantize activation to match weight dtype
+            x_q, x_scale = quantize_tensor_simple(x, w_q.dtype, dim=-1)
+            # Local matmul: x_q [tokens, input] @ w_q.T [input, output] -> [tokens, output]
+            out = jax.lax.dot_general(
+                x_q,
+                w_q,
+                dimension_numbers=(((1,), (1,)), ((), ())),
+                preferred_element_type=out_dtype,
+            )
+            out = out.astype(out_dtype)
+            # Dequantize: apply activation scale and weight scale
+            out = out * x_scale.astype(out_dtype) * jnp.expand_dims(w_scale, 0).astype(out_dtype)
+        else:
+            # No activation quantization, but weight is still quantized
+            out = jax.lax.dot_general(
+                x,
+                w_q,
+                dimension_numbers=(((1,), (1,)), ((), ())),
+                preferred_element_type=out_dtype,
+            )
+            out = out.astype(out_dtype)
+            out = out * jnp.expand_dims(w_scale, 0).astype(out_dtype)
+
+        return out
 
     def _gmm_compute(
         self,
@@ -491,6 +637,7 @@ class EPMoE(nnx.Module):
         w0_kernel_bias=None,
         w1_kernel_bias=None,
         wo_kernel_bias=None,
+        reduce_results=True,
     ):
         if x.shape[0] == 0:
             empty_output = jnp.zeros((0, wo_kernel.shape[-1]), dtype=x.dtype)
@@ -590,8 +737,13 @@ class EPMoE(nnx.Module):
             # intermediate_scale shape: (m, 1) with keepdims=True, broadcasts to (m, n_down)
             intermediate_output = intermediate_output * intermediate_scale
 
-        if self.tp_size > 1:
-            intermediate_output = jax.lax.psum(intermediate_output, "tensor")
+        if self.tp_size > 1 and reduce_results:
+            if self.reduce_scatter:
+                intermediate_output = jax.lax.psum_scatter(
+                    intermediate_output, "tensor", scatter_dimension=0, tiled=True
+                )
+            else:
+                intermediate_output = jax.lax.psum(intermediate_output, "tensor")
 
         return intermediate_output
 
