@@ -66,16 +66,26 @@ def detect_config_size(model_path: str) -> str:
         with open(config_path) as f:
             config = json.load(f)
         num_hidden_layers = config.get("num_hidden_layers", 28)
-        hidden_size = config.get("hidden_size", 1536)
-        if num_hidden_layers <= 28 and hidden_size <= 1536:
+        # 2B has 28 layers, 4B has 36, 8B has 36, 32B has 64
+        hidden_size = config.get("hidden_size", 2048)
+        if num_hidden_layers <= 28:
             return "2b"
-        else:
+        elif hidden_size <= 2560:
+            return "4b"
+        elif hidden_size <= 4096:
             return "8b"
+        else:
+            return "32b"
     return "2b"
 
 
 def create_model_config(model_path: str, dtype):
-    """Create a ModelConfig-compatible object for weight loading."""
+    """Create configs for model initialization and weight loading.
+
+    Returns:
+        qwen3_config: Full Qwen3VLConfig (contains .vision_config and .text_config)
+        hf_config: HuggingFace AutoConfig for the generation model
+    """
     from transformers import AutoConfig
 
     from sgl_jax.srt.multimodal.configs.qwen_vl.qwen3_vl_config import Qwen3VLConfig
@@ -83,21 +93,41 @@ def create_model_config(model_path: str, dtype):
     size = detect_config_size(model_path)
     print(f"  Detected model size: {size}")
 
-    if size == "2b":
-        vision_config = Qwen3VLConfig.qwen3vl_2b()
-    else:
-        vision_config = Qwen3VLConfig.qwen3vl_8b()
+    size_to_config = {
+        "2b": Qwen3VLConfig.qwen3vl_2b,
+        "4b": Qwen3VLConfig.qwen3vl_4b,
+        "8b": Qwen3VLConfig.qwen3vl_8b,
+        "32b": Qwen3VLConfig.qwen3vl_32b,
+    }
+    qwen3_config = size_to_config[size]()
 
     # Load HuggingFace config for text model
     hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
 
-    return vision_config, hf_config
+    return qwen3_config, hf_config
 
 
-def load_vision_model(model_path: str, vision_config, mesh, dtype):
-    """Load the Qwen3-VL vision encoder."""
+def load_vision_model(model_path: str, qwen3_config, mesh, dtype):
+    """Load the Qwen3-VL vision encoder.
+
+    Args:
+        model_path: Path to model weights directory
+        qwen3_config: Full Qwen3VLConfig (we extract .vision_config from it)
+        mesh: JAX device mesh
+        dtype: Model dtype
+    """
     from sgl_jax.srt.multimodal.models.qwen3_VL.qwen3_vl_vit import (
         Qwen3_VL_VisionModel,
+    )
+
+    # Extract the vision sub-config — VisionModel expects Qwen3VLVisionConfig,
+    # NOT the full Qwen3VLConfig
+    vis_cfg = qwen3_config.vision_config
+    text_cfg = qwen3_config.text_config
+
+    print(
+        f"  Vision config: depth={vis_cfg.depth}, hidden={vis_cfg.hidden_size}, "
+        f"out_hidden={vis_cfg.out_hidden_size}"
     )
 
     print("  Initializing vision model...")
@@ -107,24 +137,24 @@ def load_vision_model(model_path: str, vision_config, mesh, dtype):
     with jax.default_device(jax.devices("cpu")[0]):
         vision_model = nnx.eval_shape(
             lambda: Qwen3_VL_VisionModel(
-                config=vision_config,
+                config=vis_cfg,
                 dtype=dtype,
                 rngs=nnx.Rngs(0),
                 mesh=mesh,
             )
         )
 
-    # Load weights from safetensors
-    # The load_weights method expects a model_config with .model_path, .vocab_size, .text_hidden_size
-    class VisionModelConfig:
-        def __init__(self, path, vconfig, dt):
+    # load_weights expects a config object with .model_path, .vocab_size,
+    # .text_hidden_size (used to create the text_embed layer)
+    class VisionWeightConfig:
+        def __init__(self, path, text_config, vision_config, dt):
             self.model_path = path
             self.dtype = dt
-            self.vocab_size = getattr(vconfig, "vocab_size", 151936)
-            self.text_hidden_size = getattr(vconfig, "out_hidden_size", 1536)
+            self.vocab_size = text_config.vocab_size
+            self.text_hidden_size = vision_config.out_hidden_size
             self.quantization_config = None
 
-    vm_config = VisionModelConfig(model_path, vision_config, dtype)
+    vm_config = VisionWeightConfig(model_path, text_cfg, vis_cfg, dtype)
 
     with mesh:
         vision_model.load_weights(vm_config)
@@ -316,7 +346,7 @@ def main():
 
     # Load configs
     print("\n2. Loading configs...")
-    vision_config, hf_config = create_model_config(model_path, dtype)
+    qwen3_config, hf_config = create_model_config(model_path, dtype)
 
     # Load processor
     print("\n3. Loading processor...")
@@ -324,7 +354,7 @@ def main():
 
     # Load vision model
     print("\n4. Loading vision model...")
-    vision_model = load_vision_model(model_path, vision_config, mesh, dtype)
+    vision_model = load_vision_model(model_path, qwen3_config, mesh, dtype)
 
     # Load generation model (optional)
     gen_model = None
