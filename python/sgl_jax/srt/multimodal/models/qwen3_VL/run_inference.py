@@ -156,7 +156,10 @@ def load_vision_model(model_path: str, qwen3_config, mesh, dtype):
 
     vm_config = VisionWeightConfig(model_path, text_cfg, vis_cfg, dtype)
 
-    with mesh:
+    if mesh:
+        with mesh:
+            vision_model.load_weights(vm_config)
+    else:
         vision_model.load_weights(vm_config)
 
     print(f"  Vision model loaded in {time.time() - t0:.2f}s")
@@ -191,8 +194,11 @@ def load_generation_model(model_path: str, hf_config, mesh, dtype):
             self.quantization_config = None
 
     gm_config = GenModelConfig(model_path, hf_config, dtype)
-
-    with mesh:
+    
+    if mesh:
+        with mesh:
+            gen_model.load_weights(gm_config)
+    else:
         gen_model.load_weights(gm_config)
 
     print(f"  Generation model loaded in {time.time() - t0:.2f}s")
