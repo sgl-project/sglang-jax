@@ -8,7 +8,7 @@ from transformers import PretrainedConfig
 from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
+from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding, get_rope
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -217,13 +217,15 @@ class MiMoMoeAttention(nnx.Module):
             params_dtype=dtype,
             mesh=mesh,
         )
-        self.rotary_emb = RotaryEmbedding(
+        self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
-            max_position_embeddings=max_position_embeddings,
+            max_position=max_position_embeddings,
             base=rope_theta,
             is_neox_style=True,
+            rope_scaling=rope_scaling,
             dtype=dtype,
+            partial_rotary_factor=partial_rotary_factor,
         )
 
         self.attn = RadixAttention(
@@ -441,12 +443,20 @@ class MiMoMoeDecoderLayer(nnx.Module):
         return hidden_states, residual, kv_fused, topk_ids
 
     def is_moe_layer(self, config) -> bool:
+        moe_freq = getattr(config, "moe_layer_freq", None)
         return (
-            hasattr(config, "moe_layer_freq")
-            and 0 <= self.layer_id < len(config.moe_layer_freq)
-            and not isinstance(config.moe_layer_freq, int)
-            and config.moe_layer_freq[self.layer_id]
+            moe_freq is not None
+            and 0 <= self.layer_id < len(moe_freq)
+            and not isinstance(moe_freq, int)
+            and moe_freq[self.layer_id]
         )
+
+    def is_swa_layer(self, config) -> bool:
+        hybrid_pattern = getattr(config, "hybrid_pattern", None)
+        if hybrid_pattern is None:
+            return False
+        return 0 <= self.layer_id < len(hybrid_pattern) and hybrid_pattern[self.layer_id] == "swa"
+
 
 class MiMoV2Model(nnx.Module):
     """MiMo MoE model with embedding, layers, and normalization."""
@@ -757,4 +767,6 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         return output, layers_kv_fused, True, layers_topk_ids
 
 
-EntryClass = MiMoV2FlashForCausalLM
+EntryClass = [MiMoV2FlashForCausalLM]
+# Optionally add an alias if the config uses a different name
+# EntryClass.append(MiMoV2ForCausalLM) 
