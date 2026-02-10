@@ -145,35 +145,6 @@ class AudioBackboneScheduler:
             if logits_np.ndim == 3:
                 logits_np = logits_np[:, -1, :]
 
-            # === DEBUG: Check for NaN/Inf ===
-            step_num = self.backbone_worker._total_seq_lens.get(req.rid, 0)
-            nan_count = np.sum(np.isnan(logits_np))
-            inf_count = np.sum(np.isinf(logits_np))
-            if nan_count > 0 or inf_count > 0:
-                logger.error(
-                    "!!! NaN/Inf detected at step=%d, rid=%s: nan_count=%d, inf_count=%d",
-                    step_num, req.rid, nan_count, inf_count
-                )
-                # Check local_hidden_states
-                local_hs_np = np.array(jax.device_get(local_hidden_states))
-                logger.error(
-                    "  local_hidden_states: nan=%d, inf=%d, min=%.4f, max=%.4f",
-                    np.sum(np.isnan(local_hs_np)),
-                    np.sum(np.isinf(local_hs_np)),
-                    np.nanmin(local_hs_np),
-                    np.nanmax(local_hs_np),
-                )
-                # Check input_ids
-                if req.input_ids is not None:
-                    input_np = np.array(jax.device_get(req.input_ids))
-                    logger.error("  input_ids shape=%s, min=%d, max=%d", input_np.shape, input_np.min(), input_np.max())
-            else:
-                logger.info(
-                    "Step=%d: logits OK, min=%.4f, max=%.4f, mean=%.4f",
-                    step_num, logits_np.min(), logits_np.max(), logits_np.mean()
-                )
-            # === END DEBUG ===
-
             # Debug: show top-10 predicted tokens
             top_k = 10
             top_indices = np.argsort(logits_np[0])[-top_k:][::-1]
