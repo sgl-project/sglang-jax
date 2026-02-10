@@ -49,11 +49,11 @@ class TestMultiItemScorePerformance(CustomTestCase):
     Benchmarks comparing single-item scoring with multi-item scoring.
     """
 
-    model_name = "Qwen/Qwen3-0.6B"
+    model_name = "/data/huggingface_models/Qwen/Qwen3-0.6B"
     engine = None
     tokenizer = None
-    label_token_ids = [198]  # newline token or similar common token
-
+    label_token_ids = [198] # '\n' token or similar common token
+    
     # Target scenario
     PROMPT_LEN = 2000
     NUM_CANDIDATES = 500
@@ -90,6 +90,8 @@ class TestMultiItemScorePerformance(CustomTestCase):
             log_requests=False,
             # Enable multi-item delimiter at engine level
             multi_item_scoring_delimiter=cls.DELIMITER_TOKEN_ID,
+            disable_radix_cache=True,
+            max_multi_item_seq_len=32768,
         )
 
         cls.tokenizer = AutoTokenizer.from_pretrained(

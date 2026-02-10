@@ -166,6 +166,8 @@ class ServerArgs:
     # Maximum allowed total sequence length for multi-item scoring requests.
     # This bounds O(seq^2) custom-mask memory usage in attention.
     max_multi_item_seq_len: int = 32768
+    # Maximum number of items allowed in a single multi-item scoring request.
+    max_multi_item_count: int = 512
     # Maximum number of items processed in a single multi-item scoring forward pass.
     # Requests with more items are split into multiple multi-item chunks.
     # Set to 0 to disable chunking and process all items in one pass.
