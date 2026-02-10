@@ -486,17 +486,11 @@ class MultimodalTokenizer(TokenizerManager):
             source = source.url
 
         # Lazy import to avoid dependency issues on some platforms.
-        from decord import VideoReader, cpu, gpu
+        from decord import VideoReader, cpu
 
         tmp_path = None
         try:
-            try:
-                from decord.bridge import decord_bridge
-
-                ctx = gpu(0)
-                _ = decord_bridge.get_ctx_device(ctx)
-            except Exception:
-                ctx = cpu(0)
+            ctx = cpu(0)
 
             if isinstance(source, bytes):
                 tmp_path = self._write_temp_video(source)

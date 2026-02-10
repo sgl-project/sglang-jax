@@ -1466,19 +1466,43 @@ class ScheduleBatch:
                     )
                     input_embedding = np.concatenate([input_embedding, pad], axis=0)
                 if self.apply_for_deepstack:
-                    self.deepstack_visual_embedding_tmp = np.zeros(
-                        (
-                            self.deepstack_visual_embedding.shape[0],
-                            input_embedding.shape[0],
-                            input_embedding.shape[1],
-                        )
-                    )
-                    indexes = np.where(np.array(deepstack_visual_pos_mask_list))
-                    for layer in range(self.deepstack_visual_embedding.shape[0]):
-                        self.deepstack_visual_embedding_tmp[layer][indexes, :] = (
-                            self.deepstack_visual_embedding[layer]
-                        )
-                    self.deepstack_visual_embedding = self.deepstack_visual_embedding_tmp
+                    if not deepstack_visual_pos_mask_list:
+                        self.apply_for_deepstack = False
+                        self.deepstack_visual_embedding = None
+                        self.deepstack_visual_pos_mask = None
+                    else:
+                        mask = np.concatenate(deepstack_visual_pos_mask_list, axis=0)
+                        if not np.any(mask):
+                            self.apply_for_deepstack = False
+                            self.deepstack_visual_embedding = None
+                            self.deepstack_visual_pos_mask = None
+                        else:
+                            self.deepstack_visual_embedding_tmp = np.zeros(
+                                (
+                                    self.deepstack_visual_embedding.shape[0],
+                                    input_embedding.shape[0],
+                                    input_embedding.shape[1],
+                                )
+                            )
+                            if mask.size:
+                                indexes = np.where(mask)[0]
+                                if indexes.size:
+                                    expected = self.deepstack_visual_embedding.shape[1]
+                                    if indexes.size != expected:
+                                        logger.warning(
+                                            "Deepstack visual mask size mismatch: mask=%s, embedding=%s. "
+                                            "Skip assignment.",
+                                            indexes.size,
+                                            expected,
+                                        )
+                                    else:
+                                        for layer in range(
+                                            self.deepstack_visual_embedding.shape[0]
+                                        ):
+                                            self.deepstack_visual_embedding_tmp[layer][
+                                                indexes, :
+                                            ] = self.deepstack_visual_embedding[layer]
+                            self.deepstack_visual_embedding = self.deepstack_visual_embedding_tmp
         else:
             self.apply_for_deepstack = False
             self.deepstack_visual_embedding = None

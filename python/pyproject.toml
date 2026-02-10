@@ -66,6 +66,7 @@ all = [
 multimodal = [
     "torch",
     "torchvision",
+    "decord",
 ]
 
 [tool.setuptools.packages.find]
