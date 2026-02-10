@@ -1,7 +1,9 @@
 from types import SimpleNamespace
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
-from sgl_jax.srt.managers.scheduler_output_processor_mixin import SchedulerOutputProcessorMixin
+from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
+    SchedulerOutputProcessorMixin,
+)
 
 
 class _DummyScheduler(SchedulerOutputProcessorMixin):

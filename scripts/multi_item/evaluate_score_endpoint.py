@@ -111,7 +111,9 @@ def score_items(
 
 
 def build_perf_items(n: int) -> list[list[int]]:
-    return [copy.deepcopy(DEFAULT_ITEM_IDS[i % len(DEFAULT_ITEM_IDS)]) for i in range(n)]
+    return [
+        copy.deepcopy(DEFAULT_ITEM_IDS[i % len(DEFAULT_ITEM_IDS)]) for i in range(n)
+    ]
 
 
 def evaluate_performance(
@@ -221,7 +223,9 @@ def evaluate_mutations(
         if i == mutated_idx:
             continue
         same_unchanged_diffs.append(max_abs_diff(base_scores[i], same_len_scores[i]))
-        changed_unchanged_diffs.append(max_abs_diff(base_scores[i], changed_len_scores[i]))
+        changed_unchanged_diffs.append(
+            max_abs_diff(base_scores[i], changed_len_scores[i])
+        )
 
     return {
         "query_ids": query_ids,
@@ -232,9 +236,13 @@ def evaluate_mutations(
             "mutated_item_ids": same_len_items[mutated_idx],
             "scores": same_len_scores,
             "unchanged_item_abs_diffs": same_unchanged_diffs,
-            "max_abs_diff_unchanged": max(same_unchanged_diffs) if same_unchanged_diffs else 0.0,
+            "max_abs_diff_unchanged": (
+                max(same_unchanged_diffs) if same_unchanged_diffs else 0.0
+            ),
             "mean_abs_diff_unchanged": (
-                sum(same_unchanged_diffs) / len(same_unchanged_diffs) if same_unchanged_diffs else 0.0
+                sum(same_unchanged_diffs) / len(same_unchanged_diffs)
+                if same_unchanged_diffs
+                else 0.0
             ),
         },
         "changed_length_mutation": {
@@ -257,7 +265,11 @@ def evaluate_mutations(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["multi", "serial"], required=True)
-    parser.add_argument("--url", required=True, help="Score endpoint URL, e.g. http://127.0.0.1:30010/v1/score")
+    parser.add_argument(
+        "--url",
+        required=True,
+        help="Score endpoint URL, e.g. http://127.0.0.1:30010/v1/score",
+    )
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--rounds", type=int, default=3)

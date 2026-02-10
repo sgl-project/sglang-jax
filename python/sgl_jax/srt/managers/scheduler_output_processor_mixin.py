@@ -73,7 +73,10 @@ class SchedulerOutputProcessorMixin:
             )
         else:
             # Move next_token_ids and logprobs to cpu
-            if batch.return_output_logprob_only and logits_output.next_token_logprobs is not None:
+            if (
+                batch.return_output_logprob_only
+                and logits_output.next_token_logprobs is not None
+            ):
                 logits_output.next_token_logprobs = jax.device_get(
                     logits_output.next_token_logprobs
                 ).astype(float)
@@ -128,7 +131,9 @@ class SchedulerOutputProcessorMixin:
                     self.tree_cache.cache_unfinished_req(req)
 
                 if req.return_output_logprob_only:
-                    req.output_token_logprobs_val.append(logits_output.next_token_logprobs[i])
+                    req.output_token_logprobs_val.append(
+                        logits_output.next_token_logprobs[i]
+                    )
                     req.output_token_logprobs_idx.append(next_token_ids[i])
 
                 if req.return_logprob:
@@ -201,7 +206,9 @@ class SchedulerOutputProcessorMixin:
         batch.cache_miss_count = cache_miss_count
 
         if batch.cache_miss_count > 0:
-            logger.info("Prefill batch. #bid: %s, #cache_miss: %s", result.bid, cache_miss_count)
+            logger.info(
+                "Prefill batch. #bid: %s, #cache_miss: %s", result.bid, cache_miss_count
+            )
 
         self.set_next_batch_sampling_info_done(batch)
 
@@ -226,7 +233,9 @@ class SchedulerOutputProcessorMixin:
         predict_tokens = []
         stride = self.draft_worker.speculative_num_draft_tokens
         for i, req in enumerate(batch.reqs):
-            predict_tokens.append(next_token_ids[i * stride : i * stride + accept_lens[i]])
+            predict_tokens.append(
+                next_token_ids[i * stride : i * stride + accept_lens[i]]
+            )
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += accept_lens[i]
 
@@ -244,7 +253,9 @@ class SchedulerOutputProcessorMixin:
             result.cache_miss_count,
         )
         if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
-            next_token_ids = self._resolve_spec_decode_token_ids(result=result, batch=batch)
+            next_token_ids = self._resolve_spec_decode_token_ids(
+                result=result, batch=batch
+            )
 
             # allocate_lens_list = result.allocate_lens.tolist()
             # accept_lens_list = result.accept_lens.tolist()
@@ -256,7 +267,9 @@ class SchedulerOutputProcessorMixin:
                 self.num_generated_tokens += len(next_token_id)
                 self.accept_token += len(next_token_id)
             self.spec_num_forward_ct += len(batch.reqs)
-            self.draft_token += len(batch.reqs) * self.draft_worker.speculative_num_draft_tokens
+            self.draft_token += (
+                len(batch.reqs) * self.draft_worker.speculative_num_draft_tokens
+            )
         # FIXME(pc) add spec decode metrics
 
         if self.enable_overlap:
@@ -267,9 +280,9 @@ class SchedulerOutputProcessorMixin:
         else:
             # spec decoding handles output logprobs inside verify process.
             if batch.return_logprob or batch.return_output_logprob_only:
-                next_token_logprobs = jax.device_get(logits_output.next_token_logprobs).astype(
-                    float
-                )
+                next_token_logprobs = jax.device_get(
+                    logits_output.next_token_logprobs
+                ).astype(float)
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
@@ -286,7 +299,9 @@ class SchedulerOutputProcessorMixin:
                 if self.page_size == 1:
                     indices_to_free = batch.out_cache_loc[i : i + 1]
                 else:
-                    if (len(req.origin_input_ids) + len(req.output_ids) - 1) % self.page_size == 0:
+                    if (
+                        len(req.origin_input_ids) + len(req.output_ids) - 1
+                    ) % self.page_size == 0:
                         indices_to_free = batch.out_cache_loc[i : i + 1]
                 if indices_to_free is not None:
                     self.token_to_kv_pool_allocator.free(indices_to_free)
@@ -304,9 +319,13 @@ class SchedulerOutputProcessorMixin:
                 self.maybe_collect_routed_experts(req)
                 if batch.spec_algorithm is not None and batch.spec_algorithm.is_eagle():
                     cur_allocate_len = batch.spec_info.allocate_lens[i]
-                    all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+                    all_token_len = len(req.origin_input_ids) + max(
+                        len(req.output_ids) - 1, 0
+                    )
                     if self.page_size > 1:
-                        all_token_len = cdiv(all_token_len, self.page_size) * self.page_size
+                        all_token_len = (
+                            cdiv(all_token_len, self.page_size) * self.page_size
+                        )
                     kv_indices = self.req_to_token_pool.req_to_token[
                         req.req_pool_idx,
                         all_token_len:cur_allocate_len,
@@ -348,8 +367,12 @@ class SchedulerOutputProcessorMixin:
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
                 req.output_token_logprobs_idx.append(next_token_id)
                 if req.top_logprobs_num > 0:
-                    req.output_top_logprobs_val.append(logits_output.next_token_top_logprobs_val[i])
-                    req.output_top_logprobs_idx.append(logits_output.next_token_top_logprobs_idx[i])
+                    req.output_top_logprobs_val.append(
+                        logits_output.next_token_top_logprobs_val[i]
+                    )
+                    req.output_top_logprobs_idx.append(
+                        logits_output.next_token_top_logprobs_idx[i]
+                    )
                 if req.token_ids_logprob is not None:
                     req.output_token_ids_logprobs_val.append(
                         logits_output.next_token_token_ids_logprobs_val[i]
@@ -438,7 +461,9 @@ class SchedulerOutputProcessorMixin:
             return
 
         input_token_logprobs: tuple[int] = output.input_token_logprobs
-        input_token_logprobs = input_token_logprobs[logprob_pt : logprob_pt + num_input_logprobs]
+        input_token_logprobs = input_token_logprobs[
+            logprob_pt : logprob_pt + num_input_logprobs
+        ]
         req.input_token_logprobs.extend(input_token_logprobs)
 
         if req.top_logprobs_num > 0:
@@ -446,8 +471,12 @@ class SchedulerOutputProcessorMixin:
             req.temp_input_top_logprobs_idx.append(output.input_top_logprobs_idx[i])
 
         if req.token_ids_logprob is not None:
-            req.temp_input_token_ids_logprobs_val.append(output.input_token_ids_logprobs_val[i])
-            req.temp_input_token_ids_logprobs_idx.append(output.input_token_ids_logprobs_idx[i])
+            req.temp_input_token_ids_logprobs_val.append(
+                output.input_token_ids_logprobs_val[i]
+            )
+            req.temp_input_token_ids_logprobs_idx.append(
+                output.input_token_ids_logprobs_idx[i]
+            )
 
         if last_prefill_chunk:
             input_token_logprobs = req.input_token_logprobs
@@ -459,7 +488,10 @@ class SchedulerOutputProcessorMixin:
 
             relevant_tokens = req.origin_input_ids[req.logprob_start_len :]
             delimiter_mask = (
-                [token_id == req.multi_item_scoring_delimiter for token_id in relevant_tokens]
+                [
+                    token_id == req.multi_item_scoring_delimiter
+                    for token_id in relevant_tokens
+                ]
                 if is_multi_item_scoring
                 else None
             )
@@ -481,7 +513,9 @@ class SchedulerOutputProcessorMixin:
                 ]
                 input_token_logprobs_idx = [
                     token_id
-                    for token_id, keep in zip(relevant_tokens, delimiter_mask, strict=True)
+                    for token_id, keep in zip(
+                        relevant_tokens, delimiter_mask, strict=True
+                    )
                     if keep
                 ]
             else:
@@ -491,7 +525,8 @@ class SchedulerOutputProcessorMixin:
             # Clip the padded hash values from image tokens.
             # Otherwise, it will lead to detokenization errors.
             req.input_token_logprobs_idx = [
-                x if x < self.model_config.vocab_size - 1 else 0 for x in input_token_logprobs_idx
+                x if x < self.model_config.vocab_size - 1 else 0
+                for x in input_token_logprobs_idx
             ]
 
             if req.top_logprobs_num > 0:
@@ -550,14 +585,18 @@ class SchedulerOutputProcessorMixin:
                     req.input_token_ids_logprobs_val = [
                         val
                         for val, keep in zip(
-                            req.input_token_ids_logprobs_val, delimiter_mask, strict=True
+                            req.input_token_ids_logprobs_val,
+                            delimiter_mask,
+                            strict=True,
                         )
                         if keep
                     ]
                     req.input_token_ids_logprobs_idx = [
                         idx
                         for idx, keep in zip(
-                            req.input_token_ids_logprobs_idx, delimiter_mask, strict=True
+                            req.input_token_ids_logprobs_idx,
+                            delimiter_mask,
+                            strict=True,
                         )
                         if keep
                     ]
@@ -568,7 +607,9 @@ class SchedulerOutputProcessorMixin:
                 if is_multi_item_scoring:
                     relevant_tokens_len = sum(delimiter_mask)
                 else:
-                    relevant_tokens_len = len(req.origin_input_ids) - req.logprob_start_len
+                    relevant_tokens_len = (
+                        len(req.origin_input_ids) - req.logprob_start_len
+                    )
                 assert len(req.input_token_logprobs_val) == relevant_tokens_len
                 assert len(req.input_token_logprobs_idx) == relevant_tokens_len
                 if req.top_logprobs_num > 0:
@@ -600,8 +641,12 @@ class SchedulerOutputProcessorMixin:
             req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i])
 
         if req.token_ids_logprob is not None:
-            req.output_token_ids_logprobs_val.append(output.next_token_token_ids_logprobs_val[i])
-            req.output_token_ids_logprobs_idx.append(output.next_token_token_ids_logprobs_idx[i])
+            req.output_token_ids_logprobs_val.append(
+                output.next_token_token_ids_logprobs_val[i]
+            )
+            req.output_token_ids_logprobs_idx.append(
+                output.next_token_token_ids_logprobs_idx[i]
+            )
 
         return num_input_logprobs
 
@@ -663,19 +708,23 @@ class SchedulerOutputProcessorMixin:
         elif return_output_logprob_only:
             output_token_logprobs_val = []
             output_token_logprobs_idx = []
-            input_token_logprobs_val = input_token_logprobs_idx = input_top_logprobs_val = (
-                input_top_logprobs_idx
-            ) = output_top_logprobs_val = output_top_logprobs_idx = input_token_ids_logprobs_val = (
-                input_token_ids_logprobs_idx
-            ) = output_token_ids_logprobs_val = output_token_ids_logprobs_idx = None
-        else:
-            input_token_logprobs_val = input_token_logprobs_idx = output_token_logprobs_val = (
-                output_token_logprobs_idx
-            ) = input_top_logprobs_val = input_top_logprobs_idx = output_top_logprobs_val = (
+            input_token_logprobs_val = input_token_logprobs_idx = (
+                input_top_logprobs_val
+            ) = input_top_logprobs_idx = output_top_logprobs_val = (
                 output_top_logprobs_idx
             ) = input_token_ids_logprobs_val = input_token_ids_logprobs_idx = (
                 output_token_ids_logprobs_val
             ) = output_token_ids_logprobs_idx = None
+        else:
+            input_token_logprobs_val = input_token_logprobs_idx = (
+                output_token_logprobs_val
+            ) = output_token_logprobs_idx = input_top_logprobs_val = (
+                input_top_logprobs_idx
+            ) = output_top_logprobs_val = output_top_logprobs_idx = (
+                input_token_ids_logprobs_val
+            ) = input_token_ids_logprobs_idx = output_token_ids_logprobs_val = (
+                output_token_ids_logprobs_idx
+            ) = None
 
         for req in reqs:
             if req is skip_req:
@@ -690,18 +739,24 @@ class SchedulerOutputProcessorMixin:
                 should_output = True
             else:
                 if req.stream:
-                    stream_interval = req.sampling_params.stream_interval or self.stream_interval
+                    stream_interval = (
+                        req.sampling_params.stream_interval or self.stream_interval
+                    )
                     should_output = (
                         len(req.output_ids) % stream_interval == 1
                         if stream_interval > 1
                         else len(req.output_ids) % stream_interval == 0
                     )
                 else:
-                    should_output = len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
+                    should_output = (
+                        len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
+                    )
 
             if should_output:
                 send_token_offset = req.send_token_offset
-                send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
+                send_output_token_logprobs_offset = (
+                    req.send_output_token_logprobs_offset
+                )
                 if isinstance(req.rid, list):
                     # if rid is a list, extend the list to rids
                     rids.extend(req.rid)
@@ -729,16 +784,23 @@ class SchedulerOutputProcessorMixin:
                 completion_tokens.append(len(req.output_ids))
                 cached_tokens.append(req.cached_tokens)
 
-                if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+                if (
+                    self.spec_algorithm is not None
+                    and not self.spec_algorithm.is_none()
+                ):
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
 
                 if req.return_output_logprob_only:
                     output_token_logprobs_val.append(
-                        req.output_token_logprobs_val[send_output_token_logprobs_offset:]
+                        req.output_token_logprobs_val[
+                            send_output_token_logprobs_offset:
+                        ]
                     )
                     output_token_logprobs_idx.append(
-                        req.output_token_logprobs_idx[send_output_token_logprobs_offset:]
+                        req.output_token_logprobs_idx[
+                            send_output_token_logprobs_offset:
+                        ]
                     )
                 if return_logprob:
                     if req.return_logprob and not req.input_logprob_sent:
@@ -746,8 +808,12 @@ class SchedulerOutputProcessorMixin:
                         input_token_logprobs_idx.append(req.input_token_logprobs_idx)
                         input_top_logprobs_val.append(req.input_top_logprobs_val)
                         input_top_logprobs_idx.append(req.input_top_logprobs_idx)
-                        input_token_ids_logprobs_val.append(req.input_token_ids_logprobs_val)
-                        input_token_ids_logprobs_idx.append(req.input_token_ids_logprobs_idx)
+                        input_token_ids_logprobs_val.append(
+                            req.input_token_ids_logprobs_val
+                        )
+                        input_token_ids_logprobs_idx.append(
+                            req.input_token_ids_logprobs_idx
+                        )
                         req.input_logprob_sent = True
                     else:
                         input_token_logprobs_val.append([])
@@ -759,24 +825,38 @@ class SchedulerOutputProcessorMixin:
 
                     if req.return_logprob:
                         output_token_logprobs_val.append(
-                            req.output_token_logprobs_val[send_output_token_logprobs_offset:]
+                            req.output_token_logprobs_val[
+                                send_output_token_logprobs_offset:
+                            ]
                         )
                         output_token_logprobs_idx.append(
-                            req.output_token_logprobs_idx[send_output_token_logprobs_offset:]
+                            req.output_token_logprobs_idx[
+                                send_output_token_logprobs_offset:
+                            ]
                         )
                         output_top_logprobs_val.append(
-                            req.output_top_logprobs_val[send_output_token_logprobs_offset:]
+                            req.output_top_logprobs_val[
+                                send_output_token_logprobs_offset:
+                            ]
                         )
                         output_top_logprobs_idx.append(
-                            req.output_top_logprobs_idx[send_output_token_logprobs_offset:]
+                            req.output_top_logprobs_idx[
+                                send_output_token_logprobs_offset:
+                            ]
                         )
                         output_token_ids_logprobs_val.append(
-                            req.output_token_ids_logprobs_val[send_output_token_logprobs_offset:]
+                            req.output_token_ids_logprobs_val[
+                                send_output_token_logprobs_offset:
+                            ]
                         )
                         output_token_ids_logprobs_idx.append(
-                            req.output_token_ids_logprobs_idx[send_output_token_logprobs_offset:]
+                            req.output_token_ids_logprobs_idx[
+                                send_output_token_logprobs_offset:
+                            ]
                         )
-                        req.send_output_token_logprobs_offset = len(req.output_token_logprobs_val)
+                        req.send_output_token_logprobs_offset = len(
+                            req.output_token_logprobs_val
+                        )
                     else:
                         output_token_logprobs_val.append([])
                         output_token_logprobs_idx.append([])

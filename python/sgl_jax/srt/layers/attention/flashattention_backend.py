@@ -14,7 +14,10 @@ from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
 )
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import RadixAttention
-from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
+from sgl_jax.srt.managers.schedule_batch import (
+    ModelWorkerBatch,
+    global_server_args_dict,
+)
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
@@ -107,7 +110,9 @@ class FlashAttention(AttentionBackend):
         return mask
 
     @staticmethod
-    def _build_multi_item_attention_mask(tokens: np.ndarray, delimiter_token_id: int) -> np.ndarray:
+    def _build_multi_item_attention_mask(
+        tokens: np.ndarray, delimiter_token_id: int
+    ) -> np.ndarray:
         """Build shared-prefix + block-diagonal mask for a single multi-item sequence.
 
         Layout: query<d1>item1<d2>item2<d3>...itemN<d{N+1}>
@@ -126,9 +131,13 @@ class FlashAttention(AttentionBackend):
 
         query_len = int(delimiter_indices[0])
         if query_len <= 0:
-            raise ValueError("Multi-item scoring requires a non-empty query prefix before delimiter.")
+            raise ValueError(
+                "Multi-item scoring requires a non-empty query prefix before delimiter."
+            )
         if delimiter_indices.size < 2:
-            raise ValueError("Multi-item scoring sequence must contain at least two delimiters.")
+            raise ValueError(
+                "Multi-item scoring sequence must contain at least two delimiters."
+            )
 
         # Shared prefix includes query plus the first delimiter.
         prefix_end = query_len + 1
@@ -147,7 +156,9 @@ class FlashAttention(AttentionBackend):
             seg_start = int(delimiter_indices[i]) + 1
             seg_end_delim = int(delimiter_indices[i + 1])
             if seg_start > seg_end_delim:
-                raise ValueError("Invalid multi-item delimiter layout: empty item block boundary.")
+                raise ValueError(
+                    "Invalid multi-item delimiter layout: empty item block boundary."
+                )
 
             for q_pos in range(seg_start, seg_end_delim + 1):
                 mask[q_pos, :prefix_end] = 1
@@ -205,7 +216,9 @@ class FlashAttention(AttentionBackend):
             distribution = np.array([0, 0, num_seqs.item()], dtype=np.int32)
         elif batch.forward_mode == ForwardMode.EXTEND:
             # All sequences are prefill mode
-            distribution = np.array([0, num_seqs.item(), num_seqs.item()], dtype=np.int32)
+            distribution = np.array(
+                [0, num_seqs.item(), num_seqs.item()], dtype=np.int32
+            )
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
@@ -218,7 +231,9 @@ class FlashAttention(AttentionBackend):
             metadata.distribution,
         ) = device_array(
             (num_seqs, cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
-            sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
+            sharding=(
+                NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None
+            ),
         )
 
         # Multi-item scoring uses a custom attention mask to isolate item blocks.
@@ -230,7 +245,9 @@ class FlashAttention(AttentionBackend):
             and batch.multi_item_scoring_flags is not None
             and np.any(batch.multi_item_scoring_flags[: batch.real_bs])
         ):
-            max_multi_item_seq_len = int(global_server_args_dict.get("max_multi_item_seq_len", 8192))
+            max_multi_item_seq_len = int(
+                global_server_args_dict.get("max_multi_item_seq_len", 8192)
+            )
             padded_token_len = int(batch.input_ids.shape[0])
             if padded_token_len > max_multi_item_seq_len:
                 raise ValueError(
@@ -248,7 +265,9 @@ class FlashAttention(AttentionBackend):
                 if q_len <= 0 or kv_len <= 0:
                     continue
 
-                req_tokens = np.asarray(batch.input_ids[token_pt : token_pt + q_len], dtype=np.int32)
+                req_tokens = np.asarray(
+                    batch.input_ids[token_pt : token_pt + q_len], dtype=np.int32
+                )
                 token_pt += q_len
 
                 if batch.multi_item_scoring_flags[req_idx]:
@@ -263,7 +282,9 @@ class FlashAttention(AttentionBackend):
                         batch.multi_item_scoring_delimiter,
                     )
                 else:
-                    req_mask = self._build_causal_extend_mask(q_len=q_len, kv_len=kv_len)
+                    req_mask = self._build_causal_extend_mask(
+                        q_len=q_len, kv_len=kv_len
+                    )
 
                 req_mask_flat = req_mask.reshape(-1)
                 next_pt = mask_write_pt + req_mask_flat.size
@@ -282,7 +303,9 @@ class FlashAttention(AttentionBackend):
                 )
             metadata.custom_mask = device_array(
                 concatenated_mask,
-                sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
+                sharding=(
+                    NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None
+                ),
             )
         else:
             metadata.custom_mask = None
@@ -313,7 +336,9 @@ class FlashAttention(AttentionBackend):
         if batch.forward_mode.is_target_verify():
             padded_batch_size = len(batch.seq_lens)
             real_batch_size = batch.real_bs
-            q_lens = np.array([batch.spec_info.draft_token_num] * real_batch_size, dtype=np.int32)
+            q_lens = np.array(
+                [batch.spec_info.draft_token_num] * real_batch_size, dtype=np.int32
+            )
             extend_seq_lens = np.pad(q_lens, (0, padded_batch_size - real_batch_size))
         else:
             extend_seq_lens = batch.extend_seq_lens
@@ -328,7 +353,9 @@ class FlashAttention(AttentionBackend):
 
         if batch.forward_mode.is_target_verify():
             seq_lens += extend_seq_lens
-            aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
+            aligned_seq_lens = (
+                (seq_lens + self.page_size - 1) // self.page_size
+            ) * self.page_size
         else:
             aligned_seq_lens = (
                 (batch.seq_lens + self.page_size - 1) // self.page_size
@@ -399,7 +426,9 @@ class FlashAttention(AttentionBackend):
             metadata.distribution,
         ) = device_array(
             (num_seqs, cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
-            sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
+            sharding=(
+                NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None
+            ),
         )
         return metadata
 
@@ -434,7 +463,9 @@ class FlashAttention(AttentionBackend):
             seq_lens = batch.seq_lens + (speculative_step_id)
             seq_lens[batch.real_bs :] = 0
             seq_lens_list.append(seq_lens)
-            aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
+            aligned_seq_lens = (
+                (seq_lens + self.page_size - 1) // self.page_size
+            ) * self.page_size
             cu_kv_lens.append(
                 np.concatenate(
                     [
@@ -511,7 +542,9 @@ class FlashAttention(AttentionBackend):
                     seq_lens_list[i],
                     distribution,
                 ),
-                sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
+                sharding=(
+                    NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None
+                ),
             )
             metadata.append(metadata_tmp)
         return metadata
@@ -566,7 +599,9 @@ class FlashAttention(AttentionBackend):
                 forward_batch, token_to_kv_pool, layer.layer_id
             )
         else:
-            kv_cache_fused = jnp.zeros((0, self.num_kv_heads * 2, self.head_dim), dtype=q.dtype)
+            kv_cache_fused = jnp.zeros(
+                (0, self.num_kv_heads * 2, self.head_dim), dtype=q.dtype
+            )
         scale = (
             1.0 / jnp.sqrt(layer.head_dim)
             if (layer is None or layer.scaling is None)
@@ -584,13 +619,17 @@ class FlashAttention(AttentionBackend):
         # Select page indices and remap to SWA pool if KV cache supports it
         page_indices_arg = self.forward_metadata.page_indices
         if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
-            page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
+            page_indices_arg = token_to_kv_pool.remap_cache_loc(
+                page_indices_arg, layer.layer_id
+            )
 
         in_specs = (
             P(None, self.kv_partition_axis),  # queries
             P(None, self.kv_partition_axis),  # keys (new tokens)
             P(None, self.kv_partition_axis),  # values (new tokens)
-            P(None, None, self.kv_partition_axis, None),  # kv_cache_fused (head interleaved)
+            P(
+                None, None, self.kv_partition_axis, None
+            ),  # kv_cache_fused (head interleaved)
             P(),  # kv_lens
             P(),  # page_indices
             P(),  # cu_q_lens

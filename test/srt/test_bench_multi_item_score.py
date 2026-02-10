@@ -19,19 +19,17 @@ import numpy as np
 from transformers import AutoTokenizer
 
 from sgl_jax.srt.entrypoints.engine import Engine
-from sgl_jax.test.test_utils import (
-    CustomTestCase,
-    is_in_ci,
-    write_github_step_summary,
-)
+from sgl_jax.test.test_utils import CustomTestCase, is_in_ci, write_github_step_summary
 
 # =============================================================================
 # Benchmark Configuration
 # =============================================================================
 
+
 @dataclass
 class BenchmarkResult:
     """Results from a score benchmark run."""
+
     name: str
     total_time_sec: float
     latency_per_item_ms: float
@@ -40,9 +38,11 @@ class BenchmarkResult:
     prompt_len: int
     candidate_len: int
 
+
 # =============================================================================
 # Test Class
 # =============================================================================
+
 
 class TestMultiItemScorePerformance(CustomTestCase):
     """
@@ -53,16 +53,16 @@ class TestMultiItemScorePerformance(CustomTestCase):
     engine = None
     tokenizer = None
     label_token_ids = [198]  # newline token or similar common token
-    
+
     # Target scenario
     PROMPT_LEN = 2000
     NUM_CANDIDATES = 500
     CANDIDATE_LEN = 20
-    
+
     # Multi-item specific
     STATIC_PREFIX_LEN = 100
-    DYNAMIC_SUFFIX_LEN = 1900 # 100 + 1900 = 2000
-    DELIMITER_TOKEN_ID = 128001 # Specific delimiter for multi-item
+    DYNAMIC_SUFFIX_LEN = 1900  # 100 + 1900 = 2000
+    DELIMITER_TOKEN_ID = 128001  # Specific delimiter for multi-item
 
     @classmethod
     def setUpClass(cls):
@@ -76,10 +76,10 @@ class TestMultiItemScorePerformance(CustomTestCase):
             device="tpu",
             random_seed=3,
             node_rank=0,
-            mem_fraction_static=0.7, # Leave room for compilation
-            max_prefill_tokens=32768, # Support large packed sequences
+            mem_fraction_static=0.7,  # Leave room for compilation
+            max_prefill_tokens=32768,  # Support large packed sequences
             chunked_prefill_size=4096,
-            download_dir="/data/huggingface_models", # Use GCS mount
+            download_dir="/data/huggingface_models",  # Use GCS mount
             dtype="bfloat16",
             precompile_bs_paddings=[1, 4, 8, 16, 32],
             max_running_requests=32,
@@ -92,7 +92,9 @@ class TestMultiItemScorePerformance(CustomTestCase):
             multi_item_scoring_delimiter=cls.DELIMITER_TOKEN_ID,
         )
 
-        cls.tokenizer = AutoTokenizer.from_pretrained(cls.model_name, trust_remote_code=True)
+        cls.tokenizer = AutoTokenizer.from_pretrained(
+            cls.model_name, trust_remote_code=True
+        )
         print("[Benchmark] Engine initialized")
 
     @classmethod
@@ -107,21 +109,25 @@ class TestMultiItemScorePerformance(CustomTestCase):
         Scenario: 500 candidates scored one-by-one (or in small batches).
         Each candidate has the same 2000 token prompt prefix.
         """
-        print(f"\n[Benchmark] Starting Single-Item Sequential (Items={self.NUM_CANDIDATES}, Prompt={self.PROMPT_LEN})")
-        
+        print(
+            f"\n[Benchmark] Starting Single-Item Sequential (Items={self.NUM_CANDIDATES}, Prompt={self.PROMPT_LEN})"
+        )
+
         # Generate dummy data (using token IDs to be precise)
         query_tokens = [1] * self.PROMPT_LEN
-        candidate_tokens_list = [[2] * self.CANDIDATE_LEN for _ in range(self.NUM_CANDIDATES)]
-        
+        candidate_tokens_list = [
+            [2] * self.CANDIDATE_LEN for _ in range(self.NUM_CANDIDATES)
+        ]
+
         # Warmup (1 request)
         self.engine.score(
             query=query_tokens,
             items=candidate_tokens_list[:1],
             label_token_ids=self.label_token_ids,
         )
-        
+
         start_time = time.perf_counter()
-        
+
         # We simulate the user sending them in batches of 32 (max recommended for single-item)
         BATCH_SIZE = 32
         for i in range(0, self.NUM_CANDIDATES, BATCH_SIZE):
@@ -131,9 +137,9 @@ class TestMultiItemScorePerformance(CustomTestCase):
                 items=chunk,
                 label_token_ids=self.label_token_ids,
             )
-            
+
         total_time = time.perf_counter() - start_time
-        
+
         result = BenchmarkResult(
             name="Single-Item Sequential",
             total_time_sec=total_time,
@@ -141,7 +147,7 @@ class TestMultiItemScorePerformance(CustomTestCase):
             throughput_items_sec=self.NUM_CANDIDATES / total_time,
             num_items=self.NUM_CANDIDATES,
             prompt_len=self.PROMPT_LEN,
-            candidate_len=self.CANDIDATE_LEN
+            candidate_len=self.CANDIDATE_LEN,
         )
         self._report_result(result)
 
@@ -150,33 +156,37 @@ class TestMultiItemScorePerformance(CustomTestCase):
         Scenario: 500 candidates scored in a single packed sequence.
         Uses 100 token static prefix + 1900 token dynamic suffix + 500 * 20 token items.
         """
-        print(f"\n[Benchmark] Starting Multi-Item Packed (Items={self.NUM_CANDIDATES}, Prompt={self.PROMPT_LEN})")
-        
+        print(
+            f"\n[Benchmark] Starting Multi-Item Packed (Items={self.NUM_CANDIDATES}, Prompt={self.PROMPT_LEN})"
+        )
+
         # Generate dummy data
         # Prefix = 100 (static) + 1900 (dynamic) = 2000
         query_tokens = [1] * (self.STATIC_PREFIX_LEN + self.DYNAMIC_SUFFIX_LEN)
-        candidate_tokens_list = [[2] * self.CANDIDATE_LEN for _ in range(self.NUM_CANDIDATES)]
-        
+        candidate_tokens_list = [
+            [2] * self.CANDIDATE_LEN for _ in range(self.NUM_CANDIDATES)
+        ]
+
         # Warmup
         # Note: In multi-item mode, the Engine.score implementation handles packing and chunking.
         self.engine.score(
             query=query_tokens,
-            items=candidate_tokens_list[:10], # Small warmup
+            items=candidate_tokens_list[:10],  # Small warmup
             label_token_ids=self.label_token_ids,
         )
-        
+
         start_time = time.perf_counter()
-        
-        # The Engine.score handles the 500 items. 
+
+        # The Engine.score handles the 500 items.
         # Internally it will chunk them based on max_multi_item_seq_len (default 32k)
         self.engine.score(
             query=query_tokens,
             items=candidate_tokens_list,
             label_token_ids=self.label_token_ids,
         )
-            
+
         total_time = time.perf_counter() - start_time
-        
+
         result = BenchmarkResult(
             name="Multi-Item Packed",
             total_time_sec=total_time,
@@ -184,7 +194,7 @@ class TestMultiItemScorePerformance(CustomTestCase):
             throughput_items_sec=self.NUM_CANDIDATES / total_time,
             num_items=self.NUM_CANDIDATES,
             prompt_len=self.PROMPT_LEN,
-            candidate_len=self.CANDIDATE_LEN
+            candidate_len=self.CANDIDATE_LEN,
         )
         self._report_result(result)
 
@@ -205,6 +215,7 @@ class TestMultiItemScorePerformance(CustomTestCase):
                 f"| Latency/Item | {result.latency_per_item_ms:.2f} ms |\n"
                 f"| Total Time | {result.total_time_sec:.2f} s |\n"
             )
+
 
 if __name__ == "__main__":
     unittest.main()
