@@ -75,6 +75,19 @@ jobs:
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite score-api-core-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
+      - name: Run Multi-Item Scoring Tests
+        timeout-minutes: 30
+        shell: bash
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DOWNLOAD_TIMEOUT: 300
+          SGLANG_TEST_MODEL: Qwen/Qwen3-0.6B
+        run: |
+          source .venv/bin/activate
+          bash scripts/killall_sglang.sh
+          python test/srt/run_suite.py --suite multi-item-scoring-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
+
   # =============================================== unit tests ==============================================
   unit-test-v6e-1:
     needs: [score-api-test-v6e-1] # Serial execution as requested

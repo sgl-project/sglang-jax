@@ -422,6 +422,12 @@ suites = {
     "score-api-client-test-tpu-v6e-1": [
         TestFile("test/srt/test_score_openai_client.py", 15),
     ],
+    "multi-item-scoring-test-tpu-v6e-1": [
+        TestFile("test/srt/test_multi_item_positions.py", 2),
+        TestFile("test/srt/test_multi_item_chunking.py", 3),
+        TestFile("test/srt/test_multi_item_scheduler_output.py", 2),
+        TestFile("test/srt/test_multi_item_regression.py", 4),
+    ],
     "minimal-smoke-test": [
         TestFile("python/sgl_jax/test/test_utils.py", 0.2),
     ],
