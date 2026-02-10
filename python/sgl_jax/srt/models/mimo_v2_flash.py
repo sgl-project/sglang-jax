@@ -22,6 +22,87 @@ logger = logging.getLogger(__name__)
 
 init_fn = nnx.initializers.uniform()
 
+# Custom MoE mapping function to handle quantization and correct path patterns
+def create_moe_weights_mapping_quantized(
+    prefix: str,
+    target_prefix: str,
+    num_experts: int,
+    expert_type_names: tuple[str, str, str] = (
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ),
+    moe_backend: str = "epmoe",
+    moe_path: str = "mlp",
+    source_expert_pattern: str = "experts.{i}",
+    is_quantized: bool = False,
+) -> dict:
+    """Generate a unified mapping dictionary for MoE layer expert weights with quantization support."""
+    if moe_backend == "epmoe":
+        expert_type_map = {
+            expert_type_names[0]: "wi_0",
+            expert_type_names[1]: "wi_1",
+            expert_type_names[2]: "wo",
+        }
+    elif moe_backend == "fused":
+        expert_type_map = {
+            expert_type_names[0]: "w1",
+            expert_type_names[1]: "w3",
+            expert_type_names[2]: "w2",
+        }
+    else:
+        raise ValueError(f"Unsupported MoE backend: {moe_backend}")
+
+    mappings = {}
+    for source_name, target_name in expert_type_map.items():
+        # Target path for JAX model parameters
+        target_path_base = f"{target_prefix}.{moe_path}.{target_name}"
+
+        # Source weight paths
+        expert_keys = [
+            f"{prefix}.{moe_path}.{source_expert_pattern.format(i=i)}.{source_name}.weight"
+            for i in range(num_experts)
+        ]
+
+        if moe_backend == "epmoe":
+            # wi_0/wi_1: P("expert", "tensor", None)
+            # wo: P("expert", None, "tensor")
+            sharding = (
+                ("expert", None, "tensor") if target_name == "wo" else ("expert", "tensor", None)
+            )
+            transpose = False
+        elif moe_backend == "fused":
+            sharding = (("data", "tensor"), None, None)
+            transpose = True
+        else:
+            raise ValueError(f"Unsupported MoE backend: {moe_backend}")
+
+        mappings[f"__MOE_EXPERTS__{target_path_base}"] = WeightMapping(
+            target_path=[target_path_base] + expert_keys,
+            sharding=sharding,
+            transpose=transpose,
+        )
+        
+        # Map Scales (if quantized)
+        if is_quantized:
+            target_scale_name = f"{target_name}_scale"
+            target_path_scale = f"{target_prefix}.{moe_path}.{target_scale_name}"
+            
+            expert_scale_keys = [
+                f"{prefix}.{moe_path}.{source_expert_pattern.format(i=i)}.{source_name}.weight_scale_inv"
+                for i in range(num_experts)
+            ]
+            
+            scale_sharding = ("expert", None, None, None)
+            
+            mappings[f"__MOE_EXPERTS__{target_path_scale}"] = WeightMapping(
+                target_path=[target_path_scale] + expert_scale_keys,
+                sharding=scale_sharding,
+                transpose=False,
+            )
+
+    return mappings
+
 class MiMoV2MLP(nnx.Module):
     """MiMo V2 MLP layer with gate, up, and down projections."""
 
@@ -236,7 +317,7 @@ class MiMoMoeAttention(nnx.Module):
             layer_id=layer_id,
             v_head_dim=self.v_head_dim,
             sliding_window_size=sliding_window_size, # -1 for no sliding window
-            quant_config=quant_config,
+            
         )
 
         self.attention_sink_bias = (
@@ -258,7 +339,7 @@ class MiMoMoeAttention(nnx.Module):
 
         q = q.reshape(-1, self.q_head_num, self.head_dim)
         k = k.reshape(-1, self.k_head_num, self.head_dim)
-        v = v.reshape(-1, self.v_head_num, self.v_head_dim)
+        v = v.reshape(-1, self.k_head_num, self.v_head_dim)
 
         q, k = self.rotary_emb(positions, q, k)
         attn_output, kv_fused = self.attn(
@@ -269,6 +350,11 @@ class MiMoMoeAttention(nnx.Module):
             token_to_kv_pool,
             attention_sink=self.attention_sink_bias,
         )
+
+        # Force Slice to 128 (v_head_dim)
+        attn_output = attn_output.reshape(-1, self.q_head_num, self.head_dim)
+        attn_output = attn_output[..., :128]
+        attn_output = attn_output.reshape(-1, self.q_head_num * 128)
 
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
@@ -312,7 +398,7 @@ class MiMoMoeDecoderLayer(nnx.Module):
                 dtype=dtype,
                 qkv_bias=getattr(config, "qkv_bias", True),
                 o_bias=getattr(config, "o_bias", False),
-                quant_config=quant_config,
+                
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
                 mesh=mesh,
             )
@@ -336,7 +422,7 @@ class MiMoMoeDecoderLayer(nnx.Module):
                 dtype=dtype,
                 qkv_bias=getattr(config, "qkv_bias", True),
                 o_bias=getattr(config, "o_bias", False),
-                quant_config=quant_config,
+                
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
                 mesh=mesh,
             )
@@ -346,7 +432,7 @@ class MiMoMoeDecoderLayer(nnx.Module):
         if self.is_layer_sparse:
             self.mlp = MiMoV2Moe(
                 config=config,
-                quant_config=quant_config,
+                
                 layer_id=layer_id,
                 mesh=mesh,
                 dtype=dtype,
@@ -386,12 +472,12 @@ class MiMoMoeDecoderLayer(nnx.Module):
 
         self.input_layernorm = RMSNorm(
             config.hidden_size,
-            epsilon=config.rms_norm_eps,
+            epsilon=config.layernorm_epsilon,
             param_dtype=dtype,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
-            epsilon=config.rms_norm_eps,
+            epsilon=config.layernorm_epsilon,
             param_dtype=dtype,
         )
 
@@ -494,7 +580,7 @@ class MiMoV2Model(nnx.Module):
 
         self.norm = RMSNorm(
             config.hidden_size,
-            epsilon=config.rms_norm_eps,
+            epsilon=config.layernorm_epsilon,
             param_dtype=dtype,
         )
 
@@ -591,75 +677,147 @@ class MiMoV2FlashForCausalLM(nnx.Module):
     def _create_moe_layer_mappings(self, layer_idx: int) -> dict:
         prefix = f"model.layers.{layer_idx}"
         target_prefix = f"model.layers.{layer_idx}"
+        
+        is_quantized = getattr(self.config, "quantization_config", None) is not None
 
-        mappings = {
-            f"{prefix}.input_layernorm.weight": WeightMapping(
-                target_path=f"{target_prefix}.input_layernorm.scale",
-                sharding=(None,),
+        mappings = {}
+        
+        # QKV Projections
+        # q_proj
+        if is_quantized:
+             mappings[f"{prefix}.self_attn.q_proj.weight"] = WeightMapping(
+                target_path=f"{target_prefix}.self_attn.q_proj.weight_q",
+                sharding=("tensor", None),
+                transpose=False, # Transpose removed for QuantizedLinear [out, in]
+                head_dim_padding=True,
+                kv_head_padding=False,
+            )
+             mappings[f"{prefix}.self_attn.q_proj.weight_scale_inv"] = WeightMapping(
+                target_path=f"{target_prefix}.self_attn.q_proj.weight_scale",
+                sharding=("tensor",),
                 transpose=False,
-            ),
-            f"{prefix}.post_attention_layernorm.weight": WeightMapping(
-                target_path=f"{target_prefix}.post_attention_layernorm.scale",
-                sharding=(None,),
-                transpose=False,
-            ),
-            f"{prefix}.self_attn.q_proj.weight": WeightMapping(
+            )
+        else:
+            mappings[f"{prefix}.self_attn.q_proj.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.self_attn.q_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=False,
-            ),
-            f"{prefix}.self_attn.k_proj.weight": WeightMapping(
+            )
+
+        # k_proj
+        if is_quantized:
+             mappings[f"{prefix}.self_attn.k_proj.weight"] = WeightMapping(
+                target_path=f"{target_prefix}.self_attn.k_proj.weight_q",
+                sharding=("tensor", None), # Split axis 0 (output)
+                transpose=False,
+                head_dim_padding=True,
+                kv_head_padding=True,
+            )
+             mappings[f"{prefix}.self_attn.k_proj.weight_scale_inv"] = WeightMapping(
+                target_path=f"{target_prefix}.self_attn.k_proj.weight_scale",
+                sharding=("tensor",),
+                transpose=False,
+                repeat=(0, 2), # Manual replication for TP=8, kv=4
+            )
+        else:
+            mappings[f"{prefix}.self_attn.k_proj.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.self_attn.k_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=True,
-            ),
-            f"{prefix}.self_attn.v_proj.weight": WeightMapping(
+            )
+
+        # v_proj
+        if is_quantized:
+             mappings[f"{prefix}.self_attn.v_proj.weight"] = WeightMapping(
+                target_path=f"{target_prefix}.self_attn.v_proj.weight_q",
+                sharding=("tensor", None), # Split axis 0
+                transpose=False,
+                head_dim_padding=False,
+                kv_head_padding=False,
+                # repeat removed
+            )
+             mappings[f"{prefix}.self_attn.v_proj.weight_scale_inv"] = WeightMapping(
+                target_path=f"{target_prefix}.self_attn.v_proj.weight_scale",
+                sharding=("tensor",),
+                transpose=False,
+                repeat=(0, 2), # Need 8 (divisible by 8)
+            )
+        else:
+            mappings[f"{prefix}.self_attn.v_proj.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.self_attn.v_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=True,
-            ),
-            f"{prefix}.self_attn.o_proj.weight": WeightMapping(
+            )
+
+        # o_proj (Row Parallel: Input is sharded)
+        if is_quantized:
+             mappings[f"{prefix}.self_attn.o_proj.weight"] = WeightMapping(
+                target_path=f"{target_prefix}.self_attn.o_proj.weight_q",
+                sharding=(None, "tensor"), # Split axis 1 (Input)
+                transpose=False,
+                head_dim_padding=True,
+                kv_head_padding=False,
+            )
+             mappings[f"{prefix}.self_attn.o_proj.weight_scale_inv"] = WeightMapping(
+                target_path=f"{target_prefix}.self_attn.o_proj.weight_scale",
+                sharding=(None,), 
+                transpose=False,
+            )
+        else:
+            mappings[f"{prefix}.self_attn.o_proj.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.self_attn.o_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=False,
-            ),
-        }
+            )
+            
+        # Layernorms (standard)
+        mappings[f"{prefix}.input_layernorm.weight"] = WeightMapping(
+            target_path=f"{target_prefix}.input_layernorm.scale",
+            sharding=(None,),
+            transpose=False,
+        )
+        mappings[f"{prefix}.post_attention_layernorm.weight"] = WeightMapping(
+            target_path=f"{target_prefix}.post_attention_layernorm.scale",
+            sharding=(None,),
+            transpose=False,
+        )
 
-        # Add bias mappings if attention_bias is True
+        # Add bias mappings if attention_bias is True (Usually not quantized)
         if getattr(self.config, "attention_bias", True):
             bias_mappings = {
                 f"{prefix}.self_attn.q_proj.bias": WeightMapping(
                     target_path=f"{target_prefix}.self_attn.q_proj.bias",
-                    sharding=(None,),
+                    sharding=("tensor",), # Shard by TP
                     transpose=False,
                     head_dim_padding=True,
                     kv_head_padding=False,
                 ),
                 f"{prefix}.self_attn.k_proj.bias": WeightMapping(
                     target_path=f"{target_prefix}.self_attn.k_proj.bias",
-                    sharding=(None,),
+                    sharding=("tensor",), # Shard by TP
                     transpose=False,
                     head_dim_padding=True,
                     kv_head_padding=True,
                 ),
                 f"{prefix}.self_attn.v_proj.bias": WeightMapping(
                     target_path=f"{target_prefix}.self_attn.v_proj.bias",
-                    sharding=(None,),
+                    sharding=("tensor",), # Shard by TP
                     transpose=False,
                     head_dim_padding=True,
-                    kv_head_padding=True,
+                    kv_head_padding=False, # Use manual repeat instead!
+                    # repeat removed
                 ),
                 f"{prefix}.self_attn.o_proj.bias": WeightMapping(
                     target_path=f"{target_prefix}.self_attn.o_proj.bias",
-                    sharding=(None,),
+                    sharding=(None,), # Output (hidden_size) is not sharded
                     transpose=False,
                 ),
             }
@@ -681,6 +839,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
         if is_sparse:
             # MoE mappings for expert layers
+            # MoE gate is usually not quantized in the same way or handled by specific MoE logic
             mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.mlp.moe_gate.kernel",
                 sharding=(None, None),
@@ -690,64 +849,131 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             num_experts = getattr(self.config, "num_experts", 8)
             moe_backend = getattr(self.config, "moe_backend", "epmoe")
 
-            moe_mappings = create_moe_weights_mapping(
+            moe_mappings = create_moe_weights_mapping_quantized(
                 prefix=prefix,
                 target_prefix=target_prefix,
                 num_experts=num_experts,
                 moe_backend=moe_backend,
                 moe_path="mlp.experts",
-                source_expert_pattern="experts.{i}",
+                source_expert_pattern="{i}", 
+                is_quantized=is_quantized,
             )
             mappings.update(moe_mappings)
         else:
             # Standard MLP mappings
-            mlp_mappings = {
-                f"{prefix}.mlp.gate_proj.weight": WeightMapping(
+            if is_quantized:
+                # gate_proj
+                mappings[f"{prefix}.mlp.gate_proj.weight"] = WeightMapping(
+                    target_path=f"{target_prefix}.mlp.gate_proj.weight_q",
+                    sharding=("tensor", None), # Split axis 0
+                    transpose=False,
+                )
+                mappings[f"{prefix}.mlp.gate_proj.weight_scale_inv"] = WeightMapping(
+                    target_path=f"{target_prefix}.mlp.gate_proj.weight_scale",
+                    sharding=("tensor",),
+                    transpose=False,
+                )
+                # up_proj
+                mappings[f"{prefix}.mlp.up_proj.weight"] = WeightMapping(
+                    target_path=f"{target_prefix}.mlp.up_proj.weight_q",
+                    sharding=("tensor", None), # Split axis 0
+                    transpose=False,
+                )
+                mappings[f"{prefix}.mlp.up_proj.weight_scale_inv"] = WeightMapping(
+                    target_path=f"{target_prefix}.mlp.up_proj.weight_scale",
+                    sharding=("tensor",),
+                    transpose=False,
+                )
+                # down_proj
+                mappings[f"{prefix}.mlp.down_proj.weight"] = WeightMapping(
+                    target_path=f"{target_prefix}.mlp.down_proj.weight_q",
+                    sharding=(None, "tensor"), # Split axis 1
+                    transpose=False,
+                )
+                mappings[f"{prefix}.mlp.down_proj.weight_scale_inv"] = WeightMapping(
+                    target_path=f"{target_prefix}.mlp.down_proj.weight_scale",
+                    sharding=(None,),
+                    transpose=False,
+                )
+            else:
+                mappings[f"{prefix}.mlp.gate_proj.weight"] = WeightMapping(
                     target_path=f"{target_prefix}.mlp.gate_proj.weight",
                     sharding=(None, "tensor"),
                     transpose=True,
-                ),
-                f"{prefix}.mlp.up_proj.weight": WeightMapping(
+                )
+                mappings[f"{prefix}.mlp.up_proj.weight"] = WeightMapping(
                     target_path=f"{target_prefix}.mlp.up_proj.weight",
                     sharding=(None, "tensor"),
                     transpose=True,
-                ),
-                f"{prefix}.mlp.down_proj.weight": WeightMapping(
+                )
+                mappings[f"{prefix}.mlp.down_proj.weight"] = WeightMapping(
                     target_path=f"{target_prefix}.mlp.down_proj.weight",
                     sharding=("tensor", None),
                     transpose=True,
-                ),
-            }
-            mappings.update(mlp_mappings)
+                )
 
         # Optional shared expert weight mapping (singular in source naming)
         if (
             getattr(self.config, "shared_expert_intermediate_size", 0)
             and getattr(self.config, "shared_expert_intermediate_size", 0) > 0
         ):
-            shared_expert_mappings = {
-                f"{prefix}.mlp.shared_expert.gate_proj.weight": WeightMapping(
+            if is_quantized:
+                 # gate_proj
+                mappings[f"{prefix}.mlp.shared_expert.gate_proj.weight"] = WeightMapping(
+                    target_path=f"{target_prefix}.shared_experts.gate_proj.weight_q",
+                    sharding=("tensor", None),
+                    transpose=False,
+                )
+                mappings[f"{prefix}.mlp.shared_expert.gate_proj.weight_scale_inv"] = WeightMapping(
+                    target_path=f"{target_prefix}.shared_experts.gate_proj.weight_scale",
+                    sharding=("tensor",),
+                    transpose=False,
+                )
+                # up_proj
+                mappings[f"{prefix}.mlp.shared_expert.up_proj.weight"] = WeightMapping(
+                    target_path=f"{target_prefix}.shared_experts.up_proj.weight_q",
+                    sharding=("tensor", None),
+                    transpose=False,
+                )
+                mappings[f"{prefix}.mlp.shared_expert.up_proj.weight_scale_inv"] = WeightMapping(
+                    target_path=f"{target_prefix}.shared_experts.up_proj.weight_scale",
+                    sharding=("tensor",),
+                    transpose=False,
+                )
+                # down_proj
+                mappings[f"{prefix}.mlp.shared_expert.down_proj.weight"] = WeightMapping(
+                    target_path=f"{target_prefix}.shared_experts.down_proj.weight_q",
+                    sharding=(None, "tensor"),
+                    transpose=False,
+                )
+                mappings[f"{prefix}.mlp.shared_expert.down_proj.weight_scale_inv"] = WeightMapping(
+                    target_path=f"{target_prefix}.shared_experts.down_proj.weight_scale",
+                    sharding=(None,),
+                    transpose=False,
+                )
+            else:
+                mappings[f"{prefix}.mlp.shared_expert.gate_proj.weight"] = WeightMapping(
                     target_path=f"{target_prefix}.shared_experts.gate_proj.weight",
                     sharding=(None, "tensor"),
                     transpose=True,
-                ),
-                f"{prefix}.mlp.shared_expert.up_proj.weight": WeightMapping(
+                )
+                mappings[f"{prefix}.mlp.shared_expert.up_proj.weight"] = WeightMapping(
                     target_path=f"{target_prefix}.shared_experts.up_proj.weight",
                     sharding=(None, "tensor"),
                     transpose=True,
-                ),
-                f"{prefix}.mlp.shared_expert.down_proj.weight": WeightMapping(
+                )
+                mappings[f"{prefix}.mlp.shared_expert.down_proj.weight"] = WeightMapping(
                     target_path=f"{target_prefix}.shared_experts.down_proj.weight",
                     sharding=("tensor", None),
                     transpose=True,
-                ),
-                f"{prefix}.mlp.shared_expert_gate.weight": WeightMapping(
-                    target_path=f"{target_prefix}.shared_expert_gate.weight",
-                    sharding=(None, None),
-                    transpose=True,
-                ),
-            }
-            mappings.update(shared_expert_mappings)
+                )
+            
+            mappings[f"{prefix}.mlp.shared_expert_gate.weight"] = WeightMapping(
+                target_path=f"{target_prefix}.shared_expert_gate.weight",
+                sharding=(None, None),
+                transpose=True,
+                # Explicitly ignore padding for gate as it's typically 1D or small
+            )
 
         return mappings
 
@@ -769,4 +995,4 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
 EntryClass = [MiMoV2FlashForCausalLM]
 # Optionally add an alias if the config uses a different name
-# EntryClass.append(MiMoV2ForCausalLM) 
+# EntryClass.append(MiMoV2ForCausalLM)

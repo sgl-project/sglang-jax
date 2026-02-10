@@ -453,8 +453,32 @@ class FlashAttention(AttentionBackend):
         # Prepare fused KV cache for paged format: [num_pages, page_size, num_kv_heads * 2, head_dim]
         total_tokens = kv_cache_fused.shape[0]
         num_pages = total_tokens // self.page_size
+        
+        # Calculate aligned dimension (e.g. 256 for 192)
+        aligned_dim = (self.head_dim + 127) // 128 * 128
+        
+        # Pad Inputs if needed to match aligned_dim
+        # Note: kv_cache_fused is usually already allocated with head_dim (192), so we pad it.
+        # q/k/v also need padding.
+        
+        pad_width_cache = aligned_dim - kv_cache_fused.shape[-1]
+        if pad_width_cache > 0:
+            kv_cache_fused = jnp.pad(kv_cache_fused, ((0,0), (0,0), (0, pad_width_cache)))
+            
+        pad_width_q = aligned_dim - q.shape[-1]
+        if pad_width_q > 0:
+            q = jnp.pad(q, ((0,0), (0,0), (0, pad_width_q)))
+            
+        pad_width_k = aligned_dim - k.shape[-1]
+        if pad_width_k > 0:
+            k = jnp.pad(k, ((0,0), (0,0), (0, pad_width_k)))
+            
+        pad_width_v = aligned_dim - v.shape[-1]
+        if pad_width_v > 0:
+            v = jnp.pad(v, ((0,0), (0,0), (0, pad_width_v)))
+
         kv_cache_fused_paged = kv_cache_fused.reshape(
-            num_pages, self.page_size, -1, (self.head_dim + 127) // 128 * 128
+            num_pages, self.page_size, -1, aligned_dim
         )
         if self.forward_metadata.custom_mask is not None:
             causal = 0
@@ -474,7 +498,7 @@ class FlashAttention(AttentionBackend):
             P(),  # cu_kv_lens
             P(),  # distribution
             P(),  # custom_mask
-            P(None),  # attention_sink
+            P(self.kv_partition_axis),  # attention_sink
         )
         out_specs = (
             P(None, self.kv_partition_axis),  # attention output
@@ -530,9 +554,9 @@ class FlashAttention(AttentionBackend):
             out_specs=out_specs,
             check_vma=False,
         )(
-            q.reshape(q.shape[0], -1, self.head_dim),
-            k.reshape(k.shape[0], -1, self.head_dim),
-            v.reshape(v.shape[0], -1, self.head_dim),
+            q.reshape(q.shape[0], -1, aligned_dim),
+            k.reshape(k.shape[0], -1, aligned_dim),
+            v.reshape(v.shape[0], -1, aligned_dim),
             kv_cache_fused_paged,
             self.forward_metadata.seq_lens,
             page_indices_arg,
@@ -542,13 +566,14 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.custom_mask,
             attention_sink,
         )
-        pad_width = (self.head_dim + 127) // 128 * 128 - self.head_dim
-        if pad_width > 0:
-            updated_kv_cache_fused = jnp.pad(
-                updated_kv_cache_fused,
-                ((0, 0), (0, 0), (0, pad_width)),
-                mode="constant",
-            )
+        
+        # Slice output back to original head_dim if it was padded
+        if pad_width_q > 0:
+             attn_output = attn_output[..., :self.head_dim]
+        
+        if pad_width_cache > 0:
+             # Slice KV cache back to storage size (192)
+             updated_kv_cache_fused = updated_kv_cache_fused[..., :self.head_dim]
 
         return (
             attn_output.reshape(q.shape[0], -1),

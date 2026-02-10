@@ -422,6 +422,7 @@ class ModelConfig:
         """Returns the number of replicas for each original KV head."""
         total_num_kv_heads = self.get_total_num_kv_heads()
         if tensor_parallel_size > total_num_kv_heads:
+            logger.info(f"DEBUG: get_num_kv_head_replicas total={total_num_kv_heads} tp={tensor_parallel_size}")
             return (tensor_parallel_size + total_num_kv_heads - 1) // total_num_kv_heads
         else:
             return 1
