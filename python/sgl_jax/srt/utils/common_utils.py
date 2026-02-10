@@ -149,12 +149,14 @@ def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
         )
     return model_path, tokenizer_path
 
+
 _logger_lock = threading.Lock()
 _logger_initialized = False
 
+
 def configure_logger(server_args, prefix: str = ""):
     global _logger_initialized
-    
+
     # Quick check (Double-checked locking pattern)
     if _logger_initialized:
         return
@@ -181,6 +183,7 @@ def configure_logger(server_args, prefix: str = ""):
         root_logger.addHandler(h)
         root_logger.setLevel(server_args.log_level.upper())
         _logger_initialized = True
+
 
 def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool):
     mem = psutil.virtual_memory()
