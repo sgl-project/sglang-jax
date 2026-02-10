@@ -207,7 +207,13 @@ class GlobalScheduler:
     def handle_profile(self, recv_req: ProfileReq):
         """Route ProfileReq to the target stage's scheduler via its in_queue."""
         stage_id = recv_req.stage_id
-        if stage_id is None or stage_id < 0 or stage_id >= len(self.stage_list):
+        if stage_id is None:
+            # Default to the final output stage (typically the LLM stage).
+            stage_id = next(
+                (i for i, cfg in enumerate(self.stage_configs) if cfg.final_output),
+                len(self.stage_list) - 1,
+            )
+        if stage_id < 0 or stage_id >= len(self.stage_list):
             result = ProfileReqOutput(
                 success=False,
                 message=f"Invalid stage_id={stage_id}, must be 0..{len(self.stage_list) - 1}",
