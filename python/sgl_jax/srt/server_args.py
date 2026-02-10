@@ -165,11 +165,14 @@ class ServerArgs:
     multi_item_scoring_delimiter: int | None = None
     # Maximum allowed total sequence length for multi-item scoring requests.
     # This bounds O(seq^2) custom-mask memory usage in attention.
-    max_multi_item_seq_len: int = 8192
+    max_multi_item_seq_len: int = 32768
     # Maximum number of items processed in a single multi-item scoring forward pass.
     # Requests with more items are split into multiple multi-item chunks.
     # Set to 0 to disable chunking and process all items in one pass.
     multi_item_scoring_chunk_size: int = 2
+    # Maximum number of items allowed in a single multi-item scoring request.
+    # Requests exceeding this limit will be rejected.
+    max_multi_item_count: int = 512
 
     # LoRA
     enable_lora: bool | None = None
@@ -957,6 +960,12 @@ class ServerArgs:
             default=ServerArgs.multi_item_scoring_chunk_size,
             help="Maximum number of items per multi-item scoring chunk. Set 0 to disable chunking.",
         )
+        parser.add_argument(
+            "--max-multi-item-count",
+            type=int,
+            default=ServerArgs.max_multi_item_count,
+            help="Maximum number of items allowed in a single multi-item scoring request.",
+        )
 
         parser.add_argument(
             "--multimodal",
@@ -1126,6 +1135,7 @@ class ServerArgs:
             assert self.multi_item_scoring_chunk_size >= 0, (
                 "--multi-item-scoring-chunk-size must be non-negative"
             )
+            assert self.max_multi_item_count > 0, "--max-multi-item-count must be positive"
 
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""

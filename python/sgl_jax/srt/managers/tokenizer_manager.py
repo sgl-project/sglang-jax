@@ -1308,7 +1308,7 @@ class TokenizerManager:
                     query_tokens=query_tokens,
                     item_tokens=item_tokens,
                     delimiter_token_id=delimiter_token_id,
-                    max_items=128,
+                    max_items=self.server_args.max_multi_item_count,
                     max_total_seq_len=self.server_args.max_multi_item_seq_len,
                     enforce_total_seq_len=False,
                 )
@@ -1331,7 +1331,7 @@ class TokenizerManager:
                         query_tokens=query_tokens,
                         item_tokens=chunk_tokens,
                         delimiter_token_id=delimiter_token_id,
-                        max_items=128,
+                        max_items=self.server_args.max_multi_item_count,
                         max_total_seq_len=self.server_args.max_multi_item_seq_len,
                     )
                 except ValidationError as e:

@@ -310,8 +310,8 @@ def validate_multi_item_scoring_request(
     query_tokens: list[int],
     item_tokens: list[list[int]],
     delimiter_token_id: int,
-    max_items: int = 128,
-    max_total_seq_len: int = 8192,
+    max_items: int = 512,
+    max_total_seq_len: int = 32768,
     enforce_total_seq_len: bool = True,
 ) -> None:
     """Validate additional constraints required by multi-item scoring mode."""
