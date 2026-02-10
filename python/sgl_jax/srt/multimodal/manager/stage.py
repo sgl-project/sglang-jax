@@ -29,7 +29,7 @@ from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_backbone import (
     MiMoAudioForCausalLM,
 )
 from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_tokenizer import (
-    FlaxMiMoAudioTokenizer,
+    MiMoAudioTokenizer,
 )
 from sgl_jax.srt.multimodal.models.wan.diffusion.wan_dit import (
     WanDualTransformer3DModel,
@@ -240,7 +240,7 @@ def get_model_class(name: str):
     elif name == "Qwen2ForCausalLM":
         return Qwen2ForCausalLM
     elif name == "FlaxMiMoAudioTokenizer":
-        return FlaxMiMoAudioTokenizer
+        return MiMoAudioTokenizer
     elif name == "MiMoAudioForCausalLM":
         return MiMoAudioForCausalLM
     else:

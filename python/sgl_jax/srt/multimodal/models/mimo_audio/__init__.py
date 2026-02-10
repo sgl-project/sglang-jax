@@ -5,11 +5,11 @@ from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_backbone import (
     MiMoAudioTransformer,
 )
 from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_tokenizer import (
-    FlaxMiMoAudioTokenizer,
+    MiMoAudioTokenizer,
 )
 
 __all__ = [
-    "FlaxMiMoAudioTokenizer",
+    "MiMoAudioTokenizer",
     "MiMoAudioForCausalLM",
     "MiMoAudioTransformer",
 ]

@@ -759,7 +759,7 @@ class AudioDecoder(nnx.Module):
 
         return vocoder_out.wav
 
-class FlaxMiMoAudioTokenizer(nnx.Module):
+class MiMoAudioTokenizer(nnx.Module):
     """MiMo Audio Tokenizer combining encoder and decoder."""
 
     def __init__(
@@ -849,4 +849,4 @@ class FlaxMiMoAudioTokenizer(nnx.Module):
             config.rope_theta ** (jnp.arange(0, vocoder_half, dtype=jnp.float32) / vocoder_half)
         )
 
-EntryClass = FlaxMiMoAudioTokenizer
+EntryClass = MiMoAudioTokenizer
