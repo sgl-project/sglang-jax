@@ -113,10 +113,6 @@ class NativeAttention(AttentionBackend):
         """
         Get the kv cache from the forward batch.
         """
-        # Replace NaN with 0 to prevent cache pollution
-        k = jnp.where(jnp.isnan(k), 0.0, k)
-        v = jnp.where(jnp.isnan(v), 0.0, v)
-
         if is_tpu_runtime():
             if forward_batch.forward_mode.is_extend():
                 token_to_kv_pool.set_kv_buffer(
@@ -141,10 +137,6 @@ class NativeAttention(AttentionBackend):
             v = updated_layer.at[:, 1::2, :].get(out_sharding=kv_sharding)
             # Return fused buffer directly for persistence outside JIT
             fused_return = updated_layer
-
-        # PROTECTION: Replace NaN in cached K/V with 0 to prevent attention explosion
-        k = jnp.where(jnp.isnan(k), 0.0, k)
-        v = jnp.where(jnp.isnan(v), 0.0, v)
 
         return k, v, fused_return
 
