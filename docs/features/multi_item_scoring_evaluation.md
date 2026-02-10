@@ -1,24 +1,33 @@
 # Multi-Item Scoring Evaluation Plan
 
+Evaluation reports and machine-readable artifacts live in the dev-scripts repo:
+
+`sglang-jax-dev-scripts/evaluations/multi-item-scoring/`
+
 Latest run reports:
 
-- `docs/features/reports/multi_item_scoring_tpu_eval_20260207_v4.md`
-- `docs/features/reports/multi_item_scoring_tpu_model_matrix_20260207_v1.md`
+- `multi_item_scoring_tpu_eval_20260207_v4.md`
+- `multi_item_scoring_tpu_model_matrix_20260207_v1.md`
 
-Latest machine-readable artifacts:
+Latest machine-readable artifacts (per model):
 
-- `docs/features/reports/multi_item_eval_results_20260207_v4.json`
-- `docs/features/reports/serial_score_eval_results_20260207_v2.json`
-- `docs/features/reports/multi_vs_serial_eval_results_20260207_v4.json`
-- `docs/features/reports/jax_torch_parity_results_20260207_v4.json`
-- `docs/features/reports/multi_item_eval_results_20260207_qwen3_1_7b_v2.json`
-- `docs/features/reports/serial_score_eval_results_20260207_qwen3_1_7b_v2.json`
-- `docs/features/reports/multi_vs_serial_eval_results_20260207_qwen3_1_7b_v2.json`
-- `docs/features/reports/jax_torch_parity_results_20260207_qwen3_1_7b_v2.json`
-- `docs/features/reports/multi_item_eval_results_20260207_qwen3_4b_v1.json`
-- `docs/features/reports/serial_score_eval_results_20260207_qwen3_4b_v1.json`
-- `docs/features/reports/multi_vs_serial_eval_results_20260207_qwen3_4b_v1.json`
-- `docs/features/reports/jax_torch_parity_results_20260207_qwen3_4b_v1.json`
+**Qwen3-0.6B:**
+- `multi_item_eval_results_20260207_v4.json`
+- `serial_score_eval_results_20260207_v2.json`
+- `multi_vs_serial_eval_results_20260207_v4.json`
+- `jax_torch_parity_results_20260207_v4.json`
+
+**Qwen3-1.7B:**
+- `multi_item_eval_results_20260207_qwen3_1_7b_v2.json`
+- `serial_score_eval_results_20260207_qwen3_1_7b_v2.json`
+- `multi_vs_serial_eval_results_20260207_qwen3_1_7b_v2.json`
+- `jax_torch_parity_results_20260207_qwen3_1_7b_v2.json`
+
+**Qwen3-4B:**
+- `multi_item_eval_results_20260207_qwen3_4b_v1.json`
+- `serial_score_eval_results_20260207_qwen3_4b_v1.json`
+- `multi_vs_serial_eval_results_20260207_qwen3_4b_v1.json`
+- `jax_torch_parity_results_20260207_qwen3_4b_v1.json`
 
 ## Goals
 
