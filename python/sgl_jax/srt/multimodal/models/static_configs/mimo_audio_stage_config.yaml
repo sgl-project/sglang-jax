@@ -12,7 +12,7 @@ stage_args:
       device_kind: tpu
     scheduler: audio_encoder
     scheduler_params: {}
-    model_class: FlaxMiMoAudioTokenizer
+    model_class: MiMoAudioTokenizer
     model_path: XiaomiMiMo/MiMo-Audio-Tokenizer
     final_output: false  # 改为 true 用于单独测试 Stage 0
 
@@ -36,6 +36,6 @@ stage_args:
   #     device_kind: cpu
   #   scheduler: audio_decoder
   #   scheduler_params: {}
-  #   model_class: FlaxMiMoAudioTokenizer
+  #   model_class: MiMoAudioTokenizer
   #   model_path: XiaomiMiMo/MiMo-Audio-Tokenizer
   #   final_output: true

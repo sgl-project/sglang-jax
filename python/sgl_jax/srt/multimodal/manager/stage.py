@@ -239,7 +239,7 @@ def get_model_class(name: str):
         return Qwen2_5_VL_VisionModel
     elif name == "Qwen2ForCausalLM":
         return Qwen2ForCausalLM
-    elif name == "FlaxMiMoAudioTokenizer":
+    elif name == "MiMoAudioTokenizer":
         return MiMoAudioTokenizer
     elif name == "MiMoAudioForCausalLM":
         return MiMoAudioForCausalLM
