@@ -66,6 +66,9 @@ multimodal = [
     "torchvision",
 ]
 
+[tool.setuptools.package-data]
+sgl_jax = ["**/*.yaml"]
+
 [tool.setuptools.packages.find]
 exclude = [
     "assets*",
