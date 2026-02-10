@@ -8,6 +8,7 @@ from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 
+
 class EmbedModelRunner(BaseModelRunner):
     """Runner shell for Omni Embedding stage execution."""
 
