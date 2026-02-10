@@ -79,14 +79,11 @@ def detect_config_size(model_path: str) -> str:
 
 
 def create_model_config(model_path: str, dtype):
-    """Create configs for model initialization and weight loading.
+    """Create Qwen3VLConfig for model initialization.
 
     Returns:
         qwen3_config: Full Qwen3VLConfig (contains .vision_config and .text_config)
-        hf_config: HuggingFace AutoConfig for the generation model
     """
-    from transformers import AutoConfig
-
     from sgl_jax.srt.multimodal.configs.qwen_vl.qwen3_vl_config import Qwen3VLConfig
 
     size = detect_config_size(model_path)
@@ -98,12 +95,7 @@ def create_model_config(model_path: str, dtype):
         "8b": Qwen3VLConfig.qwen3vl_8b,
         "32b": Qwen3VLConfig.qwen3vl_32b,
     }
-    qwen3_config = size_to_config[size]()
-
-    # Load HuggingFace config for text model
-    hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-
-    return qwen3_config, hf_config
+    return size_to_config[size]()
 
 
 def load_vision_model(model_path: str, qwen3_config, mesh, dtype):
@@ -132,8 +124,10 @@ def load_vision_model(model_path: str, qwen3_config, mesh, dtype):
     print("  Initializing vision model...")
     t0 = time.time()
 
-    # Create model with eval_shape (lazy init, no memory allocation)
-    with jax.default_device(jax.devices("cpu")[0]):
+    # Must use jax.set_mesh() (not `with mesh:`) — this is the pattern used by
+    # JAXModelLoader._get_model(). jax.set_mesh() propagates into eval_shape;
+    # plain `with mesh:` does not.
+    with jax.set_mesh(mesh):
         vision_model = nnx.eval_shape(
             lambda: Qwen3_VL_VisionModel(
                 config=vis_cfg,
@@ -143,55 +137,67 @@ def load_vision_model(model_path: str, qwen3_config, mesh, dtype):
             )
         )
 
-    # load_weights expects a config object with .model_path, .vocab_size,
-    # .text_hidden_size (used to create the text_embed layer)
-    class VisionWeightConfig:
-        def __init__(self, path, text_config, vision_config, dt):
-            self.model_path = path
-            self.dtype = dt
-            self.vocab_size = text_config.vocab_size
-            self.text_hidden_size = vision_config.out_hidden_size
-            self.quantization_config = None
+        # load_weights expects a config object with .model_path, .vocab_size,
+        # .text_hidden_size (used to create the text_embed layer)
+        class VisionWeightConfig:
+            def __init__(self, path, text_config, vision_config, dt):
+                self.model_path = path
+                self.dtype = dt
+                self.vocab_size = text_config.vocab_size
+                self.text_hidden_size = vision_config.out_hidden_size
+                self.quantization_config = None
 
-    vm_config = VisionWeightConfig(model_path, text_cfg, vis_cfg, dtype)
-
-    with mesh:
+        vm_config = VisionWeightConfig(model_path, text_cfg, vis_cfg, dtype)
         vision_model.load_weights(vm_config)
 
     print(f"  Vision model loaded in {time.time() - t0:.2f}s")
     return vision_model
 
 
-def load_generation_model(model_path: str, hf_config, mesh, dtype):
-    """Load the Qwen3-VL text decoder."""
+def load_generation_model(model_path: str, qwen3_config, mesh, dtype):
+    """Load the Qwen3-VL text decoder.
+
+    Args:
+        model_path: Path to model weights directory
+        qwen3_config: Full Qwen3VLConfig (contains .text_config)
+        mesh: JAX device mesh
+        dtype: Model dtype
+    """
     from sgl_jax.srt.multimodal.models.qwen3_VL.qwen3_vl_generation import (
         Qwen3_VL_Generation,
+    )
+
+    text_cfg = qwen3_config.text_config
+    print(
+        f"  Text config: layers={text_cfg.num_hidden_layers}, "
+        f"hidden={text_cfg.hidden_size}, vocab={text_cfg.vocab_size}"
     )
 
     print("  Initializing generation model...")
     t0 = time.time()
 
-    # Create model with eval_shape (lazy init)
-    with jax.default_device(jax.devices("cpu")[0]):
+    with jax.set_mesh(mesh):
         gen_model = nnx.eval_shape(
             lambda: Qwen3_VL_Generation(
-                config=hf_config,
+                config=qwen3_config,
                 dtype=dtype,
                 mesh=mesh,
             )
         )
 
-    # Create ModelConfig for weight loading
-    class GenModelConfig:
-        def __init__(self, path, config, dt):
-            self.model_path = path
-            self.hf_config = config
-            self.dtype = dt
-            self.quantization_config = None
+        # WeightLoader needs .model_path, .num_hidden_layers, .quantization_config, etc.
+        # Proxy missing attributes to the text config.
+        class GenModelConfig:
+            def __init__(self, path, text_config, dt):
+                self.model_path = path
+                self.dtype = dt
+                self.quantization_config = None
+                self._text_config = text_config
 
-    gm_config = GenModelConfig(model_path, hf_config, dtype)
+            def __getattr__(self, name):
+                return getattr(self._text_config, name)
 
-    with mesh:
+        gm_config = GenModelConfig(model_path, text_cfg, dtype)
         gen_model.load_weights(gm_config)
 
     print(f"  Generation model loaded in {time.time() - t0:.2f}s")
@@ -330,13 +336,16 @@ def main():
     print(f"Device count: {jax.device_count()}")
     print(f"Backend: {jax.default_backend()}")
 
-    # Create mesh — must use sglang-jax's create_device_mesh so axis names
-    # match what model layers expect (kernel_axes reference "tensor" axis).
-    from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+    # Create mesh with axis names matching sglang-jax convention ("data", "tensor").
+    # Use single device for standalone testing; multi-device is handled by Option A.
+    # axis_types must be Explicit (matching create_device_mesh in mesh_utils.py).
+    import numpy as np
 
-    mesh = create_device_mesh(
-        ici_parallelism=[-1, jax.device_count()],
-        dcn_parallelism=[1, 1],
+    single_device = np.array(jax.devices()[:1]).reshape(1, 1)
+    mesh = jax.sharding.Mesh(
+        single_device,
+        axis_names=("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
     )
     print(f"Mesh: {mesh}")
 
@@ -350,7 +359,7 @@ def main():
 
     # Load configs
     print("\n2. Loading configs...")
-    qwen3_config, hf_config = create_model_config(model_path, dtype)
+    qwen3_config = create_model_config(model_path, dtype)
 
     # Load processor
     print("\n3. Loading processor...")
@@ -364,7 +373,7 @@ def main():
     gen_model = None
     if not args.skip_generation:
         print("\n5. Loading generation model...")
-        gen_model = load_generation_model(model_path, hf_config, mesh, dtype)
+        gen_model = load_generation_model(model_path, qwen3_config, mesh, dtype)
 
     # =========================================================================
     # Test 1: Text Input Processing & Embedding

@@ -1,12 +1,12 @@
 """Qwen3-VL Generation Model for SGLang-JAX.
 
-This module implements the text decoder for Qwen3-VL with M-RoPE
-(Multimodal Rotary Position Embeddings) for handling multimodal sequences.
+Self-contained text decoder — no dependency on qwen2.py. Uses sglang-jax
+sharded layers (LinearBase, Embed, RMSNorm, RadixAttention) with Qwen3-VL
+specific features:
+  - Q/K normalization (RMSNorm on query/key before RoPE)
+  - M-RoPE (Multimodal Rotary Position Embeddings)
 
-Key features:
-- Interleaved M-RoPE: T/H/W position embeddings with interleaved layout
-- Q/K normalization: RMSNorm applied to query and key before RoPE
-- Extends Qwen2Model from sglang-jax base models
+Reference: qwen3-vl/q3vljax/qwen3_vl/modeling.py
 """
 
 import logging
@@ -17,15 +17,21 @@ import numpy as np
 from flax import nnx
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
-from sgl_jax.srt.layers.embeddings import ParallelLMHead, apply_rotary_emb
+from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, apply_rotary_emb
+from sgl_jax.srt.layers.layernorm import RMSNorm
+from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.models.qwen2 import Qwen2Model
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# M-RoPE utilities
+# =============================================================================
 
 
 def _apply_interleaved_rope(x: jax.Array, mrope_section: list[int]) -> jax.Array:
@@ -135,7 +141,6 @@ class MRotaryEmbedding:
                 cos = _apply_interleaved_rope(cos, self.mrope_section)
                 sin = _apply_interleaved_rope(sin, self.mrope_section)
             else:
-                # Concatenate sections
                 cos_slices = []
                 sin_slices = []
                 offset = 0
@@ -164,41 +169,273 @@ class MRotaryEmbedding:
         return query, key
 
 
-class Qwen3_VL_Model(Qwen2Model):
-    """Qwen3-VL text decoder with M-RoPE support.
+# =============================================================================
+# Config helper
+# =============================================================================
 
-    Extends Qwen2Model to handle multimodal position embeddings.
+
+def _get_mrope_section(config) -> list[int]:
+    """Extract mrope_section from either our config or HuggingFace config.
+
+    Our Qwen3VLTextConfig:  config.mrope_section = (24, 20, 20)
+    HuggingFace config:     config.rope_scaling = {'mrope_section': [24, 20, 20], ...}
     """
+    # Our config: direct attribute
+    if hasattr(config, "mrope_section") and config.mrope_section:
+        return list(config.mrope_section)
+    # HF config: nested in rope_scaling dict
+    rope_scaling = getattr(config, "rope_scaling", None) or {}
+    return rope_scaling.get("mrope_section", [24, 20, 20])
 
-    def __init__(
+
+# =============================================================================
+# Model components (self-contained, using sglang-jax sharded layers)
+# =============================================================================
+
+
+class Qwen3VL_MLP(nnx.Module):
+    """SiLU-gated MLP for Qwen3-VL text decoder."""
+
+    def __init__(self, config, mesh, layer_id: int = 0, dtype=jnp.bfloat16):
+        self.gate_proj = LinearBase(
+            input_size=config.hidden_size,
+            output_size=config.intermediate_size,
+            kernel_axes=(None, "tensor"),
+            use_bias=False,
+            params_dtype=dtype,
+            mesh=mesh,
+        )
+        self.up_proj = LinearBase(
+            input_size=config.hidden_size,
+            output_size=config.intermediate_size,
+            kernel_axes=(None, "tensor"),
+            use_bias=False,
+            params_dtype=dtype,
+            mesh=mesh,
+        )
+        self.down_proj = LinearBase(
+            input_size=config.intermediate_size,
+            output_size=config.hidden_size,
+            kernel_axes=("tensor", None),
+            use_bias=False,
+            params_dtype=dtype,
+            mesh=mesh,
+        )
+
+    def __call__(self, hidden_states: jax.Array) -> jax.Array:
+        gate, _ = self.gate_proj(hidden_states)
+        up, _ = self.up_proj(hidden_states)
+        output, _ = self.down_proj(jax.nn.silu(gate) * up)
+        return output
+
+
+class Qwen3VL_Attention(nnx.Module):
+    """Qwen3-VL text decoder attention with Q/K norms, GQA, and M-RoPE."""
+
+    def __init__(self, config, mesh, layer_id: int = 0, dtype=jnp.bfloat16):
+        self.layer_id = layer_id
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        self.q_head_num = config.num_attention_heads
+        self.kv_head_num = config.num_key_value_heads
+        self.q_size = self.q_head_num * self.head_dim
+        self.kv_size = self.kv_head_num * self.head_dim
+        self.scaling = self.head_dim**-0.5
+
+        use_bias = getattr(config, "attention_bias", False)
+
+        self.q_proj = LinearBase(
+            input_size=config.hidden_size,
+            output_size=self.q_size,
+            use_bias=use_bias,
+            kernel_axes=(None, "tensor"),
+            params_dtype=dtype,
+            mesh=mesh,
+        )
+        self.k_proj = LinearBase(
+            input_size=config.hidden_size,
+            output_size=self.kv_size,
+            use_bias=use_bias,
+            kernel_axes=(None, "tensor"),
+            params_dtype=dtype,
+            mesh=mesh,
+        )
+        self.v_proj = LinearBase(
+            input_size=config.hidden_size,
+            output_size=self.kv_size,
+            use_bias=use_bias,
+            kernel_axes=(None, "tensor"),
+            params_dtype=dtype,
+            mesh=mesh,
+        )
+        self.o_proj = LinearBase(
+            input_size=self.q_size,
+            output_size=config.hidden_size,
+            use_bias=False,
+            kernel_axes=("tensor", None),
+            params_dtype=dtype,
+            mesh=mesh,
+        )
+
+        # Qwen3-VL specific: Q/K normalization before RoPE
+        self.q_norm = RMSNorm(
+            self.head_dim,
+            epsilon=config.rms_norm_eps,
+            param_dtype=dtype,
+        )
+        self.k_norm = RMSNorm(
+            self.head_dim,
+            epsilon=config.rms_norm_eps,
+            param_dtype=dtype,
+        )
+
+        # M-RoPE
+        mrope_section = _get_mrope_section(config)
+        rope_theta = getattr(config, "rope_theta", 5_000_000)
+
+        self.rotary_emb = MRotaryEmbedding(
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position_embeddings=32768,
+            base=rope_theta,
+            is_neox_style=True,
+            dtype=dtype,
+            mrope_section=mrope_section,
+        )
+
+        self.attn = RadixAttention(
+            num_heads=self.q_head_num,
+            head_dim=self.head_dim,
+            scaling=self.scaling,
+            num_kv_heads=self.kv_head_num,
+            layer_id=layer_id,
+        )
+
+    def __call__(
         self,
-        config,
-        mesh,
-        dtype=jnp.bfloat16,
+        positions: jax.Array,
+        hidden_states: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+    ) -> tuple[jax.Array, jax.Array]:
+        q, _ = self.q_proj(hidden_states)
+        k, _ = self.k_proj(hidden_states)
+        v, _ = self.v_proj(hidden_states)
+
+        q = q.reshape(-1, self.q_head_num, self.head_dim)
+        k = k.reshape(-1, self.kv_head_num, self.head_dim)
+        v = v.reshape(-1, self.kv_head_num, self.head_dim)
+
+        # Qwen3-VL specific: normalize Q/K before RoPE
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
+
+        output, _ = self.o_proj(attn_output)
+        return output, kv_fused
+
+
+class Qwen3VL_DecoderLayer(nnx.Module):
+    """Single decoder layer for Qwen3-VL."""
+
+    def __init__(self, config, mesh, layer_id: int = 0, dtype=jnp.bfloat16):
+        self.layer_id = layer_id
+        self.hidden_size = config.hidden_size
+
+        self.self_attn = Qwen3VL_Attention(
+            config=config,
+            mesh=mesh,
+            layer_id=layer_id,
+            dtype=dtype,
+        )
+        self.mlp = Qwen3VL_MLP(
+            config=config,
+            mesh=mesh,
+            layer_id=layer_id,
+            dtype=dtype,
+        )
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+            param_dtype=dtype,
+        )
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+            param_dtype=dtype,
+        )
+
+    def __call__(
+        self,
+        positions: jax.Array,
+        hidden_states: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        residual: jax.Array | None = None,
     ):
-        super().__init__(config=config, mesh=mesh, dtype=dtype)
+        layer_callback_flag = []
 
-        # Override rotary embeddings with M-RoPE
-        rope_scaling = getattr(config, "rope_scaling", None) or {}
-        self._mrope_section = rope_scaling.get("mrope_section")
-        self._mrope_interleaved = rope_scaling.get("mrope_interleaved", True)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states += residual
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
 
-        if self._mrope_section:
-            rope_theta = getattr(config, "rope_theta", 5000000)
-            max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
+        hidden_states, kv_fused = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+        )
 
-            for layer in self.layers:
-                head_dim = layer.self_attn.head_dim
-                layer.self_attn.rotary_emb = MRotaryEmbedding(
-                    head_size=head_dim,
-                    rotary_dim=head_dim,
-                    max_position_embeddings=max_position_embeddings,
-                    base=rope_theta,
-                    is_neox_style=True,
+        hidden_states += residual
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+
+        return hidden_states, residual, kv_fused, layer_callback_flag
+
+
+class Qwen3_VL_Model(nnx.Module):
+    """Qwen3-VL text decoder with M-RoPE (self-contained, no Qwen2 dependency)."""
+
+    def __init__(self, config, mesh, dtype=jnp.bfloat16):
+        self.config = config
+
+        self.embed_tokens = Embed(
+            num_embeddings=config.vocab_size,
+            features=config.hidden_size,
+            dtype=dtype,
+            kernel_axes=("tensor", None),
+            param_dtype=dtype,
+            mesh=mesh,
+        )
+
+        self.layers = nnx.data(
+            [
+                Qwen3VL_DecoderLayer(
+                    config=config,
+                    layer_id=i,
                     dtype=dtype,
-                    mrope_section=self._mrope_section,
-                    mrope_interleaved=self._mrope_interleaved,
+                    mesh=mesh,
                 )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
+
+        self.norm = RMSNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+            param_dtype=dtype,
+        )
+
+        # Store mrope_section for position routing
+        self._mrope_section = _get_mrope_section(config)
 
     def __call__(
         self,
@@ -245,8 +482,16 @@ class Qwen3_VL_Model(Qwen2Model):
         return hidden_states, layers_kv_fused, layers_callback_flag
 
 
+# =============================================================================
+# Top-level generation model
+# =============================================================================
+
+
 class Qwen3_VL_Generation(nnx.Module):
     """Qwen3-VL model for conditional generation.
+
+    Self-contained implementation (no Qwen2 dependency).
+    Accepts either our Qwen3VLConfig or a HuggingFace config with .text_config.
 
     Architecture:
     - Vision encoder (separate module): Processes images/videos to embeddings
@@ -265,8 +510,10 @@ class Qwen3_VL_Generation(nnx.Module):
         super().__init__()
         self.mesh = mesh
         self.config = config
-        self.text_config = get_hf_text_config(config) or config
         self.dtype = dtype or jnp.bfloat16
+
+        # Extract text config (works with both our Qwen3VLConfig and HF config)
+        self.text_config = getattr(config, "text_config", None) or config
 
         self.model = Qwen3_VL_Model(self.text_config, mesh=mesh, dtype=self.dtype)
 
