@@ -169,7 +169,9 @@ class ServerArgs:
     # Maximum number of items processed in a single multi-item scoring forward pass.
     # Requests with more items are split into multiple multi-item chunks.
     # Set to 0 to disable chunking and process all items in one pass.
-    multi_item_scoring_chunk_size: int = 2
+    # Benchmark showed chunk_size=32 provides 10.8x speedup over serial with safe memory.
+    # See: sglang-jax-dev-scripts/investigations/multi-item-chunk-size-benchmark.md
+    multi_item_scoring_chunk_size: int = 32
     # Maximum number of items allowed in a single multi-item scoring request.
     # Requests exceeding this limit will be rejected.
     max_multi_item_count: int = 512
