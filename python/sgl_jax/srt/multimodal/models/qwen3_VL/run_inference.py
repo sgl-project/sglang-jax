@@ -186,8 +186,8 @@ def load_generation_model(model_path: str, qwen3_config, mesh, dtype):
         )
 
         # WeightLoader needs .model_path, .num_hidden_layers, .quantization_config,
-        # and methods like .get_total_num_kv_heads(). Proxy simple attributes to
-        # text_config; add required methods explicitly.
+        # and several ModelConfig methods. Proxy simple attributes to text_config;
+        # add required methods explicitly (they don't exist on the dataclass).
         class GenModelConfig:
             def __init__(self, path, text_config, dt):
                 self.model_path = path
@@ -197,6 +197,21 @@ def load_generation_model(model_path: str, qwen3_config, mesh, dtype):
 
             def get_total_num_kv_heads(self):
                 return self._text_config.num_key_value_heads
+
+            def needs_kv_head_replication(self, tensor_parallel_size):
+                return tensor_parallel_size > self.get_total_num_kv_heads()
+
+            def get_num_kv_head_replicas(self, tensor_parallel_size):
+                total = self.get_total_num_kv_heads()
+                if tensor_parallel_size > total:
+                    return (tensor_parallel_size + total - 1) // total
+                return 1
+
+            def get_kv_padding_strategy(self):
+                # GQA (num_kv_heads < num_attention_heads) → replicate
+                if self._text_config.num_key_value_heads < self._text_config.num_attention_heads:
+                    return "replicate"
+                return "zero"
 
             def __getattr__(self, name):
                 return getattr(self._text_config, name)
@@ -233,7 +248,7 @@ def run_text_test(processor, model_path: str, gen_model, mesh, dtype):
     embeddings = embed_tokens(input_ids)
     print(f"  Embedding shape: {embeddings.shape}")
     print(f"  Embedding dtype: {embeddings.dtype}")
-    print(f"  Embedding norm (first token): {jnp.linalg.norm(embeddings[0, 0]):.6f}")
+    print(f"  Embedding norm (first token): {float(jnp.linalg.norm(embeddings[0, 0])):.6f}")
     print("  ✓ Text embedding lookup successful!")
 
 
@@ -289,7 +304,7 @@ def run_vision_test(processor, vision_model, image_url: str):
     print(f"  Vision embeddings shape: {vision_embeddings.shape}")
     print(f"  Vision embeddings dtype: {vision_embeddings.dtype}")
     print(
-        f"  Vision embeddings norm (mean): {jnp.mean(jnp.linalg.norm(vision_embeddings, axis=-1)):.6f}"
+        f"  Vision embeddings norm (mean): {float(jnp.mean(jnp.linalg.norm(vision_embeddings, axis=-1))):.6f}"
     )
     print(f"  Vision encoding time: {vision_time:.2f}s")
     print("  ✓ Vision encoding successful!")
