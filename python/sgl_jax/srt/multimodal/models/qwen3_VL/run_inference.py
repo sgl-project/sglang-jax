@@ -36,7 +36,6 @@ import time
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import nnx
 
 logger = logging.getLogger(__name__)
@@ -331,10 +330,14 @@ def main():
     print(f"Device count: {jax.device_count()}")
     print(f"Backend: {jax.default_backend()}")
 
-    # Create mesh — WeightLoader requires a real mesh (uses NamedSharding internally).
-    # A single-device mesh works fine for standalone inference on any backend.
-    devices = jax.devices()
-    mesh = jax.sharding.Mesh(np.array(devices).reshape(-1), axis_names=("tp",))
+    # Create mesh — must use sglang-jax's create_device_mesh so axis names
+    # match what model layers expect (kernel_axes reference "tensor" axis).
+    from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+
+    mesh = create_device_mesh(
+        ici_parallelism=[-1, jax.device_count()],
+        dcn_parallelism=[1, 1],
+    )
     print(f"Mesh: {mesh}")
 
     # Resolve model path (download if needed)
