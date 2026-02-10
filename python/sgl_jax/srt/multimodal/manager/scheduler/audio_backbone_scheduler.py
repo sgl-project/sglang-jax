@@ -145,14 +145,6 @@ class AudioBackboneScheduler:
             if logits_np.ndim == 3:
                 logits_np = logits_np[:, -1, :]
 
-            # Debug: show top-10 predicted tokens
-            top_k = 10
-            top_indices = np.argsort(logits_np[0])[-top_k:][::-1]
-            top_logits = logits_np[0][top_indices]
-            logger.info("Top-%d logits: %s", top_k, list(zip(top_indices.tolist(), top_logits.tolist())))
-
-
-
             # Sample token - let the model decide what to generate
             if sampler_config.do_sample:
                 logits = logits_np / max(sampler_config.temperature, 1e-5)
