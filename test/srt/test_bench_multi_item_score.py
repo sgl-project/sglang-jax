@@ -52,8 +52,7 @@ class TestMultiItemScorePerformance(CustomTestCase):
     model_name = "Qwen/Qwen3-0.6B"
     engine = None
     tokenizer = None
-    label_token_ids = [198] # '
-' token or similar common token
+    label_token_ids = [198]  # newline token or similar common token
     
     # Target scenario
     PROMPT_LEN = 2000
