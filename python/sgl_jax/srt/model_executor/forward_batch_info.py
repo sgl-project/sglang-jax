@@ -194,7 +194,6 @@ class ForwardBatch:
 
     ## for deepstack
     apply_for_deepstack: bool = False
-    deepstack_visual_pos_mask: jax.Array | None = None
     deepstack_visual_embedding: jax.Array | None = None
 
     def tree_flatten(self):
@@ -217,7 +216,6 @@ class ForwardBatch:
             self.input_embedding,
             self.mrope_positions,
             self.apply_for_deepstack,
-            self.deepstack_visual_pos_mask,
             self.deepstack_visual_embedding,
         )
 
@@ -262,8 +260,7 @@ class ForwardBatch:
         obj.mrope_positions = children[16] if len(children) > 16 else None
 
         obj.apply_for_deepstack = children[17]
-        obj.deepstack_visual_pos_mask = children[18]
-        obj.deepstack_visual_embeds = children[19]
+        obj.deepstack_visual_embedding = children[18]
         return obj
 
     def __repr__(self) -> str:
@@ -386,16 +383,9 @@ class ForwardBatch:
             )
 
         deepstack_visual_embedding = None
-        # deepstack_visual_pos_mask = None
         if batch.apply_for_deepstack:
-            (
-                deepstack_visual_embedding,
-                # deepstack_visual_pos_mask
-            ) = device_array(
-                (
-                    batch.deepstack_visual_embedding,
-                    # batch.deepstack_visual_pos_mask
-                ),
+            (deepstack_visual_embedding,) = device_array(
+                (batch.deepstack_visual_embedding,),
                 sharding=(
                     NamedSharding(model_runner.mesh, PartitionSpec(None, None))
                     if jax.process_count() == 1
@@ -429,7 +419,6 @@ class ForwardBatch:
             input_embedding=input_embedding,
             apply_for_deepstack=batch.apply_for_deepstack,
             deepstack_visual_embedding=deepstack_visual_embedding,
-            # deepstack_visual_pos_mask=deepstack_visual_pos_mask,
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)

@@ -1974,7 +1974,6 @@ class ModelWorkerBatch:
     input_embedding: np.ndarray | None = None
     apply_for_deepstack: bool = False
     deepstack_visual_embedding: np.ndarray | None = None
-    # deepstack_visual_pos_mask: np.ndarray | None = None
 
     # MRoPE position information [3, total_tokens]
     mrope_positions: np.ndarray | None = None

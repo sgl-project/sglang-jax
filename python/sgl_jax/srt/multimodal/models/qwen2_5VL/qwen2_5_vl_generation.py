@@ -2,12 +2,11 @@ import logging
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import nnx
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
-from sgl_jax.srt.layers.embeddings import ParallelLMHead, apply_rotary_emb
+from sgl_jax.srt.layers.embeddings import MRotaryEmbedding, ParallelLMHead
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -15,111 +14,6 @@ from sgl_jax.srt.models.qwen2 import Qwen2Model
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
-
-
-def _apply_interleaved_rope(x: jax.Array, mrope_section: list[int]) -> jax.Array:
-    x_t = x[0]
-    x_t = x_t.at[..., 1 : mrope_section[1] * 3 : 3].set(x[1, ..., 1 : mrope_section[1] * 3 : 3])
-    x_t = x_t.at[..., 2 : mrope_section[2] * 3 : 3].set(x[2, ..., 2 : mrope_section[2] * 3 : 3])
-    return x_t
-
-
-class MRotaryEmbedding:
-    """Rotary Embedding with Multimodal Sections for Qwen2.5-VL."""
-
-    def __init__(
-        self,
-        head_size: int,
-        rotary_dim: int,
-        max_position_embeddings: int,
-        base: int,
-        is_neox_style: bool,
-        dtype: jnp.dtype,
-        mrope_section: list[int],
-        mrope_interleaved: bool = False,
-    ) -> None:
-        del max_position_embeddings
-        self.head_size = head_size
-        self.rotary_dim = rotary_dim
-        self.base = base
-        self.is_neox_style = is_neox_style
-        self.dtype = dtype
-        self.mrope_section = list(mrope_section)
-        self.mrope_interleaved = mrope_interleaved
-
-        inv_freq_np = 1.0 / (base ** (np.arange(0, rotary_dim, 2, dtype=np.float32) / rotary_dim))
-        self._inv_freq_np = inv_freq_np
-
-        expected_sum = rotary_dim // 2
-        actual_sum = sum(self.mrope_section)
-        if actual_sum != expected_sum:
-            logger.warning(
-                "MRoPE section sum mismatch: expected %s, got %s. Adjusting.",
-                expected_sum,
-                actual_sum,
-            )
-            if actual_sum > 0:
-                scale_factor = expected_sum / actual_sum
-                self.mrope_section = [
-                    max(1, int(section * scale_factor)) for section in self.mrope_section
-                ]
-                current_sum = sum(self.mrope_section)
-                if current_sum != expected_sum:
-                    self.mrope_section[-1] += expected_sum - current_sum
-            else:
-                self.mrope_section = [expected_sum // len(self.mrope_section)] * len(
-                    self.mrope_section
-                )
-                remainder = expected_sum % len(self.mrope_section)
-                for i in range(remainder):
-                    self.mrope_section[i] += 1
-
-    def __call__(
-        self,
-        positions: jax.Array,
-        query: jax.Array,
-        key: jax.Array,
-    ) -> tuple[jax.Array, jax.Array]:
-        inv_freq = jnp.asarray(self._inv_freq_np, dtype=self.dtype)
-
-        if positions.ndim == 1:
-            freqs = jnp.einsum("n,d->nd", positions.astype(jnp.float32), inv_freq)
-            cos = jnp.cos(freqs).astype(self.dtype)
-            sin = jnp.sin(freqs).astype(self.dtype)
-        else:
-            freqs = jnp.einsum("tn,d->tnd", positions.astype(jnp.float32), inv_freq)
-            cos = jnp.cos(freqs).astype(self.dtype)
-            sin = jnp.sin(freqs).astype(self.dtype)
-            if self.mrope_interleaved:
-                cos = _apply_interleaved_rope(cos, self.mrope_section)
-                sin = _apply_interleaved_rope(sin, self.mrope_section)
-            else:
-                cos_slices = []
-                sin_slices = []
-                offset = 0
-                for i, section in enumerate(self.mrope_section):
-                    cos_slices.append(cos[i, :, offset : offset + section])
-                    sin_slices.append(sin[i, :, offset : offset + section])
-                    offset += section
-                cos = jnp.concatenate(cos_slices, axis=-1)
-                sin = jnp.concatenate(sin_slices, axis=-1)
-
-        num_tokens = positions.shape[-1]
-        query_shape = query.shape
-        query = query.reshape(num_tokens, -1, self.head_size)
-        query_rot = query[..., : self.rotary_dim]
-        query_pass = query[..., self.rotary_dim :]
-        query_rot = apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
-        query = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
-
-        key_shape = key.shape
-        key = key.reshape(num_tokens, -1, self.head_size)
-        key_rot = key[..., : self.rotary_dim]
-        key_pass = key[..., self.rotary_dim :]
-        key_rot = apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
-        key = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
-
-        return query, key
 
 
 class Qwen2_5_VL_Model(Qwen2Model):
