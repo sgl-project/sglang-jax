@@ -427,6 +427,7 @@ suites = {
         TestFile("test/srt/test_multi_item_chunking.py", 3),
         TestFile("test/srt/test_multi_item_scheduler_output.py", 2),
         TestFile("test/srt/test_multi_item_regression.py", 4),
+        TestFile("test/srt/test_bench_multi_item_score.py", 10),
     ],
     "minimal-smoke-test": [
         TestFile("python/sgl_jax/test/test_utils.py", 0.2),
