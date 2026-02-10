@@ -149,26 +149,38 @@ def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
         )
     return model_path, tokenizer_path
 
+_logger_lock = threading.Lock()
+_logger_initialized = False
 
 def configure_logger(server_args, prefix: str = ""):
-    if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
-        if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
-            raise Exception(
-                f"Setting SGLANG_LOGGING_CONFIG_PATH from env with {SGLANG_LOGGING_CONFIG_PATH} does not exists"
-            )
-        with open(SGLANG_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
-            custom_config = json.loads(file.read())
-        logging.config.dictConfig(custom_config)
+    global _logger_initialized
+    
+    # Quick check (Double-checked locking pattern)
+    if _logger_initialized:
         return
-    format = f"[%(asctime)s{prefix}] %(message)s"
+    with _logger_lock:
+        # Check again inside the lock to be safe
+        if _logger_initialized:
+            return
+        if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
+            if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
+                raise Exception(
+                    f"Setting SGLANG_LOGGING_CONFIG_PATH from env with {SGLANG_LOGGING_CONFIG_PATH} does not exists"
+                )
+            with open(SGLANG_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
+                custom_config = json.loads(file.read())
+            logging.config.dictConfig(custom_config)
+            _logger_initialized = True
+            return
+        format = f"[%(asctime)s{prefix}] %(message)s"
 
-    root_logger = logging.getLogger()
-    h = logging.StreamHandler()
-    fmt = logging.Formatter(format, "%Y-%m-%d %H:%M:%S", "%")
-    h.setFormatter(fmt)
-    root_logger.addHandler(h)
-    root_logger.setLevel(server_args.log_level.upper())
-
+        root_logger = logging.getLogger()
+        h = logging.StreamHandler()
+        fmt = logging.Formatter(format, "%Y-%m-%d %H:%M:%S", "%")
+        h.setFormatter(fmt)
+        root_logger.addHandler(h)
+        root_logger.setLevel(server_args.log_level.upper())
+        _logger_initialized = True
 
 def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool):
     mem = psutil.virtual_memory()
