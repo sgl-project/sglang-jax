@@ -529,19 +529,15 @@ class AudioBackboneConfigRegistry:
     """Registry that maps model names to their audio backbone (LLM) configs."""
 
     _REGISTRY: dict[str, callable] = {
-        "xiaomi/MiMo-7B-RL": lambda: MiMoAudioBackboneConfig(),
-        "MiMo-7B-RL": lambda: MiMoAudioBackboneConfig(),
-        "xiaomi/MiMo-Audio": lambda: MiMoAudioBackboneConfig(),
-        "MiMo-Audio": lambda: MiMoAudioBackboneConfig(),
         "XiaomiMiMo/MiMo-Audio-7B-Instruct": lambda: MiMoAudioBackboneConfig(),
         "MiMo-Audio-7B-Instruct": lambda: MiMoAudioBackboneConfig(),
+        "XiaomiMiMo/MiMo-Audio-7B-Base": lambda: MiMoAudioBackboneConfig(),
+        "MiMo-Audio-7B-Base": lambda: MiMoAudioBackboneConfig(),
     }
 
     _KEYWORD_PATTERNS: list[tuple[str, callable]] = [
         ("MiMo-Audio-7B-Instruct", lambda: MiMoAudioBackboneConfig()),
-        ("MiMo-7B", lambda: MiMoAudioBackboneConfig()),
-        ("mimo-7b", lambda: MiMoAudioBackboneConfig()),
-        ("MiMo-Audio", lambda: MiMoAudioBackboneConfig()),
+        ("MiMo-Audio-7B-Base", lambda: MiMoAudioBackboneConfig()),
     ]
 
     @classmethod
