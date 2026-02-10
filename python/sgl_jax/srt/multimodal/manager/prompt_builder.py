@@ -22,7 +22,7 @@ class MultimodalPromptBuilder:
     TEMPLATES = {
         "asr": {
             "prefix": "<|im_start|>user\n",
-            "suffix": "{prompt}<|im_end|>\n<|im_start|>assistant\n",
+            "suffix": "{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n",
             "default_prompt": "请转录这段音频",
         },
         "tts": {
