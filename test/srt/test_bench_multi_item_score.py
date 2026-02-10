@@ -107,8 +107,7 @@ class TestMultiItemScorePerformance(CustomTestCase):
         Scenario: 500 candidates scored one-by-one (or in small batches).
         Each candidate has the same 2000 token prompt prefix.
         """
-        print(f"
-[Benchmark] Starting Single-Item Sequential (Items={self.NUM_CANDIDATES}, Prompt={self.PROMPT_LEN})")
+        print(f"\n[Benchmark] Starting Single-Item Sequential (Items={self.NUM_CANDIDATES}, Prompt={self.PROMPT_LEN})")
         
         # Generate dummy data (using token IDs to be precise)
         query_tokens = [1] * self.PROMPT_LEN
@@ -151,8 +150,7 @@ class TestMultiItemScorePerformance(CustomTestCase):
         Scenario: 500 candidates scored in a single packed sequence.
         Uses 100 token static prefix + 1900 token dynamic suffix + 500 * 20 token items.
         """
-        print(f"
-[Benchmark] Starting Multi-Item Packed (Items={self.NUM_CANDIDATES}, Prompt={self.PROMPT_LEN})")
+        print(f"\n[Benchmark] Starting Multi-Item Packed (Items={self.NUM_CANDIDATES}, Prompt={self.PROMPT_LEN})")
         
         # Generate dummy data
         # Prefix = 100 (static) + 1900 (dynamic) = 2000
@@ -192,29 +190,20 @@ class TestMultiItemScorePerformance(CustomTestCase):
 
     def _report_result(self, result: BenchmarkResult):
         report = (
-            f"  Throughput: {result.throughput_items_sec:.2f} items/sec
-"
-            f"  Latency per item: {result.latency_per_item_ms:.2f} ms
-"
-            f"  Total time for {result.num_items} items: {result.total_time_sec:.2f} sec
-"
+            f"  Throughput: {result.throughput_items_sec:.2f} items/sec\n"
+            f"  Latency per item: {result.latency_per_item_ms:.2f} ms\n"
+            f"  Total time for {result.num_items} items: {result.total_time_sec:.2f} sec\n"
         )
         print(report)
 
         if is_in_ci():
             write_github_step_summary(
-                f"### {result.name} (Prompt={result.prompt_len}, Items={result.num_items})
-"
-                f"| Metric | Value |
-"
-                f"|--------|-------|
-"
-                f"| Throughput | {result.throughput_items_sec:.2f} items/sec |
-"
-                f"| Latency/Item | {result.latency_per_item_ms:.2f} ms |
-"
-                f"| Total Time | {result.total_time_sec:.2f} s |
-"
+                f"### {result.name} (Prompt={result.prompt_len}, Items={result.num_items})\n"
+                f"| Metric | Value |\n"
+                f"|--------|-------|\n"
+                f"| Throughput | {result.throughput_items_sec:.2f} items/sec |\n"
+                f"| Latency/Item | {result.latency_per_item_ms:.2f} ms |\n"
+                f"| Total Time | {result.total_time_sec:.2f} s |\n"
             )
 
 if __name__ == "__main__":
