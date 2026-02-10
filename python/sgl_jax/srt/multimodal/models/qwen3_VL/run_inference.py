@@ -156,10 +156,7 @@ def load_vision_model(model_path: str, qwen3_config, mesh, dtype):
 
     vm_config = VisionWeightConfig(model_path, text_cfg, vis_cfg, dtype)
 
-    if mesh:
-        with mesh:
-            vision_model.load_weights(vm_config)
-    else:
+    with mesh:
         vision_model.load_weights(vm_config)
 
     print(f"  Vision model loaded in {time.time() - t0:.2f}s")
@@ -194,11 +191,8 @@ def load_generation_model(model_path: str, hf_config, mesh, dtype):
             self.quantization_config = None
 
     gm_config = GenModelConfig(model_path, hf_config, dtype)
-    
-    if mesh:
-        with mesh:
-            gen_model.load_weights(gm_config)
-    else:
+
+    with mesh:
         gen_model.load_weights(gm_config)
 
     print(f"  Generation model loaded in {time.time() - t0:.2f}s")
@@ -337,10 +331,10 @@ def main():
     print(f"Device count: {jax.device_count()}")
     print(f"Backend: {jax.default_backend()}")
 
-    # Create mesh
-    # devices = jax.devices()
-    # mesh = jax.sharding.Mesh(np.array(devices).reshape(-1), axis_names=("tp",))
-    mesh = None
+    # Create mesh — WeightLoader requires a real mesh (uses NamedSharding internally).
+    # A single-device mesh works fine for standalone inference on any backend.
+    devices = jax.devices()
+    mesh = jax.sharding.Mesh(np.array(devices).reshape(-1), axis_names=("tp",))
     print(f"Mesh: {mesh}")
 
     # Resolve model path (download if needed)
