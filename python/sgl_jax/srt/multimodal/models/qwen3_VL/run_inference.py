@@ -332,8 +332,9 @@ def main():
     print(f"Backend: {jax.default_backend()}")
 
     # Create mesh
-    devices = jax.devices()
-    mesh = jax.sharding.Mesh(np.array(devices).reshape(-1), axis_names=("tp",))
+    # devices = jax.devices()
+    # mesh = jax.sharding.Mesh(np.array(devices).reshape(-1), axis_names=("tp",))
+    mesh = None
     print(f"Mesh: {mesh}")
 
     # Resolve model path (download if needed)
