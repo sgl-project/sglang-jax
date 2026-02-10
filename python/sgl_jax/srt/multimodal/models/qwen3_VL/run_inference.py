@@ -185,14 +185,18 @@ def load_generation_model(model_path: str, qwen3_config, mesh, dtype):
             )
         )
 
-        # WeightLoader needs .model_path, .num_hidden_layers, .quantization_config, etc.
-        # Proxy missing attributes to the text config.
+        # WeightLoader needs .model_path, .num_hidden_layers, .quantization_config,
+        # and methods like .get_total_num_kv_heads(). Proxy simple attributes to
+        # text_config; add required methods explicitly.
         class GenModelConfig:
             def __init__(self, path, text_config, dt):
                 self.model_path = path
                 self.dtype = dt
                 self.quantization_config = None
                 self._text_config = text_config
+
+            def get_total_num_kv_heads(self):
+                return self._text_config.num_key_value_heads
 
             def __getattr__(self, name):
                 return getattr(self._text_config, name)

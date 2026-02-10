@@ -545,14 +545,18 @@ class Qwen3_VL_Generation(nnx.Module):
         logger.info("Qwen3-VL (LLM) weights loaded successfully!")
 
     def _create_qwen3_weight_mappings(self) -> dict:
-        """Create weight mappings for text decoder."""
+        """Create weight mappings for text decoder.
+
+        HF safetensors keys use ``model.language_model.`` prefix;
+        our JAX model paths use ``model.`` (no language_model).
+        """
         mappings = {
-            "model.embed_tokens.weight": WeightMapping(
+            "model.language_model.embed_tokens.weight": WeightMapping(
                 target_path="model.embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             ),
-            "model.norm.weight": WeightMapping(
+            "model.language_model.norm.weight": WeightMapping(
                 target_path="model.norm.scale",
                 sharding=(None,),
                 transpose=False,
@@ -574,7 +578,7 @@ class Qwen3_VL_Generation(nnx.Module):
 
     def _create_layer_mappings(self, layer_idx: int) -> dict:
         """Create weight mappings for a single decoder layer."""
-        prefix = f"model.layers.{layer_idx}"
+        prefix = f"model.language_model.layers.{layer_idx}"
         target_prefix = f"model.layers.{layer_idx}"
 
         mappings = {
