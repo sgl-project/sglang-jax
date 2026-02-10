@@ -59,7 +59,6 @@ class ModelConfig:
         moe_backend: str | MoEBackend = MoEBackend.AUTO,
         model_sub_dir: str | None = None,
     ) -> None:
-
         self.model_path = model_path
         self.model_sub_dir = model_sub_dir
         self.revision = revision
@@ -696,6 +695,7 @@ multimodal_model_archs = [
     "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
+    "Qwen3VLForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
     "Phi4MMForCausalLM",

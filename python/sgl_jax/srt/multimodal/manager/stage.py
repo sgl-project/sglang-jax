@@ -20,6 +20,10 @@ from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vit import Qwen2_5_VL_Visio
 from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vl_generation import (
     Qwen2_5_VL_Generation,
 )
+from sgl_jax.srt.multimodal.models.qwen3_VL.qwen3_vl_vit import Qwen3_VL_VisionModel
+from sgl_jax.srt.multimodal.models.qwen3_VL.qwen3_vl_generation import (
+    Qwen3_VL_Generation,
+)
 from sgl_jax.srt.multimodal.models.wan.diffusion.wan_dit import (
     WanDualTransformer3DModel,
     WanTransformer3DModel,
@@ -189,6 +193,10 @@ def get_model_class(name: str):
         return Qwen2_5_VL_Generation
     elif name == "Qwen2_5_VL_VisionModel":
         return Qwen2_5_VL_VisionModel
+    elif name == "Qwen3_VL_Generation":
+        return Qwen3_VL_Generation
+    elif name == "Qwen3_VL_VisionModel":
+        return Qwen3_VL_VisionModel
     elif name == "Qwen2ForCausalLM":
         return Qwen2ForCausalLM
     else:
