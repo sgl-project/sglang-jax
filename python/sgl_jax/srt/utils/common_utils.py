@@ -156,7 +156,7 @@ _logger_initialized = False
 
 def configure_logger(server_args, prefix: str = ""):
     root_logger = logging.getLogger()
-    for handler in enumerate(root_logger.handlers):
+    for handler in root_logger.handlers:
         if handler.formatter._fmt == "%(levelname)s:%(name)s:%(message)s":
             root_logger.removeHandler(handler)
             handler.close()
