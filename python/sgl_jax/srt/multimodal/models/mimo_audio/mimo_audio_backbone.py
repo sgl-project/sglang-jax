@@ -189,71 +189,18 @@ class MiMoAudioAttention(nnx.Module):
         """
         # Branch 1: RadixAttention (for main model with KV cache)
         if token_to_kv_pool is not None:
-            # DEBUG: Check hidden_states before Q projection (Layer 0 only)
-            if self.layer_id == 0:
-                jax.debug.print(
-                    "Attn0 input_hidden: min={h_min}, max={h_max}, has_nan={has_nan}",
-                    h_min=jnp.min(hidden_states),
-                    h_max=jnp.max(hidden_states),
-                    has_nan=jnp.any(jnp.isnan(hidden_states))
-                )
-                # Check Q projection weights
-                q_weight = self.q_proj.weight.value
-                jax.debug.print(
-                    "Attn0 q_proj_weight: shape={shape}, min={w_min}, max={w_max}, mean={w_mean}",
-                    shape=q_weight.shape,
-                    w_min=jnp.min(q_weight),
-                    w_max=jnp.max(q_weight),
-                    w_mean=jnp.mean(q_weight)
-                )
 
             q, _ = self.q_proj(hidden_states)
             k, _ = self.k_proj(hidden_states)
             v, _ = self.v_proj(hidden_states)
 
-            # DEBUG: Check Q/K/V value ranges after projection (Layer 0 only)
-            if self.layer_id == 0:
-                jax.debug.print(
-                    "Attn0 after_proj: q_min={q_min}, q_max={q_max}, k_min={k_min}, k_max={k_max}",
-                    q_min=jnp.min(q),
-                    q_max=jnp.max(q),
-                    k_min=jnp.min(k),
-                    k_max=jnp.max(k)
-                )
-
             q = q.reshape(-1, self.q_head_num, self.head_dim)
             k = k.reshape(-1, self.kv_head_num, self.head_dim)
             v = v.reshape(-1, self.kv_head_num, self.head_dim)
 
-            # DEBUG: Check Q/K/V before RoPE (Layer 0 only)
-            if self.layer_id == 0:
-                jax.debug.print(
-                    "Attn0 before_rope: q_nan={q_nan}, k_nan={k_nan}, v_nan={v_nan}",
-                    q_nan=jnp.any(jnp.isnan(q)),
-                    k_nan=jnp.any(jnp.isnan(k)),
-                    v_nan=jnp.any(jnp.isnan(v))
-                )
-
             q, k = self.rotary_emb(positions, q, k)
 
-            # DEBUG: Check Q/K after RoPE (Layer 0 only)
-            if self.layer_id == 0:
-                jax.debug.print(
-                    "Attn0 after_rope: q_nan={q_nan}, k_nan={k_nan}, positions={positions}",
-                    q_nan=jnp.any(jnp.isnan(q)),
-                    k_nan=jnp.any(jnp.isnan(k)),
-                    positions=positions
-                )
-
             attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
-
-            # DEBUG: Check attention output (Layer 0 only)
-            if self.layer_id == 0:
-                jax.debug.print(
-                    "Attn0 after_radix_attn: output_nan={output_nan}, output_inf={output_inf}",
-                    output_nan=jnp.any(jnp.isnan(attn_output)),
-                    output_inf=jnp.any(jnp.isinf(attn_output))
-                )
 
             output, _ = self.o_proj(attn_output)
             return output, kv_fused
@@ -369,20 +316,6 @@ class MiMoAudioDecoderLayer(nnx.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
-        # DEBUG: Check residual and LayerNorm output before attention (Layer 0 only)
-        if self.self_attn.layer_id == 0:
-            jax.debug.print(
-                "Layer0 residual_before_attn: min={r_min}, max={r_max}",
-                r_min=jnp.min(residual),
-                r_max=jnp.max(residual)
-            )
-            jax.debug.print(
-                "Layer0 after_input_layernorm: min={h_min}, max={h_max}, has_nan={has_nan}",
-                h_min=jnp.min(hidden_states),
-                h_max=jnp.max(hidden_states),
-                has_nan=jnp.any(jnp.isnan(hidden_states))
-            )
-
         attn_output, kv_fused = self.self_attn(
             hidden_states=hidden_states,
             positions=positions,
@@ -390,26 +323,10 @@ class MiMoAudioDecoderLayer(nnx.Module):
             token_to_kv_pool=token_to_kv_pool,
         )
 
-        # DEBUG: Check attention output for layer 0 only
-        if self.self_attn.layer_id == 0:
-            jax.debug.print(
-                "Layer0 attn_output: has_nan={has_nan}, has_inf={has_inf}",
-                has_nan=jnp.any(jnp.isnan(attn_output)),
-                has_inf=jnp.any(jnp.isinf(attn_output))
-            )
-
         hidden_states = attn_output + residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         mlp_output = self.mlp(hidden_states)
-
-        # DEBUG: Check MLP output for layer 0 only
-        if self.self_attn.layer_id == 0:
-            jax.debug.print(
-                "Layer0 mlp_output: has_nan={has_nan}, has_inf={has_inf}",
-                has_nan=jnp.any(jnp.isnan(mlp_output)),
-                has_inf=jnp.any(jnp.isinf(mlp_output))
-            )
 
         return mlp_output, residual, kv_fused, []
 
@@ -771,15 +688,6 @@ class MiMoAudioForCausalLM(nnx.Module):
             cur_embed = self.speech_embeddings[idx]
             cur_speech_ids = speech_input_ids[:, :, idx, :]  # [B, T_groups, group_size]
 
-            # DEBUG: Print token ID range for each channel
-            jax.debug.print(
-                "Channel {idx}: min_id={min_id}, max_id={max_id}, vocab_size={vocab_size}",
-                idx=idx,
-                min_id=jnp.min(cur_speech_ids),
-                max_id=jnp.max(cur_speech_ids),
-                vocab_size=self.config.speech_vocab_sizes[idx]
-            )
-
             cur_speech_embeds = cur_embed(cur_speech_ids)  # [B, T_groups, group_size, dim]
 
             # Mask out empty tokens
@@ -787,23 +695,11 @@ class MiMoAudioForCausalLM(nnx.Module):
             cur_speech_embeds = cur_speech_embeds * ~cur_mask[..., None]
             speech_embeds = speech_embeds + cur_speech_embeds
 
-        # DEBUG: Check speech_embeds for NaN after accumulation
-        jax.debug.print(
-            "speech_embeds stats: has_nan={has_nan}, has_inf={has_inf}",
-            has_nan=jnp.any(jnp.isnan(speech_embeds)),
-            has_inf=jnp.any(jnp.isinf(speech_embeds))
-        )
-
         # Mask out non-speech positions
         speech_embeds = speech_embeds * is_speech[:, :, None, None]
 
         # Apply patch encoder
         speech_embeds = self.apply_patch_encoder(speech_embeds)
-        jax.debug.print(
-            "after_patch_encoder: has_nan={has_nan}, has_inf={has_inf}",
-            has_nan=jnp.any(jnp.isnan(speech_embeds)),
-            has_inf=jnp.any(jnp.isinf(speech_embeds))
-        )
 
         # Mask again after transformer
         speech_embeds = speech_embeds * is_speech[:, :, None, None]
@@ -812,20 +708,10 @@ class MiMoAudioForCausalLM(nnx.Module):
         speech_grouped_embeds, _ = self.speech_group_downcast(
             speech_embeds.reshape(B, T_groups, -1)
         )
-        jax.debug.print(
-            "speech_grouped_embeds: has_nan={has_nan}, has_inf={has_inf}",
-            has_nan=jnp.any(jnp.isnan(speech_grouped_embeds)),
-            has_inf=jnp.any(jnp.isinf(speech_grouped_embeds))
-        )
 
         # Get text embeddings
         text_input_ids_safe = jnp.where(text_input_ids == -100, 0, text_input_ids)
         text_embeds = self.model.embed_tokens(text_input_ids_safe)
-        jax.debug.print(
-            "text_embeds: has_nan={has_nan}, has_inf={has_inf}",
-            has_nan=jnp.any(jnp.isnan(text_embeds)),
-            has_inf=jnp.any(jnp.isinf(text_embeds))
-        )
 
         # Zero out embeddings for empty/masked tokens
         text_zero_mask = (text_input_ids == self.args.empty_idx) | (text_input_ids == -100)
@@ -833,11 +719,6 @@ class MiMoAudioForCausalLM(nnx.Module):
 
         # Combine text and speech embeddings
         result = text_embeds + speech_grouped_embeds
-        jax.debug.print(
-            "combined_embeds: has_nan={has_nan}, has_inf={has_inf}",
-            has_nan=jnp.any(jnp.isnan(result)),
-            has_inf=jnp.any(jnp.isinf(result))
-        )
         return result
 
     def forward_simple(
@@ -902,11 +783,6 @@ class MiMoAudioForCausalLM(nnx.Module):
         """
         # Prepare input embeddings (MiMo specific)
         inputs_embeds = self._prepare_input_embeds(input_ids)
-        jax.debug.print(
-            "FORWARD inputs_embeds: has_nan={has_nan}, has_inf={has_inf}",
-            has_nan=jnp.any(jnp.isnan(inputs_embeds)),
-            has_inf=jnp.any(jnp.isinf(inputs_embeds))
-        )
 
         # Flatten embeddings for RadixAttention: [Total_Tokens, H]
         B, T_groups, H = inputs_embeds.shape
@@ -915,11 +791,6 @@ class MiMoAudioForCausalLM(nnx.Module):
         # Forward through main transformer
         hidden_states, layers_kv_fused, layers_callback_flag = self.model(
             inputs_embeds_flat, forward_batch.positions, forward_batch, token_to_kv_pool
-        )
-        jax.debug.print(
-            "FORWARD hidden_states_after_model: has_nan={has_nan}, has_inf={has_inf}",
-            has_nan=jnp.any(jnp.isnan(hidden_states)),
-            has_inf=jnp.any(jnp.isinf(hidden_states))
         )
 
         # Get logits for the last positions using LogitsProcessor
