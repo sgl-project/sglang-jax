@@ -4,6 +4,7 @@ import dataclasses
 import hashlib
 import io
 import logging
+import math
 import os
 import signal
 import tempfile
@@ -49,6 +50,86 @@ from sgl_jax.srt.utils import (
 from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+# Qwen video preprocessing (ported from sglang).
+_QWEN_IMAGE_FACTOR = 28
+_QWEN_MAX_RATIO = 200
+_QWEN_VIDEO_TOTAL_PIXELS = int(float(os.environ.get("VIDEO_MAX_PIXELS", 128000 * 28 * 28 * 0.9)))
+_QWEN_VIDEO_MIN_PIXELS = 128 * 28 * 28
+_QWEN_VIDEO_MAX_PIXELS = 768 * 28 * 28
+_QWEN_FRAME_FACTOR = 2
+_QWEN_FPS = 2.0
+_QWEN_FPS_MIN_FRAMES = 4
+_QWEN_FPS_MAX_FRAMES = 768
+
+
+def _round_by_factor(number: int, factor: int) -> int:
+    return round(number / factor) * factor
+
+
+def _ceil_by_factor(number: int, factor: int) -> int:
+    return math.ceil(number / factor) * factor
+
+
+def _floor_by_factor(number: int, factor: int) -> int:
+    return math.floor(number / factor) * factor
+
+
+def _smart_resize(
+    height: int,
+    width: int,
+    *,
+    factor: int = _QWEN_IMAGE_FACTOR,
+    min_pixels: int = _QWEN_VIDEO_MIN_PIXELS,
+    max_pixels: int = _QWEN_VIDEO_MAX_PIXELS,
+) -> tuple[int, int]:
+    if max(height, width) / min(height, width) > _QWEN_MAX_RATIO:
+        raise ValueError(
+            f"absolute aspect ratio must be smaller than {_QWEN_MAX_RATIO}, got {max(height, width) / min(height, width)}"
+        )
+    h_bar = max(factor, _round_by_factor(height, factor))
+    w_bar = max(factor, _round_by_factor(width, factor))
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = _floor_by_factor(height / beta, factor)
+        w_bar = _floor_by_factor(width / beta, factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = _ceil_by_factor(height * beta, factor)
+        w_bar = _ceil_by_factor(width * beta, factor)
+    return h_bar, w_bar
+
+
+def _smart_nframes(video_config: dict, total_frames: int, video_fps: float) -> int:
+    assert not (
+        "fps" in video_config and "nframes" in video_config
+    ), "Only accept either `fps` or `nframes`"
+    if "nframes" in video_config:
+        nframes = _round_by_factor(video_config["nframes"], _QWEN_FRAME_FACTOR)
+    else:
+        fps = video_config.get("fps", _QWEN_FPS)
+        min_frames = _ceil_by_factor(
+            video_config.get("min_frames", _QWEN_FPS_MIN_FRAMES),
+            _QWEN_FRAME_FACTOR,
+        )
+        max_frames = _floor_by_factor(
+            video_config.get("max_frames", min(_QWEN_FPS_MAX_FRAMES, total_frames)),
+            _QWEN_FRAME_FACTOR,
+        )
+        nframes = total_frames / video_fps * fps
+        if nframes > total_frames:
+            logger.warning("smart_nframes: nframes[%s] > total_frames[%s]", nframes, total_frames)
+        nframes = min(min(max(nframes, min_frames), max_frames), total_frames)
+        nframes = _floor_by_factor(nframes, _QWEN_FRAME_FACTOR)
+    if not (_QWEN_FRAME_FACTOR <= nframes <= total_frames):
+        raise ValueError(
+            "nframes should in interval [%s, %s], but got %s.",
+            _QWEN_FRAME_FACTOR,
+            total_frames,
+            nframes,
+        )
+    return int(nframes)
 
 
 @dataclasses.dataclass
@@ -237,7 +318,15 @@ class MultimodalTokenizer(TokenizerManager):
             images = [
                 self._load_image_from_source(item) for item in image_data
             ]  # note: We did not perform a resize operation
-            videos = [self._load_video_from_source(item) for item in video_data]
+            processor_kwargs = {}
+            if video_data and self._is_qwen_video_processor():
+                video_config = self._build_qwen_video_config(obj)
+                videos = [self._preprocess_qwen_video(item, video_config) for item in video_data]
+                processor_kwargs["videos_kwargs"] = {"do_sample_frames": False}
+                if "fps" in video_config:
+                    processor_kwargs["videos_kwargs"]["fps"] = video_config["fps"]
+            else:
+                videos = [self._load_video_from_source(item) for item in video_data]
             audios = [self._load_audio_from_source(item) for item in audio_data]
             processor_out = self.mm_processor(
                 images=images or None,
@@ -245,6 +334,7 @@ class MultimodalTokenizer(TokenizerManager):
                 audio=audios or None,
                 text=input_text or "",
                 return_tensors="pt",
+                **processor_kwargs,
             )
             if "input_ids" in processor_out:
                 input_ids = processor_out["input_ids"][0].tolist()
@@ -252,6 +342,8 @@ class MultimodalTokenizer(TokenizerManager):
             image_grid_thw = self._to_grid_list(processor_out.get("image_grid_thw"))
             video_grid_thw = self._to_grid_list(processor_out.get("video_grid_thw"))
             second_per_grid_ts = processor_out.get("second_per_grid_ts")
+            if second_per_grid_ts is None:
+                second_per_grid_ts = processor_out.get("video_second_per_grid")
             pixel_values = self._strip_batch_dim(processor_out.get("pixel_values"))
             pixel_values_videos = self._strip_batch_dim(processor_out.get("pixel_values_videos"))
 
@@ -363,6 +455,138 @@ class MultimodalTokenizer(TokenizerManager):
         if data is None:
             return []
         return data if isinstance(data, list) else [data]
+
+    def _is_qwen_video_processor(self) -> bool:
+        if self.mm_processor is None:
+            return False
+        return self.mm_processor.__class__.__name__ in {
+            "Qwen2_5_VLProcessor",
+            "Qwen3OmniMoeProcessor",
+        }
+
+    def _build_qwen_video_config(self, obj: GenerateMMReqInput | GenerateOmniReqInput) -> dict:
+        video_config: dict[str, Any] = {}
+        fps = getattr(obj, "fps", None)
+        if fps is not None:
+            video_config["fps"] = fps
+        nframes = getattr(obj, "num_frames", None)
+        if nframes is not None and "fps" not in video_config:
+            video_config["nframes"] = nframes
+        return video_config
+
+    def _preprocess_qwen_video(
+        self, source: str | bytes | np.ndarray, video_config: dict
+    ) -> np.ndarray:
+        if isinstance(source, np.ndarray):
+            return self._resize_video_frames(source, video_config)
+
+        if isinstance(source, dict) and "url" in source:
+            source = source["url"]
+        if hasattr(source, "url"):
+            source = source.url
+
+        # Lazy import to avoid dependency issues on some platforms.
+        from decord import VideoReader, cpu, gpu
+
+        tmp_path = None
+        try:
+            try:
+                from decord.bridge import decord_bridge
+
+                ctx = gpu(0)
+                _ = decord_bridge.get_ctx_device(ctx)
+            except Exception:
+                ctx = cpu(0)
+
+            if isinstance(source, bytes):
+                tmp_path = self._write_temp_video(source)
+                vr = VideoReader(tmp_path, ctx=ctx)
+            elif isinstance(source, str):
+                if os.path.exists(source):
+                    vr = VideoReader(source, ctx=ctx)
+                elif source.startswith(("http://", "https://")):
+                    resp = requests.get(source, timeout=10)
+                    resp.raise_for_status()
+                    tmp_path = self._write_temp_video(resp.content)
+                    vr = VideoReader(tmp_path, ctx=ctx)
+                elif source.startswith("data:") and "base64," in source:
+                    payload = source.split("base64,", 1)[1]
+                    tmp_path = self._write_temp_video(base64.b64decode(payload))
+                    vr = VideoReader(tmp_path, ctx=ctx)
+                else:
+                    tmp_path = self._write_temp_video(base64.b64decode(source, validate=True))
+                    vr = VideoReader(tmp_path, ctx=ctx)
+            else:
+                raise ValueError(f"Unsupported video input type: {type(source)}")
+
+            total_frames = len(vr)
+            if total_frames <= 0:
+                raise ValueError("Video must have at least one frame")
+            video_fps = float(vr.get_avg_fps() or 1.0)
+            nframes = _smart_nframes(video_config, total_frames=total_frames, video_fps=video_fps)
+            idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
+            idx = np.unique(idx)
+            video_np = vr.get_batch(idx).asnumpy()
+            return self._resize_video_frames(video_np, video_config)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    def _write_temp_video(self, payload: bytes) -> str:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp.write(payload)
+            return tmp.name
+
+    def _resize_video_frames(self, video_np: np.ndarray, video_config: dict) -> np.ndarray:
+        if video_np.ndim != 4:
+            raise ValueError(f"Expected video array with 4 dims (T,H,W,C), got {video_np.shape}")
+
+        nframes, height, width = video_np.shape[0], video_np.shape[1], video_np.shape[2]
+        min_pixels = video_config.get("min_pixels", _QWEN_VIDEO_MIN_PIXELS)
+        total_pixels = video_config.get("total_pixels", _QWEN_VIDEO_TOTAL_PIXELS)
+        max_pixels = max(
+            min(
+                video_config.get("max_pixels", _QWEN_VIDEO_MAX_PIXELS),
+                total_pixels / nframes * _QWEN_FRAME_FACTOR,
+            ),
+            int(min_pixels * 1.05),
+        )
+
+        max_pixels_supposed = video_config.get("max_pixels", max_pixels)
+        if max_pixels_supposed > max_pixels:
+            logger.warning(
+                "The given max_pixels[%s] exceeds limit[%s].",
+                max_pixels_supposed,
+                max_pixels,
+            )
+        max_pixels = min(max_pixels_supposed, max_pixels)
+
+        if "resized_height" in video_config and "resized_width" in video_config:
+            resized_height, resized_width = _smart_resize(
+                video_config["resized_height"],
+                video_config["resized_width"],
+                factor=_QWEN_IMAGE_FACTOR,
+            )
+        else:
+            resized_height, resized_width = _smart_resize(
+                height,
+                width,
+                factor=_QWEN_IMAGE_FACTOR,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+            )
+
+        if resized_height == height and resized_width == width:
+            return video_np
+
+        resized_frames = []
+        for frame in video_np:
+            img = Image.fromarray(frame)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img = img.resize((resized_width, resized_height), resample=Image.BILINEAR)
+            resized_frames.append(np.asarray(img))
+        return np.stack(resized_frames, axis=0)
 
     def _load_image_from_source(self, source: str | bytes) -> Image.Image:
         if isinstance(source, dict) and "url" in source:
