@@ -1,4 +1,5 @@
 import logging
+import os
 import signal
 from queue import Queue
 from typing import Any
@@ -26,6 +27,7 @@ from sgl_jax.srt.multimodal.models.wan.diffusion.wan_dit import (
 )
 from sgl_jax.srt.multimodal.models.wan.vaes.wanvae import AutoencoderKLWan
 from sgl_jax.srt.server_args import ServerArgs
+from sgl_jax.srt.utils import configure_logger
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.utils import get_exception_traceback
 
@@ -111,6 +113,21 @@ class Stage:
 
         parent_process = psutil.Process().parent()
         try:
+            # Ensure stage threads honor server log level/format.
+            configure_logger(self.server_args)
+            level = getattr(logging, self.server_args.log_level.upper(), logging.INFO)
+            root_logger = logging.getLogger()
+            root_logger.setLevel(level)
+            for handler in root_logger.handlers:
+                handler.setLevel(level)
+                if not os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
+                    handler.setFormatter(
+                        logging.Formatter(
+                            "[%(asctime)s] %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S",
+                        )
+                    )
+
             logger.info(
                 "Stage-%d is initializing, Scheduler:%s, Params:%s",
                 self.stage_id,
