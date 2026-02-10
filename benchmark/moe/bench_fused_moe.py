@@ -351,7 +351,7 @@ def select_block_configs(
     if bts_candidates is None:
         bts_candidates_i = None
     else:
-        bts_candidates_i = _pick_candidates(candidates=list(bts_candidates), multiple_of=t_packing)
+        bts_candidates_i = _pick_candidates(candidates=list(bts_candidates), multiple_of=1)
     bf_candidates = _pick_candidates(candidates=bf_candidates, multiple_of=128)
     bd_candidates = _pick_candidates(candidates=bd_candidates, multiple_of=tile_align)
 
@@ -381,10 +381,8 @@ def select_block_configs(
                 False,
                 f"bt({bt}) not aligned to router_tile0({router_tile0}) for router_dtype={jnp.dtype(router_dtype).name}",
             )
-        if bts % t_packing != 0:
-            return False, f"bts({bts}) % t_packing({t_packing}) != 0"
-        if not (0 < bts <= bt):
-            return False, f"bts({bts}) not in (0, bt({bt})]"
+        if not (0 < bts <= bt * case.ep_size):
+            return False, f"bts({bts}) not in (0, bt({bt}) * ep_size({case.ep_size})]"
         if not (0 < btc <= bts):
             return False, f"btc({btc}) not in (0, bts({bts})]"
         if btc % t_packing != 0:
@@ -437,6 +435,16 @@ def select_block_configs(
     configs: list[FusedMoEBlockConfig] = []
     seen: set[tuple[int, ...]] = set()
 
+    def _ladder_div2(start: int) -> list[int]:
+        out: list[int] = []
+        v = int(start)
+        while v > 0:
+            out.append(v)
+            if v == 1:
+                break
+            v //= 2
+        return sorted(set(out), reverse=True)
+
     def add(*, raw: FusedMoEBlockConfig, effective: FusedMoEBlockConfig) -> None:
         ok, reason = validate(effective)
         if not ok:
@@ -479,33 +487,61 @@ def select_block_configs(
 
     for bt in bt_candidates:
         if bts_candidates_i is None:
-            # Match the historical behavior: when `bts` isn't explicitly tuned, it
-            # defaults to `bt` (both in the kernel and in tuned table entries).
-            bts_list: list[int] = [bt]
+            # When `bts` isn't explicitly provided, pick a small default set around the
+            # *expected* per-expert token count within one `bt` tile:
+            #
+            #   E[dyn_sz] ~= bt * ep_size * top_k / num_experts
+            #
+            # This better matches the post-routing/A2A compute dimension than tying `bts`
+            # directly to `bt` (which can be tiny in decode when `num_tokens/ep_size` is small).
+            max_bts = bt * case.ep_size
+            expected = bt * case.ep_size * case.top_k / case.num_experts
+
+            def _pow2_floor(x: float) -> int:
+                if x <= 1:
+                    return 1
+                return 1 << (int(math.floor(math.log2(x))))
+
+            def _pow2_ceil(x: float) -> int:
+                if x <= 1:
+                    return 1
+                return 1 << (int(math.ceil(math.log2(x))))
+
+            lo = _pow2_floor(expected)
+            hi = _pow2_ceil(expected)
+            bts_list = [bt, lo, hi, hi * 2]
+            bts_list = sorted({v for v in bts_list if 0 < v <= max_bts})
         else:
-            bts_list = [v for v in bts_candidates_i if v <= bt]
+            # When explicitly provided, allow `bts` to exceed `bt` (up to `bt * ep_size`).
+            bts_list = [v for v in bts_candidates_i if 0 < v <= bt * case.ep_size]
         for bts in bts_list:
             for bf in bf_candidates:
                 for bd in bd_candidates:
                     current_bse_list = bse_candidates_i if use_shared_expert else [bf]
 
                     for bse in current_bse_list:
-                        raw = FusedMoEBlockConfig(
-                            bt=bt,
-                            bf=bf,
-                            bd1=bd,
-                            bd2=bd,
-                            btc=bt,
-                            bfc=bf,
-                            bd1c=bd,
-                            bd2c=bd,
-                            bts=bts,
-                            bse=bse,
-                        )
-                        effective = raw.effective_for(
-                            num_tokens=case.num_tokens, ep_size=case.ep_size, dtype=dtype
-                        )
-                        add(raw=raw, effective=effective)
+                        # Search a small ladder of btc values for each bts.
+                        for btc in _ladder_div2(bts):
+                            if btc <= 0 or btc > bts:
+                                continue
+                            if bts % btc != 0:
+                                continue
+                            raw = FusedMoEBlockConfig(
+                                bt=bt,
+                                bf=bf,
+                                bd1=bd,
+                                bd2=bd,
+                                btc=btc,
+                                bfc=bf,
+                                bd1c=bd,
+                                bd2c=bd,
+                                bts=bts,
+                                bse=bse,
+                            )
+                            effective = raw.effective_for(
+                                num_tokens=case.num_tokens, ep_size=case.ep_size, dtype=dtype
+                            )
+                            add(raw=raw, effective=effective)
 
     if max_configs <= 0:
         raise ValueError(f"Expected {max_configs=} to be > 0.")
