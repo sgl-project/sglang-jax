@@ -1713,7 +1713,7 @@ def main() -> int:
         fused_out = (fused_out.astype(jnp.float32) + shared_out.astype(jnp.float32)).astype(
             jnp.bfloat16
         )
-
+    fused_out = jax.sharding.reshard(fused_out, NamedSharding(mesh, P(None)))
     fused_np = np.asarray(jax.device_get(fused_out))
     fused_no_shared_np = (
         None if fused_out_no_shared is None else np.asarray(jax.device_get(fused_out_no_shared))
