@@ -49,7 +49,7 @@ class TestMultiItemScorePerformance(CustomTestCase):
     Benchmarks comparing single-item scoring with multi-item scoring.
     """
 
-    model_name = "/data/huggingface_models/Qwen/Qwen3-0.6B"
+    model_name = "/models/Qwen/Qwen3-0.6B"
     engine = None
     tokenizer = None
     label_token_ids = [198]  # '\n' token or similar common token
