@@ -1,0 +1,184 @@
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: sglang-stoelinga
+  annotations:
+    leaderworkerset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels:
+          role: leader
+      spec:
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu7x
+          cloud.google.com/gke-tpu-topology: 2x2x2
+        containers:
+          - name: sglang-leader
+            image: samos123/sglang-jax
+            env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-secret
+                  key: hf_api_token
+            # Set JAX_PLATFORMS to tpu (default, but good to be explicit/safe)
+            - name: JAX_PLATFORMS
+              value: "tpu"
+            command:
+              - bash
+              - -c
+              - |
+                set -x
+                # Leader is always Rank 0
+                export NODE_RANK=0
+                
+                # Use LWS provided leader address env var or hostname
+                # For leader, we can just bind to all interfaces.
+                # JAX distributed init requires an IP:PORT that is accessible.
+                # LWS_LEADER_ADDRESS is usually available in workers. In leader it might be set too.
+                # If not, use hostname.
+                
+                # Try to resolve own IP or use 0.0.0.0 for bind, but for init_addr we need real IP/Hostname?
+                # Usually jax.distributed.initialize(addr, ...) where addr is "ip:port" of the coordinator.
+                # Rank 0 listens on this address.
+                
+                # Check if LWS_LEADER_ADDRESS is set
+                if [ -z "$LWS_LEADER_ADDRESS" ]; then
+                  echo "LWS_LEADER_ADDRESS not set, using hostname"
+                  DIST_HOST=$(hostname -i)
+                else
+                  DIST_HOST=$LWS_LEADER_ADDRESS
+                fi
+                
+                echo "Starting sglang leader with rank $NODE_RANK, dist_addr $DIST_HOST"
+                
+                python3 -m sgl_jax.launch_server \
+                  --model-path "Qwen/Qwen2.5-Coder-32B-Instruct" \
+                  --tp 8 \
+                  --nnodes 2 \
+                  --node-rank 0 \
+                  --dist-init-addr "${DIST_HOST}:20000" \
+                  --host 0.0.0.0 \
+                  --port 8000 \
+                  --trust-remote-code
+            resources:
+              limits:
+                google.com/tpu: "4"
+            ports:
+              - containerPort: 8000
+            readinessProbe:
+              tcpSocket:
+                port: 8000
+              initialDelaySeconds: 15
+              periodSeconds: 10
+            volumeMounts:
+              - mountPath: /dev/shm
+                name: dshm
+              - mountPath: /root/.cache/huggingface
+                name: cache-volume
+        volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+        - name: cache-volume
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                accessModes: [ "ReadWriteOnce" ]
+                storageClassName: "premium-rwo"
+                resources:
+                  requests:
+                    storage: 200Gi
+    workerTemplate:
+      spec:
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu7x
+          cloud.google.com/gke-tpu-topology: 2x2x2
+        containers:
+          - name: sglang-worker
+            image: samos123/sglang-jax
+            env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-secret
+                  key: hf_api_token
+            - name: JAX_PLATFORMS
+              value: "tpu"
+            command:
+              - bash
+              - -c
+              - |
+                set -x
+                # Derive Rank from hostname suffix if possible, or assume 1 if size is 2.
+                # LWS Pod names: <lws-name>-<group-index>-0 (leader), <lws-name>-<group-index>-1 (worker)
+                # We can strip everything before the last dash.
+                
+                HOSTNAME_SUFFIX=${HOSTNAME##*-}
+                if [[ "$HOSTNAME_SUFFIX" =~ ^[0-9]+$ ]]; then
+                  NODE_RANK=$HOSTNAME_SUFFIX
+                else
+                  echo "Could not derive rank from hostname $HOSTNAME, defaulting to 1"
+                  NODE_RANK=1
+                fi
+                
+                # Wait for leader address to be available (env var provided by LWS)
+                if [ -z "$LWS_LEADER_ADDRESS" ]; then
+                   echo "Error: LWS_LEADER_ADDRESS environment variable is missing in worker"
+                   exit 1
+                fi
+                
+                echo "Starting sglang worker with rank $NODE_RANK, connecting to $LWS_LEADER_ADDRESS"
+                
+                # Workers also run launch_server but with node-rank > 0.
+                # It will wait on JAX init and then run dummy health server.
+                python3 -m sgl_jax.launch_server \
+                  --model-path "Qwen/Qwen2.5-Coder-32B-Instruct" \
+                  --tp 8 \
+                  --nnodes 2 \
+                  --node-rank $NODE_RANK \
+                  --dist-init-addr "${LWS_LEADER_ADDRESS}:20000" \
+                  --host 0.0.0.0 \
+                  --port 8000 \
+                  --trust-remote-code
+            resources:
+              limits:
+                google.com/tpu: "4"
+            volumeMounts:
+              - mountPath: /dev/shm
+                name: dshm
+              - mountPath: /root/.cache/huggingface
+                name: cache-volume
+        volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+        - name: cache-volume
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                accessModes: [ "ReadWriteOnce" ]
+                storageClassName: "premium-rwo"
+                resources:
+                  requests:
+                    storage: 200Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-leader-stoelinga
+spec:
+  ports:
+    - name: http
+      port: 8000
+      protocol: TCP
+      targetPort: 8000
+  selector:
+    leaderworkerset.sigs.k8s.io/name: sglang-stoelinga
+    role: leader
+  type: ClusterIP
