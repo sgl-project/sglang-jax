@@ -506,6 +506,7 @@ class BailingMoEModel(nnx.Module):
             hidden_states += residual
 
         hidden_states = self.norm(hidden_states)
+        jax.debug.print("hidden_states: {hidden_states}", hidden_states=hidden_states)
         return hidden_states, layers_kv_fused, layers_topk_ids
 
 
