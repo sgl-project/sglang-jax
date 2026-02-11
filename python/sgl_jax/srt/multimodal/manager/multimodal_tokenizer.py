@@ -109,10 +109,6 @@ class MultimodalTokenizer(TokenizerManager):
                 logger.warning("Failed to load processor/config from %s: %s", candidate, exc)
         self.wait_timeout = int(os.environ.get("SGLANG_WAIT_TIMEOUT", "600"))
 
-        # Initialize processors for vision and audio
-        self.image_processor = None
-        self._init_image_processor(server_args.model_path)
-
         # Initialize audio processor (WhisperFeatureExtractor) for audio models
         self.audio_processor = None
         self.audio_config = {}
@@ -139,15 +135,6 @@ class MultimodalTokenizer(TokenizerManager):
             ]
         )
 
-    def _init_image_processor(self, model_path: str):
-        """Initialize image processor for multimodal models."""
-        try:
-            # Use slow image processor to avoid torchvision dependency warning
-            self.image_processor = AutoImageProcessor.from_pretrained(
-                model_path, use_fast=False
-            )
-        except Exception:
-            logger.warning("Failed to load image processor from %s", model_path)
 
     def _init_audio_processor(self, model_path: str):
         """Initialize audio processor for audio models using transformers audio_utils.
