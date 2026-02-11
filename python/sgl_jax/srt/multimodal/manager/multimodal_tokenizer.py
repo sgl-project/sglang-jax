@@ -210,11 +210,9 @@ class MultimodalTokenizer(TokenizerManager):
         is_mimo_audio = "mimo" in model_path.lower() and "audio" in model_path.lower()
 
         if is_mimo_audio:
-            # Use custom MiMoAudioProcessor
             self.mm_processor = MiMoAudioProcessor()
             logger.info("Loaded MiMoAudioProcessor for model: %s", model_path)
         else:
-            # Try to load standard AutoProcessor for vision/multimodal models
             processor_candidates = [model_path]
             model_basename = os.path.basename(model_path.rstrip("/"))
             if model_basename in {
