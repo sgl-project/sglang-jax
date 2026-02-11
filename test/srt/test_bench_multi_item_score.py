@@ -194,7 +194,7 @@ class TestMultiItemScorePerformance(CustomTestCase):
         )
         self._report_result(result)
 
-    def test_scenario_1(self):
+    def test_benchmark_scenario_1(self):
         """
         Scenario 1:
         - 500 candidate items per request
@@ -226,7 +226,7 @@ class TestMultiItemScorePerformance(CustomTestCase):
         )
         self._report_result(result)
 
-    def test_scenario_2(self):
+    def test_benchmark_scenario_2(self):
         """
         Scenario 2:
         - 500 candidate items per request
