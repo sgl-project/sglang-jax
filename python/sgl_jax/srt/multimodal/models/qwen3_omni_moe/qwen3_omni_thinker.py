@@ -398,9 +398,12 @@ class Qwen3OmniMoeThinkerTextModel(nnx.Module):
             hidden_states = jax.lax.cond(
                 predicate,
                 lambda args: (
-                    args[0] + 0
-                    if forward_batch.deepstack_visual_embedding is None
-                    else forward_batch.deepstack_visual_embedding[args[1]].astype(args[0].dtype)
+                    args[0]
+                    + (
+                        0
+                        if forward_batch.deepstack_visual_embedding is None
+                        else forward_batch.deepstack_visual_embedding[args[1]].astype(args[0].dtype)
+                    )
                 ),
                 lambda args: args[0],
                 (hidden_states, layer_id),

@@ -45,7 +45,7 @@ dependencies = [
     "omegaconf",
     "imageio[ffmpeg]",
     "librosa",
-    "msgpack",
+    "msgpack==1.0.0",
 ]
 
 [project.optional-dependencies]
