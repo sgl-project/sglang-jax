@@ -153,6 +153,45 @@ class WeightLoader:
         else:
             self.moe_abstract_mesh = None
 
+    def _normalize_physical_to_logical_map(
+        self,
+        physical_to_logical_map: np.ndarray | None,
+        num_logical_experts: int,
+        context: str,
+    ) -> np.ndarray | None:
+        if physical_to_logical_map is None:
+            return None
+
+        map_np = np.asarray(physical_to_logical_map, dtype=np.int64)
+        if map_np.ndim != 1:
+            raise ValueError(
+                f"{context}: expected 1D physical_to_logical_map, got shape={map_np.shape}"
+            )
+        if map_np.size == 0:
+            raise ValueError(f"{context}: physical_to_logical_map is empty")
+
+        min_idx = int(np.min(map_np))
+        max_idx = int(np.max(map_np))
+        if min_idx < 0 or max_idx >= num_logical_experts:
+            raise ValueError(
+                f"{context}: invalid physical_to_logical_map range [{min_idx}, {max_idx}] "
+                f"for num_logical_experts={num_logical_experts}"
+            )
+
+        quant_cfg = getattr(self.model_config, "quantization_config", None)
+        is_static_quant = quant_cfg is not None and quant_cfg.is_static_checkpoint
+        log_fn = logger.info if is_static_quant else logger.debug
+        sample = map_np[: min(10, map_np.size)].tolist()
+        log_fn(
+            "%s: p2l_map physical=%d logical=%d unique=%d sample=%s",
+            context,
+            map_np.size,
+            num_logical_experts,
+            np.unique(map_np).size,
+            sample,
+        )
+        return map_np
+
     def _scan_weight_info(self) -> dict[str, list[dict]]:
         """
         Scan all safetensors files to build a mapping from HF key to file info.
@@ -389,6 +428,11 @@ class WeightLoader:
         Lazy loader for TP-Split MOE weights (e.g., Grok MOE).
         """
         num_logical_experts = len(expected_hf_keys)
+        physical_to_logical_map = self._normalize_physical_to_logical_map(
+            physical_to_logical_map=physical_to_logical_map,
+            num_logical_experts=num_logical_experts,
+            context="split_moe_loader",
+        )
         num_physical_experts = (
             len(physical_to_logical_map)
             if physical_to_logical_map is not None
@@ -568,9 +612,12 @@ class WeightLoader:
         target_dtype = dtype_map.get(st_dtype, jnp.float32)
 
         num_logical_experts = len(expected_hf_keys)
-
+        physical_to_logical_map = self._normalize_physical_to_logical_map(
+            physical_to_logical_map=physical_to_logical_map,
+            num_logical_experts=num_logical_experts,
+            context="moe_loader",
+        )
         if physical_to_logical_map is not None:
-            physical_to_logical_map = np.array(physical_to_logical_map)
             num_physical_experts = len(physical_to_logical_map)
         else:
             num_physical_experts = num_logical_experts
@@ -917,6 +964,7 @@ class WeightLoader:
                         target_sharding=final_sharding,  # Global loading
                         physical_to_logical_map=mapping.physical_to_logical_map,
                     )
+                    loaded_shape = stacked_weight.shape
 
                     if mapping.reshape is not None:
                         stacked_weight = jnp.reshape(stacked_weight, mapping.reshape)
@@ -929,10 +977,40 @@ class WeightLoader:
                     target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
 
-                    if stacked_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
-                        model_param.value = stacked_weight
-                    else:
-                        model_param.value = stacked_weight.astype(model_param.value.dtype)
+                    if mapping.physical_to_logical_map is not None:
+                        logger.info(
+                            "MoE assign debug group=%s target=%s loaded_shape=%s final_shape=%s "
+                            "param_shape=%s reshape=%s repeat=%s sharding=%s",
+                            moe_key,
+                            target_path,
+                            loaded_shape,
+                            stacked_weight.shape,
+                            model_param.value.shape,
+                            mapping.reshape,
+                            mapping.repeat,
+                            mapping.sharding,
+                        )
+
+                    try:
+                        if stacked_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
+                            model_param.value = stacked_weight
+                        else:
+                            model_param.value = stacked_weight.astype(model_param.value.dtype)
+                    except Exception as e:
+                        logger.error(
+                            "Failed MoE assign group=%s target=%s loaded_shape=%s final_shape=%s "
+                            "param_shape=%s reshape=%s repeat=%s sharding=%s err=%s",
+                            moe_key,
+                            target_path,
+                            loaded_shape,
+                            stacked_weight.shape,
+                            model_param.value.shape,
+                            mapping.reshape,
+                            mapping.repeat,
+                            mapping.sharding,
+                            str(e),
+                        )
+                        raise
 
                     if mapping.physical_to_logical_map is not None:
                         num_logical = len(expected_hf_keys)
@@ -980,6 +1058,7 @@ class WeightLoader:
                         target_sharding=final_sharding,
                         physical_to_logical_map=mapping.physical_to_logical_map,
                     )
+                    loaded_shape = expert_weights.shape
 
                     if mapping.reshape is not None:
                         expert_weights = jnp.reshape(expert_weights, mapping.reshape)
@@ -991,10 +1070,40 @@ class WeightLoader:
                     target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
 
-                    if expert_weights.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
-                        model_param.value = expert_weights
-                    else:
-                        model_param.value = expert_weights.astype(model_param.value.dtype)
+                    if mapping.physical_to_logical_map is not None:
+                        logger.info(
+                            "Split-MoE assign debug group=%s target=%s loaded_shape=%s final_shape=%s "
+                            "param_shape=%s reshape=%s repeat=%s sharding=%s",
+                            moe_key,
+                            target_path,
+                            loaded_shape,
+                            expert_weights.shape,
+                            model_param.value.shape,
+                            mapping.reshape,
+                            mapping.repeat,
+                            mapping.sharding,
+                        )
+
+                    try:
+                        if expert_weights.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
+                            model_param.value = expert_weights
+                        else:
+                            model_param.value = expert_weights.astype(model_param.value.dtype)
+                    except Exception as e:
+                        logger.error(
+                            "Failed Split-MoE assign group=%s target=%s loaded_shape=%s final_shape=%s "
+                            "param_shape=%s reshape=%s repeat=%s sharding=%s err=%s",
+                            moe_key,
+                            target_path,
+                            loaded_shape,
+                            expert_weights.shape,
+                            model_param.value.shape,
+                            mapping.reshape,
+                            mapping.repeat,
+                            mapping.sharding,
+                            str(e),
+                        )
+                        raise
 
                     logger.info(
                         "Assigned MoE group %s (Grok Split-Stitch), shape: %s",

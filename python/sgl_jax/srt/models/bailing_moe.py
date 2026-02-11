@@ -2,6 +2,7 @@ import logging
 from typing import Any
 
 import jax
+import numpy as np
 from flax import nnx
 from jax import numpy as jnp
 from jax.sharding import NamedSharding
@@ -719,12 +720,22 @@ class BailingMoEForCausalLM(nnx.Module):
                 num_physical_experts = metadata.num_physical_experts
                 physical_to_logical_map = jax.device_get(metadata.physical_to_logical_map)
                 phy_to_log = physical_to_logical_map[layer_idx]
+                phy_to_log_np = np.asarray(phy_to_log)
+                sample = phy_to_log_np[: min(10, phy_to_log_np.shape[0])].tolist()
                 logger.info(
                     "Layer %s: logical=%s, physical=%s, redundancy=%.2fx",
                     layer_idx,
                     num_logical_experts,
                     num_physical_experts,
                     num_physical_experts / num_logical_experts,
+                )
+                logger.info(
+                    "Layer %s EPLB map: size=%s min=%s max=%s sample=%s",
+                    layer_idx,
+                    phy_to_log_np.shape[0],
+                    int(phy_to_log_np.min()),
+                    int(phy_to_log_np.max()),
+                    sample,
                 )
 
             moe_mappings = create_moe_weights_mapping(
