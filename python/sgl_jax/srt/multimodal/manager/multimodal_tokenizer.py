@@ -90,6 +90,89 @@ class MiMoAudioProcessor:
             sample_rate, n_fft, hop_length, n_mels
         )
 
+    def __call__(self, audio_array: np.ndarray, sampling_rate: int = None) -> tuple:
+        """Convert raw audio waveform to mel spectrogram.
+
+        This matches the official MiMo Audio implementation:
+        - Uses power=1.0 (amplitude spectrogram)
+        - Applies natural log via log_mel="log"
+        - Returns mel spectrogram in [batch, time, n_mels] format
+
+        Args:
+            audio_array: Raw audio waveform as numpy array, shape (samples,).
+            sampling_rate: Input audio sample rate. If different from target rate, will resample.
+
+        Returns:
+            Tuple of (mel_spectrogram, input_lengths) as numpy arrays.
+            mel_spectrogram shape: [batch, time, n_mels]
+        """
+        from transformers.audio_utils import spectrogram
+
+        # Ensure 1D array
+        if audio_array.ndim == 2:
+            audio_array = audio_array.squeeze(0)
+
+        # Resample if input sample rate differs from target rate
+        if sampling_rate is not None and sampling_rate != self.sampling_rate:
+            audio_array = self._resample_audio(audio_array, sampling_rate, self.sampling_rate)
+
+        # Compute mel spectrogram with power=1.0 (matches official MiMo)
+        # spectrogram() returns [n_mels, time] with log_mel applied
+        mels = spectrogram(
+            waveform=audio_array,
+            window=self.window,
+            frame_length=self.mel_params["n_fft"],
+            hop_length=self.mel_params["hop_length"],
+            fft_length=self.mel_params["n_fft"],
+            power=1.0,  # Amplitude spectrogram (matches official MiMo)
+            center=True,
+            mel_filters=self.mel_filters,
+            log_mel="log",  # Natural logarithm (matches official torch.log)
+            mel_floor=1e-7,  # Matches official torch.clip(spec, min=1e-7)
+        )
+
+        # mels is [n_mels, time], transpose to [1, time, n_mels] for model input
+        mels = mels.T[None, :, :]  # [1, time, n_mels]
+        input_lens = np.array([mels.shape[1]])
+
+        logger.info(
+            "Audio preprocessing: input_samples=%d, mel_shape=%s, input_lens=%s",
+            len(audio_array),
+            mels.shape,
+            input_lens,
+        )
+        logger.info(
+            "  Mel stats: min=%.4f, max=%.4f, mean=%.4f, std=%.4f",
+            mels.min(), mels.max(), mels.mean(), mels.std()
+        )
+
+        return mels, input_lens
+
+    def _resample_audio(self, audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+        """Resample audio to target sample rate using torchaudio.
+
+        Uses torchaudio.functional.resample to match official MiMo implementation.
+
+        Args:
+            audio: Input audio array.
+            orig_sr: Original sample rate.
+            target_sr: Target sample rate.
+
+        Returns:
+            Resampled audio array.
+        """
+        if orig_sr == target_sr:
+            return audio
+
+        import torch
+        import torchaudio
+
+        audio_tensor = torch.from_numpy(audio).float()
+        resampled = torchaudio.functional.resample(audio_tensor, orig_sr, target_sr)
+        logger.info("Resampled audio from %d Hz to %d Hz (%d -> %d samples)",
+                    orig_sr, target_sr, len(audio), len(resampled))
+        return resampled.numpy().astype(np.float32)
+
 
 @dataclasses.dataclass
 class MMReqState(ReqState):
@@ -181,68 +264,6 @@ class MultimodalTokenizer(TokenizerManager):
             ]
         )
 
-
-    def _preprocess_audio_to_mel(self, audio_array: np.ndarray, input_sr: int = None) -> tuple:
-        """Convert raw audio waveform to mel spectrogram using transformers audio_utils.
-
-        This matches the official MiMo Audio implementation:
-        - Uses power=1.0 (amplitude spectrogram)
-        - Applies natural log via log_mel="log"
-        - Returns mel spectrogram in [batch, time, n_mels] format
-
-        Args:
-            audio_array: Raw audio waveform as numpy array, shape (samples,).
-            input_sr: Input audio sample rate. If different from target rate, will resample.
-
-        Returns:
-            Tuple of (mel_spectrogram, input_lengths) as numpy arrays.
-            mel_spectrogram shape: [batch, time, n_mels]
-        """
-        from transformers.audio_utils import spectrogram
-
-        if not isinstance(self.mm_processor, MiMoAudioProcessor):
-            raise ValueError("mm_processor is not MiMoAudioProcessor. Cannot preprocess audio.")
-
-        # Ensure 1D array
-        if audio_array.ndim == 2:
-            audio_array = audio_array.squeeze(0)
-
-        # Resample if input sample rate differs from target rate
-        target_sr = self.mm_processor.sampling_rate
-        if input_sr is not None and input_sr != target_sr:
-            audio_array = self._resample_audio(audio_array, input_sr, target_sr)
-
-        # Compute mel spectrogram with power=1.0 (matches official MiMo)
-        # spectrogram() returns [n_mels, time] with log_mel applied
-        mels = spectrogram(
-            waveform=audio_array,
-            window=self.mm_processor.window,
-            frame_length=self.mm_processor.mel_params["n_fft"],
-            hop_length=self.mm_processor.mel_params["hop_length"],
-            fft_length=self.mm_processor.mel_params["n_fft"],
-            power=1.0,  # Amplitude spectrogram (matches official MiMo)
-            center=True,
-            mel_filters=self.mm_processor.mel_filters,
-            log_mel="log",  # Natural logarithm (matches official torch.log)
-            mel_floor=1e-7,  # Matches official torch.clip(spec, min=1e-7)
-        )
-
-        # mels is [n_mels, time], transpose to [1, time, n_mels] for model input
-        mels = mels.T[None, :, :]  # [1, time, n_mels]
-        input_lens = np.array([mels.shape[1]])
-
-        logger.info(
-            "Audio preprocessing (transformers audio_utils): input_samples=%d, mel_shape=%s, input_lens=%s",
-            len(audio_array),
-            mels.shape,
-            input_lens,
-        )
-        logger.info(
-            "  Mel stats: min=%.4f, max=%.4f, mean=%.4f, std=%.4f",
-            mels.min(), mels.max(), mels.mean(), mels.std()
-        )
-
-        return mels, input_lens
 
     def _handle_batch_output(self, reqs: list | BatchStrOut | BatchEmbeddingOut | BatchTokenIDOut):
         """Handle a batch of outputs returned from the pipeline.
@@ -798,8 +819,8 @@ class MultimodalTokenizer(TokenizerManager):
         # Load audio file
         audio_array = self._load_audio_from_bytes(obj.file, target_sr=24000)
 
-        # Preprocess to mel spectrogram
-        mel_input, mel_input_lens = self._preprocess_audio_to_mel(audio_array)
+        # Preprocess to mel spectrogram (audio already at 24kHz, no resampling needed)
+        mel_input, mel_input_lens = self.mm_processor(audio_array, sampling_rate=None)
 
         # Build prompt using prompt builder
         prefix_ids, suffix_ids = self.prompt_builder.build_and_tokenize_asr(obj.prompt)
@@ -928,32 +949,6 @@ class MultimodalTokenizer(TokenizerManager):
         logger.debug("Audio loaded: orig_sr=%d, target_sr=%d, samples=%d",
                      orig_sr, target_sr, len(audio_array))
         return audio_array
-
-    def _resample_audio(self, audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-        """Resample audio to target sample rate using torchaudio.
-
-        Uses torchaudio.functional.resample to match official MiMo implementation.
-
-        Args:
-            audio: Input audio array.
-            orig_sr: Original sample rate.
-            target_sr: Target sample rate.
-
-        Returns:
-            Resampled audio array.
-        """
-        if orig_sr == target_sr:
-            return audio
-
-        import torch
-        import torchaudio
-
-        audio_tensor = torch.from_numpy(audio).float()
-        resampled = torchaudio.functional.resample(audio_tensor, orig_sr, target_sr)
-        logger.info("Resampled audio from %d Hz to %d Hz (%d -> %d samples)",
-                    orig_sr, target_sr, len(audio), len(resampled))
-        return resampled.numpy().astype(np.float32)
-
 
 
 def run_multimodal_tokenizer_process(
