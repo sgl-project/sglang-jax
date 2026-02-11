@@ -129,7 +129,7 @@ class TestScoreOpenAIClient(ScoreOpenAIClientTestBase):
             assert abs(sum(score_list) - 1.0) < 1e-5
 
     def test_score_without_softmax_openai_client(self):
-        """Test Score API returning raw logprobs (apply_softmax=False)."""
+        """Test Score API returning unnormalized probabilities (apply_softmax=False returns exp(logprob))."""
         response = self.client.post(
             "/score",
             body={

@@ -1374,13 +1374,17 @@ class TokenizerManager:
             return all_scores
 
         if use_multi_item_scoring:
-            if isinstance(query, str) and isinstance(items, list) and (
-                not items or isinstance(items[0], str)
+            if (
+                isinstance(query, str)
+                and isinstance(items, list)
+                and (not items or isinstance(items[0], str))
             ):
                 if self.tokenizer is None:
                     raise ValueError("Tokenizer is required for text multi-item scoring.")
                 query_tokens = self.tokenizer.encode(query, add_special_tokens=False)
-                item_tokens = [self.tokenizer.encode(item, add_special_tokens=False) for item in items]
+                item_tokens = [
+                    self.tokenizer.encode(item, add_special_tokens=False) for item in items
+                ]
                 return await _score_multi_item_tokenized(query_tokens, item_tokens)
             elif (
                 isinstance(query, list)

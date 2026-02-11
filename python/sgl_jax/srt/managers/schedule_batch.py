@@ -636,9 +636,9 @@ class ScheduleBatch:
         return_output_logprob_only = all(req.return_output_logprob_only for req in reqs)
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            assert tree_cache is None or isinstance(tree_cache, SWARadixCache | ChunkCache), (
-                "SWARadixCache or ChunkCache is required for SWATokenToKVPoolAllocator"
-            )
+            assert tree_cache is None or isinstance(
+                tree_cache, SWARadixCache | ChunkCache
+            ), "SWARadixCache or ChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid = True
 
         return cls(
@@ -1808,7 +1808,9 @@ def _build_multi_item_extend_positions(
     return positions
 
 
-def _build_extend_positions_for_req(req: Req, seq_len: int, prefix_len: int, dtype: np.dtype) -> np.ndarray:
+def _build_extend_positions_for_req(
+    req: Req, seq_len: int, prefix_len: int, dtype: np.dtype
+) -> np.ndarray:
     if req.is_multi_item_scoring and req.multi_item_scoring_delimiter is not None:
         if prefix_len != 0:
             raise ValueError(

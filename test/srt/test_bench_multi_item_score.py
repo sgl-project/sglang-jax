@@ -52,8 +52,8 @@ class TestMultiItemScorePerformance(CustomTestCase):
     model_name = "/data/huggingface_models/Qwen/Qwen3-0.6B"
     engine = None
     tokenizer = None
-    label_token_ids = [198] # '\n' token or similar common token
-    
+    label_token_ids = [198]  # '\n' token or similar common token
+
     # Target scenario
     PROMPT_LEN = 2000
     NUM_CANDIDATES = 500
@@ -94,9 +94,7 @@ class TestMultiItemScorePerformance(CustomTestCase):
             max_multi_item_seq_len=32768,
         )
 
-        cls.tokenizer = AutoTokenizer.from_pretrained(
-            cls.model_name, trust_remote_code=True
-        )
+        cls.tokenizer = AutoTokenizer.from_pretrained(cls.model_name, trust_remote_code=True)
         print("[Benchmark] Engine initialized")
 
     @classmethod
@@ -117,9 +115,7 @@ class TestMultiItemScorePerformance(CustomTestCase):
 
         # Generate dummy data (using token IDs to be precise)
         query_tokens = [1] * self.PROMPT_LEN
-        candidate_tokens_list = [
-            [2] * self.CANDIDATE_LEN for _ in range(self.NUM_CANDIDATES)
-        ]
+        candidate_tokens_list = [[2] * self.CANDIDATE_LEN for _ in range(self.NUM_CANDIDATES)]
 
         # Warmup (1 request)
         self.engine.score(
@@ -165,9 +161,7 @@ class TestMultiItemScorePerformance(CustomTestCase):
         # Generate dummy data
         # Prefix = 100 (static) + 1900 (dynamic) = 2000
         query_tokens = [1] * (self.STATIC_PREFIX_LEN + self.DYNAMIC_SUFFIX_LEN)
-        candidate_tokens_list = [
-            [2] * self.CANDIDATE_LEN for _ in range(self.NUM_CANDIDATES)
-        ]
+        candidate_tokens_list = [[2] * self.CANDIDATE_LEN for _ in range(self.NUM_CANDIDATES)]
 
         # Warmup
         # Note: In multi-item mode, the Engine.score implementation handles packing and chunking.

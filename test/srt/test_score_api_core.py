@@ -238,9 +238,9 @@ class TestScoreAPICore(CustomTestCase):
                 self.assertLessEqual(score, 1.0, f"Score [{i}][{j}] = {score} exceeds 1.0")
 
     def test_score_apply_softmax_false(self):
-        """Test Score API with apply_softmax=False (logprobs).
+        """Test Score API with apply_softmax=False (unnormalized probabilities, exp(logprob)).
 
-        RFC-003: Verify no sum constraint, check logprob range.
+        RFC-003: Verify no sum constraint, check value range (all >= 0).
         """
         query = "Test query"
         items = [" option1", " option2"]

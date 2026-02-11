@@ -113,37 +113,32 @@ def main() -> None:
             "serial_scores": serial_scores,
         },
         "isolation": {
-            "same_length_mutation_unchanged_diffs": multi["isolation"][
-                "same_length_mutation"
-            ]["unchanged_item_abs_diffs"],
-            "same_length_mutation_max_abs_diff": multi["isolation"][
-                "same_length_mutation"
-            ]["max_abs_diff_unchanged"],
+            "same_length_mutation_unchanged_diffs": multi["isolation"]["same_length_mutation"][
+                "unchanged_item_abs_diffs"
+            ],
+            "same_length_mutation_max_abs_diff": multi["isolation"]["same_length_mutation"][
+                "max_abs_diff_unchanged"
+            ],
             "changed_length_mutation_unchanged_diffs": multi["isolation"][
                 "changed_length_mutation"
             ]["unchanged_item_abs_diffs"],
-            "changed_length_mutation_max_abs_diff": multi["isolation"][
-                "changed_length_mutation"
-            ]["max_abs_diff_unchanged"],
+            "changed_length_mutation_max_abs_diff": multi["isolation"]["changed_length_mutation"][
+                "max_abs_diff_unchanged"
+            ],
         },
         "performance": perf,
     }
     serial_plus_delim_scores = serial.get("semantic_alignment", {}).get(
         "base_scores_query_plus_delimiter"
     )
-    if serial_plus_delim_scores is not None and len(serial_plus_delim_scores) == len(
-        multi_scores
-    ):
+    if serial_plus_delim_scores is not None and len(serial_plus_delim_scores) == len(multi_scores):
         aligned_diffs = [
-            max_abs_diff(m, s)
-            for m, s in zip(multi_scores, serial_plus_delim_scores, strict=True)
+            max_abs_diff(m, s) for m, s in zip(multi_scores, serial_plus_delim_scores, strict=True)
         ]
         multi_vs_serial["equivalence_query_plus_delimiter"] = {
             "abs_diffs_multi_vs_serial_query_plus_delimiter": aligned_diffs,
             "max_abs_diff": max(aligned_diffs) if aligned_diffs else 0.0,
-            "mean_abs_diff": (
-                sum(aligned_diffs) / len(aligned_diffs) if aligned_diffs else 0.0
-            ),
+            "mean_abs_diff": (sum(aligned_diffs) / len(aligned_diffs) if aligned_diffs else 0.0),
             "serial_query_plus_delimiter_scores": serial_plus_delim_scores,
         }
     save_json(args.output_multi_vs_serial_json, multi_vs_serial)
@@ -166,16 +161,13 @@ def main() -> None:
         label_token_ids=labels,
     )
     abs_multi_vs_torch_multi_semantic = [
-        max_abs_diff(a, b)
-        for a, b in zip(multi_scores, torch_multi_semantic_scores, strict=True)
+        max_abs_diff(a, b) for a, b in zip(multi_scores, torch_multi_semantic_scores, strict=True)
     ]
     abs_multi_vs_torch_serial = [
-        max_abs_diff(a, b)
-        for a, b in zip(multi_scores, torch_serial_scores, strict=True)
+        max_abs_diff(a, b) for a, b in zip(multi_scores, torch_serial_scores, strict=True)
     ]
     abs_serial_vs_torch_serial = [
-        max_abs_diff(a, b)
-        for a, b in zip(serial_scores, torch_serial_scores, strict=True)
+        max_abs_diff(a, b) for a, b in zip(serial_scores, torch_serial_scores, strict=True)
     ]
     parity = {
         "model": multi["model"],
@@ -194,9 +186,7 @@ def main() -> None:
             max(abs_multi_vs_torch_serial) if abs_multi_vs_torch_serial else 0.0
         ),
         "max_abs_diff_jax_multi_vs_torch_multi_semantic": (
-            max(abs_multi_vs_torch_multi_semantic)
-            if abs_multi_vs_torch_multi_semantic
-            else 0.0
+            max(abs_multi_vs_torch_multi_semantic) if abs_multi_vs_torch_multi_semantic else 0.0
         ),
         "max_abs_diff_jax_serial_vs_torch_serial": (
             max(abs_serial_vs_torch_serial) if abs_serial_vs_torch_serial else 0.0

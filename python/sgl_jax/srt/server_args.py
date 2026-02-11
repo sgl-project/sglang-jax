@@ -233,9 +233,9 @@ class ServerArgs:
             self.chunked_prefill_size = 4096
 
         # GGUF
-        if (
-            self.load_format == "auto" or self.load_format == "gguf"
-        ) and check_gguf_file(self.model_path):
+        if (self.load_format == "auto" or self.load_format == "gguf") and check_gguf_file(
+            self.model_path
+        ):
             self.quantization = self.load_format = "gguf"
 
         if is_remote_url(self.model_path):
@@ -262,10 +262,7 @@ class ServerArgs:
             self.grammar_backend = "llguidance"
 
         # Normalize speculative_algorithm: treat empty string as None
-        if (
-            isinstance(self.speculative_algorithm, str)
-            and self.speculative_algorithm.strip() == ""
-        ):
+        if isinstance(self.speculative_algorithm, str) and self.speculative_algorithm.strip() == "":
             self.speculative_algorithm = None
 
         os.environ["SGLANG_ENABLE_DETERMINISTIC_SAMPLING"] = (
@@ -273,9 +270,7 @@ class ServerArgs:
         )
 
         if self.nnodes > 1 and self.device_indexes is not None:
-            logger.warning(
-                "In a multi-machine scenario, device_indexes will be set to None."
-            )
+            logger.warning("In a multi-machine scenario, device_indexes will be set to None.")
             self.device_indexes = None
         if self.multimodal:
             self.model_path = download_from_hf(self.model_path, allow_patterns=None)
@@ -1103,9 +1098,7 @@ class ServerArgs:
         return hf_config
 
     def check_server_args(self):
-        assert (
-            self.tp_size
-        ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+        assert (self.tp_size) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
@@ -1142,15 +1135,11 @@ class ServerArgs:
                 "Multi-item scoring requires flashattention backend. "
                 "Please set --attention-backend fa when using --multi-item-scoring-delimiter."
             )
-            assert (
-                self.max_multi_item_seq_len > 0
-            ), "--max-multi-item-seq-len must be positive"
+            assert self.max_multi_item_seq_len > 0, "--max-multi-item-seq-len must be positive"
             assert (
                 self.multi_item_scoring_chunk_size >= 0
             ), "--multi-item-scoring-chunk-size must be non-negative"
-            assert (
-                self.max_multi_item_count > 0
-            ), "--max-multi-item-count must be positive"
+            assert self.max_multi_item_count > 0, "--max-multi-item-count must be positive"
 
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""
@@ -1237,9 +1226,7 @@ class ServerArgs:
 
                                     name = os.path.basename(item.rstrip("/"))
                                     normalized_lora_refs.append(
-                                        LoRARef(
-                                            lora_name=name, lora_path=item, pinned=True
-                                        )
+                                        LoRARef(lora_name=name, lora_path=item, pinned=True)
                                     )
                             elif isinstance(item, dict):
                                 # Dict format in list: {"name": "adapter1", "path": "/path/to/adapter"}
@@ -1247,17 +1234,13 @@ class ServerArgs:
                                 path = item.get("path") or item.get("lora_path")
                                 pinned = item.get("pinned", True)
                                 normalized_lora_refs.append(
-                                    LoRARef(
-                                        lora_name=name, lora_path=path, pinned=pinned
-                                    )
+                                    LoRARef(lora_name=name, lora_path=path, pinned=pinned)
                                 )
                             elif hasattr(item, "lora_name"):
                                 # Already a LoRARef object
                                 normalized_lora_refs.append(item)
                             else:
-                                raise ValueError(
-                                    f"Unsupported lora_paths item format: {item}"
-                                )
+                                raise ValueError(f"Unsupported lora_paths item format: {item}")
 
                     self.lora_paths = normalized_lora_refs
 
@@ -1316,13 +1299,9 @@ class PortArgs:
             rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             pub_sub_addr=(
-                f"tcp://{dist_init_host}:{port_base + 4}"
-                if server_args.nnodes > 1
-                else None
+                f"tcp://{dist_init_host}:{port_base + 4}" if server_args.nnodes > 1 else None
             ),
             pub_sub_sync_addr=(
-                f"tcp://{dist_init_host}:{port_base + 5}"
-                if server_args.nnodes > 1
-                else None
+                f"tcp://{dist_init_host}:{port_base + 5}" if server_args.nnodes > 1 else None
             ),
         )

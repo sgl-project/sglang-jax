@@ -29,9 +29,7 @@ class _FakeTokenizerManager:
 
         # Emit one logprob row per delimiter. score_request skips the first row
         # and uses one row per item, so this shape matches runtime expectations.
-        fake_logprobs = [
-            [(0.0, 1, None), (0.0, 2, None)] for _ in range(num_delimiters)
-        ]
+        fake_logprobs = [[(0.0, 1, None), (0.0, 2, None)] for _ in range(num_delimiters)]
         yield [{"meta_info": {"input_token_ids_logprobs": fake_logprobs, "id": "fake"}}]
 
 
