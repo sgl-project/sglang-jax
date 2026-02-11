@@ -462,12 +462,28 @@ class ModelConfig:
         total_kv_heads = kv_heads_per_device * tensor_parallel_size
         self.num_key_value_heads = total_kv_heads
 
-        # Only set HF config if the attribute exists, otherwise create it
-        if hasattr(self.hf_text_config, "num_key_value_heads"):
-            self.hf_text_config.num_key_value_heads = total_kv_heads
-        else:
-            # For MHA models, dynamically add the attribute
-            self.hf_text_config.num_key_value_heads = total_kv_heads
+        # Update all possible attribute names for KV heads in hf_text_config
+        # This ensures that models checking different attributes (e.g., num_kv_heads vs num_key_value_heads)
+        # see the updated, replicated value.
+        attributes_to_update = [
+            "num_key_value_heads",
+            "num_kv_heads",
+            "n_head_kv",
+            "multi_query_group_num",
+        ]
+        
+        # Always update/set the primary attribute
+        self.hf_text_config.num_key_value_heads = total_kv_heads
+        
+        # Update other attributes if they exist
+        for attr in attributes_to_update:
+            if attr != "num_key_value_heads" and hasattr(self.hf_text_config, attr):
+                 setattr(self.hf_text_config, attr, total_kv_heads)
+
+        # Handle swa_num_key_value_heads if present (e.g. MiMo models)
+        if hasattr(self.hf_text_config, "swa_num_key_value_heads"):
+            if tensor_parallel_size > self.hf_text_config.swa_num_key_value_heads:
+                self.hf_text_config.swa_num_key_value_heads = tensor_parallel_size
 
     def get_original_kv_head_id(self, tp_rank: int, tensor_parallel_size: int) -> int:
         """Determine which original KV head this device should use."""
