@@ -113,56 +113,98 @@ class AudioBackboneScheduler:
     def run_backbone_batch(self, batch: list[Req]):
         """Run the backbone forward pass for a batch of requests.
 
+        Internal loop generates all tokens until EOS, avoiding cross-process overhead.
+        Only sends result once when generation is complete.
+
+        Steps per iteration:
         1. Forward through main transformer to get text logits and local hidden states.
         2. Sample text token from model output.
         3. If model outputs <|empty|>, generate audio tokens via patch decoder.
         4. Check if generation is finished (hit EOS token).
+        5. If not finished, build next step input and continue loop.
         """
         for req in batch:
             sampler_config = self._get_sampler_config(req)
+            accumulated_tokens = []
+            max_new_tokens = getattr(req, "max_new_tokens", 256)
+            step_count = 0
 
             if getattr(req, "is_prefill", True):
                 self.backbone_worker.reset_cache_state(req.rid)
 
-            # Forward through main transformer
-            (text_logits_output, local_hidden_states, _), _ = self.backbone_worker.forward(req)
+            logger.info("Starting generation loop for rid=%s, max_tokens=%d", req.rid, max_new_tokens)
 
-            # Extract logits and sample text token
-            next_token_logits = text_logits_output.next_token_logits
-            logits_np = np.array(jax.device_get(next_token_logits))
+            # Internal loop: generate tokens until EOS or max_tokens
+            while step_count < max_new_tokens:
+                # Forward through main transformer
+                (text_logits_output, local_hidden_states, _), _ = self.backbone_worker.forward(req)
 
-            if logits_np.ndim == 3:
-                logits_np = logits_np[:, -1, :]
+                # Extract logits and sample text token
+                next_token_logits = text_logits_output.next_token_logits
+                logits_np = np.array(jax.device_get(next_token_logits))
 
-            if sampler_config.do_sample:
-                logits = logits_np / max(sampler_config.temperature, 1e-5)
-                logits = logits - np.max(logits, axis=-1, keepdims=True)
-                probs = np.exp(logits)
-                probs /= np.sum(probs, axis=-1, keepdims=True)
-                text_token_id = int(np.random.choice(probs.shape[-1], p=probs[0]))
-            else:
-                text_token_id = int(np.argmax(logits_np, axis=-1)[0])
+                if logits_np.ndim == 3:
+                    logits_np = logits_np[:, -1, :]
 
-            req.generated_text_tokens = np.array([text_token_id], dtype=np.int32)
+                if sampler_config.do_sample:
+                    logits = logits_np / max(sampler_config.temperature, 1e-5)
+                    logits = logits - np.max(logits, axis=-1, keepdims=True)
+                    probs = np.exp(logits)
+                    probs /= np.sum(probs, axis=-1, keepdims=True)
+                    text_token_id = int(np.random.choice(probs.shape[-1], p=probs[0]))
+                else:
+                    text_token_id = int(np.argmax(logits_np, axis=-1)[0])
 
-            # Generate audio tokens if model outputs <|empty|>
-            if text_token_id == MIMO_EMPTY_IDX:
-                self.rng_key, subkey = jax.random.split(self.rng_key)
-                audio_tokens, _ = self.backbone_worker.patch_decode(
-                    local_hidden_states, subkey, sampler_config
-                )
-                req.generated_audio_tokens = jax.device_get(audio_tokens)
-            else:
-                req.generated_audio_tokens = None
+                # Accumulate generated token
+                accumulated_tokens.append(text_token_id)
+                logger.debug("Step %d: generated token %d", step_count, text_token_id)
 
-            req.is_finished = text_token_id in MIMO_EOS_TOKENS
-            req.is_prefill = False
+                # Generate audio tokens if model outputs <|empty|>
+                if text_token_id == MIMO_EMPTY_IDX:
+                    self.rng_key, subkey = jax.random.split(self.rng_key)
+                    audio_tokens, _ = self.backbone_worker.patch_decode(
+                        local_hidden_states, subkey, sampler_config
+                    )
+                    req.generated_audio_tokens = jax.device_get(audio_tokens)
+                else:
+                    req.generated_audio_tokens = None
+
+                # Check if generation is finished
+                if text_token_id in MIMO_EOS_TOKENS:
+                    logger.info("Generation finished for rid=%s at step %d (EOS)", req.rid, step_count)
+                    req.is_finished = True
+                    break
+
+                # Build next step input for autoregressive generation
+                req.generated_text_tokens = np.array([text_token_id], dtype=np.int32)
+                try:
+                    req.input_ids = req.build_next_step_input()
+                    req.is_prefill = False
+                    step_count += 1
+                except Exception as e:
+                    logger.error("Failed to build next step input for rid=%s: %s", req.rid, e)
+                    req.is_finished = True
+                    break
+
+            # Set accumulated tokens on request
+            req.generated_text_tokens = np.array(accumulated_tokens, dtype=np.int32)
+
+            # Mark as finished if hit max tokens
+            if step_count >= max_new_tokens:
+                logger.warning("Generation hit max_tokens=%d for rid=%s", max_new_tokens, req.rid)
+                req.is_finished = True
 
             # Clear inputs to free memory
             req.input_ids = None
             req.audio_codes = None
             req.backbone_cache = None
 
+            logger.info(
+                "Completed generation for rid=%s: %d tokens, finished=%s",
+                req.rid, len(accumulated_tokens), req.is_finished
+            )
+
+            # Send result once (instead of per-token)
             self._comm_backend.send_pyobj(req)
 
     def _get_sampler_config(self, req: Req) -> MiMoSamplerConfig:
