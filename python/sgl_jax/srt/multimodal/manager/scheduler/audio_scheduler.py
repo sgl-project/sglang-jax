@@ -38,7 +38,7 @@ class AudioScheduler:
     def event_loop_normal(self):
         while True:
             reqs = self._comm_backend.recv_requests()
-            if len(reqs) > 0:
+            if reqs is not None and len(reqs) > 0:
                 valid_reqs = []
                 for req in reqs:
                     if isinstance(req, AbortReq):
@@ -54,6 +54,8 @@ class AudioScheduler:
 
                 if valid_reqs:
                     self.run_audio_batch(valid_reqs)
+            else:
+                self._comm_backend.wait_for_new_requests(0.001)
 
     def preprocess(self, req: Req):
         sharding = NamedSharding(self.mesh, PartitionSpec())
