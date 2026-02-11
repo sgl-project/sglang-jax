@@ -9,7 +9,7 @@ from http import HTTPStatus
 
 import requests
 import uvicorn
-from fastapi import File, Form, Request, UploadFile
+from fastapi import Depends, File, Form, Request, UploadFile
 from fastapi.responses import ORJSONResponse, Response
 
 from sgl_jax.srt.entrypoints.http_server import _GlobalState, app, set_global_state
@@ -225,8 +225,7 @@ async def create_speech(obj: AudioSpeechRequest, request: Request):
         return _create_error_response(e)
 
 
-@app.post("/v1/audio/transcriptions")
-async def create_transcription(
+async def parse_transcription_request(
     request: Request,
     file: UploadFile | None = File(None),
     url: str | None = Form(None),
@@ -235,8 +234,63 @@ async def create_transcription(
     prompt: str | None = Form(None),
     response_format: str = Form("json"),
     temperature: float | None = Form(None),
-    timestamp_granularities: str | None = Form(None),  # JSON string
+    timestamp_granularities: str | None = Form(None),
+    chunking_strategy: str | None = Form(None),
+    known_speaker_names: str | None = Form(None),
+    known_speaker_references: str | None = Form(None),
+    include: str | None = Form(None),
     stream: bool = Form(False),
+) -> AudioTranscriptionRequest:
+    """Parse multipart/form-data and wrap into AudioTranscriptionRequest."""
+    import json
+
+    # Validate input
+    if file is None and url is None:
+        raise ValueError("Either 'file' or 'url' parameter is required")
+    if file is not None and url is not None:
+        raise ValueError("Cannot provide both 'file' and 'url' parameters")
+
+    # Load audio bytes
+    audio_bytes = None
+    if file is not None:
+        audio_bytes = await file.read()
+    elif url is not None:
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, timeout=30.0)
+                response.raise_for_status()
+                audio_bytes = response.content
+        except httpx.HTTPError as e:
+            raise ValueError(f"Failed to download audio from URL: {e}") from e
+
+    # Parse JSON string parameters
+    granularities = json.loads(timestamp_granularities) if timestamp_granularities else None
+    chunking = json.loads(chunking_strategy) if chunking_strategy else None
+    speaker_names = json.loads(known_speaker_names) if known_speaker_names else None
+    speaker_refs = json.loads(known_speaker_references) if known_speaker_references else None
+    include_list = json.loads(include) if include else None
+
+    return AudioTranscriptionRequest(
+        file=audio_bytes,
+        url=url,
+        model=model,
+        language=language,
+        prompt=prompt,
+        response_format=response_format,
+        temperature=temperature,
+        timestamp_granularities=granularities,
+        chunking_strategy=chunking,
+        known_speaker_names=speaker_names,
+        known_speaker_references=speaker_refs,
+        include=include_list,
+        stream=stream,
+    )
+
+
+@app.post("/v1/audio/transcriptions")
+async def create_transcription(
+    request: Request,
+    obj: AudioTranscriptionRequest = Depends(parse_transcription_request),
 ):
     """OpenAI-compatible Speech-to-Text (transcription) endpoint.
 
@@ -247,57 +301,19 @@ async def create_transcription(
     try:
         from sgl_jax.srt.entrypoints.http_server import _global_state
 
-        # 验证输入：file 和 url 必须提供其中之一
-        if file is None and url is None:
-            raise ValueError("Either 'file' or 'url' parameter is required")
-        if file is not None and url is not None:
-            raise ValueError("Cannot provide both 'file' and 'url' parameters")
-
-        audio_bytes = None
-        if file is not None:
-            # 文件上传方式
-            audio_bytes = await file.read()
-        elif url is not None:
-            # URL 下载方式
-            async with httpx.AsyncClient() as client:
-                response = await client.get(url, timeout=30.0)
-                response.raise_for_status()
-                audio_bytes = response.content
-
-        # 解析 timestamp_granularities（如果是 JSON string）
-        granularities = None
-        if timestamp_granularities:
-            import json
-            granularities = json.loads(timestamp_granularities)
-
-        obj = AudioTranscriptionRequest(
-            file=audio_bytes,
-            url=url,  # 保留 URL 用于日志
-            model=model,
-            language=language,
-            prompt=prompt,
-            response_format=response_format,
-            temperature=temperature,
-            timestamp_granularities=granularities,
-            stream=stream,
-        )
-
         result = await _global_state.tokenizer_manager.create_transcription(obj, request)
 
-        # 根据 response_format 返回不同格式
-        if response_format == "text":
+        # Return different formats based on response_format
+        if obj.response_format == "text":
             return Response(content=result, media_type="text/plain")
-        elif response_format in ("srt", "vtt"):
+        elif obj.response_format in ("srt", "vtt"):
             return Response(content=result, media_type="text/plain")
         else:  # json, verbose_json, diarized_json
-            return result  # FastAPI 自动序列化为 JSON
+            return result
 
     except ValueError as e:
         logger.error("[http_server] create_transcription error: %s", e)
         return _create_error_response(e)
-    except httpx.HTTPError as e:
-        logger.error("[http_server] Failed to download audio from URL: %s", e)
-        return _create_error_response(ValueError(f"Failed to download audio: {e}"))
 
 
 @app.api_route("/api/v1/chat/completions", methods=["POST"])
