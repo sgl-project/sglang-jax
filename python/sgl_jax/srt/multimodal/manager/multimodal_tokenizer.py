@@ -53,6 +53,44 @@ from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
+class MiMoAudioProcessor:
+    """Custom processor for MiMo Audio models."""
+
+    def __init__(self):
+        from transformers.audio_utils import mel_filter_bank, window_function
+
+        sample_rate = 24000
+        n_fft = 960
+        hop_length = 240
+        win_length = 960
+        f_min = 0
+        f_max = 12000
+        n_mels = 128
+
+        self.sampling_rate = sample_rate
+        self.mel_filters = mel_filter_bank(
+            num_frequency_bins=n_fft // 2 + 1,
+            num_mel_filters=n_mels,
+            min_frequency=f_min,
+            max_frequency=f_max,
+            sampling_rate=sample_rate,
+            norm=None,
+            mel_scale="htk",
+        )
+        self.window = window_function(win_length, "hann")
+        self.mel_params = {
+            "sample_rate": sample_rate,
+            "n_fft": n_fft,
+            "hop_length": hop_length,
+            "win_length": win_length,
+        }
+
+        logger.info(
+            "Initialized MiMoAudioProcessor: sr=%d, n_fft=%d, hop=%d, n_mels=%d",
+            sample_rate, n_fft, hop_length, n_mels
+        )
+
+
 @dataclasses.dataclass
 class MMReqState(ReqState):
     """Store the state of a multimodal request."""
@@ -82,37 +120,45 @@ class MultimodalTokenizer(TokenizerManager):
         super().__init__(server_args, port_args)
         self.mm_processor = None
         self.mm_config = None
-        processor_candidates = [server_args.model_path]
-        model_basename = os.path.basename(server_args.model_path.rstrip("/"))
-        if model_basename in {
-            "text_encoder",
-            "vision_encoder",
-            "language_model",
-            "transformer",
-            "vae",
-            "tokenizer",
-        }:
-            processor_candidates.append(os.path.dirname(server_args.model_path.rstrip("/")))
-        trust_remote_code = server_args.trust_remote_code or server_args.multimodal
-        for candidate in processor_candidates:
-            try:
-                self.mm_processor = AutoProcessor.from_pretrained(
-                    candidate,
-                    trust_remote_code=trust_remote_code,
-                )
-                self.mm_config = AutoConfig.from_pretrained(
-                    candidate,
-                    trust_remote_code=trust_remote_code,
-                )
-                break
-            except Exception as exc:
-                logger.warning("Failed to load processor/config from %s: %s", candidate, exc)
-        self.wait_timeout = int(os.environ.get("SGLANG_WAIT_TIMEOUT", "600"))
 
-        # Initialize audio processor (WhisperFeatureExtractor) for audio models
-        self.audio_processor = None
-        self.audio_config = {}
-        self._init_audio_processor(server_args.model_path)
+        # since mimo-audio does not specify preprocessor, manual implementation is required to align
+        # it with the official implementation
+        model_path = server_args.model_path
+        is_mimo_audio = "mimo" in model_path.lower() and "audio" in model_path.lower()
+
+        if is_mimo_audio:
+            # Use custom MiMoAudioProcessor
+            self.mm_processor = MiMoAudioProcessor()
+            logger.info("Loaded MiMoAudioProcessor for model: %s", model_path)
+        else:
+            # Try to load standard AutoProcessor for vision/multimodal models
+            processor_candidates = [model_path]
+            model_basename = os.path.basename(model_path.rstrip("/"))
+            if model_basename in {
+                "text_encoder",
+                "vision_encoder",
+                "language_model",
+                "transformer",
+                "vae",
+                "tokenizer",
+            }:
+                processor_candidates.append(os.path.dirname(model_path.rstrip("/")))
+            trust_remote_code = server_args.trust_remote_code or server_args.multimodal
+            for candidate in processor_candidates:
+                try:
+                    self.mm_processor = AutoProcessor.from_pretrained(
+                        candidate,
+                        trust_remote_code=trust_remote_code,
+                    )
+                    self.mm_config = AutoConfig.from_pretrained(
+                        candidate,
+                        trust_remote_code=trust_remote_code,
+                    )
+                    break
+                except Exception as exc:
+                    logger.warning("Failed to load processor/config from %s: %s", candidate, exc)
+
+        self.wait_timeout = int(os.environ.get("SGLANG_WAIT_TIMEOUT", "600"))
 
         # Initialize multimodal prompt builder for audio tasks
         self.prompt_builder = MultimodalPromptBuilder(tokenizer=self.tokenizer)
@@ -136,74 +182,6 @@ class MultimodalTokenizer(TokenizerManager):
         )
 
 
-    def _init_audio_processor(self, model_path: str):
-        """Initialize audio processor for audio models using transformers audio_utils.
-
-        This loads the audio config and initializes mel filter bank and window function
-        that match the official MiMo Audio implementation (power=1.0, log_mel="log").
-        """
-        import json
-        import os
-
-        # Special case: for mimo-audio models, directly use default config
-        if "mimo" in model_path.lower() and "audio" in model_path.lower():
-            logger.info("Detected MiMo Audio model, using default mel processor configuration")
-            self._init_default_mel_processor()
-            return
-
-    def _init_default_mel_processor(self):
-        """Initialize mel processor with default MiMo Audio parameters.
-
-        Uses the official MiMo Audio parameters:
-        - sample_rate: 24000
-        - n_fft: 960
-        - hop_length: 240
-        - win_length: 960
-        - f_min: 0
-        - f_max: 12000 (Nyquist)
-        - n_mels: 128
-        """
-        from transformers.audio_utils import mel_filter_bank, window_function
-
-        # Default MiMo Audio parameters
-        sample_rate = 24000
-        n_fft = 960
-        hop_length = 240
-        win_length = 960
-        f_min = 0
-        f_max = 12000  # Nyquist frequency
-        n_mels = 128
-
-        # Create mel filter bank
-        # Use HTK mel scale and no norm to match torchaudio defaults
-        self.mel_filters = mel_filter_bank(
-            num_frequency_bins=n_fft // 2 + 1,
-            num_mel_filters=n_mels,
-            min_frequency=f_min,
-            max_frequency=f_max,
-            sampling_rate=sample_rate,
-            norm=None,  # Match torchaudio default (no area normalization)
-            mel_scale="htk",  # Match torchaudio default
-        )
-
-        # Create window function
-        self.window = window_function(win_length, "hann")
-
-        # Store parameters for spectrogram computation
-        self.mel_params = {
-            "sample_rate": sample_rate,
-            "n_fft": n_fft,
-            "hop_length": hop_length,
-            "win_length": win_length,
-        }
-
-        # Store sampling rate for resampling
-        self.audio_processor = type('AudioProcessor', (), {'sampling_rate': sample_rate})()
-        logger.warning(
-            "Initialized transformers audio_utils with defaults: sr=%d, n_fft=%d, hop=%d, n_mels=%d",
-            sample_rate, n_fft, hop_length, n_mels
-        )
-
     def _preprocess_audio_to_mel(self, audio_array: np.ndarray, input_sr: int = None) -> tuple:
         """Convert raw audio waveform to mel spectrogram using transformers audio_utils.
 
@@ -222,15 +200,15 @@ class MultimodalTokenizer(TokenizerManager):
         """
         from transformers.audio_utils import spectrogram
 
-        if not hasattr(self, 'mel_filters') or self.mel_filters is None:
-            raise ValueError("Mel filter bank not initialized. Cannot preprocess audio.")
+        if not isinstance(self.mm_processor, MiMoAudioProcessor):
+            raise ValueError("mm_processor is not MiMoAudioProcessor. Cannot preprocess audio.")
 
         # Ensure 1D array
         if audio_array.ndim == 2:
             audio_array = audio_array.squeeze(0)
 
         # Resample if input sample rate differs from target rate
-        target_sr = self.audio_processor.sampling_rate
+        target_sr = self.mm_processor.sampling_rate
         if input_sr is not None and input_sr != target_sr:
             audio_array = self._resample_audio(audio_array, input_sr, target_sr)
 
@@ -238,13 +216,13 @@ class MultimodalTokenizer(TokenizerManager):
         # spectrogram() returns [n_mels, time] with log_mel applied
         mels = spectrogram(
             waveform=audio_array,
-            window=self.window,
-            frame_length=self.mel_params["n_fft"],
-            hop_length=self.mel_params["hop_length"],
-            fft_length=self.mel_params["n_fft"],
+            window=self.mm_processor.window,
+            frame_length=self.mm_processor.mel_params["n_fft"],
+            hop_length=self.mm_processor.mel_params["hop_length"],
+            fft_length=self.mm_processor.mel_params["n_fft"],
             power=1.0,  # Amplitude spectrogram (matches official MiMo)
             center=True,
-            mel_filters=self.mel_filters,
+            mel_filters=self.mm_processor.mel_filters,
             log_mel="log",  # Natural logarithm (matches official torch.log)
             mel_floor=1e-7,  # Matches official torch.clip(spec, min=1e-7)
         )
