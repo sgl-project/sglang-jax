@@ -258,21 +258,16 @@ class TestMultiItemScorePerformance(CustomTestCase):
         )
         self._report_result(result)
 
-        def test_benchmark_multi_item_chunk_scaling(self):
+    def test_benchmark_multi_item_chunk_scaling(self):
+        """
+        Test multi-item performance across different chunk sizes.
+        """
+        chunk_sizes = [32, 64, 128]
+        results = []
 
-            """
-
-            Test multi-item performance across different chunk sizes.
-
-            """
-
-            chunk_sizes = [32, 64, 128]
-
-            results = []
-
-            
-
-            print(f"\n[Benchmark] Starting Multi-Item Chunk Scaling (Items={self.NUM_CANDIDATES}, Prompt={self.PROMPT_LEN})")
+        print(
+            f"\n[Benchmark] Starting Multi-Item Chunk Scaling (Items={self.NUM_CANDIDATES}, Prompt={self.PROMPT_LEN})"
+        )
 
         query_tokens = [1] * (self.STATIC_PREFIX_LEN + self.DYNAMIC_SUFFIX_LEN)
         candidate_tokens_list = [[2] * self.CANDIDATE_LEN for _ in range(self.NUM_CANDIDATES)]
