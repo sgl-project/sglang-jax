@@ -153,7 +153,7 @@ class AudioBackboneScheduler:
             self._cache_locations[rid] = all_cache_loc
             self._total_seq_lens[rid] = actual_T_groups
 
-            out_cache_loc = all_cache_loc[:T_groups]
+            out_cache_loc = all_cache_loc[:actual_T_groups]
             current_seq_len = actual_T_groups
 
             positions = jnp.arange(T_groups, dtype=jnp.int32)
