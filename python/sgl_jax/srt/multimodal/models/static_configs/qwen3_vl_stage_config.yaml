@@ -1,0 +1,27 @@
+model_arch: Qwen3-VL
+stage_args:
+ - stage_id: 0
+   stage_sub_dir: ""
+   runtime:
+     num_tpus: 1
+     max_batch_size: 1
+   scheduler: vit
+   final_output: false
+   scheduler_params: {}
+   model_class: Qwen3_VL_VisionModel
+
+ - stage_id: 1
+   stage_sub_dir: ""
+   runtime:
+     num_tpus: 1
+     max_batch_size: 1
+   scheduler: auto_regressive
+   scheduler_params: {}
+   model_class: Qwen3_VL_Generation
+   final_output: true
+
+# stage0: ViT
+      #  - Call encode_vision() to get vision embeddings
+      #  - Call get_input_embeddings() to merge vision + text embeddings
+
+# Stage 1: prefill and decode

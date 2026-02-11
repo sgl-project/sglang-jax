@@ -1,0 +1,24 @@
+model_arch: Qwen3-VL
+stage_args:
+ - stage_id: 0
+   stage_sub_dir: ""
+   runtime:
+     num_tpus: 1
+     max_batch_size: 1
+   scheduler: vit
+   final_output: false
+   scheduler_params: {}
+   model_class: Qwen3_VL_VisionModel
+
+ - stage_id: 1
+   stage_sub_dir: ""
+   runtime:
+     num_tpus: 4
+     max_batch_size: 1
+   scheduler: auto_regressive
+   scheduler_params: {}
+   model_class: Qwen3_VL_Generation
+   final_output: true
+
+# stage0: ViT (single device)
+# Stage 1: prefill and decode (TP=4 for larger models like 8B/32B)

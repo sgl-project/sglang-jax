@@ -421,10 +421,11 @@ def _execute_multimodal_server_warmup(
 
     # Send a warmup request
     # For Wan models, send an image generation request
-    if "Qwen2.5-VL" in server_args.model_path:
+    if "Qwen3-VL" in server_args.model_path or "Qwen2.5-VL" in server_args.model_path:
+        model_name = "Qwen/Qwen3-VL" if "Qwen3-VL" in server_args.model_path else "Qwen/Qwen2.5-VL"
         request_endpoint = "/v1/chat/completions"
         json_data = {
-            "model": "Qwen/Qwen2.5-VL",
+            "model": model_name,
             "messages": [
                 {
                     "role": "user",
