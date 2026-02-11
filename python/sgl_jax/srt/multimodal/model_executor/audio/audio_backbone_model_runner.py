@@ -91,17 +91,13 @@ class AudioBackboneModelRunner(BaseModelRunner):
                 if key in ("speech_vocab_sizes", "speech_empty_ids"):
                     if isinstance(value, str):
                         import ast
-                        value = tuple(ast.literal_eval(value))
-                    elif isinstance(value, list):
-                        value = tuple(value)
+                        value = list(ast.literal_eval(value))
                 elif key == "delay_pattern":
                     if isinstance(value, str) and "-" in value:
-                        value = tuple(int(x) for x in value.split("-"))
+                        value = [int(x) for x in value.split("-")]
                     elif isinstance(value, str):
                         import ast
-                        value = tuple(ast.literal_eval(value))
-                    elif isinstance(value, list):
-                        value = tuple(value)
+                        value = list(ast.literal_eval(value))
                 setattr(self.model_config, key, value)
 
         self.model_config.model_path = self.server_args.model_path
