@@ -351,10 +351,11 @@ class MiMoMoeAttention(nnx.Module):
             attention_sink=self.attention_sink_bias,
         )
 
-        # Force Slice to 128 (v_head_dim)
-        attn_output = attn_output.reshape(-1, self.q_head_num, self.head_dim)
-        attn_output = attn_output[..., :128]
-        attn_output = attn_output.reshape(-1, self.q_head_num * 128)
+        # Force Slice to v_head_dim
+        if self.head_dim != self.v_head_dim:
+            attn_output = attn_output.reshape(-1, self.q_head_num, self.head_dim)
+            attn_output = attn_output[..., : self.v_head_dim]
+            attn_output = attn_output.reshape(-1, self.q_head_num * self.v_head_dim)
 
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
