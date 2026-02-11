@@ -1335,6 +1335,7 @@ def main() -> int:
     )
 
     # Match end-to-end epmoe selection logic (BailingMoE uses TopK module).
+    print("compute topk weights/ids")
     topk = TopK(
         topk=args.top_k,
         renormalize=args.renormalize_topk_logits,
@@ -1345,6 +1346,7 @@ def main() -> int:
     with jax.set_mesh(mesh):
         topk_weights, topk_ids = topk(router_logits, router_bias)
 
+    print("generate moe weights")
     moe_weight_dtype = _str_to_dtype(args.moe_weight_dtype)
     if use_static:
         w_dtype = np.asarray(wi_0_np).dtype
@@ -1617,6 +1619,7 @@ def main() -> int:
         call_w2_shared_scale = None
         call_w3_shared_scale = None
 
+    print("run fused_ep_moe")
     fused_out = fused_ep_moe(
         mesh=mesh,
         tokens=tokens,
@@ -1670,6 +1673,7 @@ def main() -> int:
         )
     # EPMoE uses `jax.sharding.reshard` under an ("expert","tensor") abstract mesh and
     # needs a concrete mesh context for device assignment.
+    print("run epmoe")
     with jax.set_mesh(epmoe.moe_mesh):
         ep_out_expert = epmoe(tokens, topk_weights, topk_ids)
         ep_out = ep_out_expert
