@@ -8,6 +8,7 @@ on:
       - "python/sgl_jax/srt/entrypoints/openai/serving_score.py"
       - "python/sgl_jax/srt/managers/tokenizer_manager.py"
       - "test/srt/test_score_*.py"
+      - "test/srt/test_multi_item_*.py"
       - ".github/workflows/tpu-score-api-test.yml"
   pull_request:
     branches:
@@ -16,6 +17,7 @@ on:
       - "python/sgl_jax/srt/entrypoints/openai/serving_score.py"
       - "python/sgl_jax/srt/managers/tokenizer_manager.py"
       - "test/srt/test_score_*.py"
+      - "test/srt/test_multi_item_*.py"
       - ".github/workflows/tpu-score-api-test.yml"
   workflow_dispatch:
 
@@ -39,8 +41,8 @@ jobs:
       - name: Run pre-commit
         run: pre-commit run --all-files --show-diff-on-failure
 
-  # =============================================== scoring =================================================
-  score-api-test-v6e-1:
+  # =============================================== core scoring ============================================
+  score-api-core-test-v6e-1:
     needs: [lint]
     runs-on: arc-runner-v6e-1
     strategy:
@@ -60,7 +62,7 @@ jobs:
           pip install uv
           uv pip install -e "python[all]"
           uv pip install pytest
-          uv pip install torch --index-url https://download.pytorch.org/whl/cpu # Required for HF reference in test_score_api.py
+          uv pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Run Score API Core Tests
         timeout-minutes: 20
@@ -75,8 +77,31 @@ jobs:
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite score-api-core-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
+  # =============================================== multi-item scoring ======================================
+  multi-item-scoring-test-v6e-1:
+    needs: [lint]
+    runs-on: arc-runner-v6e-1
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Environment
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          uv pip install pytest
+          uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+
       - name: Run Multi-Item Scoring Tests
-        timeout-minutes: 30
+        timeout-minutes: 45
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
@@ -90,7 +115,7 @@ jobs:
 
   # =============================================== unit tests ==============================================
   unit-test-v6e-1:
-    needs: [score-api-test-v6e-1] # Serial execution as requested
+    needs: [lint]
     runs-on: arc-runner-v6e-1
     strategy:
       fail-fast: false
