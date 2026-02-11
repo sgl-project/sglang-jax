@@ -194,6 +194,70 @@ class TestMultiItemScorePerformance(CustomTestCase):
         )
         self._report_result(result)
 
+    def test_scenario_1(self):
+        """
+        Scenario 1:
+        - 500 candidate items per request
+        - 20 tokens per candidate
+        - 2000-token static prefix
+        - 20 token dynamic suffix
+        """
+        print("\n[Benchmark] Starting Scenario 1")
+        static_prefix = [1] * 2000
+        dynamic_suffix = [2] * 20
+        query_tokens = static_prefix + dynamic_suffix
+        items = [[3] * 20 for _ in range(500)]
+        
+        # Warmup
+        self.engine.score(query=query_tokens, items=items[:1], label_token_ids=self.label_token_ids)
+        
+        start_time = time.perf_counter()
+        self.engine.score(query=query_tokens, items=items, label_token_ids=self.label_token_ids)
+        total_time = time.perf_counter() - start_time
+        
+        result = BenchmarkResult(
+            name="Scenario 1",
+            total_time_sec=total_time,
+            latency_per_item_ms=(total_time * 1000) / 500,
+            throughput_items_sec=500 / total_time,
+            num_items=500,
+            prompt_len=2020,
+            candidate_len=20,
+        )
+        self._report_result(result)
+
+    def test_scenario_2(self):
+        """
+        Scenario 2:
+        - 500 candidate items per request
+        - 10 tokens per candidate
+        - 1900-token static prefix
+        - 10 token dynamic suffix
+        """
+        print("\n[Benchmark] Starting Scenario 2")
+        static_prefix = [1] * 1900
+        dynamic_suffix = [2] * 10
+        query_tokens = static_prefix + dynamic_suffix
+        items = [[3] * 10 for _ in range(500)]
+        
+        # Warmup
+        self.engine.score(query=query_tokens, items=items[:1], label_token_ids=self.label_token_ids)
+        
+        start_time = time.perf_counter()
+        self.engine.score(query=query_tokens, items=items, label_token_ids=self.label_token_ids)
+        total_time = time.perf_counter() - start_time
+        
+        result = BenchmarkResult(
+            name="Scenario 2",
+            total_time_sec=total_time,
+            latency_per_item_ms=(total_time * 1000) / 500,
+            throughput_items_sec=500 / total_time,
+            num_items=500,
+            prompt_len=1910,
+            candidate_len=10,
+        )
+        self._report_result(result)
+
     def test_benchmark_multi_item_chunk_scaling(self):
         """
         Test multi-item performance across different chunk sizes.
