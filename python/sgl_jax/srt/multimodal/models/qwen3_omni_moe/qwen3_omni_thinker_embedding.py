@@ -391,11 +391,10 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
                 embed_joint = embed_joint.at[video_mask_joint, :].set(vid_embed)
                 visual_embeds_multiscale_joint = visual_embeds_multiscale_joint + (embed_joint,)
             visual_embeds_multiscale = visual_embeds_multiscale_joint
-        elif image_mask is not None:
+        elif pixel_values is not None:
             image_mask = image_mask[..., 0]
             visual_pos_masks = image_mask
-        elif video_mask is not None:
+        elif pixel_values_videos is not None:
             video_mask = video_mask[..., 0]
             visual_pos_masks = video_mask
-
         return input_embeds, visual_embeds_multiscale, visual_pos_masks
