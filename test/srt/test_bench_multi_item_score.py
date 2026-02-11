@@ -207,14 +207,14 @@ class TestMultiItemScorePerformance(CustomTestCase):
         dynamic_suffix = [2] * 20
         query_tokens = static_prefix + dynamic_suffix
         items = [[3] * 20 for _ in range(500)]
-        
+
         # Warmup
         self.engine.score(query=query_tokens, items=items[:1], label_token_ids=self.label_token_ids)
-        
+
         start_time = time.perf_counter()
         self.engine.score(query=query_tokens, items=items, label_token_ids=self.label_token_ids)
         total_time = time.perf_counter() - start_time
-        
+
         result = BenchmarkResult(
             name="Scenario 1",
             total_time_sec=total_time,
@@ -239,14 +239,14 @@ class TestMultiItemScorePerformance(CustomTestCase):
         dynamic_suffix = [2] * 10
         query_tokens = static_prefix + dynamic_suffix
         items = [[3] * 10 for _ in range(500)]
-        
+
         # Warmup
         self.engine.score(query=query_tokens, items=items[:1], label_token_ids=self.label_token_ids)
-        
+
         start_time = time.perf_counter()
         self.engine.score(query=query_tokens, items=items, label_token_ids=self.label_token_ids)
         total_time = time.perf_counter() - start_time
-        
+
         result = BenchmarkResult(
             name="Scenario 2",
             total_time_sec=total_time,
