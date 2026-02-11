@@ -25,7 +25,7 @@ stage_args:
     scheduler: audio_backbone
     scheduler_params: { }
     model_class: MiMoAudioForCausalLM
-    model_path: XiaomiMiMo/MiMo-Audio-7B-Instruct
+#    model_path: XiaomiMiMo/MiMo-Audio-7B-Instruct
     final_output: true
 
   # # Stage 2: Audio Decoder + Vocoder - decode audio tokens to waveform
