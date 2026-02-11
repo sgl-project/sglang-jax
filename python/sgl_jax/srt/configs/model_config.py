@@ -110,8 +110,12 @@ class ModelConfig:
         # After this, quantization_config is always QuantizationConfig or None
         self.quantization_config = self._resolve_quantization_config()
 
-        # Attach unified quantization config to hf_config so models can access it
-        self.hf_config.quantization_config = self.quantization_config
+        # Attach unified quantization config to hf_config so models can access it.
+        # Only set when non-None: HuggingFace's to_dict() calls
+        # self.quantization_config.to_dict() without a None guard, so assigning
+        # None here would crash any repr() on the config (e.g. inside JAX tracing).
+        if self.quantization_config is not None:
+            self.hf_config.quantization_config = self.quantization_config
 
         self.hf_generation_config = get_generation_config(
             config_path,

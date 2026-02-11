@@ -110,7 +110,7 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
         devices = jax.local_devices()
         if empty_cache:
             gc.collect()  # collect garbage to free up memory used by quantization
-            jax.clear_caches()
+            # jax.clear_caches() # Note: remove it due to cache miss occuring in multi engines running in one process. Initializing later engines results in clearing cache for the earlier ones.
         avail_mem = []
         for dev in devices:
             stats = dev.memory_stats()
@@ -125,8 +125,8 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
             dtype=jnp.float32,
         )
     elif device in ("gpu", "cuda"):
-        if empty_cache:
-            jax.clear_caches()
+        # if empty_cache:
+        #    jax.clear_caches() # Note: remove it due to cache miss occuring in multi engines running in one process. Initializing later engines results in clearing cache for the earlier ones.
         devices = [d for d in jax.local_devices() if getattr(d, "platform", None) == "gpu"]
         if not devices:
             raise RuntimeError("No GPU devices found by JAX")
