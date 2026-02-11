@@ -1023,7 +1023,6 @@ class Grok1ForCausalLM(nnx.Module):
             source_expert_pattern="{i}",
             moe_backend=moe_backend,
             expert_concat_axis_map=grok_concat_axis_map,
-            layer_id=layer_idx,
         )
         mappings.update(moe_mappings)
 

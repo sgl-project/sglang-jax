@@ -1099,7 +1099,7 @@ class FusedEPMoE(nnx.Module):
 def create_moe_weights_mapping(
     prefix: str,
     target_prefix: str,
-    num_experts: int,
+    num_experts: int,  # num logical experts
     expert_type_names: tuple[str, str, str] = (
         "gate_proj",
         "up_proj",
@@ -1112,26 +1112,8 @@ def create_moe_weights_mapping(
     moe_path: str = "mlp",
     source_expert_pattern: str = "experts.{i}",
     physical_to_logical_map=None,  # np.ndarray shape (num_physical,) or None
-    layer_id: int | None = None,
 ) -> dict:
     """Generate a unified mapping dictionary for MoE layer expert weights."""
-    if physical_to_logical_map is None and layer_id is not None:
-        try:
-            from sgl_jax.srt.eplb.expert_location import (
-                get_global_expert_location_metadata,
-            )
-        except Exception:
-            get_global_expert_location_metadata = None
-
-        if get_global_expert_location_metadata is not None:
-            metadata = get_global_expert_location_metadata()
-        else:
-            metadata = None
-
-        if metadata is not None and metadata.physical_to_logical_map is not None:
-            physical_to_logical_map = metadata.physical_to_logical_map[layer_id]
-            num_experts = metadata.num_physical_experts
-
     if moe_backend == "epmoe":
         expert_type_map = {
             expert_type_names[0]: "wi_0",
