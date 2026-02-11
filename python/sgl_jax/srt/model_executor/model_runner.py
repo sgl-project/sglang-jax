@@ -341,14 +341,25 @@ class ModelRunner(BaseModelRunner):
 
         if available_kv_cache_bytes <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
-        head_dim_aligned = self.model_config.head_dim
-        if head_dim_aligned % 128 != 0:
-            head_dim_aligned = (self.model_config.head_dim + 127) // 128 * 128
+        
+        # head_dim/v_head_dim handling
+        head_dim = self.model_config.head_dim
+        v_head_dim = getattr(self.model_config, "v_head_dim", head_dim)
+        
+        head_dim_aligned = (head_dim + 127) // 128 * 128
+        v_head_dim_aligned = (v_head_dim + 127) // 128 * 128
+        
+        # If head dims differ, they are stored separately and each aligned to 128
+        if head_dim != v_head_dim:
+             per_token_dim = head_dim_aligned + v_head_dim_aligned
+        else:
+             # Fused case
+             per_token_dim = head_dim_aligned * 2
+             
         cell_size = (
             self.model_config.get_num_kv_heads(self.tp_size)
-            * head_dim_aligned
+            * per_token_dim
             * self.model_config.num_hidden_layers
-            * 2
             * jnp.dtype(self.kv_cache_dtype).itemsize
         )
 
@@ -473,14 +484,18 @@ class ModelRunner(BaseModelRunner):
                 mesh=self.mesh,
             )
         else:
+            head_dim = self.model_config.head_dim
+            v_head_dim = getattr(self.model_config, "v_head_dim", head_dim)
+            
             self.token_to_kv_pool = MHATokenToKVPool(
                 size=self.max_total_num_tokens,
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
-                head_dim=(self.model_config.head_dim + 127) // 128 * 128,
+                head_dim=(head_dim + 127) // 128 * 128 if head_dim != v_head_dim else (head_dim + 127) // 128 * 128,
                 layer_num=self.model_config.num_hidden_layers,
                 mesh=self.mesh,
+                v_head_dim=(v_head_dim + 127) // 128 * 128 if head_dim != v_head_dim else (head_dim + 127) // 128 * 128,
             )
 
         # Create KV pool allocator
@@ -533,9 +548,10 @@ class ModelRunner(BaseModelRunner):
                 self.model_config.head_dim,
                 page_size=self.page_size,
                 mesh=self.mesh,
+                v_head_dim=getattr(self.model_config, "v_head_dim", None),
             )
         else:
-            raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
+            raise ValueError(f"Invalid attention backend: {self.server_args.attention_backend}")
 
     def _forward(
         self,

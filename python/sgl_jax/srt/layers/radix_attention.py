@@ -32,7 +32,7 @@ class RadixAttention(nnx.Module):
         scaling: float,
         num_kv_heads: int,
         layer_id: int,
-        v_head_dim: int = -1,
+        v_head_dim: int | None = None,
         sliding_window_size: int = 0,
         logit_cap: float = 0,
         attn_type: AttentionType = AttentionType.DECODER,
@@ -42,7 +42,7 @@ class RadixAttention(nnx.Module):
         self.kv_head_num = num_kv_heads
         self.head_dim = head_dim
         self.qk_head_dim = head_dim
-        self.v_head_dim = v_head_dim if v_head_dim != -1 else head_dim
+        self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
         self.scaling = scaling
         self.layer_id = layer_id
         self.sliding_window_size = sliding_window_size or None

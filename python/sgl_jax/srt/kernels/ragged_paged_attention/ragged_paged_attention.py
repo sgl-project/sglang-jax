@@ -26,6 +26,9 @@ from sgl_jax.srt.kernels.ragged_paged_attention.util import (
     get_dtype_bitwidth,
     get_dtype_packing,
 )
+from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_split import (
+    _ragged_paged_attention_kernel_split,
+)
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024  # 100MB
@@ -1407,13 +1410,13 @@ def get_kernel_scope_name(bq_size, bkv_p, page_size):
         "num_queries_per_block",
         "vmem_limit_bytes",
     ),
-    donate_argnames=("kv_cache_fused",),
+    donate_argnames=("kv_cache_fused", "k_cache", "v_cache"),
 )
 def ragged_paged_attention(
     queries: jax.Array,  # [padded_num_tokens, actual_num_q_heads, actual_head_dim]
     keys: jax.Array,  # [padded_num_tokens, actual_num_kv_heads, actual_head_dim]
     values: jax.Array,  # [padded_num_tokens, actual_num_kv_heads, actual_head_dim]
-    kv_cache_fused: jax.Array,  # [total_num_pages, page_size, actual_num_kv_heads * 2, actual_head_dim]
+    kv_cache_fused: jax.Array | None,  # [total_num_pages, page_size, actual_num_kv_heads * 2, actual_head_dim]
     kv_lens: jax.Array,  # i32[padded_batch_size]
     page_indices: jax.Array,  # i32[(padded_batch_size * model_context_len + page_size - 1) // page_size]
     cu_q_lens: jax.Array,  # i32[padded_batch_size + 1]
@@ -1421,6 +1424,8 @@ def ragged_paged_attention(
     distribution: jax.Array,  # i32[3]
     custom_mask: jax.Array,  # if causal is True, custom_mask shape is [patten_total_kv_len], else [0]
     *,
+    k_cache: jax.Array | None = None,
+    v_cache: jax.Array | None = None,
     causal: int = 1,  # 1: True, 0: False
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -1438,43 +1443,229 @@ def ragged_paged_attention(
     num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
 ):
-    """Ragged paged attention that supports mixed prefill and decode with fused KV cache.
+    """Ragged paged attention that supports mixed prefill and decode with fused or split KV cache."""
+    
+    if k_cache is not None and v_cache is not None:
+        # Split KV path
+        actual_num_q_heads = queries.shape[1]
+        actual_head_dim = queries.shape[2]
+        actual_num_kv_heads = keys.shape[1]
+        actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
+        
+        # Prepare inputs
+        q_packing = get_dtype_packing(queries.dtype)
+        kv_packing = get_dtype_packing(k_cache.dtype)
+        
+        head_dim = align_to(actual_head_dim, 128)
+        
+        # Prepare Q
+        num_q_heads_per_kv_head = align_to(actual_num_q_heads_per_kv_head, q_packing)
+        q = (
+            jnp.pad(
+                queries.reshape(
+                    queries.shape[0],
+                    actual_num_kv_heads,
+                    actual_num_q_heads_per_kv_head,
+                    actual_head_dim,
+                ),
+                (
+                    (0, 0),
+                    (0, 0),
+                    (0, num_q_heads_per_kv_head - actual_num_q_heads_per_kv_head),
+                    (0, head_dim - actual_head_dim),
+                ),
+                constant_values=0,
+            )
+            .reshape(
+                queries.shape[0],
+                actual_num_kv_heads,
+                num_q_heads_per_kv_head // q_packing,
+                q_packing,
+                head_dim,
+            )
+            .swapaxes(0, 1)
+        )
+        
+        # Prepare separate K and V inputs
+        k, v = prepare_kv(keys, values)
+        
+        # Prepare separate K and V caches
+        k_cache_processed, v_cache_processed = prepare_kv_cache(k_cache, v_cache)
+        
+        page_size = k_cache_processed.shape[1]
+        max_num_tokens = q.shape[0]
+        max_num_seqs = kv_lens.shape[0]
+        num_page_indices = page_indices.shape[0]
+        pages_per_seq = num_page_indices // max_num_seqs
+        
+        if attention_sink is not None:
+            sink = jnp.asarray(attention_sink, dtype=jnp.float32)
+            if sink.ndim == 0:
+                sink = jnp.full((actual_num_q_heads,), sink, dtype=jnp.float32)
+            padded_heads = actual_num_kv_heads * num_q_heads_per_kv_head
+            if sink.shape[0] < padded_heads:
+                sink = jnp.pad(sink, (0, padded_heads - sink.shape[0]))
+            attention_sink = sink
 
-    Args:
-      queries: concatenated all sequences' queries.
-      keys: concatenated all sequences' keys (quantized).
-      values: concatenated all sequences' values (quantized).
-      kv_cache_fused: paged KV cache with head interleaving format [K1,V1,K2,V2,...].
-      kv_lens: padded kv lengths. Only the first num_seqs values are valid.
-      page_indices: flattened page indices look-up table.
-      cu_q_lens: the cumulative sum of the effective query lengths. Similar to
-        kv_lens, only the first num_seqs+1 values are valid.
-      cu_kv_lens: the cumulative sum of the effective key/value lengths. Similar to
-        kv_lens, only the first num_seqs+1 values are valid.
-      distribution: (i, j, k) represents that sequences[0:i] are decode-only,
-        sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
-        k is also the total number of sequences.
-      custom_mask: use custom mask to calculate attention.
-      causal: If causal is set to True, use causal mask. Otherwise, use custom_mask.
-      sm_scale: the softmax scale which will be applied to the Q@K^T.
-      sliding_window: the sliding window size for the attention.
-      soft_cap: the logit soft cap for the attention.
-      mask_value: mask value for causal mask.
-      q_scale: the scale for the query.
-      k_scale: the scale for the key cache.
-      v_scale: the scale for the value cache.
-      chunk_prefill_size: the chunk prefill size for the attention.
-      xai_temperature_len: the length-based temperature term used by xai grok.
-        reference: sgl-project/sglang: python/sglang/srt/layers/attention/triton_ops/decode_attention.py
-      num_kv_pages_per_block: number of kv pages to be processed in one flash
-        attention block in the pallas kernel.
-      num_queries_per_block: number of kv pages to be processed in one flash
-        attention block in the pallas kernel.
-      vmem_limit_bytes: the vmem limit for the pallas kernel.
+        bkv_p = num_kv_pages_per_block
+        bq_sz = num_queries_per_block
+        if bq_sz is None or bkv_p is None:
+            # Use same tuning as fused for now
+            bkv_p, bq_sz = get_tuned_block_sizes(
+                q.dtype,
+                k_cache_processed.dtype,
+                actual_num_q_heads,
+                actual_num_kv_heads,
+                head_dim,
+                page_size,
+                max_num_tokens,
+                pages_per_seq,
+                causal,
+            )
+        if page_size == 1:
+            bkv_p = bkv_p // 2
+            if bkv_p == 0:
+                bkv_p = 1
+        bkv_p = align_to(bkv_p, kv_packing)
+        bkv_sz = bkv_p * page_size
+        if vmem_limit_bytes is None:
+            vmem_limit_bytes = DEFAULT_VMEM_LIMIT_BYTES
 
-    Returns:
-      The output of the attention.
-    """
+        q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+        seq_mask_lens = kv_lens * q_lens
+        cu_seq_mask_lens = jnp.concatenate([jnp.array([0], dtype=jnp.int32), jnp.cumsum(seq_mask_lens)])
+        
+        if custom_mask is not None:
+            if custom_mask.dtype == jnp.bool_:
+                custom_mask = custom_mask.astype(jnp.int32)
+            custom_mask = jnp.repeat(jnp.expand_dims(custom_mask, axis=1), repeats=head_dim, axis=1)
+
+        grid = (distribution[2],)
+
+        in_specs = [
+            pl.BlockSpec(memory_space=pltpu.ANY),  # q
+            pl.BlockSpec(memory_space=pltpu.ANY),  # k
+            pl.BlockSpec(memory_space=pltpu.ANY),  # v
+            pl.BlockSpec(memory_space=pltpu.ANY),  # k_cache
+            pl.BlockSpec(memory_space=pltpu.ANY),  # v_cache
+            pl.BlockSpec(memory_space=pltpu.ANY) if custom_mask is not None else None,  # custom_mask
+            pl.BlockSpec(memory_space=pltpu.ANY) if attention_sink is not None else None,  # attention_sink
+            pl.BlockSpec(memory_space=pltpu.ANY),  # zero mask
+        ]
+
+        out_specs = [
+            pl.BlockSpec(memory_space=pltpu.ANY),  # output
+            pl.BlockSpec(memory_space=pltpu.ANY),  # updated k_cache
+            pl.BlockSpec(memory_space=pltpu.ANY),  # updated v_cache
+        ]
+        
+        # Scratch buffers setup
+        bkvmask_double_buf = None
+        if causal != 1:
+            bkvmask_double_buf = pltpu.VMEM((2, bq_sz, bkv_sz, head_dim), jnp.int32)
+
+        # Separate VMEM for K and V
+        bk_double_buf = pltpu.VMEM((2, bkv_sz, *k_cache_processed.shape[2:]), k_cache_processed.dtype)
+        bv_double_buf = pltpu.VMEM((2, bkv_sz, *v_cache_processed.shape[2:]), v_cache_processed.dtype)
+        
+        bq_double_buf = pltpu.VMEM((2, actual_num_kv_heads, bq_sz, *q.shape[2:]), q.dtype)
+        bo_double_buf = bq_double_buf
+        l_scratch = pltpu.VMEM((actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128), jnp.float32)
+        m_scratch = l_scratch
+        acc_scratch = pltpu.VMEM((actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim), jnp.float32)
+
+        scratch_shapes = [
+            bkvmask_double_buf,
+            bk_double_buf, # Index 1
+            bv_double_buf, # Index 2
+            bq_double_buf,
+            bo_double_buf,
+            pltpu.SemaphoreType.DMA((5, 2)),
+            l_scratch,
+            m_scratch,
+            acc_scratch,
+        ]
+
+        scalar_prefetches = (
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            cu_seq_mask_lens,
+            distribution,
+            jnp.zeros((3,), jnp.int32),
+            jnp.full((4,), -1, jnp.int32),
+            jnp.full((6,), -1, jnp.int32),
+        )
+
+        # Estimate costs (simplified)
+        total_interactions = max_num_tokens * (est_avg_context_len)
+        flops = 4 * actual_num_q_heads * head_dim * total_interactions
+        bytes_accessed = q.size * q.itemsize * 2 # Q+O
+        cost_estimate = pl.CostEstimate(flops=flops, bytes_accessed=bytes_accessed, transcendentals=0)
+
+        scope_name = get_kernel_scope_name(bq_sz, bkv_p, page_size) + "split"
+        
+        kernel = pl.pallas_call(
+            functools.partial(
+                _ragged_paged_attention_kernel_split,
+                sm_scale=sm_scale,
+                sliding_window=sliding_window,
+                soft_cap=soft_cap,
+                mask_value=mask_value,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                xai_temperature_len=xai_temperature_len,
+                chunk_prefill_size=chunk_prefill_size,
+                bkv_p=bkv_p,
+                bq_sz=bq_sz,
+            ),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=len(scalar_prefetches),
+                in_specs=in_specs,
+                out_specs=out_specs,
+                grid=grid,
+                scratch_shapes=scratch_shapes,
+            ),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",),
+                vmem_limit_bytes=vmem_limit_bytes,
+                disable_bounds_checks=True,
+            ),
+            cost_estimate=cost_estimate,
+            out_shape=[
+                jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
+                jax.ShapeDtypeStruct(shape=k_cache_processed.shape, dtype=k_cache_processed.dtype),
+                jax.ShapeDtypeStruct(shape=v_cache_processed.shape, dtype=v_cache_processed.dtype),
+            ],
+            input_output_aliases={
+                9: 0,  # q input -> q output
+                12: 1, # k_cache -> updated_k
+                13: 2, # v_cache -> updated_v
+            },
+            name=scope_name,
+        )
+
+        output, updated_k, updated_v = kernel(
+            *scalar_prefetches,
+            q,
+            k,
+            v,
+            k_cache_processed,
+            v_cache_processed,
+            custom_mask,
+            attention_sink,
+            jnp.zeros((bkv_sz, head_dim), dtype=jnp.int32),
+        )
+        
+        output = prepare_outputs(output, actual_num_q_heads_per_kv_head, actual_head_dim)
+        updated_k = prepare_updated_kv_cache(updated_k, actual_num_kv_heads, k_cache.shape[-1])
+        updated_v = prepare_updated_kv_cache(updated_v, actual_num_kv_heads, v_cache.shape[-1])
+        
+        return output, updated_k, updated_v
+
+    # Fused path (original logic)
     q, k, v = queries, keys, values
     static_validate_inputs_fused(
         q,
