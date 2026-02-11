@@ -10,7 +10,7 @@ import jax
 from sgl_jax.srt.entrypoints.engine import Engine
 from sgl_jax.test.test_utils import CustomTestCase
 
-TEST_MODEL_NAME = "Qwen/Qwen3-0.6B"
+TEST_MODEL_NAME = "/data/huggingface_models/Qwen/Qwen3-0.6B"
 DELIMITER_TOKEN_ID = 151643
 LABEL_TOKEN_IDS = [9834, 902]
 QUERY_IDS = [1957, 1437, 25975, 25]
