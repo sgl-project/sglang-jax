@@ -55,6 +55,7 @@ class NativeAttention(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        sinks: jax.Array = None,
     ):
         """
         Args:
@@ -96,6 +97,8 @@ class NativeAttention(AttentionBackend):
             forward_batch.forward_mode,
             self.kv_sharding,
             xai_temperature_len=xai_temp_len,
+            sinks = sinks,
+            sliding_window_size = layer.sliding_window_size,
         )
 
         # Return full fused KV buffer for this layer so that caller can persist it outside JIT
@@ -161,6 +164,8 @@ def forward_attention(
     mode=ForwardMode.DECODE,
     kv_sharding=None,
     xai_temperature_len: float | None = None,
+    sinks=None,
+    sliding_window_size: None | int = None,
 ):
     """
     Forward pass using native JAX implementation with block-diagonal attention.
@@ -205,6 +210,18 @@ def forward_attention(
     # KV cache from get_kv_buffer is already in multi-head format: [cache_size, num_kv_heads, head_dim]
     k_heads = k_cache
     v_heads = v_cache
+    head_dim_in_kvpool = k_heads.shape[-1]
+
+    if head_dim < head_dim_in_kvpool:
+        q_heads = jnp.pad(
+            q_heads,
+            (
+                (0, 0),
+                (0, 0),
+                (0, head_dim_in_kvpool - head_dim),
+            ),
+            constant_values=0,
+        )
 
     # Transpose for efficient matrix operations
     # q: shape of (num_heads, num_tokens, head_dim)
@@ -255,15 +272,26 @@ def forward_attention(
     # Apply appropriate masking
     if mode == ForwardMode.EXTEND:
         attn_logits = _apply_extend_mask(
-            attn_logits, seq_lengths, extend_prefix_lens, extend_seq_lens, is_causal
+            attn_logits, seq_lengths, extend_prefix_lens, extend_seq_lens, is_causal, sliding_window_size
         )
     else:
-        attn_logits = _apply_decode_mask(attn_logits, seq_lengths)
+        attn_logits = _apply_decode_mask(attn_logits, seq_lengths, sliding_window_size)
+
+    _, nr_qs, nr_ks = attn_logits.shape
+
+    if sinks is not None:
+        sinks_expanded = sinks[:, None, None]
+        sinks_expanded = jnp.repeat(sinks_expanded, nr_qs, axis=1)
+        attn_logits = jnp.concatenate([attn_logits, sinks_expanded], axis=-1)
 
     # Softmax
     attn_weights = jax.nn.softmax(attn_logits, axis=-1)
 
+    if sinks is not None:
+        attn_weights = attn_weights[:, :, :nr_ks]
+
     attn_output = jnp.matmul(attn_weights, v_t)
+    attn_output = attn_output[:,:,0:head_dim]
     attn_output = jnp.transpose(attn_output, (1, 0, 2))
     return attn_output.reshape(num_tokens, hidden_size)
 
@@ -274,6 +302,7 @@ def _apply_extend_mask(
     extend_prefix_lens: jax.Array,
     extend_seq_lens: jax.Array,
     is_causal: bool = True,
+    sliding_window_size: None | int = None,
 ):
     """
     Applies a block-diagonal and optionally a causal mask in a unified,
@@ -309,6 +338,9 @@ def _apply_extend_mask(
         k_relative_positions = jnp.arange(key_len, dtype=jnp.int32) - k_starts_per_pos
 
         causal_mask = q_actual_positions[:, None] >= k_relative_positions[None, :]
+        if sliding_window_size is not None:
+            sliding_window_mask = q_actual_positions[:, None] <= (k_relative_positions[None, :] + sliding_window_size)
+            causal_mask = causal_mask & sliding_window_mask
         final_mask = final_mask & causal_mask
 
     # --- 4. Apply the final combined mask ---
@@ -320,7 +352,11 @@ def _apply_extend_mask(
     return jnp.where(final_mask, attn_weights, mask_value)
 
 
-def _apply_decode_mask(attn_weights: jax.Array, seq_lengths: jax.Array):
+def _apply_decode_mask(
+    attn_weights: jax.Array,
+    seq_lengths: jax.Array,
+    sliding_window_size: None | int = None,
+):
     """Create a sequence mask that ensures tokens only attend within their sequence."""
     _, query_len, key_len = attn_weights.shape
     num_seqs = len(seq_lengths)
@@ -329,8 +365,12 @@ def _apply_decode_mask(attn_weights: jax.Array, seq_lengths: jax.Array):
         total_prefix_len = key_len
         seq_starts = jnp.cumsum(jnp.concatenate([jnp.array([0]), seq_lengths[:-1]]))
         seq_ends = seq_starts + seq_lengths
+        if sliding_window_size is not None:
+            window_starts = jnp.where(seq_lengths < sliding_window_size, seq_starts, seq_ends - sliding_window_size)
+        else:
+            window_starts = seq_starts
         all_positions = jnp.arange(total_prefix_len)
-        seq_mask = (all_positions[None, :] >= seq_starts[:, None]) & (
+        seq_mask = (all_positions[None, :] >= window_starts[:, None]) & (
             all_positions[None, :] < seq_ends[:, None]
         )
         return seq_mask
