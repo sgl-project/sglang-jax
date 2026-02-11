@@ -572,8 +572,8 @@ def _execute_multimodal_server_warmup(
         }
     elif _is_audio_model(server_args.model_path):
         request_endpoint = "/v1/audio/transcriptions"
-        audio_url = "https://huggingface.co/datasets/nvidia/AudioSkills/resolve/main/assets/WhDJDIviAOg_120_10.mp3"
-
+        # audio_url = "https://huggingface.co/datasets/nvidia/AudioSkills/resolve/main/assets/WhDJDIviAOg_120_10.mp3"
+        audio_url = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-Omni/cookbook/asr_zh.wav"
         logger.info("Downloading warmup audio from: %s", audio_url)
         audio_response = requests.get(audio_url, timeout=30)
         audio_bytes = audio_response.content
