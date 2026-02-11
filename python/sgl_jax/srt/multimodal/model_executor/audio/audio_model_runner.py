@@ -5,12 +5,14 @@ from functools import partial
 import huggingface_hub
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.multimodal.configs.config_registry import get_audio_config
+from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_tokenizer import EncoderOutput
 from sgl_jax.srt.server_args import ServerArgs
 
 
@@ -20,10 +22,7 @@ class AudioModelRunner(BaseModelRunner):
     ):
         self.mesh = mesh
         self.model_loader = get_model_loader(
-            load_config=LoadConfig(
-                model_class=model_class,
-                sub_dir=None,
-            ),
+            load_config=LoadConfig(model_class=model_class, sub_dir=None),
             mesh=self.mesh,
         )
         self.model_class = model_class
@@ -35,7 +34,6 @@ class AudioModelRunner(BaseModelRunner):
         self.initialize_jit()
 
     def _load_hf_config(self, model_path: str) -> dict:
-        """Load config.json from HuggingFace model path."""
         if os.path.isdir(model_path):
             config_path = os.path.join(model_path, "config.json")
         else:
@@ -52,47 +50,26 @@ class AudioModelRunner(BaseModelRunner):
         self.model_config = get_audio_config(self.server_args.model_path)
         for key, value in hf_config.items():
             if hasattr(self.model_config, key):
-                if key == "encoder_attn_window_size" or key == "decoder_attn_window_size" or key == "vocoder_attn_window_size":
+                if key in ("encoder_attn_window_size", "decoder_attn_window_size", "vocoder_attn_window_size"):
                     value = tuple(value) if isinstance(value, list) else value
                 setattr(self.model_config, key, value)
         self.model_config.model_path = self.server_args.model_path
         self.model_config.model_class = self.model_class
-        self.model = self.model_loader.load_model(
-            model_config=self.model_config,
-        )
+        self.model = self.model_loader.load_model(model_config=self.model_config)
 
     def initialize_jit(self):
         model_def, model_state = nnx.split(self.model)
         model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
 
-        @partial(
-            jax.jit,
-            static_argnames=["model_state_def", "use_quantizer", "n_q"],
-        )
-        def encode(
-            model_def,
-            model_state_def,
-            model_state_leaves,
-            mels,
-            input_lens,
-            use_quantizer,
-            n_q,
-        ):
+        @partial(jax.jit, static_argnames=["model_state_def", "use_quantizer", "n_q"])
+        def encode(model_def, model_state_def, model_state_leaves, mels, input_lens, use_quantizer, n_q):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             result = model.encode(mels, input_lens, use_quantizer=use_quantizer, n_q=n_q)
             return result.hidden_states, result.packed_states, result.output_lengths, result.codes
 
-        @partial(
-            jax.jit,
-            static_argnames=["model_state_def"],
-        )
-        def decode(
-            model_def,
-            model_state_def,
-            model_state_leaves,
-            codes,
-        ):
+        @partial(jax.jit, static_argnames=["model_state_def"])
+        def decode(model_def, model_state_def, model_state_leaves, codes):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             return model.decode(codes)
@@ -101,7 +78,6 @@ class AudioModelRunner(BaseModelRunner):
             hidden_states, packed_states, output_lengths, codes = encode(
                 model_def, model_state_def, model_state_leaves, mels, input_lens, use_quantizer, n_q
             )
-            from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_tokenizer import EncoderOutput
             return EncoderOutput(
                 hidden_states=hidden_states,
                 packed_states=packed_states,
@@ -110,29 +86,14 @@ class AudioModelRunner(BaseModelRunner):
             )
 
         def decode_wrapper(codes: jax.Array):
-            # Convert codes to numpy to break any JAX sharding
-            # Then call model.decode directly without JIT to avoid sharding propagation
-            import numpy as np
             codes_np = np.asarray(jax.device_get(codes))
             codes_clean = jnp.array(codes_np)
-            # Call model directly without JIT - this avoids sharding issues on CPU
             return self.model.decode(codes_clean)
 
         self.jitted_encode = encode_wrapper
         self.jitted_decode = decode_wrapper
 
     def forward(self, x: jax.Array, input_lens: jax.Array | None, mode: str, **kwargs):
-        """Forward pass for audio encoding/decoding.
-
-        Args:
-            x: For encode mode, this is mel spectrogram [B, T, n_mels] (preprocessed in tokenizer).
-               For decode mode, this is codes [n_q, seq_len].
-            input_lens: For encode mode, the length of mel spectrogram. None for decode mode.
-            mode: "encode" or "decode".
-
-        Returns:
-            (output, cache_miss_count)
-        """
         cache_miss_count = 0
         import jax._src.test_util as jtu
 
@@ -140,7 +101,6 @@ class AudioModelRunner(BaseModelRunner):
             if mode == "encode":
                 use_quantizer = kwargs.get("use_quantizer", True)
                 n_q = kwargs.get("n_q", None)
-                # x is already mel spectrogram (preprocessed in tokenizer)
                 output = self.jitted_encode(x, input_lens, use_quantizer=use_quantizer, n_q=n_q)
             elif mode == "decode":
                 output = self.jitted_decode(x)
