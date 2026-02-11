@@ -501,12 +501,6 @@ def _is_wan_model(model_path: str) -> bool:
     """Check if the model is a Wan model based on model path."""
     return "wan" in model_path.lower()
 
-
-def _is_audio_model(model_path: str) -> bool:
-    """Check if the model is an audio model based on model path."""
-    return "mimo-audio" in model_path.lower() or "audio-tokenizer" in model_path.lower()
-
-
 def _execute_multimodal_server_warmup(
     server_args: MultimodalServerArgs,
     pipe_finish_writer: mp.connection.Connection | None,
@@ -570,7 +564,7 @@ def _execute_multimodal_server_warmup(
             "num_inference_steps": 2,
             "save_output": False,
         }
-    elif _is_audio_model(server_args.model_path):
+    elif "MiMo-Audio" in server_args.model_path:
         request_endpoint = "/v1/audio/transcriptions"
         # audio_url = "https://huggingface.co/datasets/nvidia/AudioSkills/resolve/main/assets/WhDJDIviAOg_120_10.mp3"
         audio_url = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-Omni/cookbook/asr_zh.wav"
