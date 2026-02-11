@@ -7,7 +7,7 @@ stage_args:
   # Stage 0: Audio Encoder - encode input audio to discrete tokens
   - stage_id: 0
     runtime:
-      num_tpus: 1
+      num_tpus: 2
       max_batch_size: 1
       device_kind: tpu
     scheduler: audio_encoder
@@ -19,11 +19,11 @@ stage_args:
   # Stage 1: LLM Backbone - process text + audio tokens, generate response
   - stage_id: 1
     runtime:
-      num_tpus: 1
+      num_tpus: 2
       max_batch_size: 1
       device_kind: tpu
     scheduler: audio_backbone
-    scheduler_params: { }
+    scheduler_params: {}
     model_class: MiMoAudioForCausalLM
 #    model_path: XiaomiMiMo/MiMo-Audio-7B-Instruct
     final_output: true
