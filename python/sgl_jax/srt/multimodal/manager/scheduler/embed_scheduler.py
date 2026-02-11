@@ -33,20 +33,23 @@ class EmbedScheduler:
     def event_loop_normal(self):
         while True:
             reqs = self.communication_backend.recv_requests()
-            if reqs is None:
-                continue
-            for req in reqs:
-                if isinstance(req, AbortReq):
-                    logger.info("EmbedScheduler received abort for rid=%s", req.rid)
-                    self.aborted_rids.add(req.rid)
-                elif isinstance(req, Req):
-                    if req.rid in self.aborted_rids:
-                        logger.info("EmbedScheduler skipping aborted request rid=%s", req.rid)
-                        self.aborted_rids.discard(req.rid)
-                        continue
-                    self.run_embed_step(req)
-                else:
-                    logger.warning("EmbedScheduler received unknown request type: %s", type(req))
+            if reqs is not None and len(reqs) > 0:
+                for req in reqs:
+                    if isinstance(req, AbortReq):
+                        logger.info("EmbedScheduler received abort for rid=%s", req.rid)
+                        self.aborted_rids.add(req.rid)
+                    elif isinstance(req, Req):
+                        if req.rid in self.aborted_rids:
+                            logger.info("EmbedScheduler skipping aborted request rid=%s", req.rid)
+                            self.aborted_rids.discard(req.rid)
+                            continue
+                        self.run_embed_step(req)
+                    else:
+                        logger.warning(
+                            "EmbedScheduler received unknown request type: %s", type(req)
+                        )
+            else:
+                self.communication_backend.wait_for_new_requests(0.001)
 
     def run_embed_step(self, req: Req):
         """Placeholder: run embed encoder and forward request to next stage."""
