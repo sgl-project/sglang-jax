@@ -11,7 +11,13 @@ import psutil
 import setproctitle
 import zmq
 
-from sgl_jax.srt.managers.io_struct import AbortReq, BatchStrOut, BatchTokenIDOut
+from sgl_jax.srt.managers.io_struct import (
+    AbortReq,
+    BatchStrOut,
+    BatchTokenIDOut,
+    ProfileReq,
+    ProfileReqOutput,
+)
 from sgl_jax.srt.multimodal.common.modality_enum import (
     MultimodalDataItem,
     pad_input_tokens,
@@ -136,6 +142,7 @@ class GlobalScheduler:
                 (TokenizedGenerateMMReqInput, self.convert_request),
                 (TokenizedGenerateVLMReqInput, self.convert_vlm_request),
                 (AbortReq, self.handle_abort_request),
+                (ProfileReq, self.handle_profile),
             ]
         )
 
@@ -195,6 +202,25 @@ class GlobalScheduler:
                 # Send AbortReq to detokenizer -> tokenizer to notify client
                 self.send_to_detokenizer.send_pyobj(stage_abort_req)
 
+        return None
+
+    def handle_profile(self, recv_req: ProfileReq):
+        """Route ProfileReq to the target stage's scheduler via its in_queue."""
+        stage_id = recv_req.stage_id
+        if stage_id is None:
+            # Default to the final output stage (typically the LLM stage).
+            stage_id = next(
+                (i for i, cfg in enumerate(self.stage_configs) if cfg.final_output),
+                len(self.stage_list) - 1,
+            )
+        if stage_id < 0 or stage_id >= len(self.stage_list):
+            result = ProfileReqOutput(
+                success=False,
+                message=f"Invalid stage_id={stage_id}, must be 0..{len(self.stage_list) - 1}",
+            )
+            self.send_to_detokenizer.send_pyobj(result)
+        else:
+            self.in_queues[stage_id].put_nowait(recv_req)
         return None
 
     def convert_request(self, input: TokenizedGenerateMMReqInput):
@@ -378,7 +404,14 @@ class GlobalScheduler:
                             self.in_queues[0].put_nowait(stage_req)
             else:
                 for i, stage in enumerate(self.stage_list):
-                    stage_result = Req.from_stage(stage.try_collect(), self.req_store)
+                    raw_result = stage.try_collect()
+                    if raw_result is None:
+                        continue
+                    # Forward ProfileReqOutput directly to detokenizer
+                    if isinstance(raw_result, ProfileReqOutput):
+                        self.send_to_detokenizer.send_pyobj(raw_result)
+                        continue
+                    stage_result = Req.from_stage(raw_result, self.req_store)
                     if stage_result is None:
                         continue
                     if isinstance(stage_result, BatchTokenIDOut):

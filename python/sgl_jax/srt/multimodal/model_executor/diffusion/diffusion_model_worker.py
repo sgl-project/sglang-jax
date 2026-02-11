@@ -34,6 +34,7 @@ class DiffusionModelWorker:
         batch: Req,
         mesh: jax.sharding.Mesh,
         abort_checker: Callable[[], bool] | None = None,
+        step_callback: Callable[[], None] | None = None,
     ) -> bool:
         """Generate video from text embeddings using the diffusion model.
 
@@ -46,4 +47,6 @@ class DiffusionModelWorker:
         Returns:
             True if the request was aborted, False otherwise.
         """
-        return self.model_runner.forward(batch, mesh, abort_checker=abort_checker)
+        return self.model_runner.forward(
+            batch, mesh, abort_checker=abort_checker, step_callback=step_callback
+        )

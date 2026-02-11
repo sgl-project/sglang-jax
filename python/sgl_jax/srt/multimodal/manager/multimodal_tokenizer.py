@@ -26,6 +26,7 @@ from sgl_jax.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchStrOut,
     BatchTokenIDOut,
+    ProfileReqOutput,
 )
 from sgl_jax.srt.managers.tokenizer_manager import ReqState, TokenizerManager
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
@@ -112,6 +113,10 @@ class MultimodalTokenizer(TokenizerManager):
                 (
                     AbortReq,
                     self._handle_abort_req,
+                ),
+                (
+                    ProfileReqOutput,
+                    self.profile_communicator.handle_recv,
                 ),
             ]
         )

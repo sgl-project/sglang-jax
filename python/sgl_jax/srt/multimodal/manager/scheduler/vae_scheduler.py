@@ -6,7 +6,8 @@ from jax import NamedSharding
 from jax.sharding import PartitionSpec
 
 from sgl_jax.srt.managers.communication import CommunicationBackend
-from sgl_jax.srt.managers.io_struct import AbortReq
+from sgl_jax.srt.managers.io_struct import AbortReq, ProfileReq
+from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixin
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.model_executor.vae.vae_model_worker import VaeModelWorker
@@ -15,7 +16,7 @@ from sgl_jax.srt.utils.jax_utils import device_array
 logger = logging.getLogger(__name__)
 
 
-class VaeScheduler:
+class VaeScheduler(SchedulerProfilerMixin):
     """Scheduler for VAE model inference within the multimodal pipeline.
 
     Responsibilities:
@@ -58,6 +59,8 @@ class VaeScheduler:
             stage_sub_dir=stage_sub_dir,
         )
         self.server_args = server_args
+        self.forward_ct = 0
+        self.init_profier()
         self.model_config = model_class.get_config_class()()
         # Track aborted request IDs to skip processing
         self.aborted_rids: set[str] = set()
@@ -81,6 +84,9 @@ class VaeScheduler:
                     if isinstance(req, AbortReq):
                         logger.info("VaeScheduler received abort for rid=%s", req.rid)
                         self.aborted_rids.add(req.rid)
+                    elif isinstance(req, ProfileReq):
+                        result = self.profile(req)
+                        self._comm_backend.send_pyobj(result)
                     elif isinstance(req, Req):
                         # Check if this request was aborted
                         if req.rid in self.aborted_rids:
@@ -128,4 +134,6 @@ class VaeScheduler:
             output, _ = self.vae_worker.forward(req)
             req.output = jax.device_get(output)
             req.latents = None
+            self.forward_ct += 1
+            self._profile_batch_predicate(None)
             self._comm_backend.send_pyobj(req)
