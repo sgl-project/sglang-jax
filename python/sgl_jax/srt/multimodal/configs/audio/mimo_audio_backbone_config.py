@@ -1,5 +1,3 @@
-"""MiMo Audio Backbone configuration for sglang-jax."""
-
 from dataclasses import dataclass
 from typing import Optional
 
@@ -8,7 +6,6 @@ from transformers import PretrainedConfig
 
 @dataclass
 class MiMoAudioBackboneConfig(PretrainedConfig):
-    """MiMo Audio Backbone configuration (Qwen2-based with audio components)."""
 
     model_type: str = "mimo_audio"
 
@@ -71,19 +68,17 @@ class MiMoAudioBackboneConfig(PretrainedConfig):
 
 @dataclass
 class MiMoAudioArguments:
-    """MiMo Audio special token indices."""
     model_name_or_path: Optional[str] = None
-    sosp_idx: int = 151665    # <|sosp|>
-    eosp_idx: int = 151666    # <|eosp|>
-    sostm_idx: int = 151670   # <|sostm|>
-    eostm_idx: int = 151671   # <|eostm|>
-    eot_idx: int = 151672     # <|eot|>
-    empty_idx: int = 151667   # <|empty|>
+    sosp_idx: int = 151665
+    eosp_idx: int = 151666
+    sostm_idx: int = 151670
+    eostm_idx: int = 151671
+    eot_idx: int = 151672
+    empty_idx: int = 151667
 
 
 @dataclass
 class MiMoSamplerConfig:
-    """Audio token sampling configuration."""
     do_sample: bool = True
     temperature: float = 1.0
     top_k: int = 50

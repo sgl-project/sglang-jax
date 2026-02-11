@@ -137,7 +137,6 @@ class NativeAttention(AttentionBackend):
             v = updated_layer.at[:, 1::2, :].get(out_sharding=kv_sharding)
             # Return fused buffer directly for persistence outside JIT
             fused_return = updated_layer
-
         return k, v, fused_return
 
     @staticmethod
@@ -187,7 +186,6 @@ def forward_attention(
 
     cache_size = k_cache.shape[0]
     safe_loc = jnp.where(loc > 0, loc, cache_size)
-
     k_cache = k_cache.at[safe_loc].get(out_sharding=kv_sharding, mode="fill", fill_value=0)
     v_cache = v_cache.at[safe_loc].get(out_sharding=kv_sharding, mode="fill", fill_value=0)
 
@@ -227,7 +225,6 @@ def forward_attention(
     if scale is None:
         scale = 1.0 / jnp.sqrt(head_dim)
     attn_logits = jnp.einsum("hqd,hkd->hqk", q_t, k_t) * scale
-
     neg_inf = jnp.asarray(jnp.finfo(attn_logits.dtype).min, attn_logits.dtype)
     is_valid = loc > 0
     attn_logits = jnp.where(is_valid[jnp.newaxis, jnp.newaxis, :], attn_logits, neg_inf)

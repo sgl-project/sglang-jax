@@ -468,7 +468,7 @@ class AudioConfigRegistry:
     """Registry that maps model names to their audio tokenizer configs."""
 
     _REGISTRY: dict[str, callable] = {
-        "xiaomi/MiMo-Audio-Tokenizer": lambda: MiMoAudioConfig(),
+        "XiaoMi/MiMo-Audio-Tokenizer": lambda: MiMoAudioConfig(),
         "MiMo-Audio-Tokenizer": lambda: MiMoAudioConfig(),
     }
 

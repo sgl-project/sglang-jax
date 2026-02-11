@@ -203,8 +203,8 @@ async def videos_generation(obj: VideoGenerationsRequest, request: Request):
         return _create_error_response(e)
 
 
-# === OpenAI Audio API Endpoints ===
-
+# consistent with the openai interface
+# https://developers.openai.com/api/reference/python/resources/audio
 @app.post("/v1/audio/speech")
 async def create_speech(obj: AudioSpeechRequest, request: Request):
     """OpenAI-compatible Text-to-Speech endpoint.
@@ -291,12 +291,6 @@ async def create_transcription(
     request: Request,
     obj: AudioTranscriptionRequest = Depends(parse_transcription_request),
 ):
-    """OpenAI-compatible Speech-to-Text (transcription) endpoint.
-
-    Supports two input methods:
-    1. File upload: multipart/form-data with file
-    2. URL: Provide 'url' parameter, server downloads the audio
-    """
     try:
         from sgl_jax.srt.entrypoints.http_server import _global_state
 
