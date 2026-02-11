@@ -157,7 +157,10 @@ _logger_initialized = False
 def configure_logger(server_args, prefix: str = ""):
     root_logger = logging.getLogger()
     for handler in root_logger.handlers:
-        if handler.formatter._fmt == "%(levelname)s:%(name)s:%(message)s":
+        if (
+            handler.formatter is not None
+            and handler.formatter._fmt == "%(levelname)s:%(name)s:%(message)s"
+        ):
             root_logger.removeHandler(handler)
             handler.close()
     global _logger_initialized
