@@ -742,7 +742,9 @@ def _fused_ep_moe_kernel(
 
             # Extract value from original input logits
             val = jnp.sum(
-                jnp.where(selection_mask, input_logits[:, :num_experts], 0.0), axis=1, keepdims=True
+                jnp.where(selection_mask[:, :num_experts], input_logits[:, :num_experts], 0.0),
+                axis=1,
+                keepdims=True,
             )
 
             top_k_logits = jnp.broadcast_to(val, padded_k_shape).astype(input_logits.dtype)

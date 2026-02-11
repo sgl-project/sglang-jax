@@ -829,8 +829,8 @@ def run_all(
                 layer_id=0,
                 renormalize_topk_logits=case.renormalize_topk_logits,
                 use_grouped_topk=use_grouped_topk,
-                num_groups=case.num_expert_group if use_grouped_topk else 1,
-                top_k_groups=case.topk_group if use_grouped_topk else 1,
+                num_groups=case.num_expert_group,
+                top_k_groups=case.topk_group,
                 num_shared_experts=1 if use_shared_expert else 0,
                 moe_shared_expert_intermediate_size=(
                     case.intermediate_size if use_shared_expert else None
