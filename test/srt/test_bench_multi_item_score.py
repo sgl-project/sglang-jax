@@ -261,6 +261,7 @@ class TestMultiItemScorePerformance(CustomTestCase):
     def test_benchmark_multi_item_chunk_scaling(self):
         """
         Test multi-item performance across different chunk sizes.
+        Updated for 500 items.
         """
         chunk_sizes = [32, 64, 128]
         results = []
