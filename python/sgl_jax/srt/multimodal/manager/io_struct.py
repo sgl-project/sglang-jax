@@ -98,41 +98,6 @@ class AudioTranscriptionResponse(BaseModel):
     usage: dict | None = None                    # token 或 duration 统计
 
 
-# === OpenAI Audio Chat Compatibility ===
-
-class InputAudio(BaseModel):
-    data: str | None = None       # Base64 encoded audio bytes
-    url: str | None = None        # URL to audio file
-    format: str                   # wav, mp3
-
-class ContentPart(BaseModel):
-    type: str        # "text" | "input_audio"
-    text: str | None = None
-    input_audio: InputAudio | None = None
-
-class ChatMessage(BaseModel):
-    role: str        # "user", "assistant", "system"
-    content: str | list[ContentPart]
-
-class AudioOutputConfig(BaseModel):
-    voice: str       # e.g. "alloy"
-    format: str      # "wav", "mp3"
-
-class GenerateOpenAIAudioInput(BaseModel):
-    """
-    OpenAI-compatible request body for multimodal audio chat.
-    Maps to /api/v1/chat/completions
-    """
-    model: str
-    messages: list[ChatMessage]
-    modalities: list[str] | None = ["text", "audio"]
-    audio: AudioOutputConfig | None = None
-    max_tokens: int | None = 2048
-    temperature: float | None = 1.0
-    top_p: float | None = 1.0
-    stream: bool = False
-
-
 class DataType(Enum):
     IMAGE = auto()
     VIDEO = auto()

@@ -25,7 +25,6 @@ from sgl_jax.srt.multimodal.manager.io_struct import (
     AudioTranscriptionResponse,
     DataType,
     GenerateMMReqInput,
-    GenerateOpenAIAudioInput,
     GenerateVLMReqInput,
     ImageGenerationsRequest,
     VideoGenerationsRequest,
@@ -313,19 +312,6 @@ async def create_transcription(
 
     except ValueError as e:
         logger.error("[http_server] create_transcription error: %s", e)
-        return _create_error_response(e)
-
-
-@app.api_route("/api/v1/chat/completions", methods=["POST"])
-async def chat_completions(obj: GenerateOpenAIAudioInput, request: Request):
-    """OpenAI-compatible Chat Completions endpoint for multimodal audio."""
-    try:
-        from sgl_jax.srt.entrypoints.http_server import _global_state
-
-        ret = await _global_state.tokenizer_manager.chat_completion_audio(obj, request)
-        return ret
-    except ValueError as e:
-        logger.error("[http_server] chat_completions error: %s", e)
         return _create_error_response(e)
 
 
