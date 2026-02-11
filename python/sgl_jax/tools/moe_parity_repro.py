@@ -1742,6 +1742,7 @@ def main() -> int:
     if has_shared and fused_no_shared_np is not None and shared_out is not None:
         expert_stats = _describe_diff(fused_no_shared_np, ep_expert_np)
         fused_shared_np = fused_np.astype(np.float32) - fused_no_shared_np.astype(np.float32)
+        shared_out = jax.sharding.reshard(shared_out, NamedSharding(mesh, P(None)))
         shared_np = np.asarray(jax.device_get(shared_out)).astype(np.float32)
         shared_stats = _describe_diff(fused_shared_np, shared_np)
         print(
