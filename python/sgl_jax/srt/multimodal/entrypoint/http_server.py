@@ -585,12 +585,15 @@ def _execute_multimodal_server_warmup(
             "save_output": False,
         }
     elif _is_audio_model(server_args.model_path):
-        # 使用新的 OpenAI 端点进行 warmup
         request_endpoint = "/v1/audio/transcriptions"
-        # 构造 multipart/form-data 请求
-        # 使用空 WAV 文件作为 warmup
-        files = {"file": ("warmup.wav", b"", "audio/wav")}
-        data = {"model": "whisper-1"}
+        audio_url = "https://huggingface.co/datasets/nvidia/AudioSkills/resolve/main/assets/WhDJDIviAOg_120_10.mp3"
+
+        logger.info("Downloading warmup audio from: %s", audio_url)
+        audio_response = requests.get(audio_url, timeout=30)
+        audio_bytes = audio_response.content
+
+        files = {"file": ("warmup_audio.mp3", audio_bytes, "audio/mpeg")}
+        data = {"model": server_args.model_path}
 
         try:
             res = requests.post(
@@ -600,7 +603,8 @@ def _execute_multimodal_server_warmup(
                 headers=headers,
                 timeout=600,
             )
-            assert res.status_code == 200, f"{res}"
+            assert res.status_code == 200, f"{res.status_code}: {res.text}"
+            logger.info("Audio model warmup completed successfully")
         except Exception:
             last_traceback = get_exception_traceback()
             if pipe_finish_writer is not None:
