@@ -108,16 +108,12 @@ class MiMoAudioProcessor:
         """
         from transformers.audio_utils import spectrogram
 
-        # Ensure 1D array
         if audio_array.ndim == 2:
             audio_array = audio_array.squeeze(0)
 
-        # Resample if input sample rate differs from target rate
         if sampling_rate is not None and sampling_rate != self.sampling_rate:
             audio_array = self._resample_audio(audio_array, sampling_rate, self.sampling_rate)
 
-        # Compute mel spectrogram with power=1.0 (matches official MiMo)
-        # spectrogram() returns [n_mels, time] with log_mel applied
         mels = spectrogram(
             waveform=audio_array,
             window=self.window,
@@ -127,12 +123,11 @@ class MiMoAudioProcessor:
             power=1.0,  # Amplitude spectrogram (matches official MiMo)
             center=True,
             mel_filters=self.mel_filters,
-            log_mel="log",  # Natural logarithm (matches official torch.log)
-            mel_floor=1e-7,  # Matches official torch.clip(spec, min=1e-7)
+            log_mel="log",
+            mel_floor=1e-7,
         )
 
-        # mels is [n_mels, time], transpose to [1, time, n_mels] for model input
-        mels = mels.T[None, :, :]  # [1, time, n_mels]
+        mels = mels.T[None, :, :]
         input_lens = np.array([mels.shape[1]])
 
         logger.info(

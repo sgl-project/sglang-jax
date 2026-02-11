@@ -23,16 +23,16 @@ class MultimodalPromptBuilder:
         "asr": {
             "prefix": "<|im_start|>user\n",
             "suffix": "{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n",
-            "default_prompt": "请转录这段音频",
+            "default_prompt": "transcribe the text content in this file",
         },
         "tts": {
             "prefix": "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n",
-            "default_prompt": "请生成语音",
+            "default_prompt": "convert text to speech",
         },
         "audio_understanding": {
             "prefix": "<|im_start|>user\n",
             "suffix": "{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n",
-            "default_prompt": "请回答问题",
+            "default_prompt": "identify the content in the audio",
         },
     }
 

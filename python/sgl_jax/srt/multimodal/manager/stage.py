@@ -150,10 +150,8 @@ class Stage:
             model_class = get_model_class(self.stage_config.model_class)
             stage_sub_dir = getattr(self.stage_config, "stage_sub_dir", None)
 
-            # Use per-stage model_path if available, otherwise fall back to server_args
             stage_model_path = getattr(self.stage_config, "model_path", None)
             if stage_model_path:
-                # Create a copy of server_args with the stage-specific model_path
                 import dataclasses
 
                 stage_server_args = dataclasses.replace(

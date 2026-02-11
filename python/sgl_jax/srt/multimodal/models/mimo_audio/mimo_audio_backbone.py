@@ -14,7 +14,7 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.models.qwen2 import Qwen2DecoderLayer  # Import Qwen2 components
+from sgl_jax.srt.models.qwen2 import Qwen2DecoderLayer
 from sgl_jax.srt.multimodal.configs.audio.mimo_audio_backbone_config import (
     MiMoAudioArguments,
     MiMoAudioBackboneConfig,

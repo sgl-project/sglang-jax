@@ -16,14 +16,14 @@ NegativePromptSuffix = "_negative"
 MIMO_AUDIO_GROUP_SIZE = 4
 MIMO_AUDIO_CHANNELS = 8
 MIMO_SPEECH_EMPTY_IDS = (1024, 1024, 128, 128, 128, 128, 128, 128)
-MIMO_SPEECH_VOCAB_SIZES = (1025, 1025, 129, 129, 129, 129, 129, 129)  # For token validation
-MIMO_EMPTY_IDX = 151667       # <|empty|> - text placeholder in audio patches
-MIMO_SOSP_IDX = 151665        # <|sosp|> - start of speech
-MIMO_EOSP_IDX = 151666        # <|eosp|> - end of speech
-MIMO_SOSTM_IDX = 151670       # <|sostm|> - start of streaming
-MIMO_EOSTM_IDX = 151671       # <|eostm|> - end of streaming
-MIMO_EOT_IDX = 151672         # <|eot|> - end of turn
-MIMO_TEXT_PADDING = -100      # padding for text patches (timesteps 1-3)
+MIMO_SPEECH_VOCAB_SIZES = (1025, 1025, 129, 129, 129, 129, 129, 129)
+MIMO_EMPTY_IDX = 151667
+MIMO_SOSP_IDX = 151665
+MIMO_EOSP_IDX = 151666
+MIMO_SOSTM_IDX = 151670
+MIMO_EOSTM_IDX = 151671
+MIMO_EOT_IDX = 151672
+MIMO_TEXT_PADDING = -100
 
 
 @dataclass

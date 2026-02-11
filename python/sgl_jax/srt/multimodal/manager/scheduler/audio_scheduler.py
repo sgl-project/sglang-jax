@@ -81,7 +81,6 @@ class AudioScheduler:
             codes = jax.device_get(output.codes)
             output_lens = jax.device_get(output.output_lengths)
 
-            # Replace codes beyond valid length with empty IDs
             if codes is not None and output_lens is not None and len(output_lens) > 0:
                 valid_len = int(output_lens[0])
                 total_len = codes.shape[1]

@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 
 MIMO_EOS_TOKENS = {151672, 151643, 151645, 151671}  # EOT, EOS, IM_END, EOSTM
 MIMO_GROUP_SIZE = 4
-MAX_GROUPS = 512  # Fixed maximum length (~85 seconds of audio at 24kHz)
-MAX_NEW_TOKENS = 256  # Maximum tokens to generate
+MAX_GROUPS = 5120
+MAX_NEW_TOKENS = 8192
 MAX_TOTAL_GROUPS = MAX_GROUPS + MAX_NEW_TOKENS  # Total cache slots to pre-allocate
 
 
@@ -61,14 +61,11 @@ class AudioBackboneScheduler:
         self.server_args = server_args
         self.aborted_rids: set[str] = set()
 
-        # Scheduler manages cache state (moved from worker)
         self._cache_locations: dict[str, np.ndarray] = {}
         self._total_seq_lens: dict[str, int] = {}
 
-        # Random key for sampling
         self.rng_key = jax.random.PRNGKey(42)
 
-        # Create worker within mesh context so JIT functions are traced with mesh available
         with self.mesh:
             self.backbone_worker = AudioBackboneModelWorker(
                 model_class=model_class, mesh=self.mesh, server_args=server_args
@@ -153,16 +150,12 @@ class AudioBackboneScheduler:
             if all_cache_loc is None:
                 raise RuntimeError(f"Failed to allocate {MAX_TOTAL_GROUPS} KV cache slots")
 
-            # Store for decode steps
             self._cache_locations[rid] = all_cache_loc
-            self._total_seq_lens[rid] = actual_T_groups  # ✅ Use actual length, not padded!
+            self._total_seq_lens[rid] = actual_T_groups
 
-            # For prefill, use first T_groups slots (T_groups includes padding)
             out_cache_loc = all_cache_loc[:T_groups]
-            current_seq_len = actual_T_groups  # ✅ Seq len should be actual, not padded
+            current_seq_len = actual_T_groups
 
-            # Positions and metadata for EXTEND mode
-            # Note: positions uses T_groups (padded) for RoPE, but seq lens use actual
             positions = jnp.arange(T_groups, dtype=jnp.int32)
             forward_mode = ForwardMode.EXTEND
             extend_start_loc = jnp.array([0], dtype=jnp.int32)
@@ -170,18 +163,14 @@ class AudioBackboneScheduler:
             extend_prefix_lens = jnp.zeros(B, dtype=jnp.int32)
 
         else:
-            # Decode: Reuse pre-allocated cache
             all_cache_loc = self._cache_locations[rid]
             existing_seq_len = self._total_seq_lens[rid]
 
-            # Use next 1 slot for the new group
             out_cache_loc = all_cache_loc[existing_seq_len:existing_seq_len + 1]
             current_seq_len = existing_seq_len + 1
 
-            # Update tracking
             self._total_seq_lens[rid] = current_seq_len
 
-            # Positions and metadata for DECODE mode
             positions = jnp.array([existing_seq_len], dtype=jnp.int32)
             forward_mode = ForwardMode.DECODE
             extend_start_loc = None
@@ -191,7 +180,6 @@ class AudioBackboneScheduler:
         req_pool_indices = np.arange(B, dtype=np.int32)
         seq_lens_arr = np.array([current_seq_len] * B, dtype=np.int32)
 
-        # Create attention mask for padded positions (EXTEND mode only)
         attention_mask = None
         if is_prefill and actual_T_groups < T_groups:
             attention_mask = jnp.zeros(T_groups, dtype=jnp.bool_)
@@ -207,7 +195,7 @@ class AudioBackboneScheduler:
             req_pool_indices=jnp.array(req_pool_indices),
             seq_lens=jnp.array(seq_lens_arr),
             out_cache_loc=jnp.array(out_cache_loc),
-            cache_loc=jnp.array(all_cache_loc),  # ✅ Fixed shape: (MAX_TOTAL_GROUPS,)
+            cache_loc=jnp.array(all_cache_loc),
             extend_start_loc=extend_start_loc,
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
@@ -221,7 +209,6 @@ class AudioBackboneScheduler:
         seq_len: int,
         is_prefill: bool = True,
     ) -> LogitsMetadata:
-        """Create LogitsMetadata for the forward pass."""
         if is_prefill:
             return LogitsMetadata(
                 forward_mode=ForwardMode.EXTEND,
@@ -238,7 +225,6 @@ class AudioBackboneScheduler:
             )
 
     def _prepare_batch(self, req: Req) -> tuple[jax.Array, ForwardBatch, LogitsMetadata]:
-        """Prepare batch with padding and fixed shape for JIT compilation."""
         input_ids = req.input_ids
         rid = req.rid
 
@@ -258,7 +244,6 @@ class AudioBackboneScheduler:
         existing_seq_len = self._total_seq_lens.get(rid, 0)
         is_prefill = existing_seq_len == 0
 
-        # Pad to fixed length ONLY during prefill
         if is_prefill:
             if T_groups < MAX_GROUPS:
                 pad_len = (MAX_GROUPS - T_groups) * MIMO_GROUP_SIZE
@@ -267,12 +252,9 @@ class AudioBackboneScheduler:
                 logger.debug(f"Padded from {actual_T_groups} to {MAX_GROUPS} groups")
             elif T_groups > MAX_GROUPS:
                 raise ValueError(f"Audio too long: {T_groups} groups > MAX_GROUPS={MAX_GROUPS}")
-        # else: Decode mode - don't pad, input_ids is just 1 group (4 tokens)
 
-        # Create ForwardBatch with fixed shape
         forward_batch = self._create_forward_batch(input_ids, rid, T_groups, actual_T_groups, is_prefill)
 
-        # Create LogitsMetadata (use actual length, not padded)
         logits_seq_len = actual_T_groups if is_prefill else 1
         logits_metadata = self._create_logits_metadata(B, logits_seq_len, is_prefill)
 
@@ -302,17 +284,13 @@ class AudioBackboneScheduler:
 
             logger.info("Starting generation loop for rid=%s, max_tokens=%d", req.rid, max_new_tokens)
 
-            # Internal loop: generate tokens until EOS or max_tokens
             while step_count < max_new_tokens:
-                # Prepare batch with padding and fixed shape
                 input_ids, forward_batch, logits_metadata = self._prepare_batch(req)
 
-                # Forward through main transformer
                 (text_logits_output, local_hidden_states, _), _ = self.backbone_worker.forward(
                     input_ids, forward_batch, logits_metadata
                 )
 
-                # Extract logits and sample text token
                 next_token_logits = text_logits_output.next_token_logits
                 logits_np = np.array(jax.device_get(next_token_logits))
 
@@ -328,11 +306,9 @@ class AudioBackboneScheduler:
                 else:
                     text_token_id = int(np.argmax(logits_np, axis=-1)[0])
 
-                # Accumulate generated token
                 accumulated_tokens.append(text_token_id)
                 logger.debug("Step %d: generated token %d", step_count, text_token_id)
 
-                # Generate audio tokens if model outputs <|empty|>
                 if text_token_id == MIMO_EMPTY_IDX:
                     self.rng_key, subkey = jax.random.split(self.rng_key)
                     audio_tokens, _ = self.backbone_worker.patch_decode(
@@ -342,13 +318,11 @@ class AudioBackboneScheduler:
                 else:
                     req.generated_audio_tokens = None
 
-                # Check if generation is finished
                 if text_token_id in MIMO_EOS_TOKENS:
                     logger.info("Generation finished for rid=%s at step %d (EOS)", req.rid, step_count)
                     req.is_finished = True
                     break
 
-                # Build next step input for autoregressive generation
                 req.generated_text_tokens = np.array([text_token_id], dtype=np.int32)
                 try:
                     req.input_ids = req.build_next_step_input()
@@ -359,15 +333,12 @@ class AudioBackboneScheduler:
                     req.is_finished = True
                     break
 
-            # Set accumulated tokens on request
             req.generated_text_tokens = np.array(accumulated_tokens, dtype=np.int32)
 
-            # Mark as finished if hit max tokens
             if step_count >= max_new_tokens:
                 logger.warning("Generation hit max_tokens=%d for rid=%s", max_new_tokens, req.rid)
                 req.is_finished = True
 
-            # Clear inputs to free memory
             req.input_ids = None
             req.audio_codes = None
             req.backbone_cache = None
@@ -377,7 +348,6 @@ class AudioBackboneScheduler:
                 req.rid, len(accumulated_tokens), req.is_finished
             )
 
-            # Send result once (instead of per-token)
             self._comm_backend.send_pyobj(req)
 
     def _get_sampler_config(self, req: Req) -> MiMoSamplerConfig:

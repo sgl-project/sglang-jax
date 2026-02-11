@@ -51,51 +51,44 @@ class VideoResponse(BaseModel):
     path: str | None = None
 
 
-# === OpenAI Audio API Compatibility ===
 
 class AudioSpeechRequest(BaseModel):
     """OpenAI /v1/audio/speech request."""
-    input: str                                    # 必需，最大 4096 字符
-    model: str                                    # tts-1, tts-1-hd, gpt-4o-mini-tts, etc.
-    voice: str                                    # alloy, echo, fable, onyx, nova, shimmer, etc.
-    response_format: str = "mp3"                 # mp3, opus, aac, flac, wav, pcm
-    speed: float = 1.0                           # 0.25-4.0
-    instructions: str | None = None              # 仅 gpt-4o 模型支持
-    stream_format: str | None = None             # sse 或 audio（仅 gpt-4o 模型）
+    input: str
+    model: str
+    voice: str
+    response_format: str = "mp3"
+    speed: float = 1.0
+    instructions: str | None = None
+    stream_format: str | None = None
 
 
 class AudioTranscriptionRequest(BaseModel):
-    """OpenAI /v1/audio/transcriptions request.
-
-    Note: 这是内部表示，实际 HTTP 端点支持 multipart/form-data 或 url
-    """
-    file: bytes | None = None                    # 音频文件字节（上传方式）
-    url: str | None = None                       # 音频文件 URL（URL 方式）
-    model: str                                   # gpt-4o-transcribe, whisper-1, etc.
-    language: str | None = None                  # ISO-639-1 代码
-    prompt: str | None = None                    # 上下文提示
-    response_format: str = "json"                # json, text, srt, verbose_json, vtt, diarized_json
-    temperature: float | None = None             # 0-1
-    timestamp_granularities: list[str] | None = None  # ["word", "segment"]
-    chunking_strategy: dict | None = None        # auto 或 server_vad
-    known_speaker_names: list[str] | None = None # 最多 4 个
-    known_speaker_references: list[str] | None = None  # data URLs
-    include: list[str] | None = None             # ["logprobs"]
-    stream: bool = False                         # SSE 流式传输
+    file: bytes | None = None
+    url: str | None = None
+    model: str
+    language: str | None = None
+    prompt: str | None = None
+    response_format: str = "json"
+    temperature: float | None = None
+    timestamp_granularities: list[str] | None = None
+    chunking_strategy: dict | None = None
+    known_speaker_names: list[str] | None = None
+    known_speaker_references: list[str] | None = None
+    include: list[str] | None = None
+    stream: bool = False
 
 
 class AudioTranscriptionResponse(BaseModel):
     """OpenAI transcription response (json format)."""
-    text: str                                    # 转录文本
-    # verbose_json 额外字段:
-    task: str | None = None                      # "transcribe"
-    language: str | None = None                  # 检测到的语言
-    duration: float | None = None                # 音频时长（秒）
-    segments: list[dict] | None = None           # 时间戳片段
-    words: list[dict] | None = None              # 词级时间戳
+    text: str
+    task: str | None = None
+    language: str | None = None
+    duration: float | None = None
+    segments: list[dict] | None = None
+    words: list[dict] | None = None
 
-    # usage 统计
-    usage: dict | None = None                    # token 或 duration 统计
+    usage: dict | None = None
 
 
 class DataType(Enum):

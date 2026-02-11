@@ -183,14 +183,12 @@ class ConvTranspose1d(nnx.Module):
         kernel = self.kernel.value
         kernel_size = kernel.shape[-1]
 
-        # Upsample by inserting zeros
         up_len = (length - 1) * self.stride + 1
         idx = jnp.arange(length) * self.stride
         upsampled = jnp.zeros((batch, up_len, channels), dtype=x.dtype)
         upsampled = upsampled.at[:, idx, :].set(x)
         upsampled = jnp.pad(upsampled, ((0, 0), (kernel_size - 1, kernel_size - 1), (0, 0)))
 
-        # Convolution
         lhs = jnp.swapaxes(upsampled, 1, 2)
         rhs = jnp.flip(kernel, axis=-1).transpose(1, 0, 2)
         y = jax.lax.conv_general_dilated(
@@ -231,7 +229,6 @@ class ISTFT(nnx.Module):
         frames = frames * self.window.value[None, :, None]
         frames = jnp.swapaxes(frames, 1, 2)
 
-        # Convert to numpy to avoid JAX sharding issues in the overlap-add loop
         frames_np = np.asarray(jax.device_get(frames))
         window_sq_np = np.asarray(jax.device_get(jnp.square(self.window.value)))
 
@@ -241,7 +238,6 @@ class ISTFT(nnx.Module):
         audio_np = np.zeros((batch, output_size), dtype=frames_np.dtype)
         env_np = np.zeros((batch, output_size), dtype=frames_np.dtype)
 
-        # Overlap-add in numpy (no sharding issues)
         for i in range(num_frames):
             start = i * self.hop_length
             end = start + self.win_length
@@ -823,7 +819,6 @@ class MiMoAudioTokenizer(nnx.Module):
         else:
             safetensors_path = model_path
 
-        # Load codebook weights
         with safe_open(safetensors_path, framework="numpy") as f:
             for i in range(self.config.num_quantizers):
                 hf_key = f"encoder.quantizer.vq.layers.{i}._codebook.embed"
