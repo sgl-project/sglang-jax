@@ -43,6 +43,7 @@ dependencies = [
     "pathwaysutils",
     "omegaconf",
     "imageio[ffmpeg]",
+    "librosa",
 ]
 
 [project.optional-dependencies]
@@ -64,7 +65,6 @@ multimodal = [
     "torch",
     "torchvision",
     "decord",
-    "librosa",
     "msgpack==1.0.0",
 ]
 
