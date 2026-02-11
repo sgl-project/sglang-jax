@@ -1384,6 +1384,7 @@ def main() -> int:
             )
         )
 
+    print("load epmoe weights")
     # Put MoE weights on device with the intended sharding to avoid a large replicated
     # array on a single device (important for FP8 quantization to not OOM).
     expert_w_np = np.asarray(wi_0_np).dtype if use_static else ml_dtypes.bfloat16
@@ -1415,6 +1416,7 @@ def main() -> int:
         fused_w_sharding,
     )
 
+    print("load fused weights")
     # Optional shared experts for BailingMoE: HF stores (out, in), transpose to match JAX shapes.
     # - Fused kernel expects these replicated (P()).
     # - EPMoE end-to-end computes shared_experts via MLP (BF16 or static FP8 QuantizedLinear).
@@ -1538,12 +1540,14 @@ def main() -> int:
                 "keys were not found; fused shared path may be incorrect."
             )
 
+    print("load epmoe params")
     # Replace randomly initialized params with checkpoint slice.
     with jax.sharding.use_abstract_mesh(epmoe.updated_mesh):
         epmoe.wi_0 = nnx.Param(wi_0, out_sharding=P("expert", "tensor", None))
         epmoe.wi_1 = nnx.Param(wi_1, out_sharding=P("expert", "tensor", None))
         epmoe.wo = nnx.Param(wo, out_sharding=P("expert", None, "tensor"))
 
+    print("load epmoe scales")
     if use_static:
         wi_0_scale_np, wi_1_scale_np, wo_scale_np = static_scales
         subc_quant_wsz = 256
@@ -1718,10 +1722,16 @@ def main() -> int:
             jnp.bfloat16
         )
     fused_out = jax.sharding.reshard(fused_out, NamedSharding(mesh, P(None)))
+    if fused_out_no_shared is not None:
+        fused_out_no_shared = jax.sharding.reshard(
+            fused_out_no_shared, NamedSharding(mesh, P(None))
+        )
+    print("reshape fused out")
     fused_np = np.asarray(jax.device_get(fused_out))
     fused_no_shared_np = (
         None if fused_out_no_shared is None else np.asarray(jax.device_get(fused_out_no_shared))
     )
+    ep_out = jax.sharding.reshard(ep_out, NamedSharding(mesh, P(None)))
     ep_np = np.asarray(jax.device_get(ep_out))
     ep_expert_np = np.asarray(jax.device_get(ep_out_expert))
 
