@@ -772,6 +772,8 @@ class WeightLoader:
                             regular_mappings[weight_info_key] = replaced_mapping
 
         logger.info("Starting parallel weight loading via JAX Lazy Loader...")
+        quant_cfg = getattr(self.model_config, "quantization_config", None)
+        is_static_quant = quant_cfg is not None and quant_cfg.is_static_checkpoint
 
         with SequentialSafetensorManager() as file_manager:
             # 2. Process Regular Weights (Lazy Pull)
@@ -977,9 +979,9 @@ class WeightLoader:
                     target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
 
-                    if mapping.physical_to_logical_map is not None:
+                    if is_static_quant and moe_key.endswith("_scale"):
                         logger.info(
-                            "MoE assign debug group=%s target=%s loaded_shape=%s final_shape=%s "
+                            "MoE scale debug group=%s target=%s loaded_shape=%s final_shape=%s "
                             "param_shape=%s reshape=%s repeat=%s sharding=%s",
                             moe_key,
                             target_path,
@@ -1070,9 +1072,9 @@ class WeightLoader:
                     target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
 
-                    if mapping.physical_to_logical_map is not None:
+                    if is_static_quant and moe_key.endswith("_scale"):
                         logger.info(
-                            "Split-MoE assign debug group=%s target=%s loaded_shape=%s final_shape=%s "
+                            "Split-MoE scale debug group=%s target=%s loaded_shape=%s final_shape=%s "
                             "param_shape=%s reshape=%s repeat=%s sharding=%s",
                             moe_key,
                             target_path,
