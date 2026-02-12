@@ -465,9 +465,8 @@ class EPMoE(nnx.Module):
             wo_kernel_bias,
         )
 
-        if self.ep_size > 1:
-            intermediate_output = self._combine(intermediate_output)
-
+        # Weighted-sum the top-k dimension locally before AllReduce to halve
+        # the collective data volume (topk copies collapsed to 1).
         output = self._unpermute(
             intermediate_output,
             sorted_selected_experts,
@@ -475,6 +474,10 @@ class EPMoE(nnx.Module):
             batch_size,
             seq_len,
         )
+
+        if self.ep_size > 1:
+            output = self._combine(output)
+
         return output
 
     def _gmm_compute(
