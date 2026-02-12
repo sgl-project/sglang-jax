@@ -411,6 +411,8 @@ class TokenizerManager:
             return_routed_experts=obj.return_routed_experts,
             is_multi_item_scoring=bool(obj.is_multi_item_scoring),
             multi_item_scoring_delimiter=obj.multi_item_scoring_delimiter,
+            multi_item_algorithm=obj.multi_item_algorithm,
+            multi_item_mask_mode=obj.multi_item_mask_mode,
         )
         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
         if (
@@ -1349,6 +1351,8 @@ class TokenizerManager:
                     sampling_params={"max_new_tokens": 0},
                     is_multi_item_scoring=True,
                     multi_item_scoring_delimiter=delimiter_token_id,
+                    multi_item_algorithm="packed",
+                    multi_item_mask_mode=self.server_args.multi_item_mask_impl,
                 )
                 results = await self.generate_request(batch_request, request).__anext__()
                 result = results[0] if isinstance(results, list) else results

@@ -164,6 +164,10 @@ class TokenizedGenerateReqInput:
     is_multi_item_scoring: bool = False
     # Delimiter token id used for multi-item scoring.
     multi_item_scoring_delimiter: int | None = None
+    # Optional algorithm selector for multi-item scoring.
+    multi_item_algorithm: str | None = None
+    # Optional mask mode override for multi-item scoring.
+    multi_item_mask_mode: str | None = None
 
 
 @dataclass
@@ -307,6 +311,10 @@ class GenerateReqInput:
     is_multi_item_scoring: list[bool] | bool | None = None
     # Delimiter token id used for multi-item scoring.
     multi_item_scoring_delimiter: list[int | None] | int | None = None
+    # Optional algorithm selector for multi-item scoring.
+    multi_item_algorithm: list[str | None] | str | None = None
+    # Optional mask mode override for multi-item scoring.
+    multi_item_mask_mode: list[str | None] | str | None = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -375,6 +383,10 @@ class GenerateReqInput:
             self.is_multi_item_scoring = False
         if self.multi_item_scoring_delimiter is None:
             self.multi_item_scoring_delimiter = None
+        if self.multi_item_algorithm is None:
+            self.multi_item_algorithm = None
+        if self.multi_item_mask_mode is None:
+            self.multi_item_mask_mode = None
 
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
@@ -491,6 +503,12 @@ class GenerateReqInput:
         self.multi_item_scoring_delimiter = self._normalize_param(
             self.multi_item_scoring_delimiter, None, "multi_item_scoring_delimiter", num
         )
+        self.multi_item_algorithm = self._normalize_param(
+            self.multi_item_algorithm, None, "multi_item_algorithm", num
+        )
+        self.multi_item_mask_mode = self._normalize_param(
+            self.multi_item_mask_mode, None, "multi_item_mask_mode", num
+        )
 
     # Helper function to normalize a parameter
     def _normalize_param(self, param, default_value, param_name, num):
@@ -558,6 +576,8 @@ class GenerateReqInput:
             return_routed_experts=self.return_routed_experts[i],
             is_multi_item_scoring=self.is_multi_item_scoring[i],
             multi_item_scoring_delimiter=self.multi_item_scoring_delimiter[i],
+            multi_item_algorithm=self.multi_item_algorithm[i],
+            multi_item_mask_mode=self.multi_item_mask_mode[i],
         )
 
 

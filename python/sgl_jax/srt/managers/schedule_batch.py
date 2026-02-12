@@ -64,6 +64,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "disable_radix_cache",
     "multi_item_scoring_delimiter",
     "max_multi_item_seq_len",
+    "multi_item_mask_impl",
+    "multi_item_segment_fallback_threshold",
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
     "enable_deterministic_sampling",
@@ -172,6 +174,8 @@ class Req:
         return_routed_experts: bool = False,
         is_multi_item_scoring: bool = False,
         multi_item_scoring_delimiter: int | None = None,
+        multi_item_algorithm: str | None = None,
+        multi_item_mask_mode: str | None = None,
     ):
         # Input and output info
         self.rid = rid
@@ -200,6 +204,8 @@ class Req:
         self.return_hidden_states = return_hidden_states
         self.is_multi_item_scoring = is_multi_item_scoring
         self.multi_item_scoring_delimiter = multi_item_scoring_delimiter
+        self.multi_item_algorithm = multi_item_algorithm
+        self.multi_item_mask_mode = multi_item_mask_mode
 
         # Extra key for cache namespace isolation (e.g., cache_salt, lora_id)
         if lora_id is not None:

@@ -27,6 +27,10 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 
 logger = logging.getLogger(__name__)
 
+MULTI_ITEM_MASK_MODE_CAUSAL = 0
+MULTI_ITEM_MASK_MODE_DENSE = 1
+MULTI_ITEM_MASK_MODE_SEGMENT = 2
+
 
 @register_pytree_node_class
 @dataclass
@@ -44,6 +48,9 @@ class FlashAttentionMetadata:
     seq_lens: jax.Array = None
     distribution: jax.Array = None
     custom_mask: jax.Array = None
+    multi_item_prefix_end: jax.Array = None
+    multi_item_row_seg_starts: jax.Array = None
+    multi_item_mask_mode: int = MULTI_ITEM_MASK_MODE_CAUSAL
 
     def tree_flatten(self):
         children = (
@@ -54,9 +61,11 @@ class FlashAttentionMetadata:
             self.seq_lens,
             self.distribution,
             self.custom_mask,
+            self.multi_item_prefix_end,
+            self.multi_item_row_seg_starts,
         )
 
-        aux_data = {}
+        aux_data = {"multi_item_mask_mode": self.multi_item_mask_mode}
         return (children, aux_data)
 
     @classmethod
@@ -70,6 +79,11 @@ class FlashAttentionMetadata:
         obj.seq_lens = children[4]
         obj.distribution = children[5]
         obj.custom_mask = children[6]
+        obj.multi_item_prefix_end = children[7]
+        obj.multi_item_row_seg_starts = children[8]
+        obj.multi_item_mask_mode = aux_data.get(
+            "multi_item_mask_mode", MULTI_ITEM_MASK_MODE_CAUSAL
+        )
 
         return obj
 
@@ -160,6 +174,44 @@ class FlashAttention(AttentionBackend):
 
         return mask
 
+    @staticmethod
+    def _build_multi_item_segment_layout(
+        tokens: np.ndarray,
+        delimiter_token_id: int,
+    ) -> tuple[int, np.ndarray]:
+        """Build per-row segment metadata for shared-prefix multi-item masking.
+
+        Returns:
+            prefix_end: shared prefix end (exclusive).
+            row_seg_starts: for each query row, the first key index of its item segment.
+        """
+        q_len = tokens.shape[0]
+        delimiter_indices = np.flatnonzero(tokens == delimiter_token_id)
+        if delimiter_indices.size == 0:
+            raise ValueError(
+                f"Multi-item scoring sequence must contain delimiter token {delimiter_token_id}."
+            )
+
+        query_len = int(delimiter_indices[0])
+        if query_len <= 0:
+            raise ValueError(
+                "Multi-item scoring requires a non-empty query prefix before delimiter."
+            )
+        if delimiter_indices.size < 2:
+            raise ValueError("Multi-item scoring sequence must contain at least two delimiters.")
+
+        prefix_end = query_len + 1
+        row_seg_starts = np.zeros((q_len,), dtype=np.int32)
+
+        for i in range(delimiter_indices.size - 1):
+            seg_start = int(delimiter_indices[i]) + 1
+            seg_end_delim = int(delimiter_indices[i + 1])
+            if seg_start > seg_end_delim:
+                raise ValueError("Invalid multi-item delimiter layout: empty item block boundary.")
+            row_seg_starts[seg_start : seg_end_delim + 1] = seg_start
+
+        return prefix_end, row_seg_starts
+
     def get_forward_metadata(
         self,
         batch: ModelWorkerBatch,
@@ -214,6 +266,7 @@ class FlashAttention(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
+        sharding = NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None
         (
             metadata.num_seqs,
             metadata.cu_q_lens,
@@ -223,7 +276,18 @@ class FlashAttention(AttentionBackend):
             metadata.distribution,
         ) = device_array(
             (num_seqs, cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
-            sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
+            sharding=sharding,
+        )
+        metadata.multi_item_mask_mode = MULTI_ITEM_MASK_MODE_CAUSAL
+        padded_token_len = int(batch.input_ids.shape[0])
+        default_prefix_end = np.zeros_like(seq_lens, dtype=np.int32)
+        default_row_seg_starts = np.zeros((padded_token_len,), dtype=np.int32)
+        (
+            metadata.multi_item_prefix_end,
+            metadata.multi_item_row_seg_starts,
+        ) = device_array(
+            (default_prefix_end, default_row_seg_starts),
+            sharding=sharding,
         )
 
         # Multi-item scoring uses a custom attention mask to isolate item blocks.
@@ -238,61 +302,113 @@ class FlashAttention(AttentionBackend):
             max_multi_item_seq_len = int(
                 global_server_args_dict.get("max_multi_item_seq_len", 8192)
             )
-            padded_token_len = int(batch.input_ids.shape[0])
             if padded_token_len > max_multi_item_seq_len:
                 raise ValueError(
                     f"Multi-item scoring padded token length {padded_token_len} exceeds "
                     f"max_multi_item_seq_len={max_multi_item_seq_len}."
                 )
 
-            static_size = padded_token_len * padded_token_len
-            concatenated_mask = np.zeros(static_size, dtype=np.int32)
-            mask_write_pt = 0
-            token_pt = 0
-            for req_idx in range(batch.real_bs):
-                q_len = int(batch.extend_seq_lens[req_idx])
-                kv_len = int(batch.seq_lens[req_idx])
-                if q_len <= 0 or kv_len <= 0:
-                    continue
+            mask_impl = str(global_server_args_dict.get("multi_item_mask_impl", "auto"))
+            fallback_threshold = int(
+                global_server_args_dict.get("multi_item_segment_fallback_threshold", 32768)
+            )
+            use_segment = mask_impl == "segment" or (
+                mask_impl == "auto" and padded_token_len <= fallback_threshold
+            )
 
-                req_tokens = np.asarray(
-                    batch.input_ids[token_pt : token_pt + q_len], dtype=np.int32
-                )
-                token_pt += q_len
+            if use_segment:
+                prefix_end = np.zeros_like(seq_lens, dtype=np.int32)
+                row_seg_starts = np.zeros((padded_token_len,), dtype=np.int32)
+                token_pt = 0
 
-                if batch.multi_item_scoring_flags[req_idx]:
-                    # Radix cache is disabled for multi-item mode, so q_len == kv_len.
-                    if kv_len != q_len:
-                        raise ValueError(
-                            "Multi-item scoring requires extend mode without prefix cache "
-                            f"(got q_len={q_len}, kv_len={kv_len})."
+                for req_idx in range(batch.real_bs):
+                    q_len = int(batch.extend_seq_lens[req_idx])
+                    kv_len = int(batch.seq_lens[req_idx])
+                    if q_len <= 0 or kv_len <= 0:
+                        continue
+
+                    req_start = token_pt
+                    req_end = token_pt + q_len
+                    req_tokens = np.asarray(batch.input_ids[req_start:req_end], dtype=np.int32)
+                    token_pt = req_end
+
+                    if batch.multi_item_scoring_flags[req_idx]:
+                        # Radix cache is disabled for multi-item mode, so q_len == kv_len.
+                        if kv_len != q_len:
+                            raise ValueError(
+                                "Multi-item scoring requires extend mode without prefix cache "
+                                f"(got q_len={q_len}, kv_len={kv_len})."
+                            )
+                        req_prefix_end, req_row_seg_starts = self._build_multi_item_segment_layout(
+                            req_tokens,
+                            batch.multi_item_scoring_delimiter,
                         )
-                    req_mask = self._build_multi_item_attention_mask(
-                        req_tokens,
-                        batch.multi_item_scoring_delimiter,
-                    )
-                else:
-                    req_mask = self._build_causal_extend_mask(q_len=q_len, kv_len=kv_len)
+                        prefix_end[req_idx] = req_prefix_end
+                        row_seg_starts[req_start:req_end] = req_row_seg_starts
+                    else:
+                        # Default causal behavior for non-multi-item rows.
+                        prefix_end[req_idx] = 0
+                        row_seg_starts[req_start:req_end] = 0
 
-                req_mask_flat = req_mask.reshape(-1)
-                next_pt = mask_write_pt + req_mask_flat.size
-                if next_pt > static_size:
+                (
+                    metadata.multi_item_prefix_end,
+                    metadata.multi_item_row_seg_starts,
+                ) = device_array(
+                    (prefix_end, row_seg_starts),
+                    sharding=sharding,
+                )
+                metadata.multi_item_mask_mode = MULTI_ITEM_MASK_MODE_SEGMENT
+                metadata.custom_mask = None
+            else:
+                static_size = padded_token_len * padded_token_len
+                concatenated_mask = np.zeros(static_size, dtype=np.int32)
+                mask_write_pt = 0
+                token_pt = 0
+                for req_idx in range(batch.real_bs):
+                    q_len = int(batch.extend_seq_lens[req_idx])
+                    kv_len = int(batch.seq_lens[req_idx])
+                    if q_len <= 0 or kv_len <= 0:
+                        continue
+
+                    req_tokens = np.asarray(
+                        batch.input_ids[token_pt : token_pt + q_len], dtype=np.int32
+                    )
+                    token_pt += q_len
+
+                    if batch.multi_item_scoring_flags[req_idx]:
+                        # Radix cache is disabled for multi-item mode, so q_len == kv_len.
+                        if kv_len != q_len:
+                            raise ValueError(
+                                "Multi-item scoring requires extend mode without prefix cache "
+                                f"(got q_len={q_len}, kv_len={kv_len})."
+                            )
+                        req_mask = self._build_multi_item_attention_mask(
+                            req_tokens,
+                            batch.multi_item_scoring_delimiter,
+                        )
+                    else:
+                        req_mask = self._build_causal_extend_mask(q_len=q_len, kv_len=kv_len)
+
+                    req_mask_flat = req_mask.reshape(-1)
+                    next_pt = mask_write_pt + req_mask_flat.size
+                    if next_pt > static_size:
+                        raise ValueError(
+                            f"Constructed custom mask is too large ({next_pt}) "
+                            f"for static size {static_size}."
+                        )
+                    concatenated_mask[mask_write_pt:next_pt] = req_mask_flat
+                    mask_write_pt = next_pt
+
+                if mask_write_pt > static_size:
                     raise ValueError(
-                        f"Constructed custom mask is too large ({next_pt}) "
+                        f"Constructed custom mask is too large ({mask_write_pt}) "
                         f"for static size {static_size}."
                     )
-                concatenated_mask[mask_write_pt:next_pt] = req_mask_flat
-                mask_write_pt = next_pt
-
-            if mask_write_pt > static_size:
-                raise ValueError(
-                    f"Constructed custom mask is too large ({mask_write_pt}) "
-                    f"for static size {static_size}."
+                metadata.custom_mask = device_array(
+                    concatenated_mask,
+                    sharding=sharding,
                 )
-            metadata.custom_mask = device_array(
-                concatenated_mask,
-                sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
-            )
+                metadata.multi_item_mask_mode = MULTI_ITEM_MASK_MODE_DENSE
         else:
             metadata.custom_mask = None
         return metadata
@@ -588,8 +704,19 @@ class FlashAttention(AttentionBackend):
         kv_cache_fused_paged = kv_cache_fused.reshape(
             num_pages, self.page_size, -1, (self.head_dim + 127) // 128 * 128
         )
-        if self.forward_metadata.custom_mask is not None:
+        mask_mode = getattr(
+            self.forward_metadata,
+            "multi_item_mask_mode",
+            MULTI_ITEM_MASK_MODE_CAUSAL,
+        )
+        if self.forward_metadata.custom_mask is not None or mask_mode == MULTI_ITEM_MASK_MODE_SEGMENT:
             causal = 0
+        multi_item_prefix_end = self.forward_metadata.multi_item_prefix_end
+        if multi_item_prefix_end is None:
+            multi_item_prefix_end = jnp.zeros_like(self.forward_metadata.seq_lens, dtype=jnp.int32)
+        multi_item_row_seg_starts = self.forward_metadata.multi_item_row_seg_starts
+        if multi_item_row_seg_starts is None:
+            multi_item_row_seg_starts = jnp.zeros((q.shape[0],), dtype=jnp.int32)
         # Select page indices and remap to SWA pool if KV cache supports it
         page_indices_arg = self.forward_metadata.page_indices
         if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
@@ -606,6 +733,8 @@ class FlashAttention(AttentionBackend):
             P(),  # cu_kv_lens
             P(),  # distribution
             P(),  # custom_mask
+            P(),  # multi_item_prefix_end
+            P(),  # multi_item_row_seg_starts
         )
         out_specs = (
             P(None, self.kv_partition_axis),  # attention output
@@ -633,6 +762,7 @@ class FlashAttention(AttentionBackend):
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
                 ),
                 vmem_limit_bytes=self.vmem_limit_bytes,
+                multi_item_mask_mode=mask_mode,
             )
 
             return result, updated_kv_cache_fused
@@ -656,6 +786,8 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
             self.forward_metadata.custom_mask,
+            multi_item_prefix_end,
+            multi_item_row_seg_starts,
         )
         pad_width = (self.head_dim + 127) // 128 * 128 - self.head_dim
         if pad_width > 0:

@@ -174,9 +174,13 @@ class ServerArgs:
     # Benchmark showed chunk_size=32 provides 10.8x speedup over serial with safe memory.
     # See: sglang-jax-dev-scripts/investigations/multi-item-chunk-size-benchmark.md
     multi_item_scoring_chunk_size: int = 32
-    # Maximum number of items allowed in a single multi-item scoring request.
-    # Requests exceeding this limit will be rejected.
-    max_multi_item_count: int = 512
+    # Attention mask implementation for multi-item scoring:
+    # - auto: prefer segment metadata path when safe, otherwise fallback to dense mask.
+    # - dense: force the existing dense custom mask path.
+    # - segment: force segment metadata path.
+    multi_item_mask_impl: str = "auto"
+    # In auto mode, use dense masks above this padded token length.
+    multi_item_segment_fallback_threshold: int = 32768
 
     # LoRA
     enable_lora: bool | None = None
@@ -970,6 +974,19 @@ class ServerArgs:
             default=ServerArgs.max_multi_item_count,
             help="Maximum number of items allowed in a single multi-item scoring request.",
         )
+        parser.add_argument(
+            "--multi-item-mask-impl",
+            type=str,
+            choices=["auto", "dense", "segment"],
+            default=ServerArgs.multi_item_mask_impl,
+            help="Multi-item mask implementation: auto, dense, or segment.",
+        )
+        parser.add_argument(
+            "--multi-item-segment-fallback-threshold",
+            type=int,
+            default=ServerArgs.multi_item_segment_fallback_threshold,
+            help="In auto mode, fallback to dense mask above this padded token length.",
+        )
 
         parser.add_argument(
             "--multimodal",
@@ -1140,6 +1157,14 @@ class ServerArgs:
                 self.multi_item_scoring_chunk_size >= 0
             ), "--multi-item-scoring-chunk-size must be non-negative"
             assert self.max_multi_item_count > 0, "--max-multi-item-count must be positive"
+            assert self.multi_item_mask_impl in (
+                "auto",
+                "dense",
+                "segment",
+            ), "--multi-item-mask-impl must be one of: auto, dense, segment"
+            assert (
+                self.multi_item_segment_fallback_threshold > 0
+            ), "--multi-item-segment-fallback-threshold must be positive"
 
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""

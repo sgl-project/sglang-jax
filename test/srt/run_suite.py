@@ -425,6 +425,7 @@ suites = {
     "multi-item-scoring-test-tpu-v6e-1": [
         TestFile("test/srt/test_multi_item_positions.py", 2),
         TestFile("test/srt/test_multi_item_chunking.py", 3),
+        TestFile("test/srt/test_multi_item_segment_mask.py", 2),
         TestFile("test/srt/test_multi_item_scheduler_output.py", 2),
         TestFile("test/srt/test_multi_item_regression.py", 4),
         TestFile("test/srt/test_bench_multi_item_score.py", 10),

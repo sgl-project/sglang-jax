@@ -12,6 +12,7 @@ import statistics
 import time
 import unittest
 from dataclasses import dataclass
+import os
 from typing import List
 
 import jax
@@ -63,6 +64,8 @@ class TestMultiItemScorePerformance(CustomTestCase):
     STATIC_PREFIX_LEN = 100
     DYNAMIC_SUFFIX_LEN = 1900  # 100 + 1900 = 2000
     DELIMITER_TOKEN_ID = 128001  # Specific delimiter for multi-item
+    MASK_IMPL = os.getenv("MULTI_ITEM_MASK_IMPL", "auto")
+    SEGMENT_FALLBACK_THRESHOLD = int(os.getenv("MULTI_ITEM_SEGMENT_FALLBACK_THRESHOLD", "32768"))
 
     @classmethod
     def setUpClass(cls):
@@ -92,6 +95,8 @@ class TestMultiItemScorePerformance(CustomTestCase):
             multi_item_scoring_delimiter=cls.DELIMITER_TOKEN_ID,
             disable_radix_cache=True,
             max_multi_item_seq_len=32768,
+            multi_item_mask_impl=cls.MASK_IMPL,
+            multi_item_segment_fallback_threshold=cls.SEGMENT_FALLBACK_THRESHOLD,
         )
 
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model_name, trust_remote_code=True)

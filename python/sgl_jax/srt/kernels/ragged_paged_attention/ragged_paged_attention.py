@@ -302,6 +302,8 @@ def _ragged_paged_attention_kernel(
     kv_cache_fused_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_interleaved // kv_packing, kv_packing, head_dim]
     custom_mask_ref,  # (flatten_total_kv_len, head_dim), int32, dma not support bool type
     zero_mask_ref,  # (bkv_sz, head_dim), int32, dma not support bool type
+    multi_item_prefix_end_ref,  # [padded_batch_size], int32
+    multi_item_row_seg_starts_ref,  # [padded_num_tokens], int32
     # Output
     o_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     updated_kv_cache_fused_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_interleaved // kv_packing, kv_packing, head_dim]
@@ -326,6 +328,7 @@ def _ragged_paged_attention_kernel(
     chunk_prefill_size: int | None = None,
     bkv_p,
     bq_sz,
+    multi_item_mask_mode: int = 0,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert q_hbm_ref.shape[-1] == kv_cache_fused_hbm_ref.shape[-1]  # head_dim should match
@@ -924,15 +927,38 @@ def _ragged_paged_attention_kernel(
                     start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
 
                 def load_mask(q_span, k_span):
+                    if multi_item_mask_mode == 2:
+                        q_token_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
+                        q_token_indices = q_token_start + lax.iota(jnp.int32, actual_bq_sz)
+                        row_seg_by_token = multi_item_row_seg_starts_ref[q_token_indices]
+                        row_seg_starts = jnp.repeat(row_seg_by_token, num_q_heads_per_kv_head)
+
+                        q_row_positions = q_span[:, 0]
+                        prefix_end = multi_item_prefix_end_ref[seq_idx]
+                        is_prefix_row = q_row_positions < prefix_end
+
+                        causal_allow = k_span <= q_row_positions[:, None]
+                        shared_prefix_allow = k_span < prefix_end
+                        segment_allow = jnp.logical_and(
+                            k_span >= row_seg_starts[:, None],
+                            k_span <= q_row_positions[:, None],
+                        )
+                        allow = jnp.where(
+                            is_prefix_row[:, None],
+                            causal_allow,
+                            jnp.logical_or(shared_prefix_allow, segment_allow),
+                        )
+                        return jnp.logical_not(allow)
+
                     if bkvmask_ref is None:
                         return q_span < k_span
-                    else:
-                        # use custom mask
-                        mask = bkvmask_ref[bkv_sem_idx, :actual_bq_sz, :, 0]
-                        num_q_heads_per_kv_head_mask = jnp.repeat(
-                            mask, num_q_heads_per_kv_head, axis=0
-                        )
-                        return num_q_heads_per_kv_head_mask != 1
+
+                    # use custom mask
+                    mask = bkvmask_ref[bkv_sem_idx, :actual_bq_sz, :, 0]
+                    num_q_heads_per_kv_head_mask = jnp.repeat(
+                        mask, num_q_heads_per_kv_head, axis=0
+                    )
+                    return num_q_heads_per_kv_head_mask != 1
 
                 # Flash attention with cur bkv and bq
                 # NOTE: kv_packing is divided by 2 because k and v are packed together.
@@ -1232,7 +1258,10 @@ def static_validate_inputs_fused(
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     cu_kv_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
+    multi_item_prefix_end: jax.Array | None = None,  # i32[max_num_seqs]
+    multi_item_row_seg_starts: jax.Array | None = None,  # i32[max_num_tokens]
     *,
+    multi_item_mask_mode: int = 0,
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
@@ -1303,6 +1332,18 @@ def static_validate_inputs_fused(
             f"Expected int32 dtype for {kv_lens.dtype=}, {page_indices.dtype=},"
             f" {cu_q_lens.dtype=}, {distribution.dtype=}"
         )
+    if multi_item_prefix_end is not None and multi_item_prefix_end.dtype != jnp.int32:
+        raise ValueError(
+            f"Expected int32 dtype for multi_item_prefix_end, got {multi_item_prefix_end.dtype=}"
+        )
+    if (
+        multi_item_row_seg_starts is not None
+        and multi_item_row_seg_starts.dtype != jnp.int32
+    ):
+        raise ValueError(
+            "Expected int32 dtype for multi_item_row_seg_starts, "
+            f"got {multi_item_row_seg_starts.dtype=}"
+        )
 
     if not (len(kv_lens.shape) == len(page_indices.shape) == len(cu_q_lens.shape) == 1):
         raise ValueError(
@@ -1316,6 +1357,20 @@ def static_validate_inputs_fused(
         raise ValueError(f"Expected {cu_kv_lens.shape=} to be ({max_num_seqs + 1},).")
     if distribution.shape != (3,):
         raise ValueError(f"Expected {distribution.shape=} to be (3,).")
+    if (
+        multi_item_prefix_end is not None
+        and multi_item_prefix_end.shape != (max_num_seqs,)
+    ):
+        raise ValueError(
+            f"Expected {multi_item_prefix_end.shape=} to be ({max_num_seqs},)."
+        )
+    if (
+        multi_item_row_seg_starts is not None
+        and multi_item_row_seg_starts.shape != (q.shape[0],)
+    ):
+        raise ValueError(
+            f"Expected {multi_item_row_seg_starts.shape=} to be ({q.shape[0]},)."
+        )
 
     if sliding_window is not None and sliding_window <= 0:
         raise ValueError(f"{sliding_window=} must be positive.")
@@ -1331,6 +1386,8 @@ def static_validate_inputs_fused(
         raise ValueError(f"{num_queries_per_block=} must be positive.")
     if vmem_limit_bytes is not None and vmem_limit_bytes <= 0:
         raise ValueError(f"{vmem_limit_bytes=} must be positive.")
+    if multi_item_mask_mode not in (0, 1, 2):
+        raise ValueError(f"{multi_item_mask_mode=} must be one of (0, 1, 2).")
 
     del sm_scale
     del mask_value
@@ -1338,6 +1395,7 @@ def static_validate_inputs_fused(
     del k_scale
     del v_scale
     del xai_temperature_len
+    del multi_item_mask_mode
 
 
 def get_kernel_scope_name(bq_size, bkv_p, page_size):
@@ -1360,6 +1418,7 @@ def get_kernel_scope_name(bq_size, bkv_p, page_size):
         "num_kv_pages_per_block",
         "num_queries_per_block",
         "vmem_limit_bytes",
+        "multi_item_mask_mode",
     ),
     donate_argnames=("kv_cache_fused",),
 )
@@ -1374,8 +1433,11 @@ def ragged_paged_attention(
     cu_kv_lens: jax.Array,  # i32[padded_batch_size + 1]
     distribution: jax.Array,  # i32[3]
     custom_mask: jax.Array,  # if causal is True, custom_mask shape is [patten_total_kv_len], else [0]
+    multi_item_prefix_end: jax.Array | None = None,  # i32[padded_batch_size]
+    multi_item_row_seg_starts: jax.Array | None = None,  # i32[padded_num_tokens]
     *,
     causal: int = 1,  # 1: True, 0: False
+    multi_item_mask_mode: int = 0,  # 0: causal, 1: dense custom mask, 2: segment metadata
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
@@ -1408,7 +1470,10 @@ def ragged_paged_attention(
         sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
         k is also the total number of sequences.
       custom_mask: use custom mask to calculate attention.
+      multi_item_prefix_end: per-sequence prefix end index (exclusive) for segment mode.
+      multi_item_row_seg_starts: per-query-token segment start index for segment mode.
       causal: If causal is set to True, use causal mask. Otherwise, use custom_mask.
+      multi_item_mask_mode: 0=causal, 1=dense custom mask, 2=segment metadata mask.
       sm_scale: the softmax scale which will be applied to the Q@K^T.
       sliding_window: the sliding window size for the attention.
       soft_cap: the logit soft cap for the attention.
@@ -1439,6 +1504,9 @@ def ragged_paged_attention(
         cu_q_lens,
         cu_kv_lens,
         distribution,
+        multi_item_prefix_end=multi_item_prefix_end,
+        multi_item_row_seg_starts=multi_item_row_seg_starts,
+        multi_item_mask_mode=multi_item_mask_mode,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
@@ -1500,6 +1568,10 @@ def ragged_paged_attention(
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
     seq_mask_lens = kv_lens * q_lens
     cu_seq_mask_lens = jnp.concatenate([jnp.array([0], dtype=jnp.int32), jnp.cumsum(seq_mask_lens)])
+    if multi_item_prefix_end is None:
+        multi_item_prefix_end = jnp.zeros_like(kv_lens, dtype=jnp.int32)
+    if multi_item_row_seg_starts is None:
+        multi_item_row_seg_starts = jnp.zeros((queries.shape[0],), dtype=jnp.int32)
     if custom_mask is not None:
         if custom_mask.dtype == jnp.bool_:
             logger.warning(
@@ -1521,6 +1593,8 @@ def ragged_paged_attention(
         pl.BlockSpec(memory_space=pltpu.ANY),  # kv_cache_fused
         pl.BlockSpec(memory_space=pltpu.ANY) if custom_mask is not None else None,  # custom_mask
         pl.BlockSpec(memory_space=pltpu.ANY),  # zero mask
+        pl.BlockSpec(memory_space=pltpu.ANY),  # multi_item_prefix_end
+        pl.BlockSpec(memory_space=pltpu.ANY),  # multi_item_row_seg_starts
     ]
 
     out_specs = [
@@ -1636,6 +1710,7 @@ def ragged_paged_attention(
             chunk_prefill_size=chunk_prefill_size,
             bkv_p=bkv_p,
             bq_sz=bq_sz,
+            multi_item_mask_mode=multi_item_mask_mode,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(scalar_prefetches),
@@ -1672,6 +1747,8 @@ def ragged_paged_attention(
         kv_cache_fused_processed,
         custom_mask,
         jnp.zeros((bkv_sz, head_dim), dtype=jnp.int32),
+        multi_item_prefix_end,
+        multi_item_row_seg_starts,
     )
     return (
         prepare_outputs(output, actual_num_q_heads_per_kv_head, actual_head_dim),

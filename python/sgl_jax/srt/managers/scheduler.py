@@ -704,6 +704,8 @@ class Scheduler(
             return_hidden_states=recv_req.return_hidden_states,
             is_multi_item_scoring=recv_req.is_multi_item_scoring,
             multi_item_scoring_delimiter=recv_req.multi_item_scoring_delimiter,
+            multi_item_algorithm=getattr(recv_req, "multi_item_algorithm", None),
+            multi_item_mask_mode=getattr(recv_req, "multi_item_mask_mode", None),
         )
         req.tokenizer = self.tokenizer
 
