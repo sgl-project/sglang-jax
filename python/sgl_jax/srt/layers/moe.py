@@ -1169,7 +1169,7 @@ def create_moe_weights_mapping(
             sharding=sharding,
             transpose=transpose,
             concat_axis=concat_axis,
-            physical_to_logical_map=physical_to_logical_map,
+            # physical_to_logical_map=physical_to_logical_map,
         )
 
     return mappings

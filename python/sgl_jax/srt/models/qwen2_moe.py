@@ -366,7 +366,6 @@ class Qwen2MoeDecoderLayer(nnx.Module):
             shared_output = None
 
         router_logits = self.moe_gate(hidden_states)
-        router_logits = jax.sharding.reshard(router_logits, P())
         topk_weights, topk_ids = self.topk(router_logits, dispatch_info=dispatch_info)
 
         if self.use_fused:

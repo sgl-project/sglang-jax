@@ -418,16 +418,15 @@ class BailingMoEDecoderLayer(nnx.Module):
             router_logits = self.moe_gate(hidden_states)
 
             correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
-            router_logits = jax.sharding.reshard(router_logits, P())
             topk_weights, topk_ids = self.topk(
                 router_logits,
                 correction_bias,
-                dispatch_info=dispatch_info,
+                dispatch_info=None,
             )
 
             if self.use_fused:
                 token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
-                topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
+                topk_ids = jnp.where(token_valid_mask[:, None] != 0, topk_ids, -1)
                 hidden_states = self.mlp(
                     hidden_states,
                     topk_weights,
@@ -758,7 +757,7 @@ class BailingMoEForCausalLM(nnx.Module):
                         sharding=mapping.sharding,
                         transpose=mapping.transpose,
                         concat_axis=mapping.concat_axis,
-                        physical_to_logical_map=mapping.physical_to_logical_map,
+                        # physical_to_logical_map=mapping.physical_to_logical_map,
                     )
 
                     scale_key = key + "_scale"
@@ -792,7 +791,7 @@ class BailingMoEForCausalLM(nnx.Module):
                             reshape=scale_reshape,
                             repeat=scale_repeat,
                             concat_axis=mapping.concat_axis,
-                            physical_to_logical_map=mapping.physical_to_logical_map,
+                            # physical_to_logical_map=mapping.physical_to_logical_map,
                         )
 
                     else:
@@ -815,7 +814,7 @@ class BailingMoEForCausalLM(nnx.Module):
                             reshape=scale_reshape,
                             repeat=scale_repeat,
                             concat_axis=mapping.concat_axis,
-                            physical_to_logical_map=mapping.physical_to_logical_map,
+                            # physical_to_logical_map=mapping.physical_to_logical_map,
                         )
 
                 mappings.update(new_moe_mappings)
