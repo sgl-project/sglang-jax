@@ -1,8 +1,8 @@
 import logging
 from typing import Any
 
+import jax
 from flax import nnx
-from jax import jax
 from jax import numpy as jnp
 from transformers import PretrainedConfig
 
@@ -420,7 +420,7 @@ class Qwen3OmniMoeThinkerTextModel(nnx.Module):
         return hidden_states, layers_kv_fused, layers_topk_ids
 
 
-class Qwen3OmniMoeTinkerTextForConditionalGeneration(nnx.Module):
+class Qwen3OmniMoeThinkerTextForConditionalGeneration(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,

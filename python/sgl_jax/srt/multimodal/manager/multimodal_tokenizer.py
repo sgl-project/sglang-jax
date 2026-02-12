@@ -658,7 +658,7 @@ class MultimodalTokenizer(TokenizerManager):
         if source.startswith(("http://", "https://")):
             try:
                 audio_data, _ = librosa.load(
-                    BytesIO(urlopen(source).read()),
+                    BytesIO(urlopen(source, timeout=10).read()),
                     sr=self.mm_processor.feature_extractor.sampling_rate,
                 )
                 return audio_data

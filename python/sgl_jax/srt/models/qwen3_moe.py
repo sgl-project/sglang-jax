@@ -1,8 +1,8 @@
 import logging
 from typing import Any
 
+import jax
 from flax import nnx
-from jax import jax
 from jax import numpy as jnp
 from transformers import PretrainedConfig
 
