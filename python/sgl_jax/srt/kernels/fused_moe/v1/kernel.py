@@ -2005,11 +2005,11 @@ def _fused_ep_moe_kernel(
             out_offset = pl.multiple_of(out_offset, 16)
 
             # Add SE result (F32) directly - no dtype conversion needed
-            if w1_shared_hbm is not None:
-                se_tile = b_se_acc_vmem[
-                    out_buf_id, pl.ds(out_offset, acc_bt), pl.ds(0, hidden_size)
-                ]
-                output_tile = output_tile.reshape(acc_bt, hidden_size) + se_tile
+            # if w1_shared_hbm is not None:
+            #     se_tile = b_se_acc_vmem[
+            #         out_buf_id, pl.ds(out_offset, acc_bt), pl.ds(0, hidden_size)
+            #     ]
+            #     output_tile = output_tile.reshape(acc_bt, hidden_size) + se_tile
 
             target_slice = b_output_x2_vmem.at[
                 out_buf_id, pl.ds(out_offset, acc_bt), pl.ds(0, hidden_size)
