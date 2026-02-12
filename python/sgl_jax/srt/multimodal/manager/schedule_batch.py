@@ -332,9 +332,6 @@ class Req:
         else:
             return stage_result
 
-    # =========================================================================
-    # MiMo Audio Aggregation Methods
-    # =========================================================================
 
     def _build_backbone_input(self) -> jax.Array:
         """Build backbone input by aggregating text and audio into [1, 9, seq_len] format.
@@ -352,14 +349,11 @@ class Req:
         segments = []
 
         if self.audio_mode == "tts":
-            # TTS: text patches + <|sosp|> marker (backbone will generate audio)
             if self.text_input_ids:
                 segments.append(self._build_text_segment(self.text_input_ids))
-            # Add start-of-speech marker to signal audio generation
             segments.append(self._build_sosp_segment())
 
         elif self.audio_mode == "audio_understanding":
-            # Audio understanding: [prefix] + audio patches + question text
             if self.prompt_input_ids:
                 segments.append(self._build_text_segment(self.prompt_input_ids))
                 
@@ -372,7 +366,6 @@ class Req:
                 segments.append(self._build_text_segment(self.text_input_ids))
 
         elif self.audio_mode == "asr":
-            # ASR: [prefix] + audio patches + instruction text
             if self.prompt_input_ids:
                 segments.append(self._build_text_segment(self.prompt_input_ids))
 
@@ -385,7 +378,6 @@ class Req:
                 segments.append(self._build_text_segment(self.text_input_ids))
 
         else:
-            # Default: just use whatever is available
             if self.audio_codes is not None:
                 segments.append(self._build_audio_segment(self.audio_codes))
             if self.text_input_ids:
@@ -395,19 +387,9 @@ class Req:
             logger.warning("No segments to build for backbone input, rid=%s", self.rid)
             return None
 
-        # Concatenate all segments along sequence dimension
-        input_ids = jnp.concatenate(segments, axis=1)  # [9, total_seq_len]
+        input_ids = jnp.concatenate(segments, axis=1)
 
-        # Dump detailed backbone input structure for debugging
-        logger.info("=" * 60)
-        logger.info("Backbone Input Dump (rid=%s, audio_mode=%s):", self.rid, self.audio_mode)
-        logger.info("  prompt_input_ids: %s", self.prompt_input_ids[:20] if self.prompt_input_ids else None)
-        logger.info("  text_input_ids: %s", self.text_input_ids[:20] if self.text_input_ids else None)
-        logger.info("  audio_codes shape: %s", self.audio_codes.shape if self.audio_codes is not None else None)
-        logger.info("  Final input_ids shape: %s", input_ids.shape)
-        # Show first row (text channel) structure
         text_channel = input_ids[0, :]
-        # Find non-padding tokens
         non_padding_mask = text_channel != MIMO_TEXT_PADDING
         non_padding_indices = jnp.where(non_padding_mask)[0]
         if len(non_padding_indices) > 0:
@@ -415,7 +397,7 @@ class Req:
             logger.info("  Text channel (first 30 non-padding): %s", sample_tokens)
         logger.info("=" * 60)
 
-        return input_ids[None, :, :]  # [1, 9, total_seq_len]
+        return input_ids[None, :, :]
 
     def _build_text_segment(self, text_ids: list) -> jax.Array:
         """Build a text-only segment where text tokens are active.
@@ -435,7 +417,6 @@ class Req:
         if not text_ids:
             return jnp.zeros((1 + MIMO_AUDIO_CHANNELS, 0), dtype=jnp.int32)
 
-        # Expand each text token with padding: [t1] -> [t1, -100, -100, -100]
         text_expanded = []
         for t in text_ids:
             text_expanded.append(t)
@@ -444,7 +425,6 @@ class Req:
         seq_len = len(text_expanded)
         text_row = jnp.array(text_expanded, dtype=jnp.int32)
 
-        # Build audio channel rows with speech_empty_ids
         rows = [text_row]
         for ch in range(MIMO_AUDIO_CHANNELS):
             row = jnp.full((seq_len,), MIMO_SPEECH_EMPTY_IDS[ch], dtype=jnp.int32)
@@ -481,16 +461,12 @@ class Req:
             audio_codes = jnp.concatenate([audio_codes, padding], axis=1)
             T_audio = audio_codes.shape[1]
 
-        # Text channel: [Empty, -100, -100, -100] pattern
-        # Initialize with -100 (padding)
         text_row = jnp.full((T_audio,), MIMO_TEXT_PADDING, dtype=jnp.int32)
-        # Set every group_size-th element to Empty
         text_row = text_row.at[::MIMO_AUDIO_GROUP_SIZE].set(MIMO_EMPTY_IDX)
 
-        # Concatenate text row with audio codes
         return jnp.concatenate(
             [text_row[None, :], audio_codes.astype(jnp.int32)], axis=0
-        )  # [9, T_audio]
+        )
 
     def _build_sosp_segment(self) -> jax.Array:
         """Build a <|sosp|> (start of speech) segment.
@@ -503,7 +479,6 @@ class Req:
         Returns:
             Tensor of shape [9, group_size]
         """
-        # Text row: sosp token followed by padding
         text_row = jnp.array(
             [MIMO_SOSP_IDX] + [MIMO_TEXT_PADDING] * (MIMO_AUDIO_GROUP_SIZE - 1),
             dtype=jnp.int32,
@@ -514,7 +489,7 @@ class Req:
             row = jnp.full((MIMO_AUDIO_GROUP_SIZE,), MIMO_SPEECH_EMPTY_IDS[ch], dtype=jnp.int32)
             rows.append(row)
 
-        return jnp.stack(rows, axis=0)  # [9, group_size]
+        return jnp.stack(rows, axis=0)
 
     def _build_eosp_segment(self) -> jax.Array:
         """Build a <|eosp|> (end of speech) segment.
@@ -556,22 +531,16 @@ class Req:
 
         token_id = int(self.generated_text_tokens[0])
 
-        # Text row: [token, token, token, token] - repeat token across all 4 timesteps
-        # This matches official MiMo implementation where next_text_tokens.expand(-1, group_size, -1)
         text_row = [token_id] * MIMO_AUDIO_GROUP_SIZE
         text_row = jnp.array(text_row, dtype=jnp.int32)
 
         rows = [text_row]
 
         if self.generated_audio_tokens is not None:
-            # generated_audio_tokens: [B, group_size, audio_channels]
-            # We need [audio_channels, group_size]
             audio_tokens = self.generated_audio_tokens
             if hasattr(audio_tokens, "shape") and audio_tokens.ndim == 3:
-                # Take first batch item and transpose
                 audio_rows = audio_tokens[0].T.astype(jnp.int32)
 
-                # Validate and clamp audio tokens to valid ranges
                 for i in range(MIMO_AUDIO_CHANNELS):
                     row = audio_rows[i]
                     vocab_size = MIMO_SPEECH_VOCAB_SIZES[i]
@@ -584,25 +553,21 @@ class Req:
                             "Replacing with empty IDs.",
                             i, min_val, max_val, vocab_size
                         )
-                        # Replace with empty IDs to prevent NaN propagation
                         row = jnp.full(
                             (MIMO_AUDIO_GROUP_SIZE,), MIMO_SPEECH_EMPTY_IDS[i], dtype=jnp.int32
                         )
                     rows.append(row)
             else:
-                # Fallback: fill with empty IDs
                 for ch in range(MIMO_AUDIO_CHANNELS):
                     row = jnp.full(
                         (MIMO_AUDIO_GROUP_SIZE,), MIMO_SPEECH_EMPTY_IDS[ch], dtype=jnp.int32
                     )
                     rows.append(row)
         else:
-            # No audio tokens - fill with speech empty IDs
             for ch in range(MIMO_AUDIO_CHANNELS):
                 row = jnp.full(
                     (MIMO_AUDIO_GROUP_SIZE,), MIMO_SPEECH_EMPTY_IDS[ch], dtype=jnp.int32
                 )
                 rows.append(row)
 
-        # Stack and add batch dim: [1, 9, group_size]
         return jnp.stack(rows, axis=0)[None, :, :]

@@ -23,7 +23,9 @@ from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
 
-MIMO_EOS_TOKENS = {151672, 151643, 151645, 151671}  # EOT, EOS, IM_END, EOSTM
+# Deprecated: Use model_config.eos_token_id instead
+# Kept for backward compatibility if config doesn't have eos_token_id
+MIMO_EOS_TOKENS_FALLBACK = {151672, 151643, 151645, 151671}  # EOT, EOS, IM_END, EOSTM
 MIMO_GROUP_SIZE = 4
 MAX_GROUPS = 512
 MAX_NEW_TOKENS = 256
@@ -69,6 +71,29 @@ class AudioBackboneScheduler:
         with self.mesh:
             self.backbone_worker = AudioBackboneModelWorker(
                 model_class=model_class, mesh=self.mesh, server_args=server_args
+            )
+
+        # Initialize EOS token IDs from model config
+        self._init_eos_token_ids()
+
+    def _init_eos_token_ids(self):
+        """Initialize EOS token IDs from model config or fallback to hardcoded values."""
+        model_config = self.backbone_worker.model_runner.model_config
+        eos_token_id = getattr(model_config, "eos_token_id", None)
+
+        if eos_token_id is not None:
+            # Convert to set for efficient membership testing
+            if isinstance(eos_token_id, int):
+                self.eos_token_ids = {eos_token_id}
+            else:
+                # Assume it's a list or set
+                self.eos_token_ids = set(eos_token_id)
+            logger.info("Loaded EOS token IDs from model config: %s", self.eos_token_ids)
+        else:
+            # Fallback to hardcoded values for backward compatibility
+            self.eos_token_ids = MIMO_EOS_TOKENS_FALLBACK
+            logger.warning(
+                "Model config does not have eos_token_id, using fallback: %s", self.eos_token_ids
             )
 
     def event_loop_normal(self):
@@ -318,7 +343,7 @@ class AudioBackboneScheduler:
                 else:
                     req.generated_audio_tokens = None
 
-                if text_token_id in MIMO_EOS_TOKENS:
+                if text_token_id in self.eos_token_ids:
                     logger.info("Generation finished for rid=%s at step %d (EOS)", req.rid, step_count)
                     req.is_finished = True
                     break

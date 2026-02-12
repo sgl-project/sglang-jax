@@ -50,6 +50,9 @@ class MiMoAudioBackboneConfig(PretrainedConfig):
     revision: Optional[str] = None
     dtype: str = "bfloat16"
 
+    # EOS tokens (aligned with Qwen2 base model)
+    eos_token_id: Optional[list[int] | int] = None
+
     def __post_init__(self):
         if self.speech_vocab_sizes is None:
             self.speech_vocab_sizes = [1025, 1025, 129, 129, 129, 129, 129, 129]
@@ -57,6 +60,13 @@ class MiMoAudioBackboneConfig(PretrainedConfig):
             self.speech_empty_ids = [1024, 1024, 128, 128, 128, 128, 128, 128]
         if self.delay_pattern is None:
             self.delay_pattern = [0, 1, 2, 3, 4, 5, 6, 7]
+        if self.eos_token_id is None:
+            # Default EOS tokens for MiMo Audio:
+            # 151643: EOS (Qwen2 default)
+            # 151645: IM_END
+            # 151671: EOSTM (End of Speech Turn Marker)
+            # 151672: EOT (End of Turn)
+            self.eos_token_id = [151643, 151645, 151671, 151672]
 
     def get_total_num_kv_heads(self) -> int:
         return self.num_key_value_heads
