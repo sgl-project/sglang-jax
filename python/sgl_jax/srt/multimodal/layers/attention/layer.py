@@ -5,7 +5,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 
-def simple_attention(query, key, value, scale=None, causal=False):
+def simple_attention(query, key, value, scale=None, causal=False, mask=None):
     """Simple dot-product attention for diffusion models (no KV cache).
 
     Args:
@@ -14,6 +14,8 @@ def simple_attention(query, key, value, scale=None, causal=False):
         value: [B, S, H, D]
         scale: softmax scale, default 1/sqrt(D)
         causal: whether to apply causal mask
+        mask: optional attention mask [B, S], indicating which tokens should be masked.
+              Values of 0 will be masked out (set to -inf before softmax)
     Returns:
         output: [B, S, H, D]
     """
@@ -30,8 +32,16 @@ def simple_attention(query, key, value, scale=None, causal=False):
 
     if causal:
         seq_len = query.shape[1]
-        mask = jnp.tril(jnp.ones((seq_len, seq_len)))
-        attn_weights = jnp.where(mask == 0, float("-inf"), attn_weights)
+        causal_mask = jnp.tril(jnp.ones((seq_len, seq_len)))
+        attn_weights = jnp.where(causal_mask == 0, float("-inf"), attn_weights)
+
+    # Apply custom mask if provided
+    if mask is not None:
+        # mask is [B, S], expand to [B, 1, 1, S] for broadcasting over [B, H, S, S]
+        # This masks out key positions (last dimension of attn_weights)
+        mask_expanded = jnp.expand_dims(jnp.expand_dims(mask, axis=1), axis=1)
+        # Values of 0 in mask will be set to -inf
+        attn_weights = jnp.where(mask_expanded == 0, float("-inf"), attn_weights)
 
     attn_weights = jax.nn.softmax(attn_weights, axis=-1)
 
