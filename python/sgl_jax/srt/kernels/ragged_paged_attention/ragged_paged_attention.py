@@ -1605,7 +1605,11 @@ def ragged_paged_attention(
         )
 
         # Estimate costs (simplified)
-        total_interactions = max_num_tokens * (est_avg_context_len)
+        max_num_tokens = q.shape[0]
+        max_num_seqs = kv_lens.shape[0]
+        total_mapped_pages = page_indices.shape[0]
+        est_avg_context_len = (total_mapped_pages * page_size) // max_num_seqs
+        total_interactions = max_num_tokens * est_avg_context_len
         flops = 4 * actual_num_q_heads * head_dim * total_interactions
         bytes_accessed = q.size * q.itemsize * 2 # Q+O
         cost_estimate = pl.CostEstimate(flops=flops, bytes_accessed=bytes_accessed, transcendentals=0)
@@ -2022,7 +2026,12 @@ def prepare_kv_cache(
     head_dim = align_to(actual_head_dim, 128)
     k_cache_processed = jnp.pad(
         k_cache,
-        ((0, 0), (0, 0), (0, 0), (0, head_dim - actual_head_dim)),
+        (
+            (0, 0),
+            (0, 0),
+            (0, num_kv_heads - actual_num_kv_heads),
+            (0, head_dim - actual_head_dim),
+        ),
         constant_values=0,
     ).reshape(
         total_num_pages,
@@ -2033,7 +2042,12 @@ def prepare_kv_cache(
     )
     v_cache_processed = jnp.pad(
         v_cache,
-        ((0, 0), (0, 0), (0, 0), (0, head_dim - actual_head_dim)),
+        (
+            (0, 0),
+            (0, 0),
+            (0, num_kv_heads - actual_num_kv_heads),
+            (0, head_dim - actual_head_dim),
+        ),
         constant_values=0,
     ).reshape(
         total_num_pages,

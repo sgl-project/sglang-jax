@@ -233,26 +233,23 @@ def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int], mesh: Me
     import logging
     logger = logging.getLogger(__name__)
     max_k = max(top_logprobs_nums)
-    sharding = getattr(logprobs, "sharding", None)
-    parts = 8
-    if isinstance(sharding, NamedSharding):
-        parts = sharding.mesh.shape.get("tensor", 1)
-        logprobs = jax.sharding.reshard(logprobs, NamedSharding(sharding.mesh, P(None)))
-    else:
-        logprobs = jax.device_put(jax.device_get(logprobs))
-    aligned_k = int(math.ceil(max_k / parts) * parts) if parts > 0 else max_k
-    logger.info(
-        "sampler.get_top_logprobs max_k=%s aligned_k=%s sharding=%s",
-        max_k,
-        aligned_k,
-        sharding,
-    )
-    values, indices = jax.lax.top_k(logprobs, aligned_k)
+    
+    # NOTE: Removed explicit resharding to P(None) to avoid ShardMapExportPass crashes
+    # when called within a shard_map context. JAX should handle the top_k gathering automatically.
+    
+    values, indices = jax.lax.top_k(logprobs, max_k)
+    
+    # Ensure output is replicated if mesh is provided, to match downstream expectations
     replicated = NamedSharding(mesh, P(None)) if mesh is not None else None
     if replicated is not None:
-        values = jax.sharding.reshard(values, replicated)
-        indices = jax.sharding.reshard(indices, replicated)
-    values, indices = values[:, :max_k], indices[:, :max_k]
+        try:
+            values = jax.sharding.reshard(values, replicated)
+            indices = jax.sharding.reshard(indices, replicated)
+        except Exception as e:
+            # Fallback if resharding fails (e.g. inside strict shard_map), though top_k output 
+            # should generally be manageable.
+            logger.warning("Failed to reshard top_k output to replicated: %s", e)
+
     values = jnp.nan_to_num(values, neginf=-jnp.inf, posinf=jnp.inf)
 
     batch_size = len(top_logprobs_nums)

@@ -1438,6 +1438,9 @@ class WeightLoader:
         if mapping.kv_head_padding:
             processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
 
+        if hf_key.endswith("weight_scale_inv"):
+            processed_weight = jnp.reciprocal(processed_weight)
+
         sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
 
         try:

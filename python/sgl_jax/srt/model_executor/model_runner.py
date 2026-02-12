@@ -518,6 +518,17 @@ class ModelRunner(BaseModelRunner):
                 dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
                 head_dim=self.model_config.head_dim,
+                v_head_dim=getattr(self.model_config, "v_head_dim", self.model_config.head_dim),
+                swa_head_dim=getattr(self.model_config, "swa_head_dim", self.model_config.head_dim),
+                swa_v_head_dim=getattr(
+                    self.model_config,
+                    "swa_v_head_dim",
+                    getattr(
+                        self.model_config,
+                        "v_head_dim",
+                        getattr(self.model_config, "swa_head_dim", self.model_config.head_dim),
+                    ),
+                ),
                 mesh=self.mesh,
             )
         else:
@@ -529,10 +540,10 @@ class ModelRunner(BaseModelRunner):
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
-                head_dim=(head_dim + 127) // 128 * 128 if head_dim != v_head_dim else (head_dim + 127) // 128 * 128,
+                head_dim=head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 mesh=self.mesh,
-                v_head_dim=(v_head_dim + 127) // 128 * 128 if head_dim != v_head_dim else (head_dim + 127) // 128 * 128,
+                v_head_dim=v_head_dim,
             )
 
         # Create KV pool allocator

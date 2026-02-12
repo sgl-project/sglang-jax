@@ -255,6 +255,25 @@ class MHATokenToKVPool(KVCache):
         self.kv_partition_axis = "tensor"
         self.is_split = self.head_dim != self.v_head_dim
 
+        if self.is_split:
+            logger.info(
+                "[KVPool] split enabled: head_dim=%s v_head_dim=%s layer_num=%s size=%s page_size=%s",
+                self.head_dim,
+                self.v_head_dim,
+                self.layer_num,
+                self.size,
+                self.page_size,
+            )
+        else:
+            logger.info(
+                "[KVPool] fused path: head_dim=%s v_head_dim=%s layer_num=%s size=%s page_size=%s",
+                self.head_dim,
+                self.v_head_dim,
+                self.layer_num,
+                self.size,
+                self.page_size,
+            )
+
         self._create_buffers()
         self._calculate_memory_usage()
 
@@ -624,6 +643,8 @@ class SWAKVPool(KVCache):
         swa_attention_layer_ids: list[int],
         full_attention_layer_ids: list[int],
         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        swa_head_dim: int | None = None,
+        swa_v_head_dim: int | None = None,
         **kwargs,
     ):
         self.size = size
@@ -634,16 +655,29 @@ class SWAKVPool(KVCache):
         self.kv_partition_axis = "tensor"
         kwargs["page_size"] = 1
 
+        # Build separate kwargs for full / SWA pools to allow different head dims
+        kwargs_full = dict(kwargs)
+        kwargs_swa = dict(kwargs)
+
+        if swa_head_dim is not None:
+            kwargs_swa["head_dim"] = swa_head_dim
+        if swa_v_head_dim is not None:
+            kwargs_swa["v_head_dim"] = swa_v_head_dim
+
         self.swa_kv_pool = token_to_kv_pool_class(
             size=size_swa,
             layer_num=self.swa_layer_nums,
-            **kwargs,
+            **kwargs_swa,
         )
         self.full_kv_pool = token_to_kv_pool_class(
             size=size,
             layer_num=self.full_layer_nums,
-            **kwargs,
+            **kwargs_full,
         )
+        # A global "is_split" view so callers that only look at the top-level pool
+        # can still make the right decision; the actual per-layer decision is made
+        # in get_split_kv_buffer/get_kv_buffer.
+        self.is_split = self.full_kv_pool.is_split or self.swa_kv_pool.is_split
 
         self.layers_mapping: dict[int, tuple[int, bool]] = {}
         for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
@@ -690,6 +724,7 @@ class SWAKVPool(KVCache):
         obj.swa_kv_pool = children[0]
         obj.full_kv_pool = children[1]
         obj.full_to_swa_index_mapping = children[2]
+        obj.is_split = obj.full_kv_pool.is_split or obj.swa_kv_pool.is_split
 
         return obj
 
@@ -703,6 +738,17 @@ class SWAKVPool(KVCache):
         if is_swa:
             return self.swa_kv_pool.get_kv_buffer(layer_id_pool)
         return self.full_kv_pool.get_kv_buffer(layer_id_pool)
+
+    def get_split_kv_buffer(self, layer_id: int):
+        """
+        Return (k, v) buffers for the given layer, using split buffers if the
+        underlying pool supports it; otherwise fall back to get_kv_buffer.
+        """
+        layer_id_pool, is_swa = self.layers_mapping[layer_id]
+        pool = self.swa_kv_pool if is_swa else self.full_kv_pool
+        if hasattr(pool, "get_split_kv_buffer"):
+            return pool.get_split_kv_buffer(layer_id_pool)
+        return pool.get_kv_buffer(layer_id_pool)
 
     def get_fused_kv_buffer(self, layer_id):
         layer_id_pool, is_swa = self.layers_mapping[layer_id]

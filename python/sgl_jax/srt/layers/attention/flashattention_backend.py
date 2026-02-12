@@ -12,6 +12,7 @@ from jax.tree_util import register_pytree_node_class
 from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
     ragged_paged_attention,
 )
+from sgl_jax.srt.kernels.ragged_paged_attention.util import get_dtype_packing
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -442,8 +443,35 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
+        # Resolve whether the underlying KV pool for this layer uses split (K/V separate) buffers.
+        # For hybrid/SWA pools, the top-level pool may not expose is_split, so we dive into the
+        # per-layer sub-pool when available.
+        pool_for_layer = token_to_kv_pool
         is_split = getattr(token_to_kv_pool, "is_split", False)
-        
+        if hasattr(token_to_kv_pool, "layers_mapping"):
+            try:
+                layer_id_pool, is_swa = token_to_kv_pool.layers_mapping[layer.layer_id]
+                pool_for_layer = token_to_kv_pool.swa_kv_pool if is_swa else token_to_kv_pool.full_kv_pool
+                is_split = getattr(pool_for_layer, "is_split", is_split)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "FlashAttention: failed to resolve sub-pool for layer %s: %s",
+                    getattr(layer, "layer_id", None),
+                    e,
+                )
+
+        # Fused KV 路径目前假设 q/k/v 维度一致；当 v_head_dim != head_dim 时，强制要求使用 split KV cache，
+        # 否则 fused 缓存的布局 (2 * head_dim) 无法容纳较小的 V 维度且会导致错切。
+        if self.v_head_dim != self.head_dim and not is_split:
+            msg = (
+                "FlashAttention fused KV path不支持 v_head_dim!=head_dim；"
+                "请启用 split KV cache 或扩展 fused 布局以支持异构 V 维度。"
+            )
+            logger.error(
+                "%s layer_id=%s pool=%s", msg, getattr(layer, "layer_id", None), type(pool_for_layer).__name__
+            )
+            raise ValueError(msg)
+
         scale = (
             1.0 / jnp.sqrt(layer.head_dim)
             if (layer is None or layer.scaling is None)
@@ -468,6 +496,9 @@ class FlashAttention(AttentionBackend):
             # For split, we align each dimension to 128
             head_dim_aligned = (self.head_dim + 127) // 128 * 128
             v_head_dim_aligned = (self.v_head_dim + 127) // 128 * 128
+            kv_dim_aligned = max(head_dim_aligned, v_head_dim_aligned)
+            kv_packing = get_dtype_packing(k_cache.dtype)
+            kv_heads_aligned = (self.num_kv_heads + kv_packing - 1) // kv_packing * kv_packing
             
             # Pad Inputs
             # K cache and V cache should already be aligned by pool allocation, but check
@@ -481,17 +512,37 @@ class FlashAttention(AttentionBackend):
             if pad_width_k > 0:
                 k = jnp.pad(k, ((0,0), (0,0), (0, pad_width_k)))
                 
-            pad_width_v = v_head_dim_aligned - v.shape[-1]
+            pad_width_v = kv_dim_aligned - v.shape[-1]
             if pad_width_v > 0:
                 v = jnp.pad(v, ((0,0), (0,0), (0, pad_width_v)))
                 
-            # Caches are assumed aligned by pool
-            
+            # Align cached tensors to the padded dimensions expected by the kernel
             total_tokens = k_cache.shape[0]
             num_pages = total_tokens // self.page_size
-            
-            k_cache_paged = k_cache.reshape(num_pages, self.page_size, -1, head_dim_aligned)
-            v_cache_paged = v_cache.reshape(num_pages, self.page_size, -1, v_head_dim_aligned)
+            if kv_heads_aligned != self.num_kv_heads:
+                pad_h = kv_heads_aligned - self.num_kv_heads
+                k_cache = jnp.pad(k_cache, ((0, 0), (0, pad_h), (0, 0)))
+                v_cache = jnp.pad(v_cache, ((0, 0), (0, pad_h), (0, 0)))
+
+            if k_cache.shape[-1] != kv_dim_aligned:
+                k_cache = jnp.pad(
+                    k_cache, ((0, 0), (0, 0), (0, kv_dim_aligned - k_cache.shape[-1]))
+                )
+            if v_cache.shape[-1] != kv_dim_aligned:
+                v_cache = jnp.pad(
+                    v_cache, ((0, 0), (0, 0), (0, kv_dim_aligned - v_cache.shape[-1]))
+                )
+            cache_out_sharding = NamedSharding(self.mesh, P(None, None, self.kv_partition_axis, None))
+            k_cache_paged = jax.lax.reshape(
+                k_cache,
+                (num_pages, self.page_size, kv_heads_aligned, kv_dim_aligned),
+                out_sharding=cache_out_sharding,
+            )
+            v_cache_paged = jax.lax.reshape(
+                v_cache,
+                (num_pages, self.page_size, kv_heads_aligned, kv_dim_aligned),
+                out_sharding=cache_out_sharding,
+            )
             
             in_specs = (
                 P(None, self.kv_partition_axis),  # queries
@@ -538,8 +589,8 @@ class FlashAttention(AttentionBackend):
                 check_vma=False,
             )(
                 q.reshape(q.shape[0], -1, head_dim_aligned),
-                k.reshape(k.shape[0], -1, head_dim_aligned),
-                v.reshape(v.shape[0], -1, v_head_dim_aligned),
+                k.reshape(k.shape[0], -1, kv_dim_aligned),
+                v.reshape(v.shape[0], -1, kv_dim_aligned),
                 k_cache_paged,
                 v_cache_paged,
                 self.forward_metadata.seq_lens,
@@ -551,12 +602,12 @@ class FlashAttention(AttentionBackend):
                 attention_sink,
             )
             
-            if pad_width_q > 0:
+            # Always strip padding back to logical dims (head_dim / v_head_dim)
+            if attn_output.shape[-1] != self.head_dim:
                 attn_output = attn_output[..., :self.head_dim]
-                
-            if pad_width_k > 0:
+            if updated_k.shape[-1] != self.head_dim:
                 updated_k = updated_k[..., :self.head_dim]
-            if pad_width_v > 0:
+            if updated_v.shape[-1] != self.v_head_dim:
                 updated_v = updated_v[..., :self.v_head_dim]
                 
             return (
@@ -684,12 +735,10 @@ class FlashAttention(AttentionBackend):
                 attention_sink,
             )
             
-            # Slice output back to original head_dim if it was padded
-            if pad_width_q > 0:
+            # Slice output / cache back to logical dims irrespective of padding
+            if attn_output.shape[-1] != self.head_dim:
                  attn_output = attn_output[..., :self.head_dim]
-            
-            if pad_width_cache > 0:
-                 # Slice KV cache back to storage size (192)
+            if updated_kv_cache_fused.shape[-1] != self.head_dim:
                  updated_kv_cache_fused = updated_kv_cache_fused[..., :self.head_dim]
 
             return (
