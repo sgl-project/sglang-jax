@@ -53,6 +53,7 @@ class ModelWorker:
         req_to_token_pool: ReqToTokenPool | None = None,
         is_draft_worker: bool = False,
         model_class=None,
+        precompile_params: dict | None = None,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
@@ -62,6 +63,9 @@ class ModelWorker:
             server_args.speculative_algorithm
         )
         self.server_args = server_args
+
+        # pre_precompile
+        self.precompile_params = precompile_params
 
         # LoRA configurations
         self.lora_paths = server_args.lora_paths
@@ -395,6 +399,18 @@ class ModelWorker:
         valid_cache_loc = np.arange(bs)
         invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
         lora_ids = ["0"] * bs
+        capture_hidden_mode = CaptureHiddenMode.NULL
+        has_input_embedding = False
+        has_deepstack_visual_embedding = False
+        is_mrope_position = False
+        if self.precompile_params is not None:
+            capture_hidden_mode_int = self.precompile_params.get("capture_hidden_mode", 0)
+            capture_hidden_mode = CaptureHiddenMode.parse(capture_hidden_mode_int)
+            has_input_embedding = self.precompile_params.get("input_embedding", False)
+            has_deepstack_visual_embedding = self.precompile_params.get(
+                "deepstack_visual_embedding", False
+            )
+            is_mrope_position = self.precompile_params.get("mrope", False)
 
         return ModelWorkerBatch(
             bid=1,
@@ -416,7 +432,11 @@ class ModelWorker:
             ),
             extend_input_logprob_token_ids=None,
             positions=np.concat([valid_positions, invalid_positions], axis=0),
-            mrope_positions=None,
+            mrope_positions=(
+                np.broadcast_to(np.arange(num_tokens, dtype=np.int32), (3, num_tokens))
+                if is_mrope_position
+                else None
+            ),
             extend_start_loc=np.arange(bs, dtype=np.int64),
             cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
             extend_prefix_lens=(np.array([0] * bs) if mode == ForwardMode.EXTEND else None),
@@ -424,11 +444,28 @@ class ModelWorker:
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_logprob_start_lens=None,
-            capture_hidden_mode=(
-                CaptureHiddenMode.FULL if self.server_args.multimodal else CaptureHiddenMode.NULL
-            ),
+            capture_hidden_mode=capture_hidden_mode,
             spec_algorithm=speculative_algotithm,
             lora_ids=lora_ids,  # Already set to [None] * bs above
+            apply_for_deepstack=(
+                mode == ForwardMode.EXTEND
+                and self.server_args.multimodal
+                and has_deepstack_visual_embedding
+            ),
+            input_embedding=(
+                np.zeros((num_tokens, self.model_config.hidden_size), dtype=np.float16)
+                if mode == ForwardMode.EXTEND
+                and self.server_args.multimodal
+                and has_input_embedding
+                else None
+            ),
+            deepstack_visual_embedding=(
+                np.zeros((3, num_tokens, self.model_config.hidden_size), dtype=np.float16)
+                if mode == ForwardMode.EXTEND
+                and self.server_args.multimodal
+                and has_deepstack_visual_embedding
+                else None
+            ),
         )
 
     def get_model_runner(self):

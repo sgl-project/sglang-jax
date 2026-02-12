@@ -614,7 +614,7 @@ class WeightLoader:
         else:
             sharding = target_sharding
 
-        MAX_WORKERS = 128
+        MAX_WORKERS = 16
 
         def _load_stacked_slice(index):
             expert_slice = index[0]

@@ -41,9 +41,9 @@ dependencies = [
     "pybase64",
     "partial_json_parser",
     "pathwaysutils",
-    "pybase64",
     "omegaconf",
     "imageio[ffmpeg]",
+    "librosa",
 ]
 
 [project.optional-dependencies]
@@ -64,6 +64,8 @@ all = [
 multimodal = [
     "torch",
     "torchvision",
+    "decord",
+    "msgpack==1.0.0",
 ]
 
 [tool.setuptools.packages.find]

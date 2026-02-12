@@ -136,6 +136,7 @@ class Scheduler(
         mesh: jax.sharding.Mesh = None,
         model_class: None = None,
         stage_sub_dir: str | None = None,
+        precompile_params: dict | None = None,
     ):
         if stage_sub_dir is not None:
             server_args = dataclasses.replace(server_args)
@@ -281,6 +282,7 @@ class Scheduler(
             server_args=server_args,
             mesh=self.mesh,
             model_class=model_class,
+            precompile_params=precompile_params,
         )
 
         # launch draft worker
@@ -699,9 +701,19 @@ class Scheduler(
             return_hidden_states=recv_req.return_hidden_states,
         )
         req.tokenizer = self.tokenizer
-
         if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
             req.mm_inputs = recv_req.mm_inputs
+            multimodal_embedding = recv_req.mm_inputs.get("multimodal_embedding")
+            req.multimodal_embedding = multimodal_embedding
+            if (
+                recv_req.mm_inputs.get("deepstack_visual_pos_mask") is not None
+                and recv_req.mm_inputs.get("deepstack_visual_embedding") is not None
+            ):
+                req.apply_for_deepstack = True
+                req.deepstack_visual_pos_mask = recv_req.mm_inputs.get("deepstack_visual_pos_mask")
+                req.deepstack_visual_embedding = recv_req.mm_inputs.get(
+                    "deepstack_visual_embedding"
+                )
         # Validate prompt length
         error_msg = validate_input_length(
             req,

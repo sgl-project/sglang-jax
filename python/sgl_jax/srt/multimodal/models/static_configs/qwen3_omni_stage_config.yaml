@@ -1,4 +1,4 @@
-model_arch: Qwen2.5-VL
+model_arch: Qwen3-Omni
 stage_args:
  - stage_id: 0
    stage_sub_dir: ""
@@ -6,21 +6,20 @@ stage_args:
      num_tpus: 1
      device_kind: cpu
      max_batch_size: 1
-   scheduler: vit
+   scheduler: embedding
    final_output: false
    scheduler_params: {}
-   model_class: Qwen2_5_VL_VisionModel
+   model_class: Qwen3OmniMoeThinkerEmbedding
 
  - stage_id: 1
    stage_sub_dir: ""
    runtime:
-  #  num_tpus should be 8 for qwen2.5 vl 72B
      num_tpus: 4
      max_batch_size: 1
    scheduler: auto_regressive
    scheduler_params: {}
-   precompile_params: {"input_embedding": True, "deepstack_visual_embedding": False, "mrope": True}
-   model_class: Qwen2_5_VL_Generation
+   precompile_params: {"capture_hidden_mode": 0, "input_embedding": True, "deepstack_visual_embedding": True, "mrope": True}
+   model_class: Qwen3OmniMoeTinkerTextForConditionalGeneration
    final_output: true
    # final_output_type: text
 

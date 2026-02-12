@@ -25,7 +25,7 @@ from sgl_jax.srt.multimodal.common.modality_enum import (
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
 from sgl_jax.srt.multimodal.manager.io_struct import (
     TokenizedGenerateMMReqInput,
-    TokenizedGenerateVLMReqInput,
+    TokenizedGenerateOmniReqInput,
 )
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.manager.stage import Stage
@@ -140,7 +140,7 @@ class GlobalScheduler:
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (TokenizedGenerateMMReqInput, self.convert_request),
-                (TokenizedGenerateVLMReqInput, self.convert_vlm_request),
+                (TokenizedGenerateOmniReqInput, self.convert_omni_request),
                 (AbortReq, self.handle_abort_request),
                 (ProfileReq, self.handle_profile),
             ]
@@ -254,7 +254,7 @@ class GlobalScheduler:
         self.req_store[req.rid] = ReqTrackingState(req=req, current_stage=0)
         return req
 
-    def convert_vlm_request(self, input: TokenizedGenerateVLMReqInput):
+    def convert_omni_request(self, input: TokenizedGenerateOmniReqInput):
         """Convert a tokenized VLM input into internal Req."""
         req = Req(
             rid=input.rid,
@@ -264,11 +264,12 @@ class GlobalScheduler:
         )
         req.origin_input_text = input.prompt
         req.origin_input_ids = input.input_ids
-        req.vlm_inputs = input.mm_inputs
+        req.omni_inputs = input.mm_inputs
         if input.mm_inputs:
             mm_items = input.mm_inputs.get("mm_items", [])
             image_items = []
             video_items = []
+            audio_items = []
             all_mm_items = []
             for item in mm_items:
                 if isinstance(item, MultimodalDataItem):
@@ -277,6 +278,8 @@ class GlobalScheduler:
                         image_items.append(item)
                     elif item.is_video():
                         video_items.append(item)
+                    elif item.is_audio():
+                        audio_items.append(item)
                 elif isinstance(item, dict):
                     item_obj = MultimodalDataItem.from_dict(item)
                     all_mm_items.append(item_obj)
@@ -284,17 +287,33 @@ class GlobalScheduler:
                         image_items.append(item_obj)
                     elif item_obj.is_video():
                         video_items.append(item_obj)
+                    elif item_obj.is_audio():
+                        audio_items.append(item_obj)
 
             pixel_values_list = []
+            pixel_values_images_list = []
+            pixel_values_videos_list = []
+            audio_values_list = []
             for item in image_items:
                 if item.feature is not None:
                     pixel_values_list.append(np.asarray(item.feature))
+                    pixel_values_images_list.append(np.asarray(item.feature))
             for item in video_items:
                 if item.feature is not None:
                     pixel_values_list.append(np.asarray(item.feature))
+                    pixel_values_videos_list.append(np.asarray(item.feature))
+            for item in audio_items:
+                if item.feature is not None:
+                    audio_values_list.append(np.asarray(item.feature))
 
             if pixel_values_list:
                 req.pixel_values = np.concatenate(pixel_values_list, axis=0)
+            if pixel_values_images_list:
+                req.pixel_values_images = np.concatenate(pixel_values_images_list, axis=0)
+            if pixel_values_videos_list:
+                req.pixel_values_videos = np.concatenate(pixel_values_videos_list, axis=0)
+            if audio_values_list:
+                req.audio_features = np.concatenate(audio_values_list, axis=0)
 
             image_grid_thw = input.mm_inputs.get("image_grid_thw")
             if image_grid_thw is not None:

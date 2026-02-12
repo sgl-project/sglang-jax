@@ -21,7 +21,7 @@ from sgl_jax.srt.multimodal.manager.global_scheduler import run_global_scheduler
 from sgl_jax.srt.multimodal.manager.io_struct import (
     DataType,
     GenerateMMReqInput,
-    GenerateVLMReqInput,
+    GenerateOmniReqInput,
     ImageGenerationsRequest,
     VideoGenerationsRequest,
 )
@@ -90,7 +90,7 @@ def _extract_openai_prompt(
     request: ChatCompletionRequest,
     tokenizer,
     messages_override: list[dict] | None = None,
-) -> tuple[str, list[str] | None, list[str] | None]:
+) -> tuple[str, list[str] | None, list[str] | None, list[str] | None]:
     if tokenizer is None:
         raise ValueError("Tokenizer is not initialized for chat completions.")
     openai_messages = []
@@ -122,9 +122,6 @@ def _extract_openai_prompt(
             modalities,
         )
         openai_messages.append(processed_msg)
-
-    if audio_data:
-        raise ValueError("Audio inputs are not supported for this model.")
 
     assistant_prefix = None
     if (
@@ -181,7 +178,7 @@ def _extract_openai_prompt(
         if text_parts:
             prompt += "".join(text_parts)
 
-    return prompt, (image_data or None), (video_data or None)
+    return prompt, (image_data or None), (video_data or None), (audio_data or None)
 
 
 @app.api_route("/api/v1/videos/generation", methods=["POST", "PUT"])
@@ -204,17 +201,17 @@ async def chat_completions(obj: ChatCompletionRequest, request: Request):
     try:
         from sgl_jax.srt.entrypoints.http_server import _global_state
 
-        prompt, image_data, video_data = _extract_openai_prompt(
+        prompt, image_data, video_data, audio_data = _extract_openai_prompt(
             obj, _global_state.tokenizer_manager.tokenizer
         )
-        if not image_data and not video_data:
+        if not image_data and not video_data and not audio_data:
             try:
                 raw_body = await request.json()
             except Exception:
                 raw_body = None
             raw_messages = raw_body.get("messages") if isinstance(raw_body, dict) else None
             if isinstance(raw_messages, list):
-                prompt, image_data, video_data = _extract_openai_prompt(
+                prompt, image_data, video_data, audio_data = _extract_openai_prompt(
                     obj, _global_state.tokenizer_manager.tokenizer, raw_messages
                 )
         max_new_tokens = obj.max_completion_tokens or obj.max_tokens
@@ -229,10 +226,11 @@ async def chat_completions(obj: ChatCompletionRequest, request: Request):
             "repetition_penalty": obj.repetition_penalty,
             "stop": obj.stop,
         }
-        internal_obj = GenerateVLMReqInput(
+        internal_obj = GenerateOmniReqInput(
             prompt=prompt,
             image_data=image_data,
             video_data=video_data,
+            audio_data=audio_data,
             stream=obj.stream,
             n=obj.n,
             rid=obj.rid if isinstance(obj.rid, str) else None,
@@ -436,6 +434,20 @@ def _execute_multimodal_server_warmup(
                                 "url": "https://github.com/IS-Model-Framework/sglang-jax/blob/dev/vl/test/srt/example_image.png?raw=true"
                             },
                         },
+                    ],
+                }
+            ],
+            "max_tokens": 3,
+        }
+    elif "Qwen3-Omni" in server_args.model_path:
+        request_endpoint = "/v1/chat/completions"
+        json_data = {
+            "model": server_args.model_path,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Hello"},
                     ],
                 }
             ],

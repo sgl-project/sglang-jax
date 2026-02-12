@@ -128,6 +128,16 @@ class CaptureHiddenMode(IntEnum):
     def __lt__(self, other):
         return self.value < other.value
 
+    def parse(mode: int):
+        if mode == 0:
+            return CaptureHiddenMode.NULL
+        elif mode == 1:
+            return CaptureHiddenMode.LAST
+        elif mode == 2:
+            return CaptureHiddenMode.FULL
+        else:
+            raise ValueError(f"Unknown CaptureHiddenMode: {mode}")
+
 
 @register_pytree_node_class
 @dataclass
@@ -182,6 +192,10 @@ class ForwardBatch:
     # MRoPE positions [3, total_tokens] for Qwen2.5-VL
     mrope_positions: jax.Array | None = None
 
+    ## for deepstack
+    apply_for_deepstack: bool = False
+    deepstack_visual_embedding: jax.Array | None = None
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -201,6 +215,8 @@ class ForwardBatch:
             self.attention_mask,
             self.input_embedding,
             self.mrope_positions,
+            self.apply_for_deepstack,
+            self.deepstack_visual_embedding,
         )
 
         aux_data = {
@@ -238,10 +254,13 @@ class ForwardBatch:
         obj.lora_token_indices = children[11]
         obj.lora_ranks = children[12]
         obj.spec_info = children[13]
+        # Handle optional children for backward compatibility
         obj.attention_mask = children[14] if len(children) > 14 else None
         obj.input_embedding = children[15] if len(children) > 15 else None
         obj.mrope_positions = children[16] if len(children) > 16 else None
 
+        obj.apply_for_deepstack = children[17]
+        obj.deepstack_visual_embedding = children[18]
         return obj
 
     def __repr__(self) -> str:
@@ -321,7 +340,7 @@ class ForwardBatch:
             (mrope_positions,) = device_array(
                 (batch.mrope_positions,),
                 sharding=(
-                    NamedSharding(model_runner.mesh, PartitionSpec())
+                    NamedSharding(model_runner.mesh, PartitionSpec(None, None))
                     if jax.process_count() == 1
                     else None
                 ),
@@ -331,11 +350,13 @@ class ForwardBatch:
             (input_embedding,) = device_array(
                 (batch.input_embedding,),
                 sharding=(
-                    NamedSharding(model_runner.mesh, PartitionSpec())
+                    NamedSharding(model_runner.mesh, PartitionSpec(None, None))
                     if jax.process_count() == 1
                     else None
                 ),
             )
+        if input_embedding is not None:
+            input_embedding = input_embedding.astype(jnp.bfloat16)
 
         if batch.lora_scalings is not None:
             (
@@ -361,6 +382,18 @@ class ForwardBatch:
                 batch.lora_ranks,
             )
 
+        deepstack_visual_embedding = None
+        if batch.apply_for_deepstack:
+            (deepstack_visual_embedding,) = device_array(
+                (batch.deepstack_visual_embedding,),
+                sharding=(
+                    NamedSharding(model_runner.mesh, PartitionSpec(None, None))
+                    if jax.process_count() == 1
+                    else None
+                ),
+            )
+        if deepstack_visual_embedding is not None:
+            deepstack_visual_embedding = deepstack_visual_embedding.astype(jnp.bfloat16)
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
@@ -384,6 +417,8 @@ class ForwardBatch:
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embedding=input_embedding,
+            apply_for_deepstack=batch.apply_for_deepstack,
+            deepstack_visual_embedding=deepstack_visual_embedding,
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)
