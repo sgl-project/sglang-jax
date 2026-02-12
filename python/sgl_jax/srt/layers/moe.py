@@ -465,8 +465,6 @@ class EPMoE(nnx.Module):
             wo_kernel_bias,
         )
 
-        # Weighted-sum the top-k dimension locally before AllReduce to halve
-        # the collective data volume (topk copies collapsed to 1).
         output = self._unpermute(
             intermediate_output,
             sorted_selected_experts,
