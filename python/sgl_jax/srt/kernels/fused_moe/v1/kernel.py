@@ -628,9 +628,8 @@ def _fused_ep_moe_kernel(
         bt_sem_id = bt_id & jnp.int32(1)
         bt_start = bt_id * bt
         local_num_tokens = topk_weights_hbm.shape[0]
-        # gating_bits = jnp.dtype(gating_hbm.dtype).itemsize * 8
-        # gating_tile0 = math.gcd(256 // gating_bits, local_num_tokens)
-        tile0 = math.gcd(8, local_num_tokens)
+        topk_bits = jnp.dtype(topk_weights_hbm.dtype).itemsize * 8
+        tile0 = math.gcd(256 // topk_bits, local_num_tokens)
         bt_size = bt
         bt_start = pl.multiple_of(bt_start, tile0)
         pltpu.make_async_copy(
