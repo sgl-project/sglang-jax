@@ -1,3 +1,5 @@
+import math
+import logging
 import jax
 import numpy as np
 from flax import nnx
@@ -90,7 +92,7 @@ class Sampler(nnx.Module):
             (
                 next_token_top_logprobs_val,
                 next_token_top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, sampling_metadata.top_logprobs_nums)
+            ) = get_top_logprobs(logprobs, sampling_metadata.top_logprobs_nums, self.mesh)
 
         # Set token_ids_logprobs if needed
         if sampling_metadata.token_ids_logprobs is not None and any(
@@ -197,6 +199,22 @@ class Sampler(nnx.Module):
             regular_fn,
             operands,
         )
+        try:
+            lp_slice = logprobs[:1, :8] if logprobs.ndim > 1 else logprobs[:8]
+            jax.debug.print(
+                "SAMPLER logprobs slice shape={s} min={mn} max={mx} "
+                "mean={mean} std={std} nan={nan} inf={inf} slice={sl}",
+                s=lp_slice.shape,
+                mn=jnp.nanmin(lp_slice),
+                mx=jnp.nanmax(lp_slice),
+                mean=jnp.mean(lp_slice),
+                std=jnp.std(lp_slice),
+                nan=jnp.isnan(lp_slice).sum(),
+                inf=jnp.isinf(lp_slice).sum(),
+                sl=lp_slice,
+            )
+        except Exception as e:
+            logging.getLogger(__name__).warning("SAMPLER logprobs slice logging failed: %s", e)
 
         logprob_operands = (
             logits_output,
@@ -211,16 +229,40 @@ class Sampler(nnx.Module):
         return batch_next_token_ids, logprobs, new_logits_output
 
 
-def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int]):
+def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int], mesh: Mesh | None):
+    import logging
+    logger = logging.getLogger(__name__)
     max_k = max(top_logprobs_nums)
-    values, indices = jax.lax.top_k(logprobs, max_k)
+    sharding = getattr(logprobs, "sharding", None)
+    parts = 8
+    if isinstance(sharding, NamedSharding):
+        parts = sharding.mesh.shape.get("tensor", 1)
+        logprobs = jax.sharding.reshard(logprobs, NamedSharding(sharding.mesh, P(None)))
+    else:
+        logprobs = jax.device_put(jax.device_get(logprobs))
+    aligned_k = int(math.ceil(max_k / parts) * parts) if parts > 0 else max_k
+    logger.info(
+        "sampler.get_top_logprobs max_k=%s aligned_k=%s sharding=%s",
+        max_k,
+        aligned_k,
+        sharding,
+    )
+    values, indices = jax.lax.top_k(logprobs, aligned_k)
+    replicated = NamedSharding(mesh, P(None)) if mesh is not None else None
+    if replicated is not None:
+        values = jax.sharding.reshard(values, replicated)
+        indices = jax.sharding.reshard(indices, replicated)
+    values, indices = values[:, :max_k], indices[:, :max_k]
+    values = jnp.nan_to_num(values, neginf=-jnp.inf, posinf=jnp.inf)
 
-    output_top_logprobs_val = []
-    output_top_logprobs_idx = []
+    batch_size = len(top_logprobs_nums)
+    padded_vals = jnp.full((batch_size, max_k), -jnp.inf, dtype=values.dtype)
+    padded_idx = jnp.full((batch_size, max_k), -1, dtype=indices.dtype)
     for i, k in enumerate(top_logprobs_nums):
-        output_top_logprobs_val.append(values[i][:k])
-        output_top_logprobs_idx.append(indices[i][:k])
-    return jnp.array(output_top_logprobs_val), jnp.array(output_top_logprobs_idx)
+        if k > 0:
+            padded_vals = padded_vals.at[i, :k].set(values[i][:k])
+            padded_idx = padded_idx.at[i, :k].set(indices[i][:k])
+    return padded_vals, padded_idx
 
 
 def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[int]], mesh: Mesh):

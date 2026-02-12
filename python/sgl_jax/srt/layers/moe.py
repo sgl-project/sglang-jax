@@ -1,4 +1,5 @@
 import jax
+import logging
 from flax import nnx
 from jax import numpy as jnp
 from jax import shard_map
@@ -14,6 +15,9 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor_simple,
 )
 from sgl_jax.srt.utils.weight_utils import WeightMapping
+
+logger = logging.getLogger(__name__)
+LOGGED_MOE_SHAPES = False
 
 
 class GateLogit(nnx.Module):
@@ -492,6 +496,7 @@ class EPMoE(nnx.Module):
         w1_kernel_bias=None,
         wo_kernel_bias=None,
     ):
+        global LOGGED_MOE_SHAPES
         if x.shape[0] == 0:
             empty_output = jnp.zeros((0, wo_kernel.shape[-1]), dtype=x.dtype)
             return empty_output
@@ -522,6 +527,18 @@ class EPMoE(nnx.Module):
         else:
             gemm1_lhs = x
             x_scale = None
+
+        if not LOGGED_MOE_SHAPES and w0_kernel_scale is not None:
+            logger.info(
+                "MoE layer0 gmm1 shapes: lhs=%s rhs=%s rhs_scale=%s tiling=%s num_blocks=%s block_size=%s",
+                gemm1_lhs.shape,
+                w0_kernel.shape,
+                w0_kernel_scale.shape if w0_kernel_scale is not None else None,
+                tiling_gate,
+                w0_kernel_scale.shape[1] if w0_kernel_scale is not None else None,
+                w0_kernel.shape[-1]
+                // (w0_kernel_scale.shape[1] if w0_kernel_scale is not None else 1),
+            )
 
         layer_w0 = gmm(
             lhs=gemm1_lhs,
@@ -572,6 +589,19 @@ class EPMoE(nnx.Module):
         else:
             gemm2_lhs = intermediate_layer
             intermediate_scale = None
+
+        if not LOGGED_MOE_SHAPES and wo_kernel_scale is not None:
+            logger.info(
+                "MoE layer0 gmm2 shapes: lhs=%s rhs=%s rhs_scale=%s tiling=%s num_blocks=%s block_size=%s",
+                gemm2_lhs.shape,
+                wo_kernel.shape,
+                wo_kernel_scale.shape if wo_kernel_scale is not None else None,
+                tiling_down,
+                wo_kernel_scale.shape[1] if wo_kernel_scale is not None else None,
+                wo_kernel.shape[-1]
+                // (wo_kernel_scale.shape[1] if wo_kernel_scale is not None else 1),
+            )
+            LOGGED_MOE_SHAPES = True
 
         intermediate_output = gmm(
             lhs=gemm2_lhs,

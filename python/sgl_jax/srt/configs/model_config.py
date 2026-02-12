@@ -248,6 +248,7 @@ class ModelConfig:
                     ],
                     moe_weight_dtype=jnp.float8_e4m3fn,
                     moe_activation_dtype=None,
+                    ignored_layers=hf_quant_config.get("ignored_layers"),
                 )
                 return quant_config
 
@@ -416,8 +417,11 @@ class ModelConfig:
 
     def needs_kv_head_replication(self, tensor_parallel_size: int) -> bool:
         """Returns True if KV heads need to be replicated across devices."""
-        total_num_kv_heads = self.get_total_num_kv_heads()
-        return tensor_parallel_size > total_num_kv_heads
+        # Use original KV heads (pre-TP adjustment) if available to decide replication.
+        original_kv = getattr(self, "_original_num_key_value_heads", None)
+        if original_kv is None:
+            original_kv = self.get_total_num_kv_heads()
+        return tensor_parallel_size > original_kv
 
     def get_num_kv_head_replicas(self, tensor_parallel_size: int) -> int:
         """Returns the number of replicas for each original KV head."""

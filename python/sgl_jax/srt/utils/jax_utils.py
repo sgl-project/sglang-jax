@@ -165,8 +165,15 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
     return int(free_gpu_memory * (1 << 10))
 
 
-def device_array(*data, sharding=None, **kwargs) -> jax.Array:
-    return jax.device_put(*data, device=sharding, **kwargs)
+def device_array(data, sharding=None, **kwargs) -> jax.Array:
+    """Move a pytree/array to device with optional sharding."""
+    if sharding is not None:
+        try:
+            return jax.device_put(data, sharding=sharding, **kwargs)
+        except TypeError:
+            # Older JAX versions use `device` instead of `sharding`
+            return jax.device_put(data, device=sharding, **kwargs)
+    return jax.device_put(data, **kwargs)
 
 
 _IS_TPU_RUNTIME_CACHED: bool | None = None

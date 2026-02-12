@@ -69,6 +69,7 @@ class QuantizationConfig:
     moe_weight_dtype: jnp.dtype | None = None
     moe_activation_dtype: jnp.dtype | None = None
     is_static_checkpoint: bool = False
+    ignored_layers: list[str] | None = None
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "QuantizationConfig":
@@ -101,6 +102,7 @@ class QuantizationConfig:
             )
 
         quant = cfg["quantization"]
+        ignored_layers = quant.get("ignored_layers")
 
         # Parse linear rules (required)
         linear_section = quant.get("linear", {})
@@ -127,6 +129,7 @@ class QuantizationConfig:
             moe_weight_dtype=moe_weight_dtype,
             moe_activation_dtype=moe_activation_dtype,
             is_static_checkpoint=is_static_checkpoint,
+            ignored_layers=ignored_layers,
         )
 
     @classmethod

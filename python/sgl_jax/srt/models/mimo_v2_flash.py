@@ -93,12 +93,17 @@ def create_moe_weights_mapping_quantized(
                 for i in range(num_experts)
             ]
             
+            # HF scale shape is typically [num_experts, out_features] (rank 2).
+            # Quantized MoE runtime expects shape [num_experts, 1, 1, out_features] to match
+            # in_specs PartitionSpec("expert", None, None, "tensor"). Add reshape to pad dims.
             scale_sharding = ("expert", None, None, None)
-            
+            scale_reshape = (num_experts, 1, 1, -1)
+
             mappings[f"__MOE_EXPERTS__{target_path_scale}"] = WeightMapping(
                 target_path=[target_path_scale] + expert_scale_keys,
                 sharding=scale_sharding,
                 transpose=False,
+                reshape=scale_reshape,
             )
 
     return mappings
@@ -217,12 +222,38 @@ class MiMoV2Moe(nnx.Module):
         forward_batch: ForwardBatch,
     ):
         router_logits = self.moe_gate(hidden_states)
+        h_nan = jnp.isnan(hidden_states).sum()
+        r_nan = jnp.isnan(router_logits).sum()
+        jax.lax.cond(
+            (h_nan > 0) | (r_nan > 0),
+            lambda _: jax.debug.print(
+                "MiMoV2Moe layer={lid} hidden_nan={h_nan} router_nan={r_nan}",
+                lid=self.layer_id,
+                h_nan=h_nan,
+                r_nan=r_nan,
+            ),
+            lambda _: None,
+            operand=None,
+        )
         if self.use_fused:
             token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
             mlp_output = self.experts(hidden_states, router_logits, token_valid_mask=token_valid_mask)
             topk_ids = None
         else:
             topk_weights, topk_ids = self.topk(router_logits)
+            w_nan = jnp.isnan(topk_weights).sum()
+            ids_nan = jnp.isnan(topk_ids).sum() if isinstance(topk_ids, jax.Array) else 0
+            jax.lax.cond(
+                (w_nan > 0) | (ids_nan > 0),
+                lambda _: jax.debug.print(
+                    "MiMoV2Moe layer={lid} topk_weights_nan={w_nan} topk_ids_nan={ids_nan}",
+                    lid=self.layer_id,
+                    w_nan=w_nan,
+                    ids_nan=ids_nan,
+                ),
+                lambda _: None,
+                operand=None,
+            )
             mlp_output = self.experts(hidden_states, topk_weights, topk_ids)
         
         return mlp_output, topk_ids
@@ -265,6 +296,20 @@ class MiMoMoeAttention(nnx.Module):
         self.k_size = num_kv_heads * self.head_dim
         self.v_size = num_kv_heads * self.v_head_dim
         self.scaling = self.head_dim**-0.5
+
+        logger.info(
+            "[MiMoV2Flash] layer=%d q_heads=%d k_heads=%d head_dim=%d v_head_dim=%d v_size=%d",
+            layer_id,
+            self.q_head_num,
+            self.k_head_num,
+            self.head_dim,
+            self.v_head_dim,
+            self.v_size,
+        )
+
+        # Respect model config flags: fall back to attention_bias when qkv_bias not set
+        qkv_bias = qkv_bias if qkv_bias is not None else False
+        o_bias = o_bias if o_bias is not None else False
 
         self.q_proj = LinearBase(
             input_size=hidden_size,
@@ -397,7 +442,7 @@ class MiMoMoeDecoderLayer(nnx.Module):
                 ),
                 layer_id=layer_id,
                 dtype=dtype,
-                qkv_bias=getattr(config, "qkv_bias", True),
+                qkv_bias=getattr(config, "qkv_bias", getattr(config, "attention_bias", False)),
                 o_bias=getattr(config, "o_bias", False),
                 
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
@@ -421,7 +466,7 @@ class MiMoMoeDecoderLayer(nnx.Module):
                 ),
                 layer_id=layer_id,
                 dtype=dtype,
-                qkv_bias=getattr(config, "qkv_bias", True),
+                qkv_bias=getattr(config, "qkv_bias", getattr(config, "attention_bias", False)),
                 o_bias=getattr(config, "o_bias", False),
                 
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
@@ -680,6 +725,15 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         target_prefix = f"model.layers.{layer_idx}"
         
         is_quantized = getattr(self.config, "quantization_config", None) is not None
+        ignored_layers = None
+        if is_quantized and getattr(self.config, "quantization_config", None) is not None:
+            ignored_layers = getattr(self.config.quantization_config, "ignored_layers", None)
+
+        def _ignore(layer_suffix: str) -> bool:
+            if not ignored_layers:
+                return False
+            target = f"{prefix}.{layer_suffix}"
+            return target in ignored_layers
 
         mappings = {}
         
@@ -738,7 +792,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                 sharding=("tensor", None), # Split axis 0
                 transpose=False,
                 head_dim_padding=False,
-                kv_head_padding=False,
+                kv_head_padding=True,
                 # repeat removed
             )
              mappings[f"{prefix}.self_attn.v_proj.weight_scale_inv"] = WeightMapping(
@@ -752,20 +806,23 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                 target_path=f"{target_prefix}.self_attn.v_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
-                head_dim_padding=True,
+                # v_head_dim 可能与 head_dim 不同；对 v_proj 做 head_dim padding 会让权重/偏置长度
+                # 与实际输出维度不一致（例如输出 512 而 bias 被 pad 到 1024），因此关闭。
+                head_dim_padding=False,
                 kv_head_padding=True,
             )
 
         # o_proj (Row Parallel: Input is sharded)
-        if is_quantized:
-             mappings[f"{prefix}.self_attn.o_proj.weight"] = WeightMapping(
+        ignore_o_proj = _ignore("self_attn.o_proj")
+        if is_quantized and not ignore_o_proj:
+            mappings[f"{prefix}.self_attn.o_proj.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.self_attn.o_proj.weight_q",
                 sharding=(None, "tensor"), # Split axis 1 (Input)
                 transpose=False,
                 head_dim_padding=True,
                 kv_head_padding=False,
             )
-             mappings[f"{prefix}.self_attn.o_proj.weight_scale_inv"] = WeightMapping(
+            mappings[f"{prefix}.self_attn.o_proj.weight_scale_inv"] = WeightMapping(
                 target_path=f"{target_prefix}.self_attn.o_proj.weight_scale",
                 sharding=(None,), 
                 transpose=False,
@@ -791,38 +848,36 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             transpose=False,
         )
 
-        # Add bias mappings if attention_bias is True (Usually not quantized)
-        if getattr(self.config, "attention_bias", True):
-            bias_mappings = {
-                f"{prefix}.self_attn.q_proj.bias": WeightMapping(
-                    target_path=f"{target_prefix}.self_attn.q_proj.bias",
-                    sharding=("tensor",), # Shard by TP
-                    transpose=False,
-                    head_dim_padding=True,
-                    kv_head_padding=False,
-                ),
-                f"{prefix}.self_attn.k_proj.bias": WeightMapping(
-                    target_path=f"{target_prefix}.self_attn.k_proj.bias",
-                    sharding=("tensor",), # Shard by TP
-                    transpose=False,
-                    head_dim_padding=True,
-                    kv_head_padding=True,
-                ),
-                f"{prefix}.self_attn.v_proj.bias": WeightMapping(
-                    target_path=f"{target_prefix}.self_attn.v_proj.bias",
-                    sharding=("tensor",), # Shard by TP
-                    transpose=False,
-                    head_dim_padding=True,
-                    kv_head_padding=False, # Use manual repeat instead!
-                    # repeat removed
-                ),
-                f"{prefix}.self_attn.o_proj.bias": WeightMapping(
-                    target_path=f"{target_prefix}.self_attn.o_proj.bias",
-                    sharding=(None,), # Output (hidden_size) is not sharded
-                    transpose=False,
-                ),
-            }
-            mappings.update(bias_mappings)
+        # Bias mappings follow the actual bias flags (qkv_bias / o_bias) rather than attention_bias.
+        if getattr(self.config, "qkv_bias", getattr(self.config, "attention_bias", False)):
+            mappings[f"{prefix}.self_attn.q_proj.bias"] = WeightMapping(
+                target_path=f"{target_prefix}.self_attn.q_proj.bias",
+                sharding=("tensor",),  # Shard by TP
+                transpose=False,
+                head_dim_padding=True,
+                kv_head_padding=False,
+            )
+            mappings[f"{prefix}.self_attn.k_proj.bias"] = WeightMapping(
+                target_path=f"{target_prefix}.self_attn.k_proj.bias",
+                sharding=("tensor",),  # Shard by TP
+                transpose=False,
+                head_dim_padding=True,
+                kv_head_padding=True,
+            )
+            mappings[f"{prefix}.self_attn.v_proj.bias"] = WeightMapping(
+                target_path=f"{target_prefix}.self_attn.v_proj.bias",
+                sharding=("tensor",),  # Shard by TP
+                transpose=False,
+                head_dim_padding=False,
+                kv_head_padding=True,  # Allow automatic replication for TP>KV
+            )
+
+        if getattr(self.config, "o_bias", False):
+            mappings[f"{prefix}.self_attn.o_proj.bias"] = WeightMapping(
+                target_path=f"{target_prefix}.self_attn.o_proj.bias",
+                sharding=(None,),  # Output (hidden_size) is not sharded
+                transpose=False,
+            )
 
         if getattr(self.config, "add_swa_attention_sink_bias", False):
             mappings[f"{prefix}.self_attn.attention_sink_bias"] = WeightMapping(

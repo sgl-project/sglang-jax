@@ -744,7 +744,52 @@ class WeightLoader:
                         logger.debug("Skipping excluded layer weight: %s", hf_key)
                         continue
                     else:
-                        logger.warning("No file found for weight: %s", hf_key)
+                        # Fill missing weights with zeros to avoid abstract params (ShapeDtypeStruct)
+                        try:
+                            target_path = (
+                                mapping.target_path
+                                if isinstance(mapping, WeightMapping)
+                                else mapping
+                            )
+                            if isinstance(target_path, list):
+                                target_path = target_path[0]
+                            model_param = self._get_param(params, target_path)
+                            current_val = model_param.value
+                            if isinstance(current_val, jax.ShapeDtypeStruct):
+                                fill = jnp.ones(current_val.shape, dtype=current_val.dtype) if "weight_scale" in target_path else jnp.zeros(current_val.shape, dtype=current_val.dtype)
+                                sharding = getattr(current_val, "sharding", None)
+                                if sharding is not None:
+                                    try:
+                                        target_sharding = sharding
+                                        # Replace AbstractMesh with real mesh when possible
+                                        if getattr(sharding, "mesh", None) is not None and isinstance(
+                                            sharding.mesh, jax.sharding.AbstractMesh
+                                        ):
+                                            target_sharding = jax.sharding.NamedSharding(
+                                                self.mesh, sharding.spec
+                                            )
+                                        fill = jax.device_put(fill, sharding=target_sharding)
+                                    except TypeError:
+                                        fill = jax.device_put(fill, device=target_sharding)
+                                model_param.value = fill
+                                logger.warning(
+                                    "No file found for weight: %s. Filled %s with shape %s.",
+                                    hf_key,
+                                    "ones" if "weight_scale" in target_path else "zeros",
+                                    current_val.shape,
+                                )
+                            else:
+                                logger.warning(
+                                    "No file found for weight: %s (kept existing value type %s).",
+                                    hf_key,
+                                    type(current_val),
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                "No file found for weight: %s, and zero fill failed: %s",
+                                hf_key,
+                                e,
+                            )
                         continue
 
                 infos = weight_info[hf_key]
@@ -924,8 +969,104 @@ class WeightLoader:
                         target_sharding=final_sharding,  # Global loading
                     )
 
+                    # Special handling for MOE scales: align to weight last-dim and pad shape
                     if mapping.reshape is not None:
-                        stacked_weight = jnp.reshape(stacked_weight, mapping.reshape)
+                        target_path = mapping.target_path[0]
+                        custom_scale_handled = False
+                        if target_path.endswith("_scale"):
+                            weight_path = target_path.replace("_scale", "")
+                            weight_param = self._get_param(params, weight_path)
+                            weight_shape = weight_param.value.shape
+                            is_wo_scale = weight_path.endswith(".wo")
+
+                            # Handle block-wise FP8 scales (shape: [num_experts, n_blocks, k_blocks])
+                            if (
+                                stacked_weight.ndim == 3
+                                and len(weight_shape) >= 3
+                                and weight_shape[-2] > 0
+                                and weight_shape[-1] > 0
+                            ):
+                                num_experts, block_n, block_k = (
+                                    stacked_weight.shape[0],
+                                    stacked_weight.shape[-2],
+                                    stacked_weight.shape[-1],
+                                )
+                                out_size = weight_shape[-2]
+                                in_size = weight_shape[-1]
+
+                                if out_size % block_n == 0 and in_size % block_k == 0:
+                                    if is_wo_scale:
+                                        # Collapse k blocks for wo to avoid tiny block sizes.
+                                        stacked_weight = stacked_weight.mean(axis=-1, keepdims=True)
+                                        block_k = 1
+
+                                    block_size_n = out_size // block_n
+                                    block_size_k = in_size // block_k
+
+                                    if block_size_k < 128:
+                                        # Merge adjacent k-blocks to satisfy TPU block size requirements.
+                                        merge_factor = int(np.ceil(128 / block_size_k))
+                                        block_k_eff = max(1, block_k // merge_factor)
+                                        merge_factor = max(1, block_k // block_k_eff)
+                                        stacked_weight = stacked_weight.reshape(
+                                            num_experts, block_n, block_k_eff, merge_factor
+                                        )
+                                        stacked_weight = stacked_weight.mean(axis=-1)
+                                        block_k = block_k_eff
+                                        block_size_k = in_size // block_k
+
+                                    if block_size_k < 128:
+                                        # Final fallback: collapse k-blocks to a single block.
+                                        stacked_weight = stacked_weight.mean(axis=-1, keepdims=True)
+                                        block_k = 1
+                                        block_size_k = in_size
+
+                                    # Rearrange to (experts, k_blocks, n_blocks)
+                                    scales = jnp.transpose(stacked_weight, (0, 2, 1))
+                                    # Expand each n_block value across its block_size_n span → (E, k_blocks, out_size)
+                                    scales = jnp.repeat(scales, block_size_n, axis=2)
+
+                                    target_shape = (num_experts, block_k, 1, out_size)
+                                    out_sharding = getattr(stacked_weight, "sharding", None)
+                                    stacked_weight = jax.lax.reshape(
+                                        scales,
+                                        target_shape,
+                                        dimensions=None,
+                                        out_sharding=out_sharding,
+                                    )
+                                    custom_scale_handled = True
+
+                            if not custom_scale_handled:
+                                desired_last = weight_shape[-1]
+                                flat = jnp.reshape(stacked_weight, (stacked_weight.shape[0], -1))
+                                if flat.shape[1] < desired_last:
+                                    raise ValueError(
+                                        f"Scale tensor {target_path} has {flat.shape[1]} elements per expert, expected >= {desired_last}"
+                                    )
+                                flat = flat[:, :desired_last]
+                                stacked_weight = flat
+                                target_shape = (stacked_weight.shape[0], 1, 1, desired_last)
+                        else:
+                            target_shape = list(mapping.reshape)
+                            total_elems = int(np.prod(stacked_weight.shape))
+                            known = 1
+                            unknown_idx = -1
+                            for i, d in enumerate(target_shape):
+                                if d == -1:
+                                    unknown_idx = i
+                                else:
+                                    known *= d
+                            if unknown_idx != -1:
+                                target_shape[unknown_idx] = total_elems // known
+                            target_shape = tuple(target_shape)
+
+                        out_sharding = getattr(stacked_weight, "sharding", None)
+                        stacked_weight = jax.lax.reshape(
+                            stacked_weight,
+                            target_shape,
+                            dimensions=None,
+                            out_sharding=out_sharding,
+                        )
 
                     if mapping.repeat is not None:
                         axis, times = mapping.repeat
@@ -976,7 +1117,97 @@ class WeightLoader:
                     )
 
                     if mapping.reshape is not None:
-                        expert_weights = jnp.reshape(expert_weights, mapping.reshape)
+                        # Preserve sharding when reshaping stacked MOE tensors (e.g., scales).
+                        target_path = mapping.target_path[0]
+                        custom_scale_handled = False
+                        if target_path.endswith("_scale"):
+                            weight_path = target_path.replace("_scale", "")
+                            weight_param = self._get_param(params, weight_path)
+                            weight_shape = weight_param.value.shape
+                            is_wo_scale = weight_path.endswith(".wo")
+
+                            if (
+                                expert_weights.ndim == 3
+                                and len(weight_shape) >= 3
+                                and weight_shape[-2] > 0
+                                and weight_shape[-1] > 0
+                            ):
+                                num_experts, block_n, block_k = (
+                                    expert_weights.shape[0],
+                                    expert_weights.shape[-2],
+                                    expert_weights.shape[-1],
+                                )
+                                out_size = weight_shape[-2]
+                                in_size = weight_shape[-1]
+
+                                if out_size % block_n == 0 and in_size % block_k == 0:
+                                    if is_wo_scale:
+                                        expert_weights = expert_weights.mean(axis=-1, keepdims=True)
+                                        block_k = 1
+
+                                    block_size_n = out_size // block_n
+                                    block_size_k = in_size // block_k
+
+                                    if block_size_k < 128:
+                                        merge_factor = int(np.ceil(128 / block_size_k))
+                                        block_k_eff = max(1, block_k // merge_factor)
+                                        merge_factor = max(1, block_k // block_k_eff)
+                                        expert_weights = expert_weights.reshape(
+                                            num_experts, block_n, block_k_eff, merge_factor
+                                        )
+                                        expert_weights = expert_weights.mean(axis=-1)
+                                        block_k = block_k_eff
+                                        block_size_k = in_size // block_k
+
+                                    if block_size_k < 128:
+                                        expert_weights = expert_weights.mean(axis=-1, keepdims=True)
+                                        block_k = 1
+                                        block_size_k = in_size
+
+                                    scales = jnp.transpose(expert_weights, (0, 2, 1))
+                                    scales = jnp.repeat(scales, block_size_n, axis=2)
+
+                                    target_shape = (num_experts, block_k, 1, out_size)
+                                    out_sharding = getattr(expert_weights, "sharding", None)
+                                    expert_weights = jax.lax.reshape(
+                                        scales,
+                                        target_shape,
+                                        dimensions=None,
+                                        out_sharding=out_sharding,
+                                    )
+                                    custom_scale_handled = True
+
+                            if not custom_scale_handled:
+                                desired_last = weight_shape[-1]
+                                flat = jnp.reshape(expert_weights, (expert_weights.shape[0], -1))
+                                if flat.shape[1] < desired_last:
+                                    raise ValueError(
+                                        f"Scale tensor {target_path} has {flat.shape[1]} elements per expert, expected >= {desired_last}"
+                                    )
+                                flat = flat[:, :desired_last]
+                                expert_weights = flat
+                                target_shape = (expert_weights.shape[0], 1, 1, desired_last)
+                        else:
+                            target_shape = list(mapping.reshape)
+                            total_elems = int(np.prod(expert_weights.shape))
+                            known = 1
+                            unknown_idx = -1
+                            for i, d in enumerate(target_shape):
+                                if d == -1:
+                                    unknown_idx = i
+                                else:
+                                    known *= d
+                            if unknown_idx != -1:
+                                target_shape[unknown_idx] = total_elems // known
+                            target_shape = tuple(target_shape)
+
+                        out_sharding = getattr(expert_weights, "sharding", None)
+                        expert_weights = jax.lax.reshape(
+                            expert_weights,
+                            target_shape,
+                            dimensions=None,
+                            out_sharding=out_sharding,
+                        )
 
                     if mapping.repeat is not None:
                         axis, times = mapping.repeat
@@ -1390,27 +1621,54 @@ class WeightLoader:
             return weight
 
         total_kv_heads = self.model_config.get_total_num_kv_heads()
+        original_kv_heads = getattr(
+            self.model_config, "_original_num_key_value_heads", total_kv_heads
+        )
         num_replicas = self.model_config.get_num_kv_head_replicas(self.sharding_size)
         padding_strategy = self.model_config.get_kv_padding_strategy()
 
         target_axis = -1
         step_size = -1
 
+        # Use v_head_dim for v_proj, head_dim for k_proj
+        proj_head_dim = (
+            getattr(self.model_config, "v_head_dim", self.head_dim)
+            if "v_proj" in hf_key
+            else self.head_dim
+        )
+
         dim0 = weight.shape[0]
-        if dim0 == total_kv_heads:
+        # Detect common layouts
+        if dim0 % proj_head_dim == 0:
+            target_axis = 0
+            step_size = proj_head_dim
+        if target_axis == -1 and dim0 == total_kv_heads:
             target_axis = 0
             step_size = 1
-        elif dim0 == total_kv_heads * self.head_dim:
-            target_axis = 0
-            step_size = self.head_dim
 
         if target_axis == -1 and weight.ndim > 1:
             dim1 = weight.shape[1]
-            if dim1 == total_kv_heads * self.head_dim:
+            if dim1 % proj_head_dim == 0:
                 target_axis = 1
-                step_size = self.head_dim
+                step_size = proj_head_dim
+            elif dim1 == total_kv_heads * proj_head_dim:
+                target_axis = 1
+                step_size = proj_head_dim
 
         if target_axis == -1:
+            return weight
+
+        # If weight has fewer heads than expected (e.g., orig 4 -> target 8), replicate.
+        actual_heads = weight.shape[target_axis] // step_size
+        if (
+            padding_strategy == "replicate"
+            and actual_heads < total_kv_heads
+            and actual_heads == original_kv_heads
+        ):
+            parts = []
+            for _ in range(total_kv_heads // actual_heads):
+                parts.append(weight)
+            weight = jnp.concatenate(parts, axis=target_axis)
             return weight
 
         if padding_strategy == "replicate":

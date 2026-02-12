@@ -70,6 +70,8 @@ def apply_linear_quantization(
             }
         )
 
+    ignored_layers = getattr(quant_config, "ignored_layers", None) or []
+
     def _find_matching_rule(path: str):
         """Find the first rule that matches the given module path."""
         for rule in compiled_rules:
@@ -94,6 +96,14 @@ def apply_linear_quantization(
 
                 if isinstance(attr_value, LinearBase):
                     # Check if this path matches any rule
+                    dot_path = child_path.replace("/", ".")
+                    if any(dot_path.endswith(ignored) or ignored in dot_path for ignored in ignored_layers):
+                        logger.info("Skipping %s - in ignored_layers", child_path)
+                        continue
+                    if "self_attn.o_proj" in dot_path and ignored_layers:
+                        logger.info("Skipping %s - explicit o_proj ignore", child_path)
+                        continue
+
                     rule = _find_matching_rule(child_path)
                     if rule is not None:
                         logger.debug(

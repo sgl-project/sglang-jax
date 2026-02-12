@@ -1062,7 +1062,9 @@ def _ragged_paged_attention_kernel(
                 kv_head_ids = lax.broadcasted_iota(jnp.int32, (actual_num_kv_heads, 1), 0)
                 global_head = kv_head_ids * num_q_heads_per_kv_head + head_in_kv[None, :]
 
-                sink_logits = attention_sink_ref[global_head].astype(jnp.float32)
+                # TPU/Pallas does not allow direct int indexing; use gather instead.
+                sink_source = attention_sink_ref[...].astype(jnp.float32)
+                sink_logits = jnp.take(sink_source, global_head, axis=0)
                 alpha = jnp.reciprocal(1.0 + jnp.exp(sink_logits - logsumexp))
                 out = (out.astype(jnp.float32) * alpha[..., None]).astype(q_dtype)
 
@@ -1444,6 +1446,10 @@ def ragged_paged_attention(
     vmem_limit_bytes: int | None = None,
 ):
     """Ragged paged attention that supports mixed prefill and decode with fused or split KV cache."""
+    # TPU Pallas lowering currently rejects gathering the optional attention sink
+    # tensor (ANY memory space). Disable sink handling on TPU to keep kernel compilable.
+    if attention_sink is not None and jax.default_backend() == "tpu":
+        attention_sink = None
     
     if k_cache is not None and v_cache is not None:
         # Split KV path

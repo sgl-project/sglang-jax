@@ -49,6 +49,40 @@ from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 logger = logging.getLogger(__name__)
 
 
+def _assert_no_shapedtypestruct(tree, name: str):
+    """Fail fast if any input leaf is a ShapeDtypeStruct (pjit refuses them)."""
+    try:
+        tree_map_with_path = jax.tree_util.tree_map_with_path
+    except AttributeError:
+        tree_map_with_path = None
+
+    if tree_map_with_path is not None:
+        hits = []
+
+        def _check(path, x):
+            if isinstance(x, jax.ShapeDtypeStruct):
+                hits.append((path, x.shape, x.dtype, getattr(x, "sharding", None)))
+            return x
+
+        tree_map_with_path(_check, tree)
+        if hits:
+            formatted = []
+            for path, shape, dtype, sharding in hits:
+                path_str = "/".join(str(k) for k in path)
+                formatted.append(f"{path_str} shape={shape} dtype={dtype} sharding={sharding}")
+            raise TypeError(f"Found ShapeDtypeStruct in {name}: " + "; ".join(formatted))
+    else:
+        def _check(x):
+            if isinstance(x, jax.ShapeDtypeStruct):
+                raise TypeError(
+                    f"Found ShapeDtypeStruct in {name}: shape={x.shape}, dtype={x.dtype}, "
+                    f"sharding={getattr(x, 'sharding', None)}"
+                )
+            return x
+
+        jax.tree_util.tree_map(_check, tree)
+
+
 class ModelRunner(BaseModelRunner):
     """ModelRunner runs the forward passes of the models."""
 
@@ -175,6 +209,9 @@ class ModelRunner(BaseModelRunner):
         self.model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
         sampler_def, sampler_state = nnx.split(self.sampler)
         sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(sampler_state)
+
+        # Catch abstract params early (e.g., missing weights creating ShapeDtypeStruct placeholders).
+        _assert_no_shapedtypestruct(model_state, "model_state")
 
         enable_tpu_log_recorder = jax.default_backend() == "tpu" and (
             get_bool_env_var("SGLANG_JAX_ENABLE_KERNEL_LOG_RECORDER")
@@ -561,6 +598,10 @@ class ModelRunner(BaseModelRunner):
         cache_miss_count = 0
         import jax._src.test_util as jtu
 
+        # Detect invalid abstract leaves early to surface a clear error path.
+        _assert_no_shapedtypestruct(forward_batch, "forward_batch")
+        _assert_no_shapedtypestruct(logits_metadata, "logits_metadata")
+
         with jtu.count_pjit_cpp_cache_miss() as count:
             output, layers_kv_fused, _, layers_topk_ids = self.jitted_run_model(
                 forward_batch, logits_metadata
@@ -647,10 +688,27 @@ class ModelRunner(BaseModelRunner):
             A list of next_token_ids
         """
         # Penalty application has been moved to the Sampler for better JIT performance
-        return self.jitted_sampler(
+        next_token_ids, logprobs, new_logits_output = self.jitted_sampler(
             logits_output,
             sampling_metadata,
         )
+
+        if not hasattr(self, "_logged_logits_stats"):
+            logits = logits_output.next_token_logits
+            logits_min = float(jax.device_get(jnp.nanmin(logits)))
+            logits_max = float(jax.device_get(jnp.nanmax(logits)))
+            logits_nan = int(jax.device_get(jnp.isnan(logits).sum()))
+            logits_inf = int(jax.device_get(jnp.isinf(logits).sum()))
+            logger.info(
+                "Logits stats min=%s max=%s nan=%s inf=%s",
+                logits_min,
+                logits_max,
+                logits_nan,
+                logits_inf,
+            )
+            self._logged_logits_stats = True
+
+        return next_token_ids, logprobs, new_logits_output
 
     def compute_logprobs(self, logits, token_ids: jax.Array) -> jax.Array:
         return self.jitted_compute_logprobs(logits, token_ids)
