@@ -392,10 +392,6 @@ class Req:
         text_channel = input_ids[0, :]
         non_padding_mask = text_channel != MIMO_TEXT_PADDING
         non_padding_indices = jnp.where(non_padding_mask)[0]
-        if len(non_padding_indices) > 0:
-            sample_tokens = [(int(idx), int(text_channel[idx])) for idx in non_padding_indices[:30]]
-            logger.info("  Text channel (first 30 non-padding): %s", sample_tokens)
-        logger.info("=" * 60)
 
         return input_ids[None, :, :]
 

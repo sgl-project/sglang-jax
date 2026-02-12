@@ -130,17 +130,6 @@ class MiMoAudioProcessor:
         mels = mels.T[None, :, :]
         input_lens = np.array([mels.shape[1]])
 
-        logger.info(
-            "Audio preprocessing: input_samples=%d, mel_shape=%s, input_lens=%s",
-            len(audio_array),
-            mels.shape,
-            input_lens,
-        )
-        logger.info(
-            "  Mel stats: min=%.4f, max=%.4f, mean=%.4f, std=%.4f",
-            mels.min(), mels.max(), mels.mean(), mels.std()
-        )
-
         return mels, input_lens
 
     def _resample_audio(self, audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
