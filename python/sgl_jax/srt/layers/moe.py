@@ -147,8 +147,9 @@ class TopK(nnx.Module):
         group_idx = jax.lax.top_k(group_scores, k=self.topk_group)[1]
 
         # Create group mask using scatter
-        group_mask = jnp.zeros_like(group_scores)  # [n, n_group]
-        group_mask = jax.nn.one_hot(group_idx, self.num_expert_group).sum(axis=1)  # [n, n_group]
+        group_mask = jnp.clip(
+            jax.nn.one_hot(group_idx, self.num_expert_group).sum(axis=1), 0, 1
+        )  # [n, n_group]
 
         # Create score mask
         experts_per_group = router_logits.shape[-1] // self.num_expert_group
@@ -181,8 +182,8 @@ class TopK(nnx.Module):
         # Get top group indices [n, top_k_group]
         group_idx = jax.lax.top_k(group_scores, k=self.topk_group)[1]
 
-        # Create group mask using scatter
-        group_mask = jax.nn.one_hot(group_idx, self.num_expert_group).sum(axis=1)
+        # Create group mask using scatter [n, n_group]
+        group_mask = jnp.clip(jax.nn.one_hot(group_idx, self.num_expert_group).sum(axis=1), 0, 1)
 
         # Create score mask
         experts_per_group = router_logits.shape[-1] // self.num_expert_group
