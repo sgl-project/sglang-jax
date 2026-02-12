@@ -286,6 +286,7 @@ def ref_moe(
     use_grouped_topk: bool = False,
     num_groups: int = 1,
     top_k_groups: int = 1,
+    bias: jax.Array | None = None,
     renormalize_topk_logits: bool = False,
     routed_scaling_factor: float | None = None,
     act_fn: str = "silu",
@@ -317,14 +318,22 @@ def ref_moe(
     # Compute gating scores for all experts
     gating_logits_f32 = gating_output.astype(jnp.float32)
 
-    routing_scores = gating_logits_f32
+    routing_scores = (
+        gating_logits_f32 + jnp.expand_dims(bias.astype(jnp.float32), 0)
+        if bias is not None
+        else gating_logits_f32
+    )
 
     if use_grouped_topk:
         assert num_experts % num_groups == 0
         experts_per_group = num_experts // num_groups
         reshaped_routing_scores = routing_scores.reshape(n_tokens, num_groups, experts_per_group)
 
-        group_scores = jnp.max(reshaped_routing_scores, axis=-1)
+        if bias is not None:
+            top2_vals, _ = lax.top_k(reshaped_routing_scores, 2)
+            group_scores = jnp.sum(top2_vals, axis=-1)
+        else:
+            group_scores = jnp.max(reshaped_routing_scores, axis=-1)
 
         group_mask_accum = jnp.zeros((n_tokens, num_groups), dtype=jnp.bool_)
         temp_group_scores = group_scores
@@ -2348,7 +2357,6 @@ def _validate_fused_ep_moe_args(
     w1: jax.Array,
     w2: jax.Array,
     w3: jax.Array,
-    gating_output: jax.Array | None,
     topk_weights: jax.Array,
     topk_ids: jax.Array,
     top_k: int,
@@ -2412,8 +2420,8 @@ def _validate_fused_ep_moe_args(
     # Mosaic DMA tiling constraint for `start_fetch_topk`: the slice shape along the
     # token dimension must be aligned to the underlying HBM tiling of topk weights/ids.
     local_num_tokens = num_tokens // ep_size
-    # Assuming float32/int32 (4 bytes), 256 bits = 32 bytes = 8 elements.
-    topk_tile0 = math.gcd(8, local_num_tokens)
+    topk_bits = jnp.dtype(topk_weights.dtype).itemsize * 8
+    topk_tile0 = math.gcd(256 // topk_bits, local_num_tokens)
     if block_config.bt % topk_tile0 != 0:
         raise ValueError(
             "Unsupported block_config.bt for topk tiling: "
@@ -2636,7 +2644,6 @@ def fused_ep_moe(
         w1=w1,
         w2=w2,
         w3=w3,
-        gating_output=None,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         top_k=top_k,
