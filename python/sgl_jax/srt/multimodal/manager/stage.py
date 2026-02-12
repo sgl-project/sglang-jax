@@ -23,7 +23,7 @@ from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vl_generation import (
     Qwen2_5_VL_Generation,
 )
 from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker import (
-    Qwen3OmniMoeTinkerTextForConditionalGeneration,
+    Qwen3OmniMoeThinkerTextForConditionalGeneration,
 )
 from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker_embedding import (
     Qwen3OmniMoeThinkerEmbedding,
@@ -221,8 +221,8 @@ def get_model_class(name: str):
         return Qwen2ForCausalLM
     elif name == "Qwen3OmniMoeThinkerEmbedding":
         return Qwen3OmniMoeThinkerEmbedding
-    elif name == "Qwen3OmniMoeTinkerTextForConditionalGeneration":
-        return Qwen3OmniMoeTinkerTextForConditionalGeneration
+    elif name == "Qwen3OmniMoeThinkerTextForConditionalGeneration":
+        return Qwen3OmniMoeThinkerTextForConditionalGeneration
 
     else:
         raise ValueError(f"Unknown model name: {name}")
