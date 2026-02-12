@@ -328,8 +328,7 @@ class MultimodalTokenizer(TokenizerManager):
                 video_config = self._build_qwen_video_config(obj)
                 videos = [self._preprocess_qwen_video(item, video_config) for item in video_data]
                 processor_kwargs["videos_kwargs"] = {"do_sample_frames": False}
-                if "fps" in video_config:
-                    processor_kwargs["videos_kwargs"]["fps"] = video_config["fps"]
+                processor_kwargs["videos_kwargs"]["fps"] = video_config.get("fps", _QWEN_FPS)
             else:
                 videos = [self._load_video_from_source(item) for item in video_data]
             audios = [self._load_audio_from_source(item) for item in audio_data]
