@@ -19,7 +19,7 @@ from sgl_jax.srt.layers.embeddings import (
 )
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import RMSNorm, dual_rmsnorm_forward
-from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
 from sgl_jax.srt.layers.logits_processor import (
     LogitsMetadata,
     LogitsProcessor,
@@ -192,12 +192,24 @@ class Grok1MLP(nnx.Module):
         self.layer_id = layer_id
         self.reduce_results = reduce_results
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def up_forward(self, x: jax.Array) -> jax.Array:
+        """Column-parallel part: gate/up projections + activation. No collective needed.
+
+        Returns intermediate of shape [tokens, intermediate_size] sharded as P(None, "tensor").
+        """
         gate, _ = self.gate_proj(x)
         up, _ = self.up_proj(x)
-        x, _ = self.act_fn(gate, up)
-        x, _ = self.down_proj(x)
+        intermediate, _ = self.act_fn(gate, up)
+        return intermediate
+
+    def down_forward(self, intermediate: jax.Array) -> jax.Array:
+        """Row-parallel part: down projection with all-reduce."""
+        x, _ = self.down_proj(intermediate)
         return x
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        intermediate = self.up_forward(x)
+        return self.down_forward(intermediate)
 
 
 class Grok1MoE(nnx.Module):
@@ -274,7 +286,15 @@ class Grok1MoE(nnx.Module):
                 quantization_config=getattr(config, "quantization_config", None),
             )
 
-    def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:
+    def __call__(
+        self,
+        hidden_states: jax.Array,
+        mlp_intermediate: jax.Array | None = None,
+        mlp_down_weight: jax.Array | None = None,
+        mlp_down_weight_q: jax.Array | None = None,
+        mlp_down_weight_scale: jax.Array | None = None,
+        mlp_quantize_activation: bool = False,
+    ) -> tuple[jax.Array, jax.Array | None]:
         # Router computation with soft capping
         router_logits, _ = self.gate(hidden_states)
 
@@ -286,6 +306,7 @@ class Grok1MoE(nnx.Module):
         if self.use_fused:
             # Fused kernel: pass router_logits directly
             # Top-K selection is handled internally by the kernel
+            # Note: fused MLP reduction not yet supported for FusedEPMoE
             assert isinstance(self.experts, FusedEPMoE)
             return self.experts(hidden_states, router_logits), None
         else:
@@ -297,7 +318,19 @@ class Grok1MoE(nnx.Module):
             top_k_weights, top_k_indices = self._custom_topk(
                 router_logits, self.top_k, renormalize=False
             )
-            return self.experts(hidden_states, top_k_weights, top_k_indices), top_k_indices
+            return (
+                self.experts(
+                    hidden_states,
+                    top_k_weights,
+                    top_k_indices,
+                    mlp_intermediate=mlp_intermediate,
+                    mlp_down_weight=mlp_down_weight,
+                    mlp_down_weight_q=mlp_down_weight_q,
+                    mlp_down_weight_scale=mlp_down_weight_scale,
+                    mlp_quantize_activation=mlp_quantize_activation,
+                ),
+                top_k_indices,
+            )
 
     def _custom_topk(
         self, router_logits: jax.Array, top_k: int, renormalize: bool = False
@@ -580,11 +613,43 @@ class Grok1DecoderLayer(nnx.Module):
             raise NotImplementedError()
 
     def moe_with_rmoe(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
-        """Combine MoE and residual MLP outputs (matches PyTorch implementation)."""
-        mlp_result = self.mlp(x)
-        moe_result, topk_ids = self.block_sparse_moe(x)
-        # Scale factor from the paper: 1/sqrt(2)
-        return (mlp_result + moe_result) / 1.4142135623730951, topk_ids
+        """Combine MoE and residual MLP outputs.
+
+        When using EPMoE backend, fuses the MLP down_proj into the MoE's
+        shard_map to combine partial sums locally before a single all-reduce,
+        cutting FFN communication by 50%.
+
+        Supports both LinearBase and QuantizedLinear down_proj.
+        For FusedEPMoE backend, falls back to the original separate-reduction path.
+        """
+        if not self.block_sparse_moe.use_fused:
+            # Fused path (EPMoE): compute MLP column-parallel part, then
+            # pass intermediate + down_proj weight into MoE for combined reduction
+            mlp_intermediate = self.mlp.up_forward(x)
+            down_proj = self.mlp.down_proj
+            if isinstance(down_proj, QuantizedLinear):
+                # Quantized down_proj: pass weight_q, weight_scale, and activation flag
+                combined, topk_ids = self.block_sparse_moe(
+                    x,
+                    mlp_intermediate=mlp_intermediate,
+                    mlp_down_weight_q=down_proj.weight_q.value,
+                    mlp_down_weight_scale=down_proj.weight_scale.value,
+                    mlp_quantize_activation=down_proj.activation_dtype is not None,
+                )
+            else:
+                # Non-quantized down_proj: pass weight directly
+                combined, topk_ids = self.block_sparse_moe(
+                    x,
+                    mlp_intermediate=mlp_intermediate,
+                    mlp_down_weight=down_proj.weight.value,
+                )
+            return combined, topk_ids
+        else:
+            # Fallback (FusedEPMoE): separate reductions (fused MLP not yet supported)
+            mlp_result = self.mlp(x)
+            moe_result, topk_ids = self.block_sparse_moe(x)
+            # Scale factor from the paper: 1/sqrt(2)
+            return (mlp_result + moe_result) / 1.4142135623730951, topk_ids
 
     def __call__(
         self,
