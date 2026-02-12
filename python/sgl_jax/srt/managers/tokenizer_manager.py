@@ -1279,6 +1279,36 @@ class TokenizerManager:
         except ValidationError as e:
             raise ValueError(e.message) from e
 
+        if self.server_args.multi_item_enable_prefill_extend:
+            # Tokenize inputs if necessary
+            query_tokens = query
+            if isinstance(query, str):
+                if self.tokenizer is None:
+                    raise ValueError("Tokenizer is required for text scoring.")
+                query_tokens = self.tokenizer.encode(query, add_special_tokens=False)
+
+            item_tokens_list = items
+            if isinstance(items, str):
+                item_tokens_list = [items]
+            
+            if item_tokens_list and isinstance(item_tokens_list[0], str):
+                if self.tokenizer is None:
+                    raise ValueError("Tokenizer is required for text scoring.")
+                item_tokens_list = [
+                    self.tokenizer.encode(item, add_special_tokens=False)
+                    for item in item_tokens_list
+                ]
+
+            if item_first:
+                logger.warning("Ignoring item_first=True for prefill+extend strategy.")
+
+            return await self.score_prefill_extend(
+                query_tokens=query_tokens,
+                item_tokens_list=item_tokens_list,
+                label_token_ids=label_token_ids,
+                apply_softmax=apply_softmax,
+            )
+
         delimiter_token_id = self.server_args.multi_item_scoring_delimiter
         use_multi_item_scoring = delimiter_token_id is not None
 
@@ -1465,6 +1495,147 @@ class TokenizerManager:
             scores.append(_convert_logprobs(output_logprobs[0]))
 
         return scores
+
+    async def _prefill_and_cache(self, query_tokens: list[int]) -> str:
+        """Prefill query and return handle to cached KV."""
+        req = GenerateReqInput(
+            input_ids=[query_tokens],
+            sampling_params={"max_new_tokens": 0},  # Prefill only
+            return_logprob=False,
+            cache_for_scoring=True,  # New flag
+            is_single=True,
+        )
+        # We use the RID as the cache handle
+        if req.rid is None:
+            req.rid = uuid.uuid4().hex
+        cache_handle = req.rid
+
+        # Execute request
+        async for _ in self.generate_request(req):
+            pass
+        
+        return cache_handle
+
+    async def _batched_extend_score(
+        self,
+        cache_handle: str,
+        items: list[list[int]],
+        label_token_ids: list[int],
+        apply_softmax: bool = False,
+    ) -> list[float]:
+        """Score items by extending from cached prefix."""
+        if not items:
+            return []
+            
+        requests = GenerateReqInput(
+            input_ids=items,
+            sampling_params={"max_new_tokens": 0},
+            return_logprob=True,
+            logprob_start_len=0,
+            token_ids_logprob=label_token_ids,
+            extend_from_cache=cache_handle,
+            # We don't mark is_multi_item_scoring here because these are treated as individual requests
+            # that happen to share a prefix.
+        )
+        
+        results = []
+        async for res in self.generate_request(requests):
+            # res is a list of results for the batch
+            if isinstance(res, list):
+                results.extend(res)
+            else:
+                results.append(res)
+        
+        # Sort results by index to ensure order matches input items
+        results.sort(key=lambda x: x.get("index", 0))
+        
+        scores = []
+        for result in results:
+            # logic from score_request
+            output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
+            
+            # The structure of output_token_ids_logprobs is list[list[tuple(logprob, id, text)]]
+            # We need to extract scores for label_token_ids
+            
+            # Helper to convert logprobs (copied from score_request)
+            def _convert_logprobs_local(logprobs_data: list) -> float:
+                # logprobs_data is list of (logprob, token_id, text)
+                if not logprobs_data:
+                    return 0.0 # Should not happen if validation passed
+                    
+                logprobs_map = {}
+                for logprob, token_id, _ in logprobs_data:
+                    if token_id in label_token_ids:
+                        logprobs_map[token_id] = logprob
+                
+                score_list = [logprobs_map.get(token_id, float("-inf")) for token_id in label_token_ids]
+                
+                if apply_softmax:
+                    # Softmax logic
+                    return softmax(score_list).tolist()[0] # wait, softmax returns array
+                else:
+                    # Sum or similar?
+                    # Original logic: return [math.exp(x) if x != float("-inf") else 0.0 for x in score_list]
+                    # But score_request returns list[list[float]]? 
+                    # Ah, score_request returns a score *per item*. 
+                    # And for each item, it returns a score *per label*.
+                    pass
+                return 0.0
+
+            # Re-implementing logic correctly
+            logprobs_map = {}
+            if output_logprobs and output_logprobs[0]:
+                 for logprob, token_id, _ in output_logprobs[0]:
+                    if token_id in label_token_ids:
+                        logprobs_map[token_id] = logprob
+            
+            item_scores = [logprobs_map.get(token_id, float("-inf")) for token_id in label_token_ids]
+            
+            if apply_softmax:
+                scores.append(softmax(item_scores).tolist())
+            else:
+                scores.append([math.exp(x) if x != float("-inf") else 0.0 for x in item_scores])
+
+        return scores
+
+    async def _release_cache(self, cache_handle: str):
+        """Release the cached query."""
+        # We use AbortReq to tell scheduler to release the held request/cache
+        self.abort_request(rid=cache_handle)
+
+    async def score_prefill_extend(
+        self,
+        query_tokens: list[int],
+        item_tokens_list: list[list[int]],
+        label_token_ids: list[int],
+        apply_softmax: bool = False,
+    ) -> list[list[float]]:
+        """
+        Score items using prefill+extend strategy.
+        """
+        # Step 1: Prefill query and get cache handle
+        cache_handle = await self._prefill_and_cache(query_tokens)
+
+        try:
+            # Step 2: Process items in batches
+            all_scores = []
+            batch_size = self.server_args.multi_item_extend_batch_size
+            
+            for i in range(0, len(item_tokens_list), batch_size):
+                batch = item_tokens_list[i : i + batch_size]
+                batch_scores = await self._batched_extend_score(
+                    cache_handle=cache_handle,
+                    items=batch,
+                    label_token_ids=label_token_ids,
+                    apply_softmax=apply_softmax,
+                )
+                all_scores.extend(batch_scores)
+
+            return all_scores
+        finally:
+            # Step 3: Release cache
+            await self._release_cache(cache_handle)
+
 
 
 async def print_exception_wrapper(func):

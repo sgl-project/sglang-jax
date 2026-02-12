@@ -987,6 +987,28 @@ class ServerArgs:
             default=ServerArgs.multi_item_segment_fallback_threshold,
             help="In auto mode, fallback to dense mask above this padded token length.",
         )
+        parser.add_argument(
+            "--multi-item-enable-prefill-extend",
+            action="store_true",
+            help="Enable prefill+extend scoring strategy for multi-item scoring.",
+        )
+        parser.add_argument(
+            "--multi-item-extend-batch-size",
+            type=int,
+            default=ServerArgs.multi_item_extend_batch_size,
+            help="Batch size for extend requests in prefill+extend scoring.",
+        )
+        parser.add_argument(
+            "--multi-item-prefill-extend-cache-timeout",
+            type=float,
+            default=ServerArgs.multi_item_prefill_extend_cache_timeout,
+            help="Timeout in seconds for cached query prefix in prefill+extend scoring.",
+        )
+        parser.add_argument(
+            "--enable-scoring-cache",
+            action="store_true",
+            help="Enable radix cache specifically for scoring requests.",
+        )
 
         parser.add_argument(
             "--multimodal",
@@ -1163,8 +1185,8 @@ class ServerArgs:
                 "segment",
             ), "--multi-item-mask-impl must be one of: auto, dense, segment"
             assert (
-                self.multi_item_segment_fallback_threshold > 0
-            ), "--multi-item-segment-fallback-threshold must be positive"
+                self.multi_item_segment_fallback_threshold >= 0
+            ), "--multi-item-segment-fallback-threshold must be non-negative"
 
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""

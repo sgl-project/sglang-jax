@@ -122,7 +122,19 @@ class SchedulerOutputProcessorMixin:
                             >= precision_tracer.get_max_requests()
                         ):
                             precision_tracer.stop_trace()
-                    self.tree_cache.cache_finished_req(req)
+                    if req.cache_for_scoring:
+                        # Workstream B: Keep cache locked for prefill+extend
+                        if hasattr(self, "scoring_cache_nodes"):
+                            self.scoring_cache_nodes[req.rid] = (
+                                req.last_node,
+                                req.swa_uuid_for_lock,
+                                req.origin_input_ids,
+                            )
+                        else:
+                            # Fallback if scheduler doesn't support it
+                            self.tree_cache.cache_finished_req(req)
+                    else:
+                        self.tree_cache.cache_finished_req(req)
                 elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                     # This updates radix so others can match
                     self.tree_cache.cache_unfinished_req(req)

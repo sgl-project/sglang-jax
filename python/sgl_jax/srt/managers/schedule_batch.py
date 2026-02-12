@@ -176,6 +176,8 @@ class Req:
         multi_item_scoring_delimiter: int | None = None,
         multi_item_algorithm: str | None = None,
         multi_item_mask_mode: str | None = None,
+        cache_for_scoring: bool = False,
+        extend_from_cache: str | None = None,
     ):
         # Input and output info
         self.rid = rid
@@ -206,6 +208,8 @@ class Req:
         self.multi_item_scoring_delimiter = multi_item_scoring_delimiter
         self.multi_item_algorithm = multi_item_algorithm
         self.multi_item_mask_mode = multi_item_mask_mode
+        self.cache_for_scoring = cache_for_scoring
+        self.extend_from_cache = extend_from_cache
 
         # Extra key for cache namespace isolation (e.g., cache_salt, lora_id)
         if lora_id is not None:

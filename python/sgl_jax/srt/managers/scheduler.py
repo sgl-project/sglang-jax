@@ -353,6 +353,10 @@ class Scheduler(
         # Init pause/continue state
         self._engine_paused = False
 
+        # Workstream B: Store cached nodes for prefill+extend
+        # Map: rid -> (last_node, swa_uuid_for_lock, input_ids)
+        self.scoring_cache_nodes = {}
+
         # Init schedule policy and new token estimation
         self.policy = SchedulePolicy(
             self.schedule_policy,
@@ -685,6 +689,18 @@ class Scheduler(
                 recv_req.token_ids_logprob,
             )
 
+        # Handle extend_from_cache: prepend cached prefix tokens
+        if recv_req.extend_from_cache:
+            if recv_req.extend_from_cache in self.scoring_cache_nodes:
+                _, _, prefix_ids = self.scoring_cache_nodes[recv_req.extend_from_cache]
+                # Prepend prefix to input_ids
+                recv_req.input_ids = prefix_ids + recv_req.input_ids
+            else:
+                logger.warning(
+                    "extend_from_cache handle %s not found. Treating as normal request.",
+                    recv_req.extend_from_cache,
+                )
+
         # Create a new request
         req = Req(
             recv_req.rid,
@@ -706,6 +722,8 @@ class Scheduler(
             multi_item_scoring_delimiter=recv_req.multi_item_scoring_delimiter,
             multi_item_algorithm=getattr(recv_req, "multi_item_algorithm", None),
             multi_item_mask_mode=getattr(recv_req, "multi_item_mask_mode", None),
+            cache_for_scoring=recv_req.cache_for_scoring,
+            extend_from_cache=recv_req.extend_from_cache,
         )
         req.tokenizer = self.tokenizer
 
@@ -1512,6 +1530,22 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug("Abort running request. rid=%s", req.rid)
                 req.to_finish = FINISH_ABORT()
+
+        # Abort method 4: Release cached nodes for prefill+extend
+        rids_to_remove = []
+        for rid in self.scoring_cache_nodes:
+            if recv_req.abort_all or rid.startswith(recv_req.rid):
+                rids_to_remove.append(rid)
+
+        for rid in rids_to_remove:
+            node, swa_uuid, _ = self.scoring_cache_nodes[rid]
+            # Release the lock ref
+            if isinstance(self.tree_cache, SWARadixCache):
+                self.tree_cache.dec_lock_ref(node, swa_uuid)
+            else:
+                self.tree_cache.dec_lock_ref(node)
+            del self.scoring_cache_nodes[rid]
+            logger.debug("Released cached node for rid=%s", rid)
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         self._engine_paused = True

@@ -168,6 +168,10 @@ class TokenizedGenerateReqInput:
     multi_item_algorithm: str | None = None
     # Optional mask mode override for multi-item scoring.
     multi_item_mask_mode: str | None = None
+    # Keep prefetched prefix KV cache for scoring.
+    cache_for_scoring: bool = False
+    # Request ID handle whose cached prefix should be extended.
+    extend_from_cache: str | None = None
 
 
 @dataclass
@@ -315,6 +319,10 @@ class GenerateReqInput:
     multi_item_algorithm: list[str | None] | str | None = None
     # Optional mask mode override for multi-item scoring.
     multi_item_mask_mode: list[str | None] | str | None = None
+    # Keep prefetched prefix KV cache for scoring.
+    cache_for_scoring: list[bool] | bool | None = None
+    # Request ID handle whose cached prefix should be extended.
+    extend_from_cache: list[str | None] | str | None = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -387,6 +395,10 @@ class GenerateReqInput:
             self.multi_item_algorithm = None
         if self.multi_item_mask_mode is None:
             self.multi_item_mask_mode = None
+        if self.cache_for_scoring is None:
+            self.cache_for_scoring = False
+        if self.extend_from_cache is None:
+            self.extend_from_cache = None
 
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
@@ -509,6 +521,12 @@ class GenerateReqInput:
         self.multi_item_mask_mode = self._normalize_param(
             self.multi_item_mask_mode, None, "multi_item_mask_mode", num
         )
+        self.cache_for_scoring = self._normalize_param(
+            self.cache_for_scoring, False, "cache_for_scoring", num
+        )
+        self.extend_from_cache = self._normalize_param(
+            self.extend_from_cache, None, "extend_from_cache", num
+        )
 
     # Helper function to normalize a parameter
     def _normalize_param(self, param, default_value, param_name, num):
@@ -578,6 +596,8 @@ class GenerateReqInput:
             multi_item_scoring_delimiter=self.multi_item_scoring_delimiter[i],
             multi_item_algorithm=self.multi_item_algorithm[i],
             multi_item_mask_mode=self.multi_item_mask_mode[i],
+            cache_for_scoring=self.cache_for_scoring[i],
+            extend_from_cache=self.extend_from_cache[i],
         )
 
 
