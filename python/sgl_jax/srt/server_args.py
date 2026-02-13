@@ -181,6 +181,12 @@ class ServerArgs:
     multi_item_mask_impl: str = "auto"
     # In auto mode, use dense masks above this padded token length.
     multi_item_segment_fallback_threshold: int = 32768
+    # Prefill+extend scoring path.
+    multi_item_enable_prefill_extend: bool = False
+    multi_item_extend_batch_size: int = 32
+    multi_item_prefill_extend_cache_timeout: float = 60.0
+    # Allow radix cache specifically for scoring requests.
+    enable_scoring_cache: bool = False
 
     # LoRA
     enable_lora: bool | None = None
@@ -1158,10 +1164,14 @@ class ServerArgs:
 
         # Check multi-item scoring constraints
         if self.multi_item_scoring_delimiter is not None:
-            assert self.disable_radix_cache, (
-                "Multi-item scoring requires radix cache to be disabled. "
-                "Please set --disable-radix-cache when using --multi-item-scoring-delimiter."
-            )
+            # Packed multi-item mode requires radix cache disabled.
+            # Prefill+extend mode can opt into scoring cache explicitly.
+            if not self.enable_scoring_cache:
+                assert self.disable_radix_cache, (
+                    "Multi-item scoring requires radix cache to be disabled. "
+                    "Please set --disable-radix-cache when using --multi-item-scoring-delimiter, "
+                    "or pass --enable-scoring-cache for prefill+extend mode."
+                )
             assert self.chunked_prefill_size == -1, (
                 "Multi-item scoring requires chunked prefill to be disabled. "
                 "Please set --chunked-prefill-size -1 when using --multi-item-scoring-delimiter."

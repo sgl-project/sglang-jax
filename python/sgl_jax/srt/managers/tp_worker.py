@@ -573,7 +573,9 @@ class ModelWorker:
                     sampling_metadata,
                 )
                 cache_miss_count += count()
-            if model_worker_batch.return_output_logprob_only:
+            if model_worker_batch.return_output_logprob_only and (
+                new_logits_output is None or new_logits_output.next_token_logprobs is None
+            ):
                 logprobs = self.model_runner.compute_logprobs(token_logprobs, next_token_ids_device)
                 logits_output.next_token_logprobs = logprobs[: model_worker_batch.real_bs]
         if new_logits_output is not None:

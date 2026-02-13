@@ -228,6 +228,18 @@ class FlushCacheReqOutput(BaseReq):
     error_msg: str = ""
 
 
+@dataclass
+class ReleaseScoringCacheReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class ReleaseScoringCacheReqOutput(BaseReq):
+    success: bool = True
+    released_items: int = 0
+    error_msg: str = ""
+
+
 # Type definitions for multimodal input data
 # Individual data item types for each modality
 ImageDataInputItem = Image | str | ImageData | dict

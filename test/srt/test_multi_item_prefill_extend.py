@@ -34,6 +34,7 @@ class TestMultiItemPrefillExtend(CustomTestCase):
             multi_item_extend_batch_size=4,
             log_requests=True,
             enable_deterministic_sampling=True,
+            precompile_bs_paddings=[1, 2, 4],
             # Standard args
             download_dir="/dev/shm",
             dtype="bfloat16",

@@ -261,6 +261,12 @@ class Req:
         self.swa_uuid_for_lock: int | None = None
         # The prefix length of the last prefix matching
         self.last_matched_prefix_len: int = 0
+        # Optional fast-path prefix context for extend-from-cache requests.
+        # When populated, init_next_round_input can skip an expensive radix match.
+        self.cached_prefix_indices: np.ndarray | None = None
+        self.cached_last_node: Any = None
+        self.cached_last_host_node: Any = None
+        self.cached_host_hit_length: int = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -376,14 +382,28 @@ class Req:
     ):
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.host_hit_length,
-            ) = tree_cache.match_prefix(
-                key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key),
-            )
+            if (
+                self.extend_from_cache
+                and self.cached_prefix_indices is not None
+                and self.cached_last_node is not None
+            ):
+                self.prefix_indices = self.cached_prefix_indices
+                self.last_node = self.cached_last_node
+                self.last_host_node = (
+                    self.cached_last_host_node
+                    if self.cached_last_host_node is not None
+                    else self.cached_last_node
+                )
+                self.host_hit_length = self.cached_host_hit_length
+            else:
+                (
+                    self.prefix_indices,
+                    self.last_node,
+                    self.last_host_node,
+                    self.host_hit_length,
+                ) = tree_cache.match_prefix(
+                    key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key),
+                )
             self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
@@ -851,6 +871,10 @@ class ScheduleBatch:
         if self.return_logprob:
             self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
             self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
+        elif self.return_output_logprob_only:
+            # Output-only logprobs may still request specific token-id logprobs.
+            self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+            self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
 
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
         self.extend_num_tokens = extend_num_tokens
@@ -1104,7 +1128,7 @@ class ScheduleBatch:
         self.output_ids = self.output_ids[keep_indices] if self.output_ids is not None else None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         self.return_output_logprob_only = any(req.return_output_logprob_only for req in self.reqs)
-        if self.return_logprob:
+        if self.return_logprob or self.return_output_logprob_only:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
             self.token_ids_logprobs = [self.token_ids_logprobs[i] for i in keep_indices]
         else:
@@ -1141,13 +1165,15 @@ class ScheduleBatch:
                     other.output_ids[: len(other.seq_lens)],
                 ]
             )
-        if self.return_logprob and other.return_logprob:
+        self_needs_sampling_logprob = self.return_logprob or self.return_output_logprob_only
+        other_needs_sampling_logprob = other.return_logprob or other.return_output_logprob_only
+        if self_needs_sampling_logprob and other_needs_sampling_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
             self.token_ids_logprobs.extend(other.token_ids_logprobs)
-        elif self.return_logprob:
+        elif self_needs_sampling_logprob:
             self.top_logprobs_nums.extend([0] * len(other.reqs))
             self.token_ids_logprobs.extend([None] * len(other.reqs))
-        elif other.return_logprob:
+        elif other_needs_sampling_logprob:
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
         self.reqs.extend(other.reqs)

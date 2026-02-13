@@ -39,6 +39,8 @@ from sgl_jax.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     PauseGenerationReqInput,
     ProfileReq,
+    ReleaseScoringCacheReqInput,
+    ReleaseScoringCacheReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     TokenizedGenerateReqInput,
@@ -354,7 +356,7 @@ class Scheduler(
         self._engine_paused = False
 
         # Workstream B: Store cached nodes for prefill+extend
-        # Map: rid -> (last_node, swa_uuid_for_lock, input_ids)
+        # Map: rid -> (last_node, swa_uuid_for_lock, input_ids, prefix_indices, extra_key)
         self.scoring_cache_nodes = {}
 
         # Init schedule policy and new token estimation
@@ -393,6 +395,7 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (ProfileReq, self.profile),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
+                (ReleaseScoringCacheReqInput, self.release_scoring_cache),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (PauseGenerationReqInput, self.pause_generation),
@@ -689,12 +692,33 @@ class Scheduler(
                 recv_req.token_ids_logprob,
             )
 
-        # Handle extend_from_cache: prepend cached prefix tokens
+        cached_prefix_ctx = None
+        # Handle extend_from_cache: rebuild full sequence from cached prefix + new suffix.
         if recv_req.extend_from_cache:
             if recv_req.extend_from_cache in self.scoring_cache_nodes:
-                _, _, prefix_ids = self.scoring_cache_nodes[recv_req.extend_from_cache]
-                # Prepend prefix to input_ids
-                recv_req.input_ids = prefix_ids + recv_req.input_ids
+                cached_last_node, _, prefix_ids, prefix_indices, cached_extra_key = (
+                    self.scoring_cache_nodes[recv_req.extend_from_cache]
+                )
+                # Preserve full token history so extend positions and logprob offsets remain
+                # correct, while reusing cached prefix indices for KV.
+                item_ids = recv_req.input_ids
+                recv_req.input_ids = prefix_ids + item_ids
+                cached_prefix_len = len(prefix_indices)
+                uncached_tail_len = max(0, len(prefix_ids) - cached_prefix_len)
+                cached_prefix_ctx = (cached_last_node, prefix_indices)
+                if recv_req.extra_key is None:
+                    recv_req.extra_key = cached_extra_key
+                logger.debug(
+                    "Prefill+extend scheduler: extend request rid=%s handle=%s prefix_tokens=%d cached_prefix=%d uncached_tail=%d item_tokens=%d merged_input_tokens=%d max_new_tokens=%s",
+                    recv_req.rid,
+                    recv_req.extend_from_cache,
+                    len(prefix_ids),
+                    cached_prefix_len,
+                    uncached_tail_len,
+                    len(item_ids),
+                    len(recv_req.input_ids),
+                    recv_req.sampling_params.max_new_tokens,
+                )
             else:
                 logger.warning(
                     "extend_from_cache handle %s not found. Treating as normal request.",
@@ -726,6 +750,12 @@ class Scheduler(
             extend_from_cache=recv_req.extend_from_cache,
         )
         req.tokenizer = self.tokenizer
+        if cached_prefix_ctx is not None:
+            cached_last_node, cached_prefix_indices = cached_prefix_ctx
+            req.cached_last_node = cached_last_node
+            req.cached_last_host_node = cached_last_node
+            req.cached_prefix_indices = cached_prefix_indices
+            req.cached_host_hit_length = 0
 
         if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
             req.mm_inputs = recv_req.mm_inputs
@@ -1067,7 +1097,12 @@ class Scheduler(
             # Strict mode: require perfect accounting with no tolerance
             full_protected = self.tree_cache.full_protected_size()
             swa_protected = self.tree_cache.swa_protected_size()
-            memory_leak = full_num_used != 0 or swa_num_used != 0
+            memory_leak = (
+                (full_available_size + full_evictable_size + full_protected)
+                != self.full_tokens_per_layer
+                or (swa_available_size + swa_evictable_size + swa_protected)
+                != self.swa_tokens_per_layer
+            )
             token_msg = (
                 f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, full_protected={full_protected} (used={full_num_used})\n"
                 f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, swa_protected={swa_protected} (used={swa_num_used})\n"
@@ -1075,7 +1110,7 @@ class Scheduler(
         else:
             _, _, available_size, evictable_size = self._get_token_info()
             protected_size = self.tree_cache.protected_size()
-            memory_leak = (available_size + evictable_size) != self.max_total_num_tokens
+            memory_leak = (available_size + evictable_size + protected_size) != self.max_total_num_tokens
             token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
 
         if memory_leak:
@@ -1532,20 +1567,38 @@ class Scheduler(
                 req.to_finish = FINISH_ABORT()
 
         # Abort method 4: Release cached nodes for prefill+extend
+        self._release_scoring_cache_nodes(recv_req.rid, recv_req.abort_all)
+
+    def _release_scoring_cache_nodes(self, rid_prefix: str | None, abort_all: bool) -> int:
+        released = 0
         rids_to_remove = []
         for rid in self.scoring_cache_nodes:
-            if recv_req.abort_all or rid.startswith(recv_req.rid):
+            if abort_all:
+                rids_to_remove.append(rid)
+            elif rid_prefix and rid.startswith(rid_prefix):
                 rids_to_remove.append(rid)
 
         for rid in rids_to_remove:
-            node, swa_uuid, _ = self.scoring_cache_nodes[rid]
-            # Release the lock ref
-            if isinstance(self.tree_cache, SWARadixCache):
-                self.tree_cache.dec_lock_ref(node, swa_uuid)
-            else:
-                self.tree_cache.dec_lock_ref(node)
+            node, swa_uuid, *_ = self.scoring_cache_nodes[rid]
+            if node is not None:
+                if isinstance(self.tree_cache, SWARadixCache):
+                    self.tree_cache.dec_lock_ref(node, swa_uuid)
+                else:
+                    self.tree_cache.dec_lock_ref(node)
             del self.scoring_cache_nodes[rid]
+            released += 1
             logger.debug("Released cached node for rid=%s", rid)
+        return released
+
+    def release_scoring_cache(
+        self, recv_req: ReleaseScoringCacheReqInput
+    ) -> ReleaseScoringCacheReqOutput:
+        released = self._release_scoring_cache_nodes(recv_req.rid, abort_all=False)
+        return ReleaseScoringCacheReqOutput(
+            rid=recv_req.rid,
+            success=True,
+            released_items=released,
+        )
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         self._engine_paused = True

@@ -49,6 +49,8 @@ from sgl_jax.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    ReleaseScoringCacheReqInput,
+    ReleaseScoringCacheReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -206,6 +208,9 @@ class TokenizerManager:
             self.send_to_scheduler, server_args.dp_size
         )
         self.flush_cache_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
+        self.release_scoring_cache_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.profile_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
         self.get_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
@@ -240,6 +245,10 @@ class TokenizerManager:
                 (
                     FlushCacheReqOutput,
                     self.flush_cache_communicator.handle_recv,
+                ),
+                (
+                    ReleaseScoringCacheReqOutput,
+                    self.release_scoring_cache_communicator.handle_recv,
                 ),
                 (
                     ProfileReqOutput,
@@ -413,6 +422,8 @@ class TokenizerManager:
             multi_item_scoring_delimiter=obj.multi_item_scoring_delimiter,
             multi_item_algorithm=obj.multi_item_algorithm,
             multi_item_mask_mode=obj.multi_item_mask_mode,
+            cache_for_scoring=bool(obj.cache_for_scoring),
+            extend_from_cache=obj.extend_from_cache,
         )
         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
         if (
@@ -1088,6 +1099,22 @@ class TokenizerManager:
                 state.output_token_logprobs_idx,
                 return_text_in_logprobs,
             )
+            if (
+                token_ids_logprob is not None
+                and recv_obj.output_token_ids_logprobs_val is not None
+                and len(recv_obj.output_token_ids_logprobs_val) > 0
+            ):
+                state.output_token_ids_logprobs_val.extend(
+                    recv_obj.output_token_ids_logprobs_val[recv_obj_index]
+                )
+                state.output_token_ids_logprobs_idx.extend(
+                    recv_obj.output_token_ids_logprobs_idx[recv_obj_index]
+                )
+                meta_info["output_token_ids_logprobs"] = self.detokenize_top_logprobs_tokens(
+                    state.output_token_ids_logprobs_val,
+                    state.output_token_ids_logprobs_idx,
+                    return_text_in_logprobs,
+                )
             return
         if recv_obj.input_token_logprobs_val is None:
             return
@@ -1279,7 +1306,7 @@ class TokenizerManager:
         except ValidationError as e:
             raise ValueError(e.message) from e
 
-        if self.server_args.multi_item_enable_prefill_extend:
+        if getattr(self.server_args, "multi_item_enable_prefill_extend", False):
             # Tokenize inputs if necessary
             query_tokens = query
             if isinstance(query, str):
@@ -1329,10 +1356,37 @@ class TokenizerManager:
             query_tokens: list[int], item_tokens: list[list[int]]
         ) -> list[list[float]]:
             item_count = len(item_tokens)
-            chunk_size = int(self.server_args.multi_item_scoring_chunk_size)
+            chunk_size = int(
+                getattr(
+                    self.server_args,
+                    "multi_item_scoring_chunk_size",
+                    ServerArgs.multi_item_scoring_chunk_size,
+                )
+            )
             if chunk_size <= 0:
                 chunk_size = item_count
             chunk_size = max(1, min(chunk_size, item_count))
+            max_multi_item_count = int(
+                getattr(
+                    self.server_args,
+                    "max_multi_item_count",
+                    ServerArgs.max_multi_item_count,
+                )
+            )
+            max_multi_item_seq_len = int(
+                getattr(
+                    self.server_args,
+                    "max_multi_item_seq_len",
+                    ServerArgs.max_multi_item_seq_len,
+                )
+            )
+            multi_item_mask_mode = str(
+                getattr(
+                    self.server_args,
+                    "multi_item_mask_impl",
+                    ServerArgs.multi_item_mask_impl,
+                )
+            )
 
             try:
                 # Validate query/items constraints once. Sequence-length limit is checked per chunk.
@@ -1340,8 +1394,8 @@ class TokenizerManager:
                     query_tokens=query_tokens,
                     item_tokens=item_tokens,
                     delimiter_token_id=delimiter_token_id,
-                    max_items=self.server_args.max_multi_item_count,
-                    max_total_seq_len=self.server_args.max_multi_item_seq_len,
+                    max_items=max_multi_item_count,
+                    max_total_seq_len=max_multi_item_seq_len,
                     enforce_total_seq_len=False,
                 )
             except ValidationError as e:
@@ -1363,8 +1417,8 @@ class TokenizerManager:
                         query_tokens=query_tokens,
                         item_tokens=chunk_tokens,
                         delimiter_token_id=delimiter_token_id,
-                        max_items=self.server_args.max_multi_item_count,
-                        max_total_seq_len=self.server_args.max_multi_item_seq_len,
+                        max_items=max_multi_item_count,
+                        max_total_seq_len=max_multi_item_seq_len,
                     )
                 except ValidationError as e:
                     raise ValueError(e.message) from e
@@ -1382,7 +1436,7 @@ class TokenizerManager:
                     is_multi_item_scoring=True,
                     multi_item_scoring_delimiter=delimiter_token_id,
                     multi_item_algorithm="packed",
-                    multi_item_mask_mode=self.server_args.multi_item_mask_impl,
+                    multi_item_mask_mode=multi_item_mask_mode,
                 )
                 results = await self.generate_request(batch_request, request).__anext__()
                 result = results[0] if isinstance(results, list) else results
@@ -1498,22 +1552,28 @@ class TokenizerManager:
 
     async def _prefill_and_cache(self, query_tokens: list[int]) -> str:
         """Prefill query and return handle to cached KV."""
+        cache_handle = uuid.uuid4().hex
+        logger.debug(
+            "Prefill+extend: starting prefill cache request rid=%s query_tokens=%d",
+            cache_handle,
+            len(query_tokens),
+        )
         req = GenerateReqInput(
-            input_ids=[query_tokens],
+            # Use a single request (flat token list), not a batch-of-1. This keeps
+            # the cache handle stable and avoids rid suffix rewrites during normalize.
+            input_ids=query_tokens,
             sampling_params={"max_new_tokens": 0},  # Prefill only
             return_logprob=False,
             cache_for_scoring=True,  # New flag
             is_single=True,
+            rid=cache_handle,
         )
-        # We use the RID as the cache handle
-        if req.rid is None:
-            req.rid = uuid.uuid4().hex
-        cache_handle = req.rid
 
         # Execute request
         async for _ in self.generate_request(req):
             pass
-        
+
+        logger.debug("Prefill+extend: prefill cache ready rid=%s", cache_handle)
         return cache_handle
 
     async def _batched_extend_score(
@@ -1522,22 +1582,28 @@ class TokenizerManager:
         items: list[list[int]],
         label_token_ids: list[int],
         apply_softmax: bool = False,
-    ) -> list[float]:
+    ) -> list[list[float]]:
         """Score items by extending from cached prefix."""
         if not items:
             return []
-            
+        logger.debug(
+            "Prefill+extend: scoring extend batch handle=%s batch_items=%d",
+            cache_handle,
+            len(items),
+        )
+
         requests = GenerateReqInput(
             input_ids=items,
             sampling_params={"max_new_tokens": 0},
             return_logprob=True,
-            logprob_start_len=0,
+            return_output_logprob_only=False,
             token_ids_logprob=label_token_ids,
             extend_from_cache=cache_handle,
+            stream=False,
             # We don't mark is_multi_item_scoring here because these are treated as individual requests
             # that happen to share a prefix.
         )
-        
+
         results = []
         async for res in self.generate_request(requests):
             # res is a list of results for the batch
@@ -1545,63 +1611,79 @@ class TokenizerManager:
                 results.extend(res)
             else:
                 results.append(res)
-        
-        # Sort results by index to ensure order matches input items
-        results.sort(key=lambda x: x.get("index", 0))
-        
+
+        # Sort results by index when present so scores align with request order.
+        if all("index" in result for result in results):
+            results.sort(key=lambda x: x["index"])
+
+        if len(results) != len(items):
+            raise RuntimeError(
+                f"Expected {len(items)} extend results for cache handle {cache_handle}, "
+                f"but got {len(results)}."
+            )
+
         scores = []
         for result in results:
-            # logic from score_request
-            output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
-            
-            # The structure of output_token_ids_logprobs is list[list[tuple(logprob, id, text)]]
-            # We need to extract scores for label_token_ids
-            
-            # Helper to convert logprobs (copied from score_request)
-            def _convert_logprobs_local(logprobs_data: list) -> float:
-                # logprobs_data is list of (logprob, token_id, text)
-                if not logprobs_data:
-                    return 0.0 # Should not happen if validation passed
-                    
-                logprobs_map = {}
-                for logprob, token_id, _ in logprobs_data:
-                    if token_id in label_token_ids:
-                        logprobs_map[token_id] = logprob
-                
-                score_list = [logprobs_map.get(token_id, float("-inf")) for token_id in label_token_ids]
-                
-                if apply_softmax:
-                    # Softmax logic
-                    return softmax(score_list).tolist()[0] # wait, softmax returns array
-                else:
-                    # Sum or similar?
-                    # Original logic: return [math.exp(x) if x != float("-inf") else 0.0 for x in score_list]
-                    # But score_request returns list[list[float]]? 
-                    # Ah, score_request returns a score *per item*. 
-                    # And for each item, it returns a score *per label*.
-                    pass
-                return 0.0
+            meta_info = result.get("meta_info", {})
+            finish_reason = meta_info.get("finish_reason")
+            if isinstance(finish_reason, dict) and finish_reason.get("type") == "abort":
+                raise RuntimeError(
+                    "Prefill+extend extend request aborted for "
+                    f"{meta_info.get('id', '<unknown>')}: {finish_reason}"
+                )
 
-            # Re-implementing logic correctly
+            output_logprobs = meta_info.get("output_token_ids_logprobs", [])
+            if not output_logprobs or not output_logprobs[0]:
+                raise RuntimeError(
+                    "output_token_ids_logprobs is empty for prefill+extend request "
+                    f"{meta_info.get('id', '<unknown>')}."
+                )
+
             logprobs_map = {}
-            if output_logprobs and output_logprobs[0]:
-                 for logprob, token_id, _ in output_logprobs[0]:
-                    if token_id in label_token_ids:
-                        logprobs_map[token_id] = logprob
-            
+            for logprob, token_id, _ in output_logprobs[0]:
+                if token_id in label_token_ids:
+                    logprobs_map[token_id] = logprob
+
             item_scores = [logprobs_map.get(token_id, float("-inf")) for token_id in label_token_ids]
-            
+            if all(score == float("-inf") for score in item_scores):
+                raise RuntimeError(
+                    "No requested label token IDs were found in output_token_ids_logprobs for "
+                    f"{meta_info.get('id', '<unknown>')}."
+                )
+
             if apply_softmax:
                 scores.append(softmax(item_scores).tolist())
             else:
                 scores.append([math.exp(x) if x != float("-inf") else 0.0 for x in item_scores])
 
+        logger.debug(
+            "Prefill+extend: completed extend batch handle=%s batch_items=%d",
+            cache_handle,
+            len(items),
+        )
         return scores
 
     async def _release_cache(self, cache_handle: str):
         """Release the cached query."""
-        # We use AbortReq to tell scheduler to release the held request/cache
-        self.abort_request(rid=cache_handle)
+        self.auto_create_handle_loop()
+        logger.debug("Prefill+extend: releasing cache handle=%s", cache_handle)
+        outputs = await self.release_scoring_cache_communicator(
+            ReleaseScoringCacheReqInput(rid=cache_handle)
+        )
+        if not outputs:
+            logger.warning("Release scoring cache returned no output for handle=%s", cache_handle)
+            return
+
+        for out in outputs:
+            if not out.success:
+                raise RuntimeError(
+                    f"Failed to release scoring cache handle={cache_handle}: {out.error_msg}"
+                )
+            logger.debug(
+                "Prefill+extend: released cache handle=%s released_items=%d",
+                cache_handle,
+                out.released_items,
+            )
 
     async def score_prefill_extend(
         self,
@@ -1613,24 +1695,51 @@ class TokenizerManager:
         """
         Score items using prefill+extend strategy.
         """
+        if not item_tokens_list:
+            return []
+
+        logger.debug(
+            "Prefill+extend: begin scoring query_tokens=%d items=%d",
+            len(query_tokens),
+            len(item_tokens_list),
+        )
         # Step 1: Prefill query and get cache handle
         cache_handle = await self._prefill_and_cache(query_tokens)
 
         try:
             # Step 2: Process items in batches
             all_scores = []
-            batch_size = self.server_args.multi_item_extend_batch_size
-            
+            batch_size = int(getattr(self.server_args, "multi_item_extend_batch_size", 32))
+            if batch_size <= 0:
+                batch_size = len(item_tokens_list) or 1
+
             for i in range(0, len(item_tokens_list), batch_size):
                 batch = item_tokens_list[i : i + batch_size]
+                logger.debug(
+                    "Prefill+extend: processing batch start=%d size=%d total=%d",
+                    i,
+                    len(batch),
+                    len(item_tokens_list),
+                )
+                # Keep extend batch shape stable to avoid extra compile on trailing
+                # partial batches (e.g., 10 items with batch size 4 -> 4,4,2).
+                # We drop padded scores after the call.
+                padded_batch = batch
+                padded_count = 0
+                if len(batch) < batch_size and len(batch) > 0:
+                    padded_count = batch_size - len(batch)
+                    padded_batch = batch + [batch[-1]] * padded_count
                 batch_scores = await self._batched_extend_score(
                     cache_handle=cache_handle,
-                    items=batch,
+                    items=padded_batch,
                     label_token_ids=label_token_ids,
                     apply_softmax=apply_softmax,
                 )
+                if padded_count > 0:
+                    batch_scores = batch_scores[: len(batch)]
                 all_scores.extend(batch_scores)
 
+            logger.debug("Prefill+extend: complete items=%d", len(item_tokens_list))
             return all_scores
         finally:
             # Step 3: Release cache

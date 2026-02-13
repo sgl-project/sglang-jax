@@ -40,6 +40,21 @@ class BenchmarkResult:
     candidate_len: int
 
 
+def _parse_int_list_env(name: str, default: list[int]) -> list[int]:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    values = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        values.append(int(item))
+    if not values:
+        return default
+    return values
+
+
 # =============================================================================
 # Test Class
 # =============================================================================
@@ -64,8 +79,11 @@ class TestMultiItemScorePerformance(CustomTestCase):
     STATIC_PREFIX_LEN = 100
     DYNAMIC_SUFFIX_LEN = 1900  # 100 + 1900 = 2000
     DELIMITER_TOKEN_ID = 128001  # Specific delimiter for multi-item
-    MASK_IMPL = os.getenv("MULTI_ITEM_MASK_IMPL", "auto")
+    MASK_IMPL = os.getenv("MULTI_ITEM_MASK_IMPL", "dense")
     SEGMENT_FALLBACK_THRESHOLD = int(os.getenv("MULTI_ITEM_SEGMENT_FALLBACK_THRESHOLD", "32768"))
+    PREFILL_EXTEND_BATCH_SIZE = int(os.getenv("MULTI_ITEM_EXTEND_BATCH_SIZE", "32"))
+    WARMUP_RUNS = int(os.getenv("MULTI_ITEM_BENCH_WARMUP_RUNS", "1"))
+    TIMED_RUNS = int(os.getenv("MULTI_ITEM_BENCH_TIMED_RUNS", "4"))
 
     @classmethod
     def setUpClass(cls):
@@ -168,25 +186,30 @@ class TestMultiItemScorePerformance(CustomTestCase):
         query_tokens = [1] * (self.STATIC_PREFIX_LEN + self.DYNAMIC_SUFFIX_LEN)
         candidate_tokens_list = [[2] * self.CANDIDATE_LEN for _ in range(self.NUM_CANDIDATES)]
 
-        # Warmup
-        # Note: In multi-item mode, the Engine.score implementation handles packing and chunking.
-        self.engine.score(
-            query=query_tokens,
-            items=candidate_tokens_list[:10],  # Small warmup
-            label_token_ids=self.label_token_ids,
-        )
+        # Warm up with the same shape used by timed runs to avoid counting
+        # first-hit compilation in steady-state throughput.
+        for _ in range(self.WARMUP_RUNS):
+            self.engine.score(
+                query=query_tokens,
+                items=candidate_tokens_list,
+                label_token_ids=self.label_token_ids,
+            )
 
-        start_time = time.perf_counter()
+        run_times = []
+        for run_idx in range(self.TIMED_RUNS):
+            start_time = time.perf_counter()
+            self.engine.score(
+                query=query_tokens,
+                items=candidate_tokens_list,
+                label_token_ids=self.label_token_ids,
+            )
+            run_times.append(time.perf_counter() - start_time)
+            print(
+                f"  Run {run_idx + 1}/{self.TIMED_RUNS}: "
+                f"{run_times[-1]:.2f} sec ({self.NUM_CANDIDATES / run_times[-1]:.2f} items/sec)"
+            )
 
-        # The Engine.score handles the 500 items.
-        # Internally it will chunk them based on max_multi_item_seq_len (default 32k)
-        self.engine.score(
-            query=query_tokens,
-            items=candidate_tokens_list,
-            label_token_ids=self.label_token_ids,
-        )
-
-        total_time = time.perf_counter() - start_time
+        total_time = statistics.mean(run_times)
 
         result = BenchmarkResult(
             name="Multi-Item Packed",
@@ -321,6 +344,132 @@ class TestMultiItemScorePerformance(CustomTestCase):
             print(f"  {cs:10} | {res.throughput_items_sec:19.2f} | {res.latency_per_item_ms:16.2f}")
 
     def _report_result(self, result: BenchmarkResult):
+        report = (
+            f"  Throughput: {result.throughput_items_sec:.2f} items/sec\n"
+            f"  Latency per item: {result.latency_per_item_ms:.2f} ms\n"
+            f"  Total time for {result.num_items} items: {result.total_time_sec:.2f} sec\n"
+        )
+        print(report)
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### {result.name} (Prompt={result.prompt_len}, Items={result.num_items})\n"
+                f"| Metric | Value |\n"
+                f"|--------|-------|\n"
+                f"| Throughput | {result.throughput_items_sec:.2f} items/sec |\n"
+                f"| Latency/Item | {result.latency_per_item_ms:.2f} ms |\n"
+                f"| Total Time | {result.total_time_sec:.2f} s |\n"
+            )
+
+
+class TestMultiItemPrefillExtendPerformance(CustomTestCase):
+    """
+    Benchmarks for multi-item scoring using prefill+extend mode.
+    """
+
+    model_name = "/models/Qwen/Qwen3-0.6B"
+    engine = None
+    label_token_ids = [198]
+
+    PROMPT_LEN = 2000
+    NUM_CANDIDATES = 500
+    CANDIDATE_LEN = 20
+    DELIMITER_TOKEN_ID = 128001
+    MASK_IMPL = os.getenv("MULTI_ITEM_MASK_IMPL", "dense")
+    SEGMENT_FALLBACK_THRESHOLD = int(os.getenv("MULTI_ITEM_SEGMENT_FALLBACK_THRESHOLD", "32768"))
+    PREFILL_EXTEND_BATCH_SIZE = int(os.getenv("MULTI_ITEM_EXTEND_BATCH_SIZE", "12"))
+    PREFILL_EXTEND_MAX_RUNNING_REQUESTS = int(
+        os.getenv("MULTI_ITEM_EXTEND_MAX_RUNNING_REQUESTS", "12")
+    )
+    PREFILL_EXTEND_PRECOMPILE_BS_PADDINGS = _parse_int_list_env(
+        "MULTI_ITEM_EXTEND_PRECOMPILE_BS_PADDINGS",
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    )
+    WARMUP_RUNS = int(os.getenv("MULTI_ITEM_BENCH_WARMUP_RUNS", "3"))
+    TIMED_RUNS = int(os.getenv("MULTI_ITEM_BENCH_TIMED_RUNS", "4"))
+
+    @classmethod
+    def setUpClass(cls):
+        print(f"[Benchmark] Loading model (prefill+extend): {cls.model_name}")
+        cls.engine = Engine(
+            model_path=cls.model_name,
+            trust_remote_code=True,
+            tp_size=1,
+            device="tpu",
+            random_seed=3,
+            node_rank=0,
+            mem_fraction_static=0.7,
+            max_prefill_tokens=32768,
+            chunked_prefill_size=-1,
+            download_dir="/data/huggingface_models",
+            dtype="bfloat16",
+            precompile_bs_paddings=cls.PREFILL_EXTEND_PRECOMPILE_BS_PADDINGS,
+            max_running_requests=cls.PREFILL_EXTEND_MAX_RUNNING_REQUESTS,
+            skip_server_warmup=True,
+            attention_backend="fa",
+            precompile_token_paddings=[1024, 4096, 16384],
+            page_size=64,
+            log_requests=False,
+            multi_item_scoring_delimiter=cls.DELIMITER_TOKEN_ID,
+            disable_radix_cache=False,
+            enable_scoring_cache=True,
+            max_multi_item_seq_len=32768,
+            multi_item_mask_impl=cls.MASK_IMPL,
+            multi_item_segment_fallback_threshold=cls.SEGMENT_FALLBACK_THRESHOLD,
+            multi_item_enable_prefill_extend=True,
+            multi_item_extend_batch_size=cls.PREFILL_EXTEND_BATCH_SIZE,
+        )
+        print("[Benchmark] Prefill+extend engine initialized")
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.engine is not None:
+            cls.engine.shutdown()
+        jax.clear_caches()
+
+    def test_benchmark_multi_item_prefill_extend(self):
+        print(
+            f"\n[Benchmark] Starting Multi-Item Prefill+Extend "
+            f"(Items={self.NUM_CANDIDATES}, Prompt={self.PROMPT_LEN}, ExtendBatch={self.PREFILL_EXTEND_BATCH_SIZE})"
+        )
+        query_tokens = [1] * self.PROMPT_LEN
+        candidate_tokens_list = [[2] * self.CANDIDATE_LEN for _ in range(self.NUM_CANDIDATES)]
+
+        # Warm up with the exact shape used in timed runs.
+        # For scoring-cache mode, two warmups ensure both cold prefill and
+        # cache-hit extend paths are compiled before timing.
+        for _ in range(self.WARMUP_RUNS):
+            self.engine.score(
+                query=query_tokens,
+                items=candidate_tokens_list,
+                label_token_ids=self.label_token_ids,
+            )
+
+        run_times = []
+        for run_idx in range(self.TIMED_RUNS):
+            start_time = time.perf_counter()
+            self.engine.score(
+                query=query_tokens,
+                items=candidate_tokens_list,
+                label_token_ids=self.label_token_ids,
+            )
+            run_times.append(time.perf_counter() - start_time)
+            print(
+                f"  Run {run_idx + 1}/{self.TIMED_RUNS}: "
+                f"{run_times[-1]:.2f} sec ({self.NUM_CANDIDATES / run_times[-1]:.2f} items/sec)"
+            )
+
+        total_time = statistics.mean(run_times)
+
+        result = BenchmarkResult(
+            name="Multi-Item Prefill+Extend",
+            total_time_sec=total_time,
+            latency_per_item_ms=(total_time * 1000) / self.NUM_CANDIDATES,
+            throughput_items_sec=self.NUM_CANDIDATES / total_time,
+            num_items=self.NUM_CANDIDATES,
+            prompt_len=self.PROMPT_LEN,
+            candidate_len=self.CANDIDATE_LEN,
+        )
         report = (
             f"  Throughput: {result.throughput_items_sec:.2f} items/sec\n"
             f"  Latency per item: {result.latency_per_item_ms:.2f} ms\n"

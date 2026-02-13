@@ -9,6 +9,8 @@ import numpy as np
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
+from sgl_jax.srt.mem_cache.radix_cache import RadixKey
+from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 from sgl_jax.srt.precision_tracer import precision_tracer
@@ -123,16 +125,31 @@ class SchedulerOutputProcessorMixin:
                         ):
                             precision_tracer.stop_trace()
                     if req.cache_for_scoring:
-                        # Workstream B: Keep cache locked for prefill+extend
+                        # Cache ownership transfer/freeing must happen here, otherwise
+                        # req_to_token_pool slots leak. After caching we re-match the
+                        # request prefix and keep a protected lock for the scoring handle.
+                        self.tree_cache.cache_finished_req(req)
                         if hasattr(self, "scoring_cache_nodes"):
-                            self.scoring_cache_nodes[req.rid] = (
-                                req.last_node,
-                                req.swa_uuid_for_lock,
-                                req.origin_input_ids,
+                            (
+                                prefix_indices,
+                                last_node,
+                                _,
+                                _,
+                            ) = self.tree_cache.match_prefix(
+                                key=RadixKey(req.origin_input_ids, req.extra_key)
                             )
-                        else:
-                            # Fallback if scheduler doesn't support it
-                            self.tree_cache.cache_finished_req(req)
+                            if isinstance(self.tree_cache, SWARadixCache):
+                                swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
+                            else:
+                                self.tree_cache.inc_lock_ref(last_node)
+                                swa_uuid_for_lock = None
+                            self.scoring_cache_nodes[req.rid] = (
+                                last_node,
+                                swa_uuid_for_lock,
+                                req.origin_input_ids,
+                                prefix_indices,
+                                req.extra_key,
+                            )
                     else:
                         self.tree_cache.cache_finished_req(req)
                 elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -142,6 +159,16 @@ class SchedulerOutputProcessorMixin:
                 if req.return_output_logprob_only:
                     req.output_token_logprobs_val.append(logits_output.next_token_logprobs[i])
                     req.output_token_logprobs_idx.append(next_token_ids[i])
+                    if (
+                        req.token_ids_logprob is not None
+                        and logits_output.next_token_token_ids_logprobs_val is not None
+                    ):
+                        req.output_token_ids_logprobs_val.append(
+                            logits_output.next_token_token_ids_logprobs_val[i]
+                        )
+                        req.output_token_ids_logprobs_idx.append(
+                            logits_output.next_token_token_ids_logprobs_idx[i]
+                        )
 
                 if req.return_logprob:
                     assert extend_logprob_start_len_per_req is not None
@@ -352,6 +379,16 @@ class SchedulerOutputProcessorMixin:
             if req.return_output_logprob_only:
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
                 req.output_token_logprobs_idx.append(next_token_id)
+                if (
+                    req.token_ids_logprob is not None
+                    and logits_output.next_token_token_ids_logprobs_val is not None
+                ):
+                    req.output_token_ids_logprobs_val.append(
+                        logits_output.next_token_token_ids_logprobs_val[i]
+                    )
+                    req.output_token_ids_logprobs_idx.append(
+                        logits_output.next_token_token_ids_logprobs_idx[i]
+                    )
 
             if req.return_logprob and (
                 batch.spec_algorithm is None or batch.spec_algorithm.is_none()
@@ -661,6 +698,7 @@ class SchedulerOutputProcessorMixin:
         output_routed_experts = None
 
         output_hidden_states_for_mm = None
+        has_output_token_ids_logprob = any(req.token_ids_logprob is not None for req in reqs)
         if return_logprob:
             input_token_logprobs_val = []
             input_token_logprobs_idx = []
@@ -681,7 +719,12 @@ class SchedulerOutputProcessorMixin:
                 input_top_logprobs_idx
             ) = output_top_logprobs_val = output_top_logprobs_idx = input_token_ids_logprobs_val = (
                 input_token_ids_logprobs_idx
-            ) = output_token_ids_logprobs_val = output_token_ids_logprobs_idx = None
+            ) = None
+            if has_output_token_ids_logprob:
+                output_token_ids_logprobs_val = []
+                output_token_ids_logprobs_idx = []
+            else:
+                output_token_ids_logprobs_val = output_token_ids_logprobs_idx = None
         else:
             input_token_logprobs_val = input_token_logprobs_idx = output_token_logprobs_val = (
                 output_token_logprobs_idx
@@ -754,6 +797,22 @@ class SchedulerOutputProcessorMixin:
                     output_token_logprobs_idx.append(
                         req.output_token_logprobs_idx[send_output_token_logprobs_offset:]
                     )
+                    if has_output_token_ids_logprob:
+                        if req.token_ids_logprob is not None:
+                            output_token_ids_logprobs_val.append(
+                                req.output_token_ids_logprobs_val[
+                                    send_output_token_logprobs_offset:
+                                ]
+                            )
+                            output_token_ids_logprobs_idx.append(
+                                req.output_token_ids_logprobs_idx[
+                                    send_output_token_logprobs_offset:
+                                ]
+                            )
+                        else:
+                            output_token_ids_logprobs_val.append([])
+                            output_token_ids_logprobs_idx.append([])
+                    req.send_output_token_logprobs_offset = len(req.output_token_logprobs_val)
                 if return_logprob:
                     if req.return_logprob and not req.input_logprob_sent:
                         input_token_logprobs_val.append(req.input_token_logprobs_val)

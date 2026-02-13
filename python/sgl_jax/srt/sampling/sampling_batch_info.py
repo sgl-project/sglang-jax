@@ -191,8 +191,11 @@ class SamplingMetadata:
                 target_shape, linear_penalty_sharding
             )
 
+        # Output-only logprob requests still need sampler-side logprob extraction
+        # for next-token top-k/token-id logprob fields.
+        need_sampling_logprob = batch.return_logprob or batch.return_output_logprob_only
         return cls(
-            return_logprob=batch.return_logprob,
+            return_logprob=need_sampling_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             temperatures=temperatures_device,
