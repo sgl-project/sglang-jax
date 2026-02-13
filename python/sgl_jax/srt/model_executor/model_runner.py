@@ -1,9 +1,7 @@
 """ModelRunner runs the forward passes of the models."""
 
-import gc
 import logging
 import os
-import threading
 import time
 from functools import partial
 
@@ -122,18 +120,6 @@ class ModelRunner(BaseModelRunner):
         # If it is a draft model, tp_group can be different
         self.initialize()
 
-    def get_device_memory(self):
-        """
-        Note: remove this function after debug
-        """
-        devices = jax.local_devices()
-        avail_mem = []
-        for dev in devices:
-            stats = dev.memory_stats()
-            avail_mem.append(stats["bytes_limit"] - stats["bytes_in_use"])
-        avail_mem_mb = [mem / (1 << 30) for mem in avail_mem]
-        return avail_mem_mb
-
     def initialize(self):
         server_args = self.server_args
 
@@ -151,15 +137,7 @@ class ModelRunner(BaseModelRunner):
         self.sampler = Sampler(nnx.Rngs(server_args.random_seed), mesh=self.mesh)
         total_device_memory = self.get_available_device_memory()
         self.init_attention_backend()
-        print(
-            f"[initialize {threading.get_ident()}] before load_model {self.get_device_memory()=} GB",
-            flush=True,
-        )
         self.load_model()
-        print(
-            f"[initialize {threading.get_ident()}] after load_model {self.get_device_memory()=} GB",
-            flush=True,
-        )
 
         # Check if the model is using hybrid SWA
         if (
@@ -170,54 +148,21 @@ class ModelRunner(BaseModelRunner):
             self.is_hybrid = True
 
         # Init lora
-
-        print(
-            f"[initialize {threading.get_ident()}] before init_lora_manager {self.get_device_memory()=} GB",
-            flush=True,
-        )
         if server_args.enable_lora:
             self.init_lora_manager()
-        print(
-            f"[initialize {threading.get_ident()}] after init_lora_manager {self.get_device_memory()=} GB",
-            flush=True,
-        )
 
-        print(
-            f"[initialize {threading.get_ident()}] before initialize_jit {self.get_device_memory()=} GB",
-            flush=True,
-        )
         if not self.is_draft_worker:
             self.initialize_jit()
-        print(
-            f"[initialize {threading.get_ident()}] after initialize_jit {self.get_device_memory()=} GB",
-            flush=True,
-        )
 
         # Init memory pool and attention backends
-        print(
-            f"[initialize {threading.get_ident()}] before init_memory_pool {self.get_device_memory()=} GB",
-            flush=True,
-        )
         self.init_memory_pool(
             server_args.max_running_requests,
             server_args.max_total_tokens,
             total_device_memory,
         )
-        print(
-            f"[initialize {threading.get_ident()}] after init_memory_pool {self.get_device_memory()=} GB",
-            flush=True,
-        )
 
         # Init routed experts capturer
-        print(
-            f"[initialize {threading.get_ident()}] before init_routed_experts_capturer {self.get_device_memory()=} GB",
-            flush=True,
-        )
         self.init_routed_experts_capturer()
-        print(
-            f"[initialize {threading.get_ident()}] after init_routed_experts_capturer {self.get_device_memory()=} GB",
-            flush=True,
-        )
 
     def init_routed_experts_capturer(self):
         set_global_experts_capturer(
@@ -239,7 +184,6 @@ class ModelRunner(BaseModelRunner):
         )
 
     def initialize_jit(self):
-        specified_device_list = [jax.devices()[idx] for idx in self.server_args.device_indexes]
         model_def, model_state = nnx.split(self.model)
         # note export for external modification
         self.model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
@@ -320,11 +264,13 @@ class ModelRunner(BaseModelRunner):
     def get_available_device_memory(self):
         distributed = jax.process_count() != 1
         min_available_device_memory = get_available_device_memory(
-            self.device, distributed=distributed
+            self.device, distributed=distributed, device_indexes=self.server_args.device_indexes
         )
 
         # Check memory for tensor parallelism
-        local_device_memory = get_available_device_memory(self.device)
+        local_device_memory = get_available_device_memory(
+            self.device, device_indexes=self.server_args.device_indexes
+        )
         if self.tp_size > 1 and min_available_device_memory < local_device_memory * 0.9:
             if get_bool_env_var("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
                 logger.warning(
@@ -538,7 +484,6 @@ class ModelRunner(BaseModelRunner):
                 max_context_len=self.model_config.context_len + 4,
                 dtype=np.int32,
             )
-        import threading
 
         # Create KV cache pool
         if self.is_hybrid:
@@ -553,10 +498,6 @@ class ModelRunner(BaseModelRunner):
                 mesh=self.mesh,
             )
         else:
-            print(
-                f"[initialize {threading.get_ident()}] before init_memory_pool MHATokenToKVPool {self.get_device_memory()=} MB, {self.mesh.device_ids=}",
-                flush=True,
-            )
             self.token_to_kv_pool = MHATokenToKVPool(
                 size=self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -565,11 +506,6 @@ class ModelRunner(BaseModelRunner):
                 head_dim=(self.model_config.head_dim + 127) // 128 * 128,
                 layer_num=self.model_config.num_hidden_layers,
                 mesh=self.mesh,
-            )
-
-            print(
-                f"[initialize {threading.get_ident()}] after init_memory_pool MHATokenToKVPool {self.get_device_memory()=} MB, {self.mesh.device_ids=}",
-                flush=True,
             )
 
         # Create KV pool allocator
