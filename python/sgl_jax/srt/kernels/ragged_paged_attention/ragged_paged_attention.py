@@ -1624,7 +1624,7 @@ def ragged_paged_attention(
         pl.BlockSpec(memory_space=pltpu.ANY),  # kv_cache_fused
         pl.BlockSpec(memory_space=pltpu.ANY) if custom_mask is not None else None,  # custom_mask
         pl.BlockSpec(memory_space=pltpu.ANY),  # zero mask
-        pl.BlockSpec(memory_space=pltpu.ANY),  # multi_item_prefix_end
+        pl.BlockSpec(memory_space=pltpu.SMEM),  # multi_item_prefix_end
         pl.BlockSpec(memory_space=pltpu.ANY),  # multi_item_row_seg_starts
     ]
 
