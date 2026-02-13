@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 PROMPT = "The capital of China is"
 
-#model_path = "meta-llama/Llama-3.2-1B-Instruct"
+# model_path = "meta-llama/Llama-3.2-1B-Instruct"
 
 
 def _make_engine(device_indexes: list[int]) -> Engine:
@@ -31,7 +31,7 @@ def _make_engine(device_indexes: list[int]) -> Engine:
         model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
         trust_remote_code=True,
         tp_size=len(device_indexes),
-        device="tpu", # use proxy when running in Pathways
+        device="tpu",  # use proxy when running in Pathways
         device_indexes=device_indexes,
         enable_single_process=True,
         skip_server_warmup=True,
@@ -85,9 +85,11 @@ class TestMultiEnginesInOneProcess(CustomTestCase):
         print("=== Mode 1: single engine, device_indexes=[0, 1] ===", flush=True)
         engine = _make_engine(device_indexes=[0, 1])
         try:
-            with jax.profiler.trace("/home/gcpuser/aolemila/profile"): # Use gs://aolemila/rl/profiler/multi_rollout when running in Pathways 
-               outputs = self._run_generate(engine, max_new_tokens=5)
-               print("Mode 1 output: %s", outputs, flush=True)
+            with jax.profiler.trace(
+                "/home/gcpuser/aolemila/profile"
+            ):  # Use gs://aolemila/rl/profiler/multi_rollout when running in Pathways
+                outputs = self._run_generate(engine, max_new_tokens=5)
+                print("Mode 1 output: %s", outputs, flush=True)
         finally:
             print(f"engine shutdown in mode 1")
             engine.shutdown()
@@ -105,9 +107,11 @@ class TestMultiEnginesInOneProcess(CustomTestCase):
         engine_b = _make_engine(device_indexes=[2, 3])
         try:
             [print(f"\n") for _ in range(5)]
-            with jax.profiler.trace("/home/gcpuser/aolemila/profile"): # Use gs://aolemila/rl/profiler/multi_rollout when running in Pathways 
-               outputs = self._run_generate(engine_a, max_new_tokens=5)
-               print("Mode 2 engineA output: %s", outputs, flush=True)
+            with jax.profiler.trace(
+                "/home/gcpuser/aolemila/profile"
+            ):  # Use gs://aolemila/rl/profiler/multi_rollout when running in Pathways
+                outputs = self._run_generate(engine_a, max_new_tokens=5)
+                print("Mode 2 engineA output: %s", outputs, flush=True)
         finally:
             engine_a.shutdown()
             engine_b.shutdown()
