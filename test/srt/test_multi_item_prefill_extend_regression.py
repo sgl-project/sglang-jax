@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from sgl_jax.srt.managers.io_struct import GenerateReqInput
+from sgl_jax.srt.managers.scheduler import Scheduler
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
 
 
@@ -119,7 +120,9 @@ def test_batched_extend_score_passes_cache_handle_and_scores_items():
     assert manager.seen_request is not None
     assert manager.seen_request.extend_from_cache == "cache-handle-xyz"
     assert manager.seen_request.input_ids == [[1], [2]]
-    assert manager.seen_request.return_output_logprob_only is True
+    assert manager.seen_request.return_logprob is True
+    assert manager.seen_request.return_output_logprob_only is False
+    assert manager.seen_request.token_ids_logprob == [10, 20]
     assert manager.seen_request.logprob_start_len is None
     assert len(scores) == 2
     assert scores[0] == pytest.approx([0.9, 0.1])
@@ -137,3 +140,46 @@ def test_batched_extend_score_raises_when_output_logprobs_missing():
                 apply_softmax=False,
             )
         )
+
+
+class _FakeReqToTokenPool:
+    def __init__(self, available_size: int):
+        self._available_size = available_size
+
+    def available_size(self) -> int:
+        return self._available_size
+
+
+class _FakeRunningBatch:
+    def __init__(self):
+        self.batch_is_full = False
+        self.reqs = []
+
+    def is_empty(self) -> bool:
+        return len(self.reqs) == 0
+
+
+def test_scheduler_req_slot_exhaustion_does_not_stick_batch_full():
+    """Scheduler should defer prefill when req slots are exhausted without deadlocking future rounds."""
+    scheduler = SimpleNamespace(
+        grammar_queue=[],
+        move_ready_grammar_requests=lambda: None,
+        running_batch=_FakeRunningBatch(),
+        waiting_queue=[object()],
+        chunked_req=None,
+        max_running_requests=8,
+        req_to_token_pool=_FakeReqToTokenPool(available_size=0),
+    )
+
+    new_batch = Scheduler.get_new_batch_prefill(scheduler)
+    assert new_batch is None
+    assert scheduler.running_batch.batch_is_full is True
+
+    # Simulate a later scheduler round after pressure is relieved.
+    scheduler.req_to_token_pool._available_size = 1
+    scheduler.waiting_queue = []
+    new_batch = Scheduler.get_new_batch_prefill(scheduler)
+
+    assert new_batch is None
+    # Important for liveness: soft throttle clears when the running batch is idle.
+    assert scheduler.running_batch.batch_is_full is False

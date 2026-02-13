@@ -1207,6 +1207,11 @@ class Scheduler(
         if self.grammar_queue:
             self.move_ready_grammar_requests()
 
+        # `batch_is_full` is a soft throttle flag. If nothing is running, clear it so
+        # prefill admission can resume and we don't get stuck in a full-but-idle state.
+        if self.running_batch.is_empty() and self.running_batch.batch_is_full:
+            self.running_batch.batch_is_full = False
+
         # Handle the cases where prefill is not allowed
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
@@ -1216,6 +1221,16 @@ class Scheduler(
         running_bs = len(self.running_batch.reqs)
         if running_bs >= self.max_running_requests:
             self.running_batch.batch_is_full = True
+            return None
+
+        # ReqToTokenPool slots gate how many requests can enter EXTEND in this round.
+        # Under prefill+extend scoring, a single user request can fan out into many
+        # internal requests. If we ignore current slot pressure here, prepare_for_extend()
+        # can raise and kill the scheduler process.
+        req_slots_budget = self.req_to_token_pool.available_size()
+        if req_slots_budget <= 0:
+            self.running_batch.batch_is_full = True
+            logger.debug("Deferring prefill: no req slots available in ReqToTokenPool.")
             return None
 
         # Get priority queue
@@ -1246,6 +1261,10 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if len(adder.can_run_list) >= req_slots_budget:
+                self.running_batch.batch_is_full = True
+                break
+
             if running_bs + len(adder.can_run_list) >= self.max_running_requests:
                 self.running_batch.batch_is_full = True
                 break
@@ -1273,15 +1292,6 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
-        self.waiting_queue = [x for x in self.waiting_queue if x not in set(can_run_list)]
-
-        if adder.new_chunked_req is not None:
-            assert self.chunked_req is None
-            self.chunked_req = adder.new_chunked_req
-
-        if self.chunked_req:
-            self.chunked_req.is_chunked += 1
-
         self.log_prefill_stats(adder, can_run_list, running_bs)
 
         # Create a new batch
@@ -1299,6 +1309,17 @@ class Scheduler(
         )
 
         new_batch.prepare_for_extend()
+
+        # Update waiting queue and chunked request state only after we
+        # successfully allocate req slots in prepare_for_extend().
+        self.waiting_queue = [x for x in self.waiting_queue if x not in set(can_run_list)]
+
+        if adder.new_chunked_req is not None and adder.new_chunked_req in set(can_run_list):
+            assert self.chunked_req is None
+            self.chunked_req = adder.new_chunked_req
+
+        if self.chunked_req:
+            self.chunked_req.is_chunked += 1
 
         # Mixed-style chunked prefill
         if (
