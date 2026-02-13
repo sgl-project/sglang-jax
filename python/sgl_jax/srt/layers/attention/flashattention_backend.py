@@ -81,9 +81,7 @@ class FlashAttentionMetadata:
         obj.custom_mask = children[6]
         obj.multi_item_prefix_end = children[7]
         obj.multi_item_row_seg_starts = children[8]
-        obj.multi_item_mask_mode = aux_data.get(
-            "multi_item_mask_mode", MULTI_ITEM_MASK_MODE_CAUSAL
-        )
+        obj.multi_item_mask_mode = aux_data.get("multi_item_mask_mode", MULTI_ITEM_MASK_MODE_CAUSAL)
 
         return obj
 
@@ -709,7 +707,10 @@ class FlashAttention(AttentionBackend):
             "multi_item_mask_mode",
             MULTI_ITEM_MASK_MODE_CAUSAL,
         )
-        if self.forward_metadata.custom_mask is not None or mask_mode == MULTI_ITEM_MASK_MODE_SEGMENT:
+        if (
+            self.forward_metadata.custom_mask is not None
+            or mask_mode == MULTI_ITEM_MASK_MODE_SEGMENT
+        ):
             causal = 0
         multi_item_prefix_end = self.forward_metadata.multi_item_prefix_end
         if multi_item_prefix_end is None:

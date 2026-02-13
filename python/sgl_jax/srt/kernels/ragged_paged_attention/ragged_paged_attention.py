@@ -964,9 +964,7 @@ def _ragged_paged_attention_kernel(
 
                     # use custom mask
                     mask = bkvmask_ref[bkv_sem_idx, :actual_bq_sz, :, 0]
-                    num_q_heads_per_kv_head_mask = jnp.repeat(
-                        mask, num_q_heads_per_kv_head, axis=0
-                    )
+                    num_q_heads_per_kv_head_mask = jnp.repeat(mask, num_q_heads_per_kv_head, axis=0)
                     return num_q_heads_per_kv_head_mask != 1
 
                 # Flash attention with cur bkv and bq
@@ -1345,10 +1343,7 @@ def static_validate_inputs_fused(
         raise ValueError(
             f"Expected int32 dtype for multi_item_prefix_end, got {multi_item_prefix_end.dtype=}"
         )
-    if (
-        multi_item_row_seg_starts is not None
-        and multi_item_row_seg_starts.dtype != jnp.int32
-    ):
+    if multi_item_row_seg_starts is not None and multi_item_row_seg_starts.dtype != jnp.int32:
         raise ValueError(
             "Expected int32 dtype for multi_item_row_seg_starts, "
             f"got {multi_item_row_seg_starts.dtype=}"
@@ -1366,20 +1361,10 @@ def static_validate_inputs_fused(
         raise ValueError(f"Expected {cu_kv_lens.shape=} to be ({max_num_seqs + 1},).")
     if distribution.shape != (3,):
         raise ValueError(f"Expected {distribution.shape=} to be (3,).")
-    if (
-        multi_item_prefix_end is not None
-        and multi_item_prefix_end.shape != (max_num_seqs,)
-    ):
-        raise ValueError(
-            f"Expected {multi_item_prefix_end.shape=} to be ({max_num_seqs},)."
-        )
-    if (
-        multi_item_row_seg_starts is not None
-        and multi_item_row_seg_starts.shape != (q.shape[0],)
-    ):
-        raise ValueError(
-            f"Expected {multi_item_row_seg_starts.shape=} to be ({q.shape[0]},)."
-        )
+    if multi_item_prefix_end is not None and multi_item_prefix_end.shape != (max_num_seqs,):
+        raise ValueError(f"Expected {multi_item_prefix_end.shape=} to be ({max_num_seqs},).")
+    if multi_item_row_seg_starts is not None and multi_item_row_seg_starts.shape != (q.shape[0],):
+        raise ValueError(f"Expected {multi_item_row_seg_starts.shape=} to be ({q.shape[0]},).")
 
     if sliding_window is not None and sliding_window <= 0:
         raise ValueError(f"{sliding_window=} must be positive.")

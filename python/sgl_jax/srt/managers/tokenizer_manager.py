@@ -49,10 +49,10 @@ from sgl_jax.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
-    ReleaseScoringCacheReqInput,
-    ReleaseScoringCacheReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
+    ReleaseScoringCacheReqInput,
+    ReleaseScoringCacheReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     SetInternalStateReq,
@@ -1317,7 +1317,7 @@ class TokenizerManager:
             item_tokens_list = items
             if isinstance(items, str):
                 item_tokens_list = [items]
-            
+
             if item_tokens_list and isinstance(item_tokens_list[0], str):
                 if self.tokenizer is None:
                     raise ValueError("Tokenizer is required for text scoring.")
@@ -1644,7 +1644,9 @@ class TokenizerManager:
                 if token_id in label_token_ids:
                     logprobs_map[token_id] = logprob
 
-            item_scores = [logprobs_map.get(token_id, float("-inf")) for token_id in label_token_ids]
+            item_scores = [
+                logprobs_map.get(token_id, float("-inf")) for token_id in label_token_ids
+            ]
             if all(score == float("-inf") for score in item_scores):
                 raise RuntimeError(
                     "No requested label token IDs were found in output_token_ids_logprobs for "
@@ -1744,7 +1746,6 @@ class TokenizerManager:
         finally:
             # Step 3: Release cache
             await self._release_cache(cache_handle)
-
 
 
 async def print_exception_wrapper(func):

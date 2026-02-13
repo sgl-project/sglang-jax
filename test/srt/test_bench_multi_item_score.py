@@ -8,11 +8,11 @@ under specific load conditions:
 - Tokens per candidate: 20
 """
 
+import os
 import statistics
 import time
 import unittest
 from dataclasses import dataclass
-import os
 from typing import List
 
 import jax

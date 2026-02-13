@@ -49,7 +49,7 @@ class _FakeExtendManager:
                             (math.log(0.1), 20, None),
                         ]
                     ]
-                }
+                },
             },
             {
                 "index": 1,
@@ -60,7 +60,7 @@ class _FakeExtendManager:
                             (math.log(0.8), 20, None),
                         ]
                     ]
-                }
+                },
             },
         ]
 

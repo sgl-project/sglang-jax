@@ -6,15 +6,17 @@ import pytest
 jax = pytest.importorskip("jax")
 
 from sgl_jax.srt.layers.attention.flashattention_backend import (
-    FlashAttention,
     MULTI_ITEM_MASK_MODE_DENSE,
     MULTI_ITEM_MASK_MODE_SEGMENT,
+    FlashAttention,
 )
 from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 
-def _mask_from_segment_layout(prefix_end: int, row_seg_starts: np.ndarray, seq_len: int) -> np.ndarray:
+def _mask_from_segment_layout(
+    prefix_end: int, row_seg_starts: np.ndarray, seq_len: int
+) -> np.ndarray:
     mask = np.zeros((seq_len, seq_len), dtype=np.int32)
     for row in range(seq_len):
         if row < prefix_end:
@@ -84,7 +86,9 @@ def test_get_forward_metadata_selects_segment_mode_in_auto():
 
     prefix_end = np.asarray(jax.device_get(metadata.multi_item_prefix_end))[0]
     row_seg_starts = np.asarray(jax.device_get(metadata.multi_item_row_seg_starts))
-    dense_mask = FlashAttention._build_multi_item_attention_mask(np.array(tokens, dtype=np.int32), delimiter)
+    dense_mask = FlashAttention._build_multi_item_attention_mask(
+        np.array(tokens, dtype=np.int32), delimiter
+    )
     rebuilt = _mask_from_segment_layout(int(prefix_end), row_seg_starts, len(tokens))
     np.testing.assert_array_equal(rebuilt, dense_mask)
 

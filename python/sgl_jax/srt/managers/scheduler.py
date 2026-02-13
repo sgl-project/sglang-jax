@@ -1098,11 +1098,10 @@ class Scheduler(
             full_protected = self.tree_cache.full_protected_size()
             swa_protected = self.tree_cache.swa_protected_size()
             memory_leak = (
-                (full_available_size + full_evictable_size + full_protected)
-                != self.full_tokens_per_layer
-                or (swa_available_size + swa_evictable_size + swa_protected)
-                != self.swa_tokens_per_layer
-            )
+                full_available_size + full_evictable_size + full_protected
+            ) != self.full_tokens_per_layer or (
+                swa_available_size + swa_evictable_size + swa_protected
+            ) != self.swa_tokens_per_layer
             token_msg = (
                 f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, full_protected={full_protected} (used={full_num_used})\n"
                 f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, swa_protected={swa_protected} (used={swa_num_used})\n"
@@ -1110,7 +1109,9 @@ class Scheduler(
         else:
             _, _, available_size, evictable_size = self._get_token_info()
             protected_size = self.tree_cache.protected_size()
-            memory_leak = (available_size + evictable_size + protected_size) != self.max_total_num_tokens
+            memory_leak = (
+                available_size + evictable_size + protected_size
+            ) != self.max_total_num_tokens
             token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
 
         if memory_leak:
@@ -1594,9 +1595,7 @@ class Scheduler(
         released = 0
         rids_to_remove = []
         for rid in self.scoring_cache_nodes:
-            if abort_all:
-                rids_to_remove.append(rid)
-            elif rid_prefix and rid.startswith(rid_prefix):
+            if abort_all or rid_prefix and rid.startswith(rid_prefix):
                 rids_to_remove.append(rid)
 
         for rid in rids_to_remove:

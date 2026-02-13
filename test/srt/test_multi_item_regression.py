@@ -264,8 +264,7 @@ class TestMultiItemSegmentTPURegression(CustomTestCase):
                 apply_softmax=True,
             )
             max_diff = max(
-                _max_abs_diff(dense_scores[i], segment_scores[i])
-                for i in range(len(BASE_ITEMS))
+                _max_abs_diff(dense_scores[i], segment_scores[i]) for i in range(len(BASE_ITEMS))
             )
             self.assertLessEqual(
                 max_diff,
