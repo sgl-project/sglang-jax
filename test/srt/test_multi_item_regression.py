@@ -27,6 +27,58 @@ def _max_abs_diff(vec_a: list[float], vec_b: list[float]) -> float:
     return max(abs(a - b) for a, b in zip(vec_a, vec_b, strict=True))
 
 
+def _build_score_engine(
+    *,
+    mask_impl: str,
+    prefill_extend: bool = False,
+) -> Engine:
+    kwargs = dict(
+        model_path=TEST_MODEL_NAME,
+        trust_remote_code=True,
+        tp_size=1,
+        device="tpu",
+        random_seed=3,
+        node_rank=0,
+        mem_fraction_static=0.6,
+        chunked_prefill_size=-1,
+        download_dir="/dev/shm",
+        dtype="bfloat16",
+        skip_server_warmup=True,
+        attention_backend="fa",
+        precompile_token_paddings=[1024],
+        page_size=64,
+        log_requests=False,
+        enable_deterministic_sampling=True,
+        multi_item_scoring_delimiter=DELIMITER_TOKEN_ID,
+        multi_item_scoring_chunk_size=2,
+        max_multi_item_seq_len=32768,
+        multi_item_mask_impl=mask_impl,
+        multi_item_segment_fallback_threshold=32768,
+    )
+
+    if prefill_extend:
+        kwargs.update(
+            dict(
+                max_running_requests=12,
+                precompile_bs_paddings=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                disable_radix_cache=False,
+                enable_scoring_cache=True,
+                multi_item_enable_prefill_extend=True,
+                multi_item_extend_batch_size=12,
+            )
+        )
+    else:
+        kwargs.update(
+            dict(
+                max_running_requests=32,
+                precompile_bs_paddings=[1, 4, 8, 16, 32],
+                disable_radix_cache=True,
+            )
+        )
+
+    return Engine(**kwargs)
+
+
 class TestMultiItemRegression(CustomTestCase):
     engine = None
 
@@ -159,5 +211,101 @@ class TestMultiItemRegression(CustomTestCase):
         )
 
 
+class TestMultiItemSegmentTPURegression(CustomTestCase):
+    def test_segment_mode_runs_on_tpu(self):
+        engine = _build_score_engine(mask_impl="segment")
+        try:
+            scores = engine.score(
+                query=QUERY_IDS,
+                items=BASE_ITEMS,
+                label_token_ids=LABEL_TOKEN_IDS,
+                apply_softmax=True,
+            )
+            self.assertEqual(len(scores), len(BASE_ITEMS))
+        finally:
+            engine.shutdown()
+            jax.clear_caches()
+
+
 if __name__ == "__main__":
     unittest.main()
+
+    def test_segment_matches_dense_scores(self):
+        dense_engine = _build_score_engine(mask_impl="dense")
+        segment_engine = _build_score_engine(mask_impl="segment")
+        try:
+            # Warmup both paths to exclude compile-only artifacts from parity check.
+            dense_engine.score(
+                query=QUERY_IDS,
+                items=BASE_ITEMS,
+                label_token_ids=LABEL_TOKEN_IDS,
+                apply_softmax=True,
+            )
+            segment_engine.score(
+                query=QUERY_IDS,
+                items=BASE_ITEMS,
+                label_token_ids=LABEL_TOKEN_IDS,
+                apply_softmax=True,
+            )
+
+            dense_scores = dense_engine.score(
+                query=QUERY_IDS,
+                items=BASE_ITEMS,
+                label_token_ids=LABEL_TOKEN_IDS,
+                apply_softmax=True,
+            )
+            segment_scores = segment_engine.score(
+                query=QUERY_IDS,
+                items=BASE_ITEMS,
+                label_token_ids=LABEL_TOKEN_IDS,
+                apply_softmax=True,
+            )
+            max_diff = max(
+                _max_abs_diff(dense_scores[i], segment_scores[i])
+                for i in range(len(BASE_ITEMS))
+            )
+            self.assertLessEqual(
+                max_diff,
+                1e-4,
+                f"Dense vs segment max diff exceeded tolerance: {max_diff}",
+            )
+        finally:
+            segment_engine.shutdown()
+            dense_engine.shutdown()
+            jax.clear_caches()
+
+    def test_segment_prefill_extend_flow_no_regression(self):
+        engine = _build_score_engine(mask_impl="segment", prefill_extend=True)
+        try:
+            # Use a larger set than extend batch size to cover batched extend flow.
+            items = [BASE_ITEMS[i % len(BASE_ITEMS)] for i in range(24)]
+
+            first_scores = engine.score(
+                query=QUERY_IDS,
+                items=items,
+                label_token_ids=LABEL_TOKEN_IDS,
+                apply_softmax=True,
+            )
+            second_scores = engine.score(
+                query=QUERY_IDS,
+                items=items,
+                label_token_ids=LABEL_TOKEN_IDS,
+                apply_softmax=True,
+            )
+
+            self.assertEqual(len(first_scores), len(items))
+            self.assertEqual(len(second_scores), len(items))
+            for score_vec in first_scores + second_scores:
+                self.assertAlmostEqual(sum(score_vec), 1.0, places=5)
+
+            max_replay_diff = max(
+                _max_abs_diff(first_scores[i], second_scores[i]) for i in range(len(items))
+            )
+            self.assertLessEqual(
+                max_replay_diff,
+                1e-4,
+                f"Prefill+extend replay drift exceeded tolerance: {max_replay_diff}",
+            )
+        finally:
+            engine.shutdown()
+            jax.clear_caches()

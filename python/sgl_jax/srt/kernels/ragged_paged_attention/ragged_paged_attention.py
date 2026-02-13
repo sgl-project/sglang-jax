@@ -929,8 +929,9 @@ def _ragged_paged_attention_kernel(
                 def load_mask(q_span, k_span):
                     if multi_item_mask_mode == 2:
                         q_token_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
-                        q_token_indices = q_token_start + lax.iota(jnp.int32, actual_bq_sz)
-                        row_seg_by_token = multi_item_row_seg_starts_ref[q_token_indices]
+                        row_seg_by_token = multi_item_row_seg_starts_ref[
+                            pl.ds(q_token_start, actual_bq_sz)
+                        ]
                         row_seg_starts = jnp.repeat(row_seg_by_token, num_q_heads_per_kv_head)
 
                         q_row_positions = q_span[:, 0]
