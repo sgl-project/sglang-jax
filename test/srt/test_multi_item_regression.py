@@ -226,10 +226,6 @@ class TestMultiItemSegmentTPURegression(CustomTestCase):
             engine.shutdown()
             jax.clear_caches()
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_segment_matches_dense_scores(self):
         dense_engine = _build_score_engine(mask_impl="dense")
         segment_engine = _build_score_engine(mask_impl="segment")
@@ -309,3 +305,7 @@ if __name__ == "__main__":
         finally:
             engine.shutdown()
             jax.clear_caches()
+
+
+if __name__ == "__main__":
+    unittest.main()
