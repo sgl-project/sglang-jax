@@ -227,17 +227,11 @@ class TestMultiItemSegmentTPURegression(CustomTestCase):
             jax.clear_caches()
 
     def test_segment_matches_dense_scores(self):
+        dense_scores = None
         dense_engine = _build_score_engine(mask_impl="dense")
-        segment_engine = _build_score_engine(mask_impl="segment")
         try:
-            # Warmup both paths to exclude compile-only artifacts from parity check.
+            # Warmup dense path to exclude compile-only artifacts from parity check.
             dense_engine.score(
-                query=QUERY_IDS,
-                items=BASE_ITEMS,
-                label_token_ids=LABEL_TOKEN_IDS,
-                apply_softmax=True,
-            )
-            segment_engine.score(
                 query=QUERY_IDS,
                 items=BASE_ITEMS,
                 label_token_ids=LABEL_TOKEN_IDS,
@@ -245,6 +239,19 @@ class TestMultiItemSegmentTPURegression(CustomTestCase):
             )
 
             dense_scores = dense_engine.score(
+                query=QUERY_IDS,
+                items=BASE_ITEMS,
+                label_token_ids=LABEL_TOKEN_IDS,
+                apply_softmax=True,
+            )
+        finally:
+            dense_engine.shutdown()
+            jax.clear_caches()
+
+        segment_engine = _build_score_engine(mask_impl="segment")
+        try:
+            # Warmup segment path to exclude compile-only artifacts from parity check.
+            segment_engine.score(
                 query=QUERY_IDS,
                 items=BASE_ITEMS,
                 label_token_ids=LABEL_TOKEN_IDS,
@@ -267,7 +274,6 @@ class TestMultiItemSegmentTPURegression(CustomTestCase):
             )
         finally:
             segment_engine.shutdown()
-            dense_engine.shutdown()
             jax.clear_caches()
 
     def test_segment_prefill_extend_flow_no_regression(self):
