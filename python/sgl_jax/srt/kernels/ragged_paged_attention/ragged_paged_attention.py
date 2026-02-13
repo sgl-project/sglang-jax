@@ -1656,7 +1656,7 @@ def ragged_paged_attention(
 
     bo_double_buf = bq_double_buf
 
-    row_seg_starts_double_buf = pltpu.VMEM(
+    row_seg_starts_double_buf = pltpu.SMEM(
         (2, bq_sz),
         jnp.int32,
     )
