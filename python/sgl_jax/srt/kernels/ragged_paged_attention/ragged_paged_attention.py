@@ -296,14 +296,14 @@ def _ragged_paged_attention_kernel(
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
     bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
     bkv_update_ids_ref,  # [6] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
+    multi_item_prefix_end_ref,  # [padded_batch_size], int32
+    multi_item_row_seg_starts_ref,  # [padded_num_tokens], int32
     # Input
     q_hbm_ref,  # [actual_num_kv_heads, padded_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     kv_hbm_ref,  # [padded_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim] - Fused KV with interleaved [K1,V1,K2,V2,...]
     kv_cache_fused_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_interleaved // kv_packing, kv_packing, head_dim]
     custom_mask_ref,  # (flatten_total_kv_len, head_dim), int32, dma not support bool type
     zero_mask_ref,  # (bkv_sz, head_dim), int32, dma not support bool type
-    multi_item_prefix_end_ref,  # [padded_batch_size], int32
-    multi_item_row_seg_starts_ref,  # [padded_num_tokens], int32
     # Output
     o_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     updated_kv_cache_fused_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_interleaved // kv_packing, kv_packing, head_dim]
@@ -312,7 +312,6 @@ def _ragged_paged_attention_kernel(
     bkv_fused_x2_ref,  # [2, bkv_sz, num_kv_heads_interleaved // kv_packing, kv_packing, head_dim]
     bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     bo_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
-    row_seg_x2_ref,  # [2, bq_sz], int32
     sems,  # [5, 2]
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
@@ -659,20 +658,6 @@ def _ragged_paged_attention_kernel(
             wait,
         )
 
-    def _fetch_row_seg_starts(seq_idx, bq_idx, bq_sem_idx, *, wait=False):
-        sem = sems.at[4, bq_sem_idx]
-        vmem_ref = row_seg_x2_ref.at[bq_sem_idx]
-        q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
-        q_end = cu_q_lens_ref[seq_idx + 1]
-        sz = jnp.minimum(bq_sz, q_end - q_len_start)
-
-        _async_copy(
-            multi_item_row_seg_starts_ref.at[pl.ds(q_len_start, sz)],
-            vmem_ref.at[pl.ds(0, sz)],
-            sem,
-            wait,
-        )
-
     def _send_bo(seq_idx, bo_idx, bo_sem_idx, *, wait=False):
         sem = sems.at[2, bo_sem_idx]
         vmem_ref = bo_x2_ref.at[bo_sem_idx]
@@ -704,12 +689,6 @@ def _ragged_paged_attention_kernel(
 
     def wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx):
         return _fetch_bq(seq_idx, bq_idx, bq_sem_idx, wait=True)
-
-    def start_fetch_row_seg_starts(seq_idx, bq_idx, bq_sem_idx):
-        return _fetch_row_seg_starts(seq_idx, bq_idx, bq_sem_idx)
-
-    def wait_fetch_row_seg_starts(seq_idx, bq_idx, bq_sem_idx):
-        return _fetch_row_seg_starts(seq_idx, bq_idx, bq_sem_idx, wait=True)
 
     def start_send_bo(seq_idx, bo_idx, bo_sem_idx):
         bo_ids_ref[bo_sem_idx] = seq_idx
@@ -909,8 +888,6 @@ def _ragged_paged_attention_kernel(
             def prefetch_next_bq():
                 sem_ids_ref[0] = next_bq_sem_idx
                 start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
-                if multi_item_mask_mode == 2:
-                    start_fetch_row_seg_starts(next_seq_idx, next_bq_idx, next_bq_sem_idx)
 
             def compute_with_bkv(bkv_idx, _):
                 # Create bitmask for KV.
@@ -936,12 +913,6 @@ def _ragged_paged_attention_kernel(
                 def wait_cur_bq():
                     wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
 
-                if multi_item_mask_mode == 2:
-
-                    @pl.when(bkv_idx == 0)
-                    def wait_cur_row_seg_starts():
-                        wait_fetch_row_seg_starts(seq_idx, bq_idx, bq_sem_idx)
-
                 # Wait for cur bkv
                 offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
 
@@ -957,29 +928,36 @@ def _ragged_paged_attention_kernel(
 
                 def load_mask(q_span, k_span):
                     if multi_item_mask_mode == 2:
-                        row_seg_by_token = row_seg_x2_ref.at[
-                            bq_sem_idx, pl.ds(0, actual_bq_sz)
-                        ][...]
-                        q_row_positions = (
-                            kv_len - q_len + bq_idx * bq_sz + lax.iota(jnp.int32, actual_bq_sz)
-                        )
-                        k_positions = bkv_idx * bkv_sz + lax.iota(jnp.int32, bkv_sz)
-                        prefix_end = multi_item_prefix_end_ref[seq_idx]
-                        is_prefix_row = (q_row_positions < prefix_end).astype(jnp.int32)
+                        q_token_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
 
-                        causal_allow = (k_positions[None, :] <= q_row_positions[:, None]).astype(jnp.int32)
-                        shared_prefix_allow = (k_positions < prefix_end).astype(jnp.int32)
-                        segment_allow = jnp.logical_and(
-                            k_positions[None, :] >= row_seg_by_token[:, None],
-                            k_positions[None, :] <= q_row_positions[:, None],
-                        ).astype(jnp.int32)
-                        non_prefix_allow = jnp.maximum(shared_prefix_allow[None, :], segment_allow)
-                        allow = (
-                            is_prefix_row[:, None] * causal_allow
-                            + (1 - is_prefix_row[:, None]) * non_prefix_allow
+                        def load_row_seg_start(i, row_seg_vals):
+                            token_idx = q_token_start + i
+                            return row_seg_vals.at[i].set(multi_item_row_seg_starts_ref[token_idx])
+
+                        row_seg_by_token = lax.fori_loop(
+                            0,
+                            actual_bq_sz,
+                            load_row_seg_start,
+                            jnp.zeros((actual_bq_sz,), dtype=jnp.int32),
                         )
-                        token_mask = allow == 0
-                        return jnp.repeat(token_mask, num_q_heads_per_kv_head, axis=0)
+                        row_seg_starts = jnp.repeat(row_seg_by_token, num_q_heads_per_kv_head)
+
+                        q_row_positions = q_span[:, 0]
+                        prefix_end = multi_item_prefix_end_ref[seq_idx]
+                        is_prefix_row = q_row_positions < prefix_end
+
+                        causal_allow = k_span <= q_row_positions[:, None]
+                        shared_prefix_allow = k_span < prefix_end
+                        segment_allow = jnp.logical_and(
+                            k_span >= row_seg_starts[:, None],
+                            k_span <= q_row_positions[:, None],
+                        )
+                        allow = jnp.where(
+                            is_prefix_row[:, None],
+                            causal_allow,
+                            jnp.logical_or(shared_prefix_allow, segment_allow),
+                        )
+                        return jnp.logical_not(allow)
 
                     if bkvmask_ref is None:
                         return q_span < k_span
@@ -1104,8 +1082,6 @@ def _ragged_paged_attention_kernel(
     @pl.when(seq_idx == 0)
     def prologue():
         start_fetch_bq(0, 0, 0)
-        if multi_item_mask_mode == 2:
-            start_fetch_row_seg_starts(0, 0, 0)
         # Initialize bkv_fused_x2_ref to zeros to avoid NaN issues from accessing
         # uninitialized memory. Bitcast into int32 to avoid tiling issues.
         bkv_x2_int32_ref = bkv_fused_x2_ref.bitcast(jnp.int32).reshape((2, -1, 8, 128))
@@ -1626,8 +1602,6 @@ def ragged_paged_attention(
         pl.BlockSpec(memory_space=pltpu.ANY),  # kv_cache_fused
         pl.BlockSpec(memory_space=pltpu.ANY) if custom_mask is not None else None,  # custom_mask
         pl.BlockSpec(memory_space=pltpu.ANY),  # zero mask
-        pl.BlockSpec(memory_space=pltpu.SMEM),  # multi_item_prefix_end
-        pl.BlockSpec(memory_space=pltpu.ANY),  # multi_item_row_seg_starts
     ]
 
     out_specs = [
@@ -1656,11 +1630,6 @@ def ragged_paged_attention(
 
     bo_double_buf = bq_double_buf
 
-    row_seg_starts_double_buf = pltpu.SMEM(
-        (2, bq_sz),
-        jnp.int32,
-    )
-
     l_scratch = pltpu.VMEM(
         (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
         jnp.float32,
@@ -1677,7 +1646,6 @@ def ragged_paged_attention(
         bkv_fused_double_buf,  # Double buffering for fused kv block with head interleaving.
         bq_double_buf,  # Double buffering for q block.
         bo_double_buf,  # Double buffering for output block.
-        row_seg_starts_double_buf,  # Double buffering for segment start metadata per q block.
         # Semaphores for double buffering of bkv, bq, bo and bkv_update.
         pltpu.SemaphoreType.DMA((5, 2)),
         # Intermediate buffers per kv head for flash attention.
@@ -1699,6 +1667,8 @@ def ragged_paged_attention(
         jnp.full((4,), -1, jnp.int32),
         # (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
         jnp.full((6,), -1, jnp.int32),
+        multi_item_prefix_end,
+        multi_item_row_seg_starts,
     )
 
     max_num_tokens = q.shape[0]
@@ -1773,8 +1743,8 @@ def ragged_paged_attention(
             ),
         ],
         input_output_aliases={
-            9: 0,  # q input -> q output
-            11: 1,  # kv_cache_fused input -> updated kv_cache_fused output
+            11: 0,  # q input -> q output
+            13: 1,  # kv_cache_fused input -> updated kv_cache_fused output
         },
         name=scope_name,
     )
@@ -1786,8 +1756,6 @@ def ragged_paged_attention(
         kv_cache_fused_processed,
         custom_mask,
         jnp.zeros((bkv_sz, head_dim), dtype=jnp.int32),
-        multi_item_prefix_end,
-        multi_item_row_seg_starts,
     )
     return (
         prepare_outputs(output, actual_num_q_heads_per_kv_head, actual_head_dim),
