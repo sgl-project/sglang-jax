@@ -1,14 +1,21 @@
 import logging
 from collections.abc import Callable
+from functools import partial
 from typing import Any, cast
 
 import jax
 import jax.lax
 from flax import nnx
 from jax import numpy as jnp
+from jax import shard_map
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.kernels.reduce_scatter_matmul import (
+    bidirectional_reduce_scatter_matmul,
+)
 from sgl_jax.srt.layers.activation import GeluAndMul
 from sgl_jax.srt.layers.embeddings import (
     Embed,
@@ -19,7 +26,7 @@ from sgl_jax.srt.layers.embeddings import (
 )
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import RMSNorm, dual_rmsnorm_forward
-from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
 from sgl_jax.srt.layers.logits_processor import (
     LogitsMetadata,
     LogitsProcessor,
@@ -34,6 +41,57 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 logger = logging.getLogger(__name__)
 
 init_fn = nnx.initializers.uniform()
+
+# Default tile sizes for the bidirectional RS-matmul kernel, keyed by device.
+# TPU v7 (Ironwood): MXU supports up to 256x256. Using bm=bn=256 for MXU
+# utilization, bk=128 for compatibility with head_dim=128 multiples.
+# TODO: Run tuning script to find optimal tile sizes per model shape.
+RS_MATMUL_TILE_CONFIGS: dict[str, tuple[int, int, int]] = {
+    # (bm, bn, bk)
+    "TPU v7": (256, 256, 128),
+    "TPU v6e": (128, 128, 128),
+    "TPU v5e": (128, 128, 128),
+}
+RS_MATMUL_DEFAULT_TILES = (128, 128, 128)  # Conservative fallback
+
+
+def _get_rs_matmul_tiles() -> tuple[int, int, int]:
+    """Get tile sizes for the RS-matmul kernel based on the current device."""
+    from sgl_jax.srt.utils.jax_utils import get_device_name
+
+    try:
+        device = get_device_name()
+        return RS_MATMUL_TILE_CONFIGS.get(device, RS_MATMUL_DEFAULT_TILES)
+    except Exception:
+        return RS_MATMUL_DEFAULT_TILES
+
+
+def _fused_rs_matmul(
+    x: jax.Array,
+    weight: jax.Array,
+    *,
+    axis_name: str,
+    bm: int = 128,
+    bn: int = 128,
+    bk: int = 128,
+) -> jax.Array:
+    """Fused reduce-scatter matmul using bidirectional kernel (inside shard_map).
+
+    Computes: reduce_scatter(x @ weight, scatter_dim=0) using the bidirectional
+    ring algorithm that overlaps compute with communication.
+
+    Args:
+        x: Activation [M, K_local] (local shard)
+        weight: Weight [K_local, H] (local shard)
+        axis_name: Mesh axis for collective ops
+        bm, bn, bk: Tile sizes for the Pallas kernel
+
+    Returns:
+        [M/num_devices, H] - scattered output
+    """
+    # The kernel computes x @ y.T, so transpose weight: y = weight.T → [H, K_local]
+    y = weight.T
+    return bidirectional_reduce_scatter_matmul(x, y, axis_name=axis_name, bm=bm, bn=bn, bk=bk)
 
 
 def _yarn_linear_ramp_mask(low: float, high: float, dim: int, dtype: jnp.dtype) -> jax.Array:
@@ -365,6 +423,10 @@ class Grok1Attention(nnx.Module):
         self.config = config
         self.layer_id = layer_id
         self.hidden_size = hidden_size
+        # Sequence parallel: fused RS-matmul after o_proj, local RMSNorm, allgather before MoE.
+        # Always enabled when TP>1 (bidirectional ring kernel needs 2+ devices).
+        tp_size = mesh.shape.get("tensor", 1)
+        self.sequence_parallel = tp_size > 1
 
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -451,6 +513,42 @@ class Grok1Attention(nnx.Module):
         )
         self.attn.xai_temperature_len = getattr(config, "attn_temperature_len", -1)
 
+    def _o_proj_reduce_scatter(self, attn_output: jax.Array) -> jax.Array:
+        """O projection with reduce-scatter instead of allreduce.
+
+        Instead of producing replicated [M, H] output (allreduce),
+        produces scattered [M/TP, H] output (reduce-scatter on M dimension).
+        This enables local RMSNorm on fewer tokens before allgather.
+
+        Uses the fused bidirectional RS-matmul kernel which overlaps compute
+        with bidirectional ring communication for 2x ICI bandwidth.
+        For QuantizedLinear, weights are dequantized to BF16 first.
+        """
+        o_proj = self.o_proj
+
+        # Get BF16 weight [K/TP, H] — dequantize if FP8
+        if isinstance(o_proj, QuantizedLinear):
+            scale_val = o_proj.weight_scale.value
+            if scale_val.ndim == 2 and scale_val.shape[1] == 1:
+                scale_val = jnp.squeeze(scale_val, axis=1)
+            weight = o_proj.weight_q.value.astype(jnp.bfloat16) * scale_val
+        else:
+            weight = o_proj.weight.value
+
+        bm, bn, bk = _get_rs_matmul_tiles()
+        output = shard_map(
+            partial(_fused_rs_matmul, axis_name="tensor", bm=bm, bn=bn, bk=bk),
+            mesh=self.mesh,
+            in_specs=(
+                P(None, "tensor"),  # x: full M, K sharded
+                P("tensor", None),  # weight: K sharded, full H
+            ),
+            out_specs=P("tensor", None),  # M scattered, full H
+            check_vma=False,
+        )(attn_output, weight)
+
+        return output
+
     def __call__(
         self,
         positions: jax.Array,
@@ -478,8 +576,11 @@ class Grok1Attention(nnx.Module):
         attn_ret, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
         attn_output = attn_ret[0] if isinstance(attn_ret, tuple) else attn_ret
 
-        # Project output
-        output, _ = self.o_proj(attn_output)
+        # Project output: reduce-scatter (sequence parallel) or allreduce (standard)
+        if self.sequence_parallel:
+            output = self._o_proj_reduce_scatter(attn_output)
+        else:
+            output, _ = self.o_proj(attn_output)
         return output, kv_fused
 
 
@@ -496,6 +597,10 @@ class Grok1DecoderLayer(nnx.Module):
         self.num_experts = config.num_local_experts
         self.hidden_size = config.hidden_size
         self.residual_moe = getattr(config, "residual_moe", False)
+        # Sequence parallel: fused RS-matmul after o_proj, local RMSNorm, allgather before MoE.
+        # Always enabled when TP>1 (bidirectional ring kernel needs 2+ devices).
+        tp_size = mesh.shape.get("tensor", 1)
+        self.sequence_parallel = tp_size > 1
         self.layer_id = layer_id
         self.mesh = mesh
 
@@ -621,16 +726,44 @@ class Grok1DecoderLayer(nnx.Module):
             token_to_kv_pool=token_to_kv_pool,
         )
 
-        # # Apply post-attention norm and pre-MoE norm (matching PyTorch fused_dual_residual_rmsnorm)
-        assert self.post_attn_norm.scale is not None
-        assert self.pre_moe_norm.scale is not None
-        hidden_states, residual = dual_rmsnorm_forward(
-            hidden_states,
-            residual,
-            self.post_attn_norm.scale,
-            self.pre_moe_norm.scale,
-            self.post_attn_norm.epsilon,
-        )
+        if self.sequence_parallel:
+            # Sequence parallel path:
+            # 1. o_proj already produced reduce-scattered output: [M/TP, H]
+            # 2. Scatter residual to match: [M, H] → [M/TP, H] (free slice, no communication)
+            # 3. Do dual_rmsnorm locally on scattered data (per-token, works fine)
+            # 4. Allgather both before MoE
+
+            scattered_sharding = NamedSharding(self.mesh, P("tensor", None))
+            replicated_sharding = NamedSharding(self.mesh, P(None, None))
+
+            # Scatter residual to [M/TP, H] — free, just discards replicated copies
+            residual = jax.lax.with_sharding_constraint(residual, scattered_sharding)
+
+            # Apply post-attention norm and pre-MoE norm on scattered data (local, cheap)
+            assert self.post_attn_norm.scale is not None
+            assert self.pre_moe_norm.scale is not None
+            hidden_states, residual = dual_rmsnorm_forward(
+                hidden_states,
+                residual,
+                self.post_attn_norm.scale,
+                self.pre_moe_norm.scale,
+                self.post_attn_norm.epsilon,
+            )
+
+            # Allgather before MoE: [M/TP, H] → [M, H]
+            hidden_states = jax.lax.with_sharding_constraint(hidden_states, replicated_sharding)
+            residual = jax.lax.with_sharding_constraint(residual, replicated_sharding)
+        else:
+            # Standard path: o_proj already produced allreduced [M, H] output
+            assert self.post_attn_norm.scale is not None
+            assert self.pre_moe_norm.scale is not None
+            hidden_states, residual = dual_rmsnorm_forward(
+                hidden_states,
+                residual,
+                self.post_attn_norm.scale,
+                self.pre_moe_norm.scale,
+                self.post_attn_norm.epsilon,
+            )
 
         # Feed-forward network
         if self.residual_moe:
