@@ -480,6 +480,7 @@ suites = {
         TestFile("test/srt/test_engine_pause_continue.py", 3),
         TestFile("test/srt/test_server_pause_continue.py", 6),
         TestFile("test/srt/rl/test_return_routed_experts.py", 5),
+        TestFile("test/srt/rl/test_multi_engines_in_one_process.py", 5),
         TestFile("test/srt/multimodal/test_wan2_1_models.py", 30),
     ],
 }
