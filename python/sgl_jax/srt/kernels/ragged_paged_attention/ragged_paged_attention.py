@@ -965,20 +965,20 @@ def _ragged_paged_attention_kernel(
                         )
                         k_positions = bkv_idx * bkv_sz + lax.iota(jnp.int32, bkv_sz)
                         prefix_end = multi_item_prefix_end_ref[seq_idx]
-                        is_prefix_row = q_row_positions < prefix_end
+                        is_prefix_row = (q_row_positions < prefix_end).astype(jnp.int32)
 
-                        causal_allow = k_positions[None, :] <= q_row_positions[:, None]
-                        shared_prefix_allow = k_positions < prefix_end
+                        causal_allow = (k_positions[None, :] <= q_row_positions[:, None]).astype(jnp.int32)
+                        shared_prefix_allow = (k_positions < prefix_end).astype(jnp.int32)
                         segment_allow = jnp.logical_and(
                             k_positions[None, :] >= row_seg_by_token[:, None],
                             k_positions[None, :] <= q_row_positions[:, None],
+                        ).astype(jnp.int32)
+                        non_prefix_allow = jnp.maximum(shared_prefix_allow[None, :], segment_allow)
+                        allow = (
+                            is_prefix_row[:, None] * causal_allow
+                            + (1 - is_prefix_row[:, None]) * non_prefix_allow
                         )
-                        non_prefix_allow = jnp.logical_or(shared_prefix_allow, segment_allow)
-                        allow = jnp.logical_or(
-                            jnp.logical_and(is_prefix_row[:, None], causal_allow),
-                            jnp.logical_and(jnp.logical_not(is_prefix_row[:, None]), non_prefix_allow),
-                        )
-                        token_mask = jnp.logical_not(allow)
+                        token_mask = allow == 0
                         return jnp.repeat(token_mask, num_q_heads_per_kv_head, axis=0)
 
                     if bkvmask_ref is None:
