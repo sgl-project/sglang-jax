@@ -312,6 +312,7 @@ def _ragged_paged_attention_kernel(
     bkv_fused_x2_ref,  # [2, bkv_sz, num_kv_heads_interleaved // kv_packing, kv_packing, head_dim]
     bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     bo_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
+    row_seg_x2_ref,  # [2, bq_sz], int32
     sems,  # [5, 2]
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
@@ -658,6 +659,20 @@ def _ragged_paged_attention_kernel(
             wait,
         )
 
+    def _fetch_row_seg_starts(seq_idx, bq_idx, bq_sem_idx, *, wait=False):
+        sem = sems.at[4, bq_sem_idx]
+        vmem_ref = row_seg_x2_ref.at[bq_sem_idx]
+        q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
+        q_end = cu_q_lens_ref[seq_idx + 1]
+        sz = jnp.minimum(bq_sz, q_end - q_len_start)
+
+        _async_copy(
+            multi_item_row_seg_starts_ref.at[pl.ds(q_len_start, sz)],
+            vmem_ref.at[pl.ds(0, sz)],
+            sem,
+            wait,
+        )
+
     def _send_bo(seq_idx, bo_idx, bo_sem_idx, *, wait=False):
         sem = sems.at[2, bo_sem_idx]
         vmem_ref = bo_x2_ref.at[bo_sem_idx]
@@ -689,6 +704,12 @@ def _ragged_paged_attention_kernel(
 
     def wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx):
         return _fetch_bq(seq_idx, bq_idx, bq_sem_idx, wait=True)
+
+    def start_fetch_row_seg_starts(seq_idx, bq_idx, bq_sem_idx):
+        return _fetch_row_seg_starts(seq_idx, bq_idx, bq_sem_idx)
+
+    def wait_fetch_row_seg_starts(seq_idx, bq_idx, bq_sem_idx):
+        return _fetch_row_seg_starts(seq_idx, bq_idx, bq_sem_idx, wait=True)
 
     def start_send_bo(seq_idx, bo_idx, bo_sem_idx):
         bo_ids_ref[bo_sem_idx] = seq_idx
@@ -888,6 +909,8 @@ def _ragged_paged_attention_kernel(
             def prefetch_next_bq():
                 sem_ids_ref[0] = next_bq_sem_idx
                 start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
+                if multi_item_mask_mode == 2:
+                    start_fetch_row_seg_starts(next_seq_idx, next_bq_idx, next_bq_sem_idx)
 
             def compute_with_bkv(bkv_idx, _):
                 # Create bitmask for KV.
@@ -913,6 +936,12 @@ def _ragged_paged_attention_kernel(
                 def wait_cur_bq():
                     wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
 
+                if multi_item_mask_mode == 2:
+
+                    @pl.when(bkv_idx == 0)
+                    def wait_cur_row_seg_starts():
+                        wait_fetch_row_seg_starts(seq_idx, bq_idx, bq_sem_idx)
+
                 # Wait for cur bkv
                 offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
 
@@ -928,10 +957,9 @@ def _ragged_paged_attention_kernel(
 
                 def load_mask(q_span, k_span):
                     if multi_item_mask_mode == 2:
-                        q_token_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
-                        row_seg_by_token = multi_item_row_seg_starts_ref[
-                            pl.ds(q_token_start, actual_bq_sz)
-                        ]
+                        row_seg_by_token = row_seg_x2_ref.at[
+                            bq_sem_idx, pl.ds(0, actual_bq_sz)
+                        ][...]
                         row_seg_starts = jnp.repeat(row_seg_by_token, num_q_heads_per_kv_head)
 
                         q_row_positions = q_span[:, 0]
@@ -1074,6 +1102,8 @@ def _ragged_paged_attention_kernel(
     @pl.when(seq_idx == 0)
     def prologue():
         start_fetch_bq(0, 0, 0)
+        if multi_item_mask_mode == 2:
+            start_fetch_row_seg_starts(0, 0, 0)
         # Initialize bkv_fused_x2_ref to zeros to avoid NaN issues from accessing
         # uninitialized memory. Bitcast into int32 to avoid tiling issues.
         bkv_x2_int32_ref = bkv_fused_x2_ref.bitcast(jnp.int32).reshape((2, -1, 8, 128))
@@ -1624,6 +1654,11 @@ def ragged_paged_attention(
 
     bo_double_buf = bq_double_buf
 
+    row_seg_starts_double_buf = pltpu.VMEM(
+        (2, bq_sz),
+        jnp.int32,
+    )
+
     l_scratch = pltpu.VMEM(
         (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
         jnp.float32,
@@ -1640,6 +1675,7 @@ def ragged_paged_attention(
         bkv_fused_double_buf,  # Double buffering for fused kv block with head interleaving.
         bq_double_buf,  # Double buffering for q block.
         bo_double_buf,  # Double buffering for output block.
+        row_seg_starts_double_buf,  # Double buffering for segment start metadata per q block.
         # Semaphores for double buffering of bkv, bq, bo and bkv_update.
         pltpu.SemaphoreType.DMA((5, 2)),
         # Intermediate buffers per kv head for flash attention.
