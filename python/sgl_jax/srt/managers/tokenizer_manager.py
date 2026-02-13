@@ -1669,23 +1669,46 @@ class TokenizerManager:
         """Release the cached query."""
         self.auto_create_handle_loop()
         logger.debug("Prefill+extend: releasing cache handle=%s", cache_handle)
-        outputs = await self.release_scoring_cache_communicator(
-            ReleaseScoringCacheReqInput(rid=cache_handle)
+        timeout_s = float(
+            getattr(self.server_args, "multi_item_prefill_extend_cache_timeout", 60.0)
         )
+        try:
+            outputs = await self.release_scoring_cache_communicator(
+                ReleaseScoringCacheReqInput(rid=cache_handle),
+                timeout=timeout_s if timeout_s > 0 else None,
+            )
+        except TimeoutError:
+            logger.error(
+                "Timed out releasing prefill+extend cache handle=%s (timeout=%.2fs).",
+                cache_handle,
+                timeout_s,
+            )
+            return False
+        except Exception:
+            logger.exception(
+                "Unexpected failure while releasing prefill+extend cache handle=%s.",
+                cache_handle,
+            )
+            return False
+
         if not outputs:
             logger.warning("Release scoring cache returned no output for handle=%s", cache_handle)
-            return
+            return False
 
         for out in outputs:
             if not out.success:
-                raise RuntimeError(
-                    f"Failed to release scoring cache handle={cache_handle}: {out.error_msg}"
+                logger.error(
+                    "Failed to release scoring cache handle=%s: %s",
+                    cache_handle,
+                    out.error_msg,
                 )
+                return False
             logger.debug(
                 "Prefill+extend: released cache handle=%s released_items=%d",
                 cache_handle,
                 out.released_items,
             )
+        return True
 
     async def score_prefill_extend(
         self,
@@ -1745,7 +1768,11 @@ class TokenizerManager:
             return all_scores
         finally:
             # Step 3: Release cache
-            await self._release_cache(cache_handle)
+            released = await self._release_cache(cache_handle)
+            if not released:
+                logger.warning(
+                    "Prefill+extend cache handle=%s was not cleanly released.", cache_handle
+                )
 
 
 async def print_exception_wrapper(func):
@@ -1788,33 +1815,41 @@ class _Communicator[T]:
     def __init__(self, sender, fan_out: int):
         self._sender = sender
         self._fan_out = fan_out
+        self._lock = asyncio.Lock()
         self._result_event: asyncio.Event | None = None
         self._result_values: list[T] | None = None
-        self._ready_queue: deque[asyncio.Future] = deque()
 
-    async def __call__(self, obj):
-        ready_event = asyncio.Event()
-        if self._result_event is not None or len(self._ready_queue) > 0:
-            self._ready_queue.append(ready_event)
-            await ready_event.wait()
-            assert self._result_event is None
-            assert self._result_values is None
+    async def __call__(self, obj, timeout: float | None = None):
+        async with self._lock:
+            if self._result_event is not None or self._result_values is not None:
+                raise RuntimeError(
+                    "Communicator received a new call while a previous call is still active."
+                )
 
-        if obj:
-            self._sender.send_pyobj(obj)
+            self._result_event = asyncio.Event()
+            self._result_values = []
+            try:
+                if obj is not None:
+                    self._sender.send_pyobj(obj)
 
-        self._result_event = asyncio.Event()
-        self._result_values = []
-        await self._result_event.wait()
-        result_values = self._result_values
-        self._result_event = self._result_values = None
+                wait_coro = self._result_event.wait()
+                if timeout is not None and timeout > 0:
+                    await asyncio.wait_for(wait_coro, timeout=timeout)
+                else:
+                    await wait_coro
 
-        if len(self._ready_queue) > 0:
-            self._ready_queue.popleft().set()
-
-        return result_values
+                return list(self._result_values)
+            finally:
+                self._result_event = None
+                self._result_values = None
 
     def handle_recv(self, recv_obj: T):
+        if self._result_values is None or self._result_event is None:
+            logger.warning(
+                "Dropping communicator response with no active waiter. type=%s",
+                type(recv_obj).__name__,
+            )
+            return
         self._result_values.append(recv_obj)
-        if len(self._result_values) == self._fan_out:
+        if len(self._result_values) >= self._fan_out:
             self._result_event.set()

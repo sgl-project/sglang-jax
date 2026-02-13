@@ -1008,7 +1008,10 @@ class ServerArgs:
             "--multi-item-prefill-extend-cache-timeout",
             type=float,
             default=ServerArgs.multi_item_prefill_extend_cache_timeout,
-            help="Timeout in seconds for cached query prefix in prefill+extend scoring.",
+            help=(
+                "TTL in seconds for prefill+extend cached query handles. "
+                "Set 0 to disable automatic expiration."
+            ),
         )
         parser.add_argument(
             "--enable-scoring-cache",
@@ -1197,6 +1200,12 @@ class ServerArgs:
             assert (
                 self.multi_item_segment_fallback_threshold >= 0
             ), "--multi-item-segment-fallback-threshold must be non-negative"
+            assert (
+                self.multi_item_extend_batch_size > 0
+            ), "--multi-item-extend-batch-size must be positive"
+            assert (
+                self.multi_item_prefill_extend_cache_timeout >= 0
+            ), "--multi-item-prefill-extend-cache-timeout must be non-negative"
 
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""

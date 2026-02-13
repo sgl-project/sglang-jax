@@ -356,8 +356,18 @@ class Scheduler(
         self._engine_paused = False
 
         # Workstream B: Store cached nodes for prefill+extend
-        # Map: rid -> (last_node, swa_uuid_for_lock, input_ids, prefix_indices, extra_key)
+        # Map:
+        # rid -> (
+        #   last_node,
+        #   swa_uuid_for_lock,
+        #   input_ids,
+        #   prefix_indices,
+        #   extra_key,
+        #   last_access_ts,
+        # )
         self.scoring_cache_nodes = {}
+        self.scoring_cache_timeout = float(server_args.multi_item_prefill_extend_cache_timeout)
+        self._last_scoring_cache_gc = 0.0
 
         # Init schedule policy and new token estimation
         self.policy = SchedulePolicy(
@@ -675,10 +685,119 @@ class Scheduler(
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: list):
+        self._evict_expired_scoring_cache_nodes()
         for recv_req in recv_reqs:
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
+
+    def _unpack_scoring_cache_entry(self, entry):
+        # Backward-compatible unpack for entries created before `last_access_ts`
+        # was added.
+        if len(entry) == 6:
+            return entry
+        if len(entry) == 5:
+            node, swa_uuid, input_ids, prefix_indices, extra_key = entry
+            return node, swa_uuid, input_ids, prefix_indices, extra_key, 0.0
+        raise RuntimeError(f"Invalid scoring cache entry format (len={len(entry)}).")
+
+    def _release_scoring_cache_entry(self, rid: str, entry, reason: str) -> None:
+        node, swa_uuid, *_ = self._unpack_scoring_cache_entry(entry)
+        if node is None:
+            logger.warning("Scoring cache entry rid=%s has no radix node (%s).", rid, reason)
+            return
+        try:
+            if isinstance(self.tree_cache, SWARadixCache):
+                self.tree_cache.dec_lock_ref(node, swa_uuid)
+            else:
+                self.tree_cache.dec_lock_ref(node)
+        except Exception:
+            logger.exception(
+                "Failed to decrement scoring-cache lock ref for rid=%s (%s).",
+                rid,
+                reason,
+            )
+
+    def _touch_scoring_cache_entry(self, rid: str, now: float | None = None):
+        entry = self.scoring_cache_nodes.get(rid)
+        if entry is None:
+            return
+        node, swa_uuid, input_ids, prefix_indices, extra_key, _ = self._unpack_scoring_cache_entry(
+            entry
+        )
+        self.scoring_cache_nodes[rid] = (
+            node,
+            swa_uuid,
+            input_ids,
+            prefix_indices,
+            extra_key,
+            time.monotonic() if now is None else now,
+        )
+
+    def _evict_expired_scoring_cache_nodes(self, now: float | None = None) -> int:
+        timeout = self.scoring_cache_timeout
+        if timeout <= 0:
+            return 0
+
+        now_ts = time.monotonic() if now is None else now
+        # Throttle GC to avoid walking the dict too often.
+        if now is None and now_ts - self._last_scoring_cache_gc < 0.5:
+            return 0
+        self._last_scoring_cache_gc = now_ts
+
+        expired_rids: list[str] = []
+        for rid, entry in self.scoring_cache_nodes.items():
+            *_, last_access_ts = self._unpack_scoring_cache_entry(entry)
+            if now_ts - last_access_ts > timeout:
+                expired_rids.append(rid)
+
+        for rid in expired_rids:
+            entry = self.scoring_cache_nodes.pop(rid, None)
+            if entry is None:
+                continue
+            self._release_scoring_cache_entry(rid, entry, reason="expired")
+
+        if expired_rids:
+            logger.info("Evicted %d expired scoring cache handles.", len(expired_rids))
+        return len(expired_rids)
+
+    def _resolve_extend_from_cache(
+        self, recv_req: TokenizedGenerateReqInput
+    ) -> tuple[tuple | None, str | None]:
+        if not recv_req.extend_from_cache:
+            return None, None
+
+        self._evict_expired_scoring_cache_nodes()
+        entry = self.scoring_cache_nodes.get(recv_req.extend_from_cache)
+        if entry is None:
+            err = (
+                f"Missing scoring cache handle '{recv_req.extend_from_cache}'. "
+                "The cached prefix may have expired or been released."
+            )
+            logger.warning("Prefill+extend scheduler: %s", err)
+            return None, err
+
+        cached_last_node, _, prefix_ids, prefix_indices, cached_extra_key, _ = (
+            self._unpack_scoring_cache_entry(entry)
+        )
+        item_ids = recv_req.input_ids or []
+        recv_req.input_ids = prefix_ids + item_ids
+        cached_prefix_len = len(prefix_indices)
+        suffix_len = max(0, len(item_ids))
+        if recv_req.extra_key is None:
+            recv_req.extra_key = cached_extra_key
+        self._touch_scoring_cache_entry(recv_req.extend_from_cache)
+        logger.debug(
+            "Prefill+extend scheduler: extend request rid=%s handle=%s prefix_tokens=%d cached_prefix=%d item_tokens=%d merged_input_tokens=%d max_new_tokens=%s",
+            recv_req.rid,
+            recv_req.extend_from_cache,
+            len(prefix_ids),
+            cached_prefix_len,
+            suffix_len,
+            len(recv_req.input_ids),
+            recv_req.sampling_params.max_new_tokens,
+        )
+        return (cached_last_node, prefix_indices), None
 
     def handle_generate_request(
         self,
@@ -692,38 +811,7 @@ class Scheduler(
                 recv_req.token_ids_logprob,
             )
 
-        cached_prefix_ctx = None
-        # Handle extend_from_cache: rebuild full sequence from cached prefix + new suffix.
-        if recv_req.extend_from_cache:
-            if recv_req.extend_from_cache in self.scoring_cache_nodes:
-                cached_last_node, _, prefix_ids, prefix_indices, cached_extra_key = (
-                    self.scoring_cache_nodes[recv_req.extend_from_cache]
-                )
-                # Preserve full token history so extend positions and logprob offsets remain
-                # correct, while reusing cached prefix indices for KV.
-                item_ids = recv_req.input_ids
-                recv_req.input_ids = prefix_ids + item_ids
-                cached_prefix_len = len(prefix_indices)
-                uncached_tail_len = max(0, len(prefix_ids) - cached_prefix_len)
-                cached_prefix_ctx = (cached_last_node, prefix_indices)
-                if recv_req.extra_key is None:
-                    recv_req.extra_key = cached_extra_key
-                logger.debug(
-                    "Prefill+extend scheduler: extend request rid=%s handle=%s prefix_tokens=%d cached_prefix=%d uncached_tail=%d item_tokens=%d merged_input_tokens=%d max_new_tokens=%s",
-                    recv_req.rid,
-                    recv_req.extend_from_cache,
-                    len(prefix_ids),
-                    cached_prefix_len,
-                    uncached_tail_len,
-                    len(item_ids),
-                    len(recv_req.input_ids),
-                    recv_req.sampling_params.max_new_tokens,
-                )
-            else:
-                logger.warning(
-                    "extend_from_cache handle %s not found. Treating as normal request.",
-                    recv_req.extend_from_cache,
-                )
+        cached_prefix_ctx, cache_lookup_error = self._resolve_extend_from_cache(recv_req)
 
         # Create a new request
         req = Req(
@@ -750,6 +838,11 @@ class Scheduler(
             extend_from_cache=recv_req.extend_from_cache,
         )
         req.tokenizer = self.tokenizer
+        if cache_lookup_error is not None:
+            req.set_finish_with_abort(cache_lookup_error)
+            self._add_request_to_queue(req)
+            return
+
         if cached_prefix_ctx is not None:
             cached_last_node, cached_prefix_indices = cached_prefix_ctx
             req.cached_last_node = cached_last_node
@@ -1593,19 +1686,20 @@ class Scheduler(
 
     def _release_scoring_cache_nodes(self, rid_prefix: str | None, abort_all: bool) -> int:
         released = 0
+        self._evict_expired_scoring_cache_nodes()
+        if not abort_all and not rid_prefix:
+            return released
+
         rids_to_remove = []
         for rid in self.scoring_cache_nodes:
-            if abort_all or rid_prefix and rid.startswith(rid_prefix):
+            if abort_all or (rid_prefix and rid.startswith(rid_prefix)):
                 rids_to_remove.append(rid)
 
         for rid in rids_to_remove:
-            node, swa_uuid, *_ = self.scoring_cache_nodes[rid]
-            if node is not None:
-                if isinstance(self.tree_cache, SWARadixCache):
-                    self.tree_cache.dec_lock_ref(node, swa_uuid)
-                else:
-                    self.tree_cache.dec_lock_ref(node)
-            del self.scoring_cache_nodes[rid]
+            entry = self.scoring_cache_nodes.pop(rid, None)
+            if entry is None:
+                continue
+            self._release_scoring_cache_entry(rid, entry, reason="manual")
             released += 1
             logger.debug("Released cached node for rid=%s", rid)
         return released

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING
 
 import jax
@@ -138,18 +139,25 @@ class SchedulerOutputProcessorMixin:
                             ) = self.tree_cache.match_prefix(
                                 key=RadixKey(req.origin_input_ids, req.extra_key)
                             )
-                            if isinstance(self.tree_cache, SWARadixCache):
-                                swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
+                            if last_node is None:
+                                logger.warning(
+                                    "Skipping scoring cache for rid=%s because radix node is missing.",
+                                    req.rid,
+                                )
                             else:
-                                self.tree_cache.inc_lock_ref(last_node)
-                                swa_uuid_for_lock = None
-                            self.scoring_cache_nodes[req.rid] = (
-                                last_node,
-                                swa_uuid_for_lock,
-                                req.origin_input_ids,
-                                prefix_indices,
-                                req.extra_key,
-                            )
+                                if isinstance(self.tree_cache, SWARadixCache):
+                                    swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
+                                else:
+                                    self.tree_cache.inc_lock_ref(last_node)
+                                    swa_uuid_for_lock = None
+                                self.scoring_cache_nodes[req.rid] = (
+                                    last_node,
+                                    swa_uuid_for_lock,
+                                    req.origin_input_ids,
+                                    prefix_indices,
+                                    req.extra_key,
+                                    time.monotonic(),
+                                )
                     else:
                         self.tree_cache.cache_finished_req(req)
                 elif not batch.decoding_reqs or req not in batch.decoding_reqs:

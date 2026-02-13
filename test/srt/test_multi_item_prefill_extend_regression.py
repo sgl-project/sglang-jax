@@ -2,6 +2,7 @@ import asyncio
 import math
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from sgl_jax.srt.managers.io_struct import GenerateReqInput
@@ -73,6 +74,32 @@ class _FakeExtendMissingLogprobsManager:
         yield [{"index": 0, "meta_info": {"output_token_ids_logprobs": []}}]
 
 
+class _FakeReleaseCacheCommunicator:
+    def __init__(self, outputs=None, delay_s: float = 0.0, raise_exc: Exception | None = None):
+        self.outputs = outputs
+        self.delay_s = delay_s
+        self.raise_exc = raise_exc
+
+    async def __call__(self, req, timeout=None):
+        del req, timeout
+        if self.delay_s > 0:
+            await asyncio.sleep(self.delay_s)
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return self.outputs
+
+
+class _FakeReleaseCacheManager:
+    _release_cache = TokenizerManager._release_cache
+
+    def __init__(self, communicator, timeout_s: float):
+        self.release_scoring_cache_communicator = communicator
+        self.server_args = SimpleNamespace(multi_item_prefill_extend_cache_timeout=timeout_s)
+
+    def auto_create_handle_loop(self):
+        return None
+
+
 def test_create_tokenized_object_keeps_prefill_extend_fields():
     manager = _FakeCreateTokenizedManager()
     req = GenerateReqInput(
@@ -142,6 +169,24 @@ def test_batched_extend_score_raises_when_output_logprobs_missing():
         )
 
 
+def test_release_cache_returns_true_on_success():
+    manager = _FakeReleaseCacheManager(
+        communicator=_FakeReleaseCacheCommunicator(
+            outputs=[SimpleNamespace(success=True, released_items=1, error_msg="")]
+        ),
+        timeout_s=1.0,
+    )
+    assert asyncio.run(manager._release_cache("cache-handle-ok")) is True
+
+
+def test_release_cache_times_out_and_returns_false():
+    manager = _FakeReleaseCacheManager(
+        communicator=_FakeReleaseCacheCommunicator(outputs=[], delay_s=0.2),
+        timeout_s=0.01,
+    )
+    assert asyncio.run(manager._release_cache("cache-handle-timeout")) is False
+
+
 class _FakeReqToTokenPool:
     def __init__(self, available_size: int):
         self._available_size = available_size
@@ -157,6 +202,79 @@ class _FakeRunningBatch:
 
     def is_empty(self) -> bool:
         return len(self.reqs) == 0
+
+
+class _FakeSchedulerCacheOps:
+    _unpack_scoring_cache_entry = Scheduler._unpack_scoring_cache_entry
+    _release_scoring_cache_entry = Scheduler._release_scoring_cache_entry
+    _touch_scoring_cache_entry = Scheduler._touch_scoring_cache_entry
+    _evict_expired_scoring_cache_nodes = Scheduler._evict_expired_scoring_cache_nodes
+    _resolve_extend_from_cache = Scheduler._resolve_extend_from_cache
+
+    def __init__(self, timeout_s: float):
+        self.scoring_cache_timeout = timeout_s
+        self._last_scoring_cache_gc = 0.0
+        self.scoring_cache_nodes = {}
+        self.tree_cache = SimpleNamespace(dec_lock_ref=lambda *args, **kwargs: None)
+
+
+def test_resolve_extend_from_cache_missing_handle_returns_error():
+    scheduler = _FakeSchedulerCacheOps(timeout_s=60.0)
+    recv_req = SimpleNamespace(
+        rid="req-missing",
+        input_ids=[101, 102],
+        extra_key=None,
+        extend_from_cache="missing-handle",
+        sampling_params=SimpleNamespace(max_new_tokens=0),
+    )
+
+    cached_prefix_ctx, err = scheduler._resolve_extend_from_cache(recv_req)
+
+    assert cached_prefix_ctx is None
+    assert "Missing scoring cache handle" in err
+    assert recv_req.input_ids == [101, 102]
+
+
+def test_resolve_extend_from_cache_merges_prefix_and_suffix():
+    scheduler = _FakeSchedulerCacheOps(timeout_s=0.0)
+    scheduler.scoring_cache_nodes["cache-1"] = (
+        "node",
+        None,
+        [1, 2, 3],
+        np.array([0, 1, 2], dtype=np.int32),
+        "extra-key",
+        0.0,
+    )
+    recv_req = SimpleNamespace(
+        rid="req-hit",
+        input_ids=[11, 12],
+        extra_key=None,
+        extend_from_cache="cache-1",
+        sampling_params=SimpleNamespace(max_new_tokens=0),
+    )
+
+    cached_prefix_ctx, err = scheduler._resolve_extend_from_cache(recv_req)
+
+    assert err is None
+    assert cached_prefix_ctx is not None
+    assert recv_req.input_ids == [1, 2, 3, 11, 12]
+    assert recv_req.extra_key == "extra-key"
+
+
+def test_evict_expired_scoring_cache_nodes_removes_stale_entries():
+    scheduler = _FakeSchedulerCacheOps(timeout_s=10.0)
+    scheduler.scoring_cache_nodes["cache-stale"] = (
+        None,
+        None,
+        [1, 2, 3],
+        np.array([0, 1, 2], dtype=np.int32),
+        None,
+        0.0,
+    )
+
+    removed = scheduler._evict_expired_scoring_cache_nodes(now=20.0)
+    assert removed == 1
+    assert "cache-stale" not in scheduler.scoring_cache_nodes
 
 
 def test_scheduler_req_slot_exhaustion_does_not_stick_batch_full():
