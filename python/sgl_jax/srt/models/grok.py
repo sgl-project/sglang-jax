@@ -9,6 +9,10 @@ from jax import numpy as jnp
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.eplb.expert_location import (
+    ExpertLocationMetadata,
+    topk_ids_logical_to_physical,
+)
 from sgl_jax.srt.layers.activation import GeluAndMul
 from sgl_jax.srt.layers.embeddings import (
     Embed,
@@ -274,7 +278,11 @@ class Grok1MoE(nnx.Module):
                 quantization_config=getattr(config, "quantization_config", None),
             )
 
-    def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:
+    def __call__(
+        self,
+        hidden_states: jax.Array,
+        dispatch_info: ExpertLocationMetadata | None = None,
+    ) -> tuple[jax.Array, jax.Array | None]:
         # Router computation with soft capping
         router_logits, _ = self.gate(hidden_states)
 
@@ -283,24 +291,32 @@ class Grok1MoE(nnx.Module):
             router_logits = router_logits / self.router_logit_softcapping
             router_logits = jax.nn.tanh(router_logits) * self.router_logit_softcapping
 
+        # Compute top-k routing weights using sglang-style approach:
+        # 1. Compute global softmax over ALL experts (not just top-k)
+        # 2. Select top-k experts based on logits
+        # 3. Extract corresponding weights (no renormalization)
+        top_k_weights, top_k_indices = self._custom_topk(
+            router_logits,
+            self.top_k,
+            renormalize=False,
+            dispatch_info=dispatch_info,
+        )
+
         if self.use_fused:
-            # Fused kernel: pass router_logits directly
-            # Top-K selection is handled internally by the kernel
+            # Fused kernel: pass pre-computed topk_weights/indices
             assert isinstance(self.experts, FusedEPMoE)
-            return self.experts(hidden_states, router_logits), None
+            return self.experts(hidden_states, top_k_weights, top_k_indices), top_k_indices
         else:
-            # EPMoE: compute top-k routing weights using sglang-style approach:
-            # 1. Compute global softmax over ALL experts (not just top-k)
-            # 2. Select top-k experts based on logits
-            # 3. Extract corresponding weights (no renormalization)
+            # EPMoE: pass pre-computed topk_weights/indices
             assert isinstance(self.experts, EPMoE)
-            top_k_weights, top_k_indices = self._custom_topk(
-                router_logits, self.top_k, renormalize=False
-            )
             return self.experts(hidden_states, top_k_weights, top_k_indices), top_k_indices
 
     def _custom_topk(
-        self, router_logits: jax.Array, top_k: int, renormalize: bool = False
+        self,
+        router_logits: jax.Array,
+        top_k: int,
+        renormalize: bool = False,
+        dispatch_info: ExpertLocationMetadata | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         """
         Compute top-k routing weights using sglang's approach.
@@ -335,6 +351,11 @@ class Grok1MoE(nnx.Module):
         # Select top-k experts based on logits (not weights)
         # jax.lax.top_k returns values and indices in descending order
         _, top_k_indices = jax.lax.top_k(router_logits, top_k)
+
+        if dispatch_info is not None:
+            top_k_indices = topk_ids_logical_to_physical(
+                top_k_indices, dispatch_info, self.layer_id
+            )
 
         # Extract weights for the selected top-k experts
         # Use take_along_axis to gather weights corresponding to top_k_indices
@@ -579,10 +600,14 @@ class Grok1DecoderLayer(nnx.Module):
         else:
             raise NotImplementedError()
 
-    def moe_with_rmoe(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
+    def moe_with_rmoe(
+        self,
+        x: jax.Array,
+        dispatch_info: ExpertLocationMetadata | None = None,
+    ) -> tuple[jax.Array, jax.Array | None]:
         """Combine MoE and residual MLP outputs (matches PyTorch implementation)."""
         mlp_result = self.mlp(x)
-        moe_result, topk_ids = self.block_sparse_moe(x)
+        moe_result, topk_ids = self.block_sparse_moe(x, dispatch_info=dispatch_info)
         # Scale factor from the paper: 1/sqrt(2)
         return (mlp_result + moe_result) / 1.4142135623730951, topk_ids
 
@@ -594,6 +619,7 @@ class Grok1DecoderLayer(nnx.Module):
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
         deferred_norm: RMSNorm | None = None,
+        dispatch_info: ExpertLocationMetadata | None = None,
     ) -> tuple[jax.Array, jax.Array, RMSNorm, jax.Array, jax.Array | None]:
 
         # Self Attention block (matching PyTorch logic exactly)
@@ -634,9 +660,12 @@ class Grok1DecoderLayer(nnx.Module):
 
         # Feed-forward network
         if self.residual_moe:
-            hidden_states, topk_ids = self.moe_with_rmoe(hidden_states)
+            hidden_states, topk_ids = self.moe_with_rmoe(hidden_states, dispatch_info=dispatch_info)
         else:
-            hidden_states, topk_ids = self.block_sparse_moe(hidden_states)
+            hidden_states, topk_ids = self.block_sparse_moe(
+                hidden_states,
+                dispatch_info=dispatch_info,
+            )
 
         # Return with deferred post-MoE norm (matching PyTorch)
         return hidden_states, residual, self.post_moe_norm, kv_fused, topk_ids
@@ -710,6 +739,7 @@ class Grok1Model(nnx.Module):
                 token_to_kv_pool,
                 residual,
                 deferred_norm,
+                dispatch_info=forward_batch.expert_location_metadata,
             )
             layers_kv_fused.append(kv_fused)
             layers_topk_ids.append(topk_ids)
@@ -820,7 +850,11 @@ class Grok1ForCausalLM(nnx.Module):
         input_ids = forward_batch.input_ids
         positions = forward_batch.positions
         hidden_states, layers_kv_fused, layers_topk_ids = self.model(
-            input_ids, positions, forward_batch, token_to_kv_pool, None
+            input_ids,
+            positions,
+            forward_batch,
+            token_to_kv_pool,
+            None,
         )
         output = self.logits_processor(hidden_states, cast(Embed, self.lm_head), logits_metadata)
 

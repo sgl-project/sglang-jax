@@ -1249,7 +1249,7 @@ class ScheduleBatch:
                 axis=0,
             )
 
-        # Calculate positions and extend_start_loc after padding
+        # Calculate positions after padding
         if self.forward_mode.is_extend():
             # For prefill: create positions for each token in sequences
             # Calculate total tokens without padding first
@@ -1268,11 +1268,6 @@ class ScheduleBatch:
                     [positions_cpu, np.zeros(padding_size, dtype=positions_cpu.dtype)]
                 )
 
-            # Start location of each sequence in the flattened array
-            extend_start_loc = np.cumsum(
-                np.concatenate([np.array([0]), extend_seq_lens[:-1]]),
-                dtype=seq_lens_cpu.dtype,
-            )
         else:
             # For decode: each sequence contributes one token at the next position (seq_len)
             # Create positions for actual tokens (one per sequence at seq_len)
@@ -1282,9 +1277,6 @@ class ScheduleBatch:
             # Fill in the actual positions for the real tokens
             # positions = positions.at[: len(batch_positions)].set(batch_positions)
             positions_cpu[: len(batch_positions)] = batch_positions
-            # The padding tokens (if any) will have position 0, which is fine for padding
-            # For decode, extend_start_loc is typically not used but we'll set it anyway
-            extend_start_loc = np.arange(len(seq_lens_cpu), dtype=seq_lens_cpu.dtype)
 
         mrope_positions_cpu = _compute_mrope_positions_for_batch(
             self.reqs,
@@ -1357,11 +1349,6 @@ class ScheduleBatch:
             invalid_seq_lens = np.array([0] * bs_padding_size, dtype=seq_lens_cpu.dtype)
             seq_lens_cpu = np.concat([seq_lens_cpu, invalid_seq_lens], axis=0)
             if self.forward_mode.is_extend():
-                invalid_extend_start_loc = np.array(
-                    [extend_start_loc[-1] + extend_seq_lens[-1]] * bs_padding_size,
-                    dtype=extend_start_loc.dtype,
-                )
-                extend_start_loc = np.concat([extend_start_loc, invalid_extend_start_loc], axis=0)
                 invalid_extend_prefix_lens = np.array(
                     [0] * bs_padding_size, dtype=extend_prefix_lens.dtype
                 )
@@ -1377,12 +1364,6 @@ class ScheduleBatch:
                 extend_logprob_start_lens = np.concat(
                     [extend_logprob_start_lens, invalid_extend_logprob_start_lens], axis=0
                 )
-
-            else:
-                invalid_extend_start_loc = np.array(
-                    [len(seq_lens_cpu)] * bs_padding_size, dtype=extend_start_loc.dtype
-                )
-                extend_start_loc = np.concat([extend_start_loc, invalid_extend_start_loc], axis=0)
 
         sampling_info = self.sampling_info
         if self.sampling_info:
@@ -1522,7 +1503,6 @@ class ScheduleBatch:
             sampling_info=sampling_info,
             positions=positions_cpu,
             mrope_positions=mrope_positions_cpu,
-            extend_start_loc=extend_start_loc,
             cache_loc=cache_loc_cpu,
             extend_prefix_lens=(
                 extend_prefix_lens if self.forward_mode == ForwardMode.EXTEND else None
@@ -1580,7 +1560,7 @@ class ScheduleBatch:
         else:
             positions_cpu = None
 
-        # Calculate positions and extend_start_loc after padding
+        # Calculate positions after padding
         if self.forward_mode.is_extend():
             # For prefill: create positions for each token in sequences
             # Calculate total tokens without padding first
@@ -1598,11 +1578,6 @@ class ScheduleBatch:
                     positions_cpu = positions_cpu.astype(seq_lens_cpu.dtype)
                 else:
                     positions_cpu = np.array([], dtype=seq_lens_cpu.dtype)
-            # Start location of each sequence in the flattened array
-            extend_start_loc = np.cumsum(
-                np.concatenate([np.array([0]), extend_seq_lens[:-1]]),
-                dtype=seq_lens_cpu.dtype,
-            )
         else:
             if positions_cpu is None:
                 # For decode: each sequence contributes one token at the next position (seq_len)
@@ -1613,9 +1588,6 @@ class ScheduleBatch:
                 # Fill in the actual positions for the real tokens
                 # positions = positions.at[: len(batch_positions)].set(batch_positions)
                 positions_cpu[: len(batch_positions)] = batch_positions
-                # The padding tokens (if any) will have position 0, which is fine for padding
-                # For decode, extend_start_loc is typically not used but we'll set it anyway
-            extend_start_loc = np.arange(len(seq_lens_cpu), dtype=seq_lens_cpu.dtype)
 
         mrope_positions_cpu = _compute_mrope_positions_for_batch(
             self.reqs,
@@ -1710,7 +1682,6 @@ class ScheduleBatch:
             sampling_info=self.sampling_info,
             positions=positions_cpu,
             mrope_positions=mrope_positions_cpu,
-            extend_start_loc=extend_start_loc,
             cache_loc=cache_loc_flat,
             extend_prefix_lens=(extend_prefix_lens if self.forward_mode.is_extend() else None),
             extend_seq_lens=(extend_seq_lens if self.forward_mode.is_extend() else None),
@@ -1944,8 +1915,7 @@ class ModelWorkerBatch:
     sampling_info: SamplingBatchInfo
     # Position information [total_tokens]
     positions: np.ndarray
-    # Start position for each sequence in extend mode [batch_size]
-    extend_start_loc: np.ndarray
+
     # cache_loc
     cache_loc: np.ndarray
 

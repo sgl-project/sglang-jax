@@ -437,7 +437,6 @@ class ModelWorker:
                 if is_mrope_position
                 else None
             ),
-            extend_start_loc=np.arange(bs, dtype=np.int64),
             cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
             extend_prefix_lens=(np.array([0] * bs) if mode == ForwardMode.EXTEND else None),
             extend_seq_lens=np.array([1] * bs) if mode == ForwardMode.EXTEND else None,
