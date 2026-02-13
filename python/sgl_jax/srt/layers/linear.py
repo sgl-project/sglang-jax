@@ -10,8 +10,65 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
+from sgl_jax.srt.kernels.reduce_scatter_matmul import (
+    bidirectional_reduce_scatter_matmul,
+)
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
+
+# ---------------------------------------------------------------------------
+# Reduce-scatter matmul infrastructure (sequence parallel)
+# ---------------------------------------------------------------------------
+# Default tile sizes for the bidirectional RS-matmul kernel, keyed by device.
+# TPU v7 (Ironwood): MXU supports up to 256x256.  Using bm=bn=256 for MXU
+# utilization, bk=128 for compatibility with head_dim=128 multiples.
+# TODO: Run tuning script to find optimal tile sizes per model shape.
+_RS_MATMUL_TILE_CONFIGS: dict[str, tuple[int, int, int]] = {
+    # (bm, bn, bk)
+    "TPU v7": (256, 256, 128),
+    "TPU v6e": (128, 128, 128),
+    "TPU v5e": (128, 128, 128),
+}
+_RS_MATMUL_DEFAULT_TILES = (128, 128, 128)  # Conservative fallback
+
+
+def _get_rs_matmul_tiles() -> tuple[int, int, int]:
+    """Get tile sizes for the RS-matmul kernel based on the current device."""
+    from sgl_jax.srt.utils.jax_utils import get_device_name
+
+    try:
+        device = get_device_name()
+        return _RS_MATMUL_TILE_CONFIGS.get(device, _RS_MATMUL_DEFAULT_TILES)
+    except Exception:
+        return _RS_MATMUL_DEFAULT_TILES
+
+
+def _fused_rs_matmul(
+    x: jax.Array,
+    weight: jax.Array,
+    *,
+    axis_name: str,
+    bm: int = 128,
+    bn: int = 128,
+    bk: int = 128,
+) -> jax.Array:
+    """Fused reduce-scatter matmul using bidirectional kernel (inside shard_map).
+
+    Computes: reduce_scatter(x @ weight, scatter_dim=0) using the bidirectional
+    ring algorithm that overlaps compute with communication.
+
+    Args:
+        x: Activation [M, K_local] (local shard)
+        weight: Weight [K_local, H] (local shard)
+        axis_name: Mesh axis for collective ops
+        bm, bn, bk: Tile sizes for the Pallas kernel
+
+    Returns:
+        [M/num_devices, H] - scattered output
+    """
+    # The kernel computes x @ y.T, so transpose weight: y = weight.T → [H, K_local]
+    y = weight.T
+    return bidirectional_reduce_scatter_matmul(x, y, axis_name=axis_name, bm=bm, bn=bn, bk=bk)
 
 
 class LinearBase(nnx.Module):
@@ -36,6 +93,7 @@ class LinearBase(nnx.Module):
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         kernel_axes: Sequence[str | None] | None = None,
         scope_name: str = "linear_base",
+        sequence_parallel: bool = False,
     ):
         """Initialize parameters and quantization method."""
         self.skip_bias_add = skip_bias_add
@@ -43,6 +101,7 @@ class LinearBase(nnx.Module):
         self.kernel_axes = kernel_axes
         self.mesh = mesh
         self.name = scope_name
+        self.sequence_parallel = sequence_parallel
         self.weight = nnx.Param(
             jax.random.normal(
                 jax.random.PRNGKey(0),
@@ -65,9 +124,31 @@ class LinearBase(nnx.Module):
         else:
             self.bias = None
 
+    def _forward_reduce_scatter(self, x: jax.Array) -> jax.Array:
+        """Forward with fused reduce-scatter instead of allreduce (sequence parallel).
+
+        Instead of producing replicated [M, H] output (allreduce), produces
+        scattered [M/TP, H] output (reduce-scatter on M dimension).
+        """
+        reduce_axis = self.kernel_axes[0]  # e.g. "tensor" for row-parallel
+        bm, bn, bk = _get_rs_matmul_tiles()
+        return shard_map(
+            partial(_fused_rs_matmul, axis_name=reduce_axis, bm=bm, bn=bn, bk=bk),
+            mesh=self.mesh,
+            in_specs=(
+                P(None, reduce_axis),  # x: full M, K sharded
+                P(reduce_axis, None),  # weight: K sharded, full H
+            ),
+            out_specs=P(reduce_axis, None),  # M scattered, full H
+            check_vma=False,
+        )(x, self.weight.value)
+
     @named_scope
     def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass of the linear layer."""
+        if self.sequence_parallel:
+            return self._forward_reduce_scatter(x), None
+
         bias = self.bias if not self.skip_bias_add else None
         output_pspec = P(*([None] * (x.ndim - 1)), self.kernel_axes[-1])
         output_sharding = NamedSharding(self.mesh, output_pspec)
@@ -115,6 +196,7 @@ class QuantizedLinear(nnx.Module):
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         compute_dtype: jnp.dtype | None = None,
         scope_name: str = "quantized_linear",
+        sequence_parallel: bool = False,
     ):
         """Initialize the quantized linear layer with pre-quantized weights."""
         self.weight_q = nnx.Param(weight_q)
@@ -127,6 +209,7 @@ class QuantizedLinear(nnx.Module):
         self.params_dtype = params_dtype
         self.compute_dtype = compute_dtype
         self.name = scope_name
+        self.sequence_parallel = sequence_parallel
 
         # Determine if we need tensor parallel reduction
         # kernel_axes[0] is input axis, kernel_axes[1] is output axis
@@ -191,7 +274,58 @@ class QuantizedLinear(nnx.Module):
             skip_bias_add=linear.skip_bias_add,
             params_dtype=linear.params_dtype,
             scope_name=f"quantized_{linear.name}",
+            sequence_parallel=linear.sequence_parallel,
         )
+
+    def get_weight_bf16(self) -> jax.Array:
+        """Dequantize weight to BF16, returning [input_size, output_size] layout.
+
+        This matches the LinearBase weight layout so the result can be used
+        interchangeably (e.g., for the reduce-scatter matmul kernel).
+        """
+        scale_val = self.weight_scale.value
+        if scale_val.ndim == 2 and scale_val.shape[1] == 1:
+            scale_val = jnp.squeeze(scale_val, axis=1)
+        # weight_q is [output_size, input_size], dequantize and transpose to [input_size, output_size]
+        return (self.weight_q.value.astype(jnp.bfloat16) * scale_val).T
+
+    def _forward_reduce_scatter(self, x: jax.Array) -> jax.Array:
+        """Forward with fused reduce-scatter instead of allreduce (sequence parallel).
+
+        Passes FP8 weight_q directly to the RS-matmul kernel — the kernel casts
+        tiles to f32 internally.  weight_q is already [H, K] which is the y layout
+        the kernel expects, so no transpose is needed.  The per-channel weight
+        scale is applied after the reduce-scatter (cheap element-wise on the
+        already-reduced [M/TP, H] output).
+        """
+        reduce_axis = self.reduce_axis
+        output_axis = self.kernel_axes[1]
+        bm, bn, bk = _get_rs_matmul_tiles()
+
+        # weight_q [H, K] with P(output_axis, reduce_axis) is already the y
+        # layout for the kernel (computes x @ y.T), so call directly.
+        output = shard_map(
+            partial(
+                bidirectional_reduce_scatter_matmul,
+                axis_name=reduce_axis,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+            ),
+            mesh=self.mesh,
+            in_specs=(
+                P(None, reduce_axis),  # x: [M, K] full M, K sharded
+                P(output_axis, reduce_axis),  # weight_q: [H, K] as-is
+            ),
+            out_specs=P(reduce_axis, None),  # [M/TP, H]
+            check_vma=False,
+        )(x, self.weight_q.value)
+
+        # Apply per-channel weight scale after reduce-scatter
+        scale_val = self.weight_scale.value
+        if scale_val.ndim == 2 and scale_val.shape[1] == 1:
+            scale_val = jnp.squeeze(scale_val, axis=1)
+        return output * scale_val
 
     @named_scope
     def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
@@ -204,6 +338,9 @@ class QuantizedLinear(nnx.Module):
             Tuple of (output, bias) where output is [..., output_size]
             and bias is returned if skip_bias_add is True
         """
+        if self.sequence_parallel:
+            return self._forward_reduce_scatter(x), None
+
         # Determine if we should quantize activations
         quantize_activation = self.activation_dtype is not None
 
