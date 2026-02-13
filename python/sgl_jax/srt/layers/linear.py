@@ -14,31 +14,27 @@ from sgl_jax.srt.kernels.reduce_scatter_matmul import (
     bidirectional_reduce_scatter_matmul,
 )
 from sgl_jax.srt.utils.profiling_utils import named_scope
-from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
+from sgl_jax.srt.utils.quantization.quantization_utils import (
+    quantize_tensor,
+    quantize_tensor_simple,
+)
 
 # ---------------------------------------------------------------------------
-# Reduce-scatter matmul infrastructure (sequence parallel)
+# Reduce-scatter matmul tile configs (sequence parallel)
 # ---------------------------------------------------------------------------
-# Default tile sizes for the bidirectional RS-matmul kernel, keyed by device.
-# TPU v7 (Ironwood): MXU supports up to 256x256.  Using bm=bn=256 for MXU
-# utilization, bk=128 for compatibility with head_dim=128 multiples.
-# TODO: Run tuning script to find optimal tile sizes per model shape.
 _RS_MATMUL_TILE_CONFIGS: dict[str, tuple[int, int, int]] = {
-    # (bm, bn, bk)
     "TPU v7": (256, 256, 128),
     "TPU v6e": (128, 128, 128),
     "TPU v5e": (128, 128, 128),
 }
-_RS_MATMUL_DEFAULT_TILES = (128, 128, 128)  # Conservative fallback
+_RS_MATMUL_DEFAULT_TILES = (128, 128, 128)
 
 
 def _get_rs_matmul_tiles() -> tuple[int, int, int]:
-    """Get tile sizes for the RS-matmul kernel based on the current device."""
     from sgl_jax.srt.utils.jax_utils import get_device_name
 
     try:
-        device = get_device_name()
-        return _RS_MATMUL_TILE_CONFIGS.get(device, _RS_MATMUL_DEFAULT_TILES)
+        return _RS_MATMUL_TILE_CONFIGS.get(get_device_name(), _RS_MATMUL_DEFAULT_TILES)
     except Exception:
         return _RS_MATMUL_DEFAULT_TILES
 
@@ -48,27 +44,14 @@ def _fused_rs_matmul(
     weight: jax.Array,
     *,
     axis_name: str,
-    bm: int = 128,
-    bn: int = 128,
-    bk: int = 128,
+    bm: int,
+    bn: int,
+    bk: int,
 ) -> jax.Array:
-    """Fused reduce-scatter matmul using bidirectional kernel (inside shard_map).
-
-    Computes: reduce_scatter(x @ weight, scatter_dim=0) using the bidirectional
-    ring algorithm that overlaps compute with communication.
-
-    Args:
-        x: Activation [M, K_local] (local shard)
-        weight: Weight [K_local, H] (local shard)
-        axis_name: Mesh axis for collective ops
-        bm, bn, bk: Tile sizes for the Pallas kernel
-
-    Returns:
-        [M/num_devices, H] - scattered output
-    """
-    # The kernel computes x @ y.T, so transpose weight: y = weight.T → [H, K_local]
-    y = weight.T
-    return bidirectional_reduce_scatter_matmul(x, y, axis_name=axis_name, bm=bm, bn=bn, bk=bk)
+    """reduce_scatter(x @ weight) via bidirectional ring (inside shard_map)."""
+    return bidirectional_reduce_scatter_matmul(
+        x, weight.T, axis_name=axis_name, bm=bm, bn=bn, bk=bk
+    )
 
 
 class LinearBase(nnx.Module):
@@ -125,21 +108,14 @@ class LinearBase(nnx.Module):
             self.bias = None
 
     def _forward_reduce_scatter(self, x: jax.Array) -> jax.Array:
-        """Forward with fused reduce-scatter instead of allreduce (sequence parallel).
-
-        Instead of producing replicated [M, H] output (allreduce), produces
-        scattered [M/TP, H] output (reduce-scatter on M dimension).
-        """
-        reduce_axis = self.kernel_axes[0]  # e.g. "tensor" for row-parallel
+        """Forward with fused reduce-scatter instead of allreduce."""
+        reduce_axis = self.kernel_axes[0]
         bm, bn, bk = _get_rs_matmul_tiles()
         return shard_map(
             partial(_fused_rs_matmul, axis_name=reduce_axis, bm=bm, bn=bn, bk=bk),
             mesh=self.mesh,
-            in_specs=(
-                P(None, reduce_axis),  # x: full M, K sharded
-                P(reduce_axis, None),  # weight: K sharded, full H
-            ),
-            out_specs=P(reduce_axis, None),  # M scattered, full H
+            in_specs=(P(None, reduce_axis), P(reduce_axis, None)),
+            out_specs=P(reduce_axis, None),
             check_vma=False,
         )(x, self.weight.value)
 
@@ -277,55 +253,52 @@ class QuantizedLinear(nnx.Module):
             sequence_parallel=linear.sequence_parallel,
         )
 
-    def get_weight_bf16(self) -> jax.Array:
-        """Dequantize weight to BF16, returning [input_size, output_size] layout.
-
-        This matches the LinearBase weight layout so the result can be used
-        interchangeably (e.g., for the reduce-scatter matmul kernel).
-        """
-        scale_val = self.weight_scale.value
-        if scale_val.ndim == 2 and scale_val.shape[1] == 1:
-            scale_val = jnp.squeeze(scale_val, axis=1)
-        # weight_q is [output_size, input_size], dequantize and transpose to [input_size, output_size]
-        return (self.weight_q.value.astype(jnp.bfloat16) * scale_val).T
-
     def _forward_reduce_scatter(self, x: jax.Array) -> jax.Array:
-        """Forward with fused reduce-scatter instead of allreduce (sequence parallel).
+        """Forward with fused reduce-scatter, FP8 inputs, kernel unchanged.
 
-        Passes FP8 weight_q directly to the RS-matmul kernel — the kernel casts
-        tiles to f32 internally.  weight_q is already [H, K] which is the y layout
-        the kernel expects, so no transpose is needed.  The per-channel weight
-        scale is applied after the reduce-scatter (cheap element-wise on the
-        already-reduced [M/TP, H] output).
+        1. Optionally quantize activations to FP8 (inside shard_map).
+        2. Call RS kernel with FP8 x / FP8 weight_q → FP8 output.
+        3. Cast to bf16, apply x_scale (per-token) and w_scale (per-channel).
         """
         reduce_axis = self.reduce_axis
         output_axis = self.kernel_axes[1]
+        tp_size = self.mesh.shape.get(reduce_axis, 1) if reduce_axis else 1
+        quantize_act = self.activation_dtype is not None
         bm, bn, bk = _get_rs_matmul_tiles()
 
-        # weight_q [H, K] with P(output_axis, reduce_axis) is already the y
-        # layout for the kernel (computes x @ y.T), so call directly.
-        output = shard_map(
-            partial(
-                bidirectional_reduce_scatter_matmul,
-                axis_name=reduce_axis,
-                bm=bm,
-                bn=bn,
-                bk=bk,
-            ),
+        w_scale = self.weight_scale.value
+        if w_scale.ndim == 2 and w_scale.shape[1] == 1:
+            w_scale = jnp.squeeze(w_scale, axis=1)
+
+        def _rs_fn(x_local, weight_q, weight_scale, *, axis_name, bm, bn, bk):
+            x_scale = None
+            if quantize_act:
+                x_local, x_scale = quantize_tensor_simple(x_local, weight_q.dtype, dim=-1)
+            # weight_q [H, K] is already the y layout for the kernel
+            output = bidirectional_reduce_scatter_matmul(
+                x_local, weight_q, axis_name=axis_name, bm=bm, bn=bn, bk=bk
+            )
+            # Cast to bf16 and apply scales
+            output = output.astype(jnp.bfloat16)
+            if x_scale is not None:
+                my_id = lax.axis_index(axis_name)
+                # Scatter x_scale to match output: [M] → [TP, M/TP] → pick my slice
+                my_x_scale = x_scale.reshape(tp_size, -1)[my_id]
+                output = output * my_x_scale[:, None]
+            output = output * weight_scale[None, :]
+            return output
+
+        return shard_map(
+            partial(_rs_fn, axis_name=reduce_axis, bm=bm, bn=bn, bk=bk),
             mesh=self.mesh,
             in_specs=(
-                P(None, reduce_axis),  # x: [M, K] full M, K sharded
-                P(output_axis, reduce_axis),  # weight_q: [H, K] as-is
+                P(None, reduce_axis),  # x
+                P(output_axis, reduce_axis),  # weight_q [H, K]
+                P(output_axis),  # weight_scale [H]
             ),
-            out_specs=P(reduce_axis, None),  # [M/TP, H]
+            out_specs=P(reduce_axis, None),
             check_vma=False,
-        )(x, self.weight_q.value)
-
-        # Apply per-channel weight scale after reduce-scatter
-        scale_val = self.weight_scale.value
-        if scale_val.ndim == 2 and scale_val.shape[1] == 1:
-            scale_val = jnp.squeeze(scale_val, axis=1)
-        return output * scale_val
+        )(x, self.weight_q.value, w_scale)
 
     @named_scope
     def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:

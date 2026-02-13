@@ -367,11 +367,10 @@ class Grok1Attention(nnx.Module):
         self.config = config
         self.layer_id = layer_id
         self.hidden_size = hidden_size
-
         # Sequence parallel: fused RS-matmul after o_proj, local RMSNorm, allgather before MoE.
         # Always enabled when TP>1 (bidirectional ring kernel needs 2+ devices).
         tp_size = mesh.shape.get("tensor", 1)
-        sequence_parallel = tp_size > 1
+        self.sequence_parallel = tp_size > 1
 
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -421,7 +420,7 @@ class Grok1Attention(nnx.Module):
             params_dtype=jnp.bfloat16,
             kernel_axes=("tensor", None),
             mesh=mesh,
-            sequence_parallel=sequence_parallel,
+            sequence_parallel=self.sequence_parallel,
         )
 
         # Initialize rotary embeddings based on scaling configuration
@@ -486,7 +485,7 @@ class Grok1Attention(nnx.Module):
         attn_ret, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
         attn_output = attn_ret[0] if isinstance(attn_ret, tuple) else attn_ret
 
-        # Project output: o_proj handles reduce-scatter vs allreduce internally
+        # o_proj handles reduce-scatter internally when sequence_parallel=True
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
 
