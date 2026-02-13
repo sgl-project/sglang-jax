@@ -972,10 +972,10 @@ def _ragged_paged_attention_kernel(
                             k_span >= row_seg_starts[:, None],
                             k_span <= q_row_positions[:, None],
                         )
-                        allow = jnp.where(
-                            is_prefix_row[:, None],
-                            causal_allow,
-                            jnp.logical_or(shared_prefix_allow, segment_allow),
+                        non_prefix_allow = jnp.logical_or(shared_prefix_allow, segment_allow)
+                        allow = jnp.logical_or(
+                            jnp.logical_and(is_prefix_row[:, None], causal_allow),
+                            jnp.logical_and(jnp.logical_not(is_prefix_row[:, None]), non_prefix_allow),
                         )
                         return jnp.logical_not(allow)
 
