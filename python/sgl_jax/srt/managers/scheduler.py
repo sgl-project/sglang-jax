@@ -407,6 +407,7 @@ class Scheduler(
 
         # Initialize DP scheduling state
         self.dp_round_robin_counter = 0
+        self.dp_min_running_tiebreak_counter = 0
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -571,10 +572,14 @@ class Scheduler(
             return None
 
         min_count = min(counts[dp_rank] for dp_rank in eligible)
-        for dp_rank in eligible:
-            if counts[dp_rank] == min_count:
-                return dp_rank
-        return None
+        min_candidates = [dp_rank for dp_rank in eligible if counts[dp_rank] == min_count]
+        if len(min_candidates) == 1:
+            return min_candidates[0]
+
+        # Rotate tie-breaking among equally loaded ranks to avoid a persistent low-rank bias.
+        pick_idx = self.dp_min_running_tiebreak_counter % len(min_candidates)
+        self.dp_min_running_tiebreak_counter += 1
+        return min_candidates[pick_idx]
 
     def select_dp_for_request(self, recv_reqs: list[Req]) -> list[Req]:
         """Assign dp_rank to incoming requests using the configured DP policy.
