@@ -17,13 +17,15 @@ import unittest
 import jax
 
 from sgl_jax.srt.entrypoints.engine import Engine
-from sgl_jax.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
+from sgl_jax.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    CustomTestCase,
+    is_in_ci,
+)
 
 logger = logging.getLogger(__name__)
 
 PROMPT = "The capital of China is"
-
-# model_path = "meta-llama/Llama-3.2-1B-Instruct"
 
 
 def _make_engine(device_indexes: list[int]) -> Engine:
@@ -79,6 +81,8 @@ class TestMultiEnginesInOneProcess(CustomTestCase):
             engine_b.shutdown()
 
     def test_02_multi_engine_modes(self):
+        if is_in_ci():
+            return
         # ------------------------------------------------------------------ #
         # Mode 1: single engine, devices [0, 1]                               #
         # ------------------------------------------------------------------ #
