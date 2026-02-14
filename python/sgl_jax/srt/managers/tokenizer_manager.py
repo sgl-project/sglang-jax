@@ -266,6 +266,8 @@ class TokenizerManager:
             ]
         )
         self.wait_timeout = int(os.environ.get("SGLANG_WAIT_TIMEOUT", "4"))
+        self.scheduler_pids: list[int] = []
+        self.scheduler_unavailable_error: str | None = None
 
     def _validate_multi_item_delimiter_token(self):
         delimiter_token_id = self.server_args.multi_item_scoring_delimiter
@@ -484,12 +486,86 @@ class TokenizerManager:
         tokenized_obj: TokenizedGenerateReqInput | TokenizedEmbeddingReqInput,
         created_time: float | None = None,
     ):
+        self._raise_if_scheduler_unavailable()
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         # Handle rid being a list (single element) or string
         rid_key = obj.rid[0] if isinstance(obj.rid, list) else obj.rid
         self.rid_to_state[rid_key] = state
         return state
+
+    @staticmethod
+    def _is_process_alive(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _build_scheduler_unavailable_message(self) -> str | None:
+        if not self.scheduler_pids:
+            return None
+        dead_pids = [pid for pid in self.scheduler_pids if not self._is_process_alive(pid)]
+        if not dead_pids:
+            return None
+        return (
+            "Scheduler subprocess is unavailable "
+            f"(dead pid(s): {', '.join(str(pid) for pid in dead_pids)}). "
+            "Please restart the server."
+        )
+
+    def _fail_pending_requests(self, message: str) -> None:
+        for rid, state in list(self.rid_to_state.items()):
+            if state.finished:
+                continue
+            state.finished = True
+            state.out_list.append(
+                {
+                    "text": "",
+                    "meta_info": {
+                        "id": rid,
+                        "finish_reason": {
+                            "type": "abort",
+                            "message": message,
+                            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                        },
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                    },
+                }
+            )
+            state.event.set()
+            self.rid_to_state.pop(rid, None)
+
+    def _mark_scheduler_unavailable(self, message: str) -> None:
+        if self.scheduler_unavailable_error is None:
+            logger.error(message)
+        self.scheduler_unavailable_error = message
+        self.health_check_failed = True
+        self._fail_pending_requests(message)
+
+    def _check_scheduler_health(self) -> bool:
+        if self.scheduler_unavailable_error is not None:
+            return False
+        message = self._build_scheduler_unavailable_message()
+        if message is None:
+            return True
+        self._mark_scheduler_unavailable(message)
+        return False
+
+    def _raise_if_scheduler_unavailable(self) -> None:
+        if self._check_scheduler_health():
+            return
+        raise ValueError(
+            self.scheduler_unavailable_error
+            or "Scheduler subprocess is unavailable. Please restart the server."
+        )
 
     async def _wait_one_response(
         self,
@@ -514,6 +590,11 @@ class TokenizerManager:
                         raise ValueError(
                             f"Request is disconnected from the client side (type 1). Abort request rid={obj.rid}"
                         ) from e
+                if not self._check_scheduler_health():
+                    raise ValueError(
+                        self.scheduler_unavailable_error
+                        or "Scheduler subprocess is unavailable. Please restart the server."
+                    )
                 continue
 
             out = state.out_list[-1]
@@ -528,11 +609,10 @@ class TokenizerManager:
                 # Check if this was an abort/error created by scheduler
                 if isinstance(out["meta_info"].get("finish_reason"), dict):
                     finish_reason = out["meta_info"]["finish_reason"]
-                    if (
-                        finish_reason.get("type") == "abort"
-                        and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
-                    ):
-                        raise ValueError(finish_reason["message"])
+                    if finish_reason.get("type") == "abort":
+                        raise ValueError(
+                            finish_reason.get("message") or "Request aborted by scheduler."
+                        )
 
                 yield out
                 break

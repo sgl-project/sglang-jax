@@ -632,6 +632,9 @@ def _launch_subprocesses(
 
     # Launch tokenizer process
     tokenizer_manager = TokenizerManager(server_args, port_args)
+    tokenizer_manager.scheduler_pids = [
+        proc.pid for proc in scheduler_procs if getattr(proc, "pid", None) is not None
+    ]
 
     # Initialize templates
     template_manager = TemplateManager()
@@ -659,6 +662,8 @@ def _launch_subprocesses(
 
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
+    if tokenizer_manager.scheduler_pids:
+        scheduler_info["scheduler_pids"] = list(tokenizer_manager.scheduler_pids)
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     return tokenizer_manager, template_manager, scheduler_info
 
@@ -722,6 +727,7 @@ def _launch_threads(
 
     # Launch tokenizer process
     tokenizer_manager = TokenizerManager(server_args, port_args)
+    tokenizer_manager.scheduler_pids = []
 
     # Initialize templates
     template_manager = TemplateManager()

@@ -499,12 +499,33 @@ class SchedulerOutputProcessorMixin:
         req.input_token_logprobs.extend(input_token_logprobs)
 
         if req.top_logprobs_num > 0:
-            req.temp_input_top_logprobs_val.append(output.input_top_logprobs_val[i])
-            req.temp_input_top_logprobs_idx.append(output.input_top_logprobs_idx[i])
+            req.temp_input_top_logprobs_val.append(
+                [
+                    row[: req.top_logprobs_num]
+                    for row in output.input_top_logprobs_val[i][:num_input_logprobs]
+                ]
+            )
+            req.temp_input_top_logprobs_idx.append(
+                [
+                    row[: req.top_logprobs_num]
+                    for row in output.input_top_logprobs_idx[i][:num_input_logprobs]
+                ]
+            )
 
         if req.token_ids_logprob is not None:
-            req.temp_input_token_ids_logprobs_val.append(output.input_token_ids_logprobs_val[i])
-            req.temp_input_token_ids_logprobs_idx.append(output.input_token_ids_logprobs_idx[i])
+            token_ids_len = len(req.token_ids_logprob)
+            req.temp_input_token_ids_logprobs_val.append(
+                [
+                    row[:token_ids_len]
+                    for row in output.input_token_ids_logprobs_val[i][:num_input_logprobs]
+                ]
+            )
+            req.temp_input_token_ids_logprobs_idx.append(
+                [
+                    row[:token_ids_len]
+                    for row in output.input_token_ids_logprobs_idx[i][:num_input_logprobs]
+                ]
+            )
 
         if last_prefill_chunk:
             input_token_logprobs = req.input_token_logprobs

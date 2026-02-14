@@ -2,12 +2,21 @@ import asyncio
 import math
 from types import SimpleNamespace
 
+import jax
 import numpy as np
 import pytest
+from jax.sharding import Mesh
 
+from sgl_jax.srt.layers.logits_processor import LogitsProcessor
+from sgl_jax.srt.layers.sampler import (
+    get_token_ids_logprobs as sampler_get_token_ids_logprobs,
+)
 from sgl_jax.srt.managers.io_struct import GenerateReqInput
 from sgl_jax.srt.managers.scheduler import Scheduler
-from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
+from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
+    SchedulerOutputProcessorMixin,
+)
+from sgl_jax.srt.managers.tokenizer_manager import ReqState, TokenizerManager
 
 
 class _FakeCreateTokenizedManager:
@@ -98,6 +107,38 @@ class _FakeReleaseCacheManager:
 
     def auto_create_handle_loop(self):
         return None
+
+
+class _NoopSender:
+    def __init__(self):
+        self.calls = []
+
+    def send_pyobj(self, obj):
+        self.calls.append(obj)
+
+
+class _FakeSchedulerLivenessManager:
+    _send_one_request = TokenizerManager._send_one_request
+    _wait_one_response = TokenizerManager._wait_one_response
+    _build_scheduler_unavailable_message = TokenizerManager._build_scheduler_unavailable_message
+    _fail_pending_requests = TokenizerManager._fail_pending_requests
+    _mark_scheduler_unavailable = TokenizerManager._mark_scheduler_unavailable
+    _check_scheduler_health = TokenizerManager._check_scheduler_health
+    _raise_if_scheduler_unavailable = TokenizerManager._raise_if_scheduler_unavailable
+
+    def __init__(self):
+        self.wait_timeout = 0.01
+        self.scheduler_pids = [4321]
+        self.scheduler_unavailable_error = None
+        self.health_check_failed = False
+        self.rid_to_state = {}
+        self.send_to_scheduler = _NoopSender()
+        self.log_requests = False
+
+    @staticmethod
+    def _is_process_alive(pid: int) -> bool:
+        del pid
+        return False
 
 
 def test_create_tokenized_object_keeps_prefill_extend_fields():
@@ -301,3 +342,148 @@ def test_scheduler_req_slot_exhaustion_does_not_stick_batch_full():
     assert new_batch is None
     # Important for liveness: soft throttle clears when the running batch is idle.
     assert scheduler.running_batch.batch_is_full is False
+
+
+def test_wait_one_response_fails_fast_when_scheduler_dies():
+    manager = _FakeSchedulerLivenessManager()
+    req_obj = SimpleNamespace(stream=False, rid="rid-1")
+    state = ReqState([], False, asyncio.Event(), req_obj, created_time=0.0)
+    manager.rid_to_state["rid-1"] = state
+
+    async def _await_next():
+        gen = manager._wait_one_response(req_obj, state, request=None)
+        return await gen.__anext__()
+
+    with pytest.raises(ValueError, match="Scheduler subprocess is unavailable"):
+        asyncio.run(_await_next())
+
+    assert manager.health_check_failed is True
+    assert manager.scheduler_unavailable_error is not None
+    assert state.finished is True
+    assert state.event.is_set()
+
+
+def test_send_one_request_fails_fast_when_scheduler_unavailable():
+    manager = _FakeSchedulerLivenessManager()
+    manager.scheduler_unavailable_error = "Scheduler subprocess is unavailable. Please restart."
+    req = GenerateReqInput(
+        rid="rid-2",
+        input_ids=[1, 2, 3],
+        sampling_params={"max_new_tokens": 0},
+        is_single=True,
+    )
+    req.normalize_batch_and_arguments()
+
+    with pytest.raises(ValueError, match="Scheduler subprocess is unavailable"):
+        manager._send_one_request(req, tokenized_obj=SimpleNamespace(), created_time=0.0)
+
+    assert manager.send_to_scheduler.calls == []
+
+
+def test_mark_scheduler_unavailable_aborts_all_pending_requests():
+    manager = _FakeSchedulerLivenessManager()
+    state1 = ReqState([], False, asyncio.Event(), SimpleNamespace(stream=False), created_time=0.0)
+    state2 = ReqState([], False, asyncio.Event(), SimpleNamespace(stream=False), created_time=0.0)
+    manager.rid_to_state["rid-a"] = state1
+    manager.rid_to_state["rid-b"] = state2
+
+    manager._mark_scheduler_unavailable(
+        "Scheduler subprocess is unavailable (dead pid(s): 4321). Please restart the server."
+    )
+
+    assert manager.health_check_failed is True
+    assert manager.rid_to_state == {}
+    for state in (state1, state2):
+        assert state.finished is True
+        assert state.event.is_set()
+        finish_reason = state.out_list[-1]["meta_info"]["finish_reason"]
+        assert finish_reason["type"] == "abort"
+        assert "Scheduler subprocess is unavailable" in finish_reason["message"]
+
+
+def test_token_ids_logprobs_handles_ragged_prefill_lengths():
+    mesh = Mesh(np.array(jax.devices()[:1]), ("data",))
+    all_logprobs = jax.numpy.array(
+        [
+            [0.10, 0.20, 0.70],
+            [0.15, 0.25, 0.60],
+            [0.20, 0.30, 0.50],
+        ],
+        dtype=jax.numpy.float32,
+    )
+    logits_metadata = SimpleNamespace(
+        token_ids_logprobs=[[0, 2], [0, 2], [0, 2]],
+        extend_logprob_pruned_lens_cpu=[0, 2, 1],
+    )
+
+    vals, idxs = LogitsProcessor.get_token_ids_logprobs(all_logprobs, logits_metadata, mesh)
+
+    assert vals.shape == (3, 2, 2)
+    assert idxs.shape == (3, 2, 2)
+    np.testing.assert_array_equal(np.array(idxs[0]), np.array([[-1, -1], [-1, -1]]))
+    np.testing.assert_allclose(np.array(vals[1]), np.array([[0.10, 0.70], [0.15, 0.60]]))
+    np.testing.assert_allclose(np.array(vals[2][0]), np.array([0.20, 0.50]))
+    np.testing.assert_array_equal(np.array(idxs[2][1]), np.array([-1, -1]))
+
+
+def test_input_logprob_slicing_handles_nested_lists():
+    req = SimpleNamespace(
+        is_multi_item_scoring=False,
+        multi_item_scoring_delimiter=None,
+        input_token_logprobs=[],
+        temp_input_top_logprobs_val=[],
+        temp_input_top_logprobs_idx=[],
+        temp_input_token_ids_logprobs_val=[],
+        temp_input_token_ids_logprobs_idx=[],
+        input_token_logprobs_val=None,
+        top_logprobs_num=2,
+        token_ids_logprob=[101, 202],
+    )
+    output = SimpleNamespace(
+        input_token_logprobs=[0.1, 0.2, 0.3, 0.4],
+        input_top_logprobs_val=[
+            [[0.9, 0.1, 0.0], [0.8, 0.2, 0.0], [0.7, 0.3, 0.0], [0.6, 0.4, 0.0]]
+        ],
+        input_top_logprobs_idx=[[[11, 12, -1], [21, 22, -1], [31, 32, -1], [41, 42, -1]]],
+        input_token_ids_logprobs_val=[
+            [[0.6, 0.4, 0.0], [0.7, 0.3, 0.0], [0.8, 0.2, 0.0], [0.9, 0.1, 0.0]]
+        ],
+        input_token_ids_logprobs_idx=[
+            [[101, 202, -1], [101, 202, -1], [101, 202, -1], [101, 202, -1]]
+        ],
+    )
+
+    SchedulerOutputProcessorMixin.add_input_logprob_return_values(
+        self=SimpleNamespace(),
+        i=0,
+        req=req,
+        output=output,
+        logprob_pt=0,
+        num_input_logprobs=2,
+        last_prefill_chunk=False,
+    )
+
+    assert req.input_token_logprobs == [0.1, 0.2]
+    assert req.temp_input_top_logprobs_val == [[[0.9, 0.1], [0.8, 0.2]]]
+    assert req.temp_input_top_logprobs_idx == [[[11, 12], [21, 22]]]
+    assert req.temp_input_token_ids_logprobs_val == [[[0.6, 0.4], [0.7, 0.3]]]
+    assert req.temp_input_token_ids_logprobs_idx == [[[101, 202], [101, 202]]]
+
+
+def test_sampler_token_ids_logprobs_handles_none_entries():
+    mesh = Mesh(np.array(jax.devices()[:1]), ("data",))
+    logprobs = jax.numpy.array(
+        [
+            [0.20, 0.30, 0.50],
+            [0.60, 0.10, 0.30],
+        ],
+        dtype=jax.numpy.float32,
+    )
+
+    vals, idxs = sampler_get_token_ids_logprobs(logprobs, [None, [0, 2]], mesh)
+
+    assert vals.shape == (2, 2)
+    assert idxs.shape == (2, 2)
+    np.testing.assert_array_equal(np.array(idxs[0]), np.array([-1, -1]))
+    np.testing.assert_allclose(np.array(vals[1]), np.array([0.60, 0.30]))
+    np.testing.assert_array_equal(np.array(idxs[1]), np.array([0, 2]))

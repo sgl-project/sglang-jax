@@ -218,26 +218,36 @@ def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int]):
     output_top_logprobs_val = []
     output_top_logprobs_idx = []
     for i, k in enumerate(top_logprobs_nums):
-        output_top_logprobs_val.append(values[i][:k])
-        output_top_logprobs_idx.append(indices[i][:k])
-    return jnp.array(output_top_logprobs_val), jnp.array(output_top_logprobs_idx)
+        output_top_logprobs_val.append(jnp.pad(values[i][:k], (0, max_k - k)))
+        output_top_logprobs_idx.append(
+            jnp.pad(indices[i][:k], (0, max_k - k), constant_values=-1)
+        )
+    return jnp.stack(output_top_logprobs_val), jnp.stack(output_top_logprobs_idx)
 
 
 def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[int]], mesh: Mesh):
     output_token_ids_logprobs_val = []
     output_token_ids_logprobs_idx = []
+    max_token_ids_len = max(
+        (len(token_ids) for token_ids in token_ids_logprobs if token_ids is not None),
+        default=0,
+    )
     out_sharding = NamedSharding(mesh, P(None))
     for i, token_ids in enumerate(token_ids_logprobs):
-        if token_ids is not None:
-            output_token_ids_logprobs_val.append(
-                logprobs.at[i, token_ids].get(out_sharding=out_sharding)
-            )
-            output_token_ids_logprobs_idx.append(token_ids)
+        if token_ids is not None and len(token_ids) > 0:
+            vals = logprobs.at[i, token_ids].get(out_sharding=out_sharding)
+            idxs = jnp.array(token_ids, dtype=jnp.int32)
         else:
-            output_token_ids_logprobs_val.append([])
-            output_token_ids_logprobs_idx.append([])
+            vals = jnp.zeros((0,), dtype=logprobs.dtype)
+            idxs = jnp.zeros((0,), dtype=jnp.int32)
 
-    return jnp.array(output_token_ids_logprobs_val), jnp.array(output_token_ids_logprobs_idx)
+        pad_len = max_token_ids_len - vals.shape[0]
+        output_token_ids_logprobs_val.append(jnp.pad(vals, (0, pad_len)))
+        output_token_ids_logprobs_idx.append(
+            jnp.pad(idxs, (0, pad_len), constant_values=-1)
+        )
+
+    return jnp.stack(output_token_ids_logprobs_val), jnp.stack(output_token_ids_logprobs_idx)
 
 
 def multinomial(
