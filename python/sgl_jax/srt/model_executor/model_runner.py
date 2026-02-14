@@ -2,7 +2,6 @@
 
 import logging
 import os
-import time
 from functools import partial
 
 import jax
@@ -567,7 +566,6 @@ class ModelRunner(BaseModelRunner):
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
     ):
-        t_start = time.perf_counter()
         cache_miss_count = 0
         import jax._src.test_util as jtu
 
@@ -600,12 +598,7 @@ class ModelRunner(BaseModelRunner):
                 forward_batch, logits_metadata
             )
             cache_miss_count = count()
-        tf_end = time.perf_counter()
         self._set_kv_cache_after_forward(layers_kv_fused)
-
-        t_end = time.perf_counter()
-        print(f"forward duration: %s secs: {tf_end - t_start}", flush=True)
-        print(f"set kv cache duration: %s secs: {t_end - tf_end}", flush=True)
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
         return output, cache_miss_count, layers_topk_ids
