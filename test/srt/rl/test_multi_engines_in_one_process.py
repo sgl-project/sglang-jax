@@ -1,9 +1,6 @@
 """
 Test multiple engine instances in one process on tpu-v6e-4.
 
-Usage:
-    python3 -m unittest test.srt.rl.multi_engines_in_one_process.TestMultiEnginesInOneProcess.test_multi_engine_modes
-
 Modes:
     1. Single engine: devices [0, 1], single process, warmup enabled.
     2. Two engines:   engineA [0, 1], engineB [2, 3], single process, warmup enabled.
