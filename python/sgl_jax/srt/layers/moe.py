@@ -473,6 +473,10 @@ class EPMoE(nnx.Module):
             seq_len,
         )
 
+        # All-reduce after unpermute: communication volume is (T, hidden_size)
+        # instead of (T * top_k, hidden_size), reducing by a factor of top_k.
+        if self.tp_size > 1:
+            output = jax.lax.psum(output, "tensor")
         if self.ep_size > 1:
             output = self._combine(output)
 
@@ -590,9 +594,6 @@ class EPMoE(nnx.Module):
         if intermediate_scale is not None:
             # intermediate_scale shape: (m, 1) with keepdims=True, broadcasts to (m, n_down)
             intermediate_output = intermediate_output * intermediate_scale
-
-        if self.tp_size > 1:
-            intermediate_output = jax.lax.psum(intermediate_output, "tensor")
 
         return intermediate_output
 
