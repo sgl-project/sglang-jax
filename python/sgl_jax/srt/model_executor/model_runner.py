@@ -228,6 +228,7 @@ class ModelRunner(BaseModelRunner):
             use_sort_for_toppk_minp,
             *args,
         ):
+
             model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
             return sampler(*args, use_sort_for_toppk_minp=use_sort_for_toppk_minp)
@@ -262,11 +263,13 @@ class ModelRunner(BaseModelRunner):
     def get_available_device_memory(self):
         distributed = jax.process_count() != 1
         min_available_device_memory = get_available_device_memory(
-            self.device, distributed=distributed
+            self.device, distributed=distributed, device_indexes=self.server_args.device_indexes
         )
 
         # Check memory for tensor parallelism
-        local_device_memory = get_available_device_memory(self.device)
+        local_device_memory = get_available_device_memory(
+            self.device, device_indexes=self.server_args.device_indexes
+        )
         if self.tp_size > 1 and min_available_device_memory < local_device_memory * 0.9:
             if get_bool_env_var("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
                 logger.warning(

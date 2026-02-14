@@ -5,11 +5,22 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import PartitionSpec
 
 GBYTES = 1024 * 1024 * 1024
 TPU_HEAD_SIZE_ALIGNMENT = 128
 TPU_SECOND_LAST_MINOR = 8
+
+
+# Note: we suppose the allocated devices in Pathways are contiguous. This is waiting to check from GCP.
+def get_device_id_offset(devices):
+    int32_max = np.iinfo(np.int32).max
+    offset = int32_max
+    for dev in devices:
+        if dev.id < offset:
+            offset = dev.id
+    return offset if offset != int32_max else 0
 
 
 def get_device_name(num_devices: int | None = None):
@@ -101,23 +112,41 @@ def get_original_kv_head_id(tp_rank: int, total_num_kv_heads: int, tp_size: int)
         return (tp_rank * kv_heads_per_device) % total_num_kv_heads
 
 
-def get_available_device_memory(device, distributed=False, empty_cache=True):
+def get_available_device_memory(
+    device, distributed=False, empty_cache=True, device_indexes: list[int] = None
+):
     """
     Get available memory for device:device_id.
     When distributed is True, the available memory is the minimum available memory of all devices.
     """
+
+    def filter_devices(device_list, device_indexes):
+        offset = get_device_id_offset(device_list)
+        if device_indexes is not None:
+            selected_devices = []
+            for dev in device_list:
+                if dev.id - offset in device_indexes:
+                    selected_devices.append(dev)
+        else:
+            selected_devices = device_list
+        return selected_devices
+
     if device == "tpu":
-        devices = jax.local_devices()
+        raw_devices = jax.local_devices()
+        devices = filter_devices(raw_devices, device_indexes)
         if empty_cache:
             gc.collect()  # collect garbage to free up memory used by quantization
-            jax.clear_caches()
+            # Note: remove it due to cache miss occurring in multi engines running in one process. Initializing later engines results in clearing cache for the earlier ones.
+            # TODO: Remove it in the future if do not meet device memory fraction problems.
+            # jax.clear_caches()
         avail_mem = []
         for dev in devices:
             stats = dev.memory_stats()
             avail_mem.append(stats["bytes_limit"] - stats["bytes_in_use"])
         avail_mem = jnp.array([min(avail_mem) / (1 << 10)], dtype=jnp.float32)
     elif "proxy" in device:
-        devices = jax.devices()
+        raw_devices = jax.devices()
+        devices = filter_devices(raw_devices, device_indexes)
         live_arrays = jax.live_arrays()
         pathways_hbm_used_mem = pathways_hbm_usage_gb(live_arrays, devices)
         avail_mem = jnp.array(
@@ -125,8 +154,10 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
             dtype=jnp.float32,
         )
     elif device in ("gpu", "cuda"):
-        if empty_cache:
-            jax.clear_caches()
+        # Note: remove it due to cache miss occurring in multi engines running in one process. Initializing later engines results in clearing cache for the earlier ones.
+        # TODO: Remove it in the future if do not meet device memory fraction problems.
+        # if empty_cache:
+        #    jax.clear_caches()
         devices = [d for d in jax.local_devices() if getattr(d, "platform", None) == "gpu"]
         if not devices:
             raise RuntimeError("No GPU devices found by JAX")
