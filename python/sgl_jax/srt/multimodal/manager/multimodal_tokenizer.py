@@ -35,12 +35,16 @@ from sgl_jax.srt.managers.io_struct import (
 from sgl_jax.srt.managers.tokenizer_manager import ReqState, TokenizerManager
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.manager.io_struct import (
+    AudioSpeechRequest,
+    AudioTranscriptionRequest,
+    AudioTranscriptionResponse,
     DataType,
     GenerateMMReqInput,
     GenerateOmniReqInput,
     TokenizedGenerateMMReqInput,
     TokenizedGenerateOmniReqInput,
 )
+from sgl_jax.srt.multimodal.manager.prompt_builder import MultimodalPromptBuilder
 from sgl_jax.srt.multimodal.manager.mrope_utils import compute_mrope_positions
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import (
@@ -131,6 +135,109 @@ def _smart_nframes(video_config: dict, total_frames: int, video_fps: float) -> i
             nframes,
         )
     return int(nframes)
+class MiMoAudioProcessor:
+    """Custom processor for MiMo Audio models."""
+
+    def __init__(self):
+        from transformers.audio_utils import mel_filter_bank, window_function
+
+        sample_rate = 24000
+        n_fft = 960
+        hop_length = 240
+        win_length = 960
+        f_min = 0
+        f_max = 12000
+        n_mels = 128
+
+        self.sampling_rate = sample_rate
+        self.mel_filters = mel_filter_bank(
+            num_frequency_bins=n_fft // 2 + 1,
+            num_mel_filters=n_mels,
+            min_frequency=f_min,
+            max_frequency=f_max,
+            sampling_rate=sample_rate,
+            norm=None,
+            mel_scale="htk",
+        )
+        self.window = window_function(win_length, "hann")
+        self.mel_params = {
+            "sample_rate": sample_rate,
+            "n_fft": n_fft,
+            "hop_length": hop_length,
+            "win_length": win_length,
+        }
+
+        logger.info(
+            "Initialized MiMoAudioProcessor: sr=%d, n_fft=%d, hop=%d, n_mels=%d",
+            sample_rate, n_fft, hop_length, n_mels
+        )
+
+    def __call__(self, audio_array: np.ndarray, sampling_rate: int = None) -> tuple:
+        """Convert raw audio waveform to mel spectrogram.
+
+        This matches the official MiMo Audio implementation:
+        - Uses power=1.0 (amplitude spectrogram)
+        - Applies natural log via log_mel="log"
+        - Returns mel spectrogram in [batch, time, n_mels] format
+
+        Args:
+            audio_array: Raw audio waveform as numpy array, shape (samples,).
+            sampling_rate: Input audio sample rate. If different from target rate, will resample.
+
+        Returns:
+            Tuple of (mel_spectrogram, input_lengths) as numpy arrays.
+            mel_spectrogram shape: [batch, time, n_mels]
+        """
+        from transformers.audio_utils import spectrogram
+
+        if audio_array.ndim == 2:
+            audio_array = audio_array.squeeze(0)
+
+        if sampling_rate is not None and sampling_rate != self.sampling_rate:
+            audio_array = self._resample_audio(audio_array, sampling_rate, self.sampling_rate)
+
+        mels = spectrogram(
+            waveform=audio_array,
+            window=self.window,
+            frame_length=self.mel_params["n_fft"],
+            hop_length=self.mel_params["hop_length"],
+            fft_length=self.mel_params["n_fft"],
+            power=1.0,  # Amplitude spectrogram (matches official MiMo)
+            center=True,
+            mel_filters=self.mel_filters,
+            log_mel="log",
+            mel_floor=1e-7,
+        )
+
+        mels = mels.T[None, :, :]
+        input_lens = np.array([mels.shape[1]])
+
+        return mels, input_lens
+
+    def _resample_audio(self, audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+        """Resample audio to target sample rate using torchaudio.
+
+        Uses torchaudio.functional.resample to match official MiMo implementation.
+
+        Args:
+            audio: Input audio array.
+            orig_sr: Original sample rate.
+            target_sr: Target sample rate.
+
+        Returns:
+            Resampled audio array.
+        """
+        if orig_sr == target_sr:
+            return audio
+
+        import torch
+        import torchaudio
+
+        audio_tensor = torch.from_numpy(audio).float()
+        resampled = torchaudio.functional.resample(audio_tensor, orig_sr, target_sr)
+        logger.info("Resampled audio from %d Hz to %d Hz (%d -> %d samples)",
+                    orig_sr, target_sr, len(audio), len(resampled))
+        return resampled.numpy().astype(np.float32)
 
 
 @dataclasses.dataclass
@@ -162,31 +269,46 @@ class MultimodalTokenizer(TokenizerManager):
         super().__init__(server_args, port_args)
         self.mm_processor = None
         self.mm_config = None
-        processor_candidates = [server_args.model_path]
-        model_basename = os.path.basename(server_args.model_path.rstrip("/"))
-        if model_basename in {
-            "text_encoder",
-            "vision_encoder",
-            "language_model",
-            "transformer",
-            "vae",
-            "tokenizer",
-        }:
-            processor_candidates.append(os.path.dirname(server_args.model_path.rstrip("/")))
-        trust_remote_code = server_args.trust_remote_code or server_args.multimodal
-        for candidate in processor_candidates:
-            try:
-                self.mm_processor = AutoProcessor.from_pretrained(
-                    candidate,
-                    trust_remote_code=trust_remote_code,
-                )
-                self.mm_config = AutoConfig.from_pretrained(
-                    candidate,
-                    trust_remote_code=trust_remote_code,
-                )
-                break
-            except Exception as exc:
-                logger.warning("Failed to load processor/config from %s: %s", candidate, exc)
+
+        # since mimo-audio does not specify preprocessor, manual implementation is required to align
+        # it with the official implementation
+        model_path = server_args.model_path
+        is_mimo_audio = "mimo" in model_path.lower() and "audio" in model_path.lower()
+
+        if is_mimo_audio:
+            self.mm_processor = MiMoAudioProcessor()
+            logger.info("Loaded MiMoAudioProcessor for model: %s", model_path)
+        else:
+            processor_candidates = [model_path]
+            model_basename = os.path.basename(model_path.rstrip("/"))
+            if model_basename in {
+                "text_encoder",
+                "vision_encoder",
+                "language_model",
+                "transformer",
+                "vae",
+                "tokenizer",
+            }:
+                processor_candidates.append(os.path.dirname(model_path.rstrip("/")))
+            trust_remote_code = server_args.trust_remote_code or server_args.multimodal
+            for candidate in processor_candidates:
+                try:
+                    self.mm_processor = AutoProcessor.from_pretrained(
+                        candidate,
+                        trust_remote_code=trust_remote_code,
+                    )
+                    self.mm_config = AutoConfig.from_pretrained(
+                        candidate,
+                        trust_remote_code=trust_remote_code,
+                    )
+                    break
+                except Exception as exc:
+                    logger.warning("Failed to load processor/config from %s: %s", candidate, exc)
+
+        self.wait_timeout = int(os.environ.get("SGLANG_WAIT_TIMEOUT", "600"))
+
+        self.prompt_builder = MultimodalPromptBuilder(tokenizer=self.tokenizer)
+
         self.rid_to_state: dict[str, MMReqState] = {}
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -205,6 +327,7 @@ class MultimodalTokenizer(TokenizerManager):
             ]
         )
 
+
     def _handle_batch_output(self, reqs: list | BatchStrOut | BatchEmbeddingOut | BatchTokenIDOut):
         """Handle a batch of outputs returned from the pipeline.
 
@@ -221,7 +344,33 @@ class MultimodalTokenizer(TokenizerManager):
             if req.rid in self.rid_to_state:
                 self.rid_to_state[req.rid].finished = True
                 self.rid_to_state[req.rid].event.set()
-                self.rid_to_state[req.rid].out_list = [{"success": True, "meta_info": {}}]
+
+                out_data = {"success": True, "meta_info": {}}
+                if hasattr(req, "audio_mode") and req.audio_mode is not None:
+                    if req.audio_mode in ("asr", "audio_understanding") and req.generated_text_tokens is not None:
+                        tokens = req.generated_text_tokens
+                        if hasattr(tokens, "tolist"):
+                            tokens = tokens.tolist()
+
+                        # Store raw tokens for usage calculation
+                        out_data["generated_text_tokens"] = tokens
+
+                        logger.info("ASR generated tokens: %s", tokens)
+
+                        if self.tokenizer:
+                            decoded_text = self.tokenizer.decode(tokens, skip_special_tokens=True)
+                            if not decoded_text and tokens:
+                                # Debug info if decode results in empty string
+                                debug_tokens = tokens[:20]
+                                decoded_text = f"[DEBUG: Empty Decode. Tokens: {debug_tokens}...]"
+                            out_data["text"] = decoded_text
+                            logger.info("ASR decoded text: '%s'", out_data["text"])
+                        else:
+                            # Fallback if tokenizer not available (unlikely)
+                            out_data["text"] = str(tokens)
+                            logger.warning("Tokenizer not initialized, returning raw tokens for ASR")
+
+                self.rid_to_state[req.rid].out_list = [out_data]
             else:
                 logger.warning(
                     "Received result for unknown request rid=%s. Known rids: %s",
@@ -299,7 +448,6 @@ class MultimodalTokenizer(TokenizerManager):
         Image preprocessing / references are noted as TODO; when provided
         `input_ids` are passed through unchanged.
         """
-        # Support both 'prompt' (multimodal) and 'text' (text-only) fields
         input_text = getattr(obj, "prompt", None) or getattr(obj, "text", None)
         neg_input_text = getattr(obj, "neg_prompt", None) or getattr(obj, "text", None)
         input_ids = getattr(obj, "input_ids", None)
@@ -813,6 +961,226 @@ class MultimodalTokenizer(TokenizerManager):
                     raise ValueError(
                         f"Request is disconnected from the client side. Abort request rid={state.rid}"
                     )
+
+    async def create_speech(
+        self,
+        obj: AudioSpeechRequest,
+        request: fastapi.Request | None = None,
+    ) -> bytes:
+        """OpenAI-compatible TTS: convert text to audio.
+
+        Args:
+            obj: AudioSpeechRequest containing text and voice parameters.
+            request: FastAPI request object for disconnect handling.
+
+        Returns:
+            Raw audio bytes in the specified format.
+        """
+        created_time = time.time()
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._updating)
+
+        self.auto_create_handle_loop()
+        rid = uuid.uuid4().hex
+
+        text_input_ids, prompt_input_ids = self.prompt_builder.build_and_tokenize_tts(
+            obj.input, obj.instructions
+        )
+
+        from sgl_jax.srt.multimodal.manager.io_struct import TokenizedGenerateAudioReqInput
+
+        tts_req = TokenizedGenerateAudioReqInput(
+            rid=rid,
+            audio_mode="tts",
+            text=obj.input,
+            text_input_ids=text_input_ids,
+            prompt=obj.instructions,
+            prompt_input_ids=prompt_input_ids,
+            data_type=DataType.AUDIO,
+            sample_rate=24000,
+        )
+
+        state = MMReqState(
+            rid=rid,
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            created_time=created_time,
+        )
+        self.rid_to_state[rid] = state
+
+        self.send_to_scheduler.send_pyobj(tts_req)
+
+        try:
+            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
+        except TimeoutError:
+            raise ValueError(f"TTS request timed out for rid={rid}") from None
+
+        del self.rid_to_state[rid]
+
+        out = state.out_list[-1] if state.out_list else {}
+
+        if out.get("audio_data") is not None:
+            audio_array = out["audio_data"]
+            # TODO: Convert to obj.response_format (mp3, wav, pcm, etc.)
+            # For now, return raw float32 bytes (PCM)
+            audio_bytes = audio_array.astype(np.float32).tobytes()
+            return audio_bytes
+        else:
+            raise ValueError("No audio data generated")
+
+    async def create_transcription(
+        self,
+        obj: AudioTranscriptionRequest,
+        request: fastapi.Request | None = None,
+    ) -> AudioTranscriptionResponse | str:
+        """OpenAI-compatible ASR: convert audio to text.
+
+        Supports both file upload and URL download (handled by HTTP endpoint).
+
+        Args:
+            obj: AudioTranscriptionRequest containing audio data and parameters.
+            request: FastAPI request object for disconnect handling.
+
+        Returns:
+            Transcription in the specified format (AudioTranscriptionResponse or str).
+        """
+        created_time = time.time()
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._updating)
+
+        self.auto_create_handle_loop()
+        rid = uuid.uuid4().hex
+
+        if obj.file is None:
+            raise ValueError("Audio file is required (should be handled by HTTP endpoint)")
+
+        audio_array = self._load_audio_from_bytes(obj.file, target_sr=24000)
+
+        mel_input, mel_input_lens = self.mm_processor(audio_array, sampling_rate=None)
+
+        prefix_ids, suffix_ids = self.prompt_builder.build_and_tokenize_asr(obj.prompt)
+
+        from sgl_jax.srt.multimodal.manager.io_struct import TokenizedGenerateAudioReqInput
+
+        asr_req = TokenizedGenerateAudioReqInput(
+            rid=rid,
+            mel_input=mel_input,
+            mel_input_lens=mel_input_lens,
+            audio_mode="asr",
+            sample_rate=24000,
+            data_type=DataType.AUDIO,
+            text_input_ids=suffix_ids,
+            prompt_input_ids=prefix_ids,
+            prompt=obj.prompt,
+            n_q=8,
+        )
+
+        state = MMReqState(
+            rid=rid,
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            created_time=created_time,
+        )
+        self.rid_to_state[rid] = state
+
+        self.send_to_scheduler.send_pyobj(asr_req)
+
+        try:
+            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
+        except TimeoutError:
+            raise ValueError(f"ASR request timed out for rid={rid}") from None
+
+        del self.rid_to_state[rid]
+
+        out = state.out_list[-1] if state.out_list else {}
+
+        text = ""
+        if out.get("text") is not None:
+            text = out["text"]
+        elif out.get("generated_text_tokens") is not None and self.tokenizer is not None:
+            tokens = out["generated_text_tokens"]
+            if hasattr(tokens, "tolist"):
+                tokens = tokens.tolist()
+            text = self.tokenizer.decode(tokens, skip_special_tokens=True)
+
+        if obj.response_format == "text":
+            return text
+        elif obj.response_format == "srt":
+            # TODO: Generate SRT subtitle format
+            return self._format_as_srt(text, out.get("segments"))
+        elif obj.response_format == "vtt":
+            # TODO: Generate VTT subtitle format
+            return self._format_as_vtt(text, out.get("segments"))
+        else:  # json, verbose_json, diarized_json
+            return AudioTranscriptionResponse(
+                text=text,
+                task="transcribe",
+                language=obj.language,
+                # TODO: Add duration, segments, usage fields
+            )
+
+    def _format_as_srt(self, text: str, segments: list[dict] | None) -> str:
+        """Format transcription as SRT subtitles.
+
+        TODO: Implement SRT formatting with timestamps.
+        """
+        # Placeholder implementation
+        return f"1\n00:00:00,000 --> 00:00:10,000\n{text}\n"
+
+    def _format_as_vtt(self, text: str, segments: list[dict] | None) -> str:
+        """Format transcription as WebVTT subtitles.
+
+        TODO: Implement VTT formatting with timestamps.
+        """
+        # Placeholder implementation
+        return f"WEBVTT\n\n00:00:00.000 --> 00:00:10.000\n{text}\n"
+
+    def _load_audio_from_bytes(self, audio_bytes: bytes, target_sr: int = 24000) -> np.ndarray:
+        """Load audio from bytes (wav, mp3, etc.) and resample to target_sr.
+
+        Uses soundfile for loading and torchaudio for resampling to match
+        the official MiMo Audio implementation.
+
+        Note: librosa.load produces different resampling results that cause
+        ~2.5% of mel spectrogram values to hit the floor, affecting ASR accuracy.
+        """
+        import soundfile as sf
+        import torch
+        import torchaudio
+
+        if audio_bytes[:4] == b'RIFF':
+            logger.debug("Detected WAV format (RIFF header)")
+        elif audio_bytes[:3] == b'ID3' or audio_bytes[:2] == b'\xff\xfb':
+            logger.debug("Detected MP3 format")
+        elif audio_bytes[:4] == b'fLaC':
+            logger.debug("Detected FLAC format")
+        elif audio_bytes[:4] == b'OggS':
+            logger.debug("Detected OGG format")
+        else:
+            logger.warning("Unknown audio format, first 4 bytes: %s", audio_bytes[:4].hex())
+
+        with io.BytesIO(audio_bytes) as f:
+            audio_array, orig_sr = sf.read(f)
+
+        audio_tensor = torch.from_numpy(audio_array).float()
+
+        # Handle stereo -> mono (average channels like official impl)
+        if audio_tensor.ndim == 2:
+            audio_tensor = audio_tensor.mean(dim=1)
+
+        # Resample using torchaudio (matches official MiMo implementation)
+        if orig_sr != target_sr:
+            audio_tensor = torchaudio.functional.resample(audio_tensor, orig_sr, target_sr)
+            logger.debug("Resampled audio from %d Hz to %d Hz", orig_sr, target_sr)
+
+        audio_array = audio_tensor.numpy()
+        logger.debug("Audio loaded: orig_sr=%d, target_sr=%d, samples=%d",
+                     orig_sr, target_sr, len(audio_array))
+        return audio_array
 
 
 def run_multimodal_tokenizer_process(
