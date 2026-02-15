@@ -259,7 +259,6 @@ class ForwardBatch:
         obj.lora_ranks = children[11]
         obj.spec_info = children[12]
         obj.expert_location_metadata = children[13]
-
         obj.attention_mask = children[14]
         obj.input_embedding = children[15]
         obj.mrope_positions = children[16]
@@ -333,7 +332,7 @@ class ForwardBatch:
                 batch.extend_seq_lens,
             ),
             sharding=(
-                NamedSharding(model_runner.mesh, PartitionSpec())
+                NamedSharding(model_runner.mesh, PartitionSpec("data"))
                 if jax.process_count() == 1
                 else None
             ),
@@ -373,7 +372,7 @@ class ForwardBatch:
                     batch.lora_ranks,
                 ),
                 sharding=(
-                    NamedSharding(model_runner.mesh, PartitionSpec())
+                    NamedSharding(model_runner.mesh, PartitionSpec("data"))
                     if jax.process_count() == 1
                     else None
                 ),

@@ -48,7 +48,7 @@ class BasePrefixCache(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def evict(self, num_tokens: int):
+    def evict(self, num_tokens: int, dp_rank: int | None = None):
         pass
 
     @abc.abstractmethod
@@ -59,16 +59,16 @@ class BasePrefixCache(abc.ABC):
     def dec_lock_ref(self, node: Any, swa_uuid_for_lock: str | None = None):
         pass
 
-    def evictable_size(self):
+    def evictable_size(self, dp_rank: int = 0):
         return 0
 
-    def full_evictable_size(self):
+    def full_evictable_size(self, dp_rank: int = 0):
         return 0
 
-    def swa_evictable_size(self):
+    def swa_evictable_size(self, dp_rank: int = 0):
         return 0
 
-    def protected_size(self):
+    def protected_size(self, dp_rank: int = 0):
         return 0
 
     def full_protected_size(self):
