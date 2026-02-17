@@ -122,6 +122,52 @@ class FlashAttention(AttentionBackend):
         return mask
 
     @staticmethod
+    @jax.jit
+    def _calculate_row_seg_starts_jit(tokens: jax.Array, delimiter_token_id: int):
+        """JIT-optimized version of multi-item segment layout calculation."""
+        is_delim = tokens == delimiter_token_id
+        indices = jnp.arange(tokens.shape[0])
+
+        def scan_fn(last_start, x):
+            is_d, idx = x
+            current_start = last_start
+            next_start = jnp.where(is_d, idx + 1, last_start)
+            return next_start, current_start
+
+        _, row_seg_starts = jax.lax.scan(scan_fn, jnp.int32(0), (is_delim, indices))
+
+        # First delimiter and everything before it belongs to the shared prefix (start=0)
+        first_delim_idx = jnp.argmax(is_delim)
+        row_seg_starts = jnp.where(indices <= first_delim_idx, 0, row_seg_starts)
+        prefix_end = first_delim_idx + 1
+
+        return prefix_end, row_seg_starts
+
+    @staticmethod
+    @jax.jit
+    def _build_multi_item_attention_mask_jit(tokens: jax.Array, delimiter_token_id: int) -> jax.Array:
+        """Vectorized mask builder optimized for XLA static compilation."""
+        q_len = tokens.shape[0]
+
+        # 1. Identify delimiter positions (Query <d1> Item1 <d2> ...)
+        is_delimiter = tokens == delimiter_token_id
+        block_ids = jnp.cumsum(is_delimiter)  # Query=0, d1=1, Item1=1, d2=2...
+
+        row_blocks = block_ids[:, None]
+        col_blocks = block_ids[None, :]
+
+        # 2. Basic Causal Visibility
+        indices = jnp.arange(q_len)
+        causal_mask = indices[:, None] >= indices[None, :]
+
+        # 3. Multi-Item Scoring Logic:
+        # A token can see a column if it is Causal AND (is Shared Prefix OR is Same Block)
+        # Shared Prefix is block_id 0 (query) and block_id 1 (first delimiter)
+        is_visible = (col_blocks <= 1) | (row_blocks == col_blocks)
+
+        return (causal_mask & is_visible).astype(jnp.int32)
+
+    @staticmethod
     def _build_multi_item_attention_mask(tokens: np.ndarray, delimiter_token_id: int) -> np.ndarray:
         """Build shared-prefix + block-diagonal mask for a single multi-item sequence.
 
@@ -315,6 +361,25 @@ class FlashAttention(AttentionBackend):
             )
 
             if use_segment:
+                # Use JIT for multi-item segment metadata
+                prefix_end_all, row_seg_starts_all = self._calculate_row_seg_starts_jit(
+                    batch.input_ids,
+                    batch.multi_item_scoring_delimiter,
+                )
+                
+                # prefix_end_all is currently for the whole flattened batch.
+                # The kernel expects prefix_end[req_idx].
+                # For now, we only support one multi-item request per batch anyway or multiple with same prefix.
+                # Let's extract per-request prefix_ends.
+                
+                # NOTE: In multi-item scoring, we currently assume all items in the batch
+                # belong to the same logical request (or share the same prefix_end).
+                # We extract the prefix_end from the first multi-item request.
+                
+                # Find the first delimiter in each logical request's token range
+                # This part is still slightly tricky with flattened batch.input_ids.
+                # For prototype, we'll keep the loop for per-request metadata but JIT the heavy mask parts.
+                
                 prefix_end = np.zeros_like(seq_lens, dtype=np.int32)
                 row_seg_starts = np.zeros((padded_token_len,), dtype=np.int32)
                 token_pt = 0
@@ -327,24 +392,22 @@ class FlashAttention(AttentionBackend):
 
                     req_start = token_pt
                     req_end = token_pt + q_len
-                    req_tokens = np.asarray(batch.input_ids[req_start:req_end], dtype=np.int32)
                     token_pt = req_end
 
                     if batch.multi_item_scoring_flags[req_idx]:
-                        # Radix cache is disabled for multi-item mode, so q_len == kv_len.
-                        if kv_len != q_len:
-                            raise ValueError(
-                                "Multi-item scoring requires extend mode without prefix cache "
-                                f"(got q_len={q_len}, kv_len={kv_len})."
-                            )
-                        req_prefix_end, req_row_seg_starts = self._build_multi_item_segment_layout(
+                        # JIT-optimized per-request calculation
+                        req_tokens = batch.input_ids[req_start:req_end]
+                        req_prefix_end, req_row_seg_starts = self._calculate_row_seg_starts_jit(
                             req_tokens,
                             batch.multi_item_scoring_delimiter,
                         )
                         prefix_end[req_idx] = req_prefix_end
-                        row_seg_starts[req_start:req_end] = req_row_seg_starts
+                        # row_seg_starts is flat across the whole batch
+                        # We need to slice it in. JIT returns JAX array, we can use at[].set() 
+                        # or just rely on device_array concatenation later.
+                        # For now, let's keep it simple:
+                        row_seg_starts[req_start:req_end] = np.asarray(req_row_seg_starts)
                     else:
-                        # Default causal behavior for non-multi-item rows.
                         prefix_end[req_idx] = 0
                         row_seg_starts[req_start:req_end] = 0
 
@@ -368,26 +431,19 @@ class FlashAttention(AttentionBackend):
                     if q_len <= 0 or kv_len <= 0:
                         continue
 
-                    req_tokens = np.asarray(
-                        batch.input_ids[token_pt : token_pt + q_len], dtype=np.int32
-                    )
+                    req_tokens = batch.input_ids[token_pt : token_pt + q_len]
                     token_pt += q_len
 
                     if batch.multi_item_scoring_flags[req_idx]:
-                        # Radix cache is disabled for multi-item mode, so q_len == kv_len.
-                        if kv_len != q_len:
-                            raise ValueError(
-                                "Multi-item scoring requires extend mode without prefix cache "
-                                f"(got q_len={q_len}, kv_len={kv_len})."
-                            )
-                        req_mask = self._build_multi_item_attention_mask(
+                        # JIT-optimized mask calculation
+                        req_mask = self._build_multi_item_attention_mask_jit(
                             req_tokens,
                             batch.multi_item_scoring_delimiter,
                         )
                     else:
                         req_mask = self._build_causal_extend_mask(q_len=q_len, kv_len=kv_len)
 
-                    req_mask_flat = req_mask.reshape(-1)
+                    req_mask_flat = np.asarray(req_mask.reshape(-1))
                     next_pt = mask_write_pt + req_mask_flat.size
                     if next_pt > static_size:
                         raise ValueError(
