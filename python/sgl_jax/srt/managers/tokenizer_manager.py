@@ -55,6 +55,8 @@ from sgl_jax.srt.managers.io_struct import (
     ReleaseScoringCacheReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    ScoreFromCacheReqInput,
+    ScoreFromCacheReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     TokenizedEmbeddingReqInput,
@@ -211,6 +213,9 @@ class TokenizerManager:
         self.release_scoring_cache_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.score_from_cache_v2_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.profile_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
         self.get_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
@@ -218,6 +223,10 @@ class TokenizerManager:
         self.set_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.score_fastpath_attempted = 0
+        self.score_fastpath_succeeded = 0
+        self.score_fastpath_fallback = 0
+        self.score_fastpath_fallback_reasons: dict[str, int] = {}
 
         # LoRA
         self.lora_registry = LoRARegistry(self.server_args.lora_paths)
@@ -249,6 +258,10 @@ class TokenizerManager:
                 (
                     ReleaseScoringCacheReqOutput,
                     self.release_scoring_cache_communicator.handle_recv,
+                ),
+                (
+                    ScoreFromCacheReqOutput,
+                    self.score_from_cache_v2_communicator.handle_recv,
                 ),
                 (
                     ProfileReqOutput,
@@ -1105,6 +1118,14 @@ class TokenizerManager:
                         f"Cache miss occurred {recv_obj.cache_miss_count} times, please check if the precompile logic covers the current scenario"
                     )
                 meta_info["cache_miss_count"] = recv_obj.cache_miss_count
+            if getattr(recv_obj, "scheduler_queue_wait_s", None) is not None:
+                meta_info["scheduler_queue_wait_s"] = recv_obj.scheduler_queue_wait_s[i]
+            if getattr(recv_obj, "scheduler_device_compute_s", None) is not None:
+                meta_info["scheduler_device_compute_s"] = recv_obj.scheduler_device_compute_s[i]
+            if getattr(recv_obj, "scheduler_host_overhead_s", None) is not None:
+                meta_info["scheduler_host_overhead_s"] = recv_obj.scheduler_host_overhead_s[i]
+            if getattr(recv_obj, "scheduler_dispatch_count", None) is not None:
+                meta_info["scheduler_dispatch_count"] = recv_obj.scheduler_dispatch_count[i]
 
             if isinstance(recv_obj, BatchStrOut):
                 state.text += recv_obj.output_strs[i]
@@ -1663,9 +1684,34 @@ class TokenizerManager:
         label_token_ids: list[int],
         apply_softmax: bool = False,
     ) -> list[list[float]]:
+        scores, _ = await self._batched_extend_score_with_metrics(
+            cache_handle=cache_handle,
+            items=items,
+            label_token_ids=label_token_ids,
+            apply_softmax=apply_softmax,
+        )
+        return scores
+
+    async def _batched_extend_score_with_metrics(
+        self,
+        cache_handle: str,
+        items: list[list[int]],
+        label_token_ids: list[int],
+        apply_softmax: bool = False,
+    ) -> tuple[list[list[float]], dict[str, float | int]]:
         """Score items by extending from cached prefix."""
         if not items:
-            return []
+            return (
+                [],
+                {
+                    "dispatch_count": 0,
+                    "queue_wait_s": 0.0,
+                    "device_compute_s": 0.0,
+                    "host_orchestration_s": 0.0,
+                    "lifecycle_requests_sent": 0,
+                    "lifecycle_results_received": 0,
+                },
+            )
         logger.debug(
             "Prefill+extend: scoring extend batch handle=%s batch_items=%d",
             cache_handle,
@@ -1703,6 +1749,10 @@ class TokenizerManager:
             )
 
         scores = []
+        scheduler_dispatch_counts = []
+        scheduler_queue_wait = []
+        scheduler_device_compute = []
+        scheduler_host_overhead = []
         for result in results:
             meta_info = result.get("meta_info", {})
             finish_reason = meta_info.get("finish_reason")
@@ -1737,13 +1787,47 @@ class TokenizerManager:
                 scores.append(softmax(item_scores).tolist())
             else:
                 scores.append([math.exp(x) if x != float("-inf") else 0.0 for x in item_scores])
+            if meta_info.get("scheduler_dispatch_count") is not None:
+                scheduler_dispatch_counts.append(int(meta_info["scheduler_dispatch_count"]))
+            if meta_info.get("scheduler_queue_wait_s") is not None:
+                scheduler_queue_wait.append(float(meta_info["scheduler_queue_wait_s"]))
+            if meta_info.get("scheduler_device_compute_s") is not None:
+                scheduler_device_compute.append(float(meta_info["scheduler_device_compute_s"]))
+            if meta_info.get("scheduler_host_overhead_s") is not None:
+                scheduler_host_overhead.append(float(meta_info["scheduler_host_overhead_s"]))
 
         logger.debug(
             "Prefill+extend: completed extend batch handle=%s batch_items=%d",
             cache_handle,
             len(items),
         )
-        return scores
+        return (
+            scores,
+            {
+                "dispatch_count": (
+                    max(scheduler_dispatch_counts)
+                    if scheduler_dispatch_counts
+                    else 1
+                ),
+                "queue_wait_s": (
+                    max(scheduler_queue_wait)
+                    if scheduler_queue_wait
+                    else 0.0
+                ),
+                "device_compute_s": (
+                    max(scheduler_device_compute)
+                    if scheduler_device_compute
+                    else 0.0
+                ),
+                "host_orchestration_s": (
+                    max(scheduler_host_overhead)
+                    if scheduler_host_overhead
+                    else 0.0
+                ),
+                "lifecycle_requests_sent": len(items),
+                "lifecycle_results_received": len(results),
+            },
+        )
 
     async def _release_cache(self, cache_handle: str):
         """Release the cached query."""
@@ -1790,6 +1874,69 @@ class TokenizerManager:
             )
         return True
 
+    def _record_score_fastpath_fallback(self, reason: str):
+        self.score_fastpath_fallback += 1
+        self.score_fastpath_fallback_reasons[reason] = (
+            self.score_fastpath_fallback_reasons.get(reason, 0) + 1
+        )
+
+    async def _score_from_cache_fastpath_v2(
+        self,
+        cache_handle: str,
+        items: list[list[int]],
+        label_token_ids: list[int],
+        apply_softmax: bool,
+    ) -> ScoreFromCacheReqOutput:
+        self.auto_create_handle_loop()
+        timeout_s = float(
+            getattr(self.server_args, "multi_item_prefill_extend_cache_timeout", 60.0)
+        )
+        items_per_step = int(
+            getattr(
+                self.server_args,
+                "multi_item_score_from_cache_v2_items_per_step",
+                ServerArgs.multi_item_score_from_cache_v2_items_per_step,
+            )
+        )
+        outputs = await self.score_from_cache_v2_communicator(
+            ScoreFromCacheReqInput(
+                cache_handle=cache_handle,
+                items_2d=items,
+                label_token_ids=label_token_ids,
+                apply_softmax=apply_softmax,
+                items_per_step=items_per_step,
+            ),
+            timeout=timeout_s if timeout_s > 0 else None,
+        )
+        if not outputs:
+            return ScoreFromCacheReqOutput(
+                success=False,
+                scores=[],
+                fallback_reason="no_scheduler_response",
+                error_msg="No score-from-cache v2 response from scheduler.",
+            )
+        return outputs[0]
+
+    def _maybe_log_score_path_metrics(self, metrics: dict):
+        if not getattr(self.server_args, "multi_item_score_fastpath_log_metrics", False):
+            return
+        logger.info(
+            "ScorePathMetrics path=%s items=%d dispatches=%d lifecycle_sent=%d lifecycle_recv=%d "
+            "queue_wait_s=%.6f device_compute_s=%.6f host_orchestration_s=%.6f "
+            "fastpath_attempted=%s fastpath_succeeded=%s fastpath_fallback_reason=%s",
+            metrics.get("path", "unknown"),
+            int(metrics.get("items", 0)),
+            int(metrics.get("dispatch_count", 0)),
+            int(metrics.get("lifecycle_requests_sent", 0)),
+            int(metrics.get("lifecycle_results_received", 0)),
+            float(metrics.get("queue_wait_s", 0.0)),
+            float(metrics.get("device_compute_s", 0.0)),
+            float(metrics.get("host_orchestration_s", 0.0)),
+            bool(metrics.get("fastpath_attempted", False)),
+            bool(metrics.get("fastpath_succeeded", False)),
+            metrics.get("fastpath_fallback_reason"),
+        )
+
     async def score_prefill_extend(
         self,
         query_tokens: list[int],
@@ -1808,10 +1955,90 @@ class TokenizerManager:
             len(query_tokens),
             len(item_tokens_list),
         )
+        metrics = {
+            "path": "prefill_extend_baseline",
+            "items": len(item_tokens_list),
+            "dispatch_count": 0,
+            "lifecycle_requests_sent": 0,
+            "lifecycle_results_received": 0,
+            "queue_wait_s": 0.0,
+            "device_compute_s": 0.0,
+            "host_orchestration_s": 0.0,
+            "fastpath_attempted": False,
+            "fastpath_succeeded": False,
+            "fastpath_fallback_reason": None,
+        }
         # Step 1: Prefill query and get cache handle
         cache_handle = await self._prefill_and_cache(query_tokens)
+        metrics["lifecycle_requests_sent"] += 1
+        metrics["lifecycle_results_received"] += 1
 
         try:
+            if getattr(self.server_args, "multi_item_enable_score_from_cache_v2", False):
+                metrics["fastpath_attempted"] = True
+                self.score_fastpath_attempted += 1
+                try:
+                    fastpath_out = await self._score_from_cache_fastpath_v2(
+                        cache_handle=cache_handle,
+                        items=item_tokens_list,
+                        label_token_ids=label_token_ids,
+                        apply_softmax=apply_softmax,
+                    )
+                    metrics["lifecycle_requests_sent"] += 1
+                    metrics["lifecycle_results_received"] += 1
+                except TimeoutError:
+                    fastpath_out = ScoreFromCacheReqOutput(
+                        success=False,
+                        scores=[],
+                        fallback_reason="timeout",
+                        error_msg="Timed out waiting for score-from-cache v2 response.",
+                    )
+                except Exception:
+                    logger.exception("Fastpath v2 request failed before scheduler response.")
+                    fastpath_out = ScoreFromCacheReqOutput(
+                        success=False,
+                        scores=[],
+                        fallback_reason="runtime_exception",
+                        error_msg="Fastpath v2 communicator exception.",
+                    )
+
+                fallback_reason = None
+                fallback_error_msg = fastpath_out.error_msg
+                if fastpath_out.success:
+                    if len(fastpath_out.scores) != len(item_tokens_list):
+                        fallback_reason = "invalid_response_count"
+                        fallback_error_msg = (
+                            "Fastpath v2 returned wrong score count: "
+                            f"{len(fastpath_out.scores)} != {len(item_tokens_list)}."
+                        )
+                    else:
+                        self.score_fastpath_succeeded += 1
+                        metrics["path"] = "score_from_cache_v2"
+                        metrics["fastpath_succeeded"] = True
+                        metrics["dispatch_count"] += int(fastpath_out.dispatch_count)
+                        metrics["queue_wait_s"] += float(fastpath_out.queue_wait_s)
+                        metrics["device_compute_s"] += float(fastpath_out.device_compute_s)
+                        metrics["host_orchestration_s"] += float(fastpath_out.host_orchestration_s)
+                        metrics["lifecycle_requests_sent"] += int(
+                            fastpath_out.lifecycle_requests_sent
+                        )
+                        metrics["lifecycle_results_received"] += int(
+                            fastpath_out.lifecycle_results_received
+                        )
+                        self._maybe_log_score_path_metrics(metrics)
+                        return fastpath_out.scores
+                else:
+                    fallback_reason = fastpath_out.fallback_reason or "runtime_exception"
+
+                if fallback_reason is not None:
+                    metrics["fastpath_fallback_reason"] = fallback_reason
+                    self._record_score_fastpath_fallback(fallback_reason)
+                    logger.warning(
+                        "Fastpath v2 falling back to baseline: reason=%s error=%s",
+                        fallback_reason,
+                        fallback_error_msg,
+                    )
+
             # Step 2: Process items in batches
             all_scores = []
             batch_size = int(getattr(self.server_args, "multi_item_extend_batch_size", 32))
@@ -1834,7 +2061,7 @@ class TokenizerManager:
                 if len(batch) < batch_size and len(batch) > 0:
                     padded_count = batch_size - len(batch)
                     padded_batch = batch + [batch[-1]] * padded_count
-                batch_scores = await self._batched_extend_score(
+                batch_scores, batch_metrics = await self._batched_extend_score_with_metrics(
                     cache_handle=cache_handle,
                     items=padded_batch,
                     label_token_ids=label_token_ids,
@@ -1843,8 +2070,17 @@ class TokenizerManager:
                 if padded_count > 0:
                     batch_scores = batch_scores[: len(batch)]
                 all_scores.extend(batch_scores)
+                metrics["dispatch_count"] += int(batch_metrics["dispatch_count"])
+                metrics["queue_wait_s"] += float(batch_metrics["queue_wait_s"])
+                metrics["device_compute_s"] += float(batch_metrics["device_compute_s"])
+                metrics["host_orchestration_s"] += float(batch_metrics["host_orchestration_s"])
+                # Only real items should contribute to lifecycle counters.
+                real_items = len(batch)
+                metrics["lifecycle_requests_sent"] += real_items
+                metrics["lifecycle_results_received"] += real_items
 
             logger.debug("Prefill+extend: complete items=%d", len(item_tokens_list))
+            self._maybe_log_score_path_metrics(metrics)
             return all_scores
         finally:
             # Step 3: Release cache

@@ -11,7 +11,11 @@ from sgl_jax.srt.layers.logits_processor import LogitsProcessor
 from sgl_jax.srt.layers.sampler import (
     get_token_ids_logprobs as sampler_get_token_ids_logprobs,
 )
-from sgl_jax.srt.managers.io_struct import GenerateReqInput
+from sgl_jax.srt.managers.io_struct import (
+    GenerateReqInput,
+    ScoreFromCacheReqInput,
+    ScoreFromCacheReqOutput,
+)
 from sgl_jax.srt.managers.scheduler import Scheduler
 from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
@@ -487,3 +491,327 @@ def test_sampler_token_ids_logprobs_handles_none_entries():
     np.testing.assert_array_equal(np.array(idxs[0]), np.array([-1, -1]))
     np.testing.assert_allclose(np.array(vals[1]), np.array([0.60, 0.30]))
     np.testing.assert_array_equal(np.array(idxs[1]), np.array([0, 2]))
+
+
+class _FakeScorePrefillExtendManager:
+    score_prefill_extend = TokenizerManager.score_prefill_extend
+    _record_score_fastpath_fallback = TokenizerManager._record_score_fastpath_fallback
+
+    def __init__(self, fastpath_enabled: bool, fastpath_output: ScoreFromCacheReqOutput | Exception):
+        self.server_args = SimpleNamespace(
+            multi_item_extend_batch_size=64,
+            multi_item_enable_score_from_cache_v2=fastpath_enabled,
+            multi_item_score_fastpath_log_metrics=True,
+        )
+        self.fastpath_output = fastpath_output
+        self.prefill_calls = 0
+        self.fastpath_calls = 0
+        self.baseline_calls: list[list[list[int]]] = []
+        self.logged_metrics = []
+        self.score_fastpath_attempted = 0
+        self.score_fastpath_succeeded = 0
+        self.score_fastpath_fallback = 0
+        self.score_fastpath_fallback_reasons = {}
+
+    async def _prefill_and_cache(self, query_tokens: list[int]) -> str:
+        del query_tokens
+        self.prefill_calls += 1
+        return "cache-handle"
+
+    async def _score_from_cache_fastpath_v2(
+        self,
+        cache_handle: str,
+        items: list[list[int]],
+        label_token_ids: list[int],
+        apply_softmax: bool,
+    ) -> ScoreFromCacheReqOutput:
+        del cache_handle, items, label_token_ids, apply_softmax
+        self.fastpath_calls += 1
+        if isinstance(self.fastpath_output, Exception):
+            raise self.fastpath_output
+        return self.fastpath_output
+
+    async def _batched_extend_score_with_metrics(
+        self,
+        cache_handle: str,
+        items: list[list[int]],
+        label_token_ids: list[int],
+        apply_softmax: bool,
+    ) -> tuple[list[list[float]], dict[str, float | int]]:
+        del cache_handle, label_token_ids, apply_softmax
+        self.baseline_calls.append(items)
+        scores = [[float(item[0]), float(item[0]) + 0.1] for item in items]
+        metrics = {
+            "dispatch_count": 1,
+            "queue_wait_s": 0.001,
+            "device_compute_s": 0.002,
+            "host_orchestration_s": 0.003,
+            "lifecycle_requests_sent": len(items),
+            "lifecycle_results_received": len(items),
+        }
+        return scores, metrics
+
+    async def _release_cache(self, cache_handle: str) -> bool:
+        del cache_handle
+        return True
+
+    def _maybe_log_score_path_metrics(self, metrics: dict):
+        self.logged_metrics.append(metrics)
+
+
+class _FakeSchedulerScoreFromCacheV2:
+    score_from_cache_v2 = Scheduler.score_from_cache_v2
+    _score_from_cache_v2_validate_items = Scheduler._score_from_cache_v2_validate_items
+    _score_from_cache_v2_fallback_output = Scheduler._score_from_cache_v2_fallback_output
+    _record_score_from_cache_v2_fallback = Scheduler._record_score_from_cache_v2_fallback
+    _estimate_score_from_cache_v2_words = Scheduler._estimate_score_from_cache_v2_words
+    _touch_scoring_cache_entry = Scheduler._touch_scoring_cache_entry
+    _unpack_scoring_cache_entry = Scheduler._unpack_scoring_cache_entry
+
+    def __init__(self):
+        self.enable_overlap = False
+        self.server_args = SimpleNamespace(
+            multi_item_score_from_cache_v2_items_per_step=64,
+            allow_auto_truncate=False,
+            max_running_requests=1024,
+        )
+        self.req_to_token_pool = SimpleNamespace(available_size=lambda: 1024)
+        self.model_config = SimpleNamespace(hf_eos_token_id={2}, vocab_size=32000)
+        self.max_req_len = 32768
+        self.max_req_input_len = 32768
+        self.scoring_cache_nodes = {
+            "cache-ok": (
+                "node",
+                None,
+                [101] * 2000,
+                np.arange(2000, dtype=np.int32),
+                None,
+                0.0,
+            )
+        }
+        self.scoring_cache_timeout = 0.0
+        self._last_scoring_cache_gc = 0.0
+        self.score_from_cache_v2_attempted = 0
+        self.score_from_cache_v2_succeeded = 0
+        self.score_from_cache_v2_fallback = 0
+        self.score_from_cache_v2_fallback_reasons = {}
+        self.chunk_calls = []
+        self.fail_next_chunk = False
+        self.force_estimated_words = None
+
+    def _evict_expired_scoring_cache_nodes(self):
+        return 0
+
+    def _run_score_from_cache_v2_chunk(
+        self,
+        cache_handle: str,
+        chunk_items: list[list[int]],
+        label_token_ids: list[int],
+        apply_softmax: bool,
+        cached_last_node,
+        cached_prefix_indices,
+        prefix_ids: list[int],
+        cached_extra_key: str | None,
+    ) -> tuple[list[list[float]], float, float]:
+        del (
+            cache_handle,
+            label_token_ids,
+            apply_softmax,
+            cached_last_node,
+            cached_prefix_indices,
+            prefix_ids,
+            cached_extra_key,
+        )
+        self.chunk_calls.append([item[0] for item in chunk_items])
+        if self.fail_next_chunk:
+            self.fail_next_chunk = False
+            raise RuntimeError("synthetic chunk failure")
+        return (
+            [[float(item[0]), float(item[0]) + 1.0] for item in chunk_items],
+            0.01,
+            0.02,
+        )
+
+    def _estimate_score_from_cache_v2_words(self, prefix_len: int, items: list[list[int]]) -> int:
+        if self.force_estimated_words is not None:
+            return self.force_estimated_words
+        return Scheduler._estimate_score_from_cache_v2_words(prefix_len, items)
+
+
+def _parity_metrics(
+    baseline_scores: list[list[float]],
+    fastpath_scores: list[list[float]],
+) -> tuple[float, float]:
+    diffs = []
+    for base_row, fast_row in zip(baseline_scores, fastpath_scores):
+        diffs.extend(abs(a - b) for a, b in zip(base_row, fast_row))
+    return max(diffs), sum(diffs) / len(diffs)
+
+
+def test_score_prefill_extend_fastpath_v2_500x20_order_and_count():
+    expected_scores = [[float(i), float(i) + 0.5] for i in range(500)]
+    manager = _FakeScorePrefillExtendManager(
+        fastpath_enabled=True,
+        fastpath_output=ScoreFromCacheReqOutput(
+            success=True,
+            scores=expected_scores,
+            dispatch_count=8,
+            queue_wait_s=0.01,
+            device_compute_s=0.2,
+            host_orchestration_s=0.05,
+        ),
+    )
+    query_tokens = [11] * 2000
+    items = [[i] * 20 for i in range(500)]
+
+    scores = asyncio.run(
+        manager.score_prefill_extend(
+            query_tokens=query_tokens,
+            item_tokens_list=items,
+            label_token_ids=[9454, 2753],
+            apply_softmax=False,
+        )
+    )
+
+    assert len(scores) == 500
+    assert scores == expected_scores
+    assert manager.prefill_calls == 1
+    assert manager.fastpath_calls == 1
+    assert manager.baseline_calls == []
+    assert manager.score_fastpath_attempted == 1
+    assert manager.score_fastpath_succeeded == 1
+    assert manager.score_fastpath_fallback == 0
+
+
+def test_score_prefill_extend_fastpath_exception_falls_back_and_recovers():
+    manager = _FakeScorePrefillExtendManager(
+        fastpath_enabled=True,
+        fastpath_output=RuntimeError("synthetic fastpath communicator failure"),
+    )
+    query_tokens = [7] * 2000
+    items = [[i] * 20 for i in range(500)]
+
+    scores = asyncio.run(
+        manager.score_prefill_extend(
+            query_tokens=query_tokens,
+            item_tokens_list=items,
+            label_token_ids=[9454, 2753],
+            apply_softmax=False,
+        )
+    )
+
+    assert len(scores) == 500
+    assert manager.fastpath_calls == 1
+    assert len(manager.baseline_calls) > 0
+    assert manager.score_fastpath_attempted == 1
+    assert manager.score_fastpath_succeeded == 0
+    assert manager.score_fastpath_fallback == 1
+    assert manager.score_fastpath_fallback_reasons.get("runtime_exception") == 1
+
+    # Recovery sanity: a second request still succeeds.
+    scores_2 = asyncio.run(
+        manager.score_prefill_extend(
+            query_tokens=query_tokens,
+            item_tokens_list=items[:10],
+            label_token_ids=[9454, 2753],
+            apply_softmax=False,
+        )
+    )
+    assert len(scores_2) == 10
+
+
+def test_score_from_cache_v2_chunk_loop_dispatches_multiple_steps():
+    scheduler = _FakeSchedulerScoreFromCacheV2()
+    items = [[i] * 20 for i in range(150)]
+    out = scheduler.score_from_cache_v2(
+        ScoreFromCacheReqInput(
+            cache_handle="cache-ok",
+            items_2d=items,
+            label_token_ids=[9454, 2753],
+            items_per_step=64,
+            apply_softmax=False,
+        )
+    )
+
+    assert out.success is True
+    assert out.dispatch_count == 3
+    assert len(out.scores) == 150
+    assert out.scores[0] == [0.0, 1.0]
+    assert out.scores[-1] == [149.0, 150.0]
+    assert len(scheduler.chunk_calls) == 3
+    assert scheduler.score_from_cache_v2_succeeded == 1
+
+
+def test_score_from_cache_v2_caps_items_per_step_by_req_slots():
+    scheduler = _FakeSchedulerScoreFromCacheV2()
+    scheduler.server_args.max_running_requests = 24
+    scheduler.req_to_token_pool = SimpleNamespace(available_size=lambda: 25)
+    items = [[i] * 20 for i in range(50)]
+    out = scheduler.score_from_cache_v2(
+        ScoreFromCacheReqInput(
+            cache_handle="cache-ok",
+            items_2d=items,
+            label_token_ids=[9454, 2753],
+            items_per_step=64,
+            apply_softmax=False,
+        )
+    )
+
+    assert out.success is True
+    assert out.dispatch_count == 3
+    assert [len(chunk) for chunk in scheduler.chunk_calls] == [24, 24, 2]
+
+
+def test_score_from_cache_v2_size_guard_fallback():
+    scheduler = _FakeSchedulerScoreFromCacheV2()
+    scheduler.force_estimated_words = np.iinfo(np.int32).max
+    out = scheduler.score_from_cache_v2(
+        ScoreFromCacheReqInput(
+            cache_handle="cache-ok",
+            items_2d=[[1] * 20 for _ in range(4)],
+            label_token_ids=[9454, 2753],
+            items_per_step=4,
+            apply_softmax=False,
+        )
+    )
+
+    assert out.success is False
+    assert out.fallback_reason == "size_guard"
+    assert scheduler.score_from_cache_v2_fallback == 1
+    assert scheduler.score_from_cache_v2_fallback_reasons.get("size_guard") == 1
+
+
+def test_score_from_cache_v2_runtime_exception_does_not_poison_future_requests():
+    scheduler = _FakeSchedulerScoreFromCacheV2()
+    scheduler.fail_next_chunk = True
+    first = scheduler.score_from_cache_v2(
+        ScoreFromCacheReqInput(
+            cache_handle="cache-ok",
+            items_2d=[[1] * 20 for _ in range(8)],
+            label_token_ids=[9454, 2753],
+            items_per_step=4,
+            apply_softmax=False,
+        )
+    )
+    assert first.success is False
+    assert first.fallback_reason == "runtime_exception"
+
+    second = scheduler.score_from_cache_v2(
+        ScoreFromCacheReqInput(
+            cache_handle="cache-ok",
+            items_2d=[[2] * 20 for _ in range(8)],
+            label_token_ids=[9454, 2753],
+            items_per_step=4,
+            apply_softmax=False,
+        )
+    )
+    assert second.success is True
+    assert len(second.scores) == 8
+
+
+def test_score_from_cache_v2_parity_metric_threshold():
+    baseline_scores = [[0.1, 0.9], [0.3, 0.7], [0.8, 0.2]]
+    fastpath_scores = [[0.1000004, 0.8999996], [0.3000001, 0.6999999], [0.8, 0.2]]
+    max_abs_diff, mean_abs_diff = _parity_metrics(baseline_scores, fastpath_scores)
+    assert max_abs_diff < 1e-3
+    assert mean_abs_diff < 5e-4

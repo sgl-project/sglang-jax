@@ -4,6 +4,7 @@ import concurrent.futures as futures
 import dataclasses
 import faulthandler
 import logging
+import math
 import os
 import pickle
 import signal
@@ -41,6 +42,8 @@ from sgl_jax.srt.managers.io_struct import (
     ProfileReq,
     ReleaseScoringCacheReqInput,
     ReleaseScoringCacheReqOutput,
+    ScoreFromCacheReqInput,
+    ScoreFromCacheReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     TokenizedGenerateReqInput,
@@ -71,6 +74,7 @@ from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
+from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -368,6 +372,11 @@ class Scheduler(
         self.scoring_cache_nodes = {}
         self.scoring_cache_timeout = float(server_args.multi_item_prefill_extend_cache_timeout)
         self._last_scoring_cache_gc = 0.0
+        # Fastpath v2 score-from-cache counters.
+        self.score_from_cache_v2_attempted = 0
+        self.score_from_cache_v2_succeeded = 0
+        self.score_from_cache_v2_fallback = 0
+        self.score_from_cache_v2_fallback_reasons: dict[str, int] = {}
 
         # Init schedule policy and new token estimation
         self.policy = SchedulePolicy(
@@ -406,6 +415,7 @@ class Scheduler(
                 (ProfileReq, self.profile),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
                 (ReleaseScoringCacheReqInput, self.release_scoring_cache),
+                (ScoreFromCacheReqInput, self.score_from_cache_v2),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (PauseGenerationReqInput, self.pause_generation),
@@ -799,6 +809,455 @@ class Scheduler(
         )
         return (cached_last_node, prefix_indices), None
 
+    def _record_score_from_cache_v2_fallback(self, reason: str):
+        self.score_from_cache_v2_fallback += 1
+        self.score_from_cache_v2_fallback_reasons[reason] = (
+            self.score_from_cache_v2_fallback_reasons.get(reason, 0) + 1
+        )
+
+    def _score_from_cache_v2_fallback_output(
+        self,
+        recv_req: ScoreFromCacheReqInput,
+        reason: str,
+        error_msg: str = "",
+        dispatch_count: int = 0,
+        device_compute_s: float = 0.0,
+        host_orchestration_s: float = 0.0,
+    ) -> ScoreFromCacheReqOutput:
+        self._record_score_from_cache_v2_fallback(reason)
+        return ScoreFromCacheReqOutput(
+            rid=recv_req.rid,
+            success=False,
+            scores=[],
+            fallback_reason=reason,
+            error_msg=error_msg,
+            dispatch_count=dispatch_count,
+            lifecycle_requests_sent=0,
+            lifecycle_results_received=0,
+            queue_wait_s=0.0,
+            device_compute_s=device_compute_s,
+            host_orchestration_s=host_orchestration_s,
+        )
+
+    def _score_from_cache_v2_validate_items(
+        self, recv_req: ScoreFromCacheReqInput
+    ) -> tuple[bool, str, str]:
+        if not recv_req.cache_handle:
+            return False, "missing_cache_handle", "cache_handle must be non-empty."
+        if not isinstance(recv_req.items_2d, list):
+            return False, "unsupported_shape", "items_2d must be a list of token lists."
+        if not isinstance(recv_req.label_token_ids, list) or len(recv_req.label_token_ids) == 0:
+            return False, "unsupported_shape", "label_token_ids must be a non-empty list."
+        if any((not isinstance(token_id, int)) for token_id in recv_req.label_token_ids):
+            return False, "unsupported_shape", "label_token_ids must contain ints."
+        for idx, item in enumerate(recv_req.items_2d):
+            if not isinstance(item, list):
+                return (
+                    False,
+                    "unsupported_shape",
+                    f"items_2d[{idx}] must be a list of token ids.",
+                )
+            if len(item) == 0:
+                return (
+                    False,
+                    "unsupported_shape",
+                    f"items_2d[{idx}] must contain at least one token.",
+                )
+            if any((not isinstance(token_id, int)) for token_id in item):
+                return (
+                    False,
+                    "unsupported_shape",
+                    f"items_2d[{idx}] must contain ints.",
+                )
+        return True, "", ""
+
+    @staticmethod
+    def _score_from_cache_v2_probs_from_logprobs(
+        row_logprobs: list[float], apply_softmax: bool
+    ) -> list[float]:
+        if apply_softmax:
+            finite_vals = [x for x in row_logprobs if x != float("-inf")]
+            if not finite_vals:
+                return [0.0 for _ in row_logprobs]
+            max_logprob = max(finite_vals)
+            exps = [math.exp(x - max_logprob) if x != float("-inf") else 0.0 for x in row_logprobs]
+            denom = sum(exps)
+            if denom <= 0:
+                return [0.0 for _ in row_logprobs]
+            return [x / denom for x in exps]
+        return [math.exp(x) if x != float("-inf") else 0.0 for x in row_logprobs]
+
+    @staticmethod
+    def _estimate_score_from_cache_v2_words(prefix_len: int, items: list[list[int]]) -> int:
+        # Conservative host-side int32-sized tensor estimate for this chunk.
+        total_item_tokens = sum(len(item) for item in items)
+        total_fill_tokens = sum(prefix_len + len(item) for item in items)
+        max_item_len = max((len(item) for item in items), default=0)
+        bs = len(items)
+        # Terms loosely track main arrays: flat input ids, seq/prefix/extend lengths,
+        # req_to_token writes, and token-id-logprob tensors.
+        return (
+            total_item_tokens
+            + total_fill_tokens
+            + (3 * bs)
+            + (bs * max_item_len)
+            + (bs * prefix_len)
+        )
+
+    def _cleanup_failed_score_from_cache_v2_chunk(self, reqs: list[Req]) -> None:
+        for req in reqs:
+            if req.req_pool_idx is None:
+                continue
+            try:
+                pre_len = len(req.prefix_indices)
+                seq_len = pre_len + max(0, req.extend_input_len)
+                if seq_len > 0:
+                    token_locs = self.req_to_token_pool.read(req.req_pool_idx, seq_len)
+                    token_locs = token_locs[pre_len:seq_len]
+                    token_locs = token_locs[token_locs != 0]
+                    if len(token_locs) > 0:
+                        self.token_to_kv_pool_allocator.free(token_locs)
+            except Exception:
+                logger.exception(
+                    "Fastpath v2 cleanup failed while freeing KV tokens for rid=%s.",
+                    req.rid,
+                )
+            try:
+                self.req_to_token_pool.free(req.req_pool_idx)
+            except Exception:
+                logger.exception(
+                    "Fastpath v2 cleanup failed while freeing req slot for rid=%s.",
+                    req.rid,
+                )
+            req.req_pool_idx = None
+
+    def _run_score_from_cache_v2_chunk(
+        self,
+        cache_handle: str,
+        chunk_items: list[list[int]],
+        label_token_ids: list[int],
+        apply_softmax: bool,
+        cached_last_node,
+        cached_prefix_indices,
+        prefix_ids: list[int],
+        cached_extra_key: str | None,
+    ) -> tuple[list[list[float]], float, float]:
+        reqs: list[Req] = []
+        for local_idx, item_ids in enumerate(chunk_items):
+            sampling_params = SamplingParams(max_new_tokens=0)
+            sampling_params.normalize(self.tokenizer)
+            sampling_params.verify(self.model_config.vocab_size)
+
+            rid = f"{cache_handle}-scorev2-{local_idx}-{time.time_ns()}"
+            req = Req(
+                rid=rid,
+                origin_input_text=None,
+                origin_input_ids=prefix_ids + item_ids,
+                sampling_params=sampling_params,
+                return_logprob=True,
+                return_output_logprob_only=False,
+                top_logprobs_num=0,
+                token_ids_logprob=label_token_ids,
+                stream=False,
+                extra_key=cached_extra_key,
+                eos_token_ids=self.model_config.hf_eos_token_id,
+                vocab_size=self.model_config.vocab_size,
+                is_multi_item_scoring=False,
+                cache_for_scoring=False,
+                extend_from_cache=cache_handle,
+            )
+            req.tokenizer = self.tokenizer
+            req.logprob_start_len = len(req.origin_input_ids) - 1
+            req.sampling_params.max_new_tokens = min(
+                (
+                    req.sampling_params.max_new_tokens
+                    if req.sampling_params.max_new_tokens is not None
+                    else 1 << 30
+                ),
+                self.max_req_len - len(req.origin_input_ids) - 1,
+            )
+            req.cached_last_node = cached_last_node
+            req.cached_last_host_node = cached_last_node
+            req.cached_prefix_indices = cached_prefix_indices
+            req.cached_host_hit_length = 0
+
+            error_msg = validate_input_length(
+                req,
+                self.max_req_input_len,
+                self.server_args.allow_auto_truncate,
+            )
+            if error_msg:
+                raise ValueError(error_msg)
+            req.init_next_round_input(self.tree_cache)
+            reqs.append(req)
+
+        try:
+            batch = ScheduleBatch.init_new(
+                reqs=reqs,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tree_cache=self.tree_cache,
+                model_config=self.model_config,
+                enable_overlap=self.enable_overlap,
+                spec_algorithm=self.spec_algorithm,
+                enable_custom_logit_processor=False,
+                chunked_req=None,
+                mesh=self.mesh,
+            )
+            batch.prepare_for_extend()
+            batch.bid = acc_global_bid()
+            result = self.run_batch(batch)
+
+            if result.logits_output is None:
+                raise RuntimeError("Missing logits output from score-from-cache v2 chunk.")
+
+            logprob_vals = result.logits_output.next_token_token_ids_logprobs_val
+            logprob_idxs = result.logits_output.next_token_token_ids_logprobs_idx
+            if logprob_vals is None or logprob_idxs is None:
+                raise RuntimeError(
+                    "Missing token_ids_logprobs tensors from score-from-cache v2 chunk."
+                )
+            logprob_vals = np.asarray(jax.device_get(logprob_vals), dtype=np.float64)
+            logprob_idxs = np.asarray(jax.device_get(logprob_idxs), dtype=np.int32)
+            if logprob_vals.ndim != 2 or logprob_idxs.shape != logprob_vals.shape:
+                raise RuntimeError(
+                    f"Unexpected token_ids_logprobs shape: vals={logprob_vals.shape}, idxs={logprob_idxs.shape}."
+                )
+            if logprob_vals.shape[0] != len(reqs):
+                raise RuntimeError(
+                    f"Chunk output rows ({logprob_vals.shape[0]}) != request count ({len(reqs)})."
+                )
+
+            scores: list[list[float]] = []
+            for row_vals, row_idxs in zip(logprob_vals, logprob_idxs):
+                row_logprobs: list[float] = []
+                for token_id in label_token_ids:
+                    match = np.where(row_idxs == token_id)[0]
+                    if len(match) == 0:
+                        row_logprobs.append(float("-inf"))
+                    else:
+                        row_logprobs.append(float(row_vals[int(match[0])]))
+                scores.append(
+                    self._score_from_cache_v2_probs_from_logprobs(
+                        row_logprobs=row_logprobs,
+                        apply_softmax=apply_softmax,
+                    )
+                )
+
+            for i, req in enumerate(reqs):
+                # Keep cleanup behavior aligned with the scheduler prefill path.
+                req.output_ids.append(result.next_token_ids[i])
+                req.check_finished()
+                self.tree_cache.cache_finished_req(req)
+                req.req_pool_idx = None
+
+            chunk_device_compute_s = reqs[0].device_compute_time_s if reqs else 0.0
+            chunk_host_overhead_s = reqs[0].host_overhead_time_s if reqs else 0.0
+            return scores, chunk_device_compute_s, chunk_host_overhead_s
+        except Exception:
+            self._cleanup_failed_score_from_cache_v2_chunk(reqs)
+            raise
+
+    def score_from_cache_v2(self, recv_req: ScoreFromCacheReqInput) -> ScoreFromCacheReqOutput:
+        self.score_from_cache_v2_attempted += 1
+        dispatch_count = 0
+        queue_wait_s = 0.0
+        device_compute_s = 0.0
+        host_orchestration_s = 0.0
+        score_start = time.perf_counter()
+
+        try:
+            if self.enable_overlap:
+                return self._score_from_cache_v2_fallback_output(
+                    recv_req,
+                    reason="unsupported_scheduler_mode",
+                    error_msg="score-from-cache v2 does not support overlap schedule.",
+                )
+
+            is_valid, fallback_reason, error_msg = self._score_from_cache_v2_validate_items(recv_req)
+            if not is_valid:
+                return self._score_from_cache_v2_fallback_output(
+                    recv_req,
+                    reason=fallback_reason,
+                    error_msg=error_msg,
+                )
+
+            self._evict_expired_scoring_cache_nodes()
+            entry = self.scoring_cache_nodes.get(recv_req.cache_handle)
+            if entry is None:
+                return self._score_from_cache_v2_fallback_output(
+                    recv_req,
+                    reason="missing_cache_handle",
+                    error_msg=(
+                        f"Missing scoring cache handle '{recv_req.cache_handle}'. "
+                        "The cached prefix may have expired or been released."
+                    ),
+                )
+
+            cached_last_node, _, prefix_ids, prefix_indices, cached_extra_key, _ = (
+                self._unpack_scoring_cache_entry(entry)
+            )
+            if cached_last_node is None:
+                return self._score_from_cache_v2_fallback_output(
+                    recv_req,
+                    reason="missing_cache_handle",
+                    error_msg=f"Scoring cache handle '{recv_req.cache_handle}' has no radix node.",
+                )
+
+            items_per_step = int(recv_req.items_per_step or 0)
+            default_items_per_step = int(
+                getattr(self.server_args, "multi_item_score_from_cache_v2_items_per_step", 64)
+            )
+            if default_items_per_step <= 0:
+                default_items_per_step = 1
+            if items_per_step <= 0:
+                items_per_step = default_items_per_step
+            requested_items_per_step = max(1, items_per_step)
+
+            # Keep chunk size within request-slot capacity so large configured values
+            # (e.g., 64 with max_running_requests=24) do not trigger alloc_req_slots failures.
+            capacity_caps: list[int] = []
+            max_running_requests = int(getattr(self.server_args, "max_running_requests", 0) or 0)
+            if max_running_requests > 0:
+                capacity_caps.append(max_running_requests)
+            req_to_token_pool = getattr(self, "req_to_token_pool", None)
+            if req_to_token_pool is not None and hasattr(req_to_token_pool, "available_size"):
+                try:
+                    req_pool_available = int(req_to_token_pool.available_size())
+                except Exception:
+                    req_pool_available = 0
+                if req_pool_available > 0:
+                    capacity_caps.append(req_pool_available)
+            effective_capacity = min(capacity_caps) if capacity_caps else requested_items_per_step
+            if effective_capacity <= 0:
+                return self._score_from_cache_v2_fallback_output(
+                    recv_req,
+                    reason="req_slot_exhausted",
+                    error_msg=(
+                        "Fastpath v2 requires at least one free request slot "
+                        f"(requested_items_per_step={requested_items_per_step})."
+                    ),
+                    dispatch_count=dispatch_count,
+                    device_compute_s=device_compute_s,
+                    host_orchestration_s=host_orchestration_s,
+                )
+            items_per_step = max(
+                1,
+                min(requested_items_per_step, default_items_per_step, effective_capacity),
+            )
+
+            total_items = len(recv_req.items_2d)
+            if total_items == 0:
+                self.score_from_cache_v2_succeeded += 1
+                return ScoreFromCacheReqOutput(
+                    rid=recv_req.rid,
+                    success=True,
+                    scores=[],
+                    fallback_reason=None,
+                    error_msg="",
+                    dispatch_count=0,
+                    lifecycle_requests_sent=0,
+                    lifecycle_results_received=0,
+                    queue_wait_s=0.0,
+                    device_compute_s=0.0,
+                    host_orchestration_s=0.0,
+                )
+
+            for start in range(0, total_items, items_per_step):
+                chunk_items = recv_req.items_2d[start : start + items_per_step]
+                if not chunk_items:
+                    continue
+
+                int32_max = np.iinfo(np.int32).max
+                max_seq_len = max((len(prefix_ids) + len(item) for item in chunk_items), default=0)
+                estimated_words = self._estimate_score_from_cache_v2_words(
+                    prefix_len=len(prefix_ids),
+                    items=chunk_items,
+                )
+                if max_seq_len >= int32_max or estimated_words >= int(int32_max * 0.9):
+                    return self._score_from_cache_v2_fallback_output(
+                        recv_req,
+                        reason="size_guard",
+                        error_msg=(
+                            "Fastpath v2 size guard triggered. "
+                            f"max_seq_len={max_seq_len}, estimated_words={estimated_words}"
+                        ),
+                        dispatch_count=dispatch_count,
+                        device_compute_s=device_compute_s,
+                        host_orchestration_s=host_orchestration_s,
+                    )
+
+            self._touch_scoring_cache_entry(recv_req.cache_handle)
+
+            all_scores: list[list[float]] = []
+            first_dispatch_started = False
+            for start in range(0, total_items, items_per_step):
+                chunk_items = recv_req.items_2d[start : start + items_per_step]
+                if not chunk_items:
+                    continue
+                if not first_dispatch_started:
+                    queue_wait_s = max(0.0, time.perf_counter() - score_start)
+                    first_dispatch_started = True
+                chunk_host_start = time.perf_counter()
+                chunk_scores, chunk_device_compute_s, chunk_host_overhead_s = (
+                    self._run_score_from_cache_v2_chunk(
+                        cache_handle=recv_req.cache_handle,
+                        chunk_items=chunk_items,
+                        label_token_ids=recv_req.label_token_ids,
+                        apply_softmax=recv_req.apply_softmax,
+                        cached_last_node=cached_last_node,
+                        cached_prefix_indices=prefix_indices,
+                        prefix_ids=prefix_ids,
+                        cached_extra_key=cached_extra_key,
+                    )
+                )
+                all_scores.extend(chunk_scores)
+                dispatch_count += 1
+                device_compute_s += max(0.0, chunk_device_compute_s)
+                # host_orchestration_s excludes device time by design.
+                chunk_total = max(0.0, time.perf_counter() - chunk_host_start)
+                host_orchestration_s += max(
+                    0.0,
+                    max(chunk_host_overhead_s, chunk_total - chunk_device_compute_s),
+                )
+
+            if len(all_scores) != total_items:
+                return self._score_from_cache_v2_fallback_output(
+                    recv_req,
+                    reason="runtime_exception",
+                    error_msg=(
+                        f"score-from-cache v2 returned {len(all_scores)} scores for {total_items} items."
+                    ),
+                    dispatch_count=dispatch_count,
+                    device_compute_s=device_compute_s,
+                    host_orchestration_s=host_orchestration_s,
+                )
+
+            self.score_from_cache_v2_succeeded += 1
+            return ScoreFromCacheReqOutput(
+                rid=recv_req.rid,
+                success=True,
+                scores=all_scores,
+                fallback_reason=None,
+                error_msg="",
+                dispatch_count=dispatch_count,
+                lifecycle_requests_sent=0,
+                lifecycle_results_received=0,
+                queue_wait_s=queue_wait_s,
+                device_compute_s=device_compute_s,
+                host_orchestration_s=host_orchestration_s,
+            )
+        except Exception as e:
+            logger.exception("score-from-cache v2 failed; falling back to baseline path.")
+            return self._score_from_cache_v2_fallback_output(
+                recv_req,
+                reason="runtime_exception",
+                error_msg=str(e),
+                dispatch_count=dispatch_count,
+                device_compute_s=device_compute_s,
+                host_orchestration_s=host_orchestration_s,
+            )
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -1024,6 +1483,12 @@ class Scheduler(
         ret["forward_ct_decode"] = self.forward_ct_decode
         ret["new_token_ratio"] = self.new_token_ratio
         ret["init_new_token_ratio"] = self.init_new_token_ratio
+        ret["score_from_cache_v2_metrics"] = {
+            "attempted": self.score_from_cache_v2_attempted,
+            "succeeded": self.score_from_cache_v2_succeeded,
+            "fallback": self.score_from_cache_v2_fallback,
+            "fallback_reasons": dict(self.score_from_cache_v2_fallback_reasons),
+        }
 
         return GetInternalStateReqOutput(internal_state=ret)
 
@@ -1170,9 +1635,15 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
+        req.queue_time_end = None
         self.waiting_queue.append(req)
 
     def _extend_requests_to_queue(self, reqs: list[Req], is_retracted: bool = False):
+        if is_retracted:
+            now = time.perf_counter()
+            for req in reqs:
+                req.queue_time_start = now
+                req.queue_time_end = None
         self.waiting_queue.extend(reqs)
 
     def check_memory(self):
@@ -1386,6 +1857,14 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
+        admit_ts = time.perf_counter()
+        for req in can_run_list:
+            if req.queue_time_start is None:
+                continue
+            req.queue_time_end = admit_ts
+            req.queue_wait_time_s += max(0.0, req.queue_time_end - req.queue_time_start)
+            req.queue_time_start = None
+
         self.log_prefill_stats(adder, can_run_list, running_bs)
 
         # Create a new batch
@@ -1494,6 +1973,8 @@ class Scheduler(
 
         # Run forward
         assert self.is_generation
+        batch_wall_start = time.perf_counter()
+        forward_start = time.perf_counter()
         (
             precompile_token_paddings,
             precompile_bs_paddings,
@@ -1549,8 +2030,17 @@ class Scheduler(
             next_token_ids = batch_output.next_token_ids
             logits_output = batch_output.logits_output
             cache_miss_count = batch_output.cache_miss_count
+        forward_end = time.perf_counter()
+        batch_wall_end = time.perf_counter()
         bid = model_worker_batch.bid
         batch.output_ids = next_token_ids
+
+        device_compute_s = max(0.0, forward_end - forward_start)
+        host_overhead_s = max(0.0, (batch_wall_end - batch_wall_start) - device_compute_s)
+        for req in batch.reqs:
+            req.device_compute_time_s += device_compute_s
+            req.host_overhead_time_s += host_overhead_s
+            req.scheduler_dispatch_count += 1
 
         # These 2 values are needed for processing the output, but the values can be
         # modified by overlap schedule. So we have to copy them here so that

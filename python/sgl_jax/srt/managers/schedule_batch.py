@@ -340,6 +340,10 @@ class Req:
         self.has_log_time_stats: bool = False
         self.queue_time_start = None
         self.queue_time_end = None
+        self.queue_wait_time_s: float = 0.0
+        self.device_compute_time_s: float = 0.0
+        self.host_overhead_time_s: float = 0.0
+        self.scheduler_dispatch_count: int = 0
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.

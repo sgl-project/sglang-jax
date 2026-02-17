@@ -721,6 +721,10 @@ class SchedulerOutputProcessorMixin:
         prompt_tokens = []
         completion_tokens = []
         cached_tokens = []
+        scheduler_queue_wait_s = []
+        scheduler_device_compute_s = []
+        scheduler_host_overhead_s = []
+        scheduler_dispatch_count = []
         spec_verify_ct = []
         spec_accepted_tokens = []
         output_hidden_states = None
@@ -814,6 +818,10 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(req.output_ids))
                 cached_tokens.append(req.cached_tokens)
+                scheduler_queue_wait_s.append(req.queue_wait_time_s)
+                scheduler_device_compute_s.append(req.device_compute_time_s)
+                scheduler_host_overhead_s.append(req.host_overhead_time_s)
+                scheduler_dispatch_count.append(req.scheduler_dispatch_count)
 
                 if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
@@ -926,6 +934,10 @@ class SchedulerOutputProcessorMixin:
                 output_hidden_states_for_mm,
                 cache_miss_count,
                 output_routed_experts,
+                scheduler_queue_wait_s,
+                scheduler_device_compute_s,
+                scheduler_host_overhead_s,
+                scheduler_dispatch_count,
             )
             if self._comm_backend is not None:
                 self._comm_backend.send_pyobj(out)

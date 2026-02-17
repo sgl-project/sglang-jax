@@ -79,6 +79,11 @@ class BatchStrOut:
 
     # The routed experts for each output token
     output_routed_experts: list[str | None] = None
+    # Optional scheduler-side timings for request instrumentation.
+    scheduler_queue_wait_s: list[float] | None = None
+    scheduler_device_compute_s: list[float] | None = None
+    scheduler_host_overhead_s: list[float] | None = None
+    scheduler_dispatch_count: list[int] | None = None
 
 
 @dataclass
@@ -125,6 +130,11 @@ class BatchTokenIDOut:
 
     # The routed experts for each output token
     output_routed_experts: list[np.ndarray] = None
+    # Optional scheduler-side timings for request instrumentation.
+    scheduler_queue_wait_s: list[float] | None = None
+    scheduler_device_compute_s: list[float] | None = None
+    scheduler_host_overhead_s: list[float] | None = None
+    scheduler_dispatch_count: list[int] | None = None
 
 
 @dataclass
@@ -238,6 +248,29 @@ class ReleaseScoringCacheReqOutput(BaseReq):
     success: bool = True
     released_items: int = 0
     error_msg: str = ""
+
+
+@dataclass
+class ScoreFromCacheReqInput(BaseReq):
+    cache_handle: str = ""
+    items_2d: list[list[int]] = field(default_factory=list)
+    label_token_ids: list[int] = field(default_factory=list)
+    apply_softmax: bool = False
+    items_per_step: int = 64
+
+
+@dataclass
+class ScoreFromCacheReqOutput(BaseReq):
+    success: bool = True
+    scores: list[list[float]] = field(default_factory=list)
+    fallback_reason: str | None = None
+    error_msg: str = ""
+    dispatch_count: int = 0
+    lifecycle_requests_sent: int = 0
+    lifecycle_results_received: int = 0
+    queue_wait_s: float = 0.0
+    device_compute_s: float = 0.0
+    host_orchestration_s: float = 0.0
 
 
 # Type definitions for multimodal input data
