@@ -362,33 +362,16 @@ class FlashAttention(AttentionBackend):
 
             if use_segment:
                 # Use JIT for multi-item segment metadata
-                prefix_end_all, row_seg_starts_all = self._calculate_row_seg_starts_jit(
-                    batch.input_ids,
-                    batch.multi_item_scoring_delimiter,
-                )
-                
-                # prefix_end_all is currently for the whole flattened batch.
-                # The kernel expects prefix_end[req_idx].
-                # For now, we only support one multi-item request per batch anyway or multiple with same prefix.
-                # Let's extract per-request prefix_ends.
-                
-                # NOTE: In multi-item scoring, we currently assume all items in the batch
-                # belong to the same logical request (or share the same prefix_end).
-                # We extract the prefix_end from the first multi-item request.
-                
-                # Find the first delimiter in each logical request's token range
-                # This part is still slightly tricky with flattened batch.input_ids.
-                # For prototype, we'll keep the loop for per-request metadata but JIT the heavy mask parts.
-                
-                prefix_end = np.zeros_like(seq_lens, dtype=np.int32)
-                row_seg_starts = np.zeros((padded_token_len,), dtype=np.int32)
+                # We collect JAX arrays in lists to avoid blocking CPU-TPU transfers
+                prefix_ends_list = []
+                row_seg_starts_list = []
                 token_pt = 0
 
                 for req_idx in range(batch.real_bs):
                     q_len = int(batch.extend_seq_lens[req_idx])
                     kv_len = int(batch.seq_lens[req_idx])
-                    if q_len <= 0 or kv_len <= 0:
-                        continue
+                    if q_len <= 0:
+                         continue
 
                     req_start = token_pt
                     req_end = token_pt + q_len
@@ -396,28 +379,41 @@ class FlashAttention(AttentionBackend):
 
                     if batch.multi_item_scoring_flags[req_idx]:
                         # JIT-optimized per-request calculation
-                        req_tokens = batch.input_ids[req_start:req_end]
+                        # Slice on host (cheap for numpy), compute on device
+                        req_tokens = device_array(batch.input_ids[req_start:req_end])
                         req_prefix_end, req_row_seg_starts = self._calculate_row_seg_starts_jit(
                             req_tokens,
                             batch.multi_item_scoring_delimiter,
                         )
-                        prefix_end[req_idx] = req_prefix_end
-                        # row_seg_starts is flat across the whole batch
-                        # We need to slice it in. JIT returns JAX array, we can use at[].set() 
-                        # or just rely on device_array concatenation later.
-                        # For now, let's keep it simple:
-                        row_seg_starts[req_start:req_end] = np.asarray(req_row_seg_starts)
+                        prefix_ends_list.append(req_prefix_end)
+                        row_seg_starts_list.append(req_row_seg_starts)
                     else:
-                        prefix_end[req_idx] = 0
-                        row_seg_starts[req_start:req_end] = 0
+                        # Non-scoring request: prefix_end=0, row_starts=0
+                        prefix_ends_list.append(jnp.array(0, dtype=jnp.int32))
+                        row_seg_starts_list.append(jnp.zeros((q_len,), dtype=jnp.int32))
 
-                (
-                    metadata.multi_item_prefix_end,
-                    metadata.multi_item_row_seg_starts,
-                ) = device_array(
-                    (prefix_end, row_seg_starts),
-                    sharding=sharding,
-                )
+                # Handle padding for the rest of the batch slots
+                remaining_bs = len(seq_lens) - batch.real_bs
+                if remaining_bs > 0:
+                    prefix_ends_list.extend([jnp.array(0, dtype=jnp.int32)] * remaining_bs)
+                
+                # Handle padding for tokens
+                processed_tokens = token_pt
+                remaining_tokens = padded_token_len - processed_tokens
+                if remaining_tokens > 0:
+                    row_seg_starts_list.append(jnp.zeros((remaining_tokens,), dtype=jnp.int32))
+
+                # Stack and Concatenate on Device
+                if prefix_ends_list:
+                    metadata.multi_item_prefix_end = jnp.stack(prefix_ends_list)
+                else:
+                    metadata.multi_item_prefix_end = jnp.zeros_like(seq_lens, dtype=jnp.int32)
+                    
+                if row_seg_starts_list:
+                    metadata.multi_item_row_seg_starts = jnp.concatenate(row_seg_starts_list)
+                else:
+                    metadata.multi_item_row_seg_starts = jnp.zeros((padded_token_len,), dtype=jnp.int32)
+
                 metadata.multi_item_mask_mode = MULTI_ITEM_MASK_MODE_SEGMENT
                 metadata.custom_mask = None
             else:
