@@ -275,9 +275,11 @@ class QuantizedLinear(nnx.Module):
             if quantize_act:
                 x_local, x_scale = quantize_tensor_simple(x_local, weight_q.dtype, dim=-1)
             # weight_q [H, K] is already the y layout for the kernel
+            print("before rs matmul")
             output = bidirectional_reduce_scatter_matmul(
                 x_local, weight_q, axis_name=axis_name, bm=bm, bn=bn, bk=bk
             )
+            print("after rs matmul")
             # Cast to bf16 and apply scales
             output = output.astype(jnp.bfloat16)
             if x_scale is not None:
@@ -289,7 +291,7 @@ class QuantizedLinear(nnx.Module):
             output = output.astype(jnp.bfloat16)
             return output
 
-        return shard_map(
+        res = shard_map(
             partial(_rs_fn, axis_name=reduce_axis, bm=bm, bn=bn, bk=bk),
             mesh=self.mesh,
             in_specs=(
@@ -300,6 +302,7 @@ class QuantizedLinear(nnx.Module):
             out_specs=P(reduce_axis, None),
             check_vma=False,
         )(x, self.weight_q.value, w_scale)
+        return res
 
     @named_scope
     def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
