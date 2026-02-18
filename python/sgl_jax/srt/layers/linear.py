@@ -286,6 +286,7 @@ class QuantizedLinear(nnx.Module):
                 my_x_scale = x_scale.reshape(tp_size, -1)[my_id]
                 output = output * my_x_scale[:, None]
             output = output * weight_scale[None, :]
+            output = output.astype(jnp.bfloat16)
             return output
 
         return shard_map(

@@ -683,8 +683,8 @@ class Grok1DecoderLayer(nnx.Module):
             )
 
             # Allgather before MoE: [M/TP, H] → [M, H]
-            hidden_states = jax.lax.with_sharding_constraint(hidden_states, replicated_sharding)
-            residual = jax.lax.with_sharding_constraint(residual, replicated_sharding)
+            hidden_states = jax.sharding.reshard(hidden_states, replicated_sharding)
+            residual = jax.sharding.reshard(residual, replicated_sharding)
         else:
             # Standard path: o_proj already produced allreduced [M, H] output
             assert self.post_attn_norm.scale is not None
