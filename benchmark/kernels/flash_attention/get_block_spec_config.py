@@ -195,7 +195,7 @@ def main():
                             )
 
     num_kv_pages_per_blk_config = [1, 2, 4, 8, 16, 32]
-    num_queries_per_block_config = [1, 2, 4, 8, 16, 32, 64, 128]
+    num_queries_per_block_config = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
 
     prefill_only_block_spec_configs = []
     for num_kv_pages_per_blk in num_kv_pages_per_blk_config:
