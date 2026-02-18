@@ -36,6 +36,7 @@ class DiffusionScheduler(SchedulerProfilerMixin):
         communication_backend: CommunicationBackend,
         model_class,
         stage_sub_dir: str | None = None,
+        precompile_params: dict | None = None,
     ):
         """Initialize the DiffusionScheduler.
 

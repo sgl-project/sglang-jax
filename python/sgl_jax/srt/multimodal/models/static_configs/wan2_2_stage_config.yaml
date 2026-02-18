@@ -10,6 +10,7 @@ stage_args:
    scheduler: auto_regressive
    final_output: false
    scheduler_params: {}
+   precompile_params: {"capture_hidden_mode": 2}
    model_class: UMT5EncoderModel
 
  - stage_id: 1

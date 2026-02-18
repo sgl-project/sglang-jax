@@ -9,7 +9,6 @@ import numpy as np
 
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason
 from sgl_jax.srt.multimodal.common.modality_enum import flatten_nested_list
-from sgl_jax.srt.multimodal.common.multimodal_util import ImageData
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -25,6 +24,12 @@ def has_valid_data(data) -> bool:
     if isinstance(data, list):
         return any(has_valid_data(item) for item in flatten_nested_list(data))
     return True
+
+
+@dataclass
+class ImageData:
+    url: str
+    detail: Literal["auto", "low", "high"] | None = "auto"
 
 
 @dataclass

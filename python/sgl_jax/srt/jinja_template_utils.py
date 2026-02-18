@@ -1,6 +1,6 @@
 import logging
 
-from sgl_jax.srt.multimodal.common.multimodal_util import ImageData
+from sgl_jax.srt.managers.io_struct import ImageData
 
 """
 Jinja template utilities for processing chat templates.

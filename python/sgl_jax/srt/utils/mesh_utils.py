@@ -4,6 +4,8 @@ import jax
 import numpy as np
 from jax._src import mesh_utils
 
+from sgl_jax.srt.utils.jax_utils import get_device_id_offset
+
 default_mesh_axes = [
     "data",  # data parallelism
     "tensor",  # tensor parallelism
@@ -24,10 +26,12 @@ def create_device_mesh(
     if devices is None:
         devices = jax.devices()
 
+    offset = get_device_id_offset(devices)
+
     if device_indexes is not None:
+        device_indexes = [idx + offset for idx in device_indexes]
         devices_dict = {device.id: device for device in devices}
         devices = [devices_dict.get(i) for i in list(set(device_indexes))]
-
     ici_parallelism = fill_unspecified_parallelism(ici_parallelism, len(devices))
     if num_slices > 1:
         dcn_parallelism = fill_unspecified_parallelism(dcn_parallelism, num_slices)

@@ -76,6 +76,8 @@ class ServerArgs:
     device_indexes: list[int] | None = None
     tp_size: int = 1
     ep_size: int = 1
+    ep_num_redundant_experts: int = 0
+    ep_dispatch_algorithm: str | None = None
     stream_interval: int = 1
     stream_output: bool = False
     random_seed: int | None = None
@@ -176,6 +178,13 @@ class ServerArgs:
     multimodal: bool = False
 
     enable_return_routed_experts: bool = False
+    enable_expert_balance_debug: bool = False
+    expert_balance_segment_counter: int = 100
+    expert_balance_output_file: str | None = None
+    init_expert_location: str = "trivial"
+    enable_expert_distribution_recorder: bool = False
+    expert_distribution_recorder_buffer_size: int = 100
+    expert_distribution_recorder_output_file: str | None = None
 
     def __post_init__(self):
         # Set missing default values
@@ -254,6 +263,20 @@ class ServerArgs:
             self.device_indexes = None
         if self.multimodal:
             self.model_path = download_from_hf(self.model_path, allow_patterns=None)
+
+        if self.ep_num_redundant_experts < 0:
+            raise ValueError("ep_num_redundant_experts must be non-negative")
+
+        if self.enable_expert_balance_debug and self.expert_balance_segment_counter <= 0:
+            raise ValueError("expert_balance_segment_counter must be positive")
+
+        if self.enable_expert_balance_debug and not self.expert_balance_output_file:
+            import datetime
+
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.expert_balance_output_file = os.path.join(
+                "debug_outputs", f"expert_balance_{timestamp}_{os.getpid()}.csv"
+            )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -568,6 +591,20 @@ class ServerArgs:
             help="The expert parallelism size",
         )
         parser.add_argument(
+            "--ep-num-redundant-experts",
+            type=int,
+            default=ServerArgs.ep_num_redundant_experts,
+            help="Number of redundant experts for EP load balancing. "
+            "Total physical experts = num_logical + this value.",
+        )
+        parser.add_argument(
+            "--ep-dispatch-algorithm",
+            type=str,
+            choices=["static", "dynamic", "fake"],
+            default=ServerArgs.ep_dispatch_algorithm,
+            help="Expert parallel dispatch algorithm.",
+        )
+        parser.add_argument(
             "--stream-interval",
             type=int,
             default=ServerArgs.stream_interval,
@@ -802,6 +839,45 @@ class ServerArgs:
             "--enable-precision-tracer",
             action="store_true",
             help="Enable precision tracer for debugging tensor values. May have performance impact.",
+        )
+        parser.add_argument(
+            "--enable-expert-balance-debug",
+            action="store_true",
+            help="Enable expert balance debug stats output (segment-based).",
+        )
+        parser.add_argument(
+            "--expert-balance-segment-counter",
+            type=int,
+            default=ServerArgs.expert_balance_segment_counter,
+            help="Segment size for expert balance stats (tokens or decode steps).",
+        )
+        parser.add_argument(
+            "--expert-balance-output-file",
+            type=str,
+            default=ServerArgs.expert_balance_output_file,
+            help="CSV output file path for expert balance stats.",
+        )
+        parser.add_argument(
+            "--init-expert-location",
+            type=str,
+            default=ServerArgs.init_expert_location,
+            help="Initial expert location mapping ('trivial' or file path).",
+        )
+        parser.add_argument(
+            "--enable-expert-distribution-recorder",
+            action="store_true",
+            help="Enable expert distribution recorder for EPLB.",
+        )
+        parser.add_argument(
+            "--expert-distribution-recorder-buffer-size",
+            type=int,
+            default=ServerArgs.expert_distribution_recorder_buffer_size,
+            help="Number of steps to buffer before dumping expert distribution.",
+        )
+        parser.add_argument(
+            "--expert-distribution-recorder-output-file",
+            type=str,
+            help="Output file path for expert distribution recorder (.npy).",
         )
 
         parser.add_argument(

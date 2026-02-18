@@ -144,7 +144,7 @@ class VitModelRunner(BaseModelRunner):
             image_grid_thw=batch.image_grid_thw,
             video_grid_thw=batch.video_grid_thw,
         )
-        mm_inputs = batch.vlm_inputs if isinstance(batch.vlm_inputs, dict) else None
+        mm_inputs = batch.omni_inputs if isinstance(batch.omni_inputs, dict) else None
         if mm_inputs is not None:
             input_ids = batch.input_ids or batch.origin_input_ids
             if input_ids is not None:

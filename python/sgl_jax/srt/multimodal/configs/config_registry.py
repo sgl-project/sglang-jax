@@ -452,7 +452,6 @@ def get_vae_config(model_path: str) -> WanVAEConfig:
 
 def get_qwen_vl_config(model_path: str) -> QwenVLModelVitConfig:
     """Convenience function to get Qwen vl config.
-
     Args:
         model_path: The model path from server args.
 

@@ -2,10 +2,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import jax
+import numpy as np
 import PIL.Image
 
 from sgl_jax.srt.managers.io_struct import BatchTokenIDOut, TokenizedGenerateReqInput
-from sgl_jax.srt.multimodal.manager.io_struct import DataType, VLMMInputs
+from sgl_jax.srt.multimodal.manager.io_struct import DataType, OmniInputs
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
 NegativePromptSuffix = "_negative"
@@ -65,8 +66,11 @@ class Req:
     prompt_template: dict[str, Any] | None = None
     do_classifier_free_guidance: bool = False
 
-    # VLM inputs/outputs
-    vlm_inputs: VLMMInputs | None = None
+    # Omni/VLM inputs/outputs
+    omni_inputs: OmniInputs | None = None
+    audio_features: jax.Array | np.ndarray | None = None
+    pixel_values_images: jax.Array | np.ndarray | None = None
+    pixel_values_videos: jax.Array | np.ndarray | None = None
     vision_embeds: jax.Array | None = None
     input_embeds: jax.Array | None = None
     image_grid_thw: tuple | None = None
@@ -167,10 +171,10 @@ class Req:
 
     def to_stage_reqs(self, scheduler: str):
         if scheduler == "auto_regressive":
-            is_vlm_request = (
-                self.vlm_inputs is not None or self.extra.get("sampling_params") is not None
+            is_omni_request = (
+                self.omni_inputs is not None or self.extra.get("sampling_params") is not None
             )
-            if is_vlm_request:
+            if is_omni_request:
                 params = self.extra.get("sampling_params")
                 if isinstance(params, SamplingParams):
                     sampling_params = params
@@ -190,7 +194,7 @@ class Req:
                     sampling_params=sampling_params,
                     stream=bool(self.extra.get("stream", False)),
                 )
-                tokenized_req.mm_inputs = self.vlm_inputs
+                tokenized_req.mm_inputs = self.omni_inputs
                 return [tokenized_req]
             return [
                 TokenizedGenerateReqInput(

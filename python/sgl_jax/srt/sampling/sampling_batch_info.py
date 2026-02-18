@@ -218,9 +218,10 @@ def _get_or_create_zero_penalty_device(
     """
 
     key_shape = (int(shape[0]), int(shape[1]))
+    cache_key = (int(shape[0]), int(shape[1]), sharding if sharding is not None else "None")
 
     with _zero_linear_penalty_lock:
-        cached = _zero_linear_penalty_cache.get(key_shape)
+        cached = _zero_linear_penalty_cache.get(cache_key)
     if cached is not None:
         return cached
 
@@ -230,9 +231,9 @@ def _get_or_create_zero_penalty_device(
     )
 
     with _zero_linear_penalty_lock:
-        existing = _zero_linear_penalty_cache.get(key_shape)
+        existing = _zero_linear_penalty_cache.get(cache_key)
         if existing is None:
-            _zero_linear_penalty_cache[key_shape] = zero_penalty
+            _zero_linear_penalty_cache[cache_key] = zero_penalty
             return zero_penalty
         return existing
 

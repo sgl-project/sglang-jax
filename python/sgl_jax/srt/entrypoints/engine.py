@@ -663,7 +663,6 @@ def _launch_threads(
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
         logger.info("server_args=%s", server_args)
-
     # If using model from www.modelscope.cn, first download the model.
     server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
         server_args.model_path, server_args.tokenizer_path

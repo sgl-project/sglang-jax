@@ -18,7 +18,7 @@ from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
     fused_ep_moe,
     ref_moe,
 )
-from sgl_jax.srt.layers.moe import create_moe_weights_mapping
+from sgl_jax.srt.layers.moe import TopK, create_moe_weights_mapping
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 from sgl_jax.test.test_utils import create_device_mesh
 
@@ -235,18 +235,24 @@ class MoEKernelTest(jtu.JaxTestCase):
                 bse=cast(int, bse),
             )
 
+        topk_module = TopK(
+            topk=top_k,
+            renormalize=renormalize_topk_logits,
+            num_expert_group=num_groups,
+            topk_group=top_k_groups,
+        )
+
+        topk_weights, topk_ids = topk_module(gating_output)
+
         actual = fused_ep_moe(
             mesh=self.mesh,
             tokens=a,
             w1=w1,
             w2=w2,
             w3=w3,
-            gating_output=gating_output,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             top_k=top_k,
-            use_grouped_topk=use_grouped_topk,
-            num_groups=num_groups,
-            top_k_groups=top_k_groups,
-            renormalize_topk_logits=renormalize_topk_logits,
             act_fn=act_fn,
             subc_quant_wsz=subc_quant_wsz,
             w1_scale=w1_scale,
@@ -706,15 +712,21 @@ class MoEKernelTest(jtu.JaxTestCase):
         if num_tokens % ep_size != 0:
             self.skipTest(f"num_tokens ({num_tokens}) must be divisible by ep_size ({ep_size}).")
 
+        topk_module = TopK(
+            topk=top_k,
+            renormalize=False,
+        )
+        topk_weights, topk_ids = topk_module(router_logits)
+
         actual = fused_ep_moe(
             mesh=mesh,
             tokens=tokens,
             w1=w1,
             w2=w2,
             w3=w3,
-            gating_output=router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             top_k=top_k,
-            renormalize_topk_logits=False,
             act_fn="silu",
             w1_shared=w1_shared,
             w2_shared=w2_shared,

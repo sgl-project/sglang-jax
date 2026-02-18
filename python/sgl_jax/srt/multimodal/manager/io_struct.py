@@ -91,14 +91,15 @@ class GenerateMMReqInput:
 
 
 @dataclasses.dataclass
-class GenerateVLMReqInput:
-    """Input request for VLM chat/completions."""
+class GenerateOmniReqInput:
+    """Input request for Omni/VLM chat/completions."""
 
     rid: str | None = None
     prompt: str | None = None
     input_ids: list[int] | None = None
     image_data: list[str] | str | None = None
     video_data: list[str] | str | None = None
+    audio_data: list[str] | str | None = None
     stream: bool = False
     n: int | None = 1
     sampling_params: dict | None = None
@@ -120,7 +121,7 @@ class TokenizedGenerateMMReqInput:
     n: int | None = 1
     input_reference: str | None = None
     preprocessed_image: np.ndarray | None = None
-    mm_inputs: "VLMMInputs | None" = None
+    mm_inputs: "OmniInputs | None" = None
     size: str = None
     seconds: int | None = None
     fps: int | None = None
@@ -133,11 +134,11 @@ class TokenizedGenerateMMReqInput:
 
 
 @dataclasses.dataclass
-class TokenizedGenerateVLMReqInput:
+class TokenizedGenerateOmniReqInput:
     rid: str | None = None
     prompt: str | None = None
     input_ids: list[int] | None = None
-    mm_inputs: "VLMMInputs | None" = None
+    mm_inputs: "OmniInputs | None" = None
     stream: bool = False
     n: int | None = 1
     sampling_params: dict | None = None
@@ -145,7 +146,9 @@ class TokenizedGenerateVLMReqInput:
 
 
 @dataclasses.dataclass
-class VLMMInputs:
+class OmniInputs:
+    audio_features: np.ndarray | None = None
+    audio_feature_lengths: list[int] | None = None
     pixel_values: np.ndarray | None = None
     pixel_values_videos: np.ndarray | None = None
     image_grid_thw: list[tuple[int, int, int]] | None = None
@@ -157,3 +160,5 @@ class VLMMInputs:
     video_token_id: int | None = None
     pad_values: list[int] | None = None
     multimodal_embeddings: np.ndarray | None = None
+    deepstack_visual_embedding: np.ndarray | None = None
+    deepstack_visual_pos_mask: np.ndarray | None = None

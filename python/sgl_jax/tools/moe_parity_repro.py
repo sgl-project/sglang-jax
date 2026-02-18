@@ -1335,6 +1335,7 @@ def main() -> int:
     )
 
     # Match end-to-end epmoe selection logic (BailingMoE uses TopK module).
+    print("compute topk weights/ids")
     topk = TopK(
         topk=args.top_k,
         renormalize=args.renormalize_topk_logits,
@@ -1382,6 +1383,7 @@ def main() -> int:
             )
         )
 
+    print("load epmoe weights")
     # Put MoE weights on device with the intended sharding to avoid a large replicated
     # array on a single device (important for FP8 quantization to not OOM).
     expert_w_np = np.asarray(wi_0_np).dtype if use_static else ml_dtypes.bfloat16
@@ -1413,6 +1415,7 @@ def main() -> int:
         fused_w_sharding,
     )
 
+    print("load fused weights")
     # Optional shared experts for BailingMoE: HF stores (out, in), transpose to match JAX shapes.
     # - Fused kernel expects these replicated (P()).
     # - EPMoE end-to-end computes shared_experts via MLP (BF16 or static FP8 QuantizedLinear).
@@ -1536,12 +1539,14 @@ def main() -> int:
                 "keys were not found; fused shared path may be incorrect."
             )
 
+    print("load epmoe params")
     # Replace randomly initialized params with checkpoint slice.
     with jax.sharding.use_abstract_mesh(epmoe.updated_mesh):
         epmoe.wi_0 = nnx.Param(wi_0, out_sharding=P("expert", "tensor", None))
         epmoe.wi_1 = nnx.Param(wi_1, out_sharding=P("expert", "tensor", None))
         epmoe.wo = nnx.Param(wo, out_sharding=P("expert", None, "tensor"))
 
+    print("load epmoe scales")
     if use_static:
         wi_0_scale_np, wi_1_scale_np, wo_scale_np = static_scales
         subc_quant_wsz = 256
@@ -1617,20 +1622,16 @@ def main() -> int:
         call_w2_shared_scale = None
         call_w3_shared_scale = None
 
+    print("run fused_ep_moe")
     fused_out = fused_ep_moe(
         mesh=mesh,
         tokens=tokens,
         w1=w1,
         w2=w2,
         w3=w3,
-        gating_output=router_logits,
-        bias=router_bias,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
         top_k=args.top_k,
-        use_grouped_topk=args.use_grouped_topk,
-        num_groups=args.num_groups,
-        top_k_groups=args.top_k_groups,
-        renormalize_topk_logits=args.renormalize_topk_logits,
-        routed_scaling_factor=args.routed_scaling_factor,
         act_fn=args.act_fn,
         subc_quant_wsz=subc_quant_wsz,
         w1_scale=w1_scale,
@@ -1645,26 +1646,24 @@ def main() -> int:
         tp_axis_name="tensor",
     )
     fused_out_no_shared = None
+    fused_out_only_shared = None
     if has_shared:
         # Keep the same call signature (shared args are not None) to avoid extra compilation;
         # pass zeros to isolate the shared-expert contribution inside fused_ep_moe.
         z_w1_shared = jnp.zeros_like(w1_shared_fused)
         z_w2_shared = jnp.zeros_like(w2_shared_fused)
         z_w3_shared = jnp.zeros_like(w3_shared_fused)
+
+        # 1. Run with Shared=0 to get pure Expert output
         fused_out_no_shared = fused_ep_moe(
             mesh=mesh,
             tokens=tokens,
             w1=w1,
             w2=w2,
             w3=w3,
-            gating_output=router_logits,
-            bias=router_bias,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             top_k=args.top_k,
-            use_grouped_topk=args.use_grouped_topk,
-            num_groups=args.num_groups,
-            top_k_groups=args.top_k_groups,
-            renormalize_topk_logits=args.renormalize_topk_logits,
-            routed_scaling_factor=args.routed_scaling_factor,
             act_fn=args.act_fn,
             subc_quant_wsz=subc_quant_wsz,
             w1_scale=w1_scale,
@@ -1678,8 +1677,34 @@ def main() -> int:
             w3_shared_scale=None,
             tp_axis_name="tensor",
         )
+
+        # 2. Run with ExpertWeights=0 to get pure Shared output (isolate logic bug from rounding noise)
+        z_topk_weights = jnp.zeros_like(topk_weights)
+        fused_out_only_shared = fused_ep_moe(
+            mesh=mesh,
+            tokens=tokens,
+            w1=w1,
+            w2=w2,
+            w3=w3,
+            topk_weights=z_topk_weights,
+            topk_ids=topk_ids,
+            top_k=args.top_k,
+            act_fn=args.act_fn,
+            subc_quant_wsz=subc_quant_wsz,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w3_scale=w3_scale,
+            w1_shared=call_w1_shared,
+            w2_shared=call_w2_shared,
+            w3_shared=call_w3_shared,
+            w1_shared_scale=call_w1_shared_scale,
+            w2_shared_scale=call_w2_shared_scale,
+            w3_shared_scale=call_w3_shared_scale,
+            tp_axis_name="tensor",
+        )
     # EPMoE uses `jax.sharding.reshard` under an ("expert","tensor") abstract mesh and
     # needs a concrete mesh context for device assignment.
+    print("run epmoe")
     with jax.set_mesh(epmoe.moe_mesh):
         ep_out_expert = epmoe(tokens, topk_weights, topk_ids)
         ep_out = ep_out_expert
@@ -1723,13 +1748,24 @@ def main() -> int:
         fused_out = (fused_out.astype(jnp.float32) + shared_out.astype(jnp.float32)).astype(
             jnp.bfloat16
         )
-
+    # fused_out = jax.sharding.reshard(fused_out, NamedSharding(mesh, P(None)))
+    # if fused_out_no_shared is not None:
+    #     fused_out_no_shared = jax.sharding.reshard(
+    #         fused_out_no_shared, NamedSharding(mesh, P(None))
+    #     )
+    print("reshape fused out")
     fused_np = np.asarray(jax.device_get(fused_out))
     fused_no_shared_np = (
         None if fused_out_no_shared is None else np.asarray(jax.device_get(fused_out_no_shared))
     )
+    fused_only_shared_np = (
+        None if fused_out_only_shared is None else np.asarray(jax.device_get(fused_out_only_shared))
+    )
+    # ep_out = jax.sharding.reshard(ep_out, NamedSharding(mesh, P(None)))
     ep_np = np.asarray(jax.device_get(ep_out))
     ep_expert_np = np.asarray(jax.device_get(ep_out_expert))
+    fused_shared_np = None
+    shared_np = None
 
     stats = _describe_diff(fused_np, ep_np)
     print(
@@ -1738,6 +1774,7 @@ def main() -> int:
     if has_shared and fused_no_shared_np is not None and shared_out is not None:
         expert_stats = _describe_diff(fused_no_shared_np, ep_expert_np)
         fused_shared_np = fused_np.astype(np.float32) - fused_no_shared_np.astype(np.float32)
+        # shared_out = jax.sharding.reshard(shared_out, NamedSharding(mesh, P(None)))
         shared_np = np.asarray(jax.device_get(shared_out)).astype(np.float32)
         shared_stats = _describe_diff(fused_shared_np, shared_np)
         print(
@@ -1750,6 +1787,20 @@ def main() -> int:
             + " ".join(f"{k}={v:.6g}" for k, v in shared_stats.items())
             + f" shape={shared_np.shape}"
         )
+        if fused_only_shared_np is not None:
+            fused_only_shared_f32 = fused_only_shared_np.astype(np.float32)
+            shared_only_stats = _describe_diff(fused_only_shared_f32, shared_np)
+            shared_sub_vs_only_stats = _describe_diff(fused_shared_np, fused_only_shared_f32)
+            print(
+                "[diff.shared_only] "
+                + " ".join(f"{k}={v:.6g}" for k, v in shared_only_stats.items())
+                + f" shape={fused_only_shared_f32.shape}"
+            )
+            print(
+                "[diff.shared_sub_vs_only] "
+                + " ".join(f"{k}={v:.6g}" for k, v in shared_sub_vs_only_stats.items())
+                + f" shape={fused_only_shared_f32.shape}"
+            )
 
     if args.dump_shared_intermediates:
         if not has_shared or fused_no_shared_np is None or shared_out is None:
@@ -1800,6 +1851,11 @@ def main() -> int:
                 )
 
             fused_shared_out = fused_np.astype(np.float32) - fused_no_shared_np.astype(np.float32)
+            fused_only_shared_out = (
+                None
+                if fused_only_shared_np is None
+                else fused_only_shared_np.astype(np.float32, copy=False)
+            )
             ep_a1 = np.asarray(jax.device_get(ep_shared_int["a1"])).astype(np.float32)
             ep_a2 = np.asarray(jax.device_get(ep_shared_int["a2"])).astype(np.float32)
             ep_inter = np.asarray(jax.device_get(ep_shared_int["inter"])).astype(np.float32)
@@ -1875,6 +1931,7 @@ def main() -> int:
             np.savez(
                 args.dump_shared_intermediates,
                 fused_shared_out=fused_shared_out,
+                fused_only_shared_out=fused_only_shared_out,
                 ep_shared_a1=ep_a1,
                 ep_shared_a2=ep_a2,
                 ep_shared_inter=ep_inter,
@@ -1949,11 +2006,14 @@ def main() -> int:
             topk_weights=np.asarray(jax.device_get(topk_weights)),
             topk_ids=np.asarray(jax.device_get(topk_ids)),
             fused_out=fused_np,
+            fused_out_no_shared=fused_no_shared_np,
+            fused_out_only_shared=fused_only_shared_np,
+            fused_shared_out=fused_shared_np,
             ep_out=ep_np,
             wi_0=np.asarray(wi_0_np),
             wi_1=np.asarray(wi_1_np),
             wo=np.asarray(wo_np),
-            shared_out=(None if shared_out is None else np.asarray(jax.device_get(shared_out))),
+            shared_out=shared_np,
             meta=np.asarray(
                 {
                     "prefix": hf_keys.prefix,
