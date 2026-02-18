@@ -191,6 +191,8 @@ class ServerArgs:
     multi_item_enable_score_from_cache_v2: bool = False
     # Number of items executed per internal fastpath step.
     multi_item_score_from_cache_v2_items_per_step: int = 64
+    # Compute score probabilities from label-only logprobs in fastpath v2.
+    multi_item_score_label_only_logprob: bool = False
     # Emit per-request score-path metrics to logs.
     multi_item_score_fastpath_log_metrics: bool = False
     # Allow radix cache specifically for scoring requests.
@@ -1033,6 +1035,14 @@ class ServerArgs:
             help="Internal chunk size for score-from-cache v2 fastpath.",
         )
         parser.add_argument(
+            "--multi-item-score-label-only-logprob",
+            action="store_true",
+            help=(
+                "Use label-only logprob math in score-from-cache v2 "
+                "(logit[label]-logsumexp(logits))."
+            ),
+        )
+        parser.add_argument(
             "--multi-item-score-fastpath-log-metrics",
             action="store_true",
             help="Emit per-/v1/score path metrics including fastpath counters and timings.",
@@ -1241,6 +1251,11 @@ class ServerArgs:
                 assert self.enable_scoring_cache, (
                     "score-from-cache v2 requires scoring cache. "
                     "Please pass --enable-scoring-cache."
+                )
+            if self.multi_item_score_label_only_logprob:
+                assert self.multi_item_enable_score_from_cache_v2, (
+                    "label-only logprob mode requires score-from-cache v2. "
+                    "Please pass --multi-item-enable-score-from-cache-v2."
                 )
 
     def check_lora_server_args(self):

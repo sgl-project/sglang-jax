@@ -21,6 +21,10 @@ import pathwaysutils
 import psutil
 import setproctitle
 import zmq
+from jax import numpy as jnp
+from jax.scipy import special as jsp
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -107,6 +111,15 @@ class SendDataError(Exception):
 
 class ReceiveDataError(Exception):
     pass
+
+
+@jax.jit(static_argnums=(2,))
+def _compute_label_only_logprobs(next_token_logits, label_token_ids_arr, out_sharding):
+    """Compute target-only logprobs for [batch, vocab] logits."""
+    logits_f32 = next_token_logits.astype(jnp.float32)
+    label_logits = logits_f32.at[:, label_token_ids_arr].get(out_sharding=out_sharding)
+    normalizer = jsp.logsumexp(logits_f32, axis=-1, keepdims=True)
+    return label_logits - normalizer
 
 
 @dataclass
@@ -850,6 +863,13 @@ class Scheduler(
             return False, "unsupported_shape", "label_token_ids must be a non-empty list."
         if any((not isinstance(token_id, int)) for token_id in recv_req.label_token_ids):
             return False, "unsupported_shape", "label_token_ids must contain ints."
+        for token_id in recv_req.label_token_ids:
+            if token_id < 0 or token_id >= self.model_config.vocab_size:
+                return (
+                    False,
+                    "unsupported_shape",
+                    f"label_token_ids must be in [0, {self.model_config.vocab_size - 1}].",
+                )
         for idx, item in enumerate(recv_req.items_2d):
             if not isinstance(item, list):
                 return (
@@ -942,54 +962,16 @@ class Scheduler(
         prefix_ids: list[int],
         cached_extra_key: str | None,
     ) -> tuple[list[list[float]], float, float]:
-        reqs: list[Req] = []
-        for local_idx, item_ids in enumerate(chunk_items):
-            sampling_params = SamplingParams(max_new_tokens=0)
-            sampling_params.normalize(self.tokenizer)
-            sampling_params.verify(self.model_config.vocab_size)
-
-            rid = f"{cache_handle}-scorev2-{local_idx}-{time.time_ns()}"
-            req = Req(
-                rid=rid,
-                origin_input_text=None,
-                origin_input_ids=prefix_ids + item_ids,
-                sampling_params=sampling_params,
-                return_logprob=True,
-                return_output_logprob_only=False,
-                top_logprobs_num=0,
-                token_ids_logprob=label_token_ids,
-                stream=False,
-                extra_key=cached_extra_key,
-                eos_token_ids=self.model_config.hf_eos_token_id,
-                vocab_size=self.model_config.vocab_size,
-                is_multi_item_scoring=False,
-                cache_for_scoring=False,
-                extend_from_cache=cache_handle,
-            )
-            req.tokenizer = self.tokenizer
-            req.logprob_start_len = len(req.origin_input_ids) - 1
-            req.sampling_params.max_new_tokens = min(
-                (
-                    req.sampling_params.max_new_tokens
-                    if req.sampling_params.max_new_tokens is not None
-                    else 1 << 30
-                ),
-                self.max_req_len - len(req.origin_input_ids) - 1,
-            )
-            req.cached_last_node = cached_last_node
-            req.cached_last_host_node = cached_last_node
-            req.cached_prefix_indices = cached_prefix_indices
-            req.cached_host_hit_length = 0
-
-            error_msg = validate_input_length(
-                req,
-                self.max_req_input_len,
-                self.server_args.allow_auto_truncate,
-            )
-            if error_msg:
-                raise ValueError(error_msg)
-            req.init_next_round_input(self.tree_cache)
-            reqs.append(req)
+        reqs = self._build_score_from_cache_v2_chunk_reqs(
+            cache_handle=cache_handle,
+            chunk_items=chunk_items,
+            label_token_ids=label_token_ids,
+            cached_last_node=cached_last_node,
+            cached_prefix_indices=cached_prefix_indices,
+            prefix_ids=prefix_ids,
+            cached_extra_key=cached_extra_key,
+            return_label_logprobs=True,
+        )
 
         try:
             batch = ScheduleBatch.init_new(
@@ -1058,6 +1040,181 @@ class Scheduler(
             self._cleanup_failed_score_from_cache_v2_chunk(reqs)
             raise
 
+    def _build_score_from_cache_v2_chunk_reqs(
+        self,
+        cache_handle: str,
+        chunk_items: list[list[int]],
+        label_token_ids: list[int],
+        cached_last_node,
+        cached_prefix_indices,
+        prefix_ids: list[int],
+        cached_extra_key: str | None,
+        return_label_logprobs: bool,
+    ) -> list[Req]:
+        reqs: list[Req] = []
+        for local_idx, item_ids in enumerate(chunk_items):
+            sampling_params = SamplingParams(max_new_tokens=0)
+            sampling_params.normalize(self.tokenizer)
+            sampling_params.verify(self.model_config.vocab_size)
+
+            rid = f"{cache_handle}-scorev2-{local_idx}-{time.time_ns()}"
+            req = Req(
+                rid=rid,
+                origin_input_text=None,
+                origin_input_ids=prefix_ids + item_ids,
+                sampling_params=sampling_params,
+                return_logprob=return_label_logprobs,
+                return_output_logprob_only=False,
+                top_logprobs_num=0,
+                token_ids_logprob=label_token_ids if return_label_logprobs else None,
+                stream=False,
+                extra_key=cached_extra_key,
+                eos_token_ids=self.model_config.hf_eos_token_id,
+                vocab_size=self.model_config.vocab_size,
+                is_multi_item_scoring=False,
+                cache_for_scoring=False,
+                extend_from_cache=cache_handle,
+            )
+            req.tokenizer = self.tokenizer
+            req.logprob_start_len = len(req.origin_input_ids) - 1
+            req.sampling_params.max_new_tokens = min(
+                (
+                    req.sampling_params.max_new_tokens
+                    if req.sampling_params.max_new_tokens is not None
+                    else 1 << 30
+                ),
+                self.max_req_len - len(req.origin_input_ids) - 1,
+            )
+            req.cached_last_node = cached_last_node
+            req.cached_last_host_node = cached_last_node
+            req.cached_prefix_indices = cached_prefix_indices
+            req.cached_host_hit_length = 0
+
+            error_msg = validate_input_length(
+                req,
+                self.max_req_input_len,
+                self.server_args.allow_auto_truncate,
+            )
+            if error_msg:
+                raise ValueError(error_msg)
+            req.init_next_round_input(self.tree_cache)
+            reqs.append(req)
+        return reqs
+
+    def _run_score_from_cache_v2_chunk_label_only(
+        self,
+        cache_handle: str,
+        chunk_items: list[list[int]],
+        label_token_ids: list[int],
+        label_token_ids_arr: jax.Array,
+        apply_softmax: bool,
+        cached_last_node,
+        cached_prefix_indices,
+        prefix_ids: list[int],
+        cached_extra_key: str | None,
+    ) -> tuple[list[list[float]], float, float]:
+        reqs = self._build_score_from_cache_v2_chunk_reqs(
+            cache_handle=cache_handle,
+            chunk_items=chunk_items,
+            label_token_ids=label_token_ids,
+            cached_last_node=cached_last_node,
+            cached_prefix_indices=cached_prefix_indices,
+            prefix_ids=prefix_ids,
+            cached_extra_key=cached_extra_key,
+            return_label_logprobs=False,
+        )
+        try:
+            chunk_wall_start = time.perf_counter()
+            batch = ScheduleBatch.init_new(
+                reqs=reqs,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tree_cache=self.tree_cache,
+                model_config=self.model_config,
+                enable_overlap=self.enable_overlap,
+                spec_algorithm=self.spec_algorithm,
+                enable_custom_logit_processor=False,
+                chunked_req=None,
+                mesh=self.mesh,
+            )
+            batch.prepare_for_extend()
+            batch.bid = acc_global_bid()
+            (
+                precompile_token_paddings,
+                precompile_bs_paddings,
+                precompile_cache_loc_paddings,
+            ) = self.tp_worker.get_precompile_paddings()
+            model_worker_batch = batch.get_model_worker_batch(
+                precompile_token_paddings,
+                precompile_bs_paddings,
+                precompile_cache_loc_paddings,
+                self.page_size,
+                self.server_args.enable_static_lora,
+            )
+
+            forward_start = time.perf_counter()
+            logits_output, _, _ = self.tp_worker.forward_batch_generation(
+                model_worker_batch=model_worker_batch,
+                launch_done=None,
+                skip_sample=True,
+                sampling_metadata=None,
+            )
+
+            if logits_output is None or logits_output.next_token_logits is None:
+                raise RuntimeError(
+                    "Missing next_token_logits from score-from-cache v2 label-only chunk."
+                )
+
+            next_token_logits = logits_output.next_token_logits[: model_worker_batch.real_bs, :]
+            out_sharding = NamedSharding(self.mesh, P(None, None))
+            row_logprobs_dev = _compute_label_only_logprobs(
+                next_token_logits,
+                label_token_ids_arr,
+                out_sharding,
+            )
+            row_logprobs_dev.block_until_ready()
+            forward_end = time.perf_counter()
+            row_logprobs = np.asarray(jax.device_get(row_logprobs_dev), dtype=np.float64)
+
+            if row_logprobs.ndim != 2:
+                raise RuntimeError(
+                    f"Unexpected label-only logprob shape: {row_logprobs.shape}."
+                )
+            if row_logprobs.shape[0] != len(reqs):
+                raise RuntimeError(
+                    f"Chunk output rows ({row_logprobs.shape[0]}) != request count ({len(reqs)})."
+                )
+            if row_logprobs.shape[1] != len(label_token_ids):
+                raise RuntimeError(
+                    f"Chunk output labels ({row_logprobs.shape[1]}) != requested label count ({len(label_token_ids)})."
+                )
+
+            # Align with baseline v2 semantics: raw values are token probabilities
+            # (not normalized across label ids). Apply optional softmax on those
+            # raw probability values only when requested.
+            token_prob_vals = np.exp(row_logprobs)
+            if apply_softmax:
+                row_max = np.max(token_prob_vals, axis=1, keepdims=True)
+                stable = token_prob_vals - row_max
+                exp_vals = np.exp(stable)
+                denom = np.sum(exp_vals, axis=1, keepdims=True)
+                scores_np = exp_vals / denom
+            else:
+                scores_np = token_prob_vals
+            scores = scores_np.tolist()
+
+            for req in reqs:
+                self.tree_cache.cache_finished_req(req)
+                req.req_pool_idx = None
+
+            chunk_device_compute_s = max(0.0, forward_end - forward_start)
+            chunk_total_s = max(0.0, time.perf_counter() - chunk_wall_start)
+            chunk_host_overhead_s = max(0.0, chunk_total_s - chunk_device_compute_s)
+            return scores, chunk_device_compute_s, chunk_host_overhead_s
+        except Exception:
+            self._cleanup_failed_score_from_cache_v2_chunk(reqs)
+            raise
+
     def score_from_cache_v2(self, recv_req: ScoreFromCacheReqInput) -> ScoreFromCacheReqOutput:
         self.score_from_cache_v2_attempted += 1
         dispatch_count = 0
@@ -1105,6 +1262,21 @@ class Scheduler(
                     reason="missing_cache_handle",
                     error_msg=f"Scoring cache handle '{recv_req.cache_handle}' has no radix node.",
                 )
+
+            label_only_logprob = bool(
+                getattr(self.server_args, "multi_item_score_label_only_logprob", False)
+            )
+            if label_only_logprob:
+                backend = str(getattr(self.server_args, "device", "")).lower()
+                if backend not in {"tpu", "gpu", "cuda", "cpu"}:
+                    return self._score_from_cache_v2_fallback_output(
+                        recv_req,
+                        reason="unsupported_backend",
+                        error_msg=(
+                            "Label-only logprob fastpath requires TPU/GPU/CPU backend, "
+                            f"got device={backend!r}."
+                        ),
+                    )
 
             items_per_step = int(recv_req.items_per_step or 0)
             default_items_per_step = int(
@@ -1165,6 +1337,10 @@ class Scheduler(
                     host_orchestration_s=0.0,
                 )
 
+            label_token_ids_arr = None
+            if label_only_logprob:
+                label_token_ids_arr = jnp.asarray(recv_req.label_token_ids, dtype=jnp.int32)
+
             for start in range(0, total_items, items_per_step):
                 chunk_items = recv_req.items_2d[start : start + items_per_step]
                 if not chunk_items:
@@ -1201,18 +1377,33 @@ class Scheduler(
                     queue_wait_s = max(0.0, time.perf_counter() - score_start)
                     first_dispatch_started = True
                 chunk_host_start = time.perf_counter()
-                chunk_scores, chunk_device_compute_s, chunk_host_overhead_s = (
-                    self._run_score_from_cache_v2_chunk(
-                        cache_handle=recv_req.cache_handle,
-                        chunk_items=chunk_items,
-                        label_token_ids=recv_req.label_token_ids,
-                        apply_softmax=recv_req.apply_softmax,
-                        cached_last_node=cached_last_node,
-                        cached_prefix_indices=prefix_indices,
-                        prefix_ids=prefix_ids,
-                        cached_extra_key=cached_extra_key,
+                if label_only_logprob:
+                    chunk_scores, chunk_device_compute_s, chunk_host_overhead_s = (
+                        self._run_score_from_cache_v2_chunk_label_only(
+                            cache_handle=recv_req.cache_handle,
+                            chunk_items=chunk_items,
+                            label_token_ids=recv_req.label_token_ids,
+                            label_token_ids_arr=label_token_ids_arr,
+                            apply_softmax=recv_req.apply_softmax,
+                            cached_last_node=cached_last_node,
+                            cached_prefix_indices=prefix_indices,
+                            prefix_ids=prefix_ids,
+                            cached_extra_key=cached_extra_key,
+                        )
                     )
-                )
+                else:
+                    chunk_scores, chunk_device_compute_s, chunk_host_overhead_s = (
+                        self._run_score_from_cache_v2_chunk(
+                            cache_handle=recv_req.cache_handle,
+                            chunk_items=chunk_items,
+                            label_token_ids=recv_req.label_token_ids,
+                            apply_softmax=recv_req.apply_softmax,
+                            cached_last_node=cached_last_node,
+                            cached_prefix_indices=prefix_indices,
+                            prefix_ids=prefix_ids,
+                            cached_extra_key=cached_extra_key,
+                        )
+                    )
                 all_scores.extend(chunk_scores)
                 dispatch_count += 1
                 device_compute_s += max(0.0, chunk_device_compute_s)

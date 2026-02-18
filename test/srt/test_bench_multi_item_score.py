@@ -55,6 +55,41 @@ def _parse_int_list_env(name: str, default: list[int]) -> list[int]:
     return values
 
 
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _pick_benchmark_model_path() -> str:
+    local_path = "/models/Qwen/Qwen3-0.6B"
+    if os.path.isdir(local_path):
+        return local_path
+    return "Qwen/Qwen3-0.6B"
+
+
+def _pick_benchmark_download_dir() -> str:
+    override = os.getenv("MULTI_ITEM_BENCH_DOWNLOAD_DIR")
+    if override:
+        os.makedirs(override, exist_ok=True)
+        return override
+
+    candidates = [
+        "/data/huggingface_models",
+        os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub"),
+        "/tmp/huggingface_models",
+    ]
+    for path in candidates:
+        try:
+            os.makedirs(path, exist_ok=True)
+            if os.access(path, os.W_OK):
+                return path
+        except OSError:
+            continue
+    return candidates[-1]
+
+
 # =============================================================================
 # Test Class
 # =============================================================================
@@ -65,7 +100,9 @@ class TestMultiItemScorePerformance(CustomTestCase):
     Benchmarks comparing single-item scoring with multi-item scoring.
     """
 
-    model_name = "/models/Qwen/Qwen3-0.6B"
+    model_name = _pick_benchmark_model_path()
+    download_dir = _pick_benchmark_download_dir()
+    LOG_LEVEL = os.getenv("MULTI_ITEM_BENCH_LOG_LEVEL", "error")
     engine = None
     tokenizer = None
     label_token_ids = [198]  # '\n' token or similar common token
@@ -100,7 +137,7 @@ class TestMultiItemScorePerformance(CustomTestCase):
             mem_fraction_static=0.7,  # Leave room for compilation
             max_prefill_tokens=32768,  # Support large packed sequences
             chunked_prefill_size=-1,
-            download_dir="/data/huggingface_models",  # Use GCS mount
+            download_dir=cls.download_dir,
             dtype="bfloat16",
             precompile_bs_paddings=[1, 4, 8, 16, 32],
             max_running_requests=32,
@@ -115,6 +152,7 @@ class TestMultiItemScorePerformance(CustomTestCase):
             max_multi_item_seq_len=32768,
             multi_item_mask_impl=cls.MASK_IMPL,
             multi_item_segment_fallback_threshold=cls.SEGMENT_FALLBACK_THRESHOLD,
+            log_level=cls.LOG_LEVEL,
         )
 
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model_name, trust_remote_code=True)
@@ -367,7 +405,9 @@ class TestMultiItemPrefillExtendPerformance(CustomTestCase):
     Benchmarks for multi-item scoring using prefill+extend mode.
     """
 
-    model_name = "/models/Qwen/Qwen3-0.6B"
+    model_name = _pick_benchmark_model_path()
+    download_dir = _pick_benchmark_download_dir()
+    LOG_LEVEL = os.getenv("MULTI_ITEM_BENCH_LOG_LEVEL", "error")
     engine = None
     label_token_ids = [198]
 
@@ -385,6 +425,15 @@ class TestMultiItemPrefillExtendPerformance(CustomTestCase):
         "MULTI_ITEM_EXTEND_PRECOMPILE_BS_PADDINGS",
         [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
     )
+    ENABLE_SCORE_FROM_CACHE_V2 = _parse_bool_env("MULTI_ITEM_ENABLE_SCORE_FROM_CACHE_V2", False)
+    DISABLE_OVERLAP_SCHEDULE = _parse_bool_env(
+        "MULTI_ITEM_DISABLE_OVERLAP_SCHEDULE", ENABLE_SCORE_FROM_CACHE_V2
+    )
+    SCORE_FROM_CACHE_V2_ITEMS_PER_STEP = int(
+        os.getenv("MULTI_ITEM_SCORE_FROM_CACHE_V2_ITEMS_PER_STEP", "64")
+    )
+    SCORE_FASTPATH_LOG_METRICS = _parse_bool_env("MULTI_ITEM_SCORE_FASTPATH_LOG_METRICS", False)
+    SCORE_LABEL_ONLY_LOGPROB = _parse_bool_env("MULTI_ITEM_SCORE_LABEL_ONLY_LOGPROB", False)
     WARMUP_RUNS = int(os.getenv("MULTI_ITEM_BENCH_WARMUP_RUNS", "3"))
     TIMED_RUNS = int(os.getenv("MULTI_ITEM_BENCH_TIMED_RUNS", "4"))
 
@@ -401,7 +450,7 @@ class TestMultiItemPrefillExtendPerformance(CustomTestCase):
             mem_fraction_static=0.7,
             max_prefill_tokens=32768,
             chunked_prefill_size=-1,
-            download_dir="/data/huggingface_models",
+            download_dir=cls.download_dir,
             dtype="bfloat16",
             precompile_bs_paddings=cls.PREFILL_EXTEND_PRECOMPILE_BS_PADDINGS,
             max_running_requests=cls.PREFILL_EXTEND_MAX_RUNNING_REQUESTS,
@@ -418,6 +467,12 @@ class TestMultiItemPrefillExtendPerformance(CustomTestCase):
             multi_item_segment_fallback_threshold=cls.SEGMENT_FALLBACK_THRESHOLD,
             multi_item_enable_prefill_extend=True,
             multi_item_extend_batch_size=cls.PREFILL_EXTEND_BATCH_SIZE,
+            disable_overlap_schedule=cls.DISABLE_OVERLAP_SCHEDULE,
+            multi_item_enable_score_from_cache_v2=cls.ENABLE_SCORE_FROM_CACHE_V2,
+            multi_item_score_from_cache_v2_items_per_step=cls.SCORE_FROM_CACHE_V2_ITEMS_PER_STEP,
+            multi_item_score_fastpath_log_metrics=cls.SCORE_FASTPATH_LOG_METRICS,
+            multi_item_score_label_only_logprob=cls.SCORE_LABEL_ONLY_LOGPROB,
+            log_level=cls.LOG_LEVEL,
         )
         print("[Benchmark] Prefill+extend engine initialized")
 

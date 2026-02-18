@@ -574,8 +574,10 @@ class _FakeSchedulerScoreFromCacheV2:
         self.enable_overlap = False
         self.server_args = SimpleNamespace(
             multi_item_score_from_cache_v2_items_per_step=64,
+            multi_item_score_label_only_logprob=False,
             allow_auto_truncate=False,
             max_running_requests=1024,
+            device="tpu",
         )
         self.req_to_token_pool = SimpleNamespace(available_size=lambda: 1024)
         self.model_config = SimpleNamespace(hf_eos_token_id={2}, vocab_size=32000)
@@ -598,6 +600,7 @@ class _FakeSchedulerScoreFromCacheV2:
         self.score_from_cache_v2_fallback = 0
         self.score_from_cache_v2_fallback_reasons = {}
         self.chunk_calls = []
+        self.label_only_chunk_calls = []
         self.fail_next_chunk = False
         self.force_estimated_words = None
 
@@ -638,6 +641,35 @@ class _FakeSchedulerScoreFromCacheV2:
         if self.force_estimated_words is not None:
             return self.force_estimated_words
         return Scheduler._estimate_score_from_cache_v2_words(prefix_len, items)
+
+    def _run_score_from_cache_v2_chunk_label_only(
+        self,
+        cache_handle: str,
+        chunk_items: list[list[int]],
+        label_token_ids: list[int],
+        label_token_ids_arr,
+        apply_softmax: bool,
+        cached_last_node,
+        cached_prefix_indices,
+        prefix_ids: list[int],
+        cached_extra_key: str | None,
+    ) -> tuple[list[list[float]], float, float]:
+        del (
+            cache_handle,
+            label_token_ids,
+            label_token_ids_arr,
+            apply_softmax,
+            cached_last_node,
+            cached_prefix_indices,
+            prefix_ids,
+            cached_extra_key,
+        )
+        self.label_only_chunk_calls.append([item[0] for item in chunk_items])
+        return (
+            [[float(item[0]), float(item[0]) + 0.5] for item in chunk_items],
+            0.02,
+            0.01,
+        )
 
 
 def _parity_metrics(
@@ -809,6 +841,44 @@ def test_score_from_cache_v2_runtime_exception_does_not_poison_future_requests()
     )
     assert second.success is True
     assert len(second.scores) == 8
+
+
+def test_score_from_cache_v2_label_only_uses_dedicated_chunk_runner():
+    scheduler = _FakeSchedulerScoreFromCacheV2()
+    scheduler.server_args.multi_item_score_label_only_logprob = True
+    items = [[i] * 20 for i in range(10)]
+    out = scheduler.score_from_cache_v2(
+        ScoreFromCacheReqInput(
+            cache_handle="cache-ok",
+            items_2d=items,
+            label_token_ids=[9454, 2753],
+            items_per_step=4,
+            apply_softmax=False,
+        )
+    )
+
+    assert out.success is True
+    assert out.dispatch_count == 3
+    assert [len(chunk) for chunk in scheduler.label_only_chunk_calls] == [4, 4, 2]
+    assert scheduler.chunk_calls == []
+
+
+def test_score_from_cache_v2_label_only_rejects_unsupported_backend():
+    scheduler = _FakeSchedulerScoreFromCacheV2()
+    scheduler.server_args.multi_item_score_label_only_logprob = True
+    scheduler.server_args.device = "metal"
+    out = scheduler.score_from_cache_v2(
+        ScoreFromCacheReqInput(
+            cache_handle="cache-ok",
+            items_2d=[[1] * 20 for _ in range(4)],
+            label_token_ids=[9454, 2753],
+            items_per_step=4,
+            apply_softmax=False,
+        )
+    )
+
+    assert out.success is False
+    assert out.fallback_reason == "unsupported_backend"
 
 
 def test_score_from_cache_v2_parity_metric_threshold():
