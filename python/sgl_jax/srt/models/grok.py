@@ -643,7 +643,7 @@ class Grok1DecoderLayer(nnx.Module):
             replicated_sharding = NamedSharding(self.mesh, P(None, None))
 
             # Scatter residual to [M/TP, H] — free, just discards replicated copies
-            residual = jax.lax.with_sharding_constraint(residual, scattered_sharding)
+            residual = jax.sharding.reshard(residual, scattered_sharding)
 
             # Apply post-attention norm and pre-MoE norm on scattered data (local, cheap)
             assert self.post_attn_norm.scale is not None

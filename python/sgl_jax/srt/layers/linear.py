@@ -23,7 +23,7 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
 # Reduce-scatter matmul tile configs (sequence parallel)
 # ---------------------------------------------------------------------------
 _RS_MATMUL_TILE_CONFIGS: dict[str, tuple[int, int, int]] = {
-    "TPU v7": (256, 256, 128),
+    "TPU v7": (1, 256, 128),
     "TPU v6e": (128, 128, 128),
     "TPU v5e": (128, 128, 128),
 }
