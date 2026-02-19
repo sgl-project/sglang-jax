@@ -1466,18 +1466,74 @@ def get_tuned_block_sizes(
         if device_name in TUNED_BLOCK_SIZES and keys[1:] in TUNED_BLOCK_SIZES[device_name]:
             bkv_p, bq = TUNED_BLOCK_SIZES[device_name][keys[1:]]
         else:
-            logger.info(
-                "Tuned RPA block sizes not found for %s: page_size=%s, actual_num_q_heads=%s, "
-                "actual_num_kv_heads=%s, head_dim=%s, max_num_tokens=%s, pages_per_seq=%s.",
-                device_name,
-                page_size,
-                actual_num_q_heads,
-                actual_num_kv_heads,
-                head_dim,
-                max_num_tokens,
-                pages_per_seq,
-            )
-            logger.info("Using default block size: bkv_p=%s, bq=%s.", bkv_p, bq)
+            tuned_table = TUNED_BLOCK_SIZES.get(device_name, {})
+            # Page-size-aware fallback for shapes that are not directly tuned
+            # (e.g., page_size=64 on TPU v6e): reuse the nearest page-size key and
+            # scale kv-pages-per-block by page-size ratio to keep similar token span.
+            fallback_page_sizes = [next_power_of_2(page_size), 128, 256]
+            used_fallback = False
+            for fb_page_size in fallback_page_sizes:
+                if fb_page_size <= 0:
+                    continue
+                token_candidates = sorted(
+                    {
+                        key[6]
+                        for key in tuned_table
+                        if key[:6] == keys[1:7] and key[5] == fb_page_size
+                    }
+                )
+                if not token_candidates:
+                    continue
+                fb_tokens = next_power_of_2(max_num_tokens)
+                # Clamp to largest available tuned max-token bucket when needed.
+                if fb_tokens not in token_candidates:
+                    if fb_tokens > token_candidates[-1]:
+                        fb_tokens = token_candidates[-1]
+                    else:
+                        fb_tokens = next((x for x in token_candidates if x >= fb_tokens), None)
+                        if fb_tokens is None:
+                            continue
+                fb_key = (
+                    keys[1],
+                    keys[2],
+                    keys[3],
+                    keys[4],
+                    keys[5],
+                    fb_page_size,
+                    fb_tokens,
+                )
+                if fb_key not in tuned_table:
+                    continue
+                bkv_p, bq = tuned_table[fb_key]
+                if fb_page_size != page_size and page_size > 0:
+                    bkv_p = max(1, (bkv_p * fb_page_size) // page_size)
+                logger.info(
+                    "Using fallback tuned block size for %s: requested(page_size=%s, max_num_tokens=%s) "
+                    "-> tuned(page_size=%s, max_num_tokens=%s), bkv_p=%s, bq=%s.",
+                    device_name,
+                    page_size,
+                    max_num_tokens,
+                    fb_page_size,
+                    fb_tokens,
+                    bkv_p,
+                    bq,
+                )
+                used_fallback = True
+                break
+
+            if not used_fallback:
+                logger.info(
+                    "Tuned RPA block sizes not found for %s: page_size=%s, actual_num_q_heads=%s, "
+                    "actual_num_kv_heads=%s, head_dim=%s, max_num_tokens=%s, pages_per_seq=%s.",
+                    device_name,
+                    page_size,
+                    actual_num_q_heads,
+                    actual_num_kv_heads,
+                    head_dim,
+                    max_num_tokens,
+                    pages_per_seq,
+                )
+                logger.info("Using default block size: bkv_p=%s, bq=%s.", bkv_p, bq)
 
     # if bkv_p != 16 or bq != 16:
     #     raise ValueError(
