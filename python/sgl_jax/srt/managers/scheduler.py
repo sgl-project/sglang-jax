@@ -1074,7 +1074,9 @@ class Scheduler(
                     error_msg="score-from-cache v2 does not support overlap schedule.",
                 )
 
-            is_valid, fallback_reason, error_msg = self._score_from_cache_v2_validate_items(recv_req)
+            is_valid, fallback_reason, error_msg = self._score_from_cache_v2_validate_items(
+                recv_req
+            )
             if not is_valid:
                 return self._score_from_cache_v2_fallback_output(
                     recv_req,

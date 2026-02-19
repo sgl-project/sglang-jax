@@ -497,7 +497,9 @@ class _FakeScorePrefillExtendManager:
     score_prefill_extend = TokenizerManager.score_prefill_extend
     _record_score_fastpath_fallback = TokenizerManager._record_score_fastpath_fallback
 
-    def __init__(self, fastpath_enabled: bool, fastpath_output: ScoreFromCacheReqOutput | Exception):
+    def __init__(
+        self, fastpath_enabled: bool, fastpath_output: ScoreFromCacheReqOutput | Exception
+    ):
         self.server_args = SimpleNamespace(
             multi_item_extend_batch_size=64,
             multi_item_enable_score_from_cache_v2=fastpath_enabled,

@@ -607,7 +607,7 @@ class TokenizerManager:
                     raise ValueError(
                         self.scheduler_unavailable_error
                         or "Scheduler subprocess is unavailable. Please restart the server."
-                    )
+                    ) from None
                 continue
 
             out = state.out_list[-1]
@@ -1805,24 +1805,14 @@ class TokenizerManager:
             scores,
             {
                 "dispatch_count": (
-                    max(scheduler_dispatch_counts)
-                    if scheduler_dispatch_counts
-                    else 1
+                    max(scheduler_dispatch_counts) if scheduler_dispatch_counts else 1
                 ),
-                "queue_wait_s": (
-                    max(scheduler_queue_wait)
-                    if scheduler_queue_wait
-                    else 0.0
-                ),
+                "queue_wait_s": (max(scheduler_queue_wait) if scheduler_queue_wait else 0.0),
                 "device_compute_s": (
-                    max(scheduler_device_compute)
-                    if scheduler_device_compute
-                    else 0.0
+                    max(scheduler_device_compute) if scheduler_device_compute else 0.0
                 ),
                 "host_orchestration_s": (
-                    max(scheduler_host_overhead)
-                    if scheduler_host_overhead
-                    else 0.0
+                    max(scheduler_host_overhead) if scheduler_host_overhead else 0.0
                 ),
                 "lifecycle_requests_sent": len(items),
                 "lifecycle_results_received": len(results),
