@@ -46,6 +46,7 @@ class _FakePrefillManager:
 
 class _FakeExtendManager:
     _batched_extend_score = TokenizerManager._batched_extend_score
+    _batched_extend_score_with_metrics = TokenizerManager._batched_extend_score_with_metrics
 
     def __init__(self):
         self.seen_request = None
@@ -81,6 +82,7 @@ class _FakeExtendManager:
 
 class _FakeExtendMissingLogprobsManager:
     _batched_extend_score = TokenizerManager._batched_extend_score
+    _batched_extend_score_with_metrics = TokenizerManager._batched_extend_score_with_metrics
 
     async def generate_request(self, req, request=None):
         del req, request
