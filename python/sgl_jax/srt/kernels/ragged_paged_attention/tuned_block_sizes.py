@@ -1,6 +1,7 @@
 """Auto-tuned block sizes for ragged paged attention."""
 
 import logging
+import os
 
 import jax.numpy as jnp
 
@@ -9,6 +10,15 @@ from sgl_jax.srt.utils.common_utils import next_power_of_2
 from sgl_jax.srt.utils.jax_utils import get_device_name
 
 logger = logging.getLogger(__name__)
+
+_KERNEL_V11_ENV = "SGLANG_RPA_KERNEL_V11"
+_KERNEL_V11_PAGE64_HOT_SHAPE = ("bfloat16", "bfloat16", 16, 8, 128, 64)
+_KERNEL_V11_BKV_DECODE_ENV = "SGLANG_RPA_KERNEL_V11_BKV_DECODE"
+_KERNEL_V11_BQ_DECODE_ENV = "SGLANG_RPA_KERNEL_V11_BQ_DECODE"
+_KERNEL_V11_BKV_SMALL_ENV = "SGLANG_RPA_KERNEL_V11_BKV_SMALL"
+_KERNEL_V11_BQ_SMALL_ENV = "SGLANG_RPA_KERNEL_V11_BQ_SMALL"
+_KERNEL_V11_BKV_LARGE_ENV = "SGLANG_RPA_KERNEL_V11_BKV_LARGE"
+_KERNEL_V11_BQ_LARGE_ENV = "SGLANG_RPA_KERNEL_V11_BQ_LARGE"
 # key
 #   - device_name
 #     - q dtype
@@ -1456,6 +1466,59 @@ def get_tuned_block_sizes(
     )
 
     device_name = keys[0]
+
+    kernel_v11_enabled = os.getenv(_KERNEL_V11_ENV, "0") == "1"
+    if (
+        kernel_v11_enabled
+        and device_name == "TPU v6e"
+        and keys[1:7] == _KERNEL_V11_PAGE64_HOT_SHAPE
+    ):
+        def get_env_int(name: str, default: int) -> int:
+            val = os.getenv(name)
+            if val is None:
+                return default
+            try:
+                return int(val)
+            except ValueError:
+                logger.warning(
+                    "Invalid integer env for kernel-v11 override: %s=%r. Using default=%s.",
+                    name,
+                    val,
+                    default,
+                )
+                return default
+
+        decode_bkv = max(1, get_env_int(_KERNEL_V11_BKV_DECODE_ENV, 32))
+        decode_bq = max(1, get_env_int(_KERNEL_V11_BQ_DECODE_ENV, 1))
+        small_bkv = max(1, get_env_int(_KERNEL_V11_BKV_SMALL_ENV, 16))
+        small_bq = max(1, get_env_int(_KERNEL_V11_BQ_SMALL_ENV, 256))
+        large_bkv = max(1, get_env_int(_KERNEL_V11_BKV_LARGE_ENV, 32))
+        large_bq = max(1, get_env_int(_KERNEL_V11_BQ_LARGE_ENV, 256))
+
+        token_bucket = keys[7]
+        if token_bucket <= 32:
+            bkv_p, bq = (decode_bkv, decode_bq)
+        elif token_bucket <= 4096:
+            bkv_p, bq = (small_bkv, small_bq)
+        else:
+            bkv_p, bq = (large_bkv, large_bq)
+        logger.info(
+            "Using kernel-v11 hot-shape override for %s: page_size=%s, max_num_tokens=%s, "
+            "token_bucket=%s, decode=(%s,%s), small=(%s,%s), large=(%s,%s), selected=(%s,%s).",
+            device_name,
+            page_size,
+            max_num_tokens,
+            token_bucket,
+            decode_bkv,
+            decode_bq,
+            small_bkv,
+            small_bq,
+            large_bkv,
+            large_bq,
+            bkv_p,
+            bq,
+        )
+        return (min(pages_per_seq, bkv_p), min(max_num_tokens, bq))
 
     # Default block sizes.
     bkv_p, bq = (1024 // page_size, 32)
