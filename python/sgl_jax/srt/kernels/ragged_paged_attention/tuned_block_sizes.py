@@ -1479,7 +1479,7 @@ def get_tuned_block_sizes(
                     {
                         key[6]
                         for key in tuned_table
-                        if key[:6] == keys[1:7] and key[5] == fb_page_size
+                        if key[:5] == keys[1:6] and key[5] == fb_page_size
                     }
                 )
                 if not token_candidates:
