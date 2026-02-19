@@ -924,7 +924,34 @@ class Scheduler(
             + (bs * prefix_len)
         )
 
-    def _release_score_from_cache_v2_chunk_reqs(self, reqs: list[Req]) -> None:
+    def _release_score_from_cache_v2_chunk_reqs(
+        self,
+        reqs: list[Req],
+        batch: ScheduleBatch | None = None,
+    ) -> None:
+        if batch is not None:
+            try:
+                out_cache_loc = getattr(batch, "out_cache_loc", None)
+                if out_cache_loc is not None:
+                    out_cache_loc_arr = np.asarray(out_cache_loc, dtype=np.int32)
+                    if out_cache_loc_arr.size > 0:
+                        self.token_to_kv_pool_allocator.free(out_cache_loc_arr)
+            except Exception:
+                logger.exception("Fastpath v2 cleanup failed while freeing chunk KV slots.")
+
+            try:
+                req_pool_indices = getattr(batch, "req_pool_indices", None)
+                if req_pool_indices is not None:
+                    req_pool_indices_list = np.asarray(req_pool_indices, dtype=np.int32).tolist()
+                    if req_pool_indices_list:
+                        self.req_to_token_pool.free(req_pool_indices_list)
+            except Exception:
+                logger.exception("Fastpath v2 cleanup failed while freeing chunk req slots.")
+
+            for req in reqs:
+                req.req_pool_idx = None
+            return
+
         for req in reqs:
             if req.req_pool_idx is None:
                 continue
@@ -962,6 +989,7 @@ class Scheduler(
         prefix_ids: list[int],
         cached_extra_key: str | None,
     ) -> tuple[list[list[float]], float, float]:
+        batch: ScheduleBatch | None = None
         reqs = self._build_score_from_cache_v2_chunk_reqs(
             cache_handle=cache_handle,
             chunk_items=chunk_items,
@@ -1030,7 +1058,7 @@ class Scheduler(
             chunk_host_overhead_s = reqs[0].host_overhead_time_s if reqs else 0.0
             return scores, chunk_device_compute_s, chunk_host_overhead_s
         finally:
-            self._release_score_from_cache_v2_chunk_reqs(reqs)
+            self._release_score_from_cache_v2_chunk_reqs(reqs, batch=batch)
 
     def _build_score_from_cache_v2_chunk_reqs(
         self,
@@ -1044,12 +1072,13 @@ class Scheduler(
         return_label_logprobs: bool,
     ) -> list[Req]:
         reqs: list[Req] = []
+        chunk_uid = time.time_ns()
         for local_idx, item_ids in enumerate(chunk_items):
             sampling_params = SamplingParams(max_new_tokens=0)
             sampling_params.stop_strs = []
             sampling_params.stop_str_max_len = 0
 
-            rid = f"{cache_handle}-scorev2-{local_idx}-{time.time_ns()}"
+            rid = f"{cache_handle}-scorev2-{chunk_uid}-{local_idx}"
             req = Req(
                 rid=rid,
                 origin_input_text=None,
@@ -1069,14 +1098,6 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
             req.logprob_start_len = len(req.origin_input_ids) - 1
-            req.sampling_params.max_new_tokens = min(
-                (
-                    req.sampling_params.max_new_tokens
-                    if req.sampling_params.max_new_tokens is not None
-                    else 1 << 30
-                ),
-                self.max_req_len - len(req.origin_input_ids) - 1,
-            )
             req.cached_last_node = cached_last_node
             req.cached_last_host_node = cached_last_node
             req.cached_prefix_indices = cached_prefix_indices
@@ -1105,6 +1126,7 @@ class Scheduler(
         prefix_ids: list[int],
         cached_extra_key: str | None,
     ) -> tuple[list[list[float]], float, float]:
+        batch: ScheduleBatch | None = None
         reqs = self._build_score_from_cache_v2_chunk_reqs(
             cache_handle=cache_handle,
             chunk_items=chunk_items,
@@ -1200,7 +1222,7 @@ class Scheduler(
             chunk_host_overhead_s = max(0.0, chunk_total_s - chunk_device_compute_s)
             return scores, chunk_device_compute_s, chunk_host_overhead_s
         finally:
-            self._release_score_from_cache_v2_chunk_reqs(reqs)
+            self._release_score_from_cache_v2_chunk_reqs(reqs, batch=batch)
 
     def score_from_cache_v2(self, recv_req: ScoreFromCacheReqInput) -> ScoreFromCacheReqOutput:
         self.score_from_cache_v2_attempted += 1
