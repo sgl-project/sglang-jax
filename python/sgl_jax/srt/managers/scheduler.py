@@ -924,7 +924,7 @@ class Scheduler(
             + (bs * prefix_len)
         )
 
-    def _cleanup_failed_score_from_cache_v2_chunk(self, reqs: list[Req]) -> None:
+    def _release_score_from_cache_v2_chunk_reqs(self, reqs: list[Req]) -> None:
         for req in reqs:
             if req.req_pool_idx is None:
                 continue
@@ -1026,19 +1026,11 @@ class Scheduler(
                     )
                 )
 
-            for i, req in enumerate(reqs):
-                # Keep cleanup behavior aligned with the scheduler prefill path.
-                req.output_ids.append(result.next_token_ids[i])
-                req.check_finished()
-                self.tree_cache.cache_finished_req(req)
-                req.req_pool_idx = None
-
             chunk_device_compute_s = reqs[0].device_compute_time_s if reqs else 0.0
             chunk_host_overhead_s = reqs[0].host_overhead_time_s if reqs else 0.0
             return scores, chunk_device_compute_s, chunk_host_overhead_s
-        except Exception:
-            self._cleanup_failed_score_from_cache_v2_chunk(reqs)
-            raise
+        finally:
+            self._release_score_from_cache_v2_chunk_reqs(reqs)
 
     def _build_score_from_cache_v2_chunk_reqs(
         self,
@@ -1054,8 +1046,8 @@ class Scheduler(
         reqs: list[Req] = []
         for local_idx, item_ids in enumerate(chunk_items):
             sampling_params = SamplingParams(max_new_tokens=0)
-            sampling_params.normalize(self.tokenizer)
-            sampling_params.verify(self.model_config.vocab_size)
+            sampling_params.stop_strs = []
+            sampling_params.stop_str_max_len = 0
 
             rid = f"{cache_handle}-scorev2-{local_idx}-{time.time_ns()}"
             req = Req(
@@ -1203,17 +1195,12 @@ class Scheduler(
                 scores_np = token_prob_vals
             scores = scores_np.tolist()
 
-            for req in reqs:
-                self.tree_cache.cache_finished_req(req)
-                req.req_pool_idx = None
-
             chunk_device_compute_s = max(0.0, forward_end - forward_start)
             chunk_total_s = max(0.0, time.perf_counter() - chunk_wall_start)
             chunk_host_overhead_s = max(0.0, chunk_total_s - chunk_device_compute_s)
             return scores, chunk_device_compute_s, chunk_host_overhead_s
-        except Exception:
-            self._cleanup_failed_score_from_cache_v2_chunk(reqs)
-            raise
+        finally:
+            self._release_score_from_cache_v2_chunk_reqs(reqs)
 
     def score_from_cache_v2(self, recv_req: ScoreFromCacheReqInput) -> ScoreFromCacheReqOutput:
         self.score_from_cache_v2_attempted += 1
