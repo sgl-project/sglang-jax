@@ -1490,10 +1490,12 @@ def get_tuned_block_sizes(
 
         decode_bkv = max(1, get_env_int(_KERNEL_V11_BKV_DECODE_ENV, 32))
         decode_bq = max(1, get_env_int(_KERNEL_V11_BQ_DECODE_ENV, 1))
-        small_bkv = max(1, get_env_int(_KERNEL_V11_BKV_SMALL_ENV, 16))
-        small_bq = max(1, get_env_int(_KERNEL_V11_BQ_SMALL_ENV, 256))
+        # Tuned hot-shape defaults for TPU v6e page_size=64:
+        # decode=(32,1), small=(32,40), large=(32,64).
+        small_bkv = max(1, get_env_int(_KERNEL_V11_BKV_SMALL_ENV, 32))
+        small_bq = max(1, get_env_int(_KERNEL_V11_BQ_SMALL_ENV, 40))
         large_bkv = max(1, get_env_int(_KERNEL_V11_BKV_LARGE_ENV, 32))
-        large_bq = max(1, get_env_int(_KERNEL_V11_BQ_LARGE_ENV, 256))
+        large_bq = max(1, get_env_int(_KERNEL_V11_BQ_LARGE_ENV, 64))
 
         token_bucket = keys[7]
         if token_bucket <= 32:
