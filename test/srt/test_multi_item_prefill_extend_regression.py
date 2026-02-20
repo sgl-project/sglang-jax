@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh
 
+import sgl_jax.srt.managers.scheduler as scheduler_module
 from sgl_jax.srt.layers.logits_processor import LogitsProcessor
 from sgl_jax.srt.layers.sampler import (
     get_token_ids_logprobs as sampler_get_token_ids_logprobs,
@@ -796,6 +797,31 @@ def test_score_from_cache_v2_caps_items_per_step_by_req_slots():
     assert out.success is True
     assert out.dispatch_count == 3
     assert [len(chunk) for chunk in scheduler.chunk_calls] == [24, 24, 2]
+
+
+def test_score_from_cache_v2_reqpool_oversubscribe_flag_uses_available_slots(monkeypatch):
+    scheduler = _FakeSchedulerScoreFromCacheV2()
+    scheduler.server_args.max_running_requests = 24
+    scheduler.req_to_token_pool = SimpleNamespace(available_size=lambda: 25)
+    monkeypatch.setattr(
+        scheduler_module,
+        "SCORE_V2_ALLOW_REQPOOL_OVERSUBSCRIBE",
+        True,
+    )
+    items = [[i] * 20 for i in range(50)]
+    out = scheduler.score_from_cache_v2(
+        ScoreFromCacheReqInput(
+            cache_handle="cache-ok",
+            items_2d=items,
+            label_token_ids=[9454, 2753],
+            items_per_step=64,
+            apply_softmax=False,
+        )
+    )
+
+    assert out.success is True
+    assert out.dispatch_count == 2
+    assert [len(chunk) for chunk in scheduler.chunk_calls] == [25, 25]
 
 
 def test_score_from_cache_v2_size_guard_fallback():

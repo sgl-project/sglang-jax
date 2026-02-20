@@ -99,6 +99,9 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
+SCORE_V2_ALLOW_REQPOOL_OVERSUBSCRIBE = get_bool_env_var(
+    "SGLANG_SCORE_FROM_CACHE_V2_ALLOW_REQPOOL_OVERSUBSCRIBE"
+)
 
 
 class SyncError(Exception):
@@ -1301,7 +1304,7 @@ class Scheduler(
             # (e.g., 64 with max_running_requests=24) do not trigger alloc_req_slots failures.
             capacity_caps: list[int] = []
             max_running_requests = int(getattr(self.server_args, "max_running_requests", 0) or 0)
-            if max_running_requests > 0:
+            if max_running_requests > 0 and not SCORE_V2_ALLOW_REQPOOL_OVERSUBSCRIBE:
                 capacity_caps.append(max_running_requests)
             req_to_token_pool = getattr(self, "req_to_token_pool", None)
             if req_to_token_pool is not None and hasattr(req_to_token_pool, "available_size"):
