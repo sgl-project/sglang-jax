@@ -389,6 +389,40 @@ class Scheduler(
         self.scoring_cache_nodes = {}
         self.scoring_cache_timeout = float(server_args.multi_item_prefill_extend_cache_timeout)
         self._last_scoring_cache_gc = 0.0
+        # Scoring-cache counters (vLLM-style query/hit/miss accounting).
+        self.scoring_cache_lookup_queries = 0
+        self.scoring_cache_lookup_hits = 0
+        self.scoring_cache_lookup_misses = 0
+        self.scoring_cache_lookup_by_path: dict[str, dict[str, int]] = {
+            "extend": {"queries": 0, "hits": 0, "misses": 0},
+            "score_from_cache_v2": {"queries": 0, "hits": 0, "misses": 0},
+        }
+        self.scoring_cache_handles_created = 0
+        self.scoring_cache_handles_released = 0
+        self.scoring_cache_handles_released_manual = 0
+        self.scoring_cache_handles_released_expired = 0
+        self.scoring_cache_handles_released_other = 0
+        self.scoring_cache_handles_missing_node = 0
+        # Ingress message metrics for tokenizer->scheduler and rpc->scheduler paths.
+        self.ingress_recv_calls = 0
+        self.ingress_nonempty_calls = 0
+        self.ingress_max_batch_size = 0
+        self.ingress_tokenizer_messages = 0
+        self.ingress_rpc_messages = 0
+        self.ingress_batch_size_histogram = {
+            "eq_0": 0,
+            "eq_1": 0,
+            "2_to_4": 0,
+            "5_to_16": 0,
+            "gt_16": 0,
+        }
+        self.ingress_score_paths = {
+            "tokenizer_multi_item_packed": 0,
+            "tokenizer_cache_for_scoring": 0,
+            "tokenizer_extend_from_cache": 0,
+            "rpc_score_from_cache_v2": 0,
+            "rpc_release_scoring_cache": 0,
+        }
         # Fastpath v2 score-from-cache counters.
         self.score_from_cache_v2_attempted = 0
         self.score_from_cache_v2_succeeded = 0
@@ -688,8 +722,11 @@ class Scheduler(
 
     def recv_requests(self) -> list[Req]:
         """Receive results at node_rank = 0 and broadcast it to all other Node ranks."""
+        self.ingress_recv_calls += 1
         if self.node_rank == 0:
             recv_reqs = []
+            tokenizer_count = 0
+            rpc_count = 0
 
             while True:
                 try:
@@ -697,6 +734,14 @@ class Scheduler(
                 except zmq.ZMQError:
                     break
                 recv_reqs.append(recv_req)
+                tokenizer_count += 1
+                if isinstance(recv_req, TokenizedGenerateReqInput):
+                    if bool(getattr(recv_req, "is_multi_item_scoring", False)):
+                        self.ingress_score_paths["tokenizer_multi_item_packed"] += 1
+                    if bool(getattr(recv_req, "cache_for_scoring", False)):
+                        self.ingress_score_paths["tokenizer_cache_for_scoring"] += 1
+                    if bool(getattr(recv_req, "extend_from_cache", None)):
+                        self.ingress_score_paths["tokenizer_extend_from_cache"] += 1
 
             while True:
                 try:
@@ -704,6 +749,29 @@ class Scheduler(
                 except zmq.ZMQError:
                     break
                 recv_reqs.append(recv_rpc)
+                rpc_count += 1
+                if isinstance(recv_rpc, ScoreFromCacheReqInput):
+                    self.ingress_score_paths["rpc_score_from_cache_v2"] += 1
+                elif isinstance(recv_rpc, ReleaseScoringCacheReqInput):
+                    self.ingress_score_paths["rpc_release_scoring_cache"] += 1
+
+            self.ingress_tokenizer_messages += tokenizer_count
+            self.ingress_rpc_messages += rpc_count
+            batch_size = tokenizer_count + rpc_count
+            if batch_size > 0:
+                self.ingress_nonempty_calls += 1
+                if batch_size > self.ingress_max_batch_size:
+                    self.ingress_max_batch_size = batch_size
+            if batch_size == 0:
+                self.ingress_batch_size_histogram["eq_0"] += 1
+            elif batch_size == 1:
+                self.ingress_batch_size_histogram["eq_1"] += 1
+            elif batch_size <= 4:
+                self.ingress_batch_size_histogram["2_to_4"] += 1
+            elif batch_size <= 16:
+                self.ingress_batch_size_histogram["5_to_16"] += 1
+            else:
+                self.ingress_batch_size_histogram["gt_16"] += 1
         else:
             recv_reqs = None
 
@@ -728,9 +796,62 @@ class Scheduler(
             return node, swa_uuid, input_ids, prefix_indices, extra_key, 0.0
         raise RuntimeError(f"Invalid scoring cache entry format (len={len(entry)}).")
 
+    def _record_scoring_cache_lookup(self, path: str, hit: bool) -> None:
+        self.scoring_cache_lookup_queries += 1
+        if hit:
+            self.scoring_cache_lookup_hits += 1
+        else:
+            self.scoring_cache_lookup_misses += 1
+
+        bucket = self.scoring_cache_lookup_by_path.setdefault(
+            path,
+            {"queries": 0, "hits": 0, "misses": 0},
+        )
+        bucket["queries"] += 1
+        if hit:
+            bucket["hits"] += 1
+        else:
+            bucket["misses"] += 1
+
+    def _record_scoring_cache_handle_created(self) -> None:
+        self.scoring_cache_handles_created += 1
+
+    def _record_scoring_cache_handle_released(self, reason: str) -> None:
+        self.scoring_cache_handles_released += 1
+        if reason == "manual":
+            self.scoring_cache_handles_released_manual += 1
+        elif reason == "expired":
+            self.scoring_cache_handles_released_expired += 1
+        else:
+            self.scoring_cache_handles_released_other += 1
+
+    def _scoring_cache_metrics_snapshot(self) -> dict:
+        query_total = self.scoring_cache_lookup_queries
+        hit_total = self.scoring_cache_lookup_hits
+        miss_total = self.scoring_cache_lookup_misses
+        hit_rate = float(hit_total / query_total) if query_total > 0 else 0.0
+        return {
+            "active_handles": len(self.scoring_cache_nodes),
+            "handles_created": self.scoring_cache_handles_created,
+            "handles_released_total": self.scoring_cache_handles_released,
+            "handles_released_manual": self.scoring_cache_handles_released_manual,
+            "handles_released_expired": self.scoring_cache_handles_released_expired,
+            "handles_released_other": self.scoring_cache_handles_released_other,
+            "handles_missing_node": self.scoring_cache_handles_missing_node,
+            "lookup_queries": query_total,
+            "lookup_hits": hit_total,
+            "lookup_misses": miss_total,
+            "lookup_hit_rate": hit_rate,
+            "lookup_by_path": {
+                path: dict(stats) for path, stats in self.scoring_cache_lookup_by_path.items()
+            },
+        }
+
     def _release_scoring_cache_entry(self, rid: str, entry, reason: str) -> None:
         node, swa_uuid, *_ = self._unpack_scoring_cache_entry(entry)
+        self._record_scoring_cache_handle_released(reason)
         if node is None:
+            self.scoring_cache_handles_missing_node += 1
             logger.warning("Scoring cache entry rid=%s has no radix node (%s).", rid, reason)
             return
         try:
@@ -797,12 +918,14 @@ class Scheduler(
         self._evict_expired_scoring_cache_nodes()
         entry = self.scoring_cache_nodes.get(recv_req.extend_from_cache)
         if entry is None:
+            self._record_scoring_cache_lookup(path="extend", hit=False)
             err = (
                 f"Missing scoring cache handle '{recv_req.extend_from_cache}'. "
                 "The cached prefix may have expired or been released."
             )
             logger.warning("Prefill+extend scheduler: %s", err)
             return None, err
+        self._record_scoring_cache_lookup(path="extend", hit=True)
 
         cached_last_node, _, prefix_ids, prefix_indices, cached_extra_key, _ = (
             self._unpack_scoring_cache_entry(entry)
@@ -1255,6 +1378,7 @@ class Scheduler(
             self._evict_expired_scoring_cache_nodes()
             entry = self.scoring_cache_nodes.get(recv_req.cache_handle)
             if entry is None:
+                self._record_scoring_cache_lookup(path="score_from_cache_v2", hit=False)
                 return self._score_from_cache_v2_fallback_output(
                     recv_req,
                     reason="missing_cache_handle",
@@ -1263,6 +1387,7 @@ class Scheduler(
                         "The cached prefix may have expired or been released."
                     ),
                 )
+            self._record_scoring_cache_lookup(path="score_from_cache_v2", hit=True)
 
             cached_last_node, _, prefix_ids, prefix_indices, cached_extra_key, _ = (
                 self._unpack_scoring_cache_entry(entry)
@@ -1692,6 +1817,16 @@ class Scheduler(
             "succeeded": self.score_from_cache_v2_succeeded,
             "fallback": self.score_from_cache_v2_fallback,
             "fallback_reasons": dict(self.score_from_cache_v2_fallback_reasons),
+        }
+        ret["scoring_cache_metrics"] = self._scoring_cache_metrics_snapshot()
+        ret["ingress_metrics"] = {
+            "recv_calls": self.ingress_recv_calls,
+            "nonempty_calls": self.ingress_nonempty_calls,
+            "max_batch_size": self.ingress_max_batch_size,
+            "tokenizer_messages": self.ingress_tokenizer_messages,
+            "rpc_messages": self.ingress_rpc_messages,
+            "batch_size_histogram": dict(self.ingress_batch_size_histogram),
+            "score_path_messages": dict(self.ingress_score_paths),
         }
 
         return GetInternalStateReqOutput(internal_state=ret)
@@ -2463,6 +2598,21 @@ def run_scheduler_process(
                 freeze_after,
                 gc.get_count(),
             )
+            if getattr(server_args, "gc_freeze_rollback", False):
+                if hasattr(gc, "unfreeze"):
+                    gc.unfreeze()
+                    rollback_count = (
+                        gc.get_freeze_count() if hasattr(gc, "get_freeze_count") else -1
+                    )
+                    logger.warning(
+                        "Rolled back gc.freeze due to --gc-freeze-rollback. freeze_count_after_rollback=%d gc_count=%s",
+                        rollback_count,
+                        gc.get_count(),
+                    )
+                else:
+                    logger.warning(
+                        "GC freeze rollback requested but gc.unfreeze is unavailable on this Python runtime."
+                    )
         except Exception:
             logger.exception("Failed to apply gc.freeze after warmup/precompile.")
 
@@ -2527,6 +2677,21 @@ def run_scheduler_loop_thread_after_create(
                 freeze_after,
                 gc.get_count(),
             )
+            if getattr(server_args, "gc_freeze_rollback", False):
+                if hasattr(gc, "unfreeze"):
+                    gc.unfreeze()
+                    rollback_count = (
+                        gc.get_freeze_count() if hasattr(gc, "get_freeze_count") else -1
+                    )
+                    logger.warning(
+                        "Rolled back gc.freeze due to --gc-freeze-rollback. freeze_count_after_rollback=%d gc_count=%s",
+                        rollback_count,
+                        gc.get_count(),
+                    )
+                else:
+                    logger.warning(
+                        "GC freeze rollback requested but gc.unfreeze is unavailable on this Python runtime."
+                    )
         except Exception:
             logger.exception("Failed to apply gc.freeze after warmup/precompile.")
 

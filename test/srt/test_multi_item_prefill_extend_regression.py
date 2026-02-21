@@ -569,6 +569,8 @@ class _FakeSchedulerScoreFromCacheV2:
     _score_from_cache_v2_validate_items = Scheduler._score_from_cache_v2_validate_items
     _score_from_cache_v2_fallback_output = Scheduler._score_from_cache_v2_fallback_output
     _record_score_from_cache_v2_fallback = Scheduler._record_score_from_cache_v2_fallback
+    _record_scoring_cache_lookup = Scheduler._record_scoring_cache_lookup
+    _scoring_cache_metrics_snapshot = Scheduler._scoring_cache_metrics_snapshot
     _estimate_score_from_cache_v2_words = Scheduler._estimate_score_from_cache_v2_words
     _touch_scoring_cache_entry = Scheduler._touch_scoring_cache_entry
     _unpack_scoring_cache_entry = Scheduler._unpack_scoring_cache_entry
@@ -602,6 +604,19 @@ class _FakeSchedulerScoreFromCacheV2:
         self.score_from_cache_v2_succeeded = 0
         self.score_from_cache_v2_fallback = 0
         self.score_from_cache_v2_fallback_reasons = {}
+        self.scoring_cache_lookup_queries = 0
+        self.scoring_cache_lookup_hits = 0
+        self.scoring_cache_lookup_misses = 0
+        self.scoring_cache_lookup_by_path = {
+            "extend": {"queries": 0, "hits": 0, "misses": 0},
+            "score_from_cache_v2": {"queries": 0, "hits": 0, "misses": 0},
+        }
+        self.scoring_cache_handles_created = 0
+        self.scoring_cache_handles_released = 0
+        self.scoring_cache_handles_released_manual = 0
+        self.scoring_cache_handles_released_expired = 0
+        self.scoring_cache_handles_released_other = 0
+        self.scoring_cache_handles_missing_node = 0
         self.chunk_calls = []
         self.label_only_chunk_calls = []
         self.fail_next_chunk = False
@@ -907,6 +922,51 @@ def test_score_from_cache_v2_label_only_rejects_unsupported_backend():
 
     assert out.success is False
     assert out.fallback_reason == "unsupported_backend"
+
+
+def test_score_from_cache_v2_updates_scoring_cache_lookup_counters_on_hit():
+    scheduler = _FakeSchedulerScoreFromCacheV2()
+    out = scheduler.score_from_cache_v2(
+        ScoreFromCacheReqInput(
+            cache_handle="cache-ok",
+            items_2d=[[1] * 20 for _ in range(4)],
+            label_token_ids=[9454, 2753],
+            items_per_step=4,
+            apply_softmax=False,
+        )
+    )
+
+    assert out.success is True
+    metrics = scheduler._scoring_cache_metrics_snapshot()
+    assert metrics["lookup_queries"] == 1
+    assert metrics["lookup_hits"] == 1
+    assert metrics["lookup_misses"] == 0
+    assert metrics["lookup_by_path"]["score_from_cache_v2"]["queries"] == 1
+    assert metrics["lookup_by_path"]["score_from_cache_v2"]["hits"] == 1
+    assert metrics["lookup_hit_rate"] == 1.0
+
+
+def test_score_from_cache_v2_updates_scoring_cache_lookup_counters_on_miss():
+    scheduler = _FakeSchedulerScoreFromCacheV2()
+    out = scheduler.score_from_cache_v2(
+        ScoreFromCacheReqInput(
+            cache_handle="cache-missing",
+            items_2d=[[1] * 20 for _ in range(4)],
+            label_token_ids=[9454, 2753],
+            items_per_step=4,
+            apply_softmax=False,
+        )
+    )
+
+    assert out.success is False
+    assert out.fallback_reason == "missing_cache_handle"
+    metrics = scheduler._scoring_cache_metrics_snapshot()
+    assert metrics["lookup_queries"] == 1
+    assert metrics["lookup_hits"] == 0
+    assert metrics["lookup_misses"] == 1
+    assert metrics["lookup_by_path"]["score_from_cache_v2"]["queries"] == 1
+    assert metrics["lookup_by_path"]["score_from_cache_v2"]["misses"] == 1
+    assert metrics["lookup_hit_rate"] == 0.0
 
 
 def test_score_from_cache_v2_parity_metric_threshold():

@@ -126,6 +126,7 @@ class ServerArgs:
     enable_tokenizer_batch_encode: bool = False
     disable_overlap_schedule: bool = False
     enable_gc_freeze: bool = False
+    gc_freeze_rollback: bool = False
     enable_precision_tracer: bool = False
 
     # Kernel backend
@@ -843,6 +844,14 @@ class ServerArgs:
             "--enable-gc-freeze",
             action="store_true",
             help="Freeze long-lived Python GC objects after scheduler warmup/precompile.",
+        )
+        parser.add_argument(
+            "--gc-freeze-rollback",
+            action="store_true",
+            help=(
+                "Immediately rollback gc.freeze via gc.unfreeze after warmup/precompile. "
+                "Useful as a safety valve when validating freeze behavior."
+            ),
         )
         parser.add_argument(
             "--enable-precision-tracer",

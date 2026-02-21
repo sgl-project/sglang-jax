@@ -158,6 +158,8 @@ class SchedulerOutputProcessorMixin:
                                     req.extra_key,
                                     time.monotonic(),
                                 )
+                                if hasattr(self, "_record_scoring_cache_handle_created"):
+                                    self._record_scoring_cache_handle_created()
                     else:
                         self.tree_cache.cache_finished_req(req)
                 elif not batch.decoding_reqs or req not in batch.decoding_reqs:
