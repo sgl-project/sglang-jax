@@ -100,6 +100,10 @@ Artifact:
   - `--gc-freeze-rollback`
 - Scheduler now logs:
   - `freeze_before`, `freeze_after`, and `gc_count`
+- Runtime rollback smoke confirmed:
+  - `/tmp/p1_gc_rollback_smoke.log` contains both
+    - `Applied gc.freeze ...`
+    - `Rolled back gc.freeze due to --gc-freeze-rollback ...`
 - Files:
   - `python/sgl_jax/srt/server_args.py`
   - `python/sgl_jax/srt/managers/scheduler.py`
