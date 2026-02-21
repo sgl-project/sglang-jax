@@ -3,6 +3,7 @@
 import concurrent.futures as futures
 import dataclasses
 import faulthandler
+import gc
 import logging
 import math
 import os
@@ -1194,9 +1195,7 @@ class Scheduler(
             row_logprobs = np.asarray(jax.device_get(row_logprobs_dev), dtype=np.float64)
 
             if row_logprobs.ndim != 2:
-                raise RuntimeError(
-                    f"Unexpected label-only logprob shape: {row_logprobs.shape}."
-                )
+                raise RuntimeError(f"Unexpected label-only logprob shape: {row_logprobs.shape}.")
             if row_logprobs.shape[0] != len(reqs):
                 raise RuntimeError(
                     f"Chunk output rows ({row_logprobs.shape[0]}) != request count ({len(reqs)})."
@@ -2444,6 +2443,29 @@ def run_scheduler_process(
     dp_rank: int | None,
     pipe_writer,
 ):
+    def maybe_freeze_gc_after_warmup():
+        if not getattr(server_args, "enable_gc_freeze", False):
+            return
+        if not hasattr(gc, "freeze"):
+            logger.warning(
+                "GC freeze requested but gc.freeze is unavailable on this Python runtime."
+            )
+            return
+        try:
+            freeze_before = gc.get_freeze_count() if hasattr(gc, "get_freeze_count") else -1
+            collected = gc.collect()
+            gc.freeze()
+            freeze_after = gc.get_freeze_count() if hasattr(gc, "get_freeze_count") else -1
+            logger.info(
+                "Applied gc.freeze after warmup/precompile. collected=%d freeze_before=%d freeze_after=%d gc_count=%s",
+                collected,
+                freeze_before,
+                freeze_after,
+                gc.get_count(),
+            )
+        except Exception:
+            logger.exception("Failed to apply gc.freeze after warmup/precompile.")
+
     # Generate the prefix
     prefix = ""
     if server_args.nnodes > 1:
@@ -2461,6 +2483,7 @@ def run_scheduler_process(
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(server_args, port_args)
+        maybe_freeze_gc_after_warmup()
         pipe_writer.send(
             {
                 "status": "ready",
@@ -2484,10 +2507,34 @@ def run_scheduler_loop_thread_after_create(
     server_args: ServerArgs,
     port_args: PortArgs,
 ):
+    def maybe_freeze_gc_after_warmup():
+        if not getattr(server_args, "enable_gc_freeze", False):
+            return
+        if not hasattr(gc, "freeze"):
+            logger.warning(
+                "GC freeze requested but gc.freeze is unavailable on this Python runtime."
+            )
+            return
+        try:
+            freeze_before = gc.get_freeze_count() if hasattr(gc, "get_freeze_count") else -1
+            collected = gc.collect()
+            gc.freeze()
+            freeze_after = gc.get_freeze_count() if hasattr(gc, "get_freeze_count") else -1
+            logger.info(
+                "Applied gc.freeze after warmup/precompile. collected=%d freeze_before=%d freeze_after=%d gc_count=%s",
+                collected,
+                freeze_before,
+                freeze_after,
+                gc.get_count(),
+            )
+        except Exception:
+            logger.exception("Failed to apply gc.freeze after warmup/precompile.")
+
     current_process = psutil.Process()
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(server_args, port_args)
+        maybe_freeze_gc_after_warmup()
         scheduler_thread = threading.Thread(
             target=scheduler_loop_after_create,
             args=(server_args, scheduler),

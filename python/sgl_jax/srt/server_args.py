@@ -125,6 +125,7 @@ class ServerArgs:
     allow_auto_truncate: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_overlap_schedule: bool = False
+    enable_gc_freeze: bool = False
     enable_precision_tracer: bool = False
 
     # Kernel backend
@@ -837,6 +838,11 @@ class ServerArgs:
             "--enable-tokenizer-batch-encode",
             action="store_true",
             help="Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds.",
+        )
+        parser.add_argument(
+            "--enable-gc-freeze",
+            action="store_true",
+            help="Freeze long-lived Python GC objects after scheduler warmup/precompile.",
         )
         parser.add_argument(
             "--enable-precision-tracer",
