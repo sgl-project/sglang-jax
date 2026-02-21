@@ -213,7 +213,7 @@ class TokenizerManager:
         self.release_scoring_cache_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.score_from_cache_v2_communicator = _Communicator(
+        self.score_from_cache_v2_communicator = _CorrelatedCommunicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.profile_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
@@ -1878,6 +1878,7 @@ class TokenizerManager:
         apply_softmax: bool,
     ) -> ScoreFromCacheReqOutput:
         self.auto_create_handle_loop()
+        req_rid = f"scorev2-{uuid.uuid4().hex}"
         timeout_s = float(
             getattr(self.server_args, "multi_item_prefill_extend_cache_timeout", 60.0)
         )
@@ -1890,6 +1891,7 @@ class TokenizerManager:
         )
         outputs = await self.score_from_cache_v2_communicator(
             ScoreFromCacheReqInput(
+                rid=req_rid,
                 cache_handle=cache_handle,
                 items_2d=items,
                 label_token_ids=label_token_ids,
@@ -2113,6 +2115,67 @@ class SignalHandler:
         logger.error("Received sigquit from a child process. It usually means the child failed.")
         self.tokenizer_manager.dump_requests_before_crash()
         kill_process_tree(os.getpid())
+
+
+@dataclasses.dataclass
+class _CorrelatedWaiter[T]:
+    event: asyncio.Event
+    values: list[T]
+
+
+class _CorrelatedCommunicator[T]:
+    """Allow multiple in-flight RPCs by correlating responses with `rid`."""
+
+    def __init__(self, sender, fan_out: int):
+        self._sender = sender
+        self._fan_out = fan_out
+        self._pending: dict[str, _CorrelatedWaiter[T]] = {}
+
+    async def __call__(self, obj, timeout: float | None = None):
+        rid = getattr(obj, "rid", None)
+        if not rid:
+            raise ValueError(
+                "Correlated communicator requires request objects with non-empty `rid`."
+            )
+        if rid in self._pending:
+            raise RuntimeError(f"Duplicate in-flight correlated request rid={rid!r}.")
+
+        waiter = _CorrelatedWaiter(event=asyncio.Event(), values=[])
+        self._pending[rid] = waiter
+        try:
+            if obj is not None:
+                self._sender.send_pyobj(obj)
+
+            wait_coro = waiter.event.wait()
+            if timeout is not None and timeout > 0:
+                await asyncio.wait_for(wait_coro, timeout=timeout)
+            else:
+                await wait_coro
+            return list(waiter.values)
+        finally:
+            self._pending.pop(rid, None)
+
+    def handle_recv(self, recv_obj: T):
+        rid = getattr(recv_obj, "rid", None)
+        if not rid:
+            logger.warning(
+                "Dropping correlated communicator response missing rid. type=%s",
+                type(recv_obj).__name__,
+            )
+            return
+
+        waiter = self._pending.get(rid)
+        if waiter is None:
+            logger.warning(
+                "Dropping correlated communicator response with no active waiter. rid=%s type=%s",
+                rid,
+                type(recv_obj).__name__,
+            )
+            return
+
+        waiter.values.append(recv_obj)
+        if len(waiter.values) >= self._fan_out:
+            waiter.event.set()
 
 
 class _Communicator[T]:
