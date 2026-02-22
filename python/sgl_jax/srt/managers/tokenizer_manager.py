@@ -507,6 +507,29 @@ class TokenizerManager:
         self.rid_to_state[rid_key] = state
         return state
 
+    def _send_batch_requests(
+        self,
+        objs: list[GenerateReqInput | EmbeddingReqInput],
+        tokenized_objs: list[TokenizedGenerateReqInput | TokenizedEmbeddingReqInput],
+        created_time: float | None = None,
+    ) -> list[ReqState]:
+        if len(objs) != len(tokenized_objs):
+            raise ValueError("objs and tokenized_objs must have the same length")
+        if not objs:
+            return []
+
+        self._raise_if_scheduler_unavailable()
+        payload = tokenized_objs[0] if len(tokenized_objs) == 1 else tokenized_objs
+        self.send_to_scheduler.send_pyobj(payload)
+
+        states: list[ReqState] = []
+        for obj in objs:
+            state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
+            rid_key = obj.rid[0] if isinstance(obj.rid, list) else obj.rid
+            self.rid_to_state[rid_key] = state
+            states.append(state)
+        return states
+
     @staticmethod
     def _is_process_alive(pid: int) -> bool:
         if pid <= 0:
@@ -659,12 +682,21 @@ class TokenizerManager:
                 self._validate_batch_tokenization_constraints(batch_size, obj)
 
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
-
-                for i, tokenized_obj in enumerate(tokenized_objs):
-                    tmp_obj = obj[i]
-                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, state, request))
-                    rids.append(tmp_obj.rid)
+                batched_objs = [obj[i] for i in range(batch_size)]
+                if self.server_args.enable_tokenizer_batch_send:
+                    states = self._send_batch_requests(
+                        batched_objs,
+                        tokenized_objs,
+                        created_time,
+                    )
+                    for tmp_obj, state in zip(batched_objs, states, strict=True):
+                        generators.append(self._wait_one_response(tmp_obj, state, request))
+                        rids.append(tmp_obj.rid)
+                else:
+                    for tmp_obj, tokenized_obj in zip(batched_objs, tokenized_objs, strict=True):
+                        state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                        generators.append(self._wait_one_response(tmp_obj, state, request))
+                        rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
                 for i in range(batch_size):

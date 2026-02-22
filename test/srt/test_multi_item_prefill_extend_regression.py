@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import jax
 import numpy as np
 import pytest
+import zmq
 from jax.sharding import Mesh
 
 import sgl_jax.srt.managers.scheduler as scheduler_module
@@ -126,6 +127,7 @@ class _NoopSender:
 
 class _FakeSchedulerLivenessManager:
     _send_one_request = TokenizerManager._send_one_request
+    _send_batch_requests = TokenizerManager._send_batch_requests
     _wait_one_response = TokenizerManager._wait_one_response
     _build_scheduler_unavailable_message = TokenizerManager._build_scheduler_unavailable_message
     _fail_pending_requests = TokenizerManager._fail_pending_requests
@@ -146,6 +148,91 @@ class _FakeSchedulerLivenessManager:
     def _is_process_alive(pid: int) -> bool:
         del pid
         return False
+
+
+class _FakeBatchRequestContainer:
+    def __init__(self, requests: list[SimpleNamespace], stream: bool = False):
+        self._requests = requests
+        self.batch_size = len(requests)
+        self.stream = stream
+        self.parallel_sample_num = 1
+
+    def __getitem__(self, index: int) -> SimpleNamespace:
+        return self._requests[index]
+
+
+class _FakeBatchHandleManager:
+    _handle_batch_request = TokenizerManager._handle_batch_request
+
+    def __init__(self, enable_batch_send: bool):
+        self.server_args = SimpleNamespace(
+            enable_tokenizer_batch_encode=True,
+            enable_tokenizer_batch_send=enable_batch_send,
+        )
+        self.sent_single = []
+        self.sent_batch = []
+
+    def _validate_batch_tokenization_constraints(self, batch_size, obj):
+        del batch_size, obj
+        return None
+
+    async def _batch_tokenize_and_process(self, batch_size: int, obj):
+        del obj
+        return [SimpleNamespace(tokenized_idx=i) for i in range(batch_size)]
+
+    def _send_one_request(self, obj, tokenized_obj, created_time=None):
+        self.sent_single.append((obj.rid, tokenized_obj))
+        return ReqState([], True, asyncio.Event(), obj, created_time=created_time)
+
+    def _send_batch_requests(self, objs, tokenized_objs, created_time=None):
+        self.sent_batch.append(([obj.rid for obj in objs], tokenized_objs))
+        return [ReqState([], True, asyncio.Event(), obj, created_time=created_time) for obj in objs]
+
+    async def _wait_one_response(self, obj, state, request=None):
+        del state, request
+        yield {"meta_info": {"id": obj.rid}, "text": "", "index": 0}
+
+
+class _FakeIngressSocket:
+    def __init__(self, payloads: list):
+        self.payloads = list(payloads)
+
+    def recv_pyobj(self, flags=None):
+        del flags
+        if self.payloads:
+            return self.payloads.pop(0)
+        raise zmq.ZMQError()
+
+
+class _FakeSchedulerIngress:
+    recv_requests = Scheduler.recv_requests
+
+    def __init__(self, tokenizer_payloads: list, rpc_payloads: list):
+        self.node_rank = 0
+        self.nnodes = 1
+        self.recv_from_tokenizer = _FakeIngressSocket(tokenizer_payloads)
+        self.recv_from_rpc = _FakeIngressSocket(rpc_payloads)
+        self.ingress_recv_calls = 0
+        self.ingress_nonempty_calls = 0
+        self.ingress_max_batch_size = 0
+        self.ingress_tokenizer_frames = 0
+        self.ingress_rpc_frames = 0
+        self.ingress_tokenizer_messages = 0
+        self.ingress_rpc_messages = 0
+        self.ingress_batch_size_histogram = {
+            "eq_0": 0,
+            "eq_1": 0,
+            "2_to_4": 0,
+            "5_to_16": 0,
+            "gt_16": 0,
+        }
+        self.ingress_score_paths = {
+            "tokenizer_multi_item_packed": 0,
+            "tokenizer_cache_for_scoring": 0,
+            "tokenizer_extend_from_cache": 0,
+            "rpc_score_from_cache_v2": 0,
+            "rpc_release_scoring_cache": 0,
+        }
 
 
 def test_create_tokenized_object_keeps_prefill_extend_fields():
@@ -258,11 +345,25 @@ class _FakeSchedulerCacheOps:
     _touch_scoring_cache_entry = Scheduler._touch_scoring_cache_entry
     _evict_expired_scoring_cache_nodes = Scheduler._evict_expired_scoring_cache_nodes
     _resolve_extend_from_cache = Scheduler._resolve_extend_from_cache
+    _record_scoring_cache_lookup = Scheduler._record_scoring_cache_lookup
+    _record_scoring_cache_handle_released = Scheduler._record_scoring_cache_handle_released
 
     def __init__(self, timeout_s: float):
         self.scoring_cache_timeout = timeout_s
         self._last_scoring_cache_gc = 0.0
         self.scoring_cache_nodes = {}
+        self.scoring_cache_lookup_queries = 0
+        self.scoring_cache_lookup_hits = 0
+        self.scoring_cache_lookup_misses = 0
+        self.scoring_cache_lookup_by_path = {
+            "extend": {"queries": 0, "hits": 0, "misses": 0},
+            "score_from_cache_v2": {"queries": 0, "hits": 0, "misses": 0},
+        }
+        self.scoring_cache_handles_released = 0
+        self.scoring_cache_handles_released_manual = 0
+        self.scoring_cache_handles_released_expired = 0
+        self.scoring_cache_handles_released_other = 0
+        self.scoring_cache_handles_missing_node = 0
         self.tree_cache = SimpleNamespace(dec_lock_ref=lambda *args, **kwargs: None)
 
 
@@ -385,6 +486,83 @@ def test_send_one_request_fails_fast_when_scheduler_unavailable():
         manager._send_one_request(req, tokenized_obj=SimpleNamespace(), created_time=0.0)
 
     assert manager.send_to_scheduler.calls == []
+
+
+def test_send_batch_requests_sends_single_payload_and_tracks_all_states():
+    manager = _FakeSchedulerLivenessManager()
+    manager.scheduler_pids = []
+    reqs = [SimpleNamespace(rid="rid-a"), SimpleNamespace(rid="rid-b")]
+    tokenized_objs = [SimpleNamespace(tok=1), SimpleNamespace(tok=2)]
+
+    states = manager._send_batch_requests(reqs, tokenized_objs, created_time=1.0)
+
+    assert len(states) == 2
+    assert set(manager.rid_to_state.keys()) == {"rid-a", "rid-b"}
+    assert len(manager.send_to_scheduler.calls) == 1
+    assert manager.send_to_scheduler.calls[0] == tokenized_objs
+
+
+def test_send_batch_requests_raises_on_length_mismatch():
+    manager = _FakeSchedulerLivenessManager()
+    manager.scheduler_pids = []
+    with pytest.raises(ValueError, match="same length"):
+        manager._send_batch_requests([SimpleNamespace(rid="rid-a")], [], created_time=0.0)
+
+
+def test_handle_batch_request_uses_single_send_when_batch_send_enabled():
+    manager = _FakeBatchHandleManager(enable_batch_send=True)
+    obj = _FakeBatchRequestContainer(
+        [SimpleNamespace(rid="rid-1"), SimpleNamespace(rid="rid-2")],
+        stream=False,
+    )
+
+    async def _collect():
+        outputs = []
+        async for out in manager._handle_batch_request(obj, request=None, created_time=0.0):
+            outputs.append(out)
+        return outputs
+
+    outputs = asyncio.run(_collect())
+    assert len(outputs) == 1
+    assert len(outputs[0]) == 2
+    assert len(manager.sent_batch) == 1
+    assert manager.sent_single == []
+
+
+def test_handle_batch_request_uses_per_request_send_when_batch_send_disabled():
+    manager = _FakeBatchHandleManager(enable_batch_send=False)
+    obj = _FakeBatchRequestContainer(
+        [SimpleNamespace(rid="rid-1"), SimpleNamespace(rid="rid-2")],
+        stream=False,
+    )
+
+    async def _collect():
+        outputs = []
+        async for out in manager._handle_batch_request(obj, request=None, created_time=0.0):
+            outputs.append(out)
+        return outputs
+
+    outputs = asyncio.run(_collect())
+    assert len(outputs) == 1
+    assert len(outputs[0]) == 2
+    assert manager.sent_batch == []
+    assert len(manager.sent_single) == 2
+
+
+def test_scheduler_recv_requests_unpacks_list_payload_into_logical_batch():
+    scheduler = _FakeSchedulerIngress(
+        tokenizer_payloads=[[SimpleNamespace(a=1), SimpleNamespace(a=2)]],
+        rpc_payloads=[],
+    )
+
+    recv_reqs = scheduler.recv_requests()
+
+    assert len(recv_reqs) == 2
+    assert scheduler.ingress_tokenizer_frames == 1
+    assert scheduler.ingress_tokenizer_messages == 2
+    assert scheduler.ingress_nonempty_calls == 1
+    assert scheduler.ingress_max_batch_size == 2
+    assert scheduler.ingress_batch_size_histogram["2_to_4"] == 1
 
 
 def test_mark_scheduler_unavailable_aborts_all_pending_requests():

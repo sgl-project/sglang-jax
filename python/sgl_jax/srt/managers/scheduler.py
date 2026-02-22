@@ -407,6 +407,9 @@ class Scheduler(
         self.ingress_recv_calls = 0
         self.ingress_nonempty_calls = 0
         self.ingress_max_batch_size = 0
+        self.ingress_tokenizer_frames = 0
+        self.ingress_rpc_frames = 0
+        # "messages" here counts logical requests seen by scheduler after unpack.
         self.ingress_tokenizer_messages = 0
         self.ingress_rpc_messages = 0
         self.ingress_batch_size_histogram = {
@@ -725,39 +728,53 @@ class Scheduler(
         self.ingress_recv_calls += 1
         if self.node_rank == 0:
             recv_reqs = []
-            tokenizer_count = 0
-            rpc_count = 0
+            tokenizer_frame_count = 0
+            rpc_frame_count = 0
+            tokenizer_req_count = 0
+            rpc_req_count = 0
 
             while True:
                 try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    recv_obj = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
-                recv_reqs.append(recv_req)
-                tokenizer_count += 1
-                if isinstance(recv_req, TokenizedGenerateReqInput):
-                    if bool(getattr(recv_req, "is_multi_item_scoring", False)):
-                        self.ingress_score_paths["tokenizer_multi_item_packed"] += 1
-                    if bool(getattr(recv_req, "cache_for_scoring", False)):
-                        self.ingress_score_paths["tokenizer_cache_for_scoring"] += 1
-                    if bool(getattr(recv_req, "extend_from_cache", None)):
-                        self.ingress_score_paths["tokenizer_extend_from_cache"] += 1
+                tokenizer_frame_count += 1
+                unpacked_reqs = (
+                    list(recv_obj) if isinstance(recv_obj, (list, tuple)) else [recv_obj]
+                )
+                recv_reqs.extend(unpacked_reqs)
+                tokenizer_req_count += len(unpacked_reqs)
+                for recv_req in unpacked_reqs:
+                    if isinstance(recv_req, TokenizedGenerateReqInput):
+                        if bool(getattr(recv_req, "is_multi_item_scoring", False)):
+                            self.ingress_score_paths["tokenizer_multi_item_packed"] += 1
+                        if bool(getattr(recv_req, "cache_for_scoring", False)):
+                            self.ingress_score_paths["tokenizer_cache_for_scoring"] += 1
+                        if bool(getattr(recv_req, "extend_from_cache", None)):
+                            self.ingress_score_paths["tokenizer_extend_from_cache"] += 1
 
             while True:
                 try:
-                    recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+                    recv_obj = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
-                recv_reqs.append(recv_rpc)
-                rpc_count += 1
-                if isinstance(recv_rpc, ScoreFromCacheReqInput):
-                    self.ingress_score_paths["rpc_score_from_cache_v2"] += 1
-                elif isinstance(recv_rpc, ReleaseScoringCacheReqInput):
-                    self.ingress_score_paths["rpc_release_scoring_cache"] += 1
+                rpc_frame_count += 1
+                unpacked_reqs = (
+                    list(recv_obj) if isinstance(recv_obj, (list, tuple)) else [recv_obj]
+                )
+                recv_reqs.extend(unpacked_reqs)
+                rpc_req_count += len(unpacked_reqs)
+                for recv_rpc in unpacked_reqs:
+                    if isinstance(recv_rpc, ScoreFromCacheReqInput):
+                        self.ingress_score_paths["rpc_score_from_cache_v2"] += 1
+                    elif isinstance(recv_rpc, ReleaseScoringCacheReqInput):
+                        self.ingress_score_paths["rpc_release_scoring_cache"] += 1
 
-            self.ingress_tokenizer_messages += tokenizer_count
-            self.ingress_rpc_messages += rpc_count
-            batch_size = tokenizer_count + rpc_count
+            self.ingress_tokenizer_frames += tokenizer_frame_count
+            self.ingress_rpc_frames += rpc_frame_count
+            self.ingress_tokenizer_messages += tokenizer_req_count
+            self.ingress_rpc_messages += rpc_req_count
+            batch_size = tokenizer_req_count + rpc_req_count
             if batch_size > 0:
                 self.ingress_nonempty_calls += 1
                 if batch_size > self.ingress_max_batch_size:
@@ -1823,6 +1840,8 @@ class Scheduler(
             "recv_calls": self.ingress_recv_calls,
             "nonempty_calls": self.ingress_nonempty_calls,
             "max_batch_size": self.ingress_max_batch_size,
+            "tokenizer_frames": self.ingress_tokenizer_frames,
+            "rpc_frames": self.ingress_rpc_frames,
             "tokenizer_messages": self.ingress_tokenizer_messages,
             "rpc_messages": self.ingress_rpc_messages,
             "batch_size_histogram": dict(self.ingress_batch_size_histogram),
