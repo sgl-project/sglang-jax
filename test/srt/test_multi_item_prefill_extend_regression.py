@@ -15,8 +15,10 @@ from sgl_jax.srt.layers.sampler import (
 )
 from sgl_jax.srt.managers.io_struct import (
     GenerateReqInput,
+    ReleaseScoringCacheReqInput,
     ScoreFromCacheReqInput,
     ScoreFromCacheReqOutput,
+    TokenizedGenerateReqInput,
 )
 from sgl_jax.srt.managers.scheduler import Scheduler
 from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
@@ -230,6 +232,13 @@ class _FakeSchedulerIngress:
             "gt_16": 0,
         }
         self.ingress_score_paths = {
+            "tokenizer_multi_item_packed": 0,
+            "tokenizer_cache_for_scoring": 0,
+            "tokenizer_extend_from_cache": 0,
+            "rpc_score_from_cache_v2": 0,
+            "rpc_release_scoring_cache": 0,
+        }
+        self.ingress_score_path_frames = {
             "tokenizer_multi_item_packed": 0,
             "tokenizer_cache_for_scoring": 0,
             "tokenizer_extend_from_cache": 0,
@@ -573,19 +582,55 @@ def test_handle_batch_request_uses_single_send_without_batch_encode():
 
 
 def test_scheduler_recv_requests_unpacks_list_payload_into_logical_batch():
+    tokenizer_payload = [
+        TokenizedGenerateReqInput(
+            rid="tok-1",
+            input_ids=[1, 2],
+            sampling_params={},
+            cache_for_scoring=True,
+            is_multi_item_scoring=True,
+        ),
+        TokenizedGenerateReqInput(
+            rid="tok-2",
+            input_ids=[1, 3],
+            sampling_params={},
+            extend_from_cache="cache-handle-1",
+        ),
+    ]
+    rpc_payload = [
+        ScoreFromCacheReqInput(
+            rid="rpc-1",
+            cache_handle="cache-handle-1",
+            items_2d=[[7, 8]],
+            label_token_ids=[198],
+        ),
+        ReleaseScoringCacheReqInput(rid="rpc-2"),
+    ]
     scheduler = _FakeSchedulerIngress(
-        tokenizer_payloads=[[SimpleNamespace(a=1), SimpleNamespace(a=2)]],
-        rpc_payloads=[],
+        tokenizer_payloads=[tokenizer_payload],
+        rpc_payloads=[rpc_payload],
     )
 
     recv_reqs = scheduler.recv_requests()
 
-    assert len(recv_reqs) == 2
+    assert len(recv_reqs) == 4
     assert scheduler.ingress_tokenizer_frames == 1
+    assert scheduler.ingress_rpc_frames == 1
     assert scheduler.ingress_tokenizer_messages == 2
+    assert scheduler.ingress_rpc_messages == 2
     assert scheduler.ingress_nonempty_calls == 1
-    assert scheduler.ingress_max_batch_size == 2
+    assert scheduler.ingress_max_batch_size == 4
     assert scheduler.ingress_batch_size_histogram["2_to_4"] == 1
+    assert scheduler.ingress_score_paths["tokenizer_multi_item_packed"] == 1
+    assert scheduler.ingress_score_paths["tokenizer_cache_for_scoring"] == 1
+    assert scheduler.ingress_score_paths["tokenizer_extend_from_cache"] == 1
+    assert scheduler.ingress_score_paths["rpc_score_from_cache_v2"] == 1
+    assert scheduler.ingress_score_paths["rpc_release_scoring_cache"] == 1
+    assert scheduler.ingress_score_path_frames["tokenizer_multi_item_packed"] == 1
+    assert scheduler.ingress_score_path_frames["tokenizer_cache_for_scoring"] == 1
+    assert scheduler.ingress_score_path_frames["tokenizer_extend_from_cache"] == 1
+    assert scheduler.ingress_score_path_frames["rpc_score_from_cache_v2"] == 1
+    assert scheduler.ingress_score_path_frames["rpc_release_scoring_cache"] == 1
 
 
 def test_mark_scheduler_unavailable_aborts_all_pending_requests():
@@ -770,6 +815,7 @@ class _FakeSchedulerScoreFromCacheV2:
     _score_from_cache_v2_validate_items = Scheduler._score_from_cache_v2_validate_items
     _score_from_cache_v2_fallback_output = Scheduler._score_from_cache_v2_fallback_output
     _record_score_from_cache_v2_fallback = Scheduler._record_score_from_cache_v2_fallback
+    _record_score_from_cache_v2_timing = Scheduler._record_score_from_cache_v2_timing
     _record_scoring_cache_lookup = Scheduler._record_scoring_cache_lookup
     _scoring_cache_metrics_snapshot = Scheduler._scoring_cache_metrics_snapshot
     _estimate_score_from_cache_v2_words = Scheduler._estimate_score_from_cache_v2_words
@@ -805,6 +851,12 @@ class _FakeSchedulerScoreFromCacheV2:
         self.score_from_cache_v2_succeeded = 0
         self.score_from_cache_v2_fallback = 0
         self.score_from_cache_v2_fallback_reasons = {}
+        self.score_from_cache_v2_queue_wait_s_total = 0.0
+        self.score_from_cache_v2_device_compute_s_total = 0.0
+        self.score_from_cache_v2_host_orchestration_s_total = 0.0
+        self.score_from_cache_v2_queue_wait_s_max = 0.0
+        self.score_from_cache_v2_device_compute_s_max = 0.0
+        self.score_from_cache_v2_host_orchestration_s_max = 0.0
         self.scoring_cache_lookup_queries = 0
         self.scoring_cache_lookup_hits = 0
         self.scoring_cache_lookup_misses = 0
@@ -1168,6 +1220,47 @@ def test_score_from_cache_v2_updates_scoring_cache_lookup_counters_on_miss():
     assert metrics["lookup_by_path"]["score_from_cache_v2"]["queries"] == 1
     assert metrics["lookup_by_path"]["score_from_cache_v2"]["misses"] == 1
     assert metrics["lookup_hit_rate"] == 0.0
+
+
+def test_score_from_cache_v2_timing_counters_are_recorded():
+    scheduler = _FakeSchedulerScoreFromCacheV2()
+    out = scheduler.score_from_cache_v2(
+        ScoreFromCacheReqInput(
+            cache_handle="cache-ok",
+            items_2d=[[1] * 20 for _ in range(4)],
+            label_token_ids=[9454, 2753],
+            items_per_step=4,
+            apply_softmax=False,
+        )
+    )
+
+    assert out.success is True
+    assert scheduler.score_from_cache_v2_attempted == 1
+    assert scheduler.score_from_cache_v2_succeeded == 1
+    assert scheduler.score_from_cache_v2_queue_wait_s_total >= 0.0
+    assert scheduler.score_from_cache_v2_device_compute_s_total == pytest.approx(0.01)
+    assert scheduler.score_from_cache_v2_host_orchestration_s_total == pytest.approx(0.02)
+    assert scheduler.score_from_cache_v2_device_compute_s_max == pytest.approx(0.01)
+    assert scheduler.score_from_cache_v2_host_orchestration_s_max == pytest.approx(0.02)
+
+    before_queue_wait = scheduler.score_from_cache_v2_queue_wait_s_total
+    miss_out = scheduler.score_from_cache_v2(
+        ScoreFromCacheReqInput(
+            cache_handle="cache-missing",
+            items_2d=[[1] * 20 for _ in range(4)],
+            label_token_ids=[9454, 2753],
+            items_per_step=4,
+            apply_softmax=False,
+        )
+    )
+
+    assert miss_out.success is False
+    assert scheduler.score_from_cache_v2_attempted == 2
+    assert scheduler.score_from_cache_v2_fallback == 1
+    assert scheduler.score_from_cache_v2_queue_wait_s_total >= before_queue_wait
+    # Missing-cache fallback records zero compute overhead.
+    assert scheduler.score_from_cache_v2_device_compute_s_total == pytest.approx(0.01)
+    assert scheduler.score_from_cache_v2_host_orchestration_s_total == pytest.approx(0.02)
 
 
 def test_score_from_cache_v2_parity_metric_threshold():

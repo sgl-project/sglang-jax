@@ -426,11 +426,25 @@ class Scheduler(
             "rpc_score_from_cache_v2": 0,
             "rpc_release_scoring_cache": 0,
         }
+        # Number of socket frames that carried each scoring path.
+        self.ingress_score_path_frames = {
+            "tokenizer_multi_item_packed": 0,
+            "tokenizer_cache_for_scoring": 0,
+            "tokenizer_extend_from_cache": 0,
+            "rpc_score_from_cache_v2": 0,
+            "rpc_release_scoring_cache": 0,
+        }
         # Fastpath v2 score-from-cache counters.
         self.score_from_cache_v2_attempted = 0
         self.score_from_cache_v2_succeeded = 0
         self.score_from_cache_v2_fallback = 0
         self.score_from_cache_v2_fallback_reasons: dict[str, int] = {}
+        self.score_from_cache_v2_queue_wait_s_total = 0.0
+        self.score_from_cache_v2_device_compute_s_total = 0.0
+        self.score_from_cache_v2_host_orchestration_s_total = 0.0
+        self.score_from_cache_v2_queue_wait_s_max = 0.0
+        self.score_from_cache_v2_device_compute_s_max = 0.0
+        self.score_from_cache_v2_host_orchestration_s_max = 0.0
 
         # Init schedule policy and new token estimation
         self.policy = SchedulePolicy(
@@ -744,14 +758,25 @@ class Scheduler(
                 )
                 recv_reqs.extend(unpacked_reqs)
                 tokenizer_req_count += len(unpacked_reqs)
+                tokenizer_frame_paths = {
+                    "tokenizer_multi_item_packed": False,
+                    "tokenizer_cache_for_scoring": False,
+                    "tokenizer_extend_from_cache": False,
+                }
                 for recv_req in unpacked_reqs:
                     if isinstance(recv_req, TokenizedGenerateReqInput):
                         if bool(getattr(recv_req, "is_multi_item_scoring", False)):
                             self.ingress_score_paths["tokenizer_multi_item_packed"] += 1
+                            tokenizer_frame_paths["tokenizer_multi_item_packed"] = True
                         if bool(getattr(recv_req, "cache_for_scoring", False)):
                             self.ingress_score_paths["tokenizer_cache_for_scoring"] += 1
+                            tokenizer_frame_paths["tokenizer_cache_for_scoring"] = True
                         if bool(getattr(recv_req, "extend_from_cache", None)):
                             self.ingress_score_paths["tokenizer_extend_from_cache"] += 1
+                            tokenizer_frame_paths["tokenizer_extend_from_cache"] = True
+                for path, seen in tokenizer_frame_paths.items():
+                    if seen:
+                        self.ingress_score_path_frames[path] += 1
 
             while True:
                 try:
@@ -764,11 +789,20 @@ class Scheduler(
                 )
                 recv_reqs.extend(unpacked_reqs)
                 rpc_req_count += len(unpacked_reqs)
+                rpc_frame_paths = {
+                    "rpc_score_from_cache_v2": False,
+                    "rpc_release_scoring_cache": False,
+                }
                 for recv_rpc in unpacked_reqs:
                     if isinstance(recv_rpc, ScoreFromCacheReqInput):
                         self.ingress_score_paths["rpc_score_from_cache_v2"] += 1
+                        rpc_frame_paths["rpc_score_from_cache_v2"] = True
                     elif isinstance(recv_rpc, ReleaseScoringCacheReqInput):
                         self.ingress_score_paths["rpc_release_scoring_cache"] += 1
+                        rpc_frame_paths["rpc_release_scoring_cache"] = True
+                for path, seen in rpc_frame_paths.items():
+                    if seen:
+                        self.ingress_score_path_frames[path] += 1
 
             self.ingress_tokenizer_frames += tokenizer_frame_count
             self.ingress_rpc_frames += rpc_frame_count
@@ -972,16 +1006,47 @@ class Scheduler(
             self.score_from_cache_v2_fallback_reasons.get(reason, 0) + 1
         )
 
+    def _record_score_from_cache_v2_timing(
+        self,
+        queue_wait_s: float,
+        device_compute_s: float,
+        host_orchestration_s: float,
+    ) -> None:
+        queue_wait_s = max(0.0, float(queue_wait_s))
+        device_compute_s = max(0.0, float(device_compute_s))
+        host_orchestration_s = max(0.0, float(host_orchestration_s))
+        self.score_from_cache_v2_queue_wait_s_total += queue_wait_s
+        self.score_from_cache_v2_device_compute_s_total += device_compute_s
+        self.score_from_cache_v2_host_orchestration_s_total += host_orchestration_s
+        self.score_from_cache_v2_queue_wait_s_max = max(
+            self.score_from_cache_v2_queue_wait_s_max,
+            queue_wait_s,
+        )
+        self.score_from_cache_v2_device_compute_s_max = max(
+            self.score_from_cache_v2_device_compute_s_max,
+            device_compute_s,
+        )
+        self.score_from_cache_v2_host_orchestration_s_max = max(
+            self.score_from_cache_v2_host_orchestration_s_max,
+            host_orchestration_s,
+        )
+
     def _score_from_cache_v2_fallback_output(
         self,
         recv_req: ScoreFromCacheReqInput,
         reason: str,
         error_msg: str = "",
         dispatch_count: int = 0,
+        queue_wait_s: float = 0.0,
         device_compute_s: float = 0.0,
         host_orchestration_s: float = 0.0,
     ) -> ScoreFromCacheReqOutput:
         self._record_score_from_cache_v2_fallback(reason)
+        self._record_score_from_cache_v2_timing(
+            queue_wait_s=queue_wait_s,
+            device_compute_s=device_compute_s,
+            host_orchestration_s=host_orchestration_s,
+        )
         return ScoreFromCacheReqOutput(
             rid=recv_req.rid,
             success=False,
@@ -991,7 +1056,7 @@ class Scheduler(
             dispatch_count=dispatch_count,
             lifecycle_requests_sent=0,
             lifecycle_results_received=0,
-            queue_wait_s=0.0,
+            queue_wait_s=max(0.0, float(queue_wait_s)),
             device_compute_s=device_compute_s,
             host_orchestration_s=host_orchestration_s,
         )
@@ -1465,6 +1530,7 @@ class Scheduler(
                         f"(requested_items_per_step={requested_items_per_step})."
                     ),
                     dispatch_count=dispatch_count,
+                    queue_wait_s=queue_wait_s,
                     device_compute_s=device_compute_s,
                     host_orchestration_s=host_orchestration_s,
                 )
@@ -1476,6 +1542,11 @@ class Scheduler(
             total_items = len(recv_req.items_2d)
             if total_items == 0:
                 self.score_from_cache_v2_succeeded += 1
+                self._record_score_from_cache_v2_timing(
+                    queue_wait_s=0.0,
+                    device_compute_s=0.0,
+                    host_orchestration_s=0.0,
+                )
                 return ScoreFromCacheReqOutput(
                     rid=recv_req.rid,
                     success=True,
@@ -1514,6 +1585,7 @@ class Scheduler(
                             f"max_seq_len={max_seq_len}, estimated_words={estimated_words}"
                         ),
                         dispatch_count=dispatch_count,
+                        queue_wait_s=queue_wait_s,
                         device_compute_s=device_compute_s,
                         host_orchestration_s=host_orchestration_s,
                     )
@@ -1575,11 +1647,17 @@ class Scheduler(
                         f"score-from-cache v2 returned {len(all_scores)} scores for {total_items} items."
                     ),
                     dispatch_count=dispatch_count,
+                    queue_wait_s=queue_wait_s,
                     device_compute_s=device_compute_s,
                     host_orchestration_s=host_orchestration_s,
                 )
 
             self.score_from_cache_v2_succeeded += 1
+            self._record_score_from_cache_v2_timing(
+                queue_wait_s=queue_wait_s,
+                device_compute_s=device_compute_s,
+                host_orchestration_s=host_orchestration_s,
+            )
             return ScoreFromCacheReqOutput(
                 rid=recv_req.rid,
                 success=True,
@@ -1600,6 +1678,7 @@ class Scheduler(
                 reason="runtime_exception",
                 error_msg=str(e),
                 dispatch_count=dispatch_count,
+                queue_wait_s=queue_wait_s,
                 device_compute_s=device_compute_s,
                 host_orchestration_s=host_orchestration_s,
             )
@@ -1829,13 +1908,55 @@ class Scheduler(
         ret["forward_ct_decode"] = self.forward_ct_decode
         ret["new_token_ratio"] = self.new_token_ratio
         ret["init_new_token_ratio"] = self.init_new_token_ratio
+        score_from_cache_v2_attempted = self.score_from_cache_v2_attempted
+        score_timing_totals_s = {
+            "queue_wait": self.score_from_cache_v2_queue_wait_s_total,
+            "device_compute": self.score_from_cache_v2_device_compute_s_total,
+            "host_orchestration": self.score_from_cache_v2_host_orchestration_s_total,
+        }
+        score_timing_max_s = {
+            "queue_wait": self.score_from_cache_v2_queue_wait_s_max,
+            "device_compute": self.score_from_cache_v2_device_compute_s_max,
+            "host_orchestration": self.score_from_cache_v2_host_orchestration_s_max,
+        }
+        if score_from_cache_v2_attempted > 0:
+            score_timing_mean_s = {
+                "queue_wait": (
+                    self.score_from_cache_v2_queue_wait_s_total / score_from_cache_v2_attempted
+                ),
+                "device_compute": (
+                    self.score_from_cache_v2_device_compute_s_total / score_from_cache_v2_attempted
+                ),
+                "host_orchestration": (
+                    self.score_from_cache_v2_host_orchestration_s_total
+                    / score_from_cache_v2_attempted
+                ),
+            }
+        else:
+            score_timing_mean_s = {
+                "queue_wait": 0.0,
+                "device_compute": 0.0,
+                "host_orchestration": 0.0,
+            }
+
         ret["score_from_cache_v2_metrics"] = {
-            "attempted": self.score_from_cache_v2_attempted,
+            "attempted": score_from_cache_v2_attempted,
             "succeeded": self.score_from_cache_v2_succeeded,
             "fallback": self.score_from_cache_v2_fallback,
             "fallback_reasons": dict(self.score_from_cache_v2_fallback_reasons),
+            "timing_totals_s": score_timing_totals_s,
+            "timing_mean_s": score_timing_mean_s,
+            "timing_max_s": score_timing_max_s,
         }
         ret["scoring_cache_metrics"] = self._scoring_cache_metrics_snapshot()
+        score_path_messages = dict(self.ingress_score_paths)
+        score_path_frames = dict(self.ingress_score_path_frames)
+        score_path_messages_per_frame = {}
+        for path_name, path_message_count in score_path_messages.items():
+            path_frame_count = score_path_frames.get(path_name, 0)
+            score_path_messages_per_frame[path_name] = (
+                float(path_message_count / path_frame_count) if path_frame_count > 0 else 0.0
+            )
         ret["ingress_metrics"] = {
             "recv_calls": self.ingress_recv_calls,
             "nonempty_calls": self.ingress_nonempty_calls,
@@ -1844,8 +1965,20 @@ class Scheduler(
             "rpc_frames": self.ingress_rpc_frames,
             "tokenizer_messages": self.ingress_tokenizer_messages,
             "rpc_messages": self.ingress_rpc_messages,
+            "tokenizer_messages_per_frame": (
+                float(self.ingress_tokenizer_messages / self.ingress_tokenizer_frames)
+                if self.ingress_tokenizer_frames > 0
+                else 0.0
+            ),
+            "rpc_messages_per_frame": (
+                float(self.ingress_rpc_messages / self.ingress_rpc_frames)
+                if self.ingress_rpc_frames > 0
+                else 0.0
+            ),
             "batch_size_histogram": dict(self.ingress_batch_size_histogram),
-            "score_path_messages": dict(self.ingress_score_paths),
+            "score_path_messages": score_path_messages,
+            "score_path_frames": score_path_frames,
+            "score_path_messages_per_frame": score_path_messages_per_frame,
         }
 
         return GetInternalStateReqOutput(internal_state=ret)
