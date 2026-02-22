@@ -156,3 +156,44 @@ Artifact:
 
 - One stale TPU process from an earlier ad-hoc GC check was found and killed before final matrix runs.
 - All benchmark matrices above were executed after cleanup on isolated scripts and captured to `/tmp/*.jsonl`.
+
+## Addendum (2026-02-22): Tokenizer Batch-Send A/B
+
+Branch on TPU:
+
+- `/home/kanna/pr27-repro` @ `perf/pr28-nightly-batchsend`
+
+### What changed
+
+- Added flag-gated tokenizer->scheduler batch-send:
+  - `--enable-tokenizer-batch-send`
+- Scheduler now unpacks list payloads and tracks both:
+  - `ingress.tokenizer_frames` (transport frames)
+  - `ingress.tokenizer_messages` (logical requests)
+- Batch-send now applies to:
+  - tokenizer-batch-encode path
+  - pre-tokenized batch request path (important for prefill+extend scoring traffic)
+
+### Validation
+
+- Unit tests:
+  - `test/srt/test_server_args_gc_freeze.py` (6 passed)
+  - `test/srt/test_multi_item_prefill_extend_regression.py` (40 passed)
+
+### A/B results on TPU
+
+Fastpath v2 lane (`multi_item_enable_score_from_cache_v2=1`, label-only on):
+
+- no-batch-send: `1411.15 items/s` (`/tmp/batch_send_onecase_false.log`)
+- batch-send: `1486.98 items/s` (`/tmp/batch_send_onecase_true.log`)
+- rerun no-batch-send: `1483.43 items/s` (`/tmp/batch_send_onecase_false_rerun.log`)
+- take-away: no clear steady-state regression or gain in the v2 lane (within run-to-run variance).
+
+Prefill+extend baseline lane (`multi_item_enable_score_from_cache_v2=0`):
+
+- paired rerun (short timed set):
+  - no-batch-send: `545.62 items/s`, `tokenizer_frames=367`, `tokenizer_messages=367`
+    (`/tmp/batch_send_onecase_prefill_false_rerun.log`)
+  - batch-send: `560.78 items/s`, `tokenizer_frames=52`, `tokenizer_messages=367`
+    (`/tmp/batch_send_onecase_prefill_true_rerun.log`)
+- take-away: batch-send materially reduces frame count (367 -> 52) and gives a modest throughput gain (~2.8%) on this baseline lane.
