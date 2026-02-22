@@ -164,9 +164,9 @@ class _FakeBatchRequestContainer:
 class _FakeBatchHandleManager:
     _handle_batch_request = TokenizerManager._handle_batch_request
 
-    def __init__(self, enable_batch_send: bool):
+    def __init__(self, enable_batch_send: bool, enable_batch_encode: bool):
         self.server_args = SimpleNamespace(
-            enable_tokenizer_batch_encode=True,
+            enable_tokenizer_batch_encode=enable_batch_encode,
             enable_tokenizer_batch_send=enable_batch_send,
         )
         self.sent_single = []
@@ -179,6 +179,9 @@ class _FakeBatchHandleManager:
     async def _batch_tokenize_and_process(self, batch_size: int, obj):
         del obj
         return [SimpleNamespace(tokenized_idx=i) for i in range(batch_size)]
+
+    async def _tokenize_one_request(self, obj):
+        return SimpleNamespace(tokenized_single=obj.rid)
 
     def _send_one_request(self, obj, tokenized_obj, created_time=None):
         self.sent_single.append((obj.rid, tokenized_obj))
@@ -510,7 +513,7 @@ def test_send_batch_requests_raises_on_length_mismatch():
 
 
 def test_handle_batch_request_uses_single_send_when_batch_send_enabled():
-    manager = _FakeBatchHandleManager(enable_batch_send=True)
+    manager = _FakeBatchHandleManager(enable_batch_send=True, enable_batch_encode=True)
     obj = _FakeBatchRequestContainer(
         [SimpleNamespace(rid="rid-1"), SimpleNamespace(rid="rid-2")],
         stream=False,
@@ -530,7 +533,7 @@ def test_handle_batch_request_uses_single_send_when_batch_send_enabled():
 
 
 def test_handle_batch_request_uses_per_request_send_when_batch_send_disabled():
-    manager = _FakeBatchHandleManager(enable_batch_send=False)
+    manager = _FakeBatchHandleManager(enable_batch_send=False, enable_batch_encode=True)
     obj = _FakeBatchRequestContainer(
         [SimpleNamespace(rid="rid-1"), SimpleNamespace(rid="rid-2")],
         stream=False,
@@ -547,6 +550,26 @@ def test_handle_batch_request_uses_per_request_send_when_batch_send_disabled():
     assert len(outputs[0]) == 2
     assert manager.sent_batch == []
     assert len(manager.sent_single) == 2
+
+
+def test_handle_batch_request_uses_single_send_without_batch_encode():
+    manager = _FakeBatchHandleManager(enable_batch_send=True, enable_batch_encode=False)
+    obj = _FakeBatchRequestContainer(
+        [SimpleNamespace(rid="rid-1"), SimpleNamespace(rid="rid-2")],
+        stream=False,
+    )
+
+    async def _collect():
+        outputs = []
+        async for out in manager._handle_batch_request(obj, request=None, created_time=0.0):
+            outputs.append(out)
+        return outputs
+
+    outputs = asyncio.run(_collect())
+    assert len(outputs) == 1
+    assert len(outputs[0]) == 2
+    assert len(manager.sent_batch) == 1
+    assert manager.sent_single == []
 
 
 def test_scheduler_recv_requests_unpacks_list_payload_into_logical_batch():

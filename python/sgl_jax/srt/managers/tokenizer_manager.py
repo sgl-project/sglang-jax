@@ -699,12 +699,25 @@ class TokenizerManager:
                         rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
-                for i in range(batch_size):
-                    tmp_obj = obj[i]
-                    tokenized_obj = await self._tokenize_one_request(tmp_obj)
-                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, state, request))
-                    rids.append(tmp_obj.rid)
+                batched_objs = [obj[i] for i in range(batch_size)]
+                tokenized_objs = []
+                for tmp_obj in batched_objs:
+                    tokenized_objs.append(await self._tokenize_one_request(tmp_obj))
+
+                if self.server_args.enable_tokenizer_batch_send:
+                    states = self._send_batch_requests(
+                        batched_objs,
+                        tokenized_objs,
+                        created_time,
+                    )
+                    for tmp_obj, state in zip(batched_objs, states, strict=True):
+                        generators.append(self._wait_one_response(tmp_obj, state, request))
+                        rids.append(tmp_obj.rid)
+                else:
+                    for tmp_obj, tokenized_obj in zip(batched_objs, tokenized_objs, strict=True):
+                        state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                        generators.append(self._wait_one_response(tmp_obj, state, request))
+                        rids.append(tmp_obj.rid)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
             if batch_size > 128:
