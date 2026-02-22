@@ -26,6 +26,7 @@ This plan intentionally stays close to the LinkedIn SGLang ranking post and focu
   - Concurrent load: `QPS`, `P50/P95/P99`.
   - Host vs device split (`queue_wait_s`, `host_orchestration_s`, `device_compute_s`).
   - Cache counters (`lookup_queries`, `lookup_hits`, `lookup_misses`, fallback counts).
+- Use `scripts/multi_item/benchmark_score_matrix.py` as the default gate harness for matrix capture and path-integrity probes.
 
 ## Execution Plan
 
@@ -71,6 +72,57 @@ This plan intentionally stays close to the LinkedIn SGLang ranking post and focu
      - No throughput regression beyond noise.
      - Tail latency improved or unchanged.
      - Fast rollback path validated.
+
+## Priority Queue (Current)
+
+1. `P0` Token budget reduction (context compression + prompt minimization)
+   - Rationale: usually the largest direct throughput and latency lever.
+   - Tasks:
+     - Audit and shorten ranking prompt templates.
+     - Add optional context compression pass before scoring.
+     - Track query-token and item-token distributions in benchmark reports.
+
+2. `P0` Concurrency batch-integrity verification
+   - Rationale: avoid silent fragmentation between tokenizer, ZMQ, and scheduler.
+   - Tasks:
+     - Run concurrent canaries that validate tokenizer-frame vs logical-message ratios.
+     - Confirm effective scheduler batch sizes under load for all scoring paths.
+     - Keep ingress counters in regression gates.
+
+3. `P1` Scheduler scale-out canary (LinkedIn-style runtime scaling)
+   - Rationale: host scheduling can bottleneck once device kernels are fast.
+   - Tasks:
+     - Canary 2 scheduler processes per TPU slice.
+     - Compare QPS, `P95/P99`, queue wait, and fallback behavior against single-scheduler baseline.
+     - Define promotion/rollback thresholds.
+
+4. `P1` Adaptive serving contract by traffic lane
+   - Rationale: one knob set does not optimize both throughput and interactive latency.
+   - Tasks:
+     - Keep a throughput lane (for example `items_per_step=48` when stable).
+     - Keep a latency lane (for example `items_per_step=32`).
+     - Route based on queue depth and request shape.
+
+5. `P1` Runtime hardening (`gc.freeze` + rollback discipline)
+   - Rationale: reduce Python GC-induced tail latency spikes safely.
+   - Tasks:
+     - Keep freeze flag-gated and rollback-tested.
+     - Log `gc.get_freeze_count()` at startup.
+     - Track `P95/P99` before/after freeze in canaries.
+
+6. `P1` Profiling workflow and JAX runtime hygiene
+   - Rationale: next bottleneck should be measured, not guessed.
+   - Tasks:
+     - Keep persistent JAX compilation cache enabled in benchmark runs.
+     - Capture XProf traces for representative throughput and latency cases.
+     - Add a repeatable host-vs-device attribution workflow.
+
+7. `P1` Metrics expansion (vLLM-style counters)
+   - Rationale: stable production optimization needs actionable counters, not just one hit-rate gauge.
+   - Tasks:
+     - Keep `queries/hits/misses/fallbacks` and reason codes as first-class counters.
+     - Track queue wait and host/device split for every benchmark matrix row.
+     - Add alert thresholds for fallback spikes and queue-wait regressions.
 
 ## Canary Policy
 
