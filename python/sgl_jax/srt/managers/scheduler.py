@@ -762,6 +762,8 @@ class Scheduler(
                     "tokenizer_multi_item_packed": False,
                     "tokenizer_cache_for_scoring": False,
                     "tokenizer_extend_from_cache": False,
+                    "rpc_score_from_cache_v2": False,
+                    "rpc_release_scoring_cache": False,
                 }
                 for recv_req in unpacked_reqs:
                     if isinstance(recv_req, TokenizedGenerateReqInput):
@@ -774,6 +776,15 @@ class Scheduler(
                         if bool(getattr(recv_req, "extend_from_cache", None)):
                             self.ingress_score_paths["tokenizer_extend_from_cache"] += 1
                             tokenizer_frame_paths["tokenizer_extend_from_cache"] = True
+                    elif isinstance(recv_req, ScoreFromCacheReqInput):
+                        # Score fastpath requests are sent by tokenizer manager over the
+                        # tokenizer socket.
+                        self.ingress_score_paths["rpc_score_from_cache_v2"] += 1
+                        tokenizer_frame_paths["rpc_score_from_cache_v2"] = True
+                    elif isinstance(recv_req, ReleaseScoringCacheReqInput):
+                        # Cache release requests are also sent over the tokenizer socket.
+                        self.ingress_score_paths["rpc_release_scoring_cache"] += 1
+                        tokenizer_frame_paths["rpc_release_scoring_cache"] = True
                 for path, seen in tokenizer_frame_paths.items():
                     if seen:
                         self.ingress_score_path_frames[path] += 1

@@ -633,6 +633,34 @@ def test_scheduler_recv_requests_unpacks_list_payload_into_logical_batch():
     assert scheduler.ingress_score_path_frames["rpc_release_scoring_cache"] == 1
 
 
+def test_scheduler_recv_requests_counts_score_control_reqs_on_tokenizer_socket():
+    tokenizer_payload = [
+        ScoreFromCacheReqInput(
+            rid="score-1",
+            cache_handle="cache-handle-2",
+            items_2d=[[7, 8]],
+            label_token_ids=[198],
+        ),
+        ReleaseScoringCacheReqInput(rid="release-1"),
+    ]
+    scheduler = _FakeSchedulerIngress(
+        tokenizer_payloads=[tokenizer_payload],
+        rpc_payloads=[],
+    )
+
+    recv_reqs = scheduler.recv_requests()
+
+    assert len(recv_reqs) == 2
+    assert scheduler.ingress_tokenizer_frames == 1
+    assert scheduler.ingress_rpc_frames == 0
+    assert scheduler.ingress_tokenizer_messages == 2
+    assert scheduler.ingress_rpc_messages == 0
+    assert scheduler.ingress_score_paths["rpc_score_from_cache_v2"] == 1
+    assert scheduler.ingress_score_paths["rpc_release_scoring_cache"] == 1
+    assert scheduler.ingress_score_path_frames["rpc_score_from_cache_v2"] == 1
+    assert scheduler.ingress_score_path_frames["rpc_release_scoring_cache"] == 1
+
+
 def test_mark_scheduler_unavailable_aborts_all_pending_requests():
     manager = _FakeSchedulerLivenessManager()
     state1 = ReqState([], False, asyncio.Event(), SimpleNamespace(stream=False), created_time=0.0)
