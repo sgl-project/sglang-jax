@@ -225,7 +225,9 @@ def build_engine(
                 multi_item_enable_score_from_cache_v2=bool(fastpath_v2),
                 multi_item_score_from_cache_v2_items_per_step=args.items_per_step,
                 multi_item_score_fastpath_log_metrics=bool(args.log_score_path_metrics),
-                multi_item_score_label_only_logprob=bool(args.label_only_logprob),
+                multi_item_score_label_only_logprob=(
+                    bool(args.label_only_logprob) and bool(fastpath_v2)
+                ),
             )
         )
     elif mode == "packed":
