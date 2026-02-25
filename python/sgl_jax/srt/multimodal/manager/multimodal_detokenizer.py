@@ -82,6 +82,10 @@ class MultimodalDetokenizer(DetokenizerManager):
         if req.output is None or len(req.output) == 0:
             logger.warning("No output to save for request id: %s", req.rid)
             return [req]
+
+        if req.data_type == DataType.AUDIO:
+            return [req]
+
         sample = req.output[0]
         if sample.ndim == 3:
             # for images, dim t is missing

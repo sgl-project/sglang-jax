@@ -64,8 +64,11 @@ all = [
 multimodal = [
     "torch",
     "torchvision",
+    "torchaudio",
     "decord",
     "msgpack==1.0.0",
+    "qwix",
+    "soundfile",
 ]
 
 [tool.setuptools.packages.find]
@@ -124,6 +127,8 @@ ignore = [
     "B905",
     # Loop control variable not used within loop body
     "B007",
+    # Function call in argument defaults (FastAPI uses this pattern)
+    "B008",
 ]
 
 [tool.ruff.format]
@@ -168,3 +173,4 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
