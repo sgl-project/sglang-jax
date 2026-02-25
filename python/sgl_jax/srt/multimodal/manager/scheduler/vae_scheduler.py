@@ -132,7 +132,8 @@ class VaeScheduler(SchedulerProfilerMixin):
         """
 
         for req in batch:
-            output, _ = self.vae_worker.forward(req)
+            output, cache_miss = self.vae_worker.forward(req)
+            logger.info("VAE forward pass cache miss: %s", cache_miss)
             req.output = jax.device_get(output)
             req.latents = None
             self.forward_ct += 1
