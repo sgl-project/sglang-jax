@@ -109,9 +109,16 @@ class TestQwen3OmniMoeAudioEncoderPrecision(unittest.TestCase):
         input_features_jax = jnp.array(input_features_np, dtype=jax_dtype)
         feature_lens_jax = jnp.array(feature_lens_np, dtype=jnp.int32)
 
-        jax_output = jax_audio_tower(
+        # Prepare audio input first
+        split_audio_chunk_list, padded_mask_after_cnn = jax_audio_tower.prepare_audio_input(
             input_features=input_features_jax, feature_lens=feature_lens_jax
         )
+
+        # Call the encoder
+        jax_output_full = jax_audio_tower(split_audio_chunk_list, padded_mask_after_cnn)
+
+        # Extract valid tokens using the mask
+        jax_output = jax_output_full[padded_mask_after_cnn.reshape(-1)]
 
         # PyTorch
         input_features_torch = torch.from_numpy(input_features_np).to(dtype=torch_dtype)
@@ -207,21 +214,32 @@ class TestQwen3OmniMoeThinkerEmbeddingPrecision(unittest.TestCase):
         image_grid_thw = data.get("image_grid_thw")
         video_grid_thw = data.get("video_grid_thw")
 
-        jax_output = self.jax_model_fp32(
-            input_ids=jnp.array(data["input_ids"]),
-            input_features=jnp.array(input_features) if input_features is not None else None,
-            audio_feature_lengths=(
+        # Prepare kwargs for preprocess
+        kwargs = {
+            "input_ids": jnp.array(data["input_ids"]),
+            "input_features": jnp.array(input_features) if input_features is not None else None,
+            "audio_feature_lengths": (
                 jnp.array(audio_feature_lengths) if audio_feature_lengths is not None else None
             ),
-            pixel_values=jnp.array(pixel_values) if pixel_values is not None else None,
-            pixel_values_videos=(
+            "pixel_values": jnp.array(pixel_values) if pixel_values is not None else None,
+            "pixel_values_videos": (
                 jnp.array(pixel_values_videos) if pixel_values_videos is not None else None
             ),
-            image_grid_thw=jnp.array(image_grid_thw) if image_grid_thw is not None else None,
-            video_grid_thw=jnp.array(video_grid_thw) if video_grid_thw is not None else None,
+            "image_grid_thw": jnp.array(image_grid_thw) if image_grid_thw is not None else None,
+            "video_grid_thw": jnp.array(video_grid_thw) if video_grid_thw is not None else None,
+        }
+
+        # Step 1: Preprocess
+        kwargs = self.jax_model_fp32.preprocess(**kwargs)
+
+        # Step 2: Forward pass
+        output_dict = self.jax_model_fp32(**kwargs)
+
+        # Step 3: Postprocess
+        jax_input_embeds, jax_visual_embeds_multiscale, jax_visual_pos_masks = (
+            self.jax_model_fp32.postprocess(**output_dict)
         )
 
-        jax_input_embeds, jax_visual_embeds_multiscale, jax_visual_pos_masks = jax_output
         torch_input_embeds = data.get("input_embeds")
         torch_visual_pos_masks = data.get("visual_pos_masks")
 

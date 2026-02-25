@@ -75,12 +75,15 @@ class Qwen3OmniMoeAudioAttention(nnx.Module):
     def __call__(
         self,
         hidden_states: jax.Array,
+        mask: jax.Array = None,
     ) -> tuple[jax.Array, jax.Array | None, tuple[jax.Array] | None]:
         seq_length, _ = hidden_states.shape
 
         query_states = self.q_proj(hidden_states)[0].reshape(1, seq_length, self.num_heads, -1)
         key_states = self.k_proj(hidden_states)[0].reshape(1, seq_length, self.num_heads, -1)
         value_states = self.v_proj(hidden_states)[0].reshape(1, seq_length, self.num_heads, -1)
+        if mask is not None:
+            mask = jnp.expand_dims(mask, axis=0)
 
         attn_output = simple_attention(
             query_states,
@@ -88,6 +91,7 @@ class Qwen3OmniMoeAudioAttention(nnx.Module):
             value_states,
             scale=self.scaling,
             causal=False,
+            mask=mask,
         )
 
         attn_output = attn_output.reshape(seq_length, -1)
@@ -133,10 +137,11 @@ class Qwen3OmniMoeAudioEncoderLayer(nnx.Module):
     def __call__(
         self,
         hidden_states: jax.Array,
+        mask: jax.Array = None,
     ) -> jax.Array:
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states = self.self_attn(hidden_states)
+        hidden_states = self.self_attn(hidden_states, mask)
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
@@ -144,6 +149,8 @@ class Qwen3OmniMoeAudioEncoderLayer(nnx.Module):
         hidden_states = self.activation_fn(hidden_states, approximate=False)
         hidden_states, _ = self.fc2(hidden_states)
         hidden_states = residual + hidden_states
+        if mask is not None:
+            hidden_states = jnp.where(mask[..., jnp.newaxis], hidden_states, 0.0)
 
         if hidden_states.dtype == jnp.float16:
             clamp_value = jnp.finfo(hidden_states.dtype).max - 1000
@@ -231,11 +238,12 @@ class Qwen3OmniMoeAudioEncoder(nnx.Module):
         self.n_window_infer = config.n_window_infer
         self.conv_chunksize = config.conv_chunksize
 
-    def __call__(self, input_features: jax.Array, feature_lens=None):
-        r"""
-        input_features: [f, t]
-        feature_lens: mel length
-        """
+    def prepare_audio_input(self, input_features: jax.Array, feature_lens):
+        if input_features is None or feature_lens is None:
+            return None, None
+
+        input_features = input_features.astype(self.dtype)
+
         chunk_num = (feature_lens + self.n_window * 2 - 1) // (self.n_window * 2)
         chunk_lengths = jnp.full(chunk_num.sum(), self.n_window * 2, dtype=jnp.int32)
 
@@ -259,11 +267,16 @@ class Qwen3OmniMoeAudioEncoder(nnx.Module):
         )  # [b, t]
         padded_feature = jnp.expand_dims(padded_feature, axis=3)  # [b, f, t, c]
         # Split to chunk to avoid OOM during convolution
-        padded_embeds = []
         conv_chunk_indices = jnp.arange(
             self.conv_chunksize, padded_feature.shape[0], self.conv_chunksize
         )
-        for chunk in jnp.split(padded_feature, conv_chunk_indices, axis=0):
+        split_audio_chunk_list = jnp.split(padded_feature, conv_chunk_indices, axis=0)
+
+        return split_audio_chunk_list, padded_mask_after_cnn
+
+    def __call__(self, split_audio_chunk_list, padded_mask_after_cnn):
+        padded_embeds = []
+        for chunk in split_audio_chunk_list:
             # Now chunk shape is [b, f, t, c]
             padded_embed = jax.nn.gelu(self.conv2d1(chunk), approximate=False)
             padded_embed = jax.nn.gelu(self.conv2d2(padded_embed), approximate=False)
@@ -275,11 +288,15 @@ class Qwen3OmniMoeAudioEncoder(nnx.Module):
         pos_embed_slice = self.positional_embedding(padded_embed.shape[1])
         positional_embedding = jnp.expand_dims(pos_embed_slice, axis=0).astype(padded_embed.dtype)
         padded_embed = padded_embed + positional_embedding
-        hidden_states = padded_embed[padded_mask_after_cnn]
+        # padded_embed shape: [b, t, c*f] -> [b*t, c*f]
+        hidden_states = padded_embed.reshape(-1, padded_embed.shape[-1])
+        # padded_mask_after_cnn shape: [b, t] -> [b*t]
+        padded_mask_after_cnn = padded_mask_after_cnn.reshape(-1)
 
         for encoder_layer in self.layers:
             layer_outputs = encoder_layer(
                 hidden_states,
+                padded_mask_after_cnn,
             )
 
             hidden_states = layer_outputs

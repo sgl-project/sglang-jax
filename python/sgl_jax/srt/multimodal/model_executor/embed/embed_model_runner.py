@@ -1,5 +1,8 @@
+from functools import partial
+
 import jax
 import jax.numpy as jnp
+from flax import nnx
 from transformers import AutoConfig
 
 from sgl_jax.srt.configs.load_config import LoadConfig
@@ -46,31 +49,31 @@ class EmbedModelRunner(BaseModelRunner):
         )
 
     def initialize_jit(self):
-        # model_def, model_state = nnx.split(self.model)
-        # model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
+        model_def, model_state = nnx.split(self.model)
+        model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
 
-        # @partial(
-        #     jax.jit,
-        #     static_argnames=["model_state_def"],
-        # )
+        @partial(
+            jax.jit,
+            static_argnames=["model_state_def"],
+        )
         def forward_model(
-            # model_def,
-            # model_state_def,
-            # model_state_leaves,
+            model_def,
+            model_state_def,
+            model_state_leaves,
             input_ids,
-            input_features,
-            audio_feature_lengths,
+            audio_chunk_list,
+            audio_padded_mask,
             pixel_values,
             pixel_values_videos,
             image_grid_thw,
             video_grid_thw,
         ):
-            # model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
-            # model = nnx.merge(model_def, model_state)
-            return self.model(
+            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model = nnx.merge(model_def, model_state)
+            return model(
                 input_ids=input_ids,
-                input_features=input_features,
-                audio_feature_lengths=audio_feature_lengths,
+                audio_chunk_list=audio_chunk_list,
+                audio_padded_mask=audio_padded_mask,
                 pixel_values=pixel_values,
                 pixel_values_videos=pixel_values_videos,
                 image_grid_thw=image_grid_thw,
@@ -79,20 +82,20 @@ class EmbedModelRunner(BaseModelRunner):
 
         def forward_wrapper(
             input_ids: jax.Array,
-            input_features: jax.Array | None = None,
-            audio_feature_lengths: jax.Array | None = None,
+            audio_chunk_list: jax.Array | None = None,
+            audio_padded_mask: jax.Array | None = None,
             pixel_values: jax.Array | None = None,
             pixel_values_videos: jax.Array | None = None,
             image_grid_thw: jax.Array | None = None,
             video_grid_thw: jax.Array | None = None,
         ):
             return forward_model(
-                # model_def,
-                # model_state_def,
-                # model_state_leaves,
+                model_def,
+                model_state_def,
+                model_state_leaves,
                 input_ids,
-                input_features,
-                audio_feature_lengths,
+                audio_chunk_list,
+                audio_padded_mask,
                 pixel_values,
                 pixel_values_videos,
                 image_grid_thw,
@@ -177,8 +180,16 @@ class EmbedModelRunner(BaseModelRunner):
         # Prepare inputs
         inputs = self._prepare_input(batch)
 
+        # Preprocess
+        inputs = self.model.preprocess(**inputs)
+
         # Call jitted_embedding
-        input_embeds, visual_embeds_multiscale, visual_pos_masks = self.jitted_embedding(**inputs)
+        emb_result = self.jitted_embedding(**inputs)
+
+        # Postprocess
+        input_embeds, visual_embeds_multiscale, visual_pos_masks = self.model.postprocess(
+            **emb_result
+        )
 
         mm_inputs = batch.omni_inputs if isinstance(batch.omni_inputs, dict) else None
         if mm_inputs is not None:

@@ -308,11 +308,45 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
 
         return special_image_mask, special_video_mask, special_audio_mask
 
+    def preprocess(self, **kwargs):
+        """
+        Preprocess input data and call audio_tower's prepare method.
+
+        Args:
+            **kwargs: Dictionary containing the following possible parameters:
+                - input_ids: Input token ids
+                - input_features: Audio features
+                - audio_feature_lengths: Audio feature lengths
+                - pixel_values: Image pixel values
+                - pixel_values_videos: Video pixel values
+                - image_grid_thw: Image grid thw
+                - video_grid_thw: Video grid thw
+
+        Returns:
+            None (results will be written back to kwargs)
+        """
+        # Get input parameters from kwargs
+        input_features = kwargs.get("input_features")
+        audio_feature_lengths = kwargs.get("audio_feature_lengths")
+
+        # If audio input exists, call audio_tower's prepare_audio_input method
+        split_audio_chunk_list, padded_mask_after_cnn = self.audio_tower.prepare_audio_input(
+            input_features, audio_feature_lengths
+        )
+        # Write results back to kwargs
+        kwargs["audio_chunk_list"] = split_audio_chunk_list
+        kwargs["audio_padded_mask"] = padded_mask_after_cnn
+
+        kwargs.pop("input_features", None)
+        kwargs.pop("audio_feature_lengths", None)
+
+        return kwargs
+
     def __call__(
         self,
         input_ids: jax.Array,
-        input_features=None,
-        audio_feature_lengths=None,
+        audio_chunk_list=None,
+        audio_padded_mask=None,
         pixel_values=None,
         pixel_values_videos=None,
         image_grid_thw=None,
@@ -331,19 +365,17 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
         # 1. Extract the input embeddings
         input_embeds = self.text_embed_tokens(input_ids)
 
-        visual_embeds_multiscale = None
-        visual_pos_masks = None
-
         audio_embeds = None
         image_embeds = None
         video_embeds = None
 
+        image_embeds_multiscale = None
+        video_embeds_multiscale = None
+
         # Merge text , audios , image and video
-        if input_features is not None:
-            audio_embeds = self.audio_tower(
-                input_features.astype(self.dtype),
-                feature_lens=audio_feature_lengths,
-            )
+        if audio_chunk_list is not None:
+            audio_embeds = self.audio_tower(audio_chunk_list, audio_padded_mask)
+            audio_padded_mask = audio_padded_mask.reshape(-1)
 
         if pixel_values is not None:
             image_features = self.visual(pixel_values.astype(self.dtype), image_grid_thw)
@@ -351,7 +383,6 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
                 image_features["pooler_output"],
                 image_features["deepstack_features"],
             )
-            visual_embeds_multiscale = image_embeds_multiscale
 
         if pixel_values_videos is not None:
             video_features = self.visual(pixel_values_videos.astype(self.dtype), video_grid_thw)
@@ -359,8 +390,32 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
                 video_features["pooler_output"],
                 video_features["deepstack_features"],
             )
-            if visual_embeds_multiscale is None:
-                visual_embeds_multiscale = video_embeds_multiscale
+
+        return {
+            "input_ids": input_ids,
+            "input_embeds": input_embeds,
+            "audio_embeds": audio_embeds,
+            "image_embeds": image_embeds,
+            "video_embeds": video_embeds,
+            "image_embeds_multiscale": image_embeds_multiscale,
+            "video_embeds_multiscale": video_embeds_multiscale,
+            "audio_embeds_padded_mask": audio_padded_mask,
+        }
+
+    def postprocess(
+        self,
+        input_ids: jax.Array,
+        input_embeds: jax.Array,
+        audio_embeds: jax.Array,
+        image_embeds: jax.Array,
+        video_embeds: jax.Array,
+        image_embeds_multiscale: jax.Array,
+        video_embeds_multiscale: jax.Array,
+        audio_embeds_padded_mask: jax.Array,
+    ):
+
+        visual_embeds_multiscale = None
+        visual_pos_masks = None
 
         image_mask, video_mask, audio_mask = self.get_placeholder_mask(
             input_ids,
@@ -368,7 +423,9 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
             image_features=image_embeds,
             video_features=video_embeds,
         )
+
         if audio_embeds is not None:
+            audio_embeds = audio_embeds[audio_embeds_padded_mask]
             input_embeds = input_embeds.at[audio_mask].set(jnp.ravel(audio_embeds))
         if image_embeds is not None:
             input_embeds = input_embeds.at[image_mask].set(jnp.ravel(image_embeds))
@@ -376,7 +433,7 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
             input_embeds = input_embeds.at[video_mask].set(jnp.ravel(video_embeds))
 
         # for image and video mask
-        if pixel_values is not None and pixel_values_videos is not None:
+        if image_embeds is not None and video_embeds is not None:
             image_mask = image_mask[..., 0]
             video_mask = video_mask[..., 0]
             visual_pos_masks = video_mask | image_mask
@@ -391,10 +448,13 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
                 embed_joint = embed_joint.at[video_mask_joint, :].set(vid_embed)
                 visual_embeds_multiscale_joint = visual_embeds_multiscale_joint + (embed_joint,)
             visual_embeds_multiscale = visual_embeds_multiscale_joint
-        elif pixel_values is not None:
+        elif image_embeds is not None:
             image_mask = image_mask[..., 0]
+            visual_embeds_multiscale = image_embeds_multiscale
             visual_pos_masks = image_mask
-        elif pixel_values_videos is not None:
+        elif video_embeds is not None:
             video_mask = video_mask[..., 0]
+            visual_embeds_multiscale = video_embeds_multiscale
             visual_pos_masks = video_mask
+
         return input_embeds, visual_embeds_multiscale, visual_pos_masks
