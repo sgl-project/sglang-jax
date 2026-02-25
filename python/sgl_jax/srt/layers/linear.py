@@ -9,7 +9,7 @@ from jax import shard_map
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
+from sgl_jax.srt.kernels.quantized_matmul.utils import pallas_quantized_matmul_local
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
@@ -237,7 +237,7 @@ class QuantizedLinear(nnx.Module):
 
         output = shard_map(
             partial(
-                xla_quantized_matmul_local,
+                pallas_quantized_matmul_local,
                 quantize_activation=quantize_activation,
                 reduce_axis=input_axis,  # psum over input axis (e.g., "tensor" for o_proj)
                 compute_dtype=self.compute_dtype,
