@@ -67,6 +67,34 @@ def _tpu_log_recorder_compiler_options() -> dict[str, str] | None:
     return None
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    val = val.strip().lower()
+    if val in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if val in ("0", "false", "f", "no", "n", "off", ""):
+        return False
+    raise ValueError(f"Invalid boolean env var {name}={val!r} (expected 0/1/true/false).")
+
+
+def _env_bool_opt(name: str) -> bool | None:
+    """Return None if unset, otherwise parse as bool."""
+    val = os.getenv(name)
+    if val is None:
+        return None
+    return _env_bool(name)
+
+
+def _with_all_disable(env_name: str, *, all_disable: bool) -> bool:
+    """Use per-flag env override if set; otherwise fall back to all_disable."""
+    specific = _env_bool_opt(env_name)
+    if specific is not None:
+        return specific
+    return all_disable
+
+
 def _dtype_packing(dtype: jnp.dtype) -> int:
     """Match get_dtype_packing() in fused_moe kernel (32-bit repack width)."""
     bits = jnp.dtype(dtype).itemsize * 8
@@ -816,6 +844,7 @@ def run_all(
             quantization_config = None
 
         with jax.set_mesh(mesh):
+            all_disable = _env_bool("FUSED_MOE_BENCHMARK_ALL_DISABLE", False)
             fused_layer = FusedEPMoE(
                 hidden_size=case.hidden_size,
                 num_experts=case.num_experts,
@@ -836,6 +865,45 @@ def run_all(
                     case.intermediate_size if use_shared_expert else None
                 ),
                 quantization_config=quantization_config,
+                # Env helpers:
+                # - Set `FUSED_MOE_BENCHMARK_ALL_DISABLE=1` to disable all major stages.
+                # - Any specific `FUSED_MOE_BENCHMARK_DISABLE_*` overrides ALL_DISABLE.
+                disable_a2a=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_A2A",
+                    all_disable=all_disable,
+                ),
+                disable_dynamic_ffn1=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN1",
+                    all_disable=all_disable,
+                ),
+                disable_dynamic_ffn2=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN2",
+                    all_disable=all_disable,
+                ),
+                disable_weight_load=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_WEIGHT_LOAD",
+                    all_disable=all_disable,
+                ),
+                disable_a2a_s_tile_read=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_TILE_READ",
+                    all_disable=all_disable,
+                ),
+                disable_a2a_s_acc_tile_write=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_ACC_TILE_WRITE",
+                    all_disable=all_disable,
+                ),
+                disable_shared_expert=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_SHARED_EXPERT",
+                    all_disable=all_disable,
+                ),
+                disable_all_reduce_metadata=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_ALL_REDUCE_METADATA",
+                    all_disable=all_disable,
+                ),
+                disable_sync_barrier=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_SYNC_BARRIER",
+                    all_disable=all_disable,
+                ),
             )
             if quantization_config is not None:
                 fused_layer.quantize_weights()
