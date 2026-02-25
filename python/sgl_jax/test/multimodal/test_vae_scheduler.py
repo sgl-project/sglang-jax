@@ -34,7 +34,7 @@ class TestVaeScheduler(unittest.TestCase):
     def test_run_vae_step(self):
         """Test full scheduler forward pass."""
         x = jnp.array(np.arange(1 * 5 * 3 * 4 * 16), dtype=jnp.float32).reshape(1, 5, 3, 4, 16)
-        req = Req(rid="test", latents=x)
+        req = Req(rid="test", latents=x, num_frames=17)
         self.scheduler.run_vae_batch([req])
         result = self.backend._out_queue.get()
         self.assertEqual(result.output.shape, (1, 17, 24, 32, 3))

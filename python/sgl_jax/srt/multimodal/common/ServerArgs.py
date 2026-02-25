@@ -19,6 +19,9 @@ class MultimodalServerArgs(ServerArgs):
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
     image_encoder_precision: str = "bf16"
 
+    vae_decode_precompile_width_height: list[str] | None = None
+    vae_decode_precompile_frame_paddings: list[int] | None = None
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         prefix_with_dot = ""
@@ -90,6 +93,39 @@ class MultimodalServerArgs(ServerArgs):
             choices=["fp32", "fp16", "bf16"],
             help="Precision for image encoder",
         )
+
+        parser.add_argument(
+            "--vae-decode-precompile-width-height",
+            type=str,
+            nargs="+",
+            help="Set the list of width and height for jax jit, format width*height",
+        )
+
+        parser.add_argument(
+            "--vae-decode-precompile-frame-paddings",
+            type=int,
+            nargs="+",
+            help="Set the frame count list for jax jit",
+        )
+
+    def __post_init__(self):
+        # Ensure parent validation and default-setting logic runs as well.
+        # dataclasses does not automatically chain __post_init__ implementations
+        # across inheritance, so we need to invoke the base class method
+        # manually.
+        super().__post_init__()
+
+        if self.vae_decode_precompile_width_height is not None:
+            for wh in self.vae_decode_precompile_width_height:
+                if len(wh.split("*")) < 2:
+                    raise Exception("Width and height must be connected with an asterisk *.")
+            if self.vae_decode_precompile_frame_paddings is None:
+                self.vae_decode_precompile_frame_paddings = [1]
+            else:
+                self.vae_decode_precompile_frame_paddings.sort()
+        else:
+            self.vae_decode_precompile_width_height = ["480*832"]
+            self.vae_decode_precompile_frame_paddings = [1]
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
