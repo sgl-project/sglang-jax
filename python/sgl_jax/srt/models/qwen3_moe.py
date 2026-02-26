@@ -1,4 +1,6 @@
 import logging
+import math
+import os
 from typing import Any
 
 import jax
@@ -14,7 +16,13 @@ from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK, create_moe_weights_mapping
+from sgl_jax.srt.layers.moe import (
+    EPMoE,
+    FusedMoEBlockConfig,
+    GateLogit,
+    TopK,
+    create_moe_weights_mapping,
+)
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -24,6 +32,70 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 logger = logging.getLogger(__name__)
 
 init_fn = nnx.initializers.uniform()
+
+
+def _get_qwen3_fused_moe_block_config(moe_intermediate_size: int) -> FusedMoEBlockConfig | None:
+    """Return a fused block config compatible with Qwen3-MoE intermediate dims."""
+    if moe_intermediate_size % 512 == 0:
+        return None
+
+    bf = math.gcd(moe_intermediate_size, 512)
+    if bf < 128 or moe_intermediate_size % bf != 0:
+        return None
+
+    return FusedMoEBlockConfig(
+        bt=32,
+        btc=32,
+        bts=32,
+        bf=bf,
+        bfc=bf,
+        bd1=1024,
+        bd1c=1024,
+        bd2=1024,
+        bd2c=1024,
+        bse=bf,
+    )
+
+
+def _maybe_override_qwen3_fused_moe_block_config(
+    block_config: FusedMoEBlockConfig | None,
+) -> FusedMoEBlockConfig | None:
+    """Allow model-layer block-config override for fused Qwen3 MoE via env vars.
+
+    This keeps kernel code unchanged while enabling quick runtime sweeps:
+      SGL_QWEN3_FUSED_BC_BT, BTC, BTS, BF, BFC, BD1, BD1C, BD2, BD2C, BSE
+    """
+    if block_config is None:
+        return None
+
+    env_to_field = {
+        "SGL_QWEN3_FUSED_BC_BT": "bt",
+        "SGL_QWEN3_FUSED_BC_BTC": "btc",
+        "SGL_QWEN3_FUSED_BC_BTS": "bts",
+        "SGL_QWEN3_FUSED_BC_BF": "bf",
+        "SGL_QWEN3_FUSED_BC_BFC": "bfc",
+        "SGL_QWEN3_FUSED_BC_BD1": "bd1",
+        "SGL_QWEN3_FUSED_BC_BD1C": "bd1c",
+        "SGL_QWEN3_FUSED_BC_BD2": "bd2",
+        "SGL_QWEN3_FUSED_BC_BD2C": "bd2c",
+        "SGL_QWEN3_FUSED_BC_BSE": "bse",
+    }
+    overrides = {}
+    for env_name, field_name in env_to_field.items():
+        val = os.getenv(env_name)
+        if not val:
+            continue
+        try:
+            overrides[field_name] = int(val)
+        except ValueError:
+            logger.warning("Ignoring invalid %s=%r (expected int)", env_name, val)
+
+    if not overrides:
+        return block_config
+
+    kwargs = block_config.as_kwargs()
+    kwargs.update(overrides)
+    return FusedMoEBlockConfig(**kwargs)
 
 
 class QWen3MoeAttention(nnx.Module):
@@ -187,6 +259,12 @@ class QWen3MoeDecoderLayer(nnx.Module):
 
             self.moe_backend = getattr(config, "moe_backend", "epmoe")
             self.use_fused = self.moe_backend == "fused"
+            self.fused_moe_block_config = (
+                _get_qwen3_fused_moe_block_config(moe_intermediate_size) if self.use_fused else None
+            )
+            self.fused_moe_block_config = _maybe_override_qwen3_fused_moe_block_config(
+                self.fused_moe_block_config
+            )
 
             self.moe_gate = GateLogit(
                 input_size=config.hidden_size,
@@ -201,6 +279,12 @@ class QWen3MoeDecoderLayer(nnx.Module):
             )
 
             if self.use_fused:
+                if self.fused_moe_block_config is not None and layer_id == 0:
+                    logger.info(
+                        "Using Qwen3 fused MoE compatible block config for moe_intermediate_size=%s: %s",
+                        moe_intermediate_size,
+                        self.fused_moe_block_config.as_kwargs(),
+                    )
                 self.mlp = FusedEPMoE(
                     hidden_size=config.hidden_size,
                     num_experts=num_experts,
@@ -275,7 +359,12 @@ class QWen3MoeDecoderLayer(nnx.Module):
 
             if self.use_fused:
                 # token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
-                hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+                hidden_states = self.mlp(
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    block_config=self.fused_moe_block_config,
+                )
             else:
                 hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
         else:
