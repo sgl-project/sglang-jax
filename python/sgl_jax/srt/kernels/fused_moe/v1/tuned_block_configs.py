@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # fmt: off
 TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
     # Populate per-device kind, e.g. "TPU v6e", "TPU v7".
-    "TPU v7": {
+    "TPU v5p": {
         ('bfloat16', 'bfloat16', 16, 128, 8, 2048, 768, 8, False, False): (2, 256, 2048, 2048, 2, 2, 256, 2048, 2048, 256),
         ('bfloat16', 'bfloat16', 32, 128, 8, 2048, 768, 8, False, False): (4, 256, 2048, 2048, 4, 4, 256, 2048, 2048, 256),
         ('bfloat16', 'bfloat16', 64, 128, 8, 2048, 768, 8, False, False): (8, 256, 2048, 2048, 8, 8, 256, 2048, 2048, 256),
@@ -231,6 +231,7 @@ def get_tuned_fused_moe_block_config(
     table_key = keys[1:]
 
     cfg_tuple = None
+    device_name = "TPU v5p"  # TODO: remove when we have more data in the table
     if device_name in TUNED_BLOCK_CONFIGS:
         cfg_tuple = TUNED_BLOCK_CONFIGS[device_name].get(table_key)
     if cfg_tuple is None:
