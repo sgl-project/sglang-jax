@@ -51,6 +51,8 @@ from sgl_jax.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sgl_jax.srt.managers.schedule_policy import (
+    CLIP_MAX_NEW_TOKENS_ESTIMATION,
+    IGNORE_EOS_RESERVE_TOKENS,
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
@@ -543,8 +545,134 @@ class Scheduler(
         self.dp_round_robin_counter += 1
         return dp_rank
 
-    def _select_min_running_dp(self, extra_counts: list[int] | None = None) -> int | None:
-        """Select a DP rank with the minimum running requests.
+    @staticmethod
+    def _get_input_token_len(req: Req | TokenizedGenerateReqInput) -> int:
+        if isinstance(req, Req):
+            return len(req.origin_input_ids)
+
+        if not isinstance(req, TokenizedGenerateReqInput):
+            return 0
+
+        input_ids = req.input_ids
+        if input_ids is None:
+            return 0
+        if isinstance(input_ids, list):
+            if len(input_ids) == 0:
+                return 0
+            if isinstance(input_ids[0], int):
+                return len(input_ids)
+            if isinstance(input_ids[0], list):
+                return sum(len(ids) for ids in input_ids if isinstance(ids, list))
+        return 0
+
+    @staticmethod
+    def _extract_max_new_tokens(sampling_params: object) -> int:
+        """Extract max_new_tokens from sampling params with a conservative fallback."""
+        default_max_new_tokens = 128
+        value = None
+
+        if sampling_params is None:
+            return default_max_new_tokens
+
+        if isinstance(sampling_params, dict):
+            value = sampling_params.get("max_new_tokens", default_max_new_tokens)
+        elif isinstance(sampling_params, list):
+            if len(sampling_params) > 0:
+                first = sampling_params[0]
+                if isinstance(first, dict):
+                    value = first.get("max_new_tokens", default_max_new_tokens)
+                else:
+                    value = getattr(first, "max_new_tokens", default_max_new_tokens)
+            else:
+                value = default_max_new_tokens
+        else:
+            value = getattr(sampling_params, "max_new_tokens", default_max_new_tokens)
+
+        if value is None:
+            return CLIP_MAX_NEW_TOKENS_ESTIMATION
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return default_max_new_tokens
+
+    @staticmethod
+    def _extract_ignore_eos(sampling_params: object) -> bool:
+        if sampling_params is None:
+            return False
+        if isinstance(sampling_params, dict):
+            return bool(sampling_params.get("ignore_eos", False))
+        return bool(getattr(sampling_params, "ignore_eos", False))
+
+    def _estimate_req_tokens(self, req: Req | TokenizedGenerateReqInput) -> int:
+        """Estimate per-request token load as input + expected output."""
+        input_token_len = self._get_input_token_len(req)
+        sampling_params = getattr(req, "sampling_params", None)
+        est_max_new_tokens = self._extract_max_new_tokens(sampling_params)
+        est_max_new_tokens = min(est_max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION)
+        ignore_eos = self._extract_ignore_eos(sampling_params)
+
+        # Align with handle_generate_request() clipping rule:
+        # max_new_tokens <= max_req_len - input_len - 1
+        max_by_req_len = max(0, self.max_req_len - input_token_len - 1)
+        est_max_new_tokens = min(est_max_new_tokens, max_by_req_len)
+
+        # Align with ignore_eos token estimation in PrefillAdder:
+        # ignore_eos requests use ratio=1.0 and page-aligned token budgeting.
+        new_token_ratio = 1.0 if ignore_eos else self.new_token_ratio
+        est_output_tokens = int(est_max_new_tokens * new_token_ratio)
+        if ignore_eos:
+            est_output_tokens = (
+                (est_output_tokens + self.page_size - 1) // self.page_size
+            ) * self.page_size
+            est_output_tokens += IGNORE_EOS_RESERVE_TOKENS
+
+        if isinstance(req, Req):
+            # For running requests, scheduler load should reflect total reserved footprint.
+            return input_token_len + est_output_tokens
+
+        return input_token_len + est_output_tokens
+
+    def _get_dp_load_snapshot(self) -> tuple[list[int], list[int]]:
+        """Return per-DP (request_count, token_count) for in-flight scheduled work."""
+        req_counts = [0] * self.dp_size
+        token_counts = [0] * self.dp_size
+
+        for dp_rank, info in enumerate(self.running_batch.reqs_info):
+            if not info.reqs:
+                continue
+            req_counts[dp_rank] += len(info.reqs)
+            token_counts[dp_rank] += sum(self._estimate_req_tokens(req) for req in info.reqs)
+
+        # In overlap mode, last_batch can still be in-flight (e.g., prefill/extend) but not
+        # yet merged into running_batch. Include it to avoid underestimating DP load.
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
+            for dp_rank, info in enumerate(self.last_batch.reqs_info):
+                if not info.reqs and info.chunked_req is None:
+                    continue
+
+                running_ids = set()
+                running_info = self.running_batch.reqs_info[dp_rank]
+                if running_info.reqs:
+                    running_ids = {req.rid for req in running_info.reqs}
+
+                for req in info.reqs or []:
+                    if req.rid in running_ids:
+                        continue
+                    req_counts[dp_rank] += 1
+                    token_counts[dp_rank] += self._estimate_req_tokens(req)
+
+                if info.chunked_req is not None and info.chunked_req.rid not in running_ids:
+                    req_counts[dp_rank] += 1
+                    token_counts[dp_rank] += self._estimate_req_tokens(info.chunked_req)
+
+        return req_counts, token_counts
+
+    def _select_min_running_dp(
+        self,
+        extra_counts: list[int] | None = None,
+        extra_token_counts: list[int] | None = None,
+    ) -> int | None:
+        """Select a DP rank with the minimum (running requests, scheduled tokens) load.
 
         Returns None if all DP ranks are full.
         """
@@ -553,11 +681,14 @@ class Scheduler(
 
         if extra_counts is None:
             extra_counts = [0] * self.dp_size
+        if extra_token_counts is None:
+            extra_token_counts = [0] * self.dp_size
 
-        running_counts = [
-            len(info.reqs) if info.reqs else 0 for info in self.running_batch.reqs_info
-        ]
+        running_counts, running_token_counts = self._get_dp_load_snapshot()
         counts = [running_counts[i] + extra_counts[i] for i in range(self.dp_size)]
+        token_counts = [
+            running_token_counts[i] + extra_token_counts[i] for i in range(self.dp_size)
+        ]
 
         eligible = []
         for dp_rank in range(self.dp_size):
@@ -570,11 +701,7 @@ class Scheduler(
         if not eligible:
             return None
 
-        min_count = min(counts[dp_rank] for dp_rank in eligible)
-        for dp_rank in eligible:
-            if counts[dp_rank] == min_count:
-                return dp_rank
-        return None
+        return min(eligible, key=lambda dp_rank: (counts[dp_rank], token_counts[dp_rank], dp_rank))
 
     def select_dp_for_request(self, recv_reqs: list[Req]) -> list[Req]:
         """Assign dp_rank to incoming requests using the configured DP policy.
@@ -601,6 +728,7 @@ class Scheduler(
             return combined_reqs
 
         pending_counts = [0] * self.dp_size
+        pending_token_counts = [0] * self.dp_size
         ready_reqs: list[Req] = []
 
         for req in combined_reqs:
@@ -611,6 +739,9 @@ class Scheduler(
 
             # Skip if dp_rank already set (e.g., sticky sessions)
             if req.dp_rank is not None:
+                if 0 <= req.dp_rank < self.dp_size:
+                    pending_counts[req.dp_rank] += 1
+                    pending_token_counts[req.dp_rank] += self._estimate_req_tokens(req)
                 ready_reqs.append(req)
                 continue
 
@@ -619,7 +750,10 @@ class Scheduler(
                 ready_reqs.append(req)
                 continue
 
-            dp_rank = self._select_min_running_dp(extra_counts=pending_counts)
+            dp_rank = self._select_min_running_dp(
+                extra_counts=pending_counts,
+                extra_token_counts=pending_token_counts,
+            )
             if dp_rank is None:
                 # All DP ranks are full; keep the request pending.
                 self.pending_dp_reqs.append(req)
@@ -627,6 +761,7 @@ class Scheduler(
 
             req.dp_rank = dp_rank
             pending_counts[dp_rank] += 1
+            pending_token_counts[dp_rank] += self._estimate_req_tokens(req)
             ready_reqs.append(req)
 
         return ready_reqs
