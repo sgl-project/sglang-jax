@@ -1,6 +1,3 @@
-import logging
-import os
-
 import jax
 import numpy as np
 from flax import nnx
@@ -16,10 +13,6 @@ from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.profiling_utils import named_scope
-
-
-def _debug_sampler_stage_enabled() -> bool:
-    return os.getenv("SGL_DEBUG_SAMPLER_STAGE") == "1"
 
 
 class Sampler(nnx.Module):
@@ -180,15 +173,6 @@ class Sampler(nnx.Module):
         """
 
         # Apply penalties before sampling
-        if _debug_sampler_stage_enabled():
-            jax.debug.print(
-                "SAMPLER_STAGE_PRE next_logits_shape={} return_logprob={} do_penalties={} apply_vocab_mask={} all_greedy={}\n",
-                logits_output.next_token_logits.shape,
-                sampling_metadata.return_logprob,
-                sampling_metadata.do_penalties,
-                sampling_metadata.apply_vocab_mask,
-                sampling_metadata.is_all_greedy,
-            )
         logits = lax.cond(
             sampling_metadata.do_penalties,
             self._apply_linear_penalty,
@@ -213,15 +197,6 @@ class Sampler(nnx.Module):
             regular_fn,
             operands,
         )
-        if _debug_sampler_stage_enabled():
-            jax.debug.print(
-                "SAMPLER_STAGE logits_shape={} next_ids_shape={} logprobs_shape={} return_logprob={} all_greedy={}",
-                logits.shape,
-                batch_next_token_ids.shape,
-                logprobs.shape,
-                sampling_metadata.return_logprob,
-                sampling_metadata.is_all_greedy,
-            )
 
         logprob_operands = (
             logits_output,
