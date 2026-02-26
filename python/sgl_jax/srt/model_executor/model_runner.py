@@ -53,6 +53,10 @@ from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 logger = logging.getLogger(__name__)
 
 
+def _debug_sample_stage_enabled() -> bool:
+    return os.getenv("SGL_DEBUG_MODEL_RUNNER_SAMPLE_STAGE") == "1"
+
+
 class ModelRunner(BaseModelRunner):
     """ModelRunner runs the forward passes of the models."""
 
@@ -679,10 +683,28 @@ class ModelRunner(BaseModelRunner):
             A list of next_token_ids
         """
         # Penalty application has been moved to the Sampler for better JIT performance
-        return self.jitted_sampler(
+        if _debug_sample_stage_enabled():
+            logger.info(
+                "SAMPLE_STAGE pre logits_shape=%s logits_sharding=%s return_logprob=%s",
+                getattr(getattr(logits_output, "next_token_logits", None), "shape", None),
+                getattr(getattr(logits_output, "next_token_logits", None), "sharding", None),
+                getattr(sampling_metadata, "return_logprob", None),
+            )
+        ret = self.jitted_sampler(
             logits_output,
             sampling_metadata,
         )
+        if _debug_sample_stage_enabled():
+            try:
+                logger.info(
+                    "SAMPLE_STAGE post next_ids_shape=%s logprobs_shape=%s logits_output_returned=%s",
+                    getattr(ret[0], "shape", None),
+                    getattr(ret[1], "shape", None),
+                    ret[2] is not None if isinstance(ret, tuple) and len(ret) > 2 else None,
+                )
+            except Exception:
+                logger.exception("SAMPLE_STAGE post logging failed")
+        return ret
 
     def compute_logprobs(self, logits, token_ids: jax.Array) -> jax.Array:
         return self.jitted_compute_logprobs(logits, token_ids)

@@ -1031,6 +1031,7 @@ class FusedEPMoE(nnx.Module):
         topk_weights: jax.Array,
         topk_ids: jax.Array,
         *,
+        token_valid_mask: jax.Array | None = None,
         block_config: FusedMoEBlockConfig | None = None,
     ) -> jax.Array:
         """
@@ -1046,6 +1047,7 @@ class FusedEPMoE(nnx.Module):
             MoE layer output, same shape as hidden_states
         """
         assert hidden_states.ndim == 2
+        del token_valid_mask  # Reserved for fused-path padded-token masking.
 
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
