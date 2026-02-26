@@ -234,4 +234,4 @@ if __name__ == "__main__":
         TestPerformance().test_megablox_gmm_performance()
     else:
         print("Run megablox gmm full benchmark...")
-        full_benchmark
+        full_benchmark()
