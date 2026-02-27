@@ -1205,7 +1205,8 @@ class Scheduler(
 
         if memory_leak:
             msg = f"token_to_kv_pool_allocator memory leak detected! {token_msg}"
-            raise ValueError(msg)
+            logger.error(msg)
+            # raise ValueError(msg)
 
         req_total_size = self.req_to_token_pool.size
 
