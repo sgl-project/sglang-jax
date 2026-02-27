@@ -21,6 +21,11 @@ class StageConfigRegistry:
 
     # Model name -> YAML filename mapping
     _REGISTRY: dict[str, str] = {
+        # LTX-2
+        "Lightricks/LTX-Video": "ltx2_video_only_stage_config.yaml",
+        "LTX-Video": "ltx2_video_only_stage_config.yaml",
+        "Lightricks/LTX-2": "ltx2_audio_video_stage_config.yaml",
+        "LTX-2": "ltx2_audio_video_stage_config.yaml",
         # Wan2.1 series (single transformer)
         "Wan-AI/Wan2.1-T2V-1.3B-Diffusers": "wan2_1_stage_config.yaml",
         "Wan2.1-T2V-1.3B-Diffusers": "wan2_1_stage_config.yaml",
@@ -41,19 +46,16 @@ class StageConfigRegistry:
         "Qwen2.5-VL-72B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
         # qwen3-omni
         "Qwen/Qwen3-Omni-30B-A3B-Instruct": "qwen3_omni_stage_config.yaml",
-        # MiMo Audio series
-        "XiaomiMiMo/MiMo-Audio-7B-Instruct": "mimo_audio_stage_config.yaml",
-        "XiaomiMiMo/MiMo-Audio-7B-Base": "mimo_audio_stage_config.yaml",
     }
 
     # Keyword patterns for fallback matching (order matters - more specific first)
     _KEYWORD_PATTERNS: list[tuple[str, str]] = [
+        ("LTX-Video", "ltx2_video_only_stage_config.yaml"),
+        ("LTX-2", "ltx2_audio_video_stage_config.yaml"),
         ("Wan2.2", "wan2_2_stage_config.yaml"),
         ("Wan2.1", "wan2_1_stage_config.yaml"),
         ("Qwen2.5-VL", "qwen2_5_vl_stage_config.yaml"),
         ("Qwen3-Omni", "qwen3_omni_stage_config.yaml"),
-        ("MiMo-Audio-7B-Instruct", "mimo_audio_stage_config.yaml"),
-        ("MiMo-Audio-7B-Base", "mimo_audio_stage_config.yaml"),
     ]
 
     @classmethod

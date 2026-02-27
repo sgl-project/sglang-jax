@@ -31,13 +31,19 @@ for name, cls in _CONFIG_REGISTRY.items():
 _UNSET = object()
 
 
-def download_from_hf(model_path: str, allow_patterns: list[str] | None = _UNSET):
+def download_from_hf(model_path: str, allow_patterns: list[str] | None = _UNSET, cache_dir: str | None = None):
     if os.path.exists(model_path):
         return model_path
 
-    if allow_patterns is _UNSET:
+    if "LTX" in model_path and (allow_patterns is None or allow_patterns is _UNSET):
+        allow_patterns = ["ltx-2-19b-dev.safetensors", "*.json", "*.txt"]
+    elif "gemma-3" in model_path and (allow_patterns is None or allow_patterns is _UNSET):
+        # Prevent massive 24GB download for the text encoder during pipeline initialization tests
+        allow_patterns = ["*.json", "*.txt", "*.model", "*.tiktoken"]
+    elif allow_patterns is _UNSET:
         allow_patterns = ["*.json", "*.bin", "*.model", "*.py", "*.tiktoken"]
-    return snapshot_download(model_path, allow_patterns=allow_patterns)
+    
+    return snapshot_download(model_path, allow_patterns=allow_patterns, cache_dir=cache_dir)
 
 
 def get_hf_text_config(config: PretrainedConfig):

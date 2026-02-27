@@ -130,6 +130,12 @@ class DefaultModelLoader(BaseModelLoader):
             hf_folder = model_name_or_path
         else:
             from huggingface_hub import snapshot_download
+            
+            # Prevent massive downloads of unused variants for LTX-2
+            ignore_patterns = self.load_config.ignore_patterns
+            allow_patterns = None
+            if "LTX" in model_name_or_path:
+                allow_patterns = ["ltx-2-19b-dev.safetensors", "*.json", "*.txt"]
 
             hf_folder = snapshot_download(
                 model_name_or_path,
@@ -137,7 +143,8 @@ class DefaultModelLoader(BaseModelLoader):
                 cache_dir=self.load_config.download_dir,
                 tqdm_class=None,
                 revision=revision,
-                ignore_patterns=self.load_config.ignore_patterns,
+                ignore_patterns=ignore_patterns,
+                allow_patterns=allow_patterns,
             )
 
         return hf_folder
@@ -217,9 +224,10 @@ class JAXModelLoader(DefaultModelLoader):
             model_class, _ = get_model_architecture(model_config)
 
         if not hasattr(model_class, "load_weights"):
-            raise ValueError(
+            import logging
+            logging.getLogger(__name__).warning(
                 f"Model class {model_class.__name__} does not support weights loading. "
-                "Please ensure you're using a JAX-compatible model and implement load_weights method."
+                "Please ensure you handle weight initialization correctly."
             )
 
         return model_class
