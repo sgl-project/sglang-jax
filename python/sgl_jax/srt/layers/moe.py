@@ -12,6 +12,7 @@ from sgl_jax.srt.eplb.expert_location import (
 )
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import is_supported_by_gmm_v2
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
@@ -523,9 +524,14 @@ class EPMoE(nnx.Module):
             return empty_output
 
         group_sizes = group_sizes.astype(jnp.int32)
+        interpret = not is_tpu_runtime()
+
+        # Decide kernel variant once; gmm_v2 handles LHS quantization internally,
+        # so we only do manual quantization when falling back to gmm_v1.
+        use_v2 = not interpret and is_supported_by_gmm_v2(x, w0_kernel, w0_kernel_scale)
 
         # === GEMM1: x @ w0 and x @ w1 ===
-        if self.activation_quantized_dtype is not None:
+        if not use_v2 and self.activation_quantized_dtype is not None:
             x_q, x_scale = quantize_tensor_simple(x, self.activation_quantized_dtype, dim=-1)
             gemm1_lhs = x_q
         else:
@@ -540,7 +546,8 @@ class EPMoE(nnx.Module):
             rhs_scale=w0_kernel_scale,
             rhs_bias=w0_kernel_bias,
             group_offset=group_offset,
-            interpret=not is_tpu_runtime(),
+            interpret=interpret,
+            use_gmm_v2=use_v2,
         )
 
         layer_w1 = gmm(
@@ -551,14 +558,15 @@ class EPMoE(nnx.Module):
             rhs_scale=w1_kernel_scale,
             rhs_bias=w1_kernel_bias,
             group_offset=group_offset,
-            interpret=not is_tpu_runtime(),
+            interpret=interpret,
+            use_gmm_v2=use_v2,
         )
 
         if x_scale is not None:
             layer_w0 = layer_w0 * x_scale
             layer_w1 = layer_w1 * x_scale
 
-        # === Activation in BF16 (not quantized) ===
+        # === Activation ===
         if self.activation == "silu":
             layer_act = jax.nn.silu(layer_w0)
         elif self.activation == "gelu":
@@ -568,7 +576,7 @@ class EPMoE(nnx.Module):
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
-        if self.activation_quantized_dtype is not None:
+        if not use_v2 and self.activation_quantized_dtype is not None:
             intermediate_q, intermediate_scale = quantize_tensor_simple(
                 intermediate_layer, self.activation_quantized_dtype, dim=-1
             )
@@ -585,7 +593,8 @@ class EPMoE(nnx.Module):
             rhs_scale=wo_kernel_scale,
             rhs_bias=wo_kernel_bias,
             group_offset=group_offset,
-            interpret=not is_tpu_runtime(),
+            interpret=interpret,
+            use_gmm_v2=use_v2,
         )
 
         if intermediate_scale is not None:

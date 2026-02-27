@@ -3,7 +3,6 @@ import jax.numpy as jnp
 
 from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm import gmm as gmm_v1_kernel
 from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import gmm_v2 as gmm_v2_kernel
-from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import is_supported_by_gmm_v2
 
 
 def gmm(
@@ -17,8 +16,9 @@ def gmm(
     group_offset: jnp.ndarray | None = None,
     existing_out: jnp.ndarray | None = None,
     interpret: bool = False,
+    use_gmm_v2: bool = False,
 ) -> jax.Array:
-    """Dispatch GMM to v2 (when supported on TPU) or fall back to v1.
+    """Dispatch GMM to v2 or v1.
 
     Args:
         lhs: [m, k] input matrix.
@@ -31,8 +31,9 @@ def gmm(
         group_offset: Optional group offset for sharding.
         existing_out: Optional existing output to accumulate into.
         interpret: If True, run in interpret mode (CPU); disables v2.
+        use_gmm_v2: If True, use gmm_v2 kernel (caller pre-checked support).
     """
-    if not interpret and is_supported_by_gmm_v2(lhs, rhs, rhs_scale):
+    if use_gmm_v2:
         return gmm_v2_kernel(
             lhs,
             rhs,
