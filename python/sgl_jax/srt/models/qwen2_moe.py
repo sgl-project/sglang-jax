@@ -335,11 +335,10 @@ class Qwen2MoeDecoderLayer(nnx.Module):
 
         if self.use_fused:
             token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
-            mlp_output = self.mlp(
-                hidden_states, topk_weights, topk_ids, token_valid_mask=token_valid_mask
-            )
+            topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
         else:
-            mlp_output = self.mlp(hidden_states, topk_weights, topk_ids)
+            pass
+        mlp_output = self.mlp(hidden_states, topk_weights, topk_ids)
 
         hidden_states = mlp_output if shared_output is None else (mlp_output + shared_output)
 
