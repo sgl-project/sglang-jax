@@ -11,6 +11,9 @@ from sgl_jax.srt.managers.communication import QueueBackend
 from sgl_jax.srt.managers.scheduler import Scheduler as AutoRegressiveScheduler
 from sgl_jax.srt.models.qwen2 import Qwen2ForCausalLM
 from sgl_jax.srt.models.umt5 import UMT5EncoderModel
+from sgl_jax.srt.multimodal.models.ltx2.text_encoder.gemma_text_encoder import LTX2GemmaTextEncoder
+from sgl_jax.srt.multimodal.models.ltx2.diffusion.ltx2_dit import LTX2Transformer3DModel
+from sgl_jax.srt.multimodal.models.ltx2.vae.ltx2_vae_decoder import VideoDecoder
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
 from sgl_jax.srt.multimodal.manager.scheduler.audio_backbone_scheduler import (
     AudioBackboneScheduler,
@@ -252,5 +255,11 @@ def get_model_class(name: str):
         return MiMoAudioTokenizer
     elif name == "MiMoAudioForCausalLM":
         return MiMoAudioForCausalLM
+    elif name == "LTX2GemmaTextEncoder":
+        return LTX2GemmaTextEncoder
+    elif name == "LTX2Transformer3DModel":
+        return LTX2Transformer3DModel
+    elif name in ["AutoencoderKLLTX2", "AutoencoderKLLTX2Video", "AutoencoderKLLTX2Audio"]:
+        return VideoDecoder
     else:
         raise ValueError(f"Unknown model name: {name}")

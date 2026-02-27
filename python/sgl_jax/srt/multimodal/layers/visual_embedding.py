@@ -82,10 +82,12 @@ class TimestepEmbedder(nnx.Module):
         freq_dtype=jnp.float32,
         prefix: str = "",
         mesh: jax.sharding.Mesh | None = None,
+        embedding_coefficient: int | None = None,
     ):
         super().__init__()
         self.frequency_embedding_size = frequency_embedding_size
         self.max_period = max_period
+        self.embedding_coefficient = embedding_coefficient
 
         self.mlp = MLP(
             input_dim=frequency_embedding_size,
@@ -97,7 +99,19 @@ class TimestepEmbedder(nnx.Module):
         )
         self.freq_dtype = freq_dtype
 
-    def __call__(self, t: jax.Array, timestep_seq_len: int | None = None) -> jax.Array:
+        # Final projection: hidden_size → embedding_coefficient * hidden_size
+        # Matches PyTorch AdaLayerNormSingle.linear
+        if embedding_coefficient is not None:
+            self.linear = LinearBase(
+                input_size=hidden_size,
+                output_size=hidden_size * max(1, embedding_coefficient),
+                use_bias=True,
+                params_dtype=dtype,
+                mesh=mesh,
+                kernel_axes=(None, "tensor"),
+            )
+
+    def __call__(self, t: jax.Array, timestep_seq_len: int | None = None):
         t_freq = timestep_embedding(
             t, self.frequency_embedding_size, self.max_period, dtype=self.freq_dtype
         ).astype(self.mlp.fc_in.weight.dtype)
@@ -107,8 +121,15 @@ class TimestepEmbedder(nnx.Module):
             ), "timestep length is not divisible by timestep_seq_len"
             batch_size = t_freq.shape[0] // timestep_seq_len
             t_freq = t_freq.reshape((batch_size, timestep_seq_len, -1))
-        t_emb = self.mlp(t_freq)
-        return t_emb
+        # embedded_timestep: 2-layer sinusoidal MLP output [B, hidden_size]
+        embedded_timestep = self.mlp(t_freq)
+        
+        if self.embedding_coefficient is not None:
+            # AdaLN projection: silu(emb) → linear → [B, embedding_coefficient * hidden_size]
+            # Returns (adaln_cond, embedded_timestep) matching PyTorch AdaLayerNormSingle
+            adaln_cond, _ = self.linear(jax.nn.silu(embedded_timestep))
+            return adaln_cond, embedded_timestep
+        return embedded_timestep
 
 
 def timestep_embedding(

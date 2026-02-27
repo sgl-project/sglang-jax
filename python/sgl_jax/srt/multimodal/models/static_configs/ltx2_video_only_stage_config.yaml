@@ -1,0 +1,34 @@
+model_arch: Lightricks/LTX-2-Video
+# Configuration for LTX-2 video-only model pipeline
+stage_args:
+ - stage_id: 0
+   stage_sub_dir: text_encoder
+   runtime:
+     num_tpus: 2
+     max_batch_size: 1
+   scheduler: auto_regressive
+   final_output: false
+   scheduler_params: {}
+   precompile_params: {"capture_hidden_mode": 2}
+   model_class: LTX2GemmaTextEncoder  # LTX-2 uses Gemma-based text encoder (wraps Gemma2Model)
+
+ - stage_id: 1
+   stage_sub_dir: transformer
+   runtime:
+     num_tpus: 1
+     max_batch_size: 1
+   scheduler: diffusion
+   scheduler_params: {}
+   precompile_params: {"input_embedding": False, "deepstack_visual_embedding": False}
+   model_class: LTX2Transformer3DModel
+   final_output: false
+
+ - stage_id: 2
+   stage_sub_dir: vae
+   runtime:
+     num_tpus: 1
+     max_batch_size: 1
+   scheduler: vae
+   scheduler_params: {}
+   model_class: AutoencoderKLLTX2  # LTX-2 VAE
+   final_output: true
