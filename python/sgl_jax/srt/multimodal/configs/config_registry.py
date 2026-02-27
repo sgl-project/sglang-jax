@@ -6,6 +6,10 @@ import logging
 import os
 
 from sgl_jax.srt.multimodal.configs.dits.wan_model_config import WanModelConfig
+from sgl_jax.srt.multimodal.configs.dits.ltx2_model_config import (
+    LTX2VideoOnlyModelConfig,
+    LTX2ModelConfig,
+)
 from sgl_jax.srt.multimodal.configs.mimo_audio.mimo_audio_backbone_config import (
     MiMoAudioBackboneConfig,
 )
@@ -14,6 +18,7 @@ from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
 )
 from sgl_jax.srt.multimodal.configs.vaes.wan_vae_config import WanVAEConfig
+from sgl_jax.srt.multimodal.models.ltx2.vae.ltx2_vae_config import LTX2VAEConfig
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +144,12 @@ class DiffusionConfigRegistry:
     # Model name -> config factory mapping
     # Each factory is a callable that returns a config instance
     _REGISTRY: dict[str, callable] = {
+        # LTX-2
+        "Lightricks/LTX-Video": lambda: LTX2VideoOnlyModelConfig(),
+        "LTX-Video": lambda: LTX2VideoOnlyModelConfig(),
+        "Lightricks/LTX-2": lambda: LTX2ModelConfig(),
+        "LTX-2": lambda: LTX2ModelConfig(),
+        
         # Wan2.1 T2V 1.3B (480P, flow_shift=3.0) - uses default WanModelConfig params
         "Wan-AI/Wan2.1-T2V-1.3B-Diffusers": lambda: WanModelConfig(flow_shift=3.0),
         "Wan2.1-T2V-1.3B-Diffusers": lambda: WanModelConfig(flow_shift=3.0),
@@ -180,6 +191,10 @@ class DiffusionConfigRegistry:
 
     # Keyword patterns for fallback matching (order matters - more specific first)
     _KEYWORD_PATTERNS: list[tuple[str, callable]] = [
+        # LTX-2 patterns
+        ("LTX-Video", lambda: LTX2VideoOnlyModelConfig()),
+        ("LTX-2", lambda: LTX2ModelConfig()),
+        
         # Wan2.2 A14B MoE pattern (check first as it's more specific)
         (
             "T2V-A14B",
@@ -296,6 +311,12 @@ class VAEConfigRegistry:
 
     # Model name -> config factory mapping
     _REGISTRY: dict[str, callable] = {
+        # LTX-2
+        "Lightricks/LTX-Video": lambda: LTX2VAEConfig(),
+        "LTX-Video": lambda: LTX2VAEConfig(),
+        "Lightricks/LTX-2": lambda: LTX2VAEConfig(),
+        "LTX-2": lambda: LTX2VAEConfig(),
+        
         # Wan2.1 T2V 1.3B
         "Wan-AI/Wan2.1-T2V-1.3B-Diffusers": lambda: WanVAEConfig(),
         "Wan2.1-T2V-1.3B-Diffusers": lambda: WanVAEConfig(),
@@ -313,6 +334,10 @@ class VAEConfigRegistry:
 
     # Keyword patterns for fallback matching (order matters - more specific first)
     _KEYWORD_PATTERNS: list[tuple[str, callable]] = [
+        # LTX-2 patterns
+        ("LTX-Video", lambda: LTX2VAEConfig()),
+        ("LTX-2", lambda: LTX2VAEConfig()),
+        
         # Wan2.2 patterns
         ("Wan2.2", lambda: WanVAEConfig(is_residual=False)),
         # Wan2.1 patterns
