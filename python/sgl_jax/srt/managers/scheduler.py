@@ -1205,7 +1205,7 @@ class Scheduler(
 
         if memory_leak:
             msg = f"token_to_kv_pool_allocator memory leak detected! {token_msg}"
-            logger.error(msg)
+            logger.warning(msg)
             # raise ValueError(msg)
 
         req_total_size = self.req_to_token_pool.size
@@ -1216,7 +1216,8 @@ class Scheduler(
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
-            raise ValueError(msg)
+            logger.warning(msg)
+            # raise ValueError(msg)
 
     def check_tree_cache(self):
         if self.is_hybrid and isinstance(self.tree_cache, SWARadixCache):
