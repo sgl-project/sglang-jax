@@ -1,7 +1,21 @@
-# Adapted from https://github.com/vllm-project/tpu-inference/blob/main/tpu_inference/kernels/megablox/gmm.py
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Grouped matrix multiplication kernels for TPU written in Pallas."""
 
 import functools
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import jax
@@ -11,6 +25,9 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel import common
+from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.tuned_block_sizes import (
+    get_tuned_block_sizes,
+)
 
 partial = functools.partial
 
@@ -34,17 +51,17 @@ def _validate_args(
         raise ValueError(f"Expected 3-tensor for 'rhs' but got {rhs.ndim=}.")
     common.assert_is_supported_dtype(rhs.dtype)
 
-    if lhs.shape[1] != rhs.shape[2]:
+    if lhs.shape[1] != rhs.shape[1]:
         raise ValueError(
             "Expected 'lhs' and 'rhs' to have the same number of input features."
-            f" But instead got {lhs.shape[1]=} and {rhs.shape[2]=}"
+            f" But instead got {lhs.shape[1]=} and {rhs.shape[1]=}"
         )
 
     # Validate 'group_sizes'.
     if group_sizes.dtype != jnp.int32:
         raise ValueError(f"Expected 32-bit integer 'group_sizes' but got {group_sizes.dtype=}.")
 
-    num_groups, out_size, in_size = rhs.shape
+    num_groups, in_size, out_size = rhs.shape
 
     if rhs_scale is not None:
         # Validate 'rhs_scale'.
@@ -83,18 +100,23 @@ def _calculate_irregular_num_tiles(x: int, tx: int) -> tuple[int, int]:
     return tiles, rem
 
 
-GroupMetadata = Any  # TODO(enriqueps): Clean this up and use a namedtuple
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class GroupMetadata:
+    group_offsets: jnp.ndarray
+    group_ids: jnp.ndarray
+    m_tile_ids: jnp.ndarray
 
 
 def make_group_metadata(
     *,
-    group_sizes: jax.Array,
+    group_sizes: jnp.ndarray,
     m: int,
     tm: int,
-    start_group: jax.Array,
+    start_group: jnp.ndarray,
     num_nonzero_groups: int,
     visit_empty_groups: bool = True,
-) -> GroupMetadata:
+) -> tuple[GroupMetadata, jnp.ndarray]:
     """Create the metadata needed for grouped matmul computation.
 
     Args:
@@ -253,37 +275,35 @@ def make_group_metadata(
     active_group_mask = jnp.logical_and(iota <= end_group, iota >= start_group)
     group_tiles = jnp.where(active_group_mask, group_tiles, 0)
     num_tiles = group_tiles.sum()
-    return (group_offsets, group_ids, m_tile_ids), num_tiles
+    return GroupMetadata(group_offsets, group_ids, m_tile_ids), num_tiles
 
 
 def _get_store_mask(
     *,
-    grid_id: jax.Array,
+    grid_id: jnp.ndarray,
     group_metadata: GroupMetadata,
     tm: int,
     tn: int,
-) -> jax.Array:
+) -> jnp.ndarray:
     """Mask for rows that belong to the current group in the current tile."""
-    group_offsets, group_ids, m_tile_ids = group_metadata[:3]
-    group_id = group_ids[grid_id]
-    group_start = group_offsets[group_id]
-    group_end = group_offsets[group_id + 1]
-    m_id = m_tile_ids[grid_id] * tm
+    group_id = group_metadata.group_ids[grid_id]
+    group_start = group_metadata.group_offsets[group_id]
+    group_end = group_metadata.group_offsets[group_id + 1]
+    m_id = group_metadata.m_tile_ids[grid_id] * tm
     iota = jax.lax.broadcasted_iota(jnp.int32, (tm, tn), 0) + m_id
     return jnp.logical_and(iota >= group_start, iota < group_end)
 
 
 def _zero_uninitialized_memory(
-    out: jax.Array,
+    out: jnp.ndarray,
     *,
-    start_group: jax.Array,
+    start_group: jnp.ndarray,
     num_nonzero_groups: int,
     group_metadata: GroupMetadata,
-) -> jax.Array:
+) -> jnp.ndarray:
     """Zero out uninitialized memory from output."""
-    group_offsets = group_metadata[0]
-    group_start = group_offsets[start_group]
-    group_end = group_offsets[start_group + num_nonzero_groups]
+    group_start = group_metadata.group_offsets[start_group]
+    group_end = group_metadata.group_offsets[start_group + num_nonzero_groups]
     valid_mask = jax.lax.broadcasted_iota(jnp.int32, (out.shape[0],), 0)
     valid_mask = (valid_mask >= group_start) & (valid_mask < group_end)
     return jnp.where(valid_mask[:, None], out, 0)
@@ -297,28 +317,26 @@ LutFn = Callable[[int, int, int], tuple[int, int, int] | None]
     static_argnames=[
         "preferred_element_type",
         "tiling",
-        "transpose_rhs",
         "interpret",
     ],
 )
 def gmm(
-    lhs: jax.Array,
-    rhs: jax.Array,
-    group_sizes: jax.Array,
+    lhs: jnp.ndarray,
+    rhs: jnp.ndarray,
+    group_sizes: jnp.ndarray,
     preferred_element_type: jnp.dtype = jnp.float32,
     rhs_scale: jnp.ndarray | None = None,
     rhs_bias: jnp.ndarray | None = None,
-    tiling: tuple[int, int, int] | LutFn | None = (128, 128, 128),
+    tiling: tuple[int, int, int] | LutFn | None = None,
     group_offset: jnp.ndarray | None = None,
     existing_out: jnp.ndarray | None = None,
-    transpose_rhs: bool = True,
     interpret: bool = False,
-) -> jax.Array:
+) -> jnp.ndarray:
     """Compute lhs[sizes[i-1]:sizes[i], :] @ rhs for each group 'i'.
 
     Args:
       lhs: A 2d, jnp.ndarray with shape [m, k].
-      rhs: A 3d, jnp.ndarray with shape [num_groups, n, k].
+      rhs: A 3d, jnp.ndarray with shape [num_groups, k, n].
       group_sizes: A 1d, jnp.ndarray with shape [num_groups] and jnp.int32 dtype.
       preferred_element_type: jnp.dtype, the element type for the output matrix.
       rhs_scale: A 4d, jnp.ndarray with shape [num_groups, num_blocks, 1, n].
@@ -327,17 +345,12 @@ def gmm(
       group_offset: The group in group sizes to start computing from. This is
         particularly useful for when rhs num_groups is sharded.
       existing_out: Existing output to write to.
-      transpose_rhs: True if the rhs needs to be transposed.
       interpret: Whether or not to run the kernel in interpret mode, helpful for
         testing and debugging.
 
     Returns:
       A 2d, jnp.ndarray with shape [m, n].
     """
-
-    # TODO(kyuyeunk): Instead of transpose_rhs==True, modify logic to only
-    # transpose_rhs==False instead as it simplifies the logic in kernel.
-    assert transpose_rhs
 
     if existing_out is not None:
         assert isinstance(existing_out, jax.Array)
@@ -361,12 +374,23 @@ def gmm(
     )
 
     # Gather shape information.
-    m, k, n = (lhs.shape[0], lhs.shape[1], rhs.shape[1])
+    m, k, n = (lhs.shape[0], lhs.shape[1], rhs.shape[-1])
 
     # If tiling is callable, look up the problem dimensions in the LUT. If no
     # tuned tile dimensions are available throw an error.
     if callable(tiling):
         tiling = tiling(m, k, n)
+    elif tiling is None:
+        tiling = get_tuned_block_sizes(
+            m=m,
+            k=k,
+            n=n,
+            num_total_groups=num_total_groups,
+            num_current_groups=rhs.shape[0],
+            lhs_dtype=str(lhs.dtype),
+            rhs_dtype=str(rhs.dtype),
+            quant_block_size=k,
+        )
 
     if tiling is None:
         raise ValueError(f"No tuned tiling found for (m, k, n) = ({m}, {k}, {n})")
@@ -379,16 +403,15 @@ def gmm(
         num_quant_blocks = rhs_scale.shape[1]
     else:
         num_quant_blocks = 1
-    block_size = k // num_quant_blocks
+    quant_block_size = k // num_quant_blocks
 
-    if tk > block_size or block_size % tk != 0:
-        tk = block_size
+    if tk % quant_block_size != 0 and quant_block_size % tk != 0:
+        tk = quant_block_size
 
     tiles_k, k_rem = _calculate_irregular_num_tiles(k, tk)
     tiles_n, n_rem = _calculate_irregular_num_tiles(n, tn)
     del n_rem
-
-    tiles_k //= num_quant_blocks
+    num_quant_blocks_per_tk = pl.cdiv(tk, quant_block_size)
 
     # Create the metadata we need for computation.
     group_metadata, num_active_tiles = (
@@ -413,12 +436,11 @@ def gmm(
         out,
         acc_scratch,
     ):
-        group_offsets, group_ids, m_tile_ids = group_metadata
-        del group_offsets, group_ids, group_offset
+        m_tile_ids = group_metadata.m_tile_ids
+        del group_offset
 
         grid_id = pl.program_id(1)
-        b_i = pl.program_id(2)
-        k_i = pl.program_id(3)
+        k_i = pl.program_id(2)
 
         @pl.when(k_i == 0)
         def _zero_acc():
@@ -443,10 +465,10 @@ def gmm(
             x = x.astype(jnp.float32)
             return jnp.where(iota < k_rem, x, 0).astype(orig_dtype)
 
-        def _accum(is_last_k_tile, is_first_b_tile):
+        def _accum(is_last_k_tile):
             if is_last_k_tile:
                 mask_k_rem_lhs = partial(mask_k_rem, dim=1)
-                mask_k_rem_rhs = partial(mask_k_rem, dim=1)
+                mask_k_rem_rhs = partial(mask_k_rem, dim=0)
             else:
 
                 def _wrapper(x):
@@ -455,24 +477,23 @@ def gmm(
                 mask_k_rem_lhs = _wrapper
                 mask_k_rem_rhs = _wrapper
 
-            loaded_lhs = lhs[...]
-            loaded_rhs = rhs[...]
+            loaded_lhs = mask_k_rem_lhs(lhs[...])
+            loaded_rhs = mask_k_rem_rhs(rhs[...])
 
-            acc = acc_scratch[...] + jax.lax.dot_general(
-                mask_k_rem_lhs(loaded_lhs),
-                mask_k_rem_rhs(loaded_rhs),
-                preferred_element_type=jnp.float32,
-                dimension_numbers=(((1,), (1,)), ((), ())),
-            )
+            acc = acc_scratch[...]
+            for b_i in range(num_quant_blocks_per_tk):
+                partial_result = jnp.dot(
+                    loaded_lhs[..., b_i * quant_block_size : (b_i + 1) * quant_block_size],
+                    loaded_rhs[b_i * quant_block_size : (b_i + 1) * quant_block_size, ...],
+                    preferred_element_type=jnp.float32,
+                )
+                if rhs_scale is not None:
+                    partial_result *= jnp.broadcast_to(rhs_scale[b_i], partial_result.shape)
+                acc = acc + partial_result
 
             if is_last_k_tile:
-                if rhs_scale is not None:
-                    acc *= jnp.broadcast_to(rhs_scale[...], acc.shape)
-
                 loaded_out = out[...].astype(jnp.float32)
-                if not is_first_b_tile:
-                    acc += loaded_out
-                elif rhs_bias is not None:
+                if rhs_bias is not None:
                     acc += rhs_bias[...].astype(jnp.float32)
 
                 mask = _get_store_mask(
@@ -486,49 +507,44 @@ def gmm(
                 acc_scratch[...] = acc
 
         is_last_k_tile = k_i == (tiles_k - 1)
-        is_first_b_tile = b_i == 0
 
         lax.cond(
             is_last_k_tile,
-            lambda: lax.cond(
-                is_first_b_tile,
-                partial(_accum, True, True),
-                partial(_accum, True, False),
-            ),
-            partial(_accum, False, False),
+            partial(_accum, True),
+            partial(_accum, False),
         )
 
-    def lhs_transform_indices(n_i, grid_id, b_i, k_i, group_metadata, group_offset):
+    def lhs_transform_indices(n_i, grid_id, k_i, group_metadata, group_offset):
         # lhs is (m, k). Load the [tm, tk] matrix for this m-tile.
-        group_offsets, group_ids, m_tile_ids = group_metadata
-        del n_i, group_offsets, group_ids, group_offset
-        return m_tile_ids[grid_id], b_i * tiles_k + k_i
+        m_tile_ids = group_metadata.m_tile_ids
+        del n_i, group_offset
+        return m_tile_ids[grid_id], k_i
 
-    def rhs_transform_indices(n_i, grid_id, b_i, k_i, group_metadata, group_offset):
+    def rhs_transform_indices(n_i, grid_id, k_i, group_metadata, group_offset):
         # rhs is (num_groups, k, n). Load the [tk, tn] matrix based on the group id
         # for this m-tile.
-        group_offsets, group_ids, m_tile_ids = group_metadata
-        del group_offsets, m_tile_ids
+        group_ids = group_metadata.group_ids
 
         # NOTE: If we're working on only a shard of the rhs we need to adjust the
         # group index we load from to account for this. The group_ids are in the
         # "unsharded" domain.
-        return group_ids[grid_id] - group_offset[0], n_i, b_i * tiles_k + k_i
+        return group_ids[grid_id] - group_offset[0], k_i, n_i
 
-    def rhs_scale_transform_indices(n_i, grid_id, b_i, k_i, group_metadata, group_offset):
-        group_offsets, group_ids, m_tile_ids = group_metadata
-        del group_offsets, m_tile_ids, k_i
-        return group_ids[grid_id] - group_offset[0], b_i, 0, n_i
+    def rhs_scale_transform_indices(n_i, grid_id, k_i, group_metadata, group_offset):
+        group_ids = group_metadata.group_ids
+        b_i = (k_i * tk) // quant_block_size
+        b_tile_i = b_i // num_quant_blocks_per_tk
+        return group_ids[grid_id] - group_offset[0], b_tile_i, 0, n_i
 
-    def rhs_bias_transform_indices(n_i, grid_id, b_i, k_i, group_metadata, group_offset):
-        group_offsets, group_ids, m_tile_ids = group_metadata
-        del group_offsets, m_tile_ids, k_i, b_i
+    def rhs_bias_transform_indices(n_i, grid_id, k_i, group_metadata, group_offset):
+        group_ids = group_metadata.group_ids
+        del k_i
         return group_ids[grid_id] - group_offset[0], 0, n_i
 
-    def out_transform_indices(n_i, grid_id, b_i, k_i, group_metadata, group_offset):
+    def out_transform_indices(n_i, grid_id, k_i, group_metadata, group_offset):
         # out is (m, n). Load the [tm, tn] matrix for this m-tile.
-        group_offsets, group_ids, m_tile_ids = group_metadata
-        del k_i, group_offsets, group_ids, group_offset, b_i
+        m_tile_ids = group_metadata.m_tile_ids
+        del k_i, group_offset
         return m_tile_ids[grid_id], n_i
 
     out_block_spec = pl.BlockSpec((tm, tn), out_transform_indices)
@@ -540,12 +556,14 @@ def gmm(
         input_output_aliases = {7: 0}
 
     lhs_block_spec = pl.BlockSpec((tm, tk), lhs_transform_indices)
-    rhs_block_spec = pl.BlockSpec((None, tn, tk), rhs_transform_indices)
+    rhs_block_spec = pl.BlockSpec((None, tk, tn), rhs_transform_indices)
 
     if rhs_scale is None:
         rhs_scale_block_spec = None
     else:
-        rhs_scale_block_spec = pl.BlockSpec((None, None, 1, tn), rhs_scale_transform_indices)
+        rhs_scale_block_spec = pl.BlockSpec(
+            (None, num_quant_blocks_per_tk, 1, tn), rhs_scale_transform_indices
+        )
 
     if rhs_bias is None:
         rhs_bias_block_spec = None
@@ -559,7 +577,7 @@ def gmm(
     if rhs_bias is not None:
         rhs_bytes += n * rhs_bias.itemsize
     out_bytes = (m * n) * jnp.dtype(preferred_element_type).itemsize
-    max_active_tiles = group_metadata[1].size
+    max_active_tiles = group_metadata.group_ids.size
     bytes_accessed = (lhs_bytes * tiles_n) + (rhs_bytes * max_active_tiles) + out_bytes
     flops = 2 * m * k * n
     cost_estimate = pl.CostEstimate(flops=flops, bytes_accessed=bytes_accessed, transcendentals=0)
@@ -576,7 +594,7 @@ def gmm(
                 in_out_block_spec,
             ],
             out_specs=out_block_spec,
-            grid=(tiles_n, num_active_tiles, num_quant_blocks, tiles_k),
+            grid=(tiles_n, num_active_tiles, tiles_k),
             scratch_shapes=[pltpu.VMEM((tm, tn), jnp.float32)],
         ),
         input_output_aliases=input_output_aliases,
@@ -585,11 +603,11 @@ def gmm(
                 "parallel",
                 "arbitrary",
                 "arbitrary",
-                "arbitrary",
             )
         ),
         interpret=interpret,
         cost_estimate=cost_estimate,
+        name=f"gmm-g_{num_current_groups}-m_{m}-k_{k}-n_{n}-tm_{tm}-tk_{tk}-tn_{tn}",
     )
 
     out = call_gmm(
