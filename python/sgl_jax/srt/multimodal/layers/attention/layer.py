@@ -5,7 +5,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 
-def simple_attention(query, key, value, scale=None, causal=False):
+def simple_attention(query, key, value, scale=None, causal=False, mask=None):
     """Simple dot-product attention for diffusion models (no KV cache).
 
     Args:
@@ -14,6 +14,7 @@ def simple_attention(query, key, value, scale=None, causal=False):
         value: [B, S, H, D]
         scale: softmax scale, default 1/sqrt(D)
         causal: whether to apply causal mask
+        mask: [B, S_k] or similar broadcastable mask
     Returns:
         output: [B, S, H, D]
     """
@@ -26,7 +27,17 @@ def simple_attention(query, key, value, scale=None, causal=False):
     v = jnp.transpose(value, (0, 2, 1, 3))
 
     # [B, H, S, S]
+    # Perform dot product in bfloat16 but immediately cast to float32 for softmax stability
     attn_weights = jnp.einsum("bhsd,bhtd->bhst", q, k) * scale
+    orig_dtype = attn_weights.dtype
+    attn_weights = attn_weights.astype(jnp.float32)
+
+    if mask is not None:
+        if mask.ndim == 2:
+            mask = mask[:, None, None, :]
+        elif mask.ndim == 3:
+            mask = mask[:, None, :, :]
+        attn_weights = jnp.where(~mask, float("-inf"), attn_weights)
 
     if causal:
         seq_len = query.shape[1]
@@ -36,7 +47,10 @@ def simple_attention(query, key, value, scale=None, causal=False):
     attn_weights = jax.nn.softmax(attn_weights, axis=-1)
 
     # [B, H, S, D]
-    output = jnp.einsum("bhst,bhtd->bhsd", attn_weights, v)
+    output = jnp.einsum("bhst,bhtd->bhsd", attn_weights, v.astype(jnp.float32))
+
+    # Downcast back
+    output = output.astype(orig_dtype)
 
     # [B, S, H, D]
     return jnp.transpose(output, (0, 2, 1, 3))
@@ -84,6 +98,7 @@ class USPAttention(nnx.Module):
         key: jax.Array,
         value: jax.Array,
         req=None,
+        mask: jax.Array | None = None,
     ) -> jax.Array:
         """
         Forward pass for USPAttention.
@@ -94,7 +109,7 @@ class USPAttention(nnx.Module):
         """
         # Use simple attention for diffusion (no KV cache needed)
         if req is None:
-            return simple_attention(query, key, value, self.softmax_scale, self.causal)
+            return simple_attention(query, key, value, self.softmax_scale, self.causal, mask=mask)
 
         # TODO refactor flashattention backend
         return req.attention_backend(query, key, value, self, None, None, 0)
