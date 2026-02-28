@@ -761,21 +761,39 @@ def run_all(
         )
 
         print(f"{imbalance_mode=}")
-        target_counts = MoEImbalanceSimulator.generate_counts(
-            case.num_tokens,
-            case.top_k,
-            case.num_experts,
-            mode=imbalance_mode,
-            alpha=alpha,
-            zipf_s=zipf_s,
-            hotspot_ratio=hotspot_ratio,
-            hotspot_count=hotspot_count,
-            zero_expert_count=zero_expert_count,
-            non_hotspot_alpha=non_hotspot_alpha,
-        )
-        custom_logits = MoEImbalanceSimulator.create_logits_from_counts(
-            case.num_tokens, case.num_experts, case.top_k, target_counts
-        )
+        if use_grouped_topk:
+            custom_logits, sim_stats = MoEImbalanceSimulator.create_grouped_topk_logits(
+                case.num_tokens,
+                case.num_experts,
+                case.top_k,
+                num_groups=case.num_expert_group,
+                top_k_groups=case.topk_group,
+                mode=imbalance_mode,
+                seed=int(case.seed) + 42,
+                alpha=alpha,
+                zipf_s=zipf_s,
+                hotspot_ratio=hotspot_ratio,
+                hotspot_count=hotspot_count,
+                zero_expert_count=zero_expert_count,
+                non_hotspot_alpha=non_hotspot_alpha,
+            )
+            print(f"  imbalance(sim): {sim_stats}")
+        else:
+            target_counts = MoEImbalanceSimulator.generate_counts(
+                case.num_tokens,
+                case.top_k,
+                case.num_experts,
+                mode=imbalance_mode,
+                alpha=alpha,
+                zipf_s=zipf_s,
+                hotspot_ratio=hotspot_ratio,
+                hotspot_count=hotspot_count,
+                zero_expert_count=zero_expert_count,
+                non_hotspot_alpha=non_hotspot_alpha,
+            )
+            custom_logits = MoEImbalanceSimulator.create_logits_from_counts(
+                case.num_tokens, case.num_experts, case.top_k, target_counts
+            )
 
         data["router_logits"] = jax.device_put(
             custom_logits, jax.sharding.NamedSharding(mesh, P("tensor", None))
