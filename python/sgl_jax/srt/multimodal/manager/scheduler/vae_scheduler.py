@@ -3,8 +3,6 @@ import logging
 import jax
 import jax.sharding
 import numpy as np
-from jax import NamedSharding
-from jax.sharding import PartitionSpec
 
 from sgl_jax.srt.managers.communication import CommunicationBackend
 from sgl_jax.srt.managers.io_struct import AbortReq, ProfileReq
@@ -12,7 +10,6 @@ from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixi
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.model_executor.vae.vae_model_worker import VaeModelWorker
-from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
 
@@ -23,10 +20,10 @@ class VaeScheduler(SchedulerProfilerMixin):
     Responsibilities:
     - Receive batched requests via a communication backend and prepare inputs.
     - Preprocess latents according to model config (scaling/shift).
-    - Move input arrays onto JAX devices using the provided `mesh` and a
-      `NamedSharding`/`PartitionSpec` before forwarding to the VAE worker.
+    - Group shape-compatible requests into a larger decode batch so VAE decode
+      can shard the batch dimension with SPMD.
     - Run the VAE forward pass and return/send outputs via the communication
-      backend.
+      backend in the original request order.
 
     The scheduler assumes a `VaeModelWorker` handles model execution and that
     `communication_backend` provides `recv_requests()` and `send_pyobj()`.
@@ -75,10 +72,9 @@ class VaeScheduler(SchedulerProfilerMixin):
         """Main blocking loop used in non-async environments.
 
         Repeatedly polls the `communication_backend` for requests, applies
-        `preprocess`, shards `req.latents` onto `self.mesh` with a
-        `NamedSharding(PartitionSpec())`, and then processes the batch via
-        `run_vae_batch`. AbortReq messages are processed to track aborted
-        request IDs, and any Req whose rid matches an aborted ID is skipped.
+        `preprocess`, and then processes the batch via `run_vae_batch`.
+        AbortReq messages are processed to track aborted request IDs, and any
+        Req whose rid matches an aborted ID is skipped.
         """
 
         while True:
@@ -101,9 +97,6 @@ class VaeScheduler(SchedulerProfilerMixin):
                             continue
                         assert req.latents is not None
                         self.preprocess(req)
-                        req.latents = device_array(
-                            req.latents, sharding=NamedSharding(self.mesh, PartitionSpec())
-                        )
                         valid_reqs.append(req)
                     else:
                         logger.warning("VaeScheduler received unknown request type: %s", type(req))
@@ -142,20 +135,52 @@ class VaeScheduler(SchedulerProfilerMixin):
             constant_values=0,
         )
 
+    def _get_req_group_key(self, req: Req) -> tuple:
+        return (tuple(req.latents.shape[1:]), req.latents.dtype)
+
+    def _get_output_num_frames(self, req: Req) -> int:
+        if isinstance(req.num_frames, (list, tuple, np.ndarray)):
+            return int(max(req.num_frames))
+        return int(req.num_frames)
+
     def run_vae_batch(self, batch: list[Req]):
         """Run the VAE forward pass for a batch of requests.
 
-        For each `Req` in `batch`, invokes the `VaeModelWorker.forward`, moves
-        the result back to host memory with `jax.device_get`, clears the
-        latent to free memory, and sends the completed request through the
-        communication backend.
+        Requests with the same latent shape are concatenated on batch dim so
+        the worker can use `pjit` batch sharding. Outputs are split back into
+        their original requests and emitted in input order.
         """
 
-        for req in batch:
-            output, cache_miss = self.vae_worker.forward(req)
-            logger.info("VAE forward pass cache miss: %s", cache_miss)
-            req.output = jax.device_get(output[:, : req.num_frames, :, :, :])
+        grouped_reqs: dict[tuple, list[tuple[int, Req]]] = {}
+        completed_reqs: list[Req | None] = [None] * len(batch)
+
+        for idx, req in enumerate(batch):
+            grouped_reqs.setdefault(self._get_req_group_key(req), []).append((idx, req))
+
+        for req_group in grouped_reqs.values():
+            group_latents = np.concatenate([req.latents for _, req in req_group], axis=0)
+            output, cache_miss = self.vae_worker.forward_latents(group_latents)
+            logger.info(
+                "VAE forward pass cache miss: %s (group_size=%d, batch=%d)",
+                cache_miss,
+                len(req_group),
+                group_latents.shape[0],
+            )
+            output = np.asarray(jax.device_get(output))
+
+            batch_start = 0
+            for idx, req in req_group:
+                req_batch_size = req.latents.shape[0]
+                req_output = output[batch_start : batch_start + req_batch_size]
+                batch_start += req_batch_size
+                req.output = req_output[:, : self._get_output_num_frames(req), :, :, :]
+                req.latents = None
+                self.forward_ct += 1
+                self._profile_batch_predicate(None)
+                completed_reqs[idx] = req
+
+        for req in completed_reqs:
+            if req is None:
+                continue
             req.latents = None
-            self.forward_ct += 1
-            self._profile_batch_predicate(None)
             self._comm_backend.send_pyobj(req)

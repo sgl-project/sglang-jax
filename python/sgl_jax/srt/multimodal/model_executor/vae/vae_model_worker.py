@@ -2,8 +2,6 @@ import logging
 import time
 
 import numpy as np
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
 from tqdm import tqdm
 
 from sgl_jax.srt.multimodal.configs.config_registry import get_vae_config
@@ -34,9 +32,12 @@ class VaeModelWorker:
         # Initialize model here based on model_config
 
     def forward(self, batch: Req):
-        # Implement the vae model inference logic here
-        # return batch
-        return self.model_runner.forward(batch.latents, "decode")
+        return self.forward_latents(batch.latents)
+
+    def forward_latents(self, latents):
+        sharding = self.model_runner.get_decode_input_sharding(latents.shape[0])
+        latents = device_array(latents, sharding=sharding)
+        return self.model_runner.forward(latents, "decode")
 
     def run_precompile(self):
         self.decode_precompile()
@@ -48,6 +49,9 @@ class VaeModelWorker:
             "[VAE DECODE] Begin to precompile width*height=%s",
             self.vae_decode_precompile_width_height,
         )
+        batch_sizes = [1]
+        if self.model_runner.should_use_spmd_decode(self.model_runner.decode_batch_axis_size):
+            batch_sizes.append(self.model_runner.decode_batch_axis_size)
 
         with tqdm(
             self.vae_decode_precompile_width_height, desc="[VAE DECODE] PRECOMPILE", leave=False
@@ -58,18 +62,24 @@ class VaeModelWorker:
                 assert width % self.model_config.scale_factor_spatial == 0
                 assert height % self.model_config.scale_factor_spatial == 0
                 for t in self.vae_decode_precompile_frame_paddings:
-                    pbar.set_postfix(wh=wh, t=t)
-                    latents_cpu = np.random.random(
-                        (
-                            1,
-                            t // self.model_config.scale_factor_temporal + 1,
-                            height // self.model_config.scale_factor_spatial,
-                            width // self.model_config.scale_factor_spatial,
-                            self.model_config.z_dim,
+                    for batch_size in batch_sizes:
+                        pbar.set_postfix(wh=wh, t=t, batch=batch_size)
+                        latents_cpu = np.random.random(
+                            (
+                                batch_size,
+                                t // self.model_config.scale_factor_temporal + 1,
+                                height // self.model_config.scale_factor_spatial,
+                                width // self.model_config.scale_factor_spatial,
+                                self.model_config.z_dim,
+                            )
+                        ).astype(np.float32)
+                        latents = device_array(
+                            latents_cpu,
+                            sharding=self.model_runner.get_decode_input_sharding(
+                                latents_cpu.shape[0]
+                            ),
                         )
-                    )
-                    latents = device_array(latents_cpu, sharding=(NamedSharding(self.mesh, P())))
-                    self.model_runner.forward(latents, "decode")
+                        self.model_runner.forward(latents, "decode")
         end_time = time.perf_counter()
         logger.info("[VAE DECODE] Precompile finished in %.0f secs", end_time - start_time)
 
