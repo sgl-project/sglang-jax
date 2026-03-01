@@ -17,6 +17,7 @@ def gmm(
     existing_out: jnp.ndarray | None = None,
     interpret: bool = False,
     use_gmm_v2: bool = False,
+    zero_initialize: bool = True,
 ) -> jax.Array:
     """Dispatch GMM to v2 or v1.
 
@@ -32,6 +33,7 @@ def gmm(
         existing_out: Optional existing output to accumulate into.
         interpret: If True, run in interpret mode (CPU); disables v2.
         use_gmm_v2: If True, use gmm_v2 kernel (caller pre-checked support).
+        zero_initialize: Whether to zero-init unvisited output rows inside v2.
     """
     if use_gmm_v2:
         return gmm_v2_kernel(
@@ -42,6 +44,7 @@ def gmm(
             rhs_bias=rhs_bias,
             group_offset=group_offset,
             preferred_element_type=preferred_element_type,
+            zero_initialize=zero_initialize,
         )
 
     return gmm_v1_kernel(

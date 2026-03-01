@@ -28,12 +28,12 @@ def xla_quantized_matmul_local(
         w_scale: Weight quantization scale [n_output_features]
         quantize_activation: Whether to quantize activations
         reduce_axis: Axis name for psum reduction (e.g., "tensor"). None skips reduction.
-
+        compute_dtype: Dtype for computation.
     Returns:
         Output of the quantized matmul.
     """
     out_dtype = x.dtype
-    compute_dtype = out_dtype if compute_dtype is None else compute_dtype
+    compute_dtype = jnp.float32 if compute_dtype is None else compute_dtype
 
     if quantize_activation:
         # Local quantization - each device uses its local max

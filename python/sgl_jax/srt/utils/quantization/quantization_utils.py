@@ -59,6 +59,10 @@ def apply_linear_quantization(
         weight_dtype = DTYPE_MAP.get(weight_dtype_str)
         activation_dtype = DTYPE_MAP.get(activation_dtype_str)
 
+        if weight_dtype is None and activation_dtype is None:
+            logger.info("Skipping rule %s (no quantization specified)", rule["module_path"])
+            continue
+
         if weight_dtype is None:
             raise ValueError(f"weight_dtype is required in rule but got: {weight_dtype_str}")
 

@@ -548,6 +548,7 @@ class EPMoE(nnx.Module):
             group_offset=group_offset,
             interpret=interpret,
             use_gmm_v2=use_v2,
+            zero_initialize=False,
         )
 
         layer_w1 = gmm(
@@ -560,6 +561,7 @@ class EPMoE(nnx.Module):
             group_offset=group_offset,
             interpret=interpret,
             use_gmm_v2=use_v2,
+            zero_initialize=False,
         )
 
         if x_scale is not None:
@@ -595,6 +597,7 @@ class EPMoE(nnx.Module):
             group_offset=group_offset,
             interpret=interpret,
             use_gmm_v2=use_v2,
+            zero_initialize=True,
         )
 
         if intermediate_scale is not None:
