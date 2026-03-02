@@ -289,6 +289,7 @@ def create_test_data(
         extend_input_logprob_token_ids=None,
         logits_indices=np.asarray(extend_seq_lens),
         real_bs=seq_lens.shape[0],
+        real_bs_per_dp=[seq_lens.shape[0]],
         spec_info=spec_info,
         dp_size=1,
         per_dp_bs_size=seq_lens.shape[0],

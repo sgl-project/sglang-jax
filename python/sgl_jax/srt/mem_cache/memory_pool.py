@@ -475,7 +475,11 @@ class MHATokenToKVPool(KVCache):
         N = self.kv_buffer[layer_idx].shape[0]
         safe_loc = jnp.where(loc >= 0, loc, jnp.int32(N))
         # for jax function
-        updated_layer = self.kv_buffer[layer_idx].at[safe_loc].set(fused_kv, mode="drop")
+        updated_layer = (
+            self.kv_buffer[layer_idx]
+            .at[safe_loc]
+            .set(fused_kv, mode="drop", out_sharding=self.kv_sharding)
+        )
         return updated_layer
 
 

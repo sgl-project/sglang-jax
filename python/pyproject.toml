@@ -39,6 +39,7 @@ dependencies = [
     "pandas",
     "aiohttp",
     "pybase64",
+    "datasets",
     "partial_json_parser",
     "pathwaysutils",
     "omegaconf",
