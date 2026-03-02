@@ -60,7 +60,7 @@ class SchedulerMetricsMixin:
             num_used, token_usage, _, _ = self._get_token_info()
             token_msg = f"token usage: {token_usage:.2f}, "
 
-        num_new_seq = len(can_run_list)
+        num_new_seq = sum(len(v) for v in adder.can_run_list.values())
         f = (
             f"Prefill batch. "
             f"#new-seq: {num_new_seq}, "
@@ -70,6 +70,18 @@ class SchedulerMetricsMixin:
         )
 
         f += f"#running-req: {running_bs}, "
+        if self.dp_size > 1:
+            per_dp_prefill = [len(adder.can_run_list[i]) for i in range(self.dp_size)]
+            per_dp_running = [
+                (
+                    len(self.running_batch.reqs_info[i].reqs)
+                    if self.running_batch.reqs_info[i].reqs
+                    else 0
+                )
+                for i in range(self.dp_size)
+            ]
+            f += f"#prefill per DP: {per_dp_prefill}, #running per DP: {per_dp_running}, "
+
         f += f"#queue-req: {len(self.waiting_queue)}, "
 
         logger.info(f)

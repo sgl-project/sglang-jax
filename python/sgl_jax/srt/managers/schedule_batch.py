@@ -779,33 +779,87 @@ class ScheduleBatch:
     def mix_with_running(self, running_batch: ScheduleBatch):
         # Use EXTEND instead of MIXED for precompile cache hit
         self.forward_mode = ForwardMode.EXTEND
-        running_bs = running_batch.batch_size()
+        if self.dp_size != running_batch.dp_size:
+            raise ValueError(
+                "mix_with_running requires matching dp_size, "
+                f"got {self.dp_size} vs {running_batch.dp_size}"
+            )
 
-        # Collect all requests from all DP ranks
-        all_running_reqs = []
-        for info in running_batch.reqs_info:
-            if info.reqs:
-                all_running_reqs.extend(info.reqs)
-
-        for i, req in enumerate(all_running_reqs):
-            req.fill_ids = req.origin_input_ids + req.output_ids
-            req.extend_input_len = 1
-
-        input_ids = jnp.concatenate([self.input_ids, running_batch.input_ids])
-        out_cache_loc = jnp.concatenate([self.out_cache_loc, running_batch.out_cache_loc])
-
-        self.merge_batch(running_batch)
-        self.input_ids = input_ids
-        self.out_cache_loc = out_cache_loc
+        # Snapshot per-DP merged tensor fields before merge_batch() clears out_cache_loc.
+        merged_input_ids_per_dp: dict[int, np.ndarray] = {}
+        merged_out_cache_loc_per_dp: dict[int, np.ndarray] = {}
+        added_prefix_lens_per_dp: dict[int, list[int]] = {}
 
         delta = 0 if self.enable_overlap else -1
-        # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
-        self.prefix_lens.extend(
-            [len(r.origin_input_ids) + len(r.output_ids) + delta for r in all_running_reqs]
-        )
-        self.extend_lens.extend([1] * running_bs)
-        self.extend_num_tokens += running_bs
-        self.extend_logprob_start_lens.extend([0] * running_bs)
+        for dp_rank in range(self.dp_size):
+            self_info = self.reqs_info[dp_rank]
+            running_info = running_batch.reqs_info[dp_rank]
+            running_reqs = running_info.reqs or []
+            if not running_reqs:
+                continue
+
+            for req in running_reqs:
+                req.fill_ids = req.origin_input_ids + req.output_ids
+                req.extend_input_len = 1
+
+            self_input_ids = (
+                np.asarray(self_info.input_ids, dtype=np.int32)
+                if self_info.input_ids is not None
+                else np.empty((0,), dtype=np.int32)
+            )
+            running_input_ids = (
+                np.asarray(running_info.input_ids, dtype=np.int32)
+                if running_info.input_ids is not None
+                else np.empty((0,), dtype=np.int32)
+            )
+            merged_input_ids_per_dp[dp_rank] = np.concatenate(
+                [self_input_ids, running_input_ids]
+            ).astype(np.int32, copy=False)
+
+            self_out_cache_loc = (
+                np.asarray(self_info.out_cache_loc, dtype=np.int32)
+                if self_info.out_cache_loc is not None
+                else np.empty((0,), dtype=np.int32)
+            )
+            running_out_cache_loc = (
+                np.asarray(running_info.out_cache_loc, dtype=np.int32)
+                if running_info.out_cache_loc is not None
+                else np.empty((0,), dtype=np.int32)
+            )
+            merged_out_cache_loc_per_dp[dp_rank] = np.concatenate(
+                [self_out_cache_loc, running_out_cache_loc]
+            ).astype(np.int32, copy=False)
+
+            added_prefix_lens_per_dp[dp_rank] = [
+                len(r.origin_input_ids) + len(r.output_ids) + delta for r in running_reqs
+            ]
+
+        self.merge_batch(running_batch)
+
+        for dp_rank in range(self.dp_size):
+            if dp_rank not in merged_input_ids_per_dp:
+                continue
+
+            info = self.reqs_info[dp_rank]
+            added_prefix_lens = added_prefix_lens_per_dp[dp_rank]
+            added_count = len(added_prefix_lens)
+
+            info.input_ids = merged_input_ids_per_dp[dp_rank]
+            info.out_cache_loc = merged_out_cache_loc_per_dp[dp_rank]
+
+            if info.prefix_lens is None:
+                info.prefix_lens = []
+            info.prefix_lens.extend(added_prefix_lens)
+
+            if info.extend_lens is None:
+                info.extend_lens = []
+            info.extend_lens.extend([1] * added_count)
+
+            if info.extend_logprob_start_lens is None:
+                info.extend_logprob_start_lens = []
+            info.extend_logprob_start_lens.extend([0] * added_count)
+
+            info.extend_num_tokens = (info.extend_num_tokens or 0) + added_count
 
     def prepare_for_extend(self):
         """Prepare for extend phase (unified for all dp_size >= 1).
