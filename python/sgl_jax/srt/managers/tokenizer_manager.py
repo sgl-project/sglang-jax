@@ -86,6 +86,7 @@ class ReqState:
 
     # For metrics
     created_time: float
+    event_loop: asyncio.AbstractEventLoop | None = None
     finished_time: float = 0.0
     first_token_time: float = 0.0
     last_time: float = 0.0
@@ -438,11 +439,39 @@ class TokenizerManager:
         created_time: float | None = None,
     ):
         self.send_to_scheduler.send_pyobj(tokenized_obj)
-        state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
+        # Capture the caller's event loop so that _notify_state_event can use
+        # call_soon_threadsafe when handle_loop runs on a different thread
+        # (e.g. enable_engine_loop_run_forever_daemon mode).
+        try:
+            caller_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            caller_loop = None
+        state = ReqState(
+            [], False, asyncio.Event(), obj, created_time=created_time, event_loop=caller_loop
+        )
         # Handle rid being a list (single element) or string
         rid_key = obj.rid[0] if isinstance(obj.rid, list) else obj.rid
         self.rid_to_state[rid_key] = state
         return state
+
+    def _notify_state_event(self, state: ReqState) -> None:
+        """Thread-safe wrapper around state.event.set().
+
+        If enable_engine_loop_run_forever_daemon was enabled, handle_loop would run on the daemon_loop thread, but the asyncio.Event's
+        internal Future belongs to the eval_loop (the loop that called
+        _send_one_request).  Calling fut.set_result() from the wrong thread
+        does not wake up eval_loop's selector.  call_soon_threadsafe writes to
+        the self-pipe so the selector returns from epoll_wait immediately.
+        """
+        loop = state.event_loop
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(state.event.set)
+            except RuntimeError:
+                # Loop is already closed (request timed-out / cancelled).
+                pass
+        else:
+            state.event.set()
 
     async def _wait_one_response(
         self,
@@ -1024,7 +1053,7 @@ class TokenizerManager:
                 del self.rid_to_state[rid]
 
             state.out_list.append(out_dict)
-            state.event.set()
+            self._notify_state_event(state)
 
             # Log metrics and dump
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
@@ -1203,7 +1232,7 @@ class TokenizerManager:
                 },
             }
         )
-        state.event.set()
+        self._notify_state_event(state)
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(
