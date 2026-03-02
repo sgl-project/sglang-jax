@@ -105,6 +105,7 @@ class WanTransformerBlock(nnx.Module):
             num_heads=num_heads,
             head_size=dim // num_heads,
             causal=False,
+            mesh=mesh,
         )
         self.hidden_dim = dim
         self.num_attention_heads = num_heads
@@ -348,6 +349,7 @@ class WanSelfAttention(nnx.Module):
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
+            mesh=mesh,
         )
 
     def __call__(self, x: jax.Array, context: jax.Array, context_lens: int):
