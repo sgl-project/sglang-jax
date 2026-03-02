@@ -1,6 +1,7 @@
 """TokenizerManager is a process that tokenizes the text."""
 
 import asyncio
+import contextlib
 import copy
 import dataclasses
 import json
@@ -465,11 +466,9 @@ class TokenizerManager:
         """
         loop = state.event_loop
         if loop is not None:
-            try:
+            with contextlib.suppress(RuntimeError):
+                # RuntimeError: loop is already closed (request timed-out / cancelled).
                 loop.call_soon_threadsafe(state.event.set)
-            except RuntimeError:
-                # Loop is already closed (request timed-out / cancelled).
-                pass
         else:
             state.event.set()
 
