@@ -251,6 +251,8 @@ def create_test_data(
     for r, locs in enumerate(dp_cache_locs_flat):
         cache_loc_cpu[r * per_dp_cache_loc_size : r * per_dp_cache_loc_size + len(locs)] = locs
 
+    real_bs_per_dp = [len(lens_dict.get(r, [])) for r in range(dp_size)]
+
     mwb = ModelWorkerBatch(
         bid=1,
         forward_mode=ForwardMode.EXTEND if is_prefill else ForwardMode.DECODE,
@@ -266,6 +268,7 @@ def create_test_data(
         extend_seq_lens=extend_seq_lens_cpu,
         extend_prefix_lens=extend_prefix_lens_cpu,
         real_bs=total_bs,
+        real_bs_per_dp=real_bs_per_dp,
         dp_size=dp_size,
         per_dp_bs_size=per_dp_bs_padding,
         lora_ids=["0"] * total_bs,
@@ -280,8 +283,18 @@ def create_test_data(
     )
 
     attn_backend = FlashAttention(num_heads, num_kv_heads, head_dim, page_size=page_size, mesh=mesh)
+    dummy_model_config = type(
+        "DummyModelConfig",
+        (),
+        {"is_embedding": False, "hf_config": type("DummyHFConfig", (), {"architectures": []})()},
+    )()
     fb = ForwardBatch.init_new(
-        mwb, type("DummyRunner", (), {"mesh": mesh, "attn_backend": attn_backend})()
+        mwb,
+        type(
+            "DummyRunner",
+            (),
+            {"mesh": mesh, "attn_backend": attn_backend, "model_config": dummy_model_config},
+        )(),
     )
     fb.attn_backend.forward_metadata = attn_backend.get_forward_metadata(mwb)
 

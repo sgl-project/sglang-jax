@@ -110,8 +110,16 @@ class SchedulerOutputProcessorMixin:
                 if (
                     self.is_mixed_chunk and self.enable_overlap and req.finished()
                 ):  # TODO @Brian fix it
-                    j = len(info.out_cache_loc) - batch.batch_size() + i
-                    self.token_to_kv_pool_allocator.free(info.out_cache_loc[j : j + 1], req.dp_rank)
+                    if info.decoding_reqs and req in info.decoding_reqs:
+                        decode_count = len(info.decoding_reqs)
+                        first_decode_idx = len(reqs) - decode_count
+                        if i >= first_decode_idx:
+                            local_decode_idx = i - first_decode_idx
+                            out_cache_start = len(info.out_cache_loc) - decode_count
+                            j = out_cache_start + local_decode_idx
+                            self.token_to_kv_pool_allocator.free(
+                                info.out_cache_loc[j : j + 1], req.dp_rank
+                            )
                     continue
 
                 if req.is_chunked <= 0:
