@@ -764,6 +764,16 @@ class FusedEPMoE(nnx.Module):
         num_shared_experts: int = 0,
         moe_shared_expert_intermediate_size: int | None = None,
         quantization_config=None,
+        # Profiling / ablation flags (primarily for microbenching).
+        disable_a2a: bool = False,
+        disable_dynamic_ffn1: bool = False,
+        disable_dynamic_ffn2: bool = False,
+        disable_weight_load: bool = False,
+        disable_a2a_s_tile_read: bool = False,
+        disable_a2a_s_acc_tile_write: bool = False,
+        disable_shared_expert: bool = False,
+        disable_all_reduce_metadata: bool = False,
+        disable_sync_barrier: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_experts_per_tok = num_experts_per_tok
@@ -783,6 +793,15 @@ class FusedEPMoE(nnx.Module):
             moe_shared_expert_intermediate_size or intermediate_dim
         )
         self.mesh = mesh
+        self.disable_a2a = disable_a2a
+        self.disable_dynamic_ffn1 = disable_dynamic_ffn1
+        self.disable_dynamic_ffn2 = disable_dynamic_ffn2
+        self.disable_weight_load = disable_weight_load
+        self.disable_a2a_s_tile_read = disable_a2a_s_tile_read
+        self.disable_a2a_s_acc_tile_write = disable_a2a_s_acc_tile_write
+        self.disable_shared_expert = disable_shared_expert
+        self.disable_all_reduce_metadata = disable_all_reduce_metadata
+        self.disable_sync_barrier = disable_sync_barrier
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -1086,6 +1105,15 @@ class FusedEPMoE(nnx.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             act_fn=self.activation,
             block_config=block_config,
+            disable_a2a=self.disable_a2a,
+            disable_dynamic_ffn1=self.disable_dynamic_ffn1,
+            disable_dynamic_ffn2=self.disable_dynamic_ffn2,
+            disable_weight_load=self.disable_weight_load,
+            disable_a2a_s_tile_read=self.disable_a2a_s_tile_read,
+            disable_a2a_s_acc_tile_write=self.disable_a2a_s_acc_tile_write,
+            disable_shared_expert=self.disable_shared_expert,
+            disable_all_reduce_metadata=self.disable_all_reduce_metadata,
+            disable_sync_barrier=self.disable_sync_barrier,
             # Optional parameters (not used in basic case)
             subc_quant_wsz=subc_quant_wsz,
             w1_scale=w1_scale,
