@@ -256,7 +256,7 @@ class PrefillAdder:
         new_token_ratio: float,
         rem_input_tokens: int,
         rem_chunk_tokens: int | None,
-        mixed_with_decode_tokens: int = 0,
+        mixed_with_decode_tokens: int | list[int] = 0,
         dp_size: int = 1,
     ):
         self.page_size = page_size
@@ -265,17 +265,29 @@ class PrefillAdder:
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
         self.dp_size = dp_size
-        self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
+        if isinstance(mixed_with_decode_tokens, list):
+            if len(mixed_with_decode_tokens) != dp_size:
+                raise ValueError(
+                    "mixed_with_decode_tokens must match dp_size when provided as a list, "
+                    f"got len={len(mixed_with_decode_tokens)}, dp_size={dp_size}"
+                )
+            mixed_tokens_per_dp = [max(0, int(x)) for x in mixed_with_decode_tokens]
+        else:
+            mixed_tokens_per_dp = [max(0, int(mixed_with_decode_tokens))] * dp_size
+
+        total_mixed_tokens = sum(mixed_tokens_per_dp)
+        self.rem_input_tokens = rem_input_tokens - total_mixed_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         if self.rem_chunk_tokens is not None:
-            self.rem_chunk_tokens -= mixed_with_decode_tokens
-            self.rem_chunk_tokens_list = [self.rem_chunk_tokens] * dp_size
+            self.rem_chunk_tokens_list = [
+                self.rem_chunk_tokens - mixed_tokens_per_dp[dp_rank] for dp_rank in range(dp_size)
+            ]
         else:
             self.rem_chunk_tokens_list = None
 
         # Per-DP token offsets
-        self.rem_total_token_offset = [mixed_with_decode_tokens] * dp_size
-        self.cur_rem_token_offset = [mixed_with_decode_tokens] * dp_size
+        self.rem_total_token_offset = mixed_tokens_per_dp.copy()
+        self.cur_rem_token_offset = mixed_tokens_per_dp.copy()
 
         self.req_states = {i: None for i in range(dp_size)}  # Per-DP request states
         self.can_run_list = {i: [] for i in range(dp_size)}  # Per-DP request lists

@@ -103,6 +103,21 @@ class FlashAttention(AttentionBackend):
         """Return the metadata for a forward pass."""
         metadata = FlashAttentionMetadata()
 
+        if batch.dp_size <= 0:
+            raise ValueError(f"Invalid dp_size: {batch.dp_size}")
+        if batch.per_dp_bs_size <= 0:
+            raise ValueError(f"Invalid per_dp_bs_size: {batch.per_dp_bs_size}")
+        if batch.per_dp_bs_size * batch.dp_size != len(batch.seq_lens):
+            raise ValueError(
+                "Inconsistent DP batch metadata: expected per_dp_bs_size * dp_size == len(seq_lens), "
+                f"got {batch.per_dp_bs_size} * {batch.dp_size} != {len(batch.seq_lens)}"
+            )
+        if len(batch.cache_loc) % batch.dp_size != 0:
+            raise ValueError(
+                "Inconsistent cache_loc layout for DP sharding: "
+                f"len(cache_loc)={len(batch.cache_loc)} is not divisible by dp_size={batch.dp_size}"
+            )
+
         total_loc_len = len(batch.cache_loc)
         per_dp_loc_len = total_loc_len // batch.dp_size
         page_indices_list = []

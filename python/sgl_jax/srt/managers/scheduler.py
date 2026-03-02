@@ -1477,6 +1477,9 @@ class Scheduler(
             return None
 
         running_bs = self.running_batch.batch_size()
+        running_bs_per_dp = [
+            len(info.reqs) if info.reqs else 0 for info in self.running_batch.reqs_info
+        ]
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue)
@@ -1489,7 +1492,7 @@ class Scheduler(
             self.new_token_ratio,
             self.max_prefill_tokens,
             self.chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            running_bs_per_dp if self.is_mixed_chunk else 0,
             dp_size=self.dp_size,
         )
 
