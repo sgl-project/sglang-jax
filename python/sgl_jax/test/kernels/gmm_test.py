@@ -25,6 +25,40 @@ from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import (
 
 jax.config.parse_flags_with_absl()
 
+GMM_VERSION_V1 = "v1"
+GMM_VERSION_V2 = "v2"
+
+
+def gmm_wrapper(
+    lhs,
+    rhs,
+    group_sizes,
+    version,
+    rhs_scale=None,
+    rhs_bias=None,
+    group_offset=None,
+    maybe_quantize_lhs=False,
+):
+    if version == GMM_VERSION_V1:
+        return gmm(
+            lhs,
+            rhs,
+            group_sizes,
+            rhs_scale=rhs_scale,
+            rhs_bias=rhs_bias,
+            group_offset=group_offset,
+        )
+    else:
+        return gmm_v2(
+            lhs,
+            rhs,
+            group_sizes,
+            rhs_scale=rhs_scale,
+            rhs_bias=rhs_bias,
+            group_offset=group_offset,
+            maybe_quantize_lhs=maybe_quantize_lhs,
+        )
+
 
 def get_group_sizes(batch_size: int, num_groups: int) -> jax.Array:
     distribution = jax.random.uniform(jax.random.key(0), (num_groups - 1,), dtype=jnp.float32)
@@ -122,8 +156,9 @@ class GmmTest(jtu.JaxTestCase):
         num_groups=[16, 32],
         has_bias=[True, False],
         group_offset=[0, 2, 3],
+        version=[GMM_VERSION_V1, GMM_VERSION_V2],
     )
-    def test_gmm(self, batch_size, in_size, out_size, num_groups, has_bias, group_offset):
+    def test_gmm(self, batch_size, in_size, out_size, num_groups, has_bias, group_offset, version):
         num_local_groups = num_groups - group_offset
         key = jax.random.key(0)
 
@@ -140,10 +175,11 @@ class GmmTest(jtu.JaxTestCase):
             lhs, rhs, group_sizes, rhs_bias=rhs_bias, group_offset=group_offset
         )
 
-        actual = gmm_v2(
+        actual = gmm_wrapper(
             lhs,
             rhs,
             group_sizes,
+            version=version,
             rhs_bias=rhs_bias,
             group_offset=group_offset,
         )
@@ -159,6 +195,7 @@ class GmmTest(jtu.JaxTestCase):
         weight_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float4_e2m1fn],
         block_size=[64, 128, 256, 512],
         group_offset=[0, 2, 3],
+        version=[GMM_VERSION_V1, GMM_VERSION_V2],
     )
     def test_gmm_weight_quantized(
         self,
@@ -170,6 +207,7 @@ class GmmTest(jtu.JaxTestCase):
         weight_dtype,
         block_size,
         group_offset,
+        version,
     ):
         if weight_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
             self.skipTest("Expect TPUv7+")
@@ -197,25 +235,19 @@ class GmmTest(jtu.JaxTestCase):
             group_offset=group_offset,
         )
 
-        if is_supported_by_gmm_v2(lhs, rhs_q, rhs_scale):
-            actual = gmm_v2(
-                lhs,
-                rhs_q,
-                group_sizes,
-                rhs_scale=rhs_scale,
-                group_offset=group_offset,
-                rhs_bias=rhs_bias,
-                maybe_quantize_lhs=False,
-            ).astype(lhs.dtype)
-        else:
-            actual = gmm(
-                lhs,
-                rhs_q,
-                group_sizes,
-                rhs_scale=rhs_scale,
-                group_offset=group_offset,
-                rhs_bias=rhs_bias,
-            ).astype(lhs.dtype)
+        if version == GMM_VERSION_V2 and not is_supported_by_gmm_v2(lhs, rhs_q, rhs_scale):
+            self.skipTest("Configuration not supported by gmm_v2")
+
+        actual = gmm_wrapper(
+            lhs,
+            rhs_q,
+            group_sizes,
+            version=version,
+            rhs_scale=rhs_scale,
+            group_offset=group_offset,
+            rhs_bias=rhs_bias,
+            maybe_quantize_lhs=False,
+        ).astype(lhs.dtype)
 
         self.assertArraysAllClose(actual, expected, atol=3e-1, rtol=3e-1)
 

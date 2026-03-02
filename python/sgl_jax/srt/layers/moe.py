@@ -530,6 +530,10 @@ class EPMoE(nnx.Module):
         # so we only do manual quantization when falling back to gmm_v1.
         use_v2 = not interpret and is_supported_by_gmm_v2(x, w0_kernel, w0_kernel_scale)
 
+        # When activation_quantized_dtype is None, tell gmm_v2 not to quantize
+        # the LHS even if the RHS (weights) are in a quantized dtype.
+        quantize_lhs = self.activation_quantized_dtype is not None
+
         # === GEMM1: x @ w0 and x @ w1 ===
         if not use_v2 and self.activation_quantized_dtype is not None:
             x_q, x_scale = quantize_tensor_simple(x, self.activation_quantized_dtype, dim=-1)
@@ -548,6 +552,7 @@ class EPMoE(nnx.Module):
             group_offset=group_offset,
             interpret=interpret,
             use_gmm_v2=use_v2,
+            maybe_quantize_lhs=quantize_lhs,
         )
 
         layer_w1 = gmm(
@@ -560,6 +565,7 @@ class EPMoE(nnx.Module):
             group_offset=group_offset,
             interpret=interpret,
             use_gmm_v2=use_v2,
+            maybe_quantize_lhs=quantize_lhs,
         )
 
         if x_scale is not None:
@@ -595,6 +601,7 @@ class EPMoE(nnx.Module):
             group_offset=group_offset,
             interpret=interpret,
             use_gmm_v2=use_v2,
+            maybe_quantize_lhs=quantize_lhs,
         )
 
         if intermediate_scale is not None:
