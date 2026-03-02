@@ -16,4 +16,3 @@ push: build
 	docker tag $(IMAGE_NAME):$(IMAGE_TAG) $(REMOTE_IMAGE)
 	docker push $(REMOTE_IMAGE)
 	@echo "Pushed image: $(REMOTE_IMAGE)"
-
