@@ -16,8 +16,12 @@ import jax
 import jax.numpy as jnp
 from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
-from tpu_inference.kernels.megablox.gmm import gmm
-from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2, is_supported_by_gmm_v2
+
+from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm import gmm
+from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import (
+    gmm_v2,
+    is_supported_by_gmm_v2,
+)
 
 jax.config.parse_flags_with_absl()
 
@@ -71,8 +75,7 @@ def reference_gmm(
         if jnp.isscalar(group_offset):
             group_offset = group_offset[None]
 
-    if rhs_scale is not None:
-        num_blocks = rhs_scale.shape[1] if rhs_scale is not None else 1
+    num_blocks = rhs_scale.shape[1] if rhs_scale is not None else 1
     block_size = in_size // num_blocks
 
     start = 0
