@@ -492,36 +492,6 @@ class WeightLoader:
         stacked_shape = (num_physical_experts, *final_single_shape)
         sharding = target_sharding or jax.sharding.NamedSharding(self.mesh, P())
 
-        def _load_single_expert_slice(expert_idx, inner_index):
-            hf_key = expected_hf_keys[expert_idx]
-            file_intervals = expert_file_intervals[expert_idx]
-            expert_shape = expert_global_shapes[expert_idx]
-            slice_on_axis = inner_index[concat_axis]
-            req_start, req_stop, req_step = slice_on_axis.indices(expert_shape[concat_axis])
-            assert req_step == 1
-            collected_chunks = []
-            for f_start, f_end, info in file_intervals:
-                intersect_start = max(req_start, f_start)
-                intersect_end = min(req_stop, f_end)
-                if intersect_start < intersect_end:
-                    file_read_index = list(inner_index)
-                    file_read_index[concat_axis] = slice(
-                        intersect_start - f_start, intersect_end - f_start
-                    )
-                    f = file_manager.get_handle(info["file"])
-                    chunk = f.get_slice(hf_key)[tuple(file_read_index)]
-                    collected_chunks.append(chunk)
-            if not collected_chunks:
-                return np.zeros((0,) * len(expert_shape), dtype=target_dtype)
-            if len(collected_chunks) > 1:
-                result = np.concatenate(collected_chunks, axis=concat_axis)
-            else:
-                result = collected_chunks[0]
-            result = _view_as_fp8_if_needed(result, target_dtype)
-            if do_transpose:
-                result = np.transpose(result)
-            return result
-
         MAX_WORKERS = 128
 
         def _load_stacked_slice(index):
@@ -550,34 +520,88 @@ class WeightLoader:
                     logical_to_positions[log_idx] = []
                 logical_to_positions[log_idx].append(phys_pos)
 
-            # Pre-load first expert to determine shape
-            first_log_idx = logical_indices[0]
+            unique_logical = list(logical_to_positions.keys())
+
+            # Compute inner_index adjusted for transpose
             orig_inner = list(inner_slice)
             if do_transpose and len(orig_inner) >= 2:
                 orig_inner[-1], orig_inner[-2] = orig_inner[-2], orig_inner[-1]
-            first_data = _load_single_expert_slice(first_log_idx, tuple(orig_inner))
+            orig_inner = tuple(orig_inner)
+
+            # Phase 1: Build all (expert, tp_shard) read tasks
+            read_tasks = []  # (logical_idx, shard_order, file, hf_key, file_read_index)
+            for log_idx in unique_logical:
+                hf_key = expected_hf_keys[log_idx]
+                file_intervals = expert_file_intervals[log_idx]
+                expert_shape = expert_global_shapes[log_idx]
+                slice_on_axis = orig_inner[concat_axis]
+                req_start, req_stop, req_step = slice_on_axis.indices(expert_shape[concat_axis])
+                assert req_step == 1
+
+                shard_order = 0
+                for f_start, f_end, info in file_intervals:
+                    intersect_start = max(req_start, f_start)
+                    intersect_end = min(req_stop, f_end)
+                    if intersect_start < intersect_end:
+                        file_read_index = list(orig_inner)
+                        file_read_index[concat_axis] = slice(
+                            intersect_start - f_start, intersect_end - f_start
+                        )
+                        read_tasks.append(
+                            (log_idx, shard_order, info["file"], hf_key, tuple(file_read_index))
+                        )
+                        shard_order += 1
+
+            # Phase 2: Parallel read all (expert, tp_shard) chunks at once
+            read_results = [None] * len(read_tasks)
+
+            def _read_chunk(task_idx):
+                _, _, filename, hf_key, file_read_index = read_tasks[task_idx]
+                f = file_manager.get_handle(filename)
+                chunk = f.get_slice(hf_key)[file_read_index]
+                read_results[task_idx] = _view_as_fp8_if_needed(chunk, target_dtype)
+
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                list(executor.map(_read_chunk, range(len(read_tasks))))
+
+            # Phase 3: Group by expert, concat tp shards, transpose, fill output
+            # Group read results by logical expert index
+            expert_chunks = {}  # log_idx -> [(shard_order, chunk)]
+            for task_idx, (log_idx, shard_order, _, _, _) in enumerate(read_tasks):
+                expert_chunks.setdefault(log_idx, []).append((shard_order, read_results[task_idx]))
+
+            # Assemble first expert to determine output shape
+            first_log_idx = unique_logical[0]
+            first_chunks = expert_chunks[first_log_idx]
+            first_chunks.sort(key=lambda x: x[0])
+            if len(first_chunks) == 1:
+                first_data = first_chunks[0][1]
+            else:
+                first_data = np.concatenate([c for _, c in first_chunks], axis=concat_axis)
+            if do_transpose:
+                first_data = np.transpose(first_data)
 
             out_array = np.empty((len(physical_indices), *first_data.shape), dtype=target_dtype)
             for pos in logical_to_positions[first_log_idx]:
                 out_array[pos] = first_data
 
-            # Load remaining unique experts in parallel and fill positions
-            remaining_logical = [
-                log_idx for log_idx in logical_to_positions if log_idx != first_log_idx
-            ]
-
-            def load_and_fill_expert(log_idx):
-                orig_inner = list(inner_slice)
-                if do_transpose and len(orig_inner) >= 2:
-                    orig_inner[-1], orig_inner[-2] = orig_inner[-2], orig_inner[-1]
-                data = _load_single_expert_slice(log_idx, tuple(orig_inner))
-                # Directly fill all positions that need this expert
+            # Assemble remaining experts (can parallelize concat/transpose too)
+            def _assemble_and_fill(log_idx):
+                chunks = expert_chunks[log_idx]
+                chunks.sort(key=lambda x: x[0])
+                if len(chunks) == 1:
+                    data = chunks[0][1]
+                else:
+                    data = np.concatenate([c for _, c in chunks], axis=concat_axis)
+                if do_transpose:
+                    data = np.transpose(data)
                 for pos in logical_to_positions[log_idx]:
                     out_array[pos] = data
 
+            remaining_logical = [log_idx for log_idx in unique_logical if log_idx != first_log_idx]
             if remaining_logical:
                 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                    list(executor.map(load_and_fill_expert, remaining_logical))
+                    list(executor.map(_assemble_and_fill, remaining_logical))
 
             return out_array
 
