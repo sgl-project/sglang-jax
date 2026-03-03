@@ -426,13 +426,23 @@ class TestAttention(CustomTestCase):
             cache_loc_list.append(padded_page_indices)
         page_table = jnp.stack(cache_loc_list)
 
+        # Reshard inputs to remove 'data' axis for ref implementation
+        # ref_ragged_paged_attention doesn't support data parallelism sharding
+        replicated_sharding = jax.sharding.NamedSharding(mesh, P())
+        seq_lens_replicated = jax.device_put(forward_batch.seq_lens, replicated_sharding)
+        cu_q_lens_replicated = jax.device_put(
+            forward_batch.attn_backend.forward_metadata.cu_q_lens, replicated_sharding
+        )
+        page_table_replicated = jax.device_put(page_table, replicated_sharding)
+
         expected = ref_ragged_paged_attention(
             q.reshape(q.shape[0], num_heads, head_dim),
             k.reshape(k.shape[0] // page_size, page_size, num_kv_heads, head_dim),
             v.reshape(v.shape[0] // page_size, page_size, num_kv_heads, head_dim),
-            forward_batch.seq_lens,
-            page_table,
-            forward_batch.attn_backend.forward_metadata.cu_q_lens,
+            seq_lens_replicated,
+            page_table_replicated,
+            cu_q_lens_replicated,
+            jnp.array([forward_batch.batch_size], dtype=jnp.int32),
             # forward_batch.attn_backend.forward_metadata.cu_kv_lens,
             custom_mask=(
                 forward_batch.spec_info.custom_mask if forward_batch.spec_info is not None else None

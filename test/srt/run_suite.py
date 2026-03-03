@@ -429,6 +429,7 @@ suites = {
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 1),
+        TestFile("python/sgl_jax/test/test_flashattention_dp.py", 20),
     ],
     "kernel-performance-test-tpu-v6e-1": [
         TestFile("benchmark/kernels/flash_attention/bench_flashattention.py", 5),
