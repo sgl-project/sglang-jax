@@ -13,8 +13,8 @@ from sgl_jax.srt.multimodal.kernels.flash_attention import SegmentIds, flash_att
 def jit_flash_attention(q, k, v):
     q_len = q.shape[2]
     kv_len = k.shape[2]
-    align_q_len = align_to(q_len, 128)
-    align_kv_len = align_to(kv_len, 128)
+    align_q_len = align_to(q_len, 256)
+    align_kv_len = align_to(kv_len, 256)
     seg_q = None
     seg_kv = None
     segment_ids = None

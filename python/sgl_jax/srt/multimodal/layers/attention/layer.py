@@ -112,8 +112,8 @@ class USPAttention(nnx.Module):
         value = jnp.transpose(value, (0, 2, 1, 3))
         q_len = query.shape[2]
         kv_len = key.shape[2]
-        align_q_len = align_to(q_len, 128)
-        align_kv_len = align_to(kv_len, 128)
+        align_q_len = align_to(q_len, 256)
+        align_kv_len = align_to(kv_len, 256)
         seg_q = None
         seg_kv = None
         segment_ids = None

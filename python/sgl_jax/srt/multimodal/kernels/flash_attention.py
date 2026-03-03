@@ -96,7 +96,7 @@ class BlockSizes:
         # TODO(apaszke,sharadmv): Select better parameters based on a heuristic.
         del batch_size, num_heads, q_seq_len, kv_len, d_model  # Unused.
         return BlockSizes(
-            block_q=128,
+            block_q=256,
             block_k_major=128,
             block_k=128,
             block_b=1,
@@ -422,9 +422,9 @@ def _flash_attention_kernel_single_batch_single_step(
     block_q = q_tile_ref.shape[2]
 
     assert kv_seq_len == block_k_major == block_k
-
     q = q_tile_ref[batch_idx]  # [block_q, head_dim]
     k = k_tile_ref[batch_idx]  # [block_k, head_dim]
+
     s = jax.lax.dot_general(
         q, k, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32
     )  # [block_q, block_k]
@@ -439,8 +439,7 @@ def _flash_attention_kernel_single_batch_single_step(
         repeats, rem = divmod(block_k, NUM_LANES)
         if rem:
             raise NotImplementedError(f"kv block size must be a multiple of {NUM_LANES}")
-        q_segment_ids = q_segment_ids_tile_ref[batch_idx[0]]  # [block_q, NUM_LANES].
-        q_segment_ids = jnp.tile(q_segment_ids, (1, repeats))  # [block_q, block_k].
+        q_segment_ids = q_segment_ids_tile_ref[batch_idx[0], :, :1]  # [block_q, 1]
         kv_segment_ids = kv_segment_ids_tile_ref[batch_idx[0], :1]  # [1, block_k].
         mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 
@@ -452,12 +451,12 @@ def _flash_attention_kernel_single_batch_single_step(
         col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
         causal_mask = col_ids <= row_ids
         mask = causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
-    s = s if mask is None else s + jnp.where(mask, 0.0, mask_value)
+    s = s if mask is None else jnp.where(mask, s, mask_value)
 
-    m = jnp.max(s, axis=1)[:, None]
+    m = jnp.max(s, axis=1, keepdims=True)
     p = jnp.exp(s - m)
-    l = jnp.sum(p, axis=1)[:, None]
-    p /= l
+    l = jnp.sum(p, axis=1, keepdims=True)
+    p *= jax.lax.reciprocal(l)
 
     if m_ref is not None:
         m_ref[batch_idx] = lax.broadcast_in_dim(m, m_ref.shape[2:], range(2))
