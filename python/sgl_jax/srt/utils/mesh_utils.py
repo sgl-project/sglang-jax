@@ -42,12 +42,20 @@ def create_device_mesh(
             allow_split_physical_axes=allow_split_physical_axes,
         )
     else:
-        devices_array = mesh_utils.create_device_mesh(
-            ici_parallelism,
-            devices=devices,
-            contiguous_submeshes=False,
-            allow_split_physical_axes=allow_split_physical_axes,
-        )
+        all_devices = jax.devices()
+        is_subset = len(devices) < len(all_devices)
+        if is_subset:
+            # JAX's create_device_mesh infers the full physical TPU topology
+            # and asserts len(devices) == np.prod(dims), which fails when
+            # only a subset of devices is used.  Fall back to a simple reshape.
+            devices_array = np.array(devices).reshape(ici_parallelism)
+        else:
+            devices_array = mesh_utils.create_device_mesh(
+                ici_parallelism,
+                devices=devices,
+                contiguous_submeshes=False,
+                allow_split_physical_axes=allow_split_physical_axes,
+            )
 
     if use_explicit_sharding:
         axis_types = (jax.sharding.AxisType.Explicit,) * len(mesh_axes)
