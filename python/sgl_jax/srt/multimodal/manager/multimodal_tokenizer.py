@@ -422,7 +422,7 @@ class MultimodalTokenizer(TokenizerManager):
                 },
             }
         )
-        state.event.set()
+        self._notify_state_event(state)
         logger.info("Abort completed for rid=%s", recv_obj.rid)
 
     async def generate_request(
@@ -910,6 +910,10 @@ class MultimodalTokenizer(TokenizerManager):
         `rid_to_state` keyed by the request id.
         """
         self.send_to_scheduler.send_pyobj(tokenized_obj)
+        try:
+            caller_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            caller_loop = None
         state = MMReqState(
             rid=tokenized_obj.rid,
             out_list=[],
@@ -917,6 +921,7 @@ class MultimodalTokenizer(TokenizerManager):
             event=asyncio.Event(),
             obj=obj,
             created_time=created_time,
+            event_loop=caller_loop,
         )
         self.rid_to_state[tokenized_obj.rid] = state
         return state
