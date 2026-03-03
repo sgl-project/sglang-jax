@@ -192,6 +192,7 @@ class DiffusionModelRunner(BaseModelRunner):
         )
         self.solver.set_begin_index(0)
         start_time = time.time()
+        import jax._src.test_util as jtu
 
         for step in tqdm(range(num_inference_steps), desc="Diffusion steps"):
             # Check for abort between steps
@@ -213,13 +214,15 @@ class DiffusionModelRunner(BaseModelRunner):
             # Transpose to channel-first (B, T, H, W, C) -> (B, C, T, H, W) for model
             latents_cf = latents.transpose(0, 4, 1, 2, 3)
             # Perform denoising step
-            noise_pred: jax.Array = self.jitted_forward(
-                hidden_states=latents_cf,
-                encoder_hidden_states=text_embeds,
-                timesteps=t_batch,
-                encoder_hidden_states_image=None,
-                guidance_scale=None,
-            )
+            with jtu.count_pjit_cpp_cache_miss() as count:
+                noise_pred: jax.Array = self.jitted_forward(
+                    hidden_states=latents_cf,
+                    encoder_hidden_states=text_embeds,
+                    timesteps=t_batch,
+                    encoder_hidden_states_image=None,
+                    guidance_scale=None,
+                )
+                logger.info("diffusion cache miss count: %d", count())
             if do_classifier_free_guidance:
                 bsz = latents.shape[0] // 2
                 noise_uncond = noise_pred[bsz:]
@@ -259,8 +262,8 @@ class DiffusionModelRunner(BaseModelRunner):
                     if batch.num_frames is not None
                     else 1
                 ),
-                batch.width // self.model_config.scale_factor_spatial,
                 batch.height // self.model_config.scale_factor_spatial,
+                batch.width // self.model_config.scale_factor_spatial,
                 self.model_config.latent_input_dim,
             ),
             dtype=jnp.float32,

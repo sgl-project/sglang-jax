@@ -2,6 +2,7 @@ import logging
 
 import jax
 import jax.sharding
+import numpy as np
 from jax import NamedSharding
 from jax.sharding import PartitionSpec
 
@@ -65,6 +66,10 @@ class VaeScheduler(SchedulerProfilerMixin):
         self.model_config = model_class.get_config_class()()
         # Track aborted request IDs to skip processing
         self.aborted_rids: set[str] = set()
+        if not server_args.disable_precompile:
+            logger.info("[VAE Scheduler] Begins to run vae worker precompile.")
+            self.vae_worker.run_precompile()
+            logger.info("[VAE Scheduler] Completes vae worker precompile.")
 
     def event_loop_normal(self):
         """Main blocking loop used in non-async environments.
@@ -121,6 +126,21 @@ class VaeScheduler(SchedulerProfilerMixin):
         if hasattr(self.model_config, "shift_factor"):
             req.latents += self.model_config.shift_factor
         req.latents = jax.device_get(req.latents)
+        latents_t_padding = 0
+        if self.server_args.vae_decode_precompile_frame_paddings is not None and hasattr(
+            self.model_config, "scale_factor_temporal"
+        ):
+            for n_frame in self.server_args.vae_decode_precompile_frame_paddings:
+                latents_t = (n_frame - 1) // self.model_config.scale_factor_temporal + 1
+                if latents_t >= req.latents.shape[1]:
+                    latents_t_padding = latents_t - req.latents.shape[1]
+                    break
+        req.latents = np.pad(
+            req.latents,
+            pad_width=((0, 0), (0, latents_t_padding), (0, 0), (0, 0), (0, 0)),
+            mode="constant",
+            constant_values=0,
+        )
 
     def run_vae_batch(self, batch: list[Req]):
         """Run the VAE forward pass for a batch of requests.
@@ -132,8 +152,9 @@ class VaeScheduler(SchedulerProfilerMixin):
         """
 
         for req in batch:
-            output, _ = self.vae_worker.forward(req)
-            req.output = jax.device_get(output)
+            output, cache_miss = self.vae_worker.forward(req)
+            logger.info("VAE forward pass cache miss: %s", cache_miss)
+            req.output = jax.device_get(output[:, : req.num_frames, :, :, :])
             req.latents = None
             self.forward_ct += 1
             self._profile_batch_predicate(None)

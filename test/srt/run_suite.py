@@ -422,6 +422,7 @@ suites = {
         TestFile("python/sgl_jax/test/speculative/test_eagle_utils.py", 1),
         TestFile("python/sgl_jax/test/multimodal/test_wan_vae_precision.py", 1),
         TestFile("python/sgl_jax/test/multimodal/test_vae_scheduler.py", 2),
+        TestFile("python/sgl_jax/test/multimodal/test_flash_attention_kernel.py", 2),
         TestFile("test/srt/lora/test_bgmv_backend.py", 5),
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 10),
     ],

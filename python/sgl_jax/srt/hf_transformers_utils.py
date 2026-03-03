@@ -200,7 +200,11 @@ def get_tokenizer(
         )
     tokenizer_name = download_from_hf(tokenizer_name)
     if sub_dir:
-        tokenizer_name += "/" + sub_dir
+        # Only append sub_dir if it actually exists
+        sub_dir_path = tokenizer_name + "/" + sub_dir
+        if os.path.isdir(sub_dir_path):
+            tokenizer_name = sub_dir_path
+        # else: use the root path, tokenizer might be in model root
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
