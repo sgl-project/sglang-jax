@@ -44,4 +44,7 @@ class DtypeConfig:
 
     def get_dtype(self, key: str) -> jnp.dtype | None:
         """Returns the specific dtype, or falls back to the default."""
-        return self.config_dict.get(key, self.default_dtype)
+        val = self.config_dict.get(key, self.default_dtype)
+        if not isinstance(val, jnp.dtype):
+            return self.default_dtype
+        return val
