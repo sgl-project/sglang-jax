@@ -1,6 +1,7 @@
 import abc
 import logging
 import time
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -784,6 +785,7 @@ def update_fused_kv_cache_vectorized(
     by grouping contiguous tokens into page-sized chunks for efficient updates.
     """
 
+    @partial(jax.jit, donate_argnums=(2,))
     @jax.shard_map(
         in_specs=(
             # fused_kv: sharded by data (tokens) and tensor (heads)

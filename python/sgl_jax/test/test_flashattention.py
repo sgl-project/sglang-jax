@@ -140,7 +140,7 @@ def create_test_data(
     causal=True,
     input_ids=None,
     model_config=None,
-    max_total_token_size=710016,
+    max_total_token_size=100000,
 ):
     """Create a real ForwardBatch for testing."""
     assert mode in ["prefill", "decode"]

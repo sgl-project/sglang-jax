@@ -185,6 +185,7 @@ def kv_cache_update_impl(
 @partial(
     jax.jit,
     static_argnames=["page_size", "num_slices_per_block", "kv_partition_axis"],
+    donate_argnums=(2,),
 )
 def kv_cache_update(
     new_kv: jax.Array,  # [total_num_token, num_kv_heads, head_dim]

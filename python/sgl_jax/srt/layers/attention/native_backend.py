@@ -92,7 +92,7 @@ class NativeAttention(AttentionBackend):
             P("data"),  # extend_prefix_lens
             P("data"),  # extend_seq_lens
         )
-        out_specs = P("data", "tensor", None)  # attn_output
+        out_specs = P("data", "tensor")  # attn_output: [num_tokens, hidden_size]
 
         attn_output = jax.shard_map(
             lambda q_local, k_local, v_local, seq_lens_local, loc_local, prefix_lens_local, extend_lens_local: forward_attention(

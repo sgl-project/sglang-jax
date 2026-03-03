@@ -117,7 +117,9 @@ class TestKVCache(unittest.TestCase):
         total_tokens = 16
         k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=False)
 
-        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache, page_size=1)
+        updated_k_cache, updated_v_cache = update_kv_cache(
+            k, v, loc, k_cache.copy(), v_cache.copy(), page_size=1
+        )
 
         # Expected result
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -132,7 +134,9 @@ class TestKVCache(unittest.TestCase):
         total_tokens = 12
         k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=True)
 
-        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache, page_size=1)
+        updated_k_cache, updated_v_cache = update_kv_cache(
+            k, v, loc, k_cache.copy(), v_cache.copy(), page_size=1
+        )
 
         # Expected result (should ignore padding tokens where loc == -1)
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -148,7 +152,9 @@ class TestKVCache(unittest.TestCase):
         k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=False)
 
         # Test with page_size=4
-        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache, page_size=4)
+        updated_k_cache, updated_v_cache = update_kv_cache(
+            k, v, loc, k_cache.copy(), v_cache.copy(), page_size=4
+        )
 
         # Expected result
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -163,7 +169,9 @@ class TestKVCache(unittest.TestCase):
         k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=True)
 
         # Test with page_size=4
-        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache, page_size=4)
+        updated_k_cache, updated_v_cache = update_kv_cache(
+            k, v, loc, k_cache.copy(), v_cache.copy(), page_size=4
+        )
 
         # Expected result (should ignore padding tokens where loc == -1)
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -179,7 +187,9 @@ class TestKVCache(unittest.TestCase):
         k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=False)
 
         # Test with page_size=8
-        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache, page_size=8)
+        updated_k_cache, updated_v_cache = update_kv_cache(
+            k, v, loc, k_cache.copy(), v_cache.copy(), page_size=8
+        )
 
         # Expected result
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -204,7 +214,9 @@ class TestKVCache(unittest.TestCase):
         original_v_cache = v_cache.copy()
 
         # Test both approaches
-        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache, page_size=8)
+        updated_k_cache, updated_v_cache = update_kv_cache(
+            k, v, loc, k_cache.copy(), v_cache.copy(), page_size=8
+        )
 
         # Cache should remain unchanged since all tokens are padding
         self.assertTrue(jnp.allclose(updated_k_cache, original_k_cache))
@@ -266,7 +278,7 @@ class TestKVCache(unittest.TestCase):
         for page_size in [1, 2, 4, 8]:
             with self.subTest(page_size=page_size):
                 updated_k_cache, updated_v_cache = update_kv_cache(
-                    k, v, loc, k_cache, v_cache, page_size=page_size
+                    k, v, loc, k_cache.copy(), v_cache.copy(), page_size=page_size
                 )
 
                 # Expected result

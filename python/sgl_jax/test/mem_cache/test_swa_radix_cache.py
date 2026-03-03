@@ -27,7 +27,8 @@ class TestSWARadixCache(unittest.TestCase):
     def setUp(self):
         # Keep KV sizes small to make tests light-weight
         self.devices = jax.devices()
-        self.mesh = Mesh([self.devices[0]], axis_names=("tensor",))
+        # Create mesh with both 'data' and 'tensor' axes for DP compatibility
+        self.mesh = Mesh(np.array([self.devices[0]]).reshape(1, 1), axis_names=("data", "tensor"))
 
         # Small buffers to avoid heavy allocations
         self.kv_head_num = 1
