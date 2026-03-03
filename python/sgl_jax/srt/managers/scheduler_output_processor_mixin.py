@@ -72,19 +72,23 @@ class SchedulerOutputProcessorMixin:
                 self.tp_worker.resolve_last_batch_result(launch_done)
             )
         else:
+            # Gather sharded tensors before any host-side operations
+            next_token_ids = self._gather_next_token_ids(next_token_ids)
+            logits_output = self._gather_logits_output(logits_output)
+
             # Move next_token_ids and logprobs to cpu
             if batch.return_output_logprob_only and logits_output.next_token_logprobs is not None:
                 logits_output.next_token_logprobs = jax.device_get(
                     logits_output.next_token_logprobs
-                ).astype(float)
+                )
             if batch.return_logprob:
                 if logits_output.next_token_logprobs is not None:
                     logits_output.next_token_logprobs = jax.device_get(
                         logits_output.next_token_logprobs
-                    ).astype(float)
+                    )
                 if logits_output.input_token_logprobs is not None:
                     logits_output.input_token_logprobs = tuple(
-                        jax.device_get(logits_output.input_token_logprobs).astype(float)
+                        jax.device_get(logits_output.input_token_logprobs)
                     )
         hidden_state_offset = 0
         per_dp_bs_size = batch.per_dp_bs_size
@@ -176,7 +180,7 @@ class SchedulerOutputProcessorMixin:
                                         + len(req.origin_input_ids)
                                     )
                                 ]
-                            ).astype(float)
+                            )
                         )
 
                     # Update grammar state after token sampling
@@ -295,6 +299,10 @@ class SchedulerOutputProcessorMixin:
             )
             next_token_logprobs = logits_output.next_token_logprobs
         else:
+            # Gather sharded tensors before any host-side operations
+            next_token_ids = self._gather_next_token_ids(next_token_ids)
+            logits_output = self._gather_logits_output(logits_output)
+
             # spec decoding handles output logprobs inside verify process.
             if batch.return_logprob or batch.return_output_logprob_only:
                 next_token_logprobs = jax.device_get(logits_output.next_token_logprobs).astype(

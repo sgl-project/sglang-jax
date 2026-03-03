@@ -540,6 +540,62 @@ class Scheduler(
 
         self.decode_mem_cache_buf_multiplier = 1
 
+    def _gather_logits_output(self, logits_output: LogitsProcessorOutput) -> LogitsProcessorOutput:
+        """Gather all sharded fields in LogitsProcessorOutput to replicated sharding."""
+        from jax.sharding import NamedSharding, PartitionSpec
+
+        replicated_sharding = NamedSharding(self.mesh, PartitionSpec())
+        gather_fn = jax.jit(lambda x: x, out_shardings=replicated_sharding)
+
+        # Gather each field that might be sharded
+        if logits_output.next_token_logprobs is not None:
+            logits_output.next_token_logprobs = gather_fn(logits_output.next_token_logprobs)
+        if logits_output.input_token_logprobs is not None:
+            logits_output.input_token_logprobs = gather_fn(logits_output.input_token_logprobs)
+        if logits_output.hidden_states is not None:
+            logits_output.hidden_states = gather_fn(logits_output.hidden_states)
+        if logits_output.next_token_top_logprobs_val is not None:
+            logits_output.next_token_top_logprobs_val = gather_fn(
+                logits_output.next_token_top_logprobs_val
+            )
+        if logits_output.next_token_top_logprobs_idx is not None:
+            logits_output.next_token_top_logprobs_idx = gather_fn(
+                logits_output.next_token_top_logprobs_idx
+            )
+        if logits_output.next_token_token_ids_logprobs_val is not None:
+            logits_output.next_token_token_ids_logprobs_val = gather_fn(
+                logits_output.next_token_token_ids_logprobs_val
+            )
+        if logits_output.next_token_token_ids_logprobs_idx is not None:
+            logits_output.next_token_token_ids_logprobs_idx = gather_fn(
+                logits_output.next_token_token_ids_logprobs_idx
+            )
+        if logits_output.input_top_logprobs_val is not None:
+            logits_output.input_top_logprobs_val = gather_fn(logits_output.input_top_logprobs_val)
+        if logits_output.input_top_logprobs_idx is not None:
+            logits_output.input_top_logprobs_idx = gather_fn(logits_output.input_top_logprobs_idx)
+        if logits_output.input_token_ids_logprobs_val is not None:
+            logits_output.input_token_ids_logprobs_val = gather_fn(
+                logits_output.input_token_ids_logprobs_val
+            )
+        if logits_output.input_token_ids_logprobs_idx is not None:
+            logits_output.input_token_ids_logprobs_idx = gather_fn(
+                logits_output.input_token_ids_logprobs_idx
+            )
+
+        return logits_output
+
+    def _gather_next_token_ids(self, next_token_ids: jax.Array) -> jax.Array:
+        """Gather sharded next_token_ids to replicated sharding."""
+        from jax.sharding import NamedSharding, PartitionSpec
+
+        if next_token_ids is None:
+            return None
+
+        replicated_sharding = NamedSharding(self.mesh, PartitionSpec())
+        gather_fn = jax.jit(lambda x: x, out_shardings=replicated_sharding)
+        return gather_fn(next_token_ids)
+
     def _select_round_robin_dp(self) -> int:
         dp_rank = self.dp_round_robin_counter % self.dp_size
         self.dp_round_robin_counter += 1
