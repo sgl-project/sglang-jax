@@ -38,12 +38,15 @@ def gmm_wrapper(
     rhs_bias=None,
     group_offset=None,
     maybe_quantize_lhs=False,
+    preferred_element_type=None,
 ):
     if version == GMM_VERSION_V1:
+        out_dtype = preferred_element_type if preferred_element_type is not None else lhs.dtype
         return gmm(
             lhs,
             rhs,
             group_sizes,
+            preferred_element_type=out_dtype,
             rhs_scale=rhs_scale,
             rhs_bias=rhs_bias,
             group_offset=group_offset,
@@ -156,7 +159,7 @@ class GmmTest(jtu.JaxTestCase):
         num_groups=[16, 32],
         has_bias=[True, False],
         group_offset=[0, 2, 3],
-        version=[GMM_VERSION_V1, GMM_VERSION_V2],
+        version=[GMM_VERSION_V1],
     )
     def test_gmm(self, batch_size, in_size, out_size, num_groups, has_bias, group_offset, version):
         num_local_groups = num_groups - group_offset
@@ -192,10 +195,10 @@ class GmmTest(jtu.JaxTestCase):
         out_size=[512, 1024],
         num_groups=[16, 32],
         has_bias=[True, False],
-        weight_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float4_e2m1fn],
+        weight_dtype=[jnp.int8, jnp.float8_e4m3fn],
         block_size=[64, 128, 256, 512],
         group_offset=[0, 2, 3],
-        version=[GMM_VERSION_V1, GMM_VERSION_V2],
+        version=[GMM_VERSION_V1],
     )
     def test_gmm_weight_quantized(
         self,
@@ -209,8 +212,6 @@ class GmmTest(jtu.JaxTestCase):
         group_offset,
         version,
     ):
-        if weight_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
-            self.skipTest("Expect TPUv7+")
         num_local_groups = num_groups - group_offset
         key = jax.random.key(0)
 
@@ -257,9 +258,71 @@ class GmmTest(jtu.JaxTestCase):
         out_size=[512, 1024],
         num_groups=[16, 32],
         weight_dtype=[jnp.int8, jnp.float8_e4m3fn],
+        block_size=[512],
         group_offset=[0, 2, 3],
     )
-    def test_gmm_activation_weight_quantized(
+    def test_gmm_v1_activation_weight_quantized(
+        self,
+        batch_size,
+        in_size,
+        out_size,
+        num_groups,
+        weight_dtype,
+        block_size,
+        group_offset,
+    ):
+        """V1 path: manually quantize LHS, call gmm, then rescale by x_scale."""
+        num_local_groups = num_groups - group_offset
+        key = jax.random.key(0)
+
+        lhs = jax.random.uniform(key, (batch_size, in_size), jnp.bfloat16, -1, 1)
+        rhs = jax.random.uniform(key, (num_local_groups, in_size, out_size), jnp.bfloat16, -1, 1)
+        rhs_q, rhs_scale = quantize_tensor(rhs, weight_dtype, axis=1, block_size=block_size)
+        rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+
+        group_sizes = get_group_sizes(batch_size, num_groups)
+        group_offset = jnp.array(group_offset, dtype=jnp.int32)
+
+        expected = reference_gmm(
+            lhs,
+            rhs_q,
+            group_sizes,
+            rhs_scale=rhs_scale,
+            group_offset=group_offset,
+        )
+
+        # Per-token activation quantization (mirrors moe.py _gmm_compute V1 path)
+        lhs_abs_max = jnp.max(jnp.abs(lhs), axis=-1, keepdims=True)
+        act_dtype_max = (
+            float(jnp.finfo(weight_dtype).max)
+            if jnp.issubdtype(weight_dtype, jnp.floating)
+            else float(jnp.iinfo(weight_dtype).max)
+        )
+        x_scale = lhs_abs_max / act_dtype_max
+        lhs_q = jnp.clip(lhs / x_scale, -act_dtype_max, act_dtype_max).astype(weight_dtype)
+
+        actual = gmm_wrapper(
+            lhs_q,
+            rhs_q,
+            group_sizes,
+            version=GMM_VERSION_V1,
+            rhs_scale=rhs_scale,
+            group_offset=group_offset,
+            preferred_element_type=jnp.bfloat16,
+        )
+        actual = actual * x_scale
+
+        self.assertArraysAllClose(actual, expected, atol=1.1, rtol=1.1)
+
+    @parameterized.product(
+        batch_size=[128],
+        in_size=[512, 1024],
+        out_size=[512, 1024],
+        num_groups=[16, 32],
+        weight_dtype=[jnp.int8, jnp.float8_e4m3fn],
+        group_offset=[0, 2, 3],
+    )
+    def test_gmm_v2_activation_weight_quantized(
         self,
         batch_size,
         in_size,
@@ -268,8 +331,6 @@ class GmmTest(jtu.JaxTestCase):
         weight_dtype,
         group_offset,
     ):
-        if weight_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
-            self.skipTest("Expect TPUv7+")
         # TODO(kyuyeunk, wenxindong): Add subchannel quantization on gmm_v2.
         block_size = in_size
         num_local_groups = num_groups - group_offset

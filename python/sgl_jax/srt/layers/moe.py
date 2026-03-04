@@ -526,16 +526,18 @@ class EPMoE(nnx.Module):
         group_sizes = group_sizes.astype(jnp.int32)
         interpret = not is_tpu_runtime()
 
-        # Decide kernel variant once; gmm_v2 handles LHS quantization internally,
-        # so we only do manual quantization when falling back to gmm_v1.
-        use_v2 = not interpret and is_supported_by_gmm_v2(x, w0_kernel, w0_kernel_scale)
-
-        # When activation_quantized_dtype is None, tell gmm_v2 not to quantize
-        # the LHS even if the RHS (weights) are in a quantized dtype.
         quantize_lhs = self.activation_quantized_dtype is not None
 
+        # Check v2 support separately for GEMM1 and GEMM2 since shapes differ.
+        # TODO: explicitly set to False because gmm_v2 will output NaN.
+        use_v2_gemm1 = (
+            False  # noqa: SIM223
+            and not interpret
+            and is_supported_by_gmm_v2(x, w0_kernel, w0_kernel_scale)
+        )
+
         # === GEMM1: x @ w0 and x @ w1 ===
-        if not use_v2 and self.activation_quantized_dtype is not None:
+        if not use_v2_gemm1 and self.activation_quantized_dtype is not None:
             x_q, x_scale = quantize_tensor_simple(x, self.activation_quantized_dtype, dim=-1)
             gemm1_lhs = x_q
         else:
@@ -551,7 +553,7 @@ class EPMoE(nnx.Module):
             rhs_bias=w0_kernel_bias,
             group_offset=group_offset,
             interpret=interpret,
-            use_gmm_v2=use_v2,
+            use_gmm_v2=use_v2_gemm1,
             maybe_quantize_lhs=quantize_lhs,
         )
 
@@ -564,7 +566,7 @@ class EPMoE(nnx.Module):
             rhs_bias=w1_kernel_bias,
             group_offset=group_offset,
             interpret=interpret,
-            use_gmm_v2=use_v2,
+            use_gmm_v2=use_v2_gemm1,
             maybe_quantize_lhs=quantize_lhs,
         )
 
@@ -582,7 +584,13 @@ class EPMoE(nnx.Module):
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
-        if not use_v2 and self.activation_quantized_dtype is not None:
+        use_v2_gemm2 = (
+            False  # noqa: SIM223
+            and not interpret
+            and is_supported_by_gmm_v2(intermediate_layer, wo_kernel, wo_kernel_scale)
+        )
+
+        if not use_v2_gemm2 and self.activation_quantized_dtype is not None:
             intermediate_q, intermediate_scale = quantize_tensor_simple(
                 intermediate_layer, self.activation_quantized_dtype, dim=-1
             )
@@ -600,7 +608,7 @@ class EPMoE(nnx.Module):
             rhs_bias=wo_kernel_bias,
             group_offset=group_offset,
             interpret=interpret,
-            use_gmm_v2=use_v2,
+            use_gmm_v2=use_v2_gemm2,
             maybe_quantize_lhs=quantize_lhs,
         )
 

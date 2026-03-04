@@ -597,5 +597,8 @@ def get_tuned_block_sizes(
         default_val = get_default_gmm_block_sizes(m, k, n, num_current_groups)
         logger.warning("[GMM kernel] using default block sizes for key: %s: %s", key, default_val)
         return default_val
+    else:
+        # TODO: debug purpose, will be removed
+        print(f"using tuned block sizes for key: {key} = {TUNED_BLOCK_SIZES.get(key)}", flush=True)
 
     return TUNED_BLOCK_SIZES.get(key)
