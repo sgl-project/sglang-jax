@@ -530,11 +530,7 @@ class EPMoE(nnx.Module):
 
         # Check v2 support separately for GEMM1 and GEMM2 since shapes differ.
         # TODO: explicitly set to False because gmm_v2 will output NaN.
-        use_v2_gemm1 = (
-            False  # noqa: SIM223
-            and not interpret
-            and is_supported_by_gmm_v2(x, w0_kernel, w0_kernel_scale)
-        )
+        use_v2_gemm1 = not interpret and is_supported_by_gmm_v2(x, w0_kernel, w0_kernel_scale)
 
         # === GEMM1: x @ w0 and x @ w1 ===
         if not use_v2_gemm1 and self.activation_quantized_dtype is not None:
@@ -555,6 +551,7 @@ class EPMoE(nnx.Module):
             interpret=interpret,
             use_gmm_v2=use_v2_gemm1,
             maybe_quantize_lhs=quantize_lhs,
+            zero_initialize=False,
         )
 
         layer_w1 = gmm(
@@ -568,6 +565,7 @@ class EPMoE(nnx.Module):
             interpret=interpret,
             use_gmm_v2=use_v2_gemm1,
             maybe_quantize_lhs=quantize_lhs,
+            zero_initialize=False,
         )
 
         if x_scale is not None:
@@ -584,10 +582,8 @@ class EPMoE(nnx.Module):
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
-        use_v2_gemm2 = (
-            False  # noqa: SIM223
-            and not interpret
-            and is_supported_by_gmm_v2(intermediate_layer, wo_kernel, wo_kernel_scale)
+        use_v2_gemm2 = not interpret and is_supported_by_gmm_v2(
+            intermediate_layer, wo_kernel, wo_kernel_scale
         )
 
         if not use_v2_gemm2 and self.activation_quantized_dtype is not None:
@@ -610,6 +606,7 @@ class EPMoE(nnx.Module):
             interpret=interpret,
             use_gmm_v2=use_v2_gemm2,
             maybe_quantize_lhs=quantize_lhs,
+            zero_initialize=True,
         )
 
         if intermediate_scale is not None:
