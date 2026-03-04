@@ -301,7 +301,8 @@ class ForwardBatch:
         `-1` in `out_cache_loc`.
         """
         if self.out_cache_loc is not None and self.out_cache_loc.shape == (num_tokens,):
-            return self.out_cache_loc > 0
+            # Padded tokens are marked as -1; cache location 0 is still a valid token.
+            return self.out_cache_loc >= 0
         if self.seq_lens is None or self.seq_lens.ndim != 1 or num_tokens != self.seq_lens.shape[0]:
             return None
         return self.seq_lens > 0
