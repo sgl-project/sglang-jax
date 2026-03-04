@@ -149,7 +149,23 @@ def kv_cache_update(
         assert (
             slices.shape[1] % num_slices_per_block == 0
         ), f"slices.shape[1]={slices.shape[1]} is not divisible by num_slices_per_block={num_slices_per_block}"
-        _, num_combined_kv_heads, actual_head_dim = new_kv.shape
+        _, orig_num_combined_kv_heads, orig_head_dim = new_kv.shape
+
+        # With TP sharding, a local shard can have an odd number of KV heads
+        # (e.g. global 8 heads / TP=8 => local 1). Pad locally inside shard_map
+        # so the TPU kernel still sees packed-even heads while global shapes remain unchanged.
+        local_pad_heads = orig_num_combined_kv_heads % 2
+        if local_pad_heads:
+            new_kv = jnp.pad(new_kv, ((0, 0), (0, local_pad_heads), (0, 0)))
+            kv_cache = jnp.pad(kv_cache, ((0, 0), (0, local_pad_heads), (0, 0)))
+
+        # Pad head_dim to 128-aligned (same strategy as ragged_paged_attention)
+        local_pad_head_dim = (-orig_head_dim) % 128
+        if local_pad_head_dim:
+            new_kv = jnp.pad(new_kv, ((0, 0), (0, 0), (0, local_pad_head_dim)))
+            kv_cache = jnp.pad(kv_cache, ((0, 0), (0, 0), (0, local_pad_head_dim)))
+
+        _, num_combined_kv_heads, head_dim = new_kv.shape
 
         assert num_combined_kv_heads % 2 == 0, (
             f"num_combined_kv_heads={num_combined_kv_heads} should be even after pre-padding. "
@@ -160,18 +176,8 @@ def kv_cache_update(
             kv_cache.shape[1] == num_combined_kv_heads
         ), f"kv_cache.shape[1]={kv_cache.shape[1]} is not equal to num_combined_kv_heads={num_combined_kv_heads}"
         assert (
-            kv_cache.shape[2] == actual_head_dim
-        ), f"kv_cache.shape[2]={kv_cache.shape[2]} is not equal to actual_head_dim={actual_head_dim}"
-
-        # Pad head_dim to 128-aligned (same strategy as ragged_paged_attention)
-        aligned_head_dim = (actual_head_dim + 127) // 128 * 128
-        needs_pad = actual_head_dim != aligned_head_dim
-        if needs_pad:
-            pad_size = aligned_head_dim - actual_head_dim
-            new_kv = jnp.pad(new_kv, ((0, 0), (0, 0), (0, pad_size)))
-            kv_cache = jnp.pad(kv_cache, ((0, 0), (0, 0), (0, pad_size)))
-
-        head_dim = aligned_head_dim
+            kv_cache.shape[2] == head_dim
+        ), f"kv_cache.shape[2]={kv_cache.shape[2]} is not equal to head_dim={head_dim}"
 
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
@@ -209,10 +215,10 @@ def kv_cache_update(
         )
 
         result = kernel(*scalar_prefetches, new_kv, kv_cache)[0]
-
-        # Trim back to actual head_dim
-        if needs_pad:
-            result = result[..., :actual_head_dim]
+        if local_pad_heads:
+            result = result[:, :orig_num_combined_kv_heads, :]
+        if local_pad_head_dim:
+            result = result[:, :, :orig_head_dim]
 
         return result
 

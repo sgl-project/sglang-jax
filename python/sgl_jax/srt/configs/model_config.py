@@ -172,6 +172,7 @@ class ModelConfig:
             "head_dim",
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
         )
+        self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", self.head_dim)
 
         self.attention_arch = AttentionArch.MHA
         self.num_attention_heads = self.hf_text_config.num_attention_heads
@@ -205,6 +206,14 @@ class ModelConfig:
 
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
+
+        self.moe_quant_block_size = 256
+        if self.quantization_config and self.quantization_config.weight_block_size:
+            if isinstance(self.quantization_config.weight_block_size, list):
+                self.moe_quant_block_size = self.quantization_config.weight_block_size[0]
+            else:
+                self.moe_quant_block_size = self.quantization_config.weight_block_size
+        self.hf_config.moe_quant_block_size = self.moe_quant_block_size
 
         config = self.hf_config
 
@@ -246,17 +255,26 @@ class ModelConfig:
 
             if quant_method == "fp8":
                 logger.info("Auto-detected FP8 model. Creating QuantizationConfig for static fp8.")
+                fmt = hf_quant_config.get("fmt", "e4m3")
+                weight_dtype = jnp.float8_e4m3fn if fmt == "e4m3" else jnp.float8_e5m2
+                activation_scheme = hf_quant_config.get("activation_scheme")
+                activation_dtype = (
+                    "float8_e4m3fn" if fmt == "e4m3" else "float8_e5m2"
+                ) if activation_scheme == "dynamic" else None
+                weight_block_size = hf_quant_config.get("weight_block_size")
                 quant_config = QuantizationConfig(
                     is_static_checkpoint=True,
                     linear_rules=[
                         {
                             "module_path": ".*",
-                            "weight_dtype": "float8_e4m3fn",
-                            "activation_dtype": None,
+                            "weight_dtype": "float8_e4m3fn" if fmt == "e4m3" else "float8_e5m2",
+                            "activation_dtype": activation_dtype,
                         }
                     ],
-                    moe_weight_dtype=jnp.float8_e4m3fn,
-                    moe_activation_dtype=None,
+                    moe_weight_dtype=weight_dtype,
+                    moe_activation_dtype=weight_dtype if activation_scheme == "dynamic" else None,
+                    ignored_layers=hf_quant_config.get("ignored_layers"),
+                    weight_block_size=weight_block_size,
                 )
                 return quant_config
 
@@ -423,15 +441,68 @@ class ModelConfig:
         total_num_kv_heads = self.get_total_num_kv_heads()
         return get_num_kv_heads_by_tp(total_num_kv_heads, tensor_parallel_size)
 
+    def get_kv_head_counts_for_layer(
+        self,
+        layer_idx: int | None,
+        tensor_parallel_size: int | None = None,
+    ) -> tuple[int, int]:
+        """Return (original_kv_heads, total_kv_heads_after_tp) for a given layer.
+
+        For MiMo-v2-Flash, SWA layers can use a different KV head count than normal layers.
+        Fallbacks to the global KV head configuration for models without hybrid attention.
+        """
+        from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
+
+        is_swa_layer = False
+        if layer_idx is not None:
+            # MiMo config uses hybrid_layer_pattern (list of 0/1 ints, 1=SWA)
+            hybrid_layer_pattern = getattr(self.hf_text_config, "hybrid_layer_pattern", None)
+            if hybrid_layer_pattern is not None and 0 <= layer_idx < len(hybrid_layer_pattern):
+                is_swa_layer = hybrid_layer_pattern[layer_idx] == 1
+            else:
+                # fallback for string-format hybrid_pattern (e.g. ["full", "swa", ...])
+                hybrid_pattern = getattr(self.hf_text_config, "hybrid_pattern", None)
+                if hybrid_pattern and 0 <= layer_idx < len(hybrid_pattern):
+                    is_swa_layer = hybrid_pattern[layer_idx] == "swa"
+
+        if is_swa_layer and hasattr(self.hf_text_config, "swa_num_key_value_heads"):
+            original_kv_heads = getattr(
+                self,
+                "_original_swa_num_key_value_heads",
+                getattr(self.hf_text_config, "swa_num_key_value_heads"),
+            )
+            current_total_kv_heads = getattr(self.hf_text_config, "swa_num_key_value_heads")
+        else:
+            original_kv_heads = getattr(
+                self,
+                "_original_num_key_value_heads",
+                self.get_total_num_kv_heads(),
+            )
+            current_total_kv_heads = getattr(
+                self.hf_text_config,
+                "num_key_value_heads",
+                self.num_key_value_heads,
+            )
+
+        if tensor_parallel_size is None:
+            return int(original_kv_heads), int(current_total_kv_heads)
+
+        kv_heads_per_device = get_num_kv_heads_by_tp(int(original_kv_heads), tensor_parallel_size)
+        return int(original_kv_heads), int(kv_heads_per_device * tensor_parallel_size)
+
     def needs_kv_head_replication(self, tensor_parallel_size: int) -> bool:
         """Returns True if KV heads need to be replicated across devices."""
-        total_num_kv_heads = self.get_total_num_kv_heads()
-        return tensor_parallel_size > total_num_kv_heads
+        # Use original KV heads (pre-TP adjustment) if available to decide replication.
+        original_kv = getattr(self, "_original_num_key_value_heads", None)
+        if original_kv is None:
+            original_kv = self.get_total_num_kv_heads()
+        return tensor_parallel_size > original_kv
 
     def get_num_kv_head_replicas(self, tensor_parallel_size: int) -> int:
         """Returns the number of replicas for each original KV head."""
         total_num_kv_heads = self.get_total_num_kv_heads()
         if tensor_parallel_size > total_num_kv_heads:
+            logger.info(f"DEBUG: get_num_kv_head_replicas total={total_num_kv_heads} tp={tensor_parallel_size}")
             return (tensor_parallel_size + total_num_kv_heads - 1) // total_num_kv_heads
         else:
             return 1
@@ -470,12 +541,36 @@ class ModelConfig:
         total_kv_heads = kv_heads_per_device * tensor_parallel_size
         self.num_key_value_heads = total_kv_heads
 
-        # Only set HF config if the attribute exists, otherwise create it
-        if hasattr(self.hf_text_config, "num_key_value_heads"):
-            self.hf_text_config.num_key_value_heads = total_kv_heads
-        else:
-            # For MHA models, dynamically add the attribute
-            self.hf_text_config.num_key_value_heads = total_kv_heads
+        # Update all possible attribute names for KV heads in hf_text_config
+        # This ensures that models checking different attributes (e.g., num_kv_heads vs num_key_value_heads)
+        # see the updated, replicated value.
+        attributes_to_update = [
+            "num_key_value_heads",
+            "num_kv_heads",
+            "n_head_kv",
+            "multi_query_group_num",
+        ]
+        
+        # Always update/set the primary attribute
+        self.hf_text_config.num_key_value_heads = total_kv_heads
+        
+        # Update other attributes if they exist
+        for attr in attributes_to_update:
+            if attr != "num_key_value_heads" and hasattr(self.hf_text_config, attr):
+                 setattr(self.hf_text_config, attr, total_kv_heads)
+
+        # Handle swa_num_key_value_heads if present (e.g. MiMo models)
+        if hasattr(self.hf_text_config, "swa_num_key_value_heads"):
+            if not hasattr(self, "_original_swa_num_key_value_heads"):
+                self._original_swa_num_key_value_heads = self.hf_text_config.swa_num_key_value_heads
+            from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
+
+            swa_kv_heads_per_device = get_num_kv_heads_by_tp(
+                self._original_swa_num_key_value_heads, tensor_parallel_size
+            )
+            self.hf_text_config.swa_num_key_value_heads = (
+                swa_kv_heads_per_device * tensor_parallel_size
+            )
 
     def get_original_kv_head_id(self, tp_rank: int, tensor_parallel_size: int) -> int:
         """Determine which original KV head this device should use."""

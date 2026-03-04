@@ -55,6 +55,7 @@ class NativeAttention(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        attention_sink: jax.Array | None = None,
     ):
         """
         Args:
@@ -96,6 +97,7 @@ class NativeAttention(AttentionBackend):
             forward_batch.forward_mode,
             self.kv_sharding,
             xai_temperature_len=xai_temp_len,
+            attention_sink=attention_sink,
         )
 
         # Return full fused KV buffer for this layer so that caller can persist it outside JIT
@@ -122,11 +124,18 @@ class NativeAttention(AttentionBackend):
                 token_to_kv_pool.set_kv_buffer(
                     layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
                 )
-            # Use fused layer directly from pool; derive K/V views without extra merge
-            fused_layer = token_to_kv_pool.get_fused_kv_buffer(layer_id)
-            k = fused_layer.at[:, ::2, :].get(out_sharding=kv_sharding)
-            v = fused_layer.at[:, 1::2, :].get(out_sharding=kv_sharding)
-            fused_return = fused_layer
+            # Split-KV pools do not expose a fused buffer. Return whichever format the
+            # underlying pool uses so ModelRunner.replace_kv_buffer can persist it.
+            try:
+                fused_layer = token_to_kv_pool.get_fused_kv_buffer(layer_id)
+            except NotImplementedError:
+                k, v = token_to_kv_pool.get_kv_buffer(layer_id)
+                fused_return = (k, v)
+            else:
+                # Use fused layer directly from pool; derive K/V views without extra merge
+                k = fused_layer.at[:, ::2, :].get(out_sharding=kv_sharding)
+                v = fused_layer.at[:, 1::2, :].get(out_sharding=kv_sharding)
+                fused_return = fused_layer
         else:
             updated_layer = token_to_kv_pool.set_kv_buffer_legacy(
                 layer_id, forward_batch.out_cache_loc, k, v
@@ -161,6 +170,7 @@ def forward_attention(
     mode=ForwardMode.DECODE,
     kv_sharding=None,
     xai_temperature_len: float | None = None,
+    attention_sink: jax.Array | None = None,
 ):
     """
     Forward pass using native JAX implementation with block-diagonal attention.
@@ -262,7 +272,16 @@ def forward_attention(
 
     # Softmax
     attn_logits = attn_logits - jnp.max(attn_logits, axis=-1, keepdims=True)
-    attn_weights = jax.nn.softmax(attn_logits, axis=-1)
+    if attention_sink is not None:
+        sink = jnp.asarray(attention_sink, dtype=attn_logits.dtype)
+        if sink.ndim == 0:
+            sink = jnp.full((num_heads,), sink, dtype=attn_logits.dtype)
+        sink = sink[:, None, None]
+        sink = jnp.repeat(sink, attn_logits.shape[1], axis=1)
+        attn_logits = jnp.concatenate([sink, attn_logits], axis=2)
+        attn_weights = jax.nn.softmax(attn_logits, axis=-1)[..., 1:]
+    else:
+        attn_weights = jax.nn.softmax(attn_logits, axis=-1)
 
     attn_output = jnp.matmul(attn_weights, v_t)
     attn_output = jnp.transpose(attn_output, (1, 0, 2))

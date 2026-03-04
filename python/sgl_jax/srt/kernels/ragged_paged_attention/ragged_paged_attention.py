@@ -1402,6 +1402,7 @@ def ragged_paged_attention(
             queries, keys, values, k_cache, v_cache,
             kv_lens, page_indices, cu_q_lens, cu_kv_lens, distribution, custom_mask,
             causal=causal, sm_scale=sm_scale, sliding_window=sliding_window,
+            attention_sink=attention_sink,
             soft_cap=soft_cap, mask_value=mask_value,
             q_scale=q_scale, k_scale=k_scale, v_scale=v_scale,
             xai_temperature_len=xai_temperature_len, chunk_prefill_size=chunk_prefill_size,

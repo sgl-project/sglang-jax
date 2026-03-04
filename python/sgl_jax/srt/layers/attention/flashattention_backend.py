@@ -1,4 +1,5 @@
 import logging
+import math
 from dataclasses import dataclass
 
 import jax
@@ -12,6 +13,7 @@ from jax.tree_util import register_pytree_node_class
 from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
     ragged_paged_attention,
 )
+from sgl_jax.srt.kernels.ragged_paged_attention.util import get_dtype_packing
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -435,6 +437,7 @@ class FlashAttention(AttentionBackend):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         causal: int = 1,
+        attention_sink: jax.Array | None = None,
     ):
         """
         Args:
@@ -445,29 +448,42 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
-        # Early branch: split KV path when head_dim != v_head_dim
-        is_split = getattr(token_to_kv_pool, 'is_split', False) if token_to_kv_pool is not None else False
-        if is_split:
-            return self._call_split(q, k, v, layer, forward_batch, token_to_kv_pool, causal)
+        # Resolve whether the underlying KV pool for this layer uses split (K/V separate) buffers.
+        # For hybrid/SWA pools, the top-level pool may not expose is_split, so we dive into the
+        # per-layer sub-pool when available.
+        pool_for_layer = token_to_kv_pool
+        is_split = getattr(token_to_kv_pool, "is_split", False) if token_to_kv_pool is not None else False
+        if hasattr(token_to_kv_pool, "layers_mapping"):
+            try:
+                layer_id_pool, is_swa = token_to_kv_pool.layers_mapping[layer.layer_id]
+                pool_for_layer = token_to_kv_pool.swa_kv_pool if is_swa else token_to_kv_pool.full_kv_pool
+                is_split = getattr(pool_for_layer, "is_split", is_split)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "FlashAttention: failed to resolve sub-pool for layer %s: %s",
+                    getattr(layer, "layer_id", None),
+                    e,
+                )
 
-        if forward_batch is not None and token_to_kv_pool is not None:
-            kv_cache_fused = self._get_fused_kv_cache(
-                forward_batch, token_to_kv_pool, layer.layer_id
+        # Fused KV path assumes q/k/v dimensions are the same; when v_head_dim != head_dim,
+        # split KV cache is required, otherwise the fused layout (2 * head_dim) cannot
+        # accommodate the different V dimension and will cause incorrect slicing.
+        if self.v_head_dim != self.head_dim and not is_split:
+            msg = (
+                "FlashAttention fused KV path does not support v_head_dim!=head_dim; "
+                "please enable split KV cache or extend fused layout to support heterogeneous V dimensions."
             )
-        else:
-            kv_cache_fused = jnp.zeros((0, self.num_kv_heads * 2, self.head_dim), dtype=q.dtype)
+            logger.error(
+                "%s layer_id=%s pool=%s", msg, getattr(layer, "layer_id", None), type(pool_for_layer).__name__
+            )
+            raise ValueError(msg)
+
         scale = (
             1.0 / jnp.sqrt(layer.head_dim)
             if (layer is None or layer.scaling is None)
             else layer.scaling
         )
 
-        # Prepare fused KV cache for paged format: [num_pages, page_size, num_kv_heads * 2, head_dim]
-        total_tokens = kv_cache_fused.shape[0]
-        num_pages = total_tokens // self.page_size
-        kv_cache_fused_paged = kv_cache_fused.reshape(
-            num_pages, self.page_size, -1, (self.head_dim + 127) // 128 * 128
-        )
         if self.forward_metadata.custom_mask is not None:
             causal = 0
         # Select page indices and remap to SWA pool if KV cache supports it
@@ -475,200 +491,294 @@ class FlashAttention(AttentionBackend):
         if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
             page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
 
-        in_specs = (
-            P(None, self.kv_partition_axis),  # queries
-            P(None, self.kv_partition_axis),  # keys (new tokens)
-            P(None, self.kv_partition_axis),  # values (new tokens)
-            P(None, None, self.kv_partition_axis, None),  # kv_cache_fused (head interleaved)
-            P(),  # kv_lens
-            P(),  # page_indices
-            P(),  # cu_q_lens
-            P(),  # cu_kv_lens
-            P(),  # distribution
-            P(),  # custom_mask
-        )
-        out_specs = (
-            P(None, self.kv_partition_axis),  # attention output
-            P(
-                None, self.kv_partition_axis, None
-            ),  # updated kv_cache_fused (head interleaved) - 3D: [total_tokens, num_kv_heads*2, head_dim]
-        )
+        if is_split:
+            if forward_batch is not None and token_to_kv_pool is not None:
+                k_cache, v_cache = token_to_kv_pool.get_split_kv_buffer(layer.layer_id)
+            else:
+                k_cache = jnp.zeros((0, self.num_kv_heads, self.head_dim), dtype=q.dtype)
+                v_cache = jnp.zeros((0, self.num_kv_heads, self.v_head_dim), dtype=q.dtype)
 
-        def _ragged_paged_attention_with_fused_kv(*args):
-            queries, keys, values, kv_cache_fused = args[:4]
-            other_args = args[4:]
+            # Pad dimensions
+            # For split, we align each dimension to 128
+            head_dim_aligned = (self.head_dim + 127) // 128 * 128
+            v_head_dim_aligned = (self.v_head_dim + 127) // 128 * 128
+            kv_dim_aligned = max(head_dim_aligned, v_head_dim_aligned)
+            kv_packing = get_dtype_packing(k_cache.dtype)
+            kv_heads_aligned = (self.num_kv_heads + kv_packing - 1) // kv_packing * kv_packing
+            
+            # Pad Inputs
+            # K cache and V cache should already be aligned by pool allocation, but check
+            # Q, K, V inputs need alignment
+            
+            pad_width_q = head_dim_aligned - q.shape[-1]
+            if pad_width_q > 0:
+                q = jnp.pad(q, ((0,0), (0,0), (0, pad_width_q)))
+            
+            pad_width_k = head_dim_aligned - k.shape[-1]
+            if pad_width_k > 0:
+                k = jnp.pad(k, ((0,0), (0,0), (0, pad_width_k)))
+                
+            pad_width_v = kv_dim_aligned - v.shape[-1]
+            if pad_width_v > 0:
+                v = jnp.pad(v, ((0,0), (0,0), (0, pad_width_v)))
+                
+            # Align cached tensors to the padded dimensions expected by the kernel
+            total_tokens = k_cache.shape[0]
+            num_pages = total_tokens // self.page_size
+            if kv_heads_aligned != self.num_kv_heads:
+                pad_h = kv_heads_aligned - self.num_kv_heads
+                k_cache = jnp.pad(k_cache, ((0, 0), (0, pad_h), (0, 0)))
+                v_cache = jnp.pad(v_cache, ((0, 0), (0, pad_h), (0, 0)))
 
-            # Call fused KV kernel with head interleaving
-            result, updated_kv_cache_fused = ragged_paged_attention(
+            if k_cache.shape[-1] != kv_dim_aligned:
+                k_cache = jnp.pad(
+                    k_cache, ((0, 0), (0, 0), (0, kv_dim_aligned - k_cache.shape[-1]))
+                )
+            if v_cache.shape[-1] != kv_dim_aligned:
+                v_cache = jnp.pad(
+                    v_cache, ((0, 0), (0, 0), (0, kv_dim_aligned - v_cache.shape[-1]))
+                )
+            cache_out_sharding = NamedSharding(self.mesh, P(None, None, self.kv_partition_axis, None))
+            k_cache_paged = jax.lax.reshape(
+                k_cache,
+                (num_pages, self.page_size, kv_heads_aligned, kv_dim_aligned),
+                out_sharding=cache_out_sharding,
+            )
+            v_cache_paged = jax.lax.reshape(
+                v_cache,
+                (num_pages, self.page_size, kv_heads_aligned, kv_dim_aligned),
+                out_sharding=cache_out_sharding,
+            )
+            
+            in_specs = (
+                P(None, self.kv_partition_axis),  # queries
+                P(None, self.kv_partition_axis),  # keys
+                P(None, self.kv_partition_axis),  # values
+                P(None, None, self.kv_partition_axis, None),  # k_cache
+                P(None, None, self.kv_partition_axis, None),  # v_cache
+                P(),  # kv_lens
+                P(),  # page_indices
+                P(),  # cu_q_lens
+                P(),  # cu_kv_lens
+                P(),  # distribution
+                P(),  # custom_mask
+                P(self.kv_partition_axis),  # attention_sink
+            )
+            out_specs = (
+                P(None, self.kv_partition_axis),  # output
+                P(None, self.kv_partition_axis, None), # updated k
+                P(None, self.kv_partition_axis, None), # updated v
+            )
+            
+            def _ragged_paged_attention_split_wrapper(
+                queries, keys, values, k_cache, v_cache,
+                kv_lens, page_indices, cu_q_lens, cu_kv_lens, distribution,
+                custom_mask, attention_sink
+            ):
+                # TPU kernels pack bf16/fp16 heads in pairs; with TP sharding the local
+                # shard can have an odd KV-head count (e.g. global 8 heads / TP=8 -> local 1).
+                # Pad only inside the shard_map wrapper so global shapes/sharding stay unchanged.
+                local_kv_heads = keys.shape[1]
+                local_kv_packing = get_dtype_packing(keys.dtype)
+                local_kv_heads_aligned = (
+                    (local_kv_heads + local_kv_packing - 1) // local_kv_packing
+                ) * local_kv_packing
+                local_pad_h = local_kv_heads_aligned - local_kv_heads
+                if local_pad_h > 0:
+                    # Tile (replicate) real KV heads instead of zero-padding.
+                    # Zero-padding creates fake KV heads that contain all zeros; when the
+                    # kernel assigns q-head groups to KV heads (GQA ratio =
+                    # num_q_local / num_kv_aligned), the q heads that land on the padded
+                    # zero-KV head produce wrong attention output (soft-uniform over zeros
+                    # → output 0). Tiling the real KV head ensures every q group attends
+                    # to valid keys/values.
+                    kv_rep = math.ceil(local_kv_heads_aligned / local_kv_heads)
+                    keys = jnp.tile(keys, [1, kv_rep, 1])[:, :local_kv_heads_aligned, :]
+                    values = jnp.tile(values, [1, kv_rep, 1])[:, :local_kv_heads_aligned, :]
+                    k_cache = jnp.tile(k_cache, [1, 1, kv_rep, 1])[:, :, :local_kv_heads_aligned, :]
+                    v_cache = jnp.tile(v_cache, [1, 1, kv_rep, 1])[:, :, :local_kv_heads_aligned, :]
+                    if attention_sink is not None and attention_sink.shape[0] == local_kv_heads:
+                        attention_sink = jnp.tile(attention_sink, [kv_rep])[:local_kv_heads_aligned]
+
+                result, updated_k, updated_v = ragged_paged_attention(
+                    queries, keys, values, None, # kv_cache_fused
+                    kv_lens, page_indices, cu_q_lens, cu_kv_lens, distribution, custom_mask,
+                    k_cache=k_cache, v_cache=v_cache,
+                    causal=causal, sm_scale=scale, sliding_window=layer.sliding_window_size,
+                    attention_sink=attention_sink, soft_cap=layer.logit_cap,
+                    xai_temperature_len=(
+                        layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
+                    ),
+                    vmem_limit_bytes=self.vmem_limit_bytes,
+                )
+                if local_pad_h > 0:
+                    updated_k = updated_k[:, :local_kv_heads, :]
+                    updated_v = updated_v[:, :local_kv_heads, :]
+                return result, updated_k, updated_v
+
+            attn_output, updated_k, updated_v = jax.shard_map(
+                _ragged_paged_attention_split_wrapper,
+                in_specs=in_specs,
+                out_specs=out_specs,
+                check_vma=False,
+            )(
+                q.reshape(q.shape[0], -1, head_dim_aligned),
+                k.reshape(k.shape[0], -1, kv_dim_aligned),
+                v.reshape(v.shape[0], -1, kv_dim_aligned),
+                k_cache_paged,
+                v_cache_paged,
+                self.forward_metadata.seq_lens,
+                page_indices_arg,
+                self.forward_metadata.cu_q_lens,
+                self.forward_metadata.cu_kv_lens,
+                self.forward_metadata.distribution,
+                self.forward_metadata.custom_mask,
+                attention_sink,
+            )
+            
+            # Always strip padding back to logical dims (head_dim / v_head_dim)
+            if attn_output.shape[-1] != self.v_head_dim:
+                attn_output = attn_output[..., :self.v_head_dim]
+            if updated_k.shape[-1] != self.head_dim:
+                updated_k = updated_k[..., :self.head_dim]
+            if updated_v.shape[-1] != self.v_head_dim:
+                updated_v = updated_v[..., :self.v_head_dim]
+
+            return (
+                attn_output.reshape(q.shape[0], -1),
+                (updated_k, updated_v),
+            )
+
+        else:
+            # Fused path
+            if forward_batch is not None and token_to_kv_pool is not None:
+                kv_cache_fused = self._get_fused_kv_cache(
+                    forward_batch, token_to_kv_pool, layer.layer_id
+                )
+            else:
+                kv_cache_fused = jnp.zeros((0, self.num_kv_heads * 2, self.head_dim), dtype=q.dtype)
+
+            # Prepare fused KV cache for paged format: [num_pages, page_size, num_kv_heads * 2, head_dim]
+            total_tokens = kv_cache_fused.shape[0]
+            num_pages = total_tokens // self.page_size
+            
+            # Calculate aligned dimension (e.g. 256 for 192)
+            aligned_dim = (self.head_dim + 127) // 128 * 128
+            
+            # Pad Inputs if needed to match aligned_dim
+            # Note: kv_cache_fused is usually already allocated with head_dim (192), so we pad it.
+            # q/k/v also need padding.
+            
+            pad_width_cache = aligned_dim - kv_cache_fused.shape[-1]
+            if pad_width_cache > 0:
+                kv_cache_fused = jnp.pad(kv_cache_fused, ((0,0), (0,0), (0, pad_width_cache)))
+                
+            pad_width_q = aligned_dim - q.shape[-1]
+            if pad_width_q > 0:
+                q = jnp.pad(q, ((0,0), (0,0), (0, pad_width_q)))
+                
+            pad_width_k = aligned_dim - k.shape[-1]
+            if pad_width_k > 0:
+                k = jnp.pad(k, ((0,0), (0,0), (0, pad_width_k)))
+                
+            pad_width_v = aligned_dim - v.shape[-1]
+            if pad_width_v > 0:
+                v = jnp.pad(v, ((0,0), (0,0), (0, pad_width_v)))
+
+            kv_cache_fused_paged = kv_cache_fused.reshape(
+                num_pages, self.page_size, -1, aligned_dim
+            )
+
+            in_specs = (
+                P(None, self.kv_partition_axis),  # queries
+                P(None, self.kv_partition_axis),  # keys (new tokens)
+                P(None, self.kv_partition_axis),  # values (new tokens)
+                P(None, None, self.kv_partition_axis, None),  # kv_cache_fused (head interleaved)
+                P(),  # kv_lens
+                P(),  # page_indices
+                P(),  # cu_q_lens
+                P(),  # cu_kv_lens
+                P(),  # distribution
+                P(),  # custom_mask
+                P(self.kv_partition_axis),  # attention_sink
+            )
+            out_specs = (
+                P(None, self.kv_partition_axis),  # attention output
+                P(
+                    None, self.kv_partition_axis, None
+                ),  # updated kv_cache_fused (head interleaved) - 3D: [total_tokens, num_kv_heads*2, head_dim]
+            )
+
+            def _ragged_paged_attention_with_fused_kv(
                 queries,
                 keys,
                 values,
                 kv_cache_fused,
-                *other_args,
-                causal=causal,
-                sm_scale=scale,
-                sliding_window=layer.sliding_window_size,
-                soft_cap=layer.logit_cap,
-                xai_temperature_len=(
-                    layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
-                ),
-                vmem_limit_bytes=self.vmem_limit_bytes,
-            )
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                cu_kv_lens,
+                distribution,
+                custom_mask,
+                attention_sink,
+            ):
+                # Call fused KV kernel with head interleaving
+                result, updated_kv_cache_fused = ragged_paged_attention(
+                    queries,
+                    keys,
+                    values,
+                    kv_cache_fused,
+                    kv_lens,
+                    page_indices,
+                    cu_q_lens,
+                    cu_kv_lens,
+                    distribution,
+                    custom_mask,
+                    causal=causal,
+                    sm_scale=scale,
+                    sliding_window=layer.sliding_window_size,
+                    attention_sink=attention_sink,
+                    soft_cap=layer.logit_cap,
+                    xai_temperature_len=(
+                        layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
+                    ),
+                    vmem_limit_bytes=self.vmem_limit_bytes,
+                )
 
-            return result, updated_kv_cache_fused
+                return result, updated_kv_cache_fused
 
-        (
-            attn_output,
-            updated_kv_cache_fused,
-        ) = jax.shard_map(  # Fused KV kernel handles cache updates internally
-            _ragged_paged_attention_with_fused_kv,
-            in_specs=in_specs,
-            out_specs=out_specs,
-            check_vma=False,
-        )(
-            q.reshape(q.shape[0], -1, self.head_dim),
-            k.reshape(k.shape[0], -1, self.head_dim),
-            v.reshape(v.shape[0], -1, self.head_dim),
-            kv_cache_fused_paged,
-            self.forward_metadata.seq_lens,
-            page_indices_arg,
-            self.forward_metadata.cu_q_lens,
-            self.forward_metadata.cu_kv_lens,
-            self.forward_metadata.distribution,
-            self.forward_metadata.custom_mask,
-        )
-        pad_width = (self.head_dim + 127) // 128 * 128 - self.head_dim
-        if pad_width > 0:
-            updated_kv_cache_fused = jnp.pad(
+            (
+                attn_output,
                 updated_kv_cache_fused,
-                ((0, 0), (0, 0), (0, pad_width)),
-                mode="constant",
+            ) = jax.shard_map(  # Fused KV kernel handles cache updates internally
+                _ragged_paged_attention_with_fused_kv,
+                in_specs=in_specs,
+                out_specs=out_specs,
+                check_vma=False,
+            )(
+                q.reshape(q.shape[0], -1, aligned_dim),
+                k.reshape(k.shape[0], -1, aligned_dim),
+                v.reshape(v.shape[0], -1, aligned_dim),
+                kv_cache_fused_paged,
+                self.forward_metadata.seq_lens,
+                page_indices_arg,
+                self.forward_metadata.cu_q_lens,
+                self.forward_metadata.cu_kv_lens,
+                self.forward_metadata.distribution,
+                self.forward_metadata.custom_mask,
+                attention_sink,
             )
+            
+            # Slice output / cache back to logical dims irrespective of padding
+            if attn_output.shape[-1] != self.head_dim:
+                 attn_output = attn_output[..., :self.head_dim]
+            if updated_kv_cache_fused.shape[-1] != self.head_dim:
+                 updated_kv_cache_fused = updated_kv_cache_fused[..., :self.head_dim]
 
-        return (
-            attn_output.reshape(q.shape[0], -1),
-            updated_kv_cache_fused,
-        )
-
-    @named_scope
-    def _call_split(
-        self,
-        q: jax.Array,
-        k: jax.Array,
-        v: jax.Array,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
-        causal: int = 1,
-    ):
-        """Split KV cache path: K and V have separate buffers with potentially different head_dim."""
-        k_cache, v_cache = self._get_split_kv_cache(
-            forward_batch, token_to_kv_pool, layer.layer_id
-        )
-
-        scale = (
-            1.0 / jnp.sqrt(layer.head_dim)
-            if (layer is None or layer.scaling is None)
-            else layer.scaling
-        )
-
-        # Reshape caches from flat [total_tokens, kv_heads, dim] to paged [num_pages, page_size, kv_heads, dim]
-        # NOTE: Do NOT pad head_dim here — ragged_paged_attention handles alignment
-        # internally via _prepare_single_kv_cache. Padding in reshape would corrupt
-        # the head count when head_dim is not 128-aligned (e.g., 192).
-        total_tokens_k = k_cache.shape[0]
-        num_pages = total_tokens_k // self.page_size
-        k_head_dim = k_cache.shape[-1]
-        v_head_dim_cache = v_cache.shape[-1]
-        k_cache_paged = k_cache.reshape(
-            num_pages, self.page_size, -1, k_head_dim
-        )
-        v_cache_paged = v_cache.reshape(
-            num_pages, self.page_size, -1, v_head_dim_cache
-        )
-
-        if self.forward_metadata.custom_mask is not None:
-            causal = 0
-
-        page_indices_arg = self.forward_metadata.page_indices
-        if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
-            page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
-
-        kv_part = self.kv_partition_axis
-        in_specs = (
-            P(None, kv_part),                    # q  [tokens, q_heads, head_dim]
-            P(None, kv_part),                    # k  [tokens, kv_heads, k_head_dim]
-            P(None, kv_part),                    # v  [tokens, kv_heads, v_head_dim]
-            P(None, None, kv_part, None),         # k_cache_paged [pages, ps, kv_heads, k_dim]
-            P(None, None, kv_part, None),         # v_cache_paged [pages, ps, kv_heads, v_dim]
-            P(),  # kv_lens
-            P(),  # page_indices
-            P(),  # cu_q_lens
-            P(),  # cu_kv_lens
-            P(),  # distribution
-            P(),  # custom_mask
-        )
-        out_specs = (
-            P(None, kv_part),                    # attn output
-            P(None, kv_part, None),              # updated_k 3D
-            P(None, kv_part, None),              # updated_v 3D
-        )
-
-        def _ragged_paged_attention_with_split_kv(*args):
-            queries, keys_new, values_new, k_cache_arg, v_cache_arg = args[:5]
-            other_args = args[5:]
-
-            result, updated_k, updated_v = ragged_paged_attention(
-                queries,
-                keys_new,
-                values_new,
-                None,  # kv_cache_fused=None for split path
-                *other_args,
-                k_cache=k_cache_arg,
-                v_cache=v_cache_arg,
-                causal=causal,
-                sm_scale=scale,
-                sliding_window=layer.sliding_window_size,
-                soft_cap=layer.logit_cap,
-                xai_temperature_len=(
-                    layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
-                ),
-                vmem_limit_bytes=self.vmem_limit_bytes,
+            return (
+                attn_output.reshape(q.shape[0], -1),
+                updated_kv_cache_fused,
             )
-
-            return result, updated_k, updated_v
-
-        (
-            attn_output,
-            updated_k,
-            updated_v,
-        ) = jax.shard_map(
-            _ragged_paged_attention_with_split_kv,
-            in_specs=in_specs,
-            out_specs=out_specs,
-            check_vma=False,
-        )(
-            q.reshape(q.shape[0], -1, self.head_dim),
-            k.reshape(k.shape[0], -1, k.shape[-1]),
-            v.reshape(v.shape[0], -1, v.shape[-1]),
-            k_cache_paged,
-            v_cache_paged,
-            self.forward_metadata.seq_lens,
-            page_indices_arg,
-            self.forward_metadata.cu_q_lens,
-            self.forward_metadata.cu_kv_lens,
-            self.forward_metadata.distribution,
-            self.forward_metadata.custom_mask,
-        )
-
-        # NOTE: ragged_paged_attention already trims updated caches back to
-        # actual head_dim via prepare_updated_kv_cache. No padding needed here —
-        # the pool stores buffers at actual head_dim (e.g., 192 for K, 128 for V).
-
-        return (
-            attn_output.reshape(q.shape[0], -1),
-            (updated_k, updated_v),
-        )
 
     def _get_fused_kv_cache(
         self,
@@ -677,14 +787,6 @@ class FlashAttention(AttentionBackend):
         layer_id: int,
     ) -> jax.Array:
         return token_to_kv_pool.get_fused_kv_buffer(layer_id)
-
-    def _get_split_kv_cache(
-        self,
-        forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
-        layer_id: int,
-    ) -> tuple[jax.Array, jax.Array]:
-        return token_to_kv_pool.get_split_kv_buffer(layer_id)
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
