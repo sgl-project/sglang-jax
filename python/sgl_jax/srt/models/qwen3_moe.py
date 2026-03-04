@@ -1,4 +1,6 @@
 import logging
+import math
+import os
 from typing import Any
 
 import jax
@@ -6,6 +8,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from transformers import PretrainedConfig
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
@@ -14,7 +18,13 @@ from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK, create_moe_weights_mapping
+from sgl_jax.srt.layers.moe import (
+    EPMoE,
+    FusedMoEBlockConfig,
+    GateLogit,
+    TopK,
+    create_moe_weights_mapping,
+)
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -24,6 +34,54 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 logger = logging.getLogger(__name__)
 
 init_fn = nnx.initializers.uniform()
+
+
+def _get_qwen3_moe_debug_stage_layer() -> int | None:
+    val = os.environ.get("SGL_QWEN3_MOE_DEBUG_STAGE_LAYER")
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except ValueError:
+        return None
+
+
+def _qwen3_moe_debug_stage_enabled(layer_id: int) -> bool:
+    if os.environ.get("SGL_QWEN3_MOE_DEBUG_STAGE", "0") != "1":
+        return False
+    debug_layer = _get_qwen3_moe_debug_stage_layer()
+    return debug_layer is None or layer_id == debug_layer
+
+
+def _get_qwen3_fused_moe_block_config(
+    moe_intermediate_size: int,
+) -> FusedMoEBlockConfig | None:
+    """Return a fused block config compatible with Qwen3-MoE intermediate dims.
+
+    The fused TPU kernel defaults to `bf=512`, but Qwen3-MoE uses
+    `moe_intermediate_size=768`, which fails validation (`768 % 512 != 0`).
+    We keep the default tiling shape and only shrink the FFN/intermediate tiles.
+    """
+
+    if moe_intermediate_size % 512 == 0:
+        return None
+
+    bf = math.gcd(moe_intermediate_size, 512)
+    if bf < 128 or moe_intermediate_size % bf != 0:
+        return None
+
+    return FusedMoEBlockConfig(
+        bt=32,
+        btc=32,
+        bts=32,
+        bf=bf,
+        bfc=bf,
+        bd1=1024,
+        bd1c=1024,
+        bd2=1024,
+        bd2c=1024,
+        bse=bf,
+    )
 
 
 class QWen3MoeAttention(nnx.Module):
@@ -123,14 +181,70 @@ class QWen3MoeAttention(nnx.Module):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        q = q.reshape(-1, self.q_head_num, self.head_dim)
-        k = k.reshape(-1, self.kv_head_num, self.head_dim)
-        v = v.reshape(-1, self.kv_head_num, self.head_dim)
+        # Under TP>KV, q/k/v can arrive with explicit sharding on the flattened feature axis.
+        # Reshaping directly into [..., heads, head_dim] may fail when the sharded local flat dim
+        # does not align with the logical head count. For debug/compatibility, gather to a
+        # replicated 2D view first and then reshape.
+        needs_reshape_compat = (
+            q.shape[-1] != self.q_head_num * self.head_dim
+            or k.shape[-1] != self.kv_head_num * self.head_dim
+            or v.shape[-1] != self.kv_head_num * self.head_dim
+        )
+        if needs_reshape_compat and self.q_proj.mesh is not None:
+            flat_repl_sharding = NamedSharding(self.q_proj.mesh, P(None, None))
+            q = q.at[:].get(out_sharding=flat_repl_sharding)
+            k = k.at[:].get(out_sharding=flat_repl_sharding)
+            v = v.at[:].get(out_sharding=flat_repl_sharding)
+
+        q_out_sharding = (
+            NamedSharding(self.q_proj.mesh, P(None, self.q_proj.kernel_axes[-1], None))
+            if self.q_proj.mesh is not None and self.q_proj.kernel_axes[-1] is not None
+            else None
+        )
+        kv_out_sharding = (
+            NamedSharding(self.k_proj.mesh, P(None, self.k_proj.kernel_axes[-1], None))
+            if self.k_proj.mesh is not None and self.k_proj.kernel_axes[-1] is not None
+            else None
+        )
+        if needs_reshape_compat and self.q_proj.mesh is not None:
+            q_out_sharding = NamedSharding(self.q_proj.mesh, P(None, None, None))
+            kv_out_sharding = q_out_sharding
+        local_q_heads = q.shape[-1] // self.head_dim
+        local_k_heads = k.shape[-1] // self.head_dim
+        local_v_heads = v.shape[-1] // self.head_dim
+
+        q = jax.lax.reshape(
+            q,
+            (q.shape[0], local_q_heads, self.head_dim),
+            out_sharding=q_out_sharding,
+        )
+        k = jax.lax.reshape(
+            k,
+            (k.shape[0], local_k_heads, self.head_dim),
+            out_sharding=kv_out_sharding,
+        )
+        v = jax.lax.reshape(
+            v,
+            (v.shape[0], local_v_heads, self.head_dim),
+            out_sharding=kv_out_sharding,
+        )
+        if k.shape[1] != self.kv_head_num and self.kv_head_num % k.shape[1] == 0:
+            num_copies = self.kv_head_num // k.shape[1]
+            k = jnp.repeat(k, num_copies, axis=1, out_sharding=kv_out_sharding)
+            v = jnp.repeat(v, num_copies, axis=1, out_sharding=kv_out_sharding)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
 
         q, k = self.rotary_emb(positions, q, k)
+        if _qwen3_moe_debug_stage_enabled(self.layer_id):
+            jax.debug.print(
+                "QWEN3_MOE_STAGE layer={} before_attn_kernel q_shape={} k_shape={} v_shape={}",
+                self.layer_id,
+                q.shape,
+                k.shape,
+                v.shape,
+            )
         attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
 
         output, _ = self.c_proj(attn_output)
@@ -187,6 +301,9 @@ class QWen3MoeDecoderLayer(nnx.Module):
 
             self.moe_backend = getattr(config, "moe_backend", "epmoe")
             self.use_fused = self.moe_backend == "fused"
+            self.fused_moe_block_config = (
+                _get_qwen3_fused_moe_block_config(moe_intermediate_size) if self.use_fused else None
+            )
 
             self.moe_gate = GateLogit(
                 input_size=config.hidden_size,
@@ -201,6 +318,12 @@ class QWen3MoeDecoderLayer(nnx.Module):
             )
 
             if self.use_fused:
+                if self.fused_moe_block_config is not None and layer_id == 0:
+                    logger.info(
+                        "Using Qwen3 fused MoE compatible block config for moe_intermediate_size=%s: %s",
+                        moe_intermediate_size,
+                        self.fused_moe_block_config.as_kwargs(),
+                    )
                 self.mlp = FusedEPMoE(
                     hidden_size=config.hidden_size,
                     num_experts=num_experts,
@@ -250,6 +373,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
         residual: jax.Array | None = None,
         dispatch_info: ExpertLocationMetadata | None = None,
     ):
+        debug_stage = _qwen3_moe_debug_stage_enabled(self.layer_id)
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -264,6 +388,12 @@ class QWen3MoeDecoderLayer(nnx.Module):
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
         )
+        if debug_stage:
+            jax.debug.print(
+                "QWEN3_MOE_STAGE layer={} after_attn hidden_shape={}",
+                self.layer_id,
+                hidden_states.shape,
+            )
 
         hidden_states += residual
         residual = hidden_states
@@ -272,14 +402,33 @@ class QWen3MoeDecoderLayer(nnx.Module):
         if self.is_moe_layer:
             router_logits = self.moe_gate(hidden_states)
             topk_weights, topk_ids = self.topk(router_logits, dispatch_info=dispatch_info)
+            if debug_stage:
+                jax.debug.print(
+                    "QWEN3_MOE_STAGE layer={} before_moe hidden_shape={} topk_w_shape={} topk_ids_shape={} use_fused={}",
+                    self.layer_id,
+                    hidden_states.shape,
+                    topk_weights.shape,
+                    topk_ids.shape,
+                    self.use_fused,
+                )
 
             if self.use_fused:
                 token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
                 hidden_states = self.mlp(
-                    hidden_states, topk_weights, topk_ids, token_valid_mask=token_valid_mask
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    token_valid_mask=token_valid_mask,
+                    block_config=self.fused_moe_block_config,
                 )
             else:
                 hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+            if debug_stage:
+                jax.debug.print(
+                    "QWEN3_MOE_STAGE layer={} after_moe hidden_shape={}",
+                    self.layer_id,
+                    hidden_states.shape,
+                )
         else:
             hidden_states = self.mlp(hidden_states)
             topk_ids = None

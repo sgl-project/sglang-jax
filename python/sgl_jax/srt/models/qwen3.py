@@ -5,6 +5,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from transformers import PretrainedConfig
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
@@ -121,9 +123,53 @@ class QWen3Attention(nnx.Module):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        q = q.reshape(-1, self.q_head_num, self.head_dim)
-        k = k.reshape(-1, self.kv_head_num, self.head_dim)
-        v = v.reshape(-1, self.kv_head_num, self.head_dim)
+        needs_reshape_compat = (
+            q.shape[-1] != self.q_head_num * self.head_dim
+            or k.shape[-1] != self.kv_head_num * self.head_dim
+            or v.shape[-1] != self.kv_head_num * self.head_dim
+        )
+        if needs_reshape_compat and self.q_proj.mesh is not None:
+            flat_repl_sharding = NamedSharding(self.q_proj.mesh, P(None, None))
+            q = q.at[:].get(out_sharding=flat_repl_sharding)
+            k = k.at[:].get(out_sharding=flat_repl_sharding)
+            v = v.at[:].get(out_sharding=flat_repl_sharding)
+
+        q_out_sharding = (
+            NamedSharding(self.q_proj.mesh, P(None, self.q_proj.kernel_axes[-1], None))
+            if self.q_proj.mesh is not None and self.q_proj.kernel_axes[-1] is not None
+            else None
+        )
+        kv_out_sharding = (
+            NamedSharding(self.k_proj.mesh, P(None, self.k_proj.kernel_axes[-1], None))
+            if self.k_proj.mesh is not None and self.k_proj.kernel_axes[-1] is not None
+            else None
+        )
+        if needs_reshape_compat and self.q_proj.mesh is not None:
+            q_out_sharding = NamedSharding(self.q_proj.mesh, P(None, None, None))
+            kv_out_sharding = q_out_sharding
+        local_q_heads = q.shape[-1] // self.head_dim
+        local_k_heads = k.shape[-1] // self.head_dim
+        local_v_heads = v.shape[-1] // self.head_dim
+
+        q = jax.lax.reshape(
+            q,
+            (q.shape[0], local_q_heads, self.head_dim),
+            out_sharding=q_out_sharding,
+        )
+        k = jax.lax.reshape(
+            k,
+            (k.shape[0], local_k_heads, self.head_dim),
+            out_sharding=kv_out_sharding,
+        )
+        v = jax.lax.reshape(
+            v,
+            (v.shape[0], local_v_heads, self.head_dim),
+            out_sharding=kv_out_sharding,
+        )
+        if k.shape[1] != self.kv_head_num and self.kv_head_num % k.shape[1] == 0:
+            num_copies = self.kv_head_num // k.shape[1]
+            k = jnp.repeat(k, num_copies, axis=1, out_sharding=kv_out_sharding)
+            v = jnp.repeat(v, num_copies, axis=1, out_sharding=kv_out_sharding)
 
         q = self.q_norm(q)
         k = self.k_norm(k)

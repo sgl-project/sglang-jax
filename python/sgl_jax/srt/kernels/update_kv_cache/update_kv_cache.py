@@ -149,6 +149,21 @@ def kv_cache_update(
         assert (
             slices.shape[1] % num_slices_per_block == 0
         ), f"slices.shape[1]={slices.shape[1]} is not divisible by num_slices_per_block={num_slices_per_block}"
+        _, orig_num_combined_kv_heads, orig_head_dim = new_kv.shape
+
+        # With TP sharding, a local shard can have an odd number of KV heads
+        # (e.g. global 8 heads / TP=8 => local 1). Pad locally inside shard_map
+        # so the TPU kernel still sees packed-even heads while global shapes remain unchanged.
+        local_pad_heads = orig_num_combined_kv_heads % 2
+        if local_pad_heads:
+            new_kv = jnp.pad(new_kv, ((0, 0), (0, local_pad_heads), (0, 0)))
+            kv_cache = jnp.pad(kv_cache, ((0, 0), (0, local_pad_heads), (0, 0)))
+
+        local_pad_head_dim = (-orig_head_dim) % 128
+        if local_pad_head_dim:
+            new_kv = jnp.pad(new_kv, ((0, 0), (0, 0), (0, local_pad_head_dim)))
+            kv_cache = jnp.pad(kv_cache, ((0, 0), (0, 0), (0, local_pad_head_dim)))
+
         _, num_combined_kv_heads, head_dim = new_kv.shape
 
         assert num_combined_kv_heads % 2 == 0, (
@@ -201,6 +216,10 @@ def kv_cache_update(
         )
 
         result = kernel(*scalar_prefetches, new_kv, kv_cache)[0]
+        if local_pad_heads:
+            result = result[:, :orig_num_combined_kv_heads, :]
+        if local_pad_head_dim:
+            result = result[:, :, :orig_head_dim]
 
         return result
 

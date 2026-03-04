@@ -1,4 +1,6 @@
 import dataclasses
+import logging
+import os
 from typing import TYPE_CHECKING
 
 import jax
@@ -20,6 +22,10 @@ if TYPE_CHECKING:
         CaptureHiddenMode,
         ForwardMode,
     )
+
+
+def _debug_logits_slice_enabled() -> bool:
+    return os.getenv("SGL_DEBUG_LOGITS_SLICE") == "1"
 
 
 @register_pytree_node_class
@@ -226,6 +232,28 @@ class LogitsProcessor(nnx.Module):
         self.soft_cap = soft_cap
         self.mesh = mesh
 
+    @staticmethod
+    def _log_slice(name: str, arr: jax.Array):
+        """Host-print a small slice to avoid losing logs under jit."""
+        if not _debug_logits_slice_enabled():
+            return
+        try:
+            slice_arr = arr[:1, :8] if arr.ndim > 1 else arr[:8]
+            jax.debug.print(
+                f"{name} slice shape={{s}} min={{m}} max={{M}} mean={{mean}} std={{std}} "
+                f"nan={{nan}} inf={{inf}} slice={{sl}}",
+                s=slice_arr.shape,
+                m=jnp.nanmin(slice_arr),
+                M=jnp.nanmax(slice_arr),
+                mean=jnp.mean(slice_arr),
+                std=jnp.std(slice_arr),
+                nan=jnp.isnan(slice_arr).sum(),
+                inf=jnp.isinf(slice_arr).sum(),
+                sl=slice_arr,
+            )
+        except Exception as e:
+            logging.getLogger(__name__).warning("%s slice logging failed: %s", name, e)
+
     @named_scope
     def __call__(
         self,
@@ -305,6 +333,9 @@ class LogitsProcessor(nnx.Module):
         logits = self._get_logits(pruned_states, lm_head)
         sampled_logits = logits[sample_indices] if sample_indices is not None else logits
 
+        # Host slice logging (via host_callback)
+        self._log_slice("LOGITS", logits)
+
         hidden_states_to_store: jax.Array | None = None
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
@@ -364,6 +395,8 @@ class LogitsProcessor(nnx.Module):
             input_logprobs = self.compute_temp_top_p_normalized_logprobs(
                 input_logprobs, logits_metadata
             )
+            input_logprobs = jnp.nan_to_num(input_logprobs, neginf=-jnp.inf, posinf=jnp.inf)
+            self._log_slice("INPUT_LOGPROBS", input_logprobs)
 
             # Get the logprob of top-k tokens
             if logits_metadata.extend_return_top_logprob:
@@ -427,10 +460,30 @@ class LogitsProcessor(nnx.Module):
 
         return jnp.array(input_token_ids_logprobs_val), jnp.array(input_token_ids_logprobs_idx)
 
-    @staticmethod
-    def get_top_logprobs(all_logprobs: jax.Array, logits_metadata: LogitsMetadata):
+    def get_top_logprobs(self, all_logprobs: jax.Array, logits_metadata: LogitsMetadata):
         max_k = max(logits_metadata.top_logprobs_nums)
+        import logging
+        logger = logging.getLogger(__name__)
+        if not hasattr(LogitsProcessor, "_logged_topk_once"):
+            logger.info(
+                "get_top_logprobs input shape=%s sharding=%s topk=%s",
+                all_logprobs.shape,
+                getattr(all_logprobs, "sharding", None),
+                max_k,
+            )
+            LogitsProcessor._logged_topk_once = True
+        # Replicate to avoid sharding along vocab axis before top_k
+        replicated = NamedSharding(self.mesh, P(None))
+        all_logprobs = jax.sharding.reshard(all_logprobs, replicated)
+        if not hasattr(LogitsProcessor, "_logged_topk_after"):
+            logger.info(
+                "get_top_logprobs after reshard shape=%s sharding=%s",
+                all_logprobs.shape,
+                getattr(all_logprobs, "sharding", None),
+            )
+            LogitsProcessor._logged_topk_after = True
         values, indices = jax.lax.top_k(all_logprobs, max_k)
+        values = jnp.nan_to_num(values, neginf=-jnp.inf, posinf=jnp.inf)
 
         input_top_logprobs_val, input_top_logprobs_idx = [], []
 
