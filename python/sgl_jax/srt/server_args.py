@@ -57,6 +57,7 @@ class ServerArgs:
     quantization_param_path: str | None = None
     quantization_config_path: str | None = None
     kv_cache_dtype: str = "auto"
+    dtype_config: str | dict | None = None
 
     # Memory and scheduling
     mem_fraction_static: float | None = None
@@ -250,6 +251,13 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "llguidance"
 
+        if isinstance(self.dtype_config, str):
+            if self.dtype_config.startswith("{"):
+                self.dtype_config = json.loads(self.dtype_config)
+            else:
+                with open(self.dtype_config) as f:
+                    self.dtype_config = json.load(f)
+
         # Normalize speculative_algorithm: treat empty string as None
         if isinstance(self.speculative_algorithm, str) and self.speculative_algorithm.strip() == "":
             self.speculative_algorithm = None
@@ -438,6 +446,12 @@ class ServerArgs:
             '* "bfloat16" for a balance between precision and range.\n'
             '* "float" is shorthand for FP32 precision.\n'
             '* "float32" for FP32 precision.',
+        )
+        parser.add_argument(
+            "--dtype-config",
+            type=str,
+            default=ServerArgs.dtype_config,
+            help="Config in JSON format (or path to a JSON file) to set specific dtypes for different submodules.",
         )
         parser.add_argument(
             "--quantization",
