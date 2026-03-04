@@ -573,16 +573,25 @@ class Scheduler(
 
         return logits_output
 
-    def _gather_next_token_ids(self, next_token_ids: jax.Array) -> jax.Array:
-        """Gather sharded next_token_ids to replicated sharding."""
+    def _gather_next_token_ids(self, next_token_ids) -> list[int] | None:
+        """Gather sharded next_token_ids to replicated sharding and convert to Python list."""
+        import numpy as np
         from jax.sharding import NamedSharding, PartitionSpec
 
         if next_token_ids is None:
             return None
 
+        # If already numpy array or list, convert to list and return
+        if isinstance(next_token_ids, np.ndarray | list):
+            if isinstance(next_token_ids, list):
+                return next_token_ids
+            return next_token_ids.tolist()
+
+        # Otherwise it's a JAX array - gather and convert
         replicated_sharding = NamedSharding(self.mesh, PartitionSpec())
         gather_fn = jax.jit(lambda x: x, out_shardings=replicated_sharding)
-        return gather_fn(next_token_ids)
+        gathered = gather_fn(next_token_ids)
+        return jax.device_get(gathered).tolist()
 
     def _select_round_robin_dp(self) -> int:
         dp_rank = self.dp_round_robin_counter % self.dp_size
