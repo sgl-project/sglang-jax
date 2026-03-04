@@ -31,7 +31,7 @@ class Sampler(nnx.Module):
         """Regular sampling branch"""
         logits, sampling_metadata, rng, use_sort_for_toppk_minp = operands
 
-        logits = lax.with_sharding_constraint(logits, NamedSharding(self.mesh, P(None, None)))
+        logits = jax.sharding.reshard(logits, NamedSharding(self.mesh, P("data", None)))
 
         # Validate broadcast compatibility for temperature division
         logits_batch_size = logits.shape[0]
@@ -65,7 +65,10 @@ class Sampler(nnx.Module):
         )
 
         log_probs = jnp.log(probs).clip(min=jnp.finfo(probs.dtype).min)
-        return batch_next_token_ids, log_probs
+        return (
+            jax.sharding.reshard(batch_next_token_ids, NamedSharding(self.mesh, P("data"))),
+            jax.sharding.reshard(log_probs, NamedSharding(self.mesh, P("data", "tensor"))),
+        )
 
     def _process_logprob_results(self, operands):
         """Process logprob results when return_logprob=True"""
@@ -214,13 +217,9 @@ class Sampler(nnx.Module):
 def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int]):
     max_k = max(top_logprobs_nums)
     values, indices = jax.lax.top_k(logprobs, max_k)
-
-    output_top_logprobs_val = []
-    output_top_logprobs_idx = []
-    for i, k in enumerate(top_logprobs_nums):
-        output_top_logprobs_val.append(values[i][:k])
-        output_top_logprobs_idx.append(indices[i][:k])
-    return jnp.array(output_top_logprobs_val), jnp.array(output_top_logprobs_idx)
+    # Return flat tensors: shape [batch_size, max_k]
+    # Consumer truncates each row to per-request k on CPU side.
+    return values, indices
 
 
 def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[int]], mesh: Mesh):
@@ -234,10 +233,12 @@ def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[in
             )
             output_token_ids_logprobs_idx.append(token_ids)
         else:
-            output_token_ids_logprobs_val.append([])
-            output_token_ids_logprobs_idx.append([])
+            output_token_ids_logprobs_val.append(None)
+            output_token_ids_logprobs_idx.append(None)
 
-    return jnp.array(output_token_ids_logprobs_val), jnp.array(output_token_ids_logprobs_idx)
+    # Return flat lists indexed by batch position.
+    # Consumer accesses by global_idx and handles None for padding slots.
+    return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
 
 
 def multinomial(

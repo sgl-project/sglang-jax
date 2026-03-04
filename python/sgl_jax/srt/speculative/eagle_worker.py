@@ -122,6 +122,7 @@ class EAGLEWorker(ModelWorker):
             # FIXME(pc) add padding logic here
             # Only reshape temperatures if they're 1D (from_schedule_batch produces 1D,
             # but generate_for_precompile_all_greedy produces 2D with shape (bs, 1))
+
             if model_worker_batch.sampling_info.temperatures.ndim == 1:
                 model_worker_batch.sampling_info.temperatures = (
                     model_worker_batch.sampling_info.temperatures[:, None]

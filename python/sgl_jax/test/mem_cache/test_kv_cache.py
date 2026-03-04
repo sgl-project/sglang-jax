@@ -2,6 +2,8 @@ import unittest
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.mem_cache.memory_pool import (
@@ -77,24 +79,36 @@ class TestKVCache(unittest.TestCase):
             # All valid tokens
             loc = jnp.arange(total_tokens, dtype=jnp.int32) + 10  # Start from index 10
 
-        k = jax.device_put(k, P(None, "tensor", None))
-        v = jax.device_put(v, P(None, "tensor", None))
-        k_cache = jax.device_put(k_cache, P(None, "tensor", None))
-        v_cache = jax.device_put(v_cache, P(None, "tensor", None))
-        loc = jax.device_put(loc, P(None))
+        # Set up sharding with data partition for DP support
+        kv_sharding = NamedSharding(mesh, P("data", "tensor", None))
+        loc_sharding = NamedSharding(mesh, P("data"))
+
+        k = jax.device_put(k, kv_sharding)
+        v = jax.device_put(v, kv_sharding)
+        k_cache = jax.device_put(k_cache, kv_sharding)
+        v_cache = jax.device_put(v_cache, kv_sharding)
+        loc = jax.device_put(loc, loc_sharding)
 
         return k, v, loc, k_cache, v_cache
 
     def expected_update_kv_cache(self, k, v, loc, k_cache, v_cache):
         """Expected result using simple JAX operations."""
-        expected_k_cache = k_cache.copy()
-        expected_v_cache = v_cache.copy()
+        # Convert sharded arrays to numpy for reference computation
+        k_np = np.array(k)
+        v_np = np.array(v)
+        loc_np = np.array(loc)
+        k_cache_np = np.array(k_cache)
+        v_cache_np = np.array(v_cache)
 
         # Update cache only for valid tokens (where loc != -1)
-        for i in range(loc.shape[0]):
-            if loc[i] != -1:
-                expected_k_cache = expected_k_cache.at[loc[i]].set(k[i])
-                expected_v_cache = expected_v_cache.at[loc[i]].set(v[i])
+        for i in range(loc_np.shape[0]):
+            if loc_np[i] != -1:
+                k_cache_np[loc_np[i]] = k_np[i]
+                v_cache_np[loc_np[i]] = v_np[i]
+
+        # Convert back to JAX arrays with same sharding as input
+        expected_k_cache = jax.device_put(jnp.array(k_cache_np), k_cache.sharding)
+        expected_v_cache = jax.device_put(jnp.array(v_cache_np), v_cache.sharding)
 
         return expected_k_cache, expected_v_cache
 
@@ -103,7 +117,9 @@ class TestKVCache(unittest.TestCase):
         total_tokens = 16
         k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=False)
 
-        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache, page_size=1)
+        updated_k_cache, updated_v_cache = update_kv_cache(
+            k, v, loc, k_cache.copy(), v_cache.copy(), page_size=1
+        )
 
         # Expected result
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -118,7 +134,9 @@ class TestKVCache(unittest.TestCase):
         total_tokens = 12
         k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=True)
 
-        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache, page_size=1)
+        updated_k_cache, updated_v_cache = update_kv_cache(
+            k, v, loc, k_cache.copy(), v_cache.copy(), page_size=1
+        )
 
         # Expected result (should ignore padding tokens where loc == -1)
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -127,14 +145,6 @@ class TestKVCache(unittest.TestCase):
 
         self.assertTrue(jnp.allclose(updated_k_cache, expected_k_cache))
         self.assertTrue(jnp.allclose(updated_v_cache, expected_v_cache))
-        # Verify that padding tokens didn't affect the cache
-        padding_mask = loc == -1
-        if jnp.any(padding_mask):
-            # For positions that should be ignored (padding), cache should remain unchanged
-            for i in range(total_tokens):
-                if loc[i] == -1:
-                    # Cache at this position should remain as original (zeros in this case)
-                    continue  # We don't update cache for padding tokens
 
     def test_kv_cache_update_page_size_4(self):
         """Test KV cache update with page_size=4."""
@@ -142,14 +152,14 @@ class TestKVCache(unittest.TestCase):
         k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=False)
 
         # Test with page_size=4
-        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache, page_size=4)
+        updated_k_cache, updated_v_cache = update_kv_cache(
+            k, v, loc, k_cache.copy(), v_cache.copy(), page_size=4
+        )
 
         # Expected result
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
             k, v, loc, k_cache, v_cache
         )
-        print("updated_k_cache", updated_k_cache[loc])
-        print("expected_k_cache", expected_k_cache[loc])
         self.assertTrue(jnp.allclose(updated_k_cache, expected_k_cache))
         self.assertTrue(jnp.allclose(updated_v_cache, expected_v_cache))
 
@@ -159,7 +169,9 @@ class TestKVCache(unittest.TestCase):
         k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=True)
 
         # Test with page_size=4
-        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache, page_size=4)
+        updated_k_cache, updated_v_cache = update_kv_cache(
+            k, v, loc, k_cache.copy(), v_cache.copy(), page_size=4
+        )
 
         # Expected result (should ignore padding tokens where loc == -1)
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -175,7 +187,9 @@ class TestKVCache(unittest.TestCase):
         k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=False)
 
         # Test with page_size=8
-        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache, page_size=8)
+        updated_k_cache, updated_v_cache = update_kv_cache(
+            k, v, loc, k_cache.copy(), v_cache.copy(), page_size=8
+        )
 
         # Expected result
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -192,13 +206,17 @@ class TestKVCache(unittest.TestCase):
 
         # Make all tokens padding
         loc = jnp.full((total_tokens,), -1, dtype=jnp.int32)
+        loc_sharding = NamedSharding(mesh, P("data"))
+        loc = jax.device_put(loc, loc_sharding)
 
         # Store original cache
         original_k_cache = k_cache.copy()
         original_v_cache = v_cache.copy()
 
         # Test both approaches
-        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache, page_size=8)
+        updated_k_cache, updated_v_cache = update_kv_cache(
+            k, v, loc, k_cache.copy(), v_cache.copy(), page_size=8
+        )
 
         # Cache should remain unchanged since all tokens are padding
         self.assertTrue(jnp.allclose(updated_k_cache, original_k_cache))
@@ -224,8 +242,6 @@ class TestKVCache(unittest.TestCase):
 
         # Positions 21-24 remain as padding (-1)
 
-        print(f"Corner case loc = {loc}")
-
         # Generate test data
         k = jax.random.uniform(
             jax.random.PRNGKey(42),
@@ -248,13 +264,21 @@ class TestKVCache(unittest.TestCase):
             dtype=jnp.bfloat16,
         )
 
+        # Set up sharding with data partition for DP support
+        kv_sharding = NamedSharding(mesh, P("data", "tensor", None))
+        loc_sharding = NamedSharding(mesh, P("data"))
+
+        k = jax.device_put(k, kv_sharding)
+        v = jax.device_put(v, kv_sharding)
+        k_cache = jax.device_put(k_cache, kv_sharding)
+        v_cache = jax.device_put(v_cache, kv_sharding)
+        loc = jax.device_put(loc, loc_sharding)
+
         # Test with different page sizes
         for page_size in [1, 2, 4, 8]:
             with self.subTest(page_size=page_size):
-                print(f"\nTesting page_size={page_size}")
-
                 updated_k_cache, updated_v_cache = update_kv_cache(
-                    k, v, loc, k_cache, v_cache, page_size=page_size
+                    k, v, loc, k_cache.copy(), v_cache.copy(), page_size=page_size
                 )
 
                 # Expected result
@@ -266,6 +290,9 @@ class TestKVCache(unittest.TestCase):
                 self.assertTrue(jnp.allclose(updated_v_cache, expected_v_cache))
 
                 # Verify specific segments are updated correctly
+                updated_k_cache = jax.sharding.reshard(updated_k_cache, P())
+                k = jax.sharding.reshard(k, P())
+
                 # Segment 1: cache locations 11-17
                 for i in range(7):
                     cache_pos = 11 + i
@@ -289,8 +316,6 @@ class TestKVCache(unittest.TestCase):
                     self.assertTrue(
                         jnp.allclose(updated_k_cache[cache_pos], k[input_pos], rtol=1e-5)
                     )
-
-                print(f"  ✓ page_size={page_size} passed")
 
 
 if __name__ == "__main__":

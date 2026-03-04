@@ -34,6 +34,7 @@ def get_array_size_bytes(t: np.ndarray):
 class RoutedExpertsCapturer(ABC):
     @staticmethod
     def create(
+        mesh: jax.sharding.Mesh,
         enable: bool,
         model_config: ModelConfig,
         num_tokens: int,
@@ -51,6 +52,7 @@ class RoutedExpertsCapturer(ABC):
         if enable or enable_balance_debug or enable_dist_recorder:
             return _RoutedExpertsCapturerReal(
                 model_config,
+                mesh=mesh,
                 num_tokens=num_tokens,
                 max_padding=max_padding,
                 ep_size=ep_size,
@@ -99,6 +101,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
     def __init__(
         self,
         model_config: ModelConfig,
+        mesh: jax.sharding.Mesh,
         num_tokens: int,
         max_padding: int,
         ep_size: int,
@@ -112,6 +115,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         dist_recorder_output_file: str | None,
         physical_expert_counts: int,
     ):
+        self.mesh = mesh
         self.enable_host_buffer = enable_host_buffer
         self.num_hidden_layers = model_config.hf_text_config.num_hidden_layers
         self.num_experts_per_tok = model_config.hf_text_config.num_experts_per_tok
@@ -225,8 +229,13 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
                 time.sleep(0.001)
 
     def on_forward_end(self, topk_ids: list[jax.Array], model_worker_batch: ModelWorkerBatch):
-        if not self.enable_host_buffer and self._balance_analyzer is None:
+        if (
+            not self.enable_host_buffer
+            and self._balance_analyzer is None
+            and self._dist_recorder is None
+        ):
             return
+
         topk_ids_cpu = jax.device_get(topk_ids)
         if self.enable_host_buffer:
             self._sync_fwd_experts_buffer_DtoH(
@@ -245,19 +254,19 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             if model_worker_batch.forward_mode.is_decode():
                 self._balance_analyzer.add_decode_step(
                     topk_ids_cpu,
-                    model_worker_batch.real_bs,
+                    model_worker_batch.real_bs_per_dp,
+                    model_worker_batch.per_dp_bs_size,
                 )
         if self._dist_recorder is not None:
             self._dist_recorder.add_topk_ids(
                 topk_ids_cpu,
-                model_worker_batch.real_bs,
+                model_worker_batch.real_bs_per_dp,
+                model_worker_batch.per_dp_bs_size,
             )
 
     def reset(self):
         if self._balance_analyzer is not None:
-            # Note: _ExpertBalanceAnalyzer doesn't have a reset but it fills 0 on flush.
-            # We could add one if needed.
-            pass
+            self._balance_analyzer.reset()
         if self._dist_recorder is not None:
             self._dist_recorder.reset()
 
@@ -395,23 +404,35 @@ class _ExpertBalanceAnalyzer:
             )
             self._open_writer(write_header=True)
 
-    def add_decode_step(self, topk_ids_cpu: list[np.ndarray], real_bs: int):
+    def add_decode_step(
+        self, topk_ids_cpu: list[np.ndarray], real_bs_per_dp: list[int], per_dp_bs_size: int
+    ):
         with self._lock:
             self._segment_decode_steps += 1
-            if real_bs:
-                flat = topk_ids_cpu[:real_bs, : self.topk].reshape(-1)
-                counts = np.bincount(flat, minlength=self.num_experts)
-                self._counts += counts
+            if real_bs_per_dp:
+                total_padded = int(per_dp_bs_size * len(real_bs_per_dp))
+                self._segment_padding_tokens_sum += total_padded
 
-            self._segment_padding_tokens_sum += len(topk_ids_cpu)
+            for layer_idx, ids_cpu in enumerate(topk_ids_cpu):
+                if ids_cpu is None:
+                    continue
+                for dp_rank, dp_real_bs in enumerate(real_bs_per_dp):
+                    if dp_real_bs <= 0:
+                        continue
+                    start = dp_rank * per_dp_bs_size
+                    end = start + min(dp_real_bs, per_dp_bs_size)
+                    ids_chunk = ids_cpu[start:end, :]
+                    flat = ids_chunk.reshape(-1)
+                    valid = flat[flat >= 0]
+                    valid = valid[valid < self.num_experts]
+                    if valid.size == 0:
+                        continue
+                    counts = np.bincount(valid, minlength=self.num_experts)[: self.num_experts]
+                    self._counts[layer_idx] += counts
+
             self._segment_progress += 1
             if self._segment_progress >= self.segment_counter:
-                self._flush_segment()
-                self._counts.fill(0)
-                self._segment_progress = 0
-                self._segment_idx += 1
-                self._segment_decode_steps = 0
-                self._segment_padding_tokens_sum = 0
+                self._flush_and_reset_segment()
 
     def _flush_segment(self):
         timestamp = datetime.datetime.now().isoformat(timespec="seconds")
@@ -464,6 +485,19 @@ class _ExpertBalanceAnalyzer:
             )
             self._open_writer(write_header=True)
 
+    def _flush_and_reset_segment(self):
+        self._flush_segment()
+        self._counts.fill(0)
+        self._segment_progress = 0
+        self._segment_idx += 1
+        self._segment_decode_steps = 0
+        self._segment_padding_tokens_sum = 0
+
+    def reset(self):
+        with self._lock:
+            if self._segment_progress > 0:
+                self._flush_and_reset_segment()
+
 
 class _ExpertDistributionRecorder:
     def __init__(
@@ -488,7 +522,8 @@ class _ExpertDistributionRecorder:
     def add_topk_ids(
         self,
         topk_ids_cpu: list[np.ndarray],
-        real_bs: int,
+        real_bs_per_dp: list[int],
+        per_dp_bs_size: int,
     ):
         if not topk_ids_cpu:
             return
@@ -497,12 +532,19 @@ class _ExpertDistributionRecorder:
             for layer_idx, ids_cpu in enumerate(topk_ids_cpu):
                 if ids_cpu is None:
                     continue
-                if real_bs <= 0:
-                    continue
-                ids_chunk = ids_cpu[:real_bs, :].flatten()
-                if ids_chunk.size > 0:
-                    counts = np.bincount(ids_chunk, minlength=self.physical_expert_counts)
-                    self._physical_counts[layer_idx] += counts
+                for dp_rank, real_bs in enumerate(real_bs_per_dp):
+                    if real_bs <= 0:
+                        continue
+                    # Extract the valid slice for this DP rank
+                    start = dp_rank * per_dp_bs_size
+                    end = start + real_bs
+                    ids_chunk = ids_cpu[start:end, :].flatten()
+
+                    # Count valid expert IDs (ignoring padding -1)
+                    valid_ids = ids_chunk[ids_chunk >= 0]
+                    if valid_ids.size > 0:
+                        counts = np.bincount(valid_ids, minlength=self.physical_expert_counts)
+                        self._physical_counts[layer_idx] += counts
 
             self._steps_accumulated += 1
             if self._steps_accumulated >= self.buffer_size:

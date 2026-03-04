@@ -81,7 +81,41 @@ class NativeAttention(AttentionBackend):
         # Get xai_temperature_len from the layer if it exists and pass it down.
         xai_temp_len = getattr(layer, "xai_temperature_len", None)
 
-        attn_output = forward_attention(
+        # Wrap forward_attention in shard_map to handle data parallelism.
+        # Each DP rank computes attention independently on its own batch.
+        in_specs = (
+            P("data", "tensor", None),  # q
+            P("data", "tensor", None),  # k_buffer
+            P("data", "tensor", None),  # v_buffer
+            P("data"),  # seq_lens
+            P("data"),  # cache_loc
+            P("data"),  # extend_prefix_lens
+            P("data"),  # extend_seq_lens
+        )
+        out_specs = P("data", "tensor")  # attn_output: [num_tokens, hidden_size]
+
+        attn_output = jax.shard_map(
+            lambda q_local, k_local, v_local, seq_lens_local, loc_local, prefix_lens_local, extend_lens_local: forward_attention(
+                q_local,
+                k_local,
+                v_local,
+                seq_lens_local,
+                loc_local,
+                prefix_lens_local,
+                extend_lens_local,
+                layer.q_head_num,
+                layer.kv_head_num,
+                scale,
+                is_causal,
+                forward_batch.forward_mode,
+                None,  # kv_sharding=None inside shard_map (local computation)
+                xai_temperature_len=xai_temp_len,
+            ),
+            mesh=self.mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_vma=False,
+        )(
             q,
             k_buffer,
             v_buffer,
@@ -89,13 +123,6 @@ class NativeAttention(AttentionBackend):
             forward_batch.cache_loc,
             forward_batch.extend_prefix_lens,
             forward_batch.extend_seq_lens,
-            layer.q_head_num,
-            layer.kv_head_num,
-            scale,
-            is_causal,
-            forward_batch.forward_mode,
-            self.kv_sharding,
-            xai_temperature_len=xai_temp_len,
         )
 
         # Return full fused KV buffer for this layer so that caller can persist it outside JIT
@@ -112,6 +139,7 @@ class NativeAttention(AttentionBackend):
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """
         Get the kv cache from the forward batch.
+        Returns k, v with sharding P("data", "tensor", None) for shard_map.
         """
         if is_tpu_runtime():
             if forward_batch.forward_mode.is_extend():
@@ -124,8 +152,10 @@ class NativeAttention(AttentionBackend):
                 )
             # Use fused layer directly from pool; derive K/V views without extra merge
             fused_layer = token_to_kv_pool.get_fused_kv_buffer(layer_id)
-            k = fused_layer.at[:, ::2, :].get(out_sharding=kv_sharding)
-            v = fused_layer.at[:, 1::2, :].get(out_sharding=kv_sharding)
+            # Keep P("data", "tensor", None) sharding for shard_map
+            data_tensor_sharding = NamedSharding(self.mesh, P("data", "tensor", None))
+            k = fused_layer.at[:, ::2, :].get(out_sharding=data_tensor_sharding)
+            v = fused_layer.at[:, 1::2, :].get(out_sharding=data_tensor_sharding)
             fused_return = fused_layer
         else:
             updated_layer = token_to_kv_pool.set_kv_buffer_legacy(
@@ -133,8 +163,9 @@ class NativeAttention(AttentionBackend):
             )
             # Functional style: treat updated_layer as authoritative fused buffer for this layer in this step
             # Derive K/V views for attention computation from fused buffer directly
-            k = updated_layer.at[:, ::2, :].get(out_sharding=kv_sharding)
-            v = updated_layer.at[:, 1::2, :].get(out_sharding=kv_sharding)
+            data_tensor_sharding = NamedSharding(self.mesh, P("data", "tensor", None))
+            k = updated_layer.at[:, ::2, :].get(out_sharding=data_tensor_sharding)
+            v = updated_layer.at[:, 1::2, :].get(out_sharding=data_tensor_sharding)
             # Return fused buffer directly for persistence outside JIT
             fused_return = updated_layer
         return k, v, fused_return

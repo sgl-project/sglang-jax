@@ -261,18 +261,21 @@ class UMT5Attention(nnx.Module):
 
     def _native_attention(self, q, k, v, forward_batch: ForwardBatch):
         """Native attention for encoder/cross-attention with T5 position bias."""
-        num_tokens, hidden = q.shape[0], q.shape[-1]
-        head_dim = hidden // self.n_heads
+        hidden = q.shape[-1]
+        head_dim = self.d_kv  # T5 uses d_kv as head dimension, not hidden // n_heads
+        n_heads = self.n_heads  # Capture as local variable for closure
+        is_cross_attn = self.is_cross_attention  # Capture as local variable
+        has_rel_bias = hasattr(self, "rel_bias")  # Capture as local variable
 
-        # Reshape to [heads, tokens, head_dim]
-        def to_heads(x):
-            n_tok = x.shape[0]
-            return jnp.transpose(x.reshape(n_tok, self.n_heads, head_dim), (1, 0, 2))
-
-        q_h, k_h, v_h = to_heads(q), to_heads(k), to_heads(v)
-
-        # Compute scores in float32
-        scores = jnp.einsum("hqd,hkd->hqk", q_h.astype(jnp.float32), k_h.astype(jnp.float32))
+        # Debug: print dimensions
+        jax.debug.print(
+            "UMT5 _native_attention: q.shape={q_shape}, hidden={hidden}, d_kv={d_kv}, n_heads={n_heads}, inner_dim={inner_dim}",
+            q_shape=q.shape,
+            hidden=hidden,
+            d_kv=head_dim,
+            n_heads=n_heads,
+            inner_dim=self.inner_dim,
+        )
 
         # Get sequence lengths
         q_lens = getattr(forward_batch, "extend_seq_lens", forward_batch.seq_lens)
@@ -280,12 +283,8 @@ class UMT5Attention(nnx.Module):
         if q_lens is None:
             q_lens = jnp.array([q.shape[0]], dtype=jnp.int32)
 
-        # Add position bias for self-attention (T5-specific)
-        if not self.is_cross_attention and hasattr(self, "rel_bias"):
-            pos_bias = self._compute_position_bias(q_lens, q.shape[0], k.shape[0])
-            scores = scores + pos_bias.astype(jnp.float32)
+        rel_bias_weight = self.rel_bias.embedding.value if hasattr(self, "rel_bias") else None
 
-        # Apply masking
         kv_lens = (
             getattr(forward_batch, "encoder_seq_lens", q_lens)
             if self.is_cross_attention
@@ -293,16 +292,67 @@ class UMT5Attention(nnx.Module):
         )
         is_causal = self.is_decoder and not self.is_cross_attention
 
-        # Apply block_diagonal_mask
-        scores = _apply_block_diagonal_mask(scores, q_lens, kv_lens, is_causal=is_causal)
+        # Wrap computation in shard_map for data parallelism
+        in_specs = (
+            P("data", "tensor"),  # q
+            P("data", "tensor"),  # k
+            P("data", "tensor"),  # v
+            P("data"),  # q_lens
+            P("data"),  # kv_lens
+            P(None, "tensor"),  # rel_bias_weight
+        )
+        out_specs = P("data", "tensor")
 
-        # Softmax and weighted sum
-        weights = jax.nn.softmax(scores, axis=-1)
-        out = jnp.einsum("hqk,hkd->hqd", weights, v_h.astype(jnp.float32))
+        def _compute_attention(q_local, k_local, v_local, q_lens_local, kv_lens_local, rel_weight):
+            # Debug: print local shapes inside shard_map
+            jax.debug.print(
+                "Inside shard_map: q_local.shape={q_shape}, n_heads={n_heads}, head_dim={head_dim}",
+                q_shape=q_local.shape,
+                n_heads=n_heads,
+                head_dim=head_dim,
+            )
+            local_n_heads = q_local.shape[-1] // head_dim
+            local_hidden = q_local.shape[-1]
 
-        return jnp.transpose(out, (1, 0, 2)).reshape(num_tokens, hidden)
+            # Reshape to [heads, tokens, head_dim]
+            def to_heads(x):
+                n_tok = x.shape[0]
+                return jnp.transpose(x.reshape(n_tok, local_n_heads, head_dim), (1, 0, 2))
 
-    def _compute_position_bias(self, seq_lens, q_len, k_len):
+            q_h, k_h, v_h = to_heads(q_local), to_heads(k_local), to_heads(v_local)
+
+            # Compute scores in float32
+            scores = jnp.einsum("hqd,hkd->hqk", q_h.astype(jnp.float32), k_h.astype(jnp.float32))
+
+            # Add position bias for self-attention (T5-specific)
+            if not is_cross_attn and has_rel_bias:
+                pos_bias = self._compute_position_bias(
+                    q_lens_local, q_local.shape[0], k_local.shape[0], rel_weight
+                )
+                scores = scores + pos_bias.astype(jnp.float32)
+
+            # Apply block_diagonal_mask
+            scores = _apply_block_diagonal_mask(
+                scores, q_lens_local, kv_lens_local, is_causal=is_causal
+            )
+
+            # Softmax and weighted sum
+            weights = jax.nn.softmax(scores, axis=-1)
+            out = jnp.einsum("hqk,hkd->hqd", weights, v_h.astype(jnp.float32))
+
+            return jnp.transpose(out, (1, 0, 2)).reshape(q_local.shape[0], local_hidden)
+
+        result = jax.shard_map(
+            _compute_attention,
+            mesh=self.mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_vma=False,
+        )(q, k, v, q_lens, kv_lens, rel_bias_weight)
+
+        return result
+
+    def _compute_position_bias(self, seq_lens, q_len, k_len, rel_weight):
         """Compute T5 position bias [heads, q_len, k_len]."""
         starts = jnp.cumsum(seq_lens) - seq_lens
         indicators = jnp.zeros(q_len, dtype=jnp.int32).at[starts].set(1)
@@ -318,7 +368,8 @@ class UMT5Attention(nnx.Module):
             num_buckets=self.num_buckets,
             max_distance=self.max_distance,
         )
-        return jnp.transpose(self.rel_bias(buckets), (2, 0, 1))
+        bias = rel_weight[buckets]
+        return jnp.transpose(bias, (2, 0, 1))
 
 
 # =============================================================================
@@ -467,8 +518,11 @@ class UMT5EncoderModel(nnx.Module):
 
         # Dummy logits for interface compatibility
         bs = forward_batch.seq_lens.shape[0]
-        dummy = jnp.zeros((bs, self.config.vocab_size), dtype=self.dtype)
-        dummy = jax.sharding.reshard(dummy, NamedSharding(self.mesh, P(None, "tensor")))
+        dummy = jnp.zeros(
+            (bs, self.config.vocab_size),
+            dtype=self.dtype,
+            out_sharding=NamedSharding(self.mesh, P("data", "tensor")),
+        )
         return LogitsProcessorOutput(next_token_logits=dummy, hidden_states=hidden), [], [], None
 
 

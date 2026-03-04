@@ -90,6 +90,7 @@ class ServerArgs:
 
     # Data parallel
     dp_size: int = 1
+    dp_schedule_policy: str = "min_running_queue"
 
     # Logging
     log_level: str = "info"
@@ -791,6 +792,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.dp_size,
             help="The data parallelism size.",
+        )
+        parser.add_argument(
+            "--dp-schedule-policy",
+            type=str,
+            choices=["round_robin", "min_running_queue"],
+            default=ServerArgs.dp_schedule_policy,
+            help="DP scheduling policy for assigning dp_rank to new requests.",
         )
 
         # Multi-node distributed serving
