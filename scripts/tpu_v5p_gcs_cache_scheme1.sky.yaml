@@ -1,0 +1,109 @@
+# sky launch scripts/tpu_v5p_gcs_cache_scheme1.sky.yaml -n jiongxuan-v5p-scheme1 -y --use-spot -i 120
+#
+# Purpose:
+# - TPU v5p-8 development machine for MiMo/Qwen MoE debugging
+# - Keep /models on gcsfuse, but move file cache off /dev/shm
+# - Use root disk (/var/tmp/gcsfuse-cache) as a bounded cache to avoid tmpfs blow-up
+#
+# Scheme 1 tradeoff:
+# - Pros: /dev/shm stays near zero, avoids eating host RAM/tmpfs
+# - Cons: root disk is only ~100G, so this is suitable for validation/debugging,
+#   not the final stable long-running setup
+
+resources:
+  accelerators: tpu-v6e-8
+  disk_size: 1000
+  disk_tier: ultra
+  accelerator_args:
+    tpu_vm: true
+    runtime_version: v2-alpha-tpuv6e
+
+file_mounts:
+  ~/.ssh/id_ed25519: ~/.ssh/id_ed25519
+
+setup: |
+  set -euxo pipefail
+
+  # Step 1. Prepare SSH and repo.
+  rm ~/.ssh/config
+  mkdir -p ~/.ssh
+  chmod 700 ~/.ssh
+  chmod 600 ~/.ssh/id_ed25519
+
+  if [ ! -d ~/sky_workdir/sgl-jax/.git ]; then
+    mkdir -p ~/sky_workdir
+    GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no" \
+      git clone git@github.com:sgl-project/sgl-jax.git ~/sky_workdir/sgl-jax
+  fi
+
+  cd ~/sky_workdir/sgl-jax
+
+  # Step 2. Install Python environment.
+  git checkout feat/mimo-v2-flash
+  if ! command -v uv >/dev/null 2>&1; then
+    pip install uv
+  fi
+  if [ ! -f .venv/bin/activate ]; then
+    uv venv --python 3.12
+  fi
+  source .venv/bin/activate
+  uv pip install -e "python[all]"
+
+  # Step 3. Stop old model processes before remounting /models.
+  pkill -f "sgl_jax.launch_server|sglang::scheduler" || true
+  sleep 3
+
+  # Step 4. Reconfigure gcsfuse:
+  # - cache-dir moves from /dev/shm to /var/tmp/gcsfuse-cache
+  # - file-cache is capped at 40GB
+  # - per-file parallel downloads set to 8 for a better speed/availability balance
+  # sudo mkdir -p /var/tmp/gcsfuse-cache
+  # sudo tee /etc/gcsfuse.yaml >/dev/null <<'EOF'
+  # cache-dir: "/var/tmp/gcsfuse-cache"
+  # implicit-dirs: true
+  # metadata-cache:
+  #   ttl-secs: -1
+  # file-cache:
+  #   max-size-mb: 40960
+  #   enable-parallel-downloads: true
+  #   parallel-downloads-per-file: 8
+  # file-system:
+  #   uid: 2005
+  #   gid: 2005
+  #   dir-mode: "777"
+  #   file-mode: "777"
+  # EOF
+
+  # if mountpoint -q /models; then
+  #   sudo fusermount -u /models || sudo umount /models
+  # fi
+  # sudo mkdir -p /models
+  # sudo gcsfuse --config-file /etc/gcsfuse.yaml -o allow_other model-storage-sglang /models
+
+  # # Step 5. Clear stale tmpfs cache left by old /dev/shm-based mounts.
+  # # Keep /var/tmp/gcsfuse-cache intact so subsequent launches can reuse warmed cache.
+  # sudo rm -rf /dev/shm/gcsfuse-file-cache
+  # sudo mkdir -p /dev/shm/gcsfuse-file-cache
+  # sudo chmod 700 /dev/shm/gcsfuse-file-cache
+
+  # # Step 6. Print the key verification info for this scheme.
+  # echo "==== /etc/gcsfuse.yaml ===="
+  # cat /etc/gcsfuse.yaml
+  # echo "==== mount ===="
+  # mount | grep -F " /models " || true
+  # echo "==== df ===="
+  # df -h / /dev/shm /var/tmp /models
+  # echo "==== cache dirs ===="
+  # sudo du -sh /var/tmp/gcsfuse-cache /dev/shm/gcsfuse-file-cache 2>/dev/null || true
+
+run: |
+  # set -euxo pipefail
+  cd ~/sky_workdir/sgl-jax
+  source .venv/bin/activate
+
+  export PYTHONPATH=~/sky_workdir/sgl-jax/python
+  export XLA_PYTHON_CLIENT_PREALLOCATE=false
+  #python -u -m sgl_jax.launch_server --model-path /models/MiMo-V2-Flash --trust-remote-code --tp-size 8 --ep-size 8 --moe-backend epmoe --nnodes 1 --node-rank 0 --dist-init-addr \$(hostname -I | awk '{print \$1}'):10011 --host 127.0.0.1 --port 30271 --context-length 1024 --max-total-tokens 2048 --max-prefill-tokens 256 --mem-fraction-static 0.3 --disable-precompile --skip-server-warmup --log-level info
+  echo "Machine is ready."
+  echo "Recommended next step:"
+  echo ""

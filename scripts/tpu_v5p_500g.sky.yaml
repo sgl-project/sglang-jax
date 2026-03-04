@@ -1,0 +1,36 @@
+# sky launch scripts/tpu_v5p_500g.sky.yaml -n jiongxuan-v5p-dev -y --use-spot -i 120
+# SkyPilot configuration for TPU v5p with 500GB disk
+resources:
+  # region: us-central1
+  # zone: us-central1-a
+  accelerators: tpu-v5p-8
+  disk_size: 1000
+  disk_tier: ultra
+  accelerator_args:
+    tpu_vm: True
+    # runtime_version: v2-alpha-tpuv5p
+
+file_mounts:
+  ~/.ssh/id_ed25519: ~/.ssh/id_ed25519
+
+setup: |
+  # 确保 SSH 目录权限正确
+  rm ~/.ssh/config
+  mkdir -p ~/.ssh && chmod 700 ~/.ssh
+  chmod 600 ~/.ssh/id_ed25519
+  
+  # 克隆代码 (使用 SSH)
+  if [ ! -d "sglang-jax" ]; then
+    GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no" 
+    git clone git@github.com:sgl-project/sglang-jax.git
+  fi
+
+  cd sglang-jax
+  
+  # 按照项目规范安装环境
+  pip install uv
+  uv venv --python 3.12
+  source .venv/bin/activate
+  uv pip install -e "python[all]"
+  
+  # 清理可能存在的残留进程
