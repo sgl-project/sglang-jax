@@ -138,14 +138,16 @@ class ModelWorkerClient:
         _, logits_output, next_token_ids, cache_miss_count = self.output_queue.get()
         if logits_output.next_token_logprobs is not None:
             logits_output.next_token_logprobs = jax.device_get(
-                logits_output.next_token_logprobs
+                self.async_gather_fn(logits_output.next_token_logprobs)
             ).tolist()
         if logits_output.input_token_logprobs is not None:
             logits_output.input_token_logprobs = jax.device_get(
-                logits_output.input_token_logprobs
+                self.async_gather_fn(logits_output.input_token_logprobs)
             ).tolist()
         if logits_output.hidden_states is not None:
-            logits_output.hidden_states = jax.device_get(logits_output.hidden_states)
+            logits_output.hidden_states = jax.device_get(
+                self.async_gather_fn(logits_output.hidden_states)
+            )
         next_token_ids = jax.device_get(next_token_ids).tolist()
         if launch_done is not None:
             launch_done.wait()

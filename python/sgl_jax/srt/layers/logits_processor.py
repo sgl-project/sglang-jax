@@ -241,6 +241,19 @@ class LogitsProcessor(nnx.Module):
             out_specs=P("data", None),
         )(hidden_states, indices)
 
+    def _select_logits(self, logits: jax.Array, indices: jax.Array) -> jax.Array:
+        """Select logits by indices using shard_map for DP-safe indexing."""
+
+        def select_local_fn(local_logits, local_indices):
+            return local_logits[local_indices]
+
+        return jax.shard_map(
+            select_local_fn,
+            mesh=self.mesh,
+            in_specs=(P("data", "tensor"), P("data")),
+            out_specs=P("data", "tensor"),
+        )(logits, indices)
+
     @named_scope
     def __call__(
         self,
@@ -321,7 +334,9 @@ class LogitsProcessor(nnx.Module):
 
         # Compute logits for both input and sampled tokens.
         logits = self._get_logits(pruned_states, lm_head)
-        sampled_logits = logits[sample_indices] if sample_indices is not None else logits
+        sampled_logits = (
+            self._select_logits(logits, sample_indices) if sample_indices is not None else logits
+        )
 
         hidden_states_to_store: jax.Array | None = None
         if logits_metadata.capture_hidden_mode.need_capture():
@@ -337,14 +352,14 @@ class LogitsProcessor(nnx.Module):
                     aux_pruned_states = jnp.concat(aux_pruned_states, axis=-1)
 
                     hidden_states_to_store = (
-                        aux_pruned_states[sample_indices]
+                        self._select_hidden_states(aux_pruned_states, sample_indices)
                         if sample_indices is not None
                         else aux_pruned_states
                     )
 
                 else:
                     hidden_states_to_store = (
-                        pruned_states[sample_indices]
+                        self._select_hidden_states(pruned_states, sample_indices)
                         if sample_indices is not None
                         else pruned_states
                     )
@@ -359,7 +374,7 @@ class LogitsProcessor(nnx.Module):
                 hidden_states=hidden_states_to_store,
             )
         else:
-            input_logprobs = logits[input_logprob_indices]
+            input_logprobs = self._select_logits(logits, input_logprob_indices)
 
             del hidden_states, logits
 

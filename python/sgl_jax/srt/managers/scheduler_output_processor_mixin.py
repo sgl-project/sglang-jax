@@ -72,19 +72,23 @@ class SchedulerOutputProcessorMixin:
                 self.tp_worker.resolve_last_batch_result(launch_done)
             )
         else:
+            # Gather sharded tensors before any host-side operations
+            next_token_ids = self._gather_next_token_ids(next_token_ids)
+            logits_output = self._gather_logits_output(logits_output)
+
             # Move next_token_ids and logprobs to cpu
             if batch.return_output_logprob_only and logits_output.next_token_logprobs is not None:
                 logits_output.next_token_logprobs = jax.device_get(
                     logits_output.next_token_logprobs
-                ).astype(float)
+                )
             if batch.return_logprob:
                 if logits_output.next_token_logprobs is not None:
                     logits_output.next_token_logprobs = jax.device_get(
                         logits_output.next_token_logprobs
-                    ).astype(float)
+                    )
                 if logits_output.input_token_logprobs is not None:
                     logits_output.input_token_logprobs = tuple(
-                        jax.device_get(logits_output.input_token_logprobs).astype(float)
+                        jax.device_get(logits_output.input_token_logprobs)
                     )
         hidden_state_offset = 0
         per_dp_bs_size = batch.per_dp_bs_size
@@ -104,6 +108,9 @@ class SchedulerOutputProcessorMixin:
 
             # Check finish conditions for each request in this DP rank
             for i, (req, next_token_id) in enumerate(zip(reqs, dp_output_ids)):
+                # Global index for accessing merged logprob arrays
+                global_idx = per_dp_bs_size * dp_rank + i
+
                 if req.is_retracted:
                     continue
 
@@ -148,7 +155,9 @@ class SchedulerOutputProcessorMixin:
                         self.tree_cache.cache_unfinished_req(req)
 
                     if req.return_output_logprob_only:
-                        req.output_token_logprobs_val.append(logits_output.next_token_logprobs[i])
+                        req.output_token_logprobs_val.append(
+                            logits_output.next_token_logprobs[global_idx]
+                        )
                         req.output_token_logprobs_idx.append(next_token_id)
 
                     if req.return_logprob:
@@ -158,7 +167,7 @@ class SchedulerOutputProcessorMixin:
                         extend_input_len = extend_input_len_per_req[i]
                         num_input_logprobs = extend_input_len - extend_logprob_start_len
                         self.add_logprob_return_values(
-                            i,
+                            global_idx,
                             req,
                             logprob_pt,
                             dp_output_ids,  # Pass current DP rank's output IDs
@@ -176,7 +185,7 @@ class SchedulerOutputProcessorMixin:
                                         + len(req.origin_input_ids)
                                     )
                                 ]
-                            ).astype(float)
+                            )
                         )
 
                     # Update grammar state after token sampling
@@ -295,6 +304,10 @@ class SchedulerOutputProcessorMixin:
             )
             next_token_logprobs = logits_output.next_token_logprobs
         else:
+            # Gather sharded tensors before any host-side operations
+            next_token_ids = self._gather_next_token_ids(next_token_ids)
+            logits_output = self._gather_logits_output(logits_output)
+
             # spec decoding handles output logprobs inside verify process.
             if batch.return_logprob or batch.return_output_logprob_only:
                 next_token_logprobs = jax.device_get(logits_output.next_token_logprobs).astype(
@@ -319,6 +332,8 @@ class SchedulerOutputProcessorMixin:
 
             # Check finish condition for each request in this DP rank
             for i, (req, next_token_id) in enumerate(zip(reqs, dp_output_ids)):
+                # Global index for accessing merged logprob arrays
+                global_idx = per_dp_bs_size * dp_rank + i
                 req: Req
                 if req.is_retracted:
                     continue
@@ -383,28 +398,28 @@ class SchedulerOutputProcessorMixin:
                     self.tree_cache.cache_finished_req(req)
 
                 if req.return_output_logprob_only:
-                    req.output_token_logprobs_val.append(next_token_logprobs[i])  # TODO @Brian fix
+                    req.output_token_logprobs_val.append(next_token_logprobs[global_idx])
                     req.output_token_logprobs_idx.append(next_token_id)
 
                 if req.return_logprob and (
                     batch.spec_algorithm is None or batch.spec_algorithm.is_none()
                 ):
                     # speculative worker handles logprob in speculative decoding
-                    req.output_token_logprobs_val.append(next_token_logprobs[i])
+                    req.output_token_logprobs_val.append(next_token_logprobs[global_idx])
                     req.output_token_logprobs_idx.append(next_token_id)
                     if req.top_logprobs_num > 0:
                         req.output_top_logprobs_val.append(
-                            logits_output.next_token_top_logprobs_val[i]
+                            logits_output.next_token_top_logprobs_val[global_idx]
                         )
                         req.output_top_logprobs_idx.append(
-                            logits_output.next_token_top_logprobs_idx[i]
+                            logits_output.next_token_top_logprobs_idx[global_idx]
                         )
                     if req.token_ids_logprob is not None:
                         req.output_token_ids_logprobs_val.append(
-                            logits_output.next_token_token_ids_logprobs_val[i]
+                            logits_output.next_token_token_ids_logprobs_val[global_idx]
                         )
                         req.output_token_ids_logprobs_idx.append(
-                            logits_output.next_token_token_ids_logprobs_idx[i]
+                            logits_output.next_token_token_ids_logprobs_idx[global_idx]
                         )
 
                 # Update grammar state after token sampling

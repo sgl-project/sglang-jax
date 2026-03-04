@@ -673,6 +673,9 @@ class WanTransformer3DModel(nnx.Module):
         if self.mesh is not None:
             sharding = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
             timestep_proj = jax.lax.with_sharding_constraint(timestep_proj, sharding)
+            encoder_hidden_states = jax.lax.with_sharding_constraint(
+                encoder_hidden_states, sharding
+            )
 
         # Concatenate image and text embeddings if image embeddings exist
         if encoder_hidden_states_image is not None:

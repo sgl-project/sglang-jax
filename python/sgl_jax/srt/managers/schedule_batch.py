@@ -1825,6 +1825,55 @@ class ScheduleBatch:
 
         return cache_loc_cpu
 
+    def _merge_logprob_info(
+        self,
+        per_dp_bs_size: int,
+        total_bs: int,
+    ):
+        """Merge logprob info from all DP ranks.
+
+        Returns:
+            (top_logprobs_nums, token_ids_logprobs)
+        """
+        if not self.return_logprob:
+            return None, None
+
+        # Initialize merged lists
+        top_logprobs_nums = []
+        token_ids_logprobs = []
+
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+
+            if info.seq_lens is None or len(info.seq_lens) == 0:
+                # Empty DP rank - pad with zeros/None
+                for _ in range(per_dp_bs_size):
+                    top_logprobs_nums.append(0)
+                    token_ids_logprobs.append(None)
+                continue
+
+            # Get data from this DP rank
+            dp_bs = len(info.seq_lens)
+
+            # Add actual data
+            if info.top_logprobs_nums is not None:
+                top_logprobs_nums.extend(info.top_logprobs_nums)
+            else:
+                top_logprobs_nums.extend([0] * dp_bs)
+
+            if info.token_ids_logprobs is not None:
+                token_ids_logprobs.extend(info.token_ids_logprobs)
+            else:
+                token_ids_logprobs.extend([None] * dp_bs)
+
+            # Pad to per_dp_bs_size
+            padding_needed = per_dp_bs_size - dp_bs
+            if padding_needed > 0:
+                top_logprobs_nums.extend([0] * padding_needed)
+                token_ids_logprobs.extend([None] * padding_needed)
+
+        return top_logprobs_nums, token_ids_logprobs
+
     def _merge_sampling_info(
         self,
         per_dp_bs_size: int,
@@ -1943,6 +1992,11 @@ class ScheduleBatch:
         # Step 5: Merge sampling info from all DP ranks
         sampling_info = self._merge_sampling_info(per_dp_bs_padding, total_bs)
 
+        # Step 5.5: Merge logprob info from all DP ranks
+        top_logprobs_nums, token_ids_logprobs = self._merge_logprob_info(
+            per_dp_bs_padding, total_bs
+        )
+
         # Step 6: Generate trace info if needed
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
@@ -1972,8 +2026,8 @@ class ScheduleBatch:
             out_cache_loc=out_cache_loc_cpu,
             return_logprob=self.return_logprob,
             return_output_logprob_only=self.return_output_logprob_only,
-            top_logprobs_nums=None,  # TODO: @Brian pad logprob info
-            token_ids_logprobs=None,  # TODO
+            top_logprobs_nums=top_logprobs_nums,
+            token_ids_logprobs=token_ids_logprobs,
             sampling_info=sampling_info,
             positions=positions_cpu,
             mrope_positions=None,
