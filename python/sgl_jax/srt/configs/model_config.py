@@ -6,6 +6,7 @@ from enum import Enum, IntEnum, auto
 import jax.numpy as jnp
 from transformers import PretrainedConfig
 
+from sgl_jax.srt.configs.dtype_config import STR_DTYPE_TO_JAX_DTYPE, DtypeConfig
 from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.hf_transformers_utils import (
     download_from_hf,
@@ -49,6 +50,7 @@ class ModelConfig:
         model_override_args: str = "{}",
         is_embedding: bool | None = None,
         dtype: str = "auto",
+        dtype_config: DtypeConfig | dict | None = None,
         override_config_file: str | None = None,
         is_draft_model: bool = False,
         model_impl: str | ModelImpl = ModelImpl.AUTO,
@@ -139,6 +141,16 @@ class ModelConfig:
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
         self.is_multimodal = False
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
+
+        if not isinstance(dtype_config, DtypeConfig):
+            self.dtype_config = DtypeConfig(dtype_config, default_dtype=self.dtype)
+        else:
+            self.dtype_config = dtype_config
+            # The global dtype must be the same as the default dtype provided in dtype_config
+            if self.dtype != self.dtype_config.default_dtype:
+                raise ValueError(
+                    f"Global dtype ({self.dtype}) is not the same as the default dtype provided in dtype_config ({self.dtype_config.default_dtype})."
+                )
 
         # Derive context length
         derived_context_len = get_context_length(self.hf_text_config)
@@ -351,6 +363,7 @@ class ModelConfig:
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
             dtype=server_args.dtype,
+            dtype_config=server_args.dtype_config,
             quantization=server_args.quantization,
             quantization_config_path=server_args.quantization_config_path,
             model_impl=server_args.model_impl,
@@ -596,15 +609,6 @@ class ModelConfig:
             )
 
 
-_STR_DTYPE_TO_JAX_DTYPE = {
-    "half": jnp.float16,
-    "float16": jnp.float16,
-    "float": jnp.float32,
-    "float32": jnp.float32,
-    "bfloat16": jnp.bfloat16,
-}
-
-
 def _get_and_verify_dtype(
     config: PretrainedConfig,
     dtype: str | jnp.dtype,
@@ -613,9 +617,9 @@ def _get_and_verify_dtype(
     if config_dtype is None:
         config_dtype = getattr(config, "torch_dtype", None)
     if isinstance(config_dtype, str):
-        config_dtype = _STR_DTYPE_TO_JAX_DTYPE.get(config_dtype)
+        config_dtype = STR_DTYPE_TO_JAX_DTYPE.get(config_dtype)
     elif config_dtype is not None:
-        config_dtype = _STR_DTYPE_TO_JAX_DTYPE.get(str(config_dtype).replace("torch.", ""), None)
+        config_dtype = STR_DTYPE_TO_JAX_DTYPE.get(str(config_dtype).replace("torch.", ""), None)
 
     if config_dtype is None:
         config_dtype = jnp.float32
@@ -630,9 +634,9 @@ def _get_and_verify_dtype(
                     config_dtype,
                 )
         else:
-            if dtype not in _STR_DTYPE_TO_JAX_DTYPE:
+            if dtype not in STR_DTYPE_TO_JAX_DTYPE:
                 raise ValueError(f"Unknown dtype: {dtype}")
-            jax_dtype = _STR_DTYPE_TO_JAX_DTYPE[dtype]
+            jax_dtype = STR_DTYPE_TO_JAX_DTYPE[dtype]
     elif isinstance(dtype, jnp.dtype):
         jax_dtype = dtype
     else:
