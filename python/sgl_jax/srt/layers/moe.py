@@ -240,6 +240,9 @@ class EPMoE(nnx.Module):
         self.activation_quantized_dtype = (
             quantization_config.get_moe_activation_dtype() if quantization_config else None
         )
+        self.weight_block_size = (
+            getattr(quantization_config, "weight_block_size", None) if quantization_config else None
+        )
 
         if self.num_experts % self.ep_size != 0:
             raise ValueError(
@@ -314,26 +317,71 @@ class EPMoE(nnx.Module):
         if self.quantized_dtype is None:
             return
 
-        with jax.sharding.use_abstract_mesh(self.updated_mesh):
+        with jax.set_mesh(self.moe_mesh):
             if is_static:
-                scale_sharding = P("expert", None, None, None)
+                # Static checkpoints will load real scale tensors later, but the
+                # placeholders must already satisfy expert sharding shape rules.
+                num_experts = self.wi_0.value.shape[0]
+                intermediate_dim = self.wi_0.value.shape[1]
+                hidden_size = self.wo.value.shape[1]
+
+                # Compute k_blocks for block quant placeholders.
+                # weight_block_size = [hf_out_block, hf_in_block] (HF convention).
+                # EPMoE quantizes along axis=2 (k/input dim), so use hf_in_block = [1].
+                block_size_k = None
+                if self.weight_block_size is not None:
+                    if not (isinstance(self.weight_block_size, (list, tuple)) and len(self.weight_block_size) == 2):
+                        raise ValueError(
+                            f"EPMoE weight_block_size must be a 2-element list [block_n, block_k], "
+                            f"got {self.weight_block_size}"
+                        )
+                    block_size_k = int(self.weight_block_size[1])
+                    if block_size_k <= 0:
+                        raise ValueError(f"EPMoE weight_block_size[1] must be > 0, got {block_size_k}")
+                    if hidden_size % block_size_k != 0:
+                        raise ValueError(
+                            f"EPMoE hidden_size={hidden_size} not divisible by block_size_k={block_size_k}"
+                        )
+                    if intermediate_dim % block_size_k != 0:
+                        raise ValueError(
+                            f"EPMoE intermediate_dim={intermediate_dim} not divisible by block_size_k={block_size_k}"
+                        )
+                k_blocks_wi = (hidden_size // block_size_k) if block_size_k else 1
+                k_blocks_wo = (intermediate_dim // block_size_k) if block_size_k else 1
+                wi_scale_sharding = P("expert", None, None, "tensor")
+                wo_scale_sharding = P("expert", None, None, None)
 
                 if hasattr(self, "wi_0_scale"):
                     del self.wi_0_scale
                 self.wi_0_scale = nnx.Param(
-                    jnp.zeros((1,), dtype=jnp.float32), out_sharding=scale_sharding
+                    jnp.zeros(
+                        (num_experts, k_blocks_wi, 1, intermediate_dim),
+                        dtype=jnp.float32,
+                        out_sharding=wi_scale_sharding,
+                    ),
+                    out_sharding=wi_scale_sharding,
                 )
 
                 if hasattr(self, "wi_1_scale"):
                     del self.wi_1_scale
                 self.wi_1_scale = nnx.Param(
-                    jnp.zeros((1,), dtype=jnp.float32), out_sharding=scale_sharding
+                    jnp.zeros(
+                        (num_experts, k_blocks_wi, 1, intermediate_dim),
+                        dtype=jnp.float32,
+                        out_sharding=wi_scale_sharding,
+                    ),
+                    out_sharding=wi_scale_sharding,
                 )
 
                 if hasattr(self, "wo_scale"):
                     del self.wo_scale
                 self.wo_scale = nnx.Param(
-                    jnp.zeros((1,), dtype=jnp.float32), out_sharding=scale_sharding
+                    jnp.zeros(
+                        (num_experts, k_blocks_wo, 1, hidden_size),
+                        dtype=jnp.float32,
+                        out_sharding=wo_scale_sharding,
+                    ),
+                    out_sharding=wo_scale_sharding,
                 )
                 return
 
@@ -982,6 +1030,7 @@ class FusedEPMoE(nnx.Module):
         topk_ids: jax.Array,
         *,
         block_config: FusedMoEBlockConfig | None = None,
+        token_valid_mask: jax.Array | None = None,
     ) -> jax.Array:
         """
         Forward pass through the fused MoE layer.
@@ -996,6 +1045,7 @@ class FusedEPMoE(nnx.Module):
             MoE layer output, same shape as hidden_states
         """
         assert hidden_states.ndim == 2
+        del token_valid_mask  # Reserved for fused-path padded-token masking.
 
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
