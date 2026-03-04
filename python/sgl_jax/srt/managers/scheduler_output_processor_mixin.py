@@ -408,11 +408,12 @@ class SchedulerOutputProcessorMixin:
                     req.output_token_logprobs_val.append(next_token_logprobs[global_idx])
                     req.output_token_logprobs_idx.append(next_token_id)
                     if req.top_logprobs_num > 0:
+                        k = req.top_logprobs_num
                         req.output_top_logprobs_val.append(
-                            logits_output.next_token_top_logprobs_val[global_idx]
+                            logits_output.next_token_top_logprobs_val[global_idx][:k]
                         )
                         req.output_top_logprobs_idx.append(
-                            logits_output.next_token_top_logprobs_idx[global_idx]
+                            logits_output.next_token_top_logprobs_idx[global_idx][:k]
                         )
                     if req.token_ids_logprob is not None:
                         req.output_token_ids_logprobs_val.append(
@@ -631,8 +632,9 @@ class SchedulerOutputProcessorMixin:
         )
 
         if req.top_logprobs_num > 0:
-            req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])
-            req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i])
+            k = req.top_logprobs_num
+            req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i][:k])
+            req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i][:k])
 
         if req.token_ids_logprob is not None:
             req.output_token_ids_logprobs_val.append(output.next_token_token_ids_logprobs_val[i])
