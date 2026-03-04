@@ -660,13 +660,17 @@ class ModelWorker:
                     logits_output.next_token_token_ids_logprobs_idx.tolist()
                 )
             if logits_output.input_token_ids_logprobs_val is not None:
-                logits_output.input_token_ids_logprobs_val = (
-                    logits_output.input_token_ids_logprobs_val.astype(jnp.float32).tolist()
-                )
-                logits_output.input_token_ids_logprobs_idx = (
-                    logits_output.input_token_ids_logprobs_idx.tolist()
-                )
+                # Flat list of JAX arrays, convert each element to Python
+                logits_output.input_token_ids_logprobs_val = [
+                    v.astype(jnp.float32).tolist() if hasattr(v, "astype") else v
+                    for v in logits_output.input_token_ids_logprobs_val
+                ]
+                logits_output.input_token_ids_logprobs_idx = [
+                    v.tolist() if hasattr(v, "tolist") else v
+                    for v in logits_output.input_token_ids_logprobs_idx
+                ]
             if logits_output.input_top_logprobs_val is not None:
+                # Flat tensor shape: [total_pruned_tokens, max_k]
                 logits_output.input_top_logprobs_val = logits_output.input_top_logprobs_val.astype(
                     jnp.float32
                 ).tolist()

@@ -574,14 +574,8 @@ class Scheduler(
             logits_output.input_top_logprobs_val = gather_fn(logits_output.input_top_logprobs_val)
         if logits_output.input_top_logprobs_idx is not None:
             logits_output.input_top_logprobs_idx = gather_fn(logits_output.input_top_logprobs_idx)
-        if logits_output.input_token_ids_logprobs_val is not None:
-            logits_output.input_token_ids_logprobs_val = gather_fn(
-                logits_output.input_token_ids_logprobs_val
-            )
-        if logits_output.input_token_ids_logprobs_idx is not None:
-            logits_output.input_token_ids_logprobs_idx = gather_fn(
-                logits_output.input_token_ids_logprobs_idx
-            )
+        # input_token_ids_logprobs_val/idx are Python lists of already-gathered arrays,
+        # so no need to gather them again
 
         return logits_output
 

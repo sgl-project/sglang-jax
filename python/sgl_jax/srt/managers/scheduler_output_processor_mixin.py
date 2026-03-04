@@ -480,8 +480,9 @@ class SchedulerOutputProcessorMixin:
             i: The request index in a batch.
             req: The request. Input logprobs inside req are modified as a
                 consequence of the API
-            fill_ids: The prefill ids processed.
             output: Logit processor output that's used to compute input logprobs
+            logprob_pt: Offset into the flat logprobs arrays for this request's data.
+            num_input_logprobs: Number of input logprob tokens for this request.
             last_prefill_chunk: True if it is the last prefill (when chunked).
                 Some of input logprob operation should only happen at the last
                 prefill (e.g., computing input token logprobs).
@@ -510,12 +511,34 @@ class SchedulerOutputProcessorMixin:
         req.input_token_logprobs.extend(input_token_logprobs)
 
         if req.top_logprobs_num > 0:
-            req.temp_input_top_logprobs_val.append(output.input_top_logprobs_val[i])
-            req.temp_input_top_logprobs_idx.append(output.input_top_logprobs_idx[i])
+            # Flat tensor: slice [logprob_pt:logprob_pt+num_input_logprobs] rows,
+            # then truncate each row to req.top_logprobs_num (since tensor has max_k cols)
+            k = req.top_logprobs_num
+            chunk_val = [
+                row[:k]
+                for row in output.input_top_logprobs_val[
+                    logprob_pt : logprob_pt + num_input_logprobs
+                ]
+            ]
+            chunk_idx = [
+                row[:k]
+                for row in output.input_top_logprobs_idx[
+                    logprob_pt : logprob_pt + num_input_logprobs
+                ]
+            ]
+            req.temp_input_top_logprobs_val.append(chunk_val)
+            req.temp_input_top_logprobs_idx.append(chunk_idx)
 
         if req.token_ids_logprob is not None:
-            req.temp_input_token_ids_logprobs_val.append(output.input_token_ids_logprobs_val[i])
-            req.temp_input_token_ids_logprobs_idx.append(output.input_token_ids_logprobs_idx[i])
+            # Flat list: slice [logprob_pt:logprob_pt+num_input_logprobs]
+            chunk_val = output.input_token_ids_logprobs_val[
+                logprob_pt : logprob_pt + num_input_logprobs
+            ]
+            chunk_idx = output.input_token_ids_logprobs_idx[
+                logprob_pt : logprob_pt + num_input_logprobs
+            ]
+            req.temp_input_token_ids_logprobs_val.append(chunk_val)
+            req.temp_input_token_ids_logprobs_idx.append(chunk_idx)
 
         if last_prefill_chunk:
             input_token_logprobs = req.input_token_logprobs

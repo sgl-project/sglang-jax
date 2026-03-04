@@ -45,10 +45,16 @@ class LogitsProcessorOutput:
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logprobs of input tokens.        shape: [#token]
     input_token_logprobs: jax.Array | None = None
-    # The logprobs and ids of the top-k tokens in input positions.  shape: [#seq, #token, k]
+    # The logprobs and ids of the top-k tokens in input positions.
+    # FLAT tensors containing all pruned tokens across all requests.
+    # Shape: [total_pruned_tokens, max_k]
+    # Consumer should use extend_logprob_pruned_lens_cpu to slice per-request data.
     input_top_logprobs_val: jax.Array | None = None
     input_top_logprobs_idx: jax.Array | None = None
-    # The logprobs and ids of the requested token ids in input positions. shape: [#seq, n] (n is the number of requested token ids)
+    # The logprobs and ids of the requested token ids in input positions.
+    # FLAT tensors containing all pruned tokens across all requests.
+    # Shape: [total_pruned_tokens, num_token_ids] (num_token_ids varies per request, so this is ragged in practice)
+    # Consumer should use extend_logprob_pruned_lens_cpu to slice per-request data.
     input_token_ids_logprobs_val: jax.Array | None = None
     input_token_ids_logprobs_idx: jax.Array | None = None
 
@@ -445,43 +451,26 @@ class LogitsProcessor(nnx.Module):
             logits_metadata.extend_logprob_pruned_lens_cpu,
         ):
             if pruned_len <= 0:
-                input_token_ids_logprobs_val.append([])
-                input_token_ids_logprobs_idx.append([])
                 continue
 
-            input_token_ids_logprobs_val.append(
-                [
+            for j in range(pruned_len):
+                input_token_ids_logprobs_val.append(
                     all_logprobs.at[pt + j, token_ids].get(out_sharding=out_sharding)
-                    for j in range(pruned_len)
-                ]
-            )
-            input_token_ids_logprobs_idx.append([token_ids for _ in range(pruned_len)])
+                )
+                input_token_ids_logprobs_idx.append(token_ids)
             pt += pruned_len
 
-        return jnp.array(input_token_ids_logprobs_val), jnp.array(input_token_ids_logprobs_idx)
+        # Return flat lists: each element corresponds to one pruned token
+        # Consumer uses extend_logprob_pruned_lens_cpu to slice per-request.
+        return input_token_ids_logprobs_val, input_token_ids_logprobs_idx
 
     @staticmethod
     def get_top_logprobs(all_logprobs: jax.Array, logits_metadata: LogitsMetadata):
         max_k = max(logits_metadata.top_logprobs_nums)
         values, indices = jax.lax.top_k(all_logprobs, max_k)
-
-        input_top_logprobs_val, input_top_logprobs_idx = [], []
-
-        pt = 0
-        for k, pruned_len in zip(
-            logits_metadata.top_logprobs_nums,
-            logits_metadata.extend_logprob_pruned_lens_cpu,
-        ):
-            if pruned_len <= 0:
-                input_top_logprobs_val.append([])
-                input_top_logprobs_idx.append([])
-                continue
-
-            input_top_logprobs_val.append([values[pt + j][:k] for j in range(pruned_len)])
-            input_top_logprobs_idx.append([indices[pt + j][:k] for j in range(pruned_len)])
-            pt += pruned_len
-
-        return jnp.array(input_top_logprobs_val), jnp.array(input_top_logprobs_idx)
+        # Return flat tensors: shape [total_pruned_tokens, max_k]
+        # Consumer uses extend_logprob_pruned_lens_cpu + top_logprobs_nums to slice per-request.
+        return values, indices
 
     def compute_temp_top_p_normalized_logprobs(
         self, last_logits: jax.Array, logits_metadata: LogitsMetadata
