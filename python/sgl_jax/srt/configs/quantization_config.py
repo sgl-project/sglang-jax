@@ -63,12 +63,15 @@ class QuantizationConfig:
         linear_rules: List of quantization rules for linear layers
         moe_weight_dtype: Dtype for MoE weight quantization (None = no quantization)
         moe_activation_dtype: Dtype for MoE activation quantization (None = no quantization)
+        weight_block_size: Optional block sizes for static fp8 checkpoints (e.g., [128, 128])
     """
 
     linear_rules: list[dict] | None = None
     moe_weight_dtype: jnp.dtype | None = None
     moe_activation_dtype: jnp.dtype | None = None
     is_static_checkpoint: bool = False
+    ignored_layers: list[str] | None = None
+    weight_block_size: list[int] | None = None
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "QuantizationConfig":
@@ -101,6 +104,7 @@ class QuantizationConfig:
             )
 
         quant = cfg["quantization"]
+        ignored_layers = quant.get("ignored_layers")
 
         # Parse linear rules (required)
         linear_section = quant.get("linear", {})
@@ -121,12 +125,15 @@ class QuantizationConfig:
         moe_weight_dtype = _str_to_dtype(moe_section.get("weight_dtype"))
         moe_activation_dtype = _str_to_dtype(moe_section.get("activation_dtype"))
         is_static_checkpoint = quant.get("is_static_checkpoint", False)
+        weight_block_size = quant.get("weight_block_size")
 
         return cls(
             linear_rules=linear_rules,
             moe_weight_dtype=moe_weight_dtype,
             moe_activation_dtype=moe_activation_dtype,
             is_static_checkpoint=is_static_checkpoint,
+            ignored_layers=ignored_layers,
+            weight_block_size=weight_block_size,
         )
 
     @classmethod
