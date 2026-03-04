@@ -6,6 +6,7 @@ from typing import Literal
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -55,15 +56,15 @@ class ExpertLocationMetadata:
     ):
         self.ep_dispatch_algorithm = ep_dispatch_algorithm
         self.logical_to_rank_dispatch_physical_map = device_array(
-            logical_to_rank_dispatch_physical_map, sharding=(None)
+            logical_to_rank_dispatch_physical_map, sharding=(P(None))
         )
         self.logical_to_all_physical_map = device_array(
-            logical_to_all_physical_map, sharding=(None)
+            logical_to_all_physical_map, sharding=(P(None))
         )
         self.logical_to_all_physical_map_num_valid = device_array(
-            logical_to_all_physical_map_num_valid, sharding=(None)
+            logical_to_all_physical_map_num_valid, sharding=(P(None))
         )
-        self.physical_to_logical_map = device_array(physical_to_logical_map, sharding=(None))
+        self.physical_to_logical_map = device_array(physical_to_logical_map, sharding=(P(None)))
         self.num_physical_experts = num_physical_experts
 
     def tree_flatten(self):
@@ -367,9 +368,11 @@ def _topk_ids_logical_to_physical_dynamic(
     info: ExpertLocationMetadata,
     layer_id: int = 0,
 ) -> jax.Array:
-    num_valid, selected_expert_replicas = (
-        info.logical_to_all_physical_map_num_valid[layer_id, topk_ids],
-        info.logical_to_all_physical_map[layer_id, topk_ids],
+    num_valid = info.logical_to_all_physical_map_num_valid.at[layer_id, topk_ids].get(
+        out_sharding=P("data", None)
+    )
+    selected_expert_replicas = info.logical_to_all_physical_map.at[layer_id, topk_ids].get(
+        out_sharding=P("data", None)
     )
 
     rng_key = jax.random.key(0)

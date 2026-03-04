@@ -105,6 +105,7 @@ def benchmark_backend(
             cu_kv_lens,
             distribution,
             None,
+            decode_mode=0,
             sm_scale=sm_scale,
             num_kv_pages_per_block=num_kv_pages_per_block,
             num_queries_per_block=num_queries_per_block,

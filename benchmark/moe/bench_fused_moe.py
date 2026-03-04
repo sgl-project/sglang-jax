@@ -67,6 +67,34 @@ def _tpu_log_recorder_compiler_options() -> dict[str, str] | None:
     return None
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    val = val.strip().lower()
+    if val in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if val in ("0", "false", "f", "no", "n", "off", ""):
+        return False
+    raise ValueError(f"Invalid boolean env var {name}={val!r} (expected 0/1/true/false).")
+
+
+def _env_bool_opt(name: str) -> bool | None:
+    """Return None if unset, otherwise parse as bool."""
+    val = os.getenv(name)
+    if val is None:
+        return None
+    return _env_bool(name)
+
+
+def _with_all_disable(env_name: str, *, all_disable: bool) -> bool:
+    """Use per-flag env override if set; otherwise fall back to all_disable."""
+    specific = _env_bool_opt(env_name)
+    if specific is not None:
+        return specific
+    return all_disable
+
+
 def _dtype_packing(dtype: jnp.dtype) -> int:
     """Match get_dtype_packing() in fused_moe kernel (32-bit repack width)."""
     bits = jnp.dtype(dtype).itemsize * 8
@@ -217,6 +245,7 @@ def _estimate_vmem_bytes(
             se_w1_scale = intermediate_size * 4
             se_w3_scale = intermediate_size * 4
             se_w2_scale = hidden_size * 4
+            total_bytes += se_w1_scale + se_w3_scale + se_w2_scale
 
     if verbose:
 
@@ -333,7 +362,15 @@ def select_block_configs(
             out.append(v)
         return sorted(set(out))
 
-    bt_candidates = _pick_candidates(candidates=bt_candidates, multiple_of=t_packing)
+    def _bt_allowed(v: int) -> bool:
+        # Allow 2/4/8, otherwise require alignment to 8.
+        return v in (2, 4, 8) or v % 8 == 0
+
+    bt_candidates = [
+        v
+        for v in _pick_candidates(candidates=bt_candidates, multiple_of=t_packing)
+        if _bt_allowed(v)
+    ]
     bts_candidates_i: list[int] | None
     if bts_candidates is None:
         bts_candidates_i = None
@@ -363,6 +400,8 @@ def select_block_configs(
             return False, f"bt({bt}) > local_num_tokens({local_num_tokens})"
         if bt % t_packing != 0:
             return False, f"bt({bt}) % t_packing({t_packing}) != 0"
+        if not _bt_allowed(bt):
+            return False, f"bt({bt}) must be 2, 4, 8, or a multiple of 8"
         if bt % router_tile0 != 0:
             return (
                 False,
@@ -634,7 +673,8 @@ def run_all(
     token_mask_mode: str = "none",
     token_valid_ratio: float = 1.0,
     token_mask_seed: int = 0,
-) -> None:
+    return_results: bool = False,
+) -> list[dict[str, object]] | None:
     if use_grouped_topk is None:
         use_grouped_topk = bool(num_expert_group or topk_group)
 
@@ -673,11 +713,12 @@ def run_all(
         cases.append(c)
     if not cases:
         print("No runnable fused_moe cases after filtering tp_size!=1.")
-        return
+        return [] if return_results else None
 
     tuned_results: dict[str, dict[tuple, tuple[int, int, int, int, int, int, int, int, int]]] = {}
     if tune_block_config:
         from sgl_jax.srt.utils.jax_utils import get_device_name
+    results: list[dict[str, object]] = []
 
     print(f"Running fused_moe benchmarks with weight_dtype={weight_dtype}")
     print(f"  features: shared_expert={use_shared_expert}, grouped_topk={use_grouped_topk}")
@@ -720,21 +761,39 @@ def run_all(
         )
 
         print(f"{imbalance_mode=}")
-        target_counts = MoEImbalanceSimulator.generate_counts(
-            case.num_tokens,
-            case.top_k,
-            case.num_experts,
-            mode=imbalance_mode,
-            alpha=alpha,
-            zipf_s=zipf_s,
-            hotspot_ratio=hotspot_ratio,
-            hotspot_count=hotspot_count,
-            zero_expert_count=zero_expert_count,
-            non_hotspot_alpha=non_hotspot_alpha,
-        )
-        custom_logits = MoEImbalanceSimulator.create_logits_from_counts(
-            case.num_tokens, case.num_experts, case.top_k, target_counts
-        )
+        if use_grouped_topk:
+            custom_logits, sim_stats = MoEImbalanceSimulator.create_grouped_topk_logits(
+                case.num_tokens,
+                case.num_experts,
+                case.top_k,
+                num_groups=case.num_expert_group,
+                top_k_groups=case.topk_group,
+                mode=imbalance_mode,
+                seed=int(case.seed) + 42,
+                alpha=alpha,
+                zipf_s=zipf_s,
+                hotspot_ratio=hotspot_ratio,
+                hotspot_count=hotspot_count,
+                zero_expert_count=zero_expert_count,
+                non_hotspot_alpha=non_hotspot_alpha,
+            )
+            print(f"  imbalance(sim): {sim_stats}")
+        else:
+            target_counts = MoEImbalanceSimulator.generate_counts(
+                case.num_tokens,
+                case.top_k,
+                case.num_experts,
+                mode=imbalance_mode,
+                alpha=alpha,
+                zipf_s=zipf_s,
+                hotspot_ratio=hotspot_ratio,
+                hotspot_count=hotspot_count,
+                zero_expert_count=zero_expert_count,
+                non_hotspot_alpha=non_hotspot_alpha,
+            )
+            custom_logits = MoEImbalanceSimulator.create_logits_from_counts(
+                case.num_tokens, case.num_experts, case.top_k, target_counts
+            )
 
         data["router_logits"] = jax.device_put(
             custom_logits, jax.sharding.NamedSharding(mesh, P("tensor", None))
@@ -803,6 +862,7 @@ def run_all(
             quantization_config = None
 
         with jax.set_mesh(mesh):
+            all_disable = _env_bool("FUSED_MOE_BENCHMARK_ALL_DISABLE", False)
             fused_layer = FusedEPMoE(
                 hidden_size=case.hidden_size,
                 num_experts=case.num_experts,
@@ -823,6 +883,45 @@ def run_all(
                     case.intermediate_size if use_shared_expert else None
                 ),
                 quantization_config=quantization_config,
+                # Env helpers:
+                # - Set `FUSED_MOE_BENCHMARK_ALL_DISABLE=1` to disable all major stages.
+                # - Any specific `FUSED_MOE_BENCHMARK_DISABLE_*` overrides ALL_DISABLE.
+                disable_a2a=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_A2A",
+                    all_disable=all_disable,
+                ),
+                disable_dynamic_ffn1=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN1",
+                    all_disable=all_disable,
+                ),
+                disable_dynamic_ffn2=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN2",
+                    all_disable=all_disable,
+                ),
+                disable_weight_load=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_WEIGHT_LOAD",
+                    all_disable=all_disable,
+                ),
+                disable_a2a_s_tile_read=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_TILE_READ",
+                    all_disable=all_disable,
+                ),
+                disable_a2a_s_acc_tile_write=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_ACC_TILE_WRITE",
+                    all_disable=all_disable,
+                ),
+                disable_shared_expert=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_SHARED_EXPERT",
+                    all_disable=all_disable,
+                ),
+                disable_all_reduce_metadata=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_ALL_REDUCE_METADATA",
+                    all_disable=all_disable,
+                ),
+                disable_sync_barrier=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_SYNC_BARRIER",
+                    all_disable=all_disable,
+                ),
             )
             if quantization_config is not None:
                 fused_layer.quantize_weights()
@@ -896,6 +995,7 @@ def run_all(
                 )
 
             best: tuple[float, FusedMoEBlockConfig | None] | None = None
+            default_ms: float | None = None
             for i, block_cfg in enumerate(block_cfgs):
                 tag = "default" if block_cfg is None else str(i)
                 if block_cfg is None:
@@ -995,6 +1095,8 @@ def run_all(
                     times = times[1:]
                 mean_ms = float(np.mean(times)) if times else float("nan")
                 print(f"     fused_moe[{tag}]: {mean_ms:.3f} ms (trace) | samples={times}")
+                if block_cfg is None:
+                    default_ms = mean_ms
                 if tune_block_config and np.isfinite(mean_ms):
                     if best is None or mean_ms < best[0]:
                         best = (mean_ms, block_cfg)
@@ -1038,6 +1140,29 @@ def run_all(
                             f"{per_device[table_key]} -> {cfg_tuple}"
                         )
                     per_device[table_key] = cfg_tuple
+            if return_results:
+                best_ms: float | None
+                best_cfg: FusedMoEBlockConfig | None
+                if tune_block_config:
+                    if best is None:
+                        best_ms, best_cfg = float("nan"), None
+                    else:
+                        best_ms, best_cfg = best
+                else:
+                    best_ms, best_cfg = default_ms, None
+                results.append(
+                    {
+                        "case": case.name,
+                        "num_tokens": case.num_tokens,
+                        "num_experts": case.num_experts,
+                        "top_k": case.top_k,
+                        "hidden_size": case.hidden_size,
+                        "intermediate_size": case.intermediate_size,
+                        "ep_size": case.ep_size,
+                        "best_ms": best_ms,
+                        "best_cfg": best_cfg.as_kwargs() if best_cfg is not None else None,
+                    }
+                )
 
     if tune_block_config and tuned_results:
         print("\n# --- Copy/paste into tuned_block_configs.py ---")
@@ -1050,6 +1175,10 @@ def run_all(
             ):
                 print(f"    {k}: {entries[k]},")
             print("})\n")
+
+    if return_results:
+        return results
+    return None
 
 
 def parse_args() -> argparse.Namespace:
@@ -1199,6 +1328,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--token-valid-ratios",
+        type=float,
+        nargs="+",
+        default=None,
+        help=(
+            "List of token_valid_ratio values to sweep in a single run. "
+            "Overrides --token-valid-ratio when provided."
+        ),
+    )
+    parser.add_argument(
         "--token-mask-seed",
         type=int,
         default=0,
@@ -1215,8 +1354,9 @@ if __name__ == "__main__":
     except Exception:
         pass
     args = parse_args()
-    if args.token_mask_mode == "none" and args.token_valid_ratio < 1.0:
-        args.token_mask_mode = "random"
+    if args.token_valid_ratios is None:
+        if args.token_mask_mode == "none" and args.token_valid_ratio < 1.0:
+            args.token_mask_mode = "random"
     DTYPE_MAP = {
         "int8": jnp.int8,
         "float8_e4m3fn": jnp.float8_e4m3fn,
@@ -1235,40 +1375,73 @@ if __name__ == "__main__":
     tpu_vmem_budget_bytes = int(args.tpu_vmem_budget_mb) * 1024 * 1024
     full_args_dict = vars(args)
     try:
-        run_all(
-            args.iters,
-            weight_dtype=weight_dtype,
-            warmup_iters=args.warmup_iters,
-            tune_block_config=args.tune_block_config,
-            bt_candidates=args.bt_candidates,
-            bts_candidates=args.bts_candidates,
-            bf_candidates=args.bf_candidates,
-            bd_candidates=args.bd_candidates,
-            bse_candidates=args.bse_candidates,
-            num_tokens=args.num_tokens,
-            num_experts=args.num_experts,
-            top_k=args.top_k,
-            hidden_size=args.hidden_size,
-            intermediate_size=args.intermediate_size,
-            activation=args.activation,
-            renormalize_topk_logits=args.renormalize_topk_logits,
-            num_expert_group=args.num_expert_group,
-            topk_group=args.topk_group,
-            tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
-            max_configs=args.max_configs,
-            use_shared_expert=args.use_shared_expert,
-            use_grouped_topk=None,
-            imbalance_mode=args.imbalance_mode,
-            alpha=args.alpha,
-            zipf_s=args.zipf_s,
-            hotspot_ratio=args.hotspot_ratio,
-            hotspot_count=args.hotspot_count,
-            zero_expert_count=args.zero_expert_count,
-            non_hotspot_alpha=args.non_hotspot_alpha,
-            token_mask_mode=args.token_mask_mode,
-            token_valid_ratio=args.token_valid_ratio,
-            token_mask_seed=args.token_mask_seed,
-        )
+
+        def _resolve_token_mask_mode(ratio: float, mode: str) -> str:
+            if mode == "none" and ratio < 1.0:
+                return "random"
+            return mode
+
+        ratios = args.token_valid_ratios or [args.token_valid_ratio]
+        all_results: list[tuple[float, str, list[dict[str, object]]]] = []
+        for ratio in ratios:
+            token_mask_mode = _resolve_token_mask_mode(ratio, args.token_mask_mode)
+            if len(ratios) > 1:
+                print(f"\n# --- token_valid_ratio={ratio} (token_mask_mode={token_mask_mode}) ---")
+            results = run_all(
+                args.iters,
+                weight_dtype=weight_dtype,
+                warmup_iters=args.warmup_iters,
+                tune_block_config=args.tune_block_config,
+                bt_candidates=args.bt_candidates,
+                bts_candidates=args.bts_candidates,
+                bf_candidates=args.bf_candidates,
+                bd_candidates=args.bd_candidates,
+                bse_candidates=args.bse_candidates,
+                num_tokens=args.num_tokens,
+                num_experts=args.num_experts,
+                top_k=args.top_k,
+                hidden_size=args.hidden_size,
+                intermediate_size=args.intermediate_size,
+                activation=args.activation,
+                renormalize_topk_logits=args.renormalize_topk_logits,
+                num_expert_group=args.num_expert_group,
+                topk_group=args.topk_group,
+                tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
+                max_configs=args.max_configs,
+                use_shared_expert=args.use_shared_expert,
+                use_grouped_topk=None,
+                imbalance_mode=args.imbalance_mode,
+                alpha=args.alpha,
+                zipf_s=args.zipf_s,
+                hotspot_ratio=args.hotspot_ratio,
+                hotspot_count=args.hotspot_count,
+                zero_expert_count=args.zero_expert_count,
+                non_hotspot_alpha=args.non_hotspot_alpha,
+                token_mask_mode=token_mask_mode,
+                token_valid_ratio=ratio,
+                token_mask_seed=args.token_mask_seed,
+                return_results=True,
+            )
+            all_results.append((ratio, token_mask_mode, results))
+
+        if len(all_results) > 1:
+            print("\n# === token_valid_ratio summary ===")
+            print("ratio | token_mask_mode | case | best_ms")
+            for ratio, token_mask_mode, results in all_results:
+                best_values = []
+                for row in results:
+                    best_ms = row.get("best_ms")
+                    if isinstance(best_ms, (int, float)) and np.isfinite(best_ms):
+                        best_values.append(float(best_ms))
+                    best_str = (
+                        f"{best_ms:.3f}"
+                        if isinstance(best_ms, (int, float)) and np.isfinite(best_ms)
+                        else "nan"
+                    )
+                    print(f"{ratio} | {token_mask_mode} | {row['case']} | {best_str}")
+                if best_values:
+                    avg_ms = float(np.mean(best_values))
+                    print(f"{ratio} | {token_mask_mode} | __avg__ | {avg_ms:.3f}")
     except BaseException as e:
         print(f"FATAL: {type(e).__name__}: {e}", flush=True)
         print(traceback.format_exc(), flush=True)
