@@ -287,9 +287,9 @@ class QuantizedLinear(nnx.Module):
         # Weight w_q sharding: P(output_axis, input_axis)
         # Weight scale sharding:
         #   - Per-channel: P(output_axis)
-        #   - Block-wise:  P(None, None) (replicated global block-scale matrix)
+        #   - Block-wise:  P(output_axis, input_axis) (sharded matching weights)
         # Output sharding: P(None, output_axis)
-        w_scale_spec = P(output_axis) if scale_val.ndim == 1 else P(None, None)
+        w_scale_spec = P(output_axis) if scale_val.ndim == 1 else P(output_axis, input_axis)
         in_specs = (
             P(None, input_axis),  # x
             P(output_axis, input_axis),  # w_q
@@ -315,8 +315,6 @@ class QuantizedLinear(nnx.Module):
                 xla_quantized_matmul_local,
                 quantize_activation=quantize_activation,
                 reduce_axis=input_axis,  # psum over input axis (e.g., "tensor" for o_proj)
-                input_shard_axis=input_axis,
-                output_shard_axis=output_axis,
                 compute_dtype=self.compute_dtype,
                 weight_block_size=effective_weight_block_size,
                 activation_quant_dtype=self.activation_dtype,
