@@ -25,9 +25,11 @@ def run_block_quant_test(weight_dtype, dtype_name):
     w_fp = jax.random.normal(k2, (out_dim, in_dim), dtype=compute_dtype)
 
     # 3. Perform block-wise quantization
+    # Explicitly cast to float32 for quantization to avoid JAX promotion errors
+    w_fp_f32 = w_fp.astype(jnp.float32)
     w_q, w_scale = quantize_tensor(
         dtype=weight_dtype,
-        tensor=w_fp,
+        tensor=w_fp_f32,
         axis=(0, 1),
         block_size=block_size,
     )

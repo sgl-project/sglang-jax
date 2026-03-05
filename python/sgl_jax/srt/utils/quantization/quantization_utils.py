@@ -9,8 +9,6 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
-
 logger = logging.getLogger(__name__)
 
 DTYPE_MAP = {
@@ -31,16 +29,9 @@ def apply_linear_quantization(
 ) -> Any:
     """
     Recursively apply quantization to linear layers based on rules.
-
-    Args:
-        obj: The object (model or module) to apply quantization to
-        quant_config: The global quantization configuration
-        linear_rules: List of quantization rules for linear layers
-        is_static_input: Whether weights are already quantized (static checkpoint)
-
-    Returns:
-        The modified object with quantized linear layers
     """
+    from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
+
     if not linear_rules:
         return obj
 
