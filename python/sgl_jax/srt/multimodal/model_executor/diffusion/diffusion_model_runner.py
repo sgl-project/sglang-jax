@@ -222,7 +222,8 @@ class DiffusionModelRunner(BaseModelRunner):
                     encoder_hidden_states_image=None,
                     guidance_scale=None,
                 )
-                logger.info("diffusion cache miss count: %d", count())
+                if count() > 0:
+                    logger.info("diffusion cache miss count: %d", count())
             if do_classifier_free_guidance:
                 bsz = latents.shape[0] // 2
                 noise_uncond = noise_pred[bsz:]

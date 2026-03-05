@@ -19,8 +19,8 @@ class MultimodalServerArgs(ServerArgs):
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
     image_encoder_precision: str = "bf16"
 
-    vae_decode_precompile_width_height: list[str] | None = None
-    vae_decode_precompile_frame_paddings: list[int] | None = None
+    precompile_width_heights: list[str] | None = None
+    precompile_frame_paddings: list[int] | None = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -95,14 +95,14 @@ class MultimodalServerArgs(ServerArgs):
         )
 
         parser.add_argument(
-            "--vae-decode-precompile-width-height",
+            "--precompile-width-heights",
             type=str,
             nargs="+",
             help="Set the list of width and height for jax jit, format width*height",
         )
 
         parser.add_argument(
-            "--vae-decode-precompile-frame-paddings",
+            "--precompile-frame-paddings",
             type=int,
             nargs="+",
             help="Set the frame count list for jax jit",
@@ -115,17 +115,17 @@ class MultimodalServerArgs(ServerArgs):
         # manually.
         super().__post_init__()
 
-        if self.vae_decode_precompile_width_height is not None:
-            for wh in self.vae_decode_precompile_width_height:
+        if self.precompile_width_heights is not None:
+            for wh in self.precompile_width_heights:
                 if len(wh.split("*")) < 2:
                     raise Exception("Width and height must be connected with an asterisk *.")
-            if self.vae_decode_precompile_frame_paddings is None:
-                self.vae_decode_precompile_frame_paddings = [1]
+            if self.precompile_frame_paddings is None:
+                self.precompile_frame_paddings = [1]
             else:
-                self.vae_decode_precompile_frame_paddings.sort()
+                self.precompile_frame_paddings.sort()
         else:
-            self.vae_decode_precompile_width_height = ["480*832"]
-            self.vae_decode_precompile_frame_paddings = [1]
+            self.precompile_width_heights = ["480*832"]
+            self.precompile_frame_paddings = [1]
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):

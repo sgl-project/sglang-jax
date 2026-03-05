@@ -554,14 +554,6 @@ def _execute_multimodal_server_warmup(
             ],
             "max_tokens": 3,
         }
-    elif _is_wan_model(server_args.model_path):
-        request_endpoint = "/api/v1/images/generation"
-        json_data = {
-            "prompt": "warmup request",
-            "size": "480*832",
-            "num_inference_steps": 2,
-            "save_output": False,
-        }
     elif "MiMo-Audio" in server_args.model_path:
         request_endpoint = "/v1/audio/transcriptions"
         # audio_url = "https://huggingface.co/datasets/nvidia/AudioSkills/resolve/main/assets/WhDJDIviAOg_120_10.mp3"
