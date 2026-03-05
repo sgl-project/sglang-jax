@@ -236,7 +236,7 @@ class GmmTest(jtu.JaxTestCase):
             group_offset=group_offset,
         )
 
-        if version == GMM_VERSION_V2 and not is_supported_by_gmm_v2(lhs, rhs_q, rhs_scale):
+        if version == GMM_VERSION_V2 and not is_supported_by_gmm_v2(rhs_scale):
             self.skipTest("Configuration not supported by gmm_v2")
 
         actual = gmm_wrapper(
