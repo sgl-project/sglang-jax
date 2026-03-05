@@ -29,6 +29,19 @@ from sgl_jax.srt.kernels.ragged_paged_attention.util import (
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024  # 100MB
+
+# TPU v5p has 1MB SMEM
+TPU_SMEM_LIMIT_BYTES = {
+    "TPU v5": 1024*1024,
+    "TPU v5p": 1024*1024,
+}
+
+# TPU VMEM limits (default is 100MB as per kernel)
+TPU_VMEM_LIMIT_BYTES = {
+    "TPU v5": 64 * 1024 * 1024,
+    "TPU v5p": 64 * 1024 * 1024,
+}
+
 logger = logging.getLogger(__name__)
 
 
@@ -218,6 +231,12 @@ def get_smem_estimate_bytes(max_num_seqs, pages_per_seq):
         align_to(max_num_seqs * pages_per_seq, 128) * 32
         +
         # cu_q_lens_ref: i32[max_num_seqs + 1]
+        align_to(max_num_seqs + 1, 128) * 32
+        +
+        # cu_kv_lens_ref: i32[max_num_seqs + 1]
+        align_to(max_num_seqs + 1, 128) * 32
+        +
+        # cu_seq_mask_lens: i32[max_num_seqs + 1]
         align_to(max_num_seqs + 1, 128) * 32
         +
         # distribution_ref: i32[3]
@@ -1487,6 +1506,7 @@ def ragged_paged_attention(
             pages_per_seq,
             causal,
         )
+    #print(f"[ragged_paged_attention] after get_tuned_block_sizes {bkv_p=}, {bq_sz=}", flush=True)
     kv_packing = get_dtype_packing(kv_cache_fused_processed.dtype)
     if page_size == 1:
         bkv_p = bkv_p // 2
@@ -1620,6 +1640,8 @@ def ragged_paged_attention(
 
     bytes_accessed = q_bytes + o_bytes + kv_bytes_read + kv_bytes_write
     cost_estimate = pl.CostEstimate(flops=flops, bytes_accessed=bytes_accessed, transcendentals=0)
+
+    #print(f"[ragged_paged_attention] after get_kernel_scope_name {bkv_p=}, {bq_sz=}", flush=True)
 
     scope_name = get_kernel_scope_name(bq_sz, bkv_p, page_size)
     kernel = pl.pallas_call(
