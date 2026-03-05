@@ -127,10 +127,10 @@ class VaeScheduler(SchedulerProfilerMixin):
             req.latents += self.model_config.shift_factor
         req.latents = jax.device_get(req.latents)
         latents_t_padding = 0
-        if self.server_args.vae_decode_precompile_frame_paddings is not None and hasattr(
+        if self.server_args.precompile_frame_paddings is not None and hasattr(
             self.model_config, "scale_factor_temporal"
         ):
-            for n_frame in self.server_args.vae_decode_precompile_frame_paddings:
+            for n_frame in self.server_args.precompile_frame_paddings:
                 latents_t = (n_frame - 1) // self.model_config.scale_factor_temporal + 1
                 if latents_t >= req.latents.shape[1]:
                     latents_t_padding = latents_t - req.latents.shape[1]
@@ -153,7 +153,8 @@ class VaeScheduler(SchedulerProfilerMixin):
 
         for req in batch:
             output, cache_miss = self.vae_worker.forward(req)
-            logger.info("VAE forward pass cache miss: %s", cache_miss)
+            if cache_miss > 0:
+                logger.info("VAE forward pass cache miss: %s", cache_miss)
             req.output = jax.device_get(output[:, : req.num_frames, :, :, :])
             req.latents = None
             self.forward_ct += 1

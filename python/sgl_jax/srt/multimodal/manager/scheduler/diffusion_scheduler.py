@@ -59,6 +59,10 @@ class DiffusionScheduler(SchedulerProfilerMixin):
         self.aborted_rids: set[str] = set()
         # Current request being processed (for abort checking during steps)
         self._current_rid: str | None = None
+        if not server_args.disable_precompile:
+            logger.info("[Diffusion Scheduler] Begins to run diffusion worker precompile.")
+            self.diffusion_worker.run_precompile()
+            logger.info("[Diffusion Scheduler] Completes diffusion worker precompile.")
 
     def event_loop_normal(self):
         """Blocking event loop for processing incoming diffusion requests.
