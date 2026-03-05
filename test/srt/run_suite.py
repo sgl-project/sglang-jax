@@ -409,6 +409,8 @@ suites = {
     ],
     "sglang_dependency_test": [],
     "unit-test-tpu-v6e-1": [
+        TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.1),
+        TestFile("python/sgl_jax/test/kernels/moe_block_quant_test.py", 0.1),
         TestFile("python/sgl_jax/test/test_flashattention.py", 20),
         TestFile("python/sgl_jax/test/test_moe_topk.py", 1),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 10),
@@ -470,6 +472,7 @@ suites = {
         TestFile("test/srt/lora/test_static_lora.py", 10),
     ],
     "e2e-test-tpu-v6e-4": [
+        TestFile("test/srt/test_moe_block_quant_e2e.py", 5),
         TestFile("test/srt/openai_server/basic/test_tool_calls.py", 3),
         TestFile("test/srt/test_features.py", 10),
         TestFile("test/srt/test_chunked_prefill_size.py", 5),
