@@ -16,8 +16,6 @@ def xla_quantized_matmul_local(
     w_scale: jax.Array,
     quantize_activation: bool = True,
     reduce_axis: str | None = None,
-    input_shard_axis: str | None = None,
-    output_shard_axis: str | None = None,
     compute_dtype: jnp.dtype | None = None,
     weight_block_size: tuple[int, int] | None = None,
     activation_quant_dtype: jnp.dtype | None = None,
@@ -31,8 +29,6 @@ def xla_quantized_matmul_local(
         w_scale: Weight scale tensor [out_features, 1] or [out_blocks, in_blocks]
         quantize_activation: Whether to quantize the activation
         reduce_axis: The axis to reduce over (for all-reduce)
-        input_shard_axis: The mesh axis name for input sharding
-        output_shard_axis: The mesh axis name for output sharding
         compute_dtype: The dtype to perform the computation in
         weight_block_size: Optional block size for block-wise weight quantization
         activation_quant_dtype: The dtype to use for activation quantization
@@ -56,30 +52,18 @@ def xla_quantized_matmul_local(
         if weight_block_size is not None:
             block_size_out, block_size_in = int(weight_block_size[0]), int(weight_block_size[1])
         else:
+            # Local calculation: since w_scale is now sharded, out_blocks/in_blocks are local counts
             block_size_out = math.ceil(out_dim / out_blocks)
             block_size_in = math.ceil(in_dim / in_blocks)
 
-        out_axis_index = (
-            lax.axis_index(output_shard_axis)
-            if output_shard_axis is not None
-            else jnp.array(0, dtype=jnp.int32)
-        )
-        in_axis_index = (
-            lax.axis_index(input_shard_axis)
-            if input_shard_axis is not None
-            else jnp.array(0, dtype=jnp.int32)
-        )
-        out_global_offset = out_axis_index.astype(jnp.int32) * jnp.int32(out_dim)
-        in_global_offset = in_axis_index.astype(jnp.int32) * jnp.int32(in_dim)
-
-        row_idx = (jnp.arange(out_dim, dtype=jnp.int32) + out_global_offset) // jnp.int32(
-            block_size_out
-        )
-        col_idx = (jnp.arange(in_dim, dtype=jnp.int32) + in_global_offset) // jnp.int32(
-            block_size_in
-        )
+        # No global offsets needed! w_scale is already the local shard.
+        row_idx = jnp.arange(out_dim, dtype=jnp.int32) // jnp.int32(block_size_out)
+        col_idx = jnp.arange(in_dim, dtype=jnp.int32) // jnp.int32(block_size_in)
+        
+        # Clip indices to handle potential padding/rounding at shard boundaries
         row_idx = jnp.clip(row_idx, 0, out_blocks - 1)
         col_idx = jnp.clip(col_idx, 0, in_blocks - 1)
+        
         scale_expanded = w_scale[row_idx[:, None], col_idx[None, :]]
         
         # Dequantize weight to compute_dtype
