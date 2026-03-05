@@ -64,9 +64,8 @@ class QuantizationConfig:
         moe_weight_dtype: Dtype for MoE weight quantization (None = no quantization)
         moe_activation_dtype: Dtype for MoE activation quantization (None = no quantization)
         is_static_checkpoint: Whether the checkpoint is static (true for checkpoints quantized offline, false for on-the-fly quantization)
-        weight_block_size: Optional block sizes for static checkpoints (e.g., [128, 128])
         ignored_layers: Optional list of layer name patterns to exclude from quantization
-        
+        weight_block_size: Optional block sizes for static checkpoints (e.g., [128, 128])
     """
 
     linear_rules: list[dict] | None = None
