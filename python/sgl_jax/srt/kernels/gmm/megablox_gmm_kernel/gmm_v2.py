@@ -252,10 +252,12 @@ def inner_kernel(
                     # But we can let compiler perform CSE and avoid recomputation.
                     block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
 
-                    # If block_abs_max=0, it will cause division by zero and return NaNs
-                    # during quantization. To avoid this, we add smallest representable
-                    # value to avoid block_abs_max being zero.
-                    block_abs_max += jnp.finfo(block_abs_max.dtype).smallest_subnormal
+                    # Clamp block_abs_max so that block_scale = block_abs_max / dtype_max
+                    # is at least tiny (smallest normal), preventing underflow to zero
+                    # in bf16 which would cause 0/0 = NaN during quantization.
+                    block_abs_max = jnp.maximum(
+                        block_abs_max, dtype_max * jnp.finfo(block_abs_max.dtype).tiny
+                    )
                     block_scale = block_abs_max / dtype_max
                     # Convert lhs into quantized dtype.
                     block_lhs_q = (block_lhs / block_scale).astype(lhs_q_dtype)
@@ -891,6 +893,8 @@ def get_metadata(cfgs: GmmConfigs):
         key = jax.tree_util.keystr(path, simple=True, separator=".")
         if isinstance(val, jnp.dtype):
             val = val.name
+        elif isinstance(val, type) and jnp.issubdtype(val, jnp.generic):
+            val = jnp.dtype(val).name
         ret[key] = val
     return ret
 

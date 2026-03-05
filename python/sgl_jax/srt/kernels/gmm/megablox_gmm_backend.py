@@ -19,6 +19,7 @@ def gmm(
     use_gmm_v2: bool = False,
     maybe_quantize_lhs: bool = True,
     zero_initialize: bool = True,
+    acc_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
     """Dispatch GMM to v2 or v1.
 
@@ -37,6 +38,7 @@ def gmm(
         maybe_quantize_lhs: If True, gmm_v2 will quantize lhs when rhs is
             quantized. Set to False to keep activations unquantized.
         zero_initialize: Whether to initialize unvisited output elements to zero.
+        acc_dtype: Optional accumulation dtype for gmm_v2 (e.g. jnp.float32).
     """
     if use_gmm_v2:
         return gmm_v2_kernel(
@@ -49,6 +51,7 @@ def gmm(
             preferred_element_type=preferred_element_type,
             maybe_quantize_lhs=maybe_quantize_lhs,
             zero_initialize=zero_initialize,
+            acc_dtype=acc_dtype,
         )
 
     return gmm_v1_kernel(
