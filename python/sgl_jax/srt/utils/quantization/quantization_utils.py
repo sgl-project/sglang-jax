@@ -7,11 +7,32 @@ import re
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import NamedSharding, PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.configs.quantization_config import DTYPE_MAP
 
 logger = logging.getLogger(__name__)
+
+
+def _get_block_reshape_sharding(
+    tensor: jax.Array,
+    quantized_axes: list[int],
+) -> NamedSharding | None:
+    """Preserve explicit sharding when splitting axes into (num_blocks, block)."""
+    input_sharding = getattr(tensor, "sharding", None)
+    if not isinstance(input_sharding, NamedSharding):
+        return None
+
+    quantized_axis_set = set(quantized_axes)
+    blocked_spec = []
+    for axis_idx, axis_spec in enumerate(input_sharding.spec):
+        if axis_idx in quantized_axis_set:
+            blocked_spec.extend([axis_spec, None])
+        else:
+            blocked_spec.append(axis_spec)
+
+    return NamedSharding(input_sharding.mesh, P(*blocked_spec))
 
 
 def apply_linear_quantization(
@@ -52,8 +73,9 @@ def apply_linear_quantization(
     compiled_rules = []
     for rule in linear_rules:
         pattern = re.compile(rule["module_path"])
-        weight_dtype_str = rule.get("weight_dtype")
-        activation_dtype_str = rule.get("activation_dtype")
+        # Accept both sglang-jax style and Qwix-style field names.
+        weight_dtype_str = rule.get("weight_dtype", rule.get("weight_qtype"))
+        activation_dtype_str = rule.get("activation_dtype", rule.get("act_qtype"))
 
         # Convert string dtypes to jnp dtypes
         weight_dtype = DTYPE_MAP.get(weight_dtype_str)
@@ -69,6 +91,8 @@ def apply_linear_quantization(
                 "activation_dtype": activation_dtype,
             }
         )
+
+    ignored_layers = getattr(quant_config, "ignored_layers", None) or []
 
     def _find_matching_rule(path: str):
         """Find the first rule that matches the given module path."""
@@ -94,6 +118,14 @@ def apply_linear_quantization(
 
                 if isinstance(attr_value, LinearBase):
                     # Check if this path matches any rule
+                    dot_path = child_path.replace("/", ".")
+                    if any(dot_path.endswith(ignored) or ignored in dot_path for ignored in ignored_layers):
+                        logger.info("Skipping %s - in ignored_layers", child_path)
+                        continue
+                    if "self_attn.o_proj" in dot_path and ignored_layers:
+                        logger.info("Skipping %s - explicit o_proj ignore", child_path)
+                        continue
+
                     rule = _find_matching_rule(child_path)
                     if rule is not None:
                         logger.debug(
@@ -108,6 +140,7 @@ def apply_linear_quantization(
                             weight_dtype=rule["weight_dtype"],
                             activation_dtype=rule["activation_dtype"],
                             is_static_input=is_static_input,
+                            weight_block_size=getattr(quant_config, "weight_block_size", None),
                         )
                         # Replace the attribute and free old weights
                         setattr(obj, attr_name, quantized_linear)
@@ -186,6 +219,63 @@ def apply_moe_quantization(
     return model
 
 
+def adapt_fused_moe_static_block_quant_for_kernel(
+    model: nnx.Module,
+    *,
+    target_subc_quant_wsz: int = 256,
+) -> nnx.Module:
+    """Adapt static fused-MoE block quant weights/scales before fused kernel execution.
+
+    This is a front-end compatibility step for static checkpoints whose fused MoE
+    subchannel block size is smaller than the fused kernel's supported size.
+    """
+    # Import here to avoid circular imports
+    from sgl_jax.srt.layers.moe import FusedEPMoE
+
+    adapted_count = 0
+
+    def _adapt_recursive(obj, path: str = "", visited=None):
+        nonlocal adapted_count
+        if visited is None:
+            visited = set()
+
+        obj_id = id(obj)
+        if obj_id in visited:
+            return
+        visited.add(obj_id)
+
+        if isinstance(obj, FusedEPMoE):
+            if obj.prepare_static_block_quant_for_fused_kernel(
+                target_subc_quant_wsz=target_subc_quant_wsz
+            ):
+                adapted_count += 1
+                logger.info(
+                    "Adapted static fused MoE at %s to subc=%s for fused kernel",
+                    path or getattr(obj, "name", type(obj).__name__),
+                    target_subc_quant_wsz,
+                )
+            return
+
+        if hasattr(obj, "__dict__"):
+            for attr_name, attr_value in obj.__dict__.items():
+                child_path = f"{path}/{attr_name}" if path else attr_name
+                if isinstance(attr_value, nnx.Module):
+                    _adapt_recursive(attr_value, child_path, visited)
+                elif isinstance(attr_value, list):
+                    for idx, item in enumerate(attr_value):
+                        if isinstance(item, nnx.Module):
+                            item_path = f"{child_path}[{idx}]"
+                            _adapt_recursive(item, item_path, visited)
+
+    _adapt_recursive(model)
+    if adapted_count:
+        logger.info(
+            "Completed static fused MoE block-quant kernel adaptation on %d layer(s)",
+            adapted_count,
+        )
+    return model
+
+
 def quantize_tensor_simple(
     x: jax.Array, dtype: jnp.dtype, dim: int = -1, out_dtype: jnp.dtype = jnp.float32
 ):
@@ -201,7 +291,9 @@ def quantize_tensor_simple(
 
     x_abs_max = jnp.max(jnp.abs(x), axis=dim, keepdims=True)
     scale = x_abs_max / max_val
-    x_q = jnp.clip(x / scale, min_val, max_val).astype(dtype)
+    # Guard all-zero slices to avoid 0/0 -> NaN.
+    scale_safe = scale + (scale == 0).astype(scale.dtype)
+    x_q = jnp.clip(x / scale_safe, min_val, max_val).astype(dtype)
     return x_q, scale.astype(out_dtype)
 
 
@@ -270,9 +362,15 @@ def quantize_tensor(
         # shift its position by n.
         axis = [1 + n + i for n, i in enumerate(axis)]
 
+        input_sharding = getattr(tensor, "sharding", None)
+        blocked_out_sharding = _get_block_reshape_sharding(tensor, axis)
+
         # Flatten list of lists that contains (num_blocks, block).
         blocked_shape = list(itertools.chain(*blocked_shape))
-        tensor = tensor.reshape(blocked_shape)
+        if blocked_out_sharding is not None:
+            tensor = jax.lax.reshape(tensor, blocked_shape, out_sharding=blocked_out_sharding)
+        else:
+            tensor = tensor.reshape(blocked_shape)
 
     dtype_info = jnp.iinfo(dtype) if jnp.issubdtype(dtype, jnp.integer) else jnp.finfo(dtype)
 
@@ -285,7 +383,10 @@ def quantize_tensor(
     # Guard all-zero blocks/tensors: scale==0 would produce 0/0 -> NaN.
     scale_safe = scale + (scale == 0).astype(scale.dtype)
     tensor_q = jnp.clip(tensor / scale_safe, dtype_min, dtype_max)
-    tensor_q = tensor_q.reshape(orig_shape)
+    if block_size is not None and isinstance(input_sharding, NamedSharding):
+        tensor_q = jax.lax.reshape(tensor_q, orig_shape, out_sharding=input_sharding)
+    else:
+        tensor_q = tensor_q.reshape(orig_shape)
     tensor_q = tensor_q.astype(dtype)
 
     # To avoid padded values affecting output of quantized matmul, we mask them

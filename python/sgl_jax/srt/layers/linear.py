@@ -1,41 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Linear layers."""
+
+import math
 from collections.abc import Sequence
 from functools import partial
 
 import jax
+import jax.numpy as jnp
 from flax import nnx
-from jax import lax
-from jax import numpy as jnp
 from jax import shard_map
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
+from jax.sharding import NamedSharding, PartitionSpec as P
 
 from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
-from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
 
 class LinearBase(nnx.Module):
-    """Base linear layer.
-
-    Args:
-        input_size: input dimension of the linear layer.
-        output_size: output dimension of the linear layer.
-        use_bias: If true, add bias.
-        skip_bias_add: If true, skip adding bias but instead return it.
-        params_dtype: Data type for the parameters.
-        partition_spec: Partition spec for the linear layer.
-    """
+    """Base class for all linear layers."""
 
     def __init__(
         self,
         input_size: int,
         output_size: int,
-        mesh: jax.sharding.Mesh,
         use_bias: bool = True,
+        mesh: jax.sharding.Mesh | None = None,
         skip_bias_add: bool = False,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         kernel_axes: Sequence[str | None] | None = None,
         scope_name: str = "linear_base",
+        use_weight_scale: bool = False,
     ):
         """Initialize parameters and quantization method."""
         self.skip_bias_add = skip_bias_add
@@ -43,6 +36,7 @@ class LinearBase(nnx.Module):
         self.kernel_axes = kernel_axes
         self.mesh = mesh
         self.name = scope_name
+
         self.weight = nnx.Param(
             jax.random.normal(
                 jax.random.PRNGKey(0),
@@ -51,57 +45,55 @@ class LinearBase(nnx.Module):
                 out_sharding=P(*kernel_axes),
             ),
         )
+        if use_weight_scale:
+            self.weight_scale = nnx.Param(jnp.ones((output_size,), dtype=jnp.float32))
         if use_bias:
             self.bias = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
                     (output_size,),
                     dtype=params_dtype,
-                    out_sharding=P(
-                        kernel_axes[-1],
-                    ),
+                    out_sharding=P(kernel_axes[1]),
                 ),
             )
         else:
             self.bias = None
 
-    @named_scope
-    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
-        """Forward pass of the linear layer."""
-        bias = self.bias if not self.skip_bias_add else None
-        output_pspec = P(*([None] * (x.ndim - 1)), self.kernel_axes[-1])
-        output_sharding = NamedSharding(self.mesh, output_pspec)
-        output = lax.dot_general(
-            x,
-            self.weight.value,
-            (((x.ndim - 1,), (0,)), ((), ())),
-            preferred_element_type=self.params_dtype,
-            out_sharding=output_sharding,
-        )
-        if bias is not None:
-            output = output + bias.value
-        output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
+    def __call__(self, x: jax.Array) -> jax.Array | tuple[jax.Array, jax.Array]:
+        """Forward pass."""
+        x_2d = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
+
+        if self.mesh is not None and self.kernel_axes is not None:
+            input_axis, output_axis = self.kernel_axes[0], self.kernel_axes[1]
+
+            def _sharded_dot(lhs: jax.Array, rhs: jax.Array) -> jax.Array:
+                y = jnp.dot(lhs, rhs)
+                if input_axis is not None:
+                    y = jax.lax.psum(y, input_axis)
+                return y
+
+            out = shard_map(
+                _sharded_dot,
+                mesh=self.mesh,
+                in_specs=(P(None, input_axis), P(input_axis, output_axis)),
+                out_specs=P(None, output_axis),
+                check_vma=False,
+            )(x_2d, self.weight.value)
+        else:
+            out = jnp.dot(x_2d, self.weight.value)
+
+        if x.ndim > 2:
+            out = out.reshape(x.shape[:-1] + (out.shape[-1],))
+
+        if self.skip_bias_add:
+            return out, (self.bias.value if self.bias is not None else None)
+        if self.bias is not None:
+            return out + self.bias.value
+        return out, None
 
 
 class QuantizedLinear(nnx.Module):
-    """Quantized linear layer using native quantized matmul.
-
-    This layer stores pre-quantized weights and scales, and uses the native
-    quantized matmul kernel for the forward pass. Weights are quantized once
-    at initialization/conversion time, and activations are quantized at runtime.
-
-    Args:
-        weight_q: Quantized weight tensor [output_size, input_size]
-        weight_scale: Weight quantization scale [output_size] for per-channel
-        bias: Optional bias tensor [output_size]
-        activation_dtype: Dtype for activation quantization (None = no activation quantization)
-        mesh: Device mesh for sharding
-        kernel_axes: Partition spec axes for the weight tensor
-        skip_bias_add: If true, skip adding bias but instead return it
-        params_dtype: Original data type of the parameters (for output casting)
-        scope_name: Name for profiling scope
-    """
+    """Linear layer with pre-quantized weights."""
 
     def __init__(
         self,
@@ -114,6 +106,7 @@ class QuantizedLinear(nnx.Module):
         skip_bias_add: bool = False,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         compute_dtype: jnp.dtype | None = None,
+        weight_block_size: tuple[int, int] | None = None,
         scope_name: str = "quantized_linear",
     ):
         """Initialize the quantized linear layer with pre-quantized weights."""
@@ -126,136 +119,125 @@ class QuantizedLinear(nnx.Module):
         self.skip_bias_add = skip_bias_add
         self.params_dtype = params_dtype
         self.compute_dtype = compute_dtype
+        self.weight_block_size = weight_block_size
         self.name = scope_name
-
-        # Determine if we need tensor parallel reduction
-        # kernel_axes[0] is input axis, kernel_axes[1] is output axis
-        # For row-parallel (e.g., o_proj): kernel_axes = ("tensor", None)
-        #   -> input is sharded, need psum over "tensor"
-        # For column-parallel (e.g., q_proj): kernel_axes = (None, "tensor")
-        #   -> input is replicated, no psum needed
-        self.reduce_axis = kernel_axes[0]  # Axis to reduce over (or None)
 
     @classmethod
     def from_linear(
         cls,
-        linear: "LinearBase",
+        linear: LinearBase,
         weight_dtype: jnp.dtype,
         activation_dtype: jnp.dtype | None = None,
         is_static_input: bool = False,
+        weight_block_size: Sequence[int] | None = None,
     ) -> "QuantizedLinear":
-        """Convert a LinearBase layer to a QuantizedLinear layer.
+        """Convert a LinearBase layer to a QuantizedLinear layer."""
+        effective_weight_block_size = (
+            tuple(weight_block_size) if weight_block_size is not None else None
+        )
 
-        Uses per-channel weight quantization and dynamic per-token activation quantization.
-
-        Args:
-            linear: The LinearBase layer to convert
-            weight_dtype: Target dtype for weight quantization (e.g., jnp.int8, jnp.float8_e4m3fn)
-            activation_dtype: Target dtype for activation quantization (None = no activation quantization)
-
-        Returns:
-            A new QuantizedLinear layer with quantized weights
-        """
         if is_static_input:
-            w_shape = linear.weight.shape
-            input_size, output_size = w_shape[0], w_shape[1]
-            weight_q = jnp.zeros((output_size, input_size), dtype=weight_dtype)
-            weight_scale = jnp.zeros((output_size,), dtype=jnp.float32)
-            bias = linear.bias.value if linear.bias is not None else None
-        else:
-            # LinearBase weight shape: [input_size, output_size]
-            # xla_quantized_matmul expects w_q: [output_size, input_size]
-            # So we need to transpose the weight before quantizing
+            # Static checkpoint already stores pre-quantized weights and scales.
             weight = linear.weight.value
-            weight_t = weight.T  # [output_size, input_size]
 
-            # Per-channel quantization along output dimension
-            # After transpose, output_size is axis 0, input_size is axis 1
-            # We want per-output-channel, so reduce along axis 1 (input features)
-            weight_q, weight_scale = quantize_tensor(
-                dtype=weight_dtype,
-                tensor=weight_t,
-                axis=1,
-            )
+            if isinstance(weight, jax.ShapeDtypeStruct):
+                in_features, out_features = map(int, weight.shape)
+                kernel_axes = linear.kernel_axes or (None, None)
+                wq_sharding = NamedSharding(linear.mesh, P(kernel_axes[1], kernel_axes[0]))
+                weight_q = jax.ShapeDtypeStruct(
+                    shape=(out_features, in_features),
+                    dtype=weight_dtype,
+                    sharding=wq_sharding,
+                )
 
-            # Get bias if it exists
+                if effective_weight_block_size is not None and len(effective_weight_block_size) == 2:
+                    block_n, block_k = int(effective_weight_block_size[0]), int(effective_weight_block_size[1])
+                    out_blocks = (out_features + block_n - 1) // block_n
+                    in_blocks = (in_features + block_k - 1) // block_k
+                    scale_sharding = NamedSharding(linear.mesh, P(kernel_axes[1], kernel_axes[0]))
+                    weight_scale = jax.ShapeDtypeStruct(
+                        shape=(out_blocks, in_blocks), dtype=jnp.float32, sharding=scale_sharding
+                    )
+                else:
+                    scale_sharding = NamedSharding(linear.mesh, P(kernel_axes[1]))
+                    weight_scale = jax.ShapeDtypeStruct(
+                        shape=(out_features,), dtype=jnp.float32, sharding=scale_sharding
+                    )
+                bias = linear.bias.value if linear.bias is not None else None
+            else:
+                weight_q = weight.T.astype(weight_dtype)
+                if effective_weight_block_size is not None and len(effective_weight_block_size) == 2:
+                    block_n, block_k = int(effective_weight_block_size[0]), int(effective_weight_block_size[1])
+                    out_blocks = (weight_q.shape[0] + block_n - 1) // block_n
+                    in_blocks = (weight_q.shape[1] + block_k - 1) // block_k
+                    weight_scale = jnp.ones((out_blocks, in_blocks), dtype=jnp.float32)
+                else:
+                    weight_scale = jnp.ones((weight_q.shape[0],), dtype=jnp.float32)
+                bias = linear.bias.value if linear.bias is not None else None
+        else:
+            weight = linear.weight.value
+            weight_t = weight.T 
+
+            if effective_weight_block_size is not None and len(effective_weight_block_size) == 2:
+                weight_q, weight_scale = quantize_tensor(
+                    dtype=weight_dtype, tensor=weight_t, axis=(0, 1),
+                    block_size=tuple(effective_weight_block_size), pad_tensor=True,
+                )
+            else:
+                weight_q, weight_scale = quantize_tensor(dtype=weight_dtype, tensor=weight_t, axis=1)
+
             bias = linear.bias.value if linear.bias is not None else None
 
         return cls(
-            weight_q=weight_q,
-            weight_scale=weight_scale,
-            bias=bias,
-            activation_dtype=activation_dtype,
-            mesh=linear.mesh,
+            weight_q=weight_q, weight_scale=weight_scale, bias=bias,
+            activation_dtype=activation_dtype, mesh=linear.mesh,
             kernel_axes=linear.kernel_axes,
-            skip_bias_add=linear.skip_bias_add,
-            params_dtype=linear.params_dtype,
+            skip_bias_add=linear.skip_bias_add or linear.bias is None,
+            params_dtype=linear.params_dtype, weight_block_size=effective_weight_block_size,
             scope_name=f"quantized_{linear.name}",
         )
 
-    @named_scope
-    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
-        """Forward pass using quantized matmul.
-
-        Args:
-            x: Input tensor [..., input_size]
-
-        Returns:
-            Tuple of (output, bias) where output is [..., output_size]
-            and bias is returned if skip_bias_add is True
-        """
-        # Determine if we should quantize activations
+    def __call__(self, x: jax.Array) -> jax.Array | tuple[jax.Array, jax.Array]:
+        """Forward pass with quantization."""
         quantize_activation = self.activation_dtype is not None
-
-        # Handle batched inputs by reshaping to 2D
-        orig_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
 
         scale_val = self.weight_scale.value
-        if scale_val.ndim == 2 and scale_val.shape[1] == 1:
+        if scale_val.ndim == 2 and scale_val.shape[1] == 1 and scale_val.shape[0] == self.weight_q.value.shape[0]:
             scale_val = jnp.squeeze(scale_val, axis=1)
-        # Use shard_map for local computation with single all-reduce
-        # kernel_axes[0] = input sharding axis (e.g., "tensor" for o_proj, None for q_proj)
-        # kernel_axes[1] = output sharding axis (e.g., None for o_proj, "tensor" for q_proj)
-        #
-        # Weight w_q has shape [output_size, input_size]
-        # After transpose from LinearBase, its sharding is P(kernel_axes[1], kernel_axes[0])
-        # e.g., for o_proj with kernel_axes=("tensor", None): w_q has P(None, "tensor")
-        input_axis = self.kernel_axes[0]
-        output_axis = self.kernel_axes[1]
 
-        # Input x sharding: for row-parallel, x is P(None, input_axis)
-        # Weight w_q sharding: P(output_axis, input_axis)
-        # Weight scale sharding: P(output_axis) - per output channel
-        # Output sharding: P(None, output_axis)
-        in_specs = (
-            P(None, input_axis),  # x
-            P(output_axis, input_axis),  # w_q
-            P(output_axis),  # w_scale
-        )
+        input_axis, output_axis = self.kernel_axes[0], self.kernel_axes[1]
+        w_scale_spec = P(output_axis) if scale_val.ndim == 1 else P(output_axis, input_axis)
+        
+        in_specs = (P(None, input_axis), P(output_axis, input_axis), w_scale_spec)
         out_specs = P(None, output_axis)
+
+        # Handle block size inference
+        effective_weight_block_size = self.weight_block_size
+        if scale_val.ndim == 2 and self.weight_block_size is not None:
+            global_out_size, global_in_size = self.weight_q.value.shape
+            inferred_bs_out = math.ceil(global_out_size / scale_val.shape[0])
+            inferred_bs_in = math.ceil(global_in_size / scale_val.shape[1])
+            if (inferred_bs_out != self.weight_block_size[0] or inferred_bs_in != self.weight_block_size[1]):
+                effective_weight_block_size = (inferred_bs_out, inferred_bs_in)
 
         output = shard_map(
             partial(
                 xla_quantized_matmul_local,
                 quantize_activation=quantize_activation,
-                reduce_axis=input_axis,  # psum over input axis (e.g., "tensor" for o_proj)
+                reduce_axis=input_axis,
                 compute_dtype=self.compute_dtype,
+                weight_block_size=effective_weight_block_size,
+                activation_quant_dtype=self.activation_dtype,
             ),
-            mesh=self.mesh,
-            in_specs=in_specs,
-            out_specs=out_specs,
-            check_vma=False,
+            mesh=self.mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False,
         )(x_2d, self.weight_q.value, scale_val)
 
-        # Reshape back to original batch dimensions
         if x.ndim > 2:
-            output = output.reshape(*orig_shape[:-1], output.shape[-1])
+            output = output.reshape(x.shape[:-1] + (output.shape[-1],))
 
-        # Handle bias
-        bias = self.bias if not self.skip_bias_add else None
-        if bias is not None:
-            output = output + bias.value
-        output_bias = self.bias if self.skip_bias_add else None
-
-        return output, output_bias
+        if self.skip_bias_add:
+            return output, (self.bias.value if self.bias is not None else None)
+        if self.bias is not None:
+            return output + self.bias.value
+        return output

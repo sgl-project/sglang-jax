@@ -1,0 +1,190 @@
+# SPDX-License-Identifier: Apache-2.0
+from collections import namedtuple
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from jax.sharding import Mesh
+
+import sgl_jax.srt.kernels.quantized_matmul.kernel as quant_kernel
+from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
+from sgl_jax.srt.layers.linear import QuantizedLinear
+from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
+
+
+def _create_single_device_mesh():
+    return Mesh(np.array(jax.devices()[:1]).reshape(1, 1), axis_names=("data", "tensor"))
+
+
+def _make_linear_test_inputs():
+    batch, in_dim, out_dim = 2, 256, 512
+    compute_dtype = jnp.bfloat16
+    key = jax.random.PRNGKey(42)
+    k_x, k_w = jax.random.split(key)
+    x = jax.random.normal(k_x, (batch, in_dim), dtype=compute_dtype)
+    w_fp = jax.random.normal(k_w, (out_dim, in_dim), dtype=compute_dtype)
+    return x, w_fp, compute_dtype
+
+
+def _quantize_linear_weight(weight, weight_dtype, scale_format):
+    weight_f32 = weight.astype(jnp.float32)
+
+    if scale_format == "per_channel":
+        weight_q, weight_scale = quantize_tensor(
+            dtype=weight_dtype,
+            tensor=weight_f32,
+            axis=1,
+        )
+        return weight_q, weight_scale, None
+
+    if scale_format == "block_channel":
+        weight_q, weight_scale = quantize_tensor(
+            dtype=weight_dtype,
+            tensor=weight_f32,
+            axis=1,
+            block_size=128,
+        )
+        return weight_q, weight_scale, (1, 128)
+
+    if scale_format == "block_quant":
+        weight_q, weight_scale = quantize_tensor(
+            dtype=weight_dtype,
+            tensor=weight_f32,
+            axis=(0, 1),
+            block_size=(128, 128),
+        )
+        return weight_q, weight_scale, (128, 128)
+
+    raise ValueError(f"Unsupported scale_format={scale_format}")
+
+
+def _assert_close(name, out, ref_out):
+    diff = jnp.abs(out - ref_out)
+    mae = jnp.mean(diff)
+    max_diff = jnp.max(diff)
+    rel_error = mae / jnp.mean(jnp.abs(ref_out))
+
+    print(f"\n>>> {name} <<<")
+    print(f"  MAE (Mean Absolute Error): {mae.item():.6f}")
+    print(f"  Max Absolute Difference:  {max_diff.item():.6f}")
+    print(f"  Relative Error:           {rel_error.item():.6%}")
+
+    assert rel_error.item() < 0.05, f"Relative error too high: {rel_error.item():.6%}"
+
+
+@pytest.mark.parametrize(
+    "scale_format",
+    ["per_channel", "block_channel", "block_quant"],
+    ids=["per-channel", "block-channel", "block-quant"],
+)
+def test_quantized_linear_offline_scale_formats(scale_format):
+    x, w_fp, compute_dtype = _make_linear_test_inputs()
+    mesh = _create_single_device_mesh()
+    weight_q, weight_scale, weight_block_size = _quantize_linear_weight(
+        w_fp,
+        jnp.int8,
+        scale_format,
+    )
+
+    quant_linear = QuantizedLinear(
+        weight_q=weight_q,
+        weight_scale=weight_scale,
+        bias=None,
+        activation_dtype=None,
+        mesh=mesh,
+        kernel_axes=(None, None),
+        params_dtype=compute_dtype,
+        compute_dtype=compute_dtype,
+        weight_block_size=weight_block_size,
+    )
+
+    ref_out = jnp.dot(x, w_fp.T)
+    out = quant_linear(x)
+
+    _assert_close(f"Offline QuantizedLinear ({scale_format})", out, ref_out)
+
+
+def _run_block_quant_kernel_test(weight_dtype, dtype_name):
+    x, w_fp, compute_dtype = _make_linear_test_inputs()
+    weight_q, weight_scale, weight_block_size = _quantize_linear_weight(
+        w_fp,
+        weight_dtype,
+        "block_quant",
+    )
+
+    ref_out = jnp.dot(x, w_fp.T)
+    out = xla_quantized_matmul_local(
+        x=x,
+        w_q=weight_q,
+        w_scale=weight_scale,
+        quantize_activation=False,
+        compute_dtype=compute_dtype,
+        weight_block_size=weight_block_size,
+    )
+
+    _assert_close(f"Block Quant Kernel ({dtype_name})", out, ref_out)
+
+
+def test_xla_quantized_matmul_block_quant_all():
+    _run_block_quant_kernel_test(jnp.int8, "INT8")
+
+    if hasattr(jnp, "float8_e4m3fn"):
+        _run_block_quant_kernel_test(jnp.float8_e4m3fn, "FP8_E4M3")
+
+
+def _assert_blockwise_tuning_fallback_uses_compatible_seed():
+    key_cls = namedtuple(
+        "FakeTunedKey",
+        ["tpu_version", "n_batch", "n_out", "n_in", "x_q_dtype", "w_q_dtype"],
+    )
+    tuned_value_cls = namedtuple(
+        "FakeTunedValue",
+        ["batch_block_size", "out_block_size", "in_block_size", "n_lane_multiplier"],
+    )
+
+    fake_tuned_table = {
+        key_cls(6, 16, 1024, 4096, "int8", "int8"): tuned_value_cls(16, 1024, 2048, 1),
+        key_cls(6, 16, 4096, 4096, "int8", "int8"): tuned_value_cls(16, 1024, 4096, 1),
+    }
+
+    saved_state = {
+        "_TRIED_LOADING_BLOCKWISE_3RD_TUNING": quant_kernel._TRIED_LOADING_BLOCKWISE_3RD_TUNING,
+        "_BLOCKWISE_3RD_TUNED_VALUE_CLS": quant_kernel._BLOCKWISE_3RD_TUNED_VALUE_CLS,
+        "_BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES": quant_kernel._BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES,
+        "_BLOCKWISE_3RD_TUNED_BLOCK_SIZES": quant_kernel._BLOCKWISE_3RD_TUNED_BLOCK_SIZES,
+    }
+    try:
+        quant_kernel._TRIED_LOADING_BLOCKWISE_3RD_TUNING = True
+        quant_kernel._BLOCKWISE_3RD_TUNED_VALUE_CLS = tuned_value_cls
+        quant_kernel._BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES = None
+        quant_kernel._BLOCKWISE_3RD_TUNED_BLOCK_SIZES = fake_tuned_table
+
+        tuned = quant_kernel._get_safe_blockwise_tuned_value(
+            n_batch=1,
+            n_out=256,
+            n_in=4096,
+            x_q_dtype=jnp.bfloat16,
+            w_q_dtype=jnp.int8,
+            block_size_in=128,
+        )
+    finally:
+        for name, value in saved_state.items():
+            setattr(quant_kernel, name, value)
+
+    assert tuned.batch_block_size == 1
+    assert tuned.out_block_size == 256
+    assert tuned.in_block_size in (2048, 4096)
+    assert tuned.in_block_size != 128
+
+
+def test_blockwise_tuning_fallback_uses_compatible_seed(monkeypatch):
+    del monkeypatch
+    _assert_blockwise_tuning_fallback_uses_compatible_seed()
+
+
+if __name__ == "__main__":
+    for fmt in ("per_channel", "block_channel", "block_quant"):
+        test_quantized_linear_offline_scale_formats(fmt)
+    test_xla_quantized_matmul_block_quant_all()
+    _assert_blockwise_tuning_fallback_uses_compatible_seed()
