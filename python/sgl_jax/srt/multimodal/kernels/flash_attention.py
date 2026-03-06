@@ -14,6 +14,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.multimodal.kernels.tuned_block_sizes import get_tuned_block_sizes
+
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 NUM_LANES = 128
 NUM_SUBLANES = 8
@@ -177,8 +179,11 @@ def flash_attention(
         # todo: tune the block sizes properly.
         if kv_seq_len <= 92800:
             # Override block_k/block_k_major to use `_flash_attention_kernel_single_batch_single_step`.
+            bq = get_tuned_block_sizes(
+                q.dtype, k.dtype, v.dtype, batch_size, num_heads, q_seq_len, kv_seq_len, d_model
+            )
             block_sizes = BlockSizes(
-                block_q=block_sizes.block_q,
+                block_q=bq,
                 block_b=block_sizes.block_b,
                 block_k_major=kv_seq_len,
                 block_k=kv_seq_len,
