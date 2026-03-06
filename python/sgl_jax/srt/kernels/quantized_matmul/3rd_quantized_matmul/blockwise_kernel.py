@@ -1,3 +1,4 @@
+# Adapted from https://github.com/vllm-project/tpu-inference/blob/main/tpu_inference/kernels/quantized_matmul/blockwise_kernel.py
 # SPDX-License-Identifier: Apache-2.0
 """Quantized matmul kernel with blockwise quantization support."""
 
@@ -83,7 +84,7 @@ def quantized_matmul_kernel(
     padded_n_out = next_multiple(orig_n_out, out_block_size)
     if orig_n_out < padded_n_out:
         w_q = jnp.pad(w_q, ((0, padded_n_out - orig_n_out), (0, 0)))
-        w_scale = jnp.pad(w_scale, (0, padded_n_out - orig_n_out))
+        w_scale = jnp.pad(w_scale, ((0, 0), (0, 0), (0, padded_n_out - orig_n_out)))
     padded_n_in = next_multiple(orig_n_in, in_block_size)
     if orig_n_in < padded_n_in:
         x = jnp.pad(x, ((0, 0), (0, padded_n_in - orig_n_in)))
@@ -135,16 +136,20 @@ def quantized_matmul_kernel(
     def kernel(lhs_ref, rhs_ref, w_scales_ref, out_ref, acc_scratch):
         pid_k = pl.program_id(2)
         is_first_step = pid_k == 0
-        is_last_step = pid_k == (orig_n_in // in_block_size - 1)
+        is_last_step = pid_k == (n_in - 1)
 
         def accum(is_first_step, is_last_step):
             accumulators = [None] * steps_n
 
             for i in range(steps_k):
                 k_start, k_end = i * block_size, (i + 1) * block_size
-                lhs_sub = lhs_ref[:, k_start:k_end].astype(jnp.float32)
-                lhs_q, lhs_scale = util.quantize_block(lhs_sub, 1, x_q_dtype)
-                lhs_scale = lhs_scale.astype(acc_dtype)
+                if quantize_activation:
+                    lhs_sub = lhs_ref[:, k_start:k_end].astype(jnp.float32)
+                    lhs_q, lhs_scale = util.quantize_block(lhs_sub, 1, x_q_dtype)
+                    lhs_scale = lhs_scale.astype(acc_dtype)
+                else:
+                    lhs_q = lhs_ref[:, k_start:k_end]
+                    lhs_scale = None
 
                 rhs_q_full = rhs_ref[:, k_start:k_end]
                 rhs_scale_full = w_scales_ref[i, :, :].astype(acc_dtype)
@@ -166,7 +171,8 @@ def quantized_matmul_kernel(
                         preferred_element_type=preferred_element_type,
                     )
                     res = dot_res.astype(acc_dtype)
-                    res = res * lhs_scale
+                    if lhs_scale is not None:
+                        res = res * lhs_scale
                     res = res * rhs_scale_slice
                     if i == 0:
                         accumulators[j] = res

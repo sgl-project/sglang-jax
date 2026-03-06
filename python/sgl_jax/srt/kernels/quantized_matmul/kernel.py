@@ -15,6 +15,7 @@ _BLOCKWISE_3RD_KERNEL = None
 _TRIED_LOADING_BLOCKWISE_3RD_KERNEL = False
 _BLOCKWISE_3RD_TUNED_VALUE_CLS = None
 _BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES = None
+_BLOCKWISE_3RD_TUNED_BLOCK_SIZES = None
 _TRIED_LOADING_BLOCKWISE_3RD_TUNING = False
 
 
@@ -39,10 +40,15 @@ def _get_blockwise_3rd_tuning_api():
     """Lazily load third-party tuned-size helpers for blockwise kernel."""
     global _BLOCKWISE_3RD_TUNED_VALUE_CLS
     global _BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES
+    global _BLOCKWISE_3RD_TUNED_BLOCK_SIZES
     global _TRIED_LOADING_BLOCKWISE_3RD_TUNING
 
     if _TRIED_LOADING_BLOCKWISE_3RD_TUNING:
-        return _BLOCKWISE_3RD_TUNED_VALUE_CLS, _BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES
+        return (
+            _BLOCKWISE_3RD_TUNED_VALUE_CLS,
+            _BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES,
+            _BLOCKWISE_3RD_TUNED_BLOCK_SIZES,
+        )
     _TRIED_LOADING_BLOCKWISE_3RD_TUNING = True
 
     try:
@@ -50,17 +56,89 @@ def _get_blockwise_3rd_tuning_api():
         module = importlib.import_module(f"{package}.3rd_quantized_matmul.tuned_block_sizes")
         _BLOCKWISE_3RD_TUNED_VALUE_CLS = getattr(module, "TunedValue", None)
         _BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES = getattr(module, "get_tuned_block_sizes", None)
+        _BLOCKWISE_3RD_TUNED_BLOCK_SIZES = getattr(module, "TUNED_BLOCK_SIZES", None)
     except Exception:
         _BLOCKWISE_3RD_TUNED_VALUE_CLS = None
         _BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES = None
+        _BLOCKWISE_3RD_TUNED_BLOCK_SIZES = None
 
-    return _BLOCKWISE_3RD_TUNED_VALUE_CLS, _BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES
+    return (
+        _BLOCKWISE_3RD_TUNED_VALUE_CLS,
+        _BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES,
+        _BLOCKWISE_3RD_TUNED_BLOCK_SIZES,
+    )
 
 
 def _next_multiple(x: int, m: int) -> int:
     if m <= 0:
         return x
     return ((x + m - 1) // m) * m
+
+
+def _floor_multiple(x: int, m: int) -> int:
+    if m <= 0:
+        return x
+    return max(m, (x // m) * m)
+
+
+def _nearest_power_of_two_multiple(x: int, base: int, upper_bound: int) -> int:
+    if base <= 0:
+        return x
+
+    x = max(base, x)
+    units = max(1, x // base)
+    lower_units = 1 << (units.bit_length() - 1)
+    upper_units = lower_units if lower_units == units else lower_units << 1
+
+    def _candidate(units_value: int) -> int:
+        return units_value * base
+
+    lower = _candidate(lower_units)
+    upper = _candidate(upper_units)
+    candidates = [value for value in (lower, upper) if value <= upper_bound]
+    if not candidates:
+        candidates = [lower]
+
+    return min(candidates, key=lambda value: (abs(value - x), -value))
+
+
+def _iter_blockwise_tuned_candidates(
+    tuned_block_sizes: dict | None,
+    n_batch: int,
+    n_out: int,
+    n_in: int,
+    x_q_dtype: jnp.dtype,
+    w_q_dtype: jnp.dtype,
+):
+    if not tuned_block_sizes:
+        return []
+
+    x_q_dtype_name = jnp.dtype(x_q_dtype).name
+    w_q_dtype_name = jnp.dtype(w_q_dtype).name
+    compatible_x_dtype_names = [x_q_dtype_name]
+    if jnp.issubdtype(w_q_dtype, jnp.integer) and x_q_dtype_name != "int8":
+        compatible_x_dtype_names.append("int8")
+
+    candidates = []
+    for key, value in tuned_block_sizes.items():
+        if key.w_q_dtype != w_q_dtype_name:
+            continue
+        if key.x_q_dtype not in compatible_x_dtype_names:
+            continue
+
+        score = (
+            compatible_x_dtype_names.index(key.x_q_dtype),
+            key.n_in != n_in,
+            abs(key.n_in - n_in),
+            key.n_batch != n_batch,
+            abs(key.n_batch - n_batch),
+            key.n_out != n_out,
+            abs(key.n_out - n_out),
+        )
+        candidates.append((score, value))
+
+    candidates.sort(key=lambda item: item[0])
+    return [value for _, value in candidates]
 
 
 def _get_safe_blockwise_tuned_value(
@@ -72,12 +150,22 @@ def _get_safe_blockwise_tuned_value(
     block_size_in: int,
 ):
     """Build a safe tuned value for third-party blockwise kernel on TPU."""
-    tuned_value_cls, get_tuned_block_sizes = _get_blockwise_3rd_tuning_api()
+    tuned_value_cls, get_tuned_block_sizes, tuned_block_sizes = _get_blockwise_3rd_tuning_api()
     if tuned_value_cls is None:
         return None
 
     tuned = None
-    if get_tuned_block_sizes is not None:
+    compatible_candidates = _iter_blockwise_tuned_candidates(
+        tuned_block_sizes=tuned_block_sizes,
+        n_batch=n_batch,
+        n_out=n_out,
+        n_in=n_in,
+        x_q_dtype=x_q_dtype,
+        w_q_dtype=w_q_dtype,
+    )
+    if compatible_candidates:
+        tuned = compatible_candidates[0]
+    elif get_tuned_block_sizes is not None:
         try:
             tuned = get_tuned_block_sizes(
                 n_batch=n_batch,
@@ -94,10 +182,17 @@ def _get_safe_blockwise_tuned_value(
     n_lane_multiplier = max(1, int(tuned.n_lane_multiplier))
     compute_tile_n = 256 * n_lane_multiplier
 
-    batch_block_size = max(1, int(tuned.batch_block_size))
+    batch_block_size = max(1, min(int(tuned.batch_block_size), int(n_batch)))
     out_block_size = _next_multiple(max(int(tuned.out_block_size), compute_tile_n), compute_tile_n)
+    out_block_size = min(out_block_size, _floor_multiple(int(n_out), compute_tile_n))
+    out_block_size = _nearest_power_of_two_multiple(
+        out_block_size,
+        compute_tile_n,
+        _floor_multiple(int(n_out), compute_tile_n),
+    )
     in_block_size = max(int(tuned.in_block_size), int(block_size_in))
     in_block_size = _next_multiple(in_block_size, int(block_size_in))
+    in_block_size = min(in_block_size, _floor_multiple(int(n_in), int(block_size_in)))
 
     return tuned_value_cls(batch_block_size, out_block_size, in_block_size, n_lane_multiplier)
 

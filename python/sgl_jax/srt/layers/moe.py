@@ -312,6 +312,76 @@ class EPMoE(nnx.Module):
         except Exception as _:
             return False, "cpu"
 
+    def _normalize_scale_for_gmm(
+        self,
+        scale: jax.Array | None,
+        weight: jax.Array,
+        *,
+        scale_name: str,
+    ) -> jax.Array | None:
+        if scale is None:
+            return None
+
+        num_experts, out_dim, in_dim = weight.shape
+
+        if scale.ndim == 4:
+            return scale
+
+        if scale.ndim == 2 and scale.shape == (num_experts, out_dim):
+            return scale[:, None, None, :]
+
+        if scale.ndim == 3:
+            if scale.shape == (num_experts, 1, out_dim):
+                return scale[:, :, None, :]
+
+            # Support offline 2D block quant checkpoints whose scales are stored as
+            # [num_experts, out_blocks, in_blocks]. GMM expects [E, k_blocks, 1, out_dim].
+            if (
+                self.weight_block_size is not None
+                and isinstance(self.weight_block_size, (list, tuple))
+                and len(self.weight_block_size) == 2
+            ):
+                block_size_out = int(self.weight_block_size[0])
+                block_size_k = int(self.weight_block_size[1])
+                expected_out_blocks = (out_dim + block_size_out - 1) // block_size_out
+                expected_k_blocks = (in_dim + block_size_k - 1) // block_size_k
+
+                if scale.shape == (num_experts, out_dim, expected_k_blocks):
+                    final_scale_sharding = (
+                        P("expert", None, None, None)
+                        if scale_name == "wo_scale"
+                        else P("expert", None, None, "tensor")
+                    )
+                    scale_gmm = jnp.transpose(scale, (0, 2, 1))[:, :, None, :]
+                    return jax.sharding.reshard(scale_gmm, final_scale_sharding)
+
+                if scale.shape == (num_experts, expected_out_blocks, expected_k_blocks):
+                    scale_per_out_sharding = (
+                        P("expert", None, None)
+                        if scale_name == "wo_scale"
+                        else P("expert", "tensor", None)
+                    )
+                    final_scale_sharding = (
+                        P("expert", None, None, None)
+                        if scale_name == "wo_scale"
+                        else P("expert", None, None, "tensor")
+                    )
+                    out_block_ids = jnp.arange(out_dim, dtype=jnp.int32) // block_size_out
+                    scale_per_out = scale.at[:, out_block_ids, :].get(
+                        out_sharding=scale_per_out_sharding
+                    )
+                    scale_gmm = jnp.transpose(scale_per_out, (0, 2, 1))[:, :, None, :]
+                    return jax.sharding.reshard(scale_gmm, final_scale_sharding)
+
+                if scale.shape == (num_experts, expected_k_blocks, out_dim):
+                    return scale[:, :, None, :]
+
+        raise ValueError(
+            f"Unsupported {scale_name} shape {scale.shape} for weight shape {weight.shape}. "
+            "Expected one of: [E, out_dim], [E, 1, out_dim], [E, k_blocks, 1, out_dim], "
+            "or offline block format [E, out_blocks, k_blocks]."
+        )
+
     def quantize_weights(self, is_static: bool = False):
         """Quantize MoE weights in-place or initialize params for static loading."""
         if self.quantized_dtype is None:
@@ -470,9 +540,21 @@ class EPMoE(nnx.Module):
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
 
-            w0_scale = self.wi_0_scale.value if self.wi_0_scale is not None else None
-            w1_scale = self.wi_1_scale.value if self.wi_1_scale is not None else None
-            wo_scale = self.wo_scale.value if self.wo_scale is not None else None
+            w0_scale = self._normalize_scale_for_gmm(
+                self.wi_0_scale.value if self.wi_0_scale is not None else None,
+                self.wi_0.value,
+                scale_name="wi_0_scale",
+            )
+            w1_scale = self._normalize_scale_for_gmm(
+                self.wi_1_scale.value if self.wi_1_scale is not None else None,
+                self.wi_1.value,
+                scale_name="wi_1_scale",
+            )
+            wo_scale = self._normalize_scale_for_gmm(
+                self.wo_scale.value if self.wo_scale is not None else None,
+                self.wo.value,
+                scale_name="wo_scale",
+            )
 
             result = shard_map(
                 self._forward,

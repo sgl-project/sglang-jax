@@ -1,3 +1,4 @@
+# Adapted from https://github.com/vllm-project/tpu-inference/blob/main/tpu_inference/kernels/quantized_matmul/kernel.py
 # SPDX-License-Identifier: Apache-2.0
 """Quantized matmul kernel."""
 
@@ -184,7 +185,7 @@ def quantized_matmul_kernel(
     padded_n_out = next_multiple(orig_n_out, out_block_size)
     if orig_n_out < padded_n_out:
         w_q = jnp.pad(w_q, ((0, padded_n_out - orig_n_out), (0, 0)))
-        w_scale = jnp.pad(w_scale, (0, padded_n_out - orig_n_out))
+        w_scale = jnp.pad(w_scale, ((0, 0), (0, padded_n_out - orig_n_out)))
     padded_n_in = next_multiple(orig_n_in, in_block_size)
     if orig_n_in < padded_n_in:
         x = jnp.pad(x, ((0, 0), (0, padded_n_in - orig_n_in)))

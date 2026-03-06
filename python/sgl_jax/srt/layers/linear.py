@@ -8,8 +8,8 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax import shard_map
 from jax.sharding import NamedSharding, PartitionSpec as P
-from jax.experimental.shard_map import shard_map
 
 from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
@@ -61,12 +61,35 @@ class LinearBase(nnx.Module):
 
     def __call__(self, x: jax.Array) -> jax.Array | tuple[jax.Array, jax.Array]:
         """Forward pass."""
-        out = jnp.dot(x, self.weight.value)
+        x_2d = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
+
+        if self.mesh is not None and self.kernel_axes is not None:
+            input_axis, output_axis = self.kernel_axes[0], self.kernel_axes[1]
+
+            def _sharded_dot(lhs: jax.Array, rhs: jax.Array) -> jax.Array:
+                y = jnp.dot(lhs, rhs)
+                if input_axis is not None:
+                    y = jax.lax.psum(y, input_axis)
+                return y
+
+            out = shard_map(
+                _sharded_dot,
+                mesh=self.mesh,
+                in_specs=(P(None, input_axis), P(input_axis, output_axis)),
+                out_specs=P(None, output_axis),
+                check_vma=False,
+            )(x_2d, self.weight.value)
+        else:
+            out = jnp.dot(x_2d, self.weight.value)
+
+        if x.ndim > 2:
+            out = out.reshape(x.shape[:-1] + (out.shape[-1],))
+
+        if self.skip_bias_add:
+            return out, (self.bias.value if self.bias is not None else None)
         if self.bias is not None:
-            if self.skip_bias_add:
-                return out, self.bias.value
             return out + self.bias.value
-        return out
+        return out, None
 
 
 class QuantizedLinear(nnx.Module):
@@ -168,7 +191,8 @@ class QuantizedLinear(nnx.Module):
         return cls(
             weight_q=weight_q, weight_scale=weight_scale, bias=bias,
             activation_dtype=activation_dtype, mesh=linear.mesh,
-            kernel_axes=linear.kernel_axes, skip_bias_add=linear.skip_bias_add,
+            kernel_axes=linear.kernel_axes,
+            skip_bias_add=linear.skip_bias_add or linear.bias is None,
             params_dtype=linear.params_dtype, weight_block_size=effective_weight_block_size,
             scope_name=f"quantized_{linear.name}",
         )
@@ -212,7 +236,8 @@ class QuantizedLinear(nnx.Module):
         if x.ndim > 2:
             output = output.reshape(x.shape[:-1] + (output.shape[-1],))
 
+        if self.skip_bias_add:
+            return output, (self.bias.value if self.bias is not None else None)
         if self.bias is not None:
-            if self.skip_bias_add: return output, self.bias.value
             return output + self.bias.value
         return output
