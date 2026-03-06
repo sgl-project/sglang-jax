@@ -20,6 +20,7 @@ class TestFile:
     test_methods: Optional[List[str]] = (
         None  # Optional: specific test methods to run (e.g., ["TestClass.test_method"])
     )
+    runner: str = "python"
 
 
 def run_with_timeout(
@@ -92,7 +93,7 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
                     print(f"Running: python3 -m unittest {test_path}\n", flush=True)
 
                     process = subprocess.Popen(
-                        ["uv", "run", "python3", "-m", "unittest", test_path],
+                        [sys.executable, "-m", "unittest", test_path],
                         stdout=sys.stdout,
                         stderr=sys.stderr,
                         env=os.environ,
@@ -109,14 +110,18 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
                         cleanup_model_cache()
                         return process.returncode
             else:
-                # Run entire file (existing behavior)
+                if file.runner == "pytest":
+                    cmd = [sys.executable, "-m", "pytest", "-q", filename]
+                else:
+                    cmd = [sys.executable, filename]
+
                 print(
-                    f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {filename}\n.\n.\n",
+                    f".\n.\nBegin ({i}/{len(files) - 1}):\n{' '.join(cmd)}\n.\n.\n",
                     flush=True,
                 )
 
                 process = subprocess.Popen(
-                    ["uv", "run", "python3", filename],
+                    cmd,
                     stdout=sys.stdout,
                     stderr=sys.stderr,
                     env=os.environ,
@@ -409,8 +414,8 @@ suites = {
     ],
     "sglang_dependency_test": [],
     "unit-test-tpu-v6e-1": [
-        TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.1),
-        TestFile("python/sgl_jax/test/kernels/moe_block_quant_test.py", 0.1),
+        TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.1, runner="pytest"),
+        TestFile("python/sgl_jax/test/kernels/moe_block_quant_test.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/test_flashattention.py", 20),
         TestFile("python/sgl_jax/test/test_moe_topk.py", 1),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 10),
@@ -430,6 +435,7 @@ suites = {
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 1),
+        TestFile("python/sgl_jax/test/test_linear_tp.py", 1, runner="pytest"),
     ],
     "kernel-performance-test-tpu-v6e-1": [
         TestFile("benchmark/kernels/flash_attention/bench_flashattention.py", 5),
@@ -472,13 +478,14 @@ suites = {
         TestFile("test/srt/lora/test_static_lora.py", 10),
     ],
     "e2e-test-tpu-v6e-4": [
-        TestFile("test/srt/test_moe_block_quant_e2e.py", 5),
+        TestFile("test/srt/test_moe_block_quant_e2e.py", 5, runner="pytest"),
         TestFile("test/srt/openai_server/basic/test_tool_calls.py", 3),
         TestFile("test/srt/test_features.py", 10),
         TestFile("test/srt/test_chunked_prefill_size.py", 5),
         # TestFile("test/srt/test_sliding_window_attention.py", 30), # add after gpt-oss supported
         TestFile("test/srt/test_model_loader.py", 5),
         TestFile("test/srt/quantization/test_w8_quantization.py", 10),
+        TestFile("test/srt/quantization/test_w8_block_dynamic_quantization.py", 8, runner="pytest"),
         TestFile("test/srt/test_engine_determine_generation.py", 5),
         TestFile("test/srt/test_engine_flush_cache.py", 5),
         TestFile("test/srt/test_engine_pause_continue.py", 6),

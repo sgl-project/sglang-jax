@@ -1,3 +1,4 @@
+# Adapted from https://github.com/vllm-project/tpu-inference/blob/main/tpu_inference/kernels/quantized_matmul/util.py
 # SPDX-License-Identifier: Apache-2.0
 """Utility functions for quantized matmul kernel."""
 from typing import Any, Callable
