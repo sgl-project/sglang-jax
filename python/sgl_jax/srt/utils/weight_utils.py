@@ -192,6 +192,57 @@ class WeightLoader:
         )
         return map_np
 
+    def _maybe_convert_epmoe_scale_for_kernel(
+        self,
+        weight: jax.Array,
+        model_param: nnx.Variable,
+        target_path: str,
+    ) -> jax.Array:
+        """Convert offline EPMoE scales into the 4D layout expected by GMM."""
+        if not target_path.endswith(("wi_0_scale", "wi_1_scale", "wo_scale")):
+            return weight
+
+        if weight.ndim == 4 or model_param.value.ndim != 4:
+            return weight
+
+        num_experts, k_blocks, _, out_dim = model_param.value.shape
+        if weight.ndim == 2 and weight.shape == (num_experts, out_dim):
+            return weight[:, None, None, :]
+
+        if weight.ndim != 3:
+            return weight
+
+        if weight.shape == (num_experts, out_dim, k_blocks):
+            weight_host = np.asarray(jax.device_get(weight))
+            return jnp.asarray(np.transpose(weight_host, (0, 2, 1))[:, :, None, :])
+
+        if weight.shape == (num_experts, k_blocks, out_dim):
+            return weight[:, :, None, :]
+
+        quant_cfg = getattr(self.model_config, "quantization_config", None)
+        weight_block_size = getattr(quant_cfg, "weight_block_size", None)
+        if not (isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2):
+            return weight
+
+        block_size_out = int(weight_block_size[0])
+        if block_size_out <= 0:
+            return weight
+
+        expected_out_blocks = (out_dim + block_size_out - 1) // block_size_out
+        if weight.shape != (num_experts, expected_out_blocks, k_blocks):
+            return weight
+
+        logger.info(
+            "Converting offline EPMoE scale %s from shape %s to GMM layout %s",
+            target_path,
+            weight.shape,
+            model_param.value.shape,
+        )
+        weight_host = np.asarray(jax.device_get(weight))
+        out_block_ids = np.arange(out_dim, dtype=np.int32) // block_size_out
+        scale_per_out = np.take(weight_host, out_block_ids, axis=1)
+        return jnp.asarray(np.transpose(scale_per_out, (0, 2, 1))[:, :, None, :])
+
     def _scan_weight_info(self) -> dict[str, list[dict]]:
         """
         Scan all safetensors files to build a mapping from HF key to file info.
@@ -978,6 +1029,11 @@ class WeightLoader:
                     # 3. Direct assignment
                     target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
+                    stacked_weight = self._maybe_convert_epmoe_scale_for_kernel(
+                        stacked_weight,
+                        model_param,
+                        target_path,
+                    )
 
                     if is_static_quant and moe_key.endswith("_scale"):
                         logger.info(
@@ -1071,6 +1127,11 @@ class WeightLoader:
 
                     target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
+                    expert_weights = self._maybe_convert_epmoe_scale_for_kernel(
+                        expert_weights,
+                        model_param,
+                        target_path,
+                    )
 
                     if is_static_quant and moe_key.endswith("_scale"):
                         logger.info(

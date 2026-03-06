@@ -2,10 +2,21 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.sharding import Mesh, PartitionSpec as P
 from sgl_jax.srt.layers.moe import EPMoE
 
-def test_epmoe_block_quant_logic():
+
+@pytest.mark.parametrize(
+    ("weight_block_size", "expected_k_blocks_wi", "expected_k_blocks_wo"),
+    [
+        (None, 1, 1),
+        ([1, 128], 4, 8),
+        ([128, 128], 4, 8),
+    ],
+    ids=["per-channel", "block-channel", "block-quant"],
+)
+def test_epmoe_block_quant_logic(weight_block_size, expected_k_blocks_wi, expected_k_blocks_wo):
     """
     Test the block quantization logic of EPMoE on CPU.
     Focuses on weight/scale shapes and placeholder generation.
@@ -29,7 +40,7 @@ def test_epmoe_block_quant_logic():
         def get_moe_weight_dtype(self): return jnp.int8
         def get_moe_activation_dtype(self): return None
         @property
-        def weight_block_size(self): return [1, block_size]
+        def weight_block_size(self): return weight_block_size
         
     quant_config = MockQuantConfig()
     
@@ -64,8 +75,8 @@ def test_epmoe_block_quant_logic():
     
     # 5. Assert Scale Shapes
     # EPMoE logic: k_blocks = hidden_size // block_size
-    k_blocks_wi = hidden_size // block_size
-    k_blocks_wo = intermediate_dim // block_size
+    k_blocks_wi = expected_k_blocks_wi
+    k_blocks_wo = expected_k_blocks_wo
     
     print(f"  Expert Count: {num_experts}")
     print(f"  K Blocks (WI): {k_blocks_wi}")
@@ -88,7 +99,9 @@ def test_epmoe_block_quant_logic():
 
 if __name__ == "__main__":
     try:
-        test_epmoe_block_quant_logic()
+        test_epmoe_block_quant_logic(None, 1, 1)
+        test_epmoe_block_quant_logic([1, 128], 4, 8)
+        test_epmoe_block_quant_logic([128, 128], 4, 8)
     except Exception as e:
         print(f"Test failed: {e}")
         import traceback

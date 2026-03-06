@@ -7,11 +7,32 @@ import re
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import NamedSharding, PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.configs.quantization_config import DTYPE_MAP
 
 logger = logging.getLogger(__name__)
+
+
+def _get_block_reshape_sharding(
+    tensor: jax.Array,
+    quantized_axes: list[int],
+) -> NamedSharding | None:
+    """Preserve explicit sharding when splitting axes into (num_blocks, block)."""
+    input_sharding = getattr(tensor, "sharding", None)
+    if not isinstance(input_sharding, NamedSharding):
+        return None
+
+    quantized_axis_set = set(quantized_axes)
+    blocked_spec = []
+    for axis_idx, axis_spec in enumerate(input_sharding.spec):
+        if axis_idx in quantized_axis_set:
+            blocked_spec.extend([axis_spec, None])
+        else:
+            blocked_spec.append(axis_spec)
+
+    return NamedSharding(input_sharding.mesh, P(*blocked_spec))
 
 
 def apply_linear_quantization(
@@ -341,9 +362,15 @@ def quantize_tensor(
         # shift its position by n.
         axis = [1 + n + i for n, i in enumerate(axis)]
 
+        input_sharding = getattr(tensor, "sharding", None)
+        blocked_out_sharding = _get_block_reshape_sharding(tensor, axis)
+
         # Flatten list of lists that contains (num_blocks, block).
         blocked_shape = list(itertools.chain(*blocked_shape))
-        tensor = tensor.reshape(blocked_shape)
+        if blocked_out_sharding is not None:
+            tensor = jax.lax.reshape(tensor, blocked_shape, out_sharding=blocked_out_sharding)
+        else:
+            tensor = tensor.reshape(blocked_shape)
 
     dtype_info = jnp.iinfo(dtype) if jnp.issubdtype(dtype, jnp.integer) else jnp.finfo(dtype)
 
@@ -356,7 +383,10 @@ def quantize_tensor(
     # Guard all-zero blocks/tensors: scale==0 would produce 0/0 -> NaN.
     scale_safe = scale + (scale == 0).astype(scale.dtype)
     tensor_q = jnp.clip(tensor / scale_safe, dtype_min, dtype_max)
-    tensor_q = tensor_q.reshape(orig_shape)
+    if block_size is not None and isinstance(input_sharding, NamedSharding):
+        tensor_q = jax.lax.reshape(tensor_q, orig_shape, out_sharding=input_sharding)
+    else:
+        tensor_q = tensor_q.reshape(orig_shape)
     tensor_q = tensor_q.astype(dtype)
 
     # To avoid padded values affecting output of quantized matmul, we mask them
