@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import nnx
 from jax.sharding import Mesh, PartitionSpec as P
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
@@ -27,7 +28,11 @@ def test_epmoe_block_quant_accuracy():
     ep_size = num_devices
     tp_size = 1
     devices = np.array(jax.devices()).reshape(ep_size, tp_size)
-    mesh = Mesh(devices, axis_names=("expert", "tensor"))
+    mesh = Mesh(
+        devices,
+        axis_names=("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
+    )
     
     # 2. Config
     hidden_size = 512
@@ -47,75 +52,80 @@ def test_epmoe_block_quant_accuracy():
     # 3. Create Reference (BF16) and Quantized Models
     print(f"  Initializing models with {num_experts} experts...")
     
-    # Reference Model (BF16)
-    moe_ref = EPMoE(
-        hidden_size=hidden_size,
-        num_experts=num_experts,
-        num_experts_per_tok=num_experts_per_tok,
-        ep_size=ep_size,
-        mesh=mesh,
-        intermediate_dim=intermediate_dim,
-        quantization_config=None, # Pure BF16
-    )
-    
-    # Quantized Model
-    moe_quant = EPMoE(
-        hidden_size=hidden_size,
-        num_experts=num_experts,
-        num_experts_per_tok=num_experts_per_tok,
-        ep_size=ep_size,
-        mesh=mesh,
-        intermediate_dim=intermediate_dim,
-        quantization_config=BlockQuantConfig(),
-    )
+    with jax.set_mesh(mesh):
+        # Reference Model (BF16)
+        moe_ref = EPMoE(
+            hidden_size=hidden_size,
+            num_experts=num_experts,
+            num_experts_per_tok=num_experts_per_tok,
+            ep_size=ep_size,
+            mesh=mesh,
+            intermediate_dim=intermediate_dim,
+            quantization_config=None, # Pure BF16
+        )
+        
+        # Quantized Model
+        moe_quant = EPMoE(
+            hidden_size=hidden_size,
+            num_experts=num_experts,
+            num_experts_per_tok=num_experts_per_tok,
+            ep_size=ep_size,
+            mesh=mesh,
+            intermediate_dim=intermediate_dim,
+            quantization_config=BlockQuantConfig(),
+        )
     
     # 4. Generate Reference Weights and Quantize
     key = jax.random.PRNGKey(42)
-    k_wi0, k_wi1, k_wo, k_in = jax.random.split(key, 4)
+    k_wi0, k_wi1, k_wo, k_x, k_topk = jax.random.split(key, 5)
     
     # Generate distinct random weights for each projection
     w_wi0_fp = jax.random.normal(k_wi0, (num_experts, intermediate_dim, hidden_size), dtype=compute_dtype)
     w_wi1_fp = jax.random.normal(k_wi1, (num_experts, intermediate_dim, hidden_size), dtype=compute_dtype)
     w_wo_fp = jax.random.normal(k_wo, (num_experts, hidden_size, intermediate_dim), dtype=compute_dtype)
     
-    # Set weights for Ref
-    moe_ref.wi_0 = jax.nnx.Param(w_wi0_fp, out_sharding=P("expert", "tensor", None))
-    moe_ref.wi_1 = jax.nnx.Param(w_wi1_fp, out_sharding=P("expert", "tensor", None))
-    moe_ref.wo = jax.nnx.Param(w_wo_fp, out_sharding=P("expert", None, "tensor"))
-    
     # Perform Block Quantization
     def block_quant(w, axis=2):
         w_q, w_scale = quantize_tensor(weight_dtype, w, axis=axis, block_size=block_size)
-        k_blocks = w.shape[axis] // block_size
-        # For WI, out_dim is inter_dim; for WO, out_dim is hidden_size
-        out_dim = w.shape[1]
-        w_scale = w_scale.reshape(num_experts, k_blocks, 1, out_dim)
+        # quantize_tensor(axis=2, block_size=...) returns scale [E, out_dim, k_blocks].
+        # GMM rhs_scale expects [E, k_blocks, 1, out_dim].
+        w_scale = jnp.transpose(w_scale, (0, 2, 1))[:, :, None, :]
         return w_q, w_scale
 
     wi0_q, wi0_scale = block_quant(w_wi0_fp, axis=2)
     wi1_q, wi1_scale = block_quant(w_wi1_fp, axis=2)
     wo_q, wo_scale = block_quant(w_wo_fp, axis=2)
     
-    moe_quant.wi_0 = jax.nnx.Param(wi0_q, out_sharding=P("expert", "tensor", None))
-    moe_quant.wi_1 = jax.nnx.Param(wi1_q, out_sharding=P("expert", "tensor", None))
-    moe_quant.wo = jax.nnx.Param(wo_q, out_sharding=P("expert", None, "tensor"))
-    
-    # IMPORTANT: Sharding must match EPMoE's shard_map in_specs
-    moe_quant.wi_0_scale = jax.nnx.Param(wi0_scale, out_sharding=P("expert", None, None, "tensor"))
-    moe_quant.wi_1_scale = jax.nnx.Param(wi1_scale, out_sharding=P("expert", None, None, "tensor"))
-    moe_quant.wo_scale = jax.nnx.Param(wo_scale, out_sharding=P("expert", None, None, None))
+    with jax.set_mesh(moe_ref.moe_mesh):
+        # Set weights for Ref
+        moe_ref.wi_0 = nnx.Param(w_wi0_fp, out_sharding=P("expert", "tensor", None))
+        moe_ref.wi_1 = nnx.Param(w_wi1_fp, out_sharding=P("expert", "tensor", None))
+        moe_ref.wo = nnx.Param(w_wo_fp, out_sharding=P("expert", None, "tensor"))
+
+        moe_quant.wi_0 = nnx.Param(wi0_q, out_sharding=P("expert", "tensor", None))
+        moe_quant.wi_1 = nnx.Param(wi1_q, out_sharding=P("expert", "tensor", None))
+        moe_quant.wo = nnx.Param(wo_q, out_sharding=P("expert", None, "tensor"))
+
+        # IMPORTANT: Sharding must match EPMoE's shard_map in_specs
+        del moe_quant.wi_0_scale
+        del moe_quant.wi_1_scale
+        del moe_quant.wo_scale
+        moe_quant.wi_0_scale = nnx.Param(wi0_scale, out_sharding=P("expert", None, None, "tensor"))
+        moe_quant.wi_1_scale = nnx.Param(wi1_scale, out_sharding=P("expert", None, None, "tensor"))
+        moe_quant.wo_scale = nnx.Param(wo_scale, out_sharding=P("expert", None, None, None))
     
     # 5. Run Inference
     batch_size = 16
-    x = jax.random.normal(k3, (batch_size, hidden_size), dtype=compute_dtype)
+    x = jax.random.normal(k_x, (batch_size, hidden_size), dtype=compute_dtype)
     topk_weights = jnp.ones((batch_size, num_experts_per_tok), dtype=compute_dtype)
-    topk_ids = jax.random.randint(k4, (batch_size, num_experts_per_tok), 0, num_experts)
+    topk_ids = jax.random.randint(k_topk, (batch_size, num_experts_per_tok), 0, num_experts)
     
     print("  Running BF16 Reference...")
-    out_ref = moe_ref(x, topk_weights, topk_ids)
-    
-    print("  Running Block Quantized MoE...")
-    out_quant = moe_quant(x, topk_weights, topk_ids)
+    with jax.set_mesh(moe_ref.moe_mesh):
+        out_ref = moe_ref(x, topk_weights, topk_ids)
+        
+        print("  Running Block Quantized MoE...")
+        out_quant = moe_quant(x, topk_weights, topk_ids)
     
     # 6. Evaluation
     cos_sim = get_cosine_similarity(out_ref, out_quant)
