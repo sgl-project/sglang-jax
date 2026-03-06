@@ -321,6 +321,30 @@ class EPMoE(nnx.Module):
         if self.quantized_dtype is None:
             return
 
+        def _get_block_size_k(
+            *, hidden_size: int, intermediate_dim: int, weight_block_size: list[int] | tuple[int, int] | None
+        ) -> int | None:
+            if weight_block_size is None:
+                return None
+            if not (isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2):
+                raise ValueError(
+                    f"EPMoE weight_block_size must be a 2-element list [block_n, block_k], "
+                    f"got {weight_block_size}"
+                )
+
+            block_size_k = int(weight_block_size[1])
+            if block_size_k <= 0:
+                raise ValueError(f"EPMoE weight_block_size[1] must be > 0, got {block_size_k}")
+            if hidden_size % block_size_k != 0:
+                raise ValueError(
+                    f"EPMoE hidden_size={hidden_size} not divisible by block_size_k={block_size_k}"
+                )
+            if intermediate_dim % block_size_k != 0:
+                raise ValueError(
+                    f"EPMoE intermediate_dim={intermediate_dim} not divisible by block_size_k={block_size_k}"
+                )
+            return block_size_k
+
         with jax.set_mesh(self.moe_mesh):
             if is_static:
                 # Static checkpoints will load real scale tensors later, but the
@@ -332,24 +356,11 @@ class EPMoE(nnx.Module):
                 # Compute k_blocks for block quant placeholders.
                 # weight_block_size = [hf_out_block, hf_in_block] (HF convention).
                 # EPMoE quantizes along axis=2 (k/input dim), so use hf_in_block = [1].
-                block_size_k = None
-                if self.weight_block_size is not None:
-                    if not (isinstance(self.weight_block_size, (list, tuple)) and len(self.weight_block_size) == 2):
-                        raise ValueError(
-                            f"EPMoE weight_block_size must be a 2-element list [block_n, block_k], "
-                            f"got {self.weight_block_size}"
-                        )
-                    block_size_k = int(self.weight_block_size[1])
-                    if block_size_k <= 0:
-                        raise ValueError(f"EPMoE weight_block_size[1] must be > 0, got {block_size_k}")
-                    if hidden_size % block_size_k != 0:
-                        raise ValueError(
-                            f"EPMoE hidden_size={hidden_size} not divisible by block_size_k={block_size_k}"
-                        )
-                    if intermediate_dim % block_size_k != 0:
-                        raise ValueError(
-                            f"EPMoE intermediate_dim={intermediate_dim} not divisible by block_size_k={block_size_k}"
-                        )
+                block_size_k = _get_block_size_k(
+                    hidden_size=hidden_size,
+                    intermediate_dim=intermediate_dim,
+                    weight_block_size=self.weight_block_size,
+                )
                 k_blocks_wi = (hidden_size // block_size_k) if block_size_k else 1
                 k_blocks_wo = (intermediate_dim // block_size_k) if block_size_k else 1
                 wi_scale_sharding = P("expert", None, None, "tensor")
@@ -390,45 +401,64 @@ class EPMoE(nnx.Module):
                 return
 
             # Quantize weights
+            hidden_size = self.wo.value.shape[1]
+            intermediate_dim = self.wi_0.value.shape[1]
+            block_size_k = _get_block_size_k(
+                hidden_size=hidden_size,
+                intermediate_dim=intermediate_dim,
+                weight_block_size=self.weight_block_size,
+            )
             w0_value, w0_scale = quantize_tensor(
                 self.quantized_dtype,
                 self.wi_0.value,
                 axis=2,
+                block_size=block_size_k,
             )
             w1_value, w1_scale = quantize_tensor(
                 self.quantized_dtype,
                 self.wi_1.value,
                 axis=2,
+                block_size=block_size_k,
             )
             wo_value, wo_scale = quantize_tensor(
                 self.quantized_dtype,
                 self.wo.value,
                 axis=2,
+                block_size=block_size_k,
             )
 
             self.wi_0 = nnx.Param(w0_value, out_sharding=P("expert", "tensor", None))
             self.wi_1 = nnx.Param(w1_value, out_sharding=P("expert", "tensor", None))
             self.wo = nnx.Param(wo_value, out_sharding=P("expert", None, "tensor"))
 
+            if block_size_k is not None:
+                w0_scale = jnp.transpose(w0_scale, (0, 2, 1))[:, :, None, :]
+                w1_scale = jnp.transpose(w1_scale, (0, 2, 1))[:, :, None, :]
+                wo_scale = jnp.transpose(wo_scale, (0, 2, 1))[:, :, None, :]
+            else:
+                w0_scale = w0_scale.reshape(w0_scale.shape[0], 1, 1, w0_scale.shape[1])
+                w1_scale = w1_scale.reshape(w1_scale.shape[0], 1, 1, w1_scale.shape[1])
+                wo_scale = wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1])
+
             if hasattr(self, "wi_0_scale"):
                 del self.wi_0_scale
             self.wi_0_scale = nnx.Param(
-                w0_scale.reshape(w0_scale.shape[0], 1, 1, w0_scale.shape[1]),
+                w0_scale,
                 out_sharding=P("expert", None, None, "tensor"),
             )
 
             if hasattr(self, "wi_1_scale"):
                 del self.wi_1_scale
             self.wi_1_scale = nnx.Param(
-                w1_scale.reshape(w1_scale.shape[0], 1, 1, w1_scale.shape[1]),
+                w1_scale,
                 out_sharding=P("expert", None, None, "tensor"),
             )
 
             if hasattr(self, "wo_scale"):
                 del self.wo_scale
             self.wo_scale = nnx.Param(
-                wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1]),
-                out_sharding=P("expert", None, None, "tensor"),
+                wo_scale,
+                out_sharding=P("expert", None, None, None),
             )
 
     @named_scope
