@@ -242,7 +242,6 @@ class WanTransformerBlock(nnx.Module):
             q = self.norm_q(q)
         if self.norm_k is not None and self.norm_k.num_features == self.hidden_dim:
             k = self.norm_k(k)
-
         q = q.reshape(bs, seq_len, self.num_attention_heads, -1)
         k = k.reshape(bs, seq_len, self.num_attention_heads, -1)
         v = v.reshape(bs, seq_len, self.num_attention_heads, -1)
