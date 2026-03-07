@@ -12,13 +12,8 @@ from sgl_jax.srt.eplb.expert_location import (
 )
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
-from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import is_supported_by_gmm_v2
-from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.profiling_utils import named_scope
-from sgl_jax.srt.utils.quantization.quantization_utils import (
-    quantize_tensor,
-    quantize_tensor_simple,
-)
+from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 
@@ -520,58 +515,38 @@ class EPMoE(nnx.Module):
         wo_kernel_bias=None,
     ):
         if x.shape[0] == 0:
-            empty_output = jnp.zeros((0, wo_kernel.shape[-1]), dtype=x.dtype)
-            return empty_output
+            return jnp.zeros((0, wo_kernel.shape[-1]), dtype=x.dtype)
 
         group_sizes = group_sizes.astype(jnp.int32)
-        interpret = not is_tpu_runtime()
+        act_q_dtype = self.activation_quantized_dtype
 
-        quantize_lhs = self.activation_quantized_dtype is not None
-
-        # Check v2 support separately for GEMM1 and GEMM2 since shapes differ.
-        use_v2_gemm1 = not interpret and is_supported_by_gmm_v2(w0_kernel_scale)
+        gmm_kwargs = dict(
+            group_sizes=group_sizes,
+            preferred_element_type=self.dtype,
+            group_offset=group_offset,
+            maybe_quantize_lhs=act_q_dtype is not None,
+            acc_dtype=jnp.float32,
+        )
 
         # === GEMM1: x @ w0 and x @ w1 ===
-        if not use_v2_gemm1 and self.activation_quantized_dtype is not None:
-            x_q, x_scale = quantize_tensor_simple(x, self.activation_quantized_dtype, dim=-1)
-            gemm1_lhs = x_q
-        else:
-            gemm1_lhs = x
-            x_scale = None
-
         layer_w0 = gmm(
-            lhs=gemm1_lhs,
+            lhs=x,
             rhs=w0_kernel,
-            group_sizes=group_sizes,
-            preferred_element_type=self.dtype,
             rhs_scale=w0_kernel_scale,
             rhs_bias=w0_kernel_bias,
-            group_offset=group_offset,
-            interpret=interpret,
-            use_gmm_v2=use_v2_gemm1,
-            maybe_quantize_lhs=quantize_lhs,
             zero_initialize=False,
-            acc_dtype=jnp.float32,
+            activation_quantized_dtype=act_q_dtype,
+            **gmm_kwargs,
         )
-
         layer_w1 = gmm(
-            lhs=gemm1_lhs,
+            lhs=x,
             rhs=w1_kernel,
-            group_sizes=group_sizes,
-            preferred_element_type=self.dtype,
             rhs_scale=w1_kernel_scale,
             rhs_bias=w1_kernel_bias,
-            group_offset=group_offset,
-            interpret=interpret,
-            use_gmm_v2=use_v2_gemm1,
-            maybe_quantize_lhs=quantize_lhs,
             zero_initialize=False,
-            acc_dtype=jnp.float32,
+            activation_quantized_dtype=act_q_dtype,
+            **gmm_kwargs,
         )
-
-        if x_scale is not None:
-            layer_w0 = layer_w0 * x_scale
-            layer_w1 = layer_w1 * x_scale
 
         # === Activation ===
         if self.activation == "silu":
@@ -583,36 +558,15 @@ class EPMoE(nnx.Module):
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
-        use_v2_gemm2 = not interpret and is_supported_by_gmm_v2(wo_kernel_scale)
-
-        if not use_v2_gemm2 and self.activation_quantized_dtype is not None:
-            intermediate_q, intermediate_scale = quantize_tensor_simple(
-                intermediate_layer, self.activation_quantized_dtype, dim=-1
-            )
-            gemm2_lhs = intermediate_q
-        else:
-            gemm2_lhs = intermediate_layer
-            intermediate_scale = None
-
-        intermediate_output = gmm(
-            lhs=gemm2_lhs,
+        return gmm(
+            lhs=intermediate_layer,
             rhs=wo_kernel,
-            group_sizes=group_sizes,
-            preferred_element_type=self.dtype,
             rhs_scale=wo_kernel_scale,
             rhs_bias=wo_kernel_bias,
-            group_offset=group_offset,
-            interpret=interpret,
-            use_gmm_v2=use_v2_gemm2,
-            maybe_quantize_lhs=quantize_lhs,
             zero_initialize=True,
-            acc_dtype=jnp.float32,
+            activation_quantized_dtype=act_q_dtype,
+            **gmm_kwargs,
         )
-
-        if intermediate_scale is not None:
-            intermediate_output = intermediate_output * intermediate_scale
-
-        return intermediate_output
 
     def _dispatch(self, group_sizes, expert_shard_id):
         if self.ep_size <= 1:
