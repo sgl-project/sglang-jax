@@ -12,12 +12,8 @@ from sgl_jax.srt.eplb.expert_location import (
 )
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
-from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.profiling_utils import named_scope
-from sgl_jax.srt.utils.quantization.quantization_utils import (
-    quantize_tensor,
-    quantize_tensor_simple,
-)
+from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 
@@ -266,31 +262,31 @@ class EPMoE(nnx.Module):
         )
 
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
-            # MOE weights' shape is (num_experts, n, k)
+            # MOE weights' shape is (num_experts, k, n)
             self.wi_0 = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
-                    (self.num_experts, intermediate_dim, hidden_size),
+                    (self.num_experts, hidden_size, intermediate_dim),
                     dtype=weight_dtype,
-                    out_sharding=P("expert", "tensor", None),
+                    out_sharding=P("expert", None, "tensor"),
                 )
             )
 
             self.wi_1 = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
-                    (self.num_experts, intermediate_dim, hidden_size),
+                    (self.num_experts, hidden_size, intermediate_dim),
                     dtype=weight_dtype,
-                    out_sharding=P("expert", "tensor", None),
+                    out_sharding=P("expert", None, "tensor"),
                 )
             )
 
             self.wo = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
-                    (self.num_experts, hidden_size, intermediate_dim),
+                    (self.num_experts, intermediate_dim, hidden_size),
                     dtype=weight_dtype,
-                    out_sharding=P("expert", None, "tensor"),
+                    out_sharding=P("expert", "tensor", None),
                 )
             )
 
@@ -341,26 +337,26 @@ class EPMoE(nnx.Module):
                 )
                 return
 
-            # Quantize weights
+            # Quantize weights along k-dim (axis=1 in [g, k, n] layout)
             w0_value, w0_scale = quantize_tensor(
                 self.quantized_dtype,
                 self.wi_0.value,
-                axis=2,
+                axis=1,
             )
             w1_value, w1_scale = quantize_tensor(
                 self.quantized_dtype,
                 self.wi_1.value,
-                axis=2,
+                axis=1,
             )
             wo_value, wo_scale = quantize_tensor(
                 self.quantized_dtype,
                 self.wo.value,
-                axis=2,
+                axis=1,
             )
 
-            self.wi_0 = nnx.Param(w0_value, out_sharding=P("expert", "tensor", None))
-            self.wi_1 = nnx.Param(w1_value, out_sharding=P("expert", "tensor", None))
-            self.wo = nnx.Param(wo_value, out_sharding=P("expert", None, "tensor"))
+            self.wi_0 = nnx.Param(w0_value, out_sharding=P("expert", None, "tensor"))
+            self.wi_1 = nnx.Param(w1_value, out_sharding=P("expert", None, "tensor"))
+            self.wo = nnx.Param(wo_value, out_sharding=P("expert", "tensor", None))
 
             if hasattr(self, "wi_0_scale"):
                 del self.wi_0_scale
@@ -380,7 +376,7 @@ class EPMoE(nnx.Module):
                 del self.wo_scale
             self.wo_scale = nnx.Param(
                 wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1]),
-                out_sharding=P("expert", None, None, "tensor"),
+                out_sharding=P("expert", None, None, None),
             )
 
     @named_scope
@@ -405,18 +401,18 @@ class EPMoE(nnx.Module):
                     P(None),
                     P(None),
                     P(None),
-                    # weights
-                    P("expert", "tensor", None),
-                    P("expert", "tensor", None),
+                    # weights [g, k, n]
                     P("expert", None, "tensor"),
-                    # scales
+                    P("expert", None, "tensor"),
+                    P("expert", "tensor", None),
+                    # scales [g, 1, 1, n]
                     P("expert", None, None, "tensor"),
                     P("expert", None, None, "tensor"),
                     P("expert", None, None, None),
-                    # biases (unused)
+                    # biases [g, 1, n] (unused)
                     P("expert", None, "tensor"),
                     P("expert", None, "tensor"),
-                    P("expert", "tensor", None),
+                    P("expert", None, None),
                 ),
                 out_specs=P(None),
                 check_vma=False,
@@ -519,67 +515,40 @@ class EPMoE(nnx.Module):
         wo_kernel_bias=None,
     ):
         if x.shape[0] == 0:
-            empty_output = jnp.zeros((0, wo_kernel.shape[-1]), dtype=x.dtype)
-            return empty_output
-
-        m, k = x.shape[0], x.shape[1]
-        n_gate = w0_kernel.shape[1]
-        n_down = wo_kernel.shape[1]
-
-        default_tile_size = (512, 1024, 1024)
-        tiling_gate = (
-            min(default_tile_size[0], m),
-            min(default_tile_size[1], k),
-            min(default_tile_size[2], n_gate),
-        )
-        tiling_down = (
-            min(default_tile_size[0], m),
-            min(default_tile_size[1], n_gate),
-            min(default_tile_size[2], n_down),
-        )
+            return jnp.zeros((0, wo_kernel.shape[-1]), dtype=x.dtype)
 
         group_sizes = group_sizes.astype(jnp.int32)
+        act_q_dtype = self.activation_quantized_dtype
+
+        gmm_kwargs = dict(
+            group_sizes=group_sizes,
+            preferred_element_type=self.dtype,
+            group_offset=group_offset,
+            maybe_quantize_lhs=act_q_dtype is not None,
+            acc_dtype=jnp.float32,
+        )
 
         # === GEMM1: x @ w0 and x @ w1 ===
-        # Quantize input activation for GEMM1 if activation quantization enabled
-        if self.activation_quantized_dtype is not None:
-            x_q, x_scale = quantize_tensor_simple(x, self.activation_quantized_dtype, dim=-1)
-            gemm1_lhs = x_q
-        else:
-            gemm1_lhs = x
-            x_scale = None
-
         layer_w0 = gmm(
-            lhs=gemm1_lhs,
+            lhs=x,
             rhs=w0_kernel,
-            group_sizes=group_sizes,
-            preferred_element_type=self.dtype,
             rhs_scale=w0_kernel_scale,
             rhs_bias=w0_kernel_bias,
-            tiling=tiling_gate,
-            group_offset=group_offset,
-            interpret=not is_tpu_runtime(),
+            zero_initialize=False,
+            activation_quantized_dtype=act_q_dtype,
+            **gmm_kwargs,
         )
-
         layer_w1 = gmm(
-            lhs=gemm1_lhs,
+            lhs=x,
             rhs=w1_kernel,
-            group_sizes=group_sizes,
-            preferred_element_type=self.dtype,
             rhs_scale=w1_kernel_scale,
             rhs_bias=w1_kernel_bias,
-            tiling=tiling_gate,
-            group_offset=group_offset,
-            interpret=not is_tpu_runtime(),
+            zero_initialize=False,
+            activation_quantized_dtype=act_q_dtype,
+            **gmm_kwargs,
         )
 
-        # Dequantize GEMM1 output (apply LHS scale if quantized)
-        if x_scale is not None:
-            # x_scale shape: (m, 1) with keepdims=True, broadcasts to (m, n_gate)
-            layer_w0 = layer_w0 * x_scale
-            layer_w1 = layer_w1 * x_scale
-
-        # === Activation in BF16 (not quantized) ===
+        # === Activation ===
         if self.activation == "silu":
             layer_act = jax.nn.silu(layer_w0)
         elif self.activation == "gelu":
@@ -589,34 +558,15 @@ class EPMoE(nnx.Module):
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
-        # Quantize intermediate activation for GEMM2 if activation quantization enabled
-        if self.activation_quantized_dtype is not None:
-            intermediate_q, intermediate_scale = quantize_tensor_simple(
-                intermediate_layer, self.activation_quantized_dtype, dim=-1
-            )
-            gemm2_lhs = intermediate_q
-        else:
-            gemm2_lhs = intermediate_layer
-            intermediate_scale = None
-
-        intermediate_output = gmm(
-            lhs=gemm2_lhs,
+        return gmm(
+            lhs=intermediate_layer,
             rhs=wo_kernel,
-            group_sizes=group_sizes,
-            preferred_element_type=self.dtype,
             rhs_scale=wo_kernel_scale,
             rhs_bias=wo_kernel_bias,
-            tiling=tiling_down,
-            group_offset=group_offset,
-            interpret=not is_tpu_runtime(),
+            zero_initialize=True,
+            activation_quantized_dtype=act_q_dtype,
+            **gmm_kwargs,
         )
-
-        # Dequantize GEMM2 output (apply LHS scale if quantized)
-        if intermediate_scale is not None:
-            # intermediate_scale shape: (m, 1) with keepdims=True, broadcasts to (m, n_down)
-            intermediate_output = intermediate_output * intermediate_scale
-
-        return intermediate_output
 
     def _dispatch(self, group_sizes, expert_shard_id):
         if self.ep_size <= 1:
@@ -1147,13 +1097,13 @@ def create_moe_weights_mapping(
         ]
 
         if moe_backend == "epmoe":
-            # Sharding logic based on EPMoE PartitionSpec:
-            # wi_0/wi_1 (Input projections) use P("expert", "tensor", None)
-            # wo (Output projection) uses P("expert", None, "tensor")
+            # Weights are transposed from HF [n, k] to [k, n], stacked to [g, k, n].
+            # wi_0/wi_1: [g, hidden_size, intermediate_dim] -> P("expert", None, "tensor")
+            # wo:        [g, intermediate_dim, hidden_size] -> P("expert", "tensor", None)
             sharding = (
-                ("expert", None, "tensor") if target_name == "wo" else ("expert", "tensor", None)
+                ("expert", "tensor", None) if target_name == "wo" else ("expert", None, "tensor")
             )
-            transpose = False
+            transpose = True
         elif moe_backend == "fused":
             # Fused MoE kernel shards experts across the full EP mesh, i.e. the
             # product of ("data", "tensor"). Shard expert dim (axis=0) across
