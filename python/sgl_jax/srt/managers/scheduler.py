@@ -16,6 +16,9 @@ from collections import deque
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+import concurrent.futures
+# import jax.scipy as scipy
+import jax.nn as jnn
 import jax
 import numpy as np
 import pathwaysutils
@@ -126,6 +129,25 @@ def _compute_label_only_logprobs(next_token_logits, label_token_ids_arr, out_sha
     return label_logits - normalizer
 
 
+# @jax.jit(static_argnums=(2, 3))
+# def _compute_label_only_scores(next_token_logits, label_token_ids_arr, out_sharding, apply_softmax: bool):
+#     """Compute target-only final scores for [batch, vocab] logits."""
+#     logits_f32 = next_token_logits.astype(jnp.float32)
+#     label_logits = logits_f32.at[:, label_token_ids_arr].get(out_sharding=out_sharding)
+#     normalizer = jsp.logsumexp(logits_f32, axis=-1, keepdims=True)
+    
+#     # These are the values your original function returned
+#     row_logprobs = label_logits - normalizer
+    
+#     # --- NEW: Do the CPU math on the TPU ---
+#     if apply_softmax:
+#         # jnn.softmax is highly optimized in XLA and handles the 
+#         # (val - max(val)) numerical stability trick automatically.
+#         return jnn.softmax(row_logprobs, axis=-1)
+#     else:
+#         return jnp.exp(row_logprobs)
+
+
 @dataclass
 class GenerationBatchResult:
     logits_output: LogitsProcessorOutput | None
@@ -181,6 +203,7 @@ class Scheduler(
         if port_args is not None:
             self.pub_sub_addr = port_args.pub_sub_addr
             self.pub_sub_sync_addr = port_args.pub_sub_sync_addr
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self.tp_size = server_args.tp_size
         self.schedule_policy = server_args.schedule_policy
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -1333,6 +1356,69 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache)
             reqs.append(req)
         return reqs
+    
+    def _dispatch_score_from_cache_v2_chunk_label_only(
+        self, cache_handle, chunk_items, label_token_ids, label_token_ids_arr, 
+        cached_last_node, cached_prefix_indices, prefix_ids, cached_extra_key
+    ):
+        """Part 1: Prepares arrays and dispatches to TPU (Fast, Non-blocking)"""
+        reqs = self._build_score_from_cache_v2_chunk_reqs(...) # Pass your args
+        chunk_wall_start = time.perf_counter()
+        
+        batch = ScheduleBatch.init_new(...) # Pass your args
+        batch.prepare_for_extend()
+        batch.bid = acc_global_bid()
+        
+        # Get your padding sizes
+        precompile_token_paddings, precompile_bs_paddings, precompile_cache_loc_paddings = (
+            self.tp_worker.get_precompile_paddings()
+        )
+        model_worker_batch = batch.get_model_worker_batch(...) # Pass your args
+
+        forward_start = time.perf_counter()
+        logits_output, _, _ = self.tp_worker.forward_batch_generation(
+            model_worker_batch=model_worker_batch,
+            launch_done=None,
+            skip_sample=True,
+            sampling_metadata=None,
+        )
+
+        next_token_logits = logits_output.next_token_logits[: model_worker_batch.real_bs, :]
+        out_sharding = NamedSharding(self.mesh, P(None, None))
+        
+        # Enqueue the JAX operation (Non-blocking)
+        row_logprobs_dev = _compute_label_only_logprobs(
+            next_token_logits, label_token_ids_arr, out_sharding
+        )
+        
+        # RETURN IMMEDIATELY, do not block or cleanup here.
+        return row_logprobs_dev, batch, reqs, forward_start, chunk_wall_start
+
+
+    def _resolve_math_async(
+        self, dev_future, apply_softmax, forward_start, chunk_wall_start
+    ):
+        """Part 2: Waits for TPU and does NumPy math (Runs in background thread)"""
+        dev_future.block_until_ready() # Releases GIL, thread sleeps until TPU is done
+        forward_end = time.perf_counter()
+        
+        row_logprobs = np.asarray(jax.device_get(dev_future), dtype=np.float64)
+
+        token_prob_vals = np.exp(row_logprobs)
+        if apply_softmax:
+            row_max = np.max(token_prob_vals, axis=1, keepdims=True)
+            stable = token_prob_vals - row_max
+            exp_vals = np.exp(stable)
+            denom = np.sum(exp_vals, axis=1, keepdims=True)
+            scores_np = exp_vals / denom
+        else:
+            scores_np = token_prob_vals
+
+        chunk_device_compute_s = max(0.0, forward_end - forward_start)
+        chunk_total_s = max(0.0, time.perf_counter() - chunk_wall_start)
+        chunk_host_overhead_s = max(0.0, chunk_total_s - chunk_device_compute_s)
+        
+        return scores_np.tolist(), chunk_device_compute_s, chunk_host_overhead_s
 
     def _run_score_from_cache_v2_chunk_label_only(
         self,
@@ -1410,6 +1496,13 @@ class Scheduler(
             forward_end = time.perf_counter()
             row_logprobs = np.asarray(jax.device_get(row_logprobs_dev), dtype=np.float64)
 
+            # scores_dev = _compute_label_only_scores(
+            #     next_token_logits, label_token_ids_arr, out_sharding, apply_softmax
+            # )
+
+            # scores_dev.block_until_ready()
+            # forward_end = time.perf_counter()
+
             if row_logprobs.ndim != 2:
                 raise RuntimeError(f"Unexpected label-only logprob shape: {row_logprobs.shape}.")
             if row_logprobs.shape[0] != len(reqs):
@@ -1424,6 +1517,7 @@ class Scheduler(
             # Align with baseline v2 semantics: raw values are token probabilities
             # (not normalized across label ids). Apply optional softmax on those
             # raw probability values only when requested.
+
             token_prob_vals = np.exp(row_logprobs)
             if apply_softmax:
                 row_max = np.max(token_prob_vals, axis=1, keepdims=True)
@@ -1434,6 +1528,9 @@ class Scheduler(
             else:
                 scores_np = token_prob_vals
             scores = scores_np.tolist()
+
+            # scores = np.asarray(jax.device_get(scores_dev), dtype=np.float64).tolist()
+
 
             chunk_device_compute_s = max(0.0, forward_end - forward_start)
             chunk_total_s = max(0.0, time.perf_counter() - chunk_wall_start)
@@ -1604,51 +1701,504 @@ class Scheduler(
             self._touch_scoring_cache_entry(recv_req.cache_handle)
 
             all_scores: list[list[float]] = []
-            first_dispatch_started = False
-            for start in range(0, total_items, items_per_step):
-                chunk_items = recv_req.items_2d[start : start + items_per_step]
-                if not chunk_items:
-                    continue
-                if not first_dispatch_started:
-                    queue_wait_s = max(0.0, time.perf_counter() - score_start)
-                    first_dispatch_started = True
-                chunk_host_start = time.perf_counter()
-                if label_only_logprob:
-                    chunk_scores, chunk_device_compute_s, chunk_host_overhead_s = (
-                        self._run_score_from_cache_v2_chunk_label_only(
-                            cache_handle=recv_req.cache_handle,
-                            chunk_items=chunk_items,
-                            label_token_ids=recv_req.label_token_ids,
-                            label_token_ids_arr=label_token_ids_arr,
-                            apply_softmax=recv_req.apply_softmax,
-                            cached_last_node=cached_last_node,
-                            cached_prefix_indices=prefix_indices,
-                            prefix_ids=prefix_ids,
-                            cached_extra_key=cached_extra_key,
-                        )
+                        
+            pending_tasks = [] # Stores tuples of (future, reqs, batch)
+
+            #3
+            in_flight_chunks = []  # Acts as our sliding window queue
+
+            # try:
+            #     for start in range(0, total_items, items_per_step):
+            #         chunk_items = recv_req.items_2d[start : start + items_per_step]
+            #         if not chunk_items:
+            #             continue
+                    
+            #         needed_slots = len(chunk_items)
+
+                    # =========================================================
+                    # 1. BLOCK ONLY WHEN OUT OF CAPACITY
+                    # If we don't have enough slots for the next chunk, 
+                    # we wait for the OLDEST chunk to finish and free its memory.
+                    # =========================================================
+                    # while in_flight_chunks and (
+                    #     self.req_to_token_pool.available_size() < needed_slots
+                    # ):
+                    #     old_dev_logprobs, old_reqs, old_batch, old_apply_softmax = in_flight_chunks.pop(0)
+                        
+                    #     # This blocks until the TPU finishes this specific chunk.
+                    #     # BUT the TPU is likely busy computing the other in-flight chunks!
+                    #     row_logprobs = np.asarray(jax.device_get(old_dev_logprobs), dtype=np.float64)
+                        
+                    #     # Do the math
+                    #     token_prob_vals = np.exp(row_logprobs)
+                    #     if old_apply_softmax:
+                    #         row_max = np.max(token_prob_vals, axis=1, keepdims=True)
+                    #         stable = token_prob_vals - row_max
+                    #         exp_vals = np.exp(stable)
+                    #         denom = np.sum(exp_vals, axis=1, keepdims=True)
+                    #         scores_np = exp_vals / denom
+                    #     else:
+                    #         scores_np = token_prob_vals
+                            
+                    #     all_scores.extend(scores_np.tolist())
+                        
+                    #     # Free the memory so the while-loop can evaluate the next allocation
+                    #     self._release_score_from_cache_v2_chunk_reqs(old_reqs, batch=old_batch)
+
+
+                    # =========================================================
+                    # 2. BUILD AND DISPATCH THE NEXT CHUNK
+                    # =========================================================
+                    # reqs = self._build_score_from_cache_v2_chunk_reqs(
+                    #     recv_req.cache_handle, chunk_items, recv_req.label_token_ids,
+                    #     cached_last_node, prefix_indices, prefix_ids, cached_extra_key, False
+                    # )
+                    # batch = ScheduleBatch.init_new(
+                    #     reqs=reqs, req_to_token_pool=self.req_to_token_pool,
+                    #     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    #     tree_cache=self.tree_cache, model_config=self.model_config,
+                    #     enable_overlap=self.enable_overlap, spec_algorithm=self.spec_algorithm,
+                    #     enable_custom_logit_processor=False, chunked_req=None, mesh=self.mesh,
+                    # )
+                    # batch.prepare_for_extend()
+                    # batch.bid = acc_global_bid()
+                    
+                    # paddings = self.tp_worker.get_precompile_paddings()
+                    # model_worker_batch = batch.get_model_worker_batch(
+                    #     paddings[0], paddings[1], paddings[2], self.page_size, self.server_args.enable_static_lora
+                    # )
+
+                    # # Dispatch to TPU (Non-blocking)
+                    # logits_output, _, _ = self.tp_worker.forward_batch_generation(
+                    #     model_worker_batch=model_worker_batch, launch_done=None, skip_sample=True, sampling_metadata=None,
+                    # )
+                    
+                    # next_token_logits = logits_output.next_token_logits[: model_worker_batch.real_bs, :]
+                    # out_sharding = NamedSharding(self.mesh, P(None, None))
+                    # row_logprobs_dev = _compute_label_only_logprobs(next_token_logits, label_token_ids_arr, out_sharding)
+
+                    # Add the "promise" (row_logprobs_dev) to our queue
+            #         in_flight_chunks.append((row_logprobs_dev, reqs, batch, recv_req.apply_softmax))
+
+            #     # =========================================================
+            #     # 3. DRAIN THE REMAINING QUEUE
+            #     # =========================================================
+            #     for old_dev_logprobs, old_reqs, old_batch, old_apply_softmax in in_flight_chunks:
+            #         row_logprobs = np.asarray(jax.device_get(old_dev_logprobs), dtype=np.float64)
+                    
+            #         token_prob_vals = np.exp(row_logprobs)
+            #         if old_apply_softmax:
+            #             row_max = np.max(token_prob_vals, axis=1, keepdims=True)
+            #             stable = token_prob_vals - row_max
+            #             exp_vals = np.exp(stable)
+            #             denom = np.sum(exp_vals, axis=1, keepdims=True)
+            #             scores_np = exp_vals / denom
+            #         else:
+            #             scores_np = token_prob_vals
+                        
+            #         all_scores.extend(scores_np.tolist())
+            #         self._release_score_from_cache_v2_chunk_reqs(old_reqs, batch=old_batch)
+
+            #     # Clear the list so the `finally` block doesn't try to double-free
+            #     in_flight_chunks.clear() 
+
+            # finally:
+            #     # =========================================================
+            #     # GUARANTEED CLEANUP ON EXCEPTION
+            #     # =========================================================
+            #     for _, old_reqs, old_batch, _ in in_flight_chunks:
+            #         self._release_score_from_cache_v2_chunk_reqs(old_reqs, batch=old_batch)
+
+            #2
+            # first_dispatch_started = False
+            # chunk_items = recv_req.items_2d[0 : items_per_step]
+            # reqs = self._build_score_from_cache_v2_chunk_reqs(
+            #     recv_req.cache_handle, chunk_items, recv_req.label_token_ids,
+            #     cached_last_node, prefix_indices, prefix_ids, cached_extra_key, False
+            # )
+            # batch = ScheduleBatch.init_new(
+            #     reqs=reqs, req_to_token_pool=self.req_to_token_pool,
+            #     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            #     tree_cache=self.tree_cache, model_config=self.model_config,
+            #     enable_overlap=self.enable_overlap, spec_algorithm=self.spec_algorithm,
+            #     enable_custom_logit_processor=False, chunked_req=None, mesh=self.mesh,
+            # )
+            # batch.prepare_for_extend()
+            # batch.bid = acc_global_bid()
+            
+            # paddings = self.tp_worker.get_precompile_paddings()
+            # model_worker_batch = batch.get_model_worker_batch(
+            #     paddings[0], paddings[1], paddings[2], self.page_size, self.server_args.enable_static_lora
+            # )
+            
+            # old_reqs, old_batch = None, None
+
+            # for start in range(0, total_items, items_per_step):
+            #     chunk_wall_start = time.perf_counter()
+                
+            #     # 1. DISPATCH CHUNK N TO TPU (Returns instantly)
+            #     forward_start = time.perf_counter()
+            #     logits_output, _, _ = self.tp_worker.forward_batch_generation(
+            #         model_worker_batch=model_worker_batch, launch_done=None, skip_sample=True, sampling_metadata=None,
+            #     )
+                
+            #     next_token_logits = logits_output.next_token_logits[: model_worker_batch.real_bs, :]
+            #     out_sharding = NamedSharding(self.mesh, P(None, None))
+            #     row_logprobs_dev = _compute_label_only_logprobs(next_token_logits, label_token_ids_arr, out_sharding)
+
+            #     # 2. SUBMIT DEVICE_GET TO BACKGROUND THREAD
+            #     future = self.executor.submit(
+            #         self._resolve_math_async, 
+            #         row_logprobs_dev, recv_req.apply_softmax, forward_start, chunk_wall_start
+            #     )
+
+            #     # 3. BUILD CHUNK N+1 ON HOST ***WHILE TPU COMPUTES CHUNK N***
+            #     next_start = start + items_per_step
+            #     if next_start < total_items:
+            #         next_chunk_items = recv_req.items_2d[next_start : next_start + items_per_step]
+                    
+            #         next_reqs = self._build_score_from_cache_v2_chunk_reqs(
+            #             recv_req.cache_handle, next_chunk_items, recv_req.label_token_ids,
+            #             cached_last_node, prefix_indices, prefix_ids, cached_extra_key, False
+            #         )
+            #         next_batch = ScheduleBatch.init_new(
+            #             reqs=next_reqs, req_to_token_pool=self.req_to_token_pool,
+            #             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            #             tree_cache=self.tree_cache, model_config=self.model_config,
+            #             enable_overlap=self.enable_overlap, spec_algorithm=self.spec_algorithm,
+            #             enable_custom_logit_processor=False, chunked_req=None, mesh=self.mesh,
+            #         )
+            #         next_batch.prepare_for_extend()
+            #         next_batch.bid = acc_global_bid()
+            #         next_model_worker_batch = next_batch.get_model_worker_batch(
+            #             paddings[0], paddings[1], paddings[2], self.page_size, self.server_args.enable_static_lora
+            #         )
+            #     else:
+            #         next_reqs, next_batch, next_model_worker_batch = None, None, None
+
+            #     # 4. CLEAN UP CHUNK N-1 MEMORY
+            #     if old_reqs is not None:
+            #         self._release_score_from_cache_v2_chunk_reqs(old_reqs, batch=old_batch)
+
+            #     # 5. WAIT FOR CHUNK N TO FINISH
+            #     # (TPU is likely done because we spent the last ~10ms building Chunk N+1)
+            #     scores, c_comp_s, c_host_s = future.result()
+            #     all_scores.extend(scores)
+                
+            #     dispatch_count += 1
+            #     device_compute_s += c_comp_s
+            #     host_orchestration_s += c_host_s
+
+            #     # 6. SHIFT POINTERS FOR NEXT ITERATION
+            #     old_reqs, old_batch = reqs, batch
+            #     reqs, batch, model_worker_batch = next_reqs, next_batch, next_model_worker_batch
+
+            # # --- FINAL CLEANUP ---
+            # if old_reqs is not None:
+            #     self._release_score_from_cache_v2_chunk_reqs(old_reqs, batch=old_batch)
+
+
+            # 1
+            # first_dispatch_started = False
+            # for start in range(0, total_items, items_per_step):
+            #     chunk_items = recv_req.items_2d[start : start + items_per_step]
+            #     if not chunk_items:
+            #         continue
+            #     if not first_dispatch_started:
+            #         queue_wait_s = max(0.0, time.perf_counter() - score_start)
+            #         first_dispatch_started = True
+            #     chunk_host_start = time.perf_counter()
+            #     if label_only_logprob:
+            #         chunk_scores, chunk_device_compute_s, chunk_host_overhead_s = (
+            #             self._run_score_from_cache_v2_chunk_label_only(
+            #                 cache_handle=recv_req.cache_handle,
+            #                 chunk_items=chunk_items,
+            #                 label_token_ids=recv_req.label_token_ids,
+            #                 label_token_ids_arr=label_token_ids_arr,
+            #                 apply_softmax=recv_req.apply_softmax,
+            #                 cached_last_node=cached_last_node,
+            #                 cached_prefix_indices=prefix_indices,
+            #                 prefix_ids=prefix_ids,
+            #                 cached_extra_key=cached_extra_key,
+            #             )
+            #         )
+            #     else:
+            #         chunk_scores, chunk_device_compute_s, chunk_host_overhead_s = (
+            #             self._run_score_from_cache_v2_chunk(
+            #                 cache_handle=recv_req.cache_handle,
+            #                 chunk_items=chunk_items,
+            #                 label_token_ids=recv_req.label_token_ids,
+            #                 apply_softmax=recv_req.apply_softmax,
+            #                 cached_last_node=cached_last_node,
+            #                 cached_prefix_indices=prefix_indices,
+            #                 prefix_ids=prefix_ids,
+            #                 cached_extra_key=cached_extra_key,
+            #             )
+            #         )
+            #     all_scores.extend(chunk_scores)
+            #     dispatch_count += 1
+            #     device_compute_s += max(0.0, chunk_device_compute_s)
+            #     # host_orchestration_s excludes device time by design.
+            #     chunk_total = max(0.0, time.perf_counter() - chunk_host_start)
+            #     host_orchestration_s += max(
+            #         0.0,
+            #         max(chunk_host_overhead_s, chunk_total - chunk_device_compute_s),
+            #     )
+
+            #4
+            # all_scores: list[list[float]] = []
+            
+            # # --- PRE-BUILD CHUNK 0 OUTSIDE THE LOOP ---
+            # chunk_items = recv_req.items_2d[0 : items_per_step]
+            # reqs = self._build_score_from_cache_v2_chunk_reqs(
+            #     recv_req.cache_handle, chunk_items, recv_req.label_token_ids,
+            #     cached_last_node, prefix_indices, prefix_ids, cached_extra_key, False
+            # )
+            # batch = ScheduleBatch.init_new(
+            #     reqs=reqs, req_to_token_pool=self.req_to_token_pool,
+            #     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            #     tree_cache=self.tree_cache, model_config=self.model_config,
+            #     enable_overlap=self.enable_overlap, spec_algorithm=self.spec_algorithm,
+            #     enable_custom_logit_processor=False, chunked_req=None, mesh=self.mesh,
+            # )
+            # batch.prepare_for_extend()
+            # batch.bid = acc_global_bid()
+            
+            # paddings = self.tp_worker.get_precompile_paddings()
+            # model_worker_batch = batch.get_model_worker_batch(
+            #     paddings[0], paddings[1], paddings[2], self.page_size, self.server_args.enable_static_lora
+            # )
+            
+            # next_reqs, next_batch, next_model_worker_batch = None, None, None
+
+            # try:
+            #     for start in range(0, total_items, items_per_step):
+            #         chunk_host_start = time.perf_counter()
+                    
+            #         # ==========================================
+            #         # 1. DISPATCH CHUNK N TO TPU (Returns instantly)
+            #         # ==========================================
+            #         forward_start = time.perf_counter()
+            #         logits_output, _, _ = self.tp_worker.forward_batch_generation(
+            #             model_worker_batch=model_worker_batch, launch_done=None, skip_sample=True, sampling_metadata=None,
+            #         )
+            #         print("After building nth chunk", flush=True)
+            #         print(time.perf_counter()-forward_start, flush=True)
+            #         next_token_logits = logits_output.next_token_logits[: model_worker_batch.real_bs, :]
+            #         out_sharding = NamedSharding(self.mesh, P(None, None))
+                    
+            #         # Original fast JAX kernel
+            #         row_logprobs_dev = _compute_label_only_logprobs(
+            #             next_token_logits, label_token_ids_arr, out_sharding
+            #         )
+
+            #         # ==========================================
+            #         # 2. BUILD CHUNK N+1 ON CPU *WHILE* TPU COMPUTES
+            #         # This hides the 5-15ms Python array overhead!
+            #         # ==========================================
+            #         next_start = start + items_per_step
+            #         print("Before building (n+1)th chunk", flush=True)
+            #         print(time.perf_counter()-forward_start, flush=True)
+            #         if next_start < total_items:
+            #             next_chunk_items = recv_req.items_2d[next_start : next_start + items_per_step]
+                        
+            #             next_reqs = self._build_score_from_cache_v2_chunk_reqs(
+            #                 recv_req.cache_handle, next_chunk_items, recv_req.label_token_ids,
+            #                 cached_last_node, prefix_indices, prefix_ids, cached_extra_key, False
+            #             )
+            #             print("After building (n+1)th chunk Req", flush=True)
+            #             print(time.perf_counter()-forward_start, flush=True)
+            #             next_batch = ScheduleBatch.init_new(
+            #                 reqs=next_reqs, req_to_token_pool=self.req_to_token_pool,
+            #                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            #                 tree_cache=self.tree_cache, model_config=self.model_config,
+            #                 enable_overlap=self.enable_overlap, spec_algorithm=self.spec_algorithm,
+            #                 enable_custom_logit_processor=False, chunked_req=None, mesh=self.mesh,
+            #             )
+            #             next_batch.prepare_for_extend()
+            #             next_batch.bid = acc_global_bid()
+            #             next_model_worker_batch = next_batch.get_model_worker_batch(
+            #                 paddings[0], paddings[1], paddings[2], self.page_size, self.server_args.enable_static_lora
+            #             )
+            #         else:
+            #             next_reqs, next_batch, next_model_worker_batch = None, None, None
+            #         print("After building (n+1)th chunk", flush=True)
+            #         print(time.perf_counter()-forward_start, flush=True)
+
+            #         # ==========================================
+            #         # 3. WAIT FOR TPU TO FINISH CHUNK N
+            #         # ==========================================
+            #         print("Blocking for logprobs for nth chunk", flush=True)
+            #         print(time.perf_counter()-forward_start, flush=True)
+            #         row_logprobs_dev.block_until_ready()
+            #         forward_end = time.perf_counter()
+            #         print("logprobs are here", flush=True)
+            #         print(time.perf_counter()-forward_start, flush=True)
+            #         row_logprobs = np.asarray(jax.device_get(row_logprobs_dev), dtype=np.float64)
+            #         print("Before softmax", flush=True)
+            #         print(time.perf_counter()-forward_start, flush=True)
+            #         # 4. Do the fast NumPy Math
+            #         token_prob_vals = np.exp(row_logprobs)
+            #         if recv_req.apply_softmax:
+            #             row_max = np.max(token_prob_vals, axis=1, keepdims=True)
+            #             stable = token_prob_vals - row_max
+            #             exp_vals = np.exp(stable)
+            #             denom = np.sum(exp_vals, axis=1, keepdims=True)
+            #             scores_np = exp_vals / denom
+            #         else:
+            #             scores_np = token_prob_vals
+                    
+            #         print("After softmax", flush=True)
+            #         print(time.perf_counter()-forward_start, flush=True)
+            #         all_scores.extend(scores_np.tolist())
+
+            #         # 5. Telemetry & Cleanup
+            #         chunk_device_compute_s = max(0.0, forward_end - forward_start)
+            #         chunk_total_s = max(0.0, time.perf_counter() - chunk_host_start)
+            #         host_orchestration_s += max(0.0, chunk_total_s - chunk_device_compute_s)
+            #         dispatch_count += 1
+            #         device_compute_s += chunk_device_compute_s
+
+            #         self._release_score_from_cache_v2_chunk_reqs(reqs, batch=batch)
+
+            #         # 6. Shift pointers for next iteration
+            #         reqs, batch, model_worker_batch = next_reqs, next_batch, next_model_worker_batch
+
+            # finally:
+            #     # Guaranteed cleanup if anything crashes
+            #     if reqs is not None:
+            #         self._release_score_from_cache_v2_chunk_reqs(reqs, batch=batch)
+            #     if next_reqs is not None:
+            #         self._release_score_from_cache_v2_chunk_reqs(next_reqs, batch=next_batch)
+
+            all_scores: list[list[float]] = []
+            
+            # =========================================================
+            # 1. PRE-BUILD & DISPATCH CHUNK 0 OUTSIDE THE LOOP
+            # We pay the 11ms dispatch tax upfront exactly once.
+            # =========================================================
+            curr_chunk_items = recv_req.items_2d[0 : items_per_step]
+            curr_reqs = self._build_score_from_cache_v2_chunk_reqs(
+                recv_req.cache_handle, curr_chunk_items, recv_req.label_token_ids,
+                cached_last_node, prefix_indices, prefix_ids, cached_extra_key, False
+            )
+            curr_batch = ScheduleBatch.init_new(
+                reqs=curr_reqs, req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tree_cache=self.tree_cache, model_config=self.model_config,
+                enable_overlap=self.enable_overlap, spec_algorithm=self.spec_algorithm,
+                enable_custom_logit_processor=False, chunked_req=None, mesh=self.mesh,
+            )
+            curr_batch.prepare_for_extend()
+            curr_batch.bid = acc_global_bid()
+            
+            paddings = self.tp_worker.get_precompile_paddings()
+            curr_worker_batch = curr_batch.get_model_worker_batch(
+                paddings[0], paddings[1], paddings[2], self.page_size, self.server_args.enable_static_lora
+            )
+
+            # DISPATCH CHUNK 0 TO TPU
+            logits_output_0, _, _ = self.tp_worker.forward_batch_generation(
+                model_worker_batch=curr_worker_batch, launch_done=None, skip_sample=True, sampling_metadata=None,
+            )
+            next_token_logits_0 = logits_output_0.next_token_logits[: curr_worker_batch.real_bs, :]
+            out_sharding = NamedSharding(self.mesh, P(None, None))
+            curr_future = _compute_label_only_logprobs(
+                next_token_logits_0, label_token_ids_arr, out_sharding
+            )
+
+            try:
+                # NOTE: Loop starts at `items_per_step` because Chunk 0 is already running!
+                for start in range(items_per_step, total_items, items_per_step):
+                    chunk_host_start = time.perf_counter()
+                    
+                    # =========================================================
+                    # 2. BUILD CHUNK N+1 (Takes ~6ms)
+                    # The TPU is currently crunching Chunk N.
+                    # =========================================================
+                    next_chunk_items = recv_req.items_2d[start : start + items_per_step]
+                    next_reqs = self._build_score_from_cache_v2_chunk_reqs(
+                        recv_req.cache_handle, next_chunk_items, recv_req.label_token_ids,
+                        cached_last_node, prefix_indices, prefix_ids, cached_extra_key, False
                     )
+                    next_batch = ScheduleBatch.init_new(
+                        reqs=next_reqs, req_to_token_pool=self.req_to_token_pool,
+                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        tree_cache=self.tree_cache, model_config=self.model_config,
+                        enable_overlap=self.enable_overlap, spec_algorithm=self.spec_algorithm,
+                        enable_custom_logit_processor=False, chunked_req=None, mesh=self.mesh,
+                    )
+                    next_batch.prepare_for_extend()
+                    next_batch.bid = acc_global_bid()
+                    next_worker_batch = next_batch.get_model_worker_batch(
+                        paddings[0], paddings[1], paddings[2], self.page_size, self.server_args.enable_static_lora
+                    )
+
+                    # =========================================================
+                    # 3. DISPATCH CHUNK N+1 TO XLA QUEUE (Takes ~11ms)
+                    # The TPU is *still* crunching Chunk N! 
+                    # This completely hides the 11ms CPU dispatch tax!
+                    # =========================================================
+                    logits_output_1, _, _ = self.tp_worker.forward_batch_generation(
+                        model_worker_batch=next_worker_batch, launch_done=None, skip_sample=True, sampling_metadata=None,
+                    )
+                    next_token_logits_1 = logits_output_1.next_token_logits[: next_worker_batch.real_bs, :]
+                    next_future = _compute_label_only_logprobs(
+                        next_token_logits_1, label_token_ids_arr, out_sharding
+                    )
+
+                    # =========================================================
+                    # 4. WAIT FOR CHUNK N TO FINISH 
+                    # =========================================================
+                    curr_future.block_until_ready()
+                    
+                    row_logprobs = np.asarray(jax.device_get(curr_future), dtype=np.float64)
+
+                    # 5. Softmax & Cleanup for Chunk N
+                    token_prob_vals = np.exp(row_logprobs)
+                    if recv_req.apply_softmax:
+                        row_max = np.max(token_prob_vals, axis=1, keepdims=True)
+                        stable = token_prob_vals - row_max
+                        exp_vals = np.exp(stable)
+                        denom = np.sum(exp_vals, axis=1, keepdims=True)
+                        scores_np = exp_vals / denom
+                    else:
+                        scores_np = token_prob_vals
+                        
+                    all_scores.extend(scores_np.tolist())
+
+                    # CRITICAL: Free Chunk N memory *before* the loop restarts.
+                    # This ensures SGLang sees a perfectly balanced memory pool.
+                    self._release_score_from_cache_v2_chunk_reqs(curr_reqs, batch=curr_batch)
+
+                    # 6. Shift Pointers for the next loop
+                    curr_future = next_future
+                    curr_reqs = next_reqs
+                    curr_batch = next_batch
+                    curr_worker_batch = next_worker_batch
+
+                # =========================================================
+                # 7. DRAIN THE FINAL CHUNK
+                # =========================================================
+                curr_future.block_until_ready()
+                row_logprobs = np.asarray(jax.device_get(curr_future), dtype=np.float64)
+                
+                token_prob_vals = np.exp(row_logprobs)
+                if recv_req.apply_softmax:
+                    row_max = np.max(token_prob_vals, axis=1, keepdims=True)
+                    stable = token_prob_vals - row_max
+                    exp_vals = np.exp(stable)
+                    denom = np.sum(exp_vals, axis=1, keepdims=True)
+                    scores_np = exp_vals / denom
                 else:
-                    chunk_scores, chunk_device_compute_s, chunk_host_overhead_s = (
-                        self._run_score_from_cache_v2_chunk(
-                            cache_handle=recv_req.cache_handle,
-                            chunk_items=chunk_items,
-                            label_token_ids=recv_req.label_token_ids,
-                            apply_softmax=recv_req.apply_softmax,
-                            cached_last_node=cached_last_node,
-                            cached_prefix_indices=prefix_indices,
-                            prefix_ids=prefix_ids,
-                            cached_extra_key=cached_extra_key,
-                        )
-                    )
-                all_scores.extend(chunk_scores)
-                dispatch_count += 1
-                device_compute_s += max(0.0, chunk_device_compute_s)
-                # host_orchestration_s excludes device time by design.
-                chunk_total = max(0.0, time.perf_counter() - chunk_host_start)
-                host_orchestration_s += max(
-                    0.0,
-                    max(chunk_host_overhead_s, chunk_total - chunk_device_compute_s),
-                )
+                    scores_np = token_prob_vals
+                    
+                all_scores.extend(scores_np.tolist())
+
+            finally:
+                # Guaranteed cleanup
+                if curr_reqs is not None:
+                    self._release_score_from_cache_v2_chunk_reqs(curr_reqs, batch=curr_batch)
 
             if len(all_scores) != total_items:
                 return self._score_from_cache_v2_fallback_output(

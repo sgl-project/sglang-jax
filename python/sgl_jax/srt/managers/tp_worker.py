@@ -538,15 +538,29 @@ class ModelWorker:
 
         self.dump_topk_ids(layers_topk_ids, model_worker_batch)
 
+        # if launch_done is not None:
+        #     launch_done.set()
+
+        # self.sync_queue.put(
+        #     (
+        #         layers_topk_ids,
+        #         model_worker_batch,
+        #     )
+        # )
+
+        if not skip_sample:
+            self.dump_topk_ids(layers_topk_ids, model_worker_batch)
+            
+            self.sync_queue.put(
+                (
+                    layers_topk_ids,
+                    model_worker_batch,
+                )
+            )
+
+        # Keep launch_done outside, as the scheduler might still rely on this event
         if launch_done is not None:
             launch_done.set()
-
-        self.sync_queue.put(
-            (
-                layers_topk_ids,
-                model_worker_batch,
-            )
-        )
 
         # SAVE last layer logits
         save_logits_file_info = os.getenv("DUMP_LAST_LAYER_LOGITS_FILENAMES", None)
