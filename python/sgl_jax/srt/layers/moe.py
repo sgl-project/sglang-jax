@@ -325,6 +325,25 @@ class EPMoE(nnx.Module):
         num_experts, out_dim, in_dim = weight.shape
 
         if scale.ndim == 4:
+            if scale.shape[0] != num_experts or scale.shape[2] != 1 or scale.shape[3] != out_dim:
+                raise ValueError(
+                    f"Unsupported {scale_name} shape {scale.shape} for weight shape {weight.shape}. "
+                    "Expected 4D GMM scale layout [E, k_blocks, 1, out_dim]."
+                )
+            if self.weight_block_size is None:
+                if scale.shape[1] != 1:
+                    raise ValueError(
+                        f"Unsupported {scale_name} shape {scale.shape} for weight shape {weight.shape}. "
+                        "Per-channel 4D GMM scales must have k_blocks=1."
+                    )
+            else:
+                block_size_k = int(self.weight_block_size[1])
+                expected_k_blocks = (in_dim + block_size_k - 1) // block_size_k
+                if scale.shape[1] not in (1, expected_k_blocks):
+                    raise ValueError(
+                        f"Unsupported {scale_name} shape {scale.shape} for weight shape {weight.shape}. "
+                        f"Expected k_blocks dimension to be 1 or {expected_k_blocks}."
+                    )
             return scale
 
         if scale.ndim == 2 and scale.shape == (num_experts, out_dim):

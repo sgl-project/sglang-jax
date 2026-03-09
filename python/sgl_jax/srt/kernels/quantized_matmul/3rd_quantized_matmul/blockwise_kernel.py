@@ -9,10 +9,11 @@ from jax.experimental.pallas import tpu as pltpu
 
 from . import util
 from .tuned_block_sizes import (
-    TunedValue, get_device_vmem_limit, get_tuned_block_sizes)
-from .util import (get_kernel_name,
-                                                         next_multiple,
-                                                         unfold_args)
+    TunedValue,
+    get_device_vmem_limit,
+    get_tuned_block_sizes,
+)
+from .util import get_kernel_name, next_multiple, unfold_args
 
 quantize_tensor = util.quantize_tensor
 MXU_SIZE = 256
@@ -215,7 +216,7 @@ def quantized_matmul_kernel(
             out_specs=pl.BlockSpec((batch_block_size, out_block_size),
                                    lambda b, o, i: (b, o)),
             scratch_shapes=[
-                pltpu.VMEM((batch_block_size, out_block_size), jnp.bfloat16)
+                pltpu.VMEM((batch_block_size, out_block_size), acc_dtype)
             ],
             grid=(n_batch, n_out, n_in),
         ),

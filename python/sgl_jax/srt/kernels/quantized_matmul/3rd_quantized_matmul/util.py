@@ -5,9 +5,12 @@ from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
-from jax._src import dtypes
 
 from .tuned_block_sizes import TunedValue
+
+
+def _dtype_bits(dtype: jnp.dtype) -> int:
+    return jnp.dtype(dtype).itemsize * 8
 
 
 def unfold_args(
@@ -191,7 +194,8 @@ def quantize_array(
 
     # TODO(kyuyeunk): Investigate performance gain from non xlu transpose.
     scale = jnp.transpose(x_abs_max / dtype_max)
-    scale_inv = jnp.nan_to_num(1 / scale, dtype_max)
+    scale = jnp.where(scale == 0, 1.0, scale)
+    scale_inv = jnp.nan_to_num(1 / scale, nan=dtype_max, posinf=dtype_max, neginf=-dtype_max)
     return (x * scale_inv).astype(quant_dtype), scale.astype(jnp.float32)
 
 
@@ -215,13 +219,11 @@ def get_vmem_limit(
     """Calculate VMEM limit for the kernel."""
 
     # Calculate in/out VMEM size.
-    x_size = (batch_block_size * in_block_size * dtypes.itemsize_bits(x_dtype))
-    x_abs_max_size = batch_block_size * dtypes.itemsize_bits(scale_dtype)
-    w_q_size = (out_block_size * in_block_size *
-                dtypes.itemsize_bits(w_q_dtype))
-    w_scale_size = out_block_size * dtypes.itemsize_bits(scale_dtype)
-    out_size = (batch_block_size * out_block_size *
-                dtypes.itemsize_bits(out_dtype))
+    x_size = batch_block_size * in_block_size * _dtype_bits(x_dtype)
+    x_abs_max_size = batch_block_size * _dtype_bits(scale_dtype)
+    w_q_size = out_block_size * in_block_size * _dtype_bits(w_q_dtype)
+    w_scale_size = out_block_size * _dtype_bits(scale_dtype)
+    out_size = batch_block_size * out_block_size * _dtype_bits(out_dtype)
 
     vmem_in_out = x_size + x_abs_max_size + w_q_size + w_scale_size + out_size
     vmem_in_out *= 2  # Account for compute and vreg spills.
@@ -235,11 +237,9 @@ def get_vmem_limit(
     vmem_in_out += out_size if (n_batch > 1 or n_out > 1) else 0
 
     # Calculate scratch VMEM size.
-    acc_size = (batch_block_size * out_block_size *
-                dtypes.itemsize_bits(acc_dtype))
-    x_q_size = (batch_block_size * in_block_size *
-                dtypes.itemsize_bits(x_q_dtype))
-    x_scale_size = batch_block_size * dtypes.itemsize_bits(scale_dtype)
+    acc_size = batch_block_size * out_block_size * _dtype_bits(acc_dtype)
+    x_q_size = batch_block_size * in_block_size * _dtype_bits(x_q_dtype)
+    x_scale_size = batch_block_size * _dtype_bits(scale_dtype)
 
     vmem_scratch = acc_size if save_acc else 0
     vmem_scratch += x_q_size + x_scale_size if save_x_q else 0
@@ -277,10 +277,14 @@ def validate_inputs(
     # Verify input shapes.
     if x.shape[1] != w_q.shape[1]:
         raise ValueError(f'{x.shape[1]=} must be equal to {w_q.shape[1]=}')
-    if w_q.shape[0] != w_scale.shape[1] and (w_scale.ndim == 3 and w_q.shape[0]
-                                             != w_scale.shape[2]):
-        raise ValueError(
-            f"{w_q.shape[0]=} must be equal to {w_scale.shape[1]=}")
+    if w_scale.ndim == 2:
+        if w_q.shape[0] != w_scale.shape[1]:
+            raise ValueError(f"{w_q.shape[0]=} must be equal to {w_scale.shape[1]=}")
+    elif w_scale.ndim == 3:
+        if w_q.shape[0] != w_scale.shape[2]:
+            raise ValueError(f"{w_q.shape[0]=} must be equal to {w_scale.shape[2]=}")
+    else:
+        raise ValueError(f"Unsupported {w_scale.ndim=} for quantized weight scale.")
     if x_abs_max is not None and x_abs_max.shape != (1, x.shape[0]):
         raise ValueError(
             f"{x_abs_max.shape=} must be equal to (1, {x.shape[0]=})")
@@ -317,5 +321,5 @@ def quantize_block(data, axis, target_dtype):
     if jnp.issubdtype(target_dtype, jnp.floating):
         data_q = (data / scale).clip(dtype_min, dtype_max).astype(target_dtype)
     else:
-        data_q = jnp.round(data / scale).astype(target_dtype)
+        data_q = jnp.clip(jnp.round(data / scale), dtype_min, dtype_max).astype(target_dtype)
     return data_q, scale

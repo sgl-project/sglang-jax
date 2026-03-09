@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Linear layers."""
 
-import math
 from collections.abc import Sequence
 from functools import partial
 
@@ -165,7 +164,13 @@ class QuantizedLinear(nnx.Module):
                     )
                 bias = linear.bias.value if linear.bias is not None else None
             else:
-                weight_q = weight.T.astype(weight_dtype)
+                if weight.dtype != weight_dtype:
+                    raise ValueError(
+                        "QuantizedLinear.from_linear(..., is_static_input=True) requires "
+                        "pre-quantized concrete weights or abstract shapes. "
+                        f"Got weight.dtype={weight.dtype}, expected {weight_dtype}."
+                    )
+                weight_q = weight.T
                 if effective_weight_block_size is not None and len(effective_weight_block_size) == 2:
                     block_n, block_k = int(effective_weight_block_size[0]), int(effective_weight_block_size[1])
                     out_blocks = (weight_q.shape[0] + block_n - 1) // block_n
@@ -192,7 +197,7 @@ class QuantizedLinear(nnx.Module):
             weight_q=weight_q, weight_scale=weight_scale, bias=bias,
             activation_dtype=activation_dtype, mesh=linear.mesh,
             kernel_axes=linear.kernel_axes,
-            skip_bias_add=linear.skip_bias_add or linear.bias is None,
+            skip_bias_add=linear.skip_bias_add,
             params_dtype=linear.params_dtype, weight_block_size=effective_weight_block_size,
             scope_name=f"quantized_{linear.name}",
         )
@@ -212,22 +217,13 @@ class QuantizedLinear(nnx.Module):
         in_specs = (P(None, input_axis), P(output_axis, input_axis), w_scale_spec)
         out_specs = P(None, output_axis)
 
-        # Handle block size inference
-        effective_weight_block_size = self.weight_block_size
-        if scale_val.ndim == 2 and self.weight_block_size is not None:
-            global_out_size, global_in_size = self.weight_q.value.shape
-            inferred_bs_out = math.ceil(global_out_size / scale_val.shape[0])
-            inferred_bs_in = math.ceil(global_in_size / scale_val.shape[1])
-            if (inferred_bs_out != self.weight_block_size[0] or inferred_bs_in != self.weight_block_size[1]):
-                effective_weight_block_size = (inferred_bs_out, inferred_bs_in)
-
         output = shard_map(
             partial(
                 xla_quantized_matmul_local,
                 quantize_activation=quantize_activation,
                 reduce_axis=input_axis,
                 compute_dtype=self.compute_dtype,
-                weight_block_size=effective_weight_block_size,
+                weight_block_size=self.weight_block_size,
                 activation_quant_dtype=self.activation_dtype,
             ),
             mesh=self.mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False,
