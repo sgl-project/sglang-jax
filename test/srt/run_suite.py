@@ -111,7 +111,7 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
                         return process.returncode
             else:
                 if file.runner == "pytest":
-                    cmd = [sys.executable, "-m", "pytest", "-q", filename]
+                    cmd = ["uv", "run", "--with", "pytest", "python", "-m", "pytest", "-q", filename]
                 else:
                     cmd = [sys.executable, filename]
 
