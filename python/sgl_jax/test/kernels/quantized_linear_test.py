@@ -274,6 +274,59 @@ def test_linear_return_contract_with_bias():
     assert q_bias is None
 
 
+def test_linear_skip_bias_add_returns_param_bias():
+    mesh = _create_single_device_mesh()
+    x = jnp.ones((2, 64), dtype=jnp.bfloat16)
+
+    with jax.set_mesh(mesh):
+        linear = LinearBase(
+            input_size=64,
+            output_size=32,
+            use_bias=True,
+            skip_bias_add=True,
+            mesh=mesh,
+            kernel_axes=(None, None),
+            params_dtype=jnp.bfloat16,
+            scope_name="biased_skip_proj",
+        )
+        out, bias = linear(x)
+
+    assert out.shape == (2, 32)
+    assert isinstance(bias, nnx.Param)
+
+    with jax.set_mesh(mesh):
+        quant_linear = QuantizedLinear.from_linear(
+            linear,
+            weight_dtype=jnp.int8,
+            activation_dtype=None,
+            is_static_input=False,
+        )
+        q_out, q_bias = quant_linear(x)
+
+    assert q_out.shape == (2, 32)
+    assert isinstance(q_bias, nnx.Param)
+
+
+def test_linear_accepts_legacy_positional_mesh_argument():
+    mesh = _create_single_device_mesh()
+    x = jnp.ones((2, 64), dtype=jnp.bfloat16)
+
+    with jax.set_mesh(mesh):
+        linear = LinearBase(
+            64,
+            32,
+            mesh,
+            use_bias=False,
+            kernel_axes=(None, None),
+            params_dtype=jnp.bfloat16,
+            scope_name="legacy_mesh_positional",
+        )
+        out, bias = linear(x)
+
+    assert out.shape == (2, 32)
+    assert bias is None
+
+
 def test_static_linear_rejects_non_prequantized_concrete_weights():
     mesh = _create_single_device_mesh()
 
