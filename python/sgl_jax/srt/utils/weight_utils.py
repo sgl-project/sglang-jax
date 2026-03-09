@@ -53,6 +53,7 @@ class WeightMapping:
     concat_axis: int | None = None
     is_eagle3: bool = False
     physical_to_logical_map: np.ndarray | None = None
+    merge_qkv_index: int | None = None
 
     def __post_init__(self):
         if self.sharding is None:
@@ -1324,6 +1325,10 @@ class WeightLoader:
         if mapping.kv_head_padding:
             processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
 
+        if mapping.merge_qkv_index is not None:
+            self._handle_merge_qkv_weight(params, hf_key, processed_weight, mapping)
+            return
+
         sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
 
         try:
@@ -1342,6 +1347,45 @@ class WeightLoader:
         except Exception as e:
             logger.error("Failed to load %s -> %s: %s", hf_key, jax_path, str(e))
             raise
+
+    def _handle_merge_qkv_weight(
+        self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
+    ):
+        """Load a separate Q, K, or V weight into the correct slice of a fused qkv_proj weight.
+
+        merge_qkv_index: 0 = Q, 1 = K, 2 = V
+        The fused weight layout along the output axis is [Q | K | V].
+        After transpose, the output axis is axis 1 (shape: [hidden_size, q_size + 2*kv_size]).
+        """
+        jax_path = mapping.target_path
+        model_param = self._get_param(params, jax_path)
+
+        q_dim = self.num_heads * self.head_dim
+        kv_dim = self.num_kv_heads * self.head_dim
+        offsets = [0, q_dim, q_dim + kv_dim]
+        sizes = [q_dim, kv_dim, kv_dim]
+
+        idx = mapping.merge_qkv_index
+        start = offsets[idx]
+        end = start + sizes[idx]
+
+        sharded_weight = self._shard_weight(weight, mapping.sharding)
+        if sharded_weight.dtype not in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
+            sharded_weight = sharded_weight.astype(model_param.value.dtype)
+
+        # Write into the correct slice along the output dimension (axis 1 after transpose)
+        updated = model_param.value.at[:, start:end].set(sharded_weight)
+        model_param.value = updated
+
+        logger.debug(
+            "Merge QKV %s -> %s[:%d, %d:%d], shape: %s",
+            hf_key,
+            jax_path,
+            weight.shape[0],
+            start,
+            end,
+            weight.shape,
+        )
 
     def _handle_split_weight(
         self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
