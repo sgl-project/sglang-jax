@@ -59,7 +59,7 @@ class LinearBase(nnx.Module):
         else:
             self.bias = None
 
-    def __call__(self, x: jax.Array) -> jax.Array | tuple[jax.Array, jax.Array]:
+    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass."""
         x_2d = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
 
@@ -88,7 +88,7 @@ class LinearBase(nnx.Module):
         if self.skip_bias_add:
             return out, (self.bias.value if self.bias is not None else None)
         if self.bias is not None:
-            return out + self.bias.value
+            out = out + self.bias.value
         return out, None
 
 
@@ -176,7 +176,7 @@ class QuantizedLinear(nnx.Module):
                 bias = linear.bias.value if linear.bias is not None else None
         else:
             weight = linear.weight.value
-            weight_t = weight.T 
+            weight_t = weight.T
 
             if effective_weight_block_size is not None and len(effective_weight_block_size) == 2:
                 weight_q, weight_scale = quantize_tensor(
@@ -197,7 +197,7 @@ class QuantizedLinear(nnx.Module):
             scope_name=f"quantized_{linear.name}",
         )
 
-    def __call__(self, x: jax.Array) -> jax.Array | tuple[jax.Array, jax.Array]:
+    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass with quantization."""
         quantize_activation = self.activation_dtype is not None
         x_2d = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
@@ -208,7 +208,7 @@ class QuantizedLinear(nnx.Module):
 
         input_axis, output_axis = self.kernel_axes[0], self.kernel_axes[1]
         w_scale_spec = P(output_axis) if scale_val.ndim == 1 else P(output_axis, input_axis)
-        
+
         in_specs = (P(None, input_axis), P(output_axis, input_axis), w_scale_spec)
         out_specs = P(None, output_axis)
 
@@ -239,5 +239,5 @@ class QuantizedLinear(nnx.Module):
         if self.skip_bias_add:
             return output, (self.bias.value if self.bias is not None else None)
         if self.bias is not None:
-            return output + self.bias.value
-        return output
+            output = output + self.bias.value
+        return output, None
