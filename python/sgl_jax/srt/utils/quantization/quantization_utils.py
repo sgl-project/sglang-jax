@@ -10,7 +10,7 @@ from flax import nnx
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.configs.quantization_config import DTYPE_MAP
+from sgl_jax.srt.configs.quantization_config import DTYPE_MAP, _normalize_weight_block_size
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +103,7 @@ def apply_linear_quantization(
             if "weight_block_size" in rule
             else getattr(quant_config, "weight_block_size", None)
         )
+        weight_block_size = _normalize_weight_block_size(weight_block_size)
 
         # Convert string dtypes to jnp dtypes
         weight_dtype = DTYPE_MAP.get(weight_dtype_str)
@@ -120,7 +121,7 @@ def apply_linear_quantization(
             }
         )
 
-    ignored_layers = getattr(quant_config, "ignored_layers", None) or []
+    ignored_layers = quant_config.ignored_layers or []
 
     def _find_matching_rule(path: str):
         """Find the first rule that matches the given module path."""
@@ -147,8 +148,11 @@ def apply_linear_quantization(
                 if isinstance(attr_value, LinearBase):
                     # Check if this path matches any rule
                     dot_path = child_path.replace("/", ".")
-                    if any(dot_path.endswith(ignored) or ignored in dot_path for ignored in ignored_layers):
-                        logger.info("Skipping %s - in ignored_layers", child_path)
+                    if any(
+                        dot_path == ignored or dot_path.endswith(f".{ignored}")
+                        for ignored in ignored_layers
+                    ):
+                        logger.info("Skipping %s - in ignored_layers", dot_path)
                         continue
 
                     rule = _find_matching_rule(child_path)

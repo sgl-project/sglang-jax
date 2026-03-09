@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Quantized matmul kernel."""
 
+import functools
 import importlib
+import logging
 import math
+import re
 
 import jax
 import jax.numpy as jnp
 from jax import lax
 
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor_simple
+
+logger = logging.getLogger(__name__)
 
 
 _BLOCKWISE_3RD_KERNEL = None
@@ -32,6 +37,7 @@ def _get_blockwise_3rd_kernel():
         module = importlib.import_module(f"{package}.3rd_quantized_matmul")
         _BLOCKWISE_3RD_KERNEL = getattr(module, "quantized_matmul", None)
     except Exception:
+        logger.debug("Failed to import third-party blockwise quantized matmul kernel.", exc_info=True)
         _BLOCKWISE_3RD_KERNEL = None
     return _BLOCKWISE_3RD_KERNEL
 
@@ -58,6 +64,7 @@ def _get_blockwise_3rd_tuning_api():
         _BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES = getattr(module, "get_tuned_block_sizes", None)
         _BLOCKWISE_3RD_TUNED_BLOCK_SIZES = getattr(module, "TUNED_BLOCK_SIZES", None)
     except Exception:
+        logger.debug("Failed to import third-party blockwise tuning metadata.", exc_info=True)
         _BLOCKWISE_3RD_TUNED_VALUE_CLS = None
         _BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES = None
         _BLOCKWISE_3RD_TUNED_BLOCK_SIZES = None
@@ -102,6 +109,18 @@ def _nearest_power_of_two_multiple(x: int, base: int, upper_bound: int) -> int:
     return min(candidates, key=lambda value: (abs(value - x), -value))
 
 
+@functools.lru_cache(maxsize=1)
+def _get_current_tpu_version() -> int:
+    try:
+        kind = jax.devices()[0].device_kind
+    except Exception:
+        return -1
+    match = re.match(r"^TPU[^\d]*(\d+)", kind)
+    if match is None:
+        return -1
+    return int(match.group(1))
+
+
 def _iter_blockwise_tuned_candidates(
     tuned_block_sizes: dict | None,
     n_batch: int,
@@ -109,6 +128,7 @@ def _iter_blockwise_tuned_candidates(
     n_in: int,
     x_q_dtype: jnp.dtype,
     w_q_dtype: jnp.dtype,
+    tpu_version: int,
 ):
     if not tuned_block_sizes:
         return []
@@ -121,6 +141,8 @@ def _iter_blockwise_tuned_candidates(
 
     candidates = []
     for key, value in tuned_block_sizes.items():
+        if getattr(key, "tpu_version", tpu_version) != tpu_version:
+            continue
         if key.w_q_dtype != w_q_dtype_name:
             continue
         if key.x_q_dtype not in compatible_x_dtype_names:
@@ -162,6 +184,7 @@ def _get_safe_blockwise_tuned_value(
         n_in=n_in,
         x_q_dtype=x_q_dtype,
         w_q_dtype=w_q_dtype,
+        tpu_version=_get_current_tpu_version(),
     )
     if compatible_candidates:
         tuned = compatible_candidates[0]
@@ -175,6 +198,7 @@ def _get_safe_blockwise_tuned_value(
                 w_q_dtype=jnp.dtype(w_q_dtype).name,
             )
         except Exception:
+            logger.debug("Failed to query tuned block sizes from third-party kernel.", exc_info=True)
             tuned = None
     if tuned is None:
         tuned = tuned_value_cls(128, 128, 128, 1)
@@ -356,6 +380,7 @@ def xla_quantized_matmul_local(
                     tuned_value=tuned_value,
                 )
             except Exception:
+                logger.debug("Falling back from third-party blockwise kernel to local dequant path.", exc_info=True)
                 out = None
 
         if out is None:

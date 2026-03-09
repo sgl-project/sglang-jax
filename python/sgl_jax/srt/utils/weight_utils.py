@@ -206,6 +206,11 @@ class WeightLoader:
             return weight
 
         num_experts, k_blocks, _, out_dim = model_param.value.shape
+        if model_param.value.shape[2] != 1:
+            raise ValueError(
+                f"Expected kernel-ready EPMoE scale placeholder to have singleton dim=1, "
+                f"got shape={model_param.value.shape} for {target_path}"
+            )
         if weight.ndim == 2 and weight.shape == (num_experts, out_dim):
             return weight[:, None, None, :]
 
@@ -213,8 +218,7 @@ class WeightLoader:
             return weight
 
         if weight.shape == (num_experts, out_dim, k_blocks):
-            weight_host = np.asarray(jax.device_get(weight))
-            return jnp.asarray(np.transpose(weight_host, (0, 2, 1))[:, :, None, :])
+            return jnp.expand_dims(jnp.transpose(weight, (0, 2, 1)), axis=2)
 
         if weight.shape == (num_experts, k_blocks, out_dim):
             return weight[:, :, None, :]
@@ -238,10 +242,9 @@ class WeightLoader:
             weight.shape,
             model_param.value.shape,
         )
-        weight_host = np.asarray(jax.device_get(weight))
         out_block_ids = np.arange(out_dim, dtype=np.int32) // block_size_out
-        scale_per_out = np.take(weight_host, out_block_ids, axis=1)
-        return jnp.asarray(np.transpose(scale_per_out, (0, 2, 1))[:, :, None, :])
+        scale_per_out = jnp.take(weight, jnp.asarray(out_block_ids), axis=1)
+        return jnp.expand_dims(jnp.transpose(scale_per_out, (0, 2, 1)), axis=2)
 
     def _scan_weight_info(self) -> dict[str, list[dict]]:
         """
