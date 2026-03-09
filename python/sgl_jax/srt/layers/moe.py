@@ -319,6 +319,19 @@ class EPMoE(nnx.Module):
         *,
         scale_name: str,
     ) -> jax.Array | None:
+        """Normalize offline/runtime scale tensors to GMM's 4D layout.
+
+        Accepted inputs intentionally cover the layouts we see in practice:
+
+        - per-channel: ``[E, out_dim]``
+        - already-kernel-ready: ``[E, k_blocks, 1, out_dim]``
+        - sub-channel / block-channel: ``[E, out_dim, k_blocks]`` or
+          ``[E, k_blocks, out_dim]``
+        - offline 2D block quant: ``[E, out_blocks, k_blocks]``
+
+        The returned tensor always matches the GMM contract
+        ``[E, k_blocks, 1, out_dim]``.
+        """
         if scale is None:
             return None
 
@@ -409,6 +422,12 @@ class EPMoE(nnx.Module):
         def _get_block_size_k(
             *, hidden_size: int, intermediate_dim: int, weight_block_size: list[int] | tuple[int, int] | None
         ) -> int | None:
+            """Extract the contracting-dimension block size for MoE weights.
+
+            EPMoE only block-quantizes along the GEMM ``K`` dimension, so for a
+            configured ``(block_n, block_k)`` we consume only ``block_k`` here.
+            The divisibility checks keep the later GMM scale layout well-defined.
+            """
             if weight_block_size is None:
                 return None
             if not (isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2):

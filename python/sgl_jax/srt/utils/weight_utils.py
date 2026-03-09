@@ -198,7 +198,19 @@ class WeightLoader:
         model_param: nnx.Variable,
         target_path: str,
     ) -> jax.Array:
-        """Convert offline EPMoE scales into the 4D layout expected by GMM."""
+        """Convert offline EPMoE scales into the 4D layout expected by GMM.
+
+        Offline checkpoints may store MoE scales in one of several compact
+        layouts, for example:
+
+        - per-channel: ``[E, out_dim]``
+        - block-channel: ``[E, out_dim, k_blocks]`` or ``[E, k_blocks, out_dim]``
+        - 2D block quant: ``[E, out_blocks, k_blocks]``
+
+        The runtime GMM kernel consumes only ``[E, k_blocks, 1, out_dim]``.
+        This helper performs the cheap layout conversion during weight loading
+        so the forward path does not need to reinterpret checkpoint tensors.
+        """
         if not target_path.endswith(("wi_0_scale", "wi_1_scale", "wo_scale")):
             return weight
 

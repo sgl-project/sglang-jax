@@ -77,18 +77,26 @@ def _get_blockwise_3rd_tuning_api():
 
 
 def _next_multiple(x: int, m: int) -> int:
+    """Round ``x`` up to the next multiple of ``m``."""
     if m <= 0:
         return x
     return ((x + m - 1) // m) * m
 
 
 def _floor_multiple(x: int, m: int) -> int:
+    """Round ``x`` down to a positive multiple of ``m``."""
     if m <= 0:
         return x
     return max(m, (x // m) * m)
 
 
 def _nearest_power_of_two_multiple(x: int, base: int, upper_bound: int) -> int:
+    """Snap ``x`` to a nearby power-of-two multiple of ``base``.
+
+    The imported TPU blockwise kernel is more reliable with tile sizes that are
+    aligned to the compute tile width. This helper keeps the candidate near the
+    requested value while respecting the local matrix bound.
+    """
     if base <= 0:
         return x
 
@@ -111,6 +119,7 @@ def _nearest_power_of_two_multiple(x: int, base: int, upper_bound: int) -> int:
 
 @functools.lru_cache(maxsize=1)
 def _get_current_tpu_version() -> int:
+    """Return the current TPU major version, or ``-1`` when unavailable."""
     try:
         kind = jax.devices()[0].device_kind
     except Exception:
@@ -130,6 +139,12 @@ def _iter_blockwise_tuned_candidates(
     w_q_dtype: jnp.dtype,
     tpu_version: int,
 ):
+    """Return compatible tuned-size candidates ordered by closeness.
+
+    We first filter by TPU version and weight dtype, then rank surviving
+    entries by activation dtype compatibility and distance from the requested
+    ``(n_batch, n_out, n_in)`` shape.
+    """
     if not tuned_block_sizes:
         return []
 
@@ -201,6 +216,8 @@ def _get_safe_blockwise_tuned_value(
             logger.debug("Failed to query tuned block sizes from third-party kernel.", exc_info=True)
             tuned = None
     if tuned is None:
+        # Last-resort seed. Final sizes are still clamped to the current local
+        # shape below, so this does not force a fixed launch shape.
         tuned = tuned_value_cls(128, 128, 128, 1)
 
     n_lane_multiplier = max(1, int(tuned.n_lane_multiplier))
@@ -226,7 +243,12 @@ def _get_effective_block_sizes(
     w_scale: jax.Array,
     weight_block_size: tuple[int, int] | None,
 ) -> tuple[int, int]:
-    """Infer effective (out, in) block sizes from shape metadata."""
+    """Infer effective ``(block_n, block_k)`` from weights and scales.
+
+    When a rule provides ``weight_block_size`` we trust that explicitly.
+    Otherwise, this recovers the block sizes from the compact block-scale shape
+    carried by an offline checkpoint.
+    """
     out_dim, in_dim = w_q.shape
     out_blocks, in_blocks = w_scale.shape
 
@@ -265,7 +287,12 @@ def _expand_block_scales_to_weight_shape(
     block_size_out: int,
     block_size_in: int,
 ) -> jax.Array:
-    """Expand block scales to full [n_out, n_in] layout."""
+    """Expand compact block scales to full ``[n_out, n_in]`` layout.
+
+    This is only used by the local dequantized fallback path. The third-party
+    TPU kernel consumes compact scales directly after a dedicated layout
+    conversion.
+    """
     out_blocks, in_blocks = w_scale.shape
 
     row_idx = jnp.arange(out_dim, dtype=jnp.int32) // jnp.int32(block_size_out)
@@ -282,7 +309,13 @@ def _convert_block_scale_to_3rd_layout(
     block_size_out: int,
     block_size_in: int,
 ) -> jax.Array:
-    """Convert [out_blocks, in_blocks] scale to [in_blocks, 1, n_out]."""
+    """Convert our block-scale layout to the imported TPU kernel layout.
+
+    The layer/checkpoint-facing format is ``[out_blocks, in_blocks]``.
+    The third-party kernel expects one scale per input block and output
+    channel: ``[in_blocks, 1, n_out]``. We therefore replicate each output
+    block's scale across the channels inside that block before transposing.
+    """
     needed_out_blocks = math.ceil(out_dim / block_size_out)
     needed_in_blocks = math.ceil(in_dim / block_size_in)
 
