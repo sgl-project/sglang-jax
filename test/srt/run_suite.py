@@ -486,6 +486,10 @@ suites = {
         TestFile("test/srt/test_model_loader.py", 5),
         TestFile("test/srt/quantization/test_w8_quantization.py", 10),
         TestFile("test/srt/quantization/test_w8_block_dynamic_quantization.py", 8, runner="pytest"),
+        TestFile(
+            "test/srt/quantization/test_w8_moe_block_linear_channel_quantization.py",
+            15,
+        ),
         TestFile("test/srt/test_engine_determine_generation.py", 5),
         TestFile("test/srt/test_engine_flush_cache.py", 5),
         TestFile("test/srt/test_engine_pause_continue.py", 6),
