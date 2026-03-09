@@ -19,7 +19,15 @@ def _get_block_reshape_sharding(
     tensor: jax.Array,
     quantized_axes: list[int],
 ) -> NamedSharding | None:
-    """Preserve explicit sharding when splitting axes into (num_blocks, block)."""
+    """Extend sharding specs for block reshapes.
+
+    ``quantize_tensor()`` reshapes a quantized axis into ``(num_blocks, block)``
+    before reducing over the new block axis. When the input already has explicit
+    sharding, we need a matching sharding spec for the reshaped tensor:
+
+    - keep the original sharding on the new ``num_blocks`` axis
+    - mark the inner ``block`` axis as replicated
+    """
     input_sharding = getattr(tensor, "sharding", None)
     if not isinstance(input_sharding, NamedSharding):
         return None
@@ -39,7 +47,13 @@ def _get_safe_block_quant_input_sharding(
     tensor: jax.Array,
     quantized_axes: list[int],
 ) -> NamedSharding | None:
-    """Drop sharding on axes that are about to be split into (num_blocks, block)."""
+    """Drop sharding on axes that cannot be safely split for block quant.
+
+    Some explicit shardings become invalid once an axis is reshaped into
+    ``(num_blocks, block)``. In those cases we temporarily make the quantized
+    axis replicated, perform the block quantization reshape/reduction, and let
+    callers restore a suitable sharding afterwards.
+    """
     input_sharding = getattr(tensor, "sharding", None)
     if not isinstance(input_sharding, NamedSharding):
         return None

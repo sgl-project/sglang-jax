@@ -59,6 +59,12 @@ def _resolve_config_path(config_path: str) -> str:
 def _normalize_weight_block_size(
     weight_block_size: list[int] | tuple[int, int] | None,
 ) -> tuple[int, int] | None:
+    """Validate and canonicalize ``weight_block_size`` to ``(block_n, block_k)``.
+
+    The YAML parser can hand us either lists or tuples. Downstream code assumes
+    a stable 2-tuple of positive integers, so we normalize once here and let
+    callers share the same validation rules.
+    """
     if weight_block_size is None:
         return None
     if not isinstance(weight_block_size, (list, tuple)) or len(weight_block_size) != 2:
