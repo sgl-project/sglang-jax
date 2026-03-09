@@ -9,7 +9,8 @@ from jax.sharding import Mesh
 
 import sgl_jax.srt.kernels.quantized_matmul.kernel as quant_kernel
 from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
-from sgl_jax.srt.layers.linear import QuantizedLinear
+from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
+from sgl_jax.srt.utils.quantization.quantization_utils import apply_linear_quantization
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
 
@@ -183,8 +184,55 @@ def test_blockwise_tuning_fallback_uses_compatible_seed(monkeypatch):
     _assert_blockwise_tuning_fallback_uses_compatible_seed()
 
 
+def test_linear_rule_weight_block_size_override():
+    class DummyModel(nnx.Module):
+        def __init__(self, mesh):
+            self.proj = LinearBase(
+                input_size=256,
+                output_size=512,
+                use_bias=False,
+                mesh=mesh,
+                kernel_axes=(None, None),
+                params_dtype=jnp.bfloat16,
+                scope_name="proj",
+            )
+
+    mesh = _create_single_device_mesh()
+    model = DummyModel(mesh)
+
+    class FakeModelConfig:
+        pass
+
+    model_config = FakeModelConfig()
+    model_config.quantization_config = type(
+        "FakeQuantConfig",
+        (),
+        {
+            "get_linear_rules": staticmethod(
+                lambda: [
+                    {
+                        "module_path": ".*",
+                        "weight_dtype": "int8",
+                        "activation_dtype": None,
+                        "weight_block_size": None,
+                    }
+                ]
+            ),
+            "ignored_layers": None,
+            "weight_block_size": [128, 128],
+        },
+    )()
+
+    apply_linear_quantization(model_config, model, is_static_input=False)
+
+    assert isinstance(model.proj, QuantizedLinear)
+    assert model.proj.weight_block_size is None
+    assert model.proj.weight_scale.value.ndim == 1
+
+
 if __name__ == "__main__":
     for fmt in ("per_channel", "block_channel", "block_quant"):
         test_quantized_linear_offline_scale_formats(fmt)
     test_xla_quantized_matmul_block_quant_all()
     _assert_blockwise_tuning_fallback_uses_compatible_seed()
+    test_linear_rule_weight_block_size_override()

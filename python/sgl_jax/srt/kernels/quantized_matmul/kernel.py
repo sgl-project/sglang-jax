@@ -219,6 +219,21 @@ def _get_effective_block_sizes(
     return block_size_out, block_size_in
 
 
+def _should_use_3rd_party_blockwise_kernel(
+    *,
+    out_dim: int,
+    block_size_out: int,
+) -> bool:
+    """Guard known-bad narrow-N TPU blockwise cases.
+
+    When a tensor-parallel column shard collapses to a single output block
+    (for example local N=128 with block_size_out=128), the third-party TPU
+    blockwise kernel can produce NaNs on Qwen3-MoE k/v projections. The local
+    dequantized fallback remains numerically stable for the same inputs.
+    """
+    return out_dim > block_size_out
+
+
 def _expand_block_scales_to_weight_shape(
     w_scale: jax.Array,
     out_dim: int,
@@ -307,7 +322,14 @@ def xla_quantized_matmul_local(
         # path as fallback for non-TPU / unavailable environments.
         out = None
         blockwise_3rd_kernel = _get_blockwise_3rd_kernel()
-        if jax.default_backend() == "tpu" and blockwise_3rd_kernel is not None:
+        if (
+            jax.default_backend() == "tpu"
+            and blockwise_3rd_kernel is not None
+            and _should_use_3rd_party_blockwise_kernel(
+                out_dim=int(out_dim),
+                block_size_out=int(block_size_out),
+            )
+        ):
             try:
                 w_scale_3rd = _convert_block_scale_to_3rd_layout(
                     w_scale=w_scale,
