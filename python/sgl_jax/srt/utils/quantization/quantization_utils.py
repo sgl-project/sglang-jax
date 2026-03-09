@@ -150,9 +150,6 @@ def apply_linear_quantization(
                     if any(dot_path.endswith(ignored) or ignored in dot_path for ignored in ignored_layers):
                         logger.info("Skipping %s - in ignored_layers", child_path)
                         continue
-                    if "self_attn.o_proj" in dot_path and ignored_layers:
-                        logger.info("Skipping %s - explicit o_proj ignore", child_path)
-                        continue
 
                     rule = _find_matching_rule(child_path)
                     if rule is not None:
@@ -244,63 +241,6 @@ def apply_moe_quantization(
                             _quantize_moe_recursive(item, item_path, visited)
 
     _quantize_moe_recursive(model)
-    return model
-
-
-def adapt_fused_moe_static_block_quant_for_kernel(
-    model: nnx.Module,
-    *,
-    target_subc_quant_wsz: int = 256,
-) -> nnx.Module:
-    """Adapt static fused-MoE block quant weights/scales before fused kernel execution.
-
-    This is a front-end compatibility step for static checkpoints whose fused MoE
-    subchannel block size is smaller than the fused kernel's supported size.
-    """
-    # Import here to avoid circular imports
-    from sgl_jax.srt.layers.moe import FusedEPMoE
-
-    adapted_count = 0
-
-    def _adapt_recursive(obj, path: str = "", visited=None):
-        nonlocal adapted_count
-        if visited is None:
-            visited = set()
-
-        obj_id = id(obj)
-        if obj_id in visited:
-            return
-        visited.add(obj_id)
-
-        if isinstance(obj, FusedEPMoE):
-            if obj.prepare_static_block_quant_for_fused_kernel(
-                target_subc_quant_wsz=target_subc_quant_wsz
-            ):
-                adapted_count += 1
-                logger.info(
-                    "Adapted static fused MoE at %s to subc=%s for fused kernel",
-                    path or getattr(obj, "name", type(obj).__name__),
-                    target_subc_quant_wsz,
-                )
-            return
-
-        if hasattr(obj, "__dict__"):
-            for attr_name, attr_value in obj.__dict__.items():
-                child_path = f"{path}/{attr_name}" if path else attr_name
-                if isinstance(attr_value, nnx.Module):
-                    _adapt_recursive(attr_value, child_path, visited)
-                elif isinstance(attr_value, list):
-                    for idx, item in enumerate(attr_value):
-                        if isinstance(item, nnx.Module):
-                            item_path = f"{child_path}[{idx}]"
-                            _adapt_recursive(item, item_path, visited)
-
-    _adapt_recursive(model)
-    if adapted_count:
-        logger.info(
-            "Completed static fused MoE block-quant kernel adaptation on %d layer(s)",
-            adapted_count,
-        )
     return model
 
 

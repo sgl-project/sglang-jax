@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import nnx
 from jax.sharding import Mesh
 
 import sgl_jax.srt.kernels.quantized_matmul.kernel as quant_kernel
@@ -101,7 +102,8 @@ def test_quantized_linear_offline_scale_formats(scale_format):
     )
 
     ref_out = jnp.dot(x, w_fp.T)
-    out = quant_linear(x)
+    out, bias = quant_linear(x)
+    assert bias is None
 
     _assert_close(f"Offline QuantizedLinear ({scale_format})", out, ref_out)
 
@@ -198,7 +200,8 @@ def test_linear_rule_weight_block_size_override():
             )
 
     mesh = _create_single_device_mesh()
-    model = DummyModel(mesh)
+    with jax.set_mesh(mesh):
+        model = DummyModel(mesh)
 
     class FakeModelConfig:
         pass
@@ -230,9 +233,108 @@ def test_linear_rule_weight_block_size_override():
     assert model.proj.weight_scale.value.ndim == 1
 
 
+def test_linear_return_contract_with_bias():
+    mesh = _create_single_device_mesh()
+    x = jnp.ones((2, 64), dtype=jnp.bfloat16)
+
+    with jax.set_mesh(mesh):
+        linear = LinearBase(
+            input_size=64,
+            output_size=32,
+            use_bias=True,
+            mesh=mesh,
+            kernel_axes=(None, None),
+            params_dtype=jnp.bfloat16,
+            scope_name="biased_proj",
+        )
+        out, bias = linear(x)
+
+    assert out.shape == (2, 32)
+    assert bias is None
+
+    with jax.set_mesh(mesh):
+        quant_linear = QuantizedLinear.from_linear(
+            linear,
+            weight_dtype=jnp.int8,
+            activation_dtype=None,
+            is_static_input=False,
+        )
+        q_out, q_bias = quant_linear(x)
+
+    assert q_out.shape == (2, 32)
+    assert q_bias is None
+
+
+def test_ignored_layers_only_skips_requested_paths():
+    class SelfAttn(nnx.Module):
+        def __init__(self, mesh):
+            self.q_proj = LinearBase(
+                input_size=64,
+                output_size=32,
+                use_bias=False,
+                mesh=mesh,
+                kernel_axes=(None, None),
+                params_dtype=jnp.bfloat16,
+                scope_name="q_proj",
+            )
+            self.o_proj = LinearBase(
+                input_size=64,
+                output_size=32,
+                use_bias=False,
+                mesh=mesh,
+                kernel_axes=(None, None),
+                params_dtype=jnp.bfloat16,
+                scope_name="o_proj",
+            )
+
+    class DummyBlock(nnx.Module):
+        def __init__(self, mesh):
+            self.self_attn = SelfAttn(mesh)
+
+    class FakeModelConfig:
+        pass
+
+    def _make_config(ignored_layers):
+        model_config = FakeModelConfig()
+        model_config.quantization_config = type(
+            "FakeQuantConfig",
+            (),
+            {
+                "get_linear_rules": staticmethod(
+                    lambda: [
+                        {
+                            "module_path": ".*",
+                            "weight_dtype": "int8",
+                            "activation_dtype": None,
+                            "weight_block_size": None,
+                        }
+                    ]
+                ),
+                "ignored_layers": ignored_layers,
+                "weight_block_size": [128, 128],
+            },
+        )()
+        return model_config
+
+    mesh = _create_single_device_mesh()
+    with jax.set_mesh(mesh):
+        model = DummyBlock(mesh)
+    apply_linear_quantization(_make_config(["some_other_layer"]), model, is_static_input=False)
+    assert isinstance(model.self_attn.q_proj, QuantizedLinear)
+    assert isinstance(model.self_attn.o_proj, QuantizedLinear)
+
+    with jax.set_mesh(mesh):
+        model = DummyBlock(mesh)
+    apply_linear_quantization(_make_config(["self_attn.o_proj"]), model, is_static_input=False)
+    assert isinstance(model.self_attn.q_proj, QuantizedLinear)
+    assert isinstance(model.self_attn.o_proj, LinearBase)
+
+
 if __name__ == "__main__":
     for fmt in ("per_channel", "block_channel", "block_quant"):
         test_quantized_linear_offline_scale_formats(fmt)
     test_xla_quantized_matmul_block_quant_all()
     _assert_blockwise_tuning_fallback_uses_compatible_seed()
     test_linear_rule_weight_block_size_override()
+    test_linear_return_contract_with_bias()
+    test_ignored_layers_only_skips_requested_paths()
