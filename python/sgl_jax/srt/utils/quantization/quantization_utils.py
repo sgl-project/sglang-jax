@@ -7,10 +7,14 @@ import re
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import NamedSharding, PartitionSpec as P
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.configs.quantization_config import DTYPE_MAP, _normalize_weight_block_size
+from sgl_jax.srt.configs.quantization_config import (
+    DTYPE_MAP,
+    _normalize_weight_block_size,
+)
 
 logger = logging.getLogger(__name__)
 

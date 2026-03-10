@@ -181,8 +181,13 @@ class QuantizedLinear(nnx.Module):
                     sharding=wq_sharding,
                 )
 
-                if effective_weight_block_size is not None and len(effective_weight_block_size) == 2:
-                    block_n, block_k = int(effective_weight_block_size[0]), int(effective_weight_block_size[1])
+                if (
+                    effective_weight_block_size is not None
+                    and len(effective_weight_block_size) == 2
+                ):
+                    block_n, block_k = int(effective_weight_block_size[0]), int(
+                        effective_weight_block_size[1]
+                    )
                     out_blocks = (out_features + block_n - 1) // block_n
                     in_blocks = (in_features + block_k - 1) // block_k
                     scale_sharding = NamedSharding(linear.mesh, P(kernel_axes[1], kernel_axes[0]))
@@ -203,8 +208,13 @@ class QuantizedLinear(nnx.Module):
                         f"Got weight.dtype={weight.dtype}, expected {weight_dtype}."
                     )
                 weight_q = weight.T
-                if effective_weight_block_size is not None and len(effective_weight_block_size) == 2:
-                    block_n, block_k = int(effective_weight_block_size[0]), int(effective_weight_block_size[1])
+                if (
+                    effective_weight_block_size is not None
+                    and len(effective_weight_block_size) == 2
+                ):
+                    block_n, block_k = int(effective_weight_block_size[0]), int(
+                        effective_weight_block_size[1]
+                    )
                     out_blocks = (weight_q.shape[0] + block_n - 1) // block_n
                     in_blocks = (weight_q.shape[1] + block_k - 1) // block_k
                     weight_scale = jnp.ones((out_blocks, in_blocks), dtype=jnp.float32)
@@ -221,14 +231,19 @@ class QuantizedLinear(nnx.Module):
             if effective_weight_block_size is not None and len(effective_weight_block_size) == 2:
                 # Block-wise quantization over [output_size, input_size].
                 weight_q, weight_scale = quantize_tensor(
-                    dtype=weight_dtype, tensor=weight_t, axis=(0, 1),
-                    block_size=tuple(effective_weight_block_size), pad_tensor=True,
+                    dtype=weight_dtype,
+                    tensor=weight_t,
+                    axis=(0, 1),
+                    block_size=tuple(effective_weight_block_size),
+                    pad_tensor=True,
                 )
             else:
                 # Per-channel quantization along output dimension.
                 # After transpose, output_size is axis 0 and input_size is axis 1.
                 # We want per-output-channel, so reduce along axis 1.
-                weight_q, weight_scale = quantize_tensor(dtype=weight_dtype, tensor=weight_t, axis=1)
+                weight_q, weight_scale = quantize_tensor(
+                    dtype=weight_dtype, tensor=weight_t, axis=1
+                )
 
             # Get bias if it exists.
             bias = linear.bias.value if linear.bias is not None else None
@@ -237,7 +252,7 @@ class QuantizedLinear(nnx.Module):
             weight_q=weight_q,
             weight_scale=weight_scale,
             bias=bias,
-            activation_dtype=activation_dtype, 
+            activation_dtype=activation_dtype,
             mesh=linear.mesh,
             kernel_axes=linear.kernel_axes,
             skip_bias_add=linear.skip_bias_add,
@@ -264,7 +279,11 @@ class QuantizedLinear(nnx.Module):
         x_2d = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
 
         scale_val = self.weight_scale.value
-        if scale_val.ndim == 2 and scale_val.shape[1] == 1 and scale_val.shape[0] == self.weight_q.value.shape[0]:
+        if (
+            scale_val.ndim == 2
+            and scale_val.shape[1] == 1
+            and scale_val.shape[0] == self.weight_q.value.shape[0]
+        ):
             scale_val = jnp.squeeze(scale_val, axis=1)
 
         # Determine if we need tensor parallel reduction.

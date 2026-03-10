@@ -2,13 +2,12 @@ import argparse
 import glob
 import os
 import shutil
-import signal
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, List, Optional
 
 from sgl_jax.srt.utils import kill_process_tree
 
@@ -17,7 +16,7 @@ from sgl_jax.srt.utils import kill_process_tree
 class TestFile:
     name: str
     estimated_time: float = 60  # in minitues
-    test_methods: Optional[List[str]] = (
+    test_methods: list[str] | None = (
         None  # Optional: specific test methods to run (e.g., ["TestClass.test_method"])
     )
     runner: str = "python"
@@ -26,8 +25,8 @@ class TestFile:
 def run_with_timeout(
     func: Callable,
     args: tuple = (),
-    kwargs: Optional[dict] = None,
-    timeout: float = None,
+    kwargs: dict | None = None,
+    timeout: float | None = None,
 ):
     """Run a function with timeout."""
     ret_value = []
@@ -57,38 +56,48 @@ def cleanup_model_cache():
                     try:
                         print(f"\nCleaning up model cache at {model_path}...", flush=True)
                         shutil.rmtree(model_path)
-                        print(f"Model cache cleaned successfully.\n", flush=True)
+                        print("Model cache cleaned successfully.\n", flush=True)
                     except Exception as e:
                         print(f"Failed to clean model cache: {e}\n", flush=True)
 
 
-def run_unittest_files(files: List[TestFile], timeout_per_file: float):
+def run_unittest_files(files: list[TestFile], timeout_per_file: float):
     tic = time.perf_counter()
     success = True
 
     for i, file in enumerate(files):
         filename, estimated_time = file.name, file.estimated_time
+        file_entry = file
+        file_index = i
+        file_count = len(files) - 1
+        file_estimated_time = estimated_time
         process = None
 
-        def run_one_file(filename):
+        def run_one_file(
+            filename,
+            file_entry=file_entry,
+            file_index=file_index,
+            file_count=file_count,
+            file_estimated_time=file_estimated_time,
+        ):
             nonlocal process
 
             filename = os.path.join(os.getcwd(), filename)
             tic = time.perf_counter()
 
             # Check if specific test methods are specified
-            if file.test_methods:
+            if file_entry.test_methods:
                 # Run specific test methods using unittest module syntax from test/srt directory
                 # Just use the filename directly (e.g., test_eval_accuracy_large.TestEvalAccuracyLarge.test_mmlu)
                 module_name = os.path.basename(filename).replace(".py", "")
 
                 print(
-                    f".\n.\nBegin ({i}/{len(files) - 1}):\nRunning specific test methods from {filename}\n",
+                    f".\n.\nBegin ({file_index}/{file_count}):\nRunning specific test methods from {filename}\n",
                     flush=True,
                 )
 
                 # Run each test method sequentially
-                for method in file.test_methods:
+                for method in file_entry.test_methods:
                     test_path = f"{module_name}.{method}"
                     print(f"Running: python3 -m unittest {test_path}\n", flush=True)
 
@@ -110,13 +119,23 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
                         cleanup_model_cache()
                         return process.returncode
             else:
-                if file.runner == "pytest":
-                    cmd = ["uv", "run", "--with", "pytest", "python", "-m", "pytest", "-q", filename]
+                if file_entry.runner == "pytest":
+                    cmd = [
+                        "uv",
+                        "run",
+                        "--with",
+                        "pytest",
+                        "python",
+                        "-m",
+                        "pytest",
+                        "-q",
+                        filename,
+                    ]
                 else:
                     cmd = [sys.executable, filename]
 
                 print(
-                    f".\n.\nBegin ({i}/{len(files) - 1}):\n{' '.join(cmd)}\n.\n.\n",
+                    f".\n.\nBegin ({file_index}/{file_count}):\n{' '.join(cmd)}\n.\n.\n",
                     flush=True,
                 )
 
@@ -130,7 +149,7 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
 
             elapsed = time.perf_counter() - tic
             print(
-                f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
+                f".\n.\nEnd ({file_index}/{file_count}):\n{filename=}, {elapsed=:.0f}, {file_estimated_time=}\n.\n.\n",
                 flush=True,
             )
 
@@ -585,10 +604,7 @@ if __name__ == "__main__":
     args = arg_parser.parse_args()
     print(f"{args=}")
 
-    if args.suite == "all":
-        files = glob.glob("**/test_*.py", recursive=True)
-    else:
-        files = suites[args.suite]
+    files = glob.glob("**/test_*.py", recursive=True) if args.suite == "all" else suites[args.suite]
 
     if args.auto_partition_size:
         files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)

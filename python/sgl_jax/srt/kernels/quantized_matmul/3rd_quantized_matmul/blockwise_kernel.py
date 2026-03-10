@@ -8,22 +8,20 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from . import util
-from .tuned_block_sizes import (
-    TunedValue,
-    get_device_vmem_limit,
-    get_tuned_block_sizes,
-)
+from .tuned_block_sizes import TunedValue, get_device_vmem_limit, get_tuned_block_sizes
 from .util import get_kernel_name, next_multiple, unfold_args
 
 quantize_tensor = util.quantize_tensor
 MXU_SIZE = 256
 
 
-@jax.jit(static_argnames=[
-    "block_size",
-    "x_q_dtype",
-    "tuned_value",
-])
+@jax.jit(
+    static_argnames=[
+        "block_size",
+        "x_q_dtype",
+        "tuned_value",
+    ]
+)
 def quantized_matmul_kernel(
     x: jax.Array,  # [bs, n_in]
     w_q: jax.Array,  # [n_out, n_in]
@@ -156,8 +154,7 @@ def quantized_matmul_kernel(
                 rhs_scale_full = w_scales_ref[i, :, :].astype(acc_dtype)
 
                 for j in range(steps_n):
-                    n_start, n_end = j * compute_tile_n, (j +
-                                                          1) * compute_tile_n
+                    n_start, n_end = j * compute_tile_n, (j + 1) * compute_tile_n
 
                     rhs_q_slice = rhs_q_full[n_start:n_end, :]
                     rhs_scale_slice = rhs_scale_full[:, n_start:n_end]
@@ -168,7 +165,7 @@ def quantized_matmul_kernel(
                     dot_res = jax.lax.dot_general(
                         lhs_q,
                         rhs_q_slice,
-                        (((1, ), (1, )), ((), ())),
+                        (((1,), (1,)), ((), ())),
                         preferred_element_type=preferred_element_type,
                     )
                     res = dot_res.astype(acc_dtype)
@@ -213,15 +210,11 @@ def quantized_matmul_kernel(
                     memory_space=pltpu.VMEM,
                 ),
             ],  # w_scale
-            out_specs=pl.BlockSpec((batch_block_size, out_block_size),
-                                   lambda b, o, i: (b, o)),
-            scratch_shapes=[
-                pltpu.VMEM((batch_block_size, out_block_size), acc_dtype)
-            ],
+            out_specs=pl.BlockSpec((batch_block_size, out_block_size), lambda b, o, i: (b, o)),
+            scratch_shapes=[pltpu.VMEM((batch_block_size, out_block_size), acc_dtype)],
             grid=(n_batch, n_out, n_in),
         ),
-        out_shape=jax.ShapeDtypeStruct((padded_n_batch, padded_n_out),
-                                       x.dtype),
+        out_shape=jax.ShapeDtypeStruct((padded_n_batch, padded_n_out), x.dtype),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel", "arbitrary"),
             vmem_limit_bytes=vmem_limit_bytes,

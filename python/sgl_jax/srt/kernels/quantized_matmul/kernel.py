@@ -37,7 +37,9 @@ def _get_blockwise_3rd_kernel():
         module = importlib.import_module(f"{package}.3rd_quantized_matmul")
         _BLOCKWISE_3RD_KERNEL = getattr(module, "quantized_matmul", None)
     except Exception:
-        logger.debug("Failed to import third-party blockwise quantized matmul kernel.", exc_info=True)
+        logger.debug(
+            "Failed to import third-party blockwise quantized matmul kernel.", exc_info=True
+        )
         _BLOCKWISE_3RD_KERNEL = None
     return _BLOCKWISE_3RD_KERNEL
 
@@ -213,7 +215,9 @@ def _get_safe_blockwise_tuned_value(
                 w_q_dtype=jnp.dtype(w_q_dtype).name,
             )
         except Exception:
-            logger.debug("Failed to query tuned block sizes from third-party kernel.", exc_info=True)
+            logger.debug(
+                "Failed to query tuned block sizes from third-party kernel.", exc_info=True
+            )
             tuned = None
     if tuned is None:
         # Last-resort seed. Final sizes are still clamped to the current local
@@ -413,7 +417,10 @@ def xla_quantized_matmul_local(
                     tuned_value=tuned_value,
                 )
             except Exception:
-                logger.debug("Falling back from third-party blockwise kernel to local dequant path.", exc_info=True)
+                logger.debug(
+                    "Falling back from third-party blockwise kernel to local dequant path.",
+                    exc_info=True,
+                )
                 out = None
 
         if out is None:

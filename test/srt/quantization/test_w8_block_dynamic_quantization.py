@@ -3,13 +3,18 @@ import re
 import sys
 import time
 import unittest
+from contextlib import suppress
 
 import requests
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sgl_jax.srt.utils import kill_process_tree
-from sgl_jax.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase, popen_launch_server
+from sgl_jax.test.test_utils import (
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
 
 
 class TestW8Int8DynamicBlockQuant(CustomTestCase):
@@ -42,10 +47,8 @@ class TestW8Int8DynamicBlockQuant(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-        try:
+        with suppress(Exception):
             cls.process.wait(timeout=30)
-        except Exception:
-            pass
         time.sleep(5)
 
     def _generate(self, prompt, max_new_tokens=16):
