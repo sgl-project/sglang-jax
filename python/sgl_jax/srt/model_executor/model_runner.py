@@ -313,27 +313,43 @@ class ModelRunner(BaseModelRunner):
         if self.model_config.quantization_config is not None:
             is_static = self.model_config.quantization_config.is_static_checkpoint
 
-            if not is_static:
-                logger.info("Applying DYNAMIC (online) quantization...")
-                from sgl_jax.srt.utils.quantization.quantization_utils import (
-                    apply_linear_quantization,
-                    apply_moe_quantization,
-                )
+            from sgl_jax.srt.utils.quantization.quantization_utils import (
+                adapt_fused_moe_static_block_quant_for_kernel,
+                apply_linear_quantization,
+                apply_moe_quantization,
+            )
 
-                # Apply MoE quantization first
-                if self.model_config.quantization_config.has_moe_quantization():
+            # Apply MoE quantization first. Static checkpoints already prepare MoE
+            # quantized structure in the loader before weight loading; re-running here
+            # would clobber loaded scales with placeholders.
+            if self.model_config.quantization_config.has_moe_quantization():
+                if is_static:
+                    logger.info(
+                        "Skipping STATIC MoE quantization re-wrap in ModelRunner; loader already prepared and loaded MoE scales."
+                    )
+                else:
                     self.model = apply_moe_quantization(
-                        self.model_config, self.model, is_static_input=False
+                        self.model_config, self.model, is_static_input=is_static
                     )
 
-                # Apply quantization for linear layers
-                linear_rules = self.model_config.quantization_config.get_linear_rules()
-                if linear_rules:
-                    self.model = apply_linear_quantization(
-                        self.model_config, self.model, is_static_input=False
-                    )
-            else:
-                logger.info("Static quantization detected. Skipping online requantization.")
+            # Apply quantization for linear layers
+            linear_rules = self.model_config.quantization_config.get_linear_rules()
+            if linear_rules:
+                if is_static:
+                    logger.info("Applying STATIC fp8 wrapping for linear layers...")
+                else:
+                    logger.info("Applying DYNAMIC (online) quantization for linear layers...")
+                self.model = apply_linear_quantization(
+                    self.model_config, self.model, is_static_input=is_static
+                )
+            if (
+                is_static
+                and self.model_config.quantization_config.has_moe_quantization()
+                and self.model_config.moe_backend.value == "fused"
+            ):
+                self.model = adapt_fused_moe_static_block_quant_for_kernel(
+                    self.model, target_subc_quant_wsz=256
+                )
         # Parse other args
         self.sliding_window_size = self.model_config.sliding_window
         self.dtype = self.model_config.dtype
