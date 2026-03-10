@@ -441,6 +441,11 @@ suites = {
         TestFile(
             "test/srt/test_moe_eval_accuracy_large.py", 40, ["TestMoEEvalAccuracyLarge.test_mmlu"]
         ),
+        TestFile(
+            "test/srt/test_moe_quantized_eval_accuracy.py",
+            40,
+            ["TestMoEInt8QuantizedEvalTP2EP2.test_gpqa"],
+        ),
     ],
     "performance-test-tpu-v6e-1": [TestFile("test/srt/test_bench_serving_dense.py", 7)],
     "performance-test-tpu-v6e-4": [
