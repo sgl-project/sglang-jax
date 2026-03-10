@@ -26,6 +26,9 @@ from sgl_jax.srt.kernels.ragged_paged_attention.util import (
     get_dtype_bitwidth,
     get_dtype_packing,
 )
+from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_split import (
+    ragged_paged_attention_split,
+)
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024  # 100MB
@@ -1361,13 +1364,13 @@ def get_kernel_scope_name(bq_size, bkv_p, page_size):
         "num_queries_per_block",
         "vmem_limit_bytes",
     ),
-    donate_argnames=("kv_cache_fused",),
+    donate_argnames=("kv_cache_fused", "k_cache", "v_cache"),
 )
 def ragged_paged_attention(
     queries: jax.Array,  # [padded_num_tokens, actual_num_q_heads, actual_head_dim]
     keys: jax.Array,  # [padded_num_tokens, actual_num_kv_heads, actual_head_dim]
     values: jax.Array,  # [padded_num_tokens, actual_num_kv_heads, actual_head_dim]
-    kv_cache_fused: jax.Array,  # [total_num_pages, page_size, actual_num_kv_heads * 2, actual_head_dim]
+    kv_cache_fused: jax.Array | None,  # [total_num_pages, page_size, actual_num_kv_heads * 2, actual_head_dim]
     kv_lens: jax.Array,  # i32[padded_batch_size]
     page_indices: jax.Array,  # i32[(padded_batch_size * model_context_len + page_size - 1) // page_size]
     cu_q_lens: jax.Array,  # i32[padded_batch_size + 1]
@@ -1375,6 +1378,8 @@ def ragged_paged_attention(
     distribution: jax.Array,  # i32[3]
     custom_mask: jax.Array,  # if causal is True, custom_mask shape is [patten_total_kv_len], else [0]
     *,
+    k_cache: jax.Array | None = None,
+    v_cache: jax.Array | None = None,
     causal: int = 1,  # 1: True, 0: False
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -1391,43 +1396,21 @@ def ragged_paged_attention(
     num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
 ):
-    """Ragged paged attention that supports mixed prefill and decode with fused KV cache.
+    """Ragged paged attention that supports mixed prefill and decode with fused or split KV cache."""
+    if k_cache is not None and v_cache is not None:
+        return ragged_paged_attention_split(
+            queries, keys, values, k_cache, v_cache,
+            kv_lens, page_indices, cu_q_lens, cu_kv_lens, distribution, custom_mask,
+            causal=causal, sm_scale=sm_scale, sliding_window=sliding_window,
+            soft_cap=soft_cap, mask_value=mask_value,
+            q_scale=q_scale, k_scale=k_scale, v_scale=v_scale,
+            xai_temperature_len=xai_temperature_len, chunk_prefill_size=chunk_prefill_size,
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            num_queries_per_block=num_queries_per_block,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
 
-    Args:
-      queries: concatenated all sequences' queries.
-      keys: concatenated all sequences' keys (quantized).
-      values: concatenated all sequences' values (quantized).
-      kv_cache_fused: paged KV cache with head interleaving format [K1,V1,K2,V2,...].
-      kv_lens: padded kv lengths. Only the first num_seqs values are valid.
-      page_indices: flattened page indices look-up table.
-      cu_q_lens: the cumulative sum of the effective query lengths. Similar to
-        kv_lens, only the first num_seqs+1 values are valid.
-      cu_kv_lens: the cumulative sum of the effective key/value lengths. Similar to
-        kv_lens, only the first num_seqs+1 values are valid.
-      distribution: (i, j, k) represents that sequences[0:i] are decode-only,
-        sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
-        k is also the total number of sequences.
-      custom_mask: use custom mask to calculate attention.
-      causal: If causal is set to True, use causal mask. Otherwise, use custom_mask.
-      sm_scale: the softmax scale which will be applied to the Q@K^T.
-      sliding_window: the sliding window size for the attention.
-      soft_cap: the logit soft cap for the attention.
-      mask_value: mask value for causal mask.
-      q_scale: the scale for the query.
-      k_scale: the scale for the key cache.
-      v_scale: the scale for the value cache.
-      chunk_prefill_size: the chunk prefill size for the attention.
-      xai_temperature_len: the length-based temperature term used by xai grok.
-        reference: sgl-project/sglang: python/sglang/srt/layers/attention/triton_ops/decode_attention.py
-      num_kv_pages_per_block: number of kv pages to be processed in one flash
-        attention block in the pallas kernel.
-      num_queries_per_block: number of kv pages to be processed in one flash
-        attention block in the pallas kernel.
-      vmem_limit_bytes: the vmem limit for the pallas kernel.
-
-    Returns:
-      The output of the attention.
-    """
+    # Fused path
     q, k, v = queries, keys, values
     static_validate_inputs_fused(
         q,
@@ -1767,7 +1750,12 @@ def prepare_kv_cache(
     head_dim = align_to(actual_head_dim, 128)
     k_cache_processed = jnp.pad(
         k_cache,
-        ((0, 0), (0, 0), (0, 0), (0, head_dim - actual_head_dim)),
+        (
+            (0, 0),
+            (0, 0),
+            (0, num_kv_heads - actual_num_kv_heads),
+            (0, head_dim - actual_head_dim),
+        ),
         constant_values=0,
     ).reshape(
         total_num_pages,
@@ -1778,7 +1766,12 @@ def prepare_kv_cache(
     )
     v_cache_processed = jnp.pad(
         v_cache,
-        ((0, 0), (0, 0), (0, 0), (0, head_dim - actual_head_dim)),
+        (
+            (0, 0),
+            (0, 0),
+            (0, num_kv_heads - actual_num_kv_heads),
+            (0, head_dim - actual_head_dim),
+        ),
         constant_values=0,
     ).reshape(
         total_num_pages,
