@@ -53,6 +53,40 @@ from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 logger = logging.getLogger(__name__)
 
 
+def _assert_no_shapedtypestruct(tree, name: str):
+    """Fail fast if any input leaf is a ShapeDtypeStruct (pjit refuses them)."""
+    try:
+        tree_map_with_path = jax.tree_util.tree_map_with_path
+    except AttributeError:
+        tree_map_with_path = None
+
+    if tree_map_with_path is not None:
+        hits = []
+
+        def _check(path, x):
+            if isinstance(x, jax.ShapeDtypeStruct):
+                hits.append((path, x.shape, x.dtype, getattr(x, "sharding", None)))
+            return x
+
+        tree_map_with_path(_check, tree)
+        if hits:
+            formatted = []
+            for path, shape, dtype, sharding in hits:
+                path_str = "/".join(str(k) for k in path)
+                formatted.append(f"{path_str} shape={shape} dtype={dtype} sharding={sharding}")
+            raise TypeError(f"Found ShapeDtypeStruct in {name}: " + "; ".join(formatted))
+    else:
+        def _check(x):
+            if isinstance(x, jax.ShapeDtypeStruct):
+                raise TypeError(
+                    f"Found ShapeDtypeStruct in {name}: shape={x.shape}, dtype={x.dtype}, "
+                    f"sharding={getattr(x, 'sharding', None)}"
+                )
+            return x
+
+        jax.tree_util.tree_map(_check, tree)
+
+
 class ModelRunner(BaseModelRunner):
     """ModelRunner runs the forward passes of the models."""
 
@@ -188,6 +222,9 @@ class ModelRunner(BaseModelRunner):
         self.model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
         sampler_def, sampler_state = nnx.split(self.sampler)
         sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(sampler_state)
+
+        # Catch abstract params early (e.g., missing weights creating ShapeDtypeStruct placeholders).
+        _assert_no_shapedtypestruct(model_state, "model_state")
 
         enable_tpu_log_recorder = jax.default_backend() == "tpu" and (
             get_bool_env_var("SGLANG_JAX_ENABLE_KERNEL_LOG_RECORDER")
