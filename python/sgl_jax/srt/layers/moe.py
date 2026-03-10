@@ -420,7 +420,10 @@ class EPMoE(nnx.Module):
             return
 
         def _get_block_size_k(
-            *, hidden_size: int, intermediate_dim: int, weight_block_size: list[int] | tuple[int, int] | None
+            *,
+            hidden_size: int,
+            intermediate_dim: int,
+            weight_block_size: list[int] | tuple[int, int] | None,
         ) -> int | None:
             """Extract the contracting-dimension block size for MoE weights.
 

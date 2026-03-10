@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
+from unittest import mock
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from unittest import mock
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import Mesh
+
 from sgl_jax.srt.layers.moe import EPMoE
 
 

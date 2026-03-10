@@ -4,7 +4,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import nnx
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
@@ -166,9 +167,7 @@ def test_epmoe_block_quant_accuracy(scale_format, weight_block_size):
         weight_block_size,
         scale_format,
     )
-    wi0_scale_sharding, wi1_scale_sharding, wo_scale_sharding = _get_scale_shardings(
-        scale_format
-    )
+    wi0_scale_sharding, wi1_scale_sharding, wo_scale_sharding = _get_scale_shardings(scale_format)
 
     with jax.set_mesh(moe_ref.moe_mesh):
         moe_ref.wi_0 = nnx.Param(w_wi0_fp, out_sharding=P("expert", "tensor", None))

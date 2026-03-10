@@ -4,7 +4,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
-from jax.sharding import NamedSharding, PartitionSpec as P
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh

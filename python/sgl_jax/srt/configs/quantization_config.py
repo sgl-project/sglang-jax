@@ -75,15 +75,13 @@ def _normalize_weight_block_size(
     block_n, block_k = weight_block_size
     if not isinstance(block_n, Integral) or not isinstance(block_k, Integral):
         raise ValueError(
-            "quantization.weight_block_size values must be integers, "
-            f"got {weight_block_size!r}"
+            "quantization.weight_block_size values must be integers, " f"got {weight_block_size!r}"
         )
     block_n = int(block_n)
     block_k = int(block_k)
     if block_n <= 0 or block_k <= 0:
         raise ValueError(
-            "quantization.weight_block_size values must be > 0, "
-            f"got {weight_block_size!r}"
+            "quantization.weight_block_size values must be > 0, " f"got {weight_block_size!r}"
         )
     return (block_n, block_k)
 

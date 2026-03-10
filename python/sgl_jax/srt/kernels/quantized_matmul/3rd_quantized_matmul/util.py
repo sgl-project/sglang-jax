@@ -1,7 +1,9 @@
 # Adapted from https://github.com/vllm-project/tpu-inference/blob/main/tpu_inference/kernels/quantized_matmul/util.py
 # SPDX-License-Identifier: Apache-2.0
 """Utility functions for quantized matmul kernel."""
-from typing import Any, Callable
+
+from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -22,24 +24,19 @@ def unfold_args(
     if conditions:
         arg = conditions[0]
         if isinstance(arg, bool):
-            unfold_args(conditions[1:], fn_conditions + (arg, ), fn)
+            unfold_args(conditions[1:], fn_conditions + (arg,), fn)
         else:
             assert arg.dtype == jnp.bool and arg.size == 1
             jax.lax.cond(
                 arg,
-                lambda: unfold_args(conditions[1:], fn_conditions +
-                                    (True, ), fn),
-                lambda: unfold_args(conditions[1:], fn_conditions +
-                                    (False, ), fn),
+                lambda: unfold_args(conditions[1:], fn_conditions + (True,), fn),
+                lambda: unfold_args(conditions[1:], fn_conditions + (False,), fn),
             )
     else:
         fn(*fn_conditions)
 
 
-def quantize_tensor(x: jax.Array,
-                    dtype: jnp.dtype,
-                    dim: int = -1,
-                    block_size: int | None = None):
+def quantize_tensor(x: jax.Array, dtype: jnp.dtype, dim: int = -1, block_size: int | None = None):
     if block_size is not None:
         # Flatten all leading dims into a single batch dim for block
         # quantization, then restore the original shape.
@@ -65,9 +62,7 @@ def get_kernel_name(tuned_value: TunedValue):
     batch_block_size = tuned_value.batch_block_size
     out_block_size = tuned_value.out_block_size
     in_block_size = tuned_value.in_block_size
-    return (
-        f"quantized_matmul_kernel_{batch_block_size}_{out_block_size}_{in_block_size}"
-    )
+    return f"quantized_matmul_kernel_{batch_block_size}_{out_block_size}_{in_block_size}"
 
 
 def xla_quantized_matmul(
@@ -98,7 +93,7 @@ def xla_quantized_matmul(
         out = jax.lax.dot_general(
             x_q,
             w_q,
-            dimension_numbers=(((1, ), (1, )), ((), ())),
+            dimension_numbers=(((1,), (1,)), ((), ())),
             preferred_element_type=acc_dtype,
         ).astype(jnp.float32)
         out *= x_scale
@@ -106,7 +101,7 @@ def xla_quantized_matmul(
         out = jax.lax.dot_general(
             x,
             w_q,
-            dimension_numbers=(((1, ), (1, )), ((), ())),
+            dimension_numbers=(((1,), (1,)), ((), ())),
             preferred_element_type=jnp.float32,
         )
     out *= jnp.expand_dims(w_scale, 0)
@@ -157,10 +152,7 @@ def xla_quantized_batched_matmul(
         # x_scale has same shape as x but with contracting dim(s) as 1.
         contract_set = set(contract_dims[0])
         batch_set = set(batch_dims[0])
-        lhs_free = [
-            i for i in range(x.ndim)
-            if i not in contract_set and i not in batch_set
-        ]
+        lhs_free = [i for i in range(x.ndim) if i not in contract_set and i not in batch_set]
         perm = list(batch_dims[0]) + lhs_free + list(contract_dims[0])
         if perm != list(range(x.ndim)):
             x_scale = jnp.transpose(x_scale, perm)
@@ -270,13 +262,11 @@ def validate_inputs(
         jnp.issubdtype(x_q_dtype, jnp.integer) != jnp.issubdtype(w_q.dtype, jnp.integer)
     ):
         # If the input is quantized, then it should be the same subdtype as w_q.
-        raise ValueError(
-            f"{x_q_dtype=} and {w_q.dtype=} must be the same int or float type."
-        )
+        raise ValueError(f"{x_q_dtype=} and {w_q.dtype=} must be the same int or float type.")
 
     # Verify input shapes.
     if x.shape[1] != w_q.shape[1]:
-        raise ValueError(f'{x.shape[1]=} must be equal to {w_q.shape[1]=}')
+        raise ValueError(f"{x.shape[1]=} must be equal to {w_q.shape[1]=}")
     if w_scale.ndim == 2:
         if w_q.shape[0] != w_scale.shape[1]:
             raise ValueError(f"{w_q.shape[0]=} must be equal to {w_scale.shape[1]=}")
@@ -286,23 +276,20 @@ def validate_inputs(
     else:
         raise ValueError(f"Unsupported {w_scale.ndim=} for quantized weight scale.")
     if x_abs_max is not None and x_abs_max.shape != (1, x.shape[0]):
-        raise ValueError(
-            f"{x_abs_max.shape=} must be equal to (1, {x.shape[0]=})")
+        raise ValueError(f"{x_abs_max.shape=} must be equal to (1, {x.shape[0]=})")
     if x.shape[0] % batch_block_size != 0:
-        raise ValueError(
-            f"{x.shape[0]=} must be a multiple of {batch_block_size=}")
+        raise ValueError(f"{x.shape[0]=} must be a multiple of {batch_block_size=}")
     if w_q.shape[0] % out_block_size != 0:
-        raise ValueError(
-            f"{w_q.shape[0]=} must be a multiple of {out_block_size=}")
+        raise ValueError(f"{w_q.shape[0]=} must be a multiple of {out_block_size=}")
     if x.shape[1] % in_block_size != 0:
-        raise ValueError(
-            f"{x.shape[1]=} must be a multiple of {in_block_size=}")
+        raise ValueError(f"{x.shape[1]=} must be a multiple of {in_block_size=}")
 
 
 def get_max_min(target_dtype):
     if jnp.issubdtype(target_dtype, jnp.floating):
-        return jnp.finfo(target_dtype).max.astype(
-            jnp.float32), jnp.finfo(target_dtype).min.astype(jnp.float32)
+        return jnp.finfo(target_dtype).max.astype(jnp.float32), jnp.finfo(target_dtype).min.astype(
+            jnp.float32
+        )
     else:
         return jnp.iinfo(target_dtype).max, jnp.iinfo(target_dtype).min
 

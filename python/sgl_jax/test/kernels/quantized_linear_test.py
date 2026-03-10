@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-from collections import namedtuple
 import importlib
+from collections import namedtuple
 
 import jax
 import jax.numpy as jnp
@@ -13,8 +13,10 @@ import sgl_jax.srt.kernels.quantized_matmul.kernel as quant_kernel
 from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
 from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
-from sgl_jax.srt.utils.quantization.quantization_utils import apply_linear_quantization
-from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
+from sgl_jax.srt.utils.quantization.quantization_utils import (
+    apply_linear_quantization,
+    quantize_tensor,
+)
 
 third_party_quant_util = importlib.import_module(
     "sgl_jax.srt.kernels.quantized_matmul.3rd_quantized_matmul.util"
