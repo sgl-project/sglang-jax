@@ -773,7 +773,7 @@ class SWAKVPool(KVCache):
         layer_id_pool, is_swa = self.layers_mapping[layer_id]
         if is_swa:
             if self.full_to_swa_index_mapping is not None:
-                loc = self.full_to_swa_index_mapping[loc].to(np.int32)
+                loc = self.full_to_swa_index_mapping[loc].astype(jnp.int32)
             self.swa_kv_pool.set_kv_buffer(layer_id_pool, loc, cache_k, cache_v, is_decode)
         else:
             self.full_kv_pool.set_kv_buffer(layer_id_pool, loc, cache_k, cache_v, is_decode)
