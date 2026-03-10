@@ -387,6 +387,8 @@ class ModelRunner(BaseModelRunner):
                 self.model = adapt_fused_moe_static_block_quant_for_kernel(
                     self.model, target_subc_quant_wsz=256
                 )
+            if is_static:
+                self._log_static_quant_debug_once()
         # Parse other args
         self.sliding_window_size = self.model_config.sliding_window
         self.dtype = self.model_config.dtype
@@ -404,6 +406,362 @@ class ModelRunner(BaseModelRunner):
                 eagle_aux_hidden_state_layer_ids = None
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
 
+        if os.environ.get("SGL_FUSED_MOE_DEBUG_LOG_PARAM_SHARDING", "0") == "1":
+            self._log_fused_moe_param_sharding_debug_once()
+
+    def _log_static_quant_debug_once(self):
+        """Host-side one-time stats for debugging static FP8 scale loading."""
+        logger = logging.getLogger(__name__)
+
+        def _scalar(x):
+            return jax.device_get(x).item() if hasattr(x, "shape") else x
+
+        def _arr_stats(name, arr):
+            try:
+                nan_cnt = _scalar(jnp.isnan(arr).sum())
+                inf_cnt = _scalar(jnp.isinf(arr).sum())
+                min_v = _scalar(jnp.nanmin(arr))
+                max_v = _scalar(jnp.nanmax(arr))
+                logger.info(
+                    "STATIC_FP8_DEBUG %s shape=%s dtype=%s sharding=%s nan=%s inf=%s min=%s max=%s",
+                    name,
+                    getattr(arr, "shape", None),
+                    getattr(arr, "dtype", None),
+                    getattr(arr, "sharding", None),
+                    nan_cnt,
+                    inf_cnt,
+                    min_v,
+                    max_v,
+                )
+            except Exception as e:
+                logger.warning("STATIC_FP8_DEBUG failed for %s: %s", name, e)
+
+        def _run_moe_gmm_compare(layer_idx, experts):
+            """Compare gmm(rhs_scale) vs explicit dequantization on a local MoE shard."""
+            try:
+                from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+            except Exception as e:
+                logger.warning("STATIC_FP8_GMM_COMPARE import failed: %s", e)
+                return
+
+            try:
+                w0 = experts.wi_0.value
+                w0_scale = experts.wi_0_scale.value
+            except Exception as e:
+                logger.warning("STATIC_FP8_GMM_COMPARE missing MoE tensors: %s", e)
+                return
+
+            try:
+                # Match the runtime `EPMoE.__call__` scale sharding for gmm1.
+                w0_scale_runtime = jax.sharding.reshard(
+                    w0_scale,
+                    NamedSharding(experts.moe_mesh, P("expert", None, None, "tensor")),
+                )
+            except Exception as e:
+                logger.warning("STATIC_FP8_GMM_COMPARE scale reshard failed: %s", e)
+                return
+
+            try:
+                w0_shards = list(getattr(w0, "addressable_shards", []))
+                s0_shards = list(getattr(w0_scale_runtime, "addressable_shards", []))
+                if not w0_shards or not s0_shards:
+                    logger.warning("STATIC_FP8_GMM_COMPARE no addressable shards found")
+                    return
+
+                target_device = w0_shards[0].device
+
+                def _shard_on_device(shards, dev):
+                    for shard in shards:
+                        if shard.device == dev:
+                            return shard.data
+                    return None
+
+                rhs_local = _shard_on_device(w0_shards, target_device)
+                rhs_scale_local = _shard_on_device(s0_shards, target_device)
+                if rhs_local is None or rhs_scale_local is None:
+                    logger.warning(
+                        "STATIC_FP8_GMM_COMPARE failed to align local shards on device=%s",
+                        target_device,
+                    )
+                    return
+
+                if rhs_local.ndim != 3 or rhs_scale_local.ndim != 4:
+                    logger.warning(
+                        "STATIC_FP8_GMM_COMPARE unexpected local shapes rhs=%s rhs_scale=%s",
+                        rhs_local.shape,
+                        rhs_scale_local.shape,
+                    )
+                    return
+
+                num_groups, n, k = map(int, rhs_local.shape)
+                num_blocks = int(rhs_scale_local.shape[1])
+                if num_blocks <= 0 or k % num_blocks != 0:
+                    logger.warning(
+                        "STATIC_FP8_GMM_COMPARE invalid block config rhs=%s rhs_scale=%s",
+                        rhs_local.shape,
+                        rhs_scale_local.shape,
+                    )
+                    return
+                block_k = k // num_blocks
+
+                m = min(64, max(8, num_groups * 8))
+                sizes = np.full((num_groups,), m // num_groups, dtype=np.int32)
+                sizes[: (m % num_groups)] += 1
+                group_sizes = jnp.array(sizes, dtype=jnp.int32)
+
+                dev = next(iter(rhs_local.devices()))
+                key = jax.random.PRNGKey(1234 + int(layer_idx))
+                lhs = jax.random.uniform(
+                    key,
+                    (m, k),
+                    minval=-3.0,
+                    maxval=3.0,
+                    dtype=jnp.float32,
+                )
+                lhs = jax.device_put(lhs, dev)
+                group_sizes = jax.device_put(group_sizes, dev)
+                group_offset = jnp.array(0, dtype=jnp.int32)
+
+                # Expand block scales [G, B, 1, N] -> [G, N, K] to build an explicit dequant rhs.
+                scales = jnp.squeeze(rhs_scale_local, axis=2)  # [G, B, N]
+                scales = jnp.transpose(scales, (0, 2, 1))  # [G, N, B]
+                scales = jnp.repeat(scales, block_k, axis=2)
+                scales = scales[..., :k]
+                rhs_deq = rhs_local.astype(jnp.float32) * scales.astype(jnp.float32)
+
+                tiling = (min(512, m), min(1024, k), min(1024, n))
+                out_scaled = gmm(
+                    lhs=lhs,
+                    rhs=rhs_local,
+                    group_sizes=group_sizes,
+                    preferred_element_type=jnp.float32,
+                    rhs_scale=rhs_scale_local,
+                    tiling=tiling,
+                    group_offset=group_offset,
+                    interpret=False,
+                )
+                out_deq_gmm = gmm(
+                    lhs=lhs,
+                    rhs=rhs_deq,
+                    group_sizes=group_sizes,
+                    preferred_element_type=jnp.float32,
+                    rhs_scale=None,
+                    tiling=tiling,
+                    group_offset=group_offset,
+                    interpret=False,
+                )
+
+                # Piecewise dense reference matching gmm's grouped semantics.
+                lhs_host = np.asarray(jax.device_get(lhs), dtype=np.float32)
+                rhs_deq_host = np.asarray(jax.device_get(rhs_deq), dtype=np.float32)
+                sizes_host = np.asarray(jax.device_get(group_sizes), dtype=np.int32)
+                outputs = []
+                start = 0
+                for g, sz in enumerate(sizes_host.tolist()):
+                    if sz > 0:
+                        end = start + sz
+                        outputs.append(lhs_host[start:end] @ rhs_deq_host[g].T)
+                        start = end
+                out_ref_host = (
+                    np.concatenate(outputs, axis=0)
+                    if outputs
+                    else np.zeros((0, n), dtype=np.float32)
+                )
+                out_ref = jax.device_put(out_ref_host, dev)
+
+                def _stats(arr):
+                    return (
+                        _scalar(jnp.isnan(arr).sum()),
+                        _scalar(jnp.isinf(arr).sum()),
+                        _scalar(jnp.nanmax(jnp.abs(arr.astype(jnp.float32)))),
+                    )
+
+                def _diff(a, b):
+                    a32 = a.astype(jnp.float32)
+                    b32 = b.astype(jnp.float32)
+                    finite = jnp.isfinite(a32) & jnp.isfinite(b32)
+                    diff = jnp.where(finite, jnp.abs(a32 - b32), 0.0)
+                    denom = jnp.where(finite, jnp.maximum(jnp.abs(b32), 1e-6), 1.0)
+                    rel = diff / denom
+                    finite_cnt = _scalar(finite.sum())
+                    return (
+                        finite_cnt,
+                        _scalar(diff.max()) if finite_cnt else None,
+                        _scalar(rel.max()) if finite_cnt else None,
+                    )
+
+                out_scaled_stats = _stats(out_scaled)
+                out_deq_stats = _stats(out_deq_gmm)
+                out_ref_stats = _stats(out_ref)
+                diff_scaled_deq = _diff(out_scaled, out_deq_gmm)
+                diff_scaled_ref = _diff(out_scaled, out_ref)
+                diff_deq_ref = _diff(out_deq_gmm, out_ref)
+
+                logger.info(
+                    "STATIC_FP8_GMM_COMPARE layer=%s tensor=wi_0 rhs_local=%s rhs_scale_local=%s "
+                    "block_k=%s m=%s tiling=%s "
+                    "scaled(nan=%s inf=%s absmax=%s) deq_gmm(nan=%s inf=%s absmax=%s) "
+                    "ref(nan=%s inf=%s absmax=%s) "
+                    "diff_scaled_deq(finite=%s max_abs=%s max_rel=%s) "
+                    "diff_scaled_ref(finite=%s max_abs=%s max_rel=%s) "
+                    "diff_deq_ref(finite=%s max_abs=%s max_rel=%s)",
+                    layer_idx,
+                    rhs_local.shape,
+                    rhs_scale_local.shape,
+                    block_k,
+                    m,
+                    tiling,
+                    *out_scaled_stats,
+                    *out_deq_stats,
+                    *out_ref_stats,
+                    *diff_scaled_deq,
+                    *diff_scaled_ref,
+                    *diff_deq_ref,
+                )
+            except Exception as e:
+                logger.warning("STATIC_FP8_GMM_COMPARE failed: %s", e)
+
+        try:
+            layers = getattr(getattr(self.model, "model", None), "layers", None)
+            if not layers:
+                return
+
+            # A representative linear layer that previously hit TP/block misalignment.
+            k_proj = getattr(getattr(layers[0], "self_attn", None), "k_proj", None)
+            if k_proj is not None and hasattr(k_proj, "weight_scale"):
+                logger.info(
+                    "STATIC_FP8_DEBUG linear k_proj weight_q_shape=%s weight_scale_shape=%s "
+                    "weight_q_sharding=%s weight_scale_sharding=%s block_size=%s",
+                    getattr(k_proj.weight_q.value, "shape", None),
+                    getattr(k_proj.weight_scale.value, "shape", None),
+                    getattr(k_proj.weight_q.value, "sharding", None),
+                    getattr(k_proj.weight_scale.value, "sharding", None),
+                    getattr(k_proj, "weight_block_size", None),
+                )
+                _arr_stats("linear.k_proj.weight_scale", k_proj.weight_scale.value)
+
+            # First MoE layer is typically layer 1 in MiMo-V2-Flash.
+            for i, layer in enumerate(layers):
+                experts = getattr(getattr(layer, "mlp", None), "experts", None)
+                if experts is None or not hasattr(experts, "wi_0_scale"):
+                    continue
+                if getattr(experts, "wi_0_scale", None) is None:
+                    continue
+                logger.info("STATIC_FP8_DEBUG first_moe_layer=%s", i)
+                _arr_stats(f"moe.layer{i}.wi_0_scale", experts.wi_0_scale.value)
+                _arr_stats(f"moe.layer{i}.wi_1_scale", experts.wi_1_scale.value)
+                _arr_stats(f"moe.layer{i}.wo_scale", experts.wo_scale.value)
+                _run_moe_gmm_compare(i, experts)
+                break
+        except Exception as e:
+            logger.warning("STATIC_FP8_DEBUG summary failed: %s", e)
+
+    def _log_fused_moe_param_sharding_debug_once(self):
+        """Host-side concrete sharding audit for FusedEPMoE parameters."""
+        logger = logging.getLogger(__name__)
+
+        try:
+            from sgl_jax.srt.layers.moe import FusedEPMoE
+        except Exception as e:
+            logger.warning("FUSED_MOE_PARAM_AUDIT import failed: %s", e)
+            return
+
+        max_layers = int(os.environ.get("SGL_FUSED_MOE_DEBUG_LOG_PARAM_SHARDING_MAX_LAYERS", "2"))
+        mesh_shape = dict(getattr(self.mesh, "shape", {}))
+        mesh_ep_size = mesh_shape.get("data", 1) * mesh_shape.get("tensor", 1)
+
+        audited = 0
+
+        def _arr_meta(x):
+            if x is None:
+                return "None"
+            try:
+                shape = tuple(x.shape)
+            except Exception:
+                shape = None
+            dtype = getattr(x, "dtype", None)
+            sharding = getattr(x, "sharding", None)
+            sharding_spec = getattr(sharding, "spec", sharding)
+            local_shapes = []
+            shard_count = 0
+            try:
+                shards = list(getattr(x, "addressable_shards", []))
+                shard_count = len(shards)
+                for shard in shards[: min(4, shard_count)]:
+                    local_shapes.append(tuple(shard.data.shape))
+            except Exception as e:
+                local_shapes = [f"<err:{type(e).__name__}>"]
+            unique_local_shapes = []
+            for s in local_shapes:
+                if s not in unique_local_shapes:
+                    unique_local_shapes.append(s)
+            return (
+                f"shape={shape} dtype={dtype} sharding={sharding_spec} "
+                f"addr_shards={shard_count} local_shapes={unique_local_shapes}"
+            )
+
+        def _walk(obj, path="", visited=None):
+            nonlocal audited
+            if visited is None:
+                visited = set()
+            oid = id(obj)
+            if oid in visited or audited >= max_layers:
+                return
+            visited.add(oid)
+
+            if isinstance(obj, FusedEPMoE):
+                audited += 1
+                logger.info(
+                    "FUSED_MOE_PARAM_AUDIT path=%s layer=%s self.ep_size=%s mesh_shape=%s mesh_ep_size=%s "
+                    "num_experts=%s hidden=%s inter=%s subc=%s",
+                    path or getattr(obj, "name", type(obj).__name__),
+                    getattr(obj, "layer_id", None),
+                    getattr(obj, "ep_size", None),
+                    mesh_shape,
+                    mesh_ep_size,
+                    getattr(obj, "num_experts", None),
+                    getattr(obj, "hidden_size", None),
+                    getattr(obj, "intermediate_dim", None),
+                    getattr(obj, "subc_quant_wsz", None),
+                )
+                for name in ("w1", "w2", "w3", "w1_scale", "w2_scale", "w3_scale"):
+                    var = getattr(obj, name, None)
+                    arr = None
+                    try:
+                        arr = None if var is None else var.value
+                    except Exception:
+                        arr = var
+                    logger.info("FUSED_MOE_PARAM_AUDIT %s %s", name, _arr_meta(arr))
+
+                try:
+                    w1 = obj.w1.value
+                    local_shapes = [tuple(s.data.shape) for s in w1.addressable_shards]
+                    if local_shapes:
+                        local_e = local_shapes[0][0]
+                        expected_local_e = w1.shape[0] // max(mesh_ep_size, 1)
+                        logger.info(
+                            "FUSED_MOE_PARAM_AUDIT local_experts_check local_e=%s expected_local_e=%s",
+                            local_e,
+                            expected_local_e,
+                        )
+                except Exception as e:
+                    logger.warning("FUSED_MOE_PARAM_AUDIT local_experts_check failed: %s", e)
+                return
+
+            if hasattr(obj, "__dict__"):
+                for attr_name, attr_value in obj.__dict__.items():
+                    child_path = f"{path}/{attr_name}" if path else attr_name
+                    if isinstance(attr_value, nnx.Module):
+                        _walk(attr_value, child_path, visited)
+                    elif isinstance(attr_value, list):
+                        for idx, item in enumerate(attr_value):
+                            if isinstance(item, nnx.Module):
+                                _walk(item, f"{child_path}[{idx}]", visited)
+
+        _walk(self.model)
+        if audited == 0:
+            logger.info("FUSED_MOE_PARAM_AUDIT no FusedEPMoE modules found")
+
     def profile_max_num_token(self, total_device_memory: int):
         """
         Profile the maximum number of tokens that can fit in memory.
@@ -418,21 +776,21 @@ class ModelRunner(BaseModelRunner):
 
         if available_kv_cache_bytes <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
-
+        
         # head_dim/v_head_dim handling
         head_dim = self.model_config.head_dim
         v_head_dim = getattr(self.model_config, "v_head_dim", head_dim)
-
+        
         head_dim_aligned = (head_dim + 127) // 128 * 128
         v_head_dim_aligned = (v_head_dim + 127) // 128 * 128
-
+        
         # If head dims differ, they are stored separately and each aligned to 128
         if head_dim != v_head_dim:
              per_token_dim = head_dim_aligned + v_head_dim_aligned
         else:
              # Fused case
              per_token_dim = head_dim_aligned * 2
-
+             
         cell_size = (
             self.model_config.get_num_kv_heads(self.tp_size)
             * per_token_dim
@@ -574,7 +932,7 @@ class ModelRunner(BaseModelRunner):
         else:
             head_dim = self.model_config.head_dim
             v_head_dim = getattr(self.model_config, "v_head_dim", head_dim)
-
+            
             self.token_to_kv_pool = MHATokenToKVPool(
                 size=self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -709,6 +1067,32 @@ class ModelRunner(BaseModelRunner):
 
         self.token_to_kv_pool.replace_kv_buffer(layers_kv_fused)
 
+        # Diagnostic: verify cache was actually updated by checking L1 norm
+        # L1 norm (sum of abs) should increase as new tokens are written to the cache,
+        # unlike absmax which can stay constant if new values are smaller than existing max.
+        self._cache_step = getattr(self, '_cache_step', 0) + 1
+        if hasattr(self.token_to_kv_pool, 'full_kv_pool'):
+            pool = self.token_to_kv_pool.full_kv_pool
+            if pool.is_split and pool.k_buffer:
+                k0 = pool.k_buffer[0]
+                v0 = pool.v_buffer[0]
+                k0_l1 = float(jnp.sum(jnp.abs(k0[:100].astype(jnp.float32))))
+                v0_l1 = float(jnp.sum(jnp.abs(v0[:100].astype(jnp.float32))))
+                logger.info(
+                    "[CACHE_VERIFY] step=%d full_layer0 k_l1_100=%.2f v_l1_100=%.2f k_id=%s",
+                    self._cache_step, k0_l1, v0_l1, id(k0),
+                )
+            swa_pool = self.token_to_kv_pool.swa_kv_pool
+            if swa_pool.is_split and swa_pool.k_buffer:
+                k1 = swa_pool.k_buffer[0]
+                v1 = swa_pool.v_buffer[0]
+                k1_l1 = float(jnp.sum(jnp.abs(k1[:100].astype(jnp.float32))))
+                v1_l1 = float(jnp.sum(jnp.abs(v1[:100].astype(jnp.float32))))
+                logger.info(
+                    "[CACHE_VERIFY] step=%d swa_layer0 k_l1_100=%.2f v_l1_100=%.2f k_id=%s",
+                    self._cache_step, k1_l1, v1_l1, id(k1),
+                )
+
     def forward_idle(
         self,
         forward_batch: ForwardBatch,
@@ -766,11 +1150,74 @@ class ModelRunner(BaseModelRunner):
         Returns:
             A list of next_token_ids
         """
+        debug_sample_sync = os.getenv("SGL_DEBUG_SAMPLE_SYNC_CHECKPOINTS") == "1"
+        disable_logits_stats = os.getenv("SGL_DEBUG_DISABLE_LOGITS_STATS") == "1"
+
+        if debug_sample_sync:
+            logits = logits_output.next_token_logits
+            try:
+                jax.block_until_ready(logits)
+                logger.info(
+                    "SAMPLE_SYNC pre-sampler logits ready shape=%s sharding=%s",
+                    getattr(logits, "shape", None),
+                    getattr(logits, "sharding", None),
+                )
+            except Exception:
+                logger.exception("SAMPLE_SYNC failed before sampler (logits_output.next_token_logits)")
+                raise
+
         # Penalty application has been moved to the Sampler for better JIT performance
-        return self.jitted_sampler(
+        next_token_ids, logprobs, new_logits_output = self.jitted_sampler(
             logits_output,
             sampling_metadata,
         )
+
+        if debug_sample_sync:
+            try:
+                jax.block_until_ready(next_token_ids)
+                logger.info(
+                    "SAMPLE_SYNC post-sampler next_token_ids ready shape=%s sharding=%s",
+                    getattr(next_token_ids, "shape", None),
+                    getattr(next_token_ids, "sharding", None),
+                )
+            except Exception:
+                logger.exception("SAMPLE_SYNC failed on next_token_ids after sampler")
+                raise
+            try:
+                if logprobs is not None:
+                    jax.block_until_ready(logprobs)
+                    logger.info(
+                        "SAMPLE_SYNC post-sampler logprobs ready shape=%s sharding=%s",
+                        getattr(logprobs, "shape", None),
+                        getattr(logprobs, "sharding", None),
+                    )
+            except Exception:
+                logger.exception("SAMPLE_SYNC failed on logprobs after sampler")
+                raise
+            try:
+                if new_logits_output is not None:
+                    jax.block_until_ready(new_logits_output)
+                    logger.info("SAMPLE_SYNC post-sampler new_logits_output ready")
+            except Exception:
+                logger.exception("SAMPLE_SYNC failed on new_logits_output after sampler")
+                raise
+
+        if not disable_logits_stats and not hasattr(self, "_logged_logits_stats"):
+            logits = logits_output.next_token_logits
+            logits_min = float(jax.device_get(jnp.nanmin(logits)))
+            logits_max = float(jax.device_get(jnp.nanmax(logits)))
+            logits_nan = int(jax.device_get(jnp.isnan(logits).sum()))
+            logits_inf = int(jax.device_get(jnp.isinf(logits).sum()))
+            logger.info(
+                "Logits stats min=%s max=%s nan=%s inf=%s",
+                logits_min,
+                logits_max,
+                logits_nan,
+                logits_inf,
+            )
+            self._logged_logits_stats = True
+
+        return next_token_ids, logprobs, new_logits_output
 
     def compute_logprobs(self, logits, token_ids: jax.Array) -> jax.Array:
         return self.jitted_compute_logprobs(logits, token_ids)
