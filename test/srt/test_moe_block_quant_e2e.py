@@ -45,21 +45,26 @@ def _make_quant_config(weight_dtype, weight_block_size):
 
 
 def _quantize_moe_weight(weight, weight_dtype, weight_block_size, scale_format):
+    # Weight layout is [E, k, n], quantize along k-dim (axis=1)
     if scale_format == "per_channel":
-        return quantize_tensor(weight_dtype, weight, axis=2)
+        return quantize_tensor(weight_dtype, weight, axis=1)
 
     block_size_out, block_size_k = weight_block_size
 
     if scale_format == "block_channel":
-        return quantize_tensor(weight_dtype, weight, axis=2, block_size=block_size_k)
+        return quantize_tensor(weight_dtype, weight, axis=1, block_size=block_size_k)
 
     if scale_format == "block_quant":
-        return quantize_tensor(
+        w_q, scale = quantize_tensor(
             weight_dtype,
             weight,
             axis=(1, 2),
-            block_size=(block_size_out, block_size_k),
+            block_size=(block_size_k, block_size_out),
         )
+        # quantize_tensor produces (E, k_blocks, out_blocks) following axis order,
+        # but offline checkpoints store scales as (E, out_blocks, k_blocks).
+        scale = jnp.transpose(scale, (0, 2, 1))
+        return w_q, scale
 
     raise ValueError(f"Unsupported scale_format={scale_format}")
 
@@ -74,15 +79,15 @@ def _get_scale_shardings(scale_format):
 
     if scale_format == "block_channel":
         return (
-            P("expert", "tensor", None),
-            P("expert", "tensor", None),
+            P("expert", None, "tensor"),
+            P("expert", None, "tensor"),
             P("expert", None, None),
         )
 
     if scale_format == "block_quant":
         return (
-            P("expert", "tensor", None),
-            P("expert", "tensor", None),
+            P("expert", None, "tensor"),
+            P("expert", None, "tensor"),
             P("expert", None, None),
         )
 
@@ -133,19 +138,21 @@ def test_epmoe_block_quant_accuracy(scale_format, weight_block_size):
     key = jax.random.PRNGKey(42)
     k_wi0, k_wi1, k_wo, k_x, k_topk = jax.random.split(key, 5)
 
+    # Weight layout: [E, k, n]
+    # wi_0/wi_1: [E, hidden_size, intermediate_dim], wo: [E, intermediate_dim, hidden_size]
     w_wi0_fp = jax.random.normal(
         k_wi0,
-        (num_experts, intermediate_dim, hidden_size),
+        (num_experts, hidden_size, intermediate_dim),
         dtype=compute_dtype,
     )
     w_wi1_fp = jax.random.normal(
         k_wi1,
-        (num_experts, intermediate_dim, hidden_size),
+        (num_experts, hidden_size, intermediate_dim),
         dtype=compute_dtype,
     )
     w_wo_fp = jax.random.normal(
         k_wo,
-        (num_experts, hidden_size, intermediate_dim),
+        (num_experts, intermediate_dim, hidden_size),
         dtype=compute_dtype,
     )
 
@@ -170,13 +177,13 @@ def test_epmoe_block_quant_accuracy(scale_format, weight_block_size):
     wi0_scale_sharding, wi1_scale_sharding, wo_scale_sharding = _get_scale_shardings(scale_format)
 
     with jax.set_mesh(moe_ref.moe_mesh):
-        moe_ref.wi_0 = nnx.Param(w_wi0_fp, out_sharding=P("expert", "tensor", None))
-        moe_ref.wi_1 = nnx.Param(w_wi1_fp, out_sharding=P("expert", "tensor", None))
-        moe_ref.wo = nnx.Param(w_wo_fp, out_sharding=P("expert", None, "tensor"))
+        moe_ref.wi_0 = nnx.Param(w_wi0_fp, out_sharding=P("expert", None, "tensor"))
+        moe_ref.wi_1 = nnx.Param(w_wi1_fp, out_sharding=P("expert", None, "tensor"))
+        moe_ref.wo = nnx.Param(w_wo_fp, out_sharding=P("expert", "tensor", None))
 
-        moe_quant.wi_0 = nnx.Param(wi0_q, out_sharding=P("expert", "tensor", None))
-        moe_quant.wi_1 = nnx.Param(wi1_q, out_sharding=P("expert", "tensor", None))
-        moe_quant.wo = nnx.Param(wo_q, out_sharding=P("expert", None, "tensor"))
+        moe_quant.wi_0 = nnx.Param(wi0_q, out_sharding=P("expert", None, "tensor"))
+        moe_quant.wi_1 = nnx.Param(wi1_q, out_sharding=P("expert", None, "tensor"))
+        moe_quant.wo = nnx.Param(wo_q, out_sharding=P("expert", "tensor", None))
 
         del moe_quant.wi_0_scale
         del moe_quant.wi_1_scale

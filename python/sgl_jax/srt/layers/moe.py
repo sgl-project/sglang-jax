@@ -335,7 +335,8 @@ class EPMoE(nnx.Module):
         if scale is None:
             return None
 
-        num_experts, out_dim, in_dim = weight.shape
+        # Weight layout is [E, k, n] where k=contraction dim, n=output dim.
+        num_experts, in_dim, out_dim = weight.shape
 
         if scale.ndim == 4:
             if scale.shape[0] != num_experts or scale.shape[2] != 1 or scale.shape[3] != out_dim:
@@ -457,12 +458,14 @@ class EPMoE(nnx.Module):
                 # Static checkpoints will load real scale tensors later, but the
                 # placeholders must already satisfy expert sharding shape rules.
                 num_experts = self.wi_0.value.shape[0]
-                intermediate_dim = self.wi_0.value.shape[1]
-                hidden_size = self.wo.value.shape[1]
+                # [E, k, n] layout: wi_0=[E, hidden_size, intermediate_dim],
+                #                    wo=[E, intermediate_dim, hidden_size]
+                hidden_size = self.wi_0.value.shape[1]
+                intermediate_dim = self.wo.value.shape[1]
 
                 # Compute k_blocks for block quant placeholders.
                 # weight_block_size = [hf_out_block, hf_in_block] (HF convention).
-                # EPMoE quantizes along axis=2 (k/input dim), so use hf_in_block = [1].
+                # EPMoE quantizes along axis=1 (k/contraction dim).
                 block_size_k = _get_block_size_k(
                     hidden_size=hidden_size,
                     intermediate_dim=intermediate_dim,
@@ -508,8 +511,9 @@ class EPMoE(nnx.Module):
                 return
 
             # Quantize weights along k-dim (axis=1 in [g, k, n] layout)
-            hidden_size = self.wo.value.shape[1]
-            intermediate_dim = self.wi_0.value.shape[1]
+            # wi_0=[E, hidden_size, intermediate_dim], wo=[E, intermediate_dim, hidden_size]
+            hidden_size = self.wi_0.value.shape[1]
+            intermediate_dim = self.wo.value.shape[1]
             block_size_k = _get_block_size_k(
                 hidden_size=hidden_size,
                 intermediate_dim=intermediate_dim,
