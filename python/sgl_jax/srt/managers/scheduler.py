@@ -166,6 +166,9 @@ class Scheduler(
         self.max_seq_len = server_args.max_seq_len
         self.page_size = server_args.page_size
         self.enable_overlap = not server_args.disable_overlap_schedule
+        if self.enable_overlap and server_args.device == "tpu" and server_args.nnodes > 1:
+            logger.info("Multi-node TPU detected, disabling overlap schedule for stability")
+            self.enable_overlap = False
         if server_args.multimodal:
             logger.info("Multimodal mode enabled, disabling overlap schedule")
             self.enable_overlap = False

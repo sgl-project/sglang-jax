@@ -74,6 +74,7 @@ from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 logger = logging.getLogger(__name__)
+TTFT_TRACE = get_bool_env_var("SGLANG_JAX_TTFT_TRACE")
 
 
 @dataclasses.dataclass
@@ -453,6 +454,15 @@ class TokenizerManager:
         # Handle rid being a list (single element) or string
         rid_key = obj.rid[0] if isinstance(obj.rid, list) else obj.rid
         self.rid_to_state[rid_key] = state
+        if TTFT_TRACE and isinstance(tokenized_obj, TokenizedGenerateReqInput):
+            prompt_tokens = len(tokenized_obj.input_ids)
+            logger.info(
+                "TTFT trace submit rid=%s prompt_tokens=%d max_new_tokens=%s stream=%s",
+                rid_key,
+                prompt_tokens,
+                tokenized_obj.sampling_params.max_new_tokens,
+                tokenized_obj.stream,
+            )
         return state
 
     def _notify_state_event(self, state: ReqState) -> None:
@@ -1037,10 +1047,31 @@ class TokenizerManager:
                     "meta_info": meta_info,
                 }
 
+            if (
+                TTFT_TRACE
+                and not isinstance(recv_obj, BatchEmbeddingOut)
+                and state.first_token_time == 0.0
+                and recv_obj.completion_tokens[i] > 0
+            ):
+                state.first_token_time = time.time()
+                logger.info(
+                    "TTFT trace first token delivered rid=%s completion_tokens=%d ttft=%.3fs",
+                    rid,
+                    recv_obj.completion_tokens[i],
+                    state.first_token_time - state.created_time,
+                )
+
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
+                if TTFT_TRACE and not isinstance(recv_obj, BatchEmbeddingOut):
+                    logger.info(
+                        "TTFT trace request finished rid=%s completion_tokens=%d e2e=%.3fs",
+                        rid,
+                        recv_obj.completion_tokens[i],
+                        state.finished_time - state.created_time,
+                    )
                 # Release LoRA ID if it was acquired
                 # Note: Only GenerateReqInput supports LoRA, not EmbeddingReqInput
                 if (

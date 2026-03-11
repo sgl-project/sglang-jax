@@ -83,6 +83,30 @@ def _calculate_irregular_num_tiles(x: int, tx: int) -> tuple[int, int]:
     return tiles, rem
 
 
+def _pad_rows_for_tiling(
+    lhs: jax.Array,
+    group_sizes: jax.Array,
+    tm: int,
+    existing_out: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array | None, int]:
+    """Pad the M dimension so grouped matmul can use a fixed tile size.
+
+    The MegaBlocks metadata builder assumes `m` is divisible by `tm`. When it
+    is not, append zero rows to `lhs` and account for them in the final group.
+    The padded rows are sliced away from the final result.
+    """
+    m = lhs.shape[0]
+    pad_rows = (-m) % tm
+    if pad_rows == 0:
+        return lhs, group_sizes, existing_out, m
+
+    lhs = jnp.pad(lhs, ((0, pad_rows), (0, 0)))
+    group_sizes = group_sizes.at[-1].add(jnp.asarray(pad_rows, dtype=group_sizes.dtype))
+    if existing_out is not None:
+        existing_out = jnp.pad(existing_out, ((0, pad_rows), (0, 0)))
+    return lhs, group_sizes, existing_out, m
+
+
 GroupMetadata = Any  # TODO(enriqueps): Clean this up and use a namedtuple
 
 
@@ -360,11 +384,9 @@ def gmm(
         rhs_bias=rhs_bias,
     )
 
-    # Gather shape information.
-    m, k, n = (lhs.shape[0], lhs.shape[1], rhs.shape[1])
-
     # If tiling is callable, look up the problem dimensions in the LUT. If no
     # tuned tile dimensions are available throw an error.
+    m, k, n = (lhs.shape[0], lhs.shape[1], rhs.shape[1])
     if callable(tiling):
         tiling = tiling(m, k, n)
 
@@ -372,6 +394,14 @@ def gmm(
         raise ValueError(f"No tuned tiling found for (m, k, n) = ({m}, {k}, {n})")
 
     tm, tk, tn = tiling
+
+    lhs, group_sizes, existing_out, original_m = _pad_rows_for_tiling(
+        lhs,
+        group_sizes,
+        tm,
+        existing_out,
+    )
+    m = lhs.shape[0]
 
     if rhs_scale is not None:
         assert isinstance(rhs_scale, jax.Array)
@@ -608,4 +638,6 @@ def gmm(
             num_nonzero_groups=rhs.shape[0],
             group_metadata=group_metadata,
         )
+    if original_m != m:
+        out = out[:original_m]
     return out

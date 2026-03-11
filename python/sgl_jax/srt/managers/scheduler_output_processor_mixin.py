@@ -12,6 +12,7 @@ from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_captur
 from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 from sgl_jax.srt.precision_tracer import precision_tracer
+from sgl_jax.srt.utils import get_bool_env_var
 from sgl_jax.srt.utils.common_utils import cdiv
 
 if TYPE_CHECKING:
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+TTFT_TRACE = get_bool_env_var("SGLANG_JAX_TTFT_TRACE")
 
 DEFAULT_FORCE_STREAM_INTERVAL = 50
 
@@ -101,8 +103,16 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             if req.is_chunked <= 0:
+                old_output_len = len(req.output_ids)
                 # req output_ids are set here
                 req.output_ids.append(next_token_id)
+                if TTFT_TRACE and old_output_len == 0:
+                    logger.info(
+                        "TTFT trace first token ready in prefill rid=%s forward_ct=%d bid=%s",
+                        req.rid,
+                        self.forward_ct,
+                        batch.bid,
+                    )
                 req.check_finished()
 
                 if req.finished():
@@ -293,11 +303,19 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             new_accepted_len = 1
+            old_output_len = len(req.output_ids)
             if batch.spec_algorithm is None or batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             elif self.spec_algorithm.is_eagle():
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
+            if TTFT_TRACE and old_output_len == 0 and len(req.output_ids) > 0:
+                logger.info(
+                    "TTFT trace first token ready in decode rid=%s forward_ct=%d bid=%s",
+                    req.rid,
+                    self.forward_ct,
+                    batch.bid,
+                )
 
             req.check_finished(new_accepted_len)
             if req.finished():
