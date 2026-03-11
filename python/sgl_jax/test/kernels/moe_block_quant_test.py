@@ -130,8 +130,9 @@ def _make_epmoe_for_scale_tests(weight_block_size):
 
 def test_epmoe_rejects_invalid_4d_scale_layout():
     moe = _make_epmoe_for_scale_tests([128, 128])
+    # Weight layout is [E, k, n]. For wi_0: k=hidden_size=512, n=intermediate_dim=1024
     invalid_scale = jnp.ones((2, 4, 2, 1024), dtype=jnp.float32)
-    weight = jnp.zeros((2, 1024, 512), dtype=jnp.int8)
+    weight = jnp.zeros((2, 512, 1024), dtype=jnp.int8)
 
     with pytest.raises(ValueError, match="Expected 4D GMM scale layout"):
         moe._normalize_scale_for_gmm(invalid_scale, weight, scale_name="wi_0_scale")
@@ -139,8 +140,9 @@ def test_epmoe_rejects_invalid_4d_scale_layout():
 
 def test_epmoe_rejects_per_channel_4d_scale_with_non_unit_k_blocks():
     moe = _make_epmoe_for_scale_tests(None)
+    # Weight [E, k, n]: k=512, n=1024 → out_dim=1024
     invalid_scale = jnp.ones((2, 4, 1, 1024), dtype=jnp.float32)
-    weight = jnp.zeros((2, 1024, 512), dtype=jnp.int8)
+    weight = jnp.zeros((2, 512, 1024), dtype=jnp.int8)
 
     with pytest.raises(ValueError, match="Per-channel 4D GMM scales must have k_blocks=1"):
         moe._normalize_scale_for_gmm(invalid_scale, weight, scale_name="wi_0_scale")
@@ -150,9 +152,10 @@ def test_epmoe_offline_block_scale_expansion_uses_block_size_out(monkeypatch):
     moe = _make_epmoe_for_scale_tests([128, 128])
     monkeypatch.setattr(jax.sharding, "reshard", lambda x, _: x)
 
+    # Weight [E, k, n]: in_dim(k)=512, out_dim(n)=1024
     num_experts, out_dim, in_dim = 2, 1024, 512
     out_blocks, k_blocks = 8, 4
-    weight = jnp.zeros((num_experts, out_dim, in_dim), dtype=jnp.int8)
+    weight = jnp.zeros((num_experts, in_dim, out_dim), dtype=jnp.int8)
     compact_scale = jnp.arange(num_experts * out_blocks * k_blocks, dtype=jnp.float32).reshape(
         num_experts, out_blocks, k_blocks
     )
