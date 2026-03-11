@@ -1813,6 +1813,18 @@ class WeightLoader:
 
         sharded_weight = self._shard_weight(processed_weight, sharding_spec)
 
+        # Debug: log shapes for attention projection weights to verify FP8 block quant layout
+        if any(p in jax_path for p in ("k_proj", "v_proj", "q_proj")):
+            logger.info(
+                "[SHAPE_DEBUG] %s -> %s: processed=%s sharded=%s dtype=%s sharding=%s",
+                hf_key,
+                jax_path,
+                processed_weight.shape,
+                sharded_weight.shape,
+                sharded_weight.dtype,
+                sharding_spec,
+            )
+
         try:
             logger.debug(
                 "Loading %s -> %s, shape: %s, transpose: %s",

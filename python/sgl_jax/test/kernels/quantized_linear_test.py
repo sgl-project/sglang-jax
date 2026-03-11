@@ -518,5 +518,98 @@ def test_ignored_layers_exact_match_does_not_overmatch():
     assert isinstance(model.self_attn.o_proj, QuantizedLinear)
 
 
+# ---------------------------------------------------------------------------
+# Non-128-aligned output dimension tests (e.g., MiMo k_proj head_dim=192)
+# ---------------------------------------------------------------------------
+
+
+def _make_non_aligned_block_quant_inputs(out_dim, in_dim, weight_dtype):
+    """Create inputs simulating a static checkpoint with non-aligned out_dim.
+
+    Returns (x, w_fp, weight_q, weight_scale) where weight_q has shape
+    [out_dim, in_dim] (NOT padded to block boundary) and weight_scale has
+    shape [ceil(out_dim/128), ceil(in_dim/128)].
+    """
+    batch = 2
+    compute_dtype = jnp.bfloat16
+    key = jax.random.PRNGKey(42)
+    k_x, k_w = jax.random.split(key)
+    x = jax.random.normal(k_x, (batch, in_dim), dtype=compute_dtype)
+    w_fp = jax.random.normal(k_w, (out_dim, in_dim), dtype=compute_dtype)
+
+    # quantize_tensor with pad_tensor=True pads to block boundary,
+    # then slice back to original out_dim to simulate static checkpoint layout
+    w_q_padded, w_scale = quantize_tensor(
+        dtype=weight_dtype,
+        tensor=w_fp.astype(jnp.float32),
+        axis=(0, 1),
+        block_size=(128, 128),
+        pad_tensor=True,
+    )
+    w_q = w_q_padded[:out_dim, :in_dim]
+    return x, w_fp, w_q, w_scale, compute_dtype
+
+
+def test_quantized_linear_block_quant_non_aligned_192():
+    """QuantizedLinear with out_dim=192, block_size=(128,128) — partial second block."""
+    mesh = _create_single_device_mesh()
+    out_dim, in_dim = 192, 256
+    x, w_fp, w_q, w_scale, compute_dtype = _make_non_aligned_block_quant_inputs(
+        out_dim, in_dim, jnp.int8
+    )
+
+    # scale should have 2 output blocks: ceil(192/128) = 2
+    assert w_scale.shape[0] == 2, f"Expected 2 output scale blocks, got {w_scale.shape[0]}"
+
+    quant_linear = QuantizedLinear(
+        weight_q=w_q,
+        weight_scale=w_scale,
+        bias=None,
+        activation_dtype=None,
+        mesh=mesh,
+        kernel_axes=(None, None),
+        params_dtype=compute_dtype,
+        compute_dtype=compute_dtype,
+        weight_block_size=(128, 128),
+    )
+    ref_out = jnp.dot(x, w_fp.T)
+    out, bias = quant_linear(x)
+    assert bias is None
+    _assert_close("QuantizedLinear non-aligned 192 (INT8)", out, ref_out)
+
+
+def test_xla_quantized_matmul_block_quant_non_aligned_192():
+    """Kernel-level block quant with out_dim=192 — partial second block."""
+    out_dim, in_dim = 192, 256
+    x, w_fp, w_q, w_scale, compute_dtype = _make_non_aligned_block_quant_inputs(
+        out_dim, in_dim, jnp.int8
+    )
+    ref_out = jnp.dot(x, w_fp.T)
+    out = xla_quantized_matmul_local(
+        x=x,
+        w_q=w_q,
+        w_scale=w_scale,
+        quantize_activation=False,
+        compute_dtype=compute_dtype,
+        weight_block_size=(128, 128),
+    )
+    _assert_close("Kernel non-aligned 192 (INT8)", out, ref_out)
+
+    if hasattr(jnp, "float8_e4m3fn"):
+        x_fp8, w_fp_fp8, w_q_fp8, w_scale_fp8, _ = _make_non_aligned_block_quant_inputs(
+            out_dim, in_dim, jnp.float8_e4m3fn
+        )
+        ref_out_fp8 = jnp.dot(x_fp8, w_fp_fp8.T)
+        out_fp8 = xla_quantized_matmul_local(
+            x=x_fp8,
+            w_q=w_q_fp8,
+            w_scale=w_scale_fp8,
+            quantize_activation=False,
+            compute_dtype=compute_dtype,
+            weight_block_size=(128, 128),
+        )
+        _assert_close("Kernel non-aligned 192 (FP8_E4M3)", out_fp8, ref_out_fp8)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

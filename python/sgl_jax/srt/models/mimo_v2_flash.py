@@ -149,7 +149,6 @@ class MiMoV2MLP(nnx.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         self.layer_id = layer_id
-        self.use_weight_scale = quant_config is not None and quant_config.is_static_checkpoint
 
         self.gate_proj = LinearBase(
             input_size=hidden_size,
@@ -158,7 +157,6 @@ class MiMoV2MLP(nnx.Module):
             use_bias=gate_up_down_bias,
             params_dtype=dtype,
             mesh=mesh,
-            use_weight_scale=self.use_weight_scale,
         )
 
         self.up_proj = LinearBase(
@@ -168,7 +166,6 @@ class MiMoV2MLP(nnx.Module):
             use_bias=gate_up_down_bias,
             params_dtype=dtype,
             mesh=mesh,
-            use_weight_scale=self.use_weight_scale,
         )
 
         self.down_proj = LinearBase(
@@ -178,7 +175,6 @@ class MiMoV2MLP(nnx.Module):
             use_bias=gate_up_down_bias,
             params_dtype=dtype,
             mesh=mesh,
-            use_weight_scale=self.use_weight_scale,
         )
 
         self.act_fn = jax.nn.silu
@@ -348,7 +344,6 @@ class MiMoMoeAttention(nnx.Module):
         self.k_size = num_kv_heads * self.head_dim
         self.v_size = num_kv_heads * self.v_head_dim
         self.scaling = self.head_dim**-0.5
-        self.use_weight_scale = quant_config is not None and quant_config.is_static_checkpoint
 
         logger.info(
             "[MiMoV2Flash] layer=%d q_heads=%d k_heads=%d head_dim=%d v_head_dim=%d v_size=%d",
@@ -371,7 +366,6 @@ class MiMoMoeAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
-            use_weight_scale=self.use_weight_scale,
         )
         self.k_proj = LinearBase(
             input_size=hidden_size,
@@ -380,7 +374,6 @@ class MiMoMoeAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
-            use_weight_scale=self.use_weight_scale,
         )
         self.v_proj = LinearBase(
             input_size=hidden_size,
@@ -389,7 +382,6 @@ class MiMoMoeAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
-            use_weight_scale=self.use_weight_scale,
         )
         self.o_proj = LinearBase(
             input_size=num_heads * self.v_head_dim,
@@ -398,7 +390,6 @@ class MiMoMoeAttention(nnx.Module):
             kernel_axes=("tensor", None),
             params_dtype=dtype,
             mesh=mesh,
-            use_weight_scale=self.use_weight_scale,
         )
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
