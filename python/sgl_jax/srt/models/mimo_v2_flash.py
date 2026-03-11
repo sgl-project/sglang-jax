@@ -445,11 +445,22 @@ class MiMoMoeAttention(nnx.Module):
             attention_sink=self.attention_sink_bias,
         )
 
-        # Force Slice to v_head_dim
+        # Some backends still return q_head_num * head_dim here and need an
+        # explicit slice, while split-KV attention already returns q_head_num *
+        # v_head_dim. Handle both layouts defensively.
         if self.head_dim != self.v_head_dim:
-            attn_output = attn_output.reshape(-1, self.q_head_num, self.head_dim)
-            attn_output = attn_output[..., : self.v_head_dim]
-            attn_output = attn_output.reshape(-1, self.q_head_num * self.v_head_dim)
+            expected_head_dim = self.q_head_num * self.head_dim
+            expected_v_head_dim = self.q_head_num * self.v_head_dim
+            if attn_output.shape[-1] == expected_head_dim:
+                attn_output = attn_output.reshape(-1, self.q_head_num, self.head_dim)
+                attn_output = attn_output[..., : self.v_head_dim]
+                attn_output = attn_output.reshape(-1, expected_v_head_dim)
+            elif attn_output.shape[-1] != expected_v_head_dim:
+                raise ValueError(
+                    "Unexpected attention output width for MiMo attention: "
+                    f"got {attn_output.shape[-1]}, expected {expected_head_dim} "
+                    f"or {expected_v_head_dim}"
+                )
 
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
@@ -809,7 +820,17 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             target = f"{prefix}.{layer_suffix}"
             return target in ignored_layers
 
+        def _is_swa_layer() -> bool:
+            hybrid_layer_pattern = getattr(self.config, "hybrid_layer_pattern", None)
+            if hybrid_layer_pattern is not None and 0 <= layer_idx < len(hybrid_layer_pattern):
+                return hybrid_layer_pattern[layer_idx] == 1
+            hybrid_pattern = getattr(self.config, "hybrid_pattern", None)
+            if not hybrid_pattern:
+                return False
+            return 0 <= layer_idx < len(hybrid_pattern) and hybrid_pattern[layer_idx] == "swa"
+
         mappings = {}
+        is_swa_layer = _is_swa_layer()
         
         # QKV Projections
         # q_proj
@@ -953,7 +974,12 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                 transpose=False,
             )
 
-        if getattr(self.config, "add_swa_attention_sink_bias", False):
+        has_attention_sink_bias = (
+            is_swa_layer and getattr(self.config, "add_swa_attention_sink_bias", False)
+        ) or (
+            (not is_swa_layer) and getattr(self.config, "add_full_attention_sink_bias", False)
+        )
+        if has_attention_sink_bias:
             mappings[f"{prefix}.self_attn.attention_sink_bias"] = WeightMapping(
                 target_path=f"{target_prefix}.self_attn.attention_sink_bias",
                 sharding=(None,),

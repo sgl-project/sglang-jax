@@ -518,6 +518,73 @@ def test_ignored_layers_exact_match_does_not_overmatch():
     assert isinstance(model.self_attn.o_proj, QuantizedLinear)
 
 
+def test_ignored_layers_matches_list_index_paths():
+    class SelfAttn(nnx.Module):
+        def __init__(self, mesh):
+            self.q_proj = LinearBase(
+                input_size=64,
+                output_size=32,
+                use_bias=False,
+                mesh=mesh,
+                kernel_axes=(None, None),
+                params_dtype=jnp.bfloat16,
+                scope_name="q_proj",
+            )
+            self.o_proj = LinearBase(
+                input_size=64,
+                output_size=32,
+                use_bias=False,
+                mesh=mesh,
+                kernel_axes=(None, None),
+                params_dtype=jnp.bfloat16,
+                scope_name="o_proj",
+            )
+
+    class DummyBlock(nnx.Module):
+        def __init__(self, mesh):
+            self.self_attn = SelfAttn(mesh)
+
+    class InnerModel(nnx.Module):
+        def __init__(self, mesh):
+            self.layers = nnx.List([DummyBlock(mesh)])
+
+    class RootModel(nnx.Module):
+        def __init__(self, mesh):
+            self.model = InnerModel(mesh)
+
+    class FakeModelConfig:
+        pass
+
+    model_config = FakeModelConfig()
+    model_config.quantization_config = type(
+        "FakeQuantConfig",
+        (),
+        {
+            "get_linear_rules": staticmethod(
+                lambda: [
+                    {
+                        "module_path": ".*",
+                        "weight_dtype": "int8",
+                        "activation_dtype": None,
+                        "weight_block_size": None,
+                    }
+                ]
+            ),
+            "ignored_layers": ["model.layers.0.self_attn.o_proj"],
+            "weight_block_size": [128, 128],
+        },
+    )()
+
+    mesh = _create_single_device_mesh()
+    with jax.set_mesh(mesh):
+        model = RootModel(mesh)
+
+    apply_linear_quantization(model_config, model, is_static_input=False)
+
+    assert isinstance(model.model.layers[0].self_attn.q_proj, QuantizedLinear)
+    assert isinstance(model.model.layers[0].self_attn.o_proj, LinearBase)
+
+
 # ---------------------------------------------------------------------------
 # Non-128-aligned output dimension tests (e.g., MiMo k_proj head_dim=192)
 # ---------------------------------------------------------------------------

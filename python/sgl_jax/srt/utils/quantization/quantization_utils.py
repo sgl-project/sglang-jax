@@ -19,6 +19,22 @@ from sgl_jax.srt.configs.quantization_config import (
 logger = logging.getLogger(__name__)
 
 
+def _canonicalize_module_path(path: str) -> str:
+    """Normalize module paths for config lookups.
+
+    Quantization traversal uses ``layers[0]`` for list items, while model and
+    checkpoint configs typically use ``layers.0``. Canonicalize to the latter
+    so ignored-layer checks and explicit path matches stay aligned.
+    """
+    return re.sub(r"\[(\d+)\]", r".\1", path.replace("/", "."))
+
+
+def _module_path_variants(path: str) -> tuple[str, ...]:
+    """Return path variants to keep slash-style and dot-style regexes working."""
+    variants = [path, path.replace("/", "."), _canonicalize_module_path(path)]
+    return tuple(dict.fromkeys(variants))
+
+
 def _get_block_reshape_sharding(
     tensor: jax.Array,
     quantized_axes: list[int],
@@ -143,10 +159,22 @@ def apply_linear_quantization(
 
     def _find_matching_rule(path: str):
         """Find the first rule that matches the given module path."""
+        candidates = _module_path_variants(path)
         for rule in compiled_rules:
-            if rule["pattern"].match(path):
+            if any(rule["pattern"].match(candidate) for candidate in candidates):
                 return rule
         return None
+
+    def _is_ignored(path: str) -> bool:
+        canonical_path = _canonicalize_module_path(path)
+        for ignored in ignored_layers:
+            canonical_ignored = _canonicalize_module_path(ignored)
+            if (
+                canonical_path == canonical_ignored
+                or canonical_path.endswith(f".{canonical_ignored}")
+            ):
+                return True
+        return False
 
     def _replace_linear_recursive(obj, path: str = "", visited: set | None = None):
         """Recursively walk the model and replace LinearBase with QuantizedLinear."""
@@ -164,13 +192,9 @@ def apply_linear_quantization(
                 child_path = f"{path}/{attr_name}" if path else attr_name
 
                 if isinstance(attr_value, LinearBase):
-                    # Check if this path matches any rule
-                    dot_path = child_path.replace("/", ".")
-                    if any(
-                        dot_path == ignored or dot_path.endswith(f".{ignored}")
-                        for ignored in ignored_layers
-                    ):
-                        logger.info("Skipping %s - in ignored_layers", dot_path)
+                    canonical_path = _canonicalize_module_path(child_path)
+                    if _is_ignored(child_path):
+                        logger.info("Skipping %s - in ignored_layers", canonical_path)
                         continue
 
                     rule = _find_matching_rule(child_path)
@@ -193,7 +217,7 @@ def apply_linear_quantization(
                         setattr(obj, attr_name, quantized_linear)
                         del attr_value
                     else:
-                        logger.info("Skipping %s - no matching rule", child_path)
+                        logger.info("Skipping %s - no matching rule", canonical_path)
 
                 elif isinstance(attr_value, nnx.Module):
                     _replace_linear_recursive(attr_value, child_path, visited)
