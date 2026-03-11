@@ -480,17 +480,7 @@ class WeightLoader:
             expert_global_shapes.append(tuple(global_shape))
 
         single_expert_shape = expert_global_shapes[0]
-        if do_transpose and len(single_expert_shape) >= 2:
-            final_single_shape = list(single_expert_shape)
-            final_single_shape[-1], final_single_shape[-2] = (
-                final_single_shape[-2],
-                final_single_shape[-1],
-            )
-            final_single_shape = tuple(final_single_shape)
-        else:
-            final_single_shape = single_expert_shape
-
-        stacked_shape = (num_physical_experts, *final_single_shape)
+        stacked_shape = (num_physical_experts, *single_expert_shape)
         sharding = target_sharding or jax.sharding.NamedSharding(self.mesh, P())
 
         def _load_single_expert_slice(expert_idx, inner_index):
@@ -519,8 +509,6 @@ class WeightLoader:
             else:
                 result = collected_chunks[0]
             result = _view_as_fp8_if_needed(result, target_dtype)
-            if do_transpose:
-                result = np.transpose(result)
             return result
 
         MAX_WORKERS = 128
@@ -553,10 +541,7 @@ class WeightLoader:
 
             # Pre-load first expert to determine shape
             first_log_idx = logical_indices[0]
-            orig_inner = list(inner_slice)
-            if do_transpose and len(orig_inner) >= 2:
-                orig_inner[-1], orig_inner[-2] = orig_inner[-2], orig_inner[-1]
-            first_data = _load_single_expert_slice(first_log_idx, tuple(orig_inner))
+            first_data = _load_single_expert_slice(first_log_idx, tuple(inner_slice))
 
             out_array = np.empty((len(physical_indices), *first_data.shape), dtype=target_dtype)
             for pos in logical_to_positions[first_log_idx]:
@@ -568,11 +553,7 @@ class WeightLoader:
             ]
 
             def load_and_fill_expert(log_idx):
-                orig_inner = list(inner_slice)
-                if do_transpose and len(orig_inner) >= 2:
-                    orig_inner[-1], orig_inner[-2] = orig_inner[-2], orig_inner[-1]
-                data = _load_single_expert_slice(log_idx, tuple(orig_inner))
-                # Directly fill all positions that need this expert
+                data = _load_single_expert_slice(log_idx, tuple(inner_slice))
                 for pos in logical_to_positions[log_idx]:
                     out_array[pos] = data
 
@@ -582,9 +563,12 @@ class WeightLoader:
 
             return out_array
 
-        return jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice).astype(
+        result = jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice).astype(
             target_dtype
         )
+        if do_transpose and result.ndim >= 3:
+            result = jnp.transpose(result, (0, 2, 1))
+        return result
 
     def _create_stacked_moe_lazy_tensor(
         self,

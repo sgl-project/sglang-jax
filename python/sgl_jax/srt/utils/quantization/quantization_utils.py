@@ -186,9 +186,7 @@ def apply_moe_quantization(
     return model
 
 
-def quantize_tensor_simple(
-    x: jax.Array, dtype: jnp.dtype, dim: int = -1, out_dtype: jnp.dtype = jnp.float32
-):
+def quantize_tensor_simple(x: jax.Array, dtype: jnp.dtype, dim: int = -1):
     """Simple per-token quantization for activations."""
     if jnp.issubdtype(dtype, jnp.integer):
         dtype_info = jnp.iinfo(dtype)
@@ -200,9 +198,11 @@ def quantize_tensor_simple(
         min_val = float(dtype_info.min)
 
     x_abs_max = jnp.max(jnp.abs(x), axis=dim, keepdims=True)
+
     scale = x_abs_max / max_val
-    x_q = jnp.clip(x / scale, min_val, max_val).astype(dtype)
-    return x_q, scale.astype(out_dtype)
+    scale_inv = jnp.nan_to_num(1.0 / scale, nan=0.0, posinf=max_val, neginf=min_val)
+    x_q = jnp.clip(x * scale_inv, min_val, max_val).astype(dtype)
+    return x_q, scale.astype(x.dtype)
 
 
 def quantize_tensor(
