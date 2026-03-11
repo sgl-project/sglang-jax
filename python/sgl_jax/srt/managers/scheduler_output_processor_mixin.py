@@ -89,23 +89,40 @@ class SchedulerOutputProcessorMixin:
         hidden_state_offset = 0
         # Check finish conditions
         logprob_pt = 0
+        # print(f"[process_batch_result_prefill] {len(batch.reqs)=}",flush=True)
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            # for i, req in enumerate(batch.reqs):
             if req.is_retracted:
                 continue
 
             req.latest_bid = batch.bid
+
+            # if self.enable_overlap:
+            # next_token_id=next_token_ids[i]
 
             if self.is_mixed_chunk and self.enable_overlap and req.finished():
                 j = len(batch.out_cache_loc) - len(batch.reqs) + i
                 self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
                 continue
 
+            # print(f"[process_batch_result_prefill] {req.is_chunked=}, {next_token_id=}",flush=True)
             if req.is_chunked <= 0:
                 # req output_ids are set here
                 req.output_ids.append(next_token_id)
+                # if self.enable_overlap:
+                #     req.next_token_ids_device=next_token_id
+                #     req.output_ids.append(0)
+                # else:
+                #     req.output_ids.append(next_token_id)
+
+                # print(f"============[process_batch_result_prefill] {req.output_ids=}, {req.next_token_ids_device=}",flush=True)
+
                 req.check_finished()
 
                 if req.finished():
+                    # if req.next_token_ids_device:
+                    #     req.output_ids[-1] = jax.device_get(req.next_token_ids_device).tolist()[0]
+                    #     req.next_token_ids_device=None
                     self.maybe_collect_routed_experts(req)
                     if precision_tracer.get_trace_active():
                         precision_tracer.set_request_status_to_completed(req.rid)
@@ -275,6 +292,7 @@ class SchedulerOutputProcessorMixin:
 
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            # for i, req in enumerate(batch.reqs):
             req: Req
             if req.is_retracted:
                 continue
@@ -292,15 +310,25 @@ class SchedulerOutputProcessorMixin:
                     self.token_to_kv_pool_allocator.free(indices_to_free)
                 continue
 
+            # next_token_id = next_token_ids[i]
+
             new_accepted_len = 1
             if batch.spec_algorithm is None or batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
+                # if self.enable_overlap:
+                #     req.output_ids.append(0)
+                #     req.next_token_ids_device=next_token_id
+                # else:
+                #     req.output_ids.append(next_token_id)
             elif self.spec_algorithm.is_eagle():
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 
             req.check_finished(new_accepted_len)
             if req.finished():
+                # if req.next_token_ids_device:
+                #     req.output_ids[-1] = jax.device_get(req.next_token_ids_device).tolist()[0]
+                #     req.next_token_ids_device=None
                 self.maybe_collect_routed_experts(req)
                 if batch.spec_algorithm is not None and batch.spec_algorithm.is_eagle():
                     cur_allocate_len = batch.spec_info.allocate_lens[i]

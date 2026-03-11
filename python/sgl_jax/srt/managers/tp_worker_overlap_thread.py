@@ -102,6 +102,22 @@ class ModelWorkerClient:
             if not model_worker_batch:
                 break
 
+            # initialize forward_metadata, sampling_metadata and forward_batch for DeepSeek-R1-Distill-Qwen-1.5B
+            if sampling_metadata is None:
+                sampling_metadata = SamplingMetadata.from_model_worker_batch(
+                    model_worker_batch,
+                    len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
+                    self.mesh,
+                    self.worker.model_config.vocab_size,
+                )
+
+            forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
+                model_worker_batch
+            )
+            model_worker_batch.forward_batch = ForwardBatch.init_new(
+                model_worker_batch, self.worker.get_model_runner()
+            )
+
             # Resolve future tokens in the input
             input_ids = model_worker_batch.forward_batch.input_ids
             model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
@@ -118,7 +134,6 @@ class ModelWorkerClient:
                         forward_metadata=forward_metadata,
                     )
                 )
-
             # Update the future token ids map
             self.future_token_ids_map = set_future_token_ids(
                 self.future_token_ids_map,
@@ -164,33 +179,33 @@ class ModelWorkerClient:
             penalizer_orchestrator=None,
         )
 
-        if sampling_metadata is None:
-            sampling_metadata = SamplingMetadata.from_model_worker_batch(
-                model_worker_batch,
-                len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
-                self.mesh,
-                self.worker.model_config.vocab_size,
-            )
+        # if sampling_metadata is None:
+        #     sampling_metadata = SamplingMetadata.from_model_worker_batch(
+        #         model_worker_batch,
+        #         len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
+        #         self.mesh,
+        #         self.worker.model_config.vocab_size,
+        #     )
 
-        forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
-            model_worker_batch
-        )
+        # forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
+        #     model_worker_batch
+        # )
 
         # Prepare LoRA batch if LoRA is enabled
         if self.worker.server_args.enable_lora:
             self.worker.prepare_lora_batch(model_worker_batch)
 
-        model_worker_batch.forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.worker.get_model_runner()
-        )
+        # model_worker_batch.forward_batch = ForwardBatch.init_new(
+        #     model_worker_batch, self.worker.get_model_runner()
+        # )
 
         # Push a new batch to the queue (JAX handles synchronization automatically)
         self.input_queue.put(
             (
                 model_worker_batch,
                 self.future_token_ids_ct,
-                sampling_metadata,
-                forward_metadata,
+                None,  # sampling_metadata
+                None,  # forward_metadata
             )
         )
 
