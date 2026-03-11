@@ -33,7 +33,7 @@ def xla_quantized_matmul_local(
         Output of the quantized matmul.
     """
     out_dtype = x.dtype
-    compute_dtype = out_dtype if compute_dtype is None else compute_dtype
+    compute_dtype = jnp.float32 if compute_dtype is None else compute_dtype
 
     if quantize_activation:
         # Local quantization - each device uses its local max
@@ -63,8 +63,9 @@ def xla_quantized_matmul_local(
         out = out.astype(compute_dtype)
         out = out * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
 
+    out = out.astype(out_dtype)
     # Sum partial results across devices (single all-reduce)
     if reduce_axis is not None:
         out = lax.psum(out, reduce_axis)
 
-    return out.astype(out_dtype)
+    return out
