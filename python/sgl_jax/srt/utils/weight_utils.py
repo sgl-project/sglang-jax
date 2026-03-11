@@ -53,6 +53,7 @@ class WeightMapping:
     concat_axis: int | None = None
     is_eagle3: bool = False
     physical_to_logical_map: np.ndarray | None = None
+    merge_qkv_index: int | None = None
 
     def __post_init__(self):
         if self.sharding is None:
@@ -783,10 +784,11 @@ class WeightLoader:
                 can_optimize = (
                     isinstance(mapping.target_path, str)
                     and mapping.reshape is None
-                    and mapping.repeat is None  # Check repeat here too!
+                    and mapping.repeat is None
                     and not mapping.kv_head_padding
                     and not mapping.head_dim_padding
                     and mapping.sharding is not None
+                    and mapping.merge_qkv_index is None
                     and hf_key != "d2t"
                 )
 
@@ -1308,6 +1310,10 @@ class WeightLoader:
         if mapping.kv_head_padding:
             processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
 
+        if mapping.merge_qkv_index is not None:
+            self._handle_merge_qkv_weight(params, hf_key, processed_weight, mapping)
+            return
+
         sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
 
         try:
@@ -1326,6 +1332,47 @@ class WeightLoader:
         except Exception as e:
             logger.error("Failed to load %s -> %s: %s", hf_key, jax_path, str(e))
             raise
+
+    def _handle_merge_qkv_weight(
+        self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
+    ):
+        """Buffer a separate Q, K, or V weight and concatenate once all three arrive.
+
+        merge_qkv_index: 0 = Q, 1 = K, 2 = V
+        The fused weight layout along the output axis is [Q | K | V].
+        After transpose, the output axis is axis 1 (shape: [hidden_size, q_size + 2*kv_size]).
+        """
+        jax_path = mapping.target_path
+        idx = mapping.merge_qkv_index
+
+        if not hasattr(self, "_merge_qkv_buffers"):
+            self._merge_qkv_buffers: dict[str, dict[int, jax.Array]] = {}
+
+        if jax_path not in self._merge_qkv_buffers:
+            self._merge_qkv_buffers[jax_path] = {}
+
+        sharded_weight = self._shard_weight(weight, mapping.sharding)
+        self._merge_qkv_buffers[jax_path][idx] = sharded_weight
+
+        logger.debug(
+            "Buffered merge QKV %s -> %s[index=%d], shape: %s",
+            hf_key,
+            jax_path,
+            idx,
+            weight.shape,
+        )
+
+        if len(self._merge_qkv_buffers[jax_path]) == 3:
+            buf = self._merge_qkv_buffers.pop(jax_path)
+            fused = jnp.concatenate([buf[0], buf[1], buf[2]], axis=-1)
+
+            model_param = self._get_param(params, jax_path)
+            if fused.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
+                model_param.value = fused
+            else:
+                model_param.value = fused.astype(model_param.value.dtype)
+
+            logger.debug("Merged QKV -> %s, shape: %s", jax_path, fused.shape)
 
     def _handle_split_weight(
         self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping

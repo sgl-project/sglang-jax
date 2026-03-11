@@ -400,28 +400,9 @@ class Grok1Attention(nnx.Module):
         rope_scaling = get_rope_scaling(config)
         self.rope_rotate_half_dims = getattr(config, "rope_rotate_half_dims", False)
 
-        # Separate Q, K, V projections (to match checkpoint format)
-        self.q_proj = LinearBase(
+        self.qkv_proj = LinearBase(
             input_size=hidden_size,
-            output_size=self.q_size,
-            use_bias=False,
-            params_dtype=jnp.bfloat16,
-            kernel_axes=(None, "tensor"),
-            mesh=mesh,
-        )
-
-        self.k_proj = LinearBase(
-            input_size=hidden_size,
-            output_size=self.kv_size,
-            use_bias=False,
-            params_dtype=jnp.bfloat16,
-            kernel_axes=(None, "tensor"),
-            mesh=mesh,
-        )
-
-        self.v_proj = LinearBase(
-            input_size=hidden_size,
-            output_size=self.kv_size,
+            output_size=self.q_size + 2 * self.kv_size,
             use_bias=False,
             params_dtype=jnp.bfloat16,
             kernel_axes=(None, "tensor"),
@@ -483,12 +464,9 @@ class Grok1Attention(nnx.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
 
-        # Project Q, K, V separately
-        q, _ = self.q_proj(hidden_states)
-        k, _ = self.k_proj(hidden_states)
-        v, _ = self.v_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = jnp.split(qkv, [self.q_size, self.q_size + self.kv_size], axis=-1)
 
-        # Apply rotary position embeddings
         q, k = self.rotary_emb(positions, q, k)
 
         q = q.reshape(-1, self.num_heads, self.head_dim)
@@ -903,27 +881,29 @@ class Grok1ForCausalLM(nnx.Module):
         target_prefix = f"model.layers.{layer_idx}"
 
         mappings = {
-            # self_attn - separate q, k, v projections
             f"{prefix}.self_attn.q_proj.weight": WeightMapping(
-                target_path=f"{target_prefix}.self_attn.q_proj.weight",
+                target_path=f"{target_prefix}.self_attn.qkv_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=False,
+                merge_qkv_index=0,
             ),
             f"{prefix}.self_attn.k_proj.weight": WeightMapping(
-                target_path=f"{target_prefix}.self_attn.k_proj.weight",
+                target_path=f"{target_prefix}.self_attn.qkv_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=True,
+                merge_qkv_index=1,
             ),
             f"{prefix}.self_attn.v_proj.weight": WeightMapping(
-                target_path=f"{target_prefix}.self_attn.v_proj.weight",
+                target_path=f"{target_prefix}.self_attn.qkv_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=True,
+                merge_qkv_index=2,
             ),
             f"{prefix}.self_attn.o_proj.weight": WeightMapping(
                 target_path=f"{target_prefix}.self_attn.o_proj.weight",
