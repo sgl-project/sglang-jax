@@ -1793,45 +1793,6 @@ class WeightLoader:
         if mapping.kv_head_padding:
             processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
 
-        # For FP8 k_proj with non-block-aligned head_dim (e.g., head_dim=192, block_size=128),
-        # zero-pad each KV head's output rows to the next block-size multiple.
-        # After kv_head_padding, weight is [N*head_dim_orig, in_dim] and scale is
-        # [N*step_size, in_blocks].  The kernel infers effective_bs = weight_rows / scale_rows
-        # which equals head_dim_orig / step_size = 96, NOT 128.  Rows 96-127 per head then
-        # use scale[1] (calibrated for orig rows 128-191) instead of scale[0] (for 0-127).
-        # Fix: pad weight per head from 192 to 256 so inferred_bs = 256/2 = 128 exactly.
-        # The zero padding rows contribute 0 to the matmul; forward slices them away.
-        _quant_cfg = getattr(self.model_config, "quantization_config", None)
-        _bs_out = (
-            _quant_cfg.weight_block_size[0]
-            if _quant_cfg and _quant_cfg.weight_block_size
-            else 128
-        )
-        if (
-            mapping.head_dim_padding
-            and self.head_dim_pad > 0
-            and "k_proj" in hf_key
-            and not hf_key.endswith("weight_scale_inv")
-            and processed_weight.dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2)
-            and self.head_dim_original % _bs_out != 0
-            and processed_weight.shape[0] % self.head_dim_original == 0
-        ):
-            _head_dim_padded = self.head_dim_original + self.head_dim_pad  # e.g. 256
-            _in_dim = processed_weight.shape[1]
-            _n_heads = processed_weight.shape[0] // self.head_dim_original
-            _pw = processed_weight.reshape(_n_heads, self.head_dim_original, _in_dim)
-            _pw = jnp.pad(_pw, ((0, 0), (0, self.head_dim_pad), (0, 0)))
-            processed_weight = _pw.reshape(_n_heads * _head_dim_padded, _in_dim)
-            logger.info(
-                "FP8 k_proj scale-boundary alignment: %s head_dim %d→%d per head "
-                "(zero-pad; inferred_bs_out=%d now matches configured block_size=%d)",
-                hf_key,
-                self.head_dim_original,
-                _head_dim_padded,
-                _head_dim_padded // 2,
-                _bs_out,
-            )
-
         if hf_key.endswith("weight_scale_inv"):
             # Native FP8 checkpoints commonly use the *_weight_scale_inv name for
             # compatibility, but TPU inference kernels expect and consume these raw

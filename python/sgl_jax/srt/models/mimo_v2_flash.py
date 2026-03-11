@@ -440,24 +440,7 @@ class MiMoMoeAttention(nnx.Module):
         v, _ = self.v_proj(hidden_states)
 
         q = q.reshape(-1, self.q_head_num, self.head_dim)
-        # Use actual tensor size to infer KV head count: kv_head_padding may have
-        # replicated KV heads from num_kv_heads (e.g. 4) to tp_size (e.g. 16).
-        # k_proj weight may also be zero-padded per head for FP8 scale boundary alignment
-        # (e.g., head_dim=192 padded to 256 so inferred block_size=128 matches block_size_out).
-        # Only applies when k_proj has an explicit weight_block_size (i.e., is FP8 quantized).
-        _k_wbs = getattr(self.k_proj, "weight_block_size", None)
-        if _k_wbs is not None:
-            _k_bs_out = _k_wbs[0]
-            _k_hdim_padded = (_k_bs_out - 1 + self.head_dim) // _k_bs_out * _k_bs_out
-            if _k_hdim_padded != self.head_dim and k.shape[-1] % _k_hdim_padded == 0:
-                _nkv = k.shape[-1] // _k_hdim_padded
-                k = k.reshape(-1, _nkv, _k_hdim_padded)[..., : self.head_dim].reshape(
-                    -1, _nkv, self.head_dim
-                )
-            else:
-                k = k.reshape(-1, k.shape[-1] // self.head_dim, self.head_dim)
-        else:
-            k = k.reshape(-1, k.shape[-1] // self.head_dim, self.head_dim)
+        k = k.reshape(-1, k.shape[-1] // self.head_dim, self.head_dim)
         v = v.reshape(-1, v.shape[-1] // self.v_head_dim, self.v_head_dim)
 
         q, k = self.rotary_emb(positions, q, k)
