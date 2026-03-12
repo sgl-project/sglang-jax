@@ -44,6 +44,7 @@ dependencies = [
     "omegaconf",
     "imageio[ffmpeg]",
     "librosa",
+    "torch>=2.10.0",
 ]
 
 [project.optional-dependencies]

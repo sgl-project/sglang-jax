@@ -218,6 +218,9 @@ work_dirs/
 # Executables
 *.exe
 *.out
+
+# Local scratch files
+python/sgl_jax/srt/multimodal/models/flux/transformers_raw_code.py
 *.app
 
 compile_commands.json
