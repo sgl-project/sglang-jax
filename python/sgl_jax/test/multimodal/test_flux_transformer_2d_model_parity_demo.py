@@ -1,0 +1,284 @@
+from __future__ import annotations
+
+import os
+import unittest
+from contextlib import nullcontext
+
+import numpy as np
+
+try:
+    import torch
+    from diffusers.models.transformers.transformer_flux import (
+        FluxTransformer2DModel as HFFluxTransformer2DModel,
+    )
+except ImportError:  # pragma: no cover
+    torch = None
+    HFFluxTransformer2DModel = None
+
+try:
+    import jax
+    import jax.numpy as jnp
+except ImportError:  # pragma: no cover
+    jax = None
+    jnp = None
+
+if jax is not None:
+    from sgl_jax.srt.multimodal.configs.dits.flux_model_config import FluxModelConfig
+    from sgl_jax.srt.multimodal.models.flux.fluxtransformer2dmodel import (
+        FluxTransformer2DModel as JaxFluxTransformer2DModel,
+    )
+
+
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+for _tpu_env in ("TPU_ACCELERATOR_TYPE", "TPU_WORKER_HOSTNAMES"):
+    os.environ.pop(_tpu_env, None)
+
+
+def _make_text_ids(seq_len: int) -> np.ndarray:
+    ids = np.zeros((seq_len, 3), dtype=np.int64)
+    ids[:, 0] = np.arange(seq_len, dtype=np.int64)
+    return ids
+
+
+def _make_image_ids(seq_len: int) -> np.ndarray:
+    side = int(np.ceil(np.sqrt(seq_len)))
+    row = np.arange(seq_len, dtype=np.int64) // side
+    col = np.arange(seq_len, dtype=np.int64) % side
+    return np.stack([np.zeros(seq_len, dtype=np.int64), row, col], axis=-1)
+
+
+def _copy_linear_torch_to_jax(torch_linear, jax_linear):
+    jax_linear.weight[...] = jnp.asarray(torch_linear.weight.detach().cpu().numpy().T)
+    if torch_linear.bias is not None and jax_linear.bias is not None:
+        jax_linear.bias[...] = jnp.asarray(torch_linear.bias.detach().cpu().numpy())
+
+
+def _copy_embed_torch_to_jax(torch_embed, jax_embed):
+    jax_embed.embedding[...] = jnp.asarray(torch_embed.weight.detach().cpu().numpy())
+
+
+def _copy_rmsnorm_torch_to_jax(torch_norm, jax_norm):
+    if (
+        getattr(torch_norm, "weight", None) is not None
+        and getattr(jax_norm, "scale", None) is not None
+    ):
+        jax_norm.scale[...] = jnp.asarray(torch_norm.weight.detach().cpu().numpy())
+
+
+def _copy_flux_attention_torch_to_jax(torch_attn, jax_attn):
+    _copy_linear_torch_to_jax(torch_attn.to_q, jax_attn.to_q)
+    _copy_linear_torch_to_jax(torch_attn.to_k, jax_attn.to_k)
+    _copy_linear_torch_to_jax(torch_attn.to_v, jax_attn.to_v)
+    _copy_rmsnorm_torch_to_jax(torch_attn.norm_q, jax_attn.norm_q)
+    _copy_rmsnorm_torch_to_jax(torch_attn.norm_k, jax_attn.norm_k)
+
+    if hasattr(torch_attn, "to_out") and hasattr(jax_attn, "to_out"):
+        _copy_linear_torch_to_jax(torch_attn.to_out[0], jax_attn.to_out[0])
+
+    if getattr(torch_attn, "added_kv_proj_dim", None) is not None:
+        _copy_linear_torch_to_jax(torch_attn.add_q_proj, jax_attn.add_q_proj)
+        _copy_linear_torch_to_jax(torch_attn.add_k_proj, jax_attn.add_k_proj)
+        _copy_linear_torch_to_jax(torch_attn.add_v_proj, jax_attn.add_v_proj)
+        _copy_linear_torch_to_jax(torch_attn.to_add_out, jax_attn.to_add_out)
+        _copy_rmsnorm_torch_to_jax(torch_attn.norm_added_q, jax_attn.norm_added_q)
+        _copy_rmsnorm_torch_to_jax(torch_attn.norm_added_k, jax_attn.norm_added_k)
+
+
+def _copy_flux_feedforward_torch_to_jax(torch_ff, jax_ff):
+    _copy_linear_torch_to_jax(torch_ff.net[0].proj, jax_ff.net[0])
+    _copy_linear_torch_to_jax(torch_ff.net[2], jax_ff.net[2])
+
+
+def _copy_adaln_zero_torch_to_jax(torch_norm, jax_norm):
+    _copy_linear_torch_to_jax(torch_norm.linear, jax_norm.linear)
+
+
+def _copy_adaln_zero_single_torch_to_jax(torch_norm, jax_norm):
+    _copy_linear_torch_to_jax(torch_norm.linear, jax_norm.linear)
+
+
+def _copy_adaln_continuous_torch_to_jax(torch_norm, jax_norm):
+    _copy_linear_torch_to_jax(torch_norm.linear, jax_norm.linear)
+    if (
+        getattr(torch_norm.norm, "weight", None) is not None
+        and getattr(jax_norm.norm, "scale", None) is not None
+    ):
+        jax_norm.norm.scale[...] = jnp.asarray(torch_norm.norm.weight.detach().cpu().numpy())
+    if (
+        getattr(torch_norm.norm, "bias", None) is not None
+        and getattr(jax_norm.norm, "bias", None) is not None
+    ):
+        jax_norm.norm.bias[...] = jnp.asarray(torch_norm.norm.bias.detach().cpu().numpy())
+
+
+def _copy_time_text_embed_torch_to_jax(torch_embed, jax_embed):
+    _copy_linear_torch_to_jax(
+        torch_embed.timestep_embedder.linear_1,
+        jax_embed.timestep_embedder.linear_1,
+    )
+    _copy_linear_torch_to_jax(
+        torch_embed.timestep_embedder.linear_2,
+        jax_embed.timestep_embedder.linear_2,
+    )
+    _copy_linear_torch_to_jax(
+        torch_embed.text_embedder.linear_1,
+        jax_embed.text_embedder.linear_1,
+    )
+    _copy_linear_torch_to_jax(
+        torch_embed.text_embedder.linear_2,
+        jax_embed.text_embedder.linear_2,
+    )
+
+
+def _copy_single_block_torch_to_jax(torch_block, jax_block):
+    _copy_adaln_zero_single_torch_to_jax(torch_block.norm, jax_block.norm)
+    _copy_linear_torch_to_jax(torch_block.proj_mlp, jax_block.proj_mlp)
+    _copy_linear_torch_to_jax(torch_block.proj_out, jax_block.proj_out)
+    _copy_flux_attention_torch_to_jax(torch_block.attn, jax_block.attn)
+
+
+def _copy_block_torch_to_jax(torch_block, jax_block):
+    _copy_adaln_zero_torch_to_jax(torch_block.norm1, jax_block.norm1)
+    _copy_adaln_zero_torch_to_jax(torch_block.norm1_context, jax_block.norm1_context)
+    _copy_flux_attention_torch_to_jax(torch_block.attn, jax_block.attn)
+    _copy_flux_feedforward_torch_to_jax(torch_block.ff, jax_block.ff)
+    _copy_flux_feedforward_torch_to_jax(torch_block.ff_context, jax_block.ff_context)
+
+
+def _make_mesh():
+    devices = np.array(jax.devices("cpu")[:1]).reshape((1, 1))
+    try:
+        return jax.sharding.Mesh(
+            devices,
+            ("data", "tensor"),
+            axis_types=(
+                jax.sharding.AxisType.Explicit,
+                jax.sharding.AxisType.Explicit,
+            ),
+        )
+    except TypeError:
+        return jax.sharding.Mesh(devices, ("data", "tensor"))
+
+
+def _mesh_context(mesh):
+    try:
+        return jax.sharding.use_mesh(mesh)
+    except AttributeError:
+        try:
+            return jax.set_mesh(mesh)
+        except AttributeError:
+            return nullcontext()
+
+
+@unittest.skipIf(
+    torch is None or HFFluxTransformer2DModel is None or jax is None,
+    "torch/diffusers/jax not installed",
+)
+class TestFluxTransformer2DModelParityDemo(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mesh = _make_mesh()
+
+    def test_flux_transformer_2d_model_parity(self):
+        torch.manual_seed(0)
+        batch_size = 6
+        image_seq_len = 64
+        text_seq_len = 128
+
+        hf_model = (
+            HFFluxTransformer2DModel(
+                patch_size=1,
+                in_channels=16,
+                out_channels=16,
+                num_layers=1,
+                num_single_layers=1,
+                attention_head_dim=8,
+                num_attention_heads=4,
+                joint_attention_dim=20,
+                pooled_projection_dim=12,
+                guidance_embeds=False,
+                axes_dims_rope=(2, 2, 4),
+            )
+            .cpu()
+            .eval()
+        )
+
+        config = FluxModelConfig(
+            patch_size=1,
+            in_channels=16,
+            out_channels=16,
+            num_layers=1,
+            num_single_layers=1,
+            attention_head_dim=8,
+            num_attention_heads=4,
+            joint_attention_dim=20,
+            pooled_projection_dim=12,
+            guidance_embeds=False,
+            axes_dims_rope=(2, 2, 4),
+            dtype=jnp.float32,
+            weights_dtype=jnp.float32,
+            attention_impl="naive",
+        )
+        with _mesh_context(self.mesh):
+            jax_model = JaxFluxTransformer2DModel(
+                config,
+                dtype=jnp.float32,
+                mesh=self.mesh,
+            )
+
+        _copy_time_text_embed_torch_to_jax(hf_model.time_text_embed, jax_model.time_text_embed)
+        _copy_linear_torch_to_jax(hf_model.context_embedder, jax_model.context_embedder)
+        _copy_linear_torch_to_jax(hf_model.x_embedder, jax_model.x_embedder)
+        _copy_block_torch_to_jax(hf_model.transformer_blocks[0], jax_model.transformer_blocks[0])
+        _copy_single_block_torch_to_jax(
+            hf_model.single_transformer_blocks[0],
+            jax_model.single_transformer_blocks[0],
+        )
+        _copy_adaln_continuous_torch_to_jax(hf_model.norm_out, jax_model.norm_out)
+        _copy_linear_torch_to_jax(hf_model.proj_out, jax_model.proj_out)
+
+        hidden_states_torch = torch.randn(batch_size, image_seq_len, 16, dtype=torch.float32)
+        encoder_hidden_states_torch = torch.randn(batch_size, text_seq_len, 20, dtype=torch.float32)
+        pooled_projections_torch = torch.randn(batch_size, 12, dtype=torch.float32)
+        timestep_torch = torch.tensor([0, 1, 2, 5, 150, 951], dtype=torch.int64)
+        txt_ids_torch = torch.from_numpy(_make_text_ids(text_seq_len))
+        img_ids_torch = torch.from_numpy(_make_image_ids(image_seq_len))
+
+        hidden_states_jax = jnp.asarray(hidden_states_torch.detach().cpu().numpy())
+        encoder_hidden_states_jax = jnp.asarray(encoder_hidden_states_torch.detach().cpu().numpy())
+        pooled_projections_jax = jnp.asarray(pooled_projections_torch.detach().cpu().numpy())
+        timestep_jax = jnp.asarray(timestep_torch.detach().cpu().numpy())
+        txt_ids_jax = jnp.asarray(txt_ids_torch.detach().cpu().numpy())
+        img_ids_jax = jnp.asarray(img_ids_torch.detach().cpu().numpy())
+
+        with torch.no_grad():
+            torch_output = hf_model(
+                hidden_states=hidden_states_torch,
+                encoder_hidden_states=encoder_hidden_states_torch,
+                pooled_projections=pooled_projections_torch,
+                timestep=timestep_torch,
+                img_ids=img_ids_torch,
+                txt_ids=txt_ids_torch,
+                return_dict=False,
+            )[0]
+
+        jax_output = jax_model(
+            hidden_states=hidden_states_jax,
+            encoder_hidden_states=encoder_hidden_states_jax,
+            pooled_projections=pooled_projections_jax,
+            timestep=timestep_jax,
+            img_ids=img_ids_jax,
+            txt_ids=txt_ids_jax,
+            return_dict=False,
+        )[0]
+
+        np.testing.assert_allclose(
+            torch_output.detach().cpu().numpy(),
+            np.asarray(jax_output),
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

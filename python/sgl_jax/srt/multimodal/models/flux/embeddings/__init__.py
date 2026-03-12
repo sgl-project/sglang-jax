@@ -1,6 +1,6 @@
 from sgl_jax.srt.multimodal.models.flux.embeddings.layers import (
-    CombinedTimestepLabelEmbeddings,
     CombinedTimestepGuidanceTextProjEmbeddings,
+    CombinedTimestepLabelEmbeddings,
     CombinedTimestepTextProjEmbeddings,
     FluxTextProjection,
     FluxTimestepEmbedding,

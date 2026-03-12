@@ -1,14 +1,14 @@
 import inspect
 import logging
 import math
+from contextlib import suppress
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
-from jax.sharding import Mesh
-from jax.sharding import NamedSharding
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from transformers import modeling_flax_utils
 
@@ -20,16 +20,24 @@ from sgl_jax.srt.multimodal.models.flux.embeddings import (
     CombinedTimestepGuidanceTextProjEmbeddings,
     CombinedTimestepTextProjEmbeddings,
 )
+from sgl_jax.srt.multimodal.models.flux.embeddings.layers import (
+    _apply_flux_rotary_emb,
+    _get_1d_rotary_pos_embed,
+)
+from sgl_jax.srt.multimodal.models.flux.flux_weights_mapping import to_mappings
 from sgl_jax.srt.multimodal.models.flux.normalization import (
     FluxAdaLayerNormContinuous,
     FluxAdaLayerNormZero,
     FluxAdaLayerNormZeroSingle,
 )
-from sgl_jax.srt.multimodal.models.flux.flux_weights_mapping import to_mappings
 from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 logger = logging.getLogger(__name__)
 _SUPPORTED_ATTENTION_IMPLS = ("usp", "naive")
+
+
+def _resolve_rngs(rngs: nnx.Rngs | None) -> nnx.Rngs:
+    return rngs or nnx.Rngs(0)
 
 
 def _resolve_mesh(mesh: Mesh | None) -> Mesh:
@@ -46,10 +54,8 @@ def _resolve_mesh(mesh: Mesh | None) -> Mesh:
             )
         except TypeError:
             mesh = Mesh(devices, ("data", "tensor"))
-    try:
+    with suppress(AttributeError):
         jax.set_mesh(mesh)
-    except AttributeError:
-        pass
     return mesh
 
 
@@ -57,65 +63,6 @@ def _no_shard(x: jax.Array, mesh: Mesh | None) -> jax.Array:
     if mesh is None:
         return x
     return jax.lax.with_sharding_constraint(x, NamedSharding(mesh, P()))
-
-
-def _apply_flux_rotary_emb(
-    x: jax.Array,
-    image_rotary_emb: tuple[jax.Array, jax.Array] | None,
-    use_real: bool = True,
-    use_real_unbind_dim: int = -1,
-    sequence_dim: int = 1,
-) -> jax.Array:
-    if image_rotary_emb is None:
-        return x
-    if not use_real:
-        raise NotImplementedError("Complex rotary embeddings are not implemented for Flux in sglang-jax.")
-
-    cos, sin = image_rotary_emb
-    if sequence_dim == 2:
-        cos = cos[None, None, :, :]
-        sin = sin[None, None, :, :]
-    elif sequence_dim == 1:
-        cos = cos[None, :, None, :]
-        sin = sin[None, :, None, :]
-    else:
-        raise ValueError(f"`sequence_dim={sequence_dim}` but should be 1 or 2.")
-
-    cos = cos.astype(x.dtype)
-    sin = sin.astype(x.dtype)
-
-    if use_real_unbind_dim == -1:
-        x_real, x_imag = jnp.split(x.reshape(*x.shape[:-1], -1, 2), 2, axis=-1)
-        x_rotated = jnp.stack([-jnp.squeeze(x_imag, axis=-1), jnp.squeeze(x_real, axis=-1)], axis=-1)
-        x_rotated = x_rotated.reshape(x.shape)
-    elif use_real_unbind_dim == -2:
-        x_real, x_imag = jnp.split(x.reshape(*x.shape[:-1], 2, -1), 2, axis=-2)
-        x_rotated = jnp.concatenate(
-            [(-x_imag).squeeze(axis=-2), x_real.squeeze(axis=-2)],
-            axis=-1,
-        )
-    else:
-        raise ValueError(
-            f"`use_real_unbind_dim={use_real_unbind_dim}` but should be -1 or -2."
-        )
-
-    return (x.astype(jnp.float32) * cos + x_rotated.astype(jnp.float32) * sin).astype(x.dtype)
-
-
-def _get_1d_rotary_pos_embed(
-    dim: int,
-    pos: jax.Array,
-    theta: float,
-) -> tuple[jax.Array, jax.Array]:
-    if dim % 2 != 0:
-        raise ValueError(f"Rotary dimension must be even, got dim={dim}.")
-    freqs_dtype = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
-
-    inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2, dtype=freqs_dtype) / dim))
-    freqs = pos.astype(freqs_dtype)[:, None] * inv_freq[None, :]
-    cos = jnp.repeat(jnp.cos(freqs), 2, axis=-1).astype(jnp.float32)
-    sin = jnp.repeat(jnp.sin(freqs), 2, axis=-1).astype(jnp.float32)
-    return cos, sin
 
 
 def _naive_attention(
@@ -187,36 +134,63 @@ def _get_qkv_projections(
 
 
 class FluxFeedForward(nnx.Module):
-    def __init__(self, dim: int, dim_out: int, mesh: Mesh):
-        self.fc1 = LinearBase(
-            input_size=dim,
-            output_size=dim_out,
-            use_bias=True,
-            mesh=mesh,
-            kernel_axes=(None, "tensor"),
+    def __init__(
+        self,
+        dim: int,
+        mesh: Mesh,
+        dim_out: int | None = None,
+        mult: int = 4,
+        dropout: float = 0.0,
+        activation_fn: str = "gelu-approximate",
+        final_dropout: bool = False,
+        inner_dim: int | None = None,
+        bias: bool = True,
+        params_dtype: jnp.dtype | None = jnp.bfloat16,
+        rngs: nnx.Rngs | None = None,
+    ):
+        _rngs = _resolve_rngs(rngs)
+        if inner_dim is None:
+            inner_dim = int(dim * mult)
+        dim_out = dim if dim_out is None else dim_out
+        if activation_fn == "gelu":
+            self.act = modeling_flax_utils.ACT2FN["gelu"]
+        elif activation_fn == "gelu-approximate":
+            self.act = modeling_flax_utils.ACT2FN["gelu_pytorch_tanh"]
+        else:
+            raise ValueError(f"Unsupported activation_fn {activation_fn!r} for FluxFeedForward.")
+
+        self.net = nnx.List(
+            [
+                LinearBase(
+                    input_size=dim,
+                    output_size=inner_dim,
+                    use_bias=bias,
+                    mesh=mesh,
+                    params_dtype=params_dtype,
+                    kernel_axes=(None, "tensor"),
+                ),
+                nnx.Dropout(dropout, rngs=_rngs),
+                LinearBase(
+                    input_size=inner_dim,
+                    output_size=dim_out,
+                    use_bias=bias,
+                    mesh=mesh,
+                    params_dtype=params_dtype,
+                    kernel_axes=("tensor", None),
+                ),
+            ]
         )
-        self.fc2 = LinearBase(
-            input_size=dim_out,
-            output_size=dim,
-            use_bias=True,
-            mesh=mesh,
-            kernel_axes=("tensor", None),
-        )
-        self.mlp_act = modeling_flax_utils.ACT2FN["gelu"]
+        if final_dropout:
+            self.net.append(nnx.Dropout(dropout, rngs=_rngs))
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        x, _ = self.fc1(x)
-        x = self.mlp_act(x)
-        x, _ = self.fc2(x)
+        x, _ = self.net[0](x)
+        x = self.act(x)
+        x = self.net[1](x, deterministic=True)
+        x, _ = self.net[2](x)
+        if len(self.net) == 4:
+            x = self.net[3](x, deterministic=True)
         return x
-
-
-class FluxDropout(nnx.Module):
-    def __init__(self, rate: float):
-        self.dropout = nnx.Dropout(rate)
-
-    def __call__(self, x: jax.Array, deterministic: bool = True) -> jax.Array:
-        return self.dropout(x, deterministic=deterministic)
 
 
 class FluxAttnProcessor:
@@ -291,7 +265,8 @@ class FluxAttnProcessor:
 
 class FluxAttention(nnx.Module):
     _default_processor_cls = FluxAttnProcessor
-    # NOTE FluxIPAdapterAttnProcessor is not added 
+
+    # NOTE FluxIPAdapterAttnProcessor is not added
     def __init__(
         self,
         query_dim: int,
@@ -311,13 +286,15 @@ class FluxAttention(nnx.Module):
         attention_impl: str = "usp",
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         mesh: Mesh | None = None,
+        rngs: nnx.Rngs | None = None,
     ):
         """
         NOTE: Align with the implementation of HF.
-        processor: if specified, the attention processor to use. 
+        processor: if specified, the attention processor to use.
         attention_impl: support usp and naive. usp dont support attention_mask yet.
         """
         mesh = _resolve_mesh(mesh)
+        _rngs = _resolve_rngs(rngs)
         if attention_impl not in _SUPPORTED_ATTENTION_IMPLS:
             raise ValueError(
                 f"Unsupported attention_impl {attention_impl!r}. "
@@ -376,7 +353,7 @@ class FluxAttention(nnx.Module):
                         params_dtype=params_dtype,
                         kernel_axes=("tensor", None),
                     ),
-                    FluxDropout(dropout),
+                    nnx.Dropout(dropout, rngs=_rngs),
                 ]
             )
 
@@ -470,7 +447,9 @@ class FluxAttention(nnx.Module):
         attn_parameters = set(inspect.signature(self.processor.__call__).parameters.keys())
         unused_kwargs = [k for k in kwargs if k not in attn_parameters]
         if unused_kwargs:
-            logger.warning("Ignoring unsupported joint_attention_kwargs in FluxAttention: %s", unused_kwargs)
+            logger.warning(
+                "Ignoring unsupported joint_attention_kwargs in FluxAttention: %s", unused_kwargs
+            )
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in attn_parameters}
         return self.processor(
             self,
@@ -492,14 +471,20 @@ class FluxSingleTransformerBlock(nnx.Module):
         mesh: Mesh,
         mlp_ratio: float = 4.0,
         attention_impl: str = "usp",
+        params_dtype: jnp.dtype | None = jnp.bfloat16,
+        rngs: nnx.Rngs | None = None,
     ):
+        _rngs = _resolve_rngs(rngs)
         self.mlp_hidden_dim = int(dim * mlp_ratio)
-        self.norm = FluxAdaLayerNormZeroSingle(dim, mesh=mesh)
+        self.norm = FluxAdaLayerNormZeroSingle(
+            dim, mesh=mesh, params_dtype=params_dtype, rngs=_rngs
+        )
         self.proj_mlp = LinearBase(
             input_size=dim,
             output_size=self.mlp_hidden_dim,
             use_bias=True,
             mesh=mesh,
+            params_dtype=params_dtype,
             kernel_axes=(None, "tensor"),
         )
         self.proj_out = LinearBase(
@@ -507,9 +492,10 @@ class FluxSingleTransformerBlock(nnx.Module):
             output_size=dim,
             use_bias=True,
             mesh=mesh,
+            params_dtype=params_dtype,
             kernel_axes=("tensor", None),
         )
-        self.mlp_act = modeling_flax_utils.ACT2FN["gelu"]
+        self.act_mlp = modeling_flax_utils.ACT2FN["gelu_pytorch_tanh"]
         self.attn = FluxAttention(
             query_dim=dim,
             dim_head=attention_head_dim,
@@ -520,7 +506,9 @@ class FluxSingleTransformerBlock(nnx.Module):
             pre_only=True,
             processor=FluxAttnProcessor(),
             attention_impl=attention_impl,
+            params_dtype=params_dtype,
             mesh=mesh,
+            rngs=_rngs,
         )
 
     def __call__(
@@ -538,7 +526,7 @@ class FluxSingleTransformerBlock(nnx.Module):
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
         mlp_hidden_states, _ = self.proj_mlp(norm_hidden_states)
-        mlp_hidden_states = self.mlp_act(mlp_hidden_states)
+        mlp_hidden_states = self.act_mlp(mlp_hidden_states)
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
@@ -548,8 +536,10 @@ class FluxSingleTransformerBlock(nnx.Module):
         )
 
         hidden_states = jnp.concatenate([attn_output, mlp_hidden_states], axis=-1)
+        gate = gate[:, None, :]
         hidden_states, _ = self.proj_out(hidden_states)
-        hidden_states = residual + gate[:, None, :] * hidden_states
+        hidden_states = gate * hidden_states
+        hidden_states = residual + hidden_states
 
         if hidden_states.dtype == jnp.float16:
             hidden_states = jnp.clip(hidden_states, -65504, 65504)
@@ -568,9 +558,16 @@ class FluxTransformerBlock(nnx.Module):
         mesh: Mesh,
         eps: float = 1e-6,
         attention_impl: str = "usp",
+        params_dtype: jnp.dtype | None = jnp.bfloat16,
+        rngs: nnx.Rngs | None = None,
     ):
-        self.norm1 = FluxAdaLayerNormZero(dim, mesh=mesh, eps=eps)
-        self.norm1_context = FluxAdaLayerNormZero(dim, mesh=mesh, eps=eps)
+        _rngs = _resolve_rngs(rngs)
+        self.norm1 = FluxAdaLayerNormZero(
+            dim, mesh=mesh, eps=eps, params_dtype=params_dtype, rngs=_rngs
+        )
+        self.norm1_context = FluxAdaLayerNormZero(
+            dim, mesh=mesh, eps=eps, params_dtype=params_dtype, rngs=_rngs
+        )
         self.attn = FluxAttention(
             query_dim=dim,
             added_kv_proj_dim=dim,
@@ -581,7 +578,9 @@ class FluxTransformerBlock(nnx.Module):
             eps=eps,
             processor=FluxAttnProcessor(),
             attention_impl=attention_impl,
+            params_dtype=params_dtype,
             mesh=mesh,
+            rngs=_rngs,
         )
         self.eps = eps
         self.norm2 = nnx.LayerNorm(
@@ -590,7 +589,7 @@ class FluxTransformerBlock(nnx.Module):
             use_bias=False,
             use_scale=False,
             use_fast_variance=False,
-            rngs=nnx.Rngs(0),
+            rngs=_rngs,
         )
         self.norm2_context = nnx.LayerNorm(
             num_features=dim,
@@ -598,10 +597,24 @@ class FluxTransformerBlock(nnx.Module):
             use_bias=False,
             use_scale=False,
             use_fast_variance=False,
-            rngs=nnx.Rngs(0),
+            rngs=_rngs,
         )
-        self.ff = FluxFeedForward(dim=dim, dim_out=4 * dim, mesh=mesh)
-        self.ff_context = FluxFeedForward(dim=dim, dim_out=4 * dim, mesh=mesh)
+        self.ff = FluxFeedForward(
+            dim=dim,
+            dim_out=dim,
+            activation_fn="gelu-approximate",
+            mesh=mesh,
+            params_dtype=params_dtype,
+            rngs=_rngs,
+        )
+        self.ff_context = FluxFeedForward(
+            dim=dim,
+            dim_out=dim,
+            activation_fn="gelu-approximate",
+            mesh=mesh,
+            params_dtype=params_dtype,
+            rngs=_rngs,
+        )
 
     def __call__(
         self,
@@ -678,6 +691,20 @@ class FluxPosEmbed(nnx.Module):
 
 
 class FluxTransformer2DModel(nnx.Module):
+    _supports_gradient_checkpointing = True
+    _no_split_modules = ["FluxTransformerBlock", "FluxSingleTransformerBlock"]
+    _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
+    _repeated_blocks = ["FluxTransformerBlock", "FluxSingleTransformerBlock"]
+    _cp_plan = {
+        "": {
+            "hidden_states": {"split_dim": 1, "expected_dims": 3, "split_output": False},
+            "encoder_hidden_states": {"split_dim": 1, "expected_dims": 3, "split_output": False},
+            "img_ids": {"split_dim": 0, "expected_dims": 2, "split_output": False},
+            "txt_ids": {"split_dim": 0, "expected_dims": 2, "split_output": False},
+        },
+        "proj_out": {"gather_dim": 1, "expected_dims": 3},
+    }
+
     def __init__(
         self,
         config: FluxModelConfig,
@@ -686,13 +713,16 @@ class FluxTransformer2DModel(nnx.Module):
         mesh: Mesh | None = None,
         rngs: nnx.Rngs | None = None,
     ):
-        del rngs
+        _rngs = _resolve_rngs(rngs)
+        self.config = config
         self.model_config = config
         self.dtype = dtype or config.dtype
+        self.params_dtype = config.weights_dtype
         self.mesh = _resolve_mesh(mesh)
         self.attention_impl = config.attention_impl
         self.out_channels = config.out_channels or config.in_channels
         self.inner_dim = config.num_attention_heads * config.attention_head_dim
+        self.gradient_checkpointing = False
 
         self.pos_embed = FluxPosEmbed(theta=10000, axes_dim=config.axes_dims_rope)
 
@@ -705,6 +735,8 @@ class FluxTransformer2DModel(nnx.Module):
             embedding_dim=self.inner_dim,
             pooled_projection_dim=config.pooled_projection_dim,
             mesh=self.mesh,
+            params_dtype=self.params_dtype,
+            rngs=_rngs,
         )
 
         self.context_embedder = LinearBase(
@@ -712,6 +744,7 @@ class FluxTransformer2DModel(nnx.Module):
             output_size=self.inner_dim,
             use_bias=True,
             mesh=self.mesh,
+            params_dtype=self.params_dtype,
             kernel_axes=(None, "tensor"),
         )
         self.x_embedder = LinearBase(
@@ -719,6 +752,7 @@ class FluxTransformer2DModel(nnx.Module):
             output_size=self.inner_dim,
             use_bias=True,
             mesh=self.mesh,
+            params_dtype=self.params_dtype,
             kernel_axes=(None, "tensor"),
         )
 
@@ -731,6 +765,8 @@ class FluxTransformer2DModel(nnx.Module):
                     mesh=self.mesh,
                     eps=config.epsilon,
                     attention_impl=self.attention_impl,
+                    params_dtype=self.params_dtype,
+                    rngs=_rngs,
                 )
                 for _ in range(config.num_layers)
             ]
@@ -743,6 +779,8 @@ class FluxTransformer2DModel(nnx.Module):
                     attention_head_dim=config.attention_head_dim,
                     mesh=self.mesh,
                     attention_impl=self.attention_impl,
+                    params_dtype=self.params_dtype,
+                    rngs=_rngs,
                 )
                 for _ in range(config.num_single_layers)
             ]
@@ -753,12 +791,15 @@ class FluxTransformer2DModel(nnx.Module):
             conditioning_embedding_dim=self.inner_dim,
             mesh=self.mesh,
             eps=config.epsilon,
+            params_dtype=self.params_dtype,
+            rngs=_rngs,
         )
         self.proj_out = LinearBase(
             input_size=self.inner_dim,
             output_size=config.patch_size * config.patch_size * self.out_channels,
             use_bias=True,
             mesh=self.mesh,
+            params_dtype=self.params_dtype,
             kernel_axes=("tensor", None),
         )
 
@@ -823,13 +864,14 @@ class FluxTransformer2DModel(nnx.Module):
                 interval_control = len(self.transformer_blocks) / len(controlnet_block_samples)
                 interval_control = int(math.ceil(interval_control))
                 if controlnet_blocks_repeat:
-                    hidden_states = hidden_states + controlnet_block_samples[
-                        index_block % len(controlnet_block_samples)
-                    ]
+                    hidden_states = (
+                        hidden_states
+                        + controlnet_block_samples[index_block % len(controlnet_block_samples)]
+                    )
                 else:
-                    hidden_states = hidden_states + controlnet_block_samples[
-                        index_block // interval_control
-                    ]
+                    hidden_states = (
+                        hidden_states + controlnet_block_samples[index_block // interval_control]
+                    )
 
         for index_block, block in enumerate(self.single_transformer_blocks):
             encoder_hidden_states, hidden_states = block(
@@ -846,9 +888,9 @@ class FluxTransformer2DModel(nnx.Module):
                     controlnet_single_block_samples
                 )
                 interval_control = int(math.ceil(interval_control))
-                hidden_states = hidden_states + controlnet_single_block_samples[
-                    index_block // interval_control
-                ]
+                hidden_states = (
+                    hidden_states + controlnet_single_block_samples[index_block // interval_control]
+                )
 
         hidden_states = self.norm_out(hidden_states, temb)
         output, _ = self.proj_out(hidden_states)

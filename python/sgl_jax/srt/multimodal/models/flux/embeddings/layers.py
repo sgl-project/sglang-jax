@@ -10,6 +10,71 @@ from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.layers.linear import LinearBase
 
 
+def _resolve_rngs(rngs: nnx.Rngs | None) -> nnx.Rngs:
+    return rngs or nnx.Rngs(0)
+
+
+def _apply_flux_rotary_emb(
+    x: jax.Array,
+    image_rotary_emb: tuple[jax.Array, jax.Array] | None,
+    use_real: bool = True,
+    use_real_unbind_dim: int = -1,
+    sequence_dim: int = 1,
+) -> jax.Array:
+    if image_rotary_emb is None:
+        return x
+    if not use_real:
+        raise NotImplementedError(
+            "Complex rotary embeddings are not implemented for Flux in sglang-jax."
+        )
+
+    cos, sin = image_rotary_emb
+    if sequence_dim == 2:
+        cos = cos[None, None, :, :]
+        sin = sin[None, None, :, :]
+    elif sequence_dim == 1:
+        cos = cos[None, :, None, :]
+        sin = sin[None, :, None, :]
+    else:
+        raise ValueError(f"`sequence_dim={sequence_dim}` but should be 1 or 2.")
+
+    cos = cos.astype(x.dtype)
+    sin = sin.astype(x.dtype)
+
+    if use_real_unbind_dim == -1:
+        x_real, x_imag = jnp.split(x.reshape(*x.shape[:-1], -1, 2), 2, axis=-1)
+        x_rotated = jnp.stack(
+            [-jnp.squeeze(x_imag, axis=-1), jnp.squeeze(x_real, axis=-1)], axis=-1
+        )
+        x_rotated = x_rotated.reshape(x.shape)
+    elif use_real_unbind_dim == -2:
+        x_real, x_imag = jnp.split(x.reshape(*x.shape[:-1], 2, -1), 2, axis=-2)
+        x_rotated = jnp.concatenate(
+            [(-x_imag).squeeze(axis=-2), x_real.squeeze(axis=-2)],
+            axis=-1,
+        )
+    else:
+        raise ValueError(f"`use_real_unbind_dim={use_real_unbind_dim}` but should be -1 or -2.")
+
+    return (x.astype(jnp.float32) * cos + x_rotated.astype(jnp.float32) * sin).astype(x.dtype)
+
+
+def _get_1d_rotary_pos_embed(
+    dim: int,
+    pos: jax.Array,
+    theta: float,
+) -> tuple[jax.Array, jax.Array]:
+    if dim % 2 != 0:
+        raise ValueError(f"Rotary dimension must be even, got dim={dim}.")
+    freqs_dtype = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
+
+    inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2, dtype=freqs_dtype) / dim))
+    freqs = pos.astype(freqs_dtype)[:, None] * inv_freq[None, :]
+    cos = jnp.repeat(jnp.cos(freqs), 2, axis=-1).astype(jnp.float32)
+    sin = jnp.repeat(jnp.sin(freqs), 2, axis=-1).astype(jnp.float32)
+    return cos, sin
+
+
 class Timesteps(nnx.Module):
     def __init__(
         self,
@@ -48,6 +113,7 @@ class FluxTimestepEmbedding(nnx.Module):
         time_embed_dim: int,
         mesh: Mesh,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
+        rngs: nnx.Rngs | None = None,
     ):
         self.linear_1 = LinearBase(
             input_size=in_channels,
@@ -82,6 +148,7 @@ class FluxTextProjection(nnx.Module):
         mesh: Mesh,
         act_fn: str = "silu",
         params_dtype: jnp.dtype | None = jnp.bfloat16,
+        rngs: nnx.Rngs | None = None,
     ):
         self.linear_1 = LinearBase(
             input_size=in_features,
@@ -117,6 +184,7 @@ class LabelEmbedding(nnx.Module):
         dropout_prob: float,
         mesh: Mesh,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
+        rngs: nnx.Rngs | None = None,
     ):
         use_cfg_embedding = int(dropout_prob > 0)
         self.embedding_table = Embed(
@@ -159,13 +227,16 @@ class CombinedTimestepLabelEmbeddings(nnx.Module):
         mesh: Mesh,
         class_dropout_prob: float = 0.1,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
+        rngs: nnx.Rngs | None = None,
     ):
+        _rngs = _resolve_rngs(rngs)
         self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=1)
         self.timestep_embedder = FluxTimestepEmbedding(
             in_channels=256,
             time_embed_dim=embedding_dim,
             mesh=mesh,
             params_dtype=params_dtype,
+            rngs=_rngs,
         )
         self.class_embedder = LabelEmbedding(
             num_classes=num_classes,
@@ -173,6 +244,7 @@ class CombinedTimestepLabelEmbeddings(nnx.Module):
             dropout_prob=class_dropout_prob,
             mesh=mesh,
             params_dtype=params_dtype,
+            rngs=_rngs,
         )
 
     def __call__(
@@ -196,13 +268,16 @@ class CombinedTimestepTextProjEmbeddings(nnx.Module):
         pooled_projection_dim: int,
         mesh: Mesh,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
+        rngs: nnx.Rngs | None = None,
     ):
+        _rngs = _resolve_rngs(rngs)
         self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
         self.timestep_embedder = FluxTimestepEmbedding(
             in_channels=256,
             time_embed_dim=embedding_dim,
             mesh=mesh,
             params_dtype=params_dtype,
+            rngs=_rngs,
         )
         self.text_embedder = FluxTextProjection(
             in_features=pooled_projection_dim,
@@ -210,6 +285,7 @@ class CombinedTimestepTextProjEmbeddings(nnx.Module):
             mesh=mesh,
             act_fn="silu",
             params_dtype=params_dtype,
+            rngs=_rngs,
         )
 
     def __call__(self, timestep: jax.Array, pooled_projection: jax.Array) -> jax.Array:
@@ -226,19 +302,23 @@ class CombinedTimestepGuidanceTextProjEmbeddings(nnx.Module):
         pooled_projection_dim: int,
         mesh: Mesh,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
+        rngs: nnx.Rngs | None = None,
     ):
+        _rngs = _resolve_rngs(rngs)
         self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
         self.timestep_embedder = FluxTimestepEmbedding(
             in_channels=256,
             time_embed_dim=embedding_dim,
             mesh=mesh,
             params_dtype=params_dtype,
+            rngs=_rngs,
         )
         self.guidance_embedder = FluxTimestepEmbedding(
             in_channels=256,
             time_embed_dim=embedding_dim,
             mesh=mesh,
             params_dtype=params_dtype,
+            rngs=_rngs,
         )
         self.text_embedder = FluxTextProjection(
             in_features=pooled_projection_dim,
@@ -246,6 +326,7 @@ class CombinedTimestepGuidanceTextProjEmbeddings(nnx.Module):
             mesh=mesh,
             act_fn="silu",
             params_dtype=params_dtype,
+            rngs=_rngs,
         )
 
     def __call__(

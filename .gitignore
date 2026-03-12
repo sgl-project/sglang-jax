@@ -218,8 +218,6 @@ work_dirs/
 # Executables
 *.exe
 *.out
-
-# Local scratch files
 *.app
 
 compile_commands.json

@@ -146,39 +146,39 @@ def to_mappings(has_guidance_embeds: bool = False) -> dict[str, WeightMapping]:
     )
 
     mappings["transformer_blocks.*.ff.net.0.proj.weight"] = WeightMapping(
-        target_path="transformer_blocks.*.ff.fc1.weight",
+        target_path="transformer_blocks.*.ff.net.0.weight",
         sharding=(None, "tensor"),
         transpose=True,
     )
     mappings["transformer_blocks.*.ff.net.0.proj.bias"] = WeightMapping(
-        target_path="transformer_blocks.*.ff.fc1.bias",
+        target_path="transformer_blocks.*.ff.net.0.bias",
         sharding=(None,),
     )
     mappings["transformer_blocks.*.ff.net.2.weight"] = WeightMapping(
-        target_path="transformer_blocks.*.ff.fc2.weight",
+        target_path="transformer_blocks.*.ff.net.2.weight",
         sharding=("tensor", None),
         transpose=True,
     )
     mappings["transformer_blocks.*.ff.net.2.bias"] = WeightMapping(
-        target_path="transformer_blocks.*.ff.fc2.bias",
+        target_path="transformer_blocks.*.ff.net.2.bias",
         sharding=(None,),
     )
     mappings["transformer_blocks.*.ff_context.net.0.proj.weight"] = WeightMapping(
-        target_path="transformer_blocks.*.ff_context.fc1.weight",
+        target_path="transformer_blocks.*.ff_context.net.0.weight",
         sharding=(None, "tensor"),
         transpose=True,
     )
     mappings["transformer_blocks.*.ff_context.net.0.proj.bias"] = WeightMapping(
-        target_path="transformer_blocks.*.ff_context.fc1.bias",
+        target_path="transformer_blocks.*.ff_context.net.0.bias",
         sharding=(None,),
     )
     mappings["transformer_blocks.*.ff_context.net.2.weight"] = WeightMapping(
-        target_path="transformer_blocks.*.ff_context.fc2.weight",
+        target_path="transformer_blocks.*.ff_context.net.2.weight",
         sharding=("tensor", None),
         transpose=True,
     )
     mappings["transformer_blocks.*.ff_context.net.2.bias"] = WeightMapping(
-        target_path="transformer_blocks.*.ff_context.fc2.bias",
+        target_path="transformer_blocks.*.ff_context.net.2.bias",
         sharding=(None,),
     )
 

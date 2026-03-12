@@ -1,14 +1,19 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import Mesh
-from jax.sharding import NamedSharding
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from transformers import modeling_flax_utils
 
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
-from sgl_jax.srt.multimodal.models.flux.embeddings import CombinedTimestepLabelEmbeddings
+from sgl_jax.srt.multimodal.models.flux.embeddings import (
+    CombinedTimestepLabelEmbeddings,
+)
+
+
+def _resolve_rngs(rngs: nnx.Rngs | None) -> nnx.Rngs:
+    return rngs or nnx.Rngs(0)
 
 
 def _no_shard(x: jax.Array, mesh: Mesh | None) -> jax.Array:
@@ -18,7 +23,13 @@ def _no_shard(x: jax.Array, mesh: Mesh | None) -> jax.Array:
 
 
 class _FP32LayerNorm(nnx.Module):
-    def __init__(self, num_features: int, eps: float = 1e-6):
+    def __init__(
+        self,
+        num_features: int,
+        eps: float = 1e-6,
+        rngs: nnx.Rngs | None = None,
+    ):
+        _rngs = _resolve_rngs(rngs)
         self.norm = nnx.LayerNorm(
             num_features=num_features,
             epsilon=eps,
@@ -27,14 +38,20 @@ class _FP32LayerNorm(nnx.Module):
             dtype=jnp.float32,
             param_dtype=jnp.float32,
             use_fast_variance=False,
-            rngs=nnx.Rngs(0),
+            rngs=_rngs,
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
         return self.norm(x).astype(x.dtype)
 
 
-def _build_zero_norm(dim: int, eps: float, norm_type: str):
+def _build_zero_norm(
+    dim: int,
+    eps: float,
+    norm_type: str,
+    rngs: nnx.Rngs | None = None,
+):
+    _rngs = _resolve_rngs(rngs)
     if norm_type == "layer_norm":
         return nnx.LayerNorm(
             num_features=dim,
@@ -42,10 +59,10 @@ def _build_zero_norm(dim: int, eps: float, norm_type: str):
             use_bias=False,
             use_scale=False,
             use_fast_variance=False,
-            rngs=nnx.Rngs(0),
+            rngs=_rngs,
         )
     if norm_type == "fp32_layer_norm":
-        return _FP32LayerNorm(dim, eps=eps)
+        return _FP32LayerNorm(dim, eps=eps, rngs=_rngs)
     raise ValueError(
         f"Unsupported `norm_type` ({norm_type}) provided. "
         "Supported ones are: 'layer_norm', 'fp32_layer_norm'."
@@ -57,7 +74,9 @@ def _build_continuous_norm(
     eps: float,
     elementwise_affine: bool,
     norm_type: str,
+    rngs: nnx.Rngs | None = None,
 ):
+    _rngs = _resolve_rngs(rngs)
     if norm_type == "layer_norm":
         return nnx.LayerNorm(
             num_features=embedding_dim,
@@ -65,7 +84,7 @@ def _build_continuous_norm(
             use_bias=elementwise_affine,
             use_scale=elementwise_affine,
             use_fast_variance=False,
-            rngs=nnx.Rngs(0),
+            rngs=_rngs,
         )
     if norm_type == "rms_norm":
         return RMSNorm(
@@ -88,7 +107,9 @@ class FluxAdaLayerNormZero(nnx.Module):
         eps: float = 1e-6,
         bias: bool = True,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
+        rngs: nnx.Rngs | None = None,
     ):
+        _rngs = _resolve_rngs(rngs)
         self.mesh = mesh
         self.emb = (
             CombinedTimestepLabelEmbeddings(
@@ -97,12 +118,13 @@ class FluxAdaLayerNormZero(nnx.Module):
                 mesh=mesh,
                 class_dropout_prob=class_dropout_prob,
                 params_dtype=params_dtype,
+                rngs=_rngs,
             )
             if num_embeddings is not None
             else None
         )
         self.norm_type = norm_type
-        self.norm = _build_zero_norm(dim, eps, norm_type)
+        self.norm = _build_zero_norm(dim, eps, norm_type, rngs=_rngs)
         self.act = modeling_flax_utils.ACT2FN["silu"]
         self.linear = LinearBase(
             input_size=dim,
@@ -133,9 +155,7 @@ class FluxAdaLayerNormZero(nnx.Module):
         hidden_states = self.norm(hidden_states)
         emb, _ = self.linear(self.act(emb))
         emb = _no_shard(emb, self.mesh)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(
-            emb, 6, axis=-1
-        )
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(emb, 6, axis=-1)
         hidden_states = hidden_states * (1 + scale_msa[:, None, :]) + shift_msa[:, None, :]
         return hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
@@ -149,10 +169,12 @@ class FluxAdaLayerNormZeroSingle(nnx.Module):
         eps: float = 1e-6,
         bias: bool = True,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
+        rngs: nnx.Rngs | None = None,
     ):
+        _rngs = _resolve_rngs(rngs)
         self.mesh = mesh
         self.norm_type = norm_type
-        self.norm = _build_zero_norm(dim, eps, norm_type)
+        self.norm = _build_zero_norm(dim, eps, norm_type, rngs=_rngs)
         self.act = modeling_flax_utils.ACT2FN["silu"]
         self.linear = LinearBase(
             input_size=dim,
@@ -184,7 +206,9 @@ class FluxAdaLayerNormContinuous(nnx.Module):
         bias: bool = True,
         norm_type: str = "layer_norm",
         params_dtype: jnp.dtype | None = jnp.bfloat16,
+        rngs: nnx.Rngs | None = None,
     ):
+        _rngs = _resolve_rngs(rngs)
         self.mesh = mesh
         self.norm_type = norm_type
         self.norm = _build_continuous_norm(
@@ -192,6 +216,7 @@ class FluxAdaLayerNormContinuous(nnx.Module):
             eps=eps,
             elementwise_affine=elementwise_affine,
             norm_type=norm_type,
+            rngs=_rngs,
         )
         self.act = modeling_flax_utils.ACT2FN["silu"]
         self.linear = LinearBase(

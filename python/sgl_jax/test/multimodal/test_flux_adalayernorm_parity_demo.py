@@ -245,14 +245,18 @@ class TestFluxAdaLayerNormParityDemo(unittest.TestCase):
         torch.manual_seed(0)
         batch_size, seq_len, dim = 2, 8, 128
 
-        torch_mod = HFAdaLayerNormContinuous(
-            embedding_dim=dim,
-            conditioning_embedding_dim=dim,
-            elementwise_affine=False,
-            eps=1e-6,
-            bias=True,
-            norm_type="layer_norm",
-        ).cpu().eval()
+        torch_mod = (
+            HFAdaLayerNormContinuous(
+                embedding_dim=dim,
+                conditioning_embedding_dim=dim,
+                elementwise_affine=False,
+                eps=1e-6,
+                bias=True,
+                norm_type="layer_norm",
+            )
+            .cpu()
+            .eval()
+        )
         with _mesh_context(self.mesh):
             jax_mod = FluxAdaLayerNormContinuous(
                 embedding_dim=dim,
@@ -282,14 +286,18 @@ class TestFluxAdaLayerNormParityDemo(unittest.TestCase):
         torch.manual_seed(0)
         batch_size, seq_len, dim = 2, 8, 128
 
-        torch_mod = HFAdaLayerNormContinuous(
-            embedding_dim=dim,
-            conditioning_embedding_dim=dim,
-            elementwise_affine=False,
-            eps=1e-6,
-            bias=True,
-            norm_type="rms_norm",
-        ).cpu().eval()
+        torch_mod = (
+            HFAdaLayerNormContinuous(
+                embedding_dim=dim,
+                conditioning_embedding_dim=dim,
+                elementwise_affine=False,
+                eps=1e-6,
+                bias=True,
+                norm_type="rms_norm",
+            )
+            .cpu()
+            .eval()
+        )
         with _mesh_context(self.mesh):
             jax_mod = FluxAdaLayerNormContinuous(
                 embedding_dim=dim,
@@ -303,7 +311,10 @@ class TestFluxAdaLayerNormParityDemo(unittest.TestCase):
             )
 
         _copy_linear_torch_to_jax(torch_mod.linear, jax_mod.linear)
-        if getattr(torch_mod.norm, "weight", None) is not None and getattr(jax_mod.norm, "scale", None) is not None:
+        if (
+            getattr(torch_mod.norm, "weight", None) is not None
+            and getattr(jax_mod.norm, "scale", None) is not None
+        ):
             jax_mod.norm.scale[...] = jnp.asarray(torch_mod.norm.weight.detach().cpu().numpy())
 
         hidden_states_torch = torch.randn(batch_size, seq_len, dim, dtype=torch.float32)

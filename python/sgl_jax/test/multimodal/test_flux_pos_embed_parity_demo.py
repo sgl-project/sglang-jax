@@ -10,8 +10,12 @@ import numpy as np
 
 try:
     import torch
-    from diffusers.models.embeddings import get_1d_rotary_pos_embed as hf_get_1d_rotary_pos_embed
-    from diffusers.models.transformers.transformer_flux import FluxPosEmbed as HFFluxPosEmbed
+    from diffusers.models.embeddings import (
+        get_1d_rotary_pos_embed as hf_get_1d_rotary_pos_embed,
+    )
+    from diffusers.models.transformers.transformer_flux import (
+        FluxPosEmbed as HFFluxPosEmbed,
+    )
 except ImportError:  # pragma: no cover
     torch = None
     hf_get_1d_rotary_pos_embed = None
