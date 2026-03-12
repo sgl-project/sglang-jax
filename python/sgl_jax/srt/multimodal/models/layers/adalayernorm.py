@@ -7,6 +7,7 @@ from transformers import modeling_flax_utils
 
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.multimodal.layers.layernorm import FP32LayerNorm
 from sgl_jax.srt.multimodal.models.layers.visual_embedding import (
     CombinedTimestepLabelEmbeddings,
 )
@@ -20,29 +21,6 @@ def _no_shard(x: jax.Array, mesh: Mesh | None) -> jax.Array:
     if mesh is None:
         return x
     return jax.lax.with_sharding_constraint(x, NamedSharding(mesh, P()))
-
-
-class _FP32LayerNorm(nnx.Module):
-    def __init__(
-        self,
-        num_features: int,
-        eps: float = 1e-6,
-        rngs: nnx.Rngs | None = None,
-    ):
-        _rngs = _resolve_rngs(rngs)
-        self.norm = nnx.LayerNorm(
-            num_features=num_features,
-            epsilon=eps,
-            use_bias=False,
-            use_scale=False,
-            dtype=jnp.float32,
-            param_dtype=jnp.float32,
-            use_fast_variance=False,
-            rngs=_rngs,
-        )
-
-    def __call__(self, x: jax.Array) -> jax.Array:
-        return self.norm(x).astype(x.dtype)
 
 
 def _build_zero_norm(
@@ -62,7 +40,14 @@ def _build_zero_norm(
             rngs=_rngs,
         )
     if norm_type == "fp32_layer_norm":
-        return _FP32LayerNorm(dim, eps=eps, rngs=_rngs)
+        return FP32LayerNorm(
+            dim,
+            epsilon=eps,
+            use_bias=False,
+            use_scale=False,
+            dtype=jnp.float32,
+            rngs=_rngs,
+        )
     raise ValueError(
         f"Unsupported `norm_type` ({norm_type}) provided. "
         "Supported ones are: 'layer_norm', 'fp32_layer_norm'."

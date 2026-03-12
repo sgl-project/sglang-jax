@@ -16,17 +16,17 @@ from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.multimodal.configs.dits.flux_model_config import FluxModelConfig
 from sgl_jax.srt.multimodal.layers.attention.layer import USPAttention
-from sgl_jax.srt.multimodal.models.layers.visual_embedding import (
-    CombinedTimestepGuidanceTextProjEmbeddings,
-    CombinedTimestepTextProjEmbeddings,
-    _apply_flux_rotary_emb,
-    _get_1d_rotary_pos_embed,
-)
 from sgl_jax.srt.multimodal.models.dits.flux_weights_mapping import to_mappings
 from sgl_jax.srt.multimodal.models.layers.adalayernorm import (
     FluxAdaLayerNormContinuous,
     FluxAdaLayerNormZero,
     FluxAdaLayerNormZeroSingle,
+)
+from sgl_jax.srt.multimodal.models.layers.visual_embedding import (
+    CombinedTimestepGuidanceTextProjEmbeddings,
+    CombinedTimestepTextProjEmbeddings,
+    _apply_flux_rotary_emb,
+    _get_1d_rotary_pos_embed,
 )
 from sgl_jax.srt.utils.weight_utils import WeightLoader
 
