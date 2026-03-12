@@ -13,7 +13,7 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.configs.quantization_config import (
     DTYPE_MAP,
-    _normalize_weight_block_size,
+    normalize_weight_block_size,
 )
 
 logger = logging.getLogger(__name__)
@@ -121,7 +121,7 @@ def apply_linear_quantization(
             if "weight_block_size" in rule
             else getattr(quant_config, "weight_block_size", None)
         )
-        weight_block_size = _normalize_weight_block_size(weight_block_size)
+        weight_block_size = normalize_weight_block_size(weight_block_size)
 
         # Convert string dtypes to jnp dtypes
         weight_dtype = DTYPE_MAP.get(weight_dtype_str)

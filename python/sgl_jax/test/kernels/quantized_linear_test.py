@@ -10,6 +10,7 @@ from flax import nnx
 from jax.sharding import Mesh
 
 import sgl_jax.srt.kernels.quantized_matmul.kernel as quant_kernel
+import sgl_jax.srt.kernels.quantized_matmul.blockwise_3rd_utils as blockwise_3rd_utils
 from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
 from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
@@ -161,20 +162,20 @@ def _assert_blockwise_tuning_fallback_uses_compatible_seed():
     }
 
     saved_state = {
-        "_TRIED_LOADING_BLOCKWISE_3RD_TUNING": quant_kernel._TRIED_LOADING_BLOCKWISE_3RD_TUNING,
-        "_BLOCKWISE_3RD_TUNED_VALUE_CLS": quant_kernel._BLOCKWISE_3RD_TUNED_VALUE_CLS,
-        "_BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES": quant_kernel._BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES,
-        "_BLOCKWISE_3RD_TUNED_BLOCK_SIZES": quant_kernel._BLOCKWISE_3RD_TUNED_BLOCK_SIZES,
-        "_get_current_tpu_version": quant_kernel._get_current_tpu_version,
+        "_TRIED_LOADING_BLOCKWISE_3RD_TUNING": blockwise_3rd_utils._TRIED_LOADING_BLOCKWISE_3RD_TUNING,
+        "_BLOCKWISE_3RD_TUNED_VALUE_CLS": blockwise_3rd_utils._BLOCKWISE_3RD_TUNED_VALUE_CLS,
+        "_BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES": blockwise_3rd_utils._BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES,
+        "_BLOCKWISE_3RD_TUNED_BLOCK_SIZES": blockwise_3rd_utils._BLOCKWISE_3RD_TUNED_BLOCK_SIZES,
     }
+    saved_tpu_version = blockwise_3rd_utils._get_current_tpu_version
     try:
-        quant_kernel._TRIED_LOADING_BLOCKWISE_3RD_TUNING = True
-        quant_kernel._BLOCKWISE_3RD_TUNED_VALUE_CLS = tuned_value_cls
-        quant_kernel._BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES = None
-        quant_kernel._BLOCKWISE_3RD_TUNED_BLOCK_SIZES = fake_tuned_table
-        quant_kernel._get_current_tpu_version = lambda: 6
+        blockwise_3rd_utils._TRIED_LOADING_BLOCKWISE_3RD_TUNING = True
+        blockwise_3rd_utils._BLOCKWISE_3RD_TUNED_VALUE_CLS = tuned_value_cls
+        blockwise_3rd_utils._BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES = None
+        blockwise_3rd_utils._BLOCKWISE_3RD_TUNED_BLOCK_SIZES = fake_tuned_table
+        blockwise_3rd_utils._get_current_tpu_version = lambda: 6
 
-        tuned = quant_kernel._get_safe_blockwise_tuned_value(
+        tuned = blockwise_3rd_utils.get_safe_blockwise_tuned_value(
             n_batch=1,
             n_out=256,
             n_in=4096,
@@ -184,7 +185,8 @@ def _assert_blockwise_tuning_fallback_uses_compatible_seed():
         )
     finally:
         for name, value in saved_state.items():
-            setattr(quant_kernel, name, value)
+            setattr(blockwise_3rd_utils, name, value)
+        blockwise_3rd_utils._get_current_tpu_version = saved_tpu_version
 
     assert tuned.batch_block_size == 1
     assert tuned.out_block_size == 256

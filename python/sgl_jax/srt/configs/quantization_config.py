@@ -56,7 +56,7 @@ def _resolve_config_path(config_path: str) -> str:
     )
 
 
-def _normalize_weight_block_size(
+def normalize_weight_block_size(
     weight_block_size: list[int] | tuple[int, int] | None,
 ) -> tuple[int, int] | None:
     """Validate and canonicalize ``weight_block_size`` to ``(block_n, block_k)``.
@@ -158,7 +158,7 @@ class QuantizationConfig:
         moe_weight_dtype = _str_to_dtype(moe_section.get("weight_dtype"))
         moe_activation_dtype = _str_to_dtype(moe_section.get("activation_dtype"))
         is_static_checkpoint = quant.get("is_static_checkpoint", False)
-        weight_block_size = _normalize_weight_block_size(quant.get("weight_block_size"))
+        weight_block_size = normalize_weight_block_size(quant.get("weight_block_size"))
 
         return cls(
             linear_rules=linear_rules,
