@@ -30,7 +30,7 @@ def get_args():
     parser.add_argument(
         "--file",
         type=str,
-        default="performance_results_BAILING_MOE_tp_2_ep_2.csv",
+        default="daily_performance_results_QWEN_7B_tp_1.csv",
         help="Target CSV filename",
     )
 
@@ -172,10 +172,10 @@ def plot_perf_results(df, args):
 
     # Define the 4 metrics and their titles
     metrics_config = [
-        ("ttft_ms", "Time To First Token (ms) - Lower is Better", axes[0, 0]),
-        ("itl_ms", "Inter-Token Latency (ms) - Lower is Better", axes[0, 1]),
-        ("in_tps", "Input Throughput (tokens/s) - Higher is Better", axes[1, 0]),
-        ("out_tps", "Output Throughput (tokens/s) - Higher is Better", axes[1, 1]),
+        ("ttft_ms", "Time To First Token (ms)", axes[0, 0]),
+        ("itl_ms", "Inter-Token Latency (ms)", axes[0, 1]),
+        ("in_tps", "Input Throughput (tokens/s)", axes[1, 0]),
+        ("out_tps", "Output Throughput (tokens/s)", axes[1, 1]),
     ]
 
     for metric, title, ax in metrics_config:

@@ -33,7 +33,7 @@ def get_args():
         help="Target CSV filename",
     )
     parser.add_argument(
-        "--metric", type=str, default="mmlu_pro", help="Metric column name to analyze"
+        "--metric", type=str, default="gsm8k", help="Metric column name to analyze"
     )
 
     # --- Limit Data Points ---
