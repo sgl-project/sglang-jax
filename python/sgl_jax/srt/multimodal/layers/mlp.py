@@ -58,3 +58,76 @@ class MLP(nnx.Module):
         x = self.act(x)
         x, _ = self.fc_out(x)
         return x
+
+
+def _resolve_rngs(rngs: nnx.Rngs | None) -> nnx.Rngs:
+    return rngs or nnx.Rngs(0)
+
+
+class FeedForward(nnx.Module):
+    """
+    Feed-forward block adapted for FLUX-style DiT blocks.
+
+    This keeps the current FLUX interface, including dropout arguments, while
+    remaining deterministic in the current inference/parity-test paths.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        mesh: jax.sharding.Mesh,
+        dim_out: int | None = None,
+        mult: int = 4,
+        dropout: float = 0.0,
+        activation_fn: str = "gelu-approximate",
+        final_dropout: bool = False,
+        inner_dim: int | None = None,
+        bias: bool = True,
+        params_dtype: jnp.dtype | None = jnp.bfloat16,
+        rngs: nnx.Rngs | None = None,
+    ):
+        _rngs = _resolve_rngs(rngs)
+        if inner_dim is None:
+            inner_dim = int(dim * mult)
+        dim_out = dim if dim_out is None else dim_out
+
+        if activation_fn == "gelu-approximate":
+            act_type = "gelu_pytorch_tanh"
+        elif activation_fn == "gelu":
+            act_type = "gelu"
+        else:
+            raise ValueError(f"Unsupported activation_fn {activation_fn!r} for FeedForward.")
+
+        self.net = nnx.List(
+            [
+                LinearBase(
+                    input_size=dim,
+                    output_size=inner_dim,
+                    use_bias=bias,
+                    mesh=mesh,
+                    params_dtype=params_dtype,
+                    kernel_axes=(None, "tensor"),
+                ),
+                nnx.Dropout(dropout, rngs=_rngs),
+                LinearBase(
+                    input_size=inner_dim,
+                    output_size=dim_out,
+                    use_bias=bias,
+                    mesh=mesh,
+                    params_dtype=params_dtype,
+                    kernel_axes=("tensor", None),
+                ),
+            ]
+        )
+        self.act = get_act_fn(act_type)
+        if final_dropout:
+            self.net.append(nnx.Dropout(dropout, rngs=_rngs))
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        x, _ = self.net[0](x)
+        x = self.act(x)
+        x = self.net[1](x, deterministic=True)
+        x, _ = self.net[2](x)
+        if len(self.net) == 4:
+            x = self.net[3](x, deterministic=True)
+        return x

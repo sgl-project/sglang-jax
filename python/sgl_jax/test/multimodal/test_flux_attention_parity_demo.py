@@ -38,7 +38,7 @@ if jax is not None:
     from sgl_jax.srt.multimodal.models.dits.flux import (
         FluxAttention as JaxFluxAttention,
     )
-    from sgl_jax.srt.multimodal.models.dits.flux_weights_mapping import to_mappings
+    from sgl_jax.srt.multimodal.models.dits.flux_dit_weights_mapping import to_mappings
 
 MODEL_ROOT = Path(os.environ.get("FLUX_MODEL_PATH", "/models/FLUX1.0"))
 TRANSFORMER_PATH = MODEL_ROOT / "transformer"

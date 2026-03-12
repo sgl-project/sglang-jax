@@ -35,7 +35,7 @@ if jax is not None:
     from sgl_jax.srt.multimodal.models.dits.flux import (
         FluxTransformerBlock as JaxFluxTransformerBlock,
     )
-    from sgl_jax.srt.multimodal.models.dits.flux_weights_mapping import to_mappings
+    from sgl_jax.srt.multimodal.models.dits.flux_dit_weights_mapping import to_mappings
 
 
 def _copy_hf_state_dict_to_jax(*args, **kwargs):

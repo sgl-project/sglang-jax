@@ -20,13 +20,14 @@ from sgl_jax.srt.multimodal.layers.adalayernorm import (
     FluxAdaLayerNormZeroSingle,
 )
 from sgl_jax.srt.multimodal.layers.attention.layer import USPAttention
+from sgl_jax.srt.multimodal.layers.mlp import FeedForward
 from sgl_jax.srt.multimodal.layers.visual_embedding import (
     CombinedTimestepGuidanceTextProjEmbeddings,
     CombinedTimestepTextProjEmbeddings,
     _apply_flux_rotary_emb,
     _get_1d_rotary_pos_embed,
 )
-from sgl_jax.srt.multimodal.models.dits.flux_weights_mapping import to_mappings
+from sgl_jax.srt.multimodal.models.dits.flux_dit_weights_mapping import to_mappings
 from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 logger = logging.getLogger(__name__)
@@ -132,66 +133,6 @@ def _get_qkv_projections(
     encoder_hidden_states: jax.Array | None = None,
 ):
     return _get_projections(attn, hidden_states, encoder_hidden_states)
-
-
-class FluxFeedForward(nnx.Module):
-    def __init__(
-        self,
-        dim: int,
-        mesh: Mesh,
-        dim_out: int | None = None,
-        mult: int = 4,
-        dropout: float = 0.0,
-        activation_fn: str = "gelu-approximate",
-        final_dropout: bool = False,
-        inner_dim: int | None = None,
-        bias: bool = True,
-        params_dtype: jnp.dtype | None = jnp.bfloat16,
-        rngs: nnx.Rngs | None = None,
-    ):
-        _rngs = _resolve_rngs(rngs)
-        if inner_dim is None:
-            inner_dim = int(dim * mult)
-        dim_out = dim if dim_out is None else dim_out
-        if activation_fn == "gelu":
-            self.act = modeling_flax_utils.ACT2FN["gelu"]
-        elif activation_fn == "gelu-approximate":
-            self.act = modeling_flax_utils.ACT2FN["gelu_pytorch_tanh"]
-        else:
-            raise ValueError(f"Unsupported activation_fn {activation_fn!r} for FluxFeedForward.")
-
-        self.net = nnx.List(
-            [
-                LinearBase(
-                    input_size=dim,
-                    output_size=inner_dim,
-                    use_bias=bias,
-                    mesh=mesh,
-                    params_dtype=params_dtype,
-                    kernel_axes=(None, "tensor"),
-                ),
-                nnx.Dropout(dropout, rngs=_rngs),
-                LinearBase(
-                    input_size=inner_dim,
-                    output_size=dim_out,
-                    use_bias=bias,
-                    mesh=mesh,
-                    params_dtype=params_dtype,
-                    kernel_axes=("tensor", None),
-                ),
-            ]
-        )
-        if final_dropout:
-            self.net.append(nnx.Dropout(dropout, rngs=_rngs))
-
-    def __call__(self, x: jax.Array) -> jax.Array:
-        x, _ = self.net[0](x)
-        x = self.act(x)
-        x = self.net[1](x, deterministic=True)
-        x, _ = self.net[2](x)
-        if len(self.net) == 4:
-            x = self.net[3](x, deterministic=True)
-        return x
 
 
 class FluxAttention(nnx.Module):
@@ -324,6 +265,8 @@ class FluxAttention(nnx.Module):
             self.attn = USPAttention(
                 num_heads=self.heads,
                 head_size=dim_head,
+                dropout_rate=0,
+                softmax_scale=None,
                 causal=False,
                 mesh=mesh,
             )
@@ -557,7 +500,7 @@ class FluxTransformerBlock(nnx.Module):
             use_fast_variance=False,
             rngs=_rngs,
         )
-        self.ff = FluxFeedForward(
+        self.ff = FeedForward(
             dim=dim,
             dim_out=dim,
             activation_fn="gelu-approximate",
@@ -565,7 +508,7 @@ class FluxTransformerBlock(nnx.Module):
             params_dtype=params_dtype,
             rngs=_rngs,
         )
-        self.ff_context = FluxFeedForward(
+        self.ff_context = FeedForward(
             dim=dim,
             dim_out=dim,
             activation_fn="gelu-approximate",
