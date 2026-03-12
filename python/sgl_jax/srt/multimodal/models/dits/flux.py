@@ -1,4 +1,3 @@
-import inspect
 import logging
 import math
 from contextlib import suppress
@@ -67,33 +66,34 @@ def _sdpa_attention(
     query: jax.Array,
     key: jax.Array,
     value: jax.Array,
-    attention_mask: jax.Array | None = None,
+    attn_mask: jax.Array | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
     scale: float | None = None,
-    causal: bool = False,
+    **_: Any,
 ) -> jax.Array:
-    # Match HF/PyTorch SDPA more closely by computing attention logits/probabilities
-    # through JAX's fused SDPA path in float32 and casting the final result back.
+    del dropout_p
     q = query.astype(jnp.float32)
     k = key.astype(jnp.float32)
     v = value.astype(jnp.float32)
 
     mask = None
     bias = None
-    if attention_mask is not None:
-        if attention_mask.ndim == 2:
-            attention_mask = attention_mask[:, None, None, :]
-        elif attention_mask.ndim == 3:
-            attention_mask = attention_mask[:, None, :, :]
-        elif attention_mask.ndim != 4:
+    if attn_mask is not None:
+        if attn_mask.ndim == 2:
+            attn_mask = attn_mask[:, None, None, :]
+        elif attn_mask.ndim == 3:
+            attn_mask = attn_mask[:, None, :, :]
+        elif attn_mask.ndim != 4:
             raise ValueError(
-                "attention_mask must have rank 2, 3, or 4 for Flux attention. "
-                f"Got shape {attention_mask.shape}."
+                "attn_mask must have rank 2, 3, or 4 for Flux attention. "
+                f"Got shape {attn_mask.shape}."
             )
 
-        if attention_mask.dtype == jnp.bool_:
-            mask = attention_mask
+        if attn_mask.dtype == jnp.bool_:
+            mask = attn_mask
         else:
-            bias = attention_mask.astype(jnp.float32)
+            bias = attn_mask.astype(jnp.float32)
 
     output = jax.nn.dot_product_attention(
         q,
@@ -102,7 +102,7 @@ def _sdpa_attention(
         bias=bias,
         mask=mask,
         scale=scale,
-        is_causal=causal,
+        is_causal=is_causal,
         implementation="xla",
     )
     return output.astype(query.dtype)
@@ -194,80 +194,7 @@ class FluxFeedForward(nnx.Module):
         return x
 
 
-class FluxAttnProcessor:
-    def __call__(
-        self,
-        attn: "FluxAttention",
-        hidden_states: jax.Array,
-        encoder_hidden_states: jax.Array | None = None,
-        attention_mask: jax.Array | None = None,
-        image_rotary_emb: tuple[jax.Array, jax.Array] | None = None,
-        req=None,
-    ) -> jax.Array | tuple[jax.Array, jax.Array]:
-        query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
-            attn, hidden_states, encoder_hidden_states
-        )
-
-        query = query.reshape(query.shape[0], query.shape[1], attn.heads, attn.head_dim)
-        key = key.reshape(key.shape[0], key.shape[1], attn.heads, attn.head_dim)
-        value = value.reshape(value.shape[0], value.shape[1], attn.heads, attn.head_dim)
-
-        query = attn.norm_q(query)
-        key = attn.norm_k(key)
-
-        if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-            encoder_query = encoder_query.reshape(
-                encoder_query.shape[0], encoder_query.shape[1], attn.heads, attn.head_dim
-            )
-            encoder_key = encoder_key.reshape(
-                encoder_key.shape[0], encoder_key.shape[1], attn.heads, attn.head_dim
-            )
-            encoder_value = encoder_value.reshape(
-                encoder_value.shape[0], encoder_value.shape[1], attn.heads, attn.head_dim
-            )
-
-            encoder_query = attn.norm_added_q(encoder_query)
-            encoder_key = attn.norm_added_k(encoder_key)
-
-            query = jnp.concatenate([encoder_query, query], axis=1)
-            key = jnp.concatenate([encoder_key, key], axis=1)
-            value = jnp.concatenate([encoder_value, value], axis=1)
-
-        if image_rotary_emb is not None:
-            # HF applies rotary to q/k before dispatching the attention kernel.
-            query = _apply_flux_rotary_emb(query, image_rotary_emb, sequence_dim=1)
-            key = _apply_flux_rotary_emb(key, image_rotary_emb, sequence_dim=1)
-
-        hidden_states = attn.run_attention(
-            query,
-            key,
-            value,
-            attention_mask=attention_mask,
-            req=req,
-        )
-        hidden_states = hidden_states.reshape(hidden_states.shape[0], hidden_states.shape[1], -1)
-        hidden_states = hidden_states.astype(query.dtype)
-
-        if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-            context_len = encoder_hidden_states.shape[1]
-            encoder_hidden_states = hidden_states[:, :context_len, :]
-            hidden_states = hidden_states[:, context_len:, :]
-            if not attn.pre_only:
-                hidden_states, _ = attn.to_out[0](hidden_states)
-                hidden_states = attn.to_out[1](hidden_states, deterministic=True)
-            encoder_hidden_states, _ = attn.to_add_out(encoder_hidden_states)
-            return hidden_states, encoder_hidden_states
-
-        if not attn.pre_only:
-            hidden_states, _ = attn.to_out[0](hidden_states)
-            hidden_states = attn.to_out[1](hidden_states, deterministic=True)
-        return hidden_states
-
-
 class FluxAttention(nnx.Module):
-    _default_processor_cls = FluxAttnProcessor
-
-    # NOTE FluxIPAdapterAttnProcessor is not added
     def __init__(
         self,
         query_dim: int,
@@ -283,7 +210,6 @@ class FluxAttention(nnx.Module):
         context_pre_only: bool | None = None,
         pre_only: bool = False,
         elementwise_affine: bool = True,
-        processor: FluxAttnProcessor | None = None,
         attention_impl: str = "usp",
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         mesh: Mesh | None = None,
@@ -291,7 +217,6 @@ class FluxAttention(nnx.Module):
     ):
         """
         NOTE: Align with the implementation of HF.
-        processor: if specified, the attention processor to use.
         attention_impl: support usp and sdpa. usp dont support attention_mask yet.
         """
         mesh = _resolve_mesh(mesh)
@@ -353,10 +278,11 @@ class FluxAttention(nnx.Module):
                         mesh=mesh,
                         params_dtype=params_dtype,
                         kernel_axes=("tensor", None),
-                    ),
-                    nnx.Dropout(dropout, rngs=_rngs),
+                    )
                 ]
             )
+            if dropout != 0.0:
+                self.to_out.append(nnx.Dropout(dropout, rngs=_rngs))
 
         if added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, epsilon=eps)
@@ -396,45 +322,13 @@ class FluxAttention(nnx.Module):
 
         if self.attention_impl == "usp":
             self.attn = USPAttention(
-                num_heads=heads,
+                num_heads=self.heads,
                 head_size=dim_head,
                 causal=False,
                 mesh=mesh,
             )
         else:
             self.attn = None
-        self.processor = processor or self._default_processor_cls()
-
-    def run_attention(
-        self,
-        query: jax.Array,
-        key: jax.Array,
-        value: jax.Array,
-        attention_mask: jax.Array | None = None,
-        req=None,
-    ) -> jax.Array:
-        if self.attention_impl == "sdpa":
-            del req
-            return _sdpa_attention(
-                query,
-                key,
-                value,
-                attention_mask=attention_mask,
-                causal=False,
-            )
-        if attention_mask is not None:
-            logger.warning(
-                "attention_mask is not supported by USPAttention yet; falling back to sdpa attention."
-            )
-            del req
-            return _sdpa_attention(
-                query,
-                key,
-                value,
-                attention_mask=attention_mask,
-                causal=False,
-            )
-        return self.attn(query, key, value, req)
 
     def __call__(
         self,
@@ -445,22 +339,87 @@ class FluxAttention(nnx.Module):
         req=None,
         **kwargs,
     ) -> jax.Array | tuple[jax.Array, jax.Array]:
-        attn_parameters = set(inspect.signature(self.processor.__call__).parameters.keys())
-        unused_kwargs = [k for k in kwargs if k not in attn_parameters]
-        if unused_kwargs:
+        if kwargs:
             logger.warning(
-                "Ignoring unsupported joint_attention_kwargs in FluxAttention: %s", unused_kwargs
+                "Ignoring unsupported joint_attention_kwargs in FluxAttention: %s",
+                list(kwargs),
             )
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k in attn_parameters}
-        return self.processor(
-            self,
-            hidden_states,
-            encoder_hidden_states,
-            attention_mask,
-            image_rotary_emb,
-            req=req,
-            **filtered_kwargs,
+
+        query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
+            self, hidden_states, encoder_hidden_states
         )
+
+        query = query.reshape(query.shape[0], query.shape[1], self.heads, self.head_dim)
+        key = key.reshape(key.shape[0], key.shape[1], self.heads, self.head_dim)
+        value = value.reshape(value.shape[0], value.shape[1], self.heads, self.head_dim)
+
+        query = self.norm_q(query)
+        key = self.norm_k(key)
+
+        if encoder_hidden_states is not None and self.added_kv_proj_dim is not None:
+            encoder_query = encoder_query.reshape(
+                encoder_query.shape[0], encoder_query.shape[1], self.heads, self.head_dim
+            )
+            encoder_key = encoder_key.reshape(
+                encoder_key.shape[0], encoder_key.shape[1], self.heads, self.head_dim
+            )
+            encoder_value = encoder_value.reshape(
+                encoder_value.shape[0], encoder_value.shape[1], self.heads, self.head_dim
+            )
+
+            encoder_query = self.norm_added_q(encoder_query)
+            encoder_key = self.norm_added_k(encoder_key)
+
+            query = jnp.concatenate([encoder_query, query], axis=1)
+            key = jnp.concatenate([encoder_key, key], axis=1)
+            value = jnp.concatenate([encoder_value, value], axis=1)
+
+        if image_rotary_emb is not None:
+            query = _apply_flux_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = _apply_flux_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        if self.attention_impl == "sdpa":
+            hidden_states = _sdpa_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                is_causal=False,
+            )
+        else:
+            if attention_mask is not None:
+                logger.warning(
+                    "attention_mask is not supported by USPAttention yet; falling back to sdpa attention."
+                )
+                hidden_states = _sdpa_attention(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attention_mask,
+                    is_causal=False,
+                )
+            else:
+                hidden_states = self.attn(query, key, value, req)
+
+        hidden_states = hidden_states.reshape(hidden_states.shape[0], hidden_states.shape[1], -1)
+        hidden_states = hidden_states.astype(query.dtype)
+
+        if encoder_hidden_states is not None and self.added_kv_proj_dim is not None:
+            context_len = encoder_hidden_states.shape[1]
+            encoder_hidden_states = hidden_states[:, :context_len, :]
+            hidden_states = hidden_states[:, context_len:, :]
+            if not self.pre_only:
+                hidden_states, _ = self.to_out[0](hidden_states)
+                if len(self.to_out) == 2:
+                    hidden_states = self.to_out[1](hidden_states, deterministic=True)
+            encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states)
+            return hidden_states, encoder_hidden_states
+
+        if not self.pre_only:
+            hidden_states, _ = self.to_out[0](hidden_states)
+            if len(self.to_out) == 2:
+                hidden_states = self.to_out[1](hidden_states, deterministic=True)
+        return hidden_states
 
 
 class FluxSingleTransformerBlock(nnx.Module):
@@ -505,7 +464,6 @@ class FluxSingleTransformerBlock(nnx.Module):
             bias=True,
             eps=1e-6,
             pre_only=True,
-            processor=FluxAttnProcessor(),
             attention_impl=attention_impl,
             params_dtype=params_dtype,
             mesh=mesh,
@@ -577,7 +535,6 @@ class FluxTransformerBlock(nnx.Module):
             out_dim=dim,
             bias=True,
             eps=eps,
-            processor=FluxAttnProcessor(),
             attention_impl=attention_impl,
             params_dtype=params_dtype,
             mesh=mesh,
