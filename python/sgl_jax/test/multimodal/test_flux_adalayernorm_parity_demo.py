@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover
     jnp = None
 
 if jax is not None:
-    from sgl_jax.srt.multimodal.models.flux.normalization.adalayernorm import (
+    from sgl_jax.srt.multimodal.models.layers.adalayernorm import (
         FluxAdaLayerNormContinuous,
         FluxAdaLayerNormZero,
         FluxAdaLayerNormZeroSingle,

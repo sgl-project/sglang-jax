@@ -29,10 +29,10 @@ except ImportError:  # pragma: no cover
     jnp = None
 
 if jax is not None:
-    from sgl_jax.srt.multimodal.models.flux.fluxtransformer2dmodel import (
+    from sgl_jax.srt.multimodal.models.dits.flux import (
         FluxPosEmbed as JaxFluxPosEmbed,
     )
-    from sgl_jax.srt.multimodal.models.flux.fluxtransformer2dmodel import (
+    from sgl_jax.srt.multimodal.models.dits.flux import (
         _get_1d_rotary_pos_embed as jax_get_1d_rotary_pos_embed,
     )
 

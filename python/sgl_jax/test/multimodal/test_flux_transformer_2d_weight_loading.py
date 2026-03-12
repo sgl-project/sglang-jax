@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover
 
 if jax is not None:
     from sgl_jax.srt.multimodal.configs.dits.flux_model_config import FluxModelConfig
-    from sgl_jax.srt.multimodal.models.flux.fluxtransformer2dmodel import (
+    from sgl_jax.srt.multimodal.models.dits.flux import (
         FluxTransformer2DModel,
     )
 

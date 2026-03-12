@@ -29,10 +29,10 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 for _tpu_env in ("TPU_ACCELERATOR_TYPE", "TPU_WORKER_HOSTNAMES"):
     os.environ.pop(_tpu_env, None)
 if jax is not None:
-    from sgl_jax.srt.multimodal.models.flux.fluxtransformer2dmodel import (
+    from sgl_jax.srt.multimodal.models.dits.flux import (
         FluxSingleTransformerBlock as JaxFluxSingleTransformerBlock,
     )
-    from sgl_jax.srt.multimodal.models.flux.fluxtransformer2dmodel import (
+    from sgl_jax.srt.multimodal.models.dits.flux import (
         FluxTransformerBlock as JaxFluxTransformerBlock,
     )
 

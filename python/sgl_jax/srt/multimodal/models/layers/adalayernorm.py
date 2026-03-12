@@ -7,7 +7,7 @@ from transformers import modeling_flax_utils
 
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
-from sgl_jax.srt.multimodal.models.flux.embeddings import (
+from sgl_jax.srt.multimodal.models.layers.visual_embedding import (
     CombinedTimestepLabelEmbeddings,
 )
 

@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover
     nnx = None
 
 if jax is not None:
-    from sgl_jax.srt.multimodal.models.flux.fluxtransformer2dmodel import (
+    from sgl_jax.srt.multimodal.models.dits.flux import (
         FluxAttention as JaxFluxAttention,
     )
 
