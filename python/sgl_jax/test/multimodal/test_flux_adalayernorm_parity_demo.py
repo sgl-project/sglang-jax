@@ -31,21 +31,55 @@ except ImportError:  # pragma: no cover
     jnp = None
 
 if jax is not None:
-    from sgl_jax.srt.multimodal.models.layers.adalayernorm import (
+    from sgl_jax.srt.multimodal.layers.adalayernorm import (
         FluxAdaLayerNormContinuous,
         FluxAdaLayerNormZero,
         FluxAdaLayerNormZeroSingle,
     )
+from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 
-def _copy_linear_torch_to_jax(torch_linear, jax_linear):
-    jax_linear.weight[...] = jnp.asarray(torch_linear.weight.detach().cpu().numpy().T)
-    if torch_linear.bias is not None and jax_linear.bias is not None:
-        jax_linear.bias[...] = jnp.asarray(torch_linear.bias.detach().cpu().numpy())
+def _copy_hf_state_dict_to_jax(*args, **kwargs):
+    from sgl_jax.test.multimodal.test_flux_transformer_2d_model_parity_demo import (
+        copy_hf_state_dict_to_jax,
+    )
+
+    return copy_hf_state_dict_to_jax(*args, **kwargs)
 
 
-def _copy_embed_torch_to_jax(torch_embed, jax_embed):
-    jax_embed.embedding[...] = jnp.asarray(torch_embed.weight.detach().cpu().numpy())
+_ADALN_ZERO_MAPPINGS = {
+    "linear.weight": WeightMapping(target_path="linear.weight", transpose=True),
+    "linear.bias": WeightMapping(target_path="linear.bias"),
+    "emb.timestep_embedder.linear_1.weight": WeightMapping(
+        target_path="emb.timestep_embedder.linear_1.weight",
+        transpose=True,
+    ),
+    "emb.timestep_embedder.linear_1.bias": WeightMapping(
+        target_path="emb.timestep_embedder.linear_1.bias",
+    ),
+    "emb.timestep_embedder.linear_2.weight": WeightMapping(
+        target_path="emb.timestep_embedder.linear_2.weight",
+        transpose=True,
+    ),
+    "emb.timestep_embedder.linear_2.bias": WeightMapping(
+        target_path="emb.timestep_embedder.linear_2.bias",
+    ),
+    "emb.class_embedder.embedding_table.weight": WeightMapping(
+        target_path="emb.class_embedder.embedding_table.embedding",
+    ),
+}
+
+_ADALN_ZERO_SINGLE_MAPPINGS = {
+    "linear.weight": WeightMapping(target_path="linear.weight", transpose=True),
+    "linear.bias": WeightMapping(target_path="linear.bias"),
+}
+
+_ADALN_CONTINUOUS_MAPPINGS = {
+    "linear.weight": WeightMapping(target_path="linear.weight", transpose=True),
+    "linear.bias": WeightMapping(target_path="linear.bias"),
+    "norm.weight": WeightMapping(target_path="norm.scale"),
+    "norm.bias": WeightMapping(target_path="norm.bias"),
+}
 
 
 def _make_mesh():
@@ -118,8 +152,7 @@ class TestFluxAdaLayerNormParityDemo(unittest.TestCase):
                 eps=1e-6,
                 params_dtype=jnp.float32,
             )
-
-        _copy_linear_torch_to_jax(torch_mod.linear, jax_mod.linear)
+        _copy_hf_state_dict_to_jax(torch_mod.state_dict(), jax_mod, _ADALN_ZERO_MAPPINGS)
 
         hidden_states_torch = torch.randn(batch_size, seq_len, dim, dtype=torch.float32)
         emb_torch = torch.randn(batch_size, dim, dtype=torch.float32)
@@ -146,8 +179,7 @@ class TestFluxAdaLayerNormParityDemo(unittest.TestCase):
                 eps=1e-6,
                 params_dtype=jnp.float32,
             )
-
-        _copy_linear_torch_to_jax(torch_mod.linear, jax_mod.linear)
+        _copy_hf_state_dict_to_jax(torch_mod.state_dict(), jax_mod, _ADALN_ZERO_MAPPINGS)
 
         hidden_states_torch = torch.randn(batch_size, seq_len, dim, dtype=torch.float32)
         emb_torch = torch.randn(batch_size, dim, dtype=torch.float32)
@@ -175,20 +207,7 @@ class TestFluxAdaLayerNormParityDemo(unittest.TestCase):
                 eps=1e-6,
                 params_dtype=jnp.float32,
             )
-
-        _copy_linear_torch_to_jax(torch_mod.linear, jax_mod.linear)
-        _copy_linear_torch_to_jax(
-            torch_mod.emb.timestep_embedder.linear_1,
-            jax_mod.emb.timestep_embedder.linear_1,
-        )
-        _copy_linear_torch_to_jax(
-            torch_mod.emb.timestep_embedder.linear_2,
-            jax_mod.emb.timestep_embedder.linear_2,
-        )
-        _copy_embed_torch_to_jax(
-            torch_mod.emb.class_embedder.embedding_table,
-            jax_mod.emb.class_embedder.embedding_table,
-        )
+        _copy_hf_state_dict_to_jax(torch_mod.state_dict(), jax_mod, _ADALN_ZERO_MAPPINGS)
 
         hidden_states_torch = torch.randn(batch_size, seq_len, dim, dtype=torch.float32)
         timestep_torch = torch.randint(0, 1000, (batch_size,), dtype=torch.int64)
@@ -226,8 +245,7 @@ class TestFluxAdaLayerNormParityDemo(unittest.TestCase):
                 eps=1e-6,
                 params_dtype=jnp.float32,
             )
-
-        _copy_linear_torch_to_jax(torch_mod.linear, jax_mod.linear)
+        _copy_hf_state_dict_to_jax(torch_mod.state_dict(), jax_mod, _ADALN_ZERO_SINGLE_MAPPINGS)
 
         hidden_states_torch = torch.randn(batch_size, seq_len, dim, dtype=torch.float32)
         emb_torch = torch.randn(batch_size, dim, dtype=torch.float32)
@@ -267,8 +285,7 @@ class TestFluxAdaLayerNormParityDemo(unittest.TestCase):
                 bias=True,
                 params_dtype=jnp.float32,
             )
-
-        _copy_linear_torch_to_jax(torch_mod.linear, jax_mod.linear)
+        _copy_hf_state_dict_to_jax(torch_mod.state_dict(), jax_mod, _ADALN_CONTINUOUS_MAPPINGS)
 
         hidden_states_torch = torch.randn(batch_size, seq_len, dim, dtype=torch.float32)
         conditioning_torch = torch.randn(batch_size, dim, dtype=torch.float32)
@@ -309,13 +326,7 @@ class TestFluxAdaLayerNormParityDemo(unittest.TestCase):
                 norm_type="rms_norm",
                 params_dtype=jnp.float32,
             )
-
-        _copy_linear_torch_to_jax(torch_mod.linear, jax_mod.linear)
-        if (
-            getattr(torch_mod.norm, "weight", None) is not None
-            and getattr(jax_mod.norm, "scale", None) is not None
-        ):
-            jax_mod.norm.scale[...] = jnp.asarray(torch_mod.norm.weight.detach().cpu().numpy())
+        _copy_hf_state_dict_to_jax(torch_mod.state_dict(), jax_mod, _ADALN_CONTINUOUS_MAPPINGS)
 
         hidden_states_torch = torch.randn(batch_size, seq_len, dim, dtype=torch.float32)
         conditioning_torch = torch.randn(batch_size, dim, dtype=torch.float32)

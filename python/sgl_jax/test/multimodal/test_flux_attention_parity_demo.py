@@ -38,22 +38,19 @@ if jax is not None:
     from sgl_jax.srt.multimodal.models.dits.flux import (
         FluxAttention as JaxFluxAttention,
     )
-
+    from sgl_jax.srt.multimodal.models.dits.flux_weights_mapping import to_mappings
 
 MODEL_ROOT = Path(os.environ.get("FLUX_MODEL_PATH", "/models/FLUX1.0"))
 TRANSFORMER_PATH = MODEL_ROOT / "transformer"
 CONFIG_PATH = TRANSFORMER_PATH / "config.json"
 
 
-def _copy_linear_torch_to_jax(torch_linear, jax_linear):
-    jax_linear.weight.value = jnp.asarray(torch_linear.weight.detach().cpu().numpy().T)
-    if torch_linear.bias is not None and jax_linear.bias is not None:
-        jax_linear.bias.value = jnp.asarray(torch_linear.bias.detach().cpu().numpy())
+def _copy_hf_state_dict_to_jax(*args, **kwargs):
+    from sgl_jax.test.multimodal.test_flux_transformer_2d_model_parity_demo import (
+        copy_hf_state_dict_to_jax,
+    )
 
-
-def _copy_rmsnorm_torch_to_jax(torch_norm, jax_norm):
-    if getattr(torch_norm, "weight", None) is not None and jax_norm.scale is not None:
-        jax_norm.scale.value = jnp.asarray(torch_norm.weight.detach().cpu().numpy())
+    return copy_hf_state_dict_to_jax(*args, **kwargs)
 
 
 @unittest.skipIf(
@@ -108,21 +105,13 @@ class TestFluxAttentionParityDemo(unittest.TestCase):
             attention_impl=attention_impl,
             params_dtype=jnp.float32,
         )
-
-        _copy_linear_torch_to_jax(torch_attn.to_q, jax_attn.to_q)
-        _copy_linear_torch_to_jax(torch_attn.to_k, jax_attn.to_k)
-        _copy_linear_torch_to_jax(torch_attn.to_v, jax_attn.to_v)
-        _copy_linear_torch_to_jax(torch_attn.to_out[0], jax_attn.to_out[0])
-
-        _copy_linear_torch_to_jax(torch_attn.add_q_proj, jax_attn.add_q_proj)
-        _copy_linear_torch_to_jax(torch_attn.add_k_proj, jax_attn.add_k_proj)
-        _copy_linear_torch_to_jax(torch_attn.add_v_proj, jax_attn.add_v_proj)
-        _copy_linear_torch_to_jax(torch_attn.to_add_out, jax_attn.to_add_out)
-
-        _copy_rmsnorm_torch_to_jax(torch_attn.norm_q, jax_attn.norm_q)
-        _copy_rmsnorm_torch_to_jax(torch_attn.norm_k, jax_attn.norm_k)
-        _copy_rmsnorm_torch_to_jax(torch_attn.norm_added_q, jax_attn.norm_added_q)
-        _copy_rmsnorm_torch_to_jax(torch_attn.norm_added_k, jax_attn.norm_added_k)
+        _copy_hf_state_dict_to_jax(
+            torch_attn.state_dict(),
+            jax_attn,
+            to_mappings(),
+            hf_prefix="transformer_blocks.0.attn",
+            target_prefix="transformer_blocks.0.attn",
+        )
         return torch_attn, jax_attn
 
     def _build_loaded_attention_pair(self, *, attention_impl: str):
@@ -156,19 +145,13 @@ class TestFluxAttentionParityDemo(unittest.TestCase):
             attention_impl=attention_impl,
             params_dtype=jnp.float32,
         )
-        _copy_linear_torch_to_jax(torch_attn.to_q, jax_attn.to_q)
-        _copy_linear_torch_to_jax(torch_attn.to_k, jax_attn.to_k)
-        _copy_linear_torch_to_jax(torch_attn.to_v, jax_attn.to_v)
-        if hasattr(torch_attn, "to_out") and hasattr(jax_attn, "to_out"):
-            _copy_linear_torch_to_jax(torch_attn.to_out[0], jax_attn.to_out[0])
-        _copy_linear_torch_to_jax(torch_attn.add_q_proj, jax_attn.add_q_proj)
-        _copy_linear_torch_to_jax(torch_attn.add_k_proj, jax_attn.add_k_proj)
-        _copy_linear_torch_to_jax(torch_attn.add_v_proj, jax_attn.add_v_proj)
-        _copy_linear_torch_to_jax(torch_attn.to_add_out, jax_attn.to_add_out)
-        _copy_rmsnorm_torch_to_jax(torch_attn.norm_q, jax_attn.norm_q)
-        _copy_rmsnorm_torch_to_jax(torch_attn.norm_k, jax_attn.norm_k)
-        _copy_rmsnorm_torch_to_jax(torch_attn.norm_added_q, jax_attn.norm_added_q)
-        _copy_rmsnorm_torch_to_jax(torch_attn.norm_added_k, jax_attn.norm_added_k)
+        _copy_hf_state_dict_to_jax(
+            torch_attn.state_dict(),
+            jax_attn,
+            to_mappings(),
+            hf_prefix="transformer_blocks.0.attn",
+            target_prefix="transformer_blocks.0.attn",
+        )
 
         return torch_model, torch_attn, jax_attn
 

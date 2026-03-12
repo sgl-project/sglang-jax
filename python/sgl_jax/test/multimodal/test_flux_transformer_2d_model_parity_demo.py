@@ -3,7 +3,9 @@ from __future__ import annotations
 import gc
 import json
 import os
+import re
 import unittest
+from collections.abc import Mapping
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -21,15 +23,19 @@ except ImportError:  # pragma: no cover
 try:
     import jax
     import jax.numpy as jnp
+    from flax import nnx
 except ImportError:  # pragma: no cover
     jax = None
     jnp = None
+    nnx = None
 
 if jax is not None:
     from sgl_jax.srt.multimodal.configs.dits.flux_model_config import FluxModelConfig
     from sgl_jax.srt.multimodal.models.dits.flux import (
         FluxTransformer2DModel as JaxFluxTransformer2DModel,
     )
+    from sgl_jax.srt.multimodal.models.dits.flux_weights_mapping import to_mappings
+    from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 
 MODEL_ROOT = Path(os.environ.get("FLUX_MODEL_PATH", "/models/FLUX1.0"))
@@ -64,102 +70,71 @@ def _load_flux_config_from_local_checkpoint() -> FluxModelConfig:
     )
 
 
-def _copy_linear_torch_to_jax(torch_linear, jax_linear):
-    jax_linear.weight[...] = jnp.asarray(torch_linear.weight.detach().cpu().numpy().T)
-    if torch_linear.bias is not None and jax_linear.bias is not None:
-        jax_linear.bias[...] = jnp.asarray(torch_linear.bias.detach().cpu().numpy())
+def set_jax_param(model, path: str, value: np.ndarray) -> None:
+    current = nnx.state(model)
+    for key in path.split("."):
+        current = current[int(key)] if key.isdigit() else current[key]
+    target = current[...]
+    array = jnp.asarray(value, dtype=target.dtype)
+    sharding = getattr(target, "sharding", None)
+    if sharding is not None:
+        array = jax.device_put(array, sharding)
+    current[...] = array
 
 
-def _copy_embed_torch_to_jax(torch_embed, jax_embed):
-    jax_embed.embedding[...] = jnp.asarray(torch_embed.weight.detach().cpu().numpy())
+def _resolve_mapping(
+    hf_key: str,
+    mappings: Mapping[str, WeightMapping],
+) -> tuple[WeightMapping, str] | tuple[None, None]:
+    for pattern, candidate in mappings.items():
+        if "*" not in pattern:
+            if hf_key != pattern:
+                continue
+            target_path = candidate.target_path
+            if isinstance(target_path, list):
+                return None, None
+            return candidate, target_path
+
+        match = re.fullmatch(re.escape(pattern).replace(r"\*", r"(.*?)"), hf_key)
+        if match is None:
+            continue
+        target_path = candidate.target_path
+        if isinstance(target_path, list):
+            return None, None
+        return candidate, target_path.replace("*", "{}").format(*match.groups())
+
+    return None, None
 
 
-def _copy_rmsnorm_torch_to_jax(torch_norm, jax_norm):
-    if (
-        getattr(torch_norm, "weight", None) is not None
-        and getattr(jax_norm, "scale", None) is not None
-    ):
-        jax_norm.scale[...] = jnp.asarray(torch_norm.weight.detach().cpu().numpy())
+def copy_hf_state_dict_to_jax(
+    pt_state_dict,
+    jax_model,
+    mappings: Mapping[str, WeightMapping],
+    *,
+    hf_prefix: str = "",
+    target_prefix: str = "",
+) -> None:
+    hf_prefix = f"{hf_prefix}." if hf_prefix else ""
+    target_prefix = f"{target_prefix}." if target_prefix else ""
 
+    for hf_key, tensor in pt_state_dict.items():
+        lookup_key = f"{hf_prefix}{hf_key}"
+        mapping, target_path = _resolve_mapping(lookup_key, mappings)
+        if mapping is None or target_path is None:
+            continue
 
-def _copy_flux_attention_torch_to_jax(torch_attn, jax_attn):
-    _copy_linear_torch_to_jax(torch_attn.to_q, jax_attn.to_q)
-    _copy_linear_torch_to_jax(torch_attn.to_k, jax_attn.to_k)
-    _copy_linear_torch_to_jax(torch_attn.to_v, jax_attn.to_v)
-    _copy_rmsnorm_torch_to_jax(torch_attn.norm_q, jax_attn.norm_q)
-    _copy_rmsnorm_torch_to_jax(torch_attn.norm_k, jax_attn.norm_k)
+        if target_prefix:
+            if not target_path.startswith(target_prefix):
+                continue
+            target_path = target_path[len(target_prefix) :]
 
-    if hasattr(torch_attn, "to_out") and hasattr(jax_attn, "to_out"):
-        _copy_linear_torch_to_jax(torch_attn.to_out[0], jax_attn.to_out[0])
+        weight = tensor.detach().cpu().float().numpy()
+        if mapping.transpose_axes is not None and not lookup_key.endswith(".bias"):
+            weight = np.transpose(weight, mapping.transpose_axes)
+        elif mapping.transpose and not lookup_key.endswith(".bias"):
+            weight = np.transpose(weight, (1, 0))
 
-    if getattr(torch_attn, "added_kv_proj_dim", None) is not None:
-        _copy_linear_torch_to_jax(torch_attn.add_q_proj, jax_attn.add_q_proj)
-        _copy_linear_torch_to_jax(torch_attn.add_k_proj, jax_attn.add_k_proj)
-        _copy_linear_torch_to_jax(torch_attn.add_v_proj, jax_attn.add_v_proj)
-        _copy_linear_torch_to_jax(torch_attn.to_add_out, jax_attn.to_add_out)
-        _copy_rmsnorm_torch_to_jax(torch_attn.norm_added_q, jax_attn.norm_added_q)
-        _copy_rmsnorm_torch_to_jax(torch_attn.norm_added_k, jax_attn.norm_added_k)
-
-
-def _copy_flux_feedforward_torch_to_jax(torch_ff, jax_ff):
-    _copy_linear_torch_to_jax(torch_ff.net[0].proj, jax_ff.net[0])
-    _copy_linear_torch_to_jax(torch_ff.net[2], jax_ff.net[2])
-
-
-def _copy_adaln_zero_torch_to_jax(torch_norm, jax_norm):
-    _copy_linear_torch_to_jax(torch_norm.linear, jax_norm.linear)
-
-
-def _copy_adaln_zero_single_torch_to_jax(torch_norm, jax_norm):
-    _copy_linear_torch_to_jax(torch_norm.linear, jax_norm.linear)
-
-
-def _copy_adaln_continuous_torch_to_jax(torch_norm, jax_norm):
-    _copy_linear_torch_to_jax(torch_norm.linear, jax_norm.linear)
-    if (
-        getattr(torch_norm.norm, "weight", None) is not None
-        and getattr(jax_norm.norm, "scale", None) is not None
-    ):
-        jax_norm.norm.scale[...] = jnp.asarray(torch_norm.norm.weight.detach().cpu().numpy())
-    if (
-        getattr(torch_norm.norm, "bias", None) is not None
-        and getattr(jax_norm.norm, "bias", None) is not None
-    ):
-        jax_norm.norm.bias[...] = jnp.asarray(torch_norm.norm.bias.detach().cpu().numpy())
-
-
-def _copy_time_text_embed_torch_to_jax(torch_embed, jax_embed):
-    _copy_linear_torch_to_jax(
-        torch_embed.timestep_embedder.linear_1,
-        jax_embed.timestep_embedder.linear_1,
-    )
-    _copy_linear_torch_to_jax(
-        torch_embed.timestep_embedder.linear_2,
-        jax_embed.timestep_embedder.linear_2,
-    )
-    _copy_linear_torch_to_jax(
-        torch_embed.text_embedder.linear_1,
-        jax_embed.text_embedder.linear_1,
-    )
-    _copy_linear_torch_to_jax(
-        torch_embed.text_embedder.linear_2,
-        jax_embed.text_embedder.linear_2,
-    )
-
-
-def _copy_single_block_torch_to_jax(torch_block, jax_block):
-    _copy_adaln_zero_single_torch_to_jax(torch_block.norm, jax_block.norm)
-    _copy_linear_torch_to_jax(torch_block.proj_mlp, jax_block.proj_mlp)
-    _copy_linear_torch_to_jax(torch_block.proj_out, jax_block.proj_out)
-    _copy_flux_attention_torch_to_jax(torch_block.attn, jax_block.attn)
-
-
-def _copy_block_torch_to_jax(torch_block, jax_block):
-    _copy_adaln_zero_torch_to_jax(torch_block.norm1, jax_block.norm1)
-    _copy_adaln_zero_torch_to_jax(torch_block.norm1_context, jax_block.norm1_context)
-    _copy_flux_attention_torch_to_jax(torch_block.attn, jax_block.attn)
-    _copy_flux_feedforward_torch_to_jax(torch_block.ff, jax_block.ff)
-    _copy_flux_feedforward_torch_to_jax(torch_block.ff_context, jax_block.ff_context)
+        set_jax_param(jax_model, target_path, weight)
 
 
 def _make_mesh():
@@ -205,7 +180,7 @@ class TestFluxTransformer2DModelParityDemo(unittest.TestCase):
             err_msg=f"{name} mismatch",
         )
 
-    def test_flux_transformer_2d_model_parity(self):
+    def test_flux_transformer_2d_model_random_init_state_dict_parity(self):
         torch.manual_seed(0)
         batch_size = 8
         image_seq_len = 128
@@ -251,17 +226,11 @@ class TestFluxTransformer2DModelParityDemo(unittest.TestCase):
                 dtype=jnp.float32,
                 mesh=self.mesh,
             )
-
-        _copy_time_text_embed_torch_to_jax(hf_model.time_text_embed, jax_model.time_text_embed)
-        _copy_linear_torch_to_jax(hf_model.context_embedder, jax_model.context_embedder)
-        _copy_linear_torch_to_jax(hf_model.x_embedder, jax_model.x_embedder)
-        _copy_block_torch_to_jax(hf_model.transformer_blocks[0], jax_model.transformer_blocks[0])
-        _copy_single_block_torch_to_jax(
-            hf_model.single_transformer_blocks[0],
-            jax_model.single_transformer_blocks[0],
+        copy_hf_state_dict_to_jax(
+            hf_model.state_dict(),
+            jax_model,
+            to_mappings(has_guidance_embeds=config.guidance_embeds),
         )
-        _copy_adaln_continuous_torch_to_jax(hf_model.norm_out, jax_model.norm_out)
-        _copy_linear_torch_to_jax(hf_model.proj_out, jax_model.proj_out)
 
         hidden_states_torch = torch.randn(batch_size, image_seq_len, 16, dtype=torch.float32)
         encoder_hidden_states_torch = torch.randn(batch_size, text_seq_len, 20, dtype=torch.float32)
@@ -450,8 +419,8 @@ class TestFluxTransformer2DModelParityDemo(unittest.TestCase):
         np.testing.assert_allclose(
             torch_output.detach().cpu().numpy().astype(np.float32),
             np.asarray(jax_output, dtype=np.float32),
-            atol=3e-4,
-            rtol=3e-4,
+            atol=2e-4,
+            rtol=2e-4,
         )
 
 

@@ -35,52 +35,15 @@ if jax is not None:
     from sgl_jax.srt.multimodal.models.dits.flux import (
         FluxTransformerBlock as JaxFluxTransformerBlock,
     )
+    from sgl_jax.srt.multimodal.models.dits.flux_weights_mapping import to_mappings
 
 
-def _copy_linear_torch_to_jax(torch_linear, jax_linear):
-    jax_linear.weight[...] = jnp.asarray(torch_linear.weight.detach().cpu().numpy().T)
-    if torch_linear.bias is not None and jax_linear.bias is not None:
-        jax_linear.bias[...] = jnp.asarray(torch_linear.bias.detach().cpu().numpy())
+def _copy_hf_state_dict_to_jax(*args, **kwargs):
+    from sgl_jax.test.multimodal.test_flux_transformer_2d_model_parity_demo import (
+        copy_hf_state_dict_to_jax,
+    )
 
-
-def _copy_rmsnorm_torch_to_jax(torch_norm, jax_norm):
-    if (
-        getattr(torch_norm, "weight", None) is not None
-        and getattr(jax_norm, "scale", None) is not None
-    ):
-        jax_norm.scale[...] = jnp.asarray(torch_norm.weight.detach().cpu().numpy())
-
-
-def _copy_flux_attention_torch_to_jax(torch_attn, jax_attn):
-    _copy_linear_torch_to_jax(torch_attn.to_q, jax_attn.to_q)
-    _copy_linear_torch_to_jax(torch_attn.to_k, jax_attn.to_k)
-    _copy_linear_torch_to_jax(torch_attn.to_v, jax_attn.to_v)
-    _copy_rmsnorm_torch_to_jax(torch_attn.norm_q, jax_attn.norm_q)
-    _copy_rmsnorm_torch_to_jax(torch_attn.norm_k, jax_attn.norm_k)
-
-    if hasattr(torch_attn, "to_out") and hasattr(jax_attn, "to_out"):
-        _copy_linear_torch_to_jax(torch_attn.to_out[0], jax_attn.to_out[0])
-
-    if getattr(torch_attn, "added_kv_proj_dim", None) is not None:
-        _copy_linear_torch_to_jax(torch_attn.add_q_proj, jax_attn.add_q_proj)
-        _copy_linear_torch_to_jax(torch_attn.add_k_proj, jax_attn.add_k_proj)
-        _copy_linear_torch_to_jax(torch_attn.add_v_proj, jax_attn.add_v_proj)
-        _copy_linear_torch_to_jax(torch_attn.to_add_out, jax_attn.to_add_out)
-        _copy_rmsnorm_torch_to_jax(torch_attn.norm_added_q, jax_attn.norm_added_q)
-        _copy_rmsnorm_torch_to_jax(torch_attn.norm_added_k, jax_attn.norm_added_k)
-
-
-def _copy_flux_feedforward_torch_to_jax(torch_ff, jax_ff):
-    _copy_linear_torch_to_jax(torch_ff.net[0].proj, jax_ff.net[0])
-    _copy_linear_torch_to_jax(torch_ff.net[2], jax_ff.net[2])
-
-
-def _copy_adaln_zero_single_torch_to_jax(torch_norm, jax_norm):
-    _copy_linear_torch_to_jax(torch_norm.linear, jax_norm.linear)
-
-
-def _copy_adaln_zero_torch_to_jax(torch_norm, jax_norm):
-    _copy_linear_torch_to_jax(torch_norm.linear, jax_norm.linear)
+    return copy_hf_state_dict_to_jax(*args, **kwargs)
 
 
 def _make_mesh():
@@ -157,11 +120,13 @@ class TestFluxTransformerBlockParityDemo(unittest.TestCase):
                 attention_impl="sdpa",
                 params_dtype=jnp.float32,
             )
-
-        _copy_adaln_zero_single_torch_to_jax(torch_block.norm, jax_block.norm)
-        _copy_linear_torch_to_jax(torch_block.proj_mlp, jax_block.proj_mlp)
-        _copy_linear_torch_to_jax(torch_block.proj_out, jax_block.proj_out)
-        _copy_flux_attention_torch_to_jax(torch_block.attn, jax_block.attn)
+        _copy_hf_state_dict_to_jax(
+            torch_block.state_dict(),
+            jax_block,
+            to_mappings(),
+            hf_prefix="single_transformer_blocks.0",
+            target_prefix="single_transformer_blocks.0",
+        )
 
         hidden_states_torch = torch.randn(batch_size, seq_len, dim, dtype=torch.float32)
         encoder_hidden_states_torch = torch.randn(
@@ -216,12 +181,13 @@ class TestFluxTransformerBlockParityDemo(unittest.TestCase):
                 attention_impl="sdpa",
                 params_dtype=jnp.float32,
             )
-
-        _copy_adaln_zero_torch_to_jax(torch_block.norm1, jax_block.norm1)
-        _copy_adaln_zero_torch_to_jax(torch_block.norm1_context, jax_block.norm1_context)
-        _copy_flux_attention_torch_to_jax(torch_block.attn, jax_block.attn)
-        _copy_flux_feedforward_torch_to_jax(torch_block.ff, jax_block.ff)
-        _copy_flux_feedforward_torch_to_jax(torch_block.ff_context, jax_block.ff_context)
+        _copy_hf_state_dict_to_jax(
+            torch_block.state_dict(),
+            jax_block,
+            to_mappings(),
+            hf_prefix="transformer_blocks.0",
+            target_prefix="transformer_blocks.0",
+        )
 
         hidden_states_torch = torch.randn(batch_size, seq_len, dim, dtype=torch.float32)
         encoder_hidden_states_torch = torch.randn(
