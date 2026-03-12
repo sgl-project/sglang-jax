@@ -68,7 +68,7 @@ def _load_flux_config() -> FluxModelConfig:
         model_path=str(TRANSFORMER_PATH),
         dtype=jnp.bfloat16,
         weights_dtype=jnp.bfloat16,
-        attention_impl="naive",
+        attention_impl="sdpa",
     )
 
 

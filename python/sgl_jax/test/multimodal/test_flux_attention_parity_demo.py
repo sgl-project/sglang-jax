@@ -79,7 +79,7 @@ class TestFluxAttentionParityDemo(unittest.TestCase):
             out_bias=True,
             pre_only=False,
             elementwise_affine=True,
-            attention_impl="naive",
+            attention_impl="sdpa",
             params_dtype=jnp.float32,
         )
 

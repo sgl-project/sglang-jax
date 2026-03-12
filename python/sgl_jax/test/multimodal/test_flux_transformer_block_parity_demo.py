@@ -154,7 +154,7 @@ class TestFluxTransformerBlockParityDemo(unittest.TestCase):
                 num_attention_heads=num_heads,
                 attention_head_dim=head_dim,
                 mesh=self.mesh,
-                attention_impl="naive",
+                attention_impl="sdpa",
                 params_dtype=jnp.float32,
             )
 
@@ -213,7 +213,7 @@ class TestFluxTransformerBlockParityDemo(unittest.TestCase):
                 attention_head_dim=head_dim,
                 mesh=self.mesh,
                 eps=1e-6,
-                attention_impl="naive",
+                attention_impl="sdpa",
                 params_dtype=jnp.float32,
             )
 

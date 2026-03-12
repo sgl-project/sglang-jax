@@ -33,7 +33,7 @@ from sgl_jax.srt.multimodal.models.flux.normalization import (
 from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 logger = logging.getLogger(__name__)
-_SUPPORTED_ATTENTION_IMPLS = ("usp", "naive")
+_SUPPORTED_ATTENTION_IMPLS = ("usp", "sdpa")
 
 
 def _resolve_rngs(rngs: nnx.Rngs | None) -> nnx.Rngs:
@@ -65,7 +65,7 @@ def _no_shard(x: jax.Array, mesh: Mesh | None) -> jax.Array:
     return jax.lax.with_sharding_constraint(x, NamedSharding(mesh, P()))
 
 
-def _naive_attention(
+def _sdpa_attention(
     query: jax.Array,
     key: jax.Array,
     value: jax.Array,
@@ -73,38 +73,41 @@ def _naive_attention(
     scale: float | None = None,
     causal: bool = False,
 ) -> jax.Array:
-    if scale is None:
-        scale = 1.0 / math.sqrt(query.shape[-1])
+    # Match HF/PyTorch SDPA more closely by computing attention logits/probabilities
+    # through JAX's fused SDPA path in float32 and casting the final result back.
+    q = query.astype(jnp.float32)
+    k = key.astype(jnp.float32)
+    v = value.astype(jnp.float32)
 
-    q = jnp.transpose(query, (0, 2, 1, 3))
-    k = jnp.transpose(key, (0, 2, 1, 3))
-    v = jnp.transpose(value, (0, 2, 1, 3))
-
-    attn_weights = jnp.einsum("bhsd,bhtd->bhst", q, k) * scale
+    mask = None
+    bias = None
     if attention_mask is not None:
-        mask = attention_mask
-        if mask.ndim == 2:
-            mask = mask[:, None, None, :]
-        elif mask.ndim == 3:
-            mask = mask[:, None, :, :]
-        elif mask.ndim != 4:
+        if attention_mask.ndim == 2:
+            attention_mask = attention_mask[:, None, None, :]
+        elif attention_mask.ndim == 3:
+            attention_mask = attention_mask[:, None, :, :]
+        elif attention_mask.ndim != 4:
             raise ValueError(
                 "attention_mask must have rank 2, 3, or 4 for Flux attention. "
-                f"Got shape {mask.shape}."
+                f"Got shape {attention_mask.shape}."
             )
 
-        if mask.dtype == jnp.bool_:
-            mask = jnp.where(mask, 0.0, -jnp.inf)
+        if attention_mask.dtype == jnp.bool_:
+            mask = attention_mask
         else:
-            mask = mask.astype(attn_weights.dtype)
-        attn_weights = attn_weights + mask
-    if causal:
-        seq_len = query.shape[1]
-        mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=bool))
-        attn_weights = jnp.where(mask[None, None, :, :], attn_weights, -jnp.inf)
-    attn_weights = jax.nn.softmax(attn_weights, axis=-1)
-    output = jnp.einsum("bhst,bhtd->bhsd", attn_weights, v)
-    return jnp.transpose(output, (0, 2, 1, 3))
+            bias = attention_mask.astype(jnp.float32)
+
+    output = jax.nn.dot_product_attention(
+        q,
+        k,
+        v,
+        bias=bias,
+        mask=mask,
+        scale=scale,
+        is_causal=causal,
+        implementation="xla",
+    )
+    return output.astype(query.dtype)
 
 
 def _get_projections(
@@ -291,7 +294,7 @@ class FluxAttention(nnx.Module):
         """
         NOTE: Align with the implementation of HF.
         processor: if specified, the attention processor to use.
-        attention_impl: support usp and naive. usp dont support attention_mask yet.
+        attention_impl: support usp and sdpa. usp dont support attention_mask yet.
         """
         mesh = _resolve_mesh(mesh)
         _rngs = _resolve_rngs(rngs)
@@ -412,9 +415,9 @@ class FluxAttention(nnx.Module):
         attention_mask: jax.Array | None = None,
         req=None,
     ) -> jax.Array:
-        if self.attention_impl == "naive":
+        if self.attention_impl == "sdpa":
             del req
-            return _naive_attention(
+            return _sdpa_attention(
                 query,
                 key,
                 value,
@@ -423,10 +426,10 @@ class FluxAttention(nnx.Module):
             )
         if attention_mask is not None:
             logger.warning(
-                "attention_mask is not supported by USPAttention yet; falling back to naive attention."
+                "attention_mask is not supported by USPAttention yet; falling back to sdpa attention."
             )
             del req
-            return _naive_attention(
+            return _sdpa_attention(
                 query,
                 key,
                 value,
