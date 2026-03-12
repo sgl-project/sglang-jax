@@ -225,43 +225,6 @@ def _apply_flux_rotary_emb(
 
     return (x.astype(jnp.float32) * cos + x_rotated.astype(jnp.float32) * sin).astype(x.dtype)
 
-
-def _get_1d_rotary_pos_embed(
-    dim: int,
-    pos: jax.Array | int,
-    theta: float = 10000.0,
-    use_real: bool = True,
-    linear_factor: float = 1.0,
-    ntk_factor: float = 1.0,
-    repeat_interleave_real: bool = True,
-    freqs_dtype: jnp.dtype | None = None,
-) -> tuple[jax.Array, jax.Array] | jax.Array:
-    if dim % 2 != 0:
-        raise ValueError(f"Rotary dimension must be even, got dim={dim}.")
-    pos = jnp.arange(pos) if isinstance(pos, int) else jnp.asarray(pos)
-
-    if freqs_dtype is None:
-        freqs_dtype = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
-
-    theta = theta * ntk_factor
-    inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2, dtype=freqs_dtype) / dim)) / linear_factor
-    freqs = pos.astype(freqs_dtype)[:, None] * inv_freq[None, :]
-
-    if use_real:
-        cos = jnp.cos(freqs)
-        sin = jnp.sin(freqs)
-        if repeat_interleave_real:
-            return (
-                jnp.repeat(cos, 2, axis=-1).astype(jnp.float32),
-                jnp.repeat(sin, 2, axis=-1).astype(jnp.float32),
-            )
-        return (
-            jnp.concatenate([cos, cos], axis=-1).astype(jnp.float32),
-            jnp.concatenate([sin, sin], axis=-1).astype(jnp.float32),
-        )
-    return jnp.exp(1j * freqs).astype(jnp.complex64)
-
-
 class Timesteps(nnx.Module):
     def __init__(
         self,

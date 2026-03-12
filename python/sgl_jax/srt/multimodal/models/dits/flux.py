@@ -21,11 +21,11 @@ from sgl_jax.srt.multimodal.layers.adalayernorm import (
 )
 from sgl_jax.srt.multimodal.layers.attention.layer import USPAttention
 from sgl_jax.srt.multimodal.layers.mlp import FeedForward
+from sgl_jax.srt.multimodal.layers.rotary_embedding import NDRotaryEmbedding
 from sgl_jax.srt.multimodal.layers.visual_embedding import (
     CombinedTimestepGuidanceTextProjEmbeddings,
     CombinedTimestepTextProjEmbeddings,
     _apply_flux_rotary_emb,
-    _get_1d_rotary_pos_embed,
 )
 from sgl_jax.srt.multimodal.models.dits.flux_dit_weights_mapping import to_mappings
 from sgl_jax.srt.utils.weight_utils import WeightLoader
@@ -572,23 +572,16 @@ class FluxTransformerBlock(nnx.Module):
 
 class FluxPosEmbed(nnx.Module):
     def __init__(self, theta: int, axes_dim: list[int] | tuple[int, ...]):
-        self.theta = float(theta)
-        self.axes_dim = tuple(axes_dim)
+        self.rope = NDRotaryEmbedding(
+            rope_dim_list=list(axes_dim),
+            rope_theta=float(theta),
+            use_real=True,
+            repeat_interleave_real=True,
+            dtype=jnp.float32,
+        )
 
     def __call__(self, ids: jax.Array) -> tuple[jax.Array, jax.Array]:
-        pos = ids.astype(jnp.float32)
-        n_axes = pos.shape[-1]
-        cos_out = []
-        sin_out = []
-        for axis_idx in range(n_axes):
-            cos, sin = _get_1d_rotary_pos_embed(
-                self.axes_dim[axis_idx],
-                pos[:, axis_idx],
-                theta=self.theta,
-            )
-            cos_out.append(cos)
-            sin_out.append(sin)
-        return jnp.concatenate(cos_out, axis=-1), jnp.concatenate(sin_out, axis=-1)
+        return self.rope.forward_from_positions(ids.astype(jnp.float32))
 
 
 class FluxTransformer2DModel(nnx.Module):
