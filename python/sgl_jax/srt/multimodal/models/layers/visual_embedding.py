@@ -61,18 +61,41 @@ def _apply_flux_rotary_emb(
 
 def _get_1d_rotary_pos_embed(
     dim: int,
-    pos: jax.Array,
-    theta: float,
-) -> tuple[jax.Array, jax.Array]:
+    pos: jax.Array | int,
+    theta: float = 10000.0,
+    use_real: bool = True,
+    linear_factor: float = 1.0,
+    ntk_factor: float = 1.0,
+    repeat_interleave_real: bool = True,
+    freqs_dtype: jnp.dtype | None = None,
+) -> tuple[jax.Array, jax.Array] | jax.Array:
     if dim % 2 != 0:
         raise ValueError(f"Rotary dimension must be even, got dim={dim}.")
-    freqs_dtype = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
+    pos = jnp.arange(pos) if isinstance(pos, int) else jnp.asarray(pos)
 
-    inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2, dtype=freqs_dtype) / dim))
+    if freqs_dtype is None:
+        freqs_dtype = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
+
+    theta = theta * ntk_factor
+    inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2, dtype=freqs_dtype) / dim)) / linear_factor
     freqs = pos.astype(freqs_dtype)[:, None] * inv_freq[None, :]
-    cos = jnp.repeat(jnp.cos(freqs), 2, axis=-1).astype(jnp.float32)
-    sin = jnp.repeat(jnp.sin(freqs), 2, axis=-1).astype(jnp.float32)
-    return cos, sin
+
+    if use_real:
+        cos = jnp.cos(freqs)
+        sin = jnp.sin(freqs)
+        if repeat_interleave_real:
+            # flux, hunyuan-dit, cogvideox
+            return (
+                jnp.repeat(cos, 2, axis=-1).astype(jnp.float32),
+                jnp.repeat(sin, 2, axis=-1).astype(jnp.float32),
+            )
+        # stable audio, allegro
+        return (
+            jnp.concatenate([cos, cos], axis=-1).astype(jnp.float32),
+            jnp.concatenate([sin, sin], axis=-1).astype(jnp.float32),
+        )
+    # lumina
+    return jnp.exp(1j * freqs).astype(jnp.complex64)
 
 
 class Timesteps(nnx.Module):
@@ -112,44 +135,85 @@ class FluxTimestepEmbedding(nnx.Module):
         in_channels: int,
         time_embed_dim: int,
         mesh: Mesh,
+        act_fn: str | None = "silu",
+        out_dim: int | None = None,
+        post_act_fn: str | None = None,
+        cond_proj_dim: int | None = None,
+        sample_proj_bias: bool = True,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         rngs: nnx.Rngs | None = None,
     ):
+        time_embed_dim_out = out_dim if out_dim is not None else time_embed_dim
         self.linear_1 = LinearBase(
             input_size=in_channels,
             output_size=time_embed_dim,
-            use_bias=True,
+            use_bias=sample_proj_bias,
             mesh=mesh,
             params_dtype=params_dtype,
             kernel_axes=(None, "tensor"),
         )
+        self.cond_proj = (
+            LinearBase(
+                input_size=cond_proj_dim,
+                output_size=in_channels,
+                use_bias=False,
+                mesh=mesh,
+                params_dtype=params_dtype,
+                kernel_axes=(None, "tensor"),
+            )
+            if cond_proj_dim is not None
+            else None
+        )
         self.linear_2 = LinearBase(
             input_size=time_embed_dim,
-            output_size=time_embed_dim,
-            use_bias=True,
+            output_size=time_embed_dim_out,
+            use_bias=sample_proj_bias,
             mesh=mesh,
             params_dtype=params_dtype,
             kernel_axes=("tensor", None),
         )
-        self.act = modeling_flax_utils.ACT2FN["silu"]
+        self.act = modeling_flax_utils.ACT2FN[act_fn] if act_fn is not None else None
+        self.post_act = modeling_flax_utils.ACT2FN[post_act_fn] if post_act_fn is not None else None
 
-    def __call__(self, sample: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        sample: jax.Array,
+        condition: jax.Array | None = None,
+    ) -> jax.Array:
+        if condition is not None:
+            if self.cond_proj is None:
+                raise ValueError(
+                    "`condition` was provided, but `cond_proj_dim` is not set for FluxTimestepEmbedding."
+                )
+            cond, _ = self.cond_proj(condition)
+            sample = sample + cond
         sample, _ = self.linear_1(sample)
-        sample = self.act(sample)
+        if self.act is not None:
+            sample = self.act(sample)
         sample, _ = self.linear_2(sample)
+        if self.post_act is not None:
+            sample = self.post_act(sample)
         return sample
 
 
-class FluxTextProjection(nnx.Module):
+class FP32SiLU(nnx.Module):
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return jax.nn.silu(x.astype(jnp.float32)).astype(x.dtype)
+
+
+class PixArtAlphaTextProjection(nnx.Module):
     def __init__(
         self,
         in_features: int,
         hidden_size: int,
         mesh: Mesh,
-        act_fn: str = "silu",
+        out_features: int | None = None,
+        act_fn: str = "gelu_tanh",
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         rngs: nnx.Rngs | None = None,
     ):
+        if out_features is None:
+            out_features = hidden_size
         self.linear_1 = LinearBase(
             input_size=in_features,
             output_size=hidden_size,
@@ -160,18 +224,25 @@ class FluxTextProjection(nnx.Module):
         )
         self.linear_2 = LinearBase(
             input_size=hidden_size,
-            output_size=hidden_size,
+            output_size=out_features,
             use_bias=True,
             mesh=mesh,
             params_dtype=params_dtype,
             kernel_axes=("tensor", None),
         )
         self.act_fn = act_fn
-        self.act = modeling_flax_utils.ACT2FN[act_fn]
+        if act_fn == "gelu_tanh":
+            self.act_1 = modeling_flax_utils.ACT2FN["gelu_pytorch_tanh"]
+        elif act_fn == "silu":
+            self.act_1 = modeling_flax_utils.ACT2FN["silu"]
+        elif act_fn == "silu_fp32":
+            self.act_1 = FP32SiLU()
+        else:
+            raise ValueError(f"Unknown activation function: {act_fn}")
 
     def __call__(self, caption: jax.Array) -> jax.Array:
         hidden_states, _ = self.linear_1(caption)
-        hidden_states = self.act(hidden_states)
+        hidden_states = self.act_1(hidden_states)
         hidden_states, _ = self.linear_2(hidden_states)
         return hidden_states
 
@@ -279,9 +350,10 @@ class CombinedTimestepTextProjEmbeddings(nnx.Module):
             params_dtype=params_dtype,
             rngs=_rngs,
         )
-        self.text_embedder = FluxTextProjection(
+        self.text_embedder = PixArtAlphaTextProjection(
             in_features=pooled_projection_dim,
             hidden_size=embedding_dim,
+            out_features=embedding_dim,
             mesh=mesh,
             act_fn="silu",
             params_dtype=params_dtype,
@@ -320,9 +392,10 @@ class CombinedTimestepGuidanceTextProjEmbeddings(nnx.Module):
             params_dtype=params_dtype,
             rngs=_rngs,
         )
-        self.text_embedder = FluxTextProjection(
+        self.text_embedder = PixArtAlphaTextProjection(
             in_features=pooled_projection_dim,
             hidden_size=embedding_dim,
+            out_features=embedding_dim,
             mesh=mesh,
             act_fn="silu",
             params_dtype=params_dtype,

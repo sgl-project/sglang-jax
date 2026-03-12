@@ -74,6 +74,59 @@ class TestFluxPosEmbedParityDemo(unittest.TestCase):
 
         self._assert_pair_close(torch_pair, jax_pair)
 
+    def test_get_1d_rotary_pos_embed_concat_real_parity(self):
+        dim = 128
+        theta = 10000.0
+        pos_torch = torch.arange(33, dtype=torch.float32)
+        pos_jax = jnp.asarray(pos_torch.detach().cpu().numpy())
+
+        torch_pair = hf_get_1d_rotary_pos_embed(
+            dim,
+            pos_torch,
+            theta=theta,
+            use_real=True,
+            repeat_interleave_real=False,
+            freqs_dtype=torch.float32,
+        )
+        jax_pair = jax_get_1d_rotary_pos_embed(
+            dim,
+            pos_jax,
+            theta=theta,
+            use_real=True,
+            repeat_interleave_real=False,
+            freqs_dtype=jnp.float32,
+        )
+
+        self._assert_pair_close(torch_pair, jax_pair)
+
+    def test_get_1d_rotary_pos_embed_complex_parity(self):
+        dim = 128
+        theta = 10000.0
+        pos_torch = torch.arange(17, dtype=torch.float32)
+        pos_jax = jnp.asarray(pos_torch.detach().cpu().numpy())
+
+        torch_freqs = hf_get_1d_rotary_pos_embed(
+            dim,
+            pos_torch,
+            theta=theta,
+            use_real=False,
+            freqs_dtype=torch.float32,
+        )
+        jax_freqs = jax_get_1d_rotary_pos_embed(
+            dim,
+            pos_jax,
+            theta=theta,
+            use_real=False,
+            freqs_dtype=jnp.float32,
+        )
+
+        np.testing.assert_allclose(
+            torch_freqs.detach().cpu().numpy(),
+            np.asarray(jax_freqs),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
     def test_flux_pos_embed_parity(self):
         theta = 10000
         axes_dim = [16, 56, 56]
