@@ -228,14 +228,6 @@ def to_mappings(has_guidance_embeds: bool = False) -> dict[str, WeightMapping]:
         sharding=(None,),
     )
 
-    mappings["norm_out.weight"] = WeightMapping(
-        target_path="norm_out.weight",
-        sharding=(None,),
-    )
-    mappings["norm_out.bias"] = WeightMapping(
-        target_path="norm_out.bias",
-        sharding=(None,),
-    )
     mappings["norm_out.linear.weight"] = WeightMapping(
         target_path="norm_out.linear.weight",
         sharding=(None, "tensor"),

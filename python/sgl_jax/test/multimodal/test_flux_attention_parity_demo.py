@@ -1,20 +1,22 @@
+from __future__ import annotations
+
 import os
 import unittest
+
+import numpy as np
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 for _tpu_env in ("TPU_ACCELERATOR_TYPE", "TPU_WORKER_HOSTNAMES"):
     os.environ.pop(_tpu_env, None)
 
-import numpy as np
-
 try:
     import torch
-    import torch.nn as tnn
-    import torch.nn.functional as F
+    from diffusers.models.transformers.transformer_flux import (
+        FluxAttention as HFFluxAttention,
+    )
 except ImportError:  # pragma: no cover
     torch = None
-    tnn = None
-    F = None
+    HFFluxAttention = None
 
 try:
     import jax
@@ -26,134 +28,9 @@ except ImportError:  # pragma: no cover
     nnx = None
 
 if jax is not None:
-    from sgl_jax.srt.multimodal.models.flux.FluxTransformer2DModel import (
+    from sgl_jax.srt.multimodal.models.flux.fluxtransformer2dmodel import (
         FluxAttention as JaxFluxAttention,
     )
-
-
-class TorchFluxAttnProcessor:
-    def __call__(
-        self,
-        attn: "TorchFluxAttention",
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        image_rotary_emb=None,
-    ):
-        del attention_mask, image_rotary_emb
-
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(hidden_states)
-        value = attn.to_v(hidden_states)
-
-        query = query.unflatten(-1, (attn.heads, -1))
-        key = key.unflatten(-1, (attn.heads, -1))
-        value = value.unflatten(-1, (attn.heads, -1))
-
-        query = attn.norm_q(query)
-        key = attn.norm_k(key)
-
-        if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-            encoder_query = attn.add_q_proj(encoder_hidden_states).unflatten(-1, (attn.heads, -1))
-            encoder_key = attn.add_k_proj(encoder_hidden_states).unflatten(-1, (attn.heads, -1))
-            encoder_value = attn.add_v_proj(encoder_hidden_states).unflatten(
-                -1, (attn.heads, -1)
-            )
-
-            encoder_query = attn.norm_added_q(encoder_query)
-            encoder_key = attn.norm_added_k(encoder_key)
-
-            query = torch.cat([encoder_query, query], dim=1)
-            key = torch.cat([encoder_key, key], dim=1)
-            value = torch.cat([encoder_value, value], dim=1)
-
-        q = query.transpose(1, 2)
-        k = key.transpose(1, 2)
-        v = value.transpose(1, 2)
-        hidden_states = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False
-        )
-        hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
-        hidden_states = hidden_states.to(query.dtype)
-
-        if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-            context_len = encoder_hidden_states.shape[1]
-            encoder_hidden_states = hidden_states[:, :context_len, :]
-            hidden_states = hidden_states[:, context_len:, :]
-            if not attn.pre_only:
-                hidden_states = attn.to_out[0](hidden_states)
-                hidden_states = attn.to_out[1](hidden_states)
-            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
-            return hidden_states, encoder_hidden_states
-
-        if not attn.pre_only:
-            hidden_states = attn.to_out[0](hidden_states)
-            hidden_states = attn.to_out[1](hidden_states)
-        return hidden_states
-
-
-class TorchFluxAttention(tnn.Module):
-    def __init__(
-        self,
-        query_dim: int,
-        heads: int = 8,
-        dim_head: int = 64,
-        bias: bool = False,
-        added_kv_proj_dim: int | None = None,
-        added_proj_bias: bool | None = True,
-        out_bias: bool = True,
-        eps: float = 1e-6,
-        out_dim: int | None = None,
-        pre_only: bool = False,
-        elementwise_affine: bool = True,
-    ):
-        super().__init__()
-        self.head_dim = dim_head
-        self.inner_dim = out_dim if out_dim is not None else dim_head * heads
-        self.query_dim = query_dim
-        self.out_dim = out_dim if out_dim is not None else query_dim
-        self.pre_only = pre_only
-        self.heads = out_dim // dim_head if out_dim is not None else heads
-        self.added_kv_proj_dim = added_kv_proj_dim
-
-        self.norm_q = tnn.RMSNorm(dim_head, eps=eps, elementwise_affine=elementwise_affine)
-        self.norm_k = tnn.RMSNorm(dim_head, eps=eps, elementwise_affine=elementwise_affine)
-        self.to_q = tnn.Linear(query_dim, self.inner_dim, bias=bias)
-        self.to_k = tnn.Linear(query_dim, self.inner_dim, bias=bias)
-        self.to_v = tnn.Linear(query_dim, self.inner_dim, bias=bias)
-
-        if not self.pre_only:
-            self.to_out = tnn.ModuleList(
-                [
-                    tnn.Linear(self.inner_dim, self.out_dim, bias=out_bias),
-                    tnn.Dropout(0.0),
-                ]
-            )
-
-        if added_kv_proj_dim is not None:
-            self.norm_added_q = tnn.RMSNorm(dim_head, eps=eps)
-            self.norm_added_k = tnn.RMSNorm(dim_head, eps=eps)
-            self.add_q_proj = tnn.Linear(added_kv_proj_dim, self.inner_dim, bias=added_proj_bias)
-            self.add_k_proj = tnn.Linear(added_kv_proj_dim, self.inner_dim, bias=added_proj_bias)
-            self.add_v_proj = tnn.Linear(added_kv_proj_dim, self.inner_dim, bias=added_proj_bias)
-            self.to_add_out = tnn.Linear(self.inner_dim, query_dim, bias=out_bias)
-
-        self.processor = TorchFluxAttnProcessor()
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        image_rotary_emb=None,
-    ):
-        return self.processor(
-            self,
-            hidden_states,
-            encoder_hidden_states,
-            attention_mask,
-            image_rotary_emb,
-        )
 
 
 def _copy_linear_torch_to_jax(torch_linear, jax_linear):
@@ -167,19 +44,19 @@ def _copy_rmsnorm_torch_to_jax(torch_norm, jax_norm):
         jax_norm.scale.value = jnp.asarray(torch_norm.weight.detach().cpu().numpy())
 
 
-@unittest.skipIf(torch is None or jax is None or nnx is None, "torch/jax/flax not installed")
+@unittest.skipIf(
+    torch is None or HFFluxAttention is None or jax is None or nnx is None,
+    "torch/diffusers/jax/flax not installed",
+)
 class TestFluxAttentionParityDemo(unittest.TestCase):
-    def test_flux_attention_cross_attention_cpu_parity(self):
-        torch.manual_seed(0)
-
-        batch_size = 2
-        seq_len = 8
-        context_len = 4
-        hidden_size = 128
-        num_heads = 4
-        head_dim = 8
-
-        torch_attn = TorchFluxAttention(
+    def _build_attention_pair(
+        self,
+        *,
+        hidden_size: int,
+        num_heads: int,
+        head_dim: int,
+    ):
+        torch_attn = HFFluxAttention(
             query_dim=hidden_size,
             heads=num_heads,
             dim_head=head_dim,
@@ -220,28 +97,9 @@ class TestFluxAttentionParityDemo(unittest.TestCase):
         _copy_rmsnorm_torch_to_jax(torch_attn.norm_k, jax_attn.norm_k)
         _copy_rmsnorm_torch_to_jax(torch_attn.norm_added_q, jax_attn.norm_added_q)
         _copy_rmsnorm_torch_to_jax(torch_attn.norm_added_k, jax_attn.norm_added_k)
+        return torch_attn, jax_attn
 
-        hidden_states_torch = torch.randn(batch_size, seq_len, hidden_size, dtype=torch.float32)
-        encoder_hidden_states_torch = torch.randn(
-            batch_size, context_len, hidden_size, dtype=torch.float32
-        )
-
-        hidden_states_jax = jnp.asarray(hidden_states_torch.detach().cpu().numpy())
-        encoder_hidden_states_jax = jnp.asarray(
-            encoder_hidden_states_torch.detach().cpu().numpy()
-        )
-
-        with torch.no_grad():
-            torch_hidden, torch_context = torch_attn(
-                hidden_states=hidden_states_torch,
-                encoder_hidden_states=encoder_hidden_states_torch,
-            )
-
-        jax_hidden, jax_context = jax_attn(
-            hidden_states=hidden_states_jax,
-            encoder_hidden_states=encoder_hidden_states_jax,
-        )
-
+    def _assert_outputs_close(self, torch_hidden, torch_context, jax_hidden, jax_context):
         torch_hidden_np = torch_hidden.detach().cpu().numpy()
         torch_context_np = torch_context.detach().cpu().numpy()
         jax_hidden_np = np.asarray(jax_hidden)
@@ -249,6 +107,74 @@ class TestFluxAttentionParityDemo(unittest.TestCase):
 
         np.testing.assert_allclose(torch_hidden_np, jax_hidden_np, rtol=1e-4, atol=1e-4)
         np.testing.assert_allclose(torch_context_np, jax_context_np, rtol=1e-4, atol=1e-4)
+
+    def _run_case(
+        self,
+        *,
+        attention_mask_torch: torch.Tensor | None = None,
+        image_rotary_emb_torch: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ):
+        batch_size, seq_len, context_len = 2, 8, 4
+        hidden_size, num_heads, head_dim = 128, 4, 8
+        torch_attn, jax_attn = self._build_attention_pair(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
+
+        hidden_states_torch = torch.randn(batch_size, seq_len, hidden_size, dtype=torch.float32)
+        encoder_hidden_states_torch = torch.randn(
+            batch_size, context_len, hidden_size, dtype=torch.float32
+        )
+
+        hidden_states_jax = jnp.asarray(hidden_states_torch.detach().cpu().numpy())
+        encoder_hidden_states_jax = jnp.asarray(encoder_hidden_states_torch.detach().cpu().numpy())
+        attention_mask_jax = None
+        if attention_mask_torch is not None:
+            attention_mask_jax = jnp.asarray(attention_mask_torch.detach().cpu().numpy())
+        image_rotary_emb_jax = None
+        if image_rotary_emb_torch is not None:
+            image_rotary_emb_jax = tuple(
+                jnp.asarray(x.detach().cpu().numpy()) for x in image_rotary_emb_torch
+            )
+
+        with torch.no_grad():
+            torch_hidden, torch_context = torch_attn(
+                hidden_states=hidden_states_torch,
+                encoder_hidden_states=encoder_hidden_states_torch,
+                attention_mask=attention_mask_torch,
+                image_rotary_emb=image_rotary_emb_torch,
+            )
+
+        jax_hidden, jax_context = jax_attn(
+            hidden_states=hidden_states_jax,
+            encoder_hidden_states=encoder_hidden_states_jax,
+            attention_mask=attention_mask_jax,
+            image_rotary_emb=image_rotary_emb_jax,
+        )
+
+        self._assert_outputs_close(torch_hidden, torch_context, jax_hidden, jax_context)
+
+    def test_flux_attention_cross_attention_cpu_parity(self):
+        torch.manual_seed(0)
+        self._run_case()
+
+    def test_flux_attention_cross_attention_mask_cpu_parity(self):
+        torch.manual_seed(0)
+        batch_size = 2
+        total_kv_len = 12
+        attention_mask_torch = torch.zeros((batch_size, 1, 1, total_kv_len), dtype=torch.float32)
+        attention_mask_torch[:, :, :, -2:] = -1.0e4
+        self._run_case(attention_mask_torch=attention_mask_torch)
+
+    def test_flux_attention_cross_attention_rope_cpu_parity(self):
+        torch.manual_seed(0)
+        head_dim = 8
+        total_kv_len = 12
+        cos_torch = torch.randn(total_kv_len, head_dim, dtype=torch.float32)
+        sin_torch = torch.randn(total_kv_len, head_dim, dtype=torch.float32)
+        image_rotary_emb_torch = (cos_torch, sin_torch)
+        self._run_case(image_rotary_emb_torch=image_rotary_emb_torch)
 
 
 if __name__ == "__main__":

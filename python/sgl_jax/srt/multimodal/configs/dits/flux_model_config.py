@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import Tuple
 
 import jax.numpy as jnp
 from jax.lax import Precision
@@ -20,7 +19,7 @@ class FluxModelConfig(MultiModalModelConfigs):
     joint_attention_dim: int = 4096
     pooled_projection_dim: int = 768
     guidance_embeds: bool = False
-    axes_dims_rope: Tuple[int, int, int] = (16, 56, 56)
+    axes_dims_rope: tuple[int, int, int] = (16, 56, 56)
     hidden_size: int = 3072
     epsilon: float = 1e-6
     attention_impl: str = "usp"

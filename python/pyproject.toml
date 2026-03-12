@@ -45,6 +45,7 @@ dependencies = [
     "imageio[ffmpeg]",
     "librosa",
     "torch>=2.10.0",
+    "diffusers[torch]>=0.37.0",
 ]
 
 [project.optional-dependencies]

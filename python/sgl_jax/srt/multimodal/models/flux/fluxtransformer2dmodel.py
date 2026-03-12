@@ -10,11 +10,21 @@ from flax import nnx
 from jax.sharding import Mesh
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
+from transformers import modeling_flax_utils
 
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.multimodal.configs.dits.flux_model_config import FluxModelConfig
 from sgl_jax.srt.multimodal.layers.attention.layer import USPAttention
+from sgl_jax.srt.multimodal.models.flux.embeddings import (
+    CombinedTimestepGuidanceTextProjEmbeddings,
+    CombinedTimestepTextProjEmbeddings,
+)
+from sgl_jax.srt.multimodal.models.flux.normalization import (
+    FluxAdaLayerNormContinuous,
+    FluxAdaLayerNormZero,
+    FluxAdaLayerNormZeroSingle,
+)
 from sgl_jax.srt.multimodal.models.flux.flux_weights_mapping import to_mappings
 from sgl_jax.srt.utils.weight_utils import WeightLoader
 
@@ -49,47 +59,47 @@ def _no_shard(x: jax.Array, mesh: Mesh | None) -> jax.Array:
     return jax.lax.with_sharding_constraint(x, NamedSharding(mesh, P()))
 
 
-def _layer_norm(
-    x: jax.Array,
-    weight: jax.Array | None = None,
-    bias: jax.Array | None = None,
-    eps: float = 1e-6,
-) -> jax.Array:
-    origin_dtype = x.dtype
-    y = x.astype(jnp.float32)
-    mean = jnp.mean(y, axis=-1, keepdims=True)
-    var = jnp.var(y, axis=-1, keepdims=True)
-    y = (y - mean) * jax.lax.rsqrt(var + eps)
-    if weight is not None:
-        y = y * weight.astype(jnp.float32)
-    if bias is not None:
-        y = y + bias.astype(jnp.float32)
-    return y.astype(origin_dtype)
-
-
-def _gelu_tanh(x: jax.Array) -> jax.Array:
-    return jax.nn.gelu(x, approximate=True)
-
-
-def _rotate_half(x: jax.Array) -> jax.Array:
-    x1 = x[..., ::2]
-    x2 = x[..., 1::2]
-    return jnp.stack((-x2, x1), axis=-1).reshape(x.shape)
-
-
 def _apply_flux_rotary_emb(
     x: jax.Array,
     image_rotary_emb: tuple[jax.Array, jax.Array] | None,
+    use_real: bool = True,
+    use_real_unbind_dim: int = -1,
     sequence_dim: int = 1,
 ) -> jax.Array:
     if image_rotary_emb is None:
         return x
+    if not use_real:
+        raise NotImplementedError("Complex rotary embeddings are not implemented for Flux in sglang-jax.")
+
     cos, sin = image_rotary_emb
-    if sequence_dim != 1:
-        raise NotImplementedError("Flux rotary embedding currently expects sequence_dim=1")
-    cos = cos[None, :, None, :].astype(x.dtype)
-    sin = sin[None, :, None, :].astype(x.dtype)
-    return x * cos + _rotate_half(x) * sin
+    if sequence_dim == 2:
+        cos = cos[None, None, :, :]
+        sin = sin[None, None, :, :]
+    elif sequence_dim == 1:
+        cos = cos[None, :, None, :]
+        sin = sin[None, :, None, :]
+    else:
+        raise ValueError(f"`sequence_dim={sequence_dim}` but should be 1 or 2.")
+
+    cos = cos.astype(x.dtype)
+    sin = sin.astype(x.dtype)
+
+    if use_real_unbind_dim == -1:
+        x_real, x_imag = jnp.split(x.reshape(*x.shape[:-1], -1, 2), 2, axis=-1)
+        x_rotated = jnp.stack([-jnp.squeeze(x_imag, axis=-1), jnp.squeeze(x_real, axis=-1)], axis=-1)
+        x_rotated = x_rotated.reshape(x.shape)
+    elif use_real_unbind_dim == -2:
+        x_real, x_imag = jnp.split(x.reshape(*x.shape[:-1], 2, -1), 2, axis=-2)
+        x_rotated = jnp.concatenate(
+            [(-x_imag).squeeze(axis=-2), x_real.squeeze(axis=-2)],
+            axis=-1,
+        )
+    else:
+        raise ValueError(
+            f"`use_real_unbind_dim={use_real_unbind_dim}` but should be -1 or -2."
+        )
+
+    return (x.astype(jnp.float32) * cos + x_rotated.astype(jnp.float32) * sin).astype(x.dtype)
 
 
 def _get_1d_rotary_pos_embed(
@@ -97,10 +107,14 @@ def _get_1d_rotary_pos_embed(
     pos: jax.Array,
     theta: float,
 ) -> tuple[jax.Array, jax.Array]:
-    inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
-    freqs = pos.astype(jnp.float32)[:, None] * inv_freq[None, :]
-    cos = jnp.repeat(jnp.cos(freqs), 2, axis=-1)
-    sin = jnp.repeat(jnp.sin(freqs), 2, axis=-1)
+    if dim % 2 != 0:
+        raise ValueError(f"Rotary dimension must be even, got dim={dim}.")
+    freqs_dtype = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
+
+    inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2, dtype=freqs_dtype) / dim))
+    freqs = pos.astype(freqs_dtype)[:, None] * inv_freq[None, :]
+    cos = jnp.repeat(jnp.cos(freqs), 2, axis=-1).astype(jnp.float32)
+    sin = jnp.repeat(jnp.sin(freqs), 2, axis=-1).astype(jnp.float32)
     return cos, sin
 
 
@@ -108,6 +122,7 @@ def _naive_attention(
     query: jax.Array,
     key: jax.Array,
     value: jax.Array,
+    attention_mask: jax.Array | None = None,
     scale: float | None = None,
     causal: bool = False,
 ) -> jax.Array:
@@ -119,6 +134,23 @@ def _naive_attention(
     v = jnp.transpose(value, (0, 2, 1, 3))
 
     attn_weights = jnp.einsum("bhsd,bhtd->bhst", q, k) * scale
+    if attention_mask is not None:
+        mask = attention_mask
+        if mask.ndim == 2:
+            mask = mask[:, None, None, :]
+        elif mask.ndim == 3:
+            mask = mask[:, None, :, :]
+        elif mask.ndim != 4:
+            raise ValueError(
+                "attention_mask must have rank 2, 3, or 4 for Flux attention. "
+                f"Got shape {mask.shape}."
+            )
+
+        if mask.dtype == jnp.bool_:
+            mask = jnp.where(mask, 0.0, -jnp.inf)
+        else:
+            mask = mask.astype(attn_weights.dtype)
+        attn_weights = attn_weights + mask
     if causal:
         seq_len = query.shape[1]
         mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=bool))
@@ -154,215 +186,6 @@ def _get_qkv_projections(
     return _get_projections(attn, hidden_states, encoder_hidden_states)
 
 
-class Timesteps(nnx.Module):
-    def __init__(
-        self,
-        num_channels: int,
-        flip_sin_to_cos: bool = True,
-        downscale_freq_shift: float = 0.0,
-        scale: float = 1.0,
-        max_period: int = 10000,
-    ):
-        self.num_channels = num_channels
-        self.flip_sin_to_cos = flip_sin_to_cos
-        self.downscale_freq_shift = downscale_freq_shift
-        self.scale = scale
-        self.max_period = max_period
-
-    def __call__(self, timesteps: jax.Array) -> jax.Array:
-        half_dim = self.num_channels // 2
-        exponent = -math.log(self.max_period) * jnp.arange(half_dim, dtype=jnp.float32)
-        exponent = exponent / (half_dim - self.downscale_freq_shift)
-        emb = jnp.exp(exponent)
-        emb = timesteps.astype(jnp.float32)[:, None] * emb[None, :]
-        emb = self.scale * emb
-        if self.flip_sin_to_cos:
-            emb = jnp.concatenate([jnp.cos(emb), jnp.sin(emb)], axis=-1)
-        else:
-            emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
-        if self.num_channels % 2 == 1:
-            emb = jnp.pad(emb, ((0, 0), (0, 1)))
-        return emb
-
-
-class FluxTimestepEmbedding(nnx.Module):
-    def __init__(self, in_channels: int, time_embed_dim: int, mesh: Mesh):
-        self.linear_1 = LinearBase(
-            input_size=in_channels,
-            output_size=time_embed_dim,
-            use_bias=True,
-            mesh=mesh,
-            kernel_axes=(None, "tensor"),
-        )
-        self.linear_2 = LinearBase(
-            input_size=time_embed_dim,
-            output_size=time_embed_dim,
-            use_bias=True,
-            mesh=mesh,
-            kernel_axes=("tensor", None),
-        )
-
-    def __call__(self, sample: jax.Array) -> jax.Array:
-        sample, _ = self.linear_1(sample)
-        sample = jax.nn.silu(sample)
-        sample, _ = self.linear_2(sample)
-        return sample
-
-
-class FluxTextProjection(nnx.Module):
-    def __init__(self, in_features: int, hidden_size: int, mesh: Mesh, act_fn: str = "silu"):
-        self.linear_1 = LinearBase(
-            input_size=in_features,
-            output_size=hidden_size,
-            use_bias=True,
-            mesh=mesh,
-            kernel_axes=(None, "tensor"),
-        )
-        self.linear_2 = LinearBase(
-            input_size=hidden_size,
-            output_size=hidden_size,
-            use_bias=True,
-            mesh=mesh,
-            kernel_axes=("tensor", None),
-        )
-        self.act_fn = act_fn
-
-    def __call__(self, caption: jax.Array) -> jax.Array:
-        hidden_states, _ = self.linear_1(caption)
-        if self.act_fn == "silu":
-            hidden_states = jax.nn.silu(hidden_states)
-        else:
-            hidden_states = _gelu_tanh(hidden_states)
-        hidden_states, _ = self.linear_2(hidden_states)
-        return hidden_states
-
-
-class CombinedTimestepTextProjEmbeddings(nnx.Module):
-    def __init__(self, embedding_dim: int, pooled_projection_dim: int, mesh: Mesh):
-        self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
-        self.timestep_embedder = FluxTimestepEmbedding(
-            in_channels=256, time_embed_dim=embedding_dim, mesh=mesh
-        )
-        self.text_embedder = FluxTextProjection(
-            in_features=pooled_projection_dim,
-            hidden_size=embedding_dim,
-            mesh=mesh,
-            act_fn="silu",
-        )
-
-    def __call__(self, timestep: jax.Array, pooled_projection: jax.Array) -> jax.Array:
-        timesteps_proj = self.time_proj(timestep)
-        timesteps_emb = self.timestep_embedder(timesteps_proj)
-        pooled_emb = self.text_embedder(pooled_projection)
-        return timesteps_emb + pooled_emb
-
-
-class CombinedTimestepGuidanceTextProjEmbeddings(nnx.Module):
-    def __init__(self, embedding_dim: int, pooled_projection_dim: int, mesh: Mesh):
-        self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
-        self.timestep_embedder = FluxTimestepEmbedding(
-            in_channels=256, time_embed_dim=embedding_dim, mesh=mesh
-        )
-        self.guidance_embedder = FluxTimestepEmbedding(
-            in_channels=256, time_embed_dim=embedding_dim, mesh=mesh
-        )
-        self.text_embedder = FluxTextProjection(
-            in_features=pooled_projection_dim,
-            hidden_size=embedding_dim,
-            mesh=mesh,
-            act_fn="silu",
-        )
-
-    def __call__(
-        self,
-        timestep: jax.Array,
-        guidance: jax.Array,
-        pooled_projection: jax.Array,
-    ) -> jax.Array:
-        timesteps_proj = self.time_proj(timestep)
-        guidance_proj = self.time_proj(guidance)
-        timesteps_emb = self.timestep_embedder(timesteps_proj)
-        guidance_emb = self.guidance_embedder(guidance_proj)
-        pooled_emb = self.text_embedder(pooled_projection)
-        return timesteps_emb + guidance_emb + pooled_emb
-
-
-class FluxAdaLayerNormZero(nnx.Module):
-    def __init__(self, dim: int, mesh: Mesh, eps: float = 1e-6):
-        self.mesh = mesh
-        self.linear = LinearBase(
-            input_size=dim,
-            output_size=6 * dim,
-            use_bias=True,
-            mesh=mesh,
-            kernel_axes=(None, "tensor"),
-        )
-        self.eps = eps
-
-    def __call__(
-        self,
-        hidden_states: jax.Array,
-        emb: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-        hidden_states = _layer_norm(hidden_states, eps=self.eps)
-        emb, _ = self.linear(jax.nn.silu(emb))
-        emb = _no_shard(emb, self.mesh)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(
-            emb, 6, axis=-1
-        )
-        hidden_states = hidden_states * (1 + scale_msa[:, None, :]) + shift_msa[:, None, :]
-        return hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp
-
-
-class FluxAdaLayerNormZeroSingle(nnx.Module):
-    def __init__(self, dim: int, mesh: Mesh, eps: float = 1e-6):
-        self.mesh = mesh
-        self.linear = LinearBase(
-            input_size=dim,
-            output_size=3 * dim,
-            use_bias=True,
-            mesh=mesh,
-            kernel_axes=(None, "tensor"),
-        )
-        self.eps = eps
-
-    def __call__(self, hidden_states: jax.Array, emb: jax.Array) -> tuple[jax.Array, jax.Array]:
-        hidden_states = _layer_norm(hidden_states, eps=self.eps)
-        emb, _ = self.linear(jax.nn.silu(emb))
-        emb = _no_shard(emb, self.mesh)
-        shift_msa, scale_msa, gate_msa = jnp.split(emb, 3, axis=-1)
-        hidden_states = hidden_states * (1 + scale_msa[:, None, :]) + shift_msa[:, None, :]
-        return hidden_states, gate_msa
-
-
-class FluxAdaLayerNormContinuous(nnx.Module):
-    def __init__(
-        self,
-        embedding_dim: int,
-        conditioning_embedding_dim: int,
-        mesh: Mesh,
-        eps: float = 1e-6,
-    ):
-        self.mesh = mesh
-        self.weight = nnx.Param(jnp.ones((embedding_dim,), dtype=jnp.float32))
-        self.bias = nnx.Param(jnp.zeros((embedding_dim,), dtype=jnp.float32))
-        self.linear = LinearBase(
-            input_size=conditioning_embedding_dim,
-            output_size=2 * embedding_dim,
-            use_bias=True,
-            mesh=mesh,
-            kernel_axes=(None, "tensor"),
-        )
-        self.eps = eps
-
-    def __call__(self, x: jax.Array, conditioning_embedding: jax.Array) -> jax.Array:
-        emb, _ = self.linear(jax.nn.silu(conditioning_embedding).astype(x.dtype))
-        emb = _no_shard(emb, self.mesh)
-        scale, shift = jnp.split(emb, 2, axis=-1)
-        x = _layer_norm(x, self.weight.value, self.bias.value, eps=self.eps)
-        return x * (1 + scale[:, None, :]) + shift[:, None, :]
-
-
 class FluxFeedForward(nnx.Module):
     def __init__(self, dim: int, dim_out: int, mesh: Mesh):
         self.fc1 = LinearBase(
@@ -379,10 +202,11 @@ class FluxFeedForward(nnx.Module):
             mesh=mesh,
             kernel_axes=("tensor", None),
         )
+        self.mlp_act = modeling_flax_utils.ACT2FN["gelu"]
 
     def __call__(self, x: jax.Array) -> jax.Array:
         x, _ = self.fc1(x)
-        x = _gelu_tanh(x)
+        x = self.mlp_act(x)
         x, _ = self.fc2(x)
         return x
 
@@ -405,9 +229,6 @@ class FluxAttnProcessor:
         image_rotary_emb: tuple[jax.Array, jax.Array] | None = None,
         req=None,
     ) -> jax.Array | tuple[jax.Array, jax.Array]:
-        if attention_mask is not None:
-            logger.warning("attention_mask is currently ignored in FluxAttnProcessor")
-
         query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
             attn, hidden_states, encoder_hidden_states
         )
@@ -438,10 +259,17 @@ class FluxAttnProcessor:
             value = jnp.concatenate([encoder_value, value], axis=1)
 
         if image_rotary_emb is not None:
+            # HF applies rotary to q/k before dispatching the attention kernel.
             query = _apply_flux_rotary_emb(query, image_rotary_emb, sequence_dim=1)
             key = _apply_flux_rotary_emb(key, image_rotary_emb, sequence_dim=1)
 
-        hidden_states = attn.run_attention(query, key, value, req=req)
+        hidden_states = attn.run_attention(
+            query,
+            key,
+            value,
+            attention_mask=attention_mask,
+            req=req,
+        )
         hidden_states = hidden_states.reshape(hidden_states.shape[0], hidden_states.shape[1], -1)
         hidden_states = hidden_states.astype(query.dtype)
 
@@ -463,7 +291,7 @@ class FluxAttnProcessor:
 
 class FluxAttention(nnx.Module):
     _default_processor_cls = FluxAttnProcessor
-
+    # NOTE FluxIPAdapterAttnProcessor is not added 
     def __init__(
         self,
         query_dim: int,
@@ -484,6 +312,11 @@ class FluxAttention(nnx.Module):
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         mesh: Mesh | None = None,
     ):
+        """
+        NOTE: Align with the implementation of HF.
+        processor: if specified, the attention processor to use. 
+        attention_impl: support usp and naive. usp dont support attention_mask yet.
+        """
         mesh = _resolve_mesh(mesh)
         if attention_impl not in _SUPPORTED_ATTENTION_IMPLS:
             raise ValueError(
@@ -599,11 +432,30 @@ class FluxAttention(nnx.Module):
         query: jax.Array,
         key: jax.Array,
         value: jax.Array,
+        attention_mask: jax.Array | None = None,
         req=None,
     ) -> jax.Array:
         if self.attention_impl == "naive":
             del req
-            return _naive_attention(query, key, value, causal=False)
+            return _naive_attention(
+                query,
+                key,
+                value,
+                attention_mask=attention_mask,
+                causal=False,
+            )
+        if attention_mask is not None:
+            logger.warning(
+                "attention_mask is not supported by USPAttention yet; falling back to naive attention."
+            )
+            del req
+            return _naive_attention(
+                query,
+                key,
+                value,
+                attention_mask=attention_mask,
+                causal=False,
+            )
         return self.attn(query, key, value, req)
 
     def __call__(
@@ -657,6 +509,7 @@ class FluxSingleTransformerBlock(nnx.Module):
             mesh=mesh,
             kernel_axes=("tensor", None),
         )
+        self.mlp_act = modeling_flax_utils.ACT2FN["gelu"]
         self.attn = FluxAttention(
             query_dim=dim,
             dim_head=attention_head_dim,
@@ -685,7 +538,7 @@ class FluxSingleTransformerBlock(nnx.Module):
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
         mlp_hidden_states, _ = self.proj_mlp(norm_hidden_states)
-        mlp_hidden_states = _gelu_tanh(mlp_hidden_states)
+        mlp_hidden_states = self.mlp_act(mlp_hidden_states)
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
@@ -731,6 +584,22 @@ class FluxTransformerBlock(nnx.Module):
             mesh=mesh,
         )
         self.eps = eps
+        self.norm2 = nnx.LayerNorm(
+            num_features=dim,
+            epsilon=eps,
+            use_bias=False,
+            use_scale=False,
+            use_fast_variance=False,
+            rngs=nnx.Rngs(0),
+        )
+        self.norm2_context = nnx.LayerNorm(
+            num_features=dim,
+            epsilon=eps,
+            use_bias=False,
+            use_scale=False,
+            use_fast_variance=False,
+            rngs=nnx.Rngs(0),
+        )
         self.ff = FluxFeedForward(dim=dim, dim_out=4 * dim, mesh=mesh)
         self.ff_context = FluxFeedForward(dim=dim, dim_out=4 * dim, mesh=mesh)
 
@@ -767,14 +636,14 @@ class FluxTransformerBlock(nnx.Module):
 
         hidden_states = hidden_states + gate_msa[:, None, :] * attn_output
 
-        norm_hidden_states = _layer_norm(hidden_states, eps=self.eps)
+        norm_hidden_states = self.norm2(hidden_states)
         norm_hidden_states = (
             norm_hidden_states * (1 + scale_mlp[:, None, :]) + shift_mlp[:, None, :]
         )
         hidden_states = hidden_states + gate_mlp[:, None, :] * self.ff(norm_hidden_states)
 
         encoder_hidden_states = encoder_hidden_states + c_gate_msa[:, None, :] * context_attn_output
-        norm_encoder_hidden_states = _layer_norm(encoder_hidden_states, eps=self.eps)
+        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
         norm_encoder_hidden_states = (
             norm_encoder_hidden_states * (1 + c_scale_mlp[:, None, :]) + c_shift_mlp[:, None, :]
         )
