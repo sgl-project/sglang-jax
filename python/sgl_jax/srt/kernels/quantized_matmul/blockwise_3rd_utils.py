@@ -51,9 +51,9 @@ _TRIED_LOADING_BLOCKWISE_3RD_KERNEL = False
 
 # Tuning metadata: the namedtuple class, the runtime query function, and
 # the static lookup table, all from the third-party tuned_block_sizes module.
-_BLOCKWISE_3RD_TUNED_VALUE_CLS = None      # e.g. TunedValue namedtuple class
+_BLOCKWISE_3RD_TUNED_VALUE_CLS = None  # e.g. TunedValue namedtuple class
 _BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES = None  # e.g. get_tuned_block_sizes()
-_BLOCKWISE_3RD_TUNED_BLOCK_SIZES = None      # e.g. TUNED_BLOCK_SIZES dict
+_BLOCKWISE_3RD_TUNED_BLOCK_SIZES = None  # e.g. TUNED_BLOCK_SIZES dict
 _TRIED_LOADING_BLOCKWISE_3RD_TUNING = False
 
 

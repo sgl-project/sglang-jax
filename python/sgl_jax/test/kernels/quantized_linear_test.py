@@ -9,7 +9,6 @@ import pytest
 from flax import nnx
 from jax.sharding import Mesh
 
-import sgl_jax.srt.kernels.quantized_matmul.kernel as quant_kernel
 import sgl_jax.srt.kernels.quantized_matmul.blockwise_3rd_utils as blockwise_3rd_utils
 from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
