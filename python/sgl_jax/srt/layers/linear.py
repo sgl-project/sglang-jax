@@ -286,32 +286,13 @@ class QuantizedLinear(nnx.Module):
         ):
             scale_val = jnp.squeeze(scale_val, axis=1)
 
-        # Determine if we need tensor parallel reduction.
-        # kernel_axes[0] is input axis, kernel_axes[1] is output axis.
-        # For row-parallel (e.g., o_proj): kernel_axes = ("tensor", None)
-        #   -> input is sharded, need psum over "tensor"
-        # For column-parallel (e.g., q_proj): kernel_axes = (None, "tensor")
-        #   -> input is replicated, no psum needed
-        #
+        # Shard specs for shard_map.
+        # kernel_axes = (input_axis, output_axis):
+        #   row-parallel  (e.g., o_proj): ("tensor", None)
+        #   col-parallel  (e.g., q_proj): (None, "tensor")
         input_axis, output_axis = self.kernel_axes[0], self.kernel_axes[1]
+        #   per-channel scale: [output_size], per-block: [output_blocks, input_blocks]
         w_scale_spec = P(output_axis) if scale_val.ndim == 1 else P(output_axis, input_axis)
-
-        # Use shard_map for local computation with single all-reduce.
-        # kernel_axes[0] = input sharding axis (e.g., "tensor" for o_proj,
-        # None for q_proj)
-        # kernel_axes[1] = output sharding axis (e.g., None for o_proj,
-        # "tensor" for q_proj)
-        #
-        # Weight w_q has shape [output_size, input_size].
-        # After transpose from LinearBase, its sharding is
-        # P(kernel_axes[1], kernel_axes[0]).
-        #
-        # Input x sharding: P(None, input_axis)
-        # Weight w_q sharding: P(output_axis, input_axis)
-        # Weight scale sharding:
-        #   per-channel: P(output_axis)
-        #   block-wise:  P(output_axis, input_axis)
-        # Output sharding: P(None, output_axis)
         in_specs = (P(None, input_axis), P(output_axis, input_axis), w_scale_spec)
         out_specs = P(None, output_axis)
 
