@@ -987,6 +987,9 @@ def ragged_paged_attention_split(
 
     scope_name = get_kernel_scope_name(bq_sz, bkv_p, page_size) + "split"
 
+    # Grid inputs after scalar_prefetches: q, k, v, k_cache, v_cache, ...
+    num_prefetch = len(scalar_prefetches)
+
     kernel = pl.pallas_call(
         functools.partial(
             _ragged_paged_attention_kernel_split,
@@ -1021,9 +1024,9 @@ def ragged_paged_attention_split(
             jax.ShapeDtypeStruct(shape=v_cache_processed.shape, dtype=v_cache_processed.dtype),
         ],
         input_output_aliases={
-            9: 0,  # q input -> q output
-            12: 1,  # k_cache -> updated_k
-            13: 2,  # v_cache -> updated_v
+            num_prefetch + 0: 0,  # q -> output
+            num_prefetch + 3: 1,  # k_cache -> updated_k
+            num_prefetch + 4: 2,  # v_cache -> updated_v
         },
         name=scope_name,
     )

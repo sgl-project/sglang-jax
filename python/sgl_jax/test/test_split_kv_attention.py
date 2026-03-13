@@ -668,6 +668,31 @@ class TestSplitKernelAttention(CustomTestCase):
             page_size=1,
         )
 
+    # --- page_size=16 tests ---
+    def test_split_kernel_gqa_prefill_ps16(self):
+        """GQA prefill with split KV, page_size=16."""
+        self.run_kernel_test(
+            mode="prefill",
+            lens=[(1, 128), (125, 125), (64, 256)],
+            num_heads=16,
+            head_dim=256,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=16,
+        )
+
+    def test_split_kernel_gqa_decode_ps16(self):
+        """GQA decode with split KV, page_size=16."""
+        self.run_kernel_test(
+            mode="decode",
+            lens=[(1, 127), (1, 128), (1, 512)],
+            num_heads=16,
+            head_dim=256,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=16,
+        )
+
     # --- head_dim=192 tests (MLA-style, non-128-aligned) ---
     def test_split_kernel_192_prefill_ps1(self):
         """MHA prefill with head_dim=192, v_head_dim=128 (DeepSeek-V2 MLA dims)."""
@@ -932,6 +957,31 @@ class TestSplitBackendAttention(CustomTestCase):
             num_kv_heads=8,
             v_head_dim=128,
             page_size=1,
+        )
+
+    # --- page_size=16 tests ---
+    def test_split_backend_gqa_prefill_ps16(self):
+        """GQA prefill through FlashAttention backend with split KV cache, page_size=16."""
+        self.run_backend_test(
+            mode="prefill",
+            lens=[(1, 128), (125, 125), (64, 256)],
+            num_heads=16,
+            head_dim=256,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=16,
+        )
+
+    def test_split_backend_gqa_decode_ps16(self):
+        """GQA decode through FlashAttention backend with split KV cache, page_size=16."""
+        self.run_backend_test(
+            mode="decode",
+            lens=[(1, 127), (1, 128), (1, 512)],
+            num_heads=16,
+            head_dim=256,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=16,
         )
 
     def test_split_backend_cache_update(self):
