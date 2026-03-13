@@ -8,38 +8,27 @@ from typing import List, Tuple
 
 @dataclass
 class LTX2VAEConfig:
+    """Configuration for LTX-2 Video VAE Decoder."""
+
+    # Framework fields
     revision: str | None = None
     dtype: str = "bfloat16"
     scale_factor_spatial: int = 32
     scale_factor_temporal: int = 8
     z_dim: int = 128
-    """Configuration for LTX-2 Video VAE Decoder.
-
-    Attributes:
-        in_channels: Number of input latent channels (default 128)
-        out_channels: Number of output video channels (default 3 for RGB)
-        decoder_blocks: List of decoder block specifications
-        patch_size: Final spatial expansion factor (default 4)
-        norm_layer: Normalization layer type ('pixel_norm' or 'group_norm')
-        causal: Whether to use causal convolutions (default False)
-        timestep_conditioning: Whether to use timestep conditioning (default False)
-        decoder_spatial_padding_mode: Padding mode for spatial dimensions
-        load_decoder: Whether to load the decoder (default True)
-        load_encoder: Whether to load the encoder (default False, decoder only)
-    """
 
     # Model architecture
     in_channels: int = 128
     out_channels: int = 3
     decoder_blocks: List[Tuple[str, dict]] = field(default_factory=lambda: [
-        ("compress_all", {"residual": True, "multiplier": 1}),
-        ("res_x", {"num_layers": 3}),
-        ("compress_all", {"residual": True, "multiplier": 1}),
-        ("res_x", {"num_layers": 3}),
-        ("compress_time", {}),
-        ("res_x", {"num_layers": 3}),
-        ("compress_space", {}),
-        ("res_x", {"num_layers": 3}),
+        # Matches checkpoint: 7 up_blocks, channels 1024->512->256->128
+        ("res_x", {"num_layers": 5}),
+        ("compress_all", {"residual": True, "multiplier": 2}),
+        ("res_x", {"num_layers": 5}),
+        ("compress_all", {"residual": True, "multiplier": 2}),
+        ("res_x", {"num_layers": 5}),
+        ("compress_all", {"residual": True, "multiplier": 2}),
+        ("res_x", {"num_layers": 5}),
     ])
     patch_size: int = 4
     norm_layer: str = "pixel_norm"

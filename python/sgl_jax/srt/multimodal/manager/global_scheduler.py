@@ -239,8 +239,8 @@ class GlobalScheduler:
             input_ids=input.input_ids,
             negative_input_ids=input.negative_input_ids,
             num_outputs_per_prompt=input.n,
-            width=int(size_str.split("*")[0]),
-            height=int(size_str.split("*")[1]),
+            width=int(size_str.replace("*", "x").split("x")[0]),
+            height=int(size_str.replace("*", "x").split("x")[1]),
             num_frames=input.num_frames,
             num_inference_steps=(
                 input.num_inference_steps if input.num_inference_steps is not None else 50
@@ -248,6 +248,14 @@ class GlobalScheduler:
             data_type=input.data_type,
             save_output=input.save_output,
         )
+        if getattr(input, "guidance_scale", None) is not None:
+            req.guidance_scale = input.guidance_scale
+        if getattr(input, "stg_scale", None) is not None:
+            req.stg_scale = input.stg_scale
+        if getattr(input, "rescale_scale", None) is not None:
+            req.rescale_scale = input.rescale_scale
+        if getattr(input, "fps", None) is not None:
+            req.fps = input.fps
         if input.mm_inputs is not None:
             req.extra["mm_inputs"] = input.mm_inputs
         if req.rid in self.req_store:

@@ -45,6 +45,8 @@ class WanModelConfig(MultiModalModelConfigs):
     scale_factor_spatial: int = 8
     model_class: None = None  # To be set to the model class
     quantization_config: QuantizationConfig | None = None
+    
+    scheduler_type: str = "FlowUniPCMultistepScheduler"
 
     def get_total_num_kv_heads(self) -> int:
         return self.num_attention_heads

@@ -206,16 +206,11 @@ def forward_attention(
     k_heads = k_cache
     v_heads = v_cache
 
-    # Transpose for efficient matrix operations
-    # q: shape of (num_heads, num_tokens, head_dim)
-    # k, v: shape of (total_prefix_len, num_heads, head_dim)
+    # For GQA attention, repeat k and v heads to match the number of query heads
     if num_kv_heads != num_heads:
-        # For GQA attention, we need to copy k and v heads to match the number of query heads
         num_copies = num_heads // num_kv_heads
-        # Use repeat to copy k and v heads
-        # [total_prefix_len, num_kv_heads, head_dim] -> [total_prefix_len, num_heads, head_dim]
-        k_heads = jnp.repeat(k_heads, num_copies, axis=1, out_sharding=kv_sharding)
-        v_heads = jnp.repeat(v_heads, num_copies, axis=1, out_sharding=kv_sharding)
+        k_heads = jnp.repeat(k_heads, num_copies, axis=1)
+        v_heads = jnp.repeat(v_heads, num_copies, axis=1)
 
     # Transpose for matmul: [num_heads, num_tokens, head_dim]
     q_t = jnp.transpose(q_heads, (1, 0, 2))
@@ -262,8 +257,7 @@ def forward_attention(
 
     # Softmax
     attn_logits = attn_logits - jnp.max(attn_logits, axis=-1, keepdims=True)
-    attn_weights = jax.nn.softmax(attn_logits, axis=-1)
-
+    attn_weights = jax.nn.softmax(attn_logits.astype(jnp.float32), axis=-1).astype(v_t.dtype)
     attn_output = jnp.matmul(attn_weights, v_t)
     attn_output = jnp.transpose(attn_output, (1, 0, 2))
     return attn_output.reshape(num_tokens, hidden_size)

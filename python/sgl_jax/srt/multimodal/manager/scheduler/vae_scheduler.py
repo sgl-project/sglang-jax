@@ -1,8 +1,11 @@
 import logging
+import os
 
 import jax
+import jax.numpy as jnp
 import jax.sharding
 import numpy as np
+from flax import nnx
 from jax import NamedSharding
 from jax.sharding import PartitionSpec
 
@@ -70,6 +73,11 @@ class VaeScheduler(SchedulerProfilerMixin):
             logger.info("[VAE Scheduler] Begins to run vae worker precompile.")
             self.vae_worker.run_precompile()
             logger.info("[VAE Scheduler] Completes vae worker precompile.")
+
+        # Initialize audio decoder + vocoder if available
+        self.audio_decoder = None
+        self.vocoder = None
+        self._init_audio_models(mesh)
 
     def event_loop_normal(self):
         """Main blocking loop used in non-async environments.
@@ -155,7 +163,129 @@ class VaeScheduler(SchedulerProfilerMixin):
             output, cache_miss = self.vae_worker.forward(req)
             logger.info("VAE forward pass cache miss: %s", cache_miss)
             req.output = jax.device_get(output[:, : req.num_frames, :, :, :])
+
+            # Decode audio latents if present
+            if getattr(req, "audio_latents", None) is not None and self.audio_decoder is not None:
+                self._decode_audio(req)
+            # Clear all JAX array fields before sending to detokenizer process.
+            # The detokenizer runs in a separate process without TPU access, so
+            # any remaining jax.Array fields will fail to unpickle.
             req.latents = None
+            req.audio_latents = None
+            req.prompt_embeds = None
+            req.negative_prompt_embeds = None
+            req.audio_prompt_embeds = None
+            req.audio_negative_prompt_embeds = None
+            req.prompt_attention_mask = None
+            req.negative_attention_mask = None
+            req.clip_embedding_pos = None
+            req.clip_embedding_neg = None
+            req.image_embeds = []
+            req.noise_pred = None
+            req.timesteps = None
+            req.timestep = None
+            req.image_latent = None
+            req.raw_latent_shape = None
+            req.trajectory_latents = None
+            req.trajectory_timesteps = None
+            req.vision_embeds = None
+            req.input_embeds = None
+            req.audio_features = None
+            req.pixel_values = None
+            req.preprocessed_image = None
+            req.pixel_values_images = None
+            req.pixel_values_videos = None
+            req.audio_input = None
+            req.mel_input = None
+            req.mel_input_lens = None
+            req.codes = None
+            req.audio_codes = None
+            req.backbone_cache = None
+            req.generated_text_tokens = None
+            req.generated_audio_tokens = None
+            req.text_logits = None
+            req.pooled_embeds = []
+            req.neg_pooled_embeds = []
+            req.pil_image = None
             self.forward_ct += 1
             self._profile_batch_predicate(None)
             self._comm_backend.send_pyobj(req)
+
+    def _init_audio_models(self, mesh):
+        """Load AudioDecoder and Vocoder for audio latent decoding."""
+        try:
+            from sgl_jax.srt.multimodal.models.ltx2.audio_vae.ltx2_audio_vae import AudioDecoder
+            from sgl_jax.srt.multimodal.models.ltx2.audio_vae.ltx2_audio_vae_config import (
+                LTX2AudioVAEDecoderConfig, LTX2VocoderConfig,
+            )
+            from sgl_jax.srt.multimodal.models.ltx2.audio_vae.vocoder import Vocoder
+
+            # Check if LTX-2 checkpoint exists (needed for weights)
+            from sgl_jax.srt.multimodal.models.ltx2.utils import get_hf_snapshot_dir
+            ltx_path = get_hf_snapshot_dir("Lightricks/LTX-2")
+            if not ltx_path:
+                logger.info("LTX-2 cache not found, skipping audio model init")
+                return
+
+            class _SimpleConfig:
+                def __init__(self, path):
+                    self.model_path = path
+
+            model_cfg = _SimpleConfig(ltx_path)
+
+            logger.info("Loading AudioDecoder...")
+            with jax.set_mesh(mesh):
+                decoder = nnx.eval_shape(
+                    lambda: AudioDecoder(config=LTX2AudioVAEDecoderConfig(), mesh=mesh, dtype=jnp.float32)
+                )
+            decoder.load_weights(model_cfg)
+            self.audio_decoder = decoder
+            logger.info("AudioDecoder loaded")
+
+            logger.info("Loading Vocoder...")
+            with jax.set_mesh(mesh):
+                vocoder = nnx.eval_shape(
+                    lambda: Vocoder(config=LTX2VocoderConfig(), mesh=mesh, dtype=jnp.float32)
+                )
+            vocoder.load_weights(model_cfg)
+            self.vocoder = vocoder
+            logger.info("Vocoder loaded")
+        except Exception as e:
+            logger.warning("Failed to load audio models: %s", e)
+            self.audio_decoder = None
+            self.vocoder = None
+
+    def _decode_audio(self, req: Req):
+        """Decode audio latents to waveform and save as WAV alongside the video."""
+        try:
+            audio_latents = jnp.array(req.audio_latents, dtype=jnp.float32)  # (B, T, 128)
+            # Unpatchify: (B, T, C*F) -> (B, T, F, C) where C=8, F=16
+            # PyTorch: rearrange("b t (c f) -> b c t f", c=8, f=16) — c varies slower
+            # So reshape to (B, T, C, F) first, then transpose to channel-last (B, T, F, C)
+            b, t, cf = audio_latents.shape
+            c, f = 8, 16
+            audio_latents = audio_latents.reshape(b, t, c, f)  # (B, T, C=8, F=16)
+            audio_latents = jnp.swapaxes(audio_latents, -1, -2)  # (B, T, F=16, C=8) JAX channel-last
+
+            # Audio VAE decode: (B, T, F, C) -> (B, T', mel_bins, stereo)
+            mel_spec = self.audio_decoder(audio_latents)
+            logger.info("Audio VAE decoded: %s -> %s", audio_latents.shape, mel_spec.shape)
+
+            # Vocoder: mel spec -> waveform
+            waveform = self.vocoder(mel_spec)
+            waveform = jax.device_get(waveform)  # (B, audio_len, 2)
+            logger.info("Vocoder output: %s", waveform.shape)
+
+            # Save as WAV
+            import scipy.io.wavfile
+            wav_data = np.array(waveform[0])  # (audio_len, 2)
+            wav_data = np.clip(wav_data, -1.0, 1.0)
+            wav_data = (wav_data * 32767).astype(np.int16)
+            sample_rate = 24000  # Vocoder output rate
+            output_path = getattr(req, "output_path", "outputs/")
+            wav_path = os.path.join(output_path, f"{req.rid}.wav")
+            os.makedirs(output_path, exist_ok=True)
+            scipy.io.wavfile.write(wav_path, sample_rate, wav_data)
+            logger.info("Saved audio to %s", wav_path)
+        except Exception as e:
+            logger.warning("Audio decode failed: %s", e)

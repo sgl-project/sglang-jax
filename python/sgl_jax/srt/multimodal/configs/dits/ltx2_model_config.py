@@ -17,7 +17,6 @@ class LTX2ModelConfig(MultiModalModelConfigs):
     - Text-to-video, image-to-video, and video-to-video generation
     - High fidelity outputs with multiple performance modes
     """
-    dtype: str = "bfloat16"
 
     # Model architecture parameters (from LTX-2 config)
     num_layers: int = 48
@@ -48,15 +47,7 @@ class LTX2ModelConfig(MultiModalModelConfigs):
     audio_positional_embedding_max_pos: tuple[int] = (20,)
     use_middle_indices_grid: bool = True
     rope_type: str = "split"  # "interleaved" or other rope types
-    double_precision_rope: bool = False
-
-    # Scheduler and execution parameters
-    use_dynamic_shifting: bool = True
-    base_shift: float = 0.95
-    max_shift: float = 2.05
-    stg_mode: bool = True
-    fps: float = 25.0
-    max_sequence_length: int = 1024
+    double_precision_rope: bool = True
 
     # Timestep embedding parameters
     timestep_scale_multiplier: int = 1000
@@ -84,8 +75,18 @@ class LTX2ModelConfig(MultiModalModelConfigs):
 
     # Latent space parameters
     latent_input_dim: int = 128
-    scale_factor_temporal: int = 4
-    scale_factor_spatial: int = 8
+    scale_factor_temporal: int = 8   # VAE temporal compression ratio
+    scale_factor_spatial: int = 32   # VAE spatial compression ratio
+
+    # Scheduler and execution parameters
+    scheduler_type: str = "EulerScheduler"
+    use_dynamic_shifting: bool = True
+    base_shift: float = 0.95
+    max_shift: float = 2.05
+    stg_mode: bool = True
+    fps: float = 25.0
+    max_sequence_length: int = 1024
+    flow_shift: float | None = None
 
     model_class: None = None  # To be set to the model class
     quantization_config: QuantizationConfig | None = None

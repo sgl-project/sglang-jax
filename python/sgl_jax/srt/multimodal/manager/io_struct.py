@@ -3,13 +3,26 @@ import uuid
 from enum import Enum, auto
 
 import numpy as np
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ImageGenerationsRequest(BaseModel):
     prompt: str
-    neg_prompt: str = (
-        "blurry, low quality, inconsistent lighting, floating, disconnected from scene"
+    neg_prompt: str = Field(
+        default=(
+            "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise, "
+            "grainy texture, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, "
+            "deformed facial features, asymmetrical face, missing facial features, extra limbs, disfigured hands, "
+            "wrong hand count, artifacts around text, inconsistent perspective, camera shake, incorrect depth of "
+            "field, background too sharp, background clutter, distracting reflections, harsh shadows, inconsistent "
+            "lighting direction, color banding, cartoonish rendering, 3D CGI look, unrealistic materials, uncanny "
+            "valley effect, incorrect ethnicity, wrong gender, exaggerated expressions, wrong gaze direction, "
+            "mismatched lip sync, silent or muted audio, distorted voice, robotic voice, echo, background noise, "
+            "off-sync audio, incorrect dialogue, added dialogue, repetitive speech, jittery movement, awkward "
+            "pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, "
+            "inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts."
+        ),
+        alias="negative_prompt",
     )
     model: str | None = None
     n: int | None = 1
@@ -30,8 +43,21 @@ class ImageResponse(BaseModel):
 
 class VideoGenerationsRequest(BaseModel):
     prompt: str
-    neg_prompt: str = (
-        "blurry, low quality, inconsistent lighting, floating, disconnected from scene"
+    neg_prompt: str = Field(
+        default=(
+            "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise, "
+            "grainy texture, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, "
+            "deformed facial features, asymmetrical face, missing facial features, extra limbs, disfigured hands, "
+            "wrong hand count, artifacts around text, inconsistent perspective, camera shake, incorrect depth of "
+            "field, background too sharp, background clutter, distracting reflections, harsh shadows, inconsistent "
+            "lighting direction, color banding, cartoonish rendering, 3D CGI look, unrealistic materials, uncanny "
+            "valley effect, incorrect ethnicity, wrong gender, exaggerated expressions, wrong gaze direction, "
+            "mismatched lip sync, silent or muted audio, distorted voice, robotic voice, echo, background noise, "
+            "off-sync audio, incorrect dialogue, added dialogue, repetitive speech, jittery movement, awkward "
+            "pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, "
+            "inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts."
+        ),
+        alias="negative_prompt",
     )
     input_reference: str | None = None
     model: str | None = None
@@ -41,7 +67,9 @@ class VideoGenerationsRequest(BaseModel):
     num_frames: int | None = None
     num_inference_steps: int | None = None
     save_output: bool = True
-    # guidance_scale: float | None = 5.0
+    guidance_scale: float | None = None
+    stg_scale: float | None = None
+    rescale_scale: float | None = None
     # text_embeds: np.ndarray | None = None
     # latents: np.ndarray | None = None
 
@@ -112,7 +140,17 @@ class GenerateMMReqInput:
     data_type: DataType | None = None
     prompt: str | None = None
     neg_prompt: str | None = (
-        "blurry, low quality, inconsistent lighting, floating, disconnected from scene"
+        "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise, "
+        "grainy texture, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, "
+        "deformed facial features, asymmetrical face, missing facial features, extra limbs, disfigured hands, "
+        "wrong hand count, artifacts around text, inconsistent perspective, camera shake, incorrect depth of "
+        "field, background too sharp, background clutter, distracting reflections, harsh shadows, inconsistent "
+        "lighting direction, color banding, cartoonish rendering, 3D CGI look, unrealistic materials, uncanny "
+        "valley effect, incorrect ethnicity, wrong gender, exaggerated expressions, wrong gaze direction, "
+        "mismatched lip sync, silent or muted audio, distorted voice, robotic voice, echo, background noise, "
+        "off-sync audio, incorrect dialogue, added dialogue, repetitive speech, jittery movement, awkward "
+        "pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, "
+        "inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts."
     )
     input_ids: list[int] | None = None
     stream: bool = False
@@ -129,6 +167,9 @@ class GenerateMMReqInput:
     output_format: str | None = None
     background: str | None = None
     response_format: str | None = None
+    guidance_scale: float | None = None
+    stg_scale: float | None = None
+    rescale_scale: float | None = None
 
     def __post_init__(self):
         self.rid = uuid.uuid4().hex
@@ -175,6 +216,9 @@ class TokenizedGenerateMMReqInput:
     save_output: bool = True
     background: str | None = None
     response_format: str | None = None
+    guidance_scale: float | None = None
+    stg_scale: float | None = None
+    rescale_scale: float | None = None
 
 
 @dataclasses.dataclass

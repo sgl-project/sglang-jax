@@ -4,7 +4,7 @@ LTX-2 VideoDecoder ported from PyTorch to JAX/Flax.
 This module implements the decoder portion of the LTX-2 Video VAE.
 It decodes latent representations into video frames.
 
-Reference: /Users/chandrasekhardevarakonda/Downloads/ltx/LTX-2/packages/ltx-core/src/ltx_core/model/video_vae/video_vae.py
+Reference: ltx_core/model/video_vae/video_vae.py (from Lightricks/LTX-2)
 """
 
 import logging
@@ -529,9 +529,11 @@ class DepthToSpaceUpsample(nnx.Module):
             x_in = x_in.transpose(0, 1, 5, 2, 6, 3, 7, 4)
             x_in = x_in.reshape(b, t * self.stride[0], h * self.stride[1], w * self.stride[2], c // math.prod(self.stride))
 
-            # Repeat to match output channels
+            # Tile to match output channels (must use tile, not repeat —
+            # torch.repeat tiles [A,B,C,A,B,C,...] while jnp.repeat
+            # repeats each element [A,A,B,B,C,C,...])
             num_repeat = math.prod(self.stride) // self.out_channels_reduction_factor
-            x_in = jnp.repeat(x_in, num_repeat, axis=-1)
+            x_in = jnp.tile(x_in, (1,) * (x_in.ndim - 1) + (num_repeat,))
 
             # Remove first frame if temporal upsampling
             if self.stride[0] == 2:
@@ -613,8 +615,10 @@ def unpatchify(x: Array, patch_size_hw: int, patch_size_t: int = 1) -> Array:
     # Reshape: [B, T, H, W, C] -> [B, T, H, W, out_C, patch_t, patch_h, patch_w]
     x = x.reshape(b, t, h, w, out_channels, patch_size_t, patch_size_hw, patch_size_hw)
 
-    # Permute: [B, T, H, W, out_C, patch_t, patch_h, patch_w] -> [B, T, patch_t, H, patch_h, W, patch_w, out_C]
-    x = x.transpose(0, 1, 5, 2, 6, 3, 7, 4)
+    # PyTorch einops: "b (c p r q) f h w -> b c (f p) (h q) (w r)"
+    # Channel decomposition (c, p_t, r_width, q_height): axis 6=r(W), axis 7=q(H)
+    # Permute: [B, T, H, W, C, p_t, r_W, q_H] -> [B, T, p_t, H, q_H, W, r_W, C]
+    x = x.transpose(0, 1, 5, 2, 7, 3, 6, 4)
 
     # Reshape: [B, T*patch_t, H*patch_h, W*patch_w, out_C]
     x = x.reshape(b, t * patch_size_t, h * patch_size_hw, w * patch_size_hw, out_channels)
@@ -653,6 +657,8 @@ class VideoDecoder(nnx.Module):
         self,
         config=None,
         *,
+        dtype=None,
+        mesh=None,
         convolution_dimensions: int = 3,
         in_channels: int = 128,
         out_channels: int = 3,
@@ -662,13 +668,23 @@ class VideoDecoder(nnx.Module):
         causal: bool = False,
         timestep_conditioning: bool = False,
         decoder_spatial_padding_mode: str = "reflect",
-        rngs: nnx.Rngs | None = None,
-        **kwargs,
+        rngs: nnx.Rngs = None,
     ):
-        self.mesh = kwargs.get("mesh", None)
+        self.mesh = mesh
+        self.dtype = dtype
+
+        # Accept config object (from JAXModelLoader) to extract params
+        if config is not None:
+            in_channels = getattr(config, "in_channels", in_channels)
+            out_channels = getattr(config, "out_channels", out_channels)
+            decoder_blocks = getattr(config, "decoder_blocks", decoder_blocks)
+            patch_size = getattr(config, "patch_size", patch_size)
+            norm_layer = getattr(config, "norm_layer", norm_layer)
+            causal = getattr(config, "causal", causal)
+            timestep_conditioning = getattr(config, "timestep_conditioning", timestep_conditioning)
+            decoder_spatial_padding_mode = getattr(config, "decoder_spatial_padding_mode", decoder_spatial_padding_mode)
         if rngs is None:
             rngs = nnx.Rngs(0)
-            
         if decoder_blocks is None:
             # Default LTX-2 decoder blocks (in reverse order from encoder)
             decoder_blocks = [
@@ -875,21 +891,49 @@ class VideoDecoder(nnx.Module):
 
         return sample
 
+    def decode(self, x):
+        return self(x)
+
     def load_weights(self, model_config, *args, **kwargs):
+        import logging
+        import os
+
         import jax
         import jax.numpy as jnp
-        import flax.nnx as nnx
-        from jax.sharding import NamedSharding, PartitionSpec
+        from flax import nnx
         from jax import ShapeDtypeStruct
+        from jax.sharding import NamedSharding, PartitionSpec
 
+        from sgl_jax.srt.utils.weight_utils import WeightLoader
+        from .weight_mappings import create_vae_decoder_weight_mappings
+
+        logger = logging.getLogger(__name__)
+
+        # Use only the main LTX-2 checkpoint file (not FP4/FP8/distilled variants)
+        from sgl_jax.srt.multimodal.models.ltx2.utils import get_ltx2_checkpoint_dir, cleanup_ltx2_checkpoint_dir
+        _ckpt_dir = get_ltx2_checkpoint_dir()
+        if _ckpt_dir:
+            model_config.model_path = _ckpt_dir
+
+        loader = WeightLoader(
+            model=self,
+            model_config=model_config,
+            mesh=self.mesh,
+            dtype=self.dtype or jnp.bfloat16,
+        )
+
+        weight_mappings = create_vae_decoder_weight_mappings()
+        loader.load_weights_from_safetensors(weight_mappings)
+        cleanup_ltx2_checkpoint_dir(_ckpt_dir)
+
+        # Materialize any remaining abstract params (from nnx.eval_shape) to concrete zeros
         def _replace_abstract(x):
             if isinstance(x, ShapeDtypeStruct):
                 pspec = PartitionSpec()
                 if hasattr(x, "sharding") and x.sharding is not None and hasattr(x.sharding, "spec"):
                     pspec = x.sharding.spec
-                mesh = getattr(self, "mesh", None)
-                if mesh:
-                    concrete_sharding = NamedSharding(mesh, pspec)
+                if self.mesh:
+                    concrete_sharding = NamedSharding(self.mesh, pspec)
                     return jax.device_put(jnp.zeros(x.shape, x.dtype), concrete_sharding)
                 return jnp.zeros(x.shape, x.dtype)
             return x
@@ -897,9 +941,6 @@ class VideoDecoder(nnx.Module):
         state = nnx.state(self)
         concrete_state = jax.tree_util.tree_map(_replace_abstract, state)
         nnx.update(self, concrete_state)
-
-    def decode(self, x):
-        return self(x)
 
     @staticmethod
     def get_config_class():

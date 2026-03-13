@@ -78,7 +78,7 @@ async def _convert_to_internal_request(obj: ImageGenerationsRequest | VideoGener
         num_inference_steps = obj.num_inference_steps if obj.num_inference_steps is not None else 50
     else:
         raise Exception(f"not supported type {type(obj)}")
-    return GenerateMMReqInput(
+    kwargs = dict(
         prompt=obj.prompt,
         neg_prompt=obj.neg_prompt,
         size=obj.size,
@@ -87,6 +87,15 @@ async def _convert_to_internal_request(obj: ImageGenerationsRequest | VideoGener
         data_type=data_type,
         save_output=obj.save_output,
     )
+    if hasattr(obj, "guidance_scale") and obj.guidance_scale is not None:
+        kwargs["guidance_scale"] = obj.guidance_scale
+    if hasattr(obj, "stg_scale") and obj.stg_scale is not None:
+        kwargs["stg_scale"] = obj.stg_scale
+    if hasattr(obj, "rescale_scale") and obj.rescale_scale is not None:
+        kwargs["rescale_scale"] = obj.rescale_scale
+    if hasattr(obj, "fps") and obj.fps is not None:
+        kwargs["fps"] = obj.fps
+    return GenerateMMReqInput(**kwargs)
 
 
 def _extract_openai_prompt(

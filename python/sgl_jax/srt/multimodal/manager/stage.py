@@ -13,6 +13,8 @@ from sgl_jax.srt.models.qwen2 import Qwen2ForCausalLM
 from sgl_jax.srt.models.umt5 import UMT5EncoderModel
 from sgl_jax.srt.multimodal.models.ltx2.text_encoders.ltx2_text_encoder import LTX2GemmaTextEncoder
 from sgl_jax.srt.multimodal.models.ltx2.diffusion.ltx2_dit import LTX2Transformer3DModel
+from sgl_jax.srt.multimodal.models.ltx2.audio_vae.ltx2_audio_vae import AudioDecoder, AudioEncoder
+from sgl_jax.srt.multimodal.models.ltx2.audio_vae.vocoder import Vocoder
 from sgl_jax.srt.multimodal.models.ltx2.vaes.ltx2_vae_decoder import VideoDecoder
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
 from sgl_jax.srt.multimodal.manager.scheduler.audio_backbone_scheduler import (
@@ -23,6 +25,9 @@ from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
     DiffusionScheduler,
 )
 from sgl_jax.srt.multimodal.manager.scheduler.embed_scheduler import EmbedScheduler
+from sgl_jax.srt.multimodal.manager.scheduler.text_encoder_scheduler import (
+    TextEncoderScheduler,
+)
 from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
 from sgl_jax.srt.multimodal.manager.scheduler.vit_scheduler import VitScheduler
 from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_backbone import (
@@ -224,6 +229,8 @@ def get_scheduler_class(name: str):
         return VitScheduler
     elif name == "embedding":
         return EmbedScheduler
+    elif name == "text_encoder":
+        return TextEncoderScheduler
     elif name in ["audio_encoder", "audio_decoder"]:
         return AudioScheduler
     elif name == "audio_backbone":
@@ -259,7 +266,13 @@ def get_model_class(name: str):
         return LTX2GemmaTextEncoder
     elif name == "LTX2Transformer3DModel":
         return LTX2Transformer3DModel
-    elif name in ["AutoencoderKLLTX2", "AutoencoderKLLTX2Video", "AutoencoderKLLTX2Audio"]:
+    elif name in ["AutoencoderKLLTX2", "AutoencoderKLLTX2Video"]:
         return VideoDecoder
+    elif name == "AutoencoderKLLTX2Audio":
+        return AudioDecoder
+    elif name == "LTX2AudioEncoder":
+        return AudioEncoder
+    elif name == "LTX2Vocoder":
+        return Vocoder
     else:
         raise ValueError(f"Unknown model name: {name}")
