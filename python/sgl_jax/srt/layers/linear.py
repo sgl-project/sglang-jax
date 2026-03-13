@@ -43,23 +43,23 @@ class LinearBase(nnx.Module):
         self.kernel_axes = kernel_axes
         self.mesh = mesh
         self.name = scope_name
+        out_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(*kernel_axes)) if mesh is not None else jax.sharding.PartitionSpec(*kernel_axes)
         self.weight = nnx.Param(
             jax.random.normal(
                 jax.random.PRNGKey(0),
                 (input_size, output_size),
                 dtype=params_dtype,
-                out_sharding=P(*kernel_axes),
+                out_sharding=out_sharding,
             ),
         )
         if use_bias:
+            bias_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(kernel_axes[-1])) if mesh is not None else jax.sharding.PartitionSpec(kernel_axes[-1])
             self.bias = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
                     (output_size,),
                     dtype=params_dtype,
-                    out_sharding=P(
-                        kernel_axes[-1],
-                    ),
+                    out_sharding=bias_sharding,
                 ),
             )
         else:

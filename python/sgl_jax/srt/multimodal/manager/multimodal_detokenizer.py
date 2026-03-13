@@ -1,5 +1,7 @@
 import logging
+import os
 import signal
+import subprocess
 
 import imageio
 import numpy as np
@@ -99,20 +101,58 @@ class MultimodalDetokenizer(DetokenizerManager):
             # if req.output_file_name:
             if req.data_type == DataType.VIDEO:
                 req.output_file_name = req.rid + ".mp4"
+                # Default to 25fps (LTX-2 reference) when not specified
+                video_fps = req.fps if req.fps is not None else 25
                 imageio.mimsave(
                     req.output_file_name,
                     frames,
-                    fps=req.fps,
+                    fps=video_fps,
                     format=req.data_type.get_default_extension(),
+                    quality=8,
                 )
             else:
                 req.output_file_name = req.rid + ".jpg"
                 imageio.imwrite(req.output_file_name, frames[0])
             logger.info("Saved output to %s", req.output_file_name)
+
+            # Mux audio into video if a WAV file was produced by the VAE scheduler
+            if req.data_type == DataType.VIDEO:
+                wav_path = os.path.join("outputs", req.rid + ".wav")
+                if os.path.exists(wav_path):
+                    self._mux_audio(req.output_file_name, wav_path)
         else:
             logger.info("No output path provided, output not saved")
 
         return [req]
+
+    def _mux_audio(self, video_path: str, wav_path: str):
+        """Mux a WAV audio track into an existing MP4 video file."""
+        try:
+            import imageio_ffmpeg
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            logger.warning("imageio_ffmpeg not available, skipping audio mux")
+            return
+
+        muxed_path = video_path + ".tmp.mp4"
+        cmd = [
+            ffmpeg_exe, "-y",
+            "-i", video_path,
+            "-i", wav_path,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-shortest",
+            muxed_path,
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, check=True, timeout=60)
+            os.replace(muxed_path, video_path)
+            os.remove(wav_path)
+            logger.info("Muxed audio into %s", video_path)
+        except Exception as e:
+            logger.warning("Failed to mux audio: %s", e)
+            if os.path.exists(muxed_path):
+                os.remove(muxed_path)
 
 
 def run_multimodal_detokenizer_process(

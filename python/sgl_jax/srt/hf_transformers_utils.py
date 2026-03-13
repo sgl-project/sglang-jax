@@ -38,7 +38,7 @@ def download_from_hf(model_path: str, allow_patterns: list[str] | None = _UNSET,
     if "LTX" in model_path and (allow_patterns is None or allow_patterns is _UNSET):
         allow_patterns = ["ltx-2-19b-dev.safetensors", "*.json", "*.txt"]
     elif "gemma-3" in model_path and (allow_patterns is None or allow_patterns is _UNSET):
-        # Prevent massive 24GB download for the text encoder during pipeline initialization tests
+        # Only download config/tokenizer files; weights are loaded from cache by load_weights()
         allow_patterns = ["*.json", "*.txt", "*.model", "*.tiktoken"]
     elif allow_patterns is _UNSET:
         allow_patterns = ["*.json", "*.bin", "*.model", "*.py", "*.tiktoken"]

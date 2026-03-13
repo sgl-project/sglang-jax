@@ -462,7 +462,7 @@ class MultimodalTokenizer(TokenizerManager):
         `input_ids` are passed through unchanged.
         """
         input_text = getattr(obj, "prompt", None) or getattr(obj, "text", None)
-        neg_input_text = getattr(obj, "neg_prompt", None) or getattr(obj, "text", None)
+        neg_input_text = getattr(obj, "neg_prompt", None) or ""
         input_ids = getattr(obj, "input_ids", None)
         neg_input_ids = getattr(obj, "neg_input_ids", None)
         mm_inputs = None
@@ -878,6 +878,10 @@ class MultimodalTokenizer(TokenizerManager):
             num_inference_steps=getattr(obj, "num_inference_steps", 50),
             data_type=getattr(obj, "data_type", None),
             save_output=getattr(obj, "save_output", True),
+            guidance_scale=getattr(obj, "guidance_scale", None),
+            stg_scale=getattr(obj, "stg_scale", None),
+            rescale_scale=getattr(obj, "rescale_scale", None),
+            fps=getattr(obj, "fps", None),
         )
         return tokenized_obj
 

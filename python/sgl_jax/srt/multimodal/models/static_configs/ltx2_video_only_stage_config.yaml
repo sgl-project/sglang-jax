@@ -6,10 +6,9 @@ stage_args:
    runtime:
      num_tpus: 2
      max_batch_size: 1
-   scheduler: auto_regressive
+   scheduler: text_encoder
    final_output: false
    scheduler_params: {}
-   precompile_params: {"capture_hidden_mode": 2}
    model_class: LTX2GemmaTextEncoder  # LTX-2 uses Gemma-based text encoder (wraps Gemma2Model)
 
  - stage_id: 1

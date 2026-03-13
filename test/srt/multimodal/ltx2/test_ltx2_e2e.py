@@ -34,8 +34,8 @@ class TestLTX2EndToEnd(CustomTestCase):
                 "--download-dir", "/mnt/disks/persist/hf_cache",
                 "--tp-size", "8",
                 "--enable-single-process",
-                "--max-total-tokens", "8192",
-                "--context-length", "1024",
+                "--max-total-tokens", "32768",
+                "--context-length", "8192",
             ],
             env={
                 "HF_HOME": "/mnt/disks/persist/hf_cache",
@@ -49,7 +49,7 @@ class TestLTX2EndToEnd(CustomTestCase):
             "prompt": "A horse galloping on a beach",
             "num_frames": 9,  # Minimum valid frame count: 8*1 + 1
             "size": "256*256",
-            "num_inference_steps": 4, # Keep steps low for a fast test
+            "num_inference_steps": 4,  # Keep steps low for a fast test
             "guidance_scale": 3.0,
         }
         
