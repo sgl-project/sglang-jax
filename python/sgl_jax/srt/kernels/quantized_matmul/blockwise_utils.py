@@ -1,25 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Utilities for integrating third-party blockwise quantized matmul kernels.
+"""Utilities for the TPU blockwise quantized matmul kernel.
 
-This module provides lazy-loading and safe parameter resolution for a
-third-party TPU blockwise quantized matmul kernel.  The overall call flow is:
+This module provides lazy-loading and safe parameter resolution for the
+TPU blockwise quantized matmul kernel.  The overall call flow is:
 
     kernel.py (xla_quantized_matmul_local)
         |
-        |-- get_blockwise_3rd_kernel()                # lazy-load the kernel function
-        |-- should_use_3rd_party_blockwise_kernel()   # narrow-N shape guard
-        |-- convert_block_scale_to_3rd_layout()       # scale format conversion
-        |-- get_safe_blockwise_tuned_value()           # resolve TPU tile sizes
+        |-- get_blockwise_kernel()                   # lazy-load the kernel function
+        |-- should_use_blockwise_kernel()            # narrow-N shape guard
+        |-- convert_block_scale_to_kernel_layout()   # scale format conversion
+        |-- get_safe_blockwise_tuned_value()          # resolve TPU tile sizes
         |       |
-        |       |-- _get_blockwise_3rd_tuning_api()       # lazy-load tuning tables
-        |       |-- _iter_blockwise_tuned_candidates()    # find best match in table
-        |       +-- clamp / snap sizes to local matrix    # ensure launch safety
+        |       |-- _get_blockwise_tuning_api()          # lazy-load tuning tables
+        |       |-- _iter_blockwise_tuned_candidates()   # find best match in table
+        |       +-- clamp / snap sizes to local matrix   # ensure launch safety
         |
-        +-- blockwise_3rd_kernel(...)                 # invoke the kernel
+        +-- blockwise_kernel(...)                    # invoke the kernel
 
 The tuned value resolution follows a 3-tier fallback strategy:
   1. Look up a compatible entry from a pre-computed tuning table (best).
-  2. Query the third-party ``get_tuned_block_sizes()`` API at runtime.
+  2. Query ``get_tuned_block_sizes()`` API at runtime.
   3. Fall back to a conservative default seed ``(128, 128, 128, 1)``.
 
 After obtaining a seed, the final tile sizes are clamped and snapped to
@@ -38,76 +38,76 @@ import jax.numpy as jnp
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Lazy-loaded third-party kernel and tuning state.
+# Lazy-loaded blockwise kernel and tuning state.
 #
-# These globals are populated on first access via get_blockwise_3rd_kernel()
-# and _get_blockwise_3rd_tuning_api().  The ``_TRIED_LOADING_*`` flags ensure
+# These globals are populated on first access via get_blockwise_kernel()
+# and _get_blockwise_tuning_api().  The ``_TRIED_LOADING_*`` flags ensure
 # we only attempt the import once per process, even if it fails.
 # ---------------------------------------------------------------------------
 
 # The loaded kernel callable, or None if unavailable.
-_BLOCKWISE_3RD_KERNEL = None
-_TRIED_LOADING_BLOCKWISE_3RD_KERNEL = False
+_BLOCKWISE_KERNEL = None
+_TRIED_LOADING_BLOCKWISE_KERNEL = False
 
 # Tuning metadata: the namedtuple class, the runtime query function, and
-# the static lookup table, all from the third-party tuned_block_sizes module.
-_BLOCKWISE_3RD_TUNED_VALUE_CLS = None  # e.g. TunedValue namedtuple class
-_BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES = None  # e.g. get_tuned_block_sizes()
-_BLOCKWISE_3RD_TUNED_BLOCK_SIZES = None  # e.g. TUNED_BLOCK_SIZES dict
-_TRIED_LOADING_BLOCKWISE_3RD_TUNING = False
+# the static lookup table from the tuned_block_sizes module.
+_BLOCKWISE_TUNED_VALUE_CLS = None  # e.g. TunedValue namedtuple class
+_BLOCKWISE_GET_TUNED_BLOCK_SIZES = None  # e.g. get_tuned_block_sizes()
+_BLOCKWISE_TUNED_BLOCK_SIZES = None  # e.g. TUNED_BLOCK_SIZES dict
+_TRIED_LOADING_BLOCKWISE_TUNING = False
 
 
-def get_blockwise_3rd_kernel():
-    """Lazily load the third-party blockwise kernel implementation."""
-    global _BLOCKWISE_3RD_KERNEL, _TRIED_LOADING_BLOCKWISE_3RD_KERNEL
+def get_blockwise_kernel():
+    """Lazily load the blockwise kernel implementation."""
+    global _BLOCKWISE_KERNEL, _TRIED_LOADING_BLOCKWISE_KERNEL
 
-    if _TRIED_LOADING_BLOCKWISE_3RD_KERNEL:
-        return _BLOCKWISE_3RD_KERNEL
-    _TRIED_LOADING_BLOCKWISE_3RD_KERNEL = True
+    if _TRIED_LOADING_BLOCKWISE_KERNEL:
+        return _BLOCKWISE_KERNEL
+    _TRIED_LOADING_BLOCKWISE_KERNEL = True
 
     try:
         package = __package__ or "sgl_jax.srt.kernels.quantized_matmul"
-        module = importlib.import_module(f"{package}.3rd_quantized_matmul")
-        _BLOCKWISE_3RD_KERNEL = getattr(module, "quantized_matmul", None)
+        module = importlib.import_module(f"{package}.quantized_matmul_kernels")
+        _BLOCKWISE_KERNEL = getattr(module, "quantized_matmul", None)
     except Exception:
         logger.debug(
-            "Failed to import third-party blockwise quantized matmul kernel.", exc_info=True
+            "Failed to import blockwise quantized matmul kernel.", exc_info=True
         )
-        _BLOCKWISE_3RD_KERNEL = None
-    return _BLOCKWISE_3RD_KERNEL
+        _BLOCKWISE_KERNEL = None
+    return _BLOCKWISE_KERNEL
 
 
-def _get_blockwise_3rd_tuning_api():
-    """Lazily load third-party tuned-size helpers for blockwise kernel."""
-    global _BLOCKWISE_3RD_TUNED_VALUE_CLS
-    global _BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES
-    global _BLOCKWISE_3RD_TUNED_BLOCK_SIZES
-    global _TRIED_LOADING_BLOCKWISE_3RD_TUNING
+def _get_blockwise_tuning_api():
+    """Lazily load tuned-size helpers for the blockwise kernel."""
+    global _BLOCKWISE_TUNED_VALUE_CLS
+    global _BLOCKWISE_GET_TUNED_BLOCK_SIZES
+    global _BLOCKWISE_TUNED_BLOCK_SIZES
+    global _TRIED_LOADING_BLOCKWISE_TUNING
 
-    if _TRIED_LOADING_BLOCKWISE_3RD_TUNING:
+    if _TRIED_LOADING_BLOCKWISE_TUNING:
         return (
-            _BLOCKWISE_3RD_TUNED_VALUE_CLS,
-            _BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES,
-            _BLOCKWISE_3RD_TUNED_BLOCK_SIZES,
+            _BLOCKWISE_TUNED_VALUE_CLS,
+            _BLOCKWISE_GET_TUNED_BLOCK_SIZES,
+            _BLOCKWISE_TUNED_BLOCK_SIZES,
         )
-    _TRIED_LOADING_BLOCKWISE_3RD_TUNING = True
+    _TRIED_LOADING_BLOCKWISE_TUNING = True
 
     try:
         package = __package__ or "sgl_jax.srt.kernels.quantized_matmul"
-        module = importlib.import_module(f"{package}.3rd_quantized_matmul.tuned_block_sizes")
-        _BLOCKWISE_3RD_TUNED_VALUE_CLS = getattr(module, "TunedValue", None)
-        _BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES = getattr(module, "get_tuned_block_sizes", None)
-        _BLOCKWISE_3RD_TUNED_BLOCK_SIZES = getattr(module, "TUNED_BLOCK_SIZES", None)
+        module = importlib.import_module(f"{package}.quantized_matmul_kernels.tuned_block_sizes")
+        _BLOCKWISE_TUNED_VALUE_CLS = getattr(module, "TunedValue", None)
+        _BLOCKWISE_GET_TUNED_BLOCK_SIZES = getattr(module, "get_tuned_block_sizes", None)
+        _BLOCKWISE_TUNED_BLOCK_SIZES = getattr(module, "TUNED_BLOCK_SIZES", None)
     except Exception:
-        logger.debug("Failed to import third-party blockwise tuning metadata.", exc_info=True)
-        _BLOCKWISE_3RD_TUNED_VALUE_CLS = None
-        _BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES = None
-        _BLOCKWISE_3RD_TUNED_BLOCK_SIZES = None
+        logger.debug("Failed to import blockwise tuning metadata.", exc_info=True)
+        _BLOCKWISE_TUNED_VALUE_CLS = None
+        _BLOCKWISE_GET_TUNED_BLOCK_SIZES = None
+        _BLOCKWISE_TUNED_BLOCK_SIZES = None
 
     return (
-        _BLOCKWISE_3RD_TUNED_VALUE_CLS,
-        _BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES,
-        _BLOCKWISE_3RD_TUNED_BLOCK_SIZES,
+        _BLOCKWISE_TUNED_VALUE_CLS,
+        _BLOCKWISE_GET_TUNED_BLOCK_SIZES,
+        _BLOCKWISE_TUNED_BLOCK_SIZES,
     )
 
 
@@ -128,7 +128,7 @@ def _floor_multiple(x: int, m: int) -> int:
 def _nearest_power_of_two_multiple(x: int, base: int, upper_bound: int) -> int:
     """Snap ``x`` to a nearby power-of-two multiple of ``base``.
 
-    The imported TPU blockwise kernel is more reliable with tile sizes that are
+    The TPU blockwise kernel is more reliable with tile sizes that are
     aligned to the compute tile width. This helper keeps the candidate near the
     requested value while respecting the local matrix bound.
     """
@@ -217,7 +217,7 @@ def _iter_blockwise_tuned_candidates(
     return [value for _, value in candidates]
 
 
-def should_use_3rd_party_blockwise_kernel(
+def should_use_blockwise_kernel(
     *,
     out_dim: int,
     block_size_out: int,
@@ -225,26 +225,25 @@ def should_use_3rd_party_blockwise_kernel(
     """Guard known-bad narrow-N TPU blockwise cases.
 
     When a tensor-parallel column shard collapses to a single output block
-    (for example local N=128 with block_size_out=128), the third-party TPU
-    blockwise kernel can produce NaNs on Qwen3-MoE k/v projections. The local
-    dequantized fallback remains numerically stable for the same inputs.
+    (for example local N=128 with block_size_out=128), the TPU blockwise
+    kernel can produce NaNs on Qwen3-MoE k/v projections.
     """
     return out_dim > block_size_out
 
 
-def convert_block_scale_to_3rd_layout(
+def convert_block_scale_to_kernel_layout(
     w_scale: jax.Array,
     out_dim: int,
     in_dim: int,
     block_size_out: int,
     block_size_in: int,
 ) -> jax.Array:
-    """Convert our block-scale layout to the imported TPU kernel layout.
+    """Convert our block-scale layout to the TPU kernel layout.
 
     The layer/checkpoint-facing format is ``[out_blocks, in_blocks]``.
-    The third-party kernel expects one scale per input block and output
-    channel: ``[in_blocks, 1, n_out]``. We therefore replicate each output
-    block's scale across the channels inside that block before transposing.
+    The kernel expects one scale per input block and output channel:
+    ``[in_blocks, 1, n_out]``. We therefore replicate each output block's
+    scale across the channels inside that block before transposing.
     """
     needed_out_blocks = math.ceil(out_dim / block_size_out)
     needed_in_blocks = math.ceil(in_dim / block_size_in)
@@ -255,7 +254,7 @@ def convert_block_scale_to_3rd_layout(
             f"w_scale.shape={w_scale.shape}, needed=({needed_out_blocks}, {needed_in_blocks})."
         )
 
-    # Third-party kernel expects per-output-channel scales for each input block.
+    # Kernel expects per-output-channel scales for each input block.
     # Replicate each output-block scale value across channels in that output block.
     scale_2d = w_scale[:needed_out_blocks, :needed_in_blocks]
     scale_per_out = jnp.repeat(scale_2d, repeats=block_size_out, axis=0)[:out_dim, :]
@@ -270,7 +269,7 @@ def get_safe_blockwise_tuned_value(
     w_q_dtype: jnp.dtype,
     block_size_in: int,
 ):
-    """Build a safe tuned value for the third-party blockwise kernel on TPU.
+    """Build a safe tuned value for the blockwise kernel on TPU.
 
     Returns a ``TunedValue(batch_block_size, out_block_size, in_block_size,
     n_lane_multiplier)`` whose tile sizes are guaranteed to be valid for the
@@ -278,14 +277,14 @@ def get_safe_blockwise_tuned_value(
 
     Resolution strategy (3-tier fallback):
       1. Search the pre-computed tuning table for a compatible entry.
-      2. Query the third-party ``get_tuned_block_sizes()`` API.
+      2. Query ``get_tuned_block_sizes()`` API at runtime.
       3. Use a conservative default seed ``(128, 128, 128, 1)``.
 
     After obtaining a seed, every dimension is clamped and aligned to the
     local matrix so the kernel launch never exceeds the actual tensor bounds.
     """
     # --- Tier 0: load tuning metadata (lazy, once per process) ---
-    tuned_value_cls, get_tuned_block_sizes, tuned_block_sizes = _get_blockwise_3rd_tuning_api()
+    tuned_value_cls, get_tuned_block_sizes, tuned_block_sizes = _get_blockwise_tuning_api()
     if tuned_value_cls is None:
         return None
 
@@ -302,7 +301,7 @@ def get_safe_blockwise_tuned_value(
     )
     if compatible_candidates:
         tuned = compatible_candidates[0]
-    # --- Tier 2: query the third-party API at runtime ---
+    # --- Tier 2: query the tuning API at runtime ---
     elif get_tuned_block_sizes is not None:
         try:
             tuned = get_tuned_block_sizes(
@@ -314,7 +313,7 @@ def get_safe_blockwise_tuned_value(
             )
         except Exception:
             logger.debug(
-                "Failed to query tuned block sizes from third-party kernel.", exc_info=True
+                "Failed to query tuned block sizes for blockwise kernel.", exc_info=True
             )
             tuned = None
     if tuned is None:

@@ -1,22 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Quantized matmul kernel."""
 
-import logging
 import math
 
 import jax
 import jax.numpy as jnp
 from jax import lax
 
-from sgl_jax.srt.kernels.quantized_matmul.blockwise_3rd_utils import (
-    convert_block_scale_to_3rd_layout,
-    get_blockwise_3rd_kernel,
+from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
+    convert_block_scale_to_kernel_layout,
+    get_blockwise_kernel,
     get_safe_blockwise_tuned_value,
-    should_use_3rd_party_blockwise_kernel,
+    should_use_blockwise_kernel,
 )
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor_simple
-
-logger = logging.getLogger(__name__)
 
 
 def _get_effective_block_sizes(
@@ -48,28 +45,6 @@ def _get_effective_block_sizes(
             f"Invalid block sizes: block_size_out={block_size_out}, block_size_in={block_size_in}."
         )
     return block_size_out, block_size_in
-
-
-def _expand_block_scales_to_weight_shape(
-    w_scale: jax.Array,
-    out_dim: int,
-    in_dim: int,
-    block_size_out: int,
-    block_size_in: int,
-) -> jax.Array:
-    """Expand compact block scales to full ``[n_out, n_in]`` layout.
-
-    This is only used by the local dequantized fallback path. The third-party
-    TPU kernel consumes compact scales directly after a dedicated layout
-    conversion.
-    """
-    out_blocks, in_blocks = w_scale.shape
-
-    row_idx = jnp.arange(out_dim, dtype=jnp.int32) // jnp.int32(block_size_out)
-    col_idx = jnp.arange(in_dim, dtype=jnp.int32) // jnp.int32(block_size_in)
-    row_idx = jnp.clip(row_idx, 0, out_blocks - 1)
-    col_idx = jnp.clip(col_idx, 0, in_blocks - 1)
-    return w_scale[row_idx[:, None], col_idx[None, :]]
 
 
 def xla_quantized_matmul_local(
@@ -115,78 +90,50 @@ def xla_quantized_matmul_local(
             weight_block_size=weight_block_size,
         )
 
-        # Prefer third-party blockwise kernel on TPU. Keep the local dequantized
-        # path as fallback for non-TPU (e.g., CPU/GPU) or unavailable environments.
-        # Fallback to pure JAX dequantization happens if:
-        # 1. We are not on TPU (`jax.default_backend() != "tpu"`).
-        # 2. The 3rd party kernel failed to load (`blockwise_3rd_kernel is None`).
-        # 3. Narrow-N shapes known to cause NaNs in 3rd party kernel are detected (`should_use_3rd_party_blockwise_kernel` returns False).
-        out = None
-        blockwise_3rd_kernel = get_blockwise_3rd_kernel()
-        if (
-            jax.default_backend() == "tpu"
-            and blockwise_3rd_kernel is not None
-            and should_use_3rd_party_blockwise_kernel(
-                out_dim=int(out_dim),
-                block_size_out=int(block_size_out),
+        blockwise_kernel = get_blockwise_kernel()
+        if jax.default_backend() != "tpu":
+            raise RuntimeError(
+                "Block-wise quantized matmul requires TPU backend, "
+                f"but got {jax.default_backend()!r}."
             )
+        if blockwise_kernel is None:
+            raise RuntimeError(
+                "Block-wise quantized matmul requires the blockwise kernel, "
+                "but it failed to load. Please check your installation."
+            )
+        if not should_use_blockwise_kernel(
+            out_dim=int(out_dim),
+            block_size_out=int(block_size_out),
         ):
-            try:
-                w_scale_3rd = convert_block_scale_to_3rd_layout(
-                    w_scale=w_scale,
-                    out_dim=out_dim,
-                    in_dim=in_dim,
-                    block_size_out=block_size_out,
-                    block_size_in=block_size_in,
-                )
-                x_q_dtype = act_quant_dtype if quantize_activation else x.dtype
-                tuned_value = get_safe_blockwise_tuned_value(
-                    n_batch=int(x.shape[0]),
-                    n_out=int(out_dim),
-                    n_in=int(in_dim),
-                    x_q_dtype=x_q_dtype,
-                    w_q_dtype=w_q.dtype,
-                    block_size_in=block_size_in,
-                )
-                out = blockwise_3rd_kernel(
-                    x=x,
-                    w_q=w_q,
-                    w_scale=w_scale_3rd,
-                    block_size=block_size_in,
-                    x_q_dtype=x_q_dtype,
-                    tuned_value=tuned_value,
-                )
-            except Exception:
-                logger.warning(
-                    "Falling back from third-party blockwise kernel to local dequant path.",
-                    exc_info=True,
-                )
-                out = None
-
-        if out is None:
-            scale_expanded = _expand_block_scales_to_weight_shape(
-                w_scale=w_scale,
-                out_dim=out_dim,
-                in_dim=in_dim,
-                block_size_out=block_size_out,
-                block_size_in=block_size_in,
+            raise RuntimeError(
+                f"Block-wise kernel does not support out_dim={out_dim} with "
+                f"block_size_out={block_size_out} (known to cause NaNs)."
             )
-            w_dequant = w_q.astype(compute_dtype) * scale_expanded.astype(compute_dtype)
 
-            if quantize_activation:
-                x_q, x_scale = quantize_tensor_simple(x, act_quant_dtype, dim=-1)
-                lhs = x_q.astype(compute_dtype)
-            else:
-                lhs = x.astype(compute_dtype)
-
-            out = lax.dot_general(
-                lhs,
-                w_dequant,
-                dimension_numbers=(((x.ndim - 1,), (1,)), ((), ())),
-                preferred_element_type=compute_dtype,
-            )
-            if quantize_activation:
-                out = out * x_scale.astype(compute_dtype)
+        w_scale_kernel = convert_block_scale_to_kernel_layout(
+            w_scale=w_scale,
+            out_dim=out_dim,
+            in_dim=in_dim,
+            block_size_out=block_size_out,
+            block_size_in=block_size_in,
+        )
+        x_q_dtype = act_quant_dtype if quantize_activation else x.dtype
+        tuned_value = get_safe_blockwise_tuned_value(
+            n_batch=int(x.shape[0]),
+            n_out=int(out_dim),
+            n_in=int(in_dim),
+            x_q_dtype=x_q_dtype,
+            w_q_dtype=w_q.dtype,
+            block_size_in=block_size_in,
+        )
+        out = blockwise_kernel(
+            x=x,
+            w_q=w_q,
+            w_scale=w_scale_kernel,
+            block_size=block_size_in,
+            x_q_dtype=x_q_dtype,
+            tuned_value=tuned_value,
+        )
 
     else:
         # === Standard Per-Channel Quantization Path ===

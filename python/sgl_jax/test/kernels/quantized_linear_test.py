@@ -9,7 +9,7 @@ import pytest
 from flax import nnx
 from jax.sharding import Mesh
 
-import sgl_jax.srt.kernels.quantized_matmul.blockwise_3rd_utils as blockwise_3rd_utils
+import sgl_jax.srt.kernels.quantized_matmul.blockwise_utils as blockwise_utils
 from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
 from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
@@ -18,8 +18,8 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor,
 )
 
-third_party_quant_util = importlib.import_module(
-    "sgl_jax.srt.kernels.quantized_matmul.3rd_quantized_matmul.util"
+blockwise_quant_util = importlib.import_module(
+    "sgl_jax.srt.kernels.quantized_matmul.quantized_matmul_kernels.util"
 )
 
 
@@ -161,20 +161,20 @@ def _assert_blockwise_tuning_fallback_uses_compatible_seed():
     }
 
     saved_state = {
-        "_TRIED_LOADING_BLOCKWISE_3RD_TUNING": blockwise_3rd_utils._TRIED_LOADING_BLOCKWISE_3RD_TUNING,
-        "_BLOCKWISE_3RD_TUNED_VALUE_CLS": blockwise_3rd_utils._BLOCKWISE_3RD_TUNED_VALUE_CLS,
-        "_BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES": blockwise_3rd_utils._BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES,
-        "_BLOCKWISE_3RD_TUNED_BLOCK_SIZES": blockwise_3rd_utils._BLOCKWISE_3RD_TUNED_BLOCK_SIZES,
+        "_TRIED_LOADING_BLOCKWISE_TUNING": blockwise_utils._TRIED_LOADING_BLOCKWISE_TUNING,
+        "_BLOCKWISE_TUNED_VALUE_CLS": blockwise_utils._BLOCKWISE_TUNED_VALUE_CLS,
+        "_BLOCKWISE_GET_TUNED_BLOCK_SIZES": blockwise_utils._BLOCKWISE_GET_TUNED_BLOCK_SIZES,
+        "_BLOCKWISE_TUNED_BLOCK_SIZES": blockwise_utils._BLOCKWISE_TUNED_BLOCK_SIZES,
     }
-    saved_tpu_version = blockwise_3rd_utils._get_current_tpu_version
+    saved_tpu_version = blockwise_utils._get_current_tpu_version
     try:
-        blockwise_3rd_utils._TRIED_LOADING_BLOCKWISE_3RD_TUNING = True
-        blockwise_3rd_utils._BLOCKWISE_3RD_TUNED_VALUE_CLS = tuned_value_cls
-        blockwise_3rd_utils._BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES = None
-        blockwise_3rd_utils._BLOCKWISE_3RD_TUNED_BLOCK_SIZES = fake_tuned_table
-        blockwise_3rd_utils._get_current_tpu_version = lambda: 6
+        blockwise_utils._TRIED_LOADING_BLOCKWISE_TUNING = True
+        blockwise_utils._BLOCKWISE_TUNED_VALUE_CLS = tuned_value_cls
+        blockwise_utils._BLOCKWISE_GET_TUNED_BLOCK_SIZES = None
+        blockwise_utils._BLOCKWISE_TUNED_BLOCK_SIZES = fake_tuned_table
+        blockwise_utils._get_current_tpu_version = lambda: 6
 
-        tuned = blockwise_3rd_utils.get_safe_blockwise_tuned_value(
+        tuned = blockwise_utils.get_safe_blockwise_tuned_value(
             n_batch=1,
             n_out=256,
             n_in=4096,
@@ -184,8 +184,8 @@ def _assert_blockwise_tuning_fallback_uses_compatible_seed():
         )
     finally:
         for name, value in saved_state.items():
-            setattr(blockwise_3rd_utils, name, value)
-        blockwise_3rd_utils._get_current_tpu_version = saved_tpu_version
+            setattr(blockwise_utils, name, value)
+        blockwise_utils._get_current_tpu_version = saved_tpu_version
 
     assert tuned.batch_block_size == 1
     assert tuned.out_block_size == 256
@@ -359,7 +359,7 @@ def test_validate_inputs_rejects_bad_2d_block_scale():
     bad_scale = jnp.ones((2, 3), dtype=jnp.float32)
 
     with pytest.raises(ValueError, match="w_q.shape\\[0\\].*w_scale.shape\\[1\\]"):
-        third_party_quant_util.validate_inputs(
+        blockwise_quant_util.validate_inputs(
             x=x,
             w_q=w_q,
             w_scale=bad_scale,
