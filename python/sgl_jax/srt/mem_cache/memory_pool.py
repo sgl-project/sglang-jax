@@ -359,12 +359,9 @@ class MHATokenToKVPool(KVCache):
                 self.v_head_dim,
             )
             total_memory_per_layer = (
-                (
-                    k_buffer_shape[0] * k_buffer_shape[1] * k_buffer_shape[2]
-                    + v_buffer_shape[0] * v_buffer_shape[1] * v_buffer_shape[2]
-                )
-                * jnp.dtype(self.dtype).itemsize
-            )
+                k_buffer_shape[0] * k_buffer_shape[1] * k_buffer_shape[2]
+                + v_buffer_shape[0] * v_buffer_shape[1] * v_buffer_shape[2]
+            ) * jnp.dtype(self.dtype).itemsize
         else:
             fused_buffer_shape = (
                 self.size + self.page_size,
@@ -562,7 +559,9 @@ class MHATokenToKVPool(KVCache):
                 kv_partition_axis=self.kv_partition_axis,
             )
 
-    def replace_kv_buffer(self, kv_buffer: list[jax.Array] | list[tuple[jax.Array, jax.Array]]) -> None:
+    def replace_kv_buffer(
+        self, kv_buffer: list[jax.Array] | list[tuple[jax.Array, jax.Array]]
+    ) -> None:
         if self.is_split:
             # Expect list of (k, v) tuples
             for i, (k, v) in enumerate(kv_buffer):

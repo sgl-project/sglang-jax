@@ -382,10 +382,10 @@ class ModelRunner(BaseModelRunner):
 
         # If head dims differ, they are stored separately and each aligned to 128
         if head_dim != v_head_dim:
-             per_token_dim = head_dim_aligned + v_head_dim_aligned
+            per_token_dim = head_dim_aligned + v_head_dim_aligned
         else:
-             # Fused case
-             per_token_dim = head_dim_aligned * 2
+            # Fused case
+            per_token_dim = head_dim_aligned * 2
 
         cell_size = (
             self.model_config.get_num_kv_heads(self.tp_size)
@@ -649,7 +649,7 @@ class ModelRunner(BaseModelRunner):
                 self.token_to_kv_pool.mesh,
                 P(None, self.token_to_kv_pool.kv_partition_axis, None),
             )
-            is_split = getattr(self.token_to_kv_pool, 'is_split', False)
+            is_split = getattr(self.token_to_kv_pool, "is_split", False)
             if is_split:
                 layers_kv_fused = [
                     (jax.device_put(k, target_sharding), jax.device_put(v, target_sharding))
