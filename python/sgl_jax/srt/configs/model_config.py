@@ -127,6 +127,12 @@ class ModelConfig:
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.sliding_window = getattr(self.hf_text_config, "sliding_window", None)
 
+        if not getattr(self.hf_config, "architectures", None):
+            raise ValueError(
+                f"Invalid model config for {model_path!r}: missing `architectures`. "
+                "Check that the model path points to a valid Hugging Face model directory."
+            )
+
         if is_draft_model and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
