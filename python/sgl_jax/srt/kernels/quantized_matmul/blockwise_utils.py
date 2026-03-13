@@ -70,9 +70,7 @@ def get_blockwise_kernel():
         module = importlib.import_module(f"{package}.quantized_matmul_kernels")
         _BLOCKWISE_KERNEL = getattr(module, "quantized_matmul", None)
     except Exception:
-        logger.debug(
-            "Failed to import blockwise quantized matmul kernel.", exc_info=True
-        )
+        logger.debug("Failed to import blockwise quantized matmul kernel.", exc_info=True)
         _BLOCKWISE_KERNEL = None
     return _BLOCKWISE_KERNEL
 
@@ -312,9 +310,7 @@ def get_safe_blockwise_tuned_value(
                 w_q_dtype=jnp.dtype(w_q_dtype).name,
             )
         except Exception:
-            logger.debug(
-                "Failed to query tuned block sizes for blockwise kernel.", exc_info=True
-            )
+            logger.debug("Failed to query tuned block sizes for blockwise kernel.", exc_info=True)
             tuned = None
     if tuned is None:
         # --- Tier 3: conservative default seed ---
