@@ -49,6 +49,10 @@ logger = logging.getLogger(__name__)
 _BLOCKWISE_3RD_KERNEL = None
 _TRIED_LOADING_BLOCKWISE_3RD_KERNEL = False
 
+# Per-channel kernel callable (from 3rd_quantized_matmul/kernel.py).
+_PERCHANNEL_3RD_KERNEL = None
+_TRIED_LOADING_PERCHANNEL_3RD_KERNEL = False
+
 # Tuning metadata: the namedtuple class, the runtime query function, and
 # the static lookup table, all from the third-party tuned_block_sizes module.
 _BLOCKWISE_3RD_TUNED_VALUE_CLS = None  # e.g. TunedValue namedtuple class
@@ -71,10 +75,38 @@ def get_blockwise_3rd_kernel():
         _BLOCKWISE_3RD_KERNEL = getattr(module, "quantized_matmul", None)
     except Exception:
         logger.debug(
-            "Failed to import third-party blockwise quantized matmul kernel.", exc_info=True
+            "Failed to import third-party blockwise quantized matmul kernel.",
+            exc_info=True,
         )
         _BLOCKWISE_3RD_KERNEL = None
     return _BLOCKWISE_3RD_KERNEL
+
+
+def get_perchannel_3rd_kernel():
+    """Lazily load the third-party per-channel kernel implementation.
+
+    This kernel (from ``3rd_quantized_matmul/kernel.py``) is optimized for
+    per-channel quantization: it accumulates in int32 across the full K
+    dimension and applies a single 1D scale ``[n_out]`` at the end, which
+    gives better precision than the blockwise kernel for per-channel cases.
+    """
+    global _PERCHANNEL_3RD_KERNEL, _TRIED_LOADING_PERCHANNEL_3RD_KERNEL
+
+    if _TRIED_LOADING_PERCHANNEL_3RD_KERNEL:
+        return _PERCHANNEL_3RD_KERNEL
+    _TRIED_LOADING_PERCHANNEL_3RD_KERNEL = True
+
+    try:
+        package = __package__ or "sgl_jax.srt.kernels.quantized_matmul"
+        module = importlib.import_module(f"{package}.3rd_quantized_matmul.kernel")
+        _PERCHANNEL_3RD_KERNEL = getattr(module, "quantized_matmul_kernel", None)
+    except Exception:
+        logger.debug(
+            "Failed to import third-party per-channel quantized matmul kernel.",
+            exc_info=True,
+        )
+        _PERCHANNEL_3RD_KERNEL = None
+    return _PERCHANNEL_3RD_KERNEL
 
 
 def _get_blockwise_3rd_tuning_api():
@@ -94,12 +126,18 @@ def _get_blockwise_3rd_tuning_api():
 
     try:
         package = __package__ or "sgl_jax.srt.kernels.quantized_matmul"
-        module = importlib.import_module(f"{package}.3rd_quantized_matmul.tuned_block_sizes")
+        module = importlib.import_module(
+            f"{package}.3rd_quantized_matmul.tuned_block_sizes"
+        )
         _BLOCKWISE_3RD_TUNED_VALUE_CLS = getattr(module, "TunedValue", None)
-        _BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES = getattr(module, "get_tuned_block_sizes", None)
+        _BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES = getattr(
+            module, "get_tuned_block_sizes", None
+        )
         _BLOCKWISE_3RD_TUNED_BLOCK_SIZES = getattr(module, "TUNED_BLOCK_SIZES", None)
     except Exception:
-        logger.debug("Failed to import third-party blockwise tuning metadata.", exc_info=True)
+        logger.debug(
+            "Failed to import third-party blockwise tuning metadata.", exc_info=True
+        )
         _BLOCKWISE_3RD_TUNED_VALUE_CLS = None
         _BLOCKWISE_3RD_GET_TUNED_BLOCK_SIZES = None
         _BLOCKWISE_3RD_TUNED_BLOCK_SIZES = None
@@ -285,7 +323,9 @@ def get_safe_blockwise_tuned_value(
     local matrix so the kernel launch never exceeds the actual tensor bounds.
     """
     # --- Tier 0: load tuning metadata (lazy, once per process) ---
-    tuned_value_cls, get_tuned_block_sizes, tuned_block_sizes = _get_blockwise_3rd_tuning_api()
+    tuned_value_cls, get_tuned_block_sizes, tuned_block_sizes = (
+        _get_blockwise_3rd_tuning_api()
+    )
     if tuned_value_cls is None:
         return None
 
@@ -314,7 +354,8 @@ def get_safe_blockwise_tuned_value(
             )
         except Exception:
             logger.debug(
-                "Failed to query tuned block sizes from third-party kernel.", exc_info=True
+                "Failed to query tuned block sizes from third-party kernel.",
+                exc_info=True,
             )
             tuned = None
     if tuned is None:
@@ -338,7 +379,9 @@ def get_safe_blockwise_tuned_value(
 
     # out (N): round up to compute_tile_n, cap to matrix N, then snap to
     # nearest power-of-two multiple for TPU alignment.
-    out_block_size = _next_multiple(max(int(tuned.out_block_size), compute_tile_n), compute_tile_n)
+    out_block_size = _next_multiple(
+        max(int(tuned.out_block_size), compute_tile_n), compute_tile_n
+    )
     out_block_size = min(out_block_size, _floor_multiple(int(n_out), compute_tile_n))
     out_block_size = _nearest_power_of_two_multiple(
         out_block_size,
@@ -351,4 +394,6 @@ def get_safe_blockwise_tuned_value(
     in_block_size = _next_multiple(in_block_size, int(block_size_in))
     in_block_size = min(in_block_size, _floor_multiple(int(n_in), int(block_size_in)))
 
-    return tuned_value_cls(batch_block_size, out_block_size, in_block_size, n_lane_multiplier)
+    return tuned_value_cls(
+        batch_block_size, out_block_size, in_block_size, n_lane_multiplier
+    )

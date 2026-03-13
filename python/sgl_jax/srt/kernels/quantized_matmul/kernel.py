@@ -11,6 +11,7 @@ from jax import lax
 from sgl_jax.srt.kernels.quantized_matmul.blockwise_3rd_utils import (
     convert_block_scale_to_3rd_layout,
     get_blockwise_3rd_kernel,
+    get_perchannel_3rd_kernel,
     get_safe_blockwise_tuned_value,
     should_use_3rd_party_blockwise_kernel,
 )
@@ -34,7 +35,9 @@ def _get_effective_block_sizes(
     out_blocks, in_blocks = w_scale.shape
 
     if weight_block_size is not None:
-        block_size_out, block_size_in = int(weight_block_size[0]), int(weight_block_size[1])
+        block_size_out, block_size_in = int(weight_block_size[0]), int(
+            weight_block_size[1]
+        )
     else:
         if out_blocks <= 0 or in_blocks <= 0:
             raise ValueError(
@@ -101,7 +104,9 @@ def xla_quantized_matmul_local(
     """
     out_dtype = x.dtype
     compute_dtype = jnp.float32 if compute_dtype is None else compute_dtype
-    act_quant_dtype = w_q.dtype if activation_quant_dtype is None else activation_quant_dtype
+    act_quant_dtype = (
+        w_q.dtype if activation_quant_dtype is None else activation_quant_dtype
+    )
 
     # w_scale.ndim == 2 implies block-wise quantization
     is_block_quant = w_scale.ndim == 2
@@ -190,27 +195,51 @@ def xla_quantized_matmul_local(
 
     else:
         # === Standard Per-Channel Quantization Path ===
-        if quantize_activation:
-            x_q, x_scale = quantize_tensor_simple(x, act_quant_dtype, dim=-1)
-            out = lax.dot_general(
-                x_q,
-                w_q,
-                dimension_numbers=(((1,), (1,)), ((), ())),
-                preferred_element_type=compute_dtype,
-            )
-            out = (
-                out.astype(compute_dtype)
-                * x_scale.astype(compute_dtype)
-                * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
-            )
-        else:
-            out = lax.dot_general(
-                x,
-                w_q,
-                dimension_numbers=(((1,), (1,)), ((), ())),
-                preferred_element_type=compute_dtype,
-            )
-            out = out.astype(compute_dtype) * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
+        # Prefer third-party per-channel kernel on TPU. It accumulates in int32
+        # across the full K dimension for better precision, then applies the 1D
+        # scale at the end. Falls back to pure JAX if unavailable.
+        out = None
+        perchannel_3rd_kernel = get_perchannel_3rd_kernel()
+        if jax.default_backend() == "tpu" and perchannel_3rd_kernel is not None:
+            try:
+                x_q_dtype = act_quant_dtype if quantize_activation else x.dtype
+                out = perchannel_3rd_kernel(
+                    x=x,
+                    w_q=w_q,
+                    w_scale=w_scale,
+                    x_q_dtype=x_q_dtype,
+                )
+            except Exception:
+                logger.warning(
+                    "Falling back from third-party per-channel kernel to JAX path.",
+                    exc_info=True,
+                )
+                out = None
+
+        if out is None:
+            if quantize_activation:
+                x_q, x_scale = quantize_tensor_simple(x, act_quant_dtype, dim=-1)
+                out = lax.dot_general(
+                    x_q,
+                    w_q,
+                    dimension_numbers=(((1,), (1,)), ((), ())),
+                    preferred_element_type=compute_dtype,
+                )
+                out = (
+                    out.astype(compute_dtype)
+                    * x_scale.astype(compute_dtype)
+                    * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
+                )
+            else:
+                out = lax.dot_general(
+                    x,
+                    w_q,
+                    dimension_numbers=(((1,), (1,)), ((), ())),
+                    preferred_element_type=compute_dtype,
+                )
+                out = out.astype(compute_dtype) * jnp.expand_dims(w_scale, 0).astype(
+                    compute_dtype
+                )
 
     out = out.astype(out_dtype)
     # Sum partial results across devices (single all-reduce)
