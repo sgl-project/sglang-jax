@@ -17,6 +17,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_split import (
+    ragged_paged_attention_split,
+)
 from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes import (
     get_tuned_block_sizes,
 )
@@ -25,9 +28,6 @@ from sgl_jax.srt.kernels.ragged_paged_attention.util import (
     cdiv,
     get_dtype_bitwidth,
     get_dtype_packing,
-)
-from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_split import (
-    ragged_paged_attention_split,
 )
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
@@ -1370,7 +1370,9 @@ def ragged_paged_attention(
     queries: jax.Array,  # [padded_num_tokens, actual_num_q_heads, actual_head_dim]
     keys: jax.Array,  # [padded_num_tokens, actual_num_kv_heads, actual_head_dim]
     values: jax.Array,  # [padded_num_tokens, actual_num_kv_heads, actual_head_dim]
-    kv_cache_fused: jax.Array | None,  # [total_num_pages, page_size, actual_num_kv_heads * 2, actual_head_dim]
+    kv_cache_fused: (
+        jax.Array | None
+    ),  # [total_num_pages, page_size, actual_num_kv_heads * 2, actual_head_dim]
     kv_lens: jax.Array,  # i32[padded_batch_size]
     page_indices: jax.Array,  # i32[(padded_batch_size * model_context_len + page_size - 1) // page_size]
     cu_q_lens: jax.Array,  # i32[padded_batch_size + 1]
@@ -1399,12 +1401,27 @@ def ragged_paged_attention(
     """Ragged paged attention that supports mixed prefill and decode with fused or split KV cache."""
     if k_cache is not None and v_cache is not None:
         return ragged_paged_attention_split(
-            queries, keys, values, k_cache, v_cache,
-            kv_lens, page_indices, cu_q_lens, cu_kv_lens, distribution, custom_mask,
-            causal=causal, sm_scale=sm_scale, sliding_window=sliding_window,
-            soft_cap=soft_cap, mask_value=mask_value,
-            q_scale=q_scale, k_scale=k_scale, v_scale=v_scale,
-            xai_temperature_len=xai_temperature_len, chunk_prefill_size=chunk_prefill_size,
+            queries,
+            keys,
+            values,
+            k_cache,
+            v_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            distribution,
+            custom_mask,
+            causal=causal,
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            mask_value=mask_value,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            xai_temperature_len=xai_temperature_len,
+            chunk_prefill_size=chunk_prefill_size,
             num_kv_pages_per_block=num_kv_pages_per_block,
             num_queries_per_block=num_queries_per_block,
             vmem_limit_bytes=vmem_limit_bytes,

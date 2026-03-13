@@ -283,9 +283,9 @@ def create_split_test_data(
         positions=np.asarray(positions),
         cache_loc=np.asarray(cache_loc),
         extend_seq_lens=np.asarray(extend_seq_lens) if extend_seq_lens is not None else None,
-        extend_prefix_lens=np.asarray(extend_prefix_lens)
-        if extend_prefix_lens is not None
-        else None,
+        extend_prefix_lens=(
+            np.asarray(extend_prefix_lens) if extend_prefix_lens is not None else None
+        ),
         return_logprob=False,
         return_output_logprob_only=False,
         top_logprobs_nums=None,
@@ -347,9 +347,7 @@ class TestSplitKernelAttention(CustomTestCase):
         v_pages = v.reshape(-1, page_size, num_kv_heads, head_dim)
 
         # Build 2D page_table [batch, pages_per_seq]
-        cache_start = jnp.concatenate(
-            [jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(aligned_seq_lens)]
-        )
+        cache_start = jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(aligned_seq_lens)])
         padding_size = 4096
         cache_loc_flat = []
         current_pos = 0
@@ -365,9 +363,7 @@ class TestSplitKernelAttention(CustomTestCase):
             start = cache_start[i]
             end = start + seq_lens[i]
             pages = unique_in_original_order(cache_loc_jnp[start:end] // page_size)
-            page_table_list.append(
-                jnp.pad(pages.astype(jnp.int32), (0, padding_size - len(pages)))
-            )
+            page_table_list.append(jnp.pad(pages.astype(jnp.int32), (0, padding_size - len(pages))))
         page_table = jnp.stack(page_table_list)
 
         q_lens = jnp.array([q_len for q_len, _ in lens], dtype=jnp.int32)
@@ -377,19 +373,34 @@ class TestSplitKernelAttention(CustomTestCase):
 
         out_split = ref_split_attention(
             q.reshape(q.shape[0], num_heads, head_dim),
-            k_pages, v_pages, seq_lens, page_table, cu_q_lens, num_seqs,
-            causal=True, sm_scale=sm_scale,
+            k_pages,
+            v_pages,
+            seq_lens,
+            page_table,
+            cu_q_lens,
+            num_seqs,
+            causal=True,
+            sm_scale=sm_scale,
         )
         out_fused = ref_ragged_paged_attention(
             q.reshape(q.shape[0], num_heads, head_dim),
-            k_pages, v_pages, seq_lens, page_table, cu_q_lens, num_seqs,
-            causal=True, sm_scale=sm_scale,
+            k_pages,
+            v_pages,
+            seq_lens,
+            page_table,
+            cu_q_lens,
+            num_seqs,
+            causal=True,
+            sm_scale=sm_scale,
         )
 
         np.testing.assert_allclose(
-            np.asarray(out_split), np.asarray(out_fused), rtol=0, atol=0,
+            np.asarray(out_split),
+            np.asarray(out_fused),
+            rtol=0,
+            atol=0,
             err_msg="ref_split_attention should be bit-identical to ref_ragged_paged_attention "
-                    "when head_dim == v_head_dim",
+            "when head_dim == v_head_dim",
         )
 
     def run_kernel_test(self, mode, lens, num_heads, head_dim, num_kv_heads, v_head_dim, page_size):
@@ -462,9 +473,7 @@ class TestSplitKernelAttention(CustomTestCase):
         padding_size = 4096
         page_table_list = []
         cache_loc_jnp = jnp.array(cache_loc, dtype=jnp.int32)
-        cache_start = jnp.concatenate(
-            [jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(aligned_seq_lens)]
-        )
+        cache_start = jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(aligned_seq_lens)])
         for i in range(batch_size):
             start = cache_start[i]
             end = start + seq_lens[i]
@@ -502,7 +511,12 @@ class TestSplitKernelAttention(CustomTestCase):
             P(None, kv_part),
             P(None, None, kv_part, None),
             P(None, None, kv_part, None),
-            P(), P(), P(), P(), P(), P(),
+            P(),
+            P(),
+            P(),
+            P(),
+            P(),
+            P(),
         )
         out_specs = (
             P(None, kv_part),
@@ -533,8 +547,18 @@ class TestSplitKernelAttention(CustomTestCase):
             return result, updated_k, updated_v
 
         @jax.jit
-        def run_kernel(q, extend_k, extend_v, k_pages, v_pages, seq_lens_j, page_indices_j,
-                       cu_q_lens_j, cu_kv_lens_j, distribution_j):
+        def run_kernel(
+            q,
+            extend_k,
+            extend_v,
+            k_pages,
+            v_pages,
+            seq_lens_j,
+            page_indices_j,
+            cu_q_lens_j,
+            cu_kv_lens_j,
+            distribution_j,
+        ):
             attn_output, updated_k, updated_v = jax.shard_map(
                 _split_kernel,
                 in_specs=in_specs,
@@ -559,8 +583,16 @@ class TestSplitKernelAttention(CustomTestCase):
         q_shard = jax.device_put(q, sharding)
 
         jax_output, _, _ = run_kernel(
-            q_shard, extend_k, extend_v, k_pages, v_pages,
-            seq_lens_jnp, page_indices_jnp, cu_q_lens_jnp, cu_kv_lens_jnp, distribution_jnp,
+            q_shard,
+            extend_k,
+            extend_v,
+            k_pages,
+            v_pages,
+            seq_lens_jnp,
+            page_indices_jnp,
+            cu_q_lens_jnp,
+            cu_kv_lens_jnp,
+            distribution_jnp,
         )
         jax.block_until_ready(jax_output)
 
@@ -575,8 +607,10 @@ class TestSplitKernelAttention(CustomTestCase):
         max_diff = np.max(diff)
 
         print(f"\n=== Split Kernel Test: {mode} ===")
-        print(f"num_heads={num_heads}, num_kv_heads={num_kv_heads}, "
-              f"head_dim={head_dim}, v_head_dim={v_head_dim}, page_size={page_size}")
+        print(
+            f"num_heads={num_heads}, num_kv_heads={num_kv_heads}, "
+            f"head_dim={head_dim}, v_head_dim={v_head_dim}, page_size={page_size}"
+        )
         print(f"JAX output shape: {jax_flat.shape}, Expected shape: {expected_flat.shape}")
         print(f"Max difference: {float(max_diff):.6f}")
 
@@ -591,7 +625,11 @@ class TestSplitKernelAttention(CustomTestCase):
         self.run_kernel_test(
             mode="prefill",
             lens=[(1, 128), (64, 64), (128, 256)],
-            num_heads=16, head_dim=256, num_kv_heads=16, v_head_dim=128, page_size=1,
+            num_heads=16,
+            head_dim=256,
+            num_kv_heads=16,
+            v_head_dim=128,
+            page_size=1,
         )
 
     def test_split_kernel_decode_ps1(self):
@@ -599,7 +637,11 @@ class TestSplitKernelAttention(CustomTestCase):
         self.run_kernel_test(
             mode="decode",
             lens=[(1, 119), (1, 128), (1, 256)],
-            num_heads=16, head_dim=256, num_kv_heads=16, v_head_dim=128, page_size=1,
+            num_heads=16,
+            head_dim=256,
+            num_kv_heads=16,
+            v_head_dim=128,
+            page_size=1,
         )
 
     def test_split_kernel_gqa_prefill_ps1(self):
@@ -607,7 +649,11 @@ class TestSplitKernelAttention(CustomTestCase):
         self.run_kernel_test(
             mode="prefill",
             lens=[(1, 128), (125, 125), (64, 256)],
-            num_heads=16, head_dim=256, num_kv_heads=8, v_head_dim=128, page_size=1,
+            num_heads=16,
+            head_dim=256,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=1,
         )
 
     def test_split_kernel_gqa_decode_ps1(self):
@@ -615,7 +661,11 @@ class TestSplitKernelAttention(CustomTestCase):
         self.run_kernel_test(
             mode="decode",
             lens=[(1, 127), (1, 128), (1, 512)],
-            num_heads=16, head_dim=256, num_kv_heads=8, v_head_dim=128, page_size=1,
+            num_heads=16,
+            head_dim=256,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=1,
         )
 
     # --- head_dim=192 tests (MLA-style, non-128-aligned) ---
@@ -624,7 +674,11 @@ class TestSplitKernelAttention(CustomTestCase):
         self.run_kernel_test(
             mode="prefill",
             lens=[(1, 128), (64, 64), (128, 256)],
-            num_heads=16, head_dim=192, num_kv_heads=16, v_head_dim=128, page_size=1,
+            num_heads=16,
+            head_dim=192,
+            num_kv_heads=16,
+            v_head_dim=128,
+            page_size=1,
         )
 
     def test_split_kernel_192_decode_ps1(self):
@@ -632,7 +686,11 @@ class TestSplitKernelAttention(CustomTestCase):
         self.run_kernel_test(
             mode="decode",
             lens=[(1, 119), (1, 128), (1, 256)],
-            num_heads=16, head_dim=192, num_kv_heads=16, v_head_dim=128, page_size=1,
+            num_heads=16,
+            head_dim=192,
+            num_kv_heads=16,
+            v_head_dim=128,
+            page_size=1,
         )
 
     def test_split_kernel_192_gqa_prefill_ps1(self):
@@ -640,7 +698,11 @@ class TestSplitKernelAttention(CustomTestCase):
         self.run_kernel_test(
             mode="prefill",
             lens=[(1, 128), (125, 125), (64, 256)],
-            num_heads=16, head_dim=192, num_kv_heads=8, v_head_dim=128, page_size=1,
+            num_heads=16,
+            head_dim=192,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=1,
         )
 
     def test_split_kernel_192_gqa_decode_ps1(self):
@@ -648,7 +710,11 @@ class TestSplitKernelAttention(CustomTestCase):
         self.run_kernel_test(
             mode="decode",
             lens=[(1, 127), (1, 128), (1, 512)],
-            num_heads=16, head_dim=192, num_kv_heads=8, v_head_dim=128, page_size=1,
+            num_heads=16,
+            head_dim=192,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=1,
         )
 
 
@@ -664,11 +730,26 @@ class TestSplitBackendAttention(CustomTestCase):
         self.rng_key = jax.random.PRNGKey(42)
         np.random.seed(42)
 
-    def run_backend_test(self, mode, lens, num_heads, head_dim, num_kv_heads, v_head_dim,
-                         page_size, check_cache=False):
+    def run_backend_test(
+        self,
+        mode,
+        lens,
+        num_heads,
+        head_dim,
+        num_kv_heads,
+        v_head_dim,
+        page_size,
+        check_cache=False,
+    ):
         """Run split KV attention through FlashAttention backend and compare against reference."""
         forward_batch, token_to_kv_pool, q, k, v = create_split_test_data(
-            mode, lens, num_heads, head_dim, num_kv_heads, v_head_dim, page_size,
+            mode,
+            lens,
+            num_heads,
+            head_dim,
+            num_kv_heads,
+            v_head_dim,
+            page_size,
         )
 
         sm_scale = head_dim**-0.5
@@ -739,7 +820,9 @@ class TestSplitBackendAttention(CustomTestCase):
             out = attn(q, k, v, forward_batch, token_to_kv_pool)
             return out
 
-        jax_output, kv_updated = jit_attn(q_shard, extend_k, extend_v, forward_batch, token_to_kv_pool)
+        jax_output, kv_updated = jit_attn(
+            q_shard, extend_k, extend_v, forward_batch, token_to_kv_pool
+        )
         jax.block_until_ready(jax_output)
 
         # Compare attention output
@@ -752,8 +835,10 @@ class TestSplitBackendAttention(CustomTestCase):
         max_diff = np.max(diff)
 
         print(f"\n=== Split Backend Test: {mode} ===")
-        print(f"num_heads={num_heads}, num_kv_heads={num_kv_heads}, "
-              f"head_dim={head_dim}, v_head_dim={v_head_dim}, page_size={page_size}")
+        print(
+            f"num_heads={num_heads}, num_kv_heads={num_kv_heads}, "
+            f"head_dim={head_dim}, v_head_dim={v_head_dim}, page_size={page_size}"
+        )
         print(f"JAX output shape: {jax_flat.shape}, Expected shape: {expected_flat.shape}")
         print(f"Max difference: {float(max_diff):.6f}")
 
@@ -767,8 +852,7 @@ class TestSplitBackendAttention(CustomTestCase):
         self.assertIsInstance(kv_updated, tuple, "Expected (k, v) tuple from split path")
         self.assertEqual(len(kv_updated), 2, "Expected tuple of length 2")
         updated_k, updated_v = kv_updated
-        self.assertEqual(updated_k.shape[-1], head_dim,
-                         f"Updated K head_dim should be {head_dim}")
+        self.assertEqual(updated_k.shape[-1], head_dim, f"Updated K head_dim should be {head_dim}")
 
         if check_cache:
             # After replace_kv_buffer, verify pool data matches
@@ -807,7 +891,11 @@ class TestSplitBackendAttention(CustomTestCase):
         self.run_backend_test(
             mode="prefill",
             lens=[(1, 128), (64, 64), (128, 256)],
-            num_heads=16, head_dim=256, num_kv_heads=16, v_head_dim=128, page_size=1,
+            num_heads=16,
+            head_dim=256,
+            num_kv_heads=16,
+            v_head_dim=128,
+            page_size=1,
         )
 
     def test_split_backend_decode_ps1(self):
@@ -815,7 +903,11 @@ class TestSplitBackendAttention(CustomTestCase):
         self.run_backend_test(
             mode="decode",
             lens=[(1, 119), (1, 128), (1, 256)],
-            num_heads=16, head_dim=256, num_kv_heads=16, v_head_dim=128, page_size=1,
+            num_heads=16,
+            head_dim=256,
+            num_kv_heads=16,
+            v_head_dim=128,
+            page_size=1,
         )
 
     def test_split_backend_gqa_prefill_ps1(self):
@@ -823,7 +915,11 @@ class TestSplitBackendAttention(CustomTestCase):
         self.run_backend_test(
             mode="prefill",
             lens=[(1, 128), (125, 125), (64, 256)],
-            num_heads=16, head_dim=256, num_kv_heads=8, v_head_dim=128, page_size=1,
+            num_heads=16,
+            head_dim=256,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=1,
         )
 
     def test_split_backend_gqa_decode_ps1(self):
@@ -831,7 +927,11 @@ class TestSplitBackendAttention(CustomTestCase):
         self.run_backend_test(
             mode="decode",
             lens=[(1, 127), (1, 128), (1, 512)],
-            num_heads=16, head_dim=256, num_kv_heads=8, v_head_dim=128, page_size=1,
+            num_heads=16,
+            head_dim=256,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=1,
         )
 
     def test_split_backend_cache_update(self):
@@ -839,7 +939,11 @@ class TestSplitBackendAttention(CustomTestCase):
         self.run_backend_test(
             mode="prefill",
             lens=[(64, 128), (32, 64)],
-            num_heads=16, head_dim=256, num_kv_heads=8, v_head_dim=128, page_size=1,
+            num_heads=16,
+            head_dim=256,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=1,
             check_cache=True,
         )
 
@@ -849,7 +953,11 @@ class TestSplitBackendAttention(CustomTestCase):
         self.run_backend_test(
             mode="prefill",
             lens=[(128, 128), (64, 64), (256, 256)],
-            num_heads=16, head_dim=192, num_kv_heads=8, v_head_dim=128, page_size=1,
+            num_heads=16,
+            head_dim=192,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=1,
         )
 
     def test_split_backend_192_prefill_no_prefix_mha(self):
@@ -857,7 +965,11 @@ class TestSplitBackendAttention(CustomTestCase):
         self.run_backend_test(
             mode="prefill",
             lens=[(64, 64), (128, 128)],
-            num_heads=16, head_dim=192, num_kv_heads=16, v_head_dim=128, page_size=1,
+            num_heads=16,
+            head_dim=192,
+            num_kv_heads=16,
+            v_head_dim=128,
+            page_size=1,
         )
 
     def test_split_backend_192_decode(self):
@@ -865,7 +977,11 @@ class TestSplitBackendAttention(CustomTestCase):
         self.run_backend_test(
             mode="decode",
             lens=[(1, 119), (1, 128), (1, 256)],
-            num_heads=16, head_dim=192, num_kv_heads=16, v_head_dim=128, page_size=1,
+            num_heads=16,
+            head_dim=192,
+            num_kv_heads=16,
+            v_head_dim=128,
+            page_size=1,
         )
 
     def test_split_backend_192_gqa_decode(self):
@@ -873,7 +989,11 @@ class TestSplitBackendAttention(CustomTestCase):
         self.run_backend_test(
             mode="decode",
             lens=[(1, 127), (1, 128), (1, 512)],
-            num_heads=16, head_dim=192, num_kv_heads=8, v_head_dim=128, page_size=1,
+            num_heads=16,
+            head_dim=192,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=1,
         )
 
     def test_split_backend_192_prefill_with_prefix(self):
@@ -881,7 +1001,11 @@ class TestSplitBackendAttention(CustomTestCase):
         self.run_backend_test(
             mode="prefill",
             lens=[(1, 128), (125, 125), (64, 256)],
-            num_heads=16, head_dim=192, num_kv_heads=8, v_head_dim=128, page_size=1,
+            num_heads=16,
+            head_dim=192,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=1,
         )
 
 

@@ -446,7 +446,9 @@ class FlashAttention(AttentionBackend):
             Output tensor of shape [total_tokens, hidden_size]
         """
         # Early branch: split KV path when head_dim != v_head_dim
-        is_split = getattr(token_to_kv_pool, 'is_split', False) if token_to_kv_pool is not None else False
+        is_split = (
+            getattr(token_to_kv_pool, "is_split", False) if token_to_kv_pool is not None else False
+        )
         if is_split:
             return self._call_split(q, k, v, layer, forward_batch, token_to_kv_pool, causal)
 
@@ -562,9 +564,7 @@ class FlashAttention(AttentionBackend):
         causal: int = 1,
     ):
         """Split KV cache path: K and V have separate buffers with potentially different head_dim."""
-        k_cache, v_cache = self._get_split_kv_cache(
-            forward_batch, token_to_kv_pool, layer.layer_id
-        )
+        k_cache, v_cache = self._get_split_kv_cache(forward_batch, token_to_kv_pool, layer.layer_id)
 
         scale = (
             1.0 / jnp.sqrt(layer.head_dim)
@@ -580,12 +580,8 @@ class FlashAttention(AttentionBackend):
         num_pages = total_tokens_k // self.page_size
         k_head_dim = k_cache.shape[-1]
         v_head_dim_cache = v_cache.shape[-1]
-        k_cache_paged = k_cache.reshape(
-            num_pages, self.page_size, -1, k_head_dim
-        )
-        v_cache_paged = v_cache.reshape(
-            num_pages, self.page_size, -1, v_head_dim_cache
-        )
+        k_cache_paged = k_cache.reshape(num_pages, self.page_size, -1, k_head_dim)
+        v_cache_paged = v_cache.reshape(num_pages, self.page_size, -1, v_head_dim_cache)
 
         if self.forward_metadata.custom_mask is not None:
             causal = 0
@@ -596,11 +592,11 @@ class FlashAttention(AttentionBackend):
 
         kv_part = self.kv_partition_axis
         in_specs = (
-            P(None, kv_part),                    # q  [tokens, q_heads, head_dim]
-            P(None, kv_part),                    # k  [tokens, kv_heads, k_head_dim]
-            P(None, kv_part),                    # v  [tokens, kv_heads, v_head_dim]
-            P(None, None, kv_part, None),         # k_cache_paged [pages, ps, kv_heads, k_dim]
-            P(None, None, kv_part, None),         # v_cache_paged [pages, ps, kv_heads, v_dim]
+            P(None, kv_part),  # q  [tokens, q_heads, head_dim]
+            P(None, kv_part),  # k  [tokens, kv_heads, k_head_dim]
+            P(None, kv_part),  # v  [tokens, kv_heads, v_head_dim]
+            P(None, None, kv_part, None),  # k_cache_paged [pages, ps, kv_heads, k_dim]
+            P(None, None, kv_part, None),  # v_cache_paged [pages, ps, kv_heads, v_dim]
             P(),  # kv_lens
             P(),  # page_indices
             P(),  # cu_q_lens
@@ -609,9 +605,9 @@ class FlashAttention(AttentionBackend):
             P(),  # custom_mask
         )
         out_specs = (
-            P(None, kv_part),                    # attn output
-            P(None, kv_part, None),              # updated_k 3D
-            P(None, kv_part, None),              # updated_v 3D
+            P(None, kv_part),  # attn output
+            P(None, kv_part, None),  # updated_k 3D
+            P(None, kv_part, None),  # updated_v 3D
         )
 
         def _ragged_paged_attention_with_split_kv(*args):
