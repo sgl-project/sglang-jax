@@ -565,9 +565,8 @@ class MHATokenToKVPool(KVCache):
         if self.is_split:
             # Expect list of (k, v) tuples
             for i, (k, v) in enumerate(kv_buffer):
-                idx = self.start_layer + i
-                self.k_buffer[idx] = k
-                self.v_buffer[idx] = v
+                self.k_buffer[i] = k
+                self.v_buffer[i] = v
         else:
             self.kv_buffer[self.start_layer : self.start_layer + len(kv_buffer)] = kv_buffer
 
