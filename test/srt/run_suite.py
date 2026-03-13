@@ -436,6 +436,7 @@ suites = {
         TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/moe_block_quant_test.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/test_flashattention.py", 20),
+        TestFile("python/sgl_jax/test/test_split_kv_attention.py", 10),
         TestFile("python/sgl_jax/test/test_moe_topk.py", 1),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 10),
         TestFile("python/sgl_jax/test/test_sampler.py", 0.2),
