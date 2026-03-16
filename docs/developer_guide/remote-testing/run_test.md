@@ -111,7 +111,7 @@ You can use the following structured prompt to have the Agent run a complete tes
 > ```
 >
 > **[Objective]**
-> Create a GKE TPU cluster (if one doesn't already exist), deploy the environment, and run the specified test suite on a remote v6e-1 TPU. Use the `exec-remote` skill to handle the full pipeline: `apply-resource` → `deploy-cluster` → `exec-remote`.
+> Create a GKE TPU cluster (name: sglang-jax-agent-tests, if one doesn't already exist), deploy the environment, and run the specified test suite on a remote v6e-1 TPU. Use the `exec-remote` skill to handle the full pipeline: `apply-resource` → `deploy-cluster` → `exec-remote`.
 >
 > **[Style]**
 > Step-by-step automated execution. After `xpk` creates the GKE cluster, poll `gcloud container clusters list` until status is `RUNNING` — do NOT proceed while `RECONCILING` or `PROVISIONING` (deploying in these states causes SSL errors).
@@ -145,7 +145,7 @@ If you only modified a specific module, you can run just the corresponding test 
 > I'm developing SGLang-JAX and need to run a single test file on a remote TPU. The GCP project is `tpu-service-473302`, zone is `asia-northeast1-b`. The test file is `python/sgl_jax/test/test_flashattention.py`, which requires a v6e-1 TPU. The SkyPilot pod config template to use is `docs/developer_guide/remote-testing/config_v6e_1.yaml`.
 >
 > **[Objective]**
-> Run the specified test file on a remote v6e-1 TPU using the `exec-remote` skill. Create the cluster if it doesn't exist.
+> Run the specified test file on a remote v6e-1 TPU using the `exec-remote` skill. Create the cluster(name: sglang-jax-agent-tests) if it doesn't exist.
 >
 > **[Style]**
 > Step-by-step automated execution. Poll cluster status until `RUNNING` before proceeding. If a **new** cluster or node pool was created, enable GCS model storage support before deploying SkyPilot (skip if already configured):
