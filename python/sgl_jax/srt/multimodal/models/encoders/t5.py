@@ -13,6 +13,7 @@ import copy
 import math
 import os
 import glob
+from typing import List, Optional
 
 import jax
 import jax.numpy as jnp
@@ -34,14 +35,17 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 # Utilities
 # =============================================================================
 
+
 def fp16_clamp(x):
     if x.dtype == jnp.float16 and jnp.isinf(x).any():
         clamp = jnp.finfo(x.dtype).max - 1000
         return jax.lax.clamp(x=x, min=-clamp, max=clamp)
     return x
 
+
 def gelu_new(x):
     return 0.5 * x * (1.0 + jnp.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x**3)))
+
 
 def update_decoder_seq_lens(forward_batch: ForwardBatch, dec_ids):
     if hasattr(forward_batch, "decoder_seq_lens"):
@@ -53,7 +57,9 @@ def update_decoder_seq_lens(forward_batch: ForwardBatch, dec_ids):
         forward_batch.extend_seq_alens = jnp.array([dec_len], dtype=jnp.int32)
     forward_batch.positions = jnp.arange(len(dec_ids), dtype=jnp.int32)
 
+
 ACT_FN = {"gelu": jax.nn.gelu, "gelu_new": gelu_new, "relu": jax.nn.relu}
+
 
 def _apply_block_diagonal_mask(scores, q_lens, k_lens, is_causal=False):
     _, q_len, k_len = scores.shape
@@ -79,6 +85,7 @@ def _apply_block_diagonal_mask(scores, q_lens, k_lens, is_causal=False):
 
     return jnp.where(mask[None], scores, jnp.finfo(scores.dtype).min)
 
+
 def relative_position_bucket(rel_pos, bidirectional=True, num_buckets=32, max_distance=128):
     ret = 0
     n = -rel_pos
@@ -99,6 +106,7 @@ def relative_position_bucket(rel_pos, bidirectional=True, num_buckets=32, max_di
 # =============================================================================
 # FFN Modules
 # =============================================================================
+
 
 class T5FFN(nnx.Module):
     def __init__(self, config: T5Config, mesh, dtype=jnp.bfloat16):
@@ -133,6 +141,7 @@ class T5FFN(nnx.Module):
 # =============================================================================
 # Attention Module
 # =============================================================================
+
 
 class T5Attention(nnx.Module):
     def __init__(self, config: T5Config, mesh, dtype=jnp.bfloat16, layer_idx=0, is_cross_attention=False, is_decoder=False, has_relative_attention_bias=False):
@@ -230,6 +239,7 @@ class T5Attention(nnx.Module):
 # Transformer Block & Stack
 # =============================================================================
 
+
 class T5Block(nnx.Module):
     def __init__(self, config: T5Config, mesh, dtype=jnp.bfloat16, layer_idx=0, is_decoder=False, has_relative_attention_bias=False):
         self.is_decoder = is_decoder
@@ -257,6 +267,7 @@ class T5Block(nnx.Module):
         h = self.mlp(self.ln2(x), deterministic=deterministic)
         return fp16_clamp(x + self.drop2(h, deterministic=deterministic)), new_attn_bias
 
+
 class T5Stack(nnx.Module):
     def __init__(self, config: T5Config, mesh, dtype=jnp.bfloat16, is_decoder=False, is_umt5=False):
         self.is_decoder = is_decoder
@@ -279,6 +290,7 @@ class T5Stack(nnx.Module):
 # =============================================================================
 # Weight Mapping Helper
 # =============================================================================
+
 
 def _block_mappings(config, idx, is_decoder, src_prefix, tgt_prefix, has_rel_bias=False):
     s, t = f"{src_prefix}.{idx}", f"{tgt_prefix}.{idx}"

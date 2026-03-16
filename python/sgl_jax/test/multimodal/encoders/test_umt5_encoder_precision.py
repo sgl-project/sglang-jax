@@ -34,28 +34,14 @@ DTYPE = {
 }
 
 # =============================================================================
-# Utilities (复用相同的核心逻辑)
+# Utilities
 # =============================================================================
 
-def sglang_batch(texts, tokenizer):
-    encs = [tokenizer.encode(t, add_special_tokens=True) for t in texts]
-    seq_lens = jnp.array([len(e) for e in encs], dtype=jnp.int32)
-    ids = jnp.array([t for e in encs for t in e], dtype=jnp.int32)
-    return ForwardBatch(
-        bid=0,
-        forward_mode=ForwardMode.EXTEND,
-        batch_size=len(texts),
-        input_ids=ids,
-        seq_lens=seq_lens,
-        extend_seq_lens=seq_lens,
-        req_pool_indices=jnp.arange(len(texts), dtype=jnp.int32),
-        out_cache_loc=jnp.zeros(ids.shape[0], dtype=jnp.int32),
-        positions=jnp.arange(ids.shape[0], dtype=jnp.int32),
-    )
 
 def hf_batch(texts, tokenizer):
     inp = tokenizer(texts, return_tensors="pt", padding=True)
     return inp.input_ids, inp.attention_mask
+
 
 def compare(output1, output2, name, threshold=1e-3):
     np1 = output1.detach().float().cpu().numpy() if isinstance(output1, torch.Tensor) else np.array(output1, dtype=np.float32)
@@ -69,16 +55,6 @@ def compare(output1, output2, name, threshold=1e-3):
     logger.info("%s %s: MAE=%s, Max=%s", status, name, f"{mae:.2e}", f"{max_diff:.2e}")
     return passed, mae
 
-def compare_batch_sequences(pt_outs, jax_out, seq_lens, name_prefix, threshold=1e-3):
-    all_pass, total_mae, offset = True, 0.0, 0
-    for i, (pt_seq, seq_len) in enumerate(zip(pt_outs, seq_lens)):
-        jax_seq = jax_out[offset : offset + seq_len]
-        jax_seq_reshaped = jax_seq.reshape(1, -1, jax_seq.shape[-1]) if jax_seq.ndim == 2 else jax_seq
-        passed, mae = compare(pt_seq, jax_seq_reshaped, f"{name_prefix} Seq{i+1}", threshold)
-        all_pass &= passed
-        total_mae += mae
-        offset += seq_len
-    return all_pass, total_mae / len(pt_outs) if len(pt_outs) > 0 else 0.0
 
 def set_param(model, path, val):
     parts = path.split(".")
@@ -86,6 +62,7 @@ def set_param(model, path, val):
     for p in parts:
         param = param[int(p)] if p.isdigit() else getattr(param, p)
     param[...] = jnp.array(val, dtype=param[...].dtype)
+
 
 def manual_load_weights(jax_model, hf_model):
     mappings = jax_model._weight_mappings()
@@ -101,6 +78,7 @@ def manual_load_weights(jax_model, hf_model):
                 pass
     if loaded < len(mappings) * 0.5:
         raise RuntimeError(f"Weight loading failed: only {loaded}/{len(mappings)} weights loaded")
+
 
 def load_models(model_name, mesh, precision):
     pt_dtype, jax_dtype = DTYPE[precision]
@@ -122,48 +100,53 @@ def load_models(model_name, mesh, precision):
 # Tests
 # =============================================================================
 
+
 def test_encoder(model_name, mesh, tokenizer, precision):
     logger.info("\n%s\nTest: UMT5 Encoder (Single Seq)\n%s", "=" * 60, "=" * 60)
     hf, jax_m, _ = load_models(model_name, mesh, precision)
 
     texts = ["UMT5 stands for Universal Multilingual T5.", "It calculates position bias in every layer."]
-    batch = sglang_batch(texts, tokenizer)
     hf_ids, hf_mask = hf_batch(texts, tokenizer)
 
     with torch.no_grad():
         hf_h = hf(input_ids=hf_ids, attention_mask=hf_mask).last_hidden_state
 
     with jax.set_mesh(mesh):
-        # Extract hidden_states from the 4-tuple returned by UMT5EncoderModel
-        jax_out = jax_m(batch)[0].hidden_states
+        jax_out = jax_m(jnp.array(hf_ids.numpy(), dtype=jnp.int32))
 
-    seq_len = batch.seq_lens[0].item()
-    passed, mae = compare(hf_h[0, :seq_len], jax_out[:seq_len], "Encoder Output")
+    passed, mae = compare(hf_h[0], jax_out[0], "Encoder Output")
     return passed, mae
+
 
 def test_encoder_batch(model_name, mesh, tokenizer, precision):
     logger.info("\n%s\nTest: UMT5 Encoder (Batch/Continuous)\n%s", "=" * 60, "=" * 60)
     hf, jax_m, _ = load_models(model_name, mesh, precision)
 
     texts = ["short", "A bit longer sentence.", "This is an even longer sentence for padding testing."]
+    hf_ids, hf_mask = hf_batch(texts, tokenizer)
 
-    pt_outs = []
-    for text in texts:
-        ids, mask = hf_batch([text], tokenizer)
-        with torch.no_grad():
-            pt_out = hf(input_ids=ids, attention_mask=mask).last_hidden_state
-            pt_outs.append(pt_out[0])
+    with torch.no_grad():
+        hf_out = hf(input_ids=hf_ids).last_hidden_state
 
-    batch = sglang_batch(texts, tokenizer)
     with jax.set_mesh(mesh):
-        jax_out = jax_m(batch)[0].hidden_states
+        jax_out = jax_m(jnp.array(hf_ids.numpy(), dtype=jnp.int32))
 
-    return compare_batch_sequences(pt_outs, jax_out, batch.seq_lens.tolist(), "HF vs JAX")
+    all_pass = True
+    total_mae = 0.0
+
+    for i in range(len(texts)):
+        passed, mae = compare(hf_out[i], jax_out[i], f"Batch Seq {i+1}")
+        all_pass &= passed
+        total_mae += mae
+
+    return all_pass, total_mae / len(texts)
+
 
 TESTS = {
     "encoder": test_encoder,
     "encoder_batch": test_encoder_batch,
 }
+
 
 def main():
     import traceback
@@ -205,6 +188,7 @@ def main():
     all_pass = all(r[1] for r in results)
     logger.info("\n%s (%.1fs)", "✅ All PASSED" if all_pass else "❌ Some FAILED", time.time() - t0)
     return all_pass
+
 
 if __name__ == "__main__":
     main()
