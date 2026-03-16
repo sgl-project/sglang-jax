@@ -25,7 +25,6 @@ from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
-from sgl_jax.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -51,7 +50,7 @@ def update_decoder_seq_lens(forward_batch: ForwardBatch, dec_ids):
     else:
         dec_len = len(dec_ids)
         forward_batch.seq_lens = jnp.array([dec_len], dtype=jnp.int32)
-        forward_batch.extend_seq_lens = jnp.array([dec_len], dtype=jnp.int32)
+        forward_batch.extend_seq_alens = jnp.array([dec_len], dtype=jnp.int32)
     forward_batch.positions = jnp.arange(len(dec_ids), dtype=jnp.int32)
 
 ACT_FN = {"gelu": jax.nn.gelu, "gelu_new": gelu_new, "relu": jax.nn.relu}
@@ -354,13 +353,44 @@ class T5EncoderModel(nnx.Module):
             m.update(_block_mappings(self.config, i, False, "encoder.block", "encoder.blocks", has_rel_bias=True if self.is_umt5 else (i == 0)))
         return m
 
-    def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool=None, logits_metadata=None):
-        x = self.shared(forward_batch.input_ids)
-        hidden = self.encoder(x, forward_batch, token_to_kv_pool, getattr(forward_batch, "deterministic", True))
-        bs = forward_batch.seq_lens.shape[0]
-        dummy = jnp.zeros((bs, self.config.vocab_size), dtype=self.dtype)
-        dummy = jax.sharding.reshard(dummy, NamedSharding(self.mesh, P(None, "tensor")))
-        return LogitsProcessorOutput(next_token_logits=dummy, hidden_states=hidden), [], [], None
+    def __call__(
+        self,
+        input_ids: jax.Array,
+        position_ids: Optional[jax.Array] = None,
+        output_hidden_states: Optional[bool] = None,
+        deterministic: bool = True
+    ):
+        if input_ids.ndim == 1:
+            input_ids = input_ids.reshape(1, -1)
+            if position_ids is not None:
+                position_ids = position_ids.reshape(1, -1)
+
+        batch_size, seq_len = input_ids.shape
+
+        flat_input_ids = input_ids.reshape(-1)
+        seq_lens_array = jnp.full((batch_size,), seq_len, dtype=jnp.int32)
+
+        forward_batch = ForwardBatch(
+            bid=0,
+            forward_mode=0,
+            batch_size=batch_size,
+            input_ids=flat_input_ids,
+            seq_lens=seq_lens_array,
+            extend_seq_lens=seq_lens_array,
+            positions=position_ids.reshape(-1) if position_ids is not None else jnp.tile(jnp.arange(seq_len, dtype=jnp.int32), batch_size),
+            req_pool_indices=jnp.arange(batch_size, dtype=jnp.int32),
+            out_cache_loc=jnp.zeros(flat_input_ids.shape[0], dtype=jnp.int32),
+        )
+
+        x = self.shared(flat_input_ids)
+        flat_hidden = self.encoder(x, forward_batch, token_to_kv_pool=None, deterministic=deterministic)
+
+        hidden_states = flat_hidden.reshape(batch_size, seq_len, self.config.d_model)
+
+        if output_hidden_states:
+            return hidden_states, [hidden_states]
+
+        return hidden_states
 
 
 class UMT5EncoderModel(T5EncoderModel):
