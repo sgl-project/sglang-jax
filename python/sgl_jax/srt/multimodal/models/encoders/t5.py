@@ -5,8 +5,7 @@
 """T5 & UMT5 Encoder model for Multimodal implementations.
 
 This implementation provides a clean, dense-batch forward pass for the T5
-encoder, optimized for extracting text embeddings in multimodal pipelines
-(e.g., SD3, Flux).
+encoder, highly optimized and strictly aligned with SGLang's multimodal runtime.
 """
 
 import glob
@@ -28,13 +27,6 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 # =============================================================================
 # Utilities
 # =============================================================================
-
-
-def fp16_clamp(x):
-    if x.dtype == jnp.float16 and jnp.isinf(x).any():
-        clamp = jnp.finfo(x.dtype).max - 1000
-        return jax.lax.clamp(x=x, min=-clamp, max=clamp)
-    return x
 
 
 def gelu_new(x):
@@ -70,6 +62,8 @@ def relative_position_bucket(rel_pos, bidirectional=True, num_buckets=32, max_di
 
 
 class T5FFN(nnx.Module):
+    """Corresponds to SGLang's T5LayerFF containing T5Dense(Gated)ActDense."""
+
     def __init__(self, config: T5Config, mesh, dtype=jnp.bfloat16):
         mk_linear = lambda in_sz, out_sz, axes: LinearBase(
             in_sz, out_sz, mesh, use_bias=False, kernel_axes=axes, params_dtype=dtype
@@ -90,7 +84,6 @@ class T5FFN(nnx.Module):
             self.wi = mk_linear(config.d_model, config.d_ff, (None, "tensor"))
 
         self.wo = mk_linear(config.d_ff, config.d_model, ("tensor", None))
-        self.dropout = nnx.Dropout(config.dropout_rate)
         self.act = ACT_FN.get(act_str, jax.nn.relu)
 
     def __call__(self, x, deterministic=True):
@@ -98,10 +91,10 @@ class T5FFN(nnx.Module):
         if self.is_gated:
             h0, _ = self.wi_0(x)
             h1, _ = self.wi_1(x)
-            h = self.dropout((self.act(h0) * h1).astype(dtype), deterministic=deterministic)
+            h = (self.act(h0) * h1).astype(dtype)
         else:
             h, _ = self.wi(x)
-            h = self.dropout(self.act(h).astype(dtype), deterministic=deterministic)
+            h = self.act(h).astype(dtype)
         out, _ = self.wo(h)
         return out
 
@@ -142,8 +135,6 @@ class T5Attention(nnx.Module):
                 kernel_axes=(None, "tensor"),
             )
 
-        self.dropout = nnx.Dropout(config.dropout_rate)
-
     def _compute_position_bias(self, seq_len):
         q_pos = jnp.arange(seq_len)
         k_pos = jnp.arange(seq_len)
@@ -169,6 +160,7 @@ class T5Attention(nnx.Module):
         )
         q_h, k_h, v_h = to_heads(q), to_heads(k), to_heads(v)
 
+        # Note: Standard T5 does NOT use softmax scaling (1 / sqrt(d_kv)).
         scores = jnp.einsum("bhqd,bhkd->bhqk", q_h.astype(jnp.float32), k_h.astype(jnp.float32))
 
         # Handle relative position bias
@@ -178,16 +170,27 @@ class T5Attention(nnx.Module):
         if position_bias is not None:
             scores = scores + position_bias[None, ...]
 
-        # Apply standard causal/padding mask (e.g. from tokenizer)
+        # ---------------------------------------------------------------------
+        # Aligned with SGLang: Down-streamed dynamic attention_mask formatting
+        # ---------------------------------------------------------------------
         if attention_mask is not None:
-            scores = scores + attention_mask
+            if attention_mask.ndim == 2:
+                # [B, S] -> [B, 1, 1, S]
+                attn_mask = jnp.expand_dims(attention_mask, axis=(1, 2))
+            elif attention_mask.ndim == 3:
+                # [B, S, S] -> [B, 1, S, S]
+                attn_mask = jnp.expand_dims(attention_mask, axis=1)
+            else:
+                attn_mask = attention_mask
+
+            formatted_mask = jnp.where(attn_mask > 0, 0.0, jnp.finfo(scores.dtype).min)
+            scores = scores + formatted_mask
 
         weights = jax.nn.softmax(scores, axis=-1)
         out = jnp.einsum("bhqk,bhkd->bhqd", weights, v_h.astype(jnp.float32))
 
         out = jnp.transpose(out, (0, 2, 1, 3)).reshape(batch_size, seq_len, self.inner_dim)
-        out = self.dropout(out.astype(dtype), deterministic=deterministic)
-        out, _ = self.o(out)
+        out, _ = self.o(out.astype(dtype))
 
         return out, position_bias
 
@@ -209,7 +212,6 @@ class T5Block(nnx.Module):
             use_scale=True,
         )
         self.self_attn = T5Attention(config, mesh, dtype, has_relative_attention_bias)
-        self.drop1 = nnx.Dropout(config.dropout_rate)
 
         self.ln2 = RMSNorm(
             config.d_model,
@@ -219,18 +221,19 @@ class T5Block(nnx.Module):
             use_scale=True,
         )
         self.mlp = T5FFN(config, mesh, dtype)
-        self.drop2 = nnx.Dropout(config.dropout_rate)
 
     def __call__(self, x, attention_mask=None, position_bias=None, deterministic=True):
-        # Self Attention
+        # Self Attention (strictly aligned with SGLang's T5LayerSelfAttention)
+        normed_x = self.ln1(x)
         h, new_position_bias = self.self_attn(
-            self.ln1(x), attention_mask, position_bias, deterministic=deterministic
+            normed_x, attention_mask, position_bias, deterministic=deterministic
         )
-        x = fp16_clamp(x + self.drop1(h, deterministic=deterministic))
+        x = x + h
 
-        # FFN
-        h = self.mlp(self.ln2(x), deterministic=deterministic)
-        x = fp16_clamp(x + self.drop2(h, deterministic=deterministic))
+        # FFN (strictly aligned with SGLang's T5LayerFF)
+        normed_x2 = self.ln2(x)
+        h = self.mlp(normed_x2, deterministic=deterministic)
+        x = x + h
 
         return x, new_position_bias
 
@@ -252,19 +255,15 @@ class T5Stack(nnx.Module):
             param_dtype=dtype,
             use_scale=True,
         )
-        self.dropout = nnx.Dropout(config.dropout_rate)
 
     def __call__(self, x, attention_mask=None, deterministic=True):
-        x = self.dropout(x, deterministic=deterministic)
         position_bias = None
         for block in self.blocks:
             x, pb = block(x, attention_mask, position_bias, deterministic)
-            if (
-                position_bias is None
-            ):  # In standard T5, only the first layer returns PB to be shared.
+            if position_bias is None:
                 position_bias = pb
 
-        return self.dropout(fp16_clamp(self.final_ln(x)), deterministic=deterministic)
+        return self.final_ln(x)
 
 
 # =============================================================================
@@ -395,16 +394,9 @@ class T5EncoderModel(nnx.Module):
             if attention_mask is not None:
                 attention_mask = attention_mask.reshape(1, -1)
 
-        # Prepare attention_mask for dense batch sequence (HuggingFace style broadcast)
-        extended_attention_mask = None
-        if attention_mask is not None:
-            # [batch_size, seq_len] -> [batch_size, 1, 1, seq_len]
-            extended_attention_mask = (1.0 - attention_mask[:, None, None, :]) * jnp.finfo(
-                jnp.float32
-            ).min
-
         x = self.shared(input_ids)
-        hidden_states = self.encoder(x, extended_attention_mask, deterministic=deterministic)
+        # SGLang alignment: Pass unprocessed attention_mask directly down
+        hidden_states = self.encoder(x, attention_mask, deterministic=deterministic)
 
         return BaseEncoderOutput(last_hidden_state=hidden_states)
 

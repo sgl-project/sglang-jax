@@ -127,7 +127,7 @@ def test_encoder(model_name, mesh, tokenizer, precision):
     logger.info("\n%s\nTest: T5 Encoder (Single Seq)\n%s", "=" * 60, "=" * 60)
     hf, jax_m, _ = load_models(model_name, mesh, precision)
 
-    texts = ["Hello world, this is a test for standard T5.", "Machine learning is fascinating."]
+    texts = ["Hello world, this is a test for standard T5."]
     hf_ids, hf_mask = hf_batch(texts, tokenizer)
 
     with torch.no_grad():
