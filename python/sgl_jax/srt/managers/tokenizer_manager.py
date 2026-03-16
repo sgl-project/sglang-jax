@@ -75,7 +75,6 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 logger = logging.getLogger(__name__)
 TTFT_TRACE = get_bool_env_var("SGLANG_JAX_TTFT_TRACE")
-HEALTH_CHECK_RID_PREFIX = "HEALTH_CHECK_"
 
 
 @dataclasses.dataclass
@@ -970,8 +969,7 @@ class TokenizerManager:
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
-                log_fn = logger.debug if rid.startswith(HEALTH_CHECK_RID_PREFIX) else logger.error
-                log_fn(
+                logger.error(
                     "Received output for rid=%s but the state was deleted in TokenizerManager.",
                     rid,
                 )
@@ -1248,15 +1246,7 @@ class TokenizerManager:
             self.crash_dump_request_list.popleft()
 
     def _handle_abort_req(self, recv_obj):
-        state = self.rid_to_state.get(recv_obj.rid)
-        if state is None:
-            log_fn = (
-                logger.debug
-                if recv_obj.rid is not None and recv_obj.rid.startswith(HEALTH_CHECK_RID_PREFIX)
-                else logger.warning
-            )
-            log_fn("Ignoring abort for unknown rid=%s", recv_obj.rid)
-            return
+        state = self.rid_to_state[recv_obj.rid]
         state.finished = True
         state.out_list.append(
             {
@@ -1272,7 +1262,7 @@ class TokenizerManager:
                 },
             }
         )
-        self._notify_state_event(state)
+        state.event.set()
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(

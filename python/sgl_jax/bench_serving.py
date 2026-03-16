@@ -428,6 +428,7 @@ async def async_request_sglang_generate(
                     output.latency = latency
                     output.output_len = output_len
 
+                    print(f"[response] {response=}")
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -1245,7 +1246,6 @@ async def benchmark(
     pd_separated: bool = False,
     flush_cache: bool = False,
     warmup_requests: int = 1,
-    skip_server_info: bool = False,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1371,20 +1371,16 @@ async def benchmark(
     if pbar is not None:
         pbar.close()
 
-    if "sgl-jax" in backend and not skip_server_info:
-        try:
-            server_info = requests.get(base_url + "/get_server_info")
-            if server_info.status_code == 200:
-                server_info_json = server_info.json()
-                if "decode" in server_info_json:
-                    server_info_json = server_info_json["decode"][0]
-                accept_length = server_info_json["internal_states"][0].get(
-                    "avg_spec_accept_length", None
-                )
-            else:
-                accept_length = None
-        except requests.RequestException as exc:
-            print(f"Warning: failed to fetch /get_server_info: {exc}")
+    if "sgl-jax" in backend:
+        server_info = requests.get(base_url + "/get_server_info")
+        if server_info.status_code == 200:
+            server_info_json = server_info.json()
+            if "decode" in server_info_json:
+                server_info_json = server_info_json["decode"][0]
+            accept_length = server_info_json["internal_states"][0].get(
+                "avg_spec_accept_length", None
+            )
+        else:
             accept_length = None
     else:
         accept_length = None
@@ -1541,9 +1537,6 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "warmup_requests"):
         args.warmup_requests = 1
 
-    if not hasattr(args, "skip_server_info"):
-        args.skip_server_info = False
-
     if not hasattr(args, "output_details"):
         args.output_details = False
 
@@ -1682,7 +1675,6 @@ def run_benchmark(args_: argparse.Namespace):
             pd_separated=args.pd_separated,
             flush_cache=args.flush_cache,
             warmup_requests=args.warmup_requests,
-            skip_server_info=args.skip_server_info,
         )
     )
 
@@ -1877,11 +1869,6 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of warmup requests to run before the benchmark",
-    )
-    parser.add_argument(
-        "--skip-server-info",
-        action="store_true",
-        help="Skip /get_server_info at the end of the benchmark.",
     )
     parser.add_argument(
         "--tokenize-prompt",

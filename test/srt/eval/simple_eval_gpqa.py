@@ -12,69 +12,14 @@ import re
 import eval.simple_eval_common as common
 import pandas
 from eval.simple_eval_common import (
+    ANSWER_PATTERN_MULTICHOICE,
     HTML_JINJA,
     Eval,
     EvalResult,
     SamplerBase,
     SingleEvalResult,
+    format_multichoice_question,
 )
-
-GPQA_QUERY_TEMPLATE = """
-You will be given one multiple choice question.
-Your entire visible response must be exactly one line in the format:
-Answer: $LETTER
-where LETTER is one of ABCD.
-Do not include any explanation, reasoning, markdown, or extra text.
-
-Example:
-Question: What is 2 + 2?
-A) 3
-B) 4
-C) 5
-D) 6
-Answer: B
-
-Now answer this question:
-
-{Question}
-
-A) {A}
-B) {B}
-C) {C}
-D) {D}
-""".strip()
-
-GPQA_SYSTEM_MESSAGE_SUFFIX = """
-For multiple choice questions, your entire visible response must be exactly one line in the format:
-Answer: X
-where X is one of A, B, C, or D.
-Do not output reasoning, explanations, markdown, or any extra text.
-""".strip()
-
-GPQA_ANSWER_PATTERNS = (
-    r"(?i)Answer\s*:\s*([A-D])",
-    r"(?i)(?:final|correct)?\s*answer\s*(?:is|:)\s*[*_(\\[]*([A-D])",
-    r"(?i)(?:choose|choice|option)\s*(?:is|:)?\s*[*_(\\[]*([A-D])",
-    r"(?i)\bletter\s*([A-D])\b",
-)
-
-
-def format_gpqa_question(row: dict) -> str:
-    return GPQA_QUERY_TEMPLATE.format(**row)
-
-
-def extract_gpqa_answer(response_text: str) -> str | None:
-    for pattern in GPQA_ANSWER_PATTERNS:
-        matches = list(re.finditer(pattern, response_text))
-        if matches:
-            return matches[-1].group(1).upper()
-
-    for line in reversed(response_text.splitlines()):
-        stripped = re.sub(r"[*_`\\s]", "", line)
-        if stripped in {"A", "B", "C", "D"}:
-            return stripped
-
-    return None
 
 
 class GPQAEval(Eval):
@@ -117,11 +62,12 @@ class GPQAEval(Eval):
             )
             prompt_messages = [
                 sampler._pack_message(
-                    content=format_gpqa_question(choices_dict), role="user"
+                    content=format_multichoice_question(choices_dict), role="user"
                 )
             ]
             response_text = sampler(prompt_messages)
-            extracted_answer = extract_gpqa_answer(response_text)
+            match = re.search(ANSWER_PATTERN_MULTICHOICE, response_text)
+            extracted_answer = match.group(1) if match else None
             score = 1.0 if extracted_answer == correct_answer else 0.0
             html = common.jinja_env.from_string(HTML_JINJA).render(
                 prompt_messages=prompt_messages,

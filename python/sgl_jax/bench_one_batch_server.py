@@ -16,7 +16,6 @@ import dataclasses
 import itertools
 import json
 import multiprocessing
-import multiprocessing.connection
 import os
 import time
 
@@ -91,56 +90,33 @@ class BenchArgs:
         return cls(**{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs})
 
 
-def launch_server_internal(
-    server_args: ServerArgs,
-    pipe_finish_writer: multiprocessing.connection.Connection | None = None,
-):
+def launch_server_internal(server_args):
     try:
-        http_server.launch(server_args, pipe_finish_writer=pipe_finish_writer)
+        http_server.launch(server_args)
     except Exception as e:
         raise e
     finally:
         kill_process_tree(os.getpid(), include_parent=False)
 
 
-def wait_for_server_ready(base_url: str, timeout: int = 600):
-    start_time = time.time()
-    last_error = "server did not return model info"
-    while time.time() - start_time < timeout:
-        try:
-            response = requests.get(f"{base_url}/get_model_info", timeout=5)
-            if response.status_code == 200:
-                model_info = response.json()
-                if model_info.get("is_ready", True):
-                    return
-                last_error = "server launched but warmup is still running"
-            else:
-                last_error = f"unexpected status code {response.status_code}"
-        except requests.RequestException as exc:
-            last_error = str(exc)
-        time.sleep(1)
-
-    raise TimeoutError(f"Server failed to become ready within {timeout}s: {last_error}")
-
-
 def launch_server_process(server_args: ServerArgs):
-    pipe_finish_reader, pipe_finish_writer = multiprocessing.Pipe(duplex=False)
-    proc = multiprocessing.Process(
-        target=launch_server_internal,
-        args=(server_args, pipe_finish_writer),
-    )
+    proc = multiprocessing.Process(target=launch_server_internal, args=(server_args,))
     proc.start()
-    pipe_finish_writer.close()
     base_url = f"http://{server_args.host}:{server_args.port}"
     timeout = 600
 
-    if pipe_finish_reader.poll(timeout):
-        message = pipe_finish_reader.recv()
-        if message == "ready":
-            wait_for_server_ready(base_url, timeout=30)
-            return proc, base_url
-        raise RuntimeError(f"Server failed to start: {message}")
-
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            headers = {
+                "Content-Type": "application/json; charset=utf-8",
+            }
+            response = requests.get(f"{base_url}/v1/models", headers=headers)
+            if response.status_code == 200:
+                return proc, base_url
+        except requests.RequestException:
+            pass
+        time.sleep(10)
     raise TimeoutError("Server failed to start within the timeout period.")
 
 
@@ -161,24 +137,22 @@ def run_one_case(
     api_type: str = "native",
     skip_server_info: bool = False,
     skip_flush_cache: bool = False,
-    input_requests=None,
 ):
     if not skip_flush_cache:
         requests.post(url + "/flush_cache")
 
     # Determine whether to use text or input_ids based on API type
-    if input_requests is None:
-        return_text = api_type == "openai"
-        input_requests = sample_random_requests(
-            input_len=input_len,
-            output_len=output_len,
-            num_prompts=batch_size,
-            range_ratio=1.0,
-            tokenizer=tokenizer,
-            dataset_path="",
-            random_sample=True,
-            return_text=return_text,
-        )
+    return_text = api_type == "openai"
+    input_requests = sample_random_requests(
+        input_len=input_len,
+        output_len=output_len,
+        num_prompts=batch_size,
+        range_ratio=1.0,
+        tokenizer=tokenizer,
+        dataset_path="",
+        random_sample=True,
+        return_text=return_text,
+    )
 
     use_structured_outputs = False
     if use_structured_outputs:
@@ -338,72 +312,9 @@ def run_one_case(
     )
 
 
-def iter_benchmark_cases(bench_args: BenchArgs):
-    return list(
-        dict.fromkeys(
-            itertools.product(
-                bench_args.batch_size,
-                bench_args.input_len,
-                bench_args.output_len,
-            )
-        )
-    )
-
-
-def build_case_inputs(bench_args: BenchArgs, tokenizer):
-    case_inputs = {}
-    return_text = bench_args.api_type == "openai"
-    for bs, il, ol in iter_benchmark_cases(bench_args):
-        case_inputs[(bs, il, ol)] = sample_random_requests(
-            input_len=il,
-            output_len=ol,
-            num_prompts=bs,
-            range_ratio=1.0,
-            tokenizer=tokenizer,
-            dataset_path="",
-            random_sample=True,
-            return_text=return_text,
-        )
-    return case_inputs
-
-
-def run_targeted_warmup(
-    url: str,
-    bench_args: BenchArgs,
-    tokenizer,
-    case_inputs,
-):
-    print("=" * 8 + " Warmup Begin " + "=" * 8)
-    bench_cases = iter_benchmark_cases(bench_args)
-    for idx, (bs, il, ol) in enumerate(bench_cases, start=1):
-        print(
-            f"Warmup case {idx}/{len(bench_cases)}: "
-            f"batch_size={bs}, input_len={il}, output_len={ol}"
-        )
-        run_one_case(
-            url,
-            batch_size=bs,
-            input_len=il,
-            output_len=ol,
-            temperature=bench_args.temperature,
-            return_logprob=bench_args.return_logprob,
-            stream_interval=bench_args.client_stream_interval,
-            input_len_step_percentage=bench_args.input_len_step_percentage,
-            run_name="",
-            result_filename="",
-            tokenizer=tokenizer,
-            api_type=bench_args.api_type,
-            skip_server_info=bench_args.skip_server_info,
-            skip_flush_cache=bench_args.skip_flush_cache,
-            input_requests=case_inputs[(bs, il, ol)],
-        )
-    print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
-
-
 def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     if bench_args.base_url:
         proc, base_url = None, bench_args.base_url
-        wait_for_server_ready(base_url)
     else:
         proc, base_url = launch_server_process(server_args)
 
@@ -415,11 +326,27 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         elif "prefill" in server_info:
             tokenizer_path = server_info["prefill"][0]["tokenizer_path"]
     tokenizer = get_tokenizer(tokenizer_path)
-    case_inputs = build_case_inputs(bench_args, tokenizer)
 
     # warmup
     if not bench_args.skip_warmup:
-        run_targeted_warmup(base_url, bench_args, tokenizer, case_inputs)
+        print("=" * 8 + " Warmup Begin " + "=" * 8)
+        run_one_case(
+            base_url,
+            batch_size=16,
+            input_len=1024,
+            output_len=16,
+            temperature=bench_args.temperature,
+            return_logprob=bench_args.return_logprob,
+            stream_interval=bench_args.client_stream_interval,
+            input_len_step_percentage=bench_args.input_len_step_percentage,
+            run_name="",
+            result_filename="",
+            tokenizer=tokenizer,
+            api_type=bench_args.api_type,
+            skip_server_info=bench_args.skip_server_info,
+            skip_flush_cache=bench_args.skip_flush_cache,
+        )
+        print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
 
     # benchmark
     result = []
@@ -444,7 +371,6 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                     api_type=bench_args.api_type,
                     skip_server_info=bench_args.skip_server_info,
                     skip_flush_cache=bench_args.skip_flush_cache,
-                    input_requests=case_inputs[(bs, il, ol)],
                 )
             )
 
@@ -470,7 +396,6 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                                 profile=bench_args.profile,
                                 profile_by_stage=bench_args.profile_by_stage,
                                 api_type=bench_args.api_type,
-                                input_requests=case_inputs[(bs, il, ol)],
                             )[-1],
                         )
                     )

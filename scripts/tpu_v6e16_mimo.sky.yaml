@@ -22,18 +22,10 @@ setup: |
   chmod 700 ~/.ssh
   chmod 600 ~/.ssh/id_ed25519
 
-  # Configure git to use the SSH key for all github.com operations
-  cat > ~/.ssh/config <<SSHEOF
-  Host github.com
-    IdentityFile ~/.ssh/id_ed25519
-    StrictHostKeyChecking no
-    UserKnownHostsFile /dev/null
-  SSHEOF
-  chmod 600 ~/.ssh/config
-
   if [ ! -d ~/sky_workdir/sgl-jax/.git ]; then
     mkdir -p ~/sky_workdir
-    git clone git@github.com:sgl-project/sgl-jax.git ~/sky_workdir/sgl-jax
+    GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no" \
+      git clone git@github.com:sgl-project/sgl-jax.git ~/sky_workdir/sgl-jax
   fi
 
   cd ~/sky_workdir/sgl-jax

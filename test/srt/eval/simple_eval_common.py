@@ -72,8 +72,8 @@ class Eval:
 
 
 class LargerHttpxClient(httpx.Client):
-    def __init__(self, timeout_seconds: float = 300.0):
-        timeout_config = httpx.Timeout(timeout_seconds)
+    def __init__(self):
+        timeout_config = httpx.Timeout(3600)
         limits = httpx.Limits(
             max_keepalive_connections=3600,
             max_connections=3600,
@@ -92,15 +92,10 @@ class ChatCompletionSampler(SamplerBase):
         model: str | None = None,
         system_message: str | None = None,
         temperature: float = 0.0,
-        top_p: float = 1.0,
         max_tokens: int = 2048,
-        request_timeout: float = 300.0,
-        max_retries: int = 4,
     ):
         self.base_url = base_url
         self._thread_local = threading.local()
-        self.request_timeout = request_timeout
-        self.max_retries = max_retries
         self.client = self._make_client()
 
         if model is None:
@@ -109,15 +104,11 @@ class ChatCompletionSampler(SamplerBase):
         self.model = model
         self.system_message = system_message
         self.temperature = temperature
-        self.top_p = top_p
         self.max_tokens = max_tokens
         self.image_format = "url"
 
     def _make_client(self) -> OpenAI:
-        return OpenAI(
-            base_url=self.base_url,
-            http_client=LargerHttpxClient(timeout_seconds=self.request_timeout),
-        )
+        return OpenAI(base_url=self.base_url, http_client=LargerHttpxClient())
 
     def _get_client(self) -> OpenAI:
         client = getattr(self._thread_local, "client", None)
@@ -125,15 +116,6 @@ class ChatCompletionSampler(SamplerBase):
             client = self._make_client()
             self._thread_local.client = client
         return client
-
-    def _reset_client(self) -> None:
-        client = getattr(self._thread_local, "client", None)
-        if client is not None:
-            try:
-                client.close()
-            except Exception:
-                pass
-        self._thread_local.client = self._make_client()
 
     def _handle_image(
         self,
@@ -159,14 +141,14 @@ class ChatCompletionSampler(SamplerBase):
     def __call__(self, message_list: MessageList) -> str:
         if self.system_message:
             message_list = [self._pack_message("system", self.system_message)] + message_list
-        for trial in range(self.max_retries + 1):
-            client = self._get_client()
+        client = self._get_client()
+        trial = 0
+        while True:
             try:
                 response = client.chat.completions.create(
                     model=self.model,
                     messages=message_list,
                     temperature=self.temperature,
-                    top_p=self.top_p,
                     max_tokens=self.max_tokens,
                 )
                 return response.choices[0].message.content
@@ -175,21 +157,14 @@ class ChatCompletionSampler(SamplerBase):
                 print("Bad Request Error", e)
                 return ""
             except Exception as e:
-                if trial >= self.max_retries:
-                    print(
-                        f"Sampling failed after {trial + 1} attempts; marking sample as failed:",
-                        repr(e),
-                    )
-                    return ""
-                exception_backoff = min(2**trial, 30)
+                exception_backoff = 2**trial  # expontial back off
                 print(
-                    f"Sampling exception on attempt {trial + 1}/{self.max_retries + 1}; "
-                    f"retrying after {exception_backoff}s:",
-                    repr(e),
+                    f"Rate limit exception so wait and retry {trial} after {exception_backoff} sec",
+                    e,
                 )
-                self._reset_client()
                 time.sleep(exception_backoff)
-        return ""
+                trial += 1
+            # unknown error shall throw exception
 
 
 QUERY_TEMPLATE_MULTICHOICE = """

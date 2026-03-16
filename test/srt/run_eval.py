@@ -11,20 +11,6 @@ import time
 from eval.simple_eval_common import ChatCompletionSampler, make_report, set_ulimit
 
 
-def _get_eval_system_message(args) -> str | None:
-    system_message = args.system_message
-    if args.eval_name != "gpqa":
-        return system_message
-
-    from eval.simple_eval_gpqa import GPQA_SYSTEM_MESSAGE_SUFFIX
-
-    if not system_message:
-        return GPQA_SYSTEM_MESSAGE_SUFFIX
-    if GPQA_SYSTEM_MESSAGE_SUFFIX in system_message:
-        return system_message
-    return f"{system_message.rstrip()}\n\n{GPQA_SYSTEM_MESSAGE_SUFFIX}"
-
-
 def run_eval(args):
     set_ulimit()
 
@@ -78,11 +64,7 @@ def run_eval(args):
         model=args.model,
         max_tokens=max_tokens,
         base_url=base_url,
-        system_message=_get_eval_system_message(args),
         temperature=getattr(args, "temperature", 0.0),
-        top_p=getattr(args, "top_p", 1.0),
-        request_timeout=getattr(args, "request_timeout", 300.0),
-        max_retries=getattr(args, "max_retries", 4),
     )
 
     # Run eval
@@ -134,11 +116,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top-p", type=float, default=1.0)
-    parser.add_argument("--system-message", type=str, default=None)
     parser.add_argument("--max-tokens", type=int, default=None)
-    parser.add_argument("--request-timeout", type=float, default=300.0)
-    parser.add_argument("--max-retries", type=int, default=4)
     args = parser.parse_args()
 
     run_eval(args)
