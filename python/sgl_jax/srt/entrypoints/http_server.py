@@ -8,6 +8,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import math
 import multiprocessing as multiprocessing
 import os
 import random
@@ -21,7 +22,7 @@ from typing import Any
 # Fix a bug of Python threading
 threading._register_atexit = lambda *args, **kwargs: None
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 import orjson
 import requests
@@ -84,6 +85,30 @@ from sgl_jax.version import __version__
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+WARMUP_REQUEST_TIMEOUT = float(os.getenv("SGLANG_WARMUP_REQUEST_TIMEOUT", 600))
+MODEL_INFO_WAIT_TIMEOUT = float(os.getenv("SGLANG_WAIT_FOR_MODEL_INFO_TIMEOUT", 120))
+MODEL_INFO_HTTP_TIMEOUT = float(os.getenv("SGLANG_MODEL_INFO_HTTP_TIMEOUT", 5))
+MIMO_V2_FLASH_TTFT_WARMUP_NAME = "mimo_v2_flash_ttft"
+MIMO_V2_FLASH_GPQA_WARMUP_NAME = "mimo_v2_flash_gpqa"
+MIMO_V2_FLASH_BATCH4_WARMUP_NAME = "mimo_v2_flash_batch4"
+MIMO_V2_FLASH_TTFT_PROMPT_TOKENS = 472
+MIMO_V2_FLASH_TTFT_MAX_NEW_TOKENS = 4
+MIMO_V2_FLASH_TTFT_INPUT_IDS = [42] * MIMO_V2_FLASH_TTFT_PROMPT_TOKENS
+MIMO_V2_FLASH_GPQA_PROMPT_TOKENS = (315, 357, 363, 405, 473)
+MIMO_V2_FLASH_GPQA_EXTEND_CASES = (
+    # GPQA's slowest shared-prefix path is worth warming explicitly when correctness matters,
+    # otherwise the first 186+473 request can spend minutes compiling under load.
+    (186, (149, 162, 199, 357, 473)),
+    # Later GPQA samples use a neighboring shared-prefix bucket and can still hit a long
+    # first-time compile on the 473-token suffix path without warming a smaller ladder first.
+    (188, (149, 162, 199, 473)),
+    (187, (202, 315)),
+    (191, (173,)),
+)
+MIMO_V2_FLASH_GPQA_MAX_NEW_TOKENS = 64
+MIMO_V2_FLASH_BATCH4_PROMPT_TOKENS = 472
+MIMO_V2_FLASH_BATCH4_SIZE = 4
+MIMO_V2_FLASH_BATCH4_MAX_NEW_TOKENS = 128
 
 
 # Store global states
@@ -92,6 +117,7 @@ class _GlobalState:
     tokenizer_manager: TokenizerManager
     template_manager: TemplateManager
     scheduler_info: dict
+    is_ready: bool = False
 
 
 _global_state: _GlobalState | None = None
@@ -116,11 +142,6 @@ async def lifespan(fast_api_app: FastAPI):
     )
     fast_api_app.state.openai_serving_score = OpenAIServingScore(_global_state.tokenizer_manager)
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(_global_state.tokenizer_manager)
-
-    server_args: ServerArgs = fast_api_app.server_args
-    if server_args.warmups is not None:
-        logger.info("Warmup skipped (not implemented)")
-        logger.info("Warmup ended")
 
     warmup_thread = getattr(fast_api_app, "warmup_thread", None)
     if warmup_thread is not None:
@@ -217,12 +238,18 @@ async def health_generate(request: Request) -> Response:
     while time.perf_counter() < tic + HEALTH_CHECK_TIMEOUT:
         await asyncio.sleep(1)
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
-            task.cancel()
-            _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+            if not task.done():
+                _global_state.tokenizer_manager.abort_request(rid)
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
             _global_state.tokenizer_manager.health_check_failed = False
             return Response(status_code=200)
 
+    _global_state.tokenizer_manager.abort_request(rid)
     task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
     tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
     last_receive_time = time.strftime(
         "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
@@ -233,7 +260,6 @@ async def health_generate(request: Request) -> Response:
         tic_time,
         last_receive_time,
     )
-    _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
     _global_state.tokenizer_manager.health_check_failed = True
     return Response(status_code=503)
 
@@ -245,6 +271,7 @@ async def get_model_info():
         "model_path": _global_state.tokenizer_manager.model_path,
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
+        "is_ready": _global_state.is_ready,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
     }
     return result
@@ -843,35 +870,10 @@ def launch(
 
 def _execute_server_warmup(
     server_args: ServerArgs,
-    pipe_finish_writer: multiprocessing.connection.Connection | None,
-):
-    headers = {}
+    headers: dict[str, str],
+    model_info: dict[str, Any],
+) -> bool:
     url = server_args.url()
-    if server_args.api_key:
-        headers["Authorization"] = f"Bearer {server_args.api_key}"
-
-    # Wait until the server is launched
-    success = False
-    for _ in range(120):
-        time.sleep(1)
-        try:
-            res = requests.get(url + "/get_model_info", timeout=5, headers=headers)
-            assert res.status_code == 200, f"{res=}, {res.text=}"
-            success = True
-            break
-        except (AssertionError, requests.exceptions.RequestException):
-            last_traceback = get_exception_traceback()
-            pass
-
-    if not success:
-        if pipe_finish_writer is not None:
-            pipe_finish_writer.send(last_traceback)
-        logger.error("Initialization failed. warmup error: %s", last_traceback)
-        kill_process_tree(os.getpid())
-        return success
-
-    model_info = res.json()
-
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
     max_new_tokens = 2 if model_info["is_generation"] else 1
@@ -895,10 +897,249 @@ def _execute_server_warmup(
             url + request_name,
             json=json_data,
             headers=headers,
-            timeout=600,
+            timeout=WARMUP_REQUEST_TIMEOUT,
         )
         assert res.status_code == 200, f"{res}"
+    except Exception:
+        logger.error("Default warmup failed: %s", get_exception_traceback())
+        return False
 
+    return True
+
+
+def _wait_for_model_info(
+    server_args: ServerArgs,
+    pipe_finish_writer: multiprocessing.connection.Connection | None,
+) -> dict[str, Any] | None:
+    headers = {}
+    url = server_args.url()
+    if server_args.api_key:
+        headers["Authorization"] = f"Bearer {server_args.api_key}"
+
+    # Wait until the server is launched
+    success = False
+    num_attempts = max(1, math.ceil(MODEL_INFO_WAIT_TIMEOUT))
+    for _ in range(num_attempts):
+        time.sleep(1)
+        try:
+            res = requests.get(
+                url + "/get_model_info",
+                timeout=MODEL_INFO_HTTP_TIMEOUT,
+                headers=headers,
+            )
+            assert res.status_code == 200, f"{res=}, {res.text=}"
+            success = True
+            break
+        except (AssertionError, requests.exceptions.RequestException):
+            last_traceback = get_exception_traceback()
+            pass
+
+    if not success:
+        if pipe_finish_writer is not None:
+            pipe_finish_writer.send(last_traceback)
+        logger.error("Initialization failed. warmup error: %s", last_traceback)
+        kill_process_tree(os.getpid())
+        return None
+
+    return res.json()
+
+def _run_native_generate_warmup_requests(
+    server_args: ServerArgs,
+    headers: dict[str, str],
+    *,
+    warmup_name: str,
+    request_cases: list[dict[str, Any]],
+) -> None:
+    url = server_args.url()
+    for request_case in request_cases:
+        json_data = {
+            "input_ids": request_case["input_ids"],
+            "sampling_params": {
+                "temperature": 0.0,
+                "max_new_tokens": request_case["max_new_tokens"],
+            },
+        }
+        repeats = request_case.get("repeats", 1)
+        case_label = request_case.get("label")
+        for idx in range(repeats):
+            tic = time.perf_counter()
+            res = requests.post(
+                url + "/generate",
+                json=json_data,
+                headers=headers,
+                timeout=WARMUP_REQUEST_TIMEOUT,
+            )
+            assert res.status_code == 200, f"{res=}, {res.text=}"
+            suffix = f" ({case_label})" if case_label else ""
+            logger.info(
+                "Warmup %s request %d/%d%s finished in %.3fs",
+                warmup_name,
+                idx + 1,
+                repeats,
+                suffix,
+                time.perf_counter() - tic,
+            )
+
+
+def _build_warmup_input_ids(prompt_tokens: int, seed: int) -> list[int]:
+    base = 100 + (seed % 997)
+    return [base + ((idx * 17) % 251) for idx in range(prompt_tokens)]
+
+
+def _build_prefixed_warmup_input_ids(
+    prefix_tokens: int,
+    prefix_seed: int,
+    suffix_tokens: int,
+    suffix_seed: int,
+) -> list[int]:
+    return _build_warmup_input_ids(prefix_tokens, seed=prefix_seed) + _build_warmup_input_ids(
+        suffix_tokens, seed=suffix_seed
+    )
+
+
+def _execute_mimo_v2_flash_gpqa_warmup(
+    server_args: ServerArgs,
+    headers: dict[str, str],
+    model_info: dict[str, Any],
+) -> None:
+    if not model_info["is_generation"]:
+        logger.info("Skipping %s warmup on embedding server", MIMO_V2_FLASH_GPQA_WARMUP_NAME)
+        return
+
+    request_cases = [
+        dict(
+            input_ids=_build_warmup_input_ids(prompt_tokens, seed=prompt_tokens),
+            max_new_tokens=MIMO_V2_FLASH_GPQA_MAX_NEW_TOKENS,
+            label=f"prompt_tokens={prompt_tokens}",
+        )
+        for prompt_tokens in MIMO_V2_FLASH_GPQA_PROMPT_TOKENS
+    ]
+
+    # GPQA evals reuse a long shared chat prefix, so warm the extend path as well.
+    # Each prefix bucket starts with a short primer request that populates the shared prefix
+    # in the radix cache, followed by suffix lengths observed in real GPQA runs.
+    for prefix_tokens, suffix_token_buckets in MIMO_V2_FLASH_GPQA_EXTEND_CASES:
+        prefix_seed = 10_000 + prefix_tokens
+        request_cases.append(
+            dict(
+                input_ids=_build_prefixed_warmup_input_ids(
+                    prefix_tokens,
+                    prefix_seed=prefix_seed,
+                    suffix_tokens=1,
+                    suffix_seed=20_000 + prefix_tokens,
+                ),
+                max_new_tokens=MIMO_V2_FLASH_GPQA_MAX_NEW_TOKENS,
+                label=f"cached_prefix={prefix_tokens},primer",
+            )
+        )
+        for suffix_tokens in suffix_token_buckets:
+            request_cases.append(
+                dict(
+                    input_ids=_build_prefixed_warmup_input_ids(
+                        prefix_tokens,
+                        prefix_seed=prefix_seed,
+                        suffix_tokens=suffix_tokens,
+                        suffix_seed=30_000 + prefix_tokens * 1000 + suffix_tokens,
+                    ),
+                    max_new_tokens=MIMO_V2_FLASH_GPQA_MAX_NEW_TOKENS,
+                    label=(
+                        f"cached_prefix={prefix_tokens},"
+                        f"new_prompt_tokens={suffix_tokens}"
+                    ),
+                )
+            )
+
+    _run_native_generate_warmup_requests(
+        server_args,
+        headers,
+        warmup_name=MIMO_V2_FLASH_GPQA_WARMUP_NAME,
+        request_cases=request_cases,
+    )
+
+
+def _execute_mimo_v2_flash_batch4_warmup(
+    server_args: ServerArgs,
+    headers: dict[str, str],
+    model_info: dict[str, Any],
+) -> None:
+    if not model_info["is_generation"]:
+        logger.info(
+            "Skipping %s warmup on embedding server", MIMO_V2_FLASH_BATCH4_WARMUP_NAME
+        )
+        return
+
+    request_cases = [
+        dict(
+            input_ids=[
+                _build_warmup_input_ids(
+                    MIMO_V2_FLASH_BATCH4_PROMPT_TOKENS,
+                    seed=1000 + batch_idx * 97,
+                )
+                for batch_idx in range(MIMO_V2_FLASH_BATCH4_SIZE)
+            ],
+            max_new_tokens=MIMO_V2_FLASH_BATCH4_MAX_NEW_TOKENS,
+            label=(
+                f"batch_size={MIMO_V2_FLASH_BATCH4_SIZE}, "
+                f"prompt_tokens={MIMO_V2_FLASH_BATCH4_PROMPT_TOKENS}"
+            ),
+        )
+    ]
+    _run_native_generate_warmup_requests(
+        server_args,
+        headers,
+        warmup_name=MIMO_V2_FLASH_BATCH4_WARMUP_NAME,
+        request_cases=request_cases,
+    )
+
+
+def _execute_mimo_v2_flash_ttft_warmup(
+    server_args: ServerArgs,
+    headers: dict[str, str],
+    model_info: dict[str, Any],
+) -> None:
+    if not model_info["is_generation"]:
+        logger.info("Skipping %s warmup on embedding server", MIMO_V2_FLASH_TTFT_WARMUP_NAME)
+        return
+
+    _run_native_generate_warmup_requests(
+        server_args,
+        headers,
+        warmup_name=MIMO_V2_FLASH_TTFT_WARMUP_NAME,
+        request_cases=[
+            dict(
+                input_ids=MIMO_V2_FLASH_TTFT_INPUT_IDS,
+                max_new_tokens=MIMO_V2_FLASH_TTFT_MAX_NEW_TOKENS,
+                repeats=2,
+                label=f"prompt_tokens={MIMO_V2_FLASH_TTFT_PROMPT_TOKENS}",
+            )
+        ],
+    )
+
+
+def _execute_named_warmups(
+    server_args: ServerArgs,
+    headers: dict[str, str],
+    model_info: dict[str, Any],
+    pipe_finish_writer: multiprocessing.connection.Connection | None,
+) -> bool:
+    if not server_args.warmups:
+        return True
+
+    warmup_registry = {
+        MIMO_V2_FLASH_TTFT_WARMUP_NAME: _execute_mimo_v2_flash_ttft_warmup,
+        MIMO_V2_FLASH_GPQA_WARMUP_NAME: _execute_mimo_v2_flash_gpqa_warmup,
+        MIMO_V2_FLASH_BATCH4_WARMUP_NAME: _execute_mimo_v2_flash_batch4_warmup,
+    }
+    warmup_names = [name.strip() for name in server_args.warmups.split(",") if name.strip()]
+    try:
+        for warmup_name in warmup_names:
+            warmup_fn = warmup_registry.get(warmup_name)
+            if warmup_fn is None:
+                raise ValueError(f"Unknown warmup '{warmup_name}'")
+            logger.info("Running warmup: %s", warmup_name)
+            warmup_fn(server_args, headers, model_info)
+        logger.info("Warmup ended")
+        return True
     except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
@@ -907,23 +1148,35 @@ def _execute_server_warmup(
         kill_process_tree(os.getpid())
         return False
 
-    # Debug print
-    # logger.info(f"warmup request returns: {res.json()=}")
-    return success
-
 
 def _wait_and_warmup(
     server_args: ServerArgs,
     pipe_finish_writer: multiprocessing.connection.Connection | None,
     launch_callback: Callable[[], None] | None = None,
 ):
+    model_info = _wait_for_model_info(server_args, pipe_finish_writer)
+    if model_info is None:
+        return
+
+    headers = {}
+    if server_args.api_key:
+        headers["Authorization"] = f"Bearer {server_args.api_key}"
+
     if not server_args.skip_server_warmup and not _execute_server_warmup(
         server_args,
-        pipe_finish_writer,
+        headers,
+        model_info,
     ):
+        if pipe_finish_writer is not None:
+            pipe_finish_writer.send("default warmup failed")
+        kill_process_tree(os.getpid())
+        return
+
+    if not _execute_named_warmups(server_args, headers, model_info, pipe_finish_writer):
         return
 
     logger.info("The server is fired up and ready to roll!")
+    _global_state.is_ready = True
 
     if pipe_finish_writer is not None:
         pipe_finish_writer.send("ready")
