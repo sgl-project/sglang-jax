@@ -44,7 +44,8 @@ class TreeNode:
         # full_lock_ref is always >= swa_lock_ref.
         self.full_lock_ref = 0
         self.swa_lock_ref = 0
-        # last access time is only used for sanity check. LRU is maintained by the lru list.
+        # last_access_time is only used for sanity_check. It is maintained as a logical clock by
+        # SWARadixCache and does not drive eviction.
         self.last_access_time = time.monotonic()
 
         self.hit_count = 0
@@ -313,11 +314,13 @@ class SWARadixCache(BasePrefixCache):
     ##### Public API #####
 
     def reset(self) -> None:
+        self._last_access_tick = 0
         self.root_node = TreeNode()
         self.root_node.key = RadixKey(token_ids=[], extra_key=None)
         self.root_node.value = []
         self.root_node.full_lock_ref = 1
         self.root_node.swa_lock_ref = 1
+        self.root_node.last_access_time = self._next_access_time()
         self.full_evictable_size_ = 0
         self.swa_evictable_size_ = 0
         self.full_protected_size_ = 0
@@ -745,12 +748,9 @@ class SWARadixCache(BasePrefixCache):
         self.full_lru_list.reset_node_and_parents_mru(best_last_node, self.root_node)
         self.swa_lru_list.reset_node_and_parents_mru(best_last_node, self.root_node)
 
-        # This last_access_time is for sanity check, can be deleted after validation in production
-        cur_time = time.monotonic()
-        while node:
-            node.last_access_time = cur_time
-            cur_time -= 0.0001
-            node = node.parent
+        # Keep the touched path strictly newer than any untouched node while preserving
+        # parent < child ordering on the matched path.
+        self._touch_path(best_last_node)
 
         return value[:best_value_len], best_last_node
 
@@ -767,8 +767,9 @@ class SWARadixCache(BasePrefixCache):
         # parent inherits the swa_uuid from child for swa lock ref
         new_node.swa_uuid = child.swa_uuid
         child.swa_uuid = None
-        # child time should be later than parent's time for swa tombstone
-        child.last_access_time = time.monotonic()
+        # Keep split parent older than child in the debug access order.
+        new_node.last_access_time = self._next_access_time()
+        child.last_access_time = self._next_access_time()
 
         # remove the child from the lru lists because it is being split
         self.full_lru_list.remove_node(child)
@@ -796,7 +797,7 @@ class SWARadixCache(BasePrefixCache):
     def _insert_helper(self, node: TreeNode, key: RadixKey, value, update_kv_after_len: int) -> int:
         # Update the last access time from root to leaf, so that
         # swa will tombstone the node closer to root first
-        node.last_access_time = time.monotonic()
+        node.last_access_time = self._next_access_time()
         if node != self.root_node:
             self.full_lru_list.reset_node_mru(node)
             if not node.swa_tombstone:
@@ -809,7 +810,7 @@ class SWARadixCache(BasePrefixCache):
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
-            node.last_access_time = time.monotonic()
+            node.last_access_time = self._next_access_time()
             self.full_lru_list.reset_node_mru(node)
             if not node.swa_tombstone:
                 self.swa_lru_list.reset_node_mru(node)
@@ -853,6 +854,7 @@ class SWARadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = np.array(value, copy=True)
+            new_node.last_access_time = self._next_access_time()
             self.full_lru_list.insert_mru(new_node)
             self.swa_lru_list.insert_mru(new_node)
             node.children[child_key] = new_node
@@ -860,6 +862,18 @@ class SWARadixCache(BasePrefixCache):
             self.swa_evictable_size_ += self._swa_eff_len(new_node.value)
 
         return total_prefix_length
+
+    def _next_access_time(self) -> float:
+        self._last_access_tick += 1
+        return float(self._last_access_tick)
+
+    def _touch_path(self, node: TreeNode) -> None:
+        access_path = []
+        while node:
+            access_path.append(node)
+            node = node.parent
+        for access_node in reversed(access_path):
+            access_node.last_access_time = self._next_access_time()
 
     def _iteratively_delete_tombstone_leaf(self, node: TreeNode) -> tuple[TreeNode, int]:
         full_num_evicted = 0
