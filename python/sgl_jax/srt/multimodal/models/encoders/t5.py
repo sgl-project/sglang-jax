@@ -13,7 +13,7 @@ import copy
 import math
 import os
 import glob
-from typing import List, Optional
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
