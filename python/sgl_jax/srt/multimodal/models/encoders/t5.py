@@ -406,13 +406,29 @@ class T5EncoderModel(nnx.Module):
         x = self.shared(input_ids)
         hidden_states = self.encoder(x, extended_attention_mask, deterministic=deterministic)
 
-        # T5 typically has no pooled_output
-        return BaseEncoderOutput(pooler_output=None, hidden_states=hidden_states)
+        return BaseEncoderOutput(last_hidden_state=hidden_states)
 
 
 class UMT5EncoderModel(T5EncoderModel):
     def __init__(self, config: T5Config, mesh, dtype=jnp.bfloat16):
         super().__init__(config, mesh, dtype, is_umt5=True)
+
+    def __call__(
+        self,
+        input_ids: jax.Array,
+        attention_mask: jax.Array | None = None,
+        output_hidden_states: bool | None = None,
+        deterministic: bool = True,
+    ) -> BaseEncoderOutput:
+
+        base_output = super().__call__(
+            input_ids, attention_mask, output_hidden_states, deterministic
+        )
+
+        return BaseEncoderOutput(
+            last_hidden_state=base_output.last_hidden_state,
+            attention_mask=attention_mask,
+        )
 
 
 EntryClass = [T5EncoderModel, UMT5EncoderModel]

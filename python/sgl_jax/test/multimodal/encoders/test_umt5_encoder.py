@@ -138,7 +138,11 @@ def test_encoder(model_name, mesh, tokenizer, precision):
             input_ids=jnp.array(hf_ids.numpy(), dtype=jnp.int32),
             attention_mask=jnp.array(hf_mask.numpy(), dtype=jnp.int32),
         )
-        jax_h = jax_output.hidden_states
+        jax_h = jax_output.last_hidden_state
+
+    if jax_output.attention_mask is None:
+        logger.error("❌ UMT5EncoderModel failed to return attention_mask!")
+        return False, float("inf")
 
     passed, mae = compare(hf_h[0], jax_h[0], "Encoder Output")
     return passed, mae
@@ -163,7 +167,7 @@ def test_encoder_batch(model_name, mesh, tokenizer, precision):
             input_ids=jnp.array(hf_ids.numpy(), dtype=jnp.int32),
             attention_mask=jnp.array(hf_mask.numpy(), dtype=jnp.int32),
         )
-        jax_out = jax_output.hidden_states
+        jax_out = jax_output.last_hidden_state
 
     all_pass = True
     total_mae = 0.0
