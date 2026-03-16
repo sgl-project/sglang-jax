@@ -1367,20 +1367,6 @@ class WeightLoader:
                         target_path,
                     )
 
-                    if is_static_quant and moe_key.endswith("_scale"):
-                        logger.info(
-                            "MoE scale debug group=%s target=%s loaded_shape=%s final_shape=%s "
-                            "param_shape=%s reshape=%s repeat=%s sharding=%s",
-                            moe_key,
-                            target_path,
-                            loaded_shape,
-                            stacked_weight.shape,
-                            model_param.value.shape,
-                            mapping.reshape,
-                            mapping.repeat,
-                            mapping.sharding,
-                        )
-
                     try:
                         if stacked_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
                             model_param.value = stacked_weight
@@ -1538,20 +1524,6 @@ class WeightLoader:
                         model_param,
                         target_path,
                     )
-
-                    if is_static_quant and moe_key.endswith("_scale"):
-                        logger.info(
-                            "Split-MoE scale debug group=%s target=%s loaded_shape=%s final_shape=%s "
-                            "param_shape=%s reshape=%s repeat=%s sharding=%s",
-                            moe_key,
-                            target_path,
-                            loaded_shape,
-                            expert_weights.shape,
-                            model_param.value.shape,
-                            mapping.reshape,
-                            mapping.repeat,
-                            mapping.sharding,
-                        )
 
                     try:
                         if expert_weights.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
@@ -1813,18 +1785,6 @@ class WeightLoader:
 
         sharded_weight = self._shard_weight(processed_weight, sharding_spec)
 
-        # Debug: log shapes for attention projection weights to verify FP8 block quant layout
-        if any(p in jax_path for p in ("k_proj", "v_proj", "q_proj")):
-            logger.info(
-                "[SHAPE_DEBUG] %s -> %s: processed=%s sharded=%s dtype=%s sharding=%s",
-                hf_key,
-                jax_path,
-                processed_weight.shape,
-                sharded_weight.shape,
-                sharded_weight.dtype,
-                sharding_spec,
-            )
-
         try:
             logger.debug(
                 "Loading %s -> %s, shape: %s, transpose: %s",
@@ -2080,40 +2040,11 @@ class WeightLoader:
                     for _ in range(num_replicas):
                         per_head_scales.append(head_scale)
                 out = jnp.concatenate(per_head_scales, axis=0)  # [total_kv_heads, in_blocks]
-                _dbg = (
-                    layer_idx is not None
-                    and layer_idx < 2
-                    and any(x in hf_key for x in ("k_proj", "v_proj"))
-                )
-                if _dbg:
-                    logger.info(
-                        "KV_REPL_DEBUG post (per-head scale x%d) hf_key=%s shape=%s",
-                        num_replicas, hf_key, out.shape,
-                    )
                 return out
             return weight
 
         # If weight has fewer heads than expected (e.g., orig 4 -> target 8), replicate.
         actual_heads = weight.shape[target_axis] // step_size
-        debug_kv_replication = (
-            layer_idx is not None
-            and layer_idx < 2
-            and any(x in hf_key for x in ("k_proj", "v_proj"))
-        )
-        if debug_kv_replication:
-            logger.info(
-                "KV_REPL_DEBUG pre hf_key=%s layer=%s shape=%s target_axis=%s step_size=%s "
-                "actual_heads=%s original_kv_heads=%s total_kv_heads=%s tp=%s",
-                hf_key,
-                layer_idx,
-                weight.shape,
-                target_axis,
-                step_size,
-                actual_heads,
-                original_kv_heads,
-                total_kv_heads,
-                self.sharding_size,
-            )
         if (
             padding_strategy == "replicate"
             and actual_heads < total_kv_heads
@@ -2144,9 +2075,6 @@ class WeightLoader:
                     head_scale = weight[h * step_size:(h + 1) * step_size, :]
                     head_parts.append(jnp.tile(head_scale, (reps, 1)))
                 out = jnp.concatenate(head_parts, axis=0)
-                if debug_kv_replication:
-                    scale_stats = f"mean={float(jnp.mean(out)):.6f} min={float(jnp.min(out)):.6f} max={float(jnp.max(out)):.6f}"
-                    logger.info("KV_REPL_DEBUG post (scale tile-per-head) hf_key=%s shape=%s %s", hf_key, out.shape, scale_stats)
                 return out
             # Repeat-per-head: each head is replicated reps times consecutively so that
             # TP device i always gets the KV head matching its Q group.
@@ -2161,22 +2089,12 @@ class WeightLoader:
                 for _ in range(reps):
                     parts.append(head_slice)
             weight = jnp.concatenate(parts, axis=target_axis)
-            if debug_kv_replication:
-                logger.info("KV_REPL_DEBUG post (repeat-per-head) hf_key=%s shape=%s", hf_key, weight.shape)
             return weight
 
         # `total_kv_heads` is the post-TP target total. If the tensor already has at least
         # the target number of heads (e.g., some MiMo layers are already exported as 8 KV heads),
         # do not apply the legacy generic replication path.
         if actual_heads >= total_kv_heads:
-            if debug_kv_replication:
-                logger.info(
-                    "KV_REPL_DEBUG skip replicate hf_key=%s actual_heads=%s total_kv_heads=%s shape=%s",
-                    hf_key,
-                    actual_heads,
-                    total_kv_heads,
-                    weight.shape,
-                )
             return weight
 
         if padding_strategy == "replicate":
@@ -2200,9 +2118,6 @@ class WeightLoader:
                     weight = weight[:target_len]
                 else:
                     weight = weight[:, :target_len]
-            if debug_kv_replication:
-                logger.info("KV_REPL_DEBUG post (generic replicate) hf_key=%s shape=%s", hf_key, weight.shape)
-
         elif padding_strategy == "zero":
             target_heads_total = total_kv_heads
 
