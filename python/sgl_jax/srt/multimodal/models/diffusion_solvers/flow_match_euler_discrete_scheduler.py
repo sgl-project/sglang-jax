@@ -6,8 +6,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.multimodal.configuration_utils import register_to_config
-from sgl_jax.srt.multimodal.schedulers.scheduling_utils import SchedulerMixin
 from sgl_jax.srt.multimodal.utils import BaseOutput
 
 try:
@@ -21,11 +19,9 @@ class FlowMatchEulerDiscreteSchedulerOutput(BaseOutput):
     prev_sample: jax.Array
 
 
-class FlowMatchEulerDiscreteScheduler(SchedulerMixin):
-    _compatibles: list[str] = []
+class FlowMatchEulerDiscreteScheduler:
     order = 1
 
-    @register_to_config
     def __init__(
         self,
         num_train_timesteps: int = 1000,
@@ -44,6 +40,20 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin):
         stochastic_sampling: bool = False,
         dtype: jnp.dtype = jnp.float32,
     ):
+        self.num_train_timesteps = num_train_timesteps
+        self._shift = shift
+        self.use_dynamic_shifting = use_dynamic_shifting
+        self.base_shift = base_shift
+        self.max_shift = max_shift
+        self.base_image_seq_len = base_image_seq_len
+        self.max_image_seq_len = max_image_seq_len
+        self.invert_sigmas = invert_sigmas
+        self.shift_terminal = shift_terminal
+        self.use_karras_sigmas = use_karras_sigmas
+        self.use_exponential_sigmas = use_exponential_sigmas
+        self.use_beta_sigmas = use_beta_sigmas
+        self.time_shift_type = time_shift_type
+        self.stochastic_sampling = stochastic_sampling
         self.dtype = dtype
 
         if use_beta_sigmas and scipy is None:
@@ -106,34 +116,32 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin):
         `[base_image_seq_len, max_image_seq_len]` to `[base_shift, max_shift]`.
         Values outside the configured range are clipped to the nearest endpoint.
         """
-        if self.config.base_shift is None or self.config.max_shift is None:
+        if self.base_shift is None or self.max_shift is None:
             raise ValueError(
                 "`base_shift` and `max_shift` must be set to calculate dynamic shifting `mu`."
             )
 
-        base_seq = float(self.config.base_image_seq_len)
-        max_seq = float(self.config.max_image_seq_len)
+        base_seq = float(self.base_image_seq_len)
+        max_seq = float(self.max_image_seq_len)
         if max_seq <= base_seq:
             raise ValueError("`max_image_seq_len` must be larger than `base_image_seq_len`.")
 
         seq = float(np.clip(image_seq_len, base_seq, max_seq))
-        slope = (float(self.config.max_shift) - float(self.config.base_shift)) / (
-            max_seq - base_seq
-        )
-        mu = float(self.config.base_shift) + slope * (seq - base_seq)
+        slope = (float(self.max_shift) - float(self.base_shift)) / (max_seq - base_seq)
+        mu = float(self.base_shift) + slope * (seq - base_seq)
         return mu
 
     def _sigma_to_t(self, sigma: jax.Array | float) -> jax.Array:
-        return jnp.asarray(sigma) * self.config.num_train_timesteps
+        return jnp.asarray(sigma) * self.num_train_timesteps
 
     def time_shift(self, mu: float, sigma: float, t: jax.Array) -> jax.Array:
-        if self.config.time_shift_type == "exponential":
+        if self.time_shift_type == "exponential":
             return self._time_shift_exponential(mu, sigma, t)
         return self._time_shift_linear(mu, sigma, t)
 
     def stretch_shift_to_terminal(self, t: jax.Array) -> jax.Array:
         one_minus_z = 1 - t
-        scale_factor = one_minus_z[-1] / (1 - self.config.shift_terminal)
+        scale_factor = one_minus_z[-1] / (1 - self.shift_terminal)
         return 1 - (one_minus_z / scale_factor)
 
     def set_timesteps(
@@ -145,7 +153,7 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin):
         timesteps: list[float] | None = None,
     ) -> None:
         del shape
-        if self.config.use_dynamic_shifting and mu is None:
+        if self.use_dynamic_shifting and mu is None:
             raise ValueError("`mu` must be passed when `use_dynamic_shifting` is set to True")
 
         if sigmas is not None and timesteps is not None and len(sigmas) != len(timesteps):
@@ -174,35 +182,35 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin):
                     float(self._sigma_to_t(self.sigma_min)),
                     num_inference_steps,
                 ).astype(np.float32)
-            sigmas_np = timesteps_np / self.config.num_train_timesteps
+            sigmas_np = timesteps_np / self.num_train_timesteps
         else:
             sigmas_np = np.asarray(sigmas, dtype=np.float32)
             num_inference_steps = len(sigmas_np)
 
-        if self.config.use_dynamic_shifting:
+        if self.use_dynamic_shifting:
             sigmas_np = np.asarray(self.time_shift(mu, 1.0, jnp.asarray(sigmas_np)))
         else:
             sigmas_np = self.shift * sigmas_np / (1 + (self.shift - 1) * sigmas_np)
 
-        if self.config.shift_terminal:
+        if self.shift_terminal:
             sigmas_np = np.asarray(self.stretch_shift_to_terminal(jnp.asarray(sigmas_np)))
 
-        if self.config.use_karras_sigmas:
+        if self.use_karras_sigmas:
             sigmas_np = self._convert_to_karras(sigmas_np, num_inference_steps)
-        elif self.config.use_exponential_sigmas:
+        elif self.use_exponential_sigmas:
             sigmas_np = self._convert_to_exponential(sigmas_np, num_inference_steps)
-        elif self.config.use_beta_sigmas:
+        elif self.use_beta_sigmas:
             sigmas_np = self._convert_to_beta(sigmas_np, num_inference_steps)
 
         sigmas_jax = jnp.asarray(sigmas_np, dtype=self.dtype)
         if not is_timesteps_provided:
-            timesteps_jax = sigmas_jax * self.config.num_train_timesteps
+            timesteps_jax = sigmas_jax * self.num_train_timesteps
         else:
             timesteps_jax = jnp.asarray(timesteps_np, dtype=self.dtype)
 
-        if self.config.invert_sigmas:
+        if self.invert_sigmas:
             sigmas_jax = 1.0 - sigmas_jax
-            timesteps_jax = sigmas_jax * self.config.num_train_timesteps
+            timesteps_jax = sigmas_jax * self.num_train_timesteps
             sigmas_jax = jnp.concatenate([sigmas_jax, jnp.ones((1,), dtype=self.dtype)])
         else:
             sigmas_jax = jnp.concatenate([sigmas_jax, jnp.zeros((1,), dtype=self.dtype)])
@@ -288,7 +296,7 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin):
         sample_f32 = sample.astype(jnp.float32)
 
         if per_token_timesteps is not None:
-            per_token_sigmas = per_token_timesteps / self.config.num_train_timesteps
+            per_token_sigmas = per_token_timesteps / self.num_train_timesteps
             sigmas = self.sigmas[:, None, None]
             lower_mask = sigmas < per_token_sigmas[None] - 1e-6
             lower_sigmas = jnp.where(lower_mask, sigmas, 0.0)
@@ -304,7 +312,7 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin):
             next_sigma = sigma_next
             dt = sigma_next - sigma
 
-        if self.config.stochastic_sampling:
+        if self.stochastic_sampling:
             if noise is None:
                 if rng is None:
                     raise ValueError(
@@ -369,4 +377,4 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin):
         return mu / (mu + (1 / t - 1) ** sigma)
 
     def __len__(self) -> int:
-        return self.config.num_train_timesteps
+        return self.num_train_timesteps
