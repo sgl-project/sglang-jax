@@ -44,12 +44,11 @@ def _create_causal_mask(seq_len: int, dtype: jnp.dtype):
 
 
 class CLIPAttention(nnx.Module):
-    def __init__(self, config, mesh, dtype=jnp.bfloat16, is_causal=False):
+    def __init__(self, config, mesh, dtype=jnp.bfloat16):
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
         self.scale = self.head_dim**-0.5
-        self.is_causal = is_causal
 
         # CLIP attention HAS biases.
         self.q_proj = LinearBase(
@@ -106,11 +105,22 @@ class CLIPAttention(nnx.Module):
             * self.scale
         )
 
-        if self.is_causal:
-            scores = scores + _create_causal_mask(L, scores.dtype)
+        is_causal = attention_mask is None
 
-        if attention_mask is not None:
-            scores = scores + attention_mask
+        if is_causal:
+            # SGLang: is_causal=True, attn_mask=None
+            scores = scores + _create_causal_mask(L, scores.dtype)
+        else:
+            # SGLang: is_causal=False, attn_mask=attention_mask
+            # Format Padding Mask (1 -> 0.0, 0 -> -inf) before attn calc
+            if attention_mask.ndim == 2:
+                # [B, S] -> [B, 1, 1, S]
+                attn_mask = jnp.expand_dims(attention_mask, axis=(1, 2))
+            else:
+                attn_mask = attention_mask
+
+            formatted_mask = jnp.where(attn_mask > 0, 0.0, jnp.finfo(scores.dtype).min)
+            scores = scores + formatted_mask
 
         weights = jax.nn.softmax(scores, axis=-1)
         weights = self.dropout(weights, deterministic=deterministic)
@@ -150,8 +160,8 @@ class CLIPMLP(nnx.Module):
 
 
 class CLIPEncoderLayer(nnx.Module):
-    def __init__(self, config, mesh, dtype=jnp.bfloat16, is_causal=False):
-        self.self_attn = CLIPAttention(config, mesh, dtype, is_causal=is_causal)
+    def __init__(self, config, mesh, dtype=jnp.bfloat16):
+        self.self_attn = CLIPAttention(config, mesh, dtype)
         self.layer_norm1 = nnx.LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
@@ -184,17 +194,13 @@ class CLIPEncoderLayer(nnx.Module):
 
 
 class CLIPEncoder(nnx.Module):
-    def __init__(
-        self, config, mesh, num_hidden_layers_override=None, dtype=jnp.bfloat16, is_causal=False
-    ):
+    def __init__(self, config, mesh, num_hidden_layers_override=None, dtype=jnp.bfloat16):
         num_layers = (
             num_hidden_layers_override
             if num_hidden_layers_override is not None
             else config.num_hidden_layers
         )
-        self.layers = nnx.List(
-            [CLIPEncoderLayer(config, mesh, dtype, is_causal=is_causal) for _ in range(num_layers)]
-        )
+        self.layers = nnx.List([CLIPEncoderLayer(config, mesh, dtype) for _ in range(num_layers)])
 
     def __call__(self, x, attention_mask=None, return_all_hidden_states=False, deterministic=True):
         hidden_states_pool = [x]
@@ -209,7 +215,7 @@ class CLIPEncoder(nnx.Module):
 
 
 def _layer_mappings(config, idx, src_prefix, tgt_prefix):
-    """Helper to map standard Q/K/V to our fused QKV Linear."""
+    """Generate weight mappings for an encoder layer."""
     s, t = f"{src_prefix}.{idx}", f"{tgt_prefix}.{idx}"
     return {
         f"{s}.layer_norm1.weight": WeightMapping(f"{t}.layer_norm1.scale", (None,), False),
@@ -229,10 +235,10 @@ def _layer_mappings(config, idx, src_prefix, tgt_prefix):
         ),
         f"{s}.self_attn.v_proj.bias": WeightMapping(f"{t}.self_attn.v_proj.bias", (None,), False),
         f"{s}.self_attn.out_proj.weight": WeightMapping(
-            f"{t}.self_attn.out_proj.weight", ("tensor", None), True
+            f"{t}.self_attn.out_proj.weight", ("tensor", None), False
         ),
         f"{s}.self_attn.out_proj.bias": WeightMapping(
-            f"{t}.self_attn.out_proj.bias", (None,), False
+            f"{t}.self_attn.out_proj.bias", (None,), True
         ),
         f"{s}.mlp.fc1.weight": WeightMapping(f"{t}.mlp.fc1.weight", (None, "tensor"), True),
         f"{s}.mlp.fc1.bias": WeightMapping(f"{t}.mlp.fc1.bias", (None,), False),
@@ -473,7 +479,7 @@ class CLIPTextTransformer(nnx.Module):
     def __init__(self, config: CLIPTextConfig, mesh, dtype=jnp.bfloat16):
         self.config = config
         self.embeddings = CLIPTextEmbeddings(config, mesh, dtype)
-        self.encoder = CLIPEncoder(config, mesh, dtype=dtype, is_causal=True)
+        self.encoder = CLIPEncoder(config, mesh, dtype=dtype)
         self.final_layer_norm = nnx.LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
@@ -494,19 +500,9 @@ class CLIPTextTransformer(nnx.Module):
     ) -> BaseEncoderOutput:
         hidden_states = self.embeddings(input_ids, position_ids)
 
-        formatted_attention_mask = None
-        if attention_mask is not None:
-            if attention_mask.ndim == 2:
-                pad_mask = jnp.expand_dims(attention_mask, axis=(1, 2))
-            else:
-                pad_mask = attention_mask
-            formatted_attention_mask = jnp.where(
-                pad_mask > 0, 0.0, jnp.finfo(hidden_states.dtype).min
-            )
-
         encoder_outputs = self.encoder(
             hidden_states,
-            attention_mask=formatted_attention_mask,
+            attention_mask=attention_mask,
             return_all_hidden_states=output_hidden_states,
             deterministic=deterministic,
         )
