@@ -13,6 +13,7 @@ from sgl_jax.srt.multimodal.configs.mimo_audio.mimo_audio_config import MiMoAudi
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
 )
+from sgl_jax.srt.multimodal.configs.vaes.flux_vae_config import FluxVAEConfig
 from sgl_jax.srt.multimodal.configs.vaes.wan_vae_config import WanVAEConfig
 
 logger = logging.getLogger(__name__)
@@ -296,6 +297,8 @@ class VAEConfigRegistry:
 
     # Model name -> config factory mapping
     _REGISTRY: dict[str, callable] = {
+        "black-forest-labs/FLUX.1-dev": lambda: FluxVAEConfig(),
+        "FLUX.1-dev": lambda: FluxVAEConfig(),
         # Wan2.1 T2V 1.3B
         "Wan-AI/Wan2.1-T2V-1.3B-Diffusers": lambda: WanVAEConfig(),
         "Wan2.1-T2V-1.3B-Diffusers": lambda: WanVAEConfig(),
@@ -313,6 +316,7 @@ class VAEConfigRegistry:
 
     # Keyword patterns for fallback matching (order matters - more specific first)
     _KEYWORD_PATTERNS: list[tuple[str, callable]] = [
+        ("FLUX.1", lambda: FluxVAEConfig()),
         # Wan2.2 patterns
         ("Wan2.2", lambda: WanVAEConfig(is_residual=False)),
         # Wan2.1 patterns
