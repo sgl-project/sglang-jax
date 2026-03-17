@@ -742,6 +742,30 @@ class TestSplitKernelAttention(CustomTestCase):
             page_size=1,
         )
 
+    def test_split_kernel_192_gqa_prefill_ps16(self):
+        """GQA prefill with head_dim=192, v_head_dim=128, page_size=16."""
+        self.run_kernel_test(
+            mode="prefill",
+            lens=[(1, 128), (125, 125), (64, 256)],
+            num_heads=16,
+            head_dim=192,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=16,
+        )
+
+    def test_split_kernel_192_gqa_decode_ps16(self):
+        """GQA decode with head_dim=192, v_head_dim=128, page_size=16."""
+        self.run_kernel_test(
+            mode="decode",
+            lens=[(1, 127), (1, 128), (1, 512)],
+            num_heads=16,
+            head_dim=192,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=16,
+        )
+
 
 # ===================================================================
 # Part 2: FlashAttention backend + split KV cache tests
@@ -877,7 +901,19 @@ class TestSplitBackendAttention(CustomTestCase):
         self.assertIsInstance(kv_updated, tuple, "Expected (k, v) tuple from split path")
         self.assertEqual(len(kv_updated), 2, "Expected tuple of length 2")
         updated_k, updated_v = kv_updated
-        self.assertEqual(updated_k.shape[-1], head_dim, f"Updated K head_dim should be {head_dim}")
+        # Pool stores 128-aligned head_dim; updated cache inherits that alignment
+        aligned_head_dim = (head_dim + 127) // 128 * 128
+        aligned_v_head_dim = (v_head_dim + 127) // 128 * 128
+        self.assertEqual(
+            updated_k.shape[-1],
+            aligned_head_dim,
+            f"Updated K head_dim should be {aligned_head_dim} (aligned from {head_dim})",
+        )
+        self.assertEqual(
+            updated_v.shape[-1],
+            aligned_v_head_dim,
+            f"Updated V head_dim should be {aligned_v_head_dim} (aligned from {v_head_dim})",
+        )
 
         if check_cache:
             # After replace_kv_buffer, verify pool data matches
@@ -886,14 +922,15 @@ class TestSplitBackendAttention(CustomTestCase):
             k_buf, v_buf = token_to_kv_pool.get_split_kv_buffer(0)
 
             # Check that written extend tokens are in the cache
+            # Pool stores 128-aligned dims, so compare only the actual (unpadded) portion
             aligned_pos = 0
             for i, (q_len, kv_len) in enumerate(lens):
                 aligned_len = ((kv_len + page_size - 1) // page_size) * page_size
                 extend_start = aligned_pos + (kv_len - q_len)
                 extend_end = aligned_pos + kv_len
 
-                # K cache at extend positions should match extend_k data
-                cached_k = np.asarray(k_buf[extend_start:extend_end])
+                # K cache at extend positions should match extend_k data (trim to actual head_dim)
+                cached_k = np.asarray(k_buf[extend_start:extend_end, :, :head_dim])
                 original_k = np.asarray(k[extend_start:extend_end])
                 k_close = np.allclose(cached_k, original_k, rtol=1e-3, atol=1e-3)
                 self.assertTrue(
@@ -901,13 +938,21 @@ class TestSplitBackendAttention(CustomTestCase):
                     f"K cache mismatch at seq {i}, max diff: {float(np.max(np.abs(cached_k - original_k))):.6f}",
                 )
 
-                cached_v = np.asarray(v_buf[extend_start:extend_end])
+                cached_v = np.asarray(v_buf[extend_start:extend_end, :, :v_head_dim])
                 original_v = np.asarray(v[extend_start:extend_end])
                 v_close = np.allclose(cached_v, original_v, rtol=1e-3, atol=1e-3)
                 self.assertTrue(
                     v_close,
                     f"V cache mismatch at seq {i}, max diff: {float(np.max(np.abs(cached_v - original_v))):.6f}",
                 )
+
+                # Also verify padding region is zero
+                if aligned_head_dim > head_dim:
+                    pad_k = np.asarray(k_buf[extend_start:extend_end, :, head_dim:])
+                    self.assertTrue(
+                        np.all(pad_k == 0),
+                        f"K cache padding region not zero at seq {i}",
+                    )
 
                 aligned_pos += aligned_len
 
@@ -1056,6 +1101,45 @@ class TestSplitBackendAttention(CustomTestCase):
             num_kv_heads=8,
             v_head_dim=128,
             page_size=1,
+        )
+
+    # --- head_dim=192 + page_size=16 backend tests ---
+    def test_split_backend_192_gqa_prefill_ps16(self):
+        """GQA prefill with head_dim=192, page_size=16."""
+        self.run_backend_test(
+            mode="prefill",
+            lens=[(1, 128), (125, 125), (64, 256)],
+            num_heads=16,
+            head_dim=192,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=16,
+        )
+
+    def test_split_backend_192_gqa_decode_ps16(self):
+        """GQA decode with head_dim=192, page_size=16."""
+        self.run_backend_test(
+            mode="decode",
+            lens=[(1, 127), (1, 128), (1, 512)],
+            num_heads=16,
+            head_dim=192,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=16,
+        )
+
+    # --- head_dim=192 cache verification ---
+    def test_split_backend_192_cache_update(self):
+        """Verify cache update correctness with head_dim=192 (non-128-aligned, exercises padding)."""
+        self.run_backend_test(
+            mode="prefill",
+            lens=[(64, 128), (32, 64)],
+            num_heads=16,
+            head_dim=192,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=1,
+            check_cache=True,
         )
 
 
