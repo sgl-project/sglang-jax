@@ -34,6 +34,7 @@ DTYPE = {
 # Utilities (复用相同逻辑)
 # =============================================================================
 
+
 def compare(output1, output2, name, threshold=1e-3):
     np1 = output1.detach().float().cpu().numpy() if isinstance(output1, torch.Tensor) else np.array(output1, dtype=np.float32)
     np2 = output2.detach().float().cpu().numpy() if isinstance(output2, torch.Tensor) else np.array(output2, dtype=np.float32)
@@ -46,12 +47,14 @@ def compare(output1, output2, name, threshold=1e-3):
     logger.info("%s %s: MAE=%s, Max=%s", status, name, f"{mae:.2e}", f"{max_diff:.2e}")
     return passed, mae
 
+
 def set_param(model, path, val):
     parts = path.split(".")
     param = model
     for p in parts:
         param = param[int(p)] if p.isdigit() else getattr(param, p)
     param[...] = jnp.array(val, dtype=param[...].dtype)
+
 
 def manual_load_weights(jax_model, hf_model):
     from collections import defaultdict
@@ -66,35 +69,24 @@ def manual_load_weights(jax_model, hf_model):
     loaded = 0
     for target_path, src_list in target_to_src.items():
         try:
-            if len(src_list) == 1:
-                src_k, m = src_list[0]
-                w = pt_state[src_k].detach().float().cpu().numpy()
+            # 现在全是 1对1 映射，直接取 src_list[0] 即可，不再需要 else 分支！
+            src_k, m = src_list[0]
+            w = pt_state[src_k].detach().float().cpu().numpy()
 
-                if "patch_embedding.kernel" in target_path and len(w.shape) == 4:
-                    # PyTorch: [O, I, H, W] -> JAX: [H, W, I, O]
-                    w = np.transpose(w, (2, 3, 1, 0))
-                else:
-                    w = w.T if m.transpose else w
-
-                set_param(jax_model, target_path, w)
-
+            if "patch_embedding.kernel" in target_path and len(w.shape) == 4:
+                # PyTorch: [O, I, H, W] -> JAX: [H, W, I, O]
+                w = np.transpose(w, (2, 3, 1, 0))
             else:
-                src_list_sorted = sorted(src_list, key=lambda x: {"q": 0, "k": 1, "v": 2}.get(x[0].split("_proj")[0][-1], 3))
-                w_list = []
-                for src_k, m in src_list_sorted:
-                    w = pt_state[src_k].detach().float().cpu().numpy()
-                    w = w.T if m.transpose else w
-                    w_list.append(w)
+                w = w.T if m.transpose else w
 
-                w_fused = np.concatenate(w_list, axis=-1)
-                set_param(jax_model, target_path, w_fused)
-
-            loaded += len(src_list)
+            set_param(jax_model, target_path, w)
+            loaded += 1
         except Exception as e:
             logger.error(f"Failed to load {target_path}: {e}")
 
     if loaded < len(mappings) * 0.5:
         raise RuntimeError(f"Weight loading failed: only {loaded}/{len(mappings)} weights loaded")
+
 
 def load_models(model_name, mesh, precision):
     pt_dtype, jax_dtype = DTYPE[precision]
@@ -114,6 +106,7 @@ def load_models(model_name, mesh, precision):
 # =============================================================================
 # Tests
 # =============================================================================
+
 
 def test_vision_single(model_name, mesh, precision):
     logger.info("\n%s\nTest: CLIP Vision Encoder (Single Image)\n%s", "=" * 60, "=" * 60)
@@ -161,6 +154,7 @@ TESTS = {
     "vision_hidden_states": test_vision_hidden_states,
 }
 
+
 def main():
     import traceback
     from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -199,6 +193,7 @@ def main():
     all_pass = all(r[1] for r in results)
     logger.info("\n%s (%.1fs)", "✅ All PASSED" if all_pass else "❌ Some FAILED", time.time() - t0)
     return all_pass
+
 
 if __name__ == "__main__":
     main()

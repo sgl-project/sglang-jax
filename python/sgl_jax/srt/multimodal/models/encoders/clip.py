@@ -8,7 +8,6 @@ This implements both CLIPVisionModel and CLIPTextModel using flax.nnx and
 supports QKV fusion, feature layer extraction, and precise weight loading.
 """
 
-import math
 from typing import List, Optional
 
 import jax
@@ -29,6 +28,7 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 def quick_gelu(x):
     """CLIP's default fast GELU approximation."""
     return x * jax.nn.sigmoid(1.702 * x)
+
 
 ACT_FN = {"quick_gelu": quick_gelu, "gelu": jax.nn.gelu, "relu": jax.nn.relu}
 
@@ -51,14 +51,18 @@ class CLIPAttention(nnx.Module):
         self.scale = self.head_dim ** -0.5
 
         # CLIP attention HAS biases.
-        self.qkv_proj = LinearBase(self.embed_dim, self.embed_dim * 3, mesh=mesh, use_bias=True, kernel_axes=(None, "tensor"), params_dtype=dtype)
+        self.q_proj = LinearBase(self.embed_dim, self.embed_dim, mesh=mesh, use_bias=True, kernel_axes=(None, "tensor"), params_dtype=dtype)
+        self.k_proj = LinearBase(self.embed_dim, self.embed_dim, mesh=mesh, use_bias=True, kernel_axes=(None, "tensor"), params_dtype=dtype)
+        self.v_proj = LinearBase(self.embed_dim, self.embed_dim, mesh=mesh, use_bias=True, kernel_axes=(None, "tensor"), params_dtype=dtype)
+
         self.out_proj = LinearBase(self.embed_dim, self.embed_dim, mesh=mesh, use_bias=True, kernel_axes=("tensor", None), params_dtype=dtype)
         self.dropout = nnx.Dropout(config.attention_dropout)
 
     def __call__(self, x, attention_mask=None, deterministic=True):
         B, L, _ = x.shape
-        qkv, _ = self.qkv_proj(x)
-        q, k, v = jnp.split(qkv, 3, axis=-1)
+        q, _ = self.q_proj(x)
+        k, _ = self.k_proj(x)
+        v, _ = self.v_proj(x)
 
         # [B, L, H, D] -> [B, H, L, D]
         to_heads = lambda t: jnp.transpose(t.reshape(B, L, self.num_heads, self.head_dim), (0, 2, 1, 3))
@@ -139,12 +143,12 @@ def _layer_mappings(config, idx, src_prefix, tgt_prefix):
         f"{s}.layer_norm2.bias":   WeightMapping(f"{t}.layer_norm2.bias", (None,), False),
 
         # Fused QKV mapping
-        f"{s}.self_attn.q_proj.weight": WeightMapping(f"{t}.self_attn.qkv_proj.weight", (None, "tensor"), True),
-        f"{s}.self_attn.q_proj.bias":   WeightMapping(f"{t}.self_attn.qkv_proj.bias", (None,), True),
-        f"{s}.self_attn.k_proj.weight": WeightMapping(f"{t}.self_attn.qkv_proj.weight", (None, "tensor"), True),
-        f"{s}.self_attn.k_proj.bias":   WeightMapping(f"{t}.self_attn.qkv_proj.bias", (None,), True),
-        f"{s}.self_attn.v_proj.weight": WeightMapping(f"{t}.self_attn.qkv_proj.weight", (None, "tensor"), True),
-        f"{s}.self_attn.v_proj.bias":   WeightMapping(f"{t}.self_attn.qkv_proj.bias", (None,), True),
+        f"{s}.self_attn.q_proj.weight": WeightMapping(f"{t}.self_attn.q_proj.weight", (None, "tensor"), True),
+        f"{s}.self_attn.q_proj.bias":   WeightMapping(f"{t}.self_attn.q_proj.bias", (None,), False),
+        f"{s}.self_attn.k_proj.weight": WeightMapping(f"{t}.self_attn.k_proj.weight", (None, "tensor"), True),
+        f"{s}.self_attn.k_proj.bias":   WeightMapping(f"{t}.self_attn.k_proj.bias", (None,), False),
+        f"{s}.self_attn.v_proj.weight": WeightMapping(f"{t}.self_attn.v_proj.weight", (None, "tensor"), True),
+        f"{s}.self_attn.v_proj.bias":   WeightMapping(f"{t}.self_attn.v_proj.bias", (None,), False),
 
         f"{s}.self_attn.out_proj.weight": WeightMapping(f"{t}.self_attn.out_proj.weight", ("tensor", None), True),
         f"{s}.self_attn.out_proj.bias":   WeightMapping(f"{t}.self_attn.out_proj.bias", (None,), False),
@@ -192,7 +196,7 @@ class CLIPVisionEmbeddings(nnx.Module):
         B = patch_embeds.shape[0]
         patch_embeds = patch_embeds.reshape(B, -1, self.embed_dim)
 
-        class_embeds = jnp.broadcast_to(self.class_embedding.value, (B, 1, self.embed_dim))
+        class_embeds = jnp.broadcast_to(self.class_embedding, (B, 1, self.embed_dim))
         embeddings = jnp.concatenate([class_embeds, patch_embeds], axis=1)
         embeddings = embeddings + self.position_embedding.embedding
         return embeddings
@@ -303,15 +307,32 @@ class CLIPTextModel(nnx.Module):
             m.update(_layer_mappings(self.config, i, "text_model.encoder.layers", "encoder.layers"))
         return m
 
-    def __call__(self, input_ids: jax.Array, position_ids: Optional[jax.Array] = None, output_hidden_states: Optional[bool] = None, deterministic=True):
+    def __call__(
+        self,
+        input_ids: jax.Array,
+        position_ids: Optional[jax.Array] = None,
+        attention_mask: Optional[jax.Array] = None,
+        output_hidden_states: Optional[bool] = None,
+        deterministic=True
+    ):
         hidden_states = self.embeddings(input_ids, position_ids)
 
         # CLIP Text strictly uses causal mask
         causal_mask = _create_causal_mask(input_ids.shape[-1], hidden_states.dtype)
 
+        final_attention_mask = causal_mask
+        if attention_mask is not None:
+            if attention_mask.ndim == 2:
+                pad_mask = jnp.expand_dims(attention_mask, axis=(1, 2))
+            else:
+                pad_mask = attention_mask
+
+            pad_mask_val = jnp.where(pad_mask > 0, 0.0, jnp.finfo(hidden_states.dtype).min)
+            final_attention_mask = causal_mask + pad_mask_val
+
         encoder_outputs = self.encoder(
             hidden_states,
-            attention_mask=causal_mask,
+            attention_mask=final_attention_mask,
             return_all_hidden_states=output_hidden_states,
             deterministic=deterministic
         )
