@@ -95,9 +95,9 @@ class CLIPMLP(nnx.Module):
 class CLIPEncoderLayer(nnx.Module):
     def __init__(self, config, mesh, dtype=jnp.bfloat16):
         self.self_attn = CLIPAttention(config, mesh, dtype)
-        self.layer_norm1 = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, use_bias=True, dtype=dtype, param_dtype=dtype)
+        self.layer_norm1 = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, use_bias=True, dtype=dtype, param_dtype=dtype, rngs=nnx.Rngs(0))
         self.mlp = CLIPMLP(config, mesh, dtype)
-        self.layer_norm2 = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, use_bias=True, dtype=dtype, param_dtype=dtype)
+        self.layer_norm2 = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, use_bias=True, dtype=dtype, param_dtype=dtype, rngs=nnx.Rngs(0))
 
     def __call__(self, x, attention_mask=None, deterministic=True):
         residual = x
@@ -175,7 +175,8 @@ class CLIPVisionEmbeddings(nnx.Module):
             strides=(self.patch_size, self.patch_size),
             use_bias=False,
             dtype=dtype,
-            param_dtype=dtype
+            param_dtype=dtype,
+            rngs=nnx.Rngs(0)
         )
 
         num_patches = (config.image_size // self.patch_size) ** 2
@@ -204,13 +205,13 @@ class CLIPVisionModel(nnx.Module):
         self.embeddings = CLIPVisionEmbeddings(config, mesh, dtype)
         self.pre_layrnorm = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, use_bias=True, dtype=dtype, param_dtype=dtype)
 
-        self.encoder = CLIPEncoder(config, mesh, num_hidden_layers_override=getattr(config, "num_hidden_layers_override", None), dtype=dtype)
+        self.encoder = CLIPEncoder(config, mesh, num_hidden_layers_override=getattr(config, "num_hidden_layers_override", None), dtype=dtype, rngs=nnx.Rngs(0))
 
         # Check if post norm is explicitly requested to be skipped to save memory
         num_layers = config.num_hidden_layers
         require_post_norm = getattr(config, "require_post_norm", len(self.encoder.layers) == num_layers)
 
-        self.post_layernorm = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, use_bias=True, dtype=dtype, param_dtype=dtype) if require_post_norm else None
+        self.post_layernorm = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, use_bias=True, dtype=dtype, param_dtype=dtype, rngs=nnx.Rngs(0)) if require_post_norm else None
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(self, model_config, self.mesh, self.dtype)
@@ -285,7 +286,7 @@ class CLIPTextModel(nnx.Module):
         self.config, self.mesh, self.dtype = config, mesh, dtype
         self.embeddings = CLIPTextEmbeddings(config, mesh, dtype)
         self.encoder = CLIPEncoder(config, mesh, dtype=dtype)
-        self.final_layer_norm = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, use_bias=True, dtype=dtype, param_dtype=dtype)
+        self.final_layer_norm = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, use_bias=True, dtype=dtype, param_dtype=dtype, rngs=nnx.Rngs(0))
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(self, model_config, self.mesh, self.dtype)
