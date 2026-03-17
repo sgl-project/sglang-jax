@@ -12,11 +12,15 @@ from flax import nnx
 class DiagonalGaussianDistribution:
     parameters: jax.Array
     deterministic: bool = False
+    channel_axis: int | None = None
 
     def __post_init__(self):
-        # Wan's VAE distribution splits along axis 4 for [B, T, H, W, C] video
-        # tensors, but FLUX exposes image latents as NCHW, so we split on axis 1.
-        self.mean, self.logvar = jnp.split(self.parameters, 2, axis=1)
+        # FLUX uses NCHW for 4D image tensors in isolated model tests, but the
+        # current VAE runner feeds 5D [B, T, H, W, C] tensors. Support both.
+        axis = self.channel_axis
+        if axis is None:
+            axis = 1 if self.parameters.ndim == 4 else self.parameters.ndim - 1
+        self.mean, self.logvar = jnp.split(self.parameters, 2, axis=axis)
         self.logvar = jnp.clip(self.logvar, -30.0, 20.0)
         self.std = jnp.exp(0.5 * self.logvar)
         self.var = jnp.exp(self.logvar)
@@ -98,9 +102,7 @@ class ResnetBlock2D(nnx.Module):
         self.in_channels = in_channels
         self.out_channels = in_channels if out_channels is None else out_channels
         self.use_nin_shortcut = (
-            in_channels != self.out_channels
-            if use_nin_shortcut is None
-            else use_nin_shortcut
+            in_channels != self.out_channels if use_nin_shortcut is None else use_nin_shortcut
         )
 
         _rngs = rngs or nnx.Rngs(0)

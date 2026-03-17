@@ -63,7 +63,7 @@ class FluxVAEConfig(VAEConfig):
         self.blend_num_frames = 0
 
     @classmethod
-    def from_dict(cls, config_dict: dict[str, Any]) -> "FluxVAEConfig":
+    def from_dict(cls, config_dict: dict[str, Any]) -> FluxVAEConfig:
         field_names = set(cls.__dataclass_fields__.keys())
         init_dict = {}
         for key, value in config_dict.items():
@@ -79,7 +79,7 @@ class FluxVAEConfig(VAEConfig):
         return cls(**init_dict)
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str | Path) -> "FluxVAEConfig":
+    def from_pretrained(cls, pretrained_model_name_or_path: str | Path) -> FluxVAEConfig:
         config_path = Path(pretrained_model_name_or_path)
         if config_path.is_dir():
             config_path = config_path / "config.json"

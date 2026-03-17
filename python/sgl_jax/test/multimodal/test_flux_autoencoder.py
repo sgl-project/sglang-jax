@@ -6,31 +6,38 @@ import unittest
 from pathlib import Path
 
 try:
+    import torch
+    from diffusers.models.autoencoders.autoencoder_kl import (
+        AutoencoderKL as HFAutoencoderKL,
+    )
+except ImportError:  # pragma: no cover
+    torch = None
+    HFAutoencoderKL = None
+
+try:
     import jax
     import jax.numpy as jnp
     import numpy as np
-    import torch
     from flax import nnx
 except ImportError:  # pragma: no cover
     jax = None
     jnp = None
     np = None
-    torch = None
     nnx = None
 
 if jax is not None:
-    from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL as HFAutoencoderKL
     from sgl_jax.srt.multimodal.configs.vaes.flux_vae_config import FluxVAEConfig
-    from sgl_jax.srt.multimodal.models.vaes.autoencoder import (
-        AutoencoderKL,
-    )
+    from sgl_jax.srt.multimodal.models.vaes.autoencoder import AutoencoderKL
     from sgl_jax.srt.multimodal.models.vaes.flux_vae_weight_mappings import to_mappings
 
 
 FLUX1_VAE_ROOT = Path(os.environ.get("FLUX1_VAE_ROOT", "/models/FLUX1.0/vae"))
 
 
-@unittest.skipIf(jax is None, "jax not installed")
+@unittest.skipIf(
+    torch is None or HFAutoencoderKL is None or jax is None or nnx is None,
+    "torch/diffusers/jax/flax not installed",
+)
 class TestFluxAutoencoder(unittest.TestCase):
     @staticmethod
     def _make_image_like_input(

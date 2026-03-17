@@ -98,9 +98,7 @@ class AutoencoderKL(nnx.Module):
             if isinstance(config.sample_size, (list, tuple))
             else config.sample_size
         )
-        self.tile_latent_min_size = int(
-            sample_size / (2 ** (len(config.block_out_channels) - 1))
-        )
+        self.tile_latent_min_size = int(sample_size / (2 ** (len(config.block_out_channels) - 1)))
         self.tile_overlap_factor = 0.25
 
     @classmethod
@@ -110,9 +108,9 @@ class AutoencoderKL(nnx.Module):
         *,
         dtype: jnp.dtype = jnp.float32,
         mesh=None,
-    ) -> "AutoencoderKL":
+    ) -> AutoencoderKL:
         if not isinstance(config, FluxVAEConfig):
-            config = FluxVAEConfig.from_config(config)
+            config = FluxVAEConfig.from_dict(config)
         return cls(config=config, dtype=dtype, mesh=mesh)
 
     @classmethod
@@ -122,7 +120,7 @@ class AutoencoderKL(nnx.Module):
         *,
         dtype: jnp.dtype = jnp.float32,
         mesh=None,
-    ) -> "AutoencoderKL":
+    ) -> AutoencoderKL:
         config = FluxVAEConfig.from_pretrained(pretrained_model_name_or_path)
         model_path = Path(pretrained_model_name_or_path)
         config.model_path = str(model_path if model_path.name == "vae" else model_path / "vae")
@@ -159,22 +157,25 @@ class AutoencoderKL(nnx.Module):
         return_dict: bool = True,
     ) -> AutoencoderKLOutput | tuple[DiagonalGaussianDistribution]:
         moments = self._encode(x)
-        posterior = DiagonalGaussianDistribution(moments)
+        channel_axis = 1 if moments.ndim == 4 else moments.ndim - 1
+        posterior = DiagonalGaussianDistribution(moments, channel_axis=channel_axis)
         if not return_dict:
             return (posterior,)
         return AutoencoderKLOutput(latent_dist=posterior)
 
     def _encode(self, x: jax.Array) -> jax.Array:
+        if x.ndim not in (4, 5):
+            raise ValueError(f"Expected 4D or 5D input for encode, got shape {x.shape}.")
         if self.use_tiling and (
             x.shape[-1] > self.tile_sample_min_size or x.shape[-2] > self.tile_sample_min_size
         ):
             raise NotImplementedError("Tiled VAE encode is not implemented yet.")
 
-        x_nhwc = self._to_nhwc(x)
+        x_nhwc, restore_layout = self._to_channels_last(x)
         moments_nhwc = self.encoder(x_nhwc)
         if hasattr(self, "quant_conv"):
             moments_nhwc = self.quant_conv(moments_nhwc)
-        return self._to_nchw(moments_nhwc)
+        return restore_layout(moments_nhwc)
 
     def decode(
         self,
@@ -188,16 +189,18 @@ class AutoencoderKL(nnx.Module):
         z: jax.Array,
         return_dict: bool = True,
     ) -> DecoderOutput | tuple[jax.Array]:
+        if z.ndim not in (4, 5):
+            raise ValueError(f"Expected 4D or 5D input for decode, got shape {z.shape}.")
         if self.use_tiling and (
             z.shape[-1] > self.tile_latent_min_size or z.shape[-2] > self.tile_latent_min_size
         ):
             raise NotImplementedError("Tiled VAE decode is not implemented yet.")
 
-        z_nhwc = self._to_nhwc(z)
+        z_nhwc, restore_layout = self._to_channels_last(z)
         if hasattr(self, "post_quant_conv"):
             z_nhwc = self.post_quant_conv(z_nhwc)
         sample_nhwc = self.decoder(z_nhwc)
-        sample = self._to_nchw(sample_nhwc)
+        sample = restore_layout(sample_nhwc)
 
         if not return_dict:
             return (sample,)
@@ -220,12 +223,25 @@ class AutoencoderKL(nnx.Module):
         return jax.sharding.Mesh(devices, axis_names=("tensor",))
 
     @staticmethod
-    def _to_nhwc(x: jax.Array) -> jax.Array:
-        return jnp.transpose(x, (0, 2, 3, 1))
+    def _to_channels_last(x: jax.Array):
+        if x.ndim == 4:
+            x_nhwc = jnp.transpose(x, (0, 2, 3, 1))
 
-    @staticmethod
-    def _to_nchw(x: jax.Array) -> jax.Array:
-        return jnp.transpose(x, (0, 3, 1, 2))
+            def restore_layout(y: jax.Array) -> jax.Array:
+                return jnp.transpose(y, (0, 3, 1, 2))
+
+            return x_nhwc, restore_layout
+
+        if x.ndim == 5:
+            batch, frames, height, width, channels = x.shape
+            x_flat = x.reshape(batch * frames, height, width, channels)
+
+            def restore_layout(y: jax.Array) -> jax.Array:
+                return y.reshape(batch, frames, y.shape[1], y.shape[2], y.shape[3])
+
+            return x_flat, restore_layout
+
+        raise ValueError(f"Expected 4D or 5D input, got shape {x.shape}.")
 
 
 EntryClass = AutoencoderKL
