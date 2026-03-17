@@ -46,6 +46,7 @@ class WanModelConfig(MultiModalModelConfigs):
     model_class: None = None  # To be set to the model class
     quantization_config: QuantizationConfig | None = None
     
+    model_type: str = "wan"
     scheduler_type: str = "FlowUniPCMultistepScheduler"
 
     def get_total_num_kv_heads(self) -> int:

@@ -1176,9 +1176,10 @@ class LTX2Transformer3DModel(nnx.Module):
             ax = self.audio_proj_out(ax)
             ax_out = ax
 
-        # Return (video, audio) tuple when audio is generated, else just video
+        # Return dict when audio is generated for self-documenting output,
+        # plain array for video-only (consistent with WAN's return type).
         if ax_out is not None:
-            return vx_out, ax_out
+            return {"video": vx_out, "audio": ax_out}
         return vx_out
 
     def load_weights(self, model_config) -> None:

@@ -564,7 +564,7 @@ class LTX2GemmaTextEncoder(nnx.Module):
 
         return mappings
 
-    def load_weights(self, model_config: ModelConfig, ltx_checkpoint_path: str | None = None):
+    def load_weights(self, model_config: ModelConfig, ltx_checkpoint_path: str | None = None):  # noqa: ARG002 — ltx_checkpoint_path kept for backward compat
         import os
 
         # Auto-discover Gemma-3 checkpoint from HF cache
@@ -609,21 +609,27 @@ class LTX2GemmaTextEncoder(nnx.Module):
             )
         logger.info("Set connector norm scales to ones (video + audio)")
 
-        # Auto-discover LTX checkpoint path if not provided
-        if ltx_checkpoint_path is None:
-            ltx_path = get_hf_snapshot_dir("Lightricks/LTX-2")
-            if ltx_path:
-                ckpt_file = os.path.join(ltx_path, "ltx-2-19b-dev.safetensors")
-                if os.path.exists(ckpt_file):
-                    ltx_checkpoint_path = ckpt_file
+        # Load feature extractor and connector weights from LTX-2 checkpoint
+        self._load_ltx2_connector_weights(model_config)
 
-        if ltx_checkpoint_path is not None:
-            # We must load feature_extractor and embeddings_connector from LTX checkpoint
-            self._load_ltx2_connector_weights(ltx_checkpoint_path)
+    def _load_ltx2_connector_weights(self, model_config: ModelConfig):
+        """Load connector weights from LTX-2 checkpoint using WeightLoader.
 
-    def _load_ltx2_connector_weights(self, checkpoint_path: str):
-        from safetensors import safe_open
-        logger.info(f"Loading text encoder connector weights from {checkpoint_path}")
+        Uses the same WeightLoader infrastructure as the DiT and VAE for
+        consistent sharding and mesh-aware tensor placement. Temporarily
+        swaps model_config.model_path to the LTX-2 checkpoint directory
+        (same pattern as DiT load_weights).
+        """
+        from sgl_jax.srt.multimodal.models.ltx2.utils import (
+            get_ltx2_checkpoint_dir, cleanup_ltx2_checkpoint_dir,
+        )
+
+        ckpt_dir = get_ltx2_checkpoint_dir()
+        if ckpt_dir is None:
+            logger.warning("LTX-2 checkpoint not found; connector weights not loaded")
+            return
+
+        logger.info(f"Loading text encoder connector weights via WeightLoader from {ckpt_dir}")
 
         mappings = {
             "text_embedding_projection.aggregate_embed.weight": WeightMapping(
@@ -667,44 +673,27 @@ class LTX2GemmaTextEncoder(nnx.Module):
                     f"{prefix}.ff.net.2.bias": WeightMapping(f"{target}.ff.fc_out.bias", (None,)),
                 })
 
-        loaded = 0
-        with safe_open(checkpoint_path, framework="pt", device="cpu") as f:
-            all_keys = set(f.keys())
-            for ck, mapping in mappings.items():
-                if ck in all_keys:
-                    tensor = f.get_tensor(ck).float().numpy()
-                    if mapping.transpose:
-                        tensor = tensor.T
+        # Temporarily swap model_path to the LTX checkpoint directory
+        # (same pattern as DiT load_weights at ltx2_dit.py:1215).
+        original_path = model_config.model_path
+        model_config.model_path = ckpt_dir
 
-                    # Navigate the model hierarchy directly (not nnx.state)
-                    target_keys = mapping.target_path.split('.')
-                    current = self
-                    for key in target_keys[:-1]:
-                        if key.isdigit():
-                            current = current[int(key)]
-                        else:
-                            current = getattr(current, key)
-                    last_key = target_keys[-1]
-
-                    existing = getattr(current, last_key)
-                    existing_val = existing.value if isinstance(existing, nnx.Param) else existing
-                    jax_tensor = jnp.array(tensor, dtype=existing_val.dtype)
-                    if jax_tensor.shape != existing_val.shape:
-                        logger.warning(f"Shape mismatch for {ck}: {jax_tensor.shape} != {existing_val.shape}")
-                    else:
-                        setattr(current, last_key, nnx.Param(jax_tensor))
-                        loaded += 1
-                else:
-                    logger.warning(f"Key {ck} not found in checkpoint")
-
-        logger.info(f"Loaded {loaded} LTX-2 connector weights.")
+        loader = WeightLoader(
+            model=self,
+            model_config=model_config,
+            mesh=self.mesh,
+            dtype=self.dtype,
+        )
+        loader.load_weights_from_safetensors(mappings)
+        model_config.model_path = original_path
+        cleanup_ltx2_checkpoint_dir(ckpt_dir)
+        logger.info("Loaded LTX-2 connector weights via WeightLoader.")
 
     @staticmethod
     def from_pretrained(
         model_name_or_path: str,
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        ltx_checkpoint_path: str | None = None,
     ):
         from transformers import AutoConfig
 
@@ -712,7 +701,7 @@ class LTX2GemmaTextEncoder(nnx.Module):
         encoder = LTX2GemmaTextEncoder(config, mesh=mesh, dtype=dtype)
 
         model_config = ModelConfig(model_path=model_name_or_path)
-        encoder.load_weights(model_config, ltx_checkpoint_path)
+        encoder.load_weights(model_config)
 
         return encoder
 

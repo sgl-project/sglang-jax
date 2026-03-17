@@ -56,6 +56,9 @@ class LTX2ModelConfig(MultiModalModelConfigs):
     # Patch embedding parameters
     patch_size: tuple[int, int, int] = (1, 2, 2)  # (temporal, height, width)
 
+    # Model identity
+    model_type: str = "ltx2"
+
     # Model type flags
     is_video_enabled: bool = True
     is_audio_enabled: bool = True
@@ -90,6 +93,29 @@ class LTX2ModelConfig(MultiModalModelConfigs):
 
     model_class: None = None  # To be set to the model class
     quantization_config: QuantizationConfig | None = None
+
+    # Default example prompt following LTX-2 prompting best practices:
+    # single continuous paragraph, present tense, specific camera choreography,
+    # physical details, temporal connectors, atmospheric audio description.
+    default_prompt: str = (
+        "An animated cinematic shot of a matte-gray humanoid robot walking slowly "
+        "down the center of a rain-slicked city sidewalk at dusk. The camera begins "
+        "in a medium wide shot, dollying steadily backward to keep the robot framed "
+        "at center as it takes heavy, deliberate steps, its metal feet clanking "
+        "softly against the wet pavement. Warm amber streetlights reflect off its "
+        "polished shoulder plates and the shallow puddles beneath it. As the robot "
+        "continues forward, its pace gradually increases into a slow, heavy run, "
+        "mechanical joints grinding with each stride, arms pumping stiffly at its "
+        "sides. Then it stops abruptly, one foot planted forward, steam venting from "
+        "its knee actuators. The camera keeps pulling back smoothly, widening the "
+        "frame, until a second robot with a blue metallic shell appears from behind "
+        "the camera in an over-the-shoulder composition, its silhouette filling the "
+        "right edge of frame. The blue robot stands motionless, facing the gray one "
+        "from a distance. Cold blue neon signage and warm orange storefront lights "
+        "create contrasting pools of color on the glistening asphalt. Ambient city "
+        "sounds fill the scene: distant traffic hum, the patter of light rain on "
+        "metal, and the low mechanical whir of cooling fans inside the robots."
+    )
 
     def get_total_num_kv_heads(self) -> int:
         return self.num_attention_heads
