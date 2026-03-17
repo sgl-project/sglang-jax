@@ -142,7 +142,6 @@ def _layer_mappings(config, idx, src_prefix, tgt_prefix):
         f"{s}.layer_norm2.weight": WeightMapping(f"{t}.layer_norm2.scale", (None,), False),
         f"{s}.layer_norm2.bias":   WeightMapping(f"{t}.layer_norm2.bias", (None,), False),
 
-        # Fused QKV mapping
         f"{s}.self_attn.q_proj.weight": WeightMapping(f"{t}.self_attn.q_proj.weight", (None, "tensor"), True),
         f"{s}.self_attn.q_proj.bias":   WeightMapping(f"{t}.self_attn.q_proj.bias", (None,), False),
         f"{s}.self_attn.k_proj.weight": WeightMapping(f"{t}.self_attn.k_proj.weight", (None, "tensor"), True),
