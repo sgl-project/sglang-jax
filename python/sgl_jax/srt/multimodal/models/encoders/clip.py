@@ -219,7 +219,7 @@ class CLIPVisionModel(nnx.Module):
 
     def _weight_mappings(self):
         m = {
-            "vision_model.embeddings.class_embedding": WeightMapping("embeddings.class_embedding.value", (None,), False),
+            "vision_model.embeddings.class_embedding": WeightMapping("embeddings.class_embedding", (None,), False),
             "vision_model.embeddings.patch_embedding.weight": WeightMapping("embeddings.patch_embedding.kernel", (None,), False),
             "vision_model.embeddings.position_embedding.weight": WeightMapping("embeddings.position_embedding.embedding", ("tensor", None), False),
             "vision_model.pre_layrnorm.weight": WeightMapping("pre_layrnorm.scale", (None,), False),
