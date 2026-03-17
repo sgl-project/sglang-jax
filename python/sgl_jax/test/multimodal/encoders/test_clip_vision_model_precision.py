@@ -124,6 +124,8 @@ def test_vision_single(model_name, mesh, precision):
 
     with torch.no_grad():
         hf_out = hf(pixel_values=pixel_values).last_hidden_state
+        # We manually apply this operation to the HF output here to align them for testing:
+        hf_out = hf.vision_model.post_layernorm(hf_out)
 
     with jax.set_mesh(mesh):
         jax_out = jax_m(jnp.array(pixel_values.numpy(), dtype=DTYPE[precision][1]))
@@ -141,8 +143,6 @@ def test_vision_hidden_states(model_name, mesh, precision):
     with torch.no_grad():
         # HF: output_hidden_states returns all intermediate features (before post_layernorm!)
         hf_out = hf(pixel_values=pixel_values, output_hidden_states=True)
-        # We manually apply this operation to the HF output here to align them for testing:
-        hf_out = hf.vision_model.post_layernorm(hf_out)
 
     with jax.set_mesh(mesh):
         # JAX: We matched the un-normed intermediate output hook
