@@ -235,10 +235,10 @@ def _layer_mappings(config, idx, src_prefix, tgt_prefix):
         ),
         f"{s}.self_attn.v_proj.bias": WeightMapping(f"{t}.self_attn.v_proj.bias", (None,), False),
         f"{s}.self_attn.out_proj.weight": WeightMapping(
-            f"{t}.self_attn.out_proj.weight", ("tensor", None), False
+            f"{t}.self_attn.out_proj.weight", ("tensor", None), True
         ),
         f"{s}.self_attn.out_proj.bias": WeightMapping(
-            f"{t}.self_attn.out_proj.bias", (None,), True
+            f"{t}.self_attn.out_proj.bias", (None,), False
         ),
         f"{s}.mlp.fc1.weight": WeightMapping(f"{t}.mlp.fc1.weight", (None, "tensor"), True),
         f"{s}.mlp.fc1.bias": WeightMapping(f"{t}.mlp.fc1.bias", (None,), False),
