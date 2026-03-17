@@ -26,6 +26,10 @@ class DeviceManager:
     def allocate(self, num_tpus: int):
         """Allocate `num_tpus` devices from the allocatable pool.
 
+        Allocates the LARGEST contiguous block first to ensure 4+ device
+        meshes get topologically valid device groups. Smaller allocations
+        (1-2 devices) are taken from what remains.
+
         Returns an array of integer indices representing allocated devices.
         Raises an Exception if there are not enough free devices.
         """

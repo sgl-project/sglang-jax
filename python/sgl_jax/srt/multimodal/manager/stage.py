@@ -77,7 +77,8 @@ class Stage:
     """
 
     def __init__(
-        self, stage_config: Any, *, device_manager: DeviceManager, server_args: ServerArgs
+        self, stage_config: Any, *, device_manager: DeviceManager, server_args: ServerArgs,
+        pre_allocated_devices=None,
     ):
         """Initialize stage resources and create the device mesh.
 
@@ -86,6 +87,8 @@ class Stage:
                 scheduler information).
             device_manager: `DeviceManager` used to reserve device indices.
             server_args: Global server arguments passed to schedulers.
+            pre_allocated_devices: Optional pre-allocated device indices. If provided,
+                skips device_manager.allocate and uses these directly.
         """
         self._in_queue = None
         self._out_queue = None
@@ -104,11 +107,11 @@ class Stage:
                 devices=cpu_devices[:num_devices],
             )
         else:
-            # this parallelism setting is accord to stage config
+            device_indexes = pre_allocated_devices if pre_allocated_devices is not None else device_manager.allocate(num_devices)
             self.mesh = create_device_mesh(
                 ici_parallelism=[-1, num_devices],
                 dcn_parallelism=[1, 1],
-                device_indexes=device_manager.allocate(num_devices),
+                device_indexes=device_indexes,
             )
         self.stage_config = stage_config
         self.server_args = server_args

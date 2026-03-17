@@ -82,9 +82,6 @@ class Gemma2Attention(nnx.Module):
         logit_cap: float = 0,
         attention_bias: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
-        is_causal: bool = True,
-        rope_scaling_factor: float = 1.0,
-        qk_norm: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -125,14 +122,6 @@ class Gemma2Attention(nnx.Module):
             mesh=mesh,
         )
 
-        # QK normalization (Gemma3 has this, Gemma2 does not)
-        if qk_norm:
-            self.q_norm = GemmaRMSNorm(self.head_dim, epsilon=1e-6)
-            self.k_norm = GemmaRMSNorm(self.head_dim, epsilon=1e-6)
-        else:
-            self.q_norm = None
-            self.k_norm = None
-
         self.rotary_emb = RotaryEmbedding(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
@@ -140,9 +129,7 @@ class Gemma2Attention(nnx.Module):
             base=rope_theta,
             is_neox_style=True,
             dtype=dtype,
-            scaling_factor=rope_scaling_factor,
         )
-        from sgl_jax.srt.layers.radix_attention import AttentionType
         self.attn = RadixAttention(
             num_heads=num_heads,
             head_dim=self.head_dim,
@@ -151,7 +138,6 @@ class Gemma2Attention(nnx.Module):
             layer_id=layer_id,
             sliding_window_size=sliding_window_size,
             logit_cap=logit_cap,
-            attn_type=AttentionType.DECODER if is_causal else AttentionType.ENCODER_ONLY,
         )
         self.layer_id = layer_id
 
@@ -164,16 +150,9 @@ class Gemma2Attention(nnx.Module):
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
-
         q = q.reshape(-1, self.num_heads, self.head_dim)
         k = k.reshape(-1, self.num_kv_heads, self.head_dim)
         v = v.reshape(-1, self.num_kv_heads, self.head_dim)
-
-        if self.q_norm is not None:
-            q = self.q_norm(q)
-        if self.k_norm is not None:
-            k = self.k_norm(k)
-
         q, k = self.rotary_emb(forward_batch.positions, q, k)
         attn_output, kv_fused = self.attn(
             q, k, v, forward_batch=forward_batch, token_to_kv_pool=token_to_kv_pool
@@ -191,21 +170,7 @@ class Gemma2DecoderLayer(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
     ):
         self.layer_id = layer_id
-        # In Gemma 3, sliding_attention layers use local RoPE (different theta, no scaling)
-        use_sliding_window = False
-        if hasattr(config, "layer_types"):
-            use_sliding_window = config.layer_types[layer_id] == "sliding_attention"
-        is_causal = not getattr(config, "use_bidirectional_attention", False)
-        
-        if use_sliding_window and hasattr(config, "rope_local_base_freq"):
-            layer_rope_theta = config.rope_local_base_freq
-            rope_scaling_factor = 1.0
-        else:
-            layer_rope_theta = config.rope_theta
-            rope_scaling_factor = 1.0
-            if getattr(config, "rope_scaling", None):
-                rope_scaling_factor = config.rope_scaling.get("factor", 1.0)
-            
+        use_sliding_window = config.layer_types[layer_id] == "sliding_attention"
         self.self_attn = Gemma2Attention(
             layer_id,
             config.hidden_size,
@@ -213,16 +178,13 @@ class Gemma2DecoderLayer(nnx.Module):
             config.num_key_value_heads,
             config.head_dim,
             config.max_position_embeddings,
-            mesh=mesh,
-            rope_theta=layer_rope_theta,
+            rope_theta=config.rope_theta,
             query_pre_attn_scalar=config.query_pre_attn_scalar,
             sliding_window_size=config.sliding_window if use_sliding_window else 0,
             logit_cap=getattr(config, "attn_logit_softcapping", 0.0),
-            attention_bias=getattr(config, "attention_bias", False),
+            attention_bias=config.attention_bias,
             dtype=dtype,
-            is_causal=is_causal,
-            rope_scaling_factor=rope_scaling_factor,
-            qk_norm=getattr(config, "model_type", "").startswith("gemma3"),
+            mesh=mesh,
         )
         self.mlp = Gemma2MLP(
             config.hidden_size,
@@ -254,9 +216,15 @@ class Gemma2DecoderLayer(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        residual: jax.Array | None = None,
     ):
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states += residual
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states, kv_fused = self.self_attn(
             hidden_states=hidden_states,
@@ -270,8 +238,8 @@ class Gemma2DecoderLayer(nnx.Module):
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states, kv_fused
+
+        return hidden_states, residual, kv_fused
 
 
 class Gemma2Model(nnx.Module):
@@ -321,23 +289,26 @@ class Gemma2Model(nnx.Module):
         if self.capture_aux_hidden_states:
             aux_hidden_states.append(hidden_states)
 
+        residual = None
         layers_kv_fused = []
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states, kv_fused = layer(
-                hidden_states, forward_batch, token_to_kv_pool
+            hidden_states, residual, kv_fused = layer(
+                hidden_states, forward_batch, token_to_kv_pool, residual
             )
             layers_kv_fused.append(kv_fused)
             if self.capture_aux_hidden_states:
-                if i < len(self.layers) - 1:
-                    aux_hidden_states.append(hidden_states)
+                aux_hidden_states.append(hidden_states + residual if residual is not None else hidden_states)
+
+        if residual is not None:
+            hidden_states += residual
 
         hidden_states = self.norm(hidden_states)
 
         if self.capture_aux_hidden_states:
-            aux_hidden_states.append(hidden_states)
             return hidden_states, aux_hidden_states, layers_kv_fused
         return hidden_states, layers_kv_fused
+
 
 class Gemma2ForCausalLM(nnx.Module):
     def __init__(

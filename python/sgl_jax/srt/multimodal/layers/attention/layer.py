@@ -29,17 +29,16 @@ def simple_attention(query, key, value, scale=None, causal=False, mask=None):
         output: [B, S, H, D]
     """
     if scale is None:
-        scale = 1.0 / math.sqrt(query.shape[-1])
+        scale = 1.0 / jnp.sqrt(query.shape[-1])
 
     # [B, H, S, D]
     q = jnp.transpose(query, (0, 2, 1, 3))
     k = jnp.transpose(key, (0, 2, 1, 3))
     v = jnp.transpose(value, (0, 2, 1, 3))
 
-    # [B, H, S, S]
-    # Perform dot product in bfloat16 but immediately cast to float32 for softmax stability
+    orig_dtype = q.dtype
+
     attn_weights = jnp.einsum("bhsd,bhtd->bhst", q, k) * scale
-    orig_dtype = attn_weights.dtype
     attn_weights = attn_weights.astype(jnp.float32)
 
     if mask is not None:

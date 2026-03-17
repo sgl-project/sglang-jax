@@ -51,7 +51,7 @@ class LTX2ModelConfig(MultiModalModelConfigs):
 
     # Timestep embedding parameters
     timestep_scale_multiplier: int = 1000
-    av_ca_timestep_scale_multiplier: int = 1  # Audio-video cross attention timestep scale
+    av_ca_timestep_scale_multiplier: float = 1000.0  # Audio-video cross attention timestep scale
 
     # Patch embedding parameters
     patch_size: tuple[int, int, int] = (1, 2, 2)  # (temporal, height, width)
@@ -84,7 +84,7 @@ class LTX2ModelConfig(MultiModalModelConfigs):
     base_shift: float = 0.95
     max_shift: float = 2.05
     stg_mode: bool = True
-    fps: float = 25.0
+    fps: float = 24.0
     max_sequence_length: int = 1024
     flow_shift: float | None = None
 

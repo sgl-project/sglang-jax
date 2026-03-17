@@ -3,6 +3,7 @@ import math
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 
 from sgl_jax.srt.layers.layernorm import RMSNorm
@@ -28,9 +29,22 @@ def _apply_split_rotary_flat(
     Matches PyTorch's apply_split_rotary_emb exactly.
     """
     batch_size, seq_len, d = x.shape
+    orig_dtype = x.dtype
+    x = x.astype(jnp.float32)
     # Infer num_heads from cos shape [1, num_heads, seq_len, head_dim/2]
     num_heads = cos.shape[1]
     head_dim = d // num_heads
+
+    # If tensor-sharded and num_heads doesn't divide evenly (e.g. 30 heads on 8 TPUs),
+    # replicate before reshape to avoid data corruption.
+    if mesh is not None:
+        from jax.sharding import NamedSharding, PartitionSpec as P
+        try:
+            shard = x.sharding
+            if hasattr(shard, 'shard_shape') and shard.shard_shape(x.shape)[-1] % head_dim != 0:
+                x = jax.lax.with_sharding_constraint(x, NamedSharding(mesh, P()))
+        except Exception:
+            pass
 
     # PyTorch LTX-2 uses [B, H, T, D_head] for rotation
     # x: [B, T, num_heads, head_dim]
@@ -59,17 +73,17 @@ def _apply_split_rotary_flat(
     # Swap back to [B, T, num_heads, head_dim]
     output = jnp.swapaxes(output, 1, 2)
     # Flatten back to [B, T, D]
-    return output.reshape(batch_size, seq_len, d)
+    return output.reshape(batch_size, seq_len, d).astype(orig_dtype)
 
 
 def compute_video_pe(T: int, H: int, W: int, fps: float, theta: float, inner_dim: int, num_attention_heads: int):
     """Compute video positional embeddings in split RoPE format.
 
-    Matches the PyTorch ltx_core reference implementation:
-    - Uses geometric frequency spacing (theta^linspace * pi/2)
-    - Causal fix on temporal axis
-    - Midpoint coordinates for all axes
+    Matches the PyTorch pipeline: get_patch_grid_bounds → get_pixel_coords →
+    /fps → generate_freqs (midpoints, fractional, scaled to [-1,1]).
+    - Pixel-space coordinates with causal fix on temporal axis
     - Fractional positions normalized by max_pos, scaled to [-1, 1]
+    - Geometric frequency spacing (theta^linspace * pi/2)
     - Split format: cos/sin reshaped to [1, num_heads, seq_len, head_dim/2]
 
     Returns (freqs_cos, freqs_sin) each of shape [1, num_heads, seq_len, head_dim/2].
@@ -79,20 +93,24 @@ def compute_video_pe(T: int, H: int, W: int, fps: float, theta: float, inner_dim
     n_elem = 2 * 3  # 2 * max_pos_count (T, H, W)
     indices_len = inner_dim // n_elem
 
-    lin = jnp.linspace(
-        math.log(start) / math.log(theta),
-        math.log(end) / math.log(theta),
-        indices_len,
-        dtype=jnp.float32,
+    # Use float64 for theta^linspace power computation (matching PyTorch's
+    # generate_freq_grid_np with double_precision_rope=True).
+    # Use numpy directly to bypass JAX float64 requirement and avoid JIT errors
+    pow_indices = np.power(
+        theta,
+        np.linspace(
+            math.log(start) / math.log(theta),
+            math.log(end) / math.log(theta),
+            indices_len,
+            dtype=np.float64,
+        ),
     )
-
-    indices = theta ** lin
-    indices = indices * (math.pi / 2.0)
+    indices = jnp.array((pow_indices * (math.pi / 2.0)), dtype=jnp.float32)
 
     max_pos = [20, 2048, 2048]
     scale_factors = [8, 32, 32]
 
-    # Temporal coordinates with causal fix
+    # Temporal coordinates with causal fix (matches get_pixel_coords + /fps)
     t_start = jnp.arange(T, dtype=jnp.float32) * scale_factors[0]
     t_end = t_start + scale_factors[0]
     shift = scale_factors[0] - 1
@@ -172,13 +190,18 @@ def compute_1d_pe(midpoints, theta, inner_dim, num_heads, max_pos=20):
     n_elem = 2  # 1D: 2 * num_spatial_dims
     indices_len = inner_dim // n_elem
 
-    lin = jnp.linspace(
-        math.log(1.0) / math.log(theta),
-        1.0,
-        indices_len,
-        dtype=jnp.float32,
+    # Use float64 for theta^linspace (matching PyTorch generate_freq_grid_np)
+    # Use numpy directly to bypass JAX float64 requirement and avoid JIT errors
+    pow_indices = np.power(
+        theta,
+        np.linspace(
+            math.log(1.0) / math.log(theta),
+            1.0,
+            indices_len,
+            dtype=np.float64,
+        ),
     )
-    indices = theta ** lin * (math.pi / 2.0)
+    indices = jnp.array((pow_indices * (math.pi / 2.0)), dtype=jnp.float32)
 
     frac = midpoints / max_pos
     frac_scaled = (frac * 2.0 - 1.0)[:, None]  # [seq_len, 1]
@@ -219,11 +242,13 @@ def _apply_interleaved_rotary_flat(
     Pairs adjacent elements: (x0, x1), (x2, x3), ...
     cos, sin: [1, T, D] (already repeat_interleaved from freq computation).
     """
+    orig_dtype = x.dtype
+    x = x.astype(jnp.float32)
     x_paired = x.reshape(*x.shape[:-1], -1, 2)  # [..., D/2, 2]
     x0, x1 = x_paired[..., 0], x_paired[..., 1]
     x_rot = jnp.stack([-x1, x0], axis=-1)  # [..., D/2, 2]
     x_rot = x_rot.reshape(x.shape)
-    return x * cos + x_rot * sin
+    return (x * cos + x_rot * sin).astype(orig_dtype)
 
 
 def _audio_temporal_midpoints(T_audio):
@@ -238,7 +263,7 @@ def _audio_temporal_midpoints(T_audio):
 
     mel_frames = jnp.arange(T_audio, dtype=jnp.float32) * downsample_factor
     start_mel = jnp.maximum(mel_frames + causal_offset - downsample_factor, 0.0)
-    end_mel = mel_frames + causal_offset
+    end_mel = jnp.maximum(mel_frames + causal_offset, 0.0)
 
     t_start = start_mel * hop_length / sample_rate
     t_end = end_mel * hop_length / sample_rate
@@ -339,6 +364,7 @@ class LTX2Attention(nnx.Module):
         mask: jax.Array | None = None,
         pe: jax.Array | None = None,
         k_pe: jax.Array | None = None,
+        perturbation_mask: float | jax.Array = 1.0,
         req=None,
     ) -> jax.Array:
         """
@@ -348,6 +374,7 @@ class LTX2Attention(nnx.Module):
             mask: Attention mask
             pe: Positional embeddings (cos, sin) each [T, inner_dim] interleaved
             k_pe: Positional embeddings for keys
+            perturbation_mask: STG mask for blending output with raw value
         """
         context = context if context is not None else x
         b, n, d = x.shape[0], self.heads, self.dim_head
@@ -381,6 +408,13 @@ class LTX2Attention(nnx.Module):
 
         # Compute attention
         attn_output = self.attn(q, k, v, req=req, mask=mask)
+
+        # Apply perturbation mask for STG
+        if isinstance(perturbation_mask, jax.Array) or perturbation_mask != 1.0:
+            pm = perturbation_mask
+            if isinstance(pm, jax.Array) and pm.ndim < 4:
+                pm = jnp.expand_dims(pm, axis=tuple(range(pm.ndim, 4)))
+            attn_output = attn_output * pm + v * (1.0 - pm)
 
         # Flatten: (B, seq, heads, head_dim) -> (B, seq, heads*head_dim)
         attn_output = attn_output.reshape(attn_output.shape[0], attn_output.shape[1], -1)
@@ -562,7 +596,7 @@ class LTX2TransformerBlock(nnx.Module):
             if "stg_mask" in video_args and self.idx in video_args.get("stg_blocks", []):
                 v_mask = video_args["stg_mask"]
 
-            vx = vx + self.attn1(norm_vx, pe=video_args.get("pe"), req=req) * vgate_msa * v_mask
+            vx = vx + self.attn1(norm_vx, pe=video_args.get("pe"), perturbation_mask=v_mask, req=req) * vgate_msa
 
             # Cross-attention with text
             cross_attn_out = self.attn2(
@@ -587,7 +621,7 @@ class LTX2TransformerBlock(nnx.Module):
             if "stg_mask" in video_args and self.idx in video_args.get("stg_blocks", []):
                 a_mask = video_args["stg_mask"]
 
-            ax = ax + self.audio_attn1(norm_ax, pe=audio_args.get("pe"), req=req) * agate_msa * a_mask
+            ax = ax + self.audio_attn1(norm_ax, pe=audio_args.get("pe"), perturbation_mask=a_mask, req=req) * agate_msa
 
             ax = ax + self.audio_attn2(
                 self._rms_norm(ax),
@@ -918,6 +952,7 @@ class LTX2Transformer3DModel(nnx.Module):
         audio_latent: jax.Array | None = None,
         video_context: jax.Array | None = None,
         audio_context: jax.Array | None = None,
+        audio_timesteps: jax.Array | None = None,
         video_positions: jax.Array | None = None,
         audio_positions: jax.Array | None = None,
         video_context_mask: jax.Array | None = None,
@@ -1045,10 +1080,11 @@ class LTX2Transformer3DModel(nnx.Module):
         if audio_latent is not None and self.config.is_audio_enabled:
             ax = self.audio_patch_embedding(audio_latent)
             batch_size = ax.shape[0]
+            audio_timesteps_to_use = audio_timesteps if audio_timesteps is not None else timesteps
 
             # Timestep embedding: returns (adaln_cond, embedded_ts) tuple
             a_adaln_cond, a_embedded_ts = self.audio_adaln_single(
-                timesteps.flatten() * self.config.timestep_scale_multiplier
+                audio_timesteps_to_use.flatten() * self.config.timestep_scale_multiplier
             )
             a_adaln_cond = a_adaln_cond.reshape(batch_size, 1, a_adaln_cond.shape[-1])
 
@@ -1078,10 +1114,10 @@ class LTX2Transformer3DModel(nnx.Module):
             # Add cross attention timesteps if video is enabled
             if self.config.is_video_enabled:
                 a_cross_ss_adaln, _ = self.av_ca_audio_scale_shift_adaln(
-                    timesteps.flatten() * self.config.timestep_scale_multiplier
+                    audio_timesteps_to_use.flatten() * self.config.timestep_scale_multiplier
                 )
                 a_cross_gate_adaln, _ = self.av_ca_v2a_gate_adaln(
-                    timesteps.flatten() * self.config.av_ca_timestep_scale_multiplier
+                    audio_timesteps_to_use.flatten() * self.config.av_ca_timestep_scale_multiplier
                 )
                 audio_args["cross_scale_shift_timestep"] = a_cross_ss_adaln.reshape(
                     batch_size, 1, a_cross_ss_adaln.shape[-1]

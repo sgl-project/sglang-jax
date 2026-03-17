@@ -15,6 +15,8 @@ from jax.sharding import NamedSharding, PartitionSpec
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.layers.embeddings import RotaryEmbedding
+from sgl_jax.srt.layers.layernorm import GemmaRMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.models.gemma2 import Gemma2Model
@@ -60,6 +62,7 @@ class Embeddings1DConnector(nnx.Module):
     def __init__(self, num_layers=2, dim=3840, heads=30, dim_head=128, num_registers=128, mesh=None):
         super().__init__()
         self.dim = dim
+        self.heads = heads
         self.num_registers = num_registers
         self.blocks = [_BasicTransformerBlock1D(dim, heads, dim_head, mesh) for _ in range(num_layers)]
         if hasattr(nnx, 'data'):
@@ -69,12 +72,19 @@ class Embeddings1DConnector(nnx.Module):
             self.learnable_registers = nnx.Param(jnp.zeros((num_registers, dim), dtype=jnp.float32))
 
     def _compute_pe(self, L):
-        """Compute interleaved RoPE positional embeddings for the connector."""
+        """Compute interleaved RoPE positional embeddings for the connector.
+
+        Uses max_pos=[4096] from checkpoint config and f64 frequency grid.
+        """
         theta = 10000.0
         n_freqs = self.dim // 2  # 1920
-        indices = theta ** jnp.linspace(0.0, 1.0, n_freqs, dtype=jnp.float32) * (jnp.pi / 2)
+        max_pos = 4096  # From checkpoint config: connector_positional_embedding_max_pos=[4096]
+        # Frequency grid: f64 for theta^linspace (matching PyTorch)
+        pow_indices = jnp.power(theta, jnp.linspace(0.0, 1.0, n_freqs, dtype=jnp.float64))
+        indices = (pow_indices * (jnp.pi / 2.0)).astype(jnp.float32)
         positions = jnp.arange(L, dtype=jnp.float32)
-        pos_scaled = positions * 2.0 - 1.0  # centered: [-1, 1, 3, 5, ...]
+        frac = positions / max_pos
+        pos_scaled = frac * 2.0 - 1.0
         freqs = indices[None, :] * pos_scaled[:, None]  # [L, 1920]
         cos_freq = jnp.repeat(jnp.cos(freqs), 2, axis=-1)  # [L, 3840]
         sin_freq = jnp.repeat(jnp.sin(freqs), 2, axis=-1)  # [L, 3840]
@@ -154,7 +164,7 @@ class GemmaFeaturesExtractorProjLinear(nnx.Module):
             mean_per_token = jnp.zeros((t, 1, l), dtype=hs.dtype)
             range_per_token = jnp.ones((t, 1, l), dtype=hs.dtype)
             for i in range(batch_size):
-                req_mask = (request_ids == i)  # [T]
+                req_mask = (request_ids == i) & mask[0]  # [T]
                 req_sum = (hs * req_mask[:, None, None]).sum(axis=(0, 1), keepdims=True)  # [1, 1, L]
                 req_count = req_mask.sum() * d
                 req_mean = req_sum / (req_count + eps)  # [1, 1, L]
@@ -200,10 +210,11 @@ class LTX2GemmaTextEncoder(nnx.Module):
         self.mesh = mesh
         self.dtype = dtype
 
-        # Use causal attention (matching PyTorch Gemma3ForConditionalGeneration).
-        # The feature extractor was trained with causal Gemma hidden states.
         self.model = Gemma2Model(config, dtype=dtype, mesh=mesh)
         self.model.capture_aux_hidden_states = True
+        # Augment Gemma2Model layers with Gemma3-specific features (QK norms,
+        # per-layer RoPE theta/scaling) needed by forward_no_cache.
+        self._augment_gemma3_layers(config, dtype)
 
         self.hidden_size = config.hidden_size
 
@@ -294,6 +305,48 @@ class LTX2GemmaTextEncoder(nnx.Module):
         dummy = jax.device_put(dummy, NamedSharding(self.mesh, PartitionSpec(None, "tensor")))
         return LogitsProcessorOutput(next_token_logits=dummy, hidden_states=encoded_ctx, audio_hidden_states=audio_encoded_ctx), layers_kv_fused, [], None
 
+    def _augment_gemma3_layers(self, config, dtype):
+        """Add Gemma3-specific features to Gemma2Model layers.
+
+        The base Gemma2Model doesn't have QK normalization or per-layer RoPE
+        theta/scaling. Gemma3 requires these. We add them here so that
+        forward_no_cache can use them without modifying the shared gemma2.py.
+        """
+        is_gemma3 = getattr(config, "model_type", "").startswith("gemma3")
+        if not is_gemma3:
+            return
+
+        for i, layer in enumerate(self.model.layers):
+            attn = layer.self_attn
+
+            # Add QK normalization (Gemma3 has this, Gemma2 does not)
+            attn.q_norm = GemmaRMSNorm(config.head_dim, epsilon=1e-6)
+            attn.k_norm = GemmaRMSNorm(config.head_dim, epsilon=1e-6)
+
+            # Replace RoPE with correct per-layer theta and scaling.
+            # Gemma3 sliding_attention layers use a local rope base freq
+            # with no scaling. Global layers use the main rope_theta with
+            # linear scaling.
+            is_sliding = config.layer_types[i] == "sliding_attention"
+            if is_sliding and hasattr(config, "rope_local_base_freq"):
+                layer_rope_theta = config.rope_local_base_freq
+                scaling_factor = 1.0
+            else:
+                layer_rope_theta = config.rope_theta
+                scaling_factor = 1.0
+                if getattr(config, "rope_scaling", None):
+                    scaling_factor = config.rope_scaling.get("factor", 1.0)
+
+            attn.rotary_emb = RotaryEmbedding(
+                head_size=config.head_dim,
+                rotary_dim=config.head_dim,
+                max_position_embeddings=config.max_position_embeddings,
+                base=layer_rope_theta,
+                is_neox_style=True,
+                dtype=dtype,
+                scaling_factor=scaling_factor,
+            )
+
     def forward_no_cache(self, input_ids_pos, input_ids_neg):
         """Run the full text encoder pipeline without KV cache.
 
@@ -310,12 +363,27 @@ class LTX2GemmaTextEncoder(nnx.Module):
         """
         PROMPT_LEN = 1024
 
-        all_ids = [input_ids_pos, input_ids_neg]
-        all_hidden_stacks = []  # will hold [seq_len, D, L] per prompt
+        all_ids_raw = [input_ids_pos, input_ids_neg]
+        all_hidden_stacks = []  # will hold [1024, D, L] per prompt
+        
+        # We need a shared mask for the Gemma feature extractor projection
+        all_masks = []
+        original_lens = []
 
-        for ids in all_ids:
-            ids_array = jnp.array(ids, dtype=jnp.int32)
-            seq_len = ids_array.shape[0]
+        for ids in all_ids_raw:
+            original_len = len(ids)
+            original_lens.append(original_len)
+            
+            # 1. Pad input_ids upfront (matching PyTorch)
+            padded_ids = ids + [0] * (PROMPT_LEN - original_len)
+            ids_array = jnp.array(padded_ids, dtype=jnp.int32)
+            
+            # 2. Create attention mask
+            attention_mask = [True] * original_len + [False] * (PROMPT_LEN - original_len)
+            mask_array = jnp.array(attention_mask, dtype=jnp.bool_)
+            all_masks.append(mask_array)
+            
+            seq_len = ids_array.shape[0] # Now exactly 1024
 
             # Embedding
             hidden = self.model.embed_tokens(ids_array)
@@ -327,7 +395,7 @@ class LTX2GemmaTextEncoder(nnx.Module):
 
             # Run through all Gemma layers with simple_attention
             for i, layer in enumerate(self.model.layers):
-                hidden = self._layer_forward_no_cache(layer, hidden, seq_len)
+                hidden = self._layer_forward_no_cache(layer, hidden, seq_len, mask_array)
                 if i < len(self.model.layers) - 1:
                     aux_hidden_states.append(hidden)
 
@@ -339,19 +407,16 @@ class LTX2GemmaTextEncoder(nnx.Module):
             all_hidden_stacks.append(stacked)
 
         # Concatenate both prompts for feature extraction
-        combined = jnp.concatenate(all_hidden_stacks, axis=0)  # [N_total, D, L]
+        combined = jnp.concatenate(all_hidden_stacks, axis=0)  # [N_total=2048, D, L]
         n_total = combined.shape[0]
         combined = combined.reshape(1, n_total, combined.shape[1], combined.shape[2])
-        mask = jnp.ones((1, n_total), dtype=jnp.bool_)
+        
+        # Mask needs to reflect real vs padded for the feature extractor
+        mask = jnp.concatenate(all_masks, axis=0).reshape(1, n_total) # [1, 2048]
 
-        seq_lens = jnp.array(
-            [len(input_ids_pos), len(input_ids_neg)], dtype=jnp.int32
-        )
-        cum = jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(seq_lens)])
-
-        # Per-request IDs for feature extractor normalization
+        # Per-request IDs for feature extractor normalization (0 for pos, 1 for neg)
         positions = jnp.arange(n_total)
-        request_ids = jnp.where(positions < cum[1], 0, 1)
+        request_ids = jnp.where(positions < PROMPT_LEN, 0, 1)
 
         projected = self.feature_extractor(
             combined, mask, request_ids=request_ids, batch_size=2
@@ -361,13 +426,15 @@ class LTX2GemmaTextEncoder(nnx.Module):
         results = []
         audio_results = []
         for i in range(2):
-            local_pos = jnp.arange(PROMPT_LEN)
-            global_pos = cum[i] + local_pos
-            valid = local_pos < seq_lens[i]
-            safe_pos = jnp.where(valid, global_pos, jnp.int32(0))
-            chunk = projected[0][safe_pos]  # [1024, 3840]
-            chunk = jnp.where(valid[:, None], chunk, 0.0)
-            num_valid = seq_lens[i]
+            # Because we padded the input tokens upfront, the projected features 
+            # are ALREADY length 1024 per prompt. We just need to slice them out.
+            start_idx = i * PROMPT_LEN
+            end_idx = start_idx + PROMPT_LEN
+            chunk = projected[0][start_idx:end_idx]  # [1024, 3840]
+            
+            num_valid = original_lens[i]
+            
+            # The connector will replace the 0-padded features with the learnable registers
             encoded_chunk = self.embeddings_connector(
                 chunk[None], num_valid_tokens=num_valid
             )
@@ -380,7 +447,7 @@ class LTX2GemmaTextEncoder(nnx.Module):
 
         return results[0], results[1], audio_results[0], audio_results[1]
 
-    def _layer_forward_no_cache(self, layer, hidden_states, seq_len):
+    def _layer_forward_no_cache(self, layer, hidden_states, seq_len, mask_array):
         """Run a single Gemma decoder layer using simple_attention (no KV cache)."""
         residual = hidden_states
         hidden_states = layer.input_layernorm(hidden_states)
@@ -394,10 +461,12 @@ class LTX2GemmaTextEncoder(nnx.Module):
         k = k.reshape(-1, attn.num_kv_heads, attn.head_dim)
         v = v.reshape(-1, attn.num_kv_heads, attn.head_dim)
 
-        if attn.q_norm is not None:
-            q = attn.q_norm(q)
-        if attn.k_norm is not None:
-            k = attn.k_norm(k)
+        q_norm = getattr(attn, "q_norm", None)
+        k_norm = getattr(attn, "k_norm", None)
+        if q_norm is not None:
+            q = q_norm(q)
+        if k_norm is not None:
+            k = k_norm(k)
 
         # Apply RoPE
         positions = jnp.arange(seq_len, dtype=jnp.int32)
@@ -414,7 +483,10 @@ class LTX2GemmaTextEncoder(nnx.Module):
             k = jnp.repeat(k, copies, axis=2)
             v = jnp.repeat(v, copies, axis=2)
 
-        attn_output = simple_attention(q, k, v, scale=attn.scaling, causal=True)
+        # Create 2D boolean mask for attention: [1, S_k]
+        attn_mask = mask_array[None]
+
+        attn_output = simple_attention(q, k, v, scale=attn.scaling, causal=True, mask=attn_mask)
         attn_output = attn_output[0]  # [S, H, D]
         attn_output = attn_output.reshape(-1, attn.num_heads * attn.head_dim)
         output, _ = attn.o_proj(attn_output)

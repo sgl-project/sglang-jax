@@ -116,9 +116,17 @@ class GlobalScheduler:
         dispatcher mapping.
         """
 
+        # Pre-allocate devices for each stage sequentially (largest first)
+        # to ensure valid TPU mesh topologies before parallel stage building.
+        stage_devices = {}
+        configs_by_size = sorted(enumerate(self.stage_configs), key=lambda x: x[1].runtime.num_tpus, reverse=True)
+        for idx, cfg in configs_by_size:
+            stage_devices[idx] = self.device_manager.allocate(cfg.runtime.num_tpus)
+
         def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, Stage]:
             idx, cfg = idx_cfg
-            return idx, Stage(cfg, device_manager=self.device_manager, server_args=self.server_args)
+            return idx, Stage(cfg, device_manager=self.device_manager, server_args=self.server_args,
+                              pre_allocated_devices=stage_devices[idx])
 
         with ThreadPoolExecutor(
             max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))
