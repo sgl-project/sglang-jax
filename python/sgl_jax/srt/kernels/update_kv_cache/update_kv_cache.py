@@ -149,7 +149,7 @@ def kv_cache_update(
         assert (
             slices.shape[1] % num_slices_per_block == 0
         ), f"slices.shape[1]={slices.shape[1]} is not divisible by num_slices_per_block={num_slices_per_block}"
-        _, num_combined_kv_heads, actual_head_dim = new_kv.shape
+        _, num_combined_kv_heads, head_dim = new_kv.shape
 
         assert num_combined_kv_heads % 2 == 0, (
             f"num_combined_kv_heads={num_combined_kv_heads} should be even after pre-padding. "
@@ -160,18 +160,9 @@ def kv_cache_update(
             kv_cache.shape[1] == num_combined_kv_heads
         ), f"kv_cache.shape[1]={kv_cache.shape[1]} is not equal to num_combined_kv_heads={num_combined_kv_heads}"
         assert (
-            kv_cache.shape[2] == actual_head_dim
-        ), f"kv_cache.shape[2]={kv_cache.shape[2]} is not equal to actual_head_dim={actual_head_dim}"
-
-        # Pad head_dim to 128-aligned (same strategy as ragged_paged_attention)
-        aligned_head_dim = (actual_head_dim + 127) // 128 * 128
-        needs_pad = actual_head_dim != aligned_head_dim
-        if needs_pad:
-            pad_size = aligned_head_dim - actual_head_dim
-            new_kv = jnp.pad(new_kv, ((0, 0), (0, 0), (0, pad_size)))
-            kv_cache = jnp.pad(kv_cache, ((0, 0), (0, 0), (0, pad_size)))
-
-        head_dim = aligned_head_dim
+            kv_cache.shape[2] == head_dim
+        ), f"kv_cache.shape[2]={kv_cache.shape[2]} is not equal to head_dim={head_dim}"
+        assert head_dim % 128 == 0, f"head_dim={head_dim} is not divisible by 128"
 
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
@@ -209,10 +200,6 @@ def kv_cache_update(
         )
 
         result = kernel(*scalar_prefetches, new_kv, kv_cache)[0]
-
-        # Trim back to actual head_dim
-        if needs_pad:
-            result = result[..., :actual_head_dim]
 
         return result
 

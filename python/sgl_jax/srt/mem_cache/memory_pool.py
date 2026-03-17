@@ -9,6 +9,11 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
+
+def _align128(dim: int) -> int:
+    """Align dimension to 128 boundary (required by Pallas kernels on TPU)."""
+    return (dim + 127) // 128 * 128
+
 from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
     get_num_slices_per_block,
     get_slot_mapping,
@@ -351,12 +356,12 @@ class MHATokenToKVPool(KVCache):
             k_buffer_shape = (
                 self.size + self.page_size,
                 self.head_num,
-                self.head_dim,
+                _align128(self.head_dim),
             )
             v_buffer_shape = (
                 self.size + self.page_size,
                 self.head_num,
-                self.v_head_dim,
+                _align128(self.v_head_dim),
             )
             total_memory_per_layer = (
                 k_buffer_shape[0] * k_buffer_shape[1] * k_buffer_shape[2]
@@ -366,7 +371,7 @@ class MHATokenToKVPool(KVCache):
             fused_buffer_shape = (
                 self.size + self.page_size,
                 self.head_num * 2,  # [K0,V0,K1,V1,...]
-                self.head_dim,
+                _align128(self.head_dim),
             )
             total_memory_per_layer = (
                 fused_buffer_shape[0]
@@ -430,7 +435,7 @@ class MHATokenToKVPool(KVCache):
             size_bytes = (
                 (self.size + self.page_size)
                 * self.head_num
-                * (self.head_dim + self.v_head_dim)
+                * (_align128(self.head_dim) + _align128(self.v_head_dim))
                 * jnp.dtype(self.dtype).itemsize
                 * self.layer_num
             )
@@ -438,7 +443,7 @@ class MHATokenToKVPool(KVCache):
             size_bytes = (
                 (self.size + self.page_size)
                 * self.head_num  # num_kv_heads
-                * self.head_dim
+                * _align128(self.head_dim)
                 * 2  # num_heads * 2 (head interleaving)
                 * jnp.dtype(self.dtype).itemsize
                 * self.layer_num
@@ -457,14 +462,14 @@ class MHATokenToKVPool(KVCache):
             k_size = (
                 (self.size + self.page_size)
                 * self.head_num
-                * self.head_dim
+                * _align128(self.head_dim)
                 * jnp.dtype(self.dtype).itemsize
                 * self.layer_num
             )
             v_size = (
                 (self.size + self.page_size)
                 * self.head_num
-                * self.v_head_dim
+                * _align128(self.v_head_dim)
                 * jnp.dtype(self.dtype).itemsize
                 * self.layer_num
             )
@@ -472,7 +477,7 @@ class MHATokenToKVPool(KVCache):
             fused_kv_size = (
                 (self.size + self.page_size)
                 * self.head_num  # num_kv_heads
-                * self.head_dim
+                * _align128(self.head_dim)
                 * 2  # num_heads * 2 (head interleaving)
                 * jnp.dtype(self.dtype).itemsize
                 * self.layer_num
@@ -531,6 +536,13 @@ class MHATokenToKVPool(KVCache):
         page_size = 1 if is_decode else self.page_size
 
         if self.is_split:
+            # Pad new K/V tokens to match buffer's aligned head_dim
+            k_buf_dim = _align128(self.head_dim)
+            v_buf_dim = _align128(self.v_head_dim)
+            if k.shape[-1] < k_buf_dim:
+                k = jnp.pad(k, ((0, 0), (0, 0), (0, k_buf_dim - k.shape[-1])))
+            if v.shape[-1] < v_buf_dim:
+                v = jnp.pad(v, ((0, 0), (0, 0), (0, v_buf_dim - v.shape[-1])))
             # Update separate buffers
             # update_kv_cache_vectorized supports separate k_cache and v_cache
             self.k_buffer[layer_idx], self.v_buffer[layer_idx] = update_kv_cache_vectorized(
@@ -543,6 +555,12 @@ class MHATokenToKVPool(KVCache):
                 kv_partition_axis=self.kv_partition_axis,
             )
         else:
+            # Pad new K/V tokens to match buffer's aligned head_dim
+            buf_dim = _align128(self.head_dim)
+            if k.shape[-1] < buf_dim:
+                k = jnp.pad(k, ((0, 0), (0, 0), (0, buf_dim - k.shape[-1])))
+            if v.shape[-1] < buf_dim:
+                v = jnp.pad(v, ((0, 0), (0, 0), (0, buf_dim - v.shape[-1])))
             # Merge k and v into fused format
             fused_kv = merge_kv(k, v)  # [total_tokens, num_heads * 2, head_dim]
 
@@ -618,11 +636,24 @@ class MHATokenToKVPool(KVCache):
         """
         layer_idx = layer_id - self.start_layer
         if self.is_split:
+            # Pad new K/V tokens to match buffer's aligned head_dim
+            k_buf_dim = _align128(self.head_dim)
+            v_buf_dim = _align128(self.v_head_dim)
+            if cache_k.shape[-1] < k_buf_dim:
+                cache_k = jnp.pad(cache_k, ((0, 0), (0, 0), (0, k_buf_dim - cache_k.shape[-1])))
+            if cache_v.shape[-1] < v_buf_dim:
+                cache_v = jnp.pad(cache_v, ((0, 0), (0, 0), (0, v_buf_dim - cache_v.shape[-1])))
             N = self.k_buffer[layer_idx].shape[0]
             safe_loc = jnp.where(loc >= 0, loc, jnp.int32(N))
             updated_k = self.k_buffer[layer_idx].at[safe_loc].set(cache_k, mode="drop")
             updated_v = self.v_buffer[layer_idx].at[safe_loc].set(cache_v, mode="drop")
             return updated_k, updated_v
+        # Pad new K/V tokens to match buffer's aligned head_dim
+        buf_dim = _align128(self.head_dim)
+        if cache_k.shape[-1] < buf_dim:
+            cache_k = jnp.pad(cache_k, ((0, 0), (0, 0), (0, buf_dim - cache_k.shape[-1])))
+        if cache_v.shape[-1] < buf_dim:
+            cache_v = jnp.pad(cache_v, ((0, 0), (0, 0), (0, buf_dim - cache_v.shape[-1])))
         # Merge k and v into fused format
         fused_kv = merge_kv(cache_k, cache_v)
         N = self.kv_buffer[layer_idx].shape[0]
