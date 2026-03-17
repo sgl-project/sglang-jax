@@ -18,10 +18,7 @@ from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 
 from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm import gmm
-from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import (
-    gmm_v2,
-    is_supported_by_gmm_v2,
-)
+from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import TileSizes, gmm_v2
 
 jax.config.parse_flags_with_absl()
 
@@ -236,9 +233,6 @@ class GmmTest(jtu.JaxTestCase):
             group_offset=group_offset,
         )
 
-        if version == GMM_VERSION_V2 and not is_supported_by_gmm_v2(rhs_scale):
-            self.skipTest("Configuration not supported by gmm_v2")
-
         actual = gmm_wrapper(
             lhs,
             rhs_q,
@@ -251,6 +245,114 @@ class GmmTest(jtu.JaxTestCase):
         ).astype(lhs.dtype)
 
         self.assertArraysAllClose(actual, expected, atol=3e-1, rtol=3e-1)
+
+    @parameterized.product(
+        batch_size=[128],
+        in_size=[1024],
+        out_size=[512],
+        num_groups=[16],
+        weight_dtype=[jnp.int8, jnp.float8_e4m3fn],
+        block_size=[1024],
+        tile_k=[128, 256, 512],
+        group_offset=[0],
+    )
+    def test_gmm_weight_quantized_block_larger_than_tile_k(
+        self,
+        batch_size,
+        in_size,
+        out_size,
+        num_groups,
+        weight_dtype,
+        block_size,
+        tile_k,
+        group_offset,
+    ):
+        """Test that quant_block_size > tile_k is handled correctly."""
+        num_local_groups = num_groups - group_offset
+        key = jax.random.key(0)
+
+        lhs = jax.random.uniform(key, (batch_size, in_size), jnp.bfloat16, -1, 1)
+        rhs = jax.random.uniform(key, (num_local_groups, in_size, out_size), jnp.bfloat16, -1, 1)
+        rhs_q, rhs_scale = quantize_tensor(rhs, weight_dtype, axis=1, block_size=block_size)
+        rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+
+        group_sizes = get_group_sizes(batch_size, num_groups)
+        group_offset = jnp.array(group_offset, dtype=jnp.int32)
+
+        expected = reference_gmm(
+            lhs,
+            rhs_q,
+            group_sizes,
+            rhs_scale=rhs_scale,
+            group_offset=group_offset,
+        )
+
+        tile_info = TileSizes(tile_m=128, tile_k=tile_k, tile_n=out_size)
+        actual = gmm_v2(
+            lhs,
+            rhs_q,
+            group_sizes,
+            rhs_scale=rhs_scale,
+            group_offset=group_offset,
+            tile_info=tile_info,
+            maybe_quantize_lhs=False,
+        ).astype(lhs.dtype)
+
+        self.assertArraysAllClose(actual, expected, atol=3e-1, rtol=3e-1)
+
+    @parameterized.product(
+        batch_size=[128],
+        in_size=[1024],
+        out_size=[512],
+        num_groups=[16],
+        weight_dtype=[jnp.int8, jnp.float8_e4m3fn],
+        block_size=[1024],
+        tile_k=[128, 256, 512],
+        group_offset=[0],
+    )
+    def test_gmm_activation_weight_quantized_block_larger_than_tile_k(
+        self,
+        batch_size,
+        in_size,
+        out_size,
+        num_groups,
+        weight_dtype,
+        block_size,
+        tile_k,
+        group_offset,
+    ):
+        """Test activation+weight quantized path with quant_block_size > tile_k."""
+        num_local_groups = num_groups - group_offset
+        key = jax.random.key(0)
+
+        lhs = jax.random.uniform(key, (batch_size, in_size), jnp.bfloat16, -1, 1)
+        rhs = jax.random.uniform(key, (num_local_groups, in_size, out_size), jnp.bfloat16, -1, 1)
+        rhs_q, rhs_scale = quantize_tensor(rhs, weight_dtype, axis=1, block_size=block_size)
+        rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+
+        group_sizes = get_group_sizes(batch_size, num_groups)
+        group_offset = jnp.array(group_offset, dtype=jnp.int32)
+
+        expected = reference_gmm(
+            lhs,
+            rhs_q,
+            group_sizes,
+            rhs_scale=rhs_scale,
+            group_offset=group_offset,
+        )
+
+        tile_info = TileSizes(tile_m=128, tile_k=tile_k, tile_n=out_size)
+        actual = gmm_v2(
+            lhs,
+            rhs_q,
+            group_sizes,
+            rhs_scale=rhs_scale,
+            group_offset=group_offset,
+            tile_info=tile_info,
+            maybe_quantize_lhs=True,
+        ).astype(lhs.dtype)
+
+        self.assertArraysAllClose(actual, expected, atol=1.2, rtol=1.2)
 
     @parameterized.product(
         batch_size=[128],
@@ -320,6 +422,7 @@ class GmmTest(jtu.JaxTestCase):
         out_size=[512, 1024],
         num_groups=[16, 32],
         weight_dtype=[jnp.int8, jnp.float8_e4m3fn],
+        block_size=[512, 1024],
         group_offset=[0, 2, 3],
     )
     def test_gmm_v2_activation_weight_quantized(
@@ -329,10 +432,11 @@ class GmmTest(jtu.JaxTestCase):
         out_size,
         num_groups,
         weight_dtype,
+        block_size,
         group_offset,
     ):
-        # TODO(kyuyeunk, wenxindong): Add subchannel quantization on gmm_v2.
-        block_size = in_size
+        if block_size > in_size:
+            self.skipTest("block_size must be <= in_size")
         num_local_groups = num_groups - group_offset
         key = jax.random.key(0)
 

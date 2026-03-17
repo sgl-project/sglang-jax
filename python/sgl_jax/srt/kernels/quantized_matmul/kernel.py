@@ -15,12 +15,14 @@ def xla_quantized_matmul_local(
     quantize_activation: bool = True,
     reduce_axis: str | None = None,
     compute_dtype: jnp.dtype | None = None,
+    reduce_scatter: bool = False,
 ) -> jax.Array:
     """
     Local quantized matmul for use inside shard_map.
 
     All computation (quantize, matmul, dequantize) happens locally on each device.
-    If reduce_axis is provided, uses psum to combine partial sums across devices.
+    If reduce_axis is provided, uses psum (or psum_scatter when reduce_scatter=True)
+    to combine partial sums across devices.
 
     Args:
         x: Activation tensor [batch, n_input_features] (local slice)
@@ -28,6 +30,9 @@ def xla_quantized_matmul_local(
         w_scale: Weight quantization scale [n_output_features]
         quantize_activation: Whether to quantize activations
         reduce_axis: Axis name for psum reduction (e.g., "tensor"). None skips reduction.
+        compute_dtype: Override for intermediate computation dtype.
+        reduce_scatter: If True, use psum_scatter instead of psum so each device
+            receives a 1/tp_size shard of the output features.
 
     Returns:
         Output of the quantized matmul.
@@ -64,8 +69,10 @@ def xla_quantized_matmul_local(
         out = out * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
 
     out = out.astype(out_dtype)
-    # Sum partial results across devices (single all-reduce)
     if reduce_axis is not None:
-        out = lax.psum(out, reduce_axis)
+        if reduce_scatter:
+            out = lax.psum_scatter(out, reduce_axis, scatter_dimension=out.ndim - 1, tiled=True)
+        else:
+            out = lax.psum(out, reduce_axis)
 
     return out
