@@ -30,6 +30,7 @@ class SchedulerMixin(ConfigMixin):
     - diffusers-wide compatible scheduler discovery across packages
     - `PushToHubMixin` behavior from the full HF implementation
     """
+
     config_name = SCHEDULER_CONFIG_NAME
     _compatibles: list[str] = []
     has_compatibles = True

@@ -5,10 +5,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
-for _tpu_env in ("TPU_ACCELERATOR_TYPE", "TPU_WORKER_HOSTNAMES"):
-    os.environ.pop(_tpu_env, None)
-
 import numpy as np
 
 try:
@@ -31,6 +27,9 @@ if jax is not None:
     from sgl_jax.srt.multimodal.models.diffusion_solvers.flow_match_euler_discrete_scheduler import (
         FlowMatchEulerDiscreteScheduler as JaxFlowMatchEulerDiscreteScheduler,
     )
+
+
+FLUX1_SCHEDULER_ROOT = Path(os.environ.get("FLUX1_SCHEDULER_ROOT", "/models/FLUX1.0"))
 
 
 @unittest.skipIf(
@@ -271,36 +270,34 @@ class TestFlowMatchEulerDiscreteSchedulerParity(unittest.TestCase):
             rtol=1e-6,
         )
 
-    def test_per_token_timesteps_step_parity(self):
-        torch_scheduler, jax_scheduler = self._build_pair(shift=1.0)
-        torch_scheduler.set_timesteps(num_inference_steps=4)
-        jax_scheduler.set_timesteps(num_inference_steps=4, shape=(2, 4, 3))
+    def test_per_token_timesteps_matches_global_step_when_uniform(self):
+        scheduler = JaxFlowMatchEulerDiscreteScheduler(shift=1.0)
+        scheduler.set_timesteps(num_inference_steps=4, shape=(2, 4, 3))
 
-        model_output_torch = torch.randn(2, 4, 3, dtype=torch.float32)
-        sample_torch = torch.randn(2, 4, 3, dtype=torch.float32)
-        per_token_timesteps_torch = torch.tensor(
-            [[1000.0, 667.0, 334.0, 1.0], [667.0, 334.0, 1.0, 1.0]],
-            dtype=torch.float32,
-        )
+        model_output = jnp.asarray(np.random.randn(2, 4, 3).astype(np.float32))
+        sample = jnp.asarray(np.random.randn(2, 4, 3).astype(np.float32))
+        timestep = scheduler.timesteps[0]
 
-        out_torch = torch_scheduler.step(
-            model_output=model_output_torch,
-            timestep=torch_scheduler.timesteps[0],
-            sample=sample_torch,
-            per_token_timesteps=per_token_timesteps_torch,
+        out_global = scheduler.step(
+            model_output=model_output,
+            timestep=timestep,
+            sample=sample,
             return_dict=True,
         ).prev_sample
-        out_jax = jax_scheduler.step(
-            model_output=jnp.asarray(model_output_torch.cpu().numpy()),
-            timestep=jnp.asarray(torch_scheduler.timesteps[0].cpu().numpy()),
-            sample=jnp.asarray(sample_torch.cpu().numpy()),
-            per_token_timesteps=jnp.asarray(per_token_timesteps_torch.cpu().numpy()),
+
+        scheduler.set_timesteps(num_inference_steps=4, shape=(2, 4, 3))
+        per_token_timesteps = jnp.full((2, 4), timestep, dtype=jnp.float32)
+        out_per_token = scheduler.step(
+            model_output=model_output,
+            timestep=timestep,
+            sample=sample,
+            per_token_timesteps=per_token_timesteps,
             return_dict=True,
         ).prev_sample
 
         np.testing.assert_allclose(
-            out_torch.cpu().numpy(),
-            np.asarray(out_jax),
+            np.asarray(out_global),
+            np.asarray(out_per_token),
             atol=1e-6,
             rtol=1e-6,
         )
@@ -321,6 +318,36 @@ class TestFlowMatchEulerDiscreteSchedulerParity(unittest.TestCase):
         ).prev_sample
 
         scheduler.set_timesteps(num_inference_steps=4, shape=(2, 3, 4, 4))
+        out_int = scheduler.step(
+            model_output=model_output,
+            timestep=timestep.astype(jnp.int32),
+            sample=sample,
+            return_dict=True,
+        ).prev_sample
+
+        np.testing.assert_allclose(
+            np.asarray(out_float),
+            np.asarray(out_int),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+    def test_integer_timestep_compatibility_with_noninteger_schedule(self):
+        scheduler = JaxFlowMatchEulerDiscreteScheduler(shift=1.1, use_karras_sigmas=True)
+        scheduler.set_timesteps(num_inference_steps=5, shape=(2, 3, 4, 4))
+
+        model_output = jnp.ones((2, 3, 4, 4), dtype=jnp.float32)
+        sample = jnp.zeros((2, 3, 4, 4), dtype=jnp.float32)
+        timestep = scheduler.timesteps[1]
+
+        out_float = scheduler.step(
+            model_output=model_output,
+            timestep=timestep,
+            sample=sample,
+            return_dict=True,
+        ).prev_sample
+
+        scheduler.set_timesteps(num_inference_steps=5, shape=(2, 3, 4, 4))
         out_int = scheduler.step(
             model_output=model_output,
             timestep=timestep.astype(jnp.int32),
@@ -389,6 +416,77 @@ class TestFlowMatchEulerDiscreteSchedulerParity(unittest.TestCase):
 
         for step in range(4):
             model_output_torch = torch.randn(1, 4, 2, 4, 4, dtype=torch.float32)
+            model_output_jax = jnp.asarray(model_output_torch.cpu().numpy())
+
+            sample_torch = torch_scheduler.step(
+                model_output=model_output_torch,
+                timestep=torch_scheduler.timesteps[step],
+                sample=sample_torch,
+                return_dict=False,
+            )[0]
+            sample_jax = jax_scheduler.step(
+                model_output=model_output_jax,
+                timestep=jnp.asarray(jax_scheduler.timesteps[step]),
+                sample=sample_jax,
+                return_dict=False,
+            )[0]
+
+        np.testing.assert_allclose(
+            sample_torch.cpu().numpy(),
+            np.asarray(sample_jax),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+    @unittest.skipUnless(
+        (FLUX1_SCHEDULER_ROOT / "scheduler" / "scheduler_config.json").is_file(),
+        "local FLUX scheduler config not found",
+    )
+    def test_from_real_flux_scheduler_config_rollout(self):
+        image_seq_len = 4096
+        sample_shape = (2, 16, 4, 16, 16)
+        num_inference_steps = 8
+        torch_scheduler = HFFlowMatchEulerDiscreteScheduler.from_pretrained(
+            FLUX1_SCHEDULER_ROOT,
+            subfolder="scheduler",
+        )
+        jax_scheduler = JaxFlowMatchEulerDiscreteScheduler.from_pretrained(
+            FLUX1_SCHEDULER_ROOT,
+            subfolder="scheduler",
+        )
+
+        self.assertEqual(torch_scheduler.config.shift, 3.0)
+        self.assertEqual(jax_scheduler.config.shift, 3.0)
+        self.assertTrue(torch_scheduler.config.use_dynamic_shifting)
+        self.assertTrue(jax_scheduler.config.use_dynamic_shifting)
+
+        mu = jax_scheduler.calculate_mu(image_seq_len)
+        torch_scheduler.set_timesteps(num_inference_steps=num_inference_steps, mu=mu)
+        jax_scheduler.set_timesteps(
+            num_inference_steps=num_inference_steps,
+            shape=sample_shape,
+            mu=mu,
+        )
+
+        np.testing.assert_allclose(
+            torch_scheduler.timesteps.cpu().numpy(),
+            np.asarray(jax_scheduler.timesteps),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+        np.testing.assert_allclose(
+            torch_scheduler.sigmas.cpu().numpy(),
+            np.asarray(jax_scheduler.sigmas),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+        torch.manual_seed(0)
+        sample_torch = torch.randn(*sample_shape, dtype=torch.float32)
+        sample_jax = jnp.asarray(sample_torch.cpu().numpy())
+
+        for step in range(num_inference_steps):
+            model_output_torch = torch.randn(*sample_shape, dtype=torch.float32)
             model_output_jax = jnp.asarray(model_output_torch.cpu().numpy())
 
             sample_torch = torch_scheduler.step(

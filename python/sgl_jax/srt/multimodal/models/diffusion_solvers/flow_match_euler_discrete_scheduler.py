@@ -117,7 +117,9 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin):
             raise ValueError("`max_image_seq_len` must be larger than `base_image_seq_len`.")
 
         seq = float(np.clip(image_seq_len, base_seq, max_seq))
-        slope = (float(self.config.max_shift) - float(self.config.base_shift)) / (max_seq - base_seq)
+        slope = (float(self.config.max_shift) - float(self.config.base_shift)) / (
+            max_seq - base_seq
+        )
         mu = float(self.config.base_shift) + slope * (seq - base_seq)
         return mu
 
@@ -163,10 +165,7 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin):
         self.num_inference_steps = num_inference_steps
         is_timesteps_provided = timesteps is not None
 
-        if is_timesteps_provided:
-            timesteps_np = np.asarray(timesteps, dtype=np.float32)
-        else:
-            timesteps_np = None
+        timesteps_np = np.asarray(timesteps, dtype=np.float32) if is_timesteps_provided else None
 
         if sigmas is None:
             if timesteps_np is None:
@@ -223,6 +222,8 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin):
         timestep_arr = np.asarray(timestep)
         schedule_arr = np.asarray(schedule_timesteps)
         indices = np.argwhere(schedule_arr == timestep_arr).flatten()
+        if len(indices) == 0:
+            return int(np.argmin(np.abs(schedule_arr - timestep_arr)))
         pos = 1 if len(indices) > 1 else 0
         return int(indices[pos])
 
@@ -248,7 +249,9 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin):
             timestep = timestep[None]
 
         if self.begin_index is None:
-            step_indices = [self.index_for_timestep(t, schedule_timesteps) for t in np.asarray(timestep)]
+            step_indices = [
+                self.index_for_timestep(t, schedule_timesteps) for t in np.asarray(timestep)
+            ]
         elif self.step_index is not None:
             step_indices = [self.step_index] * timestep.shape[0]
         else:
@@ -293,7 +296,7 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin):
 
             current_sigma = per_token_sigmas[..., None]
             next_sigma = lower_sigmas[..., None]
-            dt = current_sigma - next_sigma
+            dt = next_sigma - current_sigma
         else:
             sigma = self.sigmas[self.step_index]
             sigma_next = self.sigmas[self.step_index + 1]
@@ -304,7 +307,9 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin):
         if self.config.stochastic_sampling:
             if noise is None:
                 if rng is None:
-                    raise ValueError("`rng` or explicit `noise` must be provided for stochastic sampling.")
+                    raise ValueError(
+                        "`rng` or explicit `noise` must be provided for stochastic sampling."
+                    )
                 noise = jax.random.normal(rng, sample_f32.shape, dtype=sample_f32.dtype)
             x0 = sample_f32 - current_sigma * model_output
             prev_sample = (1.0 - next_sigma) * x0 + next_sigma * noise
@@ -328,7 +333,9 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin):
         max_inv_rho = sigma_max ** (1 / rho)
         return (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
 
-    def _convert_to_exponential(self, in_sigmas: np.ndarray, num_inference_steps: int) -> np.ndarray:
+    def _convert_to_exponential(
+        self, in_sigmas: np.ndarray, num_inference_steps: int
+    ) -> np.ndarray:
         sigma_min = in_sigmas[-1].item()
         sigma_max = in_sigmas[0].item()
         return np.exp(np.linspace(math.log(sigma_max), math.log(sigma_min), num_inference_steps))

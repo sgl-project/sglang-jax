@@ -58,6 +58,7 @@ class ConfigMixin:
     - compatibility-class filtering from diffusers' full `extract_init_dict`
     - deprecation utilities and hidden/legacy config migration logic
     """
+
     config_name = "config.json"
     ignore_for_config: list[str] = []
 
@@ -159,7 +160,9 @@ class ConfigMixin:
 
     def save_config(self, save_directory: str | os.PathLike) -> None:
         if os.path.isfile(save_directory):
-            raise AssertionError(f"Provided path ({save_directory}) should be a directory, not a file")
+            raise AssertionError(
+                f"Provided path ({save_directory}) should be a directory, not a file"
+            )
         os.makedirs(save_directory, exist_ok=True)
         self.to_json_file(os.path.join(save_directory, self.config_name))
 
@@ -172,11 +175,7 @@ def register_to_config(init):
         bound = signature.bind(self, *args, **kwargs)
         bound.apply_defaults()
 
-        init_kwargs = {
-            key: value
-            for key, value in bound.arguments.items()
-            if key != "self"
-        }
+        init_kwargs = {key: value for key, value in bound.arguments.items() if key != "self"}
 
         init(self, *args, **kwargs)
         if not isinstance(self, ConfigMixin):
