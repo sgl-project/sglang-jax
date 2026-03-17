@@ -203,7 +203,7 @@ class CLIPVisionModel(nnx.Module):
         self.config, self.mesh, self.dtype = config, mesh, dtype
 
         self.embeddings = CLIPVisionEmbeddings(config, mesh, dtype)
-        self.pre_layrnorm = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, use_bias=True, dtype=dtype, param_dtype=dtype)
+        self.pre_layrnorm = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, use_bias=True, dtype=dtype, param_dtype=dtype, rngs=nnx.Rngs(0))
 
         self.encoder = CLIPEncoder(config, mesh, num_hidden_layers_override=getattr(config, "num_hidden_layers_override", None), dtype=dtype, rngs=nnx.Rngs(0))
 
