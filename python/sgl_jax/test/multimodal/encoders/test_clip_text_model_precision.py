@@ -55,17 +55,45 @@ def set_param(model, path, val):
     param[...] = jnp.array(val, dtype=param[...].dtype)
 
 def manual_load_weights(jax_model, hf_model):
+    from collections import defaultdict
     mappings = jax_model._weight_mappings()
     pt_state = hf_model.state_dict()
+
+    target_to_src = defaultdict(list)
+    for src_k, m in mappings.items():
+        if src_k in pt_state:
+            target_to_src[m.target_path].append((src_k, m))
+
     loaded = 0
-    for k, m in mappings.items():
-        if k in pt_state:
-            try:
-                w = pt_state[k].detach().float().cpu().numpy()
-                set_param(jax_model, m.target_path, w.T if m.transpose else w)
-                loaded += 1
-            except Exception:
-                pass
+    for target_path, src_list in target_to_src.items():
+        try:
+            if len(src_list) == 1:
+                src_k, m = src_list[0]
+                w = pt_state[src_k].detach().float().cpu().numpy()
+
+                if "patch_embedding.kernel" in target_path and len(w.shape) == 4:
+                    # PyTorch: [O, I, H, W] -> JAX: [H, W, I, O]
+                    w = np.transpose(w, (2, 3, 1, 0))
+                else:
+                    w = w.T if m.transpose else w
+
+                set_param(jax_model, target_path, w)
+
+            else:
+                src_list_sorted = sorted(src_list, key=lambda x: {"q": 0, "k": 1, "v": 2}.get(x[0].split("_proj")[0][-1], 3))
+                w_list = []
+                for src_k, m in src_list_sorted:
+                    w = pt_state[src_k].detach().float().cpu().numpy()
+                    w = w.T if m.transpose else w
+                    w_list.append(w)
+
+                w_fused = np.concatenate(w_list, axis=-1)
+                set_param(jax_model, target_path, w_fused)
+
+            loaded += len(src_list)
+        except Exception as e:
+            logger.error(f"Failed to load {target_path}: {e}")
+
     if loaded < len(mappings) * 0.5:
         raise RuntimeError(f"Weight loading failed: only {loaded}/{len(mappings)} weights loaded")
 
