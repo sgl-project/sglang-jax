@@ -1,39 +1,10 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
-
-
-@dataclass
-class DiagonalGaussianDistribution:
-    parameters: jax.Array
-    deterministic: bool = False
-    channel_axis: int | None = None
-
-    def __post_init__(self):
-        # FLUX uses NCHW for 4D image tensors in isolated model tests, but the
-        # current VAE runner feeds 5D [B, T, H, W, C] tensors. Support both.
-        axis = self.channel_axis
-        if axis is None:
-            axis = 1 if self.parameters.ndim == 4 else self.parameters.ndim - 1
-        self.mean, self.logvar = jnp.split(self.parameters, 2, axis=axis)
-        self.logvar = jnp.clip(self.logvar, -30.0, 20.0)
-        self.std = jnp.exp(0.5 * self.logvar)
-        self.var = jnp.exp(self.logvar)
-        if self.deterministic:
-            self.std = jnp.zeros_like(self.mean)
-            self.var = jnp.zeros_like(self.mean)
-
-    def sample(self, key: jax.Array) -> jax.Array:
-        noise = jax.random.normal(key, self.mean.shape, dtype=self.parameters.dtype)
-        return self.mean + self.std * noise
-
-    def mode(self) -> jax.Array:
-        return self.mean
 
 
 class Upsample2D(nnx.Module):
