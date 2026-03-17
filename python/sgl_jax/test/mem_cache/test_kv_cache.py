@@ -334,8 +334,12 @@ class TestSplitKVCacheUpdate(unittest.TestCase):
         self.assertEqual(v_buf.shape[-1], aligned_v_head_dim)
 
         # Generate random K/V with actual (unaligned) head dims
-        k = jax.random.normal(jax.random.PRNGKey(42), (num_tokens, num_heads, head_dim), dtype=jnp.bfloat16)
-        v = jax.random.normal(jax.random.PRNGKey(43), (num_tokens, num_heads, v_head_dim), dtype=jnp.bfloat16)
+        k = jax.random.normal(
+            jax.random.PRNGKey(42), (num_tokens, num_heads, head_dim), dtype=jnp.bfloat16
+        )
+        v = jax.random.normal(
+            jax.random.PRNGKey(43), (num_tokens, num_heads, v_head_dim), dtype=jnp.bfloat16
+        )
         loc = jnp.arange(num_tokens, dtype=jnp.int32) + 5  # offset to test non-zero start
 
         # Write to pool
@@ -370,11 +374,15 @@ class TestSplitKVCacheUpdate(unittest.TestCase):
 
     def test_split_pool_192_128_ps1(self):
         """Split pool with head_dim=192, v_head_dim=128, page_size=1."""
-        self._run_split_pool_test(head_dim=192, v_head_dim=128, num_tokens=16, num_heads=8, page_size=1)
+        self._run_split_pool_test(
+            head_dim=192, v_head_dim=128, num_tokens=16, num_heads=8, page_size=1
+        )
 
     def test_split_pool_256_128_ps1(self):
         """Split pool with head_dim=256, v_head_dim=128, page_size=1."""
-        self._run_split_pool_test(head_dim=256, v_head_dim=128, num_tokens=16, num_heads=8, page_size=1)
+        self._run_split_pool_test(
+            head_dim=256, v_head_dim=128, num_tokens=16, num_heads=8, page_size=1
+        )
 
     def test_split_pool_192_128_with_padding(self):
         """Split pool with head_dim=192, padding tokens (loc=-1)."""
@@ -400,8 +408,12 @@ class TestSplitKVCacheUpdate(unittest.TestCase):
             v_head_dim=aligned_v_head_dim,
         )
 
-        k = jax.random.normal(jax.random.PRNGKey(42), (num_tokens, num_heads, head_dim), dtype=jnp.bfloat16)
-        v = jax.random.normal(jax.random.PRNGKey(43), (num_tokens, num_heads, v_head_dim), dtype=jnp.bfloat16)
+        k = jax.random.normal(
+            jax.random.PRNGKey(42), (num_tokens, num_heads, head_dim), dtype=jnp.bfloat16
+        )
+        v = jax.random.normal(
+            jax.random.PRNGKey(43), (num_tokens, num_heads, v_head_dim), dtype=jnp.bfloat16
+        )
 
         # Mix valid and padding locations
         loc = jnp.array([5, -1, 7, -1, 9, 10, -1, 12, 13, 14, -1, 16], dtype=jnp.int32)
