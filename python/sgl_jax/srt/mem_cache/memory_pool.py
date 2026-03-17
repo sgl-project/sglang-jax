@@ -484,10 +484,6 @@ class MHATokenToKVPool(KVCache):
     def get_fused_kv_buffer(self, layer_id: int) -> jax.Array:
         if self.is_split:
             # When split, we cannot return a fused buffer.
-            # This method should generally not be called when is_split=True unless caller handles it.
-            # For backward compatibility, we might return the split buffers if the caller expects it?
-            # But the signature says jax.Array.
-            # The caller (FlashAttention) will need to be updated to use get_split_kv_buffer or check type.
             raise NotImplementedError("get_fused_kv_buffer not supported for split KV cache")
         return self.kv_buffer[layer_id - self.start_layer]
 
