@@ -311,22 +311,24 @@ class TestSplitKVCacheUpdate(unittest.TestCase):
 
         test_mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 
+        # Pre-align dims before passing to pool (matching model_runner behavior)
+        aligned_head_dim = (head_dim + 127) // 128 * 128
+        aligned_v_head_dim = (v_head_dim + 127) // 128 * 128
+
         pool = MHATokenToKVPool(
             size=num_tokens + 100,
             page_size=page_size,
             dtype=jnp.bfloat16,
             head_num=num_heads,
-            head_dim=head_dim,
+            head_dim=aligned_head_dim,
             layer_num=1,
             mesh=test_mesh,
-            v_head_dim=v_head_dim,
+            v_head_dim=aligned_v_head_dim,
         )
 
         self.assertTrue(pool.is_split, "Expected split KV cache")
 
-        # Buffer should be 128-aligned
-        aligned_head_dim = (head_dim + 127) // 128 * 128
-        aligned_v_head_dim = (v_head_dim + 127) // 128 * 128
+        # Buffer should use aligned dims
         k_buf, v_buf = pool.get_split_kv_buffer(0)
         self.assertEqual(k_buf.shape[-1], aligned_head_dim)
         self.assertEqual(v_buf.shape[-1], aligned_v_head_dim)
@@ -383,15 +385,19 @@ class TestSplitKVCacheUpdate(unittest.TestCase):
         num_tokens = 12
         test_mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 
+        # Pre-align dims before passing to pool (matching model_runner behavior)
+        aligned_head_dim = (head_dim + 127) // 128 * 128
+        aligned_v_head_dim = (v_head_dim + 127) // 128 * 128
+
         pool = MHATokenToKVPool(
             size=num_tokens + 100,
             page_size=1,
             dtype=jnp.bfloat16,
             head_num=num_heads,
-            head_dim=head_dim,
+            head_dim=aligned_head_dim,
             layer_num=1,
             mesh=test_mesh,
-            v_head_dim=v_head_dim,
+            v_head_dim=aligned_v_head_dim,
         )
 
         k = jax.random.normal(jax.random.PRNGKey(42), (num_tokens, num_heads, head_dim), dtype=jnp.bfloat16)

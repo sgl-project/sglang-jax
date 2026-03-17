@@ -192,16 +192,16 @@ def create_split_test_data(
     positions = jnp.arange(total_aligned_tokens, dtype=jnp.int32)
     req_pool_indices = jnp.arange(batch_size, dtype=jnp.int32)
 
-    # Create split KV pool
+    # Create split KV pool (pass 128-aligned dims, matching model_runner behavior)
     current_kv_cache = MHATokenToKVPool(
         size=max_total_token_size,
         page_size=page_size,
         dtype=dtype,
         head_num=num_kv_heads,
-        head_dim=head_dim,
+        head_dim=(head_dim + 127) // 128 * 128,
         layer_num=1,
         mesh=mesh,
-        v_head_dim=v_head_dim,
+        v_head_dim=(v_head_dim + 127) // 128 * 128,
     )
     assert current_kv_cache.is_split, "Expected split KV cache"
 
