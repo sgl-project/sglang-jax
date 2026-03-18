@@ -258,6 +258,47 @@ class WeightLoader:
         scale_per_out = jnp.take(weight, jnp.asarray(out_block_ids), axis=1)
         return jnp.expand_dims(jnp.transpose(scale_per_out, (0, 2, 1)), axis=2)
 
+    def _maybe_expand_linear_block_scale(
+        self,
+        weight: jax.Array,
+        model_param: nnx.Variable,
+        target_path: str,
+    ) -> jax.Array:
+        """Expand 2D block-quant scale [out_blocks, in_blocks] to 3D [in_blocks, 1, n_out] at load time."""
+        if not target_path.endswith("weight_scale"):
+            return weight
+
+        # Only convert when checkpoint has 2D scale and model expects 3D.
+        if weight.ndim != 2 or model_param.value.ndim != 3:
+            return weight
+
+        # Model param shape: [in_blocks, 1, n_out]
+        if model_param.value.shape[1] != 1:
+            return weight
+
+        quant_cfg = getattr(self.model_config, "quantization_config", None)
+        weight_block_size = getattr(quant_cfg, "weight_block_size", None)
+        if not (isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2):
+            return weight
+
+        block_size_out = int(weight_block_size[0])
+        if block_size_out <= 0:
+            return weight
+
+        from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
+            expand_block_scale,
+        )
+
+        n_out = int(model_param.value.shape[2])
+        logger.info(
+            "Expanding linear block-quant scale %s from %s to kernel-ready layout [%d, 1, %d]",
+            target_path,
+            weight.shape,
+            weight.shape[1],
+            n_out,
+        )
+        return expand_block_scale(weight, n_out, block_size_out)
+
     def _scan_weight_info(self) -> dict[str, list[dict]]:
         """
         Scan all safetensors files to build a mapping from HF key to file info.
@@ -903,6 +944,11 @@ class WeightLoader:
                         target_path = mapping.target_path
                         model_param = self._get_param(params, target_path)
 
+                        # Expand 2D block-quant scale to 3D kernel-ready layout.
+                        lazy_weight = self._maybe_expand_linear_block_scale(
+                            lazy_weight, model_param, target_path
+                        )
+
                         if lazy_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
                             model_param.value = lazy_weight
                         else:
@@ -1388,6 +1434,12 @@ class WeightLoader:
 
         try:
             model_param = self._get_param(params, jax_path)
+
+            # Expand 2D block-quant scale to 3D kernel-ready layout.
+            sharded_weight = self._maybe_expand_linear_block_scale(
+                sharded_weight, model_param, jax_path
+            )
+
             logger.debug(
                 "Loading %s -> %s, shape: %s, transpose: %s",
                 hf_key,

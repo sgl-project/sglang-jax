@@ -229,6 +229,46 @@ def should_use_blockwise_kernel(
     return out_dim > block_size_out
 
 
+def expand_block_scale(
+    scale_2d: jax.Array,
+    n_out: int,
+    block_size_out: int,
+    channel_to_block: jax.Array | None = None,
+) -> jax.Array:
+    """Expand a 2D block scale to the 3D kernel-ready layout.
+
+    This should be called **once at init / weight-loading time**, not on
+    every inference step.
+
+    Args:
+        scale_2d: Compact block scale ``[out_blocks, in_blocks]``.
+        n_out: Total number of output channels.
+        block_size_out: Uniform block size along the output dimension.
+        channel_to_block: Optional ``[n_out]`` int array that maps each
+            output channel to its block index.  When ``None`` (the default),
+            a uniform mapping ``channel // block_size_out`` is used.
+
+            .. note::
+
+                For non-uniform block quant (e.g. per-head boundaries),
+                pass an explicit ``channel_to_block`` index array.
+
+    Returns:
+        Kernel-ready scale ``[in_blocks, 1, n_out]``.
+    """
+    if channel_to_block is not None:
+        # Non-uniform block mapping (e.g., per-head block quant).
+        scale_per_channel = scale_2d[channel_to_block]  # [n_out, in_blocks]
+    else:
+        # Standard uniform block quant: repeat each block's scale to its
+        # constituent channels, then truncate to the actual output size.
+        scale_per_channel = jnp.repeat(scale_2d, repeats=block_size_out, axis=0)[:n_out]
+
+    # Transpose to [in_blocks, n_out] and insert the singleton dim expected
+    # by the blockwise kernel: [in_blocks, 1, n_out].
+    return jnp.transpose(scale_per_channel, (1, 0))[:, None, :]
+
+
 def convert_block_scale_to_kernel_layout(
     w_scale: jax.Array,
     out_dim: int,
@@ -238,10 +278,9 @@ def convert_block_scale_to_kernel_layout(
 ) -> jax.Array:
     """Convert our block-scale layout to the TPU kernel layout.
 
-    The layer/checkpoint-facing format is ``[out_blocks, in_blocks]``.
-    The kernel expects one scale per input block and output channel:
-    ``[in_blocks, 1, n_out]``. We therefore replicate each output block's
-    scale across the channels inside that block before transposing.
+    .. deprecated::
+        Use :func:`expand_block_scale` at init time instead.  This function
+        is kept only for internal / test compatibility.
     """
     needed_out_blocks = math.ceil(out_dim / block_size_out)
     needed_in_blocks = math.ceil(in_dim / block_size_in)
@@ -252,11 +291,8 @@ def convert_block_scale_to_kernel_layout(
             f"w_scale.shape={w_scale.shape}, needed=({needed_out_blocks}, {needed_in_blocks})."
         )
 
-    # Kernel expects per-output-channel scales for each input block.
-    # Replicate each output-block scale value across channels in that output block.
     scale_2d = w_scale[:needed_out_blocks, :needed_in_blocks]
-    scale_per_out = jnp.repeat(scale_2d, repeats=block_size_out, axis=0)[:out_dim, :]
-    return jnp.transpose(scale_per_out, (1, 0))[:, None, :]
+    return expand_block_scale(scale_2d, out_dim, block_size_out)
 
 
 def get_safe_blockwise_tuned_value(

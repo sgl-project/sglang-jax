@@ -11,6 +11,7 @@ from jax.sharding import Mesh
 
 import sgl_jax.srt.kernels.quantized_matmul.blockwise_utils as blockwise_utils
 from sgl_jax.srt.configs.quantization_config import QuantizationConfig
+from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import expand_block_scale
 from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
 from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
 from sgl_jax.srt.utils.quantization.quantization_utils import (
@@ -123,6 +124,9 @@ def _run_block_quant_kernel_test(weight_dtype, dtype_name):
         weight_dtype,
         "block_quant",
     )
+
+    # The kernel expects pre-expanded 3D scale [in_blocks, 1, n_out].
+    weight_scale = expand_block_scale(weight_scale, weight_q.shape[0], int(weight_block_size[0]))
 
     ref_out = jnp.dot(x, w_fp.T)
     out = xla_quantized_matmul_local(
