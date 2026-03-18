@@ -62,10 +62,6 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 GLOBAL_SERVER_ARGS_KEYS = [
     "device",
     "disable_radix_cache",
-    "multi_item_scoring_delimiter",
-    "max_multi_item_seq_len",
-    "multi_item_mask_impl",
-    "multi_item_segment_fallback_threshold",
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
     "enable_deterministic_sampling",
@@ -172,10 +168,6 @@ class Req:
         vocab_size: int | None = None,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
-        is_multi_item_scoring: bool = False,
-        multi_item_scoring_delimiter: int | None = None,
-        multi_item_algorithm: str | None = None,
-        multi_item_mask_mode: str | None = None,
         cache_for_scoring: bool = False,
         extend_from_cache: str | None = None,
     ):
@@ -204,10 +196,6 @@ class Req:
         # Sampling info
         self.sampling_params = sampling_params
         self.return_hidden_states = return_hidden_states
-        self.is_multi_item_scoring = is_multi_item_scoring
-        self.multi_item_scoring_delimiter = multi_item_scoring_delimiter
-        self.multi_item_algorithm = multi_item_algorithm
-        self.multi_item_mask_mode = multi_item_mask_mode
         self.cache_for_scoring = cache_for_scoring
         self.extend_from_cache = extend_from_cache
 
@@ -1471,14 +1459,7 @@ class ScheduleBatch:
                         dtype=input_embedding.dtype,
                     )
                     input_embedding = np.concatenate([input_embedding, pad], axis=0)
-        multi_item_scoring_flags = np.array(
-            [req.is_multi_item_scoring for req in self.reqs] + [False] * bs_padding_size,
-            dtype=np.bool_,
-        )
-        multi_item_scoring_delimiter = next(
-            (req.multi_item_scoring_delimiter for req in self.reqs if req.is_multi_item_scoring),
-            None,
-        )
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -1492,8 +1473,6 @@ class ScheduleBatch:
             top_logprobs_nums=self.top_logprobs_nums,
             token_ids_logprobs=self.token_ids_logprobs,
             is_prefill_only=self.is_prefill_only,
-            multi_item_scoring_flags=multi_item_scoring_flags,
-            multi_item_scoring_delimiter=multi_item_scoring_delimiter,
             sampling_info=sampling_info,
             positions=positions_cpu,
             mrope_positions=mrope_positions_cpu,
@@ -1668,13 +1647,6 @@ class ScheduleBatch:
             self._generate_trace_info(real_bs, bid)
         # Extract lora_ids from requests
         lora_ids = [req.lora_id for req in self.reqs]
-        multi_item_scoring_flags = np.array(
-            [req.is_multi_item_scoring for req in self.reqs], dtype=np.bool_
-        )
-        multi_item_scoring_delimiter = next(
-            (req.multi_item_scoring_delimiter for req in self.reqs if req.is_multi_item_scoring),
-            None,
-        )
 
         return ModelWorkerBatch(
             bid=bid,
@@ -1689,8 +1661,6 @@ class ScheduleBatch:
             top_logprobs_nums=self.top_logprobs_nums,
             token_ids_logprobs=self.token_ids_logprobs,
             is_prefill_only=self.is_prefill_only,
-            multi_item_scoring_flags=multi_item_scoring_flags,
-            multi_item_scoring_delimiter=multi_item_scoring_delimiter,
             sampling_info=self.sampling_info,
             positions=positions_cpu,
             mrope_positions=mrope_positions_cpu,
@@ -1811,63 +1781,9 @@ def align_to_size(lst: list, size: int, value: int = 0) -> list:
     return lst[:] + [value] * (align_len - len(lst))
 
 
-def _build_multi_item_extend_positions(
-    tokens: np.ndarray, delimiter_token_id: int, dtype: np.dtype
-) -> np.ndarray:
-    """Build RoPE positions with per-item reset for multi-item scoring.
-
-    Layout:
-      query<d>item1<d>item2<d>...<d>
-
-    Query keeps standard causal positions [0..query_len-1].
-    For each item block, positions reset at the block delimiter:
-      delimiter -> query_len
-      first item token -> query_len + 1
-      ...
-    """
-    if tokens.size == 0:
-        return np.array([], dtype=dtype)
-
-    delimiter_indices = np.flatnonzero(tokens == delimiter_token_id)
-    if delimiter_indices.size == 0:
-        raise ValueError(
-            f"Multi-item scoring sequence must contain delimiter token {delimiter_token_id}."
-        )
-
-    query_len = int(delimiter_indices[0])
-    if query_len <= 0:
-        raise ValueError("Multi-item scoring requires a non-empty query prefix before delimiter.")
-
-    positions = np.empty(tokens.shape[0], dtype=dtype)
-    positions[:query_len] = np.arange(query_len, dtype=dtype)
-
-    suffix_idx = np.arange(query_len, tokens.shape[0], dtype=np.int32)
-    seg_ids = np.searchsorted(delimiter_indices, suffix_idx, side="right") - 1
-    seg_starts = delimiter_indices[seg_ids]
-    positions[suffix_idx] = query_len + (suffix_idx - seg_starts)
-    return positions
-
-
 def _build_extend_positions_for_req(
     req: Req, seq_len: int, prefix_len: int, dtype: np.dtype
 ) -> np.ndarray:
-    if req.is_multi_item_scoring and req.multi_item_scoring_delimiter is not None:
-        if prefix_len != 0:
-            raise ValueError(
-                "Multi-item scoring requires extend mode without cached prefix "
-                f"(got prefix_len={prefix_len})."
-            )
-        req_tokens = np.asarray(req.fill_ids[prefix_len:seq_len], dtype=np.int32)
-        positions = _build_multi_item_extend_positions(
-            req_tokens, req.multi_item_scoring_delimiter, dtype
-        )
-        expected_len = seq_len - prefix_len
-        if len(positions) != expected_len:
-            raise ValueError(
-                f"Invalid multi-item position shape: expected {expected_len}, got {len(positions)}."
-            )
-        return positions
-
     return np.arange(prefix_len, seq_len, dtype=dtype)
 
 

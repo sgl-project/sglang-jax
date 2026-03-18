@@ -214,12 +214,8 @@ def build_engine(
     if mode == "prefill_extend":
         common.update(
             dict(
-                multi_item_scoring_delimiter=args.multi_item_delimiter,
                 disable_radix_cache=False,
                 enable_scoring_cache=True,
-                max_multi_item_seq_len=32768,
-                multi_item_mask_impl="dense",
-                multi_item_segment_fallback_threshold=0,
                 multi_item_enable_prefill_extend=True,
                 multi_item_extend_batch_size=args.extend_batch_size,
                 multi_item_enable_score_from_cache_v2=bool(fastpath_v2),

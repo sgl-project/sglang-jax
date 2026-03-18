@@ -162,36 +162,15 @@ class ServerArgs:
     use_sort_for_toppk_minp: bool = False
 
     # Scoring configuration
-    # Delimiter token ID used to combine query and items into a single sequence for
-    # multi-item scoring:
-    # query<delimiter>item1<delimiter>item2<delimiter>...
-    multi_item_scoring_delimiter: int | None = None
-    # Maximum allowed total sequence length for multi-item scoring requests.
-    # This bounds O(seq^2) custom-mask memory usage in attention.
-    max_multi_item_seq_len: int = 32768
     # Maximum number of items allowed in a single multi-item scoring request.
     max_multi_item_count: int = 512
-    # Maximum number of items processed in a single multi-item scoring forward pass.
-    # Requests with more items are split into multiple multi-item chunks.
-    # Set to 0 to disable chunking and process all items in one pass.
-    # Benchmark showed chunk_size=32 provides 10.8x speedup over serial with safe memory.
-    # See: sglang-jax-dev-scripts/investigations/multi-item-chunk-size-benchmark.md
-    multi_item_scoring_chunk_size: int = 32
-    # Attention mask implementation for multi-item scoring:
-    # - auto: prefer segment metadata path when safe, otherwise fallback to dense mask.
-    # - dense: force the existing dense custom mask path.
-    # - segment: force segment metadata path.
-    multi_item_mask_impl: str = "auto"
-    # In auto mode, use dense masks above this padded token length.
-    multi_item_segment_fallback_threshold: int = 32768
     # Prefill+extend scoring path.
-    multi_item_enable_prefill_extend: bool = False
+    multi_item_enable_prefill_extend: bool = True
     multi_item_extend_batch_size: int = 32
     multi_item_prefill_extend_cache_timeout: float = 60.0
     # Experimental score-from-cache fastpath v2.
     # This path uses a dedicated internal score RPC with chunked worker execution.
-    # Default OFF to preserve production behavior.
-    multi_item_enable_score_from_cache_v2: bool = False
+    multi_item_enable_score_from_cache_v2: bool = True
     # Number of items executed per internal fastpath step.
     multi_item_score_from_cache_v2_items_per_step: int = 64
     # Compute score probabilities from label-only logprobs in fastpath v2.
@@ -991,46 +970,16 @@ class ServerArgs:
         )
 
         parser.add_argument(
-            "--multi-item-scoring-delimiter",
-            type=int,
-            default=ServerArgs.multi_item_scoring_delimiter,
-            help="Delimiter token ID for multi-item scoring. Used to combine query and items into a single sequence: query<delimiter>item1<delimiter>item2<delimiter>...",
-        )
-        parser.add_argument(
-            "--max-multi-item-seq-len",
-            type=int,
-            default=ServerArgs.max_multi_item_seq_len,
-            help="Maximum allowed total sequence length for multi-item scoring requests.",
-        )
-        parser.add_argument(
-            "--multi-item-scoring-chunk-size",
-            type=int,
-            default=ServerArgs.multi_item_scoring_chunk_size,
-            help="Maximum number of items per multi-item scoring chunk. Set 0 to disable chunking.",
-        )
-        parser.add_argument(
             "--max-multi-item-count",
             type=int,
             default=ServerArgs.max_multi_item_count,
             help="Maximum number of items allowed in a single multi-item scoring request.",
         )
         parser.add_argument(
-            "--multi-item-mask-impl",
-            type=str,
-            choices=["auto", "dense", "segment"],
-            default=ServerArgs.multi_item_mask_impl,
-            help="Multi-item mask implementation: auto, dense, or segment.",
-        )
-        parser.add_argument(
-            "--multi-item-segment-fallback-threshold",
-            type=int,
-            default=ServerArgs.multi_item_segment_fallback_threshold,
-            help="In auto mode, fallback to dense mask above this padded token length.",
-        )
-        parser.add_argument(
             "--multi-item-enable-prefill-extend",
             action="store_true",
-            help="Enable prefill+extend scoring strategy for multi-item scoring.",
+            help="Enable prefill+extend scoring strategy for multi-item scoring. On by default.",
+            default=True,
         )
         parser.add_argument(
             "--multi-item-extend-batch-size",
@@ -1050,7 +999,8 @@ class ServerArgs:
         parser.add_argument(
             "--multi-item-enable-score-from-cache-v2",
             action="store_true",
-            help="Enable experimental v2 score-from-cache fastpath.",
+            help="Enable v2 score-from-cache fastpath. On by default.",
+            default=True,
         )
         parser.add_argument(
             "--multi-item-score-from-cache-v2-items-per-step",
@@ -1224,63 +1174,31 @@ class ServerArgs:
             )
 
         # Check multi-item scoring constraints
-        if self.multi_item_scoring_delimiter is not None:
-            # Packed multi-item mode requires radix cache disabled.
-            # Prefill+extend mode can opt into scoring cache explicitly.
-            if not self.enable_scoring_cache:
-                assert self.disable_radix_cache, (
-                    "Multi-item scoring requires radix cache to be disabled. "
-                    "Please set --disable-radix-cache when using --multi-item-scoring-delimiter, "
-                    "or pass --enable-scoring-cache for prefill+extend mode."
-                )
-            assert self.chunked_prefill_size == -1, (
-                "Multi-item scoring requires chunked prefill to be disabled. "
-                "Please set --chunked-prefill-size -1 when using --multi-item-scoring-delimiter."
+        assert self.max_multi_item_count > 0, "--max-multi-item-count must be positive"
+        assert (
+            self.multi_item_extend_batch_size > 0
+        ), "--multi-item-extend-batch-size must be positive"
+        assert (
+            self.multi_item_prefill_extend_cache_timeout >= 0
+        ), "--multi-item-prefill-extend-cache-timeout must be non-negative"
+        assert (
+            self.multi_item_score_from_cache_v2_items_per_step > 0
+        ), "--multi-item-score-from-cache-v2-items-per-step must be positive"
+        
+        if self.multi_item_enable_score_from_cache_v2:
+            assert self.multi_item_enable_prefill_extend, (
+                "score-from-cache v2 requires prefill+extend to be enabled. "
+                "Please pass --multi-item-enable-prefill-extend."
             )
-            assert self.speculative_algorithm is None, (
-                "Multi-item scoring does not support speculative decoding. "
-                "Please unset --speculative-algorithm when using --multi-item-scoring-delimiter."
+            assert self.enable_scoring_cache, (
+                "score-from-cache v2 requires scoring cache. "
+                "Please pass --enable-scoring-cache."
             )
-            assert self.attention_backend == "fa", (
-                "Multi-item scoring requires flashattention backend. "
-                "Please set --attention-backend fa when using --multi-item-scoring-delimiter."
+        if self.multi_item_score_label_only_logprob:
+            assert self.multi_item_enable_score_from_cache_v2, (
+                "label-only logprob mode requires score-from-cache v2. "
+                "Please pass --multi-item-enable-score-from-cache-v2."
             )
-            assert self.max_multi_item_seq_len > 0, "--max-multi-item-seq-len must be positive"
-            assert (
-                self.multi_item_scoring_chunk_size >= 0
-            ), "--multi-item-scoring-chunk-size must be non-negative"
-            assert self.max_multi_item_count > 0, "--max-multi-item-count must be positive"
-            assert self.multi_item_mask_impl in (
-                "auto",
-                "dense",
-                "segment",
-            ), "--multi-item-mask-impl must be one of: auto, dense, segment"
-            assert (
-                self.multi_item_segment_fallback_threshold >= 0
-            ), "--multi-item-segment-fallback-threshold must be non-negative"
-            assert (
-                self.multi_item_extend_batch_size > 0
-            ), "--multi-item-extend-batch-size must be positive"
-            assert (
-                self.multi_item_prefill_extend_cache_timeout >= 0
-            ), "--multi-item-prefill-extend-cache-timeout must be non-negative"
-            assert (
-                self.multi_item_score_from_cache_v2_items_per_step > 0
-            ), "--multi-item-score-from-cache-v2-items-per-step must be positive"
-            if self.multi_item_enable_score_from_cache_v2:
-                assert self.multi_item_enable_prefill_extend, (
-                    "score-from-cache v2 requires prefill+extend to be enabled. "
-                    "Please pass --multi-item-enable-prefill-extend."
-                )
-                assert self.enable_scoring_cache, (
-                    "score-from-cache v2 requires scoring cache. "
-                    "Please pass --enable-scoring-cache."
-                )
-            if self.multi_item_score_label_only_logprob:
-                assert self.multi_item_enable_score_from_cache_v2, (
-                    "label-only logprob mode requires score-from-cache v2. "
-                    "Please pass --multi-item-enable-score-from-cache-v2."
-                )
 
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""

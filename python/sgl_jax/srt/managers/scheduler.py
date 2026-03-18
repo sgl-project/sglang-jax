@@ -443,7 +443,6 @@ class Scheduler(
             "gt_16": 0,
         }
         self.ingress_score_paths = {
-            "tokenizer_multi_item_packed": 0,
             "tokenizer_cache_for_scoring": 0,
             "tokenizer_extend_from_cache": 0,
             "rpc_score_from_cache_v2": 0,
@@ -451,7 +450,6 @@ class Scheduler(
         }
         # Number of socket frames that carried each scoring path.
         self.ingress_score_path_frames = {
-            "tokenizer_multi_item_packed": 0,
             "tokenizer_cache_for_scoring": 0,
             "tokenizer_extend_from_cache": 0,
             "rpc_score_from_cache_v2": 0,
@@ -782,7 +780,6 @@ class Scheduler(
                 recv_reqs.extend(unpacked_reqs)
                 tokenizer_req_count += len(unpacked_reqs)
                 tokenizer_frame_paths = {
-                    "tokenizer_multi_item_packed": False,
                     "tokenizer_cache_for_scoring": False,
                     "tokenizer_extend_from_cache": False,
                     "rpc_score_from_cache_v2": False,
@@ -790,9 +787,6 @@ class Scheduler(
                 }
                 for recv_req in unpacked_reqs:
                     if isinstance(recv_req, TokenizedGenerateReqInput):
-                        if bool(getattr(recv_req, "is_multi_item_scoring", False)):
-                            self.ingress_score_paths["tokenizer_multi_item_packed"] += 1
-                            tokenizer_frame_paths["tokenizer_multi_item_packed"] = True
                         if bool(getattr(recv_req, "cache_for_scoring", False)):
                             self.ingress_score_paths["tokenizer_cache_for_scoring"] += 1
                             tokenizer_frame_paths["tokenizer_cache_for_scoring"] = True
@@ -1335,7 +1329,6 @@ class Scheduler(
                 extra_key=cached_extra_key,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 vocab_size=self.model_config.vocab_size,
-                is_multi_item_scoring=False,
                 cache_for_scoring=False,
                 extend_from_cache=cache_handle,
             )
@@ -2275,10 +2268,6 @@ class Scheduler(
             vocab_size=self.model_config.vocab_size,
             return_routed_experts=recv_req.return_routed_experts,
             return_hidden_states=recv_req.return_hidden_states,
-            is_multi_item_scoring=recv_req.is_multi_item_scoring,
-            multi_item_scoring_delimiter=recv_req.multi_item_scoring_delimiter,
-            multi_item_algorithm=getattr(recv_req, "multi_item_algorithm", None),
-            multi_item_mask_mode=getattr(recv_req, "multi_item_mask_mode", None),
             cache_for_scoring=recv_req.cache_for_scoring,
             extend_from_cache=recv_req.extend_from_cache,
         )

@@ -115,9 +115,6 @@ class TestMultiItemScorePerformance(CustomTestCase):
     # Multi-item specific
     STATIC_PREFIX_LEN = 100
     DYNAMIC_SUFFIX_LEN = 1900  # 100 + 1900 = 2000
-    DELIMITER_TOKEN_ID = 128001  # Specific delimiter for multi-item
-    MASK_IMPL = os.getenv("MULTI_ITEM_MASK_IMPL", "dense")
-    SEGMENT_FALLBACK_THRESHOLD = int(os.getenv("MULTI_ITEM_SEGMENT_FALLBACK_THRESHOLD", "32768"))
     PREFILL_EXTEND_BATCH_SIZE = int(os.getenv("MULTI_ITEM_EXTEND_BATCH_SIZE", "32"))
     WARMUP_RUNS = int(os.getenv("MULTI_ITEM_BENCH_WARMUP_RUNS", "1"))
     TIMED_RUNS = int(os.getenv("MULTI_ITEM_BENCH_TIMED_RUNS", "4"))
@@ -146,12 +143,7 @@ class TestMultiItemScorePerformance(CustomTestCase):
             precompile_token_paddings=[1024, 4096, 16384],
             page_size=64,
             log_requests=False,
-            # Enable multi-item delimiter at engine level
-            multi_item_scoring_delimiter=cls.DELIMITER_TOKEN_ID,
             disable_radix_cache=True,
-            max_multi_item_seq_len=32768,
-            multi_item_mask_impl=cls.MASK_IMPL,
-            multi_item_segment_fallback_threshold=cls.SEGMENT_FALLBACK_THRESHOLD,
             log_level=cls.LOG_LEVEL,
         )
 
@@ -414,9 +406,6 @@ class TestMultiItemPrefillExtendPerformance(CustomTestCase):
     PROMPT_LEN = 2000
     NUM_CANDIDATES = 500
     CANDIDATE_LEN = 20
-    DELIMITER_TOKEN_ID = 128001
-    MASK_IMPL = os.getenv("MULTI_ITEM_MASK_IMPL", "dense")
-    SEGMENT_FALLBACK_THRESHOLD = int(os.getenv("MULTI_ITEM_SEGMENT_FALLBACK_THRESHOLD", "32768"))
     PREFILL_EXTEND_BATCH_SIZE = int(os.getenv("MULTI_ITEM_EXTEND_BATCH_SIZE", "12"))
     PREFILL_EXTEND_MAX_RUNNING_REQUESTS = int(
         os.getenv("MULTI_ITEM_EXTEND_MAX_RUNNING_REQUESTS", "12")
@@ -459,12 +448,8 @@ class TestMultiItemPrefillExtendPerformance(CustomTestCase):
             precompile_token_paddings=[1024, 4096, 16384],
             page_size=64,
             log_requests=False,
-            multi_item_scoring_delimiter=cls.DELIMITER_TOKEN_ID,
             disable_radix_cache=False,
             enable_scoring_cache=True,
-            max_multi_item_seq_len=32768,
-            multi_item_mask_impl=cls.MASK_IMPL,
-            multi_item_segment_fallback_threshold=cls.SEGMENT_FALLBACK_THRESHOLD,
             multi_item_enable_prefill_extend=True,
             multi_item_extend_batch_size=cls.PREFILL_EXTEND_BATCH_SIZE,
             disable_overlap_schedule=cls.DISABLE_OVERLAP_SCHEDULE,

@@ -27,10 +27,6 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 
 logger = logging.getLogger(__name__)
 
-MULTI_ITEM_MASK_MODE_CAUSAL = 0
-MULTI_ITEM_MASK_MODE_DENSE = 1
-MULTI_ITEM_MASK_MODE_SEGMENT = 2
-
 
 @register_pytree_node_class
 @dataclass
@@ -48,9 +44,6 @@ class FlashAttentionMetadata:
     seq_lens: jax.Array = None
     distribution: jax.Array = None
     custom_mask: jax.Array = None
-    multi_item_prefix_end: jax.Array = None
-    multi_item_row_seg_starts: jax.Array = None
-    multi_item_mask_mode: int = MULTI_ITEM_MASK_MODE_CAUSAL
 
     def tree_flatten(self):
         children = (
@@ -61,11 +54,9 @@ class FlashAttentionMetadata:
             self.seq_lens,
             self.distribution,
             self.custom_mask,
-            self.multi_item_prefix_end,
-            self.multi_item_row_seg_starts,
         )
 
-        aux_data = {"multi_item_mask_mode": self.multi_item_mask_mode}
+        aux_data = {}
         return (children, aux_data)
 
     @classmethod
@@ -79,9 +70,6 @@ class FlashAttentionMetadata:
         obj.seq_lens = children[4]
         obj.distribution = children[5]
         obj.custom_mask = children[6]
-        obj.multi_item_prefix_end = children[7]
-        obj.multi_item_row_seg_starts = children[8]
-        obj.multi_item_mask_mode = aux_data.get("multi_item_mask_mode", MULTI_ITEM_MASK_MODE_CAUSAL)
 
         return obj
 
@@ -322,145 +310,8 @@ class FlashAttention(AttentionBackend):
             (num_seqs, cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
             sharding=sharding,
         )
-        metadata.multi_item_mask_mode = MULTI_ITEM_MASK_MODE_CAUSAL
-        padded_token_len = int(batch.input_ids.shape[0])
-        default_prefix_end = np.zeros_like(seq_lens, dtype=np.int32)
-        default_row_seg_starts = np.zeros((padded_token_len,), dtype=np.int32)
-        (
-            metadata.multi_item_prefix_end,
-            metadata.multi_item_row_seg_starts,
-        ) = device_array(
-            (default_prefix_end, default_row_seg_starts),
-            sharding=sharding,
-        )
 
-        # Multi-item scoring uses a custom attention mask to isolate item blocks.
-        # Use a fixed mask size based on the token-padding bucket (T^2) to keep
-        # the JAX shape static and avoid recompilation per request.
-        if (
-            batch.forward_mode == ForwardMode.EXTEND
-            and batch.multi_item_scoring_delimiter is not None
-            and batch.multi_item_scoring_flags is not None
-            and np.any(batch.multi_item_scoring_flags[: batch.real_bs])
-        ):
-            max_multi_item_seq_len = int(
-                global_server_args_dict.get("max_multi_item_seq_len", 8192)
-            )
-            if padded_token_len > max_multi_item_seq_len:
-                raise ValueError(
-                    f"Multi-item scoring padded token length {padded_token_len} exceeds "
-                    f"max_multi_item_seq_len={max_multi_item_seq_len}."
-                )
-
-            mask_impl = str(global_server_args_dict.get("multi_item_mask_impl", "auto"))
-            fallback_threshold = int(
-                global_server_args_dict.get("multi_item_segment_fallback_threshold", 32768)
-            )
-            use_segment = mask_impl == "segment" or (
-                mask_impl == "auto" and padded_token_len <= fallback_threshold
-            )
-
-            if use_segment:
-                # Use JIT for multi-item segment metadata
-                # We collect JAX arrays in lists to avoid blocking CPU-TPU transfers
-                prefix_ends_list = []
-                row_seg_starts_list = []
-                token_pt = 0
-
-                for req_idx in range(batch.real_bs):
-                    q_len = int(batch.extend_seq_lens[req_idx])
-                    kv_len = int(batch.seq_lens[req_idx])
-                    if q_len <= 0:
-                         continue
-
-                    req_start = token_pt
-                    req_end = token_pt + q_len
-                    token_pt = req_end
-
-                    if batch.multi_item_scoring_flags[req_idx]:
-                        # JIT-optimized per-request calculation
-                        # Slice on host (cheap for numpy), compute on device
-                        req_tokens = device_array(batch.input_ids[req_start:req_end])
-                        req_prefix_end, req_row_seg_starts = self._calculate_row_seg_starts_jit(
-                            req_tokens,
-                            batch.multi_item_scoring_delimiter,
-                        )
-                        prefix_ends_list.append(req_prefix_end)
-                        row_seg_starts_list.append(req_row_seg_starts)
-                    else:
-                        # Non-scoring request: prefix_end=0, row_starts=0
-                        prefix_ends_list.append(jnp.array(0, dtype=jnp.int32))
-                        row_seg_starts_list.append(jnp.zeros((q_len,), dtype=jnp.int32))
-
-                # Handle padding for the rest of the batch slots
-                remaining_bs = len(seq_lens) - batch.real_bs
-                if remaining_bs > 0:
-                    prefix_ends_list.extend([jnp.array(0, dtype=jnp.int32)] * remaining_bs)
-                
-                # Handle padding for tokens
-                processed_tokens = token_pt
-                remaining_tokens = padded_token_len - processed_tokens
-                if remaining_tokens > 0:
-                    row_seg_starts_list.append(jnp.zeros((remaining_tokens,), dtype=jnp.int32))
-
-                # Stack and Concatenate on Device
-                if prefix_ends_list:
-                    metadata.multi_item_prefix_end = jnp.stack(prefix_ends_list)
-                else:
-                    metadata.multi_item_prefix_end = jnp.zeros_like(seq_lens, dtype=jnp.int32)
-                    
-                if row_seg_starts_list:
-                    metadata.multi_item_row_seg_starts = jnp.concatenate(row_seg_starts_list)
-                else:
-                    metadata.multi_item_row_seg_starts = jnp.zeros((padded_token_len,), dtype=jnp.int32)
-
-                metadata.multi_item_mask_mode = MULTI_ITEM_MASK_MODE_SEGMENT
-                metadata.custom_mask = None
-            else:
-                static_size = padded_token_len * padded_token_len
-                concatenated_mask = np.zeros(static_size, dtype=np.int32)
-                mask_write_pt = 0
-                token_pt = 0
-                for req_idx in range(batch.real_bs):
-                    q_len = int(batch.extend_seq_lens[req_idx])
-                    kv_len = int(batch.seq_lens[req_idx])
-                    if q_len <= 0 or kv_len <= 0:
-                        continue
-
-                    req_tokens = batch.input_ids[token_pt : token_pt + q_len]
-                    token_pt += q_len
-
-                    if batch.multi_item_scoring_flags[req_idx]:
-                        # JIT-optimized mask calculation
-                        req_mask = self._build_multi_item_attention_mask_jit(
-                            req_tokens,
-                            batch.multi_item_scoring_delimiter,
-                        )
-                    else:
-                        req_mask = self._build_causal_extend_mask(q_len=q_len, kv_len=kv_len)
-
-                    req_mask_flat = np.asarray(req_mask.reshape(-1))
-                    next_pt = mask_write_pt + req_mask_flat.size
-                    if next_pt > static_size:
-                        raise ValueError(
-                            f"Constructed custom mask is too large ({next_pt}) "
-                            f"for static size {static_size}."
-                        )
-                    concatenated_mask[mask_write_pt:next_pt] = req_mask_flat
-                    mask_write_pt = next_pt
-
-                if mask_write_pt > static_size:
-                    raise ValueError(
-                        f"Constructed custom mask is too large ({mask_write_pt}) "
-                        f"for static size {static_size}."
-                    )
-                metadata.custom_mask = device_array(
-                    concatenated_mask,
-                    sharding=sharding,
-                )
-                metadata.multi_item_mask_mode = MULTI_ITEM_MASK_MODE_DENSE
-        else:
-            metadata.custom_mask = None
+        metadata.custom_mask = None
         return metadata
 
     def get_eagle_forward_metadata(self, batch: ModelWorkerBatch):
@@ -754,22 +605,10 @@ class FlashAttention(AttentionBackend):
         kv_cache_fused_paged = kv_cache_fused.reshape(
             num_pages, self.page_size, -1, (self.head_dim + 127) // 128 * 128
         )
-        mask_mode = getattr(
-            self.forward_metadata,
-            "multi_item_mask_mode",
-            MULTI_ITEM_MASK_MODE_CAUSAL,
-        )
-        if (
-            self.forward_metadata.custom_mask is not None
-            or mask_mode == MULTI_ITEM_MASK_MODE_SEGMENT
-        ):
+
+        if self.forward_metadata.custom_mask is not None:
             causal = 0
-        multi_item_prefix_end = self.forward_metadata.multi_item_prefix_end
-        if multi_item_prefix_end is None:
-            multi_item_prefix_end = jnp.zeros_like(self.forward_metadata.seq_lens, dtype=jnp.int32)
-        multi_item_row_seg_starts = self.forward_metadata.multi_item_row_seg_starts
-        if multi_item_row_seg_starts is None:
-            multi_item_row_seg_starts = jnp.zeros((q.shape[0],), dtype=jnp.int32)
+
         # Select page indices and remap to SWA pool if KV cache supports it
         page_indices_arg = self.forward_metadata.page_indices
         if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
@@ -786,8 +625,6 @@ class FlashAttention(AttentionBackend):
             P(),  # cu_kv_lens
             P(),  # distribution
             P(),  # custom_mask
-            P(),  # multi_item_prefix_end
-            P(),  # multi_item_row_seg_starts
         )
         out_specs = (
             P(None, self.kv_partition_axis),  # attention output
@@ -815,7 +652,6 @@ class FlashAttention(AttentionBackend):
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
                 ),
                 vmem_limit_bytes=self.vmem_limit_bytes,
-                multi_item_mask_mode=mask_mode,
             )
 
             return result, updated_kv_cache_fused
@@ -839,8 +675,6 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
             self.forward_metadata.custom_mask,
-            multi_item_prefix_end,
-            multi_item_row_seg_starts,
         )
         pad_width = (self.head_dim + 127) // 128 * 128 - self.head_dim
         if pad_width > 0:

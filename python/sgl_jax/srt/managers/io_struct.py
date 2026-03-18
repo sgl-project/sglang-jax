@@ -170,14 +170,6 @@ class TokenizedGenerateReqInput:
     return_hidden_states: bool = False
     # multimodal inputs (e.g., mrope positions, embeddings)
     mm_inputs: dict | None = None
-    # Multi-item scoring request marker.
-    is_multi_item_scoring: bool = False
-    # Delimiter token id used for multi-item scoring.
-    multi_item_scoring_delimiter: int | None = None
-    # Optional algorithm selector for multi-item scoring.
-    multi_item_algorithm: str | None = None
-    # Optional mask mode override for multi-item scoring.
-    multi_item_mask_mode: str | None = None
     # Keep prefetched prefix KV cache for scoring.
     cache_for_scoring: bool = False
     # Request ID handle whose cached prefix should be extended.
@@ -356,14 +348,6 @@ class GenerateReqInput:
     extra_key: list[str] | str | None = None
 
     return_routed_experts: list[bool] | bool | None = None
-    # Multi-item scoring request marker.
-    is_multi_item_scoring: list[bool] | bool | None = None
-    # Delimiter token id used for multi-item scoring.
-    multi_item_scoring_delimiter: list[int | None] | int | None = None
-    # Optional algorithm selector for multi-item scoring.
-    multi_item_algorithm: list[str | None] | str | None = None
-    # Optional mask mode override for multi-item scoring.
-    multi_item_mask_mode: list[str | None] | str | None = None
     # Keep prefetched prefix KV cache for scoring.
     cache_for_scoring: list[bool] | bool | None = None
     # Request ID handle whose cached prefix should be extended.
@@ -432,14 +416,6 @@ class GenerateReqInput:
                 raise ValueError("Single request cannot have multiple lora_paths")
         if self.return_routed_experts is None:
             self.return_routed_experts = False
-        if self.is_multi_item_scoring is None:
-            self.is_multi_item_scoring = False
-        if self.multi_item_scoring_delimiter is None:
-            self.multi_item_scoring_delimiter = None
-        if self.multi_item_algorithm is None:
-            self.multi_item_algorithm = None
-        if self.multi_item_mask_mode is None:
-            self.multi_item_mask_mode = None
         if self.cache_for_scoring is None:
             self.cache_for_scoring = False
         if self.extend_from_cache is None:
@@ -554,18 +530,6 @@ class GenerateReqInput:
         )
 
     def _normalize_multi_item_params(self, num):
-        self.is_multi_item_scoring = self._normalize_param(
-            self.is_multi_item_scoring, False, "is_multi_item_scoring", num
-        )
-        self.multi_item_scoring_delimiter = self._normalize_param(
-            self.multi_item_scoring_delimiter, None, "multi_item_scoring_delimiter", num
-        )
-        self.multi_item_algorithm = self._normalize_param(
-            self.multi_item_algorithm, None, "multi_item_algorithm", num
-        )
-        self.multi_item_mask_mode = self._normalize_param(
-            self.multi_item_mask_mode, None, "multi_item_mask_mode", num
-        )
         self.cache_for_scoring = self._normalize_param(
             self.cache_for_scoring, False, "cache_for_scoring", num
         )
@@ -637,10 +601,6 @@ class GenerateReqInput:
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
             lora_id=self.lora_id[i] if self.lora_id is not None else None,
             return_routed_experts=self.return_routed_experts[i],
-            is_multi_item_scoring=self.is_multi_item_scoring[i],
-            multi_item_scoring_delimiter=self.multi_item_scoring_delimiter[i],
-            multi_item_algorithm=self.multi_item_algorithm[i],
-            multi_item_mask_mode=self.multi_item_mask_mode[i],
             cache_for_scoring=self.cache_for_scoring[i],
             extend_from_cache=self.extend_from_cache[i],
         )

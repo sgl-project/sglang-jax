@@ -11,7 +11,6 @@ from sgl_jax.srt.entrypoints.engine import Engine
 from sgl_jax.test.test_utils import CustomTestCase
 
 TEST_MODEL_NAME = "/models/Qwen/Qwen3-0.6B"
-DELIMITER_TOKEN_ID = 151643
 LABEL_TOKEN_IDS = [9834, 902]
 QUERY_IDS = [1957, 1437, 25975, 25]
 BASE_ITEMS = [
@@ -49,11 +48,6 @@ def _build_score_engine(
         page_size=64,
         log_requests=False,
         enable_deterministic_sampling=True,
-        multi_item_scoring_delimiter=DELIMITER_TOKEN_ID,
-        multi_item_scoring_chunk_size=2,
-        max_multi_item_seq_len=32768,
-        multi_item_mask_impl=mask_impl,
-        multi_item_segment_fallback_threshold=32768,
     )
 
     if prefill_extend:
@@ -104,8 +98,6 @@ class TestMultiItemRegression(CustomTestCase):
             log_requests=False,
             enable_deterministic_sampling=True,
             disable_radix_cache=True,
-            multi_item_scoring_delimiter=DELIMITER_TOKEN_ID,
-            multi_item_scoring_chunk_size=2,
         )
 
     @classmethod

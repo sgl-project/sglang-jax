@@ -475,9 +475,6 @@ class SchedulerOutputProcessorMixin:
                 prefill (e.g., computing input token logprobs).
         """
         assert output.input_token_logprobs is not None
-        is_multi_item_scoring = (
-            req.is_multi_item_scoring and req.multi_item_scoring_delimiter is not None
-        )
         if req.input_token_logprobs is None:
             req.input_token_logprobs = []
         if req.temp_input_top_logprobs_val is None:
@@ -538,33 +535,15 @@ class SchedulerOutputProcessorMixin:
             assert req.input_top_logprobs_idx is None
 
             relevant_tokens = req.origin_input_ids[req.logprob_start_len :]
-            delimiter_mask = (
-                [token_id == req.multi_item_scoring_delimiter for token_id in relevant_tokens]
-                if is_multi_item_scoring
-                else None
-            )
 
             # Align per-token logprobs to token positions:
             # token[i] maps to model prediction at i-1 (first token has None).
-            # This keeps multi-item semantics consistent with delimiter-1 scoring.
             aligned_input_token_logprobs = [None]
             aligned_input_token_logprobs.extend(input_token_logprobs)
             aligned_input_token_logprobs.pop()
 
-            if is_multi_item_scoring:
-                req.input_token_logprobs_val = [
-                    val
-                    for val, keep in zip(aligned_input_token_logprobs, delimiter_mask, strict=True)
-                    if keep
-                ]
-                input_token_logprobs_idx = [
-                    token_id
-                    for token_id, keep in zip(relevant_tokens, delimiter_mask, strict=True)
-                    if keep
-                ]
-            else:
-                req.input_token_logprobs_val = aligned_input_token_logprobs
-                input_token_logprobs_idx = relevant_tokens
+            req.input_token_logprobs_val = aligned_input_token_logprobs
+            input_token_logprobs_idx = relevant_tokens
 
             # Clip the padded hash values from image tokens.
             # Otherwise, it will lead to detokenization errors.
@@ -590,21 +569,6 @@ class SchedulerOutputProcessorMixin:
                 req.input_top_logprobs_val.pop()
                 req.input_top_logprobs_idx.pop()
 
-                if is_multi_item_scoring:
-                    req.input_top_logprobs_val = [
-                        val
-                        for val, keep in zip(
-                            req.input_top_logprobs_val, delimiter_mask, strict=True
-                        )
-                        if keep
-                    ]
-                    req.input_top_logprobs_idx = [
-                        idx
-                        for idx, keep in zip(
-                            req.input_top_logprobs_idx, delimiter_mask, strict=True
-                        )
-                        if keep
-                    ]
                 req.temp_input_top_logprobs_idx = None
                 req.temp_input_top_logprobs_val = None
 
@@ -624,33 +588,11 @@ class SchedulerOutputProcessorMixin:
                 req.input_token_ids_logprobs_val.pop()
                 req.input_token_ids_logprobs_idx.pop()
 
-                if is_multi_item_scoring:
-                    req.input_token_ids_logprobs_val = [
-                        val
-                        for val, keep in zip(
-                            req.input_token_ids_logprobs_val,
-                            delimiter_mask,
-                            strict=True,
-                        )
-                        if keep
-                    ]
-                    req.input_token_ids_logprobs_idx = [
-                        idx
-                        for idx, keep in zip(
-                            req.input_token_ids_logprobs_idx,
-                            delimiter_mask,
-                            strict=True,
-                        )
-                        if keep
-                    ]
                 req.temp_input_token_ids_logprobs_idx = None
                 req.temp_input_token_ids_logprobs_val = None
 
             if req.return_logprob:
-                if is_multi_item_scoring:
-                    relevant_tokens_len = sum(delimiter_mask)
-                else:
-                    relevant_tokens_len = len(req.origin_input_ids) - req.logprob_start_len
+                relevant_tokens_len = len(req.origin_input_ids) - req.logprob_start_len
                 assert len(req.input_token_logprobs_val) == relevant_tokens_len
                 assert len(req.input_token_logprobs_idx) == relevant_tokens_len
                 if req.top_logprobs_num > 0:
