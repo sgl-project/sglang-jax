@@ -585,6 +585,7 @@ class EPMoE(nnx.Module):
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
 
+            # Normalize scales to GMM's 4D layout [E, k_blocks, 1, out_dim]
             w0_scale = self._normalize_scale_for_gmm(
                 self.wi_0_scale.value if self.wi_0_scale is not None else None,
                 self.wi_0.value,

@@ -1,50 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Quantized matmul kernel."""
 
-import math
-
 import jax
 import jax.numpy as jnp
 from jax import lax
 
 from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
-    convert_block_scale_to_kernel_layout,
     get_blockwise_kernel,
     get_safe_blockwise_tuned_value,
     should_use_blockwise_kernel,
 )
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor_simple
-
-
-def _get_effective_block_sizes(
-    w_q: jax.Array,
-    w_scale: jax.Array,
-    weight_block_size: tuple[int, int] | None,
-) -> tuple[int, int]:
-    """Infer effective ``(block_n, block_k)`` from weights and scales.
-
-    When a rule provides ``weight_block_size`` we trust that explicitly.
-    Otherwise, this recovers the block sizes from the compact block-scale shape
-    carried by an offline checkpoint.
-    """
-    out_dim, in_dim = w_q.shape
-    out_blocks, in_blocks = w_scale.shape
-
-    if weight_block_size is not None:
-        block_size_out, block_size_in = int(weight_block_size[0]), int(weight_block_size[1])
-    else:
-        if out_blocks <= 0 or in_blocks <= 0:
-            raise ValueError(
-                f"Invalid w_scale shape: {w_scale.shape}. Both dimensions must be positive."
-            )
-        block_size_out = math.ceil(out_dim / out_blocks)
-        block_size_in = math.ceil(in_dim / in_blocks)
-
-    if block_size_out <= 0 or block_size_in <= 0:
-        raise ValueError(
-            f"Invalid block sizes: block_size_out={block_size_out}, block_size_in={block_size_in}."
-        )
-    return block_size_out, block_size_in
 
 
 def xla_quantized_matmul_local(
@@ -66,9 +32,12 @@ def xla_quantized_matmul_local(
     Args:
         x: Activation tensor [batch, n_input_features] (local slice)
         w_q: Quantized weight tensor [n_output_features, n_input_features] (local slice)
-        w_scale: Weight quantization scale [n_output_features]
+        w_scale: Weight quantization scale.  Per-channel: ``[n_output_features]``.
+            Block-wise (pre-expanded): ``[in_blocks, 1, n_output_features]``.
         quantize_activation: Whether to quantize activations
         reduce_axis: Axis name for psum reduction (e.g., "tensor"). None skips reduction.
+        weight_block_size: ``(block_n, block_k)`` for block-wise quantization.
+        activation_quant_dtype: Dtype for activation quantization.
 
     Returns:
         Output of the quantized matmul.
@@ -78,17 +47,21 @@ def xla_quantized_matmul_local(
     compute_dtype = jnp.float32 if compute_dtype is None else compute_dtype
     act_quant_dtype = w_q.dtype if activation_quant_dtype is None else activation_quant_dtype
 
-    # w_scale.ndim == 2 implies block-wise quantization
-    is_block_quant = w_scale.ndim == 2
+    # w_scale.ndim == 3 implies pre-expanded block-wise quantization
+    # (scale was expanded from [out_blocks, in_blocks] to [in_blocks, 1, n_out]
+    #  at init time via expand_block_scale).
+    is_block_quant = w_scale.ndim == 3
 
     if is_block_quant:
         # === Block Quantization Path ===
         out_dim, in_dim = w_q.shape
-        block_size_out, block_size_in = _get_effective_block_sizes(
-            w_q=w_q,
-            w_scale=w_scale,
-            weight_block_size=weight_block_size,
-        )
+        in_blocks = w_scale.shape[0]
+        block_size_in = in_dim // in_blocks
+
+        if weight_block_size is not None:
+            block_size_out = int(weight_block_size[0])
+        else:
+            block_size_out = block_size_in
 
         blockwise_kernel = get_blockwise_kernel()
         if jax.default_backend() != "tpu":
@@ -110,13 +83,7 @@ def xla_quantized_matmul_local(
                 f"block_size_out={block_size_out} (known to cause NaNs)."
             )
 
-        w_scale_kernel = convert_block_scale_to_kernel_layout(
-            w_scale=w_scale,
-            out_dim=out_dim,
-            in_dim=in_dim,
-            block_size_out=block_size_out,
-            block_size_in=block_size_in,
-        )
+        # w_scale is already in kernel-ready layout [in_blocks, 1, n_out].
         x_q_dtype = act_quant_dtype if quantize_activation else x.dtype
         tuned_value = get_safe_blockwise_tuned_value(
             n_batch=int(x.shape[0]),
@@ -129,7 +96,7 @@ def xla_quantized_matmul_local(
         out = blockwise_kernel(
             x=x,
             w_q=w_q,
-            w_scale=w_scale_kernel,
+            w_scale=w_scale,
             block_size=block_size_in,
             x_q_dtype=x_q_dtype,
             tuned_value=tuned_value,
