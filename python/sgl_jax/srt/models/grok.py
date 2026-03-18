@@ -6,6 +6,8 @@ import jax
 import jax.lax
 from flax import nnx
 from jax import numpy as jnp
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -434,6 +436,7 @@ class Grok1Attention(nnx.Module):
             use_bias=False,
             params_dtype=jnp.bfloat16,
             kernel_axes=("tensor", None),
+            reduce_scatter=True,
             mesh=mesh,
         )
 
@@ -478,6 +481,7 @@ class Grok1Attention(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        reduce_scatter: bool = True,
     ) -> tuple[jax.Array, jax.Array]:
         # Short circuit for empty sequences
         if hidden_states.shape[0] == 0:
@@ -499,8 +503,7 @@ class Grok1Attention(nnx.Module):
         attn_ret, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
         attn_output = attn_ret[0] if isinstance(attn_ret, tuple) else attn_ret
 
-        # Project output
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output, reduce_scatter=reduce_scatter)
         return output, kv_fused
 
 
@@ -639,17 +642,26 @@ class Grok1DecoderLayer(nnx.Module):
             # First layer or no deferred norm - use fused_rmsnorm equivalent
             hidden_states, residual = self.pre_attn_norm(hidden_states), hidden_states
 
-        # Self-attention
+        # Self-attention with ReduceScatter when seq dim is large enough
+        tp_size = self.mesh.shape["tensor"]
+        use_reduce_scatter = hidden_states.shape[0] >= tp_size
+
         hidden_states, kv_fused = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
+            reduce_scatter=use_reduce_scatter,
         )
 
-        # # Apply post-attention norm and pre-MoE norm (matching PyTorch fused_dual_residual_rmsnorm)
         assert self.post_attn_norm.scale is not None
         assert self.pre_moe_norm.scale is not None
+
+        if use_reduce_scatter:
+            sharded = NamedSharding(self.mesh, P("tensor", None))
+            replicated = NamedSharding(self.mesh, P(None, None))
+            residual = jax.sharding.reshard(residual, sharded)
+
         hidden_states, residual = dual_rmsnorm_forward(
             hidden_states,
             residual,
@@ -657,6 +669,10 @@ class Grok1DecoderLayer(nnx.Module):
             self.pre_moe_norm.scale,
             self.post_attn_norm.epsilon,
         )
+
+        if use_reduce_scatter:
+            hidden_states = jax.sharding.reshard(hidden_states, replicated)
+            residual = jax.sharding.reshard(residual, replicated)
 
         # Feed-forward network
         if self.residual_moe:
