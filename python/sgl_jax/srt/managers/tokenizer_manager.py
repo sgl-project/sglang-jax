@@ -404,10 +404,6 @@ class TokenizerManager:
             lora_id=obj.lora_id,
             extra_key=obj.extra_key,
             return_routed_experts=obj.return_routed_experts,
-            is_multi_item_scoring=bool(obj.is_multi_item_scoring),
-            multi_item_scoring_delimiter=obj.multi_item_scoring_delimiter,
-            multi_item_algorithm=obj.multi_item_algorithm,
-            multi_item_mask_mode=obj.multi_item_mask_mode,
             cache_for_scoring=bool(obj.cache_for_scoring),
             extend_from_cache=obj.extend_from_cache,
         )

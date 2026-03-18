@@ -408,8 +408,6 @@ class ModelWorker:
             return_logprob=False,
             return_output_logprob_only=True,
             is_prefill_only=(mode == ForwardMode.EXTEND),
-            multi_item_scoring_flags=np.array([False] * bs, dtype=np.bool_),
-            multi_item_scoring_delimiter=None,
             sampling_info=(
                 SamplingBatchInfo.generate_for_precompile(bs, self.model_config.vocab_size)
                 if speculative_algotithm is None

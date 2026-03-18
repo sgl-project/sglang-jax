@@ -1915,8 +1915,6 @@ class ModelWorkerBatch:
     top_logprobs_nums: list[int] | None
     token_ids_logprobs: list[list[int]] | None
     is_prefill_only: bool
-    multi_item_scoring_flags: np.ndarray | None
-    multi_item_scoring_delimiter: int | None
 
     # For extend
     # extend_num_tokens: Optional[int]
