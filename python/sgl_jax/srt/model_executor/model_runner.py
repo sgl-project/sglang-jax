@@ -138,6 +138,12 @@ class ModelRunner(BaseModelRunner):
         self.init_attention_backend()
         self.load_model()
 
+        # Enable per-layer hidden states capture if requested.
+        # Must be set before initialize_jit() since layers_to_capture
+        # is baked into model_def during nnx.split().
+        if server_args.enable_return_hidden_states:
+            self._setup_hidden_states_capture()
+
         # Check if the model is using hybrid SWA
         if (
             not self.server_args.disable_hybrid_swa_memory
@@ -181,6 +187,22 @@ class ModelRunner(BaseModelRunner):
                 + getattr(self.model_config.hf_config, "num_experts", 0),
             )
         )
+
+    def _setup_hidden_states_capture(self):
+        """Configure the model to capture all layers' hidden states.
+
+        Must be called after load_model() and before initialize_jit(),
+        because layers_to_capture is baked into model_def during nnx.split().
+        """
+        num_layers = self.model_config.num_hidden_layers
+        # Set layers_to_capture on the inner model (e.g., QWen3Model)
+        inner_model = getattr(self.model, "model", None)
+        if inner_model is not None and hasattr(inner_model, "layers_to_capture"):
+            inner_model.layers_to_capture = list(range(num_layers))
+            logger.info("Hidden states capture enabled for all %d layers", num_layers)
+        # Some models gate aux_hidden_states behind this flag (e.g., Llama)
+        if hasattr(self.model, "capture_aux_hidden_states"):
+            self.model.capture_aux_hidden_states = True
 
     def initialize_jit(self):
         model_def, model_state = nnx.split(self.model)

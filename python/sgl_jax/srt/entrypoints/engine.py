@@ -155,6 +155,7 @@ class Engine(EngineBase):
         stream: bool = False,
         lora_path: list[str] | str | None = None,
         return_routed_experts: list[bool] | bool | None = False,
+        return_hidden_states: bool | None = False,
     ) -> dict | Iterator[dict]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -175,6 +176,7 @@ class Engine(EngineBase):
             stream=stream,
             lora_path=lora_path,
             return_routed_experts=return_routed_experts,
+            return_hidden_states=return_hidden_states,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -206,6 +208,7 @@ class Engine(EngineBase):
         stream: bool = False,
         lora_path: list[str] | str | None = None,
         return_routed_experts: list[bool] | bool | None = False,
+        return_hidden_states: bool | None = False,
     ) -> dict | AsyncIterator[dict]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -226,6 +229,7 @@ class Engine(EngineBase):
             stream=stream,
             lora_path=lora_path,
             return_routed_experts=return_routed_experts,
+            return_hidden_states=return_hidden_states,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 

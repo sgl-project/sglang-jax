@@ -305,6 +305,9 @@ class GenerateReqInput:
 
     return_routed_experts: list[bool] | bool | None = None
 
+    # Whether to return hidden states
+    return_hidden_states: bool | None = None
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -540,6 +543,7 @@ class GenerateReqInput:
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
             lora_id=self.lora_id[i] if self.lora_id is not None else None,
             return_routed_experts=self.return_routed_experts[i],
+            return_hidden_states=self.return_hidden_states,
         )
 
 

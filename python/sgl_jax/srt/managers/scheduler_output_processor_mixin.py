@@ -147,16 +147,18 @@ class SchedulerOutputProcessorMixin:
                     )
                     logprob_pt += num_input_logprobs
                 if req.return_hidden_states and logits_output.hidden_states is not None:
-                    req.hidden_states.append(
-                        jax.device_get(
-                            logits_output.hidden_states[
-                                hidden_state_offset : (
-                                    hidden_state_offset := hidden_state_offset
-                                    + len(req.origin_input_ids)
-                                )
-                            ]
-                        ).astype(float)
-                    )
+                    hs = jax.device_get(
+                        logits_output.hidden_states[
+                            hidden_state_offset : (
+                                hidden_state_offset := hidden_state_offset
+                                + len(req.origin_input_ids)
+                            )
+                        ]
+                    ).astype(float)
+                    if self.server_args.enable_return_hidden_states:
+                        num_layers = self.model_config.num_hidden_layers
+                        hs = hs.reshape(hs.shape[0], num_layers, -1)
+                    req.hidden_states.append(hs)
                 # Update grammar state after token sampling
                 if req.grammar is not None:
                     try:
@@ -375,7 +377,11 @@ class SchedulerOutputProcessorMixin:
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
             if req.return_hidden_states and logits_output.hidden_states is not None:
-                req.hidden_states.append(logits_output.hidden_states[i])
+                hs = jax.device_get(logits_output.hidden_states[i]).astype(float)
+                if self.server_args.enable_return_hidden_states:
+                    num_layers = self.model_config.num_hidden_layers
+                    hs = hs.reshape(num_layers, -1)
+                req.hidden_states.append(hs)
         self.set_next_batch_sampling_info_done(batch)
         self.stream_output(
             batch.reqs,
@@ -726,6 +732,9 @@ class SchedulerOutputProcessorMixin:
                         output_token_ids_logprobs_val.append([])
                         output_token_ids_logprobs_idx.append([])
                 if req.return_hidden_states:
+                    if output_hidden_states is None:
+                        output_hidden_states = []
+                    output_hidden_states.append(req.hidden_states)
                     if output_hidden_states_for_mm is None:
                         output_hidden_states_for_mm = []
                     output_hidden_states_for_mm.append(req.hidden_states)
