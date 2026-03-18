@@ -375,7 +375,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
 
     def available_size(self):
-        raise NotImplementedError()
+        # A hybrid request needs capacity from both full-attention and SWA pools,
+        # so the effective allocatable budget is the smaller of the two.
+        return min(
+            self.full_attn_allocator.available_size(),
+            self.swa_attn_allocator.available_size(),
+        )
 
     def full_available_size(self):
         return self.full_attn_allocator.available_size()
