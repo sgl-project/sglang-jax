@@ -49,6 +49,78 @@ WAN2_1_T2V_14B = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
 
+# --- Hidden states alignment utilities ---
+
+EARLY_LAYER_MAE_THRESHOLD = 5e-2  # layers 0 to num_layers//4
+OVERALL_MAE_THRESHOLD = 5e-1  # all layers
+
+
+def assert_hidden_states_aligned(
+    test_case: unittest.TestCase,
+    hf_hidden_states: tuple,
+    sgl_hidden_states: np.ndarray,
+    prompt: str,
+    early_threshold: float = EARLY_LAYER_MAE_THRESHOLD,
+    overall_threshold: float = OVERALL_MAE_THRESHOLD,
+):
+    """Compare per-layer hidden states between HF and SGLang-JAX.
+
+    Args:
+        test_case: unittest.TestCase instance (for assertions).
+        hf_hidden_states: HF output_hidden_states tuple, each (1, seq_len, hidden_dim).
+        sgl_hidden_states: SGLang prefill hidden states, shape (seq_len, num_layers, hidden_dim).
+        prompt: The prompt string (for error messages and logging).
+        early_threshold: MAE threshold for early layers (first quarter).
+        overall_threshold: MAE threshold for all layers.
+    """
+    import torch
+
+    num_layers = sgl_hidden_states.shape[1]
+    early_cutoff = num_layers // 4
+
+    print(f"\nPrompt: {prompt!r}")
+    print(f"SGLang prefill shape: {sgl_hidden_states.shape}")
+    print(f"HF layers (including embedding): {len(hf_hidden_states)}")
+    print(f"Comparing {num_layers} transformer layers...")
+    print(f"  Early layers [0, {early_cutoff}): MAE < {early_threshold}")
+    print(f"  All layers [0, {num_layers}): MAE < {overall_threshold}")
+
+    test_case.assertEqual(
+        len(hf_hidden_states),
+        num_layers + 1,
+        "HF should have num_layers + 1 outputs (layer inputs + final normed output)",
+    )
+
+    all_passed = True
+    for layer_idx in range(num_layers):
+        hf_layer = hf_hidden_states[layer_idx]
+        if isinstance(hf_layer, torch.Tensor):
+            hf_layer = hf_layer[0].float().numpy()
+        sgl_layer = np.array(sgl_hidden_states[:, layer_idx, :], dtype=np.float32)
+
+        mae = np.abs(hf_layer - sgl_layer).mean()
+        max_abs_err = np.abs(hf_layer - sgl_layer).max()
+
+        threshold = early_threshold if layer_idx < early_cutoff else overall_threshold
+        passed = mae < threshold
+        status = "PASS" if passed else "FAIL"
+
+        if layer_idx % 4 == 0 or layer_idx == num_layers - 1 or not passed:
+            print(
+                f"  [{status}] Layer {layer_idx:2d}: "
+                f"MAE={mae:.4e}, max_err={max_abs_err:.4e} "
+                f"(threshold={threshold:.0e})"
+            )
+
+        if not passed:
+            all_passed = False
+
+    test_case.assertTrue(
+        all_passed,
+        f"Some layers exceeded MAE threshold for prompt: {prompt!r}",
+    )
+    print(f"  All {num_layers} layers passed.")
+
 
 def is_in_ci():
     """Return whether it is in CI runner."""

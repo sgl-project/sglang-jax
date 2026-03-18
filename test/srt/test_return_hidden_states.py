@@ -65,7 +65,6 @@ class TestReturnHiddenStates(CustomTestCase):
 
         self.assertEqual(len(outputs), 2)
         for prompt, output in zip(prompts, outputs):
-            # Convert each hidden state to numpy array
             for i in range(len(output["meta_info"]["hidden_states"])):
                 hs = output["meta_info"]["hidden_states"][i]
                 if not isinstance(hs, np.ndarray):
@@ -83,8 +82,6 @@ class TestReturnHiddenStates(CustomTestCase):
                 f"Completion_tokens: {completion_tokens}"
             )
 
-            # Prefill hidden states: [prompt_tokens, num_layers, hidden_dim]
-            # Decode hidden states: [num_layers, hidden_dim] per token
             raw_hs = output["meta_info"]["hidden_states"]
             print(f"Number of hidden state chunks: {len(raw_hs)}")
             for idx, h in enumerate(raw_hs):
@@ -95,14 +92,12 @@ class TestReturnHiddenStates(CustomTestCase):
                 [np.expand_dims(h, 0) if h.ndim == 2 else h for h in raw_hs]
             )
             print(f"Combined hidden states shape: {hidden_states.shape}")
-            # In autoregressive generation, the last completion token is never fed
-            # into the model as input, so its hidden state is not available.
             # Expected: [prompt_tokens + completion_tokens - 1, num_layers, hidden_dim]
             self.assertEqual(hidden_states.shape[0], total_tokens - 1)
             self.assertEqual(hidden_states.shape[1], EXPECTED_NUM_LAYERS)
             self.assertEqual(hidden_states.shape[2], EXPECTED_HIDDEN_DIM)
 
-            # Verify per-layer hidden states are distinct (not all zeros, not all same)
+            # Verify per-layer hidden states are not all zeros
             for layer_idx in [0, EXPECTED_NUM_LAYERS // 2, EXPECTED_NUM_LAYERS - 1]:
                 layer_hs = hidden_states[0, layer_idx, :]
                 self.assertGreater(
@@ -131,7 +126,6 @@ class TestReturnHiddenStates(CustomTestCase):
 
         self.assertEqual(len(outputs), 1)
         hidden_states = outputs[0]["meta_info"].get("hidden_states")
-        # When return_hidden_states is not set, hidden_states should be absent or empty
         if hidden_states is not None:
             self.assertEqual(len(hidden_states), 0)
 
