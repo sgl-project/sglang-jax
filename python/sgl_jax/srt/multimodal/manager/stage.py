@@ -22,6 +22,7 @@ from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
 from sgl_jax.srt.multimodal.manager.scheduler.embed_scheduler import EmbedScheduler
 from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
 from sgl_jax.srt.multimodal.manager.scheduler.vit_scheduler import VitScheduler
+from sgl_jax.srt.multimodal.manager.scheduler.encoder_scheduler import EncoderScheduler
 from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_backbone import (
     MiMoAudioForCausalLM,
 )
@@ -43,6 +44,9 @@ from sgl_jax.srt.multimodal.models.wan.diffusion.wan_dit import (
     WanTransformer3DModel,
 )
 from sgl_jax.srt.multimodal.models.wan.vaes.wanvae import AutoencoderKLWan
+from sgl_jax.srt.multimodal.models.encoders.clip import CLIPTextModel
+from sgl_jax.srt.multimodal.models.encoders.t5 import T5EncoderModel
+from sgl_jax.srt.multimodal.models.dits.flux import FluxTransformer2DModel
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils import configure_logger
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -225,32 +229,41 @@ def get_scheduler_class(name: str):
         return AudioScheduler
     elif name == "audio_backbone":
         return AudioBackboneScheduler
+    elif name == "text_encoder":
+        return EncoderScheduler
     else:
         raise ValueError(f"Unknown scheduler name: {name}")
 
 
 def get_model_class(name: str):
-    if name == "AutoencoderKLWan":
-        return AutoencoderKLWan
-    elif name == "UMT5EncoderModel":
-        return UMT5EncoderModel
-    elif name == "WanTransformer3DModel":
-        return WanTransformer3DModel
-    elif name == "WanDualTransformer3DModel":
-        return WanDualTransformer3DModel
-    elif name == "Qwen2_5_VL_Generation":
-        return Qwen2_5_VL_Generation
-    elif name == "Qwen2_5_VL_VisionModel":
-        return Qwen2_5_VL_VisionModel
-    elif name == "Qwen2ForCausalLM":
-        return Qwen2ForCausalLM
-    elif name == "Qwen3OmniMoeThinkerEmbedding":
-        return Qwen3OmniMoeThinkerEmbedding
-    elif name == "Qwen3OmniMoeThinkerTextForConditionalGeneration":
-        return Qwen3OmniMoeThinkerTextForConditionalGeneration
-    elif name == "MiMoAudioTokenizer":
-        return MiMoAudioTokenizer
-    elif name == "MiMoAudioForCausalLM":
-        return MiMoAudioForCausalLM
-    else:
-        raise ValueError(f"Unknown model name: {name}")
+    model_classes = {
+        "AutoencoderKLWan": AutoencoderKLWan,
+        "UMT5EncoderModel": UMT5EncoderModel,
+        "WanTransformer3DModel": WanTransformer3DModel,
+        "WanDualTransformer3DModel": WanDualTransformer3DModel,
+        "Qwen2_5_VL_Generation": Qwen2_5_VL_Generation,
+        "Qwen2_5_VL_VisionModel": Qwen2_5_VL_VisionModel,
+        "Qwen2ForCausalLM": Qwen2ForCausalLM,
+        "Qwen3OmniMoeThinkerEmbedding": Qwen3OmniMoeThinkerEmbedding,
+        "Qwen3OmniMoeThinkerTextForConditionalGeneration": (
+            Qwen3OmniMoeThinkerTextForConditionalGeneration
+        ),
+        "MiMoAudioTokenizer": MiMoAudioTokenizer,
+        "MiMoAudioForCausalLM": MiMoAudioForCausalLM,
+        "CLIPTextModel": CLIPTextModel,
+        "T5EncoderModel": T5EncoderModel,
+        "FluxTransformer2DModel": FluxTransformer2DModel,
+        # "AutoencoderKL": AutoencoderKL,
+    }
+
+    if "," in name:
+        names = [item.strip() for item in name.split(",") if item.strip()]
+        unknown_names = [item for item in names if item not in model_classes]
+        if unknown_names:
+            raise ValueError(f"Unknown model name: {', '.join(unknown_names)}")
+        return [model_classes[item] for item in names]
+
+    if name in model_classes:
+        return model_classes[name]
+
+    raise ValueError(f"Unknown model name: {name}")
