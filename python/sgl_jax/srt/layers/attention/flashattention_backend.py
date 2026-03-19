@@ -15,7 +15,7 @@ from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
-from sgl_jax.srt.mem_cache.memory_pool import KVCache
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, SplitMHATokenToKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.utils import cdiv
@@ -445,13 +445,23 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
-        # Early branch: split KV path when head_dim != v_head_dim
-        is_split = (
-            getattr(token_to_kv_pool, "is_split", False) if token_to_kv_pool is not None else False
-        )
-        if is_split:
+        if isinstance(token_to_kv_pool, SplitMHATokenToKVPool):
             return self._call_split(q, k, v, layer, forward_batch, token_to_kv_pool, causal)
+        else:
+            return self._call_fused(q, k, v, layer, forward_batch, token_to_kv_pool, causal)
 
+    @named_scope
+    def _call_fused(
+        self,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        causal: int = 1,
+    ):
+        """Fused KV cache path: K and V interleaved in a single buffer."""
         if forward_batch is not None and token_to_kv_pool is not None:
             kv_cache_fused = self._get_fused_kv_cache(
                 forward_batch, token_to_kv_pool, layer.layer_id

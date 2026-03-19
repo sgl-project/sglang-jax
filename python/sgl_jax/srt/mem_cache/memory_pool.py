@@ -592,22 +592,19 @@ class SplitMHATokenToKVPool(MHATokenToKVPool):
     def tree_unflatten(cls, aux_data, children):
         k_buffer = children[0]
         v_buffer = children[1]
-        parent_children = children[2:] if len(children) > 2 else ()
 
         obj = object.__new__(cls)
 
-        parent_obj = KVCache.tree_unflatten(aux_data, parent_children)
-        for attr in [
-            "size",
-            "page_size",
-            "dtype",
-            "layer_num",
-            "mesh",
-            "start_layer",
-            "end_layer",
-            "mem_usage",
-        ]:
-            setattr(obj, attr, getattr(parent_obj, attr))
+        # Set base KVCache attributes directly (cannot call KVCache.tree_unflatten
+        # because KVCache is abstract and object.__new__(KVCache) would fail).
+        obj.size = aux_data["size"]
+        obj.page_size = aux_data["page_size"]
+        obj.dtype = aux_data["dtype"]
+        obj.layer_num = aux_data["layer_num"]
+        obj.mesh = aux_data["mesh"]
+        obj.start_layer = aux_data["start_layer"]
+        obj.end_layer = aux_data["end_layer"]
+        obj.mem_usage = aux_data["mem_usage"]
 
         obj.head_num = aux_data["head_num"]
         obj.head_dim = aux_data["head_dim"]
@@ -659,9 +656,7 @@ class SplitMHATokenToKVPool(MHATokenToKVPool):
             kv_partition_axis=self.kv_partition_axis,
         )
 
-    def replace_kv_buffer(
-        self, kv_buffer: list[tuple[jax.Array, jax.Array]]
-    ) -> None:
+    def replace_kv_buffer(self, kv_buffer: list[tuple[jax.Array, jax.Array]]) -> None:
         for i, (k, v) in enumerate(kv_buffer):
             self.k_buffer[i] = k
             self.v_buffer[i] = v
@@ -717,7 +712,8 @@ class SWAKVPool(KVCache):
         size_swa: int,
         swa_attention_layer_ids: list[int],
         full_attention_layer_ids: list[int],
-        token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        full_pool_class: KVCache = MHATokenToKVPool,
+        swa_pool_class: KVCache = MHATokenToKVPool,
         swa_head_dim: int | None = None,
         swa_v_head_dim: int | None = None,
         **kwargs,
@@ -739,22 +735,12 @@ class SWAKVPool(KVCache):
         if swa_v_head_dim is not None:
             kwargs_swa["v_head_dim"] = swa_v_head_dim
 
-        def _resolve_pool_class(cls, pool_kwargs):
-            """Auto-select SplitMHATokenToKVPool when head dims differ."""
-            if cls is not MHATokenToKVPool:
-                return cls
-            hd = pool_kwargs.get("head_dim")
-            vhd = pool_kwargs.get("v_head_dim", hd)
-            if vhd is not None and vhd != hd:
-                return SplitMHATokenToKVPool
-            return MHATokenToKVPool
-
-        self.swa_kv_pool = _resolve_pool_class(token_to_kv_pool_class, kwargs_swa)(
+        self.swa_kv_pool = swa_pool_class(
             size=size_swa,
             layer_num=self.swa_layer_nums,
             **kwargs_swa,
         )
-        self.full_kv_pool = _resolve_pool_class(token_to_kv_pool_class, kwargs_full)(
+        self.full_kv_pool = full_pool_class(
             size=size,
             layer_num=self.full_layer_nums,
             **kwargs_full,

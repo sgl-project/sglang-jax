@@ -38,8 +38,8 @@ from sgl_jax.srt.mem_cache.allocator import (
 from sgl_jax.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     ReqToTokenPool,
-    SWAKVPool,
     SplitMHATokenToKVPool,
+    SWAKVPool,
 )
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -505,38 +505,31 @@ class ModelRunner(BaseModelRunner):
 
         # Create KV cache pool
         if self.is_hybrid:
+            # Determine pool classes from raw (pre-alignment) head dims
+            full_hd = self.model_config.head_dim
+            full_vhd = getattr(self.model_config, "v_head_dim", full_hd)
+            swa_hd = getattr(self.model_config, "swa_head_dim", full_hd)
+            swa_vhd = getattr(
+                self.model_config,
+                "swa_v_head_dim",
+                getattr(self.model_config, "v_head_dim", swa_hd),
+            )
+            full_pool_class = SplitMHATokenToKVPool if full_hd != full_vhd else MHATokenToKVPool
+            swa_pool_class = SplitMHATokenToKVPool if swa_hd != swa_vhd else MHATokenToKVPool
+
             self.token_to_kv_pool = SWAKVPool(
                 size=self.full_max_total_num_tokens,
                 size_swa=self.swa_max_total_num_tokens,
                 swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
                 full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+                full_pool_class=full_pool_class,
+                swa_pool_class=swa_pool_class,
                 dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
-                head_dim=(self.model_config.head_dim + 127) // 128 * 128,
-                v_head_dim=(
-                    getattr(self.model_config, "v_head_dim", self.model_config.head_dim) + 127
-                )
-                // 128
-                * 128,
-                swa_head_dim=(
-                    getattr(self.model_config, "swa_head_dim", self.model_config.head_dim) + 127
-                )
-                // 128
-                * 128,
-                swa_v_head_dim=(
-                    getattr(
-                        self.model_config,
-                        "swa_v_head_dim",
-                        getattr(
-                            self.model_config,
-                            "v_head_dim",
-                            getattr(self.model_config, "swa_head_dim", self.model_config.head_dim),
-                        ),
-                    )
-                    + 127
-                )
-                // 128
-                * 128,
+                head_dim=(full_hd + 127) // 128 * 128,
+                v_head_dim=(full_vhd + 127) // 128 * 128,
+                swa_head_dim=(swa_hd + 127) // 128 * 128,
+                swa_v_head_dim=(swa_vhd + 127) // 128 * 128,
                 mesh=self.mesh,
             )
         else:
@@ -546,9 +539,7 @@ class ModelRunner(BaseModelRunner):
             aligned_head_dim = (head_dim + 127) // 128 * 128
             aligned_v_head_dim = (v_head_dim + 127) // 128 * 128
 
-            pool_class = (
-                SplitMHATokenToKVPool if aligned_head_dim != aligned_v_head_dim else MHATokenToKVPool
-            )
+            pool_class = SplitMHATokenToKVPool if head_dim != v_head_dim else MHATokenToKVPool
             self.token_to_kv_pool = pool_class(
                 size=self.max_total_num_tokens,
                 page_size=self.page_size,
