@@ -64,6 +64,11 @@ def xla_quantized_matmul_local(
             block_size_out = block_size_in
 
         blockwise_kernel = get_blockwise_kernel()
+        if jax.default_backend() != "tpu":
+            raise RuntimeError(
+                "Block-wise quantized matmul requires TPU backend, "
+                f"but got {jax.default_backend()!r}."
+            )
         if blockwise_kernel is None:
             raise RuntimeError(
                 "Block-wise quantized matmul requires the blockwise kernel, "
