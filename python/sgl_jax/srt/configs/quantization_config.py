@@ -9,6 +9,7 @@ import os
 from dataclasses import dataclass
 from numbers import Integral
 
+import jax
 import jax.numpy as jnp
 import yaml
 
@@ -159,6 +160,15 @@ class QuantizationConfig:
         moe_activation_dtype = _str_to_dtype(moe_section.get("activation_dtype"))
         is_static_checkpoint = quant.get("is_static_checkpoint", False)
         weight_block_size = normalize_weight_block_size(quant.get("weight_block_size"))
+
+        # Block-wise quant relies on a TPU Pallas kernel; reject early on other backends.
+        # NOTE: if _resolve_quantization_config() ever extracts weight_block_size
+        # from HF config.json, the same check must be added there.
+        if weight_block_size is not None and jax.default_backend() != "tpu":
+            raise RuntimeError(
+                f"Block-wise quantization (weight_block_size={weight_block_size}) "
+                f"requires TPU backend, but got {jax.default_backend()!r}."
+            )
 
         return cls(
             linear_rules=linear_rules,
