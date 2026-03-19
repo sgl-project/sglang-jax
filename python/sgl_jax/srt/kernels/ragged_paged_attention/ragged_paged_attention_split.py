@@ -895,6 +895,7 @@ def ragged_paged_attention_split(
             max_num_tokens,
             pages_per_seq,
             causal,
+            kernel_type="split",
         )
     if page_size == 1:
         bkv_p = bkv_p // 2
