@@ -1079,6 +1079,11 @@ class ServerArgs:
             action="store_true",
             help="Enable returning routed experts of each layer with responses.",
         )
+        parser.add_argument(
+            "--enable-return-hidden-states",
+            action="store_true",
+            help="Enable returning per-layer hidden states with responses.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
