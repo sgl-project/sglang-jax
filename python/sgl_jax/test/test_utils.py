@@ -41,7 +41,7 @@ GEMMA2_2B_IT = "google/gemma-2-2b-it"
 BAILING_MOE = "inclusionAI/Ling-mini-2.0"
 DEEPSEEK_R1_DISTILL_QWEN_1_5B = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 
-QWEN3_32B = "google/gemma-2-2b-it"
+QWEN3_32B = "Qwen/Qwen3-32B"
 QWEN3_32B_EAGLE3 = "AngelSlim/Qwen3-32B_eagle3"
 
 WAN2_1_T2V_1_3B = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
@@ -96,6 +96,8 @@ def assert_hidden_states_aligned(
         hf_layer = hf_hidden_states[layer_idx]
         if isinstance(hf_layer, torch.Tensor):
             hf_layer = hf_layer[0].float().numpy()
+        elif isinstance(hf_layer, np.ndarray) and hf_layer.ndim == 3:
+            hf_layer = hf_layer[0].astype(np.float32)
         sgl_layer = np.array(sgl_hidden_states[:, layer_idx, :], dtype=np.float32)
 
         mae = np.abs(hf_layer - sgl_layer).mean()

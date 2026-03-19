@@ -263,6 +263,12 @@ class Scheduler(
                 device_indexes=server_args.device_indexes,
             )
 
+        logger.info(
+            "Device mesh created: shape=%s, devices=%s",
+            dict(self.mesh.shape),
+            self.mesh.devices.flatten().tolist(),
+        )
+
         if server_args.moe_backend == "fused":
             mesh_ep_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
             if server_args.ep_size != mesh_ep_size:
