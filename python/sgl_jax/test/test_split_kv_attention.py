@@ -1,7 +1,7 @@
 """Tests for split KV cache attention (different K and V head dimensions).
 
 Part 1: Kernel correctness — ragged_paged_attention with split k_cache/v_cache
-Part 2: FlashAttention backend + MHATokenToKVPool with is_split=True
+Part 2: FlashAttention backend + SplitMHATokenToKVPool end-to-end
 """
 
 import unittest
@@ -18,7 +18,7 @@ from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
 from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
-from sgl_jax.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, SplitMHATokenToKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import CustomTestCase
@@ -193,7 +193,7 @@ def create_split_test_data(
     req_pool_indices = jnp.arange(batch_size, dtype=jnp.int32)
 
     # Create split KV pool (pass 128-aligned dims, matching model_runner behavior)
-    current_kv_cache = MHATokenToKVPool(
+    current_kv_cache = SplitMHATokenToKVPool(
         size=max_total_token_size,
         page_size=page_size,
         dtype=dtype,
@@ -203,7 +203,7 @@ def create_split_test_data(
         mesh=mesh,
         v_head_dim=(v_head_dim + 127) // 128 * 128,
     )
-    assert current_kv_cache.is_split, "Expected split KV cache"
+    assert isinstance(current_kv_cache, SplitMHATokenToKVPool), "Expected split KV cache"
 
     q, k, v = create_split_qkv_cache(
         lens, num_heads, head_dim, num_kv_heads, v_head_dim, page_size, dtype=dtype
@@ -771,7 +771,7 @@ class TestSplitKernelAttention(CustomTestCase):
 # Part 2: FlashAttention backend + split KV cache tests
 # ===================================================================
 class TestSplitBackendAttention(CustomTestCase):
-    """Test FlashAttention backend with split MHATokenToKVPool end-to-end."""
+    """Test FlashAttention backend with SplitMHATokenToKVPool end-to-end."""
 
     def setUp(self):
         if not jax.devices():

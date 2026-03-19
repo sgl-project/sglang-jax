@@ -39,6 +39,7 @@ from sgl_jax.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     ReqToTokenPool,
     SWAKVPool,
+    SplitMHATokenToKVPool,
 )
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -542,15 +543,21 @@ class ModelRunner(BaseModelRunner):
             head_dim = self.model_config.head_dim
             v_head_dim = getattr(self.model_config, "v_head_dim", head_dim)
 
-            self.token_to_kv_pool = MHATokenToKVPool(
+            aligned_head_dim = (head_dim + 127) // 128 * 128
+            aligned_v_head_dim = (v_head_dim + 127) // 128 * 128
+
+            pool_class = (
+                SplitMHATokenToKVPool if aligned_head_dim != aligned_v_head_dim else MHATokenToKVPool
+            )
+            self.token_to_kv_pool = pool_class(
                 size=self.max_total_num_tokens,
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
-                head_dim=(head_dim + 127) // 128 * 128,
+                head_dim=aligned_head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 mesh=self.mesh,
-                v_head_dim=(v_head_dim + 127) // 128 * 128,
+                v_head_dim=aligned_v_head_dim,
             )
 
         # Create KV pool allocator
@@ -662,7 +669,9 @@ class ModelRunner(BaseModelRunner):
                 self.token_to_kv_pool.mesh,
                 P(None, self.token_to_kv_pool.kv_partition_axis, None),
             )
-            is_split = getattr(self.token_to_kv_pool, "is_split", False)
+            is_split = isinstance(self.token_to_kv_pool, SplitMHATokenToKVPool) or getattr(
+                self.token_to_kv_pool, "is_split", False
+            )
             if is_split:
                 layers_kv_fused = [
                     (jax.device_put(k, target_sharding), jax.device_put(v, target_sharding))

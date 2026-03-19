@@ -306,7 +306,7 @@ class TestSplitKVCacheUpdate(unittest.TestCase):
 
     def _run_split_pool_test(self, head_dim, v_head_dim, num_tokens, num_heads, page_size):
         """Create a split pool, write tokens, read back and verify."""
-        from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from sgl_jax.srt.mem_cache.memory_pool import SplitMHATokenToKVPool
         from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
         test_mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
@@ -315,7 +315,7 @@ class TestSplitKVCacheUpdate(unittest.TestCase):
         aligned_head_dim = (head_dim + 127) // 128 * 128
         aligned_v_head_dim = (v_head_dim + 127) // 128 * 128
 
-        pool = MHATokenToKVPool(
+        pool = SplitMHATokenToKVPool(
             size=num_tokens + 100,
             page_size=page_size,
             dtype=jnp.bfloat16,
@@ -326,7 +326,7 @@ class TestSplitKVCacheUpdate(unittest.TestCase):
             v_head_dim=aligned_v_head_dim,
         )
 
-        self.assertTrue(pool.is_split, "Expected split KV cache")
+        self.assertIsInstance(pool, SplitMHATokenToKVPool)
 
         # Buffer should use aligned dims
         k_buf, v_buf = pool.get_split_kv_buffer(0)
@@ -386,7 +386,7 @@ class TestSplitKVCacheUpdate(unittest.TestCase):
 
     def test_split_pool_192_128_with_padding(self):
         """Split pool with head_dim=192, padding tokens (loc=-1)."""
-        from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from sgl_jax.srt.mem_cache.memory_pool import SplitMHATokenToKVPool
         from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
         head_dim, v_head_dim, num_heads = 192, 128, 8
@@ -397,7 +397,7 @@ class TestSplitKVCacheUpdate(unittest.TestCase):
         aligned_head_dim = (head_dim + 127) // 128 * 128
         aligned_v_head_dim = (v_head_dim + 127) // 128 * 128
 
-        pool = MHATokenToKVPool(
+        pool = SplitMHATokenToKVPool(
             size=num_tokens + 100,
             page_size=1,
             dtype=jnp.bfloat16,
