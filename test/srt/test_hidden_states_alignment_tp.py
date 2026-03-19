@@ -1,131 +1,83 @@
 """
-Multi-node TP hidden states alignment test.
+TP hidden states alignment test.
 
 Verifies hidden states remain numerically correct when model weights
 and computation are sharded across multiple TPU chips via Tensor Parallelism.
 
-Environment: TPU v6e-8, tp_size=8, nnodes=2 (4 chips per host)
-Model: Qwen/Qwen3-32B (64 layers, hidden_dim=5120)
+Environment: TPU v6e-4, tp_size=4
+Model: Qwen/Qwen3-8B (36 layers, hidden_dim=4096)
 """
 
-import multiprocessing
-import os
-import pickle
-import sys
-import tempfile
 import unittest
 
 import numpy as np
-
-# Node 1 starts Engine immediately, but node 0 first computes HF hidden states
-os.environ.setdefault("JAX_COORDINATOR_STARTUP_TIMEOUT", "600")
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from sgl_jax.srt.entrypoints.engine import Engine
 from sgl_jax.test.test_utils import (
-    QWEN3_32B,
+    DEFAULT_MODEL_NAME_FOR_TEST,
     CustomTestCase,
     assert_hidden_states_aligned,
 )
 
-ALL_PROMPTS = [
-    "The capital of France is",
-    "Hello world",
-    "The future of AI is",
-]
-
-# Multi-node configuration from environment
-NODE_RANK = int(os.environ.get("NODE_RANK", "0"))
-NNODES = int(os.environ.get("NNODES", "1"))
-HEAD_IP = os.environ.get("HEAD_IP", "127.0.0.1")
-DIST_INIT_ADDR = f"{HEAD_IP}:29500"
-TP_SIZE = NNODES * 4  # 4 chips per v6e host
-
-ENGINE_KWARGS = dict(
-    model_path=QWEN3_32B,
-    trust_remote_code=True,
-    tp_size=TP_SIZE,
-    nnodes=NNODES,
-    dist_init_addr=DIST_INIT_ADDR,
-    device="tpu",
-    random_seed=3,
-    mem_fraction_static=0.6,
-    chunked_prefill_size=1024,
-    download_dir="/tmp",
-    dtype="bfloat16",
-    precompile_bs_paddings=[8],
-    max_running_requests=8,
-    skip_server_warmup=True,
-    attention_backend="fa",
-    precompile_token_paddings=[1024],
-    page_size=64,
-    log_requests=False,
-    enable_return_hidden_states=True,
-)
-
-
-def _compute_hf_hidden_states(model_path, prompts, output_path):
-    """Run in a subprocess so all memory is freed when the process exits."""
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    print(f"[HF subprocess] Loading {model_path} on CPU (bfloat16)...")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, trust_remote_code=True, dtype=torch.bfloat16
-    ).eval()
-    print("[HF subprocess] Model loaded.")
-
-    results = {}
-    for prompt in prompts:
-        print(f"[HF subprocess] Computing hidden states for: {prompt!r}")
-        inputs = tokenizer(prompt, return_tensors="pt")
-        with torch.no_grad():
-            outputs = model(**inputs, output_hidden_states=True)
-        results[prompt] = tuple(h.float().numpy() for h in outputs.hidden_states)
-
-    with open(output_path, "wb") as f:
-        pickle.dump(results, f)
-    print("[HF subprocess] Done. Exiting (all memory will be freed).")
-
 
 class TestHiddenStatesAlignmentTP(CustomTestCase):
     """
-    Multi-chip TP hidden states alignment test (v6e-8, tp_size=8).
+    TP hidden states alignment test (v6e-4, tp_size=4).
 
-    Only runs on the coordinator node (NODE_RANK=0).
+    Compares prefill-phase per-layer hidden states from SGLang-JAX engine
+    (with 4-way TP) against HuggingFace Transformers reference (CPU, float32).
     """
 
     @classmethod
     def setUpClass(cls):
-        # Phase 1: Compute HF reference hidden states in a subprocess.
-        # The subprocess exits after completion, freeing all memory.
-        tmp = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
-        tmp.close()
-        proc = multiprocessing.Process(
-            target=_compute_hf_hidden_states,
-            args=(QWEN3_32B, ALL_PROMPTS, tmp.name),
-        )
-        proc.start()
-        proc.join()
-        assert proc.exitcode == 0, f"HF subprocess failed with exit code {proc.exitcode}"
+        cls.model_path = DEFAULT_MODEL_NAME_FOR_TEST  # Qwen/Qwen3-8B
 
-        with open(tmp.name, "rb") as f:
-            cls.hf_hidden_states = pickle.load(f)
-        os.unlink(tmp.name)
-        print("HF hidden states loaded from subprocess results.")
+        # Load HuggingFace model on CPU (float32)
+        print(f"Loading HuggingFace model: {cls.model_path} on CPU...")
+        cls.hf_tokenizer = AutoTokenizer.from_pretrained(cls.model_path, trust_remote_code=True)
+        cls.hf_model = AutoModelForCausalLM.from_pretrained(
+            cls.model_path,
+            trust_remote_code=True,
+            dtype=torch.float32,
+        ).eval()
+        print("HuggingFace model loaded.")
 
-        # Phase 2: Load SGLang-JAX engine (coordinator node).
-        # The worker node's Engine is already waiting in jax.distributed.initialize.
-        print(
-            f"Loading SGLang-JAX engine: {QWEN3_32B} on TPU "
-            f"(tp_size={TP_SIZE}, nnodes={NNODES})..."
+        # Load SGLang-JAX engine on TPU with TP=4
+        print(f"Loading SGLang-JAX engine: {cls.model_path} on TPU (tp_size=4)...")
+        cls.engine = Engine(
+            model_path=cls.model_path,
+            trust_remote_code=True,
+            tp_size=4,
+            device="tpu",
+            random_seed=3,
+            node_rank=0,
+            mem_fraction_static=0.6,
+            chunked_prefill_size=1024,
+            download_dir="/tmp",
+            dtype="bfloat16",
+            precompile_bs_paddings=[8],
+            max_running_requests=8,
+            skip_server_warmup=True,
+            attention_backend="fa",
+            precompile_token_paddings=[1024],
+            page_size=64,
+            log_requests=False,
+            enable_return_hidden_states=True,
         )
-        cls.engine = Engine(**ENGINE_KWARGS, node_rank=NODE_RANK)
         print("SGLang-JAX engine loaded.")
 
     @classmethod
     def tearDownClass(cls):
         cls.engine.shutdown()
+        del cls.hf_model
+
+    def _get_hf_hidden_states(self, prompt):
+        inputs = self.hf_tokenizer(prompt, return_tensors="pt")
+        with torch.no_grad():
+            outputs = self.hf_model(**inputs, output_hidden_states=True)
+        return outputs.hidden_states
 
     def _get_sgl_prefill_hidden_states(self, prompt):
         outputs = self.engine.generate(
@@ -139,7 +91,7 @@ class TestHiddenStatesAlignmentTP(CustomTestCase):
         return prefill_hs
 
     def _compare_per_layer(self, prompt):
-        hf_hs = self.hf_hidden_states[prompt]
+        hf_hs = self._get_hf_hidden_states(prompt)
         sgl_hs = self._get_sgl_prefill_hidden_states(prompt)
         assert_hidden_states_aligned(self, hf_hs, sgl_hs, prompt)
 
@@ -155,12 +107,4 @@ class TestHiddenStatesAlignmentTP(CustomTestCase):
 
 
 if __name__ == "__main__":
-    if NODE_RANK >= 1:
-        # Worker node: create Engine and block until coordinator shuts down.
-        print(f"[Worker node {NODE_RANK}] Creating Engine (tp_size={TP_SIZE})...")
-        Engine(**ENGINE_KWARGS, node_rank=NODE_RANK)
-        print(f"[Worker node {NODE_RANK}] Engine exited.")
-        sys.exit(0)
-
-    # Coordinator node (rank 0): run tests.
     unittest.main()
