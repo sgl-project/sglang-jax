@@ -311,6 +311,13 @@ class ModelRunner(BaseModelRunner):
 
         # Apply quantization if quantization config is set
         if self.model_config.quantization_config is not None:
+            # Block-wise quant relies on a TPU Pallas kernel; reject early.
+            wbs = self.model_config.quantization_config.weight_block_size
+            if wbs is not None and jax.default_backend() != "tpu":
+                raise RuntimeError(
+                    f"Block-wise quantization (weight_block_size={wbs}) "
+                    f"requires TPU backend, but got {jax.default_backend()!r}."
+                )
             is_static = self.model_config.quantization_config.is_static_checkpoint
 
             if not is_static:
