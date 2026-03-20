@@ -16,6 +16,9 @@ from sgl_jax.srt.model_loader.loader import JAXModelLoader, get_model_loader
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.configs.config_registry import get_diffusion_config
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
+from sgl_jax.srt.multimodal.models.diffusion_solvers.flow_match_euler_discrete_scheduler import (
+    FlowMatchEulerDiscreteScheduler,
+)
 from sgl_jax.srt.multimodal.models.diffusion_solvers.flow_unipc_multistep_scheduler import (
     FlowUniPCMultistepScheduler,
 )
@@ -32,9 +35,11 @@ class DiffusionModelRunner(BaseModelRunner):
         mesh: jax.sharding.Mesh = None,
         model_class=None,
         stage_sub_dir: str | None = None,
+        scheduler: str | None = None,
     ):
         self.server_args = server_args
         self.mesh = mesh
+        self.scheduler = scheduler
         load_sub_dir = "transformer" if stage_sub_dir is None else stage_sub_dir
         if load_sub_dir == "":
             load_sub_dir = None
@@ -68,9 +73,16 @@ class DiffusionModelRunner(BaseModelRunner):
             mesh=self.mesh, load_config=LoadConfig(sub_dir=load_sub_dir)
         )
         self.model = self.model_loader.load_model(model_config=self.model_config)
-        self.solver: FlowUniPCMultistepScheduler = FlowUniPCMultistepScheduler(
-            shift=self.model_config.flow_shift
-        )
+        if self.scheduler in (None, "FlowUniPCMultistepScheduler"):
+            self.solver = FlowUniPCMultistepScheduler(
+                shift=self.model_config.flow_shift
+            )
+        elif self.scheduler == "FlowMatchEulerDiscreteScheduler":
+            self.solver = FlowMatchEulerDiscreteScheduler(
+                shift=self.model_config.flow_shift
+            )
+        else:
+            raise ValueError(f"Unsupported diffusion scheduler: {self.scheduler}")
         # self.solver_state = self.solver.create_state()
         # Any additional initialization specific to diffusion models
         self.initialize_jit()

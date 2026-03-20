@@ -26,10 +26,16 @@ class DiffusionModelWorker:
         mesh: jax.sharding.Mesh = None,
         model_class=None,
         stage_sub_dir: str | None = None,
+        scheduler: str | None = None,
     ):
         self.mesh = mesh
+        self.scheduler = scheduler
         self.model_runner = DiffusionModelRunner(
-            server_args, self.mesh, model_class=model_class, stage_sub_dir=stage_sub_dir
+            server_args,
+            self.mesh,
+            model_class=model_class,
+            stage_sub_dir=stage_sub_dir,
+            scheduler=self.scheduler,
         )
         self.initialize()
         self.precompile_width_heights = server_args.precompile_width_heights

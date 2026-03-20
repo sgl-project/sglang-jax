@@ -17,6 +17,7 @@ from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.server_args import ServerArgs
+from sgl_jax.srt.multimodal.models.encoders.base import BaseEncoderOutput
 
 logger = logging.getLogger(__name__)
 
@@ -258,12 +259,18 @@ class EncoderModelRunner(BaseModelRunner):
                 input_ids=tokenized["input_ids"],
                 attention_mask=model_attention_mask,
             )
-            hidden_states, pooler_output = self._extract_encoder_outputs(outputs)
-            if hidden_states is not None:
-                embeds_list.append(hidden_states)
-            if pooler_output is not None:
-                pooler_embeds_list.append(pooler_output)
-            attn_masks_list.append(model_attention_mask)
+            processed_output, output_kind = self._postprocess_encoder_outputs(
+                spec,
+                outputs,
+                tokenized,
+            )
+            if processed_output is None:
+                continue
+            if output_kind == "pooler":
+                pooler_embeds_list.append(processed_output)
+            else:
+                embeds_list.append(processed_output)
+                attn_masks_list.append(model_attention_mask)
 
         return embeds_list, attn_masks_list, pooler_embeds_list
        
@@ -305,24 +312,47 @@ class EncoderModelRunner(BaseModelRunner):
         return spec.jitted_forward(input_ids, attention_mask)
 
 
-    def _extract_encoder_outputs(self, outputs: Any) -> tuple[jax.Array | None, jax.Array | None]:
-        output_obj = outputs[0] if isinstance(outputs, tuple) else outputs
+    def _postprocess_encoder_outputs(
+        self,
+        spec: _EncoderSpec,
+        outputs: BaseEncoderOutput,
+        text_inputs: dict[str, jax.Array],
+    ) -> tuple[jax.Array | None, str]:
+        if not isinstance(outputs, BaseEncoderOutput):
+            raise TypeError(
+                f"Expected BaseEncoderOutput from _forward_encoder, got {type(outputs)!r}"
+            )
 
-        if hasattr(output_obj, "last_hidden_state"):
-            pooler_output = getattr(output_obj, "pooler_output", None)
-            return output_obj.last_hidden_state, pooler_output
+        model_class_name = getattr(spec.model_class, "__name__", str(spec.model_class))
 
-        if hasattr(output_obj, "hidden_states"):
-            pooler_output = getattr(output_obj, "pooler_output", None)
-            if pooler_output is None and self.is_flux_v1():
-                pooler_output = getattr(output_obj, "text_embeds", None)
-            return output_obj.hidden_states, pooler_output
+        if "T5" in model_class_name:
+            return self.t5_postprocess_text(outputs, text_inputs), "hidden_states"
+        if "CLIP" in model_class_name:
+            return self.clip_postprocess_text(outputs, text_inputs), "pooler"
 
-        if isinstance(output_obj, jax.Array):
-            pooler_output = output_obj if self.is_flux_v1() and output_obj.ndim == 2 else None
-            return output_obj, pooler_output
+        if outputs.last_hidden_state is not None:
+            return outputs.last_hidden_state, "hidden_states"
+        if outputs.pooler_output is not None:
+            return outputs.pooler_output, "pooler"
+        return None, "hidden_states"
 
-        raise TypeError(f"Unsupported encoder output type: {type(output_obj)!r}")
+    @staticmethod
+    def t5_postprocess_text(
+        outputs: BaseEncoderOutput,
+        _text_inputs: dict[str, jax.Array],
+    ) -> jax.Array:
+        if outputs.last_hidden_state is None:
+            raise ValueError("T5 encoder output does not contain last_hidden_state.")
+        return outputs.last_hidden_state
+
+    @staticmethod
+    def clip_postprocess_text(
+        outputs: BaseEncoderOutput,
+        _text_inputs: dict[str, jax.Array],
+    ) -> jax.Array:
+        if outputs.pooler_output is None:
+            raise ValueError("CLIP encoder output does not contain pooler_output.")
+        return outputs.pooler_output
 
     def _tokenize_text(self, spec: _EncoderSpec, text: str | list[str]) -> dict[str, jax.Array]:
         if spec.max_length is None:
