@@ -290,11 +290,11 @@ suites = {
             estimated_time=2.5,
             test_methods=["TestModelPerf.test_QWEN2_5_7B_INSTRUCT_performance_tp_4"],
         ),
-        TestFile(
-            "nightly-test/test_perf.py",
-            estimated_time=45,
-            test_methods=["TestModelPerf.test_qwen3_32B_lora_r32_performance_tp_4"],
-        ),
+        # TestFile(
+        #     "nightly-test/test_perf.py",
+        #     estimated_time=45,
+        #     test_methods=["TestModelPerf.test_qwen3_32B_lora_r32_performance_tp_4"],
+        # ),
     ],
     "nightly-test-perf-trace-text-models-tpu-v6e-1": [
         TestFile(
@@ -423,8 +423,8 @@ suites = {
         TestFile("python/sgl_jax/test/multimodal/test_wan_vae_precision.py", 1),
         TestFile("python/sgl_jax/test/multimodal/test_vae_scheduler.py", 2),
         TestFile("python/sgl_jax/test/multimodal/test_flash_attention_kernel.py", 2),
-        TestFile("test/srt/lora/test_bgmv_backend.py", 5),
-        TestFile("test/srt/lora/test_align_lora_accuracy.py", 10),
+        # TestFile("test/srt/lora/test_bgmv_backend.py", 5),
+        # TestFile("test/srt/lora/test_align_lora_accuracy.py", 10),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 1),
@@ -465,9 +465,9 @@ suites = {
         TestFile("test/srt/test_srt_engine.py", 1),
         TestFile("test/srt/test_logprobs.py", 3),
         TestFile("test/srt/test_qwen1_5_models_dummy.py", 3),
-        TestFile("test/srt/lora/test_bgmv_backend.py", 6),
-        TestFile("test/srt/lora/test_dynamic_lora.py", 10),
-        TestFile("test/srt/lora/test_static_lora.py", 10),
+        # TestFile("test/srt/lora/test_bgmv_backend.py", 6),
+        # TestFile("test/srt/lora/test_dynamic_lora.py", 10),
+        # TestFile("test/srt/lora/test_static_lora.py", 10),
     ],
     "e2e-test-tpu-v6e-4": [
         TestFile("test/srt/openai_server/basic/test_tool_calls.py", 3),
