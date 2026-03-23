@@ -418,7 +418,7 @@ class LogitsProcessor(nnx.Module):
 
             input_token_ids_logprobs_val.append(
                 [
-                    all_logprobs[pt + j].at[token_ids].get(out_sharding=out_sharding)
+                    all_logprobs.at[pt + j, token_ids].get(out_sharding=out_sharding)
                     for j in range(pruned_len)
                 ]
             )
