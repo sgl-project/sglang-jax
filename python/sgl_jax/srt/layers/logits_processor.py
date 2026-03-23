@@ -416,12 +416,9 @@ class LogitsProcessor(nnx.Module):
                 input_token_ids_logprobs_idx.append([])
                 continue
 
-            token_ids_arr = jnp.array(token_ids)
             input_token_ids_logprobs_val.append(
                 [
-                    jax.lax.with_sharding_constraint(
-                        jnp.take(all_logprobs[pt + j], token_ids_arr), out_sharding
-                    )
+                    all_logprobs[pt + j].at[token_ids].get(out_sharding=out_sharding)
                     for j in range(pruned_len)
                 ]
             )
