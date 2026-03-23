@@ -35,14 +35,12 @@ class LinearBase(nnx.Module):
         skip_bias_add: bool = False,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         kernel_axes: Sequence[str | None] | None = None,
-        reduce_scatter: bool = False,
         scope_name: str = "linear_base",
     ):
         """Initialize parameters and quantization method."""
         self.skip_bias_add = skip_bias_add
         self.params_dtype = params_dtype
         self.kernel_axes = kernel_axes
-        self.reduce_scatter = reduce_scatter
         self.mesh = mesh
         self.name = scope_name
         self.weight = nnx.Param(
@@ -68,16 +66,10 @@ class LinearBase(nnx.Module):
             self.bias = None
 
     @named_scope
-    def __call__(
-        self, x: jax.Array, reduce_scatter: bool | None = None
-    ) -> tuple[jax.Array, jax.Array | None]:
+    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass of the linear layer."""
         bias = self.bias if not self.skip_bias_add else None
-        rs = self.reduce_scatter if reduce_scatter is None else reduce_scatter
-        if rs:
-            output_pspec = P(self.kernel_axes[0], *([None] * (x.ndim - 2)), self.kernel_axes[-1])
-        else:
-            output_pspec = P(*([None] * (x.ndim - 1)), self.kernel_axes[-1])
+        output_pspec = P(*([None] * (x.ndim - 1)), self.kernel_axes[-1])
         output_sharding = NamedSharding(self.mesh, output_pspec)
         output = lax.dot_general(
             x,
@@ -122,7 +114,6 @@ class QuantizedLinear(nnx.Module):
         skip_bias_add: bool = False,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         compute_dtype: jnp.dtype | None = None,
-        reduce_scatter: bool = False,
         scope_name: str = "quantized_linear",
     ):
         """Initialize the quantized linear layer with pre-quantized weights."""
@@ -135,7 +126,6 @@ class QuantizedLinear(nnx.Module):
         self.skip_bias_add = skip_bias_add
         self.params_dtype = params_dtype
         self.compute_dtype = compute_dtype
-        self.reduce_scatter = reduce_scatter
         self.name = scope_name
 
         # Determine if we need tensor parallel reduction
@@ -200,26 +190,20 @@ class QuantizedLinear(nnx.Module):
             kernel_axes=linear.kernel_axes,
             skip_bias_add=linear.skip_bias_add,
             params_dtype=linear.params_dtype,
-            reduce_scatter=linear.reduce_scatter,
             scope_name=f"quantized_{linear.name}",
         )
 
     @named_scope
-    def __call__(
-        self, x: jax.Array, reduce_scatter: bool | None = None
-    ) -> tuple[jax.Array, jax.Array | None]:
+    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass using quantized matmul.
 
         Args:
             x: Input tensor [..., input_size]
-            reduce_scatter: Override for reduce_scatter mode. None uses self.reduce_scatter.
 
         Returns:
             Tuple of (output, bias) where output is [..., output_size]
             and bias is returned if skip_bias_add is True
         """
-        rs = self.reduce_scatter if reduce_scatter is None else reduce_scatter
-
         # Determine if we should quantize activations
         quantize_activation = self.activation_dtype is not None
 
@@ -230,22 +214,32 @@ class QuantizedLinear(nnx.Module):
         scale_val = self.weight_scale.value
         if scale_val.ndim == 2 and scale_val.shape[1] == 1:
             scale_val = jnp.squeeze(scale_val, axis=1)
+        # Use shard_map for local computation with single all-reduce
+        # kernel_axes[0] = input sharding axis (e.g., "tensor" for o_proj, None for q_proj)
+        # kernel_axes[1] = output sharding axis (e.g., None for o_proj, "tensor" for q_proj)
+        #
+        # Weight w_q has shape [output_size, input_size]
+        # After transpose from LinearBase, its sharding is P(kernel_axes[1], kernel_axes[0])
+        # e.g., for o_proj with kernel_axes=("tensor", None): w_q has P(None, "tensor")
         input_axis = self.kernel_axes[0]
         output_axis = self.kernel_axes[1]
 
+        # Input x sharding: for row-parallel, x is P(None, input_axis)
+        # Weight w_q sharding: P(output_axis, input_axis)
+        # Weight scale sharding: P(output_axis) - per output channel
+        # Output sharding: P(None, output_axis)
         in_specs = (
             P(None, input_axis),  # x
             P(output_axis, input_axis),  # w_q
             P(output_axis),  # w_scale
         )
-        out_specs = P(input_axis, output_axis) if rs else P(None, output_axis)
+        out_specs = P(None, output_axis)
 
         output = shard_map(
             partial(
                 xla_quantized_matmul_local,
                 quantize_activation=quantize_activation,
-                reduce_axis=input_axis,
-                reduce_scatter=rs,
+                reduce_axis=input_axis,  # psum over input axis (e.g., "tensor" for o_proj)
                 compute_dtype=self.compute_dtype,
             ),
             mesh=self.mesh,
