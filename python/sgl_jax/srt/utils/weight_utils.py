@@ -192,6 +192,113 @@ class WeightLoader:
         )
         return map_np
 
+    def _maybe_convert_epmoe_scale_for_kernel(
+        self,
+        weight: jax.Array,
+        model_param: nnx.Variable,
+        target_path: str,
+    ) -> jax.Array:
+        """Convert offline EPMoE scales into the 4D layout expected by GMM.
+
+        Offline checkpoints may store MoE scales in one of several compact
+        layouts, for example:
+
+        - per-channel: ``[E, out_dim]``
+        - block-channel: ``[E, out_dim, k_blocks]`` or ``[E, k_blocks, out_dim]``
+        - 2D block quant: ``[E, out_blocks, k_blocks]``
+
+        The runtime GMM kernel consumes only ``[E, k_blocks, 1, out_dim]``.
+        This helper performs the cheap layout conversion during weight loading
+        so the forward path does not need to reinterpret checkpoint tensors.
+        """
+        if not target_path.endswith(("wi_0_scale", "wi_1_scale", "wo_scale")):
+            return weight
+
+        if weight.ndim == 4 or model_param.value.ndim != 4:
+            return weight
+
+        num_experts, k_blocks, _, out_dim = model_param.value.shape
+        if model_param.value.shape[2] != 1:
+            raise ValueError(
+                f"Expected kernel-ready EPMoE scale placeholder to have singleton dim=1, "
+                f"got shape={model_param.value.shape} for {target_path}"
+            )
+        if weight.ndim == 2 and weight.shape == (num_experts, out_dim):
+            return weight[:, None, None, :]
+
+        if weight.ndim != 3:
+            return weight
+
+        if weight.shape == (num_experts, out_dim, k_blocks):
+            return jnp.expand_dims(jnp.transpose(weight, (0, 2, 1)), axis=2)
+
+        if weight.shape == (num_experts, k_blocks, out_dim):
+            return weight[:, :, None, :]
+
+        quant_cfg = getattr(self.model_config, "quantization_config", None)
+        weight_block_size = getattr(quant_cfg, "weight_block_size", None)
+        if not (isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2):
+            return weight
+
+        block_size_out = int(weight_block_size[0])
+        if block_size_out <= 0:
+            return weight
+
+        expected_out_blocks = (out_dim + block_size_out - 1) // block_size_out
+        if weight.shape != (num_experts, expected_out_blocks, k_blocks):
+            return weight
+
+        logger.info(
+            "Converting offline EPMoE scale %s from shape %s to GMM layout %s",
+            target_path,
+            weight.shape,
+            model_param.value.shape,
+        )
+        out_block_ids = np.arange(out_dim, dtype=np.int32) // block_size_out
+        scale_per_out = jnp.take(weight, jnp.asarray(out_block_ids), axis=1)
+        return jnp.expand_dims(jnp.transpose(scale_per_out, (0, 2, 1)), axis=2)
+
+    def _maybe_expand_linear_block_scale(
+        self,
+        weight: jax.Array,
+        model_param: nnx.Variable,
+        target_path: str,
+    ) -> jax.Array:
+        """Expand 2D block-quant scale [out_blocks, in_blocks] to 3D [in_blocks, 1, n_out] at load time."""
+        if not target_path.endswith("weight_scale"):
+            return weight
+
+        # Only convert when checkpoint has 2D scale and model expects 3D.
+        if weight.ndim != 2 or model_param.value.ndim != 3:
+            return weight
+
+        # Model param shape: [in_blocks, 1, n_out]
+        if model_param.value.shape[1] != 1:
+            return weight
+
+        quant_cfg = getattr(self.model_config, "quantization_config", None)
+        weight_block_size = getattr(quant_cfg, "weight_block_size", None)
+        if not (isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2):
+            return weight
+
+        block_size_out = int(weight_block_size[0])
+        if block_size_out <= 0:
+            return weight
+
+        from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
+            expand_block_scale,
+        )
+
+        n_out = int(model_param.value.shape[2])
+        logger.info(
+            "Expanding linear block-quant scale %s from %s to kernel-ready layout [%d, 1, %d]",
+            target_path,
+            weight.shape,
+            weight.shape[1],
+            n_out,
+        )
+        return expand_block_scale(weight, n_out, block_size_out)
+
     def _scan_weight_info(self) -> dict[str, list[dict]]:
         """
         Scan all safetensors files to build a mapping from HF key to file info.
@@ -837,6 +944,11 @@ class WeightLoader:
                         target_path = mapping.target_path
                         model_param = self._get_param(params, target_path)
 
+                        # Expand 2D block-quant scale to 3D kernel-ready layout.
+                        lazy_weight = self._maybe_expand_linear_block_scale(
+                            lazy_weight, model_param, target_path
+                        )
+
                         if lazy_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
                             model_param.value = lazy_weight
                         else:
@@ -962,6 +1074,11 @@ class WeightLoader:
                     # 3. Direct assignment
                     target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
+                    stacked_weight = self._maybe_convert_epmoe_scale_for_kernel(
+                        stacked_weight,
+                        model_param,
+                        target_path,
+                    )
 
                     if is_static_quant and moe_key.endswith("_scale"):
                         logger.info(
@@ -1055,6 +1172,11 @@ class WeightLoader:
 
                     target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
+                    expert_weights = self._maybe_convert_epmoe_scale_for_kernel(
+                        expert_weights,
+                        model_param,
+                        target_path,
+                    )
 
                     if is_static_quant and moe_key.endswith("_scale"):
                         logger.info(
@@ -1312,6 +1434,12 @@ class WeightLoader:
 
         try:
             model_param = self._get_param(params, jax_path)
+
+            # Expand 2D block-quant scale to 3D kernel-ready layout.
+            sharded_weight = self._maybe_expand_linear_block_scale(
+                sharded_weight, model_param, jax_path
+            )
+
             logger.debug(
                 "Loading %s -> %s, shape: %s, transpose: %s",
                 hf_key,

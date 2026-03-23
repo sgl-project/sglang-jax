@@ -1,0 +1,18 @@
+# FP8 dynamic block weight quantization config
+# - Uses online requantization (not static checkpoint loading)
+# - Uses 128x128 block scales for all layers
+# - weight_dtype: float8_e4m3fn, no activation quantization
+
+quantization:
+  is_static_checkpoint: false
+  weight_block_size: [128, 128]
+
+  linear:
+    rules:
+      - module_path: '.*'
+        weight_dtype: 'float8_e4m3fn'
+        activation_dtype: null
+
+  moe:
+    weight_dtype: 'float8_e4m3fn'
+    activation_dtype: null
