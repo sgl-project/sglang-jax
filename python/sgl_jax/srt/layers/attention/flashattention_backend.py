@@ -445,7 +445,11 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
-        if isinstance(token_to_kv_pool, SplitMHATokenToKVPool):
+        # Split path: SplitMHATokenToKVPool directly, or SWAKVPool wrapping
+        # split sub-pools (e.g. hybrid models with different K/V head dims).
+        if isinstance(token_to_kv_pool, SplitMHATokenToKVPool) or getattr(
+            token_to_kv_pool, "is_split", False
+        ):
             return self._call_split(q, k, v, layer, forward_batch, token_to_kv_pool, causal)
         else:
             return self._call_fused(q, k, v, layer, forward_batch, token_to_kv_pool, causal)

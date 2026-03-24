@@ -1763,6 +1763,8 @@ def get_simplified_key(
         kv_dtype_name,
         num_q_heads,
         num_kv_heads,
+        # NOTE: head_dim is rounded up to 128-alignment (e.g. 192 -> 256) because
+        # the underlying Pallas kernel requires head_dim to be a multiple of 128.
         (head_dim + 127) // 128 * 128,
         next_power_of_2(page_size),
         next_power_of_2(max_num_tokens),

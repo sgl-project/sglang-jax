@@ -657,6 +657,7 @@ class SplitMHATokenToKVPool(MHATokenToKVPool):
         )
 
     def replace_kv_buffer(self, kv_buffer: list[tuple[jax.Array, jax.Array]]) -> None:
+        # TODO: handle start_layer offset when pipeline parallelism is supported
         for i, (k, v) in enumerate(kv_buffer):
             self.k_buffer[i] = k
             self.v_buffer[i] = v
