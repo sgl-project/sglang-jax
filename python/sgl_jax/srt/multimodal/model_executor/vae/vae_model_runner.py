@@ -101,3 +101,9 @@ class VaeModelRunner(BaseModelRunner):
                 output = self.jitted_decode(x)
             cache_miss_count = count()
         return output, cache_miss_count
+
+    def mock_data(self, batch) -> object:
+        """Generate mock VAE decode output (random image) for debugging."""
+        key = jax.random.PRNGKey(42)
+        batch.output = jax.random.uniform(key, (1, 3, batch.height, batch.width))
+        return batch

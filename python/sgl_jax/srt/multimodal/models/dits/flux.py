@@ -38,23 +38,23 @@ def _resolve_rngs(rngs: nnx.Rngs | None) -> nnx.Rngs:
     return rngs or nnx.Rngs(0)
 
 
-def _resolve_mesh(mesh: Mesh | None) -> Mesh:
-    if mesh is None:
-        devices = np.array(jax.devices()).reshape((1, -1))
-        try:
-            mesh = Mesh(
-                devices,
-                ("data", "tensor"),
-                axis_types=(
-                    jax.sharding.AxisType.Explicit,
-                    jax.sharding.AxisType.Explicit,
-                ),
-            )
-        except TypeError:
-            mesh = Mesh(devices, ("data", "tensor"))
-    with suppress(AttributeError):
-        jax.set_mesh(mesh)
-    return mesh
+# def _resolve_mesh(mesh: Mesh | None) -> Mesh:
+#     if mesh is None:
+#         devices = np.array(jax.devices()).reshape((1, -1))
+#         try:
+#             mesh = Mesh(
+#                 devices,
+#                 ("data", "tensor"),
+#                 axis_types=(
+#                     jax.sharding.AxisType.Explicit,
+#                     jax.sharding.AxisType.Explicit,
+#                 ),
+#             )
+#         except TypeError:
+#             mesh = Mesh(devices, ("data", "tensor"))
+#     with suppress(AttributeError):
+#         jax.set_mesh(mesh)
+#     return mesh
 
 
 def _no_shard(x: jax.Array, mesh: Mesh | None) -> jax.Array:
@@ -160,7 +160,6 @@ class FluxAttention(nnx.Module):
         NOTE: Align with the implementation of HF.
         attention_impl: support usp and sdpa. usp dont support attention_mask yet.
         """
-        mesh = _resolve_mesh(mesh)
         _rngs = _resolve_rngs(rngs)
         if attention_impl not in _SUPPORTED_ATTENTION_IMPLS:
             raise ValueError(
@@ -612,7 +611,7 @@ class FluxTransformer2DModel(nnx.Module):
         self.model_config = config
         self.dtype = dtype or config.dtype
         self.params_dtype = config.weights_dtype
-        self.mesh = _resolve_mesh(mesh)
+        self.mesh = mesh
         self.attention_impl = config.attention_impl
         self.out_channels = config.out_channels or config.in_channels
         self.inner_dim = config.num_attention_heads * config.attention_head_dim

@@ -196,11 +196,11 @@ class EncoderModelRunner(BaseModelRunner):
         all_indices = list(range(len(self.encoder_specs)))
         prompt_text = batch.prompt or batch.origin_input_text
         if prompt_text is not None:
-            # prompt_embeds_list, prompt_masks_list, pooler_embeds_list = self.encode_text(
-            #     prompt_text,
-            #     encoder_index=all_indices,
-            # )
-            prompt_embeds_list, prompt_masks_list, pooler_embeds_list = self.mock_data()
+            prompt_embeds_list, prompt_masks_list, pooler_embeds_list = self.encode_text(
+                prompt_text,
+                encoder_index=all_indices,
+            )
+            # prompt_embeds_list, prompt_masks_list, pooler_embeds_list = self.mock_data()
             self._assign_prompt_outputs(
                 batch=batch,
                 embeds_list=prompt_embeds_list,
@@ -210,11 +210,11 @@ class EncoderModelRunner(BaseModelRunner):
             )
 
         if batch.do_classifier_free_guidance and batch.negative_prompt is not None:
-            # neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.encode_text(
-            #     batch.negative_prompt,
-            #     encoder_index=all_indices,
-            # )
-            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.mock_data()
+            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.encode_text(
+                batch.negative_prompt,
+                encoder_index=all_indices,
+            )
+            # neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.mock_data()
             self._assign_prompt_outputs(
                 batch=batch,
                 embeds_list=neg_embeds_list,
@@ -222,6 +222,25 @@ class EncoderModelRunner(BaseModelRunner):
                 pooler_embeds_list=neg_pooler_embeds_list,
                 is_negative=True,
             )
+
+        # === Stage 0 alignment instrumentation ===
+        import numpy as np
+        save_dict = {}
+        if hasattr(batch, "prompt_embeds") and batch.prompt_embeds is not None:
+            pe = batch.prompt_embeds
+            if isinstance(pe, list):
+                for i, p in enumerate(pe):
+                    save_dict[f"prompt_embeds_{i}"] = np.array(p, dtype=np.float32)
+            else:
+                save_dict["prompt_embeds"] = np.array(pe, dtype=np.float32)
+        if hasattr(batch, "pooled_embeds") and batch.pooled_embeds is not None:
+            for i, p in enumerate(batch.pooled_embeds):
+                save_dict[f"pooled_embeds_{i}"] = np.array(p, dtype=np.float32)
+        if save_dict:
+            np.savez("/tmp/flux_stage0_tpu_server.npz", **save_dict)
+            logger.info("Saved Stage 0 outputs to /tmp/flux_stage0_tpu_server.npz: %s",
+                        {k: v.shape for k, v in save_dict.items()})
+        # === End instrumentation ===
 
         return batch
 

@@ -18,7 +18,7 @@ class FluxModelConfig(MultiModalModelConfigs):
     num_attention_heads: int = 24
     joint_attention_dim: int = 4096
     pooled_projection_dim: int = 768
-    guidance_embeds: bool = False
+    guidance_embeds: bool = True
     axes_dims_rope: tuple[int, int, int] = (16, 56, 56)
     hidden_size: int = 3072
     epsilon: float = 1e-6

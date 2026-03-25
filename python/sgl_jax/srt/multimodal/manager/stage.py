@@ -47,6 +47,7 @@ from sgl_jax.srt.multimodal.models.wan.vaes.wanvae import AutoencoderKLWan
 from sgl_jax.srt.multimodal.models.encoders.clip import CLIPTextModel
 from sgl_jax.srt.multimodal.models.encoders.t5 import T5EncoderModel
 from sgl_jax.srt.multimodal.models.dits.flux import FluxTransformer2DModel
+from sgl_jax.srt.multimodal.models.vaes.autoencoder import AutoencoderKL
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils import configure_logger
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -253,7 +254,7 @@ def get_model_class(name: str):
         "CLIPTextModel": CLIPTextModel,
         "T5EncoderModel": T5EncoderModel,
         "FluxTransformer2DModel": FluxTransformer2DModel,
-        # "AutoencoderKL": AutoencoderKL,
+        "AutoencoderKL": AutoencoderKL,
     }
 
     if "," in name:
