@@ -94,10 +94,10 @@ Test and benchmark is important and required. Please add benchmark in ```benchma
 ## Usage Guide
 ### Supporting matrix for different attention backends
 
-| Backend | Paged Attention | Spec Decoding | MLA | Sliding Window |
-|---------|----------------|---------------|-----|----------------|
-| FlashAttention | ✅ | ❌ | ❌ | ✅ |
-| NativeAttention | ❌ | ❌ | ❌ | ❌ |
+| Backend | Paged Attention | Spec Decoding | Split KV | MLA | Sliding Window |
+|---------|----------------|---------------|----------|-----|----------------|
+| FlashAttention | ✅ | ❌ | ✅ | ❌ | ✅ |
+| NativeAttention | ❌ | ❌ | ❌ | ❌ | ❌ |
 
 ### Launch command for different attention backends
 
@@ -112,3 +112,12 @@ Recommended for debugging and development, simple and straightforward logic
 ```
  python3 -u -m sgl_jax.launch_server --model-path Qwen/Qwen-7B-Chat --trust-remote-code --device=tpu --attention-backend=native
 ```
+
+### Fused vs Split FlashAttention Kernel
+
+The FlashAttention backend has two Pallas kernel variants:
+
+- **Fused** (`ragged_paged_attention.py`): Interleaves K/V heads in a single buffer `[K0,V0,K1,V1,...]`. Used when K and V have the same head_dim, which is the common case.
+- **Split** (`ragged_paged_attention_split.py`): Stores K and V in separate buffers. Used when K and V have different head_dim (e.g. K=192, V=128). The split kernel uses independent VMEM double buffers and DMA transfers for K and V, and handles the dimension mismatch in QK matmul via `common_dim = min(q_dim, k_dim)`.
+
+The backend automatically selects the split kernel when `head_dim != v_head_dim` in the model config. No user-facing flags are needed.

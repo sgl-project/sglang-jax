@@ -15,7 +15,7 @@ from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
-from sgl_jax.srt.mem_cache.memory_pool import KVCache
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, SplitMHATokenToKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.utils import cdiv
@@ -84,6 +84,7 @@ class FlashAttention(AttentionBackend):
         page_size: int = 1,
         kv_partition_axis: str = "tensor",
         mesh: jax.sharding.Mesh = None,
+        v_head_dim: int | None = None,
     ):
         self.vmem_limit_bytes = vmem_limit_bytes
         self.num_heads = num_attn_heads
@@ -92,6 +93,7 @@ class FlashAttention(AttentionBackend):
         else:
             self.num_kv_heads = num_attn_heads
         self.head_dim = head_dim
+        self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
         self.page_size = page_size
         self.kv_partition_axis = kv_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
@@ -400,6 +402,9 @@ class FlashAttention(AttentionBackend):
             "vmem_limit_bytes": self.vmem_limit_bytes,
             "head_dim": self.head_dim,
             "page_size": self.page_size,
+            "kv_partition_axis": self.kv_partition_axis,
+            "mesh": self.mesh,
+            "v_head_dim": self.v_head_dim,
         }
         return (children, aux_data)
 
@@ -411,6 +416,9 @@ class FlashAttention(AttentionBackend):
             aux_data["head_dim"],
             aux_data["vmem_limit_bytes"],
             aux_data["page_size"],
+            kv_partition_axis=aux_data.get("kv_partition_axis", "tensor"),
+            mesh=aux_data.get("mesh"),
+            v_head_dim=aux_data.get("v_head_dim"),
         )
 
         obj.forward_metadata = children[0]
@@ -437,6 +445,27 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
+        # Split path: SplitMHATokenToKVPool directly, or SWAKVPool wrapping
+        # split sub-pools (e.g. hybrid models with different K/V head dims).
+        if isinstance(token_to_kv_pool, SplitMHATokenToKVPool) or getattr(
+            token_to_kv_pool, "is_split", False
+        ):
+            return self._call_split(q, k, v, layer, forward_batch, token_to_kv_pool, causal)
+        else:
+            return self._call_fused(q, k, v, layer, forward_batch, token_to_kv_pool, causal)
+
+    @named_scope
+    def _call_fused(
+        self,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        causal: int = 1,
+    ):
+        """Fused KV cache path: K and V interleaved in a single buffer."""
         if forward_batch is not None and token_to_kv_pool is not None:
             kv_cache_fused = self._get_fused_kv_cache(
                 forward_batch, token_to_kv_pool, layer.layer_id
@@ -537,6 +566,120 @@ class FlashAttention(AttentionBackend):
             updated_kv_cache_fused,
         )
 
+    @named_scope
+    def _call_split(
+        self,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        causal: int = 1,
+    ):
+        """Split KV cache path: K and V have separate buffers with potentially different head_dim."""
+        k_cache, v_cache = self._get_split_kv_cache(forward_batch, token_to_kv_pool, layer.layer_id)
+
+        scale = (
+            1.0 / jnp.sqrt(layer.head_dim)
+            if (layer is None or layer.scaling is None)
+            else layer.scaling
+        )
+
+        # Reshape caches from flat [total_tokens, kv_heads, dim] to paged [num_pages, page_size, kv_heads, dim]
+        # NOTE: Do NOT pad head_dim here — ragged_paged_attention handles alignment
+        # internally via _prepare_single_kv_cache. Padding in reshape would corrupt
+        # the head count when head_dim is not 128-aligned (e.g., 192).
+        total_tokens_k = k_cache.shape[0]
+        num_pages = total_tokens_k // self.page_size
+        k_head_dim = k_cache.shape[-1]
+        v_head_dim_cache = v_cache.shape[-1]
+        k_cache_paged = k_cache.reshape(num_pages, self.page_size, -1, k_head_dim)
+        v_cache_paged = v_cache.reshape(num_pages, self.page_size, -1, v_head_dim_cache)
+
+        if self.forward_metadata.custom_mask is not None:
+            causal = 0
+
+        page_indices_arg = self.forward_metadata.page_indices
+        if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
+            page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
+
+        kv_part = self.kv_partition_axis
+        in_specs = (
+            P(None, kv_part),  # q  [tokens, q_heads, head_dim]
+            P(None, kv_part),  # k  [tokens, kv_heads, k_head_dim]
+            P(None, kv_part),  # v  [tokens, kv_heads, v_head_dim]
+            P(None, None, kv_part, None),  # k_cache_paged [pages, ps, kv_heads, k_dim]
+            P(None, None, kv_part, None),  # v_cache_paged [pages, ps, kv_heads, v_dim]
+            P(),  # kv_lens
+            P(),  # page_indices
+            P(),  # cu_q_lens
+            P(),  # cu_kv_lens
+            P(),  # distribution
+            P(),  # custom_mask
+        )
+        out_specs = (
+            P(None, kv_part),  # attn output
+            P(None, kv_part, None),  # updated_k 3D
+            P(None, kv_part, None),  # updated_v 3D
+        )
+
+        def _ragged_paged_attention_with_split_kv(*args):
+            queries, keys_new, values_new, k_cache_arg, v_cache_arg = args[:5]
+            other_args = args[5:]
+
+            result, updated_k, updated_v = ragged_paged_attention(
+                queries,
+                keys_new,
+                values_new,
+                None,  # kv_cache_fused=None for split path
+                *other_args,
+                k_cache=k_cache_arg,
+                v_cache=v_cache_arg,
+                causal=causal,
+                sm_scale=scale,
+                sliding_window=layer.sliding_window_size,
+                soft_cap=layer.logit_cap,
+                xai_temperature_len=(
+                    layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
+                ),
+                vmem_limit_bytes=self.vmem_limit_bytes,
+            )
+
+            return result, updated_k, updated_v
+
+        (
+            attn_output,
+            updated_k,
+            updated_v,
+        ) = jax.shard_map(
+            _ragged_paged_attention_with_split_kv,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_vma=False,
+        )(
+            q.reshape(q.shape[0], -1, self.head_dim),
+            k.reshape(k.shape[0], -1, k.shape[-1]),
+            v.reshape(v.shape[0], -1, v.shape[-1]),
+            k_cache_paged,
+            v_cache_paged,
+            self.forward_metadata.seq_lens,
+            page_indices_arg,
+            self.forward_metadata.cu_q_lens,
+            self.forward_metadata.cu_kv_lens,
+            self.forward_metadata.distribution,
+            self.forward_metadata.custom_mask,
+        )
+
+        # NOTE: ragged_paged_attention already trims updated caches back to
+        # actual head_dim via prepare_updated_kv_cache. No padding needed here —
+        # the pool stores buffers at actual head_dim (e.g., 192 for K, 128 for V).
+
+        return (
+            attn_output.reshape(q.shape[0], -1),
+            (updated_k, updated_v),
+        )
+
     def _get_fused_kv_cache(
         self,
         forward_batch: ForwardBatch,
@@ -544,6 +687,14 @@ class FlashAttention(AttentionBackend):
         layer_id: int,
     ) -> jax.Array:
         return token_to_kv_pool.get_fused_kv_buffer(layer_id)
+
+    def _get_split_kv_cache(
+        self,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        layer_id: int,
+    ) -> tuple[jax.Array, jax.Array]:
+        return token_to_kv_pool.get_split_kv_buffer(layer_id)
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:

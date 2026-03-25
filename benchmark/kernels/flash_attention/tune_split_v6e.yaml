@@ -1,0 +1,40 @@
+# sky launch benchmark/kernels/flash_attention/tune_split_v6e.yaml -n tune-split-v6e -y
+#
+# Purpose: Tune split kernel block sizes on TPU v6e (tpu-v6e-1, ~$2.70/hr)
+# v6e has 32GB HBM, full config sweep.
+
+resources:
+  accelerators: tpu-v6e-1
+  accelerator_args:
+    tpu_vm: true
+    runtime_version: v2-alpha-tpuv6e
+
+setup: |
+  set -euxo pipefail
+
+  if [ ! -d ~/sglang-jax/.git ]; then
+    git clone https://github.com/sgl-project/sglang-jax.git ~/sglang-jax
+  fi
+
+  cd ~/sglang-jax
+  git fetch origin feat/support_spilt_kv
+  git checkout feat/support_spilt_kv
+  git pull origin feat/support_spilt_kv
+
+  if ! command -v uv >/dev/null 2>&1; then
+    pip install uv
+  fi
+  if [ ! -f .venv/bin/activate ]; then
+    uv venv --python 3.12
+  fi
+  source .venv/bin/activate
+  uv pip install -e "python[all]"
+
+run: |
+  set -euxo pipefail
+  cd ~/sglang-jax
+  source .venv/bin/activate
+
+  echo "========== Split Kernel Block Size Tuning (TPU v6e) =========="
+  cd benchmark/kernels/flash_attention
+  python get_split_block_spec_config.py
