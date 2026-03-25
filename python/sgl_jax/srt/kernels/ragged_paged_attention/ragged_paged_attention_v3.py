@@ -1594,10 +1594,10 @@ def ragged_paged_attention(
         # `get_vmem_estimate_bytes` when VREG spilling is fixed.
         vmem_limit_bytes = DEFAULT_VMEM_LIMIT_BYTES
 
-    jax.debug.print("distribution: {distribution}", distribution=distribution)
-    jax.debug.print("cu_q_lens: {cu_q_lens}", cu_q_lens=cu_q_lens)
-    jax.debug.print("kv_lens: {kv_lens}", kv_lens=kv_lens)
-    jax.debug.print("page_indices: {page_indices}", page_indices=page_indices)
+    # jax.debug.print("distribution: {distribution}", distribution=distribution)
+    # jax.debug.print("cu_q_lens: {cu_q_lens}", cu_q_lens=cu_q_lens)
+    # jax.debug.print("kv_lens: {kv_lens}", kv_lens=kv_lens)
+    # jax.debug.print("page_indices: {page_indices}", page_indices=page_indices)
 
     static_validate_inputs(
         q,
@@ -1836,6 +1836,8 @@ def ragged_paged_attention(
     )
     if chunk_prefill_size is not None:
         # Prefill-only
+        # print(f"Running prefill kernel with chunk_prefill_size: {chunk_prefill_size}")
+        # jax.debug.print("Running prefill kernel with chunk_prefill_size: {chunk_prefill_size}", chunk_prefill_size=chunk_prefill_size)
         q, kv_cache = run_rpa_kernel(
             q,
             kv_cache,
