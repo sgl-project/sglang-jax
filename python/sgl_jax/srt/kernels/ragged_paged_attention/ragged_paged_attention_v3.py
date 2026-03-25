@@ -27,7 +27,8 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-from tpu_inference.kernels.ragged_paged_attention.v3.util import (
+
+from sgl_jax.srt.kernels.ragged_paged_attention.util import (
     align_to,
     cdiv,
     get_dtype_packing,
