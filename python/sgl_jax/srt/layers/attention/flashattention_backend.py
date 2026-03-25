@@ -443,6 +443,12 @@ class FlashAttention(AttentionBackend):
 
         chunk_prefill_size = self.chunked_prefill_size
 
+        xai_temp_len = getattr(layer, "xai_temperature_len", None)
+        if xai_temp_len is not None and xai_temp_len <= 0:
+            raise AssertionError(
+                f"xai_temperature_len must be a positive integer, got {xai_temp_len}"
+            )
+
         # Select page indices and remap to SWA pool if KV cache supports it
         page_indices_arg = self.forward_metadata.page_indices
         if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
@@ -488,6 +494,7 @@ class FlashAttention(AttentionBackend):
                 sm_scale=scale,
                 sliding_window=layer.sliding_window_size,
                 soft_cap=layer.logit_cap,
+                xai_temperature_len=xai_temp_len,
                 chunk_prefill_size=chunk_prefill_size,
             )
 

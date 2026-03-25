@@ -91,6 +91,7 @@ def ref_ragged_paged_attention(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    xai_temperature_len: float | None = None,
 ):
     if out_dtype is None:
         out_dtype = jnp.float32 if queries.dtype == jnp.float32 else jnp.bfloat16
@@ -186,6 +187,14 @@ def ref_ragged_paged_attention(
             attn *= q_scale
         if soft_cap is not None:
             attn = soft_cap * jnp.tanh(attn / soft_cap)
+
+        if xai_temperature_len is not None:
+            prefix_len = kv_len - q_len
+            qidx = jnp.arange(prefix_len, kv_len)
+            xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
+            _qtemp = jnp.log2(qidx.astype(jnp.float32)) * xai_temperature_scale
+            xai_temperature_reg = jnp.where(qidx > xai_temperature_len, _qtemp, 1.0)
+            attn = attn * xai_temperature_reg[None, :, None]
 
         if use_causal_mask:
             q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
@@ -334,6 +343,7 @@ def _ragged_paged_attention_kernel_loop(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    xai_temperature_len: float | None = None,
     static_q_len: int | None = None,
     bq_sz,  # bq fetch size
     bkv_sz,  # bkv prefetch size
@@ -437,6 +447,7 @@ def _ragged_paged_attention_kernel_loop(
         processed_q_len,
         processed_kv_len,
         effective_kv_len,
+        xai_temperature_reg=None,
     ):
         assert len(q.shape) == 2
         assert q.shape[0] % num_q_heads_per_kv_head == 0
@@ -466,6 +477,10 @@ def _ragged_paged_attention_kernel_loop(
             s *= q_scale
         if soft_cap is not None:
             s = soft_cap * jnp.tanh(s / soft_cap)
+
+        if xai_temperature_reg is not None:
+            assert len(xai_temperature_reg.shape) == 1
+            s = s * xai_temperature_reg.astype(out_dtype)[:, None]
 
         int_ty = jnp.int32
         if get_dtype_packing(q_dtype) != 1 and get_tpu_version() >= 6:
@@ -893,6 +908,22 @@ def _ragged_paged_attention_kernel_loop(
             )
 
             processed_q_len = kv_q_gap + bq_idx * actual_bq_sz
+
+            xai_temperature_reg = None
+            if xai_temperature_len is not None:
+                prefix_len = kv_len - q_len
+                local_q_offset = (
+                    bq_idx * actual_bq_sz
+                    + lax.iota(jnp.int32, actual_bq_sz * num_q_heads_per_kv_head)
+                    // num_q_heads_per_kv_head
+                )
+                absolute_q_position = prefix_len + local_q_offset
+                xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
+                _qtemp = jnp.log2(absolute_q_position.astype(jnp.float32)) * xai_temperature_scale
+                xai_temperature_reg = jnp.where(
+                    absolute_q_position > xai_temperature_len, _qtemp, 1.0
+                )
+
             start_bkv_idx = 0
             if sliding_window is not None:
                 # Recalculate the start_bkv_idx based on the processed_q_len.
@@ -981,6 +1012,12 @@ def _ragged_paged_attention_kernel_loop(
                             # `step2_pv` for the previous KV head, which depends on the
                             # softmax output, is overlapped with `step1_qk_softmax` for the
                             # current KV head, reducing overall wait times.
+                            bq_xai_temp = None
+                            if xai_temperature_reg is not None:
+                                temp_start = bq_start * num_q_heads_per_kv_head
+                                temp_end = (bq_start + actual_bq_csz) * num_q_heads_per_kv_head
+                                bq_xai_temp = xai_temperature_reg[temp_start:temp_end]
+
                             cur_p, cur_v, cur_exp_m_diff = flash_attention_step1_qk_softmax(
                                 bq_c,
                                 bk_c,
@@ -990,6 +1027,7 @@ def _ragged_paged_attention_kernel_loop(
                                 processed_q_len=processed_q_len + bq_start,
                                 processed_kv_len=processed_kv_len + bkv_start,
                                 effective_kv_len=effective_kv_len,
+                                xai_temperature_reg=bq_xai_temp,
                             )
                             if prev_lm_slice is not None:
                                 flash_attention_step2_pv(
@@ -1282,6 +1320,7 @@ def static_validate_inputs(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    xai_temperature_len: float | None = None,
     # Kernel optimization params.
     chunk_prefill_size: int | None = None,
     # Kernel tuning params.
@@ -1377,6 +1416,8 @@ def static_validate_inputs(
         raise ValueError(f"{sliding_window=} must be positive.")
     if soft_cap is not None and soft_cap == 0.0:
         raise ValueError(f"{soft_cap=} must not be 0.0.")
+    if xai_temperature_len is not None and xai_temperature_len <= 0:
+        raise ValueError(f"{xai_temperature_len=} must be positive.")
     if chunk_prefill_size is not None and chunk_prefill_size <= 0:
         raise ValueError(f"{chunk_prefill_size=} must be positive.")
 
@@ -1413,6 +1454,7 @@ def static_validate_inputs(
     del q_scale
     del k_scale
     del v_scale
+    del xai_temperature_len
 
 
 def get_default_block_sizes(
@@ -1491,6 +1533,7 @@ def get_default_block_sizes(
         "q_scale",
         "k_scale",
         "v_scale",
+        "xai_temperature_len",
         "chunk_prefill_size",
         "d_block_sizes",
         "p_block_sizes",
@@ -1522,6 +1565,7 @@ def ragged_paged_attention(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    xai_temperature_len: float | None = None,
     # Kernel optimization params.
     chunk_prefill_size: int | None = None,
     # Kernel tuning params for decode, prefill, and mixed cases.
@@ -1566,6 +1610,7 @@ def ragged_paged_attention(
       q_scale: the scale for the query.
       k_scale: the scale for the key.
       v_scale: the scale for the value.
+      xai_temperature_len: the length-based temperature term used by xai grok.
       chunk_prefill_size: the chunk prefill size for the attention.
       d_block_sizes: the block sizes for the decode case.
       p_block_sizes: the block sizes for the prefill case.
@@ -1618,6 +1663,7 @@ def ragged_paged_attention(
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
+        xai_temperature_len=xai_temperature_len,
         chunk_prefill_size=chunk_prefill_size,
         d_block_sizes=d_block_sizes,
         p_block_sizes=p_block_sizes,
@@ -1745,6 +1791,7 @@ def ragged_paged_attention(
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                xai_temperature_len=xai_temperature_len,
                 static_q_len=static_q_len,
                 bq_sz=bq_sz,
                 bkv_sz=bkv_sz,
