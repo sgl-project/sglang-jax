@@ -634,6 +634,8 @@ def run_all(
     token_mask_mode: str = "none",
     token_valid_ratio: float = 1.0,
     token_mask_seed: int = 0,
+    profile: bool = False,
+    profile_dir: str = "profile_fused_moe",
 ) -> None:
     if use_grouped_topk is None:
         use_grouped_topk = bool(num_expert_group or topk_group)
@@ -959,13 +961,30 @@ def run_all(
                             subc_quant_wsz=None,
                             block_config=block_cfg,
                         )
-                    times = multiple_iteration_timeit_from_trace(
-                        compute_func=_compute,
-                        data_generator=lambda: (),
-                        task=task,
-                        tries=iters,
-                        warmup=warmup_iters,
-                    )
+                    if profile:
+                        profile_case_dir = os.path.join(
+                            profile_dir,
+                            f"case_{case.num_tokens}t_{case.num_experts}e_ep{mesh_ep}",
+                        )
+                        os.makedirs(profile_case_dir, exist_ok=True)
+                        print(f"  Profiling to: {profile_case_dir}")
+                        for _ in range(warmup_iters):
+                            out = _compute()
+                            jax.block_until_ready(out)
+                        with jax.profiler.trace(profile_case_dir):
+                            for step in range(iters):
+                                with jax.profiler.StepTraceAnnotation(task, step_num=step):
+                                    out = _compute()
+                                    jax.block_until_ready(out)
+                        print(f"  Profile saved to: {profile_case_dir}")
+                    else:
+                        times = multiple_iteration_timeit_from_trace(
+                            compute_func=_compute,
+                            data_generator=lambda: (),
+                            task=task,
+                            tries=iters,
+                            warmup=warmup_iters,
+                        )
                 except ValueError as e:
                     print(f"SKIP fused_moe blocks [{i+1}/{len(block_cfgs)}], reason: {e}")
                     continue
@@ -990,6 +1009,8 @@ def run_all(
                         flush=True,
                     )
                     print(traceback.format_exc(), flush=True)
+                    continue
+                if profile:
                     continue
                 if len(times) > 1:
                     times = times[1:]
@@ -1204,6 +1225,17 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="RNG seed for --token-mask-mode=random (combined with case.seed).",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable JAX profiling. Dumps trace to --profile-dir for TensorBoard/xprof.",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        type=str,
+        default="profile_fused_moe",
+        help="Output directory for JAX profiling traces (default: profile_fused_moe).",
+    )
     return parser.parse_args()
 
 
@@ -1268,6 +1300,8 @@ if __name__ == "__main__":
             token_mask_mode=args.token_mask_mode,
             token_valid_ratio=args.token_valid_ratio,
             token_mask_seed=args.token_mask_seed,
+            profile=args.profile,
+            profile_dir=args.profile_dir,
         )
     except BaseException as e:
         print(f"FATAL: {type(e).__name__}: {e}", flush=True)
