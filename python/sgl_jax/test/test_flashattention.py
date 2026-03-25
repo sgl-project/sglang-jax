@@ -5,7 +5,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
+from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
+    get_kv_cache_shape,
     ref_ragged_paged_attention,
 )
 from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
@@ -422,23 +423,35 @@ class TestAttention(CustomTestCase):
             cache_loc_list.append(padded_page_indices)
         page_table = jnp.stack(cache_loc_list)
 
-        expected = ref_ragged_paged_attention(
+        total_num_pages = k.shape[0] // page_size
+        kv_cache_shape = get_kv_cache_shape(
+            total_num_pages,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            k.dtype,
+        )
+        kv_cache_for_ref = jnp.zeros(kv_cache_shape, dtype=k.dtype)
+
+        # max_num_seqs = forward_batch.seq_lens.shape[0]
+        # pages_per_seq = page_table.shape[1]
+        page_indices_flat = page_table.reshape(-1)
+
+        num_seqs_val = forward_batch.attn_backend.forward_metadata.num_seqs[0]
+        distribution = jnp.array([0, 0, num_seqs_val], dtype=jnp.int32)
+
+        expected, _ = ref_ragged_paged_attention(
             q.reshape(q.shape[0], num_heads, head_dim),
-            k.reshape(k.shape[0] // page_size, page_size, num_kv_heads, head_dim),
-            v.reshape(v.shape[0] // page_size, page_size, num_kv_heads, head_dim),
+            k.reshape(k.shape[0], num_kv_heads, head_dim),
+            v.reshape(v.shape[0], num_kv_heads, head_dim),
+            kv_cache_for_ref,
             forward_batch.seq_lens,
-            page_table,
+            page_indices_flat,
             forward_batch.attn_backend.forward_metadata.cu_q_lens,
-            # forward_batch.attn_backend.forward_metadata.cu_kv_lens,
-            forward_batch.attn_backend.forward_metadata.num_seqs,
-            custom_mask=(
-                forward_batch.spec_info.custom_mask if forward_batch.spec_info is not None else None
-            ),
-            causal=causal,
+            distribution,
             sm_scale=head_dim**-0.5,
             sliding_window=sliding_window,
             soft_cap=logit_cap,
-            xai_temperature_len=xai_temperature_len,
         )
         jax.block_until_ready(expected)
 

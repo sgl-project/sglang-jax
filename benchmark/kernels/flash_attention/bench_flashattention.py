@@ -12,8 +12,7 @@ import jax
 import numpy as np
 from utils import create_decode_uniform_data, create_prefill_uniform_data
 
-from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
-    get_kernel_scope_name,
+from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
     ragged_paged_attention,
 )
 from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes import (
@@ -97,7 +96,6 @@ def benchmark_backend(
         kv_lens,
         page_indices,
         cu_q_lens,
-        cu_kv_lens,
         distribution,
         sm_scale,
     ):
@@ -109,10 +107,7 @@ def benchmark_backend(
             kv_lens,
             page_indices,
             cu_q_lens,
-            cu_kv_lens,
             distribution,
-            custom_mask=None,
-            causal=1,
             sm_scale=sm_scale,
         )
 
@@ -125,7 +120,6 @@ def benchmark_backend(
         kv_lens,
         page_indices,
         cu_q_lens,
-        cu_kv_lens,
         distribution,
         scale,
     )
@@ -146,10 +140,11 @@ def benchmark_backend(
         page_indices.shape[0] // kv_lens.shape[0],
         True,
     )
+    scope_name = f"RPA-bq_{best_bq_sz}-bkvp_{best_bkv_p}-p_{page_size}"
     times = multiple_iteration_timeit_from_trace(
         compute_func=lambda: attn(),
         data_generator=lambda: (),
-        task=get_kernel_scope_name(best_bq_sz, best_bkv_p, page_size),
+        task=scope_name,
         tries=1,
     )
     avg_time = float(np.mean(times)) if times else float("nan")

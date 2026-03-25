@@ -5,8 +5,7 @@ import jax
 import numpy as np
 from utils import create_decode_uniform_data, create_prefill_uniform_data
 
-from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
-    get_kernel_scope_name,
+from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
     ragged_paged_attention,
 )
 from sgl_jax.srt.kernels.utils.perf import multiple_iteration_timeit_from_trace
@@ -88,11 +87,8 @@ def benchmark_backend(
         kv_lens,
         page_indices,
         cu_q_lens,
-        cu_kv_lens,
         distribution,
         sm_scale,
-        num_kv_pages_per_block,
-        num_queries_per_block,
     ):
         return ragged_paged_attention(
             q,
@@ -102,12 +98,8 @@ def benchmark_backend(
             kv_lens,
             page_indices,
             cu_q_lens,
-            cu_kv_lens,
             distribution,
-            None,
             sm_scale=sm_scale,
-            num_kv_pages_per_block=num_kv_pages_per_block,
-            num_queries_per_block=num_queries_per_block,
         )
 
     attn = functools.partial(
@@ -119,11 +111,8 @@ def benchmark_backend(
         kv_lens,
         page_indices,
         cu_q_lens,
-        cu_kv_lens,
         distribution,
         scale,
-        num_kv_pages_per_block,
-        num_queries_per_block,
     )
 
     # Warmup
@@ -131,10 +120,11 @@ def benchmark_backend(
     jax.block_until_ready(output)
 
     # Benchmark
+    scope_name = f"RPA-bq_{num_queries_per_block}-bkvp_{num_kv_pages_per_block}-p_{page_size}"
     times = multiple_iteration_timeit_from_trace(
         compute_func=lambda: attn(),
         data_generator=lambda: (),
-        task=get_kernel_scope_name(num_queries_per_block, num_kv_pages_per_block, page_size),
+        task=scope_name,
         tries=3,
     )
     avg_time = float(np.mean(times)) if times else float("nan")

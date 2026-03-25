@@ -769,6 +769,7 @@ class Grok1ForCausalLM(nnx.Module):
         mesh: jax.sharding.Mesh,
     ) -> None:
         super().__init__()
+        # config.num_hidden_layers = 1
         assert dtype == jnp.bfloat16
         self.config = config
         self.mesh = mesh

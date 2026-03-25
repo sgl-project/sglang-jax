@@ -53,3 +53,11 @@ def get_tpu_version() -> int:
 
 def get_dtype_bitwidth(dtype):
     return dtypes.bit_width(dtype) if hasattr(dtypes, "bit_width") else dtypes.itemsize_bits(dtype)
+
+
+def next_power_of_2(x: int):
+    """Finds the smallest power of 2 >= x."""
+    assert x > 0
+    if x == 1:
+        return 1
+    return 1 << (x - 1).bit_length()

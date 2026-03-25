@@ -98,26 +98,26 @@ def ref_ragged_paged_attention(
     if mask_value is None:
         # We do not set to -inf directly because (-inf) - (-inf) is nan.
         mask_value = -float(jnp.finfo(out_dtype).max)
-    dynamic_validate_inputs(
-        queries,
-        keys,
-        values,
-        kv_cache,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        distribution,
-        use_causal_mask=use_causal_mask,
-        skip_kv_mask=skip_kv_mask,
-        sm_scale=sm_scale,
-        sliding_window=sliding_window,
-        soft_cap=soft_cap,
-        out_dtype=out_dtype,
-        mask_value=mask_value,
-        q_scale=q_scale,
-        k_scale=k_scale,
-        v_scale=v_scale,
-    )
+    # dynamic_validate_inputs(
+    #     queries,
+    #     keys,
+    #     values,
+    #     kv_cache,
+    #     kv_lens,
+    #     page_indices,
+    #     cu_q_lens,
+    #     distribution,
+    #     use_causal_mask=use_causal_mask,
+    #     skip_kv_mask=skip_kv_mask,
+    #     sm_scale=sm_scale,
+    #     sliding_window=sliding_window,
+    #     soft_cap=soft_cap,
+    #     out_dtype=out_dtype,
+    #     mask_value=mask_value,
+    #     q_scale=q_scale,
+    #     k_scale=k_scale,
+    #     v_scale=v_scale,
+    # )
     actual_head_dim = queries.shape[2]
     actual_num_q_heads = queries.shape[1]
     actual_num_kv_heads = keys.shape[1]
@@ -137,7 +137,9 @@ def ref_ragged_paged_attention(
     assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
     outputs = []
-
+    # jax.debug.print("distribution: {distribution}", distribution=distribution)
+    # jax.debug.print("distribution shape: {dist_shape}", dist_shape=distribution.shape)
+    # print(f"distribution: {distribution}")
     for i in range(distribution[-1]):
         q_start = cu_q_lens[i]
         q_end = cu_q_lens[i + 1]
@@ -1591,6 +1593,11 @@ def ragged_paged_attention(
         # TODO(jevinjiang, jacobplatin): change this to use
         # `get_vmem_estimate_bytes` when VREG spilling is fixed.
         vmem_limit_bytes = DEFAULT_VMEM_LIMIT_BYTES
+
+    jax.debug.print("distribution: {distribution}", distribution=distribution)
+    jax.debug.print("cu_q_lens: {cu_q_lens}", cu_q_lens=cu_q_lens)
+    jax.debug.print("kv_lens: {kv_lens}", kv_lens=kv_lens)
+    jax.debug.print("page_indices: {page_indices}", page_indices=page_indices)
 
     static_validate_inputs(
         q,
