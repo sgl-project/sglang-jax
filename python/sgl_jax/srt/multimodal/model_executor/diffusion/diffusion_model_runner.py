@@ -4,6 +4,7 @@ from collections.abc import Callable
 from functools import partial
 
 import jax
+import numpy as np
 import jax.numpy as jnp
 from flax import nnx
 from jax import NamedSharding
@@ -220,8 +221,9 @@ class DiffusionModelRunner(BaseModelRunner):
         image_seq_len = (batch.height // (vae_scale_factor * 2)) * (batch.width // (vae_scale_factor * 2))
         mu = self._calculate_mu(image_seq_len)
 
-        # 6. Set timesteps with dynamic shifting
-        self.solver.set_timesteps(num_inference_steps=num_inference_steps, mu=mu)
+        # 6. Set timesteps with dynamic shifting (match GPU: sigmas = linspace(1, 1/N, N))
+        sigmas = np.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps).tolist()
+        self.solver.set_timesteps(sigmas=sigmas, mu=mu)
 
         # 7. Build guidance tensor (embedded_cfg_scale=3.5 for FLUX.1-dev)
         embedded_cfg_scale = 3.5
@@ -235,7 +237,15 @@ class DiffusionModelRunner(BaseModelRunner):
         txt_ids = device_array(txt_ids, sharding=NamedSharding(self.mesh, PartitionSpec()))
         guidance = device_array(guidance, sharding=NamedSharding(self.mesh, PartitionSpec()))
 
-        # 9. Denoising loop
+        # 9. Denoising loop (with optional debug saving)
+        debug_data = {
+            "timesteps": np.array(self.solver.timesteps),
+            "sigmas": np.array(self.solver.sigmas),
+            "mu": mu,
+            "initial_latents": jax.device_get(latents),
+            "prompt_embeds_shape": prompt_embeds.shape,
+            "pooled_shape": pooled_projections.shape,
+        }
         start_time = time.time()
         for step in tqdm(range(num_inference_steps), desc="FLUX diffusion"):
             if abort_checker is not None and abort_checker():
@@ -246,13 +256,14 @@ class DiffusionModelRunner(BaseModelRunner):
                 return True
 
             t = jnp.array(self.solver.timesteps[step])
-            t_batch = jnp.broadcast_to(t, (latents.shape[0],))
+            # Model internally multiplies by 1000, so pass sigma [0,1] not timestep [0,1000]
+            t_for_model = jnp.broadcast_to(t / 1000.0, (latents.shape[0],))
 
             noise_pred = self.jitted_forward(
                 hidden_states=latents,
                 encoder_hidden_states=prompt_embeds,
                 pooled_projections=pooled_projections,
-                timestep=t_batch,
+                timestep=t_for_model,
                 img_ids=img_ids,
                 txt_ids=txt_ids,
                 guidance=guidance,
@@ -265,10 +276,19 @@ class DiffusionModelRunner(BaseModelRunner):
                 return_dict=False,
             )[0]
 
+            debug_data[f"step{step}_t"] = float(t)
+            debug_data[f"step{step}_noise_pred"] = jax.device_get(noise_pred)
+            debug_data[f"step{step}_latents"] = jax.device_get(latents)
+
             if step_callback is not None:
                 step_callback()
 
         logger.info("Finished FLUX diffusion in %.2f seconds", time.time() - start_time)
+
+        # Save debug data
+        debug_data["final_latents_packed"] = jax.device_get(latents)
+        np.savez("/tmp/flux_stage1_tpu_debug.npz", **debug_data)
+        logger.info("Saved Stage 1 debug data to /tmp/flux_stage1_tpu_debug.npz")
 
         # 10. Unpack latents: [B, seq, C] -> [B, C//4, H', W']
         latents = self._unpack_latents_flux(latents, height_latent, width_latent, in_channels)
@@ -363,6 +383,10 @@ class DiffusionModelRunner(BaseModelRunner):
                 return_dict=False,
             )[0]
             latents = latents.transpose(0, 2, 3, 4, 1)
+            debug_data[f"step{step}_t"] = float(t)
+            debug_data[f"step{step}_noise_pred"] = jax.device_get(noise_pred)
+            debug_data[f"step{step}_latents"] = jax.device_get(latents)
+
             if step_callback is not None:
                 step_callback()
 

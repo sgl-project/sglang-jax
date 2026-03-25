@@ -5,6 +5,7 @@ stage_args:
    stage_sub_dir: text_encoder,text_encoder_2
    runtime:
      num_tpus: 1
+     device_kind: cpu
      max_batch_size: 1
    scheduler: text_encoder
    final_output: false
@@ -16,7 +17,6 @@ stage_args:
    stage_sub_dir: transformer
    runtime:
      num_tpus: 1
-     device_kind: cpu
      max_batch_size: 1
    scheduler: diffusion
    scheduler_params: {Scheduler: FlowMatchEulerDiscreteScheduler}

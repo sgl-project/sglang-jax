@@ -65,7 +65,8 @@ class VaeModelRunner(BaseModelRunner):
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
-            return model.encode(x)
+            # Return plain array for JIT compatibility
+            return model.encode(x).latent_dist.sample()
 
         @partial(
             jax.jit,
@@ -79,7 +80,8 @@ class VaeModelRunner(BaseModelRunner):
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
-            return model.decode(x)
+            # Return plain array for JIT compatibility (DecoderOutput is not a JAX type)
+            return model.decode(x).sample
 
         def encode_wrapper(x: jax.Array):
             return encode(model_def, model_state_def, model_state_leaves, x)

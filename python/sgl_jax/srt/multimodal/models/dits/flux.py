@@ -320,7 +320,11 @@ class FluxAttention(nnx.Module):
             query = _apply_flux_rotary_emb(query, image_rotary_emb, sequence_dim=1)
             key = _apply_flux_rotary_emb(key, image_rotary_emb, sequence_dim=1)
 
-        if self.attention_impl == "sdpa":
+        _use_sdpa = (
+            self.attention_impl == "sdpa"
+            or (self.mesh is not None and all(s == 1 for s in self.mesh.shape.values()))
+        )
+        if _use_sdpa:
             hidden_states = _sdpa_attention(
                 query,
                 key,
@@ -330,9 +334,6 @@ class FluxAttention(nnx.Module):
             )
         else:
             if attention_mask is not None:
-                logger.warning(
-                    "attention_mask is not supported by USPAttention yet; falling back to sdpa attention."
-                )
                 hidden_states = _sdpa_attention(
                     query,
                     key,

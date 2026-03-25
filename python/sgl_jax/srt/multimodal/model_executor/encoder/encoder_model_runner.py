@@ -143,19 +143,30 @@ class EncoderModelRunner(BaseModelRunner):
                 kwargs["output_hidden_states"] = True
             if use_cache:
                 kwargs["use_cache"] = False
-            return model(**kwargs)
+            outputs = model(**kwargs)
+            # Return as dict of arrays for JIT compatibility
+            # (BaseEncoderOutput is not a registered JAX pytree)
+            return {
+                "last_hidden_state": outputs.last_hidden_state,
+                "pooler_output": outputs.pooler_output,
+            }
 
         def forward_wrapper(input_ids: jax.Array, attention_mask: jax.Array):
-            return forward(
+            result = forward(
                 model_def,
                 model_state_def,
                 model_state_leaves,
                 input_ids,
                 attention_mask,
             )
+            return BaseEncoderOutput(
+                last_hidden_state=result["last_hidden_state"],
+                pooler_output=result["pooler_output"],
+            )
 
         spec.jitted_forward = forward_wrapper
 
+    
     def mock_data(self):
         # 初始化随机种子，用于生成逼真的浮点数 Embedding
         key = jax.random.PRNGKey(42)
@@ -169,38 +180,28 @@ class EncoderModelRunner(BaseModelRunner):
         embed_1 = jax.random.normal(k1, (1, 768))
         embed_2 = jax.random.normal(k2, (1, 512, 4096))
 
-        prompt_embeds_list = [embed_1, embed_2]
+        # Match real encoder flow: CLIP -> pooler_embeds, T5 -> prompt_embeds
+        prompt_embeds_list = [embed_2]  # T5 hidden only
 
-        # ---------------------------------------------------------
-        # 2. 构造 prompt_masks_list
-        # ---------------------------------------------------------
-        # 第一个形状是 (1, 77)，前面是1，后面是0
-        # 假设我们模拟一个长度为 30 的有效句子，剩下的 47 个全是 Padding(0)
-        valid_length = 30
-        # 使用 jnp.arange 生成 0-76 的索引，并与 valid_length 比较，最后 reshape 回 (1, 77)
-        mask_1 = jnp.where(jnp.arange(77) < valid_length, 1, 0).reshape(1, 77).astype(jnp.int32)
-
-        # 第二个形状是 (1, 512)，全 1
+        # T5 attention mask (all ones for FLUX max padding)
         mask_2 = jnp.ones((1, 512), dtype=jnp.int32)
+        prompt_masks_list = [mask_2]
 
-        prompt_masks_list = [mask_1, mask_2]
-
-        # ---------------------------------------------------------
-        # 3. 构造 pooler_embeds_list
-        # ---------------------------------------------------------
-        pooler_embeds_list = [jax.random.normal(k3, (1, 768)), None]
+        # CLIP pooler output
+        pooler_embeds_list = [jax.random.normal(k3, (1, 768))]
 
         return prompt_embeds_list, prompt_masks_list, pooler_embeds_list
-    
+
+
     def forward(self, batch: Req) -> Req:
         all_indices = list(range(len(self.encoder_specs)))
         prompt_text = batch.prompt or batch.origin_input_text
         if prompt_text is not None:
-            prompt_embeds_list, prompt_masks_list, pooler_embeds_list = self.encode_text(
-                prompt_text,
-                encoder_index=all_indices,
-            )
-            # prompt_embeds_list, prompt_masks_list, pooler_embeds_list = self.mock_data()
+            # prompt_embeds_list, prompt_masks_list, pooler_embeds_list = self.encode_text(
+            #     prompt_text,
+            #     encoder_index=all_indices,
+            # )
+            prompt_embeds_list, prompt_masks_list, pooler_embeds_list = self.mock_data()
             self._assign_prompt_outputs(
                 batch=batch,
                 embeds_list=prompt_embeds_list,
@@ -210,11 +211,11 @@ class EncoderModelRunner(BaseModelRunner):
             )
 
         if batch.do_classifier_free_guidance and batch.negative_prompt is not None:
-            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.encode_text(
-                batch.negative_prompt,
-                encoder_index=all_indices,
-            )
-            # neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.mock_data()
+            # neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.encode_text(
+            #     batch.negative_prompt,
+            #     encoder_index=all_indices,
+            # )
+            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.mock_data()
             self._assign_prompt_outputs(
                 batch=batch,
                 embeds_list=neg_embeds_list,
@@ -267,7 +268,7 @@ class EncoderModelRunner(BaseModelRunner):
 
         for idx in indices:
             spec = self.encoder_specs[idx]
-            tokenized = self._tokenize_text(spec, text)
+            tokenized = self._tokenize_text(spec, text, idx)
             model_attention_mask = self._get_model_attention_mask(
                 spec,
                 tokenized["attention_mask"],
@@ -373,21 +374,28 @@ class EncoderModelRunner(BaseModelRunner):
             raise ValueError("CLIP encoder output does not contain pooler_output.")
         return outputs.pooler_output
 
-    def _tokenize_text(self, spec: _EncoderSpec, text: str | list[str]) -> dict[str, jax.Array]:
+    def _tokenize_text(self, spec: _EncoderSpec, text: str | list[str], encoder_idx: int = 0) -> dict[str, jax.Array]:
         if spec.max_length is None:
             raise ValueError(f"Encoder max_length is not initialized for {spec.model_class}.")
-        encoded_unpadded = spec.tokenizer(
-            text,
-            padding=False,
-            truncation=True,
-            max_length=spec.max_length,
-            return_tensors="np",
-        )
-        actual_length = encoded_unpadded["input_ids"].shape[1]
-        padded_max_length = self._select_precompiled_max_length(
-            actual_length=actual_length,
-            encoder_max_length=spec.max_length,
-        )
+
+        # FLUX T5: skip bucketing, pad to max_length (512) to match GPU SGLang behavior.
+        # With all-ones attention mask, T5 treats pad tokens as real input, so
+        # the padding length affects the output.
+        if self.is_flux_t5(spec, encoder_idx):
+            padded_max_length = spec.max_length
+        else:
+            encoded_unpadded = spec.tokenizer(
+                text,
+                padding=False,
+                truncation=True,
+                max_length=spec.max_length,
+                return_tensors="np",
+            )
+            actual_length = encoded_unpadded["input_ids"].shape[1]
+            padded_max_length = self._select_precompiled_max_length(
+                actual_length=actual_length,
+                encoder_max_length=spec.max_length,
+            )
         encoded = spec.tokenizer(
             text,
             padding="max_length",
