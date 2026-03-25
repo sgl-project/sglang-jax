@@ -1559,16 +1559,16 @@ def ragged_paged_attention(
     grid = (distribution[2],)
 
     in_specs = [
-        pl.BlockSpec(memory_space=pltpu.ANY),  # q
-        pl.BlockSpec(memory_space=pltpu.ANY),  # kv_fused
-        pl.BlockSpec(memory_space=pltpu.ANY),  # kv_cache_fused
-        pl.BlockSpec(memory_space=pltpu.ANY) if custom_mask is not None else None,  # custom_mask
-        pl.BlockSpec(memory_space=pltpu.ANY),  # zero mask
+        pl.BlockSpec(memory_space=pltpu.HBM),  # q
+        pl.BlockSpec(memory_space=pltpu.HBM),  # kv_fused
+        pl.BlockSpec(memory_space=pltpu.HBM),  # kv_cache_fused
+        pl.BlockSpec(memory_space=pltpu.HBM) if custom_mask is not None else None,  # custom_mask
+        pl.BlockSpec(memory_space=pltpu.HBM),  # zero mask
     ]
 
     out_specs = [
-        pl.BlockSpec(memory_space=pltpu.ANY),  # output
-        pl.BlockSpec(memory_space=pltpu.ANY),  # updated kv_cache_fused
+        pl.BlockSpec(memory_space=pltpu.HBM),  # output
+        pl.BlockSpec(memory_space=pltpu.HBM),  # updated kv_cache_fused
     ]
 
     bkv_fused_double_buf = pltpu.VMEM(

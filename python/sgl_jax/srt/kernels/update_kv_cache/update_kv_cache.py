@@ -165,11 +165,11 @@ def kv_cache_update(
         assert head_dim % 128 == 0, f"head_dim={head_dim} is not divisible by 128"
 
         in_specs = [
-            pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
-            pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
         ]
 
-        out_specs = [pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY)]
+        out_specs = [pl.BlockSpec(memory_space=pltpu.HBM)]
         out_shape = [jax.ShapeDtypeStruct(kv_cache.shape, dtype=kv_cache.dtype)]
 
         scalar_prefetches = [slices]
