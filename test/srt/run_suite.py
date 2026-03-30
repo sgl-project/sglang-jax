@@ -450,6 +450,7 @@ suites = {
         TestFile("python/sgl_jax/test/multimodal/test_wan_vae_precision.py", 1),
         TestFile("python/sgl_jax/test/multimodal/test_vae_scheduler.py", 2),
         TestFile("python/sgl_jax/test/multimodal/test_flash_attention_kernel.py", 2),
+        TestFile("python/sgl_jax/test/test_group_rmsnorm.py", 1, runner="pytest"),
         TestFile("test/srt/lora/test_bgmv_backend.py", 5),
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 10),
     ],
