@@ -70,7 +70,10 @@ def xla_quantized_matmul_local(
     out = out.astype(out_dtype)
     if reduce_axis is not None:
         if reduce_scatter:
-            out = lax.psum_scatter(out, reduce_axis, scatter_dimension=0, tiled=True)
+            jax.debug.print("reduce_scatter is True")
+            with jax.profiler.TraceAnnotation("reduce_scatter"):
+                out = lax.psum_scatter(out, reduce_axis, scatter_dimension=0, tiled=True)
+            print(f"sharding of out is {jax.typeof(out)}")
         else:
             out = lax.psum(out, reduce_axis)
 

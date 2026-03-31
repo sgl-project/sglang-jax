@@ -50,16 +50,16 @@ dependencies = [
 dev = [
 ]
 tpu = [
-    "jax[tpu]==0.8.1",
+    "jax[tpu]==0.9.2",
 ]
 gpu = [
-    "jax[cuda12]==0.8.1",
+    "jax[cuda12]==0.9.2",
 ]
 cpu = [
-    "jax[cpu]==0.8.1",
+    "jax[cpu]==0.9.2",
 ]
 all = [
-    "jax[tpu]==0.8.1",
+    "jax[tpu]==0.9.2",
 ]
 multimodal = [
     "torch",

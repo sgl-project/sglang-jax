@@ -254,6 +254,10 @@ class QuantizedLinear(nnx.Module):
             check_vma=False,
         )(x_2d, self.weight_q.value, scale_val)
 
+        if rs:
+            # jax.debug.print("output: {output_shape}", output_shape=output.shape)
+            print("output sharding in quantized linear is ", jax.typeof(output))
+
         # Reshape back to original batch dimensions
         if x.ndim > 2:
             output = output.reshape(*orig_shape[:-1], output.shape[-1])

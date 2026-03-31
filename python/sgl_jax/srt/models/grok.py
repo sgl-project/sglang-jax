@@ -504,6 +504,7 @@ class Grok1Attention(nnx.Module):
         attn_output = attn_ret[0] if isinstance(attn_ret, tuple) else attn_ret
 
         output, _ = self.o_proj(attn_output, reduce_scatter=reduce_scatter)
+        print("output sharding in o_proj is ", jax.typeof(output))
         return output, kv_fused
 
 
@@ -657,11 +658,20 @@ class Grok1DecoderLayer(nnx.Module):
         assert self.post_attn_norm.scale is not None
         assert self.pre_moe_norm.scale is not None
 
-        if use_reduce_scatter:
+        if use_reduce_scatter and residual is not None:
+            jax.debug.print("residual is not None")
+            jax.debug.print("residual: {residual}", residual=residual)
             sharded = NamedSharding(self.mesh, P("tensor", None))
             replicated = NamedSharding(self.mesh, P(None, None))
             residual = jax.sharding.reshard(residual, sharded)
 
+        if use_reduce_scatter:
+            jax.debug.print(
+                "hidden_states: {hidden_states_shape}", hidden_states_shape=hidden_states.shape
+            )
+            print("hidden_states sharding is ", jax.typeof(hidden_states))
+            jax.debug.print("residual: {residual_shape}", residual_shape=residual.shape)
+            print("residual sharding is ", jax.typeof(residual))
         hidden_states, residual = dual_rmsnorm_forward(
             hidden_states,
             residual,
@@ -786,6 +796,7 @@ class Grok1ForCausalLM(nnx.Module):
     ) -> None:
         super().__init__()
         assert dtype == jnp.bfloat16
+        config.num_hidden_layers = 1
         self.config = config
         self.mesh = mesh
 
