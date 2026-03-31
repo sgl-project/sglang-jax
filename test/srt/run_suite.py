@@ -425,6 +425,7 @@ suites = {
         TestFile("python/sgl_jax/test/multimodal/test_flash_attention_kernel.py", 2),
         TestFile("test/srt/lora/test_bgmv_backend.py", 5),
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 10),
+        TestFile("test/srt/test_dtype_config_llama.py", 1),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 1),

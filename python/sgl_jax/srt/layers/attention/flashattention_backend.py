@@ -499,6 +499,7 @@ class FlashAttention(AttentionBackend):
                 xai_temperature_len=(
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
                 ),
+                softmax_dtype=layer.softmax_dtype,
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
 

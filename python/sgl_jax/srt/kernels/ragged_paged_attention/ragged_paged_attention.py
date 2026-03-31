@@ -47,6 +47,7 @@ def ref_ragged_paged_attention_fused(
     k_scale: float | None = None,
     v_scale: float | None = None,
     xai_temperature_len: float | None = None,
+    softmax_dtype: jnp.dtype | None = None,
 ):
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
@@ -105,7 +106,17 @@ def ref_ragged_paged_attention_fused(
             attn = attn * xai_temperature_reg[:, None]
 
         attn += jnp.where(mask, mask_value, 0.0)
-        attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
+
+        # Cast to softmax_dtype if specified
+        if softmax_dtype is not None:
+            attn = attn.astype(softmax_dtype)
+
+        attn = jax.nn.softmax(attn, axis=-1)
+
+        # Cast to v.dtype if different for the next operation
+        if attn.dtype != v.dtype:
+            attn = attn.astype(v.dtype)
+
         out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
         outputs.append(out)
 
@@ -130,6 +141,7 @@ def ref_ragged_paged_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     xai_temperature_len: float | None = None,
+    softmax_dtype: jnp.dtype | None = None,
 ):
     if not causal:
         assert (
@@ -202,7 +214,17 @@ def ref_ragged_paged_attention(
             attn = attn * xai_temperature_reg[None, :, None]
 
         attn += jnp.where(mask, mask_value, 0.0)
-        attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
+
+        # Cast to softmax_dtype if specified
+        if softmax_dtype is not None:
+            attn = attn.astype(softmax_dtype)
+
+        attn = jax.nn.softmax(attn, axis=-1)
+
+        # Cast to v.dtype if different for the next operation
+        if attn.dtype != v.dtype:
+            attn = attn.astype(v.dtype)
+
         out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
         outputs.append(out)
 
@@ -323,6 +345,7 @@ def _ragged_paged_attention_kernel(
     k_scale: float | None = None,
     v_scale: float | None = None,
     xai_temperature_len: float | None = None,
+    softmax_dtype: jnp.dtype | None = None,
     chunk_prefill_size: int | None = None,
     bkv_p,
     bq_sz,
@@ -429,11 +452,18 @@ def _ragged_paged_attention_kernel(
         if soft_cap is not None:
             s = soft_cap * jnp.tanh(s / soft_cap)
         s += jnp.where(mask, mask_value, 0.0)
+
+        if softmax_dtype is not None:
+            s = s.astype(softmax_dtype)
+
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
         m_prev = load_with_init(head_m_ref, -jnp.inf)
         m_curr = jnp.maximum(m_prev, s_rowmax)
-        head_m_ref[...] = m_curr
+        head_m_ref[...] = m_curr.astype(jnp.float32)
         p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
+
+        if p.dtype != v.dtype:
+            p = p.astype(v.dtype)
 
         p_rowsum = jnp.sum(p, axis=1, keepdims=True)
         exp_m_diff = jnp.exp(m_prev - m_curr)
@@ -1356,6 +1386,7 @@ def get_kernel_scope_name(bq_size, bkv_p, page_size):
         "k_scale",
         "v_scale",
         "xai_temperature_len",
+        "softmax_dtype",
         "chunk_prefill_size",
         "num_kv_pages_per_block",
         "num_queries_per_block",
@@ -1384,6 +1415,7 @@ def ragged_paged_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     xai_temperature_len: float | None = None,
+    softmax_dtype: jnp.dtype | None = None,
     # Kernel optimization params.
     chunk_prefill_size: int | None = None,
     # Kernel tuning params.
@@ -1447,6 +1479,7 @@ def ragged_paged_attention(
         k_scale=k_scale,
         v_scale=v_scale,
         xai_temperature_len=xai_temperature_len,
+        softmax_dtype=softmax_dtype,
         chunk_prefill_size=chunk_prefill_size,
         num_kv_pages_per_block=num_kv_pages_per_block,
         num_queries_per_block=num_queries_per_block,
@@ -1633,6 +1666,7 @@ def ragged_paged_attention(
             k_scale=k_scale,
             v_scale=v_scale,
             xai_temperature_len=xai_temperature_len,
+            softmax_dtype=softmax_dtype,
             chunk_prefill_size=chunk_prefill_size,
             bkv_p=bkv_p,
             bq_sz=bq_sz,

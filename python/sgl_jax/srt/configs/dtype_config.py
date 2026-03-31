@@ -8,6 +8,7 @@ STR_DTYPE_TO_JAX_DTYPE = {
     "float": jnp.float32,
     "float32": jnp.float32,
     "bfloat16": jnp.bfloat16,
+    "int8": jnp.int8,
 }
 
 
@@ -22,7 +23,7 @@ class DtypeConfig:
         self.config_dict = self._parse_dict(config_dict or {})
 
         # Resolve the default dtype for this level
-        self.default_dtype = self.config_dict.get("default", default_dtype)
+        self.default_dtype = self.config_dict.get("default", jnp.dtype(default_dtype))
 
     def _parse_dict(self, d: dict[str, Any]) -> dict[str, Any]:
         """Recursively parses a dictionary, converting string dtypes to jnp.dtype."""
@@ -33,7 +34,11 @@ class DtypeConfig:
             elif isinstance(v, str) and v.lower() in STR_DTYPE_TO_JAX_DTYPE:
                 parsed[k] = STR_DTYPE_TO_JAX_DTYPE[v.lower()]
             else:
-                raise ValueError(f"Unknown dtype: {v}")
+                try:
+                    # Handles both dtype instances and dtype type objects (e.g., jnp.bfloat16)
+                    parsed[k] = jnp.dtype(v)
+                except (TypeError, ValueError) as err:
+                    raise ValueError(f"Unknown dtype: {v}, provided value type: {type(v)}") from err
         return parsed
 
     def get_config(self, key: str) -> "DtypeConfig":
@@ -45,6 +50,8 @@ class DtypeConfig:
     def get_dtype(self, key: str) -> jnp.dtype | None:
         """Returns the specific dtype, or falls back to the default."""
         val = self.config_dict.get(key, self.default_dtype)
-        if not isinstance(val, jnp.dtype):
+        if isinstance(val, dict):
             return self.default_dtype
-        return val
+        if val is None:
+            return None
+        return jnp.dtype(val)
