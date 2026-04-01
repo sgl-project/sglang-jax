@@ -1,17 +1,34 @@
 import jax.numpy as jnp
 import numpy as np
+import pytest
 import torch
 from torch import nn
 
 from sgl_jax.srt.layers.layernorm import GroupRMSNorm
 
-HIDDEN_SIZE = 128
+HIDDEN_SIZE = 8192
 NUM_GROUPS = 8
+GROUP_SIZE = HIDDEN_SIZE // NUM_GROUPS  # 1024
 EPSILON = 1e-6
 SEED = 42
-BATCH_SIZE = 2
-SEQ_LEN = 16
-RTOL = 1e-6
+BATCH_SIZE = 4
+SEQ_LEN = 8
+
+# (200 trials, 3x safety margin)
+# Config: HIDDEN_SIZE=8192, NUM_GROUPS=8, GROUP_SIZE=1024
+FP32_ATOL = 8.6e-6
+FP32_RTOL = 1.4e-6
+
+# bf16: fp32 normalize → cast bf16 → weight mul
+# (200 trials, 3x safety margin)
+BF16_ATOL = 9.9e-2
+BF16_RTOL = 2.4e-2
+
+# Theoretical single-framework error bound for fp64 ground truth verification
+# Computation graph: square(1) → sum(GROUP_SIZE) → div(1) → rsqrt(1) → mul(1) → weight_mul(1)
+_eps_fp32 = float(jnp.finfo(jnp.float32).eps)  # 2^-23
+_n_ops = GROUP_SIZE + 5
+_single_framework_bound = _n_ops * _eps_fp32
 
 
 class BailingMoeV2_5GroupRMSNorm(nn.Module):
@@ -41,13 +58,17 @@ class BailingMoeV2_5GroupRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype).view(input_shape)
 
 
-def _numpy_group_rmsnorm(hidden_states, weight, num_groups, eps):
-    """Numpy reference implementation of GroupRMSNorm."""
-    orig_shape = hidden_states.shape
-    grouped = hidden_states.reshape(*orig_shape[:-1], num_groups, orig_shape[-1] // num_groups)
-    variance = np.mean(grouped**2, axis=-1, keepdims=True)
-    normalized = grouped / np.sqrt(variance + eps)
-    return weight * normalized.reshape(orig_shape)
+def _numpy_group_rmsnorm_fp64(hidden_states, weight, num_groups, eps):
+    """fp64 ground truth reference implementation."""
+    x = hidden_states.astype(np.float64)
+    w = weight.astype(np.float64)
+    orig_shape = x.shape
+    group_size = orig_shape[-1] // num_groups
+    x = x.reshape(*orig_shape[:-1], num_groups, group_size)
+    variance = np.mean(x**2, axis=-1, keepdims=True)
+    x = x / np.sqrt(variance + eps)
+    x = x.reshape(orig_shape)
+    return w * x
 
 
 def _make_input(rng, shape):
@@ -55,35 +76,35 @@ def _make_input(rng, shape):
     return rng.standard_normal(shape).astype(np.float32)
 
 
-def _make_weight(rng):
+def _make_weight(rng, hidden_size=HIDDEN_SIZE):
     """Generate random float32 weight vector."""
-    return rng.standard_normal(HIDDEN_SIZE).astype(np.float32)
+    return rng.standard_normal(hidden_size).astype(np.float32)
 
 
-def _make_jax_model(weight=None):
+def _make_jax_model(hidden_size=HIDDEN_SIZE, num_groups=NUM_GROUPS, weight=None):
     """Create a JAX GroupRMSNorm model, optionally with custom weight."""
-    model = GroupRMSNorm(HIDDEN_SIZE, num_groups=NUM_GROUPS, epsilon=EPSILON)
+    model = GroupRMSNorm(hidden_size, num_groups=num_groups, epsilon=EPSILON)
     if weight is not None:
         model.weight[...] = jnp.array(weight)
     return model
 
 
-def _make_torch_model(weight=None):
+def _make_torch_model(hidden_size=HIDDEN_SIZE, num_groups=NUM_GROUPS, weight=None):
     """Create a PyTorch GroupRMSNorm model, optionally with custom weight."""
-    model = BailingMoeV2_5GroupRMSNorm(HIDDEN_SIZE, NUM_GROUPS, eps=EPSILON)
+    model = BailingMoeV2_5GroupRMSNorm(hidden_size, num_groups, eps=EPSILON)
     if weight is not None:
         model.weight = torch.nn.Parameter(torch.from_numpy(weight))
     return model
 
 
-def _run_jax(model, input_np):
+def _run_jax(model, input_np, dtype=jnp.float32):
     """Run JAX model and return numpy array."""
-    return np.array(model(jnp.array(input_np)))
+    return np.array(model(jnp.array(input_np, dtype=dtype)))
 
 
-def _run_torch(model, input_np):
+def _run_torch(model, input_np, dtype=torch.float32):
     """Run PyTorch model and return numpy array."""
-    return model(torch.from_numpy(input_np)).detach().numpy()
+    return model(torch.tensor(input_np, dtype=dtype)).detach().float().numpy()
 
 
 class TestGroupRMSNorm:
@@ -116,7 +137,8 @@ class TestGroupRMSNorm:
         np.testing.assert_allclose(
             output_original[..., group_size:],
             output_modified[..., group_size:],
-            rtol=RTOL,
+            rtol=FP32_RTOL,
+            atol=FP32_ATOL,
         )
         # Group 0 should differ.
         assert not np.allclose(
@@ -130,11 +152,11 @@ class TestGroupRMSNorm:
         input_data = _make_input(rng, (BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE))
         weight = _make_weight(rng)
 
-        model = _make_jax_model(weight)
+        model = _make_jax_model(weight=weight)
         jax_output = _run_jax(model, input_data)
-        expected = _numpy_group_rmsnorm(input_data, weight, NUM_GROUPS, EPSILON)
+        expected = _numpy_group_rmsnorm_fp64(input_data, weight, NUM_GROUPS, EPSILON)
 
-        np.testing.assert_allclose(jax_output, expected, rtol=RTOL)
+        np.testing.assert_allclose(jax_output, expected, rtol=FP32_RTOL, atol=FP32_ATOL)
 
 
 class TestCrossFramework:
@@ -154,54 +176,125 @@ class TestCrossFramework:
         assert torch_output.shape == input_data.shape
         assert jax_output.shape == torch_output.shape
 
-    def test_values_match_with_default_weight(self):
+    _DTYPE_PARAMS = [
+        (jnp.float32, torch.float32, FP32_ATOL, FP32_RTOL),
+        (jnp.bfloat16, torch.bfloat16, BF16_ATOL, BF16_RTOL),
+    ]
+    _DTYPE_IDS = ["fp32", "bf16"]
+
+    @pytest.mark.parametrize(
+        ("jax_dtype", "torch_dtype", "atol", "rtol"), _DTYPE_PARAMS, ids=_DTYPE_IDS
+    )
+    def test_values_match_with_default_weight(self, jax_dtype, torch_dtype, atol, rtol):
         """JAX and PyTorch must produce identical output with default weights (ones)."""
         rng = np.random.default_rng(SEED)
         input_data = _make_input(rng, (BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE))
 
-        jax_output = _run_jax(_make_jax_model(), input_data)
-        torch_output = _run_torch(_make_torch_model(), input_data)
+        jax_output = _run_jax(_make_jax_model(), input_data, jax_dtype)
+        torch_output = _run_torch(_make_torch_model(), input_data, torch_dtype)
 
-        np.testing.assert_allclose(jax_output, torch_output, rtol=RTOL)
+        np.testing.assert_allclose(jax_output, torch_output, atol=atol, rtol=rtol)
 
-    def test_values_match_with_random_weight(self):
+    @pytest.mark.parametrize(
+        ("jax_dtype", "torch_dtype", "atol", "rtol"), _DTYPE_PARAMS, ids=_DTYPE_IDS
+    )
+    def test_values_match_with_random_weight(self, jax_dtype, torch_dtype, atol, rtol):
         """JAX and PyTorch must produce identical output with random weights."""
         rng = np.random.default_rng(123)
-        input_data = _make_input(rng, (BATCH_SIZE * 2, SEQ_LEN // 2, HIDDEN_SIZE))
+        input_data = _make_input(rng, (BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE))
         weight = _make_weight(rng)
 
-        jax_output = _run_jax(_make_jax_model(weight), input_data)
-        torch_output = _run_torch(_make_torch_model(weight), input_data)
+        jax_output = _run_jax(_make_jax_model(weight=weight), input_data, jax_dtype)
+        torch_output = _run_torch(_make_torch_model(weight=weight), input_data, torch_dtype)
 
-        np.testing.assert_allclose(jax_output, torch_output, rtol=RTOL)
+        np.testing.assert_allclose(jax_output, torch_output, atol=atol, rtol=rtol)
 
-    def test_values_match_with_2d_input(self):
+    @pytest.mark.parametrize(
+        ("jax_dtype", "torch_dtype", "atol", "rtol"), _DTYPE_PARAMS, ids=_DTYPE_IDS
+    )
+    def test_values_match_with_2d_input(self, jax_dtype, torch_dtype, atol, rtol):
         """Cross-framework consistency with 2D input (batch, hidden)."""
         rng = np.random.default_rng(99)
         input_data = _make_input(rng, (BATCH_SIZE * 4, HIDDEN_SIZE))
         weight = _make_weight(rng)
 
-        jax_output = _run_jax(_make_jax_model(weight), input_data)
-        torch_output = _run_torch(_make_torch_model(weight), input_data)
+        jax_output = _run_jax(_make_jax_model(weight=weight), input_data, jax_dtype)
+        torch_output = _run_torch(_make_torch_model(weight=weight), input_data, torch_dtype)
 
         assert jax_output.shape == torch_output.shape
-        np.testing.assert_allclose(jax_output, torch_output, rtol=RTOL)
+        np.testing.assert_allclose(jax_output, torch_output, atol=atol, rtol=rtol)
 
-    def test_precision_report(self):
-        """Report precision difference between JAX and PyTorch (no assertion)."""
-        rng = np.random.default_rng(123)
-        input_data = _make_input(rng, (BATCH_SIZE * 2, SEQ_LEN // 2, HIDDEN_SIZE))
-        weight = _make_weight(rng)
 
-        jax_output = _run_jax(_make_jax_model(weight), input_data)
-        torch_output = _run_torch(_make_torch_model(weight), input_data)
+class TestErrorBound:
+    """Verify each framework stays within theoretical error bound vs fp64 ground truth."""
 
-        abs_diff = np.abs(jax_output - torch_output)
-        print(f"\n{'='*50}")
-        print("  Precision diff: JAX vs PyTorch (float32)")
-        print(f"{'='*50}")
-        print(f"  max  abs diff: {abs_diff.max():.6e}")
-        print(f"  mean abs diff: {abs_diff.mean():.6e}")
-        print(f"  min  abs diff: {abs_diff.min():.6e}")
-        print(f"{'='*50}")
-        assert abs_diff.max() < RTOL, f"max abs diff {abs_diff.max():.6e} exceeds {RTOL} threshold"
+    def test_error_bound_verification(self):
+        """Both JAX and PyTorch must stay within theoretical relative error bound."""
+        max_abs_jax = 0.0
+        max_abs_torch = 0.0
+        max_rel_jax = 0.0
+        max_rel_torch = 0.0
+        sum_abs_jax = 0.0
+        sum_abs_torch = 0.0
+        sum_rel_jax = 0.0
+        sum_rel_torch = 0.0
+        n_trials = 100
+
+        for seed in range(n_trials):
+            rng = np.random.default_rng(seed)
+            input_data = _make_input(rng, (BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE))
+            weight = _make_weight(rng)
+
+            fp64_out = _numpy_group_rmsnorm_fp64(input_data, weight, NUM_GROUPS, EPSILON)
+            jax_out = _run_jax(_make_jax_model(weight=weight), input_data, jnp.float32).astype(
+                np.float64
+            )
+            torch_out = _run_torch(
+                _make_torch_model(weight=weight), input_data, torch.float32
+            ).astype(np.float64)
+
+            # Absolute error
+            abs_jax = np.max(np.abs(jax_out - fp64_out))
+            abs_torch = np.max(np.abs(torch_out - fp64_out))
+            max_abs_jax = max(max_abs_jax, abs_jax)
+            max_abs_torch = max(max_abs_torch, abs_torch)
+            sum_abs_jax += abs_jax
+            sum_abs_torch += abs_torch
+
+            # Relative error: |impl - truth| / |truth|
+            nonzero = np.abs(fp64_out) > 1e-12
+            rel_jax = np.max(
+                np.abs(jax_out[nonzero] - fp64_out[nonzero]) / np.abs(fp64_out[nonzero])
+            )
+            rel_torch = np.max(
+                np.abs(torch_out[nonzero] - fp64_out[nonzero]) / np.abs(fp64_out[nonzero])
+            )
+            max_rel_jax = max(max_rel_jax, rel_jax)
+            max_rel_torch = max(max_rel_torch, rel_torch)
+            sum_rel_jax += rel_jax
+            sum_rel_torch += rel_torch
+
+        print(f"\n{'=' * 50}")
+        print(f"  Error bound verification ({n_trials} trials)")
+        print(f"{'=' * 50}")
+        print(f"  theoretical bound:   {_single_framework_bound:.6e}")
+        print(f"  JAX  max  abs err:   {max_abs_jax:.6e}")
+        print(f"  JAX  mean abs err:   {sum_abs_jax / n_trials:.6e}")
+        print(f"  JAX  max  rel err:   {max_rel_jax:.6e}")
+        print(f"  JAX  mean rel err:   {sum_rel_jax / n_trials:.6e}")
+        print(f"  Torch max  abs err:  {max_abs_torch:.6e}")
+        print(f"  Torch mean abs err:  {sum_abs_torch / n_trials:.6e}")
+        print(f"  Torch max  rel err:  {max_rel_torch:.6e}")
+        print(f"  Torch mean rel err:  {sum_rel_torch / n_trials:.6e}")
+        print(f"{'=' * 50}")
+
+        np.testing.assert_array_less(
+            max_rel_jax,
+            _single_framework_bound,
+            err_msg=f"JAX exceeded bound: {max_rel_jax:.6e}",
+        )
+        np.testing.assert_array_less(
+            max_rel_torch,
+            _single_framework_bound,
+            err_msg=f"Torch exceeded bound: {max_rel_torch:.6e}",
+        )
