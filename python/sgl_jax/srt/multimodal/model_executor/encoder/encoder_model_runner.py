@@ -167,41 +167,14 @@ class EncoderModelRunner(BaseModelRunner):
         spec.jitted_forward = forward_wrapper
 
     
-    def mock_data(self):
-        # 初始化随机种子，用于生成逼真的浮点数 Embedding
-        key = jax.random.PRNGKey(42)
-        k1, k2, k3 = jax.random.split(key, 3)
-
-        # ---------------------------------------------------------
-        # 1. 构造 prompt_embeds_list
-        # ---------------------------------------------------------
-        # 形状分别是 (1, 768) 和 (1, 512, 4096)
-        # 使用正态分布模拟真实的文本特征向量
-        embed_1 = jax.random.normal(k1, (1, 768))
-        embed_2 = jax.random.normal(k2, (1, 512, 4096))
-
-        # Match real encoder flow: CLIP -> pooler_embeds, T5 -> prompt_embeds
-        prompt_embeds_list = [embed_2]  # T5 hidden only
-
-        # T5 attention mask (all ones for FLUX max padding)
-        mask_2 = jnp.ones((1, 512), dtype=jnp.int32)
-        prompt_masks_list = [mask_2]
-
-        # CLIP pooler output
-        pooler_embeds_list = [jax.random.normal(k3, (1, 768))]
-
-        return prompt_embeds_list, prompt_masks_list, pooler_embeds_list
-
-
     def forward(self, batch: Req) -> Req:
         all_indices = list(range(len(self.encoder_specs)))
         prompt_text = batch.prompt or batch.origin_input_text
         if prompt_text is not None:
-            # prompt_embeds_list, prompt_masks_list, pooler_embeds_list = self.encode_text(
-            #     prompt_text,
-            #     encoder_index=all_indices,
-            # )
-            prompt_embeds_list, prompt_masks_list, pooler_embeds_list = self.mock_data()
+            prompt_embeds_list, prompt_masks_list, pooler_embeds_list = self.encode_text(
+                prompt_text,
+                encoder_index=all_indices,
+            )
             self._assign_prompt_outputs(
                 batch=batch,
                 embeds_list=prompt_embeds_list,
@@ -211,11 +184,10 @@ class EncoderModelRunner(BaseModelRunner):
             )
 
         if batch.do_classifier_free_guidance and batch.negative_prompt is not None:
-            # neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.encode_text(
-            #     batch.negative_prompt,
-            #     encoder_index=all_indices,
-            # )
-            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.mock_data()
+            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.encode_text(
+                batch.negative_prompt,
+                encoder_index=all_indices,
+            )
             self._assign_prompt_outputs(
                 batch=batch,
                 embeds_list=neg_embeds_list,
