@@ -1,6 +1,5 @@
 import logging
 import math
-from contextlib import suppress
 from typing import Any
 
 import jax
@@ -36,25 +35,6 @@ _SUPPORTED_ATTENTION_IMPLS = ("usp", "sdpa")
 
 def _resolve_rngs(rngs: nnx.Rngs | None) -> nnx.Rngs:
     return rngs or nnx.Rngs(0)
-
-
-# def _resolve_mesh(mesh: Mesh | None) -> Mesh:
-#     if mesh is None:
-#         devices = np.array(jax.devices()).reshape((1, -1))
-#         try:
-#             mesh = Mesh(
-#                 devices,
-#                 ("data", "tensor"),
-#                 axis_types=(
-#                     jax.sharding.AxisType.Explicit,
-#                     jax.sharding.AxisType.Explicit,
-#                 ),
-#             )
-#         except TypeError:
-#             mesh = Mesh(devices, ("data", "tensor"))
-#     with suppress(AttributeError):
-#         jax.set_mesh(mesh)
-#     return mesh
 
 
 def _no_shard(x: jax.Array, mesh: Mesh | None) -> jax.Array:

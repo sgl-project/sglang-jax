@@ -93,16 +93,13 @@ class VaeModelRunner(BaseModelRunner):
         self.jitted_decode = decode_wrapper
 
     def forward(self, x: jax.Array, mode: str):
-        cache_miss_count = 0
-        import jax._src.test_util as jtu
-
-        with jtu.count_pjit_cpp_cache_miss() as count:
-            if mode == "encode":
-                output = self.jitted_encode(x)
-            elif mode == "decode":
-                output = self.jitted_decode(x)
-            cache_miss_count = count()
-        return output, cache_miss_count
+        if mode == "encode":
+            output = self.jitted_encode(x)
+        elif mode == "decode":
+            output = self.jitted_decode(x)
+        else:
+            raise ValueError(f"Unsupported VAE mode: {mode}")
+        return output
 
     def mock_data(self, batch) -> object:
         """Generate mock VAE decode output (random image) for debugging."""

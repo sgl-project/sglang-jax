@@ -17,7 +17,6 @@ from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.server_args import ServerArgs
-from sgl_jax.srt.multimodal.models.encoders.base import BaseEncoderOutput
 
 logger = logging.getLogger(__name__)
 
@@ -133,35 +132,26 @@ class EncoderModelRunner(BaseModelRunner):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             kwargs = {}
-            if use_input_ids:
-                kwargs["input_ids"] = input_ids
-                kwargs["attention_mask"] = attention_mask
-            else:
-                kwargs["input_ids"] = input_ids
-                kwargs["attention_mask"] = attention_mask
+            kwargs["input_ids"] = input_ids
+            kwargs["attention_mask"] = attention_mask
             if use_output_hidden_states:
                 kwargs["output_hidden_states"] = True
             if use_cache:
                 kwargs["use_cache"] = False
             outputs = model(**kwargs)
             # Return as dict of arrays for JIT compatibility
-            # (BaseEncoderOutput is not a registered JAX pytree)
             return {
                 "last_hidden_state": outputs.last_hidden_state,
                 "pooler_output": outputs.pooler_output,
             }
 
         def forward_wrapper(input_ids: jax.Array, attention_mask: jax.Array):
-            result = forward(
+            return forward(
                 model_def,
                 model_state_def,
                 model_state_leaves,
                 input_ids,
                 attention_mask,
-            )
-            return BaseEncoderOutput(
-                last_hidden_state=result["last_hidden_state"],
-                pooler_output=result["pooler_output"],
             )
 
         spec.jitted_forward = forward_wrapper
@@ -195,25 +185,6 @@ class EncoderModelRunner(BaseModelRunner):
                 pooler_embeds_list=neg_pooler_embeds_list,
                 is_negative=True,
             )
-
-        # === Stage 0 alignment instrumentation ===
-        import numpy as np
-        save_dict = {}
-        if hasattr(batch, "prompt_embeds") and batch.prompt_embeds is not None:
-            pe = batch.prompt_embeds
-            if isinstance(pe, list):
-                for i, p in enumerate(pe):
-                    save_dict[f"prompt_embeds_{i}"] = np.array(p, dtype=np.float32)
-            else:
-                save_dict["prompt_embeds"] = np.array(pe, dtype=np.float32)
-        if hasattr(batch, "pooled_embeds") and batch.pooled_embeds is not None:
-            for i, p in enumerate(batch.pooled_embeds):
-                save_dict[f"pooled_embeds_{i}"] = np.array(p, dtype=np.float32)
-        if save_dict:
-            np.savez("/tmp/flux_stage0_tpu_server.npz", **save_dict)
-            logger.info("Saved Stage 0 outputs to /tmp/flux_stage0_tpu_server.npz: %s",
-                        {k: v.shape for k, v in save_dict.items()})
-        # === End instrumentation ===
 
         return batch
 
@@ -307,14 +278,9 @@ class EncoderModelRunner(BaseModelRunner):
     def _postprocess_encoder_outputs(
         self,
         spec: _EncoderSpec,
-        outputs: BaseEncoderOutput,
+        outputs: dict[str, jax.Array],
         text_inputs: dict[str, jax.Array],
     ) -> tuple[jax.Array | None, str]:
-        if not isinstance(outputs, BaseEncoderOutput):
-            raise TypeError(
-                f"Expected BaseEncoderOutput from _forward_encoder, got {type(outputs)!r}"
-            )
-
         model_class_name = getattr(spec.model_class, "__name__", str(spec.model_class))
 
         if "T5" in model_class_name:
@@ -322,29 +288,29 @@ class EncoderModelRunner(BaseModelRunner):
         if "CLIP" in model_class_name:
             return self.clip_postprocess_text(outputs, text_inputs), "pooler"
 
-        if outputs.last_hidden_state is not None:
-            return outputs.last_hidden_state, "hidden_states"
-        if outputs.pooler_output is not None:
-            return outputs.pooler_output, "pooler"
+        if outputs["last_hidden_state"] is not None:
+            return outputs["last_hidden_state"], "hidden_states"
+        if outputs["pooler_output"] is not None:
+            return outputs["pooler_output"], "pooler"
         return None, "hidden_states"
 
     @staticmethod
     def t5_postprocess_text(
-        outputs: BaseEncoderOutput,
+        outputs: dict[str, jax.Array],
         _text_inputs: dict[str, jax.Array],
     ) -> jax.Array:
-        if outputs.last_hidden_state is None:
+        if outputs["last_hidden_state"] is None:
             raise ValueError("T5 encoder output does not contain last_hidden_state.")
-        return outputs.last_hidden_state
+        return outputs["last_hidden_state"]
 
     @staticmethod
     def clip_postprocess_text(
-        outputs: BaseEncoderOutput,
+        outputs: dict[str, jax.Array],
         _text_inputs: dict[str, jax.Array],
     ) -> jax.Array:
-        if outputs.pooler_output is None:
+        if outputs["pooler_output"] is None:
             raise ValueError("CLIP encoder output does not contain pooler_output.")
-        return outputs.pooler_output
+        return outputs["pooler_output"]
 
     def _tokenize_text(self, spec: _EncoderSpec, text: str | list[str], encoder_idx: int = 0) -> dict[str, jax.Array]:
         if spec.max_length is None:

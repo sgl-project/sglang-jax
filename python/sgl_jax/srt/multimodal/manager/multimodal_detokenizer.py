@@ -100,7 +100,6 @@ class MultimodalDetokenizer(DetokenizerManager):
 
         # Save outputs if requested
         if req.save_output:
-            # if req.output_file_name:
             if req.data_type == DataType.VIDEO:
                 req.output_file_name = req.rid + ".mp4"
                 imageio.mimsave(

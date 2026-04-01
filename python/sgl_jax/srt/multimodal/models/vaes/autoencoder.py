@@ -13,17 +13,16 @@ from sgl_jax.srt.multimodal.configs.vaes.flux_vae_config import FluxVAEConfig
 from sgl_jax.srt.multimodal.models.vaes.common import Decoder, Encoder
 from sgl_jax.srt.multimodal.models.vaes.flux_vae_weight_mappings import to_mappings
 from sgl_jax.srt.multimodal.models.wan.vaes.commons import DiagonalGaussianDistribution
-from sgl_jax.srt.multimodal.utils import BaseOutput
 from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 
 @dataclass
-class DecoderOutput(BaseOutput):
+class DecoderOutput:
     sample: jax.Array
 
 
 @dataclass
-class AutoencoderKLOutput(BaseOutput):
+class AutoencoderKLOutput:
     latent_dist: DiagonalGaussianDistribution
 
 

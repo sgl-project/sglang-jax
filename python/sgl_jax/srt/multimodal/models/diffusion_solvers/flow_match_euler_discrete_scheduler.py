@@ -6,7 +6,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.multimodal.utils import BaseOutput
 
 try:
     import scipy.stats
@@ -15,7 +14,7 @@ except ImportError:  # pragma: no cover
 
 
 @dataclass
-class FlowMatchEulerDiscreteSchedulerOutput(BaseOutput):
+class FlowMatchEulerDiscreteSchedulerOutput:
     prev_sample: jax.Array
 
 

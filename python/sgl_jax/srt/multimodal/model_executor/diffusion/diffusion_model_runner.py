@@ -226,7 +226,7 @@ class DiffusionModelRunner(BaseModelRunner):
         self.solver.set_timesteps(sigmas=sigmas, mu=mu)
 
         # 7. Build guidance tensor (embedded_cfg_scale=3.5 for FLUX.1-dev)
-        embedded_cfg_scale = 3.5
+        embedded_cfg_scale = getattr(batch, 'guidance_scale', 3.5)
         guidance = jnp.full((1,), embedded_cfg_scale)
 
         # 8. Move to device
@@ -327,7 +327,6 @@ class DiffusionModelRunner(BaseModelRunner):
         )
         self.solver.set_begin_index(0)
         start_time = time.time()
-        import jax._src.test_util as jtu
 
         for step in tqdm(range(num_inference_steps), desc="Diffusion steps"):
             if abort_checker is not None and abort_checker():
@@ -343,16 +342,13 @@ class DiffusionModelRunner(BaseModelRunner):
                 latents = jnp.concatenate([latents] * 2, axis=0)
             t_batch = jnp.broadcast_to(t_scalar, (latents.shape[0],))
             latents_cf = latents.transpose(0, 4, 1, 2, 3)
-            with jtu.count_pjit_cpp_cache_miss() as count:
-                noise_pred: jax.Array = self.jitted_forward(
-                    hidden_states=latents_cf,
-                    encoder_hidden_states=text_embeds,
-                    timesteps=t_batch,
-                    encoder_hidden_states_image=None,
-                    guidance_scale=None,
-                )
-                if count() > 0:
-                    logger.info("diffusion cache miss count: %d", count())
+            noise_pred: jax.Array = self.jitted_forward(
+                hidden_states=latents_cf,
+                encoder_hidden_states=text_embeds,
+                timesteps=t_batch,
+                encoder_hidden_states_image=None,
+                guidance_scale=None,
+            )
             if do_classifier_free_guidance:
                 bsz = latents.shape[0] // 2
                 noise_uncond = noise_pred[bsz:]
@@ -366,9 +362,6 @@ class DiffusionModelRunner(BaseModelRunner):
                 return_dict=False,
             )[0]
             latents = latents.transpose(0, 2, 3, 4, 1)
-            debug_data[f"step{step}_t"] = float(t)
-            debug_data[f"step{step}_noise_pred"] = jax.device_get(noise_pred)
-            debug_data[f"step{step}_latents"] = jax.device_get(latents)
 
             if step_callback is not None:
                 step_callback()
@@ -385,7 +378,7 @@ class DiffusionModelRunner(BaseModelRunner):
         if batch.num_frames is not None:
             assert (batch.num_frames - 1) % self.model_config.scale_factor_temporal == 0
         latents = jax.random.normal(
-            jax.random.PRNGKey(46),
+            jax.random.PRNGKey(batch.seed or 42),
             (
                 1,
                 (
