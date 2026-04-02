@@ -458,7 +458,7 @@ suites = {
         TestFile("python/sgl_jax/test/multimodal/test_vae_scheduler.py", 2),
         TestFile("python/sgl_jax/test/multimodal/test_flash_attention_kernel.py", 2),
         TestFile(
-            "python/sgl_jax/test/test_group_rmsnorm.py",
+            "python/sgl_jax/test/layers/test_group_rmsnorm.py",
             1,
             runner="pytest",
             extra_deps=["torch"],
