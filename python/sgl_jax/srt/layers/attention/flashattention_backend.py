@@ -76,7 +76,7 @@ class FlashAttention(AttentionBackend):
         head_dim,
         vmem_limit_bytes: int = 64 * (1 << 20),  # 64MB
         page_size: int = 1,
-        chunked_prefill_size: int = 4096,
+        # chunked_prefill_size: int = 4096,
         kv_partition_axis: str = "tensor",
         mesh: jax.sharding.Mesh = None,
         max_context_len: int = 131072,
@@ -93,11 +93,11 @@ class FlashAttention(AttentionBackend):
         self.kv_partition_axis = kv_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
-        assert (
-            chunked_prefill_size is not None and chunked_prefill_size > 0
-        ), f"chunked_prefill_size must be a positive integer, got {chunked_prefill_size}"
-        self.chunked_prefill_size = chunked_prefill_size
-        print(f"chunked_prefill_size: {chunked_prefill_size}")
+        # assert (
+        #     chunked_prefill_size is not None and chunked_prefill_size > 0
+        # ), f"chunked_prefill_size must be a positive integer, got {chunked_prefill_size}"
+        # self.chunked_prefill_size = chunked_prefill_size
+        # print(f"chunked_prefill_size: {chunked_prefill_size}")
 
     def get_forward_metadata(
         self,
@@ -159,7 +159,7 @@ class FlashAttention(AttentionBackend):
                 [num_seqs.item(), num_seqs.item(), num_seqs.item()], dtype=np.int32
             )
         elif batch.forward_mode == ForwardMode.EXTEND:
-            # TODO (Qinghan): we probably don't want to use MIXED when it is prefill
+            # Qinghan: in this place we can't use
             distribution = np.array([0, 0, num_seqs.item()], dtype=np.int32)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
@@ -378,7 +378,7 @@ class FlashAttention(AttentionBackend):
             "head_dim": self.head_dim,
             "page_size": self.page_size,
             "pages_per_seq": self.pages_per_seq,
-            "chunked_prefill_size": self.chunked_prefill_size,
+            # "chunked_prefill_size": self.chunked_prefill_size,
         }
         return (children, aux_data)
 
@@ -390,7 +390,7 @@ class FlashAttention(AttentionBackend):
             aux_data["head_dim"],
             aux_data["vmem_limit_bytes"],
             aux_data["page_size"],
-            aux_data["chunked_prefill_size"],
+            # aux_data["chunked_prefill_size"],
         )
         obj.pages_per_seq = aux_data[
             "pages_per_seq"
@@ -441,7 +441,7 @@ class FlashAttention(AttentionBackend):
             num_pages, self.page_size, num_kv_heads_x2, padded_head_dim
         )
 
-        chunk_prefill_size = self.chunked_prefill_size
+        # chunk_prefill_size = self.chunked_prefill_size
 
         xai_temp_len = getattr(layer, "xai_temperature_len", None)
         if xai_temp_len is not None and xai_temp_len <= 0:
@@ -495,7 +495,7 @@ class FlashAttention(AttentionBackend):
                 sliding_window=layer.sliding_window_size,
                 soft_cap=layer.logit_cap,
                 xai_temperature_len=xai_temp_len,
-                chunk_prefill_size=chunk_prefill_size,
+                # chunk_prefill_size=chunk_prefill_size,
             )
 
             updated_kv_cache_4d = updated_kv_cache_5d.reshape(

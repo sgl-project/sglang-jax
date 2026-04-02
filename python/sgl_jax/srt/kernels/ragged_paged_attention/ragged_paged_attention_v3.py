@@ -36,8 +36,6 @@ from sgl_jax.srt.kernels.ragged_paged_attention.util import (
     next_power_of_2,
 )
 
-DEFAULT_VMEM_LIMIT_BYTES = 120 * 1024 * 1024
-
 
 class RpaCase(Enum):
     """Represents the different cases for Ragged Paged Attention.
@@ -98,7 +96,7 @@ def ref_ragged_paged_attention(
 
     if mask_value is None:
         # We do not set to -inf directly because (-inf) - (-inf) is nan.
-        mask_value = -float(jnp.finfo(out_dtype).max)
+        mask_value = jnp.finfo(out_dtype).min
     # dynamic_validate_inputs(
     #     queries,
     #     keys,
@@ -138,9 +136,7 @@ def ref_ragged_paged_attention(
     assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
     outputs = []
-    # jax.debug.print("distribution: {distribution}", distribution=distribution)
-    # jax.debug.print("distribution shape: {dist_shape}", dist_shape=distribution.shape)
-    # print(f"distribution: {distribution}")
+
     for i in range(distribution[-1]):
         q_start = cu_q_lens[i]
         q_end = cu_q_lens[i + 1]
@@ -1520,8 +1516,7 @@ def get_default_block_sizes(
     }
 
 
-@functools.partial(
-    jax.jit,
+@jax.jit(
     static_argnames=(
         "use_causal_mask",
         "skip_kv_mask",
@@ -1632,17 +1627,13 @@ def ragged_paged_attention(
 
     if mask_value is None:
         # We do not set to -inf directly because (-inf) - (-inf) is nan.
-        mask_value = -float(jnp.finfo(out_dtype).max)
+        mask_value = jnp.finfo(out_dtype).min
 
     if vmem_limit_bytes is None:
         # TODO(jevinjiang, jacobplatin): change this to use
         # `get_vmem_estimate_bytes` when VREG spilling is fixed.
-        vmem_limit_bytes = DEFAULT_VMEM_LIMIT_BYTES
-
-    # jax.debug.print("distribution: {distribution}", distribution=distribution)
-    # jax.debug.print("cu_q_lens: {cu_q_lens}", cu_q_lens=cu_q_lens)
-    # jax.debug.print("kv_lens: {kv_lens}", kv_lens=kv_lens)
-    # jax.debug.print("page_indices: {page_indices}", page_indices=page_indices)
+        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+        vmem_limit_bytes = 60 * 1024 * 1024
 
     static_validate_inputs(
         q,
@@ -1691,11 +1682,6 @@ def ragged_paged_attention(
     assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
     num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_q_packing * q_packing
-
-    if vmem_limit_bytes is None:
-        # TODO(jevinjiang, jacobplatin): change this to use
-        # `get_vmem_estimate_bytes` when VREG spilling is fixed.
-        vmem_limit_bytes = DEFAULT_VMEM_LIMIT_BYTES
 
     # (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
     init_sem_ids = jnp.zeros((3,), jnp.int32)
@@ -1811,7 +1797,7 @@ def ragged_paged_attention(
                 # TODO(jevinjiang): since each sequence depends on the previous
                 # one, we need some extra work to support Megacore mode.
                 dimension_semantics=("arbitrary",),
-                vmem_limit_bytes=vmem_limit_bytes,
+                vmem_limit_bytes=60 * 1024 * 1024,
                 # Paged attention invokes multiple small DMAs for each pages
                 # instead of a single large DMA. Therefore, the overhead of bounds
                 # checking becomes too significant so we disable it.
@@ -1881,17 +1867,15 @@ def ragged_paged_attention(
         static_q_len=1,
         case=RpaCase.DECODE,
     )
-    if chunk_prefill_size is not None:
-        # Prefill-only
-        # print(f"Running prefill kernel with chunk_prefill_size: {chunk_prefill_size}")
-        # jax.debug.print("Running prefill kernel with chunk_prefill_size: {chunk_prefill_size}", chunk_prefill_size=chunk_prefill_size)
-        q, kv_cache = run_rpa_kernel(
-            q,
-            kv_cache,
-            **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
-            static_q_len=chunk_prefill_size,
-            case=RpaCase.PREFILL,
-        )
+
+    # TODO:
+    # q, kv_cache = run_rpa_kernel(
+    #     q,
+    #     kv_cache,
+    #     **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
+    #     static_q_len=128,
+    #     case=RpaCase.PREFILL,
+    # )
     # Mixed
     q, kv_cache = run_rpa_kernel(
         q,

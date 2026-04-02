@@ -516,6 +516,118 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                 sliding_window=-1,
             )
 
+    def test_ragged_paged_attention_grok_single_prefill(self):
+        """Reproduce the exact input configuration captured in record.txt.
+
+        Single prefill sequence: q_len=10, kv_len=10, num_q_heads=8,
+        num_kv_heads=1, head_dim=128, page_size=128, soft_cap=30.0,
+        xai_temperature_len=1024, max_num_seq=128.
+        """
+        seq_lens = [(10, 10)]
+        num_heads = (8, 1)
+        head_dim = 128
+        page_size = 128
+        num_pages = 16724
+        dtype = jnp.bfloat16
+
+        rng = np.random.default_rng(1234)
+
+        def gen_random(shape, dtype):
+            return jnp.array(rng.random(size=shape, dtype=np.float32)).astype(dtype)
+
+        if not jtu.is_device_tpu_at_least(version=4):
+            self.skipTest("Expect TPUv4+")
+
+        cu_q_lens = [0]
+        kv_lens = []
+        for q_len, kv_len in seq_lens:
+            assert q_len <= kv_len
+            cu_q_lens.append(cu_q_lens[-1] + q_len)
+            kv_lens.append(kv_len)
+
+        max_num_batched_tokens = max(align_to(cu_q_lens[-1], 128), 128)
+        max_num_seq = 128
+        max_kv_len = max(kv_lens)
+        pages_per_seq = cdiv(max_kv_len, page_size)
+        num_q_heads, num_kv_heads = num_heads
+
+        q = gen_random((max_num_batched_tokens, num_q_heads, head_dim), dtype)
+        k = gen_random((max_num_batched_tokens, num_kv_heads, head_dim), dtype)
+        v = gen_random((max_num_batched_tokens, num_kv_heads, head_dim), dtype)
+
+        kv_packing = get_dtype_packing(dtype)
+        padded_head_dim = align_to(head_dim, 128)
+        num_kv_heads_x2 = align_to(num_kv_heads * 2, kv_packing)
+        page_cnt = 0
+        page_indices_list = []
+        kv_pages_list = []
+        for kv_len_val in kv_lens:
+            kv = gen_random(
+                (kv_len_val, num_kv_heads_x2 // kv_packing, kv_packing, padded_head_dim),
+                dtype,
+            )
+            kv = jnp.pad(
+                kv,
+                ((0, cdiv(kv_len_val, page_size) * page_size - kv_len_val), (0, 0), (0, 0), (0, 0)),
+                constant_values=jnp.nan,
+            ).reshape(-1, page_size, num_kv_heads_x2 // kv_packing, kv_packing, padded_head_dim)
+            indices = page_cnt + jnp.arange(kv.shape[0], dtype=jnp.int32)
+            indices = jnp.pad(
+                indices,
+                ((0, pages_per_seq - indices.shape[0]),),
+                constant_values=jnp.nan,
+            )
+            page_indices_list.append(indices)
+            page_cnt += kv.shape[0]
+            kv_pages_list.append(kv)
+
+        kv_cache = jnp.concatenate(kv_pages_list, axis=0)
+        kv_cache = jnp.pad(
+            kv_cache,
+            ((0, num_pages - kv_cache.shape[0]), (0, 0), (0, 0), (0, 0), (0, 0)),
+            constant_values=jnp.nan,
+        )
+        page_indices = jnp.stack(page_indices_list, axis=0)
+        page_indices = jnp.pad(
+            page_indices,
+            ((0, max_num_seq - page_indices.shape[0]), (0, 0)),
+            constant_values=jnp.nan,
+        )
+        page_indices = page_indices.reshape(-1)
+
+        cu_q_lens = jnp.array(cu_q_lens, dtype=jnp.int32)
+        cu_q_lens = jnp.pad(cu_q_lens, (0, max_num_seq + 1 - cu_q_lens.shape[0]))
+        kv_lens_arr = jnp.array(kv_lens, dtype=jnp.int32)
+        kv_lens_arr = jnp.pad(kv_lens_arr, (0, max_num_seq - kv_lens_arr.shape[0]))
+
+        distribution = jnp.array([0, 1, 1], dtype=jnp.int32)
+
+        sm_scale = 0.08838834764831845
+        soft_cap = 30.0
+        xai_temperature_len = 1024
+
+        args = (q, k, v, kv_cache, kv_lens_arr, page_indices, cu_q_lens, distribution)
+
+        kwargs = {
+            "use_causal_mask": True,
+            "sm_scale": sm_scale,
+            "soft_cap": soft_cap,
+            "xai_temperature_len": xai_temperature_len,
+        }
+
+        expected, expected_kv_cache = ref_ragged_paged_attention(*args, **kwargs)
+
+        output, updated_kv_cache = ragged_paged_attention(
+            *args, **kwargs, vmem_limit_bytes=60 * 1024 * 1024
+        )
+        output = output[: cu_q_lens[distribution[-1]]]
+
+        tol = 0.2
+        self.assertAllClose(output, expected, atol=tol, rtol=tol)
+        mask = ~jnp.isnan(expected_kv_cache)
+        self.assertArraysEqual(updated_kv_cache[mask], expected_kv_cache[mask])
+        self.assertEqual(output.shape[-1], head_dim)
+
     def test_ragged_paged_attention_soft_cap_cannot_be_zero(self):
         dtype = jnp.float32
         seq_lens = [(192, 328), (128, 180), (64, 255)]
