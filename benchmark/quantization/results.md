@@ -8,6 +8,20 @@
 
 ---
 
+## HLO 观察到的实际 Quantized Matmul Cases
+
+以下 3 个 case 来自模型实际编译产生的 HLO，均为 TP=1 场景：
+
+| HLO Kernel | 计算 (X × W^T → Out) | 对应 Projection | BF16 (ms) | FP8 (ms) | Speedup |
+|---|---|---|---|---|---|
+| `quantized_matmul_kernel_128_256_128` | `bf16[2048, 4096] × f8e4m3fn[768, 4096]^T → bf16[2048, 768]` | k_proj (full attn, tokens=2048) | 0.248 | 0.964 | 0.26x |
+| `quantized_matmul_kernel_128_256_128` | `bf16[2048, 4096] × f8e4m3fn[1024, 4096]^T → bf16[2048, 1024]` | v_proj (SWA, tokens=2048) | 0.278 | 1.212 | 0.23x |
+| `quantized_matmul_kernel_64_256_128` | `bf16[64, 4096] × f8e4m3fn[768, 4096]^T → bf16[64, 768]` | k_proj (full attn, tokens=64) | 0.206 | 0.246 | 0.84x |
+
+> kernel 名中的数字为 Pallas tiling 参数 (block_m, block_n, block_k)。Weight 以转置形式 `[out, in]` 存储。
+
+---
+
 ## 结论
 
 **FP8 block-128 在 TPU v6e 上全面落后于 BF16**。
