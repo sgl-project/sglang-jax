@@ -465,7 +465,11 @@ class Grok1Attention(nnx.Module):
             return hidden_states, hidden_states
 
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = jnp.split(qkv, [self.q_size, self.q_size + self.kv_size], axis=-1)
+        q = jax.lax.slice_in_dim(qkv, 0, self.q_size, axis=-1)
+        k = jax.lax.slice_in_dim(qkv, self.q_size, self.q_size + self.kv_size, axis=-1)
+        v = jax.lax.slice_in_dim(
+            qkv, self.q_size + self.kv_size, self.q_size + 2 * self.kv_size, axis=-1
+        )
 
         q, k = self.rotary_emb(positions, q, k)
 
