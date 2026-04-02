@@ -1,10 +1,26 @@
+import os
+
+os.environ["JAX_PLATFORMS"] = "cpu"
+
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
 from torch import nn
 
-from sgl_jax.srt.layers.layernorm import GroupRMSNorm
+from sgl_jax.srt.layers.attention.fla.layernorm_gated import GroupRMSNorm
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _enforce_cpu():
+    """Ensure both JAX and PyTorch run on CPU."""
+    jax_backend = jax.default_backend()
+    torch_device = torch.tensor(0).device
+    print(f"\n[unit test device] JAX backend: {jax_backend}, PyTorch device: {torch_device}")
+    assert jax_backend == "cpu", f"Expected JAX backend 'cpu', got '{jax_backend}'"
+    assert torch.device("cpu") == torch_device, "PyTorch default device is not CPU"
+
 
 HIDDEN_SIZE = 8192
 NUM_GROUPS = 8
@@ -102,9 +118,10 @@ def _run_jax(model, input_np, dtype=jnp.float32):
     return np.array(model(jnp.array(input_np, dtype=dtype)))
 
 
-def _run_torch(model, input_np, dtype=torch.float32):
+def _run_torch(model, input_np, dtype=torch.float32, device="cpu"):
     """Run PyTorch model and return numpy array."""
-    return model(torch.tensor(input_np, dtype=dtype)).detach().float().numpy()
+    model = model.to(device)
+    return model(torch.tensor(input_np, dtype=dtype, device=device)).detach().float().cpu().numpy()
 
 
 class TestGroupRMSNorm:
@@ -123,11 +140,10 @@ class TestGroupRMSNorm:
     def test_groups_are_independent(self):
         """Modifying one group must not affect other groups' outputs."""
         rng = np.random.default_rng(SEED)
-        group_size = HIDDEN_SIZE // NUM_GROUPS
 
         input_original = _make_input(rng, (1, 1, HIDDEN_SIZE))
         input_modified = input_original.copy()
-        input_modified[..., :group_size] = _make_input(rng, (group_size,))  # perturb group 0 only
+        input_modified[..., :GROUP_SIZE] = _make_input(rng, (GROUP_SIZE,))  # perturb group 0 only
 
         model = _make_jax_model()
         output_original = _run_jax(model, input_original)
@@ -135,15 +151,15 @@ class TestGroupRMSNorm:
 
         # Groups 1~7 should be identical.
         np.testing.assert_allclose(
-            output_original[..., group_size:],
-            output_modified[..., group_size:],
+            output_original[..., GROUP_SIZE:],
+            output_modified[..., GROUP_SIZE:],
             rtol=FP32_RTOL,
             atol=FP32_ATOL,
         )
         # Group 0 should differ.
         assert not np.allclose(
-            output_original[..., :group_size],
-            output_modified[..., :group_size],
+            output_original[..., :GROUP_SIZE],
+            output_modified[..., :GROUP_SIZE],
         )
 
     def test_weight_participates_in_computation(self):
