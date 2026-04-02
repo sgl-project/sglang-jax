@@ -28,6 +28,9 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import os
+import random
+import string
 import traceback
 from dataclasses import dataclass
 from functools import partial
@@ -39,7 +42,7 @@ from flax import nnx
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from benchmark.utils import multiple_iteration_timeit_from_trace
+from sgl_jax.srt.kernels.utils.perf import _load_trace
 from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
@@ -115,6 +118,17 @@ def _make_quant_config(
 BF16_BASELINE = QuantConfig("bf16_baseline", None, None, None)
 
 
+def _extract_kernel_durations_ms(trace: dict, scope_name: str) -> list[float]:
+    """Extract kernel-level device durations by matching scope_name in tf_op field."""
+    durations: list[float] = []
+    for e in trace.get("traceEvents", []):
+        args = e.get("args", {})
+        tf_op = args.get("tf_op", "")
+        if scope_name in tf_op and "device_duration_ps" in args:
+            durations.append(float(args["device_duration_ps"]) / 1e9)
+    return durations
+
+
 def build_mesh(tp_size: int) -> Mesh:
     devices = jax.devices()[:tp_size]
     if len(devices) < tp_size:
@@ -185,18 +199,30 @@ def benchmark_single(
             out, _ = layer(x)
             return out
 
-        task = f"quant_linear_{quant.name}"
+        # Use the layer's scope_name to match kernel-level time from trace
+        # BF16 LinearBase -> "linear_base", FP8 QuantizedLinear -> "quantized_linear_base"
+        scope_name = "linear_base" if is_baseline else "quantized_linear_base"
 
         def compute():
             return forward(x, state_treedef=state_treedef, state_leaves=state_leaves)
 
-        times = multiple_iteration_timeit_from_trace(
-            compute_func=lambda: compute(),
-            data_generator=lambda: (),
-            task=task,
-            tries=tries,
-            warmup=warmup,
-        )
+        # Manual warmup
+        for _ in range(warmup):
+            out = compute()
+            jax.block_until_ready(out)
+
+        # Profile without MARKER scope — extract kernel time via tf_op matching
+        trace_tag = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        trace_dir = f"/tmp/quant_linear_trace/{scope_name}_{trace_tag}"
+        os.makedirs(trace_dir, exist_ok=True)
+
+        with jax.profiler.trace(trace_dir):
+            for _ in range(tries):
+                out = compute()
+                jax.block_until_ready(out)
+
+        trace = _load_trace(trace_dir)
+        times = _extract_kernel_durations_ms(trace, scope_name)
 
     if len(times) > 1:
         times = times[1:]

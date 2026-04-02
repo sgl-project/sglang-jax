@@ -26,42 +26,22 @@
 - Issues:
   1. TP>1 AxisType.Auto 错误 → 改用 `create_device_mesh` 创建 Explicit axes mesh 解决
   2. 所有 FP8 配置均报 "Couldn't find tuned sizes" → `tuned_block_sizes.py` 仅有 INT8 条目，FP8 on v6 无预调优
-- 结论: FP8 block-128 在 TPU v6e 上性能远低于 BF16 (0.03x-0.73x)，根本原因是缺少 tuned block sizes
+- 结论: FP8 block-128 在 TPU v6e 上性能远低于 BF16，根本原因是缺少 tuned block sizes
+- 注意: 初版使用 jit scope 时间，后修正为 kernel-level device_duration_ps（从 profiler trace 提取）
 
 ### Run 2: k_proj Full Attention [4096, 768] column-parallel
 
-- Start:
-- Command: `python -m benchmark.quantization.bench_quantized_linear --hidden-size 4096 --intermediate-size 768 --tokens 1 128 256 512 1024 2048 4096 --weight-dtype fp8 --act-dtype none --block-size 128 --tp-size 1 2 --parallel-mode column --warmup 3 --tries 10`
-- Status:
-- Issues:
+- Start: 2026-04-02
+- Command: `python -m benchmark.quantization.bench_quantized_linear --hidden-size 4096 --intermediate-size 768 --tokens 1 64 128 256 512 1024 2048 4096 --weight-dtype fp8 --act-dtype none --block-size 128 --tp-size 1 2 --parallel-mode column --warmup 3 --tries 10`
+- Status: **完成**（TP=4 跳过，768/4=192 不整除 block_size=128）
+- Issues: 同 Run 1，FP8 无 tuned sizes
 
-### Run 3: k_proj SWA [4096, 1536] column-parallel
+### Run 3: v_proj SWA [4096, 1024] column-parallel
 
-- Start:
-- Command: `python -m benchmark.quantization.bench_quantized_linear --hidden-size 4096 --intermediate-size 1536 --tokens 1 128 256 512 1024 2048 4096 --weight-dtype fp8 --act-dtype none --block-size 128 --tp-size 1 2 4 --parallel-mode column --warmup 3 --tries 10`
-- Status:
-- Issues:
-
-### Run 4: v_proj Full Attention [4096, 512] column-parallel
-
-- Start:
-- Command: `python -m benchmark.quantization.bench_quantized_linear --hidden-size 4096 --intermediate-size 512 --tokens 1 128 256 512 1024 2048 4096 --weight-dtype fp8 --act-dtype none --block-size 128 --tp-size 1 2 4 --parallel-mode column --warmup 3 --tries 10`
-- Status:
-- Issues:
-
-### Run 5: v_proj SWA [4096, 1024] column-parallel
-
-- Start:
+- Start: 2026-04-02
 - Command: `python -m benchmark.quantization.bench_quantized_linear --hidden-size 4096 --intermediate-size 1024 --tokens 1 128 256 512 1024 2048 4096 --weight-dtype fp8 --act-dtype none --block-size 128 --tp-size 1 2 4 --parallel-mode column --warmup 3 --tries 10`
-- Status:
-- Issues:
-
-### Run 6: o_proj [8192, 4096] row-parallel
-
-- Start:
-- Command: `python -m benchmark.quantization.bench_quantized_linear --hidden-size 8192 --intermediate-size 4096 --tokens 1 128 256 512 1024 2048 4096 --weight-dtype fp8 --act-dtype none --block-size 128 --tp-size 1 2 4 --parallel-mode row --warmup 3 --tries 10`
-- Status:
-- Issues:
+- Status: **完成**
+- Issues: 同 Run 1，FP8 无 tuned sizes
 
 ## Issues & Solutions
 
