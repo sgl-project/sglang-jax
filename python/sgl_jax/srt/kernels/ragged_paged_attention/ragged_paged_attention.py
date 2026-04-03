@@ -1274,6 +1274,7 @@ def static_validate_inputs_fused(
     k_scale: float | None = None,
     v_scale: float | None = None,
     xai_temperature_len: float | None = None,
+    softmax_dtype: jnp.dtype | None = None,
     # Kernel optimization params.
     chunk_prefill_size: int | None = None,
     # Kernel tuning params.
@@ -1364,6 +1365,10 @@ def static_validate_inputs_fused(
         raise ValueError(f"{num_queries_per_block=} must be positive.")
     if vmem_limit_bytes is not None and vmem_limit_bytes <= 0:
         raise ValueError(f"{vmem_limit_bytes=} must be positive.")
+    if softmax_dtype is not None and not jnp.issubdtype(softmax_dtype, jnp.floating):
+        raise ValueError(
+            f"Expected softmax_dtype to be a floating point dtype, got {softmax_dtype}"
+        )
 
     del sm_scale
     del mask_value
@@ -1371,6 +1376,7 @@ def static_validate_inputs_fused(
     del k_scale
     del v_scale
     del xai_temperature_len
+    del softmax_dtype
 
 
 def get_kernel_scope_name(bq_size, bkv_p, page_size):
