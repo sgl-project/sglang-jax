@@ -232,6 +232,7 @@ def rmsnorm_forward(x, residual, weight, epsilon) -> jax.Array | tuple[jax.Array
         return output, residual
 
 
+@named_scope
 def dual_rmsnorm_forward(
     x: jax.Array,
     residual: jax.Array,
