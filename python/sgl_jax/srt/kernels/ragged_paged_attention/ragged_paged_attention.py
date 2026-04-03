@@ -17,6 +17,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_split import (
+    ragged_paged_attention_split,
+)
 from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes import (
     get_tuned_block_sizes,
 )
@@ -1392,13 +1395,15 @@ def get_kernel_scope_name(bq_size, bkv_p, page_size):
         "num_queries_per_block",
         "vmem_limit_bytes",
     ),
-    donate_argnames=("kv_cache_fused",),
+    donate_argnames=("kv_cache_fused", "k_cache", "v_cache"),
 )
 def ragged_paged_attention(
     queries: jax.Array,  # [padded_num_tokens, actual_num_q_heads, actual_head_dim]
     keys: jax.Array,  # [padded_num_tokens, actual_num_kv_heads, actual_head_dim]
     values: jax.Array,  # [padded_num_tokens, actual_num_kv_heads, actual_head_dim]
-    kv_cache_fused: jax.Array,  # [total_num_pages, page_size, actual_num_kv_heads * 2, actual_head_dim]
+    kv_cache_fused: (
+        jax.Array | None
+    ),  # [total_num_pages, page_size, actual_num_kv_heads * 2, actual_head_dim]
     kv_lens: jax.Array,  # i32[padded_batch_size]
     page_indices: jax.Array,  # i32[(padded_batch_size * model_context_len + page_size - 1) // page_size]
     cu_q_lens: jax.Array,  # i32[padded_batch_size + 1]
@@ -1406,6 +1411,8 @@ def ragged_paged_attention(
     distribution: jax.Array,  # i32[3]
     custom_mask: jax.Array,  # if causal is True, custom_mask shape is [patten_total_kv_len], else [0]
     *,
+    k_cache: jax.Array | None = None,
+    v_cache: jax.Array | None = None,
     causal: int = 1,  # 1: True, 0: False
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -1423,13 +1430,14 @@ def ragged_paged_attention(
     num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
 ):
-    """Ragged paged attention that supports mixed prefill and decode with fused KV cache.
+    """Ragged paged attention that supports mixed prefill and decode with fused or split KV cache.
 
     Args:
       queries: concatenated all sequences' queries.
       keys: concatenated all sequences' keys (quantized).
       values: concatenated all sequences' values (quantized).
       kv_cache_fused: paged KV cache with head interleaving format [K1,V1,K2,V2,...].
+        Set to None when using the split KV cache path.
       kv_lens: padded kv lengths. Only the first num_seqs values are valid.
       page_indices: flattened page indices look-up table.
       cu_q_lens: the cumulative sum of the effective query lengths. Similar to
@@ -1440,6 +1448,9 @@ def ragged_paged_attention(
         sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
         k is also the total number of sequences.
       custom_mask: use custom mask to calculate attention.
+      k_cache: separate paged K cache. When both k_cache and v_cache are provided,
+        the split KV path is used instead of the fused path.
+      v_cache: separate paged V cache. Can have a different head_dim than k_cache.
       causal: If causal is set to True, use causal mask. Otherwise, use custom_mask.
       sm_scale: the softmax scale which will be applied to the Q@K^T.
       sliding_window: the sliding window size for the attention.
@@ -1448,9 +1459,9 @@ def ragged_paged_attention(
       q_scale: the scale for the query.
       k_scale: the scale for the key cache.
       v_scale: the scale for the value cache.
-      chunk_prefill_size: the chunk prefill size for the attention.
       xai_temperature_len: the length-based temperature term used by xai grok.
         reference: sgl-project/sglang: python/sglang/srt/layers/attention/triton_ops/decode_attention.py
+      chunk_prefill_size: the chunk prefill size for the attention.
       num_kv_pages_per_block: number of kv pages to be processed in one flash
         attention block in the pallas kernel.
       num_queries_per_block: number of kv pages to be processed in one flash
@@ -1458,8 +1469,39 @@ def ragged_paged_attention(
       vmem_limit_bytes: the vmem limit for the pallas kernel.
 
     Returns:
-      The output of the attention.
+      The output of the attention. For the split path, returns
+      (output, updated_k_cache, updated_v_cache). For the fused path, returns
+      (output, updated_kv_cache_fused).
     """
+    if k_cache is not None and v_cache is not None:
+        return ragged_paged_attention_split(
+            queries,
+            keys,
+            values,
+            k_cache,
+            v_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            distribution,
+            custom_mask,
+            causal=causal,
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            mask_value=mask_value,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            xai_temperature_len=xai_temperature_len,
+            chunk_prefill_size=chunk_prefill_size,
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            num_queries_per_block=num_queries_per_block,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
+
+    # Fused path
     q, k, v = queries, keys, values
     static_validate_inputs_fused(
         q,
@@ -1519,6 +1561,7 @@ def ragged_paged_attention(
             max_num_tokens,
             pages_per_seq,
             causal,
+            kernel_type="fused",
         )
     kv_packing = get_dtype_packing(kv_cache_fused_processed.dtype)
     if page_size == 1:
@@ -1788,37 +1831,3 @@ def prepare_updated_kv_cache_fused(
         num_kv_heads_interleaved_packed * kv_packing,
         head_dim,
     )[:, :actual_num_kv_heads_interleaved, :actual_head_dim]
-
-
-def prepare_kv_cache(
-    k_cache: jax.Array,  # [total_num_pages, page_size, actual_num_kv_heads, actual_head_dim],
-    v_cache: jax.Array,  # [total_num_pages, page_size, actual_num_kv_heads, actual_head_dim],
-):
-    total_num_pages, page_size, actual_num_kv_heads, actual_head_dim = k_cache.shape
-    kv_packing = get_dtype_packing(k_cache.dtype)
-    actual_num_kv_heads = k_cache.shape[2]
-    num_kv_heads = align_to(actual_num_kv_heads, kv_packing)
-    head_dim = align_to(actual_head_dim, 128)
-    k_cache_processed = jnp.pad(
-        k_cache,
-        ((0, 0), (0, 0), (0, 0), (0, head_dim - actual_head_dim)),
-        constant_values=0,
-    ).reshape(
-        total_num_pages,
-        page_size,
-        num_kv_heads // kv_packing,
-        kv_packing,
-        head_dim,
-    )
-    v_cache_processed = jnp.pad(
-        v_cache,
-        ((0, 0), (0, 0), (0, 0), (0, head_dim - actual_head_dim)),
-        constant_values=0,
-    ).reshape(
-        total_num_pages,
-        page_size,
-        num_kv_heads // kv_packing,
-        kv_packing,
-        head_dim,
-    )
-    return k_cache_processed, v_cache_processed

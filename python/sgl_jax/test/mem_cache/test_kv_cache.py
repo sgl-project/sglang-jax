@@ -293,5 +293,151 @@ class TestKVCache(unittest.TestCase):
                 print(f"  ✓ page_size={page_size} passed")
 
 
+class TestSplitKVCacheUpdate(unittest.TestCase):
+    """Test KV cache update through MHATokenToKVPool with split K/V head dims.
+
+    Exercises the pad-before-write path in set_kv_buffer when head_dim is not
+    128-aligned (e.g., DeepSeek-V2 MLA with K head_dim=192, V head_dim=128).
+    """
+
+    def setUp(self):
+        if not jax.devices():
+            self.skipTest("JAX not available")
+
+    def _run_split_pool_test(self, head_dim, v_head_dim, num_tokens, num_heads, page_size):
+        """Create a split pool, write tokens, read back and verify."""
+        from sgl_jax.srt.mem_cache.memory_pool import SplitMHATokenToKVPool
+        from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+
+        test_mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
+
+        # Pre-align dims before passing to pool (matching model_runner behavior)
+        aligned_head_dim = (head_dim + 127) // 128 * 128
+        aligned_v_head_dim = (v_head_dim + 127) // 128 * 128
+
+        pool = SplitMHATokenToKVPool(
+            size=num_tokens + 100,
+            page_size=page_size,
+            dtype=jnp.bfloat16,
+            head_num=num_heads,
+            head_dim=aligned_head_dim,
+            layer_num=1,
+            mesh=test_mesh,
+            v_head_dim=aligned_v_head_dim,
+        )
+
+        self.assertIsInstance(pool, SplitMHATokenToKVPool)
+
+        # Buffer should use aligned dims
+        k_buf, v_buf = pool.get_split_kv_buffer(0)
+        self.assertEqual(k_buf.shape[-1], aligned_head_dim)
+        self.assertEqual(v_buf.shape[-1], aligned_v_head_dim)
+
+        # Generate random K/V with actual (unaligned) head dims
+        k = jax.random.normal(
+            jax.random.PRNGKey(42), (num_tokens, num_heads, head_dim), dtype=jnp.bfloat16
+        )
+        v = jax.random.normal(
+            jax.random.PRNGKey(43), (num_tokens, num_heads, v_head_dim), dtype=jnp.bfloat16
+        )
+        loc = jnp.arange(num_tokens, dtype=jnp.int32) + 5  # offset to test non-zero start
+
+        # Write to pool
+        pool.set_kv_buffer(layer_id=0, loc=loc, k=k, v=v)
+
+        # Read back
+        k_buf, v_buf = pool.get_split_kv_buffer(0)
+
+        # Verify actual data region matches (trim aligned buffer to actual dims)
+        for i in range(num_tokens):
+            cache_pos = loc[i]
+            cached_k = k_buf[cache_pos, :, :head_dim]
+            cached_v = v_buf[cache_pos, :, :v_head_dim]
+            self.assertTrue(
+                jnp.allclose(cached_k, k[i], rtol=1e-3, atol=1e-3),
+                f"K mismatch at token {i}, max diff: {float(jnp.max(jnp.abs(cached_k - k[i])))}",
+            )
+            self.assertTrue(
+                jnp.allclose(cached_v, v[i], rtol=1e-3, atol=1e-3),
+                f"V mismatch at token {i}, max diff: {float(jnp.max(jnp.abs(cached_v - v[i])))}",
+            )
+
+        # Verify padding region is zero
+        if aligned_head_dim > head_dim:
+            for i in range(num_tokens):
+                cache_pos = loc[i]
+                pad_k = k_buf[cache_pos, :, head_dim:]
+                self.assertTrue(
+                    jnp.all(pad_k == 0),
+                    f"K padding not zero at token {i}",
+                )
+
+    def test_split_pool_192_128_ps1(self):
+        """Split pool with head_dim=192, v_head_dim=128, page_size=1."""
+        self._run_split_pool_test(
+            head_dim=192, v_head_dim=128, num_tokens=16, num_heads=8, page_size=1
+        )
+
+    def test_split_pool_256_128_ps1(self):
+        """Split pool with head_dim=256, v_head_dim=128, page_size=1."""
+        self._run_split_pool_test(
+            head_dim=256, v_head_dim=128, num_tokens=16, num_heads=8, page_size=1
+        )
+
+    def test_split_pool_192_128_with_padding(self):
+        """Split pool with head_dim=192, padding tokens (loc=-1)."""
+        from sgl_jax.srt.mem_cache.memory_pool import SplitMHATokenToKVPool
+        from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+
+        head_dim, v_head_dim, num_heads = 192, 128, 8
+        num_tokens = 12
+        test_mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
+
+        # Pre-align dims before passing to pool (matching model_runner behavior)
+        aligned_head_dim = (head_dim + 127) // 128 * 128
+        aligned_v_head_dim = (v_head_dim + 127) // 128 * 128
+
+        pool = SplitMHATokenToKVPool(
+            size=num_tokens + 100,
+            page_size=1,
+            dtype=jnp.bfloat16,
+            head_num=num_heads,
+            head_dim=aligned_head_dim,
+            layer_num=1,
+            mesh=test_mesh,
+            v_head_dim=aligned_v_head_dim,
+        )
+
+        k = jax.random.normal(
+            jax.random.PRNGKey(42), (num_tokens, num_heads, head_dim), dtype=jnp.bfloat16
+        )
+        v = jax.random.normal(
+            jax.random.PRNGKey(43), (num_tokens, num_heads, v_head_dim), dtype=jnp.bfloat16
+        )
+
+        # Mix valid and padding locations
+        loc = jnp.array([5, -1, 7, -1, 9, 10, -1, 12, 13, 14, -1, 16], dtype=jnp.int32)
+
+        pool.set_kv_buffer(layer_id=0, loc=loc, k=k, v=v)
+
+        k_buf, v_buf = pool.get_split_kv_buffer(0)
+
+        # Only non-padding tokens should be written
+        for i in range(num_tokens):
+            if loc[i] == -1:
+                continue
+            cache_pos = loc[i]
+            cached_k = k_buf[cache_pos, :, :head_dim]
+            self.assertTrue(
+                jnp.allclose(cached_k, k[i], rtol=1e-3, atol=1e-3),
+                f"K mismatch at token {i} (loc={loc[i]})",
+            )
+            cached_v = v_buf[cache_pos, :, :v_head_dim]
+            self.assertTrue(
+                jnp.allclose(cached_v, v[i], rtol=1e-3, atol=1e-3),
+                f"V mismatch at token {i} (loc={loc[i]})",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

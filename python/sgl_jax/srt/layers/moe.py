@@ -1,201 +1,21 @@
+"""GMM-based Expert-Parallel MoE layer and weight mapping utilities."""
+
 import jax
 from flax import nnx
 from jax import numpy as jnp
 from jax import shard_map
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.eplb.expert_location import (
-    ExpertLocationMetadata,
-    get_global_expert_location_metadata,
-    topk_ids_logical_to_physical,
-)
-from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
+from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+
+# Re-export for backward compatibility: external code imports from this module.
+from sgl_jax.srt.layers.fused_moe import FusedEPMoE  # noqa: F401
+from sgl_jax.srt.layers.gate import GateLogit, TopK  # noqa: F401
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 from sgl_jax.srt.utils.weight_utils import WeightMapping
-
-
-class GateLogit(nnx.Module):
-    def __init__(
-        self,
-        input_size: int,
-        num_experts: int = 0,
-        weight_dtype: jnp.dtype = jnp.bfloat16,
-        enable_expert_bias: bool | None = False,
-        score_func: str | None = "softmax",
-    ):
-        self.weight_dtype = weight_dtype
-        self.enable_expert_bias = enable_expert_bias
-        self.score_func = score_func
-
-        self.kernel = nnx.Param(
-            jax.random.normal(
-                jax.random.PRNGKey(0),
-                (input_size, num_experts),
-                dtype=self.weight_dtype,
-                out_sharding=P(None, None),
-            ),
-        )
-        if enable_expert_bias:
-            self.bias = nnx.Param(
-                jax.random.normal(
-                    jax.random.PRNGKey(0),
-                    (num_experts,),
-                    dtype=self.weight_dtype,
-                    out_sharding=P(None),
-                ),
-            )
-        else:
-            self.bias = None
-
-    @named_scope
-    def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:
-        logits = jnp.dot(hidden_states, self.kernel.value)
-
-        if self.score_func:
-            if self.score_func == "softmax":
-                logits = jax.nn.softmax(logits, axis=-1)
-            elif self.score_func == "sigmoid":
-                logits = jax.nn.sigmoid(logits)
-            elif self.score_func == "tanh":
-                logits = jax.nn.tanh(logits)
-            else:
-                raise ValueError("unknown score func")
-
-        return logits
-
-
-class TopK(nnx.Module):
-    def __init__(
-        self,
-        topk: int,
-        renormalize: bool,
-        num_expert_group: int = 0,
-        topk_group: int = 0,
-        routed_scaling_factor: float | None = None,
-        layer_id: int = 0,
-    ):
-        self.topk = topk
-        self.renormalize = renormalize
-        self.num_expert_group = num_expert_group
-        self.topk_group = topk_group
-        self.routed_scaling_factor = routed_scaling_factor
-        self.layer_id = layer_id
-
-    @named_scope
-    def __call__(
-        self,
-        router_logits: jax.Array,
-        correction_bias: jax.Array = None,
-        dispatch_info: ExpertLocationMetadata | None = None,
-    ):
-        router_logits = router_logits.astype(jnp.float32)
-
-        if self.num_expert_group > 0 or self.topk_group > 0:
-            if correction_bias is not None:
-                topk_weights, topk_ids = self._biased_grouped_topk(router_logits, correction_bias)
-            else:
-                topk_weights, topk_ids = self._grouped_topk(router_logits)
-        else:
-            if correction_bias is not None:
-                topk_weights, topk_ids = self._biased_topk(router_logits, correction_bias)
-            else:
-                topk_weights, topk_ids = self._topk(router_logits)
-
-        if dispatch_info is not None:
-            topk_ids = topk_ids_logical_to_physical(topk_ids, dispatch_info, self.layer_id)
-
-        if self.renormalize:
-            topk_weights = topk_weights / (jnp.sum(topk_weights, axis=-1, keepdims=True))
-            if self.routed_scaling_factor is not None:
-                topk_weights *= self.routed_scaling_factor
-
-        topk_weights = topk_weights.astype(jnp.float32)
-
-        return topk_weights, topk_ids
-
-    def _topk(self, router_logits):
-        return jax.lax.top_k(router_logits, self.topk)
-
-    def _biased_topk(self, router_logits, correction_bias):
-        n_routed_experts = router_logits.shape[-1]
-        scores_for_choice = router_logits.reshape(-1, n_routed_experts) + jnp.expand_dims(
-            correction_bias, axis=0
-        )
-        topk_ids = jax.lax.top_k(scores_for_choice, self.topk)[1]
-        topk_weights = jnp.take_along_axis(router_logits, topk_ids, axis=1)
-        return topk_weights, topk_ids
-
-    def _grouped_topk(
-        self,
-        router_logits: jax.Array,
-    ):
-        num_token = router_logits.shape[0]
-
-        # Group scores calculation
-        group_shape = (num_token, self.num_expert_group, -1)
-        scores_grouped = router_logits.reshape(group_shape)
-        group_scores = jnp.max(scores_grouped, axis=-1)  # [n, n_group]
-
-        # Get top group indices # [n, top_k_group]
-        group_idx = jax.lax.top_k(group_scores, k=self.topk_group)[1]
-
-        # Create group mask using scatter
-        group_mask = jnp.clip(
-            jax.nn.one_hot(group_idx, self.num_expert_group).sum(axis=1), 0, 1
-        )  # [n, n_group]
-
-        # Create score mask
-        experts_per_group = router_logits.shape[-1] // self.num_expert_group
-        score_mask = jnp.expand_dims(group_mask, axis=-1)  # [n, n_group, 1]
-        score_mask = jnp.broadcast_to(
-            score_mask, (num_token, self.num_expert_group, experts_per_group)
-        )
-        score_mask = score_mask.reshape(num_token, -1)  # [n, e]
-
-        # Apply mask and get topk
-        tmp_scores = jnp.where(score_mask, router_logits, 0.0)  # [n, e]
-        topk_weights, topk_ids = jax.lax.top_k(tmp_scores, k=self.topk)
-
-        return topk_weights, topk_ids
-
-    def _biased_grouped_topk(
-        self,
-        router_logits: jax.Array,
-        correction_bias: jax.Array = None,
-    ):
-        num_token = router_logits.shape[0]
-        scores_for_choice = router_logits.reshape(num_token, -1) + jnp.expand_dims(
-            correction_bias, axis=0
-        )
-
-        # Group scores calculation
-        scores_grouped = scores_for_choice.reshape(num_token, self.num_expert_group, -1)
-        group_scores = jnp.sum(jax.lax.top_k(scores_grouped, k=2)[0], axis=-1)  # [n, n_group]
-
-        # Get top group indices [n, top_k_group]
-        group_idx = jax.lax.top_k(group_scores, k=self.topk_group)[1]
-
-        # Create group mask using scatter [n, n_group]
-        group_mask = jnp.clip(jax.nn.one_hot(group_idx, self.num_expert_group).sum(axis=1), 0, 1)
-
-        # Create score mask
-        experts_per_group = router_logits.shape[-1] // self.num_expert_group
-        score_mask = jnp.expand_dims(group_mask, axis=-1)  # [n, n_group, 1]
-        score_mask = jnp.broadcast_to(
-            score_mask, (num_token, self.num_expert_group, experts_per_group)
-        )
-        score_mask = score_mask.reshape(num_token, -1)  # [n, e]
-
-        # Apply mask and get topk
-        tmp_scores = jnp.where(score_mask, scores_for_choice, float("-inf"))  # [n, e]
-
-        topk_ids = jax.lax.top_k(tmp_scores, k=self.topk)[1]
-        topk_weights = jnp.take_along_axis(router_logits, topk_ids, axis=1)
-
-        return topk_weights, topk_ids
 
 
 class EPMoE(nnx.Module):
@@ -239,6 +59,9 @@ class EPMoE(nnx.Module):
         )
         self.activation_quantized_dtype = (
             quantization_config.get_moe_activation_dtype() if quantization_config else None
+        )
+        self.weight_block_size = (
+            getattr(quantization_config, "weight_block_size", None) if quantization_config else None
         )
 
         if self.num_experts % self.ep_size != 0:
@@ -309,73 +132,265 @@ class EPMoE(nnx.Module):
         except Exception as _:
             return False, "cpu"
 
+    def _normalize_scale_for_gmm(
+        self,
+        scale: jax.Array | None,
+        weight: jax.Array,
+        *,
+        scale_name: str,
+    ) -> jax.Array | None:
+        """Normalize offline/runtime scale tensors to GMM's 4D layout.
+
+        Accepted inputs intentionally cover the layouts we see in practice:
+
+        - per-channel: ``[E, out_dim]``
+        - already-kernel-ready: ``[E, k_blocks, 1, out_dim]``
+        - sub-channel / block-channel: ``[E, out_dim, k_blocks]`` or
+          ``[E, k_blocks, out_dim]``
+        - offline 2D block quant: ``[E, out_blocks, k_blocks]``
+
+        The returned tensor always matches the GMM contract
+        ``[E, k_blocks, 1, out_dim]``.
+        """
+        if scale is None:
+            return None
+
+        # Weight layout is [E, k, n] where k=contraction dim, n=output dim.
+        num_experts, in_dim, out_dim = weight.shape
+
+        if scale.ndim == 4:
+            if scale.shape[0] != num_experts or scale.shape[2] != 1 or scale.shape[3] != out_dim:
+                raise ValueError(
+                    f"Unsupported {scale_name} shape {scale.shape} for weight shape {weight.shape}. "
+                    "Expected 4D GMM scale layout [E, k_blocks, 1, out_dim]."
+                )
+            if self.weight_block_size is None:
+                if scale.shape[1] != 1:
+                    raise ValueError(
+                        f"Unsupported {scale_name} shape {scale.shape} for weight shape {weight.shape}. "
+                        "Per-channel 4D GMM scales must have k_blocks=1."
+                    )
+            else:
+                block_size_k = int(self.weight_block_size[1])
+                expected_k_blocks = (in_dim + block_size_k - 1) // block_size_k
+                if scale.shape[1] not in (1, expected_k_blocks):
+                    raise ValueError(
+                        f"Unsupported {scale_name} shape {scale.shape} for weight shape {weight.shape}. "
+                        f"Expected k_blocks dimension to be 1 or {expected_k_blocks}."
+                    )
+            return scale
+
+        if scale.ndim == 2 and scale.shape == (num_experts, out_dim):
+            return scale[:, None, None, :]
+
+        if scale.ndim == 3:
+            if scale.shape == (num_experts, 1, out_dim):
+                return scale[:, :, None, :]
+
+            # Support offline 2D block quant checkpoints whose scales are stored as
+            # [num_experts, out_blocks, in_blocks]. GMM expects [E, k_blocks, 1, out_dim].
+            if (
+                self.weight_block_size is not None
+                and isinstance(self.weight_block_size, (list, tuple))
+                and len(self.weight_block_size) == 2
+            ):
+                block_size_out = int(self.weight_block_size[0])
+                block_size_k = int(self.weight_block_size[1])
+                expected_out_blocks = (out_dim + block_size_out - 1) // block_size_out
+                expected_k_blocks = (in_dim + block_size_k - 1) // block_size_k
+
+                if scale.shape == (num_experts, out_dim, expected_k_blocks):
+                    final_scale_sharding = (
+                        P("expert", None, None, None)
+                        if scale_name == "wo_scale"
+                        else P("expert", None, None, "tensor")
+                    )
+                    scale_gmm = jnp.transpose(scale, (0, 2, 1))[:, :, None, :]
+                    return jax.sharding.reshard(scale_gmm, final_scale_sharding)
+
+                if scale.shape == (num_experts, expected_out_blocks, expected_k_blocks):
+                    scale_per_out_sharding = (
+                        P("expert", None, None)
+                        if scale_name == "wo_scale"
+                        else P("expert", "tensor", None)
+                    )
+                    final_scale_sharding = (
+                        P("expert", None, None, None)
+                        if scale_name == "wo_scale"
+                        else P("expert", None, None, "tensor")
+                    )
+                    out_block_ids = jnp.arange(out_dim, dtype=jnp.int32) // block_size_out
+                    scale_per_out = scale.at[:, out_block_ids, :].get(
+                        out_sharding=scale_per_out_sharding
+                    )
+                    scale_gmm = jnp.transpose(scale_per_out, (0, 2, 1))[:, :, None, :]
+                    return jax.sharding.reshard(scale_gmm, final_scale_sharding)
+
+                if scale.shape == (num_experts, expected_k_blocks, out_dim):
+                    return scale[:, :, None, :]
+
+        raise ValueError(
+            f"Unsupported {scale_name} shape {scale.shape} for weight shape {weight.shape}. "
+            "Expected one of: [E, out_dim], [E, 1, out_dim], [E, k_blocks, 1, out_dim], "
+            "or offline block format [E, out_blocks, k_blocks]."
+        )
+
     def quantize_weights(self, is_static: bool = False):
         """Quantize MoE weights in-place or initialize params for static loading."""
         if self.quantized_dtype is None:
             return
 
-        with jax.sharding.use_abstract_mesh(self.updated_mesh):
+        def _get_block_size_k(
+            *,
+            hidden_size: int,
+            intermediate_dim: int,
+            weight_block_size: list[int] | tuple[int, int] | None,
+        ) -> int | None:
+            """Extract the contracting-dimension block size for MoE weights.
+
+            EPMoE only block-quantizes along the GEMM ``K`` dimension, so for a
+            configured ``(block_n, block_k)`` we consume only ``block_k`` here.
+            The divisibility checks keep the later GMM scale layout well-defined.
+            """
+            if weight_block_size is None:
+                return None
+            if not (isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2):
+                raise ValueError(
+                    f"EPMoE weight_block_size must be a 2-element list [block_n, block_k], "
+                    f"got {weight_block_size}"
+                )
+
+            block_size_k = int(weight_block_size[1])
+            if block_size_k <= 0:
+                raise ValueError(f"EPMoE weight_block_size[1] must be > 0, got {block_size_k}")
+            if hidden_size % block_size_k != 0:
+                raise ValueError(
+                    f"EPMoE hidden_size={hidden_size} not divisible by block_size_k={block_size_k}"
+                )
+            if intermediate_dim % block_size_k != 0:
+                raise ValueError(
+                    f"EPMoE intermediate_dim={intermediate_dim} not divisible by block_size_k={block_size_k}"
+                )
+            return block_size_k
+
+        with jax.set_mesh(self.moe_mesh):
             if is_static:
-                scale_sharding = P("expert", None, None, None)
+                # Static checkpoints will load real scale tensors later, but the
+                # placeholders must already satisfy expert sharding shape rules.
+                num_experts = self.wi_0.value.shape[0]
+                # [E, k, n] layout: wi_0=[E, hidden_size, intermediate_dim],
+                #                    wo=[E, intermediate_dim, hidden_size]
+                hidden_size = self.wi_0.value.shape[1]
+                intermediate_dim = self.wo.value.shape[1]
+
+                # Compute k_blocks for block quant placeholders.
+                # weight_block_size = [hf_out_block, hf_in_block] (HF convention).
+                # EPMoE quantizes along axis=1 (k/contraction dim).
+                block_size_k = _get_block_size_k(
+                    hidden_size=hidden_size,
+                    intermediate_dim=intermediate_dim,
+                    weight_block_size=self.weight_block_size,
+                )
+                k_blocks_wi = (hidden_size // block_size_k) if block_size_k else 1
+                k_blocks_wo = (intermediate_dim // block_size_k) if block_size_k else 1
+                wi_scale_sharding = P("expert", None, None, "tensor")
+                wo_scale_sharding = P("expert", None, None, None)
 
                 if hasattr(self, "wi_0_scale"):
                     del self.wi_0_scale
                 self.wi_0_scale = nnx.Param(
-                    jnp.zeros((1,), dtype=jnp.float32), out_sharding=scale_sharding
+                    jnp.zeros(
+                        (num_experts, k_blocks_wi, 1, intermediate_dim),
+                        dtype=jnp.float32,
+                        out_sharding=wi_scale_sharding,
+                    ),
+                    out_sharding=wi_scale_sharding,
                 )
 
                 if hasattr(self, "wi_1_scale"):
                     del self.wi_1_scale
                 self.wi_1_scale = nnx.Param(
-                    jnp.zeros((1,), dtype=jnp.float32), out_sharding=scale_sharding
+                    jnp.zeros(
+                        (num_experts, k_blocks_wi, 1, intermediate_dim),
+                        dtype=jnp.float32,
+                        out_sharding=wi_scale_sharding,
+                    ),
+                    out_sharding=wi_scale_sharding,
                 )
 
                 if hasattr(self, "wo_scale"):
                     del self.wo_scale
                 self.wo_scale = nnx.Param(
-                    jnp.zeros((1,), dtype=jnp.float32), out_sharding=scale_sharding
+                    jnp.zeros(
+                        (num_experts, k_blocks_wo, 1, hidden_size),
+                        dtype=jnp.float32,
+                        out_sharding=wo_scale_sharding,
+                    ),
+                    out_sharding=wo_scale_sharding,
                 )
                 return
 
             # Quantize weights along k-dim (axis=1 in [g, k, n] layout)
+            # wi_0=[E, hidden_size, intermediate_dim], wo=[E, intermediate_dim, hidden_size]
+            hidden_size = self.wi_0.value.shape[1]
+            intermediate_dim = self.wo.value.shape[1]
+            block_size_k = _get_block_size_k(
+                hidden_size=hidden_size,
+                intermediate_dim=intermediate_dim,
+                weight_block_size=self.weight_block_size,
+            )
             w0_value, w0_scale = quantize_tensor(
                 self.quantized_dtype,
                 self.wi_0.value,
                 axis=1,
+                block_size=block_size_k,
             )
             w1_value, w1_scale = quantize_tensor(
                 self.quantized_dtype,
                 self.wi_1.value,
                 axis=1,
+                block_size=block_size_k,
             )
             wo_value, wo_scale = quantize_tensor(
                 self.quantized_dtype,
                 self.wo.value,
                 axis=1,
+                block_size=block_size_k,
             )
 
             self.wi_0 = nnx.Param(w0_value, out_sharding=P("expert", None, "tensor"))
             self.wi_1 = nnx.Param(w1_value, out_sharding=P("expert", None, "tensor"))
             self.wo = nnx.Param(wo_value, out_sharding=P("expert", "tensor", None))
 
+            if block_size_k is not None:
+                # axis=1 quantization on [g, k, n] gives scale [g, k_blocks, n]
+                # → expand to [g, k_blocks, 1, n]
+                w0_scale = w0_scale[:, :, None, :]
+                w1_scale = w1_scale[:, :, None, :]
+                wo_scale = wo_scale[:, :, None, :]
+            else:
+                w0_scale = w0_scale.reshape(w0_scale.shape[0], 1, 1, w0_scale.shape[1])
+                w1_scale = w1_scale.reshape(w1_scale.shape[0], 1, 1, w1_scale.shape[1])
+                wo_scale = wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1])
+
             if hasattr(self, "wi_0_scale"):
                 del self.wi_0_scale
             self.wi_0_scale = nnx.Param(
-                w0_scale.reshape(w0_scale.shape[0], 1, 1, w0_scale.shape[1]),
+                w0_scale,
                 out_sharding=P("expert", None, None, "tensor"),
             )
 
             if hasattr(self, "wi_1_scale"):
                 del self.wi_1_scale
             self.wi_1_scale = nnx.Param(
-                w1_scale.reshape(w1_scale.shape[0], 1, 1, w1_scale.shape[1]),
+                w1_scale,
                 out_sharding=P("expert", None, None, "tensor"),
             )
 
             if hasattr(self, "wo_scale"):
                 del self.wo_scale
             self.wo_scale = nnx.Param(
-                wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1]),
+                wo_scale,
                 out_sharding=P("expert", None, None, None),
             )
 
@@ -390,9 +405,22 @@ class EPMoE(nnx.Module):
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
 
-            w0_scale = self.wi_0_scale.value if self.wi_0_scale is not None else None
-            w1_scale = self.wi_1_scale.value if self.wi_1_scale is not None else None
-            wo_scale = self.wo_scale.value if self.wo_scale is not None else None
+            # Normalize scales to GMM's 4D layout [E, k_blocks, 1, out_dim]
+            w0_scale = self._normalize_scale_for_gmm(
+                self.wi_0_scale.value if self.wi_0_scale is not None else None,
+                self.wi_0.value,
+                scale_name="wi_0_scale",
+            )
+            w1_scale = self._normalize_scale_for_gmm(
+                self.wi_1_scale.value if self.wi_1_scale is not None else None,
+                self.wi_1.value,
+                scale_name="wi_1_scale",
+            )
+            wo_scale = self._normalize_scale_for_gmm(
+                self.wo_scale.value if self.wo_scale is not None else None,
+                self.wo.value,
+                scale_name="wo_scale",
+            )
 
             result = shard_map(
                 self._forward,
@@ -660,392 +688,6 @@ class EPMoE(nnx.Module):
             final_output = output.reshape(batch_size, seq_len, -1).astype(self.dtype)
 
         return final_output
-
-
-class FusedEPMoE(nnx.Module):
-    """
-    Expert Parallel MoE layer using fused TPU kernel.
-
-    This layer wraps the optimized fused_ep_moe kernel which combines Top-K selection,
-    expert computation, and aggregation into a single efficient operation.
-
-    Key differences from EPMoE:
-    - Weight format: w1/w3 are (num_experts, hidden_size, intermediate_size) for gate/up proj
-      and w2 is (num_experts, intermediate_size, hidden_size) for down proj
-    - Input: Takes router_logits directly instead of pre-computed topk_weights/topk_ids
-    - Implementation: Uses Pallas kernel with manual memory management for TPU optimization
-
-    Args:
-        hidden_size: Hidden size of the model
-        num_experts: Total number of experts
-        num_experts_per_tok: Number of experts to select per token (top_k)
-        ep_size: Expert parallel size (number of devices to shard experts across)
-        mesh: JAX mesh for distributed execution
-        intermediate_dim: Intermediate dimension for expert FFN
-        weight_dtype: Data type for weights
-        dtype: Data type for computation
-        activation: Activation function ("silu", "gelu", "swigluoai")
-        layer_id: Layer index (for debugging)
-        renormalize_topk_logits: Whether to renormalize top-k weights
-        bt, bf, bd1, bd2, btc, bfc, bd1c, bd2c: Tile size parameters (auto-selected if None)
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_experts: int,
-        num_experts_per_tok: int,
-        ep_size: int,
-        mesh: Mesh,
-        intermediate_dim: int = 2048,
-        weight_dtype: jnp.dtype = jnp.bfloat16,
-        dtype: jnp.dtype = jnp.bfloat16,
-        activation: str = "silu",
-        layer_id: int = 0,
-        use_grouped_topk: bool = False,
-        num_groups: int = 1,
-        top_k_groups: int = 1,
-        renormalize_topk_logits: bool = False,
-        routed_scaling_factor: float | None = None,
-        num_shared_experts: int = 0,
-        moe_shared_expert_intermediate_size: int | None = None,
-        quantization_config=None,
-    ):
-        self.hidden_size = hidden_size
-        self.num_experts_per_tok = num_experts_per_tok
-        self.intermediate_dim = intermediate_dim
-        self.weight_dtype = weight_dtype
-        self.dtype = dtype
-        self.layer_id = layer_id
-        self.ep_size = ep_size
-        self.activation = activation
-        self.use_grouped_topk = use_grouped_topk
-        self.num_groups = num_groups
-        self.top_k_groups = top_k_groups
-        self.renormalize_topk_logits = renormalize_topk_logits
-        self.routed_scaling_factor = routed_scaling_factor
-        self.num_shared_experts = num_shared_experts
-        self.moe_shared_expert_intermediate_size = (
-            moe_shared_expert_intermediate_size or intermediate_dim
-        )
-        self.mesh = mesh
-
-        metadata = get_global_expert_location_metadata()
-        if metadata is not None and layer_id is not None:
-            self.num_experts = metadata.num_physical_experts
-        else:
-            self.num_experts = num_experts
-
-        if self.num_experts % self.ep_size != 0:
-            raise ValueError(
-                f"num_experts({self.num_experts}) must be divisible by ep_size ({self.ep_size})"
-            )
-
-        self.quantized_dtype = (
-            quantization_config.get_moe_weight_dtype() if quantization_config else None
-        )
-        self.activation_quantized_dtype = (
-            quantization_config.get_moe_activation_dtype() if quantization_config else None
-        )
-
-        # Initialize weights.
-        self.w1 = nnx.Param(
-            jax.random.normal(
-                jax.random.key(0),
-                (self.num_experts, hidden_size, intermediate_dim),
-                dtype=weight_dtype,
-                out_sharding=P(("data", "tensor"), None, None),
-            )
-        )
-        self.w3 = nnx.Param(
-            jax.random.normal(
-                jax.random.key(1),
-                (self.num_experts, hidden_size, intermediate_dim),
-                dtype=weight_dtype,
-                out_sharding=P(("data", "tensor"), None, None),
-            )
-        )
-
-        self.w2 = nnx.Param(
-            jax.random.normal(
-                jax.random.key(0),
-                (self.num_experts, intermediate_dim, hidden_size),
-                dtype=weight_dtype,
-                out_sharding=P(("data", "tensor"), None, None),
-            )
-        )
-
-        self.w1_scale = None
-        self.w3_scale = None
-        self.w2_scale = None
-
-        if self.num_shared_experts > 0:
-            se_inter_dim = self.moe_shared_expert_intermediate_size * self.num_shared_experts
-
-            self.w1_shared = nnx.Param(
-                jax.random.normal(
-                    jax.random.key(0),
-                    (hidden_size, se_inter_dim),
-                    dtype=weight_dtype,
-                    out_sharding=P(None, None),
-                )
-            )
-
-            self.w2_shared = nnx.Param(
-                jax.random.normal(
-                    jax.random.key(0),
-                    (se_inter_dim, hidden_size),
-                    dtype=weight_dtype,
-                    out_sharding=P(None, None),
-                )
-            )
-
-            self.w3_shared = nnx.Param(
-                jax.random.normal(
-                    jax.random.key(0),
-                    (hidden_size, se_inter_dim),
-                    dtype=weight_dtype,
-                    out_sharding=P(None, None),
-                )
-            )
-        else:
-            self.w1_shared = None
-            self.w3_shared = None
-            self.w2_shared = None
-
-        self.w1_shared_scale = None
-        self.w3_shared_scale = None
-        self.w2_shared_scale = None
-
-        self.subc_quant_wsz = None  # Use default sub channel quantization block size
-
-    def quantize_weights(self, is_static: bool = False):
-        """Quantize MoE weights in-place. Call once after model loading."""
-        if self.quantized_dtype is None:
-            return
-
-        if hasattr(self, "subc_quant_wsz"):
-            del self.subc_quant_wsz
-            self.subc_quant_wsz = 256
-
-        with jax.set_mesh(self.mesh):
-            if is_static:
-                ep_scale_sharding = P(("data", "tensor"), None, None, None)
-
-                if hasattr(self, "w1_scale"):
-                    del self.w1_scale
-                self.w1_scale = nnx.Param(
-                    jnp.zeros((1,), dtype=jnp.float32), out_sharding=ep_scale_sharding
-                )
-
-                if hasattr(self, "w3_scale"):
-                    del self.w3_scale
-                self.w3_scale = nnx.Param(
-                    jnp.zeros((1,), dtype=jnp.float32), out_sharding=ep_scale_sharding
-                )
-
-                if hasattr(self, "w2_scale"):
-                    del self.w2_scale
-                self.w2_scale = nnx.Param(
-                    jnp.zeros((1,), dtype=jnp.float32), out_sharding=ep_scale_sharding
-                )
-
-                if self.num_shared_experts > 0:
-                    shared_scale_sharding = P(None, None, None)
-
-                    if hasattr(self, "w1_shared_scale"):
-                        del self.w1_shared_scale
-                    self.w1_shared_scale = nnx.Param(
-                        jnp.zeros((1,), dtype=jnp.float32), out_sharding=shared_scale_sharding
-                    )
-
-                    if hasattr(self, "w3_shared_scale"):
-                        del self.w3_shared_scale
-                    self.w3_shared_scale = nnx.Param(
-                        jnp.zeros((1,), dtype=jnp.float32), out_sharding=shared_scale_sharding
-                    )
-
-                    if hasattr(self, "w2_shared_scale"):
-                        del self.w2_shared_scale
-                    self.w2_shared_scale = nnx.Param(
-                        jnp.zeros((1,), dtype=jnp.float32), out_sharding=shared_scale_sharding
-                    )
-
-                return
-
-            # Replace original weights with quantized versions
-            w1_value, w1_scale = quantize_tensor(
-                self.quantized_dtype,
-                self.w1.value,
-                axis=1,
-                block_size=self.subc_quant_wsz,
-            )
-            w3_value, w3_scale = quantize_tensor(
-                self.quantized_dtype,
-                self.w3.value,
-                axis=1,
-                block_size=self.subc_quant_wsz,
-            )
-            w2_value, w2_scale = quantize_tensor(
-                self.quantized_dtype,
-                self.w2.value,
-                axis=1,
-                block_size=self.subc_quant_wsz,
-            )
-
-            # NOTE: Fused MoE shards the expert dimension across EP=(data*tensor).
-            ep_sharding = P(("data", "tensor"), None, None)
-            ep_scale_sharding = P(("data", "tensor"), None, None, None)
-
-            self.w1 = nnx.Param(w1_value, out_sharding=ep_sharding)
-            self.w3 = nnx.Param(w3_value, out_sharding=ep_sharding)
-            self.w2 = nnx.Param(w2_value, out_sharding=ep_sharding)
-
-            # Update scales (reshape to 4D for GMM kernel)
-            if hasattr(self, "w1_scale"):
-                del self.w1_scale
-            self.w1_scale = nnx.Param(
-                w1_scale.reshape(w1_scale.shape[0], w1_scale.shape[1], 1, w1_scale.shape[2]),
-                out_sharding=ep_scale_sharding,
-            )
-            if hasattr(self, "w3_scale"):
-                del self.w3_scale
-            self.w3_scale = nnx.Param(
-                w3_scale.reshape(w3_scale.shape[0], w3_scale.shape[1], 1, w3_scale.shape[2]),
-                out_sharding=ep_scale_sharding,
-            )
-            if hasattr(self, "w2_scale"):
-                del self.w2_scale
-            self.w2_scale = nnx.Param(
-                w2_scale.reshape(w2_scale.shape[0], w2_scale.shape[1], 1, w2_scale.shape[2]),
-                out_sharding=ep_scale_sharding,
-            )
-
-            if self.w1_shared is not None:
-                w1_shared_value, w1_shared_scale = quantize_tensor(
-                    self.quantized_dtype,
-                    self.w1_shared.value,
-                    axis=0,
-                )
-                w3_shared_value, w3_shared_scale = quantize_tensor(
-                    self.quantized_dtype,
-                    self.w3_shared.value,
-                    axis=0,
-                )
-                w2_shared_value, w2_shared_scale = quantize_tensor(
-                    self.quantized_dtype,
-                    self.w2_shared.value,
-                    axis=0,
-                )
-
-                self.w1_shared = nnx.Param(w1_shared_value, out_sharding=P(None, None))
-                self.w3_shared = nnx.Param(w3_shared_value, out_sharding=P(None, None))
-                self.w2_shared = nnx.Param(w2_shared_value, out_sharding=P(None, None))
-
-                if hasattr(self, "w1_shared_scale"):
-                    del self.w1_shared_scale
-                self.w1_shared_scale = nnx.Param(
-                    w1_shared_scale.reshape(
-                        1,
-                        1,
-                        w1_shared_scale.shape[0],
-                    ),
-                    out_sharding=P(None, None, None),
-                )
-
-                if hasattr(self, "w3_shared_scale"):
-                    del self.w3_shared_scale
-                self.w3_shared_scale = nnx.Param(
-                    w3_shared_scale.reshape(
-                        1,
-                        1,
-                        w3_shared_scale.shape[0],
-                    ),
-                    out_sharding=P(None, None, None),
-                )
-
-                if hasattr(self, "w2_shared_scale"):
-                    del self.w2_shared_scale
-                self.w2_shared_scale = nnx.Param(
-                    w2_shared_scale.reshape(
-                        1,
-                        1,
-                        w2_shared_scale.shape[0],
-                    ),
-                    out_sharding=P(None, None, None),
-                )
-
-    def __call__(
-        self,
-        hidden_states: jax.Array,
-        topk_weights: jax.Array,
-        topk_ids: jax.Array,
-        *,
-        block_config: FusedMoEBlockConfig | None = None,
-    ) -> jax.Array:
-        """
-        Forward pass through the fused MoE layer.
-
-        Args:
-            hidden_states: Input tokens, shape (num_tokens, hidden_size) or
-                          (batch_size, seq_len, hidden_size)
-            topk_weights: Pre-computed top-k weights
-            topk_ids: Pre-computed top-k expert IDs
-
-        Returns:
-            MoE layer output, same shape as hidden_states
-        """
-        assert hidden_states.ndim == 2
-
-        w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
-        w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
-        w2_shared_val = self.w2_shared.value if self.w2_shared is not None else None
-
-        w1_scale = self.w1_scale.value if self.w1_scale is not None else None
-        w3_scale = self.w3_scale.value if self.w3_scale is not None else None
-        w2_scale = self.w2_scale.value if self.w2_scale is not None else None
-        w1_shared_scale = self.w1_shared_scale.value if self.w1_shared_scale is not None else None
-        w3_shared_scale = self.w3_shared_scale.value if self.w3_shared_scale is not None else None
-        w2_shared_scale = self.w2_shared_scale.value if self.w2_shared_scale is not None else None
-
-        subc_quant_wsz = self.subc_quant_wsz if self.subc_quant_wsz is not None else None
-
-        output = fused_ep_moe(
-            mesh=self.mesh,
-            tokens=hidden_states,
-            w1=self.w1.value,
-            w2=self.w2.value,
-            w3=self.w3.value,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            top_k=self.num_experts_per_tok,
-            use_grouped_topk=self.use_grouped_topk,
-            num_groups=self.num_groups,
-            top_k_groups=self.top_k_groups,
-            renormalize_topk_logits=self.renormalize_topk_logits,
-            routed_scaling_factor=self.routed_scaling_factor,
-            act_fn=self.activation,
-            block_config=block_config,
-            # Optional parameters (not used in basic case)
-            subc_quant_wsz=subc_quant_wsz,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            w3_scale=w3_scale,
-            w1_shared=w1_shared_val,
-            w2_shared=w2_shared_val,
-            w3_shared=w3_shared_val,
-            w1_shared_scale=w1_shared_scale,
-            w2_shared_scale=w2_shared_scale,
-            w3_shared_scale=w3_shared_scale,
-            b1=None,
-            b2=None,
-            b3=None,
-            dp_axis_name="data",
-            tp_axis_name="tensor",
-        )
-
-        output = jax.sharding.reshard(output, NamedSharding(self.mesh, P(None, None)))
-        return output
 
 
 # create_moe_weights_mapping is utility function to generate weight mapping for MOE layers
