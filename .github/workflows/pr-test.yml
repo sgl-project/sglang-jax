@@ -29,8 +29,13 @@ jobs:
   check-changes:
     runs-on: ubuntu-latest
     outputs:
-      main_package: ${{ steps.filter.outputs.main_package }}
-      pallas_kernel: ${{ steps.filter.outputs.pallas_kernel }}
+      unit_test_1: ${{ steps.triggers.outputs.unit_test_1 }}
+      unit_test_4: ${{ steps.triggers.outputs.unit_test_4 }}
+      e2e_test_1: ${{ steps.triggers.outputs.e2e_test_1 }}
+      e2e_test_4: ${{ steps.triggers.outputs.e2e_test_4 }}
+      accuracy_test: ${{ steps.triggers.outputs.accuracy_test }}
+      performance_test: ${{ steps.triggers.outputs.performance_test }}
+      pallas_kernel: ${{ steps.triggers.outputs.pallas_kernel }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -52,20 +57,158 @@ jobs:
         uses: dorny/paths-filter@v3
         with:
           filters: |
-            main_package:
-              - "python/sgl_jax/**"
+            foundational:
+              - "python/sgl_jax/srt/utils/**"
+              - "python/sgl_jax/srt/configs/**"
+              - "python/sgl_jax/srt/server_args.py"
+              - "python/sgl_jax/srt/__init__.py"
+              - "python/sgl_jax/srt/conversation.py"
+              - "python/sgl_jax/srt/hf_transformers_utils.py"
+              - "python/sgl_jax/srt/jinja_template_utils.py"
+              - "python/sgl_jax/srt/memory_profiler.py"
+              - "python/sgl_jax/srt/precision_tracer.py"
+              - "python/sgl_jax/srt/reasoning_parser.py"
               - "python/*.toml"
+              - "python/sgl_jax/__init__.py"
+              - "python/sgl_jax/global_config.py"
+              - "python/sgl_jax/version.py"
               - "scripts/**"
-              - "test/**"
+              - "test/srt/run_suite.py"
               - ".github/workflows/pr-test.yml"
+            kernels:
+              - "python/sgl_jax/srt/kernels/**"
+            layers:
+              - "python/sgl_jax/srt/layers/**"
+            mem_cache:
+              - "python/sgl_jax/srt/mem_cache/**"
+            sampling:
+              - "python/sgl_jax/srt/sampling/**"
+              - "python/sgl_jax/srt/eplb/**"
+            model_executor:
+              - "python/sgl_jax/srt/model_executor/**"
+              - "python/sgl_jax/srt/model_loader/**"
+            models:
+              - "python/sgl_jax/srt/models/**"
+            managers:
+              - "python/sgl_jax/srt/managers/**"
+            entrypoints:
+              - "python/sgl_jax/srt/entrypoints/**"
+            speculative:
+              - "python/sgl_jax/srt/speculative/**"
+            lora:
+              - "python/sgl_jax/srt/lora/**"
+            multimodal:
+              - "python/sgl_jax/srt/multimodal/**"
+            constrained:
+              - "python/sgl_jax/srt/constrained/**"
+              - "python/sgl_jax/srt/function_call/**"
+            quantization:
+              - "python/sgl_jax/srt/utils/quantization/**"
+              - "python/sgl_jax/srt/kernels/quantized_matmul/**"
+            test_e2e:
+              - "test/srt/**"
+            any_source:
+              - "python/sgl_jax/srt/**"
             pallas_kernel:
-              - "python/sgl_jax/kernels/**"
+              - "python/sgl_jax/srt/kernels/**"
               - "benchmark/kernels/**"
-              - ".github/workflows/pr-test.yml"
+
+      - name: Compute composite triggers
+        id: triggers
+        run: |
+          # Read filter outputs
+          FOUNDATIONAL=${{ steps.filter.outputs.foundational }}
+          KERNELS=${{ steps.filter.outputs.kernels }}
+          LAYERS=${{ steps.filter.outputs.layers }}
+          MEM_CACHE=${{ steps.filter.outputs.mem_cache }}
+          SAMPLING=${{ steps.filter.outputs.sampling }}
+          MODEL_EXECUTOR=${{ steps.filter.outputs.model_executor }}
+          MODELS=${{ steps.filter.outputs.models }}
+          MANAGERS=${{ steps.filter.outputs.managers }}
+          ENTRYPOINTS=${{ steps.filter.outputs.entrypoints }}
+          SPECULATIVE=${{ steps.filter.outputs.speculative }}
+          LORA=${{ steps.filter.outputs.lora }}
+          MULTIMODAL=${{ steps.filter.outputs.multimodal }}
+          CONSTRAINED=${{ steps.filter.outputs.constrained }}
+          QUANTIZATION=${{ steps.filter.outputs.quantization }}
+          TEST_E2E=${{ steps.filter.outputs.test_e2e }}
+          ANY_SOURCE=${{ steps.filter.outputs.any_source }}
+          PALLAS_KERNEL=${{ steps.filter.outputs.pallas_kernel }}
+
+          # CORE = any core pipeline module changed
+          if [[ "$FOUNDATIONAL" == "true" || "$KERNELS" == "true" || "$LAYERS" == "true" \
+             || "$MEM_CACHE" == "true" || "$SAMPLING" == "true" || "$MODEL_EXECUTOR" == "true" \
+             || "$MODELS" == "true" || "$MANAGERS" == "true" || "$ENTRYPOINTS" == "true" ]]; then
+            CORE=true
+          else
+            CORE=false
+          fi
+
+          # Safety net: source changed but no specific filter matched → force CORE
+          if [[ "$ANY_SOURCE" == "true" && "$CORE" == "false" \
+             && "$SPECULATIVE" == "false" && "$LORA" == "false" \
+             && "$MULTIMODAL" == "false" && "$CONSTRAINED" == "false" \
+             && "$QUANTIZATION" == "false" ]]; then
+            echo "Safety net triggered: source changed but no specific filter matched, forcing CORE=true"
+            CORE=true
+          fi
+
+          # Compute per-job triggers
+          # unit-test-1-tpu: CORE or any leaf module or test changes
+          if [[ "$CORE" == "true" || "$SPECULATIVE" == "true" || "$MULTIMODAL" == "true" \
+             || "$LORA" == "true" || "$CONSTRAINED" == "true" || "$QUANTIZATION" == "true" \
+             || "$TEST_E2E" == "true" ]]; then
+            echo "unit_test_1=true" >> $GITHUB_OUTPUT
+          else
+            echo "unit_test_1=false" >> $GITHUB_OUTPUT
+          fi
+
+          # unit-test-4-tpu: only foundational/kernels/layers/mem_cache
+          if [[ "$FOUNDATIONAL" == "true" || "$KERNELS" == "true" \
+             || "$LAYERS" == "true" || "$MEM_CACHE" == "true" ]]; then
+            echo "unit_test_4=true" >> $GITHUB_OUTPUT
+          else
+            echo "unit_test_4=false" >> $GITHUB_OUTPUT
+          fi
+
+          # e2e-test-1-tpu: CORE or lora or constrained or test changes
+          if [[ "$CORE" == "true" || "$LORA" == "true" \
+             || "$CONSTRAINED" == "true" || "$TEST_E2E" == "true" ]]; then
+            echo "e2e_test_1=true" >> $GITHUB_OUTPUT
+          else
+            echo "e2e_test_1=false" >> $GITHUB_OUTPUT
+          fi
+
+          # e2e-test-4-tpu: CORE or quantization or multimodal or test changes
+          if [[ "$CORE" == "true" || "$QUANTIZATION" == "true" \
+             || "$MULTIMODAL" == "true" || "$TEST_E2E" == "true" ]]; then
+            echo "e2e_test_4=true" >> $GITHUB_OUTPUT
+          else
+            echo "e2e_test_4=false" >> $GITHUB_OUTPUT
+          fi
+
+          # accuracy-test: CORE only
+          echo "accuracy_test=$CORE" >> $GITHUB_OUTPUT
+
+          # performance-test: CORE only
+          echo "performance_test=$CORE" >> $GITHUB_OUTPUT
+
+          # pallas-kernel-benchmark
+          echo "pallas_kernel=$PALLAS_KERNEL" >> $GITHUB_OUTPUT
+
+          echo "--- Trigger summary ---"
+          echo "CORE=$CORE"
+          echo "unit_test_1=$(grep unit_test_1 $GITHUB_OUTPUT | tail -1)"
+          echo "unit_test_4=$(grep unit_test_4 $GITHUB_OUTPUT | tail -1)"
+          echo "e2e_test_1=$(grep e2e_test_1 $GITHUB_OUTPUT | tail -1)"
+          echo "e2e_test_4=$(grep e2e_test_4 $GITHUB_OUTPUT | tail -1)"
+          echo "accuracy_test=$CORE"
+          echo "performance_test=$CORE"
+          echo "pallas_kernel=$PALLAS_KERNEL"
   # =============================================== unit-test ====================================================
   unit-test-1-tpu:
     needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.unit_test_1 == 'true'
     runs-on: arc-runner-v6e-1
     #runs-on: ubuntu-slim
     strategy:
@@ -89,7 +232,7 @@ jobs:
 
   unit-test-4-tpu:
     needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.unit_test_4 == 'true'
     runs-on: arc-runner-v6e-4
     strategy:
       fail-fast: false
@@ -113,7 +256,7 @@ jobs:
   # =============================================== e2e-test ===============================================
   e2e-test-1-tpu:
     needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.e2e_test_1 == 'true'
     runs-on: arc-runner-v6e-1
     strategy:
       fail-fast: false
@@ -140,7 +283,7 @@ jobs:
 
   e2e-test-4-tpu:
     needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.e2e_test_4 == 'true'
     runs-on: arc-runner-v6e-4
     strategy:
       fail-fast: false
@@ -167,7 +310,7 @@ jobs:
   # =============================================== accurancy-test ===============================================
   accurancy-test-1-tpu:
     needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.accuracy_test == 'true'
     runs-on: arc-runner-v6e-1
     strategy:
       fail-fast: false
@@ -193,7 +336,7 @@ jobs:
 
   accurancy-test-4-tpu:
     needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.accuracy_test == 'true'
 
     runs-on: arc-runner-v6e-4
     strategy:
@@ -221,7 +364,7 @@ jobs:
   # =============================================== performance-test ===============================================
   performance-test-1-tpu:
     needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.performance_test == 'true'
 
     runs-on: arc-runner-v6e-1
     strategy:
@@ -248,7 +391,7 @@ jobs:
 
   performance-test-4-tpu:
     needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.performance_test == 'true'
 
     runs-on: arc-runner-v6e-4
     strategy:
@@ -301,6 +444,7 @@ jobs:
           python test/srt/run_suite.py --suite kernel-performance-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   pr-test-finish:
+    if: always()
     needs: [
       performance-test-1-tpu,
       performance-test-4-tpu,
@@ -312,7 +456,7 @@ jobs:
       e2e-test-4-tpu,
       pallas-kernel-benchmark,
     ]
-    runs-on: arc-runner-v6e-1
+    runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
         run: |
