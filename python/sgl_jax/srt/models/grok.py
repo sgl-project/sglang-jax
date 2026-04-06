@@ -483,6 +483,11 @@ class Grok1Attention(nnx.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
 
+        # Unshard activations if sequence parallel enabled
+        if True:
+            spec = jax.sharding.PartitionSpec(*([None] * len(hidden_states.shape)))
+            hidden_states = jax.sharding.reshard(hidden_states, spec)
+
         # Project Q, K, V separately
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
