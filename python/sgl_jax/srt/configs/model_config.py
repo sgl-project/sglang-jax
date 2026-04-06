@@ -172,8 +172,11 @@ class ModelConfig:
             "head_dim",
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
         )
-
-        self.attention_arch = AttentionArch.MHA
+        # TODO (qinghan): add the model architecture detection later, for now use deepseek
+        if any("Deepseek" in arch for arch in self.hf_config.architectures):
+            self.attention_arch = AttentionArch.MLA
+        else:
+            self.attention_arch = AttentionArch.MHA
         self.num_attention_heads = self.hf_text_config.num_attention_heads
         self.num_key_value_heads = getattr(self.hf_text_config, "num_key_value_heads", None)
 

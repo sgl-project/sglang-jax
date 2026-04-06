@@ -37,6 +37,7 @@ from sgl_jax.srt.mem_cache.allocator import (
 )
 from sgl_jax.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
+    MLATokenToKVPool,
     ReqToTokenPool,
     SplitMHATokenToKVPool,
     SWAKVPool,
@@ -540,6 +541,8 @@ class ModelRunner(BaseModelRunner):
             aligned_v_head_dim = (v_head_dim + 127) // 128 * 128
 
             pool_class = SplitMHATokenToKVPool if head_dim != v_head_dim else MHATokenToKVPool
+            if self.use_mla_backend:
+                pool_class = MLATokenToKVPool
             self.token_to_kv_pool = pool_class(
                 size=self.max_total_num_tokens,
                 page_size=self.page_size,
