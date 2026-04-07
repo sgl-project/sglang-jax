@@ -39,6 +39,25 @@ logger = logging.getLogger(__name__)
 
 init_fn = nnx.initializers.uniform()
 
+import functools
+
+def log_shardings(name):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            for i, a in enumerate(args):
+                if hasattr(a, 'aval') and hasattr(a.aval, 'sharding'):
+                    print(f"{name} input[{i}]: {a.aval.shape} {a.aval.sharding}")
+            result = fn(*args, **kwargs)
+            if hasattr(result, 'aval') and hasattr(result.aval, 'sharding'):
+                print(f"{name} output: {result.aval.shape} {result.aval.sharding}")
+            elif isinstance(result, tuple):
+                for i, r in enumerate(result):
+                    if hasattr(r, 'aval') and hasattr(r.aval, 'sharding'):
+                        print(f"{name} output[{i}]: {r.aval.shape} {r.aval.sharding}")
+            return result
+        return wrapper
+    return decorator
 
 def _yarn_linear_ramp_mask(low: float, high: float, dim: int, dtype: jnp.dtype) -> jax.Array:
     """Create a linear ramp mask for YaRN scaling."""
@@ -197,6 +216,7 @@ class Grok1MLP(nnx.Module):
         self.reduce_results = reduce_results
         self.mesh = mesh
 
+    @log_shardings("MLP")
     def __call__(self, x: jax.Array) -> jax.Array:
         # Unshard activations if sequence parallel enabled
         with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
@@ -284,6 +304,7 @@ class Grok1MoE(nnx.Module):
                 quantization_config=getattr(config, "quantization_config", None),
             )
 
+    @log_shardings("MoE")
     def __call__(
         self,
         hidden_states: jax.Array,
