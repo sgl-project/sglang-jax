@@ -227,6 +227,10 @@ class Grok1MLP(nnx.Module):
         up, _ = self.up_proj(x)
         x, _ = self.act_fn(gate, up)
         x, _ = self.down_proj(x)
+        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+            if len(x.shape) == 2 and x.shape[0] >= 64 or len(x.shape) == 3 and x.shape[1] >= 64:
+                out_specs = jax.sharding.PartitionSpec("tensor", None) if len(x.shape) == 2 else jax.sharding.PartitionSpec(None, "tensor", None)
+                x = jax.sharding.reshard(x, out_specs)
         return x
 
 
@@ -504,6 +508,7 @@ class Grok1Attention(nnx.Module):
         )
         self.attn.xai_temperature_len = getattr(config, "attn_temperature_len", -1)
 
+    @log_shardings("Attention")
     def __call__(
         self,
         positions: jax.Array,
@@ -538,6 +543,12 @@ class Grok1Attention(nnx.Module):
 
         # Project output
         output, _ = self.o_proj(attn_output)
+
+        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+            if len(output.shape) == 2 and output.shape[0] >= 64 or len(output.shape) == 3 and output.shape[1] >= 64:
+                out_specs = jax.sharding.PartitionSpec("tensor", None) if len(output.shape) == 2 else jax.sharding.PartitionSpec(None, "tensor", None)
+                output = jax.sharding.reshard(output, out_specs)
+
         return output, kv_fused
 
 
