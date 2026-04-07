@@ -98,9 +98,13 @@ spec:
               echo "=== Worker $TPU_WORKER_ID: devices=$(python3 -c 'import jax; print(jax.device_count())') ==="
 
               # Run official tuning script with our model params
+              # Create output dir
+              mkdir -p "$PROFILE_DIR"
+
+              # Run official tuning script with MiMoV2Flash params
               python -m benchmark.moe.bench_fused_moe \
                 --tune-block-config \
-                --num-experts 256 --topk 8 \
+                --num-experts 256 --top-k 8 \
                 --hidden-size 4096 --intermediate-size 2048 \
                 --num-tokens 1024 16384 \
                 --imbalance-mode balanced \
