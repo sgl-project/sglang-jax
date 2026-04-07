@@ -510,6 +510,16 @@ class SplitMHATokenToKVPool(MHATokenToKVPool):
     Used when K and V have different head_dim (e.g., K=192, V=128 in DeepSeek-V2).
     """
 
+    def prepare_split_kv_kernel_inputs(
+        self,
+        k: jax.Array,
+        v: jax.Array,
+        attention_sink: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+        # Keep cache storage in the physical head contract, but leave live per-step
+        # tensors to be aligned later on each local shard by the attention backend.
+        return k, v, attention_sink
+
     def _create_buffers(self):
         """Create sharded separate K and V cache buffers."""
         self.kv_sharding = NamedSharding(self.mesh, P(None, self.kv_partition_axis, None))
@@ -826,6 +836,19 @@ class SWAKVPool(KVCache):
         if hasattr(pool, "get_split_kv_buffer"):
             return pool.get_split_kv_buffer(layer_id_pool)
         return pool.get_kv_buffer(layer_id_pool)
+
+    def prepare_split_kv_kernel_inputs(
+        self,
+        layer_id: int,
+        k: jax.Array,
+        v: jax.Array,
+        attention_sink: jax.Array | None = None,
+    ):
+        layer_id_pool, is_swa = self.layers_mapping[layer_id]
+        pool = self.swa_kv_pool if is_swa else self.full_kv_pool
+        if hasattr(pool, "prepare_split_kv_kernel_inputs"):
+            return pool.prepare_split_kv_kernel_inputs(k, v, attention_sink)
+        return k, v, attention_sink
 
     def get_fused_kv_buffer(self, layer_id):
         layer_id_pool, is_swa = self.layers_mapping[layer_id]

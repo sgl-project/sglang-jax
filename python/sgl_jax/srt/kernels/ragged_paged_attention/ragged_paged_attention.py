@@ -18,6 +18,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_split import (
+    _prepare_logsumexp_outputs,
     ragged_paged_attention_split,
 )
 from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes import (
@@ -308,12 +309,14 @@ def _ragged_paged_attention_kernel(
     # Output
     o_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     updated_kv_cache_fused_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_interleaved // kv_packing, kv_packing, head_dim]
+    lse_hbm_ref,  # [actual_num_kv_heads, max_num_tokens + bq_sz, num_q_heads_per_kv_head // q_packing, lse_minor] or None
     # Scratch
     bkvmask_ref,  # [2, bq_sz, bkv_sz, head_dim]
     bkv_fused_x2_ref,  # [2, bkv_sz, num_kv_heads_interleaved // kv_packing, kv_packing, head_dim]
     bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     bo_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
-    sems,  # [5, 2]
+    lse_vmem_ref,  # [actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, lse_minor] or None
+    sems,  # [6, 2] (added 1 sem for lse DMA)
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim],
@@ -703,6 +706,22 @@ def _ragged_paged_attention_kernel(
         def _():
             _send_bo(old_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
 
+    def _send_lse(seq_idx, bq_idx):
+        """Send logsumexp from VMEM to HBM (blocking)."""
+        if lse_hbm_ref is not None and lse_vmem_ref is not None:
+            sem = sems.at[5, 0]
+            q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
+            q_end = cu_q_lens_ref[seq_idx + 1]
+            sz = jnp.minimum(bq_sz, q_end - q_len_start)
+
+            cp = pltpu.make_async_copy(
+                lse_vmem_ref.at[:, pl.ds(0, sz)],
+                lse_hbm_ref.at[:, pl.ds(q_len_start, sz)],
+                sem,
+            )
+            cp.start()
+            cp.wait()
+
     def start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz):
         bkv_update_ids_ref[bkv_sem_idx] = seq_idx
         bkv_update_ids_ref[bkv_sem_idx + 2] = offset
@@ -1027,6 +1046,18 @@ def _ragged_paged_attention_kernel(
                 if q_dtype == jnp.float32
                 else (acc * pl.reciprocal(l, approx=True)).astype(q_dtype)
             )
+
+            # Compute and send logsumexp for attention_sink correction.
+            if lse_vmem_ref is not None:
+                logsumexp = jnp.log(l_ref[..., 0]) + m_ref[..., 0]
+                lse_vmem_ref[...] = jnp.zeros(lse_vmem_ref.shape, dtype=jnp.float32)
+                lse_vmem_ref[:, :, :, :q_packing] = logsumexp.reshape(
+                    actual_num_kv_heads,
+                    bq_sz,
+                    num_q_heads_per_kv_head_per_packing,
+                    q_packing,
+                )
+                _send_lse(seq_idx, bq_idx)
 
             # Wait for previous bo to be fully sent before storing new bo.
             bo_sem_idx = sem_ids_ref[2]
@@ -1385,6 +1416,7 @@ def ragged_paged_attention(
     causal: int = 1,  # 1: True, 0: False
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
+    attention_sink: jax.Array | None = None,
     soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
     q_scale: float | None = None,
@@ -1457,6 +1489,7 @@ def ragged_paged_attention(
             causal=causal,
             sm_scale=sm_scale,
             sliding_window=sliding_window,
+            attention_sink=attention_sink,
             soft_cap=soft_cap,
             mask_value=mask_value,
             q_scale=q_scale,
@@ -1470,6 +1503,15 @@ def ragged_paged_attention(
         )
 
     # Fused path
+    # Prepare attention_sink for post-kernel correction (pad to actual_num_q_heads)
+    if attention_sink is not None:
+        sink = jnp.asarray(attention_sink, dtype=jnp.float32)
+        if sink.ndim == 0:
+            sink = jnp.full((queries.shape[1],), sink, dtype=jnp.float32)
+        if sink.shape[0] < queries.shape[1]:
+            sink = jnp.pad(sink, (0, queries.shape[1] - sink.shape[0]))
+        attention_sink = sink[:queries.shape[1]]
+
     q, k, v = queries, keys, values
     static_validate_inputs_fused(
         q,
@@ -1566,9 +1608,12 @@ def ragged_paged_attention(
         pl.BlockSpec(memory_space=pltpu.ANY),  # zero mask
     ]
 
+    lse_minor = 128
+
     out_specs = [
         pl.BlockSpec(memory_space=pltpu.ANY),  # output
         pl.BlockSpec(memory_space=pltpu.ANY),  # updated kv_cache_fused
+        pl.BlockSpec(memory_space=pltpu.ANY),  # logsumexp (always allocated; used for attention_sink)
     ]
 
     bkv_fused_double_buf = pltpu.VMEM(
@@ -1603,13 +1648,19 @@ def ragged_paged_attention(
         jnp.float32,
     )
 
+    lse_scratch = pltpu.VMEM(
+        (actual_num_kv_heads, bq_sz, q.shape[2], lse_minor),
+        jnp.float32,
+    )
+
     scratch_shapes = [
         bkvmask_double_buf,  # Double buffering for fused kv mask block with head interleaving.
         bkv_fused_double_buf,  # Double buffering for fused kv block with head interleaving.
         bq_double_buf,  # Double buffering for q block.
         bo_double_buf,  # Double buffering for output block.
-        # Semaphores for double buffering of bkv, bq, bo and bkv_update.
-        pltpu.SemaphoreType.DMA((5, 2)),
+        lse_scratch,  # VMEM scratch for logsumexp (None if not needed).
+        # Semaphores: bkv(0), bq(1), bo(2), bkv_update(3,4), lse(5).
+        pltpu.SemaphoreType.DMA((6, 2)),
         # Intermediate buffers per kv head for flash attention.
         l_scratch,
         m_scratch,
@@ -1665,6 +1716,16 @@ def ragged_paged_attention(
     cost_estimate = pl.CostEstimate(flops=flops, bytes_accessed=bytes_accessed, transcendentals=0)
 
     scope_name = get_kernel_scope_name(bq_sz, bkv_p, page_size)
+    lse_shape = (q.shape[0], q.shape[1] + bq_sz, q.shape[2], lse_minor)
+    out_shape_list = [
+        jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
+        jax.ShapeDtypeStruct(
+            shape=kv_cache_fused_processed.shape,
+            dtype=kv_cache_fused_processed.dtype,
+        ),
+        jax.ShapeDtypeStruct(shape=lse_shape, dtype=jnp.float32),
+    ]
+
     kernel = pl.pallas_call(
         functools.partial(
             _ragged_paged_attention_kernel,
@@ -1694,13 +1755,7 @@ def ragged_paged_attention(
             disable_bounds_checks=True,
         ),
         cost_estimate=cost_estimate,
-        out_shape=[
-            jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
-            jax.ShapeDtypeStruct(
-                shape=kv_cache_fused_processed.shape,
-                dtype=kv_cache_fused_processed.dtype,
-            ),
-        ],
+        out_shape=out_shape_list,
         input_output_aliases={
             9: 0,  # q input -> q output
             11: 1,  # kv_cache_fused input -> updated kv_cache_fused output
@@ -1708,7 +1763,7 @@ def ragged_paged_attention(
         name=scope_name,
     )
 
-    output, updated_kv_cache_fused = kernel(
+    kernel_results = kernel(
         *scalar_prefetches,
         q,
         kv,
@@ -1716,8 +1771,21 @@ def ragged_paged_attention(
         custom_mask,
         jnp.zeros((bkv_sz, head_dim), dtype=jnp.int32),
     )
+    output, updated_kv_cache_fused, logsumexp = kernel_results
+
+    prepared_output = prepare_outputs(output, actual_num_q_heads_per_kv_head, actual_head_dim)
+
+    # Post-kernel attention_sink correction
+    if attention_sink is not None:
+        logsumexp = logsumexp[:, :max_num_tokens]
+        prepared_lse = _prepare_logsumexp_outputs(logsumexp, actual_num_q_heads_per_kv_head)
+        alpha = jnp.reciprocal(1.0 + jnp.exp(attention_sink[None, :] - prepared_lse))
+        prepared_output = (prepared_output.astype(jnp.float32) * alpha[..., None]).astype(
+            prepared_output.dtype
+        )
+
     return (
-        prepare_outputs(output, actual_num_q_heads_per_kv_head, actual_head_dim),
+        prepared_output,
         prepare_updated_kv_cache_fused(
             updated_kv_cache_fused, actual_num_kv_heads, actual_head_dim
         ),

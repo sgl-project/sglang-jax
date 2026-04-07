@@ -4,16 +4,23 @@ Part 1: Kernel correctness — ragged_paged_attention with split k_cache/v_cache
 Part 2: FlashAttention backend + SplitMHATokenToKVPool end-to-end
 """
 
+import inspect
 import unittest
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental import multihost_utils
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
     ragged_paged_attention,
     ref_ragged_paged_attention,
+)
+from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_split import (
+    _compute_attention_sink_alpha,
+    _expand_attention_sink_logits,
 )
 from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
 from sgl_jax.srt.layers.radix_attention import RadixAttention
@@ -27,6 +34,143 @@ mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 jax.sharding.set_mesh(mesh)
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.float32).max)
+
+
+def test_ragged_paged_attention_accepts_attention_sink_kwarg():
+    assert "attention_sink" in inspect.signature(ragged_paged_attention).parameters
+
+
+def test_expand_attention_sink_logits_matches_head_gather_pattern():
+    actual_num_kv_heads = 2
+    num_q_heads_per_kv_head = 4
+    q_rows = 12
+    attention_sink = jnp.arange(
+        actual_num_kv_heads * num_q_heads_per_kv_head, dtype=jnp.float32
+    )
+
+    expanded = _expand_attention_sink_logits(
+        attention_sink,
+        actual_num_kv_heads=actual_num_kv_heads,
+        num_q_heads_per_kv_head=num_q_heads_per_kv_head,
+        q_rows=q_rows,
+    )
+
+    row_ids = jnp.arange(q_rows, dtype=jnp.int32)
+    head_in_kv = row_ids % num_q_heads_per_kv_head
+    kv_head_ids = jnp.arange(actual_num_kv_heads, dtype=jnp.int32)[:, None]
+    expected = attention_sink[kv_head_ids * num_q_heads_per_kv_head + head_in_kv[None, :]]
+
+    np.testing.assert_array_equal(np.asarray(expanded), np.asarray(expected))
+
+
+def test_attention_sink_alpha_matches_explicit_fake_token_softmax():
+    actual_num_kv_heads = 2
+    num_q_heads_per_kv_head = 2
+    q_rows = 4
+    kv_len = 3
+    v_dim = 2
+
+    regular_logits = jnp.array(
+        [
+            [[1.0, 0.5, -0.5], [0.1, -0.2, 0.3], [1.4, 0.2, -1.0], [0.7, 0.0, -0.1]],
+            [[-0.4, 0.6, 0.2], [0.9, -1.2, 0.4], [0.3, 0.1, -0.7], [0.8, 0.5, -0.6]],
+        ],
+        dtype=jnp.float32,
+    )
+    values = jnp.array(
+        [
+            [[1.0, 2.0], [0.0, 1.0], [3.0, -1.0]],
+            [[-1.0, 0.5], [2.0, 1.5], [0.5, -2.0]],
+        ],
+        dtype=jnp.float32,
+    )
+    attention_sink = jnp.array([0.2, -0.3, 0.7, 0.1], dtype=jnp.float32)
+
+    regular_weights = jax.nn.softmax(regular_logits, axis=-1)
+    regular_out = jnp.einsum("hqk,hkd->hqd", regular_weights, values)
+    logsumexp = jax.nn.logsumexp(regular_logits, axis=-1)
+
+    alpha = _compute_attention_sink_alpha(
+        attention_sink,
+        actual_num_kv_heads=actual_num_kv_heads,
+        num_q_heads_per_kv_head=num_q_heads_per_kv_head,
+        q_rows=q_rows,
+        logsumexp=logsumexp,
+    )
+    scaled_out = regular_out * alpha[..., None]
+
+    sink_logits = _expand_attention_sink_logits(
+        attention_sink,
+        actual_num_kv_heads=actual_num_kv_heads,
+        num_q_heads_per_kv_head=num_q_heads_per_kv_head,
+        q_rows=q_rows,
+    )
+    explicit_logits = jnp.concatenate([sink_logits[..., None], regular_logits], axis=-1)
+    explicit_weights = jax.nn.softmax(explicit_logits, axis=-1)[..., 1:]
+    explicit_out = jnp.einsum("hqk,hkd->hqd", explicit_weights, values)
+
+    np.testing.assert_allclose(np.asarray(scaled_out), np.asarray(explicit_out), rtol=1e-6, atol=1e-6)
+
+
+def test_ref_split_attention_with_attention_sink_matches_fake_token_reference():
+    queries = jnp.array(
+        [
+            [[0.2, -0.1, 0.4, 0.3], [0.5, 0.6, -0.2, 0.1], [0.1, -0.4, 0.7, 0.2], [0.3, 0.0, 0.2, -0.5]],
+            [[-0.2, 0.3, 0.1, 0.6], [0.4, -0.5, 0.2, 0.7], [0.6, 0.1, -0.3, 0.0], [0.2, 0.8, -0.1, -0.4]],
+        ],
+        dtype=jnp.float32,
+    )
+    k_pages = jnp.array(
+        [
+            [[[0.1, 0.2, 0.3, 0.4], [0.0, 0.5, -0.2, 0.1]]],
+            [[[0.4, -0.1, 0.2, 0.3], [0.3, 0.2, 0.1, -0.4]]],
+            [[[0.2, 0.0, -0.3, 0.6], [-0.1, 0.4, 0.2, 0.5]]],
+        ],
+        dtype=jnp.float32,
+    )
+    v_pages = jnp.array(
+        [
+            [[[1.0, 0.5], [0.2, -0.3]]],
+            [[[0.4, 1.2], [-0.5, 0.7]]],
+            [[[1.5, -0.2], [0.8, 0.1]]],
+        ],
+        dtype=jnp.float32,
+    )
+    kv_lens = jnp.array([3], dtype=jnp.int32)
+    page_table = jnp.array([[0, 1, 2]], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 2], dtype=jnp.int32)
+    num_seqs = jnp.array([1], dtype=jnp.int32)
+    attention_sink = jnp.array([0.2, -0.1, 0.6, 0.0], dtype=jnp.float32)
+    sm_scale = queries.shape[-1] ** -0.5
+
+    actual = ref_split_attention(
+        queries,
+        k_pages,
+        v_pages,
+        kv_lens,
+        page_table,
+        cu_q_lens,
+        num_seqs,
+        causal=True,
+        sm_scale=sm_scale,
+        attention_sink=attention_sink,
+    )
+
+    k = k_pages[page_table[0]].reshape(-1, 2, 4)[: kv_lens[0]]
+    v = v_pages[page_table[0]].reshape(-1, 2, 2)[: kv_lens[0]]
+    k = jnp.repeat(k, 2, axis=1)
+    v = jnp.repeat(v, 2, axis=1)
+    logits = jnp.einsum("qhd,khd->hqk", queries, k, preferred_element_type=jnp.float32) * sm_scale
+    q_len = queries.shape[0]
+    kv_len = int(kv_lens[0])
+    q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, logits.shape, 1)
+    kv_span = jax.lax.broadcasted_iota(jnp.int32, logits.shape, 2)
+    logits = logits + jnp.where(q_span < kv_span, DEFAULT_MASK_VALUE, 0.0)
+    sink = jnp.repeat(attention_sink[:, None, None], q_len, axis=1)
+    weights = jax.nn.softmax(jnp.concatenate([sink, logits], axis=-1), axis=-1)[..., 1:]
+    expected = jnp.einsum("hqk,khd->qhd", weights, v)
+
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +188,7 @@ def ref_split_attention(
     causal: bool = True,
     sm_scale: float = 1.0,
     mask_value: float = DEFAULT_MASK_VALUE,
+    attention_sink: jax.Array | None = None,
     sliding_window: int | None = None,
 ):
     """Pure JAX reference for split KV attention (K and V may have different head_dim)."""
@@ -84,7 +229,15 @@ def ref_split_attention(
             sw_mask = q_span - sliding_window >= kv_span
             attn += jnp.where(sw_mask, mask_value, 0.0)
 
-        attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
+        if attention_sink is not None:
+            sink = jnp.asarray(attention_sink, dtype=attn.dtype)
+            if sink.ndim == 0:
+                sink = jnp.full((num_q_heads,), sink, dtype=attn.dtype)
+            sink = jnp.repeat(sink[:, None, None], attn.shape[1], axis=1)
+            attn = jnp.concatenate([sink, attn], axis=-1)
+            attn = jax.nn.softmax(attn, axis=-1)[..., 1:].astype(v.dtype)
+        else:
+            attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
         # attn*V: output has v_head_dim
         out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
         outputs.append(out)
@@ -419,6 +572,7 @@ class TestSplitKernelAttention(CustomTestCase):
         num_kv_heads,
         v_head_dim,
         page_size,
+        attention_sink=None,
         sliding_window=None,
         num_kv_pages_per_block=None,
     ):
@@ -517,6 +671,7 @@ class TestSplitKernelAttention(CustomTestCase):
             jnp.array(num_seqs),
             causal=True,
             sm_scale=sm_scale,
+            attention_sink=attention_sink,
             sliding_window=sliding_window,
         )
         jax.block_until_ready(expected)
@@ -530,12 +685,7 @@ class TestSplitKernelAttention(CustomTestCase):
             P(None, kv_part),
             P(None, None, kv_part, None),
             P(None, None, kv_part, None),
-            P(),
-            P(),
-            P(),
-            P(),
-            P(),
-            P(),
+            P(), P(), P(), P(), P(), P(), P(kv_part),
         )
         out_specs = (
             P(None, kv_part),
@@ -551,35 +701,32 @@ class TestSplitKernelAttention(CustomTestCase):
 
         def _split_kernel(*args):
             queries, keys_new, values_new, k_cache_arg, v_cache_arg = args[:5]
-            other_args = args[5:]
+            kv_lens_arg, page_indices_arg, cu_q_lens_arg, cu_kv_lens_arg, distribution_arg = args[5:10]
+            custom_mask_arg, attention_sink_arg = args[10:12]
             result, updated_k, updated_v = ragged_paged_attention(
                 queries,
                 keys_new,
                 values_new,
                 None,
-                *other_args,
+                kv_lens_arg,
+                page_indices_arg,
+                cu_q_lens_arg,
+                cu_kv_lens_arg,
+                distribution_arg,
+                custom_mask_arg,
                 k_cache=k_cache_arg,
                 v_cache=v_cache_arg,
                 causal=1,
                 sm_scale=sm_scale,
                 sliding_window=sliding_window,
+                attention_sink=attention_sink_arg,
                 num_kv_pages_per_block=num_kv_pages_per_block,
             )
             return result, updated_k, updated_v
 
         @jax.jit
-        def run_kernel(
-            q,
-            extend_k,
-            extend_v,
-            k_pages,
-            v_pages,
-            seq_lens_j,
-            page_indices_j,
-            cu_q_lens_j,
-            cu_kv_lens_j,
-            distribution_j,
-        ):
+        def run_kernel(q, extend_k, extend_v, k_pages, v_pages, seq_lens_j, page_indices_j,
+                       cu_q_lens_j, cu_kv_lens_j, distribution_j, attention_sink_j):
             attn_output, updated_k, updated_v = jax.shard_map(
                 _split_kernel,
                 in_specs=in_specs,
@@ -597,25 +744,31 @@ class TestSplitKernelAttention(CustomTestCase):
                 cu_kv_lens_j,
                 distribution_j,
                 None,  # custom_mask
+                attention_sink_j,
             )
             return attn_output, updated_k, updated_v
 
         sharding = jax.sharding.NamedSharding(mesh, P(None, "tensor"))
         q_shard = jax.device_put(q, sharding)
+        sink_sharding = jax.sharding.NamedSharding(mesh, P("tensor"))
+        attention_sink_shard = (
+            jax.device_put(jnp.asarray(attention_sink, dtype=jnp.float32), sink_sharding)
+            if attention_sink is not None
+            else None
+        )
 
         jax_output, _, _ = run_kernel(
-            q_shard,
-            extend_k,
-            extend_v,
-            k_pages,
-            v_pages,
-            seq_lens_jnp,
-            page_indices_jnp,
-            cu_q_lens_jnp,
-            cu_kv_lens_jnp,
-            distribution_jnp,
+            q_shard, extend_k, extend_v, k_pages, v_pages,
+            seq_lens_jnp, page_indices_jnp, cu_q_lens_jnp, cu_kv_lens_jnp, distribution_jnp,
+            attention_sink_shard,
         )
         jax.block_until_ready(jax_output)
+        if jax.process_count() > 1:
+            # shard_map returns a global jax.Array on multi-host TPU; gather the
+            # tiled global value before converting to NumPy on process 0.
+            jax_output = multihost_utils.process_allgather(jax_output, tiled=True)
+        if jax.process_index() != 0:
+            return
 
         # Compare
         rtol = 2e-2
@@ -714,6 +867,19 @@ class TestSplitKernelAttention(CustomTestCase):
             page_size=16,
         )
 
+    def test_split_kernel_gqa_decode_ps1_attention_sink(self):
+        """GQA decode with split KV and attention sink enabled on a 16-way mesh."""
+        self.run_kernel_test(
+            mode="decode",
+            lens=[(1, 127), (1, 128), (1, 512)],
+            num_heads=64,
+            head_dim=256,
+            num_kv_heads=32,
+            v_head_dim=128,
+            page_size=1,
+            attention_sink=jnp.linspace(-0.4, 0.4, 64, dtype=jnp.float32),
+        )
+
     # --- sliding_window tests (SWA with bkv_idx_start > 0) ---
     def test_split_kernel_sliding_window_decode_ps16(self):
         """Decode with sliding_window where bkv_idx_start > 0.
@@ -733,6 +899,21 @@ class TestSplitKernelAttention(CustomTestCase):
             page_size=16,
             sliding_window=32,
             num_kv_pages_per_block=4,
+        )
+
+    def test_split_kernel_sliding_window_attention_sink_decode_ps16(self):
+        """Decode with both sliding_window and attention_sink (MiMo-V2-Flash style)."""
+        self.run_kernel_test(
+            mode="decode",
+            lens=[(1, 128), (1, 256)],
+            num_heads=16,
+            head_dim=192,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=16,
+            sliding_window=32,
+            num_kv_pages_per_block=4,
+            attention_sink=jnp.linspace(-0.4, 0.4, 16, dtype=jnp.float32),
         )
 
     def test_split_kernel_sliding_window_prefill_ps16(self):
@@ -822,10 +1003,32 @@ class TestSplitKernelAttention(CustomTestCase):
             page_size=16,
         )
 
-
 # ===================================================================
 # Part 2: FlashAttention backend + split KV cache tests
 # ===================================================================
+def test_flashattention_uses_split_path_for_wrapped_split_cache(monkeypatch):
+    backend = FlashAttention(
+        num_attn_heads=4,
+        num_kv_heads=2,
+        head_dim=128,
+        v_head_dim=64,
+        page_size=1,
+        mesh=mesh,
+    )
+    split_result = object()
+    fused_result = object()
+    monkeypatch.setattr(backend, "_call_split", lambda *args, **kwargs: split_result)
+    monkeypatch.setattr(backend, "_call_fused", lambda *args, **kwargs: fused_result)
+
+    q = jnp.zeros((1, 4, 128), dtype=jnp.bfloat16)
+    token_to_kv_pool = SimpleNamespace(is_split=True)
+    layer = SimpleNamespace(layer_id=0)
+
+    result = backend(q, q, q, layer, None, token_to_kv_pool)
+
+    assert result is split_result
+
+
 class TestSplitBackendAttention(CustomTestCase):
     """Test FlashAttention backend with SplitMHATokenToKVPool end-to-end."""
 
