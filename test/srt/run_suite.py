@@ -20,7 +20,6 @@ class TestFile:
         None  # Optional: specific test methods to run (e.g., ["TestClass.test_method"])
     )
     runner: str = "python"
-    extra_deps: list[str] | None = None
 
 
 def run_with_timeout(
@@ -126,18 +125,12 @@ def run_unittest_files(files: list[TestFile], timeout_per_file: float):
                         "run",
                         "--with",
                         "pytest",
+                        "python",
+                        "-m",
+                        "pytest",
+                        "-q",
+                        filename,
                     ]
-                    for dep in file_entry.extra_deps or []:
-                        cmd.extend(["--with", dep])
-                    cmd.extend(
-                        [
-                            "python",
-                            "-m",
-                            "pytest",
-                            "-q",
-                            filename,
-                        ]
-                    )
                 else:
                     cmd = [sys.executable, filename]
 
@@ -457,7 +450,6 @@ suites = {
         TestFile("python/sgl_jax/test/multimodal/test_wan_vae_precision.py", 1),
         TestFile("python/sgl_jax/test/multimodal/test_vae_scheduler.py", 2),
         TestFile("python/sgl_jax/test/multimodal/test_flash_attention_kernel.py", 2),
-        TestFile("python/sgl_jax/test/layers/test_group_rmsnorm.py", 1, runner="pytest"),
         TestFile("test/srt/lora/test_bgmv_backend.py", 5),
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 10),
     ],
@@ -471,17 +463,11 @@ suites = {
         TestFile("benchmark/kernels/update_kv_cache/bench_update_kv_cache.py", 3),
     ],
     "accuracy-test-tpu-v6e-1": [
-        TestFile(
-            "test/srt/test_eval_accuracy_large.py",
-            5,
-            ["TestEvalAccuracyLarge.test_mmlu"],
-        ),
+        TestFile("test/srt/test_eval_accuracy_large.py", 5, ["TestEvalAccuracyLarge.test_mmlu"]),
     ],
     "accuracy-test-tpu-v6e-4": [
         TestFile(
-            "test/srt/test_moe_eval_accuracy_large.py",
-            40,
-            ["TestMoEEvalAccuracyLarge.test_mmlu"],
+            "test/srt/test_moe_eval_accuracy_large.py", 40, ["TestMoEEvalAccuracyLarge.test_mmlu"]
         ),
     ],
     "performance-test-tpu-v6e-1": [TestFile("test/srt/test_bench_serving_dense.py", 7)],
@@ -519,11 +505,7 @@ suites = {
         # TestFile("test/srt/test_sliding_window_attention.py", 30), # add after gpt-oss supported
         TestFile("test/srt/test_model_loader.py", 5),
         TestFile("test/srt/quantization/test_w8_quantization.py", 10),
-        TestFile(
-            "test/srt/quantization/test_w8_block_dynamic_quantization.py",
-            8,
-            runner="pytest",
-        ),
+        TestFile("test/srt/quantization/test_w8_block_dynamic_quantization.py", 8, runner="pytest"),
         TestFile(
             "test/srt/quantization/test_w8_moe_block_linear_channel_quantization.py",
             15,
