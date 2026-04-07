@@ -8,7 +8,6 @@ TPU blockwise quantized matmul kernel.  The overall call flow is:
         |
         |-- get_blockwise_kernel()                   # lazy-load the kernel function
         |-- should_use_blockwise_kernel()            # narrow-N shape guard
-        |-- convert_block_scale_to_kernel_layout()   # scale format conversion
         |-- get_safe_blockwise_tuned_value()          # resolve TPU tile sizes
         |       |
         |       |-- _get_blockwise_tuning_api()          # lazy-load tuning tables
@@ -29,7 +28,6 @@ the actual local matrix dimensions so that the kernel launch is always valid.
 import functools
 import importlib
 import logging
-import math
 import re
 
 import jax
@@ -215,18 +213,22 @@ def _iter_blockwise_tuned_candidates(
     return [value for _, value in candidates]
 
 
+_MIN_MXU_TILE_N = 256
+"""Minimum TPU MXU output tile width (compute_tile_n = 256 * n_lane_multiplier)."""
+
+
 def should_use_blockwise_kernel(
     *,
     out_dim: int,
     block_size_out: int,
 ) -> bool:
-    """Guard known-bad narrow-N TPU blockwise cases.
+    """Return whether the TPU blockwise kernel is valid for the local N size.
 
-    When a tensor-parallel column shard collapses to a single output block
-    (for example local N=128 with block_size_out=128), the TPU blockwise
-    kernel can produce NaNs on Qwen3-MoE k/v projections.
+    The blockwise kernel requires out_dim >= _MIN_MXU_TILE_N (256) because
+    compute_tile_n = 256 * n_lane_multiplier, and _floor_multiple(out_dim,
+    compute_tile_n) would be 0 for out_dim < 256, making the kernel invalid.
     """
-    return out_dim > block_size_out
+    return out_dim >= max(block_size_out, _MIN_MXU_TILE_N)
 
 
 def expand_block_scale(
@@ -267,32 +269,6 @@ def expand_block_scale(
     # Transpose to [in_blocks, n_out] and insert the singleton dim expected
     # by the blockwise kernel: [in_blocks, 1, n_out].
     return jnp.transpose(scale_per_channel, (1, 0))[:, None, :]
-
-
-def convert_block_scale_to_kernel_layout(
-    w_scale: jax.Array,
-    out_dim: int,
-    in_dim: int,
-    block_size_out: int,
-    block_size_in: int,
-) -> jax.Array:
-    """Convert our block-scale layout to the TPU kernel layout.
-
-    .. deprecated::
-        Use :func:`expand_block_scale` at init time instead.  This function
-        is kept only for internal / test compatibility.
-    """
-    needed_out_blocks = math.ceil(out_dim / block_size_out)
-    needed_in_blocks = math.ceil(in_dim / block_size_in)
-
-    if w_scale.shape[0] < needed_out_blocks or w_scale.shape[1] < needed_in_blocks:
-        raise ValueError(
-            "Block scale shape is smaller than required by weight shape: "
-            f"w_scale.shape={w_scale.shape}, needed=({needed_out_blocks}, {needed_in_blocks})."
-        )
-
-    scale_2d = w_scale[:needed_out_blocks, :needed_in_blocks]
-    return expand_block_scale(scale_2d, out_dim, block_size_out)
 
 
 def get_safe_blockwise_tuned_value(

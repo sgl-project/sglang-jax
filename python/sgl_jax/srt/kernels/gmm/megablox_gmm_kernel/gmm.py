@@ -88,6 +88,30 @@ def _calculate_irregular_num_tiles(x: int, tx: int) -> tuple[int, int]:
     return tiles, rem
 
 
+def _pad_rows_for_tiling(
+    lhs: jax.Array,
+    group_sizes: jax.Array,
+    tm: int,
+    existing_out: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array | None, int]:
+    """Pad the M dimension so grouped matmul can use a fixed tile size.
+
+    The MegaBlocks metadata builder assumes `m` is divisible by `tm`. When it
+    is not, append zero rows to `lhs` and account for them in the final group.
+    The padded rows are sliced away from the final result.
+    """
+    m = lhs.shape[0]
+    pad_rows = (-m) % tm
+    if pad_rows == 0:
+        return lhs, group_sizes, existing_out, m
+
+    lhs = jnp.pad(lhs, ((0, pad_rows), (0, 0)))
+    group_sizes = group_sizes.at[-1].add(jnp.asarray(pad_rows, dtype=group_sizes.dtype))
+    if existing_out is not None:
+        existing_out = jnp.pad(existing_out, ((0, pad_rows), (0, 0)))
+    return lhs, group_sizes, existing_out, m
+
+
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class GroupMetadata:
@@ -345,6 +369,7 @@ def gmm(
         expected_dtype = existing_out.dtype
         if expected_dtype != preferred_element_type:
             raise ValueError("Existing output dtype must match preferred_element_type.")
+
     if group_offset is None:
         group_offset = jnp.array([0], dtype=jnp.int32)
     else:
@@ -384,6 +409,14 @@ def gmm(
         raise ValueError(f"No tuned tiling found for (m, k, n) = ({m}, {k}, {n})")
 
     tm, tk, tn = tiling
+
+    lhs, group_sizes, existing_out, original_m = _pad_rows_for_tiling(
+        lhs,
+        group_sizes,
+        tm,
+        existing_out,
+    )
+    m = lhs.shape[0]
 
     if rhs_scale is not None:
         assert isinstance(rhs_scale, jax.Array)
@@ -614,4 +647,6 @@ def gmm(
             num_nonzero_groups=rhs.shape[0],
             group_metadata=group_metadata,
         )
+    if original_m != m:
+        out = out[:original_m]
     return out
