@@ -211,6 +211,47 @@ def apply_linear_quantization(
     return model
 
 
+def finalize_quantized_layers(model: nnx.Module) -> None:
+    """Pre-dequant QuantizedLinear layers whose blockwise kernel can't handle them.
+
+    Called once after weight loading.  Walks the model tree and invokes
+    ``maybe_pre_dequant()`` on every :class:`QuantizedLinear` whose local
+    output dimension is too small for the TPU blockwise kernel.  After this
+    call the affected layers store bf16 weights and use a plain matmul in
+    their forward pass, avoiding per-step dequantization overhead.
+    """
+    from sgl_jax.srt.layers.linear import QuantizedLinear
+
+    visited: set[int] = set()
+    count = 0
+
+    def _walk(obj, path=""):
+        nonlocal count
+        if id(obj) in visited:
+            return
+        visited.add(id(obj))
+
+        if isinstance(obj, QuantizedLinear):
+            if obj.maybe_pre_dequant():
+                logger.info("Pre-dequanted: %s", path)
+                count += 1
+            return
+
+        if hasattr(obj, "__dict__"):
+            for name, val in obj.__dict__.items():
+                child = f"{path}/{name}" if path else name
+                if isinstance(val, nnx.Module):
+                    _walk(val, child)
+                elif isinstance(val, list):
+                    for i, item in enumerate(val):
+                        if isinstance(item, nnx.Module):
+                            _walk(item, f"{child}[{i}]")
+
+    _walk(model)
+    if count:
+        logger.info("Pre-dequanted %d layers total", count)
+
+
 def apply_moe_quantization(
     model_config: ModelConfig, model: nnx.Module, is_static_input: bool = False
 ) -> nnx.Module:

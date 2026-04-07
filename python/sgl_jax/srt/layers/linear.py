@@ -9,7 +9,7 @@ from jax import shard_map
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import expand_block_scale
+from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import should_use_blockwise_kernel
 from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
@@ -39,6 +39,7 @@ class LinearBase(nnx.Module):
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         kernel_axes: Sequence[str | None] | None = None,
         scope_name: str = "linear_base",
+        force_dequant: bool = False,
     ):
         """Initialize parameters and quantization method."""
         self.skip_bias_add = skip_bias_add
@@ -46,6 +47,7 @@ class LinearBase(nnx.Module):
         self.kernel_axes = kernel_axes
         self.mesh = mesh
         self.name = scope_name
+        self.force_dequant = force_dequant
 
         self.weight = nnx.Param(
             jax.random.normal(
@@ -93,15 +95,10 @@ class QuantizedLinear(nnx.Module):
     quantized matmul kernel for the forward pass. Weights are quantized once
     at initialization/conversion time, and activations are quantized at runtime.
 
-    Block-wise scales are pre-expanded from ``[out_blocks, in_blocks]`` to the
-    kernel-ready ``[in_blocks, 1, n_out]`` layout at init time so that no
-    ``jnp.repeat`` runs on the inference hot path.
-
     Args:
         weight_q: Quantized weight tensor with shape ``[output_size, input_size]``.
         weight_scale: Weight quantization scale. Per-channel uses
-            ``[output_size]``; block-wise uses ``[in_blocks, 1, output_size]``
-            (pre-expanded kernel-ready layout).
+            ``[output_size]``; block-wise uses ``[in_blocks, 1, output_size]``.
         bias: Optional bias tensor with shape ``[output_size]``.
         activation_dtype: Dtype for activation quantization. ``None`` disables
             activation quantization.
@@ -128,21 +125,9 @@ class QuantizedLinear(nnx.Module):
         compute_dtype: jnp.dtype | None = None,
         weight_block_size: tuple[int, int] | None = None,
         scope_name: str = "quantized_linear",
+        force_dequant: bool = False,
     ):
         """Initialize the quantized linear layer with pre-quantized weights."""
-        # Auto-expand 2D block-quant scale to 3D kernel-ready layout.
-        # This handles direct construction (not via from_linear) where the
-        # caller passes a compact 2D scale [out_blocks, in_blocks] or
-        # [n_out, in_blocks] along with weight_block_size.
-        if (
-            weight_block_size is not None
-            and not isinstance(weight_scale, jax.ShapeDtypeStruct)
-            and weight_scale.ndim == 2
-        ):
-            n_out = weight_q.shape[0] if not isinstance(weight_q, jax.ShapeDtypeStruct) else None
-            if n_out is not None:
-                weight_scale = expand_block_scale(weight_scale, n_out, int(weight_block_size[0]))
-
         self.weight_q = nnx.Param(weight_q)
         self.weight_scale = nnx.Param(weight_scale)
         self.bias = nnx.Param(bias) if bias is not None else None
@@ -154,6 +139,47 @@ class QuantizedLinear(nnx.Module):
         self.compute_dtype = compute_dtype
         self.weight_block_size = weight_block_size
         self.name = scope_name
+        self.force_dequant = force_dequant
+        self._pre_dequanted = False
+
+    def maybe_pre_dequant(self) -> bool:
+        """Pre-dequant blockwise weights when the blockwise kernel can't handle them.
+
+        Called once at model-loading time. Converts block-scaled int8 weights
+        to bf16 so the forward pass uses a plain matmul instead of going
+        through the quantized kernel fallback on every step.
+        """
+        if self._pre_dequanted or self.weight_scale is None:
+            return False
+
+        scale_val = self.weight_scale.value
+        if scale_val.ndim != 3:
+            return False
+
+        w_q = self.weight_q.value
+        out_dim, in_dim = w_q.shape
+
+        # Compute the local out_dim that shard_map would see.
+        output_axis = self.kernel_axes[1] if self.kernel_axes else None
+        local_out = out_dim // self.mesh.shape[output_axis] if output_axis else out_dim
+        block_size_out = int(self.weight_block_size[0]) if self.weight_block_size else local_out
+
+        if not self.force_dequant and should_use_blockwise_kernel(out_dim=local_out, block_size_out=block_size_out):
+            return False
+
+        # Dequant: expand block scale and multiply into weights.
+        in_blocks = scale_val.shape[0]
+        block_size_in = in_dim // in_blocks
+        scale_2d = scale_val[:, 0, :]  # [in_blocks, out_dim]
+        scale_full = jnp.repeat(scale_2d, block_size_in, axis=0)[:in_dim]  # [in_dim, out_dim]
+        scale_full = jnp.transpose(scale_full, (1, 0))  # [out_dim, in_dim]
+        w_deq = (w_q.astype(jnp.float32) * scale_full.astype(jnp.float32)).astype(jnp.bfloat16)
+
+        self.weight_q = nnx.Param(w_deq)
+        self.weight_scale = None
+        self.weight_block_size = None
+        self._pre_dequanted = True
+        return True
 
     @classmethod
     def from_linear(
@@ -208,7 +234,6 @@ class QuantizedLinear(nnx.Module):
                         effective_weight_block_size[1]
                     )
                     in_blocks = (in_features + block_k - 1) // block_k
-                    # Pre-expanded kernel-ready layout: [in_blocks, 1, n_out].
                     scale_sharding = NamedSharding(
                         linear.mesh, P(kernel_axes[0], None, kernel_axes[1])
                     )
@@ -238,10 +263,9 @@ class QuantizedLinear(nnx.Module):
                     block_n, block_k = int(effective_weight_block_size[0]), int(
                         effective_weight_block_size[1]
                     )
-                    out_blocks = (weight_q.shape[0] + block_n - 1) // block_n
                     in_blocks = (weight_q.shape[1] + block_k - 1) // block_k
-                    scale_2d = jnp.ones((out_blocks, in_blocks), dtype=jnp.float32)
-                    weight_scale = expand_block_scale(scale_2d, weight_q.shape[0], block_n)
+                    out_features = weight_q.shape[0]
+                    weight_scale = jnp.ones((in_blocks, 1, out_features), dtype=jnp.float32)
                 else:
                     weight_scale = jnp.ones((weight_q.shape[0],), dtype=jnp.float32)
                 bias = linear.bias.value if linear.bias is not None else None
@@ -260,13 +284,6 @@ class QuantizedLinear(nnx.Module):
                     axis=(0, 1),
                     block_size=tuple(effective_weight_block_size),
                     pad_tensor=True,
-                )
-                # Expand scale from [out_blocks, in_blocks] to kernel-ready
-                # [in_blocks, 1, n_out] at init time.
-                weight_scale = expand_block_scale(
-                    weight_scale,
-                    weight_q.shape[0],
-                    int(effective_weight_block_size[0]),
                 )
             else:
                 # Per-channel quantization along output dimension.
@@ -290,6 +307,7 @@ class QuantizedLinear(nnx.Module):
             params_dtype=linear.params_dtype,
             weight_block_size=effective_weight_block_size,
             scope_name=f"quantized_{linear.name}",
+            force_dequant=getattr(linear, 'force_dequant', False),
         )
 
     @named_scope
@@ -303,6 +321,26 @@ class QuantizedLinear(nnx.Module):
             Tuple of (output, bias) where output is [..., output_size]
             and bias is returned if skip_bias_add is True
         """
+        # Fast path for pre-dequanted layers: pure bf16 matmul.
+        if self._pre_dequanted:
+            x_2d = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
+            output_pspec = P(*([None] * (x_2d.ndim - 1)), self.kernel_axes[1])
+            output_sharding = NamedSharding(self.mesh, output_pspec)
+            output = lax.dot_general(
+                x_2d,
+                self.weight_q.value,
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=self.params_dtype,
+                out_sharding=output_sharding,
+            )
+            if x.ndim > 2:
+                output = output.reshape(x.shape[:-1] + (output.shape[-1],))
+            if self.skip_bias_add:
+                return output, self.bias
+            if self.bias is not None:
+                output = output + self.bias.value
+            return output, None
+
         # Determine if we should quantize activations.
         quantize_activation = self.activation_dtype is not None
 
@@ -310,24 +348,12 @@ class QuantizedLinear(nnx.Module):
         x_2d = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
 
         scale_val = self.weight_scale.value
-        if (
-            scale_val.ndim == 2
-            and scale_val.shape[1] == 1
-            and scale_val.shape[0] == self.weight_q.value.shape[0]
-        ):
-            scale_val = jnp.squeeze(scale_val, axis=1)
 
-        # Shard specs for shard_map.
-        # kernel_axes = (input_axis, output_axis):
-        #   row-parallel  (e.g., o_proj): ("tensor", None)
-        #   col-parallel  (e.g., q_proj): (None, "tensor")
         input_axis, output_axis = self.kernel_axes[0], self.kernel_axes[1]
-        if scale_val.ndim == 3:  # noqa: SIM108
-            # Pre-expanded block scale: [in_blocks, 1, n_out]
-            w_scale_spec = P(input_axis, None, output_axis)
-        else:
-            # Per-channel scale: [n_out]
+        if scale_val.ndim == 1:
             w_scale_spec = P(output_axis)
+        else:  # ndim == 3, block-quant
+            w_scale_spec = P(input_axis, None, output_axis)
         in_specs = (P(None, input_axis), P(output_axis, input_axis), w_scale_spec)
         out_specs = P(None, output_axis)
 

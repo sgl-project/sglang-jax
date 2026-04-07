@@ -8,9 +8,9 @@ from jax import lax
 from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
     get_blockwise_kernel,
     get_safe_blockwise_tuned_value,
-    should_use_blockwise_kernel,
 )
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor_simple
+
 
 
 def xla_quantized_matmul_local(
@@ -66,18 +66,11 @@ def xla_quantized_matmul_local(
         blockwise_kernel = get_blockwise_kernel()
         if blockwise_kernel is None:
             raise RuntimeError(
-                "Block-wise quantized matmul requires the blockwise kernel, "
-                "but it failed to load. Please check your installation."
+                "Block-wise quantized matmul requires the TPU blockwise kernel, "
+                "but it is not available on this backend. "
+                "Layers with out_dim < 256 should be pre-dequanted via "
+                "finalize_quantized_layers() at model-loading time."
             )
-        if not should_use_blockwise_kernel(
-            out_dim=int(out_dim),
-            block_size_out=int(block_size_out),
-        ):
-            raise RuntimeError(
-                f"Block-wise kernel does not support out_dim={out_dim} with "
-                f"block_size_out={block_size_out} (known to cause NaNs)."
-            )
-
         # w_scale is already in kernel-ready layout [in_blocks, 1, n_out].
         x_q_dtype = act_quant_dtype if quantize_activation else x.dtype
         tuned_value = get_safe_blockwise_tuned_value(
