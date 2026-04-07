@@ -573,7 +573,7 @@ def _ragged_paged_attention_kernel_split(
                     if custom_mask_ref is not None:
                         start_fetch_mask(next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx)
 
-                @pl.when(bkv_idx == 0)
+                @pl.when(bkv_idx == bkv_idx_start)
                 def wait_cur_bq():
                     wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
 
@@ -671,7 +671,7 @@ def _ragged_paged_attention_kernel_split(
                     kv_head_idx=prev_kv_head_idx,
                 )
 
-            lax.fori_loop(0, num_bkv, compute_with_bkv, None, unroll=False)
+            lax.fori_loop(bkv_idx_start, num_bkv, compute_with_bkv, None, unroll=False)
 
             acc = acc_ref[...]
             l = broadcast_minor(l_ref[...], acc.shape)  # noqa

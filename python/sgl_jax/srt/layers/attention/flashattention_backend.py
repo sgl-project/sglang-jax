@@ -15,7 +15,7 @@ from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
-from sgl_jax.srt.mem_cache.memory_pool import KVCache, SplitMHATokenToKVPool
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, SplitMHATokenToKVPool, SWAKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.utils import cdiv
@@ -38,6 +38,7 @@ class FlashAttentionMetadata:
     cu_q_lens: jax.Array = None
     cu_kv_lens: jax.Array = None
     page_indices: jax.Array = None
+    swa_page_indices: jax.Array = None
     seq_lens: jax.Array = None
     distribution: jax.Array = None
     custom_mask: jax.Array = None
@@ -48,6 +49,7 @@ class FlashAttentionMetadata:
             self.cu_q_lens,
             self.cu_kv_lens,
             self.page_indices,
+            self.swa_page_indices,
             self.seq_lens,
             self.distribution,
             self.custom_mask,
@@ -64,9 +66,10 @@ class FlashAttentionMetadata:
         obj.cu_q_lens = children[1]
         obj.cu_kv_lens = children[2]
         obj.page_indices = children[3]
-        obj.seq_lens = children[4]
-        obj.distribution = children[5]
-        obj.custom_mask = children[6]
+        obj.swa_page_indices = children[4]
+        obj.seq_lens = children[5]
+        obj.distribution = children[6]
+        obj.custom_mask = children[7]
 
         return obj
 
@@ -98,6 +101,9 @@ class FlashAttention(AttentionBackend):
         self.kv_partition_axis = kv_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
+        # SWA dual-pool support: set by model_runner after pool creation
+        # via object.__setattr__() to bypass Flax NNX's Pytree __setattr__ check.
+        # Accessed via getattr(self, 'swa_index_mapping', None) in get_forward_metadata().
 
     def get_forward_metadata(
         self,
@@ -153,15 +159,24 @@ class FlashAttention(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
+        # Compute SWA page indices by translating full-pool indices to SWA-pool space
+        swa_page_indices = None
+        swa_mapping = getattr(self, 'swa_index_mapping', None)
+        if swa_mapping is not None:
+            swa_cache_loc = swa_mapping[batch.cache_loc].astype(np.int64)
+            swa_selected = swa_cache_loc[indices]
+            swa_page_indices = (swa_selected // self.page_size).astype(np.int32)
+
         (
             metadata.num_seqs,
             metadata.cu_q_lens,
             metadata.cu_kv_lens,
             metadata.page_indices,
+            metadata.swa_page_indices,
             metadata.seq_lens,
             metadata.distribution,
         ) = device_array(
-            (num_seqs, cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
+            (num_seqs, cu_q_lens, cu_kv_lens, page_indices, swa_page_indices, seq_lens, distribution),
             sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
         )
         return metadata
@@ -425,7 +440,6 @@ class FlashAttention(AttentionBackend):
 
         return obj
 
-    @named_scope
     def __call__(
         self,
         q: jax.Array,  # [total_tokens, num_heads, head_dim]
@@ -488,7 +502,11 @@ class FlashAttention(AttentionBackend):
             causal = 0
         # Select page indices and remap to SWA pool if KV cache supports it
         page_indices_arg = self.forward_metadata.page_indices
-        if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
+        # Use SWA page indices for sliding window layers (fused path)
+        is_swa_layer = layer.sliding_window_size is not None and layer.sliding_window_size > 0
+        if is_swa_layer and self.forward_metadata.swa_page_indices is not None:
+            page_indices_arg = self.forward_metadata.swa_page_indices
+        elif hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
             page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
 
         in_specs = (
@@ -601,7 +619,11 @@ class FlashAttention(AttentionBackend):
             causal = 0
 
         page_indices_arg = self.forward_metadata.page_indices
-        if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
+        # Use SWA page indices for sliding window layers (split path)
+        is_swa_layer = layer.sliding_window_size is not None and layer.sliding_window_size > 0
+        if is_swa_layer and self.forward_metadata.swa_page_indices is not None:
+            page_indices_arg = self.forward_metadata.swa_page_indices
+        elif hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
             page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
 
         kv_part = self.kv_partition_axis
@@ -670,10 +692,14 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.distribution,
             self.forward_metadata.custom_mask,
         )
-
-        # NOTE: ragged_paged_attention already trims updated caches back to
-        # actual head_dim via prepare_updated_kv_cache. No padding needed here —
-        # the pool stores buffers at actual head_dim (e.g., 192 for K, 128 for V).
+        if attn_output.shape[-1] != self.v_head_dim:
+            attn_output = attn_output[..., : self.v_head_dim]
+        # NOTE: Do NOT trim updated_k/updated_v to raw head_dim here.
+        # The pool stores buffers at aligned dimensions (e.g. k_dim=256 for
+        # head_dim=192).  Trimming to 192 causes replace_kv_buffer to shrink
+        # the pool buffer, forcing a full-pool re-pad on every subsequent
+        # forward step — an O(pool_size) copy that also triggers XLA
+        # recompilation and can cause TPU hangs on long sequences.
 
         return (
             attn_output.reshape(q.shape[0], -1),
