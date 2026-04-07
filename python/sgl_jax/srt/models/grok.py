@@ -874,8 +874,7 @@ class Grok1ForCausalLM(nnx.Module):
         )
 
         with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
-            output = jax.sharding.reshard(output, jax.sharding.PartitionSpec(None))
-
+            hidden_states = jax.sharding.reshard(hidden_states, jax.sharding.PartitionSpec(None))
         
         output = self.logits_processor(hidden_states, cast(Embed, self.lm_head), logits_metadata)
 
