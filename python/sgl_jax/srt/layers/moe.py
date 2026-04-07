@@ -9,6 +9,10 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import (
+    TileSizes,
+    calculate_tiling,
+)
 
 # Re-export for backward compatibility: external code imports from this module.
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE  # noqa: F401
@@ -16,6 +20,20 @@ from sgl_jax.srt.layers.gate import GateLogit, TopK  # noqa: F401
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 from sgl_jax.srt.utils.weight_utils import WeightMapping
+
+
+def _adaptive_tile_fn(lhs_dtype, rhs_dtype, dims, vmem_limit_bytes):
+    """Adaptive TileFn: use tile_m=256 for large M (prefill), default for small M (decode).
+
+    Benchmarked on v6e-16 with MiMoV2Flash shapes (256 experts, top_k=8, H=4096, I=2048):
+      - M >= 8192 (prefill): tile_m=256 gives +1-2% speedup over default tile_m=128
+      - M < 8192 (decode):   default tile_m=128 is optimal; tile_m=256 is 1% slower
+    """
+    tiles = calculate_tiling(lhs_dtype, rhs_dtype, dims, vmem_limit_bytes)
+    if dims.size_m >= 8192:
+        tile_m = min(256, dims.size_m)
+        return TileSizes(tile_m=tile_m, tile_k=tiles.tile_k, tile_n=tiles.tile_n)
+    return tiles
 
 
 class EPMoE(nnx.Module):
@@ -33,7 +51,7 @@ class EPMoE(nnx.Module):
         layer_id: int = 0,
         quantization_config=None,
         physical_to_logical_map: "jax.Array | None" = None,
-        v2_tile_info=None,
+        v2_tile_info=_adaptive_tile_fn,
     ):
         self.num_experts_per_tok = num_experts_per_tok
         self.physical_to_logical_map = physical_to_logical_map
@@ -502,10 +520,7 @@ class EPMoE(nnx.Module):
         group_sizes = group_sizes.astype(jnp.int32)
         act_q_dtype = self.activation_quantized_dtype
 
-        # Adaptive v2 tiling: use tile_m=256 for large batches (prefill),
-        # default auto-tiling for small batches (decode).
-        # Profiled: tile_m=256 gives ~2% speedup at 16k tokens, but ~4% slower at 1k.
-        v2_tile_info = getattr(self, "v2_tile_info", None)
+        v2_tile_info = getattr(self, "v2_tile_info", _adaptive_tile_fn)
 
         gmm_kwargs = dict(
             group_sizes=group_sizes,
