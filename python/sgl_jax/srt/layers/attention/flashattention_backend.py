@@ -1,4 +1,5 @@
 import logging
+import math
 from dataclasses import dataclass
 
 import jax
@@ -12,6 +13,7 @@ from jax.tree_util import register_pytree_node_class
 from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
     ragged_paged_attention,
 )
+from sgl_jax.srt.kernels.ragged_paged_attention.util import get_dtype_packing
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -621,16 +623,56 @@ class FlashAttention(AttentionBackend):
             else layer.scaling
         )
 
-        # Reshape caches from flat [total_tokens, kv_heads, dim] to paged [num_pages, page_size, kv_heads, dim]
-        # NOTE: Do NOT pad head_dim here — ragged_paged_attention handles alignment
-        # internally via _prepare_single_kv_cache. Padding in reshape would corrupt
-        # the head count when head_dim is not 128-aligned (e.g., 192).
+        head_dim_aligned = (self.head_dim + 127) // 128 * 128
+        v_head_dim_aligned = (self.v_head_dim + 127) // 128 * 128
+        # Use independent alignment for K and V instead of forcing both to
+        # max(k, v).  The split-KV Pallas kernel already handles different
+        # head_dim for K and V, so the old `max()` was adding unnecessary
+        # padding (e.g. V 128→256, doubling V-cache data volume every step).
+        k_dim_aligned = head_dim_aligned
+        v_dim_aligned = v_head_dim_aligned
+
+        # Zero-copy optimisation: derive head count from the physical buffer
+        # shape rather than self.num_kv_heads.  With interleaved head layout
+        # (jnp.repeat) each TP shard already holds packing-aligned identical
+        # heads, so no tile is needed for the cache path.
+        kv_heads_physical = k_cache.shape[1]
+        kv_packing = get_dtype_packing(k_cache.dtype)
+        kv_heads_aligned = (kv_heads_physical + kv_packing - 1) // kv_packing * kv_packing
+
+        # Pad new Q/K/V tokens (small, per-step tensors)
+        if q.shape[-1] != head_dim_aligned:
+            q = jnp.pad(q, ((0, 0), (0, 0), (0, head_dim_aligned - q.shape[-1])))
+        if k.shape[-1] != k_dim_aligned:
+            k = jnp.pad(k, ((0, 0), (0, 0), (0, k_dim_aligned - k.shape[-1])))
+        if v.shape[-1] != v_dim_aligned:
+            v = jnp.pad(v, ((0, 0), (0, 0), (0, v_dim_aligned - v.shape[-1])))
+        # Pad cache heads (no-op when physical heads already packing-aligned)
+        if k_cache.shape[1] != kv_heads_aligned:
+            k_cache = jnp.pad(k_cache, ((0, 0), (0, kv_heads_aligned - k_cache.shape[1]), (0, 0)))
+        if v_cache.shape[1] != kv_heads_aligned:
+            v_cache = jnp.pad(v_cache, ((0, 0), (0, kv_heads_aligned - v_cache.shape[1]), (0, 0)))
+        # Pad cache dims (needed when pool stores raw head_dim)
+        if k_cache.shape[-1] != k_dim_aligned:
+            k_cache = jnp.pad(k_cache, ((0, 0), (0, 0), (0, k_dim_aligned - k_cache.shape[-1])))
+        if v_cache.shape[-1] != v_dim_aligned:
+            v_cache = jnp.pad(v_cache, ((0, 0), (0, 0), (0, v_dim_aligned - v_cache.shape[-1])))
+
+        # Reshape caches from flat [total_tokens, kv_heads, dim] to paged
+        # [num_pages, page_size, kv_heads, dim].
         total_tokens_k = k_cache.shape[0]
         num_pages = total_tokens_k // self.page_size
-        k_head_dim = k_cache.shape[-1]
-        v_head_dim_cache = v_cache.shape[-1]
-        k_cache_paged = k_cache.reshape(num_pages, self.page_size, -1, k_head_dim)
-        v_cache_paged = v_cache.reshape(num_pages, self.page_size, -1, v_head_dim_cache)
+        cache_out_sharding = NamedSharding(self.mesh, P(None, None, self.kv_partition_axis, None))
+        k_cache_paged = jax.lax.reshape(
+            k_cache,
+            (num_pages, self.page_size, kv_heads_aligned, k_dim_aligned),
+            out_sharding=cache_out_sharding,
+        )
+        v_cache_paged = jax.lax.reshape(
+            v_cache,
+            (num_pages, self.page_size, kv_heads_aligned, v_dim_aligned),
+            out_sharding=cache_out_sharding,
+        )
 
         if self.forward_metadata.custom_mask is not None:
             causal = 0
@@ -669,6 +711,30 @@ class FlashAttention(AttentionBackend):
             other_args = args[5:-1]
             attn_sink = args[-1]
 
+            # Zero-copy path: cache already has packing-aligned heads per shard
+            # (interleaved repeat layout), so only new tokens need tiling.
+            local_kv_heads_cache = k_cache_arg.shape[2]  # e.g. 2 (physical, aligned)
+            local_kv_heads_new = keys_new.shape[1]  # e.g. 1 (from projection)
+            local_kv_packing = get_dtype_packing(keys_new.dtype)
+            local_kv_heads_target = (
+                (local_kv_heads_cache + local_kv_packing - 1) // local_kv_packing
+            ) * local_kv_packing
+
+            # Tile only new tokens to match cache head count (cheap: only 1 token)
+            if local_kv_heads_new < local_kv_heads_target:
+                kv_rep = math.ceil(local_kv_heads_target / local_kv_heads_new)
+                keys_new = jnp.tile(keys_new, [1, kv_rep, 1])[:, :local_kv_heads_target, :]
+                values_new = jnp.tile(values_new, [1, kv_rep, 1])[:, :local_kv_heads_target, :]
+                if attn_sink is not None and attn_sink.shape[0] == local_kv_heads_new:
+                    attn_sink = jnp.tile(attn_sink, [kv_rep])[:local_kv_heads_target]
+
+            # Pad cache heads only if not yet aligned (should be no-op with
+            # interleaved layout, but kept as safety guard)
+            local_pad_h = local_kv_heads_target - local_kv_heads_cache
+            if local_pad_h > 0:
+                k_cache_arg = jnp.pad(k_cache_arg, ((0, 0), (0, 0), (0, local_pad_h), (0, 0)))
+                v_cache_arg = jnp.pad(v_cache_arg, ((0, 0), (0, 0), (0, local_pad_h), (0, 0)))
+
             result, updated_k, updated_v = ragged_paged_attention(
                 queries,
                 keys_new,
@@ -687,6 +753,10 @@ class FlashAttention(AttentionBackend):
                 ),
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
+            # Strip head padding from output (no-op when local_pad_h == 0)
+            if local_pad_h > 0:
+                updated_k = updated_k[:, :local_kv_heads_cache, :]
+                updated_v = updated_v[:, :local_kv_heads_cache, :]
 
             return result, updated_k, updated_v
 
@@ -700,9 +770,9 @@ class FlashAttention(AttentionBackend):
             out_specs=out_specs,
             check_vma=False,
         )(
-            q.reshape(q.shape[0], -1, self.head_dim),
-            k.reshape(k.shape[0], -1, k.shape[-1]),
-            v.reshape(v.shape[0], -1, v.shape[-1]),
+            q.reshape(q.shape[0], -1, head_dim_aligned),
+            k.reshape(k.shape[0], -1, k_dim_aligned),
+            v.reshape(v.shape[0], -1, v_dim_aligned),
             k_cache_paged,
             v_cache_paged,
             self.forward_metadata.seq_lens,
