@@ -563,28 +563,25 @@ class EPMoE(nnx.Module):
             acc_dtype=jnp.float32,
         )
 
-        # === GEMM1: fused gate-up projection ===
-        # Concatenate w0 (gate) and w1 (up) along output dim for a single GMM call.
-        wi_01 = jnp.concatenate([w0_kernel, w1_kernel], axis=2)
-        wi_01_scale = None
-        if w0_kernel_scale is not None and w1_kernel_scale is not None:
-            wi_01_scale = jnp.concatenate([w0_kernel_scale, w1_kernel_scale], axis=-1)
-        wi_01_bias = None
-        if w0_kernel_bias is not None and w1_kernel_bias is not None:
-            wi_01_bias = jnp.concatenate([w0_kernel_bias, w1_kernel_bias], axis=-1)
-
-        gate_up = gmm(
+        # === GEMM1: x @ w0 and x @ w1 ===
+        layer_w0 = gmm(
             lhs=x,
-            rhs=wi_01,
-            rhs_scale=wi_01_scale,
-            rhs_bias=wi_01_bias,
+            rhs=w0_kernel,
+            rhs_scale=w0_kernel_scale,
+            rhs_bias=w0_kernel_bias,
             zero_initialize=False,
             activation_quantized_dtype=act_q_dtype,
             **gmm_kwargs,
         )
-        n_half = w0_kernel.shape[2]
-        layer_w0 = gate_up[:, :n_half]
-        layer_w1 = gate_up[:, n_half:]
+        layer_w1 = gmm(
+            lhs=x,
+            rhs=w1_kernel,
+            rhs_scale=w1_kernel_scale,
+            rhs_bias=w1_kernel_bias,
+            zero_initialize=False,
+            activation_quantized_dtype=act_q_dtype,
+            **gmm_kwargs,
+        )
 
         # === Activation ===
         if self.activation == "silu":

@@ -72,7 +72,7 @@ spec:
             - name: BENCH_REPO
               value: "https://github.com/primatrix/sglang-jax.git"
             - name: PROFILE_DIR
-              value: "/gcs/prayer/moe_profiling/20260407_indexed_gmm_gateup"
+              value: "/gcs/prayer/moe_profiling/20260407_indexed_gmm_only"
           command:
             - bash
             - -c
