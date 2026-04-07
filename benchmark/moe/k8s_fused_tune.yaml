@@ -72,7 +72,7 @@ spec:
             - name: BENCH_REPO
               value: "https://github.com/primatrix/sglang-jax.git"
             - name: PROFILE_DIR
-              value: "/gcs/prayer/moe_profiling/20260408_fused_tune"
+              value: "/gcs/prayer/moe_profiling/20260408_fused_tune_full"
           command:
             - bash
             - -c
@@ -106,7 +106,7 @@ spec:
                 --tune-block-config \
                 --num-experts 256 --top-k 8 \
                 --hidden-size 4096 --intermediate-size 2048 \
-                --num-tokens 1024 16384 \
+                --num-tokens 16 32 64 128 256 512 1024 2048 4096 8192 16384 32768 \
                 --imbalance-mode balanced \
                 --max-configs 25 \
                 --iters 5 --warmup-iters 2 \
