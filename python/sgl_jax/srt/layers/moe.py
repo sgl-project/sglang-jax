@@ -494,7 +494,7 @@ class EPMoE(nnx.Module):
         if self.tp_size > 1:
             # scatter on sequence/token dimension
             scatter_dimension = 0 if len(output.shape) == 2 else 1
-            output = jax.lax.psum_scatter(output, "tensor", scatter_dimension=scatter_dimension)
+            output = jax.lax.psum_scatter(output, "tensor", scatter_dimension=scatter_dimension, tiled=True)
         if self.ep_size > 1:
             output = self._combine(output)
 
