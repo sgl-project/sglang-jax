@@ -1,0 +1,82 @@
+##############################################
+# Headless Service (for pod-to-pod DNS resolution)
+##############################################
+apiVersion: v1
+kind: Service
+metadata:
+  name: debug-v6e16-svc
+spec:
+  clusterIP: None
+  selector:
+    job-name: debug-v6e16
+  ports:
+    - name: tpu-data
+      port: 8471
+      targetPort: 8471
+    - name: tpu-coord
+      port: 8081
+      targetPort: 8081
+---
+##############################################
+# Long-running debug Job (sleep infinity)
+##############################################
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: debug-v6e16
+spec:
+  backoffLimit: 0
+  completionMode: Indexed
+  completions: 4
+  parallelism: 4
+  template:
+    spec:
+      subdomain: debug-v6e16-svc
+      nodeSelector:
+        cloud.google.com/gke-nodepool: tpu-v6e-16-debug
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: "4x4"
+      containers:
+      - name: debug
+        image: python:3.12-slim
+        command:
+        - bash
+        - -c
+        - |
+          set -euo pipefail
+          unset CLOUD_TPU_TASK_ID
+          export TPU_WORKER_ID=$JOB_COMPLETION_INDEX
+
+          echo "=== Worker $TPU_WORKER_ID starting ==="
+
+          # Install basic tools
+          apt-get update -qq && apt-get install -yqq git curl procps > /dev/null 2>&1
+
+          # Install uv
+          curl -LsSf https://astral.sh/uv/install.sh | sh > /dev/null 2>&1
+          export PATH="$HOME/.local/bin:$PATH"
+
+          # Install JAX TPU
+          pip install -q jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html 2>&1 | tail -3
+
+          echo "=== Worker $TPU_WORKER_ID ready, sleeping... ==="
+          echo "Run: kubectl exec -it debug-v6e16-${TPU_WORKER_ID}-xxxxx -- bash"
+
+          # Keep pod alive for debugging
+          sleep infinity
+        env:
+        - name: TPU_WORKER_HOSTNAMES
+          value: "debug-v6e16-0.debug-v6e16-svc,debug-v6e16-1.debug-v6e16-svc,debug-v6e16-2.debug-v6e16-svc,debug-v6e16-3.debug-v6e16-svc"
+        - name: TPU_WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        ports:
+        - containerPort: 8471
+        - containerPort: 8081
+        resources:
+          limits:
+            google.com/tpu: "4"
+          requests:
+            google.com/tpu: "4"
+      restartPolicy: Never
