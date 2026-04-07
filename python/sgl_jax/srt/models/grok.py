@@ -872,6 +872,11 @@ class Grok1ForCausalLM(nnx.Module):
             token_to_kv_pool,
             None,
         )
+
+        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+            output = jax.sharding.reshard(output, jax.sharding.PartitionSpec(None))
+
+        
         output = self.logits_processor(hidden_states, cast(Embed, self.lm_head), logits_metadata)
 
         return output, layers_kv_fused, True, layers_topk_ids
