@@ -634,24 +634,18 @@ class EPMoE(nnx.Module):
                 padding = jnp.zeros((padding_size, intermediate.shape[1]), dtype=intermediate.dtype)
                 intermediate = jnp.concatenate([intermediate, padding], axis=0)
 
+        # Unsort: gather directly into (N, K, H) by reshaping the small index array.
         argsort_indices = jnp.argsort(sorted_selected_experts, stable=True)
-        unsort_intermediate = jnp.take(intermediate, indices=argsort_indices, axis=0)
-
         total_tokens = weights.shape[0] * weights.shape[1] // self.num_experts_per_tok
+        grouped_indices = jnp.reshape(argsort_indices, (total_tokens, self.num_experts_per_tok))
+        grouped_intermediate = jnp.take(intermediate, indices=grouped_indices, axis=0)
 
+        # Weighted sum over K experts via einsum.
         reshaped_weights = jnp.reshape(weights, (total_tokens, self.num_experts_per_tok))
-        reshaped_intermediate = jnp.reshape(
-            unsort_intermediate,
-            (total_tokens, self.num_experts_per_tok, -1),
-        )
-
-        intermediate_fp32 = reshaped_intermediate.astype(jnp.float32)
-        weights_fp32 = reshaped_weights.astype(jnp.float32)
-
         output = jnp.einsum(
-            "BKE,BK -> BE",
-            intermediate_fp32,
-            weights_fp32,
+            "BKE,BK->BE",
+            grouped_intermediate.astype(jnp.float32),
+            reshaped_weights.astype(jnp.float32),
         )
 
         if len(weights.shape) == 2:
