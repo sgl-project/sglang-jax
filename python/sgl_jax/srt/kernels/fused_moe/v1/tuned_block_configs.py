@@ -144,6 +144,12 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'float8_e4m3fn', 2048, 256, 8, 2048, 512, 32, True, True): (64, 512, 2048, 2048, 64, 64, 512, 2048, 2048, 512),
         ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 2048, 512, 32, True, True): (128, 512, 2048, 2048, 128, 128, 512, 2048, 2048, 256),
     },
+    # MiMoV2Flash: 256 experts, top_k=8, H=4096, I=2048, ep=16, no shared expert, no grouped topk
+    # Tuned on v6e-16 (4x4 topology) with vmem_limit=96MB, 2026-04-08
+    "TPU v6e": {
+        ('bfloat16', 'bfloat16', 1024, 256, 8, 4096, 2048, 16, False, False): (64, 2048, 2048, 2048, 512, 512, 2048, 2048, 2048, 2048),
+        ('bfloat16', 'bfloat16', 16384, 256, 8, 4096, 2048, 16, False, False): (512, 1024, 1024, 1024, 256, 256, 1024, 1024, 1024, 1024),
+    },
     # Fallback for any device kind.
     "*": {},
 }
