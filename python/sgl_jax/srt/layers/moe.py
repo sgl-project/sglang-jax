@@ -55,7 +55,7 @@ class EPMoE(nnx.Module):
         quantization_config=None,
         physical_to_logical_map: "jax.Array | None" = None,
         v2_tile_info=_adaptive_tile_fn,
-        pre_gather_quant_dtype=None,
+        pre_gather_quant_dtype="auto",
     ):
         self.num_experts_per_tok = num_experts_per_tok
         self.physical_to_logical_map = physical_to_logical_map
@@ -520,10 +520,14 @@ class EPMoE(nnx.Module):
         # indexed_gmm: gather sorted_inputs here instead of in _permute,
         # so XLA can fuse the gather with the matmul and avoid materializing
         # the full [M*top_k, D] sorted_inputs tensor at peak memory.
-        pre_gather_q = getattr(self, "pre_gather_quant_dtype", None)
+        # Resolve pre-gather quantization: "auto" enables int8 for large M (prefill)
+        # where scatter bandwidth dominates, but disables for small M (decode)
+        # where quantize/dequantize overhead outweighs the bandwidth savings.
+        pre_gather_q = getattr(self, "pre_gather_quant_dtype", "auto")
+        if pre_gather_q == "auto":
+            _AUTO_PRE_GATHER_THRESHOLD = 4096
+            pre_gather_q = jnp.int8 if inputs_2d.shape[0] >= _AUTO_PRE_GATHER_THRESHOLD else None
         if pre_gather_q is not None:
-            # Quantize BEFORE gather to halve HBM bandwidth (int8 = 1 byte vs bf16 = 2 bytes).
-            # Dequantize after gather; net effect: gather moves half the bytes.
             x_q, x_scale = quantize_tensor_simple(inputs_2d, pre_gather_q, dim=-1)
             x = x_q[token_indices]
             x_scale = x_scale[token_indices]
