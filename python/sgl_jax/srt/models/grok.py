@@ -485,8 +485,9 @@ class Grok1Attention(nnx.Module):
 
         # Unshard activations if sequence parallel enabled
         if True:
-            spec = jax.sharding.PartitionSpec(*([None] * len(hidden_states.shape)))
-            hidden_states = jax.sharding.reshard(hidden_states, spec)
+            with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+                spec = jax.sharding.PartitionSpec(*([None] * len(hidden_states.shape)))
+                hidden_states = jax.sharding.reshard(hidden_states, spec)
 
         # Project Q, K, V separately
         q, _ = self.q_proj(hidden_states)
@@ -774,7 +775,6 @@ class Grok1ForCausalLM(nnx.Module):
         mesh: jax.sharding.Mesh,
     ) -> None:
         super().__init__()
-        # config.num_hidden_layers = 1
         assert dtype == jnp.bfloat16
         self.config = config
         self.mesh = mesh
