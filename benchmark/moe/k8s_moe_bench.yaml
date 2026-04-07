@@ -30,6 +30,7 @@ spec:
       annotations:
         gke-gcsfuse/volumes: "true"
     spec:
+      serviceAccountName: gcs-account
       subdomain: moe-bench-svc
       restartPolicy: Never
       nodeSelector:
@@ -70,6 +71,8 @@ spec:
               value: "feat/moe-benchmark"
             - name: BENCH_REPO
               value: "https://github.com/primatrix/sglang-jax.git"
+            - name: PROFILE_DIR
+              value: "/gcs/prayer/moe_profiling/20260407_indexed_gmm_gateup"
           command:
             - bash
             - -c
