@@ -260,6 +260,11 @@ class JAXModelLoader(DefaultModelLoader):
         else:
             logger.info("No quantization config found. Skipping quantization.")
         model.load_weights(model_config)
+
+        from sgl_jax.srt.utils.quantization.quantization_utils import finalize_quantized_layers
+
+        finalize_quantized_layers(model)
+
         return model
 
 

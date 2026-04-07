@@ -326,6 +326,7 @@ class ModelRunner(BaseModelRunner):
                 from sgl_jax.srt.utils.quantization.quantization_utils import (
                     apply_linear_quantization,
                     apply_moe_quantization,
+                    finalize_quantized_layers,
                 )
 
                 # Apply MoE quantization first
@@ -340,6 +341,8 @@ class ModelRunner(BaseModelRunner):
                     self.model = apply_linear_quantization(
                         self.model_config, self.model, is_static_input=False
                     )
+
+                finalize_quantized_layers(self.model)
             else:
                 logger.info("Static quantization detected. Skipping online requantization.")
         # Parse other args
