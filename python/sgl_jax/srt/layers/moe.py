@@ -171,12 +171,11 @@ class EPMoE(nnx.Module):
                         "Per-channel 4D GMM scales must have k_blocks=1."
                     )
             else:
-                block_size_k = int(self.weight_block_size[1])
-                expected_k_blocks = (in_dim + block_size_k - 1) // block_size_k
-                if scale.shape[1] not in (1, expected_k_blocks):
+                k_blocks = int(scale.shape[1])
+                if k_blocks <= 0 or in_dim % k_blocks != 0:
                     raise ValueError(
                         f"Unsupported {scale_name} shape {scale.shape} for weight shape {weight.shape}. "
-                        f"Expected k_blocks dimension to be 1 or {expected_k_blocks}."
+                        f"Expected k_blocks dimension to evenly divide in_dim={in_dim}."
                     )
             return scale
 
