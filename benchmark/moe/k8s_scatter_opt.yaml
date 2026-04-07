@@ -1,0 +1,101 @@
+# Headless Service for TPU worker DNS resolution
+apiVersion: v1
+kind: Service
+metadata:
+  name: scatter-opt-svc
+spec:
+  clusterIP: None
+  selector:
+    job-name: scatter-opt
+  ports:
+    - name: tpu-data
+      port: 8471
+      targetPort: 8471
+    - name: tpu-coord
+      port: 8081
+      targetPort: 8081
+---
+# v6e-16 TPU Job (4 hosts x 4 chips, all ICI)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: scatter-opt
+spec:
+  completionMode: Indexed
+  completions: 4
+  parallelism: 4
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
+    spec:
+      serviceAccountName: gcs-account
+      subdomain: scatter-opt-svc
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: tpu-v6e-16-xc
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: "4x4"
+      volumes:
+        - name: dev-shm
+          emptyDir:
+            medium: Memory
+        - name: gcs-storage
+          persistentVolumeClaim:
+            claimName: moe-bench-gcs-pvc
+      containers:
+        - name: bench
+          image: python:3.12-slim
+          ports:
+            - containerPort: 8471
+            - containerPort: 8081
+          resources:
+            requests:
+              google.com/tpu: "4"
+            limits:
+              google.com/tpu: "4"
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: dev-shm
+            - mountPath: /gcs
+              name: gcs-storage
+          env:
+            - name: TPU_WORKER_HOSTNAMES
+              value: "scatter-opt-0.scatter-opt-svc,scatter-opt-1.scatter-opt-svc,scatter-opt-2.scatter-opt-svc,scatter-opt-3.scatter-opt-svc"
+            - name: TPU_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+            - name: BENCH_BRANCH
+              value: "exp/scatter-optimization"
+            - name: BENCH_REPO
+              value: "https://github.com/primatrix/sglang-jax.git"
+            - name: PROFILE_DIR
+              value: "/gcs/prayer/moe_profiling/20260408_scatter_opt"
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              unset CLOUD_TPU_TASK_ID
+              export TPU_WORKER_ID=$JOB_COMPLETION_INDEX
+
+              echo "=== Worker $TPU_WORKER_ID starting ==="
+
+              # Install tools
+              apt-get update -qq && apt-get install -yqq git curl procps > /dev/null 2>&1
+
+              # Install JAX TPU
+              pip install -q jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html 2>&1 | tail -3
+              pip install -q flax 2>&1 | tail -1
+
+              # Clone repo
+              git clone --branch "$BENCH_BRANCH" --depth 1 "$BENCH_REPO" /workspace
+              cd /workspace
+              pip install -q -e "./python[tpu]" 2>&1 | tail -3
+
+              echo "=== Worker $TPU_WORKER_ID: devices=$(python3 -c 'import jax; print(jax.device_count())') ==="
+
+              # Run scatter optimization benchmark
+              python -m benchmark.moe.scatter_opt_bench
