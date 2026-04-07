@@ -292,11 +292,12 @@ class PrefillAdder:
     @property
     def rem_total_tokens(self):
         if self.is_hybrid:
-            available_and_evictable = min(
+            # For hybrid models, use the full pool's capacity for budget estimation.
+            # SWA layers only need sliding_window tokens per request (not full
+            # input+output), so the SWA pool should not limit admission here.
+            available_and_evictable = (
                 self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size(),
-                self.token_to_kv_pool_allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size(),
+                + self.tree_cache.full_evictable_size()
             )
         else:
             available_and_evictable = (
@@ -308,6 +309,8 @@ class PrefillAdder:
     @property
     def cur_rem_tokens(self):
         if self.is_hybrid:
+            # For immediate prefill budget, respect both pools since prefill
+            # allocates input_len pages from both full and SWA pools.
             available_and_evictable = min(
                 self.token_to_kv_pool_allocator.full_available_size()
                 + self.tree_cache.full_evictable_size(),

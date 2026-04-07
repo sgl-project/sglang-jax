@@ -246,6 +246,9 @@ class Req:
         self.last_host_node: Any = None
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: int | None = None
+        # SWA eviction: sequence positions [0, swa_evicted_seqlen) have had
+        # their SWA pool slots freed (no longer in the sliding window).
+        self.swa_evicted_seqlen: int = 0
         # The prefix length of the last prefix matching
         self.last_matched_prefix_len: int = 0
 
@@ -825,6 +828,14 @@ class ScheduleBatch:
             extend_input_logprob_token_ids = None
 
         # Allocate memory
+        # Evict SWA slots before allocation (important for chunked prefill)
+        if self.is_hybrid:
+            sliding_window_size = getattr(self.model_config, "sliding_window", None)
+            if sliding_window_size and sliding_window_size > 0:
+                ps = self.token_to_kv_pool_allocator.page_size
+                for req, pre_len in zip(reqs, prefix_lens):
+                    self._evict_swa(req, pre_len, sliding_window_size, ps)
+
         if self.token_to_kv_pool_allocator.page_size == 1:
             out_cache_loc = alloc_token_slots(self.tree_cache, extend_num_tokens)
         else:
@@ -1016,7 +1027,39 @@ class ScheduleBatch:
             self.model_config.vocab_size,
         )
 
+    def maybe_evict_swa(self):
+        """Evict SWA pool slots outside the sliding window for all requests."""
+        if not self.is_hybrid:
+            return
+        sliding_window_size = getattr(self.model_config, "sliding_window", None)
+        if sliding_window_size is None or sliding_window_size <= 0:
+            return
+        page_size = getattr(self.token_to_kv_pool_allocator, "_page_size",
+                           getattr(self.token_to_kv_pool_allocator, "page_size", 1))
+        for req in self.reqs:
+            pre_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+            self._evict_swa(req, pre_len, sliding_window_size, page_size)
+
+    def _evict_swa(self, req, pre_len: int, sliding_window_size: int, page_size: int):
+        """Free SWA pool slots for tokens outside the sliding window."""
+        new_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size)
+        # Page-align down
+        if page_size > 1:
+            new_evicted = (new_evicted // page_size) * page_size
+        if new_evicted <= req.swa_evicted_seqlen:
+            return
+        # Get the full-pool token indices for evicted positions
+        free_slots = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, req.swa_evicted_seqlen : new_evicted
+        ]
+        self.token_to_kv_pool_allocator.free_swa(free_slots)
+        req.swa_evicted_seqlen = new_evicted
+
     def prepare_for_decode(self):
+        # Evict SWA slots outside the sliding window before decode allocation
+        if self.is_hybrid:
+            self.maybe_evict_swa()
+
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
         if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():

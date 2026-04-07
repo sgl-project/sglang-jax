@@ -343,7 +343,7 @@ class ModelWorker:
 
     def set_forward_metadata(self, model_worker_batch: ModelWorkerBatch):
         self.model_runner.attn_backend.forward_metadata = (
-            self.worker.model_runner.attn_backend.get_forward_metadata(model_worker_batch)
+            self.model_runner.attn_backend.get_forward_metadata(model_worker_batch)
         )
 
     def get_max_padded_size(self):
@@ -501,8 +501,8 @@ class ModelWorker:
 
     def get_tokens_per_layer_info(self):
         return (
-            self.model_runner.full_max_total_num_tokens,
-            self.model_runner.swa_max_total_num_tokens,
+            getattr(self.model_runner, "full_max_total_num_tokens", self.model_runner.max_total_num_tokens),
+            getattr(self.model_runner, "swa_max_total_num_tokens", self.model_runner.max_total_num_tokens),
         )
 
     def get_pad_input_ids_func(self):
@@ -551,7 +551,7 @@ class ModelWorker:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
         if forward_metadata is None:
-            forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
+            forward_metadata = self.model_runner.attn_backend.get_forward_metadata(
                 model_worker_batch
             )
 

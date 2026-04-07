@@ -44,6 +44,8 @@ def ref_split_attention(
     causal: bool = True,
     sm_scale: float = 1.0,
     mask_value: float = DEFAULT_MASK_VALUE,
+    attention_sink: jax.Array | None = None,
+    sliding_window: int | None = None,
 ):
     """Pure JAX reference for split KV attention (K and V may have different head_dim)."""
     _, _, num_kv_heads, k_head_dim = k_pages.shape
@@ -77,7 +79,21 @@ def ref_split_attention(
             mask = q_span < kv_span
             attn += jnp.where(mask, mask_value, 0.0)
 
-        attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
+        if sliding_window is not None:
+            q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
+            kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
+            sw_mask = q_span - sliding_window >= kv_span
+            attn += jnp.where(sw_mask, mask_value, 0.0)
+
+        if attention_sink is not None:
+            sink = jnp.asarray(attention_sink, dtype=attn.dtype)
+            if sink.ndim == 0:
+                sink = jnp.full((num_q_heads,), sink, dtype=attn.dtype)
+            sink = jnp.repeat(sink[:, None, None], attn.shape[1], axis=1)
+            attn = jnp.concatenate([sink, attn], axis=-1)
+            attn = jax.nn.softmax(attn, axis=-1)[..., 1:].astype(v.dtype)
+        else:
+            attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
         # attn*V: output has v_head_dim
         out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
         outputs.append(out)
@@ -403,7 +419,19 @@ class TestSplitKernelAttention(CustomTestCase):
             "when head_dim == v_head_dim",
         )
 
-    def run_kernel_test(self, mode, lens, num_heads, head_dim, num_kv_heads, v_head_dim, page_size):
+    def run_kernel_test(
+        self,
+        mode,
+        lens,
+        num_heads,
+        head_dim,
+        num_kv_heads,
+        v_head_dim,
+        page_size,
+        attention_sink=None,
+        sliding_window=None,
+        num_kv_pages_per_block=None,
+    ):
         """Run split kernel and compare against reference."""
         dtype = jnp.bfloat16
         sm_scale = head_dim**-0.5
@@ -499,6 +527,8 @@ class TestSplitKernelAttention(CustomTestCase):
             jnp.array(num_seqs),
             causal=True,
             sm_scale=sm_scale,
+            attention_sink=attention_sink,
+            sliding_window=sliding_window,
         )
         jax.block_until_ready(expected)
 
@@ -543,6 +573,9 @@ class TestSplitKernelAttention(CustomTestCase):
                 v_cache=v_cache_arg,
                 causal=1,
                 sm_scale=sm_scale,
+                sliding_window=sliding_window,
+                attention_sink=attention_sink_arg,
+                num_kv_pages_per_block=num_kv_pages_per_block,
             )
             return result, updated_k, updated_v
 
@@ -691,6 +724,69 @@ class TestSplitKernelAttention(CustomTestCase):
             num_kv_heads=8,
             v_head_dim=128,
             page_size=16,
+        )
+
+    def test_split_kernel_gqa_decode_ps1_attention_sink(self):
+        """GQA decode with split KV and attention sink enabled on a 16-way mesh."""
+        self.run_kernel_test(
+            mode="decode",
+            lens=[(1, 127), (1, 128), (1, 512)],
+            num_heads=64,
+            head_dim=256,
+            num_kv_heads=32,
+            v_head_dim=128,
+            page_size=1,
+            attention_sink=jnp.linspace(-0.4, 0.4, 64, dtype=jnp.float32),
+        )
+
+    # --- sliding_window tests (SWA with bkv_idx_start > 0) ---
+    def test_split_kernel_sliding_window_decode_ps16(self):
+        """Decode with sliding_window where bkv_idx_start > 0.
+
+        Uses num_kv_pages_per_block=4, page_size=16 → bkv_sz=64.
+        With sliding_window=32, kv_len=128: bkv_idx_start = (128-1-32)//64 = 1.
+        This regression test catches the prologue/fori_loop mismatch bug where
+        the prologue prefetches at bkv_idx_start but fori_loop started from 0.
+        """
+        self.run_kernel_test(
+            mode="decode",
+            lens=[(1, 128), (1, 256), (1, 512)],
+            num_heads=16,
+            head_dim=256,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=16,
+            sliding_window=32,
+            num_kv_pages_per_block=4,
+        )
+
+    def test_split_kernel_sliding_window_attention_sink_decode_ps16(self):
+        """Decode with both sliding_window and attention_sink (MiMo-V2-Flash style)."""
+        self.run_kernel_test(
+            mode="decode",
+            lens=[(1, 128), (1, 256)],
+            num_heads=16,
+            head_dim=192,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=16,
+            sliding_window=32,
+            num_kv_pages_per_block=4,
+            attention_sink=jnp.linspace(-0.4, 0.4, 16, dtype=jnp.float32),
+        )
+
+    def test_split_kernel_sliding_window_prefill_ps16(self):
+        """Prefill with sliding_window where bkv_idx_start > 0."""
+        self.run_kernel_test(
+            mode="prefill",
+            lens=[(32, 256), (64, 512)],
+            num_heads=16,
+            head_dim=256,
+            num_kv_heads=8,
+            v_head_dim=128,
+            page_size=16,
+            sliding_window=32,
+            num_kv_pages_per_block=4,
         )
 
     # --- head_dim=192 tests (MLA-style, non-128-aligned) ---

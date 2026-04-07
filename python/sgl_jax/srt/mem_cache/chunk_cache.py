@@ -47,7 +47,7 @@ class ChunkCache(BasePrefixCache):
             req.req_pool_idx, : len(req.fill_ids)
         ]
 
-    def evict(self, num_tokens: int):
+    def evict(self, num_tokens: int, swa_num_tokens: int = 0):
         pass
 
     def inc_lock_ref(self, node: Any):

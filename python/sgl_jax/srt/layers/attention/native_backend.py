@@ -55,6 +55,7 @@ class NativeAttention(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        **kwargs,
     ):
         """
         Args:
