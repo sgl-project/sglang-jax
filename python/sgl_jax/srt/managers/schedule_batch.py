@@ -1236,7 +1236,24 @@ class ScheduleBatch:
         page_size: int,
         enable_static_lora: bool = False,
     ) -> ModelWorkerBatch:
-        if self.forward_mode.is_decode_or_idle():
+        # Radix cache hit n-1 tokens → extend_len=1, use DECODE path to
+        # avoid ragged-attention overhead and extra shape compilations on TPU.
+        use_decode_fastpath_for_extend = (
+            self.forward_mode == ForwardMode.EXTEND
+            and not self.return_logprob
+            and not self.return_output_logprob_only
+            and self.spec_info is None
+            and all(extend_len == 1 for extend_len in self.extend_lens)
+            and all(req.is_chunked <= 0 for req in self.reqs)
+            and all(len(req.output_ids) == 0 for req in self.reqs)
+            and all(not req.mm_inputs for req in self.reqs)
+            and all(not req.apply_for_deepstack for req in self.reqs)
+        )
+        worker_forward_mode = (
+            ForwardMode.DECODE if use_decode_fastpath_for_extend else self.forward_mode
+        )
+
+        if worker_forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
             token_paddings = bs_paddings
         else:
@@ -1293,7 +1310,7 @@ class ScheduleBatch:
             )
 
         # Calculate positions after padding
-        if self.forward_mode.is_extend():
+        if worker_forward_mode.is_extend():
             # For prefill: create positions for each token in sequences
             # Calculate total tokens without padding first
             total_tokens_before_padding = sum([extend_len for extend_len in self.extend_lens])
@@ -1391,7 +1408,7 @@ class ScheduleBatch:
             )
             invalid_seq_lens = np.array([0] * bs_padding_size, dtype=seq_lens_cpu.dtype)
             seq_lens_cpu = np.concat([seq_lens_cpu, invalid_seq_lens], axis=0)
-            if self.forward_mode.is_extend():
+            if worker_forward_mode.is_extend():
                 invalid_extend_prefix_lens = np.array(
                     [0] * bs_padding_size, dtype=extend_prefix_lens.dtype
                 )
@@ -1461,7 +1478,7 @@ class ScheduleBatch:
         if bs_padding_size > 0:
             lora_ids = lora_ids + [None] * bs_padding_size
         input_embedding = None
-        if self.forward_mode == ForwardMode.EXTEND:
+        if worker_forward_mode == ForwardMode.EXTEND:
             input_embedding_list = []
             deepstack_visual_embedding_list = []
             deepstack_visual_pos_mask_list = []
@@ -1533,7 +1550,7 @@ class ScheduleBatch:
 
         return ModelWorkerBatch(
             bid=bid,
-            forward_mode=self.forward_mode,
+            forward_mode=worker_forward_mode,
             input_ids=input_ids_cpu,
             real_input_ids_len=real_input_ids_len,
             req_pool_indices=req_pool_indices_cpu,
@@ -1548,9 +1565,11 @@ class ScheduleBatch:
             mrope_positions=mrope_positions_cpu,
             cache_loc=cache_loc_cpu,
             extend_prefix_lens=(
-                extend_prefix_lens if self.forward_mode == ForwardMode.EXTEND else None
+                extend_prefix_lens if worker_forward_mode == ForwardMode.EXTEND else None
             ),
-            extend_seq_lens=(extend_seq_lens if self.forward_mode == ForwardMode.EXTEND else None),
+            extend_seq_lens=(
+                extend_seq_lens if worker_forward_mode == ForwardMode.EXTEND else None
+            ),
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             lora_ids=(
