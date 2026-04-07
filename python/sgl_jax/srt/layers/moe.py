@@ -33,9 +33,11 @@ class EPMoE(nnx.Module):
         layer_id: int = 0,
         quantization_config=None,
         physical_to_logical_map: "jax.Array | None" = None,
+        v2_tile_info=None,
     ):
         self.num_experts_per_tok = num_experts_per_tok
         self.physical_to_logical_map = physical_to_logical_map
+        self.v2_tile_info = v2_tile_info
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -500,12 +502,18 @@ class EPMoE(nnx.Module):
         group_sizes = group_sizes.astype(jnp.int32)
         act_q_dtype = self.activation_quantized_dtype
 
+        # Adaptive v2 tiling: use tile_m=256 for large batches (prefill),
+        # default auto-tiling for small batches (decode).
+        # Profiled: tile_m=256 gives ~2% speedup at 16k tokens, but ~4% slower at 1k.
+        v2_tile_info = getattr(self, "v2_tile_info", None)
+
         gmm_kwargs = dict(
             group_sizes=group_sizes,
             preferred_element_type=self.dtype,
             group_offset=group_offset,
             maybe_quantize_lhs=act_q_dtype is not None,
             acc_dtype=jnp.float32,
+            v2_tile_info=v2_tile_info,
         )
 
         # === GEMM1: fused gate-up projection (weights pre-concatenated at load time) ===
