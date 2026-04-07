@@ -3043,7 +3043,7 @@ def fused_ep_moe(
                 collective_id=0,
                 allow_collective_id_without_custom_barrier=True,
                 has_side_effects=True,
-                vmem_limit_bytes=64 * 1024 * 1024,
+                vmem_limit_bytes=96 * 1024 * 1024,
             ),
             name=scope_name,
         )
