@@ -7,7 +7,6 @@ Saves traces to /tmp/moe_profiles/ for extraction via kubectl cp or GCS upload.
 from __future__ import annotations
 
 import os
-import time
 
 import jax
 import jax.numpy as jnp
@@ -26,7 +25,7 @@ NUM_EXPERTS = 256
 TOP_K = 8
 HIDDEN_SIZE = 4096
 INTERMEDIATE_SIZE = 2048
-PROFILE_DIR = "/tmp/moe_profiles"
+PROFILE_DIR = os.environ.get("PROFILE_DIR", "/gcs/moe_profiles")
 
 # Which configs to profile: (backend, ep_size, tp_size, num_tokens)
 PROFILE_CASES = [
@@ -212,10 +211,7 @@ def main():
             ) / (1024 * 1024)
             print(f"  {d}: {len(files)} files, {total_mb:.1f} MB")
 
-    print("\n=== Done. Pod staying alive for trace extraction. ===")
-    print("Use: kubectl cp <pod>:/tmp/moe_profiles ./moe_profiles")
-    while True:
-        time.sleep(3600)
+    print(f"\n=== Done. Traces saved to {PROFILE_DIR} ===")
 
 
 if __name__ == "__main__":

@@ -26,6 +26,9 @@ spec:
   parallelism: 4
   backoffLimit: 0
   template:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
     spec:
       subdomain: moe-bench-svc
       restartPolicy: Never
@@ -37,6 +40,9 @@ spec:
         - name: dev-shm
           emptyDir:
             medium: Memory
+        - name: gcs-storage
+          persistentVolumeClaim:
+            claimName: moe-bench-gcs-pvc
       containers:
         - name: moe-bench
           image: python:3.12-slim
@@ -51,6 +57,8 @@ spec:
           volumeMounts:
             - mountPath: /dev/shm
               name: dev-shm
+            - mountPath: /gcs
+              name: gcs-storage
           env:
             - name: TPU_WORKER_HOSTNAMES
               value: "moe-bench-0.moe-bench-svc,moe-bench-1.moe-bench-svc,moe-bench-2.moe-bench-svc,moe-bench-3.moe-bench-svc"
@@ -58,7 +66,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
-            # Repo branch to benchmark
             - name: BENCH_BRANCH
               value: "feat/moe-benchmark"
             - name: BENCH_REPO
@@ -87,5 +94,5 @@ spec:
 
               echo "=== Worker $TPU_WORKER_ID: devices=$(python3 -c 'import jax; print(jax.device_count())') ==="
 
-              # Run xprof profiling (pod stays alive after for trace extraction)
+              # Run xprof profiling — traces saved to GCS
               python -m benchmark.moe.profile_moe
