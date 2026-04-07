@@ -30,7 +30,7 @@ spec:
       subdomain: moe-bench-svc
       restartPolicy: Never
       nodeSelector:
-        cloud.google.com/gke-nodepool: tpu-v6e-16-debug
+        cloud.google.com/gke-nodepool: tpu-v6e-16-xc
         cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
         cloud.google.com/gke-tpu-topology: "4x4"
       volumes:
@@ -83,7 +83,7 @@ spec:
               # Clone repo
               git clone --branch "$BENCH_BRANCH" --depth 1 "$BENCH_REPO" /workspace
               cd /workspace
-              pip install -q -e ".[tpu]" 2>&1 | tail -3
+              pip install -q -e "./python[tpu]" 2>&1 | tail -3
 
               echo "=== Worker $TPU_WORKER_ID: devices=$(python3 -c 'import jax; print(jax.device_count())') ==="
 

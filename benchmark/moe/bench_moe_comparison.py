@@ -113,6 +113,7 @@ def _run_epmoe(
                 data_generator=lambda: (),
                 task=f"epmoe_ep{ep_size}_tp{tp_size}_nt{case.num_tokens}",
                 tries=iters,
+                warmup=1,
             )
         except Exception as e:
             print(f"    ERROR EPMoE EP={ep_size} TP={tp_size}: {e}")
@@ -200,6 +201,7 @@ def _run_fused_epmoe(
                 data_generator=lambda: (),
                 task=f"fused_ep{ep_size}_nt{case.num_tokens}",
                 tries=iters,
+                warmup=1,
             )
         except Exception as e:
             print(f"    ERROR FusedEPMoE EP={ep_size}: {e}")
@@ -213,7 +215,7 @@ def _run_fused_epmoe(
 
 def run_comparison(
     num_tokens: list[int] | None = None,
-    iters: int = 3,
+    iters: int = 5,
     scenario: str = "balanced",
 ) -> None:
     num_devices = len(jax.devices())
