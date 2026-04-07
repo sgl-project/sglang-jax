@@ -1,0 +1,77 @@
+# sky launch scripts/tpu_v6e16_mimo.sky.yaml -n jiongxuan-v6e16-mimo -y --use-spot -i 120
+#
+# Purpose:
+# - TPU v6e-16 machine for MiMo-V2-Flash (256 experts, fp8) debugging
+# - Run unit tests first, then launch server for e2e verification
+
+resources:
+  accelerators: tpu-v6e-16
+  accelerator_args:
+    tpu_vm: true
+    runtime_version: v2-alpha-tpuv6e
+
+setup: |
+  set -euxo pipefail
+
+  # Step 1. Prepare repo.
+  if [ ! -d ~/sky_workdir/sgl-jax/.git ]; then
+    mkdir -p ~/sky_workdir
+    git clone https://github.com/sgl-project/sglang-jax.git ~/sky_workdir/sgl-jax
+  fi
+
+  cd ~/sky_workdir/sgl-jax
+
+  # Step 2. Install Python environment.
+  git remote set-url origin https://github.com/primatrix/sglang-jax.git
+  git fetch origin feat/mimo-v2-flash
+  git checkout feat/mimo-v2-flash
+  git pull --ff-only origin feat/mimo-v2-flash
+  if ! command -v uv >/dev/null 2>&1; then
+    python3 -m pip install --user uv
+  fi
+  if [ ! -f .venv/bin/activate ]; then
+    uv venv --python 3.12
+  fi
+  source .venv/bin/activate
+  uv pip install -e "python[all,multimodal]"
+
+  # Step 3. Stop old model processes.
+  pkill -f "sgl_jax.launch_server|sglang::scheduler" || true
+  sleep 3
+
+run: |
+  # Kill any leftover processes before starting.
+  pkill -f "sgl_jax.launch_server|sglang::scheduler" || true
+  sleep 3
+  rm ~/1.log || true
+  cd ~/sky_workdir/sgl-jax
+  source .venv/bin/activate
+
+  export PYTHONPATH=~/sky_workdir/sgl-jax/python
+  export XLA_PYTHON_CLIENT_PREALLOCATE=false
+  export LOG=~/1.log
+
+  # v6e-16 = 4 nodes x 4 chips. SkyPilot sets SKYPILOT_NODE_RANK (0-3) and SKYPILOT_NODE_IPS.
+  NUM_NODES=${SKYPILOT_NUM_NODES:-1}
+  NODE_RANK=${SKYPILOT_NODE_RANK:-0}
+  HEAD_IP=$(echo "$SKYPILOT_NODE_IPS" | head -1 | awk '{print $1}')
+  # Fallback: if head IP is empty, use this node's IP
+  HEAD_IP=${HEAD_IP:-$(hostname -I | awk '{print $1}')}
+
+  echo "Starting server: node_rank=${NODE_RANK} nnodes=${NUM_NODES} head=${HEAD_IP}"
+
+  python -u -m sgl_jax.launch_server \
+    --model-path /models/MiMo-V2-Flash \
+    --trust-remote-code \
+    --tp-size 16 --ep-size 16 \
+    --moe-backend epmoe \
+    --nnodes ${NUM_NODES} --node-rank ${NODE_RANK} \
+    --dist-init-addr ${HEAD_IP}:10011 \
+    --host 127.0.0.1 --port 30271 \
+    --context-length 1024 \
+    --max-total-tokens 2048 \
+    --max-prefill-tokens 256 \
+    --mem-fraction-static 0.7 \
+    --disable-precompile --skip-server-warmup \
+    --log-level info \
+    > $LOG 2>&1 &

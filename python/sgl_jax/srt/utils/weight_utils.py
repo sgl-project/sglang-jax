@@ -258,47 +258,6 @@ class WeightLoader:
         scale_per_out = jnp.take(weight, jnp.asarray(out_block_ids), axis=1)
         return jnp.expand_dims(jnp.transpose(scale_per_out, (0, 2, 1)), axis=2)
 
-    def _maybe_expand_linear_block_scale(
-        self,
-        weight: jax.Array,
-        model_param: nnx.Variable,
-        target_path: str,
-    ) -> jax.Array:
-        """Expand 2D block-quant scale [out_blocks, in_blocks] to 3D [in_blocks, 1, n_out] at load time."""
-        if not target_path.endswith("weight_scale"):
-            return weight
-
-        # Only convert when checkpoint has 2D scale and model expects 3D.
-        if weight.ndim != 2 or model_param.value.ndim != 3:
-            return weight
-
-        # Model param shape: [in_blocks, 1, n_out]
-        if model_param.value.shape[1] != 1:
-            return weight
-
-        quant_cfg = getattr(self.model_config, "quantization_config", None)
-        weight_block_size = getattr(quant_cfg, "weight_block_size", None)
-        if not (isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2):
-            return weight
-
-        block_size_out = int(weight_block_size[0])
-        if block_size_out <= 0:
-            return weight
-
-        from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
-            expand_block_scale,
-        )
-
-        n_out = int(model_param.value.shape[2])
-        logger.info(
-            "Expanding linear block-quant scale %s from %s to kernel-ready layout [%d, 1, %d]",
-            target_path,
-            weight.shape,
-            weight.shape[1],
-            n_out,
-        )
-        return expand_block_scale(weight, n_out, block_size_out)
-
     def _scan_weight_info(self) -> dict[str, list[dict]]:
         """
         Scan all safetensors files to build a mapping from HF key to file info.
@@ -806,6 +765,55 @@ class WeightLoader:
             target_dtype
         )
 
+    def _get_moe_mesh(self, ep_size: int) -> jax.sharding.Mesh:
+        world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
+        tp_size = world_size // ep_size
+        devices = self.mesh.devices.flatten()
+        return jax.sharding.Mesh(
+            devices.reshape(ep_size, tp_size),
+            axis_names=("expert", "tensor"),
+            axis_types=(
+                jax.sharding.AxisType.Explicit,
+                jax.sharding.AxisType.Explicit,
+            ),
+        )
+
+    @staticmethod
+    def _adapt_pspec_rank(pspec: tuple, target_rank: int) -> tuple:
+        pspec_list = list(pspec)
+        while len(pspec_list) > target_rank:
+            remove_idx = None
+            for i in range(len(pspec_list) - 2, 0, -1):
+                if pspec_list[i] is None:
+                    remove_idx = i
+                    break
+            if remove_idx is None:
+                remove_idx = len(pspec_list) - 2
+            pspec_list.pop(remove_idx)
+        if len(pspec_list) != target_rank:
+            raise ValueError(
+                f"Cannot adapt PartitionSpec rank: pspec={pspec} target_rank={target_rank}"
+            )
+        return tuple(pspec_list)
+
+    def _build_moe_named_sharding(
+        self,
+        mapping: WeightMapping,
+        *,
+        rank: int | None = None,
+    ) -> jax.sharding.NamedSharding:
+        pspec = tuple(mapping.sharding)
+        if rank is not None and len(pspec) != rank:
+            pspec = self._adapt_pspec_rank(pspec, rank)
+
+        if "expert" in mapping.sharding:
+            ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
+            mesh = self._get_moe_mesh(ep_size)
+        else:
+            mesh = self.mesh
+
+        return jax.sharding.NamedSharding(mesh, P(*pspec))
+
     def load_weights_from_safetensors(
         self,
         weight_mappings: Mapping[str, str | list[str] | WeightMapping],
@@ -867,7 +875,26 @@ class WeightLoader:
         is_static_quant = quant_cfg is not None and quant_cfg.is_static_checkpoint
 
         with SequentialSafetensorManager() as file_manager:
+
+            def maybe_dequantize_linear_weight(hf_key: str, arr: jax.Array):
+                """If checkpoint stores float8 weight with companion weight_scale_inv, dequantize to fp32."""
+                if arr.dtype not in (jnp.float8_e4m3fn, jnp.float8_e5m2):
+                    return arr
+                if not hf_key.endswith(".weight"):
+                    return arr
+                scale_key = hf_key.replace(".weight", ".weight_scale_inv")
+                if scale_key not in weight_info:
+                    return arr
+                # Dequantization handled at runtime via weight_scale in LinearBase; keep float8 to save memory.
+                return arr
+
             # 2. Process Regular Weights (Lazy Pull)
+            # Detect block quantization — scale_inv weights need 2D→3D expansion
+            # which only the SLOW path provides via _maybe_expand_linear_block_scale.
+            _bq_cfg = getattr(self.model_config, "quantization_config", None)
+            _bq_wbs = getattr(_bq_cfg, "weight_block_size", None)
+            _has_block_quant = isinstance(_bq_wbs, (list, tuple)) and len(_bq_wbs) == 2
+
             for hf_key, mapping in tqdm(regular_mappings.items(), desc="Loading Regular Weights"):
                 if hf_key not in weight_info:
                     if hf_key == "d2t":
@@ -877,7 +904,52 @@ class WeightLoader:
                         logger.debug("Skipping excluded layer weight: %s", hf_key)
                         continue
                     else:
-                        logger.warning("No file found for weight: %s", hf_key)
+                        # Fill missing weights with zeros to avoid abstract params (ShapeDtypeStruct)
+                        try:
+                            target_path = (
+                                mapping.target_path
+                                if isinstance(mapping, WeightMapping)
+                                else mapping
+                            )
+                            if isinstance(target_path, list):
+                                target_path = target_path[0]
+                            model_param = self._get_param(params, target_path)
+                            current_val = model_param.value
+                            if isinstance(current_val, jax.ShapeDtypeStruct):
+                                fill = jnp.ones(current_val.shape, dtype=current_val.dtype) if "weight_scale" in target_path else jnp.zeros(current_val.shape, dtype=current_val.dtype)
+                                sharding = getattr(current_val, "sharding", None)
+                                if sharding is not None:
+                                    try:
+                                        target_sharding = sharding
+                                        # Replace AbstractMesh with real mesh when possible
+                                        if getattr(sharding, "mesh", None) is not None and isinstance(
+                                            sharding.mesh, jax.sharding.AbstractMesh
+                                        ):
+                                            target_sharding = jax.sharding.NamedSharding(
+                                                self.mesh, sharding.spec
+                                            )
+                                        fill = jax.device_put(fill, sharding=target_sharding)
+                                    except TypeError:
+                                        fill = jax.device_put(fill, device=target_sharding)
+                                model_param.value = fill
+                                logger.warning(
+                                    "No file found for weight: %s. Filled %s with shape %s.",
+                                    hf_key,
+                                    "ones" if "weight_scale" in target_path else "zeros",
+                                    current_val.shape,
+                                )
+                            else:
+                                logger.warning(
+                                    "No file found for weight: %s (kept existing value type %s).",
+                                    hf_key,
+                                    type(current_val),
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                "No file found for weight: %s, and zero fill failed: %s",
+                                hf_key,
+                                e,
+                            )
                         continue
 
                 infos = weight_info[hf_key]
@@ -887,6 +959,10 @@ class WeightLoader:
 
                 is_split_weight = len(infos) > 1 and mapping.concat_axis is not None
 
+                # Block-quant scale_inv must go through SLOW path for 2D→3D expansion
+                _is_block_scale = (
+                    _has_block_quant and hf_key.endswith("weight_scale_inv")
+                )
                 can_optimize = (
                     isinstance(mapping.target_path, str)
                     and mapping.reshape is None
@@ -895,6 +971,7 @@ class WeightLoader:
                     and not mapping.head_dim_padding
                     and mapping.sharding is not None
                     and hf_key != "d2t"
+                    and not _is_block_scale
                 )
 
                 if can_optimize:
@@ -927,6 +1004,8 @@ class WeightLoader:
                             )
                             lazy_weight = lazy_arrays[0]
 
+                        lazy_weight = maybe_dequantize_linear_weight(hf_key, lazy_weight)
+
                         # Handle multi-dimensional transpose (transpose_axes) or 2D transpose
                         if mapping.transpose_axes is not None:
                             lazy_weight = jnp.transpose(lazy_weight, mapping.transpose_axes)
@@ -943,11 +1022,6 @@ class WeightLoader:
 
                         target_path = mapping.target_path
                         model_param = self._get_param(params, target_path)
-
-                        # Expand 2D block-quant scale to 3D kernel-ready layout.
-                        lazy_weight = self._maybe_expand_linear_block_scale(
-                            lazy_weight, model_param, target_path
-                        )
 
                         if lazy_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
                             model_param.value = lazy_weight
@@ -981,6 +1055,8 @@ class WeightLoader:
                     lazy_weight = jnp.concatenate(lazy_arrays, axis=mapping.concat_axis)
                 else:
                     lazy_weight = lazy_arrays[0]
+
+                lazy_weight = maybe_dequantize_linear_weight(hf_key, lazy_weight)
 
                 if hf_key == "d2t":
                     base = jnp.arange(lazy_weight.shape[0], dtype=lazy_weight.dtype)
@@ -1030,28 +1106,9 @@ class WeightLoader:
 
                 # OPTIMIZATION: Use Stacked Loader if no TP split
                 if not is_tp_split and mapping.concat_axis is None:
-                    # 1. Pre-construct target sharding
-                    if "expert" in mapping.sharding:
-                        ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
-                        world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get(
-                            "tensor", 1
-                        )
-                        tp_size = world_size // ep_size
-
-                        devices = self.mesh.devices.flatten()
-                        # Construct MoE specific mesh
-                        moe_mesh = jax.sharding.Mesh(
-                            devices.reshape(ep_size, tp_size),
-                            axis_names=("expert", "tensor"),
-                            axis_types=(
-                                jax.sharding.AxisType.Explicit,
-                                jax.sharding.AxisType.Explicit,
-                            ),
-                        )
-                        final_sharding = jax.sharding.NamedSharding(moe_mesh, P(*mapping.sharding))
-                    else:
-                        # Standard Sharding
-                        final_sharding = jax.sharding.NamedSharding(self.mesh, P(*mapping.sharding))
+                    raw_rank = len(weight_info[expected_hf_keys[0]][0]["shape"]) + 1
+                    load_sharding = self._build_moe_named_sharding(mapping, rank=raw_rank)
+                    final_sharding = self._build_moe_named_sharding(mapping)
 
                     # 2. Call creator
                     stacked_weight = self._create_stacked_moe_lazy_tensor(
@@ -1059,17 +1116,256 @@ class WeightLoader:
                         weight_info,
                         file_manager,
                         do_transpose=mapping.transpose,  # CPU transpose
-                        target_sharding=final_sharding,  # Global loading
+                        target_sharding=load_sharding,  # Raw tensor loading
                         physical_to_logical_map=mapping.physical_to_logical_map,
                     )
                     loaded_shape = stacked_weight.shape
+                    # NOTE: For native FP8 checkpoints, the tensor is often named
+                    # *_weight_scale_inv for vLLM compatibility, but TPU inference
+                    # paths consume raw checkpoint values directly as the scale tensor.
+                    if all("weight_scale_inv" in k for k in expected_hf_keys):
+                        pass
 
+                    # Special handling for MOE scales: align to weight last-dim and pad shape
                     if mapping.reshape is not None:
-                        stacked_weight = jnp.reshape(stacked_weight, mapping.reshape)
+                        target_path = mapping.target_path[0]
+                        custom_scale_handled = False
+                        if target_path.endswith("_scale"):
+                            weight_path = target_path.replace("_scale", "")
+                            weight_param = self._get_param(params, weight_path)
+                            weight_shape = weight_param.value.shape
+                            is_fused_moe_scale = target_path.endswith(
+                                (".w1_scale", ".w2_scale", ".w3_scale")
+                            )
+                            is_epmoe_scale = target_path.endswith(
+                                (".wi_0_scale", ".wi_1_scale", ".wo_scale")
+                            )
+
+                            # Handle block-wise FP8 scales (shape: [num_experts, n_blocks, k_blocks])
+                            if (
+                                stacked_weight.ndim == 3
+                                and len(weight_shape) >= 3
+                                and weight_shape[-2] > 0
+                                and weight_shape[-1] > 0
+                            ):
+                                if is_epmoe_scale:
+                                    # NOTE: This block is still a shared EPMoE static-scale loader path,
+                                    # not a MiMo-only hook. MiMo currently depends on the same branch
+                                    # because its checkpoint-to-kernel alignment is expressed through
+                                    # mapping metadata rather than a dedicated loader variant. If more
+                                    # model-specific MoE scale layouts show up, split these transforms
+                                    # out of weight_utils instead of growing this shared branch further.
+                                    # EPMoE weight shape: (E, k, n).
+                                    # Block quant scale from checkpoint: (E, n_blocks, k_blocks) or
+                                    # (E, k_blocks, n_blocks). Use divisibility to determine orientation.
+                                    # Target kernel layout: (E, k_blocks, 1, out_size) where out_size = n.
+                                    num_experts_val = stacked_weight.shape[0]
+                                    in_size_val = int(weight_shape[-2])   # k dim (full input size)
+                                    out_size_val = int(weight_shape[-1])  # n dim (full output size)
+                                    A_dim = int(stacked_weight.shape[1])
+                                    B_dim = int(stacked_weight.shape[2])
+                                    if (
+                                        out_size_val % A_dim == 0
+                                        and in_size_val % B_dim == 0
+                                    ):
+                                        # orientation: (E, n_blocks, k_blocks)
+                                        n_blocks_val, k_blocks_val = A_dim, B_dim
+                                        scales = stacked_weight
+                                    elif (
+                                        in_size_val % A_dim == 0
+                                        and out_size_val % B_dim == 0
+                                    ):
+                                        # orientation: (E, k_blocks, n_blocks) → transpose to (E, n_blocks, k_blocks)
+                                        k_blocks_val, n_blocks_val = A_dim, B_dim
+                                        scales = jnp.transpose(stacked_weight, (0, 2, 1))
+                                    else:
+                                        raise ValueError(
+                                            f"Cannot determine EPMoE block quant scale orientation: "
+                                            f"target={target_path} stacked_shape={stacked_weight.shape} "
+                                            f"weight_shape={weight_shape}"
+                                        )
+                                    # scales: (E, n_blocks, k_blocks) → (E, k_blocks, n_blocks)
+                                    scales = jnp.transpose(scales, (0, 2, 1))
+                                    # Expand n_blocks → full out_size: (E, k_blocks, out_size)
+                                    block_size_n = out_size_val // n_blocks_val
+                                    scales = jnp.repeat(scales, block_size_n, axis=2)
+                                    target_shape = (num_experts_val, k_blocks_val, 1, out_size_val)
+                                    # The compact checkpoint layout shards the raw 3D tensor along
+                                    # the block axis, but the expanded 4D kernel layout must follow
+                                    # the final parameter sharding (tensor-parallel on out_size).
+                                    out_sharding = final_sharding
+                                    stacked_weight = jax.lax.reshape(
+                                        scales,
+                                        target_shape,
+                                        dimensions=None,
+                                        out_sharding=out_sharding,
+                                    )
+                                    custom_scale_handled = True
+                                elif is_fused_moe_scale:
+                                    num_experts = stacked_weight.shape[0]
+                                    target_dim0 = int(weight_shape[-2])
+                                    target_dim1 = int(weight_shape[-1])
+
+                                    quant_cfg = getattr(self.model_config, "quantization_config", None)
+                                    weight_block_size = (
+                                        getattr(quant_cfg, "weight_block_size", None)
+                                        if quant_cfg is not None
+                                        else None
+                                    )
+                                    if (
+                                        not isinstance(weight_block_size, (list, tuple))
+                                        or len(weight_block_size) != 2
+                                    ):
+                                        raise ValueError(
+                                            "Fused MoE static scale loading requires quantization_config.weight_block_size "
+                                            f"to be a 2-element list/tuple, got {weight_block_size}"
+                                        )
+
+                                    hf_out_block = int(weight_block_size[0])
+                                    hf_in_block = int(weight_block_size[1])
+                                    if hf_out_block <= 0 or hf_in_block <= 0:
+                                        raise ValueError(
+                                            f"Invalid weight_block_size for fused MoE: {weight_block_size}"
+                                        )
+
+                                    if target_dim0 % hf_in_block != 0 or target_dim1 % hf_out_block != 0:
+                                        raise ValueError(
+                                            "Fused MoE static scale transform incompatible with target weight shape: "
+                                            f"target={target_path} weight_shape={weight_shape} "
+                                            f"weight_block_size={weight_block_size}"
+                                        )
+
+                                    expected_q_blocks = target_dim0 // hf_in_block
+                                    expected_out_blocks = target_dim1 // hf_out_block
+                                    raw_blocks = tuple(int(x) for x in stacked_weight.shape[1:])
+
+                                    if raw_blocks == (expected_out_blocks, expected_q_blocks):
+                                        # Fused expert weights are loaded transposed from HF. Align the scale grid
+                                        # to target weight axes before expanding the HF out-block axis.
+                                        scales = jnp.transpose(stacked_weight, (0, 2, 1))
+                                    elif raw_blocks == (expected_q_blocks, expected_out_blocks):
+                                        # Already aligned to target weight axes.
+                                        scales = stacked_weight
+                                    else:
+                                        raise ValueError(
+                                            "Unexpected fused MoE static scale grid shape: "
+                                            f"target={target_path} raw_blocks={raw_blocks} "
+                                            f"expected_hf_oriented={(expected_out_blocks, expected_q_blocks)} "
+                                            f"expected_target_oriented={(expected_q_blocks, expected_out_blocks)} "
+                                            f"weight_shape={weight_shape} weight_block_size={weight_block_size}"
+                                        )
+
+                                    scales = jnp.repeat(scales, hf_out_block, axis=2)
+                                    if scales.shape != (num_experts, expected_q_blocks, target_dim1):
+                                        raise ValueError(
+                                            "Fused MoE static scale expansion produced wrong shape: "
+                                            f"target={target_path} got={scales.shape} "
+                                            f"expected={(num_experts, expected_q_blocks, target_dim1)}"
+                                        )
+
+                                    target_shape = (num_experts, expected_q_blocks, 1, target_dim1)
+                                    out_sharding = getattr(stacked_weight, "sharding", None)
+                                    stacked_weight = jax.lax.reshape(
+                                        scales,
+                                        target_shape,
+                                        dimensions=None,
+                                        out_sharding=out_sharding,
+                                    )
+                                    custom_scale_handled = True
+
+                                num_experts, block_n, block_k = (
+                                    stacked_weight.shape[0],
+                                    stacked_weight.shape[-2],
+                                    stacked_weight.shape[-1],
+                                )
+                                # EPMoE expert kernels use [E, k, n] weights, where
+                                # the last dim is the GEMM output dim consumed by GMM
+                                # scales. Expanding scales along k would produce
+                                # malformed [E, k_blocks, 1, k] tensors such as
+                                # (..., 32, 1, 2048) for wi_0 instead of the required
+                                # (..., 32, 1, 4096).
+                                in_size = weight_shape[-2]
+                                out_size = weight_shape[-1]
+
+                                if (
+                                    not custom_scale_handled
+                                    and out_size % block_n == 0
+                                    and in_size % block_k == 0
+                                ):
+                                    block_size_n = out_size // block_n
+                                    block_size_k = in_size // block_k
+
+                                    if block_size_k < 128:
+                                        # Merge adjacent k-blocks to satisfy TPU block size requirements.
+                                        merge_factor = int(np.ceil(128 / block_size_k))
+                                        block_k_eff = max(1, block_k // merge_factor)
+                                        merge_factor = max(1, block_k // block_k_eff)
+                                        stacked_weight = stacked_weight.reshape(
+                                            num_experts, block_n, block_k_eff, merge_factor
+                                        )
+                                        stacked_weight = stacked_weight.mean(axis=-1)
+                                        block_k = block_k_eff
+                                        block_size_k = in_size // block_k
+
+                                    if block_size_k < 128:
+                                        # Final fallback: collapse k-blocks to a single block.
+                                        stacked_weight = stacked_weight.mean(axis=-1, keepdims=True)
+                                        block_k = 1
+                                        block_size_k = in_size
+
+                                    # Rearrange to (experts, k_blocks, n_blocks)
+                                    scales = jnp.transpose(stacked_weight, (0, 2, 1))
+                                    # Expand each n_block value across its block_size_n span → (E, k_blocks, out_size)
+                                    scales = jnp.repeat(scales, block_size_n, axis=2)
+
+                                    target_shape = (num_experts, block_k, 1, out_size)
+                                    out_sharding = getattr(stacked_weight, "sharding", None)
+                                    stacked_weight = jax.lax.reshape(
+                                        scales,
+                                        target_shape,
+                                        dimensions=None,
+                                        out_sharding=out_sharding,
+                                    )
+                                    custom_scale_handled = True
+
+                            if not custom_scale_handled:
+                                desired_last = weight_shape[-1]
+                                flat = jnp.reshape(stacked_weight, (stacked_weight.shape[0], -1))
+                                if flat.shape[1] < desired_last:
+                                    raise ValueError(
+                                        f"Scale tensor {target_path} has {flat.shape[1]} elements per expert, expected >= {desired_last}"
+                                    )
+                                flat = flat[:, :desired_last]
+                                stacked_weight = flat
+                                target_shape = (stacked_weight.shape[0], 1, 1, desired_last)
+                        else:
+                            target_shape = list(mapping.reshape)
+                            total_elems = int(np.prod(stacked_weight.shape))
+                            known = 1
+                            unknown_idx = -1
+                            for i, d in enumerate(target_shape):
+                                if d == -1:
+                                    unknown_idx = i
+                                else:
+                                    known *= d
+                            if unknown_idx != -1:
+                                target_shape[unknown_idx] = total_elems // known
+                            target_shape = tuple(target_shape)
+
+                        out_sharding = getattr(stacked_weight, "sharding", None)
+                        stacked_weight = jax.lax.reshape(
+                            stacked_weight,
+                            target_shape,
+                            dimensions=None,
+                            out_sharding=out_sharding,
+                        )
 
                     if mapping.repeat is not None:
                         axis, times = mapping.repeat
                         stacked_weight = jnp.repeat(stacked_weight, times, axis=axis)
+
+                    if stacked_weight.ndim == len(mapping.sharding):
+                        stacked_weight = jax.sharding.reshard(stacked_weight, final_sharding)
 
                     # 3. Direct assignment
                     target_path = mapping.target_path[0]
@@ -1079,20 +1375,6 @@ class WeightLoader:
                         model_param,
                         target_path,
                     )
-
-                    if is_static_quant and moe_key.endswith("_scale"):
-                        logger.info(
-                            "MoE scale debug group=%s target=%s loaded_shape=%s final_shape=%s "
-                            "param_shape=%s reshape=%s repeat=%s sharding=%s",
-                            moe_key,
-                            target_path,
-                            loaded_shape,
-                            stacked_weight.shape,
-                            model_param.value.shape,
-                            mapping.reshape,
-                            mapping.repeat,
-                            mapping.sharding,
-                        )
 
                     try:
                         if stacked_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
@@ -1132,25 +1414,9 @@ class WeightLoader:
                             stacked_weight.shape,
                         )
                 else:
-                    ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
-                    if "expert" in mapping.sharding:
-                        world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get(
-                            "tensor", 1
-                        )
-                        tp_size = world_size // ep_size
-                        devices = self.mesh.devices.flatten()
-                        moe_mesh = jax.sharding.Mesh(
-                            devices.reshape(ep_size, tp_size),
-                            axis_names=("expert", "tensor"),
-                            axis_types=(
-                                jax.sharding.AxisType.Explicit,
-                                jax.sharding.AxisType.Explicit,
-                            ),
-                        )
-                        # Use regular mesh for loading individual expert weights (TP sharding only)
-                        final_sharding = jax.sharding.NamedSharding(moe_mesh, P(*mapping.sharding))
-                    else:
-                        final_sharding = jax.sharding.NamedSharding(self.mesh, P(*mapping.sharding))
+                    raw_rank = len(weight_info[expected_hf_keys[0]][0]["shape"]) + 1
+                    load_sharding = self._build_moe_named_sharding(mapping, rank=raw_rank)
+                    final_sharding = self._build_moe_named_sharding(mapping)
 
                     expert_weights = self._create_stacked_split_moe_lazy_tensor(
                         expected_hf_keys,
@@ -1158,17 +1424,107 @@ class WeightLoader:
                         file_manager,
                         concat_axis=mapping.concat_axis,
                         do_transpose=mapping.transpose,
-                        target_sharding=final_sharding,
+                        target_sharding=load_sharding,
                         physical_to_logical_map=mapping.physical_to_logical_map,
                     )
                     loaded_shape = expert_weights.shape
+                    if all("weight_scale_inv" in k for k in expected_hf_keys):
+                        pass
 
                     if mapping.reshape is not None:
-                        expert_weights = jnp.reshape(expert_weights, mapping.reshape)
+                        # Preserve sharding when reshaping stacked MOE tensors (e.g., scales).
+                        target_path = mapping.target_path[0]
+                        custom_scale_handled = False
+                        if target_path.endswith("_scale"):
+                            weight_path = target_path.replace("_scale", "")
+                            weight_param = self._get_param(params, weight_path)
+                            weight_shape = weight_param.value.shape
+
+                            if (
+                                expert_weights.ndim == 3
+                                and len(weight_shape) >= 3
+                                and weight_shape[-2] > 0
+                                and weight_shape[-1] > 0
+                            ):
+                                num_experts, block_n, block_k = (
+                                    expert_weights.shape[0],
+                                    expert_weights.shape[-2],
+                                    expert_weights.shape[-1],
+                                )
+                                out_size = weight_shape[-2]
+                                in_size = weight_shape[-1]
+
+                                if out_size % block_n == 0 and in_size % block_k == 0:
+                                    block_size_n = out_size // block_n
+                                    block_size_k = in_size // block_k
+
+                                    if block_size_k < 128:
+                                        merge_factor = int(np.ceil(128 / block_size_k))
+                                        block_k_eff = max(1, block_k // merge_factor)
+                                        merge_factor = max(1, block_k // block_k_eff)
+                                        expert_weights = expert_weights.reshape(
+                                            num_experts, block_n, block_k_eff, merge_factor
+                                        )
+                                        expert_weights = expert_weights.mean(axis=-1)
+                                        block_k = block_k_eff
+                                        block_size_k = in_size // block_k
+
+                                    if block_size_k < 128:
+                                        expert_weights = expert_weights.mean(axis=-1, keepdims=True)
+                                        block_k = 1
+                                        block_size_k = in_size
+
+                                    scales = jnp.transpose(expert_weights, (0, 2, 1))
+                                    scales = jnp.repeat(scales, block_size_n, axis=2)
+
+                                    target_shape = (num_experts, block_k, 1, out_size)
+                                    out_sharding = getattr(expert_weights, "sharding", None)
+                                    expert_weights = jax.lax.reshape(
+                                        scales,
+                                        target_shape,
+                                        dimensions=None,
+                                        out_sharding=out_sharding,
+                                    )
+                                    custom_scale_handled = True
+
+                            if not custom_scale_handled:
+                                desired_last = weight_shape[-1]
+                                flat = jnp.reshape(expert_weights, (expert_weights.shape[0], -1))
+                                if flat.shape[1] < desired_last:
+                                    raise ValueError(
+                                        f"Scale tensor {target_path} has {flat.shape[1]} elements per expert, expected >= {desired_last}"
+                                    )
+                                flat = flat[:, :desired_last]
+                                expert_weights = flat
+                                target_shape = (expert_weights.shape[0], 1, 1, desired_last)
+                        else:
+                            target_shape = list(mapping.reshape)
+                            total_elems = int(np.prod(expert_weights.shape))
+                            known = 1
+                            unknown_idx = -1
+                            for i, d in enumerate(target_shape):
+                                if d == -1:
+                                    unknown_idx = i
+                                else:
+                                    known *= d
+                            if unknown_idx != -1:
+                                target_shape[unknown_idx] = total_elems // known
+                            target_shape = tuple(target_shape)
+
+                        out_sharding = getattr(expert_weights, "sharding", None)
+                        expert_weights = jax.lax.reshape(
+                            expert_weights,
+                            target_shape,
+                            dimensions=None,
+                            out_sharding=out_sharding,
+                        )
 
                     if mapping.repeat is not None:
                         axis, times = mapping.repeat
                         expert_weights = jnp.repeat(expert_weights, times, axis=axis)
+
+                    if expert_weights.ndim == len(mapping.sharding):
+                        expert_weights = jax.sharding.reshard(expert_weights, final_sharding)
 
                     target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
@@ -1177,20 +1533,6 @@ class WeightLoader:
                         model_param,
                         target_path,
                     )
-
-                    if is_static_quant and moe_key.endswith("_scale"):
-                        logger.info(
-                            "Split-MoE scale debug group=%s target=%s loaded_shape=%s final_shape=%s "
-                            "param_shape=%s reshape=%s repeat=%s sharding=%s",
-                            moe_key,
-                            target_path,
-                            loaded_shape,
-                            expert_weights.shape,
-                            model_param.value.shape,
-                            mapping.reshape,
-                            mapping.repeat,
-                            mapping.sharding,
-                        )
 
                     try:
                         if expert_weights.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
@@ -1409,6 +1751,8 @@ class WeightLoader:
     ):
         jax_path = mapping.target_path
         processed_weight = weight
+        model_param = self._get_param(params, jax_path)
+        sharding_spec = mapping.sharding
 
         # Apply output_multiplier_scale to lm_head weights (matching PyTorch implementation)
         if "lm_head" in hf_key and hasattr(self.model_config.hf_config, "output_multiplier_scale"):
@@ -1430,23 +1774,37 @@ class WeightLoader:
         if mapping.kv_head_padding:
             processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
 
-        sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
+        if hf_key.endswith("weight_scale_inv"):
+            # Native FP8 checkpoints commonly use the *_weight_scale_inv name for
+            # compatibility, but TPU inference kernels expect and consume these raw
+            # checkpoint values directly as the dequant scale tensor.
+            target_shape = getattr(model_param.value, "shape", ())
+            if processed_weight.ndim == 2 and len(target_shape) == 3:
+                # Expand 2D checkpoint scale to 3D kernel-ready layout.
+                # Model-specific override for non-standard block/head alignment.
+                expand_fn = getattr(self.model, "_expand_linear_block_scale", None)
+                if expand_fn is not None:
+                    processed_weight = expand_fn(
+                        processed_weight, model_param, jax_path, self.model_config
+                    )
+                sharding_spec = (None, None, None)  # fully replicated
+            elif processed_weight.ndim == 2 and len(target_shape) == 2:
+                # Linear block-quant scales are tiny; keep them fully replicated so local
+                # kernels can reconstruct exact per-element scales even when TP shards cut
+                # across block boundaries (e.g., k_proj with 1536 out-dim, tp=8, block=128).
+                sharding_spec = (None, None)
+            if processed_weight.ndim == 2 and len(target_shape) == 1:
+                raise ValueError(
+                    "Refusing to fold 2D block quant scale into 1D scale: "
+                    f"{hf_key} -> {jax_path}, source shape={processed_weight.shape}, "
+                    f"target shape={target_shape}. This indicates a block-quant/sharding "
+                    "mismatch that must be fixed without changing quantization semantics."
+                )
+
+        sharded_weight = self._shard_weight(processed_weight, sharding_spec)
 
         try:
             model_param = self._get_param(params, jax_path)
-
-            # Expand 2D block-quant scale to 3D kernel-ready layout.
-            sharded_weight = self._maybe_expand_linear_block_scale(
-                sharded_weight, model_param, jax_path
-            )
-
-            logger.debug(
-                "Loading %s -> %s, shape: %s, transpose: %s",
-                hf_key,
-                jax_path,
-                processed_weight.shape,
-                mapping.transpose,
-            )
             if sharded_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
                 model_param.value = sharded_weight
             else:
@@ -1607,11 +1965,20 @@ class WeightLoader:
     def _apply_kv_head_padding(self, weight: jax.Array, hf_key: str) -> jax.Array:
         """Apply KV head padding/replication when tp_size > total_kv_heads.
 
-        Handles:
-        1. Bias/Scale (1D or 2D with shape[0]=heads) -> Pad Axis 0
-        2. Standard Weight (2D with shape[1]=heads*dim) -> Pad Axis 1
-        3. Static Quant Weight (2D with shape[0]=heads*dim) -> Pad Axis 0
+        Models can override this by defining a ``_apply_kv_head_padding`` method
+        on the model class (e.g. MiMo-V2-Flash handles per-layer KV heads,
+        split K/V head dims, and misaligned block-quant scales).
+
+        The generic fallback handles standard GQA/MHA head replication/padding.
         """
+        # Model-specific override (e.g. MiMo-V2-Flash)
+        custom_fn = getattr(self.model, "_apply_kv_head_padding", None)
+        if custom_fn is not None:
+            return custom_fn(
+                weight, hf_key, self.model_config, self.sharding_size, self.head_dim
+            )
+
+        # Generic fallback: simple KV head replication/padding
         if not (
             any(proj in hf_key for proj in ["k_proj", "v_proj"])
             and self.model_config.needs_kv_head_replication(self.sharding_size)
