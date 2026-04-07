@@ -323,11 +323,12 @@ class PrefillAdder:
             Available tokens minus total token offset
         """
         if self.is_hybrid:
-            available_and_evictable = min(
+            # For hybrid models, use the full pool's capacity for budget
+            # estimation. SWA layers only need sliding-window tokens per request,
+            # so the SWA pool should not limit admission here.
+            available_and_evictable = (
                 self.token_to_kv_pool_allocator.full_available_size(dp_rank=dp_rank)
-                + self.tree_cache.full_evictable_size(dp_rank=dp_rank),
-                self.token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
-                + self.tree_cache.swa_evictable_size(dp_rank=dp_rank),
+                + self.tree_cache.full_evictable_size(dp_rank=dp_rank)
             )
         else:
             available_and_evictable = self.token_to_kv_pool_allocator.available_size(
@@ -346,6 +347,8 @@ class PrefillAdder:
             Available tokens minus current token offset
         """
         if self.is_hybrid:
+            # For immediate prefill budget, respect both pools since prefill
+            # allocates input_len pages from both full and SWA pools.
             available_and_evictable = min(
                 self.token_to_kv_pool_allocator.full_available_size(dp_rank=dp_rank)
                 + self.tree_cache.full_evictable_size(dp_rank=dp_rank),

@@ -521,8 +521,10 @@ class ModelRunner(BaseModelRunner):
             self.token_to_kv_pool = SWAKVPool(
                 size=self.full_max_total_num_tokens,
                 size_swa=self.swa_max_total_num_tokens,
+                page_size=self.page_size,
                 swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
                 full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+                token_to_kv_pool_class=MHATokenToKVPool,
                 dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(
                     self.attention_tp_size
@@ -554,6 +556,7 @@ class ModelRunner(BaseModelRunner):
                         self.full_max_total_num_tokens,
                         self.swa_max_total_num_tokens,
                         kvcache=self.token_to_kv_pool,
+                        page_size=self.page_size,
                         dp_size=dp_size,
                     )
                 else:
@@ -563,16 +566,33 @@ class ModelRunner(BaseModelRunner):
                         dp_size=dp_size,
                     )
             else:
-                assert (
-                    not self.is_hybrid
-                ), f"model_runner: is_hybrid should be False in non-DP mode, got is_hybrid={self.is_hybrid}"
-                self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                    size=self.max_total_num_tokens,
-                    page_size=self.page_size,
-                    kvcache=self.token_to_kv_pool,
-                    debug_mode=False,
-                    dp_size=dp_size,
-                )
+                if self.is_hybrid:
+                    self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                        self.full_max_total_num_tokens,
+                        self.swa_max_total_num_tokens,
+                        kvcache=self.token_to_kv_pool,
+                        page_size=self.page_size,
+                        dp_size=dp_size,
+                    )
+                else:
+                    self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                        size=self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        kvcache=self.token_to_kv_pool,
+                        debug_mode=False,
+                        dp_size=dp_size,
+                    )
+
+        if (
+            self.is_hybrid
+            and hasattr(self, "attn_backend")
+            and hasattr(self.token_to_kv_pool_allocator, "full_to_swa_index_mapping")
+        ):
+            object.__setattr__(
+                self.attn_backend,
+                "swa_index_mapping",
+                self.token_to_kv_pool_allocator.full_to_swa_index_mapping,
+            )
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
@@ -789,11 +809,11 @@ class ModelRunner(BaseModelRunner):
         self.full_max_total_num_tokens = int(total_tokens / denominator)
         self.swa_max_total_num_tokens = int(self.full_max_total_num_tokens * swa_full_tokens_ratio)
 
-        # Align to dp_size so KV cache buffers can be evenly sharded
-        dp = self.dp_size
-        if dp > 1:
-            self.full_max_total_num_tokens = (self.full_max_total_num_tokens // dp) * dp
-            self.swa_max_total_num_tokens = (self.swa_max_total_num_tokens // dp) * dp
+        # Align pool sizes to page_size and dp_size for sharding compatibility
+        dp_size = self.server_args.dp_size
+        alignment = self.page_size * dp_size
+        self.full_max_total_num_tokens -= self.full_max_total_num_tokens % alignment
+        self.swa_max_total_num_tokens -= self.swa_max_total_num_tokens % alignment
 
         self.max_total_num_tokens = self.full_max_total_num_tokens
 

@@ -37,6 +37,7 @@ class FlashAttentionMetadata:
     cu_q_lens: jax.Array = None
     cu_kv_lens: jax.Array = None
     page_indices: jax.Array = None
+    swa_page_indices: jax.Array = None
     seq_lens: jax.Array = None
     distribution: jax.Array = None
     custom_mask: jax.Array = None
@@ -46,6 +47,7 @@ class FlashAttentionMetadata:
             self.cu_q_lens,
             self.cu_kv_lens,
             self.page_indices,
+            self.swa_page_indices,
             self.seq_lens,
             self.distribution,
             self.custom_mask,
@@ -61,9 +63,10 @@ class FlashAttentionMetadata:
         obj.cu_q_lens = children[0]
         obj.cu_kv_lens = children[1]
         obj.page_indices = children[2]
-        obj.seq_lens = children[3]
-        obj.distribution = children[4]
-        obj.custom_mask = children[5]
+        obj.swa_page_indices = children[3]
+        obj.seq_lens = children[4]
+        obj.distribution = children[5]
+        obj.custom_mask = children[6]
 
         return obj
 
@@ -95,6 +98,8 @@ class FlashAttention(AttentionBackend):
         self.attention_data_partition_axis = attention_data_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
+        # SWA dual-pool support: set by model_runner after pool creation.
+        # Accessed on host during metadata construction.
 
     def get_forward_metadata(
         self,
@@ -143,6 +148,30 @@ class FlashAttention(AttentionBackend):
             page_indices_list.append(rank_page_indices)
         # 5. Merge: Concatenate all ranks
         page_indices = np.concatenate(page_indices_list)
+
+        swa_page_indices = None
+        swa_mapping = getattr(self, "swa_index_mapping", None)
+        if swa_mapping is not None:
+            swa_page_indices_list = []
+            for i in range(batch.dp_size):
+                start = i * per_dp_loc_len
+                end = (i + 1) * per_dp_loc_len
+                rank_cache_loc = batch.cache_loc[start:end]
+                mapping = swa_mapping[i] if isinstance(swa_mapping, list) else swa_mapping
+                rank_swa_cache_loc = mapping[rank_cache_loc].astype(np.int64)
+
+                remainder = len(rank_swa_cache_loc) % self.page_size
+                if remainder > 0:
+                    pad_len = self.page_size - remainder
+                    rank_swa_cache_loc = np.concatenate(
+                        [rank_swa_cache_loc, np.zeros(pad_len, dtype=np.int64)]
+                    )
+
+                rank_swa_selected = rank_swa_cache_loc[:: self.page_size]
+                rank_swa_page_indices = (rank_swa_selected // self.page_size).astype(np.int32)
+                swa_page_indices_list.append(rank_swa_page_indices)
+
+            swa_page_indices = np.concatenate(swa_page_indices_list)
 
         # Compute cu_q_lens per DP rank section (each section starts from 0)
         if batch.forward_mode == ForwardMode.EXTEND:
@@ -217,10 +246,11 @@ class FlashAttention(AttentionBackend):
             metadata.cu_q_lens,
             metadata.cu_kv_lens,
             metadata.page_indices,
+            metadata.swa_page_indices,
             metadata.seq_lens,
             metadata.distribution,
         ) = device_array(
-            (cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
+            (cu_q_lens, cu_kv_lens, page_indices, swa_page_indices, seq_lens, distribution),
             sharding=(NamedSharding(self.mesh, P("data")) if jax.process_count() == 1 else None),
         )
         return metadata
@@ -459,6 +489,9 @@ class FlashAttention(AttentionBackend):
             "vmem_limit_bytes": self.vmem_limit_bytes,
             "head_dim": self.head_dim,
             "page_size": self.page_size,
+            "kv_partition_axis": self.kv_partition_axis,
+            "attention_data_partition_axis": self.attention_data_partition_axis,
+            "mesh": self.mesh,
         }
         return (children, aux_data)
 
@@ -470,6 +503,9 @@ class FlashAttention(AttentionBackend):
             aux_data["head_dim"],
             aux_data["vmem_limit_bytes"],
             aux_data["page_size"],
+            kv_partition_axis=aux_data.get("kv_partition_axis", "tensor"),
+            attention_data_partition_axis=aux_data.get("attention_data_partition_axis", "data"),
+            mesh=aux_data.get("mesh"),
         )
 
         obj.forward_metadata = children[0]
@@ -522,7 +558,10 @@ class FlashAttention(AttentionBackend):
             causal = 0
         # Select page indices and remap to SWA pool if KV cache supports it
         page_indices_arg = self.forward_metadata.page_indices
-        if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
+        is_swa_layer = layer.sliding_window_size is not None and layer.sliding_window_size > 0
+        if is_swa_layer and self.forward_metadata.swa_page_indices is not None:
+            page_indices_arg = self.forward_metadata.swa_page_indices
+        elif hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
             page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
 
         in_specs = (

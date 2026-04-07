@@ -62,6 +62,7 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 GLOBAL_SERVER_ARGS_KEYS = [
     "device",
+    "chunked_prefill_size",
     "disable_radix_cache",
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
@@ -249,6 +250,13 @@ class Req:
         self.last_host_node: Any = None
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: int | None = None
+        # SWA eviction: sequence positions [0, swa_evicted_seqlen) have had
+        # their SWA pool slots freed (no longer in the sliding window).
+        self.swa_evicted_seqlen: int = 0
+        # The number of extend/decode batches this request has already gone through.
+        # These counters gate overlap-safe SWA reclaim timing.
+        self.extend_batch_idx: int = 0
+        self.decode_batch_idx: int = 0
         # The prefix length of the last prefix matching
         self.last_matched_prefix_len: int = 0
 
@@ -508,6 +516,9 @@ class Req:
         self.is_chunked = 0
         self.req_pool_idx = None
         self.already_computed = 0
+        self.swa_evicted_seqlen = 0
+        self.extend_batch_idx = 0
+        self.decode_batch_idx = 0
         self.routed_experts = None
         self.latest_bid = None
 
@@ -973,6 +984,23 @@ class ScheduleBatch:
             else:
                 extend_input_logprob_token_ids = None
 
+            if self.is_hybrid:
+                sliding_window_size = getattr(self.model_config, "sliding_window", None)
+                if sliding_window_size and sliding_window_size > 0:
+                    page_size = getattr(
+                        self.token_to_kv_pool_allocator,
+                        "_page_size",
+                        getattr(self.token_to_kv_pool_allocator, "page_size", 1),
+                    )
+                    chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
+                    for req, pre_len in zip(reqs, prefix_lens, strict=True):
+                        if self.enable_overlap and req.is_chunked > 0:
+                            if req.extend_batch_idx < 2:
+                                continue
+                            if chunked_prefill_size is not None and chunked_prefill_size > 0:
+                                pre_len -= chunked_prefill_size
+                        self._evict_swa(req, pre_len, sliding_window_size, page_size, dp_rank)
+
             # Allocate memory for this DP rank
             if self.token_to_kv_pool_allocator.page_size == 1:
                 out_cache_loc = alloc_token_slots(
@@ -992,6 +1020,9 @@ class ScheduleBatch:
                     extend_num_tokens,
                     dp_rank=dp_rank,
                 )
+
+            for req in reqs:
+                req.extend_batch_idx += 1
 
             # Set fields for this DP rank's info
             info.input_ids = input_ids_cpu
@@ -1287,6 +1318,65 @@ class ScheduleBatch:
                 batch=self,
             )
 
+    def maybe_evict_swa(self):
+        """Evict SWA pool slots outside the sliding window for all requests."""
+        if not self.is_hybrid:
+            return
+        sliding_window_size = getattr(self.model_config, "sliding_window", None)
+        if sliding_window_size is None or sliding_window_size <= 0:
+            return
+        page_size = getattr(
+            self.token_to_kv_pool_allocator,
+            "_page_size",
+            getattr(self.token_to_kv_pool_allocator, "page_size", 1),
+        )
+
+        if self.forward_mode is not None and self.forward_mode.is_decode():
+            for dp_rank, info in enumerate(self.reqs_info):
+                if not info.reqs:
+                    continue
+                for req in info.reqs:
+                    if req.decode_batch_idx % sliding_window_size == 1:
+                        self._evict_swa(
+                            req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
+                        )
+            return
+
+        if self.forward_mode is None or not self.forward_mode.is_extend():
+            return
+
+        chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
+        for dp_rank, info in enumerate(self.reqs_info):
+            if not info.reqs or info.prefix_lens is None:
+                continue
+            for req, pre_len in zip(info.reqs, info.prefix_lens, strict=True):
+                if self.enable_overlap and req.is_chunked > 0:
+                    if req.extend_batch_idx < 2:
+                        continue
+                    if chunked_prefill_size is not None and chunked_prefill_size > 0:
+                        pre_len -= chunked_prefill_size
+                self._evict_swa(req, pre_len, sliding_window_size, page_size, dp_rank)
+
+    def _evict_swa(
+        self,
+        req: Req,
+        pre_len: int,
+        sliding_window_size: int,
+        page_size: int,
+        dp_rank: int = 0,
+    ):
+        """Free SWA pool slots for tokens outside the sliding window."""
+        new_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size)
+        if page_size > 1:
+            new_evicted = (new_evicted // page_size) * page_size
+        if new_evicted <= req.swa_evicted_seqlen:
+            return
+        free_slots = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, req.swa_evicted_seqlen : new_evicted
+        ]
+        self.token_to_kv_pool_allocator.free_swa(free_slots, dp_rank=dp_rank)
+        req.swa_evicted_seqlen = new_evicted
+
     def prepare_for_decode(self):
         """Prepare for decode phase (unified for all dp_size >= 1).
 
@@ -1294,6 +1384,9 @@ class ScheduleBatch:
         the old single-rank logic but with cleaner structure.
         """
         self.forward_mode = ForwardMode.DECODE
+
+        if self.is_hybrid:
+            self.maybe_evict_swa()
 
         # Process each DP rank
         for dp_rank in range(self.dp_size):
@@ -1373,6 +1466,8 @@ class ScheduleBatch:
             self.req_to_token_pool.write(
                 (info.req_pool_indices, locs), info.out_cache_loc.astype(np.int32)
             )
+            for req in reqs:
+                req.decode_batch_idx += 1
 
     def filter_batch(
         self,

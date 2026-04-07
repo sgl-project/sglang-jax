@@ -491,6 +491,7 @@ class SWAKVPool(KVCache):
         self,
         size: int,
         size_swa: int,
+        page_size: int,
         swa_attention_layer_ids: list[int],
         full_attention_layer_ids: list[int],
         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
@@ -499,11 +500,13 @@ class SWAKVPool(KVCache):
     ):
         self.size = size
         self.size_swa = size_swa
+        self.page_size = page_size
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
         self.mesh = kwargs["mesh"]
+        self.dp_size = kwargs.get("dp_size", 1)
         self.kv_partition_axis = "tensor"
-        kwargs["page_size"] = 1
+        kwargs["page_size"] = page_size
 
         # SWA layers may have different KV head count than full-attention layers
         swa_kwargs = kwargs
@@ -537,11 +540,12 @@ class SWAKVPool(KVCache):
         self.mem_usage = (k_size + v_size) / GB
 
     def tree_flatten(self):
-        children = (
-            self.swa_kv_pool,
-            self.full_kv_pool,
-            self.full_to_swa_index_mapping,
-        )
+        mapping = self.full_to_swa_index_mapping
+        if isinstance(mapping, list):
+            mapping_children = tuple(mapping)
+        else:
+            mapping_children = (mapping,)
+        children = (self.swa_kv_pool, self.full_kv_pool) + mapping_children
         aux_data = {
             "size": self.size,
             "size_swa": self.size_swa,
@@ -549,6 +553,9 @@ class SWAKVPool(KVCache):
             "full_layer_nums": self.full_layer_nums,
             "layers_mapping": self.layers_mapping,
             "mem_usage": self.mem_usage,
+            "dp_size": self.dp_size,
+            "page_size": self.page_size,
+            "mapping_count": len(mapping_children),
         }
         return (children, aux_data)
 
@@ -562,10 +569,17 @@ class SWAKVPool(KVCache):
         obj.full_layer_nums = aux_data["full_layer_nums"]
         obj.layers_mapping = aux_data["layers_mapping"]
         obj.mem_usage = aux_data["mem_usage"]
+        obj.dp_size = aux_data.get("dp_size", 1)
+        obj.page_size = aux_data.get("page_size", 1)
 
         obj.swa_kv_pool = children[0]
         obj.full_kv_pool = children[1]
-        obj.full_to_swa_index_mapping = children[2]
+
+        mc = aux_data.get("mapping_count", 1)
+        if mc == 1:
+            obj.full_to_swa_index_mapping = children[2]
+        else:
+            obj.full_to_swa_index_mapping = list(children[2 : 2 + mc])
 
         return obj
 
@@ -586,43 +600,26 @@ class SWAKVPool(KVCache):
             return self.swa_kv_pool.get_fused_kv_buffer(layer_id_pool)
         return self.full_kv_pool.get_fused_kv_buffer(layer_id_pool)
 
-    def _remap_loc_swa(self, loc: jax.Array) -> jax.Array:
-        """Remap full-attention cache indices to SWA cache indices, per DP rank.
+    def _remap_swa_loc(self, loc: jax.Array) -> jax.Array:
+        """Remap full-pool indices to SWA-pool indices, handling both DP=1 and DP>1.
 
-        full_to_swa_index_mapping is a list of dp_size numpy arrays, each
-        mapping local full-attention indices to local SWA indices for one rank.
-        We use shard_map so each DP rank applies its own mapping.
+        In DP>1, full_to_swa_index_mapping is a list of per-rank numpy arrays.
+        We stack them and do per-rank gather via take_along_axis.
         """
-        if self.full_to_swa_index_mapping is None:
+        mapping = self.full_to_swa_index_mapping
+        if mapping is None:
             return loc
-
-        dp_size = self.swa_kv_pool.dp_size
-
-        if dp_size <= 1:
-            # Single DP rank: direct 1D gather
-            mapping = jnp.asarray(self.full_to_swa_index_mapping[0], dtype=jnp.int32)
-            return mapping[loc]
-
-        # Multi-DP: stack per-rank mappings → [dp_size, size_per_rank + 1]
-        mesh = self.swa_kv_pool.mesh
-        data_axis = self.swa_kv_pool.attention_data_partition_axis
-
-        mapping_stacked = jnp.stack(
-            [jnp.asarray(m, dtype=jnp.int32) for m in self.full_to_swa_index_mapping]
-        )
-
-        @jax.shard_map(
-            mesh=mesh,
-            in_specs=(P(data_axis, None), P(data_axis)),
-            out_specs=P(data_axis),
-            check_vma=False,
-        )
-        def _remap(local_mapping, local_loc):
-            # local_mapping: [1, size_per_rank + 1] (one rank's mapping)
-            # local_loc: [tokens_per_rank]
-            return local_mapping[0, local_loc].astype(jnp.int32)
-
-        return _remap(mapping_stacked, loc)
+        if isinstance(mapping, list):
+            # DP>1: stack per-rank mappings → [dp_size, size_per_rank+1]
+            stacked = jnp.stack([jnp.asarray(m) for m in mapping])
+            tokens_per_rank = loc.shape[0] // self.dp_size
+            loc_2d = loc.reshape(self.dp_size, tokens_per_rank)
+            # Per-rank gather: each rank's loc indexes into its own mapping
+            remapped = jnp.take_along_axis(stacked, loc_2d.astype(jnp.int64), axis=1)
+            return remapped.reshape(-1).astype(jnp.int32)
+        else:
+            # DP=1: simple 1D gather
+            return jnp.asarray(mapping)[loc].astype(jnp.int32)
 
     def set_kv_buffer(
         self,
@@ -634,7 +631,7 @@ class SWAKVPool(KVCache):
     ):
         layer_id_pool, is_swa = self.layers_mapping[layer_id]
         if is_swa:
-            loc = self._remap_loc_swa(loc)
+            loc = self._remap_swa_loc(loc)
             self.swa_kv_pool.set_kv_buffer(layer_id_pool, loc, cache_k, cache_v, is_decode)
         else:
             self.full_kv_pool.set_kv_buffer(layer_id_pool, loc, cache_k, cache_v, is_decode)
@@ -669,7 +666,7 @@ class SWAKVPool(KVCache):
         _, is_swa = self.layers_mapping[layer_id]
         if not is_swa:
             return loc
-        return self._remap_loc_swa(loc)
+        return self._remap_swa_loc(loc)
 
 
 def _set_fused_kv_buffer(

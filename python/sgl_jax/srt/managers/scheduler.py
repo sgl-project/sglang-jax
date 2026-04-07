@@ -1749,6 +1749,14 @@ class Scheduler(
                         model_worker_batch, sampling_metadata=None
                     )
                 )
+                # In multi-host DP, next_token_ids may span non-addressable
+                # devices.  Replicate first so device_get can proceed.
+                if self.dp_size > 1:
+                    from jax.experimental.multihost_utils import process_allgather
+
+                    next_token_ids_device = process_allgather(
+                        next_token_ids_device, tiled=True
+                    )
                 next_token_ids = np.array(jax.device_get(next_token_ids_device))
                 self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
         else:

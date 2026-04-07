@@ -1072,7 +1072,7 @@ def _ragged_paged_attention_kernel(
         start_fetch_bq(0, 0, 0)
         # Initialize bkv_fused_x2_ref to zeros to avoid NaN issues from accessing
         # uninitialized memory. Bitcast into int32 to avoid tiling issues.
-        bkv_x2_int32_ref = bkv_fused_x2_ref.bitcast(jnp.int32).reshape((2, -1, 8, 128))
+        bkv_x2_int32_ref = bkv_fused_x2_ref.bitcast(jnp.int32).reshape((2, -1, num_kv_heads_per_kv_packing, head_dim))
         zeros = jnp.zeros(bkv_x2_int32_ref.shape[1:], jnp.int32)
 
         # To pipeline VST and DMA, we divide the initialization into two steps.
