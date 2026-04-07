@@ -97,19 +97,20 @@ def _ragged_paged_attention_kernel_split(
     k_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing, k_head_dim]
     v_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing, v_head_dim]
     custom_mask_ref,  # (flatten_total_kv_len, head_dim), int32
-    attention_sink_ref,  # [actual_num_q_heads_padded] or None
     zero_mask_ref,  # (bkv_sz, head_dim), int32
     # Output
     o_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     updated_k_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing, k_head_dim]
     updated_v_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing, v_head_dim]
+    lse_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, 128]
     # Scratch
     bkvmask_ref,  # [2, bq_sz, bkv_sz, head_dim]
     bk_x2_ref,  # [2, bkv_sz, num_kv_heads // kv_packing, kv_packing, k_head_dim]
     bv_x2_ref,  # [2, bkv_sz, num_kv_heads // kv_packing, kv_packing, v_head_dim]
     bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     bo_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
-    sems,  # [5, 2]
+    lse_vmem_ref,  # [actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, 128]
+    sems,  # [6, 2]
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim],
@@ -263,6 +264,11 @@ def _ragged_paged_attention_kernel_split(
             cp.wait()
         else:
             cp.start()
+
+    def _async_copy_blocking(src, dst, sem):
+        cp = pltpu.make_async_copy(src, dst, sem)
+        cp.start()
+        cp.wait()
 
     def _fetch_mask(seq_idx, bq_idx, bkvmask_idx, bkvmask_sem_idx, *, wait=False):
         if custom_mask_ref is None:
@@ -463,6 +469,18 @@ def _ragged_paged_attention_kernel_split(
             o_hbm_ref.at[:, pl.ds(q_len_start, sz)],
             sem,
             wait,
+        )
+
+    def _send_lse(seq_idx, bq_idx):
+        sem = sems.at[5, 0]
+        q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
+        q_end = cu_q_lens_ref[seq_idx + 1]
+        sz = jnp.minimum(bq_sz, q_end - q_len_start)
+
+        _async_copy_blocking(
+            lse_vmem_ref.at[:, pl.ds(0, sz)],
+            lse_hbm_ref.at[:, pl.ds(q_len_start, sz)],
+            sem,
         )
 
     def start_fetch_mask(seq_idx, bq_idx, bkvmask_idx, bkvmask_sem_idx):
@@ -737,20 +755,16 @@ def _ragged_paged_attention_kernel_split(
                 if q_dtype == jnp.float32
                 else (acc * pl.reciprocal(l, approx=True)).astype(q_dtype)
             )
-            if attention_sink_ref is not None:
-                l_scalar = l_ref[..., 0]
-                m_scalar = m_ref[..., 0]
-                logsumexp = jnp.log(l_scalar) + m_scalar
-
-                q_rows = l_scalar.shape[1]
-                row_ids = lax.broadcasted_iota(jnp.int32, (q_rows,), 0)
-                head_in_kv = row_ids % num_q_heads_per_kv_head
-                kv_head_ids = lax.broadcasted_iota(jnp.int32, (actual_num_kv_heads, 1), 0)
-                global_head = kv_head_ids * num_q_heads_per_kv_head + head_in_kv[None, :]
-
-                sink_logits = attention_sink_ref[global_head].astype(jnp.float32)
-                alpha = jnp.reciprocal(1.0 + jnp.exp(sink_logits - logsumexp))
-                out = (out.astype(jnp.float32) * alpha[..., None]).astype(q_dtype)
+            q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
+            logsumexp = jnp.log(l_ref[..., 0]) + m_ref[..., 0]
+            lse_vmem_ref[...] = jnp.zeros(lse_vmem_ref.shape, dtype=jnp.float32)
+            lse_vmem_ref[:, :, :, :q_packing] = logsumexp.reshape(
+                actual_num_kv_heads,
+                bq_sz,
+                num_q_heads_per_kv_head_per_packing,
+                q_packing,
+            )
+            _send_lse(seq_idx, bq_idx)
 
             bo_sem_idx = sem_ids_ref[2]
             sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
@@ -930,15 +944,6 @@ def ragged_paged_attention_split(
     num_page_indices = page_indices.shape[0]
     pages_per_seq = num_page_indices // max_num_seqs
 
-    if attention_sink is not None:
-        sink = jnp.asarray(attention_sink, dtype=jnp.float32)
-        if sink.ndim == 0:
-            sink = jnp.full((actual_num_q_heads,), sink, dtype=jnp.float32)
-        padded_heads = actual_num_kv_heads * num_q_heads_per_kv_head
-        if sink.shape[0] < padded_heads:
-            sink = jnp.pad(sink, (0, padded_heads - sink.shape[0]))
-        attention_sink = sink
-
     bkv_p = num_kv_pages_per_block
     bq_sz = num_queries_per_block
     if bq_sz is None or bkv_p is None:
@@ -960,6 +965,15 @@ def ragged_paged_attention_split(
             bkv_p = 1
     bkv_p = align_to(bkv_p, kv_packing)
     bkv_sz = bkv_p * page_size
+
+    if attention_sink is not None:
+        sink = jnp.asarray(attention_sink, dtype=jnp.float32)
+        if sink.ndim == 0:
+            sink = jnp.full((actual_num_q_heads,), sink, dtype=jnp.float32)
+        if sink.shape[0] < actual_num_q_heads:
+            sink = jnp.pad(sink, (0, actual_num_q_heads - sink.shape[0]))
+        attention_sink = sink[:actual_num_q_heads]
+
     if vmem_limit_bytes is None:
         vmem_limit_bytes = DEFAULT_VMEM_LIMIT_BYTES
 
@@ -981,7 +995,6 @@ def ragged_paged_attention_split(
         pl.BlockSpec(memory_space=pltpu.ANY),  # k_cache
         pl.BlockSpec(memory_space=pltpu.ANY),  # v_cache
         pl.BlockSpec(memory_space=pltpu.ANY) if custom_mask is not None else None,
-        pl.BlockSpec(memory_space=pltpu.ANY) if attention_sink is not None else None,
         pl.BlockSpec(memory_space=pltpu.ANY),  # zero mask
     ]
 
@@ -989,6 +1002,7 @@ def ragged_paged_attention_split(
         pl.BlockSpec(memory_space=pltpu.ANY),  # output
         pl.BlockSpec(memory_space=pltpu.ANY),  # updated k_cache
         pl.BlockSpec(memory_space=pltpu.ANY),  # updated v_cache
+        pl.BlockSpec(memory_space=pltpu.ANY),  # logsumexp
     ]
 
     # Scratch buffers
@@ -1001,6 +1015,16 @@ def ragged_paged_attention_split(
 
     bq_double_buf = pltpu.VMEM((2, actual_num_kv_heads, bq_sz, *q.shape[2:]), q.dtype)
     bo_double_buf = bq_double_buf
+    lse_minor = 128
+    lse_scratch = pltpu.VMEM(
+        (
+            actual_num_kv_heads,
+            bq_sz,
+            q.shape[2],
+            lse_minor,
+        ),
+        jnp.float32,
+    )
     l_scratch = pltpu.VMEM((actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128), jnp.float32)
     m_scratch = l_scratch
     acc_scratch = pltpu.VMEM(
@@ -1013,7 +1037,8 @@ def ragged_paged_attention_split(
         bv_double_buf,
         bq_double_buf,
         bo_double_buf,
-        pltpu.SemaphoreType.DMA((5, 2)),
+        lse_scratch,
+        pltpu.SemaphoreType.DMA((6, 2)),
         l_scratch,
         m_scratch,
         acc_scratch,
@@ -1044,6 +1069,7 @@ def ragged_paged_attention_split(
     cost_estimate = pl.CostEstimate(flops=flops, bytes_accessed=bytes_accessed, transcendentals=0)
 
     scope_name = get_kernel_scope_name(bq_sz, bkv_p, page_size) + "split"
+    lse_shape = (q.shape[0], q.shape[1] + bq_sz, q.shape[2], lse_minor)
 
     # Grid inputs after scalar_prefetches: q, k, v, k_cache, v_cache, ...
     num_prefetch = len(scalar_prefetches)
@@ -1080,6 +1106,7 @@ def ragged_paged_attention_split(
             jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
             jax.ShapeDtypeStruct(shape=k_cache_processed.shape, dtype=k_cache_processed.dtype),
             jax.ShapeDtypeStruct(shape=v_cache_processed.shape, dtype=v_cache_processed.dtype),
+            jax.ShapeDtypeStruct(shape=lse_shape, dtype=jnp.float32),
         ],
         input_output_aliases={
             num_prefetch + 0: 0,  # q -> output
@@ -1089,7 +1116,7 @@ def ragged_paged_attention_split(
         name=scope_name,
     )
 
-    output, updated_k, updated_v = kernel(
+    output, updated_k, updated_v, logsumexp = kernel(
         *scalar_prefetches,
         q,
         k,
@@ -1097,7 +1124,6 @@ def ragged_paged_attention_split(
         k_cache_processed,
         v_cache_processed,
         custom_mask,
-        attention_sink,
         jnp.zeros((bkv_sz, head_dim), dtype=jnp.int32),
     )
 
@@ -1106,6 +1132,11 @@ def ragged_paged_attention_split(
         actual_v_head_dim <= actual_head_dim
     ), f"v_head_dim ({actual_v_head_dim}) > head_dim ({actual_head_dim}) is not supported"
     output = prepare_outputs(output, actual_num_q_heads_per_kv_head, actual_v_head_dim)
+    if attention_sink is not None:
+        logsumexp = logsumexp[:, :max_num_tokens]
+        prepared_lse = _prepare_logsumexp_outputs(logsumexp, actual_num_q_heads_per_kv_head)
+        alpha = jnp.reciprocal(1.0 + jnp.exp(attention_sink[None, :] - prepared_lse))
+        output = (output.astype(jnp.float32) * alpha[..., None]).astype(output.dtype)
     updated_k = prepare_updated_kv_cache(updated_k, actual_num_kv_heads, k_cache.shape[-1])
     updated_v = prepare_updated_kv_cache(updated_v, actual_num_kv_heads, v_cache.shape[-1])
 

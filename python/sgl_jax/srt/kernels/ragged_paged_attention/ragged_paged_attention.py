@@ -1416,6 +1416,7 @@ def ragged_paged_attention(
     causal: int = 1,  # 1: True, 0: False
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
+    attention_sink: jax.Array | None = None,
     soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
     q_scale: float | None = None,
@@ -1488,6 +1489,7 @@ def ragged_paged_attention(
             causal=causal,
             sm_scale=sm_scale,
             sliding_window=sliding_window,
+            attention_sink=attention_sink,
             soft_cap=soft_cap,
             mask_value=mask_value,
             q_scale=q_scale,

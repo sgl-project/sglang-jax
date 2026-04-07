@@ -25,6 +25,15 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 logger = logging.getLogger(__name__)
 
 
+def _uses_split_kv_cache(token_to_kv_pool: KVCache | None) -> bool:
+    """Return whether the KV cache should use the split-KV attention path."""
+    if token_to_kv_pool is None:
+        return False
+    if isinstance(token_to_kv_pool, SplitMHATokenToKVPool):
+        return True
+    return bool(getattr(token_to_kv_pool, "is_split", False))
+
+
 @register_pytree_node_class
 @dataclass
 class FlashAttentionMetadata:
@@ -449,6 +458,7 @@ class FlashAttention(AttentionBackend):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         causal: int = 1,
+        attention_sink: jax.Array | None = None,
     ):
         """
         Args:
@@ -459,14 +469,10 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
-        # Split path: SplitMHATokenToKVPool directly, or SWAKVPool wrapping
-        # split sub-pools (e.g. hybrid models with different K/V head dims).
-        if isinstance(token_to_kv_pool, SplitMHATokenToKVPool) or getattr(
-            token_to_kv_pool, "is_split", False
-        ):
-            return self._call_split(q, k, v, layer, forward_batch, token_to_kv_pool, causal)
+        if _uses_split_kv_cache(token_to_kv_pool):
+            return self._call_split(q, k, v, layer, forward_batch, token_to_kv_pool, causal, attention_sink)
         else:
-            return self._call_fused(q, k, v, layer, forward_batch, token_to_kv_pool, causal)
+            return self._call_fused(q, k, v, layer, forward_batch, token_to_kv_pool, causal, attention_sink)
 
     @named_scope
     def _call_fused(
@@ -478,8 +484,14 @@ class FlashAttention(AttentionBackend):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         causal: int = 1,
+        attention_sink: jax.Array | None = None,
     ):
         """Fused KV cache path: K and V interleaved in a single buffer."""
+        if self.v_head_dim != self.head_dim:
+            raise ValueError(
+                "FlashAttention fused KV path does not support v_head_dim!=head_dim; "
+                "please use split KV cache."
+            )
         if forward_batch is not None and token_to_kv_pool is not None:
             kv_cache_fused = self._get_fused_kv_cache(
                 forward_batch, token_to_kv_pool, layer.layer_id
@@ -520,6 +532,7 @@ class FlashAttention(AttentionBackend):
             P(),  # cu_kv_lens
             P(),  # distribution
             P(),  # custom_mask
+            P(self.kv_partition_axis),  # attention_sink
         )
         out_specs = (
             P(None, self.kv_partition_axis),  # attention output
@@ -530,7 +543,8 @@ class FlashAttention(AttentionBackend):
 
         def _ragged_paged_attention_with_fused_kv(*args):
             queries, keys, values, kv_cache_fused = args[:4]
-            other_args = args[4:]
+            other_args = args[4:-1]
+            attn_sink = args[-1]
 
             # Call fused KV kernel with head interleaving
             result, updated_kv_cache_fused = ragged_paged_attention(
@@ -542,6 +556,7 @@ class FlashAttention(AttentionBackend):
                 causal=causal,
                 sm_scale=scale,
                 sliding_window=layer.sliding_window_size,
+                attention_sink=attn_sink,
                 soft_cap=layer.logit_cap,
                 xai_temperature_len=(
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
@@ -570,6 +585,7 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
             self.forward_metadata.custom_mask,
+            attention_sink,
         )
         pad_width = (self.head_dim + 127) // 128 * 128 - self.head_dim
         if pad_width > 0:
@@ -594,6 +610,7 @@ class FlashAttention(AttentionBackend):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         causal: int = 1,
+        attention_sink: jax.Array | None = None,
     ):
         """Split KV cache path: K and V have separate buffers with potentially different head_dim."""
         k_cache, v_cache = self._get_split_kv_cache(forward_batch, token_to_kv_pool, layer.layer_id)
@@ -639,6 +656,7 @@ class FlashAttention(AttentionBackend):
             P(),  # cu_kv_lens
             P(),  # distribution
             P(),  # custom_mask
+            P(kv_part),  # attention_sink
         )
         out_specs = (
             P(None, kv_part),  # attn output
@@ -648,7 +666,8 @@ class FlashAttention(AttentionBackend):
 
         def _ragged_paged_attention_with_split_kv(*args):
             queries, keys_new, values_new, k_cache_arg, v_cache_arg = args[:5]
-            other_args = args[5:]
+            other_args = args[5:-1]
+            attn_sink = args[-1]
 
             result, updated_k, updated_v = ragged_paged_attention(
                 queries,
@@ -661,6 +680,7 @@ class FlashAttention(AttentionBackend):
                 causal=causal,
                 sm_scale=scale,
                 sliding_window=layer.sliding_window_size,
+                attention_sink=attn_sink,
                 soft_cap=layer.logit_cap,
                 xai_temperature_len=(
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
@@ -691,6 +711,7 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
             self.forward_metadata.custom_mask,
+            attention_sink,
         )
         if attn_output.shape[-1] != self.v_head_dim:
             attn_output = attn_output[..., : self.v_head_dim]
