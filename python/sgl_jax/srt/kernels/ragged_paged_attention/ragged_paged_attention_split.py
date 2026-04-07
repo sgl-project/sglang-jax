@@ -22,6 +22,63 @@ DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024  # 100MB
 
 
+def _expand_attention_sink_logits(
+    attention_sink: jax.Array,
+    *,
+    actual_num_kv_heads: int,
+    num_q_heads_per_kv_head: int,
+    q_rows: int,
+) -> jax.Array:
+    """Expand per-head sink logits to the per-row layout used by the kernel."""
+    assert q_rows % num_q_heads_per_kv_head == 0
+    sink = attention_sink.reshape(actual_num_kv_heads, num_q_heads_per_kv_head)
+    return jnp.tile(sink, (1, q_rows // num_q_heads_per_kv_head))
+
+
+def _compute_attention_sink_alpha(
+    attention_sink: jax.Array,
+    *,
+    actual_num_kv_heads: int,
+    num_q_heads_per_kv_head: int,
+    q_rows: int,
+    logsumexp: jax.Array,
+) -> jax.Array:
+    """Equivalent to appending a zero-value sink token before softmax."""
+    sink_logits = _expand_attention_sink_logits(
+        attention_sink,
+        actual_num_kv_heads=actual_num_kv_heads,
+        num_q_heads_per_kv_head=num_q_heads_per_kv_head,
+        q_rows=q_rows,
+    ).astype(logsumexp.dtype)
+    return jnp.reciprocal(1.0 + jnp.exp(sink_logits - logsumexp))
+
+
+def _prepare_logsumexp_outputs(
+    lse,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, lse_minor]
+    actual_num_q_heads_per_kv_head: int,
+):
+    (
+        actual_num_kv_heads,
+        max_num_tokens,
+        num_q_heads_per_kv_head_per_q_packing,
+        lse_minor,
+    ) = lse.shape
+    # lse_minor is the buffer dimension (e.g. 128) but only the first q_packing
+    # columns contain valid logsumexp data.  Extract them before reshaping.
+    q_packing = actual_num_q_heads_per_kv_head // num_q_heads_per_kv_head_per_q_packing
+    actual_num_q_heads = actual_num_q_heads_per_kv_head * actual_num_kv_heads
+    return (
+        lse[:, :, :, :q_packing]
+        .swapaxes(0, 1)
+        .reshape(
+            max_num_tokens,
+            actual_num_kv_heads,
+            num_q_heads_per_kv_head_per_q_packing * q_packing,
+        )[:, :, :actual_num_q_heads_per_kv_head]
+        .reshape(max_num_tokens, actual_num_q_heads)
+    )
+
+
 def _ragged_paged_attention_kernel_split(
     # Prefetch
     kv_lens_ref,  # [padded_batch_size]
@@ -573,7 +630,7 @@ def _ragged_paged_attention_kernel_split(
                     if custom_mask_ref is not None:
                         start_fetch_mask(next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx)
 
-                @pl.when(bkv_idx == 0)
+                @pl.when(bkv_idx == bkv_idx_start)
                 def wait_cur_bq():
                     wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
 
@@ -671,7 +728,7 @@ def _ragged_paged_attention_kernel_split(
                     kv_head_idx=prev_kv_head_idx,
                 )
 
-            lax.fori_loop(0, num_bkv, compute_with_bkv, None, unroll=False)
+            lax.fori_loop(bkv_idx_start, num_bkv, compute_with_bkv, None, unroll=False)
 
             acc = acc_ref[...]
             l = broadcast_minor(l_ref[...], acc.shape)  # noqa

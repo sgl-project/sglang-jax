@@ -353,19 +353,34 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         size: int,
         size_swa: int,
         kvcache: SWAKVPool,
+        page_size: int = 1,
     ):
-        super().__init__(size, 1, kvcache)
+        super().__init__(size, page_size, kvcache)
         assert isinstance(kvcache, SWAKVPool)
         self._size_full = size
         self._size_swa = size_swa
-        self.full_attn_allocator = TokenToKVPoolAllocator(
-            size,
-            kvcache.full_kv_pool,
-        )
-        self.swa_attn_allocator = TokenToKVPoolAllocator(
-            size_swa,
-            kvcache.swa_kv_pool,
-        )
+        if page_size == 1:
+            self.full_attn_allocator = TokenToKVPoolAllocator(
+                size,
+                kvcache.full_kv_pool,
+            )
+            self.swa_attn_allocator = TokenToKVPoolAllocator(
+                size_swa,
+                kvcache.swa_kv_pool,
+            )
+        else:
+            self.full_attn_allocator = PagedTokenToKVPoolAllocator(
+                size=size,
+                page_size=page_size,
+                kvcache=kvcache.full_kv_pool,
+                debug_mode=False,
+            )
+            self.swa_attn_allocator = PagedTokenToKVPoolAllocator(
+                size=size_swa,
+                page_size=page_size,
+                kvcache=kvcache.swa_kv_pool,
+                debug_mode=False,
+            )
         self.full_to_swa_index_mapping = np.empty(
             size + size_swa + 1,
             dtype=np.int64,
@@ -375,7 +390,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
 
     def available_size(self):
-        raise NotImplementedError()
+        # A hybrid request needs capacity from both full-attention and SWA pools,
+        # so the effective allocatable budget is the smaller of the two.
+        return min(
+            self.full_attn_allocator.available_size(),
+            self.swa_attn_allocator.available_size(),
+        )
 
     def full_available_size(self):
         return self.full_attn_allocator.available_size()
@@ -410,6 +430,58 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
         self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
         return alloc_full_indices
+
+    def alloc_extend(
+        self,
+        prefix_lens: list[int],
+        seq_lens: list[int],
+        last_loc: list[int],
+        extend_num_tokens: int,
+    ) -> np.ndarray | None:
+        # Allocate from full attention pool
+        full_indices = self.full_attn_allocator.alloc_extend(
+            prefix_lens, seq_lens, last_loc, extend_num_tokens
+        )
+        if full_indices is None:
+            return None
+
+        # Translate last_loc from full-index space to SWA-index space
+        last_loc_np = np.array(last_loc)
+        swa_last_loc = self.full_to_swa_index_mapping[last_loc_np].astype(np.int32).tolist()
+
+        # Allocate from SWA pool with translated last_loc
+        swa_indices = self.swa_attn_allocator.alloc_extend(
+            prefix_lens, seq_lens, swa_last_loc, extend_num_tokens
+        )
+        if swa_indices is None:
+            return None
+
+        # Update mapping for newly allocated indices
+        self.full_to_swa_index_mapping[full_indices] = swa_indices
+        return full_indices
+
+    def alloc_decode(
+        self,
+        seq_lens: list[int],
+        last_loc: list[int],
+    ) -> np.ndarray | None:
+        # Allocate from full attention pool
+        full_indices = self.full_attn_allocator.alloc_decode(seq_lens, last_loc)
+        if full_indices is None:
+            return None
+
+        # Translate last_loc from full-index space to SWA-index space
+        last_loc_np = np.array(last_loc)
+        swa_last_loc = self.full_to_swa_index_mapping[last_loc_np].astype(np.int32).tolist()
+
+        # Allocate from SWA pool with translated last_loc
+        swa_indices = self.swa_attn_allocator.alloc_decode(seq_lens, swa_last_loc)
+        if swa_indices is None:
+            return None
+
+        # Update mapping for newly allocated indices
+        self.full_to_swa_index_mapping[full_indices] = swa_indices
+        return full_indices
 
     def free(self, free_index: np.array):
         if len(free_index) == 0:
