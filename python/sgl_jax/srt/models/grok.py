@@ -33,12 +33,12 @@ from sgl_jax.srt.layers.moe import EPMoE, create_moe_weights_mapping
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.utils.debug_utils import log_shardings
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
 init_fn = nnx.initializers.uniform()
-
 
 def _yarn_linear_ramp_mask(low: float, high: float, dim: int, dtype: jnp.dtype) -> jax.Array:
     """Create a linear ramp mask for YaRN scaling."""
@@ -196,6 +196,7 @@ class Grok1MLP(nnx.Module):
         self.layer_id = layer_id
         self.reduce_results = reduce_results
 
+    @log_shardings("GrokMLP")
     def __call__(self, x: jax.Array) -> jax.Array:
         gate, _ = self.gate_proj(x)
         up, _ = self.up_proj(x)
@@ -278,6 +279,7 @@ class Grok1MoE(nnx.Module):
                 quantization_config=getattr(config, "quantization_config", None),
             )
 
+    @log_shardings("GrokMoE")
     def __call__(
         self,
         hidden_states: jax.Array,
@@ -472,6 +474,7 @@ class Grok1Attention(nnx.Module):
         )
         self.attn.xai_temperature_len = getattr(config, "attn_temperature_len", -1)
 
+    @log_shardings("GrokAttention")
     def __call__(
         self,
         positions: jax.Array,
