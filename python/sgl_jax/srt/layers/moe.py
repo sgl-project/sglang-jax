@@ -504,7 +504,7 @@ class EPMoE(nnx.Module):
                 scatter_dimension = 0 if len(output.shape) == 2 else 1
                 output = jax.lax.psum_scatter(output, "tensor", scatter_dimension=scatter_dimension, tiled=True)
             else:
-                output = jax.sharding.psum(output, "tensor")
+                output = jax.lax.psum(output, "tensor")
         if self.ep_size > 1:
             output = self._combine(output)
 
