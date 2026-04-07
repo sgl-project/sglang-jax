@@ -18,7 +18,10 @@ from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import (
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE  # noqa: F401
 from sgl_jax.srt.layers.gate import GateLogit, TopK  # noqa: F401
 from sgl_jax.srt.utils.profiling_utils import named_scope
-from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
+from sgl_jax.srt.utils.quantization.quantization_utils import (
+    quantize_tensor,
+    quantize_tensor_simple,
+)
 from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 
@@ -52,10 +55,12 @@ class EPMoE(nnx.Module):
         quantization_config=None,
         physical_to_logical_map: "jax.Array | None" = None,
         v2_tile_info=_adaptive_tile_fn,
+        pre_gather_quant_dtype=None,
     ):
         self.num_experts_per_tok = num_experts_per_tok
         self.physical_to_logical_map = physical_to_logical_map
         self.v2_tile_info = v2_tile_info
+        self.pre_gather_quant_dtype = pre_gather_quant_dtype
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -515,7 +520,16 @@ class EPMoE(nnx.Module):
         # indexed_gmm: gather sorted_inputs here instead of in _permute,
         # so XLA can fuse the gather with the matmul and avoid materializing
         # the full [M*top_k, D] sorted_inputs tensor at peak memory.
-        x = inputs_2d[token_indices].astype(self.dtype)
+        pre_gather_q = getattr(self, "pre_gather_quant_dtype", None)
+        if pre_gather_q is not None:
+            # Quantize BEFORE gather to halve HBM bandwidth (int8 = 1 byte vs bf16 = 2 bytes).
+            # Dequantize after gather; net effect: gather moves half the bytes.
+            x_q, x_scale = quantize_tensor_simple(inputs_2d, pre_gather_q, dim=-1)
+            x = x_q[token_indices]
+            x_scale = x_scale[token_indices]
+            x = (x.astype(jnp.float32) * x_scale).astype(self.dtype)
+        else:
+            x = inputs_2d[token_indices].astype(self.dtype)
 
         group_sizes = group_sizes.astype(jnp.int32)
         act_q_dtype = self.activation_quantized_dtype
