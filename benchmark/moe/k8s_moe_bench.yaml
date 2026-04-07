@@ -87,11 +87,5 @@ spec:
 
               echo "=== Worker $TPU_WORKER_ID: devices=$(python3 -c 'import jax; print(jax.device_count())') ==="
 
-              # Run benchmark
-              python -m benchmark.moe.bench_moe_comparison \
-                --num-tokens 256 512 1024 2048 4096 \
-                --iters 3 \
-                --scenario balanced \
-                --compilation-cache-dir /tmp/jax_cache
-
-              echo "=== Worker $TPU_WORKER_ID done ==="
+              # Run xprof profiling (pod stays alive after for trace extraction)
+              python -m benchmark.moe.profile_moe
