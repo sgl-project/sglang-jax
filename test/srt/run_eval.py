@@ -116,6 +116,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--max-tokens", type=int, default=None)
     args = parser.parse_args()
 
     run_eval(args)

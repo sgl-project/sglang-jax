@@ -46,6 +46,8 @@ class BenchArgs:
     profile: bool = False
     profile_by_stage: bool = False
     api_type: str = "native"  # "native" or "openai"
+    skip_server_info: bool = False
+    skip_flush_cache: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -78,6 +80,8 @@ class BenchArgs:
             choices=["native", "openai"],
             help="API type to use: 'native' for /generate or 'openai' for /v1/completions",
         )
+        parser.add_argument("--skip-server-info", action="store_true")
+        parser.add_argument("--skip-flush-cache", action="store_true")
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -131,8 +135,11 @@ def run_one_case(
     profile: bool = False,
     profile_by_stage: bool = False,
     api_type: str = "native",
+    skip_server_info: bool = False,
+    skip_flush_cache: bool = False,
 ):
-    requests.post(url + "/flush_cache")
+    if not skip_flush_cache:
+        requests.post(url + "/flush_cache")
 
     # Determine whether to use text or input_ids based on API type
     return_text = api_type == "openai"
@@ -261,9 +268,12 @@ def run_one_case(
     output_throughput = batch_size * output_len / (latency - ttft)
     overall_throughput = batch_size * (input_len + output_len) / latency
 
-    server_info = requests.get(url + "/get_server_info").json()
-    acc_length = server_info["internal_states"][0].get("avg_spec_accept_length", None)
-    last_gen_throughput = server_info["internal_states"][0]["last_gen_throughput"]
+    acc_length = None
+    last_gen_throughput = 0.0
+    if not skip_server_info:
+        server_info = requests.get(url + "/get_server_info").json()
+        acc_length = server_info["internal_states"][0].get("avg_spec_accept_length", None)
+        last_gen_throughput = server_info["internal_states"][0]["last_gen_throughput"]
 
     print(f"batch size: {batch_size}")
     print(f"input_len: {input_len}")
@@ -308,11 +318,13 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     else:
         proc, base_url = launch_server_process(server_args)
 
-    server_info = requests.get(base_url + "/get_server_info").json()
-    if "tokenizer_path" in server_info:
-        tokenizer_path = server_info["tokenizer_path"]
-    elif "prefill" in server_info:
-        tokenizer_path = server_info["prefill"][0]["tokenizer_path"]
+    tokenizer_path = server_args.tokenizer_path or server_args.model_path
+    if not bench_args.skip_server_info:
+        server_info = requests.get(base_url + "/get_server_info").json()
+        if "tokenizer_path" in server_info:
+            tokenizer_path = server_info["tokenizer_path"]
+        elif "prefill" in server_info:
+            tokenizer_path = server_info["prefill"][0]["tokenizer_path"]
     tokenizer = get_tokenizer(tokenizer_path)
 
     # warmup
@@ -331,6 +343,8 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             result_filename="",
             tokenizer=tokenizer,
             api_type=bench_args.api_type,
+            skip_server_info=bench_args.skip_server_info,
+            skip_flush_cache=bench_args.skip_flush_cache,
         )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
 
@@ -355,6 +369,8 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                     result_filename=bench_args.result_filename,
                     tokenizer=tokenizer,
                     api_type=bench_args.api_type,
+                    skip_server_info=bench_args.skip_server_info,
+                    skip_flush_cache=bench_args.skip_flush_cache,
                 )
             )
 

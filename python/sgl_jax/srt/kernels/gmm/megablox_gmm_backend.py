@@ -54,6 +54,8 @@ def gmm(
     if interpret is None:
         interpret = not is_tpu_runtime()
 
+    # TODO: gmm_v2 doesn't support subchannel (block) quantization because its
+    # rhs_scale index map hardcodes k_dim=0. Block quant falls back to v1.
     use_gmm_v2 = not interpret and is_supported_by_gmm_v2(rhs_scale)
 
     lhs_scale = None
