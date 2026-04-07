@@ -195,6 +195,7 @@ class Grok1MLP(nnx.Module):
         self.act_fn = GeluAndMul(approximate="tanh")
         self.layer_id = layer_id
         self.reduce_results = reduce_results
+        self.mesh = mesh
 
     def __call__(self, x: jax.Array) -> jax.Array:
         # Unshard activations if sequence parallel enabled
