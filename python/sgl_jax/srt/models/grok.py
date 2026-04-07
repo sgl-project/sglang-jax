@@ -197,6 +197,11 @@ class Grok1MLP(nnx.Module):
         self.reduce_results = reduce_results
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        # Unshard activations if sequence parallel enabled
+        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+            spec = jax.sharding.PartitionSpec(*([None] * len(x.shape)))
+            x = jax.sharding.reshard(x, spec)
+
         gate, _ = self.gate_proj(x)
         up, _ = self.up_proj(x)
         x, _ = self.act_fn(gate, up)
@@ -283,6 +288,11 @@ class Grok1MoE(nnx.Module):
         hidden_states: jax.Array,
         dispatch_info: ExpertLocationMetadata | None = None,
     ) -> tuple[jax.Array, jax.Array | None]:
+        # Unshard activations if sequence parallel enabled
+        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+            spec = jax.sharding.PartitionSpec(*([None] * len(hidden_states.shape)))
+            hidden_states = jax.sharding.reshard(hidden_states, spec)
+
         # Router computation with soft capping
         router_logits, _ = self.gate(hidden_states)
 
@@ -484,10 +494,9 @@ class Grok1Attention(nnx.Module):
             return hidden_states, hidden_states
 
         # Unshard activations if sequence parallel enabled
-        if True:
-            with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
-                spec = jax.sharding.PartitionSpec(*([None] * len(hidden_states.shape)))
-                hidden_states = jax.sharding.reshard(hidden_states, spec)
+        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+            spec = jax.sharding.PartitionSpec(*([None] * len(hidden_states.shape)))
+            hidden_states = jax.sharding.reshard(hidden_states, spec)
 
         # Project Q, K, V separately
         q, _ = self.q_proj(hidden_states)

@@ -394,7 +394,10 @@ class EPMoE(nnx.Module):
             w1_scale = self.wi_1_scale.value if self.wi_1_scale is not None else None
             wo_scale = self.wo_scale.value if self.wo_scale is not None else None
 
-            out_specs = P("tensor", None) if len(hidden_states_reshard.shape) == 2 else P(None, "tensor", None)
+            if len(hidden_states_reshard.shape) == 2 and hidden_states_reshard.shape[0] >= 64 or len(hidden_states_reshard.shape) == 3 and hidden_states_reshard.shape[1] >= 64:
+                out_specs = P("tensor", None) if len(hidden_states_reshard.shape) == 2 else P(None, "tensor", None)
+            else:
+                out_specs = P(None)
             result = shard_map(
                 self._forward,
                 mesh=self.moe_mesh,
@@ -496,9 +499,12 @@ class EPMoE(nnx.Module):
         # All-reduce after unpermute: communication volume is (T, hidden_size)
         # instead of (T * top_k, hidden_size), reducing by a factor of top_k.
         if self.tp_size > 1:
-            # scatter on sequence/token dimension
-            scatter_dimension = 0 if len(output.shape) == 2 else 1
-            output = jax.lax.psum_scatter(output, "tensor", scatter_dimension=scatter_dimension, tiled=True)
+            if len(output.shape) == 2 and output.shape[0] >= 64 or len(output.shape) == 3 and output.shape[1] >= 64:
+                # scatter on sequence/token dimension
+                scatter_dimension = 0 if len(output.shape) == 2 else 1
+                output = jax.lax.psum_scatter(output, "tensor", scatter_dimension=scatter_dimension, tiled=True)
+            else:
+                output = jax.sharding.psum(output, "tensor")
         if self.ep_size > 1:
             output = self._combine(output)
 
