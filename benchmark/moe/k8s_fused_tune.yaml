@@ -104,6 +104,7 @@ spec:
                 --hidden-size 4096 --intermediate-size 2048 \
                 --num-tokens 1024 16384 \
                 --imbalance-mode balanced \
-                --max-configs 20 \
+                --max-configs 25 \
                 --iters 5 --warmup-iters 2 \
+                --tpu-vmem-budget-mb 96 \
                 2>&1 | tee "$PROFILE_DIR/fused_tune_worker${TPU_WORKER_ID}.log"
