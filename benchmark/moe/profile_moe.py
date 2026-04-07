@@ -28,14 +28,15 @@ INTERMEDIATE_SIZE = 2048
 PROFILE_DIR = os.environ.get("PROFILE_DIR", "/gcs/moe_profiles")
 
 # Which configs to profile: (backend, ep_size, tp_size, num_tokens)
+# num_tokens: 16384 = prefill (16k input), 1024 = decode (1k output)
 PROFILE_CASES = [
-    ("epmoe", 1, 16, 512),
-    ("epmoe", 8, 2, 512),
-    ("epmoe", 16, 1, 512),
-    ("fused", 16, 1, 512),
-    ("epmoe", 1, 16, 2048),
-    ("epmoe", 16, 1, 2048),
-    ("fused", 16, 1, 2048),
+    ("epmoe", 1, 16, 1024),
+    ("epmoe", 8, 2, 1024),
+    ("epmoe", 16, 1, 1024),
+    ("fused", 16, 1, 1024),
+    ("epmoe", 1, 16, 16384),
+    ("epmoe", 16, 1, 16384),
+    ("fused", 16, 1, 16384),
 ]
 
 
