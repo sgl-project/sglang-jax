@@ -2,6 +2,7 @@
 
 import os
 import resource
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -93,7 +94,9 @@ class ChatCompletionSampler(SamplerBase):
         temperature: float = 0.0,
         max_tokens: int = 2048,
     ):
-        self.client = OpenAI(base_url=base_url, http_client=LargerHttpxClient())
+        self.base_url = base_url
+        self._thread_local = threading.local()
+        self.client = self._make_client()
 
         if model is None:
             model = self.client.models.list().data[0].id
@@ -103,6 +106,16 @@ class ChatCompletionSampler(SamplerBase):
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.image_format = "url"
+
+    def _make_client(self) -> OpenAI:
+        return OpenAI(base_url=self.base_url, http_client=LargerHttpxClient())
+
+    def _get_client(self) -> OpenAI:
+        client = getattr(self._thread_local, "client", None)
+        if client is None:
+            client = self._make_client()
+            self._thread_local.client = client
+        return client
 
     def _handle_image(
         self,
@@ -128,10 +141,11 @@ class ChatCompletionSampler(SamplerBase):
     def __call__(self, message_list: MessageList) -> str:
         if self.system_message:
             message_list = [self._pack_message("system", self.system_message)] + message_list
+        client = self._get_client()
         trial = 0
         while True:
             try:
-                response = self.client.chat.completions.create(
+                response = client.chat.completions.create(
                     model=self.model,
                     messages=message_list,
                     temperature=self.temperature,

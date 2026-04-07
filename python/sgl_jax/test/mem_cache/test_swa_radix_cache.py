@@ -318,6 +318,26 @@ class TestSWARadixCache(unittest.TestCase):
             np.asarray(match_plain.device_indices), np.asarray(match_radix.device_indices)
         )
 
+    def test_match_prefix_keeps_full_lru_consistent_on_deep_tree(self):
+        """Matching on a split deep tree should not desync full LRU ordering."""
+        self.cache.sliding_window_size = 5
+
+        seq_a = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        seq_b = [1, 2, 3, 4, 5, 6, 7, 8, 11, 12]
+        seq_c = [1, 2, 3, 4, 5, 6, 13, 14, 15, 16]
+
+        self.cache.insert(seq_a, value=self._alloc_indices(len(seq_a)), prev_prefix_len=0)
+        self.cache.insert(seq_b, value=self._alloc_indices(len(seq_b)), prev_prefix_len=0)
+        self.cache.insert(seq_c, value=self._alloc_indices(len(seq_c)), prev_prefix_len=0)
+
+        # Touch the tree through the public path that previously made
+        # last_access_time disagree with the actual MRU ordering.
+        match = self.cache.match_prefix(seq_b)
+        self.assertEqual(len(match.device_indices), len(seq_b))
+
+        # This used to fail with "Incorrect LRU list" for the full LRU.
+        self.cache.sanity_check()
+
 
 if __name__ == "__main__":
     unittest.main()
