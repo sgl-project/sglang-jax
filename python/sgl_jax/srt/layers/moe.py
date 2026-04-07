@@ -432,6 +432,10 @@ class EPMoE(nnx.Module):
                 None,
             )
 
+            # Need to reshard from expert mesh to original mesh
+            with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+                output = jax.sharding.reshard(output, out_specs)  # sharded on original mesh
+
             return result
 
     def _forward(
