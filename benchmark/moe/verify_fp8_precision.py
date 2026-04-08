@@ -166,11 +166,17 @@ def run_test(
 
 
 def main():
-    print(f"JAX version: {jax.__version__}")
-    print(f"Backend: {jax.default_backend()}")
-    print(f"Devices: {jax.device_count()}")
-    print(f"Local devices: {jax.local_device_count()}")
-    print()
+    print(f"JAX version: {jax.__version__}", flush=True)
+    try:
+        print(f"Backend: {jax.default_backend()}", flush=True)
+    except Exception as e:
+        print(f"Backend detection failed: {e}", flush=True)
+    try:
+        print(f"Devices: {jax.device_count()}", flush=True)
+        print(f"Local devices: {jax.local_device_count()}", flush=True)
+    except Exception as e:
+        print(f"Device enumeration failed: {e}", flush=True)
+    print(flush=True)
 
     mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 
@@ -277,8 +283,12 @@ def main():
 if __name__ == "__main__":
     import traceback
 
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
     try:
         main()
     except Exception:
         traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
         sys.exit(1)
