@@ -212,28 +212,25 @@ def _estimate_vmem_bytes(
         + routing_temporaries
     )
 
-    # Estimate XLA intermediaries from statically-unrolled scale-group loops.
-    # Each scale group iteration materializes dot results in VMEM that XLA
-    # cannot fully reuse across unrolled iterations.
+    # Estimate compute intermediaries from scale-group fori_loops.
+    # With lax.fori_loop (XLA While), only ONE iteration's intermediaries
+    # are live at a time (not n_sg copies as with Python-loop unrolling).
     compute_intermediaries = 0
     if subc_quant_wsz is not None:
         btc = cfg.btc
         bfc = cfg.bfc
         bd1c = cfg.bd1c
         bd2c = cfg.bd2c
-        bd1c_per_tp = bd1c // t_packing
-        n_sg_ffn1 = bd1c_per_tp // subc_quant_wsz
-        n_sg_ffn2 = bfc // subc_quant_wsz
         n_bd1c_tiles = (bd1 + bd1c - 1) // bd1c
         n_bfc_tiles = (bf + bfc - 1) // bfc
-        # FFN1: each sg produces 2 dot results (w1,w3) of shape (btc, bfc) f32
+        # FFN1: each sg iteration produces 2 dot results (w1,w3) of shape (btc, bfc) f32
         ffn1_per_sg = 2 * btc * bfc * 4
-        ffn1_total = n_bd1c_tiles * n_bfc_tiles * n_sg_ffn1 * t_packing * ffn1_per_sg
-        # FFN2: each sg produces 1 dot result of shape (bt, bd2c_per_tp) f32
+        ffn1_total = n_bd1c_tiles * n_bfc_tiles * 1 * t_packing * ffn1_per_sg
+        # FFN2: each sg iteration produces 1 dot result of shape (btc, bd2c_per_tp) f32
         bd2c_per_tp = bd2c // t_packing
         n_bd2c_tiles = (bd2 + bd2c - 1) // bd2c
-        ffn2_per_sg = bt * bd2c_per_tp * 4
-        ffn2_total = n_bd2c_tiles * n_sg_ffn2 * t_packing * ffn2_per_sg
+        ffn2_per_sg = btc * bd2c_per_tp * 4
+        ffn2_total = n_bd2c_tiles * 1 * t_packing * ffn2_per_sg
         compute_intermediaries = ffn1_total + ffn2_total
     total_bytes += compute_intermediaries
 
@@ -256,7 +253,6 @@ def _estimate_vmem_bytes(
         se_tokens = 4 * bt * bd1 * token_bytes
         # b_se_acc_vmem: F32(2, bt, hidden_size) - accumulator for SE to avoid bf16 precision loss
         se_acc = 2 * bt * hidden * 4
-        total_bytes += se_w1 + se_w3 + se_w2 + se_tokens + se_acc
 
         # Shared expert scale scratch buffers (F32).
         # b_se_w1_scale_x2_vmem: (2, t_packing, bd1 // t_packing // subc_quant_wsz, 1, bse)
@@ -267,6 +263,16 @@ def _estimate_vmem_bytes(
             se_w3_scale = intermediate_size * 4
             se_w2_scale = hidden_size * 4
             total_bytes += se_w1_scale + se_w3_scale + se_w2_scale
+
+    total_bytes += se_w1 + se_w3 + se_w2 + se_tokens + se_acc
+    total_bytes += se_w1_scale + se_w3_scale + se_w2_scale
+
+    # XLA's Memory Space Assignment (MSA) allocates significantly more VMEM
+    # than the sum of explicit scratch shapes due to buffer alignment, While
+    # loop state copies, and packing fragmentation.  Empirically measured at
+    # ~1.5x on TPU v6e with the fused MoE megakernel (67 MB scratch → 104 MB
+    # XLA actual).
+    total_bytes = int(total_bytes * 1.5)
 
     if verbose:
 
@@ -312,8 +318,9 @@ def _estimate_vmem_bytes(
         print(f"      routing_temporaries:    {_mb(routing_temporaries)} MB")
         if compute_intermediaries > 0:
             print(
-                f"      compute_intermediaries: {_mb(compute_intermediaries)} MB  (unrolled scale-group dot products)"
+                f"      compute_intermediaries: {_mb(compute_intermediaries)} MB  (fori_loop single-iteration dot products)"
             )
+        print("      xla_msa_overhead (1.5x): included in total")
         if use_shared_expert:
             bse = cfg.bse
             print(
