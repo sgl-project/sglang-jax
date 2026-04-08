@@ -451,8 +451,8 @@ def select_block_configs(
             use_shared_expert=use_shared_expert,
             subc_quant_wsz=subc_quant_wsz,
         )
-        # Reserve 5% headroom for XLA stack temporaries not captured by estimate
-        effective_budget = int(tpu_vmem_budget_bytes * 0.95)
+        # Reserve 10% headroom for XLA stack temporaries not captured by estimate
+        effective_budget = int(tpu_vmem_budget_bytes * 0.90)
         if est > effective_budget:
             return (
                 False,
