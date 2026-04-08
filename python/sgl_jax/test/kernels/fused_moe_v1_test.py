@@ -579,6 +579,92 @@ class MoEKernelTest(jtu.JaxTestCase):
     @parameterized.product(
         w_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2, jnp.float4_e2m1fn],
     )
+    def test_sub_channel_quantization_group128(self, w_dtype):
+        """Test sub-channel quantization with group_size=128 (block-wise quant).
+
+        With bd1c=512 and subc_quant_wsz=128, n_sg = 512/2/128 = 2.
+        With bfc=256 and subc_quant_wsz=128, n_sg2 = 256/128 = 2.
+        """
+        if w_dtype in (
+            jnp.float8_e4m3fn,
+            jnp.float8_e5m2,
+            jnp.float4_e2m1fn,
+        ) and not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("Expect TPUv7+")
+        dtype = jnp.bfloat16
+        top_k = 8
+        num_experts = 128
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=1234,
+            renormalize_topk_logits=False,
+            w_dtype=w_dtype,
+            subc_quant_wsz=128,
+            bt=32,
+            bf=1024,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=256,
+            bd1c=256,
+            bd2c=256,
+            bse=512,
+        )
+
+    @parameterized.product(
+        w_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2, jnp.float4_e2m1fn],
+    )
+    def test_sub_channel_quantization_group128_large_tile(self, w_dtype):
+        """Test group_size=128 with large tiles to exercise fori_loop with more iterations.
+
+        With bd1c=1024 and subc_quant_wsz=128, n_sg = 1024/2/128 = 4.
+        With bfc=1024 and subc_quant_wsz=128, n_sg2 = 1024/128 = 8.
+        """
+        if w_dtype in (
+            jnp.float8_e4m3fn,
+            jnp.float8_e5m2,
+            jnp.float4_e2m1fn,
+        ) and not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("Expect TPUv7+")
+        dtype = jnp.bfloat16
+        top_k = 8
+        num_experts = 128
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=1234,
+            renormalize_topk_logits=False,
+            w_dtype=w_dtype,
+            subc_quant_wsz=128,
+            bt=32,
+            bf=1024,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=1024,
+            bd1c=1024,
+            bd2c=1024,
+            bse=512,
+        )
+
+    @parameterized.product(
+        w_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2, jnp.float4_e2m1fn],
+    )
     def test_shared_expert_quantized(self, w_dtype):
         if w_dtype in (
             jnp.float8_e4m3fn,

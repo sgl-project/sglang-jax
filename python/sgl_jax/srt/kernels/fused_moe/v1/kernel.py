@@ -269,8 +269,8 @@ def validate_fused_moe_block_config(
     if subc_quant_wsz is not None:
         if subc_quant_wsz <= 0:
             raise ValueError(f"Expected {subc_quant_wsz=} to be non-negative.")
-        if subc_quant_wsz % 256 != 0:
-            raise ValueError(f"Expected {subc_quant_wsz=} to be aligned to 256.")
+        if subc_quant_wsz % 128 != 0:
+            raise ValueError(f"Expected {subc_quant_wsz=} to be aligned to 128.")
         if hidden_size % subc_quant_wsz != 0:
             raise ValueError(f"Expected {hidden_size=} to be aligned to {subc_quant_wsz=}.")
         if intermediate_size % subc_quant_wsz != 0:
@@ -608,7 +608,7 @@ def _fused_ep_moe_kernel(
     bd2c_per_t_packing = bd2c // t_packing
 
     if subc_quant_wsz is not None:
-        assert subc_quant_wsz % 256 == 0
+        assert subc_quant_wsz % 128 == 0
         assert bd1c_per_t_packing % subc_quant_wsz == 0
         assert bfc % subc_quant_wsz == 0
         assert bd1 % subc_quant_wsz == 0
