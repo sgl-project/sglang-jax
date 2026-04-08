@@ -253,7 +253,7 @@ class MultimodalDataItem:
         if isinstance(modality, str):
             modality = Modality[modality]
         ret = MultimodalDataItem(modality=modality, **kwargs)
-        ret.initialize_dependent_fields()
+        ret.validate()
         return ret
 
     def merge(self, other):

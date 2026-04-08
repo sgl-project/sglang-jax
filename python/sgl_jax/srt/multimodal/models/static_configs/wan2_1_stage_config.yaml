@@ -18,7 +18,7 @@ stage_args:
      num_tpus: 1
      max_batch_size: 1
    scheduler: diffusion
-   scheduler_params: {}
+   scheduler_params: {"Scheduler": "FlowUniPCMultistepScheduler"}
    precompile_params: {"input_embedding": False, "deepstack_visual_embedding": False}
    model_class: WanTransformer3DModel
    final_output: false

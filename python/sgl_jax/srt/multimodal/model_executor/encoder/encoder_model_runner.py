@@ -420,10 +420,13 @@ class EncoderModelRunner(BaseModelRunner):
             if isinstance(value, int) and value > 0:
                 return value
 
-        raise ValueError(
-            f"Unable to infer max_length for encoder {spec.model_class}. "
-            "Please ensure the tokenizer or model config exposes a sequence length."
+        # Models using relative position encodings (e.g. UMT5) may not expose
+        # a sequence length. Fall back to 512 (matches diffusers default).
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            f"Could not infer max_length for {spec.model_class}, defaulting to 512."
         )
+        return 512
 
     @staticmethod
     def _normalize_to_list(value: Any | Sequence[Any] | None) -> list[Any]:
