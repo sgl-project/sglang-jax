@@ -2,15 +2,17 @@
 
 ## Summary
 
-This document describes the design and testing approach for `MLAAttention` in sglang-jax, targeting DeepSeek-V2 style models (Ling-2.5-1T, etc.).
+This document describes the design and testing plan for the `MLAAttention` layer in sglang-jax, targeting models that use the MLA architecture (DeepSeek-V2/V3, etc.).
 
-MLA can theoretically reduce per-token cache from `heads x (qk_head_dim + v_head_dim)` to `kv_lora_rank + qk_rope_head_dim` via compressed-state KV cache, but **the current implementation uses non-absorbed mode**, which decompresses to standard Q/K/V in `MLAAttention.__call__` and then reuses the existing `RadixAttention` + `SplitMHATokenToKVPool`. Therefore, the current goal is to correctly integrate the MLA data flow with minimal system changes, not to immediately gain the KV cache compression benefits of absorbed mode.
+The current implementation uses **non-absorbed (purely native) mode**: `MLAAttention` fully decompresses the latent state into standard Q/K/V tensors during forward, then reuses the existing `RadixAttention` + `SplitMHATokenToKVPool` infrastructure without relying on any MLA-specific attention kernel or compressed KV cache. The goal is to correctly integrate the MLA data flow with minimal system changes.
+
+`MLAAttention` is a reusable layer module located at `srt/layers/mla.py`, alongside other layers (`linear.py`, `layernorm.py`, etc.). It does not introduce a new attention backend — attention computation is dispatched through `RadixAttention` to the existing native backend (`srt/layers/attention/native_backend.py`). A future absorbed mode implementation would require adding a dedicated backend under `srt/layers/attention/` along with `MLATokenToKVPool`.
 
 ## Background and Goals
 
 ### Goals
 
-- Provide a reusable MLA layer that correctly implements the Q/K/V projection pipeline from [BailingMoeV2_5MultiLatentAttention](https://huggingface.co/inclusionAI/Ling-2.5-1T/blob/main/modeling_bailing_moe_v2_5.py#L580).
+- Provide a reusable MLA layer that correctly implements the MLA Q/K/V projection pipeline.
 - Integrate with existing attention infrastructure (`RadixAttention`, `SplitMHATokenToKVPool`) without modifying these components.
 - Support K_dim != V_dim (192 vs 128) through `SplitMHATokenToKVPool` separate buffers.
 
@@ -81,28 +83,17 @@ The current implementation completes all decompression in `MLAAttention.__call__
 | `kv_b_proj` | (kv_lora_rank, num_heads x (qk_nope_head_dim + v_head_dim)) | kernel: (None, "tensor") |
 | `o_proj` | (num_heads x v_head_dim, hidden_size) | kernel: ("tensor", None) |
 
-**Config (Ling-2.5-1T):**
+**Constructor Parameters:** `hidden_size`, `num_heads`, `q_lora_rank`, `kv_lora_rank`, `qk_nope_head_dim`, `qk_rope_head_dim`, `v_head_dim`, `rope_theta`, `rope_interleave`, etc., provided by model configuration.
 
-| Parameter | Value |
-|-----------|-------|
-| q_lora_rank | 1536 |
-| kv_lora_rank | 512 |
-| qk_nope_head_dim | 128 |
-| qk_rope_head_dim | 64 |
-| v_head_dim | 128 |
-| num_attention_heads | 64 |
-| rope_theta | 6000000.0 |
-| rope_style | interleaved |
+**Output Shapes:** Q = [tokens, num_heads, qk_head_dim], K = [tokens, num_heads, qk_head_dim], V = [tokens, num_heads, v_head_dim], where qk_head_dim = qk_nope_head_dim + qk_rope_head_dim.
 
-**Output shapes:** Q = [tokens, 64, 192], K = [tokens, 64, 192], V = [tokens, 64, 128]
-
-**Attention scaling:** `scaling = qk_head_dim^(-0.5) = 192^(-0.5)`, consistent with HuggingFace BailingMoeV2_5MultiLatentAttention. The scaling is applied to the full Q.K^T after concatenation, not to the nope or rope portions individually.
+**Attention Scaling:** `scaling = qk_head_dim^(-0.5)`. The scaling is applied to the full Q.K^T after concatenation, not to the nope or rope portions individually.
 
 ## Testing
 
 ### Unit Tests
 
-Tests validate the Q/K/V projection pipeline by stepping through `MLAAttention` submodules individually and comparing against an fp64 numpy reference implementation. The reference follows the HuggingFace [BailingMoeV2_5MultiLatentAttention](https://huggingface.co/inclusionAI/Ling-2.5-1T/blob/main/modeling_bailing_moe_v2_5.py#L580) computation flow, adapted for the sglang-jax weight layout (`weight=(in_features, out_features)`, forward = `x @ weight`).
+Tests validate the Q/K/V projection pipeline by stepping through `MLAAttention` submodules individually and comparing against an fp64 numpy reference implementation. The reference follows the standard MLA computation flow, adapted for the sglang-jax weight layout (`weight=(in_features, out_features)`, forward = `x @ weight`).
 
 **Test cases:**
 
@@ -114,18 +105,11 @@ Tests validate the Q/K/V projection pipeline by stepping through `MLAAttention` 
 | `test_full_qkv` | Full Q/K/V projection with RoPE applied and tensors assembled |
 | `test_k_rope_broadcast` | `k_rope` broadcast from 1 head to all heads (all heads must be identical) |
 
-Tests use Ling-2.5-1T production config dimensions:
-- hidden_size=8192
-- num_heads=64
-- q_lora_rank=1536
-- kv_lora_rank=512
-- qk_nope_head_dim=128
-- qk_rope_head_dim=64
-- v_head_dim=128
+Tests use production-scale dimensions sourced from the target model configuration.
 
 #### Correctness Metric
 
-For production-scale dimensions (Ling-2.5-1T config) with bf16 matmuls, element-wise `allclose` is highly sensitive to tolerance settings, leading to two problems:
+For production-scale dimensions with bf16 matmuls, element-wise `allclose` is highly sensitive to tolerance settings, leading to two problems:
 
 - Tolerances too strict cause persistent false positives
 - Relaxed tolerances make the assertion itself lose discriminating power
@@ -133,36 +117,6 @@ For production-scale dimensions (Ling-2.5-1T config) with bf16 matmuls, element-
 Based on empirical calibration results, we use cosine similarity (threshold >= 0.99) as the primary correctness metric, measuring directional agreement between outputs and the fp64 reference.
 
 > FlashInfer uses the same approach in their absorbed-MLA decode kernel tests ([flashinfer-ai/flashinfer#551](https://github.com/flashinfer-ai/flashinfer/pull/551#discussion_r1826453290)). Maintainer confirmed: `"cosine similarity is okay in this case."`
-
-#### Experimental Data
-
-The following results are based on Ling-2.5-1T production config, collected over 100 random samples on 4x TPU v6e (TP=4, `ici_parallelism=[1, -1]`).
-
-**allclose calibration** (only elements with `|expected| > 1.0`):
-
-| Path | max abs error | mean abs error | max rel error |
-|------|--------------|---------------|--------------|
-| Q path | 0.863 | 0.646 | 0.446 |
-| KV k_nope | 0.461 | 0.371 | 0.223 |
-| KV v | 0.449 | 0.365 | 0.222 |
-| Full QKV (Q) | 1.389 | 0.878 | 0.446 |
-| Full QKV (K) | 2.919 | 1.015 | 0.434 |
-| Full QKV (V) | 0.449 | 0.365 | 0.222 |
-
-> Taking Full QKV (K) as an example, max abs error reaches 2.919 (mean is also 1.015), max rel error is 0.434. With a 3x safety factor, `allclose` would require `atol ~ 8.76, rtol ~ 1.30` to pass.
-
-**Cosine similarity:**
-
-| Path | min cosine | mean cosine |
-|------|-----------|-------------|
-| Q path | 0.99999406 | 0.99999450 |
-| KV k_nope | 0.99999329 | 0.99999452 |
-| KV v | 0.99999322 | 0.99999453 |
-| Full QKV (Q) | 0.99999378 | 0.99999422 |
-| Full QKV (K) | 0.99999419 | 0.99999624 |
-| Full QKV (V) | 0.99999322 | 0.99999453 |
-
-> `cosine >= 0.99` means the output vector deviates < 8 degrees from the reference direction. All components have min cosine >= 0.99999, well above the 0.99 threshold with ample margin.
 
 #### Reference Implementation
 
@@ -188,7 +142,7 @@ Tests use a numpy fp64 reference implementation as the ground-truth oracle, cons
 3. 2 new tokens' hidden states enter `MLAAttention.__call__`, completing Q/K/V projection and RoPE
 4. Hand off to `RadixAttention`: write new tokens' K/V into the pool, perform attention over all historical K/V
 
-**Assertions:** Output shape is `[2, 8192]`, no NaN/Inf.
+**Assertions:** Output shape is `[2, hidden_size]`, no NaN/Inf.
 
 > The test uses random weights and random prefix KV without verifying numerical correctness — the focus is validating that MLA's output shapes and dtypes are correctly accepted by the downstream attention + KV cache infrastructure. Numerical correctness is covered by unit tests.
 
@@ -198,21 +152,21 @@ This document does not define model-level e2e accuracy baselines. Model-level en
 
 ## Alternatives
 
-**Absorbed mode**: Cache the compressed latent state (576 dims) instead of decompressed K/V (20480 dims per token). Requires a custom attention kernel that decompresses on-the-fly during attention computation. ~35x memory reduction but significantly more implementation complexity. Deferred to a future iteration.
+**Absorbed mode**: Cache the compressed latent state instead of decompressed K/V. Requires a custom attention kernel that decompresses on-the-fly during attention computation. ~35x memory reduction but significantly more implementation complexity. Deferred to a future iteration.
 
 ## Appendix: Absorbed Mode Roadmap
 
 > Not in scope for this iteration. This appendix documents future optimization directions for reference.
 
-`MLATokenToKVPool` is already defined in `memory_pool.py` with compressed buffer layout `[size, 1, 576]`, but is not wired into the attention pipeline. The full chain for absorbed mode requires changes across multiple components:
+`MLATokenToKVPool` is already defined in `memory_pool.py` with compressed buffer layout `[size, 1, kv_lora_rank + qk_rope_head_dim]`, but is not wired into the attention pipeline. The full chain for absorbed mode requires changes across multiple components:
 
 ```mermaid
 graph TD
     subgraph "MLAAttention.__call__"
         hidden[hidden] --> Q_path["Q path (same as non-absorbed)"]
-        Q_path --> Q["Q [tokens, 64, 192]"]
+        Q_path --> Q["Q [tokens, num_heads, qk_head_dim]"]
         hidden --> kv_a_proj["kv_a_proj"]
-        kv_a_proj --> compressed["compressed [tokens, 1, 576]<br/>(no kv_b_proj decompression)"]
+        kv_a_proj --> compressed["compressed [tokens, 1, latent_dim]<br/>(skip kv_b_proj decompression)"]
     end
 
     subgraph "RadixAttention"
