@@ -66,6 +66,9 @@ def xla_quantized_matmul_local(
     out = out.astype(out_dtype)
     # Sum partial results across devices (single all-reduce)
     if reduce_axis is not None:
-        out = lax.psum(out, reduce_axis)
+        if out.shape[0] >= 64:
+            out = lax.psum_scatter(out, reduce_axis, scatter_dimension=0, tiled=True)
+        else:
+            out = lax.psum(out, reduce_axis)
 
     return out

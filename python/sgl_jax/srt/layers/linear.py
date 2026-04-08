@@ -69,7 +69,10 @@ class LinearBase(nnx.Module):
     def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass of the linear layer."""
         bias = self.bias if not self.skip_bias_add else None
-        output_pspec = P(*([None] * (x.ndim - 1)), self.kernel_axes[-1])
+        if x.shape[0] >= 64:
+            output_pspec = P(*(self.kernel_axes))
+        else:
+            output_pspec = P(*([None] * (x.ndim - 1)), self.kernel_axes[-1])
         output_sharding = NamedSharding(self.mesh, output_pspec)
         output = lax.dot_general(
             x,
@@ -233,7 +236,10 @@ class QuantizedLinear(nnx.Module):
             P(output_axis, input_axis),  # w_q
             P(output_axis),  # w_scale
         )
-        out_specs = P(None, output_axis)
+        if x_2d.shape[0] >= 64:
+            out_specs = P(input_axis, output_axis)
+        else:
+            out_specs = P(None, output_axis)
 
         output = shard_map(
             partial(

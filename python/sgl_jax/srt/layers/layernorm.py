@@ -11,6 +11,26 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
+import functools
+
+def log_shardings(name):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            for i, a in enumerate(args):
+                if hasattr(a, 'aval') and hasattr(a.aval, 'sharding'):
+                    print(f"{name} input[{i}]: {a.aval.shape} {a.aval.sharding}")
+            result = fn(*args, **kwargs)
+            if hasattr(result, 'aval') and hasattr(result.aval, 'sharding'):
+                print(f"{name} output: {result.aval.shape} {result.aval.sharding}")
+            elif isinstance(result, tuple):
+                for i, r in enumerate(result):
+                    if hasattr(r, 'aval') and hasattr(r.aval, 'sharding'):
+                        print(f"{name} output[{i}]: {r.aval.shape} {r.aval.sharding}")
+            return result
+        return wrapper
+    return decorator
+
 
 def _canonicalize_axes(rank: int, axes: Axes) -> tuple[int, ...]:
     """Returns a tuple of deduplicated, sorted, and positive axes."""
@@ -216,7 +236,7 @@ class GemmaRMSNorm(nnx.Module):
         x = x.astype(orig_dtype)
         return x if residual is None else (x, residual)
 
-
+@log_shardings("norm")
 def rmsnorm_forward(x, residual, weight, epsilon) -> jax.Array | tuple[jax.Array, jax.Array]:
     orig_dtype = x.dtype
     x_f32 = jnp.asarray(x, jnp.float32)
@@ -233,6 +253,7 @@ def rmsnorm_forward(x, residual, weight, epsilon) -> jax.Array | tuple[jax.Array
 
 
 @named_scope
+@log_shardings("dual_norm")
 def dual_rmsnorm_forward(
     x: jax.Array,
     residual: jax.Array,

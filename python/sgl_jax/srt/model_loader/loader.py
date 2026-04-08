@@ -260,6 +260,11 @@ class JAXModelLoader(DefaultModelLoader):
         else:
             logger.info("No quantization config found. Skipping quantization.")
         model.load_weights(model_config)
+
+        # Print all parameter shardings
+        for name, param in model.named_parameters():
+            print(f"{name}: shape={param.value.shape} sharding={param.value.sharding}")
+
         return model
 
 

@@ -93,8 +93,8 @@ class SchedulerProfilerMixin:
     def stop_profile(self) -> ProfileReqOutput | None:
         if not self.profile_in_progress:
             return ProfileReqOutput(
-                success=False,
-                message="Profiling is not in progress. Call /start_profile first.",
+                success=True,
+                message="Profiling is not in progress, nothing to stop.",
             )
 
         if not Path(self.profiler_output_dir).exists():

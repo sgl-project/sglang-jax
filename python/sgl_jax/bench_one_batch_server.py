@@ -162,7 +162,9 @@ def run_one_case(
 
     profile_link = None
     if profile:
-        profile_link: str = run_profile(url, 3, ["CPU", "GPU"], None, None, profile_by_stage)
+        # num_steps should not exceed the actual forward passes (1 prefill + output_len decode steps)
+        num_profile_steps = 1 + output_len
+        profile_link: str = run_profile(url, num_profile_steps, ["CPU", "GPU"], None, None, profile_by_stage)
 
     tic = time.perf_counter()
 
@@ -257,6 +259,12 @@ def run_one_case(
                     ttft = time.perf_counter() - tic
 
     latency = time.perf_counter() - tic
+
+    # Explicitly stop profiling to ensure jax.profiler.stop_trace() is called
+    # and the trace is flushed to disk, even if num_steps wasn't reached.
+    if profile:
+        requests.post(url + "/stop_profile")
+
     input_throughput = batch_size * input_len / ttft
     output_throughput = batch_size * output_len / (latency - ttft)
     overall_throughput = batch_size * (input_len + output_len) / latency
