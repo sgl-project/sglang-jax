@@ -75,8 +75,16 @@ class FusedMoEBlockConfig:
         bd1c = self.bd1c
         bfc = self.bfc
         if subc_quant_wsz is not None:
-            bd1c = subc_quant_wsz * t_packing
-            bfc = subc_quant_wsz
+            # bd1c/bfc must be multiples of the quantization group size, but no
+            # longer forced to exactly one group.  Allowing larger compute tiles
+            # drastically reduces HLO size (and thus XLA compile time) because
+            # the Python for-loops over bd1c/bfc are statically unrolled.
+            min_bd1c = subc_quant_wsz * t_packing
+            bd1c = max(bd1c, min_bd1c)
+            bd1c -= bd1c % min_bd1c  # align down to multiple
+            min_bfc = subc_quant_wsz
+            bfc = max(bfc, min_bfc)
+            bfc -= bfc % min_bfc
 
         bse = self.bf if self.bse is None else self.bse
 
@@ -267,12 +275,14 @@ def validate_fused_moe_block_config(
             raise ValueError(f"Expected {hidden_size=} to be aligned to {subc_quant_wsz=}.")
         if intermediate_size % subc_quant_wsz != 0:
             raise ValueError(f"Expected {intermediate_size=} to be aligned to {subc_quant_wsz=}.")
-        if bd1c != subc_quant_wsz * t_packing:
+        if bd1c % (subc_quant_wsz * t_packing) != 0:
             raise ValueError(
-                f"Expected {bd1c=} to be {subc_quant_wsz * t_packing=} when quantized."
+                f"Expected {bd1c=} to be a multiple of {subc_quant_wsz * t_packing=} when quantized."
             )
-        if bfc != subc_quant_wsz:
-            raise ValueError(f"Expected {bfc=} to be {subc_quant_wsz=} when quantized.")
+        if bfc % subc_quant_wsz != 0:
+            raise ValueError(
+                f"Expected {bfc=} to be a multiple of {subc_quant_wsz=} when quantized."
+            )
 
 
 def ref_moe(
@@ -599,8 +609,8 @@ def _fused_ep_moe_kernel(
 
     if subc_quant_wsz is not None:
         assert subc_quant_wsz % 256 == 0
-        assert bd1c_per_t_packing == subc_quant_wsz
-        assert bfc == subc_quant_wsz
+        assert bd1c_per_t_packing % subc_quant_wsz == 0
+        assert bfc % subc_quant_wsz == 0
         assert bd1 % subc_quant_wsz == 0
         assert bf % subc_quant_wsz == 0
         assert bd1_per_t_packing % subc_quant_wsz == 0
@@ -1444,7 +1454,7 @@ def _fused_ep_moe_kernel(
                 1,
                 bf,
             )
-            assert bd1c_per_t_packing == subc_quant_wsz
+            assert bd1c_per_t_packing % subc_quant_wsz == 0
         if w3_scale_vmem is not None:
             assert w3_scale_vmem.shape == (
                 t_packing,
@@ -1452,7 +1462,11 @@ def _fused_ep_moe_kernel(
                 1,
                 bf,
             )
-            assert bd1c_per_t_packing == subc_quant_wsz
+            assert bd1c_per_t_packing % subc_quant_wsz == 0
+
+        # Number of scale groups per bd1c compute tile (1 when not quantized).
+        n_sg = bd1c_per_t_packing // subc_quant_wsz if subc_quant_wsz is not None else 1
+        sg_k = subc_quant_wsz if subc_quant_wsz is not None else bd1c_per_t_packing
 
         dyn_sz_i32 = dyn_sz.astype(jnp.int32)
         num_loops = lax.select(dyn_sz_i32 > 0, (dyn_sz_i32 + (btc - 1)) // btc, 0)
@@ -1460,42 +1474,100 @@ def _fused_ep_moe_kernel(
         def compute_tile(btc_id, is_init_mode):
             for bd1c_id in range(cdiv(bd1, bd1c)):
                 for p_id in range(t_packing):
-                    t = t_vmem[
+                    t_tile = t_vmem[
                         pl.ds(btc_id * btc, btc),
                         p_id,
                         pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing),
                     ]
                     for bfc_id in range(cdiv(bf, bfc)):
-                        w_slices = (
-                            p_id,
-                            pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing),
-                            pl.ds(bfc_id * bfc, bfc),
-                        )
-                        w1 = w1_vmem[*w_slices]
-                        acc1 = jnp.dot(t, w1, preferred_element_type=jnp.float32)
+                        if w1_scale_vmem is not None and n_sg > 1:
+                            # Quantized path with multiple scale groups per tile:
+                            # use lax.fori_loop to avoid static unrolling of HLO.
+                            base_sg = bd1c_id * n_sg
 
-                        if w1_scale_vmem is not None:
-                            w1_scale_slices = (
+                            def _sg_body(sg_id, carry):
+                                a1, a3 = carry
+                                sg_offset = sg_id * sg_k
+                                t_g = t_tile[:, pl.ds(sg_offset, sg_k)]
+                                w_g_slices = (
+                                    p_id,
+                                    pl.ds(
+                                        bd1c_id * bd1c_per_t_packing + sg_offset,
+                                        sg_k,
+                                    ),
+                                    pl.ds(bfc_id * bfc, bfc),
+                                )
+                                d1 = jnp.dot(
+                                    t_g,
+                                    w1_vmem[*w_g_slices],
+                                    preferred_element_type=jnp.float32,
+                                )
+                                global_sg = base_sg + sg_id
+                                s1 = w1_scale_vmem[
+                                    p_id,
+                                    pl.ds(global_sg, 1),
+                                    pl.ds(0, 1),
+                                    pl.ds(bfc_id * bfc, bfc),
+                                ]
+                                d1 *= jnp.broadcast_to(s1, d1.shape)
+
+                                d3 = jnp.dot(
+                                    t_g,
+                                    w3_vmem[*w_g_slices],
+                                    preferred_element_type=jnp.float32,
+                                )
+                                if w3_scale_vmem is not None:
+                                    s3 = w3_scale_vmem[
+                                        p_id,
+                                        pl.ds(global_sg, 1),
+                                        pl.ds(0, 1),
+                                        pl.ds(bfc_id * bfc, bfc),
+                                    ]
+                                    d3 *= jnp.broadcast_to(s3, d3.shape)
+                                return (a1 + d1, a3 + d3)
+
+                            init_carry = (
+                                jnp.zeros((btc, bfc), dtype=jnp.float32),
+                                jnp.zeros((btc, bfc), dtype=jnp.float32),
+                            )
+                            acc1, acc3 = lax.fori_loop(0, n_sg, _sg_body, init_carry)
+                        else:
+                            # Non-quantized or single scale group: direct dot.
+                            w_slices = (
                                 p_id,
-                                bd1c_id,
-                                pl.ds(0, 1),
+                                pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing),
                                 pl.ds(bfc_id * bfc, bfc),
                             )
-                            w1_scale = jnp.broadcast_to(w1_scale_vmem[*w1_scale_slices], acc1.shape)
-                            acc1 *= w1_scale
-
-                        w3 = w3_vmem[*w_slices]
-                        acc3 = jnp.dot(t, w3, preferred_element_type=jnp.float32)
-
-                        if w3_scale_vmem is not None:
-                            w3_scale_slices = (
-                                p_id,
-                                bd1c_id,
-                                pl.ds(0, 1),
-                                pl.ds(bfc_id * bfc, bfc),
+                            acc1 = jnp.dot(
+                                t_tile,
+                                w1_vmem[*w_slices],
+                                preferred_element_type=jnp.float32,
                             )
-                            w3_scale = jnp.broadcast_to(w3_scale_vmem[*w3_scale_slices], acc3.shape)
-                            acc3 *= w3_scale
+                            acc3 = jnp.dot(
+                                t_tile,
+                                w3_vmem[*w_slices],
+                                preferred_element_type=jnp.float32,
+                            )
+                            if w1_scale_vmem is not None:
+                                w1_scale_slices = (
+                                    p_id,
+                                    bd1c_id,
+                                    pl.ds(0, 1),
+                                    pl.ds(bfc_id * bfc, bfc),
+                                )
+                                acc1 *= jnp.broadcast_to(
+                                    w1_scale_vmem[*w1_scale_slices], acc1.shape
+                                )
+                            if w3_scale_vmem is not None:
+                                w3_scale_slices = (
+                                    p_id,
+                                    bd1c_id,
+                                    pl.ds(0, 1),
+                                    pl.ds(bfc_id * bfc, bfc),
+                                )
+                                acc3 *= jnp.broadcast_to(
+                                    w3_scale_vmem[*w3_scale_slices], acc3.shape
+                                )
 
                         acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
 
@@ -1559,7 +1631,11 @@ def _fused_ep_moe_kernel(
                 1,
                 bd2_per_t_packing,
             )
-            assert bfc == subc_quant_wsz
+            assert bfc % subc_quant_wsz == 0
+
+        # Number of scale groups per bfc compute tile.
+        n_sg2 = bfc // subc_quant_wsz if subc_quant_wsz is not None else 1
+        sg_k2 = subc_quant_wsz if subc_quant_wsz is not None else bfc
 
         dyn_sz_i32 = dyn_sz.astype(jnp.int32)
         num_loops = lax.select(dyn_sz_i32 > 0, (dyn_sz_i32 + (btc - 1)) // btc, 0)
@@ -1583,23 +1659,61 @@ def _fused_ep_moe_kernel(
                         acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
                         acc1 = acc1_vmem[*acc_slices]
                         acc3 = acc3_vmem[*acc_slices]
+                        # Compute activation once for the full bfc chunk.
                         act = activation_fn(acc1, acc3, act_fn)
-                        w2 = w2_vmem[
-                            p_id,
-                            pl.ds(bfc_id * bfc, bfc),
-                            pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing),
-                        ]
-                        acc = jnp.dot(act, w2, preferred_element_type=jnp.float32)
-                        if w2_scale_vmem is not None:
-                            w2_scale_slices = (
-                                p_id,
-                                bfc_id,
-                                pl.ds(0, 1),
-                                pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing),
+
+                        if w2_scale_vmem is not None and n_sg2 > 1:
+                            # Quantized path with multiple scale groups:
+                            # loop over groups via lax.fori_loop.
+                            base_sg = bfc_id * n_sg2
+
+                            def _sg2_body(sg_id, r):
+                                sg_offset = sg_id * sg_k2
+                                act_g = act[:, pl.ds(sg_offset, sg_k2)]
+                                w2_g = w2_vmem[
+                                    p_id,
+                                    pl.ds(bfc_id * bfc + sg_offset, sg_k2),
+                                    pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing),
+                                ]
+                                d = jnp.dot(
+                                    act_g,
+                                    w2_g,
+                                    preferred_element_type=jnp.float32,
+                                )
+                                global_sg = base_sg + sg_id
+                                s = w2_scale_vmem[
+                                    p_id,
+                                    pl.ds(global_sg, 1),
+                                    pl.ds(0, 1),
+                                    pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing),
+                                ]
+                                d *= jnp.broadcast_to(s, d.shape)
+                                return r + d
+
+                            res += lax.fori_loop(
+                                0,
+                                n_sg2,
+                                _sg2_body,
+                                jnp.zeros((btc, bd2c_per_t_packing), dtype=jnp.float32),
                             )
-                            w2_scale = jnp.broadcast_to(w2_scale_vmem[*w2_scale_slices], acc.shape)
-                            acc *= w2_scale
-                        res += acc
+                        else:
+                            # Non-quantized or single scale group.
+                            w2 = w2_vmem[
+                                p_id,
+                                pl.ds(bfc_id * bfc, bfc),
+                                pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing),
+                            ]
+                            acc = jnp.dot(act, w2, preferred_element_type=jnp.float32)
+                            if w2_scale_vmem is not None:
+                                w2_scale_slices = (
+                                    p_id,
+                                    bfc_id,
+                                    pl.ds(0, 1),
+                                    pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing),
+                                )
+                                acc *= jnp.broadcast_to(w2_scale_vmem[*w2_scale_slices], acc.shape)
+                            res += acc
+
                     res_slice = res_vmem.at[
                         pl.ds(btc_id * btc, btc),
                         p_id,
