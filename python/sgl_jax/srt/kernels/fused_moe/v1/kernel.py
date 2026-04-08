@@ -1474,11 +1474,6 @@ def _fused_ep_moe_kernel(
         def compute_tile(btc_id, is_init_mode):
             for bd1c_id in range(cdiv(bd1, bd1c)):
                 for p_id in range(t_packing):
-                    t_tile = t_vmem[
-                        pl.ds(btc_id * btc, btc),
-                        p_id,
-                        pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing),
-                    ]
                     for bfc_id in range(cdiv(bf, bfc)):
                         if w1_scale_vmem is not None and n_sg > 1:
                             # Quantized path with multiple scale groups per tile.
@@ -1490,7 +1485,15 @@ def _fused_ep_moe_kernel(
                             acc3 = jnp.zeros((btc, bfc), dtype=jnp.float32)
                             for sg_id in range(n_sg):
                                 sg_offset = sg_id * sg_k
-                                t_g = t_tile[:, pl.ds(sg_offset, sg_k)]
+                                # Index t_vmem directly — can't sub-slice a Ref result
+                                t_g = t_vmem[
+                                    pl.ds(btc_id * btc, btc),
+                                    p_id,
+                                    pl.ds(
+                                        bd1c_id * bd1c_per_t_packing + sg_offset,
+                                        sg_k,
+                                    ),
+                                ]
                                 w_g_slices = (
                                     p_id,
                                     pl.ds(
@@ -1530,6 +1533,11 @@ def _fused_ep_moe_kernel(
                                 acc3 += d3
                         else:
                             # Non-quantized or single scale group: direct dot.
+                            t_tile = t_vmem[
+                                pl.ds(btc_id * btc, btc),
+                                p_id,
+                                pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing),
+                            ]
                             w_slices = (
                                 p_id,
                                 pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing),
@@ -1665,7 +1673,7 @@ def _fused_ep_moe_kernel(
                             sg_acc = jnp.zeros((btc, bd2c_per_t_packing), dtype=jnp.float32)
                             for sg_id in range(n_sg2):
                                 sg_offset = sg_id * sg_k2
-                                act_g = act[:, pl.ds(sg_offset, sg_k2)]
+                                act_g = act[:, sg_offset : sg_offset + sg_k2]
                                 w2_g = w2_vmem[
                                     p_id,
                                     pl.ds(bfc_id * bfc + sg_offset, sg_k2),
