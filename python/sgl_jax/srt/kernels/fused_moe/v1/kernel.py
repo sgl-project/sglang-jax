@@ -1474,18 +1474,17 @@ def _fused_ep_moe_kernel(
         def compute_tile(btc_id, is_init_mode):
             for bd1c_id in range(cdiv(bd1, bd1c)):
                 for p_id in range(t_packing):
-                    for bfc_id in range(cdiv(bf, bfc)):
-                        if w1_scale_vmem is not None and n_sg > 1:
-                            # Quantized path with multiple scale groups per tile.
-                            # Python for-loop is statically unrolled, but with large
-                            # bd1c/bfc the outer loops collapse to 1 iteration each,
-                            # reducing total unrolls from ~128 to ~16.
+                    if w1_scale_vmem is not None and n_sg > 1:
+                        # Quantized path with multiple scale groups per tile.
+                        # Python for-loop is statically unrolled, but with large
+                        # bd1c/bfc the outer loops collapse to 1 iteration each,
+                        # reducing total unrolls from ~128 to ~16.
+                        for bfc_id in range(cdiv(bf, bfc)):
                             base_sg = bd1c_id * n_sg
                             acc1 = jnp.zeros((btc, bfc), dtype=jnp.float32)
                             acc3 = jnp.zeros((btc, bfc), dtype=jnp.float32)
                             for sg_id in range(n_sg):
                                 sg_offset = sg_id * sg_k
-                                # Index t_vmem directly — can't sub-slice a Ref result
                                 t_g = t_vmem[
                                     pl.ds(btc_id * btc, btc),
                                     p_id,
@@ -1531,28 +1530,46 @@ def _fused_ep_moe_kernel(
                                     ]
                                     d3 *= jnp.broadcast_to(s3, d3.shape)
                                 acc3 += d3
-                        else:
-                            # Non-quantized or single scale group: direct dot.
-                            t_tile = t_vmem[
-                                pl.ds(btc_id * btc, btc),
-                                p_id,
-                                pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing),
-                            ]
+
+                            acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
+
+                            if is_init_mode and p_id == 0 and bd1c_id == 0:
+                                if b1_vmem is not None:
+                                    b1_scale_slices = (
+                                        pl.ds(0, 1),
+                                        pl.ds(bfc_id * bfc, bfc),
+                                    )
+                                    b1 = jnp.broadcast_to(b1_vmem[*b1_scale_slices], acc1.shape)
+                                    acc1 += b1
+                                if b3_vmem is not None:
+                                    b3_scale_slices = (
+                                        pl.ds(0, 1),
+                                        pl.ds(bfc_id * bfc, bfc),
+                                    )
+                                    b3 = jnp.broadcast_to(b3_vmem[*b3_scale_slices], acc1.shape)
+                                    acc3 += b3
+
+                                acc1_vmem[*acc_slices] = acc1
+                                acc3_vmem[*acc_slices] = acc3
+                            else:
+                                acc1_vmem[*acc_slices] += acc1
+                                acc3_vmem[*acc_slices] += acc3
+                    else:
+                        # Non-quantized or single scale group: original structure.
+                        t = t_vmem[
+                            pl.ds(btc_id * btc, btc),
+                            p_id,
+                            pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing),
+                        ]
+                        for bfc_id in range(cdiv(bf, bfc)):
                             w_slices = (
                                 p_id,
                                 pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing),
                                 pl.ds(bfc_id * bfc, bfc),
                             )
-                            acc1 = jnp.dot(
-                                t_tile,
-                                w1_vmem[*w_slices],
-                                preferred_element_type=jnp.float32,
-                            )
-                            acc3 = jnp.dot(
-                                t_tile,
-                                w3_vmem[*w_slices],
-                                preferred_element_type=jnp.float32,
-                            )
+                            w1 = w1_vmem[*w_slices]
+                            acc1 = jnp.dot(t, w1, preferred_element_type=jnp.float32)
+
                             if w1_scale_vmem is not None:
                                 w1_scale_slices = (
                                     p_id,
@@ -1560,9 +1577,14 @@ def _fused_ep_moe_kernel(
                                     pl.ds(0, 1),
                                     pl.ds(bfc_id * bfc, bfc),
                                 )
-                                acc1 *= jnp.broadcast_to(
+                                w1_scale = jnp.broadcast_to(
                                     w1_scale_vmem[*w1_scale_slices], acc1.shape
                                 )
+                                acc1 *= w1_scale
+
+                            w3 = w3_vmem[*w_slices]
+                            acc3 = jnp.dot(t, w3, preferred_element_type=jnp.float32)
+
                             if w3_scale_vmem is not None:
                                 w3_scale_slices = (
                                     p_id,
@@ -1570,33 +1592,34 @@ def _fused_ep_moe_kernel(
                                     pl.ds(0, 1),
                                     pl.ds(bfc_id * bfc, bfc),
                                 )
-                                acc3 *= jnp.broadcast_to(
+                                w3_scale = jnp.broadcast_to(
                                     w3_scale_vmem[*w3_scale_slices], acc3.shape
                                 )
+                                acc3 *= w3_scale
 
-                        acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
+                            acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
 
-                        if is_init_mode and p_id == 0 and bd1c_id == 0:
-                            if b1_vmem is not None:
-                                b1_scale_slices = (
-                                    pl.ds(0, 1),
-                                    pl.ds(bfc_id * bfc, bfc),
-                                )
-                                b1 = jnp.broadcast_to(b1_vmem[*b1_scale_slices], acc1.shape)
-                                acc1 += b1
-                            if b3_vmem is not None:
-                                b3_scale_slices = (
-                                    pl.ds(0, 1),
-                                    pl.ds(bfc_id * bfc, bfc),
-                                )
-                                b3 = jnp.broadcast_to(b3_vmem[*b3_scale_slices], acc1.shape)
-                                acc3 += b3
+                            if is_init_mode and p_id == 0 and bd1c_id == 0:
+                                if b1_vmem is not None:
+                                    b1_scale_slices = (
+                                        pl.ds(0, 1),
+                                        pl.ds(bfc_id * bfc, bfc),
+                                    )
+                                    b1 = jnp.broadcast_to(b1_vmem[*b1_scale_slices], acc1.shape)
+                                    acc1 += b1
+                                if b3_vmem is not None:
+                                    b3_scale_slices = (
+                                        pl.ds(0, 1),
+                                        pl.ds(bfc_id * bfc, bfc),
+                                    )
+                                    b3 = jnp.broadcast_to(b3_vmem[*b3_scale_slices], acc1.shape)
+                                    acc3 += b3
 
-                            acc1_vmem[*acc_slices] = acc1
-                            acc3_vmem[*acc_slices] = acc3
-                        else:
-                            acc1_vmem[*acc_slices] += acc1
-                            acc3_vmem[*acc_slices] += acc3
+                                acc1_vmem[*acc_slices] = acc1
+                                acc3_vmem[*acc_slices] = acc3
+                            else:
+                                acc1_vmem[*acc_slices] += acc1
+                                acc3_vmem[*acc_slices] += acc3
 
         if should_init:
 
@@ -1660,14 +1683,13 @@ def _fused_ep_moe_kernel(
                         b2 = jnp.broadcast_to(b2_vmem[*b2_scale_slices], res.shape)
                         res += b2
 
-                    for bfc_id in range(cdiv(bf, bfc)):
-                        acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
-                        acc1 = acc1_vmem[*acc_slices]
-                        acc3 = acc3_vmem[*acc_slices]
-                        # Compute activation once for the full bfc chunk.
-                        act = activation_fn(acc1, acc3, act_fn)
+                    if w2_scale_vmem is not None and n_sg2 > 1:
+                        for bfc_id in range(cdiv(bf, bfc)):
+                            acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
+                            acc1 = acc1_vmem[*acc_slices]
+                            acc3 = acc3_vmem[*acc_slices]
+                            act = activation_fn(acc1, acc3, act_fn)
 
-                        if w2_scale_vmem is not None and n_sg2 > 1:
                             # Quantized path with multiple scale groups.
                             base_sg = bfc_id * n_sg2
                             sg_acc = jnp.zeros((btc, bd2c_per_t_packing), dtype=jnp.float32)
@@ -1700,8 +1722,13 @@ def _fused_ep_moe_kernel(
                                 d *= jnp.broadcast_to(s, d.shape)
                                 sg_acc += d
                             res += sg_acc
-                        else:
-                            # Non-quantized or single scale group.
+                    else:
+                        # Non-quantized or single scale group: original structure.
+                        for bfc_id in range(cdiv(bf, bfc)):
+                            acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
+                            acc1 = acc1_vmem[*acc_slices]
+                            acc3 = acc3_vmem[*acc_slices]
+                            act = activation_fn(acc1, acc3, act_fn)
                             w2 = w2_vmem[
                                 p_id,
                                 pl.ds(bfc_id * bfc, bfc),
@@ -1715,7 +1742,10 @@ def _fused_ep_moe_kernel(
                                     pl.ds(0, 1),
                                     pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing),
                                 )
-                                acc *= jnp.broadcast_to(w2_scale_vmem[*w2_scale_slices], acc.shape)
+                                w2_scale = jnp.broadcast_to(
+                                    w2_scale_vmem[*w2_scale_slices], acc.shape
+                                )
+                                acc *= w2_scale
                             res += acc
 
                     res_slice = res_vmem.at[
