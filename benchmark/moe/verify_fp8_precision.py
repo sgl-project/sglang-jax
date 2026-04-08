@@ -59,13 +59,20 @@ def gen_moe_inputs(dtype, top_k, num_experts, hidden_size, intermediate_size, nu
     return a, w1, w2, w3, gating_output
 
 
-def run_test(mesh, num_tokens, block_config, atol=2e-1, rtol=2e-1):
+def run_test(
+    mesh,
+    num_tokens,
+    block_config,
+    *,
+    num_experts=128,
+    hidden_size=2048,
+    intermediate_size=1024,
+    top_k=8,
+    atol=2e-1,
+    rtol=2e-1,
+):
     dtype = jnp.bfloat16
     w_dtype = jnp.float8_e4m3fn
-    top_k = 8
-    num_experts = 256
-    hidden_size = 4096
-    intermediate_size = 2048
     subc_quant_wsz = 256
 
     a, w1, w2, w3, gating_output = gen_moe_inputs(
@@ -167,67 +174,73 @@ def main():
 
     mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 
-    # Test configs: (num_tokens, block_config_name, FusedMoEBlockConfig)
-    # These are the tuned FP8 configs with large bd1c/bfc
+    # 128 experts, H=2048, I=1024: small enough to fit in memory (~1.5 GB weights)
+    # but large enough to exercise scale-group loop:
+    #   bd1c=2048, subc_quant_wsz=256, t_packing=2 → n_sg = 2048/2/256 = 4
+    #   bfc=1024, subc_quant_wsz=256 → n_sg2 = 1024/256 = 4
+    model_kwargs = dict(num_experts=128, hidden_size=2048, intermediate_size=1024, top_k=8)
+
     test_cases = [
+        # Large bd1c/bfc: exercises the scale-group Python for-loop (n_sg=4, n_sg2=4)
         (
             64,
-            "tuned-large-tile",
+            "large-tile(n_sg=4)",
             FusedMoEBlockConfig(
-                bt=4, bf=2048, bd1=4096, bd2=4096, btc=64, bfc=2048, bd1c=4096, bd2c=4096, bse=2048
+                bt=4, bf=1024, bd1=2048, bd2=2048, btc=4, bfc=1024, bd1c=2048, bd2c=2048, bse=1024
             ),
         ),
         (
             256,
-            "tuned-large-tile",
+            "large-tile(n_sg=4)",
             FusedMoEBlockConfig(
                 bt=16,
-                bf=2048,
-                bd1=4096,
-                bd2=4096,
-                btc=256,
-                bfc=2048,
-                bd1c=4096,
-                bd2c=4096,
-                bse=2048,
+                bf=1024,
+                bd1=2048,
+                bd2=2048,
+                btc=16,
+                bfc=1024,
+                bd1c=2048,
+                bd2c=2048,
+                bse=1024,
             ),
         ),
         (
             512,
-            "tuned-large-tile",
+            "large-tile(n_sg=4)",
             FusedMoEBlockConfig(
                 bt=32,
-                bf=2048,
-                bd1=4096,
-                bd2=4096,
-                btc=512,
-                bfc=2048,
-                bd1c=4096,
-                bd2c=4096,
-                bse=2048,
+                bf=1024,
+                bd1=2048,
+                bd2=2048,
+                btc=32,
+                bfc=1024,
+                bd1c=2048,
+                bd2c=2048,
+                bse=1024,
             ),
         ),
-        (
-            1024,
-            "tuned-large-tile",
-            FusedMoEBlockConfig(
-                bt=64,
-                bf=2048,
-                bd1=4096,
-                bd2=4096,
-                btc=512,
-                bfc=2048,
-                bd1c=4096,
-                bd2c=4096,
-                bse=2048,
-            ),
-        ),
-        # Also test with old small-tile config for comparison
+        # Medium bd1c: n_sg=2 (intermediate scale group count)
         (
             256,
-            "old-small-tile",
+            "med-tile(n_sg=2)",
             FusedMoEBlockConfig(
-                bt=16, bf=2048, bd1=4096, bd2=4096, btc=256, bfc=256, bd1c=512, bd2c=512, bse=2048
+                bt=16,
+                bf=1024,
+                bd1=2048,
+                bd2=2048,
+                btc=16,
+                bfc=512,
+                bd1c=1024,
+                bd2c=1024,
+                bse=1024,
+            ),
+        ),
+        # Old small bd1c=512, bfc=256: n_sg=1 (no scale group loop, baseline)
+        (
+            256,
+            "small-tile(n_sg=1)",
+            FusedMoEBlockConfig(
+                bt=16, bf=1024, bd1=2048, bd2=2048, btc=16, bfc=256, bd1c=512, bd2c=512, bse=1024
             ),
         ),
     ]
@@ -240,7 +253,9 @@ def main():
 
     for num_tokens, cfg_name, block_config in test_cases:
         try:
-            ok, max_abs, mean_abs, max_rel, mean_rel = run_test(mesh, num_tokens, block_config)
+            ok, max_abs, mean_abs, max_rel, mean_rel = run_test(
+                mesh, num_tokens, block_config, **model_kwargs
+            )
             status = "OK" if ok else "FAIL"
             if not ok:
                 all_pass = False
