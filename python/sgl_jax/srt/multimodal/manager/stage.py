@@ -236,7 +236,7 @@ def get_scheduler_class(name: str):
         raise ValueError(f"Unknown scheduler name: {name}")
 
 
-def get_model_class(name: str):
+def get_model_class(name: str) -> type | list[type]:
     model_classes = {
         "AutoencoderKLWan": AutoencoderKLWan,
         "UMT5EncoderModel": UMT5EncoderModel,

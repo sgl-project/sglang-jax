@@ -228,11 +228,7 @@ class FlowMatchEulerDiscreteScheduler:
             schedule_timesteps = self.timesteps
         timestep_arr = np.asarray(timestep)
         schedule_arr = np.asarray(schedule_timesteps)
-        indices = np.argwhere(schedule_arr == timestep_arr).flatten()
-        if len(indices) == 0:
-            return int(np.argmin(np.abs(schedule_arr - timestep_arr)))
-        pos = 1 if len(indices) > 1 else 0
-        return int(indices[pos])
+        return int(np.argmin(np.abs(schedule_arr - timestep_arr)))
 
     def _init_step_index(self, timestep: float | jax.Array) -> None:
         if self.begin_index is None:
@@ -275,16 +271,12 @@ class FlowMatchEulerDiscreteScheduler:
         model_output: jax.Array,
         timestep: float | jax.Array,
         sample: jax.Array,
-        s_churn: float = 0.0,
-        s_tmin: float = 0.0,
-        s_tmax: float = float("inf"),
-        s_noise: float = 1.0,
+
         noise: jax.Array | None = None,
         rng: jax.Array | None = None,
         per_token_timesteps: jax.Array | None = None,
         return_dict: bool = True,
     ) -> FlowMatchEulerDiscreteSchedulerOutput | tuple[jax.Array]:
-        del s_churn, s_tmin, s_tmax, s_noise
         timestep = jnp.asarray(timestep)
         if jnp.issubdtype(timestep.dtype, jnp.integer):
             timestep = timestep.astype(self.timesteps.dtype)

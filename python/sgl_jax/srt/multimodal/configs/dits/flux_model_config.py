@@ -32,6 +32,7 @@ class FluxModelConfig(MultiModalModelConfigs):
 
     def __post_init__(self) -> None:
         self.out_channels = self.out_channels or self.in_channels
+        # Note: hidden_size is always derived; any user-specified value is overridden.
         self.hidden_size = self.num_attention_heads * self.attention_head_dim
 
     def get_total_num_kv_heads(self) -> int:

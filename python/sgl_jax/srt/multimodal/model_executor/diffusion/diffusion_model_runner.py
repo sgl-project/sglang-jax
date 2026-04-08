@@ -155,13 +155,6 @@ class DiffusionModelRunner(BaseModelRunner):
         img_ids = img_ids.at[..., 2].add(jnp.arange(int(w))[None, :])
         return img_ids.reshape(int(h) * int(w), 3)
 
-    @staticmethod
-    def _calculate_mu(image_seq_len, base_seq_len=256, max_seq_len=4096, base_shift=0.5, max_shift=1.15):
-        """Port of GPU calculate_shift() from flux.py pipeline."""
-        m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-        b = base_shift - m * base_seq_len
-        return image_seq_len * m + b
-
     # ── Forward dispatch ──
 
     def forward(
@@ -204,14 +197,15 @@ class DiffusionModelRunner(BaseModelRunner):
         height_latent = 2 * (batch.height // (vae_scale_factor * 2))
         width_latent = 2 * (batch.width // (vae_scale_factor * 2))
         num_channels = in_channels // 4  # 16
+        seed = 42 if batch.seed is None else batch.seed
         latents = jax.random.normal(
-            jax.random.PRNGKey(batch.seed or 42),
+            jax.random.PRNGKey(seed),
             (1, num_channels, height_latent, width_latent),
             dtype=jnp.float32,
         )
 
         # 3. Pack latents: [B, C//4, H', W'] -> [B, H'/2*W'/2, C]
-        latents = self._pack_latents_flux(latents, 1, num_channels, height_latent, width_latent)
+        latents = self._pack_latents_flux(latents, latents.shape[0], num_channels, height_latent, width_latent)
 
         # 4. Prepare position IDs
         img_ids = self._prepare_latent_image_ids(batch.height, batch.width, vae_scale_factor)
@@ -219,7 +213,7 @@ class DiffusionModelRunner(BaseModelRunner):
 
         # 5. Compute mu for dynamic timestep shifting
         image_seq_len = (batch.height // (vae_scale_factor * 2)) * (batch.width // (vae_scale_factor * 2))
-        mu = self._calculate_mu(image_seq_len)
+        mu = self.solver.calculate_mu(image_seq_len)
 
         # 6. Set timesteps with dynamic shifting (match GPU: sigmas = linspace(1, 1/N, N))
         sigmas = np.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps).tolist()
@@ -227,7 +221,7 @@ class DiffusionModelRunner(BaseModelRunner):
 
         # 7. Build guidance tensor (embedded_cfg_scale=3.5 for FLUX.1-dev)
         embedded_cfg_scale = getattr(batch, 'guidance_scale', 3.5)
-        guidance = jnp.full((1,), embedded_cfg_scale)
+        guidance = jnp.full((latents.shape[0],), embedded_cfg_scale)
 
         # 8. Move to device
         latents = device_array(latents, sharding=NamedSharding(self.mesh, PartitionSpec()))
@@ -378,7 +372,7 @@ class DiffusionModelRunner(BaseModelRunner):
         if batch.num_frames is not None:
             assert (batch.num_frames - 1) % self.model_config.scale_factor_temporal == 0
         latents = jax.random.normal(
-            jax.random.PRNGKey(batch.seed or 42),
+            jax.random.PRNGKey(42 if batch.seed is None else batch.seed),
             (
                 1,
                 (
@@ -393,24 +387,3 @@ class DiffusionModelRunner(BaseModelRunner):
             dtype=jnp.float32,
         )
         batch.latents = latents
-
-    def mock_data(self, batch: Req) -> Req:
-        """Generate mock diffusion output for stage-by-stage debugging."""
-        if self.is_flux():
-            vae_scale_factor = self.vae_config.scale_factor_spatial  # 8
-            in_channels = self.model_config.in_channels  # 64
-            height_latent = 2 * (batch.height // (vae_scale_factor * 2))
-            width_latent = 2 * (batch.width // (vae_scale_factor * 2))
-            num_channels = in_channels // 4  # 16
-            key = jax.random.PRNGKey(42)
-            batch.latents = jax.random.normal(key, (1, num_channels, height_latent, width_latent))
-        else:
-            key = jax.random.PRNGKey(42)
-            batch.latents = jax.random.normal(key, (
-                1,
-                (batch.num_frames - 1) // self.model_config.scale_factor_temporal + 1,
-                batch.height // self.model_config.scale_factor_spatial,
-                batch.width // self.model_config.scale_factor_spatial,
-                self.model_config.latent_input_dim,
-            ))
-        return batch

@@ -65,8 +65,10 @@ class VaeModelRunner(BaseModelRunner):
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
-            # Return plain array for JIT compatibility
-            return model.encode(x).latent_dist.sample()
+            # Return plain array for JIT compatibility.
+            # Use .mode() (distribution mean) instead of .sample() for
+            # deterministic encoding during inference.
+            return model.encode(x).latent_dist.mode()
 
         @partial(
             jax.jit,
@@ -100,9 +102,3 @@ class VaeModelRunner(BaseModelRunner):
         else:
             raise ValueError(f"Unsupported VAE mode: {mode}")
         return output
-
-    def mock_data(self, batch) -> object:
-        """Generate mock VAE decode output (random image) for debugging."""
-        key = jax.random.PRNGKey(42)
-        batch.output = jax.random.uniform(key, (1, 3, batch.height, batch.width))
-        return batch

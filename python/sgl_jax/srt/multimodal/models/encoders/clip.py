@@ -344,8 +344,13 @@ class CLIPVisionTransformer(nnx.Module):
         x = self.pre_layrnorm(x)
 
         return_all = output_hidden_states or (feature_sample_layers is not None)
+        # Vision encoder uses bidirectional attention (not causal).
+        # Pass an all-ones mask so CLIPAttention uses non-causal path.
+        B, L, _ = x.shape
+        vision_attention_mask = jnp.ones((B, L), dtype=jnp.int32)
         encoder_outputs = self.encoder(
-            x, return_all_hidden_states=return_all, deterministic=deterministic
+            x, attention_mask=vision_attention_mask,
+            return_all_hidden_states=return_all, deterministic=deterministic,
         )
 
         if not return_all:

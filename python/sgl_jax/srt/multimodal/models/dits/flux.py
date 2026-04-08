@@ -304,6 +304,11 @@ class FluxAttention(nnx.Module):
             self.attention_impl == "sdpa"
             or (self.mesh is not None and all(s == 1 for s in self.mesh.shape.values()))
         )
+        if _use_sdpa and self.attention_impl != "sdpa":
+            logger.warning(
+                "Falling back from USP to SDPA attention (single-device mesh or attention_mask present). "
+                "This may reduce performance."
+            )
         if _use_sdpa:
             hidden_states = _sdpa_attention(
                 query,

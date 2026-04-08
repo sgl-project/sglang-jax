@@ -139,10 +139,18 @@ class EncoderModelRunner(BaseModelRunner):
             if use_cache:
                 kwargs["use_cache"] = False
             outputs = model(**kwargs)
-            # Return as dict of arrays for JIT compatibility
+            # Return as dict of arrays for JIT compatibility.
+            # T5 models do not have pooler_output; use a zero tensor
+            # to keep a fixed pytree structure required by JAX JIT.
+            pooler_output = getattr(outputs, "pooler_output", None)
+            if pooler_output is None:
+                pooler_output = jnp.zeros(
+                    (input_ids.shape[0], outputs.last_hidden_state.shape[-1]),
+                    dtype=outputs.last_hidden_state.dtype,
+                )
             return {
                 "last_hidden_state": outputs.last_hidden_state,
-                "pooler_output": outputs.pooler_output,
+                "pooler_output": pooler_output,
             }
 
         def forward_wrapper(input_ids: jax.Array, attention_mask: jax.Array):
@@ -370,8 +378,8 @@ class EncoderModelRunner(BaseModelRunner):
         return attention_mask
 
     def is_flux_t5(self, spec: _EncoderSpec, encoder_idx: int) -> bool:
-        is_flux_t5 = self.is_flux_v1() and encoder_idx == 1
-        return is_flux_t5
+        model_class_name = getattr(spec.model_class, "__name__", str(spec.model_class))
+        return self.is_flux_v1() and "T5" in model_class_name
 
     def is_flux_v1(self) -> bool:
         model_path = (self.server_args.model_path or "").lower()
