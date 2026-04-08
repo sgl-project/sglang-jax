@@ -570,6 +570,46 @@ class MoEKernelTest(jtu.JaxTestCase):
             bse=512,
         )
 
+    @parameterized.product(
+        w_dtype=[jnp.int8],
+        bd1c=[512, 1024],
+        bfc=[256, 1024],
+    )
+    def test_sub_channel_quantization_large_tile(self, w_dtype, bd1c, bfc):
+        """Verify correctness with large bd1c/bfc that trigger multiple scale groups.
+
+        With subc_quant_wsz=256 and t_packing=2 (bf16 activations):
+          bd1c=1024 → n_sg = 1024/2/256 = 2 scale groups in FFN1
+          bfc=1024  → n_sg2 = 1024/256 = 4 scale groups in FFN2
+        """
+        dtype = jnp.bfloat16
+        top_k = 8
+        num_experts = 128
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=1234,
+            renormalize_topk_logits=False,
+            w_dtype=w_dtype,
+            subc_quant_wsz=256,
+            bt=32,
+            bf=1024,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=bfc,
+            bd1c=bd1c,
+            bd2c=bd1c,
+            bse=512,
+        )
+
     def test_fused_moe_weight_mapping_shards_experts_across_ep_mesh(self):
         # This guards an easy-to-miss end-to-end correctness issue: the fused
         # kernel shards experts across EP=(data*tensor), so weight loading must
