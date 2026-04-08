@@ -1510,7 +1510,7 @@ def _fused_ep_moe_kernel(
                                 global_sg = base_sg + sg_id
                                 s1 = w1_scale_vmem[
                                     p_id,
-                                    pl.ds(global_sg, 1),
+                                    global_sg,
                                     pl.ds(0, 1),
                                     pl.ds(bfc_id * bfc, bfc),
                                 ]
@@ -1525,7 +1525,7 @@ def _fused_ep_moe_kernel(
                                 if w3_scale_vmem is not None:
                                     s3 = w3_scale_vmem[
                                         p_id,
-                                        pl.ds(global_sg, 1),
+                                        global_sg,
                                         pl.ds(0, 1),
                                         pl.ds(bfc_id * bfc, bfc),
                                     ]
@@ -1690,7 +1690,7 @@ def _fused_ep_moe_kernel(
                                 global_sg = base_sg + sg_id
                                 s = w2_scale_vmem[
                                     p_id,
-                                    pl.ds(global_sg, 1),
+                                    global_sg,
                                     pl.ds(0, 1),
                                     pl.ds(
                                         bd2c_id * bd2c_per_t_packing,
