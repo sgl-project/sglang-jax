@@ -1476,14 +1476,13 @@ def _fused_ep_moe_kernel(
                 for p_id in range(t_packing):
                     if w1_scale_vmem is not None and n_sg > 1:
                         # Quantized path with multiple scale groups per tile.
-                        # Python for-loop is statically unrolled, but with large
-                        # bd1c/bfc the outer loops collapse to 1 iteration each,
-                        # reducing total unrolls from ~128 to ~16.
+                        # Use lax.fori_loop instead of Python for-loop to avoid
+                        # static unrolling which explodes HLO size and VMEM usage.
                         for bfc_id in range(cdiv(bf, bfc)):
                             base_sg = bd1c_id * n_sg
-                            acc1 = jnp.zeros((btc, bfc), dtype=jnp.float32)
-                            acc3 = jnp.zeros((btc, bfc), dtype=jnp.float32)
-                            for sg_id in range(n_sg):
+
+                            def _ffn1_sg_body(sg_id, carry):
+                                acc1, acc3 = carry
                                 sg_offset = sg_id * sg_k
                                 t_g = t_vmem[
                                     pl.ds(btc_id * btc, btc),
@@ -1513,8 +1512,8 @@ def _fused_ep_moe_kernel(
                                     pl.ds(0, 1),
                                     pl.ds(bfc_id * bfc, bfc),
                                 ]
-                                d1 *= jnp.broadcast_to(s1, d1.shape)
-                                acc1 += d1
+                                d1 = d1 * jnp.broadcast_to(s1, d1.shape)
+                                acc1 = acc1 + d1
 
                                 d3 = jnp.dot(
                                     t_g,
@@ -1528,8 +1527,19 @@ def _fused_ep_moe_kernel(
                                         pl.ds(0, 1),
                                         pl.ds(bfc_id * bfc, bfc),
                                     ]
-                                    d3 *= jnp.broadcast_to(s3, d3.shape)
-                                acc3 += d3
+                                    d3 = d3 * jnp.broadcast_to(s3, d3.shape)
+                                acc3 = acc3 + d3
+                                return (acc1, acc3)
+
+                            acc1, acc3 = lax.fori_loop(
+                                0,
+                                n_sg,
+                                _ffn1_sg_body,
+                                (
+                                    jnp.zeros((btc, bfc), dtype=jnp.float32),
+                                    jnp.zeros((btc, bfc), dtype=jnp.float32),
+                                ),
+                            )
 
                             acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
 
@@ -1691,11 +1701,12 @@ def _fused_ep_moe_kernel(
                             act = activation_fn(acc1, acc3, act_fn)
 
                             # Quantized path with multiple scale groups.
+                            # Use lax.fori_loop to avoid static unrolling.
                             base_sg = bfc_id * n_sg2
-                            sg_acc = jnp.zeros((btc, bd2c_per_t_packing), dtype=jnp.float32)
-                            for sg_id in range(n_sg2):
+
+                            def _ffn2_sg_body(sg_id, sg_acc):
                                 sg_offset = sg_id * sg_k2
-                                act_g = act[:, sg_offset : sg_offset + sg_k2]
+                                act_g = lax.dynamic_slice_in_dim(act, sg_offset, sg_k2, axis=1)
                                 w2_g = w2_vmem[
                                     p_id,
                                     pl.ds(bfc_id * bfc + sg_offset, sg_k2),
@@ -1719,8 +1730,15 @@ def _fused_ep_moe_kernel(
                                         bd2c_per_t_packing,
                                     ),
                                 ]
-                                d *= jnp.broadcast_to(s, d.shape)
-                                sg_acc += d
+                                d = d * jnp.broadcast_to(s, d.shape)
+                                return sg_acc + d
+
+                            sg_acc = lax.fori_loop(
+                                0,
+                                n_sg2,
+                                _ffn2_sg_body,
+                                jnp.zeros((btc, bd2c_per_t_packing), dtype=jnp.float32),
+                            )
                             res += sg_acc
                     else:
                         # Non-quantized or single scale group: original structure.

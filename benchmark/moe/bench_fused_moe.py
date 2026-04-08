@@ -136,7 +136,6 @@ def _estimate_vmem_bytes(
 
     token_bytes = jnp.dtype(dtype).itemsize
     weight_bytes = jnp.dtype(weight_dtype).itemsize
-    router_bytes = jnp.dtype(router_dtype).itemsize
 
     t_packing = _dtype_packing(dtype)
     padded_num_experts = ((case.num_experts + 127) // 128) * 128
@@ -146,14 +145,12 @@ def _estimate_vmem_bytes(
     a2a_max_tokens = ((bt * num_devices + bts - 1) // bts) * bts
 
     # Output-side staging (no overlap):
-    # - a2a_g_acc_vmem: (1, top_k, gcd(bt, 16), t_packing, hidden_per_pack)
+    # - a2a_g_acc_vmem: (2, top_k, gcd(bt, 16), t_packing, hidden_per_pack)
     # - b_output_x2_vmem: (2, bt, hidden_size)
     acc_bt = math.gcd(bt, 16)  # Must match fused_moe kernel scratch shape.
-    a2a_g_acc = 1 * top_k * acc_bt * hidden * token_bytes
+    a2a_g_acc = 2 * top_k * acc_bt * hidden * token_bytes
     # b_output_x2_vmem is double-buffered to overlap store(output_hbm) with next bt's compute.
     b_output = 2 * bt * hidden * token_bytes
-    # b_gating_x2_vmem is double-buffered for run_bt overlap: (2, bt, padded_num_experts)
-    b_gating = 2 * bt * padded_num_experts * router_bytes
     # t2e_routing_smem scratch is placed in SMEM (not VMEM).
     t2e_routing = 0
 
@@ -202,7 +199,6 @@ def _estimate_vmem_bytes(
     total_bytes = (
         a2a_g_acc
         + b_output
-        + b_gating
         + t2e_routing
         + w1
         + w3
@@ -215,6 +211,31 @@ def _estimate_vmem_bytes(
         + a2a_s_acc_stage_b32
         + routing_temporaries
     )
+
+    # Estimate XLA intermediaries from statically-unrolled scale-group loops.
+    # Each scale group iteration materializes dot results in VMEM that XLA
+    # cannot fully reuse across unrolled iterations.
+    compute_intermediaries = 0
+    if subc_quant_wsz is not None:
+        btc = cfg.btc
+        bfc = cfg.bfc
+        bd1c = cfg.bd1c
+        bd2c = cfg.bd2c
+        bd1c_per_tp = bd1c // t_packing
+        n_sg_ffn1 = bd1c_per_tp // subc_quant_wsz
+        n_sg_ffn2 = bfc // subc_quant_wsz
+        n_bd1c_tiles = (bd1 + bd1c - 1) // bd1c
+        n_bfc_tiles = (bf + bfc - 1) // bfc
+        # FFN1: each sg produces 2 dot results (w1,w3) of shape (btc, bfc) f32
+        ffn1_per_sg = 2 * btc * bfc * 4
+        ffn1_total = n_bd1c_tiles * n_bfc_tiles * n_sg_ffn1 * t_packing * ffn1_per_sg
+        # FFN2: each sg produces 1 dot result of shape (bt, bd2c_per_tp) f32
+        bd2c_per_tp = bd2c // t_packing
+        n_bd2c_tiles = (bd2 + bd2c - 1) // bd2c
+        ffn2_per_sg = bt * bd2c_per_tp * 4
+        ffn2_total = n_bd2c_tiles * n_sg_ffn2 * t_packing * ffn2_per_sg
+        compute_intermediaries = ffn1_total + ffn2_total
+    total_bytes += compute_intermediaries
 
     # Shared expert scratch buffers.
     se_w1 = 0
@@ -280,7 +301,7 @@ def _estimate_vmem_bytes(
         print(f"      b_acc_vmem:             {_mb(b_acc)} MB  (2, {a2a_max_tokens}, 1, {bf}) f32")
         print(f"      b_output_x2_vmem:       {_mb(b_output)} MB  (2, {bt}, {hidden})")
         print(
-            f"      a2a_g_acc_vmem:         {_mb(a2a_g_acc)} MB  (1, {top_k}, {acc_bt}, {t_packing}, {hidden // t_packing})"
+            f"      a2a_g_acc_vmem:         {_mb(a2a_g_acc)} MB  (2, {top_k}, {acc_bt}, {t_packing}, {hidden // t_packing})"
         )
         print(
             f"      b_stage_x2_vmem:        {_mb(t_stage_b32)} MB  (2, {bts}, {t_packing}, {bd1 // t_packing})"
@@ -288,8 +309,11 @@ def _estimate_vmem_bytes(
         print(
             f"      a2a_s_acc_stage_x3:     {_mb(a2a_s_acc_stage_b32)} MB  (3, {bts}, {t_packing}, {bd2 // t_packing})"
         )
-        print(f"      b_gating_x2_vmem:       {_mb(b_gating)} MB  (2, {bt}, {padded_num_experts})")
         print(f"      routing_temporaries:    {_mb(routing_temporaries)} MB")
+        if compute_intermediaries > 0:
+            print(
+                f"      compute_intermediaries: {_mb(compute_intermediaries)} MB  (unrolled scale-group dot products)"
+            )
         if use_shared_expert:
             bse = cfg.bse
             print(
