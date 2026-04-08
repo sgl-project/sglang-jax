@@ -1695,18 +1695,26 @@ def _fused_ep_moe_kernel(
 
                     if w2_scale_vmem is not None and n_sg2 > 1:
                         for bfc_id in range(cdiv(bf, bfc)):
-                            acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
-                            acc1 = acc1_vmem[*acc_slices]
-                            acc3 = acc3_vmem[*acc_slices]
-                            act = activation_fn(acc1, acc3, act_fn)
-
                             # Quantized path with multiple scale groups.
                             # Use lax.fori_loop to avoid static unrolling.
+                            # Read per-group slices from VMEM refs and compute
+                            # activation inside the loop body, avoiding
+                            # dynamic_slice on JAX arrays (unsupported in
+                            # Pallas TPU lowering). activation is element-wise
+                            # so act(acc[slice]) == act(acc)[slice].
                             base_sg = bfc_id * n_sg2
 
                             def _ffn2_sg_body(sg_id, sg_acc):
                                 sg_offset = sg_id * sg_k2
-                                act_g = lax.dynamic_slice_in_dim(act, sg_offset, sg_k2, axis=1)
+                                acc1_g = acc1_vmem[
+                                    pl.ds(btc_id * btc, btc),
+                                    pl.ds(bfc_id * bfc + sg_offset, sg_k2),
+                                ]
+                                acc3_g = acc3_vmem[
+                                    pl.ds(btc_id * btc, btc),
+                                    pl.ds(bfc_id * bfc + sg_offset, sg_k2),
+                                ]
+                                act_g = activation_fn(acc1_g, acc3_g, act_fn)
                                 w2_g = w2_vmem[
                                     p_id,
                                     pl.ds(bfc_id * bfc + sg_offset, sg_k2),
