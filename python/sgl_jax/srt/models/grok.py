@@ -654,8 +654,8 @@ class Grok1DecoderLayer(nnx.Module):
         dispatch_info: ExpertLocationMetadata | None = None,
     ) -> tuple[jax.Array, jax.Array | None]:
         """Combine MoE and residual MLP outputs (matches PyTorch implementation)."""
-        mlp_result = self.mlp(x)
-        moe_result, topk_ids = self.block_sparse_moe(x, dispatch_info=dispatch_info)
+        mlp_result = jax.lax.optimization_barrier(self.mlp(x))
+        moe_result, topk_ids = jax.lax.optimization_barrier(self.block_sparse_moe(x, dispatch_info=dispatch_info))
         # Scale factor from the paper: 1/sqrt(2)
         return (mlp_result + moe_result) / 1.4142135623730951, topk_ids
 
@@ -688,12 +688,12 @@ class Grok1DecoderLayer(nnx.Module):
             hidden_states, residual = self.pre_attn_norm(hidden_states), hidden_states
 
         # Self-attention
-        hidden_states, kv_fused = self.self_attn(
+        hidden_states, kv_fused = jax.lax.optimization_barrier(self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
-        )
+        ))
 
         # # Apply post-attention norm and pre-MoE norm (matching PyTorch fused_dual_residual_rmsnorm)
         assert self.post_attn_norm.scale is not None
