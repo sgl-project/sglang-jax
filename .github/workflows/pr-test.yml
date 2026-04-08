@@ -27,6 +27,8 @@ concurrency:
 jobs:
   # =============================================== check changes ====================================================
   check-changes:
+    # Only run tests when targeting sgl-project/sglang-jax (skip for forks like primatrix/sglang-jax)
+    if: github.repository == 'sgl-project/sglang-jax'
     runs-on: ubuntu-latest
     outputs:
       main_package: ${{ steps.filter.outputs.main_package }}

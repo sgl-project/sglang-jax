@@ -427,6 +427,7 @@ class FlashAttention(AttentionBackend):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         causal: int = 1,
+        **kwargs,
     ):
         """
         Args:
@@ -515,7 +516,7 @@ class FlashAttention(AttentionBackend):
         )(
             q.reshape(q.shape[0], -1, self.head_dim),
             k.reshape(k.shape[0], -1, self.head_dim),
-            v.reshape(v.shape[0], -1, self.head_dim),
+            v.reshape(v.shape[0], -1, self.v_head_dim),
             kv_cache_fused_paged,
             self.forward_metadata.seq_lens,
             page_indices_arg,
