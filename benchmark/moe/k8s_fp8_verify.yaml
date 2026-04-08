@@ -75,7 +75,7 @@ spec:
             - bash
             - -c
             - |
-              set -euo pipefail
+              set -xuo pipefail
               unset CLOUD_TPU_TASK_ID
               export TPU_WORKER_ID=$JOB_COMPLETION_INDEX
               export PYTHONUNBUFFERED=1
@@ -94,10 +94,21 @@ spec:
               cd /workspace
               pip install -q -e "./python[tpu]" 2>&1 | tail -5
 
+              echo "=== Worker $TPU_WORKER_ID: pip install done, waiting for peers ==="
+              # Simple barrier: wait for all workers' DNS to resolve
+              for host in fp8-verify-0.fp8-verify-svc fp8-verify-1.fp8-verify-svc fp8-verify-2.fp8-verify-svc fp8-verify-3.fp8-verify-svc; do
+                until getent hosts "$host" > /dev/null 2>&1; do
+                  echo "Waiting for $host..."
+                  sleep 2
+                done
+              done
+              # Extra settle time for slower workers to finish pip install
+              sleep 15
+
               echo "=== Worker $TPU_WORKER_ID: Running FP8 precision verification ==="
 
-              # verify_fp8_precision.py prints JAX version/devices info in main()
-              python -m benchmark.moe.verify_fp8_precision 2>&1 || {
-                echo "ERROR: verify_fp8_precision failed with exit code $?"
-                exit 1
-              }
+              # Run verification (the script handles JAX init internally)
+              python -m benchmark.moe.verify_fp8_precision 2>&1
+              VERIFY_EXIT=$?
+              echo "=== Verification finished with exit code $VERIFY_EXIT ==="
+              exit $VERIFY_EXIT
