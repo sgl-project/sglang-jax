@@ -451,10 +451,12 @@ def select_block_configs(
             use_shared_expert=use_shared_expert,
             subc_quant_wsz=subc_quant_wsz,
         )
-        if est > tpu_vmem_budget_bytes:
+        # Reserve 5% headroom for XLA stack temporaries not captured by estimate
+        effective_budget = int(tpu_vmem_budget_bytes * 0.95)
+        if est > effective_budget:
             return (
                 False,
-                f"vmem_est={est / (1024 * 1024):.1f}MB > budget={tpu_vmem_budget_bytes / (1024 * 1024):.1f}MB",
+                f"vmem_est={est / (1024 * 1024):.1f}MB > budget={effective_budget / (1024 * 1024):.1f}MB",
             )
         return True, "ok"
 
@@ -1017,9 +1019,10 @@ def run_all(
                         verbose=True,
                     )
                     vmem_mb = vmem_bytes / (1024 * 1024)
-                    vmem_remaining_mb = 64.0 - vmem_mb
+                    budget_mb = tpu_vmem_budget_bytes / (1024 * 1024)
+                    vmem_remaining_mb = budget_mb - vmem_mb
                     print(
-                        f"    => VMEM: {vmem_mb:.2f} MB / 64 MB (remaining: {vmem_remaining_mb:.2f} MB)"
+                        f"    => VMEM: {vmem_mb:.2f} MB / {budget_mb:.0f} MB (remaining: {vmem_remaining_mb:.2f} MB)"
                     )
 
                 task = "fused-moe-k_.*"
