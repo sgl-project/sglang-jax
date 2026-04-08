@@ -428,7 +428,6 @@ def _ragged_paged_attention_kernel(
             assert len(xai_temperature_reg.shape) == 1
             s = s * xai_temperature_reg[:, None]
 
-        # TODO(jevinjiang, xiowei): reduce pages_per_seq based on sliding_window.
         if sliding_window is not None:
             mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
 
@@ -461,7 +460,7 @@ def _ragged_paged_attention_kernel(
         head_acc_ref = acc_ref.at[kv_head_idx, :q_shape_0]
 
         def load_with_init(ref, init_val):
-            return jnp.where(bkv_idx == 0, jnp.full_like(ref, init_val), ref[...])
+            return jnp.where(bkv_idx == bkv_idx_start, jnp.full_like(ref, init_val), ref[...])
 
         pv = jnp.einsum("nm,md->nd", p, v, preferred_element_type=jnp.float32)
         if v_scale is not None:
@@ -928,7 +927,7 @@ def _ragged_paged_attention_kernel(
                         start_fetch_mask(next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx)
 
                 # Wait for cur bq if not ready yet
-                @pl.when(bkv_idx == 0)
+                @pl.when(bkv_idx == bkv_idx_start)
                 def wait_cur_bq():
                     wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
 
@@ -1036,7 +1035,7 @@ def _ragged_paged_attention_kernel(
                     kv_head_idx=prev_kv_head_idx,
                 )
 
-            lax.fori_loop(0, num_bkv, compute_with_bkv, None, unroll=False)
+            lax.fori_loop(bkv_idx_start, num_bkv, compute_with_bkv, None, unroll=False)
 
             # Load acc and calculate final output.
             acc = acc_ref[...]
@@ -1510,7 +1509,7 @@ def ragged_paged_attention(
             sink = jnp.full((queries.shape[1],), sink, dtype=jnp.float32)
         if sink.shape[0] < queries.shape[1]:
             sink = jnp.pad(sink, (0, queries.shape[1] - sink.shape[0]))
-        attention_sink = sink[:queries.shape[1]]
+        attention_sink = sink[: queries.shape[1]]
 
     q, k, v = queries, keys, values
     static_validate_inputs_fused(
@@ -1613,7 +1612,9 @@ def ragged_paged_attention(
     out_specs = [
         pl.BlockSpec(memory_space=pltpu.ANY),  # output
         pl.BlockSpec(memory_space=pltpu.ANY),  # updated kv_cache_fused
-        pl.BlockSpec(memory_space=pltpu.ANY),  # logsumexp (always allocated; used for attention_sink)
+        pl.BlockSpec(
+            memory_space=pltpu.ANY
+        ),  # logsumexp (always allocated; used for attention_sink)
     ]
 
     bkv_fused_double_buf = pltpu.VMEM(
