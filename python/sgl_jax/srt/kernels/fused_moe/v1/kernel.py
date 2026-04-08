@@ -1506,12 +1506,14 @@ def _fused_ep_moe_kernel(
                                     preferred_element_type=jnp.float32,
                                 )
                                 global_sg = base_sg + sg_id
+                                # Use pl.ds for traced global_sg index.
                                 s1 = w1_scale_vmem[
                                     p_id,
-                                    global_sg,
+                                    pl.ds(global_sg, 1),
                                     pl.ds(0, 1),
                                     pl.ds(bfc_id * bfc, bfc),
                                 ]
+                                s1 = s1.reshape(1, bfc)
                                 d1 = d1 * jnp.broadcast_to(s1, d1.shape)
                                 acc1 = acc1 + d1
 
@@ -1523,10 +1525,11 @@ def _fused_ep_moe_kernel(
                                 if w3_scale_vmem is not None:
                                     s3 = w3_scale_vmem[
                                         p_id,
-                                        global_sg,
+                                        pl.ds(global_sg, 1),
                                         pl.ds(0, 1),
                                         pl.ds(bfc_id * bfc, bfc),
                                     ]
+                                    s3 = s3.reshape(1, bfc)
                                     d3 = d3 * jnp.broadcast_to(s3, d3.shape)
                                 acc3 = acc3 + d3
                                 return (acc1, acc3)
@@ -1729,15 +1732,17 @@ def _fused_ep_moe_kernel(
                                     preferred_element_type=jnp.float32,
                                 )
                                 global_sg = base_sg + sg_id
+                                # Use pl.ds for traced global_sg index.
                                 s = w2_scale_vmem[
                                     p_id,
-                                    global_sg,
+                                    pl.ds(global_sg, 1),
                                     pl.ds(0, 1),
                                     pl.ds(
                                         bd2c_id * bd2c_per_t_packing,
                                         bd2c_per_t_packing,
                                     ),
                                 ]
+                                s = s.reshape(1, bd2c_per_t_packing)
                                 d = d * jnp.broadcast_to(s, d.shape)
                                 return sg_acc + d
 
