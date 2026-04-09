@@ -450,12 +450,6 @@ class FlashAttention(AttentionBackend):
             else layer.scaling
         )
 
-        # Prepare fused KV cache for paged format: [num_pages, page_size, num_kv_heads * 2, head_dim]
-        total_tokens = kv_cache_fused.shape[0]
-        num_pages = total_tokens // self.page_size
-        kv_cache_fused_paged = kv_cache_fused.reshape(
-            num_pages, self.page_size, -1, (self.head_dim + 127) // 128 * 128
-        )
         if self.forward_metadata.custom_mask is not None:
             causal = 0
         # Select page indices and remap to SWA pool if KV cache supports it
@@ -482,7 +476,7 @@ class FlashAttention(AttentionBackend):
         out_specs = (
             P(None, self.kv_partition_axis),  # attention output
             P(
-                None, self.kv_partition_axis, None
+                None, None, self.kv_partition_axis, None, None
             ),  # updated kv_cache_fused (head interleaved) - 3D: [total_tokens, num_kv_heads*2, head_dim]
         )
 
@@ -521,7 +515,7 @@ class FlashAttention(AttentionBackend):
             q.reshape(q.shape[0], -1, self.head_dim),
             k.reshape(k.shape[0], -1, self.head_dim),
             v.reshape(v.shape[0], -1, self.head_dim),
-            kv_cache_fused_paged,
+            kv_cache_fused,
             self.forward_metadata.seq_lens,
             page_indices_arg,
             self.forward_metadata.cu_q_lens,
@@ -530,14 +524,6 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.custom_mask,
             attention_sink,
         )
-
-        pad_width = (self.head_dim + 127) // 128 * 128 - self.head_dim
-        if pad_width > 0:
-            updated_kv_cache_fused = jnp.pad(
-                updated_kv_cache_fused,
-                ((0, 0), (0, 0), (0, pad_width)),
-                mode="constant",
-            )
 
         return (
             attn_output.reshape(q.shape[0], -1),
