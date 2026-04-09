@@ -398,8 +398,15 @@ class ModelWorker:
         logger.info("[DECODE] Precompile finished in %.0f secs", end_time - start_time)
 
     def set_forward_metadata(self, model_worker_batch: ModelWorkerBatch):
-        self.model_runner.attn_backend.forward_metadata = (
-            self.model_runner.attn_backend.get_forward_metadata(model_worker_batch)
+        self.worker.model_runner.attn_backend.forward_metadata = (
+            self.worker.model_runner.attn_backend.get_forward_metadata(
+                model_worker_batch,
+                swa_index_mapping=getattr(
+                    self.worker.model_runner.token_to_kv_pool_allocator,
+                    "full_to_swa_index_mapping",
+                    None,
+                ),
+            )
         )
 
     def get_max_padded_size(self):
@@ -591,7 +598,12 @@ class ModelWorker:
 
         if forward_metadata is None:
             forward_metadata = self.model_runner.attn_backend.get_forward_metadata(
-                model_worker_batch
+                model_worker_batch,
+                swa_index_mapping=getattr(
+                    self.model_runner.token_to_kv_pool_allocator,
+                    "full_to_swa_index_mapping",
+                    None,
+                ),
             )
 
         if sampling_metadata is None:

@@ -441,15 +441,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 debug_mode=False,
                 dp_size=dp_size,
             )
-        if dp_size == 1:
-            self.full_to_swa_index_mapping = np.zeros(
-                self.full_attn_allocator.size_per_rank + 1, dtype=np.int64
-            )
-        else:
-            self.full_to_swa_index_mapping = [
-                np.zeros(self.full_attn_allocator.size_per_rank + 1, dtype=np.int64)
-                for _ in range(dp_size)
-            ]
+        self.full_to_swa_index_mapping = [
+            np.zeros(self.full_attn_allocator.size_per_rank + 1, dtype=np.int64)
+            for _ in range(dp_size)
+        ]
         self.clear()
 
         self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
@@ -495,12 +490,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # Rollback full allocation if swa allocation fails
             self.full_attn_allocator.free(alloc_full_indices, dp_rank=dp_rank)
             return None
-        mapping = (
-            self.full_to_swa_index_mapping
-            if self.dp_size == 1
-            else self.full_to_swa_index_mapping[dp_rank]
-        )
-        mapping[alloc_full_indices] = alloc_swa_indices
+        self.full_to_swa_index_mapping[dp_rank][alloc_full_indices] = alloc_swa_indices
         return alloc_full_indices
 
     def alloc_extend(
@@ -517,11 +507,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if full_indices is None:
             return None
 
-        mapping = (
-            self.full_to_swa_index_mapping
-            if self.dp_size == 1
-            else self.full_to_swa_index_mapping[dp_rank]
-        )
+        mapping = self.full_to_swa_index_mapping[dp_rank]
         last_loc_np = np.array(last_loc)
         swa_last_loc = mapping[last_loc_np].astype(np.int32).tolist()
 
@@ -545,11 +531,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if full_indices is None:
             return None
 
-        mapping = (
-            self.full_to_swa_index_mapping
-            if self.dp_size == 1
-            else self.full_to_swa_index_mapping[dp_rank]
-        )
+        mapping = self.full_to_swa_index_mapping[dp_rank]
         last_loc_np = np.array(last_loc)
         swa_last_loc = mapping[last_loc_np].astype(np.int32).tolist()
 
@@ -574,22 +556,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert (
             self.full_attn_allocator.available_size(dp_rank=dp_rank)
             <= self.full_attn_allocator.size_per_rank
-            if self.dp_size > 1
-            else self.full_attn_allocator.size
         )
         assert (
             self.swa_attn_allocator.available_size(dp_rank=dp_rank)
             <= self.swa_attn_allocator.size_per_rank
-            if self.dp_size > 1
-            else self.swa_attn_allocator.size
         )
 
     def free_swa(self, free_index: np.array, dp_rank: int = 0):
-        mapping = (
-            self.full_to_swa_index_mapping
-            if self.dp_size == 1
-            else self.full_to_swa_index_mapping[dp_rank]
-        )
+        mapping = self.full_to_swa_index_mapping[dp_rank]
         map_vals = mapping[free_index]
         swa_indices = map_vals[map_vals > 0]
         self.swa_attn_allocator.free(swa_indices, dp_rank=dp_rank)
@@ -606,19 +580,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # Clear all ranks
             self.swa_attn_allocator.clear()
             self.full_attn_allocator.clear()
-            if self.dp_size == 1:
-                self.full_to_swa_index_mapping.fill(0)
-            else:
-                for rank in range(self.dp_size):
-                    self.full_to_swa_index_mapping[rank].fill(0)
+            for rank in range(self.dp_size):
+                self.full_to_swa_index_mapping[rank].fill(0)
         else:
             # Clear specific rank
             self.swa_attn_allocator.clear(dp_rank=dp_rank)
             self.full_attn_allocator.clear(dp_rank=dp_rank)
-            if self.dp_size == 1:
-                self.full_to_swa_index_mapping.fill(0)
-            else:
-                self.full_to_swa_index_mapping[dp_rank].fill(0)
+            self.full_to_swa_index_mapping[dp_rank].fill(0)
         self.is_not_in_free_group = True
         self.free_group = [[] for _ in range(self.dp_size)]
 
