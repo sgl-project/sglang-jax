@@ -193,9 +193,11 @@ class FusedEPMoE(nnx.Module):
         if self.quantized_dtype is None:
             return
 
+        # Default subc_quant_wsz to 256 if not explicitly set.
+        wsz = self.subc_quant_wsz if self.subc_quant_wsz is not None else 256
         if hasattr(self, "subc_quant_wsz"):
             del self.subc_quant_wsz
-            self.subc_quant_wsz = 256
+        self.subc_quant_wsz = wsz
 
         with jax.set_mesh(self.mesh):
             if is_static:

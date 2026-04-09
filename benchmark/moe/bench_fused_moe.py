@@ -757,6 +757,12 @@ def run_all(
 
     print(f"Running fused_moe benchmarks with weight_dtype={weight_dtype}")
     print(f"  features: shared_expert={use_shared_expert}, grouped_topk={use_grouped_topk}")
+    if subc_quant_n_wsz is not None:
+        print(
+            f"  quantization: 2D block-wise (block_k={subc_quant_wsz_override}, block_n={subc_quant_n_wsz})"
+        )
+    elif subc_quant_wsz_override is not None:
+        print(f"  quantization: 1D sub-channel (wsz={subc_quant_wsz_override})")
     print(
         "  shape: "
         f"num_experts={num_experts}, top_k={top_k}, hidden_size={hidden_size}, intermediate_size={intermediate_size}, "
@@ -962,6 +968,8 @@ def run_all(
                 ),
             )
             if quantization_config is not None:
+                if subc_quant_wsz is not None:
+                    fused_layer.subc_quant_wsz = subc_quant_wsz
                 if subc_quant_n_wsz is not None:
                     fused_layer.quant_block_n = subc_quant_n_wsz
                 fused_layer.quantize_weights()
@@ -1097,7 +1105,7 @@ def run_all(
                             intermediate_size=case.intermediate_size,
                             dtype=dtype,
                             ep_size=mesh_ep,
-                            subc_quant_wsz=None,
+                            subc_quant_wsz=subc_quant_wsz,
                             block_config=block_cfg,
                         )
                     times = multiple_iteration_timeit_from_trace(
