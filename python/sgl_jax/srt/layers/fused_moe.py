@@ -210,28 +210,58 @@ class FusedEPMoE(nnx.Module):
         with jax.set_mesh(self.mesh):
             if is_static:
                 ep_scale_sharding = P(("data", "tensor"), None, None, None)
-                # Keep a shardable placeholder shape for static checkpoints.
-                # Axis 0 is sharded by ("data", "tensor"), so it must be divisible by EP mesh size.
-                ep_scale_placeholder_shape = (self.num_experts, 1, 1, 1)
+
+                # Compute the actual kernel-expected scale shapes so the weight
+                # loader can match dimensions and assign directly.
+                if self.quant_block_n is not None:
+                    # 2D block-wise: (E, K_groups, N_groups, 1)
+                    w1_scale_shape = (
+                        self.num_experts,
+                        self.hidden_size // wsz,
+                        self.intermediate_dim // self.quant_block_n,
+                        1,
+                    )
+                    w3_scale_shape = w1_scale_shape
+                    w2_scale_shape = (
+                        self.num_experts,
+                        self.intermediate_dim // wsz,
+                        self.hidden_size // self.quant_block_n,
+                        1,
+                    )
+                else:
+                    # 1D sub-channel: (E, K_groups, 1, N)
+                    w1_scale_shape = (
+                        self.num_experts,
+                        self.hidden_size // wsz,
+                        1,
+                        self.intermediate_dim,
+                    )
+                    w3_scale_shape = w1_scale_shape
+                    w2_scale_shape = (
+                        self.num_experts,
+                        self.intermediate_dim // wsz,
+                        1,
+                        self.hidden_size,
+                    )
 
                 if hasattr(self, "w1_scale"):
                     del self.w1_scale
                 self.w1_scale = nnx.Param(
-                    jnp.zeros(ep_scale_placeholder_shape, dtype=jnp.float32),
+                    jnp.zeros(w1_scale_shape, dtype=jnp.float32),
                     out_sharding=ep_scale_sharding,
                 )
 
                 if hasattr(self, "w3_scale"):
                     del self.w3_scale
                 self.w3_scale = nnx.Param(
-                    jnp.zeros(ep_scale_placeholder_shape, dtype=jnp.float32),
+                    jnp.zeros(w3_scale_shape, dtype=jnp.float32),
                     out_sharding=ep_scale_sharding,
                 )
 
                 if hasattr(self, "w2_scale"):
                     del self.w2_scale
                 self.w2_scale = nnx.Param(
-                    jnp.zeros(ep_scale_placeholder_shape, dtype=jnp.float32),
+                    jnp.zeros(w2_scale_shape, dtype=jnp.float32),
                     out_sharding=ep_scale_sharding,
                 )
 

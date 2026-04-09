@@ -14,7 +14,7 @@ import ml_dtypes
 import numpy as np
 from flax import nnx
 from jax.experimental import multihost_utils
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from safetensors import safe_open
 from tqdm import tqdm
@@ -225,15 +225,10 @@ class WeightLoader:
         param_shape = model_param.value.shape
         num_experts = param_shape[0]
 
-        # Detect FusedEPMoE: placeholder is (E, 1, 1, 1) from is_static path
-        is_fused_placeholder = param_shape[1] == 1 and param_shape[2] == 1 and param_shape[3] == 1
-
-        if is_fused_placeholder and weight.ndim == 3:
-            # FusedEPMoE: checkpoint stores (E, N_groups, K_groups),
-            # kernel expects (E, K_groups, N_groups, 1).
-            # Transpose per-shard with numpy and reconstruct JAX array to avoid
-            # creating an intermediate with explicit expert-mesh NamedSharding
-            # (which would conflict with the model mesh during shard_map tracing).
+        # --- FusedEPMoE 2D block-wise path ---
+        # Placeholder shape: (E, K_groups, N_groups, 1) — last dim is 1, dim2 > 1.
+        # Checkpoint stores:  (E, N_groups, K_groups) — axes 1,2 swapped.
+        if param_shape[3] == 1 and param_shape[2] > 1 and weight.ndim == 3:
             new_shape = (weight.shape[0], weight.shape[2], weight.shape[1], 1)
             logger.info(
                 "Converting FusedEPMoE scale %s from shape %s to %s",
@@ -241,26 +236,27 @@ class WeightLoader:
                 weight.shape,
                 new_shape,
             )
+            # Per-shard numpy transpose to avoid JAX ops that stamp expert-mesh
+            # metadata (which conflicts with model mesh during shard_map).
             transposed_shards = []
             for shard in weight.addressable_shards:
                 s_np = np.asarray(shard.data)
                 transposed_shards.append(jnp.array(np.transpose(s_np, (0, 2, 1))[..., np.newaxis]))
-
-            from jax.sharding import PositionalSharding
-
-            devices = [s.device for s in weight.addressable_shards]
-            pos_sharding = PositionalSharding(devices).reshape(len(devices), 1, 1, 1)
+            # Reconstruct with weight's original mesh — same approach as
+            # make_array_from_callback used for w1/w2/w3 weights.
+            orig_sharding = weight.sharding
+            new_sharding = NamedSharding(
+                orig_sharding.mesh,
+                P(orig_sharding.spec[0], None, None, None),
+            )
             return jax.make_array_from_single_device_arrays(
-                new_shape, pos_sharding, transposed_shards
+                new_shape, new_sharding, transposed_shards
             )
 
-        # --- EPMoE / GMM path below ---
-        num_experts, k_blocks, _, out_dim = param_shape
+        # --- EPMoE / GMM path (also FusedEPMoE 1D sub-channel) ---
         if param_shape[2] != 1:
-            raise ValueError(
-                f"Expected kernel-ready EPMoE scale placeholder to have singleton dim=1, "
-                f"got shape={param_shape} for {target_path}"
-            )
+            return weight
+        num_experts, k_blocks, _, out_dim = param_shape
         if weight.ndim == 2 and weight.shape == (num_experts, out_dim):
             return weight[:, None, None, :]
 
