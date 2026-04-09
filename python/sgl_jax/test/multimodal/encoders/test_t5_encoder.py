@@ -111,9 +111,7 @@ class TestT5Encoder(unittest.TestCase):
         hf_ids, hf_mask = inp.input_ids, inp.attention_mask
 
         with torch.no_grad():
-            hf_out = self.hf_model(
-                input_ids=hf_ids, attention_mask=hf_mask
-            ).last_hidden_state
+            hf_out = self.hf_model(input_ids=hf_ids, attention_mask=hf_mask).last_hidden_state
 
         with jax.set_mesh(self.mesh):
             jax_out = self.jax_model(

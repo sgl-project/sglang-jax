@@ -4,7 +4,6 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -300,9 +299,8 @@ class FluxAttention(nnx.Module):
             query = _apply_flux_rotary_emb(query, image_rotary_emb, sequence_dim=1)
             key = _apply_flux_rotary_emb(key, image_rotary_emb, sequence_dim=1)
 
-        _use_sdpa = (
-            self.attention_impl == "sdpa"
-            or (self.mesh is not None and all(s == 1 for s in self.mesh.shape.values()))
+        _use_sdpa = self.attention_impl == "sdpa" or (
+            self.mesh is not None and all(s == 1 for s in self.mesh.shape.values())
         )
         if _use_sdpa and self.attention_impl != "sdpa":
             logger.warning(

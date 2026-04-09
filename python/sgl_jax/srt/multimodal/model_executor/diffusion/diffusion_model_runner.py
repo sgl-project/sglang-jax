@@ -84,9 +84,7 @@ class DiffusionModelRunner(BaseModelRunner):
         )
         self.model = self.model_loader.load_model(model_config=self.model_config)
         if self.scheduler == "FlowUniPCMultistepScheduler":
-            self.solver = FlowUniPCMultistepScheduler(
-                shift=self.model_config.flow_shift
-            )
+            self.solver = FlowUniPCMultistepScheduler(shift=self.model_config.flow_shift)
         elif self.scheduler == "FlowMatchEulerDiscreteScheduler":
             # FLUX uses dynamic shifting (no flow_shift needed)
             self.solver = FlowMatchEulerDiscreteScheduler(
@@ -205,14 +203,18 @@ class DiffusionModelRunner(BaseModelRunner):
         )
 
         # 3. Pack latents: [B, C//4, H', W'] -> [B, H'/2*W'/2, C]
-        latents = self._pack_latents_flux(latents, latents.shape[0], num_channels, height_latent, width_latent)
+        latents = self._pack_latents_flux(
+            latents, latents.shape[0], num_channels, height_latent, width_latent
+        )
 
         # 4. Prepare position IDs
         img_ids = self._prepare_latent_image_ids(batch.height, batch.width, vae_scale_factor)
         txt_ids = jnp.zeros((prompt_embeds.shape[1], 3))
 
         # 5. Compute mu for dynamic timestep shifting
-        image_seq_len = (batch.height // (vae_scale_factor * 2)) * (batch.width // (vae_scale_factor * 2))
+        image_seq_len = (batch.height // (vae_scale_factor * 2)) * (
+            batch.width // (vae_scale_factor * 2)
+        )
         mu = self.solver.calculate_mu(image_seq_len)
 
         # 6. Set timesteps with dynamic shifting (match GPU: sigmas = linspace(1, 1/N, N))
@@ -220,13 +222,17 @@ class DiffusionModelRunner(BaseModelRunner):
         self.solver.set_timesteps(sigmas=sigmas, mu=mu)
 
         # 7. Build guidance tensor (embedded_cfg_scale=3.5 for FLUX.1-dev)
-        embedded_cfg_scale = getattr(batch, 'guidance_scale', 3.5)
+        embedded_cfg_scale = getattr(batch, "guidance_scale", 3.5)
         guidance = jnp.full((latents.shape[0],), embedded_cfg_scale)
 
         # 8. Move to device
         latents = device_array(latents, sharding=NamedSharding(self.mesh, PartitionSpec()))
-        prompt_embeds = device_array(prompt_embeds, sharding=NamedSharding(self.mesh, PartitionSpec()))
-        pooled_projections = device_array(pooled_projections, sharding=NamedSharding(self.mesh, PartitionSpec()))
+        prompt_embeds = device_array(
+            prompt_embeds, sharding=NamedSharding(self.mesh, PartitionSpec())
+        )
+        pooled_projections = device_array(
+            pooled_projections, sharding=NamedSharding(self.mesh, PartitionSpec())
+        )
         img_ids = device_array(img_ids, sharding=NamedSharding(self.mesh, PartitionSpec()))
         txt_ids = device_array(txt_ids, sharding=NamedSharding(self.mesh, PartitionSpec()))
         guidance = device_array(guidance, sharding=NamedSharding(self.mesh, PartitionSpec()))
@@ -237,7 +243,9 @@ class DiffusionModelRunner(BaseModelRunner):
             if abort_checker is not None and abort_checker():
                 logger.info(
                     "Diffusion aborted at step %d/%d for rid=%s",
-                    step, num_inference_steps, batch.rid,
+                    step,
+                    num_inference_steps,
+                    batch.rid,
                 )
                 return True
 
@@ -301,13 +309,12 @@ class DiffusionModelRunner(BaseModelRunner):
             return embeds
 
         prompt_embeds = pad_to_512(prompt_embeds)
-        if do_classifier_free_guidance:
-            if batch.negative_prompt_embeds is not None:
-                neg_embeds = batch.negative_prompt_embeds
-                if neg_embeds.ndim == 2:
-                    neg_embeds = jnp.expand_dims(neg_embeds, axis=0)
-                neg_embeds = pad_to_512(neg_embeds)
-                prompt_embeds = jnp.concatenate([prompt_embeds, neg_embeds], axis=0)
+        if do_classifier_free_guidance and batch.negative_prompt_embeds is not None:
+            neg_embeds = batch.negative_prompt_embeds
+            if neg_embeds.ndim == 2:
+                neg_embeds = jnp.expand_dims(neg_embeds, axis=0)
+            neg_embeds = pad_to_512(neg_embeds)
+            prompt_embeds = jnp.concatenate([prompt_embeds, neg_embeds], axis=0)
 
         text_embeds = device_array(
             prompt_embeds, sharding=NamedSharding(self.mesh, PartitionSpec())
@@ -326,7 +333,9 @@ class DiffusionModelRunner(BaseModelRunner):
             if abort_checker is not None and abort_checker():
                 logger.info(
                     "Diffusion aborted at step %d/%d for rid=%s",
-                    step, num_inference_steps, batch.rid,
+                    step,
+                    num_inference_steps,
+                    batch.rid,
                 )
                 return True
 

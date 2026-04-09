@@ -105,9 +105,9 @@ class TimestepEmbedder(nnx.Module):
             t, self.frequency_embedding_size, self.max_period, dtype=self.freq_dtype
         ).astype(self.mlp.fc_in.weight.dtype)
         if timestep_seq_len is not None:
-            assert (
-                t_freq.shape[0] % timestep_seq_len == 0
-            ), "timestep length is not divisible by timestep_seq_len"
+            assert t_freq.shape[0] % timestep_seq_len == 0, (
+                "timestep length is not divisible by timestep_seq_len"
+            )
             batch_size = t_freq.shape[0] // timestep_seq_len
             t_freq = t_freq.reshape((batch_size, timestep_seq_len, -1))
         t_emb = self.mlp(t_freq)
@@ -224,6 +224,7 @@ def _apply_flux_rotary_emb(
         raise ValueError(f"`use_real_unbind_dim={use_real_unbind_dim}` but should be -1 or -2.")
 
     return (x.astype(jnp.float32) * cos + x_rotated.astype(jnp.float32) * sin).astype(x.dtype)
+
 
 class Timesteps(nnx.Module):
     def __init__(

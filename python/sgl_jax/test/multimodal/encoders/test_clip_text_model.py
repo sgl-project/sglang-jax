@@ -85,8 +85,26 @@ class TestCLIPTextModel(unittest.TestCase):
     def test_single_seq_without_attn_mask(self):
         """Mimics the real FLUX.1 calling path — expects perfect alignment."""
         input_ids = torch.tensor(
-            [[49406, 320, 2242, 1794, 2102, 22456, 49407, 49407, 49407, 49407,
-              49407, 49407, 49407, 49407, 49407, 49407]],
+            [
+                [
+                    49406,
+                    320,
+                    2242,
+                    1794,
+                    2102,
+                    22456,
+                    49407,
+                    49407,
+                    49407,
+                    49407,
+                    49407,
+                    49407,
+                    49407,
+                    49407,
+                    49407,
+                    49407,
+                ]
+            ],
             dtype=torch.long,
         )
 

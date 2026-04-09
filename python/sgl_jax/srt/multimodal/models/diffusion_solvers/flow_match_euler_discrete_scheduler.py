@@ -271,7 +271,6 @@ class FlowMatchEulerDiscreteScheduler:
         model_output: jax.Array,
         timestep: float | jax.Array,
         sample: jax.Array,
-
         noise: jax.Array | None = None,
         rng: jax.Array | None = None,
         per_token_timesteps: jax.Array | None = None,

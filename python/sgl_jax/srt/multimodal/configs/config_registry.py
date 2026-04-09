@@ -221,7 +221,7 @@ class DiffusionConfigRegistry:
         ("T2V-1.3B", lambda: WanModelConfig(flow_shift=3.0)),
         # Generic Wan2.1 fallback (default to 1.3B/480P)
         ("Wan2.1", lambda: WanModelConfig(flow_shift=3.0)),
-          # FLUX.1.dev
+        # FLUX.1.dev
         ("FLUX.1-dev", lambda: FluxModelConfig()),
     ]
 

@@ -55,7 +55,7 @@ class VaeModelRunner(BaseModelRunner):
 
         # Wan VAE (AutoencoderKLWan) returns plain jax.Array from encode/decode.
         # FLUX VAE (AutoencoderKL) returns wrapper objects that need unwrapping.
-        is_flux_vae = 'AutoencoderKLWan' not in self.model_class.__name__
+        is_flux_vae = "AutoencoderKLWan" not in self.model_class.__name__
 
         @partial(
             jax.jit,

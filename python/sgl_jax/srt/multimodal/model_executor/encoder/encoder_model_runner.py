@@ -112,9 +112,8 @@ class EncoderModelRunner(BaseModelRunner):
     def _initialize_jit(self, spec: _EncoderSpec):
         model_def, model_state = nnx.split(spec.model)
         model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
-        model_call = getattr(spec.model, "__call__")
+        model_call = spec.model.__call__
         parameters = inspect.signature(model_call).parameters
-        use_input_ids = "input_ids" in parameters
         use_output_hidden_states = "output_hidden_states" in parameters
         use_cache = "use_cache" in parameters
 
@@ -164,7 +163,6 @@ class EncoderModelRunner(BaseModelRunner):
 
         spec.jitted_forward = forward_wrapper
 
-    
     def forward(self, batch: Req) -> Req:
         all_indices = list(range(len(self.encoder_specs)))
         prompt_text = batch.prompt or batch.origin_input_text
@@ -244,7 +242,6 @@ class EncoderModelRunner(BaseModelRunner):
                 attn_masks_list.append(model_attention_mask)
 
         return embeds_list, attn_masks_list, pooler_embeds_list
-       
 
     def _assign_prompt_outputs(
         self,
@@ -281,7 +278,6 @@ class EncoderModelRunner(BaseModelRunner):
         if spec.jitted_forward is None:
             raise ValueError(f"Encoder model for {spec.model_class} has not been jitted.")
         return spec.jitted_forward(input_ids, attention_mask)
-
 
     def _postprocess_encoder_outputs(
         self,
@@ -320,7 +316,9 @@ class EncoderModelRunner(BaseModelRunner):
             raise ValueError("CLIP encoder output does not contain pooler_output.")
         return outputs["pooler_output"]
 
-    def _tokenize_text(self, spec: _EncoderSpec, text: str | list[str], encoder_idx: int = 0) -> dict[str, jax.Array]:
+    def _tokenize_text(
+        self, spec: _EncoderSpec, text: str | list[str], encoder_idx: int = 0
+    ) -> dict[str, jax.Array]:
         if spec.max_length is None:
             raise ValueError(f"Encoder max_length is not initialized for {spec.model_class}.")
 
@@ -423,8 +421,9 @@ class EncoderModelRunner(BaseModelRunner):
         # Models using relative position encodings (e.g. UMT5) may not expose
         # a sequence length. Fall back to 512 (matches diffusers default).
         import logging as _logging
+
         _logging.getLogger(__name__).warning(
-            f"Could not infer max_length for {spec.model_class}, defaulting to 512."
+            "Could not infer max_length for %s, defaulting to 512.", spec.model_class
         )
         return 512
 

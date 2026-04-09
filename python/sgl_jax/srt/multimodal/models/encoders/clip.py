@@ -349,8 +349,10 @@ class CLIPVisionTransformer(nnx.Module):
         B, L, _ = x.shape
         vision_attention_mask = jnp.ones((B, L), dtype=jnp.int32)
         encoder_outputs = self.encoder(
-            x, attention_mask=vision_attention_mask,
-            return_all_hidden_states=return_all, deterministic=deterministic,
+            x,
+            attention_mask=vision_attention_mask,
+            return_all_hidden_states=return_all,
+            deterministic=deterministic,
         )
 
         if not return_all:

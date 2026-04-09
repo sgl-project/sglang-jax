@@ -150,15 +150,28 @@ class VaeScheduler(SchedulerProfilerMixin):
 
     def _cleanup_jax_arrays(self, req: Req):
         for fn in [
-            "prompt_embeds", "negative_prompt_embeds",
-            "prompt_attention_mask", "negative_attention_mask",
-            "pooled_embeds", "neg_pooled_embeds",
-            "clip_embedding_pos", "clip_embedding_neg",
-            "image_embeds", "pixel_values", "preprocessed_image",
-            "pil_image", "vision_embeds", "input_embeds",
-            "noise_pred", "image_latent", "raw_latent_shape",
-            "timesteps", "timestep", "audio_features",
-            "pixel_values_images", "pixel_values_videos",
+            "prompt_embeds",
+            "negative_prompt_embeds",
+            "prompt_attention_mask",
+            "negative_attention_mask",
+            "pooled_embeds",
+            "neg_pooled_embeds",
+            "clip_embedding_pos",
+            "clip_embedding_neg",
+            "image_embeds",
+            "pixel_values",
+            "preprocessed_image",
+            "pil_image",
+            "vision_embeds",
+            "input_embeds",
+            "noise_pred",
+            "image_latent",
+            "raw_latent_shape",
+            "timesteps",
+            "timestep",
+            "audio_features",
+            "pixel_values_images",
+            "pixel_values_videos",
         ]:
             val = getattr(req, fn, None)
             if val is None:

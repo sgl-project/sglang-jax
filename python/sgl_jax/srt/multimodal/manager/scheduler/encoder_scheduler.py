@@ -1,9 +1,6 @@
 import logging
 import jax
 import jax.sharding
-import numpy as np
-from jax import NamedSharding
-from jax.sharding import PartitionSpec
 
 from sgl_jax.srt.managers.communication import CommunicationBackend
 from sgl_jax.srt.managers.io_struct import AbortReq, ProfileReq
@@ -23,7 +20,7 @@ class EncoderScheduler(SchedulerProfilerMixin):
         communication_backend: CommunicationBackend,
         model_class: str | list[str] = None,
         stage_sub_dir: str | None = None,
-        **kwargs
+        **kwargs,
     ):
         """Initialize the EncoderScheduler.
 
@@ -38,20 +35,23 @@ class EncoderScheduler(SchedulerProfilerMixin):
         self.communication_backend = communication_backend
         self.mesh = mesh
         self.encoder_worker = EncoderModelWorker(
-            server_args, mesh=mesh, model_class=model_class, stage_sub_dir=stage_sub_dir, tokenizer=kwargs.get("tokenizers", "tokenizer")
+            server_args,
+            mesh=mesh,
+            model_class=model_class,
+            stage_sub_dir=stage_sub_dir,
+            tokenizer=kwargs.get("tokenizers", "tokenizer"),
         )
         self.forward_ct = 0
         self.init_profier()
 
         if not server_args.disable_precompile:
-            logger.info('[Encoder Scheduler] Begins to run encoder worker precompile.')
+            logger.info("[Encoder Scheduler] Begins to run encoder worker precompile.")
             self.encoder_worker.run_precompile()
-            logger.info('[Encoder Scheduler] Completes encoder worker precompile.')
+            logger.info("[Encoder Scheduler] Completes encoder worker precompile.")
         # Track aborted request IDs to skip processing
         self.aborted_rids: set[str] = set()
         # Current request being processed (for abort checking during steps)
         self._current_rid: str | None = None
-
 
     def event_loop_normal(self):
         """Blocking event loop for processing incoming encoder requests.
@@ -75,13 +75,11 @@ class EncoderScheduler(SchedulerProfilerMixin):
                     elif isinstance(req, Req):
                         # Check if this request was aborted
                         if req.rid in self.aborted_rids:
-                            logger.info(
-                                "EncoderScheduler skipping aborted request rid=%s", req.rid
-                            )
+                            logger.info("EncoderScheduler skipping aborted request rid=%s", req.rid)
                             self.aborted_rids.discard(req.rid)
                             continue
                         req = self.encoder_worker.forward(req)
-                
+
                         self.forward_ct += 1
                         self._profile_batch_predicate(None)
                         self.communication_backend.send_pyobj(req)
