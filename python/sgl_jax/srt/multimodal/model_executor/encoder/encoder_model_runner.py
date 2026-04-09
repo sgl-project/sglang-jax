@@ -235,11 +235,14 @@ class EncoderModelRunner(BaseModelRunner):
             )
             if processed_output is None:
                 continue
+            # Move outputs to host (NumPy) so downstream stages and
+            # serialization (ZMQ send_pyobj) do not depend on device arrays.
+            host_output = jax.device_get(processed_output)
             if output_kind == "pooler":
-                pooler_embeds_list.append(processed_output)
+                pooler_embeds_list.append(host_output)
             else:
-                embeds_list.append(processed_output)
-                attn_masks_list.append(model_attention_mask)
+                embeds_list.append(host_output)
+                attn_masks_list.append(jax.device_get(model_attention_mask))
 
         return embeds_list, attn_masks_list, pooler_embeds_list
 

@@ -148,45 +148,6 @@ class VaeScheduler(SchedulerProfilerMixin):
             constant_values=0,
         )
 
-    def _cleanup_jax_arrays(self, req: Req):
-        for fn in [
-            "prompt_embeds",
-            "negative_prompt_embeds",
-            "prompt_attention_mask",
-            "negative_attention_mask",
-            "pooled_embeds",
-            "neg_pooled_embeds",
-            "clip_embedding_pos",
-            "clip_embedding_neg",
-            "image_embeds",
-            "pixel_values",
-            "preprocessed_image",
-            "pil_image",
-            "vision_embeds",
-            "input_embeds",
-            "noise_pred",
-            "image_latent",
-            "raw_latent_shape",
-            "timesteps",
-            "timestep",
-            "audio_features",
-            "pixel_values_images",
-            "pixel_values_videos",
-        ]:
-            val = getattr(req, fn, None)
-            if val is None:
-                continue
-            if isinstance(val, list):
-                converted = []
-                for v in val:
-                    if hasattr(v, "device"):
-                        converted.append(np.asarray(v))
-                    else:
-                        converted.append(v)
-                setattr(req, fn, converted)
-            elif hasattr(val, "device"):
-                setattr(req, fn, np.asarray(val))
-
     def run_vae_batch(self, batch: list[Req]):
         """Run the VAE forward pass for a batch of requests.
 
@@ -207,5 +168,4 @@ class VaeScheduler(SchedulerProfilerMixin):
             req.latents = None
             self.forward_ct += 1
             self._profile_batch_predicate(None)
-            self._cleanup_jax_arrays(req)
             self._comm_backend.send_pyobj(req)
