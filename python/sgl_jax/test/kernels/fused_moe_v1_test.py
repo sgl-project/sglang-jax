@@ -542,12 +542,8 @@ class MoEKernelTest(jtu.JaxTestCase):
         w_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2, jnp.float4_e2m1fn],
     )
     def test_sub_channel_quantization(self, w_dtype):
-        if w_dtype in (
-            jnp.float8_e4m3fn,
-            jnp.float8_e5m2,
-            jnp.float4_e2m1fn,
-        ) and not jtu.is_device_tpu_at_least(version=7):
-            self.skipTest("Expect TPUv7+")
+        if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("float4 requires TPUv7+")
         dtype = jnp.bfloat16
         top_k = 8
         num_experts = 128
@@ -587,12 +583,8 @@ class MoEKernelTest(jtu.JaxTestCase):
         With bd1c=1024 and subc_quant_wsz=256, n_sg = 1024/2/256 = 2.
         With bfc=1024 and subc_quant_wsz=256, n_sg2 = 1024/256 = 4.
         """
-        if w_dtype in (
-            jnp.float8_e4m3fn,
-            jnp.float8_e5m2,
-            jnp.float4_e2m1fn,
-        ) and not jtu.is_device_tpu_at_least(version=7):
-            self.skipTest("Expect TPUv7+")
+        if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("float4 requires TPUv7+")
         dtype = jnp.bfloat16
         top_k = 8
         num_experts = 128
@@ -630,12 +622,8 @@ class MoEKernelTest(jtu.JaxTestCase):
         With bd1c=512 and subc_quant_wsz=128, n_sg = 512/2/128 = 2.
         With bfc=256 and subc_quant_wsz=128, n_sg2 = 256/128 = 2.
         """
-        if w_dtype in (
-            jnp.float8_e4m3fn,
-            jnp.float8_e5m2,
-            jnp.float4_e2m1fn,
-        ) and not jtu.is_device_tpu_at_least(version=7):
-            self.skipTest("Expect TPUv7+")
+        if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("float4 requires TPUv7+")
         dtype = jnp.bfloat16
         top_k = 8
         num_experts = 128
@@ -673,12 +661,8 @@ class MoEKernelTest(jtu.JaxTestCase):
         With bd1c=1024 and subc_quant_wsz=128, n_sg = 1024/2/128 = 4.
         With bfc=1024 and subc_quant_wsz=128, n_sg2 = 1024/128 = 8.
         """
-        if w_dtype in (
-            jnp.float8_e4m3fn,
-            jnp.float8_e5m2,
-            jnp.float4_e2m1fn,
-        ) and not jtu.is_device_tpu_at_least(version=7):
-            self.skipTest("Expect TPUv7+")
+        if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("float4 requires TPUv7+")
         dtype = jnp.bfloat16
         top_k = 8
         num_experts = 128
@@ -716,12 +700,8 @@ class MoEKernelTest(jtu.JaxTestCase):
         Scale shape is (E, K//128, N//128, 1) instead of (E, K//128, 1, N).
         Each (128, 128) sub-matrix shares one scalar scale.
         """
-        if w_dtype in (
-            jnp.float8_e4m3fn,
-            jnp.float8_e5m2,
-            jnp.float4_e2m1fn,
-        ) and not jtu.is_device_tpu_at_least(version=7):
-            self.skipTest("Expect TPUv7+")
+        if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("float4 requires TPUv7+")
         dtype = jnp.bfloat16
         top_k = 8
         num_experts = 128
@@ -761,12 +741,8 @@ class MoEKernelTest(jtu.JaxTestCase):
         With bfc=1024 and subc_quant_wsz=128, n_sg2 = 1024/128 = 8.
         N-dim block_n=128: bfc//block_n = 1024//128 = 8 groups per tile.
         """
-        if w_dtype in (
-            jnp.float8_e4m3fn,
-            jnp.float8_e5m2,
-            jnp.float4_e2m1fn,
-        ) and not jtu.is_device_tpu_at_least(version=7):
-            self.skipTest("Expect TPUv7+")
+        if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("float4 requires TPUv7+")
         dtype = jnp.bfloat16
         top_k = 8
         num_experts = 128
@@ -800,12 +776,8 @@ class MoEKernelTest(jtu.JaxTestCase):
         w_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2, jnp.float4_e2m1fn],
     )
     def test_shared_expert_quantized(self, w_dtype):
-        if w_dtype in (
-            jnp.float8_e4m3fn,
-            jnp.float8_e5m2,
-            jnp.float4_e2m1fn,
-        ) and not jtu.is_device_tpu_at_least(version=7):
-            self.skipTest("Expect TPUv7+")
+        if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("float4 requires TPUv7+")
         dtype = jnp.bfloat16
         top_k = 8
         num_experts = 128
