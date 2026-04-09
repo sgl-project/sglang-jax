@@ -144,7 +144,7 @@ class FlashAttention(AttentionBackend):
             rank_selected_locs = rank_cache_loc[:: self.page_size]
 
             # 4. Convert: Physical slot -> Physical page index
-            rank_page_indices = (rank_selected_locs // self.page_size)
+            rank_page_indices = rank_selected_locs // self.page_size
             page_indices_list.append(rank_page_indices)
         # 5. Merge: Concatenate all ranks
         page_indices = np.concatenate(page_indices_list)
@@ -168,7 +168,7 @@ class FlashAttention(AttentionBackend):
                     )
 
                 rank_swa_selected = rank_swa_cache_loc[:: self.page_size]
-                rank_swa_page_indices = (rank_swa_selected // self.page_size)
+                rank_swa_page_indices = rank_swa_selected // self.page_size
                 swa_page_indices_list.append(rank_swa_page_indices)
 
             swa_page_indices = np.concatenate(swa_page_indices_list)
@@ -545,15 +545,6 @@ class FlashAttention(AttentionBackend):
             else layer.scaling
         )
 
-        # Prepare fused KV cache for paged format: [num_pages, page_size, num_kv_heads * 2, head_dim]
-        total_tokens = kv_cache_fused.shape[0]
-        num_pages = total_tokens // self.page_size
-
-        aligned_head_dim = (self.head_dim + 127) // 128 * 128
-
-        kv_cache_fused_paged = kv_cache_fused.reshape(
-            num_pages, self.page_size, -1, aligned_head_dim
-        )
         if self.forward_metadata.custom_mask is not None:
             causal = 0
         # Select page indices and remap to SWA pool if KV cache supports it
@@ -569,7 +560,7 @@ class FlashAttention(AttentionBackend):
             P(self.attention_data_partition_axis, self.kv_partition_axis),  # keys (new tokens)
             P(self.attention_data_partition_axis, self.kv_partition_axis),  # values (new tokens)
             P(
-                self.attention_data_partition_axis, None, self.kv_partition_axis, None
+                self.attention_data_partition_axis, None, self.kv_partition_axis, None, None
             ),  # kv_cache_fused (head interleaved)
             P(self.attention_data_partition_axis),  # kv_lens
             P(self.attention_data_partition_axis),  # page_indices
@@ -585,7 +576,7 @@ class FlashAttention(AttentionBackend):
         out_specs = (
             P(self.attention_data_partition_axis, self.kv_partition_axis),  # attention output
             P(
-                self.attention_data_partition_axis, self.kv_partition_axis, None
+                self.attention_data_partition_axis, None, self.kv_partition_axis, None, None
             ),  # updated kv_cache_fused (head interleaved) - 3D: [total_tokens, num_kv_heads*2, head_dim]
         )
 
@@ -624,7 +615,7 @@ class FlashAttention(AttentionBackend):
             q.reshape(q.shape[0], -1, self.head_dim),
             k.reshape(k.shape[0], -1, self.head_dim),
             v.reshape(v.shape[0], -1, self.head_dim),
-            kv_cache_fused_paged,
+            kv_cache_fused,
             self.forward_metadata.seq_lens,
             page_indices_arg,
             self.forward_metadata.cu_q_lens,
@@ -633,14 +624,6 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.custom_mask,
             attention_sink,
         )
-
-        pad_width = (self.head_dim + 127) // 128 * 128 - self.head_dim
-        if pad_width > 0:
-            updated_kv_cache_fused = jnp.pad(
-                updated_kv_cache_fused,
-                ((0, 0), (0, 0), (0, pad_width)),
-                mode="constant",
-            )
 
         return (
             attn_output.reshape(q.shape[0], -1),
