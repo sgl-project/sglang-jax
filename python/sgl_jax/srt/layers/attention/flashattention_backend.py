@@ -474,7 +474,9 @@ class FlashAttention(AttentionBackend):
             P(),  # cu_kv_lens
             P(),  # distribution
             P(),  # custom_mask
-            P(),  # attention sink
+            (
+                P(self.kv_partition_axis) if attention_sink is not None else P()
+            ),  # attention sink: (num_q_heads,), sharded by heads
         )
 
         out_specs = (
