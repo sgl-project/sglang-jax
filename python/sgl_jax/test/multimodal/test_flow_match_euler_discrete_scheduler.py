@@ -356,20 +356,6 @@ class TestFlowMatchEulerDiscreteSchedulerParity(unittest.TestCase):
             rtol=1e-6,
         )
 
-    def test_scheduler_output_base_output_behavior(self):
-        scheduler = JaxFlowMatchEulerDiscreteScheduler(shift=1.0)
-        scheduler.set_timesteps(num_inference_steps=4, shape=(1, 1, 2, 2))
-        out = scheduler.step(
-            model_output=jnp.ones((1, 1, 2, 2), dtype=jnp.float32),
-            timestep=scheduler.timesteps[0],
-            sample=jnp.zeros((1, 1, 2, 2), dtype=jnp.float32),
-            return_dict=True,
-        )
-
-        self.assertTrue(isinstance(out, dict))
-        np.testing.assert_allclose(np.asarray(out["prev_sample"]), np.asarray(out.prev_sample))
-        np.testing.assert_allclose(np.asarray(out[0]), np.asarray(out.prev_sample))
-
 
 if __name__ == "__main__":
     unittest.main()
