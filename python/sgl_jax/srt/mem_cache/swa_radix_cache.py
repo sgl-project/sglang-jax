@@ -264,10 +264,10 @@ class LRUList:
                 x_lru = getattr(x, self.prv)
 
             if self.swa:
-                evictable_size = tree_cache.swa_evictable_size()
+                evictable_size = sum(tree_cache.swa_evictable_size_.values())
                 lru_list_evictable_size = tree_cache.swa_lru_list_evictable_size()
             else:
-                evictable_size = tree_cache.full_evictable_size()
+                evictable_size = sum(tree_cache.full_evictable_size_.values())
                 lru_list_evictable_size = tree_cache.full_lru_list_evictable_size()
 
             assert (

@@ -512,7 +512,13 @@ class ModelRunner(BaseModelRunner):
 
         # Create KV cache pool
         if self.is_hybrid:
-            self.token_to_kv_pool = SWAKVPool(  # TODO @Brian dp in swa
+            # SWA layers may have different KV head count
+            swa_head_num = None
+            hf_cfg = self.model_config.hf_text_config
+            if hasattr(hf_cfg, "swa_num_key_value_heads"):
+                swa_head_num = hf_cfg.swa_num_key_value_heads
+
+            self.token_to_kv_pool = SWAKVPool(
                 size=self.full_max_total_num_tokens,
                 size_swa=self.swa_max_total_num_tokens,
                 swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
@@ -521,8 +527,10 @@ class ModelRunner(BaseModelRunner):
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(
                     self.attention_tp_size
                 ),
+                swa_head_num=swa_head_num,
                 head_dim=(self.model_config.head_dim + 127) // 128 * 128,
                 mesh=self.mesh,
+                dp_size=dp_size,
             )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
@@ -768,6 +776,7 @@ class ModelRunner(BaseModelRunner):
         # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
         # - Find total # of tokens available across layers.
         # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
+        # - Account for SWA layers potentially having different KV head count.
         total_tokens = self.max_total_num_tokens * self.model_config.num_hidden_layers
         full_layers_num = len(full_attention_layer_ids)
         swa_layers_num = len(swa_attention_layer_ids)
@@ -779,6 +788,13 @@ class ModelRunner(BaseModelRunner):
         denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
         self.full_max_total_num_tokens = int(total_tokens / denominator)
         self.swa_max_total_num_tokens = int(self.full_max_total_num_tokens * swa_full_tokens_ratio)
+
+        # Align to dp_size so KV cache buffers can be evenly sharded
+        dp = self.dp_size
+        if dp > 1:
+            self.full_max_total_num_tokens = (self.full_max_total_num_tokens // dp) * dp
+            self.swa_max_total_num_tokens = (self.swa_max_total_num_tokens // dp) * dp
+
         self.max_total_num_tokens = self.full_max_total_num_tokens
 
         logger.info(

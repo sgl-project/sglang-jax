@@ -254,7 +254,10 @@ class Scheduler(
 
         # init distribution
         if self.nnodes > 1:
-            jax.distributed.initialize(server_args.dist_init_addr, self.nnodes, self.node_rank)
+            if not jax.distributed.is_initialized():
+                jax.distributed.initialize(server_args.dist_init_addr, self.nnodes, self.node_rank)
+            else:
+                logger.info("JAX distributed already initialized, skipping re-initialization")
 
         platform = os.getenv("JAX_PLATFORMS", None)
         if platform == "proxy":

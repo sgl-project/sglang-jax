@@ -183,9 +183,16 @@ class ModelWorker:
 
         assert self.max_running_requests > 0, "max_running_request is zero"
 
+        # A single request lives on one DP rank, so max_req_len is bounded
+        # by per-rank pool size, not the global (dp-scaled) pool size.
+        per_rank_tokens = (
+            self.max_total_num_tokens // self.dp_size
+            if self.dp_size > 1
+            else self.max_total_num_tokens
+        )
         self.max_req_len = min(
             self.model_config.context_len - 1,
-            self.max_total_num_tokens - 1,
+            per_rank_tokens - 1,
         )
         self.max_req_input_len = self.max_req_len - 5
         assert self.max_req_len > 0 and self.max_req_input_len > 0, "Memory pool size is too small"
@@ -760,9 +767,13 @@ class MockModelWorker:
             self.model_runner.req_to_token_pool.size,
         )
         assert self.max_running_requests > 0, "max_running_request is zero"
+        dp_size = server_args.dp_size
+        per_rank_tokens = (
+            self.max_total_num_tokens // dp_size if dp_size > 1 else self.max_total_num_tokens
+        )
         self.max_req_len = min(
             self.model_config.context_len - 1,
-            self.max_total_num_tokens - 1,
+            per_rank_tokens - 1,
         )
         self.max_req_input_len = self.max_req_len - 5
         assert self.max_req_len > 0 and self.max_req_input_len > 0, "Memory pool size is too small"

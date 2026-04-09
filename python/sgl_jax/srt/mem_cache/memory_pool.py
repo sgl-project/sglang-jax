@@ -267,7 +267,9 @@ class MHATokenToKVPool(KVCache):
             **parent_aux_data,
             "head_num": self.head_num,
             "head_dim": self.head_dim,
+            "dp_size": self.dp_size,
             "kv_partition_axis": self.kv_partition_axis,
+            "attention_data_partition_axis": self.attention_data_partition_axis,
             "kv_sharding": self.kv_sharding,
         }
         return (children, aux_data)
@@ -294,7 +296,9 @@ class MHATokenToKVPool(KVCache):
 
         obj.head_num = aux_data["head_num"]
         obj.head_dim = aux_data["head_dim"]
+        obj.dp_size = aux_data.get("dp_size", 1)
         obj.kv_partition_axis = aux_data["kv_partition_axis"]
+        obj.attention_data_partition_axis = aux_data.get("attention_data_partition_axis", "data")
         obj.kv_sharding = aux_data["kv_sharding"]
 
         obj.kv_buffer = kv_buffer
@@ -490,6 +494,7 @@ class SWAKVPool(KVCache):
         swa_attention_layer_ids: list[int],
         full_attention_layer_ids: list[int],
         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        swa_head_num: int | None = None,
         **kwargs,
     ):
         self.size = size
@@ -500,10 +505,15 @@ class SWAKVPool(KVCache):
         self.kv_partition_axis = "tensor"
         kwargs["page_size"] = 1
 
+        # SWA layers may have different KV head count than full-attention layers
+        swa_kwargs = kwargs
+        if swa_head_num is not None:
+            swa_kwargs = {**kwargs, "head_num": swa_head_num}
+
         self.swa_kv_pool = token_to_kv_pool_class(
             size=size_swa,
             layer_num=self.swa_layer_nums,
-            **kwargs,
+            **swa_kwargs,
         )
         self.full_kv_pool = token_to_kv_pool_class(
             size=size,
@@ -576,6 +586,44 @@ class SWAKVPool(KVCache):
             return self.swa_kv_pool.get_fused_kv_buffer(layer_id_pool)
         return self.full_kv_pool.get_fused_kv_buffer(layer_id_pool)
 
+    def _remap_loc_swa(self, loc: jax.Array) -> jax.Array:
+        """Remap full-attention cache indices to SWA cache indices, per DP rank.
+
+        full_to_swa_index_mapping is a list of dp_size numpy arrays, each
+        mapping local full-attention indices to local SWA indices for one rank.
+        We use shard_map so each DP rank applies its own mapping.
+        """
+        if self.full_to_swa_index_mapping is None:
+            return loc
+
+        dp_size = self.swa_kv_pool.dp_size
+
+        if dp_size <= 1:
+            # Single DP rank: direct 1D gather
+            mapping = jnp.asarray(self.full_to_swa_index_mapping[0], dtype=jnp.int32)
+            return mapping[loc]
+
+        # Multi-DP: stack per-rank mappings → [dp_size, size_per_rank + 1]
+        mesh = self.swa_kv_pool.mesh
+        data_axis = self.swa_kv_pool.attention_data_partition_axis
+
+        mapping_stacked = jnp.stack(
+            [jnp.asarray(m, dtype=jnp.int32) for m in self.full_to_swa_index_mapping]
+        )
+
+        @jax.shard_map(
+            mesh=mesh,
+            in_specs=(P(data_axis, None), P(data_axis)),
+            out_specs=P(data_axis),
+            check_vma=False,
+        )
+        def _remap(local_mapping, local_loc):
+            # local_mapping: [1, size_per_rank + 1] (one rank's mapping)
+            # local_loc: [tokens_per_rank]
+            return local_mapping[0, local_loc].astype(jnp.int32)
+
+        return _remap(mapping_stacked, loc)
+
     def set_kv_buffer(
         self,
         layer_id: int,
@@ -586,8 +634,7 @@ class SWAKVPool(KVCache):
     ):
         layer_id_pool, is_swa = self.layers_mapping[layer_id]
         if is_swa:
-            if self.full_to_swa_index_mapping is not None:
-                loc = self.full_to_swa_index_mapping[loc].astype(jnp.int32)
+            loc = self._remap_loc_swa(loc)
             self.swa_kv_pool.set_kv_buffer(layer_id_pool, loc, cache_k, cache_v, is_decode)
         else:
             self.full_kv_pool.set_kv_buffer(layer_id_pool, loc, cache_k, cache_v, is_decode)
@@ -622,12 +669,7 @@ class SWAKVPool(KVCache):
         _, is_swa = self.layers_mapping[layer_id]
         if not is_swa:
             return loc
-        if self.full_to_swa_index_mapping is None:
-            # No mapping available yet; return as-is to avoid crash. Caller may handle.
-            return loc
-        # Convert host mapping to jax array and gather
-        mapping_jax = jnp.asarray(self.full_to_swa_index_mapping, dtype=jnp.int32)
-        return mapping_jax[loc]
+        return self._remap_loc_swa(loc)
 
 
 def _set_fused_kv_buffer(
