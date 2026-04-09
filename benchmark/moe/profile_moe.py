@@ -19,8 +19,8 @@ from benchmark.moe.utils import (
     build_mesh,
     prepare_fused_moe_inputs,
 )
+from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.layers.moe import FusedEPMoE, TopK
-from sgl_jax.srt.utils.quantization.quantization_config import QuantizationConfig
 
 NUM_EXPERTS = 256
 TOP_K = 8
