@@ -30,15 +30,16 @@ PROFILE_DIR = os.environ.get("PROFILE_DIR", "/gcs/moe_profiles")
 
 # (tag, ep_size, num_tokens, weight_dtype, subc_quant_wsz, quant_block_n)
 PROFILE_CASES = [
-    # bf16 baseline
-    ("fused_bf16", 16, 128, None, None, None),
-    ("fused_bf16", 16, 4096, None, None, None),
-    # FP8 sub-channel (wsz=128)
-    ("fused_fp8_subchan128", 16, 128, jnp.float8_e4m3fn, 128, None),
-    ("fused_fp8_subchan128", 16, 4096, jnp.float8_e4m3fn, 128, None),
-    # FP8 2D block-wise (block_k=128, block_n=128)
-    ("fused_fp8_block128", 16, 128, jnp.float8_e4m3fn, 128, 128),
-    ("fused_fp8_block128", 16, 4096, jnp.float8_e4m3fn, 128, 128),
+    # FP8 sub-channel wsz=256 (default) vs wsz=128
+    ("fused_fp8_subchan256", 16, 64, jnp.float8_e4m3fn, 256, None),
+    ("fused_fp8_subchan256", 16, 128, jnp.float8_e4m3fn, 256, None),
+    ("fused_fp8_subchan256", 16, 4096, jnp.float8_e4m3fn, 256, None),
+    ("fused_fp8_subchan256", 16, 8192, jnp.float8_e4m3fn, 256, None),
+    # FP8 2D block-wise (block_k=256, block_n=128)
+    ("fused_fp8_block256", 16, 64, jnp.float8_e4m3fn, 256, 128),
+    ("fused_fp8_block256", 16, 128, jnp.float8_e4m3fn, 256, 128),
+    ("fused_fp8_block256", 16, 4096, jnp.float8_e4m3fn, 256, 128),
+    ("fused_fp8_block256", 16, 8192, jnp.float8_e4m3fn, 256, 128),
 ]
 
 
