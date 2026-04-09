@@ -519,7 +519,6 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         # Q/K head_dim padding (192→256) is handled by the kernel internally.
         if self._is_static_quant:
             self._dequantize_fp8_to_bf16()
-            self._fix_fused_moe_scales()
 
     @staticmethod
     def _warmup_safetensors_cache(model_config: ModelConfig):
@@ -772,41 +771,6 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         # uses head_dim (Q/K) for shape matching, so it misses v_proj when
         # v_head_dim != head_dim. Replicate kv_heads here.
         self._ensure_kv_head_replication()
-
-    def _fix_fused_moe_scales(self):
-        """Fix FusedEPMoE scale shapes after loading from pre-quantized checkpoint.
-
-        HF checkpoint stores MoE scales as (E, N_groups, K_groups), but the
-        fused kernel expects (E, K_groups, N_groups, 1). Transforms in-place.
-
-        Scales are loaded under an 'expert' mesh by the MoE weight loader,
-        so we transpose under the source mesh, then reshard to the model mesh.
-        """
-        from jax.sharding import NamedSharding
-
-        from sgl_jax.srt.layers.fused_moe import FusedEPMoE
-
-        target_sharding = NamedSharding(self.mesh, P(("data", "tensor"), None, None, None))
-
-        for layer in self.model.layers:
-            if not (hasattr(layer, "mlp") and hasattr(layer.mlp, "experts")):
-                continue
-            experts = layer.mlp.experts
-            if not isinstance(experts, FusedEPMoE) or experts.quant_block_n is None:
-                continue
-            for attr in ("w1_scale", "w3_scale", "w2_scale"):
-                scale_param = getattr(experts, attr, None)
-                if scale_param is None or not isinstance(scale_param, nnx.Param):
-                    continue
-                s = scale_param.value
-                if s.ndim == 3:
-                    # Transpose under the array's source mesh (expert axis)
-                    with jax.set_mesh(s.sharding.mesh):
-                        fixed = jnp.transpose(s, (0, 2, 1))[..., None]
-                    # Reshard to model mesh (data, tensor)
-                    fixed = jax.device_put(fixed, target_sharding)
-                    scale_param.value = fixed
-            logger.info("Fixed FusedEPMoE scales for layer %d", layer.layer_id)
 
     def _ensure_kv_head_replication(self):
         """Replicate KV heads for TP alignment when the weight loader missed them.
