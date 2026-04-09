@@ -185,8 +185,16 @@ class FusedEPMoE(nnx.Module):
         self.w3_shared_scale = None
         self.w2_shared_scale = None
 
-        self.subc_quant_wsz = None  # Use default sub channel quantization block size
-        self.quant_block_n = None  # N-dim block size for 2D block-wise quantization
+        # Read block-wise quantization settings from config.
+        weight_block_size = (
+            getattr(quantization_config, "weight_block_size", None) if quantization_config else None
+        )
+        if weight_block_size is not None and len(weight_block_size) == 2:
+            self.subc_quant_wsz = int(weight_block_size[1])  # block_k
+            self.quant_block_n = int(weight_block_size[0])  # block_n
+        else:
+            self.subc_quant_wsz = None
+            self.quant_block_n = None
 
     def quantize_weights(self, is_static: bool = False):
         """Quantize MoE weights in-place. Call once after model loading."""
@@ -455,6 +463,7 @@ class FusedEPMoE(nnx.Module):
             disable_sync_barrier=self.disable_sync_barrier,
             # Optional parameters (not used in basic case)
             subc_quant_wsz=subc_quant_wsz,
+            subc_quant_n_wsz=self.quant_block_n,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w3_scale=w3_scale,

@@ -11,6 +11,7 @@ from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
+from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -96,28 +97,50 @@ class MiMoV2Moe(nnx.Module):
         else:
             self.correction_bias = None
 
+        self.moe_backend = getattr(config, "moe_backend", "epmoe")
+        self.use_fused = self.moe_backend == "fused"
+
         self.topk = TopK(
             topk=num_experts_per_tok,
             renormalize=getattr(config, "norm_topk_prob", True),
         )
 
-        self.experts = EPMoE(
-            hidden_size=config.hidden_size,
-            num_experts=num_experts,
-            num_experts_per_tok=num_experts_per_tok,
-            intermediate_dim=moe_intermediate_size,
-            mesh=mesh,
-            ep_size=config.ep_size,
-            weight_dtype=dtype,
-            dtype=dtype,
-            layer_id=layer_id,
-            quantization_config=getattr(config, "quantization_config", None),
-        )
+        if self.use_fused:
+            self.experts = FusedEPMoE(
+                hidden_size=config.hidden_size,
+                num_experts=num_experts,
+                num_experts_per_tok=num_experts_per_tok,
+                intermediate_dim=moe_intermediate_size,
+                mesh=mesh,
+                activation="silu",
+                ep_size=config.ep_size,
+                weight_dtype=dtype,
+                dtype=dtype,
+                layer_id=layer_id,
+                renormalize_topk_logits=getattr(config, "norm_topk_prob", True),
+                quantization_config=getattr(config, "quantization_config", None),
+            )
+        else:
+            self.experts = EPMoE(
+                hidden_size=config.hidden_size,
+                num_experts=num_experts,
+                num_experts_per_tok=num_experts_per_tok,
+                intermediate_dim=moe_intermediate_size,
+                mesh=mesh,
+                ep_size=config.ep_size,
+                weight_dtype=dtype,
+                dtype=dtype,
+                layer_id=layer_id,
+                quantization_config=getattr(config, "quantization_config", None),
+            )
 
     def __call__(self, hidden_states: jax.Array, forward_batch: ForwardBatch):
         router_logits = self.moe_gate(hidden_states)
         correction_bias = self.correction_bias.value if self.correction_bias is not None else None
         topk_weights, topk_ids = self.topk(router_logits, correction_bias=correction_bias)
+        if self.use_fused:
+            token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+            topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
         mlp_output = self.experts(hidden_states, topk_weights, topk_ids)
         return mlp_output, topk_ids
 
