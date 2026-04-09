@@ -53,6 +53,10 @@ class VaeModelRunner(BaseModelRunner):
         model_def, model_state = nnx.split(self.model)
         model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
 
+        # Wan VAE (AutoencoderKLWan) returns plain jax.Array from encode/decode.
+        # FLUX VAE (AutoencoderKL) returns wrapper objects that need unwrapping.
+        is_flux_vae = 'AutoencoderKLWan' not in self.model_class.__name__
+
         @partial(
             jax.jit,
             static_argnames=["model_state_def"],
@@ -68,7 +72,12 @@ class VaeModelRunner(BaseModelRunner):
             # Return plain array for JIT compatibility.
             # Use .mode() (distribution mean) instead of .sample() for
             # deterministic encoding during inference.
-            return model.encode(x).latent_dist.mode()
+            # Wan VAE returns plain jax.Array; FLUX returns AutoencoderKLOutput.
+            # Use return_dict=False for FLUX (returns tuple), direct call for Wan.
+            if is_flux_vae:
+                return model.encode(x, return_dict=False)[0].mode()
+            else:
+                return model.encode(x)
 
         @partial(
             jax.jit,
@@ -83,7 +92,12 @@ class VaeModelRunner(BaseModelRunner):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             # Return plain array for JIT compatibility (DecoderOutput is not a JAX type)
-            return model.decode(x).sample
+            # Wan VAE returns plain jax.Array; FLUX returns DecoderOutput.
+            # Use return_dict=False for FLUX (returns tuple), direct call for Wan.
+            if is_flux_vae:
+                return model.decode(x, return_dict=False)[0]
+            else:
+                return model.decode(x)
 
         def encode_wrapper(x: jax.Array):
             return encode(model_def, model_state_def, model_state_leaves, x)

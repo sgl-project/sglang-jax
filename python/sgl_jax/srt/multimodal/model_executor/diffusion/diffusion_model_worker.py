@@ -92,9 +92,13 @@ class DiffusionModelWorker:
                     pbar.set_postfix(wh=wh, t=t)
                     embeds = np.random.random((2, 512, self.model_config.text_dim))
                     embeds = device_array(embeds, sharding=NamedSharding(self.mesh, P()))
+                    # FLUX needs pooled_embeds for CLIP pooled projections
+                    pooled = np.random.random((1, 768)).astype(np.float32)
+                    pooled = device_array(pooled, sharding=NamedSharding(self.mesh, P()))
                     req = Req(
                         prompt_embeds=embeds[0],
                         negative_prompt_embeds=embeds[1],
+                        pooled_embeds=[pooled],
                         do_classifier_free_guidance=True,
                         width=width,
                         height=height,

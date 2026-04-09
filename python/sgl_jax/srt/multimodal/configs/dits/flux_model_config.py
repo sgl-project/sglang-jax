@@ -24,6 +24,10 @@ class FluxModelConfig(MultiModalModelConfigs):
     epsilon: float = 1e-6
     attention_impl: str = "usp"
 
+    # Required by diffusion precompile (shared interface with WanModelConfig)
+    scale_factor_spatial: int = 8
+    text_dim: int = 4096
+
     weights_dtype: jnp.dtype = jnp.bfloat16
     dtype: jnp.dtype = jnp.bfloat16
     precision: Precision = Precision.HIGHEST
