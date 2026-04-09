@@ -401,27 +401,6 @@ class FusedEPMoE(nnx.Module):
                     out_sharding=P(None, None, None),
                 )
 
-    def fix_loaded_scales(self):
-        """Fix MoE scales loaded from pre-quantized checkpoint.
-
-        HF checkpoint stores scales as (E, N_groups, K_groups) but the fused
-        kernel expects (E, K_groups, N_groups, 1). Call once after weight loading.
-        """
-        if self.quant_block_n is None:
-            return
-
-        ep_scale_sharding = P(("data", "tensor"), None, None, None)
-
-        for attr in ("w1_scale", "w3_scale", "w2_scale"):
-            scale_param = getattr(self, attr, None)
-            if scale_param is None or not isinstance(scale_param, nnx.Param):
-                continue
-            s = scale_param.value
-            if s.ndim == 3:
-                # (E, N_groups, K_groups) → (E, K_groups, N_groups, 1)
-                fixed = jnp.transpose(s, (0, 2, 1))[..., None]
-                setattr(self, attr, nnx.Param(fixed, out_sharding=ep_scale_sharding))
-
     def __call__(
         self,
         hidden_states: jax.Array,

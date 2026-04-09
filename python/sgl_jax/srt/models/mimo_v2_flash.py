@@ -781,12 +781,24 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         """
         from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 
-        for layer in self.model.layers:
-            if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
+        with jax.set_mesh(self.mesh):
+            for layer in self.model.layers:
+                if not (hasattr(layer, "mlp") and hasattr(layer.mlp, "experts")):
+                    continue
                 experts = layer.mlp.experts
-                if isinstance(experts, FusedEPMoE):
-                    experts.fix_loaded_scales()
-                    logger.info("Fixed FusedEPMoE scales for layer %d", layer.layer_id)
+                if not isinstance(experts, FusedEPMoE) or experts.quant_block_n is None:
+                    continue
+                ep_scale_sharding = P(("data", "tensor"), None, None, None)
+                for attr in ("w1_scale", "w3_scale", "w2_scale"):
+                    scale_param = getattr(experts, attr, None)
+                    if scale_param is None or not isinstance(scale_param, nnx.Param):
+                        continue
+                    s = scale_param.value
+                    if s.ndim == 3:
+                        # (E, N_groups, K_groups) → (E, K_groups, N_groups, 1)
+                        fixed = jnp.transpose(s, (0, 2, 1))[..., None]
+                        setattr(experts, attr, nnx.Param(fixed, out_sharding=ep_scale_sharding))
+                logger.info("Fixed FusedEPMoE scales for layer %d", layer.layer_id)
 
     def _ensure_kv_head_replication(self):
         """Replicate KV heads for TP alignment when the weight loader missed them.
