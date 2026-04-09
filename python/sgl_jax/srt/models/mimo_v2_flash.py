@@ -979,10 +979,19 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                         if use_model_mesh_for_scale
                         else ("expert", None, None)
                     )
+                    # FusedEPMoE 2D block-wise: expand N_groups → N via repeat
+                    # so scale becomes (E, K_groups, N) after loading, then
+                    # _maybe_convert adds dim → (E, K_groups, 1, N).
+                    # TPU DMA requires last dim ≥128; N_groups would fail.
+                    wbs = getattr(self._quant_config, "weight_block_size", None)
+                    block_n = (
+                        int(wbs[0]) if wbs and len(wbs) == 2 and use_model_mesh_for_scale else None
+                    )
                     augmented[scale_key] = WeightMapping(
                         target_path=[scale_target] + scale_srcs,
                         sharding=scale_sharding,
                         transpose=use_model_mesh_for_scale,
+                        repeat=(2, block_n) if block_n is not None else None,
                         concat_axis=mapping.concat_axis,
                         physical_to_logical_map=mapping.physical_to_logical_map,
                     )

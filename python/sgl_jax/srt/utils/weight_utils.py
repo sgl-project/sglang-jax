@@ -225,11 +225,11 @@ class WeightLoader:
         param_shape = model_param.value.shape
         num_experts = param_shape[0]
 
-        # --- FusedEPMoE 2D block-wise path ---
-        # Placeholder shape: (E, K_groups, N_groups, 1) — last dim is 1, dim2 > 1.
-        # Transpose is already handled via WeightMapping(transpose=True) in the
-        # model definition, so the weight arrives as (E, K_groups, N_groups).
-        # We only need to append the trailing singleton dim.
+        # --- FusedEPMoE 2D block-wise (compressed, no repeat) ---
+        # If placeholder shape is (E, K_groups, N_groups, 1) and weight is 3D,
+        # just append trailing dim.  Note: the current MiMo path pre-expands
+        # via WeightMapping(repeat=) to (E, K_groups, N), so it falls through
+        # to the "k_blocks, out_dim" branch below instead.
         if param_shape[3] == 1 and param_shape[2] > 1 and weight.ndim == 3:
             return weight[..., None]
 

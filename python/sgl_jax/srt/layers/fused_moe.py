@@ -214,19 +214,22 @@ class FusedEPMoE(nnx.Module):
                 # Compute the actual kernel-expected scale shapes so the weight
                 # loader can match dimensions and assign directly.
                 if self.quant_block_n is not None:
-                    # 2D block-wise: (E, K_groups, N_groups, 1)
+                    # 2D block-wise: pre-expand N_groups → N and store as
+                    # (E, K_groups, 1, N) — same as 1D format.  TPU DMA
+                    # requires last dim ≥128; N_groups would violate this.
+                    # Kernel receives subc_quant_n_wsz=None (1D code path).
                     w1_scale_shape = (
                         self.num_experts,
                         self.hidden_size // wsz,
-                        self.intermediate_dim // self.quant_block_n,
                         1,
+                        self.intermediate_dim,
                     )
                     w3_scale_shape = w1_scale_shape
                     w2_scale_shape = (
                         self.num_experts,
                         self.intermediate_dim // wsz,
-                        self.hidden_size // self.quant_block_n,
                         1,
+                        self.hidden_size,
                     )
                 else:
                     # 1D sub-channel: (E, K_groups, 1, N)
@@ -493,7 +496,10 @@ class FusedEPMoE(nnx.Module):
             disable_sync_barrier=self.disable_sync_barrier,
             # Optional parameters (not used in basic case)
             subc_quant_wsz=subc_quant_wsz,
-            subc_quant_n_wsz=self.quant_block_n,
+            # 2D block-wise scales are pre-expanded to (E, K_groups, 1, N)
+            # during weight loading, matching the 1D sub-channel format.
+            # Pass None so the kernel uses its 1D code path (same as unit tests).
+            subc_quant_n_wsz=None,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w3_scale=w3_scale,
