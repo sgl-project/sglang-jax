@@ -4,17 +4,17 @@
 
 This document describes the design and testing plan for the `MLAAttention` layer in sglang-jax, targeting models that use the MLA architecture (DeepSeek-V2/V3, etc.).
 
-The current implementation uses **non-absorbed (purely native) mode**: `MLAAttention` fully decompresses the latent state into standard Q/K/V tensors during forward, then reuses the existing `RadixAttention` + `SplitMHATokenToKVPool` infrastructure without relying on any MLA-specific attention kernel or compressed KV cache. The goal is to correctly integrate the MLA data flow with minimal system changes.
+The current implementation uses **non-absorbed mode**: `MLAAttention` fully decompresses the latent state into Q/K/V tensors during forward (V is zero-padded to match K's head_dim for KV cache compatibility), then reuses the existing `RadixAttention` + `MHATokenToKVPool` infrastructure without relying on any MLA-specific attention kernel or compressed KV cache. The goal is to correctly integrate the MLA data flow with minimal system changes.
 
-`MLAAttention` is a reusable layer module located at `srt/layers/mla.py`, alongside other layers (`linear.py`, `layernorm.py`, etc.). It does not introduce a new attention backend — attention computation is dispatched through `RadixAttention` to the existing native backend (`srt/layers/attention/native_backend.py`). A future absorbed mode implementation would require adding a dedicated backend under `srt/layers/attention/` along with `MLATokenToKVPool`.
+`MLAAttention` is a reusable layer module located at `srt/layers/mla.py`, alongside other layers (`linear.py`, `layernorm.py`, etc.). It does not introduce a new attention backend — attention computation is dispatched through `RadixAttention` to the existing backend. A future absorbed mode implementation would require adding a dedicated backend under `srt/layers/attention/` along with `MLATokenToKVPool`.
 
 ## Background and Goals
 
 ### Goals
 
 - Provide a reusable MLA layer that correctly implements the MLA Q/K/V projection pipeline.
-- Integrate with existing attention infrastructure (`RadixAttention`, `SplitMHATokenToKVPool`) without modifying these components.
-- Support K_dim != V_dim (192 vs 128) through `SplitMHATokenToKVPool` separate buffers.
+- Integrate with existing attention infrastructure (`RadixAttention`, `MHATokenToKVPool`) without modifying these components.
+- Handle K_dim != V_dim by padding V to match K's head_dim, enabling use of the fused `MHATokenToKVPool`.
 
 ### Non-Goals
 
@@ -39,35 +39,37 @@ graph LR
     kv_split2 -- k_nope --> assemble
     RoPE -- k_rope' --> assemble
     assemble --> RadixAttention
-    kv_split2 -- v --> RadixAttention
-    RadixAttention --> o_proj --> output[hidden]
+    kv_split2 -- v --> pad["pad V to qk_head_dim"]
+    pad --> RadixAttention
+    RadixAttention --> strip["strip V padding"]
+    strip --> o_proj --> output[hidden]
 ```
 
 **Key design decisions:**
 
-1. **Non-absorbed mode**: All decompression is completed in `MLAAttention.__call__`, then standard Q/K/V are handed to `RadixAttention`. The attention layer is unaware of the low-rank origin.
-2. **Split KV cache**: After MLA decompression, K has head_dim=192 and V has head_dim=128. Since K_dim != V_dim, they cannot share a single fused buffer (`MHATokenToKVPool` requires uniform dimensions). `SplitMHATokenToKVPool` maintains two independent buffers (K: `[size, heads, 192]`, V: `[size, heads, 128]`). This is existing sglang-jax infrastructure, not MLA-specific.
+1. **Non-absorbed mode**: All decompression is completed in `MLAAttention.__call__`, then decompressed Q/K/V are handed to `RadixAttention`. The attention layer is unaware of the low-rank origin.
+2. **V padding for fused KV cache**: After MLA decompression, K has head_dim=qk_head_dim and V has head_dim=v_head_dim. Since `MHATokenToKVPool` requires K and V to have the same shape, V is zero-padded to qk_head_dim before being passed to `RadixAttention`. After attention, the padding is stripped from the output before the output projection.
 
 ### Constraints and Boundaries
 
-**The current implementation uses non-absorbed mode.** MLA has two implementation strategies:
+MLA has two implementation strategies — the current implementation uses non-absorbed mode:
 
 | | Non-absorbed (current) | Absorbed (not implemented) |
 |---|---|---|
-| Data flow | Compress -> **decompress to standard Q/K/V** -> standard attention | Compress -> **cache compressed state** -> decompress inside attention |
+| Data flow | Compress -> **decompress to Q/K/V** (V padded to qk_head_dim) -> standard attention | Compress -> **cache compressed state** -> decompress inside attention |
 | KV cache content | Decompressed full K/V | Compressed state (kv_lora_rank + qk_rope_head_dim) |
-| Per-token KV cache | heads x (qk_head_dim + v_head_dim) = 64x(192+128) = 20480 | kv_lora_rank + qk_rope_head_dim = 576 |
-| Attention kernel | Standard `RadixAttention` + `SplitMHATokenToKVPool` | Custom kernel needed (`MLATokenToKVPool` defined but not wired in) |
-| Memory efficiency | Low (20480/576 ~ 35x vs absorbed) | High |
+| Per-token KV cache | heads x (qk_head_dim + qk_head_dim) (V padded to qk_head_dim) | kv_lora_rank + qk_rope_head_dim |
+| Attention kernel | Standard `RadixAttention` + `MHATokenToKVPool` | Custom kernel needed (`MLATokenToKVPool` defined but not wired in) |
+| Memory efficiency | Low (24576/576 ≈ 43x vs absorbed) | High |
 
-The current implementation completes all decompression in `MLAAttention.__call__`, outputting standard Q/K/V tensors before handing off to `RadixAttention`. The attention layer does not need to know the data originates from a low-rank decomposition. K_dim(192) != V_dim(128) is handled by `SplitMHATokenToKVPool` with separate buffers. See [Appendix: Absorbed Mode Roadmap](#appendix-absorbed-mode-roadmap) for the absorbed mode roadmap.
+The current implementation completes all decompression in `MLAAttention.__call__`, outputting decompressed Q/K/V tensors (V padded to qk_head_dim) before handing off to `RadixAttention`. The attention layer does not need to know the data originates from a low-rank decomposition. The padding is stripped after attention, before `o_proj`. See [Appendix: Absorbed Mode Roadmap](#appendix-absorbed-mode-roadmap) for the absorbed mode roadmap.
 
 ### Risks and Mitigations
 
 | Risk | Mitigation |
 |------|-----------|
-| Non-absorbed mode uses ~35x more KV cache than absorbed mode | Acceptable for initial implementation; absorbed mode is a future optimization |
-| bf16 precision loss in chained matmuls | Validated via cosine similarity (>= 0.99) against fp32 reference; allclose is not viable at production dimensions |
+| Non-absorbed mode uses ~43x more KV cache than absorbed mode | Acceptable for initial implementation; absorbed mode is a future optimization |
+| bf16 precision loss in chained matmuls | Q/K/V projection pipeline validated via cosine similarity (>= 0.99) against fp32 reference; attention and o_proj numerical correctness is covered by model-level accuracy tests |
 
 ## Design Details
 
@@ -85,7 +87,7 @@ The current implementation completes all decompression in `MLAAttention.__call__
 
 **Constructor Parameters:** `hidden_size`, `num_heads`, `q_lora_rank`, `kv_lora_rank`, `qk_nope_head_dim`, `qk_rope_head_dim`, `v_head_dim`, `rope_theta`, `rope_interleave`, etc., provided by model configuration.
 
-**Output Shapes:** Q = [tokens, num_heads, qk_head_dim], K = [tokens, num_heads, qk_head_dim], V = [tokens, num_heads, v_head_dim], where qk_head_dim = qk_nope_head_dim + qk_rope_head_dim.
+**Output Shapes (pre-padding):** Q = [tokens, num_heads, qk_head_dim], K = [tokens, num_heads, qk_head_dim], V = [tokens, num_heads, v_head_dim], where qk_head_dim = qk_nope_head_dim + qk_rope_head_dim. Note: V is zero-padded to qk_head_dim before entering RadixAttention.
 
 **Attention Scaling:** `scaling = qk_head_dim^(-0.5)`. The scaling is applied to the full Q.K^T after concatenation, not to the nope or rope portions individually.
 
@@ -131,13 +133,13 @@ Tests use a numpy fp32 reference implementation as the ground-truth oracle, cons
 
 ### Integration Test
 
-`test_radix_attention_integration`: Simulates one decode step to verify that MLA output can be correctly accepted and processed by `RadixAttention` + `SplitMHATokenToKVPool`.
+`test_radix_attention_integration`: Simulates one decode step to verify that MLA output can be correctly accepted and processed by `RadixAttention` + `MHATokenToKVPool`.
 
 **Scenario:** 2 sequences, KV lengths of 4 and 6 (cached history tokens), each sequence currently processing 1 new token (2 query tokens total).
 
 **Flow:**
 
-1. Create `SplitMHATokenToKVPool` (separate K/V buffers), write random prefix KV into the pool to simulate cached historical K/V
+1. Create `MHATokenToKVPool` (fused K/V buffer), write random prefix KV into the pool to simulate cached historical K/V
 2. Build `cache_loc` and `ForwardBatch`, specifying the physical position of each token's KV in the pool
 3. 2 new tokens' hidden states enter `MLAAttention.__call__`, completing Q/K/V projection and RoPE
 4. Hand off to `RadixAttention`: write new tokens' K/V into the pool, perform attention over all historical K/V
@@ -152,13 +154,13 @@ This document does not define model-level e2e accuracy baselines. Model-level en
 
 ## Alternatives
 
-**Absorbed mode**: Cache the compressed latent state instead of decompressed K/V. Requires a custom attention kernel that decompresses on-the-fly during attention computation. ~35x memory reduction but significantly more implementation complexity. Deferred to a future iteration.
+**Absorbed mode**: Cache the compressed latent state instead of decompressed K/V. Requires a custom attention kernel that decompresses on-the-fly during attention computation. ~43x memory reduction but significantly more implementation complexity. Deferred to a future iteration.
 
 ## Appendix: Absorbed Mode Roadmap
 
 > Not in scope for this iteration. This appendix documents future optimization directions for reference.
 
-`MLATokenToKVPool` is already defined in `memory_pool.py` with compressed buffer layout `[size, 1, kv_lora_rank + qk_rope_head_dim]`, but is not wired into the attention pipeline. The full chain for absorbed mode requires changes across multiple components:
+`MLATokenToKVPool` is already defined in `srt/mem_cache/memory_pool.py` with compressed buffer layout `[size, 1, kv_lora_rank + qk_rope_head_dim]`, but is not wired into the attention pipeline. The full chain for absorbed mode requires changes across multiple components:
 
 ```mermaid
 graph TD
