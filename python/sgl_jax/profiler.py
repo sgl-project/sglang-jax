@@ -24,6 +24,7 @@ def _run_profile(
     output_dir: str | None = None,
     profile_name: str | None = None,
     profile_by_stage: bool = False,
+    profile_stages: list[str] | None = None,
 ) -> str:
     if output_dir is None:
         output_dir = PARENT_FOLDER
@@ -57,6 +58,7 @@ def _run_profile(
         "num_steps": str(num_steps),
         "activities": activities,
         "profile_by_stage": profile_by_stage,
+        "profile_stages": profile_stages,
     }
 
     response = requests.post(url=url + "/start_profile", json=json_data)
@@ -73,9 +75,12 @@ def run_profile(
     output_dir: str | None = None,
     profile_name: str | None = None,
     profile_by_stage: bool = False,
+    profile_stages: list[str] | None = None,
 ):
     # step based profile will self terminate on num_steps constraints
-    link = _run_profile(url, num_steps, activities, output_dir, profile_name, profile_by_stage)
+    link = _run_profile(
+        url, num_steps, activities, output_dir, profile_name, profile_by_stage, profile_stages
+    )
     return link
 
 
@@ -110,7 +115,13 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         type=bool,
         default=False,
-        help="The number of forward steps to profile.",
+        help="Whether to profile prefill and decode stages separately.",
+    )
+    parser.add_argument(
+        "--profile-stages",
+        type=str,
+        default=None,
+        help="Comma-separated stages to profile, e.g. 'prefill,decode'. Default: prefill,decode.",
     )
     parser.add_argument(
         "--cpu",
@@ -151,6 +162,9 @@ if __name__ == "__main__":
         activities.append("MEM")
     if args.rpd:
         activities.append("RPD")
+    profile_stages = None
+    if args.profile_stages:
+        profile_stages = [s.strip() for s in args.profile_stages.split(",")]
     run_profile(
         args.url,
         args.num_steps,
@@ -158,4 +172,5 @@ if __name__ == "__main__":
         args.output_dir,
         args.profile_name,
         args.profile_by_stage,
+        profile_stages,
     )
