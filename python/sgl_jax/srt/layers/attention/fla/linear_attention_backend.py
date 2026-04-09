@@ -43,6 +43,13 @@ class LinearAttentionMetadata:
 class LinearAttentionBackend(nnx.Module):
     """Pre-computes scatter/gather index metadata for linear attention prefill.
 
+    Design note: this backend is intentionally kept separate from FlashAttentionBackend.
+    Ling-2.5 uses a hybrid architecture (MLA + Linear Attention layers). When the full
+    model is integrated, these two backends may be combined into a single
+    HybridAttnBackend that dispatches by layer_id (similar to sglang-python's
+    HybridLinearAttnBackend). For now, keeping them independent simplifies development
+    and unit testing of each attention type.
+
     Attributes:
         mesh: Optional JAX mesh for sharding.
         T_packed_bucket: Total chunk-aligned buffer length (static; changes trigger

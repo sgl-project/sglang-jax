@@ -347,7 +347,6 @@ class ModelRunner(BaseModelRunner):
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", self.model_config.num_hidden_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
-        self.linear_attn_backend = getattr(self.model, "linear_attn_backend", None)
         if self.server_args.speculative_algorithm == "EAGLE3" and not self.is_draft_worker:
             try:
                 # get the aux layer from draft model config
