@@ -42,6 +42,11 @@ class EncoderScheduler(SchedulerProfilerMixin):
         )
         self.forward_ct = 0
         self.init_profier()
+
+        if not server_args.disable_precompile:
+            logger.info('[Encoder Scheduler] Begins to run encoder worker precompile.')
+            self.encoder_worker.run_precompile()
+            logger.info('[Encoder Scheduler] Completes encoder worker precompile.')
         # Track aborted request IDs to skip processing
         self.aborted_rids: set[str] = set()
         # Current request being processed (for abort checking during steps)
