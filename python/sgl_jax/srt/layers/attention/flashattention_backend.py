@@ -144,7 +144,7 @@ class FlashAttention(AttentionBackend):
             rank_selected_locs = rank_cache_loc[:: self.page_size]
 
             # 4. Convert: Physical slot -> Physical page index
-            rank_page_indices = (rank_selected_locs // self.page_size).astype(np.int32)
+            rank_page_indices = (rank_selected_locs // self.page_size)
             page_indices_list.append(rank_page_indices)
         # 5. Merge: Concatenate all ranks
         page_indices = np.concatenate(page_indices_list)
@@ -158,17 +158,17 @@ class FlashAttention(AttentionBackend):
                 end = (i + 1) * per_dp_loc_len
                 rank_cache_loc = batch.cache_loc[start:end]
                 mapping = swa_mapping[i] if isinstance(swa_mapping, list) else swa_mapping
-                rank_swa_cache_loc = mapping[rank_cache_loc].astype(np.int64)
+                rank_swa_cache_loc = mapping[rank_cache_loc]
 
                 remainder = len(rank_swa_cache_loc) % self.page_size
                 if remainder > 0:
                     pad_len = self.page_size - remainder
                     rank_swa_cache_loc = np.concatenate(
-                        [rank_swa_cache_loc, np.zeros(pad_len, dtype=np.int64)]
+                        [rank_swa_cache_loc, np.zeros(pad_len, dtype=np.int32)]
                     )
 
                 rank_swa_selected = rank_swa_cache_loc[:: self.page_size]
-                rank_swa_page_indices = (rank_swa_selected // self.page_size).astype(np.int32)
+                rank_swa_page_indices = (rank_swa_selected // self.page_size)
                 swa_page_indices_list.append(rank_swa_page_indices)
 
             swa_page_indices = np.concatenate(swa_page_indices_list)
