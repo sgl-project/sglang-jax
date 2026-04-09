@@ -300,21 +300,23 @@ class FusedEPMoE(nnx.Module):
 
             # Update scales (reshape to 4D for GMM kernel)
             if self.quant_block_n is not None:
-                # 2D: (E, K//block_k, N//block_n) → (E, K//block_k, N//block_n, 1)
-                w1_scale_4d = w1_scale.reshape(*w1_scale.shape, 1)
-                w3_scale_4d = w3_scale.reshape(*w3_scale.shape, 1)
-                w2_scale_4d = w2_scale.reshape(*w2_scale.shape, 1)
-            else:
-                # 1D: (E, K//wsz, N) → (E, K//wsz, 1, N)
-                w1_scale_4d = w1_scale.reshape(
-                    w1_scale.shape[0], w1_scale.shape[1], 1, w1_scale.shape[2]
-                )
-                w3_scale_4d = w3_scale.reshape(
-                    w3_scale.shape[0], w3_scale.shape[1], 1, w3_scale.shape[2]
-                )
-                w2_scale_4d = w2_scale.reshape(
-                    w2_scale.shape[0], w2_scale.shape[1], 1, w2_scale.shape[2]
-                )
+                # 2D block-wise: (E, K//block_k, N//block_n) → expand N → (E, K//block_k, N)
+                # then reshape to 1D format (E, K//block_k, 1, N).
+                # Pre-expansion avoids TPU DMA alignment issues (last dim must be ≥128).
+                w1_scale = jnp.repeat(w1_scale, self.quant_block_n, axis=2)
+                w3_scale = jnp.repeat(w3_scale, self.quant_block_n, axis=2)
+                w2_scale = jnp.repeat(w2_scale, self.quant_block_n, axis=2)
+
+            # (E, K//wsz, N) → (E, K//wsz, 1, N)
+            w1_scale_4d = w1_scale.reshape(
+                w1_scale.shape[0], w1_scale.shape[1], 1, w1_scale.shape[2]
+            )
+            w3_scale_4d = w3_scale.reshape(
+                w3_scale.shape[0], w3_scale.shape[1], 1, w3_scale.shape[2]
+            )
+            w2_scale_4d = w2_scale.reshape(
+                w2_scale.shape[0], w2_scale.shape[1], 1, w2_scale.shape[2]
+            )
 
             if hasattr(self, "w1_scale"):
                 del self.w1_scale
@@ -423,7 +425,6 @@ class FusedEPMoE(nnx.Module):
         w2_shared_scale = self.w2_shared_scale.value if self.w2_shared_scale is not None else None
 
         subc_quant_wsz = self.subc_quant_wsz if self.subc_quant_wsz is not None else None
-        subc_quant_n_wsz = self.quant_block_n
 
         output = fused_ep_moe(
             mesh=self.mesh,
@@ -452,7 +453,6 @@ class FusedEPMoE(nnx.Module):
             disable_sync_barrier=self.disable_sync_barrier,
             # Optional parameters (not used in basic case)
             subc_quant_wsz=subc_quant_wsz,
-            subc_quant_n_wsz=subc_quant_n_wsz,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w3_scale=w3_scale,

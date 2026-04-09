@@ -192,7 +192,9 @@ class MoEKernelTest(jtu.JaxTestCase):
                 subc_quant_wsz = 256
 
             if subc_quant_n_wsz is not None:
-                # 2D block-wise quantization
+                # 2D block-wise quantization: quantize with 2D blocking,
+                # then expand to 1D format for kernel compatibility.
+                # (TPU DMA requires last dim ≥128, 2D scale dim3=1 violates this)
                 w1, w1_scale_3d = quantize_tensor(
                     w_dtype, w1, axis=(1, 2), block_size=[subc_quant_wsz, subc_quant_n_wsz]
                 )
@@ -203,10 +205,32 @@ class MoEKernelTest(jtu.JaxTestCase):
                     w_dtype, w2, axis=(1, 2), block_size=[subc_quant_wsz, subc_quant_n_wsz]
                 )
 
-                # Reshape to 4D: (E, K//block_k, N//block_n) → (E, K//block_k, N//block_n, 1)
-                w1_scale = w1_scale_3d.reshape(*w1_scale_3d.shape, 1)
-                w3_scale = w3_scale_3d.reshape(*w3_scale_3d.shape, 1)
-                w2_scale = w2_scale_3d.reshape(*w2_scale_3d.shape, 1)
+                # Expand 2D → 1D: (E, K//bk, N//bn) → repeat along N → (E, K//bk, N)
+                w1_scale_expanded = jnp.repeat(w1_scale_3d, subc_quant_n_wsz, axis=2)
+                w3_scale_expanded = jnp.repeat(w3_scale_3d, subc_quant_n_wsz, axis=2)
+                w2_scale_expanded = jnp.repeat(w2_scale_3d, subc_quant_n_wsz, axis=2)
+
+                # Reshape to 4D: (E, K//bk, 1, N) — same as 1D layout
+                w1_scale = w1_scale_expanded.reshape(
+                    w1_scale_expanded.shape[0],
+                    w1_scale_expanded.shape[1],
+                    1,
+                    w1_scale_expanded.shape[2],
+                )
+                w3_scale = w3_scale_expanded.reshape(
+                    w3_scale_expanded.shape[0],
+                    w3_scale_expanded.shape[1],
+                    1,
+                    w3_scale_expanded.shape[2],
+                )
+                w2_scale = w2_scale_expanded.reshape(
+                    w2_scale_expanded.shape[0],
+                    w2_scale_expanded.shape[1],
+                    1,
+                    w2_scale_expanded.shape[2],
+                )
+                # Kernel sees 1D format — no subc_quant_n_wsz needed
+                subc_quant_n_wsz = None
             else:
                 # 1D sub-channel quantization
                 w1, w1_scale_3d = quantize_tensor(w_dtype, w1, axis=1, block_size=subc_quant_wsz)
