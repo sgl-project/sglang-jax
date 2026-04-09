@@ -962,6 +962,10 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
             if is_fp8:
                 augmented = {}
+                # FusedEPMoE scales must live on the model mesh (data, tensor)
+                # to avoid expert-mesh NamedSharding conflicts in shard_map.
+                # EPMoE scales stay on the expert mesh.
+                use_model_mesh_for_scale = moe_backend == "fused"
                 for key, mapping in moe_mappings.items():
                     augmented[key] = mapping
                     # Add scale mapping for each MoE group
@@ -970,10 +974,15 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                     scale_key = key + "_scale"
                     scale_target = target_param + "_scale"
                     scale_srcs = [p.replace(".weight", ".weight_scale_inv") for p in src_paths]
+                    scale_sharding = (
+                        (("data", "tensor"), None, None)
+                        if use_model_mesh_for_scale
+                        else ("expert", None, None)
+                    )
                     augmented[scale_key] = WeightMapping(
                         target_path=[scale_target] + scale_srcs,
-                        sharding=("expert", None, None),
-                        transpose=True,
+                        sharding=scale_sharding,
+                        transpose=use_model_mesh_for_scale,
                         concat_axis=mapping.concat_axis,
                         physical_to_logical_map=mapping.physical_to_logical_map,
                     )
