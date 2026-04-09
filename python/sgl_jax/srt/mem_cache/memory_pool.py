@@ -540,11 +540,7 @@ class SWAKVPool(KVCache):
         self.mem_usage = (k_size + v_size) / GB
 
     def tree_flatten(self):
-        mapping = self.full_to_swa_index_mapping
-        if isinstance(mapping, list):
-            mapping_children = tuple(mapping)
-        else:
-            mapping_children = (mapping,)
+        mapping_children = tuple(self.full_to_swa_index_mapping)
         children = (self.swa_kv_pool, self.full_kv_pool) + mapping_children
         aux_data = {
             "size": self.size,
@@ -576,10 +572,7 @@ class SWAKVPool(KVCache):
         obj.full_kv_pool = children[1]
 
         mc = aux_data.get("mapping_count", 1)
-        if mc == 1:
-            obj.full_to_swa_index_mapping = children[2]
-        else:
-            obj.full_to_swa_index_mapping = list(children[2 : 2 + mc])
+        obj.full_to_swa_index_mapping = list(children[2 : 2 + mc])
 
         return obj
 
@@ -603,23 +596,19 @@ class SWAKVPool(KVCache):
     def _remap_swa_loc(self, loc: jax.Array) -> jax.Array:
         """Remap full-pool indices to SWA-pool indices, handling both DP=1 and DP>1.
 
-        In DP>1, full_to_swa_index_mapping is a list of per-rank numpy arrays.
+        full_to_swa_index_mapping is always a list of per-rank numpy arrays.
         We stack them and do per-rank gather via take_along_axis.
         """
         mapping = self.full_to_swa_index_mapping
         if mapping is None:
             return loc
-        if isinstance(mapping, list):
-            # DP>1: stack per-rank mappings → [dp_size, size_per_rank+1]
-            stacked = jnp.stack([jnp.asarray(m) for m in mapping])
-            tokens_per_rank = loc.shape[0] // self.dp_size
-            loc_2d = loc.reshape(self.dp_size, tokens_per_rank)
-            # Per-rank gather: each rank's loc indexes into its own mapping
-            remapped = jnp.take_along_axis(stacked, loc_2d.astype(jnp.int64), axis=1)
-            return remapped.reshape(-1).astype(jnp.int32)
-        else:
-            # DP=1: simple 1D gather
-            return jnp.asarray(mapping)[loc].astype(jnp.int32)
+        # Stack per-rank mappings → [dp_size, size_per_rank+1]
+        stacked = jnp.stack([jnp.asarray(m) for m in mapping])
+        tokens_per_rank = loc.shape[0] // self.dp_size
+        loc_2d = loc.reshape(self.dp_size, tokens_per_rank)
+        # Per-rank gather: each rank's loc indexes into its own mapping
+        remapped = jnp.take_along_axis(stacked, loc_2d.astype(jnp.int64), axis=1)
+        return remapped.reshape(-1).astype(jnp.int32)
 
     def set_kv_buffer(
         self,

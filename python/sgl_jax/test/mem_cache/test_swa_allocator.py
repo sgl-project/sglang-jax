@@ -65,7 +65,7 @@ class TestSWAAllocatorTokenLevel(unittest.TestCase):
         self.assertIsNotNone(indices)
         self.assertEqual(len(indices), 4)
         # Mapping should contain non-zero SWA indices
-        swa_indices = self.alloc.full_to_swa_index_mapping[indices]
+        swa_indices = self.alloc.full_to_swa_index_mapping[0][indices]
         self.assertTrue(np.all(swa_indices > 0))
         # SWA indices should be unique
         self.assertEqual(len(np.unique(swa_indices)), 4)
@@ -123,10 +123,10 @@ class TestSWAAllocatorTokenLevel(unittest.TestCase):
         """free_swa() zeroes out the mapping for freed indices."""
         indices = self.alloc.alloc(5)
         # Mapping should be non-zero
-        self.assertTrue(np.all(self.alloc.full_to_swa_index_mapping[indices] > 0))
+        self.assertTrue(np.all(self.alloc.full_to_swa_index_mapping[0][indices] > 0))
         self.alloc.free_swa(indices)
         # Mapping should be zero
-        self.assertTrue(np.all(self.alloc.full_to_swa_index_mapping[indices] == 0))
+        self.assertTrue(np.all(self.alloc.full_to_swa_index_mapping[0][indices] == 0))
 
     # 8
     def test_free_swa_idempotent(self):
@@ -178,7 +178,7 @@ class TestSWAAllocatorPaged(unittest.TestCase):
 
         # Each full index should have a valid SWA mapping
         for idx in full_indices:
-            swa_idx = self.alloc.full_to_swa_index_mapping[idx]
+            swa_idx = self.alloc.full_to_swa_index_mapping[0][idx]
             self.assertGreater(swa_idx, 0)
 
     # 10
@@ -193,7 +193,7 @@ class TestSWAAllocatorPaged(unittest.TestCase):
         self.assertIsNotNone(full_indices)
         self.assertEqual(len(full_indices), 1)
 
-        swa_idx = self.alloc.full_to_swa_index_mapping[full_indices[0]]
+        swa_idx = self.alloc.full_to_swa_index_mapping[0][full_indices[0]]
         self.assertGreater(swa_idx, 0)
 
     # 11 — Bug 1 test (should FAIL before fix)
@@ -250,7 +250,7 @@ class TestSWAAllocatorPaged(unittest.TestCase):
         self.assertIsNotNone(prefix)
 
         last_full = int(prefix[-1])
-        expected_swa_last = int(self.alloc.full_to_swa_index_mapping[last_full])
+        expected_swa_last = int(self.alloc.full_to_swa_index_mapping[0][last_full])
         self.assertGreater(expected_swa_last, 0)
 
         # Extend by 4 more tokens
@@ -261,7 +261,7 @@ class TestSWAAllocatorPaged(unittest.TestCase):
 
         # Verify new mappings exist
         for idx in result:
-            self.assertGreater(int(self.alloc.full_to_swa_index_mapping[idx]), 0)
+            self.assertGreater(int(self.alloc.full_to_swa_index_mapping[0][idx]), 0)
 
     # 14
     def test_free_releases_both_paged_pools(self):
@@ -281,7 +281,7 @@ class TestSWAAllocatorPaged(unittest.TestCase):
         self.assertEqual(self.alloc.full_available_size(), self.size)
         self.assertEqual(self.alloc.swa_available_size(), self.size_swa)
         # Mapping should be all zeros
-        self.assertTrue(np.all(self.alloc.full_to_swa_index_mapping == 0))
+        self.assertTrue(np.all(self.alloc.full_to_swa_index_mapping[0] == 0))
 
 
 # ---------------------------------------------------------------------------
@@ -518,8 +518,8 @@ class TestSWAOverlapSafety(unittest.TestCase):
             dp_size=1,
         )
 
-    def test_overlap_decode_first_batch_skips_reclaim(self):
-        """Overlap decode should skip reclaim while the previous batch may still read SWA pages."""
+    def test_overlap_decode_first_batch_evicts(self):
+        """Overlap decode now always calls _evict_swa; idempotency guard handles safety."""
         from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
         req = self._make_req(origin_len=100, output_len=1)
@@ -534,8 +534,10 @@ class TestSWAOverlapSafety(unittest.TestCase):
         swa_before = self.alloc.swa_available_size()
         batch.maybe_evict_swa()
 
-        self.assertEqual(req.swa_evicted_seqlen, 0)
-        self.assertEqual(self.alloc.swa_available_size(), swa_before)
+        # pre_len = seqlen - 1 = 100, evicted = max(0, 100 - 64) = 36
+        expected = req.seqlen - 1 - self.sliding_window
+        self.assertEqual(req.swa_evicted_seqlen, expected)
+        self.assertEqual(self.alloc.swa_available_size(), swa_before + expected)
 
     def test_overlap_decode_second_batch_reclaims(self):
         """Overlap decode should reclaim once the request reaches the safe reclaim point."""
@@ -557,8 +559,8 @@ class TestSWAOverlapSafety(unittest.TestCase):
         self.assertEqual(req.swa_evicted_seqlen, expected)
         self.assertEqual(self.alloc.swa_available_size(), swa_before + expected)
 
-    def test_overlap_chunked_extend_skips_first_two_batches(self):
-        """Chunked extend with overlap should delay reclaim for the first two chunks."""
+    def test_overlap_chunked_extend_evicts_with_overlap_protection(self):
+        """Chunked extend with overlap uses pre_len -= chunked_prefill_size for safety."""
         from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
         from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -578,20 +580,24 @@ class TestSWAOverlapSafety(unittest.TestCase):
         try:
             swa_before = self.alloc.swa_available_size()
 
+            # All batches now evict with pre_len -= chunked_prefill_size protection
+            # pre_len = 128 - 32 = 96, evicted = max(0, 96 - 64) = 32
+            expected_pre_len = 128 - self.chunked_prefill_size
+            expected_evicted = expected_pre_len - self.sliding_window
+
             req.extend_batch_idx = 0
             batch.maybe_evict_swa()
-            self.assertEqual(req.swa_evicted_seqlen, 0)
+            self.assertEqual(req.swa_evicted_seqlen, expected_evicted)
 
+            # Subsequent calls are idempotent (same pre_len → no change)
             req.extend_batch_idx = 1
             batch.maybe_evict_swa()
-            self.assertEqual(req.swa_evicted_seqlen, 0)
+            self.assertEqual(req.swa_evicted_seqlen, expected_evicted)
 
             req.extend_batch_idx = 2
             batch.maybe_evict_swa()
-
-            expected_pre_len = 128 - self.chunked_prefill_size
-            expected_evicted = expected_pre_len - self.sliding_window
             self.assertEqual(req.swa_evicted_seqlen, expected_evicted)
+
             self.assertEqual(self.alloc.swa_available_size(), swa_before + expected_evicted)
         finally:
             global_server_args_dict["chunked_prefill_size"] = old_chunked_prefill_size

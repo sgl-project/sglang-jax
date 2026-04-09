@@ -175,7 +175,12 @@ class ModelWorkerClient:
             )
 
         forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
-            model_worker_batch
+            model_worker_batch,
+            swa_index_mapping=getattr(
+                self.worker.model_runner.token_to_kv_pool_allocator,
+                "full_to_swa_index_mapping",
+                None,
+            ),
         )
 
         # Prepare LoRA batch if LoRA is enabled

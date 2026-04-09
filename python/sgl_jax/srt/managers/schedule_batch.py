@@ -987,16 +987,10 @@ class ScheduleBatch:
             if self.is_hybrid:
                 sliding_window_size = getattr(self.model_config, "sliding_window", None)
                 if sliding_window_size and sliding_window_size > 0:
-                    page_size = getattr(
-                        self.token_to_kv_pool_allocator,
-                        "_page_size",
-                        getattr(self.token_to_kv_pool_allocator, "page_size", 1),
-                    )
+                    page_size = self.token_to_kv_pool_allocator.page_size
                     chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
                     for req, pre_len in zip(reqs, prefix_lens, strict=True):
                         if self.enable_overlap and req.is_chunked > 0:
-                            if req.extend_batch_idx < 2:
-                                continue
                             if chunked_prefill_size is not None and chunked_prefill_size > 0:
                                 pre_len -= chunked_prefill_size
                         self._evict_swa(req, pre_len, sliding_window_size, page_size, dp_rank)
@@ -1325,21 +1319,16 @@ class ScheduleBatch:
         sliding_window_size = getattr(self.model_config, "sliding_window", None)
         if sliding_window_size is None or sliding_window_size <= 0:
             return
-        page_size = getattr(
-            self.token_to_kv_pool_allocator,
-            "_page_size",
-            getattr(self.token_to_kv_pool_allocator, "page_size", 1),
-        )
+        page_size = self.token_to_kv_pool_allocator.page_size
 
         if self.forward_mode is not None and self.forward_mode.is_decode():
             for dp_rank, info in enumerate(self.reqs_info):
                 if not info.reqs:
                     continue
                 for req in info.reqs:
-                    if req.decode_batch_idx % sliding_window_size == 1:
-                        self._evict_swa(
-                            req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
-                        )
+                    self._evict_swa(
+                        req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
+                    )
             return
 
         if self.forward_mode is None or not self.forward_mode.is_extend():
@@ -1351,8 +1340,6 @@ class ScheduleBatch:
                 continue
             for req, pre_len in zip(info.reqs, info.prefix_lens, strict=True):
                 if self.enable_overlap and req.is_chunked > 0:
-                    if req.extend_batch_idx < 2:
-                        continue
                     if chunked_prefill_size is not None and chunked_prefill_size > 0:
                         pre_len -= chunked_prefill_size
                 self._evict_swa(req, pre_len, sliding_window_size, page_size, dp_rank)

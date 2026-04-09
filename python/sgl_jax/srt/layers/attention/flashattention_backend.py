@@ -98,12 +98,11 @@ class FlashAttention(AttentionBackend):
         self.attention_data_partition_axis = attention_data_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
-        # SWA dual-pool support: set by model_runner after pool creation.
-        # Accessed on host during metadata construction.
 
     def get_forward_metadata(
         self,
         batch: ModelWorkerBatch,
+        swa_index_mapping=None,
     ):
         """Return the metadata for a forward pass."""
         metadata = FlashAttentionMetadata()
@@ -150,14 +149,14 @@ class FlashAttention(AttentionBackend):
         page_indices = np.concatenate(page_indices_list)
 
         swa_page_indices = None
-        swa_mapping = getattr(self, "swa_index_mapping", None)
+        swa_mapping = swa_index_mapping
         if swa_mapping is not None:
             swa_page_indices_list = []
             for i in range(batch.dp_size):
                 start = i * per_dp_loc_len
                 end = (i + 1) * per_dp_loc_len
                 rank_cache_loc = batch.cache_loc[start:end]
-                mapping = swa_mapping[i] if isinstance(swa_mapping, list) else swa_mapping
+                mapping = swa_mapping[i]
                 rank_swa_cache_loc = mapping[rank_cache_loc].astype(np.int64)
 
                 remainder = len(rank_swa_cache_loc) % self.page_size
@@ -561,8 +560,6 @@ class FlashAttention(AttentionBackend):
         is_swa_layer = layer.sliding_window_size is not None and layer.sliding_window_size > 0
         if is_swa_layer and self.forward_metadata.swa_page_indices is not None:
             page_indices_arg = self.forward_metadata.swa_page_indices
-        elif hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
-            page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
 
         in_specs = (
             P(self.attention_data_partition_axis, self.kv_partition_axis),  # queries

@@ -583,17 +583,6 @@ class ModelRunner(BaseModelRunner):
                         dp_size=dp_size,
                     )
 
-        if (
-            self.is_hybrid
-            and hasattr(self, "attn_backend")
-            and hasattr(self.token_to_kv_pool_allocator, "full_to_swa_index_mapping")
-        ):
-            object.__setattr__(
-                self.attn_backend,
-                "swa_index_mapping",
-                self.token_to_kv_pool_allocator.full_to_swa_index_mapping,
-            )
-
     def init_attention_backend(self):
         """Init attention kernel backend."""
         self.attn_backend = self._get_attention_backend()
