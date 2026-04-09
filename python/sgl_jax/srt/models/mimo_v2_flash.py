@@ -6,6 +6,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -206,7 +207,16 @@ class MiMoV2Attention(nnx.Module):
         )
 
         self.attention_sink_bias = (
-            nnx.Param(jnp.zeros(self.q_head_num, dtype=dtype)) if attention_sink_bias else None
+            nnx.Param(
+                jax.random.normal(
+                    jax.random.PRNGKey(0),
+                    (self.q_head_num,),
+                    dtype=dtype,
+                    out_sharding=P("tensor"),
+                )
+            )
+            if attention_sink_bias
+            else None
         )
 
     def __call__(
@@ -236,7 +246,7 @@ class MiMoV2Attention(nnx.Module):
             v,
             forward_batch,
             token_to_kv_pool,
-            attention_sink=self.attention_sink_bias,
+            attention_sink=self.attention_sink_bias.value if self.attention_sink_bias else None,
         )
 
         # V was padded to head_dim for fused KV cache; slice back to v_head_dim
