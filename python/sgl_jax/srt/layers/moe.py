@@ -111,12 +111,19 @@ class EPMoE(nnx.Module):
 
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             # MOE weights' shape is (num_experts, k, n)
-            # Gate (wi_0) and up (wi_1) are pre-concatenated along output dim
-            # to avoid runtime concat overhead. Shape: [E, hidden, 2*intermediate]
-            self.wi_01 = nnx.Param(
+            self.wi_0 = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
-                    (self.num_experts, hidden_size, intermediate_dim * 2),
+                    (self.num_experts, hidden_size, intermediate_dim),
+                    dtype=weight_dtype,
+                    out_sharding=P("expert", None, "tensor"),
+                )
+            )
+
+            self.wi_1 = nnx.Param(
+                jax.random.normal(
+                    jax.random.PRNGKey(0),
+                    (self.num_experts, hidden_size, intermediate_dim),
                     dtype=weight_dtype,
                     out_sharding=P("expert", None, "tensor"),
                 )
@@ -133,7 +140,8 @@ class EPMoE(nnx.Module):
 
             # Scales are None by default - only set by quantize_weights() if quantization is enabled
             # gmm kernel handles None scales properly (no scaling applied)
-            self.wi_01_scale = None
+            self.wi_0_scale = None
+            self.wi_1_scale = None
             self.wo_scale = None
 
     def _detect_device_capabilities(self):
@@ -294,10 +302,10 @@ class EPMoE(nnx.Module):
             if is_static:
                 # Static checkpoints will load real scale tensors later, but the
                 # placeholders must already satisfy expert sharding shape rules.
-                num_experts = self.wi_01.value.shape[0]
-                # [E, k, n] layout: wi_01=[E, hidden_size, 2*intermediate_dim],
+                num_experts = self.wi_0.value.shape[0]
+                # [E, k, n] layout: wi_0=[E, hidden_size, intermediate_dim],
                 #                    wo=[E, intermediate_dim, hidden_size]
-                hidden_size = self.wi_01.value.shape[1]
+                hidden_size = self.wi_0.value.shape[1]
                 intermediate_dim = self.wo.value.shape[1]
 
                 # Compute k_blocks for block quant placeholders.
@@ -313,11 +321,22 @@ class EPMoE(nnx.Module):
                 wi_scale_sharding = P("expert", None, None, "tensor")
                 wo_scale_sharding = P("expert", None, None, None)
 
-                if hasattr(self, "wi_01_scale"):
-                    del self.wi_01_scale
-                self.wi_01_scale = nnx.Param(
+                if hasattr(self, "wi_0_scale"):
+                    del self.wi_0_scale
+                self.wi_0_scale = nnx.Param(
                     jnp.zeros(
-                        (num_experts, k_blocks_wi, 1, intermediate_dim * 2),
+                        (num_experts, k_blocks_wi, 1, intermediate_dim),
+                        dtype=jnp.float32,
+                        out_sharding=wi_scale_sharding,
+                    ),
+                    out_sharding=wi_scale_sharding,
+                )
+
+                if hasattr(self, "wi_1_scale"):
+                    del self.wi_1_scale
+                self.wi_1_scale = nnx.Param(
+                    jnp.zeros(
+                        (num_experts, k_blocks_wi, 1, intermediate_dim),
                         dtype=jnp.float32,
                         out_sharding=wi_scale_sharding,
                     ),
@@ -337,17 +356,23 @@ class EPMoE(nnx.Module):
                 return
 
             # Quantize weights along k-dim (axis=1 in [g, k, n] layout)
-            # wi_01=[E, hidden_size, 2*intermediate_dim], wo=[E, intermediate_dim, hidden_size]
-            hidden_size = self.wi_01.value.shape[1]
+            # wi_0=[E, hidden_size, intermediate_dim], wo=[E, intermediate_dim, hidden_size]
+            hidden_size = self.wi_0.value.shape[1]
             intermediate_dim = self.wo.value.shape[1]
             block_size_k = _get_block_size_k(
                 hidden_size=hidden_size,
                 intermediate_dim=intermediate_dim,
                 weight_block_size=self.weight_block_size,
             )
-            wi_01_value, wi_01_scale = quantize_tensor(
+            w0_value, w0_scale = quantize_tensor(
                 self.quantized_dtype,
-                self.wi_01.value,
+                self.wi_0.value,
+                axis=1,
+                block_size=block_size_k,
+            )
+            w1_value, w1_scale = quantize_tensor(
+                self.quantized_dtype,
+                self.wi_1.value,
                 axis=1,
                 block_size=block_size_k,
             )
@@ -358,22 +383,32 @@ class EPMoE(nnx.Module):
                 block_size=block_size_k,
             )
 
-            self.wi_01 = nnx.Param(wi_01_value, out_sharding=P("expert", None, "tensor"))
+            self.wi_0 = nnx.Param(w0_value, out_sharding=P("expert", None, "tensor"))
+            self.wi_1 = nnx.Param(w1_value, out_sharding=P("expert", None, "tensor"))
             self.wo = nnx.Param(wo_value, out_sharding=P("expert", "tensor", None))
 
             if block_size_k is not None:
                 # axis=1 quantization on [g, k, n] gives scale [g, k_blocks, n]
                 # → expand to [g, k_blocks, 1, n]
-                wi_01_scale = wi_01_scale[:, :, None, :]
+                w0_scale = w0_scale[:, :, None, :]
+                w1_scale = w1_scale[:, :, None, :]
                 wo_scale = wo_scale[:, :, None, :]
             else:
-                wi_01_scale = wi_01_scale.reshape(wi_01_scale.shape[0], 1, 1, wi_01_scale.shape[1])
+                w0_scale = w0_scale.reshape(w0_scale.shape[0], 1, 1, w0_scale.shape[1])
+                w1_scale = w1_scale.reshape(w1_scale.shape[0], 1, 1, w1_scale.shape[1])
                 wo_scale = wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1])
 
-            if hasattr(self, "wi_01_scale"):
-                del self.wi_01_scale
-            self.wi_01_scale = nnx.Param(
-                wi_01_scale,
+            if hasattr(self, "wi_0_scale"):
+                del self.wi_0_scale
+            self.wi_0_scale = nnx.Param(
+                w0_scale,
+                out_sharding=P("expert", None, None, "tensor"),
+            )
+
+            if hasattr(self, "wi_1_scale"):
+                del self.wi_1_scale
+            self.wi_1_scale = nnx.Param(
+                w1_scale,
                 out_sharding=P("expert", None, None, "tensor"),
             )
 
@@ -396,10 +431,15 @@ class EPMoE(nnx.Module):
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
 
             # Normalize scales to GMM's 4D layout [E, k_blocks, 1, out_dim]
-            wi_01_scale = self._normalize_scale_for_gmm(
-                self.wi_01_scale.value if self.wi_01_scale is not None else None,
-                self.wi_01.value,
-                scale_name="wi_01_scale",
+            w0_scale = self._normalize_scale_for_gmm(
+                self.wi_0_scale.value if self.wi_0_scale is not None else None,
+                self.wi_0.value,
+                scale_name="wi_0_scale",
+            )
+            w1_scale = self._normalize_scale_for_gmm(
+                self.wi_1_scale.value if self.wi_1_scale is not None else None,
+                self.wi_1.value,
+                scale_name="wi_1_scale",
             )
             wo_scale = self._normalize_scale_for_gmm(
                 self.wo_scale.value if self.wo_scale is not None else None,
@@ -416,11 +456,14 @@ class EPMoE(nnx.Module):
                     P(None),
                     # weights [g, k, n]
                     P("expert", None, "tensor"),
+                    P("expert", None, "tensor"),
                     P("expert", "tensor", None),
                     # scales [g, 1, 1, n]
                     P("expert", None, None, "tensor"),
+                    P("expert", None, None, "tensor"),
                     P("expert", None, None, None),
                     # biases [g, 1, n] (unused)
+                    P("expert", None, "tensor"),
                     P("expert", None, "tensor"),
                     P("expert", None, None),
                 ),
@@ -430,10 +473,13 @@ class EPMoE(nnx.Module):
                 hidden_states_reshard,
                 topk_weights_reshard,
                 topk_ids_reshard,
-                self.wi_01.value,
+                self.wi_0.value,
+                self.wi_1.value,
                 self.wo.value,
-                wi_01_scale,
+                w0_scale,
+                w1_scale,
                 wo_scale,
+                None,
                 None,
                 None,
             )
@@ -447,11 +493,14 @@ class EPMoE(nnx.Module):
         hidden_states,
         topk_weights,
         topk_ids,
-        wi_01_weights,
+        w0_weights,
+        w1_weights,
         wo_weights,
-        wi_01_kernel_scale=None,
+        w0_kernel_scale=None,
+        w1_kernel_scale=None,
         wo_kernel_scale=None,
-        wi_01_kernel_bias=None,
+        w0_kernel_bias=None,
+        w1_kernel_bias=None,
         wo_kernel_bias=None,
     ):
         expert_shard_id = jax.lax.axis_index("expert")
@@ -475,12 +524,15 @@ class EPMoE(nnx.Module):
             inputs_2d,
             token_indices,
             group_sizes,
-            wi_01_weights,
+            w0_weights,
+            w1_weights,
             wo_weights,
             group_offset,
-            wi_01_kernel_scale,
+            w0_kernel_scale,
+            w1_kernel_scale,
             wo_kernel_scale,
-            wi_01_kernel_bias,
+            w0_kernel_bias,
+            w1_kernel_bias,
             wo_kernel_bias,
         )
 
@@ -506,12 +558,15 @@ class EPMoE(nnx.Module):
         inputs_2d,
         token_indices,
         group_sizes,
-        wi_01_kernel,
+        w0_kernel,
+        w1_kernel,
         wo_kernel,
         group_offset,
-        wi_01_kernel_scale=None,
+        w0_kernel_scale=None,
+        w1_kernel_scale=None,
         wo_kernel_scale=None,
-        wi_01_kernel_bias=None,
+        w0_kernel_bias=None,
+        w1_kernel_bias=None,
         wo_kernel_bias=None,
     ):
         if token_indices.shape[0] == 0:
@@ -543,19 +598,25 @@ class EPMoE(nnx.Module):
             v2_tile_info=v2_tile_info,
         )
 
-        # === GEMM1: fused gate-up projection (weights pre-concatenated at load time) ===
-        gate_up = gmm(
+        # === GEMM1: x @ w0 and x @ w1 ===
+        layer_w0 = gmm(
             lhs=x,
-            rhs=wi_01_kernel,
-            rhs_scale=wi_01_kernel_scale,
-            rhs_bias=wi_01_kernel_bias,
+            rhs=w0_kernel,
+            rhs_scale=w0_kernel_scale,
+            rhs_bias=w0_kernel_bias,
             zero_initialize=False,
             activation_quantized_dtype=act_q_dtype,
             **gmm_kwargs,
         )
-        n_half = wi_01_kernel.shape[2] // 2
-        layer_w0 = gate_up[:, :n_half]
-        layer_w1 = gate_up[:, n_half:]
+        layer_w1 = gmm(
+            lhs=x,
+            rhs=w1_kernel,
+            rhs_scale=w1_kernel_scale,
+            rhs_bias=w1_kernel_bias,
+            zero_initialize=False,
+            activation_quantized_dtype=act_q_dtype,
+            **gmm_kwargs,
+        )
 
         # === Activation ===
         if self.activation == "silu":
@@ -671,7 +732,6 @@ class EPMoE(nnx.Module):
             final_output = output.reshape(batch_size, seq_len, -1).astype(self.dtype)
 
         return final_output
-
 
 
 # create_moe_weights_mapping is utility function to generate weight mapping for MOE layers
