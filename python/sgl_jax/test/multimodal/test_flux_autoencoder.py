@@ -148,12 +148,12 @@ class TestFluxAutoencoder(unittest.TestCase):
             hf_posterior = hf_model.encode(x_torch).latent_dist
             hf_decoded = hf_model.decode(hf_posterior.mode()).sample
 
-        jax_posterior = jax_model.encode(x_nchw).latent_dist
-        jax_decoded = jax_model.decode(jax_posterior.mode()).sample
+        jax_latents = jax_model.encode(x_nchw)
+        jax_decoded = jax_model.decode(jax_latents)
 
         self._assert_outputs_close(
-            torch_output=hf_posterior.parameters,
-            jax_output=jax_posterior.parameters,
+            torch_output=hf_posterior.mode(),
+            jax_output=jax_latents,
             rtol=1e-4,
             atol=1e-4,
         )

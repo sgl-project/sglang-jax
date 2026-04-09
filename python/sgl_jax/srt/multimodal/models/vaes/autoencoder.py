@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -14,16 +13,6 @@ from sgl_jax.srt.multimodal.models.vaes.common import Decoder, Encoder
 from sgl_jax.srt.multimodal.models.vaes.flux_vae_weight_mappings import to_mappings
 from sgl_jax.srt.multimodal.models.wan.vaes.commons import DiagonalGaussianDistribution
 from sgl_jax.srt.utils.weight_utils import WeightLoader
-
-
-@dataclass
-class DecoderOutput:
-    sample: jax.Array
-
-
-@dataclass
-class AutoencoderKLOutput:
-    latent_dist: DiagonalGaussianDistribution
 
 
 class AutoencoderKL(nnx.Module):
@@ -147,17 +136,12 @@ class AutoencoderKL(nnx.Module):
         )
         loader.load_weights_from_safetensors(to_mappings(self.config))
 
-    def encode(
-        self,
-        x: jax.Array,
-        return_dict: bool = True,
-    ) -> AutoencoderKLOutput | tuple[DiagonalGaussianDistribution]:
+    def encode(self, x: jax.Array) -> jax.Array:
+        """Encode input to latent space. Returns plain jax.Array (posterior mode)."""
         moments = self._encode(x)
         channel_axis = 1 if moments.ndim == 4 else moments.ndim - 1
         posterior = DiagonalGaussianDistribution(moments, channel_axis=channel_axis)
-        if not return_dict:
-            return (posterior,)
-        return AutoencoderKLOutput(latent_dist=posterior)
+        return posterior.mode()
 
     def _encode(self, x: jax.Array) -> jax.Array:
         if x.ndim not in (4, 5):
@@ -173,18 +157,11 @@ class AutoencoderKL(nnx.Module):
             moments_nhwc = self.quant_conv(moments_nhwc)
         return restore_layout(moments_nhwc)
 
-    def decode(
-        self,
-        z: jax.Array,
-        return_dict: bool = True,
-    ) -> DecoderOutput | tuple[jax.Array]:
-        return self._decode(z, return_dict=return_dict)
+    def decode(self, z: jax.Array) -> jax.Array:
+        """Decode latent to sample. Returns plain jax.Array."""
+        return self._decode(z)
 
-    def _decode(
-        self,
-        z: jax.Array,
-        return_dict: bool = True,
-    ) -> DecoderOutput | tuple[jax.Array]:
+    def _decode(self, z: jax.Array) -> jax.Array:
         if z.ndim not in (4, 5):
             raise ValueError(f"Expected 4D or 5D input for decode, got shape {z.shape}.")
         if self.use_tiling and (
@@ -196,22 +173,11 @@ class AutoencoderKL(nnx.Module):
         if hasattr(self, "post_quant_conv"):
             z_nhwc = self.post_quant_conv(z_nhwc)
         sample_nhwc = self.decoder(z_nhwc)
-        sample = restore_layout(sample_nhwc)
+        return restore_layout(sample_nhwc)
 
-        if not return_dict:
-            return (sample,)
-        return DecoderOutput(sample=sample)
-
-    def __call__(
-        self,
-        sample: jax.Array,
-        sample_posterior: bool = False,
-        key: jax.Array | None = None,
-        return_dict: bool = True,
-    ) -> DecoderOutput | tuple[jax.Array]:
-        posterior = self.encode(sample, return_dict=True).latent_dist
-        latents = posterior.sample(key) if sample_posterior else posterior.mode()
-        return self.decode(latents, return_dict=return_dict)
+    def __call__(self, sample: jax.Array) -> jax.Array:
+        latents = self.encode(sample)
+        return self.decode(latents)
 
     @staticmethod
     def _default_mesh():
