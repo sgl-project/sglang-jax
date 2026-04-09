@@ -9,8 +9,8 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
-from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
-    ragged_paged_attention,
+from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
+    ragged_paged_attention as ragged_paged_attention_v3,
 )
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import RadixAttention
@@ -427,6 +427,7 @@ class FlashAttention(AttentionBackend):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         causal: int = 1,
+        attention_sink: jax.Array = None,
     ):
         """
         Args:
@@ -473,7 +474,9 @@ class FlashAttention(AttentionBackend):
             P(),  # cu_kv_lens
             P(),  # distribution
             P(),  # custom_mask
+            P(),  # attention sink
         )
+
         out_specs = (
             P(None, self.kv_partition_axis),  # attention output
             P(
@@ -486,7 +489,7 @@ class FlashAttention(AttentionBackend):
             other_args = args[4:]
 
             # Call fused KV kernel with head interleaving
-            result, updated_kv_cache_fused = ragged_paged_attention(
+            result, updated_kv_cache_fused = ragged_paged_attention_v3(
                 queries,
                 keys,
                 values,
@@ -523,7 +526,9 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
             self.forward_metadata.custom_mask,
+            attention_sink,
         )
+
         pad_width = (self.head_dim + 127) // 128 * 128 - self.head_dim
         if pad_width > 0:
             updated_kv_cache_fused = jnp.pad(
