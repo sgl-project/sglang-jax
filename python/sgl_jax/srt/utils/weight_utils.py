@@ -231,12 +231,28 @@ class WeightLoader:
         if is_fused_placeholder and weight.ndim == 3:
             # FusedEPMoE: checkpoint stores (E, N_groups, K_groups),
             # kernel expects (E, K_groups, N_groups, 1).
+            # Transpose per-shard with numpy and reconstruct JAX array to avoid
+            # creating an intermediate with explicit expert-mesh NamedSharding
+            # (which would conflict with the model mesh during shard_map tracing).
+            new_shape = (weight.shape[0], weight.shape[2], weight.shape[1], 1)
             logger.info(
-                "Converting FusedEPMoE scale %s from shape %s to (E, K, N, 1)",
+                "Converting FusedEPMoE scale %s from shape %s to %s",
                 target_path,
                 weight.shape,
+                new_shape,
             )
-            return jnp.transpose(weight, (0, 2, 1))[..., None]
+            transposed_shards = []
+            for shard in weight.addressable_shards:
+                s_np = np.asarray(shard.data)
+                transposed_shards.append(jnp.array(np.transpose(s_np, (0, 2, 1))[..., np.newaxis]))
+
+            from jax.sharding import PositionalSharding
+
+            devices = [s.device for s in weight.addressable_shards]
+            pos_sharding = PositionalSharding(devices).reshape(len(devices), 1, 1, 1)
+            return jax.make_array_from_single_device_arrays(
+                new_shape, pos_sharding, transposed_shards
+            )
 
         # --- EPMoE / GMM path below ---
         num_experts, k_blocks, _, out_dim = param_shape
