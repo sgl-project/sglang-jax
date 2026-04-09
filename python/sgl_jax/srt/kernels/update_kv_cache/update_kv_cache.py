@@ -142,12 +142,13 @@ def kv_cache_update_impl(
     assert head_dim % 128 == 0, f"head_dim={head_dim} is not divisible by 128"
     # smaller or equal to page_size
 
+    _any_mem = getattr(pltpu.MemorySpace, "ANY", pltpu.MemorySpace.HBM)
     in_specs = [
-        pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
-        pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
+        pl.BlockSpec(memory_space=_any_mem),
+        pl.BlockSpec(memory_space=_any_mem),
     ]
 
-    out_specs = [pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY)]
+    out_specs = [pl.BlockSpec(memory_space=_any_mem)]
     out_shape = [jax.ShapeDtypeStruct(kv_cache.shape, dtype=kv_cache.dtype)]
 
     scalar_prefetches = [slices]

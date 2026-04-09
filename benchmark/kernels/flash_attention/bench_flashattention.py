@@ -12,12 +12,11 @@ import jax
 import numpy as np
 from utils import create_decode_uniform_data, create_prefill_uniform_data
 
-from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
-    get_kernel_scope_name,
+from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
+    RpaCase,
+    get_default_block_sizes,
+    get_vmem_limit,
     ragged_paged_attention,
-)
-from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes import (
-    get_tuned_block_sizes,
 )
 from sgl_jax.srt.kernels.utils.perf import multiple_iteration_timeit_from_trace
 from sgl_jax.srt.utils.jax_utils import get_device_name
@@ -33,6 +32,7 @@ def benchmark_backend(
     kv_head_num,
     head_dim,
     page_size,
+    sliding_window=None,
 ):
     scale = head_dim**-0.5
 
@@ -87,7 +87,7 @@ def benchmark_backend(
 
     @functools.partial(
         jax.jit,
-        static_argnames=["sm_scale"],
+        static_argnames=["sm_scale", "sliding_window"],
     )
     def jitted_attn(
         q,
@@ -100,6 +100,7 @@ def benchmark_backend(
         cu_kv_lens,
         distribution,
         sm_scale,
+        sliding_window=None,
     ):
         return ragged_paged_attention(
             q,
@@ -115,8 +116,26 @@ def benchmark_backend(
             decode_mode=0,
             causal=1,
             sm_scale=sm_scale,
+            sliding_window=sliding_window,
         )
 
+    # Benchmark
+    max_num_seqs = kv_lens.shape[0]
+    pages_per_seq = page_indices.shape[0] // max_num_seqs
+    rpa_case = RpaCase.DECODE if mode == "decode" else RpaCase.PREFILL
+    block_sizes = get_default_block_sizes(
+        q.dtype,
+        k.dtype,
+        q_head_num,
+        kv_head_num,
+        head_dim,
+        page_size,
+        max_num_batched_tokens,
+        max_num_seqs,
+        pages_per_seq,
+        case=rpa_case,
+        vmem_limit_bytes=get_vmem_limit(),
+    )
     attn = functools.partial(
         jitted_attn,
         q,
@@ -129,28 +148,22 @@ def benchmark_backend(
         cu_kv_lens,
         distribution,
         scale,
+        sliding_window=sliding_window,
     )
-
     # Warmup
     output = attn()
     jax.block_until_ready(output)
-
-    # Benchmark
-    best_bkv_p, best_bq_sz = get_tuned_block_sizes(
-        q.dtype,
-        k.dtype,
-        q_head_num,
-        kv_head_num,
-        head_dim,
-        page_size,
-        max_num_batched_tokens,
-        page_indices.shape[0] // kv_lens.shape[0],
-        True,
+    scope_name = (
+        f"RPA{rpa_case.symbol}-p_{page_size}"
+        f"-bq_{block_sizes['bq_sz']}_{block_sizes['bq_csz']}"
+        f"-bkv_{block_sizes['bkv_sz']}_{block_sizes['bkv_csz']}"
     )
+    if sliding_window is not None:
+        scope_name += f"-sw_{sliding_window}"
     times = multiple_iteration_timeit_from_trace(
         compute_func=lambda: attn(),
         data_generator=lambda: (),
-        task=get_kernel_scope_name(best_bq_sz, best_bkv_p, page_size),
+        task=scope_name,
         tries=1,
     )
     avg_time = float(np.mean(times)) if times else float("nan")
