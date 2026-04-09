@@ -6,7 +6,7 @@ import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
+from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
     ref_ragged_paged_attention,
 )
 from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
@@ -332,6 +332,7 @@ class TestAttention(CustomTestCase):
         sliding_window=None,
         logit_cap=None,
         xai_temperature_len=None,
+        attention_sink=None,
     ):
         num_heads, head_dim, num_kv_heads, page_size, dtype = mode_args
         causal = True
@@ -380,6 +381,7 @@ class TestAttention(CustomTestCase):
             sliding_window=sliding_window,
             logit_cap=logit_cap,
             xai_temperature_len=xai_temperature_len,
+            attention_sink=attention_sink,
         )
 
         sharding = NamedSharding(mesh, P("data", "tensor"))
@@ -403,7 +405,7 @@ class TestAttention(CustomTestCase):
 
         @jax.jit
         def jit_attn(q, k, v, forward_batch, token_to_kv_pool):
-            out = attn(q, k, v, forward_batch, token_to_kv_pool)
+            out = attn(q, k, v, forward_batch, token_to_kv_pool, attention_sink=attention_sink)
             return out
 
         # run
@@ -638,6 +640,90 @@ class TestAttention(CustomTestCase):
             xai_temperature_len=temp_len,
         )
 
+    def test_attention_sink_decode_dp_4(self):
+        """
+        Feature Test: Attention Sink with MHA and DP in decode mode.
+        Validates q_packing alignment fix for MHA (num_q_heads_per_kv_head=1).
+        """
+        mesh = set_mesh(tp_size=1, dp_size=4)
+        num_heads = 8
+        num_kv_heads = 8
+        head_dim = 128
+
+        lens_dict = {
+            0: [(1, 128)],
+            1: [(1, 256)],
+            2: [(1, 512)],
+            3: [(1, 1024)],
+        }
+
+        rng = np.random.RandomState(123)
+        attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
+
+        self.run_test(
+            "decode",
+            lens_dict,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            mesh,
+            4,
+            attention_sink=attention_sink,
+        )
+
+    def test_attention_sink_prefill_dp_4(self):
+        """
+        Feature Test: Attention Sink with MHA and DP in prefill mode.
+        """
+        mesh = set_mesh(tp_size=1, dp_size=4)
+        num_heads = 8
+        num_kv_heads = 8
+        head_dim = 128
+
+        lens_dict = {
+            0: [(64, 64)],
+            1: [(128, 128)],
+            2: [(32, 64)],
+            3: [(256, 256)],
+        }
+
+        rng = np.random.RandomState(456)
+        attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
+
+        self.run_test(
+            "prefill",
+            lens_dict,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            mesh,
+            4,
+            attention_sink=attention_sink,
+        )
+
+    def test_attention_sink_gqa_dp_2_tp_2(self):
+        """
+        Feature Test: Attention Sink with GQA and DP+TP.
+        Validates attention_sink TP sharding (P("tensor")).
+        """
+        mesh = set_mesh(tp_size=2, dp_size=2)
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+
+        lens_dict = {
+            0: [(1, 256), (1, 512)],
+            1: [(1, 128), (1, 1024)],
+        }
+
+        rng = np.random.RandomState(789)
+        attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
+
+        self.run_test(
+            "decode",
+            lens_dict,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            mesh,
+            2,
+            attention_sink=attention_sink,
+        )
+
 
 def compute_dp_reference_attention(
     mode,
@@ -653,6 +739,7 @@ def compute_dp_reference_attention(
     sliding_window=None,
     logit_cap=None,
     xai_temperature_len=None,
+    attention_sink=None,
 ):
     """
     Computes reference attention results using ref_ragged_paged_attention.
@@ -748,6 +835,7 @@ def compute_dp_reference_attention(
             sliding_window=sliding_window,
             soft_cap=logit_cap,
             xai_temperature_len=xai_temperature_len,
+            attention_sink=attention_sink,
         )
         rank_out = jax.block_until_ready(rank_out)
         # Ensure numpy array

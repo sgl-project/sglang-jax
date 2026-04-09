@@ -889,23 +889,25 @@ def _ragged_paged_attention_kernel_loop(
 
         @pl.loop(0, num_bq, unroll=False)
         def compute_with_bq(bq_idx):
-            # Re-initialize l, m, acc to 0 before bkv loop.
-            l_ref[...] = jnp.full_like(l_ref, 0.0)
-            m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
             acc_ref[...] = jnp.full_like(acc_ref, 0.0)
 
-            # Attention sink: override m and l initialization.
+            # Initialize l, m before bkv loop.
             if attention_sink_ref is not None:
+                # Attention sink: m = sink logits, l = 1.0
+                # (pretend we've already seen a virtual token with logit = sink_value).
+                m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
+                l_ref[...] = jnp.full_like(l_ref, 1.0)
                 for kv_head_idx in range(actual_num_kv_heads):
                     sinks = attention_sink_ref[kv_head_idx]  # [num_q_heads_per_kv_head, 128]
                     lm_start = 0
                     lm_size = actual_bq_sz * num_q_heads_per_kv_head
-                    m_ref.at[kv_head_idx, pl.ds(lm_start, lm_size)][...] = jnp.concat(
-                        [sinks] * actual_bq_sz, axis=0
-                    ).astype(out_dtype)
-                    l_ref.at[kv_head_idx, pl.ds(lm_start, lm_size)][...] = jnp.full(
-                        (lm_size, 128), 1.0, dtype=out_dtype
+                    sink_tiled = jnp.tile(sinks, (actual_bq_sz, 1))
+                    m_ref.at[kv_head_idx, pl.ds(lm_start, lm_size)][...] = sink_tiled.astype(
+                        out_dtype
                     )
+            else:
+                l_ref[...] = jnp.full_like(l_ref, 0.0)
+                m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
 
             bq_sem_idx = sem_ids_ref[0]
             next_seq_idx, next_bq_idx, next_bq_sem_idx = get_next_bq_ids(
@@ -1157,6 +1159,7 @@ def prepare_inputs(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     k: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
     v: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
+    attention_sink: jax.Array | float | None = None,  # f32[actual_num_q_heads]
 ):
     max_num_tokens, actual_num_q_heads, actual_head_dim = q.shape
     actual_num_kv_heads = k.shape[1]
@@ -1191,7 +1194,21 @@ def prepare_inputs(
         .swapaxes(0, 1)
     )
     kv = merge_kv(k, v)
-    return q, kv
+
+    if attention_sink is not None:
+        sink = jnp.asarray(attention_sink, dtype=jnp.float32)
+        if sink.ndim == 0:
+            sink = jnp.full((actual_num_q_heads,), sink, dtype=jnp.float32)
+        sink = sink[: actual_num_kv_heads * actual_num_q_heads_per_kv_head]
+        sink = sink.reshape(actual_num_kv_heads, actual_num_q_heads_per_kv_head)
+        if num_q_heads_per_kv_head > actual_num_q_heads_per_kv_head:
+            sink = jnp.pad(
+                sink, ((0, 0), (0, num_q_heads_per_kv_head - actual_num_q_heads_per_kv_head))
+            )
+        attention_sink = sink.reshape(actual_num_kv_heads, num_q_heads_per_kv_head, 1)
+        attention_sink = jnp.repeat(attention_sink, 128, axis=-1)
+
+    return q, kv, attention_sink
 
 
 def prepare_outputs(
@@ -1713,19 +1730,8 @@ def ragged_paged_attention(
     actual_num_kv_heads = k.shape[1]
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
 
-    q, kv = prepare_inputs(q, k, v)
+    q, kv, attention_sink = prepare_inputs(q, k, v, attention_sink)
     kv_cache_fused_processed = prepare_kv_cache_fused(kv_cache_fused)
-
-    # Prepare attention_sink for VMEM.
-    if attention_sink is not None:
-        sink = jnp.asarray(attention_sink, dtype=jnp.float32)
-        if sink.ndim == 0:
-            sink = jnp.full((actual_num_q_heads,), sink, dtype=jnp.float32)
-        padded_heads = actual_num_kv_heads * actual_num_q_heads_per_kv_head
-        if sink.shape[0] < padded_heads:
-            sink = jnp.pad(sink, (0, padded_heads - sink.shape[0]))
-        attention_sink = sink.reshape(actual_num_kv_heads, actual_num_q_heads_per_kv_head, 1)
-        attention_sink = jnp.repeat(attention_sink, 128, axis=-1)
 
     (
         _,

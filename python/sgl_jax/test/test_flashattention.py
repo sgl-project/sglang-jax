@@ -927,6 +927,144 @@ class TestAttention(CustomTestCase):
             attention_sink=attention_sink,
         )
 
+    def test_mha_attention_sink_decode_accuracy(self):
+        """Test attention sink accuracy in decode mode with MHA (num_heads == num_kv_heads)"""
+        num_heads = 32
+        num_kv_heads = 32
+        head_dim = 128
+
+        lens = [
+            (1, 256),
+            (1, 512),
+            (1, 1024),
+        ]
+
+        rng = np.random.RandomState(789)
+        attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
+
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            max_total_token_size=200000,
+            attention_sink=attention_sink,
+        )
+
+    def test_mha_attention_sink_prefill_accuracy(self):
+        """Test attention sink accuracy in prefill mode with MHA (num_heads == num_kv_heads)"""
+        num_heads = 32
+        num_kv_heads = 32
+        head_dim = 128
+
+        lens = [
+            (1, 128),
+            (64, 64),
+            (128, 256),
+        ]
+
+        rng = np.random.RandomState(101)
+        attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
+
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            max_total_token_size=200000,
+            attention_sink=attention_sink,
+        )
+
+    def test_gqa_4q1kv_attention_sink_decode_accuracy(self):
+        """Test attention sink with GQA (4 q_heads, 1 kv_head) in decode mode"""
+        num_heads = 4
+        num_kv_heads = 1
+        head_dim = 128
+
+        lens = [
+            (1, 256),
+            (1, 512),
+            (1, 1024),
+        ]
+
+        rng = np.random.RandomState(202)
+        attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
+
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            max_total_token_size=200000,
+            attention_sink=attention_sink,
+        )
+
+    def test_gqa_4q1kv_attention_sink_prefill_accuracy(self):
+        """Test attention sink with GQA (4 q_heads, 1 kv_head) in prefill mode"""
+        num_heads = 4
+        num_kv_heads = 1
+        head_dim = 128
+
+        lens = [
+            (1, 128),
+            (64, 64),
+            (128, 256),
+        ]
+
+        rng = np.random.RandomState(303)
+        attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
+
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            max_total_token_size=200000,
+            attention_sink=attention_sink,
+        )
+
+    def test_single_head_attention_sink_decode_accuracy(self):
+        """Test attention sink with single head MHA (1 q_head, 1 kv_head) in decode mode"""
+        num_heads = 1
+        num_kv_heads = 1
+        head_dim = 128
+
+        lens = [
+            (1, 256),
+            (1, 512),
+            (1, 1024),
+        ]
+
+        rng = np.random.RandomState(404)
+        attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
+
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            max_total_token_size=200000,
+            attention_sink=attention_sink,
+        )
+
+    def test_single_head_attention_sink_prefill_accuracy(self):
+        """Test attention sink with single head MHA (1 q_head, 1 kv_head) in prefill mode"""
+        num_heads = 1
+        num_kv_heads = 1
+        head_dim = 128
+
+        lens = [
+            (1, 128),
+            (64, 64),
+            (128, 256),
+        ]
+
+        rng = np.random.RandomState(505)
+        attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
+
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            max_total_token_size=200000,
+            attention_sink=attention_sink,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
