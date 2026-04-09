@@ -67,7 +67,7 @@ The current implementation completes all decompression in `MLAAttention.__call__
 | Risk | Mitigation |
 |------|-----------|
 | Non-absorbed mode uses ~35x more KV cache than absorbed mode | Acceptable for initial implementation; absorbed mode is a future optimization |
-| bf16 precision loss in chained matmuls | Validated via cosine similarity (>= 0.99) against fp64 reference; allclose is not viable at production dimensions |
+| bf16 precision loss in chained matmuls | Validated via cosine similarity (>= 0.99) against fp32 reference; allclose is not viable at production dimensions |
 
 ## Design Details
 
@@ -93,7 +93,7 @@ The current implementation completes all decompression in `MLAAttention.__call__
 
 ### Unit Tests
 
-Tests validate the Q/K/V projection pipeline by stepping through `MLAAttention` submodules individually and comparing against an fp64 numpy reference implementation. The reference follows the standard MLA computation flow, adapted for the sglang-jax weight layout (`weight=(in_features, out_features)`, forward = `x @ weight`).
+Tests validate the Q/K/V projection pipeline by stepping through `MLAAttention` submodules individually and comparing against an fp32 numpy reference implementation. The reference follows the standard MLA computation flow, adapted for the sglang-jax weight layout (`weight=(in_features, out_features)`, forward = `x @ weight`).
 
 **Test cases:**
 
@@ -114,20 +114,20 @@ For production-scale dimensions with bf16 matmuls, element-wise `allclose` is hi
 - Tolerances too strict cause persistent false positives
 - Relaxed tolerances make the assertion itself lose discriminating power
 
-Based on empirical calibration results, we use cosine similarity (threshold >= 0.99) as the primary correctness metric, measuring directional agreement between outputs and the fp64 reference.
+Based on empirical calibration results, we use cosine similarity (threshold >= 0.99) as the primary correctness metric, measuring directional agreement between outputs and the fp32 reference.
 
 > FlashInfer uses the same approach in their absorbed-MLA decode kernel tests ([flashinfer-ai/flashinfer#551](https://github.com/flashinfer-ai/flashinfer/pull/551#discussion_r1826453290)). Maintainer confirmed: `"cosine similarity is okay in this case."`
 
 #### Reference Implementation
 
-Tests use a numpy fp64 reference implementation as the ground-truth oracle, consisting of the following functions:
+Tests use a numpy fp32 reference implementation as the ground-truth oracle, consisting of the following functions:
 
 | Function | Purpose |
 |----------|---------|
-| `numpy_linear_fp64(x, weight)` | `x @ weight` in fp64 |
-| `numpy_rmsnorm_fp64(x, scale, eps)` | RMSNorm |
-| `numpy_rotary_emb_fp64(x, cos, sin)` | Interleaved RoPE |
-| `numpy_mla_qkv_fp64(hidden, positions, weights, config)` | Complete Q/K/V projection pipeline |
+| `numpy_linear_fp32(x, weight)` | `x @ weight` in fp32 |
+| `numpy_rmsnorm_fp32(x, scale, eps)` | RMSNorm |
+| `numpy_rotary_emb_fp32(x, cos, sin)` | Interleaved RoPE |
+| `numpy_mla_qkv_fp32(hidden, positions, weights, config)` | Complete Q/K/V projection pipeline |
 
 ### Integration Test
 
