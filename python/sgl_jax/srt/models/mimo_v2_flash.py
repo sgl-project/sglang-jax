@@ -519,6 +519,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         # Q/K head_dim padding (192→256) is handled by the kernel internally.
         if self._is_static_quant:
             self._dequantize_fp8_to_bf16()
+            self._fix_fused_moe_scales()
 
     @staticmethod
     def _warmup_safetensors_cache(model_config: ModelConfig):
@@ -771,6 +772,21 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         # uses head_dim (Q/K) for shape matching, so it misses v_proj when
         # v_head_dim != head_dim. Replicate kv_heads here.
         self._ensure_kv_head_replication()
+
+    def _fix_fused_moe_scales(self):
+        """Fix FusedEPMoE scale shapes after loading from pre-quantized checkpoint.
+
+        HF checkpoint stores MoE scales as (E, N_groups, K_groups), but the
+        fused kernel expects (E, K_groups, N_groups, 1). Transforms in-place.
+        """
+        from sgl_jax.srt.layers.fused_moe import FusedEPMoE
+
+        for layer in self.model.layers:
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
+                experts = layer.mlp.experts
+                if isinstance(experts, FusedEPMoE):
+                    experts.fix_loaded_scales()
+                    logger.info("Fixed FusedEPMoE scales for layer %d", layer.layer_id)
 
     def _ensure_kv_head_replication(self):
         """Replicate KV heads for TP alignment when the weight loader missed them.
