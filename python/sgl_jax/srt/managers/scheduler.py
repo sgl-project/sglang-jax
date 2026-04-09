@@ -514,19 +514,19 @@ class Scheduler(
         server_args = self.server_args
         self.req_to_token_pool, self.token_to_kv_pool_allocator = self.tp_worker.get_memory_pool()
 
-        if server_args.chunked_prefill_size is not None and server_args.disable_radix_cache:
-            self.tree_cache = ChunkCache(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                page_size=self.page_size,
-            )
-        elif self.is_hybrid:
+        if self.is_hybrid:
             self.tree_cache = SWARadixCache(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 sliding_window_size=self.sliding_window_size,
                 page_size=self.page_size,
                 disable=server_args.disable_radix_cache,
+            )
+        elif server_args.chunked_prefill_size is not None and server_args.disable_radix_cache:
+            self.tree_cache = ChunkCache(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                page_size=self.page_size,
             )
         else:
             self.tree_cache = RadixCache(
@@ -1754,9 +1754,7 @@ class Scheduler(
                 if self.dp_size > 1:
                     from jax.experimental.multihost_utils import process_allgather
 
-                    next_token_ids_device = process_allgather(
-                        next_token_ids_device, tiled=True
-                    )
+                    next_token_ids_device = process_allgather(next_token_ids_device, tiled=True)
                 next_token_ids = np.array(jax.device_get(next_token_ids_device))
                 self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
         else:
