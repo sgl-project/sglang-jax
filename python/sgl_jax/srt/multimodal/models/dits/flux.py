@@ -46,41 +46,17 @@ def _sdpa_attention(
     query: jax.Array,
     key: jax.Array,
     value: jax.Array,
-    attn_mask: jax.Array | None = None,
-    dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: float | None = None,
-    **_: Any,
 ) -> jax.Array:
-    del dropout_p
     q = query.astype(jnp.float32)
     k = key.astype(jnp.float32)
     v = value.astype(jnp.float32)
-
-    mask = None
-    bias = None
-    if attn_mask is not None:
-        if attn_mask.ndim == 2:
-            attn_mask = attn_mask[:, None, None, :]
-        elif attn_mask.ndim == 3:
-            attn_mask = attn_mask[:, None, :, :]
-        elif attn_mask.ndim != 4:
-            raise ValueError(
-                "attn_mask must have rank 2, 3, or 4 for Flux attention. "
-                f"Got shape {attn_mask.shape}."
-            )
-
-        if attn_mask.dtype == jnp.bool_:
-            mask = attn_mask
-        else:
-            bias = attn_mask.astype(jnp.float32)
 
     output = jax.nn.dot_product_attention(
         q,
         k,
         v,
-        bias=bias,
-        mask=mask,
         scale=scale,
         is_causal=is_causal,
         implementation="xla",
@@ -137,7 +113,7 @@ class FluxAttention(nnx.Module):
     ):
         """
         NOTE: Align with the implementation of HF.
-        attention_impl: support usp and sdpa. usp dont support attention_mask yet.
+        attention_impl: support usp and sdpa. Falls back to sdpa on single-device mesh.
         """
         _rngs = _resolve_rngs(rngs)
         if attention_impl not in _SUPPORTED_ATTENTION_IMPLS:
@@ -255,7 +231,6 @@ class FluxAttention(nnx.Module):
         self,
         hidden_states: jax.Array,
         encoder_hidden_states: jax.Array | None = None,
-        attention_mask: jax.Array | None = None,
         image_rotary_emb: tuple[jax.Array, jax.Array] | None = None,
         req=None,
         **kwargs,
@@ -302,30 +277,20 @@ class FluxAttention(nnx.Module):
         _use_sdpa = self.attention_impl == "sdpa" or (
             self.mesh is not None and all(s == 1 for s in self.mesh.shape.values())
         )
-        if _use_sdpa and self.attention_impl != "sdpa":
-            logger.warning(
-                "Falling back from USP to SDPA attention (single-device mesh or attention_mask present). "
-                "This may reduce performance."
-            )
         if _use_sdpa:
+            if self.attention_impl != "sdpa":
+                logger.warning(
+                    "Falling back from USP to SDPA attention (single-device mesh). "
+                    "This may reduce performance."
+                )
             hidden_states = _sdpa_attention(
                 query,
                 key,
                 value,
-                attn_mask=attention_mask,
                 is_causal=False,
             )
         else:
-            if attention_mask is not None:
-                hidden_states = _sdpa_attention(
-                    query,
-                    key,
-                    value,
-                    attn_mask=attention_mask,
-                    is_causal=False,
-                )
-            else:
-                hidden_states = self.attn(query, key, value, req)
+            hidden_states = self.attn(query, key, value, req)
 
         hidden_states = hidden_states.reshape(hidden_states.shape[0], hidden_states.shape[1], -1)
         hidden_states = hidden_states.astype(query.dtype)
