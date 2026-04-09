@@ -39,6 +39,9 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
+    from sgl_jax.srt.layers.attention.fla.linear_attention_backend import (
+        LinearAttentionMetadata,
+    )
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
@@ -201,6 +204,9 @@ class ForwardBatch:
     apply_for_deepstack: bool = False
     deepstack_visual_embedding: jax.Array | None = None
 
+    # Linear attention metadata (prefill only, None for non-linear-attention models)
+    linear_attn_metadata: LinearAttentionMetadata | None = None
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -222,6 +228,7 @@ class ForwardBatch:
             self.mrope_positions,
             self.apply_for_deepstack,
             self.deepstack_visual_embedding,
+            self.linear_attn_metadata,
         )
 
         aux_data = {
@@ -266,6 +273,7 @@ class ForwardBatch:
 
         obj.apply_for_deepstack = children[17]
         obj.deepstack_visual_embedding = children[18]
+        obj.linear_attn_metadata = children[19]
         return obj
 
     def __repr__(self) -> str:

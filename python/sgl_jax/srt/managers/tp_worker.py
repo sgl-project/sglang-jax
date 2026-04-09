@@ -564,6 +564,10 @@ class ModelWorker:
             )
 
         self.model_runner.attn_backend.forward_metadata = forward_metadata
+        if self.model_runner.linear_attn_backend is not None:
+            forward_batch.linear_attn_metadata = (
+                self.model_runner.linear_attn_backend.get_forward_metadata(model_worker_batch)
+            )
         logits_output, cache_miss_count, layers_topk_ids = self.model_runner.forward(
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
