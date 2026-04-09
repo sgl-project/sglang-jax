@@ -14,7 +14,7 @@ import ml_dtypes
 import numpy as np
 from flax import nnx
 from jax.experimental import multihost_utils
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from safetensors import safe_open
 from tqdm import tqdm
@@ -227,32 +227,11 @@ class WeightLoader:
 
         # --- FusedEPMoE 2D block-wise path ---
         # Placeholder shape: (E, K_groups, N_groups, 1) — last dim is 1, dim2 > 1.
-        # Checkpoint stores:  (E, N_groups, K_groups) — axes 1,2 swapped.
+        # Transpose is already handled via WeightMapping(transpose=True) in the
+        # model definition, so the weight arrives as (E, K_groups, N_groups).
+        # We only need to append the trailing singleton dim.
         if param_shape[3] == 1 and param_shape[2] > 1 and weight.ndim == 3:
-            new_shape = (weight.shape[0], weight.shape[2], weight.shape[1], 1)
-            logger.info(
-                "Converting FusedEPMoE scale %s from shape %s to %s",
-                target_path,
-                weight.shape,
-                new_shape,
-            )
-            # Per-shard numpy transpose to avoid JAX ops that stamp expert-mesh
-            # metadata (which conflicts with model mesh during shard_map).
-            transposed_shards = []
-            for shard in weight.addressable_shards:
-                s_np = np.asarray(shard.data)
-                t_np = np.transpose(s_np, (0, 2, 1))[..., np.newaxis]
-                transposed_shards.append(jax.device_put(t_np, shard.device))
-            # Reconstruct with weight's original mesh — same approach as
-            # make_array_from_callback used for w1/w2/w3 weights.
-            orig_sharding = weight.sharding
-            new_sharding = NamedSharding(
-                orig_sharding.mesh,
-                P(orig_sharding.spec[0], None, None, None),
-            )
-            return jax.make_array_from_single_device_arrays(
-                new_shape, new_sharding, transposed_shards
-            )
+            return weight[..., None]
 
         # --- EPMoE / GMM path (also FusedEPMoE 1D sub-channel) ---
         if param_shape[2] != 1:

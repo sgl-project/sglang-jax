@@ -973,7 +973,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                     augmented[scale_key] = WeightMapping(
                         target_path=[scale_target] + scale_srcs,
                         sharding=("expert", None, None),
-                        transpose=False,
+                        transpose=True,
                         concat_axis=mapping.concat_axis,
                         physical_to_logical_map=mapping.physical_to_logical_map,
                     )
