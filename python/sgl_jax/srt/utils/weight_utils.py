@@ -241,7 +241,8 @@ class WeightLoader:
             transposed_shards = []
             for shard in weight.addressable_shards:
                 s_np = np.asarray(shard.data)
-                transposed_shards.append(jnp.array(np.transpose(s_np, (0, 2, 1))[..., np.newaxis]))
+                t_np = np.transpose(s_np, (0, 2, 1))[..., np.newaxis]
+                transposed_shards.append(jax.device_put(t_np, shard.device))
             # Reconstruct with weight's original mesh — same approach as
             # make_array_from_callback used for w1/w2/w3 weights.
             orig_sharding = weight.sharding
