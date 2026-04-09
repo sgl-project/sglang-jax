@@ -634,6 +634,14 @@ class FlashAttention(AttentionBackend):
             attention_sink,
         )
 
+        pad_width = (self.head_dim + 127) // 128 * 128 - self.head_dim
+        if pad_width > 0:
+            updated_kv_cache_fused = jnp.pad(
+                updated_kv_cache_fused,
+                ((0, 0), (0, 0), (0, pad_width)),
+                mode="constant",
+            )
+
         return (
             attn_output.reshape(q.shape[0], -1),
             updated_kv_cache_fused,
