@@ -1,7 +1,8 @@
 """
-Capture xprof traces for EPMoE vs FusedEPMoE on MiMoV2Flash MoE dimensions.
+Capture xprof traces for FusedEPMoE on MiMoV2Flash MoE dimensions.
 
-Saves traces to /tmp/moe_profiles/ for extraction via kubectl cp or GCS upload.
+Supports bf16, FP8 sub-channel, and FP8 2D block-wise quantization.
+Saves traces to PROFILE_DIR for analysis via ant-profiler.
 """
 
 from __future__ import annotations
@@ -16,10 +17,10 @@ from benchmark.moe.utils import (
     MoEBenchmarkCase,
     MoEImbalanceSimulator,
     build_mesh,
-    generate_router_logits,
     prepare_fused_moe_inputs,
 )
-from sgl_jax.srt.layers.moe import EPMoE, FusedEPMoE, TopK
+from sgl_jax.srt.layers.moe import FusedEPMoE, TopK
+from sgl_jax.srt.utils.quantization.quantization_config import QuantizationConfig
 
 NUM_EXPERTS = 256
 TOP_K = 8
@@ -27,77 +28,28 @@ HIDDEN_SIZE = 4096
 INTERMEDIATE_SIZE = 2048
 PROFILE_DIR = os.environ.get("PROFILE_DIR", "/gcs/moe_profiles")
 
-# Which configs to profile: (backend, ep_size, tp_size, num_tokens)
-# num_tokens: 16384 = prefill (16k input), 1024 = decode (1k output)
+# (tag, ep_size, num_tokens, weight_dtype, subc_quant_wsz, quant_block_n)
 PROFILE_CASES = [
-    ("epmoe", 1, 16, 1024),
-    ("epmoe", 8, 2, 1024),
-    ("epmoe", 16, 1, 1024),
-    ("fused", 16, 1, 1024),
-    ("epmoe", 1, 16, 16384),
-    ("epmoe", 16, 1, 16384),
-    ("fused", 16, 1, 16384),
+    # bf16 baseline
+    ("fused_bf16", 16, 64, None, None, None),
+    ("fused_bf16", 16, 8192, None, None, None),
+    # FP8 sub-channel (wsz=128)
+    ("fused_fp8_subchan128", 16, 64, jnp.float8_e4m3fn, 128, None),
+    ("fused_fp8_subchan128", 16, 8192, jnp.float8_e4m3fn, 128, None),
+    # FP8 2D block-wise (block_k=128, block_n=128)
+    ("fused_fp8_block128", 16, 64, jnp.float8_e4m3fn, 128, 128),
+    ("fused_fp8_block128", 16, 8192, jnp.float8_e4m3fn, 128, 128),
 ]
 
 
-def profile_epmoe(ep_size: int, tp_size: int, num_tokens: int, trace_dir: str) -> None:
-    mesh = build_mesh(ep_size=ep_size, tp_size=tp_size)
-    tokens = jnp.empty((num_tokens, HIDDEN_SIZE), dtype=jnp.bfloat16)
-    router_logits = generate_router_logits(
-        num_tokens,
-        NUM_EXPERTS,
-        "balanced",
-        num_experts_per_tok=TOP_K,
-    ).astype(jnp.bfloat16)
-
-    with jax.set_mesh(mesh):
-        topk_layer = TopK(topk=TOP_K, renormalize=True)
-        moe_layer = EPMoE(
-            hidden_size=HIDDEN_SIZE,
-            num_experts=NUM_EXPERTS,
-            num_experts_per_tok=TOP_K,
-            ep_size=ep_size,
-            mesh=mesh,
-            intermediate_dim=INTERMEDIATE_SIZE,
-            weight_dtype=jnp.bfloat16,
-            dtype=jnp.bfloat16,
-            activation="silu",
-            layer_id=0,
-        )
-
-        topk_def, topk_state = nnx.split(topk_layer)
-        topk_leaves, topk_treedef = jax.tree_util.tree_flatten(topk_state)
-        moe_def, moe_state = nnx.split(moe_layer)
-        moe_leaves, moe_treedef = jax.tree_util.tree_flatten(moe_state)
-
-        @jax.jit(static_argnames=("topk_treedef", "moe_treedef"))
-        def fn(hidden, logits, *, topk_treedef, topk_leaves, moe_treedef, moe_leaves):
-            topk = nnx.merge(topk_def, jax.tree_util.tree_unflatten(topk_treedef, topk_leaves))
-            moe = nnx.merge(moe_def, jax.tree_util.tree_unflatten(moe_treedef, moe_leaves))
-            w, ids = topk(logits)
-            return moe(hidden, w, ids)
-
-        kwargs = dict(
-            topk_treedef=topk_treedef,
-            topk_leaves=topk_leaves,
-            moe_treedef=moe_treedef,
-            moe_leaves=moe_leaves,
-        )
-
-        # Warmup (compile)
-        out = fn(tokens, router_logits, **kwargs)
-        jax.block_until_ready(out)
-        print("    warmup done")
-
-        # Profile
-        with jax.profiler.trace(trace_dir):
-            for i in range(5):
-                out = fn(tokens, router_logits, **kwargs)
-                jax.block_until_ready(out)
-        print(f"    trace saved to {trace_dir}")
-
-
-def profile_fused(ep_size: int, num_tokens: int, trace_dir: str) -> None:
+def profile_fused(
+    ep_size: int,
+    num_tokens: int,
+    trace_dir: str,
+    weight_dtype=None,
+    subc_quant_wsz: int | None = None,
+    quant_block_n: int | None = None,
+) -> None:
     case = MoEBenchmarkCase(
         name="fused_profile",
         num_tokens=num_tokens,
@@ -134,6 +86,13 @@ def profile_fused(ep_size: int, num_tokens: int, trace_dir: str) -> None:
         NamedSharding(mesh, P("tensor", None)),
     )
 
+    quantization_config = None
+    if weight_dtype is not None:
+        quantization_config = QuantizationConfig(
+            moe_weight_dtype=weight_dtype,
+            moe_activation_dtype=None,
+        )
+
     with jax.set_mesh(mesh):
         fused_layer = FusedEPMoE(
             hidden_size=HIDDEN_SIZE,
@@ -147,7 +106,16 @@ def profile_fused(ep_size: int, num_tokens: int, trace_dir: str) -> None:
             activation="silu",
             layer_id=0,
             renormalize_topk_logits=True,
+            quantization_config=quantization_config,
         )
+
+        if quantization_config is not None:
+            if subc_quant_wsz is not None:
+                fused_layer.subc_quant_wsz = subc_quant_wsz
+            if quant_block_n is not None:
+                fused_layer.quant_block_n = quant_block_n
+            fused_layer.quantize_weights()
+
         topk_layer = TopK(topk=TOP_K, renormalize=True)
 
         moe_def, moe_state = nnx.split(fused_layer)
@@ -187,15 +155,20 @@ def main():
     print(f"MoE xprof profiling: {num_devices} x {jax.devices()[0].device_kind}")
     os.makedirs(PROFILE_DIR, exist_ok=True)
 
-    for backend, ep, tp, nt in PROFILE_CASES:
-        tag = f"{backend}_ep{ep}_tp{tp}_nt{nt}"
-        trace_dir = os.path.join(PROFILE_DIR, tag)
-        print(f"\n[{tag}]")
+    for tag, ep, nt, w_dtype, wsz, block_n in PROFILE_CASES:
+        full_tag = f"{tag}_ep{ep}_nt{nt}"
+        trace_dir = os.path.join(PROFILE_DIR, full_tag)
+        quant_info = ""
+        if w_dtype is not None:
+            if block_n is not None:
+                quant_info = f", 2D block-wise (bk={wsz}, bn={block_n})"
+            else:
+                quant_info = f", sub-channel (wsz={wsz})"
+        print(f"\n[{full_tag}] tokens={nt}, ep={ep}{quant_info}")
 
-        if backend == "epmoe":
-            profile_epmoe(ep, tp, nt, trace_dir)
-        else:
-            profile_fused(ep, nt, trace_dir)
+        profile_fused(
+            ep, nt, trace_dir, weight_dtype=w_dtype, subc_quant_wsz=wsz, quant_block_n=block_n
+        )
 
     # List output
     print("\n=== Profiles saved ===")
