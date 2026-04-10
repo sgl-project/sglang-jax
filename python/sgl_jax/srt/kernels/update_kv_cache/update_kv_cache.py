@@ -163,6 +163,7 @@ def kv_cache_update(
             kv_cache.shape[2] == head_dim
         ), f"kv_cache.shape[2]={kv_cache.shape[2]} is not equal to head_dim={head_dim}"
         assert head_dim % 128 == 0, f"head_dim={head_dim} is not divisible by 128"
+        # smaller or equal to page_size
 
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
