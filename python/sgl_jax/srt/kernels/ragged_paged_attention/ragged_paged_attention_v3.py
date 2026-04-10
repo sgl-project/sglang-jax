@@ -1239,13 +1239,14 @@ def prepare_outputs(
 def prepare_kv_cache_fused(
     kv_cache_fused: jax.Array,  # [total_num_pages, page_size, actual_num_kv_heads * 2, actual_head_dim]
 ):
-    total_num_pages, page_size, actual_num_kv_heads_interleaved, actual_head_dim = (
-        kv_cache_fused.shape
-    )
-    assert actual_num_kv_heads_interleaved % 2 == 0
-
-    kv_packing = get_dtype_packing(kv_cache_fused.dtype)
-    num_kv_heads_interleaved = align_to(actual_num_kv_heads_interleaved, kv_packing)
+    (
+        total_num_pages,
+        page_size,
+        actual_num_kv_heads_interleaved_per_packing,
+        packing,
+        actual_head_dim,
+    ) = kv_cache_fused.shape
+    # assert actual_num_kv_heads_interleaved_per_packing % 2 == 0
     head_dim = align_to(actual_head_dim, 128)
 
     kv_cache_fused_processed = jnp.pad(
@@ -1253,16 +1254,11 @@ def prepare_kv_cache_fused(
         (
             (0, 0),
             (0, 0),
-            (0, num_kv_heads_interleaved - actual_num_kv_heads_interleaved),
+            (0, 0),
+            (0, 0),
             (0, head_dim - actual_head_dim),
         ),
         constant_values=0,
-    ).reshape(
-        total_num_pages,
-        page_size,
-        num_kv_heads_interleaved // kv_packing,
-        kv_packing,
-        head_dim,
     )
     return kv_cache_fused_processed
 
@@ -1282,11 +1278,7 @@ def prepare_updated_kv_cache_fused(
     ) = kv_cache_fused.shape
 
     actual_num_kv_heads_interleaved = actual_num_kv_heads * 2
-    return kv_cache_fused.reshape(
-        -1,
-        num_kv_heads_interleaved_packed * kv_packing,
-        head_dim,
-    )[:, :actual_num_kv_heads_interleaved, :actual_head_dim]
+    return kv_cache_fused[:, :, :actual_num_kv_heads_interleaved]
 
 
 def static_validate_inputs(

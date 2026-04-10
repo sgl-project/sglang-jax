@@ -679,7 +679,9 @@ class ModelRunner(BaseModelRunner):
                 self.token_to_kv_pool.mesh,
                 P(
                     self.token_to_kv_pool.attention_data_partition_axis,
+                    None,
                     self.token_to_kv_pool.kv_partition_axis,
+                    None,
                     None,
                 ),
             )

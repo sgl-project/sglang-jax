@@ -446,10 +446,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # so the mapping array must be sized accordingly.
         mapping_size = self.full_attn_allocator.size_per_rank + page_size
         if dp_size == 1:
-            self.full_to_swa_index_mapping = np.zeros(mapping_size, dtype=np.int64)
+            self.full_to_swa_index_mapping = np.zeros(mapping_size, dtype=np.int32)
         else:
             self.full_to_swa_index_mapping = [
-                np.zeros(mapping_size, dtype=np.int64) for _ in range(dp_size)
+                np.zeros(mapping_size, dtype=np.int32) for _ in range(dp_size)
             ]
         self.clear()
 

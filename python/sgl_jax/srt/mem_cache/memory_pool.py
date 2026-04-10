@@ -9,6 +9,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
+from sgl_jax.srt.kernels.ragged_paged_attention.util import get_dtype_packing
 from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
     get_num_slices_per_block,
     get_slot_mapping,
@@ -308,19 +309,27 @@ class MHATokenToKVPool(KVCache):
     def _create_buffers(self):
         """Create sharded fused KV cache buffers with proper distributed allocation"""
         self.kv_sharding = NamedSharding(
-            self.mesh, P(self.attention_data_partition_axis, self.kv_partition_axis, None)
+            self.mesh,
+            P(self.attention_data_partition_axis, None, self.kv_partition_axis, None, None),
         )
 
         logger.info("Creating fused KV buffers for %s layers", self.layer_num)
         start_time = time.time()
 
-        assert self.size % self.dp_size == 0, "Cache size must be divisible by dp_size"
+        assert (
+            self.size % self.dp_size == 0 and self.size % self.page_size == 0
+        ), "Cache size must be divisible by dp_size and size must be divisible by page size"
 
+        # Hack: this shape is more friendly to rpav3
+        packing = get_dtype_packing(self.dtype)
         fused_buffer_shape = (
-            self.size + self.page_size * self.dp_size,
-            self.head_num * 2,  # [K0,V0,K1,V1,...]
+            (self.size + self.page_size * self.dp_size) // self.page_size,
+            self.page_size,
+            self.head_num * 2 // packing,  # [K0,V0,K1,V1,...]
+            packing,
             self.head_dim,
         )
+        print(f"{fused_buffer_shape=}")
         total_memory_per_layer = (
             fused_buffer_shape[0]
             * fused_buffer_shape[1]
@@ -541,10 +550,7 @@ class SWAKVPool(KVCache):
 
     def tree_flatten(self):
         mapping = self.full_to_swa_index_mapping
-        if isinstance(mapping, list):
-            mapping_children = tuple(mapping)
-        else:
-            mapping_children = (mapping,)
+        mapping_children = tuple(mapping) if isinstance(mapping, list) else (mapping,)
         children = (self.swa_kv_pool, self.full_kv_pool) + mapping_children
         aux_data = {
             "size": self.size,
