@@ -114,7 +114,7 @@ class SamplingMetadata:
         mesh: Mesh = None,
         vocab_size: int = 32000,
     ) -> SamplingMetadata:
-        sharding = NamedSharding(mesh, PartitionSpec("data")) if jax.process_count() == 1 else None
+        sharding = NamedSharding(mesh, PartitionSpec("data"))
         if batch.sampling_info.sampling_seeds is not None:
             sampling_seeds_device = device_array(
                 batch.sampling_info.sampling_seeds, sharding=sharding
@@ -141,11 +141,7 @@ class SamplingMetadata:
         # TODO: @Brian fix penalty with DataParallel
         linear_penalty_device = None
         do_penalties = False
-        linear_penalty_sharding = (
-            NamedSharding(mesh, PartitionSpec("data", "tensor"))
-            if jax.process_count() == 1
-            else None
-        )
+        linear_penalty_sharding = NamedSharding(mesh, PartitionSpec("data", "tensor"))
 
         # Handle linear penalty independently (created by update_penalties)
         if (
