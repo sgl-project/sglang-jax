@@ -6,7 +6,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-
 try:
     import scipy.stats
 except ImportError:  # pragma: no cover

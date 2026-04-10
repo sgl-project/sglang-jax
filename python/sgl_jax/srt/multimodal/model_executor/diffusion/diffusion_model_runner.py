@@ -4,8 +4,8 @@ from collections.abc import Callable
 from functools import partial
 
 import jax
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from jax import NamedSharding
 from jax.sharding import PartitionSpec

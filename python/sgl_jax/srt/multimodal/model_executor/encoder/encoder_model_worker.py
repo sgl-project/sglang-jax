@@ -3,7 +3,9 @@ import logging
 import jax.numpy as jnp
 
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
-from sgl_jax.srt.multimodal.model_executor.encoder.encoder_model_runner import EncoderModelRunner
+from sgl_jax.srt.multimodal.model_executor.encoder.encoder_model_runner import (
+    EncoderModelRunner,
+)
 from sgl_jax.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)

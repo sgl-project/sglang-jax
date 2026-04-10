@@ -105,9 +105,9 @@ class TimestepEmbedder(nnx.Module):
             t, self.frequency_embedding_size, self.max_period, dtype=self.freq_dtype
         ).astype(self.mlp.fc_in.weight.dtype)
         if timestep_seq_len is not None:
-            assert t_freq.shape[0] % timestep_seq_len == 0, (
-                "timestep length is not divisible by timestep_seq_len"
-            )
+            assert (
+                t_freq.shape[0] % timestep_seq_len == 0
+            ), "timestep length is not divisible by timestep_seq_len"
             batch_size = t_freq.shape[0] // timestep_seq_len
             t_freq = t_freq.reshape((batch_size, timestep_seq_len, -1))
         t_emb = self.mlp(t_freq)

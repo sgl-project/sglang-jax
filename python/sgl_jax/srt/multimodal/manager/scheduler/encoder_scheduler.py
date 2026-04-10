@@ -1,4 +1,5 @@
 import logging
+
 import jax
 import jax.sharding
 
@@ -7,7 +8,9 @@ from sgl_jax.srt.managers.io_struct import AbortReq, ProfileReq
 from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixin
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
-from sgl_jax.srt.multimodal.model_executor.encoder.encoder_model_worker import EncoderModelWorker
+from sgl_jax.srt.multimodal.model_executor.encoder.encoder_model_worker import (
+    EncoderModelWorker,
+)
 
 logger = logging.getLogger(__name__)
 
