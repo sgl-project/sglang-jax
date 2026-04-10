@@ -1428,6 +1428,17 @@ def ragged_paged_attention(
     Returns:
       The output of the attention.
     """
+    # Fused path: attention_sink is not supported here because the fused kernel does not
+    # output logsumexp, which is required for the post-kernel alpha correction used by
+    # ragged_paged_attention_split. Use split KV cache (k_cache + v_cache) instead.
+    if attention_sink is not None:
+        raise NotImplementedError(
+            "attention_sink is not supported in the fused KV path. "
+            "The fused kernel does not output logsumexp, so the post-kernel alpha correction "
+            "used by ragged_paged_attention_split cannot be applied. "
+            "To use attention_sink, pass k_cache and v_cache (split KV) instead of kv_cache_fused, "
+            "or ensure the model's token_to_kv_pool has is_split=True."
+        )
     q, k, v = queries, keys, values
     static_validate_inputs_fused(
         q,
