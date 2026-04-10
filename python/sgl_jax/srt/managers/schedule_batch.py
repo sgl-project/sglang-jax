@@ -880,6 +880,9 @@ class ScheduleBatch:
         """
         self.forward_mode = ForwardMode.EXTEND
 
+        if self.is_hybrid:
+            self.maybe_evict_swa()
+
         # Process each DP rank
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]

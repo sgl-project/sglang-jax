@@ -386,10 +386,24 @@ class ModelRunner(BaseModelRunner):
         head_dim = self.model_config.head_dim
         head_dim_aligned = (head_dim + 127) // 128 * 128
 
+
+        def adjust_layer_num():
+            # 0 for full attention, 1 for swa
+            full,swa=0,0
+            if getattr(self.model_config.hf_text_config, "hybrid_layer_pattern",None):
+                for pattern in self.model_config.hf_text_config.hybrid_layer_pattern:
+                    if pattern==0:
+                        full+=1
+                    elif pattern==1:
+                        swa+=1
+                return (self.model_config.hf_text_config.swa_num_key_value_heads//self.model_config.hf_text_config.num_key_value_heads)*swa+full
+            else:
+                return self.model_config.num_hidden_layers 
+
         cell_size = (
             self.model_config.get_num_kv_heads(self.attention_tp_size)
             * head_dim_aligned
-            * self.model_config.num_hidden_layers
+            * adjust_layer_num()
             * 2
             * jnp.dtype(self.kv_cache_dtype).itemsize
         )
