@@ -125,122 +125,61 @@ class FlashAttention(AttentionBackend):
 
         total_loc_len = len(batch.cache_loc)
         per_dp_loc_len = total_loc_len // batch.dp_size
-        page_indices_list = []
-        for i in range(batch.dp_size):
-            # 1. Split: Get the slice for this DP rank
-            start = i * per_dp_loc_len
-            end = (i + 1) * per_dp_loc_len
-            rank_cache_loc = batch.cache_loc[start:end]
-            # 2. Pad: Ensure the rank's data is a multiple of page_size
-            # This ensures that when we stride, we cover the last partial page if it exists,
-            # and the stride for the NEXT rank starts fresh at index 0.
-            remainder = len(rank_cache_loc) % self.page_size
-            if remainder > 0:
-                pad_len = self.page_size - remainder
-                # Pad with 0 (safe dummy slot mapping to page 0)
-                rank_cache_loc = np.concatenate([rank_cache_loc, np.zeros(pad_len, dtype=np.int32)])
 
-            # 3. Select: Sample the start of each page
-            rank_selected_locs = rank_cache_loc[:: self.page_size]
+        # Reshape cache_loc to (dp_size, per_dp_loc_len) — O(1) view
+        cache_loc_2d = batch.cache_loc.reshape(batch.dp_size, per_dp_loc_len)
+        # Stride by page_size to pick one slot per page — O(1) view
+        strided_2d = cache_loc_2d[:, :: self.page_size]
+        # Physical slot -> Physical page index
+        page_indices = (strided_2d // self.page_size).ravel()
 
-            # 4. Convert: Physical slot -> Physical page index
-            rank_page_indices = rank_selected_locs // self.page_size
-            page_indices_list.append(rank_page_indices)
-        # 5. Merge: Concatenate all ranks
-        page_indices = np.concatenate(page_indices_list)
-
+        # SWA page indices: stride first, then apply mapping on ~N_pages entries
+        # instead of ~N_tokens entries (256x fewer random accesses)
         swa_page_indices = None
         swa_mapping = getattr(self, "swa_index_mapping", None)
         if swa_mapping is not None:
-            swa_page_indices_list = []
+            n_pages = strided_2d.shape[1]
+            swa_strided = np.empty((batch.dp_size, n_pages), dtype=np.int32)
             for i in range(batch.dp_size):
-                start = i * per_dp_loc_len
-                end = (i + 1) * per_dp_loc_len
-                rank_cache_loc = batch.cache_loc[start:end]
                 mapping = swa_mapping[i] if isinstance(swa_mapping, list) else swa_mapping
-                rank_swa_cache_loc = mapping[rank_cache_loc]
+                swa_strided[i] = mapping[strided_2d[i]]
+            swa_page_indices = (swa_strided // self.page_size).ravel()
 
-                remainder = len(rank_swa_cache_loc) % self.page_size
-                if remainder > 0:
-                    pad_len = self.page_size - remainder
-                    rank_swa_cache_loc = np.concatenate(
-                        [rank_swa_cache_loc, np.zeros(pad_len, dtype=np.int32)]
-                    )
-
-                rank_swa_selected = rank_swa_cache_loc[:: self.page_size]
-                rank_swa_page_indices = rank_swa_selected // self.page_size
-                swa_page_indices_list.append(rank_swa_page_indices)
-
-            swa_page_indices = np.concatenate(swa_page_indices_list)
-
-        # Compute cu_q_lens per DP rank section (each section starts from 0)
+        # cu_q_lens per DP rank section (each section starts from 0)
         if batch.forward_mode == ForwardMode.EXTEND:
-            cu_q_lens_sections = []
-            for i in range(0, len(batch.extend_seq_lens), batch.per_dp_bs_size):
-                section_lens = batch.extend_seq_lens[i : i + batch.per_dp_bs_size]
-                section_cu = np.concatenate(
-                    [
-                        np.array([0], dtype=np.int32),
-                        np.cumsum(section_lens, dtype=np.int32),
-                    ]
-                )
-                cu_q_lens_sections.append(section_cu)
-            cu_q_lens = np.concatenate(cu_q_lens_sections)
+            ext_2d = batch.extend_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
+            cu_q_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)
+            cu_q_2d[:, 1:] = np.cumsum(ext_2d, axis=1)
+            cu_q_lens = cu_q_2d.ravel()
         elif batch.forward_mode == ForwardMode.DECODE:
-            cu_q_lens_sections = []
-            for i in range(0, len(batch.seq_lens), batch.per_dp_bs_size):
-                section_cu = np.concatenate(
-                    [
-                        np.array([0], dtype=np.int32),
-                        np.cumsum(np.ones(batch.per_dp_bs_size, dtype=np.int32)),
-                    ]
-                )
-                cu_q_lens_sections.append(section_cu)
-            cu_q_lens = np.concatenate(cu_q_lens_sections)
+            single_cu = np.arange(batch.per_dp_bs_size + 1, dtype=np.int32)
+            cu_q_lens = np.tile(single_cu, batch.dp_size)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-        seq_lens = np.copy(batch.seq_lens)
+        seq_lens = batch.seq_lens
 
         aligned_seq_lens = (
             (batch.seq_lens + self.page_size - 1) // self.page_size
         ) * self.page_size
 
-        # Compute cu_kv_lens per DP rank section (each section starts from 0)
-        cu_kv_lens_sections = []
-        for i in range(0, len(aligned_seq_lens), batch.per_dp_bs_size):
-            section_lens = aligned_seq_lens[i : i + batch.per_dp_bs_size]
-            section_cu = np.concatenate(
-                [
-                    np.array([0], dtype=np.int32),
-                    np.cumsum(section_lens, dtype=np.int32),
-                ]
-            )
-            cu_kv_lens_sections.append(section_cu)
-        cu_kv_lens = np.concatenate(cu_kv_lens_sections)
+        # cu_kv_lens per DP rank section — vectorized 2D cumsum
+        aligned_2d = aligned_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
+        cu_kv_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)
+        cu_kv_2d[:, 1:] = np.cumsum(aligned_2d, axis=1)
+        cu_kv_lens = cu_kv_2d.ravel()
 
-        distribution_list = []
-
-        # Iterate through each DP rank's section of the batch
-        for i in range(0, len(batch.seq_lens), batch.per_dp_bs_size):
-            section_seq_lens = batch.seq_lens[i : i + batch.per_dp_bs_size]
-
-            local_num_seqs = np.sum(section_seq_lens > 0, dtype=np.int32)
-
-            if batch.forward_mode == ForwardMode.DECODE:
-                # For Decode, we use the decode-only rpa mode
-                dist = np.array([local_num_seqs, local_num_seqs, local_num_seqs], dtype=np.int32)
-            elif batch.forward_mode == ForwardMode.EXTEND:
-                # For Extend/Prefill: [0, local_num_seqs, local_num_seqs]
-                dist = np.array([0, local_num_seqs, local_num_seqs], dtype=np.int32)
-            else:
-                raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
-
-            distribution_list.append(dist)
-
-        # Stack them to create a (dp_size, 3) array
-        # This allows JAX to shard it along axis 0, so each device gets its own (3,) distribution
-        distribution = np.concatenate(distribution_list)
+        # distribution — vectorized
+        seq_lens_2d = batch.seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
+        local_num_seqs = np.sum(seq_lens_2d > 0, axis=1, dtype=np.int32)
+        if batch.forward_mode == ForwardMode.DECODE:
+            distribution = np.repeat(local_num_seqs, 3)
+        elif batch.forward_mode == ForwardMode.EXTEND:
+            distribution = np.column_stack(
+                [np.zeros_like(local_num_seqs), local_num_seqs, local_num_seqs]
+            ).ravel()
+        else:
+            raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
         (
             metadata.cu_q_lens,
