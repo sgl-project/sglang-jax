@@ -13,9 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
-from sgl_jax.srt.mem_cache.allocator import (
-    SWATokenToKVPoolAllocator,
-)
+from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     ReqToTokenPool,
@@ -272,7 +270,84 @@ class TestSWAAllocatorPaged(unittest.TestCase):
         self.assertEqual(self.alloc.full_available_size(), self.size)
         self.assertEqual(self.alloc.swa_available_size(), self.size_swa)
 
-    # 15
+    # 15 — Regression test for the OOB bug (GH-231)
+    def test_mapping_covers_last_page_indices(self):
+        """full_to_swa_index_mapping must be large enough for max paged token index.
+
+        Before the fix, mapping size was size_per_rank+1, but PagedTokenToKVPoolAllocator
+        can produce indices up to size_per_rank + page_size - 1, causing IndexError
+        when alloc_extend or alloc_decode touches the last page.
+        """
+        # Use a small pool so we can easily exhaust pages and hit the last page
+        ps = 4
+        size = 32  # 8 pages (1..8)
+        size_swa = 32
+        kv = _make_swa_pool(size=size, size_swa=size_swa, page_size=ps, mesh=self.mesh)
+        alloc = SWATokenToKVPoolAllocator(size=size, size_swa=size_swa, kvcache=kv, page_size=ps)
+
+        # Verify mapping array is large enough: needs size + page_size
+        self.assertGreaterEqual(len(alloc.full_to_swa_index_mapping), size + ps)
+
+        # Allocate all pages (8 pages = 32 tokens)
+        all_indices = alloc.alloc(size)
+        self.assertIsNotNone(all_indices)
+
+        # Max index = pages_per_rank * ps + ps - 1 = 8*4+3 = 35
+        max_idx = int(np.max(all_indices))
+        self.assertEqual(max_idx, size + ps - 1)
+
+        # This must NOT raise IndexError
+        swa_val = alloc.full_to_swa_index_mapping[max_idx]
+        self.assertGreater(swa_val, 0)
+
+    # 15b — Regression: alloc_extend on last page must not OOB (GH-231)
+    def test_alloc_extend_last_page_no_oob(self):
+        """alloc_extend touching the last page must not raise IndexError."""
+        ps = 4
+        size = 32
+        size_swa = 32
+        kv = _make_swa_pool(size=size, size_swa=size_swa, page_size=ps, mesh=self.mesh)
+        alloc = SWATokenToKVPoolAllocator(size=size, size_swa=size_swa, kvcache=kv, page_size=ps)
+
+        # Alloc 28 tokens (7 pages), leaving 1 page (page 8) free
+        prefix = alloc.alloc(28)
+        self.assertIsNotNone(prefix)
+        last_loc = [int(prefix[-1])]
+
+        # Extend by 4 tokens → must allocate the 8th (last) page
+        result = alloc.alloc_extend(
+            prefix_lens=[28], seq_lens=[32], last_loc=last_loc, extend_num_tokens=4
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result), 4)
+
+        # All returned indices should have valid SWA mappings
+        for idx in result:
+            self.assertGreater(int(alloc.full_to_swa_index_mapping[idx]), 0)
+
+    # 15c — Regression: alloc_decode on last page must not OOB (GH-231)
+    def test_alloc_decode_last_page_no_oob(self):
+        """alloc_decode allocating the last page must not raise IndexError."""
+        ps = 4
+        size = 32
+        size_swa = 32
+        kv = _make_swa_pool(size=size, size_swa=size_swa, page_size=ps, mesh=self.mesh)
+        alloc = SWATokenToKVPoolAllocator(size=size, size_swa=size_swa, kvcache=kv, page_size=ps)
+
+        # Alloc 28 tokens (7 pages), then the last page boundary token
+        prefix = alloc.alloc(28)
+        self.assertIsNotNone(prefix)
+        last_loc = [int(prefix[-1])]
+
+        # Decode: seq_lens=[29] → needs a new page (page 8), the last one
+        result = alloc.alloc_decode(seq_lens=[29], last_loc=last_loc)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result), 1)
+
+        # The new token should have a valid SWA mapping
+        self.assertGreater(int(alloc.full_to_swa_index_mapping[result[0]]), 0)
+
+    # 16
     def test_clear_resets_everything(self):
         """clear() fully resets both pools and the mapping."""
         indices = self.alloc.alloc(16)

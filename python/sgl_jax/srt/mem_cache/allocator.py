@@ -441,14 +441,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 debug_mode=False,
                 dp_size=dp_size,
             )
+        # When page_size > 1, the paged allocator produces token indices up to
+        # pages_per_rank * page_size + page_size - 1 = size_per_rank + page_size - 1,
+        # so the mapping array must be sized accordingly.
+        mapping_size = self.full_attn_allocator.size_per_rank + page_size
         if dp_size == 1:
-            self.full_to_swa_index_mapping = np.zeros(
-                self.full_attn_allocator.size_per_rank + 1, dtype=np.int32
-            )
+            self.full_to_swa_index_mapping = np.zeros(mapping_size, dtype=np.int32)
         else:
             self.full_to_swa_index_mapping = [
-                np.zeros(self.full_attn_allocator.size_per_rank + 1, dtype=np.int32)
-                for _ in range(dp_size)
+                np.zeros(mapping_size, dtype=np.int32) for _ in range(dp_size)
             ]
         self.clear()
 
@@ -553,9 +554,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc_np = np.array(last_loc)
         swa_last_loc = mapping[last_loc_np].astype(np.int32).tolist()
 
-        swa_indices = self.swa_attn_allocator.alloc_decode(
-            seq_lens, swa_last_loc, dp_rank=dp_rank
-        )
+        swa_indices = self.swa_attn_allocator.alloc_decode(seq_lens, swa_last_loc, dp_rank=dp_rank)
         if swa_indices is None:
             self.full_attn_allocator.free(full_indices, dp_rank=dp_rank)
             return None
