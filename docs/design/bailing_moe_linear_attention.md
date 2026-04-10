@@ -189,7 +189,20 @@ This pattern (GSPMD for pure-JAX kernels, `shard_map` for Pallas kernels) is con
 All requests' q/k/v are scattered into a chunk-aligned `[1, T_packed_bucket, H, K]` buffer and processed in a single `simple_gla_fwd` call. `cu_seqlens_dev` is passed as sequence boundaries (dispatching to `chunk_simple_gla_fwd_varlen`), which resets state at boundaries — natural per-request state isolation. This avoids per-request Python loops and repeated kernel launches.
 
 **Intra-chunk padding and state accuracy**
-After scatter, positions in the chunk-aligned buffer that correspond to intra-chunk padding are filled with zeros (from `jnp.zeros` initialization). The kernel processes these as `h_t = decay * h_{t-1}`, causing `(chunk_size - seq_len % chunk_size) % chunk_size` extra decay steps. Worst case: `seq_len=1` padded to 64, state multiplied by `decay^63`. The actual precision impact depends on the magnitude of each head's `|g_gamma|` (determined jointly by the base slope and the layer-dependent scale factor); the concrete error is covered by the cross-framework numerical validation in the Testing section.
+After scatter, positions in the chunk-aligned buffer that correspond to intra-chunk padding are filled with zeros (from `jnp.zeros` initialization). The kernel processes these as `h_t = decay * h_{t-1}`, causing `(chunk_size - seq_len % chunk_size) % chunk_size` extra decay steps. Worst case: `seq_len=1` padded to 64, state multiplied by `decay^63`.
+
+Empirical measurements (g_gamma values: -0.05, -0.10, -0.15, -0.20; h0 scale 0.1; float32):
+
+| Scenario | Extra positions | Head (g_gamma) | decay^N | State max diff |
+|----------|---------------:|----------------|--------:|---------------:|
+| T=100→128 | 28 | Head 2 (-0.05) | 0.2466 | 1.10e+01 |
+| T=100→128 | 28 | Head 0 (-0.10) | 0.0608 | 1.03e+01 |
+| T=100→128 | 28 | Head 3 (-0.15) | 0.0150 | 9.33e+00 |
+| T=100→128 | 28 | Head 1 (-0.20) | 0.0037 | 8.10e+00 |
+| T=1→64   | 63 | Head 2 (-0.05) | 0.0429 | 5.48e+00 |
+| T=1→64   | 63 | Head 0 (-0.10) | 0.0018 | 1.02e+01 |
+| T=1→64   | 63 | Head 3 (-0.15) | 0.0001 | 7.44e+00 |
+| T=1→64   | 63 | Head 1 (-0.20) | 0.0000 | 5.40e+00 |
 
 Accepted rationale: intra-chunk padding only affects the prefill path; `seq_len=1` prefill is rare in practice; the decode path fully avoids this via `fused_recurrent_simple_gla`.
 

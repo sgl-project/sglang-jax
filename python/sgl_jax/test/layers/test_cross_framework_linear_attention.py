@@ -595,3 +595,60 @@ class TestGLARecurrenceReference:
             rtol=1e-2,
             err_msg="Prefill kernel final state diverges from numpy GLA reference",
         )
+
+    @requires_tops
+    @requires_tpu
+    def test_prefill_non_aligned_matches_numpy_reference(self):
+        """simple_gla_fwd with non-chunk-aligned seq_len (zero-padded to chunk boundary).
+
+        Verifies that scatter/padding → kernel → state produces results consistent
+        with numpy recurrence over the same zero-padded input.
+        """
+        T_real = 100  # non-aligned
+        CHUNK = 64
+        T_padded = ((T_real + CHUNK - 1) // CHUNK) * CHUNK  # 128
+        H, K = 4, 128
+        B = 1
+        rng = np.random.default_rng(302)
+
+        # Generate real tokens, then zero-pad to chunk-aligned length
+        q_real = rng.standard_normal((B, T_real, H, K)).astype(np.float32)
+        k_real = rng.standard_normal((B, T_real, H, K)).astype(np.float32)
+        v_real = rng.standard_normal((B, T_real, H, K)).astype(np.float32)
+
+        q_padded = np.zeros((B, T_padded, H, K), dtype=np.float32)
+        k_padded = np.zeros((B, T_padded, H, K), dtype=np.float32)
+        v_padded = np.zeros((B, T_padded, H, K), dtype=np.float32)
+        q_padded[:, :T_real] = q_real
+        k_padded[:, :T_real] = k_real
+        v_padded[:, :T_real] = v_real
+
+        h0_np = rng.standard_normal((B, H, K, K)).astype(np.float32) * 0.1
+        g_gamma_np = np.array([-0.1, -0.2, -0.05, -0.15], dtype=np.float32)
+
+        # Numpy reference: recurrence over T_padded (including zero-padded positions)
+        _, state_ref_padded = numpy_gla_recurrent(
+            q_padded, k_padded, v_padded, g_gamma_np, h0=h0_np
+        )
+
+        # Kernel with cu_seqlens set to padded length (as our LinearAttentionBackend does)
+        cu_seqlens = jnp.array([0, T_padded], dtype=jnp.int32)
+        _, state_jax = simple_gla_fwd(
+            jnp.array(q_padded),
+            jnp.array(k_padded),
+            jnp.array(v_padded),
+            g_gamma=jnp.array(g_gamma_np),
+            h0=jnp.array(h0_np),
+            cu_seqlens_dev=cu_seqlens,
+            scale=None,
+            use_ht=True,
+            chunk_size=CHUNK,
+        )
+
+        np.testing.assert_allclose(
+            jax_to_numpy(state_jax),
+            state_ref_padded,
+            atol=5e-2,
+            rtol=1e-2,
+            err_msg="Kernel state diverges from numpy reference (non-aligned T=100, padded T=128)",
+        )
