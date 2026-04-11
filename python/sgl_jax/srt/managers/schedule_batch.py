@@ -1603,9 +1603,9 @@ class ScheduleBatch:
         if len(seq_lens_cpu) > 0:
             seq_lens = seq_lens_cpu
             if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
-                if self.forward_mode == ForwardMode.TARGET_VERIFY:
+                if self.forward_mode == ForwardMode.TARGET_VERIFY and self.spec_info is not None:
                     seq_lens = seq_lens_cpu + self.spec_info.draft_token_num
-                elif self.forward_mode == ForwardMode.DECODE:
+                elif self.forward_mode == ForwardMode.DECODE and self.spec_algorithm.is_eagle():
                     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 
                     seq_lens = seq_lens_cpu + EagleDraftInput.ALLOC_LEN_PER_DECODE
@@ -1618,7 +1618,8 @@ class ScheduleBatch:
                 if (
                     self.forward_mode == ForwardMode.DECODE
                     and not self.spec_algorithm.is_none()
-                    and self.spec_info.allocate_lens is not None
+                    and self.spec_info is not None
+                    and getattr(self.spec_info, "allocate_lens", None) is not None
                 ):
                     # Explicitly convert to numpy to avoid JAX device synchronization overhead
                     allocated_len_cpu = np.array(self.spec_info.allocate_lens)
@@ -1702,6 +1703,7 @@ class ScheduleBatch:
             spec_info=self.spec_info,
             spec_algorithm=self.spec_algorithm,
             tree_cache=self.tree_cache,
+            reqs=self.reqs,
         )
 
     def _generate_trace_info(self, real_bs: int, bid: int) -> list[str]:
@@ -1971,6 +1973,9 @@ class ModelWorkerBatch:
 
     # MRoPE position information [3, total_tokens]
     mrope_positions: np.ndarray | None = None
+
+    # Request objects (needed by ngram speculative decoding)
+    reqs: list | None = None
 
     def get_original_input_len(self):
         """

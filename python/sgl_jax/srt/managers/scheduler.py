@@ -293,6 +293,13 @@ class Scheduler(
                 server_args=server_args,
                 target_worker=self.tp_worker,
             )
+        elif self.spec_algorithm is not None and self.spec_algorithm.is_ngram():
+            from sgl_jax.srt.speculative.ngram_worker import NgramWorker
+
+            self.draft_worker = NgramWorker(
+                server_args=server_args,
+                target_worker=self.tp_worker,
+            )
 
         # Get token and memory info from the model worker
         (
@@ -1402,6 +1409,9 @@ class Scheduler(
         if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
             assert isinstance(batch_output.next_draft_input, EagleDraftInput)
             ret.next_draft_input = batch_output.next_draft_input
+            ret.accept_lens = batch_output.accept_lens
+            ret.allocate_lens = batch_output.allocate_lens
+        elif self.spec_algorithm is not None and self.spec_algorithm.is_ngram():
             ret.accept_lens = batch_output.accept_lens
             ret.allocate_lens = batch_output.allocate_lens
         return ret
