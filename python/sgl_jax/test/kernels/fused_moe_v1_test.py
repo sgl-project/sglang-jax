@@ -163,7 +163,7 @@ class MoEKernelTest(jtu.JaxTestCase):
         bse: int | None = None,
         act_fn="silu",
         w_dtype=None,
-        subc_quant_wsz=None,
+        quant_block_k=None,
         has_bias=False,
         has_shared_expert=False,
         use_grouped_topk=False,
@@ -187,13 +187,13 @@ class MoEKernelTest(jtu.JaxTestCase):
         w1_shared_scale = w2_shared_scale = w3_shared_scale = None
 
         if w_dtype is not None:
-            if subc_quant_wsz is None:
-                subc_quant_wsz = 256
+            if quant_block_k is None:
+                quant_block_k = 256
 
             # 1D sub-channel quantization
-            w1, w1_scale_3d = quantize_tensor(w_dtype, w1, axis=1, block_size=subc_quant_wsz)
-            w3, w3_scale_3d = quantize_tensor(w_dtype, w3, axis=1, block_size=subc_quant_wsz)
-            w2, w2_scale_3d = quantize_tensor(w_dtype, w2, axis=1, block_size=subc_quant_wsz)
+            w1, w1_scale_3d = quantize_tensor(w_dtype, w1, axis=1, block_size=quant_block_k)
+            w3, w3_scale_3d = quantize_tensor(w_dtype, w3, axis=1, block_size=quant_block_k)
+            w2, w2_scale_3d = quantize_tensor(w_dtype, w2, axis=1, block_size=quant_block_k)
 
             # Reshape scales to the 4D layout expected by the kernel.
             w1_scale = w1_scale_3d.reshape(
@@ -255,7 +255,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             topk_ids=topk_ids,
             top_k=top_k,
             act_fn=act_fn,
-            subc_quant_wsz=subc_quant_wsz,
+            quant_block_k=quant_block_k,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w3_scale=w3_scale,
@@ -286,7 +286,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             b3=b3,
             renormalize_topk_logits=renormalize_topk_logits,
             act_fn=act_fn,
-            subc_quant_wsz=subc_quant_wsz,
+            quant_block_k=quant_block_k,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w3_scale=w3_scale,
@@ -516,7 +516,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             seed=1234,
             renormalize_topk_logits=False,
             w_dtype=w_dtype,
-            subc_quant_wsz=256,
+            quant_block_k=256,
             bt=32,
             bf=1024,
             bd1=1024,
@@ -536,8 +536,8 @@ class MoEKernelTest(jtu.JaxTestCase):
 
         This exercises the scale-group Python for-loop (n_sg > 1) that was
         added to avoid HLO unrolling explosion with FP8 sub-channel quant.
-        With bd1c=1024 and subc_quant_wsz=256, n_sg = 1024/2/256 = 2.
-        With bfc=1024 and subc_quant_wsz=256, n_sg2 = 1024/256 = 4.
+        With bd1c=1024 and quant_block_k=256, n_sg = 1024/2/256 = 2.
+        With bfc=1024 and quant_block_k=256, n_sg2 = 1024/256 = 4.
         """
         if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
             self.skipTest("float4 requires TPUv7+")
@@ -557,7 +557,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             seed=1234,
             renormalize_topk_logits=False,
             w_dtype=w_dtype,
-            subc_quant_wsz=256,
+            quant_block_k=256,
             bt=32,
             bf=1024,
             bd1=1024,
@@ -575,8 +575,8 @@ class MoEKernelTest(jtu.JaxTestCase):
     def test_sub_channel_quantization_group128(self, w_dtype):
         """Test sub-channel quantization with group_size=128 (block-wise quant).
 
-        With bd1c=512 and subc_quant_wsz=128, n_sg = 512/2/128 = 2.
-        With bfc=256 and subc_quant_wsz=128, n_sg2 = 256/128 = 2.
+        With bd1c=512 and quant_block_k=128, n_sg = 512/2/128 = 2.
+        With bfc=256 and quant_block_k=128, n_sg2 = 256/128 = 2.
         """
         if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
             self.skipTest("float4 requires TPUv7+")
@@ -596,7 +596,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             seed=1234,
             renormalize_topk_logits=False,
             w_dtype=w_dtype,
-            subc_quant_wsz=128,
+            quant_block_k=128,
             bt=32,
             bf=1024,
             bd1=1024,
@@ -614,8 +614,8 @@ class MoEKernelTest(jtu.JaxTestCase):
     def test_sub_channel_quantization_group128_large_tile(self, w_dtype):
         """Test group_size=128 with large tiles to exercise fori_loop with more iterations.
 
-        With bd1c=1024 and subc_quant_wsz=128, n_sg = 1024/2/128 = 4.
-        With bfc=1024 and subc_quant_wsz=128, n_sg2 = 1024/128 = 8.
+        With bd1c=1024 and quant_block_k=128, n_sg = 1024/2/128 = 4.
+        With bfc=1024 and quant_block_k=128, n_sg2 = 1024/128 = 8.
         """
         if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
             self.skipTest("float4 requires TPUv7+")
@@ -635,7 +635,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             seed=1234,
             renormalize_topk_logits=False,
             w_dtype=w_dtype,
-            subc_quant_wsz=128,
+            quant_block_k=128,
             bt=32,
             bf=1024,
             bd1=1024,
@@ -669,7 +669,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             seed=1234,
             renormalize_topk_logits=False,
             w_dtype=w_dtype,
-            subc_quant_wsz=256,
+            quant_block_k=256,
             has_shared_expert=True,
             bt=32,
             bf=1024,

@@ -196,10 +196,10 @@ class FusedEPMoE(nnx.Module):
             getattr(quantization_config, "weight_block_size", None) if quantization_config else None
         )
         if weight_block_size is not None and len(weight_block_size) == 2:
-            self.subc_quant_wsz = int(weight_block_size[1])  # block_k
+            self.quant_block_k = int(weight_block_size[1])  # block_k
             self.quant_block_n = int(weight_block_size[0])  # block_n
         else:
-            self.subc_quant_wsz = None
+            self.quant_block_k = None
             self.quant_block_n = None
 
     def quantize_weights(self, is_static: bool = False):
@@ -207,11 +207,11 @@ class FusedEPMoE(nnx.Module):
         if self.quantized_dtype is None:
             return
 
-        # Default subc_quant_wsz to 256 if not explicitly set.
-        wsz = self.subc_quant_wsz if self.subc_quant_wsz is not None else 256
-        if hasattr(self, "subc_quant_wsz"):
-            del self.subc_quant_wsz
-        self.subc_quant_wsz = wsz
+        # Default quant_block_k to 256 if not explicitly set.
+        wsz = self.quant_block_k if self.quant_block_k is not None else 256
+        if hasattr(self, "quant_block_k"):
+            del self.quant_block_k
+        self.quant_block_k = wsz
 
         with jax.set_mesh(self.mesh):
             if is_static:
@@ -302,19 +302,19 @@ class FusedEPMoE(nnx.Module):
                     self.quantized_dtype,
                     self.w1.value,
                     axis=(1, 2),
-                    block_size=[self.subc_quant_wsz, self.quant_block_n],
+                    block_size=[self.quant_block_k, self.quant_block_n],
                 )
                 w3_value, w3_scale = quantize_tensor(
                     self.quantized_dtype,
                     self.w3.value,
                     axis=(1, 2),
-                    block_size=[self.subc_quant_wsz, self.quant_block_n],
+                    block_size=[self.quant_block_k, self.quant_block_n],
                 )
                 w2_value, w2_scale = quantize_tensor(
                     self.quantized_dtype,
                     self.w2.value,
                     axis=(1, 2),
-                    block_size=[self.subc_quant_wsz, self.quant_block_n],
+                    block_size=[self.quant_block_k, self.quant_block_n],
                 )
             else:
                 # 1D sub-channel quantization: scale shape (E, K//wsz, N)
@@ -322,19 +322,19 @@ class FusedEPMoE(nnx.Module):
                     self.quantized_dtype,
                     self.w1.value,
                     axis=1,
-                    block_size=self.subc_quant_wsz,
+                    block_size=self.quant_block_k,
                 )
                 w3_value, w3_scale = quantize_tensor(
                     self.quantized_dtype,
                     self.w3.value,
                     axis=1,
-                    block_size=self.subc_quant_wsz,
+                    block_size=self.quant_block_k,
                 )
                 w2_value, w2_scale = quantize_tensor(
                     self.quantized_dtype,
                     self.w2.value,
                     axis=1,
-                    block_size=self.subc_quant_wsz,
+                    block_size=self.quant_block_k,
                 )
 
             # NOTE: Fused MoE shards the expert dimension across EP=(data*tensor).
@@ -475,7 +475,7 @@ class FusedEPMoE(nnx.Module):
         w3_shared_scale = self.w3_shared_scale.value if self.w3_shared_scale is not None else None
         w2_shared_scale = self.w2_shared_scale.value if self.w2_shared_scale is not None else None
 
-        subc_quant_wsz = self.subc_quant_wsz if self.subc_quant_wsz is not None else None
+        quant_block_k = self.quant_block_k if self.quant_block_k is not None else None
 
         output = fused_ep_moe(
             mesh=self.mesh,
@@ -503,7 +503,7 @@ class FusedEPMoE(nnx.Module):
             disable_all_reduce_metadata=self.disable_all_reduce_metadata,
             disable_sync_barrier=self.disable_sync_barrier,
             # Optional parameters (not used in basic case)
-            subc_quant_wsz=subc_quant_wsz,
+            quant_block_k=quant_block_k,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w3_scale=w3_scale,

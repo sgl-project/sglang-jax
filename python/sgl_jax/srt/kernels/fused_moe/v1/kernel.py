@@ -49,7 +49,7 @@ class FusedMoEBlockConfig:
         num_tokens: int,
         ep_size: int,
         dtype: jnp.dtype,
-        subc_quant_wsz: int | None = None,
+        quant_block_k: int | None = None,
     ) -> FusedMoEBlockConfig:
         """Return the *effective* config after applying kernel override rules.
 
@@ -84,15 +84,15 @@ class FusedMoEBlockConfig:
 
         bd1c = self.bd1c
         bfc = self.bfc
-        if subc_quant_wsz is not None:
+        if quant_block_k is not None:
             # bd1c/bfc must be multiples of the quantization group size, but no
             # longer forced to exactly one group.  Allowing larger compute tiles
             # drastically reduces HLO size (and thus XLA compile time) because
             # the Python for-loops over bd1c/bfc are statically unrolled.
-            min_bd1c = subc_quant_wsz * t_packing
+            min_bd1c = quant_block_k * t_packing
             bd1c = max(bd1c, min_bd1c)
             bd1c -= bd1c % min_bd1c  # align down to multiple
-            min_bfc = subc_quant_wsz
+            min_bfc = quant_block_k
             bfc = max(bfc, min_bfc)
             bfc -= bfc % min_bfc
 
@@ -212,7 +212,7 @@ def validate_fused_moe_block_config(
     intermediate_size: int,
     dtype: jnp.dtype,
     ep_size: int,
-    subc_quant_wsz: int | None,
+    quant_block_k: int | None,
     block_config: FusedMoEBlockConfig,
 ) -> None:
     """Validate a (post-override) block config against kernel constraints."""
@@ -281,22 +281,22 @@ def validate_fused_moe_block_config(
     if hidden_size % bd1 != 0 or hidden_size % bd2 != 0:
         raise ValueError(f"Expected {hidden_size=} to be aligned to {bd1=} and {bd2=}.")
 
-    if subc_quant_wsz is not None:
-        if subc_quant_wsz <= 0:
-            raise ValueError(f"Expected {subc_quant_wsz=} to be non-negative.")
-        if subc_quant_wsz % 128 != 0:
-            raise ValueError(f"Expected {subc_quant_wsz=} to be aligned to 128.")
-        if hidden_size % subc_quant_wsz != 0:
-            raise ValueError(f"Expected {hidden_size=} to be aligned to {subc_quant_wsz=}.")
-        if intermediate_size % subc_quant_wsz != 0:
-            raise ValueError(f"Expected {intermediate_size=} to be aligned to {subc_quant_wsz=}.")
-        if bd1c % (subc_quant_wsz * t_packing) != 0:
+    if quant_block_k is not None:
+        if quant_block_k <= 0:
+            raise ValueError(f"Expected {quant_block_k=} to be non-negative.")
+        if quant_block_k % 128 != 0:
+            raise ValueError(f"Expected {quant_block_k=} to be aligned to 128.")
+        if hidden_size % quant_block_k != 0:
+            raise ValueError(f"Expected {hidden_size=} to be aligned to {quant_block_k=}.")
+        if intermediate_size % quant_block_k != 0:
+            raise ValueError(f"Expected {intermediate_size=} to be aligned to {quant_block_k=}.")
+        if bd1c % (quant_block_k * t_packing) != 0:
             raise ValueError(
-                f"Expected {bd1c=} to be a multiple of {subc_quant_wsz * t_packing=} when quantized."
+                f"Expected {bd1c=} to be a multiple of {quant_block_k * t_packing=} when quantized."
             )
-        if bfc % subc_quant_wsz != 0:
+        if bfc % quant_block_k != 0:
             raise ValueError(
-                f"Expected {bfc=} to be a multiple of {subc_quant_wsz=} when quantized."
+                f"Expected {bfc=} to be a multiple of {quant_block_k=} when quantized."
             )
 
 
@@ -315,16 +315,16 @@ def ref_moe(
     renormalize_topk_logits: bool = False,
     routed_scaling_factor: float | None = None,
     act_fn: str = "silu",
-    subc_quant_wsz: int | None = None,
+    quant_block_k: int | None = None,
     w1_scale: (
         jax.Array | None
-    ) = None,  # F32(num_experts, hidden_size // subc_quant_wsz, scale_dim2, scale_dim3)
+    ) = None,  # F32(num_experts, hidden_size // quant_block_k, scale_dim2, scale_dim3)
     w2_scale: (
         jax.Array | None
-    ) = None,  # F32(num_experts, intermediate_size // subc_quant_wsz, scale_dim2, scale_dim3)
+    ) = None,  # F32(num_experts, intermediate_size // quant_block_k, scale_dim2, scale_dim3)
     w3_scale: (
         jax.Array | None
-    ) = None,  # F32(num_experts, hidden_size // subc_quant_wsz, scale_dim2, scale_dim3)
+    ) = None,  # F32(num_experts, hidden_size // quant_block_k, scale_dim2, scale_dim3)
     b1: jax.Array | None = None,  # F32(num_experts, 1, intermediate_size)
     b2: jax.Array | None = None,  # F32(num_experts, 1, hidden_size)
     b3: jax.Array | None = None,  # F32(num_experts, 1, intermediate_size)
@@ -401,16 +401,16 @@ def ref_moe(
             expert_w1 = w1[expert_id].astype(jnp.float32)
             expert_w3 = w3[expert_id].astype(jnp.float32)
             if w1_scale is not None:
-                expert_w1 *= jnp.repeat(w1_scale[expert_id, :, 0], subc_quant_wsz, axis=0)[
+                expert_w1 *= jnp.repeat(w1_scale[expert_id, :, 0], quant_block_k, axis=0)[
                     :hidden_size
                 ]
             if w3_scale is not None:
-                expert_w3 *= jnp.repeat(w3_scale[expert_id, :, 0], subc_quant_wsz, axis=0)[
+                expert_w3 *= jnp.repeat(w3_scale[expert_id, :, 0], quant_block_k, axis=0)[
                     :hidden_size
                 ]
             expert_weight_2 = w2[expert_id].astype(jnp.float32)  # [intermediate_size, hidden_size]
             if w2_scale is not None:
-                expert_weight_2 *= jnp.repeat(w2_scale[expert_id, :, 0], subc_quant_wsz, axis=0)[
+                expert_weight_2 *= jnp.repeat(w2_scale[expert_id, :, 0], quant_block_k, axis=0)[
                     :intermediate_size
                 ]
 
@@ -490,9 +490,9 @@ def _fused_ep_moe_kernel(
     # TODO(jevinjiang): We choose F32 scale for easier slicing. The extra
     # latency should be hidden in the pipeline overlapping. But is there a better
     # way to do this?
-    w1_scale_hbm,  # None | F32(local_num_experts, cdiv(hidden_size, subc_quant_wsz), 1, intermediate_size)
-    w2_scale_hbm,  # None | F32(local_num_experts, cdiv(intermediate_size, subc_quant_wsz), 1, hidden_size)
-    w3_scale_hbm,  # None | F32(local_num_experts, cdiv(hidden_size, subc_quant_wsz), 1, intermediate_size)
+    w1_scale_hbm,  # None | F32(local_num_experts, cdiv(hidden_size, quant_block_k), 1, intermediate_size)
+    w2_scale_hbm,  # None | F32(local_num_experts, cdiv(intermediate_size, quant_block_k), 1, hidden_size)
+    w3_scale_hbm,  # None | F32(local_num_experts, cdiv(hidden_size, quant_block_k), 1, intermediate_size)
     b1_hbm,  # None | F32(local_num_experts, 1, intermediate_size)
     b2_hbm,  # None | F32(local_num_experts, 1, hidden_size)
     b3_hbm,  # None | F32(local_num_experts, 1, intermediate_size)
@@ -525,9 +525,9 @@ def _fused_ep_moe_kernel(
     b_w1_x2_vmem,  # <bw_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_w3_x2_vmem,  # <bw_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_w2_x2_vmem,  # <bw_sem_id> (2, t_packing, bf, bd2 // t_packing)
-    b_w1_scale_x2_vmem,  # None | <bw_sem_id> (2, t_packing, bd1 // t_packing // subc_quant_wsz, 1, bf)
-    b_w3_scale_x2_vmem,  # None | <bw_sem_id> (2, t_packing, bd1 // t_packing // subc_quant_wsz, 1, bf)
-    b_w2_scale_x2_vmem,  # None | <bw_sem_id> (2, t_packing, bf // subc_quant_wsz, 1, bd2 // t_packing)
+    b_w1_scale_x2_vmem,  # None | <bw_sem_id> (2, t_packing, bd1 // t_packing // quant_block_k, 1, bf)
+    b_w3_scale_x2_vmem,  # None | <bw_sem_id> (2, t_packing, bd1 // t_packing // quant_block_k, 1, bf)
+    b_w2_scale_x2_vmem,  # None | <bw_sem_id> (2, t_packing, bf // quant_block_k, 1, bd2 // t_packing)
     b_b1_x2_vmem,  # None | <bw_sem_id> (2, 1, bf)
     b_b3_x2_vmem,  # None | <bw_sem_id> (2, 1, bf)
     b_b2_x2_vmem,  # None | <bw_sem_id> (2, t_packing, 1, bd2 // t_packing)
@@ -567,7 +567,7 @@ def _fused_ep_moe_kernel(
     disable_shared_expert: bool = False,
     disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
-    subc_quant_wsz: int | None = None,
+    quant_block_k: int | None = None,
     # Kernel tuning params.
     bt: int,  # Outer token tile size (output tiling).
     bf: int,  # Block size of intermediate_size.
@@ -627,14 +627,14 @@ def _fused_ep_moe_kernel(
     bd1c_per_t_packing = bd1c // t_packing
     bd2c_per_t_packing = bd2c // t_packing
 
-    if subc_quant_wsz is not None:
-        assert subc_quant_wsz % 128 == 0
-        assert bd1c_per_t_packing % subc_quant_wsz == 0
-        assert bfc % subc_quant_wsz == 0
-        assert bd1 % subc_quant_wsz == 0
-        assert bf % subc_quant_wsz == 0
-        assert bd1_per_t_packing % subc_quant_wsz == 0
-        assert h_per_t_packing % subc_quant_wsz == 0
+    if quant_block_k is not None:
+        assert quant_block_k % 128 == 0
+        assert bd1c_per_t_packing % quant_block_k == 0
+        assert bfc % quant_block_k == 0
+        assert bd1 % quant_block_k == 0
+        assert bf % quant_block_k == 0
+        assert bd1_per_t_packing % quant_block_k == 0
+        assert h_per_t_packing % quant_block_k == 0
 
     num_bf = cdiv(intermediate_size, bf)
     num_bd1 = cdiv(hidden_size, bd1)
@@ -1116,15 +1116,15 @@ def _fused_ep_moe_kernel(
                 sem=local_sems.at[bw1_sem_id, 1],
             ).start()
             if w1_scale_hbm is not None:
-                assert subc_quant_wsz is not None
+                assert quant_block_k is not None
                 scale_dim2 = pl.ds(0, 1)
                 scale_dim3 = pl.ds(bf_id * bf, bf)
                 pltpu.make_async_copy(
                     src_ref=w1_scale_hbm.at[
                         local_e_id,
                         pl.ds(
-                            offset // subc_quant_wsz,
-                            bd1_per_t_packing // subc_quant_wsz,
+                            offset // quant_block_k,
+                            bd1_per_t_packing // quant_block_k,
                         ),
                         scale_dim2,
                         scale_dim3,
@@ -1157,13 +1157,13 @@ def _fused_ep_moe_kernel(
                 sem=local_sems.at[bw2_sem_id, 2],
             ).start()
             if w2_scale_hbm is not None:
-                assert subc_quant_wsz is not None
+                assert quant_block_k is not None
                 w2_scale_dim2 = pl.ds(0, 1)
                 w2_scale_dim3 = pl.ds(offset, bd2_per_t_packing)
                 pltpu.make_async_copy(
                     src_ref=w2_scale_hbm.at[
                         local_e_id,
-                        pl.ds(bf_id * bf // subc_quant_wsz, bf // subc_quant_wsz),
+                        pl.ds(bf_id * bf // quant_block_k, bf // quant_block_k),
                         w2_scale_dim2,
                         w2_scale_dim3,
                     ],
@@ -1192,15 +1192,15 @@ def _fused_ep_moe_kernel(
                 sem=local_sems.at[bw3_sem_id, 3],
             ).start()
             if w3_scale_hbm is not None:
-                assert subc_quant_wsz is not None
+                assert quant_block_k is not None
                 w3_scale_dim2 = pl.ds(0, 1)
                 w3_scale_dim3 = pl.ds(bf_id * bf, bf)
                 pltpu.make_async_copy(
                     src_ref=w3_scale_hbm.at[
                         local_e_id,
                         pl.ds(
-                            offset // subc_quant_wsz,
-                            bd1_per_t_packing // subc_quant_wsz,
+                            offset // quant_block_k,
+                            bd1_per_t_packing // quant_block_k,
                         ),
                         w3_scale_dim2,
                         w3_scale_dim3,
@@ -1478,23 +1478,23 @@ def _fused_ep_moe_kernel(
         if w1_scale_vmem is not None:
             assert w1_scale_vmem.shape == (
                 t_packing,
-                bd1_per_t_packing // subc_quant_wsz,
+                bd1_per_t_packing // quant_block_k,
                 1,
                 bf,
             )
-            assert bd1c_per_t_packing % subc_quant_wsz == 0
+            assert bd1c_per_t_packing % quant_block_k == 0
         if w3_scale_vmem is not None:
             assert w3_scale_vmem.shape == (
                 t_packing,
-                bd1_per_t_packing // subc_quant_wsz,
+                bd1_per_t_packing // quant_block_k,
                 1,
                 bf,
             )
-            assert bd1c_per_t_packing % subc_quant_wsz == 0
+            assert bd1c_per_t_packing % quant_block_k == 0
 
         # Number of scale groups per bd1c compute tile (1 when not quantized).
-        n_sg = bd1c_per_t_packing // subc_quant_wsz if subc_quant_wsz is not None else 1
-        sg_k = subc_quant_wsz if subc_quant_wsz is not None else bd1c_per_t_packing
+        n_sg = bd1c_per_t_packing // quant_block_k if quant_block_k is not None else 1
+        sg_k = quant_block_k if quant_block_k is not None else bd1c_per_t_packing
         sg_unroll = n_sg
 
         dyn_sz_i32 = dyn_sz.astype(jnp.int32)
@@ -1705,15 +1705,15 @@ def _fused_ep_moe_kernel(
         if w2_scale_vmem is not None:
             assert w2_scale_vmem.shape == (
                 t_packing,
-                bf // subc_quant_wsz,
+                bf // quant_block_k,
                 1,
                 bd2_per_t_packing,
             )
-            assert bfc % subc_quant_wsz == 0
+            assert bfc % quant_block_k == 0
 
         # Number of scale groups per bfc compute tile.
-        n_sg2 = bfc // subc_quant_wsz if subc_quant_wsz is not None else 1
-        sg_k2 = subc_quant_wsz if subc_quant_wsz is not None else bfc
+        n_sg2 = bfc // quant_block_k if quant_block_k is not None else 1
+        sg_k2 = quant_block_k if quant_block_k is not None else bfc
         sg2_unroll = n_sg2
 
         dyn_sz_i32 = dyn_sz.astype(jnp.int32)
@@ -2731,7 +2731,7 @@ def _validate_fused_ep_moe_args(
     topk_weights: jax.Array,
     topk_ids: jax.Array,
     top_k: int,
-    subc_quant_wsz: int | None,
+    quant_block_k: int | None,
     w1_scale: jax.Array | None,
     w2_scale: jax.Array | None,
     w3_scale: jax.Array | None,
@@ -2784,7 +2784,7 @@ def _validate_fused_ep_moe_args(
         intermediate_size=intermediate_size,
         dtype=tokens.dtype,
         ep_size=ep_size,
-        subc_quant_wsz=subc_quant_wsz,
+        quant_block_k=quant_block_k,
         block_config=block_config,
     )
 
@@ -2806,11 +2806,11 @@ def _validate_fused_ep_moe_args(
     # Note: we should dump scale as the kernel expected shape in the
     # checkpoint offline or reshape right after weight loading.
     if w1_scale is not None:
-        if subc_quant_wsz is None:
-            raise ValueError("Expected subc_quant_wsz to be set when w1_scale is provided.")
+        if quant_block_k is None:
+            raise ValueError("Expected quant_block_k to be set when w1_scale is provided.")
         expected_w1_scale_shape = (
             num_experts,
-            hidden_size // subc_quant_wsz,
+            hidden_size // quant_block_k,
             1,
             intermediate_size,
         )
@@ -2820,11 +2820,11 @@ def _validate_fused_ep_moe_args(
             w1_scale = w1_scale.astype(jnp.float32)
 
     if w2_scale is not None:
-        if subc_quant_wsz is None:
-            raise ValueError("Expected subc_quant_wsz to be set when w2_scale is provided.")
+        if quant_block_k is None:
+            raise ValueError("Expected quant_block_k to be set when w2_scale is provided.")
         expected_w2_scale_shape = (
             num_experts,
-            intermediate_size // subc_quant_wsz,
+            intermediate_size // quant_block_k,
             1,
             hidden_size,
         )
@@ -2834,11 +2834,11 @@ def _validate_fused_ep_moe_args(
             w2_scale = w2_scale.astype(jnp.float32)
 
     if w3_scale is not None:
-        if subc_quant_wsz is None:
-            raise ValueError("Expected subc_quant_wsz to be set when w3_scale is provided.")
+        if quant_block_k is None:
+            raise ValueError("Expected quant_block_k to be set when w3_scale is provided.")
         expected_w3_scale_shape = (
             num_experts,
-            hidden_size // subc_quant_wsz,
+            hidden_size // quant_block_k,
             1,
             intermediate_size,
         )
@@ -2890,7 +2890,7 @@ def _validate_fused_ep_moe_args(
                 f"Expected w2_shared shape ({se_intermediate_size}, {hidden_size}), got {w2_shared.shape}"
             )
 
-        if subc_quant_wsz is not None:
+        if quant_block_k is not None:
             if w1_shared_scale is not None:
                 expected_w1_shared_scale = (
                     1,
@@ -2947,7 +2947,7 @@ def _validate_fused_ep_moe_args(
         "disable_shared_expert",
         "disable_all_reduce_metadata",
         "disable_sync_barrier",
-        "subc_quant_wsz",
+        "quant_block_k",
         "block_config",
         "dp_axis_name",
         "tp_axis_name",
@@ -2979,7 +2979,7 @@ def fused_ep_moe(
     disable_shared_expert: bool = False,
     disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
-    subc_quant_wsz: int | None = None,
+    quant_block_k: int | None = None,
     w1_scale: jax.Array | None = None,
     w2_scale: jax.Array | None = None,
     w3_scale: jax.Array | None = None,
@@ -3029,7 +3029,7 @@ def fused_ep_moe(
         num_tokens=tokens.shape[0],
         ep_size=ep_size,
         dtype=tokens.dtype,
-        subc_quant_wsz=subc_quant_wsz,
+        quant_block_k=quant_block_k,
     )
     _validate_fused_ep_moe_args(
         mesh=mesh,
@@ -3040,7 +3040,7 @@ def fused_ep_moe(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         top_k=top_k,
-        subc_quant_wsz=subc_quant_wsz,
+        quant_block_k=quant_block_k,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         w3_scale=w3_scale,
@@ -3129,19 +3129,19 @@ def fused_ep_moe(
 
     w1_scale_scratch = None
     if w1_scale is not None:
-        assert subc_quant_wsz is not None
-        w1_scale_shape = (2, t_packing, bd1_per_pack // subc_quant_wsz, 1, block_config.bf)
+        assert quant_block_k is not None
+        w1_scale_shape = (2, t_packing, bd1_per_pack // quant_block_k, 1, block_config.bf)
         w1_scale_scratch = pltpu.VMEM(w1_scale_shape, jnp.float32)
     w3_scale_scratch = None
     if w3_scale is not None:
-        assert subc_quant_wsz is not None
-        w3_scale_shape = (2, t_packing, bd1_per_pack // subc_quant_wsz, 1, block_config.bf)
+        assert quant_block_k is not None
+        w3_scale_shape = (2, t_packing, bd1_per_pack // quant_block_k, 1, block_config.bf)
         w3_scale_scratch = pltpu.VMEM(w3_scale_shape, jnp.float32)
 
     w2_scale_scratch = None
     if w2_scale is not None:
-        assert subc_quant_wsz is not None
-        w2_scale_shape = (2, t_packing, block_config.bf // subc_quant_wsz, 1, bd2_per_pack)
+        assert quant_block_k is not None
+        w2_scale_shape = (2, t_packing, block_config.bf // quant_block_k, 1, bd2_per_pack)
         w2_scale_scratch = pltpu.VMEM(w2_scale_shape, jnp.float32)
 
     if padded_top_k > top_k:
@@ -3251,7 +3251,7 @@ def fused_ep_moe(
                 disable_shared_expert=disable_shared_expert,
                 disable_all_reduce_metadata=disable_all_reduce_metadata,
                 disable_sync_barrier=disable_sync_barrier,
-                subc_quant_wsz=subc_quant_wsz,
+                quant_block_k=quant_block_k,
                 bt=bt,
                 bf=block_config.bf,
                 bd1=block_config.bd1,
