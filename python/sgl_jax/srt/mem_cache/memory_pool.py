@@ -310,19 +310,18 @@ class MHATokenToKVPool(KVCache):
         start_time = time.time()
 
         assert (
-            self.size % self.dp_size == 0 and self.size % self.page_size == 0
+            self.size % self.page_size == 0
         ), "Cache size must be divisible by dp_size and size must be divisible by page size"
 
         # Hack: this shape is more friendly to rpav3
         packing = get_dtype_packing(self.dtype)
         fused_buffer_shape = (
-            (self.size + self.page_size * self.dp_size) // self.page_size,
+            self.size // self.page_size,
             self.page_size,
             self.head_num * 2 // packing,  # [K0,V0,K1,V1,...]
             packing,
             self.head_dim,
         )
-        print(f"{fused_buffer_shape=}")
         total_memory_per_layer = (
             fused_buffer_shape[0]
             * fused_buffer_shape[1]

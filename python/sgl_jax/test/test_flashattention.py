@@ -303,7 +303,6 @@ def create_test_data(
         extend_logprob_start_lens=None,
         extend_input_logprob_token_ids=None,
         real_bs=seq_lens.shape[0],
-        real_bs_per_dp=[seq_lens.shape[0]],
         spec_info=spec_info,
     )
 
