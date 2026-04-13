@@ -476,16 +476,6 @@ class FusedEPMoE(nnx.Module):
         w2_shared_scale = self.w2_shared_scale.value if self.w2_shared_scale is not None else None
 
         subc_quant_wsz = self.subc_quant_wsz if self.subc_quant_wsz is not None else None
-        subc_quant_n_wsz = self.quant_block_n
-        # Expanded per-channel scales are mathematically equivalent to the
-        # original 2D block scales, but allow us to reuse the much faster
-        # 1D kernel path.
-        if subc_quant_n_wsz is not None and (
-            (w1_scale is None or w1_scale.shape[3] == self.intermediate_dim)
-            and (w3_scale is None or w3_scale.shape[3] == self.intermediate_dim)
-            and (w2_scale is None or w2_scale.shape[3] == self.hidden_size)
-        ):
-            subc_quant_n_wsz = None
 
         output = fused_ep_moe(
             mesh=self.mesh,
@@ -514,7 +504,6 @@ class FusedEPMoE(nnx.Module):
             disable_sync_barrier=self.disable_sync_barrier,
             # Optional parameters (not used in basic case)
             subc_quant_wsz=subc_quant_wsz,
-            subc_quant_n_wsz=subc_quant_n_wsz,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w3_scale=w3_scale,

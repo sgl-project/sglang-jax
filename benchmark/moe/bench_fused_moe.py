@@ -115,7 +115,6 @@ def _estimate_vmem_bytes(
     hidden_size: int,
     use_shared_expert: bool = False,
     subc_quant_wsz: int | None = None,
-    subc_quant_n_wsz: int | None = None,
     verbose: bool = False,
 ) -> int:
     """Rough VMEM estimate to avoid compile-time OOM (TPU VMEM is 64MB/core).
@@ -127,8 +126,6 @@ def _estimate_vmem_bytes(
     Args:
         subc_quant_wsz: Sub-channel quantization block size for weight scales.
             When set, adds VMEM for scale scratch buffers.
-        subc_quant_n_wsz: N-dim block size for 2D block-wise quantization.
-            When set, scale scratch dim3 follows kernel's padded n-group layout.
     """
     bt = cfg.bt
     bts = bt if cfg.bts is None else int(cfg.bts)
@@ -168,25 +165,15 @@ def _estimate_vmem_bytes(
     # 1D sub-channel:
     #   b_w1/w3_scale_x2_vmem: (2, t_packing, bd1 // t_packing // subc_quant_wsz, 1, bf)
     #   b_w2_scale_x2_vmem:    (2, t_packing, bf // subc_quant_wsz, 1, bd2 // t_packing)
-    # 2D block-wise:
-    #   b_w1/w3_scale dim3 == pad128(intermediate_size // subc_quant_n_wsz + 128)
-    #   b_w2_scale    dim3 == pad128(hidden_size // subc_quant_n_wsz + 128)
     w1_scale = 0
     w3_scale = 0
     w2_scale = 0
     if subc_quant_wsz is not None:
         bd1_per_pack = bd1 // t_packing
-        if subc_quant_n_wsz is None:
-            bd2_per_pack = bd2 // t_packing
-            w1_scale_dim3 = bf
-            w3_scale_dim3 = bf
-            w2_scale_dim3 = bd2_per_pack
-        else:
-            w1_n_groups = (intermediate_size + subc_quant_n_wsz - 1) // subc_quant_n_wsz
-            w2_n_groups = (hidden_size + subc_quant_n_wsz - 1) // subc_quant_n_wsz
-            w1_scale_dim3 = ((w1_n_groups + 128 + 127) // 128) * 128
-            w3_scale_dim3 = w1_scale_dim3
-            w2_scale_dim3 = ((w2_n_groups + 128 + 127) // 128) * 128
+        bd2_per_pack = bd2 // t_packing
+        w1_scale_dim3 = bf
+        w3_scale_dim3 = bf
+        w2_scale_dim3 = bd2_per_pack
         w1_scale = 2 * t_packing * (bd1_per_pack // subc_quant_wsz) * 1 * w1_scale_dim3 * 4
         w3_scale = 2 * t_packing * (bd1_per_pack // subc_quant_wsz) * 1 * w3_scale_dim3 * 4
         w2_scale = 2 * t_packing * (bf // subc_quant_wsz) * 1 * w2_scale_dim3 * 4
@@ -309,16 +296,9 @@ def _estimate_vmem_bytes(
         )
         if subc_quant_wsz is not None:
             bd1_per_pack = bd1 // t_packing
-            if subc_quant_n_wsz is None:
-                w1_scale_dim3 = bf
-                w3_scale_dim3 = bf
-                w2_scale_dim3 = bd2 // t_packing
-            else:
-                w1_n_groups = (intermediate_size + subc_quant_n_wsz - 1) // subc_quant_n_wsz
-                w2_n_groups = (hidden_size + subc_quant_n_wsz - 1) // subc_quant_n_wsz
-                w1_scale_dim3 = ((w1_n_groups + 128 + 127) // 128) * 128
-                w3_scale_dim3 = w1_scale_dim3
-                w2_scale_dim3 = ((w2_n_groups + 128 + 127) // 128) * 128
+            w1_scale_dim3 = bf
+            w3_scale_dim3 = bf
+            w2_scale_dim3 = bd2 // t_packing
             print(
                 f"      b_w1_scale_x2_vmem:     {_mb(w1_scale)} MB  "
                 f"(2, {t_packing}, {bd1_per_pack // subc_quant_wsz}, 1, {w1_scale_dim3}) f32"
@@ -399,7 +379,6 @@ def select_block_configs(
     max_configs: int,
     use_shared_expert: bool = False,
     subc_quant_wsz: int | None = None,
-    subc_quant_n_wsz: int | None = None,
     excluded_configs: set[tuple[int, ...]] | None = None,
 ) -> list[FusedMoEBlockConfig]:
     """Enumerate block configs from the explicit candidate lists."""
@@ -499,20 +478,6 @@ def select_block_configs(
             return False, f"bd1c({bd1c})/bd2c({bd2c}) not aligned to tile_align({tile_align})"
         if bd1 % bd1c != 0 or bd2 % bd2c != 0:
             return False, f"bd1({bd1}) % bd1c({bd1c}) != 0 or bd2({bd2}) % bd2c({bd2c}) != 0"
-        if subc_quant_n_wsz is not None:
-            if bf % subc_quant_n_wsz != 0:
-                return False, f"bf({bf}) % subc_quant_n_wsz({subc_quant_n_wsz}) != 0"
-            if bfc % subc_quant_n_wsz != 0:
-                return False, f"bfc({bfc}) % subc_quant_n_wsz({subc_quant_n_wsz}) != 0"
-            if bd2 % subc_quant_n_wsz != 0:
-                return False, f"bd2({bd2}) % subc_quant_n_wsz({subc_quant_n_wsz}) != 0"
-            if bd2c % subc_quant_n_wsz != 0:
-                return False, f"bd2c({bd2c}) % subc_quant_n_wsz({subc_quant_n_wsz}) != 0"
-            if ((bd2c // t_packing) % subc_quant_n_wsz) != 0:
-                return (
-                    False,
-                    f"bd2c//t_packing({bd2c // t_packing}) % subc_quant_n_wsz({subc_quant_n_wsz}) != 0",
-                )
 
         # Pass use_shared_expert to estimate correct VMEM
         est = _estimate_vmem_bytes(
@@ -525,7 +490,6 @@ def select_block_configs(
             hidden_size=case.hidden_size,
             use_shared_expert=use_shared_expert,
             subc_quant_wsz=subc_quant_wsz,
-            subc_quant_n_wsz=subc_quant_n_wsz,
         )
         est = int(math.ceil(est * tpu_vmem_estimate_scale))
         effective_budget = int(tpu_vmem_budget_bytes * tpu_vmem_headroom_ratio)
@@ -775,7 +739,6 @@ def run_all(
     token_valid_ratio: float = 1.0,
     token_mask_seed: int = 0,
     subc_quant_wsz_override: int | None = None,
-    subc_quant_n_wsz: int | None = None,
     return_results: bool = False,
 ) -> list[dict[str, object]] | None:
     if use_grouped_topk is None:
@@ -825,11 +788,7 @@ def run_all(
 
     print(f"Running fused_moe benchmarks with weight_dtype={weight_dtype}")
     print(f"  features: shared_expert={use_shared_expert}, grouped_topk={use_grouped_topk}")
-    if subc_quant_n_wsz is not None:
-        print(
-            f"  quantization: 2D block-wise (block_k={subc_quant_wsz_override}, block_n={subc_quant_n_wsz})"
-        )
-    elif subc_quant_wsz_override is not None:
+    if subc_quant_wsz_override is not None:
         print(f"  quantization: 1D sub-channel (wsz={subc_quant_wsz_override})")
     print(
         "  shape: "
@@ -1015,24 +974,7 @@ def run_all(
             if quantization_config is not None:
                 if subc_quant_wsz is not None:
                     fused_layer.subc_quant_wsz = subc_quant_wsz
-                if subc_quant_n_wsz is not None:
-                    fused_layer.quant_block_n = subc_quant_n_wsz
                 fused_layer.quantize_weights()
-
-            effective_subc_quant_n_wsz = subc_quant_n_wsz
-            if (
-                quantization_config is not None
-                and subc_quant_n_wsz is not None
-                and fused_layer.w1_scale is not None
-                and fused_layer.w2_scale is not None
-                and fused_layer.w1_scale.value.shape[3] == case.intermediate_size
-                and fused_layer.w2_scale.value.shape[3] == case.hidden_size
-            ):
-                effective_subc_quant_n_wsz = None
-                print(
-                    "  runtime quantization path: expanded 2D scales -> 1D fast-layout "
-                    f"(tuning with effective block_n={effective_subc_quant_n_wsz})"
-                )
 
             block_cfgs: list[FusedMoEBlockConfig | None]
             if tune_block_config:
@@ -1060,7 +1002,6 @@ def run_all(
                     max_configs=max_configs,
                     use_shared_expert=use_shared_expert,
                     subc_quant_wsz=subc_quant_wsz,
-                    subc_quant_n_wsz=effective_subc_quant_n_wsz,
                     excluded_configs=EXCLUDED_BLOCK_CONFIGS.get(case_excl_key),
                 )
             else:
@@ -1154,7 +1095,6 @@ def run_all(
                         hidden_size=case.hidden_size,
                         use_shared_expert=use_shared_expert,
                         subc_quant_wsz=subc_quant_wsz,
-                        subc_quant_n_wsz=effective_subc_quant_n_wsz,
                         verbose=True,
                     )
                     vmem_mb = (vmem_bytes * tpu_vmem_estimate_scale) / (1024 * 1024)
@@ -1202,7 +1142,6 @@ def run_all(
                             dtype=dtype,
                             ep_size=mesh_ep,
                             subc_quant_wsz=subc_quant_wsz,
-                            subc_quant_n_wsz=effective_subc_quant_n_wsz,
                             block_config=block_cfg,
                         )
                     times = multiple_iteration_timeit_from_trace(
@@ -1458,12 +1397,6 @@ def parse_args() -> argparse.Namespace:
         help="Sub-channel quantization block size (default: 256 for FP8, None for bf16).",
     )
     parser.add_argument(
-        "--subc-quant-n-wsz",
-        type=int,
-        default=None,
-        help="N-dim block size for 2D block-wise quantization. When set, uses block_k=subc-quant-wsz, block_n=this value.",
-    )
-    parser.add_argument(
         "--alpha",
         type=float,
         default=1.0,
@@ -1593,7 +1526,6 @@ if __name__ == "__main__":
                 token_valid_ratio=ratio,
                 token_mask_seed=args.token_mask_seed,
                 subc_quant_wsz_override=args.subc_quant_wsz,
-                subc_quant_n_wsz=args.subc_quant_n_wsz,
                 return_results=True,
             )
             all_results.append((ratio, token_mask_mode, results))
