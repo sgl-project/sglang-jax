@@ -85,6 +85,7 @@ jobs:
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
+          uv pip install "tops @ git+https://github.com/primatrix/pallas-kernel.git@41431b1c4c5e60f12c7f66e84b09a2585e3b9596"  # release/v0.4
           python test/srt/run_suite.py --suite unit-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   unit-test-4-tpu:
@@ -107,6 +108,7 @@ jobs:
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
+          uv pip install "tops @ git+https://github.com/primatrix/pallas-kernel.git@41431b1c4c5e60f12c7f66e84b09a2585e3b9596"  # release/v0.4
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite unit-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
