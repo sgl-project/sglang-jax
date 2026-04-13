@@ -490,5 +490,45 @@ class TestSWARadixCache(unittest.TestCase):
         self.assertEqual(allocator.swa_available_size(dp_rank=1), initial_swa[1])
 
 
+class TestSchedulerCacheInit(unittest.TestCase):
+    """Tests for scheduler cache type selection with hybrid models (#202)."""
+
+    def _select_cache_type(self, is_hybrid, chunked_prefill_size, disable_radix_cache):
+        """Mirror the condition logic in scheduler.py init_memory_pool_and_cache."""
+        if is_hybrid:
+            return "SWARadixCache"
+        elif chunked_prefill_size is not None and disable_radix_cache:
+            return "ChunkCache"
+        else:
+            return "RadixCache"
+
+    def test_hybrid_with_disable_radix_cache_gets_swa_radix_cache(self):
+        """When is_hybrid=True and disable_radix_cache=True, must use SWARadixCache, not ChunkCache."""
+        self.assertEqual(
+            self._select_cache_type(
+                is_hybrid=True, chunked_prefill_size=8192, disable_radix_cache=True
+            ),
+            "SWARadixCache",
+        )
+
+    def test_hybrid_with_radix_cache_enabled_gets_swa_radix_cache(self):
+        """When is_hybrid=True and disable_radix_cache=False, must use SWARadixCache."""
+        self.assertEqual(
+            self._select_cache_type(
+                is_hybrid=True, chunked_prefill_size=8192, disable_radix_cache=False
+            ),
+            "SWARadixCache",
+        )
+
+    def test_non_hybrid_with_disable_radix_cache_gets_chunk_cache(self):
+        """Non-hybrid with disable_radix_cache should still use ChunkCache."""
+        self.assertEqual(
+            self._select_cache_type(
+                is_hybrid=False, chunked_prefill_size=8192, disable_radix_cache=True
+            ),
+            "ChunkCache",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
