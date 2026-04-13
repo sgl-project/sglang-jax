@@ -1937,7 +1937,7 @@ def _fused_ep_moe_kernel(
             )
 
         def run_gate_up_slices(*, bf_id: int, bw_sem_id):
-            def run_gate_up_bd1(*, bd1_id, bw_sem_id, token_buf_seed, should_init_ffn1: bool):
+            def run_gate_up_bd1(*, bd1_id, bw_sem_id, token_buf_offset, should_init_ffn1: bool):
                 def body(bw_sem_id: int):
                     next_bw_sem_id = 1 - bw_sem_id
                     next_bd1_id = bd1_id + jnp.int32(1)
@@ -1947,7 +1947,7 @@ def _fused_ep_moe_kernel(
                     @pl.when((num_token_tiles > 0) & (bd1_id == 0))
                     def _prefetch_tokens_for_bd0_bts0():
                         start_stage_a2a_s_tile_from_hbm(
-                            jnp.int32(0), bd1_id, jnp.int32(token_buf_seed)
+                            jnp.int32(0), bd1_id, jnp.int32(token_buf_offset)
                         )
 
                     @pl.when(has_tokens & (next_bd1_id < num_bd1))
@@ -2033,7 +2033,7 @@ def _fused_ep_moe_kernel(
                         0,
                         num_token_tiles,
                         run_ffn1_tile,
-                        jnp.int32(token_buf_seed),
+                        jnp.int32(token_buf_offset),
                         unroll=False,
                     )
 
@@ -2054,19 +2054,19 @@ def _fused_ep_moe_kernel(
 
             # Peel bd1_id=0 so `should_init_ffn1` stays static.
             def _run_active(_):
-                active_bw_sem_id, token_buf_seed = run_gate_up_bd1(
+                active_bw_sem_id, token_buf_offset = run_gate_up_bd1(
                     bd1_id=jnp.int32(0),
                     bw_sem_id=bw_sem_id,
-                    token_buf_seed=jnp.int32(0),
+                    token_buf_offset=jnp.int32(0),
                     should_init_ffn1=True,
                 )
 
                 def run_one_bd1_no_init(bd1_id, carry):
-                    bw_sem_id, token_buf_seed = carry
+                    bw_sem_id, token_buf_offset = carry
                     return run_gate_up_bd1(
                         bd1_id=bd1_id,
                         bw_sem_id=bw_sem_id,
-                        token_buf_seed=token_buf_seed,
+                        token_buf_offset=token_buf_offset,
                         should_init_ffn1=False,
                     )
 
@@ -2075,7 +2075,7 @@ def _fused_ep_moe_kernel(
                     1,
                     num_bd1,
                     run_one_bd1_no_init,
-                    (active_bw_sem_id, token_buf_seed),
+                    (active_bw_sem_id, token_buf_offset),
                     unroll=bd1_unroll,
                 )
                 return final_bw_sem_id
