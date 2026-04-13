@@ -169,10 +169,10 @@ class MLAAttention(nnx.Module):
         k_rope = k_rope_raw.reshape(-1, 1, self.qk_rope_head_dim)
 
         q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
-        k_rope = jnp.broadcast_to(k_rope, (k_rope.shape[0], self.num_heads, self.qk_rope_head_dim))
-        k_rope = jax.lax.with_sharding_constraint(
+        k_rope = jnp.broadcast_to(
             k_rope,
-            jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec(None, "tensor", None)),
+            (k_rope.shape[0], self.num_heads, self.qk_rope_head_dim),
+            out_sharding=jax.sharding.PartitionSpec(None, "tensor", None),
         )
 
         q = jnp.concatenate([q_nope, q_rope], axis=-1)
