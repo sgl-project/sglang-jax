@@ -2979,6 +2979,10 @@ def fused_ep_moe(
     disable_shared_expert: bool = False,
     disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
+    # Quantization block size along the K (reduction) dimension.  Models with
+    # 2D block-wise quantization (block_k, block_n) have their scales expanded
+    # to 1D format at weight-loading time by _expand_moe_block_scale(), so the
+    # kernel only ever sees per-column (1D) scales shaped (E, K//block_k, 1, N).
     quant_block_k: int | None = None,
     w1_scale: jax.Array | None = None,
     w2_scale: jax.Array | None = None,
