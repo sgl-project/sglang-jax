@@ -326,10 +326,9 @@ class PrefillAdder:
             # For hybrid models, use the full pool's capacity for budget
             # estimation. SWA layers only need sliding-window tokens per request,
             # so the SWA pool should not limit admission here.
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.full_available_size(dp_rank=dp_rank)
-                + self.tree_cache.full_evictable_size(dp_rank=dp_rank)
-            )
+            available_and_evictable = self.token_to_kv_pool_allocator.full_available_size(
+                dp_rank=dp_rank
+            ) + self.tree_cache.full_evictable_size(dp_rank=dp_rank)
         else:
             available_and_evictable = self.token_to_kv_pool_allocator.available_size(
                 dp_rank=dp_rank

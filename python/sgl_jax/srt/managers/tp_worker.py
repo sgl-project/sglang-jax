@@ -540,8 +540,16 @@ class ModelWorker:
 
     def get_tokens_per_layer_info(self):
         return (
-            getattr(self.model_runner, "full_max_total_num_tokens", self.model_runner.max_total_num_tokens),
-            getattr(self.model_runner, "swa_max_total_num_tokens", self.model_runner.max_total_num_tokens),
+            getattr(
+                self.model_runner,
+                "full_max_total_num_tokens",
+                self.model_runner.max_total_num_tokens,
+            ),
+            getattr(
+                self.model_runner,
+                "swa_max_total_num_tokens",
+                self.model_runner.max_total_num_tokens,
+            ),
         )
 
     def get_pad_input_ids_func(self):

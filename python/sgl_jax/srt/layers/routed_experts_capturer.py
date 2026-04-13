@@ -223,7 +223,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             raise RuntimeError("Host buffer is disabled. enable_return_routed_experts is required.")
         cache_pool_idx = req_to_token_pool.req_to_token[req_pool_idx][: seqlen - 1]
         while True:
-            if self.bid >= bid:
+            if self.bid is not None and bid is not None and self.bid >= bid:
                 return self.host_buffer[:, cache_pool_idx, :]
             else:
                 time.sleep(0.001)
