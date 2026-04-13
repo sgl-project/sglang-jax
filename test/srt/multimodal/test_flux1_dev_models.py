@@ -50,6 +50,5 @@ class TestFLUX1_DEV(CustomTestCase):
         process.kill()
 
 
-
 if __name__ == "__main__":
     unittest.main()
