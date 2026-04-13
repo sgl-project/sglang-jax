@@ -1472,6 +1472,7 @@ def get_default_block_sizes(
     case: RpaCase = RpaCase.MIXED,
     vmem_limit_bytes: int | None = None,
     use_custom_mask: bool = False,
+    sliding_window: int | None = None,
 ):
     """Get (bq_sz, bkv_sz, bq_csz, bkv_csz) by some heuristic formulas."""
     tpu_version = get_tpu_version()
@@ -1495,7 +1496,7 @@ def get_default_block_sizes(
         case 5 | 6:
             if case == RpaCase.DECODE:
                 bq_sz = 1
-                bkv_sz = min(min_bkv_sz_to_peak, max_kv)
+                bkv_sz = min(min_bkv_sz_to_peak, max_kv) if sliding_window is None else 256
                 bq_csz = 1
                 bkv_csz = bkv_sz
             else:
@@ -1954,7 +1955,9 @@ def ragged_paged_attention(
                 case=case,
                 vmem_limit_bytes=vmem_limit_bytes,
                 use_custom_mask=not use_causal_mask,
+                sliding_window=sliding_window,
             )
+
         return {
             "bq_sz": block_sizes[0],
             "bkv_sz": block_sizes[1],
@@ -1975,6 +1978,7 @@ def ragged_paged_attention(
         static_q_len=1,
         case=RpaCase.DECODE,
     )
+
     if chunk_prefill_size is not None:
         # Prefill-only
         q, kv_cache_fused_processed = run_rpa_kernel(
