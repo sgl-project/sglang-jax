@@ -1742,16 +1742,20 @@ def ragged_paged_attention(
     if out_dtype is None:
         out_dtype = jnp.float32 if q.dtype == jnp.float32 else jnp.bfloat16
 
-    # Prepare cu_seq_mask_lens for custom mask.
-    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-    seq_mask_lens = kv_lens * q_lens
-    cu_seq_mask_lens = jnp.concatenate([jnp.array([0], dtype=jnp.int32), jnp.cumsum(seq_mask_lens)])
-
     # Prepare custom mask.
     if custom_mask is not None:
         if custom_mask.dtype == jnp.bool_:
             custom_mask = custom_mask.astype(jnp.int32)
         custom_mask = jnp.repeat(jnp.expand_dims(custom_mask, axis=1), repeats=head_dim, axis=1)
+
+        # Prepare cu_seq_mask_lens for custom mask.
+        q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+        seq_mask_lens = kv_lens * q_lens
+        cu_seq_mask_lens = jnp.concatenate(
+            [jnp.array([0], dtype=jnp.int32), jnp.cumsum(seq_mask_lens)]
+        )
+    else:
+        cu_seq_mask_lens = jnp.array([0])
 
     # Scalar prefetch init values.
     init_sem_ids = jnp.zeros((3,), jnp.int32)

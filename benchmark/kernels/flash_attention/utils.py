@@ -11,10 +11,10 @@ def create_kv_cache_data(
     packing = get_dtype_packing(dtype)
     key = jax.random.PRNGKey(seed)
     keys = jax.random.split(key, 3)
-    # total_num_pages = cdiv(max_kv_cache_tokens, page_size)
+    total_num_pages = cdiv(max_kv_cache_tokens, page_size)
     kv_cache = jax.random.normal(
         keys[1],
-        (233, page_size, head_num * 2 // packing, packing, head_dim),
+        (total_num_pages, page_size, head_num * 2 // packing, packing, head_dim),
         dtype=dtype,
     )
     return kv_cache
@@ -128,8 +128,7 @@ def create_decode_uniform_data(
 ):
     batch_size = max_num_batched_tokens
     # hackly set prefix len to 2048-4096 for decode one seq in random
-    # random_prefix_lens = jax.random.randint(jax.random.PRNGKey(42), (batch_size,), 1024, 2048)
-    random_prefix_lens = jnp.array([16 * 1024] * batch_size, dtype=jnp.int32)
+    random_prefix_lens = jax.random.randint(jax.random.PRNGKey(42), (batch_size,), 1024, 2048)
     seq_lens = random_prefix_lens + 1
     cu_q_lens = jnp.concatenate(
         [

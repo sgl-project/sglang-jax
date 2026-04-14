@@ -37,9 +37,11 @@ VMEM_SIZE = 64 * 1024 * 1024  # 32MB
 
 def get_num_slices_per_block(new_kv: jax.Array, kv_cache: jax.Array, page_size=128):
     """
-    new_kv: [total_num_token, num_combined_kv_heads, head_dim]
-    kv_cache: [max_num_tokens, num_combined_kv_heads, head_dim]
+    new_kv: 5D [tokens, 1, heads*2//packing, packing, head_dim]
+    kv_cache: 5D [num_pages, page_size, heads*2//packing, packing, head_dim]
     """
+    assert new_kv.ndim == 5, f"new_kv must be 5D, got {new_kv.ndim}D"
+    assert kv_cache.ndim == 5, f"kv_cache must be 5D, got {kv_cache.ndim}D"
     assert (
         new_kv.dtype == kv_cache.dtype
     ), f"new_kv.dtype={new_kv.dtype} is not equal to kv_cache.dtype={kv_cache.dtype}"
@@ -50,9 +52,9 @@ def get_num_slices_per_block(new_kv: jax.Array, kv_cache: jax.Array, page_size=1
 
     bytes_per_element = bits // 8
 
-    total_num_token = new_kv.shape[0]
-    kv_head_num = new_kv.shape[1]
-    head_dim = new_kv.shape[2]
+    total_num_token = new_kv.shape[0] * new_kv.shape[1]
+    kv_head_num = new_kv.shape[2] * new_kv.shape[3]
+    head_dim = new_kv.shape[4]
 
     max_num_slices_per_block = VMEM_SIZE // (bytes_per_element * page_size * kv_head_num * head_dim)
     assert (
@@ -123,9 +125,19 @@ def kv_cache_update_impl(
     page_size,
     num_slices_per_block,
 ):
+    """Accept 5D inputs. Flattens to 3D internally for Pallas kernel, reshapes output back to 5D."""
+    assert new_kv.ndim == 5, f"new_kv must be 5D, got {new_kv.ndim}D: {new_kv.shape}"
+    assert kv_cache.ndim == 5, f"kv_cache must be 5D, got {kv_cache.ndim}D: {kv_cache.shape}"
     assert (
         slices.shape[1] % num_slices_per_block == 0
     ), f"slices.shape[1]={slices.shape[1]} is not divisible by num_slices_per_block={num_slices_per_block}"
+
+    original_cache_shape = kv_cache.shape
+    s = new_kv.shape
+    new_kv = new_kv.reshape(s[0] * s[1], s[2] * s[3], s[4])
+    s = kv_cache.shape
+    kv_cache = kv_cache.reshape(s[0] * s[1], s[2] * s[3], s[4])
+
     _, num_combined_kv_heads, head_dim = new_kv.shape
 
     assert num_combined_kv_heads % 2 == 0, (
@@ -140,7 +152,6 @@ def kv_cache_update_impl(
         kv_cache.shape[2] == head_dim
     ), f"kv_cache.shape[2]={kv_cache.shape[2]} is not equal to head_dim={head_dim}"
     assert head_dim % 128 == 0, f"head_dim={head_dim} is not divisible by 128"
-    # smaller or equal to page_size
 
     _any_mem = getattr(pltpu.MemorySpace, "ANY", pltpu.MemorySpace.HBM)
     in_specs = [
@@ -180,7 +191,7 @@ def kv_cache_update_impl(
 
     result = kernel(*scalar_prefetches, new_kv, kv_cache)[0]
 
-    return result
+    return result.reshape(original_cache_shape)
 
 
 @partial(

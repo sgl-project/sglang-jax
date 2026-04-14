@@ -62,11 +62,11 @@ class NativeAttention(AttentionBackend):
             forward_batch: ForwardBatch object containing seq_lens and batch_size
             is_causal: Whether to apply causal masking
         Returns:
-            Tuple of (output tensor of shape [total_tokens, hidden_size], k, v)
+            Tuple of (output tensor of shape [total_tokens, hidden_size], kv_fused 5D)
         """
         # TODO(pc) support tree based native attention backend
         k_buffer, v_buffer, kv_fused = self._get_and_update_kv_cache(
-            k, v, forward_batch, token_to_kv_pool, self.kv_sharding, layer.layer_id
+            k, v, forward_batch, token_to_kv_pool, layer.layer_id
         )
 
         scale = 1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
@@ -107,11 +107,13 @@ class NativeAttention(AttentionBackend):
         v: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-        kv_sharding: jax.NamedSharding,
         layer_id: int,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """
-        Get the kv cache from the forward batch.
+        Update KV cache and return (k_3d, v_3d, fused_5d).
+
+        The 5D fused buffer is persisted outside JIT. The 3D k/v views are
+        used by forward_attention for the actual attention computation.
         """
         if is_tpu_runtime():
             if forward_batch.forward_mode.is_extend():
@@ -122,22 +124,26 @@ class NativeAttention(AttentionBackend):
                 token_to_kv_pool.set_kv_buffer(
                     layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
                 )
-            # Use fused layer directly from pool; derive K/V views without extra merge
-            fused_layer = token_to_kv_pool.get_fused_kv_buffer(layer_id)
-            k = fused_layer.at[:, ::2, :].get(out_sharding=kv_sharding)
-            v = fused_layer.at[:, 1::2, :].get(out_sharding=kv_sharding)
-            fused_return = fused_layer
+            fused_5d = token_to_kv_pool.get_fused_kv_buffer(layer_id)
         else:
-            updated_layer = token_to_kv_pool.set_kv_buffer_legacy(
+            fused_5d = token_to_kv_pool.set_kv_buffer_legacy(
                 layer_id, forward_batch.out_cache_loc, k, v
             )
-            # Functional style: treat updated_layer as authoritative fused buffer for this layer in this step
-            # Derive K/V views for attention computation from fused buffer directly
-            k = updated_layer.at[:, ::2, :].get(out_sharding=kv_sharding)
-            v = updated_layer.at[:, 1::2, :].get(out_sharding=kv_sharding)
-            # Return fused buffer directly for persistence outside JIT
-            fused_return = updated_layer
-        return k, v, fused_return
+
+        # Flatten 5D -> 3D: [pages, page_size, heads_x2_per_pack, pack, hdim] -> [tokens, heads_x2, hdim]
+        num_pages, page_size, heads_x2_per_pack, packing, head_dim = fused_5d.shape
+        total_tokens = num_pages * page_size
+        fused_3d = jax.lax.reshape(
+            fused_5d,
+            (total_tokens, heads_x2_per_pack * packing, head_dim),
+            out_sharding=P(None, "tensor", None),
+        )
+
+        # Split interleaved [K0, V0, K1, V1, ...] into separate K and V
+        k_3d = fused_3d.at[:, ::2, :].get(out_sharding=self.kv_sharding)
+        v_3d = fused_3d.at[:, 1::2, :].get(out_sharding=self.kv_sharding)
+
+        return k_3d, v_3d, fused_5d
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:

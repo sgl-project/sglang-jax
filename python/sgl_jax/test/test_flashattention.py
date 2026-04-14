@@ -102,10 +102,8 @@ def write_prefix_tokens_for_kv(forward_batch, token_to_kv_pool: KVCache, lens, k
     """Write prefix tokens to KV cache and return extend tokens.
 
     k, v should be numpy arrays (or unsharded JAX arrays) to allow safe slicing.
-    Prefix data is resharded to match KV cache sharding before writing.
     """
     page_size = forward_batch.attn_backend.page_size
-    kv_sharding = token_to_kv_pool.kv_sharding  # P("data", "tensor", None)
 
     # Use aligned positions for k/v indexing since k/v arrays are created with alignment gaps
     seq_lens_np = np.asarray(forward_batch.seq_lens)
@@ -127,13 +125,11 @@ def write_prefix_tokens_for_kv(forward_batch, token_to_kv_pool: KVCache, lens, k
         extend_end = start + kv_len
 
         if kv_len > q_len:
-            # write prefix token - reshard to match KV cache sharding
+            # write prefix tokens - set_kv_buffer accepts 3D k/v and handles
+            # merge_kv + reshape to 5D fused format internally
             prefix_cache_loc = jnp.array(cache_loc_np[start:prefix_end], dtype=jnp.int32)
-            prefix_k = jax.device_put(jnp.array(k_np[start:prefix_end], dtype=k.dtype), kv_sharding)
-            prefix_v = jax.device_put(jnp.array(v_np[start:prefix_end], dtype=v.dtype), kv_sharding)
-            # Reshard loc to match data axis of KV cache
-            loc_sharding = NamedSharding(kv_sharding.mesh, P(kv_sharding.spec[0]))
-            prefix_cache_loc = jax.device_put(prefix_cache_loc, loc_sharding)
+            prefix_k = jnp.array(k_np[start:prefix_end], dtype=k.dtype)
+            prefix_v = jnp.array(v_np[start:prefix_end], dtype=v.dtype)
             token_to_kv_pool.set_kv_buffer(0, prefix_cache_loc, prefix_k, prefix_v)
 
         extend_k.append(k_np[extend_start:extend_end])

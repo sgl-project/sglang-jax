@@ -461,7 +461,9 @@ class FlashAttention(AttentionBackend):
             P(None, self.kv_partition_axis),  # queries
             P(None, self.kv_partition_axis),  # keys (new tokens)
             P(None, self.kv_partition_axis),  # values (new tokens)
-            P(None, None, self.kv_partition_axis, None),  # kv_cache_fused (head interleaved)
+            P(
+                None, None, self.kv_partition_axis, None, None
+            ),  # kv_cache_fused 5D (head interleaved)
             P(),  # kv_lens
             P(),  # page_indices
             P(),  # cu_q_lens
