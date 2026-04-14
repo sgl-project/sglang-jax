@@ -13,6 +13,7 @@ from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
     get_num_slices_per_block,
     get_slot_mapping,
     kv_cache_update,
+    kv_cache_update_impl,
 )
 
 
@@ -418,6 +419,8 @@ class MHATokenToKVPool(KVCache):
             kv_cache=self.kv_buffer[layer_idx],
             page_size=page_size,
             kv_partition_axis=self.kv_partition_axis,
+            attention_data_partition_axis=None,
+            mesh=self.mesh,
         )
 
     def replace_kv_buffer(self, fused_kv_buffer: list[jax.Array]) -> None:
@@ -626,6 +629,8 @@ def _set_fused_kv_buffer(
     kv_cache: jax.Array,
     page_size: int,
     kv_partition_axis: str = "tensor",
+    attention_data_partition_axis: str = None,
+    mesh: Mesh = None,
 ) -> jax.Array:
     """
     Update fused KV cache with new fused KV data.
@@ -646,6 +651,8 @@ def _set_fused_kv_buffer(
         kv_cache,
         page_size=page_size,
         kv_partition_axis=kv_partition_axis,
+        data_partition_axis=attention_data_partition_axis,
+        mesh=mesh,
     )
 
 
@@ -655,6 +662,8 @@ def update_fused_kv_cache(
     kv_cache: jax.Array,  # [cache_size, num_kv_heads * 2, head_dim]
     page_size: int = 1,
     kv_partition_axis: str = "tensor",
+    data_partition_axis: str = None,
+    mesh: Mesh = None,
 ) -> jax.Array:
     """
     Main fused KV cache update function.
@@ -675,6 +684,8 @@ def update_fused_kv_cache(
         kv_cache,
         page_size=page_size,
         kv_partition_axis=kv_partition_axis,
+        data_partition_axis=data_partition_axis,
+        mesh=mesh,
     )
 
 
@@ -753,47 +764,65 @@ def update_fused_kv_cache_vectorized(
     kv_cache: jax.Array,  # [cache_size, num_kv_heads * 2, head_dim]
     page_size: int,
     kv_partition_axis: str = "tensor",
+    data_partition_axis: str = None,
+    mesh: Mesh = None,
 ) -> jax.Array:
     """
     Vectorized fused KV cache update that handles padding and supports page_size > 1
     by grouping contiguous tokens into page-sized chunks for efficient updates.
     """
-    total_tokens = loc.shape[0]
-    loc = loc.astype(jnp.int32)
 
-    # Use original logic for page_size = 1: one slice per token
-    kv_cache_locs = jnp.where(loc == -1, 0, loc).astype(jnp.int32)
-    new_kv_locs = jnp.arange(total_tokens, dtype=jnp.int32)
-    slice_lens = jnp.where(loc == -1, 0, 1).astype(jnp.int32)
-    num_slices = total_tokens
-
-    # head_num, cache_len, new_kv_len, head_dim (fused), page_size
-    num_slices_per_block = get_num_slices_per_block(
-        fused_kv,  # num_kv_heads
-        kv_cache,
-        page_size,
+    @jax.shard_map(
+        in_specs=(
+            # fused_kv: sharded by data (tokens) and tensor (heads)
+            P(data_partition_axis, kv_partition_axis, None),
+            # loc: sharded by data
+            P(data_partition_axis),
+            # kv_cache: sharded by data and tensor
+            P(data_partition_axis, kv_partition_axis, None),
+        ),
+        out_specs=P(data_partition_axis, kv_partition_axis, None),
+        mesh=mesh,
+        check_vma=False,
     )
+    def _sharded_update(local_fused_kv, local_loc, local_kv_cache):
+        # 1. Compute slices (locally)
+        # We assume local_loc already contains indices local to this shard.
+        total_tokens = local_loc.shape[0]
+        local_loc_int = local_loc.astype(jnp.int32)
 
-    slot_mapping = get_slot_mapping(
-        num_slices_per_block=num_slices_per_block,
-        kv_cache_start_loc=kv_cache_locs,
-        new_kv_start_loc=new_kv_locs,
-        slice_lens=slice_lens,
-    )
+        kv_cache_locs = jnp.where(local_loc_int == -1, 0, local_loc_int).astype(jnp.int32)
+        new_kv_locs = jnp.arange(total_tokens, dtype=jnp.int32)
+        slice_lens = jnp.where(local_loc_int == -1, 0, 1).astype(jnp.int32)
+        num_slices = total_tokens
 
-    num_kv_update_slices = jnp.array([num_slices], dtype=jnp.int32)
+        # head_num, cache_len, new_kv_len, head_dim (fused), page_size
+        num_slices_per_block = get_num_slices_per_block(
+            local_fused_kv,  # num_kv_heads
+            local_kv_cache,
+            page_size,
+        )
 
-    kv_cache = kv_cache_update(
-        new_kv=fused_kv,
-        slices=slot_mapping,
-        kv_cache=kv_cache,
-        num_kv_update_slices=num_kv_update_slices,
-        page_size=page_size,
-        num_slices_per_block=num_slices_per_block,
-        kv_partition_axis=kv_partition_axis,
-    )
+        slot_mapping = get_slot_mapping(
+            num_slices_per_block=num_slices_per_block,
+            kv_cache_start_loc=kv_cache_locs,
+            new_kv_start_loc=new_kv_locs,
+            slice_lens=slice_lens,
+        )
 
-    return kv_cache
+        num_kv_update_slices = jnp.array([num_slices], dtype=jnp.int32)
+
+        # 2. Call kernel implementation directly
+        return kv_cache_update_impl(
+            new_kv=local_fused_kv,
+            slices=slot_mapping,
+            kv_cache=local_kv_cache,
+            num_kv_update_slices=num_kv_update_slices,
+            page_size=page_size,
+            num_slices_per_block=num_slices_per_block,
+        )
+
+    return _sharded_update(fused_kv, loc, kv_cache)
 
 
 class MLATokenToKVPool(KVCache):
