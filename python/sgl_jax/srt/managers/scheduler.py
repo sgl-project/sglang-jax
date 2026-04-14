@@ -1123,7 +1123,7 @@ class Scheduler(
         # scheduling state
         ret["cur_batch_is_none"] = self.cur_batch is None
         ret["last_batch_is_none"] = self.last_batch is None
-        ret["chunked_req_is_none"] = self.chunked_reqs is None
+        ret["chunked_req_is_none"] = all(r is None for r in self.chunked_reqs)
 
         # request cache stat
         if isinstance(self.tree_cache, ChunkCache):
@@ -1968,7 +1968,7 @@ class Scheduler(
                 for req in retracted_reqs:
                     self._add_request_to_queue(req)
 
-            self.chunked_reqs = None
+            self.chunked_reqs = [None] * self.dp_size
             logger.info("Paused generation retracted")
         elif recv_req.mode == "in_place":
             logger.info("Paused generation in place")

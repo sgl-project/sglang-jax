@@ -1293,7 +1293,7 @@ class ScheduleBatch:
             for idx, _ in enumerate(dp_reqs.reqs):
                 self.release_req(idx, dp_rank, len(dp_reqs.reqs) - 1, server_args)
 
-        self.filter_batch(retracted_reqs)
+        self.filter_batch(keep_indices={dp_rank: [] for dp_rank in range(self.dp_size)})
         return retracted_reqs
 
     def prepare_for_idle(self):
