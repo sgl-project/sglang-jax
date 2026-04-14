@@ -25,7 +25,11 @@ blockwise_quant_util = importlib.import_module(
 
 
 def _create_single_device_mesh():
-    return Mesh(np.array(jax.devices()[:1]).reshape(1, 1), axis_names=("data", "tensor"))
+    return Mesh(
+        np.array(jax.devices()[:1]).reshape(1, 1),
+        axis_names=("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
+    )
 
 
 def _make_linear_test_inputs():
