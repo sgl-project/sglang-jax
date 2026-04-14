@@ -1335,11 +1335,16 @@ class ScheduleBatch:
         )
 
         if self.forward_mode is not None and self.forward_mode.is_decode():
+            # Evict at the smaller of sliding_window_size and page_size to avoid
+            # stale SWA slot accumulation. For large windows (e.g., 4096) this
+            # prevents holding memory far beyond what's needed; for small windows
+            # (e.g., 128) it aligns with the natural eviction boundary.
+            evict_interval = max(min(sliding_window_size, page_size), 1)
             for dp_rank, info in enumerate(self.reqs_info):
                 if not info.reqs:
                     continue
                 for req in info.reqs:
-                    if req.decode_batch_idx % sliding_window_size == 1:
+                    if req.decode_batch_idx % evict_interval == 1:
                         self._evict_swa(
                             req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
                         )
