@@ -594,6 +594,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.swa_attn_allocator.free(swa_indices, dp_rank=dp_rank)
         mapping[free_index] = 0
 
+    def count_swa_mapped(self, indices: np.array, dp_rank: int = 0) -> int:
+        """Count how many of the given full indices have an active SWA mapping."""
+        mapping = (
+            self.full_to_swa_index_mapping
+            if self.dp_size == 1
+            else self.full_to_swa_index_mapping[dp_rank]
+        )
+        return int((mapping[indices] > 0).sum())
+
     def backup_state(self):
         raise NotImplementedError
 

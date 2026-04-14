@@ -1382,7 +1382,15 @@ class ScheduleBatch:
         free_slots = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, req.swa_evicted_seqlen : new_evicted
         ]
+        # Count actual SWA slots that will be freed (those with active mapping)
+        num_swa_freed = self.token_to_kv_pool_allocator.count_swa_mapped(
+            free_slots, dp_rank=dp_rank
+        )
         self.token_to_kv_pool_allocator.free_swa(free_slots, dp_rank=dp_rank)
+        # Notify cache layer: these slots were protected (node is locked),
+        # so adjust swa_protected_size_ to prevent bookkeeping leak.
+        if num_swa_freed > 0 and isinstance(self.tree_cache, SWARadixCache):
+            self.tree_cache.adjust_swa_protected_size(-num_swa_freed, dp_rank=dp_rank)
         req.swa_evicted_seqlen = new_evicted
 
     def prepare_for_decode(self):

@@ -716,6 +716,16 @@ class SWARadixCache(BasePrefixCache):
         # protected size refers to the size of the swa cache that is locked
         return self.swa_protected_size_[dp_rank]
 
+    def adjust_swa_protected_size(self, delta: int, dp_rank: int = 0):
+        """Adjust swa_protected_size_ when SWA slots are freed outside the cache layer.
+
+        Called by _evict_swa (schedule_batch.py) which directly frees SWA slots
+        via allocator.free_swa() for tokens that fell outside the sliding window.
+        Since those tokens belong to locked (protected) nodes, the freed count
+        must be subtracted from swa_protected_size_ to keep bookkeeping correct.
+        """
+        self.swa_protected_size_[dp_rank] += delta
+
     def all_values_flatten(self) -> jnp.Array:
         values = []
 
