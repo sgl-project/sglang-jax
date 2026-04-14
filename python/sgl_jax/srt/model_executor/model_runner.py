@@ -39,7 +39,6 @@ from sgl_jax.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
-    SplitMHATokenToKVPool,
     SWAKVPool,
 )
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
@@ -374,25 +373,14 @@ class ModelRunner(BaseModelRunner):
 
         if available_kv_cache_bytes <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
-
-        # head_dim/v_head_dim handling
-        head_dim = self.model_config.head_dim
-        v_head_dim = getattr(self.model_config, "v_head_dim", head_dim)
-
-        head_dim_aligned = (head_dim + 127) // 128 * 128
-        v_head_dim_aligned = (v_head_dim + 127) // 128 * 128
-
-        # If head dims differ, they are stored separately and each aligned to 128
-        if head_dim != v_head_dim:
-            per_token_dim = head_dim_aligned + v_head_dim_aligned
-        else:
-            # Fused case
-            per_token_dim = head_dim_aligned * 2
-
+        head_dim_aligned = self.model_config.head_dim
+        if head_dim_aligned % 128 != 0:
+            head_dim_aligned = (self.model_config.head_dim + 127) // 128 * 128
         cell_size = (
             self.model_config.get_num_kv_heads(self.tp_size)
-            * per_token_dim
+            * head_dim_aligned
             * self.model_config.num_hidden_layers
+            * 2
             * jnp.dtype(self.kv_cache_dtype).itemsize
         )
 
@@ -506,52 +494,25 @@ class ModelRunner(BaseModelRunner):
 
         # Create KV cache pool
         if self.is_hybrid:
-            # Determine pool classes from raw (pre-alignment) head dims
-            full_hd = self.model_config.head_dim
-            full_vhd = getattr(self.model_config, "v_head_dim", full_hd)
-            swa_hd = getattr(self.model_config, "swa_head_dim", full_hd)
-            swa_vhd = getattr(
-                self.model_config,
-                "swa_v_head_dim",
-                getattr(self.model_config, "v_head_dim", swa_hd),
-            )
-            full_pool_class = SplitMHATokenToKVPool if full_hd != full_vhd else MHATokenToKVPool
-            swa_pool_class = SplitMHATokenToKVPool if swa_hd != swa_vhd else MHATokenToKVPool
-
             self.token_to_kv_pool = SWAKVPool(
                 size=self.full_max_total_num_tokens,
                 size_swa=self.swa_max_total_num_tokens,
                 swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
                 full_attention_layer_ids=self.model_config.full_attention_layer_ids,
-                full_pool_class=full_pool_class,
-                swa_pool_class=swa_pool_class,
                 dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
-                head_dim=(full_hd + 127) // 128 * 128,
-                v_head_dim=(full_vhd + 127) // 128 * 128,
-                swa_head_dim=(swa_hd + 127) // 128 * 128,
-                swa_v_head_dim=(swa_vhd + 127) // 128 * 128,
+                head_dim=self.model_config.head_dim,
                 mesh=self.mesh,
             )
         else:
-            head_dim = self.model_config.head_dim
-            v_head_dim = getattr(self.model_config, "v_head_dim", head_dim)
-
-            aligned_head_dim = (head_dim + 127) // 128 * 128
-            aligned_v_head_dim = (v_head_dim + 127) // 128 * 128
-
-            pool_class = SplitMHATokenToKVPool if head_dim != v_head_dim else MHATokenToKVPool
-            if self.use_mla_backend:
-                pool_class = MLATokenToKVPool
-            self.token_to_kv_pool = pool_class(
+            self.token_to_kv_pool = MHATokenToKVPool(
                 size=self.max_total_num_tokens,
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
-                head_dim=aligned_head_dim,
+                head_dim=(self.model_config.head_dim + 127) // 128 * 128,
                 layer_num=self.model_config.num_hidden_layers,
                 mesh=self.mesh,
-                v_head_dim=aligned_v_head_dim,
             )
 
         # Create KV pool allocator
@@ -604,10 +565,9 @@ class ModelRunner(BaseModelRunner):
                 self.model_config.head_dim,
                 page_size=self.page_size,
                 mesh=self.mesh,
-                v_head_dim=getattr(self.model_config, "v_head_dim", None),
             )
         else:
-            raise ValueError(f"Invalid attention backend: {self.server_args.attention_backend}")
+            raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
 
     def _forward(
         self,
@@ -657,25 +617,15 @@ class ModelRunner(BaseModelRunner):
         # Issue: https://github.com/sgl-project/sglang-jax/issues/233
         # Q: Why does not call device_put in every layer?
         # A: Because it does not work and cache_miss still happens. According to benchmark(https://github.com/sgl-project/sglang-jax/pull/234), the performance is not influenced.
-
         if self.tp_size == 1:
             target_sharding = NamedSharding(
                 self.token_to_kv_pool.mesh,
                 P(None, self.token_to_kv_pool.kv_partition_axis, None),
             )
-            is_split = isinstance(self.token_to_kv_pool, SplitMHATokenToKVPool) or getattr(
-                self.token_to_kv_pool, "is_split", False
-            )
-            if is_split:
-                layers_kv_fused = [
-                    (jax.device_put(k, target_sharding), jax.device_put(v, target_sharding))
-                    for k, v in layers_kv_fused
-                ]
-            else:
-                layers_kv_fused = [
-                    jax.device_put(layer_kv_fused, target_sharding)
-                    for layer_kv_fused in layers_kv_fused
-                ]
+            layers_kv_fused = [
+                jax.device_put(layer_kv_fused, target_sharding)
+                for layer_kv_fused in layers_kv_fused
+            ]
 
         self.token_to_kv_pool.replace_kv_buffer(layers_kv_fused)
 

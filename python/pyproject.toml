@@ -171,6 +171,7 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
+tops = { git = "https://github.com/primatrix/pallas-kernel.git", rev = "41431b1c4c5e60f12c7f66e84b09a2585e3b9596" }  # release/v0.4
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
