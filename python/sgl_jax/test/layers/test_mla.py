@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.layers.mla import MLAAttention
+from sgl_jax.srt.layers.attention.mla import MLAAttention
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import CustomTestCase
 
