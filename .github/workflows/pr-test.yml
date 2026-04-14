@@ -162,7 +162,7 @@ jobs:
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install uv
-          uv pip install -e "python[all]"
+          uv pip install -e "python[all,multimodal]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite e2e-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
