@@ -1,5 +1,6 @@
 import logging
 
+from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 logger = logging.getLogger(__name__)
@@ -90,9 +91,7 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int, d
 
 def available_and_evictable_str(tree_cache, dp_rank: int = 0) -> str:
     token_to_kv_pool_allocator = tree_cache.token_to_kv_pool_allocator
-    # if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-    # not support SWA yet currently , hack this branch
-    if False:
+    if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
         full_available_size = token_to_kv_pool_allocator.full_available_size(dp_rank=dp_rank)
         swa_available_size = token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
         full_evictable_size = tree_cache.full_evictable_size(dp_rank=dp_rank)
@@ -100,8 +99,6 @@ def available_and_evictable_str(tree_cache, dp_rank: int = 0) -> str:
         return (
             f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
             f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
-            f"Full LRU list evictable size: {tree_cache.full_lru_list_evictable_size()}\n"
-            f"SWA LRU list evictable size: {tree_cache.swa_lru_list_evictable_size()}\n"
         )
     else:
         available_size = token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
