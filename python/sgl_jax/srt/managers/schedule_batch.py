@@ -1882,20 +1882,15 @@ class ScheduleBatch:
             total_cache_loc_size = cache_loc_paddings[-1]  # Use largest padding
         else:
             # For decode mode, use the cache_loc_padding that corresponds to the bs bucket.
-            # This matches the precompile logic in tp_worker.precompile_decode() which uses:
-            #   aligned_cache_loc_size = (bs * max_req_len + page_size - 1) // page_size * page_size
-            # and precompile_cache_loc_paddings is defined as:
-            #   [bs * ((max_req_len + page_size - 1) // page_size * page_size) for bs in bs_paddings]
-            # We select cache_loc_padding based on bs bucket to match precompiled kernels.
             total_bs = per_dp_bs_size * self.dp_size
             _, bs_index = find_padding_size(total_bs, bs_paddings)
             total_cache_loc_size = cache_loc_paddings[bs_index]
 
         per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
-        cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
+        # np.empty avoids page-fault zeroing; padding positions are masked by seq_lens downstream.
+        cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
 
         offset_bs = 0
-        offset_cache = 0
 
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
@@ -1904,32 +1899,30 @@ class ScheduleBatch:
                 offset_bs += per_dp_cache_loc_size
                 continue
 
-            # Get token indices from req_to_token pool for this DP rank
             token_indices = self.req_to_token_pool.req_to_token[info.req_pool_indices]
+            seq_lens = info.seq_lens
 
-            # Ensure we start writing at the correct offset for this DP rank
-            offset_cache = offset_bs
+            n_reqs = len(seq_lens)
+            if n_reqs > 0:
+                # Page-aligned offsets per request
+                aligned_lens = ((seq_lens + page_size - 1) // page_size) * page_size
+                offsets = np.empty(n_reqs, dtype=np.int64)
+                offsets[0] = 0
+                np.cumsum(aligned_lens[:-1], out=offsets[1:])
 
-            # Build cache_loc for each request in this DP rank
-            for i, seq_len in enumerate(info.seq_lens):
-                if seq_len > 0:
-                    # Calculate page-aligned length
-                    aligned_len = ((seq_len + page_size - 1) // page_size) * page_size
+                total_elements = seq_lens.sum()
 
-                    # Safety check to prevent overflow
-                    if offset_cache + seq_len > offset_bs + per_dp_cache_loc_size:
-                        raise RuntimeError(
-                            f"Cache loc overflow in DP rank {dp_rank}. "
-                            f"Offset {offset_cache} + len {seq_len} > limit {offset_bs + per_dp_cache_loc_size}. "
-                            f"Chosen bucket size: {per_dp_cache_loc_size}"
-                        )
+                # Vectorized source indices: (row, col) into token_indices
+                src_row = np.repeat(np.arange(n_reqs, dtype=np.int32), seq_lens)
+                cumsum = np.cumsum(seq_lens)
+                col_offsets = np.repeat(cumsum - seq_lens, seq_lens)
+                src_col = np.arange(total_elements, dtype=np.int32) - col_offsets
 
-                    # Copy actual token indices
-                    tokens_to_copy = token_indices[i, :seq_len]
-                    cache_loc_cpu[offset_cache : offset_cache + seq_len] = tokens_to_copy
+                # Vectorized destination indices
+                dest_starts = offsets + offset_bs
+                dest_indices = np.repeat(dest_starts, seq_lens) + src_col
 
-                    # Move to next page-aligned position
-                    offset_cache += aligned_len
+                cache_loc_cpu[dest_indices] = token_indices[src_row, src_col]
 
             # Move to next DP rank's section (fixed stride)
             offset_bs += per_dp_cache_loc_size
