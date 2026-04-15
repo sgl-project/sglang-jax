@@ -36,7 +36,6 @@ from sgl_jax.srt.kernels.ragged_paged_attention.util import (
     next_power_of_2,
 )
 
-
 class RpaCase(Enum):
     """Represents the different cases for Ragged Paged Attention.
 
@@ -97,26 +96,6 @@ def ref_ragged_paged_attention(
     if mask_value is None:
         # We do not set to -inf directly because (-inf) - (-inf) is nan.
         mask_value = jnp.finfo(out_dtype).min
-    # dynamic_validate_inputs(
-    #     queries,
-    #     keys,
-    #     values,
-    #     kv_cache,
-    #     kv_lens,
-    #     page_indices,
-    #     cu_q_lens,
-    #     distribution,
-    #     use_causal_mask=use_causal_mask,
-    #     skip_kv_mask=skip_kv_mask,
-    #     sm_scale=sm_scale,
-    #     sliding_window=sliding_window,
-    #     soft_cap=soft_cap,
-    #     out_dtype=out_dtype,
-    #     mask_value=mask_value,
-    #     q_scale=q_scale,
-    #     k_scale=k_scale,
-    #     v_scale=v_scale,
-    # )
     actual_head_dim = queries.shape[2]
     actual_num_q_heads = queries.shape[1]
     actual_num_kv_heads = keys.shape[1]
@@ -410,29 +389,6 @@ def _ragged_paged_attention_kernel_loop(
         next_kv_q_gap = next_kv_len - next_q_len
         next_seq_start_bkv_idx = jnp.maximum(next_kv_q_gap - sliding_window, 0) // bkv_sz
 
-    def debug_print(msg, *args):
-        if debug_mode:
-            pl.debug_print(msg, *args)
-
-    debug_print("[RPA debug] ======= In loop seq_idx={}", seq_idx)
-    debug_print("[RPA debug] start_seq_idx={}", start_seq_idx)
-    debug_print("[RPA debug] end_seq_idx={}", end_seq_idx)
-    debug_print("[RPA debug] num_seqs={}", num_seqs)
-    debug_print("[RPA debug] bkv_p={}", bkv_p)
-    debug_print("[RPA debug] page_size={}", page_size)
-    debug_print("[RPA debug] pages_per_seq={}", pages_per_seq)
-    debug_print("[RPA debug] bkv_sz={}", bkv_sz)
-    debug_print("[RPA debug] bq_sz={}", bq_sz)
-    debug_print(f"[RPA debug] static_q_len={static_q_len}")
-    debug_print("[RPA debug] q_start={}", q_start)
-    debug_print("[RPA debug] q_end={}", q_end)
-    debug_print("[RPA debug] q_len={}", q_len)
-    debug_print("[RPA debug] kv_len={}", kv_len)
-    debug_print("[RPA debug] kv_q_gap={}", kv_q_gap)
-    debug_print(f"[RPA debug] sliding_window={sliding_window}")
-    debug_print("[RPA debug] cur_seq_start_bkv_idx={}", cur_seq_start_bkv_idx)
-    debug_print("[RPA debug] next_seq_start_bkv_idx={}", next_seq_start_bkv_idx)
-
     def flash_attention_step1_qk_softmax(
         q,  # [actual_bq_csz * num_q_heads_per_kv_head, head_dim]
         k,  # [bkv_csz, head_dim]
@@ -562,26 +518,14 @@ def _ragged_paged_attention_kernel_loop(
         q_end = cu_q_lens_ref[seq_idx + 1]
         q_len = q_end - q_start
 
-        kv_left = kv_len - kv_len_start
+        # FIX: Clip kv_left to >= 0 to prevent negative sizes when fetching padded inputs
+        kv_left = jnp.maximum(kv_len - kv_len_start, 0)
         kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
         kv_left_frm_new = kv_left - kv_left_frm_cache
 
         bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, bkv_sz)
         bkv_sz_frm_new = jnp.minimum(bkv_sz - bkv_sz_frm_cache, kv_left_frm_new)
         page_indices_offset = seq_idx * pages_per_seq + kv_p_start
-
-        debug_print("[RPA debug]" f" -----------{'wait' if wait else 'start'}_fetch_bkv-----------")
-        debug_print("[RPA debug] seq_idx={}", seq_idx)
-        debug_print("[RPA debug] bkv_idx={}", bkv_idx)
-        debug_print("[RPA debug] bkv_sem_idx={}", bkv_sem_idx)
-        debug_print("[RPA debug] kv_len_start={}", kv_len_start)
-        debug_print("[RPA debug] kv_p_start={}", kv_p_start)
-        debug_print("[RPA debug] kv_left={}", kv_left)
-        debug_print("[RPA debug] kv_left_frm_cache={}", kv_left_frm_cache)
-        debug_print("[RPA debug] kv_left_frm_new={}", kv_left_frm_new)
-        debug_print("[RPA debug] bkv_sz_frm_cache={}", bkv_sz_frm_cache)
-        debug_print("[RPA debug] bkv_sz_frm_new={}", bkv_sz_frm_new)
-        debug_print("[RPA debug] page_indices_offset={}", page_indices_offset)
 
         if not wait:
             # Make sure the current bkv buffer is safe to overwrite.
@@ -601,10 +545,8 @@ def _ragged_paged_attention_kernel_loop(
                     sem,
                     wait=False,
                 )
-                debug_print("[RPA debug] loop_body i={}, sz={}", i, sz)
 
             new_kv_len_start = q_end - kv_left_frm_new
-            debug_print("[RPA debug] new_kv_len_start={}", new_kv_len_start)
             _async_copy(
                 kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
                 vmem_ref.at[pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)],
@@ -636,20 +578,6 @@ def _ragged_paged_attention_kernel_loop(
             cache_hbm_shape[0] * cache_hbm_shape[1], *cache_hbm_shape[2:]
         )
 
-        debug_print(
-            "[RPA debug]" f" -----------{'wait' if wait else 'start'}_update_kv_cache-----------"
-        )
-        debug_print("[RPA debug] seq_idx={}", seq_idx)
-        debug_print("[RPA debug] bkv_sem_idx={}", bkv_sem_idx)
-        debug_print("[RPA debug] offset={}", offset)
-        debug_print("[RPA debug] update_sz={}", update_sz)
-        debug_print("[RPA debug] bkv_id={}", bkv_id)
-        debug_print("[RPA debug] kv_p_start={}", kv_p_start)
-        debug_print("[RPA debug] kv_p_end={}", kv_p_end)
-        debug_print("[RPA debug] ignore={}", ignore)
-        debug_print("[RPA debug] p_ignore={}", p_ignore)
-        debug_print("[RPA debug] page_indices_offset={}", page_indices_offset)
-
         def loop_body(i, states):
             update_sz, ignore = states
             sz = jnp.minimum(page_size - ignore, update_sz)
@@ -665,7 +593,6 @@ def _ragged_paged_attention_kernel_loop(
                 sem,
                 wait,
             )
-            debug_print("[RPA debug] loop_body i={}, sz={}", i, sz)
             return update_sz - sz, 0
 
         if not wait:
@@ -691,14 +618,8 @@ def _ragged_paged_attention_kernel_loop(
         q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
         q_end = cu_q_lens_ref[seq_idx + 1]
         sz = jnp.minimum(bq_sz, q_end - q_len_start)
-
-        debug_print("[RPA debug]" f" -----------{'wait' if wait else 'start'}_fetch_bq-----------")
-        debug_print("[RPA debug] seq_idx={}", seq_idx)
-        debug_print("[RPA debug] bq_idx={}", bq_idx)
-        debug_print("[RPA debug] bq_sem_idx={}", bq_sem_idx)
-        debug_print("[RPA debug] q_len_start={}", q_len_start)
-        debug_print("[RPA debug] q_end={}", q_end)
-        debug_print("[RPA debug] sz={}", sz)
+        # FIX: Ensure sz >= 0
+        sz = jnp.maximum(sz, 0)
 
         _async_copy(
             q_hbm_ref.at[:, pl.ds(q_len_start, sz)],
@@ -713,14 +634,8 @@ def _ragged_paged_attention_kernel_loop(
         q_len_start = cu_q_lens_ref[seq_idx] + bo_idx * bq_sz
         q_end = cu_q_lens_ref[seq_idx + 1]
         sz = jnp.minimum(bq_sz, q_end - q_len_start)
-
-        debug_print("[RPA debug]" f" -----------{'wait' if wait else 'start'}_send_bo-----------")
-        debug_print("[RPA debug] seq_idx={}", seq_idx)
-        debug_print("[RPA debug] bo_idx={}", bo_idx)
-        debug_print("[RPA debug] bo_sem_idx={}", bo_sem_idx)
-        debug_print("[RPA debug] q_len_start={}", q_len_start)
-        debug_print("[RPA debug] q_end={}", q_end)
-        debug_print("[RPA debug] sz={}", sz)
+        # FIX: Ensure sz >= 0
+        sz = jnp.maximum(sz, 0)
 
         _async_copy(
             vmem_ref.at[:, pl.ds(0, sz)],
@@ -929,6 +844,10 @@ def _ragged_paged_attention_kernel_loop(
             else:
                 effective_kv_len = kv_len
             end_bkv_idx = cdiv(effective_kv_len, bkv_sz)
+            
+            # FIX: Ensure end_bkv_idx is at least start_bkv_idx + 1 to prevent pipeline deadlock
+            # when effective_kv_len <= 0 (which happens with padded inputs).
+            end_bkv_idx = jnp.maximum(end_bkv_idx, start_bkv_idx + 1)
 
             # Prefetch next bq
             @pl.when(next_seq_idx < end_seq_idx)
@@ -967,10 +886,6 @@ def _ragged_paged_attention_kernel_loop(
                 def update_cur_bkv_to_cache():
                     start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
 
-                debug_print("[RPA debug] -----------flash attention-----------")
-                debug_print("[RPA debug] seq_idx={}", seq_idx)
-                debug_print("[RPA debug] bq_idx={}", bq_idx)
-                debug_print("[RPA debug] bkv_idx={}", bkv_idx)
                 if debug_mode:
                     # Skip flash attention if debug mode is enabled.
                     return
@@ -1869,13 +1784,13 @@ def ragged_paged_attention(
     )
 
     # TODO:
-    # q, kv_cache = run_rpa_kernel(
-    #     q,
-    #     kv_cache,
-    #     **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
-    #     static_q_len=128,
-    #     case=RpaCase.PREFILL,
-    # )
+    q, kv_cache = run_rpa_kernel(
+        q,
+        kv_cache,
+        **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
+        static_q_len=128,
+        case=RpaCase.PREFILL,
+    )
     # Mixed
     q, kv_cache = run_rpa_kernel(
         q,
@@ -1889,3 +1804,42 @@ def ragged_paged_attention(
         prepare_outputs(q, actual_num_q_heads_per_kv_head, actual_head_dim),
         kv_cache,
     )
+
+def main():
+    max_num_tokens = 32
+    actual_num_q_heads = 4
+    actual_num_kv_heads = 2
+    actual_head_dim = 128
+    
+    total_num_pages = 10
+    page_size = 16
+    
+    q = jnp.ones((max_num_tokens, actual_num_q_heads, actual_head_dim), dtype=jnp.bfloat16)
+    k = jnp.ones((max_num_tokens, actual_num_kv_heads, actual_head_dim), dtype=jnp.bfloat16)
+    v = jnp.ones((max_num_tokens, actual_num_kv_heads, actual_head_dim), dtype=jnp.bfloat16)
+    
+    kv_packing = get_dtype_packing(jnp.bfloat16)
+    num_kv_heads_x2 = align_to(actual_num_kv_heads * 2, kv_packing)
+    head_dim = align_to(actual_head_dim, 128)
+    
+    kv_cache = jnp.zeros((total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim), dtype=jnp.bfloat16)
+    
+    max_num_seqs = 2
+    pages_per_seq = 2
+    kv_lens = jnp.array([16, 16], dtype=jnp.int32)
+    page_indices = jnp.arange(max_num_seqs * pages_per_seq, dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 16, 32], dtype=jnp.int32)
+    distribution = jnp.array([0, 0, 2], dtype=jnp.int32)
+    
+    print("Calling ragged_paged_attention...")
+    out, updated_kv_cache = ragged_paged_attention(
+        q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution,
+        use_causal_mask=True,
+        debug_mode=True
+    )
+    print("Output shape:", out.shape)
+    print("Output mean:", jnp.mean(out))
+
+if __name__ == "__main__":
+    main()
+

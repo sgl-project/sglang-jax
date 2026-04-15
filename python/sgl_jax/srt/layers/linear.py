@@ -238,10 +238,8 @@ class QuantizedLinear(nnx.Module):
             P(output_axis, input_axis),  # w_q
             P(output_axis),  # w_scale
         )
-        # row parallel
-        if input_axis:
-            out_specs = P(None, None, unreduced=frozenset({input_axis}))
-        # column parallel
+        if x_2d.shape[0] >= 64:
+            out_specs = P(input_axis, output_axis)
         else:
             out_specs = P(None, output_axis)
 
