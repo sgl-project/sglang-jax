@@ -545,6 +545,18 @@ class EPMoE(nnx.Module):
         if x.shape[0] == 0:
             return jnp.zeros((0, wo_kernel.shape[-1]), dtype=x.dtype)
 
+        # TPU Pallas GMM kernel requires size_m aligned to sublane tiling
+        # (hardware-dependent, e.g. 16 for bfloat16 on TPU v7).
+        # Pad with zeros and assign to the last expert group;
+        # _unpermute trims the extra rows afterwards.
+        from jax.experimental.pallas import tpu as pltpu
+
+        sublane_align = pltpu.get_tpu_info().get_sublane_tiling(x.dtype)
+        pad_size = (-x.shape[0]) % sublane_align
+        if pad_size > 0:
+            x = jnp.pad(x, ((0, pad_size), (0, 0)))
+            group_sizes = group_sizes.at[-1].add(pad_size)
+
         group_sizes = group_sizes.astype(jnp.int32)
         act_q_dtype = self.activation_quantized_dtype
 

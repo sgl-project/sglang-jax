@@ -175,6 +175,13 @@ class ModelConfig:
         # TODO (qinghan): add the model architecture detection later, for now use deepseek
         if any("Deepseek" in arch for arch in self.hf_config.architectures):
             self.attention_arch = AttentionArch.MLA
+            # MLA uses qk_nope_head_dim + qk_rope_head_dim as the effective head_dim
+            # for Q/K (and V is padded to match). Override the config-level head_dim
+            # so the attention backend allocates the correct shapes.
+            qk_nope = getattr(self.hf_text_config, "qk_nope_head_dim", 0)
+            qk_rope = getattr(self.hf_text_config, "qk_rope_head_dim", 0)
+            if qk_nope and qk_rope:
+                self.head_dim = qk_nope + qk_rope
         else:
             self.attention_arch = AttentionArch.MHA
         self.num_attention_heads = self.hf_text_config.num_attention_heads
