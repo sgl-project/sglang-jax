@@ -8,6 +8,8 @@ from jax import numpy as jnp
 from jax import shard_map
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
+from jax.sharding import reshard
+from jax.sharding import use_abstract_mesh
 
 from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
 from sgl_jax.srt.utils.profiling_utils import named_scope
@@ -253,6 +255,15 @@ class QuantizedLinear(nnx.Module):
             out_specs=out_specs,
             check_vma=False,
         )(x_2d, self.weight_q.value, scale_val)
+
+        # row parallel
+        if input_axis:
+            with use_abstract_mesh(self.mesh.abstract_mesh):
+            # Sequence parallel
+                if output.shape[0] >= 64:
+                    output = jax.sharding.reshard(output, P(input_axis, None))
+                else:
+                    output = jax.sharding.reshard(output, P(None, None))
 
         # Reshape back to original batch dimensions
         if x.ndim > 2:
