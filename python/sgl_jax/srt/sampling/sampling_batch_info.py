@@ -110,7 +110,7 @@ class SamplingMetadata:
         mesh: Mesh = None,
         vocab_size: int = 32000,
     ) -> SamplingMetadata:
-        sharding = NamedSharding(mesh, PartitionSpec()) if jax.process_count() == 1 else None
+        sharding = NamedSharding(mesh, PartitionSpec())
         if batch.sampling_info.sampling_seeds is not None:
             sampling_seeds_device = device_array(
                 batch.sampling_info.sampling_seeds, sharding=sharding
@@ -136,9 +136,7 @@ class SamplingMetadata:
         # Extract penalty information from penalizer orchestrator
         linear_penalty_device = None
         do_penalties = False
-        linear_penalty_sharding = (
-            NamedSharding(mesh, PartitionSpec(None, "tensor")) if jax.process_count() == 1 else None
-        )
+        linear_penalty_sharding = NamedSharding(mesh, PartitionSpec(None, "tensor"))
 
         # Handle linear penalty independently (created by update_penalties)
         if (

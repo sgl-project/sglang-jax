@@ -332,31 +332,19 @@ class ForwardBatch:
                 batch.extend_prefix_lens,
                 batch.extend_seq_lens,
             ),
-            sharding=(
-                NamedSharding(model_runner.mesh, PartitionSpec())
-                if jax.process_count() == 1
-                else None
-            ),
+            sharding=(NamedSharding(model_runner.mesh, PartitionSpec())),
         )
         mrope_positions = None
         if batch.mrope_positions is not None:
             (mrope_positions,) = device_array(
                 (batch.mrope_positions,),
-                sharding=(
-                    NamedSharding(model_runner.mesh, PartitionSpec(None, None))
-                    if jax.process_count() == 1
-                    else None
-                ),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, None))),
             )
         input_embedding = None
         if batch.input_embedding is not None:
             (input_embedding,) = device_array(
                 (batch.input_embedding,),
-                sharding=(
-                    NamedSharding(model_runner.mesh, PartitionSpec(None, None))
-                    if jax.process_count() == 1
-                    else None
-                ),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, None))),
             )
         if input_embedding is not None:
             input_embedding = input_embedding.astype(jnp.bfloat16)
@@ -372,11 +360,7 @@ class ForwardBatch:
                     batch.lora_token_indices,
                     batch.lora_ranks,
                 ),
-                sharding=(
-                    NamedSharding(model_runner.mesh, PartitionSpec())
-                    if jax.process_count() == 1
-                    else None
-                ),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec())),
             )
         else:
             (lora_scalings, lora_token_indices, lora_ranks) = (
@@ -389,11 +373,7 @@ class ForwardBatch:
         if batch.apply_for_deepstack:
             (deepstack_visual_embedding,) = device_array(
                 (batch.deepstack_visual_embedding,),
-                sharding=(
-                    NamedSharding(model_runner.mesh, PartitionSpec(None, None))
-                    if jax.process_count() == 1
-                    else None
-                ),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, None))),
             )
         if deepstack_visual_embedding is not None:
             deepstack_visual_embedding = deepstack_visual_embedding.astype(jnp.bfloat16)

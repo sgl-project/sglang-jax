@@ -82,22 +82,14 @@ class EAGLEWorker(ModelWorker):
             if self.draft_model_runner.model.hot_token_ids is not None:
                 self.hot_token_ids = device_array(
                     self.draft_model_runner.model.hot_token_ids,
-                    sharding=(
-                        NamedSharding(self.model_runner.mesh, P())
-                        if jax.process_count() == 1
-                        else None
-                    ),
+                    sharding=(NamedSharding(self.model_runner.mesh, P())),
                 )
         else:
             if self.hot_token_ids is not None:
                 head = head.clone()
                 self.hot_token_ids = device_array(
                     self.draft_model_runner.model.hot_token_ids,
-                    sharding=(
-                        NamedSharding(self.model_runner.mesh, P())
-                        if jax.process_count() == 1
-                        else None
-                    ),
+                    sharding=(NamedSharding(self.model_runner.mesh, P())),
                 )
                 head.data = head.data[self.hot_token_ids]
 
@@ -638,9 +630,7 @@ class EAGLEWorker(ModelWorker):
         scores = None
         positions_base = device_array(
             np.repeat(model_worker_batch.seq_lens, self.topk),
-            sharding=(
-                NamedSharding(self.model_runner.mesh, P()) if jax.process_count() == 1 else None
-            ),
+            sharding=(NamedSharding(self.model_runner.mesh, P())),
         )
         logits_metadata = None
         metadata_per_step = self.draft_model_runner.attn_backend.get_eagle_multi_step_metadata(

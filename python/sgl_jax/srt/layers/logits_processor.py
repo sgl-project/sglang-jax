@@ -187,7 +187,7 @@ class LogitsMetadata:
             extend_return_logprob = extend_return_top_logprob = extend_token_ids_logprob = False
             extend_logprob_pruned_lens_cpu = extend_seq_lens_cpu = None
 
-        sharding = NamedSharding(mesh, P()) if jax.process_count() == 1 else None
+        sharding = NamedSharding(mesh, P())
 
         return cls(
             forward_mode=batch.forward_mode,
