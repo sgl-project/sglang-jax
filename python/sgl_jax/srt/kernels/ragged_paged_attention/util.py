@@ -53,3 +53,15 @@ def get_tpu_version() -> int:
 
 def get_dtype_bitwidth(dtype):
     return dtypes.bit_width(dtype) if hasattr(dtypes, "bit_width") else dtypes.itemsize_bits(dtype)
+
+
+def next_power_of_2(x):
+    if x <= 0:
+        return 1
+    x = x - 1
+    x |= x >> 1
+    x |= x >> 2
+    x |= x >> 4
+    x |= x >> 8
+    x |= x >> 16
+    return x + 1

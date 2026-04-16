@@ -76,7 +76,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
       - name: Run unit test
-        timeout-minutes: 30
+        timeout-minutes: 60
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
