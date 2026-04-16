@@ -198,7 +198,7 @@ class WeightLoader:
         model_param: nnx.Variable,
         target_path: str,
     ) -> jax.Array:
-        """Convert offline EPMoE scales into the 4D layout expected by GMM.
+        """Convert offline EPMoE/FusedEPMoE scales into kernel-ready 4D layout.
 
         Offline checkpoints may store MoE scales in one of several compact
         layouts, for example:
@@ -207,27 +207,67 @@ class WeightLoader:
         - block-channel: ``[E, out_dim, k_blocks]`` or ``[E, k_blocks, out_dim]``
         - 2D block quant: ``[E, out_blocks, k_blocks]``
 
-        The runtime GMM kernel consumes only ``[E, k_blocks, 1, out_dim]``.
+        The runtime GMM kernel consumes ``[E, k_blocks, 1, out_dim]``.
+        The FusedEPMoE kernel consumes ``[E, k_blocks, 1, out_groups_padded]``.
+
         This helper performs the cheap layout conversion during weight loading
         so the forward path does not need to reinterpret checkpoint tensors.
         """
-        if not target_path.endswith(("wi_0_scale", "wi_1_scale", "wo_scale")):
+        # Match both EPMoE (wi_0_scale etc.) and FusedEPMoE (w1_scale etc.)
+        if not target_path.endswith(
+            ("wi_0_scale", "wi_1_scale", "wo_scale", "w1_scale", "w2_scale", "w3_scale")
+        ):
             return weight
 
         if weight.ndim == 4 or model_param.value.ndim != 4:
             return weight
 
-        num_experts, k_blocks, _, out_dim = model_param.value.shape
-        if model_param.value.shape[2] != 1:
-            raise ValueError(
-                f"Expected kernel-ready EPMoE scale placeholder to have singleton dim=1, "
-                f"got shape={model_param.value.shape} for {target_path}"
-            )
+        param_shape = model_param.value.shape
+        num_experts = param_shape[0]
+
+        # --- FusedEPMoE legacy 2D block-wise placeholder ---
+        # Older placeholders may use (E, K_groups, N_groups, 1).
+        if param_shape[3] == 1 and param_shape[2] > 1 and weight.ndim == 3:
+            return weight[..., None]
+
+        # --- EPMoE / GMM path (also FusedEPMoE 1D sub-channel) ---
+        if param_shape[2] != 1:
+            return weight
+        num_experts, k_blocks, _, out_dim = param_shape
         if weight.ndim == 2 and weight.shape == (num_experts, out_dim):
             return weight[:, None, None, :]
 
         if weight.ndim != 3:
             return weight
+
+        quant_cfg = getattr(self.model_config, "quantization_config", None)
+        weight_block_size = getattr(quant_cfg, "weight_block_size", None)
+        block_size_out = None
+        if isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2:
+            block_size_out = int(weight_block_size[0])
+
+        is_fused_scale = target_path.endswith(("w1_scale", "w2_scale", "w3_scale"))
+        if is_fused_scale and block_size_out is not None and block_size_out > 0:
+            expected_out_blocks = (out_dim + block_size_out - 1) // block_size_out
+            if weight.shape == (num_experts, k_blocks, expected_out_blocks):
+                logger.info(
+                    "Expanding fused MoE 2D scale %s from %s to fast kernel layout %s",
+                    target_path,
+                    weight.shape,
+                    model_param.value.shape,
+                )
+                weight = jnp.repeat(weight, block_size_out, axis=2)[..., :out_dim]
+                return weight[:, :, None, :]
+            if weight.shape == (num_experts, expected_out_blocks, k_blocks):
+                logger.info(
+                    "Transposing+expanding fused MoE 2D scale %s from %s to fast kernel layout %s",
+                    target_path,
+                    weight.shape,
+                    model_param.value.shape,
+                )
+                weight = jnp.transpose(weight, (0, 2, 1))
+                weight = jnp.repeat(weight, block_size_out, axis=2)[..., :out_dim]
+                return weight[:, :, None, :]
 
         if weight.shape == (num_experts, out_dim, k_blocks):
             return jnp.expand_dims(jnp.transpose(weight, (0, 2, 1)), axis=2)
@@ -235,8 +275,36 @@ class WeightLoader:
         if weight.shape == (num_experts, k_blocks, out_dim):
             return weight[:, :, None, :]
 
-        quant_cfg = getattr(self.model_config, "quantization_config", None)
-        weight_block_size = getattr(quant_cfg, "weight_block_size", None)
+        # FusedEPMoE 2D block-quant checkpoints (e.g., MiMo) often store scales
+        # compactly as [E, K_blocks, N_blocks] or [E, N_blocks, K_blocks], while
+        # the fused kernel expects [E, K_blocks, 1, out_groups_padded].
+        if is_fused_scale and weight.ndim == 3:
+            if weight.shape[0] == num_experts and weight.shape[1] == k_blocks:
+                n_groups = weight.shape[2]
+                if n_groups <= out_dim:
+                    if n_groups < out_dim:
+                        logger.info(
+                            "Padding fused MoE scale %s from %s to kernel layout %s",
+                            target_path,
+                            weight.shape,
+                            model_param.value.shape,
+                        )
+                        weight = jnp.pad(weight, ((0, 0), (0, 0), (0, out_dim - n_groups)))
+                    return weight[:, :, None, :]
+            if weight.shape[0] == num_experts and weight.shape[2] == k_blocks:
+                n_groups = weight.shape[1]
+                if n_groups <= out_dim:
+                    logger.info(
+                        "Transposing fused MoE scale %s from %s to kernel layout %s",
+                        target_path,
+                        weight.shape,
+                        model_param.value.shape,
+                    )
+                    weight = jnp.transpose(weight, (0, 2, 1))
+                    if n_groups < out_dim:
+                        weight = jnp.pad(weight, ((0, 0), (0, 0), (0, out_dim - n_groups)))
+                    return weight[:, :, None, :]
+
         if not (isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2):
             return weight
 
