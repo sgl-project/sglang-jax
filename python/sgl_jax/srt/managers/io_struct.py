@@ -661,6 +661,7 @@ class ProfileReqInput:
 class ProfileReqType(Enum):
     START_PROFILE = 1
     STOP_PROFILE = 2
+    GET_STATUS = 3
 
 
 @dataclass

@@ -660,6 +660,11 @@ class TokenizerManager:
         req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
         return await self._execute_profile(req)
 
+    async def get_profile_status(self):
+        self.auto_create_handle_loop()
+        req = ProfileReq(type=ProfileReqType.GET_STATUS)
+        return await self._execute_profile(req)
+
     async def _execute_profile(self, req: ProfileReq):
         result = (await self.profile_communicator(req))[0]
         if not result.success:
