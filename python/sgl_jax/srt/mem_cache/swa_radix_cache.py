@@ -680,6 +680,10 @@ class SWARadixCache(BasePrefixCache):
         # protected size refers to the size of the swa cache that is locked
         return self.swa_protected_size_
 
+    def adjust_swa_protected_size(self, delta: int):
+        """Adjust swa_protected_size_ by delta (can be negative)."""
+        self.swa_protected_size_ += delta
+
     def all_values_flatten(self) -> jnp.Array:
         values = []
 

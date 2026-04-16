@@ -1,0 +1,620 @@
+# cd python && USE_DEVICE_TYPE=cpu python -m pytest sgl_jax/test/mem_cache/test_swa_allocator.py -v
+
+import os
+import unittest
+from types import SimpleNamespace
+
+if os.environ.get("USE_DEVICE_TYPE") == "cpu":
+    os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+    os.environ["JAX_PLATFORMS"] = "cpu"
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.sharding import Mesh
+
+from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
+from sgl_jax.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    ReqToTokenPool,
+    SWAKVPool,
+)
+
+
+def _make_mesh():
+    devices = np.array(jax.devices()[:1], dtype=object).reshape(1, 1)
+    return Mesh(devices, axis_names=("data", "tensor"))
+
+
+def _make_swa_pool(size, size_swa, page_size, mesh):
+    """Create a minimal SWAKVPool for testing."""
+    return SWAKVPool(
+        size=size,
+        size_swa=size_swa,
+        page_size=page_size,
+        swa_attention_layer_ids=[0],
+        full_attention_layer_ids=[1],
+        token_to_kv_pool_class=MHATokenToKVPool,
+        dtype=jnp.bfloat16,
+        head_num=1,
+        head_dim=1,
+        mesh=mesh,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Class 1: Token-level allocator (page_size=1)
+# ---------------------------------------------------------------------------
+class TestSWAAllocatorTokenLevel(unittest.TestCase):
+    def setUp(self):
+        self.mesh = _make_mesh()
+        self.kvcache = _make_swa_pool(size=64, size_swa=32, page_size=1, mesh=self.mesh)
+        self.alloc = SWATokenToKVPoolAllocator(
+            size=64, size_swa=32, kvcache=self.kvcache, page_size=1
+        )
+
+    # 1
+    def test_alloc_basic_creates_mapping(self):
+        """alloc(n) returns full indices and mapping points to SWA indices."""
+        indices = self.alloc.alloc(4)
+        self.assertIsNotNone(indices)
+        self.assertEqual(len(indices), 4)
+        swa_indices = self.alloc.full_to_swa_index_mapping[indices]
+        self.assertTrue(np.all(swa_indices > 0))
+        self.assertEqual(len(np.unique(swa_indices)), 4)
+
+    # 2
+    def test_alloc_exceeds_full_returns_none(self):
+        """Full pool exhaustion returns None."""
+        self.alloc.full_attn_allocator.alloc(64)
+        result = self.alloc.alloc(1)
+        self.assertIsNone(result)
+
+    # 3
+    def test_alloc_exceeds_swa_returns_none(self):
+        """SWA pool exhaustion returns None (SWA < full)."""
+        result = self.alloc.alloc(32)
+        self.assertIsNotNone(result)
+        result = self.alloc.alloc(1)
+        self.assertIsNone(result)
+
+    # 4
+    def test_available_size_returns_min(self):
+        """available_size() = min(full_avail, swa_avail)."""
+        self.assertEqual(self.alloc.available_size(), 32)  # min(64, 32)
+        self.alloc.alloc(10)
+        self.assertEqual(self.alloc.available_size(), 22)  # min(54, 22)
+
+    # 5
+    def test_free_restores_both_pools(self):
+        """free() returns tokens to both full and SWA pools."""
+        indices = self.alloc.alloc(10)
+        self.assertEqual(self.alloc.available_size(), 22)
+        self.alloc.free(indices)
+        self.assertEqual(self.alloc.full_available_size(), 64)
+        self.assertEqual(self.alloc.swa_available_size(), 32)
+
+    # 6
+    def test_free_swa_only_releases_swa(self):
+        """free_swa() releases SWA slots but keeps full slots allocated."""
+        indices = self.alloc.alloc(10)
+        full_before = self.alloc.full_available_size()
+        swa_before = self.alloc.swa_available_size()
+
+        self.alloc.free_swa(indices)
+
+        self.assertEqual(self.alloc.full_available_size(), full_before)
+        self.assertEqual(self.alloc.swa_available_size(), swa_before + 10)
+
+    # 7
+    def test_free_swa_clears_mapping(self):
+        """free_swa() zeroes out the mapping for freed indices."""
+        indices = self.alloc.alloc(5)
+        self.assertTrue(np.all(self.alloc.full_to_swa_index_mapping[indices] > 0))
+        self.alloc.free_swa(indices)
+        self.assertTrue(np.all(self.alloc.full_to_swa_index_mapping[indices] == 0))
+
+    # 8
+    def test_free_swa_idempotent(self):
+        """free_swa() twice on same indices does not crash or double-free."""
+        indices = self.alloc.alloc(5)
+        self.alloc.free_swa(indices)
+        swa_after_first = self.alloc.swa_available_size()
+        self.alloc.free_swa(indices)
+        self.assertEqual(self.alloc.swa_available_size(), swa_after_first)
+
+
+# ---------------------------------------------------------------------------
+# Class 2: Paged allocator (page_size=4)
+# ---------------------------------------------------------------------------
+class TestSWAAllocatorPaged(unittest.TestCase):
+    def setUp(self):
+        self.mesh = _make_mesh()
+        self.page_size = 4
+        self.size = 128
+        self.size_swa = 64
+        self.kvcache = _make_swa_pool(
+            size=self.size,
+            size_swa=self.size_swa,
+            page_size=self.page_size,
+            mesh=self.mesh,
+        )
+        self.alloc = SWATokenToKVPoolAllocator(
+            size=self.size,
+            size_swa=self.size_swa,
+            kvcache=self.kvcache,
+            page_size=self.page_size,
+        )
+
+    # 9
+    def test_alloc_extend_mapping_correct(self):
+        """alloc_extend() produces correct full->SWA mapping."""
+        prefix = self.alloc.alloc(8)
+        self.assertIsNotNone(prefix)
+
+        last_loc = [int(prefix[-1])]
+        full_indices = self.alloc.alloc_extend(
+            prefix_lens=[8], seq_lens=[12], last_loc=last_loc, extend_num_tokens=4
+        )
+        self.assertIsNotNone(full_indices)
+        self.assertEqual(len(full_indices), 4)
+
+        for idx in full_indices:
+            swa_idx = self.alloc.full_to_swa_index_mapping[idx]
+            self.assertGreater(swa_idx, 0)
+
+    # 10
+    def test_alloc_decode_mapping_correct(self):
+        """alloc_decode() produces correct full->SWA mapping."""
+        prefix = self.alloc.alloc(4)
+        self.assertIsNotNone(prefix)
+
+        last_loc = [int(prefix[-1])]
+        full_indices = self.alloc.alloc_decode(seq_lens=[5], last_loc=last_loc)
+        self.assertIsNotNone(full_indices)
+        self.assertEqual(len(full_indices), 1)
+
+        swa_idx = self.alloc.full_to_swa_index_mapping[full_indices[0]]
+        self.assertGreater(swa_idx, 0)
+
+    # 11 - Rollback on SWA failure (alloc_extend)
+    def test_alloc_extend_rollback_on_swa_failure(self):
+        """When SWA pool is exhausted, alloc_extend must roll back full-pool pages."""
+        eaten = self.alloc.alloc(self.size_swa)
+        self.assertIsNotNone(eaten)
+        self.assertEqual(self.alloc.swa_available_size(), 0)
+        full_before = self.alloc.full_available_size()
+
+        last_loc = [int(eaten[-1])]
+        result = self.alloc.alloc_extend(
+            prefix_lens=[self.size_swa],
+            seq_lens=[self.size_swa + 4],
+            last_loc=last_loc,
+            extend_num_tokens=4,
+        )
+        self.assertIsNone(result)
+        self.assertEqual(self.alloc.full_available_size(), full_before)
+
+    # 12 - Rollback on SWA failure (alloc_decode)
+    def test_alloc_decode_rollback_on_swa_failure(self):
+        """When SWA pool is exhausted, alloc_decode must roll back full-pool pages."""
+        eaten = self.alloc.alloc(self.size_swa)
+        self.assertIsNotNone(eaten)
+        self.assertEqual(self.alloc.swa_available_size(), 0)
+        full_before = self.alloc.full_available_size()
+
+        last_loc = [int(eaten[-1])]
+        result = self.alloc.alloc_decode(seq_lens=[self.size_swa + 1], last_loc=last_loc)
+        self.assertIsNone(result)
+        self.assertEqual(self.alloc.full_available_size(), full_before)
+
+    # 13
+    def test_alloc_extend_swa_last_loc_translation(self):
+        """alloc_extend translates last_loc through the full->SWA mapping."""
+        prefix = self.alloc.alloc(4)
+        self.assertIsNotNone(prefix)
+
+        last_full = int(prefix[-1])
+        expected_swa_last = int(self.alloc.full_to_swa_index_mapping[last_full])
+        self.assertGreater(expected_swa_last, 0)
+
+        result = self.alloc.alloc_extend(
+            prefix_lens=[4], seq_lens=[8], last_loc=[last_full], extend_num_tokens=4
+        )
+        self.assertIsNotNone(result)
+
+        for idx in result:
+            self.assertGreater(int(self.alloc.full_to_swa_index_mapping[idx]), 0)
+
+    # 14
+    def test_free_releases_both_paged_pools(self):
+        """free() returns pages to both full and SWA paged pools."""
+        indices = self.alloc.alloc(8)
+        self.assertIsNotNone(indices)
+        self.alloc.free(indices)
+        self.assertEqual(self.alloc.full_available_size(), self.size)
+        self.assertEqual(self.alloc.swa_available_size(), self.size_swa)
+
+    # 15 - Regression test for OOB bug (GH-231)
+    def test_mapping_covers_last_page_indices(self):
+        """full_to_swa_index_mapping must be large enough for max paged token index."""
+        ps = 4
+        size = 32
+        size_swa = 32
+        kv = _make_swa_pool(size=size, size_swa=size_swa, page_size=ps, mesh=self.mesh)
+        alloc = SWATokenToKVPoolAllocator(size=size, size_swa=size_swa, kvcache=kv, page_size=ps)
+
+        self.assertGreaterEqual(len(alloc.full_to_swa_index_mapping), size + ps)
+
+        all_indices = alloc.alloc(size)
+        self.assertIsNotNone(all_indices)
+
+        max_idx = int(np.max(all_indices))
+        self.assertEqual(max_idx, size + ps - 1)
+
+        swa_val = alloc.full_to_swa_index_mapping[max_idx]
+        self.assertGreater(swa_val, 0)
+
+    # 15b - Regression: alloc_extend on last page must not OOB (GH-231)
+    def test_alloc_extend_last_page_no_oob(self):
+        """alloc_extend touching the last page must not raise IndexError."""
+        ps = 4
+        size = 32
+        size_swa = 32
+        kv = _make_swa_pool(size=size, size_swa=size_swa, page_size=ps, mesh=self.mesh)
+        alloc = SWATokenToKVPoolAllocator(size=size, size_swa=size_swa, kvcache=kv, page_size=ps)
+
+        prefix = alloc.alloc(28)
+        self.assertIsNotNone(prefix)
+        last_loc = [int(prefix[-1])]
+
+        result = alloc.alloc_extend(
+            prefix_lens=[28], seq_lens=[32], last_loc=last_loc, extend_num_tokens=4
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result), 4)
+
+        for idx in result:
+            self.assertGreater(int(alloc.full_to_swa_index_mapping[idx]), 0)
+
+    # 15c - Regression: alloc_decode on last page must not OOB (GH-231)
+    def test_alloc_decode_last_page_no_oob(self):
+        """alloc_decode allocating the last page must not raise IndexError."""
+        ps = 4
+        size = 32
+        size_swa = 32
+        kv = _make_swa_pool(size=size, size_swa=size_swa, page_size=ps, mesh=self.mesh)
+        alloc = SWATokenToKVPoolAllocator(size=size, size_swa=size_swa, kvcache=kv, page_size=ps)
+
+        prefix = alloc.alloc(28)
+        self.assertIsNotNone(prefix)
+        last_loc = [int(prefix[-1])]
+
+        result = alloc.alloc_decode(seq_lens=[29], last_loc=last_loc)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result), 1)
+
+        self.assertGreater(int(alloc.full_to_swa_index_mapping[result[0]]), 0)
+
+    # 16
+    def test_clear_resets_everything(self):
+        """clear() fully resets both pools and the mapping."""
+        indices = self.alloc.alloc(16)
+        self.assertIsNotNone(indices)
+        self.alloc.clear()
+        self.assertEqual(self.alloc.full_available_size(), self.size)
+        self.assertEqual(self.alloc.swa_available_size(), self.size_swa)
+        self.assertTrue(np.all(self.alloc.full_to_swa_index_mapping == 0))
+
+
+# ---------------------------------------------------------------------------
+# Class 3: SWA Eviction logic
+# ---------------------------------------------------------------------------
+class TestSWAEviction(unittest.TestCase):
+    """Tests for _evict_swa logic (called via maybe_evict_swa)."""
+
+    def setUp(self):
+        self.mesh = _make_mesh()
+        self.page_size = 1
+        self.sliding_window = 64
+        self.pool_size = 256
+        self.pool_size_swa = 256
+        self.kvcache = _make_swa_pool(
+            size=self.pool_size,
+            size_swa=self.pool_size_swa,
+            page_size=self.page_size,
+            mesh=self.mesh,
+        )
+        self.alloc = SWATokenToKVPoolAllocator(
+            size=self.pool_size,
+            size_swa=self.pool_size_swa,
+            kvcache=self.kvcache,
+            page_size=self.page_size,
+        )
+        self.req_to_token_pool = ReqToTokenPool(size=8, max_context_len=256)
+
+    def _make_req(self, origin_len, output_len):
+        """Create a minimal Req-like object for eviction tests."""
+
+        class FakeReq:
+            def __init__(self, origin_input_ids, output_ids):
+                self.origin_input_ids = origin_input_ids
+                self.output_ids = output_ids
+                self.swa_evicted_seqlen = 0
+                self.req_pool_idx = 0
+                self.decode_batch_idx = 0
+                self.extend_batch_idx = 0
+                self.is_chunked = 0
+
+            @property
+            def seqlen(self):
+                return len(self.origin_input_ids) + len(self.output_ids)
+
+        return FakeReq(
+            origin_input_ids=list(range(origin_len)),
+            output_ids=list(range(output_len)),
+        )
+
+    def _setup_req_tokens(self, req, n_tokens):
+        """Allocate n_tokens and record them in req_to_token_pool."""
+        indices = self.alloc.alloc(n_tokens)
+        assert indices is not None, f"Failed to allocate {n_tokens} tokens"
+        self.req_to_token_pool.req_to_token[req.req_pool_idx, :n_tokens] = indices
+        return indices
+
+    def _evict(self, req, pre_len):
+        """Wrapper around the eviction logic matching _evict_swa."""
+        new_evicted = max(req.swa_evicted_seqlen, pre_len - self.sliding_window)
+        if self.page_size > 1:
+            new_evicted = (new_evicted // self.page_size) * self.page_size
+        if new_evicted <= req.swa_evicted_seqlen:
+            return
+        free_slots = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, req.swa_evicted_seqlen : new_evicted
+        ]
+        self.alloc.free_swa(free_slots)
+        req.swa_evicted_seqlen = new_evicted
+
+    # 16
+    def test_evict_basic(self):
+        """100 tokens, window=64 -> evicts [0, 36)."""
+        req = self._make_req(origin_len=100, output_len=0)
+        self._setup_req_tokens(req, 100)
+        pre_len = 100
+
+        swa_before = self.alloc.swa_available_size()
+        self._evict(req, pre_len)
+        expected_evicted = pre_len - self.sliding_window  # 36
+        self.assertEqual(req.swa_evicted_seqlen, expected_evicted)
+        self.assertEqual(self.alloc.swa_available_size(), swa_before + expected_evicted)
+
+    # 17
+    def test_evict_idempotent(self):
+        """Same pre_len repeated does not double-free."""
+        req = self._make_req(origin_len=100, output_len=0)
+        self._setup_req_tokens(req, 100)
+        self._evict(req, 100)
+        swa_after_first = self.alloc.swa_available_size()
+
+        self._evict(req, 100)
+        self.assertEqual(self.alloc.swa_available_size(), swa_after_first)
+
+    # 18
+    def test_evict_incremental(self):
+        """Decode step +1 -> evicts exactly 1 slot."""
+        req = self._make_req(origin_len=100, output_len=0)
+        self._setup_req_tokens(req, 100)
+
+        self._evict(req, 100)
+        evicted_1 = req.swa_evicted_seqlen
+        swa_1 = self.alloc.swa_available_size()
+
+        self._evict(req, 101)
+        self.assertEqual(req.swa_evicted_seqlen, evicted_1 + 1)
+        self.assertEqual(self.alloc.swa_available_size(), swa_1 + 1)
+
+    # 19
+    def test_evict_page_aligned(self):
+        """page_size=4: frontier aligns down to page boundary."""
+        page_size = 4
+        kvcache = _make_swa_pool(size=256, size_swa=256, page_size=page_size, mesh=self.mesh)
+        alloc = SWATokenToKVPoolAllocator(
+            size=256, size_swa=256, kvcache=kvcache, page_size=page_size
+        )
+        req_pool = ReqToTokenPool(size=8, max_context_len=256)
+
+        req = self._make_req(origin_len=100, output_len=0)
+        indices = alloc.alloc(100)
+        self.assertIsNotNone(indices)
+        req_pool.req_to_token[req.req_pool_idx, :100] = indices
+
+        # pre_len=100, window=64 -> raw evicted=36 -> page-aligned=36//4*4=36
+        new_evicted = max(req.swa_evicted_seqlen, 100 - self.sliding_window)
+        new_evicted = (new_evicted // page_size) * page_size  # 36
+        self.assertEqual(new_evicted, 36)
+
+        # pre_len=101 -> raw=37 -> aligned=36 (no change from 36)
+        new_evicted2 = max(36, 101 - self.sliding_window)
+        new_evicted2 = (new_evicted2 // page_size) * page_size
+        self.assertEqual(new_evicted2, 36)
+
+        # pre_len=104 -> raw=40 -> aligned=40
+        new_evicted3 = max(36, 104 - self.sliding_window)
+        new_evicted3 = (new_evicted3 // page_size) * page_size
+        self.assertEqual(new_evicted3, 40)
+
+    # 20
+    def test_evict_within_window_noop(self):
+        """pre_len <= window -> nothing evicted."""
+        req = self._make_req(origin_len=50, output_len=0)
+        self._setup_req_tokens(req, 50)
+        swa_before = self.alloc.swa_available_size()
+
+        self._evict(req, 50)
+        self.assertEqual(req.swa_evicted_seqlen, 0)
+        self.assertEqual(self.alloc.swa_available_size(), swa_before)
+
+    # 21
+    def test_evict_reclaims_swa_capacity(self):
+        """Eviction increases swa_available_size."""
+        req = self._make_req(origin_len=128, output_len=0)
+        self._setup_req_tokens(req, 128)
+        swa_before = self.alloc.swa_available_size()
+
+        self._evict(req, 128)
+        expected_freed = 128 - self.sliding_window  # 64
+        self.assertEqual(self.alloc.swa_available_size(), swa_before + expected_freed)
+
+
+# ---------------------------------------------------------------------------
+# Class 4: Overlap safety
+# ---------------------------------------------------------------------------
+class TestSWAOverlapSafety(unittest.TestCase):
+    """Test overlap-aware reclaim timing for decode and chunked extend."""
+
+    def setUp(self):
+        self.mesh = _make_mesh()
+        self.page_size = 1
+        self.sliding_window = 64
+        self.chunked_prefill_size = 32
+        self.pool_size = 256
+        self.pool_size_swa = 256
+        self.kvcache = _make_swa_pool(
+            size=self.pool_size,
+            size_swa=self.pool_size_swa,
+            page_size=self.page_size,
+            mesh=self.mesh,
+        )
+        self.alloc = SWATokenToKVPoolAllocator(
+            size=self.pool_size,
+            size_swa=self.pool_size_swa,
+            kvcache=self.kvcache,
+            page_size=self.page_size,
+        )
+        self.req_to_token_pool = ReqToTokenPool(size=8, max_context_len=256)
+
+    def _make_req(self, origin_len, output_len):
+        class FakeReq:
+            def __init__(self, origin_input_ids, output_ids):
+                self.origin_input_ids = origin_input_ids
+                self.output_ids = output_ids
+                self.swa_evicted_seqlen = 0
+                self.req_pool_idx = 0
+                self.decode_batch_idx = 0
+                self.extend_batch_idx = 0
+                self.is_chunked = 0
+
+            @property
+            def seqlen(self):
+                return len(self.origin_input_ids) + len(self.output_ids)
+
+        return FakeReq(
+            origin_input_ids=list(range(origin_len)),
+            output_ids=list(range(output_len)),
+        )
+
+    def _setup_req_tokens(self, req, n_tokens):
+        indices = self.alloc.alloc(n_tokens)
+        assert indices is not None, f"Failed to allocate {n_tokens} tokens"
+        self.req_to_token_pool.req_to_token[req.req_pool_idx, :n_tokens] = indices
+        return indices
+
+    def _make_batch(self, req, *, enable_overlap, forward_mode, prefix_lens=None, chunked_req=None):
+        from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
+
+        batch = ScheduleBatch(
+            reqs=[req],
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.alloc,
+            tree_cache=None,
+            is_hybrid=True,
+            model_config=SimpleNamespace(sliding_window=self.sliding_window),
+            forward_mode=forward_mode,
+            enable_overlap=enable_overlap,
+            chunked_req=chunked_req,
+        )
+        if prefix_lens is not None:
+            batch.prefix_lens = prefix_lens
+        return batch
+
+    def test_overlap_decode_first_batch_skips_reclaim(self):
+        """Overlap decode should skip reclaim while previous batch may still read SWA pages."""
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
+        req = self._make_req(origin_len=100, output_len=1)
+        self._setup_req_tokens(req, req.seqlen)
+        req.decode_batch_idx = 0
+        batch = self._make_batch(
+            req,
+            enable_overlap=True,
+            forward_mode=ForwardMode.DECODE,
+        )
+
+        swa_before = self.alloc.swa_available_size()
+        batch.maybe_evict_swa()
+
+        self.assertEqual(req.swa_evicted_seqlen, 0)
+        self.assertEqual(self.alloc.swa_available_size(), swa_before)
+
+    def test_overlap_decode_second_batch_reclaims(self):
+        """Overlap decode should reclaim once the request reaches the safe reclaim point."""
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
+        req = self._make_req(origin_len=100, output_len=1)
+        self._setup_req_tokens(req, req.seqlen)
+        req.decode_batch_idx = 1
+        batch = self._make_batch(
+            req,
+            enable_overlap=True,
+            forward_mode=ForwardMode.DECODE,
+        )
+
+        swa_before = self.alloc.swa_available_size()
+        batch.maybe_evict_swa()
+
+        expected = req.seqlen - 1 - self.sliding_window
+        self.assertEqual(req.swa_evicted_seqlen, expected)
+        self.assertEqual(self.alloc.swa_available_size(), swa_before + expected)
+
+    def test_overlap_chunked_extend_skips_first_two_batches(self):
+        """Chunked extend with overlap should delay reclaim for the first two chunks."""
+        from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
+        req = self._make_req(origin_len=128, output_len=0)
+        self._setup_req_tokens(req, 128)
+        req.is_chunked = 1
+        batch = self._make_batch(
+            req,
+            enable_overlap=True,
+            forward_mode=ForwardMode.EXTEND,
+            prefix_lens=[128],
+            chunked_req=req,
+        )
+
+        old_chunked_prefill_size = global_server_args_dict.get("chunked_prefill_size")
+        global_server_args_dict["chunked_prefill_size"] = self.chunked_prefill_size
+        try:
+            swa_before = self.alloc.swa_available_size()
+
+            req.extend_batch_idx = 0
+            batch.maybe_evict_swa()
+            self.assertEqual(req.swa_evicted_seqlen, 0)
+
+            req.extend_batch_idx = 1
+            batch.maybe_evict_swa()
+            self.assertEqual(req.swa_evicted_seqlen, 0)
+
+            req.extend_batch_idx = 2
+            batch.maybe_evict_swa()
+
+            expected_pre_len = 128 - self.chunked_prefill_size
+            expected_evicted = expected_pre_len - self.sliding_window
+            self.assertEqual(req.swa_evicted_seqlen, expected_evicted)
+            self.assertEqual(self.alloc.swa_available_size(), swa_before + expected_evicted)
+        finally:
+            global_server_args_dict["chunked_prefill_size"] = old_chunked_prefill_size
+
+
+if __name__ == "__main__":
+    unittest.main()
