@@ -217,39 +217,24 @@ class FusedEPMoE(nnx.Module):
             if is_static:
                 ep_scale_sharding = P(("data", "tensor"), None, None, None)
 
-                # Compute the actual kernel-expected scale shapes so the weight
-                # loader can match dimensions and assign directly.
-                if self.quant_block_n is not None:
-                    # 2D block-wise: expand once at load time to per-channel
-                    # scales and reuse the kernel's much faster 1D scale path.
-                    w1_scale_shape = (
-                        self.num_experts,
-                        self.hidden_size // wsz,
-                        1,
-                        self.intermediate_dim,
-                    )
-                    w3_scale_shape = w1_scale_shape
-                    w2_scale_shape = (
-                        self.num_experts,
-                        self.intermediate_dim // wsz,
-                        1,
-                        self.hidden_size,
-                    )
-                else:
-                    # 1D sub-channel: (E, K_groups, 1, N)
-                    w1_scale_shape = (
-                        self.num_experts,
-                        self.hidden_size // wsz,
-                        1,
-                        self.intermediate_dim,
-                    )
-                    w3_scale_shape = w1_scale_shape
-                    w2_scale_shape = (
-                        self.num_experts,
-                        self.intermediate_dim // wsz,
-                        1,
-                        self.hidden_size,
-                    )
+                # Scale placeholder shapes are (E, K//block_k, 1, N) for both
+                # 1D sub-channel and 2D block-wise quantization.  In the 2D case,
+                # _expand_moe_block_scale() expands the compact (E, K//bk, N//bn)
+                # scales to the same (E, K//bk, 1, N) layout at weight-loading
+                # time, so the kernel always sees the unified 1D shape.
+                w1_scale_shape = (
+                    self.num_experts,
+                    self.hidden_size // wsz,
+                    1,
+                    self.intermediate_dim,
+                )
+                w3_scale_shape = w1_scale_shape
+                w2_scale_shape = (
+                    self.num_experts,
+                    self.intermediate_dim // wsz,
+                    1,
+                    self.hidden_size,
+                )
 
                 if hasattr(self, "w1_scale"):
                     del self.w1_scale
