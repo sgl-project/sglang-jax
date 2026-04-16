@@ -1887,8 +1887,7 @@ class ScheduleBatch:
             total_cache_loc_size = cache_loc_paddings[bs_index]
 
         per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
-        # np.empty avoids page-fault zeroing; padding positions are masked by seq_lens downstream.
-        cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
+        cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
 
         offset_bs = 0
 

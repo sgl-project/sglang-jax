@@ -1391,7 +1391,7 @@ def parse_args() -> argparse.Namespace:
         help="All-to-all imbalance mode.",
     )
     parser.add_argument(
-        "--subc-quant-wsz",
+        "--quant-block-k",
         type=int,
         default=None,
         help="Sub-channel quantization block size (default: 256 for FP8, None for bf16).",
