@@ -558,7 +558,6 @@ class ModelRunner(BaseModelRunner):
                 page_size=self.page_size,
                 mesh=self.mesh,
                 max_context_len=self.model_config.context_len,
-                # chunked_prefill_size=self.server_args.chunked_prefill_size,
             )
         else:
             raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")

@@ -1140,7 +1140,7 @@ def dynamic_validate_inputs(
     k_scale: float | None = None,
     v_scale: float | None = None,
     # Kernel optimization params.
-    chunk_prefill_size: int | None = None,
+    prefill_size: int | None = None,
     # Kernel tuning params.
     d_block_sizes: tuple[int, int, int, int] | None = None,
     p_block_sizes: tuple[int, int, int, int] | None = None,
@@ -1167,7 +1167,7 @@ def dynamic_validate_inputs(
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
-        chunk_prefill_size=chunk_prefill_size,
+        prefill_size=prefill_size,
         d_block_sizes=d_block_sizes,
         p_block_sizes=p_block_sizes,
         m_block_sizes=m_block_sizes,
@@ -1233,7 +1233,7 @@ def static_validate_inputs(
     v_scale: float | None = None,
     xai_temperature_len: float | None = None,
     # Kernel optimization params.
-    chunk_prefill_size: int | None = None,
+    prefill_size: int | None = None,
     # Kernel tuning params.
     d_block_sizes: tuple[int, int, int, int] | None = None,
     p_block_sizes: tuple[int, int, int, int] | None = None,
@@ -1329,8 +1329,8 @@ def static_validate_inputs(
         raise ValueError(f"{soft_cap=} must not be 0.0.")
     if xai_temperature_len is not None and xai_temperature_len <= 0:
         raise ValueError(f"{xai_temperature_len=} must be positive.")
-    if chunk_prefill_size is not None and chunk_prefill_size <= 0:
-        raise ValueError(f"{chunk_prefill_size=} must be positive.")
+    if prefill_size is not None and prefill_size <= 0:
+        raise ValueError(f"{prefill_size=} must be positive.")
 
     def _validate_block_sizes(block_sizes, prefix):
         if block_sizes is None:
@@ -1444,7 +1444,7 @@ def get_default_block_sizes(
         "k_scale",
         "v_scale",
         "xai_temperature_len",
-        "chunk_prefill_size",
+        "prefill_size",
         "d_block_sizes",
         "p_block_sizes",
         "m_block_sizes",
@@ -1477,7 +1477,7 @@ def ragged_paged_attention(
     v_scale: float | None = None,
     xai_temperature_len: float | None = None,
     # Kernel optimization params.
-    chunk_prefill_size: int | None = None,
+    prefill_size: int | None = None,
     # Kernel tuning params for decode, prefill, and mixed cases.
     # Each case takes a tuple of (bq_sz, bkv_sz, bq_csz, bkv_csz).
     # - bq_sz: the block size for the query fetching.
@@ -1521,7 +1521,9 @@ def ragged_paged_attention(
       k_scale: the scale for the key.
       v_scale: the scale for the value.
       xai_temperature_len: the length-based temperature term used by xai grok.
-      chunk_prefill_size: the chunk prefill size for the attention.
+      prefill_size: the static query-length bucket used by the PREFILL kernel.
+        Each prefill sequence must be padded so its q_len equals this bucket,
+        which makes it a compile-time constant for the kernel.
       d_block_sizes: the block sizes for the decode case.
       p_block_sizes: the block sizes for the prefill case.
       m_block_sizes: the block sizes for the mixed case.
@@ -1570,7 +1572,7 @@ def ragged_paged_attention(
         k_scale=k_scale,
         v_scale=v_scale,
         xai_temperature_len=xai_temperature_len,
-        chunk_prefill_size=chunk_prefill_size,
+        prefill_size=prefill_size,
         d_block_sizes=d_block_sizes,
         p_block_sizes=p_block_sizes,
         m_block_sizes=m_block_sizes,
@@ -1783,12 +1785,11 @@ def ragged_paged_attention(
         case=RpaCase.DECODE,
     )
 
-    # TODO:
     q, kv_cache = run_rpa_kernel(
         q,
         kv_cache,
         **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
-        static_q_len=128,
+        static_q_len=prefill_size,
         case=RpaCase.PREFILL,
     )
     # Mixed
