@@ -141,6 +141,13 @@ def apply_linear_quantization(
 
     ignored_layers = quant_config.ignored_layers or []
 
+    # Normalize ignored layer patterns: convert HF dot-index (layers.0.) to
+    # bracket-index (layers[0].) since the model walk uses bracket notation.
+    normalized_ignored = []
+    for ig in ignored_layers:
+        normalized_ignored.append(re.sub(r"\.(\d+)\.", r"[\1].", ig))
+    ignored_layers = normalized_ignored
+
     def _find_matching_rule(path: str):
         """Find the first rule that matches the given module path."""
         for rule in compiled_rules:
