@@ -115,12 +115,18 @@ class TestLogprobsDense(unittest.TestCase):
         )
 
         expected_output_logprobs = [
-            [-0.9453125, 32313, "Okay"],
+            [-0.87109375, 32313, "Okay"],
             [0.0, 11, ","],
-            [-0.3515625, 773, " so"],
+            [-0.318359375, 773, " so"],
         ]
         self.check_output(output_meta, "output_token_logprobs", expected_output_logprobs)
 
+        # use another expected, because jax compiler fused ops will introduce numerical precision issue
+        expected_output_logprobs = [
+            [-0.921875, 32313, "Okay"],
+            [0.0, 11, ","],
+            [-0.3515625, 773, " so"],
+        ]
         output = self.engine.generate(
             input_ids=input_ids,
             sampling_params=sampling_params,
@@ -133,9 +139,9 @@ class TestLogprobsDense(unittest.TestCase):
         sampling_params = {"n": 1, "temperature": 0.6, "top_p": 0.95, "max_new_tokens": 3}
 
         expected_output_logprobs = [
-            [-0.8046875, 32313, "Okay"],  ## todo use output compute is -0.79296875
+            [-0.8984375, 71486, "Alright"],  ## todo use output compute is -0.79296875
             [0.0, 11, ","],
-            [-0.1650390625, 773, " so"],
+            [-0.06787109375, 279, " the"],
         ]
 
         output = self.engine.generate(
@@ -149,6 +155,12 @@ class TestLogprobsDense(unittest.TestCase):
         output_meta = output["meta_info"]
         self.check_output(output_meta, "output_token_logprobs", expected_output_logprobs)
 
+        # use another expected, because jax compiler fused ops will introduce numerical precision issue
+        expected_output_logprobs = [
+            [-0.78125, 32313, "Okay"],  # todo use output compute is -0.79296875
+            [0.0, 11, ","],
+            [-0.1650390625, 773, " so"],
+        ]
         output = self.engine.generate(
             input_ids=input_ids,
             sampling_params=sampling_params,

@@ -619,7 +619,13 @@ class ModelRunner(BaseModelRunner):
         if self.tp_size == 1:
             target_sharding = NamedSharding(
                 self.token_to_kv_pool.mesh,
-                P(None, self.token_to_kv_pool.kv_partition_axis, None),
+                P(
+                    None,
+                    None,
+                    self.token_to_kv_pool.kv_partition_axis,
+                    None,
+                    None,
+                ),
             )
             layers_kv_fused = [
                 jax.device_put(layer_kv_fused, target_sharding)
