@@ -114,11 +114,7 @@ class LinearAttentionBackend(nnx.Module):
         # Multi-host (process_count > 1): leave sharding=None; the arrays are
         # small metadata (cu_seqlens, scatter_idx) and will be replicated by
         # shard_map's in_specs=P() when consumed by the model.
-        sharding = (
-            NamedSharding(self.mesh, P())
-            if self.mesh is not None and jax.process_count() == 1
-            else None
-        )
+        sharding = NamedSharding(self.mesh, P()) if self.mesh is not None else None
         cu_seqlens_dev, scatter_idx_dev = device_array((cu_seqlens, scatter_idx), sharding=sharding)
         return LinearAttentionMetadata(cu_seqlens_dev=cu_seqlens_dev, scatter_idx=scatter_idx_dev)
 

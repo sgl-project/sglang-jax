@@ -315,9 +315,7 @@ def create_test_data(
 
         fb.attn_backend.forward_metadata.custom_mask = device_array(
             (fb.spec_info.custom_mask),
-            sharding=(
-                NamedSharding(attention_backend.mesh, P()) if jax.process_count() == 1 else None
-            ),
+            sharding=(NamedSharding(attention_backend.mesh, P())),
         )
     return fb, current_kv_cache, q, k, v
 
