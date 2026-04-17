@@ -28,7 +28,6 @@ logger = logging.getLogger(__name__)
 
 
 class TreeNode:
-
     counter = 0
     swa_uuid_counter = 1
 
@@ -131,9 +130,9 @@ class LRUList:
         Move a (existing) node to most recently used position
         """
         assert node.id in self.cache, f"Resetting node {node.id=} not in lru list"
-        assert (
-            not self.swa or not node.swa_tombstone
-        ), f"Resetting swa tombstone node in swa lru list: {node.id=}"
+        assert not self.swa or not node.swa_tombstone, (
+            f"Resetting swa tombstone node in swa lru list: {node.id=}"
+        )
         self._remove_node(node)
         self._add_node(node)
 
@@ -146,9 +145,9 @@ class LRUList:
         while node != root_node:
             # for swa lru list, only reset non-tombstone nodes
             if not self.swa or not node.swa_tombstone:
-                assert (
-                    node.id in self.cache
-                ), f"Resetting node {node.id=} not in lru list when resetting node and parents mru"
+                assert node.id in self.cache, (
+                    f"Resetting node {node.id=} not in lru list when resetting node and parents mru"
+                )
                 self._remove_node(node)
                 self._add_node_after(prev_node, node)
                 prev_node = node
@@ -158,12 +157,12 @@ class LRUList:
         """
         Insert a (new) node as most recently used
         """
-        assert (
-            not self.swa or not node.swa_tombstone
-        ), f"Inserting swa tombstone node in swa lru list: {node.id=}"
-        assert (
-            node.id not in self.cache
-        ), f"Inserting node {node.id=} already in lru list, existing node: {self.cache[node.id].id=}"
+        assert not self.swa or not node.swa_tombstone, (
+            f"Inserting swa tombstone node in swa lru list: {node.id=}"
+        )
+        assert node.id not in self.cache, (
+            f"Inserting node {node.id=} already in lru list, existing node: {self.cache[node.id].id=}"
+        )
         self.cache[node.id] = node
         self._add_node(node)
 
@@ -172,9 +171,9 @@ class LRUList:
         Remove node from lru list
         """
         assert node.id in self.cache, f"Removing node {node.id=} not in lru list"
-        assert (
-            not self.swa or not node.swa_tombstone
-        ), f"Removing swa tombstone node from swa lru list: {node.id=}"
+        assert not self.swa or not node.swa_tombstone, (
+            f"Removing swa tombstone node from swa lru list: {node.id=}"
+        )
         del self.cache[node.id]
         self._remove_node(node)
 
@@ -242,9 +241,9 @@ class LRUList:
             # heapify based on last_access_time
             heapq.heapify(nodes)
             # the root node is not in the lru list
-            assert (
-                len(nodes) == len(self.cache) + 1
-            ), f"len(nodes): {len(nodes)} != len(self.cache) + 1: {len(self.cache) + 1}"
+            assert len(nodes) == len(self.cache) + 1, (
+                f"len(nodes): {len(nodes)} != len(self.cache) + 1: {len(self.cache) + 1}"
+            )
 
             x_lru = self._get_lru()
             while len(nodes):
@@ -252,15 +251,15 @@ class LRUList:
                 if x == tree_cache.root_node:
                     # root node is not in the lru list
                     continue
-                assert (
-                    x == x_lru
-                ), f"Incorrect LRU list, {self.swa=}, x: {x.id=} != x_lru: {x_lru.id=}"
-                assert (
-                    x_lru.full_lock_ref == 0
-                ), f"x_lru should not be locked when idle, {x_lru.full_lock_ref=}, {x_lru.swa_uuid=}, {x_lru.id=}"
-                assert (
-                    x_lru.swa_lock_ref == 0
-                ), f"x_lru should not be locked when idle, {x_lru.swa_lock_ref=}, {x_lru.swa_uuid=}, {x_lru.id=}"
+                assert x == x_lru, (
+                    f"Incorrect LRU list, {self.swa=}, x: {x.id=} != x_lru: {x_lru.id=}"
+                )
+                assert x_lru.full_lock_ref == 0, (
+                    f"x_lru should not be locked when idle, {x_lru.full_lock_ref=}, {x_lru.swa_uuid=}, {x_lru.id=}"
+                )
+                assert x_lru.swa_lock_ref == 0, (
+                    f"x_lru should not be locked when idle, {x_lru.swa_lock_ref=}, {x_lru.swa_uuid=}, {x_lru.id=}"
+                )
                 x_lru = getattr(x, self.prv)
 
             if self.swa:
@@ -270,9 +269,9 @@ class LRUList:
                 evictable_size = tree_cache.full_evictable_size()
                 lru_list_evictable_size = tree_cache.full_lru_list_evictable_size()
 
-            assert (
-                evictable_size == lru_list_evictable_size
-            ), f"{self.swa=}, total nodes: {total_nodes}, total lru plus 1: {total_lru_plus_1}, evictable size: {evictable_size} != lru list evictable size: {lru_list_evictable_size}"
+            assert evictable_size == lru_list_evictable_size, (
+                f"{self.swa=}, total nodes: {total_nodes}, total lru plus 1: {total_lru_plus_1}, evictable size: {evictable_size} != lru list evictable size: {lru_list_evictable_size}"
+            )
         except Exception as e:
             logger.error("SWA Radix tree sanity check failed %s", e)
             raise e
@@ -533,9 +532,9 @@ class SWARadixCache(BasePrefixCache):
                     self._tombstone_internal_node(x)
                     self.swa_evictable_size_ -= actual_swa_free
                 else:
-                    assert (
-                        x.full_lock_ref == 0
-                    ), f"leaf node with full lock must also have swa lock, {x.id=}"
+                    assert x.full_lock_ref == 0, (
+                        f"leaf node with full lock must also have swa lock, {x.id=}"
+                    )
                     # 1. a leaf node, free full and swa tokens
                     actual_swa_free = self._swa_eff_len(x.value)
                     self.token_to_kv_pool_allocator.free(x.value)
@@ -570,9 +569,9 @@ class SWARadixCache(BasePrefixCache):
         swa_uuid_for_lock = None
         while node != self.root_node:
             # lock full from node to root
-            assert (
-                node.full_lock_ref >= 0
-            ), f"inc_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
+            assert node.full_lock_ref >= 0, (
+                f"inc_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
+            )
             if node.full_lock_ref == 0:
                 self.full_evictable_size_ -= len(node.value)
                 self.full_protected_size_ += len(node.value)
@@ -609,9 +608,9 @@ class SWARadixCache(BasePrefixCache):
 
         dec_lock_swa = True
         while node != self.root_node:
-            assert (
-                node.full_lock_ref > 0
-            ), f"dec_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
+            assert node.full_lock_ref > 0, (
+                f"dec_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
+            )
             if node.full_lock_ref == 1:
                 self.full_evictable_size_ += len(node.value)
                 self.full_protected_size_ -= len(node.value)
@@ -619,9 +618,9 @@ class SWARadixCache(BasePrefixCache):
 
             if dec_lock_swa:
                 assert not node.swa_tombstone, f"dec_lock_ref on swa_tombstone node, {node.id=}"
-                assert (
-                    node.swa_lock_ref > 0
-                ), f"dec_lock_ref on node with {node.swa_lock_ref=}, {node.id=}"
+                assert node.swa_lock_ref > 0, (
+                    f"dec_lock_ref on node with {node.swa_lock_ref=}, {node.id=}"
+                )
 
                 if node.swa_lock_ref == 1:
                     eff = self._swa_eff_len(node.value)
@@ -683,6 +682,14 @@ class SWARadixCache(BasePrefixCache):
     def adjust_swa_protected_size(self, delta: int):
         """Adjust swa_protected_size_ by delta (can be negative)."""
         self.swa_protected_size_ += delta
+
+    def notify_swa_mapping_freed(self, num_freed: int):
+        """No-op: _evict_swa frees SWA mappings, but tree cache counters don't
+        need adjustment because _swa_eff_len (used by inc/dec_lock_ref, insert,
+        evict) already reads the live mapping state.  Any adjustment here
+        would cause double-accounting.
+        """
+        pass
 
     def all_values_flatten(self) -> jnp.Array:
         values = []
@@ -831,9 +838,9 @@ class SWARadixCache(BasePrefixCache):
             if update_kv_after_len < total_prefix_length + prefix_len:
                 first_diff_idx = max(0, update_kv_after_len - total_prefix_length)
                 if node.swa_tombstone:
-                    assert (
-                        node.swa_lock_ref == 0
-                    ), f"tombstone swa_lock_ref should always be 0, {node.full_lock_ref=}, {node.swa_lock_ref=}, {node.id=}"
+                    assert node.swa_lock_ref == 0, (
+                        f"tombstone swa_lock_ref should always be 0, {node.full_lock_ref=}, {node.swa_lock_ref=}, {node.id=}"
+                    )
                     self.token_to_kv_pool_allocator.free(node.value[first_diff_idx:])
                     node.value = np.array(value[:prefix_len], copy=True)
                     node.swa_tombstone = False
@@ -874,9 +881,9 @@ class SWARadixCache(BasePrefixCache):
             # if locked, means node is in use, skip
             if node.parent.full_lock_ref > 0:
                 break
-            assert (
-                node.parent.swa_lock_ref == 0
-            ), f"tombstone swa_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.swa_lock_ref=}, {node.parent.id=}"
+            assert node.parent.swa_lock_ref == 0, (
+                f"tombstone swa_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.swa_lock_ref=}, {node.parent.id=}"
+            )
             # delete tombstone node evicts full tokens
             self.token_to_kv_pool_allocator.free(node.parent.value)
             full_num_evicted += len(node.parent.value)
@@ -960,9 +967,9 @@ class SWARadixCache(BasePrefixCache):
             for key, child in current_node.children.items():
                 stack.append((child, current_indent + 2))
 
-                assert key == self.get_child_key_fn(
-                    child.key
-                ), f"{key=}, {self.get_child_key_fn(child.key)=}"
+                assert key == self.get_child_key_fn(child.key), (
+                    f"{key=}, {self.get_child_key_fn(child.key)=}"
+                )
 
     def _total_size_helper(self) -> tuple[int, int]:
         total_size = 0

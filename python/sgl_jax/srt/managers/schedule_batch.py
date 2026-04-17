@@ -651,9 +651,9 @@ class ScheduleBatch:
         return_output_logprob_only = all(req.return_output_logprob_only for req in reqs)
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            assert tree_cache is None or isinstance(
-                tree_cache, (SWARadixCache, ChunkCache)
-            ), "SWARadixCache or ChunkCache is required for SWATokenToKVPoolAllocator"
+            assert tree_cache is None or isinstance(tree_cache, (SWARadixCache, ChunkCache)), (
+                "SWARadixCache or ChunkCache is required for SWATokenToKVPoolAllocator"
+            )
             is_hybrid = True
 
         return cls(
@@ -757,13 +757,12 @@ class ScheduleBatch:
         free_slots = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, req.swa_evicted_seqlen : new_evicted
         ]
-        # Count actual SWA slots that will be freed (those with active mapping)
-        num_swa_freed = self.token_to_kv_pool_allocator.count_swa_mapped(free_slots)
         self.token_to_kv_pool_allocator.free_swa(free_slots)
-        # Notify cache layer: these slots were protected (node is locked),
-        # so adjust swa_protected_size_ to prevent bookkeeping leak.
-        if num_swa_freed > 0 and isinstance(self.tree_cache, SWARadixCache):
-            self.tree_cache.adjust_swa_protected_size(-num_swa_freed)
+        # NOTE: We intentionally do NOT adjust the tree cache's evictable/protected
+        # counters here.  _swa_eff_len (used by inc_lock_ref / dec_lock_ref /
+        # _insert_helper / evict) already reads the live SWA mapping state, so the
+        # counters are naturally correct when tokens enter or leave the tree.
+        # Trying to adjust here causes double-accounting.
         req.swa_evicted_seqlen = new_evicted
 
     def maybe_evict_swa(self, sliding_window_size=None):
@@ -997,13 +996,13 @@ class ScheduleBatch:
                 if self.is_hybrid:
                     full_available_size = self.token_to_kv_pool_allocator.full_available_size()
                     swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-                    assert (
-                        full_available_size > 0 and swa_available_size > 0
-                    ), f"No space left for only one request in SWA mode {full_available_size=}, {swa_available_size=}"
+                    assert full_available_size > 0 and swa_available_size > 0, (
+                        f"No space left for only one request in SWA mode {full_available_size=}, {swa_available_size=}"
+                    )
                 else:
-                    assert (
-                        self.token_to_kv_pool_allocator.available_size() > 0
-                    ), f"No space left for only one request, {self.token_to_kv_pool_allocator.available_size()=}"
+                    assert self.token_to_kv_pool_allocator.available_size() > 0, (
+                        f"No space left for only one request, {self.token_to_kv_pool_allocator.available_size()=}"
+                    )
                 break
 
             first_iter = False
