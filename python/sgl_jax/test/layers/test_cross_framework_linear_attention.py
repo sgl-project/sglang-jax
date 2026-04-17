@@ -37,17 +37,21 @@ except ImportError:
     _HAS_TORCH = False
 
 try:
-    from tops.ops.simple_gla import simple_gla_fwd
-    from tops.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
+    from sgl_jax.srt.kernels.simple_gla.simple_gla import (
+        fused_recurrent_simple_gla,
+        simple_gla_fwd,
+    )
 
-    _HAS_TOPS = True
+    _HAS_SIMPLE_GLA = True
 except ImportError:
-    _HAS_TOPS = False
+    _HAS_SIMPLE_GLA = False
 
 _HAS_TPU = any(d.platform == "tpu" for d in jax.devices())
 
 requires_torch = pytest.mark.skipif(not _HAS_TORCH, reason="torch not installed")
-requires_tops = pytest.mark.skipif(not _HAS_TOPS, reason="tops library not installed")
+requires_simple_gla = pytest.mark.skipif(
+    not _HAS_SIMPLE_GLA, reason="simple_gla kernel not installed"
+)
 requires_tpu = pytest.mark.skipif(not _HAS_TPU, reason="chunk kernel requires TPU")
 
 # ---------------------------------------------------------------------------
@@ -432,7 +436,7 @@ class TestModuleLevelMockKernel:
 # ---------------------------------------------------------------------------
 
 
-@requires_tops
+@requires_simple_gla
 class TestScaleBehavior:
     def test_scale_none_matches_explicit(self):
         """fused_recurrent_simple_gla: scale=None should equal scale=K^-0.5."""
@@ -506,7 +510,7 @@ def numpy_gla_recurrent(q, k, v, g_gamma, h0=None, scale=None):
     return output.astype(np.float32), h.astype(np.float32)
 
 
-@requires_tops
+@requires_simple_gla
 class TestGLARecurrenceReference:
     def test_decode_matches_numpy_reference(self):
         """fused_recurrent_simple_gla output matches pure-numpy GLA recurrence."""
@@ -547,7 +551,7 @@ class TestGLARecurrenceReference:
             err_msg="Decode kernel final state diverges from numpy GLA reference",
         )
 
-    @requires_tops
+    @requires_simple_gla
     @requires_tpu
     def test_prefill_matches_numpy_reference(self):
         """simple_gla_fwd (chunk kernel) output matches pure-numpy GLA recurrence.
@@ -596,7 +600,7 @@ class TestGLARecurrenceReference:
             err_msg="Prefill kernel final state diverges from numpy GLA reference",
         )
 
-    @requires_tops
+    @requires_simple_gla
     @requires_tpu
     def test_prefill_non_aligned_matches_numpy_reference(self):
         """simple_gla_fwd with non-chunk-aligned seq_len (zero-padded to chunk boundary).
