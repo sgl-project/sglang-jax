@@ -65,6 +65,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
     "enable_deterministic_sampling",
+    "chunked_prefill_size",
 ]
 
 PADDING_BUCKETS = [1 << i for i in range(6, 21)]
@@ -305,6 +306,11 @@ class Req:
                 self.output_token_ids_logprobs_idx
             ) = None
         self.hidden_states: list[list[float]] = []
+
+        # SWA eviction tracking
+        self.swa_evicted_seqlen: int = 0
+        self.extend_batch_idx: int = 0
+        self.decode_batch_idx: int = 0
 
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
@@ -741,6 +747,63 @@ class ScheduleBatch:
         self.extend_num_tokens += running_bs
         self.extend_logprob_start_lens.extend([0] * running_bs)
 
+    def _evict_swa(self, req: Req, pre_len: int, sliding_window_size: int, page_size: int):
+        """Evict SWA pool tokens outside the sliding window for a single request."""
+        new_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size)
+        if page_size > 1:
+            new_evicted = (new_evicted // page_size) * page_size
+        if new_evicted <= req.swa_evicted_seqlen:
+            return
+        free_slots = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, req.swa_evicted_seqlen : new_evicted
+        ]
+        # Count actual SWA slots that will be freed (those with active mapping)
+        num_swa_freed = self.token_to_kv_pool_allocator.count_swa_mapped(free_slots)
+        self.token_to_kv_pool_allocator.free_swa(free_slots)
+        # Notify cache layer: these slots were protected (node is locked),
+        # so adjust swa_protected_size_ to prevent bookkeeping leak.
+        if num_swa_freed > 0 and isinstance(self.tree_cache, SWARadixCache):
+            self.tree_cache.adjust_swa_protected_size(-num_swa_freed)
+        req.swa_evicted_seqlen = new_evicted
+
+    def maybe_evict_swa(self, sliding_window_size=None):
+        """Evict SWA pool tokens for all requests if hybrid model."""
+        if not self.is_hybrid:
+            return
+        if sliding_window_size is None:
+            sliding_window_size = getattr(self.model_config, "sliding_window", None)
+        if sliding_window_size is None or sliding_window_size <= 0:
+            return
+        page_size = getattr(
+            self.token_to_kv_pool_allocator,
+            "_page_size",
+            getattr(self.token_to_kv_pool_allocator, "page_size", 1),
+        )
+
+        if self.forward_mode is not None and self.forward_mode.is_decode():
+            # Evict at the smaller of sliding_window_size and page_size to avoid
+            # stale SWA slot accumulation.
+            evict_interval = max(min(sliding_window_size, page_size), 1)
+            for req in self.reqs:
+                if req.decode_batch_idx > 0 and (
+                    evict_interval <= 1 or req.decode_batch_idx % evict_interval == 1
+                ):
+                    self._evict_swa(req, req.seqlen - 1, sliding_window_size, page_size)
+            return
+
+        if self.forward_mode is None or not self.forward_mode.is_extend():
+            return
+
+        for i, req in enumerate(self.reqs):
+            pre_len = self.prefix_lens[i] if self.prefix_lens is not None else 0
+            if self.enable_overlap and req.is_chunked > 0:
+                if req.extend_batch_idx < 2:
+                    continue
+                chunked_prefill_size = global_server_args_dict.get("chunked_prefill_size")
+                if chunked_prefill_size is not None and chunked_prefill_size > 0:
+                    pre_len -= chunked_prefill_size
+            self._evict_swa(req, pre_len, sliding_window_size, page_size)
+
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
@@ -776,6 +839,7 @@ class ScheduleBatch:
             req.cached_tokens += pre_len - req.already_computed
             req.already_computed = seq_len
             req.is_retracted = False
+            req.extend_batch_idx += 1
 
             # Compute the relative logprob_start_len in an extend batch
             if req.logprob_start_len >= pre_len:
@@ -877,6 +941,10 @@ class ScheduleBatch:
                 out_cache_loc[pt : pt + extend_lens[i]],
             )
             pt += extend_lens[i]
+
+        # Evict SWA tokens outside sliding window
+        if self.is_hybrid:
+            self.maybe_evict_swa()
 
         # Build sampling info
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -1019,6 +1087,11 @@ class ScheduleBatch:
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
+
+        # Evict SWA tokens outside sliding window
+        if self.is_hybrid:
+            self.maybe_evict_swa()
+
         if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
@@ -1067,6 +1140,9 @@ class ScheduleBatch:
         self.req_to_token_pool.write(
             (self.req_pool_indices, locs), self.out_cache_loc.astype(np.int32)
         )
+
+        for req in self.reqs:
+            req.decode_batch_idx += 1
 
     def filter_batch(
         self,

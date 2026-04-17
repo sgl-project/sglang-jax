@@ -41,6 +41,7 @@ class FlashAttentionMetadata:
     seq_lens: jax.Array = None
     distribution: jax.Array = None
     custom_mask: jax.Array = None
+    swa_page_indices: jax.Array = None
 
     def tree_flatten(self):
         children = (
@@ -51,6 +52,7 @@ class FlashAttentionMetadata:
             self.seq_lens,
             self.distribution,
             self.custom_mask,
+            self.swa_page_indices,
         )
 
         aux_data = {}
@@ -67,6 +69,7 @@ class FlashAttentionMetadata:
         obj.seq_lens = children[4]
         obj.distribution = children[5]
         obj.custom_mask = children[6]
+        obj.swa_page_indices = children[7]
 
         return obj
 
@@ -96,6 +99,7 @@ class FlashAttention(AttentionBackend):
         self.kv_partition_axis = kv_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
+        self.swa_index_mapping = None
 
     def get_forward_metadata(
         self,
@@ -151,17 +155,47 @@ class FlashAttention(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-        (
-            metadata.num_seqs,
-            metadata.cu_q_lens,
-            metadata.cu_kv_lens,
-            metadata.page_indices,
-            metadata.seq_lens,
-            metadata.distribution,
-        ) = device_array(
-            (num_seqs, cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
-            sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
-        )
+        # Compute swa_page_indices if SWA index mapping is available
+        swa_page_indices = None
+        if self.swa_index_mapping is not None:
+            swa_cache_loc = self.swa_index_mapping[batch.cache_loc]
+            swa_indices = np.arange(0, len(swa_cache_loc), self.page_size)
+            swa_selected = swa_cache_loc[swa_indices]
+            swa_page_indices = (swa_selected // self.page_size).astype(np.int32)
+
+        if swa_page_indices is not None:
+            (
+                metadata.num_seqs,
+                metadata.cu_q_lens,
+                metadata.cu_kv_lens,
+                metadata.page_indices,
+                metadata.seq_lens,
+                metadata.distribution,
+                metadata.swa_page_indices,
+            ) = device_array(
+                (
+                    num_seqs,
+                    cu_q_lens,
+                    cu_kv_lens,
+                    page_indices,
+                    seq_lens,
+                    distribution,
+                    swa_page_indices,
+                ),
+                sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
+            )
+        else:
+            (
+                metadata.num_seqs,
+                metadata.cu_q_lens,
+                metadata.cu_kv_lens,
+                metadata.page_indices,
+                metadata.seq_lens,
+                metadata.distribution,
+            ) = device_array(
+                (num_seqs, cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
+                sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
+            )
         return metadata
 
     def get_eagle_forward_metadata(self, batch: ModelWorkerBatch):
@@ -454,7 +488,13 @@ class FlashAttention(AttentionBackend):
             causal = 0
         # Select page indices and remap to SWA pool if KV cache supports it
         page_indices_arg = self.forward_metadata.page_indices
-        if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
+        if self.forward_metadata.swa_page_indices is not None and hasattr(
+            token_to_kv_pool, "layers_mapping"
+        ):
+            _, is_swa = token_to_kv_pool.layers_mapping[layer.layer_id]
+            if is_swa:
+                page_indices_arg = self.forward_metadata.swa_page_indices
+        elif hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
             page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
 
         in_specs = (
