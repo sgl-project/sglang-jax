@@ -37,6 +37,7 @@ from sgl_jax.srt.mem_cache.allocator import (
 )
 from sgl_jax.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
+    RecurrentStatePool,
     ReqToTokenPool,
     SWAKVPool,
 )
@@ -201,24 +202,51 @@ class ModelRunner(BaseModelRunner):
                 "(compiler_options: xla_tpu_enable_log_recorder=true)."
             )
 
-        @partial(
-            jax.jit,
-            donate_argnames=["token_to_kv_pool"],  # just donate KV cache
-            static_argnames=["model_state_def"],
-            compiler_options=jit_compiler_options,
-        )
-        def jitted_run_model(
-            model_def,
-            model_state_def,
-            model_state_leaves,
-            forward_batch,
-            token_to_kv_pool,
-            logits_metadata,
-        ):
-            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
-            model = nnx.merge(model_def, model_state)
-            with LoraBatchContext.set_batch(forward_batch):
-                return model(forward_batch, token_to_kv_pool, logits_metadata)
+        has_recurrent = getattr(self.model_config.hf_config, "num_linear_attention_layers", 0) > 0
+        self._has_recurrent = has_recurrent
+
+        if has_recurrent:
+            @partial(
+                jax.jit,
+                donate_argnames=["token_to_kv_pool", "recurrent_state_pool"],
+                static_argnames=["model_state_def"],
+                compiler_options=jit_compiler_options,
+            )
+            def jitted_run_model(
+                model_def,
+                model_state_def,
+                model_state_leaves,
+                forward_batch,
+                token_to_kv_pool,
+                logits_metadata,
+                recurrent_state_pool,
+            ):
+                model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+                model = nnx.merge(model_def, model_state)
+                with LoraBatchContext.set_batch(forward_batch):
+                    return model(
+                        forward_batch, token_to_kv_pool, logits_metadata,
+                        recurrent_state_pool=recurrent_state_pool,
+                    )
+        else:
+            @partial(
+                jax.jit,
+                donate_argnames=["token_to_kv_pool"],  # just donate KV cache
+                static_argnames=["model_state_def"],
+                compiler_options=jit_compiler_options,
+            )
+            def jitted_run_model(
+                model_def,
+                model_state_def,
+                model_state_leaves,
+                forward_batch,
+                token_to_kv_pool,
+                logits_metadata,
+            ):
+                model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+                model = nnx.merge(model_def, model_state)
+                with LoraBatchContext.set_batch(forward_batch):
+                    return model(forward_batch, token_to_kv_pool, logits_metadata)
 
         @partial(jax.jit, static_argnames=["sampler_state_def", "use_sort_for_toppk_minp"])
         def jitted_sampler(
@@ -237,16 +265,30 @@ class ModelRunner(BaseModelRunner):
         def jitted_compute_logprobs(mesh, logits, next_tokens):
             return compute_logprobs(mesh, logits, next_tokens)
 
-        def run_model_wrapper(forward_batch, logits_metadata):
-            token_to_kv_pool = self.token_to_kv_pool
-            return jitted_run_model(
-                model_def,
-                model_state_def,
-                self.model_state_leaves,
-                forward_batch,
-                token_to_kv_pool,
-                logits_metadata,
-            )
+        if has_recurrent:
+            def run_model_wrapper(forward_batch, logits_metadata):
+                token_to_kv_pool = self.token_to_kv_pool
+                recurrent_state_pool = self.recurrent_state_pool
+                return jitted_run_model(
+                    model_def,
+                    model_state_def,
+                    self.model_state_leaves,
+                    forward_batch,
+                    token_to_kv_pool,
+                    logits_metadata,
+                    recurrent_state_pool,
+                )
+        else:
+            def run_model_wrapper(forward_batch, logits_metadata):
+                token_to_kv_pool = self.token_to_kv_pool
+                return jitted_run_model(
+                    model_def,
+                    model_state_def,
+                    self.model_state_leaves,
+                    forward_batch,
+                    token_to_kv_pool,
+                    logits_metadata,
+                )
 
         self.jitted_run_model = run_model_wrapper
 
@@ -303,6 +345,7 @@ class ModelRunner(BaseModelRunner):
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
         )
+        self.linear_attn_backend = getattr(self.model, "linear_attn_backend", None)
         if self.is_draft_worker:
             # if draft model and target model share same safetensor files, we should hack here to avoid create redundant layer kv cache
             self.model_config.num_hidden_layers = getattr(
@@ -537,6 +580,41 @@ class ModelRunner(BaseModelRunner):
                     debug_mode=False,
                 )
 
+        # Create recurrent state pool for linear attention layers (e.g. Ling-V2.5)
+        self.recurrent_state_pool = None
+        num_linear_layers = getattr(self.model_config.hf_config, "num_linear_attention_layers", 0)
+        if num_linear_layers > 0:
+            num_heads_linear = self.model_config.hf_config.num_attention_heads
+            linear_head_dim = (
+                self.model_config.hf_config.hidden_size // num_heads_linear
+            )
+            # Budget: each state is [batch, heads, dim, dim] in float32
+            bytes_per_state = num_heads_linear * linear_head_dim * linear_head_dim * 4  # float32
+            bytes_per_batch = num_linear_layers * bytes_per_state
+            # Cap batch size to fit in available memory (use at most 20% of remaining)
+            available_mem = self.get_available_device_memory()
+            recurrent_budget = int(available_mem * 0.20)
+            max_recurrent_batch = max(64, recurrent_budget // bytes_per_batch)
+            recurrent_batch_size = min(max_num_reqs + 1, max_recurrent_batch)
+            logger.info(
+                "RecurrentStatePool budget: available=%.2fGB, budget=%.2fGB, "
+                "bytes_per_batch=%d, max_batch=%d, actual_batch=%d",
+                available_mem / 1e9, recurrent_budget / 1e9,
+                bytes_per_batch, max_recurrent_batch, recurrent_batch_size,
+            )
+            self.recurrent_state_pool = RecurrentStatePool(
+                max_batch_size=recurrent_batch_size,
+                num_layers=num_linear_layers,
+                num_heads=num_heads_linear,
+                head_dim=linear_head_dim,
+                dtype=jnp.float32,
+                mesh=self.mesh,
+            )
+            logger.info(
+                "Created RecurrentStatePool: %d layers, batch=%d, heads=%d, head_dim=%d",
+                num_linear_layers, recurrent_batch_size, num_heads_linear, linear_head_dim,
+            )
+
     def init_attention_backend(self):
         """Init attention kernel backend."""
         self.attn_backend = self._get_attention_backend()
@@ -601,11 +679,16 @@ class ModelRunner(BaseModelRunner):
                 logger.debug("logits_metadata %s: %s", key, value)
 
         with jtu.count_pjit_cpp_cache_miss() as count:
-            output, layers_kv_fused, _, layers_topk_ids = self.jitted_run_model(
-                forward_batch, logits_metadata
-            )
+            result = self.jitted_run_model(forward_batch, logits_metadata)
             cache_miss_count = count()
-        self._set_kv_cache_after_forward(layers_kv_fused)
+
+        if getattr(self, "_has_recurrent", False) and len(result) == 5:
+            output, layers_kv_fused, _, layers_topk_ids, updated_recurrent_states = result
+            self._set_kv_cache_after_forward(layers_kv_fused)
+            self._set_recurrent_state_after_forward(updated_recurrent_states)
+        else:
+            output, layers_kv_fused, _, layers_topk_ids = result
+            self._set_kv_cache_after_forward(layers_kv_fused)
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
         return output, cache_miss_count, layers_topk_ids
@@ -627,6 +710,11 @@ class ModelRunner(BaseModelRunner):
             ]
 
         self.token_to_kv_pool.replace_kv_buffer(layers_kv_fused)
+
+    def _set_recurrent_state_after_forward(self, updated_recurrent_states):
+        """Write back updated recurrent states from linear attention layers."""
+        if self.recurrent_state_pool is not None and updated_recurrent_states:
+            self.recurrent_state_pool.replace_states(updated_recurrent_states)
 
     def forward_idle(
         self,

@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -182,6 +182,9 @@ class ForwardBatch:
     # For EPLB
     expert_location_metadata: ExpertLocationMetadata | None = None
 
+    # For linear attention (prefill scatter/gather metadata)
+    linear_attn_metadata: Any = None
+
     trace_request_ids: list[str] | None = None
     trace_request_objects: list | None = None
 
@@ -217,6 +220,7 @@ class ForwardBatch:
             self.lora_ranks,
             self.spec_info,
             self.expert_location_metadata,
+            self.linear_attn_metadata,
             self.attention_mask,
             self.input_embedding,
             self.mrope_positions,
@@ -259,13 +263,14 @@ class ForwardBatch:
         obj.lora_ranks = children[11]
         obj.spec_info = children[12]
         obj.expert_location_metadata = children[13]
+        obj.linear_attn_metadata = children[14]
 
-        obj.attention_mask = children[14]
-        obj.input_embedding = children[15]
-        obj.mrope_positions = children[16]
+        obj.attention_mask = children[15]
+        obj.input_embedding = children[16]
+        obj.mrope_positions = children[17]
 
-        obj.apply_for_deepstack = children[17]
-        obj.deepstack_visual_embedding = children[18]
+        obj.apply_for_deepstack = children[18]
+        obj.deepstack_visual_embedding = children[19]
         return obj
 
     def __repr__(self) -> str:

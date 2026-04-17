@@ -931,3 +931,74 @@ class MLATokenToKVPool(KVCache):
             kv_host = kv_cache_host[layer_id]
             kv_device = jax.device_put(kv_host, self.kv_sharding)
             self.kv_buffer[layer_id] = self.kv_buffer[layer_id].at[indices].set(kv_device)
+
+
+@register_pytree_node_class
+class RecurrentStatePool:
+    """Pool for linear attention recurrent states.
+
+    Each linear attention layer stores [max_batch_size, num_heads, head_dim, head_dim].
+    States are indexed by req_pool_indices (same slots as KV cache).
+    """
+
+    def __init__(
+        self,
+        max_batch_size: int,
+        num_layers: int,
+        num_heads: int,
+        head_dim: int,
+        dtype,
+        mesh,
+    ):
+        self.max_batch_size = max_batch_size
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.dtype = dtype
+        self.mesh = mesh
+
+        sharding = NamedSharding(mesh, P(None, None, None, None))
+        state_shape = (max_batch_size, num_heads, head_dim, head_dim)
+        self.states = []
+        for _ in range(num_layers):
+            buf = jax.jit(
+                lambda: jnp.zeros(shape=state_shape, dtype=dtype),
+                out_shardings=sharding,
+            )()
+            self.states.append(buf)
+
+    def get_state(self, layer_id: int, req_indices):
+        """Retrieve recurrent states for batch requests at a layer."""
+        return self.states[layer_id][req_indices]
+
+    def set_state(self, layer_id: int, req_indices, new_state):
+        """Scatter updated states back into pool for given requests."""
+        self.states[layer_id] = self.states[layer_id].at[req_indices].set(new_state)
+
+    def replace_states(self, updated_states):
+        """Replace all state buffers (used after JIT forward pass)."""
+        for i, state in enumerate(updated_states):
+            self.states[i] = state
+
+    def tree_flatten(self):
+        children = tuple(self.states)
+        aux_data = {
+            "max_batch_size": self.max_batch_size,
+            "num_layers": self.num_layers,
+            "num_heads": self.num_heads,
+            "head_dim": self.head_dim,
+            "dtype": self.dtype,
+        }
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = object.__new__(cls)
+        obj.max_batch_size = aux_data["max_batch_size"]
+        obj.num_layers = aux_data["num_layers"]
+        obj.num_heads = aux_data["num_heads"]
+        obj.head_dim = aux_data["head_dim"]
+        obj.dtype = aux_data["dtype"]
+        obj.mesh = None
+        obj.states = list(children)
+        return obj

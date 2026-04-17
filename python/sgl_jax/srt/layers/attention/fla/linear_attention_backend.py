@@ -59,7 +59,7 @@ class LinearAttentionBackend(nnx.Module):
     def __init__(self, mesh=None):
         self.mesh = mesh
         # Static attribute — enters NNX graphdef; changing it triggers recompilation.
-        self.T_packed_bucket: int = 0
+        self.T_packed_bucket: int = 256
 
     def get_forward_metadata(self, batch) -> "LinearAttentionMetadata":
         """Pre-compute scatter/gather metadata for the current batch.

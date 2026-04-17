@@ -55,7 +55,7 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.head_dim = config.head_dim
+        self.head_dim = self.hidden_size // self.num_heads
         self.num_hidden_layers = config.num_hidden_layers
         self.mesh = mesh
         self.backend = backend
@@ -112,7 +112,13 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
             self.k_norm = None
 
         # Partial rotary positional embeddings
-        rotary_dim = int(self.head_dim * config.partial_rotary_factor)
+        # Use config.rotary_dim directly (like PyTorch), not partial_rotary_factor,
+        # because partial_rotary_factor is computed with config.head_dim (192 for MLA)
+        # but linear attention uses hidden_size // num_heads (128).
+        if hasattr(config, "rotary_dim"):
+            rotary_dim = config.rotary_dim
+        else:
+            rotary_dim = int(self.head_dim * config.partial_rotary_factor)
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=rotary_dim,
@@ -132,14 +138,16 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
             scope_name="g_norm",
         )
 
-        # ALiBi slopes (stored as a JAX constant, not a trainable parameter)
-        self.slope = self._compute_slope()
+        # ALiBi slopes: store as a Python list of floats (NOT numpy/jax array).
+        # This avoids ShapeDtypeStruct issues from nnx.eval_shape during JIT init.
+        # The JAX array is created fresh inside __call__.
+        self._slope_values = self._compute_slope_list()
 
-    def _compute_slope(self) -> jnp.ndarray:
-        """Compute per-head ALiBi slopes with per-layer decay."""
+    def _compute_slope_list(self) -> list[float]:
+        """Compute slope as a Python list (not JAX) to survive eval_shape."""
         base_slopes = np.array(self.build_slope_tensor(self.num_heads), dtype=np.float32)
-        slope = -base_slopes * (1 - (self.layer_idx - 1) / (self.num_hidden_layers - 1) + 1e-5)
-        return jnp.array(slope, dtype=jnp.float32)
+        slope = -base_slopes * (1 - self.layer_idx / (self.num_hidden_layers - 1) + 1e-5)
+        return slope.tolist()
 
     @staticmethod
     def build_slope_tensor(num_heads: int) -> list[float]:
@@ -181,13 +189,21 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
         T = hidden_states.shape[0]
 
         # 1. QKV projection
+        # PyTorch reference stores QKV as contiguous [Q_all | K_all | V_all] blocks.
+        # A direct reshape to [T, 3, H, D] would interleave Q/K/V by head and
+        # produce incorrect results. Split first, then reshape each block.
         qkv, _ = self.qkv_proj(hidden_states)
-        qkv = jax.lax.reshape(
-            qkv,
-            (T, 3, self.num_heads, self.head_dim),
-            out_sharding=NamedSharding(self.mesh, P(None, None, "tensor", None)),
-        )
-        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # each [T, H, K]
+        q_size = self.num_heads * self.head_dim
+        q, k, v = jnp.split(qkv, [q_size, 2 * q_size], axis=-1)
+        q = q.reshape(T, self.num_heads, self.head_dim)
+        k = k.reshape(T, self.num_heads, self.head_dim)
+        v = v.reshape(T, self.num_heads, self.head_dim)
+
+        # Cast QKV to float32 BEFORE QK norm and RoPE (matches PyTorch reference)
+        orig_dtype = q.dtype
+        q = q.astype(jnp.float32)
+        k = k.astype(jnp.float32)
+        v = v.astype(jnp.float32)
 
         # 2. Q/K RMSNorm (V skipped)
         if self.q_norm is not None:
@@ -197,8 +213,14 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
         # 3. Partial RoPE
         q, k = self.rotary_emb(positions, q, k)
 
+        # 3.5 Q scaling (matches PyTorch linear_scale=True for minimax backend)
+        q = q * (self.head_dim ** -0.5)
+
         # Cast recurrent state to float32 for numerical stability
         recurrent_state = recurrent_state.astype(jnp.float32)
+
+        # Materialize slopes as a JAX array (stored as Python list to survive eval_shape)
+        slopes = jnp.array(self._slope_values, dtype=jnp.float32)
 
         # 4. Kernel dispatch
         if forward_batch.forward_mode.is_decode():
@@ -217,7 +239,7 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
                 q_d,
                 k_d,
                 v_d,
-                g_gamma=self.slope,
+                g_gamma=slopes,
                 initial_state=recurrent_state,
                 output_final_state=True,
                 scale=None,
@@ -236,10 +258,10 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
             cu_seqlens = forward_batch.linear_attn_metadata.cu_seqlens_dev
 
             # Reshard slope and h0 onto the mesh before shard_map.
-            # self.slope is a plain jnp.array (not NNX, so not pre-sharded);
+            # slopes is materialized from a Python list inside __call__;
             # recurrent_state comes from the caller and may be replicated.
             slope_sm = jax.sharding.reshard(
-                self.slope, jax.sharding.NamedSharding(self.mesh, P("tensor"))
+                slopes, jax.sharding.NamedSharding(self.mesh, P("tensor"))
             )
             h0_sm = jax.sharding.reshard(
                 recurrent_state,
@@ -293,8 +315,8 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
         else:
             raise NotImplementedError(f"Unsupported forward mode: {forward_batch.forward_mode}")
 
-        # 5. Reshape to [T, H*V]
-        attn_output = attn_output.reshape(T, -1)
+        # 5. Reshape to [T, H*V] and cast back to original dtype
+        attn_output = attn_output.reshape(T, -1).astype(orig_dtype)
 
         # 6. Gating: GroupRMSNorm(attn_output) * sigmoid(g_proj(hidden_states))
         g, _ = self.g_proj(hidden_states)
