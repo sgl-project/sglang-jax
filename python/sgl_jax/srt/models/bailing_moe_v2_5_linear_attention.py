@@ -27,8 +27,10 @@ from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 try:
-    from tops.ops.simple_gla import simple_gla_fwd
-    from tops.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
+    from sgl_jax.srt.kernels.simple_gla.simple_gla import (
+        fused_recurrent_simple_gla,
+        simple_gla_fwd,
+    )
 except ModuleNotFoundError:
     simple_gla_fwd = None
     fused_recurrent_simple_gla = None
@@ -203,7 +205,7 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
         # 4. Kernel dispatch
         if forward_batch.forward_mode.is_decode():
             if fused_recurrent_simple_gla is None:
-                raise ImportError("tops library is required for linear attention decode")
+                raise ImportError("simple_gla kernel is required for linear attention decode")
             # Reshard recurrent_state along H so scan carry matches q/k/v sharding.
             recurrent_state = jax.sharding.reshard(
                 recurrent_state,
@@ -229,7 +231,7 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
             # reaching this point; DRAFT_EXTEND/TARGET_VERIFY (spec decoding) are
             # not supported for linear attention models.
             if simple_gla_fwd is None:
-                raise ImportError("tops library is required for linear attention prefill")
+                raise ImportError("simple_gla kernel is required for linear attention prefill")
             # Prefill: scatter to chunk-aligned layout
             T_pb = self.backend.T_packed_bucket
             scatter_idx = forward_batch.linear_attn_metadata.scatter_idx
