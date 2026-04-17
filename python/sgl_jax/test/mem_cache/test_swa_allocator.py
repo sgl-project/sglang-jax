@@ -19,6 +19,7 @@ from sgl_jax.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
+from sgl_jax.test.test_utils import CustomTestCase
 
 
 def _make_mesh():
@@ -45,7 +46,7 @@ def _make_swa_pool(size, size_swa, page_size, mesh):
 # ---------------------------------------------------------------------------
 # Class 1: Token-level allocator (page_size=1)
 # ---------------------------------------------------------------------------
-class TestSWAAllocatorTokenLevel(unittest.TestCase):
+class TestSWAAllocatorTokenLevel(CustomTestCase):
     def setUp(self):
         self.mesh = _make_mesh()
         self.kvcache = _make_swa_pool(size=64, size_swa=32, page_size=1, mesh=self.mesh)
@@ -127,7 +128,7 @@ class TestSWAAllocatorTokenLevel(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Class 2: Paged allocator (page_size=4)
 # ---------------------------------------------------------------------------
-class TestSWAAllocatorPaged(unittest.TestCase):
+class TestSWAAllocatorPaged(CustomTestCase):
     def setUp(self):
         self.mesh = _make_mesh()
         self.page_size = 4
@@ -310,7 +311,7 @@ class TestSWAAllocatorPaged(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Class 3: SWA Eviction logic
 # ---------------------------------------------------------------------------
-class TestSWAEviction(unittest.TestCase):
+class TestSWAEviction(CustomTestCase):
     """Tests for _evict_swa logic (called via maybe_evict_swa)."""
 
     def setUp(self):
@@ -469,7 +470,7 @@ class TestSWAEviction(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Class 4: Overlap safety
 # ---------------------------------------------------------------------------
-class TestSWAOverlapSafety(unittest.TestCase):
+class TestSWAOverlapSafety(CustomTestCase):
     """Test overlap-aware reclaim timing for decode and chunked extend."""
 
     def setUp(self):

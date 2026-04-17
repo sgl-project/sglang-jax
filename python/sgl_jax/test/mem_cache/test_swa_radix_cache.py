@@ -21,9 +21,10 @@ from sgl_jax.srt.mem_cache.memory_pool import (
 )
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sgl_jax.test.test_utils import CustomTestCase
 
 
-class TestSWARadixCache(unittest.TestCase):
+class TestSWARadixCache(CustomTestCase):
     def setUp(self):
         # Keep KV sizes small to make tests light-weight
         self.devices = jax.devices()
@@ -318,7 +319,7 @@ class TestSWARadixCache(unittest.TestCase):
         )
 
 
-class TestSchedulerCacheInit(unittest.TestCase):
+class TestSchedulerCacheInit(CustomTestCase):
     """Tests for scheduler cache type selection with hybrid models (#202)."""
 
     def _select_cache_type(self, is_hybrid, chunked_prefill_size, disable_radix_cache):
