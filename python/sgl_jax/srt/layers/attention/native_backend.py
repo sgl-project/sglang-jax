@@ -283,7 +283,11 @@ def forward_attention(
     # Apply appropriate masking
     if mode == ForwardMode.EXTEND:
         attn_logits = _apply_extend_mask(
-            attn_logits, seq_lengths, extend_prefix_lens, extend_seq_lens, is_causal,
+            attn_logits,
+            seq_lengths,
+            extend_prefix_lens,
+            extend_seq_lens,
+            is_causal,
             sliding_window_size,
         )
     else:
