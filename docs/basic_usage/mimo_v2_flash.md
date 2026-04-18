@@ -4,23 +4,6 @@ MiMo-V2-Flash is Xiaomi's 256-expert MoE model with hybrid attention (full atten
 
 ## Quick Start
 
-### Single-node (TPU v6e-4)
-
-```bash
-JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache uv run python -u -m sgl_jax.launch_server \
-    --model-path XiaomiMiMo/MiMo-V2-Flash \
-    --trust-remote-code \
-    --tp-size 4 --ep-size 4 \
-    --moe-backend epmoe \
-    --nnodes 1 --node-rank 0 \
-    --dist-init-addr 0.0.0.0:30000 \
-    --host 0.0.0.0 --port 30271 \
-    --page-size 256 --context-length 262144 \
-    --chunked-prefill-size 2048 \
-    --dtype bfloat16 --mem-fraction-static 0.9 \
-    --skip-server-warmup
-```
-
 ### Multi-node (TPU v6e-16, 4 nodes)
 
 Launch on each node with the appropriate `--node-rank` (0-3):
@@ -102,7 +85,6 @@ evalscope eval \
 
 | TPU Type | Nodes | TP Size | EP Size | mem-fraction-static | max-running-requests |
 |----------|-------|---------|---------|--------------------|-----------------------|
-| v6e-4    | 1     | 4       | 4       | 0.9                | 32                    |
 | v6e-16   | 4     | 16      | 16      | 0.95               | 128                   |
 
 ### SWA Pool Tuning

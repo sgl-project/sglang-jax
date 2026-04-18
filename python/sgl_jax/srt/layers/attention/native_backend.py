@@ -109,7 +109,6 @@ class NativeAttention(AttentionBackend):
             xai_temperature_len=xai_temp_len,
             attention_sink=attention_sink,
             sliding_window_size=layer.sliding_window_size,
-            positions=forward_batch.positions,
         )
 
         # Return full fused KV buffer for this layer so that caller can persist it outside JIT
@@ -129,12 +128,15 @@ class NativeAttention(AttentionBackend):
         The 5D fused buffer is persisted outside JIT. The 3D k/v views are
         used by forward_attention for the actual attention computation.
         """
-        is_decode = forward_batch.forward_mode == ForwardMode.DECODE
-
         if is_tpu_runtime():
-            token_to_kv_pool.set_kv_buffer(
-                layer_id, forward_batch.out_cache_loc, k, v, is_decode=is_decode
-            )
+            if forward_batch.forward_mode.is_extend():
+                token_to_kv_pool.set_kv_buffer(
+                    layer_id, forward_batch.out_cache_loc, k, v, is_decode=False
+                )
+            else:
+                token_to_kv_pool.set_kv_buffer(
+                    layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
+                )
             fused_5d = token_to_kv_pool.get_fused_kv_buffer(layer_id)
         else:
             fused_5d = token_to_kv_pool.set_kv_buffer_legacy(
@@ -180,7 +182,6 @@ def forward_attention(
     xai_temperature_len: float | None = None,
     attention_sink: jax.Array | None = None,
     sliding_window_size: int | None = None,
-    positions: jax.Array | None = None,
 ):
     """
     Forward pass using native JAX implementation with block-diagonal attention.
@@ -197,10 +198,8 @@ def forward_attention(
         num_heads: number of query heads
         num_kv_heads: number of key/value heads
         scale: scale for the attention weights
-        seq_mask: boolean mask of shape [batch_size, total_prefix_len]
         xai_temperature_len: length of the xai temperature
         sliding_window_size: sliding window size for attention
-        positions: absolute positions of the tokens [total_tokens]
 
     Returns:
         Output tensor of shape[batch_size, hidden_size]
@@ -241,13 +240,10 @@ def forward_attention(
     if scale is None:
         scale = 1.0 / jnp.sqrt(head_dim)
 
-    # Calculate attention logits using (T, H, K) layout
-    # q_heads: [num_tokens, num_heads, head_dim]
-    # k_heads: [cache_size, num_heads, head_dim]
+    # Attention logits using (T, H, K) layout — no transpose needed
     attn_logits = jnp.einsum("qhd,khd->qhk", q_heads, k_heads) * scale
     neg_inf = jnp.asarray(jnp.finfo(attn_logits.dtype).min, attn_logits.dtype)
     is_valid = loc > 0
-    # Broadcast is_valid from [cache_size] to [1, 1, cache_size]
     attn_logits = jnp.where(is_valid[None, None, :], attn_logits, neg_inf)
 
     # ** Apply XAI temperature scaling if specified **
@@ -270,7 +266,7 @@ def forward_attention(
         temp_factor = log_pos * xai_scale
         regulator = jnp.where(q_positions > xai_temperature_len, temp_factor, 1.0)
 
-        # Broadcast regulator from [num_tokens] to [num_tokens, 1, 1] to scale weights
+        # Broadcast regulator from [num_tokens] to [num_tokens, 1, 1]
         attn_logits = attn_logits * regulator[:, None, None]
 
     # Apply appropriate masking
@@ -294,13 +290,12 @@ def forward_attention(
 
     if attention_sink is not None:
         # attention_sink: [num_heads] — acts as a phantom token in the softmax denominator.
-        # Broadcast sink from [num_heads] to [1, num_heads, 1] to match max_logit [T, H, 1]
+        # Broadcast sink from [num_heads] to [1, num_heads, 1] to match (T, H, K) layout
         sink_term = jnp.exp(attention_sink[None, :, None] - max_logit)
         sum_exp = sum_exp + sink_term
 
     attn_weights = exp_logits / sum_exp
 
-    # attn_output: [num_tokens, num_heads, v_head_dim]
     attn_output = jnp.einsum("qhk,khd->qhd", attn_weights, v_heads)
 
     # Use v_head_dim from V (may differ from head_dim for split K/V models)
@@ -364,7 +359,6 @@ def _apply_extend_mask(
     final_mask = final_mask & q_valid_mask[:, None] & k_valid_mask[None, :]
 
     mask_value = jnp.finfo(attn_weights.dtype).min
-    # Broadcast from [T, K] to [T, 1, K] to match attn_weights [T, H, K]
     final_mask = final_mask[:, None, :]
     return jnp.where(final_mask, attn_weights, mask_value)
 
@@ -389,8 +383,6 @@ def _apply_decode_mask(
 
         if sliding_window_size is not None:
             # SWA mask: only attend to last W tokens
-            # Current token is at position seq_lengths[i] (which is prefix_len + 1)
-            # Actually, seq_lengths[i] here is the length of the sequence in the cache
             swa_mask = all_positions[None, :] >= (seq_ends[:, None] - sliding_window_size)
             seq_mask = seq_mask & swa_mask
 
@@ -401,6 +393,5 @@ def _apply_decode_mask(
     final_mask = final_mask.at[:num_seqs, :].set(per_sequence_mask)
 
     mask_value = jnp.finfo(attn_weights.dtype).min
-    # Broadcast from [T, K] to [T, 1, K] to match attn_weights [T, H, K]
     final_mask = final_mask[:, None, :]
     return jnp.where(final_mask, attn_weights, mask_value)

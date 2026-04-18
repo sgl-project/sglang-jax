@@ -471,10 +471,6 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
 
     def load_weights(self, model_config: ModelConfig):
-        # Pre-warm GCSFuse cache: sequential read of large safetensors files
-        # dramatically speeds up subsequent random-access MoE expert loading.
-        self._warmup_safetensors_cache(model_config)
-
         loader = WeightLoader(
             model=self,
             model_config=model_config,
@@ -490,48 +486,6 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         # Q/K head_dim padding (192→256) is handled by the kernel internally.
         if self._is_static_quant:
             self._dequantize_fp8_to_bf16()
-
-    @staticmethod
-    def _warmup_safetensors_cache(model_config: ModelConfig):
-        """Pre-read safetensors files to warm GCSFuse cache.
-
-        GCSFuse random reads are ~400ms per tensor (cold) vs ~1ms (warm).
-        Sequential bulk read fills the cache so MoE loading uses warm reads.
-        """
-        import glob
-        import os
-        from concurrent.futures import ThreadPoolExecutor
-
-        model_path = model_config.model_path
-        st_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
-        if not st_files:
-            return
-
-        total_size = sum(os.path.getsize(f) for f in st_files)
-        logger.info(
-            "Warming up GCSFuse cache: %d files, %.1f GB",
-            len(st_files),
-            total_size / 1024**3,
-        )
-
-        def _read_file(path):
-            """Read file sequentially to populate GCSFuse cache."""
-            buf = bytearray(4 * 1024 * 1024)  # 4MB buffer
-            with open(path, "rb") as f:
-                while f.readinto(buf):
-                    pass
-
-        import time
-
-        t0 = time.time()
-        with ThreadPoolExecutor(max_workers=min(8, len(st_files))) as executor:
-            list(executor.map(_read_file, st_files))
-        t1 = time.time()
-        logger.info(
-            "GCSFuse cache warm-up done: %.1fs (%.0f MB/s)",
-            t1 - t0,
-            total_size / 1024**2 / (t1 - t0) if t1 > t0 else 0,
-        )
 
     def _is_quant_ignored(self, hf_path: str) -> bool:
         """Check if a HuggingFace weight path is in the quantization ignored_layers list."""
