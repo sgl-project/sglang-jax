@@ -571,20 +571,21 @@ class Glm4MoeForCausalLM(nnx.Module):
         )
 
         # Biases
-        mappings[f"{prefix}.self_attn.q_proj.bias"] = WeightMapping(
-            target_path=f"{target_prefix}.self_attn.q_proj.bias",
-            sharding=("tensor",),
-        )
-        mappings[f"{prefix}.self_attn.k_proj.bias"] = WeightMapping(
-            target_path=f"{target_prefix}.self_attn.k_proj.bias",
-            sharding=("tensor",),
-            kv_head_padding=True,
-        )
-        mappings[f"{prefix}.self_attn.v_proj.bias"] = WeightMapping(
-            target_path=f"{target_prefix}.self_attn.v_proj.bias",
-            sharding=("tensor",),
-            kv_head_padding=True,
-        )
+        if getattr(self.config, "attention_bias", False):
+            mappings[f"{prefix}.self_attn.q_proj.bias"] = WeightMapping(
+                target_path=f"{target_prefix}.self_attn.q_proj.bias",
+                sharding=("tensor",),
+            )
+            mappings[f"{prefix}.self_attn.k_proj.bias"] = WeightMapping(
+                target_path=f"{target_prefix}.self_attn.k_proj.bias",
+                sharding=("tensor",),
+                kv_head_padding=True,
+            )
+            mappings[f"{prefix}.self_attn.v_proj.bias"] = WeightMapping(
+                target_path=f"{target_prefix}.self_attn.v_proj.bias",
+                sharding=("tensor",),
+                kv_head_padding=True,
+            )
 
         if is_static_quant:
             mappings[f"{prefix}.self_attn.q_proj.weight_scale"] = WeightMapping(
