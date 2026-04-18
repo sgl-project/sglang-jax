@@ -369,6 +369,10 @@ class Glm4MoeDecoderLayer(nnx.Module):
                 dispatch_info=dispatch_info,
             )
 
+            if self.use_fused:
+                token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+                topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
+
             hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
 
             if shared_output is not None:
