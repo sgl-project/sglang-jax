@@ -56,6 +56,14 @@ def gmm(
 
     use_gmm_v2 = not interpret and is_supported_by_gmm_v2(rhs_scale)
 
+    # Pad LHS to multiple of 128 on TPU to avoid small/unaligned tiles
+    m = lhs.shape[0]
+    pad_size = 0
+    if not interpret and m % 128 != 0:
+        pad_size = 128 - (m % 128)
+        lhs = jnp.pad(lhs, ((0, pad_size), (0, 0)))
+        group_sizes = group_sizes.at[-1].add(pad_size)
+
     lhs_scale = None
     if not use_gmm_v2 and activation_quantized_dtype is not None:
         lhs_q, lhs_scale = quantize_tensor_simple(lhs, activation_quantized_dtype, dim=-1)
@@ -90,5 +98,9 @@ def gmm(
 
     if lhs_scale is not None:
         out = out * lhs_scale
+
+    # Slice output back to original size if padded
+    if pad_size > 0:
+        out = out[:m]
 
     return out
