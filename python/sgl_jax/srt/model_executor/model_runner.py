@@ -600,7 +600,6 @@ class ModelRunner(BaseModelRunner):
                 self.num_kv_heads,
                 self.model_config.head_dim,
                 page_size=self.page_size,
-                v_head_dim=getattr(self.model_config, "v_head_dim", None),
                 mesh=self.mesh,
             )
         else:

@@ -85,7 +85,6 @@ class FlashAttention(AttentionBackend):
         head_dim,
         vmem_limit_bytes: int = 64 * (1 << 20),  # 64MB
         page_size: int = 1,
-        v_head_dim: int | None = None,
         kv_partition_axis: str = "tensor",
         mesh: jax.sharding.Mesh = None,
     ):
@@ -96,7 +95,6 @@ class FlashAttention(AttentionBackend):
         else:
             self.num_kv_heads = num_attn_heads
         self.head_dim = head_dim
-        self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
         self.page_size = page_size
         self.kv_partition_axis = kv_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
@@ -436,9 +434,6 @@ class FlashAttention(AttentionBackend):
             "vmem_limit_bytes": self.vmem_limit_bytes,
             "head_dim": self.head_dim,
             "page_size": self.page_size,
-            "v_head_dim": self.v_head_dim,
-            "kv_partition_axis": self.kv_partition_axis,
-            "mesh": self.mesh,
         }
         return (children, aux_data)
 
@@ -448,10 +443,8 @@ class FlashAttention(AttentionBackend):
             aux_data["num_heads"],
             aux_data["num_kv_heads"],
             aux_data["head_dim"],
-            page_size=aux_data["page_size"],
-            v_head_dim=aux_data.get("v_head_dim"),
-            kv_partition_axis=aux_data.get("kv_partition_axis", "tensor"),
-            mesh=aux_data.get("mesh"),
+            aux_data["vmem_limit_bytes"],
+            aux_data["page_size"],
         )
 
         obj.forward_metadata = children[0]
@@ -484,17 +477,7 @@ class FlashAttention(AttentionBackend):
                 forward_batch, token_to_kv_pool, layer.layer_id
             )
         else:
-            from sgl_jax.srt.kernels.ragged_paged_attention.util import (
-                align_to,
-                get_dtype_packing,
-            )
-
-            packing = get_dtype_packing(q.dtype)
-            head_dim_aligned = align_to(self.head_dim, 128)
-            heads_per_pack = align_to(self.num_kv_heads * 2, packing) // packing
-            kv_cache_fused = jnp.zeros(
-                (0, self.page_size, heads_per_pack, packing, head_dim_aligned), dtype=q.dtype
-            )
+            kv_cache_fused = jnp.zeros((0, self.num_kv_heads * 2, self.head_dim), dtype=q.dtype)
         scale = (
             1.0 / jnp.sqrt(layer.head_dim)
             if (layer is None or layer.scaling is None)
@@ -514,11 +497,6 @@ class FlashAttention(AttentionBackend):
         elif hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
             page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
 
-        # Default attention_sink to a zero scalar when not provided so that
-        # shard_map always receives a consistent set of arguments.
-        if attention_sink is None:
-            attention_sink = jnp.float32(0.0)
-
         in_specs = (
             P(None, self.kv_partition_axis),  # queries
             P(None, self.kv_partition_axis),  # keys (new tokens)
@@ -532,7 +510,9 @@ class FlashAttention(AttentionBackend):
             P(),  # cu_kv_lens
             P(),  # distribution
             P(),  # custom_mask
-            P(),  # attention_sink (replicated scalar or per-head array)
+            (
+                P(self.kv_partition_axis) if attention_sink is not None else P()
+            ),  # attention sink: (num_q_heads,), sharded by heads
         )
 
         out_specs = (
