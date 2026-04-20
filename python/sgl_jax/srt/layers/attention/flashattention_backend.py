@@ -108,37 +108,28 @@ class FlashAttention(AttentionBackend):
         """Return the metadata for a forward pass."""
         metadata = FlashAttentionMetadata()
 
-        total_loc_len = len(batch.cache_loc)
-        per_dp_loc_len = total_loc_len // batch.dp_size
+        # Stride by page_size to pick one slot per page — O(N/page_size) instead of O(N)
+        indices = np.arange(0, len(batch.cache_loc), self.page_size)
+        page_indices = (batch.cache_loc[indices] // self.page_size).astype(np.int32)
 
-        # Reshape cache_loc to (dp_size, per_dp_loc_len) — O(1) view
-        cache_loc_2d = batch.cache_loc.reshape(batch.dp_size, per_dp_loc_len)
-        # Stride by page_size to pick one slot per page — O(1) view
-        strided_2d = cache_loc_2d[:, :: self.page_size]
-        # Physical slot -> Physical page index
-        page_indices = (strided_2d // self.page_size).ravel()
-
-        # SWA page indices: stride first, then apply mapping on ~N_pages entries
-        # instead of ~N_tokens entries (256x fewer random accesses)
+        # SWA page indices: apply mapping on ~N_pages entries
+        # instead of ~N_tokens entries (page_size x fewer random accesses)
         swa_page_indices = None
         swa_mapping = getattr(self, "swa_index_mapping", None)
         if swa_mapping is not None:
-            n_pages = strided_2d.shape[1]
-            swa_strided = np.empty((batch.dp_size, n_pages), dtype=np.int32)
-            for i in range(batch.dp_size):
-                mapping = swa_mapping[i] if isinstance(swa_mapping, list) else swa_mapping
-                swa_strided[i] = mapping[strided_2d[i]]
-            swa_page_indices = (swa_strided // self.page_size).ravel()
+            swa_slots = swa_mapping[batch.cache_loc[indices]]
+            swa_page_indices = (swa_slots // self.page_size).astype(np.int32)
 
-        # cu_q_lens per DP rank section (each section starts from 0)
+        # cu_q_lens
         if batch.forward_mode == ForwardMode.EXTEND:
-            ext_2d = batch.extend_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
-            cu_q_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)
-            cu_q_2d[:, 1:] = np.cumsum(ext_2d, axis=1)
-            cu_q_lens = cu_q_2d.ravel()
+            cu_q_lens = np.concatenate(
+                [
+                    np.array([0], dtype=np.int32),
+                    np.cumsum(batch.extend_seq_lens, dtype=np.int32),
+                ]
+            )
         elif batch.forward_mode == ForwardMode.DECODE:
-            single_cu = np.arange(batch.per_dp_bs_size + 1, dtype=np.int32)
-            cu_q_lens = np.tile(single_cu, batch.dp_size)
+            cu_q_lens = np.arange(len(batch.seq_lens) + 1, dtype=np.int32)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
@@ -148,21 +139,20 @@ class FlashAttention(AttentionBackend):
             (batch.seq_lens + self.page_size - 1) // self.page_size
         ) * self.page_size
 
-        # cu_kv_lens per DP rank section — vectorized 2D cumsum
-        aligned_2d = aligned_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
-        cu_kv_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)
-        cu_kv_2d[:, 1:] = np.cumsum(aligned_2d, axis=1)
-        cu_kv_lens = cu_kv_2d.ravel()
+        # cu_kv_lens
+        cu_kv_lens = np.concatenate(
+            [
+                np.array([0], dtype=np.int32),
+                np.cumsum(aligned_seq_lens, dtype=np.int32),
+            ]
+        )
 
-        # distribution — vectorized
-        seq_lens_2d = batch.seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
-        local_num_seqs = np.sum(seq_lens_2d > 0, axis=1, dtype=np.int32)
+        # distribution for V2 kernel: [decode_end, prefill_end, mixed_end]
+        num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32)
         if batch.forward_mode == ForwardMode.DECODE:
-            distribution = np.repeat(local_num_seqs, 3)
+            distribution = np.array([0, 0, num_seqs], dtype=np.int32)
         elif batch.forward_mode == ForwardMode.EXTEND:
-            distribution = np.column_stack(
-                [np.zeros_like(local_num_seqs), local_num_seqs, local_num_seqs]
-            ).ravel()
+            distribution = np.array([0, num_seqs, num_seqs], dtype=np.int32)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
