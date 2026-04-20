@@ -845,7 +845,7 @@ def main() -> int:
         help="Dtype for router logits passed to the MoE kernels.",
     )
     parser.add_argument(
-        "--subc-quant-wsz",
+        "--quant-block-k",
         type=int,
         default=256,
         help="Sub-channel quantization block size used when --moe-weight-dtype is set.",
