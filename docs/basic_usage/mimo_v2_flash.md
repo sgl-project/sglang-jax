@@ -8,6 +8,31 @@ MiMo-V2-Flash is Xiaomi's 256-expert MoE model with hybrid attention (full atten
 
 Launch on each node with the appropriate `--node-rank` (0-3):
 
+#### Fused MoE (Recommended)
+
+Uses the fused Pallas kernel which combines expert computation and all-to-all communication into a single optimized operation:
+
+```bash
+JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache uv run python -u -m sgl_jax.launch_server \
+    --model-path XiaomiMiMo/MiMo-V2-Flash \
+    --trust-remote-code \
+    --tp-size 16 --ep-size 16 \
+    --moe-backend fused \
+    --nnodes 4 --node-rank $RANK \
+    --dist-init-addr $MASTER_IP:30000 \
+    --host 0.0.0.0 --port 30271 \
+    --page-size 256 --context-length 262144 \
+    --disable-radix-cache --chunked-prefill-size 2048 \
+    --dtype bfloat16 --mem-fraction-static 0.95 \
+    --swa-full-tokens-ratio 0.2 --skip-server-warmup \
+    --max-running-requests 128 \
+    --attention-backend fa
+```
+
+#### EP MoE (Alternative)
+
+Uses GMM-based expert-parallel dispatch with separate all-to-all communication:
+
 ```bash
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache uv run python -u -m sgl_jax.launch_server \
     --model-path XiaomiMiMo/MiMo-V2-Flash \
@@ -21,12 +46,13 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache uv run python -u -m sgl_jax.launch_serv
     --disable-radix-cache --chunked-prefill-size 2048 \
     --dtype bfloat16 --mem-fraction-static 0.95 \
     --swa-full-tokens-ratio 0.2 --skip-server-warmup \
-    --max-running-requests 128
+    --max-running-requests 128 \
+    --attention-backend fa
 ```
 
 Key flags:
 - `--tp-size / --ep-size`: Match your total TPU chip count across all nodes
-- `--moe-backend epmoe`: Required for expert-parallel MoE dispatch
+- `--moe-backend fused|epmoe`: `fused` uses an optimized Pallas kernel; `epmoe` uses GMM-based expert dispatch
 - `--swa-full-tokens-ratio 0.2`: Allocates 20% of KV cache pool to full-attention layers, 80% to SWA layers
 - `--page-size 256`: Recommended page size for SWA eviction efficiency
 - `--disable-radix-cache`: Recommended for multi-node deployments
