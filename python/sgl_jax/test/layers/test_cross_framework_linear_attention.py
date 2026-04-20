@@ -214,7 +214,7 @@ class TestSubComponentComparison:
         for layer_idx in [0, 4, 9]:
             with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
                 module = _make_module(layer_idx=layer_idx)
-            jax_slopes = jax_to_numpy(module.slope)  # negative
+            jax_slopes = np.array(module._slope_values, dtype=np.float32)  # negative
             pt_slopes = pt_compute_slope(_H, layer_idx, _NUM_LAYERS)  # positive
             np.testing.assert_allclose(
                 np.abs(jax_slopes),

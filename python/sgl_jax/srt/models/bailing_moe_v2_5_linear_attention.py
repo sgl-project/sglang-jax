@@ -142,20 +142,21 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
             scope_name="g_norm",
         )
 
-        # ALiBi slopes: stored as NumPy array (not jnp.array) to survive
-        # nnx.eval_shape during model_runner init. Converted to JAX in __call__.
-        self.slope = self._compute_slope()
+        # ALiBi slopes: stored as a Python list of floats (NOT numpy/jax array).
+        # Python lists are invisible to nnx.state() traversal, avoiding issues
+        # with _copy_weights_across_meshes and eval_shape. The JAX array is
+        # created fresh inside __call__.
+        self._slope_values = self._compute_slope_list()
 
-    def _compute_slope(self) -> np.ndarray:
+    def _compute_slope_list(self) -> list[float]:
         """Compute per-head ALiBi slopes with per-layer decay.
 
-        Returns NumPy array to avoid nnx.eval_shape issues with jnp.array
-        stored as plain attributes.
+        Returns a Python list to stay invisible to nnx.state() traversal.
         Uses 0-indexed layer_idx (sglang-jax convention).
         """
         base_slopes = np.array(self.build_slope_tensor(self.num_heads), dtype=np.float32)
         slope = -base_slopes * (1 - self.layer_idx / (self.num_hidden_layers - 1) + 1e-5)
-        return slope
+        return slope.tolist()
 
     @staticmethod
     def build_slope_tensor(num_heads: int) -> list[float]:
@@ -216,8 +217,9 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
         # Cast recurrent state to float32 for numerical stability
         recurrent_state = recurrent_state.astype(jnp.float32)
 
-        # Materialize slopes as JAX array (stored as NumPy to survive eval_shape)
-        slopes = jnp.array(self.slope, dtype=jnp.float32)
+        # Materialize slopes as JAX array (stored as Python list to stay
+        # invisible to nnx.state() traversal)
+        slopes = jnp.array(self._slope_values, dtype=jnp.float32)
 
         # 4. Kernel dispatch
         if forward_batch.forward_mode.is_decode():

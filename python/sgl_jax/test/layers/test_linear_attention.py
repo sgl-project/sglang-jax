@@ -103,7 +103,7 @@ class TestBuildSlopeTensor:
 
 
 # ---------------------------------------------------------------------------
-# ALiBi slope tensor tests (via module._compute_slope / module.slope)
+# ALiBi slope tensor tests (via module._compute_slope_list / module._slope_values)
 # ---------------------------------------------------------------------------
 
 
@@ -111,7 +111,7 @@ class TestSlopes:
     def test_slopes_all_negative(self):
         """All slope values must be negative after applying the layer scaling."""
         module = _make_module(layer_idx=10)
-        slope_np = np.asarray(module.slope)
+        slope_np = np.array(module._slope_values, dtype=np.float32)
         assert np.all(slope_np < 0), "Expected all slopes to be negative"
 
     def test_slopes_decrease_with_layer_idx(self):
@@ -119,8 +119,8 @@ class TestSlopes:
         config = _make_config()
         module_early = _make_module(layer_idx=5, config=config)
         module_late = _make_module(layer_idx=50, config=config)
-        early_mag = np.abs(np.asarray(module_early.slope))
-        late_mag = np.abs(np.asarray(module_late.slope))
+        early_mag = np.abs(np.array(module_early._slope_values, dtype=np.float32))
+        late_mag = np.abs(np.array(module_late._slope_values, dtype=np.float32))
         assert np.all(
             early_mag > late_mag
         ), "Expected layer 5 slope magnitude > layer 50 slope magnitude"
@@ -130,7 +130,7 @@ class TestSlopes:
         config = _make_config()
         for layer_idx in [1, 10, 40, 79]:
             module = _make_module(layer_idx=layer_idx, config=config)
-            actual = np.asarray(module.slope)
+            actual = np.array(module._slope_values, dtype=np.float32)
             expected = _expected_slope(
                 config.num_attention_heads, layer_idx, config.num_hidden_layers
             )
@@ -146,7 +146,7 @@ class TestSlopes:
         """Slope tensor shape must be (num_attention_heads,)."""
         config = _make_config()
         module = _make_module(layer_idx=1, config=config)
-        assert module.slope.shape == (config.num_attention_heads,)
+        assert len(module._slope_values) == config.num_attention_heads
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +166,7 @@ class TestModuleStructure:
             "k_norm",
             "rotary_emb",
             "g_norm",
-            "slope",
+            "_slope_values",
             "backend",
         ]:
             assert hasattr(module, attr), f"Missing attribute: {attr}"
@@ -803,7 +803,7 @@ class TestGLAWrapper:
 
             # Direct kernel call (same args as module code)
             slope_sm = jax.sharding.reshard(
-                jnp.array(module.slope, dtype=jnp.float32), NamedSharding(mesh, P("tensor"))
+                jnp.array(module._slope_values, dtype=jnp.float32), NamedSharding(mesh, P("tensor"))
             )
             q_d = q[:, None, :, :]
             k_d = k[:, None, :, :]
@@ -899,7 +899,7 @@ class TestGLAWrapper:
             T_pb = metadata.T_packed_bucket
             cu_seqlens = metadata.cu_seqlens_dev
             slope_sm = jax.sharding.reshard(
-                jnp.array(module.slope, dtype=jnp.float32), NamedSharding(mesh, P("tensor"))
+                jnp.array(module._slope_values, dtype=jnp.float32), NamedSharding(mesh, P("tensor"))
             )
 
             def _direct_prefill_fn(q_l, k_l, v_l, gamma, h0, scatter_idx_p, cu_seqlens_p):
@@ -1006,16 +1006,13 @@ def _copy_weights_across_meshes(target_module, source_module):
     Overwriting it would corrupt the target's pre-computed metadata and
     replace nnx.Variable with plain arrays (causing .value AttributeError).
     """
-    # Temporarily detach backends and slope so nnx.state doesn't traverse them.
-    # slope is a plain np.ndarray (no .sharding), backend contains runtime metadata.
+    # Temporarily detach backends so nnx.state doesn't traverse them.
+    # _slope_values is a plain Python list, invisible to nnx.state().
+    # backend contains runtime metadata (not model weights).
     src_backend = source_module.backend
     tgt_backend = target_module.backend
-    src_slope = source_module.slope
-    tgt_slope = target_module.slope
     source_module.backend = None
     target_module.backend = None
-    source_module.slope = None
-    target_module.slope = None
 
     try:
         source_state = nnx.state(source_module)
@@ -1028,11 +1025,9 @@ def _copy_weights_across_meshes(target_module, source_module):
         new_state = jax.tree.map(_copy_leaf, source_state, target_state)
         nnx.update(target_module, new_state)
     finally:
-        # Restore backends and slope
+        # Restore backends
         source_module.backend = src_backend
         target_module.backend = tgt_backend
-        source_module.slope = src_slope
-        target_module.slope = tgt_slope
 
 
 class TestTPConsistency:
