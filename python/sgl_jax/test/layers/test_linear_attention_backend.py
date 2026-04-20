@@ -83,9 +83,9 @@ class TestTPackedBucket:
     def test_two_unaligned_requests(self):
         backend = LinearAttentionBackend()
         batch = _make_batch(ForwardMode.EXTEND, [30, 50], [30, 50])
-        backend.get_forward_metadata(batch)
+        metadata = backend.get_forward_metadata(batch)
         # 30->64, 50->64; total=128
-        assert backend.T_packed_bucket == 128
+        assert metadata.T_packed_bucket == 128
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +117,7 @@ class TestScatterIdx:
         batch = _make_batch(ForwardMode.EXTEND, [30, 50], [30, 50], T_outer=128)
         metadata = backend.get_forward_metadata(batch)
         idx = np.asarray(metadata.scatter_idx)
-        T_pb = backend.T_packed_bucket  # 128
+        T_pb = metadata.T_packed_bucket  # 128
 
         # First 30 tokens map to packed positions 0..29
         np.testing.assert_array_equal(idx[:30], np.arange(0, 30, dtype=np.int32))
@@ -132,7 +132,7 @@ class TestScatterIdx:
         batch = _make_batch(ForwardMode.EXTEND, [30, 0], [30, 0], T_outer=64)
         metadata = backend.get_forward_metadata(batch)
         idx = np.asarray(metadata.scatter_idx)
-        T_pb = backend.T_packed_bucket  # 64 (only one real chunk of 64)
+        T_pb = metadata.T_packed_bucket  # 64 (only one real chunk of 64)
 
         # First 30 tokens map to 0..29
         np.testing.assert_array_equal(idx[:30], np.arange(30, dtype=np.int32))
@@ -151,8 +151,8 @@ class TestDecodeNoOp:
         batch = _make_batch(ForwardMode.DECODE, None, [10, 20], T_outer=2)
         # Should return immediately without raising
         metadata = backend.get_forward_metadata(batch)
-        # State unchanged from init
-        assert backend.T_packed_bucket == 0
+        # Decode returns an empty LinearAttentionMetadata with default T_packed_bucket=0.
+        assert metadata.T_packed_bucket == 0
         # Decode returns an empty LinearAttentionMetadata with None fields.
         assert isinstance(metadata, LinearAttentionMetadata)
         assert metadata.cu_seqlens_dev is None
@@ -176,7 +176,7 @@ class TestScatterGather:
         H, K = 4, 8
         x = jnp.ones((128, H, K), dtype=jnp.float32)
         scatter_idx = metadata.scatter_idx
-        T_pb = backend.T_packed_bucket
+        T_pb = metadata.T_packed_bucket
         out = scatter_to_packed(x, scatter_idx, T_pb)
         assert out.shape == (1, T_pb, H, K)
 
@@ -188,7 +188,7 @@ class TestScatterGather:
         x_np = rng.standard_normal((64, H, K)).astype(np.float32)
         x = jnp.array(x_np)
         scatter_idx = metadata.scatter_idx
-        T_pb = backend.T_packed_bucket  # 64
+        T_pb = metadata.T_packed_bucket  # 64
 
         packed = scatter_to_packed(x, scatter_idx, T_pb)
         recovered = gather_from_packed(packed, scatter_idx)
@@ -209,7 +209,7 @@ class TestScatterGather:
         x = jnp.array(x_np)
 
         scatter_idx = metadata.scatter_idx
-        T_pb = backend.T_packed_bucket
+        T_pb = metadata.T_packed_bucket
 
         packed = scatter_to_packed(x, scatter_idx, T_pb)
         recovered = gather_from_packed(packed, scatter_idx)
@@ -236,7 +236,7 @@ class TestScatterGather:
         x = jnp.array(x_np)
 
         scatter_idx = metadata.scatter_idx
-        T_pb = backend.T_packed_bucket  # ceil(50/64)*64 = 64
+        T_pb = metadata.T_packed_bucket  # ceil(50/64)*64 = 64
 
         # Verify tail positions in scatter_idx map to dummy slot
         idx_np = np.asarray(scatter_idx)
@@ -295,7 +295,7 @@ class TestJitSafety:
         # Simulate ForwardBatch by nesting metadata in a tuple (pytree container)
         @jax.jit
         def scatter_inside_jit(x, meta):
-            packed = scatter_to_packed(x, meta.scatter_idx, backend.T_packed_bucket)
+            packed = scatter_to_packed(x, meta.scatter_idx, meta.T_packed_bucket)
             recovered = gather_from_packed(packed, meta.scatter_idx)
             return recovered
 

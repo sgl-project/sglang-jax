@@ -57,7 +57,9 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.head_dim = config.head_dim
+        # LA layers use hidden_size // num_heads (128 for Ling-1T), NOT config.head_dim
+        # which may refer to MLA's qk_head_dim (192) in hybrid architectures.
+        self.head_dim = self.hidden_size // self.num_heads
         self.num_hidden_layers = config.num_hidden_layers
         self.mesh = mesh
         self.backend = backend
@@ -114,7 +116,13 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
             self.k_norm = None
 
         # Partial rotary positional embeddings
-        rotary_dim = int(self.head_dim * config.partial_rotary_factor)
+        # Prefer config.rotary_dim (absolute) over partial_rotary_factor (relative),
+        # because partial_rotary_factor may be defined w.r.t. MLA's qk_head_dim (192)
+        # rather than LA's head_dim (128). Matches bailing_moe.py fallback pattern.
+        if hasattr(config, "rotary_dim"):
+            rotary_dim = config.rotary_dim
+        else:
+            rotary_dim = int(self.head_dim * config.partial_rotary_factor)
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=rotary_dim,
@@ -134,14 +142,20 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
             scope_name="g_norm",
         )
 
-        # ALiBi slopes (stored as a JAX constant, not a trainable parameter)
+        # ALiBi slopes: stored as NumPy array (not jnp.array) to survive
+        # nnx.eval_shape during model_runner init. Converted to JAX in __call__.
         self.slope = self._compute_slope()
 
-    def _compute_slope(self) -> jnp.ndarray:
-        """Compute per-head ALiBi slopes with per-layer decay."""
+    def _compute_slope(self) -> np.ndarray:
+        """Compute per-head ALiBi slopes with per-layer decay.
+
+        Returns NumPy array to avoid nnx.eval_shape issues with jnp.array
+        stored as plain attributes.
+        Uses 0-indexed layer_idx (sglang-jax convention).
+        """
         base_slopes = np.array(self.build_slope_tensor(self.num_heads), dtype=np.float32)
-        slope = -base_slopes * (1 - (self.layer_idx - 1) / (self.num_hidden_layers - 1) + 1e-5)
-        return jnp.array(slope, dtype=jnp.float32)
+        slope = -base_slopes * (1 - self.layer_idx / (self.num_hidden_layers - 1) + 1e-5)
+        return slope
 
     @staticmethod
     def build_slope_tensor(num_heads: int) -> list[float]:
@@ -202,6 +216,9 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
         # Cast recurrent state to float32 for numerical stability
         recurrent_state = recurrent_state.astype(jnp.float32)
 
+        # Materialize slopes as JAX array (stored as NumPy to survive eval_shape)
+        slopes = jnp.array(self.slope, dtype=jnp.float32)
+
         # 4. Kernel dispatch
         if forward_batch.forward_mode.is_decode():
             if fused_recurrent_simple_gla is None:
@@ -219,7 +236,7 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
                 q_d,
                 k_d,
                 v_d,
-                g_gamma=self.slope,
+                g_gamma=slopes,
                 initial_state=recurrent_state,
                 output_final_state=True,
                 scale=None,
@@ -233,15 +250,15 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
             if simple_gla_fwd is None:
                 raise ImportError("simple_gla kernel is required for linear attention prefill")
             # Prefill: scatter to chunk-aligned layout
-            T_pb = self.backend.T_packed_bucket
+            T_pb = forward_batch.linear_attn_metadata.T_packed_bucket
             scatter_idx = forward_batch.linear_attn_metadata.scatter_idx
             cu_seqlens = forward_batch.linear_attn_metadata.cu_seqlens_dev
 
             # Reshard slope and h0 onto the mesh before shard_map.
-            # self.slope is a plain jnp.array (not NNX, so not pre-sharded);
+            # slopes is materialized from NumPy inside __call__;
             # recurrent_state comes from the caller and may be replicated.
             slope_sm = jax.sharding.reshard(
-                self.slope, jax.sharding.NamedSharding(self.mesh, P("tensor"))
+                slopes, jax.sharding.NamedSharding(self.mesh, P("tensor"))
             )
             h0_sm = jax.sharding.reshard(
                 recurrent_state,

@@ -65,7 +65,7 @@ def _hf_build_slope_tensor(num_heads):
 def _expected_slope(num_heads, layer_idx, num_hidden_layers):
     """Expected slope tensor matching the _compute_slope formula."""
     base = np.array(_hf_build_slope_tensor(num_heads), dtype=np.float32)
-    return -base * (1 - (layer_idx - 1) / (num_hidden_layers - 1) + 1e-5)
+    return -base * (1 - layer_idx / (num_hidden_layers - 1) + 1e-5)
 
 
 def _make_module(layer_idx=1, config=None):
@@ -1010,7 +1010,9 @@ class TestGLAWrapper:
             )
 
             # Direct kernel call (same args as module code)
-            slope_sm = jax.sharding.reshard(module.slope, NamedSharding(mesh, P("tensor")))
+            slope_sm = jax.sharding.reshard(
+                jnp.array(module.slope, dtype=jnp.float32), NamedSharding(mesh, P("tensor"))
+            )
             q_d = q[:, None, :, :]
             k_d = k[:, None, :, :]
             v_d = v[:, None, :, :]
@@ -1147,9 +1149,11 @@ class TestGLAWrapper:
             # the composition of pre-kernel (QKV/norm/RoPE) and post-kernel
             # (gate/dense) steps.
             scatter_idx = metadata.scatter_idx
-            T_pb = backend.T_packed_bucket
+            T_pb = metadata.T_packed_bucket
             cu_seqlens = metadata.cu_seqlens_dev
-            slope_sm = jax.sharding.reshard(module.slope, NamedSharding(mesh, P("tensor")))
+            slope_sm = jax.sharding.reshard(
+                jnp.array(module.slope, dtype=jnp.float32), NamedSharding(mesh, P("tensor"))
+            )
 
             def _direct_prefill_fn(q_l, k_l, v_l, gamma, h0, scatter_idx_p, cu_seqlens_p):
                 q_p = scatter_to_packed(q_l, scatter_idx_p, T_pb)

@@ -31,13 +31,18 @@ class LinearAttentionMetadata:
 
     cu_seqlens_dev: jax.Array = None  # [N_padded+1], chunk-aligned boundaries
     scatter_idx: jax.Array = None  # [T], tight-packed -> chunk-aligned mapping
+    T_packed_bucket: int = 0  # total packed buffer length (aux_data, not traced)
 
     def tree_flatten(self):
-        return (self.cu_seqlens_dev, self.scatter_idx), {}
+        return (self.cu_seqlens_dev, self.scatter_idx), {"T_packed_bucket": self.T_packed_bucket}
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        return cls(cu_seqlens_dev=children[0], scatter_idx=children[1])
+        return cls(
+            cu_seqlens_dev=children[0],
+            scatter_idx=children[1],
+            T_packed_bucket=aux_data["T_packed_bucket"],
+        )
 
 
 class LinearAttentionBackend(nnx.Module):
@@ -52,14 +57,10 @@ class LinearAttentionBackend(nnx.Module):
 
     Attributes:
         mesh: Optional JAX mesh for sharding.
-        T_packed_bucket: Total chunk-aligned buffer length (static; changes trigger
-            recompilation when used inside jit).
     """
 
     def __init__(self, mesh=None):
         self.mesh = mesh
-        # Static attribute — enters NNX graphdef; changing it triggers recompilation.
-        self.T_packed_bucket: int = 0
 
     def get_forward_metadata(self, batch) -> "LinearAttentionMetadata":
         """Pre-compute scatter/gather metadata for the current batch.
@@ -108,8 +109,6 @@ class LinearAttentionBackend(nnx.Module):
             )
             offset_tight += seq_len
 
-        self.T_packed_bucket = T_pb
-
         # Single-host: explicitly place as replicated P() on the mesh.
         # Multi-host (process_count > 1): leave sharding=None; the arrays are
         # small metadata (cu_seqlens, scatter_idx) and will be replicated by
@@ -120,7 +119,11 @@ class LinearAttentionBackend(nnx.Module):
             else None
         )
         cu_seqlens_dev, scatter_idx_dev = device_array((cu_seqlens, scatter_idx), sharding=sharding)
-        return LinearAttentionMetadata(cu_seqlens_dev=cu_seqlens_dev, scatter_idx=scatter_idx_dev)
+        return LinearAttentionMetadata(
+            cu_seqlens_dev=cu_seqlens_dev,
+            scatter_idx=scatter_idx_dev,
+            T_packed_bucket=T_pb,
+        )
 
 
 def scatter_to_packed(x: jax.Array, scatter_idx: jax.Array, T_packed_bucket: int) -> jax.Array:
