@@ -211,6 +211,49 @@ class TestSpecInfoIntegration(unittest.TestCase):
         self.assertEqual(SpeculativeAlgorithm.from_string("ngram"), SpeculativeAlgorithm.NGRAM)
         self.assertEqual(SpeculativeAlgorithm.from_string("Ngram"), SpeculativeAlgorithm.NGRAM)
 
+    @unittest.skipUnless(HAS_JAX, "jax is not installed")
+    def test_ngram_verify_input_keeps_allocate_lens_out_of_aux_data(self):
+        import jax.numpy as jnp
+
+        from sgl_jax.srt.speculative.ngram_worker import NgramVerifyInput
+
+        spec = NgramVerifyInput(
+            custom_mask=jnp.array([1, 0, 1], dtype=jnp.int32),
+            draft_token_num=4,
+            allocate_lens=np.array([3, 4], dtype=np.int32),
+        )
+        children, aux_data = spec.tree_flatten()
+
+        self.assertEqual(set(aux_data.keys()), {"draft_token_num"})
+        self.assertEqual(aux_data["draft_token_num"], 4)
+        self.assertEqual(len(children), 2)
+        np.testing.assert_array_equal(np.asarray(children[1]), np.array([3, 4], dtype=np.int32))
+
+    @unittest.skipUnless(HAS_JAX, "jax is not installed")
+    def test_ngram_verify_input_bs2_metadata_can_reuse_jit(self):
+        import jax
+        import jax.numpy as jnp
+
+        from sgl_jax.srt.speculative.ngram_worker import NgramVerifyInput
+
+        @jax.jit
+        def f(spec):
+            return spec.custom_mask + 1
+
+        spec_a = NgramVerifyInput(
+            custom_mask=jnp.array([1, 2], dtype=jnp.int32),
+            draft_token_num=4,
+            allocate_lens=np.array([3, 4], dtype=np.int32),
+        )
+        spec_b = NgramVerifyInput(
+            custom_mask=jnp.array([1, 2], dtype=jnp.int32),
+            draft_token_num=4,
+            allocate_lens=np.array([5, 6], dtype=np.int32),
+        )
+
+        np.testing.assert_array_equal(np.asarray(f(spec_a)), np.array([2, 3], dtype=np.int32))
+        np.testing.assert_array_equal(np.asarray(f(spec_b)), np.array([2, 3], dtype=np.int32))
+
 
 def _count_node(cache: NgramCache, path: list[int]) -> int:
     """Walk the trie following ``path`` and return the terminal node's count.

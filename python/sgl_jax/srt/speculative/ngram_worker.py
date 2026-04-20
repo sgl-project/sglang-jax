@@ -41,10 +41,11 @@ class NgramVerifyInput:
 
     Registered as a JAX pytree so the wrapping ``ModelWorkerBatch`` can flow
     through ``jax.jit`` (the target ``forward`` is jitted and inspects every
-    leaf of ``model_worker_batch``). ``custom_mask`` is the only jax.Array
-    leaf; ``draft_token_num`` is static (compile-time) metadata; and
-    ``allocate_lens`` is a host-side numpy array we keep out of the pytree
-    to avoid forcing host->device transfers on every call.
+    leaf of ``model_worker_batch``). ``draft_token_num`` is compile-time
+    metadata; runtime-varying arrays such as ``custom_mask`` and
+    ``allocate_lens`` must stay in the pytree leaves so that they do not
+    participate in JAX's metadata equality checks (which would both crash for
+    bs>=2 and force recompilation whenever the lengths change).
     """
 
     custom_mask: np.ndarray | jax.Array
@@ -52,10 +53,14 @@ class NgramVerifyInput:
     allocate_lens: np.ndarray | None = None
 
     def tree_flatten(self):
-        children = (self.custom_mask,)
+        allocate_lens = (
+            np.empty((0,), dtype=np.int32)
+            if self.allocate_lens is None
+            else np.asarray(self.allocate_lens, dtype=np.int32)
+        )
+        children = (self.custom_mask, allocate_lens)
         aux_data = {
             "draft_token_num": self.draft_token_num,
-            "allocate_lens": self.allocate_lens,
         }
         return (children, aux_data)
 
@@ -64,7 +69,7 @@ class NgramVerifyInput:
         return cls(
             custom_mask=children[0],
             draft_token_num=aux_data["draft_token_num"],
-            allocate_lens=aux_data["allocate_lens"],
+            allocate_lens=(children[1] if len(children[1]) > 0 else None),
         )
 
 
@@ -138,6 +143,19 @@ def _build_custom_mask_flat(
     return np.concatenate(per_req_mask_blocks)
 
 
+def _pick_context_len(
+    max_seq_len: int,
+    precompile_token_paddings: list[int],
+) -> int:
+    """Bucket ``max_seq_len`` to a stable precompile token padding."""
+    max_seq_len = max(int(max_seq_len), 1)
+    if precompile_token_paddings:
+        for padding in sorted(precompile_token_paddings):
+            if padding >= max_seq_len:
+                return padding
+    return 1 << (max_seq_len - 1).bit_length()
+
+
 class NgramWorker:
     """Speculative decoding worker that uses n-gram lookup instead of a draft model."""
 
@@ -177,6 +195,12 @@ class NgramWorker:
                 max_trie_depth=self.max_trie_depth,
             )
         return self._caches[req_id]
+
+    def _get_padding_bs_index(self, real_bs: int) -> tuple[int, int]:
+        for i, size in enumerate(self.precompile_bs_paddings):
+            if size >= real_bs:
+                return size - real_bs, i
+        raise RuntimeError(f"Failed to find precompile batch-size bucket for {real_bs=}")
 
     def _evict_finished_requests(self, active_req_ids: set[str]) -> None:
         stale = [rid for rid in self._caches if rid not in active_req_ids]
@@ -352,21 +376,57 @@ class NgramWorker:
         # positions can never match.
         safe_input_ids = _make_safe_input_ids(draft_tokens_np)
 
+        # Bucket the verify inputs to stable precompile shapes. Without this,
+        # ``custom_mask`` and ``cache_loc`` would grow every decode step and
+        # force a fresh TPU compilation on every iteration.
+        _, padding_bs_index = self._get_padding_bs_index(bs)
+        padded_bs = self.precompile_bs_paddings[padding_bs_index]
+        max_seq_len = int(np.max(seq_lens_before_draft)) if len(seq_lens_before_draft) > 0 else 1
+        context_len = _pick_context_len(max_seq_len, self.precompile_token_paddings)
+
+        padded_input_ids = np.zeros(padded_bs * D, dtype=np.int32)
+        padded_input_ids[: bs * D] = safe_input_ids
+        padded_positions = np.zeros(padded_bs * D, dtype=np.int32)
+        padded_positions[: bs * D] = positions
+
+        padded_seq_lens = np.pad(
+            seq_lens_before_draft,
+            (0, padded_bs - bs),
+            constant_values=0,
+        )
+        padded_req_pool_indices = np.pad(
+            model_worker_batch.req_pool_indices[:bs],
+            (0, padded_bs - bs),
+            constant_values=-1,
+        )
+        padded_allocate_lens = np.pad(
+            allocate_lens,
+            (0, padded_bs - bs),
+            constant_values=0,
+        )
+        padded_custom_mask = np.zeros(
+            padded_bs * D * (context_len + D) + 1,
+            dtype=np.int32,
+        )
+        padded_custom_mask[: len(custom_mask_flat)] = custom_mask_flat
+
         # Set up model_worker_batch for target verify. We keep
         # ``model_worker_batch.seq_lens`` at the rewound value only for
         # the duration of ``get_eagle_forward_metadata`` + target
-        # forward, then restore it before returning.
-        model_worker_batch.input_ids = safe_input_ids
-        model_worker_batch.positions = positions
+        # forward, then restore the original unpadded array before
+        # returning.
+        model_worker_batch.input_ids = padded_input_ids
+        model_worker_batch.positions = padded_positions
         model_worker_batch.forward_mode = ForwardMode.TARGET_VERIFY
-        model_worker_batch.seq_lens[:bs] = seq_lens_before_draft
+        model_worker_batch.seq_lens = padded_seq_lens
+        model_worker_batch.req_pool_indices = padded_req_pool_indices
 
         # Create NgramVerifyInput as spec_info so get_eagle_forward_metadata
         # can access custom_mask and draft_token_num.
         model_worker_batch.spec_info = NgramVerifyInput(
-            custom_mask=jnp.asarray(custom_mask_flat, dtype=jnp.int32),
+            custom_mask=jnp.asarray(padded_custom_mask, dtype=jnp.int32),
             draft_token_num=D,
-            allocate_lens=allocate_lens,
+            allocate_lens=padded_allocate_lens,
         )
 
         # Build cache_loc for the verify forward
@@ -377,9 +437,13 @@ class NgramWorker:
         for i in range(bs):
             seq_len_with_draft = int(seq_lens_before_draft[i]) + D
             cache_loc_parts.append(token_indices[i, :seq_len_with_draft])
-        model_worker_batch.cache_loc = (
-            np.concatenate(cache_loc_parts) if cache_loc_parts else np.array([], dtype=np.int32)
+        cache_loc = np.concatenate(cache_loc_parts) if cache_loc_parts else np.array([], dtype=np.int32)
+        total_cache_loc_size = self.precompile_cache_loc_paddings[padding_bs_index]
+        assert total_cache_loc_size >= len(cache_loc), (
+            f"cache_loc bucket too small: {total_cache_loc_size=} < {len(cache_loc)=}"
         )
+        model_worker_batch.cache_loc = np.zeros(total_cache_loc_size, dtype=np.int32)
+        model_worker_batch.cache_loc[: len(cache_loc)] = cache_loc
 
         try:
             # --- Forward target model ---
@@ -393,10 +457,10 @@ class NgramWorker:
                 model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
             )
         finally:
-            # Restore seq_lens so the scheduler's
+            # Restore the original unpadded seq_lens so the scheduler's
             # ``batch.seq_lens += accept_lens`` lands on the un-rewound
             # value. Must happen even if forward_batch_generation raises.
-            model_worker_batch.seq_lens[:bs] = seq_lens_original
+            model_worker_batch.seq_lens = seq_lens_original
 
         # --- Verify phase ---
         # Note: the verify kernel receives the ORIGINAL draft_tokens_np
