@@ -87,6 +87,38 @@ class TestTPackedBucket:
         # 30->64, 50->64; total=128
         assert metadata.T_packed_bucket == 128
 
+    def test_different_batches_produce_different_values(self):
+        """Core staleness test: same backend, different batches -> different T_packed_bucket."""
+        backend = LinearAttentionBackend()
+
+        # Batch 1: two short sequences -> T_pb = 128
+        batch1 = _make_batch(ForwardMode.EXTEND, [30, 50], [30, 50])
+        meta1 = backend.get_forward_metadata(batch1)
+        assert meta1.T_packed_bucket == 128
+
+        # Batch 2: one long sequence -> T_pb = 256
+        batch2 = _make_batch(ForwardMode.EXTEND, [200], [200])
+        meta2 = backend.get_forward_metadata(batch2)
+        assert meta2.T_packed_bucket == 256
+
+        # Batch 3: one short sequence -> T_pb = 64
+        batch3 = _make_batch(ForwardMode.EXTEND, [10], [10])
+        meta3 = backend.get_forward_metadata(batch3)
+        assert meta3.T_packed_bucket == 64
+
+        # meta1 must still hold its original value (not mutated by later calls)
+        assert meta1.T_packed_bucket == 128
+
+    def test_t_packed_bucket_survives_pytree_roundtrip(self):
+        """T_packed_bucket in aux_data survives jax.tree.flatten/unflatten."""
+        backend = LinearAttentionBackend()
+        batch = _make_batch(ForwardMode.EXTEND, [30, 50], [30, 50])
+        metadata = backend.get_forward_metadata(batch)
+
+        leaves, treedef = jax.tree.flatten(metadata)
+        reconstructed = treedef.unflatten(leaves)
+        assert reconstructed.T_packed_bucket == 128
+
 
 # ---------------------------------------------------------------------------
 # scatter_idx tests
