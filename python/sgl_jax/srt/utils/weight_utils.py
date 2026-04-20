@@ -1754,3 +1754,76 @@ class WeightLoader:
 
         layer_num = int(parts[2])
         return layer_num >= self.model_config.num_hidden_layers
+
+
+def replicate_kv_heads(
+    layers,
+    mesh: jax.sharding.Mesh,
+    head_dim: int,
+    v_head_dim: int,
+    target_kv_heads: int,
+):
+    """Replicate KV heads for TP alignment when the weight loader missed them.
+
+    When v_head_dim != head_dim, the weight loader's _apply_kv_head_padding
+    can't pattern-match v_proj shapes. This function fixes that by checking
+    actual weight dims against expected (tp-aligned) dims and replicating.
+
+    Args:
+        layers: List of decoder layers, each with self_attn containing k_proj/v_proj.
+        mesh: JAX mesh for sharding.
+        head_dim: K/Q head dimension.
+        v_head_dim: V head dimension (may differ from head_dim).
+        target_kv_heads: Target number of KV heads after TP alignment.
+    """
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    from sgl_jax.srt.layers.linear import LinearBase
+
+    for layer_idx, layer in enumerate(layers):
+        attn = layer.self_attn
+
+        for proj_name, hd in [
+            ("k_proj", head_dim),
+            ("v_proj", v_head_dim),
+        ]:
+            proj = getattr(attn, proj_name)
+            w = proj.weight.value
+            expected_size = target_kv_heads * hd
+            actual_size = w.shape[1]
+
+            if actual_size == expected_size:
+                continue
+
+            if actual_size > 0 and expected_size % actual_size == 0:
+                num_replicas = expected_size // actual_size
+                orig_kv = actual_size // hd
+
+                logger.info(
+                    "KV head replication: layer %d %s %d→%d heads (%d→%d)",
+                    layer_idx,
+                    proj_name,
+                    orig_kv,
+                    target_kv_heads,
+                    actual_size,
+                    expected_size,
+                )
+
+                w_full = jax.device_put(w, NamedSharding(mesh, P()))
+                w_3d = w_full.reshape(w.shape[0], orig_kv, hd)
+                w_rep = jnp.repeat(w_3d, num_replicas, axis=1)
+                w_new = w_rep.reshape(w.shape[0], expected_size)
+                w_new = jax.device_put(w_new, NamedSharding(mesh, P(None, "tensor")))
+
+                with jax.set_mesh(mesh):
+                    new_linear = LinearBase(
+                        input_size=w.shape[0],
+                        output_size=expected_size,
+                        kernel_axes=proj.kernel_axes,
+                        use_bias=False,
+                        params_dtype=jnp.bfloat16,
+                        mesh=mesh,
+                    )
+                    new_linear.weight = nnx.Param(w_new)
+                setattr(attn, proj_name, new_linear)

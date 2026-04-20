@@ -19,7 +19,7 @@ from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK, create_moe_weights_ma
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping, replicate_kv_heads
 
 logger = logging.getLogger(__name__)
 
@@ -734,64 +734,15 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         self._ensure_kv_head_replication()
 
     def _ensure_kv_head_replication(self):
-        """Replicate KV heads for TP alignment when the weight loader missed them.
-
-        When v_head_dim != head_dim, the weight loader's _apply_kv_head_padding
-        can't pattern-match v_proj shapes. We fix that here by checking actual
-        weight dims against expected (tp-aligned) dims and replicating as needed.
-        """
-        from jax.sharding import NamedSharding
-        from jax.sharding import PartitionSpec as P
-
-        for layer_idx, layer in enumerate(self.model.layers):
-            attn = layer.self_attn
-            # attn.k_head_num is already the TP-aligned count (e.g., 16)
-            target_kv_heads = attn.k_head_num
-
-            for proj_name, head_dim in [
-                ("k_proj", attn.head_dim),
-                ("v_proj", attn.v_head_dim),
-            ]:
-                proj = getattr(attn, proj_name)
-                w = proj.weight.value
-                expected_size = target_kv_heads * head_dim
-                actual_size = w.shape[1]
-
-                if actual_size == expected_size:
-                    continue
-
-                # Weight is smaller than expected — needs replication
-                if actual_size > 0 and expected_size % actual_size == 0:
-                    num_replicas = expected_size // actual_size
-                    orig_kv = actual_size // head_dim
-
-                    logger.info(
-                        "KV head replication: layer %d %s %d→%d heads (%d→%d)",
-                        layer_idx,
-                        proj_name,
-                        orig_kv,
-                        target_kv_heads,
-                        actual_size,
-                        expected_size,
-                    )
-
-                    w_full = jax.device_put(w, NamedSharding(self.mesh, P()))
-                    w_3d = w_full.reshape(w.shape[0], orig_kv, head_dim)
-                    w_rep = jnp.repeat(w_3d, num_replicas, axis=1)
-                    w_new = w_rep.reshape(w.shape[0], expected_size)
-                    w_new = jax.device_put(w_new, NamedSharding(self.mesh, P(None, "tensor")))
-
-                    with jax.set_mesh(self.mesh):
-                        new_linear = LinearBase(
-                            input_size=w.shape[0],
-                            output_size=expected_size,
-                            kernel_axes=proj.kernel_axes,
-                            use_bias=False,
-                            params_dtype=jnp.bfloat16,
-                            mesh=self.mesh,
-                        )
-                        new_linear.weight = nnx.Param(w_new)
-                    setattr(attn, proj_name, new_linear)
+        """Replicate KV heads for TP alignment when the weight loader missed them."""
+        attn = self.model.layers[0].self_attn
+        replicate_kv_heads(
+            layers=self.model.layers,
+            mesh=self.mesh,
+            head_dim=attn.head_dim,
+            v_head_dim=attn.v_head_dim,
+            target_kv_heads=attn.k_head_num,
+        )
 
     def _create_weight_mappings(self) -> dict:
         mappings = {

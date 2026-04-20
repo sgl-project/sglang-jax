@@ -1,6 +1,6 @@
 # MiMo-V2-Flash on SGL-JAX
 
-MiMo-V2-Flash is Xiaomi's 256-expert MoE model with hybrid attention (full attention + sliding window attention), optimized for long-context reasoning tasks. SGL-JAX supports it on TPU v6e with FP8 quantization, tensor parallelism, and expert parallelism.
+MiMo-V2-Flash is Xiaomi's 256-expert MoE model with hybrid attention (full attention + sliding window attention), optimized for long-context reasoning tasks. SGL-JAX supports it on TPU v6e/v7x with FP8 quantization, tensor parallelism, and expert parallelism.
 
 ## Quick Start
 
@@ -57,6 +57,23 @@ Key flags:
 - `--page-size 256`: Recommended page size for SWA eviction efficiency
 - `--disable-radix-cache`: Recommended for multi-node deployments
 
+### Single-node (TPU v7x-8)
+
+```bash
+JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache uv run python -u -m sgl_jax.launch_server \
+    --model-path XiaomiMiMo/MiMo-V2-Flash \
+    --trust-remote-code \
+    --tp-size 8 --ep-size 8 \
+    --moe-backend fused \
+    --host 0.0.0.0 --port 30271 \
+    --page-size 256 --context-length 262144 \
+    --disable-radix-cache --chunked-prefill-size 4096 \
+    --dtype bfloat16 --mem-fraction-static 0.95 \
+    --swa-full-tokens-ratio 0.2 --skip-server-warmup \
+    --max-running-requests 128 \
+    --attention-backend fa
+```
+
 ## Configuration Tips
 
 ### Memory Management
@@ -109,9 +126,10 @@ evalscope eval \
 
 ### TPU Configuration Guide
 
-| TPU Type | Nodes | TP Size | EP Size | mem-fraction-static | max-running-requests |
-|----------|-------|---------|---------|--------------------|-----------------------|
-| v6e-16   | 4     | 16      | 16      | 0.95               | 128                   |
+| TPU Type | Nodes | TP Size | EP Size | chunked-prefill-size | mem-fraction-static | max-running-requests |
+|----------|-------|---------|---------|----------------------|--------------------|-----------------------|
+| v6e-16   | 4     | 16      | 16      | 2048                 | 0.95               | 128                   |
+| v7x-8    | 1     | 8       | 8       | 4096                 | 0.95               | 128                   |
 
 ### SWA Pool Tuning
 - Monitor SWA pool usage via server logs: `swa token usage` and `full token usage`

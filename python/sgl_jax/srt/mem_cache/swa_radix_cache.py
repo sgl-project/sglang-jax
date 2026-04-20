@@ -683,14 +683,6 @@ class SWARadixCache(BasePrefixCache):
         """Adjust swa_protected_size_ by delta (can be negative)."""
         self.swa_protected_size_ += delta
 
-    def notify_swa_mapping_freed(self, num_freed: int):
-        """No-op: _evict_swa frees SWA mappings, but tree cache counters don't
-        need adjustment because _swa_eff_len (used by inc/dec_lock_ref, insert,
-        evict) already reads the live mapping state.  Any adjustment here
-        would cause double-accounting.
-        """
-        pass
-
     def all_values_flatten(self) -> jnp.Array:
         values = []
 
