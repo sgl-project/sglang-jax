@@ -12,7 +12,6 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax import shard_map
-from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.fla.group_rmsnorm import GroupRMSNorm
@@ -214,7 +213,7 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
         q, k = self.rotary_emb(positions, q, k)
 
         # 3.5 Q scaling (matches PyTorch linear_scale=True for minimax backend)
-        q = q * (self.head_dim ** -0.5)
+        q = q * (self.head_dim**-0.5)
 
         # Cast recurrent state to float32 for numerical stability
         recurrent_state = recurrent_state.astype(jnp.float32)
@@ -253,7 +252,7 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
             if simple_gla_fwd is None:
                 raise ImportError("tops library is required for linear attention prefill")
             # Prefill: scatter to chunk-aligned layout
-            T_pb = self.backend.T_packed_bucket
+            T_pb = forward_batch.linear_attn_metadata.T_packed_bucket
             scatter_idx = forward_batch.linear_attn_metadata.scatter_idx
             cu_seqlens = forward_batch.linear_attn_metadata.cu_seqlens_dev
 

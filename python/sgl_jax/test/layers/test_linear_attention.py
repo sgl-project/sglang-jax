@@ -113,7 +113,7 @@ class TestBuildSlopeTensor:
 
 
 # ---------------------------------------------------------------------------
-# ALiBi slope tensor tests (via module._compute_slope / module.slope)
+# ALiBi slope tensor tests (via module._compute_slope_list / module._slope_values)
 # ---------------------------------------------------------------------------
 
 
@@ -121,7 +121,7 @@ class TestSlopes:
     def test_slopes_all_negative(self):
         """All slope values must be negative after applying the layer scaling."""
         module = _make_module(layer_idx=10)
-        slope_np = np.asarray(module.slope)
+        slope_np = np.array(module._slope_values, dtype=np.float32)
         assert np.all(slope_np < 0), "Expected all slopes to be negative"
 
     def test_slopes_decrease_with_layer_idx(self):
@@ -129,8 +129,8 @@ class TestSlopes:
         config = _make_config()
         module_early = _make_module(layer_idx=5, config=config)
         module_late = _make_module(layer_idx=50, config=config)
-        early_mag = np.abs(np.asarray(module_early.slope))
-        late_mag = np.abs(np.asarray(module_late.slope))
+        early_mag = np.abs(np.array(module_early._slope_values, dtype=np.float32))
+        late_mag = np.abs(np.array(module_late._slope_values, dtype=np.float32))
         assert np.all(
             early_mag > late_mag
         ), "Expected layer 5 slope magnitude > layer 50 slope magnitude"
@@ -140,7 +140,7 @@ class TestSlopes:
         config = _make_config()
         for layer_idx in [1, 10, 40, 79]:
             module = _make_module(layer_idx=layer_idx, config=config)
-            actual = np.asarray(module.slope)
+            actual = np.array(module._slope_values, dtype=np.float32)
             expected = _expected_slope(
                 config.num_attention_heads, layer_idx, config.num_hidden_layers
             )
@@ -153,10 +153,10 @@ class TestSlopes:
             )
 
     def test_slopes_shape(self):
-        """Slope tensor shape must be (num_attention_heads,)."""
+        """Slope list length must equal num_attention_heads."""
         config = _make_config()
         module = _make_module(layer_idx=1, config=config)
-        assert module.slope.shape == (config.num_attention_heads,)
+        assert len(module._slope_values) == config.num_attention_heads
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +176,7 @@ class TestModuleStructure:
             "k_norm",
             "rotary_emb",
             "g_norm",
-            "slope",
+            "_slope_values",
             "backend",
         ]:
             assert hasattr(module, attr), f"Missing attribute: {attr}"
@@ -994,11 +994,19 @@ class TestGLAWrapper:
             qkv = _reshape_qkv(qkv, T, _SMALL_H, _SMALL_K)
             q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
 
+            # Match model: cast to float32 before norm/RoPE
+            q = q.astype(jnp.float32)
+            k = k.astype(jnp.float32)
+            v = v.astype(jnp.float32)
+
             if module.q_norm is not None:
                 q = module.q_norm(q)
                 k = module.k_norm(k)
 
             q, k = module.rotary_emb(positions, q, k)
+
+            # Match model: Q scaling
+            q = q * (_SMALL_K**-0.5)
 
             recurrent_state = state_init.astype(jnp.float32)
             # Match the model's resharding: state must have H on "tensor" axis
@@ -1009,7 +1017,8 @@ class TestGLAWrapper:
             )
 
             # Direct kernel call (same args as module code)
-            slope_sm = jax.sharding.reshard(module.slope, NamedSharding(mesh, P("tensor")))
+            slopes_jax = jnp.array(module._slope_values, dtype=jnp.float32)
+            slope_sm = jax.sharding.reshard(slopes_jax, NamedSharding(mesh, P("tensor")))
             q_d = q[:, None, :, :]
             k_d = k[:, None, :, :]
             v_d = v[:, None, :, :]
@@ -1025,7 +1034,7 @@ class TestGLAWrapper:
             attn_output = output_d[:, 0, :, :]  # [T, H, V]
 
             # Apply same gating and dense as module
-            attn_output = attn_output.reshape(T, -1)
+            attn_output = attn_output.reshape(T, -1).astype(jnp.bfloat16)
             g, _ = module.g_proj(hidden)
             gate = jax.nn.sigmoid(g)
             attn_output = module.g_norm(attn_output) * gate
@@ -1131,11 +1140,19 @@ class TestGLAWrapper:
             qkv = _reshape_qkv(qkv, seq_len, _SMALL_H, _SMALL_K)
             q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
 
+            # Match model: cast to float32 before norm/RoPE
+            q = q.astype(jnp.float32)
+            k = k.astype(jnp.float32)
+            v = v.astype(jnp.float32)
+
             if module.q_norm is not None:
                 q = module.q_norm(q)
                 k = module.k_norm(k)
 
             q, k = module.rotary_emb(positions, q, k)
+
+            # Match model: Q scaling
+            q = q * (_SMALL_K**-0.5)
 
             recurrent_state = state_init.astype(jnp.float32)
             recurrent_state = jax.sharding.reshard(
@@ -1149,9 +1166,10 @@ class TestGLAWrapper:
             # the composition of pre-kernel (QKV/norm/RoPE) and post-kernel
             # (gate/dense) steps.
             scatter_idx = metadata.scatter_idx
-            T_pb = backend.T_packed_bucket
+            T_pb = metadata.T_packed_bucket
             cu_seqlens = metadata.cu_seqlens_dev
-            slope_sm = jax.sharding.reshard(module.slope, NamedSharding(mesh, P("tensor")))
+            slopes_jax = jnp.array(module._slope_values, dtype=jnp.float32)
+            slope_sm = jax.sharding.reshard(slopes_jax, NamedSharding(mesh, P("tensor")))
 
             def _direct_prefill_fn(q_l, k_l, v_l, gamma, h0, scatter_idx_p, cu_seqlens_p):
                 q_p = scatter_to_packed(q_l, scatter_idx_p, T_pb)
@@ -1190,7 +1208,7 @@ class TestGLAWrapper:
             attn_output = gather_from_packed(output_packed, scatter_idx)
 
             # Apply same gating and dense as module
-            attn_output = attn_output.reshape(seq_len, -1)
+            attn_output = attn_output.reshape(seq_len, -1).astype(jnp.bfloat16)
             g, _ = module.g_proj(hidden)
             gate = jax.nn.sigmoid(g)
             attn_output = module.g_norm(attn_output) * gate
