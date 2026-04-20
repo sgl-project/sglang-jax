@@ -515,6 +515,12 @@ class ModelRunner(BaseModelRunner):
 
         # Create KV cache pool
         if self.is_hybrid:
+            # Compute SWA KV head count (may differ from full attention heads)
+            swa_num_kv_heads = getattr(self.model_config.hf_config, "swa_num_key_value_heads", None)
+            if swa_num_kv_heads is not None:
+                swa_head_num = max(swa_num_kv_heads, self.tp_size)
+            else:
+                swa_head_num = None
             self.token_to_kv_pool = SWAKVPool(
                 size=self.full_max_total_num_tokens,
                 size_swa=self.swa_max_total_num_tokens,
@@ -524,6 +530,7 @@ class ModelRunner(BaseModelRunner):
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
                 head_dim=(self.model_config.head_dim + 127) // 128 * 128,
                 page_size=self.page_size,
+                swa_head_num=swa_head_num,
                 mesh=self.mesh,
             )
         else:

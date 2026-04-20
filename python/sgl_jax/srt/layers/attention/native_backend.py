@@ -40,7 +40,11 @@ class NativeAttention(AttentionBackend):
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        return cls(num_attn_heads=aux_data["num_heads"], num_kv_heads=aux_data["num_kv_heads"])
+        return cls(
+            num_attn_heads=aux_data["num_heads"],
+            num_kv_heads=aux_data["num_kv_heads"],
+            mesh=aux_data["mesh"],
+        )
 
     def get_forward_metadata(self, batch: ModelWorkerBatch):
         """Init the metadata for a forward pass and return it."""
@@ -55,6 +59,7 @@ class NativeAttention(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        **kwargs,
     ):
         """
         Args:
@@ -81,6 +86,11 @@ class NativeAttention(AttentionBackend):
         # Get xai_temperature_len from the layer if it exists and pass it down.
         xai_temp_len = getattr(layer, "xai_temperature_len", None)
 
+        # Extract attention sink bias (e.g. MiMo-V2-Flash SWA layers)
+        attention_sink = kwargs.get("attention_sink")
+        if attention_sink is not None and hasattr(attention_sink, "value"):
+            attention_sink = attention_sink.value
+
         attn_output = forward_attention(
             q,
             k_buffer,
@@ -96,6 +106,8 @@ class NativeAttention(AttentionBackend):
             forward_batch.forward_mode,
             self.kv_sharding,
             xai_temperature_len=xai_temp_len,
+            attention_sink=attention_sink,
+            sliding_window_size=layer.sliding_window_size,
         )
 
         # Return full fused KV buffer for this layer so that caller can persist it outside JIT
@@ -167,6 +179,8 @@ def forward_attention(
     mode=ForwardMode.DECODE,
     kv_sharding=None,
     xai_temperature_len: float | None = None,
+    attention_sink: jax.Array | None = None,
+    sliding_window_size: int | None = None,
 ):
     """
     Forward pass using native JAX implementation with block-diagonal attention.
@@ -183,8 +197,9 @@ def forward_attention(
         num_heads: number of query heads
         num_kv_heads: number of key/value heads
         scale: scale for the attention weights
-        seq_mask: boolean mask of shape [batch_size, total_prefix_len]
         xai_temperature_len: length of the xai temperature
+        attention_sink: per-head bias for phantom attention sink token
+        sliding_window_size: sliding window size for attention
 
     Returns:
         Output tensor of shape[batch_size, hidden_size]
@@ -212,6 +227,13 @@ def forward_attention(
     k_heads = k_cache
     v_heads = v_cache
 
+    # Pad Q to match K cache head_dim if KV pool was 128-aligned (e.g. 192 -> 256)
+    k_cache_head_dim = k_heads.shape[-1]
+    if k_cache_head_dim != head_dim:
+        pad_size = k_cache_head_dim - head_dim
+        q_heads = jnp.pad(q_heads, ((0, 0), (0, 0), (0, pad_size)))
+        head_dim = k_cache_head_dim
+
     # Transpose for efficient matrix operations
     # q: shape of (num_heads, num_tokens, head_dim)
     # k, v: shape of (total_prefix_len, num_heads, head_dim)
@@ -235,7 +257,7 @@ def forward_attention(
     is_valid = loc > 0
     attn_logits = jnp.where(is_valid[jnp.newaxis, jnp.newaxis, :], attn_logits, neg_inf)
 
-    # ** NEW: Apply XAI temperature scaling if specified **
+    # ** Apply XAI temperature scaling if specified **
     if xai_temperature_len is not None and xai_temperature_len > 0:
         query_len = q_heads.shape[0]
 
@@ -261,18 +283,36 @@ def forward_attention(
     # Apply appropriate masking
     if mode == ForwardMode.EXTEND:
         attn_logits = _apply_extend_mask(
-            attn_logits, seq_lengths, extend_prefix_lens, extend_seq_lens, is_causal
+            attn_logits,
+            seq_lengths,
+            extend_prefix_lens,
+            extend_seq_lens,
+            is_causal,
+            sliding_window_size,
         )
     else:
-        attn_logits = _apply_decode_mask(attn_logits, seq_lengths)
+        attn_logits = _apply_decode_mask(attn_logits, seq_lengths, sliding_window_size)
 
-    # Softmax
-    attn_logits = attn_logits - jnp.max(attn_logits, axis=-1, keepdims=True)
-    attn_weights = jax.nn.softmax(attn_logits, axis=-1)
+    # Softmax (with optional attention sink)
+    max_logit = jnp.max(attn_logits, axis=-1, keepdims=True)
+    attn_logits = attn_logits - max_logit
+    exp_logits = jnp.exp(attn_logits)
+    sum_exp = jnp.sum(exp_logits, axis=-1, keepdims=True)
+
+    if attention_sink is not None:
+        # attention_sink: [num_heads] — acts as a phantom token in the softmax denominator.
+        # Broadcast sink from [num_heads] to [num_heads, 1, 1] to match (H, Q, K) layout
+        sink_term = jnp.exp(attention_sink[:, None, None] - max_logit)
+        sum_exp = sum_exp + sink_term
+
+    attn_weights = exp_logits / sum_exp
 
     attn_output = jnp.matmul(attn_weights, v_t)
     attn_output = jnp.transpose(attn_output, (1, 0, 2))
-    return attn_output.reshape(num_tokens, hidden_size)
+
+    # Use v_head_dim from V (may differ from head_dim for split K/V models)
+    v_head_dim = v_heads.shape[-1]
+    return attn_output.reshape(num_tokens, num_heads * v_head_dim)
 
 
 def _apply_extend_mask(
@@ -281,9 +321,10 @@ def _apply_extend_mask(
     extend_prefix_lens: jax.Array,
     extend_seq_lens: jax.Array,
     is_causal: bool = True,
+    sliding_window_size: int | None = None,
 ):
     """
-    Applies a block-diagonal and optionally a causal mask in a unified,
+    Applies a block-diagonal and optionally a causal/SWA mask in a unified,
     efficient way, correctly handling padding.
     """
     _, query_len, key_len = attn_weights.shape
@@ -305,8 +346,8 @@ def _apply_extend_mask(
     # --- 2. Create block-diagonal mask ---
     final_mask = q_batch_ids[:, None] == k_batch_ids[None, :]
 
-    # --- 3. Optionally add causal mask ---
-    if is_causal:
+    # --- 3. Optionally add causal/SWA mask ---
+    if is_causal or sliding_window_size is not None:
         q_starts_per_pos = q_starts[q_batch_ids]
         q_relative_positions = jnp.arange(query_len, dtype=jnp.int32) - q_starts_per_pos
         prefix_lens_per_pos = extend_prefix_lens[q_batch_ids]
@@ -315,8 +356,15 @@ def _apply_extend_mask(
         k_starts_per_pos = k_starts[k_batch_ids]
         k_relative_positions = jnp.arange(key_len, dtype=jnp.int32) - k_starts_per_pos
 
-        causal_mask = q_actual_positions[:, None] >= k_relative_positions[None, :]
-        final_mask = final_mask & causal_mask
+        if is_causal:
+            causal_mask = q_actual_positions[:, None] >= k_relative_positions[None, :]
+            final_mask = final_mask & causal_mask
+
+        if sliding_window_size is not None:
+            swa_mask = (
+                q_actual_positions[:, None] - k_relative_positions[None, :] < sliding_window_size
+            )
+            final_mask = final_mask & swa_mask
 
     # --- 4. Apply the final combined mask ---
     # Combine with validity masks to handle padding
@@ -327,8 +375,10 @@ def _apply_extend_mask(
     return jnp.where(final_mask, attn_weights, mask_value)
 
 
-def _apply_decode_mask(attn_weights: jax.Array, seq_lengths: jax.Array):
-    """Create a sequence mask that ensures tokens only attend within their sequence."""
+def _apply_decode_mask(
+    attn_weights: jax.Array, seq_lengths: jax.Array, sliding_window_size: int | None = None
+):
+    """Create a sequence mask that ensures tokens only attend within their sequence and window."""
     _, query_len, key_len = attn_weights.shape
     num_seqs = len(seq_lengths)
 
@@ -340,6 +390,11 @@ def _apply_decode_mask(attn_weights: jax.Array, seq_lengths: jax.Array):
         seq_mask = (all_positions[None, :] >= seq_starts[:, None]) & (
             all_positions[None, :] < seq_ends[:, None]
         )
+
+        if sliding_window_size is not None:
+            swa_mask = all_positions[None, :] >= (seq_ends[:, None] - sliding_window_size)
+            seq_mask = seq_mask & swa_mask
+
         return seq_mask
 
     per_sequence_mask = create_decode_sequence_mask()

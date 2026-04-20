@@ -28,7 +28,6 @@ logger = logging.getLogger(__name__)
 
 
 class TreeNode:
-
     counter = 0
     swa_uuid_counter = 1
 
