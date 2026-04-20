@@ -1006,11 +1006,16 @@ def _copy_weights_across_meshes(target_module, source_module):
     Overwriting it would corrupt the target's pre-computed metadata and
     replace nnx.Variable with plain arrays (causing .value AttributeError).
     """
-    # Temporarily detach backends so nnx.state doesn't traverse them
+    # Temporarily detach backends and slope so nnx.state doesn't traverse them.
+    # slope is a plain np.ndarray (no .sharding), backend contains runtime metadata.
     src_backend = source_module.backend
     tgt_backend = target_module.backend
+    src_slope = source_module.slope
+    tgt_slope = target_module.slope
     source_module.backend = None
     target_module.backend = None
+    source_module.slope = None
+    target_module.slope = None
 
     try:
         source_state = nnx.state(source_module)
@@ -1023,9 +1028,11 @@ def _copy_weights_across_meshes(target_module, source_module):
         new_state = jax.tree.map(_copy_leaf, source_state, target_state)
         nnx.update(target_module, new_state)
     finally:
-        # Restore backends
+        # Restore backends and slope
         source_module.backend = src_backend
         target_module.backend = tgt_backend
+        source_module.slope = src_slope
+        target_module.slope = tgt_slope
 
 
 class TestTPConsistency:
