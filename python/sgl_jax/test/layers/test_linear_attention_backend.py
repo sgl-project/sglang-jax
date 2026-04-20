@@ -73,6 +73,40 @@ class TestCuSeqlens:
         expected = np.array([0, 64, 192, 192], dtype=np.int32)
         np.testing.assert_array_equal(np.asarray(metadata.cu_seqlens_dev), expected)
 
+    def test_single_token_request(self):
+        """Minimum seq_len=1: should pad to one full chunk."""
+        backend = LinearAttentionBackend()
+        batch = _make_batch(ForwardMode.EXTEND, [1], [1])
+        metadata = backend.get_forward_metadata(batch)
+        # ceil(1/64)*64 = 64
+        expected = np.array([0, 64], dtype=np.int32)
+        np.testing.assert_array_equal(np.asarray(metadata.cu_seqlens_dev), expected)
+
+    def test_chunk_boundary_minus_one(self):
+        """seq_len=63: one below chunk boundary, should pad to 64."""
+        backend = LinearAttentionBackend()
+        batch = _make_batch(ForwardMode.EXTEND, [63], [63])
+        metadata = backend.get_forward_metadata(batch)
+        expected = np.array([0, 64], dtype=np.int32)
+        np.testing.assert_array_equal(np.asarray(metadata.cu_seqlens_dev), expected)
+
+    def test_chunk_boundary_plus_one(self):
+        """seq_len=65: one above chunk boundary, should pad to 128."""
+        backend = LinearAttentionBackend()
+        batch = _make_batch(ForwardMode.EXTEND, [65], [65])
+        metadata = backend.get_forward_metadata(batch)
+        expected = np.array([0, 128], dtype=np.int32)
+        np.testing.assert_array_equal(np.asarray(metadata.cu_seqlens_dev), expected)
+
+    def test_mixed_boundary_requests(self):
+        """Mix of boundary and non-boundary lengths in one batch."""
+        backend = LinearAttentionBackend()
+        batch = _make_batch(ForwardMode.EXTEND, [1, 63, 64, 65], [1, 63, 64, 65])
+        metadata = backend.get_forward_metadata(batch)
+        # 1->64, 63->64, 64->64, 65->128; cumsum: [0,64,128,192,320]
+        expected = np.array([0, 64, 128, 192, 320], dtype=np.int32)
+        np.testing.assert_array_equal(np.asarray(metadata.cu_seqlens_dev), expected)
+
 
 # ---------------------------------------------------------------------------
 # T_packed_bucket tests
@@ -170,6 +204,31 @@ class TestScatterIdx:
         np.testing.assert_array_equal(idx[:30], np.arange(30, dtype=np.int32))
         # Remaining 34 outer positions map to dummy slot
         np.testing.assert_array_equal(idx[30:], np.full(34, T_pb, dtype=np.int32))
+
+    def test_single_token_scatter(self):
+        """seq_len=1: single token maps to position 0, rest is dummy."""
+        backend = LinearAttentionBackend()
+        batch = _make_batch(ForwardMode.EXTEND, [1], [1], T_outer=64)
+        metadata = backend.get_forward_metadata(batch)
+        idx = np.asarray(metadata.scatter_idx)
+        T_pb = metadata.T_packed_bucket  # 64
+
+        assert idx[0] == 0  # single real token
+        np.testing.assert_array_equal(idx[1:], np.full(63, T_pb, dtype=np.int32))
+
+    def test_chunk_boundary_scatter(self):
+        """seq_len=63 and 65: verify scatter around chunk boundary."""
+        backend = LinearAttentionBackend()
+        # 63 tokens: fits in one chunk (padded to 64), 65: needs two chunks (padded to 128)
+        batch = _make_batch(ForwardMode.EXTEND, [63, 65], [63, 65], T_outer=128)
+        metadata = backend.get_forward_metadata(batch)
+        idx = np.asarray(metadata.scatter_idx)
+        assert metadata.T_packed_bucket == 192  # 64 + 128
+
+        # First 63 tokens map to 0..62
+        np.testing.assert_array_equal(idx[:63], np.arange(63, dtype=np.int32))
+        # Next 65 tokens map to 64..128 (second chunk starts at cu_seqlens[1]=64)
+        np.testing.assert_array_equal(idx[63:128], np.arange(64, 129, dtype=np.int32))
 
 
 # ---------------------------------------------------------------------------
