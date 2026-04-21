@@ -165,7 +165,7 @@ class FlashAttention(AttentionBackend):
             metadata.distribution,
         ) = device_array(
             (cu_q_lens, cu_kv_lens, page_indices, swa_page_indices, seq_lens, distribution),
-            sharding=(NamedSharding(self.mesh, P("data")) if jax.process_count() == 1 else None),
+            sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
         )
         return metadata
 
