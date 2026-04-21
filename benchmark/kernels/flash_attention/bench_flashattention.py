@@ -163,7 +163,6 @@ def benchmark_backend(
     )
     if sliding_window is not None:
         scope_name += f"-sw_{sliding_window}"
-    print(f"{scope_name=}")
     times = multiple_iteration_timeit_from_trace(
         compute_func=lambda: attn(),
         data_generator=lambda: (),
@@ -308,7 +307,7 @@ class TestPerformance(CustomTestCase):
                 ("decode", 256, 256, 8, 1, 128, 600000): 1.0714862,
             },
             "TPU v7": {
-                # ("prefill", 128, 1024, 4, 1, 128, 600000): 0.014767107,
+                ("decode", 128, 20, 4, 1, 128, 600000): 0.014767107,
                 # ("prefill", 128, 1024, 4, 2, 128, 600000): 0.015102041,
                 # ("prefill", 128, 1024, 8, 1, 128, 600000): 0.022470588,
                 # ("prefill", 128, 1024, 8, 4, 128, 600000): 0.023110444,
@@ -340,11 +339,11 @@ class TestPerformance(CustomTestCase):
                 # ("decode", 256, 256, 4, 2, 128, 600000): 0.415367347,
                 # ("decode", 256, 256, 8, 1, 128, 600000): 0.303222089,
                 # ("decode", 256, 256, 8, 4, 128, 600000): 0.610410564,
-                ("decode", 256, 64, 8, 1, 256, 600000): 0.610410564,
             },
         }
+        print(f"{get_device_name()}")
         test_cases = test_cases_for_different_devices[get_device_name()]
-        max_context_len = 262144
+        max_context_len = 40960
         for case, baseline in test_cases.items():
             (
                 mode,

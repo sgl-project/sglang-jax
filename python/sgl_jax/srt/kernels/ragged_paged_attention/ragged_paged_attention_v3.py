@@ -1496,8 +1496,9 @@ def get_default_block_sizes(
         case 5 | 6:
             if case == RpaCase.DECODE:
                 bq_sz = 1
-                bkv_sz = min(min_bkv_sz_to_peak, max_kv) if sliding_window is None else page_size
-                print(f"{bkv_sz=}")
+                bkv_sz = (
+                    min(min_bkv_sz_to_peak, max_kv) if sliding_window is None else sliding_window
+                )
                 bq_csz = 1
                 bkv_csz = bkv_sz
             else:
@@ -1508,7 +1509,9 @@ def get_default_block_sizes(
         case 7:
             if case == RpaCase.DECODE:
                 bq_sz = 1
-                bkv_sz = min(min_bkv_sz_to_peak, max_kv) if sliding_window is None else 128
+                bkv_sz = (
+                    min(min_bkv_sz_to_peak, max_kv) if sliding_window is None else sliding_window
+                )
                 bq_csz = 1
                 bkv_csz = bkv_sz
             else:
@@ -1530,6 +1533,7 @@ def get_default_block_sizes(
     # stack, spills, f32 softmax pipeline) not captured by get_vmem_estimate_bytes.
     if vmem_limit_bytes is not None:
         vmem_budget = int(vmem_limit_bytes * 0.30)
+        print(f"{vmem_budget=}")
         while bq_sz > 1 or bkv_sz > bkv_alignment:
             vmem_est = get_vmem_estimate_bytes(
                 actual_num_kv_heads,
@@ -1578,7 +1582,7 @@ def get_default_block_sizes(
         use_custom_mask,
         vmem_limit_bytes,
     )
-    print(f"{bkv_sz} {bkv_csz}")
+    print(f"{bkv_sz=} {bkv_csz=}")
     return {
         "bq_sz": bq_sz,
         "bkv_sz": bkv_sz,

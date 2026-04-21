@@ -128,8 +128,7 @@ def create_decode_uniform_data(
 ):
     batch_size = max_num_batched_tokens
     # hackly set prefix len to 2048-4096 for decode one seq in random
-    # random_prefix_lens = jax.random.randint(jax.random.PRNGKey(42), (batch_size,), 1024, 2048)
-    random_prefix_lens = jax.random.randint(jax.random.PRNGKey(42), (batch_size,), 16384, 16384)
+    random_prefix_lens = jax.random.randint(jax.random.PRNGKey(42), (batch_size,), 1024, 2048)
     seq_lens = random_prefix_lens + 1
     cu_q_lens = jnp.concatenate(
         [
