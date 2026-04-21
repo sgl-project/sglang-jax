@@ -332,6 +332,7 @@ class TestPrefillForward:
             65,  # one above chunk boundary
             100,  # non-aligned, crosses chunk boundary
             128,  # two full chunks
+            512,  # large multi-chunk (8 full chunks)
         ],
     )
     def test_prefill_output_and_state(self, seq_len):
@@ -489,6 +490,93 @@ class TestWhiteBox:
             y, _ = module.dense(x)
 
         assert not jnp.allclose(x, y), "Dense projection should change values"
+
+    def test_gating_preserves_shape(self):
+        """Output shape should be [T, H*K] after GroupRMSNorm * sigmoid gating."""
+        backend = LinearAttentionBackend(mesh=mesh)
+        T = 4
+
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            module = BailingMoeV2_5LinearAttention(
+                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend
+            )
+            attn_output = jax.random.normal(
+                jax.random.PRNGKey(0), (T, _SMALL_H * _SMALL_K), dtype=jnp.bfloat16
+            )
+            hidden = jax.random.normal(
+                jax.random.PRNGKey(1), (T, _SMALL_HIDDEN), dtype=jnp.bfloat16
+            )
+            g, _ = module.g_proj(hidden)
+            gate = jax.nn.sigmoid(g)
+            gated = module.g_norm(attn_output) * gate
+
+        assert gated.shape == (
+            T,
+            _SMALL_H * _SMALL_K,
+        ), f"Expected ({T}, {_SMALL_H * _SMALL_K}), got {gated.shape}"
+
+    @requires_simple_gla
+    def test_g_gamma_scalar_vs_expanded(self):
+        """g_gamma=[H] and equivalent expanded g produce identical decode output/state."""
+        T = 2
+
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            from sgl_jax.srt.kernels.simple_gla.simple_gla import (
+                fused_recurrent_simple_gla,
+            )
+
+            rng = jax.random.PRNGKey(42)
+            q = jax.random.normal(rng, (T, 1, _SMALL_H, _SMALL_K), dtype=jnp.float32)
+            k = jax.random.normal(
+                jax.random.PRNGKey(43), (T, 1, _SMALL_H, _SMALL_K), dtype=jnp.float32
+            )
+            v = jax.random.normal(
+                jax.random.PRNGKey(44), (T, 1, _SMALL_H, _SMALL_K), dtype=jnp.float32
+            )
+            state = jnp.zeros((T, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.float32)
+
+            # Scalar per-head slopes [H]
+            slopes = (
+                jnp.array(
+                    BailingMoeV2_5LinearAttention.build_slope_tensor(_SMALL_H), dtype=jnp.float32
+                )
+                * -0.1
+            )
+
+            # Expanded slopes [T, 1, H] — same value repeated across T and seq_len=1
+            slopes_expanded = jnp.broadcast_to(slopes[None, None, :], (T, 1, _SMALL_H))
+
+            out_scalar, state_scalar = fused_recurrent_simple_gla(
+                q,
+                k,
+                v,
+                g_gamma=slopes,
+                initial_state=state,
+                output_final_state=True,
+                scale=None,
+            )
+            out_expanded, state_expanded = fused_recurrent_simple_gla(
+                q,
+                k,
+                v,
+                g_gamma=slopes_expanded,
+                initial_state=state,
+                output_final_state=True,
+                scale=None,
+            )
+
+        np.testing.assert_allclose(
+            np.array(out_scalar),
+            np.array(out_expanded),
+            atol=0,
+            err_msg="g_gamma=[H] vs expanded [T,1,H] output should be identical",
+        )
+        np.testing.assert_allclose(
+            np.array(state_scalar),
+            np.array(state_expanded),
+            atol=0,
+            err_msg="g_gamma=[H] vs expanded [T,1,H] state should be identical",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -678,17 +766,20 @@ class TestMultiRequestIsolation:
     def test_prefill_vs_decode_approximate_agreement(self):
         """Prefill and token-by-token decode should produce approximately similar results.
 
+        Uses non-chunk-aligned seq_len (100, not a multiple of chunk_size=64)
+        to verify scatter/gather + state transfer works across the boundary.
+
         This is a cross-algorithm sanity check, NOT an exact consistency test.
         The chunk kernel (simple_gla_fwd, parallel matmul) and recurrent kernel
         (fused_recurrent_simple_gla, sequential MAC) use fundamentally different
-        reduction orders.  After 64 steps of bf16 accumulation, significant
+        reduction orders.  After many steps of bf16 accumulation, significant
         numerical divergence is expected.
 
         This test catches structural bugs (wrong decay sign, transposed state,
         missing scale) which cause order-of-magnitude differences, but cannot
         detect subtle numerical issues within the tolerance band.
         """
-        seq_len = 64
+        seq_len = 100  # non-chunk-aligned: crosses chunk boundary (100 != 64*N)
 
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
             backend = LinearAttentionBackend(mesh=mesh)
@@ -727,10 +818,10 @@ class TestMultiRequestIsolation:
         # The chunk kernel (simple_gla_fwd) and recurrent kernel
         # (fused_recurrent_simple_gla) are mathematically equivalent but use
         # very different reduction orders: parallel chunk matmuls vs sequential
-        # multiply-accumulate. With bf16 inputs over 64 steps, accumulated
-        # floating-point divergence is significant. Use generous tolerances;
-        # structural errors (wrong decay, transposed state) would produce
-        # order-of-magnitude differences.
+        # multiply-accumulate. With bf16 inputs over 100 steps (non-aligned),
+        # accumulated floating-point divergence is significant. Use generous
+        # tolerances; structural errors (wrong decay, transposed state) would
+        # produce order-of-magnitude differences.
         #
         # Tolerances derived from TPU v6e-4 empirical data (2026-04-08):
         #   state: max_abs_diff=1.14, mismatch=8/65536 (0.012%) at rtol=0.2/atol=0.5

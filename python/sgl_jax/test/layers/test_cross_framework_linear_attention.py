@@ -432,6 +432,28 @@ class TestModuleLevelMockKernel:
 
 
 # ---------------------------------------------------------------------------
+# End-to-end cross-framework tests (require kernel + torch)
+# ---------------------------------------------------------------------------
+
+
+@requires_torch
+@requires_simple_gla
+@requires_tpu
+class TestEndToEndCrossFramework:
+    """Full pipeline JAX vs PyTorch comparison (design doc §Cross-Framework Consistency)."""
+
+    @pytest.mark.skip(reason="Requires HF PyTorch BailingMoeV2_5LinearAttention with tops kernel")
+    def test_float32_output_and_state_match(self):
+        """float32: full module output max abs diff < 1e-5, new_state same."""
+        pass
+
+    @pytest.mark.skip(reason="Requires HF PyTorch BailingMoeV2_5LinearAttention with tops kernel")
+    def test_bfloat16_output_and_state_match(self):
+        """bfloat16: full module output max abs diff < 0.05, new_state same."""
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Scale behavior verification
 # ---------------------------------------------------------------------------
 
