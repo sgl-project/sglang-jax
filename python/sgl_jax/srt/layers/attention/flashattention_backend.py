@@ -108,10 +108,19 @@ class FlashAttention(AttentionBackend):
         """Return the metadata for a forward pass."""
         metadata = FlashAttentionMetadata()
 
+        # Stride by page_size to pick one slot per page — O(N/page_size) instead of O(N)
         indices = np.arange(0, len(batch.cache_loc), self.page_size)
-        selected_cache_locs = batch.cache_loc[indices]
-        page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
+        page_indices = (batch.cache_loc[indices] // self.page_size).astype(np.int32)
 
+        # SWA page indices: apply mapping on ~N_pages entries
+        # instead of ~N_tokens entries (page_size x fewer random accesses)
+        swa_page_indices = None
+        swa_mapping = getattr(self, "swa_index_mapping", None)
+        if swa_mapping is not None:
+            swa_slots = swa_mapping[batch.cache_loc[indices]]
+            swa_page_indices = (swa_slots // self.page_size).astype(np.int32)
+
+        # cu_q_lens
         if batch.forward_mode == ForwardMode.EXTEND:
             cu_q_lens = np.concatenate(
                 [
@@ -120,82 +129,44 @@ class FlashAttention(AttentionBackend):
                 ]
             )
         elif batch.forward_mode == ForwardMode.DECODE:
-            cu_q_lens = np.concatenate(
-                [
-                    np.array([0], dtype=np.int32),
-                    np.cumsum(np.ones(len(batch.seq_lens), dtype=np.int32)),
-                ]
-            )
+            cu_q_lens = np.arange(len(batch.seq_lens) + 1, dtype=np.int32)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-        seq_lens = np.copy(batch.seq_lens)
+        seq_lens = batch.seq_lens
 
         aligned_seq_lens = (
             (batch.seq_lens + self.page_size - 1) // self.page_size
         ) * self.page_size
+
+        # cu_kv_lens
         cu_kv_lens = np.concatenate(
             [
                 np.array([0], dtype=np.int32),
-                np.cumsum(aligned_seq_lens),
+                np.cumsum(aligned_seq_lens, dtype=np.int32),
             ]
         )
 
-        num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32).reshape(
-            1,
-        )
-
-        # Construct distribution for V2 kernel: [decode_end, prefill_end, mixed_end]
+        # distribution for V2 kernel: [decode_end, prefill_end, mixed_end]
+        num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32)
         if batch.forward_mode == ForwardMode.DECODE:
-            # All sequences are decode/mixed mode
-            distribution = np.array([0, 0, num_seqs.item()], dtype=np.int32)
+            distribution = np.array([0, 0, num_seqs], dtype=np.int32)
         elif batch.forward_mode == ForwardMode.EXTEND:
-            # All sequences are prefill mode
-            distribution = np.array([0, num_seqs.item(), num_seqs.item()], dtype=np.int32)
+            distribution = np.array([0, num_seqs, num_seqs], dtype=np.int32)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-        # Compute swa_page_indices if SWA index mapping is available
-        swa_page_indices = None
-        if self.swa_index_mapping is not None:
-            swa_cache_loc = self.swa_index_mapping[batch.cache_loc]
-            swa_indices = np.arange(0, len(swa_cache_loc), self.page_size)
-            swa_selected = swa_cache_loc[swa_indices]
-            swa_page_indices = (swa_selected // self.page_size).astype(np.int32)
-
-        if swa_page_indices is not None:
-            (
-                metadata.num_seqs,
-                metadata.cu_q_lens,
-                metadata.cu_kv_lens,
-                metadata.page_indices,
-                metadata.seq_lens,
-                metadata.distribution,
-                metadata.swa_page_indices,
-            ) = device_array(
-                (
-                    num_seqs,
-                    cu_q_lens,
-                    cu_kv_lens,
-                    page_indices,
-                    seq_lens,
-                    distribution,
-                    swa_page_indices,
-                ),
-                sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
-            )
-        else:
-            (
-                metadata.num_seqs,
-                metadata.cu_q_lens,
-                metadata.cu_kv_lens,
-                metadata.page_indices,
-                metadata.seq_lens,
-                metadata.distribution,
-            ) = device_array(
-                (num_seqs, cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
-                sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
-            )
+        (
+            metadata.cu_q_lens,
+            metadata.cu_kv_lens,
+            metadata.page_indices,
+            metadata.swa_page_indices,
+            metadata.seq_lens,
+            metadata.distribution,
+        ) = device_array(
+            (cu_q_lens, cu_kv_lens, page_indices, swa_page_indices, seq_lens, distribution),
+            sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
+        )
         return metadata
 
     def get_eagle_forward_metadata(self, batch: ModelWorkerBatch):
