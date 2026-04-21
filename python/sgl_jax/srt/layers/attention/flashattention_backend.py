@@ -150,7 +150,7 @@ class FlashAttention(AttentionBackend):
         # distribution for V2 kernel: [decode_end, prefill_end, mixed_end]
         num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32)
         if batch.forward_mode == ForwardMode.DECODE:
-            distribution = np.array([0, 0, num_seqs], dtype=np.int32)
+            distribution = np.array([num_seqs, num_seqs, num_seqs], dtype=np.int32)
         elif batch.forward_mode == ForwardMode.EXTEND:
             distribution = np.array([0, num_seqs, num_seqs], dtype=np.int32)
         else:
