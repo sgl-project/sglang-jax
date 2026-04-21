@@ -9,8 +9,8 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
-from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
-    ragged_paged_attention,
+from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
+    ragged_paged_attention as ragged_paged_attention_v3,
 )
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import RadixAttention
@@ -41,6 +41,7 @@ class FlashAttentionMetadata:
     seq_lens: jax.Array = None
     distribution: jax.Array = None
     custom_mask: jax.Array = None
+    swa_page_indices: jax.Array = None
 
     def tree_flatten(self):
         children = (
@@ -51,6 +52,7 @@ class FlashAttentionMetadata:
             self.seq_lens,
             self.distribution,
             self.custom_mask,
+            self.swa_page_indices,
         )
 
         aux_data = {}
@@ -67,6 +69,7 @@ class FlashAttentionMetadata:
         obj.seq_lens = children[4]
         obj.distribution = children[5]
         obj.custom_mask = children[6]
+        obj.swa_page_indices = children[7]
 
         return obj
 
@@ -96,6 +99,7 @@ class FlashAttention(AttentionBackend):
         self.kv_partition_axis = kv_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
+        self.swa_index_mapping = None
 
     def get_forward_metadata(
         self,
@@ -104,10 +108,19 @@ class FlashAttention(AttentionBackend):
         """Return the metadata for a forward pass."""
         metadata = FlashAttentionMetadata()
 
+        # Stride by page_size to pick one slot per page — O(N/page_size) instead of O(N)
         indices = np.arange(0, len(batch.cache_loc), self.page_size)
-        selected_cache_locs = batch.cache_loc[indices]
-        page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
+        page_indices = (batch.cache_loc[indices] // self.page_size).astype(np.int32)
 
+        # SWA page indices: apply mapping on ~N_pages entries
+        # instead of ~N_tokens entries (page_size x fewer random accesses)
+        swa_page_indices = None
+        swa_mapping = getattr(self, "swa_index_mapping", None)
+        if swa_mapping is not None:
+            swa_slots = swa_mapping[batch.cache_loc[indices]]
+            swa_page_indices = (swa_slots // self.page_size).astype(np.int32)
+
+        # cu_q_lens
         if batch.forward_mode == ForwardMode.EXTEND:
             cu_q_lens = np.concatenate(
                 [
@@ -116,50 +129,42 @@ class FlashAttention(AttentionBackend):
                 ]
             )
         elif batch.forward_mode == ForwardMode.DECODE:
-            cu_q_lens = np.concatenate(
-                [
-                    np.array([0], dtype=np.int32),
-                    np.cumsum(np.ones(len(batch.seq_lens), dtype=np.int32)),
-                ]
-            )
+            cu_q_lens = np.arange(len(batch.seq_lens) + 1, dtype=np.int32)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-        seq_lens = np.copy(batch.seq_lens)
+        seq_lens = batch.seq_lens
 
         aligned_seq_lens = (
             (batch.seq_lens + self.page_size - 1) // self.page_size
         ) * self.page_size
+
+        # cu_kv_lens
         cu_kv_lens = np.concatenate(
             [
                 np.array([0], dtype=np.int32),
-                np.cumsum(aligned_seq_lens),
+                np.cumsum(aligned_seq_lens, dtype=np.int32),
             ]
         )
 
-        num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32).reshape(
-            1,
-        )
-
-        # Construct distribution for V2 kernel: [decode_end, prefill_end, mixed_end]
+        # distribution for V2 kernel: [decode_end, prefill_end, mixed_end]
+        num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32)
         if batch.forward_mode == ForwardMode.DECODE:
-            # All sequences are decode/mixed mode
-            distribution = np.array([0, 0, num_seqs.item()], dtype=np.int32)
+            distribution = np.array([0, 0, num_seqs], dtype=np.int32)
         elif batch.forward_mode == ForwardMode.EXTEND:
-            # All sequences are prefill mode
-            distribution = np.array([0, num_seqs.item(), num_seqs.item()], dtype=np.int32)
+            distribution = np.array([0, num_seqs, num_seqs], dtype=np.int32)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
         (
-            metadata.num_seqs,
             metadata.cu_q_lens,
             metadata.cu_kv_lens,
             metadata.page_indices,
+            metadata.swa_page_indices,
             metadata.seq_lens,
             metadata.distribution,
         ) = device_array(
-            (num_seqs, cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
+            (cu_q_lens, cu_kv_lens, page_indices, swa_page_indices, seq_lens, distribution),
             sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
         )
         return metadata
@@ -427,6 +432,7 @@ class FlashAttention(AttentionBackend):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         causal: int = 1,
+        attention_sink: jax.Array = None,
     ):
         """
         Args:
@@ -449,35 +455,41 @@ class FlashAttention(AttentionBackend):
             else layer.scaling
         )
 
-        # Prepare fused KV cache for paged format: [num_pages, page_size, num_kv_heads * 2, head_dim]
-        total_tokens = kv_cache_fused.shape[0]
-        num_pages = total_tokens // self.page_size
-        kv_cache_fused_paged = kv_cache_fused.reshape(
-            num_pages, self.page_size, -1, (self.head_dim + 127) // 128 * 128
-        )
         if self.forward_metadata.custom_mask is not None:
             causal = 0
         # Select page indices and remap to SWA pool if KV cache supports it
         page_indices_arg = self.forward_metadata.page_indices
-        if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
+        if self.forward_metadata.swa_page_indices is not None and hasattr(
+            token_to_kv_pool, "layers_mapping"
+        ):
+            _, is_swa = token_to_kv_pool.layers_mapping[layer.layer_id]
+            if is_swa:
+                page_indices_arg = self.forward_metadata.swa_page_indices
+        elif hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
             page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
 
         in_specs = (
             P(None, self.kv_partition_axis),  # queries
             P(None, self.kv_partition_axis),  # keys (new tokens)
             P(None, self.kv_partition_axis),  # values (new tokens)
-            P(None, None, self.kv_partition_axis, None),  # kv_cache_fused (head interleaved)
+            P(
+                None, None, self.kv_partition_axis, None, None
+            ),  # kv_cache_fused 5D (head interleaved)
             P(),  # kv_lens
             P(),  # page_indices
             P(),  # cu_q_lens
             P(),  # cu_kv_lens
             P(),  # distribution
             P(),  # custom_mask
+            (
+                P(self.kv_partition_axis) if attention_sink is not None else P()
+            ),  # attention sink: (num_q_heads,), sharded by heads
         )
+
         out_specs = (
             P(None, self.kv_partition_axis),  # attention output
             P(
-                None, self.kv_partition_axis, None
+                None, None, self.kv_partition_axis, None, None
             ),  # updated kv_cache_fused (head interleaved) - 3D: [total_tokens, num_kv_heads*2, head_dim]
         )
 
@@ -486,7 +498,7 @@ class FlashAttention(AttentionBackend):
             other_args = args[4:]
 
             # Call fused KV kernel with head interleaving
-            result, updated_kv_cache_fused = ragged_paged_attention(
+            result, updated_kv_cache_fused = ragged_paged_attention_v3(
                 queries,
                 keys,
                 values,
@@ -499,7 +511,6 @@ class FlashAttention(AttentionBackend):
                 xai_temperature_len=(
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
                 ),
-                vmem_limit_bytes=self.vmem_limit_bytes,
             )
 
             return result, updated_kv_cache_fused
@@ -516,21 +527,15 @@ class FlashAttention(AttentionBackend):
             q.reshape(q.shape[0], -1, self.head_dim),
             k.reshape(k.shape[0], -1, self.head_dim),
             v.reshape(v.shape[0], -1, self.head_dim),
-            kv_cache_fused_paged,
+            kv_cache_fused,
             self.forward_metadata.seq_lens,
             page_indices_arg,
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
             self.forward_metadata.custom_mask,
+            attention_sink,
         )
-        pad_width = (self.head_dim + 127) // 128 * 128 - self.head_dim
-        if pad_width > 0:
-            updated_kv_cache_fused = jnp.pad(
-                updated_kv_cache_fused,
-                ((0, 0), (0, 0), (0, pad_width)),
-                mode="constant",
-            )
 
         return (
             attn_output.reshape(q.shape[0], -1),

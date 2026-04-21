@@ -637,6 +637,8 @@ class TokenizerManager:
         host_tracer_level: int | None = None,
         python_tracer_level: int | None = None,
         stage_id: int | None = None,
+        profile_by_stage: bool = False,
+        profile_stages: list[str] | None = None,
     ):
         self.auto_create_handle_loop()
         req = ProfileReq(
@@ -648,12 +650,19 @@ class TokenizerManager:
             python_tracer_level=python_tracer_level,
             profile_id=str(time.time()),
             stage_id=stage_id,
+            profile_by_stage=profile_by_stage,
+            profile_stages=profile_stages,
         )
         return await self._execute_profile(req)
 
     async def stop_profile(self):
         self.auto_create_handle_loop()
         req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
+        return await self._execute_profile(req)
+
+    async def get_profile_status(self):
+        self.auto_create_handle_loop()
+        req = ProfileReq(type=ProfileReqType.GET_STATUS)
         return await self._execute_profile(req)
 
     async def _execute_profile(self, req: ProfileReq):

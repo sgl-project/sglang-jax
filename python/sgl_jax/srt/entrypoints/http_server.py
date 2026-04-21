@@ -384,6 +384,8 @@ async def start_profile_async(obj: ProfileReqInput | None = None):
         host_tracer_level=obj.host_tracer_level,
         python_tracer_level=obj.python_tracer_level,
         stage_id=obj.stage_id,
+        profile_by_stage=obj.profile_by_stage,
+        profile_stages=obj.profile_stages,
     )
     return Response(
         content="Start profiling.\n",
@@ -399,6 +401,13 @@ async def stop_profile_async():
         content="Stop profiling. This will take some time.\n",
         status_code=200,
     )
+
+
+@app.api_route("/profile_status", methods=["GET"])
+async def profile_status_async():
+    """Get profiling status. Returns {"status": "in_progress"} or {"status": "idle"}."""
+    result = await _global_state.tokenizer_manager.get_profile_status()
+    return ORJSONResponse(content={"status": result.message})
 
 
 @app.api_route("/start_trace", methods=["GET", "POST"])

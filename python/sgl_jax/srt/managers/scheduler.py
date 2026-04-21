@@ -485,19 +485,19 @@ class Scheduler(
         server_args = self.server_args
         self.req_to_token_pool, self.token_to_kv_pool_allocator = self.tp_worker.get_memory_pool()
 
-        if server_args.chunked_prefill_size is not None and server_args.disable_radix_cache:
-            self.tree_cache = ChunkCache(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                page_size=self.page_size,
-            )
-        elif self.is_hybrid:
+        if self.is_hybrid:
             self.tree_cache = SWARadixCache(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 sliding_window_size=self.sliding_window_size,
                 page_size=self.page_size,
                 disable=server_args.disable_radix_cache,
+            )
+        elif server_args.chunked_prefill_size is not None and server_args.disable_radix_cache:
+            self.tree_cache = ChunkCache(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                page_size=self.page_size,
             )
         else:
             self.tree_cache = RadixCache(
@@ -1040,8 +1040,8 @@ class Scheduler(
     def check_memory(self):
         if self.is_hybrid:
             (
-                full_num_used,
-                swa_num_used,
+                _,
+                _,
                 _,
                 _,
                 full_available_size,
@@ -1049,19 +1049,30 @@ class Scheduler(
                 swa_available_size,
                 swa_evictable_size,
             ) = self._get_swa_token_info()
-            # Strict mode: require perfect accounting with no tolerance
+            # Invariant: available + evictable + protected == total
             full_protected = self.tree_cache.full_protected_size()
             swa_protected = self.tree_cache.swa_protected_size()
-            memory_leak = full_num_used != 0 or swa_num_used != 0
+            full_total = full_available_size + full_evictable_size + full_protected
+            swa_total = swa_available_size + swa_evictable_size + swa_protected
+            full_leak = full_total != self.full_tokens_per_layer
+            swa_leak = swa_total != self.swa_tokens_per_layer
+            memory_leak = full_leak or swa_leak
             token_msg = (
-                f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, full_protected={full_protected} (used={full_num_used})\n"
-                f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, swa_protected={swa_protected} (used={swa_num_used})\n"
+                f"[full] total={self.full_tokens_per_layer}, {full_available_size=}, "
+                f"{full_evictable_size=}, {full_protected=}\n"
+                f"[swa] total={self.swa_tokens_per_layer}, {swa_available_size=}, "
+                f"{swa_evictable_size=}, {swa_protected=}\n"
             )
         else:
             _, _, available_size, evictable_size = self._get_token_info()
             protected_size = self.tree_cache.protected_size()
-            memory_leak = (available_size + evictable_size) != self.max_total_num_tokens
-            token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+            memory_leak = (
+                available_size + evictable_size + protected_size
+            ) != self.max_total_num_tokens
+            token_msg = (
+                f"total={self.max_total_num_tokens}, {available_size=}, "
+                f"{evictable_size=}, {protected_size=}\n"
+            )
 
         if memory_leak:
             msg = f"token_to_kv_pool_allocator memory leak detected! {token_msg}"

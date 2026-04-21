@@ -1,17 +1,21 @@
 import jax
 import jax.numpy as jnp
 
+from sgl_jax.srt.kernels.ragged_paged_attention.util import get_dtype_packing
 from sgl_jax.srt.utils import cdiv
 
 
 def create_kv_cache_data(
     max_kv_cache_tokens, head_num, head_dim, page_size=128, dtype=jnp.bfloat16, seed=42
 ):
+    packing = get_dtype_packing(dtype)
     key = jax.random.PRNGKey(seed)
     keys = jax.random.split(key, 3)
     total_num_pages = cdiv(max_kv_cache_tokens, page_size)
     kv_cache = jax.random.normal(
-        keys[1], (total_num_pages, page_size, head_num * 2, head_dim), dtype=dtype
+        keys[1],
+        (total_num_pages, page_size, head_num * 2 // packing, packing, head_dim),
+        dtype=dtype,
     )
     return kv_cache
 
@@ -152,7 +156,7 @@ def create_decode_uniform_data(
         batch_size, total_kv_lens, seq_lens, max_context_len, page_size=page_size
     )
     num_seqs = jnp.array([batch_size], dtype=jnp.int32)
-    distribution = jnp.array([0, 0, batch_size], dtype=jnp.int32)
+    distribution = jnp.array([batch_size, batch_size, batch_size], dtype=jnp.int32)
     return (
         q,
         k,
