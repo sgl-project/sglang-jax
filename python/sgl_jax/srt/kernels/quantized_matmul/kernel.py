@@ -10,6 +10,7 @@ from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
     get_safe_blockwise_tuned_value,
     should_use_blockwise_kernel,
 )
+from sgl_jax.srt.utils.parallel_utils import should_scatter
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor_simple
 
 
@@ -22,6 +23,7 @@ def xla_quantized_matmul_local(
     compute_dtype: jnp.dtype | None = None,
     weight_block_size: tuple[int, int] | None = None,
     activation_quant_dtype: jnp.dtype | None = None,
+    output_scatter_dimension: int | None = None,
 ) -> jax.Array:
     """
     Local quantized matmul for use inside shard_map.
@@ -124,6 +126,14 @@ def xla_quantized_matmul_local(
     out = out.astype(out_dtype)
     # Sum partial results across devices (single all-reduce)
     if reduce_axis is not None:
-        out = lax.psum(out, axis_name=reduce_axis)
+        mesh = jax.sharding.get_abstract_mesh()
+        if output_scatter_dimension is not None and should_scatter(
+            out.shape[output_scatter_dimension], mesh.shape[reduce_axis]
+        ):
+            out = lax.psum_scatter(
+                out, axis_name=reduce_axis, scatter_dimension=output_scatter_dimension, tiled=True
+            )
+        else:
+            out = lax.psum(out, axis_name=reduce_axis)
 
     return out
