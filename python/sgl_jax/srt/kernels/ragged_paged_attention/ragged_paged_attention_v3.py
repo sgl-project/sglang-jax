@@ -1908,7 +1908,7 @@ def ragged_paged_attention(
                 ]
             ),
             input_output_aliases={
-                9: 0,  # q -> output
+                # 9: 0,  # q -> output
                 11: 1,  # kv_cache -> updated_kv_cache
             },
             name=scope_name,
