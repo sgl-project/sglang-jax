@@ -77,9 +77,6 @@ class MLAAttention(nnx.Module):
                 kernel_axes=(None, None),
                 scope_name="q_a_proj",
             )
-            # dtype=bf16 forces RMSNorm output back to bf16 (it would otherwise
-            # promote to fp32 via the fp32 scale param), so QuantizedLinear
-            # downstream stays in bf16.
             self.q_a_layernorm = RMSNorm(q_lora_rank, dtype=dtype)
             self.q_b_proj = LinearBase(
                 q_lora_rank,
