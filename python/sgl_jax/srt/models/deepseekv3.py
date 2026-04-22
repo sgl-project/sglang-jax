@@ -18,7 +18,7 @@ from flax import nnx
 from jax import numpy as jnp
 from transformers import PretrainedConfig
 
-from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
+from sgl_jax.srt.configs.model_config import AttentionArch, ModelConfig, MoEBackend
 from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
 from sgl_jax.srt.layers.attention.mla import MLAAttention
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
@@ -390,6 +390,17 @@ class DeepseekV3Model(nnx.Module):
 
 
 class DeepseekV3ForCausalLM(nnx.Module):
+    @classmethod
+    def patch_model_config(cls, mc: ModelConfig) -> None:
+        # MLA: Q/K head dim is qk_nope + qk_rope; V head dim differs (v_head_dim).
+        # Override the generic head_dim so the attention backend and KV pool
+        # allocate MLA-shaped buffers.
+        mc.attention_arch = AttentionArch.MLA
+        qk_nope = getattr(mc.hf_text_config, "qk_nope_head_dim", 0)
+        qk_rope = getattr(mc.hf_text_config, "qk_rope_head_dim", 0)
+        if qk_nope and qk_rope:
+            mc.head_dim = qk_nope + qk_rope
+
     def __init__(
         self,
         config: PretrainedConfig,

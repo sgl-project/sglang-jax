@@ -172,18 +172,8 @@ class ModelConfig:
             "head_dim",
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
         )
-        # TODO (qinghan): add the model architecture detection later, for now use deepseek
-        if any("Deepseek" in arch for arch in self.hf_config.architectures):
-            self.attention_arch = AttentionArch.MLA
-            # MLA uses qk_nope_head_dim + qk_rope_head_dim as the effective head_dim
-            # for Q/K (and V is padded to match). Override the config-level head_dim
-            # so the attention backend allocates the correct shapes.
-            qk_nope = getattr(self.hf_text_config, "qk_nope_head_dim", 0)
-            qk_rope = getattr(self.hf_text_config, "qk_rope_head_dim", 0)
-            if qk_nope and qk_rope:
-                self.head_dim = qk_nope + qk_rope
-        else:
-            self.attention_arch = AttentionArch.MHA
+        self.attention_arch = AttentionArch.MHA
+        self._apply_model_specific_config()
         self.num_attention_heads = self.hf_text_config.num_attention_heads
         self.num_key_value_heads = getattr(self.hf_text_config, "num_key_value_heads", None)
 
@@ -358,6 +348,25 @@ class ModelConfig:
         # 3. No quantization config found
         logger.info("No quantization config found in HF config or user config")
         return None
+
+    def _apply_model_specific_config(self) -> None:
+        """Invoke the model class's optional `patch_model_config` hook so model
+        files can own their own config overrides (attention_arch, head_dim,
+        MLA-specific dims, etc.) instead of a centralized if/elif chain here.
+
+        Runs during ModelConfig construction — before ModelRunner reads
+        `attention_arch` for backend selection — so patches land in time.
+        Import is lazy because model modules import ModelConfig back.
+        """
+        from sgl_jax.srt.models.registry import ModelRegistry
+
+        try:
+            model_cls, _ = ModelRegistry.resolve_model_cls(self.hf_config.architectures)
+        except ValueError:
+            return
+        patch = getattr(model_cls, "patch_model_config", None)
+        if patch is not None:
+            patch(self)
 
     @staticmethod
     def from_server_args(
