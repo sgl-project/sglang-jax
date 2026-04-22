@@ -326,6 +326,7 @@ Where we diverge from each reference and why:
 - [ ] Wire dispatch in `model_runner.py` (§3.10).
 - [ ] Pad `r_dim=64` → 128 inside `MLAAttentionBackend`.
 - [ ] Unit tests for pool (shape, set/get, pytree round-trip, `get_kv_size_bytes`) and backend (kernel call, shard_map specs, decode + extend parity vs. a naive reference).
+- [ ] Unit test for the MLA backend (mirror of [test_flashattention.py](../../python/sgl_jax/test/test_flashattention.py)) verifying `ForwardBatch` compatibility and numerical accuracy.
 
 ## 5. Additional notes
 
