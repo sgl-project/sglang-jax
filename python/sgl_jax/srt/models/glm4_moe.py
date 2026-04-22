@@ -10,7 +10,7 @@ from transformers import PretrainedConfig
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
 from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
-from sgl_jax.srt.layers.layernorm import RMSNorm
+from sgl_jax.srt.layers.layernorm import RMSNorm, rmsnorm_forward
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import (
@@ -137,8 +137,8 @@ class Glm4MoeAttention(nnx.Module):
         v = v.reshape(-1, self.kv_head_num, self.head_dim)
 
         if self.use_qk_norm:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+            q = rmsnorm_forward(q, None, self.q_norm.scale, self.q_norm.epsilon)
+            k = rmsnorm_forward(k, None, self.k_norm.scale, self.k_norm.epsilon)
 
         q, k = self.rotary_emb(positions, q, k)
         attn_output, kv_fused = self.attn(
@@ -247,7 +247,7 @@ class Glm4MoeDecoderLayer(nnx.Module):
             self.is_moe_layer = False
             self.moe_gate = None
         else:
-            router_dtype = jnp.float32
+            router_dtype = getattr(config, "router_dtype", jnp.float32)
             self.moe_gate = GateLogit(
                 input_size=config.hidden_size,
                 num_experts=config.n_routed_experts,
@@ -336,14 +336,23 @@ class Glm4MoeDecoderLayer(nnx.Module):
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
         dispatch_info: ExpertLocationMetadata | None = None,
+        token_valid_mask: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = rmsnorm_forward(
+                hidden_states,
+                None,
+                self.input_layernorm.scale,
+                self.input_layernorm.epsilon,
+            )
         else:
-            hidden_states += residual
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states, residual = rmsnorm_forward(
+                hidden_states,
+                residual,
+                self.input_layernorm.scale,
+                self.input_layernorm.epsilon,
+            )
 
         hidden_states, kv_fused = self.self_attn(
             positions=positions,
@@ -351,9 +360,13 @@ class Glm4MoeDecoderLayer(nnx.Module):
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
         )
-        hidden_states += residual
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+
+        hidden_states, residual = rmsnorm_forward(
+            hidden_states,
+            residual,
+            self.post_attention_layernorm.scale,
+            self.post_attention_layernorm.epsilon,
+        )
 
         if self.is_moe_layer:
             if self.shared_experts is not None:
@@ -369,8 +382,7 @@ class Glm4MoeDecoderLayer(nnx.Module):
                 dispatch_info=dispatch_info,
             )
 
-            if self.use_fused:
-                token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+            if self.use_fused and token_valid_mask is not None:
                 topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
 
             hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
@@ -428,6 +440,9 @@ class Glm4MoeModel(nnx.Module):
         residual = None
         layers_kv_fused = []
         layers_topk_ids = []
+        
+        token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+        
         for layer in self.layers:
             hidden_states, residual, kv_fused, topk_ids = layer(
                 forward_batch.positions,
@@ -436,14 +451,20 @@ class Glm4MoeModel(nnx.Module):
                 token_to_kv_pool,
                 residual,
                 dispatch_info=forward_batch.expert_location_metadata,
+                token_valid_mask=token_valid_mask,
             )
             layers_kv_fused.append(kv_fused)
             layers_topk_ids.append(topk_ids)
 
         if residual is not None:
-            hidden_states += residual
-
-        hidden_states = self.norm(hidden_states)
+            hidden_states, _ = rmsnorm_forward(
+                hidden_states, residual, self.norm.scale, self.norm.epsilon
+            )
+        else:
+            hidden_states = rmsnorm_forward(
+                hidden_states, None, self.norm.scale, self.norm.epsilon
+            )
+            
         return hidden_states, layers_kv_fused, layers_topk_ids
 
 class Glm4MoeForCausalLM(nnx.Module):
