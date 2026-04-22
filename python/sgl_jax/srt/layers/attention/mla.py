@@ -77,11 +77,10 @@ class MLAAttention(nnx.Module):
                 kernel_axes=(None, None),
                 scope_name="q_a_proj",
             )
-            # param_dtype=fp32 keeps norm stats stable; dtype=<compute dtype>
-            # casts the output back so downstream QuantizedLinear (which
-            # preserves input dtype) returns bf16 instead of fp32, matching
-            # LinearBase's preferred_element_type=params_dtype behavior.
-            self.q_a_layernorm = RMSNorm(q_lora_rank, param_dtype=jnp.float32, dtype=dtype)
+            # dtype=bf16 forces RMSNorm output back to bf16 (it would otherwise
+            # promote to fp32 via the fp32 scale param), so QuantizedLinear
+            # downstream stays in bf16.
+            self.q_a_layernorm = RMSNorm(q_lora_rank, dtype=dtype)
             self.q_b_proj = LinearBase(
                 q_lora_rank,
                 num_heads * self.qk_head_dim,
@@ -101,7 +100,7 @@ class MLAAttention(nnx.Module):
             kernel_axes=(None, None),
             scope_name="kv_a_proj",
         )
-        self.kv_a_layernorm = RMSNorm(kv_lora_rank, param_dtype=jnp.float32, dtype=dtype)
+        self.kv_a_layernorm = RMSNorm(kv_lora_rank, dtype=dtype)
         self.kv_b_proj = LinearBase(
             kv_lora_rank,
             num_heads * (qk_nope_head_dim + v_head_dim),
