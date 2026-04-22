@@ -654,6 +654,11 @@ class TestMultiRequestIsolation:
             positions_both = jnp.array([0, 0], dtype=jnp.int32)
             out_both, s_both = module(positions_both, hidden_both, fb, state_both)
 
+        # Materialize to host before slicing — Explicit-axis mesh + LinearBase's
+        # P("data", ...) output sharding makes device-side fancy slicing ambiguous.
+        out_both = np.asarray(out_both)
+        s_both = np.asarray(s_both)
+
         # fused_recurrent_simple_gla uses jax.lax.scan — no cross-batch
         # interaction, so B=1 vs B=2 results are mathematically identical.
         # However, XLA generates different tiling for [1,H,K,V] vs [2,H,K,V],
@@ -751,6 +756,11 @@ class TestMultiRequestIsolation:
             state_both_init = jnp.zeros((2, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16)
             fb_ext_both = _make_forward_batch(ForwardMode.EXTEND, linear_attn_metadata=meta_both)
             out_both, s_both = module_both(pos_both, h_both, fb_ext_both, state_both_init)
+
+        # Materialize to host before slicing — Explicit-axis mesh + LinearBase's
+        # P("data", ...) output sharding makes device-side fancy slicing ambiguous.
+        out_both = np.asarray(out_both)
+        s_both = np.asarray(s_both)
 
         # Output tolerance: TPU bf16 matmul uses different tiling strategies for
         # different matrix dimensions.  Single-request (T=128) vs batched (T=256)
@@ -931,6 +941,11 @@ class TestMultiRequestIsolation:
             state_both_init = jnp.zeros((2, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16)
             fb_ext_both = _make_forward_batch(ForwardMode.EXTEND, linear_attn_metadata=meta_both)
             out_both, s_both = module_both(pos_both, h_both, fb_ext_both, state_both_init)
+
+        # Materialize to host before slicing — Explicit-axis mesh + LinearBase's
+        # P("data", ...) output sharding makes device-side fancy slicing ambiguous.
+        out_both = np.asarray(out_both)
+        s_both = np.asarray(s_both)
 
         # Same tolerance rationale as test_prefill_multi_request_isolation:
         # output atol=1.0 for TPU bf16 dense matmul tiling divergence,

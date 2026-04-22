@@ -2061,6 +2061,25 @@ class ScheduleBatch:
 
         # input_embedding = None
 
+        # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
+        # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
+        if self.return_logprob:
+            top_logprobs_nums = [0] * total_bs
+            token_ids_logprobs: list[list[int] | None] = [None] * total_bs
+            offset_bs = 0
+            for dp_rank in range(self.dp_size):
+                info = self.reqs_info[dp_rank]
+                if info.seq_lens is not None and len(info.seq_lens) > 0:
+                    dp_bs = len(info.seq_lens)
+                    if info.top_logprobs_nums is not None:
+                        top_logprobs_nums[offset_bs : offset_bs + dp_bs] = info.top_logprobs_nums
+                    if info.token_ids_logprobs is not None:
+                        token_ids_logprobs[offset_bs : offset_bs + dp_bs] = info.token_ids_logprobs
+                offset_bs += per_dp_bs_padding
+        else:
+            top_logprobs_nums = None
+            token_ids_logprobs = None
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -2071,8 +2090,8 @@ class ScheduleBatch:
             out_cache_loc=out_cache_loc_cpu,
             return_logprob=self.return_logprob,
             return_output_logprob_only=self.return_output_logprob_only,
-            top_logprobs_nums=None,  # TODO: @Brian pad logprob info
-            token_ids_logprobs=None,  # TODO
+            top_logprobs_nums=top_logprobs_nums,
+            token_ids_logprobs=token_ids_logprobs,
             sampling_info=sampling_info,
             positions=positions_cpu,
             mrope_positions=None,
@@ -2680,6 +2699,9 @@ class ModelWorkerSamplingInfo:
         else:
             sampling_seeds = None
 
+        num_int32_per_vocab = (vocab_size + 31) // 32
+        vocab_mask = np.zeros((bs, num_int32_per_vocab), dtype=np.int32)
+
         ret = cls(
             temperatures=temperatures.reshape(-1, 1),
             top_ps=top_ps,
@@ -2694,11 +2716,32 @@ class ModelWorkerSamplingInfo:
             sampling_seeds=sampling_seeds,
             penalizer_orchestrator=None,
             linear_penalty=None,
+            vocab_mask=vocab_mask,
         )
         return ret
 
     def update_penalties(self):
         self.linear_penalty = None
+
+    def update_grammar_vocab_mask(self):
+        """Update vocabulary masks from grammars before sampling."""
+        if not self.grammars:
+            self.vocab_mask = None
+            return
+
+        first_grammar = next((g for g in self.grammars if g), None)
+        if first_grammar is None:
+            self.vocab_mask = None
+            return
+
+        self.vocab_mask = first_grammar.allocate_vocab_mask(
+            vocab_size=self.vocab_size,
+            batch_size=len(self.temperatures),
+        )
+
+        for i, grammar in enumerate(self.grammars):
+            if grammar and not grammar.finished and not grammar.is_terminated():
+                grammar.fill_vocab_mask(self.vocab_mask, i)
 
 
 @dataclasses.dataclass

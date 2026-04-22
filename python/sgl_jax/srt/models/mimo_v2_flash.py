@@ -256,9 +256,19 @@ class MiMoV2Attention(nnx.Module):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        q = q.reshape(-1, self.q_head_num, self.head_dim)
-        k = k.reshape(-1, k.shape[-1] // self.head_dim, self.head_dim)
-        v = v.reshape(-1, v.shape[-1] // self.v_head_dim, self.v_head_dim)
+        q = q.reshape(-1, self.q_head_num, self.head_dim, out_sharding=P("data", "tensor", None))
+        k = k.reshape(
+            -1,
+            k.shape[-1] // self.head_dim,
+            self.head_dim,
+            out_sharding=P("data", "tensor", None),
+        )
+        v = v.reshape(
+            -1,
+            v.shape[-1] // self.v_head_dim,
+            self.v_head_dim,
+            out_sharding=P("data", "tensor", None),
+        )
         # Pad V to match Q/K head_dim for fused KV cache
         if self.v_head_dim != self.head_dim:
             pad_size = self.head_dim - self.v_head_dim

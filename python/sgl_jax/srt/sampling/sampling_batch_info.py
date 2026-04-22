@@ -480,26 +480,3 @@ class SamplingBatchInfo:
         """
         if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
             self.penalizer_orchestrator.cumulate_output_tokens(output_ids)
-
-    def update_grammar_vocab_mask(self):
-        """Update vocabulary masks from grammars before sampling."""
-        if not self.grammars:
-            self.vocab_mask = None
-            return
-
-        # Find first non-None grammar from the list
-        first_grammar = next((g for g in self.grammars if g), None)
-        if first_grammar is None:
-            self.vocab_mask = None
-            return
-
-        # Allocate bitmask using the grammar object's method
-        self.vocab_mask = first_grammar.allocate_vocab_mask(
-            vocab_size=self.vocab_size,
-            batch_size=len(self.temperatures),
-        )
-
-        # Fill mask for each request with active grammar
-        for i, grammar in enumerate(self.grammars):
-            if grammar and not grammar.finished and not grammar.is_terminated():
-                grammar.fill_vocab_mask(self.vocab_mask, i)

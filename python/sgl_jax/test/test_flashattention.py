@@ -12,7 +12,12 @@ from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import
 from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
-from sgl_jax.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
+from sgl_jax.srt.mem_cache.memory_pool import (
+    KVCache,
+    MHATokenToKVPool,
+    _set_fused_kv_buffer,
+    merge_kv,
+)
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.speculative.eagle_util import EagleVerifyInput
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -102,8 +107,11 @@ def write_prefix_tokens_for_kv(forward_batch, token_to_kv_pool: KVCache, lens, k
     """Write prefix tokens to KV cache and return extend tokens.
 
     k, v should be numpy arrays (or unsharded JAX arrays) to allow safe slicing.
+    Prefix data is resharded to match KV cache sharding before writing.
     """
     page_size = forward_batch.attn_backend.page_size
+    # 5D fused KV cache sharding: P(data, None, tensor, None, None)
+    kv_sharding = token_to_kv_pool.kv_sharding
 
     # Use aligned positions for k/v indexing since k/v arrays are created with alignment gaps
     seq_lens_np = np.asarray(forward_batch.seq_lens)
@@ -118,6 +126,9 @@ def write_prefix_tokens_for_kv(forward_batch, token_to_kv_pool: KVCache, lens, k
     k_np = np.asarray(k)
     v_np = np.asarray(v)
 
+    # loc is sharded by data axis only (1D)
+    loc_sharding = NamedSharding(kv_sharding.mesh, P(kv_sharding.spec[0]))
+
     for i, (q_len, kv_len) in enumerate(lens):
         start = int(aligned_cache_loc_idx[i])
         prefix_end = start + (kv_len - q_len)
@@ -125,12 +136,25 @@ def write_prefix_tokens_for_kv(forward_batch, token_to_kv_pool: KVCache, lens, k
         extend_end = start + kv_len
 
         if kv_len > q_len:
-            # write prefix tokens - set_kv_buffer accepts 3D k/v and handles
-            # merge_kv + reshape to 5D fused format internally
+            # Build fused 5D KV [tokens, 1, heads*2//packing, packing, head_dim]
+            prefix_k_3d = jnp.array(k_np[start:prefix_end], dtype=k.dtype)
+            prefix_v_3d = jnp.array(v_np[start:prefix_end], dtype=v.dtype)
+            prefix_fused = merge_kv(prefix_k_3d, prefix_v_3d)
+            prefix_fused = jax.device_put(prefix_fused, kv_sharding)
+
             prefix_cache_loc = jnp.array(cache_loc_np[start:prefix_end], dtype=jnp.int32)
-            prefix_k = jnp.array(k_np[start:prefix_end], dtype=k.dtype)
-            prefix_v = jnp.array(v_np[start:prefix_end], dtype=v.dtype)
-            token_to_kv_pool.set_kv_buffer(0, prefix_cache_loc, prefix_k, prefix_v)
+            prefix_cache_loc = jax.device_put(prefix_cache_loc, loc_sharding)
+
+            # Update fused KV cache directly via 5D path
+            token_to_kv_pool.kv_buffer[0] = _set_fused_kv_buffer(
+                fused_kv=prefix_fused,
+                loc=prefix_cache_loc,
+                kv_cache=token_to_kv_pool.kv_buffer[0],
+                page_size=token_to_kv_pool.page_size,
+                kv_partition_axis=token_to_kv_pool.kv_partition_axis,
+                attention_data_partition_axis=token_to_kv_pool.attention_data_partition_axis,
+                mesh=token_to_kv_pool.mesh,
+            )
 
         extend_k.append(k_np[extend_start:extend_end])
         extend_v.append(v_np[extend_start:extend_end])
@@ -298,8 +322,12 @@ def create_test_data(
         token_ids_logprobs=None,
         extend_logprob_start_lens=None,
         extend_input_logprob_token_ids=None,
+        logits_indices=np.asarray(extend_seq_lens),
         real_bs=seq_lens.shape[0],
+        real_bs_per_dp=[seq_lens.shape[0]],
         spec_info=spec_info,
+        dp_size=1,
+        per_dp_bs_size=seq_lens.shape[0],
     )
 
     fb = ForwardBatch(
@@ -323,9 +351,7 @@ def create_test_data(
 
         fb.attn_backend.forward_metadata.custom_mask = device_array(
             (fb.spec_info.custom_mask),
-            sharding=(
-                NamedSharding(attention_backend.mesh, P()) if jax.process_count() == 1 else None
-            ),
+            sharding=(NamedSharding(attention_backend.mesh, P())),
         )
     return fb, current_kv_cache, q, k, v
 

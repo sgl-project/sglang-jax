@@ -510,13 +510,19 @@ class MHATokenToKVPool(KVCache):
         )
 
         safe_loc = jnp.where(loc >= 0, loc, jnp.int32(total_cache_tokens))
-        updated_3d = cache_3d.at[safe_loc].set(fused_kv_3d, mode="drop")
+        updated_3d = cache_3d.at[safe_loc].set(
+            fused_kv_3d,
+            mode="drop",
+            out_sharding=P(None, self.kv_partition_axis, None),
+        )
 
         # Reshape back to 5D
         return jax.lax.reshape(
             updated_3d,
             (num_pages, page_size, heads_x2_per_pack, packing, head_dim),
-            out_sharding=P(None, None, self.kv_partition_axis, None, None),
+            out_sharding=P(
+                self.attention_data_partition_axis, None, self.kv_partition_axis, None, None
+            ),
         )
 
 

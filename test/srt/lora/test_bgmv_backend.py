@@ -369,7 +369,9 @@ class TestBgmvLoRABackend(CustomTestCase):
             extend_prefix_lens=None,
             extend_logprob_start_lens=None,
             extend_input_logprob_token_ids=None,
+            logits_indices=np.array(seq_lengths, dtype=np.int32),
             real_bs=batch_size,
+            real_bs_per_dp=[batch_size],
         )
 
     def stack_lora_weights(
