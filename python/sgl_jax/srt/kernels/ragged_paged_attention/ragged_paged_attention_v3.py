@@ -1496,7 +1496,9 @@ def get_default_block_sizes(
         case 5 | 6:
             if case == RpaCase.DECODE:
                 bq_sz = 1
-                bkv_sz = min(min_bkv_sz_to_peak, max_kv) if sliding_window is None else page_size
+                bkv_sz = (
+                    min(min_bkv_sz_to_peak, max_kv) if sliding_window is None else sliding_window
+                )
                 bq_csz = 1
                 bkv_csz = bkv_sz
             else:
@@ -1507,7 +1509,9 @@ def get_default_block_sizes(
         case 7:
             if case == RpaCase.DECODE:
                 bq_sz = 1
-                bkv_sz = min(min_bkv_sz_to_peak, max_kv)
+                bkv_sz = (
+                    min(min_bkv_sz_to_peak, max_kv) if sliding_window is None else sliding_window
+                )
                 bq_csz = 1
                 bkv_csz = bkv_sz
             else:
