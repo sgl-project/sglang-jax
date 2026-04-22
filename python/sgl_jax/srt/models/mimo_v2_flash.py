@@ -265,6 +265,8 @@ class MiMoV2Attention(nnx.Module):
             v = jnp.pad(v, ((0, 0), (0, 0), (0, pad_size)))
 
         q, k = self.rotary_emb(positions, q, k)
+        if self.attention_value_scale is not None:
+            v = v * self.attention_value_scale
 
         attn_output, kv_fused = self.attn(
             q,
@@ -284,9 +286,6 @@ class MiMoV2Attention(nnx.Module):
                 attn_output = attn_output.reshape(-1, self.q_head_num, padded_head_dim)
                 attn_output = attn_output[..., : self.v_head_dim]
                 attn_output = attn_output.reshape(-1, expected_v_head_dim)
-
-        if self.attention_value_scale is not None:
-            attn_output = attn_output * self.attention_value_scale
 
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
