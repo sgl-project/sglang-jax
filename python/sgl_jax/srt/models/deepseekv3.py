@@ -412,14 +412,13 @@ class DeepseekV3ForCausalLM(nnx.Module):
         self.dtype = dtype
         self.model = DeepseekV3Model(config, mesh=mesh, dtype=dtype)
 
-        if not getattr(config, "tie_word_embeddings", False):
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                dtype=dtype,
-                param_dtype=dtype,
-                kernel_axes=("tensor", None),
-            )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            dtype=dtype,
+            param_dtype=dtype,
+            kernel_axes=("tensor", None),
+        )
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh)
 
     def __call__(
@@ -431,12 +430,7 @@ class DeepseekV3ForCausalLM(nnx.Module):
         hidden_states, layers_kv_fused, layers_topk_ids = self.model(
             forward_batch, token_to_kv_pool
         )
-        if not getattr(self.config, "tie_word_embeddings", False):
-            output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
-        else:
-            output = self.logits_processor(
-                hidden_states, self.model.embed_tokens, logits_metadata
-            )
+        output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         return output, layers_kv_fused, True, layers_topk_ids
 
     def load_weights(self, model_config: ModelConfig):
@@ -465,14 +459,12 @@ class DeepseekV3ForCausalLM(nnx.Module):
                 sharding=(None,),
                 transpose=False,
             ),
-        }
-
-        if not getattr(self.config, "tie_word_embeddings", False):
-            mappings["lm_head.weight"] = WeightMapping(
+            "lm_head.weight": WeightMapping(
                 target_path="lm_head.embedding",
                 sharding=("tensor", None),
                 transpose=False,
-            )
+            ),
+        }
 
         n_routed_experts = getattr(self.config, "n_routed_experts", None)
         first_k_dense_replace = getattr(self.config, "first_k_dense_replace", 0)
