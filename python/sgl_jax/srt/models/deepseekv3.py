@@ -408,10 +408,6 @@ class DeepseekV3ForCausalLM(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
     ):
         self.mesh = mesh
-        # TEMP: short-run accuracy parity with GPU golden — restrict to first 4
-        # layers so we cover both dense (0-2) and MoE (3) paths without needing
-        # the full 671B checkpoint.
-        config.num_hidden_layers = 4
         self.config = config
         self.dtype = dtype
         self.model = DeepseekV3Model(config, mesh=mesh, dtype=dtype)
