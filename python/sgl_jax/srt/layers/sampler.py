@@ -163,6 +163,7 @@ class Sampler(nnx.Module):
         logits_output: LogitsProcessorOutput,
         sampling_metadata: SamplingMetadata,
         use_sort_for_toppk_minp: bool,
+        rng_override: jax.Array | None = None,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
@@ -188,7 +189,7 @@ class Sampler(nnx.Module):
             (logits, sampling_metadata.vocab_mask),
         )
 
-        _, rng = jax.random.split(self.rngs.params())
+        _, rng = jax.random.split(rng_override if rng_override is not None else self.rngs.params())
         operands = (logits, sampling_metadata, rng)
         regular_fn = lambda op: self._regular_sampling((*op, use_sort_for_toppk_minp))
         batch_next_token_ids, logprobs = lax.cond(

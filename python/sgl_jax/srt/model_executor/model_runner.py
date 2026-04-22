@@ -151,6 +151,7 @@ class ModelRunner(BaseModelRunner):
             self.init_lora_manager()
 
         if not self.is_draft_worker:
+            self._sampler_rng = jax.random.PRNGKey(server_args.random_seed)
             self.initialize_jit()
 
         # Init memory pool and attention backends
@@ -226,12 +227,15 @@ class ModelRunner(BaseModelRunner):
             sampler_state_def,
             sampler_state_leaves,
             use_sort_for_toppk_minp,
+            rng_key,
             *args,
         ):
 
             model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
-            return sampler(*args, use_sort_for_toppk_minp=use_sort_for_toppk_minp)
+            return sampler(
+                *args, use_sort_for_toppk_minp=use_sort_for_toppk_minp, rng_override=rng_key
+            )
 
         @partial(jax.jit, static_argnames=["mesh"])
         def jitted_compute_logprobs(mesh, logits, next_tokens):
@@ -728,8 +732,11 @@ class ModelRunner(BaseModelRunner):
         Returns:
             A list of next_token_ids
         """
+        # Split the RNG key so each call gets a unique key
+        self._sampler_rng, rng = jax.random.split(self._sampler_rng)
         # Penalty application has been moved to the Sampler for better JIT performance
         return self.jitted_sampler(
+            rng,
             logits_output,
             sampling_metadata,
         )
