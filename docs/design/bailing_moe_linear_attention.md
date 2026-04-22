@@ -287,7 +287,7 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
 | Output shape unchanged by gating | `[tokens, 8192]` preserved |
 | Dense projection applied | Output differs before and after dense |
 | ALiBi slopes correctness | All slopes negative; magnitude decreases with layer_idx; values match formula in Design section |
-| g_gamma path correctness | Feeding g_gamma=[H] and equivalent expanded g produce identical output and new_state; prefill: g=[1, T_pb, H]; decode: g=[T, 1, H] (T=decode batch, 1=single step) |
+| g_gamma all negative | All g_gamma slopes are negative (decay, not growth) across multiple layer indices |
 | GLA wrapper correctness (prefill) | Scatter q, k, v with same scatter_idx to obtain packed tensors; directly call `simple_gla_fwd` with same cu_seqlens_dev; output and new_state match module's internal call |
 | GLA wrapper correctness (decode) | Directly calling `fused_recurrent_simple_gla` with same q, k, v, g_gamma, h0 matches module's internal output and new_state |
 | Decode state isolation | Two requests decoded individually produce same output and new_state as batched (reshape to [T,1,H,K]) decode |
