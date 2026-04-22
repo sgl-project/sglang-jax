@@ -524,6 +524,7 @@ class SWAKVPool(KVCache):
         swa_attention_layer_ids: list[int],
         full_attention_layer_ids: list[int],
         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        swa_head_num: int | None = None,
         **kwargs,
     ):
         self.size = size
@@ -532,12 +533,18 @@ class SWAKVPool(KVCache):
         self.full_layer_nums = len(full_attention_layer_ids)
         self.mesh = kwargs["mesh"]
         self.kv_partition_axis = "tensor"
-        kwargs["page_size"] = 1
+
+        # If SWA layers have different KV head count, create separate kwargs
+        if swa_head_num is not None and swa_head_num != kwargs.get("head_num"):
+            swa_kwargs = dict(kwargs)
+            swa_kwargs["head_num"] = swa_head_num
+        else:
+            swa_kwargs = kwargs
 
         self.swa_kv_pool = token_to_kv_pool_class(
             size=size_swa,
             layer_num=self.swa_layer_nums,
-            **kwargs,
+            **swa_kwargs,
         )
         self.full_kv_pool = token_to_kv_pool_class(
             size=size,
@@ -610,6 +617,11 @@ class SWAKVPool(KVCache):
             return self.swa_kv_pool.get_fused_kv_buffer(layer_id_pool)
         return self.full_kv_pool.get_fused_kv_buffer(layer_id_pool)
 
+    def _remap_swa_loc(self, loc):
+        """Remap full-pool locations to SWA-pool locations via the index mapping."""
+        mapping = jnp.asarray(self.full_to_swa_index_mapping)
+        return mapping[loc].astype(jnp.int32)
+
     def set_kv_buffer(
         self,
         layer_id: int,
@@ -621,7 +633,7 @@ class SWAKVPool(KVCache):
         layer_id_pool, is_swa = self.layers_mapping[layer_id]
         if is_swa:
             if self.full_to_swa_index_mapping is not None:
-                loc = self.full_to_swa_index_mapping[loc].to(np.int32)
+                loc = self._remap_swa_loc(loc)
             self.swa_kv_pool.set_kv_buffer(layer_id_pool, loc, cache_k, cache_v, is_decode)
         else:
             self.full_kv_pool.set_kv_buffer(layer_id_pool, loc, cache_k, cache_v, is_decode)

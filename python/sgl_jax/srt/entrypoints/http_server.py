@@ -403,6 +403,13 @@ async def stop_profile_async():
     )
 
 
+@app.api_route("/profile_status", methods=["GET"])
+async def profile_status_async():
+    """Get profiling status. Returns {"status": "in_progress"} or {"status": "idle"}."""
+    result = await _global_state.tokenizer_manager.get_profile_status()
+    return ORJSONResponse(content={"status": result.message})
+
+
 @app.api_route("/start_trace", methods=["GET", "POST"])
 async def start_trace_async(obj: StartTraceReqInput | None = None):
     """Start precision tracing."""

@@ -256,6 +256,12 @@ class ModelConfig:
 
             if quant_method == "fp8":
                 logger.info("Auto-detected FP8 model. Creating QuantizationConfig for static fp8.")
+                ignored_layers = hf_quant_config.get("ignored_layers")
+                weight_block_size = hf_quant_config.get("weight_block_size")
+                if isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2:
+                    weight_block_size = (int(weight_block_size[0]), int(weight_block_size[1]))
+                else:
+                    weight_block_size = None
                 quant_config = QuantizationConfig(
                     is_static_checkpoint=True,
                     linear_rules=[
@@ -267,6 +273,8 @@ class ModelConfig:
                     ],
                     moe_weight_dtype=jnp.float8_e4m3fn,
                     moe_activation_dtype=None,
+                    ignored_layers=ignored_layers,
+                    weight_block_size=weight_block_size,
                 )
                 return quant_config
 
@@ -486,6 +494,19 @@ class ModelConfig:
         else:
             # For MHA models, dynamically add the attribute
             self.hf_text_config.num_key_value_heads = total_kv_heads
+
+        # Handle swa_num_key_value_heads if present (e.g. MiMo models)
+        if hasattr(self.hf_text_config, "swa_num_key_value_heads"):
+            if not hasattr(self, "_original_swa_num_key_value_heads"):
+                self._original_swa_num_key_value_heads = self.hf_text_config.swa_num_key_value_heads
+            from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
+
+            swa_kv_heads_per_device = get_num_kv_heads_by_tp(
+                self._original_swa_num_key_value_heads, tensor_parallel_size
+            )
+            self.hf_text_config.swa_num_key_value_heads = (
+                swa_kv_heads_per_device * tensor_parallel_size
+            )
 
     def get_original_kv_head_id(self, tp_rank: int, tensor_parallel_size: int) -> int:
         """Determine which original KV head this device should use."""

@@ -41,6 +41,7 @@ class FlashAttentionMetadata:
     seq_lens: jax.Array = None
     distribution: jax.Array = None
     custom_mask: jax.Array = None
+    swa_page_indices: jax.Array = None
 
     def tree_flatten(self):
         children = (
@@ -51,6 +52,7 @@ class FlashAttentionMetadata:
             self.seq_lens,
             self.distribution,
             self.custom_mask,
+            self.swa_page_indices,
         )
 
         aux_data = {}
@@ -67,6 +69,7 @@ class FlashAttentionMetadata:
         obj.seq_lens = children[4]
         obj.distribution = children[5]
         obj.custom_mask = children[6]
+        obj.swa_page_indices = children[7]
 
         return obj
 
@@ -96,6 +99,7 @@ class FlashAttention(AttentionBackend):
         self.kv_partition_axis = kv_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
+        self.swa_index_mapping = None
 
     def get_forward_metadata(
         self,
@@ -104,10 +108,19 @@ class FlashAttention(AttentionBackend):
         """Return the metadata for a forward pass."""
         metadata = FlashAttentionMetadata()
 
+        # Stride by page_size to pick one slot per page — O(N/page_size) instead of O(N)
         indices = np.arange(0, len(batch.cache_loc), self.page_size)
-        selected_cache_locs = batch.cache_loc[indices]
-        page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
+        page_indices = (batch.cache_loc[indices] // self.page_size).astype(np.int32)
 
+        # SWA page indices: apply mapping on ~N_pages entries
+        # instead of ~N_tokens entries (page_size x fewer random accesses)
+        swa_page_indices = None
+        swa_mapping = getattr(self, "swa_index_mapping", None)
+        if swa_mapping is not None:
+            swa_slots = swa_mapping[batch.cache_loc[indices]]
+            swa_page_indices = (swa_slots // self.page_size).astype(np.int32)
+
+        # cu_q_lens
         if batch.forward_mode == ForwardMode.EXTEND:
             cu_q_lens = np.concatenate(
                 [
@@ -116,50 +129,42 @@ class FlashAttention(AttentionBackend):
                 ]
             )
         elif batch.forward_mode == ForwardMode.DECODE:
-            cu_q_lens = np.concatenate(
-                [
-                    np.array([0], dtype=np.int32),
-                    np.cumsum(np.ones(len(batch.seq_lens), dtype=np.int32)),
-                ]
-            )
+            cu_q_lens = np.arange(len(batch.seq_lens) + 1, dtype=np.int32)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-        seq_lens = np.copy(batch.seq_lens)
+        seq_lens = batch.seq_lens
 
         aligned_seq_lens = (
             (batch.seq_lens + self.page_size - 1) // self.page_size
         ) * self.page_size
+
+        # cu_kv_lens
         cu_kv_lens = np.concatenate(
             [
                 np.array([0], dtype=np.int32),
-                np.cumsum(aligned_seq_lens),
+                np.cumsum(aligned_seq_lens, dtype=np.int32),
             ]
         )
 
-        num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32).reshape(
-            1,
-        )
-
-        # Construct distribution for V2 kernel: [decode_end, prefill_end, mixed_end]
+        # distribution for V2 kernel: [decode_end, prefill_end, mixed_end]
+        num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32)
         if batch.forward_mode == ForwardMode.DECODE:
-            # All sequences are decode/mixed mode
-            distribution = np.array([0, 0, num_seqs.item()], dtype=np.int32)
+            distribution = np.array([num_seqs, num_seqs, num_seqs], dtype=np.int32)
         elif batch.forward_mode == ForwardMode.EXTEND:
-            # All sequences are prefill mode
-            distribution = np.array([0, num_seqs.item(), num_seqs.item()], dtype=np.int32)
+            distribution = np.array([0, num_seqs, num_seqs], dtype=np.int32)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
         (
-            metadata.num_seqs,
             metadata.cu_q_lens,
             metadata.cu_kv_lens,
             metadata.page_indices,
+            metadata.swa_page_indices,
             metadata.seq_lens,
             metadata.distribution,
         ) = device_array(
-            (num_seqs, cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
+            (cu_q_lens, cu_kv_lens, page_indices, swa_page_indices, seq_lens, distribution),
             sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
         )
         return metadata
@@ -454,7 +459,13 @@ class FlashAttention(AttentionBackend):
             causal = 0
         # Select page indices and remap to SWA pool if KV cache supports it
         page_indices_arg = self.forward_metadata.page_indices
-        if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
+        if self.forward_metadata.swa_page_indices is not None and hasattr(
+            token_to_kv_pool, "layers_mapping"
+        ):
+            _, is_swa = token_to_kv_pool.layers_mapping[layer.layer_id]
+            if is_swa:
+                page_indices_arg = self.forward_metadata.swa_page_indices
+        elif hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
             page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
 
         in_specs = (
