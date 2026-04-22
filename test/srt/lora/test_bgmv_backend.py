@@ -274,9 +274,7 @@ class TestBgmvLoRABackend(CustomTestCase):
                 batch.lora_scalings,
                 batch.lora_token_indices,
             ),
-            sharding=(
-                NamedSharding(self.mesh, PartitionSpec()) if jax.process_count() == 1 else None
-            ),
+            sharding=(NamedSharding(self.mesh, PartitionSpec())),
         )
         return lora_scalings, lora_token_indices
 
