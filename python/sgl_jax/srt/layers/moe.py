@@ -564,10 +564,11 @@ class EPMoE(nnx.Module):
         else:
             x = inputs_2d[token_indices].astype(self.dtype)
 
-        # TPU Pallas GMM kernel requires size_m aligned to sublane tiling
-        # (hardware-dependent, e.g. 16 for bfloat16 on TPU v7).
-        # Pad with zeros and assign to the last expert group;
-        # _unpermute trims the extra rows afterwards.
+        # TODO(Qinghan): DeepSeek-V2-Lite has num_experts_per_tok=6, so with
+        # the default power-of-2 bs bucketing `padded_bs * 6` can land on a
+        # value > 16 that isn't a multiple of 16 (e.g. bs=4 -> size_m=24),
+        # which is why this padding is necessary. Models with power-of-2
+        # top_k (Grok=2, DeepSeek-V3=8, Qwen3-MoE=8) wouldn't need it.
         from jax.experimental.pallas import tpu as pltpu
 
         sublane_align = pltpu.get_tpu_info().get_sublane_tiling(x.dtype)
