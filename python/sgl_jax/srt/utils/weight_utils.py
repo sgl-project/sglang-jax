@@ -324,14 +324,7 @@ class WeightLoader:
         )
         out_block_ids = np.arange(out_dim, dtype=np.int32) // block_size_out
         scale_per_out = jnp.take(weight, jnp.asarray(out_block_ids), axis=1)
-        result = jnp.expand_dims(jnp.transpose(scale_per_out, (0, 2, 1)), axis=2)
-        # Reshard to the target param's sharding. The gather+transpose above
-        # produces a replicated-on-tensor-axis layout; the kernel param expects
-        # sharding like P("expert", None, None, "tensor") for wi_0/wi_1 scales.
-        target_sharding = getattr(model_param.value, "sharding", None)
-        if target_sharding is not None:
-            result = jax.device_put(result, target_sharding)
-        return result
+        return jnp.expand_dims(jnp.transpose(scale_per_out, (0, 2, 1)), axis=2)
 
     def _maybe_expand_linear_block_scale(
         self,
