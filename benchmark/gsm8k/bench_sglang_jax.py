@@ -8,7 +8,7 @@ Usage:
     #   python3 -m sgl_jax.launch_server --model-path <model> --port 30000 ...
 
     # Run benchmark:
-    python bench_sglang.py --base-url http://localhost:30000 --num-questions 200
+    python bench_sglang_jax.py --base-url http://localhost:30000 --num-questions 200
 """
 
 import argparse
