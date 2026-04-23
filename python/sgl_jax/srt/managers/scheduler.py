@@ -1298,13 +1298,24 @@ class Scheduler(
         ):
             old_ratio = self.new_token_ratio
 
-            retracted_reqs, new_token_ratio = batch.retract_decode(self.server_args)
+            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
+                self.server_args
+            )
             num_retracted_reqs = len(retracted_reqs)
             self.new_token_ratio = new_token_ratio
 
+            # Send abort responses so clients get an error instead of a hung connection
+            for req in reqs_to_abort:
+                abort_out = AbortReq(rid=req.rid)
+                if self._comm_backend is not None:
+                    self._comm_backend.send_pyobj(abort_out)
+                else:
+                    self.send_to_tokenizer.send_pyobj(abort_out)
+
             logger.info(
-                "KV cache pool is full. Retract requests. #retracted_reqs: %d, #new_token_ratio: %.4f -> %.4f",
+                "KV cache pool is full. Retract requests. #retracted_reqs: %d, #aborted_reqs: %d, #new_token_ratio: %.4f -> %.4f",
                 num_retracted_reqs,
+                len(reqs_to_abort),
                 old_ratio,
                 self.new_token_ratio,
             )
@@ -1318,6 +1329,9 @@ class Scheduler(
 
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
+
+        if batch.is_empty():
+            return batch
 
         # Update batch arrays
         batch.prepare_for_decode()

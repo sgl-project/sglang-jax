@@ -976,7 +976,9 @@ class ScheduleBatch:
         self._evict_tree_cache_if_needed(num_tokens)
         return self._is_available_size_sufficient(num_tokens)
 
-    def retract_decode(self, server_args: ServerArgs):
+    def retract_decode(
+        self, server_args: ServerArgs
+    ) -> tuple[list[Req], float, list[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = list(range(len(self.reqs)))
 
@@ -990,19 +992,11 @@ class ScheduleBatch:
 
         retracted_reqs = []
         first_iter = True
-        while (not self.check_decode_mem(selected_indices=sorted_indices)) or first_iter:
+        while first_iter or (
+            not self.check_decode_mem(selected_indices=sorted_indices)
+        ):
             if len(sorted_indices) == 1:
-                # Corner case: only one request left
-                if self.is_hybrid:
-                    full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-                    swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-                    assert (
-                        full_available_size > 0 and swa_available_size > 0
-                    ), f"No space left for only one request in SWA mode {full_available_size=}, {swa_available_size=}"
-                else:
-                    assert (
-                        self.token_to_kv_pool_allocator.available_size() > 0
-                    ), f"No space left for only one request, {self.token_to_kv_pool_allocator.available_size()=}"
+                # Keep at least one request in the loop; handle OOM below.
                 break
 
             first_iter = False
@@ -1011,11 +1005,26 @@ class ScheduleBatch:
             retracted_reqs.append(req)
             self.release_req(idx, len(sorted_indices), server_args)
 
-            if len(retracted_reqs) == 0:
-                # Corner case: only one request left
-                raise ValueError(
-                    "Failed to retract any request. No space left for only one request."
-                )
+        # If the last remaining request still can't fit, abort it gracefully
+        # instead of crashing the scheduler (follows upstream sglang).
+        reqs_to_abort: list[Req] = []
+        if len(sorted_indices) <= 1 and not self.check_decode_mem(
+            selected_indices=sorted_indices
+        ):
+            last_idx = sorted_indices.pop()
+            last_req = self.reqs[last_idx]
+            last_req.to_finish = FINISH_ABORT(
+                "Out of memory even after retracting all other requests "
+                "in the decode batch. Aborting the last request.",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+            )
+            reqs_to_abort.append(last_req)
+            self.release_req(last_idx, 0, server_args)
+            logger.warning(
+                "retract_decode: aborted last request %s due to OOM",
+                last_req.rid,
+            )
 
         self.filter_batch(keep_indices=sorted_indices)
 
@@ -1025,10 +1034,10 @@ class ScheduleBatch:
 
         new_estimate_ratio = (
             total_decoded_tokens + global_config.retract_decode_steps * len(self.reqs)
-        ) / total_max_new_tokens
+        ) / (total_max_new_tokens + 1)  # +1 to avoid zero division when all reqs aborted
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
-        return retracted_reqs, new_estimate_ratio
+        return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
