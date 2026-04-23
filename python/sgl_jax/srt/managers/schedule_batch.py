@@ -1250,7 +1250,7 @@ class ScheduleBatch:
             token_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : seq_lens_cpu[idx]
             ]
-            self.token_to_kv_pool_allocator.free(token_indices, req.dp_rank)
+            self.token_to_kv_pool_allocator.free(token_indices, dp_rank)
             self.req_to_token_pool.free(req.req_pool_idx)
         else:
             last_uncached_pos = (
@@ -1259,7 +1259,7 @@ class ScheduleBatch:
             token_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
             ]
-            self.token_to_kv_pool_allocator.free(token_indices, req.dp_rank)
+            self.token_to_kv_pool_allocator.free(token_indices, dp_rank)
             self.req_to_token_pool.free(req.req_pool_idx)
 
             # release the last node
@@ -1269,7 +1269,7 @@ class ScheduleBatch:
                 self.tree_cache.dec_lock_ref(req.last_node)
 
             num_tokens = remaing_req_count * global_config.retract_decode_steps
-            self._evict_tree_cache_if_needed({req.dp_rank: num_tokens})
+            self._evict_tree_cache_if_needed({dp_rank: num_tokens})
 
         req.reset_for_retract()
 

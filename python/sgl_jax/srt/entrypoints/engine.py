@@ -599,7 +599,7 @@ def _launch_subprocesses(
         for proc in scheduler_procs:
             proc.join()
             logger.error(
-                "Scheduler or DataParallelController %s terminated with %s",
+                "Scheduler %s terminated with %s",
                 proc.pid,
                 proc.exitcode,
             )
@@ -687,7 +687,7 @@ def _launch_threads(
 
         for thread in scheduler_threads:
             thread.join()
-            logger.error("Scheduler or DataParallelController %s terminated", thread.name)
+            logger.error("Scheduler %s terminated", thread.name)
         return None, None, None
 
     # Launch detokenizer thread

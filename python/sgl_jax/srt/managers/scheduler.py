@@ -1317,47 +1317,47 @@ class Scheduler(
 
     def check_memory(self):
         if self.is_hybrid:
-            (
-                _,
-                _,
-                _,
-                _,
-                full_available_size,
-                full_evictable_size,
-                swa_available_size,
-                swa_evictable_size,
-            ) = self._get_swa_token_info()
-            # Invariant (aligned with sglang GPU):
-            #   available + evictable + protected == total
-            # At idle, protected must be 0 (no locked nodes).
-            full_protected = self.tree_cache.full_protected_size()
-            swa_protected = self.tree_cache.swa_protected_size()
-            full_total = full_available_size + full_evictable_size + full_protected
-            swa_total = swa_available_size + swa_evictable_size + swa_protected
-            full_leak = full_total != self.full_tokens_per_layer
-            swa_leak = swa_total != self.swa_tokens_per_layer
-            memory_leak = full_leak or swa_leak
-            token_msg = (
-                f"[full] total={self.full_tokens_per_layer}, {full_available_size=}, "
-                f"{full_evictable_size=}, {full_protected=}\n"
-                f"[swa] total={self.swa_tokens_per_layer}, {swa_available_size=}, "
-                f"{swa_evictable_size=}, {swa_protected=}\n"
-            )
+            # Per-rank invariant: available + evictable + protected == size_per_rank.
+            # Checking per-rank avoids one rank's over-count masking another's leak.
+            full_size_per_rank = self.token_to_kv_pool_allocator.full_attn_allocator.size_per_rank
+            swa_size_per_rank = self.token_to_kv_pool_allocator.swa_attn_allocator.size_per_rank
+            leak_msgs = []
+            for dp in range(self.dp_size):
+                full_avail = self.token_to_kv_pool_allocator.full_available_size(dp)
+                full_evict = self.tree_cache.full_evictable_size(dp_rank=dp)
+                full_protected = self.tree_cache.full_protected_size(dp_rank=dp)
+                swa_avail = self.token_to_kv_pool_allocator.swa_available_size(dp)
+                swa_evict = self.tree_cache.swa_evictable_size(dp_rank=dp)
+                swa_protected = self.tree_cache.swa_protected_size(dp_rank=dp)
+                if full_avail + full_evict + full_protected != full_size_per_rank:
+                    leak_msgs.append(
+                        f"[dp={dp}][full] expected={full_size_per_rank}, "
+                        f"{full_avail=}, {full_evict=}, {full_protected=}"
+                    )
+                if swa_avail + swa_evict + swa_protected != swa_size_per_rank:
+                    leak_msgs.append(
+                        f"[dp={dp}][swa] expected={swa_size_per_rank}, "
+                        f"{swa_avail=}, {swa_evict=}, {swa_protected=}"
+                    )
+            if leak_msgs:
+                raise ValueError(
+                    "token_to_kv_pool_allocator memory leak detected!\n" + "\n".join(leak_msgs)
+                )
         else:
-            _, _, available_size, evictable_size = self._get_token_info()
-            protected_size = self.tree_cache.protected_size()
-            memory_leak = (
-                available_size + evictable_size + protected_size
-            ) != self.max_total_num_tokens
-            token_msg = (
-                f"total={self.max_total_num_tokens}, {available_size=}, "
-                f"{evictable_size=}, {protected_size=}\n"
-            )
-
-        if memory_leak:
-            msg = f"token_to_kv_pool_allocator memory leak detected! {token_msg}"
-            logger.warning(msg)
-            # raise ValueError(msg)
+            size_per_rank = self.token_to_kv_pool_allocator.size_per_rank
+            leak_msgs = []
+            for dp in range(self.dp_size):
+                avail = self.token_to_kv_pool_allocator.available_size(dp)
+                evict = self.tree_cache.evictable_size(dp_rank=dp)
+                protected = self.tree_cache.protected_size(dp_rank=dp)
+                if avail + evict + protected != size_per_rank:
+                    leak_msgs.append(
+                        f"[dp={dp}] expected={size_per_rank}, " f"{avail=}, {evict=}, {protected=}"
+                    )
+            if leak_msgs:
+                raise ValueError(
+                    "token_to_kv_pool_allocator memory leak detected!\n" + "\n".join(leak_msgs)
+                )
 
         req_total_size = self.req_to_token_pool.size
 
@@ -1367,8 +1367,7 @@ class Scheduler(
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
-            logger.warning(msg)
-            # raise ValueError(msg)
+            raise ValueError(msg)
 
     def check_tree_cache(self):
         if self.is_hybrid and isinstance(self.tree_cache, SWARadixCache):
