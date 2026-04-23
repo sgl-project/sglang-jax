@@ -151,6 +151,8 @@ class ModelRunner(BaseModelRunner):
             self.init_lora_manager()
 
         if not self.is_draft_worker:
+            self._sampler_base_rng = jax.random.PRNGKey(server_args.random_seed)
+            self._sampler_step = 0
             self.initialize_jit()
 
         # Init memory pool and attention backends
@@ -220,18 +222,27 @@ class ModelRunner(BaseModelRunner):
             with LoraBatchContext.set_batch(forward_batch):
                 return model(forward_batch, token_to_kv_pool, logits_metadata)
 
+        # Capture base RNG key as a constant in the JIT closure.
+        # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
+        # the eager jax.random.split that would serialize the host-device pipeline.
+        base_rng_key = self._sampler_base_rng
+
         @partial(jax.jit, static_argnames=["sampler_state_def", "use_sort_for_toppk_minp"])
         def jitted_sampler(
             sampler_def,
             sampler_state_def,
             sampler_state_leaves,
             use_sort_for_toppk_minp,
+            rng_step,
             *args,
         ):
 
             model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
-            return sampler(*args, use_sort_for_toppk_minp=use_sort_for_toppk_minp)
+            rng_key = jax.random.fold_in(base_rng_key, rng_step)
+            return sampler(
+                *args, use_sort_for_toppk_minp=use_sort_for_toppk_minp, rng_override=rng_key
+            )
 
         @partial(jax.jit, static_argnames=["mesh"])
         def jitted_compute_logprobs(mesh, logits, next_tokens):
@@ -728,8 +739,12 @@ class ModelRunner(BaseModelRunner):
         Returns:
             A list of next_token_ids
         """
+        # Advance step counter (pure Python, zero device overhead).
+        # fold_in(base_key, step) inside JIT produces a unique RNG per step.
+        self._sampler_step += 1
         # Penalty application has been moved to the Sampler for better JIT performance
         return self.jitted_sampler(
+            self._sampler_step,
             logits_output,
             sampling_metadata,
         )
