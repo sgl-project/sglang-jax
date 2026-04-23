@@ -10,7 +10,6 @@ reusing existing modules: MLAAttention, GateLogit, TopK, EPMoE/FusedEPMoE.
 
 import logging
 import math
-from typing import Any
 
 import jax
 import numpy as np
@@ -300,9 +299,7 @@ class DeepseekV3DecoderLayer(nnx.Module):
                 shared_output = None
 
             router_logits = self.moe_gate(hidden_states)
-            correction_bias = (
-                self.moe_gate.bias.value if self.moe_gate.bias is not None else None
-            )
+            correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
             topk_weights, topk_ids = self.topk(
                 router_logits, correction_bias, dispatch_info=dispatch_info
             )

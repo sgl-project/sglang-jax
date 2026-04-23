@@ -81,14 +81,10 @@ async def send_request(session, base_url, text, sampling_params, semaphore, pbar
     }
     async with semaphore:
         timeout = aiohttp.ClientTimeout(total=300)
-        async with session.post(
-            f"{base_url}/generate", json=payload, timeout=timeout
-        ) as response:
+        async with session.post(f"{base_url}/generate", json=payload, timeout=timeout) as response:
             if response.status != 200:
                 error_text = await response.text()
-                raise RuntimeError(
-                    f"Request failed with status {response.status}: {error_text}"
-                )
+                raise RuntimeError(f"Request failed with status {response.status}: {error_text}")
             result = await response.json()
             pbar.update(1)
             return result
@@ -100,8 +96,7 @@ async def run_batch(base_url, questions, sampling_params, parallel):
 
     async with aiohttp.ClientSession() as session:
         tasks = [
-            send_request(session, base_url, q, sampling_params, semaphore, pbar)
-            for q in questions
+            send_request(session, base_url, q, sampling_params, semaphore, pbar) for q in questions
         ]
         results = await asyncio.gather(*tasks)
 
@@ -118,17 +113,13 @@ def main(args):
         assert (
             args.tokenizer_path is not None
         ), "--tokenizer-path is required when --enable-thinking is set"
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.tokenizer_path, trust_remote_code=True
-        )
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
 
     # Read data
     if args.platinum:
         print("Loading GSM8K Platinum dataset from HuggingFace...")
         dataset = load_dataset("madrylab/gsm8k-platinum", "main", split="test")
-        lines = [
-            {"question": item["question"], "answer": item["answer"]} for item in dataset
-        ]
+        lines = [{"question": item["question"], "answer": item["answer"]} for item in dataset]
     else:
         data_path = args.data_path
         url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
@@ -155,7 +146,7 @@ def main(args):
             )
         questions.append(raw_question)
         labels.append(get_answer_value(lines[i]["answer"]))
-    assert all(l != INVALID for l in labels)
+    assert all(label != INVALID for label in labels)
 
     # Sampling parameters
     sampling_params = {
@@ -171,9 +162,7 @@ def main(args):
         f"(parallelism={args.parallel})..."
     )
     tic = time.perf_counter()
-    results = asyncio.run(
-        run_batch(args.base_url, questions, sampling_params, args.parallel)
-    )
+    results = asyncio.run(run_batch(args.base_url, questions, sampling_params, args.parallel))
     latency = time.perf_counter() - tic
 
     # Extract predictions
@@ -201,7 +190,7 @@ def main(args):
             for i, r in enumerate(results):
                 f.write(f"=== Question {i} ===\n")
                 f.write(questions[i] + "\n")
-                f.write(f"=== Answer ===\n")
+                f.write("=== Answer ===\n")
                 f.write(r["text"] + "\n")
                 f.write(f"=== Prediction: {preds[i]}, Label: {labels[i]} ===\n\n")
         print(f"Raw outputs saved to {args.output_file}")

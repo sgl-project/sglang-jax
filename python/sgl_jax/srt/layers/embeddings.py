@@ -727,9 +727,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         self.yarn_mscale = mscale
         self.yarn_mscale_all_dim = mscale_all_dim
 
-        super().__init__(
-            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
-        )
+        super().__init__(head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype)
 
         # Replace inv_freq with YaRN blended version
         self._inv_freq_np = self._compute_yarn_inv_freq()
@@ -755,9 +753,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         )
         # Linear ramp mask: 1 in the extrapolation region, 0 in the interpolation region
         max_val = max(high - low, 0.001)
-        inv_freq_mask = 1.0 - np.clip(
-            (np.arange(dim // 2, dtype=np.float32) - low) / max_val, 0, 1
-        )
+        inv_freq_mask = 1.0 - np.clip((np.arange(dim // 2, dtype=np.float32) - low) / max_val, 0, 1)
         return freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
 
     @named_scope

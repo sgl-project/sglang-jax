@@ -37,7 +37,6 @@ from sgl_jax.srt.mem_cache.allocator import (
 )
 from sgl_jax.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
-    MLATokenToKVPool,
     ReqToTokenPool,
     SWAKVPool,
 )
