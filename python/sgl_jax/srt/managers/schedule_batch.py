@@ -976,9 +976,7 @@ class ScheduleBatch:
         self._evict_tree_cache_if_needed(num_tokens)
         return self._is_available_size_sufficient(num_tokens)
 
-    def retract_decode(
-        self, server_args: ServerArgs
-    ) -> tuple[list[Req], float, list[Req]]:
+    def retract_decode(self, server_args: ServerArgs) -> tuple[list[Req], float, list[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = list(range(len(self.reqs)))
 
@@ -992,9 +990,7 @@ class ScheduleBatch:
 
         retracted_reqs = []
         first_iter = True
-        while first_iter or (
-            not self.check_decode_mem(selected_indices=sorted_indices)
-        ):
+        while first_iter or (not self.check_decode_mem(selected_indices=sorted_indices)):
             if len(sorted_indices) == 1:
                 # Keep at least one request in the loop; handle OOM below.
                 break
@@ -1008,9 +1004,7 @@ class ScheduleBatch:
         # If the last remaining request still can't fit, abort it gracefully
         # instead of crashing the scheduler (follows upstream sglang).
         reqs_to_abort: list[Req] = []
-        if len(sorted_indices) <= 1 and not self.check_decode_mem(
-            selected_indices=sorted_indices
-        ):
+        if len(sorted_indices) <= 1 and not self.check_decode_mem(selected_indices=sorted_indices):
             last_idx = sorted_indices.pop()
             last_req = self.reqs[last_idx]
             last_req.to_finish = FINISH_ABORT(
@@ -1034,7 +1028,9 @@ class ScheduleBatch:
 
         new_estimate_ratio = (
             total_decoded_tokens + global_config.retract_decode_steps * len(self.reqs)
-        ) / (total_max_new_tokens + 1)  # +1 to avoid zero division when all reqs aborted
+        ) / (
+            total_max_new_tokens + 1
+        )  # +1 to avoid zero division when all reqs aborted
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
