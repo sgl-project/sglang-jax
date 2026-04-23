@@ -77,7 +77,7 @@ class MLAAttention(nnx.Module):
                 kernel_axes=(None, None),
                 scope_name="q_a_proj",
             )
-            self.q_a_layernorm = RMSNorm(q_lora_rank, param_dtype=jnp.float32)
+            self.q_a_layernorm = RMSNorm(q_lora_rank, dtype=dtype)
             self.q_b_proj = LinearBase(
                 q_lora_rank,
                 num_heads * self.qk_head_dim,
@@ -97,7 +97,7 @@ class MLAAttention(nnx.Module):
             kernel_axes=(None, None),
             scope_name="kv_a_proj",
         )
-        self.kv_a_layernorm = RMSNorm(kv_lora_rank, param_dtype=jnp.float32)
+        self.kv_a_layernorm = RMSNorm(kv_lora_rank, dtype=dtype)
         self.kv_b_proj = LinearBase(
             kv_lora_rank,
             num_heads * (qk_nope_head_dim + v_head_dim),

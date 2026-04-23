@@ -173,8 +173,8 @@ class ModelConfig:
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
         )
         self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", self.head_dim)
-
         self.attention_arch = AttentionArch.MHA
+        self._apply_model_specific_config()
         self.num_attention_heads = self.hf_text_config.num_attention_heads
         self.num_key_value_heads = getattr(self.hf_text_config, "num_key_value_heads", None)
 
@@ -349,6 +349,25 @@ class ModelConfig:
         # 3. No quantization config found
         logger.info("No quantization config found in HF config or user config")
         return None
+
+    def _apply_model_specific_config(self) -> None:
+        """Invoke the model class's optional `patch_model_config` hook so model
+        files can own their own config overrides (attention_arch, head_dim,
+        MLA-specific dims, etc.) instead of a centralized if/elif chain here.
+
+        Runs during ModelConfig construction — before ModelRunner reads
+        `attention_arch` for backend selection — so patches land in time.
+        Import is lazy because model modules import ModelConfig back.
+        """
+        from sgl_jax.srt.models.registry import ModelRegistry
+
+        try:
+            model_cls, _ = ModelRegistry.resolve_model_cls(self.hf_config.architectures)
+        except ValueError:
+            return
+        patch = getattr(model_cls, "patch_model_config", None)
+        if patch is not None:
+            patch(self)
 
     @staticmethod
     def from_server_args(

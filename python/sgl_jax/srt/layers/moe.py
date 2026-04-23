@@ -564,6 +564,19 @@ class EPMoE(nnx.Module):
         else:
             x = inputs_2d[token_indices].astype(self.dtype)
 
+        # TODO(Qinghan): DeepSeek-V2-Lite has num_experts_per_tok=6, so with
+        # the default power-of-2 bs bucketing `padded_bs * 6` can land on a
+        # value > 16 that isn't a multiple of 16 (e.g. bs=4 -> size_m=24),
+        # which is why this padding is necessary. Models with power-of-2
+        # top_k (Grok=2, DeepSeek-V3=8, Qwen3-MoE=8) wouldn't need it.
+        from jax.experimental.pallas import tpu as pltpu
+
+        sublane_align = pltpu.get_tpu_info().get_sublane_tiling(x.dtype)
+        pad_size = (-x.shape[0]) % sublane_align
+        if pad_size > 0:
+            x = jnp.pad(x, ((0, pad_size), (0, 0)))
+            group_sizes = group_sizes.at[-1].add(pad_size)
+
         group_sizes = group_sizes.astype(jnp.int32)
         act_q_dtype = self.activation_quantized_dtype
 
