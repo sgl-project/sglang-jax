@@ -104,7 +104,6 @@ class NDRotaryEmbedding(nnx.Module):
         Returns:
             A tuple of (cos, sin) tensors compatible with FLUX rotary apply.
         """
-        pos = jnp.asarray(pos)
         if pos.ndim != 2:
             raise ValueError(
                 "pos must have shape [num_tokens, ndim] for NDRotaryEmbedding. "
