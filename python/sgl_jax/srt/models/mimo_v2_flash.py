@@ -162,6 +162,7 @@ class MiMoV2Attention(nnx.Module):
         sliding_window_size: int | None = None,
         attention_sink_bias: bool = False,
         partial_rotary_factor: float = 1.0,
+        attention_value_scale: float | None = None,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
@@ -171,6 +172,7 @@ class MiMoV2Attention(nnx.Module):
         self.q_head_num = num_heads
         self.k_head_num = num_kv_heads
         self.v_head_dim = v_head_dim if v_head_dim is not None else self.head_dim
+        self.attention_value_scale = attention_value_scale
 
         self.q_size = num_heads * self.head_dim
         self.k_size = num_kv_heads * self.head_dim
@@ -263,6 +265,8 @@ class MiMoV2Attention(nnx.Module):
             v = jnp.pad(v, ((0, 0), (0, 0), (0, pad_size)))
 
         q, k = self.rotary_emb(positions, q, k)
+        if self.attention_value_scale is not None:
+            v = v * self.attention_value_scale
 
         attn_output, kv_fused = self.attn(
             q,
@@ -300,6 +304,7 @@ class MiMoV2DecoderLayer(nnx.Module):
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
+        attention_value_scale = getattr(config, "attention_value_scale", None)
 
         if self._is_swa_layer(config):
             self.self_attn = MiMoV2Attention(
@@ -314,6 +319,7 @@ class MiMoV2DecoderLayer(nnx.Module):
                 sliding_window_size=getattr(config, "sliding_window_size", None),
                 attention_sink_bias=getattr(config, "add_swa_attention_sink_bias", False),
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+                attention_value_scale=attention_value_scale,
                 layer_id=layer_id,
                 dtype=dtype,
                 mesh=mesh,
@@ -331,6 +337,7 @@ class MiMoV2DecoderLayer(nnx.Module):
                 sliding_window_size=0,  # full attention
                 attention_sink_bias=getattr(config, "add_full_attention_sink_bias", False),
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+                attention_value_scale=attention_value_scale,
                 layer_id=layer_id,
                 dtype=dtype,
                 mesh=mesh,
