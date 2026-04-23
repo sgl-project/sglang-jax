@@ -9,7 +9,6 @@ reusing existing modules: MLAAttention, GateLogit, TopK, EPMoE/FusedEPMoE.
 """
 
 import logging
-import math
 
 import jax
 import numpy as np
@@ -19,7 +18,12 @@ from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import AttentionArch, ModelConfig, MoEBackend
 from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
-from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
+from sgl_jax.srt.layers.embeddings import (
+    Embed,
+    ParallelLMHead,
+    _deepseek_yarn_get_mscale,
+    get_rope,
+)
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -36,13 +40,6 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
-
-
-def _yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
-    """Compute attention mscale factor for YaRN rope scaling."""
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
 
 
 class DeepseekV3MLP(nnx.Module):
@@ -314,7 +311,7 @@ class DeepseekV3DecoderLayer(nnx.Module):
             mscale_all_dim = rope_scaling.get("mscale_all_dim", 0)
             if mscale_all_dim:
                 scaling_factor = rope_scaling["factor"]
-                mscale = _yarn_get_mscale(scaling_factor, mscale_all_dim)
+                mscale = _deepseek_yarn_get_mscale(scaling_factor, mscale_all_dim)
                 self.self_attn.attn.scaling *= mscale * mscale
 
         # MLP: MoE or dense depending on layer index

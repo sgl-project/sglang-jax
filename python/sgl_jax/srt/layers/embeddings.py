@@ -659,8 +659,8 @@ def get_rope(
     return rotary_emb
 
 
-def _yarn_get_mscale(scaling_factor: float) -> float:
-    # Approximate magnitude scaling correction used by YaRN
+def _grok_yarn_get_mscale(scaling_factor: float) -> float:
+    """YaRN mscale variant used by Grok (sqrt form)."""
     if scaling_factor <= 1:
         return 1.0
     return math.sqrt(scaling_factor)
