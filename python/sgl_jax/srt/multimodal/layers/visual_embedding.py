@@ -361,8 +361,8 @@ class PixArtAlphaTextProjection(nnx.Module):
             kernel_axes=("tensor", None),
         )
         self.act_fn = act_fn
-        if act_fn == "gelu_tanh":
-            self.act_1 = modeling_flax_utils.ACT2FN["gelu_pytorch_tanh"]
+        if act_fn == "silu":
+            self.act_1 = modeling_flax_utils.ACT2FN["silu"]
         else:
             raise ValueError(f"Unknown activation function: {act_fn}")
 
