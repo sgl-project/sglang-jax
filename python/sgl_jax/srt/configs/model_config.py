@@ -172,6 +172,7 @@ class ModelConfig:
             "head_dim",
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
         )
+        self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", self.head_dim)
         self.attention_arch = AttentionArch.MHA
         self._apply_model_specific_config()
         self.num_attention_heads = self.hf_text_config.num_attention_heads
