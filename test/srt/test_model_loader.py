@@ -11,6 +11,7 @@ if os.environ.get("USE_DEVICE_TYPE") == "cpu":
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from flax.nnx.statelib import State
 from huggingface_hub.errors import HFValidationError
@@ -18,7 +19,11 @@ from jax.sharding import Mesh
 
 from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.model_loader.loader import JAXModelLoader, get_model_loader
+from sgl_jax.srt.model_loader.loader import (
+    JAXDummyModelLoader,
+    JAXModelLoader,
+    get_model_loader,
+)
 from sgl_jax.srt.models.qwen import QWenLMHeadModel
 
 
@@ -785,6 +790,204 @@ class TestModelLoaderEdgeCases(unittest.TestCase):
                 model_path=self.temp_dir,
                 trust_remote_code=True,  # Empty directory
             )
+
+
+class TestKimiLinearModelLoader(unittest.TestCase):
+    """Test Kimi-Linear model instantiation and dummy weight loading.
+
+    Validates that the full dummy-load pipeline works for
+    moonshotai/Kimi-Linear-48B-A3B-Instruct (hybrid MLA+KDA + MoE).
+    Requires network access to download the HF config.json (~few KB).
+    """
+
+    KIMI_MODEL_ID = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            cls.model_config = ModelConfig(
+                model_path=cls.KIMI_MODEL_ID,
+                trust_remote_code=True,
+                dtype="bfloat16",
+            )
+        except Exception as e:
+            raise unittest.SkipTest(f"Cannot access Kimi-Linear HF config (network issue?): {e}")
+
+        # ep_size is normally set by ModelRunner; set it manually for testing
+        cls.model_config.hf_config.ep_size = 1
+
+    def setUp(self):
+        devices = jax.devices()
+        num_devices = min(len(devices), 4)
+        # EPMoE requires a 2D mesh ("data", "tensor"), matching create_device_mesh
+        device_array = np.array(devices[:num_devices]).reshape(1, num_devices)
+        self.mesh = Mesh(
+            device_array,
+            ("data", "tensor"),
+            axis_types=(
+                jax.sharding.AxisType.Explicit,
+                jax.sharding.AxisType.Explicit,
+            ),
+        )
+
+    def test_kimi_linear_dummy_weight_loading(self):
+        """End-to-end dummy weight loading: registry lookup -> eval_shape -> dummy weights."""
+        from sgl_jax.srt.models.kimi_linear import KimiLinearForCausalLM
+
+        load_config = LoadConfig(load_format=LoadFormat.DUMMY)
+        loader = get_model_loader(load_config, self.mesh)
+
+        model = loader.load_model(model_config=self.model_config)
+
+        # Verify model type resolved correctly via registry
+        self.assertIsInstance(model, KimiLinearForCausalLM)
+
+        # Verify layer count
+        self.assertEqual(len(model.model.layers), 27)
+
+        # Verify param tree has key paths with correct shapes
+        state = nnx.state(model)
+        hf_config = self.model_config.hf_config
+
+        # Embedding
+        embed = self._get_param(state, "model.embed_tokens.embedding")
+        self.assertEqual(embed.value.shape[1], hf_config.hidden_size)
+
+        # Final norm
+        norm = self._get_param(state, "model.norm.scale")
+        self.assertEqual(norm.value.shape, (hf_config.hidden_size,))
+
+        # LM head (tie_word_embeddings=false)
+        lm_head = self._get_param(state, "lm_head.embedding")
+        self.assertEqual(lm_head.value.shape[1], hf_config.hidden_size)
+
+        # MLA layer attention weights (layer 3 is MLA, 0-indexed from kda_layers)
+        mla_layer_idx = self._find_mla_layer_idx(hf_config)
+        kv_a = self._get_param(state, f"model.layers.{mla_layer_idx}.self_attn.kv_a_proj.weight")
+        self.assertIsNotNone(kv_a.value)
+
+        # MoE layer expert weights (layer 1 is first MoE layer)
+        moe_wi = self._get_param(state, "model.layers.1.block_sparse_moe.wi_0")
+        self.assertEqual(moe_wi.value.shape[0], hf_config.num_experts)
+
+        # Dense layer MLP (layer 0)
+        dense_gate = self._get_param(state, "model.layers.0.mlp.gate_proj.weight")
+        self.assertIsNotNone(dense_gate.value)
+
+        print(
+            f"PASS: Kimi-Linear dummy weight loading succeeded ({len(model.model.layers)} layers)"
+        )
+
+    def test_kimi_linear_weight_mapping_completeness(self):
+        """Verify weight mappings cover all expected HF keys per RFC-0018."""
+        from sgl_jax.srt.models.kimi_linear import KimiLinearForCausalLM, _is_kda_layer
+
+        load_config = LoadConfig(load_format=LoadFormat.DUMMY)
+        loader = JAXDummyModelLoader(load_config, self.mesh)
+
+        # Instantiate model (shapes only) without loading weights
+        with jax.set_mesh(self.mesh):
+            model = nnx.eval_shape(
+                lambda: KimiLinearForCausalLM(
+                    self.model_config.hf_config,
+                    dtype=self.model_config.dtype,
+                    mesh=self.mesh,
+                )
+            )
+
+        mappings = model._create_weight_mappings(self.model_config)
+        hf_config = self.model_config.hf_config
+
+        # Count layer types
+        num_layers = hf_config.num_hidden_layers
+        kda_layers = [i for i in range(num_layers) if _is_kda_layer(hf_config, i)]
+        mla_layers = [i for i in range(num_layers) if not _is_kda_layer(hf_config, i)]
+        first_k = getattr(hf_config, "first_k_dense_replace", 0)
+        dense_layers = [i for i in range(num_layers) if i < first_k]
+        moe_layers = [i for i in range(num_layers) if i >= first_k]
+
+        self.assertEqual(len(kda_layers), 20)
+        self.assertEqual(len(mla_layers), 7)
+        self.assertEqual(len(dense_layers), 1)
+        self.assertEqual(len(moe_layers), 26)
+
+        # Global weights
+        self.assertIn("model.embed_tokens.weight", mappings)
+        self.assertIn("model.norm.weight", mappings)
+        self.assertIn("lm_head.weight", mappings)
+
+        # MLA layers must have kv_a, kv_b, q_proj, o_proj, kv_a_layernorm
+        for layer_idx in mla_layers:
+            prefix = f"model.layers.{layer_idx}"
+            for key_suffix in [
+                "self_attn.q_proj.weight",
+                "self_attn.o_proj.weight",
+                "self_attn.kv_a_proj_with_mqa.weight",
+                "self_attn.kv_a_layernorm.weight",
+                "self_attn.kv_b_proj.weight",
+            ]:
+                self.assertIn(
+                    f"{prefix}.{key_suffix}",
+                    mappings,
+                    f"Missing MLA mapping: {prefix}.{key_suffix}",
+                )
+
+        # KDA layers must NOT have attention mappings (only layernorms)
+        for layer_idx in kda_layers:
+            prefix = f"model.layers.{layer_idx}"
+            # Layernorms should be present
+            self.assertIn(f"{prefix}.input_layernorm.weight", mappings)
+            self.assertIn(f"{prefix}.post_attention_layernorm.weight", mappings)
+            # Attention weights should NOT be present
+            self.assertNotIn(
+                f"{prefix}.self_attn.q_proj.weight",
+                mappings,
+                f"KDA layer {layer_idx} should not have q_proj mapping",
+            )
+
+        # Dense MLP (layer 0)
+        for layer_idx in dense_layers:
+            prefix = f"model.layers.{layer_idx}"
+            for proj in ["gate_proj", "up_proj", "down_proj"]:
+                self.assertIn(f"{prefix}.mlp.{proj}.weight", mappings)
+
+        # MoE layers: gate, expert weights (via __MOE_EXPERTS__), shared experts
+        for layer_idx in moe_layers:
+            prefix = f"model.layers.{layer_idx}"
+            self.assertIn(f"{prefix}.block_sparse_moe.gate.weight", mappings)
+            self.assertIn(f"{prefix}.block_sparse_moe.gate.e_score_correction_bias", mappings)
+            for proj in ["gate_proj", "up_proj", "down_proj"]:
+                self.assertIn(
+                    f"{prefix}.block_sparse_moe.shared_experts.{proj}.weight",
+                    mappings,
+                )
+
+        # MoE expert weights are keyed with __MOE_EXPERTS__ prefix
+        moe_expert_keys = [k for k in mappings if k.startswith("__MOE_EXPERTS__")]
+        # 26 MoE layers × 3 weight types (w1, w3, w2)
+        self.assertEqual(len(moe_expert_keys), 26 * 3)
+
+        print(
+            f"PASS: Weight mapping completeness verified "
+            f"({len(mappings)} total mappings, "
+            f"{len(moe_expert_keys)} MoE expert entries)"
+        )
+
+    def _get_param(self, state, path):
+        """Get parameter from nnx.State by dot-separated path."""
+        current = state
+        for key in path.split("."):
+            current = current[int(key) if key.isdigit() else key]
+        return current
+
+    def _find_mla_layer_idx(self, hf_config):
+        """Find the first MLA (non-KDA) layer index."""
+        from sgl_jax.srt.models.kimi_linear import _is_kda_layer
+
+        for i in range(hf_config.num_hidden_layers):
+            if not _is_kda_layer(hf_config, i):
+                return i
+        raise ValueError("No MLA layer found")
 
 
 if __name__ == "__main__":
