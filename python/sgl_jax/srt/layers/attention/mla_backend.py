@@ -41,9 +41,10 @@ logger = logging.getLogger(__name__)
 class MLAAttentionMetadata:
     """Per-forward metadata for the MLA v2 kernel.
 
-    Drops `custom_mask` / `swa_page_indices` / `attention_sink` (RFC §3.8); keeps
-    `cu_kv_lens` for parity with the MHA metadata even though kernel v2 does not
-    consume it.
+    Drops `custom_mask` / `swa_page_indices` / `attention_sink` (RFC §3.8). The
+    `cu_kv_lens` field carries the page-aligned KV cumulative lengths used by
+    the kernel to locate each sequence's pages in the ragged `page_indices`
+    layout (matches RPA v3 addressing).
     """
 
     cu_q_lens: jax.Array = None
@@ -239,6 +240,7 @@ class MLAAttentionBackend(AttentionBackend):
             P(),  # seq_lens
             P(),  # page_indices
             P(),  # cu_q_lens
+            P(),  # cu_kv_lens
             P(),  # distribution
         )
         out_specs = (
@@ -255,6 +257,7 @@ class MLAAttentionBackend(AttentionBackend):
             seq_lens_,
             page_indices_,
             cu_q_lens_,
+            cu_kv_lens_,
             distribution_,
         ):
             return mla_ragged_paged_attention(
@@ -266,6 +269,7 @@ class MLAAttentionBackend(AttentionBackend):
                 seq_lens_,
                 page_indices_,
                 cu_q_lens_,
+                cu_kv_lens_,
                 distribution_,
                 sm_scale=sm_scale,
                 num_kv_pages_per_block=self.num_kv_pages_per_block,
@@ -288,6 +292,7 @@ class MLAAttentionBackend(AttentionBackend):
             self.forward_metadata.seq_lens,
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
+            self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
         )
 

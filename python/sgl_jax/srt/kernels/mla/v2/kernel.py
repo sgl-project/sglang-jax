@@ -14,7 +14,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU-Friendly MLA Ragged Paged Attention kernel."""
+"""TPU-Friendly MLA Ragged Paged Attention kernel.
+
+This kernel adapts tpu-inference's MLA v2 kernel to sglang-jax's ragged page
+indices layout (each sequence's pages are tightly concatenated into a flat
+array, not padded to a uniform `pages_per_seq`).
+
+sglang-jax specific features:
+- cu_kv_lens-based page_indices offset computation (matches RPA v3)
+"""
 
 import functools
 import math
@@ -109,8 +117,9 @@ def static_validate_inputs(
     new_k_pe: jax.Array,  # [max_num_tokens, actual_r_dim]
     cache_kv: jax.Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
     kv_lens: jax.Array,  # i32[max_num_seqs]
-    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    page_indices: jax.Array,  # i32[num_page_indices] (ragged: each seq's pages tightly concatenated)
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    cu_kv_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
     *,
     sm_scale: float = 1.0,
@@ -179,24 +188,35 @@ def static_validate_inputs(
         raise ValueError(f"{kv_packing=} does not match with {cache_kv.dtype=}")
 
     if not (
-        jnp.int32 == kv_lens.dtype == page_indices.dtype == cu_q_lens.dtype == distribution.dtype
+        jnp.int32
+        == kv_lens.dtype
+        == page_indices.dtype
+        == cu_q_lens.dtype
+        == cu_kv_lens.dtype
+        == distribution.dtype
     ):
         raise ValueError(
             f"Expected int32 dtype for {kv_lens.dtype=}, {page_indices.dtype=},"
-            f" {cu_q_lens.dtype=}, {distribution.dtype=}"
+            f" {cu_q_lens.dtype=}, {cu_kv_lens.dtype=}, {distribution.dtype=}"
         )
 
-    if not (len(kv_lens.shape) == len(page_indices.shape) == len(cu_q_lens.shape) == 1):
+    if not (
+        len(kv_lens.shape)
+        == len(page_indices.shape)
+        == len(cu_q_lens.shape)
+        == len(cu_kv_lens.shape)
+        == 1
+    ):
         raise ValueError(
-            f"Expected 1D array for {kv_lens.shape=}, {page_indices.shape=}," f" {cu_q_lens.shape=}"
+            f"Expected 1D array for {kv_lens.shape=}, {page_indices.shape=},"
+            f" {cu_q_lens.shape=}, {cu_kv_lens.shape=}"
         )
 
     max_num_seqs = kv_lens.shape[0]
-    num_page_indices = page_indices.shape[0]
-    if num_page_indices % max_num_seqs != 0:
-        raise ValueError(f"Expected {num_page_indices=} to be divisible by {max_num_seqs=}.")
     if cu_q_lens.shape != (max_num_seqs + 1,):
         raise ValueError(f"Expected {cu_q_lens.shape=} to be ({max_num_seqs + 1},).")
+    if cu_kv_lens.shape != (max_num_seqs + 1,):
+        raise ValueError(f"Expected {cu_kv_lens.shape=} to be ({max_num_seqs + 1},).")
     if distribution.shape != (3,):
         raise ValueError(f"Expected {distribution.shape=} to be (3,).")
 
@@ -233,8 +253,9 @@ def static_validate_inputs(
 def _mla_ragged_paged_attention_kernel(
     # Prefetch
     kv_lens_ref,  # [max_num_seqs]
-    page_indices_ref,  # [max_num_seqs * pages_per_seq]
+    page_indices_ref,  # [num_page_indices] (ragged: each seq's pages tightly concatenated)
     cu_q_lens_ref,  # [max_num_seqs + 1]
+    cu_kv_lens_ref,  # [max_num_seqs + 1] (page-aligned, used to locate each seq's pages)
     start_end_seq_idx_ref,  # [2] (start_seq_idx, end_seq_idx)
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
     bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
@@ -282,11 +303,8 @@ def _mla_ragged_paged_attention_kernel(
     r_dim = q_pe_hbm_ref.shape[-1]
     num_q_heads = num_q_heads_per_q_packing * q_packing
     total_num_pages, page_size_per_kv_packing, kv_packing, _ = cache_kv_hbm_ref.shape
-    max_num_seqs = kv_lens_ref.shape[0]
     num_page_indices = page_indices_ref.shape[0]
 
-    assert num_page_indices % max_num_seqs == 0
-    pages_per_seq = num_page_indices // max_num_seqs
     q_dtype = ql_nope_hbm_ref.dtype
     # Validate against the KV dtype.
     kv_dtype = cache_kv_hbm_ref.dtype
@@ -314,7 +332,7 @@ def _mla_ragged_paged_attention_kernel(
     debug_print("[RPA debug] end_seq_idx={}", end_seq_idx)
     debug_print("[RPA debug] bkv_p={}", bkv_p)
     debug_print("[RPA debug] page_size={}", page_size)
-    debug_print("[RPA debug] pages_per_seq={}", pages_per_seq)
+    debug_print("[RPA debug] num_page_indices={}", num_page_indices)
     debug_print("[RPA debug] bkv_sz_per_kv_packing={}", bkv_sz_per_kv_packing)
     debug_print("[RPA debug] bq_sz={}", bq_sz)
     debug_print("[RPA debug] batch_size={}", batch_size)
@@ -447,7 +465,10 @@ def _mla_ragged_paged_attention_kernel(
             bkv_sz_frm_new = jnp.minimum(bkv_sz - bkv_sz_frm_cache, kv_left_frm_new)
             bkv_sz_frm_cache_per_kv_packing = cdiv_on_kv_packing(bkv_sz_frm_cache, kv_packing)
             bkv_sz_frm_new_per_kv_packing = cdiv_on_kv_packing(bkv_sz_frm_new, kv_packing)
-            page_indices_offset = seq_idx * pages_per_seq + kv_p_start
+            # Ragged page_indices: each seq's pages are tightly concatenated.
+            # cu_kv_lens is page-aligned so cdiv == //; cdiv mirrors RPA v3 for parity.
+            start_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx], page_size)
+            page_indices_offset = start_kv_page_idx + kv_p_start
 
             new_kv_len_start = q_end - kv_left_frm_new
             new_kv_len_start_per_kv_packing = floor_div_on_kv_packing(new_kv_len_start, kv_packing)
@@ -804,7 +825,8 @@ def _mla_ragged_paged_attention_kernel(
             start_word_in_page = floor_div_on_kv_packing(offset % page_size, kv_packing)
             start_word_in_vmem = floor_div_on_kv_packing(offset % bkv_sz, kv_packing)
             words_to_transfer = update_kv_packing_iters
-            page_indices_offset = seq_idx * pages_per_seq + kv_p_start
+            start_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx], page_size)
+            page_indices_offset = start_kv_page_idx + kv_p_start
 
             def loop_body(i, states):
                 curr_word_in_page, words_to_transfer, curr_word_in_vmem = states
@@ -1325,8 +1347,9 @@ def mla_ragged_paged_attention(
     new_k_pe: jax.Array,  # [max_num_tokens, actual_r_dim]
     cache_kv: jax.Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, align_to(lkv_dim, 128)]
     kv_lens: jax.Array,  # i32[max_num_seqs]
-    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    page_indices: jax.Array,  # i32[num_page_indices] (ragged: each seq's pages tightly concatenated)
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    cu_kv_lens: jax.Array,  # i32[max_num_seqs + 1] (page-aligned cumsum)
     distribution: jax.Array,  # i32[3]
     *,
     sm_scale: float = 1.0,
@@ -1406,6 +1429,7 @@ def mla_ragged_paged_attention(
         kv_lens,
         page_indices,
         cu_q_lens,
+        cu_kv_lens,
         distribution,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
@@ -1436,9 +1460,6 @@ def mla_ragged_paged_attention(
     _, page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
     page_size = page_size_per_kv_packing * kv_packing
     _, num_q_heads_per_q_packing, q_packing, _ = ql_nope.shape
-    max_num_seqs = kv_lens.shape[0]
-    num_page_indices = page_indices.shape[0]
-    assert num_page_indices % max_num_seqs == 0
     num_q_heads = num_q_heads_per_q_packing * q_packing
 
     def run_mla_kernel(
@@ -1448,8 +1469,9 @@ def mla_ragged_paged_attention(
         new_k_pe: jax.Array,  # [max_num_tokens, actual_r_dim]
         cache_kv: jax.Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, align_to(lkv_dim, 128)]
         kv_lens: jax.Array,  # i32[max_num_seqs]
-        page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+        page_indices: jax.Array,  # i32[num_page_indices]
         cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+        cu_kv_lens: jax.Array,  # i32[max_num_seqs + 1]
         start_seq_idx: jax.Array,  # i32
         end_seq_idx: jax.Array,  # i32
         static_q_len: int | None,
@@ -1547,6 +1569,7 @@ def mla_ragged_paged_attention(
             kv_lens,
             page_indices,
             cu_q_lens,
+            cu_kv_lens,
             jnp.array([start_seq_idx, end_seq_idx], jnp.int32),
             # (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
             jnp.zeros((3,), jnp.int32),
@@ -1591,8 +1614,8 @@ def mla_ragged_paged_attention(
                     jax.ShapeDtypeStruct(shape=cache_kv.shape, dtype=cache_kv.dtype),
                 ],
                 input_output_aliases={
-                    7: 0,  # Alias output activation with ql_nope
-                    11: 1,  # Aliasing cache_kv with updated_cache_kv
+                    8: 0,  # Alias output activation with ql_nope
+                    12: 1,  # Aliasing cache_kv with updated_cache_kv
                 },
                 name=scope_name,
             )
@@ -1617,6 +1640,7 @@ def mla_ragged_paged_attention(
         kv_lens,
         page_indices,
         cu_q_lens,
+        cu_kv_lens,
         num_kv_pages_per_block=num_kv_pages_per_blocks[0],
         num_queries_per_block=num_queries_per_blocks[0],
         start_seq_idx=jnp.array(0),
@@ -1636,6 +1660,7 @@ def mla_ragged_paged_attention(
         kv_lens,
         page_indices,
         cu_q_lens,
+        cu_kv_lens,
         num_kv_pages_per_block=num_kv_pages_per_blocks[0],
         num_queries_per_block=num_queries_per_blocks[0],
         start_seq_idx=batch_distribution,
@@ -1656,6 +1681,7 @@ def mla_ragged_paged_attention(
         kv_lens,
         page_indices,
         cu_q_lens,
+        cu_kv_lens,
         num_kv_pages_per_block=num_kv_pages_per_blocks[2],
         num_queries_per_block=num_queries_per_blocks[2],
         start_seq_idx=distribution[1],
