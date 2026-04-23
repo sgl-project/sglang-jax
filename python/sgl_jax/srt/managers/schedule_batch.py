@@ -192,6 +192,7 @@ class Req:
 
         # Each decode stage's output ids
         self.output_ids = []
+        # self.next_token_ids_device: jax.Array = None # store it and use device_get to get when need it
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
 
@@ -413,6 +414,7 @@ class Req:
             self.surr_offset = max(self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0)
 
         all_ids = self.origin_input_ids_unpadded + self.output_ids
+        # all_ids = self.origin_input_ids_unpadded + self.output_ids[:-1] if self.next_token_ids_device else self.output_ids
         return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
 
     def check_finished(self, new_accepted_len: int = 1):
@@ -1106,6 +1108,24 @@ class ScheduleBatch:
         if self.sampling_info.penalizer_orchestrator.is_required:
             if self.enable_overlap:
                 # TODO: this can be slow, optimize this.
+                # tmp=[]
+                # for req in self.reqs:
+                #     if req.next_token_ids_device:
+                #         output_id=jax.device_get(req.next_token_ids_device).tolist()[0]
+                #         req.next_token_ids_device=None
+                #         req.output_ids[-1]=output_id
+                #         print(f"[next_token_ids_device] {req.output_ids=}",flush=True)
+                #     elif len(req.output_ids):
+                #         output_id = req.output_ids[-1]
+                #         print(f"[len(req.output_ids):] {req.output_ids=}",flush=True)
+                #     else:
+                #         output_id = req.origin_input_ids[-1]
+                #         print(f"[other]] {req.output_ids=}",flush=True)
+                #     tmp.append(output_id)
+
+                # delayed_output_ids = np.array(tmp,dtype=np.int64)
+                # print(f"[prepare_for_decode] {tmp=}",flush=True)
+
                 delayed_output_ids = np.array(
                     [
                         (req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1])
@@ -1117,8 +1137,25 @@ class ScheduleBatch:
             else:
                 self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(self.output_ids)
 
+        # output_ids = self.output_ids
+        # if self.enable_overlap:
+        #     print(f"=======overlap========",flush=True)
+        #     valid_output_ids = []
+        #     for req in self.reqs:
+        #         print(f"[for req] {req.next_token_ids_device=}, {req.output_ids=}",flush=True)
+        #         if req.next_token_ids_device:
+        #             output_id=jax.device_get(req.next_token_ids_device).tolist()[0]
+        #             req.next_token_ids_device=None
+        #             req.output_ids[-1]=output_id
+        #             valid_output_ids.append(output_id)
+        #             print(f"[next_token_ids_device 1] {req.output_ids=}",flush=True)
+        #     output_ids = np.concat(valid_output_ids,dtype=np.int32)
+
         # Update fields
         self.input_ids = self.output_ids
+        # self.input_ids = output_ids
+
+        # print(f"[prepare_for_decode] {self.input_ids=}",flush=True)
 
         self.output_ids = None
 
@@ -1293,7 +1330,9 @@ class ScheduleBatch:
         seq_lens_cpu = self.seq_lens
         real_bs = len(seq_lens_cpu)
         req_pool_indices_cpu = self.req_pool_indices
-        token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
+        token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[
+            self.req_pool_indices
+        ]  # cost in pathways, 23ms
 
         # padding seq
         # extend & decode: input_ids, positions, out_cache_loc, cache_loc
@@ -1391,6 +1430,8 @@ class ScheduleBatch:
 
                 # Fill the array efficiently
                 offset = 0
+                ######################### cost in Pathways 10ms#####################
+                #####concurrecny=256,tp=4,page_size=256,max_running_requests=256
                 for i, (seq_idx, seq_len, aligned_len) in enumerate(
                     zip(valid_indices, valid_seq_lens, aligned_lengths)
                 ):
@@ -1400,6 +1441,7 @@ class ScheduleBatch:
                     ]
                     # Padding is already zero from initialization
                     offset += aligned_len
+                ######################### cost in Pathways#####################
 
         offset = np.sum(seq_lens_cpu[seq_lens_cpu > 0]) if len(seq_lens_cpu) > 0 else 0
 
@@ -1413,6 +1455,7 @@ class ScheduleBatch:
         if len(cache_loc_flat) < total_cache_loc_size:
             cache_loc_cpu[len(cache_loc_flat) :] = 0
 
+        ####################cost in Pathways 22ms######################
         if bs_padding_size > 0:
             invalid_req_pool_indices = np.array(
                 [-1] * bs_padding_size, dtype=req_pool_indices_cpu.dtype
@@ -1442,6 +1485,8 @@ class ScheduleBatch:
                 extend_logprob_start_lens = np.concat(
                     [extend_logprob_start_lens, invalid_extend_logprob_start_lens], axis=0
                 )
+
+        ############################################################################
 
         sampling_info = self.sampling_info
         if self.sampling_info:

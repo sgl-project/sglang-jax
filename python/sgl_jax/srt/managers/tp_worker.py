@@ -606,6 +606,7 @@ class ModelWorker:
                     sampling_metadata,
                 )
                 cache_miss_count += count()
+                next_token_ids_device = jax.copy_to_host_async(next_token_ids_device)
             if model_worker_batch.return_output_logprob_only:
                 logprobs = self.model_runner.compute_logprobs(token_logprobs, next_token_ids_device)
                 logits_output.next_token_logprobs = logprobs[: model_worker_batch.real_bs]
