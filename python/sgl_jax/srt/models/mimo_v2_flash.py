@@ -518,8 +518,8 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
         # Post-load: dequantize FP8 attention + layer-0 MLP to bf16.
         # Q/K head_dim padding (192→256) is handled by the kernel internally.
-        if self._is_static_quant:
-            self._dequantize_fp8_to_bf16()
+        # if self._is_static_quant:
+        #     self._dequantize_fp8_to_bf16()
 
     def _is_quant_ignored(self, hf_path: str) -> bool:
         """Check if a HuggingFace weight path is in the quantization ignored_layers list."""
