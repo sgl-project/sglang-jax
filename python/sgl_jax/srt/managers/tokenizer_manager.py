@@ -379,6 +379,7 @@ class TokenizerManager:
             obj.lora_id,
             obj.extra_key,
             obj.return_routed_experts,
+            obj.return_hidden_states,
         )
         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
         if (

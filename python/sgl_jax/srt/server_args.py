@@ -178,6 +178,7 @@ class ServerArgs:
     multimodal: bool = False
 
     enable_return_routed_experts: bool = False
+    enable_return_hidden_states: bool = False
     enable_expert_balance_debug: bool = False
     expert_balance_segment_counter: int = 100
     expert_balance_output_file: str | None = None
@@ -1077,6 +1078,11 @@ class ServerArgs:
             "--enable-return-routed-experts",
             action="store_true",
             help="Enable returning routed experts of each layer with responses.",
+        )
+        parser.add_argument(
+            "--enable-return-hidden-states",
+            action="store_true",
+            help="Enable returning per-layer hidden states with responses.",
         )
 
     @classmethod

@@ -469,6 +469,7 @@ suites = {
         TestFile("python/sgl_jax/test/layers/test_mla.py", 2),
         TestFile("test/srt/lora/test_bgmv_backend.py", 5),
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 10),
+        TestFile("test/srt/test_return_hidden_states.py", 10),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 1),
@@ -520,6 +521,7 @@ suites = {
         TestFile("test/srt/lora/test_bgmv_backend.py", 6),
         TestFile("test/srt/lora/test_dynamic_lora.py", 10),
         TestFile("test/srt/lora/test_static_lora.py", 10),
+        TestFile("test/srt/test_hidden_states_alignment.py", 10),
     ],
     "e2e-test-tpu-v6e-4": [
         TestFile("test/srt/test_moe_block_quant_e2e.py", 5, runner="pytest"),
@@ -545,6 +547,7 @@ suites = {
         TestFile("test/srt/rl/test_return_routed_experts.py", 5),
         TestFile("test/srt/rl/test_multi_engines_in_one_process.py", 5),
         TestFile("test/srt/multimodal/test_wan2_1_models.py", 30),
+        TestFile("test/srt/test_hidden_states_alignment_tp.py", 10),
     ],
 }
 
