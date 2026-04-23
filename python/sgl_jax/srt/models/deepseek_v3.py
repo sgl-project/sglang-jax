@@ -204,11 +204,20 @@ class DeepseekV3Attention(nnx.Module):
             dtype=dtype,
         )
 
-        self.attn = RadixAttention(
+        # Absorbed MLA is structurally MQA from the attention-kernel's point
+        # of view: after folding W_UK into Q the kernel sees H query heads
+        # against a single shared latent K and V (num_kv_heads=1). head_dim
+        # encodes the concatenated latent + rope Q-K contraction width;
+        # v_head_dim is the latent rank the kernel returns per head. The MLA-
+        # specific W_UK / W_UV factoring lives in __call__, outside the
+        # kernel. Name mirrors sglang-gpu's `attn_mqa` to advertise the
+        # MQA-shape contract.
+        self.attn_mqa = RadixAttention(
             num_heads=num_heads,
-            head_dim=self.qk_head_dim,
+            head_dim=kv_lora_rank + qk_rope_head_dim,
             scaling=self.qk_head_dim**-0.5,
-            num_kv_heads=num_heads,
+            num_kv_heads=1,
+            v_head_dim=kv_lora_rank,
             layer_id=layer_id,
         )
 
@@ -219,6 +228,15 @@ class DeepseekV3Attention(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ) -> tuple[jax.Array, jax.Array]:
+        """Absorbed-MLA forward (docs/design/MLA.md §3.9).
+
+        Fold W_UK into Q so the Pallas kernel attends directly against the
+        latent c_kv (MQA pattern — see attn_mqa). Fold W_UV into the output
+        chain to project the latent attention back to v_head_dim. kv_b_proj's
+        weight is reused per-forward as the source of (W_UK, W_UV); the
+        reshape/slice is constant-folded by XLA, so no runtime cost and no
+        weight-loader change needed.
+        """
         if self.q_lora_rank is None:
             q, _ = self.q_proj(hidden_states)
         else:
@@ -232,37 +250,42 @@ class DeepseekV3Attention(nnx.Module):
         kv_a_out, _ = self.kv_a_proj(hidden_states)
         compressed = kv_a_out[:, : self.kv_lora_rank]
         k_rope_raw = kv_a_out[:, self.kv_lora_rank :]
-
         compressed = self.kv_a_layernorm(compressed)
-        kv_out, _ = self.kv_b_proj(compressed)
-        kv_out = kv_out.reshape(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope = kv_out[:, :, : self.qk_nope_head_dim]
-        v = kv_out[:, :, self.qk_nope_head_dim :]
-
-        # Pad V to qk_head_dim to match K, required by fused MHATokenToKVPool.
-        v = jnp.pad(v, ((0, 0), (0, 0), (0, self.qk_head_dim - self.v_head_dim)))
 
         k_rope = k_rope_raw.reshape(-1, 1, self.qk_rope_head_dim)
         q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
-        k_rope = jnp.broadcast_to(
-            k_rope,
-            (k_rope.shape[0], self.num_heads, self.qk_rope_head_dim),
-            out_sharding=jax.sharding.PartitionSpec(None, "tensor", None),
+
+        # kv_b_proj.weight is [kv_lora_rank, n_h * (qk_nope + v_head_dim)],
+        # head-major with [nope, v] within each head block.
+        w_kv = self.kv_b_proj.weight.value.reshape(
+            self.kv_lora_rank,
+            self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+        )
+        w_uk = w_kv[:, :, : self.qk_nope_head_dim]  # [R, n_h, D_k]
+        w_uv = w_kv[:, :, self.qk_nope_head_dim :]  # [R, n_h, D_v]
+
+        # ql_nope[t, h, r] = sum_d q_nope[t, h, d] * w_uk[r, h, d]
+        ql_nope = jnp.einsum("thd,rhd->thr", q_nope, w_uk)
+
+        # Latent K/V are a single shared head — pack into the [T, 1, *]
+        # contract RadixAttention expects for MQA. MLAAttentionBackend strips
+        # the singleton axis before handing to the Pallas kernel.
+        c_kv_3d = compressed[:, None, :]
+
+        o_latent, kv_fused = self.attn_mqa(
+            ql_nope,
+            c_kv_3d,
+            c_kv_3d,
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+            q_rope=q_rope,
+            k_rope=k_rope,
         )
 
-        q = jnp.concatenate([q_nope, q_rope], axis=-1)
-        k = jnp.concatenate([k_nope, k_rope], axis=-1)
-
-        attn_output, kv_fused = self.attn(
-            q, k, v, forward_batch=forward_batch, token_to_kv_pool=token_to_kv_pool
-        )
-
-        # Strip V padding: o_proj expects num_heads * v_head_dim.
-        attn_output = attn_output.reshape(-1, self.num_heads, self.qk_head_dim)
-        attn_output = attn_output[:, :, : self.v_head_dim].reshape(
-            -1, self.num_heads * self.v_head_dim
-        )
-
+        # o_v[t, h, d] = sum_r o_latent[t, h, r] * w_uv[r, h, d]
+        o_v = jnp.einsum("thr,rhd->thd", o_latent, w_uv)
+        attn_output = o_v.reshape(-1, self.num_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
 
@@ -312,7 +335,7 @@ class DeepseekV3DecoderLayer(nnx.Module):
             if mscale_all_dim:
                 scaling_factor = rope_scaling["factor"]
                 mscale = _deepseek_yarn_get_mscale(scaling_factor, mscale_all_dim)
-                self.self_attn.attn.scaling *= mscale * mscale
+                self.self_attn.attn_mqa.scaling *= mscale * mscale
 
         # MLP: MoE or dense depending on layer index
         n_routed_experts = getattr(config, "n_routed_experts", None)
