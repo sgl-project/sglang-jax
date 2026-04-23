@@ -416,8 +416,7 @@ class SWARadixCache(BasePrefixCache):
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, : len(req.fill_ids)]
 
-            # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-            req.prefix_indices = kv_indices
+            req.prefix_indices = kv_indices.copy()
             return
 
         token_ids = req.fill_ids
@@ -681,6 +680,8 @@ class SWARadixCache(BasePrefixCache):
 
     def adjust_swa_protected_size(self, delta: int):
         """Adjust swa_protected_size_ by delta (can be negative)."""
+        if self.disable:
+            return
         self.swa_protected_size_ += delta
 
     def all_values_flatten(self) -> jnp.Array:

@@ -514,6 +514,10 @@ class Req:
         self.routed_experts = None
         self.latest_bid = None
 
+        self.swa_evicted_seqlen = 0
+        self.extend_batch_idx = 0
+        self.decode_batch_idx = 0
+
     def set_finish_with_abort(self, error_msg: str):
         # set it to one token to skip the long prefill
         self.origin_input_ids = [0]
@@ -757,12 +761,10 @@ class ScheduleBatch:
         free_slots = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, req.swa_evicted_seqlen : new_evicted
         ]
+        num_swa_freed = self.token_to_kv_pool_allocator.count_swa_mapped(free_slots)
         self.token_to_kv_pool_allocator.free_swa(free_slots)
-        # NOTE: We intentionally do NOT adjust the tree cache's evictable/protected
-        # counters here.  _swa_eff_len (used by inc_lock_ref / dec_lock_ref /
-        # _insert_helper / evict) already reads the live SWA mapping state, so the
-        # counters are naturally correct when tokens enter or leave the tree.
-        # Trying to adjust here causes double-accounting.
+        if num_swa_freed > 0 and isinstance(self.tree_cache, SWARadixCache):
+            self.tree_cache.adjust_swa_protected_size(-num_swa_freed)
         req.swa_evicted_seqlen = new_evicted
 
     def maybe_evict_swa(self, sliding_window_size=None):
@@ -794,10 +796,14 @@ class ScheduleBatch:
             return
 
         for i, req in enumerate(self.reqs):
-            pre_len = self.prefix_lens[i] if self.prefix_lens is not None else 0
+            pre_len = len(req.prefix_indices)
             if self.enable_overlap and req.is_chunked > 0:
-                if req.extend_batch_idx < 2:
-                    continue
+                # In overlap mode, the previous chunk's forward may still be
+                # in-flight reading SWA pages for positions
+                # [len_{N-2} - sliding_window, len_{N-1}). Subtracting
+                # chunked_prefill_size from pre_len shifts the eviction
+                # boundary back by exactly one chunk, which mathematically
+                # keeps new_evicted <= len_{N-2} - sliding_window.
                 chunked_prefill_size = global_server_args_dict.get("chunked_prefill_size")
                 if chunked_prefill_size is not None and chunked_prefill_size > 0:
                     pre_len -= chunked_prefill_size
@@ -805,6 +811,10 @@ class ScheduleBatch:
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
+
+        # Evict SWA tokens before allocating, so the SWA pool has space.
+        if self.is_hybrid:
+            self.maybe_evict_swa()
 
         # Allocate req slots
         bs = len(self.reqs)
@@ -941,10 +951,6 @@ class ScheduleBatch:
             )
             pt += extend_lens[i]
 
-        # Evict SWA tokens outside sliding window
-        if self.is_hybrid:
-            self.maybe_evict_swa()
-
         # Build sampling info
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
@@ -953,18 +959,12 @@ class ScheduleBatch:
 
     def new_page_count_next_decode(self, selected_indices: list[int] | None = None):
         page_size = self.token_to_kv_pool_allocator.page_size
-        requests = (
-            self.reqs if selected_indices is None else [self.reqs[i] for i in selected_indices]
-        )
         if page_size == 1:
-            return len(requests)
-        # In the decoding phase, the length of a request's KV cache should be
-        # the total length of the request minus 1
-        return (
-            sum(1 for req in requests if req.seqlen % page_size == 0)
-            if self.enable_overlap
-            else sum(1 for req in requests if (req.seqlen - 1) % page_size == 0)
-        )
+            return len(self.reqs) if selected_indices is None else len(selected_indices)
+        seq_lens = self.seq_lens
+        if selected_indices is not None:
+            seq_lens = seq_lens[selected_indices]
+        return int(np.sum(seq_lens % page_size == 0))
 
     def check_decode_mem(self, buf_multiplier=1, selected_indices: list[int] | None = None):
         num_tokens = (
@@ -1034,8 +1034,11 @@ class ScheduleBatch:
         req = self.reqs[idx]
         seq_lens_cpu = self.seq_lens
 
-        if isinstance(self.tree_cache, ChunkCache):
-            # ChunkCache does not have eviction
+        radix_cache_disabled = isinstance(self.tree_cache, ChunkCache) or getattr(
+            self.tree_cache, "disable", False
+        )
+
+        if radix_cache_disabled:
             token_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : seq_lens_cpu[idx]
             ]

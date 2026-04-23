@@ -504,6 +504,10 @@ class TestSWAOverlapSafety(CustomTestCase):
                 self.decode_batch_idx = 0
                 self.extend_batch_idx = 0
                 self.is_chunked = 0
+                # `prefix_indices` is read by maybe_evict_swa (extend path) to
+                # compute pre_len. Default to empty; tests set it explicitly
+                # when exercising the extend code path.
+                self.prefix_indices = np.empty(0, dtype=np.int32)
 
             @property
             def seqlen(self):
@@ -518,6 +522,9 @@ class TestSWAOverlapSafety(CustomTestCase):
         indices = self.alloc.alloc(n_tokens)
         assert indices is not None, f"Failed to allocate {n_tokens} tokens"
         self.req_to_token_pool.req_to_token[req.req_pool_idx, :n_tokens] = indices
+        # Mirror what cache_unfinished_req does in the real flow: prefix_indices
+        # is the row data for the cached portion (used by maybe_evict_swa).
+        req.prefix_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :n_tokens].copy()
         return indices
 
     def _make_batch(self, req, *, enable_overlap, forward_mode, prefix_lens=None, chunked_req=None):
@@ -577,42 +584,81 @@ class TestSWAOverlapSafety(CustomTestCase):
         self.assertEqual(req.swa_evicted_seqlen, expected)
         self.assertEqual(self.alloc.swa_available_size(), swa_before + expected)
 
-    def test_overlap_chunked_extend_skips_first_two_batches(self):
-        """Chunked extend with overlap should delay reclaim for the first two chunks."""
+    def test_overlap_chunked_extend_protects_inflight_chunk(self):
+        """Overlap chunked extend must never free SWA slots that the previous
+        chunk's in-flight forward could still be reading.
+
+        Real flow grows ``req.prefix_indices`` incrementally — each iter's
+        ``cache_unfinished_req`` captures the full row up to the cumulative
+        chunk boundary. Subtracting ``chunked_prefill_size`` from
+        ``pre_len`` shifts the eviction boundary back by exactly one chunk,
+        which by construction keeps ``new_evicted`` at most
+        ``len_{N-2} - sliding_window`` — the lowest position the in-flight
+        chunk N-1 forward could still be reading.
+
+        We assert two things:
+          1. ``swa_evicted_seqlen`` never exceeds the in-flight safe bound.
+          2. Eviction does kick in once cumulative prefix grows past
+             ``chunked_prefill_size + sliding_window``, so the test isn't
+             vacuously satisfied by always returning 0.
+        """
         from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
         from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
-        req = self._make_req(origin_len=128, output_len=0)
-        self._setup_req_tokens(req, 128)
+        # Pick a total length that spans enough chunks to observe both the
+        # "no eviction yet" and "eviction kicks in" phases.
+        total_len = 200  # > sliding_window + 2 * chunked_prefill_size
+        req = self._make_req(origin_len=total_len, output_len=0)
+        self._setup_req_tokens(req, total_len)
         req.is_chunked = 1
+        # Snapshot the full row of slot indices so we can produce the per-iter
+        # cumulative slices, mirroring what cache_unfinished_req would set.
+        full_row = self.req_to_token_pool.req_to_token[req.req_pool_idx, :total_len].copy()
+
         batch = self._make_batch(
             req,
             enable_overlap=True,
             forward_mode=ForwardMode.EXTEND,
-            prefix_lens=[128],
             chunked_req=req,
         )
 
         old_chunked_prefill_size = global_server_args_dict.get("chunked_prefill_size")
         global_server_args_dict["chunked_prefill_size"] = self.chunked_prefill_size
         try:
-            swa_before = self.alloc.swa_available_size()
+            num_chunks = total_len // self.chunked_prefill_size
+            saw_eviction = False
+            for k in range(num_chunks + 1):
+                cumulative = k * self.chunked_prefill_size
+                # Mirror cache_unfinished_req: prefix_indices is the row data
+                # for the cached portion (len_{k-1} after iter k-1's process).
+                req.prefix_indices = full_row[:cumulative].copy()
+                req.extend_batch_idx = k
 
-            req.extend_batch_idx = 0
-            batch.maybe_evict_swa()
-            self.assertEqual(req.swa_evicted_seqlen, 0)
+                batch.maybe_evict_swa()
 
-            req.extend_batch_idx = 1
-            batch.maybe_evict_swa()
-            self.assertEqual(req.swa_evicted_seqlen, 0)
+                # In-flight chunk N-1 reads SWA from
+                # [len_{N-2} - sliding_window, len_{N-1}). The lowest position
+                # we must NOT have evicted is len_{N-2} - sliding_window.
+                # len_{N-2} = max(0, cumulative - chunked_prefill_size).
+                in_flight_low = max(
+                    0,
+                    cumulative - self.chunked_prefill_size - self.sliding_window,
+                )
+                self.assertLessEqual(
+                    req.swa_evicted_seqlen,
+                    in_flight_low,
+                    f"iter {k}: evicted={req.swa_evicted_seqlen} would corrupt "
+                    f"in-flight chunk reading from position {in_flight_low}",
+                )
+                if req.swa_evicted_seqlen > 0:
+                    saw_eviction = True
 
-            req.extend_batch_idx = 2
-            batch.maybe_evict_swa()
-
-            expected_pre_len = 128 - self.chunked_prefill_size
-            expected_evicted = expected_pre_len - self.sliding_window
-            self.assertEqual(req.swa_evicted_seqlen, expected_evicted)
-            self.assertEqual(self.alloc.swa_available_size(), swa_before + expected_evicted)
+            # Sanity: with total_len=200 the loop must reach iters where
+            # eviction kicks in, otherwise the test would be vacuous.
+            self.assertTrue(
+                saw_eviction,
+                "Test never observed any SWA eviction; widen the loop range " "or weaken the setup",
+            )
         finally:
             global_server_args_dict["chunked_prefill_size"] = old_chunked_prefill_size
 
