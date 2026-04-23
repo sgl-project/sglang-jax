@@ -572,18 +572,18 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_swa(free_index, dp_rank=dp_rank)
         else:
             self.free_group[dp_rank].append(free_index)
-        assert (
-            self.full_attn_allocator.available_size(dp_rank=dp_rank)
-            <= self.full_attn_allocator.size_per_rank
+        full_expected = (
+            self.full_attn_allocator.size_per_rank
             if self.dp_size > 1
             else self.full_attn_allocator.size
         )
-        assert (
-            self.swa_attn_allocator.available_size(dp_rank=dp_rank)
-            <= self.swa_attn_allocator.size_per_rank
+        assert self.full_attn_allocator.available_size(dp_rank=dp_rank) <= full_expected
+        swa_expected = (
+            self.swa_attn_allocator.size_per_rank
             if self.dp_size > 1
             else self.swa_attn_allocator.size
         )
+        assert self.swa_attn_allocator.available_size(dp_rank=dp_rank) <= swa_expected
 
     def free_swa(self, free_index: np.array, dp_rank: int = 0):
         mapping = (

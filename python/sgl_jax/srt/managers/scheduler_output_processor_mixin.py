@@ -120,7 +120,7 @@ class SchedulerOutputProcessorMixin:
                             out_cache_start = len(info.out_cache_loc) - decode_count
                             j = out_cache_start + local_decode_idx
                             self.token_to_kv_pool_allocator.free(
-                                info.out_cache_loc[j : j + 1], req.dp_rank
+                                info.out_cache_loc[j : j + 1], dp_rank
                             )
                     continue
 
@@ -337,7 +337,7 @@ class SchedulerOutputProcessorMixin:
                         ) % self.page_size == 0:
                             indices_to_free = info.out_cache_loc[i : i + 1]
                     if indices_to_free is not None:
-                        self.token_to_kv_pool_allocator.free(indices_to_free, req.dp_rank)
+                        self.token_to_kv_pool_allocator.free(indices_to_free, dp_rank)
                     continue
 
                 new_accepted_len = 1
@@ -367,7 +367,7 @@ class SchedulerOutputProcessorMixin:
                             len(kv_indices) <= EagleDraftInput.ALLOC_LEN_PER_DECODE
                         ), f"redundant kv indices {len(kv_indices)=} should less than {EagleDraftInput.ALLOC_LEN_PER_DECODE=}"
 
-                        self.token_to_kv_pool_allocator.free(kv_indices, req.dp_rank)
+                        self.token_to_kv_pool_allocator.free(kv_indices, dp_rank)
                     # End trace for finished request
                     if precision_tracer.get_trace_active():
                         precision_tracer.set_request_status_to_completed(req.rid)
