@@ -518,8 +518,8 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
         # Post-load: dequantize FP8 attention + layer-0 MLP to bf16.
         # Q/K head_dim padding (192→256) is handled by the kernel internally.
-        # if self._is_static_quant:
-        #     self._dequantize_fp8_to_bf16()
+        if self._is_static_quant:
+            self._dequantize_fp8_to_bf16()
 
     def _is_quant_ignored(self, hf_path: str) -> bool:
         """Check if a HuggingFace weight path is in the quantization ignored_layers list."""
@@ -720,7 +720,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
         for layer_idx, layer in enumerate(self.model.layers):
             attn = layer.self_attn
-            for proj_name in ("q_proj", "k_proj", "v_proj"):
+            for proj_name in ("k_proj", "v_proj"):
                 proj = getattr(attn, proj_name)
                 if isinstance(proj, QuantizedLinear):
                     # Pass head_dim for per-head block quant handling.
@@ -789,20 +789,30 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         is_fp8 = self._is_static_quant
 
         # Attention projections
+        q_proj_stays_fp8 = is_fp8 and not self._is_quant_ignored(
+            f"{prefix}.self_attn.q_proj"
+        )
         for proj, sharding, kv_pad, hd_pad in [
-            ("q_proj", (None, "tensor"), False, True),
+            (
+                "q_proj",
+                ("tensor", None) if q_proj_stays_fp8 else (None, "tensor"),
+                False,
+                not q_proj_stays_fp8,
+            ),
             ("k_proj", (None, "tensor"), not is_fp8, True),
             ("v_proj", (None, "tensor"), not is_fp8, False),
             ("o_proj", ("tensor", None), False, True),
         ]:
             hf_key = f"{prefix}.self_attn.{proj}"
             ignored = self._is_quant_ignored(hf_key)
+            use_quant = is_fp8 and not ignored
+            stay_fp8 = use_quant and proj == "q_proj"
             weight_suffix = "weight" if (not is_fp8 or ignored) else "weight_q"
 
             mappings[f"{hf_key}.weight"] = WeightMapping(
                 target_path=f"{target}.self_attn.{proj}.{weight_suffix}",
                 sharding=sharding,
-                transpose=True,
+                transpose=not stay_fp8,
                 head_dim_padding=hd_pad,
                 kv_head_padding=kv_pad,
             )
