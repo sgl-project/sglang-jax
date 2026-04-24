@@ -765,6 +765,12 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         for layer_idx, layer in enumerate(self.model.layers):
             attn = layer.self_attn
 
+            # Dequantize q_proj (uniform block quant, no head boundaries).
+            q_proj = getattr(attn, "q_proj")
+            if isinstance(q_proj, QuantizedLinear):
+                setattr(attn, "q_proj", self._dequantize_quantized_linear(q_proj))
+                logger.info("Dequantized layer %d q_proj → bf16", layer_idx)
+
             # Save k_proj's 2D scale before dequant — v_proj needs it for
             # cross-scale dequant (MiMo-Flash combined k+v block quant).
             k_scale_2d = None
@@ -844,16 +850,8 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         is_fp8 = self._is_static_quant
 
         # Attention projections
-        q_proj_stays_fp8 = is_fp8 and not self._is_quant_ignored(
-            f"{prefix}.self_attn.q_proj"
-        )
         for proj, sharding, kv_pad, hd_pad in [
-            (
-                "q_proj",
-                ("tensor", None) if q_proj_stays_fp8 else (None, "tensor"),
-                False,
-                not q_proj_stays_fp8,
-            ),
+            ("q_proj", (None, "tensor"), False, True),
             ("k_proj", (None, "tensor"), not is_fp8, True),
             ("v_proj", (None, "tensor"), not is_fp8, False),
             ("o_proj", ("tensor", None), False, True),
@@ -861,13 +859,12 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             hf_key = f"{prefix}.self_attn.{proj}"
             ignored = self._is_quant_ignored(hf_key)
             use_quant = is_fp8 and not ignored
-            stay_fp8 = use_quant and proj == "q_proj"
             weight_suffix = "weight" if (not is_fp8 or ignored) else "weight_q"
 
             mappings[f"{hf_key}.weight"] = WeightMapping(
                 target_path=f"{target}.self_attn.{proj}.{weight_suffix}",
                 sharding=sharding,
-                transpose=not stay_fp8,
+                transpose=True,
                 head_dim_padding=hd_pad,
                 kv_head_padding=kv_pad,
             )
