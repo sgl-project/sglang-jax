@@ -642,32 +642,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
         if dim1 == out_dim:
             # Model layout [in, out], no kv-padding
-            # Check if per-head re-indexing is needed: when head_dim doesn't
-            # divide evenly by block_size, the pre-expanded uniform scale has
-            # wrong block assignments at head boundaries.
-            if head_dim is not None and head_dim % 128 != 0:
-                block_size = 128
-                blocks_per_head = math.ceil(head_dim / block_size)
-                num_heads = out_dim // head_dim
-                # Build per-head gather: map each output channel to a channel
-                # position in the uniformly-expanded scale that holds the
-                # correct per-head block's value.
-                gather_idx = jnp.array(
-                    [
-                        ((j // head_dim) * blocks_per_head + (j % head_dim) // block_size)
-                        * block_size
-                        for j in range(out_dim)
-                    ]
-                )
-                weight_scale = weight_scale[:, :, gather_idx]
-                logger.info(
-                    "Per-head block re-index (pre-expanded): %d heads × head_dim=%d, "
-                    "%d blocks/head, scale shape=%s",
-                    num_heads,
-                    head_dim,
-                    blocks_per_head,
-                    weight_scale.shape,
-                )
+            pass
         elif dim0 == out_dim:
             # HF layout [out, in] — transpose to model layout
             weight_q = jnp.transpose(weight_q)
