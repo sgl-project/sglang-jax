@@ -1478,6 +1478,28 @@ class WeightLoader:
         jax_path = mapping.target_path
         processed_weight = weight
 
+        # Handle fused KV buffer storage (used by MiMo-V2-Flash per-head dequant).
+        # target_path like "__KV_K_WEIGHT__42" stores into model._kv_buffers.
+        if jax_path.startswith("__KV_"):
+            if hasattr(self.model, "_kv_buffers"):
+                layer_idx = int(jax_path.rsplit("__", 1)[-1])
+                buf = self.model._kv_buffers.setdefault(layer_idx, {})
+                if "K_WEIGHT" in jax_path:
+                    buf["k_weight"] = processed_weight
+                elif "K_SCALE" in jax_path:
+                    buf["k_scale"] = processed_weight
+                elif "V_WEIGHT" in jax_path:
+                    buf["v_weight"] = processed_weight
+                elif "V_SCALE" in jax_path:
+                    buf["v_scale"] = processed_weight
+                logger.info(
+                    "Stored KV buffer %s for layer %d, shape=%s",
+                    jax_path.split("__")[2],
+                    layer_idx,
+                    processed_weight.shape,
+                )
+            return
+
         # Apply output_multiplier_scale to lm_head weights (matching PyTorch implementation)
         if "lm_head" in hf_key and hasattr(self.model_config.hf_config, "output_multiplier_scale"):
             logger.info(
