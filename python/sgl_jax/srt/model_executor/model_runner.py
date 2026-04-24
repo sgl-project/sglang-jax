@@ -396,16 +396,17 @@ class ModelRunner(BaseModelRunner):
         return effective
 
     def _compute_cell_size(self) -> int:
-        """Per-token KV cache cost in bytes across all layers.
+        """Per-token KV cache cost in bytes per device, summed across layers.
 
-        Branches by attention layout:
+        Two layouts:
         - absorbed MLA (`fa` on MLA model): only the latent c_kv is cached
           (`kv_lora_rank + qk_rope_head_dim`); W_UV is applied post-attention,
-          so V never enters the cache (no *2).
-        - fa_mha on MLA model: kv_b_proj decompresses to per-head K/V; FA stores
-          them as two independent tensors (*2). V is padded to qk_head_dim by
-          `_forward_mha`, so K and V share the same head_dim.
-        - standard MHA/GQA: K and V are independent projections (*2).
+          so V never enters the cache (no *2). The MLA pool is replicated, so
+          per-device cost == total cost.
+        - everything else (standard MHA/GQA, and fa_mha/native on MLA model):
+          K and V stored as independent per-head tensors (*2), MHA pool is
+          sharded on the head dim — so use per-device kv head count.
+          For MLA models, patch_model_config sets head_dim = qk_nope+qk_rope.
         """
 
         def align128(x: int) -> int:
@@ -424,11 +425,6 @@ class ModelRunner(BaseModelRunner):
                 * num_layers
                 * dtype_size
             )
-
-        if self.use_mla_backend:
-            cfg = self.model_config.hf_text_config
-            qk_head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim
-            return self.num_attn_heads * align128(qk_head_dim) * 2 * num_layers * dtype_size
 
         return (
             self.model_config.get_num_kv_heads(self.tp_size)

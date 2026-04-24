@@ -40,6 +40,8 @@ GEMMA2_2B_IT = "google/gemma-2-2b-it"
 
 BAILING_MOE = "inclusionAI/Ling-mini-2.0"
 DEEPSEEK_R1_DISTILL_QWEN_1_5B = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+DEEPSEEK_V2_LITE = "deepseek-ai/DeepSeek-V2-Lite"
+DEEPSEEK_CODER_V2_LITE_INSTRUCT = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 
 QWEN3_32B = "google/gemma-2-2b-it"
 QWEN3_32B_EAGLE3 = "AngelSlim/Qwen3-32B_eagle3"

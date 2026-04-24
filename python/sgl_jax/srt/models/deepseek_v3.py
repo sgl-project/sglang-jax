@@ -283,7 +283,7 @@ class DeepseekV3Attention(nnx.Module):
         q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
 
         if self.use_absorbed:
-            attn_output, kv_fused = self._forward_absorbed(
+            attn_output, kv_fused = self._forward_mqa(
                 q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
             )
         else:
@@ -314,7 +314,7 @@ class DeepseekV3Attention(nnx.Module):
         self.w_uv.value = w_kv[:, :, self.qk_nope_head_dim :]
         self.kv_b_proj = None
 
-    def _forward_absorbed(
+    def _forward_mqa(
         self,
         q_nope: jax.Array,
         q_rope: jax.Array,
