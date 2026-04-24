@@ -121,14 +121,56 @@ class ReqToTokenPool:
         """Return number of available request slots"""
         return len(self.free_slots)
 
-    def alloc(self, need_size: int = 1) -> list[int]:
-        """Allocate request slots"""
-        if need_size > len(self.free_slots):
+    def alloc(self, reqs=1) -> list[int]:
+        """Allocate request slots.
+
+        Backwards-compatible signature:
+        - reqs: int -- legacy path (need_size); take need_size slots from the head of free_slots.
+        - reqs: Sequence[Req-like] -- new path (RFC §Chunked Prefill Slot Reuse line 431):
+            * Reqs already holding a req_pool_idx are skipped (must satisfy is_chunked > 0
+              -- safety assert).
+            * Reqs with no req_pool_idx are allocated from free_slots and have
+              req.req_pool_idx written back.
+            * If capacity is insufficient, return None and leave every req field untouched
+              (atomic semantics).
+
+        Returns: list[int] (the slot per req), or None if capacity is insufficient.
+        """
+        if isinstance(reqs, int):
+            need_size = reqs
+            if need_size > len(self.free_slots):
+                return None
+            select_indices = self.free_slots[:need_size]
+            self.free_slots = self.free_slots[need_size:]
+            return select_indices
+
+        # New path: list[Req-like]
+        # Pass 1: count slots that need fresh allocation; assert safety on reuses.
+        new_count = 0
+        for req in reqs:
+            if req.req_pool_idx is None:
+                new_count += 1
+            else:
+                assert req.is_chunked > 0, (
+                    "ReqToTokenPool.alloc: req with existing req_pool_idx must have "
+                    f"is_chunked > 0 (chunked prefill); got is_chunked={req.is_chunked!r}"
+                )
+
+        if new_count > len(self.free_slots):
             return None
 
-        select_indices = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
-        return select_indices
+        # Pass 2: atomic allocation.
+        new_slots = self.free_slots[:new_count]
+        self.free_slots = self.free_slots[new_count:]
+
+        result = []
+        cursor = 0
+        for req in reqs:
+            if req.req_pool_idx is None:
+                req.req_pool_idx = new_slots[cursor]
+                cursor += 1
+            result.append(req.req_pool_idx)
+        return result
 
     def free(self, free_index: int | list[int]):
         """Free request slots"""
@@ -140,6 +182,40 @@ class ReqToTokenPool:
     def clear(self):
         """Clear all allocation states"""
         self.free_slots = list(range(self.size))
+
+
+class HybridReqToTokenPool(ReqToTokenPool):
+    """Hybrid-architecture ReqToTokenPool that coordinates KV slots and recurrent state slots.
+
+    RFC-0015 §HybridReqToTokenPool.
+    - Inherits from ReqToTokenPool (KV slot behavior unchanged).
+    - Holds a reference to a RecurrentStatePool (the same instance also lives inside
+      MemoryPools).
+    - Maintains req_index_to_recurrent_index_mapping (CPU-side np.int32) bridging
+      req_pool_idx -> recurrent_pool_idx.
+
+    **JIT compatibility warning (must NOT be passed to JIT)**:
+    The parent ReqToTokenPool is registered as a pytree node via
+    `@register_pytree_node_class`, but a Python decorator does **not** propagate to
+    subclasses. This subclass is intentionally not registered, so JAX treats it as a
+    plain Python object — passing it directly to `jax.jit` will raise
+    "unregistered pytree node". Phase 1 only uses this class on the Python side
+    (slot coordination + mapping); it never enters JIT trace. If a later Phase
+    needs to JIT this class, add `@register_pytree_node_class` to the subclass
+    and override tree_flatten / tree_unflatten to include recurrent_state_pool.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        dtype: np.dtype,
+        recurrent_state_pool,
+    ):
+        super().__init__(size=size, max_context_len=max_context_len, dtype=dtype)
+        self.recurrent_state_pool = recurrent_state_pool
+        # mapping[req_pool_idx] = recurrent_pool_idx; initialized to 0 (dummy slot).
+        self.req_index_to_recurrent_index_mapping = np.zeros(size, dtype=np.int32)
 
 
 @register_pytree_node_class
