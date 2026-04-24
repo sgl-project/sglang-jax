@@ -571,15 +571,29 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         elif weight_scale.ndim == 2:
             # 2D block-quant scale: (out_blocks, in_blocks) in HF layout.
             # Expand to 3D kernel-ready (in_blocks, 1, out_dim) then reuse _block_dequant.
+            import math
+
             from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
                 expand_block_scale,
             )
 
             # Determine out_dim: weight_q is (in, out) model layout or (out, in) HF layout.
-            _, in_blocks = weight_scale.shape
+            out_blocks, in_blocks = weight_scale.shape
             out_dim = weight_q.shape[1] if weight_q.shape[0] % in_blocks == 0 else weight_q.shape[0]
             block_size_out = 128
-            scale_3d = expand_block_scale(weight_scale, out_dim, block_size_out)
+            uniform_blocks = math.ceil(out_dim / block_size_out)
+
+            channel_to_block = None
+            if head_dim is not None and out_blocks != uniform_blocks:
+                blocks_per_head = math.ceil(head_dim / block_size_out)
+                channel_to_block = jnp.array([
+                    (j // head_dim) * blocks_per_head + (j % head_dim) // block_size_out
+                    for j in range(out_dim)
+                ])
+
+            scale_3d = expand_block_scale(
+                weight_scale, out_dim, block_size_out, channel_to_block=channel_to_block
+            )
             weight_bf16 = self._block_dequant(weight_q, scale_3d, head_dim=head_dim)
         elif weight_scale.ndim == 1:
             out_dim = weight_scale.shape[0]
