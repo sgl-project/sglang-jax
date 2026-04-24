@@ -778,7 +778,10 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
         head_dim = self.config.head_dim
         v_head_dim = getattr(self.config, "v_head_dim", head_dim)
-        num_kv_heads = self.config.num_key_value_heads
+        # Infer num_kv_heads from actual weight shape, not config
+        # (config may have the TP-replicated count).
+        first_buf = next(iter(kv_buffers.values()))
+        num_kv_heads = first_buf["k_weight"].shape[0] // head_dim
 
         quant_cfg = getattr(self, "_quant_config", None)
         block_size = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
