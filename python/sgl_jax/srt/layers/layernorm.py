@@ -216,6 +216,7 @@ class GemmaRMSNorm(nnx.Module):
         x = x.astype(orig_dtype)
         return x if residual is None else (x, residual)
 
+
 def rmsnorm_forward(x, residual, weight, epsilon) -> jax.Array | tuple[jax.Array, jax.Array]:
     orig_dtype = x.dtype
     x_f32 = jnp.asarray(x, jnp.float32)

@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 init_fn = nnx.initializers.uniform()
 
+
 def _yarn_linear_ramp_mask(low: float, high: float, dim: int, dtype: jnp.dtype) -> jax.Array:
     """Create a linear ramp mask for YaRN scaling."""
     if low == high:

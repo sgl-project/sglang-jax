@@ -11,9 +11,7 @@ class FrameworkLogLevel(IntEnum):
     TRACE = 4
 
 
-FRAMEWORK_LOG_LEVEL = FrameworkLogLevel(
-    int(os.environ.get("SGLANG_FRAMEWORK_LOG_LEVEL", "0"))
-)
+FRAMEWORK_LOG_LEVEL = FrameworkLogLevel(int(os.environ.get("SGLANG_FRAMEWORK_LOG_LEVEL", "0")))
 
 
 def print_parameter_shardings(model):
