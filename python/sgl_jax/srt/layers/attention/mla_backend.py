@@ -1,10 +1,14 @@
 """Attention backend for the absorbed MLA path (MLA v2 Pallas kernel).
 
 This backend wraps `mla_ragged_paged_attention` with a 4D paged latent KV cache
-(see `MLATokenToKVPool`). Unlike the MHA backend it takes a 4-tuple payload
-`(ql_nope, q_pe, new_kv_c, new_k_pe)` and returns a latent output `o_latent` of
-shape `[T, n_h, kv_lora_rank]`; the caller is responsible for projecting through
-`W_UV → W_O` (see `docs/design/MLA.md` §3.9).
+(see `MLATokenToKVPool`). It follows the same `(q, k, v, layer, forward_batch,
+pool, **kwargs)` contract as the MHA FlashAttention backend so that
+`RadixAttention` remains the unified entry point. Callers pass the absorbed
+latent Q as `q`, the latent `c_kv` as both `k` and `v`, and the rope parts as
+the `q_rope` / `k_rope` kwargs; the backend reassembles the 4-tuple
+`(ql_nope, q_pe, new_kv_c, new_k_pe)` the Pallas kernel consumes. The output
+is the latent attention `o_latent: [T, n_h, kv_lora_rank]`; the caller
+projects it through `W_UV → W_O` (see `docs/design/MLA.md` §3.9).
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
-from sgl_jax.srt.kernels.mla.v2.kernel import mla_ragged_paged_attention
+from sgl_jax.srt.kernels.mla.v2.kernel import cdiv, mla_ragged_paged_attention
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.jax_utils import device_array
@@ -143,7 +147,9 @@ class MLAAttentionBackend(AttentionBackend):
         if batch.forward_mode == ForwardMode.DECODE:
             distribution = np.array([num_seqs, num_seqs, num_seqs], dtype=np.int32)
         elif batch.forward_mode == ForwardMode.EXTEND:
-            distribution = np.array([0, num_seqs, num_seqs], dtype=np.int32)
+            # MLA v2 kernel skips the chunked-prefill-only branch (sequences[i:j]);
+            # route all extend seqs through the mixed branch (sequences[j:k]).
+            distribution = np.array([0, 0, num_seqs], dtype=np.int32)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
@@ -196,33 +202,51 @@ class MLAAttentionBackend(AttentionBackend):
     @named_scope
     def __call__(
         self,
-        payload: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         **kwargs,
     ):
-        """Absorbed-MLA forward.
+        """Absorbed-MLA forward, called through ``RadixAttention``.
 
-        Args:
-            payload: `(ql_nope, q_pe, new_kv_c, new_k_pe)`
-                - ql_nope:  [T, n_h, kv_lora_rank]
-                - q_pe:     [T, n_h, qk_rope_head_dim]
-                - new_kv_c: [T, kv_lora_rank]
-                - new_k_pe: [T, qk_rope_head_dim]
-            layer: RadixAttention metadata holder.
-            forward_batch / token_to_kv_pool: cache + scheduling info.
+        Signature mirrors the other attention backends so ``RadixAttention``
+        can serve as the unified entry point. The MLA-specific tensors land in
+        standard slots:
 
-        Returns:
-            (o_latent, updated_cache) where
-              - o_latent: [T, n_h, kv_lora_rank] (caller projects via W_UV→W_O)
-              - updated_cache: 4D paged buffer to feed back into the pool.
+            q:         [T, n_h, kv_lora_rank]            — absorbed latent query (``ql_nope``)
+            k:         [T, 1, kv_lora_rank]              — latent KV (c_kv); v is the same tensor
+            v:         [T, 1, kv_lora_rank]              — same object as ``k`` (MLA is MQA on the latent)
+            q_rope=…:  [T, n_h, qk_rope_head_dim]        — ``q_pe``
+            k_rope=…:  [T, 1, qk_rope_head_dim]          — ``k_pe`` (shared across heads)
 
-        The kernel handles `qk_rope_head_dim=64 → 128` and other
-        `align_to(*, 128)` padding internally, so callers should pass tensors at
-        the unpadded logical dim.
+        Internally reassembles the 4-tuple ``(ql_nope, q_pe, new_kv_c, new_k_pe)``
+        the v2 Pallas kernel consumes. Returns ``(o_latent, updated_cache)``
+        with ``o_latent: [T, n_h, kv_lora_rank]`` — the caller is responsible
+        for projecting via ``W_UV → W_O``.
+
+        The kernel handles ``qk_rope_head_dim=64 → 128`` and other
+        ``align_to(*, 128)`` padding internally, so callers pass logical dims.
         """
-        ql_nope, q_pe, new_kv_c, new_k_pe = payload
+        # v is the same latent tensor as k in MLA-MQA — we only need one.
+        del v
+        q_rope = kwargs.get("q_rope")
+        k_rope = kwargs.get("k_rope")
+        if q_rope is None or k_rope is None:
+            raise ValueError(
+                "MLAAttentionBackend requires q_rope/k_rope kwargs (q_pe/k_pe) "
+                "alongside the non-rope q/k tensors."
+            )
+
+        # Strip the (single) KV-head axis from the latent K/K-rope tensors.
+        # Squeezing a length-1 axis preserves any caller-provided sharding on
+        # the remaining dims (replicated stays replicated).
+        new_kv_c = k if k.ndim == 2 else jnp.squeeze(k, axis=1)
+        new_k_pe = k_rope if k_rope.ndim == 2 else jnp.squeeze(k_rope, axis=1)
+        ql_nope = q
+        q_pe = q_rope
 
         cache = token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
         sm_scale = (
@@ -230,12 +254,14 @@ class MLAAttentionBackend(AttentionBackend):
             if (layer is None or layer.scaling is None)
             else layer.scaling
         )
+        sliding_window = layer.sliding_window_size if layer is not None else None
+        soft_cap = layer.logit_cap if layer is not None else None
 
         in_specs = (
-            P(None, None, None),  # ql_nope    [T, n_h, lkv]
-            P(None, None, None),  # q_pe       [T, n_h, r]
-            P(None, None),  # new_kv_c   [T, lkv]
-            P(None, None),  # new_k_pe   [T, r]
+            P(None, "tensor", None),  # ql_nope    [T, n_h/tp, lkv]
+            P(None, "tensor", None),  # q_pe       [T, n_h/tp, r]
+            P(None, None),  # new_kv_c   [T, lkv]  (replicated — single latent)
+            P(None, None),  # new_k_pe   [T, r]    (replicated)
             P(None, None, None, None),  # cache (replicated, RFC §3.1)
             P(),  # seq_lens
             P(),  # page_indices
@@ -244,8 +270,8 @@ class MLAAttentionBackend(AttentionBackend):
             P(),  # distribution
         )
         out_specs = (
-            P(None, None, None),  # o_latent       [T, n_h, lkv]
-            P(None, None, None, None),  # updated cache  4D
+            P(None, "tensor", None),  # o_latent       [T, n_h/tp, lkv]
+            P(None, None, None, None),  # updated cache  4D (replicated)
         )
 
         def _run(
@@ -272,6 +298,8 @@ class MLAAttentionBackend(AttentionBackend):
                 cu_kv_lens_,
                 distribution_,
                 sm_scale=sm_scale,
+                sliding_window=sliding_window,
+                soft_cap=soft_cap,
                 num_kv_pages_per_block=self.num_kv_pages_per_block,
                 num_queries_per_block=self.num_queries_per_block,
                 decode_batch_size=self.decode_batch_size,
@@ -297,3 +325,15 @@ class MLAAttentionBackend(AttentionBackend):
         )
 
         return o_latent, updated_cache
+
+    @staticmethod
+    def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
+        # Same scalar-prefetch budget heuristic as FlashAttention.get_max_running_reqests:
+        # caps the number of concurrent requests by the per-request page slot count
+        # so metadata arrays fit in TPU scalar-prefetch memory.
+        num_page_per_req = cdiv(max_context_len, page_size)
+        res = 1024 * 1024 // 2 // num_page_per_req // 4
+        assert (
+            res > 0
+        ), f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"
+        return res

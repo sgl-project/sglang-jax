@@ -544,6 +544,30 @@ class ModelRunner(BaseModelRunner):
                 swa_head_num=swa_head_num,
                 mesh=self.mesh,
             )
+        elif self.use_mla_backend:
+            # Absorbed MLA path: a single latent KV stored as a fused 4D paged
+            # buffer (RFC §3.2). Shape is driven by (kv_lora_rank, qk_rope_head_dim),
+            # not by (head_num, head_dim) the MHA pool expects.
+            hf_text_config = self.model_config.hf_text_config
+            kv_lora_rank = getattr(hf_text_config, "kv_lora_rank", None)
+            qk_rope_head_dim = getattr(hf_text_config, "qk_rope_head_dim", None)
+            if kv_lora_rank is None or qk_rope_head_dim is None:
+                raise ValueError(
+                    "MLA pool requires kv_lora_rank and qk_rope_head_dim on the "
+                    "model config; got "
+                    f"kv_lora_rank={kv_lora_rank}, qk_rope_head_dim={qk_rope_head_dim}."
+                )
+            from sgl_jax.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+            self.token_to_kv_pool = MLATokenToKVPool(
+                size=self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+                mesh=self.mesh,
+            )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
                 size=self.max_total_num_tokens,
@@ -602,6 +626,22 @@ class ModelRunner(BaseModelRunner):
 
             return NativeAttention(self.num_attn_heads, self.num_kv_heads, self.mesh)
         elif backend == "fa":
+            if self.use_mla_backend:
+                # Absorbed MLA path: the v2 Pallas kernel replaces FlashAttention
+                # for models with AttentionArch.MLA (see docs/design/MLA.md §3.10).
+                from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
+
+                hf_text_config = self.model_config.hf_text_config
+                return MLAAttentionBackend(
+                    num_attn_heads=self.num_attn_heads,
+                    kv_lora_rank=hf_text_config.kv_lora_rank,
+                    qk_nope_head_dim=hf_text_config.qk_nope_head_dim,
+                    qk_rope_head_dim=hf_text_config.qk_rope_head_dim,
+                    v_head_dim=hf_text_config.v_head_dim,
+                    page_size=self.page_size,
+                    mesh=self.mesh,
+                )
+
             from sgl_jax.srt.layers.attention.flashattention_backend import (
                 FlashAttention,
             )
