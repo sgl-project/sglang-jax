@@ -9,8 +9,6 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax._src import mesh as mesh_lib
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
@@ -306,6 +304,12 @@ class ModelRunner(BaseModelRunner):
             self.server_args.ep_num_redundant_experts
         )
         self.model_config.hf_config.moe_backend = self.model_config.moe_backend.value
+        # Pick MLA forward path at server start. Only `fa` selects absorbed
+        # (the MLA Pallas kernel); `fa_mha` and `native` both decompress latent
+        # KV via kv_b_proj and run standard attention. Read by
+        # DeepseekV3DecoderLayer to construct DeepseekV3Attention; harmless on
+        # non-MLA models that ignore the attribute.
+        self.model_config.hf_config.use_absorbed_mla = self.server_args.attention_backend == "fa"
 
         if self.server_args.ep_dispatch_algorithm:
             with jax.set_mesh(self.mesh):
@@ -391,6 +395,49 @@ class ModelRunner(BaseModelRunner):
         effective = (swa_num_kv_heads / num_kv_heads) * swa_layers + full_layers
         return effective
 
+    def _compute_cell_size(self) -> int:
+        """Per-token KV cache cost in bytes across all layers.
+
+        Branches by attention layout:
+        - absorbed MLA (`fa` on MLA model): only the latent c_kv is cached
+          (`kv_lora_rank + qk_rope_head_dim`); W_UV is applied post-attention,
+          so V never enters the cache (no *2).
+        - fa_mha on MLA model: kv_b_proj decompresses to per-head K/V; FA stores
+          them as two independent tensors (*2). V is padded to qk_head_dim by
+          `_forward_mha`, so K and V share the same head_dim.
+        - standard MHA/GQA: K and V are independent projections (*2).
+        """
+
+        def align128(x: int) -> int:
+            return (x + 127) // 128 * 128
+
+        dtype_size = jnp.dtype(self.kv_cache_dtype).itemsize
+        num_layers = self.adjust_layer_num()
+
+        if self.use_mla_backend and self.server_args.attention_backend == "fa":
+            # Two-segment alignment matches the MLA v2 kernel ABI: lkv and rope
+            # are independent buffers each padded to 128, NOT align(lkv+rope).
+            # Mirrors MLATokenToKVPool.kv_dim — see kernel.py:163-176.
+            cfg = self.model_config.hf_text_config
+            return (
+                (align128(cfg.kv_lora_rank) + align128(cfg.qk_rope_head_dim))
+                * num_layers
+                * dtype_size
+            )
+
+        if self.use_mla_backend:
+            cfg = self.model_config.hf_text_config
+            qk_head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim
+            return self.num_attn_heads * align128(qk_head_dim) * 2 * num_layers * dtype_size
+
+        return (
+            self.model_config.get_num_kv_heads(self.tp_size)
+            * align128(self.model_config.head_dim)
+            * 2
+            * num_layers
+            * dtype_size
+        )
+
     def profile_max_num_token(self, total_device_memory: int):
         """
         Profile the maximum number of tokens that can fit in memory.
@@ -405,16 +452,7 @@ class ModelRunner(BaseModelRunner):
 
         if available_kv_cache_bytes <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
-        head_dim_aligned = self.model_config.head_dim
-        if head_dim_aligned % 128 != 0:
-            head_dim_aligned = (self.model_config.head_dim + 127) // 128 * 128
-        cell_size = (
-            self.model_config.get_num_kv_heads(self.tp_size)
-            * head_dim_aligned
-            * self.adjust_layer_num()
-            * 2
-            * jnp.dtype(self.kv_cache_dtype).itemsize
-        )
+        cell_size = self._compute_cell_size()
 
         # Calculate max tokens that can fit in available memory
         max_tokens = max(1, int(available_kv_cache_bytes // cell_size))
@@ -544,7 +582,7 @@ class ModelRunner(BaseModelRunner):
                 swa_head_num=swa_head_num,
                 mesh=self.mesh,
             )
-        elif self.use_mla_backend:
+        elif self.use_mla_backend and self.server_args.attention_backend == "fa":
             # Absorbed MLA path: a single latent KV stored as a fused 4D paged
             # buffer (RFC §3.2). Shape is driven by (kv_lora_rank, qk_rope_head_dim),
             # not by (head_num, head_dim) the MHA pool expects.
@@ -569,6 +607,8 @@ class ModelRunner(BaseModelRunner):
                 mesh=self.mesh,
             )
         else:
+            # Non-MLA model, OR an MLA model running fa_mha / native (both
+            # decompress latent KV per-forward and store full per-head K/V).
             self.token_to_kv_pool = MHATokenToKVPool(
                 size=self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -614,47 +654,57 @@ class ModelRunner(BaseModelRunner):
         self.attn_backend = self._get_attention_backend()
 
     def _get_attention_backend(self):
-        # Fallback on CPU: FlashAttention (Pallas/Triton) does not support CPU compilation and execution
         backend = self.server_args.attention_backend
-        if self.server_args.device == "cpu" and backend == "fa":
+        if self.server_args.device == "cpu" and backend in ("fa", "fa_mha"):
             logger.warning(
                 "FlashAttention backend is not supported on CPU; falling back to native."
             )
             backend = "native"
+
         if backend == "native":
             from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 
             return NativeAttention(self.num_attn_heads, self.num_kv_heads, self.mesh)
-        elif backend == "fa":
-            if self.use_mla_backend:
-                # Absorbed MLA path: the v2 Pallas kernel replaces FlashAttention
-                # for models with AttentionArch.MLA (see docs/design/MLA.md §3.10).
-                from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
 
-                hf_text_config = self.model_config.hf_text_config
-                return MLAAttentionBackend(
-                    num_attn_heads=self.num_attn_heads,
-                    kv_lora_rank=hf_text_config.kv_lora_rank,
-                    qk_nope_head_dim=hf_text_config.qk_nope_head_dim,
-                    qk_rope_head_dim=hf_text_config.qk_rope_head_dim,
-                    v_head_dim=hf_text_config.v_head_dim,
-                    page_size=self.page_size,
-                    mesh=self.mesh,
-                )
+        # Absorbed MLA is the only branch that does not use FlashAttention.
+        if backend == "fa" and self.use_mla_backend:
+            from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
 
-            from sgl_jax.srt.layers.attention.flashattention_backend import (
-                FlashAttention,
-            )
-
-            return FlashAttention(
-                self.num_attn_heads,
-                self.num_kv_heads,
-                self.model_config.head_dim,
+            cfg = self.model_config.hf_text_config
+            return MLAAttentionBackend(
+                num_attn_heads=self.num_attn_heads,
+                kv_lora_rank=cfg.kv_lora_rank,
+                qk_nope_head_dim=cfg.qk_nope_head_dim,
+                qk_rope_head_dim=cfg.qk_rope_head_dim,
+                v_head_dim=cfg.v_head_dim,
                 page_size=self.page_size,
                 mesh=self.mesh,
             )
-        else:
+
+        if backend not in ("fa", "fa_mha"):
             raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
+
+        # fa_mha on an MLA model: decompress latent KV via kv_b_proj per-forward
+        # and run standard FlashAttention with per-head K/V (num_kv_heads ==
+        # num_attn_heads). All other (backend, model) combinations use the
+        # model's native MHA/GQA dims.
+        from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
+
+        if backend == "fa_mha" and self.use_mla_backend:
+            cfg = self.model_config.hf_text_config
+            head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim
+            num_kv_heads = self.num_attn_heads
+        else:
+            head_dim = self.model_config.head_dim
+            num_kv_heads = self.num_kv_heads
+
+        return FlashAttention(
+            self.num_attn_heads,
+            num_kv_heads,
+            head_dim,
+            page_size=self.page_size,
+            mesh=self.mesh,
+        )
 
     def _forward(
         self,
@@ -705,16 +755,10 @@ class ModelRunner(BaseModelRunner):
         # Q: Why does not call device_put in every layer?
         # A: Because it does not work and cache_miss still happens. According to benchmark(https://github.com/sgl-project/sglang-jax/pull/234), the performance is not influenced.
         if self.tp_size == 1:
-            target_sharding = NamedSharding(
-                self.token_to_kv_pool.mesh,
-                P(
-                    None,
-                    None,
-                    self.token_to_kv_pool.kv_partition_axis,
-                    None,
-                    None,
-                ),
-            )
+            # MHA pool is 5D `(pages, page_size, kv_packing, num_kv_heads*2, head_dim)`,
+            # MLA pool is 4D `(pages, page_size, kv_packing, kv_lora_rank+qk_rope)`.
+            # Take the spec directly from the pool's buffer instead of hardcoding.
+            target_sharding = self.token_to_kv_pool.kv_sharding
             layers_kv_fused = [
                 jax.device_put(layer_kv_fused, target_sharding)
                 for layer_kv_fused in layers_kv_fused

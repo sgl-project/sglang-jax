@@ -963,7 +963,22 @@ class MLATokenToKVPool(KVCache):
         return obj
 
     def _create_buffers(self):
-        """Allocate replicated 4D paged KV buffers for the MLA v2 kernel."""
+        """Allocate replicated 4D paged KV buffers for the MLA v2 kernel.
+
+        Layout matches the kernel ABI (`get_kv_cache_shape`):
+            [num_pages, align_to(page_size, kv_packing) // kv_packing,
+             kv_packing, align_to(kv_lora_rank, 128) + align_to(qk_rope_head_dim, 128)]
+
+        The last dim is `align(lkv,128) + align(rope,128)` — each segment
+        padded INDEPENDENTLY, NOT `align(lkv+rope, 128)`. The kernel slices
+        the cache as two adjacent buffers (`bkvc_x2_ref` at offset 0,
+        `bkpe_x2_ref` at offset `lkv_dim`); under-allocating with the
+        single-align formula would cause out-of-bounds rope reads on shapes
+        where the per-segment padding diverges from the combined-then-aligned
+        size (e.g. lora=192, rope=64: 256+128=384 vs align(256,128)=256).
+        DeepSeek-V3 (lora=512, rope=64) is a coincidental match — 512+128=640
+        and align(576,128)=640.
+        """
         from sgl_jax.srt.kernels.mla.v2.kernel import get_kv_cache_shape
 
         # MLA cache has no head axis to shard; replicate across the mesh.

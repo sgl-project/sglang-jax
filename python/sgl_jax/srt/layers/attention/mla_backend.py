@@ -95,6 +95,13 @@ class MLAAttentionBackend(AttentionBackend):
         vmem_limit_bytes: int = 100 * (1 << 20),
         num_kv_pages_per_block: tuple[int, int, int] = (3, 1, 1),
         num_queries_per_block: tuple[int, int, int] = (1, 16, 16),
+        # decode_batch_size: kernel-internal microbatch for the BATCHED_DECODE
+        # branch. The v2 kernel runs `floor(num_decode_seqs / decode_batch_size)
+        # * decode_batch_size` requests through a batched path (q_len=1, q-tile
+        # of size `decode_batch_size`) to keep the MXU busy on MLA's MQA-on-
+        # latent decode (single q row per seq otherwise underutilizes the q
+        # axis); the remainder falls back to per-seq decode.
+        # TODO(tuner): hardcoded 4, matches upstream — should be autotuned.
         decode_batch_size: int = 4,
     ):
         self.num_heads = num_attn_heads
