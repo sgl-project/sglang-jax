@@ -765,12 +765,6 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         for layer_idx, layer in enumerate(self.model.layers):
             attn = layer.self_attn
 
-            # Dequantize q_proj (uniform block quant, no head boundaries).
-            q_proj = getattr(attn, "q_proj")
-            if isinstance(q_proj, QuantizedLinear):
-                setattr(attn, "q_proj", self._dequantize_quantized_linear(q_proj))
-                logger.info("Dequantized layer %d q_proj → bf16", layer_idx)
-
             # Save k_proj's 2D scale before dequant — v_proj needs it for
             # cross-scale dequant (MiMo-Flash combined k+v block quant).
             k_scale_2d = None
@@ -778,10 +772,9 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             if isinstance(k_proj_obj, QuantizedLinear) and k_proj_obj.weight_scale.value.ndim == 2:
                 k_scale_2d = k_proj_obj.weight_scale.value
 
-            for proj_name in ("k_proj", "v_proj"):
+            for proj_name in ("q_proj", "k_proj", "v_proj"):
                 proj = getattr(attn, proj_name)
                 if isinstance(proj, QuantizedLinear):
-                    # Pass head_dim for per-head block quant handling.
                     # Q/K use head_dim, V uses v_head_dim.
                     hd = attn.v_head_dim if proj_name == "v_proj" else attn.head_dim
                     extra = {}
