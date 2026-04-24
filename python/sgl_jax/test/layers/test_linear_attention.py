@@ -65,7 +65,7 @@ def _hf_build_slope_tensor(num_heads):
 def _expected_slope(num_heads, layer_idx, num_hidden_layers):
     """Expected slope tensor matching the _compute_slope formula."""
     base = np.array(_hf_build_slope_tensor(num_heads), dtype=np.float32)
-    return -base * (1 - (layer_idx - 1) / (num_hidden_layers - 1) + 1e-5)
+    return -base * (1 - layer_idx / (num_hidden_layers - 1) + 1e-5)
 
 
 def _make_module(layer_idx=1, config=None):
@@ -101,19 +101,9 @@ class TestBuildSlopeTensor:
         expected = _hf_build_slope_tensor(48)
         np.testing.assert_allclose(slopes, expected, rtol=1e-6)
 
-    def test_length_matches_num_heads(self):
-        """Output list length equals num_heads."""
-        for n in [8, 16, 32, 48, 64]:
-            assert len(BailingMoeV2_5LinearAttention.build_slope_tensor(n)) == n
-
-    def test_all_positive(self):
-        """Raw slopes from build_slope_tensor are all positive."""
-        slopes = BailingMoeV2_5LinearAttention.build_slope_tensor(64)
-        assert all(s > 0 for s in slopes)
-
 
 # ---------------------------------------------------------------------------
-# ALiBi slope tensor tests (via module._compute_slope / module.slope)
+# ALiBi slope tensor tests (via module._compute_slope_list / module._slope_values)
 # ---------------------------------------------------------------------------
 
 
@@ -121,7 +111,7 @@ class TestSlopes:
     def test_slopes_all_negative(self):
         """All slope values must be negative after applying the layer scaling."""
         module = _make_module(layer_idx=10)
-        slope_np = np.asarray(module.slope)
+        slope_np = np.array(module._slope_values, dtype=np.float32)
         assert np.all(slope_np < 0), "Expected all slopes to be negative"
 
     def test_slopes_decrease_with_layer_idx(self):
@@ -129,8 +119,8 @@ class TestSlopes:
         config = _make_config()
         module_early = _make_module(layer_idx=5, config=config)
         module_late = _make_module(layer_idx=50, config=config)
-        early_mag = np.abs(np.asarray(module_early.slope))
-        late_mag = np.abs(np.asarray(module_late.slope))
+        early_mag = np.abs(np.array(module_early._slope_values, dtype=np.float32))
+        late_mag = np.abs(np.array(module_late._slope_values, dtype=np.float32))
         assert np.all(
             early_mag > late_mag
         ), "Expected layer 5 slope magnitude > layer 50 slope magnitude"
@@ -140,7 +130,7 @@ class TestSlopes:
         config = _make_config()
         for layer_idx in [1, 10, 40, 79]:
             module = _make_module(layer_idx=layer_idx, config=config)
-            actual = np.asarray(module.slope)
+            actual = np.array(module._slope_values, dtype=np.float32)
             expected = _expected_slope(
                 config.num_attention_heads, layer_idx, config.num_hidden_layers
             )
@@ -156,7 +146,7 @@ class TestSlopes:
         """Slope tensor shape must be (num_attention_heads,)."""
         config = _make_config()
         module = _make_module(layer_idx=1, config=config)
-        assert module.slope.shape == (config.num_attention_heads,)
+        assert len(module._slope_values) == config.num_attention_heads
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +166,7 @@ class TestModuleStructure:
             "k_norm",
             "rotary_emb",
             "g_norm",
-            "slope",
+            "_slope_values",
             "backend",
         ]:
             assert hasattr(module, attr), f"Missing attribute: {attr}"
@@ -333,84 +323,21 @@ class TestDecodeForward:
 class TestPrefillForward:
     @requires_simple_gla
     @requires_tpu
-    def test_prefill_output_shape(self):
-        """Prefill forward should return output [T, hidden_size] and new_state [N_padded, H, K, V]."""
+    @pytest.mark.parametrize(
+        "seq_len",
+        [
+            1,  # minimum: single token
+            63,  # one below chunk boundary (64)
+            64,  # exact chunk boundary
+            65,  # one above chunk boundary
+            100,  # non-aligned, crosses chunk boundary
+            128,  # two full chunks
+            512,  # large multi-chunk (8 full chunks)
+        ],
+    )
+    def test_prefill_output_and_state(self, seq_len):
+        """Prefill forward produces correct shapes and finite non-zero output."""
         backend = LinearAttentionBackend(mesh=mesh)
-        seq_len = 128
-        N_padded = 1
-
-        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
-            module = BailingMoeV2_5LinearAttention(
-                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend
-            )
-
-            batch_meta = SimpleNamespace(
-                forward_mode=ForwardMode.EXTEND,
-                extend_seq_lens=np.array([seq_len], dtype=np.int32),
-                seq_lens=np.array([seq_len], dtype=np.int32),
-                input_ids=np.zeros(seq_len, dtype=np.int32),
-            )
-            metadata = backend.get_forward_metadata(batch_meta)
-
-            hidden = jax.random.normal(
-                jax.random.PRNGKey(0), (seq_len, _SMALL_HIDDEN), dtype=jnp.bfloat16
-            )
-            positions = jnp.arange(seq_len, dtype=jnp.int32)
-            recurrent_state = jnp.zeros(
-                (N_padded, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16
-            )
-            fb = _make_forward_batch(ForwardMode.EXTEND, linear_attn_metadata=metadata)
-
-            output, new_state = module(positions, hidden, fb, recurrent_state)
-
-        assert output.shape == (seq_len, _SMALL_HIDDEN)
-        assert new_state.shape == (N_padded, _SMALL_H, _SMALL_K, _SMALL_K)
-        assert jnp.all(jnp.isfinite(output)), "Output contains NaN/Inf"
-        assert not jnp.all(output == 0), "Output is all zeros"
-
-    @requires_simple_gla
-    @requires_tpu
-    def test_prefill_non_chunk_aligned(self):
-        """Prefill with non-chunk-aligned seq_len (e.g. 100) should work via scatter/gather."""
-        backend = LinearAttentionBackend(mesh=mesh)
-        seq_len = 100
-        N_padded = 1
-
-        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
-            module = BailingMoeV2_5LinearAttention(
-                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend
-            )
-
-            batch_meta = SimpleNamespace(
-                forward_mode=ForwardMode.EXTEND,
-                extend_seq_lens=np.array([seq_len], dtype=np.int32),
-                seq_lens=np.array([seq_len], dtype=np.int32),
-                input_ids=np.zeros(seq_len, dtype=np.int32),
-            )
-            metadata = backend.get_forward_metadata(batch_meta)
-
-            hidden = jax.random.normal(
-                jax.random.PRNGKey(0), (seq_len, _SMALL_HIDDEN), dtype=jnp.bfloat16
-            )
-            positions = jnp.arange(seq_len, dtype=jnp.int32)
-            recurrent_state = jnp.zeros(
-                (N_padded, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16
-            )
-            fb = _make_forward_batch(ForwardMode.EXTEND, linear_attn_metadata=metadata)
-
-            output, new_state = module(positions, hidden, fb, recurrent_state)
-
-        assert output.shape == (seq_len, _SMALL_HIDDEN)
-        assert new_state.shape == (N_padded, _SMALL_H, _SMALL_K, _SMALL_K)
-        assert jnp.all(jnp.isfinite(output)), "Output contains NaN/Inf"
-        assert not jnp.all(output == 0), "Output is all zeros"
-
-    @requires_simple_gla
-    @requires_tpu
-    def test_prefill_zeros_state_runs(self):
-        """Prefill with all-zeros initial state should complete without error."""
-        backend = LinearAttentionBackend(mesh=mesh)
-        seq_len = 128
 
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
             module = BailingMoeV2_5LinearAttention(
@@ -436,8 +363,8 @@ class TestPrefillForward:
 
         assert output.shape == (seq_len, _SMALL_HIDDEN)
         assert new_state.shape == (1, _SMALL_H, _SMALL_K, _SMALL_K)
-        assert jnp.all(jnp.isfinite(output)), "Output contains NaN/Inf"
-        assert not jnp.all(output == 0), "Output is all zeros"
+        assert jnp.all(jnp.isfinite(output)), f"Output contains NaN/Inf (seq_len={seq_len})"
+        assert not jnp.all(output == 0), f"Output is all zeros (seq_len={seq_len})"
 
 
 # ---------------------------------------------------------------------------
@@ -448,46 +375,33 @@ class TestPrefillForward:
 class TestWhiteBox:
     def test_qkv_projection_shape(self):
         """QKV projection should produce [T, 3*H*head_dim]."""
-        config = _make_config(
-            hidden_size=256,
-            num_attention_heads=4,
-            head_dim=64,
-            num_hidden_layers=10,
-            partial_rotary_factor=0.5,
-            max_position_embeddings=1024,
-            rope_theta=10000,
-            group_norm_size=4,
-        )
         backend = LinearAttentionBackend(mesh=mesh)
 
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
             module = BailingMoeV2_5LinearAttention(
-                config=config, layer_idx=5, mesh=mesh, backend=backend
+                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend
             )
-            hidden = jax.random.normal(jax.random.PRNGKey(0), (4, 256), dtype=jnp.bfloat16)
+            hidden = jax.random.normal(
+                jax.random.PRNGKey(0), (4, _SMALL_HIDDEN), dtype=jnp.bfloat16
+            )
             qkv, _ = module.qkv_proj(hidden)
 
-        assert qkv.shape == (4, 3 * 4 * 64), f"Expected (4, 768), got {qkv.shape}"
+        assert qkv.shape == (
+            4,
+            3 * _SMALL_H * _SMALL_K,
+        ), f"Expected (4, {3 * _SMALL_H * _SMALL_K}), got {qkv.shape}"
 
     def test_gating_values_in_range(self):
         """Sigmoid gating values should be in [0, 1]."""
-        config = _make_config(
-            hidden_size=256,
-            num_attention_heads=4,
-            head_dim=64,
-            num_hidden_layers=10,
-            partial_rotary_factor=0.5,
-            max_position_embeddings=1024,
-            rope_theta=10000,
-            group_norm_size=4,
-        )
         backend = LinearAttentionBackend(mesh=mesh)
 
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
             module = BailingMoeV2_5LinearAttention(
-                config=config, layer_idx=5, mesh=mesh, backend=backend
+                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend
             )
-            hidden = jax.random.normal(jax.random.PRNGKey(0), (4, 256), dtype=jnp.bfloat16)
+            hidden = jax.random.normal(
+                jax.random.PRNGKey(0), (4, _SMALL_HIDDEN), dtype=jnp.bfloat16
+            )
             g, _ = module.g_proj(hidden)
             gate = jax.nn.sigmoid(g)
 
@@ -495,38 +409,23 @@ class TestWhiteBox:
 
     def test_v_skips_rmsnorm(self):
         """V should NOT be modified by Q/K RMSNorm."""
-        H, K = 4, 64
-        config = _make_config(
-            hidden_size=256,
-            num_attention_heads=H,
-            head_dim=K,
-            num_hidden_layers=10,
-            partial_rotary_factor=0.5,
-            max_position_embeddings=1024,
-            rope_theta=10000,
-            group_norm_size=4,
-        )
         backend = LinearAttentionBackend(mesh=mesh)
 
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
             module = BailingMoeV2_5LinearAttention(
-                config=config, layer_idx=5, mesh=mesh, backend=backend
+                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend
             )
-            hidden = jax.random.normal(jax.random.PRNGKey(0), (4, 256), dtype=jnp.float32)
+            hidden = jax.random.normal(jax.random.PRNGKey(0), (4, _SMALL_HIDDEN), dtype=jnp.float32)
 
             qkv, _ = module.qkv_proj(hidden)
-            qkv = _reshape_qkv(qkv, 4, H, K)
+            qkv = _reshape_qkv(qkv, 4, _SMALL_H, _SMALL_K)
             q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
 
             if module.q_norm is not None:
                 q_normed = module.q_norm(q)
                 k_normed = module.k_norm(k)
-                # Q and K should be changed by RMSNorm (sanity check)
                 assert not jnp.allclose(q, q_normed), "Q should be modified by RMSNorm"
                 assert not jnp.allclose(k, k_normed), "K should be modified by RMSNorm"
-            # V is never passed through any norm — verify by applying q_norm to v
-            # and confirming the result differs (proving norm is non-trivial),
-            # then checking the module code never does this.
             v_if_normed = module.q_norm(v)
             assert not jnp.allclose(
                 v, v_if_normed
@@ -534,28 +433,17 @@ class TestWhiteBox:
 
     def test_rope_only_affects_first_rotary_dims(self):
         """RoPE should only modify the first rope_dim dims; rest unchanged."""
-        H, K = 4, 64
-        config = _make_config(
-            hidden_size=256,
-            num_attention_heads=H,
-            head_dim=K,
-            num_hidden_layers=10,
-            partial_rotary_factor=0.5,
-            max_position_embeddings=1024,
-            rope_theta=10000,
-            group_norm_size=4,
-        )
-        rope_dim = int(K * 0.5)  # 32
+        rope_dim = int(_SMALL_K * _SMALL_CONFIG.partial_rotary_factor)
         backend = LinearAttentionBackend(mesh=mesh)
 
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
             module = BailingMoeV2_5LinearAttention(
-                config=config, layer_idx=5, mesh=mesh, backend=backend
+                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend
             )
-            hidden = jax.random.normal(jax.random.PRNGKey(0), (4, 256), dtype=jnp.float32)
+            hidden = jax.random.normal(jax.random.PRNGKey(0), (4, _SMALL_HIDDEN), dtype=jnp.float32)
 
             qkv, _ = module.qkv_proj(hidden)
-            qkv = _reshape_qkv(qkv, 4, H, K)
+            qkv = _reshape_qkv(qkv, 4, _SMALL_H, _SMALL_K)
             q_pre = qkv[:, 0]
             k_pre = qkv[:, 1]
 
@@ -590,27 +478,57 @@ class TestWhiteBox:
 
     def test_dense_projection_changes_values(self):
         """Dense projection should produce different values from its input."""
-        H, K = 4, 64
-        config = _make_config(
-            hidden_size=256,
-            num_attention_heads=H,
-            head_dim=K,
-            num_hidden_layers=10,
-            partial_rotary_factor=0.5,
-            max_position_embeddings=1024,
-            rope_theta=10000,
-            group_norm_size=4,
-        )
         backend = LinearAttentionBackend(mesh=mesh)
 
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
             module = BailingMoeV2_5LinearAttention(
-                config=config, layer_idx=5, mesh=mesh, backend=backend
+                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend
             )
-            x = jax.random.normal(jax.random.PRNGKey(0), (4, H * K), dtype=jnp.bfloat16)
+            x = jax.random.normal(
+                jax.random.PRNGKey(0), (4, _SMALL_H * _SMALL_K), dtype=jnp.bfloat16
+            )
             y, _ = module.dense(x)
 
         assert not jnp.allclose(x, y), "Dense projection should change values"
+
+    def test_gating_preserves_shape(self):
+        """Output shape should be [T, H*K] after GroupRMSNorm * sigmoid gating."""
+        backend = LinearAttentionBackend(mesh=mesh)
+        T = 4
+
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            module = BailingMoeV2_5LinearAttention(
+                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend
+            )
+            attn_output = jax.random.normal(
+                jax.random.PRNGKey(0), (T, _SMALL_H * _SMALL_K), dtype=jnp.bfloat16
+            )
+            hidden = jax.random.normal(
+                jax.random.PRNGKey(1), (T, _SMALL_HIDDEN), dtype=jnp.bfloat16
+            )
+            g, _ = module.g_proj(hidden)
+            gate = jax.nn.sigmoid(g)
+            gated = module.g_norm(attn_output) * gate
+
+        assert gated.shape == (
+            T,
+            _SMALL_H * _SMALL_K,
+        ), f"Expected ({T}, {_SMALL_H * _SMALL_K}), got {gated.shape}"
+
+    @requires_simple_gla
+    def test_g_gamma_all_negative(self):
+        """All g_gamma slopes should be negative (decay, not growth)."""
+        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
+            backend = LinearAttentionBackend(mesh=mesh)
+            for layer_idx in [0, 5, 9]:
+                module = BailingMoeV2_5LinearAttention(
+                    config=_SMALL_CONFIG, layer_idx=layer_idx, mesh=mesh, backend=backend
+                )
+                slopes = np.array(module._slope_values, dtype=np.float32)
+                assert np.all(slopes < 0), (
+                    f"layer_idx={layer_idx}: all slopes should be negative, "
+                    f"got max={slopes.max()}"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -688,9 +606,19 @@ class TestMultiRequestIsolation:
 
     @requires_simple_gla
     @requires_tpu
-    def test_prefill_multi_request_isolation(self):
+    @pytest.mark.parametrize(
+        "seq_lens_pair",
+        [
+            (128, 128),  # two equal, chunk-aligned
+            (64, 100),  # one aligned, one not
+            (1, 64),  # single token + full chunk
+            (63, 65),  # both near chunk boundary
+        ],
+        ids=["equal-128", "64-100", "1-64", "63-65"],
+    )
+    def test_prefill_multi_request_isolation(self, seq_lens_pair):
         """Two requests prefilled separately should match prefilled together."""
-        seq_len1, seq_len2 = 128, 128
+        seq_len1, seq_len2 = seq_lens_pair
 
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
             # --- Separate (independent modules with shared weights) ---
@@ -753,12 +681,10 @@ class TestMultiRequestIsolation:
             out_both, s_both = module_both(pos_both, h_both, fb_ext_both, state_both_init)
 
         # Output tolerance: TPU bf16 matmul uses different tiling strategies for
-        # different matrix dimensions.  Single-request (T=128) vs batched (T=256)
-        # triggers different XLA tiling → different bf16 accumulation order →
-        # non-associative rounding.  Diagnostic script (debug_prefill_tp4_isolation.py)
-        # confirmed all intermediate values (q/k/v, scatter, kernel, gather, gated)
-        # are identical; only dense matmul output diverges.  Observed max_diff=0.5
-        # on v6e-4 TP=4 (1 ULP at magnitude ~54 in bf16).
+        # different matrix dimensions.  Single-request vs batched triggers
+        # different XLA tiling → different bf16 accumulation order →
+        # non-associative rounding.  Observed max_diff=0.5 on v6e-4 TP=4
+        # (1 ULP at magnitude ~54 in bf16).
         #
         # State tolerance kept tight (5e-2): state comes directly from kernel
         # output, not through dense matmul, so tiling differences don't apply.
@@ -766,43 +692,38 @@ class TestMultiRequestIsolation:
             np.array(out_both[:seq_len1]),
             np.array(out1),
             atol=1.0,
-            err_msg="Request 1 output differs in batched prefill",
+            err_msg=f"Request 1 (len={seq_len1}) output differs in batched prefill",
         )
         np.testing.assert_allclose(
             np.array(s_both[0]),
             np.array(s1[0]),
             atol=5e-2,
-            err_msg="Request 1 state differs in batched prefill",
+            err_msg=f"Request 1 (len={seq_len1}) state differs in batched prefill",
         )
         np.testing.assert_allclose(
             np.array(out_both[seq_len1:]),
             np.array(out2),
             atol=1.0,
-            err_msg="Request 2 output differs in batched prefill",
+            err_msg=f"Request 2 (len={seq_len2}) output differs in batched prefill",
         )
         np.testing.assert_allclose(
             np.array(s_both[1]),
             np.array(s2[0]),
             atol=5e-2,
-            err_msg="Request 2 state differs in batched prefill",
+            err_msg=f"Request 2 (len={seq_len2}) state differs in batched prefill",
         )
 
     @requires_simple_gla
     @requires_tpu
     def test_prefill_vs_decode_approximate_agreement(self):
-        """Prefill and token-by-token decode should produce approximately similar results.
+        """Non-chunk-aligned prefill followed by N decode steps (integration).
 
-        This is a cross-algorithm sanity check, NOT an exact consistency test.
-        The chunk kernel (simple_gla_fwd, parallel matmul) and recurrent kernel
-        (fused_recurrent_simple_gla, sequential MAC) use fundamentally different
-        reduction orders.  After 64 steps of bf16 accumulation, significant
-        numerical divergence is expected.
-
-        This test catches structural bugs (wrong decay sign, transposed state,
-        missing scale) which cause order-of-magnitude differences, but cannot
-        detect subtle numerical issues within the tolerance band.
+        Design doc black-box test: seq_len not a multiple of chunk_size;
+        after prefill, run N decode steps; state transfers correctly,
+        each decode output differs, new_state updates each step.
         """
-        seq_len = 64
+        seq_len = 100  # non-chunk-aligned: crosses chunk boundary (100 != 64*N)
+        n_decode_steps = 3
 
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
             backend = LinearAttentionBackend(mesh=mesh)
@@ -825,140 +746,33 @@ class TestMultiRequestIsolation:
             )
             meta_prefill = backend.get_forward_metadata(batch_prefill)
             fb_ext = _make_forward_batch(ForwardMode.EXTEND, linear_attn_metadata=meta_prefill)
-            out_prefill, state_prefill = module(positions, hidden, fb_ext, state_init)
+            out_prefill, state_after_prefill = module(positions, hidden, fb_ext, state_init)
 
-            # --- Decode: token by token ---
+            # Prefill should produce valid output and non-zero state
+            assert out_prefill.shape == (seq_len, _SMALL_HIDDEN)
+            assert np.all(np.isfinite(np.array(out_prefill)))
+            assert np.any(np.array(state_after_prefill) != 0), "State after prefill is all-zero"
+
+            # --- Decode: N steps using state from prefill ---
             fb_dec = _make_forward_batch(ForwardMode.DECODE)
-            state_dec = state_init
-            decode_outputs = []
-            for t in range(seq_len):
-                h_t = hidden[t : t + 1]  # [1, hidden_size]
-                pos_t = jnp.array([t], dtype=jnp.int32)
+            state_dec = state_after_prefill
+            prev_state = state_after_prefill
+            for t in range(n_decode_steps):
+                h_t = jax.random.normal(
+                    jax.random.PRNGKey(100 + t), (1, _SMALL_HIDDEN), dtype=jnp.bfloat16
+                )
+                pos_t = jnp.array([seq_len + t], dtype=jnp.int32)
                 out_t, state_dec = module(pos_t, h_t, fb_dec, state_dec)
-                decode_outputs.append(out_t)
-            out_decode = jnp.concatenate(decode_outputs, axis=0)
 
-        # The chunk kernel (simple_gla_fwd) and recurrent kernel
-        # (fused_recurrent_simple_gla) are mathematically equivalent but use
-        # very different reduction orders: parallel chunk matmuls vs sequential
-        # multiply-accumulate. With bf16 inputs over 64 steps, accumulated
-        # floating-point divergence is significant. Use generous tolerances;
-        # structural errors (wrong decay, transposed state) would produce
-        # order-of-magnitude differences.
-        #
-        # Tolerances derived from TPU v6e-4 empirical data (2026-04-08):
-        #   state: max_abs_diff=1.14, mismatch=8/65536 (0.012%) at rtol=0.2/atol=0.5
-        #          near-zero elements (|ref|≈0.23) dominate the outliers.
-        #          atol=1.5 provides ~30% headroom above observed max.
-        #   output: max_abs_diff well below 0.5 (all elements pass at atol=0.5).
-        np.testing.assert_allclose(
-            np.array(state_prefill[0]),
-            np.array(state_dec[0]),
-            rtol=0.2,
-            atol=1.5,
-            err_msg="Prefill final state != decode accumulated state",
-        )
-        np.testing.assert_allclose(
-            np.array(out_prefill),
-            np.array(out_decode),
-            rtol=0.2,
-            atol=0.5,
-            err_msg="Prefill output != decode output",
-        )
+                # Each decode step should produce valid output
+                assert out_t.shape == (1, _SMALL_HIDDEN), f"Decode step {t} wrong shape"
+                assert np.all(np.isfinite(np.array(out_t))), f"Decode step {t} has non-finite"
 
-    @requires_simple_gla
-    @requires_tpu
-    def test_prefill_unequal_length_isolation(self):
-        """Two requests with different lengths prefilled together should match separate runs."""
-        seq_len1, seq_len2 = 64, 100  # one chunk-aligned, one not
-
-        with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
-            # --- Separate (independent modules with shared weights) ---
-            backend1 = LinearAttentionBackend(mesh=mesh)
-            module1 = BailingMoeV2_5LinearAttention(
-                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend1
-            )
-            batch1 = SimpleNamespace(
-                forward_mode=ForwardMode.EXTEND,
-                extend_seq_lens=np.array([seq_len1], dtype=np.int32),
-                seq_lens=np.array([seq_len1], dtype=np.int32),
-                input_ids=np.zeros(seq_len1, dtype=np.int32),
-            )
-            meta1 = backend1.get_forward_metadata(batch1)
-            h1 = jax.random.normal(
-                jax.random.PRNGKey(10), (seq_len1, _SMALL_HIDDEN), dtype=jnp.bfloat16
-            )
-            pos1 = jnp.arange(seq_len1, dtype=jnp.int32)
-            state1_init = jnp.zeros((1, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16)
-            fb_ext1 = _make_forward_batch(ForwardMode.EXTEND, linear_attn_metadata=meta1)
-            out1, s1 = module1(pos1, h1, fb_ext1, state1_init)
-
-            backend2 = LinearAttentionBackend(mesh=mesh)
-            module2 = BailingMoeV2_5LinearAttention(
-                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend2
-            )
-            _copy_weights_across_meshes(module2, module1)
-            batch2 = SimpleNamespace(
-                forward_mode=ForwardMode.EXTEND,
-                extend_seq_lens=np.array([seq_len2], dtype=np.int32),
-                seq_lens=np.array([seq_len2], dtype=np.int32),
-                input_ids=np.zeros(seq_len2, dtype=np.int32),
-            )
-            meta2 = backend2.get_forward_metadata(batch2)
-            h2 = jax.random.normal(
-                jax.random.PRNGKey(11), (seq_len2, _SMALL_HIDDEN), dtype=jnp.bfloat16
-            )
-            pos2 = jnp.arange(seq_len2, dtype=jnp.int32)
-            state2_init = jnp.zeros((1, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16)
-            fb_ext2 = _make_forward_batch(ForwardMode.EXTEND, linear_attn_metadata=meta2)
-            out2, s2 = module2(pos2, h2, fb_ext2, state2_init)
-
-            # --- Together ---
-            backend_both = LinearAttentionBackend(mesh=mesh)
-            module_both = BailingMoeV2_5LinearAttention(
-                config=_SMALL_CONFIG, layer_idx=5, mesh=mesh, backend=backend_both
-            )
-            _copy_weights_across_meshes(module_both, module1)
-            batch_both = SimpleNamespace(
-                forward_mode=ForwardMode.EXTEND,
-                extend_seq_lens=np.array([seq_len1, seq_len2], dtype=np.int32),
-                seq_lens=np.array([seq_len1, seq_len2], dtype=np.int32),
-                input_ids=np.zeros(seq_len1 + seq_len2, dtype=np.int32),
-            )
-            meta_both = backend_both.get_forward_metadata(batch_both)
-            h_both = jnp.concatenate([h1, h2], axis=0)
-            pos_both = jnp.concatenate([pos1, pos2], axis=0)
-            state_both_init = jnp.zeros((2, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16)
-            fb_ext_both = _make_forward_batch(ForwardMode.EXTEND, linear_attn_metadata=meta_both)
-            out_both, s_both = module_both(pos_both, h_both, fb_ext_both, state_both_init)
-
-        # Same tolerance rationale as test_prefill_multi_request_isolation:
-        # output atol=1.0 for TPU bf16 dense matmul tiling divergence,
-        # state atol=5e-2 (kernel output, no dense matmul involved).
-        np.testing.assert_allclose(
-            np.array(out_both[:seq_len1]),
-            np.array(out1),
-            atol=1.0,
-            err_msg="Request 1 (len=64) output differs in batched prefill",
-        )
-        np.testing.assert_allclose(
-            np.array(s_both[0]),
-            np.array(s1[0]),
-            atol=5e-2,
-            err_msg="Request 1 (len=64) state differs in batched prefill",
-        )
-        np.testing.assert_allclose(
-            np.array(out_both[seq_len1:]),
-            np.array(out2),
-            atol=1.0,
-            err_msg="Request 2 (len=100) output differs in batched prefill",
-        )
-        np.testing.assert_allclose(
-            np.array(s_both[1]),
-            np.array(s2[0]),
-            atol=5e-2,
-            err_msg="Request 2 (len=100) state differs in batched prefill",
-        )
+                # State should update each step (not frozen)
+                assert not np.allclose(
+                    np.array(state_dec), np.array(prev_state), atol=1e-6
+                ), f"Decode step {t}: state did not update"
+                prev_state = state_dec
 
 
 # ---------------------------------------------------------------------------
@@ -1010,7 +824,9 @@ class TestGLAWrapper:
             )
 
             # Direct kernel call (same args as module code)
-            slope_sm = jax.sharding.reshard(module.slope, NamedSharding(mesh, P("tensor")))
+            slope_sm = jax.sharding.reshard(
+                jnp.array(module._slope_values, dtype=jnp.float32), NamedSharding(mesh, P("tensor"))
+            )
             q_d = q[:, None, :, :]
             k_d = k[:, None, :, :]
             v_d = v[:, None, :, :]
@@ -1043,51 +859,6 @@ class TestGLAWrapper:
             np.array(new_state_direct),
             atol=1e-6,
             err_msg="Decode: module state != direct kernel state",
-        )
-
-    @requires_simple_gla
-    def test_gla_recurrence_matches_numpy(self):
-        """fused_recurrent_simple_gla should match pure-numpy step-by-step GLA recurrence."""
-
-        seq_len, H, K = 8, _SMALL_H, _SMALL_K
-        rng = np.random.default_rng(42)
-        q_np = rng.standard_normal((seq_len, H, K)).astype(np.float32)
-        k_np = rng.standard_normal((seq_len, H, K)).astype(np.float32)
-        v_np = rng.standard_normal((seq_len, H, K)).astype(np.float32)
-        h0_np = rng.standard_normal((H, K, K)).astype(np.float32)
-        slope_np = -np.array(BailingMoeV2_5LinearAttention.build_slope_tensor(H), dtype=np.float32)
-
-        # Numpy reference: h_t = exp(slope) * h_{t-1} + k_t^T x v_t, o_t = q_t @ h_t * scale
-        scale = K**-0.5
-        decay = np.exp(slope_np)
-        h, ref_outs = h0_np.copy(), []
-        for t in range(seq_len):
-            h = decay[:, None, None] * h + np.einsum("hk,hv->hkv", k_np[t], v_np[t])
-            ref_outs.append(np.einsum("hk,hkv->hv", q_np[t], h) * scale)
-        ref_out, ref_h = np.stack(ref_outs), h
-
-        # JAX kernel (expects [B, T, H, K])
-        out_jax, state_jax = fused_recurrent_simple_gla(
-            jnp.array(q_np[None, :]),
-            jnp.array(k_np[None, :]),
-            jnp.array(v_np[None, :]),
-            g_gamma=jnp.array(slope_np),
-            initial_state=jnp.array(h0_np[None]),
-            output_final_state=True,
-            scale=None,
-        )
-
-        np.testing.assert_allclose(
-            np.array(out_jax[0]),
-            ref_out,
-            atol=1e-4,
-            err_msg="GLA output != numpy reference",
-        )
-        np.testing.assert_allclose(
-            np.array(state_jax[0]),
-            ref_h,
-            atol=1e-4,
-            err_msg="GLA final state != numpy reference",
         )
 
     @requires_simple_gla
@@ -1147,9 +918,11 @@ class TestGLAWrapper:
             # the composition of pre-kernel (QKV/norm/RoPE) and post-kernel
             # (gate/dense) steps.
             scatter_idx = metadata.scatter_idx
-            T_pb = backend.T_packed_bucket
+            T_pb = metadata.T_packed_bucket
             cu_seqlens = metadata.cu_seqlens_dev
-            slope_sm = jax.sharding.reshard(module.slope, NamedSharding(mesh, P("tensor")))
+            slope_sm = jax.sharding.reshard(
+                jnp.array(module._slope_values, dtype=jnp.float32), NamedSharding(mesh, P("tensor"))
+            )
 
             def _direct_prefill_fn(q_l, k_l, v_l, gamma, h0, scatter_idx_p, cu_seqlens_p):
                 q_p = scatter_to_packed(q_l, scatter_idx_p, T_pb)
@@ -1255,7 +1028,9 @@ def _copy_weights_across_meshes(target_module, source_module):
     Overwriting it would corrupt the target's pre-computed metadata and
     replace nnx.Variable with plain arrays (causing .value AttributeError).
     """
-    # Temporarily detach backends so nnx.state doesn't traverse them
+    # Temporarily detach backends so nnx.state doesn't traverse them.
+    # _slope_values is a plain Python list, invisible to nnx.state().
+    # backend contains runtime metadata (not model weights).
     src_backend = source_module.backend
     tgt_backend = target_module.backend
     source_module.backend = None

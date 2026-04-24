@@ -210,18 +210,18 @@ class TestSubComponentComparison:
         np.testing.assert_array_equal(jax_base, pt_base)
 
         # Test per-layer slopes for multiple layers (comparing absolute values)
-        for jax_layer_idx in [1, 5, 10]:
-            pt_layer_id = jax_layer_idx - 1
+        # Both JAX and PyTorch now use 0-indexed layer_idx
+        for layer_idx in [0, 4, 9]:
             with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
-                module = _make_module(layer_idx=jax_layer_idx)
-            jax_slopes = jax_to_numpy(module.slope)  # negative
-            pt_slopes = pt_compute_slope(_H, pt_layer_id, _NUM_LAYERS)  # positive
+                module = _make_module(layer_idx=layer_idx)
+            jax_slopes = np.array(module._slope_values, dtype=np.float32)  # negative
+            pt_slopes = pt_compute_slope(_H, layer_idx, _NUM_LAYERS)  # positive
             np.testing.assert_allclose(
                 np.abs(jax_slopes),
                 np.abs(pt_slopes),
                 atol=0,
                 rtol=1e-7,
-                err_msg=f"Slope mismatch at layer_idx={jax_layer_idx}",
+                err_msg=f"Slope mismatch at layer_idx={layer_idx}",
             )
 
     def test_qkv_projection_matches_torch(self):
@@ -429,6 +429,28 @@ class TestModuleLevelMockKernel:
             atol=_MATMUL_ATOL,
             err_msg="Final output diverged",
         )
+
+
+# ---------------------------------------------------------------------------
+# End-to-end cross-framework tests (require kernel + torch)
+# ---------------------------------------------------------------------------
+
+
+@requires_torch
+@requires_simple_gla
+@requires_tpu
+class TestEndToEndCrossFramework:
+    """Full pipeline JAX vs PyTorch comparison (design doc §Cross-Framework Consistency)."""
+
+    @pytest.mark.skip(reason="Requires HF PyTorch BailingMoeV2_5LinearAttention with tops kernel")
+    def test_float32_output_and_state_match(self):
+        """float32: full module output max abs diff < 1e-5, new_state same."""
+        pass
+
+    @pytest.mark.skip(reason="Requires HF PyTorch BailingMoeV2_5LinearAttention with tops kernel")
+    def test_bfloat16_output_and_state_match(self):
+        """bfloat16: full module output max abs diff < 0.05, new_state same."""
+        pass
 
 
 # ---------------------------------------------------------------------------

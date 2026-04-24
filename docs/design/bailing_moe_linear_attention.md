@@ -24,8 +24,8 @@ Implement `BailingMoeV2_5LinearAttention` as a Flax NNX module, supporting prefi
 |-----------|-------|--------|
 | hidden_size | 8192 | model config |
 | num_attention_heads (H) | 64 | model config |
-| head_dim (K=V) | 128 | model config |
-| rope_dim (= head_dim × partial_rotary_factor) | 64 | derived from partial_rotary_factor=0.5 |
+| head_dim (K=V) | 128 | derived: hidden_size // num_attention_heads |
+| rope_dim | 64 | config.rotary_dim (preferred), fallback: head_dim × partial_rotary_factor |
 | use_qk_norm | true | model config |
 | group_norm_size | 8 | model config |
 | chunk_size | 64 | kernel default |
@@ -55,11 +55,11 @@ tp_worker.py forward_batch_generation()
         Returns LinearAttentionMetadata pytree:
           .cu_seqlens_dev   # [N_padded+1], chunk-aligned boundaries per request
           .scatter_idx  # [T], tight-packed → chunk-aligned position mapping
-        backend.T_packed_bucket  # Σchunk-aligned lengths aligned to token_paddings, static
+          .T_packed_bucket      # Σchunk-aligned lengths (pytree aux_data, static per batch)
     ↓ forward_batch.linear_attn_metadata = metadata
     ↓ model_runner.forward(forward_batch)                     ← JIT boundary
-        model_def contains T_packed_bucket (static, triggers recompile on change)
-        forward_batch contains linear_attn_metadata (pytree, dynamic, traced through ForwardBatch.tree_flatten)
+        forward_batch contains linear_attn_metadata (pytree, T_packed_bucket in aux_data triggers recompile on change,
+        cu_seqlens_dev/scatter_idx are dynamic traced through ForwardBatch.tree_flatten)
         ↓ BailingMoeV2_5LinearAttention.__call__(...)         ← see Forward Flow
 ```
 
@@ -97,7 +97,7 @@ q, k, v each [T, H, head_dim] = [T, 64, 128]
         # MIXED is converted to EXTEND by the scheduler before reaching this point
         # q, k, v are tight-packed [T, H, K]; scatter to chunk-aligned layout for the chunk kernel
         # LinearAttentionBackend has pre-computed boundaries outside JIT
-        T_pb        = self.backend.T_packed_bucket        # chunk-aligned packed buffer length (static shape)
+        T_pb        = forward_batch.linear_attn_metadata.T_packed_bucket  # chunk-aligned packed buffer length (pytree aux_data, static)
         cu_seqlens  = forward_batch.linear_attn_metadata.cu_seqlens_dev   # [N_padded+1], chunk-aligned boundaries per request
         scatter_idx = forward_batch.linear_attn_metadata.scatter_idx  # [T], tight-packed → chunk-aligned position mapping
         # Pallas/Mosaic kernel cannot be partitioned by GSPMD (custom_call is opaque to the XLA partitioner);
@@ -148,20 +148,22 @@ returns (output [T, 8192], new_state [N_padded, H, K, V] for prefill / [T, H, K,
 ### Key Design Notes
 
 **ALiBi slopes as decay**
-`g_gamma` (shape `[H]`) = `-build_slope_tensor(H) * (1 - (layer_idx-1)/(num_hidden_layers-1) + 1e-5)`, layer_idx 0-indexed. Use the HF reference implementation as ground truth:
+`g_gamma` (shape `[H]`) = `-build_slope_tensor(H) * (1 - layer_idx/(num_hidden_layers-1) + 1e-5)`, layer_idx 0-indexed. Stored as a Python list (`self._slope_values`) to stay invisible to `nnx.state()` traversal; materialized as a JAX array inside `__call__`.
 
 ```python
 slope = -BailingMoeV2_5LinearAttention.build_slope_tensor(self.num_heads) * (
-    1 - (self.layer_idx - 1) / (self.config.num_hidden_layers - 1) + 1e-5
+    1 - self.layer_idx / (self.config.num_hidden_layers - 1) + 1e-5
 )
+# stored as: self._slope_values = slope.tolist()
+# used as:   slopes = jnp.array(self._slope_values, dtype=jnp.float32)
 ```
 
 **Tensor Parallelism**
 
 The two execution paths use different sharding strategies because Pallas/Mosaic kernels are opaque to GSPMD (compiled as `custom_call` nodes that the XLA partitioner cannot analyze — sharded inputs trigger implicit all-gather rather than kernel partitioning).
 
-- **Decode** (`fused_recurrent_simple_gla`, pure JAX `lax.scan`): GSPMD automatically propagates H-dimension sharding; `g_gamma=self.slope` (shape `[H]`) is sharded along with q's sharding. `recurrent_state` is explicitly resharded to `P(None, "tensor", None, None)` before the kernel call to ensure the scan carry matches q/k/v H-dim sharding. TP=1 and TP>1 share the same code path.
-- **Prefill** (`simple_gla_fwd` → Pallas kernel): Uses `shard_map` for explicit partitioning. `self.slope` is resharded to `P("tensor")` and `recurrent_state` to `P(None, "tensor", None, None)` before being passed into `shard_map`; scatter and kernel call run independently per device on the local H shard — no all-gather. `cu_seqlens` is passed as `P()` (replicated) so each device has complete boundary information.
+- **Decode** (`fused_recurrent_simple_gla`, pure JAX `lax.scan`): GSPMD automatically propagates H-dimension sharding; `g_gamma=slopes` (shape `[H]`, materialized from `self._slope_values`) is sharded along with q's sharding. `recurrent_state` is explicitly resharded to `P(None, "tensor", None, None)` before the kernel call to ensure the scan carry matches q/k/v H-dim sharding. TP=1 and TP>1 share the same code path.
+- **Prefill** (`simple_gla_fwd` → Pallas kernel): Uses `shard_map` for explicit partitioning. `slopes` (materialized from `self._slope_values`) is resharded to `P("tensor")` and `recurrent_state` to `P(None, "tensor", None, None)` before being passed into `shard_map`; scatter and kernel call run independently per device on the local H shard — no all-gather. `cu_seqlens` is passed as `P()` (replicated) so each device has complete boundary information.
 
 This pattern (GSPMD for pure-JAX kernels, `shard_map` for Pallas kernels) is consistent with how other Pallas kernels are handled in the project (see `flashattention_backend.py`). TP consistency verified on CPU and TPU v6e-4 (TP=2/4, H=64, prefill+decode): output `max abs diff < 6e-1` (bf16 row-parallel dense all-reduce addition order differs from TP=1, producing up to ~0.5 max diff at bf16 precision); state `max abs diff < 5e-2` (state is not affected by dense all-reduce, each head is independent across TP shards).
 
@@ -177,7 +179,7 @@ This pattern (GSPMD for pure-JAX kernels, `shard_map` for Pallas kernels) is con
   - **DECODE**: returns `LinearAttentionMetadata()` with `cu_seqlens_dev=None, scatter_idx=None` (scatter/gather metadata is only needed for prefill)
   - **EXTEND**: uses numpy `batch.extend_seq_lens` to compute chunk-aligned lengths; returns `LinearAttentionMetadata(cu_seqlens_dev=..., scatter_idx=...)`
 - The returned `LinearAttentionMetadata` is a pytree (registered via `@register_pytree_node_class`) and is stored on `forward_batch.linear_attn_metadata`, flowing through `ForwardBatch.tree_flatten` into JIT as traced values — matching the `FlashAttentionMetadata` pattern
-- `T_packed_bucket` (Python int) stored as a plain attribute on the backend, enters NNX graphdef (static); changes trigger recompilation
+- `T_packed_bucket` (Python int) stored in `LinearAttentionMetadata` pytree `aux_data` (per-batch, not shared); changes trigger recompilation via pytree aux_data
 - `cu_seqlens_dev` shape uses padded batch size (`len(batch.seq_lens)`, aligned to `bs_paddings`); trailing padding slots correspond to zero-length sequences and are skipped by the kernel; the kernel guarantees zero state output for these trailing slots — no masking required on write-back
 
 **scatter_to_packed / gather_from_packed**
@@ -221,7 +223,7 @@ q/k/v reshaped to `[T, 1, H, K]`; each B slot is an independent request, state i
 | Prefill multi-request strategy | scatter → single kernel call (cu_seqlens_dev) | All requests in one `simple_gla_fwd` call; cu_seqlens_dev resets state at boundaries in-kernel; avoids Python loops and repeated kernel launch overhead |
 | cu_seqlens_dev construction | numpy pre-compute outside JIT, returned in `LinearAttentionMetadata` pytree | Consistent with `FlashAttentionMetadata` pattern; metadata flows through `ForwardBatch.tree_flatten` into JIT as traced values; cu_seqlens_dev shape fixed to padded batch size to prevent recompilation |
 | scatter_idx construction | numpy pre-compute outside JIT, returned in `LinearAttentionMetadata` pytree | Shape `[T]` is static (no recompilation); `at[].set()` / advanced indexing inside JIT compiled to XLA scatter/gather, no Python loops |
-| Slopes storage | Computed in `__init__`, stored as attribute | JAX JIT treats Python attributes as constants, equivalent to PyTorch `register_buffer` |
+| Slopes storage | Computed in `__init__`, stored as `self._slope_values` (Python list) | Python lists are invisible to `nnx.state()` traversal, avoiding issues with `_copy_weights_across_meshes` and `eval_shape`; follows `_inv_freq_np` convention |
 | Prefill TP partitioning | `shard_map` explicit partitioning | Pallas kernel compiles to `custom_call`; GSPMD cannot analyze its internals and inserts all-gather for sharded inputs. `shard_map` lets each device run scatter + kernel on its local H shard — no communication overhead; consistent with FlashAttention and other Pallas kernels in the project |
 | GroupRMSNorm integration | Direct integration (`layers/attention/fla/group_rmsnorm.py`) | GroupRMSNorm is already available; no stub needed |
 
@@ -235,8 +237,8 @@ class LinearAttentionBackend(nnx.Module):
 
     def get_forward_metadata(self, batch: ModelWorkerBatch) -> LinearAttentionMetadata:
         # Called before the JIT boundary in tp_worker.py forward_batch_generation()
-        # Returns LinearAttentionMetadata pytree with cu_seqlens_dev and scatter_idx
-        # Also updates self.T_packed_bucket (int, static) as a side effect
+        # Returns LinearAttentionMetadata pytree with cu_seqlens_dev, scatter_idx,
+        # and T_packed_bucket (in aux_data, per-batch)
         ...
 
 class BailingMoeV2_5LinearAttention(nnx.Module):
@@ -285,7 +287,7 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
 | Output shape unchanged by gating | `[tokens, 8192]` preserved |
 | Dense projection applied | Output differs before and after dense |
 | ALiBi slopes correctness | All slopes negative; magnitude decreases with layer_idx; values match formula in Design section |
-| g_gamma path correctness | Feeding g_gamma=[H] and equivalent expanded g produce identical output and new_state; prefill: g=[1, T_pb, H]; decode: g=[T, 1, H] (T=decode batch, 1=single step) |
+| g_gamma all negative | All g_gamma slopes are negative (decay, not growth) across multiple layer indices |
 | GLA wrapper correctness (prefill) | Scatter q, k, v with same scatter_idx to obtain packed tensors; directly call `simple_gla_fwd` with same cu_seqlens_dev; output and new_state match module's internal call |
 | GLA wrapper correctness (decode) | Directly calling `fused_recurrent_simple_gla` with same q, k, v, g_gamma, h0 matches module's internal output and new_state |
 | Decode state isolation | Two requests decoded individually produce same output and new_state as batched (reshape to [T,1,H,K]) decode |
@@ -315,18 +317,18 @@ Compare JAX implementation against HuggingFace PyTorch `BailingMoeV2_5LinearAtte
 
 ## Work Breakdown
 
-- [ ] Implement `LinearAttentionBackend` (`linear_attention_backend.py`): `get_forward_metadata` computes `T_packed_bucket` and returns `LinearAttentionMetadata` with `cu_seqlens_dev` and `scatter_idx`
-- [ ] `model_runner.py`: add `self.linear_attn_backend = getattr(self.model, "linear_attn_backend", None)` at the end of `load_model()`
-- [ ] `tp_worker.py`: in `forward_batch_generation`, call `linear_attn_backend.get_forward_metadata(batch)` and store result in `forward_batch.linear_attn_metadata`
-- [ ] Implement `__init__`:
+- [x] Implement `LinearAttentionBackend` (`linear_attention_backend.py`): `get_forward_metadata` returns `LinearAttentionMetadata` with `cu_seqlens_dev`, `scatter_idx`, and `T_packed_bucket` (in pytree aux_data)
+- [x] `model_runner.py`: add `self.linear_attn_backend = getattr(self.model, "linear_attn_backend", None)` at the end of `load_model()`
+- [x] `tp_worker.py`: in `forward_batch_generation`, call `linear_attn_backend.get_forward_metadata(batch)` and store result in `forward_batch.linear_attn_metadata`
+- [x] Implement `__init__`:
   - QKV proj (`scope_name="query_key_value"`), g_proj (`scope_name="g_proj"`): column-parallel, `kernel_axes=(None, "tensor")`
   - dense (`scope_name="dense"`): row-parallel, `kernel_axes=("tensor", None)`
   - Q/K RMSNorm (`scope_name="query_layernorm"`/`"key_layernorm"`, note `param_dtype=dtype`)
-  - RotaryEmbedding, ALiBi slopes (stored as `self.slope`)
+  - RotaryEmbedding (with `config.rotary_dim` fallback), ALiBi slopes (stored as `self._slope_values`, Python list)
   - g_norm: `GroupRMSNorm(hidden_size=H*head_dim, num_groups=group_norm_size, epsilon=rms_norm_eps, scope_name="g_norm")` from `layers/attention/fla/group_rmsnorm.py`
-- [ ] Implement forward: QKV projection → split + reshape → Q/K norm → Partial RoPE → kernel dispatch (decode/prefill branches, prefill includes scatter/gather) → gating → dense → return state
-- [ ] Integrate `GroupRMSNorm` (`layers/attention/fla/group_rmsnorm.py`)
-- [ ] Write unit tests and integration tests
+- [x] Implement forward: QKV projection → split + reshape → Q/K norm → Partial RoPE → kernel dispatch (decode/prefill branches, prefill includes scatter/gather) → gating → dense → return state
+- [x] Integrate `GroupRMSNorm` (`layers/attention/fla/group_rmsnorm.py`)
+- [x] Write unit tests and integration tests
 
 ---
 
@@ -334,8 +336,8 @@ Compare JAX implementation against HuggingFace PyTorch `BailingMoeV2_5LinearAtte
 
 | Dependency | Status |
 |------------|--------|
-| `simple_gla_fwd` / `chunk_simple_gla_fwd_varlen` cu_seqlens_dev support (tops library, pallas-kernel feat/varlen branch) | **In progress** (parameter signature exists; Pallas TPU kernel internal support expected soon) |
-| `fused_recurrent_simple_gla` (tops library, for decode correctness) | **Ready** ([pallas-kernel PR #92](https://github.com/primatrix/pallas-kernel/pull/92), merged 2026-03-30) |
+| `simple_gla_fwd` / `chunk_simple_gla_fwd_varlen` | **Ready** — vendored to `sgl_jax.srt.kernels.simple_gla.simple_gla` (PR #924) |
+| `fused_recurrent_simple_gla` (decode kernel) | **Ready** — vendored to `sgl_jax.srt.kernels.simple_gla.simple_gla` (PR #924) |
 | `GroupRMSNorm` layer | **Ready** (`python/sgl_jax/srt/layers/attention/fla/group_rmsnorm.py`) |
 | DecoderLayer-level dispatch | Downstream task |
 | Model runner recurrent state management | **Blocking dependency** — current model runner only supports KV Cache; needs extension to support per-request recurrent state storage and retrieval |
