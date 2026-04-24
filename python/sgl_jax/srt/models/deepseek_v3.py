@@ -204,14 +204,6 @@ class DeepseekV3Attention(nnx.Module):
             dtype=dtype,
         )
 
-        # Absorbed MLA is structurally MQA from the attention-kernel's point
-        # of view: after folding W_UK into Q the kernel sees H query heads
-        # against a single shared latent K and V (num_kv_heads=1). head_dim
-        # encodes the concatenated latent + rope Q-K contraction width;
-        # v_head_dim is the latent rank the kernel returns per head. The MLA-
-        # specific W_UK / W_UV factoring lives in __call__, outside the
-        # kernel. Name mirrors sglang-gpu's `attn_mqa` to advertise the
-        # MQA-shape contract.
         self.attn_mqa = RadixAttention(
             num_heads=num_heads,
             head_dim=kv_lora_rank + qk_rope_head_dim,
@@ -262,6 +254,8 @@ class DeepseekV3Attention(nnx.Module):
             self.num_heads,
             self.qk_nope_head_dim + self.v_head_dim,
         )
+
+        # TODO: need to check whether slicing at this point costs
         w_uk = w_kv[:, :, : self.qk_nope_head_dim]  # [R, n_h, D_k]
         w_uv = w_kv[:, :, self.qk_nope_head_dim :]  # [R, n_h, D_v]
 

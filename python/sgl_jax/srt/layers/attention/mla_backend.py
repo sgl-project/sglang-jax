@@ -165,18 +165,6 @@ class MLAAttentionBackend(AttentionBackend):
         )
         return metadata
 
-    @staticmethod
-    def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
-        # Same scalar-prefetch budget heuristic as FlashAttention.get_max_running_reqests:
-        # caps the number of concurrent requests by the per-request page slot count
-        # so metadata arrays fit in TPU scalar-prefetch memory.
-        num_page_per_req = cdiv(max_context_len, page_size)
-        res = 1024 * 1024 // 2 // num_page_per_req // 4
-        assert (
-            res > 0
-        ), f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"
-        return res
-
     def tree_flatten(self):
         children = (self.forward_metadata,)
         aux_data = {
@@ -253,24 +241,12 @@ class MLAAttentionBackend(AttentionBackend):
             )
 
         # Strip the (single) KV-head axis from the latent K/K-rope tensors.
+        # Squeezing a length-1 axis preserves any caller-provided sharding on
+        # the remaining dims (replicated stays replicated).
         new_kv_c = k if k.ndim == 2 else jnp.squeeze(k, axis=1)
         new_k_pe = k_rope if k_rope.ndim == 2 else jnp.squeeze(k_rope, axis=1)
         ql_nope = q
         q_pe = q_rope
-
-        # TP sharding: heads are sharded along the "tensor" axis in production
-        # (upstream q_b_proj / kv_b_proj already produce per-head-tensor-sharded
-        # outputs). The MLA kernel is per-head independent, so each TP rank
-        # processes its own heads with no cross-rank communication. Reshard
-        # here so the shard_map in_specs match regardless of what the caller
-        # produced (unit tests pass replicated inputs — reshard splits to
-        # tensor-sharded; production passes already-sharded inputs — no-op).
-        heads_spec = NamedSharding(self.mesh, P(None, "tensor", None))
-        replicated_2d = NamedSharding(self.mesh, P(None, None))
-        ql_nope = jax.sharding.reshard(ql_nope, heads_spec)
-        q_pe = jax.sharding.reshard(q_pe, heads_spec)
-        new_kv_c = jax.sharding.reshard(new_kv_c, replicated_2d)
-        new_k_pe = jax.sharding.reshard(new_k_pe, replicated_2d)
 
         cache = token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
         sm_scale = (
@@ -349,3 +325,15 @@ class MLAAttentionBackend(AttentionBackend):
         )
 
         return o_latent, updated_cache
+
+    @staticmethod
+    def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
+        # Same scalar-prefetch budget heuristic as FlashAttention.get_max_running_reqests:
+        # caps the number of concurrent requests by the per-request page slot count
+        # so metadata arrays fit in TPU scalar-prefetch memory.
+        num_page_per_req = cdiv(max_context_len, page_size)
+        res = 1024 * 1024 // 2 // num_page_per_req // 4
+        assert (
+            res > 0
+        ), f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"
+        return res

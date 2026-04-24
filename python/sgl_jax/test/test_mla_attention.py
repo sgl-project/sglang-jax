@@ -25,6 +25,8 @@ import unittest
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.mla.v1.ref import ref_mla_ragged_paged_attention
 from sgl_jax.srt.kernels.mla.v2.kernel import align_to, get_dtype_packing
@@ -412,6 +414,15 @@ class TestMLAAttention(CustomTestCase):
         new_kv_c_3d = new_kv_c.reshape(new_kv_c.shape[0], 1, new_kv_c.shape[1])
         new_k_pe_3d = new_k_pe.reshape(new_k_pe.shape[0], 1, new_k_pe.shape[1])
 
+        # Match the backend's shard_map in_specs: Q tensors are head-sharded on
+        # "tensor", latent K/V are replicated (single shared KV head).
+        heads_sharded = NamedSharding(mesh, P(None, "tensor", None))
+        replicated = NamedSharding(mesh, P(None, None, None))
+        ql_nope_s = jax.device_put(ql_nope, heads_sharded)
+        q_pe_s = jax.device_put(q_pe, heads_sharded)
+        new_kv_c_3d_s = jax.device_put(new_kv_c_3d, replicated)
+        new_k_pe_3d_s = jax.device_put(new_k_pe_3d, replicated)
+
         @jax.jit
         def jit_call(q_, k_, v_, q_rope_, k_rope_, forward_batch, pool_):
             return attn(
@@ -424,7 +435,9 @@ class TestMLAAttention(CustomTestCase):
                 k_rope=k_rope_,
             )
 
-        jax_output, _ = jit_call(ql_nope, new_kv_c_3d, new_kv_c_3d, q_pe, new_k_pe_3d, fb, pool)
+        jax_output, _ = jit_call(
+            ql_nope_s, new_kv_c_3d_s, new_kv_c_3d_s, q_pe_s, new_k_pe_3d_s, fb, pool
+        )
         jax.block_until_ready(jax_output)
 
         cu_q_lens_np = np.concatenate([[0], np.cumsum([q for q, _ in lens])]).astype(np.int32)
