@@ -492,6 +492,9 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         self.config = config
         self.dtype = dtype
         self.model = MiMoV2Model(config, dtype=self.dtype, mesh=mesh)
+        # Buffer to hold raw FP8 K/V weights+scales for per-head fused dequant.
+        # Populated during weight loading, consumed by _dequant_fused_kv_heads.
+        self._kv_buffers: dict[int, dict] = {}
 
         if not getattr(self.config, "tie_word_embeddings", True):
             self.lm_head = ParallelLMHead(
@@ -520,6 +523,10 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         # Q/K head_dim padding (192→256) is handled by the kernel internally.
         if self._is_static_quant:
             self._dequantize_fp8_to_bf16()
+            # K+V: fused per-head dequant (cross K/V boundary blocks)
+            self._dequant_fused_kv_heads()
+            # KV head replication for TP alignment (after K/V are bf16 LinearBase)
+            self._ensure_kv_head_replication()
 
     def _is_quant_ignored(self, hf_path: str) -> bool:
         """Check if a HuggingFace weight path is in the quantization ignored_layers list."""
@@ -720,12 +727,12 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
         for layer_idx, layer in enumerate(self.model.layers):
             attn = layer.self_attn
-            for proj_name in ("q_proj", "k_proj", "v_proj"):
+            # Only Q and o_proj go through QuantizedLinear path.
+            # K/V are handled by _dequant_fused_kv_heads (per-head fused dequant).
+            for proj_name in ("q_proj",):
                 proj = getattr(attn, proj_name)
                 if isinstance(proj, QuantizedLinear):
-                    # Pass head_dim for per-head block quant handling.
-                    # Q/K use head_dim, V uses v_head_dim.
-                    hd = attn.v_head_dim if proj_name == "v_proj" else attn.head_dim
+                    hd = attn.head_dim
                     setattr(attn, proj_name, self._dequantize_quantized_linear(proj, head_dim=hd))
                     logger.info("Dequantized layer %d %s → bf16", layer_idx, proj_name)
 
@@ -739,11 +746,6 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
         logger.info("FP8 → BF16 dequantization complete.")
 
-        # Fix kv_head_padding for v_proj: the weight loader's _apply_kv_head_padding
-        # uses head_dim (Q/K) for shape matching, so it misses v_proj when
-        # v_head_dim != head_dim. Replicate kv_heads here.
-        self._ensure_kv_head_replication()
-
     def _ensure_kv_head_replication(self):
         """Replicate KV heads for TP alignment when the weight loader missed them."""
         attn = self.model.layers[0].self_attn
@@ -754,6 +756,143 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             v_head_dim=attn.v_head_dim,
             target_kv_heads=attn.k_head_num,
         )
+
+    def _dequant_fused_kv_heads(self):
+        """Dequantize per-KV-head fused K+V FP8 weights.
+
+        The FP8 checkpoint quantized K+V per KV head:
+          [K(head_dim), V(v_head_dim)] = fused_dim → ceil(fused_dim/block_size) blocks
+          Block boundaries can cross K/V boundary, so K and V must be fused
+          for correct dequantization.
+
+        K scale has ceil(head_dim/block_size) blocks per head,
+        V scale has (blocks_per_head - k_blocks) blocks per head.
+        """
+        import math
+
+        from jax.sharding import NamedSharding
+
+        kv_buffers = self._kv_buffers
+        if not kv_buffers:
+            return
+
+        head_dim = self.config.head_dim
+        v_head_dim = getattr(self.config, "v_head_dim", head_dim)
+        num_kv_heads = self.config.num_key_value_heads
+
+        quant_cfg = getattr(self, "_quant_config", None)
+        block_size = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
+
+        fused_dim = head_dim + v_head_dim
+        blocks_per_head = math.ceil(fused_dim / block_size)
+        padded_dim = blocks_per_head * block_size
+        k_blocks = math.ceil(head_dim / block_size)
+        v_blocks = blocks_per_head - k_blocks
+
+        logger.info(
+            "Fused KV dequant: head_dim=%d, v_head_dim=%d, fused=%d, "
+            "blocks_per_head=%d (K=%d, V=%d), padded=%d, num_kv_heads=%d",
+            head_dim,
+            v_head_dim,
+            fused_dim,
+            blocks_per_head,
+            k_blocks,
+            v_blocks,
+            padded_dim,
+            num_kv_heads,
+        )
+
+        for layer_idx in sorted(kv_buffers.keys()):
+            buf = kv_buffers[layer_idx]
+            k_weight = buf["k_weight"]  # [num_kv_heads * head_dim, hidden], FP8
+            k_scale = buf["k_scale"]  # [num_kv_heads * k_blocks, in_blocks], f32
+            v_weight = buf["v_weight"]  # [num_kv_heads * v_head_dim, hidden], FP8
+            v_scale = buf["v_scale"]  # [num_kv_heads * v_blocks, in_blocks], f32
+
+            in_dim = k_weight.shape[1]
+            in_blocks = in_dim // block_size
+
+            if layer_idx % 10 == 0:
+                logger.info(
+                    "Layer %d: k_weight=%s k_scale=%s v_weight=%s v_scale=%s",
+                    layer_idx,
+                    k_weight.shape,
+                    k_scale.shape,
+                    v_weight.shape,
+                    v_scale.shape,
+                )
+
+            # Reshape to per-head
+            k_w = k_weight.reshape(num_kv_heads, head_dim, in_dim)
+            v_w = v_weight.reshape(num_kv_heads, v_head_dim, in_dim)
+            k_s = k_scale.reshape(num_kv_heads, k_blocks, in_blocks)
+            v_s = v_scale.reshape(num_kv_heads, v_blocks, in_blocks)
+
+            # Fuse K+V per head
+            fused_w = jnp.concatenate([k_w, v_w], axis=1)  # [heads, fused_dim, hidden]
+            fused_s = jnp.concatenate([k_s, v_s], axis=1)  # [heads, blocks_per_head, in_blocks]
+
+            # Pad to block boundary
+            if fused_dim < padded_dim:
+                fused_w = jnp.pad(fused_w, ((0, 0), (0, padded_dim - fused_dim), (0, 0)))
+
+            # Block dequant: vectorized across heads
+            fused_5d = fused_w.astype(jnp.float32).reshape(
+                num_kv_heads, blocks_per_head, block_size, in_blocks, block_size
+            )
+            scale_5d = fused_s[:, :, None, :, None]
+            dequanted = (
+                (fused_5d * scale_5d)
+                .reshape(num_kv_heads, padded_dim, in_dim)[:, :fused_dim, :]
+                .astype(jnp.bfloat16)
+            )
+
+            # Split K and V, reshape to flat HF layout
+            k_bf16 = dequanted[:, :head_dim, :].reshape(num_kv_heads * head_dim, in_dim)
+            v_bf16 = dequanted[:, head_dim:, :].reshape(num_kv_heads * v_head_dim, in_dim)
+
+            # Transpose to model layout [in, out] and shard
+            tp_sharding = NamedSharding(self.mesh, P(None, "tensor"))
+            k_bf16 = jax.device_put(jnp.transpose(k_bf16), tp_sharding)
+            v_bf16 = jax.device_put(jnp.transpose(v_bf16), tp_sharding)
+
+            # Replace placeholder LinearBase with correctly dequanted weights
+            attn = self.model.layers[layer_idx].self_attn
+            in_features_k, out_features_k = k_bf16.shape
+            in_features_v, out_features_v = v_bf16.shape
+
+            with jax.set_mesh(self.mesh):
+                k_linear = LinearBase(
+                    input_size=in_features_k,
+                    output_size=out_features_k,
+                    kernel_axes=(None, "tensor"),
+                    use_bias=False,
+                    params_dtype=jnp.bfloat16,
+                    mesh=self.mesh,
+                )
+                k_linear.weight = nnx.Param(k_bf16)
+                attn.k_proj = k_linear
+
+                v_linear = LinearBase(
+                    input_size=in_features_v,
+                    output_size=out_features_v,
+                    kernel_axes=(None, "tensor"),
+                    use_bias=False,
+                    params_dtype=jnp.bfloat16,
+                    mesh=self.mesh,
+                )
+                v_linear.weight = nnx.Param(v_bf16)
+                attn.v_proj = v_linear
+
+            if layer_idx == 0:
+                logger.info(
+                    "Layer 0 fused KV dequant: K=%s V=%s",
+                    k_bf16.shape,
+                    v_bf16.shape,
+                )
+
+        kv_buffers.clear()
+        logger.info("Fused KV per-head FP8 dequantization complete for all layers.")
 
     def _create_weight_mappings(self) -> dict:
         mappings = {
@@ -797,6 +936,23 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         ]:
             hf_key = f"{prefix}.self_attn.{proj}"
             ignored = self._is_quant_ignored(hf_key)
+
+            # FP8 K/V: bypass QuantizedLinear, store raw FP8 data for fused
+            # per-head dequant (cross K/V boundary blocks).
+            if is_fp8 and not ignored and proj in ("k_proj", "v_proj"):
+                kv_key = "K" if proj == "k_proj" else "V"
+                mappings[f"{hf_key}.weight"] = WeightMapping(
+                    target_path=f"__KV_{kv_key}_WEIGHT__{layer_idx}",
+                    sharding=(None, None),
+                    transpose=False,
+                )
+                mappings[f"{hf_key}.weight_scale_inv"] = WeightMapping(
+                    target_path=f"__KV_{kv_key}_SCALE__{layer_idx}",
+                    sharding=(None, None),
+                    transpose=False,
+                )
+                continue
+
             weight_suffix = "weight" if (not is_fp8 or ignored) else "weight_q"
 
             mappings[f"{hf_key}.weight"] = WeightMapping(
