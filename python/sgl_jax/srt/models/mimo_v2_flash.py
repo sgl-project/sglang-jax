@@ -757,16 +757,33 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             target_kv_heads=attn.k_head_num,
         )
 
+    def _uniform_block_dequant(self, weight, scale, block_size):
+        """Simple uniform block dequant for weight[out_dim, in_dim] * scale[out_blocks, in_blocks].
+
+        Used for layers where K/V are quantized uniformly across all heads
+        (no cross-boundary scale sharing between K and V).
+        """
+        out_dim, in_dim = weight.shape
+        out_blocks = scale.shape[0]
+        padded_out = out_blocks * block_size
+        in_blocks = scale.shape[1]
+        if padded_out > out_dim:
+            weight = jnp.pad(weight, ((0, padded_out - out_dim), (0, 0)))
+        w_4d = weight.astype(jnp.float32).reshape(out_blocks, block_size, in_blocks, block_size)
+        s_4d = scale[:, None, :, None]
+        result = (w_4d * s_4d).reshape(padded_out, in_dim)[:out_dim, :].astype(jnp.bfloat16)
+        return result
+
     def _dequant_fused_kv_heads(self):
-        """Dequantize per-KV-head fused K+V FP8 weights.
+        """Dequantize FP8 K+V weights with per-layer quantization scheme detection.
 
-        The FP8 checkpoint quantized K+V per KV head:
-          [K(head_dim), V(v_head_dim)] = fused_dim → ceil(fused_dim/block_size) blocks
-          Block boundaries can cross K/V boundary, so K and V must be fused
-          for correct dequantization.
-
-        K scale has ceil(head_dim/block_size) blocks per head,
-        V scale has (blocks_per_head - k_blocks) blocks per head.
+        Different layers may use different quantization schemes:
+        - Per-head fused: K+V quantized as fused [K(head_dim), V(v_head_dim)] per KV head.
+          Block boundaries cross K/V boundary, so they must be fused for correct dequant.
+          Signature: k_scale_blocks == num_kv_heads * ceil(head_dim/block_size)
+        - Uniform: K and V quantized independently across the whole tensor.
+          No cross-boundary issue, can dequant K and V separately.
+          Signature: k_scale_blocks == ceil(num_kv_heads * head_dim / block_size)
         """
         import math
 
@@ -778,96 +795,76 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
         head_dim = self.config.head_dim
         v_head_dim = getattr(self.config, "v_head_dim", head_dim)
-        # Infer num_kv_heads from actual weight shape, not config
-        # (config may have the TP-replicated count).
-        first_buf = next(iter(kv_buffers.values()))
-        num_kv_heads = first_buf["k_weight"].shape[0] // head_dim
-
         quant_cfg = getattr(self, "_quant_config", None)
         block_size = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
 
         fused_dim = head_dim + v_head_dim
         blocks_per_head = math.ceil(fused_dim / block_size)
         padded_dim = blocks_per_head * block_size
-        k_blocks = math.ceil(head_dim / block_size)
-        v_blocks = blocks_per_head - k_blocks
+        k_blocks_per_head = math.ceil(head_dim / block_size)
+        v_blocks_per_head = blocks_per_head - k_blocks_per_head
 
-        logger.info(
-            "Fused KV dequant: head_dim=%d, v_head_dim=%d, fused=%d, "
-            "blocks_per_head=%d (K=%d, V=%d), padded=%d, num_kv_heads=%d",
-            head_dim,
-            v_head_dim,
-            fused_dim,
-            blocks_per_head,
-            k_blocks,
-            v_blocks,
-            padded_dim,
-            num_kv_heads,
-        )
+        tp_sharding = NamedSharding(self.mesh, P(None, "tensor"))
 
         for layer_idx in sorted(kv_buffers.keys()):
             buf = kv_buffers[layer_idx]
-            k_weight = buf["k_weight"]  # [num_kv_heads * head_dim, hidden], FP8
-            k_scale = buf["k_scale"]  # [num_kv_heads * k_blocks, in_blocks], f32
-            v_weight = buf["v_weight"]  # [num_kv_heads * v_head_dim, hidden], FP8
-            v_scale = buf["v_scale"]  # [num_kv_heads * v_blocks, in_blocks], f32
+            k_weight = buf["k_weight"]
+            k_scale = buf["k_scale"]
+            v_weight = buf["v_weight"]
+            v_scale = buf["v_scale"]
 
             in_dim = k_weight.shape[1]
             in_blocks = in_dim // block_size
 
-            if layer_idx % 10 == 0:
-                logger.info(
-                    "Layer %d: k_weight=%s k_scale=%s v_weight=%s v_scale=%s",
-                    layer_idx,
-                    k_weight.shape,
-                    k_scale.shape,
-                    v_weight.shape,
-                    v_scale.shape,
+            # Per-layer num_kv_heads from actual weight shape
+            num_kv_heads = k_weight.shape[0] // head_dim
+            k_scale_blocks = k_scale.shape[0]
+
+            # Detect quantization scheme for this layer
+            expected_per_head = num_kv_heads * k_blocks_per_head
+            expected_uniform = math.ceil(num_kv_heads * head_dim / block_size)
+            is_per_head = (
+                k_scale_blocks == expected_per_head and expected_per_head != expected_uniform
+            )
+
+            if is_per_head:
+                # Per-head fused: K+V must be fused because scale blocks cross K/V boundary
+                k_w = k_weight.reshape(num_kv_heads, head_dim, in_dim)
+                v_w = v_weight.reshape(num_kv_heads, v_head_dim, in_dim)
+                k_s = k_scale.reshape(num_kv_heads, k_blocks_per_head, in_blocks)
+                v_s = v_scale.reshape(num_kv_heads, v_blocks_per_head, in_blocks)
+                fused_w = jnp.concatenate([k_w, v_w], axis=1)
+                fused_s = jnp.concatenate([k_s, v_s], axis=1)
+                if fused_dim < padded_dim:
+                    fused_w = jnp.pad(fused_w, ((0, 0), (0, padded_dim - fused_dim), (0, 0)))
+                fused_5d = fused_w.astype(jnp.float32).reshape(
+                    num_kv_heads, blocks_per_head, block_size, in_blocks, block_size
                 )
+                scale_5d = fused_s[:, :, None, :, None]
+                dequanted = (
+                    (fused_5d * scale_5d)
+                    .reshape(num_kv_heads, padded_dim, in_dim)[:, :fused_dim, :]
+                    .astype(jnp.bfloat16)
+                )
+                k_bf16 = dequanted[:, :head_dim, :].reshape(num_kv_heads * head_dim, in_dim)
+                v_bf16 = dequanted[:, head_dim:, :].reshape(num_kv_heads * v_head_dim, in_dim)
+            else:
+                # Uniform: K and V can be dequanted independently
+                k_bf16 = self._uniform_block_dequant(k_weight, k_scale, block_size)
+                v_bf16 = self._uniform_block_dequant(v_weight, v_scale, block_size)
 
-            # Reshape to per-head
-            k_w = k_weight.reshape(num_kv_heads, head_dim, in_dim)
-            v_w = v_weight.reshape(num_kv_heads, v_head_dim, in_dim)
-            k_s = k_scale.reshape(num_kv_heads, k_blocks, in_blocks)
-            v_s = v_scale.reshape(num_kv_heads, v_blocks, in_blocks)
-
-            # Fuse K+V per head
-            fused_w = jnp.concatenate([k_w, v_w], axis=1)  # [heads, fused_dim, hidden]
-            fused_s = jnp.concatenate([k_s, v_s], axis=1)  # [heads, blocks_per_head, in_blocks]
-
-            # Pad to block boundary
-            if fused_dim < padded_dim:
-                fused_w = jnp.pad(fused_w, ((0, 0), (0, padded_dim - fused_dim), (0, 0)))
-
-            # Block dequant: vectorized across heads
-            fused_5d = fused_w.astype(jnp.float32).reshape(
-                num_kv_heads, blocks_per_head, block_size, in_blocks, block_size
-            )
-            scale_5d = fused_s[:, :, None, :, None]
-            dequanted = (
-                (fused_5d * scale_5d)
-                .reshape(num_kv_heads, padded_dim, in_dim)[:, :fused_dim, :]
-                .astype(jnp.bfloat16)
-            )
-
-            # Split K and V, reshape to flat HF layout
-            k_bf16 = dequanted[:, :head_dim, :].reshape(num_kv_heads * head_dim, in_dim)
-            v_bf16 = dequanted[:, head_dim:, :].reshape(num_kv_heads * v_head_dim, in_dim)
-
-            # Transpose to model layout [in, out] and shard
-            tp_sharding = NamedSharding(self.mesh, P(None, "tensor"))
+            # Transpose [out, in] → [in, out], shard, replace
             k_bf16 = jax.device_put(jnp.transpose(k_bf16), tp_sharding)
             v_bf16 = jax.device_put(jnp.transpose(v_bf16), tp_sharding)
 
-            # Replace placeholder LinearBase with correctly dequanted weights
             attn = self.model.layers[layer_idx].self_attn
-            in_features_k, out_features_k = k_bf16.shape
-            in_features_v, out_features_v = v_bf16.shape
+            in_k, out_k = k_bf16.shape
+            in_v, out_v = v_bf16.shape
 
             with jax.set_mesh(self.mesh):
                 k_linear = LinearBase(
-                    input_size=in_features_k,
-                    output_size=out_features_k,
+                    input_size=in_k,
+                    output_size=out_k,
                     kernel_axes=(None, "tensor"),
                     use_bias=False,
                     params_dtype=jnp.bfloat16,
@@ -877,8 +874,8 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                 attn.k_proj = k_linear
 
                 v_linear = LinearBase(
-                    input_size=in_features_v,
-                    output_size=out_features_v,
+                    input_size=in_v,
+                    output_size=out_v,
                     kernel_axes=(None, "tensor"),
                     use_bias=False,
                     params_dtype=jnp.bfloat16,
@@ -887,15 +884,18 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                 v_linear.weight = nnx.Param(v_bf16)
                 attn.v_proj = v_linear
 
-            if layer_idx == 0:
+            if layer_idx % 10 == 0 or layer_idx == 0:
                 logger.info(
-                    "Layer 0 fused KV dequant: K=%s V=%s",
+                    "Layer %d KV dequant: %s, heads=%d, K=%s V=%s",
+                    layer_idx,
+                    "per-head" if is_per_head else "uniform",
+                    num_kv_heads,
                     k_bf16.shape,
                     v_bf16.shape,
                 )
 
         kv_buffers.clear()
-        logger.info("Fused KV per-head FP8 dequantization complete for all layers.")
+        logger.info("FP8 KV dequantization complete for all layers.")
 
     def _create_weight_mappings(self) -> dict:
         mappings = {
