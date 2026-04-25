@@ -382,3 +382,39 @@ class TestModelRunnerIntegration:
         # full_attn_backend should be NativeAttention since we asked for "native".
         assert isinstance(backend.full_attn_backend, NativeAttention)
         assert backend.full_attn_layers == frozenset({0, 2})
+
+
+# ---------------------------------------------------------------------------
+# TP-6: two-layer mock model — each sub-backend invoked once, in layer order.
+# ---------------------------------------------------------------------------
+
+
+class TestTwoLayerForwardOrdering:
+    def test_two_layer_forward_calls_each_sub_once_in_order(self):
+        """1 MLA layer (layer_id=0) + 1 KDA layer (layer_id=1)."""
+        hybrid, full, linear = _make_hybrid(full_layers=(0,))
+
+        # Set forward_metadata once, mimicking tp_worker pre-forward.
+        hybrid.forward_metadata = HybridLinearAttentionBackendMetadata(
+            full_attn_metadata=_FakeFullMetadata(tag="step-full"),
+            linear_attn_metadata=_FakeLinearMetadata(tag="step-linear"),
+        )
+
+        # Walk layers in index order: 0 (MLA / full), 1 (KDA / linear).
+        results = []
+        for layer_id in (0, 1):
+            results.append(
+                hybrid(
+                    layer=_FakeLayer(layer_id=layer_id),
+                    forward_batch=_FakeBatch(name="step1"),
+                )
+            )
+
+        assert [c["layer_id"] for c in full.calls] == [0]
+        assert [c["layer_id"] for c in linear.calls] == [1]
+        # Sub-backends saw their respective metadata via the setter.
+        assert full.forward_metadata.tag == "step-full"
+        assert linear.forward_metadata.tag == "step-linear"
+        # Outputs preserve dispatch labels.
+        assert results[0][0] == "full-out"
+        assert results[1][0] == "linear-out"
