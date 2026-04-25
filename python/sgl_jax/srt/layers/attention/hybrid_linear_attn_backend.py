@@ -175,10 +175,14 @@ def attn_backend_wrapper(
     """Wrap full_attn_backend in HybridLinearAttnBackend for hybrid models.
 
     Mirrors upstream `sglang/srt/layers/attention/attention_registry.py:attn_backend_wrapper`.
-    When no hybrid (linear-recurrent) config is set, returns `full_attn_backend`
-    unchanged so the caller can invoke this unconditionally.
+    `runner.linear_recurrent_config` is the cheap "is this hybrid?" detector;
+    dispatch to a concrete sub-backend uses the specific config properties
+    (e.g. `runner.kimi_linear_config`).
     """
-    if runner.linear_recurrent_config is not None:
+    cfg = runner.linear_recurrent_config
+    if cfg is None:
+        return full_attn_backend
+    if runner.kimi_linear_config is not None:
         # KDAAttnBackend lives in a separate PR — lazy import keeps this PR
         # self-contained.
         try:
@@ -189,7 +193,8 @@ def attn_backend_wrapper(
             ) from e
 
         linear_attn_backend = KDAAttnBackend(runner)
-        full_attn_layers = runner.linear_recurrent_config.full_attention_layer_ids
-        return HybridLinearAttnBackend(full_attn_backend, linear_attn_backend, full_attn_layers)
-
-    return full_attn_backend
+    else:
+        raise NotImplementedError(f"No linear backend wired for hybrid config {type(cfg).__name__}")
+    return HybridLinearAttnBackend(
+        full_attn_backend, linear_attn_backend, cfg.full_attention_layer_ids
+    )

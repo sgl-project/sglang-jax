@@ -650,17 +650,23 @@ class ModelRunner(BaseModelRunner):
         self.attn_backend = self._get_attention_backend()
 
     @property
-    def linear_recurrent_config(self):
-        """Linear-recurrent (state-based) hybrid model config, or None.
-
-        Currently detects Kimi-Linear; extend with additional hybrid configs
-        (GDN, ...) as they're added.
-        """
+    def kimi_linear_config(self):
+        """Return the Kimi-Linear config when the model is Kimi-Linear, else None."""
         from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 
         if isinstance(self.model_config.hf_config, KimiLinearConfig):
             return self.model_config.hf_config
         return None
+
+    @property
+    def linear_recurrent_config(self):
+        """OR over all hybrid linear-recurrent configs supported on this runner.
+
+        Cheap detector for `attn_backend_wrapper` to decide whether to wrap.
+        Dispatch to a concrete sub-backend uses the specific properties (e.g.
+        `kimi_linear_config`) — do not switch on this.
+        """
+        return self.kimi_linear_config  # add `or self.hybrid_gdn_config` etc. later
 
     def _get_attention_backend(self):
         backend = self.server_args.attention_backend

@@ -402,7 +402,7 @@ class TestAttnBackendWrapper:
     def test_passthrough_when_linear_recurrent_config_is_none(self):
         from types import SimpleNamespace
 
-        runner = SimpleNamespace(linear_recurrent_config=None)
+        runner = SimpleNamespace(linear_recurrent_config=None, kimi_linear_config=None)
         full = _FakeFullBackend()
         result = attn_backend_wrapper(runner, full)
         assert result is full  # identity — unchanged
@@ -412,7 +412,7 @@ class TestAttnBackendWrapper:
         from types import SimpleNamespace
 
         cfg = SimpleNamespace(full_attention_layer_ids=[0, 2])
-        runner = SimpleNamespace(linear_recurrent_config=cfg)
+        runner = SimpleNamespace(linear_recurrent_config=cfg, kimi_linear_config=cfg)
 
         monkeypatch.setitem(
             sys.modules,
@@ -445,7 +445,7 @@ class TestAttnBackendWrapper:
         )
 
         cfg = SimpleNamespace(full_attention_layer_ids=[0, 2])
-        runner = SimpleNamespace(linear_recurrent_config=cfg)
+        runner = SimpleNamespace(linear_recurrent_config=cfg, kimi_linear_config=cfg)
         full = _FakeFullBackend()
 
         result = attn_backend_wrapper(runner, full)
@@ -454,6 +454,21 @@ class TestAttnBackendWrapper:
         assert result.full_attn_backend is full
         assert isinstance(result.linear_attn_backend, _FakeKDA)
         assert result.full_attn_layers == frozenset({0, 2})
+
+    def test_raises_not_implemented_for_unwired_hybrid_config(self):
+        # linear_recurrent_config set (umbrella detector says "hybrid"), but
+        # no concrete config wired (kimi_linear_config is None) → wrapper must
+        # surface a NotImplementedError instead of silently doing the wrong thing.
+        from types import SimpleNamespace
+
+        cfg = SimpleNamespace(full_attention_layer_ids=[0])
+        runner = SimpleNamespace(linear_recurrent_config=cfg, kimi_linear_config=None)
+        try:
+            attn_backend_wrapper(runner, _FakeFullBackend())
+        except NotImplementedError as e:
+            assert "SimpleNamespace" in str(e)  # uses type(cfg).__name__
+            return
+        raise AssertionError("expected NotImplementedError")
 
 
 # ---------------------------------------------------------------------------
@@ -495,9 +510,10 @@ class TestModelRunnerIntegration:
             model_config=SimpleNamespace(head_dim=64),
             page_size=1,
             mesh=mesh,
-            # The wrapper now reads `linear_recurrent_config` (a @property on the
-            # real ModelRunner). We supply it directly on the SimpleNamespace.
+            # The wrapper now reads both `linear_recurrent_config` (umbrella
+            # hybrid detector) and `kimi_linear_config` (concrete dispatch).
             linear_recurrent_config=cfg,
+            kimi_linear_config=cfg,
         )
 
         backend = ModelRunner._get_attention_backend(runner)
@@ -509,31 +525,49 @@ class TestModelRunnerIntegration:
 
 
 # ---------------------------------------------------------------------------
-# linear_recurrent_config @property on ModelRunner returns KimiLinearConfig
-# instance when hf_config is one, otherwise None.
+# kimi_linear_config + linear_recurrent_config @property on ModelRunner.
 # ---------------------------------------------------------------------------
 
 
-class TestLinearRecurrentConfigProperty:
-    def test_returns_kimi_linear_config_when_hf_config_matches(self):
+class TestHybridConfigProperties:
+    def _runner_with_hf(self, hf_config):
+        """Tiny shim that exposes the two ModelRunner @property descriptors."""
         from types import SimpleNamespace
 
-        from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
         from sgl_jax.srt.model_executor.model_runner import ModelRunner
+
+        class _Runner:
+            kimi_linear_config = ModelRunner.kimi_linear_config
+            linear_recurrent_config = ModelRunner.linear_recurrent_config
+
+            def __init__(self, hf):
+                self.model_config = SimpleNamespace(hf_config=hf)
+
+        return _Runner(hf_config)
+
+    def test_kimi_linear_config_returns_config_when_hf_matches(self):
+        from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 
         cfg = KimiLinearConfig(num_hidden_layers=2)
-        runner = SimpleNamespace(model_config=SimpleNamespace(hf_config=cfg))
-        result = ModelRunner.linear_recurrent_config.fget(runner)
-        assert result is cfg
+        runner = self._runner_with_hf(cfg)
+        assert runner.kimi_linear_config is cfg
 
-    def test_returns_none_for_non_kimi_config(self):
-        from types import SimpleNamespace
+    def test_kimi_linear_config_returns_none_for_other_configs(self):
+        runner = self._runner_with_hf(object())
+        assert runner.kimi_linear_config is None
 
-        from sgl_jax.srt.model_executor.model_runner import ModelRunner
+    def test_linear_recurrent_config_is_kimi_for_now(self):
+        # linear_recurrent_config currently ORs only kimi_linear_config; future
+        # additions (hybrid_gdn_config, ...) extend the chain.
+        from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 
-        runner = SimpleNamespace(model_config=SimpleNamespace(hf_config=object()))
-        result = ModelRunner.linear_recurrent_config.fget(runner)
-        assert result is None
+        cfg = KimiLinearConfig(num_hidden_layers=2)
+        runner = self._runner_with_hf(cfg)
+        assert runner.linear_recurrent_config is cfg
+
+    def test_linear_recurrent_config_none_when_no_hybrid(self):
+        runner = self._runner_with_hf(object())
+        assert runner.linear_recurrent_config is None
 
 
 # ---------------------------------------------------------------------------
