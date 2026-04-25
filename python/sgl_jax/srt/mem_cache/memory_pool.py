@@ -874,7 +874,19 @@ def update_fused_kv_cache_vectorized(
     return _sharded_update(fused_kv, loc, kv_cache)
 
 
+@register_pytree_node_class
 class MLATokenToKVPool(KVCache):
+    """Paged KV cache for absorbed-MLA path.
+
+    Layout matches the MLA v2 Pallas kernel (`get_kv_cache_shape`):
+      `[num_pages, align_to(page_size, kv_packing)//kv_packing, kv_packing,
+        align_to(kv_lora_rank, 128) + align_to(qk_rope_head_dim, 128)]`
+
+    The cache is fully replicated across the TP mesh (single latent head, no head
+    axis to shard). Cache writes happen inside the kernel via input/output aliasing,
+    so `set_kv_buffer` is only used by non-kernel fallback paths.
+    """
+
     def __init__(
         self,
         size: int,
@@ -884,7 +896,7 @@ class MLATokenToKVPool(KVCache):
         qk_rope_head_dim: int,
         layer_num: int,
         mesh: Mesh,
-        kv_partition_axis: str = "data",  # Note: ignored in MLA, no sharding applied
+        kv_partition_axis: str = "data",  # ignored: MLA cache is replicated
         start_layer: int | None = None,
         end_layer: int | None = None,
     ):
@@ -893,110 +905,181 @@ class MLATokenToKVPool(KVCache):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.kv_partition_axis = kv_partition_axis
 
+        from sgl_jax.srt.kernels.mla.v2.kernel import align_to
+
+        self.nope_dim = align_to(kv_lora_rank, 128)
+        self.rope_dim = align_to(qk_rope_head_dim, 128)
+        self.kv_dim = self.nope_dim + self.rope_dim
+
         self._create_buffers()
         self._calculate_memory_usage()
 
+    def tree_flatten(self):
+        parent_children, parent_aux_data = super().tree_flatten()
+
+        children = (self.kv_buffer,) + parent_children
+        aux_data = {
+            **parent_aux_data,
+            "kv_lora_rank": self.kv_lora_rank,
+            "qk_rope_head_dim": self.qk_rope_head_dim,
+            "kv_partition_axis": self.kv_partition_axis,
+            "nope_dim": self.nope_dim,
+            "rope_dim": self.rope_dim,
+            "kv_dim": self.kv_dim,
+            "kv_sharding": self.kv_sharding,
+        }
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        kv_buffer = children[0]
+        parent_children = children[1:] if len(children) > 1 else ()
+
+        obj = object.__new__(cls)
+
+        parent_obj = super().tree_unflatten(aux_data, parent_children)
+        for attr in [
+            "size",
+            "page_size",
+            "dtype",
+            "layer_num",
+            "mesh",
+            "start_layer",
+            "end_layer",
+            "mem_usage",
+        ]:
+            setattr(obj, attr, getattr(parent_obj, attr))
+
+        obj.kv_lora_rank = aux_data["kv_lora_rank"]
+        obj.qk_rope_head_dim = aux_data["qk_rope_head_dim"]
+        obj.kv_partition_axis = aux_data["kv_partition_axis"]
+        obj.nope_dim = aux_data["nope_dim"]
+        obj.rope_dim = aux_data["rope_dim"]
+        obj.kv_dim = aux_data["kv_dim"]
+        obj.kv_sharding = aux_data["kv_sharding"]
+
+        obj.kv_buffer = kv_buffer
+
+        return obj
+
     def _create_buffers(self):
-        """Create KV buffers for MLA"""
-        # MLA sharding strategy - no sharding for MLA KV cache even with TP
-        self.kv_sharding = NamedSharding(self.mesh, P(None, None, None))
+        """Allocate replicated 4D paged KV buffers for the MLA v2 kernel.
+
+        Layout matches the kernel ABI (`get_kv_cache_shape`):
+            [num_pages, align_to(page_size, kv_packing) // kv_packing,
+             kv_packing, align_to(kv_lora_rank, 128) + align_to(qk_rope_head_dim, 128)]
+
+        The last dim is `align(lkv,128) + align(rope,128)` — each segment
+        padded INDEPENDENTLY, NOT `align(lkv+rope, 128)`. The kernel slices
+        the cache as two adjacent buffers (`bkvc_x2_ref` at offset 0,
+        `bkpe_x2_ref` at offset `lkv_dim`); under-allocating with the
+        single-align formula would cause out-of-bounds rope reads on shapes
+        where the per-segment padding diverges from the combined-then-aligned
+        size (e.g. lora=192, rope=64: 256+128=384 vs align(256,128)=256).
+        DeepSeek-V3 (lora=512, rope=64) is a coincidental match — 512+128=640
+        and align(576,128)=640.
+        """
+        from sgl_jax.srt.kernels.mla.v2.kernel import get_kv_cache_shape
+
+        # MLA cache has no head axis to shard; replicate across the mesh.
+        self.kv_sharding = NamedSharding(self.mesh, P(None, None, None, None))
+
+        assert self.size % self.page_size == 0, "Cache size must be divisible by page size"
+
+        total_num_pages = (self.size + self.page_size) // self.page_size
+        buffer_shape = get_kv_cache_shape(
+            total_num_pages=total_num_pages,
+            page_size=self.page_size,
+            kv_dim=self.kv_dim,
+            kv_dtype=self.dtype,
+        )
+
+        per_layer_bytes = (
+            buffer_shape[0]
+            * buffer_shape[1]
+            * buffer_shape[2]
+            * buffer_shape[3]
+            * jnp.dtype(self.dtype).itemsize
+        )
+        logger.info(
+            "MLA KV cache shape per layer: %s, dtype: %s, %.2f GB",
+            buffer_shape,
+            self.dtype,
+            per_layer_bytes / GB,
+        )
 
         with self.mesh:
-            # The padded slot 0 is used for writing dummy outputs from padded tokens
             self.kv_buffer = []
             for _ in range(self.layer_num):
-                kv_buf = jnp.zeros(
-                    (
-                        self.size + self.page_size,
-                        1,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                    ),
-                    dtype=self.dtype,
-                )
-                kv_buf = jax.device_put(kv_buf, self.kv_sharding)
+                kv_buf = jax.jit(
+                    lambda: jnp.zeros(shape=buffer_shape, dtype=self.dtype),
+                    out_shardings=self.kv_sharding,
+                )()
                 self.kv_buffer.append(kv_buf)
 
     def _calculate_memory_usage(self):
-        """Calculate memory usage"""
-        kv_size = (
-            self.size
-            * (self.kv_lora_rank + self.qk_rope_head_dim)
-            * jnp.dtype(self.dtype).itemsize
-            * self.layer_num
-        )
-        self.mem_usage = kv_size / GB
+        """Calculate memory usage for the 4D paged MLA cache."""
+        total_bytes = self._buffer_bytes() * self.layer_num
+        self.mem_usage = total_bytes / GB
 
         logger.info(
             "JAX MLA KV Cache allocated. #tokens: %s, KV size: %.2f GB",
             self.size,
-            kv_size / GB,
+            total_bytes / GB,
         )
+
+    def _buffer_bytes(self) -> int:
+        total_num_pages = (self.size + self.page_size) // self.page_size
+        from sgl_jax.srt.kernels.mla.v2.kernel import get_kv_cache_shape
+
+        shape = get_kv_cache_shape(
+            total_num_pages=total_num_pages,
+            page_size=self.page_size,
+            kv_dim=self.kv_dim,
+            kv_dtype=self.dtype,
+        )
+        return shape[0] * shape[1] * shape[2] * shape[3] * jnp.dtype(self.dtype).itemsize
 
     def get_kv_size_bytes(self):
-        """Calculate KV cache size in bytes"""
-        kv_size = (
-            self.size
-            * (self.kv_lora_rank + self.qk_rope_head_dim)
-            * jnp.dtype(self.dtype).itemsize
-            * self.layer_num
-        )
-        return kv_size
+        """Calculate KV cache size in bytes."""
+        return self._buffer_bytes() * self.layer_num
 
     def get_fused_kv_buffer(self, layer_id: int) -> jax.Array:
-        """Get fused buffer for MLA architecture.
-
-        Note: MLA has different architecture than standard MHA,
-        but we provide this interface for compatibility.
-        """
+        """Return the 4D paged buffer; consumed directly by the MLA v2 kernel."""
         return self.kv_buffer[layer_id - self.start_layer]
 
     def get_kv_buffer(self, layer_id: int) -> tuple[jax.Array, jax.Array]:
-        """Get separate K and V buffers for native attention from MLA KV cache.
-
-        Note: MLA architecture differs from standard MHA. For native attention compatibility,
-        we split the combined kv_lora_rank + qk_rope_head_dim into separate K and V components.
-
-        Returns:
-            Tuple of (k_buffer, v_buffer) where:
-            - k_buffer contains the kv_lora_rank portion
-            - v_buffer contains the qk_rope_head_dim portion
-        """
-        layer_idx = layer_id - self.start_layer
-        mla_kv = self.kv_buffer[layer_idx]  # [cache_size, 1, kv_lora_rank + qk_rope_head_dim]
-
-        # Split MLA KV buffer into K and V components for native attention
-        k_buffer = mla_kv[:, :, : self.kv_lora_rank]  # [cache_size, 1, kv_lora_rank]
-        v_buffer = mla_kv[:, :, self.kv_lora_rank :]  # [cache_size, 1, qk_rope_head_dim]
-
-        return k_buffer, v_buffer
+        """Split the latent buffer into (c_kv, k_pe) views for non-kernel fallbacks."""
+        buf = self.kv_buffer[layer_id - self.start_layer]
+        c_kv = buf[..., : self.kv_lora_rank]
+        k_pe = buf[..., self.nope_dim : self.nope_dim + self.qk_rope_head_dim]
+        return c_kv, k_pe
 
     def set_kv_buffer(
         self,
         layer_id: int,
         loc: jax.Array,
         cache_k: jax.Array,
-        cache_v: jax.Array,
+        cache_v: jax.Array = None,
         is_decode: bool = False,
     ) -> None:
-        """Set KV cache data for MLA"""
-        layer_idx = layer_id - self.start_layer
-        self.kv_buffer[layer_idx] = self.kv_buffer[layer_idx].at[loc].set(cache_k)
+        """Non-kernel write path. The MLA v2 kernel writes the cache via input/output
+        aliasing, so this is only invoked from native fallback / eval paths and is
+        intentionally left as a NotImplementedError for the absorbed PR scope.
+        """
+        raise NotImplementedError(
+            "MLATokenToKVPool.set_kv_buffer is not supported in the absorbed path; "
+            "the MLA v2 kernel writes the cache in-place via input_output_aliases."
+        )
 
-    def set_mla_kv_buffer(
-        self,
-        layer_id: int,
-        loc: jax.Array,
-        cache_k_nope: jax.Array,
-        cache_k_rope: jax.Array,
-    ):
-        """Set MLA KV buffer with separate nope and rope components"""
-        layer_idx = layer_id - self.start_layer
-        # Concatenate nope and rope components
-        cache_k_combined = jnp.concatenate([cache_k_nope, cache_k_rope], axis=-1)
-        self.kv_buffer[layer_idx] = self.kv_buffer[layer_idx].at[loc].set(cache_k_combined)
+    def replace_kv_buffer(self, kv_buffer: list[jax.Array]) -> None:
+        self.kv_buffer[self.start_layer : self.start_layer + len(kv_buffer)] = kv_buffer
 
     def get_cpu_copy(self, indices):
-        """Get CPU copy of KV cache for specified indices"""
+        """Get CPU copy of KV cache for specified indices.
+
+        `indices` selects pages along the leading axis (num_pages).
+        """
         kv_cache_host = []
         for layer_id in range(self.layer_num):
             kv_host = jax.device_get(self.kv_buffer[layer_id][indices])
@@ -1004,7 +1087,7 @@ class MLATokenToKVPool(KVCache):
         return kv_cache_host
 
     def load_cpu_copy(self, kv_cache_host, indices):
-        """Load host copy back to device"""
+        """Load host copy back to device."""
         for layer_id in range(self.layer_num):
             kv_host = kv_cache_host[layer_id]
             kv_device = jax.device_put(kv_host, self.kv_sharding)

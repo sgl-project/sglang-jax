@@ -14,6 +14,7 @@ import jax
 import numpy as np
 from flax import nnx
 from jax import numpy as jnp
+from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import AttentionArch, ModelConfig, MoEBackend
@@ -122,6 +123,7 @@ class DeepseekV3Attention(nnx.Module):
         rope_interleave: bool = True,
         max_position_embeddings: int = 163840,
         dtype: jnp.dtype = jnp.bfloat16,
+        use_absorbed: bool = True,
     ):
         super().__init__()
         self.mesh = mesh
@@ -204,11 +206,46 @@ class DeepseekV3Attention(nnx.Module):
             dtype=dtype,
         )
 
-        self.attn = RadixAttention(
+        self.attn_mqa = RadixAttention(
+            num_heads=num_heads,
+            head_dim=kv_lora_rank + qk_rope_head_dim,
+            scaling=self.qk_head_dim**-0.5,
+            num_kv_heads=1,
+            v_head_dim=kv_lora_rank,
+            layer_id=layer_id,
+        )
+
+        self.use_absorbed = use_absorbed
+        # Absorbed-MLA fused projections, populated by post_load_weights() after
+        # weight loading: w_uk[R, n_h, D_k] folds W_UK into Q, w_uv[R, n_h, D_v]
+        # folds W_UV into the output. Placeholders here so nnx tracks them in
+        # the model state tree; sharded on the head dim like kv_b_proj.weight.
+        if use_absorbed:
+            uk_axes = (None, "tensor", None)
+            self.w_uk = nnx.Param(
+                jnp.zeros(
+                    (kv_lora_rank, num_heads, qk_nope_head_dim),
+                    dtype=dtype,
+                    out_sharding=P(*uk_axes),
+                )
+            )
+            self.w_uv = nnx.Param(
+                jnp.zeros(
+                    (kv_lora_rank, num_heads, v_head_dim),
+                    dtype=dtype,
+                    out_sharding=P(*uk_axes),
+                )
+            )
+        # Non-absorbed (MHA) RadixAttention: every Q head has its own K/V,
+        # head_dim is the concatenated nope+rope dim. We pad V to the same
+        # head_dim before calling FlashAttention (RPA v3 requires k/v share
+        # head_dim) and slice back to v_head_dim after.
+        self.attn_mha = RadixAttention(
             num_heads=num_heads,
             head_dim=self.qk_head_dim,
             scaling=self.qk_head_dim**-0.5,
             num_kv_heads=num_heads,
+            v_head_dim=self.qk_head_dim,
             layer_id=layer_id,
         )
 
@@ -219,6 +256,14 @@ class DeepseekV3Attention(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ) -> tuple[jax.Array, jax.Array]:
+        """MLA forward. Two paths, picked at server start via --attention-backend:
+
+        - `fa` (default, absorbed): fold W_UK into Q, attend latent c_kv via
+          MLA kernel (MQA). Cache stores latent. See docs/design/MLA.md §3.9.
+        - `fa_mha` (non-absorbed): kv_b_proj decompresses to per-head K/V, run
+          FlashAttention. ~70x more KV memory; for A/B and short-context only.
+        """
+        # Shared front-half: project Q, project KV-A latent, apply RoPE.
         if self.q_lora_rank is None:
             q, _ = self.q_proj(hidden_states)
         else:
@@ -232,28 +277,104 @@ class DeepseekV3Attention(nnx.Module):
         kv_a_out, _ = self.kv_a_proj(hidden_states)
         compressed = kv_a_out[:, : self.kv_lora_rank]
         k_rope_raw = kv_a_out[:, self.kv_lora_rank :]
-
         compressed = self.kv_a_layernorm(compressed)
-        kv_out, _ = self.kv_b_proj(compressed)
-        kv_out = kv_out.reshape(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope = kv_out[:, :, : self.qk_nope_head_dim]
-        v = kv_out[:, :, self.qk_nope_head_dim :]
-
-        # Pad V to qk_head_dim to match K, required by fused MHATokenToKVPool.
-        v = jnp.pad(v, ((0, 0), (0, 0), (0, self.qk_head_dim - self.v_head_dim)))
 
         k_rope = k_rope_raw.reshape(-1, 1, self.qk_rope_head_dim)
         q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+
+        if self.use_absorbed:
+            attn_output, kv_fused = self._forward_mqa(
+                q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
+            )
+        else:
+            attn_output, kv_fused = self._forward_mha(
+                q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
+            )
+
+        output, _ = self.o_proj(attn_output)
+        return output, kv_fused
+
+    def post_load_weights(self):
+        """Split kv_b_proj.weight into absorbed-MLA folded projections.
+
+        kv_b_proj.weight has layout [kv_lora_rank, n_h * (qk_nope+v_head_dim)],
+        head-major with [nope, v] within each head block. Absorbed MLA folds
+        W_UK into Q (pre-attn) and W_UV into the output (post-attn), so once
+        split we can drop kv_b_proj entirely. Mirrors sglang's
+        deepseek_weight_loader.post_process(). No-op for non-absorbed path.
+        """
+        if not self.use_absorbed:
+            return
+        w_kv = self.kv_b_proj.weight.value.reshape(
+            self.kv_lora_rank,
+            self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+        )
+        self.w_uk.value = w_kv[:, :, : self.qk_nope_head_dim]
+        self.w_uv.value = w_kv[:, :, self.qk_nope_head_dim :]
+        self.kv_b_proj = None
+
+    def _forward_mqa(
+        self,
+        q_nope: jax.Array,
+        q_rope: jax.Array,
+        compressed: jax.Array,
+        k_rope: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+    ) -> tuple[jax.Array, jax.Array]:
+        # ql_nope[t, h, r] = sum_d q_nope[t, h, d] * w_uk[r, h, d]
+        ql_nope = jnp.einsum("thd,rhd->thr", q_nope, self.w_uk.value)
+
+        # Latent K/V are a single shared head — pack into [T, 1, *] for MQA.
+        c_kv_3d = compressed[:, None, :]
+
+        o_latent, kv_fused = self.attn_mqa(
+            ql_nope,
+            c_kv_3d,
+            c_kv_3d,
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+            q_rope=q_rope,
+            k_rope=k_rope,
+        )
+
+        # o_v[t, h, d] = sum_r o_latent[t, h, r] * w_uv[r, h, d]
+        o_v = jnp.einsum("thr,rhd->thd", o_latent, self.w_uv.value)
+        attn_output = o_v.reshape(-1, self.num_heads * self.v_head_dim)
+        return attn_output, kv_fused
+
+    def _forward_mha(
+        self,
+        q_nope: jax.Array,
+        q_rope: jax.Array,
+        compressed: jax.Array,
+        k_rope: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+    ) -> tuple[jax.Array, jax.Array]:
+        # Decompress latent c_kv into per-head K-nope and V via kv_b_proj.
+        kv, _ = self.kv_b_proj(compressed)
+        kv = kv.reshape(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope, v = jnp.split(kv, [self.qk_nope_head_dim], axis=-1)
+
+        # k_rope is shared across heads — broadcast with the head-sharded spec
+        # so the downstream concat keeps "tensor" sharding on the head axis.
         k_rope = jnp.broadcast_to(
             k_rope,
             (k_rope.shape[0], self.num_heads, self.qk_rope_head_dim),
-            out_sharding=jax.sharding.PartitionSpec(None, "tensor", None),
+            out_sharding=P(None, "tensor", None),
         )
 
         q = jnp.concatenate([q_nope, q_rope], axis=-1)
         k = jnp.concatenate([k_nope, k_rope], axis=-1)
 
-        attn_output, kv_fused = self.attn(
+        # RPA v3 requires k.shape[-1] == v.shape[-1]; attn_mha is configured with
+        # v_head_dim=qk_head_dim, so pad V on the head dim and strip the pad off
+        # the output below.
+        v = jnp.pad(v, ((0, 0), (0, 0), (0, self.qk_head_dim - self.v_head_dim)))
+
+        attn_output, kv_fused = self.attn_mha(
             q, k, v, forward_batch=forward_batch, token_to_kv_pool=token_to_kv_pool
         )
 
@@ -262,9 +383,7 @@ class DeepseekV3Attention(nnx.Module):
         attn_output = attn_output[:, :, : self.v_head_dim].reshape(
             -1, self.num_heads * self.v_head_dim
         )
-
-        output, _ = self.o_proj(attn_output)
-        return output, kv_fused
+        return attn_output, kv_fused
 
 
 class DeepseekV3DecoderLayer(nnx.Module):
@@ -304,6 +423,7 @@ class DeepseekV3DecoderLayer(nnx.Module):
             rope_interleave=True,
             max_position_embeddings=max_position_embeddings,
             dtype=dtype,
+            use_absorbed=getattr(config, "use_absorbed_mla", True),
         )
 
         # Adjust attention scaling for YaRN mscale
@@ -312,7 +432,8 @@ class DeepseekV3DecoderLayer(nnx.Module):
             if mscale_all_dim:
                 scaling_factor = rope_scaling["factor"]
                 mscale = _deepseek_yarn_get_mscale(scaling_factor, mscale_all_dim)
-                self.self_attn.attn.scaling *= mscale * mscale
+                self.self_attn.attn_mqa.scaling *= mscale * mscale
+                self.self_attn.attn_mha.scaling *= mscale * mscale
 
         # MLP: MoE or dense depending on layer index
         n_routed_experts = getattr(config, "n_routed_experts", None)
@@ -616,6 +737,10 @@ class DeepseekV3ForCausalLM(nnx.Module):
         )
         weight_mappings = self._create_weight_mappings(model_config)
         loader.load_weights_from_safetensors(weight_mappings)
+        # Absorbed-MLA path: pre-split kv_b_proj into w_uk/w_uv and drop the
+        # original projection (sglang parity, deepseek_weight_loader.post_process).
+        for layer in self.model.layers:
+            layer.self_attn.post_load_weights()
         logger.info("DeepSeek V3 weights loaded successfully!")
 
     def _create_weight_mappings(self, model_config: ModelConfig) -> dict:

@@ -910,9 +910,16 @@ class ServerArgs:
             choices=[
                 "native",
                 "fa",
+                "fa_mha",
             ],
             default=ServerArgs.attention_backend,
-            help="Choose the kernels for attention layers.",
+            help=(
+                "Choose the kernels for attention layers. "
+                "'fa' = FlashAttention for MHA models, MLA Pallas kernel (absorbed) for MLA models. "
+                "'fa_mha' = force the MHA FlashAttention path for MLA models too "
+                "(decompress latent KV per-forward via kv_b_proj; ~70x more KV cache than 'fa', "
+                "intended for kernel A/B on short contexts)."
+            ),
         )
         parser.add_argument(
             "--moe-backend",

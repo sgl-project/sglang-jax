@@ -443,6 +443,7 @@ suites = {
         TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/moe_block_quant_test.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/test_flashattention.py", 20),
+        TestFile("python/sgl_jax/test/test_mla_attention.py", 15),
         TestFile("python/sgl_jax/test/test_moe_topk.py", 1),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 10),
         TestFile("python/sgl_jax/test/test_sampler.py", 0.2),
@@ -528,6 +529,7 @@ suites = {
         TestFile("test/srt/test_chunked_prefill_size.py", 5),
         # TestFile("test/srt/test_sliding_window_attention.py", 30), # add after gpt-oss supported
         TestFile("test/srt/test_model_loader.py", 5),
+        TestFile("test/srt/test_deepseek_v2_lite_models.py", 10),
         TestFile("test/srt/quantization/test_w8_quantization.py", 10),
         TestFile(
             "test/srt/quantization/test_w8_block_dynamic_quantization.py",
