@@ -83,8 +83,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         self._forward_metadata = nnx.data(HybridLinearAttentionBackendMetadata())
 
     # The remaining methods are added in Tasks 2.2 - 2.5.
-    def get_forward_metadata(self, batch):  # placeholder
-        raise NotImplementedError
+    def get_forward_metadata(self, batch):
+        return HybridLinearAttentionBackendMetadata(
+            full_attn_metadata=self.full_attn_backend.get_forward_metadata(batch),
+            linear_attn_metadata=self.linear_attn_backend.get_forward_metadata(batch),
+        )
 
     @property
     def forward_metadata(self):

@@ -123,3 +123,28 @@ def test_module_imports():
 def test_constructor_records_full_attn_layers_as_frozenset():
     hybrid, _, _ = _make_hybrid(full_layers=[0, 2, 2])
     assert hybrid.full_attn_layers == frozenset({0, 2})
+
+
+# ---------------------------------------------------------------------------
+# TP-1: get_forward_metadata aggregates sub-backend metadata
+# ---------------------------------------------------------------------------
+
+
+class TestGetForwardMetadata:
+    def test_aggregates_sub_backend_metadata(self):
+        hybrid, full, linear = _make_hybrid()
+        batch = _FakeBatch(name="b1")
+
+        meta = hybrid.get_forward_metadata(batch)
+
+        assert isinstance(meta, HybridLinearAttentionBackendMetadata)
+        assert meta.full_attn_metadata == full.get_forward_metadata(batch)
+        assert meta.linear_attn_metadata == linear.get_forward_metadata(batch)
+
+    def test_each_sub_backend_called_with_same_batch(self):
+        hybrid, full, linear = _make_hybrid()
+        batch = _FakeBatch(name="step42")
+        meta = hybrid.get_forward_metadata(batch)
+        # Both fields should reflect the batch name.
+        assert meta.full_attn_metadata.tag == "full-from-step42"
+        assert meta.linear_attn_metadata.tag == "linear-from-step42"
