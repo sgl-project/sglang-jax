@@ -152,6 +152,10 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
 
+    # Ngram speculative decoding
+    speculative_ngram_max_trie_depth: int = 8
+    speculative_ngram_max_bfs_breadth: int = 1
+
     # For deterministic sampling
     enable_deterministic_sampling: bool = False
     enable_single_process: bool = False
@@ -939,7 +943,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
             help="Speculative algorithm.",
             default=ServerArgs.speculative_algorithm,
         )
@@ -987,6 +991,20 @@ class ServerArgs:
             type=float,
             help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
             default=ServerArgs.speculative_accept_threshold_acc,
+        )
+        parser.add_argument(
+            "--speculative-ngram-max-trie-depth",
+            type=int,
+            help="Maximum depth of the ngram trie (longest stored n-gram).",
+            default=ServerArgs.speculative_ngram_max_trie_depth,
+        )
+        parser.add_argument(
+            "--speculative-ngram-max-bfs-breadth",
+            type=int,
+            help="Maximum BFS breadth when generating draft tokens from the ngram trie. "
+            "Default 1 (chain mode) ensures correct KV cache management. "
+            "Values > 1 (branching) require KV compaction (not yet implemented).",
+            default=ServerArgs.speculative_ngram_max_bfs_breadth,
         )
 
         # For deterministic sampling

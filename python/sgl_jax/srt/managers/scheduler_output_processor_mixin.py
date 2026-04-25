@@ -295,7 +295,7 @@ class SchedulerOutputProcessorMixin:
             new_accepted_len = 1
             if batch.spec_algorithm is None or batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
-            elif self.spec_algorithm.is_eagle():
+            elif self.spec_algorithm.is_eagle() or self.spec_algorithm.is_ngram():
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 
@@ -319,6 +319,9 @@ class SchedulerOutputProcessorMixin:
                     ), f"redundant kv indices {len(kv_indices)=} should less than {EagleDraftInput.ALLOC_LEN_PER_DECODE=}"
 
                     self.token_to_kv_pool_allocator.free(kv_indices)
+                # Ngram frees unaccepted KV slots inside _forward_decode
+                # for all requests (finished and non-finished), so no
+                # additional freeing is needed here.
                 # End trace for finished request
                 if precision_tracer.get_trace_active():
                     precision_tracer.set_request_status_to_completed(req.rid)
