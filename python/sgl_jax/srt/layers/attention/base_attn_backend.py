@@ -1,15 +1,35 @@
 from __future__ import annotations
 
 from abc import abstractmethod
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import jax
 from flax import nnx
+from jax.tree_util import register_pytree_node_class
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.radix_attention import RadixAttention
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+@register_pytree_node_class
+@dataclass
+class AttentionBackendMetadata:
+    """Empty pytree base type for per-backend forward metadata.
+
+    Concrete backends (FlashAttention, MLA, LinearRecurrent, ...) subclass this so
+    HybridLinearAttentionBackendMetadata can type its `full_attn_metadata` field
+    without depending on any specific concrete backend.
+    """
+
+    def tree_flatten(self):
+        return (), None
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls()
 
 
 class AttentionBackend(nnx.Module):
