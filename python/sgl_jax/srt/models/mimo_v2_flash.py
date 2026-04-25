@@ -589,9 +589,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
     # Post-load transforms: dequantize FP8 → BF16, pad head dims
     # ------------------------------------------------------------------
 
-    def _dequantize_quantized_linear(
-        self, ql, head_dim=None, k_scale_2d=None, k_head_dim=None
-    ) -> LinearBase:
+    def _dequantize_quantized_linear(self, ql, head_dim=None) -> LinearBase:
         """Dequantize a single QuantizedLinear to bf16 LinearBase.
 
         weight_q may be in HF layout [out, in] or model layout [in, out]
@@ -608,11 +606,6 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                 when head_dim % block_size != 0 (e.g., head_dim=192 with
                 block_size=128), as the HF checkpoint uses per-head block
                 boundaries instead of uniform blocks.
-            k_scale_2d: For v_proj only. The 2D scale [out_blocks, in_blocks]
-                from k_proj, needed because MiMo-Flash quantizes k and v in
-                combined blocks — v's first channels share k's last block scale.
-            k_head_dim: For v_proj only. The head_dim of k_proj (may differ
-                from v_head_dim).
         """
         weight_q = ql.weight_q.value
         weight_scale = ql.weight_scale.value
@@ -629,52 +622,15 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         elif weight_scale.ndim == 2:
             # 2D block-quant scale: (out_blocks, in_blocks) in HF layout.
             # Expand to 3D kernel-ready (in_blocks, 1, out_dim) then reuse _block_dequant.
-            import math
-
             from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
                 expand_block_scale,
             )
 
             # Determine out_dim: weight_q is (in, out) model layout or (out, in) HF layout.
-            out_blocks, in_blocks = weight_scale.shape
+            _, in_blocks = weight_scale.shape
             out_dim = weight_q.shape[1] if weight_q.shape[0] % in_blocks == 0 else weight_q.shape[0]
             block_size_out = 128
-            uniform_blocks = math.ceil(out_dim / block_size_out)
-
-            channel_to_block = None
-            effective_scale = weight_scale
-
-            if k_scale_2d is not None and k_head_dim is not None:
-                # v_proj: MiMo-Flash quantizes [k, v] in combined per-head blocks.
-                # Per head: [k0:k192, v0:v64] → 2 blocks (k scale),
-                #           [v64:v128, pad64] → 1 block (v scale).
-                # So v's first v_overlap channels use k's last block scale.
-                k_blocks_per_head = math.ceil(k_head_dim / block_size_out)
-                v_overlap = k_blocks_per_head * block_size_out - k_head_dim
-                num_heads = out_dim // head_dim
-
-                if v_overlap > 0:
-                    rows = []
-                    for h in range(num_heads):
-                        rows.append(k_scale_2d[h * k_blocks_per_head + k_blocks_per_head - 1])
-                        rows.append(weight_scale[h])
-                    effective_scale = jnp.stack(rows)
-
-                    channel_to_block = jnp.array([
-                        (j // head_dim) * 2 + (0 if (j % head_dim) < v_overlap else 1)
-                        for j in range(out_dim)
-                    ])
-            elif head_dim is not None and out_blocks != uniform_blocks:
-                # k_proj: per-head block quant (out_blocks=8 != uniform=6).
-                blocks_per_head = math.ceil(head_dim / block_size_out)
-                channel_to_block = jnp.array([
-                    (j // head_dim) * blocks_per_head + (j % head_dim) // block_size_out
-                    for j in range(out_dim)
-                ])
-
-            scale_3d = expand_block_scale(
-                effective_scale, out_dim, block_size_out, channel_to_block=channel_to_block
-            )
+            scale_3d = expand_block_scale(weight_scale, out_dim, block_size_out)
             weight_bf16 = self._block_dequant(weight_q, scale_3d, head_dim=head_dim)
         elif weight_scale.ndim == 1:
             out_dim = weight_scale.shape[0]
@@ -815,23 +771,13 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
         for layer_idx, layer in enumerate(self.model.layers):
             attn = layer.self_attn
-
-            # Save k_proj's 2D scale before dequant — v_proj needs it for
-            # cross-scale dequant (MiMo-Flash combined k+v block quant).
-            k_scale_2d = None
-            k_proj_obj = getattr(attn, "k_proj")
-            if isinstance(k_proj_obj, QuantizedLinear) and k_proj_obj.weight_scale.value.ndim == 2:
-                k_scale_2d = k_proj_obj.weight_scale.value
-
             for proj_name in ("q_proj", "k_proj", "v_proj"):
                 proj = getattr(attn, proj_name)
                 if isinstance(proj, QuantizedLinear):
+                    # Pass head_dim for per-head block quant handling.
                     # Q/K use head_dim, V uses v_head_dim.
                     hd = attn.v_head_dim if proj_name == "v_proj" else attn.head_dim
-                    extra = {}
-                    if proj_name == "v_proj" and k_scale_2d is not None:
-                        extra = {"k_scale_2d": k_scale_2d, "k_head_dim": attn.head_dim}
-                    setattr(attn, proj_name, self._dequantize_quantized_linear(proj, head_dim=hd, **extra))
+                    setattr(attn, proj_name, self._dequantize_quantized_linear(proj, head_dim=hd))
                     logger.info("Dequantized layer %d %s → bf16", layer_idx, proj_name)
 
             # Layer 0 dense MLP
