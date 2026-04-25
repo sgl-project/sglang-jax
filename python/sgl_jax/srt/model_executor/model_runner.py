@@ -649,6 +649,25 @@ class ModelRunner(BaseModelRunner):
         """Init attention kernel backend."""
         self.attn_backend = self._get_attention_backend()
 
+    @property
+    def kimi_linear_config(self):
+        """Return the Kimi-Linear config when the model is Kimi-Linear, else None."""
+        from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
+
+        if isinstance(self.model_config.hf_config, KimiLinearConfig):
+            return self.model_config.hf_config
+        return None
+
+    @property
+    def linear_recurrent_config(self):
+        """OR over all hybrid linear-recurrent configs supported on this runner.
+
+        Cheap detector for `attn_backend_wrapper` to decide whether to wrap.
+        Dispatch to a concrete sub-backend uses the specific properties (e.g.
+        `kimi_linear_config`) — do not switch on this.
+        """
+        return self.kimi_linear_config  # add `or self.hybrid_gdn_config` etc. later
+
     def _get_attention_backend(self):
         backend = self.server_args.attention_backend
         if self.server_args.device == "cpu" and backend in ("fa", "fa_mha"):
@@ -660,14 +679,14 @@ class ModelRunner(BaseModelRunner):
         if backend == "native":
             from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 
-            return NativeAttention(self.num_attn_heads, self.num_kv_heads, self.mesh)
+            full_attn_backend = NativeAttention(self.num_attn_heads, self.num_kv_heads, self.mesh)
 
-        # Absorbed MLA is the only branch that does not use FlashAttention.
-        if backend == "fa" and self.use_mla_backend:
+        elif backend == "fa" and self.use_mla_backend:
+            # Absorbed MLA is the only branch that does not use FlashAttention.
             from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
 
             cfg = self.model_config.hf_text_config
-            return MLAAttentionBackend(
+            full_attn_backend = MLAAttentionBackend(
                 num_attn_heads=self.num_attn_heads,
                 kv_lora_rank=cfg.kv_lora_rank,
                 qk_nope_head_dim=cfg.qk_nope_head_dim,
@@ -677,30 +696,40 @@ class ModelRunner(BaseModelRunner):
                 mesh=self.mesh,
             )
 
-        if backend not in ("fa", "fa_mha"):
+        elif backend in ("fa", "fa_mha"):
+            # fa_mha on an MLA model: decompress latent KV via kv_b_proj per-forward
+            # and run standard FlashAttention with per-head K/V (num_kv_heads ==
+            # num_attn_heads). All other (backend, model) combinations use the
+            # model's native MHA/GQA dims.
+            from sgl_jax.srt.layers.attention.flashattention_backend import (
+                FlashAttention,
+            )
+
+            if backend == "fa_mha" and self.use_mla_backend:
+                cfg = self.model_config.hf_text_config
+                head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim
+                num_kv_heads = self.num_attn_heads
+            else:
+                head_dim = self.model_config.head_dim
+                num_kv_heads = self.num_kv_heads
+
+            full_attn_backend = FlashAttention(
+                self.num_attn_heads,
+                num_kv_heads,
+                head_dim,
+                page_size=self.page_size,
+                mesh=self.mesh,
+            )
+
+        else:
             raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
 
-        # fa_mha on an MLA model: decompress latent KV via kv_b_proj per-forward
-        # and run standard FlashAttention with per-head K/V (num_kv_heads ==
-        # num_attn_heads). All other (backend, model) combinations use the
-        # model's native MHA/GQA dims.
-        from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
-
-        if backend == "fa_mha" and self.use_mla_backend:
-            cfg = self.model_config.hf_text_config
-            head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim
-            num_kv_heads = self.num_attn_heads
-        else:
-            head_dim = self.model_config.head_dim
-            num_kv_heads = self.num_kv_heads
-
-        return FlashAttention(
-            self.num_attn_heads,
-            num_kv_heads,
-            head_dim,
-            page_size=self.page_size,
-            mesh=self.mesh,
+        # Always go through the wrapper — it's a no-op when no hybrid config is set.
+        from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
+            attn_backend_wrapper,
         )
+
+        return attn_backend_wrapper(self, full_attn_backend)
 
     def _forward(
         self,
