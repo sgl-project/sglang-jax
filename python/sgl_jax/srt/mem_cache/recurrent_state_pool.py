@@ -1,12 +1,16 @@
-"""RecurrentStatePool — recurrent + conv state management for KDA layers.
+"""RecurrentStatePool — recurrent + conv state management for linear recurrent layers.
 
-Design reference: RFC-0015 §RecurrentStatePool object design (v2, list containers).
+Design reference: RFC-0015 §RecurrentStatePool (v2, list containers; layer_id-keyed accessors).
 - Dual list containers:
     recurrent_buffers: list[jax.Array] of length L, each [N+1, H, D, D] (default f32)
     conv_buffers: list[list[jax.Array]] outer L, inner currently 1, each [N+1, K-1, proj] (default bf16)
 - Slot 0 is reserved as dummy; valid slots start from 1 (aligned with sglang PyTorch MambaPool).
 - Does NOT inherit from KVCache (KVCache abstract methods are meaningless for recurrent state).
-- list index semantics: outer list index is the KDA-subset index (0..L-1), NOT the global model layer_id.
+- Outer list is keyed by local 0..L-1 internally; the public API
+  (get_/set_linear_recurrent_layer_cache) accepts the model-global layer_id and
+  translates via self.layers_mapping. Mirrors sgl-jax SWAKVPool's
+  swa_attention_layer_ids / layers_mapping pattern.
+- Naming is generic (linear_recurrent_*) to allow Mamba / GDN reuse beyond KDA.
 """
 
 from __future__ import annotations
@@ -34,14 +38,11 @@ def _resolve_dtype(env_var: str, default):
 
 @jax.tree_util.register_pytree_node_class
 class RecurrentStatePool:
-    """Recurrent + conv state pool (per-request slot indexing).
-
-    RFC-0015 §RecurrentStatePool object design line 113-185.
-    """
+    """Recurrent + conv state pool (per-request slot indexing)."""
 
     def __init__(
         self,
-        num_layers: int,
+        linear_recurrent_layer_ids: list[int],
         max_num_reqs: int,
         num_heads: int,
         head_dim: int,
@@ -58,21 +59,39 @@ class RecurrentStatePool:
         self.temporal_dtype = temporal_dtype
         self.conv_dtype = conv_dtype
 
+        # linear_recurrent_layer_ids: model-global layer ids of linear recurrent layers
+        # (KDA / Mamba / GDN ...); duplicates are not allowed since they would collide
+        # in layers_mapping. layers_mapping: global layer_id -> local 0..L-1 index;
+        # used internally so the public get_/set_linear_recurrent_layer_cache API can
+        # accept a global layer_id. Mirrors sgl-jax SWAKVPool's
+        # swa_attention_layer_ids / layers_mapping pattern.
+        assert len(set(linear_recurrent_layer_ids)) == len(linear_recurrent_layer_ids), (
+            f"linear_recurrent_layer_ids must not contain duplicates, "
+            f"got {linear_recurrent_layer_ids}"
+        )
+        self.linear_recurrent_layer_ids: list[int] = list(linear_recurrent_layer_ids)
+        self.layers_mapping: dict[int, int] = {
+            layer_id: idx for idx, layer_id in enumerate(self.linear_recurrent_layer_ids)
+        }
+        # Cached derived count; kept so existing alloc/clear/replace_buffer loops
+        # can keep referring to self.num_layers.
+        self.num_layers: int = len(self.linear_recurrent_layer_ids)
+
         # Dimension bookkeeping
-        self.num_layers = num_layers
         self.max_num_reqs = max_num_reqs
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.conv_kernel_size = conv_kernel_size
 
-        # proj_size MUST be written as proj_v + 2*proj_k (Implementation Guide 1.1 note #4
-        # mandates this; do NOT simplify to `* 3` since future GQA may diverge proj_v/proj_k).
+        # proj_size MUST be written as proj_v + 2*proj_k.
+        # Do NOT simplify to `* 3`: future GQA could diverge proj_v from proj_k,
+        # and the formula would silently break.
         proj_v = num_heads * head_dim
         proj_k = num_heads * head_dim
         self.proj_size = proj_v + 2 * proj_k
 
-        # Boundary asserts
-        assert num_layers > 0, f"num_layers must be > 0, got {num_layers}"
+        # Boundary asserts. NOTE: linear_recurrent_layer_ids may legitimately be empty
+        # (degenerate pool with no recurrent layers); we do NOT assert num_layers > 0.
         assert max_num_reqs > 0, f"max_num_reqs must be > 0, got {max_num_reqs}"
         assert num_heads > 0, f"num_heads must be > 0, got {num_heads}"
         assert head_dim > 0, f"head_dim must be > 0, got {head_dim}"
@@ -90,7 +109,7 @@ class RecurrentStatePool:
                 (max_num_reqs + 1, num_heads, head_dim, head_dim),
                 dtype=self.temporal_dtype,
             )
-            for _ in range(num_layers)
+            for _ in range(self.num_layers)
         ]
         # conv: list[list[Array]], outer L, inner currently 1 (reserved for future
         # multi-conv-segment expansion, mirroring PyTorch KimiLinearStateShape.conv: List[tuple]).
@@ -101,7 +120,7 @@ class RecurrentStatePool:
                     dtype=self.conv_dtype,
                 )
             ]
-            for _ in range(num_layers)
+            for _ in range(self.num_layers)
         ]
 
         # Slot management: starts from 1; slot 0 is reserved as dummy.
@@ -111,7 +130,6 @@ class RecurrentStatePool:
     def alloc(self, need_size: int = 1):
         """Allocate need_size slots from free_slots; clear-on-alloc via list element mutation.
 
-        RFC §RecurrentStatePool object design line 178 + Implementation Guide 1.1 note #6.
         - Returns None if free_slots is insufficient (state unchanged).
         - clear-on-alloc: cross-layer uses list element mutation (write back to list[l]);
           intra-layer uses vectorized scatter (clears all slots in one .at[].set(0));
@@ -142,14 +160,74 @@ class RecurrentStatePool:
         else:
             self.free_slots.extend(idx)
 
+    def get_linear_recurrent_layer_cache(self, layer_id: int):
+        """Read the per-layer view, keyed by model-global layer_id.
+
+        Mirrors sgl-jax KV pool get_fused_kv_buffer + PyTorch mamba2_layer_cache.
+        Returns a 2-tuple (recurrent_per_layer, conv_per_layer); both are the
+        list elements themselves (no copy; `is` relation holds with
+        recurrent_buffers[idx] / conv_buffers[idx]).
+
+        External consumers (e.g., the linear recurrent attention backend) MUST
+        go through this method and the matching set_linear_recurrent_layer_cache
+        instead of indexing recurrent_buffers / conv_buffers directly. This
+        matches the existing KV pool convention (attention backends never
+        touch kv_buffer directly).
+        """
+        if layer_id not in self.layers_mapping:
+            raise ValueError(
+                f"layer_id={layer_id} is not a registered linear recurrent layer. "
+                f"Registered: {self.linear_recurrent_layer_ids}"
+            )
+        idx = self.layers_mapping[layer_id]
+        return self.recurrent_buffers[idx], self.conv_buffers[idx]
+
+    def set_linear_recurrent_layer_cache(
+        self,
+        layer_id: int,
+        indices,
+        new_recurrent,
+        new_conv,
+    ):
+        """Write back the per-layer cache, keyed by model-global layer_id.
+
+        Mirrors sgl-jax KV pool set_kv_buffer. Performs list element mutation
+        internally on both recurrent_buffers[idx] and each conv_buffers[idx][i].
+
+        **Why list element mutation matters**: list is a mutable Python container,
+        and multiple layers share the same RecurrentStatePool instance. After
+        layer N writes via this method, layer N+1 reads the updated value via
+        get_linear_recurrent_layer_cache (because both see the same list slot).
+        If the implementation accidentally assigned to a local variable instead
+        of writing back into the list, layers 0..N-1 updates would silently be
+        lost in a multi-layer forward.
+
+        new_conv must be a list whose length equals the inner length of
+        conv_buffers[idx] (currently always 1); the assert guards against
+        future multi-conv-segment misuse.
+        """
+        if layer_id not in self.layers_mapping:
+            raise ValueError(
+                f"layer_id={layer_id} is not a registered linear recurrent layer. "
+                f"Registered: {self.linear_recurrent_layer_ids}"
+            )
+        idx = self.layers_mapping[layer_id]
+        self.recurrent_buffers[idx] = self.recurrent_buffers[idx].at[indices].set(new_recurrent)
+        assert len(new_conv) == len(self.conv_buffers[idx]), (
+            f"new_conv length {len(new_conv)} mismatches conv_buffers[{idx}] inner length "
+            f"{len(self.conv_buffers[idx])}"
+        )
+        for i, new_c in enumerate(new_conv):
+            self.conv_buffers[idx][i] = self.conv_buffers[idx][i].at[indices].set(new_c)
+
     def replace_buffer(self, buffers) -> None:
         """Update both buffer-list references after a JIT donate.
 
-        RFC §RecurrentStatePool object design line 180-181:
         - buffers: tuple[list[jax.Array], list[list[jax.Array]]]
             [0] = new_recurrent_buffers list (length num_layers)
             [1] = new_conv_buffers list-of-list (outer length num_layers; inner lengths must match)
-        - Per-element device_put handles the tp_size==1 sharding fix (issue #233).
+        - Per-element device_put handles the tp_size==1 sharding fix
+          (see sgl-project/sglang-jax#233 for the original fix).
 
         Sharding detection: probe each element's `.sharding` attribute for single-device.
         On the Phase 1 CPU unit-test path this triggers the single-device branch where
@@ -201,8 +279,8 @@ class RecurrentStatePool:
         """Full reset: zero out every layer and reset free_slots.
 
         MUST use list element mutation (assigning each layer in place);
-        we cannot replace the list reference wholesale because downstream KDA layers
-        may hold a captured reference to self.recurrent_buffers.
+        we cannot replace the list reference wholesale because downstream
+        recurrent layers may hold a captured reference to self.recurrent_buffers.
         """
         for layer in range(self.num_layers):
             self.recurrent_buffers[layer] = jnp.zeros_like(self.recurrent_buffers[layer])
@@ -214,9 +292,13 @@ class RecurrentStatePool:
     def tree_flatten(self):
         # list is a default pytree container; auto-expands to 2L leaves
         # (outer L recurrent + L inner conv lists each yielding their own leaves).
+        # aux carries tuple(linear_recurrent_layer_ids) instead of num_layers, so
+        # tree_unflatten can reconstruct layers_mapping (otherwise JIT donate would
+        # lose the global-layer-id -> local-index mapping). list is unhashable, so
+        # we wrap as tuple to satisfy aux's hashability requirement.
         children = (self.recurrent_buffers, self.conv_buffers)
         aux = (
-            self.num_layers,
+            tuple(self.linear_recurrent_layer_ids),
             self.max_num_reqs,
             self.num_heads,
             self.head_dim,
@@ -229,7 +311,7 @@ class RecurrentStatePool:
     @classmethod
     def tree_unflatten(cls, aux, children):
         (
-            num_layers,
+            linear_recurrent_layer_ids_tup,
             max_num_reqs,
             num_heads,
             head_dim,
@@ -238,7 +320,13 @@ class RecurrentStatePool:
             conv_dtype,
         ) = aux
         obj = cls.__new__(cls)
-        obj.num_layers = num_layers
+        # Restore linear_recurrent_layer_ids + rebuild layers_mapping
+        # (must rebuild here, otherwise JIT donate would lose the mapping).
+        obj.linear_recurrent_layer_ids = list(linear_recurrent_layer_ids_tup)
+        obj.layers_mapping = {
+            layer_id: idx for idx, layer_id in enumerate(obj.linear_recurrent_layer_ids)
+        }
+        obj.num_layers = len(obj.linear_recurrent_layer_ids)
         obj.max_num_reqs = max_num_reqs
         obj.num_heads = num_heads
         obj.head_dim = head_dim

@@ -126,7 +126,7 @@ class ReqToTokenPool:
 
         Backwards-compatible signature:
         - reqs: int -- legacy path (need_size); take need_size slots from the head of free_slots.
-        - reqs: Sequence[Req-like] -- new path (RFC §Chunked Prefill Slot Reuse line 431):
+        - reqs: Sequence[Req-like] -- new chunked-prefill path:
             * Reqs already holding a req_pool_idx are skipped (must satisfy is_chunked > 0
               -- safety assert).
             * Reqs with no req_pool_idx are allocated from free_slots and have
@@ -365,7 +365,7 @@ class KVCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def replace_kv_buffer(self, kv_buffer: list[jax.Array]) -> None:
+    def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
         """Replace the internal KV buffer with a new one.
 
         This method is essential for JAX jit compatibility since JAX functions
@@ -589,7 +589,7 @@ class MHATokenToKVPool(KVCache):
             mesh=self.mesh,
         )
 
-    def replace_kv_buffer(self, fused_kv_buffer: list[jax.Array]) -> None:
+    def replace_buffer(self, fused_kv_buffer: list[jax.Array]) -> None:
         self.kv_buffer[self.start_layer : self.start_layer + len(fused_kv_buffer)] = fused_kv_buffer
 
     def get_cpu_copy(self, indices):
@@ -787,7 +787,7 @@ class SWAKVPool(KVCache):
         else:
             self.full_kv_pool.set_kv_buffer(layer_id_pool, loc, cache_k, cache_v, is_decode)
 
-    def replace_kv_buffer(self, kv_buffer: list[jax.Array]):
+    def replace_buffer(self, kv_buffer: list[jax.Array]):
         assert len(kv_buffer) == len(self.layers_mapping)
 
         full_kv_buffer = []
@@ -799,8 +799,8 @@ class SWAKVPool(KVCache):
             else:
                 full_kv_buffer.append(layer_kv_buffer)
 
-        self.swa_kv_pool.replace_kv_buffer(swa_kv_buffer)
-        self.full_kv_pool.replace_kv_buffer(full_kv_buffer)
+        self.swa_kv_pool.replace_buffer(swa_kv_buffer)
+        self.full_kv_pool.replace_buffer(full_kv_buffer)
 
     def remap_cache_loc(self, loc: jax.Array, layer_id: int) -> jax.Array:
         """
@@ -1221,7 +1221,7 @@ class MLATokenToKVPool(KVCache):
             "the MLA v2 kernel writes the cache in-place via input_output_aliases."
         )
 
-    def replace_kv_buffer(self, kv_buffer: list[jax.Array]) -> None:
+    def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
         self.kv_buffer[self.start_layer : self.start_layer + len(kv_buffer)] = kv_buffer
 
     def get_cpu_copy(self, indices):

@@ -14,8 +14,7 @@ def _make_req(req_pool_idx=None, is_chunked=0):
 
 
 class TestReqToTokenPoolAllocBackwardCompat(unittest.TestCase):
-    """ReqToTokenPool.alloc backwards-compatible signature change
-    (RFC §goal 2 / Chunked Prefill Slot Reuse)."""
+    """Backwards-compatible signature: int (legacy) or list[Req] (new chunked-prefill path)."""
 
     def setUp(self):
         if not jax.devices():
@@ -105,7 +104,7 @@ class TestHybridReqToTokenPoolInit(unittest.TestCase):
         from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 
         rsp = RecurrentStatePool(
-            num_layers=1,
+            linear_recurrent_layer_ids=[0],
             max_num_reqs=max_num_reqs,
             num_heads=1,
             head_dim=2,
@@ -162,7 +161,7 @@ class TestHybridReqToTokenPoolAlloc(unittest.TestCase):
         from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 
         rsp = RecurrentStatePool(
-            num_layers=1,
+            linear_recurrent_layer_ids=[0],
             max_num_reqs=max_num_reqs,
             num_heads=1,
             head_dim=2,
@@ -248,7 +247,7 @@ class TestHybridReqToTokenPoolAlloc(unittest.TestCase):
             pool.alloc(2)
 
     def test_chunked_prefill_reuse_preserves_buffer_content(self):
-        """RFC §test strategy line 484: chunked prefill reuse must preserve recurrent + conv state."""
+        """Chunked prefill reuse must preserve recurrent + conv state across chunks."""
         import jax.numpy as jnp
 
         pool, rsp = self._make()
@@ -289,7 +288,11 @@ class TestHybridReqToTokenPoolFree(unittest.TestCase):
         from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 
         rsp = RecurrentStatePool(
-            num_layers=1, max_num_reqs=4, num_heads=1, head_dim=2, conv_kernel_size=4
+            linear_recurrent_layer_ids=[0],
+            max_num_reqs=4,
+            num_heads=1,
+            head_dim=2,
+            conv_kernel_size=4,
         )
         pool = HybridReqToTokenPool(
             size=5, max_context_len=8, dtype=np.int32, recurrent_state_pool=rsp
@@ -350,7 +353,11 @@ class TestHybridReqToTokenPoolGetRecurrentIndices(unittest.TestCase):
         from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 
         rsp = RecurrentStatePool(
-            num_layers=1, max_num_reqs=4, num_heads=1, head_dim=2, conv_kernel_size=4
+            linear_recurrent_layer_ids=[0],
+            max_num_reqs=4,
+            num_heads=1,
+            head_dim=2,
+            conv_kernel_size=4,
         )
         pool = HybridReqToTokenPool(
             size=5, max_context_len=8, dtype=np.int32, recurrent_state_pool=rsp
@@ -377,7 +384,11 @@ class TestHybridReqToTokenPoolClear(unittest.TestCase):
         from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 
         rsp = RecurrentStatePool(
-            num_layers=1, max_num_reqs=4, num_heads=1, head_dim=2, conv_kernel_size=4
+            linear_recurrent_layer_ids=[0],
+            max_num_reqs=4,
+            num_heads=1,
+            head_dim=2,
+            conv_kernel_size=4,
         )
         pool = HybridReqToTokenPool(
             size=5, max_context_len=8, dtype=np.int32, recurrent_state_pool=rsp

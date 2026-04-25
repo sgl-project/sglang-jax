@@ -10,7 +10,7 @@ def _rsp(max_num_reqs=2):
     from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 
     return RecurrentStatePool(
-        num_layers=1,
+        linear_recurrent_layer_ids=[0],
         max_num_reqs=max_num_reqs,
         num_heads=1,
         head_dim=2,
@@ -241,9 +241,13 @@ class TestMemoryPoolsJitDonate(unittest.TestCase):
         from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
         from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 
-        # Need num_layers >= 2 to exercise the contract.
+        # Need linear_recurrent_layer_ids of length >= 2 to exercise the contract.
         rsp = RecurrentStatePool(
-            num_layers=2, max_num_reqs=2, num_heads=1, head_dim=2, conv_kernel_size=4
+            linear_recurrent_layer_ids=[0, 1],
+            max_num_reqs=2,
+            num_heads=1,
+            head_dim=2,
+            conv_kernel_size=4,
         )
         mp = MemoryPools(recurrent_state_pool=rsp)
 

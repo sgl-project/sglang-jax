@@ -129,6 +129,11 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     enable_precision_tracer: bool = False
 
+    # Hybrid recurrent state (RFC-0015): ratio of state buffer budget to KV cache
+    # budget for hybrid models. r = state / kv (matches sglang PyTorch
+    # mamba_full_memory_ratio). state_budget = available * r/(1+r).
+    state_to_kv_ratio: float = 0.9
+
     # Kernel backend
     attention_backend: str | None = "fa"
     moe_backend: str = "epmoe"
@@ -494,6 +499,17 @@ class ServerArgs:
             type=float,
             default=ServerArgs.mem_fraction_static,
             help="The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
+        )
+        parser.add_argument(
+            "--state-to-kv-ratio",
+            type=float,
+            default=ServerArgs.state_to_kv_ratio,
+            help=(
+                "For hybrid models with recurrent state (e.g. Kimi-Linear KDA "
+                "layers), ratio of recurrent state buffer budget to KV cache "
+                "budget (r = state/kv). state_budget = available * r/(1+r). "
+                "Has no effect on non-hybrid models."
+            ),
         )
         parser.add_argument(
             "--max-running-requests",

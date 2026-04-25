@@ -34,7 +34,11 @@ class TestRecurrentStatePoolOnTpu(unittest.TestCase):
         from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 
         return RecurrentStatePool(
-            num_layers=2, max_num_reqs=4, num_heads=2, head_dim=4, conv_kernel_size=4
+            linear_recurrent_layer_ids=[0, 1],
+            max_num_reqs=4,
+            num_heads=2,
+            head_dim=4,
+            conv_kernel_size=4,
         )
 
     def test_buffers_on_tpu_devices(self):

@@ -34,10 +34,13 @@ from sgl_jax.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sgl_jax.srt.mem_cache.memory_pool import (
+    HybridReqToTokenPool,
+    MemoryPools,
     MHATokenToKVPool,
     ReqToTokenPool,
     SWAKVPool,
 )
+from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_loader.loader import get_model_loader
@@ -49,6 +52,127 @@ from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 
 logger = logging.getLogger(__name__)
+
+
+def _has_recurrent_state(hf_config) -> bool:
+    """Return True iff hf_config exposes a non-empty linear_attn_config["kda_layers"].
+
+    NOTE: linear_attn_config is a `dict | None` in real Kimi-Linear HF config
+    (see Decision #12); subscript access is required, not attribute access.
+    """
+    linear_attn_config = getattr(hf_config, "linear_attn_config", None)
+    if linear_attn_config is None:
+        return False
+    if "kda_layers" not in linear_attn_config:
+        return False
+    return len(linear_attn_config["kda_layers"]) > 0
+
+
+def _build_hybrid_pools(
+    hf_config,
+    max_num_reqs: int,
+    max_context_len: int,
+    tp_size: int,
+    token_to_kv_pool,
+):
+    """Construct (RecurrentStatePool, HybridReqToTokenPool, MemoryPools) for a
+    hybrid recurrent model. Caller must ensure _has_recurrent_state(hf_config).
+
+    NOTE: linear_attn_config is a dict (Decision #12); access via subscript.
+    """
+    cfg = hf_config.linear_attn_config  # dict
+    rsp = RecurrentStatePool(
+        linear_recurrent_layer_ids=list(cfg["kda_layers"]),
+        max_num_reqs=max_num_reqs,
+        num_heads=cfg["num_heads"],
+        head_dim=cfg["head_dim"],
+        conv_kernel_size=cfg["short_conv_kernel_size"],
+    )
+    hybrid_pool = HybridReqToTokenPool(
+        size=max_num_reqs + 1,  # +1 for dummy slot 0
+        max_context_len=max_context_len,
+        dtype=np.int32,
+        recurrent_state_pool=rsp,
+    )
+    mp = MemoryPools(
+        token_to_kv_pool=token_to_kv_pool,
+        recurrent_state_pool=rsp,
+    )
+    return rsp, hybrid_pool, mp
+
+
+def _build_non_hybrid_memory_pools(token_to_kv_pool):
+    """Wrap a single KV pool in MemoryPools (so _forward can uniformly call
+    self.memory_pools.replace_all)."""
+    return MemoryPools(token_to_kv_pool=token_to_kv_pool)
+
+
+def _compute_recurrent_per_req_bytes(
+    num_layers: int,
+    num_heads: int,
+    head_dim: int,
+    conv_kernel_size: int,
+    tp_size: int,
+    temporal_dtype_bytes: int,
+    conv_dtype_bytes: int,
+) -> int:
+    """Per-device per-request recurrent + conv buffer size in bytes.
+
+    Mirrors RecurrentStatePool buffer shapes (Phase 1):
+      per_req_recurrent = L * (H/tp) * D * D * temporal_dtype.itemsize
+      per_req_conv      = L * (K-1) * (proj_size/tp) * conv_dtype.itemsize
+                         where proj_size = num_heads * head_dim + 2 * (num_heads * head_dim)
+    """
+    assert num_heads % tp_size == 0, f"num_heads {num_heads} must be divisible by tp_size {tp_size}"
+    proj_size = num_heads * head_dim + 2 * (num_heads * head_dim)
+    assert proj_size % tp_size == 0, f"proj_size {proj_size} must be divisible by tp_size {tp_size}"
+    per_req_recurrent = (
+        num_layers * (num_heads // tp_size) * head_dim * head_dim * temporal_dtype_bytes
+    )
+    per_req_conv = num_layers * (conv_kernel_size - 1) * (proj_size // tp_size) * conv_dtype_bytes
+    return per_req_recurrent + per_req_conv
+
+
+def _split_state_kv_budget(available_bytes: int, ratio: float) -> tuple[int, int]:
+    """Split available HBM into (state_budget, kv_budget).
+
+    state_budget = available * r/(1+r), where r = state_to_kv_ratio
+    (matches sglang PyTorch mamba_full_memory_ratio formula).
+    """
+    assert ratio >= 0.0, f"state_to_kv_ratio must be >= 0, got {ratio}"
+    state_budget = int(available_bytes * ratio / (1.0 + ratio))
+    kv_budget = available_bytes - state_budget
+    return state_budget, kv_budget
+
+
+def _compute_max_num_reqs_from_state_budget(state_budget: int, per_req_bytes: int) -> int:
+    """Floor division; returns 0 if state_budget is 0 (degenerate)."""
+    if per_req_bytes <= 0:
+        return 0
+    return state_budget // per_req_bytes
+
+
+def _enforce_recurrent_state_server_constraints(server_args) -> None:
+    """Force disable_radix_cache=True and assert disable_overlap_schedule=True
+    for hybrid recurrent state models.
+
+    - disable_radix_cache: prefix slots being all-zero would corrupt suffix
+      computation in the recurrent path (matches sglang PyTorch
+      _handle_mamba_radix_cache(support_mamba_cache=False)).
+    - disable_overlap_schedule: this version does not implement double-buffer
+      ping-pong (mamba_ping_pong_track_buffer_size); overlap scheduler would
+      race on shared recurrent state.
+    """
+    if not server_args.disable_radix_cache:
+        logger.info(
+            "Hybrid recurrent state model: forcing disable_radix_cache=True "
+            "(prefix sharing is unsafe with recurrent state)."
+        )
+        server_args.disable_radix_cache = True
+    assert server_args.disable_overlap_schedule, (
+        "Hybrid recurrent state models require --disable-overlap-schedule "
+        "(this version does not support double-buffer ping-pong for recurrent state)."
+    )
 
 
 class ModelRunner(BaseModelRunner):
@@ -550,8 +674,15 @@ class ModelRunner(BaseModelRunner):
 
         logger.info("ModelRunner max_total_num_tokens: %s", self.max_total_num_tokens)
 
-        # Create request to token pool if not already created
-        if self.req_to_token_pool is None:
+        # Detect hybrid recurrent state (e.g. Kimi-Linear KDA layers).
+        has_recurrent_state = _has_recurrent_state(self.model_config.hf_config)
+        if has_recurrent_state:
+            _enforce_recurrent_state_server_constraints(self.server_args)
+
+        # Create request to token pool if not already created.
+        # For hybrid models, defer to after token_to_kv_pool is built so we can
+        # construct HybridReqToTokenPool with both pool references.
+        if self.req_to_token_pool is None and not has_recurrent_state:
             self.req_to_token_pool = ReqToTokenPool(
                 size=max_num_reqs + 1,
                 max_context_len=self.model_config.context_len + 4,
@@ -614,6 +745,18 @@ class ModelRunner(BaseModelRunner):
                 layer_num=self.model_config.num_hidden_layers,
                 mesh=self.mesh,
             )
+
+        # Wrap KV pool in MemoryPools (uniform replace_all path for _forward).
+        if has_recurrent_state:
+            _, self.req_to_token_pool, self.memory_pools = _build_hybrid_pools(
+                hf_config=self.model_config.hf_config,
+                max_num_reqs=max_num_reqs,
+                max_context_len=self.model_config.context_len + 4,
+                tp_size=self.tp_size,
+                token_to_kv_pool=self.token_to_kv_pool,
+            )
+        else:
+            self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)
 
         # Create KV pool allocator
         if self.token_to_kv_pool_allocator is None:
@@ -789,7 +932,7 @@ class ModelRunner(BaseModelRunner):
                 for layer_kv_fused in layers_kv_fused
             ]
 
-        self.token_to_kv_pool.replace_kv_buffer(layers_kv_fused)
+        self.token_to_kv_pool.replace_buffer(layers_kv_fused)
 
     def forward_idle(
         self,
