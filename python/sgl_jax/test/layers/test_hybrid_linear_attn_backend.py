@@ -325,3 +325,60 @@ class TestAttnBackendWrapper:
         assert result.full_attn_backend is full
         assert isinstance(result.linear_attn_backend, _FakeKDA)
         assert result.full_attn_layers == frozenset({0, 2})
+
+
+# ---------------------------------------------------------------------------
+# TP-5: ModelRunner._get_attention_backend wraps in HybridLinearAttnBackend
+# when kimi_linear_config is set.
+# ---------------------------------------------------------------------------
+
+
+class TestModelRunnerIntegration:
+    def test_get_attention_backend_wraps_in_hybrid(self, monkeypatch):
+        import sys
+        from types import ModuleType, SimpleNamespace
+
+        import jax
+        from jax.sharding import Mesh
+
+        from sgl_jax.srt.layers.attention.native_backend import NativeAttention
+        from sgl_jax.srt.model_executor.model_runner import ModelRunner
+
+        # Inject fake kda_backend module so attn_backend_wrapper's lazy import succeeds.
+        fake_module = ModuleType(
+            "sgl_jax.srt.layers.attention.linear.kda_backend"
+        )
+
+        class _FakeKDA(nnx.Module):
+            def __init__(self, runner):
+                self.runner = runner
+
+        fake_module.KDAAttnBackend = _FakeKDA
+        monkeypatch.setitem(
+            sys.modules,
+            "sgl_jax.srt.layers.attention.linear.kda_backend",
+            fake_module,
+        )
+
+        # Single-device mesh required by NativeAttention's NamedSharding(...).
+        mesh = Mesh(jax.devices()[:1], axis_names=("tensor",))
+
+        cfg = SimpleNamespace(full_attention_layer_ids=[0, 2])
+        runner = SimpleNamespace(
+            server_args=SimpleNamespace(attention_backend="native", device="cpu"),
+            num_attn_heads=4,
+            num_kv_heads=4,
+            model_config=SimpleNamespace(head_dim=64),
+            page_size=1,
+            mesh=mesh,
+            kimi_linear_config=cfg,
+        )
+
+        # Call _get_attention_backend on the SimpleNamespace stand-in.
+        backend = ModelRunner._get_attention_backend(runner)
+
+        assert isinstance(backend, HybridLinearAttnBackend)
+        assert isinstance(backend.linear_attn_backend, _FakeKDA)
+        # full_attn_backend should be NativeAttention since we asked for "native".
+        assert isinstance(backend.full_attn_backend, NativeAttention)
+        assert backend.full_attn_layers == frozenset({0, 2})
