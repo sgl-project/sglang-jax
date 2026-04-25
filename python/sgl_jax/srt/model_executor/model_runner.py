@@ -624,6 +624,13 @@ class ModelRunner(BaseModelRunner):
         cache_miss_count = 0
         import jax._src.test_util as jtu
 
+        from sgl_jax.srt.debug_utils.hidden_state_dump_hook import (
+            get_hidden_state_dumper,
+        )
+
+        hs_dumper = get_hidden_state_dumper()
+        hs_dumper.begin_forward(forward_batch)
+
         for key, value in forward_batch.__dict__.items():
             if isinstance(value, jax.Array):
                 logger.debug(
@@ -653,6 +660,12 @@ class ModelRunner(BaseModelRunner):
                 forward_batch, logits_metadata
             )
             cache_miss_count = count()
+
+        if hs_dumper.is_active and hasattr(output, "next_token_logits"):
+            hs_dumper.end_forward(output.next_token_logits)
+        else:
+            hs_dumper.end_forward()
+
         self._set_kv_cache_after_forward(layers_kv_fused)
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
