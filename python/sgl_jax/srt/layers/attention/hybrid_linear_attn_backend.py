@@ -120,8 +120,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
         return sub(*args, layer=layer, forward_batch=forward_batch, **kwargs)
 
-    def get_max_running_reqests(self, max_context_len, page_size):  # placeholder
-        raise NotImplementedError
+    def get_max_running_reqests(self, max_context_len, page_size):
+        return min(
+            self.full_attn_backend.get_max_running_reqests(max_context_len, page_size),
+            self.linear_attn_backend.get_max_running_reqests(max_context_len, page_size),
+        )
 
     # Pytree registration: full_attn_layers is hashable (frozenset) and goes to
     # aux_data so structure changes trigger retracing; everything else is data.
@@ -147,5 +150,28 @@ class HybridLinearAttnBackend(AttentionBackend):
 def attn_backend_wrapper(
     runner: ModelRunner,
     full_attn_backend: AttentionBackend,
-):  # placeholder, filled in 2.5
-    raise NotImplementedError
+):
+    """Wrap full_attn_backend in HybridLinearAttnBackend for hybrid models.
+
+    Mirrors upstream `sglang/srt/layers/attention/attention_registry.py:attn_backend_wrapper`.
+    Only handles Kimi-Linear in this PR. When no hybrid config is set, returns
+    `full_attn_backend` unchanged so the caller can invoke this unconditionally.
+    """
+    if runner.kimi_linear_config is not None:
+        # KDAAttnBackend lives in a separate PR — lazy import keeps this PR
+        # self-contained.
+        try:
+            from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+        except ImportError as e:
+            raise ImportError(
+                "HybridLinearAttnBackend needs KDAAttnBackend "
+                "(delivered by a separate PR)."
+            ) from e
+
+        linear_attn_backend = KDAAttnBackend(runner)
+        full_attn_layers = runner.kimi_linear_config.full_attention_layer_ids
+        return HybridLinearAttnBackend(
+            full_attn_backend, linear_attn_backend, full_attn_layers
+        )
+
+    return full_attn_backend

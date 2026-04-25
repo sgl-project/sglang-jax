@@ -243,3 +243,85 @@ class TestPytreeRoundtrip:
         assert isinstance(
             rebuilt._forward_metadata, HybridLinearAttentionBackendMetadata
         )
+
+
+# ---------------------------------------------------------------------------
+# TP-4: get_max_running_reqests returns min of sub-backends
+# ---------------------------------------------------------------------------
+
+
+class TestGetMaxRunningReqests:
+    def test_returns_min_of_subs(self):
+        hybrid, _, _ = _make_hybrid(full_max=37, linear_max=99)
+        assert hybrid.get_max_running_reqests(1024, 16) == 37
+
+    def test_returns_min_when_linear_smaller(self):
+        hybrid, _, _ = _make_hybrid(full_max=99, linear_max=10)
+        assert hybrid.get_max_running_reqests(2048, 8) == 10
+
+
+# ---------------------------------------------------------------------------
+# attn_backend_wrapper helper
+# ---------------------------------------------------------------------------
+
+
+class TestAttnBackendWrapper:
+    def test_passthrough_when_kimi_linear_config_is_none(self):
+        from types import SimpleNamespace
+
+        runner = SimpleNamespace(kimi_linear_config=None)
+        full = _FakeFullBackend()
+        result = attn_backend_wrapper(runner, full)
+        assert result is full  # identity — unchanged
+
+    def test_raises_when_kda_backend_module_missing(self, monkeypatch):
+        import sys
+        from types import SimpleNamespace
+
+        cfg = SimpleNamespace(full_attention_layer_ids=[0, 2])
+        runner = SimpleNamespace(kimi_linear_config=cfg)
+
+        # Force the lazy import to fail.
+        monkeypatch.setitem(
+            sys.modules,
+            "sgl_jax.srt.layers.attention.linear.kda_backend",
+            None,
+        )
+
+        try:
+            attn_backend_wrapper(runner, _FakeFullBackend())
+        except ImportError as e:
+            assert "KDAAttnBackend" in str(e)
+            return
+        raise AssertionError("expected ImportError")
+
+    def test_builds_hybrid_with_full_attn_layers_from_config(self, monkeypatch):
+        import sys
+        from types import ModuleType, SimpleNamespace
+
+        # Inject fake kda_backend module so the lazy import succeeds.
+        fake_module = ModuleType(
+            "sgl_jax.srt.layers.attention.linear.kda_backend"
+        )
+
+        class _FakeKDA(nnx.Module):
+            def __init__(self, runner):
+                self.runner = runner
+
+        fake_module.KDAAttnBackend = _FakeKDA
+        monkeypatch.setitem(
+            sys.modules,
+            "sgl_jax.srt.layers.attention.linear.kda_backend",
+            fake_module,
+        )
+
+        cfg = SimpleNamespace(full_attention_layer_ids=[0, 2])
+        runner = SimpleNamespace(kimi_linear_config=cfg)
+        full = _FakeFullBackend()
+
+        result = attn_backend_wrapper(runner, full)
+
+        assert isinstance(result, HybridLinearAttnBackend)
+        assert result.full_attn_backend is full
+        assert isinstance(result.linear_attn_backend, _FakeKDA)
+        assert result.full_attn_layers == frozenset({0, 2})
