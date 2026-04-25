@@ -3,9 +3,6 @@
 
 The class itself owns no memory pool and allocates no device buffers; it only
 holds two sub-backends + a `full_attn_layers` whitelist and routes calls.
-
-Spec: docs/projects/sglang-jax/design_docs/support_hybrid_linear_attn_backend.md
-Upstream reference (PyTorch): sglang/srt/layers/attention/hybrid_linear_attn_backend.py
 """
 
 from __future__ import annotations
@@ -13,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import jax
 from flax import nnx
 from jax.tree_util import register_pytree_node_class
 
@@ -22,7 +20,6 @@ from sgl_jax.srt.layers.attention.base_attn_backend import (
 )
 
 if TYPE_CHECKING:
-    from sgl_jax.srt.layers.radix_attention import RadixAttention
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
 
@@ -32,12 +29,38 @@ if TYPE_CHECKING:
 # `linear/kda_backend.py` (already on the epic branch) keeps importing.
 
 
+@register_pytree_node_class
+@dataclass
 class LinearRecurrentAttnBackendMetadata:
-    pass
+    """Stub metadata for linear-recurrent backends; KDA PR will flesh out fields."""
+
+    def tree_flatten(self):
+        return ((), {})
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls()
 
 
 class LinearRecurrentAttnBackend(AttentionBackend):
-    pass
+    """Stub base class for linear-recurrent backends (KDA, etc.).
+
+    Inherits AttentionBackend (nnx.Module), so it is auto-registered as a pytree
+    via flax-nnx's metaclass. tree_flatten / tree_unflatten are provided
+    explicitly for symmetry with the metadata stub.
+    """
+
+    def get_forward_metadata(self, batch):
+        # Concrete subclasses (KDAAttnBackend, ...) override this. The stub
+        # returns an empty metadata so it can be instantiated for tests.
+        return LinearRecurrentAttnBackendMetadata()
+
+    def tree_flatten(self):
+        return ((), {})
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls()
 
 
 # --- HybridLinearAttnBackend -----------------------------------------------
@@ -56,7 +79,7 @@ class HybridLinearAttentionBackendMetadata:
     linear_attn_metadata: LinearRecurrentAttnBackendMetadata = field(default=None)
 
     def tree_flatten(self):
-        return (self.full_attn_metadata, self.linear_attn_metadata), None
+        return ((self.full_attn_metadata, self.linear_attn_metadata), {})
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
@@ -100,25 +123,44 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def __call__(
         self,
-        *args,
-        layer: RadixAttention = None,
-        forward_batch: ForwardBatch = None,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        layer,  # RadixAttention or RadixLinearAttention
+        forward_batch: ForwardBatch,
+        pool,  # state_pool or token_to_kv_pool
+        mixed_qkv: jax.Array | None = None,  # For linear attention
+        a: jax.Array | None = None,  # For linear attention
+        b: jax.Array | None = None,  # For linear attention
         **kwargs,
     ):
         """Dispatch by layer.layer_id.
 
-        Signature is intentionally generic (forwarding *args/**kwargs) — the
-        upstream-style dataclass signature is deferred until primatrix/wiki#112
-        finalises the unified backend interface. Sub-backends own their own
-        concrete signatures.
+        full-attention sub-backend gets (q, k, v, layer, forward_batch, pool, **kwargs).
+        linear-attention sub-backend additionally gets mixed_qkv / a / b before pool.
         """
-        assert layer is not None, "HybridLinearAttnBackend requires `layer=`"
-        sub = (
-            self.full_attn_backend
-            if layer.layer_id in self.full_attn_layers
-            else self.linear_attn_backend
+        if layer.layer_id in self.full_attn_layers:
+            return self.full_attn_backend(
+                q,
+                k,
+                v,
+                layer=layer,
+                forward_batch=forward_batch,
+                pool=pool,
+                **kwargs,
+            )
+        return self.linear_attn_backend(
+            q,
+            k,
+            v,
+            layer=layer,
+            forward_batch=forward_batch,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            pool=pool,
+            **kwargs,
         )
-        return sub(*args, layer=layer, forward_batch=forward_batch, **kwargs)
 
     def get_max_running_reqests(self, max_context_len, page_size):
         return min(
@@ -154,10 +196,10 @@ def attn_backend_wrapper(
     """Wrap full_attn_backend in HybridLinearAttnBackend for hybrid models.
 
     Mirrors upstream `sglang/srt/layers/attention/attention_registry.py:attn_backend_wrapper`.
-    Only handles Kimi-Linear in this PR. When no hybrid config is set, returns
-    `full_attn_backend` unchanged so the caller can invoke this unconditionally.
+    When no hybrid (linear-recurrent) config is set, returns `full_attn_backend`
+    unchanged so the caller can invoke this unconditionally.
     """
-    if runner.kimi_linear_config is not None:
+    if runner.linear_recurrent_config is not None:
         # KDAAttnBackend lives in a separate PR — lazy import keeps this PR
         # self-contained.
         try:
@@ -168,7 +210,7 @@ def attn_backend_wrapper(
             ) from e
 
         linear_attn_backend = KDAAttnBackend(runner)
-        full_attn_layers = runner.kimi_linear_config.full_attention_layer_ids
+        full_attn_layers = runner.linear_recurrent_config.full_attention_layer_ids
         return HybridLinearAttnBackend(full_attn_backend, linear_attn_backend, full_attn_layers)
 
     return full_attn_backend

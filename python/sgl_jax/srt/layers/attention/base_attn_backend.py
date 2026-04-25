@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 class AttentionBackendMetadata:
     """Empty pytree base type for per-backend forward metadata.
 
-    Concrete backends (FlashAttention, MLA, LinearRecurrent, ...) subclass this so
+    Concrete backends (FlashAttention, MLA, ...) subclass this so
     HybridLinearAttentionBackendMetadata can type its `full_attn_metadata` field
     without depending on any specific concrete backend.
     """

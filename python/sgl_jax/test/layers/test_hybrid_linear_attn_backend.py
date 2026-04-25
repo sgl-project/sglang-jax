@@ -12,6 +12,7 @@ Maps to design doc test plan §4:
 from dataclasses import dataclass
 
 import jax
+import jax.numpy as jnp
 from flax import nnx
 
 from sgl_jax.srt.layers.attention.base_attn_backend import (
@@ -21,6 +22,8 @@ from sgl_jax.srt.layers.attention.base_attn_backend import (
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttentionBackendMetadata,
     HybridLinearAttnBackend,
+    LinearRecurrentAttnBackend,
+    LinearRecurrentAttnBackendMetadata,
     attn_backend_wrapper,
 )
 
@@ -57,11 +60,15 @@ class _FakeFullBackend(AttentionBackend):
     def get_forward_metadata(self, batch):
         return _FakeFullMetadata(tag=f"full-from-{getattr(batch, 'name', 'batch')}")
 
-    def __call__(self, *args, layer=None, forward_batch=None, **kwargs):
+    def __call__(self, q, k, v, layer=None, forward_batch=None, pool=None, **kwargs):
         self.calls.append(
             {
                 "layer_id": getattr(layer, "layer_id", None),
-                "args": args,
+                "q": q,
+                "k": k,
+                "v": v,
+                "forward_batch": forward_batch,
+                "pool": pool,
                 "kwargs": kwargs,
             }
         )
@@ -82,11 +89,30 @@ class _FakeLinearBackend(nnx.Module):
     def get_forward_metadata(self, batch):
         return _FakeLinearMetadata(tag=f"linear-from-{getattr(batch, 'name', 'batch')}")
 
-    def __call__(self, *args, layer=None, forward_batch=None, **kwargs):
+    def __call__(
+        self,
+        q,
+        k,
+        v,
+        layer=None,
+        forward_batch=None,
+        mixed_qkv=None,
+        a=None,
+        b=None,
+        pool=None,
+        **kwargs,
+    ):
         self.calls.append(
             {
                 "layer_id": getattr(layer, "layer_id", None),
-                "args": args,
+                "q": q,
+                "k": k,
+                "v": v,
+                "forward_batch": forward_batch,
+                "mixed_qkv": mixed_qkv,
+                "a": a,
+                "b": b,
+                "pool": pool,
                 "kwargs": kwargs,
             }
         )
@@ -113,6 +139,14 @@ def _make_hybrid(full_layers=(0, 2), full_max=100, linear_max=100):
     return hybrid, full, linear
 
 
+def _qkv():
+    """Tiny stand-in arrays for the q/k/v positional params."""
+    q = jnp.zeros((1, 1, 1))
+    k = jnp.zeros((1, 1, 1))
+    v = jnp.zeros((1, 1, 1))
+    return q, k, v
+
+
 # ---------------------------------------------------------------------------
 # Smoke tests
 # ---------------------------------------------------------------------------
@@ -121,12 +155,44 @@ def _make_hybrid(full_layers=(0, 2), full_max=100, linear_max=100):
 def test_module_imports():
     assert HybridLinearAttnBackend is not None
     assert HybridLinearAttentionBackendMetadata is not None
+    assert LinearRecurrentAttnBackend is not None
+    assert LinearRecurrentAttnBackendMetadata is not None
     assert callable(attn_backend_wrapper)
 
 
 def test_constructor_records_full_attn_layers_as_frozenset():
     hybrid, _, _ = _make_hybrid(full_layers=[0, 2, 2])
     assert hybrid.full_attn_layers == frozenset({0, 2})
+
+
+# ---------------------------------------------------------------------------
+# Stub linear-recurrent classes are pytree-registered
+# ---------------------------------------------------------------------------
+
+
+class TestLinearRecurrentStubsArePytrees:
+    def test_metadata_pytree_roundtrip(self):
+        m = LinearRecurrentAttnBackendMetadata()
+        leaves, treedef = jax.tree_util.tree_flatten(m)
+        rebuilt = jax.tree_util.tree_unflatten(treedef, leaves)
+        assert isinstance(rebuilt, LinearRecurrentAttnBackendMetadata)
+
+    def test_metadata_inside_jit(self):
+        @jax.jit
+        def identity(x):
+            return x
+
+        m = LinearRecurrentAttnBackendMetadata()
+        out = identity(m)
+        assert isinstance(out, LinearRecurrentAttnBackendMetadata)
+
+    def test_backend_is_pytree(self):
+        # Inherits AttentionBackend (nnx.Module) → registered automatically by
+        # flax-nnx's metaclass. Smoke-check by flattening / unflattening.
+        b = LinearRecurrentAttnBackend()
+        leaves, treedef = jax.tree_util.tree_flatten(b)
+        rebuilt = jax.tree_util.tree_unflatten(treedef, leaves)
+        assert isinstance(rebuilt, LinearRecurrentAttnBackend)
 
 
 # ---------------------------------------------------------------------------
@@ -149,9 +215,18 @@ class TestGetForwardMetadata:
         hybrid, full, linear = _make_hybrid()
         batch = _FakeBatch(name="step42")
         meta = hybrid.get_forward_metadata(batch)
-        # Both fields should reflect the batch name.
         assert meta.full_attn_metadata.tag == "full-from-step42"
         assert meta.linear_attn_metadata.tag == "linear-from-step42"
+
+    def test_metadata_pytree_aux_is_empty_dict(self):
+        # tree_flatten on HybridLinearAttentionBackendMetadata returns ((...), {})
+        meta = HybridLinearAttentionBackendMetadata(
+            full_attn_metadata=_FakeFullMetadata(tag="x"),
+            linear_attn_metadata=_FakeLinearMetadata(tag="y"),
+        )
+        children, aux = meta.tree_flatten()
+        assert aux == {}
+        assert len(children) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +249,6 @@ class TestForwardMetadataSetter:
 
         assert full.forward_metadata is fm
         assert linear.forward_metadata is lm
-        # Hybrid keeps the aggregate (used by pytree traversal).
         assert hybrid.forward_metadata is value
 
     def test_setter_overwrites_previous_value(self):
@@ -194,48 +268,101 @@ class TestForwardMetadataSetter:
 
 
 # ---------------------------------------------------------------------------
-# TP-3: __call__ dispatches by layer.layer_id
+# TP-3: __call__ dispatches by layer.layer_id with the new q/k/v/pool signature
 # ---------------------------------------------------------------------------
 
 
 class TestDispatch:
-    def test_full_attn_layer_routes_to_full_sub(self):
+    def test_full_attn_layer_routes_to_full_sub_without_linear_only_args(self):
         hybrid, full, linear = _make_hybrid(full_layers=(0, 2))
+        q, k, v = _qkv()
+        pool = object()
 
-        out = hybrid(layer=_FakeLayer(layer_id=0), forward_batch=_FakeBatch())
+        out = hybrid(
+            q,
+            k,
+            v,
+            layer=_FakeLayer(layer_id=0),
+            forward_batch=_FakeBatch(),
+            pool=pool,
+            mixed_qkv=jnp.ones((1, 1)),  # provided but should be IGNORED for full
+            a=jnp.ones((1, 1)),
+            b=jnp.ones((1, 1)),
+        )
 
         assert out[0] == "full-out"
         assert len(full.calls) == 1
         assert len(linear.calls) == 0
-        assert full.calls[0]["layer_id"] == 0
+        c = full.calls[0]
+        assert c["layer_id"] == 0
+        assert c["pool"] is pool
+        # Full sub-backend signature does not name mixed_qkv / a / b — they
+        # must NOT have been forwarded.
+        assert "mixed_qkv" not in c["kwargs"]
+        assert "a" not in c["kwargs"]
+        assert "b" not in c["kwargs"]
 
-    def test_kda_layer_routes_to_linear_sub(self):
+    def test_kda_layer_routes_to_linear_sub_with_linear_only_args(self):
         hybrid, full, linear = _make_hybrid(full_layers=(0, 2))
+        q, k, v = _qkv()
+        pool = object()
+        mixed_qkv = jnp.full((1, 1), 7.0)
+        a = jnp.full((1, 1), 8.0)
+        b = jnp.full((1, 1), 9.0)
 
-        out = hybrid(layer=_FakeLayer(layer_id=1), forward_batch=_FakeBatch())
+        out = hybrid(
+            q,
+            k,
+            v,
+            layer=_FakeLayer(layer_id=1),
+            forward_batch=_FakeBatch(),
+            pool=pool,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+        )
 
         assert out[0] == "linear-out"
         assert len(linear.calls) == 1
         assert len(full.calls) == 0
-        assert linear.calls[0]["layer_id"] == 1
+        c = linear.calls[0]
+        assert c["layer_id"] == 1
+        assert c["pool"] is pool
+        assert c["mixed_qkv"] is mixed_qkv
+        assert c["a"] is a
+        assert c["b"] is b
 
-    def test_kwargs_passthrough(self):
-        hybrid, full, linear = _make_hybrid()
+    def test_kwargs_passthrough_to_full_sub(self):
+        hybrid, full, _ = _make_hybrid()
+        q, k, v = _qkv()
         sentinel = object()
+
         hybrid(
+            q,
+            k,
+            v,
             layer=_FakeLayer(layer_id=0),
             forward_batch=_FakeBatch(),
+            pool=None,
             extra_kw=sentinel,
         )
         assert full.calls[0]["kwargs"]["extra_kw"] is sentinel
 
-    def test_assert_layer_required(self):
-        hybrid, _, _ = _make_hybrid()
-        try:
-            hybrid(forward_batch=_FakeBatch())
-        except AssertionError:
-            return
-        raise AssertionError("expected AssertionError when layer= is omitted")
+    def test_kwargs_passthrough_to_linear_sub(self):
+        hybrid, _, linear = _make_hybrid()
+        q, k, v = _qkv()
+        sentinel = object()
+
+        hybrid(
+            q,
+            k,
+            v,
+            layer=_FakeLayer(layer_id=1),
+            forward_batch=_FakeBatch(),
+            pool=None,
+            extra_kw=sentinel,
+        )
+        assert linear.calls[0]["kwargs"]["extra_kw"] is sentinel
 
 
 class TestPytreeRoundtrip:
@@ -263,15 +390,15 @@ class TestGetMaxRunningReqests:
 
 
 # ---------------------------------------------------------------------------
-# attn_backend_wrapper helper
+# attn_backend_wrapper helper — branches on runner.linear_recurrent_config
 # ---------------------------------------------------------------------------
 
 
 class TestAttnBackendWrapper:
-    def test_passthrough_when_kimi_linear_config_is_none(self):
+    def test_passthrough_when_linear_recurrent_config_is_none(self):
         from types import SimpleNamespace
 
-        runner = SimpleNamespace(kimi_linear_config=None)
+        runner = SimpleNamespace(linear_recurrent_config=None)
         full = _FakeFullBackend()
         result = attn_backend_wrapper(runner, full)
         assert result is full  # identity — unchanged
@@ -281,9 +408,8 @@ class TestAttnBackendWrapper:
         from types import SimpleNamespace
 
         cfg = SimpleNamespace(full_attention_layer_ids=[0, 2])
-        runner = SimpleNamespace(kimi_linear_config=cfg)
+        runner = SimpleNamespace(linear_recurrent_config=cfg)
 
-        # Force the lazy import to fail.
         monkeypatch.setitem(
             sys.modules,
             "sgl_jax.srt.layers.attention.linear.kda_backend",
@@ -301,7 +427,6 @@ class TestAttnBackendWrapper:
         import sys
         from types import ModuleType, SimpleNamespace
 
-        # Inject fake kda_backend module so the lazy import succeeds.
         fake_module = ModuleType("sgl_jax.srt.layers.attention.linear.kda_backend")
 
         class _FakeKDA(nnx.Module):
@@ -316,7 +441,7 @@ class TestAttnBackendWrapper:
         )
 
         cfg = SimpleNamespace(full_attention_layer_ids=[0, 2])
-        runner = SimpleNamespace(kimi_linear_config=cfg)
+        runner = SimpleNamespace(linear_recurrent_config=cfg)
         full = _FakeFullBackend()
 
         result = attn_backend_wrapper(runner, full)
@@ -329,7 +454,7 @@ class TestAttnBackendWrapper:
 
 # ---------------------------------------------------------------------------
 # TP-5: ModelRunner._get_attention_backend wraps in HybridLinearAttnBackend
-# when kimi_linear_config is set.
+# when runner.linear_recurrent_config is set.
 # ---------------------------------------------------------------------------
 
 
@@ -338,13 +463,11 @@ class TestModelRunnerIntegration:
         import sys
         from types import ModuleType, SimpleNamespace
 
-        import jax
         from jax.sharding import Mesh
 
         from sgl_jax.srt.layers.attention.native_backend import NativeAttention
         from sgl_jax.srt.model_executor.model_runner import ModelRunner
 
-        # Inject fake kda_backend module so attn_backend_wrapper's lazy import succeeds.
         fake_module = ModuleType("sgl_jax.srt.layers.attention.linear.kda_backend")
 
         class _FakeKDA(nnx.Module):
@@ -358,7 +481,6 @@ class TestModelRunnerIntegration:
             fake_module,
         )
 
-        # Single-device mesh required by NativeAttention's NamedSharding(...).
         mesh = Mesh(jax.devices()[:1], axis_names=("tensor",))
 
         cfg = SimpleNamespace(full_attention_layer_ids=[0, 2])
@@ -369,17 +491,45 @@ class TestModelRunnerIntegration:
             model_config=SimpleNamespace(head_dim=64),
             page_size=1,
             mesh=mesh,
-            kimi_linear_config=cfg,
+            # The wrapper now reads `linear_recurrent_config` (a @property on the
+            # real ModelRunner). We supply it directly on the SimpleNamespace.
+            linear_recurrent_config=cfg,
         )
 
-        # Call _get_attention_backend on the SimpleNamespace stand-in.
         backend = ModelRunner._get_attention_backend(runner)
 
         assert isinstance(backend, HybridLinearAttnBackend)
         assert isinstance(backend.linear_attn_backend, _FakeKDA)
-        # full_attn_backend should be NativeAttention since we asked for "native".
         assert isinstance(backend.full_attn_backend, NativeAttention)
         assert backend.full_attn_layers == frozenset({0, 2})
+
+
+# ---------------------------------------------------------------------------
+# linear_recurrent_config @property on ModelRunner returns KimiLinearConfig
+# instance when hf_config is one, otherwise None.
+# ---------------------------------------------------------------------------
+
+
+class TestLinearRecurrentConfigProperty:
+    def test_returns_kimi_linear_config_when_hf_config_matches(self):
+        from types import SimpleNamespace
+
+        from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
+        from sgl_jax.srt.model_executor.model_runner import ModelRunner
+
+        cfg = KimiLinearConfig(num_hidden_layers=2)
+        runner = SimpleNamespace(model_config=SimpleNamespace(hf_config=cfg))
+        result = ModelRunner.linear_recurrent_config.fget(runner)
+        assert result is cfg
+
+    def test_returns_none_for_non_kimi_config(self):
+        from types import SimpleNamespace
+
+        from sgl_jax.srt.model_executor.model_runner import ModelRunner
+
+        runner = SimpleNamespace(model_config=SimpleNamespace(hf_config=object()))
+        result = ModelRunner.linear_recurrent_config.fget(runner)
+        assert result is None
 
 
 # ---------------------------------------------------------------------------
@@ -391,28 +541,29 @@ class TestTwoLayerForwardOrdering:
     def test_two_layer_forward_calls_each_sub_once_in_order(self):
         """1 MLA layer (layer_id=0) + 1 KDA layer (layer_id=1)."""
         hybrid, full, linear = _make_hybrid(full_layers=(0,))
+        q, k, v = _qkv()
 
-        # Set forward_metadata once, mimicking tp_worker pre-forward.
         hybrid.forward_metadata = HybridLinearAttentionBackendMetadata(
             full_attn_metadata=_FakeFullMetadata(tag="step-full"),
             linear_attn_metadata=_FakeLinearMetadata(tag="step-linear"),
         )
 
-        # Walk layers in index order: 0 (MLA / full), 1 (KDA / linear).
         results = []
         for layer_id in (0, 1):
             results.append(
                 hybrid(
+                    q,
+                    k,
+                    v,
                     layer=_FakeLayer(layer_id=layer_id),
                     forward_batch=_FakeBatch(name="step1"),
+                    pool=None,
                 )
             )
 
         assert [c["layer_id"] for c in full.calls] == [0]
         assert [c["layer_id"] for c in linear.calls] == [1]
-        # Sub-backends saw their respective metadata via the setter.
         assert full.forward_metadata.tag == "step-full"
         assert linear.forward_metadata.tag == "step-linear"
-        # Outputs preserve dispatch labels.
         assert results[0][0] == "full-out"
         assert results[1][0] == "linear-out"

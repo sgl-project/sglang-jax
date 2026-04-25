@@ -88,15 +88,6 @@ class ModelRunner(BaseModelRunner):
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid = False
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
-        # Hybrid (KDA + MLA) detection. Non-None iff the loaded model is a
-        # Kimi-Linear-style hybrid; consumed by _get_attention_backend().
-        from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
-
-        self.kimi_linear_config = (
-            self.model_config.hf_config
-            if isinstance(self.model_config.hf_config, KimiLinearConfig)
-            else None
-        )
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         self.forward_pass_id = 0
@@ -657,6 +648,19 @@ class ModelRunner(BaseModelRunner):
     def init_attention_backend(self):
         """Init attention kernel backend."""
         self.attn_backend = self._get_attention_backend()
+
+    @property
+    def linear_recurrent_config(self):
+        """Linear-recurrent (state-based) hybrid model config, or None.
+
+        Currently detects Kimi-Linear; extend with additional hybrid configs
+        (GDN, ...) as they're added.
+        """
+        from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
+
+        if isinstance(self.model_config.hf_config, KimiLinearConfig):
+            return self.model_config.hf_config
+        return None
 
     def _get_attention_backend(self):
         backend = self.server_args.attention_backend
