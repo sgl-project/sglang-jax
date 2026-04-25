@@ -152,21 +152,6 @@ def _compute_max_num_reqs_from_state_budget(state_budget: int, per_req_bytes: in
     return state_budget // per_req_bytes
 
 
-def _wrap_pool_updates(layers_kv_fused):
-    """Phase 3 transition bridge.
-
-    During Phase 3, models migrate from returning a bare list of fused KV
-    arrays to returning a {"pool_name": list} dict. This helper accepts either
-    shape and yields the dict form expected by MemoryPools.replace_all.
-
-    Phase 3 Task 5 deletes this helper once all 13 edited models return dict
-    (and llama_eagle3 inherits the migrated parent __call__).
-    """
-    if isinstance(layers_kv_fused, dict):
-        return layers_kv_fused
-    return {"token_to_kv_pool": layers_kv_fused}
-
-
 def _check_state_to_kv_ratio_for_hybrid(state_to_kv_ratio: float) -> None:
     """D5: fail-fast if state_to_kv_ratio is non-positive when has_recurrent_state.
 
@@ -941,15 +926,11 @@ class ModelRunner(BaseModelRunner):
                 logger.debug("logits_metadata %s: %s", key, value)
 
         with jtu.count_pjit_cpp_cache_miss() as count:
-            output, layers_kv_fused, _, layers_topk_ids = self.jitted_run_model(
+            output, pool_updates, _, layers_topk_ids = self.jitted_run_model(
                 forward_batch, logits_metadata
             )
             cache_miss_count = count()
-        # Phase 3 transition: each model migrates incrementally from bare list
-        # to dict; _wrap_pool_updates absorbs both shapes. Phase 3 Task 5
-        # deletes this helper once all 13 edited models return dict (and
-        # llama_eagle3 inherits the migrated parent __call__).
-        pool_updates = _wrap_pool_updates(layers_kv_fused)
+        # Phase 3 done: models now return pool_updates dict directly at idx 1.
         self.memory_pools.replace_all(pool_updates)
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch

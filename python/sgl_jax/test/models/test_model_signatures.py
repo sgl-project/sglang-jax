@@ -96,5 +96,41 @@ class TestMigratedModelSignatures(unittest.TestCase):
                 )
 
 
+class TestAll13ModelsMigrated(unittest.TestCase):
+    """Lock-in: Phase 3 must end with exactly 13 entries in MIGRATED_MODELS.
+
+    Note: `grep token_to_kv_pool` in srt/models/ hits 14 files, but
+    llama_eagle3.LlamaForCausalLMEagle3 inherits __call__ from
+    LlamaForCausalLM (D6) — so it is migrated transparently by Task 2 and
+    NOT counted here. The 14th hit is on the inner LlamaEagleModel.__call__
+    which is out of scope per Task 2's "inner Model unchanged" constraint.
+    """
+
+    def test_exactly_13(self):
+        names = [c for _, c, *_ in MIGRATED_MODELS]
+        self.assertEqual(
+            len(MIGRATED_MODELS),
+            13,
+            f"Expected 13 migrated outer model classes, got {len(MIGRATED_MODELS)}: {names}",
+        )
+
+
+class TestEagle3InheritsMigratedCall(unittest.TestCase):
+    """Lock-in: llama_eagle3.LlamaForCausalLMEagle3 inherits the migrated
+    __call__ from LlamaForCausalLM (D6). Verify by signature-only — no
+    source check (inspect.getsource would just return the parent's source)."""
+
+    def test_eagle3_outer_call_inherits_memory_pools(self):
+        from sgl_jax.srt.models.llama import LlamaForCausalLM
+        from sgl_jax.srt.models.llama_eagle3 import LlamaForCausalLMEagle3
+
+        # Same function object via MRO inheritance.
+        self.assertIs(
+            LlamaForCausalLMEagle3.__call__,
+            LlamaForCausalLM.__call__,
+            "Eagle3 must inherit __call__ from LlamaForCausalLM, not override it",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
