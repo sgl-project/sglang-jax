@@ -42,25 +42,19 @@ class LinearRecurrentAttnBackendMetadata:
         return cls()
 
 
+@dataclass
 class LinearRecurrentAttnBackend(AttentionBackend):
     """Stub base class for linear-recurrent backends (KDA, etc.).
 
-    Inherits AttentionBackend (nnx.Module), so it is auto-registered as a pytree
-    via flax-nnx's metaclass. tree_flatten / tree_unflatten are provided
-    explicitly for symmetry with the metadata stub.
+    Inherits AttentionBackend (nnx.Module) — auto-registered as a pytree by
+    nnx's metaclass; no explicit @register_pytree_node_class needed (and adding
+    one would raise a duplicate-registration error).
     """
 
     def get_forward_metadata(self, batch):
         # Concrete subclasses (KDAAttnBackend, ...) override this. The stub
         # returns an empty metadata so it can be instantiated for tests.
         return LinearRecurrentAttnBackendMetadata()
-
-    def tree_flatten(self):
-        return ((), {})
-
-    @classmethod
-    def tree_unflatten(cls, aux_data, children):
-        return cls()
 
 
 # --- HybridLinearAttnBackend -----------------------------------------------
@@ -86,10 +80,14 @@ class HybridLinearAttnBackendMetadata:
         return cls(full_attn_metadata=children[0], linear_attn_metadata=children[1])
 
 
+@dataclass
 class HybridLinearAttnBackend(AttentionBackend):
     """Routes by layer.layer_id to a full or linear sub-backend.
 
     Owns no memory pool / device buffers — sub-backends do.
+    Inherits AttentionBackend (nnx.Module) → auto-registered as a pytree;
+    `_forward_metadata` is wrapped in `nnx.data(...)` so its leaves participate
+    in flatten/unflatten without us writing custom tree methods.
     """
 
     def __init__(
@@ -101,7 +99,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_backend = full_attn_backend
         self.linear_attn_backend = linear_attn_backend
         # Stored as a frozenset so membership checks are O(1) and the value is
-        # hashable (safe to use as pytree aux_data).
+        # hashable.
         self.full_attn_layers = frozenset(full_attn_layers)
         self._forward_metadata = nnx.data(HybridLinearAttnBackendMetadata())
 
@@ -128,7 +126,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         v: jax.Array,
         layer,  # RadixAttention or RadixLinearAttention
         forward_batch: ForwardBatch,
-        pool,  # state_pool or token_to_kv_pool
+        pool,  # token_to_kv_pool (full attn) or recurrent_state_pool (linear attn)
         mixed_qkv: jax.Array | None = None,  # For linear attention
         a: jax.Array | None = None,  # For linear attention
         b: jax.Array | None = None,  # For linear attention
@@ -136,8 +134,9 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         """Dispatch by layer.layer_id.
 
-        full-attention sub-backend gets (q, k, v, layer, forward_batch, pool, **kwargs).
-        linear-attention sub-backend additionally gets mixed_qkv / a / b before pool.
+        full-attn sub-backend gets pool as `token_to_kv_pool=`; linear-attn
+        sub-backend gets the same value as `recurrent_state_pool=` plus the
+        linear-only mixed_qkv / a / b kwargs.
         """
         if layer.layer_id in self.full_attn_layers:
             return self.full_attn_backend(
@@ -146,7 +145,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 v,
                 layer=layer,
                 forward_batch=forward_batch,
-                pool=pool,
+                token_to_kv_pool=pool,
                 **kwargs,
             )
         return self.linear_attn_backend(
@@ -158,7 +157,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
-            pool=pool,
+            recurrent_state_pool=pool,
             **kwargs,
         )
 
@@ -167,26 +166,6 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.full_attn_backend.get_max_running_reqests(max_context_len, page_size),
             self.linear_attn_backend.get_max_running_reqests(max_context_len, page_size),
         )
-
-    # Pytree registration: full_attn_layers is hashable (frozenset) and goes to
-    # aux_data so structure changes trigger retracing; everything else is data.
-    def tree_flatten(self):
-        children = (
-            self.full_attn_backend,
-            self.linear_attn_backend,
-            self._forward_metadata,
-        )
-        aux_data = {"full_attn_layers": self.full_attn_layers}
-        return children, aux_data
-
-    @classmethod
-    def tree_unflatten(cls, aux_data, children):
-        obj = cls.__new__(cls)
-        obj.full_attn_backend = children[0]
-        obj.linear_attn_backend = children[1]
-        obj._forward_metadata = children[2]
-        obj.full_attn_layers = aux_data["full_attn_layers"]
-        return obj
 
 
 def attn_backend_wrapper(

@@ -60,7 +60,7 @@ class _FakeFullBackend(AttentionBackend):
     def get_forward_metadata(self, batch):
         return _FakeFullMetadata(tag=f"full-from-{getattr(batch, 'name', 'batch')}")
 
-    def __call__(self, q, k, v, layer=None, forward_batch=None, pool=None, **kwargs):
+    def __call__(self, q, k, v, layer=None, forward_batch=None, token_to_kv_pool=None, **kwargs):
         self.calls.append(
             {
                 "layer_id": getattr(layer, "layer_id", None),
@@ -68,7 +68,7 @@ class _FakeFullBackend(AttentionBackend):
                 "k": k,
                 "v": v,
                 "forward_batch": forward_batch,
-                "pool": pool,
+                "token_to_kv_pool": token_to_kv_pool,
                 "kwargs": kwargs,
             }
         )
@@ -99,7 +99,7 @@ class _FakeLinearBackend(nnx.Module):
         mixed_qkv=None,
         a=None,
         b=None,
-        pool=None,
+        recurrent_state_pool=None,
         **kwargs,
     ):
         self.calls.append(
@@ -112,7 +112,7 @@ class _FakeLinearBackend(nnx.Module):
                 "mixed_qkv": mixed_qkv,
                 "a": a,
                 "b": b,
-                "pool": pool,
+                "recurrent_state_pool": recurrent_state_pool,
                 "kwargs": kwargs,
             }
         )
@@ -295,12 +295,14 @@ class TestDispatch:
         assert len(linear.calls) == 0
         c = full.calls[0]
         assert c["layer_id"] == 0
-        assert c["pool"] is pool
+        assert c["token_to_kv_pool"] is pool
         # Full sub-backend signature does not name mixed_qkv / a / b — they
         # must NOT have been forwarded.
         assert "mixed_qkv" not in c["kwargs"]
         assert "a" not in c["kwargs"]
         assert "b" not in c["kwargs"]
+        # And the linear-only kwarg name `recurrent_state_pool` must NOT leak.
+        assert "recurrent_state_pool" not in c["kwargs"]
 
     def test_kda_layer_routes_to_linear_sub_with_linear_only_args(self):
         hybrid, full, linear = _make_hybrid(full_layers=(0, 2))
@@ -327,10 +329,12 @@ class TestDispatch:
         assert len(full.calls) == 0
         c = linear.calls[0]
         assert c["layer_id"] == 1
-        assert c["pool"] is pool
+        assert c["recurrent_state_pool"] is pool
         assert c["mixed_qkv"] is mixed_qkv
         assert c["a"] is a
         assert c["b"] is b
+        # And the full-only kwarg name `token_to_kv_pool` must NOT leak.
+        assert "token_to_kv_pool" not in c["kwargs"]
 
     def test_kwargs_passthrough_to_full_sub(self):
         hybrid, full, _ = _make_hybrid()
