@@ -94,8 +94,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         return self._forward_metadata
 
     @forward_metadata.setter
-    def forward_metadata(self, value):  # placeholder
-        raise NotImplementedError
+    def forward_metadata(self, value: HybridLinearAttentionBackendMetadata):
+        self._forward_metadata = value
+        self.full_attn_backend.forward_metadata = value.full_attn_metadata
+        self.linear_attn_backend.forward_metadata = value.linear_attn_metadata
 
     def __call__(self, *args, **kwargs):  # placeholder
         raise NotImplementedError

@@ -148,3 +148,41 @@ class TestGetForwardMetadata:
         # Both fields should reflect the batch name.
         assert meta.full_attn_metadata.tag == "full-from-step42"
         assert meta.linear_attn_metadata.tag == "linear-from-step42"
+
+
+# ---------------------------------------------------------------------------
+# TP-2: forward_metadata setter unpacks dataclass fields to sub-backends
+# ---------------------------------------------------------------------------
+
+
+class TestForwardMetadataSetter:
+    def test_unpacks_to_sub_backends(self):
+        hybrid, full, linear = _make_hybrid()
+
+        fm = _FakeFullMetadata(tag="injected-full")
+        lm = _FakeLinearMetadata(tag="injected-linear")
+        value = HybridLinearAttentionBackendMetadata(
+            full_attn_metadata=fm, linear_attn_metadata=lm,
+        )
+
+        hybrid.forward_metadata = value
+
+        assert full.forward_metadata is fm
+        assert linear.forward_metadata is lm
+        # Hybrid keeps the aggregate (used by pytree traversal).
+        assert hybrid.forward_metadata is value
+
+    def test_setter_overwrites_previous_value(self):
+        hybrid, full, linear = _make_hybrid()
+        v1 = HybridLinearAttentionBackendMetadata(
+            full_attn_metadata=_FakeFullMetadata(tag="a"),
+            linear_attn_metadata=_FakeLinearMetadata(tag="a"),
+        )
+        v2 = HybridLinearAttentionBackendMetadata(
+            full_attn_metadata=_FakeFullMetadata(tag="b"),
+            linear_attn_metadata=_FakeLinearMetadata(tag="b"),
+        )
+        hybrid.forward_metadata = v1
+        hybrid.forward_metadata = v2
+        assert full.forward_metadata.tag == "b"
+        assert linear.forward_metadata.tag == "b"
