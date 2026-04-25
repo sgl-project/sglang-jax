@@ -11,6 +11,7 @@ Maps to design doc test plan §4:
 
 from dataclasses import dataclass, field
 
+import jax
 from flax import nnx
 
 from sgl_jax.srt.layers.attention.base_attn_backend import (
@@ -186,3 +187,59 @@ class TestForwardMetadataSetter:
         hybrid.forward_metadata = v2
         assert full.forward_metadata.tag == "b"
         assert linear.forward_metadata.tag == "b"
+
+
+# ---------------------------------------------------------------------------
+# TP-3: __call__ dispatches by layer.layer_id
+# ---------------------------------------------------------------------------
+
+
+class TestDispatch:
+    def test_full_attn_layer_routes_to_full_sub(self):
+        hybrid, full, linear = _make_hybrid(full_layers=(0, 2))
+
+        out = hybrid(layer=_FakeLayer(layer_id=0), forward_batch=_FakeBatch())
+
+        assert out[0] == "full-out"
+        assert len(full.calls) == 1
+        assert len(linear.calls) == 0
+        assert full.calls[0]["layer_id"] == 0
+
+    def test_kda_layer_routes_to_linear_sub(self):
+        hybrid, full, linear = _make_hybrid(full_layers=(0, 2))
+
+        out = hybrid(layer=_FakeLayer(layer_id=1), forward_batch=_FakeBatch())
+
+        assert out[0] == "linear-out"
+        assert len(linear.calls) == 1
+        assert len(full.calls) == 0
+        assert linear.calls[0]["layer_id"] == 1
+
+    def test_kwargs_passthrough(self):
+        hybrid, full, linear = _make_hybrid()
+        sentinel = object()
+        hybrid(
+            layer=_FakeLayer(layer_id=0),
+            forward_batch=_FakeBatch(),
+            extra_kw=sentinel,
+        )
+        assert full.calls[0]["kwargs"]["extra_kw"] is sentinel
+
+    def test_assert_layer_required(self):
+        hybrid, _, _ = _make_hybrid()
+        try:
+            hybrid(forward_batch=_FakeBatch())
+        except AssertionError:
+            return
+        raise AssertionError("expected AssertionError when layer= is omitted")
+
+
+class TestPytreeRoundtrip:
+    def test_flatten_unflatten_preserves_state(self):
+        hybrid, _, _ = _make_hybrid(full_layers=(0, 2))
+        leaves, treedef = jax.tree_util.tree_flatten(hybrid)
+        rebuilt = jax.tree_util.tree_unflatten(treedef, leaves)
+        assert rebuilt.full_attn_layers == hybrid.full_attn_layers
+        assert isinstance(
+            rebuilt._forward_metadata, HybridLinearAttentionBackendMetadata
+        )

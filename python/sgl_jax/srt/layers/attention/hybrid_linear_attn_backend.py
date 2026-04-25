@@ -82,7 +82,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_layers = frozenset(full_attn_layers)
         self._forward_metadata = nnx.data(HybridLinearAttentionBackendMetadata())
 
-    # The remaining methods are added in Tasks 2.2 - 2.5.
     def get_forward_metadata(self, batch):
         return HybridLinearAttentionBackendMetadata(
             full_attn_metadata=self.full_attn_backend.get_forward_metadata(batch),
@@ -99,11 +98,50 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_backend.forward_metadata = value.full_attn_metadata
         self.linear_attn_backend.forward_metadata = value.linear_attn_metadata
 
-    def __call__(self, *args, **kwargs):  # placeholder
-        raise NotImplementedError
+    def __call__(
+        self,
+        *args,
+        layer: "RadixAttention" = None,
+        forward_batch: "ForwardBatch" = None,
+        **kwargs,
+    ):
+        """Dispatch by layer.layer_id.
+
+        Signature is intentionally generic (forwarding *args/**kwargs) — the
+        upstream-style dataclass signature is deferred until primatrix/wiki#112
+        finalises the unified backend interface. Sub-backends own their own
+        concrete signatures.
+        """
+        assert layer is not None, "HybridLinearAttnBackend requires `layer=`"
+        sub = (
+            self.full_attn_backend
+            if layer.layer_id in self.full_attn_layers
+            else self.linear_attn_backend
+        )
+        return sub(*args, layer=layer, forward_batch=forward_batch, **kwargs)
 
     def get_max_running_reqests(self, max_context_len, page_size):  # placeholder
         raise NotImplementedError
+
+    # Pytree registration: full_attn_layers is hashable (frozenset) and goes to
+    # aux_data so structure changes trigger retracing; everything else is data.
+    def tree_flatten(self):
+        children = (
+            self.full_attn_backend,
+            self.linear_attn_backend,
+            self._forward_metadata,
+        )
+        aux_data = {"full_attn_layers": self.full_attn_layers}
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = cls.__new__(cls)
+        obj.full_attn_backend = children[0]
+        obj.linear_attn_backend = children[1]
+        obj._forward_metadata = children[2]
+        obj.full_attn_layers = aux_data["full_attn_layers"]
+        return obj
 
 
 def attn_backend_wrapper(
