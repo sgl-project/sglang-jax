@@ -843,22 +843,23 @@ class Grok1ForCausalLM(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
+        memory_pools,
         logits_metadata: LogitsMetadata,
-    ) -> tuple[LogitsProcessorOutput, list[jax.Array], bool, list[jax.Array | None]]:
+    ) -> tuple[LogitsProcessorOutput, dict, bool, list[jax.Array | None]]:
         """Forward pass through the model using unified forward_batch API."""
+        kv_pool = memory_pools.token_to_kv_pool
         input_ids = forward_batch.input_ids
         positions = forward_batch.positions
         hidden_states, layers_kv_fused, layers_topk_ids = self.model(
             input_ids,
             positions,
             forward_batch,
-            token_to_kv_pool,
+            kv_pool,
             None,
         )
         output = self.logits_processor(hidden_states, cast(Embed, self.lm_head), logits_metadata)
 
-        return output, layers_kv_fused, True, layers_topk_ids
+        return output, {"token_to_kv_pool": layers_kv_fused}, True, layers_topk_ids
 
     def load_weights(self, model_config: ModelConfig) -> None:
         loader = WeightLoader(

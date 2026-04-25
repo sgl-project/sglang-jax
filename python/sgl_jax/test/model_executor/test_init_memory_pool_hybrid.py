@@ -190,5 +190,118 @@ class TestServerArgsForcedConstraints(unittest.TestCase):
             _enforce_recurrent_state_server_constraints(sa)
 
 
+class TestForwardCallsReplaceAll(unittest.TestCase):
+    """_forward must dispatch via self.memory_pools.replace_all(pool_updates)
+    instead of the legacy _set_kv_cache_after_forward path.
+
+    We only verify the contract surface (method existence + call shape) without
+    invoking a real forward, since real forward needs model loading.
+    """
+
+    def setUp(self):
+        if not jax.devices():
+            self.skipTest("JAX not available")
+
+    def test_set_kv_cache_after_forward_method_removed(self):
+        """After Task 5, _set_kv_cache_after_forward must be deleted."""
+        from sgl_jax.srt.model_executor import model_runner
+
+        self.assertFalse(
+            hasattr(model_runner.ModelRunner, "_set_kv_cache_after_forward"),
+            "_set_kv_cache_after_forward should be removed; "
+            "sharding fix now lives in each pool's replace_buffer.",
+        )
+
+    def test_jitted_run_model_donates_memory_pools(self):
+        """The JIT signature must donate memory_pools, not token_to_kv_pool."""
+        import inspect
+
+        from sgl_jax.srt.model_executor import model_runner
+
+        # Inspect the source of _build_jitted_run_model (or jitted_run_model wrapper)
+        # for "donate_argnames" containing "memory_pools".
+        src = inspect.getsource(model_runner)
+        self.assertIn('donate_argnames=["memory_pools"]', src)
+        self.assertNotIn('donate_argnames=["token_to_kv_pool"]', src)
+
+
+class TestStateToKvRatioZeroGuard(unittest.TestCase):
+    """D5 decision: ratio<=0 with has_recurrent_state must raise ValueError
+    explicitly (not fall through to RecurrentStatePool's max_num_reqs assert,
+    whose error message would not point at the ratio config)."""
+
+    def setUp(self):
+        if not jax.devices():
+            self.skipTest("JAX not available")
+
+    def test_zero_ratio_with_hybrid_raises_value_error(self):
+        from sgl_jax.srt.model_executor.model_runner import (
+            _check_state_to_kv_ratio_for_hybrid,
+        )
+
+        with self.assertRaises(ValueError) as ctx:
+            _check_state_to_kv_ratio_for_hybrid(state_to_kv_ratio=0.0)
+        msg = str(ctx.exception)
+        self.assertIn("state_to_kv_ratio", msg)
+        self.assertIn("0", msg)
+        self.assertIn("--state-to-kv-ratio", msg)  # actionable hint
+
+    def test_negative_ratio_raises_value_error(self):
+        from sgl_jax.srt.model_executor.model_runner import (
+            _check_state_to_kv_ratio_for_hybrid,
+        )
+
+        with self.assertRaises(ValueError):
+            _check_state_to_kv_ratio_for_hybrid(state_to_kv_ratio=-0.5)
+
+    def test_positive_ratio_passes(self):
+        from sgl_jax.srt.model_executor.model_runner import (
+            _check_state_to_kv_ratio_for_hybrid,
+        )
+
+        # No exception
+        _check_state_to_kv_ratio_for_hybrid(state_to_kv_ratio=0.9)
+        _check_state_to_kv_ratio_for_hybrid(state_to_kv_ratio=0.001)
+
+
+class TestPhase2EndToEndSanity(unittest.TestCase):
+    """Phase 2 surface integration: hybrid pool wiring + non-hybrid wrapping
+    + JIT signature both work without raising at construction time."""
+
+    def setUp(self):
+        if not jax.devices():
+            self.skipTest("JAX not available")
+
+    def test_hybrid_construction_does_not_raise(self):
+        """Constructing the full hybrid stack via the helpers does not raise."""
+        from sgl_jax.srt.model_executor.model_runner import _build_hybrid_pools
+
+        hf = _mock_hf_config(kda_layers=[0, 1, 2], num_heads=4, head_dim=8)
+        kv_stub = SimpleNamespace(replace_buffer=lambda v: None)
+        rsp, hybrid_pool, mp = _build_hybrid_pools(
+            hf_config=hf,
+            max_num_reqs=4,
+            max_context_len=16,
+            tp_size=1,
+            token_to_kv_pool=kv_stub,
+        )
+        # All three pools share the same RecurrentStatePool instance.
+        self.assertIs(rsp, hybrid_pool.recurrent_state_pool)
+        self.assertIs(rsp, mp.recurrent_state_pool)
+        self.assertIs(kv_stub, mp.token_to_kv_pool)
+
+    def test_memory_pools_replace_all_with_kv_only(self):
+        """Non-hybrid path: MemoryPools.replace_all dispatches to kv pool."""
+        from sgl_jax.srt.model_executor.model_runner import (
+            _build_non_hybrid_memory_pools,
+        )
+
+        captured = {}
+        kv_stub = SimpleNamespace(replace_buffer=lambda v: captured.setdefault("v", v))
+        mp = _build_non_hybrid_memory_pools(token_to_kv_pool=kv_stub)
+        mp.replace_all({"token_to_kv_pool": ["dummy_layer"]})
+        self.assertEqual(captured["v"], ["dummy_layer"])
+
+
 if __name__ == "__main__":
     unittest.main()

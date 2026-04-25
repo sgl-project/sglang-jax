@@ -208,6 +208,11 @@ class Req:
 
         # Memory pool info
         self.req_pool_idx: int | None = None
+        # HybridReqToTokenPool slot for recurrent + conv state (Kimi-Linear
+        # KDA layers etc.). None for non-hybrid models. Written by
+        # HybridReqToTokenPool.alloc; read by HybridReqToTokenPool.alloc/free
+        # for chunked-prefill slot reuse and end-of-request release.
+        self.recurrent_pool_idx: int | None = None
 
         # Check finish
         self.tokenizer = None
@@ -510,6 +515,7 @@ class Req:
         self.extend_logprob_start_len = 0
         self.is_chunked = 0
         self.req_pool_idx = None
+        self.recurrent_pool_idx = None
         self.already_computed = 0
         self.routed_experts = None
         self.latest_bid = None

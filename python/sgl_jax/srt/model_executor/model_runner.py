@@ -152,6 +152,36 @@ def _compute_max_num_reqs_from_state_budget(state_budget: int, per_req_bytes: in
     return state_budget // per_req_bytes
 
 
+def _wrap_pool_updates(layers_kv_fused):
+    """Phase 3 transition bridge.
+
+    During Phase 3, models migrate from returning a bare list of fused KV
+    arrays to returning a {"pool_name": list} dict. This helper accepts either
+    shape and yields the dict form expected by MemoryPools.replace_all.
+
+    Phase 3 Task 5 deletes this helper once all 13 edited models return dict
+    (and llama_eagle3 inherits the migrated parent __call__).
+    """
+    if isinstance(layers_kv_fused, dict):
+        return layers_kv_fused
+    return {"token_to_kv_pool": layers_kv_fused}
+
+
+def _check_state_to_kv_ratio_for_hybrid(state_to_kv_ratio: float) -> None:
+    """D5: fail-fast if state_to_kv_ratio is non-positive when has_recurrent_state.
+
+    Raised early with an actionable message instead of letting the error
+    surface from RecurrentStatePool's `assert max_num_reqs > 0` deep inside
+    the constructor — that error message would not point at the ratio config.
+    """
+    if state_to_kv_ratio <= 0:
+        raise ValueError(
+            f"state_to_kv_ratio={state_to_kv_ratio} <= 0 is invalid for "
+            f"has_recurrent_state model: state budget would be 0; "
+            f"set --state-to-kv-ratio > 0 (default 0.9)"
+        )
+
+
 def _enforce_recurrent_state_server_constraints(server_args) -> None:
     """Force disable_radix_cache=True and assert disable_overlap_schedule=True
     for hybrid recurrent state models.
@@ -327,7 +357,7 @@ class ModelRunner(BaseModelRunner):
 
         @partial(
             jax.jit,
-            donate_argnames=["token_to_kv_pool"],  # just donate KV cache
+            donate_argnames=["memory_pools"],
             static_argnames=["model_state_def"],
             compiler_options=jit_compiler_options,
         )
@@ -336,13 +366,16 @@ class ModelRunner(BaseModelRunner):
             model_state_def,
             model_state_leaves,
             forward_batch,
-            token_to_kv_pool,
+            memory_pools,
             logits_metadata,
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
+            # Phase 2: model __call__ still expects token_to_kv_pool; bridge here.
+            # Phase 3 will migrate models to take memory_pools directly.
+            kv_pool = memory_pools.token_to_kv_pool
             with LoraBatchContext.set_batch(forward_batch):
-                return model(forward_batch, token_to_kv_pool, logits_metadata)
+                return model(forward_batch, kv_pool, logits_metadata)
 
         # Capture base RNG key as a constant in the JIT closure.
         # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
@@ -371,13 +404,13 @@ class ModelRunner(BaseModelRunner):
             return compute_logprobs(mesh, logits, next_tokens)
 
         def run_model_wrapper(forward_batch, logits_metadata):
-            token_to_kv_pool = self.token_to_kv_pool
+            memory_pools = self.memory_pools
             return jitted_run_model(
                 model_def,
                 model_state_def,
                 self.model_state_leaves,
                 forward_batch,
-                token_to_kv_pool,
+                memory_pools,
                 logits_metadata,
             )
 
@@ -678,6 +711,7 @@ class ModelRunner(BaseModelRunner):
         has_recurrent_state = _has_recurrent_state(self.model_config.hf_config)
         if has_recurrent_state:
             _enforce_recurrent_state_server_constraints(self.server_args)
+            _check_state_to_kv_ratio_for_hybrid(self.server_args.state_to_kv_ratio)
 
         # Create request to token pool if not already created.
         # For hybrid models, defer to after token_to_kv_pool is built so we can
@@ -911,28 +945,15 @@ class ModelRunner(BaseModelRunner):
                 forward_batch, logits_metadata
             )
             cache_miss_count = count()
-        self._set_kv_cache_after_forward(layers_kv_fused)
+        # Phase 3 transition: each model migrates incrementally from bare list
+        # to dict; _wrap_pool_updates absorbs both shapes. Phase 3 Task 5
+        # deletes this helper once all 13 edited models return dict (and
+        # llama_eagle3 inherits the migrated parent __call__).
+        pool_updates = _wrap_pool_updates(layers_kv_fused)
+        self.memory_pools.replace_all(pool_updates)
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
         return output, cache_miss_count, layers_topk_ids
-
-    def _set_kv_cache_after_forward(self, layers_kv_fused):
-        # Note: For tp_size == 1, we need to put the layers_kv_fused on the device with the target_sharding
-        # because sharding P(None, 'tensor') constraint has lost and this results in cache_miss for first prefill phase.
-        # Issue: https://github.com/sgl-project/sglang-jax/issues/233
-        # Q: Why does not call device_put in every layer?
-        # A: Because it does not work and cache_miss still happens. According to benchmark(https://github.com/sgl-project/sglang-jax/pull/234), the performance is not influenced.
-        if self.tp_size == 1:
-            # MHA pool is 5D `(pages, page_size, kv_packing, num_kv_heads*2, head_dim)`,
-            # MLA pool is 4D `(pages, page_size, kv_packing, kv_lora_rank+qk_rope)`.
-            # Take the spec directly from the pool's buffer instead of hardcoding.
-            target_sharding = self.token_to_kv_pool.kv_sharding
-            layers_kv_fused = [
-                jax.device_put(layer_kv_fused, target_sharding)
-                for layer_kv_fused in layers_kv_fused
-            ]
-
-        self.token_to_kv_pool.replace_buffer(layers_kv_fused)
 
     def forward_idle(
         self,
@@ -1142,3 +1163,8 @@ class MockModelRunner(ModelRunner):
             layer_num=self.model_config.num_hidden_layers,
             mesh=mesh,
         )
+
+        # D5: MockModelRunner doesn't go through init_memory_pool, so wrap
+        # token_to_kv_pool in MemoryPools manually so the inherited _forward
+        # can dispatch via self.memory_pools.replace_all(...).
+        self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)

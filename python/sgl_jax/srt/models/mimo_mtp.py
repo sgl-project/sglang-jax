@@ -234,10 +234,11 @@ class MiMoMTPForCausalLM(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
+        memory_pools,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.model(forward_batch, token_to_kv_pool)
+        kv_pool = memory_pools.token_to_kv_pool
+        hidden_states, layers_kv_fused = self.model(forward_batch, kv_pool)
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(
                 hidden_states, self.lm_head, logits_metadata, aux_hidden_states=None
@@ -250,7 +251,7 @@ class MiMoMTPForCausalLM(nnx.Module):
                 aux_hidden_states=None,
             )
 
-        return output, layers_kv_fused, []
+        return output, {"token_to_kv_pool": layers_kv_fused}, []
 
     def get_embed_and_head(self):
         return (

@@ -577,11 +577,12 @@ class LlamaForCausalLM(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
+        memory_pools,
         logits_metadata: LogitsMetadata,
     ):
+        kv_pool = memory_pools.token_to_kv_pool
         hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag = self.model(
-            forward_batch=forward_batch, token_to_kv_pool=token_to_kv_pool
+            forward_batch=forward_batch, token_to_kv_pool=kv_pool
         )
         if not self.capture_aux_hidden_states:
             aux_hidden_states = None
@@ -597,7 +598,7 @@ class LlamaForCausalLM(nnx.Module):
                 hidden_states, self.lm_head, logits_metadata, aux_hidden_states=aux_hidden_states
             )
 
-        return output, layers_kv_fused, layers_callback_flag, None
+        return output, {"token_to_kv_pool": layers_kv_fused}, layers_callback_flag, None
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):

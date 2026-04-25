@@ -429,15 +429,16 @@ class QWenLMHeadModel(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
+        memory_pools,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.model(forward_batch, token_to_kv_pool)
+        kv_pool = memory_pools.token_to_kv_pool
+        hidden_states, layers_kv_fused = self.model(forward_batch, kv_pool)
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
-        return output, layers_kv_fused, True, None
+        return output, {"token_to_kv_pool": layers_kv_fused}, True, None
 
 
 EntryClass = QWenLMHeadModel

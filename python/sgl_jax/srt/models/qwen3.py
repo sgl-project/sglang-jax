@@ -552,11 +552,12 @@ class Qwen3ForCausalLM(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
+        memory_pools,
         logits_metadata: LogitsMetadata,
     ):
+        kv_pool = memory_pools.token_to_kv_pool
         hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag = self.model(
-            forward_batch, token_to_kv_pool
+            forward_batch, kv_pool
         )
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(
@@ -570,7 +571,7 @@ class Qwen3ForCausalLM(nnx.Module):
                 aux_hidden_states=aux_hidden_states,
             )
 
-        return output, layers_kv_fused, layers_callback_flag, None
+        return output, {"token_to_kv_pool": layers_kv_fused}, layers_callback_flag, None
 
 
 EntryClass = Qwen3ForCausalLM
