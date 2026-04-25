@@ -83,3 +83,20 @@ class TestIsMoe:
 
     def test_no_experts(self):
         assert KimiLinearConfig().is_moe is False
+
+
+class TestAutoConfigRegistration:
+    def test_auto_config_resolves_kimi_linear(self):
+        # Importing model_config triggers AutoConfig.register as a side effect.
+        import sgl_jax.srt.configs.model_config  # noqa: F401
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.for_model(
+            "kimi_linear",
+            num_hidden_layers=2,
+            linear_attn_config={"kda_layers": [2], "full_attn_layers": [1]},
+        )
+        assert isinstance(cfg, KimiLinearConfig)
+        assert cfg.is_kda_layer(1) is True   # 1+1=2 ∈ {2}
+        assert cfg.is_kda_layer(0) is False
+

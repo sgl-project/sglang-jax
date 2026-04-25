@@ -4,8 +4,10 @@ import os
 from enum import Enum, IntEnum, auto
 
 import jax.numpy as jnp
+from transformers import AutoConfig as _AutoConfig
 from transformers import PretrainedConfig
 
+from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig as _KimiLinearConfig
 from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.hf_transformers_utils import (
     download_from_hf,
@@ -18,6 +20,14 @@ from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
+
+# Register custom configs with HF AutoConfig so checkpoints with
+# `model_type: "kimi_linear"` resolve to KimiLinearConfig.
+try:
+    _AutoConfig.register("kimi_linear", _KimiLinearConfig)
+except ValueError:
+    # Already registered (e.g., re-import in tests). Safe to ignore.
+    pass
 
 
 class AttentionArch(IntEnum):
