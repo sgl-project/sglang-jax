@@ -124,6 +124,7 @@ class DeepseekV3Attention(nnx.Module):
         max_position_embeddings: int = 163840,
         dtype: jnp.dtype = jnp.bfloat16,
         use_absorbed: bool = True,
+        skip_rope: bool = False,
     ):
         super().__init__()
         self.mesh = mesh
@@ -196,15 +197,18 @@ class DeepseekV3Attention(nnx.Module):
             scope_name="o_proj",
         )
 
-        self.rotary_emb = get_rope(
-            head_size=qk_rope_head_dim,
-            rotary_dim=qk_rope_head_dim,
-            max_position=max_position_embeddings,
-            base=int(rope_theta),
-            is_neox_style=not rope_interleave,
-            rope_scaling=rope_scaling,
-            dtype=dtype,
-        )
+        if not skip_rope:
+            self.rotary_emb = get_rope(
+                head_size=qk_rope_head_dim,
+                rotary_dim=qk_rope_head_dim,
+                max_position=max_position_embeddings,
+                base=int(rope_theta),
+                is_neox_style=not rope_interleave,
+                rope_scaling=rope_scaling,
+                dtype=dtype,
+            )
+        else:
+            self.rotary_emb = None
 
         self.attn_mqa = RadixAttention(
             num_heads=num_heads,
@@ -280,7 +284,8 @@ class DeepseekV3Attention(nnx.Module):
         compressed = self.kv_a_layernorm(compressed)
 
         k_rope = k_rope_raw.reshape(-1, 1, self.qk_rope_head_dim)
-        q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+        if self.rotary_emb is not None:
+            q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
 
         if self.use_absorbed:
             attn_output, kv_fused = self._forward_mqa(
