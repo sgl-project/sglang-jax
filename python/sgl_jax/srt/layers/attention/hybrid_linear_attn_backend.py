@@ -101,8 +101,8 @@ class HybridLinearAttnBackend(AttentionBackend):
     def __call__(
         self,
         *args,
-        layer: "RadixAttention" = None,
-        forward_batch: "ForwardBatch" = None,
+        layer: RadixAttention = None,
+        forward_batch: ForwardBatch = None,
         **kwargs,
     ):
         """Dispatch by layer.layer_id.
@@ -164,14 +164,11 @@ def attn_backend_wrapper(
             from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
         except ImportError as e:
             raise ImportError(
-                "HybridLinearAttnBackend needs KDAAttnBackend "
-                "(delivered by a separate PR)."
+                "HybridLinearAttnBackend needs KDAAttnBackend " "(delivered by a separate PR)."
             ) from e
 
         linear_attn_backend = KDAAttnBackend(runner)
         full_attn_layers = runner.kimi_linear_config.full_attention_layer_ids
-        return HybridLinearAttnBackend(
-            full_attn_backend, linear_attn_backend, full_attn_layers
-        )
+        return HybridLinearAttnBackend(full_attn_backend, linear_attn_backend, full_attn_layers)
 
     return full_attn_backend

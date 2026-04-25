@@ -9,7 +9,7 @@ Maps to design doc test plan §4:
 - TP-6: TestTwoLayerForwardOrdering (Task 3.3)
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import jax
 from flax import nnx
@@ -23,7 +23,6 @@ from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     attn_backend_wrapper,
 )
-
 
 # ---------------------------------------------------------------------------
 # Test fixtures: fake sub-backends + fake metadata + fake layer / batch
@@ -59,11 +58,13 @@ class _FakeFullBackend(AttentionBackend):
         return _FakeFullMetadata(tag=f"full-from-{getattr(batch, 'name', 'batch')}")
 
     def __call__(self, *args, layer=None, forward_batch=None, **kwargs):
-        self.calls.append({
-            "layer_id": getattr(layer, "layer_id", None),
-            "args": args,
-            "kwargs": kwargs,
-        })
+        self.calls.append(
+            {
+                "layer_id": getattr(layer, "layer_id", None),
+                "args": args,
+                "kwargs": kwargs,
+            }
+        )
         return ("full-out", layer.layer_id if layer is not None else None)
 
     def get_max_running_reqests(self, max_context_len, page_size):
@@ -82,11 +83,13 @@ class _FakeLinearBackend(nnx.Module):
         return _FakeLinearMetadata(tag=f"linear-from-{getattr(batch, 'name', 'batch')}")
 
     def __call__(self, *args, layer=None, forward_batch=None, **kwargs):
-        self.calls.append({
-            "layer_id": getattr(layer, "layer_id", None),
-            "args": args,
-            "kwargs": kwargs,
-        })
+        self.calls.append(
+            {
+                "layer_id": getattr(layer, "layer_id", None),
+                "args": args,
+                "kwargs": kwargs,
+            }
+        )
         return ("linear-out", layer.layer_id if layer is not None else None)
 
     def get_max_running_reqests(self, max_context_len, page_size):
@@ -163,7 +166,8 @@ class TestForwardMetadataSetter:
         fm = _FakeFullMetadata(tag="injected-full")
         lm = _FakeLinearMetadata(tag="injected-linear")
         value = HybridLinearAttentionBackendMetadata(
-            full_attn_metadata=fm, linear_attn_metadata=lm,
+            full_attn_metadata=fm,
+            linear_attn_metadata=lm,
         )
 
         hybrid.forward_metadata = value
@@ -240,9 +244,7 @@ class TestPytreeRoundtrip:
         leaves, treedef = jax.tree_util.tree_flatten(hybrid)
         rebuilt = jax.tree_util.tree_unflatten(treedef, leaves)
         assert rebuilt.full_attn_layers == hybrid.full_attn_layers
-        assert isinstance(
-            rebuilt._forward_metadata, HybridLinearAttentionBackendMetadata
-        )
+        assert isinstance(rebuilt._forward_metadata, HybridLinearAttentionBackendMetadata)
 
 
 # ---------------------------------------------------------------------------
@@ -300,9 +302,7 @@ class TestAttnBackendWrapper:
         from types import ModuleType, SimpleNamespace
 
         # Inject fake kda_backend module so the lazy import succeeds.
-        fake_module = ModuleType(
-            "sgl_jax.srt.layers.attention.linear.kda_backend"
-        )
+        fake_module = ModuleType("sgl_jax.srt.layers.attention.linear.kda_backend")
 
         class _FakeKDA(nnx.Module):
             def __init__(self, runner):
@@ -345,9 +345,7 @@ class TestModelRunnerIntegration:
         from sgl_jax.srt.model_executor.model_runner import ModelRunner
 
         # Inject fake kda_backend module so attn_backend_wrapper's lazy import succeeds.
-        fake_module = ModuleType(
-            "sgl_jax.srt.layers.attention.linear.kda_backend"
-        )
+        fake_module = ModuleType("sgl_jax.srt.layers.attention.linear.kda_backend")
 
         class _FakeKDA(nnx.Module):
             def __init__(self, runner):

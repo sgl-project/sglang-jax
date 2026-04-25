@@ -28,9 +28,9 @@ class TestIsKdaLayer:
     def test_kda_vs_full_layers_1_indexed(self):
         cfg = self._make_cfg()
         assert cfg.is_kda_layer(0) is False
-        assert cfg.is_kda_layer(1) is True   # 1+1=2 ∈ {2,4}
+        assert cfg.is_kda_layer(1) is True  # 1+1=2 ∈ {2,4}
         assert cfg.is_kda_layer(2) is False
-        assert cfg.is_kda_layer(3) is True   # 3+1=4 ∈ {2,4}
+        assert cfg.is_kda_layer(3) is True  # 3+1=4 ∈ {2,4}
 
     def test_full_attention_layer_ids_property(self):
         cfg = self._make_cfg()
@@ -88,8 +88,9 @@ class TestIsMoe:
 class TestAutoConfigRegistration:
     def test_auto_config_resolves_kimi_linear(self):
         # Importing model_config triggers AutoConfig.register as a side effect.
-        import sgl_jax.srt.configs.model_config  # noqa: F401
         from transformers import AutoConfig
+
+        import sgl_jax.srt.configs.model_config  # noqa: F401
 
         cfg = AutoConfig.for_model(
             "kimi_linear",
@@ -97,6 +98,5 @@ class TestAutoConfigRegistration:
             linear_attn_config={"kda_layers": [2], "full_attn_layers": [1]},
         )
         assert isinstance(cfg, KimiLinearConfig)
-        assert cfg.is_kda_layer(1) is True   # 1+1=2 ∈ {2}
+        assert cfg.is_kda_layer(1) is True  # 1+1=2 ∈ {2}
         assert cfg.is_kda_layer(0) is False
-

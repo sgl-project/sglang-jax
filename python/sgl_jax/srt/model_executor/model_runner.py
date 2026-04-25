@@ -691,7 +691,9 @@ class ModelRunner(BaseModelRunner):
             # and run standard FlashAttention with per-head K/V (num_kv_heads ==
             # num_attn_heads). All other (backend, model) combinations use the
             # model's native MHA/GQA dims.
-            from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
+            from sgl_jax.srt.layers.attention.flashattention_backend import (
+                FlashAttention,
+            )
 
             if backend == "fa_mha" and self.use_mla_backend:
                 cfg = self.model_config.hf_text_config
