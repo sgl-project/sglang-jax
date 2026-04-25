@@ -255,9 +255,15 @@ class MiMoV2Attention(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ) -> tuple[jax.Array, jax.Array]:
+        lid = self.layer_id
+
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
+
+        hs_dumper.dump("attn_q_before_rope", q, layer_id=lid)
+        hs_dumper.dump("attn_k_before_rope", k, layer_id=lid)
+        hs_dumper.dump("attn_v_before_rope", v, layer_id=lid)
 
         q = q.reshape(-1, self.q_head_num, self.head_dim)
         k = k.reshape(-1, k.shape[-1] // self.head_dim, self.head_dim)
@@ -268,8 +274,14 @@ class MiMoV2Attention(nnx.Module):
             v = jnp.pad(v, ((0, 0), (0, 0), (0, pad_size)))
 
         q, k = self.rotary_emb(positions, q, k)
+
+        hs_dumper.dump("attn_q_after_rope", q, layer_id=lid)
+        hs_dumper.dump("attn_k_after_rope", k, layer_id=lid)
+
         if self.attention_value_scale is not None:
             v = v * self.attention_value_scale
+
+        hs_dumper.dump("attn_v_after_scale", v, layer_id=lid)
 
         attn_output, kv_fused = self.attn(
             q,
@@ -290,7 +302,12 @@ class MiMoV2Attention(nnx.Module):
                 attn_output = attn_output[..., : self.v_head_dim]
                 attn_output = attn_output.reshape(-1, expected_v_head_dim)
 
+        hs_dumper.dump("attn_output_before_o_proj", attn_output, layer_id=lid)
+
         output, _ = self.o_proj(attn_output)
+
+        hs_dumper.dump("attn_output_after_o_proj", output, layer_id=lid)
+
         return output, kv_fused
 
 
