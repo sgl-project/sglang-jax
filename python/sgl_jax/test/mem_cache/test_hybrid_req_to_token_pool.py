@@ -151,8 +151,257 @@ class TestHybridReqToTokenPoolInit(unittest.TestCase):
             any(kw in doc for kw in ("unregistered", "do not", "not register", "must not"))
         )
 
-    def test_inherits_alloc_int_path(self):
+
+class TestHybridReqToTokenPoolAlloc(unittest.TestCase):
+    def setUp(self):
+        if not jax.devices():
+            self.skipTest("JAX not available")
+
+    def _make(self, max_num_reqs=4):
+        from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool
+        from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
+
+        rsp = RecurrentStatePool(
+            num_layers=1,
+            max_num_reqs=max_num_reqs,
+            num_heads=1,
+            head_dim=2,
+            conv_kernel_size=4,
+        )
+        pool = HybridReqToTokenPool(
+            size=max_num_reqs + 1,
+            max_context_len=8,
+            dtype=np.int32,
+            recurrent_state_pool=rsp,
+        )
+        return pool, rsp
+
+    def test_alloc_fresh_reqs_assigns_both_indices(self):
+        pool, rsp = self._make()
+        reqs = [_make_req(), _make_req()]
+        slots = pool.alloc(reqs)
+        self.assertEqual(len(slots), 2)
+        for req in reqs:
+            self.assertIsNotNone(req.req_pool_idx)
+            self.assertIsNotNone(req.recurrent_pool_idx)
+            self.assertGreaterEqual(req.recurrent_pool_idx, 1)
+            self.assertEqual(
+                pool.req_index_to_recurrent_index_mapping[req.req_pool_idx],
+                req.recurrent_pool_idx,
+            )
+
+    def test_alloc_partial_reuse_consumes_only_new_slots(self):
+        pool, rsp = self._make()
+        req_a = _make_req()
+        pool.alloc([req_a])
+        old_recurrent = req_a.recurrent_pool_idx
+
+        req_a.is_chunked = 1
+        req_b = _make_req()
+        before = len(rsp.free_slots)
+        pool.alloc([req_a, req_b])
+        self.assertEqual(req_a.recurrent_pool_idx, old_recurrent)
+        self.assertIsNotNone(req_b.recurrent_pool_idx)
+        self.assertNotEqual(req_b.recurrent_pool_idx, old_recurrent)
+        self.assertEqual(len(rsp.free_slots), before - 1)
+
+    def test_alloc_full_reuse_does_not_consume_recurrent_slot(self):
+        pool, rsp = self._make()
+        req = _make_req()
+        pool.alloc([req])
+        before = len(rsp.free_slots)
+        req.is_chunked = 1
+        pool.alloc([req])
+        self.assertEqual(len(rsp.free_slots), before)
+
+    def test_alloc_recurrent_pool_exhausted_returns_none_atomically(self):
+        """Critical: on failure neither req fields nor mapping may be partially mutated."""
+        pool, rsp = self._make(max_num_reqs=2)
+        # rsp capacity is 2; allocating 3 fresh reqs MUST fail.
+        reqs = [_make_req(), _make_req(), _make_req()]
+        before_free = list(rsp.free_slots)
+        before_mapping = pool.req_index_to_recurrent_index_mapping.copy()
+
+        result = pool.alloc(reqs)
+
+        self.assertIsNone(result)
+        # No req field touched.
+        for req in reqs:
+            self.assertIsNone(req.req_pool_idx)
+            self.assertIsNone(req.recurrent_pool_idx)
+        # rsp.free_slots untouched.
+        self.assertEqual(rsp.free_slots, before_free)
+        # mapping untouched.
+        self.assertTrue(bool((pool.req_index_to_recurrent_index_mapping == before_mapping).all()))
+
+    def test_alloc_safety_assert_when_reuse_without_chunked(self):
+        pool, rsp = self._make()
+        req = _make_req()
+        pool.alloc([req])
+        # is_chunked still 0 -> reuse must raise (assert from parent alloc).
+        with self.assertRaises(AssertionError):
+            pool.alloc([req])
+
+    def test_alloc_int_disallowed(self):
         pool, _ = self._make()
-        # Hybrid does not override alloc yet (Task 6); int path inherits from parent.
-        slots = pool.alloc(2)
-        self.assertEqual(slots, [0, 1])
+        with self.assertRaises(AssertionError):
+            pool.alloc(2)
+
+    def test_chunked_prefill_reuse_preserves_buffer_content(self):
+        """RFC §test strategy line 484: chunked prefill reuse must preserve recurrent + conv state."""
+        import jax.numpy as jnp
+
+        pool, rsp = self._make()
+        req = _make_req()
+        pool.alloc([req])
+        slot = req.recurrent_pool_idx
+
+        # Simulate first chunk forward: write accumulator values
+        # (per-layer + per-inner list element mutation).
+        for layer in range(rsp.num_layers):
+            rsp.recurrent_buffers[layer] = rsp.recurrent_buffers[layer].at[slot].set(7.5)
+            for inner in range(len(rsp.conv_buffers[layer])):
+                rsp.conv_buffers[layer][inner] = (
+                    rsp.conv_buffers[layer][inner].at[slot].set(jnp.bfloat16(3.25))
+                )
+
+        # Enter second chunk: req has both indices + is_chunked > 0.
+        req.is_chunked = 1
+        pool.alloc([req])
+
+        # Critical assertion: reused-slot content was NOT cleared.
+        for layer in range(rsp.num_layers):
+            self.assertTrue(bool(jnp.all(rsp.recurrent_buffers[layer][slot] == 7.5)))
+            for inner in range(len(rsp.conv_buffers[layer])):
+                self.assertTrue(
+                    bool(jnp.all(rsp.conv_buffers[layer][inner][slot] == jnp.bfloat16(3.25)))
+                )
+        self.assertEqual(req.recurrent_pool_idx, slot)
+
+
+class TestHybridReqToTokenPoolFree(unittest.TestCase):
+    def setUp(self):
+        if not jax.devices():
+            self.skipTest("JAX not available")
+
+    def _make(self):
+        from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool
+        from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
+
+        rsp = RecurrentStatePool(
+            num_layers=1, max_num_reqs=4, num_heads=1, head_dim=2, conv_kernel_size=4
+        )
+        pool = HybridReqToTokenPool(
+            size=5, max_context_len=8, dtype=np.int32, recurrent_state_pool=rsp
+        )
+        return pool, rsp
+
+    def test_free_recurrent_cache_returns_slot_and_resets_field(self):
+        pool, rsp = self._make()
+        req = _make_req()
+        pool.alloc([req])
+        slot = req.recurrent_pool_idx
+        free_before = list(rsp.free_slots)
+
+        pool.free_recurrent_cache(req)
+
+        self.assertIsNone(req.recurrent_pool_idx)
+        self.assertIn(slot, rsp.free_slots)
+        self.assertEqual(len(rsp.free_slots), len(free_before) + 1)
+        self.assertEqual(pool.req_index_to_recurrent_index_mapping[req.req_pool_idx], 0)
+
+    def test_free_recurrent_cache_idempotent_on_no_idx(self):
+        pool, rsp = self._make()
+        req = _make_req()  # recurrent_pool_idx=None
+        before = list(rsp.free_slots)
+        pool.free_recurrent_cache(req)
+        self.assertEqual(rsp.free_slots, before)
+        self.assertIsNone(req.recurrent_pool_idx)
+
+    def test_alloc_recurrent_state_cleared_after_free(self):
+        """clear-on-alloc reuse path: write non-zero, free, re-alloc -> zeroed."""
+        import jax.numpy as jnp
+
+        pool, rsp = self._make()
+        req = _make_req()
+        pool.alloc([req])
+        # Per-layer list element mutation to write non-zero.
+        for layer in range(rsp.num_layers):
+            rsp.recurrent_buffers[layer] = (
+                rsp.recurrent_buffers[layer].at[req.recurrent_pool_idx].set(99.0)
+            )
+        pool.free_recurrent_cache(req)
+        new_req = _make_req()
+        pool.alloc([new_req])
+        # The reallocated slot is cleared in every layer.
+        for layer in range(rsp.num_layers):
+            self.assertTrue(
+                bool(jnp.all(rsp.recurrent_buffers[layer][new_req.recurrent_pool_idx] == 0))
+            )
+
+
+class TestHybridReqToTokenPoolGetRecurrentIndices(unittest.TestCase):
+    def setUp(self):
+        if not jax.devices():
+            self.skipTest("JAX not available")
+
+    def _make(self):
+        from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool
+        from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
+
+        rsp = RecurrentStatePool(
+            num_layers=1, max_num_reqs=4, num_heads=1, head_dim=2, conv_kernel_size=4
+        )
+        pool = HybridReqToTokenPool(
+            size=5, max_context_len=8, dtype=np.int32, recurrent_state_pool=rsp
+        )
+        return pool, rsp
+
+    def test_get_recurrent_indices_via_mapping(self):
+        pool, rsp = self._make()
+        reqs = [_make_req(), _make_req()]
+        pool.alloc(reqs)
+        req_pool_indices = np.array([reqs[0].req_pool_idx, reqs[1].req_pool_idx])
+        recurrent_indices = pool.get_recurrent_indices(req_pool_indices)
+        self.assertEqual(recurrent_indices[0], reqs[0].recurrent_pool_idx)
+        self.assertEqual(recurrent_indices[1], reqs[1].recurrent_pool_idx)
+
+
+class TestHybridReqToTokenPoolClear(unittest.TestCase):
+    def setUp(self):
+        if not jax.devices():
+            self.skipTest("JAX not available")
+
+    def _make(self):
+        from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool
+        from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
+
+        rsp = RecurrentStatePool(
+            num_layers=1, max_num_reqs=4, num_heads=1, head_dim=2, conv_kernel_size=4
+        )
+        pool = HybridReqToTokenPool(
+            size=5, max_context_len=8, dtype=np.int32, recurrent_state_pool=rsp
+        )
+        return pool, rsp
+
+    def test_clear_resets_both_pools_and_mapping(self):
+        import jax.numpy as jnp
+
+        pool, rsp = self._make()
+        reqs = [_make_req(), _make_req()]
+        pool.alloc(reqs)
+        # Write non-zero (per-layer + per-inner list element mutation).
+        for layer in range(rsp.num_layers):
+            rsp.recurrent_buffers[layer] = jnp.ones_like(rsp.recurrent_buffers[layer])
+            for inner in range(len(rsp.conv_buffers[layer])):
+                rsp.conv_buffers[layer][inner] = jnp.ones_like(rsp.conv_buffers[layer][inner])
+
+        pool.clear()
+
+        self.assertEqual(pool.free_slots, list(range(pool.size)))
+        self.assertEqual(rsp.free_slots, [1, 2, 3, 4])
+        for layer in range(rsp.num_layers):
+            self.assertTrue(bool(jnp.all(rsp.recurrent_buffers[layer] == 0)))
+            for inner in range(len(rsp.conv_buffers[layer])):
+                self.assertTrue(bool(jnp.all(rsp.conv_buffers[layer][inner] == 0)))
+        self.assertTrue(bool((pool.req_index_to_recurrent_index_mapping == 0).all()))

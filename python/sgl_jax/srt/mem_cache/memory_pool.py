@@ -217,6 +217,79 @@ class HybridReqToTokenPool(ReqToTokenPool):
         # mapping[req_pool_idx] = recurrent_pool_idx; initialized to 0 (dummy slot).
         self.req_index_to_recurrent_index_mapping = np.zeros(size, dtype=np.int32)
 
+    def alloc(self, reqs):
+        """Coordinate allocation: KV slot first, then recurrent slot; atomic semantics.
+
+        Mirrors the "all-or-nothing" coordinated allocation from sglang PyTorch
+        HybridReqToTokenPool.alloc.
+
+        Strategy:
+        1. Pre-check recurrent_state_pool.free_slots capacity.
+        2. super().alloc(reqs) -- KV slot path is already atomic.
+        3. Actually allocate recurrent slot + write back to req + update mapping.
+
+        On any resource shortage we return None; req fields and mapping stay
+        completely untouched before the KV alloc succeeds (recurrent writes only
+        happen after KV passes).
+        """
+        # Explicitly disallow int path; hybrid pool requires list[Req].
+        assert not isinstance(reqs, int), "HybridReqToTokenPool.alloc requires list[Req], not int"
+
+        # 1. Pre-check recurrent capacity.
+        needed_recurrent = sum(1 for req in reqs if req.recurrent_pool_idx is None)
+        if needed_recurrent > len(self.recurrent_state_pool.free_slots):
+            return None
+
+        # 2. KV slot (parent is atomic).
+        kv_indices = super().alloc(reqs)
+        if kv_indices is None:
+            return None
+
+        # 3. Actually allocate recurrent slot; after pre-check this MUST succeed.
+        for req in reqs:
+            if req.recurrent_pool_idx is not None:
+                continue
+            slots = self.recurrent_state_pool.alloc(1)
+            assert slots is not None, (
+                "HybridReqToTokenPool.alloc: recurrent_state_pool.alloc unexpectedly "
+                "returned None after pre-check; concurrent mutation?"
+            )
+            req.recurrent_pool_idx = slots[0]
+            self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = slots[0]
+
+        return kv_indices
+
+    def free_recurrent_cache(self, req) -> None:
+        """Release the recurrent state slot held by `req`. Idempotent.
+
+        Sets req.recurrent_pool_idx back to None and clears the corresponding
+        mapping entry to the dummy slot (0). Safe to call when the req has no
+        recurrent slot allocated.
+        """
+        if req.recurrent_pool_idx is None:
+            return
+        self.recurrent_state_pool.free(req.recurrent_pool_idx)
+        self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = 0
+        req.recurrent_pool_idx = None
+
+    def get_recurrent_indices(self, req_pool_indices):
+        """Look up recurrent slot indices via the CPU-side mapping table.
+
+        Accepts an np.ndarray (or list[int]) of req_pool_idx and returns
+        the same-shape np.ndarray of recurrent_pool_idx values.
+        """
+        return self.req_index_to_recurrent_index_mapping[req_pool_indices]
+
+    def clear(self) -> None:
+        """Full reset: parent clear + recurrent_state_pool.clear + mapping zeroed.
+
+        Called from flush_cache; resets KV slot allocator, recurrent slot allocator,
+        recurrent + conv buffers, and the req_pool_idx -> recurrent_pool_idx mapping.
+        """
+        super().clear()
+        self.recurrent_state_pool.clear()
+        self.req_index_to_recurrent_index_mapping[:] = 0
+
 
 @register_pytree_node_class
 class KVCache(abc.ABC):
@@ -1168,3 +1241,57 @@ class MLATokenToKVPool(KVCache):
             kv_host = kv_cache_host[layer_id]
             kv_device = jax.device_put(kv_host, self.kv_sharding)
             self.kv_buffer[layer_id] = self.kv_buffer[layer_id].at[indices].set(kv_device)
+
+
+@register_pytree_node_class
+class MemoryPools:
+    """Pytree container that uniformly manages multiple pool replace operations.
+
+    Single JIT function + fixed donate_argnames; O(1) extension as new pools are added.
+
+    - Construct: MemoryPools(token_to_kv_pool=..., recurrent_state_pool=...)
+    - Each pool exposed via __getattr__ (mp.token_to_kv_pool / mp.recurrent_state_pool)
+    - tree_flatten yields children sorted by pool name; aux_data is the sorted key tuple
+    - replace_all(updates) does NOT unpack values; each value is forwarded as-is to
+      the corresponding pool.replace_buffer(value) (each pool interprets its own type)
+    """
+
+    def __init__(self, **pools):
+        self._pools = pools
+
+    def __getattr__(self, name):
+        # Block dunder/private lookups so we never confuse Python internals.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            return self._pools[name]
+        except KeyError:
+            raise AttributeError(f"MemoryPools has no pool '{name}'") from None
+
+    def tree_flatten(self):
+        keys = sorted(self._pools.keys())
+        return [self._pools[k] for k in keys], tuple(keys)
+
+    @classmethod
+    def tree_unflatten(cls, keys, children):
+        return cls(**dict(zip(keys, children)))
+
+    def replace_all(self, updates: dict) -> None:
+        """Dispatch updates by key, calling pool.replace_buffer(value) as-is.
+
+        Constraints:
+        - updates.keys() must exactly match self._pools.keys() (count + names).
+        - value is NOT unpacked: token_to_kv_pool receives list[jax.Array],
+          recurrent_state_pool receives tuple[list[jax.Array], list[list[jax.Array]]],
+          etc. Each pool interprets its own value shape.
+        - Strict key matching is required because after JIT donate the old buffers
+          are invalidated; any pool not present in `updates` would hold a dangling
+          reference.
+        """
+        if set(updates.keys()) != set(self._pools.keys()):
+            raise ValueError(
+                f"replace_all: updates keys {sorted(updates.keys())} "
+                f"must exactly match MemoryPools keys {sorted(self._pools.keys())}"
+            )
+        for key, value in updates.items():
+            self._pools[key].replace_buffer(value)
