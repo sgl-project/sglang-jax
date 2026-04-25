@@ -1,7 +1,10 @@
 """init_memory_pool has_recurrent_state branch.
 
-Uses SimpleNamespace mock for hf_config / server_args / mesh-related state to
-exercise the hybrid construction path without loading a real model.
+Detection now lives on ``ModelRunner.linear_recurrent_config`` (a @property
+that combines ``isinstance(KimiLinearConfig)`` with the config's own
+``is_linear_attn`` flag), so this file constructs real ``KimiLinearConfig``
+instances for the detection cases and uses ``SimpleNamespace`` only for the
+pool stubs / server args.
 """
 
 import unittest
@@ -10,62 +13,86 @@ from types import SimpleNamespace
 import jax
 
 
-def _mock_hf_config(kda_layers=None, num_heads=2, head_dim=4, conv_kernel_size=4):
-    """Mock hf_config with linear_attn_config sub-dict.
+def _kimi_cfg(kda_layers=None, num_heads=2, head_dim=4, conv_kernel_size=4):
+    """Build a KimiLinearConfig with the given linear_attn_config sub-dict.
 
-    NOTE: linear_attn_config is a `dict | None` in real Kimi-Linear HF config,
-    not a nested config object (see Decision #12). Field access in the
-    implementation uses dict[key] subscript, not obj.attr.
+    ``kda_layers=None`` produces a degenerate KimiLinearConfig (type matches
+    but ``is_linear_attn`` is False), used to exercise the detection
+    negative path where the hf_config carries no ``linear_attn_config``.
+
+    NOTE: linear_attn_config is a `dict | None` in real Kimi-Linear HF config
+    (see Decision #12). KimiLinearConfig's own __init__ asserts both
+    ``kda_layers`` and ``full_attn_layers`` keys are present and non-None
+    when the dict is given; we satisfy that with an empty ``full_attn_layers``
+    list (length is irrelevant to the recurrent pool path).
     """
+    from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
+
     if kda_layers is None:
-        return SimpleNamespace(linear_attn_config=None)
-    return SimpleNamespace(
+        return KimiLinearConfig(num_hidden_layers=2)
+    return KimiLinearConfig(
+        num_hidden_layers=max(max(kda_layers, default=0) + 1, 2),
         linear_attn_config={
-            "kda_layers": kda_layers,
+            "kda_layers": list(kda_layers),
+            "full_attn_layers": [],
             "num_heads": num_heads,
             "head_dim": head_dim,
             "short_conv_kernel_size": conv_kernel_size,
-        }
+        },
     )
 
 
+def _runner_shim(hf_config):
+    """SimpleNamespace-style shim that exposes ModelRunner.linear_recurrent_config
+    so tests can drive the @property without instantiating a real ModelRunner.
+
+    Mirrors the shim used in test_hybrid_linear_attn_backend.TestHybridConfigProperties
+    to keep the two test files aligned.
+    """
+    from sgl_jax.srt.model_executor.model_runner import ModelRunner
+
+    class _Runner:
+        kimi_linear_config = ModelRunner.kimi_linear_config
+        linear_recurrent_config = ModelRunner.linear_recurrent_config
+
+        def __init__(self, hf):
+            self.model_config = SimpleNamespace(hf_config=hf)
+
+    return _Runner(hf_config)
+
+
 class TestHasRecurrentStateDetection(unittest.TestCase):
-    """Detection logic: has_recurrent_state iff hf_config.linear_attn_config.kda_layers non-empty."""
+    """Detection logic: ``runner.linear_recurrent_config is not None`` iff the
+    hf_config is a ``KimiLinearConfig`` AND its ``is_linear_attn`` flag is True
+    (i.e. ``linear_attn_config["kda_layers"]`` is a non-empty list)."""
 
     def setUp(self):
         if not jax.devices():
             self.skipTest("JAX not available")
 
     def test_detects_kimi_linear_kda_layers(self):
-        from sgl_jax.srt.model_executor.model_runner import _has_recurrent_state
+        runner = _runner_shim(_kimi_cfg(kda_layers=[0, 1, 2]))
+        self.assertIsNotNone(runner.linear_recurrent_config)
 
-        hf = _mock_hf_config(kda_layers=[0, 1, 2])
-        self.assertTrue(_has_recurrent_state(hf))
+    def test_non_kimi_linear_hf_config_returns_none(self):
+        # Any object that is not a KimiLinearConfig instance must be rejected
+        # by isinstance(), even if it duck-types a linear_attn_config attribute.
+        hf = SimpleNamespace(linear_attn_config={"kda_layers": [0, 1]})
+        runner = _runner_shim(hf)
+        self.assertIsNone(runner.linear_recurrent_config)
 
-    def test_no_linear_attn_config_returns_false(self):
-        from sgl_jax.srt.model_executor.model_runner import _has_recurrent_state
+    def test_degenerate_kimi_linear_returns_none(self):
+        # Type matches but linear_attn_config is None → is_linear_attn=False
+        # → property must return None (the C1 fix).
+        runner = _runner_shim(_kimi_cfg(kda_layers=None))
+        self.assertIsNotNone(runner.kimi_linear_config)  # type still matches
+        self.assertIsNone(runner.linear_recurrent_config)
 
-        hf = SimpleNamespace()  # no linear_attn_config attr
-        self.assertFalse(_has_recurrent_state(hf))
-
-    def test_linear_attn_config_none_returns_false(self):
-        from sgl_jax.srt.model_executor.model_runner import _has_recurrent_state
-
-        hf = _mock_hf_config(kda_layers=None)
-        self.assertFalse(_has_recurrent_state(hf))
-
-    def test_empty_kda_layers_returns_false(self):
-        from sgl_jax.srt.model_executor.model_runner import _has_recurrent_state
-
-        hf = _mock_hf_config(kda_layers=[])
-        self.assertFalse(_has_recurrent_state(hf))
-
-    def test_kda_layers_key_missing_returns_false(self):
-        """linear_attn_config exists but lacks "kda_layers" key (corrupt config)."""
-        from sgl_jax.srt.model_executor.model_runner import _has_recurrent_state
-
-        hf = SimpleNamespace(linear_attn_config={"num_heads": 2})  # no kda_layers key
-        self.assertFalse(_has_recurrent_state(hf))
+    def test_empty_kda_layers_returns_none(self):
+        # is_linear_attn explicitly treats an empty kda_layers list as not
+        # linear-attn-based (matches the per-config flag's semantics).
+        runner = _runner_shim(_kimi_cfg(kda_layers=[]))
+        self.assertIsNone(runner.linear_recurrent_config)
 
 
 class TestInitMemoryPoolHybridBranch(unittest.TestCase):
@@ -79,16 +106,15 @@ class TestInitMemoryPoolHybridBranch(unittest.TestCase):
             self.skipTest("JAX not available")
 
     def test_standard_model_no_recurrent_state(self):
-        """has_recurrent_state=False -> MemoryPools contains only token_to_kv_pool;
-        req_to_token_pool is plain ReqToTokenPool."""
+        """linear_recurrent_config is None -> MemoryPools contains only
+        token_to_kv_pool; req_to_token_pool is plain ReqToTokenPool."""
         from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
         from sgl_jax.srt.model_executor.model_runner import (
             _build_non_hybrid_memory_pools,
-            _has_recurrent_state,
         )
 
-        hf = _mock_hf_config(kda_layers=None)
-        self.assertFalse(_has_recurrent_state(hf))
+        runner = _runner_shim(_kimi_cfg(kda_layers=None))
+        self.assertIsNone(runner.linear_recurrent_config)
 
         kv_stub = SimpleNamespace(replace_buffer=lambda v: None)
         mp = _build_non_hybrid_memory_pools(token_to_kv_pool=kv_stub)
@@ -97,17 +123,17 @@ class TestInitMemoryPoolHybridBranch(unittest.TestCase):
         # Plain ReqToTokenPool path is unchanged (caller handles construction).
 
     def test_hybrid_with_mha_pool(self):
-        """has_recurrent_state=True with MHA-like KV pool stub -> MemoryPools
-        contains both pools; req_to_token_pool is HybridReqToTokenPool."""
+        """linear_recurrent_config truthy with MHA-like KV pool stub ->
+        MemoryPools contains both pools; req_to_token_pool is HybridReqToTokenPool."""
         from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, MemoryPools
         from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
         from sgl_jax.srt.model_executor.model_runner import _build_hybrid_pools
 
-        hf = _mock_hf_config(kda_layers=[0, 1], num_heads=2, head_dim=4)
+        cfg = _kimi_cfg(kda_layers=[0, 1], num_heads=2, head_dim=4)
         # Stub mimics MHATokenToKVPool externally (any object with replace_buffer).
         mha_like_stub = SimpleNamespace(replace_buffer=lambda v: None)
         rsp, hybrid_pool, mp = _build_hybrid_pools(
-            hf_config=hf,
+            cfg=cfg,
             max_num_reqs=4,
             max_context_len=16,
             tp_size=1,
@@ -124,15 +150,15 @@ class TestInitMemoryPoolHybridBranch(unittest.TestCase):
         self.assertEqual(rsp.linear_recurrent_layer_ids, [0, 1])
 
     def test_hybrid_with_mla_pool(self):
-        """Kimi-Linear real-world scenario: has_recurrent_state=True with MLA-like
-        KV pool. Verifies MLA pool enters MemoryPools without special handling
-        (transparent to wrapping layer). Same shape as MHA case; only KV pool
-        type differs - this IS the proof that MHA/MLA pool is transparent to
-        the MemoryPools wrapper."""
+        """Kimi-Linear real-world scenario: linear_recurrent_config truthy with
+        MLA-like KV pool. Verifies MLA pool enters MemoryPools without special
+        handling (transparent to wrapping layer). Same shape as MHA case; only
+        KV pool type differs - this IS the proof that MHA/MLA pool is
+        transparent to the MemoryPools wrapper."""
         from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
         from sgl_jax.srt.model_executor.model_runner import _build_hybrid_pools
 
-        hf = _mock_hf_config(kda_layers=[0, 1], num_heads=2, head_dim=4)
+        cfg = _kimi_cfg(kda_layers=[0, 1], num_heads=2, head_dim=4)
         # Stub mimics MLATokenToKVPool externally (different shape/dim
         # internally, but MemoryPools sees only `replace_buffer`).
         mla_like_stub = SimpleNamespace(
@@ -140,7 +166,7 @@ class TestInitMemoryPoolHybridBranch(unittest.TestCase):
             kv_lora_rank=512,  # MLA-specific attr; MemoryPools doesn't touch it
         )
         rsp, hybrid_pool, mp = _build_hybrid_pools(
-            hf_config=hf,
+            cfg=cfg,
             max_num_reqs=4,
             max_context_len=16,
             tp_size=1,
@@ -276,10 +302,10 @@ class TestPhase2EndToEndSanity(unittest.TestCase):
         """Constructing the full hybrid stack via the helpers does not raise."""
         from sgl_jax.srt.model_executor.model_runner import _build_hybrid_pools
 
-        hf = _mock_hf_config(kda_layers=[0, 1, 2], num_heads=4, head_dim=8)
+        cfg = _kimi_cfg(kda_layers=[0, 1, 2], num_heads=4, head_dim=8)
         kv_stub = SimpleNamespace(replace_buffer=lambda v: None)
         rsp, hybrid_pool, mp = _build_hybrid_pools(
-            hf_config=hf,
+            cfg=cfg,
             max_num_reqs=4,
             max_context_len=16,
             tp_size=1,

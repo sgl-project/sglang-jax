@@ -54,39 +54,28 @@ from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 logger = logging.getLogger(__name__)
 
 
-def _has_recurrent_state(hf_config) -> bool:
-    """Return True iff hf_config exposes a non-empty linear_attn_config["kda_layers"].
-
-    NOTE: linear_attn_config is a `dict | None` in real Kimi-Linear HF config
-    (see Decision #12); subscript access is required, not attribute access.
-    """
-    linear_attn_config = getattr(hf_config, "linear_attn_config", None)
-    if linear_attn_config is None:
-        return False
-    if "kda_layers" not in linear_attn_config:
-        return False
-    return len(linear_attn_config["kda_layers"]) > 0
-
-
 def _build_hybrid_pools(
-    hf_config,
+    cfg,
     max_num_reqs: int,
     max_context_len: int,
     tp_size: int,
     token_to_kv_pool,
 ):
     """Construct (RecurrentStatePool, HybridReqToTokenPool, MemoryPools) for a
-    hybrid recurrent model. Caller must ensure _has_recurrent_state(hf_config).
+    hybrid recurrent model.
 
-    NOTE: linear_attn_config is a dict (Decision #12); access via subscript.
+    Caller must ensure ``cfg`` is the runner's ``linear_recurrent_config`` (i.e.,
+    a hybrid linear-recurrent config whose ``is_linear_attn`` is True). The
+    ``linear_attn_config`` payload is a dict (Decision #12); subscript access
+    is required, not attribute access.
     """
-    cfg = hf_config.linear_attn_config  # dict
+    linear_attn_config = cfg.linear_attn_config  # dict
     rsp = RecurrentStatePool(
-        linear_recurrent_layer_ids=list(cfg["kda_layers"]),
+        linear_recurrent_layer_ids=list(linear_attn_config["kda_layers"]),
         max_num_reqs=max_num_reqs,
-        num_heads=cfg["num_heads"],
-        head_dim=cfg["head_dim"],
-        conv_kernel_size=cfg["short_conv_kernel_size"],
+        num_heads=linear_attn_config["num_heads"],
+        head_dim=linear_attn_config["head_dim"],
+        conv_kernel_size=linear_attn_config["short_conv_kernel_size"],
     )
     hybrid_pool = HybridReqToTokenPool(
         size=max_num_reqs + 1,  # +1 for dummy slot 0
@@ -692,8 +681,12 @@ class ModelRunner(BaseModelRunner):
 
         logger.info("ModelRunner max_total_num_tokens: %s", self.max_total_num_tokens)
 
-        # Detect hybrid recurrent state (e.g. Kimi-Linear KDA layers).
-        has_recurrent_state = _has_recurrent_state(self.model_config.hf_config)
+        # Detect hybrid recurrent state (e.g. Kimi-Linear KDA layers) via the
+        # ModelRunner.linear_recurrent_config property: type-checked + gated on
+        # the config's own is_linear_attn flag, so a degenerate KimiLinearConfig
+        # without a populated linear_attn_config does NOT trigger the hybrid path.
+        recurrent_cfg = self.linear_recurrent_config
+        has_recurrent_state = recurrent_cfg is not None
         if has_recurrent_state:
             _enforce_recurrent_state_server_constraints(self.server_args)
             _check_state_to_kv_ratio_for_hybrid(self.server_args.state_to_kv_ratio)
@@ -768,7 +761,7 @@ class ModelRunner(BaseModelRunner):
         # Wrap KV pool in MemoryPools (uniform replace_all path for _forward).
         if has_recurrent_state:
             _, self.req_to_token_pool, self.memory_pools = _build_hybrid_pools(
-                hf_config=self.model_config.hf_config,
+                cfg=recurrent_cfg,
                 max_num_reqs=max_num_reqs,
                 max_context_len=self.model_config.context_len + 4,
                 tp_size=self.tp_size,
@@ -827,8 +820,18 @@ class ModelRunner(BaseModelRunner):
         Cheap detector for `attn_backend_wrapper` to decide whether to wrap.
         Dispatch to a concrete sub-backend uses the specific properties (e.g.
         `kimi_linear_config`) — do not switch on this.
+
+        A KimiLinearConfig instance whose ``is_linear_attn`` flag is False
+        (e.g. a default-constructed config without ``linear_attn_config``)
+        is NOT considered a hybrid model — it returns None. This keeps the
+        umbrella detector consistent with the per-config truth and prevents
+        ``attn_backend_wrapper`` from wrapping a non-hybrid runtime while
+        ``init_memory_pool`` would skip the hybrid pool path.
         """
-        return self.kimi_linear_config  # add `or self.hybrid_gdn_config` etc. later
+        cfg = self.kimi_linear_config
+        if cfg is not None and cfg.is_linear_attn:
+            return cfg
+        return None  # add `or self.hybrid_gdn_config` etc. later
 
     def _get_attention_backend(self):
         backend = self.server_args.attention_backend

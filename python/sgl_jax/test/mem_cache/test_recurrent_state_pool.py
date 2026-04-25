@@ -451,8 +451,8 @@ class TestPytreeRoundtripPreservesMapping(_Base):
         self.assertEqual(conv[0].shape, pool.conv_buffers[1][0].shape)
 
 
-class TestGetSetLinearRecurrentLayerCache(_Base):
-    """get_/set_linear_recurrent_layer_cache external API."""
+class TestGetLinearRecurrentLayerCache(_Base):
+    """get_linear_recurrent_layer_cache external API."""
 
     def test_get_returns_two_tuple_of_list_elements(self):
         pool = self._make()  # [0, 1]
@@ -478,87 +478,124 @@ class TestGetSetLinearRecurrentLayerCache(_Base):
         self.assertIn("99", str(ctx.exception))
         self.assertIn("Registered", str(ctx.exception))
 
-    def test_set_writes_back_via_list_element_mutation(self):
+    def test_no_setter_method_exposed(self):
+        """RFC-0015: backend uses functional .at[].set() return; pool exposes no setter."""
         pool = self._make()
+        self.assertFalse(hasattr(pool, "set_linear_recurrent_layer_cache"))
+
+
+class TestBackendFunctionalReturnNoPoolSideEffect(_Base):
+    """RFC-0015 functional pattern: backend reads via get, applies
+    .at[indices].set(...) to build a new layer buffer, and returns it. The
+    pool's internal recurrent_buffers / conv_buffers list elements stay
+    referentially unchanged across the backend call. Persistence happens only
+    when replace_buffer is invoked with the collected per-layer outputs.
+    """
+
+    def test_backend_call_does_not_mutate_pool_buffers(self):
+        pool = self._make(linear_recurrent_layer_ids=[3, 7])
         slots = pool.alloc(2)  # [1, 2]
+
+        # Capture per-layer references before the simulated backend call.
+        recurrent_refs_before = [pool.recurrent_buffers[i] for i in range(pool.num_layers)]
+        conv_refs_before = [
+            [pool.conv_buffers[i][j] for j in range(len(pool.conv_buffers[i]))]
+            for i in range(pool.num_layers)
+        ]
+
         idx_arr = jnp.asarray(slots, dtype=jnp.int32)
-        new_state = jnp.ones((2, 2, 4, 4), dtype=jnp.float32) * 5.0
-        new_conv_seg = jnp.ones((2, 3, 24), dtype=jnp.bfloat16) * jnp.bfloat16(7.0)
-        pool.set_linear_recurrent_layer_cache(
-            layer_id=0,
-            indices=idx_arr,
-            new_recurrent=new_state,
-            new_conv=[new_conv_seg],
-        )
-        # Layer 0 slots [1, 2] updated; layer 1 untouched.
+        new_state_l3 = jnp.full((2, 2, 4, 4), 3.0, dtype=jnp.float32)
+        new_state_l7 = jnp.full((2, 2, 4, 4), 7.0, dtype=jnp.float32)
+        new_conv_l3 = jnp.full((2, 3, 24), jnp.bfloat16(3.5), dtype=jnp.bfloat16)
+        new_conv_l7 = jnp.full((2, 3, 24), jnp.bfloat16(7.5), dtype=jnp.bfloat16)
+
+        layers_recurrent = []
+        layers_conv = []
+        # Simulate backend per-layer: read -> functional update -> append return.
+        for layer_id, new_state, new_conv in [
+            (3, new_state_l3, new_conv_l3),
+            (7, new_state_l7, new_conv_l7),
+        ]:
+            cur_recurrent_layer, cur_conv_layer = pool.get_linear_recurrent_layer_cache(layer_id)
+            new_recurrent_layer = cur_recurrent_layer.at[idx_arr].set(new_state)
+            new_conv_layer = [cur_conv_layer[0].at[idx_arr].set(new_conv)]
+            layers_recurrent.append(new_recurrent_layer)
+            layers_conv.append(new_conv_layer)
+
+        # `is` relation must hold: backend never wrote into pool's internal lists.
+        for i in range(pool.num_layers):
+            self.assertIs(pool.recurrent_buffers[i], recurrent_refs_before[i])
+            for j in range(len(pool.conv_buffers[i])):
+                self.assertIs(pool.conv_buffers[i][j], conv_refs_before[i][j])
+
+        # The returned per-layer buffers must be NEW objects (functional update).
+        for i in range(pool.num_layers):
+            self.assertIsNot(layers_recurrent[i], recurrent_refs_before[i])
+            self.assertIsNot(layers_conv[i][0], conv_refs_before[i][0])
+
+        # Now persist via replace_buffer; only at this point do the pool's
+        # list element references swap away from the pre-call captures.
+        # Note: replace_buffer goes through jax.device_put on the single-device
+        # CPU path, which may re-wrap the array — so we check value equality
+        # against the returned per-layer buffers rather than `is` identity.
+        pool.replace_buffer((layers_recurrent, layers_conv))
+        for i in range(pool.num_layers):
+            self.assertIsNot(pool.recurrent_buffers[i], recurrent_refs_before[i])
+            self.assertTrue(bool(jnp.array_equal(pool.recurrent_buffers[i], layers_recurrent[i])))
+            for j in range(len(pool.conv_buffers[i])):
+                self.assertIsNot(pool.conv_buffers[i][j], conv_refs_before[i][j])
+                self.assertTrue(bool(jnp.array_equal(pool.conv_buffers[i][j], layers_conv[i][j])))
+
+        # Value check: layer 3 (idx 0) carries 3.0 / 3.5 at the written slots.
         for slot in slots:
-            self.assertTrue(bool(jnp.all(pool.recurrent_buffers[0][slot] == 5)))
-            self.assertTrue(bool(jnp.all(pool.conv_buffers[0][0][slot] == jnp.bfloat16(7))))
-            self.assertTrue(bool(jnp.all(pool.recurrent_buffers[1][slot] == 0)))
-
-    def test_set_unregistered_layer_id_raises_value_error(self):
-        pool = self._make()
-        with self.assertRaises(ValueError):
-            pool.set_linear_recurrent_layer_cache(
-                layer_id=99,
-                indices=jnp.asarray([1], dtype=jnp.int32),
-                new_recurrent=jnp.zeros((1, 2, 4, 4), dtype=jnp.float32),
-                new_conv=[jnp.zeros((1, 3, 24), dtype=jnp.bfloat16)],
-            )
-
-    def test_set_conv_inner_length_mismatch_raises(self):
-        pool = self._make()  # conv inner length 1
-        with self.assertRaises(AssertionError):
-            pool.set_linear_recurrent_layer_cache(
-                layer_id=0,
-                indices=jnp.asarray([1], dtype=jnp.int32),
-                new_recurrent=jnp.zeros((1, 2, 4, 4), dtype=jnp.float32),
-                new_conv=[
-                    jnp.zeros((1, 3, 24), dtype=jnp.bfloat16),
-                    jnp.zeros((1, 3, 24), dtype=jnp.bfloat16),
-                ],
-            )
+            self.assertTrue(bool(jnp.all(pool.recurrent_buffers[0][slot] == 3.0)))
+            self.assertTrue(bool(jnp.all(pool.conv_buffers[0][0][slot] == jnp.bfloat16(3.5))))
+            self.assertTrue(bool(jnp.all(pool.recurrent_buffers[1][slot] == 7.0)))
+            self.assertTrue(bool(jnp.all(pool.conv_buffers[1][0][slot] == jnp.bfloat16(7.5))))
 
 
 class TestJitMultiLayerSharingContract(_Base):
-    """Inside JIT: layer N+1 must see layer N's set_linear_recurrent_layer_cache write
-    via get_linear_recurrent_layer_cache, when both share the same RecurrentStatePool.
-
-    This is the multi-layer contract that makes list element mutation mandatory
-    (see set_linear_recurrent_layer_cache docstring).
+    """RFC-0015 functional contract under JIT: the model layer collects
+    per-layer backend outputs into ``(layers_recurrent, layers_conv)`` and
+    returns them. Each layer's contribution must be preserved (no layer drops
+    out) when the pool is later updated via replace_buffer. This replaces the
+    earlier "layer N+1 reads layer N's setter write" contract, which no
+    longer holds since the setter is gone.
     """
 
-    def test_layer_n_plus_1_reads_layer_n_write_inside_jit(self):
+    def test_per_layer_updates_all_persist_via_replace_buffer(self):
         import functools
 
         pool = self._make(linear_recurrent_layer_ids=[3, 7])
 
         @functools.partial(jax.jit, donate_argnames=["sp"])
         def two_layer_forward(sp):
-            # Layer 3 (local idx 0): set slot 1 to constant 10.
-            sp.set_linear_recurrent_layer_cache(
-                layer_id=3,
-                indices=jnp.asarray([1], dtype=jnp.int32),
-                new_recurrent=jnp.full((1, 2, 4, 4), 10.0, dtype=jnp.float32),
-                new_conv=[jnp.zeros((1, 3, 24), dtype=jnp.bfloat16)],
-            )
-            # Layer 7 (local idx 1): MUST read layer 3's update via get.
-            rec3, _ = sp.get_linear_recurrent_layer_cache(3)
-            layer3_value = rec3[1, 0, 0, 0]  # should be 10.0
-            sp.set_linear_recurrent_layer_cache(
-                layer_id=7,
-                indices=jnp.asarray([1], dtype=jnp.int32),
-                new_recurrent=jnp.full((1, 2, 4, 4), layer3_value + 5.0, dtype=jnp.float32),
-                new_conv=[jnp.zeros((1, 3, 24), dtype=jnp.bfloat16)],
-            )
-            return sp.recurrent_buffers, sp.conv_buffers
+            # Mirror the model-level loop: per layer, read -> functional update
+            # -> append the new buffer to the per-layer list. The pool itself
+            # is never written to inside the JIT trace.
+            layer_ids = [3, 7]
+            layers_recurrent = []
+            layers_conv = []
+            for layer_id in layer_ids:
+                cur_recurrent, cur_conv = sp.get_linear_recurrent_layer_cache(layer_id)
+                indices = jnp.asarray([1], dtype=jnp.int32)
+                new_state = jnp.full((1, 2, 4, 4), float(layer_id), dtype=jnp.float32)
+                new_conv = jnp.full(
+                    (1, 3, 24), jnp.bfloat16(float(layer_id) + 0.5), dtype=jnp.bfloat16
+                )
+                layers_recurrent.append(cur_recurrent.at[indices].set(new_state))
+                layers_conv.append([cur_conv[0].at[indices].set(new_conv)])
+            return layers_recurrent, layers_conv
 
-        new_recurrent, new_conv = two_layer_forward(pool)
-        pool.replace_buffer((new_recurrent, new_conv))
-        # Layer 3 / slot 1 = 10
-        self.assertEqual(float(pool.recurrent_buffers[0][1, 0, 0, 0]), 10.0)
-        # Layer 7 / slot 1 = 10 + 5 = 15 (proves layer 7 read layer 3's write).
-        self.assertEqual(float(pool.recurrent_buffers[1][1, 0, 0, 0]), 15.0)
+        layers_recurrent, layers_conv = two_layer_forward(pool)
+        pool.replace_buffer((layers_recurrent, layers_conv))
+
+        # Both layers' updates must be visible after replace_buffer
+        # (proves the model-layer collection did not drop earlier layers).
+        self.assertEqual(float(pool.recurrent_buffers[0][1, 0, 0, 0]), 3.0)
+        self.assertEqual(float(pool.recurrent_buffers[1][1, 0, 0, 0]), 7.0)
+        self.assertEqual(float(pool.conv_buffers[0][0][1, 0, 0]), 3.5)
+        self.assertEqual(float(pool.conv_buffers[1][0][1, 0, 0]), 7.5)
 
 
 if __name__ == "__main__":

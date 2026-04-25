@@ -364,12 +364,12 @@ class TestHybridReqToTokenPoolGetRecurrentIndices(unittest.TestCase):
         )
         return pool, rsp
 
-    def test_get_recurrent_indices_via_mapping(self):
+    def test_get_linear_recurrent_indices_via_mapping(self):
         pool, rsp = self._make()
         reqs = [_make_req(), _make_req()]
         pool.alloc(reqs)
         req_pool_indices = np.array([reqs[0].req_pool_idx, reqs[1].req_pool_idx])
-        recurrent_indices = pool.get_recurrent_indices(req_pool_indices)
+        recurrent_indices = pool.get_linear_recurrent_indices(req_pool_indices)
         self.assertEqual(recurrent_indices[0], reqs[0].recurrent_pool_idx)
         self.assertEqual(recurrent_indices[1], reqs[1].recurrent_pool_idx)
 

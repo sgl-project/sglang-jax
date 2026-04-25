@@ -272,8 +272,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = 0
         req.recurrent_pool_idx = None
 
-    def get_recurrent_indices(self, req_pool_indices):
-        """Look up recurrent slot indices via the CPU-side mapping table.
+    def get_linear_recurrent_indices(self, req_pool_indices):
+        """Look up linear recurrent slot indices via the CPU-side mapping table.
 
         Accepts an np.ndarray (or list[int]) of req_pool_idx and returns
         the same-shape np.ndarray of recurrent_pool_idx values.
@@ -590,6 +590,12 @@ class MHATokenToKVPool(KVCache):
         )
 
     def replace_buffer(self, fused_kv_buffer: list[jax.Array]) -> None:
+        # tp_size==1 sharding fix (issue #233): NamedSharding constraint can be
+        # lost on JIT output; explicit device_put with self.kv_sharding restores
+        # it before the slice assign so the next JIT trace sees a stable shape.
+        # Mirrors RecurrentStatePool.replace_buffer (Phase 1) per-element fix.
+        if hasattr(self, "kv_sharding") and len(self.kv_sharding.device_set) == 1:
+            fused_kv_buffer = [jax.device_put(buf, self.kv_sharding) for buf in fused_kv_buffer]
         self.kv_buffer[self.start_layer : self.start_layer + len(fused_kv_buffer)] = fused_kv_buffer
 
     def get_cpu_copy(self, indices):
@@ -1222,6 +1228,12 @@ class MLATokenToKVPool(KVCache):
         )
 
     def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
+        # tp_size==1 sharding fix (issue #233): NamedSharding constraint can be
+        # lost on JIT output; explicit device_put with self.kv_sharding restores
+        # it before the slice assign so the next JIT trace sees a stable shape.
+        # Mirrors RecurrentStatePool.replace_buffer (Phase 1) per-element fix.
+        if hasattr(self, "kv_sharding") and len(self.kv_sharding.device_set) == 1:
+            kv_buffer = [jax.device_put(buf, self.kv_sharding) for buf in kv_buffer]
         self.kv_buffer[self.start_layer : self.start_layer + len(kv_buffer)] = kv_buffer
 
     def get_cpu_copy(self, indices):

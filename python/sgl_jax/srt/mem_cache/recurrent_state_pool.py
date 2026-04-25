@@ -7,7 +7,7 @@ Design reference: RFC-0015 §RecurrentStatePool (v2, list containers; layer_id-k
 - Slot 0 is reserved as dummy; valid slots start from 1 (aligned with sglang PyTorch MambaPool).
 - Does NOT inherit from KVCache (KVCache abstract methods are meaningless for recurrent state).
 - Outer list is keyed by local 0..L-1 internally; the public API
-  (get_/set_linear_recurrent_layer_cache) accepts the model-global layer_id and
+  (get_linear_recurrent_layer_cache) accepts the model-global layer_id and
   translates via self.layers_mapping. Mirrors sgl-jax SWAKVPool's
   swa_attention_layer_ids / layers_mapping pattern.
 - Naming is generic (linear_recurrent_*) to allow Mamba / GDN reuse beyond KDA.
@@ -62,7 +62,7 @@ class RecurrentStatePool:
         # linear_recurrent_layer_ids: model-global layer ids of linear recurrent layers
         # (KDA / Mamba / GDN ...); duplicates are not allowed since they would collide
         # in layers_mapping. layers_mapping: global layer_id -> local 0..L-1 index;
-        # used internally so the public get_/set_linear_recurrent_layer_cache API can
+        # used internally so the public get_linear_recurrent_layer_cache API can
         # accept a global layer_id. Mirrors sgl-jax SWAKVPool's
         # swa_attention_layer_ids / layers_mapping pattern.
         assert len(set(linear_recurrent_layer_ids)) == len(linear_recurrent_layer_ids), (
@@ -168,11 +168,14 @@ class RecurrentStatePool:
         list elements themselves (no copy; `is` relation holds with
         recurrent_buffers[idx] / conv_buffers[idx]).
 
-        External consumers (e.g., the linear recurrent attention backend) MUST
-        go through this method and the matching set_linear_recurrent_layer_cache
-        instead of indexing recurrent_buffers / conv_buffers directly. This
-        matches the existing KV pool convention (attention backends never
-        touch kv_buffer directly).
+        Consumers (e.g., the linear recurrent attention backend) read with this
+        method, then update functionally by doing
+        ``new_layer = cur_layer.at[indices].set(new_state)`` and returning the
+        new buffer up to the model layer (which collects per-layer outputs into
+        ``(layers_recurrent, layers_conv)`` and hands them to
+        ``MemoryPools.replace_all`` outside the JIT). No setter method is
+        exposed: the pool's internal lists are only swapped via
+        ``replace_buffer``, so backend calls have no side effect on the pool.
         """
         if layer_id not in self.layers_mapping:
             raise ValueError(
@@ -181,44 +184,6 @@ class RecurrentStatePool:
             )
         idx = self.layers_mapping[layer_id]
         return self.recurrent_buffers[idx], self.conv_buffers[idx]
-
-    def set_linear_recurrent_layer_cache(
-        self,
-        layer_id: int,
-        indices,
-        new_recurrent,
-        new_conv,
-    ):
-        """Write back the per-layer cache, keyed by model-global layer_id.
-
-        Mirrors sgl-jax KV pool set_kv_buffer. Performs list element mutation
-        internally on both recurrent_buffers[idx] and each conv_buffers[idx][i].
-
-        **Why list element mutation matters**: list is a mutable Python container,
-        and multiple layers share the same RecurrentStatePool instance. After
-        layer N writes via this method, layer N+1 reads the updated value via
-        get_linear_recurrent_layer_cache (because both see the same list slot).
-        If the implementation accidentally assigned to a local variable instead
-        of writing back into the list, layers 0..N-1 updates would silently be
-        lost in a multi-layer forward.
-
-        new_conv must be a list whose length equals the inner length of
-        conv_buffers[idx] (currently always 1); the assert guards against
-        future multi-conv-segment misuse.
-        """
-        if layer_id not in self.layers_mapping:
-            raise ValueError(
-                f"layer_id={layer_id} is not a registered linear recurrent layer. "
-                f"Registered: {self.linear_recurrent_layer_ids}"
-            )
-        idx = self.layers_mapping[layer_id]
-        self.recurrent_buffers[idx] = self.recurrent_buffers[idx].at[indices].set(new_recurrent)
-        assert len(new_conv) == len(self.conv_buffers[idx]), (
-            f"new_conv length {len(new_conv)} mismatches conv_buffers[{idx}] inner length "
-            f"{len(self.conv_buffers[idx])}"
-        )
-        for i, new_c in enumerate(new_conv):
-            self.conv_buffers[idx][i] = self.conv_buffers[idx][i].at[indices].set(new_c)
 
     def replace_buffer(self, buffers) -> None:
         """Update both buffer-list references after a JIT donate.
