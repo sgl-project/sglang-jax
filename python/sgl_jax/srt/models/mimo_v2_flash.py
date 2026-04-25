@@ -10,6 +10,7 @@ from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.debug_utils.hidden_state_dump_hook import get_hidden_state_dumper
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import RMSNorm
@@ -26,6 +27,8 @@ from sgl_jax.srt.utils.weight_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+hs_dumper = get_hidden_state_dumper()
 
 
 class MiMoV2MLP(nnx.Module):
@@ -252,9 +255,15 @@ class MiMoV2Attention(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ) -> tuple[jax.Array, jax.Array]:
+        lid = self.layer_id
+
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
+
+        hs_dumper.dump("attn_q_before_rope", q, layer_id=lid)
+        hs_dumper.dump("attn_k_before_rope", k, layer_id=lid)
+        hs_dumper.dump("attn_v_before_rope", v, layer_id=lid)
 
         q = q.reshape(-1, self.q_head_num, self.head_dim)
         k = k.reshape(-1, k.shape[-1] // self.head_dim, self.head_dim)
@@ -265,8 +274,14 @@ class MiMoV2Attention(nnx.Module):
             v = jnp.pad(v, ((0, 0), (0, 0), (0, pad_size)))
 
         q, k = self.rotary_emb(positions, q, k)
+
+        hs_dumper.dump("attn_q_after_rope", q, layer_id=lid)
+        hs_dumper.dump("attn_k_after_rope", k, layer_id=lid)
+
         if self.attention_value_scale is not None:
             v = v * self.attention_value_scale
+
+        hs_dumper.dump("attn_v_after_scale", v, layer_id=lid)
 
         attn_output, kv_fused = self.attn(
             q,
@@ -287,7 +302,12 @@ class MiMoV2Attention(nnx.Module):
                 attn_output = attn_output[..., : self.v_head_dim]
                 attn_output = attn_output.reshape(-1, expected_v_head_dim)
 
+        hs_dumper.dump("attn_output_before_o_proj", attn_output, layer_id=lid)
+
         output, _ = self.o_proj(attn_output)
+
+        hs_dumper.dump("attn_output_after_o_proj", output, layer_id=lid)
+
         return output, kv_fused
 
 
@@ -380,6 +400,12 @@ class MiMoV2DecoderLayer(nnx.Module):
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
+        lid = self.layer_id
+
+        hs_dumper.dump("hidden_states_input", hidden_states, layer_id=lid)
+        if residual is not None:
+            hs_dumper.dump("residual_input", residual, layer_id=lid)
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -388,6 +414,9 @@ class MiMoV2DecoderLayer(nnx.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
+        hs_dumper.dump("after_input_layernorm", hidden_states, layer_id=lid)
+        hs_dumper.dump("after_input_layernorm_residual", residual, layer_id=lid)
+
         hidden_states, kv_fused = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -395,9 +424,16 @@ class MiMoV2DecoderLayer(nnx.Module):
             token_to_kv_pool=token_to_kv_pool,
         )
 
+        # NOTE: In JAX SPMD, self_attn output is post-all-reduce (full hidden_size).
+        # GPU dumps after_self_attn pre-all-reduce (hidden_size / tp_size).
+        hs_dumper.dump("after_self_attn", hidden_states, layer_id=lid)
+
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+
+        hs_dumper.dump("after_post_attn_layernorm", hidden_states, layer_id=lid)
+        hs_dumper.dump("after_post_attn_layernorm_residual", residual, layer_id=lid)
 
         if self.is_layer_sparse:
             mlp_output, topk_ids = self.mlp(hidden_states, forward_batch)
@@ -405,7 +441,15 @@ class MiMoV2DecoderLayer(nnx.Module):
             mlp_output = self.mlp(hidden_states)
             topk_ids = None
 
+        # NOTE: In JAX SPMD, mlp output is post-all-reduce (full hidden_size).
+        # GPU dumps after_mlp pre-all-reduce (hidden_size / tp_size).
+        hs_dumper.dump("after_mlp", mlp_output, layer_id=lid)
+
         hidden_states = mlp_output
+
+        hs_dumper.dump("hidden_states_output", hidden_states, layer_id=lid)
+        hs_dumper.dump("residual_output", residual, layer_id=lid)
+
         return hidden_states, residual, kv_fused, topk_ids
 
     def _is_moe_layer(self, config) -> bool:
@@ -460,6 +504,8 @@ class MiMoV2Model(nnx.Module):
         residual = None
         hidden_states = self.embed_tokens(forward_batch.input_ids)
 
+        hs_dumper.dump("embedding_output", hidden_states)
+
         layers_kv_fused = []
         layers_topk_ids = []
 
@@ -477,7 +523,12 @@ class MiMoV2Model(nnx.Module):
         if residual is not None:
             hidden_states += residual
 
+        hs_dumper.dump("before_final_norm", hidden_states)
+
         hidden_states = self.norm(hidden_states)
+
+        hs_dumper.dump("final_norm_output", hidden_states)
+
         return hidden_states, layers_kv_fused, layers_topk_ids
 
 
@@ -797,6 +848,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         ]:
             hf_key = f"{prefix}.self_attn.{proj}"
             ignored = self._is_quant_ignored(hf_key)
+            use_quant = is_fp8 and not ignored
             weight_suffix = "weight" if (not is_fp8 or ignored) else "weight_q"
 
             mappings[f"{hf_key}.weight"] = WeightMapping(
