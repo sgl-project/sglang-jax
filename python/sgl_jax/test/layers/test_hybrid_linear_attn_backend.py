@@ -20,8 +20,8 @@ from sgl_jax.srt.layers.attention.base_attn_backend import (
     AttentionBackendMetadata,
 )
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
-    HybridLinearAttentionBackendMetadata,
     HybridLinearAttnBackend,
+    HybridLinearAttnBackendMetadata,
     LinearRecurrentAttnBackend,
     LinearRecurrentAttnBackendMetadata,
     attn_backend_wrapper,
@@ -37,11 +37,11 @@ class _FakeFullMetadata(AttentionBackendMetadata):
     tag: str = "full"
 
     def tree_flatten(self):
-        return (), self.tag
+        return (), {"tag": self.tag}
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        return cls(tag=aux_data)
+        return cls(tag=aux_data["tag"])
 
 
 @dataclass
@@ -154,7 +154,7 @@ def _qkv():
 
 def test_module_imports():
     assert HybridLinearAttnBackend is not None
-    assert HybridLinearAttentionBackendMetadata is not None
+    assert HybridLinearAttnBackendMetadata is not None
     assert LinearRecurrentAttnBackend is not None
     assert LinearRecurrentAttnBackendMetadata is not None
     assert callable(attn_backend_wrapper)
@@ -207,7 +207,7 @@ class TestGetForwardMetadata:
 
         meta = hybrid.get_forward_metadata(batch)
 
-        assert isinstance(meta, HybridLinearAttentionBackendMetadata)
+        assert isinstance(meta, HybridLinearAttnBackendMetadata)
         assert meta.full_attn_metadata == full.get_forward_metadata(batch)
         assert meta.linear_attn_metadata == linear.get_forward_metadata(batch)
 
@@ -219,8 +219,8 @@ class TestGetForwardMetadata:
         assert meta.linear_attn_metadata.tag == "linear-from-step42"
 
     def test_metadata_pytree_aux_is_empty_dict(self):
-        # tree_flatten on HybridLinearAttentionBackendMetadata returns ((...), {})
-        meta = HybridLinearAttentionBackendMetadata(
+        # tree_flatten on HybridLinearAttnBackendMetadata returns ((...), {})
+        meta = HybridLinearAttnBackendMetadata(
             full_attn_metadata=_FakeFullMetadata(tag="x"),
             linear_attn_metadata=_FakeLinearMetadata(tag="y"),
         )
@@ -240,7 +240,7 @@ class TestForwardMetadataSetter:
 
         fm = _FakeFullMetadata(tag="injected-full")
         lm = _FakeLinearMetadata(tag="injected-linear")
-        value = HybridLinearAttentionBackendMetadata(
+        value = HybridLinearAttnBackendMetadata(
             full_attn_metadata=fm,
             linear_attn_metadata=lm,
         )
@@ -253,11 +253,11 @@ class TestForwardMetadataSetter:
 
     def test_setter_overwrites_previous_value(self):
         hybrid, full, linear = _make_hybrid()
-        v1 = HybridLinearAttentionBackendMetadata(
+        v1 = HybridLinearAttnBackendMetadata(
             full_attn_metadata=_FakeFullMetadata(tag="a"),
             linear_attn_metadata=_FakeLinearMetadata(tag="a"),
         )
-        v2 = HybridLinearAttentionBackendMetadata(
+        v2 = HybridLinearAttnBackendMetadata(
             full_attn_metadata=_FakeFullMetadata(tag="b"),
             linear_attn_metadata=_FakeLinearMetadata(tag="b"),
         )
@@ -371,7 +371,7 @@ class TestPytreeRoundtrip:
         leaves, treedef = jax.tree_util.tree_flatten(hybrid)
         rebuilt = jax.tree_util.tree_unflatten(treedef, leaves)
         assert rebuilt.full_attn_layers == hybrid.full_attn_layers
-        assert isinstance(rebuilt._forward_metadata, HybridLinearAttentionBackendMetadata)
+        assert isinstance(rebuilt._forward_metadata, HybridLinearAttnBackendMetadata)
 
 
 # ---------------------------------------------------------------------------
@@ -543,7 +543,7 @@ class TestTwoLayerForwardOrdering:
         hybrid, full, linear = _make_hybrid(full_layers=(0,))
         q, k, v = _qkv()
 
-        hybrid.forward_metadata = HybridLinearAttentionBackendMetadata(
+        hybrid.forward_metadata = HybridLinearAttnBackendMetadata(
             full_attn_metadata=_FakeFullMetadata(tag="step-full"),
             linear_attn_metadata=_FakeLinearMetadata(tag="step-linear"),
         )

@@ -68,7 +68,7 @@ class LinearRecurrentAttnBackend(AttentionBackend):
 
 @register_pytree_node_class
 @dataclass
-class HybridLinearAttentionBackendMetadata:
+class HybridLinearAttnBackendMetadata:
     """Aggregate metadata returned by HybridLinearAttnBackend.get_forward_metadata.
 
     The setter on HybridLinearAttnBackend.forward_metadata unpacks these two
@@ -103,10 +103,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         # Stored as a frozenset so membership checks are O(1) and the value is
         # hashable (safe to use as pytree aux_data).
         self.full_attn_layers = frozenset(full_attn_layers)
-        self._forward_metadata = nnx.data(HybridLinearAttentionBackendMetadata())
+        self._forward_metadata = nnx.data(HybridLinearAttnBackendMetadata())
 
     def get_forward_metadata(self, batch):
-        return HybridLinearAttentionBackendMetadata(
+        return HybridLinearAttnBackendMetadata(
             full_attn_metadata=self.full_attn_backend.get_forward_metadata(batch),
             linear_attn_metadata=self.linear_attn_backend.get_forward_metadata(batch),
         )
@@ -116,7 +116,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         return self._forward_metadata
 
     @forward_metadata.setter
-    def forward_metadata(self, value: HybridLinearAttentionBackendMetadata):
+    def forward_metadata(self, value: HybridLinearAttnBackendMetadata):
         self._forward_metadata = value
         self.full_attn_backend.forward_metadata = value.full_attn_metadata
         self.linear_attn_backend.forward_metadata = value.linear_attn_metadata
