@@ -1,11 +1,3 @@
-"""Kimi-Linear-48B-A3B-Instruct model implementation.
-
-Hybrid architecture: MLA (Multi-Latent Attention) + KDA (Key-Delta Attention)
-with MoE (Mixture of Experts) sparse FFN.
-
-Reference: https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct
-"""
-
 import logging
 
 import jax
@@ -18,10 +10,11 @@ from sgl_jax.srt.configs.model_config import AttentionArch, ModelConfig
 from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
 from sgl_jax.srt.layers.attention.mla import MLAAttention
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
+from sgl_jax.srt.layers.gate import GateLogit, TopK
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK, create_moe_weights_mapping
+from sgl_jax.srt.layers.moe import EPMoE, create_moe_weights_mapping
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -29,19 +22,149 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 logger = logging.getLogger(__name__)
 
 
-class KimiMLP(nnx.Module):
-    """SwiGLU MLP used for dense layers and shared experts."""
+class KimiLinearConfig(PretrainedConfig):
+    # https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Base/blob/main/configuration_kimi.py
+    model_type = "kimi_linear"
+    keys_to_ignore_at_inference = ["past_key_values"]
 
+    def __init__(
+        self,
+        model_type="kimi_linear",
+        vocab_size=163840,
+        hidden_size=4096,
+        head_dim=None,
+        intermediate_size=11008,
+        num_hidden_layers=32,
+        num_attention_heads=32,
+        num_key_value_heads=None,
+        hidden_act="silu",
+        initializer_range=0.02,
+        rms_norm_eps=1e-6,
+        use_cache=True,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        rope_theta=10000.0,
+        rope_scaling=None,
+        tie_word_embeddings=False,
+        moe_intermediate_size: int | None = None,
+        moe_renormalize: bool = True,
+        moe_router_activation_func: str = "sigmoid",
+        num_experts: int | None = None,
+        num_experts_per_token: int | None = None,
+        num_shared_experts: int = 0,
+        routed_scaling_factor: float = 1.0,
+        first_k_dense_replace: int = 0,
+        moe_layer_freq: int = 1,
+        use_grouped_topk: bool = True,
+        num_expert_group: int = 1,
+        topk_group: int = 1,
+        q_lora_rank: int | None = None,
+        kv_lora_rank: int | None = None,
+        qk_nope_head_dim: int | None = None,
+        qk_rope_head_dim: int | None = None,
+        v_head_dim: int | None = None,
+        mla_use_nope: bool | None = False,
+        num_nextn_predict_layers: int = 0,
+        linear_attn_config: dict | None = None,
+        **kwargs,
+    ):
+        self.model_type = model_type
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+
+        if num_key_value_heads is None:
+            num_key_value_heads = num_attention_heads
+
+        self.num_key_value_heads = num_key_value_heads
+        self.hidden_act = hidden_act
+        self.initializer_range = initializer_range
+        self.rms_norm_eps = rms_norm_eps
+        self.use_cache = use_cache
+        self.rope_theta = rope_theta
+        self.rope_scaling = rope_scaling
+
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+        self.mla_use_nope = mla_use_nope
+
+        self.num_experts = num_experts
+        self.num_experts_per_token = num_experts_per_token
+        self.moe_renormalize = moe_renormalize
+        self.num_shared_experts = num_shared_experts
+        self.routed_scaling_factor = routed_scaling_factor
+        self.moe_router_activation_func = moe_router_activation_func
+        assert self.moe_router_activation_func in ("softmax", "sigmoid")
+        self.moe_intermediate_size = moe_intermediate_size
+        self.first_k_dense_replace = first_k_dense_replace
+        self.moe_layer_freq = moe_layer_freq
+        self.use_grouped_topk = use_grouped_topk
+        self.num_expert_group = num_expert_group
+        self.topk_group = topk_group
+        self.num_nextn_predict_layers = num_nextn_predict_layers
+
+        if linear_attn_config is not None:
+            assert linear_attn_config["kda_layers"] is not None
+            assert linear_attn_config["full_attn_layers"] is not None
+        self.linear_attn_config = linear_attn_config
+
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs,
+        )
+
+    @property
+    def is_mla(self):
+        return (
+            self.q_lora_rank is not None
+            or self.kv_lora_rank is not None
+            or self.qk_nope_head_dim is not None
+            or self.qk_rope_head_dim is not None
+            or self.v_head_dim is not None
+            or self.mla_use_nope is True
+        )
+
+    @property
+    def is_moe(self):
+        return self.num_experts is not None
+
+    @property
+    def is_linear_attn(self) -> bool:
+        return not (
+            self.linear_attn_config is None
+            or (
+                isinstance(self.linear_attn_config, dict)
+                and self.linear_attn_config["kda_layers"] is not None
+                and len(self.linear_attn_config["kda_layers"]) == 0
+            )
+        )
+
+    def is_kda_layer(self, layer_idx: int):
+        return (
+            self.linear_attn_config is not None
+            and (layer_idx + 1) in self.linear_attn_config["kda_layers"]
+        )
+
+
+class KimiMLP(nnx.Module):
     def __init__(
         self,
         hidden_size: int,
         intermediate_size: int,
         mesh: jax.sharding.Mesh,
-        layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
-    ) -> None:
-        self.layer_id = layer_id
-
+    ):
+        super().__init__()
         self.gate_proj = LinearBase(
             input_size=hidden_size,
             output_size=intermediate_size,
@@ -51,7 +174,6 @@ class KimiMLP(nnx.Module):
             mesh=mesh,
             scope_name="gate_proj",
         )
-
         self.up_proj = LinearBase(
             input_size=hidden_size,
             output_size=intermediate_size,
@@ -61,7 +183,6 @@ class KimiMLP(nnx.Module):
             mesh=mesh,
             scope_name="up_proj",
         )
-
         self.down_proj = LinearBase(
             input_size=intermediate_size,
             output_size=hidden_size,
@@ -72,127 +193,203 @@ class KimiMLP(nnx.Module):
             scope_name="down_proj",
         )
 
-        self.act_fn = jax.nn.silu
-
     def __call__(self, hidden_states: jax.Array) -> jax.Array:
         gate, _ = self.gate_proj(hidden_states)
         up, _ = self.up_proj(hidden_states)
-        output, _ = self.down_proj(up * self.act_fn(gate))
+        output, _ = self.down_proj(jax.nn.silu(gate) * up)
         return output
 
 
-class KimiDecoderLayer(nnx.Module):
-    """Single decoder layer with MLA/KDA attention dispatch and dense/MoE FFN dispatch."""
+class KimiMoE(nnx.Module):
+    shared_experts: KimiMLP | None
+    moe_gate: GateLogit
+    topk: TopK
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        layer_id: int,
+        config: KimiLinearConfig,
         mesh: jax.sharding.Mesh,
-        layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
-        self.layer_id = layer_id
-        self.hidden_size = config.hidden_size
-        self.is_kda = _is_kda_layer(config, layer_id)
+        super().__init__()
+        self.moe_layer = config.is_moe
+        # Gate
+        # https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Base/blob/main/modeling_kimi.py#L532
+        self.moe_gate = GateLogit(
+            input_size=config.hidden_size,
+            num_experts=config.num_experts,
+            enable_expert_bias=True,  # 这里怎么填
+            weight_dtype=dtype,
+            score_func=config.moe_router_activation_func,
+        )
 
-        # --- Attention ---
-        if self.is_kda:
-            self.self_attn = None  # KDA not yet implemented
-        else:
-            rope_scaling = getattr(config, "rope_scaling", None)
-            self.self_attn = MLAAttention(
+        # TopK routing
+        self.topk = TopK(
+            topk=config.num_experts_per_token,
+            renormalize=config.moe_renormalize,
+            num_expert_group=config.num_expert_group,
+            topk_group=config.topk_group,
+            routed_scaling_factor=config.routed_scaling_factor,
+            layer_idx=layer_id,
+        )
+
+        self.experts = EPMoE(
+            hidden_size=config.hidden_size,
+            num_experts=config.num_experts,
+            num_experts_per_tok=config.num_experts_per_token,
+            intermediate_dim=config.moe_intermediate_size,
+            mesh=mesh,
+            weight_dtype=dtype,
+            dtype=dtype,
+            layer_id=layer_id,
+            ep_size=config.ep_size,
+        )
+
+        if config.num_shared_experts > 0:
+            self.shared_experts = KimiMLP(
                 hidden_size=config.hidden_size,
-                num_heads=config.num_attention_heads,
-                q_lora_rank=config.q_lora_rank,
-                kv_lora_rank=config.kv_lora_rank,
-                qk_nope_head_dim=config.qk_nope_head_dim,
-                qk_rope_head_dim=config.qk_rope_head_dim,
-                v_head_dim=config.v_head_dim,
+                intermediate_size=config.moe_intermediate_size * config.num_shared_experts,
                 mesh=mesh,
-                layer_id=layer_id,
-                rope_theta=getattr(config, "rope_theta", 10000.0),
-                rope_scaling=rope_scaling,
-                rope_interleave=getattr(config, "rope_interleave", True),
-                max_position_embeddings=getattr(config, "max_position_embeddings", 163840),
                 dtype=dtype,
             )
+        else:
+            self.shared_experts = None
 
-        # --- FFN ---
-        first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
-        if layer_id < first_k_dense_replace:
-            # Dense MLP (layer 0)
-            self.is_moe_layer = False
+    def __call__(self, hidden_states: jax.Array, dispatch_info=None) -> tuple[jax.Array, jax.Array]:
+        if self.shared_experts is not None:
+            shared_output = self.shared_experts(hidden_states)
+
+        router_logits = self.moe_gate(hidden_states)
+        correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
+        topk_weights, topk_ids = self.topk(
+            router_logits, correction_bias, dispatch_info=dispatch_info
+        )
+        hidden_states = self.experts(hidden_states, topk_weights, topk_ids)
+
+        if self.shared_experts is not None:
+            hidden_states = hidden_states + shared_output
+
+        return hidden_states, topk_ids
+
+
+class KimiMLAAttention(nnx.Module):
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        mesh: jax.sharding.Mesh,
+        dtype: jnp.dtype = jnp.bfloat16,
+        layer_id: int = 0,
+    ) -> None:
+        super().__init__()
+
+        self.mesh = mesh
+        self.dtype = dtype
+        self.layer_id = layer_id
+
+        self.self_attn = MLAAttention(
+            hidden_size=config.hidden_size,
+            num_heads=config.num_attention_heads,
+            q_lora_rank=config.q_lora_rank,
+            kv_lora_rank=config.kv_lora_rank,
+            qk_nope_head_dim=config.qk_nope_head_dim,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            v_head_dim=config.v_head_dim,
+            mesh=mesh,
+            layer_id=layer_id,
+            rope_theta=config.rope_theta,
+            rope_scaling=config.rope_scaling,
+            rope_interleave=True,
+            dtype=dtype,
+        )
+
+    def __call__(
+        self,
+        positions: jax.Array,
+        hidden_states: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+    ) -> tuple[jax.Array, jax.Array]:
+        return self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+        )
+
+
+class KimiDeltaAttention(nnx.Module):
+    """Placeholder for KDA (linear attention). Not yet implemented."""
+
+    def __init__(self, layer_idx: int, hidden_size: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.hidden_size = hidden_size
+
+    def __call__(
+        self,
+        positions: jax.Array,
+        hidden_states: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+    ) -> tuple[jax.Array, None]:
+        raise NotImplementedError("KimiDeltaAttention (KDA) is not yet implemented")
+
+
+class KimiDecoderLayer(nnx.Module):
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        mesh: jax.sharding.Mesh,
+        layer_idx: int,
+        dtype: jnp.dtype = jnp.bfloat16,
+    ):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.is_kda = config.is_kda_layer(layer_idx)
+
+        # Attention
+        if self.is_kda:
+            self.self_attn = KimiDeltaAttention(
+                layer_idx=layer_idx,
+                hidden_size=config.hidden_size,
+            )
+        else:
+            self.self_attn = KimiMLAAttention(
+                config=config,
+                mesh=mesh,
+                dtype=dtype,
+                layer_id=layer_idx,
+            )
+
+        # FFN
+        if (
+            config.is_moe
+            and layer_idx >= config.first_k_dense_replace
+            and layer_idx % config.moe_layer_freq == 0
+        ):
+            self.block_sparse_moe = KimiMoE(
+                layer_id=layer_idx,
+                config=config,
+                mesh=mesh,
+                dtype=dtype,
+            )
+            self.mlp = self.block_sparse_moe
+        else:
             self.mlp = KimiMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 mesh=mesh,
-                layer_id=layer_id,
                 dtype=dtype,
             )
-            self.moe_gate = None
-        else:
-            # MoE (layers 1-26)
-            self.is_moe_layer = True
-            self.mlp = None
-
-            self.moe_gate = GateLogit(
-                input_size=config.hidden_size,
-                num_experts=config.num_experts,
-                enable_expert_bias=True,
-                score_func="sigmoid",
-            )
-
-            self.topk = TopK(
-                topk=config.num_experts_per_token,
-                renormalize=getattr(config, "moe_renormalize", False),
-                num_expert_group=getattr(config, "num_expert_group", 1),
-                topk_group=getattr(config, "topk_group", 1),
-                routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
-                layer_id=layer_id,
-            )
-
-            self.block_sparse_moe = EPMoE(
-                hidden_size=config.hidden_size,
-                num_experts=config.num_experts,
-                num_experts_per_tok=config.num_experts_per_token,
-                intermediate_dim=config.moe_intermediate_size,
-                mesh=mesh,
-                ep_size=config.ep_size,
-                weight_dtype=dtype,
-                dtype=dtype,
-                layer_id=layer_id,
-                quantization_config=getattr(config, "quantization_config", None),
-            )
-
-            num_shared_experts = getattr(config, "num_shared_experts", 0)
-            if num_shared_experts > 0:
-                shared_intermediate = (
-                    getattr(
-                        config,
-                        "moe_shared_expert_intermediate_size",
-                        config.moe_intermediate_size,
-                    )
-                    * num_shared_experts
-                )
-                self.shared_experts = KimiMLP(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=shared_intermediate,
-                    mesh=mesh,
-                    layer_id=layer_id,
-                    dtype=dtype,
-                )
-            else:
-                self.shared_experts = None
-
-        # --- Layer Norms ---
         self.input_layernorm = RMSNorm(
-            config.hidden_size,
-            epsilon=getattr(config, "rms_norm_eps", 1e-6),
+            hidden_size=config.hidden_size,
+            epsilon=config.rms_norm_eps,
             param_dtype=jnp.float32,
         )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size,
-            epsilon=getattr(config, "rms_norm_eps", 1e-6),
+            hidden_size=config.hidden_size,
+            epsilon=config.rms_norm_eps,
             param_dtype=jnp.float32,
         )
 
@@ -204,7 +401,7 @@ class KimiDecoderLayer(nnx.Module):
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
         dispatch_info: ExpertLocationMetadata | None = None,
-    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
+    ):
         # Pre-norm residual pattern
         if residual is None:
             residual = hidden_states
@@ -215,39 +412,20 @@ class KimiDecoderLayer(nnx.Module):
             hidden_states = self.input_layernorm(hidden_states)
 
         # Attention
-        if self.is_kda:
-            raise NotImplementedError(f"KDA attention not yet implemented (layer {self.layer_id})")
-        else:
-            hidden_states, kv_fused = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                token_to_kv_pool=token_to_kv_pool,
-            )
-
+        hidden_states, kv_fused = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+        )
+        # Post-attention residual + norm
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        # FFN
-        if self.is_moe_layer:
-            if self.shared_experts is not None:
-                shared_output = self.shared_experts(hidden_states)
-            else:
-                shared_output = None
-
-            router_logits = self.moe_gate(hidden_states)
-            correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
-            topk_weights, topk_ids = self.topk(
-                router_logits,
-                correction_bias,
-                dispatch_info=dispatch_info,
-            )
-
-            hidden_states = self.block_sparse_moe(hidden_states, topk_weights, topk_ids)
-
-            if shared_output is not None:
-                hidden_states = hidden_states + shared_output
+        # Fully Connected
+        if isinstance(self.mlp, KimiMoE):
+            hidden_states, topk_ids = self.mlp(hidden_states, dispatch_info=dispatch_info)
         else:
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
@@ -256,16 +434,13 @@ class KimiDecoderLayer(nnx.Module):
 
 
 class KimiLinearModel(nnx.Module):
-    """Kimi-Linear transformer model (without lm_head)."""
-
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: KimiLinearConfig,
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-    ):
+    ) -> None:
         self.config = config
-        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = Embed(
@@ -273,7 +448,7 @@ class KimiLinearModel(nnx.Module):
             features=config.hidden_size,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_axes=(None, "tensor"),
+            kernel_axes=("tensor", None),
             mesh=mesh,
         )
 
@@ -282,7 +457,7 @@ class KimiLinearModel(nnx.Module):
                 KimiDecoderLayer(
                     config=config,
                     mesh=mesh,
-                    layer_id=i,
+                    layer_idx=i,
                     dtype=dtype,
                 )
                 for i in range(config.num_hidden_layers)
@@ -291,7 +466,7 @@ class KimiLinearModel(nnx.Module):
 
         self.norm = RMSNorm(
             config.hidden_size,
-            epsilon=getattr(config, "rms_norm_eps", 1e-6),
+            epsilon=config.rms_norm_eps,
             param_dtype=jnp.float32,
         )
 
@@ -305,6 +480,7 @@ class KimiLinearModel(nnx.Module):
         residual = None
         layers_kv_fused = []
         layers_topk_ids = []
+
         for layer in self.layers:
             hidden_states, residual, kv_fused, topk_ids = layer(
                 forward_batch.positions,
@@ -325,18 +501,25 @@ class KimiLinearModel(nnx.Module):
 
 
 class KimiLinearForCausalLM(nnx.Module):
-    """Kimi-Linear causal language model."""
+    @classmethod
+    def patch_model_config(cls, config: ModelConfig) -> None:
+        config.attention_arch = AttentionArch.MLA
+        qk_nope = getattr(config.hf_text_config, "qk_nope_head_dim", 0)
+        qk_rope = getattr(config.hf_text_config, "qk_rope_head_dim", 0)
+        if qk_nope and qk_rope:
+            config.head_dim = qk_nope + qk_rope
 
     def __init__(
-        self,
-        config: PretrainedConfig,
-        mesh: jax.sharding.Mesh,
-        dtype: jnp.dtype = jnp.bfloat16,
-    ):
-        self.mesh = mesh
+        self, config: KimiLinearConfig, mesh: jax.sharding.Mesh, dtype: jnp.dtype = jnp.bfloat16
+    ) -> None:
         self.config = config
+        self.mesh = mesh
         self.dtype = dtype
-        self.model = KimiLinearModel(config, dtype=dtype, mesh=mesh)
+        self.model = KimiLinearModel(
+            config=config,
+            mesh=mesh,
+            dtype=dtype,
+        )
 
         if not getattr(config, "tie_word_embeddings", False):
             self.lm_head = ParallelLMHead(
@@ -349,13 +532,21 @@ class KimiLinearForCausalLM(nnx.Module):
 
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh)
 
-    @classmethod
-    def patch_model_config(cls, mc: ModelConfig) -> None:
-        mc.attention_arch = AttentionArch.MLA
-        qk_nope = getattr(mc.hf_text_config, "qk_nope_head_dim", 0)
-        qk_rope = getattr(mc.hf_text_config, "qk_rope_head_dim", 0)
-        if qk_nope and qk_rope:
-            mc.head_dim = qk_nope + qk_rope
+    def __call__(
+        self,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        logits_metadata: LogitsMetadata,
+    ):
+        hidden_states, layers_kv_fused, layers_topk_ids = self.model(
+            forward_batch,
+            token_to_kv_pool,
+        )
+        if not getattr(self.config, "tie_word_embeddings", False):
+            output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
+        else:
+            output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
+        return output, layers_kv_fused, True, layers_topk_ids
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
@@ -364,11 +555,11 @@ class KimiLinearForCausalLM(nnx.Module):
             mesh=self.mesh,
             dtype=self.dtype,
         )
-        weight_mappings = self._create_weight_mappings(model_config)
+        weight_mappings = self._create_weight_mappings()
         loader.load_weights_from_safetensors(weight_mappings)
         logger.info("Weights loaded successfully!")
 
-    def _create_weight_mappings(self, model_config: ModelConfig) -> dict:
+    def _create_weight_mappings(self) -> dict:
         mappings = {
             "model.embed_tokens.weight": WeightMapping(
                 target_path="model.embed_tokens.embedding",
@@ -390,11 +581,11 @@ class KimiLinearForCausalLM(nnx.Module):
             )
 
         num_layers = self.config.num_hidden_layers
-        first_k_dense_replace = getattr(self.config, "first_k_dense_replace", 0)
+        first_k_dense_replace = self.config.first_k_dense_replace
 
         for layer_idx in range(num_layers):
             is_dense = layer_idx < first_k_dense_replace
-            is_kda = _is_kda_layer(self.config, layer_idx)
+            is_kda = self.config.is_kda_layer(layer_idx)
             layer_mappings = self._create_layer_mappings(
                 layer_idx, is_dense=is_dense, is_kda=is_kda
             )
@@ -407,7 +598,7 @@ class KimiLinearForCausalLM(nnx.Module):
         target_prefix = f"model.layers.{layer_idx}"
 
         mappings = {
-            # Layer norms
+            # Layer norms (all layers)
             f"{prefix}.input_layernorm.weight": WeightMapping(
                 target_path=f"{target_prefix}.input_layernorm.scale",
                 sharding=(None,),
@@ -420,34 +611,36 @@ class KimiLinearForCausalLM(nnx.Module):
             ),
         }
 
-        # --- Attention-specific mappings ---
+        # --- Attention mappings ---
         if is_kda:
             # KDA layer weights are mapped after KDA module is implemented.
             pass
         else:
-            # MLA layer
+            # MLA layer — target goes through KimiMLAAttention wrapper:
+            # self.self_attn (KimiMLAAttention) -> self.self_attn (MLAAttention)
+            attn_target = f"{target_prefix}.self_attn.self_attn"
             mappings[f"{prefix}.self_attn.q_proj.weight"] = WeightMapping(
-                target_path=f"{target_prefix}.self_attn.q_proj.weight",
+                target_path=f"{attn_target}.q_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             )
             mappings[f"{prefix}.self_attn.o_proj.weight"] = WeightMapping(
-                target_path=f"{target_prefix}.self_attn.o_proj.weight",
+                target_path=f"{attn_target}.o_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
             )
             mappings[f"{prefix}.self_attn.kv_a_proj_with_mqa.weight"] = WeightMapping(
-                target_path=f"{target_prefix}.self_attn.kv_a_proj.weight",
+                target_path=f"{attn_target}.kv_a_proj.weight",
                 sharding=(None, None),
                 transpose=True,
             )
             mappings[f"{prefix}.self_attn.kv_a_layernorm.weight"] = WeightMapping(
-                target_path=f"{target_prefix}.self_attn.kv_a_layernorm.scale",
+                target_path=f"{attn_target}.kv_a_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             )
             mappings[f"{prefix}.self_attn.kv_b_proj.weight"] = WeightMapping(
-                target_path=f"{target_prefix}.self_attn.kv_b_proj.weight",
+                target_path=f"{attn_target}.kv_b_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             )
@@ -466,14 +659,17 @@ class KimiLinearForCausalLM(nnx.Module):
                     transpose=True,
                 )
         else:
-            # MoE gate
+            # MoE — gate/topk/experts/shared_experts are inside KimiMoE (block_sparse_moe)
+            moe_target = f"{target_prefix}.block_sparse_moe"
+
+            # Gate
             mappings[f"{prefix}.block_sparse_moe.gate.weight"] = WeightMapping(
-                target_path=f"{target_prefix}.moe_gate.kernel",
+                target_path=f"{moe_target}.moe_gate.kernel",
                 sharding=(None, None),
                 transpose=True,
             )
             mappings[f"{prefix}.block_sparse_moe.gate.e_score_correction_bias"] = WeightMapping(
-                target_path=f"{target_prefix}.moe_gate.bias",
+                target_path=f"{moe_target}.moe_gate.bias",
                 sharding=(None,),
             )
 
@@ -492,11 +688,11 @@ class KimiLinearForCausalLM(nnx.Module):
 
             moe_mappings = create_moe_weights_mapping(
                 prefix=prefix,
-                target_prefix=target_prefix,
+                target_prefix=moe_target,
                 num_experts=num_logical_experts,
                 expert_type_names=("w1", "w3", "w2"),
                 moe_backend="epmoe",
-                moe_path="block_sparse_moe",
+                moe_path="experts",
                 physical_to_logical_map=phy_to_log,
             )
             mappings.update(moe_mappings)
@@ -509,38 +705,13 @@ class KimiLinearForCausalLM(nnx.Module):
             ]:
                 mappings[f"{prefix}.block_sparse_moe.shared_experts.{proj_name}.weight"] = (
                     WeightMapping(
-                        target_path=f"{target_prefix}.shared_experts.{proj_name}.weight",
+                        target_path=f"{moe_target}.shared_experts.{proj_name}.weight",
                         sharding=sharding,
                         transpose=True,
                     )
                 )
 
         return mappings
-
-    def __call__(
-        self,
-        forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
-        logits_metadata: LogitsMetadata,
-    ):
-        hidden_states, layers_kv_fused, layers_topk_ids = self.model(
-            forward_batch,
-            token_to_kv_pool,
-        )
-        if not getattr(self.config, "tie_word_embeddings", False):
-            output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
-        else:
-            output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
-        return output, layers_kv_fused, True, layers_topk_ids
-
-
-def _is_kda_layer(config: PretrainedConfig, layer_idx: int) -> bool:
-    """Check if a layer uses KDA (Key-Delta Attention).
-
-    The config's ``linear_attn_config["kda_layers"]`` list is 1-indexed.
-    """
-    kda_layers = config.linear_attn_config["kda_layers"]
-    return (layer_idx + 1) in kda_layers
 
 
 EntryClass = [KimiLinearForCausalLM]
