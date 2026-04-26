@@ -60,14 +60,14 @@ def _build_hybrid_pools(
     max_context_len: int,
     tp_size: int,
     token_to_kv_pool,
+    mesh,
 ):
-    """Construct (RecurrentStatePool, HybridReqToTokenPool, MemoryPools) for a
-    hybrid recurrent model.
+    """Build the hybrid pool stack: RecurrentStatePool + HybridReqToTokenPool + MemoryPools wrapper.
 
-    Caller must ensure ``cfg`` is the runner's ``linear_recurrent_config`` (i.e.,
-    a hybrid linear-recurrent config whose ``is_linear_attn`` is True). The
-    ``linear_attn_config`` payload is a dict (Decision #12); subscript access
-    is required, not attribute access.
+    Caller must pass the runner's linear_recurrent_config (a config whose
+    is_linear_attn is True with non-empty kda_layers); mesh is forwarded so
+    RecurrentStatePool's buffers get the same TP-aware sharding pattern as
+    the token_to_kv_pool.
     """
     linear_attn_config = cfg.linear_attn_config  # dict
     rsp = RecurrentStatePool(
@@ -76,6 +76,7 @@ def _build_hybrid_pools(
         num_heads=linear_attn_config["num_heads"],
         head_dim=linear_attn_config["head_dim"],
         conv_kernel_size=linear_attn_config["short_conv_kernel_size"],
+        mesh=mesh,
     )
     hybrid_pool = HybridReqToTokenPool(
         size=max_num_reqs + 1,  # +1 for dummy slot 0
@@ -104,16 +105,24 @@ def _compute_recurrent_per_req_bytes(
     tp_size: int,
     temporal_dtype_bytes: int,
     conv_dtype_bytes: int,
+    num_k_heads: int | None = None,
+    head_k_dim: int | None = None,
 ) -> int:
     """Per-device per-request recurrent + conv buffer size in bytes.
 
-    Mirrors RecurrentStatePool buffer shapes (Phase 1):
+    Mirrors RecurrentStatePool buffer shapes :
       per_req_recurrent = L * (H/tp) * D * D * temporal_dtype.itemsize
       per_req_conv      = L * (K-1) * (proj_size/tp) * conv_dtype.itemsize
-                         where proj_size = num_heads * head_dim + 2 * (num_heads * head_dim)
+                         where proj_size = num_heads*head_dim + 2*num_k_heads*head_k_dim
+                         (num_k_heads / head_k_dim default to num_heads / head_dim
+                          for current Kimi-Linear convention).
     """
+    if num_k_heads is None:
+        num_k_heads = num_heads
+    if head_k_dim is None:
+        head_k_dim = head_dim
     assert num_heads % tp_size == 0, f"num_heads {num_heads} must be divisible by tp_size {tp_size}"
-    proj_size = num_heads * head_dim + 2 * (num_heads * head_dim)
+    proj_size = num_heads * head_dim + 2 * (num_k_heads * head_k_dim)
     assert proj_size % tp_size == 0, f"proj_size {proj_size} must be divisible by tp_size {tp_size}"
     per_req_recurrent = (
         num_layers * (num_heads // tp_size) * head_dim * head_dim * temporal_dtype_bytes
@@ -197,22 +206,22 @@ def _check_state_to_kv_ratio_for_hybrid(state_to_kv_ratio: float) -> None:
 
 
 def _enforce_recurrent_state_server_constraints(server_args) -> None:
-    """Force disable_radix_cache=True and assert disable_overlap_schedule=True
+    """Assert both disable_radix_cache=True and disable_overlap_schedule=True
     for hybrid recurrent state models.
 
     - disable_radix_cache: prefix slots being all-zero would corrupt suffix
-      computation in the recurrent path (matches sglang PyTorch
-      _handle_mamba_radix_cache(support_mamba_cache=False)).
+      computation in the recurrent path. We require the user to opt in with
+      --disable-radix-cache rather than silently overriding their config so
+      the constraint is transparent.
     - disable_overlap_schedule: this version does not implement double-buffer
       ping-pong (mamba_ping_pong_track_buffer_size); overlap scheduler would
       race on shared recurrent state.
     """
-    if not server_args.disable_radix_cache:
-        logger.info(
-            "Hybrid recurrent state model: forcing disable_radix_cache=True "
-            "(prefix sharing is unsafe with recurrent state)."
-        )
-        server_args.disable_radix_cache = True
+    assert server_args.disable_radix_cache, (
+        "Hybrid recurrent state models require --disable-radix-cache "
+        "(prefix sharing is unsafe with recurrent state). Please pass "
+        "--disable-radix-cache explicitly."
+    )
     assert server_args.disable_overlap_schedule, (
         "Hybrid recurrent state models require --disable-overlap-schedule "
         "(this version does not support double-buffer ping-pong for recurrent state)."
@@ -798,11 +807,17 @@ class ModelRunner(BaseModelRunner):
                 "Hybrid budget split: max_num_reqs %s -> %s "
                 "(state_budget=%s bytes, per_req=%s bytes)",
                 max_num_reqs,
-                state_max_reqs,
+                min(max_num_reqs, state_max_reqs),
                 state_budget,
                 per_req_state_bytes,
             )
-            max_num_reqs = state_max_reqs
+            # Take the smaller of the previously computed max_num_reqs (KV-side
+            # budget / context-len heuristic) and the recurrent-state budget cap.
+            # Mirrors sglang upstream model_runner_kv_cache_mixin._resolve_max_num_reqs:
+            #     max_num_reqs = min(max_num_reqs, max_mamba_cache_size // ratio)
+            # Direct override would silently raise the cap when the recurrent
+            # budget exceeds the KV-side cap; min() preserves the tighter bound.
+            max_num_reqs = min(max_num_reqs, state_max_reqs)
 
         # Create request to token pool if not already created.
         # For hybrid models, defer to after token_to_kv_pool is built so we can
@@ -879,6 +894,7 @@ class ModelRunner(BaseModelRunner):
                 max_context_len=self.model_config.context_len + 4,
                 tp_size=self.tp_size,
                 token_to_kv_pool=self.token_to_kv_pool,
+                mesh=self.mesh,
             )
         else:
             self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)
@@ -1046,7 +1062,7 @@ class ModelRunner(BaseModelRunner):
                 forward_batch, logits_metadata
             )
             cache_miss_count = count()
-        # Phase 3 done: models now return pool_updates dict directly at idx 1.
+        #  done: models now return pool_updates dict directly at idx 1.
         self.memory_pools.replace_all(pool_updates)
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch

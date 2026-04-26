@@ -1,8 +1,8 @@
 """TPU platform compatibility tests for RecurrentStatePool.
 
 Constructs pools directly on a single TPU device (no mesh/sharding) and
-exercises alloc / replace_buffer (via JIT donate) / clear. CPU runs auto-skip
-via skipUnless.
+exercises clear_slot / replace_buffer (via JIT donate) / clear. CPU runs
+auto-skip via skipUnless.
 
 Run on TPU:
     python -m unittest python.sgl_jax.test.mem_cache.test_recurrent_state_pool_tpu -v
@@ -13,6 +13,14 @@ import unittest
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.sharding import Mesh
+
+
+def _mesh():
+    """Single-device mesh with the canonical "tensor" axis name; matches the
+    sharding axis RecurrentStatePool partitions H / proj_size on."""
+    return Mesh(np.array(jax.devices()), ("tensor",))
 
 
 def _has_tpu_devices() -> bool:
@@ -39,26 +47,28 @@ class TestRecurrentStatePoolOnTpu(unittest.TestCase):
             num_heads=2,
             head_dim=4,
             conv_kernel_size=4,
+            mesh=_mesh(),
         )
 
     def test_buffers_on_tpu_devices(self):
         pool = self._make()
-        for layer in range(pool.num_layers):
+        for layer in range(pool.num_linear_recurrent_layers):
             for d in pool.recurrent_buffers[layer].devices():
                 self.assertEqual(d.platform, "tpu")
             for inner in range(len(pool.conv_buffers[layer])):
                 for d in pool.conv_buffers[layer][inner].devices():
                     self.assertEqual(d.platform, "tpu")
 
-    def test_alloc_clears_buffers_on_tpu(self):
+    def test_clear_slot_clears_buffers_on_tpu(self):
         pool = self._make()
         # list element mutation to write non-zero.
-        for layer in range(pool.num_layers):
+        for layer in range(pool.num_linear_recurrent_layers):
             pool.recurrent_buffers[layer] = jnp.ones_like(pool.recurrent_buffers[layer])
             for inner in range(len(pool.conv_buffers[layer])):
                 pool.conv_buffers[layer][inner] = jnp.ones_like(pool.conv_buffers[layer][inner])
-        slots = pool.alloc(2)
-        for layer in range(pool.num_layers):
+        slots = [1, 2]
+        pool.clear_slot(slots)
+        for layer in range(pool.num_linear_recurrent_layers):
             for idx in slots:
                 self.assertTrue(bool(jnp.all(pool.recurrent_buffers[layer][idx] == 0)))
             for inner in range(len(pool.conv_buffers[layer])):
@@ -82,7 +92,7 @@ class TestRecurrentStatePoolOnTpu(unittest.TestCase):
         self.assertEqual(float(pool.recurrent_buffers[0][1, 0, 0, 0]), 7.0)
         self.assertEqual(float(pool.conv_buffers[0][0][1, 0, 0]), 3.0)
         # Buffers stay on TPU (per layer + per inner).
-        for layer in range(pool.num_layers):
+        for layer in range(pool.num_linear_recurrent_layers):
             for d in pool.recurrent_buffers[layer].devices():
                 self.assertEqual(d.platform, "tpu")
             for inner in range(len(pool.conv_buffers[layer])):
@@ -91,17 +101,15 @@ class TestRecurrentStatePoolOnTpu(unittest.TestCase):
 
     def test_clear_on_tpu(self):
         pool = self._make()
-        pool.alloc(2)
-        for layer in range(pool.num_layers):
+        for layer in range(pool.num_linear_recurrent_layers):
             pool.recurrent_buffers[layer] = jnp.ones_like(pool.recurrent_buffers[layer])
             for inner in range(len(pool.conv_buffers[layer])):
                 pool.conv_buffers[layer][inner] = jnp.ones_like(pool.conv_buffers[layer][inner])
         pool.clear()
-        for layer in range(pool.num_layers):
+        for layer in range(pool.num_linear_recurrent_layers):
             self.assertTrue(bool(jnp.all(pool.recurrent_buffers[layer] == 0)))
             for inner in range(len(pool.conv_buffers[layer])):
                 self.assertTrue(bool(jnp.all(pool.conv_buffers[layer][inner] == 0)))
-        self.assertEqual(pool.free_slots, [1, 2, 3, 4])
 
 
 if __name__ == "__main__":

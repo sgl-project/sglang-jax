@@ -1,7 +1,7 @@
-"""Phase 5 TPU TP=4 真测: RecurrentStatePool sharding under NamedSharding.
+""" TPU TP=4 真测: RecurrentStatePool sharding under NamedSharding.
 
-Run on tpu-tpu-v6e-4-lattn-10934 via sky exec (see plan Task 5 runbook).
-Removes the 'Phase 1 deferred' marker from RecurrentStatePool.replace_buffer
+Run on tpu-tpu-v6e-4-lattn-10934 via sky exec (see plan  runbook).
+Removes the ' deferred' marker from RecurrentStatePool.replace_buffer
 docstring once this passes.
 """
 
@@ -35,6 +35,7 @@ class TestRecurrentStatePoolTP4Sharding(unittest.TestCase):
                 num_heads=8,  # divisible by 4
                 head_dim=4,
                 conv_kernel_size=4,
+                mesh=self.mesh,
             )
             # Probe sharding: each layer's recurrent buffer must report
             # device_set with 4 devices (sharded across tensor axis).
@@ -47,7 +48,7 @@ class TestRecurrentStatePoolTP4Sharding(unittest.TestCase):
                 )
 
     def test_replace_buffer_preserves_sharding_after_jit_donate(self):
-        """Phase 1 deferred concern: per-element .sharding probe + device_put
+        """deferred concern: per-element .sharding probe + device_put
         must not throw under real NamedSharding. This test removes the deferral."""
         from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 
@@ -58,6 +59,7 @@ class TestRecurrentStatePoolTP4Sharding(unittest.TestCase):
                 num_heads=8,
                 head_dim=4,
                 conv_kernel_size=4,
+                mesh=self.mesh,
             )
 
             # Simulate JIT output: create new buffers without explicit sharding

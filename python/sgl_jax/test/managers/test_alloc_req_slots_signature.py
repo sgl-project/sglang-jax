@@ -1,6 +1,6 @@
-"""Phase 4: ScheduleBatch.alloc_req_slots takes reqs (list) instead of num_reqs (int).
+""": ScheduleBatch.alloc_req_slots takes reqs (list) instead of num_reqs (int).
 
-Backed by Phase 1's ReqToTokenPool.alloc(reqs) which already accepts
+Backed by 's ReqToTokenPool.alloc(reqs) which already accepts
 list[Req] and skips reqs whose req_pool_idx is set (chunked reuse path).
 """
 

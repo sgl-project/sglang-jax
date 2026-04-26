@@ -11,7 +11,7 @@ from sgl_jax.srt.layers.layernorm import GemmaRMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
-from sgl_jax.srt.mem_cache.memory_pool import KVCache
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
@@ -418,7 +418,7 @@ class Gemma2ForCausalLM(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
-        memory_pools,
+        memory_pools: MemoryPools,
         logits_metadata: LogitsMetadata,
     ):
         kv_pool = memory_pools.token_to_kv_pool

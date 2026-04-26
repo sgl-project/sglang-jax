@@ -10,12 +10,7 @@ import numpy as np
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
-from sgl_jax.srt.managers.schedule_batch import (
-    BaseFinishReason,
-    Req,
-    ScheduleBatch,
-    _maybe_free_recurrent_cache,
-)
+from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.utils.common_utils import cdiv
 
@@ -128,7 +123,6 @@ class SchedulerOutputProcessorMixin:
                         ):
                             precision_tracer.stop_trace()
                     self.tree_cache.cache_finished_req(req)
-                    _maybe_free_recurrent_cache(self.req_to_token_pool, req)
                 elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                     # This updates radix so others can match
                     self.tree_cache.cache_unfinished_req(req)
@@ -342,7 +336,6 @@ class SchedulerOutputProcessorMixin:
                     ):
                         precision_tracer.stop_trace()
                 self.tree_cache.cache_finished_req(req)
-                _maybe_free_recurrent_cache(self.req_to_token_pool, req)
 
             if req.return_output_logprob_only:
                 req.output_token_logprobs_val.append(next_token_logprobs[i])

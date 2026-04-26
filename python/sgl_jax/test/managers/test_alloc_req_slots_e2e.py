@@ -1,13 +1,13 @@
-"""Phase 4 end-to-end wiring test.
+""" end-to-end wiring test.
 
-Exercises the Phase 4 chain:
+Exercises the  chain:
   scheduler decides free vs keep
     -> ScheduleBatch.alloc_req_slots(reqs)
     -> ReqToTokenPool.alloc(reqs) | HybridReqToTokenPool.alloc(reqs)
     -> reuse vs fresh decision per req
 
-We use SimpleNamespace mock Reqs (matching Phase 1 test pattern) and the
-real pool classes from Phase 1, so this test covers the integration even
+We use SimpleNamespace mock Reqs (matching  test pattern) and the
+real pool classes from , so this test covers the integration even
 without spinning up a full ScheduleBatch / Scheduler.
 """
 
@@ -16,6 +16,13 @@ from types import SimpleNamespace
 
 import jax
 import numpy as np
+from jax.sharding import Mesh
+
+
+def _mesh():
+    """Single-device mesh with the canonical "tensor" axis name; matches the
+    sharding axis RecurrentStatePool partitions H / proj_size on."""
+    return Mesh(np.array(jax.devices()), ("tensor",))
 
 
 def _make_req(req_pool_idx=None, recurrent_pool_idx=None, is_chunked=0):
@@ -44,6 +51,7 @@ class TestAllocReqSlotsE2EHybrid(unittest.TestCase):
             num_heads=2,
             head_dim=4,
             conv_kernel_size=4,
+            mesh=_mesh(),
         )
         return HybridReqToTokenPool(
             size=4 + 1,
@@ -62,7 +70,7 @@ class TestAllocReqSlotsE2EHybrid(unittest.TestCase):
         self.assertIsNotNone(req.recurrent_pool_idx)
 
     def test_second_chunk_reuses_both_indices(self):
-        """Phase 4 hybrid path: scheduler skipped free, so req keeps both
+        """hybrid path: scheduler skipped free, so req keeps both
         indices; second alloc must reuse, not allocate fresh."""
         pool = self._make_hybrid_pool()
         req = _make_req()
@@ -111,15 +119,14 @@ class TestAllocReqSlotsE2ENonHybrid(unittest.TestCase):
         self.assertEqual(req.req_pool_idx, indices[0])
 
     def test_after_free_and_clear_alloc_treats_as_fresh(self):
-        """Phase 4 non-hybrid path: scheduler called pool.free + cleared
+        """non-hybrid path: scheduler called pool.free + cleared
         req.req_pool_idx; next alloc must allocate a fresh slot."""
         pool = self._make_pool()
         req = _make_req()
         pool.alloc([req])
-        first_idx = req.req_pool_idx
 
         # Simulate scheduler non-hybrid path: pool.free + clear ref.
-        pool.free(first_idx)
+        pool.free(req)
         req.req_pool_idx = None
 
         # Second alloc: req has no req_pool_idx, treated as fresh.
@@ -131,17 +138,15 @@ class TestAllocReqSlotsE2ENonHybrid(unittest.TestCase):
 
 
 class TestSchedulerHelperPlusPoolAllocCombo(unittest.TestCase):
-    """Wires _maybe_free_chunked_req_slot (Task 3) directly to pool.alloc
-    (Task 2 list path). This is the smallest reproduction of the actual
-    transient that D7 documents as 'safe under CPU unit tests' --
-    proving the post-Task-3 end-state behaves correctly."""
+    """Wires pool.free_chunked directly to pool.alloc.
+    The smallest reproduction of the actual scheduler chunked-prefill path
+    end-state (post-polymorphism refactor)."""
 
     def setUp(self):
         if not jax.devices():
             self.skipTest("JAX not available")
 
     def test_hybrid_skip_free_plus_alloc_reuses_same_slot(self):
-        from sgl_jax.srt.managers.scheduler import _maybe_free_chunked_req_slot
         from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool
         from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 
@@ -151,6 +156,7 @@ class TestSchedulerHelperPlusPoolAllocCombo(unittest.TestCase):
             num_heads=2,
             head_dim=4,
             conv_kernel_size=4,
+            mesh=_mesh(),
         )
         pool = HybridReqToTokenPool(
             size=5, max_context_len=16, dtype=np.int32, recurrent_state_pool=rsp
@@ -160,9 +166,9 @@ class TestSchedulerHelperPlusPoolAllocCombo(unittest.TestCase):
         first_req_idx = req.req_pool_idx
         first_recurrent_idx = req.recurrent_pool_idx
 
-        # Scheduler chunked path (hybrid): skip-free.
+        # Scheduler chunked path (hybrid): polymorphic no-op via free_chunked.
         req.is_chunked = 1
-        _maybe_free_chunked_req_slot(pool, req)
+        pool.free_chunked(req)
 
         # Both indices preserved.
         self.assertEqual(req.req_pool_idx, first_req_idx)
@@ -174,15 +180,14 @@ class TestSchedulerHelperPlusPoolAllocCombo(unittest.TestCase):
         self.assertEqual(req.recurrent_pool_idx, first_recurrent_idx)
 
     def test_non_hybrid_free_clear_plus_alloc_gives_fresh_slot(self):
-        from sgl_jax.srt.managers.scheduler import _maybe_free_chunked_req_slot
         from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 
         pool = ReqToTokenPool(size=5, max_context_len=16, dtype=np.int32)
         req = _make_req()
         pool.alloc([req])
 
-        # Scheduler chunked path (non-hybrid): free + clear stale ref.
-        _maybe_free_chunked_req_slot(pool, req)
+        # Scheduler chunked path (non-hybrid): free + clear stale ref via free_chunked.
+        pool.free_chunked(req)
         self.assertIsNone(req.req_pool_idx, "Non-hybrid path must clear req_pool_idx after free")
 
         # Next alloc round: fresh allocation succeeds.

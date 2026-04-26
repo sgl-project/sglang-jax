@@ -1,6 +1,6 @@
-"""Phase 5 TPU TP=1 真测: D2 sharding fix verification on real TPU NamedSharding.
+""" TPU TP=1 真测: D2 sharding fix verification on real TPU NamedSharding.
 
-Run on tpu-v6e-1-lattn-1775630353 via sky exec (see plan Task 5 runbook).
+Run on tpu-v6e-1-lattn-1775630353 via sky exec (see plan  runbook).
 Skipped on non-TPU runtimes; runs only when jax.devices() reports TPU.
 
 Verifies:
@@ -35,7 +35,7 @@ class TestKVPoolReplaceBufferShardingOnTPU1(unittest.TestCase):
         self.mesh = Mesh(devices, axis_names=("data", "tensor"))
 
     def test_mha_replace_buffer_preserves_sharding(self):
-        """Phase 5 D2: replace_buffer must restore kv_sharding on tp=1
+        """D2: replace_buffer must restore kv_sharding on tp=1
         (otherwise the next JIT trace sees an unconstrained input and may
         produce inconsistent compiled code; issue #233)."""
         from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool

@@ -102,8 +102,8 @@ class TestMLATokenToKVPoolReplaceBuffer(unittest.TestCase):
 
         If roundtrip fails (e.g. start_layer offset lost, sharding fix
         absent, or any aux field missing), STOP and report; user decides
-        whether to backfill in Phase 2 (new task) or defer to a later phase.
-        Phase 2 must NOT silently rewrite epic's pytree implementation.
+        whether to backfill in  (new task) or defer to a later phase.
+         must NOT silently rewrite epic's pytree implementation.
         """
         import jax as _jax
 

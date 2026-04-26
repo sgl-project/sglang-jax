@@ -5,8 +5,8 @@ Maps to design doc test plan §4:
 - TP-2: TestForwardMetadataSetter.*
 - TP-3: TestDispatch.*
 - TP-4: TestGetMaxRunningReqests.*
-- TP-5: TestModelRunnerIntegration (Task 3.2)
-- TP-6: TestTwoLayerForwardOrdering (Task 3.3)
+- TP-5: TestModelRunnerIntegration
+- TP-6: TestTwoLayerForwardOrdering
 """
 
 from dataclasses import dataclass

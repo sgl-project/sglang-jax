@@ -1,7 +1,7 @@
-"""Phase 5 D3 + D7 end-to-end: mock model exercises the full JIT donate +
+""" D3 + D7 end-to-end: mock model exercises the full JIT donate +
 replace_all chain across multiple layers and multiple forward calls.
 
-Verifies the list element mutation contract that Phase 1+2+3+4 took on
+Verifies the list element mutation contract that +2+3+4 took on
 faith holds end-to-end:
 - Layer N writes recurrent state via the returned pool_updates dict
 - Layer N+1 reads via the same dict (no inter-layer leak)
@@ -10,7 +10,7 @@ faith holds end-to-end:
 Does NOT instantiate any Kimi-Linear model classes; uses jax primitives
 to model 'read state -> mock forward -> write state' directly.
 
-CRITICAL CONTRACT (Phase 3 RFC §5.1): the mock model is a PURE function
+CRITICAL CONTRACT : the mock model is a PURE function
 that returns the full pool_updates dict. It NEVER mutates the pool
 in-place; MemoryPools.replace_all is the sole writer (this matches the
 real model contract -- model returns dict, _forward dispatches via
@@ -47,6 +47,7 @@ def _build_pools():
         num_heads=2,
         head_dim=4,
         conv_kernel_size=4,
+        mesh=mesh,
     )
     kv = MHATokenToKVPool(
         size=8,
@@ -96,7 +97,7 @@ def _mock_forward_pure(memory_pools, slot_idx):
 
 class TestPhase5EndToEndMockModelMultiLayerForward(unittest.TestCase):
     """Multi-layer multi-forward state preservation via the pure-function +
-    replace_all contract (no in-pool mutation; matches Phase 3 model contract)."""
+    replace_all contract (no in-pool mutation; matches  model contract)."""
 
     def setUp(self):
         if not jax.devices():
@@ -147,7 +148,7 @@ class TestPhase5EndToEndMockModelMultiLayerForward(unittest.TestCase):
         req = SimpleNamespace(req_pool_idx=None, recurrent_pool_idx=None, is_chunked=0)
         hybrid.alloc([req])
 
-        # JIT the pure forward; donate memory_pools (matches Phase 2 _forward
+        # JIT the pure forward; donate memory_pools (matches  _forward
         # contract: jitted_run_model returns model output).
         @jax.jit
         def jit_step(mp, slot):

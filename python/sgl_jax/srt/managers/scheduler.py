@@ -119,26 +119,6 @@ class GenerationBatchResult:
     accept_lens: np.ndarray | None = None
 
 
-def _maybe_free_chunked_req_slot(req_to_token_pool, chunked_req) -> None:
-    """Phase 4: branch the chunked_req slot release by pool type.
-
-    - Hybrid path (HybridReqToTokenPool, duck-typed via free_recurrent_cache):
-      skip the free entirely so HybridReqToTokenPool.alloc reuses both
-      req_pool_idx and recurrent_pool_idx next round; recurrent state is
-      preserved across chunks.
-    - Non-hybrid path: free the slot AND clear chunked_req.req_pool_idx so
-      the new alloc(reqs) list path treats this req as a fresh allocation
-      (without the clear, alloc would silently return the stale slot index
-      that has already been returned to free_slots, causing data corruption).
-    """
-    if hasattr(req_to_token_pool, "free_recurrent_cache"):
-        # Hybrid: keep req_pool_idx + recurrent_pool_idx so the next
-        # alloc_req_slots(reqs) call reuses the same slots.
-        return
-    req_to_token_pool.free(chunked_req.req_pool_idx)
-    chunked_req.req_pool_idx = None
-
-
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerProfilerMixin,
@@ -1146,11 +1126,12 @@ class Scheduler(
             # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
             self.tree_cache.cache_unfinished_req(self.chunked_req)
-            # For hybrid models: keep the slot so recurrent state survives
-            # across chunks (alloc next round reuses via req_pool_idx +
-            # recurrent_pool_idx). For non-hybrid: free + clear stale ref so
-            # alloc(reqs) treats this req as fresh.
-            _maybe_free_chunked_req_slot(self.req_to_token_pool, self.chunked_req)
+            # Polymorphic release for the chunked req's slot:
+            # - ReqToTokenPool.free_chunked: free + clear req_pool_idx so
+            #   alloc(reqs) treats this req as fresh next round.
+            # - HybridReqToTokenPool.free_chunked: no-op so both KV slot and
+            #   recurrent_pool_idx survive across chunks (alloc reuses them).
+            self.req_to_token_pool.free_chunked(self.chunked_req)
 
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():

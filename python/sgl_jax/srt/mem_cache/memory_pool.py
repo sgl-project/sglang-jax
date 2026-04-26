@@ -161,12 +161,39 @@ class ReqToTokenPool:
             result.append(req.req_pool_idx)
         return result
 
-    def free(self, free_index: int | list[int]):
-        """Free request slots"""
-        if isinstance(free_index, int):
-            self.free_slots.append(free_index)
-        else:
-            self.free_slots.extend(free_index)
+    def free(self, req):
+        """Free request slot held by ``req``.
+
+        Accepts a Req-like object with a ``req_pool_idx`` attribute (matches
+        ``alloc(reqs)`` signature symmetry). Subclasses (HybridReqToTokenPool)
+        override to release additional state slots (recurrent state) before
+        delegating here.
+        """
+        # Defensive type check: legacy callers passing bare int / list[int]
+        # hit an immediate, clear error instead of silent AttributeError
+        # downstream when self.free_slots.append(req.req_pool_idx) accesses
+        # a missing attribute.
+        if not hasattr(req, "req_pool_idx"):
+            raise TypeError(
+                f"ReqToTokenPool.free expects a Req object with req_pool_idx attr; "
+                f"got {type(req).__name__}. Legacy int/list[int] callers must migrate."
+            )
+        self.free_slots.append(req.req_pool_idx)
+
+    def free_chunked(self, chunked_req) -> None:
+        """Release the slot held by a chunked req.
+
+        Calls free(req) and additionally clears req.req_pool_idx so the next
+        alloc(reqs) round treats this req as fresh -- otherwise alloc would
+        skip the req thinking it's still allocated, returning the stale slot
+        index that's now back in free_slots.
+
+        Subclasses with auxiliary state (e.g. HybridReqToTokenPool's
+        recurrent slot) override this to preserve the slot for reuse across
+        chunks (no-op).
+        """
+        self.free(chunked_req)
+        chunked_req.req_pool_idx = None
 
     def clear(self):
         """Clear all allocation states"""
@@ -176,22 +203,36 @@ class ReqToTokenPool:
 class HybridReqToTokenPool(ReqToTokenPool):
     """Hybrid-architecture ReqToTokenPool that coordinates KV slots and recurrent state slots.
 
-    RFC-0015 §HybridReqToTokenPool.
+    Coordinates KV slot and recurrent state slot allocation for hybrid
+    attention models (KDA / Mamba / GDN paired with standard attention).
+
     - Inherits from ReqToTokenPool (KV slot behavior unchanged).
     - Holds a reference to a RecurrentStatePool (the same instance also lives inside
-      MemoryPools).
+      MemoryPools); RecurrentStatePool is a pure buffer pool and intentionally does
+      NOT manage its own slot allocator state.
+    - Owns recurrent_free_slots (1-indexed; slot 0 is reserved as dummy and never
+      allocated). Public name mirrors the parent ReqToTokenPool.free_slots; the
+      separation between buffer pool and slot allocator follows the same shape as
+      MHATokenToKVPool vs TokenToKVPoolAllocator -- it keeps the buffer pool out
+      of JIT donate while leaving allocator state on the host-side scheduler
+      object.
     - Maintains req_index_to_recurrent_index_mapping (CPU-side np.int32) bridging
-      req_pool_idx -> recurrent_pool_idx.
+      req_pool_idx -> recurrent_pool_idx; default 0 (dummy) until a real slot is
+      written, so an unallocated req maps to the reserved slot 0.
 
     **JIT compatibility warning (must NOT be passed to JIT)**:
     The parent ReqToTokenPool is registered as a pytree node via
     `@register_pytree_node_class`, but a Python decorator does **not** propagate to
     subclasses. This subclass is intentionally not registered, so JAX treats it as a
     plain Python object — passing it directly to `jax.jit` will raise
-    "unregistered pytree node". Phase 1 only uses this class on the Python side
-    (slot coordination + mapping); it never enters JIT trace. If a later Phase
-    needs to JIT this class, add `@register_pytree_node_class` to the subclass
-    and override tree_flatten / tree_unflatten to include recurrent_state_pool.
+    "unregistered pytree node".  only uses this class on the Python side
+    (slot coordination + mapping); it never enters JIT trace. Because the
+    recurrent allocator state lives here (not on RecurrentStatePool, which is the
+    pytree leaf passed through MemoryPools / JIT donate), there is no JIT
+    recompile risk from carrying a Python list. If a later Phase needs to JIT
+    this class, add `@register_pytree_node_class` to the subclass and override
+    tree_flatten / tree_unflatten to include recurrent_state_pool +
+    recurrent_free_slots.
     """
 
     def __init__(
@@ -203,6 +244,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
     ):
         super().__init__(size=size, max_context_len=max_context_len, dtype=dtype)
         self.recurrent_state_pool = recurrent_state_pool
+        # Recurrent slot allocator state. 1-indexed because slot 0 is reserved as
+        # the dummy slot in the underlying RecurrentStatePool buffers; mapping
+        # entries default to 0 so an unallocated req lands on the dummy slot.
+        # Mirrors sglang PyTorch MambaPool free_slots semantics.
+        self.recurrent_free_slots: list[int] = list(range(1, recurrent_state_pool.max_num_reqs + 1))
         # mapping[req_pool_idx] = recurrent_pool_idx; initialized to 0 (dummy slot).
         self.req_index_to_recurrent_index_mapping = np.zeros(size, dtype=np.int32)
 
@@ -210,20 +256,23 @@ class HybridReqToTokenPool(ReqToTokenPool):
         """Coordinate allocation: KV slot first, then recurrent slot; atomic semantics.
 
         Mirrors the "all-or-nothing" coordinated allocation from sglang PyTorch
-        HybridReqToTokenPool.alloc.
+        HybridReqToTokenPool.alloc and the parent ReqToTokenPool.alloc Pass-2
+        batch-slice pattern.
 
         Strategy:
-        1. Pre-check recurrent_state_pool.free_slots capacity.
+        1. Pre-check the local recurrent_free_slots capacity for fresh allocs.
         2. super().alloc(reqs) -- KV slot path is already atomic.
-        3. Actually allocate recurrent slot + write back to req + update mapping.
+        3. Batch-slice the needed recurrent slots, clear-on-alloc all of them in
+           one recurrent_state_pool.clear_slot call (avoids per-slot JIT scatter
+           overhead), then assign + write mapping.
 
-        On any resource shortage we return None; req fields and mapping stay
-        completely untouched before the KV alloc succeeds (recurrent writes only
-        happen after KV passes).
+        On any resource shortage we return None; req fields, recurrent_free_slots
+        and mapping all stay completely untouched before the KV alloc succeeds
+        (recurrent writes only happen after KV passes).
         """
-        # 1. Pre-check recurrent capacity.
+        # 1. Pre-check recurrent capacity (only fresh reqs consume a slot).
         needed_recurrent = sum(1 for req in reqs if req.recurrent_pool_idx is None)
-        if needed_recurrent > len(self.recurrent_state_pool.free_slots):
+        if needed_recurrent > len(self.recurrent_free_slots):
             return None
 
         # 2. KV slot (parent is atomic).
@@ -231,30 +280,65 @@ class HybridReqToTokenPool(ReqToTokenPool):
         if kv_indices is None:
             return None
 
-        # 3. Actually allocate recurrent slot; after pre-check this MUST succeed.
+        # 3. Atomic batch slice (mirrors parent's Pass-2 pattern), then a single
+        #    clear-on-alloc call covering every newly-handed-out slot.
+        new_recurrent_slots = self.recurrent_free_slots[:needed_recurrent]
+        self.recurrent_free_slots = self.recurrent_free_slots[needed_recurrent:]
+
+        if new_recurrent_slots:
+            self.recurrent_state_pool.clear_slot(new_recurrent_slots)
+
+        cursor = 0
         for req in reqs:
-            if req.recurrent_pool_idx is not None:
-                continue
-            slots = self.recurrent_state_pool.alloc(1)
-            assert slots is not None, (
-                "HybridReqToTokenPool.alloc: recurrent_state_pool.alloc unexpectedly "
-                "returned None after pre-check; concurrent mutation?"
-            )
-            req.recurrent_pool_idx = slots[0]
-            self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = slots[0]
+            if req.recurrent_pool_idx is None:
+                req.recurrent_pool_idx = new_recurrent_slots[cursor]
+                cursor += 1
+            self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = req.recurrent_pool_idx
 
         return kv_indices
+
+    def free(self, req) -> None:
+        """Coordinate release: recurrent slot first, then KV slot.
+
+        Idempotent when ``req.recurrent_pool_idx`` is None (free_recurrent_cache
+        no-op). Mirrors the alloc(reqs) coordination pattern (KV first then
+        recurrent on alloc; recurrent first then KV on free, so a partially
+        constructed req can never end up with a freed KV slot but a still-held
+        recurrent slot).
+        """
+        # Defensive type check at the override entry too: free_recurrent_cache
+        # touches req.recurrent_pool_idx before super().free reaches its own
+        # type check, so without this guard a legacy int caller would fail
+        # with AttributeError instead of the explicit TypeError contract.
+        if not hasattr(req, "req_pool_idx"):
+            raise TypeError(
+                f"HybridReqToTokenPool.free expects a Req object with req_pool_idx attr; "
+                f"got {type(req).__name__}. Legacy int/list[int] callers must migrate."
+            )
+        self.free_recurrent_cache(req)
+        super().free(req)
+
+    def free_chunked(self, chunked_req) -> None:
+        """Hybrid override: keep both KV slot AND recurrent slot so the next
+        alloc(reqs) reuses them -- preserves the recurrent state across
+        chunks without an alloc/free roundtrip.
+
+        No-op by design: req keeps both req_pool_idx and recurrent_pool_idx;
+        alloc(reqs) sees them set and skips re-allocation, returning the same
+        indices.
+        """
+        # Intentional no-op (see docstring).
 
     def free_recurrent_cache(self, req) -> None:
         """Release the recurrent state slot held by `req`. Idempotent.
 
-        Sets req.recurrent_pool_idx back to None and clears the corresponding
-        mapping entry to the dummy slot (0). Safe to call when the req has no
-        recurrent slot allocated.
+        Returns the slot to recurrent_free_slots, sets req.recurrent_pool_idx
+        back to None and clears the corresponding mapping entry to the dummy
+        slot (0). Safe to call when the req has no recurrent slot allocated.
         """
         if req.recurrent_pool_idx is None:
             return
-        self.recurrent_state_pool.free(req.recurrent_pool_idx)
+        self.recurrent_free_slots.append(req.recurrent_pool_idx)
         self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = 0
         req.recurrent_pool_idx = None
 
@@ -267,13 +351,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
         return self.req_index_to_recurrent_index_mapping[req_pool_indices]
 
     def clear(self) -> None:
-        """Full reset: parent clear + recurrent_state_pool.clear + mapping zeroed.
+        """Full reset: parent clear + recurrent buffer clear + recurrent allocator
+        reset + mapping zeroed.
 
-        Called from flush_cache; resets KV slot allocator, recurrent slot allocator,
-        recurrent + conv buffers, and the req_pool_idx -> recurrent_pool_idx mapping.
+        Called from flush_cache; resets KV slot allocator, recurrent slot
+        allocator, recurrent + conv buffers, and the req_pool_idx ->
+        recurrent_pool_idx mapping.
         """
         super().clear()
         self.recurrent_state_pool.clear()
+        self.recurrent_free_slots = list(range(1, self.recurrent_state_pool.max_num_reqs + 1))
         self.req_index_to_recurrent_index_mapping[:] = 0
 
 
@@ -579,7 +666,7 @@ class MHATokenToKVPool(KVCache):
         # tp_size==1 sharding fix (issue #233): NamedSharding constraint can be
         # lost on JIT output; explicit device_put with self.kv_sharding restores
         # it before the slice assign so the next JIT trace sees a stable shape.
-        # Mirrors RecurrentStatePool.replace_buffer (Phase 1) per-element fix.
+        # Mirrors RecurrentStatePool.replace_buffer  per-element fix.
         if hasattr(self, "kv_sharding") and len(self.kv_sharding.device_set) == 1:
             fused_kv_buffer = [jax.device_put(buf, self.kv_sharding) for buf in fused_kv_buffer]
         self.kv_buffer[self.start_layer : self.start_layer + len(fused_kv_buffer)] = fused_kv_buffer
@@ -1217,7 +1304,7 @@ class MLATokenToKVPool(KVCache):
         # tp_size==1 sharding fix (issue #233): NamedSharding constraint can be
         # lost on JIT output; explicit device_put with self.kv_sharding restores
         # it before the slice assign so the next JIT trace sees a stable shape.
-        # Mirrors RecurrentStatePool.replace_buffer (Phase 1) per-element fix.
+        # Mirrors RecurrentStatePool.replace_buffer  per-element fix.
         if hasattr(self, "kv_sharding") and len(self.kv_sharding.device_set) == 1:
             kv_buffer = [jax.device_put(buf, self.kv_sharding) for buf in kv_buffer]
         self.kv_buffer[self.start_layer : self.start_layer + len(kv_buffer)] = kv_buffer
@@ -1271,8 +1358,8 @@ class MemoryPools:
         return [self._pools[k] for k in keys], tuple(keys)
 
     @classmethod
-    def tree_unflatten(cls, keys, children):
-        return cls(**dict(zip(keys, children)))
+    def tree_unflatten(cls, aux_data, children):
+        return cls(**dict(zip(aux_data, children)))
 
     def replace_all(self, updates) -> None:
         """Mirror _set_kv_cache_after_forward semantics for the multi-pool world.

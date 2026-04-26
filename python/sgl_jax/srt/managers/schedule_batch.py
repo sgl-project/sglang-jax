@@ -148,17 +148,6 @@ class FINISH_ABORT(BaseFinishReason):
         }
 
 
-def _maybe_free_recurrent_cache(req_to_token_pool, req) -> None:
-    """Phase 5: release recurrent state slot if pool is hybrid.
-
-    Mirrors Phase 4's _maybe_free_chunked_req_slot pattern (D1): duck-type
-    hybrid pool via hasattr(...,'free_recurrent_cache') and forward the
-    release. No-op for non-hybrid pools (keeps non-hybrid call sites clean).
-    """
-    if hasattr(req_to_token_pool, "free_recurrent_cache"):
-        req_to_token_pool.free_recurrent_cache(req)
-
-
 class Req:
     """The input and output status of a request."""
 
@@ -219,10 +208,7 @@ class Req:
 
         # Memory pool info
         self.req_pool_idx: int | None = None
-        # HybridReqToTokenPool slot for recurrent + conv state (Kimi-Linear
-        # KDA layers etc.). None for non-hybrid models. Written by
-        # HybridReqToTokenPool.alloc; read by HybridReqToTokenPool.alloc/free
-        # for chunked-prefill slot reuse and end-of-request release.
+        # Slot in HybridReqToTokenPool's recurrent state pool; None for non-hybrid models.
         self.recurrent_pool_idx: int | None = None
 
         # Check finish
@@ -1072,8 +1058,7 @@ class ScheduleBatch:
                 req.req_pool_idx, : seq_lens_cpu[idx]
             ]
             self.token_to_kv_pool_allocator.free(token_indices)
-            self.req_to_token_pool.free(req.req_pool_idx)
-            _maybe_free_recurrent_cache(self.req_to_token_pool, req)
+            self.req_to_token_pool.free(req)
         else:
             last_uncached_pos = (
                 len(req.prefix_indices) // server_args.page_size
@@ -1082,8 +1067,7 @@ class ScheduleBatch:
                 req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
             ]
             self.token_to_kv_pool_allocator.free(token_indices)
-            self.req_to_token_pool.free(req.req_pool_idx)
-            _maybe_free_recurrent_cache(self.req_to_token_pool, req)
+            self.req_to_token_pool.free(req)
 
             # release the last node
             if self.is_hybrid:

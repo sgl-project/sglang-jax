@@ -1,9 +1,9 @@
-"""Phase 5 D2 / issue #233: KV pool replace_buffer must preserve kv_sharding
+""" D2 / issue #233: KV pool replace_buffer must preserve kv_sharding
 on tp_size==1 (single-device) so the next JIT trace sees a stable shape.
 
-Phase 2 Task 5 deleted _set_kv_cache_after_forward which had this fix at
-the model_runner level; Phase 5 puts it back inside each pool's
-replace_buffer (mirroring RecurrentStatePool.replace_buffer Phase 1 pattern).
+  deleted _set_kv_cache_after_forward which had this fix at
+the model_runner level;  puts it back inside each pool's
+replace_buffer (mirroring RecurrentStatePool.replace_buffer  pattern).
 """
 
 import unittest

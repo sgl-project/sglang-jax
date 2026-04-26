@@ -1,7 +1,7 @@
 """Req.recurrent_pool_idx field for hybrid recurrent state slot tracking.
 
-HybridReqToTokenPool.alloc(reqs) (Phase 1) reads/writes this field to
-coordinate recurrent slot reuse during chunked prefill. Phase 4 wires up
+HybridReqToTokenPool.alloc(reqs)  reads/writes this field to
+coordinate recurrent slot reuse during chunked prefill.  wires up
 the Req-side field so the round-trip works end-to-end.
 """
 
@@ -18,7 +18,7 @@ class TestReqRecurrentPoolIdxField(unittest.TestCase):
         from sgl_jax.srt.managers.schedule_batch import Req
 
         # Req.__init__ requires complex args; verify the field is initialized
-        # via source inspection (same trick Phase 3 used for model signature
+        # via source inspection (same trick  used for model signature
         # checks).
         src = inspect.getsource(Req.__init__)
         self.assertIn(

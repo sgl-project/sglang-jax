@@ -129,7 +129,7 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     enable_precision_tracer: bool = False
 
-    # Hybrid recurrent state (RFC-0015): ratio of state buffer budget to KV cache
+    # Hybrid recurrent state: ratio of state buffer budget to KV cache
     # budget for hybrid models. r = state / kv (matches sglang PyTorch
     # mamba_full_memory_ratio). state_budget = available * r/(1+r).
     state_to_kv_ratio: float = 0.9

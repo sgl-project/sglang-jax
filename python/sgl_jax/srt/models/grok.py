@@ -31,7 +31,7 @@ from sgl_jax.srt.layers.logits_processor import (
 )
 from sgl_jax.srt.layers.moe import EPMoE, create_moe_weights_mapping
 from sgl_jax.srt.layers.radix_attention import RadixAttention
-from sgl_jax.srt.mem_cache.memory_pool import KVCache
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
@@ -843,7 +843,7 @@ class Grok1ForCausalLM(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
-        memory_pools,
+        memory_pools: MemoryPools,
         logits_metadata: LogitsMetadata,
     ) -> tuple[LogitsProcessorOutput, dict, bool, list[jax.Array | None]]:
         """Forward pass through the model using unified forward_batch API."""

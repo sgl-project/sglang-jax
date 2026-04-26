@@ -4,6 +4,13 @@ import unittest
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import Mesh
+
+
+def _mesh():
+    """Single-device mesh with the canonical "tensor" axis name; matches the
+    sharding axis RecurrentStatePool partitions H / proj_size on."""
+    return Mesh(np.array(jax.devices()), ("tensor",))
 
 
 def _rsp(max_num_reqs=2):
@@ -15,6 +22,7 @@ def _rsp(max_num_reqs=2):
         num_heads=1,
         head_dim=2,
         conv_kernel_size=4,
+        mesh=_mesh(),
     )
 
 
@@ -92,7 +100,7 @@ class TestMemoryPoolsContainer(unittest.TestCase):
         leaves, treedef = jax.tree_util.tree_flatten(mp)
         mp2 = jax.tree_util.tree_unflatten(treedef, leaves)
         self.assertTrue(hasattr(mp2, "recurrent_state_pool"))
-        for layer in range(rsp.num_layers):
+        for layer in range(rsp.num_linear_recurrent_layers):
             self.assertTrue(
                 bool(
                     jnp.all(
@@ -131,7 +139,7 @@ class TestMemoryPoolsReplaceAll(unittest.TestCase):
         new_recurrent = [jnp.ones_like(b) * 5.0 for b in rsp.recurrent_buffers]
         new_conv = [[jnp.ones_like(c) for c in inner] for inner in rsp.conv_buffers]
         mp.replace_all({"recurrent_state_pool": (new_recurrent, new_conv)})
-        for layer in range(rsp.num_layers):
+        for layer in range(rsp.num_linear_recurrent_layers):
             self.assertTrue(bool(jnp.all(rsp.recurrent_buffers[layer] == 5)))
 
     def test_replace_all_two_pools_each_gets_its_value_type(self):
@@ -150,7 +158,7 @@ class TestMemoryPoolsReplaceAll(unittest.TestCase):
         )
         # KV pool received the original list (contract: no value unpacking).
         self.assertIsInstance(kv.last_replace_value, list)
-        for layer in range(rsp.num_layers):
+        for layer in range(rsp.num_linear_recurrent_layers):
             self.assertTrue(bool(jnp.all(rsp.recurrent_buffers[layer] == 1)))
 
     def test_replace_all_missing_key_raises(self):
@@ -280,6 +288,7 @@ class TestMemoryPoolsJitDonate(unittest.TestCase):
             num_heads=1,
             head_dim=2,
             conv_kernel_size=4,
+            mesh=_mesh(),
         )
         mp = MemoryPools(recurrent_state_pool=rsp)
 
@@ -334,7 +343,7 @@ class TestMemoryPoolsJitDonate(unittest.TestCase):
         req = SimpleNamespace(req_pool_idx=None, recurrent_pool_idx=None, is_chunked=0)
         hybrid.alloc([req])
         # The newly allocated slot is cleared in every layer + every inner.
-        for layer in range(rsp.num_layers):
+        for layer in range(rsp.num_linear_recurrent_layers):
             self.assertTrue(
                 bool(jnp.all(rsp.recurrent_buffers[layer][req.recurrent_pool_idx] == 0))
             )

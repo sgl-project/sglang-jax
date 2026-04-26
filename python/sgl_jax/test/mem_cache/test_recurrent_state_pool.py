@@ -3,6 +3,14 @@ import unittest
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.sharding import Mesh
+
+
+def _mesh():
+    """Single-device mesh with the canonical "tensor" axis name; matches the
+    sharding axis RecurrentStatePool partitions H / proj_size on."""
+    return Mesh(np.array(jax.devices()), ("tensor",))
 
 
 class _Base(unittest.TestCase):
@@ -19,6 +27,7 @@ class _Base(unittest.TestCase):
             num_heads=2,
             head_dim=4,
             conv_kernel_size=4,
+            mesh=_mesh(),
         )
         kwargs.update(overrides)
         return RecurrentStatePool(**kwargs)
@@ -61,13 +70,49 @@ class TestInit(_Base):
                 self.assertEqual(pool.conv_buffers[layer][inner].dtype, jnp.bfloat16)
                 self.assertTrue(bool(jnp.all(pool.conv_buffers[layer][inner] == 0)))
 
-    def test_free_slots_starts_from_one(self):
+    def test_free_slots_no_longer_attribute(self):
+        """Lock-in: slot allocator state was moved to HybridReqToTokenPool;
+        RecurrentStatePool must not regrow a free_slots attribute."""
         pool = self._make()
-        self.assertEqual(pool.free_slots, [1, 2, 3, 4])
+        self.assertFalse(hasattr(pool, "free_slots"))
 
     def test_proj_size_attribute(self):
         pool = self._make()
         self.assertEqual(pool.proj_size, 24)
+
+
+class TestKHeadsAndKDimGqaApi(_Base):
+    """num_k_heads / head_k_dim default to num_heads / head_dim (current
+    Kimi-Linear convention) but accept explicit overrides for GQA-style
+    linear-recurrent attention models. Mirrors sglang upstream
+    KimiLinearStateShape.create() defaults."""
+
+    def test_default_k_dims_collapse_to_num_heads_head_dim(self):
+        """Backward-compat: omitting num_k_heads / head_k_dim falls back to V
+        dims so existing Kimi-Linear callers see proj_size = 3*num_heads*head_dim."""
+        pool = self._make(num_heads=4, head_dim=8)
+        self.assertEqual(pool.num_k_heads, 4)
+        self.assertEqual(pool.head_k_dim, 8)
+        # proj_size = 4*8 + 2*(4*8) = 96
+        self.assertEqual(pool.proj_size, 96)
+        # Conv buffer last dim equals proj_size.
+        self.assertEqual(pool.conv_buffers[0][0].shape[-1], 96)
+
+    def test_explicit_gqa_k_dims_change_proj_size(self):
+        """num_k_heads / head_k_dim explicitly set: proj_size reflects the
+        override, decoupled from V dims."""
+        pool = self._make(
+            num_heads=4,
+            head_dim=8,
+            num_k_heads=2,
+            head_k_dim=4,
+        )
+        self.assertEqual(pool.num_k_heads, 2)
+        self.assertEqual(pool.head_k_dim, 4)
+        # proj_size = 4*8 + 2*(2*4) = 48
+        self.assertEqual(pool.proj_size, 48)
+        # Conv buffer last dim matches the GQA proj_size.
+        self.assertEqual(pool.conv_buffers[0][0].shape[-1], 48)
 
 
 class TestPytree(_Base):
@@ -90,7 +135,7 @@ class TestPytree(_Base):
 
         # Buffers are equal layer-by-layer + inner-by-inner.
         self.assertEqual(len(pool2.recurrent_buffers), len(pool.recurrent_buffers))
-        for layer in range(pool.num_layers):
+        for layer in range(pool.num_linear_recurrent_layers):
             self.assertTrue(
                 bool(jnp.all(pool.recurrent_buffers[layer] == pool2.recurrent_buffers[layer]))
             )
@@ -103,13 +148,12 @@ class TestPytree(_Base):
                 )
 
         # Metadata
-        self.assertEqual(pool2.num_layers, pool.num_layers)
+        self.assertEqual(pool2.num_linear_recurrent_layers, pool.num_linear_recurrent_layers)
         self.assertEqual(pool2.max_num_reqs, pool.max_num_reqs)
         self.assertEqual(pool2.num_heads, pool.num_heads)
         self.assertEqual(pool2.head_dim, pool.head_dim)
         self.assertEqual(pool2.conv_kernel_size, pool.conv_kernel_size)
         self.assertEqual(pool2.proj_size, pool.proj_size)
-        self.assertEqual(pool2.free_slots, pool.free_slots)
         self.assertEqual(pool2.recurrent_buffers[0].dtype, jnp.float32)
         self.assertEqual(pool2.conv_buffers[0][0].dtype, jnp.bfloat16)
 
@@ -172,7 +216,6 @@ class TestEdgeCases(_Base):
         self.assertEqual(len(pool.conv_buffers), 1)
         self.assertEqual(len(pool.conv_buffers[0]), 1)
         self.assertEqual(pool.conv_buffers[0][0].shape, (2, 1, 3))
-        self.assertEqual(pool.free_slots, [1])
 
     def test_odd_num_heads_supported(self):
         pool = self._make(num_heads=3)
@@ -201,95 +244,79 @@ class TestEdgeCases(_Base):
                 self._make(**kwargs)
 
 
-class TestAllocFree(_Base):
-    """alloc / free / clear-on-alloc behavior."""
+class TestClearSlot(_Base):
+    """clear_slot helper used by HybridReqToTokenPool for clear-on-alloc."""
 
-    def test_alloc_single_returns_first_free_slot(self):
+    def test_clear_slot_int_zeros_recurrent_and_conv(self):
         pool = self._make()
-        slots = pool.alloc(1)
-        self.assertEqual(slots, [1])
-        self.assertEqual(pool.free_slots, [2, 3, 4])
+        # Stamp non-zero into slot 1 across every layer + every conv inner.
+        for layer in range(pool.num_linear_recurrent_layers):
+            pool.recurrent_buffers[layer] = pool.recurrent_buffers[layer].at[1].set(9.0)
+            for inner in range(len(pool.conv_buffers[layer])):
+                pool.conv_buffers[layer][inner] = (
+                    pool.conv_buffers[layer][inner].at[1].set(jnp.bfloat16(2.5))
+                )
+        pool.clear_slot(1)
+        for layer in range(pool.num_linear_recurrent_layers):
+            self.assertTrue(bool(jnp.all(pool.recurrent_buffers[layer][1] == 0)))
+            for inner in range(len(pool.conv_buffers[layer])):
+                self.assertTrue(bool(jnp.all(pool.conv_buffers[layer][inner][1] == 0)))
 
-    def test_alloc_batch_returns_consecutive_slots(self):
+    def test_clear_slot_list_zeros_multiple(self):
         pool = self._make()
-        slots = pool.alloc(3)
-        self.assertEqual(slots, [1, 2, 3])
-        self.assertEqual(pool.free_slots, [4])
+        for layer in range(pool.num_linear_recurrent_layers):
+            pool.recurrent_buffers[layer] = jnp.ones_like(pool.recurrent_buffers[layer])
+            for inner in range(len(pool.conv_buffers[layer])):
+                pool.conv_buffers[layer][inner] = jnp.ones_like(pool.conv_buffers[layer][inner])
+        pool.clear_slot([1, 2])
+        for layer in range(pool.num_linear_recurrent_layers):
+            for slot in (1, 2):
+                self.assertTrue(bool(jnp.all(pool.recurrent_buffers[layer][slot] == 0)))
+                for inner in range(len(pool.conv_buffers[layer])):
+                    self.assertTrue(bool(jnp.all(pool.conv_buffers[layer][inner][slot] == 0)))
+            # Untouched slots keep their previous content.
+            for slot in (0, 3, 4):
+                self.assertTrue(bool(jnp.all(pool.recurrent_buffers[layer][slot] == 1)))
 
-    def test_alloc_exceeding_returns_none_without_state_change(self):
+    def test_clear_slot_does_not_touch_other_slots(self):
         pool = self._make()
-        pool.alloc(3)
-        before = list(pool.free_slots)
-        # Compare list refs with `is` + per-element `is` to assert nothing was replaced.
+        for layer in range(pool.num_linear_recurrent_layers):
+            pool.recurrent_buffers[layer] = pool.recurrent_buffers[layer].at[3].set(7.0)
+        pool.clear_slot(1)
+        for layer in range(pool.num_linear_recurrent_layers):
+            self.assertTrue(bool(jnp.all(pool.recurrent_buffers[layer][3] == 7)))
+
+    def test_clear_slot_empty_iterable_is_noop(self):
+        pool = self._make()
+        # Refs captured before should equal refs captured after (no scatter issued).
         before_recurrent_refs = list(pool.recurrent_buffers)
         before_conv_refs = [list(inner) for inner in pool.conv_buffers]
-        self.assertIsNone(pool.alloc(2))
-        self.assertEqual(pool.free_slots, before)
-        for layer in range(pool.num_layers):
+        pool.clear_slot([])
+        for layer in range(pool.num_linear_recurrent_layers):
             self.assertIs(pool.recurrent_buffers[layer], before_recurrent_refs[layer])
             for inner in range(len(pool.conv_buffers[layer])):
                 self.assertIs(pool.conv_buffers[layer][inner], before_conv_refs[layer][inner])
 
-    def test_alloc_clears_both_buffers_at_allocated_slots(self):
-        pool = self._make()
-        # Write non-zero via list element mutation (matches the implementation style).
-        for layer in range(pool.num_layers):
-            pool.recurrent_buffers[layer] = jnp.ones_like(pool.recurrent_buffers[layer])
-            for inner in range(len(pool.conv_buffers[layer])):
-                pool.conv_buffers[layer][inner] = jnp.ones_like(pool.conv_buffers[layer][inner])
-        slots = pool.alloc(2)  # [1, 2]
-        for layer in range(pool.num_layers):
-            for idx in slots:
-                self.assertTrue(
-                    bool(jnp.all(pool.recurrent_buffers[layer][idx] == 0)),
-                    f"recurrent_buffers[{layer}][{idx}] not cleared",
-                )
-            for inner in range(len(pool.conv_buffers[layer])):
-                for idx in slots:
-                    self.assertTrue(
-                        bool(jnp.all(pool.conv_buffers[layer][inner][idx] == 0)),
-                        f"conv_buffers[{layer}][{inner}][{idx}] not cleared",
-                    )
-        # Unallocated slot 3 keeps its previous value (per layer + per inner).
-        for layer in range(pool.num_layers):
-            self.assertTrue(bool(jnp.all(pool.recurrent_buffers[layer][3] == 1)))
-            for inner in range(len(pool.conv_buffers[layer])):
-                self.assertTrue(bool(jnp.all(pool.conv_buffers[layer][inner][3] == 1)))
 
-    def test_alloc_does_not_touch_dummy_slot_zero(self):
-        pool = self._make()
-        # Stamp slot 0; alloc must not touch it.
-        for layer in range(pool.num_layers):
-            pool.recurrent_buffers[layer] = pool.recurrent_buffers[layer].at[0].set(7.0)
-        pool.alloc(4)
-        for layer in range(pool.num_layers):
-            self.assertTrue(bool(jnp.all(pool.recurrent_buffers[layer][0] == 7)))
+class TestNoSlotAllocatorState(_Base):
+    """Lock-in: alloc / free / free_slots were moved to HybridReqToTokenPool.
+    The buffer pool must NOT regrow them, even via a pytree roundtrip
+    (a regression here would re-introduce the silent free_slots reset that
+    motivated the refactor)."""
 
-    def test_free_returns_slot_to_pool(self):
+    def test_attributes_absent_on_fresh_pool(self):
         pool = self._make()
-        slots = pool.alloc(2)
-        pool.free(slots[0])
-        self.assertIn(slots[0], pool.free_slots)
+        self.assertFalse(hasattr(pool, "free_slots"))
+        self.assertFalse(hasattr(pool, "alloc"))
+        self.assertFalse(hasattr(pool, "free"))
 
-    def test_free_then_realloc_clears_again(self):
+    def test_attributes_absent_after_pytree_roundtrip(self):
         pool = self._make()
-        slots = pool.alloc(1)  # [1]
-        # Write non-zero into slot 1 (per-layer list element mutation).
-        for layer in range(pool.num_layers):
-            pool.recurrent_buffers[layer] = pool.recurrent_buffers[layer].at[slots[0]].set(99.0)
-        pool.free(slots[0])
-        new_slots = pool.alloc(1)
-        idx = new_slots[0]
-        # After re-alloc the slot is cleared in every layer.
-        for layer in range(pool.num_layers):
-            self.assertTrue(bool(jnp.all(pool.recurrent_buffers[layer][idx] == 0)))
-
-    def test_free_accepts_int_or_list(self):
-        pool = self._make()
-        pool.alloc(3)
-        pool.free(1)
-        pool.free([2, 3])
-        self.assertEqual(sorted(pool.free_slots), [1, 2, 3, 4])
+        leaves, treedef = jax.tree_util.tree_flatten(pool)
+        pool2 = jax.tree_util.tree_unflatten(treedef, leaves)
+        self.assertFalse(hasattr(pool2, "free_slots"))
+        self.assertFalse(hasattr(pool2, "alloc"))
+        self.assertFalse(hasattr(pool2, "free"))
 
 
 class TestReplaceBufferAndClear(_Base):
@@ -300,7 +327,7 @@ class TestReplaceBufferAndClear(_Base):
             [jnp.ones_like(c) * jnp.bfloat16(4.0) for c in inner] for inner in pool.conv_buffers
         ]
         pool.replace_buffer((new_recurrent, new_conv))
-        for layer in range(pool.num_layers):
+        for layer in range(pool.num_linear_recurrent_layers):
             self.assertTrue(bool(jnp.all(pool.recurrent_buffers[layer] == 3)))
             for inner in range(len(pool.conv_buffers[layer])):
                 self.assertTrue(bool(jnp.all(pool.conv_buffers[layer][inner] == jnp.bfloat16(4))))
@@ -310,31 +337,26 @@ class TestReplaceBufferAndClear(_Base):
         new_recurrent = [jnp.zeros_like(b) for b in pool.recurrent_buffers]
         new_conv = [[jnp.zeros_like(c) for c in inner] for inner in pool.conv_buffers]
         pool.replace_buffer((new_recurrent, new_conv))
-        for layer in range(pool.num_layers):
+        for layer in range(pool.num_linear_recurrent_layers):
             self.assertEqual(pool.recurrent_buffers[layer].dtype, jnp.float32)
             for inner in range(len(pool.conv_buffers[layer])):
                 self.assertEqual(pool.conv_buffers[layer][inner].dtype, jnp.bfloat16)
 
-    def test_replace_buffer_does_not_touch_free_slots(self):
+    def test_replace_buffer_does_not_touch_buffer_shapes(self):
         pool = self._make()
-        pool.alloc(2)
+        # Sanity: replace_buffer of all-zero buffers leaves shapes intact and
+        # does not depend on any allocator state living on the pool.
         new_recurrent = [jnp.zeros_like(b) for b in pool.recurrent_buffers]
         new_conv = [[jnp.zeros_like(c) for c in inner] for inner in pool.conv_buffers]
         pool.replace_buffer((new_recurrent, new_conv))
-        self.assertEqual(pool.free_slots, [3, 4])
-
-    def test_alloc_after_replace_uses_correct_slot_order(self):
-        pool = self._make()
-        pool.alloc(2)
-        new_recurrent = [jnp.ones_like(b) for b in pool.recurrent_buffers]
-        new_conv = [[jnp.ones_like(c) for c in inner] for inner in pool.conv_buffers]
-        pool.replace_buffer((new_recurrent, new_conv))
-        slots = pool.alloc(1)
-        self.assertEqual(slots, [3])
+        for layer in range(pool.num_linear_recurrent_layers):
+            self.assertEqual(pool.recurrent_buffers[layer].shape, (5, 2, 4, 4))
+            for inner in range(len(pool.conv_buffers[layer])):
+                self.assertEqual(pool.conv_buffers[layer][inner].shape, (5, 3, 24))
 
     def test_replace_buffer_assert_recurrent_length_mismatch(self):
-        """recurrent list length must equal num_layers."""
-        pool = self._make()  # num_layers = 2
+        """recurrent list length must equal num_linear_recurrent_layers."""
+        pool = self._make()  # num_linear_recurrent_layers = 2
         short_recurrent = [pool.recurrent_buffers[0]]  # length 1
         new_conv = [[jnp.zeros_like(c) for c in inner] for inner in pool.conv_buffers]
         with self.assertRaises(AssertionError):
@@ -359,20 +381,18 @@ class TestReplaceBufferAndClear(_Base):
         with self.assertRaises(AssertionError):
             pool.replace_buffer((new_recurrent, new_conv))
 
-    def test_clear_zeros_both_buffers_and_resets_free_slots(self):
+    def test_clear_zeros_both_buffers(self):
         pool = self._make()
         # Write non-zero via list element mutation (matches implementation style).
-        for layer in range(pool.num_layers):
+        for layer in range(pool.num_linear_recurrent_layers):
             pool.recurrent_buffers[layer] = jnp.ones_like(pool.recurrent_buffers[layer])
             for inner in range(len(pool.conv_buffers[layer])):
                 pool.conv_buffers[layer][inner] = jnp.ones_like(pool.conv_buffers[layer][inner])
-        pool.alloc(3)
         pool.clear()
-        for layer in range(pool.num_layers):
+        for layer in range(pool.num_linear_recurrent_layers):
             self.assertTrue(bool(jnp.all(pool.recurrent_buffers[layer] == 0)))
             for inner in range(len(pool.conv_buffers[layer])):
                 self.assertTrue(bool(jnp.all(pool.conv_buffers[layer][inner] == 0)))
-        self.assertEqual(pool.free_slots, [1, 2, 3, 4])
 
 
 class TestLayersMapping(_Base):
@@ -382,14 +402,14 @@ class TestLayersMapping(_Base):
         pool = self._make()  # [0, 1]
         self.assertEqual(pool.linear_recurrent_layer_ids, [0, 1])
         self.assertEqual(pool.layers_mapping, {0: 0, 1: 1})
-        self.assertEqual(pool.num_layers, 2)
+        self.assertEqual(pool.num_linear_recurrent_layers, 2)
 
     def test_mapping_for_non_consecutive_ids(self):
         pool = self._make(linear_recurrent_layer_ids=[3, 7])
         self.assertEqual(pool.linear_recurrent_layer_ids, [3, 7])
         self.assertEqual(pool.layers_mapping, {3: 0, 7: 1})
-        self.assertEqual(pool.num_layers, 2)
-        # buffers length tracks num_layers, not the max id
+        self.assertEqual(pool.num_linear_recurrent_layers, 2)
+        # buffers length tracks num_linear_recurrent_layers, not the max id
         self.assertEqual(len(pool.recurrent_buffers), 2)
         self.assertEqual(len(pool.conv_buffers), 2)
 
@@ -400,7 +420,7 @@ class TestLayersMapping(_Base):
         full_attn = {3, 7, 11, 15, 19, 23, 26}
         kda_layers = [i for i in range(27) if i not in full_attn]
         pool = self._make(linear_recurrent_layer_ids=kda_layers, max_num_reqs=2)
-        self.assertEqual(pool.num_layers, 20)
+        self.assertEqual(pool.num_linear_recurrent_layers, 20)
         self.assertEqual(len(pool.layers_mapping), 20)
         # Spot-check: first KDA layer (id 0) maps to local idx 0;
         # last KDA layer (id 25) maps to local idx 19.
@@ -416,16 +436,15 @@ class TestLayersMapping(_Base):
     def test_empty_layer_ids_is_legal(self):
         # Degenerate but valid: zero recurrent layers.
         pool = self._make(linear_recurrent_layer_ids=[])
-        self.assertEqual(pool.num_layers, 0)
+        self.assertEqual(pool.num_linear_recurrent_layers, 0)
         self.assertEqual(pool.linear_recurrent_layer_ids, [])
         self.assertEqual(pool.layers_mapping, {})
         self.assertEqual(pool.recurrent_buffers, [])
         self.assertEqual(pool.conv_buffers, [])
-        # alloc / clear must still work on the empty pool.
-        slots = pool.alloc(2)
-        self.assertEqual(slots, [1, 2])
+        # clear / clear_slot must remain no-ops on the empty pool.
         pool.clear()
-        self.assertEqual(pool.free_slots, [1, 2, 3, 4])
+        pool.clear_slot([1, 2])
+        self.assertEqual(pool.recurrent_buffers, [])
 
 
 class TestPytreeRoundtripPreservesMapping(_Base):
@@ -444,7 +463,7 @@ class TestPytreeRoundtripPreservesMapping(_Base):
         pool2 = jax.tree_util.tree_unflatten(treedef, leaves)
         self.assertEqual(pool2.linear_recurrent_layer_ids, [3, 7])
         self.assertEqual(pool2.layers_mapping, {3: 0, 7: 1})
-        self.assertEqual(pool2.num_layers, 2)
+        self.assertEqual(pool2.num_linear_recurrent_layers, 2)
         # External API still works after JIT donate roundtrip.
         rec, conv = pool2.get_linear_recurrent_layer_cache(7)
         self.assertEqual(rec.shape, pool.recurrent_buffers[1].shape)
@@ -479,13 +498,13 @@ class TestGetLinearRecurrentLayerCache(_Base):
         self.assertIn("Registered", str(ctx.exception))
 
     def test_no_setter_method_exposed(self):
-        """RFC-0015: backend uses functional .at[].set() return; pool exposes no setter."""
+        """Backend uses functional .at[].set() return; pool exposes no setter."""
         pool = self._make()
         self.assertFalse(hasattr(pool, "set_linear_recurrent_layer_cache"))
 
 
 class TestBackendFunctionalReturnNoPoolSideEffect(_Base):
-    """RFC-0015 functional pattern: backend reads via get, applies
+    """Functional update pattern: backend reads via get, applies
     .at[indices].set(...) to build a new layer buffer, and returns it. The
     pool's internal recurrent_buffers / conv_buffers list elements stay
     referentially unchanged across the backend call. Persistence happens only
@@ -494,13 +513,17 @@ class TestBackendFunctionalReturnNoPoolSideEffect(_Base):
 
     def test_backend_call_does_not_mutate_pool_buffers(self):
         pool = self._make(linear_recurrent_layer_ids=[3, 7])
-        slots = pool.alloc(2)  # [1, 2]
+        # Slots are picked by HybridReqToTokenPool in production; for this
+        # buffer-pool-only test we just pick the first two valid slots directly.
+        slots = [1, 2]
 
         # Capture per-layer references before the simulated backend call.
-        recurrent_refs_before = [pool.recurrent_buffers[i] for i in range(pool.num_layers)]
+        recurrent_refs_before = [
+            pool.recurrent_buffers[i] for i in range(pool.num_linear_recurrent_layers)
+        ]
         conv_refs_before = [
             [pool.conv_buffers[i][j] for j in range(len(pool.conv_buffers[i]))]
-            for i in range(pool.num_layers)
+            for i in range(pool.num_linear_recurrent_layers)
         ]
 
         idx_arr = jnp.asarray(slots, dtype=jnp.int32)
@@ -523,13 +546,13 @@ class TestBackendFunctionalReturnNoPoolSideEffect(_Base):
             layers_conv.append(new_conv_layer)
 
         # `is` relation must hold: backend never wrote into pool's internal lists.
-        for i in range(pool.num_layers):
+        for i in range(pool.num_linear_recurrent_layers):
             self.assertIs(pool.recurrent_buffers[i], recurrent_refs_before[i])
             for j in range(len(pool.conv_buffers[i])):
                 self.assertIs(pool.conv_buffers[i][j], conv_refs_before[i][j])
 
         # The returned per-layer buffers must be NEW objects (functional update).
-        for i in range(pool.num_layers):
+        for i in range(pool.num_linear_recurrent_layers):
             self.assertIsNot(layers_recurrent[i], recurrent_refs_before[i])
             self.assertIsNot(layers_conv[i][0], conv_refs_before[i][0])
 
@@ -539,7 +562,7 @@ class TestBackendFunctionalReturnNoPoolSideEffect(_Base):
         # CPU path, which may re-wrap the array — so we check value equality
         # against the returned per-layer buffers rather than `is` identity.
         pool.replace_buffer((layers_recurrent, layers_conv))
-        for i in range(pool.num_layers):
+        for i in range(pool.num_linear_recurrent_layers):
             self.assertIsNot(pool.recurrent_buffers[i], recurrent_refs_before[i])
             self.assertTrue(bool(jnp.array_equal(pool.recurrent_buffers[i], layers_recurrent[i])))
             for j in range(len(pool.conv_buffers[i])):
@@ -555,7 +578,7 @@ class TestBackendFunctionalReturnNoPoolSideEffect(_Base):
 
 
 class TestJitMultiLayerSharingContract(_Base):
-    """RFC-0015 functional contract under JIT: the model layer collects
+    """Functional contract under JIT: the model layer collects
     per-layer backend outputs into ``(layers_recurrent, layers_conv)`` and
     returns them. Each layer's contribution must be preserved (no layer drops
     out) when the pool is later updated via replace_buffer. This replaces the
@@ -596,6 +619,104 @@ class TestJitMultiLayerSharingContract(_Base):
         self.assertEqual(float(pool.recurrent_buffers[1][1, 0, 0, 0]), 7.0)
         self.assertEqual(float(pool.conv_buffers[0][0][1, 0, 0]), 3.5)
         self.assertEqual(float(pool.conv_buffers[1][0][1, 0, 0]), 7.5)
+
+
+class TestShardingPersistence(_Base):
+    """Sharding lock-in: buffers ship with the recurrent_sharding /
+    conv_sharding NamedSharding from _create_buffers, and clear() preserves
+    that sharding via jnp.zeros_like (decision 3 sanity check; if a future
+    JAX release stops propagating sharding through zeros_like, this test
+    will fail and force the implementation to switch to _create_buffers
+    rebuild)."""
+
+    def test_initial_buffers_carry_persisted_sharding(self):
+        pool = self._make()
+        for layer in range(pool.num_linear_recurrent_layers):
+            self.assertEqual(
+                pool.recurrent_buffers[layer].sharding,
+                pool.recurrent_sharding,
+                f"layer {layer} recurrent buffer must ship with recurrent_sharding",
+            )
+            for inner in range(len(pool.conv_buffers[layer])):
+                self.assertEqual(
+                    pool.conv_buffers[layer][inner].sharding,
+                    pool.conv_sharding,
+                    f"layer {layer} conv[{inner}] must ship with conv_sharding",
+                )
+
+    def test_clear_preserves_sharding(self):
+        """Decision 3: clear() uses jnp.zeros_like which must preserve the
+        sharded array's sharding metadata. If JAX behavior changes, the
+        cleared buffer would lose its NamedSharding -- caught here."""
+        pool = self._make()
+        # Mutate buffers first so clear() actually has work to do.
+        pool.recurrent_buffers[0] = pool.recurrent_buffers[0].at[1].set(1.5)
+        pool.conv_buffers[0][0] = pool.conv_buffers[0][0].at[1].set(jnp.bfloat16(2.5))
+
+        pool.clear()
+
+        for layer in range(pool.num_linear_recurrent_layers):
+            self.assertEqual(
+                pool.recurrent_buffers[layer].sharding,
+                pool.recurrent_sharding,
+                f"clear() must preserve recurrent_sharding on layer {layer}",
+            )
+            for inner in range(len(pool.conv_buffers[layer])):
+                self.assertEqual(
+                    pool.conv_buffers[layer][inner].sharding,
+                    pool.conv_sharding,
+                    f"clear() must preserve conv_sharding on layer {layer}[{inner}]",
+                )
+
+
+class TestPytreeRoundtripPreservesMeshAndSharding(_Base):
+    """Lock-in: tree_flatten aux must carry mesh + partition axis names +
+    NamedSharding objects so JIT donate cycles (which round-trip through
+    flatten / unflatten) don't drop sharding metadata. This is the same class
+    of bug  hit when layers_mapping was missing from aux."""
+
+    def test_aux_is_hashable(self):
+        """JAX requires aux_data to be hashable (it lives in the treedef)."""
+        pool = self._make()
+        _, aux = pool.tree_flatten()
+        # Will raise TypeError if any aux element is unhashable.
+        hash(aux)
+
+    def test_roundtrip_preserves_mesh_and_partition_axes(self):
+        pool = self._make()
+        leaves, treedef = jax.tree_util.tree_flatten(pool)
+        pool2 = jax.tree_util.tree_unflatten(treedef, leaves)
+
+        self.assertIs(pool2.mesh, pool.mesh)
+        self.assertEqual(pool2.recurrent_partition_axis, pool.recurrent_partition_axis)
+        self.assertEqual(pool2.conv_partition_axis, pool.conv_partition_axis)
+
+    def test_roundtrip_preserves_sharding_specs(self):
+        pool = self._make()
+        leaves, treedef = jax.tree_util.tree_flatten(pool)
+        pool2 = jax.tree_util.tree_unflatten(treedef, leaves)
+
+        self.assertEqual(pool2.recurrent_sharding, pool.recurrent_sharding)
+        self.assertEqual(pool2.conv_sharding, pool.conv_sharding)
+
+    def test_roundtrip_preserves_per_layer_buffer_sharding(self):
+        """After unflatten, the restored per-layer buffers must still report
+        the original sharding -- otherwise replace_buffer's persisted-sharding
+        device_put fix would drift from what JIT sees on the next trace."""
+        pool = self._make()
+        leaves, treedef = jax.tree_util.tree_flatten(pool)
+        pool2 = jax.tree_util.tree_unflatten(treedef, leaves)
+
+        for layer in range(pool.num_linear_recurrent_layers):
+            self.assertEqual(
+                pool2.recurrent_buffers[layer].sharding,
+                pool.recurrent_sharding,
+            )
+            for inner in range(len(pool.conv_buffers[layer])):
+                self.assertEqual(
+                    pool2.conv_buffers[layer][inner].sharding,
+                    pool.conv_sharding,
+                )
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
-"""Phase 3 Task 5 lock-in: _wrap_pool_updates bridge removed.
+"""  lock-in: _wrap_pool_updates bridge removed.
 
 Once all 13 edited models return dict (and llama_eagle3 inherits the
 migrated parent __call__), the legacy bridge helper is deleted.
 TestForwardBridgeAcceptsBothShapes (transient, asserted bridge behavior
-during Tasks 2-4) is replaced by TestForwardBridgeRemoved (asserts the
+during ) is replaced by TestForwardBridgeRemoved (asserts the
 helper no longer exists).
 """
 
@@ -11,7 +11,7 @@ import unittest
 
 
 class TestForwardBridgeRemoved(unittest.TestCase):
-    """Phase 3 Task 5: once all 13 edited models return dict (and llama_eagle3
+    """: once all 13 edited models return dict (and llama_eagle3
     inherits the migrated parent __call__), the legacy bridge helper must be
     deleted (no half-finished implementations)."""
 

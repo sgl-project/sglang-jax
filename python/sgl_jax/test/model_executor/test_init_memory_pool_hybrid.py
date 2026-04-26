@@ -11,6 +11,14 @@ import unittest
 from types import SimpleNamespace
 
 import jax
+import numpy as np
+from jax.sharding import Mesh
+
+
+def _mesh():
+    """Single-device mesh with the canonical "tensor" axis name; matches the
+    sharding axis RecurrentStatePool partitions H / proj_size on."""
+    return Mesh(np.array(jax.devices()), ("tensor",))
 
 
 def _kimi_cfg(kda_layers=None, num_heads=2, head_dim=4, conv_kernel_size=4):
@@ -21,7 +29,7 @@ def _kimi_cfg(kda_layers=None, num_heads=2, head_dim=4, conv_kernel_size=4):
     negative path where the hf_config carries no ``linear_attn_config``.
 
     NOTE: linear_attn_config is a `dict | None` in real Kimi-Linear HF config
-    (see Decision #12). KimiLinearConfig's own __init__ asserts both
+    (see ). KimiLinearConfig's own __init__ asserts both
     ``kda_layers`` and ``full_attn_layers`` keys are present and non-None
     when the dict is given; we satisfy that with an empty ``full_attn_layers``
     list (length is irrelevant to the recurrent pool path).
@@ -138,6 +146,7 @@ class TestInitMemoryPoolHybridBranch(unittest.TestCase):
             max_context_len=16,
             tp_size=1,
             token_to_kv_pool=mha_like_stub,
+            mesh=_mesh(),
         )
         self.assertIsInstance(rsp, RecurrentStatePool)
         self.assertIsInstance(hybrid_pool, HybridReqToTokenPool)
@@ -171,6 +180,7 @@ class TestInitMemoryPoolHybridBranch(unittest.TestCase):
             max_context_len=16,
             tp_size=1,
             token_to_kv_pool=mla_like_stub,
+            mesh=_mesh(),
         )
         self.assertIsInstance(mp, MemoryPools)
         self.assertEqual(set(mp._pools.keys()), {"token_to_kv_pool", "recurrent_state_pool"})
@@ -181,39 +191,43 @@ class TestInitMemoryPoolHybridBranch(unittest.TestCase):
 
 
 class TestServerArgsForcedConstraints(unittest.TestCase):
-    """has_recurrent_state model must force disable_radix_cache=True
-    and assert disable_overlap_schedule=True."""
+    """has_recurrent_state model must assert both disable_radix_cache=True
+    and disable_overlap_schedule=True (transparent failure, not silent override)."""
 
     def setUp(self):
         if not jax.devices():
             self.skipTest("JAX not available")
 
-    def test_force_disable_radix_cache_logs_and_sets_true(self):
+    def test_assert_radix_cache_disabled_when_user_left_it_enabled(self):
         from sgl_jax.srt.model_executor.model_runner import (
             _enforce_recurrent_state_server_constraints,
         )
 
         sa = SimpleNamespace(disable_radix_cache=False, disable_overlap_schedule=True)
-        _enforce_recurrent_state_server_constraints(sa)
-        self.assertTrue(sa.disable_radix_cache)
+        with self.assertRaises(AssertionError) as cm:
+            _enforce_recurrent_state_server_constraints(sa)
+        self.assertIn("disable-radix-cache", str(cm.exception))
 
-    def test_disable_radix_cache_already_true_is_idempotent(self):
+    def test_both_disabled_passes(self):
         from sgl_jax.srt.model_executor.model_runner import (
             _enforce_recurrent_state_server_constraints,
         )
 
         sa = SimpleNamespace(disable_radix_cache=True, disable_overlap_schedule=True)
+        # Should not raise.
         _enforce_recurrent_state_server_constraints(sa)
-        self.assertTrue(sa.disable_radix_cache)
 
     def test_assert_overlap_schedule_disabled(self):
         from sgl_jax.srt.model_executor.model_runner import (
             _enforce_recurrent_state_server_constraints,
         )
 
-        sa = SimpleNamespace(disable_radix_cache=False, disable_overlap_schedule=False)
-        with self.assertRaises(AssertionError):
+        # Use disable_radix_cache=True so the radix-cache assert passes and
+        # we hit the overlap-schedule assert specifically.
+        sa = SimpleNamespace(disable_radix_cache=True, disable_overlap_schedule=False)
+        with self.assertRaises(AssertionError) as cm:
             _enforce_recurrent_state_server_constraints(sa)
+        self.assertIn("disable-overlap-schedule", str(cm.exception))
 
 
 class TestForwardCallsReplaceAll(unittest.TestCase):
@@ -229,7 +243,7 @@ class TestForwardCallsReplaceAll(unittest.TestCase):
             self.skipTest("JAX not available")
 
     def test_set_kv_cache_after_forward_method_removed(self):
-        """After Task 5, _set_kv_cache_after_forward must be deleted."""
+        """After , _set_kv_cache_after_forward must be deleted."""
         from sgl_jax.srt.model_executor import model_runner
 
         self.assertFalse(
@@ -291,7 +305,7 @@ class TestStateToKvRatioZeroGuard(unittest.TestCase):
 
 
 class TestPhase2EndToEndSanity(unittest.TestCase):
-    """Phase 2 surface integration: hybrid pool wiring + non-hybrid wrapping
+    """surface integration: hybrid pool wiring + non-hybrid wrapping
     + JIT signature both work without raising at construction time."""
 
     def setUp(self):
@@ -310,6 +324,7 @@ class TestPhase2EndToEndSanity(unittest.TestCase):
             max_context_len=16,
             tp_size=1,
             token_to_kv_pool=kv_stub,
+            mesh=_mesh(),
         )
         # All three pools share the same RecurrentStatePool instance.
         self.assertIs(rsp, hybrid_pool.recurrent_state_pool)

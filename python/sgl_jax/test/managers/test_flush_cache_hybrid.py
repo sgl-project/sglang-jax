@@ -1,7 +1,7 @@
-"""Phase 5: flush_cache must reset hybrid recurrent state via existing path.
+""": flush_cache must reset hybrid recurrent state via existing path.
 
 scheduler.flush_cache calls self.req_to_token_pool.clear(); for hybrid
-pools, HybridReqToTokenPool.clear (Phase 1) chains super().clear() +
+pools, HybridReqToTokenPool.clear  chains super().clear() +
 recurrent_state_pool.clear(). This test guards that chain end-to-end
 without exercising the full Scheduler.flush_cache path.
 
@@ -14,6 +14,13 @@ import unittest
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import Mesh
+
+
+def _mesh():
+    """Single-device mesh with the canonical "tensor" axis name; matches the
+    sharding axis RecurrentStatePool partitions H / proj_size on."""
+    return Mesh(np.array(jax.devices()), ("tensor",))
 
 
 class TestHybridReqToTokenPoolClearResetsRecurrentState(unittest.TestCase):
@@ -34,6 +41,7 @@ class TestHybridReqToTokenPoolClearResetsRecurrentState(unittest.TestCase):
             num_heads=2,
             head_dim=4,
             conv_kernel_size=4,
+            mesh=_mesh(),
         )
         return HybridReqToTokenPool(
             size=5, max_context_len=16, dtype=np.int32, recurrent_state_pool=rsp
@@ -78,7 +86,7 @@ class TestHybridReqToTokenPoolClearResetsRecurrentState(unittest.TestCase):
 
 class TestSchedulerFlushCacheCallsClear(unittest.TestCase):
     """Static check: scheduler.flush_cache still calls req_to_token_pool.clear()
-    after Phase 5 refactors (defensive guard against future code drift)."""
+    after  refactors (defensive guard against future code drift)."""
 
     def test_flush_cache_source_calls_req_to_token_pool_clear(self):
         import inspect
