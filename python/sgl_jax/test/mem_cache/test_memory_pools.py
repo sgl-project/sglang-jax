@@ -181,6 +181,38 @@ class TestMemoryPoolsReplaceAll(unittest.TestCase):
         with self.assertRaises(ValueError):
             mp.replace_all({})
 
+    def test_replace_all_accepts_legacy_list(self):
+        """Single-pool legacy / encoder-style models return a bare list of
+        per-layer KV arrays at idx 1 (no MemoryPools dispatch key). The
+        container must absorb that shape internally so caller and model code
+        both stay insulated from the multi-pool naming convention -- mirroring
+        base/upstream's _set_kv_cache_after_forward(list) call site."""
+        from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
+
+        kv = _StubKVPool(jnp.zeros(2))
+        mp = MemoryPools(token_to_kv_pool=kv)
+
+        layers = [jnp.ones(2), jnp.ones(2) * 2]
+        mp.replace_all(layers)
+
+        # Legacy list is forwarded as-is to the kv pool's replace_buffer.
+        self.assertIs(kv.last_replace_value, layers)
+
+    def test_replace_all_legacy_list_rejected_when_multi_pool(self):
+        """List shape is unambiguous only for single-pool MemoryPools (it
+        implies token_to_kv_pool). For a multi-pool container the caller
+        must use the explicit dict shape; bare list raises so a hybrid
+        workload cannot silently drop the recurrent_state_pool update."""
+        from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
+
+        rsp = _rsp()
+        mp = MemoryPools(
+            token_to_kv_pool=_StubKVPool(jnp.zeros(2)),
+            recurrent_state_pool=rsp,
+        )
+        with self.assertRaises(ValueError):
+            mp.replace_all([jnp.zeros(2)])
+
 
 class TestMemoryPoolsJitDonate(unittest.TestCase):
     """End-to-end: JIT donate(memory_pools) -> model returns pool_updates -> replace_all.

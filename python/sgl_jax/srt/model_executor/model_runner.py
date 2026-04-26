@@ -141,6 +141,46 @@ def _compute_max_num_reqs_from_state_budget(state_budget: int, per_req_bytes: in
     return state_budget // per_req_bytes
 
 
+def _per_token_mha_kv_bytes(
+    num_kv_heads_with_replication: int,
+    head_dim: int,
+    num_layers: int,
+    kv_dtype_bytes: int,
+) -> int:
+    """Per-token KV cache bytes for the MHA pool path.
+
+    Mirrors MHATokenToKVPool's per-token storage: K and V each occupy one slot
+    of (num_kv_heads_with_replication * head_dim * num_layers) elements, so the
+    factor of 2 is K+V. Caller passes num_kv_heads_with_replication (already
+    accounting for tp replication) and the same padded head_dim that the pool
+    constructor uses.
+    """
+    return num_kv_heads_with_replication * head_dim * num_layers * kv_dtype_bytes * 2
+
+
+def _per_req_state_bytes_from_config(linear_attn_config: dict, tp_size: int) -> int:
+    """Per-request recurrent + conv state bytes for a hybrid recurrent model.
+
+    Resolves temporal_dtype / conv_dtype via the same env var lookup that
+    RecurrentStatePool.__init__ uses, so the budget estimate matches the
+    pool's actual allocation. Wraps _compute_recurrent_per_req_bytes to keep
+    the dtype resolution out of init_memory_pool.
+    """
+    from sgl_jax.srt.mem_cache.recurrent_state_pool import _resolve_dtype
+
+    temporal_dtype = _resolve_dtype("SGLANG_JAX_RECURRENT_STATE_DTYPE", jnp.float32)
+    conv_dtype = _resolve_dtype("SGLANG_JAX_CONV_STATE_DTYPE", jnp.bfloat16)
+    return _compute_recurrent_per_req_bytes(
+        num_layers=len(linear_attn_config["kda_layers"]),
+        num_heads=linear_attn_config["num_heads"],
+        head_dim=linear_attn_config["head_dim"],
+        conv_kernel_size=linear_attn_config["short_conv_kernel_size"],
+        tp_size=tp_size,
+        temporal_dtype_bytes=jnp.dtype(temporal_dtype).itemsize,
+        conv_dtype_bytes=jnp.dtype(conv_dtype).itemsize,
+    )
+
+
 def _check_state_to_kv_ratio_for_hybrid(state_to_kv_ratio: float) -> None:
     """D5: fail-fast if state_to_kv_ratio is non-positive when has_recurrent_state.
 
@@ -345,11 +385,8 @@ class ModelRunner(BaseModelRunner):
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
-            # Phase 2: model __call__ still expects token_to_kv_pool; bridge here.
-            # Phase 3 will migrate models to take memory_pools directly.
-            kv_pool = memory_pools.token_to_kv_pool
             with LoraBatchContext.set_batch(forward_batch):
-                return model(forward_batch, kv_pool, logits_metadata)
+                return model(forward_batch, memory_pools, logits_metadata)
 
         # Capture base RNG key as a constant in the JIT closure.
         # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
@@ -690,6 +727,82 @@ class ModelRunner(BaseModelRunner):
         if has_recurrent_state:
             _enforce_recurrent_state_server_constraints(self.server_args)
             _check_state_to_kv_ratio_for_hybrid(self.server_args.state_to_kv_ratio)
+
+            # Budget split must happen BEFORE token_to_kv_pool construction
+            # so the KV pool is sized against kv_budget instead of the full
+            # profile (otherwise state_to_kv_ratio is dead code: KV pool keeps
+            # all HBM and the state pool starves at runtime).
+            if self.is_hybrid or self.use_mla_backend:
+                # SWA-hybrid (full + swa KV pools) and absorbed-MLA (latent KV
+                # geometry) have different per-token byte formulas; keeping
+                # those out of scope for now keeps the MHA + recurrent path
+                # honest. Removing this guard requires per-path per_token
+                # byte helpers that match each pool's actual storage shape.
+                raise NotImplementedError(
+                    "state_to_kv_ratio budget split is implemented only for "
+                    "the MHA + recurrent_state path; SWA-hybrid and MLA paths "
+                    "are TODO."
+                )
+
+            per_token_kv_bytes = _per_token_mha_kv_bytes(
+                num_kv_heads_with_replication=(
+                    self.model_config.get_total_num_kv_heads_with_replication(self.tp_size)
+                ),
+                head_dim=(self.model_config.head_dim + 127) // 128 * 128,
+                num_layers=self.model_config.num_hidden_layers,
+                kv_dtype_bytes=jnp.dtype(self.kv_cache_dtype).itemsize,
+            )
+            available_bytes = self.max_total_num_tokens * per_token_kv_bytes
+            state_budget, kv_budget = _split_state_kv_budget(
+                available_bytes, self.server_args.state_to_kv_ratio
+            )
+
+            # Re-derive max_total_num_tokens from kv_budget; re-align to page
+            # size since the prior alignment was over the full profile.
+            new_max_tokens = kv_budget // per_token_kv_bytes
+            new_max_tokens = (
+                new_max_tokens // self.server_args.page_size * self.server_args.page_size
+            )
+            if new_max_tokens <= 0:
+                raise RuntimeError(
+                    "state_to_kv_ratio split left no KV budget; "
+                    f"kv_budget={kv_budget} bytes, per_token={per_token_kv_bytes} bytes. "
+                    "Lower --state-to-kv-ratio or increase --mem-fraction-static."
+                )
+            logger.info(
+                "Hybrid budget split (state_to_kv_ratio=%s): "
+                "max_total_num_tokens %s -> %s (kv_budget=%s bytes)",
+                self.server_args.state_to_kv_ratio,
+                self.max_total_num_tokens,
+                new_max_tokens,
+                kv_budget,
+            )
+            self.max_total_num_tokens = new_max_tokens
+
+            # Re-derive max_num_reqs from state_budget so RecurrentStatePool is
+            # sized against actual recurrent + conv per-request bytes.
+            per_req_state_bytes = _per_req_state_bytes_from_config(
+                recurrent_cfg.linear_attn_config, self.tp_size
+            )
+            state_max_reqs = _compute_max_num_reqs_from_state_budget(
+                state_budget, per_req_state_bytes
+            )
+            if state_max_reqs <= 0:
+                raise RuntimeError(
+                    "state_to_kv_ratio split left no recurrent state budget; "
+                    f"state_budget={state_budget} bytes, "
+                    f"per_req_state={per_req_state_bytes} bytes. "
+                    "Raise --state-to-kv-ratio or increase --mem-fraction-static."
+                )
+            logger.info(
+                "Hybrid budget split: max_num_reqs %s -> %s "
+                "(state_budget=%s bytes, per_req=%s bytes)",
+                max_num_reqs,
+                state_max_reqs,
+                state_budget,
+                per_req_state_bytes,
+            )
+            max_num_reqs = state_max_reqs
 
         # Create request to token pool if not already created.
         # For hybrid models, defer to after token_to_kv_pool is built so we can

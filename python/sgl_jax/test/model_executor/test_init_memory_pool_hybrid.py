@@ -329,5 +329,158 @@ class TestPhase2EndToEndSanity(unittest.TestCase):
         self.assertEqual(captured["v"], ["dummy_layer"])
 
 
+class TestPerTokenMhaKvBytes(unittest.TestCase):
+    """_per_token_mha_kv_bytes mirrors MHATokenToKVPool's per-token storage:
+    K and V each occupy num_kv_heads_with_replication * head_dim * num_layers
+    elements, hence the * 2 factor. Caller is responsible for any tp / padding
+    adjustment on the inputs."""
+
+    def test_basic_computation(self):
+        from sgl_jax.srt.model_executor.model_runner import _per_token_mha_kv_bytes
+
+        # 8 kv heads, 128 head_dim, 32 layers, bf16 (2 bytes) -> K+V doubles it.
+        per_token = _per_token_mha_kv_bytes(
+            num_kv_heads_with_replication=8,
+            head_dim=128,
+            num_layers=32,
+            kv_dtype_bytes=2,
+        )
+        self.assertEqual(per_token, 8 * 128 * 32 * 2 * 2)
+
+    def test_dtype_scales_linearly(self):
+        from sgl_jax.srt.model_executor.model_runner import _per_token_mha_kv_bytes
+
+        bf16 = _per_token_mha_kv_bytes(8, 128, 32, kv_dtype_bytes=2)
+        f32 = _per_token_mha_kv_bytes(8, 128, 32, kv_dtype_bytes=4)
+        self.assertEqual(f32, 2 * bf16)
+
+
+class TestPerReqStateBytesFromConfig(unittest.TestCase):
+    """_per_req_state_bytes_from_config wraps _compute_recurrent_per_req_bytes
+    after resolving temporal_dtype / conv_dtype with the same env-var lookup
+    that RecurrentStatePool uses, so the budget estimate matches the pool's
+    actual allocation."""
+
+    def setUp(self):
+        if not jax.devices():
+            self.skipTest("JAX not available")
+
+    def test_default_dtypes_match_pool_construction(self):
+        """Default temporal=f32 (4) + conv=bf16 (2). Compare against the
+        canonical per_req formula at tp=1."""
+        from sgl_jax.srt.model_executor.model_runner import (
+            _per_req_state_bytes_from_config,
+        )
+
+        cfg = {
+            "kda_layers": [0, 1, 2],
+            "num_heads": 4,
+            "head_dim": 16,
+            "short_conv_kernel_size": 4,
+        }
+        bytes_ = _per_req_state_bytes_from_config(cfg, tp_size=1)
+        proj_size = 4 * 16 + 2 * (4 * 16)  # = 192
+        expected_recurrent = 3 * 4 * 16 * 16 * 4
+        expected_conv = 3 * 3 * proj_size * 2
+        self.assertEqual(bytes_, expected_recurrent + expected_conv)
+
+    def test_tp_size_divides_per_device_bytes(self):
+        from sgl_jax.srt.model_executor.model_runner import (
+            _per_req_state_bytes_from_config,
+        )
+
+        cfg = {
+            "kda_layers": [0, 1],
+            "num_heads": 8,
+            "head_dim": 16,
+            "short_conv_kernel_size": 4,
+        }
+        tp1 = _per_req_state_bytes_from_config(cfg, tp_size=1)
+        tp2 = _per_req_state_bytes_from_config(cfg, tp_size=2)
+        # Both recurrent and conv components scale by 1/tp.
+        self.assertEqual(tp1, tp2 * 2)
+
+
+class TestStateToKvRatioActuallySplitsBudget(unittest.TestCase):
+    """Structural lock-in: init_memory_pool must wire the budget split helpers
+    in the hybrid branch BEFORE token_to_kv_pool / hybrid pool construction.
+    Otherwise state_to_kv_ratio is dead code: KV pool keeps the full profile
+    and the recurrent state pool starves at runtime."""
+
+    def setUp(self):
+        if not jax.devices():
+            self.skipTest("JAX not available")
+
+    def _src(self):
+        import inspect
+
+        from sgl_jax.srt.model_executor.model_runner import ModelRunner
+
+        return inspect.getsource(ModelRunner.init_memory_pool)
+
+    def test_split_helpers_are_called(self):
+        src = self._src()
+        self.assertIn("_split_state_kv_budget(", src)
+        self.assertIn("_compute_max_num_reqs_from_state_budget(", src)
+        self.assertIn("_per_token_mha_kv_bytes(", src)
+        self.assertIn("_per_req_state_bytes_from_config(", src)
+
+    def test_split_happens_before_kv_pool_construction(self):
+        """The kv_budget recompute must precede MHATokenToKVPool construction;
+        otherwise the pool is sized against the full profile."""
+        src = self._src()
+        split_pos = src.find("_split_state_kv_budget(")
+        mha_pool_pos = src.find("MHATokenToKVPool(")
+        self.assertGreater(split_pos, 0, "split helper must be called in init_memory_pool")
+        self.assertGreater(
+            mha_pool_pos, 0, "MHATokenToKVPool must be constructed in init_memory_pool"
+        )
+        self.assertLess(
+            split_pos,
+            mha_pool_pos,
+            "_split_state_kv_budget must be called BEFORE MHATokenToKVPool() "
+            "so the pool size reflects kv_budget, not the full profile.",
+        )
+
+    def test_max_num_reqs_recomputed_before_build_hybrid_pools(self):
+        """max_num_reqs override must happen before _build_hybrid_pools so
+        RecurrentStatePool is sized against state_budget, not the default
+        formula."""
+        src = self._src()
+        reqs_pos = src.find("_compute_max_num_reqs_from_state_budget(")
+        build_pos = src.find("_build_hybrid_pools(")
+        self.assertGreater(reqs_pos, 0)
+        self.assertGreater(build_pos, 0)
+        self.assertLess(
+            reqs_pos,
+            build_pos,
+            "max_num_reqs must be recomputed from state_budget BEFORE "
+            "_build_hybrid_pools(...) so RecurrentStatePool gets the "
+            "ratio-derived size.",
+        )
+
+
+class TestMlaAndSwaHybridRaiseNotImplemented(unittest.TestCase):
+    """MLA + recurrent_state and SWA + recurrent_state are out of scope for
+    this initial wiring (per-token byte formulas differ from MHA). Lock-in
+    that init_memory_pool fails fast with NotImplementedError instead of
+    silently sizing pools wrong."""
+
+    def setUp(self):
+        if not jax.devices():
+            self.skipTest("JAX not available")
+
+    def test_init_memory_pool_source_guards_mla_and_swa(self):
+        """Source-level lock-in: the guard raises NotImplementedError when
+        is_hybrid (SWA) or use_mla_backend is True in the recurrent branch."""
+        import inspect
+
+        from sgl_jax.srt.model_executor.model_runner import ModelRunner
+
+        src = inspect.getsource(ModelRunner.init_memory_pool)
+        self.assertIn("self.is_hybrid or self.use_mla_backend", src)
+        self.assertIn("NotImplementedError", src)
+
+
 if __name__ == "__main__":
     unittest.main()

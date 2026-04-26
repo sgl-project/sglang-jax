@@ -13,8 +13,13 @@ def _make_req(req_pool_idx=None, is_chunked=0):
     )
 
 
-class TestReqToTokenPoolAllocBackwardCompat(unittest.TestCase):
-    """Backwards-compatible signature: int (legacy) or list[Req] (new chunked-prefill path)."""
+class TestReqToTokenPoolAlloc(unittest.TestCase):
+    """Signature: alloc(reqs: list[Req-like]) -> list[int] | None.
+
+    The int path was a transient compat shim and has been removed; callers
+    must construct Req-like objects (chunked-prefill semantics depend on
+    req_pool_idx / is_chunked, which int can't carry).
+    """
 
     def setUp(self):
         if not jax.devices():
@@ -25,24 +30,6 @@ class TestReqToTokenPoolAllocBackwardCompat(unittest.TestCase):
 
         return ReqToTokenPool(size=4, max_context_len=8, dtype=np.int32)
 
-    # --- int path (backwards-compatible) ---
-    def test_alloc_int_returns_first_n_slots(self):
-        pool = self._pool()
-        self.assertEqual(pool.alloc(2), [0, 1])
-        self.assertEqual(pool.free_slots, [2, 3])
-
-    def test_alloc_int_returns_none_when_insufficient(self):
-        pool = self._pool()
-        pool.alloc(3)
-        self.assertIsNone(pool.alloc(2))
-
-    def test_alloc_default_int_is_one(self):
-        pool = self._pool()
-        # Existing implementation is alloc(need_size: int = 1);
-        # backwards compatibility requires the no-arg call to still work.
-        self.assertEqual(pool.alloc(), [0])
-
-    # --- list[Req] path (new signature) ---
     def test_alloc_reqs_assigns_req_pool_idx(self):
         pool = self._pool()
         reqs = [_make_req(), _make_req()]
@@ -81,7 +68,8 @@ class TestReqToTokenPoolAllocBackwardCompat(unittest.TestCase):
 
     def test_alloc_reqs_returns_none_when_insufficient_without_partial_mutation(self):
         pool = self._pool()
-        pool.alloc(3)  # consumes [0, 1, 2]; only [3] left
+        # Consume 3 slots first so only 1 remains.
+        pool.alloc([_make_req(), _make_req(), _make_req()])
         reqs = [_make_req(), _make_req()]
         result = pool.alloc(reqs)
         self.assertIsNone(result)
@@ -92,6 +80,14 @@ class TestReqToTokenPoolAllocBackwardCompat(unittest.TestCase):
     def test_alloc_reqs_empty_list_returns_empty(self):
         pool = self._pool()
         self.assertEqual(pool.alloc([]), [])
+
+    def test_alloc_int_no_longer_supported(self):
+        """The int compat shim is gone; passing an int now raises (TypeError
+        from iteration), proving the shim was not silently re-introduced.
+        Lock-in for reviewer's request to drop hard-coded compatibility."""
+        pool = self._pool()
+        with self.assertRaises(TypeError):
+            pool.alloc(2)
 
 
 class TestHybridReqToTokenPoolInit(unittest.TestCase):
@@ -242,8 +238,10 @@ class TestHybridReqToTokenPoolAlloc(unittest.TestCase):
             pool.alloc([req])
 
     def test_alloc_int_disallowed(self):
+        """Hybrid pool inherits the list-only contract from base; int now
+        raises TypeError (no defensive isinstance shim)."""
         pool, _ = self._make()
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(TypeError):
             pool.alloc(2)
 
     def test_chunked_prefill_reuse_preserves_buffer_content(self):

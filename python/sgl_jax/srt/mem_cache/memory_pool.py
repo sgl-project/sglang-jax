@@ -121,30 +121,19 @@ class ReqToTokenPool:
         """Return number of available request slots"""
         return len(self.free_slots)
 
-    def alloc(self, reqs=1) -> list[int]:
-        """Allocate request slots.
+    def alloc(self, reqs) -> list[int] | None:
+        """Allocate request slots for a list of Req-like objects.
 
-        Backwards-compatible signature:
-        - reqs: int -- legacy path (need_size); take need_size slots from the head of free_slots.
-        - reqs: Sequence[Req-like] -- new chunked-prefill path:
-            * Reqs already holding a req_pool_idx are skipped (must satisfy is_chunked > 0
-              -- safety assert).
-            * Reqs with no req_pool_idx are allocated from free_slots and have
-              req.req_pool_idx written back.
-            * If capacity is insufficient, return None and leave every req field untouched
-              (atomic semantics).
+        Chunked-prefill semantics:
+        - Reqs already holding a req_pool_idx are skipped (must satisfy
+          is_chunked > 0 -- safety assert).
+        - Reqs with no req_pool_idx are allocated from free_slots and have
+          req.req_pool_idx written back.
+        - If capacity is insufficient, return None and leave every req field
+          untouched (atomic semantics).
 
         Returns: list[int] (the slot per req), or None if capacity is insufficient.
         """
-        if isinstance(reqs, int):
-            need_size = reqs
-            if need_size > len(self.free_slots):
-                return None
-            select_indices = self.free_slots[:need_size]
-            self.free_slots = self.free_slots[need_size:]
-            return select_indices
-
-        # New path: list[Req-like]
         # Pass 1: count slots that need fresh allocation; assert safety on reuses.
         new_count = 0
         for req in reqs:
@@ -232,9 +221,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         completely untouched before the KV alloc succeeds (recurrent writes only
         happen after KV passes).
         """
-        # Explicitly disallow int path; hybrid pool requires list[Req].
-        assert not isinstance(reqs, int), "HybridReqToTokenPool.alloc requires list[Req], not int"
-
         # 1. Pre-check recurrent capacity.
         needed_recurrent = sum(1 for req in reqs if req.recurrent_pool_idx is None)
         if needed_recurrent > len(self.recurrent_state_pool.free_slots):
@@ -1288,10 +1274,20 @@ class MemoryPools:
     def tree_unflatten(cls, keys, children):
         return cls(**dict(zip(keys, children)))
 
-    def replace_all(self, updates: dict) -> None:
-        """Dispatch updates by key, calling pool.replace_buffer(value) as-is.
+    def replace_all(self, updates) -> None:
+        """Mirror _set_kv_cache_after_forward semantics for the multi-pool world.
 
-        Constraints:
+        Single-pool legacy shape (bare list of per-layer KV arrays) is
+        normalized to dict internally so the caller never needs to know
+        whether the workload is hybrid; multi-pool dict shape is required
+        only when the caller actually updates multiple pools (hybrid
+        recurrent state).
+
+        Each pool's replace_buffer carries its own implementation details
+        (tp_size==1 device_put, sharding fix, ...); replace_all only does
+        shape normalization and key dispatch.
+
+        Constraints (after normalization):
         - updates.keys() must exactly match self._pools.keys() (count + names).
         - value is NOT unpacked: token_to_kv_pool receives list[jax.Array],
           recurrent_state_pool receives tuple[list[jax.Array], list[list[jax.Array]]],
@@ -1300,6 +1296,8 @@ class MemoryPools:
           are invalidated; any pool not present in `updates` would hold a dangling
           reference.
         """
+        if isinstance(updates, list):
+            updates = {"token_to_kv_pool": updates}
         if set(updates.keys()) != set(self._pools.keys()):
             raise ValueError(
                 f"replace_all: updates keys {sorted(updates.keys())} "
