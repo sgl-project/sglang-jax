@@ -26,24 +26,40 @@ Issue #948 delivers KDA inference components: kernel, backend, dispatch entry, l
 
 - **Base class file location**: Design doc §3.2/§3.3 places `LinearRecurrentAttnBackend` + `LinearRecurrentAttnBackendMetadata` in `kda_backend.py`. This decomposition keeps them in `hybrid_linear_attn_backend.py` instead, because: (1) they are shared base classes for KDA / GDN / Mamba2, not KDA-specific; (2) PR #961 already placed stubs there; (3) `kda_backend.py` already imports from `hybrid_linear_attn_backend.py`. The design doc should be updated to reflect this.
 - **Kernel dispatcher fallback**: Design doc §4.2 shows symmetric fallback for both prefill and decode (`chunk_kda_pallas if _HAS_PALLAS else chunk_kda_jax_naive`, same for decode). This decomposition deviates: **prefill = pallas only** (no naive prefill impl exists — `chunk_kda_jax_naive` is out of scope), **decode = naive only** (no pallas decode impl exists). The dispatcher in `__init__.py` directly re-exports `chunk_kda_fwd` from `kda.py` and `naive_recurrent_kda` from `naive.py` without try/except fallback.
+- **L2 norm outside kernel**: GPU reference uses `use_qk_l2norm_in_kernel=True` (L2 norm done inside the kernel). JAX kernels do not support this — Pallas kernel: `assert use_qk_l2norm_in_kernel is False`; naive kernel: no such parameter. L2 norm is done in `KimiDeltaAttention` layer before dispatch.
+- **Gate activation split across kernel paths**: GPU reference computes `fused_kda_gate` in the layer and passes activated gate to the kernel uniformly. In JAX, the Pallas kernel supports `use_gate_in_kernel=True` (accepts raw gate + `A_log` + `dt_bias`, does activation internally), but the naive kernel expects pre-activated gate. `KDAAttnBackend` handles this asymmetry: prefill path passes raw gate with `use_gate_in_kernel=True`; decode path computes activation inline (`-exp(A_log) * softplus(g + dt_bias)`) before calling naive kernel. `KimiDeltaAttention` always passes raw gate.
 
 ### Development workflow
 
 ```
-epic/support_kimi_linear  (upstream, PR #961/#962 merged)
-  │
-  └─ feat/kda-inference-components  (主分支, branched from epic)
-       │
-       ├─ worktree: sub0-dump-upgrade        ──→ merge --no-ff → feat/kda-inference-components
-       ├─ worktree: sub1-kernel-dispatcher   ──→ merge --no-ff → feat/kda-inference-components
-       ├─ worktree: sub2-backend-dispatch    ──→ merge --no-ff → feat/kda-inference-components
-       └─ worktree: sub3-layer-tests         ──→ merge --no-ff → feat/kda-inference-components
+Remotes:
+  origin  → sgl-project/sglang-jax   (upstream, read-only for @MokusMokun)
+  mokus   → MokusMokun/sglang-jax    (fork, push target)
+
+Branches:
+  epic/support_kimi_linear  (upstream, PR #961/#962 merged)
+    │
+    └─ feat/kda-inference-components  (主分支, branched from epic)
+         │
+         ├─ sub0/dump-upgrade        ──→ merge --no-ff → feat/kda-inference-components
+         ├─ sub1/kernel-dispatcher   ──→ merge --no-ff → feat/kda-inference-components
+         ├─ sub2/backend-dispatch    ──→ merge --no-ff → feat/kda-inference-components
+         └─ sub3/layer-tests         ──→ merge --no-ff → feat/kda-inference-components
+
+Worktree paths (.claude/worktrees/):
+  kda-main              → feat/kda-inference-components  (主分支, merge 操作在这里)
+  sub0-dump-upgrade     → sub0/dump-upgrade
+  sub1-kernel-dispatcher → sub1/kernel-dispatcher
+  sub2-backend-dispatch  → sub2/backend-dispatch
+  sub3-layer-tests       → sub3/layer-tests
 ```
 
 - **主分支**: `feat/kda-inference-components`，从 `epic/support_kimi_linear` 拉出
-- **并行开发**: 每个 sub-issue 一个 worktree + 分支，按工作内容命名
-- **合入**: worktree 完成后 `merge --no-ff` 进主分支（保留 merge commit，方便回溯）
+- **Push 目标**: 所有分支 push 到 `mokus` (MokusMokun/sglang-jax)，`origin` 无写权限
+- **并行开发**: 每个 sub-issue 一个 worktree + 分支（`sub{N}/xxx`），按工作内容命名
+- **合入**: worktree 完成后在 `kda-main` worktree 执行 `git merge --no-ff sub{N}/xxx`（保留 merge commit，方便回溯）
 - **Upstream 同步**: 只有 `feat/kda-inference-components` 跟 `epic/support_kimi_linear` rebase
+- **最终 PR**: `MokusMokun/sglang-jax:feat/kda-inference-components` → `sgl-project/sglang-jax:epic/support_kimi_linear`
 
 ---
 
@@ -60,7 +76,7 @@ epic/support_kimi_linear  (upstream, PR #961/#962 merged)
 
 | Gap | Current | Required (design doc §6.1) |
 |-----|---------|---------------------------|
-| Config | `hidden=128, heads=4, head_dim=32` | `hidden=4096, heads=32, head_dim=128` (HF checkpoint actual config) |
+| Config | `hidden=128, heads=4, head_dim=32` | `hidden_size=2304, heads=32, head_dim=128` (HF checkpoint actual config; `projection_size` = 32×128 = 4096) |
 | Weights | Random init | Extracted from HF safetensors (`model.layers.{idx}.self_attn.*`) |
 
 **What stays**: Existing small-config dumps are preserved as-is for fast local debugging. New real-config dumps are added alongside (e.g. `dumps_real/` or separate `case_real_*` prefix).
@@ -193,6 +209,11 @@ def naive_recurrent_kda(
    - `_dispatch_chunk` → `chunk_kda` (from `kernels/kda`)
    - `_dispatch_recurrent` → `fused_recurrent_kda` (from `kernels/kda`)
 
+   **Sub-1 review notes for implementer**:
+   - **12-tuple return**: `chunk_kda` (prefill) returns a 12-tuple `(o, final_state, g_cumsum, Aqk, Akk, None, None, None, None, None, None, initial_state)` — positions 5-10 are always `None` (intermediates released for GC). Destructure as `o, final_state, *_ = chunk_kda(...)`.
+   - **State shape asymmetry**: prefill `initial_state` is `[N, H, K, V]` (N = number of sequences), decode `initial_state` is `[B, H, K, V]`. Backend must handle this shape difference when reading/writing `recurrent_state_pool`.
+   - `fused_recurrent_kda` (decode) returns a clean 2-tuple `(o, final_state)` — no special handling needed.
+
 4. **RadixLinearAttention**:
    - `__init__`: `layer_id, num_q_heads, num_k_heads, num_v_heads, head_q_dim, head_k_dim, head_v_dim, conv_weights, bias, activation, A_log, dt_bias`
    - `__call__(self, forward_batch, mixed_qkv, a, b, recurrent_state_pool)`: calls `forward_batch.attn_backend(mixed_qkv, a, b, self, forward_batch, recurrent_state_pool=recurrent_state_pool)` — uses `__call__`, consistent with `RadixAttention` calling `forward_batch.attn_backend(q, k, v, self, forward_batch, ...)`
@@ -255,30 +276,72 @@ def naive_recurrent_kda(
 
 | File | Deliverable |
 |------|-------------|
-| `python/sgl_jax/srt/models/kimi_linear.py` | `KimiDeltaAttention` nnx.Module — full KDA forward. |
+| `python/sgl_jax/srt/models/kimi_linear.py` | `KimiDeltaAttention` nnx.Module — full KDA forward. **Only** this class; no KimiDecoderLayer/KimiModel/KimiLinearForCausalLM (those are PR #968 scope). |
+| `python/sgl_jax/srt/layers/attention/linear/kda_backend.py` | Minor changes to `_forward_extend` and `_forward_decode` for gate activation handling. |
 | `python/sgl_jax/test/layers/test_kda_backend.py` | M1 numerical alignment + prefill-to-decode invariance tests. |
+
+**PR #968 boundary**: PR #968 (collaborator) creates the same `kimi_linear.py` with the full model skeleton + stub `KimiDeltaAttention`. Sub-3 creates the file with only `KimiDeltaAttention` implemented; the collaborator integrates it into their model skeleton afterward. `KimiDecoderLayer` pool routing (passing `recurrent_state_pool` instead of `token_to_kv_pool` to KDA layers) is part of that integration, not this sub-issue.
+
+**Reference**: `fixed_kda_module.py` (Sub-0 GPU reference), HF `modeling_kimi.py` `KimiDeltaAttention`
+
+Sub-3 is split into three phases:
+
+#### Phase A: `KimiDeltaAttention` nnx.Module + `KDAAttnBackend` gate changes
 
 **KimiDeltaAttention implementation** (design doc §4.6):
 
-1. `__init__`: q/k/v_proj, b_proj, f_a_proj+f_b_proj, g_a_proj+g_b_proj, A_log, dt_bias, q/k/v_conv1d, o_norm (FusedRMSNormGated), o_proj, `self.attn = RadixLinearAttention(...)`
+1. `__init__`: q/k/v_proj, b_proj, f_a_proj+f_b_proj, g_a_proj+g_b_proj, A_log, dt_bias, conv1d weights, o_norm weights, o_proj, `self.attn = RadixLinearAttention(..., A_log=A_log, dt_bias=dt_bias)`
 2. `__call__(hidden_states, positions, forward_batch, recurrent_state_pool)` — 4 steps:
-   - Step 1: QKV + beta + forget gate + g projections (`forward_qkvbfg`)
-   - Step 2: Conv1d + SiLU + L2 norm on Q/K — implemented in `KimiDeltaAttention` layer (not in backend or `RadixLinearAttention`)
-   - Step 3: Dispatch via `self.attn(forward_batch, mixed_qkv, a=forget_gate, b=beta, recurrent_state_pool=recurrent_state_pool)`
-   - Step 4: Output gate + FusedRMSNormGated + o_proj
+   - Step 1: QKV + beta + forget gate (raw, before activation) + output gate projections
+   - Step 2: Conv1d + SiLU + **L2 norm on Q/K** — implemented in `KimiDeltaAttention` layer (not in backend or `RadixLinearAttention`)
+   - Step 3: Dispatch via `self.attn(forward_batch, mixed_qkv, a=raw_gate, b=beta, recurrent_state_pool=recurrent_state_pool)` — **layer passes raw gate** (after low-rank projection, before activation)
+   - Step 4: Gated RMSNorm + o_proj
 
    Note: `recurrent_state_pool` is passed in by upper model code (`KimiDecoderLayer`, follow-up issue), which extracts it from `memory_pool`. This layer does not see `memory_pool` directly.
 
-**Reference**: sglang GPU `KimiDeltaAttention` (L166-408), HF `modeling_kimi.py` `KimiDeltaAttention`
+**Naive inline components** (no separate utility classes):
 
-**Tests** (design doc §6.2):
-- Ground truth: `kda_gpu/dumps` with real HF config + weights (Sub-0 deliverable). Small-config dumps from existing package available for fast local debugging.
-- 12 cases: single-seq (T=1,8,64,65,128,256,1024), varlen (balanced_4x32, unbalanced, single_T128), initial-state (2 cases)
-- Tolerance: fp32 `atol=1e-5, rtol=1e-5`; bf16 `atol=1e-3, rtol=1e-3`
-- Prefill-to-decode invariance: `prefill(seq[:T])` final step matches `prefill(seq[:T-k]) -> decode k steps` (k>=8)
-- Weights loaded from HF safetensors by key pattern
+| Component | Implementation | Why inline |
+|-----------|---------------|------------|
+| **Conv1d** | `jax.lax.conv_general_dilated` or slice-and-dot (kernel_size=4, causal). Conv state read/write via `recurrent_state_pool`. | No conv1d utility exists in codebase |
+| **L2 norm on Q/K** | `x / max(‖x‖₂, eps)` per head. Applied after conv1d+SiLU, before dispatch. | Both JAX kernels lack in-kernel L2 norm (see Deviation §3) |
+| **Gated RMSNorm** | `o_norm(o, g_out)`: split gate → RMSNorm → element-wise multiply. Reference: `fixed_kda_module.py` line 221 | No `FusedRMSNormGated` in codebase; only `RMSNorm` and `GroupRMSNorm` exist |
 
-**Dependencies**: Sub-1 (working kernel implementations via PR #964) + Sub-2 (backend + dispatch entry) + Sub-0 (real-config dumps as ground truth).
+**`KDAAttnBackend` gate activation changes** (modifies Sub-2 delivered file):
+
+The layer always passes **raw gate `g`** (after low-rank projection `f_b(f_a(x))`, before activation). Gate activation is handled differently per kernel path:
+
+- **`_forward_extend`** (Pallas kernel): pass `A_log=layer.A_log, dt_bias=layer.dt_bias, use_gate_in_kernel=True` to `chunk_kda`. Kernel computes activation + cumsum internally via `kda_gate_chunk_cumsum`: `g_act = -exp(A_log) * softplus(g + dt_bias)`.
+- **`_forward_decode`** (naive kernel): compute gate activation inline before calling `fused_recurrent_kda`:
+  ```python
+  g = -jnp.exp(layer.A_log) * jax.nn.softplus(g + layer.dt_bias)
+  ```
+  Naive kernel expects pre-activated gate in log-space (docstring: `"Per-element gate in log-space (e.g., -exp(A)*softplus(g))"`).
+
+This split keeps `KimiDeltaAttention` clean (no gate activation logic) and leverages the Pallas kernel's built-in gate support. `RadixLinearAttention` already stores `A_log` and `dt_bias` as attributes (set in Sub-2), so the backend accesses them via the `layer` parameter.
+
+#### Phase B: M1 module-level numerical alignment tests
+
+- **Execution environment**: TPU v6e-4 (`sky-efe2-yuhao`), `conda activate sglang` (JAX 0.8.1). Pallas kernel runs on real TPU hardware.
+- **Ground truth**: Sub-0 real-config dumps on GCS FUSE mount at `/models/yuhao/kimi-linear/kda_module/{L0,L6,L13,L22}/` (`gs://model-storage-sglang`). Each layer directory contains `weights.npz` + 12 `case_*.npz` files.
+- **Test flow**:
+  1. Load `weights.npz` → construct `KimiDeltaAttention` with numpy weights (key pattern: `weights__q_proj.weight`, `weights__A_log`, etc.)
+  2. Set up `ForwardBatch` with `attn_backend = KDAAttnBackend` (direct, no `HybridLinearAttnBackend`)
+  3. Set up `MockRecurrentStatePool` with initial state from dump (when `has_initial_state=True`)
+  4. For each of 12 `case_*.npz`: run `KimiDeltaAttention` forward on `hidden_states` input, compare output vs `out_fp32`
+  5. Intermediate comparisons (`intermediates__q_after_conv`, `intermediates__g`, `intermediates__beta`, `intermediates__o_kda_chunk`, `intermediates__o_norm`) available to pinpoint which step diverges
+- **12 cases**: single-seq (T=1,8,64,65,128,256,1024), varlen (balanced_4x32, unbalanced, single_T128), initial-state (2 cases)
+- **Tolerance**: fp32 `atol=1e-5, rtol=1e-5`; bf16 `atol=1e-3, rtol=1e-3`
+- **Layer coverage**: L0 by default for fast validation; optionally parametrize over all 4 layers (L0/L6/L13/L22)
+
+#### Phase C: Prefill-to-decode invariance tests
+
+- Self-contained (no external dumps, uses random weights)
+- `prefill(seq[:T])` final-step output must match `prefill(seq[:T-k]) → decode k steps` (k≥8)
+- Tests that the EXTEND→DECODE transition through `KDAAttnBackend` + `MockRecurrentStatePool` state write-back is consistent
+- Validates both kernel paths (Pallas prefill → naive decode) produce coherent results
+
+**Dependencies**: Sub-1 (kernel) + Sub-2 (backend + dispatch entry) + Sub-0 (real-config dumps for Phase B).
 
 ---
 
@@ -291,7 +354,11 @@ Sub-1 (kernel: PR #964 done, dispatcher remaining)        │
   │                                                       │
   └──→ Sub-2 (backend + dispatch)  ───────────────────────┤
                                                           │
-                                                          └──→ Sub-3 (layer + tests)
+                                                          └──→ Sub-3 Phase A (layer + backend gate changes)
+                                                                │
+                                    Sub-0 dumps on GCS ─────────┼──→ Sub-3 Phase B (M1 alignment tests)
+                                                                │
+                                                                └──→ Sub-3 Phase C (prefill-to-decode invariance)
 ```
 
 | Phase | Who | What | Blocks on |
@@ -299,16 +366,18 @@ Sub-1 (kernel: PR #964 done, dispatcher remaining)        │
 | Day 1 | @MokusMokun | Sub-0: dump upgrade (real config + HF weights) | Nothing |
 | Day 1 | @MokusMokun | Sub-1: merge PR #964 + wire `__init__.py` dispatcher | Nothing |
 | Day 1 | @MokusMokun | Sub-2: backend + dispatch | Sub-1 dispatcher |
-| Day 1 | @MokusMokun | Sub-3: layer skeleton (can start with mock kernel/backend) | — |
-| Merge | @MokusMokun | Sub-3: integration tests | Sub-0 + Sub-1 + Sub-2 merged |
+| Day 2 | @MokusMokun | Sub-3 Phase A: `KimiDeltaAttention` + `KDAAttnBackend` gate changes | Sub-1 + Sub-2 merged |
+| Day 2 | @MokusMokun | Sub-3 Phase B: M1 numerical alignment tests (TPU v6e-4) | Phase A + Sub-0 dumps |
+| Day 2 | @MokusMokun | Sub-3 Phase C: prefill-to-decode invariance tests | Phase A |
 
-**Maximum parallelism**: Sub-0, Sub-1 (small — just `__init__.py` wiring after PR #964 merge), and Sub-3 skeleton all start Day 1. Sub-2 starts after Sub-1's dispatcher. Sub-3 tests are the convergence point.
+**Maximum parallelism**: Sub-0, Sub-1 (small — just `__init__.py` wiring after PR #964 merge) start Day 1. Sub-2 starts after Sub-1's dispatcher. Sub-3 Phase A starts after Sub-1 + Sub-2 merge. Phase B requires Phase A + Sub-0 dumps on GCS. Phase C requires only Phase A (self-contained).
 
 ---
 
 ## Out of scope (deferred to follow-up issues)
 
 - Full Kimi-Linear model assembly (`KimiLinearModel` / `KimiDecoderLayer` / 3:1 hybrid)
+- PR #968 model skeleton integration (`KimiDecoderLayer` pool routing, `KimiModel`, `KimiLinearForCausalLM`, weight mappings)
 - `HybridLinearAttnBackend` (PR #961)
 - `RecurrentStatePool` implementation (RFC-0015)
 - Pallas kernel backward / training
