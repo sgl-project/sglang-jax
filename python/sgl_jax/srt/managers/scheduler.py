@@ -1518,6 +1518,8 @@ class Scheduler(
             if self.chunked_reqs[dp_rank] is not None:
                 self.chunked_reqs[dp_rank].init_next_round_input()
                 self.chunked_reqs[dp_rank] = adder.add_chunked_req(self.chunked_reqs[dp_rank])
+                if self.chunked_reqs[dp_rank] is not None:
+                    self.chunked_reqs[dp_rank].is_chunked += 1
 
         # Collect existing LoRA IDs in the running batch if LoRA is enabled
         if self.lora_paths is not None:
