@@ -31,6 +31,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
     metadata_cls = KDAAttnBackendMetadata
+    use_pallas_prefill = False
 
     def __call__(
         self,
@@ -100,6 +101,25 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         cu_seqlens: jax.Array,
         layer: RadixLinearAttention,
     ) -> tuple[jax.Array, jax.Array]:
+        if self.use_pallas_prefill:
+            return self._forward_extend_pallas(
+                q, k, v, g, beta, initial_state, cu_seqlens, layer
+            )
+        return self._forward_extend_naive(
+            q, k, v, g, beta, initial_state, cu_seqlens, layer
+        )
+
+    def _forward_extend_pallas(
+        self,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        g: jax.Array,
+        beta: jax.Array,
+        initial_state: jax.Array,
+        cu_seqlens: jax.Array,
+        layer: RadixLinearAttention,
+    ) -> tuple[jax.Array, jax.Array]:
         """Chunked prefill via Pallas kernel.  Returns (output, new_state)."""
         A_log, dt_bias = self._gate_params(layer, g)
         # Kernel expects [1, T_packed, H, K] packed layout.
@@ -120,6 +140,47 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         # Remove the B=1 packed dim: [1, T, H, V] -> [T, H, V]
         return o[0], final_state
 
+    def _forward_extend_naive(
+        self,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        g: jax.Array,
+        beta: jax.Array,
+        initial_state: jax.Array,
+        cu_seqlens: jax.Array,
+        layer: RadixLinearAttention,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Prefill fallback via naive recurrent kernel."""
+        g = self._activate_gate(layer, g)
+        if cu_seqlens.shape[0] == 2:
+            o, final_state = fused_recurrent_kda(
+                q[None, ...],
+                k[None, ...],
+                v[None, ...],
+                g[None, ...],
+                beta[None, ...],
+                scale=self._get_scale(layer),
+                initial_state=initial_state,
+                output_final_state=True,
+            )
+            return o[0], final_state
+
+        q_b, k_b, v_b, g_b, beta_b = self._unpack_varlen(
+            q, k, v, g, beta, cu_seqlens
+        )
+        o_b, final_state = fused_recurrent_kda(
+            q_b,
+            k_b,
+            v_b,
+            g_b,
+            beta_b,
+            scale=self._get_scale(layer),
+            initial_state=initial_state,
+            output_final_state=True,
+        )
+        return self._repack_varlen(o_b, cu_seqlens, q.shape[0]), final_state
+
     def _forward_decode(
         self,
         q: jax.Array,
@@ -131,10 +192,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         layer: RadixLinearAttention,
     ) -> tuple[jax.Array, jax.Array]:
         """Single-step decode via naive JAX recurrence.  Returns (output, new_state)."""
-        A_log, dt_bias = self._gate_params(layer, g)
-        g = -jnp.exp(A_log.reshape(1, g.shape[-2], 1)) * jax.nn.softplus(
-            g + dt_bias.reshape(1, g.shape[-2], g.shape[-1])
-        )
+        g = self._activate_gate(layer, g)
         # Kernel expects [B, T=1, H, K].
         o, final_state = fused_recurrent_kda(
             q[:, None, ...],
@@ -148,6 +206,52 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         )
         # Remove the T=1 dim: [B, 1, H, V] -> [B, H, V]
         return o[:, 0], final_state
+
+    def _activate_gate(
+        self,
+        layer: RadixLinearAttention,
+        g: jax.Array,
+    ) -> jax.Array:
+        A_log, dt_bias = self._gate_params(layer, g)
+        return -jnp.exp(A_log.reshape(1, g.shape[-2], 1)) * jax.nn.softplus(
+            g + dt_bias.reshape(1, g.shape[-2], g.shape[-1])
+        )
+
+    @staticmethod
+    def _unpack_varlen(
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        g: jax.Array,
+        beta: jax.Array,
+        cu_seqlens: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+        T = q.shape[0]
+        positions = jnp.arange(T, dtype=cu_seqlens.dtype)
+        starts = cu_seqlens[:-1]
+        lens = cu_seqlens[1:] - starts
+        token_idx = starts[:, None] + positions[None, :]
+        valid = positions[None, :] < lens[:, None]
+        safe_idx = jnp.where(valid, token_idx, 0)
+
+        def gather(x):
+            padded = x[safe_idx]
+            return jnp.where(valid[(...,) + (None,) * (x.ndim - 1)], padded, 0)
+
+        beta_b = beta[safe_idx]
+        beta_b = jnp.where(valid[..., None], beta_b, 0)
+        return gather(q), gather(k), gather(v), gather(g), beta_b
+
+    @staticmethod
+    def _repack_varlen(
+        output: jax.Array,
+        cu_seqlens: jax.Array,
+        total_tokens: int,
+    ) -> jax.Array:
+        token_idx = jnp.arange(total_tokens, dtype=cu_seqlens.dtype)
+        seq_ids = jnp.searchsorted(cu_seqlens[1:], token_idx, side="right")
+        seq_offsets = token_idx - cu_seqlens[:-1][seq_ids]
+        return output[seq_ids, seq_offsets]
 
     @staticmethod
     def _as_array(value) -> jax.Array:
