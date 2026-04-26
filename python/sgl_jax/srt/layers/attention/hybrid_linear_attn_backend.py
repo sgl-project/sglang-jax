@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.sharding import NamedSharding
@@ -56,6 +55,12 @@ class LinearRecurrentAttnBackendMetadata:
 
 @dataclass
 class LinearRecurrentAttnBackend(AttentionBackend):
+    """Base class for linear recurrent attention backends (KDA, GDN, Mamba2).
+
+    Provides metadata computation and pytree infrastructure.
+    Subclasses implement ``__call__`` with model-specific forward logic.
+    """
+
     metadata_cls = LinearRecurrentAttnBackendMetadata
 
     def __init__(self, mesh: jax.sharding.Mesh | None = None):
@@ -108,164 +113,6 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         obj = cls(mesh=aux_data["mesh"])
         obj.forward_metadata = children[0]
         return obj
-
-    def __call__(
-        self,
-        mixed_qkv: jax.Array,
-        a: jax.Array,
-        b: jax.Array,
-        layer: RadixLinearAttention,
-        forward_batch: ForwardBatch,
-        recurrent_state_pool,
-        **kwargs,
-    ) -> jax.Array:
-        q, k, v = self._split_mixed_qkv(mixed_qkv, layer)
-        g = self._reshape_gate(a, q)
-        beta = self._reshape_beta(b, q)
-
-        if forward_batch.forward_mode in (ForwardMode.IDLE, ForwardMode.DUMMY_FIRST):
-            return jnp.zeros((q.shape[0], q.shape[1] * v.shape[-1]), dtype=v.dtype)
-        if forward_batch.forward_mode in (
-            ForwardMode.DRAFT_EXTEND,
-            ForwardMode.TARGET_VERIFY,
-        ):
-            raise NotImplementedError(
-                f"Linear recurrent attention does not support {forward_batch.forward_mode}"
-            )
-
-        recurrent_indices = self.forward_metadata.recurrent_indices
-        recurrent_cache, _ = self._get_layer_cache(
-            recurrent_state_pool,
-            layer.layer_id,
-        )
-        initial_state = recurrent_cache[recurrent_indices].astype(jnp.float32)
-
-        if forward_batch.forward_mode == ForwardMode.EXTEND:
-            output, new_recurrent = self._dispatch_chunk(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                initial_state,
-                self.forward_metadata.cu_q_lens,
-                layer,
-            )
-            output = output[0]
-        elif forward_batch.forward_mode == ForwardMode.DECODE:
-            output, new_recurrent = self._dispatch_recurrent(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                initial_state,
-                layer,
-            )
-            output = output[:, 0]
-        else:
-            raise NotImplementedError(
-                f"Linear recurrent attention does not support {forward_batch.forward_mode}"
-            )
-
-        recurrent_state_pool.set_linear_recurrent_layer_cache(
-            layer.layer_id,
-            recurrent_indices,
-            new_recurrent,
-            None,
-        )
-        return output.reshape(output.shape[0], -1)
-
-    def _dispatch_chunk(
-        self,
-        q: jax.Array,
-        k: jax.Array,
-        v: jax.Array,
-        g: jax.Array,
-        beta: jax.Array,
-        initial_state: jax.Array,
-        cu_seqlens: jax.Array,
-        layer: RadixLinearAttention,
-    ) -> tuple[jax.Array, jax.Array]:
-        raise NotImplementedError()
-
-    def _dispatch_recurrent(
-        self,
-        q: jax.Array,
-        k: jax.Array,
-        v: jax.Array,
-        g: jax.Array,
-        beta: jax.Array,
-        initial_state: jax.Array,
-        layer: RadixLinearAttention,
-    ) -> tuple[jax.Array, jax.Array]:
-        raise NotImplementedError()
-
-    @staticmethod
-    def _split_mixed_qkv(
-        mixed_qkv: jax.Array | tuple[jax.Array, jax.Array, jax.Array],
-        layer: RadixLinearAttention,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        if isinstance(mixed_qkv, tuple):
-            if len(mixed_qkv) != 3:
-                raise ValueError("mixed_qkv tuple must contain q, k, v")
-            return mixed_qkv
-
-        if mixed_qkv.ndim == 4 and mixed_qkv.shape[1] == 3:
-            return mixed_qkv[:, 0], mixed_qkv[:, 1], mixed_qkv[:, 2]
-
-        if mixed_qkv.ndim == 3:
-            q_end = layer.head_q_dim
-            k_end = q_end + layer.head_k_dim
-            v_end = k_end + layer.head_v_dim
-            if mixed_qkv.shape[-1] != v_end:
-                raise ValueError(
-                    f"mixed_qkv last dim must be {v_end}, got {mixed_qkv.shape[-1]}"
-                )
-            return (
-                mixed_qkv[:, :, :q_end],
-                mixed_qkv[:, :, q_end:k_end],
-                mixed_qkv[:, :, k_end:v_end],
-            )
-
-        if mixed_qkv.ndim == 2:
-            q_size = layer.num_q_heads * layer.head_q_dim
-            k_size = layer.num_k_heads * layer.head_k_dim
-            v_size = layer.num_v_heads * layer.head_v_dim
-            if mixed_qkv.shape[-1] != q_size + k_size + v_size:
-                raise ValueError(
-                    "mixed_qkv flat dim does not match q/k/v head configuration"
-                )
-            q_raw, k_raw, v_raw = jnp.split(
-                mixed_qkv,
-                [q_size, q_size + k_size],
-                axis=-1,
-            )
-            return (
-                q_raw.reshape(mixed_qkv.shape[0], layer.num_q_heads, layer.head_q_dim),
-                k_raw.reshape(mixed_qkv.shape[0], layer.num_k_heads, layer.head_k_dim),
-                v_raw.reshape(mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim),
-            )
-
-        raise ValueError(f"Unsupported mixed_qkv shape: {mixed_qkv.shape}")
-
-    @staticmethod
-    def _reshape_gate(gate: jax.Array, q: jax.Array) -> jax.Array:
-        if gate.shape == q.shape:
-            return gate
-        if gate.ndim == 2 and gate.shape[-1] == q.shape[1] * q.shape[2]:
-            return gate.reshape(q.shape)
-        raise ValueError(f"Gate shape {gate.shape} is incompatible with q shape {q.shape}")
-
-    @staticmethod
-    def _reshape_beta(beta: jax.Array, q: jax.Array) -> jax.Array:
-        if beta.ndim == 3 and beta.shape[-1] == 1:
-            beta = beta[..., 0]
-        if beta.shape == q.shape[:2]:
-            return beta
-        if beta.ndim == 1 and beta.shape[0] == q.shape[0] * q.shape[1]:
-            return beta.reshape(q.shape[:2])
-        raise ValueError(f"Beta shape {beta.shape} is incompatible with q shape {q.shape}")
 
     @staticmethod
     def _get_scale(layer: RadixLinearAttention) -> float:
