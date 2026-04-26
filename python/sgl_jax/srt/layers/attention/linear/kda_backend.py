@@ -162,7 +162,6 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         # Flat [T, total_dim] — split and reshape to [T, H, D].
         q_size = layer.num_q_heads * layer.head_q_dim
         k_size = layer.num_k_heads * layer.head_k_dim
-        v_size = layer.num_v_heads * layer.head_v_dim
         q_raw, k_raw, v_raw = jnp.split(
             mixed_qkv,
             [q_size, q_size + k_size],
