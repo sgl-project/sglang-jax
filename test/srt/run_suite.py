@@ -443,7 +443,7 @@ suites = {
         TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/moe_block_quant_test.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/test_flashattention.py", 20),
-        TestFile("python/sgl_jax/test/test_split_kv_attention.py", 10),
+        TestFile("python/sgl_jax/test/test_mla_attention.py", 15),
         TestFile("python/sgl_jax/test/test_moe_topk.py", 1),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 10),
         TestFile("python/sgl_jax/test/test_sampler.py", 0.2),
@@ -452,12 +452,22 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_kv_cache.py", 20),
         TestFile("python/sgl_jax/test/mem_cache/test_radix_cache.py", 0.2),
         TestFile("python/sgl_jax/test/mem_cache/test_swa_radix_cache.py", 0.2),
+        TestFile("python/sgl_jax/test/mem_cache/test_swa_allocator.py", 0.2),
         TestFile("python/sgl_jax/test/speculative/test_eagle_tree_build.py", 1),
         TestFile("python/sgl_jax/test/speculative/test_eagle_utils.py", 1),
         TestFile("python/sgl_jax/test/multimodal/test_wan_vae_precision.py", 1),
         TestFile("python/sgl_jax/test/multimodal/test_vae_scheduler.py", 2),
         TestFile("python/sgl_jax/test/multimodal/test_flash_attention_kernel.py", 2),
         TestFile("python/sgl_jax/test/layers/test_group_rmsnorm.py", 1, runner="pytest"),
+        TestFile("python/sgl_jax/test/layers/test_linear_attention_backend.py", 1, runner="pytest"),
+        TestFile(
+            "python/sgl_jax/test/layers/test_cross_framework_linear_attention.py",
+            1,
+            runner="pytest",
+            extra_deps=["torch"],
+        ),
+        TestFile("python/sgl_jax/test/layers/test_linear_attention.py", 5, runner="pytest"),
+        TestFile("python/sgl_jax/test/layers/test_mla.py", 2),
         TestFile("test/srt/lora/test_bgmv_backend.py", 5),
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 10),
         TestFile("test/srt/test_dtype_config_llama.py", 1),
@@ -466,6 +476,7 @@ suites = {
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 1),
         TestFile("python/sgl_jax/test/test_linear_tp.py", 1, runner="pytest"),
+        TestFile("python/sgl_jax/test/layers/test_linear_attention.py", 5, runner="pytest"),
     ],
     "kernel-performance-test-tpu-v6e-1": [
         TestFile("benchmark/kernels/flash_attention/bench_flashattention.py", 5),
@@ -520,6 +531,7 @@ suites = {
         TestFile("test/srt/test_chunked_prefill_size.py", 5),
         # TestFile("test/srt/test_sliding_window_attention.py", 30), # add after gpt-oss supported
         TestFile("test/srt/test_model_loader.py", 5),
+        TestFile("test/srt/test_deepseek_v2_lite_models.py", 10),
         TestFile("test/srt/quantization/test_w8_quantization.py", 10),
         TestFile(
             "test/srt/quantization/test_w8_block_dynamic_quantization.py",

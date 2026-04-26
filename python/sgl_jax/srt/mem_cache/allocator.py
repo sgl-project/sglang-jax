@@ -352,30 +352,36 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self,
         size: int,
         size_swa: int,
-        kvcache: SWAKVPool,
+        kvcache: "SWAKVPool",
+        page_size: int = 1,
     ):
-        super().__init__(size, 1, kvcache)
-        assert isinstance(kvcache, SWAKVPool)
         self._size_full = size
         self._size_swa = size_swa
-        self.full_attn_allocator = TokenToKVPoolAllocator(
-            size,
-            kvcache.full_kv_pool,
-        )
-        self.swa_attn_allocator = TokenToKVPoolAllocator(
-            size_swa,
-            kvcache.swa_kv_pool,
-        )
-        self.full_to_swa_index_mapping = np.empty(
-            size + size_swa + 1,
-            dtype=np.int64,
-        )
-        self.clear()
+        self._page_size = page_size
+        self.page_size = page_size
+        self._kvcache = kvcache
+        self.is_not_in_free_group = True
+        self.free_group = []
 
-        self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
+        if page_size == 1:
+            self.full_attn_allocator = TokenToKVPoolAllocator(size, kvcache.full_kv_pool)
+            self.swa_attn_allocator = TokenToKVPoolAllocator(size_swa, kvcache.swa_kv_pool)
+        else:
+            self.full_attn_allocator = PagedTokenToKVPoolAllocator(
+                size=size, page_size=page_size, kvcache=kvcache.full_kv_pool, debug_mode=False
+            )
+            self.swa_attn_allocator = PagedTokenToKVPoolAllocator(
+                size=size_swa, page_size=page_size, kvcache=kvcache.swa_kv_pool, debug_mode=False
+            )
+
+        # Mapping from full-pool indices to SWA-pool indices.
+        # Size = size + page_size to handle paged allocator's max index range.
+        mapping_size = size + page_size
+        self.full_to_swa_index_mapping = np.zeros(mapping_size, dtype=np.int32)
+        kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
 
     def available_size(self):
-        raise NotImplementedError()
+        return min(self.full_available_size(), self.swa_available_size())
 
     def full_available_size(self):
         return self.full_attn_allocator.available_size()
@@ -400,12 +406,61 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
-    def alloc(self, need_size: int):
-        if need_size > self.full_attn_allocator.available_size():
-            return None
-        if need_size > self.swa_attn_allocator.available_size():
+    def alloc_extend(self, prefix_lens, seq_lens, last_loc, extend_num_tokens):
+        """Allocate for extend: full and SWA sub-allocators, update mapping."""
+        # Allocate full
+        full_out_cache_loc = self.full_attn_allocator.alloc_extend(
+            prefix_lens, seq_lens, last_loc, extend_num_tokens
+        )
+        if full_out_cache_loc is None:
             return None
 
+        # Translate last_loc for SWA pool via mapping
+        last_loc_np = np.array(last_loc)
+        swa_last_loc = self.full_to_swa_index_mapping[last_loc_np].astype(np.int32).tolist()
+
+        # Allocate SWA
+        swa_out_cache_loc = self.swa_attn_allocator.alloc_extend(
+            prefix_lens, seq_lens, swa_last_loc, extend_num_tokens
+        )
+        if swa_out_cache_loc is None:
+            # Rollback full allocation
+            self.full_attn_allocator.free(full_out_cache_loc)
+            return None
+
+        # Update mapping
+        self.full_to_swa_index_mapping[full_out_cache_loc] = swa_out_cache_loc
+
+        return full_out_cache_loc
+
+    def alloc_decode(self, seq_lens, last_loc):
+        """Allocate for decode: full and SWA sub-allocators, update mapping."""
+        # Allocate full
+        full_out_cache_loc = self.full_attn_allocator.alloc_decode(seq_lens, last_loc)
+        if full_out_cache_loc is None:
+            return None
+
+        # Translate last_loc for SWA pool via mapping
+        last_loc_np = np.array(last_loc)
+        swa_last_loc = self.full_to_swa_index_mapping[last_loc_np].astype(np.int32).tolist()
+
+        # Allocate SWA
+        swa_out_cache_loc = self.swa_attn_allocator.alloc_decode(seq_lens, swa_last_loc)
+        if swa_out_cache_loc is None:
+            # Rollback full allocation
+            self.full_attn_allocator.free(full_out_cache_loc)
+            return None
+
+        # Update mapping
+        self.full_to_swa_index_mapping[full_out_cache_loc] = swa_out_cache_loc
+
+        return full_out_cache_loc
+
+    def alloc(self, need_size: int):
+        if self.full_attn_allocator.available_size() < need_size:
+            return None
+        if self.swa_attn_allocator.available_size() < need_size:
+            return None
         alloc_full_indices = self.full_attn_allocator.alloc(need_size)
         alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
         self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
@@ -422,11 +477,18 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
-    def free_swa(self, free_index: np.array):
-        map_vals = self.full_to_swa_index_mapping[free_index]
-        swa_indices = map_vals[map_vals > 0]
-        self.swa_attn_allocator.free(swa_indices)
+    def free_swa(self, free_index):
+        """Free only the SWA pool tokens mapped from the given full-pool indices."""
+        swa_indices = self.full_to_swa_index_mapping[free_index]
+        mask = swa_indices != 0
+        if np.any(mask):
+            self.swa_attn_allocator.free(swa_indices[mask])
         self.full_to_swa_index_mapping[free_index] = 0
+
+    def count_swa_mapped(self, indices: np.ndarray) -> int:
+        """Count how many of the given full indices have an active SWA mapping."""
+        swa_vals = self.full_to_swa_index_mapping[indices]
+        return int(np.count_nonzero(swa_vals))
 
     def backup_state(self):
         raise NotImplementedError
@@ -435,8 +497,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         raise NotImplementedError
 
     def clear(self):
-        self.swa_attn_allocator.clear()
         self.full_attn_allocator.clear()
-        self.full_to_swa_index_mapping.fill(0)
-        self.is_not_in_free_group = True
-        self.free_group = []
+        self.swa_attn_allocator.clear()
+        self.full_to_swa_index_mapping[:] = 0

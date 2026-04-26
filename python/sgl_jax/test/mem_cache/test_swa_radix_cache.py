@@ -21,9 +21,10 @@ from sgl_jax.srt.mem_cache.memory_pool import (
 )
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sgl_jax.test.test_utils import CustomTestCase
 
 
-class TestSWARadixCache(unittest.TestCase):
+class TestSWARadixCache(CustomTestCase):
     def setUp(self):
         # Keep KV sizes small to make tests light-weight
         self.devices = jax.devices()
@@ -47,8 +48,7 @@ class TestSWARadixCache(unittest.TestCase):
             size_swa=self.swa_size,
             swa_attention_layer_ids=[0],
             full_attention_layer_ids=[1],
-            full_pool_class=MHATokenToKVPool,
-            swa_pool_class=MHATokenToKVPool,
+            token_to_kv_pool_class=MHATokenToKVPool,
             page_size=1,
             dtype=self.dtype,
             head_num=self.kv_head_num,
@@ -316,6 +316,46 @@ class TestSWARadixCache(unittest.TestCase):
         match_radix = self.cache.match_prefix(RadixKey(key, None))
         np.testing.assert_array_equal(
             np.asarray(match_plain.device_indices), np.asarray(match_radix.device_indices)
+        )
+
+
+class TestSchedulerCacheInit(CustomTestCase):
+    """Tests for scheduler cache type selection with hybrid models (#202)."""
+
+    def _select_cache_type(self, is_hybrid, chunked_prefill_size, disable_radix_cache):
+        """Mirror the condition logic in scheduler.py init_memory_pool_and_cache."""
+        if is_hybrid:
+            return "SWARadixCache"
+        elif chunked_prefill_size is not None and disable_radix_cache:
+            return "ChunkCache"
+        else:
+            return "RadixCache"
+
+    def test_hybrid_with_disable_radix_cache_gets_swa_radix_cache(self):
+        """When is_hybrid=True and disable_radix_cache=True, must use SWARadixCache, not ChunkCache."""
+        self.assertEqual(
+            self._select_cache_type(
+                is_hybrid=True, chunked_prefill_size=8192, disable_radix_cache=True
+            ),
+            "SWARadixCache",
+        )
+
+    def test_hybrid_with_radix_cache_enabled_gets_swa_radix_cache(self):
+        """When is_hybrid=True and disable_radix_cache=False, must use SWARadixCache."""
+        self.assertEqual(
+            self._select_cache_type(
+                is_hybrid=True, chunked_prefill_size=8192, disable_radix_cache=False
+            ),
+            "SWARadixCache",
+        )
+
+    def test_non_hybrid_with_disable_radix_cache_gets_chunk_cache(self):
+        """Non-hybrid with disable_radix_cache should still use ChunkCache."""
+        self.assertEqual(
+            self._select_cache_type(
+                is_hybrid=False, chunked_prefill_size=8192, disable_radix_cache=True
+            ),
+            "ChunkCache",
         )
 
 

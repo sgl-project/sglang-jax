@@ -198,7 +198,7 @@ class WeightLoader:
         model_param: nnx.Variable,
         target_path: str,
     ) -> jax.Array:
-        """Convert offline EPMoE scales into the 4D layout expected by GMM.
+        """Convert offline EPMoE/FusedEPMoE scales into kernel-ready 4D layout.
 
         Offline checkpoints may store MoE scales in one of several compact
         layouts, for example:
@@ -207,27 +207,67 @@ class WeightLoader:
         - block-channel: ``[E, out_dim, k_blocks]`` or ``[E, k_blocks, out_dim]``
         - 2D block quant: ``[E, out_blocks, k_blocks]``
 
-        The runtime GMM kernel consumes only ``[E, k_blocks, 1, out_dim]``.
+        The runtime GMM kernel consumes ``[E, k_blocks, 1, out_dim]``.
+        The FusedEPMoE kernel consumes ``[E, k_blocks, 1, out_groups_padded]``.
+
         This helper performs the cheap layout conversion during weight loading
         so the forward path does not need to reinterpret checkpoint tensors.
         """
-        if not target_path.endswith(("wi_0_scale", "wi_1_scale", "wo_scale")):
+        # Match both EPMoE (wi_0_scale etc.) and FusedEPMoE (w1_scale etc.)
+        if not target_path.endswith(
+            ("wi_0_scale", "wi_1_scale", "wo_scale", "w1_scale", "w2_scale", "w3_scale")
+        ):
             return weight
 
         if weight.ndim == 4 or model_param.value.ndim != 4:
             return weight
 
-        num_experts, k_blocks, _, out_dim = model_param.value.shape
-        if model_param.value.shape[2] != 1:
-            raise ValueError(
-                f"Expected kernel-ready EPMoE scale placeholder to have singleton dim=1, "
-                f"got shape={model_param.value.shape} for {target_path}"
-            )
+        param_shape = model_param.value.shape
+        num_experts = param_shape[0]
+
+        # --- FusedEPMoE legacy 2D block-wise placeholder ---
+        # Older placeholders may use (E, K_groups, N_groups, 1).
+        if param_shape[3] == 1 and param_shape[2] > 1 and weight.ndim == 3:
+            return weight[..., None]
+
+        # --- EPMoE / GMM path (also FusedEPMoE 1D sub-channel) ---
+        if param_shape[2] != 1:
+            return weight
+        num_experts, k_blocks, _, out_dim = param_shape
         if weight.ndim == 2 and weight.shape == (num_experts, out_dim):
             return weight[:, None, None, :]
 
         if weight.ndim != 3:
             return weight
+
+        quant_cfg = getattr(self.model_config, "quantization_config", None)
+        weight_block_size = getattr(quant_cfg, "weight_block_size", None)
+        block_size_out = None
+        if isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2:
+            block_size_out = int(weight_block_size[0])
+
+        is_fused_scale = target_path.endswith(("w1_scale", "w2_scale", "w3_scale"))
+        if is_fused_scale and block_size_out is not None and block_size_out > 0:
+            expected_out_blocks = (out_dim + block_size_out - 1) // block_size_out
+            if weight.shape == (num_experts, k_blocks, expected_out_blocks):
+                logger.info(
+                    "Expanding fused MoE 2D scale %s from %s to fast kernel layout %s",
+                    target_path,
+                    weight.shape,
+                    model_param.value.shape,
+                )
+                weight = jnp.repeat(weight, block_size_out, axis=2)[..., :out_dim]
+                return weight[:, :, None, :]
+            if weight.shape == (num_experts, expected_out_blocks, k_blocks):
+                logger.info(
+                    "Transposing+expanding fused MoE 2D scale %s from %s to fast kernel layout %s",
+                    target_path,
+                    weight.shape,
+                    model_param.value.shape,
+                )
+                weight = jnp.transpose(weight, (0, 2, 1))
+                weight = jnp.repeat(weight, block_size_out, axis=2)[..., :out_dim]
+                return weight[:, :, None, :]
 
         if weight.shape == (num_experts, out_dim, k_blocks):
             return jnp.expand_dims(jnp.transpose(weight, (0, 2, 1)), axis=2)
@@ -235,8 +275,36 @@ class WeightLoader:
         if weight.shape == (num_experts, k_blocks, out_dim):
             return weight[:, :, None, :]
 
-        quant_cfg = getattr(self.model_config, "quantization_config", None)
-        weight_block_size = getattr(quant_cfg, "weight_block_size", None)
+        # FusedEPMoE 2D block-quant checkpoints (e.g., MiMo) often store scales
+        # compactly as [E, K_blocks, N_blocks] or [E, N_blocks, K_blocks], while
+        # the fused kernel expects [E, K_blocks, 1, out_groups_padded].
+        if is_fused_scale and weight.ndim == 3:
+            if weight.shape[0] == num_experts and weight.shape[1] == k_blocks:
+                n_groups = weight.shape[2]
+                if n_groups <= out_dim:
+                    if n_groups < out_dim:
+                        logger.info(
+                            "Padding fused MoE scale %s from %s to kernel layout %s",
+                            target_path,
+                            weight.shape,
+                            model_param.value.shape,
+                        )
+                        weight = jnp.pad(weight, ((0, 0), (0, 0), (0, out_dim - n_groups)))
+                    return weight[:, :, None, :]
+            if weight.shape[0] == num_experts and weight.shape[2] == k_blocks:
+                n_groups = weight.shape[1]
+                if n_groups <= out_dim:
+                    logger.info(
+                        "Transposing fused MoE scale %s from %s to kernel layout %s",
+                        target_path,
+                        weight.shape,
+                        model_param.value.shape,
+                    )
+                    weight = jnp.transpose(weight, (0, 2, 1))
+                    if n_groups < out_dim:
+                        weight = jnp.pad(weight, ((0, 0), (0, 0), (0, out_dim - n_groups)))
+                    return weight[:, :, None, :]
+
         if not (isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2):
             return weight
 
@@ -1410,6 +1478,28 @@ class WeightLoader:
         jax_path = mapping.target_path
         processed_weight = weight
 
+        # Handle fused KV buffer storage (used by MiMo-V2-Flash per-head dequant).
+        # target_path like "__KV_K_WEIGHT__42" stores into model._kv_buffers.
+        if jax_path.startswith("__KV_"):
+            if hasattr(self.model, "_kv_buffers"):
+                layer_idx = int(jax_path.rsplit("__", 1)[-1])
+                buf = self.model._kv_buffers.setdefault(layer_idx, {})
+                if "K_WEIGHT" in jax_path:
+                    buf["k_weight"] = processed_weight
+                elif "K_SCALE" in jax_path:
+                    buf["k_scale"] = processed_weight
+                elif "V_WEIGHT" in jax_path:
+                    buf["v_weight"] = processed_weight
+                elif "V_SCALE" in jax_path:
+                    buf["v_scale"] = processed_weight
+                logger.info(
+                    "Stored KV buffer %s for layer %d, shape=%s",
+                    jax_path.split("__")[2],
+                    layer_idx,
+                    processed_weight.shape,
+                )
+            return
+
         # Apply output_multiplier_scale to lm_head weights (matching PyTorch implementation)
         if "lm_head" in hf_key and hasattr(self.model_config.hf_config, "output_multiplier_scale"):
             logger.info(
@@ -1686,3 +1776,76 @@ class WeightLoader:
 
         layer_num = int(parts[2])
         return layer_num >= self.model_config.num_hidden_layers
+
+
+def replicate_kv_heads(
+    layers,
+    mesh: jax.sharding.Mesh,
+    head_dim: int,
+    v_head_dim: int,
+    target_kv_heads: int,
+):
+    """Replicate KV heads for TP alignment when the weight loader missed them.
+
+    When v_head_dim != head_dim, the weight loader's _apply_kv_head_padding
+    can't pattern-match v_proj shapes. This function fixes that by checking
+    actual weight dims against expected (tp-aligned) dims and replicating.
+
+    Args:
+        layers: List of decoder layers, each with self_attn containing k_proj/v_proj.
+        mesh: JAX mesh for sharding.
+        head_dim: K/Q head dimension.
+        v_head_dim: V head dimension (may differ from head_dim).
+        target_kv_heads: Target number of KV heads after TP alignment.
+    """
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    from sgl_jax.srt.layers.linear import LinearBase
+
+    for layer_idx, layer in enumerate(layers):
+        attn = layer.self_attn
+
+        for proj_name, hd in [
+            ("k_proj", head_dim),
+            ("v_proj", v_head_dim),
+        ]:
+            proj = getattr(attn, proj_name)
+            w = proj.weight.value
+            expected_size = target_kv_heads * hd
+            actual_size = w.shape[1]
+
+            if actual_size == expected_size:
+                continue
+
+            if actual_size > 0 and expected_size % actual_size == 0:
+                num_replicas = expected_size // actual_size
+                orig_kv = actual_size // hd
+
+                logger.info(
+                    "KV head replication: layer %d %s %d→%d heads (%d→%d)",
+                    layer_idx,
+                    proj_name,
+                    orig_kv,
+                    target_kv_heads,
+                    actual_size,
+                    expected_size,
+                )
+
+                w_full = jax.device_put(w, NamedSharding(mesh, P()))
+                w_3d = w_full.reshape(w.shape[0], orig_kv, hd)
+                w_rep = jnp.repeat(w_3d, num_replicas, axis=1)
+                w_new = w_rep.reshape(w.shape[0], expected_size)
+                w_new = jax.device_put(w_new, NamedSharding(mesh, P(None, "tensor")))
+
+                with jax.set_mesh(mesh):
+                    new_linear = LinearBase(
+                        input_size=w.shape[0],
+                        output_size=expected_size,
+                        kernel_axes=proj.kernel_axes,
+                        use_bias=False,
+                        params_dtype=jnp.bfloat16,
+                        mesh=mesh,
+                    )
+                    new_linear.weight = nnx.Param(w_new)
+                setattr(attn, proj_name, new_linear)

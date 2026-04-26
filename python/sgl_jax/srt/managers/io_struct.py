@@ -654,11 +654,14 @@ class ProfileReqInput:
     # 1: Enables Python tracing (this is the default).
     python_tracer_level: int | None = None
     stage_id: int | None = None  # Which stage to count steps for (multimodal only)
+    profile_by_stage: bool = False  # Whether to profile prefill/decode separately
+    profile_stages: list[str] | None = None  # Stages to profile, e.g. ["prefill", "decode"]
 
 
 class ProfileReqType(Enum):
     START_PROFILE = 1
     STOP_PROFILE = 2
+    GET_STATUS = 3
 
 
 @dataclass
@@ -671,6 +674,8 @@ class ProfileReq:
     python_tracer_level: int | None = None
     profile_id: str | None = None
     stage_id: int | None = None
+    profile_by_stage: bool = False
+    profile_stages: list[str] | None = None
 
 
 @dataclass

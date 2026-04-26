@@ -12,12 +12,11 @@ import jax
 import numpy as np
 from utils import create_decode_uniform_data, create_prefill_uniform_data
 
-from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
-    get_kernel_scope_name,
+from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
+    RpaCase,
+    get_default_block_sizes,
+    get_vmem_limit,
     ragged_paged_attention,
-)
-from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes import (
-    get_tuned_block_sizes,
 )
 from sgl_jax.srt.kernels.utils.perf import multiple_iteration_timeit_from_trace
 from sgl_jax.srt.utils.jax_utils import get_device_name
@@ -33,6 +32,7 @@ def benchmark_backend(
     kv_head_num,
     head_dim,
     page_size,
+    sliding_window=None,
 ):
     scale = head_dim**-0.5
 
@@ -87,7 +87,7 @@ def benchmark_backend(
 
     @functools.partial(
         jax.jit,
-        static_argnames=["sm_scale"],
+        static_argnames=["sm_scale", "sliding_window", "d_block_sizes"],
     )
     def jitted_attn(
         q,
@@ -100,6 +100,8 @@ def benchmark_backend(
         cu_kv_lens,
         distribution,
         sm_scale,
+        sliding_window=None,
+        d_block_sizes=None,
     ):
         return ragged_paged_attention(
             q,
@@ -114,8 +116,28 @@ def benchmark_backend(
             custom_mask=None,
             causal=1,
             sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            d_block_sizes=d_block_sizes,
         )
 
+    # Benchmark
+    max_num_seqs = kv_lens.shape[0]
+    pages_per_seq = page_indices.shape[0] // max_num_seqs
+    rpa_case = RpaCase.DECODE if mode == "decode" else RpaCase.MIXED
+    block_sizes = get_default_block_sizes(
+        q.dtype,
+        k.dtype,
+        q_head_num,
+        kv_head_num,
+        head_dim,
+        page_size,
+        max_num_batched_tokens,
+        max_num_seqs,
+        pages_per_seq,
+        case=rpa_case,
+        vmem_limit_bytes=get_vmem_limit(),
+        sliding_window=sliding_window,
+    )
     attn = functools.partial(
         jitted_attn,
         q,
@@ -128,28 +150,24 @@ def benchmark_backend(
         cu_kv_lens,
         distribution,
         scale,
+        sliding_window=sliding_window,
     )
 
     # Warmup
     output = attn()
     jax.block_until_ready(output)
-
-    # Benchmark
-    best_bkv_p, best_bq_sz = get_tuned_block_sizes(
-        q.dtype,
-        k.dtype,
-        q_head_num,
-        kv_head_num,
-        head_dim,
-        page_size,
-        max_num_batched_tokens,
-        page_indices.shape[0] // kv_lens.shape[0],
-        True,
+    scope_name = (
+        f"RPA{rpa_case.symbol}-p_{page_size}"
+        f"-bq_{block_sizes["bq_sz"]}_{block_sizes["bq_csz"]}"
+        f"-bkv_{block_sizes["bkv_sz"]}_{block_sizes["bkv_csz"]}"
     )
+    if sliding_window is not None:
+        scope_name += f"-sw_{sliding_window}"
+
     times = multiple_iteration_timeit_from_trace(
         compute_func=lambda: attn(),
         data_generator=lambda: (),
-        task=get_kernel_scope_name(best_bq_sz, best_bkv_p, page_size),
+        task=scope_name,
         tries=1,
     )
     avg_time = float(np.mean(times)) if times else float("nan")
@@ -257,38 +275,37 @@ class TestPerformance(CustomTestCase):
         # Value: expected cost-time (baseline) in ms
         test_cases_for_different_devices = {
             "TPU v6e": {
-                ("prefill", 128, 1024, 4, 1, 128, 600000): 0.01574625,
-                ("prefill", 128, 1024, 4, 2, 128, 600000): 0.01525625,
-                ("prefill", 128, 1024, 8, 1, 128, 600000): 0.02189,
-                ("prefill", 128, 1024, 8, 4, 128, 600000): 0.0239625,
-                ("prefill", 128, 4096, 4, 1, 128, 600000): 0.09134625,
-                ("prefill", 128, 4096, 4, 2, 128, 600000): 0.0915075,
-                ("prefill", 128, 4096, 8, 1, 128, 600000): 0.14679375,
-                ("prefill", 128, 4096, 8, 4, 128, 600000): 0.162105,
-                ("prefill", 256, 1024, 4, 1, 128, 600000): 0.0157125,
-                ("prefill", 256, 1024, 4, 2, 128, 600000): 0.01491875,
-                ("prefill", 256, 1024, 8, 1, 128, 600000): 0.02186125,
-                ("prefill", 256, 1024, 8, 4, 128, 600000): 0.0237575,
-                ("prefill", 256, 4096, 4, 1, 128, 600000): 0.09128125,
-                ("prefill", 256, 4096, 4, 2, 128, 600000): 0.0919325,
-                ("prefill", 256, 4096, 8, 1, 128, 600000): 0.14679125,
-                ("prefill", 256, 4096, 8, 4, 128, 600000): 0.16232,
-                ("decode", 128, 128, 4, 1, 128, 600000): 0.2329225,
-                ("decode", 128, 128, 4, 2, 128, 600000): 0.29882625,
-                ("decode", 128, 128, 8, 1, 128, 600000): 0.23746875,
-                ("decode", 128, 128, 8, 4, 128, 600000): 0.5295875,
-                ("decode", 128, 256, 4, 1, 128, 600000): 0.4627675,
-                ("decode", 128, 256, 4, 2, 128, 600000): 0.5923825,
-                ("decode", 128, 256, 8, 1, 128, 600000): 0.4630275,
-                ("decode", 128, 256, 8, 4, 128, 600000): 1.05854875,
-                ("decode", 256, 128, 4, 1, 128, 600000): 0.16898125,
-                ("decode", 256, 128, 4, 2, 128, 600000): 0.25190875,
-                ("decode", 256, 128, 8, 1, 128, 600000): 0.16870875,
-                ("decode", 256, 128, 8, 4, 128, 600000): 0.3997425,
-                ("decode", 256, 256, 4, 1, 128, 600000): 0.33464,
-                ("decode", 256, 256, 4, 2, 128, 600000): 0.51019875,
-                ("decode", 256, 256, 8, 1, 128, 600000): 0.33216375,
-                ("decode", 256, 256, 8, 4, 128, 600000): 0.81125875,
+                ("prefill", 128, 1024, 4, 1, 128, 600000): 0.0334175,
+                ("prefill", 128, 1024, 4, 2, 128, 600000): 0.05767375,
+                ("prefill", 128, 1024, 8, 1, 128, 600000): 0.04415,
+                ("prefill", 128, 1024, 8, 4, 128, 600000): 0.0835275,
+                ("prefill", 128, 4096, 4, 1, 128, 600000): 0.19460875,
+                ("prefill", 128, 4096, 4, 2, 128, 600000): 0.34417875,
+                ("prefill", 128, 4096, 8, 1, 128, 600000): 0.25254875,
+                ("prefill", 128, 4096, 8, 4, 128, 600000): 0.50654375,
+                ("prefill", 256, 1024, 4, 1, 128, 600000): 0.03286125,
+                ("prefill", 256, 1024, 4, 2, 128, 600000): 0.0571225,
+                ("prefill", 256, 1024, 8, 1, 128, 600000): 0.043765,
+                ("prefill", 256, 1024, 8, 4, 128, 600000): 0.0829025,
+                ("prefill", 256, 4096, 4, 1, 128, 600000): 0.19131,
+                ("prefill", 256, 4096, 4, 2, 128, 600000): 0.34008,
+                ("prefill", 256, 4096, 8, 1, 128, 600000): 0.25009625,
+                ("prefill", 256, 4096, 8, 4, 128, 600000): 0.50262875,
+                ("decode", 128, 128, 4, 1, 128, 600000): 0.58231125,
+                ("decode", 128, 128, 4, 2, 128, 600000): 0.3259175,
+                ("decode", 128, 128, 8, 1, 128, 600000): 0.5799825,
+                ("decode", 128, 128, 8, 4, 128, 600000): 0.55449,
+                ("decode", 128, 256, 4, 1, 128, 600000): 1.1546875,
+                ("decode", 128, 256, 4, 2, 128, 600000): 0.64474375,
+                ("decode", 128, 256, 8, 1, 128, 600000): 1.150025,
+                ("decode", 128, 256, 8, 4, 128, 600000): 1.1009563,
+                ("decode", 256, 128, 4, 1, 128, 600000): 0.54297,
+                ("decode", 256, 128, 4, 2, 128, 600000): 0.28788125,
+                ("decode", 256, 128, 8, 1, 128, 600000): 0.5406875,
+                ("decode", 256, 128, 8, 4, 128, 600000): 0.42053875,
+                ("decode", 256, 256, 4, 1, 128, 600000): 1.0762225,
+                ("decode", 256, 256, 4, 2, 128, 600000): 0.56767875,
+                ("decode", 256, 256, 8, 1, 128, 600000): 1.0714862,
             },
             "TPU v7": {
                 ("prefill", 128, 1024, 4, 1, 128, 600000): 0.014767107,

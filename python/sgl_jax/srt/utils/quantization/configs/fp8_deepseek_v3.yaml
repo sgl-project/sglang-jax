@@ -1,0 +1,25 @@
+# FP8 block-quant config for DeepSeek V3 static HF checkpoints.
+# - Matches HF DeepSeek-V3/R1 FP8 release: float8_e4m3fn weights with
+#   128x128 block-wise `weight_scale_inv` sidecars.
+# - Static checkpoint: pre-quantized weights + scales loaded directly; no
+#   on-the-fly quantization.
+# - Every LinearBase inside the model is quantized (q_a_proj, q_b_proj,
+#   kv_a_proj, kv_b_proj, o_proj, dense gate/up/down_proj, shared experts).
+#   The MoE gate is GateLogit (not LinearBase) and stays in bf16.
+# - Note: use `moe_backend: epmoe` (not `fused`) for the FP8 path; the
+#   fused kernel's static scale placeholders are not yet wired for block
+#   scales (fused_moe.py quantize_weights(is_static=True) uses shape (1,)).
+
+quantization:
+  is_static_checkpoint: true
+  weight_block_size: [128, 128]
+
+  linear:
+    rules:
+      - module_path: '.*'
+        weight_dtype: 'float8_e4m3fn'
+        activation_dtype: null
+
+  moe:
+    weight_dtype: 'float8_e4m3fn'
+    activation_dtype: null
