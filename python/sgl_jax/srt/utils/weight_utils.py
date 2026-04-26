@@ -353,11 +353,29 @@ class WeightLoader:
         if block_size_out <= 0:
             return weight
 
+        import math
+
         from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
             expand_block_scale,
         )
 
         n_out = int(model_param.value.shape[2])
+        out_blocks = weight.shape[0]
+        uniform_blocks = math.ceil(n_out / block_size_out)
+
+        if out_blocks != uniform_blocks:
+            # Per-head block quant: out_blocks reflects per-head boundaries
+            # (e.g., head_dim=192 with block_size=128 → 2 blocks/head).
+            # Keep 2D so the model's dequant can apply correct per-head mapping.
+            logger.info(
+                "Skipping uniform expand for per-head block scale %s: "
+                "out_blocks=%d != uniform=%d, keeping 2D for model dequant",
+                target_path,
+                out_blocks,
+                uniform_blocks,
+            )
+            return weight
+
         logger.info(
             "Expanding linear block-quant scale %s from %s to kernel-ready layout [%d, 1, %d]",
             target_path,

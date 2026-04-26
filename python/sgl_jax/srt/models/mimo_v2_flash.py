@@ -660,17 +660,21 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                         rows.append(weight_scale[h])
                     effective_scale = jnp.stack(rows)
 
-                    channel_to_block = jnp.array([
-                        (j // head_dim) * 2 + (0 if (j % head_dim) < v_overlap else 1)
-                        for j in range(out_dim)
-                    ])
+                    channel_to_block = jnp.array(
+                        [
+                            (j // head_dim) * 2 + (0 if (j % head_dim) < v_overlap else 1)
+                            for j in range(out_dim)
+                        ]
+                    )
             elif head_dim is not None and out_blocks != uniform_blocks:
                 # k_proj: per-head block quant (out_blocks=8 != uniform=6).
                 blocks_per_head = math.ceil(head_dim / block_size_out)
-                channel_to_block = jnp.array([
-                    (j // head_dim) * blocks_per_head + (j % head_dim) // block_size_out
-                    for j in range(out_dim)
-                ])
+                channel_to_block = jnp.array(
+                    [
+                        (j // head_dim) * blocks_per_head + (j % head_dim) // block_size_out
+                        for j in range(out_dim)
+                    ]
+                )
 
             scale_3d = expand_block_scale(
                 effective_scale, out_dim, block_size_out, channel_to_block=channel_to_block
@@ -819,7 +823,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             # Save k_proj's 2D scale before dequant — v_proj needs it for
             # cross-scale dequant (MiMo-Flash combined k+v block quant).
             k_scale_2d = None
-            k_proj_obj = getattr(attn, "k_proj")
+            k_proj_obj = attn.k_proj
             if isinstance(k_proj_obj, QuantizedLinear) and k_proj_obj.weight_scale.value.ndim == 2:
                 k_scale_2d = k_proj_obj.weight_scale.value
 
@@ -829,9 +833,29 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                     # Q/K use head_dim, V uses v_head_dim.
                     hd = attn.v_head_dim if proj_name == "v_proj" else attn.head_dim
                     extra = {}
-                    if proj_name == "v_proj" and k_scale_2d is not None:
+                    if (
+                        proj_name == "v_proj"
+                        and k_scale_2d is not None
+                        and proj.weight_scale.value.ndim == 3
+                    ):
+                        # Full attention layer: k_proj uses per-head block quant,
+                        # so v_proj needs cross-kv scale correction.
+                        # Restore 3D scale (uniform-expanded by WeightLoader) back
+                        # to 2D so _dequantize_quantized_linear can apply the
+                        # cross-kv mapping (v's first v_overlap channels use k's
+                        # last block scale).
+                        scale_3d = proj.weight_scale.value  # [in_blocks, 1, n_out]
+                        v_hd = attn.v_head_dim
+                        num_heads = scale_3d.shape[2] // v_hd
+                        indices = jnp.arange(num_heads) * v_hd
+                        scale_2d_v = scale_3d[:, 0, indices].T  # [num_heads, in_blocks]
+                        proj.weight_scale = nnx.Param(scale_2d_v)
                         extra = {"k_scale_2d": k_scale_2d, "k_head_dim": attn.head_dim}
-                    setattr(attn, proj_name, self._dequantize_quantized_linear(proj, head_dim=hd, **extra))
+                    setattr(
+                        attn,
+                        proj_name,
+                        self._dequantize_quantized_linear(proj, head_dim=hd, **extra),
+                    )
                     logger.info("Dequantized layer %d %s → bf16", layer_idx, proj_name)
 
             # Layer 0 dense MLP
@@ -902,7 +926,6 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         ]:
             hf_key = f"{prefix}.self_attn.{proj}"
             ignored = self._is_quant_ignored(hf_key)
-            use_quant = is_fp8 and not ignored
             weight_suffix = "weight" if (not is_fp8 or ignored) else "weight_q"
 
             mappings[f"{hf_key}.weight"] = WeightMapping(
