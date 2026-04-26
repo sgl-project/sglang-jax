@@ -459,15 +459,14 @@ def _ragged_paged_attention_kernel(
         if softmax_dtype is not None:
             s = s.astype(softmax_dtype)
 
+        # Compute stable numerator for softmax
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
         m_prev = load_with_init(head_m_ref, -jnp.inf)
         m_curr = jnp.maximum(m_prev, s_rowmax)
         head_m_ref[...] = m_curr.astype(jnp.float32)
         p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
 
-        if p.dtype != v.dtype:
-            p = p.astype(v.dtype)
-
+        # Compute stable denominator for softmax
         p_rowsum = jnp.sum(p, axis=1, keepdims=True)
         exp_m_diff = jnp.exp(m_prev - m_curr)
         l_prev = load_with_init(head_l_ref, 0.0)

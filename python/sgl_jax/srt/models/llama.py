@@ -418,22 +418,18 @@ class LlamaForCausalLM(nnx.Module):
         self.mesh = mesh
         self.config = config
         self.dtype = dtype
-        self.dtype_config = dtype_config
-
         if dtype_config is None:
             dtype_config = DtypeConfig(default_dtype=dtype)
-        elif dtype != dtype_config.default_dtype:
-            raise ValueError(
-                f"Global dtype ({dtype}) is not the same as the default dtype provided in dtype_config ({dtype_config.default_dtype})."
-            )
-
-        if dtype_config is not None:
-            logger.info("LlamaForCausalLM using dtype_config: %s", self.dtype_config)
+            logger.info("LlamaForCausalLM config dtype: %s", dtype)
         else:
-            logger.info("LlamaForCausalLM config dtype: %s", self.dtype)
+            if dtype != dtype_config.default_dtype:
+                raise ValueError(
+                    f"Global dtype ({dtype}) is not the same as the default dtype provided in dtype_config ({dtype_config.default_dtype})."
+                )
+            logger.info("LlamaForCausalLM using dtype_config: %s", dtype_config)
 
         self.model = LlamaModel(
-            config, dtype=self.dtype, dtype_config=self.dtype_config.get_config("model"), mesh=mesh
+            config, dtype=self.dtype, dtype_config=dtype_config.get_config("model"), mesh=mesh
         )
 
         if not getattr(self.config, "tie_word_embeddings", False):
@@ -441,7 +437,7 @@ class LlamaForCausalLM(nnx.Module):
                 config.vocab_size,
                 config.hidden_size,
                 dtype=self.dtype,
-                param_dtype=self.dtype_config.get_dtype("lm_head"),
+                param_dtype=dtype_config.get_dtype("lm_head"),
                 kernel_axes=("tensor", None),
             )
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
