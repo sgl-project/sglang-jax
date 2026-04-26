@@ -101,6 +101,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         layer: RadixLinearAttention,
     ) -> tuple[jax.Array, jax.Array]:
         """Chunked prefill via Pallas kernel.  Returns (output, new_state)."""
+        A_log, dt_bias = self._gate_params(layer, g)
         # Kernel expects [1, T_packed, H, K] packed layout.
         o, final_state, *_ = chunk_kda(
             q[None, ...],
@@ -112,6 +113,9 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             initial_state=initial_state,
             output_final_state=True,
             cu_seqlens=cu_seqlens,
+            use_gate_in_kernel=True,
+            A_log=A_log,
+            dt_bias=dt_bias,
         )
         # Remove the B=1 packed dim: [1, T, H, V] -> [T, H, V]
         return o[0], final_state
@@ -127,6 +131,10 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         layer: RadixLinearAttention,
     ) -> tuple[jax.Array, jax.Array]:
         """Single-step decode via naive JAX recurrence.  Returns (output, new_state)."""
+        A_log, dt_bias = self._gate_params(layer, g)
+        g = -jnp.exp(A_log.reshape(1, g.shape[-2], 1)) * jax.nn.softplus(
+            g + dt_bias.reshape(1, g.shape[-2], g.shape[-1])
+        )
         # Kernel expects [B, T=1, H, K].
         o, final_state = fused_recurrent_kda(
             q[:, None, ...],
@@ -140,6 +148,25 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         )
         # Remove the T=1 dim: [B, 1, H, V] -> [B, H, V]
         return o[:, 0], final_state
+
+    @staticmethod
+    def _as_array(value) -> jax.Array:
+        return value[...] if hasattr(value, "__getitem__") else value
+
+    @classmethod
+    def _gate_params(
+        cls,
+        layer: RadixLinearAttention,
+        g: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        if layer.A_log is None or layer.dt_bias is None:
+            raise ValueError("KDA gate activation requires layer.A_log and layer.dt_bias")
+        A_log = jnp.asarray(cls._as_array(layer.A_log), dtype=jnp.float32).reshape(-1)
+        dt_bias = jnp.asarray(cls._as_array(layer.dt_bias), dtype=jnp.float32).reshape(
+            g.shape[-2],
+            g.shape[-1],
+        )
+        return A_log, dt_bias
 
     # ------------------------------------------------------------------
     # QKV / gate / beta helpers (KDA-specific shapes)

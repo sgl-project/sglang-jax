@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.sharding import NamedSharding
@@ -304,6 +305,11 @@ class MockRecurrentStatePool:
 
         recurrent_cache, conv_cache = self.layer_caches[layer_id]
         recurrent_cache = recurrent_cache.at[indices].set(recurrent)
-        if conv_cache is not None and conv is not None:
+        if conv is not None:
+            if conv_cache is None:
+                conv_cache = jnp.zeros(
+                    (recurrent_cache.shape[0],) + conv.shape[1:],
+                    dtype=conv.dtype,
+                )
             conv_cache = conv_cache.at[indices].set(conv)
         self.layer_caches[layer_id] = (recurrent_cache, conv_cache)
