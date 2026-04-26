@@ -23,6 +23,7 @@ from sgl_jax.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     AttentionBackendMetadata,
 )
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.jax_utils import device_array
 
 if TYPE_CHECKING:
@@ -55,24 +56,25 @@ class LinearRecurrentAttnBackendMetadata:
 
 @dataclass
 class LinearRecurrentAttnBackend(AttentionBackend):
+    metadata_cls = LinearRecurrentAttnBackendMetadata
+
     def __init__(self, mesh: jax.sharding.Mesh | None = None):
         self.mesh = mesh
-        self.forward_metadata = nnx.data(LinearRecurrentAttnBackendMetadata())
+        self.forward_metadata = nnx.data(self.metadata_cls())
 
     def get_forward_metadata(
         self,
         batch: ModelWorkerBatch,
         recurrent_indices: np.ndarray | jax.Array,
     ) -> LinearRecurrentAttnBackendMetadata:
-        mode_name = _forward_mode_name(batch.forward_mode)
-        if mode_name == "EXTEND":
+        if batch.forward_mode == ForwardMode.EXTEND:
             q_lens = np.asarray(batch.extend_seq_lens, dtype=np.int32)
             cu_q_lens = np.concatenate(
                 [np.array([0], dtype=np.int32), np.cumsum(q_lens, dtype=np.int32)]
             )
-        elif mode_name == "DECODE":
+        elif batch.forward_mode == ForwardMode.DECODE:
             cu_q_lens = np.arange(len(batch.seq_lens) + 1, dtype=np.int32)
-        elif mode_name in ("IDLE", "DUMMY_FIRST"):
+        elif batch.forward_mode in (ForwardMode.IDLE, ForwardMode.DUMMY_FIRST):
             cu_q_lens = np.array([0], dtype=np.int32)
         else:
             raise NotImplementedError(
@@ -89,11 +91,11 @@ class LinearRecurrentAttnBackend(AttentionBackend):
             (cu_q_lens, recurrent_indices),
             sharding=sharding,
         )
-        metadata = type(self.forward_metadata)(
+        metadata = self.metadata_cls(
             cu_q_lens=cu_q_lens_dev,
             recurrent_indices=recurrent_indices_dev,
         )
-        self.forward_metadata = metadata
+        self.forward_metadata = nnx.data(metadata)
         return metadata
 
     def tree_flatten(self):
@@ -120,24 +122,25 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         q, k, v = self._split_mixed_qkv(mixed_qkv, layer)
         g = self._reshape_gate(a, q)
         beta = self._reshape_beta(b, q)
-        mode_name = _forward_mode_name(forward_batch.forward_mode)
 
-        if mode_name in ("IDLE", "DUMMY_FIRST"):
+        if forward_batch.forward_mode in (ForwardMode.IDLE, ForwardMode.DUMMY_FIRST):
             return jnp.zeros((q.shape[0], q.shape[1] * v.shape[-1]), dtype=v.dtype)
-        if mode_name in ("DRAFT_EXTEND", "TARGET_VERIFY"):
+        if forward_batch.forward_mode in (
+            ForwardMode.DRAFT_EXTEND,
+            ForwardMode.TARGET_VERIFY,
+        ):
             raise NotImplementedError(
                 f"Linear recurrent attention does not support {forward_batch.forward_mode}"
             )
 
         recurrent_indices = self.forward_metadata.recurrent_indices
-        recurrent_cache, conv_cache = self._get_layer_cache(
+        recurrent_cache, _ = self._get_layer_cache(
             recurrent_state_pool,
             layer.layer_id,
         )
         initial_state = recurrent_cache[recurrent_indices].astype(jnp.float32)
-        selected_conv = None if conv_cache is None else conv_cache[recurrent_indices]
 
-        if mode_name == "EXTEND":
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
             output, new_recurrent = self._dispatch_chunk(
                 q,
                 k,
@@ -149,7 +152,7 @@ class LinearRecurrentAttnBackend(AttentionBackend):
                 layer,
             )
             output = output[0]
-        elif mode_name == "DECODE":
+        elif forward_batch.forward_mode == ForwardMode.DECODE:
             output, new_recurrent = self._dispatch_recurrent(
                 q,
                 k,
@@ -169,7 +172,7 @@ class LinearRecurrentAttnBackend(AttentionBackend):
             layer.layer_id,
             recurrent_indices,
             new_recurrent,
-            selected_conv,
+            None,
         )
         return output.reshape(output.shape[0], -1)
 
@@ -429,10 +432,6 @@ def attn_backend_wrapper(
 
 
 # --- Helpers ----------------------------------------------------------------
-
-
-def _forward_mode_name(forward_mode) -> str:
-    return getattr(forward_mode, "name", str(forward_mode).rsplit(".", 1)[-1])
 
 
 class MockRecurrentStatePool:

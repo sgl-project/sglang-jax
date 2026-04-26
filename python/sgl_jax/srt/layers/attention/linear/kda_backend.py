@@ -19,9 +19,7 @@ class KDAAttnBackendMetadata(LinearRecurrentAttnBackendMetadata):
 
 
 class KDAAttnBackend(LinearRecurrentAttnBackend):
-    def __init__(self, mesh: jax.sharding.Mesh | None = None):
-        super().__init__(mesh=mesh)
-        self.forward_metadata = KDAAttnBackendMetadata()
+    metadata_cls = KDAAttnBackendMetadata
 
     def _dispatch_chunk(
         self,
