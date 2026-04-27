@@ -465,7 +465,7 @@ class EPMoE(nnx.Module):
             )
 
         # Reshard result back to original mesh
-        replicated_pspec = P(*([None] * result.ndim))
+        replicated_pspec = P("data", *([None] * (result.ndim - 1)))
         return jax.sharding.reshard(result, jax.sharding.NamedSharding(self.mesh, replicated_pspec))
 
     def _forward(

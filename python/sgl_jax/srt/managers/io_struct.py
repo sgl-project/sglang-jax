@@ -165,6 +165,8 @@ class TokenizedGenerateReqInput:
     return_hidden_states: bool = False
     # multimodal inputs (e.g., mrope positions, embeddings)
     mm_inputs: dict | None = None
+    # The data parallel rank for this request
+    dp_rank: int | None = None
 
 
 @dataclass
