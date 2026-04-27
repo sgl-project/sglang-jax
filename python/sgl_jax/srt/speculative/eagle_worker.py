@@ -528,7 +528,12 @@ class EAGLEWorker(ModelWorker):
         for token_ids, num_tokens in zip(token_ids_logprobs, num_tokens_per_req):
             token_ids_logprobs_repeat_interleaved.extend([token_ids] * num_tokens)
 
-        # Extract logprobs
+        # Extract logprobs.
+        # NOTE: get_top_logprobs / get_token_ids_logprobs now return device
+        # dense tensors; per-req trimming happens on host downstream. This
+        # spec-decode path doesn't currently route through that host
+        # slicing, so it is best-effort and may need follow-up alongside
+        # the broader spec+DP+logprob unification.
         if any(x > 0 for x in top_logprobs_nums):
             (
                 logits_output.next_token_top_logprobs_val,
@@ -539,13 +544,12 @@ class EAGLEWorker(ModelWorker):
             )
 
         if any(x is not None for x in token_ids_logprobs):
-            (
-                logits_output.next_token_token_ids_logprobs_val,
-                logits_output.next_token_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs(
+            logits_output.next_token_token_ids_logprobs_val = get_token_ids_logprobs(
                 logprobs,
                 token_ids_logprobs_repeat_interleaved,
+                None,
             )
+            logits_output.next_token_token_ids_logprobs_idx = None
 
         logits_output.next_token_logprobs = logprobs[
             jnp.arange(len(batch_next_token_ids), device=batch.sampling_info.device),

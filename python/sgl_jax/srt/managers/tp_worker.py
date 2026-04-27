@@ -612,9 +612,10 @@ class ModelWorker:
             )
 
         self.model_runner.attn_backend.forward_metadata = forward_metadata
+        logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh)
         logits_output, cache_miss_count, layers_topk_ids = self.model_runner.forward(
             forward_batch,
-            logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
+            logits_metadata=logits_metadata,
         )
 
         self.dump_topk_ids(layers_topk_ids, model_worker_batch)
@@ -662,44 +663,107 @@ class ModelWorker:
                 logits_output.next_token_logprobs = jax.device_get(logprobs)[selector]
         if new_logits_output is not None:
             logits_output = new_logits_output
-            if logits_output.next_token_logprobs is not None:
-                logits_output.next_token_logprobs = jax.device_get(
-                    logits_output.next_token_logprobs
-                )[selector]
-            if logits_output.next_token_top_logprobs_val is not None:
-                logits_output.next_token_top_logprobs_val = jax.device_get(
-                    logits_output.next_token_top_logprobs_val.astype(jnp.float32)
-                )[selector].tolist()
-                logits_output.next_token_top_logprobs_idx = jax.device_get(
-                    logits_output.next_token_top_logprobs_idx
-                )[selector].tolist()
-            if logits_output.next_token_token_ids_logprobs_val is not None:
-                logits_output.next_token_token_ids_logprobs_val = jax.device_get(
-                    logits_output.next_token_token_ids_logprobs_val.astype(jnp.float32)
-                )[selector].tolist()
-                logits_output.next_token_token_ids_logprobs_idx = jax.device_get(
-                    logits_output.next_token_token_ids_logprobs_idx
-                )[selector].tolist()
-            if logits_output.input_token_ids_logprobs_val is not None:
-                logits_output.input_token_ids_logprobs_val = jax.device_get(
-                    logits_output.input_token_ids_logprobs_val.astype(jnp.float32)
-                )[selector].tolist()
-                logits_output.input_token_ids_logprobs_idx = jax.device_get(
-                    logits_output.input_token_ids_logprobs_idx
-                )[selector].tolist()
-            if logits_output.input_top_logprobs_val is not None:
-                logits_output.input_top_logprobs_val = jax.device_get(
-                    logits_output.input_top_logprobs_val.astype(jnp.float32)
-                )[selector].tolist()
-                logits_output.input_top_logprobs_idx = jax.device_get(
-                    logits_output.input_top_logprobs_idx
-                )[selector].tolist()
+            self._materialize_logprobs_to_host(
+                logits_output, model_worker_batch, logits_metadata, selector
+            )
 
         return (
             logits_output,
             next_token_ids_device,
             cache_miss_count,
         )
+
+    def _materialize_logprobs_to_host(
+        self,
+        logits_output: LogitsProcessorOutput,
+        model_worker_batch: ModelWorkerBatch,
+        logits_metadata: LogitsMetadata,
+        selector: np.ndarray,
+    ):
+        """Reorder + per-req split logprob tensors from device to host lists.
+
+        `next_token_*` tensors are batch-major and routed through `selector`
+        to recover original-req order. `input_*` tensors are per prompt-token
+        in DP-rank-then-req order which already matches the original-req
+        order, so they are split directly using `extend_logprob_pruned_lens_cpu`.
+        Per-req `top_logprobs_nums` / `token_ids_logprobs` give the trim k_i /
+        gather columns. Output shape is `list[list[float]]` per req, matching
+        the consumer contract in `scheduler_output_processor_mixin`.
+        """
+
+        def gather(arr, *, as_float=False):
+            if as_float:
+                arr = arr.astype(jnp.float32)
+            return jax.device_get(arr)[selector]
+
+        if logits_output.next_token_logprobs is not None:
+            logits_output.next_token_logprobs = jax.device_get(logits_output.next_token_logprobs)[
+                selector
+            ]
+
+        top_nums = model_worker_batch.top_logprobs_nums
+        tok_ids = model_worker_batch.token_ids_logprobs
+
+        if logits_output.next_token_top_logprobs_val is not None:
+            vals = gather(logits_output.next_token_top_logprobs_val, as_float=True)
+            idxs = gather(logits_output.next_token_top_logprobs_idx)
+            logits_output.next_token_top_logprobs_val = [
+                vals[i, : top_nums[orig]].tolist() for i, orig in enumerate(selector)
+            ]
+            logits_output.next_token_top_logprobs_idx = [
+                idxs[i, : top_nums[orig]].tolist() for i, orig in enumerate(selector)
+            ]
+
+        if logits_output.next_token_token_ids_logprobs_val is not None:
+            full = gather(logits_output.next_token_token_ids_logprobs_val, as_float=True)
+            per_req_vals, per_req_idxs = [], []
+            for i, orig in enumerate(selector):
+                ids = tok_ids[orig] if tok_ids else None
+                if ids:
+                    per_req_vals.append(full[i, ids].tolist())
+                    per_req_idxs.append(list(ids))
+                else:
+                    per_req_vals.append([])
+                    per_req_idxs.append([])
+            logits_output.next_token_token_ids_logprobs_val = per_req_vals
+            logits_output.next_token_token_ids_logprobs_idx = per_req_idxs
+
+        pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu
+
+        if logits_output.input_top_logprobs_val is not None:
+            vals = jax.device_get(logits_output.input_top_logprobs_val.astype(jnp.float32))
+            idxs = jax.device_get(logits_output.input_top_logprobs_idx)
+            per_req_vals, per_req_idxs = [], []
+            pt = 0
+            for k, plen in zip(logits_metadata.top_logprobs_nums, pruned_lens):
+                if plen <= 0:
+                    per_req_vals.append([])
+                    per_req_idxs.append([])
+                    continue
+                per_req_vals.append(vals[pt : pt + plen, :k].tolist())
+                per_req_idxs.append(idxs[pt : pt + plen, :k].tolist())
+                pt += plen
+            logits_output.input_top_logprobs_val = per_req_vals
+            logits_output.input_top_logprobs_idx = per_req_idxs
+
+        if logits_output.input_token_ids_logprobs_val is not None:
+            full = jax.device_get(logits_output.input_token_ids_logprobs_val.astype(jnp.float32))
+            per_req_vals, per_req_idxs = [], []
+            pt = 0
+            for ids, plen in zip(logits_metadata.token_ids_logprobs, pruned_lens):
+                if plen <= 0:
+                    per_req_vals.append([])
+                    per_req_idxs.append([])
+                    continue
+                if ids:
+                    per_req_vals.append(full[pt : pt + plen][:, ids].tolist())
+                    per_req_idxs.append([list(ids) for _ in range(plen)])
+                else:
+                    per_req_vals.append([])
+                    per_req_idxs.append([])
+                pt += plen
+            logits_output.input_token_ids_logprobs_val = per_req_vals
+            logits_output.input_token_ids_logprobs_idx = per_req_idxs
 
     def dump_topk_ids(self, layers_topk_ids: list[jax.Array], model_worker_batch: ModelWorkerBatch):
         enable = self.server_args.enable_return_routed_experts

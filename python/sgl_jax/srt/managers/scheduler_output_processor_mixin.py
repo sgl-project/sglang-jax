@@ -302,10 +302,6 @@ class SchedulerOutputProcessorMixin:
             self.draft_token += batch.batch_size() * self.draft_worker.speculative_num_draft_tokens
         # FIXME(pc) add spec decode metrics
 
-        # NOTE: overlap mode + DP > 1 + return_logprob is not yet correct
-        # because logprob host-reorder via logits_indices_selector is not
-        # wired through resolve_last_batch_result. Use --disable-overlap-schedule
-        # if you need correct logprobs under DP > 1.
         if self.enable_overlap:
             logits_output, next_token_ids, cache_miss_count = (
                 self.tp_worker.resolve_last_batch_result(launch_done)
@@ -619,11 +615,11 @@ class SchedulerOutputProcessorMixin:
     ):
         """Attach logprobs to the return values.
 
-        `i` is the flat req index (DP-rank-then-req) used to index logprob
-        arrays that have already been reordered by `logits_indices_selector`.
-        `local_idx` is the per-DP-rank index used only to index
-        `next_token_ids` (which is sliced per-DP-rank by the caller).
-        For DP=1 they are equal so `local_idx=None` falls back to `i`.
+        `i` indexes logprob arrays (already reordered to original-req order).
+        `local_idx` indexes `next_token_ids` (per-DP-rank slice from caller).
+        DP=1: `i == local_idx`; pass `local_idx=None` to fall back to `i`.
+        DP>1: `i` is the global flat req index, `local_idx` is the per-rank
+        position; both must be passed.
         """
         nt_idx = i if local_idx is None else local_idx
         req.output_token_logprobs_val.append(output.next_token_logprobs[i])
