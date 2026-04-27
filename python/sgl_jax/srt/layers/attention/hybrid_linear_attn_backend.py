@@ -162,10 +162,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
 
     def get_max_running_reqests(self, max_context_len, page_size):
-        return min(
-            self.full_attn_backend.get_max_running_reqests(max_context_len, page_size),
-            self.linear_attn_backend.get_max_running_reqests(max_context_len, page_size),
-        )
+        return self.full_attn_backend.get_max_running_reqests(max_context_len, page_size)
 
 
 def attn_backend_wrapper(
