@@ -635,11 +635,17 @@ class MHATokenToKVPool(KVCache):
         )
 
     def replace_buffer(self, fused_kv_buffer: list[jax.Array]) -> None:
-        # tp_size==1 sharding fix (issue #233): NamedSharding constraint can be
-        # lost on JIT output; explicit device_put with self.kv_sharding restores
-        # it before the slice assign so the next JIT trace sees a stable shape.
-        # Mirrors RecurrentStatePool.replace_buffer  per-element fix.
-        if hasattr(self, "kv_sharding") and len(self.kv_sharding.device_set) == 1:
+        # tp_size==1 sharding fix (issue #233): when the tp axis is degenerate
+        # (size 1), JAX optimizes away the P(None, "tensor") constraint on
+        # JIT output; explicit device_put with self.kv_sharding restores it
+        # before the slice assign so the next JIT trace sees a stable shape.
+        # Trigger condition is `mesh.shape["tensor"] == 1` (== ServerArgs
+        # tp_size == 1), which is what aolemila's original fix in
+        # _set_kv_cache_after_forward used. NOT `len(device_set) == 1` —
+        # that's mesh-total-devices, which differs in multi-device tp_size=1
+        # deployments (e.g. 8 devices with tp=1 → device_set=8 but tensor
+        # axis still degenerate, fix still required).
+        if self.mesh.shape.get("tensor", 1) == 1 and hasattr(self, "kv_sharding"):
             fused_kv_buffer = [jax.device_put(buf, self.kv_sharding) for buf in fused_kv_buffer]
         self.kv_buffer[self.start_layer : self.start_layer + len(fused_kv_buffer)] = fused_kv_buffer
 
@@ -1273,11 +1279,12 @@ class MLATokenToKVPool(KVCache):
         )
 
     def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
-        # tp_size==1 sharding fix (issue #233): NamedSharding constraint can be
-        # lost on JIT output; explicit device_put with self.kv_sharding restores
-        # it before the slice assign so the next JIT trace sees a stable shape.
-        # Mirrors RecurrentStatePool.replace_buffer  per-element fix.
-        if hasattr(self, "kv_sharding") and len(self.kv_sharding.device_set) == 1:
+        # tp_size==1 sharding fix (issue #233): see MHATokenToKVPool.replace_buffer
+        # for full rationale. MLA's kv_sharding is fully replicated (P(None)*4),
+        # but the same JIT-output constraint loss happens on the tensor axis when
+        # it's degenerate; trigger condition matches aolemila's original
+        # _set_kv_cache_after_forward fix (mesh.shape["tensor"] == 1).
+        if self.mesh.shape.get("tensor", 1) == 1 and hasattr(self, "kv_sharding"):
             kv_buffer = [jax.device_put(buf, self.kv_sharding) for buf in kv_buffer]
         self.kv_buffer[self.start_layer : self.start_layer + len(kv_buffer)] = kv_buffer
 

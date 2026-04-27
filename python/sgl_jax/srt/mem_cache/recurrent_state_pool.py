@@ -286,17 +286,20 @@ class RecurrentStatePool:
             )
 
         # tp_size==1 sharding fix using persisted sharding (mirrors MHA pool's
-        # `if hasattr(self, "kv_sharding") and len(...) == 1` guard).
+        # `mesh.shape["tensor"] == 1` guard — see MHATokenToKVPool.replace_buffer
+        # for full rationale on why we trigger on tensor axis size, not
+        # device_set).
+        tp_degenerate = self.mesh.shape.get("tensor", 1) == 1
         for layer in range(self.num_linear_recurrent_layers):
             buf = new_recurrent[layer]
-            if hasattr(self, "recurrent_sharding") and len(self.recurrent_sharding.device_set) == 1:
+            if tp_degenerate and hasattr(self, "recurrent_sharding"):
                 buf = jax.device_put(buf, self.recurrent_sharding)
             self.recurrent_buffers[layer] = buf
 
         for layer in range(self.num_linear_recurrent_layers):
             for i in range(len(new_conv[layer])):
                 buf = new_conv[layer][i]
-                if hasattr(self, "conv_sharding") and len(self.conv_sharding.device_set) == 1:
+                if tp_degenerate and hasattr(self, "conv_sharding"):
                     buf = jax.device_put(buf, self.conv_sharding)
                 self.conv_buffers[layer][i] = buf
 

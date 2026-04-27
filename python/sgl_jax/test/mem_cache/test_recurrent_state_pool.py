@@ -669,6 +669,43 @@ class TestShardingPersistence(_Base):
                 )
 
 
+class TestReplaceBufferTpDegenerateGuard(unittest.TestCase):
+    """Lock-in for the issue #233 fix trigger condition: replace_buffer
+    applies the device_put sharding restore ONLY when the tensor axis is
+    degenerate (mesh.shape["tensor"] == 1), matching ServerArgs tp_size==1.
+
+    aolemila's original fix in _set_kv_cache_after_forward (commit 30f405ec)
+    used `if self.tp_size == 1`. When the fix moved into the pool, the
+    trigger MUST stay equivalent: we read mesh.shape["tensor"] (== tp_size)
+    and NOT len(kv_sharding.device_set) (== mesh total devices), because
+    the two diverge in multi-device tp_size=1 deployments.
+    """
+
+    def setUp(self):
+        if not jax.devices():
+            self.skipTest("JAX not available")
+
+    def _src(self, module_path):
+        import importlib
+        import inspect
+
+        return inspect.getsource(importlib.import_module(module_path))
+
+    def test_mha_pool_uses_tensor_axis_size_not_device_set(self):
+        src = self._src("sgl_jax.srt.mem_cache.memory_pool")
+        # Positive: the new tensor-axis check exists.
+        self.assertIn('self.mesh.shape.get("tensor", 1) == 1', src)
+        # Negative: the old device_set check is gone (would silently misfire
+        # on multi-device tp_size=1 deployments).
+        self.assertNotIn("len(self.kv_sharding.device_set) == 1", src)
+
+    def test_recurrent_pool_uses_tensor_axis_size_not_device_set(self):
+        src = self._src("sgl_jax.srt.mem_cache.recurrent_state_pool")
+        self.assertIn('self.mesh.shape.get("tensor", 1) == 1', src)
+        self.assertNotIn("len(self.recurrent_sharding.device_set) == 1", src)
+        self.assertNotIn("len(self.conv_sharding.device_set) == 1", src)
+
+
 class TestPytreeRoundtripPreservesMeshAndSharding(_Base):
     """Lock-in: tree_flatten aux must carry mesh + partition axis names +
     NamedSharding objects so JIT donate cycles (which round-trip through
