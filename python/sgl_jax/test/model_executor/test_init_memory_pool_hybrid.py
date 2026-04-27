@@ -455,26 +455,32 @@ class TestStateToKvRatioActuallySplitsBudget(unittest.TestCase):
         )
 
 
-class TestMlaAndSwaHybridRaiseNotImplemented(unittest.TestCase):
-    """MLA + recurrent_state and SWA + recurrent_state are out of scope for
-    this initial wiring (per-token byte formulas differ from MHA). Lock-in
-    that init_memory_pool fails fast with NotImplementedError instead of
-    silently sizing pools wrong."""
+class TestSwaHybridRaisesNotImplemented(unittest.TestCase):
+    """SWA + recurrent_state is out of scope for this initial wiring (full +
+    swa KV pools have independent per-token sizes; the single-pool budget
+    arithmetic would over-commit). Lock-in that init_memory_pool fails fast
+    with NotImplementedError instead of silently sizing pools wrong.
+
+    MLA + recurrent_state is now supported via _compute_cell_size's MLA fast
+    path (absorbed latent KV geometry), so the guard no longer mentions MLA.
+    """
 
     def setUp(self):
         if not jax.devices():
             self.skipTest("JAX not available")
 
-    def test_init_memory_pool_source_guards_mla_and_swa(self):
+    def test_init_memory_pool_source_guards_swa_only(self):
         """Source-level lock-in: the guard raises NotImplementedError when
-        is_hybrid (SWA) or use_mla_backend is True in the recurrent branch."""
+        is_hybrid (SWA) is True in the recurrent branch, and does NOT guard
+        on use_mla_backend (which is now supported)."""
         import inspect
 
         from sgl_jax.srt.model_executor.model_runner import ModelRunner
 
         src = inspect.getsource(ModelRunner.init_memory_pool)
-        self.assertIn("self.is_hybrid or self.use_mla_backend", src)
+        self.assertIn("if self.is_hybrid:", src)
         self.assertIn("NotImplementedError", src)
+        self.assertNotIn("self.is_hybrid or self.use_mla_backend", src)
 
 
 if __name__ == "__main__":

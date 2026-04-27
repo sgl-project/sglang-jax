@@ -573,23 +573,22 @@ class ModelRunner(BaseModelRunner):
             # so the KV pool is sized against kv_budget instead of the full
             # profile (otherwise state_to_kv_ratio is dead code: KV pool keeps
             # all HBM and the state pool starves at runtime).
-            if self.is_hybrid or self.use_mla_backend:
-                # SWA-hybrid (full + swa KV pools) and absorbed-MLA (latent KV
-                # geometry) have different per-token byte formulas; keeping
-                # those out of scope for now keeps the MHA + recurrent path
-                # honest. Removing this guard requires per-path per_token
-                # byte helpers that match each pool's actual storage shape.
+            if self.is_hybrid:
+                # SWA-hybrid keeps two KV pools (full + swa) with independent
+                # per-token sizes; the single-pool budget arithmetic below
+                # would size both against the same `per_token` and over-
+                # commit. Out of scope for the initial recurrent wiring.
                 raise NotImplementedError(
-                    "state_to_kv_ratio budget split is implemented only for "
-                    "the MHA + recurrent_state path; SWA-hybrid and MLA paths "
-                    "are TODO."
+                    "state_to_kv_ratio budget split is implemented for the "
+                    "MHA / MLA + recurrent_state paths; SWA-hybrid is TODO."
                 )
 
             # Use the project's existing _compute_cell_size helper so per-token
-            # KV bytes match what the KV pool actually consumes per device:
-            # per-device head count + align128 + adjust_layer_num + K+V *2 +
-            # MLA latent fast path. Keeps a single source of truth for KV
-            # byte arithmetic (no parallel formula to drift).
+            # KV bytes match what the KV pool actually consumes per device.
+            # Single source of truth for KV byte arithmetic — handles both
+            # MHA/GQA (per-device head count + align128 + K+V *2) and
+            # absorbed-MLA (align128(lkv) + align128(rope), no *2 since V is
+            # not cached) via _compute_cell_size's MLA fast path.
             per_token_kv_bytes = self._compute_cell_size()
             available_bytes = self.max_total_num_tokens * per_token_kv_bytes
             state_budget, kv_budget = _split_state_kv_budget(
