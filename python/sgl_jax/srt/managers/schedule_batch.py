@@ -1956,6 +1956,7 @@ class ScheduleBatch:
         top_ks = np.ones(total_bs, dtype=np.int32)
         min_ps = np.zeros(total_bs, dtype=np.float32)
         sampling_seeds = None
+        linear_penalty = None  # lazily allocated only if any DP rank has penalties
 
         offset_bs = 0
         has_sampling_seeds = False
@@ -1989,6 +1990,17 @@ class ScheduleBatch:
                     has_sampling_seeds = True
                 sampling_seeds[offset_bs : offset_bs + dp_bs] = dp_sampling.sampling_seeds[:dp_bs]
 
+            # Compute per-DP penalties (no-op if not required) and stitch into the
+            # merged buffer using the same per-DP slot offset as the other arrays.
+            dp_sampling.update_penalties()
+            if dp_sampling.linear_penalty is not None and dp_sampling.linear_penalty.size > 0:
+                if linear_penalty is None:
+                    linear_penalty = np.zeros(
+                        (total_bs, dp_sampling.linear_penalty.shape[1]),
+                        dtype=dp_sampling.linear_penalty.dtype,
+                    )
+                linear_penalty[offset_bs : offset_bs + dp_bs] = dp_sampling.linear_penalty[:dp_bs]
+
             # Move to next DP rank's slot (fixed slot size)
             offset_bs += per_dp_bs_size
 
@@ -2000,6 +2012,7 @@ class ScheduleBatch:
             vocab_size=vocab_size,
             is_all_greedy=is_all_greedy,
             sampling_seeds=sampling_seeds if has_sampling_seeds else None,
+            linear_penalty=linear_penalty,
             grammars=[req.grammar for req in all_reqs] if self.has_grammar else None,
         )
 
@@ -2731,7 +2744,9 @@ class ModelWorkerSamplingInfo:
         return ret
 
     def update_penalties(self):
-        self.linear_penalty = None
+        # No-op: linear_penalty is pre-computed during ScheduleBatch._merge_sampling_info.
+        # Kept for API parity with SamplingBatchInfo.update_penalties (called by overlap thread).
+        return
 
     def update_grammar_vocab_mask(self):
         """Update vocabulary masks from grammars before sampling."""
