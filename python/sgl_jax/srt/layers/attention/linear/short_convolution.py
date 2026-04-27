@@ -15,12 +15,40 @@ State convention follows FLA's ``ShortConvolution``: cache has width ``K``
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import jax
 import jax.numpy as jnp
 
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
-_SUPPORTED_ACTIVATIONS = (None, "silu")
+# Map of supported activation names → callable. ``None`` means identity.
+_ACTIVATION_FNS: dict[str | None, Callable[[jax.Array], jax.Array] | None] = {
+    None: None,
+    "silu": jax.nn.silu,
+    "swish": jax.nn.silu,
+    "gelu": jax.nn.gelu,
+    "relu": jax.nn.relu,
+    "sigmoid": jax.nn.sigmoid,
+    "tanh": jnp.tanh,
+}
+
+
+def _resolve_activation(
+    activation: str | Callable[[jax.Array], jax.Array] | None,
+) -> Callable[[jax.Array], jax.Array] | None:
+    """Resolve an activation spec to a callable (or None for identity).
+
+    Accepts either a name from ``_ACTIVATION_FNS`` or a user-supplied callable.
+    """
+    if activation is None or callable(activation):
+        return activation
+    if activation not in _ACTIVATION_FNS:
+        raise ValueError(
+            f"short_convolution activation must be one of {sorted(k for k in _ACTIVATION_FNS if k is not None)} "
+            f"or a callable; got {activation!r}"
+        )
+    return _ACTIVATION_FNS[activation]
 
 
 def short_convolution(
@@ -30,7 +58,7 @@ def short_convolution(
     cu_seqlens: jax.Array | None,
     forward_mode: ForwardMode,
     bias: jax.Array | None = None,
-    activation: str | None = "silu",
+    activation: str | Callable[[jax.Array], jax.Array] | None = "silu",
 ) -> tuple[jax.Array, jax.Array]:
     """Depthwise causal conv1d with per-sequence cache.
 
@@ -43,25 +71,22 @@ def short_convolution(
             ``EXTEND``, ignored for ``DECODE``.
         forward_mode: ``ForwardMode.DECODE`` or ``ForwardMode.EXTEND``.
         bias: optional ``[D]`` channel bias added before the activation.
-        activation: ``"silu"`` or ``None``.
+        activation: name (e.g. ``"silu"``, ``"gelu"``, ``"sigmoid"``), a
+            user-supplied callable, or ``None`` for identity.
 
     Returns:
         ``(y, new_cache)`` where ``y`` matches the leading dims of ``x`` and
         ``new_cache`` has the same shape as ``cache``.
     """
-    if activation not in _SUPPORTED_ACTIVATIONS:
-        raise ValueError(
-            f"short_convolution activation must be one of {_SUPPORTED_ACTIVATIONS}, "
-            f"got {activation!r}"
-        )
+    activation_fn = _resolve_activation(activation)
 
     weight = _normalize_weight(weight)
 
     if forward_mode == ForwardMode.DECODE:
-        return _decode_conv(x, weight, cache, bias, activation)
+        return _decode_conv(x, weight, cache, bias, activation_fn)
     if cu_seqlens is None:
         raise ValueError("short_convolution(EXTEND) requires cu_seqlens")
-    return _extend_conv(x, weight, cache, cu_seqlens, bias, activation)
+    return _extend_conv(x, weight, cache, cu_seqlens, bias, activation_fn)
 
 
 def _normalize_weight(weight: jax.Array) -> jax.Array:
@@ -72,42 +97,41 @@ def _normalize_weight(weight: jax.Array) -> jax.Array:
     return weight
 
 
-def _apply_activation(y: jax.Array, activation: str | None) -> jax.Array:
-    if activation == "silu":
-        return jax.nn.silu(y)
-    return y
+def _apply_activation(
+    y: jax.Array,
+    activation_fn: Callable[[jax.Array], jax.Array] | None,
+) -> jax.Array:
+    if activation_fn is None:
+        return y
+    return activation_fn(y)
 
 
 def _decode_conv(
     x: jax.Array,
-    weight: jax.Array,
+    conv_kernel: jax.Array,
     cache: jax.Array,
     bias: jax.Array | None,
-    activation: str | None,
+    activation_fn: Callable[[jax.Array], jax.Array] | None,
 ) -> tuple[jax.Array, jax.Array]:
     # Roll the cache left by one and append the new token at the last slot.
     new_cache = jnp.concatenate([cache[:, :, 1:], x[:, :, None]], axis=-1)
-    y = jnp.einsum(
-        "bck,ck->bc",
-        new_cache.astype(jnp.float32),
-        weight.astype(jnp.float32),
-    )
+    y = jnp.einsum("bck,ck->bc", new_cache, conv_kernel.astype(new_cache.dtype))
     if bias is not None:
-        y = y + bias.astype(jnp.float32)
-    y = _apply_activation(y, activation)
-    return y.astype(x.dtype), new_cache
+        y = y + bias.astype(y.dtype)
+    y = _apply_activation(y, activation_fn)
+    return y, new_cache
 
 
 def _extend_conv(
     x: jax.Array,
-    weight: jax.Array,
+    conv_kernel: jax.Array,
     cache: jax.Array,
     cu_seqlens: jax.Array,
     bias: jax.Array | None,
-    activation: str | None,
+    activation_fn: Callable[[jax.Array], jax.Array] | None,
 ) -> tuple[jax.Array, jax.Array]:
     T = x.shape[0]
-    K = weight.shape[-1]
+    K = conv_kernel.shape[-1]
 
     # Locate every output token within its owning sequence.
     token_idx = jnp.arange(T, dtype=cu_seqlens.dtype)
@@ -131,14 +155,10 @@ def _extend_conv(
         axis=1,
     )
     window = jnp.where(from_x[:, :, None], x_window, cache_window)
-    y = jnp.einsum(
-        "tkc,ck->tc",
-        window.astype(jnp.float32),
-        weight.astype(jnp.float32),
-    )
+    y = jnp.einsum("tkc,ck->tc", window, conv_kernel.astype(window.dtype))
     if bias is not None:
-        y = y + bias.astype(jnp.float32)
-    y = _apply_activation(y, activation)
+        y = y + bias.astype(y.dtype)
+    y = _apply_activation(y, activation_fn)
 
     # Compute the new per-sequence cache as the last K input tokens of each
     # sequence, falling back to the prior cache when the sequence is shorter
@@ -153,7 +173,7 @@ def _extend_conv(
     final_cache = jnp.take_along_axis(cache, final_cache_pos[:, None, :], axis=2)
     new_cache = jnp.where(final_from_x[:, None, :], final_x, final_cache)
 
-    return y.astype(x.dtype), new_cache
+    return y, new_cache
 
 
 def l2_normalize(x: jax.Array, epsilon: float = 1e-6) -> jax.Array:

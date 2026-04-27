@@ -60,17 +60,17 @@ class KimiDeltaAttention(nnx.Module):
 
         self.q_conv1d = LinearBase(
             self.conv_size, self.projection_k_size, mesh,
-            use_bias=False, params_dtype=jnp.float32,
+            use_bias=False, params_dtype=dtype,
             kernel_axes=(None, "tensor"), scope_name="q_conv1d",
         )
         self.k_conv1d = LinearBase(
             self.conv_size, self.projection_k_size, mesh,
-            use_bias=False, params_dtype=jnp.float32,
+            use_bias=False, params_dtype=dtype,
             kernel_axes=(None, "tensor"), scope_name="k_conv1d",
         )
         self.v_conv1d = LinearBase(
             self.conv_size, self.projection_size, mesh,
-            use_bias=False, params_dtype=jnp.float32,
+            use_bias=False, params_dtype=dtype,
             kernel_axes=(None, "tensor"), scope_name="v_conv1d",
         )
 
@@ -78,9 +78,13 @@ class KimiDeltaAttention(nnx.Module):
         self.dt_bias = nnx.Param(jnp.zeros((self.projection_size,), dtype=jnp.float32))
 
         self.f_a_proj = LinearBase(
-            self.hidden_size, self.head_dim, mesh,
-            use_bias=False, params_dtype=dtype,
-            kernel_axes=(None, None), scope_name="f_a_proj",
+            self.hidden_size,
+            self.head_dim,
+            mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=(None, None),
+            scope_name="f_a_proj",
         )
         self.f_b_proj = LinearBase(
             self.head_dim, self.projection_size, mesh,
@@ -93,9 +97,13 @@ class KimiDeltaAttention(nnx.Module):
             kernel_axes=(None, "tensor"), scope_name="b_proj",
         )
         self.g_a_proj = LinearBase(
-            self.hidden_size, self.head_dim, mesh,
-            use_bias=False, params_dtype=dtype,
-            kernel_axes=(None, None), scope_name="g_a_proj",
+            self.hidden_size,
+            self.head_dim,
+            mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=(None, None),
+            scope_name="g_a_proj",
         )
         self.g_b_proj = LinearBase(
             self.head_dim, self.projection_size, mesh,
@@ -142,6 +150,7 @@ class KimiDeltaAttention(nnx.Module):
         v, _ = self.v_proj(hidden_states)
 
         raw_gate, _ = self.f_b_proj(self.f_a_proj(hidden_states)[0])
+        raw_gate = raw_gate.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
         beta = jax.nn.sigmoid(self.b_proj(hidden_states)[0].astype(jnp.float32))
 
         o, recurrent_state_pool = self.attn(

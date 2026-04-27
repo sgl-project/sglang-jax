@@ -50,24 +50,44 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         q_conv_w, k_conv_w, v_conv_w = layer.conv_weights
         # LinearBase stores weights as [in_features=K, out_features=D]; the
         # short conv kernel expects depthwise layout [D, K], so transpose.
-        q_conv_w = self._to_depthwise_layout(q_conv_w)
-        k_conv_w = self._to_depthwise_layout(k_conv_w)
-        v_conv_w = self._to_depthwise_layout(v_conv_w)
+        q_conv_w = self._reshape_conv_kernel(q_conv_w)
+        k_conv_w = self._reshape_conv_kernel(k_conv_w)
+        v_conv_w = self._reshape_conv_kernel(v_conv_w)
         cu_q_lens = self.forward_metadata.cu_q_lens
         q, q_state_new = short_convolution(
-            q, q_conv_w, q_state, cu_q_lens, forward_batch.forward_mode
+            q,
+            q_conv_w,
+            q_state,
+            cu_q_lens,
+            forward_batch.forward_mode,
+            activation=layer.activation,
         )
         k, k_state_new = short_convolution(
-            k, k_conv_w, k_state, cu_q_lens, forward_batch.forward_mode
+            k,
+            k_conv_w,
+            k_state,
+            cu_q_lens,
+            forward_batch.forward_mode,
+            activation=layer.activation,
         )
         v, v_state_new = short_convolution(
-            v, v_conv_w, v_state, cu_q_lens, forward_batch.forward_mode
+            v,
+            v_conv_w,
+            v_state,
+            cu_q_lens,
+            forward_batch.forward_mode,
+            activation=layer.activation,
         )
         new_conv_states = jnp.stack([q_state_new, k_state_new, v_state_new], axis=1)
 
         q = q.reshape(q.shape[0], layer.num_q_heads, layer.head_q_dim)
         k = k.reshape(k.shape[0], layer.num_k_heads, layer.head_k_dim)
         v = v.reshape(v.shape[0], layer.num_v_heads, layer.head_v_dim)
+
+        # KDA requires L2-normalized q/k for all paths (decode, naive prefill,
+        # Pallas prefill). The official implementation does this inside the
+        # kernel via use_qk_l2norm_in_kernel=True; our kernels don't expose
+        # that flag yet, so we normalize in JAX up front.
         q = l2_normalize(q)
         k = l2_normalize(k)
 
@@ -175,7 +195,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         layer: RadixLinearAttention,
     ) -> tuple[jax.Array, jax.Array]:
         """Prefill fallback via naive recurrent kernel."""
-        g = self._activate_gate(layer, g)
+        g = self._fused_kda_gate(layer, g)
         if cu_seqlens.shape[0] == 2:
             o, final_state = fused_recurrent_kda(
                 q[None, ...],
@@ -213,7 +233,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         layer: RadixLinearAttention,
     ) -> tuple[jax.Array, jax.Array]:
         """Single-step decode via naive JAX recurrence.  Returns (output, new_state)."""
-        g = self._activate_gate(layer, g)
+        g = self._fused_kda_gate(layer, g)
         # Kernel expects [B, T=1, H, K].
         o, final_state = fused_recurrent_kda(
             q[:, None, ...],
@@ -228,7 +248,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         # Remove the T=1 dim: [B, 1, H, V] -> [B, H, V]
         return o[:, 0], final_state
 
-    def _activate_gate(
+    def _fused_kda_gate(
         self,
         layer: RadixLinearAttention,
         g: jax.Array,
@@ -292,7 +312,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         return conv_states[:, 0], conv_states[:, 1], conv_states[:, 2]
 
     @staticmethod
-    def _to_depthwise_layout(weight: jax.Array) -> jax.Array:
+    def _reshape_conv_kernel(weight: jax.Array) -> jax.Array:
         """Coerce a conv weight to the depthwise [D, K] layout.
 
         ``LinearBase`` stores weights as ``[in_features, out_features]``; for
@@ -304,9 +324,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         if weight.ndim == 3 and weight.shape[1] == 1:
             return weight
         if weight.ndim != 2:
-            raise ValueError(
-                f"conv weight must be rank 2 or [D, 1, K]; got shape {weight.shape}"
-            )
+            raise ValueError(f"conv weight must be rank 2 or [D, 1, K]; got shape {weight.shape}")
         return jnp.swapaxes(weight, 0, 1)
 
 

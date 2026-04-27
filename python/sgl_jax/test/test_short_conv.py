@@ -88,7 +88,7 @@ def _baseline_extend(
 
 
 def _baseline_decode(
-    x_step: jax.Array,           # [B, D]
+    x_step: jax.Array,  # [B, D]
     prior_inputs: list[jax.Array],  # per-seq history of past tokens, each [T_i, D]
     conv: nnx.Conv,
 ) -> jax.Array:
@@ -123,9 +123,7 @@ class ShortConvolutionTest(CustomTestCase):
 
     def _run_extend_case(self, seq_lens, hidden, kernel, has_prior_cache):
         total = sum(seq_lens)
-        cu_seqlens = jnp.asarray(
-            np.concatenate([[0], np.cumsum(seq_lens)]), dtype=jnp.int32
-        )
+        cu_seqlens = jnp.asarray(np.concatenate([[0], np.cumsum(seq_lens)]), dtype=jnp.int32)
         x = jnp.asarray(
             self.rng.standard_normal((total, hidden)).astype(np.float32),
             dtype=self.dtype,
@@ -172,13 +170,11 @@ class ShortConvolutionTest(CustomTestCase):
             start, end = int(cu[i]), int(cu[i + 1])
             T_i = end - start
             seq = np.asarray(x[start:end])  # [T_i, D]
-            old = np.asarray(cache[i])      # [D, K]
+            old = np.asarray(cache[i])  # [D, K]
             if T_i >= kernel:
                 expected = seq[-kernel:].T  # [D, K]
             else:
-                expected = np.concatenate(
-                    [old[:, T_i:], seq.T], axis=1
-                )  # [D, K]
+                expected = np.concatenate([old[:, T_i:], seq.T], axis=1)  # [D, K]
             np.testing.assert_allclose(
                 np.asarray(new_cache[i]),
                 expected,
@@ -187,38 +183,28 @@ class ShortConvolutionTest(CustomTestCase):
             )
 
     def test_extend_single_sequence_no_prior_cache(self):
-        self._run_extend_case(
-            seq_lens=[7], hidden=8, kernel=4, has_prior_cache=False
-        )
+        self._run_extend_case(seq_lens=[7], hidden=1024, kernel=4, has_prior_cache=False)
 
     def test_extend_multi_sequence_no_prior_cache(self):
-        self._run_extend_case(
-            seq_lens=[5, 3, 9], hidden=16, kernel=4, has_prior_cache=False
-        )
+        self._run_extend_case(seq_lens=[5, 3, 9], hidden=1024, kernel=4, has_prior_cache=False)
 
     def test_extend_multi_sequence_with_prior_cache(self):
-        self._run_extend_case(
-            seq_lens=[5, 3, 9], hidden=16, kernel=4, has_prior_cache=True
-        )
+        self._run_extend_case(seq_lens=[5, 3, 9], hidden=1024, kernel=4, has_prior_cache=True)
 
     def test_extend_short_sequence_with_prior_cache(self):
         # Sequence shorter than kernel → new cache must mix prior cache
         # tail with the few new tokens.
-        self._run_extend_case(
-            seq_lens=[1, 2, 3], hidden=8, kernel=4, has_prior_cache=True
-        )
+        self._run_extend_case(seq_lens=[1, 2, 3], hidden=1024, kernel=4, has_prior_cache=True)
 
     def test_extend_kernel_size_2(self):
-        self._run_extend_case(
-            seq_lens=[3, 4], hidden=8, kernel=2, has_prior_cache=True
-        )
+        self._run_extend_case(seq_lens=[3, 4], hidden=1024, kernel=2, has_prior_cache=True)
 
     # ------------------------------------------------------------------
     # DECODE mode
     # ------------------------------------------------------------------
 
     def test_decode_single_step_against_baseline(self):
-        B, hidden, kernel = 3, 8, 4
+        B, hidden, kernel = 3, 1024, 4
         weight = _make_weight(self.rng, hidden, kernel, self.dtype)
 
         # Build a per-sequence prior history of varying lengths so the cache
@@ -269,9 +255,7 @@ class ShortConvolutionTest(CustomTestCase):
         # New cache should equal old cache shifted left + new x at slot K-1.
         for i in range(B):
             old = np.asarray(cache[i])
-            expected = np.concatenate(
-                [old[:, 1:], np.asarray(x_step[i])[:, None]], axis=1
-            )
+            expected = np.concatenate([old[:, 1:], np.asarray(x_step[i])[:, None]], axis=1)
             np.testing.assert_allclose(
                 np.asarray(new_cache[i]),
                 expected,
@@ -282,7 +266,7 @@ class ShortConvolutionTest(CustomTestCase):
     def test_decode_rolling_matches_extend(self):
         """Decoding token-by-token should match running extend on the full
         sequence in one shot."""
-        T, hidden, kernel = 6, 8, 4
+        T, hidden, kernel = 6, 1024, 4
         seq = jnp.asarray(
             self.rng.standard_normal((T, hidden)).astype(np.float32),
             dtype=self.dtype,
@@ -329,7 +313,7 @@ class ShortConvolutionTest(CustomTestCase):
     # ------------------------------------------------------------------
 
     def test_bias_added_before_activation(self):
-        T, hidden, kernel = 4, 6, 3
+        T, hidden, kernel = 4, 1024, 3
         x = jnp.asarray(
             self.rng.standard_normal((T, hidden)).astype(np.float32),
             dtype=self.dtype,
@@ -354,7 +338,7 @@ class ShortConvolutionTest(CustomTestCase):
         self.assertGreater(float(np.max(np.abs(diff))), 1e-4)
 
     def test_activation_none_skips_silu(self):
-        T, hidden, kernel = 4, 6, 3
+        T, hidden, kernel = 4, 1024, 3
         x = jnp.asarray(
             self.rng.standard_normal((T, hidden)).astype(np.float32),
             dtype=self.dtype,
@@ -384,8 +368,54 @@ class ShortConvolutionTest(CustomTestCase):
                 jnp.zeros((1, 4, 3)),
                 jnp.asarray([0, 1], dtype=jnp.int32),
                 ForwardMode.EXTEND,
-                activation="relu",
+                activation="not_a_real_activation",
             )
+
+    def test_activation_named_relu_matches_jax_relu(self):
+        T, hidden, kernel = 4, 1024, 3
+        x = jnp.asarray(
+            self.rng.standard_normal((T, hidden)).astype(np.float32),
+            dtype=self.dtype,
+        )
+        weight = _make_weight(self.rng, hidden, kernel, self.dtype)
+        cache = jnp.zeros((1, hidden, kernel), dtype=self.dtype)
+        cu = jnp.asarray([0, T], dtype=jnp.int32)
+
+        y_relu, _ = short_convolution(
+            x, weight, cache, cu, ForwardMode.EXTEND, bias=None, activation="relu"
+        )
+        y_none, _ = short_convolution(
+            x, weight, cache, cu, ForwardMode.EXTEND, bias=None, activation=None
+        )
+        np.testing.assert_allclose(
+            np.asarray(y_relu),
+            np.asarray(jax.nn.relu(y_none)),
+            atol=self.atol,
+            rtol=self.rtol,
+        )
+
+    def test_activation_callable_is_used(self):
+        T, hidden, kernel = 4, 1024, 3
+        x = jnp.asarray(
+            self.rng.standard_normal((T, hidden)).astype(np.float32),
+            dtype=self.dtype,
+        )
+        weight = _make_weight(self.rng, hidden, kernel, self.dtype)
+        cache = jnp.zeros((1, hidden, kernel), dtype=self.dtype)
+        cu = jnp.asarray([0, T], dtype=jnp.int32)
+
+        y_callable, _ = short_convolution(
+            x, weight, cache, cu, ForwardMode.EXTEND, bias=None, activation=jax.nn.gelu
+        )
+        y_none, _ = short_convolution(
+            x, weight, cache, cu, ForwardMode.EXTEND, bias=None, activation=None
+        )
+        np.testing.assert_allclose(
+            np.asarray(y_callable),
+            np.asarray(jax.nn.gelu(y_none)),
+            atol=self.atol,
+            rtol=self.rtol,
+        )
 
     def test_extend_requires_cu_seqlens(self):
         with self.assertRaises(ValueError):
@@ -396,6 +426,22 @@ class ShortConvolutionTest(CustomTestCase):
                 cu_seqlens=None,
                 forward_mode=ForwardMode.EXTEND,
             )
+
+
+class ShortConvolutionBF16Test(ShortConvolutionTest):
+    """Same suite as ShortConvolutionTest but with bf16 inputs/weights.
+
+    bf16 has ~3 decimal digits of mantissa, so we relax the tolerances
+    accordingly. This exercises the dtype-preserving code path: the
+    convolution should run end-to-end in bf16 (no internal fp32
+    upcast) and match an nnx.Conv baseline that also runs in bf16.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.dtype = jnp.bfloat16
+        self.atol = 1e-2
+        self.rtol = 1e-2
 
 
 if __name__ == "__main__":
