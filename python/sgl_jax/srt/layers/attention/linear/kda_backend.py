@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
-from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.kernels.kda import chunk_kda, fused_recurrent_kda
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
-    LinearRecurrentAttnBackendMetadata,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -19,19 +16,16 @@ if TYPE_CHECKING:
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-@register_pytree_node_class
-@dataclass
-class KDAAttnBackendMetadata(LinearRecurrentAttnBackendMetadata):
-    @classmethod
-    def tree_unflatten(cls, aux_data, children):
-        return cls(cu_q_lens=children[0], recurrent_indices=children[1])
-
-
 class KDAAttnBackend(LinearRecurrentAttnBackend):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
-    metadata_cls = KDAAttnBackendMetadata
     use_pallas_prefill = False
+
+    def __init__(self, runner):
+        super().__init__(
+            mesh=runner.mesh,
+            req_to_token_pool=runner.req_to_token_pool,
+        )
 
     def __call__(
         self,
@@ -331,4 +325,4 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         )
 
 
-__all__ = ["KDAAttnBackend", "KDAAttnBackendMetadata"]
+__all__ = ["KDAAttnBackend"]

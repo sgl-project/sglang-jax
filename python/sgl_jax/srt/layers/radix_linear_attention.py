@@ -56,5 +56,5 @@ class RadixLinearAttention(nnx.Module):
             b,
             self,
             forward_batch,
-            recurrent_state_pool=recurrent_state_pool,
+            recurrent_state_pool,
         )

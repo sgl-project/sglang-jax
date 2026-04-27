@@ -19,7 +19,7 @@ Issue #948 delivers KDA inference components: kernel, backend, dispatch entry, l
 
 ### Key constraints
 
-- **RFC-0015 not landed yet**: `RecurrentStatePool` / `MemoryPools` / `HybridReqToTokenPool` are unavailable. Backend must use interface stubs for state pool consumption.
+- **PR #966 not landed yet**: `RecurrentStatePool` / `MemoryPools` / `HybridReqToTokenPool` are unavailable. Backend must use interface stubs for state pool consumption.
 - **No naive prefill**: `chunk_kda_jax_naive` is not in scope. v1 ships pallas prefill + naive decode.
 
 ### Deviation from design doc
@@ -173,12 +173,12 @@ def naive_recurrent_kda(
 **Key implementation details**:
 
 1. **Metadata pytree** (`LinearRecurrentAttnBackendMetadata` in `hybrid_linear_attn_backend.py`):
-   - Fields: `cu_q_lens: jax.Array` (`[N+1]` int32), `recurrent_indices: jax.Array` (`[B]` int32, pool slot indices — passed in by external caller, not computed by backend)
+   - Fields: `cu_q_lens: jax.Array` (`[N+1]` int32), `recurrent_indices: jax.Array` (`[B]` int32, pool slot indices — computed internally via `req_to_token_pool.get_linear_recurrent_indices`)
    - `@register_pytree_node_class`; children = `(cu_q_lens, recurrent_indices)`, aux_data = `{}`
 
 2. **Backend base** (`LinearRecurrentAttnBackend` in `hybrid_linear_attn_backend.py`):
    - Extends `AttentionBackend`
-   - `get_forward_metadata(model_worker_batch, recurrent_indices)` — computes `cu_q_lens` from batch; `recurrent_indices` is passed in by external caller (`HybridLinearAttnBackend`, PR #961 scope). Returns `LinearRecurrentAttnBackendMetadata`.
+   - `get_forward_metadata(model_worker_batch)` — computes `cu_q_lens` from batch; `recurrent_indices` computed internally via `self.req_to_token_pool.get_linear_recurrent_indices(batch.req_pool_indices)`. Returns `LinearRecurrentAttnBackendMetadata`.
    - Single `__call__` (same pattern as `FlashAttention`):
      ```python
      def __call__(
@@ -249,15 +249,15 @@ def naive_recurrent_kda(
      │    → HybridLinearAttnBackend.get_forward_metadata():              (PR #961)
      │      ├─ full_attn_backend.get_forward_metadata(...)
      │      │     → FlashAttentionMetadata
-     │      └─ linear_attn_backend.get_forward_metadata(batch, recurrent_indices)
-     │             recurrent_indices computed by HybridLinearAttnBackend
+     │      └─ linear_attn_backend.get_forward_metadata(batch)
+     │             recurrent_indices computed internally via req_to_token_pool
      │             → LinearRecurrentAttnBackendMetadata(cu_q_lens, recurrent_indices)
      │             → linear_attn_backend.forward_metadata = result       ← sub-backend stores its own
      ├─ attn_backend.forward_metadata = forward_metadata                 ← pytree child, crosses JIT
      └─ jitted_run_model(forward_batch, memory_pool, ...)
    ```
 
-7. **Temporary state buffer (RFC-0015 not landed)**: `LinearRecurrentAttnBackend.__call__` needs a working `recurrent_state_pool` to read/write conv + recurrent state. Since RFC-0015 is not landed, Sub-2 provides a minimal `MockRecurrentStatePool` class that implements `get_linear_recurrent_layer_cache(layer_id)` and `set_linear_recurrent_layer_cache(layer_id, indices, recurrent, conv)` using a plain dict. Sub-3 tests instantiate this mock and pass it through `RadixLinearAttention`. The mock is **not JIT-compatible** (dict is not a pytree); acceptable because Sub-3 tests don't run the full `ModelRunner._forward` JIT path. **Migration reminder**: `MockRecurrentStatePool.__init__` emits `logger.warning("Using MockRecurrentStatePool; replace with RecurrentStatePool when RFC-0015 lands")`.
+7. **Temporary state buffer (PR #966 not landed)**: `LinearRecurrentAttnBackend.__call__` needs a working `recurrent_state_pool` to read/write conv + recurrent state. Since PR #966 is not landed, Sub-2 provides a minimal `MockRecurrentStatePool` class that implements `get_linear_recurrent_indices(req_pool_indices)`, `get_linear_recurrent_layer_cache(layer_id)` and `set_linear_recurrent_layer_cache(layer_id, indices, recurrent, conv)` using a plain dict. Sub-3 tests instantiate this mock and pass it through `RadixLinearAttention`. The mock is **not JIT-compatible** (dict is not a pytree); acceptable because Sub-3 tests don't run the full `ModelRunner._forward` JIT path. **Migration reminder**: `MockRecurrentStatePool.__init__` emits `logger.warning("Using MockRecurrentStatePool; replace with HybridReqToTokenPool + RecurrentStatePool when PR #966 lands")`.
 
 **Reference patterns**:
 - `FlashAttention` / `FlashAttentionMetadata` in `layers/attention/flashattention_backend.py` — pytree registration, `get_forward_metadata`, shard_map
@@ -379,7 +379,7 @@ Sub-1 (kernel: PR #964 done, dispatcher remaining)        │
 - Full Kimi-Linear model assembly (`KimiLinearModel` / `KimiDecoderLayer` / 3:1 hybrid)
 - PR #968 model skeleton integration (`KimiDecoderLayer` pool routing, `KimiModel`, `KimiLinearForCausalLM`, weight mappings)
 - `HybridLinearAttnBackend` (PR #961)
-- `RecurrentStatePool` implementation (RFC-0015)
+- `RecurrentStatePool` implementation (PR #966)
 - Pallas kernel backward / training
 - End-to-end MMLU-Pro evaluation
 - CI registration (deferred to model integration issue)
