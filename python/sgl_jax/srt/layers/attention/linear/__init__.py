@@ -1,5 +1,3 @@
-"""Linear / state-based attention backends.
+from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 
-Concrete backends (LinearRecurrentAttentionBackend, KDAAttnBackend) are added
-by separate PRs. This file is intentionally minimal so those PRs are pure adds.
-"""
+__all__ = ["KDAAttnBackend"]
