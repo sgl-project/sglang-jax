@@ -517,6 +517,7 @@ suites = {
         TestFile("test/srt/openai_server/features/test_structural_tag.py", 2),
         TestFile("test/srt/test_srt_engine.py", 1),
         TestFile("test/srt/test_logprobs.py", 3),
+        TestFile("test/srt/test_penalty.py", 12),
         TestFile("test/srt/test_qwen1_5_models_dummy.py", 3),
         TestFile("test/srt/lora/test_bgmv_backend.py", 6),
         TestFile("test/srt/lora/test_dynamic_lora.py", 10),
