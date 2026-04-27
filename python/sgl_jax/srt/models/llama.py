@@ -24,6 +24,7 @@ import jax.numpy as jnp
 from flax import nnx
 from transformers import LlamaConfig, PretrainedConfig
 
+from sgl_jax.srt.configs.dtype_config import DtypeConfig
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
 from sgl_jax.srt.layers.layernorm import RMSNorm
@@ -47,15 +48,22 @@ class LlamaMLP(nnx.Module):
         mesh: jax.sharding.Mesh,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
+        dtype_config: DtypeConfig | None = None,
     ) -> None:
         self.layer_id = layer_id
+        if dtype_config is None:
+            dtype_config = DtypeConfig(default_dtype=dtype)
+        elif dtype != dtype_config.default_dtype:
+            raise ValueError(
+                f"Global dtype ({dtype}) is not the same as the default dtype provided in dtype_config ({dtype_config.default_dtype})."
+            )
 
         self.gate_proj = LinearBase(
             input_size=hidden_size,
             output_size=intermediate_size,
             kernel_axes=(None, "tensor"),
             use_bias=False,
-            params_dtype=dtype,
+            params_dtype=dtype_config.get_dtype("gate_proj"),
             mesh=mesh,
         )
 
@@ -64,7 +72,7 @@ class LlamaMLP(nnx.Module):
             output_size=intermediate_size,
             kernel_axes=(None, "tensor"),
             use_bias=False,
-            params_dtype=dtype,
+            params_dtype=dtype_config.get_dtype("up_proj"),
             mesh=mesh,
         )
 
@@ -73,7 +81,7 @@ class LlamaMLP(nnx.Module):
             output_size=hidden_size,
             kernel_axes=("tensor", None),
             use_bias=False,
-            params_dtype=dtype,
+            params_dtype=dtype_config.get_dtype("down_proj"),
             mesh=mesh,
         )
 
@@ -103,11 +111,19 @@ class LlamaAttention(nnx.Module):
         max_position_embeddings: int = 8192,
         dtype: jnp.dtype = jnp.bfloat16,
         attention_bias: bool = False,
+        dtype_config: DtypeConfig | None = None,
     ) -> None:
         self.hidden_size = hidden_size
         self.q_head_num = num_heads
         self.kv_head_num = num_kv_heads
         self.head_dim = head_dim or self.hidden_size // self.q_head_num
+
+        if dtype_config is None:
+            dtype_config = DtypeConfig(default_dtype=dtype)
+        elif dtype != dtype_config.default_dtype:
+            raise ValueError(
+                f"Global dtype ({dtype}) is not the same as the default dtype provided in dtype_config ({dtype_config.default_dtype})."
+            )
 
         if partial_rotary_factor is None:
             partial_rotary_factor = 1
@@ -124,7 +140,7 @@ class LlamaAttention(nnx.Module):
             output_size=num_heads * self.head_dim,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            params_dtype=dtype,
+            params_dtype=dtype_config.get_dtype("q_proj"),
             mesh=mesh,
         )
         self.k_proj = LinearBase(
@@ -132,7 +148,7 @@ class LlamaAttention(nnx.Module):
             output_size=num_kv_heads * self.head_dim,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            params_dtype=dtype,
+            params_dtype=dtype_config.get_dtype("k_proj"),
             mesh=mesh,
         )
         self.v_proj = LinearBase(
@@ -140,7 +156,7 @@ class LlamaAttention(nnx.Module):
             output_size=num_kv_heads * self.head_dim,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            params_dtype=dtype,
+            params_dtype=dtype_config.get_dtype("v_proj"),
             mesh=mesh,
         )
         self.o_proj = LinearBase(
@@ -148,7 +164,7 @@ class LlamaAttention(nnx.Module):
             output_size=hidden_size,
             use_bias=attention_bias,
             kernel_axes=("tensor", None),
-            params_dtype=dtype,
+            params_dtype=dtype_config.get_dtype("o_proj"),
             mesh=mesh,
         )
         self.rotary_emb = get_rope(
@@ -167,6 +183,7 @@ class LlamaAttention(nnx.Module):
             scaling=self.scaling,
             num_kv_heads=num_kv_heads,
             layer_id=layer_id,
+            softmax_dtype=dtype_config.get_dtype("softmax"),
         )
 
     def __call__(
@@ -200,10 +217,18 @@ class LlamaDecoderLayer(nnx.Module):
         mesh: jax.sharding.Mesh,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
+        dtype_config: DtypeConfig | None = None,
     ) -> None:
         # super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
+        if dtype_config is None:
+            dtype_config = DtypeConfig(default_dtype=dtype)
+        elif dtype != dtype_config.default_dtype:
+            raise ValueError(
+                f"Global dtype ({dtype}) is not the same as the default dtype provided in dtype_config ({dtype_config.default_dtype})."
+            )
+
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is not None and getattr(config, "original_max_position_embeddings", None):
@@ -230,23 +255,25 @@ class LlamaDecoderLayer(nnx.Module):
             attention_bias=attention_bias,
             dtype=dtype,
             mesh=mesh,
+            dtype_config=dtype_config.get_config("self_attn"),
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             dtype=dtype,
             mesh=mesh,
+            dtype_config=dtype_config.get_config("mlp"),
         )
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
-            param_dtype=dtype,
+            param_dtype=dtype_config.get_dtype("input_layernorm"),
             dtype=dtype,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
-            param_dtype=dtype,
+            param_dtype=dtype_config.get_dtype("post_attention_layernorm"),
             dtype=dtype,
         )
 
@@ -303,18 +330,26 @@ class LlamaModel(nnx.Module):
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
         is_draft_model: bool = False,
+        dtype_config: DtypeConfig | None = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        if dtype_config is None:
+            dtype_config = DtypeConfig(default_dtype=dtype)
+        elif dtype != dtype_config.default_dtype:
+            raise ValueError(
+                f"Global dtype ({dtype}) is not the same as the default dtype provided in dtype_config ({dtype_config.default_dtype})."
+            )
+
         if not is_draft_model:
             self.embed_tokens = Embed(
                 config.vocab_size,
                 config.hidden_size,
                 dtype=dtype,
                 kernel_axes=("tensor", None),
-                param_dtype=dtype,
+                param_dtype=dtype_config.get_dtype("embed_tokens"),
                 mesh=mesh,
             )
 
@@ -324,6 +359,7 @@ class LlamaModel(nnx.Module):
                         config=config,
                         layer_id=i,
                         dtype=dtype,
+                        dtype_config=dtype_config.get_config("layers"),
                         mesh=mesh,
                     )
                     for i in range(config.num_hidden_layers)
@@ -333,7 +369,7 @@ class LlamaModel(nnx.Module):
             self.norm = RMSNorm(
                 config.hidden_size,
                 epsilon=config.rms_norm_eps,
-                param_dtype=dtype,
+                param_dtype=dtype_config.get_dtype("norm"),
             )
         self.layers_to_capture = []
 
@@ -377,18 +413,31 @@ class LlamaForCausalLM(nnx.Module):
         config: PretrainedConfig,
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
+        dtype_config: DtypeConfig | None = None,
     ):
         self.mesh = mesh
         self.config = config
         self.dtype = dtype
-        logger.info("LlamaForCausalLM config dtype: %s", self.dtype)
-        self.model = LlamaModel(config, dtype=self.dtype, mesh=mesh)
+        if dtype_config is None:
+            dtype_config = DtypeConfig(default_dtype=dtype)
+            logger.info("LlamaForCausalLM config dtype: %s", dtype)
+        else:
+            if dtype != dtype_config.default_dtype:
+                raise ValueError(
+                    f"Global dtype ({dtype}) is not the same as the default dtype provided in dtype_config ({dtype_config.default_dtype})."
+                )
+            logger.info("LlamaForCausalLM using dtype_config: %s", dtype_config)
+
+        self.model = LlamaModel(
+            config, dtype=self.dtype, dtype_config=dtype_config.get_config("model"), mesh=mesh
+        )
+
         if not getattr(self.config, "tie_word_embeddings", False):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
                 dtype=self.dtype,
-                param_dtype=self.dtype,
+                param_dtype=dtype_config.get_dtype("lm_head"),
                 kernel_axes=("tensor", None),
             )
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)

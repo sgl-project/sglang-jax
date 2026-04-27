@@ -470,6 +470,8 @@ suites = {
         TestFile("python/sgl_jax/test/layers/test_mla.py", 2),
         TestFile("test/srt/lora/test_bgmv_backend.py", 5),
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 10),
+        TestFile("test/srt/test_dtype_config_llama.py", 1),
+        TestFile("test/srt/test_dtype_config_consistency.py", 10),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 1),

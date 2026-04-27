@@ -230,10 +230,14 @@ class JAXModelLoader(DefaultModelLoader):
         else:
             config = model_config.hf_config
 
+        import inspect
+
+        kwargs = {"dtype": model_config.dtype, "mesh": self.mesh}
+        if "dtype_config" in inspect.signature(model_class.__init__).parameters:
+            kwargs["dtype_config"] = getattr(model_config, "dtype_config", None)
+
         with jax.set_mesh(self.mesh):
-            model = nnx.eval_shape(
-                lambda: model_class(config, dtype=model_config.dtype, mesh=self.mesh)
-            )
+            model = nnx.eval_shape(lambda: model_class(config, **kwargs))
 
         # Quantization config is already unified in model_config
         # No need for any conversion logic here
@@ -291,12 +295,14 @@ class JAXDummyModelLoader(BaseModelLoader):
     ) -> Any:
         model_class = self._initialize_model(model_config)
 
+        import inspect
+
+        kwargs = {"dtype": model_config.dtype, "mesh": self.mesh}
+        if "dtype_config" in inspect.signature(model_class.__init__).parameters:
+            kwargs["dtype_config"] = getattr(model_config, "dtype_config", None)
+
         with jax.set_mesh(self.mesh):
-            model = nnx.eval_shape(
-                lambda: model_class(
-                    model_config.hf_config, dtype=model_config.dtype, mesh=self.mesh
-                )
-            )
+            model = nnx.eval_shape(lambda: model_class(model_config.hf_config, **kwargs))
 
         # Use model's load_weights with dummy mode to ensure correct sharding
         # Set a marker in model_config to indicate dummy mode
