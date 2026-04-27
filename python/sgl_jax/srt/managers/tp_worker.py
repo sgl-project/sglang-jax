@@ -504,6 +504,7 @@ class ModelWorker:
             dp_size=dp_size,
             per_dp_bs_size=per_dp_bs_size,
             real_bs_per_dp=[bs] * dp_size,
+            logits_indices_selector=np.arange(bs, dtype=np.int32),
         )
 
     def get_model_runner(self):
@@ -648,44 +649,51 @@ class ModelWorker:
                 self._update_grammar_vocab_mask(model_worker_batch, sampling_metadata)
 
             with jtu.count_pjit_cpp_cache_miss() as count:
-                next_token_ids_device, token_logprobs, new_logits_output = (
-                    self.model_runner.sample(  # TODO @Brian: Data-Parallel sharding
-                        logits_output,
-                        sampling_metadata,
-                    )
+                next_token_ids_device, token_logprobs, new_logits_output = self.model_runner.sample(
+                    logits_output,
+                    sampling_metadata,
                 )
                 cache_miss_count += count()
+            # `selector` reorders DP-interleaved per-req tensors back to
+            # original request order. For DP=1 it's just np.arange(real_bs).
+            selector = model_worker_batch.logits_indices_selector
             if model_worker_batch.return_output_logprob_only:
                 logprobs = self.model_runner.compute_logprobs(token_logprobs, next_token_ids_device)
-                logits_output.next_token_logprobs = logprobs[: model_worker_batch.real_bs]
+                logits_output.next_token_logprobs = jax.device_get(logprobs)[selector]
         if new_logits_output is not None:
             logits_output = new_logits_output
+            if logits_output.next_token_logprobs is not None:
+                logits_output.next_token_logprobs = jax.device_get(
+                    logits_output.next_token_logprobs
+                )[selector]
             if logits_output.next_token_top_logprobs_val is not None:
-                logits_output.next_token_top_logprobs_val = (
-                    logits_output.next_token_top_logprobs_val.astype(jnp.float32).tolist()
-                )
-                logits_output.next_token_top_logprobs_idx = (
-                    logits_output.next_token_top_logprobs_idx.tolist()
-                )
+                logits_output.next_token_top_logprobs_val = jax.device_get(
+                    logits_output.next_token_top_logprobs_val.astype(jnp.float32)
+                )[selector].tolist()
+                logits_output.next_token_top_logprobs_idx = jax.device_get(
+                    logits_output.next_token_top_logprobs_idx
+                )[selector].tolist()
             if logits_output.next_token_token_ids_logprobs_val is not None:
-                logits_output.next_token_token_ids_logprobs_val = (
-                    logits_output.next_token_token_ids_logprobs_val.astype(jnp.float32).tolist()
-                )
-                logits_output.next_token_token_ids_logprobs_idx = (
-                    logits_output.next_token_token_ids_logprobs_idx.tolist()
-                )
+                logits_output.next_token_token_ids_logprobs_val = jax.device_get(
+                    logits_output.next_token_token_ids_logprobs_val.astype(jnp.float32)
+                )[selector].tolist()
+                logits_output.next_token_token_ids_logprobs_idx = jax.device_get(
+                    logits_output.next_token_token_ids_logprobs_idx
+                )[selector].tolist()
             if logits_output.input_token_ids_logprobs_val is not None:
-                logits_output.input_token_ids_logprobs_val = (
-                    logits_output.input_token_ids_logprobs_val.astype(jnp.float32).tolist()
-                )
-                logits_output.input_token_ids_logprobs_idx = (
-                    logits_output.input_token_ids_logprobs_idx.tolist()
-                )
+                logits_output.input_token_ids_logprobs_val = jax.device_get(
+                    logits_output.input_token_ids_logprobs_val.astype(jnp.float32)
+                )[selector].tolist()
+                logits_output.input_token_ids_logprobs_idx = jax.device_get(
+                    logits_output.input_token_ids_logprobs_idx
+                )[selector].tolist()
             if logits_output.input_top_logprobs_val is not None:
-                logits_output.input_top_logprobs_val = logits_output.input_top_logprobs_val.astype(
-                    jnp.float32
-                ).tolist()
-                logits_output.input_top_logprobs_idx = logits_output.input_top_logprobs_idx.tolist()
+                logits_output.input_top_logprobs_val = jax.device_get(
+                    logits_output.input_top_logprobs_val.astype(jnp.float32)
+                )[selector].tolist()
+                logits_output.input_top_logprobs_idx = jax.device_get(
+                    logits_output.input_top_logprobs_idx
+                )[selector].tolist()
 
         return (
             logits_output,

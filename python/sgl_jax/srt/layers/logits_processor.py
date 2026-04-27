@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logits of the next tokens.       shape: [#seq, vocab_size]
-    next_token_logits: jax.Array  # TODO @Brian: Data-Parallel sharding
+    next_token_logits: jax.Array
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: jax.Array | None = None
