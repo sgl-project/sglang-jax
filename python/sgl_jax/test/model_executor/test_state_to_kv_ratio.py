@@ -18,7 +18,7 @@ class TestRecurrentPerReqBytes(unittest.TestCase):
         per_req_conv      = L * (K-1) * (proj_size/tp) * 2
                           = 20 * 3 * (12288/1) * 2 = 1,474,560 (~1.4 MB)
         """
-        from sgl_jax.srt.model_executor.model_runner import (
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
             _compute_recurrent_per_req_bytes,
         )
 
@@ -35,7 +35,7 @@ class TestRecurrentPerReqBytes(unittest.TestCase):
 
     def test_kimi_linear_tp4_per_req_bytes(self):
         """TP=4: H/tp=8, proj_size/tp=3072. RFC line 419 cites ~100 MB recurrent / ~360 KB conv."""
-        from sgl_jax.srt.model_executor.model_runner import (
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
             _compute_recurrent_per_req_bytes,
         )
 
@@ -63,7 +63,9 @@ class TestStateToKvRatioSplit(unittest.TestCase):
 
     def test_default_ratio_zero_point_nine(self):
         """r=0.9 -> state_budget = available * 0.9/(1+0.9) ~ 47.4%."""
-        from sgl_jax.srt.model_executor.model_runner import _split_state_kv_budget
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
+            _split_state_kv_budget,
+        )
 
         available = 100 * (1024**3)  # 100 GB
         state_budget, kv_budget = _split_state_kv_budget(available, ratio=0.9)
@@ -72,7 +74,9 @@ class TestStateToKvRatioSplit(unittest.TestCase):
         self.assertAlmostEqual(kv_budget, available - state_budget, delta=1)
 
     def test_ratio_zero_means_no_state_budget(self):
-        from sgl_jax.srt.model_executor.model_runner import _split_state_kv_budget
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
+            _split_state_kv_budget,
+        )
 
         state_budget, kv_budget = _split_state_kv_budget(1000, ratio=0.0)
         self.assertEqual(state_budget, 0)
@@ -80,7 +84,9 @@ class TestStateToKvRatioSplit(unittest.TestCase):
 
     def test_ratio_extreme_high_starves_kv(self):
         """r=1000 -> state_budget approaches 100% of available."""
-        from sgl_jax.srt.model_executor.model_runner import _split_state_kv_budget
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
+            _split_state_kv_budget,
+        )
 
         state_budget, kv_budget = _split_state_kv_budget(1000, ratio=1000.0)
         # state = 1000 * 1000/1001 ~ 999
@@ -88,7 +94,9 @@ class TestStateToKvRatioSplit(unittest.TestCase):
         self.assertLess(kv_budget, 5)  # nearly nothing left
 
     def test_negative_ratio_raises(self):
-        from sgl_jax.srt.model_executor.model_runner import _split_state_kv_budget
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
+            _split_state_kv_budget,
+        )
 
         with self.assertRaises(AssertionError):
             _split_state_kv_budget(1000, ratio=-0.1)
@@ -102,7 +110,7 @@ class TestComputeMaxNumReqsFromStateBudget(unittest.TestCase):
             self.skipTest("JAX not available")
 
     def test_basic_division(self):
-        from sgl_jax.srt.model_executor.model_runner import (
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
             _compute_max_num_reqs_from_state_budget,
         )
 
@@ -111,7 +119,7 @@ class TestComputeMaxNumReqsFromStateBudget(unittest.TestCase):
         self.assertEqual(n, 10)
 
     def test_floor_division_truncates(self):
-        from sgl_jax.srt.model_executor.model_runner import (
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
             _compute_max_num_reqs_from_state_budget,
         )
 
@@ -120,7 +128,7 @@ class TestComputeMaxNumReqsFromStateBudget(unittest.TestCase):
         self.assertEqual(n, 9)
 
     def test_zero_state_budget_returns_zero(self):
-        from sgl_jax.srt.model_executor.model_runner import (
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
             _compute_max_num_reqs_from_state_budget,
         )
 

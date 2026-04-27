@@ -117,7 +117,7 @@ class TestInitMemoryPoolHybridBranch(unittest.TestCase):
         """linear_recurrent_config is None -> MemoryPools contains only
         token_to_kv_pool; req_to_token_pool is plain ReqToTokenPool."""
         from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
-        from sgl_jax.srt.model_executor.model_runner import (
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
             _build_non_hybrid_memory_pools,
         )
 
@@ -135,7 +135,9 @@ class TestInitMemoryPoolHybridBranch(unittest.TestCase):
         MemoryPools contains both pools; req_to_token_pool is HybridReqToTokenPool."""
         from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, MemoryPools
         from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
-        from sgl_jax.srt.model_executor.model_runner import _build_hybrid_pools
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
+            _build_hybrid_pools,
+        )
 
         cfg = _kimi_cfg(kda_layers=[0, 1], num_heads=2, head_dim=4)
         # Stub mimics MHATokenToKVPool externally (any object with replace_buffer).
@@ -165,7 +167,9 @@ class TestInitMemoryPoolHybridBranch(unittest.TestCase):
         KV pool type differs - this IS the proof that MHA/MLA pool is
         transparent to the MemoryPools wrapper."""
         from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
-        from sgl_jax.srt.model_executor.model_runner import _build_hybrid_pools
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
+            _build_hybrid_pools,
+        )
 
         cfg = _kimi_cfg(kda_layers=[0, 1], num_heads=2, head_dim=4)
         # Stub mimics MLATokenToKVPool externally (different shape/dim
@@ -199,7 +203,7 @@ class TestServerArgsForcedConstraints(unittest.TestCase):
             self.skipTest("JAX not available")
 
     def test_assert_radix_cache_disabled_when_user_left_it_enabled(self):
-        from sgl_jax.srt.model_executor.model_runner import (
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
             _enforce_recurrent_state_server_constraints,
         )
 
@@ -209,7 +213,7 @@ class TestServerArgsForcedConstraints(unittest.TestCase):
         self.assertIn("disable-radix-cache", str(cm.exception))
 
     def test_both_disabled_passes(self):
-        from sgl_jax.srt.model_executor.model_runner import (
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
             _enforce_recurrent_state_server_constraints,
         )
 
@@ -218,7 +222,7 @@ class TestServerArgsForcedConstraints(unittest.TestCase):
         _enforce_recurrent_state_server_constraints(sa)
 
     def test_assert_overlap_schedule_disabled(self):
-        from sgl_jax.srt.model_executor.model_runner import (
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
             _enforce_recurrent_state_server_constraints,
         )
 
@@ -275,7 +279,7 @@ class TestStateToKvRatioZeroGuard(unittest.TestCase):
             self.skipTest("JAX not available")
 
     def test_zero_ratio_with_hybrid_raises_value_error(self):
-        from sgl_jax.srt.model_executor.model_runner import (
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
             _check_state_to_kv_ratio_for_hybrid,
         )
 
@@ -287,7 +291,7 @@ class TestStateToKvRatioZeroGuard(unittest.TestCase):
         self.assertIn("--state-to-kv-ratio", msg)  # actionable hint
 
     def test_negative_ratio_raises_value_error(self):
-        from sgl_jax.srt.model_executor.model_runner import (
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
             _check_state_to_kv_ratio_for_hybrid,
         )
 
@@ -295,7 +299,7 @@ class TestStateToKvRatioZeroGuard(unittest.TestCase):
             _check_state_to_kv_ratio_for_hybrid(state_to_kv_ratio=-0.5)
 
     def test_positive_ratio_passes(self):
-        from sgl_jax.srt.model_executor.model_runner import (
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
             _check_state_to_kv_ratio_for_hybrid,
         )
 
@@ -314,7 +318,9 @@ class TestPhase2EndToEndSanity(unittest.TestCase):
 
     def test_hybrid_construction_does_not_raise(self):
         """Constructing the full hybrid stack via the helpers does not raise."""
-        from sgl_jax.srt.model_executor.model_runner import _build_hybrid_pools
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
+            _build_hybrid_pools,
+        )
 
         cfg = _kimi_cfg(kda_layers=[0, 1, 2], num_heads=4, head_dim=8)
         kv_stub = SimpleNamespace(replace_buffer=lambda v: None)
@@ -333,7 +339,7 @@ class TestPhase2EndToEndSanity(unittest.TestCase):
 
     def test_memory_pools_replace_all_with_kv_only(self):
         """Non-hybrid path: MemoryPools.replace_all dispatches to kv pool."""
-        from sgl_jax.srt.model_executor.model_runner import (
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
             _build_non_hybrid_memory_pools,
         )
 
@@ -342,32 +348,6 @@ class TestPhase2EndToEndSanity(unittest.TestCase):
         mp = _build_non_hybrid_memory_pools(token_to_kv_pool=kv_stub)
         mp.replace_all({"token_to_kv_pool": ["dummy_layer"]})
         self.assertEqual(captured["v"], ["dummy_layer"])
-
-
-class TestPerTokenMhaKvBytes(unittest.TestCase):
-    """_per_token_mha_kv_bytes mirrors MHATokenToKVPool's per-token storage:
-    K and V each occupy num_kv_heads_with_replication * head_dim * num_layers
-    elements, hence the * 2 factor. Caller is responsible for any tp / padding
-    adjustment on the inputs."""
-
-    def test_basic_computation(self):
-        from sgl_jax.srt.model_executor.model_runner import _per_token_mha_kv_bytes
-
-        # 8 kv heads, 128 head_dim, 32 layers, bf16 (2 bytes) -> K+V doubles it.
-        per_token = _per_token_mha_kv_bytes(
-            num_kv_heads_with_replication=8,
-            head_dim=128,
-            num_layers=32,
-            kv_dtype_bytes=2,
-        )
-        self.assertEqual(per_token, 8 * 128 * 32 * 2 * 2)
-
-    def test_dtype_scales_linearly(self):
-        from sgl_jax.srt.model_executor.model_runner import _per_token_mha_kv_bytes
-
-        bf16 = _per_token_mha_kv_bytes(8, 128, 32, kv_dtype_bytes=2)
-        f32 = _per_token_mha_kv_bytes(8, 128, 32, kv_dtype_bytes=4)
-        self.assertEqual(f32, 2 * bf16)
 
 
 class TestPerReqStateBytesFromConfig(unittest.TestCase):
@@ -383,7 +363,7 @@ class TestPerReqStateBytesFromConfig(unittest.TestCase):
     def test_default_dtypes_match_pool_construction(self):
         """Default temporal=f32 (4) + conv=bf16 (2). Compare against the
         canonical per_req formula at tp=1."""
-        from sgl_jax.srt.model_executor.model_runner import (
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
             _per_req_state_bytes_from_config,
         )
 
@@ -400,7 +380,7 @@ class TestPerReqStateBytesFromConfig(unittest.TestCase):
         self.assertEqual(bytes_, expected_recurrent + expected_conv)
 
     def test_tp_size_divides_per_device_bytes(self):
-        from sgl_jax.srt.model_executor.model_runner import (
+        from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
             _per_req_state_bytes_from_config,
         )
 
@@ -437,7 +417,7 @@ class TestStateToKvRatioActuallySplitsBudget(unittest.TestCase):
         src = self._src()
         self.assertIn("_split_state_kv_budget(", src)
         self.assertIn("_compute_max_num_reqs_from_state_budget(", src)
-        self.assertIn("_per_token_mha_kv_bytes(", src)
+        self.assertIn("self._compute_cell_size()", src)
         self.assertIn("_per_req_state_bytes_from_config(", src)
 
     def test_split_happens_before_kv_pool_construction(self):

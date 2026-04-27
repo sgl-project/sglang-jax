@@ -179,21 +179,16 @@ class ReqToTokenPool:
                 f"got {type(req).__name__}. Legacy int/list[int] callers must migrate."
             )
         self.free_slots.append(req.req_pool_idx)
+        # Clear the slot ref on the req so a stale value can't leak into a
+        # later caller (the slot may already be re-handed to another req by
+        # then). Keeps free / free_chunked / free_recurrent_cache symmetric.
+        req.req_pool_idx = None
 
     def free_chunked(self, chunked_req) -> None:
-        """Release the slot held by a chunked req.
-
-        Calls free(req) and additionally clears req.req_pool_idx so the next
-        alloc(reqs) round treats this req as fresh -- otherwise alloc would
-        skip the req thinking it's still allocated, returning the stale slot
-        index that's now back in free_slots.
-
-        Subclasses with auxiliary state (e.g. HybridReqToTokenPool's
-        recurrent slot) override this to preserve the slot for reuse across
-        chunks (no-op).
+        """Release for chunked-prefill. Default: identical to free.
+        HybridReqToTokenPool overrides to preserve slots across chunks.
         """
         self.free(chunked_req)
-        chunked_req.req_pool_idx = None
 
     def clear(self):
         """Clear all allocation states"""
@@ -201,38 +196,15 @@ class ReqToTokenPool:
 
 
 class HybridReqToTokenPool(ReqToTokenPool):
-    """Hybrid-architecture ReqToTokenPool that coordinates KV slots and recurrent state slots.
+    """Coordinates KV slot + recurrent state slot allocation for hybrid models.
 
-    Coordinates KV slot and recurrent state slot allocation for hybrid
-    attention models (KDA / Mamba / GDN paired with standard attention).
-
-    - Inherits from ReqToTokenPool (KV slot behavior unchanged).
-    - Holds a reference to a RecurrentStatePool (the same instance also lives inside
-      MemoryPools); RecurrentStatePool is a pure buffer pool and intentionally does
-      NOT manage its own slot allocator state.
-    - Owns recurrent_free_slots (1-indexed; slot 0 is reserved as dummy and never
-      allocated). Public name mirrors the parent ReqToTokenPool.free_slots; the
-      separation between buffer pool and slot allocator follows the same shape as
-      MHATokenToKVPool vs TokenToKVPoolAllocator -- it keeps the buffer pool out
-      of JIT donate while leaving allocator state on the host-side scheduler
-      object.
-    - Maintains req_index_to_recurrent_index_mapping (CPU-side np.int32) bridging
-      req_pool_idx -> recurrent_pool_idx; default 0 (dummy) until a real slot is
-      written, so an unallocated req maps to the reserved slot 0.
-
-    **JIT compatibility warning (must NOT be passed to JIT)**:
-    The parent ReqToTokenPool is registered as a pytree node via
-    `@register_pytree_node_class`, but a Python decorator does **not** propagate to
-    subclasses. This subclass is intentionally not registered, so JAX treats it as a
-    plain Python object — passing it directly to `jax.jit` will raise
-    "unregistered pytree node".  only uses this class on the Python side
-    (slot coordination + mapping); it never enters JIT trace. Because the
-    recurrent allocator state lives here (not on RecurrentStatePool, which is the
-    pytree leaf passed through MemoryPools / JIT donate), there is no JIT
-    recompile risk from carrying a Python list. If a later Phase needs to JIT
-    this class, add `@register_pytree_node_class` to the subclass and override
-    tree_flatten / tree_unflatten to include recurrent_state_pool +
-    recurrent_free_slots.
+    - Owns `recurrent_free_slots` (slot 0 dummy, valid 1..max). Allocator
+      state lives here, not on RecurrentStatePool — so the buffer pool stays
+      a pytree leaf safe for JIT donate.
+    - Maintains `req_index_to_recurrent_index_mapping` bridging
+      req_pool_idx -> recurrent_pool_idx (defaults to 0 = dummy).
+    - NOT registered as a pytree node: the host-side allocator state
+      must not enter JIT donate (would otherwise reset on tree_unflatten).
     """
 
     def __init__(
