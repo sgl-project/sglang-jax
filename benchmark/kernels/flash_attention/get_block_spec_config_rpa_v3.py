@@ -89,7 +89,13 @@ def benchmark_backend(
 
     @functools.partial(
         jax.jit,
-        static_argnames=["sm_scale", "m_block_config", "d_block_config", "p_block_config"],
+        static_argnames=[
+            "sm_scale",
+            "chunk_prefill_size",
+            "m_block_config",
+            "d_block_config",
+            "p_block_config",
+        ],
     )
     def jitted_attn(
         q,
@@ -99,6 +105,7 @@ def benchmark_backend(
         kv_lens,
         page_indices,
         cu_q_lens,
+        cu_kv_lens,
         distribution,
         sm_scale,
         chunk_prefill_size,
@@ -114,9 +121,12 @@ def benchmark_backend(
             kv_lens,
             page_indices,
             cu_q_lens,
+            cu_kv_lens,
             distribution,
             sm_scale=sm_scale,
             chunk_prefill_size=chunk_prefill_size,
+            custom_mask=None,
+            attention_sink=None,
             p_block_sizes=p_block_config,
             m_block_sizes=m_block_config,
             d_block_sizes=d_block_config,
@@ -131,6 +141,7 @@ def benchmark_backend(
         kv_lens,
         page_indices,
         cu_q_lens,
+        cu_kv_lens,
         distribution,
         scale,
         static_q_len,
@@ -144,8 +155,9 @@ def benchmark_backend(
     jax.block_until_ready(output)
 
     # Benchmark
-    rpa_case = "d" if static_q_len == 1 else "m" if static_q_len == 0 else "p"
+    rpa_case = "d" if static_q_len == 1 else "m" if static_q_len is None else "p"
     scope_name = f"RPA{rpa_case}-p_{page_size}-bq_{bq_sz}_{bq_csz}-bkv_{bkv_sz}_{bkv_csz}"
+    print(scope_name)
     times = multiple_iteration_timeit_from_trace(
         compute_func=lambda: attn(),
         data_generator=lambda: (),
@@ -304,6 +316,8 @@ def main():
                 block_spec_configs,
             )
         else:
+            block_spec_configs = prefill_only_block_spec_configs
+
             # Mixed kernel tuning
             get_tuned_value(
                 max_context_len,
