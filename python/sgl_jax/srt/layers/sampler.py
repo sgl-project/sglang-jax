@@ -95,14 +95,16 @@ class Sampler(nnx.Module):
                 next_token_top_logprobs_idx,
             ) = get_top_logprobs(logprobs, sampling_metadata.top_logprobs_nums)
 
-        # Set token_ids_logprobs if needed
+        # Set token_ids_logprobs if needed.
+        # Device side returns the full logprobs[B, vocab]; host slices
+        # ragged per-req token_ids columns after device_get.
         if sampling_metadata.token_ids_logprobs is not None and any(
             x is not None for x in sampling_metadata.token_ids_logprobs
         ):
-            (
-                next_token_token_ids_logprobs_val,
-                next_token_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs(logprobs, sampling_metadata.token_ids_logprobs, self.mesh)
+            next_token_token_ids_logprobs_val = get_token_ids_logprobs(
+                logprobs, sampling_metadata.token_ids_logprobs, self.mesh
+            )
+            next_token_token_ids_logprobs_idx = None
 
         return LogitsProcessorOutput(
             next_token_logits=logits_output.next_token_logits,
@@ -216,32 +218,20 @@ class Sampler(nnx.Module):
 
 
 def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int]):
+    # Return device-side dense `[B, max_k]`. Per-req trimming to k_i is
+    # done on host in tp_worker after device_get.
     max_k = max(top_logprobs_nums)
     values, indices = jax.lax.top_k(logprobs, max_k)
-
-    output_top_logprobs_val = []
-    output_top_logprobs_idx = []
-    for i, k in enumerate(top_logprobs_nums):
-        output_top_logprobs_val.append(values[i][:k])
-        output_top_logprobs_idx.append(indices[i][:k])
-    return jnp.array(output_top_logprobs_val), jnp.array(output_top_logprobs_idx)
+    return values, indices
 
 
 def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[int]], mesh: Mesh):
-    output_token_ids_logprobs_val = []
-    output_token_ids_logprobs_idx = []
-    out_sharding = NamedSharding(mesh, P(None))
-    for i, token_ids in enumerate(token_ids_logprobs):
-        if token_ids is not None:
-            output_token_ids_logprobs_val.append(
-                logprobs.at[i, token_ids].get(out_sharding=out_sharding)
-            )
-            output_token_ids_logprobs_idx.append(token_ids)
-        else:
-            output_token_ids_logprobs_val.append([])
-            output_token_ids_logprobs_idx.append([])
-
-    return jnp.array(output_token_ids_logprobs_val), jnp.array(output_token_ids_logprobs_idx)
+    # Return the full per-req `logprobs[B, vocab]` so host can gather the
+    # ragged per-req `token_ids` columns after device_get. Device side
+    # can't produce a static per-req dense tensor because token_ids
+    # length varies per req.
+    del token_ids_logprobs, mesh  # unused; kept for API parity
+    return logprobs
 
 
 def multinomial(

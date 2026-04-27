@@ -1803,7 +1803,14 @@ class ScheduleBatch:
 
         Returns:
             (req_pool_indices, seq_lens, extend_prefix_lens,
-             extend_seq_lens, extend_logprob_start_lens, logits_indices, real_bs)
+             extend_seq_lens, extend_logprob_start_lens, logits_indices, real_bs,
+             real_bs_per_dp, logits_indices_selector)
+
+        logits_indices_selector maps "original request order"
+        (i.e., DP-rank-then-req flat order) to the DP-interleaved padded
+        slot in the global batch. It lets host-side code reorder per-req
+        outputs (e.g. logprobs) back to original order with one numpy
+        gather, instead of rederiving per-rank offsets at every callsite.
         """
         req_pool_indices_cpu = np.full(total_bs, -1, dtype=np.int32)
         seq_lens_cpu = np.zeros(total_bs, dtype=np.int32)
@@ -1822,6 +1829,7 @@ class ScheduleBatch:
         offset_bs = 0
         real_bs = 0
         real_bs_per_dp = [0] * self.dp_size
+        selector_chunks: list[np.ndarray] = []
 
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
@@ -1857,7 +1865,13 @@ class ScheduleBatch:
                         info.extend_logprob_start_lens
                     )
 
+            selector_chunks.append(np.arange(offset_bs, offset_bs + dp_bs, dtype=np.int32))
             offset_bs += per_dp_bs_size
+
+        if selector_chunks:
+            logits_indices_selector = np.concatenate(selector_chunks)
+        else:
+            logits_indices_selector = np.empty(0, dtype=np.int32)
 
         return (
             req_pool_indices_cpu,
@@ -1868,6 +1882,7 @@ class ScheduleBatch:
             logits_indices,
             real_bs,
             real_bs_per_dp,
+            logits_indices_selector,
         )
 
     def _merge_cache_loc(
@@ -2055,6 +2070,7 @@ class ScheduleBatch:
             logits_indices,
             real_bs,
             real_bs_per_dp,
+            logits_indices_selector,
         ) = self._merge_batch_metadata(per_dp_bs_padding, total_bs)
 
         # Step 4: Merge cache_loc from all DP ranks
@@ -2127,6 +2143,7 @@ class ScheduleBatch:
             lora_ids=lora_ids,
             real_bs=real_bs,
             real_bs_per_dp=real_bs_per_dp,
+            logits_indices_selector=logits_indices_selector,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL if self.return_hidden_states else CaptureHiddenMode.NULL
             ),
@@ -2809,6 +2826,12 @@ class ModelWorkerBatch:
     # For padding
     real_bs: int
     real_bs_per_dp: list[int]
+
+    # Maps "original request order" (DP-rank-then-req flat order) to the
+    # DP-interleaved padded slot in the global batch. Host code applies
+    # `arr[selector]` once after device_get to put per-req outputs back
+    # into original order, removing the need for per-rank index math.
+    logits_indices_selector: np.ndarray | None = None
 
     # For Data Parallelism
     dp_size: int = 1

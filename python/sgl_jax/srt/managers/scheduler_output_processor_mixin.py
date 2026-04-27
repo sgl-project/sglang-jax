@@ -90,6 +90,14 @@ class SchedulerOutputProcessorMixin:
         per_dp_bs_size = batch.per_dp_bs_size
 
         logprob_pt = 0
+        # Flat index across all DP ranks. logprob arrays in `logits_output`
+        # have already been reordered to original-req order in tp_worker
+        # via `logits_indices_selector`, so we just walk it sequentially.
+        # `extend_*_per_req` lists are also collected in DP-rank-then-req
+        # order in scheduler.run_batch, matching this counter. Increment
+        # for every req we visit (including retracted) so the counter stays
+        # aligned with the selector / collected lists.
+        req_idx = 0
 
         for dp_rank in range(batch.dp_size):
             info = batch.reqs_info[dp_rank]
@@ -105,6 +113,7 @@ class SchedulerOutputProcessorMixin:
             # Check finish conditions for each request in this DP rank
             for i, (req, next_token_id) in enumerate(zip(reqs, dp_output_ids)):
                 if req.is_retracted:
+                    req_idx += 1
                     continue
 
                 req.latest_bid = result.bid
@@ -120,6 +129,7 @@ class SchedulerOutputProcessorMixin:
                             self.token_to_kv_pool_allocator.free(
                                 info.out_cache_loc[j : j + 1], dp_rank
                             )
+                    req_idx += 1
                     continue
 
                 if req.is_chunked <= 0:
@@ -148,22 +158,25 @@ class SchedulerOutputProcessorMixin:
                         self.tree_cache.cache_unfinished_req(req)
 
                     if req.return_output_logprob_only:
-                        req.output_token_logprobs_val.append(logits_output.next_token_logprobs[i])
+                        req.output_token_logprobs_val.append(
+                            logits_output.next_token_logprobs[req_idx]
+                        )
                         req.output_token_logprobs_idx.append(next_token_id)
 
                     if req.return_logprob:
                         assert extend_logprob_start_len_per_req is not None
                         assert extend_input_len_per_req is not None
-                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                        extend_input_len = extend_input_len_per_req[i]
+                        extend_logprob_start_len = extend_logprob_start_len_per_req[req_idx]
+                        extend_input_len = extend_input_len_per_req[req_idx]
                         num_input_logprobs = extend_input_len - extend_logprob_start_len
                         self.add_logprob_return_values(
-                            i,
+                            req_idx,
                             req,
                             logprob_pt,
                             dp_output_ids,  # Pass current DP rank's output IDs
                             num_input_logprobs,
                             logits_output,
+                            local_idx=i,
                         )
                         logprob_pt += num_input_logprobs
 
@@ -205,13 +218,13 @@ class SchedulerOutputProcessorMixin:
 
                     # Incrementally update input logprobs.
                     if req.return_logprob:
-                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                        extend_input_len = extend_input_len_per_req[i]
+                        extend_logprob_start_len = extend_logprob_start_len_per_req[req_idx]
+                        extend_input_len = extend_input_len_per_req[req_idx]
                         if extend_logprob_start_len < extend_input_len:
                             # Update input logprobs.
                             num_input_logprobs = extend_input_len - extend_logprob_start_len
                             self.add_input_logprob_return_values(
-                                i,
+                                req_idx,
                                 req,
                                 logits_output,
                                 logprob_pt,
@@ -219,6 +232,7 @@ class SchedulerOutputProcessorMixin:
                                 last_prefill_chunk=False,
                             )
                             logprob_pt += num_input_logprobs
+                req_idx += 1
 
         batch.cache_miss_count = cache_miss_count
 
@@ -288,7 +302,6 @@ class SchedulerOutputProcessorMixin:
             self.draft_token += batch.batch_size() * self.draft_worker.speculative_num_draft_tokens
         # FIXME(pc) add spec decode metrics
 
-        # TODO: Overlap mode and logprobs support for DP
         if self.enable_overlap:
             logits_output, next_token_ids, cache_miss_count = (
                 self.tp_worker.resolve_last_batch_result(launch_done)
@@ -305,6 +318,12 @@ class SchedulerOutputProcessorMixin:
 
         # Process each DP rank's requests (unified for all dp_size >= 1)
         per_dp_bs_size = batch.per_dp_bs_size  # Padded batch size per DP rank
+        # Flat index across all DP ranks. logprob arrays in `logits_output`
+        # / `next_token_logprobs` have already been reordered to original-req
+        # order in tp_worker via `logits_indices_selector`. Increment for
+        # every visited req (including retracted) so the counter stays
+        # aligned with the selector.
+        req_idx = 0
 
         for dp_rank in range(batch.dp_size):
             info = batch.reqs_info[dp_rank]
@@ -321,6 +340,7 @@ class SchedulerOutputProcessorMixin:
             for i, (req, next_token_id) in enumerate(zip(reqs, dp_output_ids)):
                 req: Req
                 if req.is_retracted:
+                    req_idx += 1
                     continue
 
                 req.latest_bid = result.bid
@@ -336,6 +356,7 @@ class SchedulerOutputProcessorMixin:
                             indices_to_free = info.out_cache_loc[i : i + 1]
                     if indices_to_free is not None:
                         self.token_to_kv_pool_allocator.free(indices_to_free, dp_rank)
+                    req_idx += 1
                     continue
 
                 new_accepted_len = 1
@@ -385,28 +406,28 @@ class SchedulerOutputProcessorMixin:
                     self.tree_cache.cache_finished_req(req)
 
                 if req.return_output_logprob_only:
-                    req.output_token_logprobs_val.append(next_token_logprobs[i])  # TODO @Brian fix
+                    req.output_token_logprobs_val.append(next_token_logprobs[req_idx])
                     req.output_token_logprobs_idx.append(next_token_id)
 
                 if req.return_logprob and (
                     batch.spec_algorithm is None or batch.spec_algorithm.is_none()
                 ):
                     # speculative worker handles logprob in speculative decoding
-                    req.output_token_logprobs_val.append(next_token_logprobs[i])
+                    req.output_token_logprobs_val.append(next_token_logprobs[req_idx])
                     req.output_token_logprobs_idx.append(next_token_id)
                     if req.top_logprobs_num > 0:
                         req.output_top_logprobs_val.append(
-                            logits_output.next_token_top_logprobs_val[i]
+                            logits_output.next_token_top_logprobs_val[req_idx]
                         )
                         req.output_top_logprobs_idx.append(
-                            logits_output.next_token_top_logprobs_idx[i]
+                            logits_output.next_token_top_logprobs_idx[req_idx]
                         )
                     if req.token_ids_logprob is not None:
                         req.output_token_ids_logprobs_val.append(
-                            logits_output.next_token_token_ids_logprobs_val[i]
+                            logits_output.next_token_token_ids_logprobs_val[req_idx]
                         )
                         req.output_token_ids_logprobs_idx.append(
-                            logits_output.next_token_token_ids_logprobs_idx[i]
+                            logits_output.next_token_token_ids_logprobs_idx[req_idx]
                         )
 
                 # Update grammar state after token sampling
@@ -426,7 +447,12 @@ class SchedulerOutputProcessorMixin:
                         self.abort_request(AbortReq(rid=req.rid))
                     req.grammar.finished = req.finished()
                 if req.return_hidden_states and logits_output.hidden_states is not None:
+                    # NOTE: hidden_states is not yet reordered through
+                    # logits_indices_selector. Decode-mode hidden_states is
+                    # DP-interleaved like the raw next_token_logprobs were.
+                    # Tracking as a follow-up; not in scope for this fix.
                     req.hidden_states.append(logits_output.hidden_states[i])
+                req_idx += 1
 
         # Collect all requests from all DP ranks for stream output
         all_reqs = []
@@ -585,10 +611,19 @@ class SchedulerOutputProcessorMixin:
         next_token_ids: list[int],
         num_input_logprobs: int,
         output: LogitsProcessorOutput,
+        local_idx: int | None = None,
     ):
-        """Attach logprobs to the return values."""
+        """Attach logprobs to the return values.
+
+        `i` indexes logprob arrays (already reordered to original-req order).
+        `local_idx` indexes `next_token_ids` (per-DP-rank slice from caller).
+        DP=1: `i == local_idx`; pass `local_idx=None` to fall back to `i`.
+        DP>1: `i` is the global flat req index, `local_idx` is the per-rank
+        position; both must be passed.
+        """
+        nt_idx = i if local_idx is None else local_idx
         req.output_token_logprobs_val.append(output.next_token_logprobs[i])
-        req.output_token_logprobs_idx.append(next_token_ids[i])
+        req.output_token_logprobs_idx.append(next_token_ids[nt_idx])
 
         self.add_input_logprob_return_values(
             i, req, output, pt, num_input_logprobs, last_prefill_chunk=True
