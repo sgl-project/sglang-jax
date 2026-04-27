@@ -23,12 +23,11 @@ from sgl_jax.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     AttentionBackendMetadata,
 )
+from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
-from sgl_jax.srt.utils import cdiv
 from sgl_jax.srt.utils.jax_utils import device_array
 
 if TYPE_CHECKING:
-    from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
@@ -66,98 +65,71 @@ class LinearRecurrentAttnBackend(AttentionBackend):
     def __init__(
         self,
         mesh: jax.sharding.Mesh | None = None,
-        req_to_token_pool=None,
     ):
         self.mesh = mesh
-        self.req_to_token_pool = req_to_token_pool
         self.forward_metadata = nnx.data(LinearRecurrentAttnBackendMetadata())
 
     def get_forward_metadata(
         self,
+        req_to_token_pool: ReqToTokenPool,
         batch: ModelWorkerBatch,
     ) -> LinearRecurrentAttnBackendMetadata:
+        """Return the metadata for a forward pass."""
+        metadata = LinearRecurrentAttnBackendMetadata()
+
+        # cu_q_lens
         if batch.forward_mode == ForwardMode.EXTEND:
-            q_lens = np.asarray(batch.extend_seq_lens, dtype=np.int32)
             cu_q_lens = np.concatenate(
-                [np.array([0], dtype=np.int32), np.cumsum(q_lens, dtype=np.int32)]
+                [
+                    np.array([0], dtype=np.int32),
+                    np.cumsum(batch.extend_seq_lens, dtype=np.int32),
+                ]
             )
         elif batch.forward_mode == ForwardMode.DECODE:
             cu_q_lens = np.arange(len(batch.seq_lens) + 1, dtype=np.int32)
-        elif batch.forward_mode in (ForwardMode.IDLE, ForwardMode.DUMMY_FIRST):
-            cu_q_lens = np.array([0], dtype=np.int32)
         else:
-            raise NotImplementedError(
-                f"Linear recurrent attention does not support {batch.forward_mode}"
-            )
+            raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-        if self.req_to_token_pool is not None:
-            recurrent_indices = np.asarray(
-                self.req_to_token_pool.get_linear_recurrent_indices(
-                    batch.req_pool_indices
-                ),
-                dtype=np.int32,
-            )
-        else:
-            recurrent_indices = np.arange(len(batch.seq_lens), dtype=np.int32)
-        sharding = (
-            NamedSharding(self.mesh, P())
-            if self.mesh is not None and jax.process_count() == 1
-            else None
-        )
-        cu_q_lens_dev, recurrent_indices_dev = device_array(
+        # recurrent_indices
+        recurrent_indices = req_to_token_pool.get_linear_recurrent_indices(batch.req_pool_indices)
+        # put array to devices
+        (
+            metadata.cu_q_lens,
+            metadata.recurrent_indices,
+        ) = device_array(
             (cu_q_lens, recurrent_indices),
-            sharding=sharding,
+            sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
         )
-        metadata = LinearRecurrentAttnBackendMetadata(
-            cu_q_lens=cu_q_lens_dev,
-            recurrent_indices=recurrent_indices_dev,
-        )
+
         self.forward_metadata = nnx.data(metadata)
         return metadata
 
     def tree_flatten(self):
         children = (self.forward_metadata,)
-        aux_data = {"mesh": self.mesh, "req_to_token_pool": self.req_to_token_pool}
+        aux_data = {"mesh": self.mesh}
         return children, aux_data
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         obj = cls(
             mesh=aux_data["mesh"],
-            req_to_token_pool=aux_data.get("req_to_token_pool"),
         )
         obj.forward_metadata = children[0]
         return obj
 
     @staticmethod
-    def _get_scale(layer: RadixLinearAttention) -> float:
-        return layer.scaling if layer.scaling is not None else layer.head_q_dim**-0.5
-
-    @staticmethod
-    def _get_layer_cache(recurrent_state_pool, layer_id: int):
+    def get_layer_cache(recurrent_state_pool, layer_id: int):
         """Returns (recurrent_cache, conv_cache) for the given layer.
 
         Matches RecurrentStatePool.get_linear_recurrent_layer_cache (PR #966)
         which returns a (recurrent, conv) tuple.
         """
-        layer_cache = recurrent_state_pool.get_linear_recurrent_layer_cache(layer_id)
-        if isinstance(layer_cache, tuple) and len(layer_cache) == 2:
-            return layer_cache
-        raise TypeError(
-            "linear recurrent layer cache must be a (recurrent, conv) tuple"
-        )
+        return recurrent_state_pool.get_linear_recurrent_layer_cache(layer_id)
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
-        # Same scalar-prefetch budget heuristic as FlashAttention: metadata
-        # arrays (cu_q_lens, recurrent_indices) must fit in TPU scalar-prefetch
-        # memory.
-        num_page_per_req = cdiv(max_context_len, page_size)
-        res = 1024 * 1024 // 2 // num_page_per_req // 4
-        assert (
-            res > 0
-        ), f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"
-        return res
+        # hack setting to 1024, because linear attention backend has no limitation
+        return 1024
 
 
 # --- HybridLinearAttnBackend -----------------------------------------------
@@ -311,9 +283,7 @@ class MockRecurrentStatePool:
         )
         self.layer_caches = {} if layer_caches is None else dict(layer_caches)
 
-    def get_linear_recurrent_indices(
-        self, req_pool_indices: np.ndarray
-    ) -> np.ndarray:
+    def get_linear_recurrent_indices(self, req_pool_indices: np.ndarray) -> np.ndarray:
         """Identity mapping — slot i maps to recurrent index i."""
         return np.asarray(req_pool_indices, dtype=np.int32)
 

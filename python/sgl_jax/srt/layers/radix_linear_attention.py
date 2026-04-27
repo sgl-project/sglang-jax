@@ -21,7 +21,7 @@ class RadixLinearAttention(nnx.Module):
         head_q_dim: int,
         head_k_dim: int,
         head_v_dim: int,
-        conv_weights: jax.Array | None = None,
+        conv_weights: tuple[jax.Array, jax.Array, jax.Array] | None = None,
         bias: jax.Array | None = None,
         activation=None,
         A_log: jax.Array | None = None,
@@ -45,13 +45,17 @@ class RadixLinearAttention(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
-        mixed_qkv: jax.Array,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
         a: jax.Array,
         b: jax.Array,
         recurrent_state_pool,
-    ) -> tuple[jax.Array, object]:
-        output = forward_batch.attn_backend(
-            mixed_qkv,
+    ):
+        output, recurrent_state_pool = forward_batch.attn_backend(
+            q,
+            k,
+            v,
             a,
             b,
             self,

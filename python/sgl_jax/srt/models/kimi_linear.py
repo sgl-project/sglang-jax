@@ -117,11 +117,15 @@ class KimiDeltaAttention(nnx.Module):
             head_q_dim=self.k_head_dim,
             head_k_dim=self.k_head_dim,
             head_v_dim=self.v_head_dim,
-            conv_weights=(self.q_conv1d.weight, self.k_conv1d.weight, self.v_conv1d.weight),
+            conv_weights=(
+                self.q_conv1d.weight[...],
+                self.k_conv1d.weight[...],
+                self.v_conv1d.weight[...],
+            ),
             bias=None,
             activation=jax.nn.silu,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
+            A_log=self.A_log[...],
+            dt_bias=self.dt_bias[...],
         )
 
     def __call__(
@@ -136,16 +140,15 @@ class KimiDeltaAttention(nnx.Module):
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
-        mixed_qkv = jnp.concatenate([q, k, v], axis=-1)
 
-        f_a, _ = self.f_a_proj(hidden_states)
-        raw_gate, _ = self.f_b_proj(f_a)
-        b_raw, _ = self.b_proj(hidden_states)
-        beta = jax.nn.sigmoid(b_raw.astype(jnp.float32))
+        raw_gate, _ = self.f_b_proj(self.f_a_proj(hidden_states)[0])
+        beta = jax.nn.sigmoid(self.b_proj(hidden_states)[0].astype(jnp.float32))
 
         o, recurrent_state_pool = self.attn(
             forward_batch,
-            mixed_qkv,
+            q,
+            k,
+            v,
             raw_gate,
             beta,
             recurrent_state_pool,

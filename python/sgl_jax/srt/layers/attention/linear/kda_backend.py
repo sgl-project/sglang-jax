@@ -9,6 +9,10 @@ from sgl_jax.srt.kernels.kda import chunk_kda, fused_recurrent_kda
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
 )
+from sgl_jax.srt.layers.attention.linear.short_convolution import (
+    l2_normalize,
+    short_convolution,
+)
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 if TYPE_CHECKING:
@@ -19,17 +23,17 @@ if TYPE_CHECKING:
 class KDAAttnBackend(LinearRecurrentAttnBackend):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
-    use_pallas_prefill = False
-
-    def __init__(self, runner):
+    def __init__(self, mesh: jax.sharding.Mesh = None, use_pallas_prefill: bool = False):
         super().__init__(
-            mesh=runner.mesh,
-            req_to_token_pool=runner.req_to_token_pool,
+            mesh=mesh,
         )
+        self.use_pallas_prefill = use_pallas_prefill
 
     def __call__(
         self,
-        mixed_qkv: jax.Array,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
         a: jax.Array,
         b: jax.Array,
         layer: RadixLinearAttention,
@@ -37,48 +41,76 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         recurrent_state_pool,
         **kwargs,
     ) -> jax.Array:
-        q, k, v = self._split_qkv(mixed_qkv, layer)
-        g = self._reshape_gate(a, q)
-        beta = self._reshape_beta(b, q)
-
-        if forward_batch.forward_mode in (ForwardMode.IDLE, ForwardMode.DUMMY_FIRST):
-            return jnp.zeros((q.shape[0], q.shape[1] * v.shape[-1]), dtype=v.dtype)
-        if forward_batch.forward_mode in (
-            ForwardMode.DRAFT_EXTEND,
-            ForwardMode.TARGET_VERIFY,
-        ):
-            raise NotImplementedError(
-                f"KDA does not support {forward_batch.forward_mode}"
-            )
-
         recurrent_indices = self.forward_metadata.recurrent_indices
-        recurrent_cache, _ = self._get_layer_cache(
-            recurrent_state_pool,
-            layer.layer_id,
+        ssm_states, conv_states = self.get_state(
+            recurrent_state_pool, layer.layer_id, recurrent_indices
         )
-        initial_state = recurrent_cache[recurrent_indices].astype(jnp.float32)
+        q_state, k_state, v_state = self._unpack_conv_states(conv_states)
+
+        q_conv_w, k_conv_w, v_conv_w = layer.conv_weights
+        # LinearBase stores weights as [in_features=K, out_features=D]; the
+        # short conv kernel expects depthwise layout [D, K], so transpose.
+        q_conv_w = self._to_depthwise_layout(q_conv_w)
+        k_conv_w = self._to_depthwise_layout(k_conv_w)
+        v_conv_w = self._to_depthwise_layout(v_conv_w)
+        cu_q_lens = self.forward_metadata.cu_q_lens
+        q, q_state_new = short_convolution(
+            q, q_conv_w, q_state, cu_q_lens, forward_batch.forward_mode
+        )
+        k, k_state_new = short_convolution(
+            k, k_conv_w, k_state, cu_q_lens, forward_batch.forward_mode
+        )
+        v, v_state_new = short_convolution(
+            v, v_conv_w, v_state, cu_q_lens, forward_batch.forward_mode
+        )
+        new_conv_states = jnp.stack([q_state_new, k_state_new, v_state_new], axis=1)
+
+        q = q.reshape(q.shape[0], layer.num_q_heads, layer.head_q_dim)
+        k = k.reshape(k.shape[0], layer.num_k_heads, layer.head_k_dim)
+        v = v.reshape(v.shape[0], layer.num_v_heads, layer.head_v_dim)
+        q = l2_normalize(q)
+        k = l2_normalize(k)
 
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             output, new_recurrent = self._forward_extend(
-                q, k, v, g, beta, initial_state,
-                self.forward_metadata.cu_q_lens, layer,
+                q,
+                k,
+                v,
+                a,
+                b,
+                ssm_states,
+                cu_q_lens,
+                layer,
             )
         elif forward_batch.forward_mode == ForwardMode.DECODE:
             output, new_recurrent = self._forward_decode(
-                q, k, v, g, beta, initial_state, layer,
+                q,
+                k,
+                v,
+                a,
+                b,
+                ssm_states,
+                layer,
             )
         else:
-            raise NotImplementedError(
-                f"KDA does not support {forward_batch.forward_mode}"
-            )
+            raise NotImplementedError(f"KDA does not support {forward_batch.forward_mode}")
 
-        recurrent_state_pool.set_linear_recurrent_layer_cache(
-            layer.layer_id,
-            recurrent_indices,
-            new_recurrent,
-            None,
+        new_ssm_states = self.set_ssm_state(ssm_states, recurrent_indices, new_recurrent)
+        new_conv_states = self.set_conv_state(conv_states, recurrent_indices, new_conv_states)
+        return output.reshape(output.shape[0], -1), (new_ssm_states, new_conv_states)
+
+    def get_state(self, recurrent_state_pool, layer_id, recurrent_indices):
+        recurrent_buffers, conv_buffers = self.get_layer_cache(
+            recurrent_state_pool,
+            layer_id,
         )
-        return output.reshape(output.shape[0], -1)
+        return recurrent_buffers[recurrent_indices], conv_buffers[recurrent_indices]
+
+    def set_conv_state(self, conv_buffers, recurrent_indices, new_conv_states):
+        return conv_buffers.at[recurrent_indices].set(new_conv_states)
+
+    def set_ssm_state(self, recurrent_buffers, recurrent_indices, new_ssm_states):
+        return recurrent_buffers.at[recurrent_indices].set(new_ssm_states)
 
     # ------------------------------------------------------------------
     # Forward mode implementations
@@ -96,12 +128,8 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         layer: RadixLinearAttention,
     ) -> tuple[jax.Array, jax.Array]:
         if self.use_pallas_prefill:
-            return self._forward_extend_pallas(
-                q, k, v, g, beta, initial_state, cu_seqlens, layer
-            )
-        return self._forward_extend_naive(
-            q, k, v, g, beta, initial_state, cu_seqlens, layer
-        )
+            return self._forward_extend_pallas(q, k, v, g, beta, initial_state, cu_seqlens, layer)
+        return self._forward_extend_naive(q, k, v, g, beta, initial_state, cu_seqlens, layer)
 
     def _forward_extend_pallas(
         self,
@@ -115,7 +143,8 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         layer: RadixLinearAttention,
     ) -> tuple[jax.Array, jax.Array]:
         """Chunked prefill via Pallas kernel.  Returns (output, new_state)."""
-        A_log, dt_bias = self._gate_params(layer, g)
+        if layer.A_log is None or layer.dt_bias is None:
+            raise ValueError("KDA gate activation requires layer.A_log and layer.dt_bias")
         # Kernel expects [1, T_packed, H, K] packed layout.
         o, final_state, *_ = chunk_kda(
             q[None, ...],
@@ -128,8 +157,8 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             output_final_state=True,
             cu_seqlens=cu_seqlens,
             use_gate_in_kernel=True,
-            A_log=A_log,
-            dt_bias=dt_bias,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
         )
         # Remove the B=1 packed dim: [1, T, H, V] -> [T, H, V]
         return o[0], final_state
@@ -160,9 +189,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             )
             return o[0], final_state
 
-        q_b, k_b, v_b, g_b, beta_b = self._unpack_varlen(
-            q, k, v, g, beta, cu_seqlens
-        )
+        q_b, k_b, v_b, g_b, beta_b = self._unpack_varlen(q, k, v, g, beta, cu_seqlens)
         o_b, final_state = fused_recurrent_kda(
             q_b,
             k_b,
@@ -206,10 +233,13 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         layer: RadixLinearAttention,
         g: jax.Array,
     ) -> jax.Array:
-        A_log, dt_bias = self._gate_params(layer, g)
-        return -jnp.exp(A_log.reshape(1, g.shape[-2], 1)) * jax.nn.softplus(
-            g + dt_bias.reshape(1, g.shape[-2], g.shape[-1])
-        )
+        if layer.A_log is None or layer.dt_bias is None:
+            raise ValueError("KDA gate activation requires layer.A_log and layer.dt_bias")
+        H = g.shape[-2]
+        orig_dtype = g.dtype
+        g32 = g.astype(jnp.float32) + layer.dt_bias.reshape(H, -1).astype(jnp.float32)
+        out = -jnp.exp(layer.A_log.reshape(H, 1).astype(jnp.float32)) * jax.nn.softplus(g32)
+        return out.astype(orig_dtype)
 
     @staticmethod
     def _unpack_varlen(
@@ -248,81 +278,36 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         return output[seq_ids, seq_offsets]
 
     @staticmethod
-    def _as_array(value) -> jax.Array:
-        return value[...] if hasattr(value, "__getitem__") else value
-
-    @classmethod
-    def _gate_params(
-        cls,
-        layer: RadixLinearAttention,
-        g: jax.Array,
-    ) -> tuple[jax.Array, jax.Array]:
-        if layer.A_log is None or layer.dt_bias is None:
-            raise ValueError("KDA gate activation requires layer.A_log and layer.dt_bias")
-        A_log = jnp.asarray(cls._as_array(layer.A_log), dtype=jnp.float32).reshape(-1)
-        dt_bias = jnp.asarray(cls._as_array(layer.dt_bias), dtype=jnp.float32).reshape(
-            g.shape[-2],
-            g.shape[-1],
-        )
-        return A_log, dt_bias
-
-    # ------------------------------------------------------------------
-    # QKV / gate / beta helpers (KDA-specific shapes)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _split_qkv(
-        mixed_qkv: jax.Array | tuple[jax.Array, jax.Array, jax.Array],
-        layer: RadixLinearAttention,
+    def _unpack_conv_states(
+        conv_states,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Split mixed QKV into separate q, k, v arrays.
+        """Pull per-stream conv caches out of the pool layout.
 
-        Handles two formats produced by ``KimiDeltaAttention``:
-        - tuple of 3 arrays (already split)
-        - flat ``[T, q_dim + k_dim + v_dim]`` concatenation
+        Accepts either a ``(qs, ks, vs)`` tuple or a stacked ``[B, 3, C, K]``
+        array (the layout written back by ``__call__``).
         """
-        if isinstance(mixed_qkv, tuple):
-            return mixed_qkv
-
-        # Flat [T, total_dim] — split and reshape to [T, H, D].
-        q_size = layer.num_q_heads * layer.head_q_dim
-        k_size = layer.num_k_heads * layer.head_k_dim
-        q_raw, k_raw, v_raw = jnp.split(
-            mixed_qkv,
-            [q_size, q_size + k_size],
-            axis=-1,
-        )
-        return (
-            q_raw.reshape(mixed_qkv.shape[0], layer.num_q_heads, layer.head_q_dim),
-            k_raw.reshape(mixed_qkv.shape[0], layer.num_k_heads, layer.head_k_dim),
-            v_raw.reshape(mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim),
-        )
+        if isinstance(conv_states, (tuple, list)) and len(conv_states) == 3:
+            return tuple(conv_states)
+        # Expect [B, 3, C, K] stacked layout.
+        return conv_states[:, 0], conv_states[:, 1], conv_states[:, 2]
 
     @staticmethod
-    def _reshape_gate(gate: jax.Array, q: jax.Array) -> jax.Array:
-        """Ensure gate has shape ``[T, H, K]`` matching q."""
-        if gate.shape == q.shape:
-            return gate
-        if gate.ndim == 2 and gate.shape[-1] == q.shape[1] * q.shape[2]:
-            return gate.reshape(q.shape)
-        raise ValueError(
-            f"Gate shape {gate.shape} incompatible with q {q.shape}; "
-            f"expected {q.shape} or [{q.shape[0]}, {q.shape[1] * q.shape[2]}]"
-        )
+    def _to_depthwise_layout(weight: jax.Array) -> jax.Array:
+        """Coerce a conv weight to the depthwise [D, K] layout.
 
-    @staticmethod
-    def _reshape_beta(beta: jax.Array, q: jax.Array) -> jax.Array:
-        """Ensure beta has shape ``[T, H]`` matching q[:2]."""
-        if beta.ndim == 3 and beta.shape[-1] == 1:
-            beta = beta[..., 0]
-        if beta.shape == q.shape[:2]:
-            return beta
-        if beta.ndim == 1 and beta.shape[0] == q.shape[0] * q.shape[1]:
-            return beta.reshape(q.shape[:2])
-        raise ValueError(
-            f"Beta shape {beta.shape} incompatible with q {q.shape}; "
-            f"expected {q.shape[:2]} or [{q.shape[0] * q.shape[1]}]"
-        )
+        ``LinearBase`` stores weights as ``[in_features, out_features]``; for
+        the conv1d projections that means ``[K, D]`` (kernel size, channels).
+        ``short_convolution`` expects channels-first ``[D, K]``, so we
+        transpose. The ``[D, 1, K]`` PyTorch layout is passed through —
+        ``short_convolution`` squeezes the singleton axis itself.
+        """
+        if weight.ndim == 3 and weight.shape[1] == 1:
+            return weight
+        if weight.ndim != 2:
+            raise ValueError(
+                f"conv weight must be rank 2 or [D, 1, K]; got shape {weight.shape}"
+            )
+        return jnp.swapaxes(weight, 0, 1)
 
 
 __all__ = ["KDAAttnBackend"]
