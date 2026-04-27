@@ -25,8 +25,6 @@ class KimiDeltaAttention(nnx.Module):
         mesh: jax.sharding.Mesh | None = None,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
-        if mesh is None:
-            mesh = jax.sharding.Mesh(jax.devices()[:1], ("tensor",))
         self.mesh = mesh
 
         linear_config = config.linear_attn_config
@@ -128,11 +126,11 @@ class KimiDeltaAttention(nnx.Module):
 
     def __call__(
         self,
-        hidden_states: jax.Array,
         positions: jax.Array | None,
+        hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         recurrent_state_pool,
-    ) -> jax.Array:
+    ) -> tuple[jax.Array, object]:
         del positions
 
         q, _ = self.q_proj(hidden_states)
@@ -145,7 +143,7 @@ class KimiDeltaAttention(nnx.Module):
         b_raw, _ = self.b_proj(hidden_states)
         beta = jax.nn.sigmoid(b_raw.astype(jnp.float32))
 
-        o = self.attn(
+        o, recurrent_state_pool = self.attn(
             forward_batch,
             mixed_qkv,
             raw_gate,
@@ -160,7 +158,7 @@ class KimiDeltaAttention(nnx.Module):
         o = self.o_norm(o, output_gate).reshape(hidden_states.shape[0], self.projection_size)
         o, _ = self.o_proj(o)
 
-        return o
+        return o, recurrent_state_pool
 
 
 __all__ = ["KimiDeltaAttention"]

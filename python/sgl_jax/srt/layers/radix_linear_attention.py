@@ -49,8 +49,8 @@ class RadixLinearAttention(nnx.Module):
         a: jax.Array,
         b: jax.Array,
         recurrent_state_pool,
-    ) -> jax.Array:
-        return forward_batch.attn_backend(
+    ) -> tuple[jax.Array, object]:
+        output = forward_batch.attn_backend(
             mixed_qkv,
             a,
             b,
@@ -58,3 +58,4 @@ class RadixLinearAttention(nnx.Module):
             forward_batch,
             recurrent_state_pool,
         )
+        return output, recurrent_state_pool
