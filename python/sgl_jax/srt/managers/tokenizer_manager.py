@@ -666,15 +666,7 @@ class TokenizerManager:
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = True
-            if obj.mode != "abort":
-                await self.send_to_scheduler.send_pyobj(obj)
-            else:
-                # use len(self.rid_to_state) == 0 to ensure all requests are aborted
-                while True:
-                    self.abort_request(abort_all=True)
-                    if len(self.rid_to_state) == 0:
-                        break
-                    await asyncio.sleep(0.1)
+            await self.send_to_scheduler.send_pyobj(obj)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:

@@ -1958,6 +1958,58 @@ class Scheduler(
                 logger.debug("Abort running request. rid=%s", req.rid)
                 req.to_finish = FINISH_ABORT()
 
+        # Release KV for any chunked-prefill requests being aborted. These
+        # reqs are not in running_batch yet, so the to_finish path above will
+        # not free their slots and they will leak in token_to_kv_pool.
+        for dp_rank in range(self.dp_size):
+            chunked_req = self.chunked_reqs[dp_rank]
+            if chunked_req is None:
+                continue
+            if not (recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid)):
+                continue
+            self._release_chunked_req(dp_rank)
+            self._send_abort_to_tokenizer(chunked_req.rid)
+            logger.debug("Abort chunked request. rid=%s", chunked_req.rid)
+
+    def _release_chunked_req(self, dp_rank: int):
+        """Release ALL KV held by a chunked-prefill request on a DP rank.
+
+        Used by pause(abort) and abort_request when the chunked req will not
+        resume. Unlike `cache_unfinished_req` (which inserts into radix and
+        keeps a lock so the next chunk can pick up), this does a full release:
+        free every written KV slot for the req, drop the radix lock on its
+        prefix node, and free its req_pool slot.
+        """
+        chunked_req = self.chunked_reqs[dp_rank]
+        if chunked_req is None:
+            return None
+        fill_len = len(chunked_req.fill_ids)
+        if fill_len > 0:
+            kv_indices = self.req_to_token_pool.read(chunked_req.req_pool_idx, fill_len)
+            kv_indices = kv_indices[kv_indices != 0]
+            if len(kv_indices) > 0:
+                self.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
+        # Drop the radix lock acquired during the previous chunk's
+        # cache_unfinished_req call. Skip when there is no last_node yet
+        # (e.g. the first chunk has not been processed).
+        if getattr(chunked_req, "last_node", None) is not None:
+            if self.is_hybrid:
+                self.tree_cache.dec_lock_ref(
+                    chunked_req.last_node, getattr(chunked_req, "swa_uuid_for_lock", None)
+                )
+            else:
+                self.tree_cache.dec_lock_ref(chunked_req.last_node)
+        self.req_to_token_pool.free(chunked_req.req_pool_idx)
+        self.chunked_reqs[dp_rank] = None
+        return chunked_req
+
+    def _send_abort_to_tokenizer(self, rid: str):
+        abort_out = AbortReq(rid=rid)
+        if self._comm_backend is not None:
+            self._comm_backend.send_pyobj(abort_out)
+        else:
+            self.send_to_tokenizer.send_pyobj(abort_out)
+
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         self._engine_paused = True
 
@@ -1969,6 +2021,13 @@ class Scheduler(
             self.cur_batch = None
 
         if recv_req.mode == "retract":
+            # Free KV held by any chunked-prefill requests before retracting
+            # the running batch, otherwise their slots leak (chunked reqs are
+            # not part of running_batch yet).
+            for dp_rank in range(self.dp_size):
+                self._release_chunked_req(dp_rank)
+            self.chunked_reqs = [None] * self.dp_size
+
             self.running_batch.filter_batch()
             all_reqs = [
                 req for info in self.running_batch.reqs_info for req in info.reqs if info.reqs
@@ -1979,8 +2038,72 @@ class Scheduler(
                 for req in retracted_reqs:
                     self._add_request_to_queue(req)
 
-            self.chunked_reqs = [None] * self.dp_size
             logger.info("Paused generation retracted")
+        elif recv_req.mode == "abort":
+            # Free chunked-prefill KV first, then abort the running batch.
+            # Without this the per-DP token_to_kv_pool_allocator leaks the
+            # chunked req's slots and check_memory() will SIGQUIT the scheduler.
+            chunked_state = [
+                (dp, None if r is None else (r.rid, len(r.fill_ids)))
+                for dp, r in enumerate(self.chunked_reqs)
+            ]
+            running_state = [
+                (dp, len(info.reqs) if info.reqs else 0)
+                for dp, info in enumerate(self.running_batch.reqs_info)
+            ]
+            cur_state = (
+                None
+                if self.cur_batch is None or self.cur_batch is self.running_batch
+                else [
+                    (dp, len(info.reqs) if info.reqs else 0)
+                    for dp, info in enumerate(self.cur_batch.reqs_info)
+                ]
+            )
+            avail = self.token_to_kv_pool_allocator.available_size(0)
+            evict = self.tree_cache.evictable_size(dp_rank=0)
+            prot = self.tree_cache.protected_size(dp_rank=0)
+            print(
+                f"[abort-debug] enter chunked={chunked_state} running={running_state} "
+                f"cur_batch={cur_state} avail={avail} evict={evict} protected={prot}",
+                flush=True,
+            )
+
+            aborted_chunked: list[Req] = []
+            for dp_rank in range(self.dp_size):
+                req = self._release_chunked_req(dp_rank)
+                if req is not None:
+                    aborted_chunked.append(req)
+            self.chunked_reqs = [None] * self.dp_size
+
+            self.running_batch.filter_batch()
+            all_running = [
+                req for info in self.running_batch.reqs_info for req in info.reqs if info.reqs
+            ]
+            if len(all_running) != 0:
+                # retract_all releases per-DP KV through ScheduleBatch.release_req
+                aborted_running = self.running_batch.retract_all(self.server_args)
+            else:
+                aborted_running = []
+
+            # Notify tokenizer for every aborted request so clients see a
+            # finish_reason rather than hanging on the response stream.
+            for req in aborted_chunked + aborted_running:
+                self._send_abort_to_tokenizer(req.rid)
+
+            self.cur_batch = None
+            avail2 = self.token_to_kv_pool_allocator.available_size(0)
+            evict2 = self.tree_cache.evictable_size(dp_rank=0)
+            prot2 = self.tree_cache.protected_size(dp_rank=0)
+            print(
+                f"[abort-debug] exit chunked={len(aborted_chunked)} "
+                f"running={len(aborted_running)} avail={avail2} evict={evict2} protected={prot2}",
+                flush=True,
+            )
+            logger.info(
+                "Paused generation aborted (chunked=%d, running=%d)",
+                len(aborted_chunked),
+                len(aborted_running),
+            )
         elif recv_req.mode == "in_place":
             logger.info("Paused generation in place")
 
