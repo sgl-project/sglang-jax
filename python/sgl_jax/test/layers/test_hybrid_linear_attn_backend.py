@@ -5,8 +5,8 @@ Maps to design doc test plan §4:
 - TP-2: TestForwardMetadataSetter.*
 - TP-3: TestDispatch.*
 - TP-4: TestGetMaxRunningReqests.*
-- TP-5: TestModelRunnerIntegration (Task 3.2)
-- TP-6: TestTwoLayerForwardOrdering (Task 3.3)
+- TP-5: TestModelRunnerIntegration
+- TP-6: TestTwoLayerForwardOrdering
 """
 
 from dataclasses import dataclass
@@ -558,12 +558,33 @@ class TestHybridConfigProperties:
 
     def test_linear_recurrent_config_is_kimi_for_now(self):
         # linear_recurrent_config currently ORs only kimi_linear_config; future
-        # additions (hybrid_gdn_config, ...) extend the chain.
+        # additions (hybrid_gdn_config, ...) extend the chain. Tightened to
+        # additionally require the config's own is_linear_attn flag, so a real
+        # KimiLinear hf_config must carry a populated linear_attn_config dict.
+        from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
+
+        cfg = KimiLinearConfig(
+            num_hidden_layers=2,
+            linear_attn_config={
+                "kda_layers": [2],
+                "full_attn_layers": [1],
+            },
+        )
+        runner = self._runner_with_hf(cfg)
+        assert runner.linear_recurrent_config is cfg
+
+    def test_linear_recurrent_config_none_for_degenerate_kimi_linear(self):
+        # KimiLinearConfig type matches but linear_attn_config is None →
+        # is_linear_attn is False → linear_recurrent_config must be None.
+        # Without this gating the umbrella detector would say "hybrid" while
+        # init_memory_pool would skip the hybrid pool, leaving the runtime
+        # in an inconsistent state at first forward.
         from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 
         cfg = KimiLinearConfig(num_hidden_layers=2)
         runner = self._runner_with_hf(cfg)
-        assert runner.linear_recurrent_config is cfg
+        assert runner.kimi_linear_config is cfg  # type still matches
+        assert runner.linear_recurrent_config is None  # but flag is False
 
     def test_linear_recurrent_config_none_when_no_hybrid(self):
         runner = self._runner_with_hf(object())
