@@ -10,7 +10,7 @@ from sgl_jax.srt.model_loader import get_model_loader
 from sgl_jax.srt.models.kimi_linear import KimiLinearForCausalLM
 from sgl_jax.test.test_utils import create_device_mesh
 
-MODEL_PATH = "/models/Kimi-Linear-48B-A3B-Instruct"
+MODEL_PATH = "/Kimi-Linear-48B-A3B-Instruct"
 
 
 class TestKimiLinear(unittest.TestCase):
