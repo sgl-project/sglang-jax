@@ -182,19 +182,25 @@ class TestPenalty(CustomTestCase):
             max_tokens=60,
         )
 
-    def test_server_alive(self):
-        """Sanity check: server is up and /v1/chat/completions responds."""
-        resp = requests.post(
-            self.base_url + "/v1/chat/completions",
-            json={
-                "model": self.model,
-                "messages": [{"role": "user", "content": "Say hi."}],
-                "max_tokens": 8,
-                "temperature": 0.0,
-            },
+    def test_penalty_edge_cases_extreme_penalty_values(self):
+        """Extreme penalty values should strongly reduce repetition."""
+        prompt = "Write the word 'extreme' exactly 20 times in a row, separated by spaces."
+        baseline_params = {
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+        }
+        extreme_penalty_params = {
+            "frequency_penalty": 2.0,
+            "presence_penalty": 2.0,
+        }
+        self._test_penalty_effect(
+            prompt,
+            baseline_params,
+            extreme_penalty_params,
+            "extreme",
+            expected_reduction=True,
+            max_tokens=80,
         )
-        self.assertEqual(resp.status_code, 200)
-        self.assertIn("choices", resp.json())
 
 
 if __name__ == "__main__":
