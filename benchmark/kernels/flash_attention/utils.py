@@ -98,7 +98,7 @@ def create_prefill_uniform_data(
     )
 
     num_seqs = jnp.array([batch_size], dtype=jnp.int32)
-    distribution = jnp.array([0, 0, batch_size], dtype=jnp.int32)
+    distribution = jnp.array([0, batch_size, batch_size], dtype=jnp.int32)
     return (
         q,
         k,
