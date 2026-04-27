@@ -47,12 +47,13 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         )
         q_state, k_state, v_state = self._unpack_conv_states(conv_states)
 
-        q_conv_w, k_conv_w, v_conv_w = layer.conv_weights
-        # LinearBase stores weights as [in_features=K, out_features=D]; the
-        # short conv kernel expects depthwise layout [D, K], so transpose.
-        q_conv_w = self._reshape_conv_kernel(q_conv_w)
-        k_conv_w = self._reshape_conv_kernel(k_conv_w)
-        v_conv_w = self._reshape_conv_kernel(v_conv_w)
+        # Conv weights are stored directly in depthwise ``[D, K]`` layout —
+        # the format ``short_convolution`` consumes — so no reshape needed.
+        # Reading ``.value`` keeps us tied to the live nnx.Param so checkpoint
+        # loads done after backend construction are picked up automatically.
+        q_conv_w = layer.q_conv1d.weight.value
+        k_conv_w = layer.k_conv1d.weight.value
+        v_conv_w = layer.v_conv1d.weight.value
         cu_q_lens = self.forward_metadata.cu_q_lens
         q, q_state_new = short_convolution(
             q,
@@ -101,6 +102,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 ssm_states,
                 cu_q_lens,
                 layer,
+                scale=layer.scale,
             )
         elif forward_batch.forward_mode == ForwardMode.DECODE:
             output, new_recurrent = self._forward_decode(
@@ -111,6 +113,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 b,
                 ssm_states,
                 layer,
+                scale=layer.scale,
             )
         else:
             raise NotImplementedError(f"KDA does not support {forward_batch.forward_mode}")
@@ -146,10 +149,15 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         initial_state: jax.Array,
         cu_seqlens: jax.Array,
         layer: RadixLinearAttention,
+        scale: float | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         if self.use_pallas_prefill:
-            return self._forward_extend_pallas(q, k, v, g, beta, initial_state, cu_seqlens, layer)
-        return self._forward_extend_naive(q, k, v, g, beta, initial_state, cu_seqlens, layer)
+            return self._forward_extend_pallas(
+                q, k, v, g, beta, initial_state, cu_seqlens, layer, scale=scale
+            )
+        return self._forward_extend_naive(
+            q, k, v, g, beta, initial_state, cu_seqlens, layer, scale=scale
+        )
 
     def _forward_extend_pallas(
         self,
@@ -161,6 +169,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         initial_state: jax.Array,
         cu_seqlens: jax.Array,
         layer: RadixLinearAttention,
+        scale: float | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         """Chunked prefill via Pallas kernel.  Returns (output, new_state)."""
         if layer.A_log is None or layer.dt_bias is None:
@@ -172,13 +181,13 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             v[None, ...],
             g[None, ...],
             beta[None, ...],
-            scale=self._get_scale(layer),
+            scale=scale,
             initial_state=initial_state,
             output_final_state=True,
             cu_seqlens=cu_seqlens,
             use_gate_in_kernel=True,
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
+            A_log=layer.A_log.value,
+            dt_bias=layer.dt_bias.value,
         )
         # Remove the B=1 packed dim: [1, T, H, V] -> [T, H, V]
         return o[0], final_state
@@ -193,6 +202,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         initial_state: jax.Array,
         cu_seqlens: jax.Array,
         layer: RadixLinearAttention,
+        scale: float | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         """Prefill fallback via naive recurrent kernel."""
         g = self._fused_kda_gate(layer, g)
@@ -203,7 +213,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 v[None, ...],
                 g[None, ...],
                 beta[None, ...],
-                scale=self._get_scale(layer),
+                scale=scale,
                 initial_state=initial_state,
                 output_final_state=True,
             )
@@ -216,7 +226,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             v_b,
             g_b,
             beta_b,
-            scale=self._get_scale(layer),
+            scale=scale,
             initial_state=initial_state,
             output_final_state=True,
         )
@@ -231,6 +241,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         beta: jax.Array,
         initial_state: jax.Array,
         layer: RadixLinearAttention,
+        scale: float | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         """Single-step decode via naive JAX recurrence.  Returns (output, new_state)."""
         g = self._fused_kda_gate(layer, g)
@@ -241,7 +252,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             v[:, None, ...],
             g[:, None, ...],
             beta[:, None, ...],
-            scale=self._get_scale(layer),
+            scale=scale,
             initial_state=initial_state,
             output_final_state=True,
         )
@@ -257,8 +268,8 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             raise ValueError("KDA gate activation requires layer.A_log and layer.dt_bias")
         H = g.shape[-2]
         orig_dtype = g.dtype
-        g32 = g.astype(jnp.float32) + layer.dt_bias.reshape(H, -1).astype(jnp.float32)
-        out = -jnp.exp(layer.A_log.reshape(H, 1).astype(jnp.float32)) * jax.nn.softplus(g32)
+        g32 = g.astype(jnp.float32) + layer.dt_bias.value.reshape(H, -1).astype(jnp.float32)
+        out = -jnp.exp(layer.A_log.value.reshape(H, 1).astype(jnp.float32)) * jax.nn.softplus(g32)
         return out.astype(orig_dtype)
 
     @staticmethod
@@ -310,22 +321,6 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             return tuple(conv_states)
         # Expect [B, 3, C, K] stacked layout.
         return conv_states[:, 0], conv_states[:, 1], conv_states[:, 2]
-
-    @staticmethod
-    def _reshape_conv_kernel(weight: jax.Array) -> jax.Array:
-        """Coerce a conv weight to the depthwise [D, K] layout.
-
-        ``LinearBase`` stores weights as ``[in_features, out_features]``; for
-        the conv1d projections that means ``[K, D]`` (kernel size, channels).
-        ``short_convolution`` expects channels-first ``[D, K]``, so we
-        transpose. The ``[D, 1, K]`` PyTorch layout is passed through —
-        ``short_convolution`` squeezes the singleton axis itself.
-        """
-        if weight.ndim == 3 and weight.shape[1] == 1:
-            return weight
-        if weight.ndim != 2:
-            raise ValueError(f"conv weight must be rank 2 or [D, 1, K]; got shape {weight.shape}")
-        return jnp.swapaxes(weight, 0, 1)
 
 
 __all__ = ["KDAAttnBackend"]

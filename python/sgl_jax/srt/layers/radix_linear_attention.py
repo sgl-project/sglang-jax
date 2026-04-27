@@ -8,6 +8,7 @@ import jax
 from flax import nnx
 
 if TYPE_CHECKING:
+    from sgl_jax.srt.layers.linear import LinearBase
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -21,12 +22,14 @@ class RadixLinearAttention(nnx.Module):
         head_q_dim: int,
         head_k_dim: int,
         head_v_dim: int,
-        conv_weights: tuple[jax.Array, jax.Array, jax.Array] | None = None,
+        q_conv1d: LinearBase | None = None,
+        k_conv1d: LinearBase | None = None,
+        v_conv1d: LinearBase | None = None,
         bias: jax.Array | None = None,
         activation=None,
-        A_log: jax.Array | None = None,
-        dt_bias: jax.Array | None = None,
-        scaling: float | None = None,
+        A_log: nnx.Param | None = None,
+        dt_bias: nnx.Param | None = None,
+        scale: float | None = None,
     ):
         self.layer_id = layer_id
         self.num_q_heads = num_q_heads
@@ -35,12 +38,19 @@ class RadixLinearAttention(nnx.Module):
         self.head_q_dim = head_q_dim
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
-        self.conv_weights = conv_weights
-        self.bias = bias
+        # LinearBase / nnx.Param references — the live containers, not
+        # ``param[...]`` snapshots, so checkpoint loads done after construction
+        # propagate automatically. The conv1d LinearBases are used as parameter
+        # containers only (never called); their ``weight.value`` is laid out
+        # directly as ``[D, K]`` for ``short_convolution``.
+        self.q_conv1d = q_conv1d
+        self.k_conv1d = k_conv1d
+        self.v_conv1d = v_conv1d
+        self.bias = nnx.data(bias) if bias is not None else None
         self.activation = activation
         self.A_log = A_log
         self.dt_bias = dt_bias
-        self.scaling = scaling
+        self.scale = scale if scale is not None else head_v_dim**-0.5
 
     def __call__(
         self,

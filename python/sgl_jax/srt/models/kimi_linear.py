@@ -43,35 +43,64 @@ class KimiDeltaAttention(nnx.Module):
         self.rms_norm_eps = getattr(config, "rms_norm_eps", 1e-6)
 
         self.q_proj = LinearBase(
-            self.hidden_size, self.projection_k_size, mesh,
-            use_bias=False, params_dtype=dtype,
-            kernel_axes=(None, "tensor"), scope_name="q_proj",
+            self.hidden_size,
+            self.projection_k_size,
+            mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=(None, "tensor"),
+            scope_name="q_proj",
         )
         self.k_proj = LinearBase(
-            self.hidden_size, self.projection_k_size, mesh,
-            use_bias=False, params_dtype=dtype,
-            kernel_axes=(None, "tensor"), scope_name="k_proj",
+            self.hidden_size,
+            self.projection_k_size,
+            mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=(None, "tensor"),
+            scope_name="k_proj",
         )
         self.v_proj = LinearBase(
-            self.hidden_size, self.projection_size, mesh,
-            use_bias=False, params_dtype=dtype,
-            kernel_axes=(None, "tensor"), scope_name="v_proj",
+            self.hidden_size,
+            self.projection_size,
+            mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=(None, "tensor"),
+            scope_name="v_proj",
         )
 
+        # Depthwise short-conv weights stored in ``[D, K]`` directly — that's
+        # the layout ``short_convolution`` consumes. We use LinearBase only as
+        # a parameter container (never call it); ``input_size=D``,
+        # ``output_size=K`` makes ``weight.value`` ship out as ``[D, K]`` with
+        # D sharded across "tensor".
         self.q_conv1d = LinearBase(
-            self.conv_size, self.projection_k_size, mesh,
-            use_bias=False, params_dtype=dtype,
-            kernel_axes=(None, "tensor"), scope_name="q_conv1d",
+            self.projection_k_size,
+            self.conv_size,
+            mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=("tensor", None),
+            scope_name="q_conv1d",
         )
         self.k_conv1d = LinearBase(
-            self.conv_size, self.projection_k_size, mesh,
-            use_bias=False, params_dtype=dtype,
-            kernel_axes=(None, "tensor"), scope_name="k_conv1d",
+            self.projection_k_size,
+            self.conv_size,
+            mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=("tensor", None),
+            scope_name="k_conv1d",
         )
         self.v_conv1d = LinearBase(
-            self.conv_size, self.projection_size, mesh,
-            use_bias=False, params_dtype=dtype,
-            kernel_axes=(None, "tensor"), scope_name="v_conv1d",
+            self.projection_size,
+            self.conv_size,
+            mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=("tensor", None),
+            scope_name="v_conv1d",
         )
 
         self.A_log = nnx.Param(jnp.zeros((1, 1, self.num_heads, 1), dtype=jnp.float32))
@@ -87,14 +116,22 @@ class KimiDeltaAttention(nnx.Module):
             scope_name="f_a_proj",
         )
         self.f_b_proj = LinearBase(
-            self.head_dim, self.projection_size, mesh,
-            use_bias=False, params_dtype=dtype,
-            kernel_axes=(None, "tensor"), scope_name="f_b_proj",
+            self.head_dim,
+            self.projection_size,
+            mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=(None, "tensor"),
+            scope_name="f_b_proj",
         )
         self.b_proj = LinearBase(
-            self.hidden_size, self.num_heads, mesh,
-            use_bias=False, params_dtype=dtype,
-            kernel_axes=(None, "tensor"), scope_name="b_proj",
+            self.hidden_size,
+            self.num_heads,
+            mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=(None, "tensor"),
+            scope_name="b_proj",
         )
         self.g_a_proj = LinearBase(
             self.hidden_size,
@@ -106,15 +143,23 @@ class KimiDeltaAttention(nnx.Module):
             scope_name="g_a_proj",
         )
         self.g_b_proj = LinearBase(
-            self.head_dim, self.projection_size, mesh,
-            use_bias=False, params_dtype=dtype,
-            kernel_axes=(None, "tensor"), scope_name="g_b_proj",
+            self.head_dim,
+            self.projection_size,
+            mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=(None, "tensor"),
+            scope_name="g_b_proj",
         )
         self.o_norm = GatedRMSNorm(self.head_dim, epsilon=self.rms_norm_eps)
         self.o_proj = LinearBase(
-            self.projection_size, self.hidden_size, mesh,
-            use_bias=False, params_dtype=dtype,
-            kernel_axes=("tensor", None), scope_name="o_proj",
+            self.projection_size,
+            self.hidden_size,
+            mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=("tensor", None),
+            scope_name="o_proj",
         )
 
         self.attn = RadixLinearAttention(
@@ -125,15 +170,13 @@ class KimiDeltaAttention(nnx.Module):
             head_q_dim=self.k_head_dim,
             head_k_dim=self.k_head_dim,
             head_v_dim=self.v_head_dim,
-            conv_weights=(
-                self.q_conv1d.weight[...],
-                self.k_conv1d.weight[...],
-                self.v_conv1d.weight[...],
-            ),
+            q_conv1d=self.q_conv1d,
+            k_conv1d=self.k_conv1d,
+            v_conv1d=self.v_conv1d,
             bias=None,
             activation=jax.nn.silu,
-            A_log=self.A_log[...],
-            dt_bias=self.dt_bias[...],
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
         )
 
     def __call__(
