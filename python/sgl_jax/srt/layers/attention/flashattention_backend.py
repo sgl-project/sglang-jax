@@ -512,7 +512,6 @@ class FlashAttention(AttentionBackend):
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
                 ),
                 softmax_dtype=layer.softmax_dtype,
-                vmem_limit_bytes=self.vmem_limit_bytes,
             )
 
             return result, updated_kv_cache_fused

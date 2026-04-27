@@ -357,6 +357,7 @@ def _ragged_paged_attention_kernel_loop(
     k_scale: float | None = None,
     v_scale: float | None = None,
     xai_temperature_len: float | None = None,
+    softmax_dtype: jnp.dtype | None = None,
     static_q_len: int | None = None,
     bq_sz,  # bq fetch size
     bkv_sz,  # bkv prefetch size
@@ -507,6 +508,9 @@ def _ragged_paged_attention_kernel_loop(
 
         if mask is not None:
             s = jnp.where(mask, s, mask_value)
+
+        if softmax_dtype is not None:
+            s = s.astype(softmax_dtype)
 
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
         m_prev = m_ref[...].astype(jnp.float32)
@@ -1646,6 +1650,7 @@ def ragged_paged_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     xai_temperature_len: float | None = None,
+    softmax_dtype: jnp.dtype | None = None,
     chunk_prefill_size: int | None = None,
     d_block_sizes: tuple[int, int, int, int] | None = None,
     p_block_sizes: tuple[int, int, int, int] | None = None,
@@ -1872,6 +1877,7 @@ def ragged_paged_attention(
                 k_scale=k_scale,
                 v_scale=v_scale,
                 xai_temperature_len=xai_temperature_len,
+                softmax_dtype=softmax_dtype,
                 static_q_len=static_q_len,
                 bq_sz=bq_sz,
                 bkv_sz=bkv_sz,
