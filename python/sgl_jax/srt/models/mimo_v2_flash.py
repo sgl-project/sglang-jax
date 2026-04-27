@@ -19,16 +19,13 @@ from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK, create_moe_weights_ma
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils.weight_utils import (
-    WeightLoader,
-    WeightMapping,
-    replicate_kv_heads,
-)
+from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
 
 class MiMoV2MLP(nnx.Module):
+
     def __init__(
         self,
         hidden_size: int,
@@ -73,6 +70,7 @@ class MiMoV2MLP(nnx.Module):
 
 
 class MiMoV2Moe(nnx.Module):
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -148,6 +146,7 @@ class MiMoV2Moe(nnx.Module):
 
 
 class MiMoV2Attention(nnx.Module):
+
     def __init__(
         self,
         hidden_size: int,
@@ -292,6 +291,7 @@ class MiMoV2Attention(nnx.Module):
 
 
 class MiMoV2DecoderLayer(nnx.Module):
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -425,6 +425,7 @@ class MiMoV2DecoderLayer(nnx.Module):
 
 
 class MiMoV2Model(nnx.Module):
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -482,6 +483,7 @@ class MiMoV2Model(nnx.Module):
 
 
 class MiMoV2FlashForCausalLM(nnx.Module):
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -493,7 +495,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         self.dtype = dtype
         self.model = MiMoV2Model(config, dtype=self.dtype, mesh=mesh)
         # Buffer to hold raw FP8 K/V weights+scales for per-head fused dequant.
-        # Populated during weight loading, consumed by _dequant_fused_kv_heads.
+        # Populated during weight loading, consumed by WeightLoader.dequant_fused_kv().
         self._kv_buffers: dict[int, dict] = {}
 
         if not getattr(self.config, "tie_word_embeddings", True):
@@ -508,7 +510,11 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
 
     def load_weights(self, model_config: ModelConfig):
-        loader = WeightLoader(
+        # Pre-warm GCSFuse cache: sequential read of large safetensors files
+        # dramatically speeds up subsequent random-access MoE expert loading.
+        self._warmup_safetensors_cache(model_config)
+
+        self.loader = WeightLoader(
             model=self,
             model_config=model_config,
             mesh=self.mesh,
@@ -516,386 +522,78 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         )
         self._quant_config = model_config.quantization_config
         weight_mappings = self._create_weight_mappings()
-        loader.load_weights_from_safetensors(weight_mappings)
+        self.loader.load_weights_from_safetensors(weight_mappings)
         logger.info("MiMoV2Flash weights loaded successfully!")
 
         # Post-load: dequantize FP8 attention + layer-0 MLP to bf16.
-        # Q/K head_dim padding (192→256) is handled by the kernel internally.
-        if self._is_static_quant:
-            self._dequantize_fp8_to_bf16()
-            # K+V: fused per-head dequant (cross K/V boundary blocks)
-            self._dequant_fused_kv_heads()
-            # KV head replication for TP alignment (after K/V are bf16 LinearBase)
-            self._ensure_kv_head_replication()
+        if self.loader.is_static_quant:
+            head_dim = self.config.head_dim
+            v_head_dim = getattr(self.config, "v_head_dim", head_dim)
+            # 1. Dequant Q only (K/V go through fused KV path via _kv_buffers)
+            self.loader.dequant_fp8_layers(
+                self.model.layers,
+                specs=[("self_attn.q_proj", head_dim)],
+            )
+            # 2. Fused KV per-head dequant (cross K/V boundary blocks)
+            self.loader.dequant_fused_kv(self._kv_buffers, self.model.layers, self.config)
+            # 3. Layer-0 dense MLP
+            self.loader.dequant_fp8_layers(
+                self.model.layers,
+                specs=[
+                    ("mlp.gate_proj", None),
+                    ("mlp.up_proj", None),
+                    ("mlp.down_proj", None),
+                ],
+                layer_filter=lambda idx, layer: idx == 0 and not layer.is_layer_sparse,
+            )
+            # 4. KV head replication for TP alignment
+            self.loader.replicate_kv_heads(
+                self.model.layers,
+                specs=[("self_attn.k_proj", head_dim), ("self_attn.v_proj", v_head_dim)],
+                target_kv_heads_fn=lambda attn: attn.k_head_num,
+            )
 
-    def _is_quant_ignored(self, hf_path: str) -> bool:
-        """Check if a HuggingFace weight path is in the quantization ignored_layers list."""
-        quant_cfg = getattr(self, "_quant_config", None)
-        if quant_cfg is None or not quant_cfg.is_static_checkpoint:
-            return True  # not quantized at all
-        ignored = quant_cfg.ignored_layers or []
-        return any(hf_path == ig or hf_path.endswith(f".{ig}") for ig in ignored)
+    @staticmethod
+    def _warmup_safetensors_cache(model_config: ModelConfig):
+        """Pre-read safetensors files to warm GCSFuse cache.
 
-    @property
-    def _is_static_quant(self) -> bool:
-        quant_cfg = getattr(self, "_quant_config", None)
-        return quant_cfg is not None and quant_cfg.is_static_checkpoint
-
-    # ------------------------------------------------------------------
-    # Post-load transforms: dequantize FP8 → BF16, pad head dims
-    # ------------------------------------------------------------------
-
-    def _dequantize_quantized_linear(self, ql, head_dim=None) -> LinearBase:
-        """Dequantize a single QuantizedLinear to bf16 LinearBase.
-
-        weight_q may be in HF layout [out, in] or model layout [in, out]
-        depending on the transpose flag used during loading.
-        weight_scale is in kernel-ready 3D layout [in_blocks, 1, out_dim].
-
-        Handles kv_head_padding: when weight_q has been replicated along the
-        output axis (e.g. 4 kv_heads → 16 for TP), the scale only covers the
-        original (unreplicated) output dimension.  We extract one copy of the
-        original heads, dequantize, then re-replicate in bf16.
-
-        Args:
-            head_dim: If set, enables per-head block quant handling. Required
-                when head_dim % block_size != 0 (e.g., head_dim=192 with
-                block_size=128), as the HF checkpoint uses per-head block
-                boundaries instead of uniform blocks.
+        GCSFuse random reads are ~400ms per tensor (cold) vs ~1ms (warm).
+        Sequential bulk read fills the cache so MoE loading uses warm reads.
         """
-        weight_q = ql.weight_q.value
-        weight_scale = ql.weight_scale.value
-        logger.info(
-            "Dequant debug: weight_q.shape=%s weight_scale.shape=%s kernel_axes=%s head_dim=%s",
-            weight_q.shape,
-            weight_scale.shape,
-            ql.kernel_axes,
-            head_dim,
-        )
+        import glob
+        import os
+        from concurrent.futures import ThreadPoolExecutor
 
-        if weight_scale.ndim == 3:
-            weight_bf16 = self._block_dequant(weight_q, weight_scale, head_dim=head_dim)
-        elif weight_scale.ndim == 2:
-            # 2D block-quant scale: (out_blocks, in_blocks) in HF layout.
-            # Expand to 3D kernel-ready (in_blocks, 1, out_dim) then reuse _block_dequant.
-            from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
-                expand_block_scale,
-            )
-
-            # Determine out_dim: weight_q is (in, out) model layout or (out, in) HF layout.
-            _, in_blocks = weight_scale.shape
-            out_dim = weight_q.shape[1] if weight_q.shape[0] % in_blocks == 0 else weight_q.shape[0]
-            block_size_out = 128
-            scale_3d = expand_block_scale(weight_scale, out_dim, block_size_out)
-            weight_bf16 = self._block_dequant(weight_q, scale_3d, head_dim=head_dim)
-        elif weight_scale.ndim == 1:
-            out_dim = weight_scale.shape[0]
-            if weight_q.shape[1] == out_dim:
-                weight_bf16 = (weight_q.astype(jnp.float32) * weight_scale[None, :]).astype(
-                    jnp.bfloat16
-                )
-            else:
-                weight_bf16 = (
-                    jnp.transpose(weight_q).astype(jnp.float32) * weight_scale[None, :]
-                ).astype(jnp.bfloat16)
-        else:
-            raise ValueError(f"Unexpected weight_scale ndim={weight_scale.ndim}")
-
-        # weight_bf16 is now in model layout [in, out]
-        in_features, out_features = weight_bf16.shape
-
-        with jax.set_mesh(ql.mesh):
-            new_linear = LinearBase(
-                input_size=in_features,
-                output_size=out_features,
-                kernel_axes=ql.kernel_axes,
-                use_bias=ql.bias is not None,
-                params_dtype=jnp.bfloat16,
-                mesh=ql.mesh,
-            )
-            new_linear.weight = nnx.Param(weight_bf16)
-            if ql.bias is not None:
-                new_linear.bias = nnx.Param(ql.bias.value.astype(jnp.bfloat16))
-        return new_linear
-
-    def _block_dequant(
-        self, weight_q: jax.Array, weight_scale: jax.Array, head_dim: int | None = None
-    ) -> jax.Array:
-        """Block-dequantize weight_q using 3D scale [in_blocks, 1, out_dim].
-
-        Returns bf16 weight in model layout [in_dim, out_dim].
-        Handles kv_head_padding where weight_q is larger than scale coverage
-        by tiling the scale to match.
-
-        Args:
-            head_dim: If set, enables per-head block quant handling when scale
-                out_dim doesn't match weight dims. The scale is re-indexed using
-                per-head block boundaries instead of uniform block mapping.
-        """
-        import math
-
-        in_blocks = weight_scale.shape[0]
-        out_dim = weight_scale.shape[2]
-
-        # Detect layout and kv-padding
-        dim0, dim1 = weight_q.shape
-
-        if dim1 == out_dim:
-            # Model layout [in, out], no kv-padding
-            pass
-        elif dim0 == out_dim:
-            # HF layout [out, in] — transpose to model layout
-            weight_q = jnp.transpose(weight_q)
-        elif head_dim is not None and dim1 != out_dim and dim0 != out_dim:
-            # Per-head block quant: scale was expanded for wrong n_out.
-            # Determine layout: in_dim must be divisible by in_blocks.
-            if dim0 % in_blocks == 0:
-                actual_out = dim1  # model layout [in, out]
-            else:
-                weight_q = jnp.transpose(weight_q)
-                actual_out = dim0  # was HF layout [out, in]
-
-            # Re-index scale using per-head block boundaries.
-            # The wrongly-expanded scale has uniform block mapping (ch // 128),
-            # but we need per-head mapping where each head's blocks are independent.
-            block_size = out_dim // (out_dim // 128) if out_dim >= 128 else 128
-            block_size = 128  # from weight_block_size config
-            blocks_per_head = math.ceil(head_dim / block_size)
-            num_heads = actual_out // head_dim
-
-            # Build gather index: for each output channel, find the corresponding
-            # channel in the uniformly-expanded scale that has the correct block's value.
-            gather_idx = jnp.array(
-                [
-                    ((j // head_dim) * blocks_per_head + (j % head_dim) // block_size) * block_size
-                    for j in range(actual_out)
-                ]
-            )
-            weight_scale = weight_scale[:, :, gather_idx]  # (in_blocks, 1, actual_out)
-            out_dim = actual_out
-
-            logger.info(
-                "Per-head block dequant: %d heads × head_dim=%d, %d blocks/head, "
-                "remapped scale to (%s)",
-                num_heads,
-                head_dim,
-                blocks_per_head,
-                weight_scale.shape,
-            )
-        elif dim1 > out_dim and dim1 % out_dim == 0:
-            # Model layout [in, kv_padded_out] — tile scale to match
-            kv_replicas = dim1 // out_dim
-            weight_scale = jnp.tile(weight_scale, (1, 1, kv_replicas))
-            out_dim = dim1
-            logger.info(
-                "Detected kv_head_padding: tiling scale %dx to match %d out channels",
-                kv_replicas,
-                out_dim,
-            )
-        elif dim0 > out_dim and dim0 % out_dim == 0:
-            # HF layout [kv_padded_out, in] — transpose and tile scale
-            kv_replicas = dim0 // out_dim
-            weight_q = jnp.transpose(weight_q)
-            weight_scale = jnp.tile(weight_scale, (1, 1, kv_replicas))
-            out_dim = weight_q.shape[1]
-            logger.info(
-                "Detected kv_head_padding (HF layout): tiling scale %dx to match %d out channels",
-                kv_replicas,
-                out_dim,
-            )
-        else:
-            raise ValueError(
-                f"Cannot match weight_q shape {weight_q.shape} with scale out_dim={out_dim}"
-            )
-
-        # weight_q is now [in_dim, out_dim] in model layout
-        in_dim = weight_q.shape[0]
-        block_k = in_dim // in_blocks
-        weight_f = weight_q.astype(jnp.float32).reshape(in_blocks, block_k, out_dim)
-        weight_bf16 = (weight_f * weight_scale).reshape(in_dim, out_dim).astype(jnp.bfloat16)
-
-        return weight_bf16
-
-    def _dequantize_fp8_to_bf16(self):
-        """Dequantize FP8 QuantizedLinear → bf16 LinearBase.
-
-        Targets:
-        - All layers: self_attn.q_proj, k_proj, v_proj
-        - Layer 0: mlp.gate_proj, up_proj, down_proj (dense MLP only)
-        """
-        from sgl_jax.srt.layers.linear import QuantizedLinear
-
-        for layer_idx, layer in enumerate(self.model.layers):
-            attn = layer.self_attn
-            # Only Q and o_proj go through QuantizedLinear path.
-            # K/V are handled by _dequant_fused_kv_heads (per-head fused dequant).
-            for proj_name in ("q_proj",):
-                proj = getattr(attn, proj_name)
-                if isinstance(proj, QuantizedLinear):
-                    hd = attn.head_dim
-                    setattr(attn, proj_name, self._dequantize_quantized_linear(proj, head_dim=hd))
-                    logger.info("Dequantized layer %d %s → bf16", layer_idx, proj_name)
-
-            # Layer 0 dense MLP
-            if layer_idx == 0 and not layer.is_layer_sparse:
-                for proj_name in ("gate_proj", "up_proj", "down_proj"):
-                    proj = getattr(layer.mlp, proj_name)
-                    if isinstance(proj, QuantizedLinear):
-                        setattr(layer.mlp, proj_name, self._dequantize_quantized_linear(proj))
-                        logger.info("Dequantized layer 0 MLP %s → bf16", proj_name)
-
-        logger.info("FP8 → BF16 dequantization complete.")
-
-    def _ensure_kv_head_replication(self):
-        """Replicate KV heads for TP alignment when the weight loader missed them."""
-        attn = self.model.layers[0].self_attn
-        replicate_kv_heads(
-            layers=self.model.layers,
-            mesh=self.mesh,
-            head_dim=attn.head_dim,
-            v_head_dim=attn.v_head_dim,
-            target_kv_heads=attn.k_head_num,
-        )
-
-    def _uniform_block_dequant(self, weight, scale, block_size):
-        """Simple uniform block dequant for weight[out_dim, in_dim] * scale[out_blocks, in_blocks].
-
-        Used for layers where K/V are quantized uniformly across all heads
-        (no cross-boundary scale sharing between K and V).
-        """
-        out_dim, in_dim = weight.shape
-        out_blocks = scale.shape[0]
-        padded_out = out_blocks * block_size
-        in_blocks = scale.shape[1]
-        if padded_out > out_dim:
-            weight = jnp.pad(weight, ((0, padded_out - out_dim), (0, 0)))
-        w_4d = weight.astype(jnp.float32).reshape(out_blocks, block_size, in_blocks, block_size)
-        s_4d = scale[:, None, :, None]
-        result = (w_4d * s_4d).reshape(padded_out, in_dim)[:out_dim, :].astype(jnp.bfloat16)
-        return result
-
-    def _dequant_fused_kv_heads(self):
-        """Dequantize FP8 K+V weights with per-layer quantization scheme detection.
-
-        Different layers may use different quantization schemes:
-        - Per-head fused: K+V quantized as fused [K(head_dim), V(v_head_dim)] per KV head.
-          Block boundaries cross K/V boundary, so they must be fused for correct dequant.
-          Signature: k_scale_blocks == num_kv_heads * ceil(head_dim/block_size)
-        - Uniform: K and V quantized independently across the whole tensor.
-          No cross-boundary issue, can dequant K and V separately.
-          Signature: k_scale_blocks == ceil(num_kv_heads * head_dim / block_size)
-        """
-        import math
-
-        from jax.sharding import NamedSharding
-
-        kv_buffers = self._kv_buffers
-        if not kv_buffers:
+        model_path = model_config.model_path
+        st_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+        if not st_files:
             return
 
-        head_dim = self.config.head_dim
-        v_head_dim = getattr(self.config, "v_head_dim", head_dim)
-        quant_cfg = getattr(self, "_quant_config", None)
-        block_size = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
+        total_size = sum(os.path.getsize(f) for f in st_files)
+        logger.info(
+            "Warming up GCSFuse cache: %d files, %.1f GB",
+            len(st_files),
+            total_size / 1024**3,
+        )
 
-        fused_dim = head_dim + v_head_dim
-        blocks_per_head = math.ceil(fused_dim / block_size)
-        padded_dim = blocks_per_head * block_size
-        k_blocks_per_head = math.ceil(head_dim / block_size)
-        v_blocks_per_head = blocks_per_head - k_blocks_per_head
+        def _read_file(path):
+            """Read file sequentially to populate GCSFuse cache."""
+            buf = bytearray(4 * 1024 * 1024)  # 4MB buffer
+            with open(path, "rb") as f:
+                while f.readinto(buf):
+                    pass
 
-        tp_sharding = NamedSharding(self.mesh, P(None, "tensor"))
+        import time
 
-        for layer_idx in sorted(kv_buffers.keys()):
-            buf = kv_buffers[layer_idx]
-            k_weight = buf["k_weight"]
-            k_scale = buf["k_scale"]
-            v_weight = buf["v_weight"]
-            v_scale = buf["v_scale"]
-
-            in_dim = k_weight.shape[1]
-            in_blocks = in_dim // block_size
-
-            # Per-layer num_kv_heads from actual weight shape
-            num_kv_heads = k_weight.shape[0] // head_dim
-            k_scale_blocks = k_scale.shape[0]
-
-            # Detect quantization scheme for this layer
-            expected_per_head = num_kv_heads * k_blocks_per_head
-            expected_uniform = math.ceil(num_kv_heads * head_dim / block_size)
-            is_per_head = (
-                k_scale_blocks == expected_per_head and expected_per_head != expected_uniform
-            )
-
-            if is_per_head:
-                # Per-head fused: K+V must be fused because scale blocks cross K/V boundary
-                k_w = k_weight.reshape(num_kv_heads, head_dim, in_dim)
-                v_w = v_weight.reshape(num_kv_heads, v_head_dim, in_dim)
-                k_s = k_scale.reshape(num_kv_heads, k_blocks_per_head, in_blocks)
-                v_s = v_scale.reshape(num_kv_heads, v_blocks_per_head, in_blocks)
-                fused_w = jnp.concatenate([k_w, v_w], axis=1)
-                fused_s = jnp.concatenate([k_s, v_s], axis=1)
-                if fused_dim < padded_dim:
-                    fused_w = jnp.pad(fused_w, ((0, 0), (0, padded_dim - fused_dim), (0, 0)))
-                fused_5d = fused_w.astype(jnp.float32).reshape(
-                    num_kv_heads, blocks_per_head, block_size, in_blocks, block_size
-                )
-                scale_5d = fused_s[:, :, None, :, None]
-                dequanted = (
-                    (fused_5d * scale_5d)
-                    .reshape(num_kv_heads, padded_dim, in_dim)[:, :fused_dim, :]
-                    .astype(jnp.bfloat16)
-                )
-                k_bf16 = dequanted[:, :head_dim, :].reshape(num_kv_heads * head_dim, in_dim)
-                v_bf16 = dequanted[:, head_dim:, :].reshape(num_kv_heads * v_head_dim, in_dim)
-            else:
-                # Uniform: K and V can be dequanted independently
-                k_bf16 = self._uniform_block_dequant(k_weight, k_scale, block_size)
-                v_bf16 = self._uniform_block_dequant(v_weight, v_scale, block_size)
-
-            # Transpose [out, in] → [in, out], shard, replace
-            k_bf16 = jax.device_put(jnp.transpose(k_bf16), tp_sharding)
-            v_bf16 = jax.device_put(jnp.transpose(v_bf16), tp_sharding)
-
-            attn = self.model.layers[layer_idx].self_attn
-            in_k, out_k = k_bf16.shape
-            in_v, out_v = v_bf16.shape
-
-            with jax.set_mesh(self.mesh):
-                k_linear = LinearBase(
-                    input_size=in_k,
-                    output_size=out_k,
-                    kernel_axes=(None, "tensor"),
-                    use_bias=False,
-                    params_dtype=jnp.bfloat16,
-                    mesh=self.mesh,
-                )
-                k_linear.weight = nnx.Param(k_bf16)
-                attn.k_proj = k_linear
-
-                v_linear = LinearBase(
-                    input_size=in_v,
-                    output_size=out_v,
-                    kernel_axes=(None, "tensor"),
-                    use_bias=False,
-                    params_dtype=jnp.bfloat16,
-                    mesh=self.mesh,
-                )
-                v_linear.weight = nnx.Param(v_bf16)
-                attn.v_proj = v_linear
-
-            if layer_idx % 10 == 0 or layer_idx == 0:
-                logger.info(
-                    "Layer %d KV dequant: %s, heads=%d, K=%s V=%s",
-                    layer_idx,
-                    "per-head" if is_per_head else "uniform",
-                    num_kv_heads,
-                    k_bf16.shape,
-                    v_bf16.shape,
-                )
-
-        kv_buffers.clear()
-        logger.info("FP8 KV dequantization complete for all layers.")
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=min(8, len(st_files))) as executor:
+            list(executor.map(_read_file, st_files))
+        t1 = time.time()
+        logger.info(
+            "GCSFuse cache warm-up done: %.1fs (%.0f MB/s)",
+            t1 - t0,
+            total_size / 1024**2 / (t1 - t0) if t1 > t0 else 0,
+        )
 
     def _create_weight_mappings(self) -> dict:
         mappings = {
@@ -928,7 +626,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         target = prefix
 
         mappings = {}
-        is_fp8 = self._is_static_quant
+        is_fp8 = self.loader.is_static_quant
 
         # Attention projections
         for proj, sharding, kv_pad, hd_pad in [
@@ -938,7 +636,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             ("o_proj", ("tensor", None), False, True),
         ]:
             hf_key = f"{prefix}.self_attn.{proj}"
-            ignored = self._is_quant_ignored(hf_key)
+            ignored = self.loader.is_quant_ignored(hf_key)
 
             # FP8 K/V: bypass QuantizedLinear, store raw FP8 data for fused
             # per-head dequant (cross K/V boundary blocks).
@@ -1044,6 +742,9 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
             if is_fp8:
                 augmented = {}
+                # FusedEPMoE scales must live on the model mesh (data, tensor)
+                # to avoid expert-mesh NamedSharding conflicts in shard_map.
+                # EPMoE scales stay on the expert mesh.
                 use_model_mesh_for_scale = moe_backend == "fused"
                 for key, mapping in moe_mappings.items():
                     augmented[key] = mapping
