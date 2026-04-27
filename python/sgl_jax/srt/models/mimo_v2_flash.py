@@ -535,9 +535,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                 specs=[("self_attn.q_proj", head_dim)],
             )
             # 2. Fused KV per-head dequant (cross K/V boundary blocks)
-            self.loader.dequant_fused_kv(
-                self._kv_buffers, self.model.layers, self.config
-            )
+            self.loader.dequant_fused_kv(self._kv_buffers, self.model.layers, self.config)
             # 3. Layer-0 dense MLP
             self.loader.dequant_fp8_layers(
                 self.model.layers,
