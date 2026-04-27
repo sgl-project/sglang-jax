@@ -31,6 +31,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.kernels.ragged_paged_attention.rpa_v3_tuned_block_sizes import (
+    get_tuned_block_sizes,
+)
 from sgl_jax.srt.kernels.ragged_paged_attention.util import (
     align_to,
     cdiv,
@@ -1949,6 +1952,31 @@ def ragged_paged_attention(
         return run(scalar_prefetches, q, kv, kv_cache)
 
     def _prepare_block_sizes(block_sizes, case):
+        tuned_values = get_tuned_block_sizes(
+            q.dtype,
+            kv_cache_fused_processed.dtype,
+            actual_num_q_heads,
+            actual_num_kv_heads,
+            head_dim,
+            page_size,
+            max_num_tokens,
+            pages_per_seq,
+            (
+                None
+                if case == RpaCase.MIXED
+                else 1 if case == RpaCase.DECODE else chunk_prefill_size
+            ),
+        )
+
+        if tuned_values is not None:
+            (bkv_sz, bq_sz, bkv_csz, bq_csz) = tuned_values
+            return {
+                "bq_sz": bq_sz,
+                "bkv_sz": bkv_sz,
+                "bq_csz": bq_csz,
+                "bkv_csz": bkv_csz,
+            }
+
         if block_sizes is None:
             return get_default_block_sizes(
                 q.dtype,
