@@ -404,6 +404,121 @@ class WeightLoader:
                         self.create_bf16_linear(w_new, proj.kernel_axes, self.mesh),
                     )
 
+    @staticmethod
+    def _uniform_block_dequant(weight, scale, block_size):
+        """Uniform block dequant for weight[out_dim, in_dim] * scale[out_blocks, in_blocks]."""
+        out_dim, in_dim = weight.shape
+        out_blocks = scale.shape[0]
+        padded_out = out_blocks * block_size
+        in_blocks = scale.shape[1]
+        if padded_out > out_dim:
+            weight = jnp.pad(weight, ((0, padded_out - out_dim), (0, 0)))
+        w_4d = weight.astype(jnp.float32).reshape(out_blocks, block_size, in_blocks, block_size)
+        s_4d = scale[:, None, :, None]
+        result = (w_4d * s_4d).reshape(padded_out, in_dim)[:out_dim, :].astype(jnp.bfloat16)
+        return result
+
+    def dequant_fused_kv(
+        self,
+        kv_buffers: dict[int, dict],
+        layers: list,
+        config,
+    ):
+        """Dequantize FP8 K+V weights with per-layer quantization scheme detection.
+
+        Handles two schemes:
+        - Per-head fused: K+V quantized as fused [K(head_dim), V(v_head_dim)] per head.
+          Block boundaries cross K/V boundary, so they must be fused for correct dequant.
+        - Uniform: K and V quantized independently across the whole tensor.
+
+        Args:
+            kv_buffers: dict mapping layer_idx -> {k_weight, k_scale, v_weight, v_scale}
+            layers: model.layers list
+            config: model config with head_dim, v_head_dim
+        """
+        import math
+
+        from jax.sharding import NamedSharding
+
+        if not kv_buffers:
+            return
+
+        head_dim = config.head_dim
+        v_head_dim = getattr(config, "v_head_dim", head_dim)
+        quant_cfg = getattr(config, "quantization_config", None)
+        block_size = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
+
+        fused_dim = head_dim + v_head_dim
+        blocks_per_head = math.ceil(fused_dim / block_size)
+        padded_dim = blocks_per_head * block_size
+        k_blocks_per_head = math.ceil(head_dim / block_size)
+        v_blocks_per_head = blocks_per_head - k_blocks_per_head
+
+        tp_sharding = NamedSharding(self.mesh, P(None, "tensor"))
+
+        for layer_idx in sorted(kv_buffers.keys()):
+            buf = kv_buffers[layer_idx]
+            k_weight = buf["k_weight"]
+            k_scale = buf["k_scale"]
+            v_weight = buf["v_weight"]
+            v_scale = buf["v_scale"]
+
+            in_dim = k_weight.shape[1]
+            in_blocks = in_dim // block_size
+
+            num_kv_heads = k_weight.shape[0] // head_dim
+            k_scale_blocks = k_scale.shape[0]
+
+            expected_per_head = num_kv_heads * k_blocks_per_head
+            expected_uniform = math.ceil(num_kv_heads * head_dim / block_size)
+            is_per_head = (
+                k_scale_blocks == expected_per_head and expected_per_head != expected_uniform
+            )
+
+            if is_per_head:
+                k_w = k_weight.reshape(num_kv_heads, head_dim, in_dim)
+                v_w = v_weight.reshape(num_kv_heads, v_head_dim, in_dim)
+                k_s = k_scale.reshape(num_kv_heads, k_blocks_per_head, in_blocks)
+                v_s = v_scale.reshape(num_kv_heads, v_blocks_per_head, in_blocks)
+                fused_w = jnp.concatenate([k_w, v_w], axis=1)
+                fused_s = jnp.concatenate([k_s, v_s], axis=1)
+                if fused_dim < padded_dim:
+                    fused_w = jnp.pad(fused_w, ((0, 0), (0, padded_dim - fused_dim), (0, 0)))
+                fused_5d = fused_w.astype(jnp.float32).reshape(
+                    num_kv_heads, blocks_per_head, block_size, in_blocks, block_size
+                )
+                scale_5d = fused_s[:, :, None, :, None]
+                dequanted = (
+                    (fused_5d * scale_5d)
+                    .reshape(num_kv_heads, padded_dim, in_dim)[:, :fused_dim, :]
+                    .astype(jnp.bfloat16)
+                )
+                k_bf16 = dequanted[:, :head_dim, :].reshape(num_kv_heads * head_dim, in_dim)
+                v_bf16 = dequanted[:, head_dim:, :].reshape(num_kv_heads * v_head_dim, in_dim)
+            else:
+                k_bf16 = self._uniform_block_dequant(k_weight, k_scale, block_size)
+                v_bf16 = self._uniform_block_dequant(v_weight, v_scale, block_size)
+
+            k_bf16 = jax.device_put(jnp.transpose(k_bf16), tp_sharding)
+            v_bf16 = jax.device_put(jnp.transpose(v_bf16), tp_sharding)
+
+            attn = layers[layer_idx].self_attn
+            attn.k_proj = self.create_bf16_linear(k_bf16, (None, "tensor"), self.mesh)
+            attn.v_proj = self.create_bf16_linear(v_bf16, (None, "tensor"), self.mesh)
+
+            if layer_idx % 10 == 0 or layer_idx == 0:
+                logger.info(
+                    "Layer %d KV dequant: %s, heads=%d, K=%s V=%s",
+                    layer_idx,
+                    "per-head" if is_per_head else "uniform",
+                    num_kv_heads,
+                    k_bf16.shape,
+                    v_bf16.shape,
+                )
+
+        kv_buffers.clear()
+        logger.info("FP8 KV dequantization complete for all layers.")
+
     def dequant_fused_qkv(
         self,
         fused_qkv_buffers: dict[int, dict],
@@ -1760,6 +1875,7 @@ class WeightLoader:
                 can_optimize = (
                     isinstance(mapping.target_path, str)
                     and not mapping.target_path.startswith("__FUSED_QKV_")
+                    and not mapping.target_path.startswith("__KV_")
                     and mapping.reshape is None
                     and mapping.repeat is None  # Check repeat here too!
                     and not mapping.kv_head_padding

@@ -495,7 +495,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         self.dtype = dtype
         self.model = MiMoV2Model(config, dtype=self.dtype, mesh=mesh)
         # Buffer to hold raw FP8 K/V weights+scales for per-head fused dequant.
-        # Populated during weight loading, consumed by _dequant_fused_kv_heads.
+        # Populated during weight loading, consumed by WeightLoader.dequant_fused_kv().
         self._kv_buffers: dict[int, dict] = {}
 
         if not getattr(self.config, "tie_word_embeddings", True):
