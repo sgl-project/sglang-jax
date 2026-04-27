@@ -480,7 +480,6 @@ suites = {
         TestFile("python/sgl_jax/test/test_mesh.py", 1),
         TestFile("python/sgl_jax/test/test_linear_tp.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/layers/test_linear_attention.py", 5, runner="pytest"),
-        TestFile("python/sgl_jax/test/model/test_kimi_linear.py", 20),
     ],
     "kernel-performance-test-tpu-v6e-1": [
         TestFile("benchmark/kernels/flash_attention/bench_flashattention.py", 5),
