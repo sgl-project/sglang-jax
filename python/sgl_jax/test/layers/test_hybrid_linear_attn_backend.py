@@ -379,18 +379,18 @@ class TestPytreeRoundtrip:
 
 
 # ---------------------------------------------------------------------------
-# TP-4: get_max_running_reqests returns min of sub-backends
+# TP-4: get_max_running_reqests delegates to full_attn_backend
 # ---------------------------------------------------------------------------
 
 
 class TestGetMaxRunningReqests:
-    def test_returns_min_of_subs(self):
+    def test_returns_full_attn_backend_value(self):
         hybrid, _, _ = _make_hybrid(full_max=37, linear_max=99)
         assert hybrid.get_max_running_reqests(1024, 16) == 37
 
-    def test_returns_min_when_linear_smaller(self):
+    def test_ignores_linear_attn_backend_value(self):
         hybrid, _, _ = _make_hybrid(full_max=99, linear_max=10)
-        assert hybrid.get_max_running_reqests(2048, 8) == 10
+        assert hybrid.get_max_running_reqests(2048, 8) == 99
 
 
 # ---------------------------------------------------------------------------
