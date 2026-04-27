@@ -100,3 +100,28 @@ def available_and_evictable_str(tree_cache) -> str:
         available_size = token_to_kv_pool_allocator.available_size()
         evictable_size = tree_cache.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+
+
+def release_kv_cache(req, tree_cache: BasePrefixCache, is_insert: bool = True) -> None:
+    from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
+    from sgl_jax.srt.utils.common_utils import cdiv
+
+    tree_cache.cache_finished_req(req, is_insert=is_insert)
+    start_p, end_p = req.pop_overallocated_kv_cache()
+
+    page_size = tree_cache.page_size
+    spec_algo = global_server_args_dict.get("speculative_algorithm")
+
+    if spec_algo is None:
+        assert (
+            start_p == end_p
+        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
+
+    if page_size > 1:
+        start_p = cdiv(start_p, page_size) * page_size
+
+    if start_p >= end_p:
+        return
+
+    indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx, start_p:end_p]
+    tree_cache.token_to_kv_pool_allocator.free(indices_to_free)

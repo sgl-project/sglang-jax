@@ -64,6 +64,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "disable_radix_cache",
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
+    "speculative_algorithm",
+    "speculative_eagle_topk",
     "enable_deterministic_sampling",
     "chunked_prefill_size",
 ]
@@ -250,6 +252,12 @@ class Req:
         # The prefix length of the last prefix matching
         self.last_matched_prefix_len: int = 0
 
+        # For req-level memory management
+        self.kv_committed_len = 0
+        self.kv_allocated_len = 0
+        self.kv_committed_freed = False
+        self.kv_overallocated_freed = False
+
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
         # processed.
@@ -386,6 +394,30 @@ class Req:
             self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
+    def pop_committed_kv_cache(self) -> int:
+        """Return the length of committed KV cache and mark them as freed."""
+        # NOTE: This function is called exactly once after the request is finished.
+        spec_algo = global_server_args_dict.get("speculative_algorithm")
+        topk = global_server_args_dict.get("speculative_eagle_topk")
+
+        enable_kv_committed_len = spec_algo is None or topk is None or topk == 1
+        if enable_kv_committed_len:
+            assert (
+                not self.kv_committed_freed
+            ), f"Committed KV cache already freed ({self.kv_committed_len=})"
+            self.kv_committed_freed = True
+            return self.kv_committed_len
+        else:
+            return len(self.origin_input_ids) + max(len(self.output_ids) - 1, 0)
+
+    def pop_overallocated_kv_cache(self) -> tuple[int, int]:
+        """Return the range of over-allocated KV cache and mark them as freed."""
+        assert (
+            not self.kv_overallocated_freed
+        ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
+        self.kv_overallocated_freed = True
+        return self.kv_committed_len, self.kv_allocated_len
+
     def adjust_max_prefix_ids(self):
         self.fill_ids = self.origin_input_ids + self.output_ids
         input_len = len(self.fill_ids)
@@ -517,6 +549,10 @@ class Req:
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
+        self.kv_committed_len = 0
+        self.kv_allocated_len = 0
+        self.kv_committed_freed = False
+        self.kv_overallocated_freed = False
 
     def set_finish_with_abort(self, error_msg: str):
         # set it to one token to skip the long prefill
@@ -840,6 +876,10 @@ class ScheduleBatch:
             req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
 
+            # update req-level memory management fields
+            req.kv_committed_len = seq_len
+            req.kv_allocated_len = seq_len
+
             prefix_indices = req.prefix_indices
             if pre_len > 0:
                 # note: prefix_indices has to locate on device, or will meet Received incompatible devices for jitted computation
@@ -1150,6 +1190,8 @@ class ScheduleBatch:
 
         for req in self.reqs:
             req.decode_batch_idx += 1
+            req.kv_committed_len += 1
+            req.kv_allocated_len += 1
 
     def filter_batch(
         self,

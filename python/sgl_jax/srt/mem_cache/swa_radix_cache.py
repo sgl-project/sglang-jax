@@ -375,18 +375,19 @@ class SWARadixCache(BasePrefixCache):
             value = [x for x in key.token_ids]
         return self._insert_helper(self.root_node, key, value, prev_prefix_len)
 
-    def cache_finished_req(self, req: Req) -> None:
+    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
+        committed_kv_len = req.pop_committed_kv_cache()
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx,
-                : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
+                :committed_kv_len,
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+        token_ids = (req.origin_input_ids + req.output_ids)[:committed_kv_len][:-1]
         kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, : len(token_ids)]
 
         if self.page_size != 1:
