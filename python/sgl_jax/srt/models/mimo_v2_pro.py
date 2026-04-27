@@ -19,7 +19,7 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 logger = logging.getLogger(__name__)
 
 
-class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
+class MiMoV2ForCausalLM(MiMoV2FlashForCausalLM):
 
     def __init__(
         self,
@@ -240,4 +240,4 @@ class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
         return mappings
 
 
-EntryClass = MiMoV2ProForCausalLM
+EntryClass = MiMoV2ForCausalLM
