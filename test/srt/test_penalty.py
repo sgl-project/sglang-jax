@@ -66,6 +66,67 @@ class TestPenalty(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
+    def run_generate_with_prompt(self, prompt, sampling_params, max_tokens=100):
+        """POST to /v1/chat/completions with the given prompt and params."""
+        sampling_params.setdefault("temperature", 0.05)
+        sampling_params.setdefault("top_p", 1.0)
+
+        response = requests.post(
+            self.base_url + "/v1/chat/completions",
+            json={
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                **sampling_params,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        content = result["choices"][0]["message"]["content"]
+        return content
+
+    def count_word_repetitions(self, text, word):
+        """Count occurrences of `word` in `text` (case-insensitive, word-boundary)."""
+        return len(re.findall(r"\b" + re.escape(word) + r"\b", text.lower()))
+
+    def _test_penalty_effect(
+        self,
+        prompt,
+        baseline_params,
+        penalty_params,
+        target_word,
+        expected_reduction=True,
+        max_tokens=50,
+    ):
+        """Run baseline vs penalty 5 times each; compare mean target-word counts."""
+        baseline_counts = []
+        penalty_counts = []
+
+        for _ in range(5):
+            baseline_output = self.run_generate_with_prompt(prompt, baseline_params, max_tokens)
+            penalty_output = self.run_generate_with_prompt(prompt, penalty_params, max_tokens)
+
+            baseline_counts.append(self.count_word_repetitions(baseline_output, target_word))
+            penalty_counts.append(self.count_word_repetitions(penalty_output, target_word))
+
+        avg_baseline = sum(baseline_counts) / len(baseline_counts)
+        avg_penalty = sum(penalty_counts) / len(penalty_counts)
+
+        if expected_reduction:
+            self.assertLess(
+                avg_penalty,
+                avg_baseline,
+                f"Penalty should reduce '{target_word}' repetition: "
+                f"{avg_baseline:.1f} -> {avg_penalty:.1f}",
+            )
+        else:
+            self.assertGreater(
+                avg_penalty,
+                avg_baseline,
+                f"Negative penalty should increase '{target_word}' repetition: "
+                f"{avg_baseline:.1f} -> {avg_penalty:.1f}",
+            )
+
     def test_server_alive(self):
         """Sanity check: server is up and /v1/chat/completions responds."""
         resp = requests.post(
