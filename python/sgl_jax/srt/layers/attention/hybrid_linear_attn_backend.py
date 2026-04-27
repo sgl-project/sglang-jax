@@ -7,54 +7,129 @@ holds two sub-backends + a `full_attn_layers` whitelist and routes calls.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import jax
+import jax.numpy as jnp
+import numpy as np
 from flax import nnx
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     AttentionBackendMetadata,
 )
+from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.utils.jax_utils import device_array
 
 if TYPE_CHECKING:
+    from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
 
+logger = logging.getLogger(__name__)
 
-# --- Placeholder linear (state-based) attention base classes ----------------
-# Real implementation lands in a separate PR; these stubs exist so that
-# `linear/kda_backend.py` (already on the epic branch) keeps importing.
+
+# --- Linear (state-based) attention base classes ----------------------------
 
 
 @register_pytree_node_class
 @dataclass
 class LinearRecurrentAttnBackendMetadata:
-    """Stub metadata for linear-recurrent backends; KDA PR will flesh out fields."""
+    cu_q_lens: jax.Array = None
+    recurrent_indices: jax.Array = None
 
     def tree_flatten(self):
-        return ((), {})
+        children = (self.cu_q_lens, self.recurrent_indices)
+        aux_data = {}
+        return children, aux_data
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        return cls()
+        return cls(cu_q_lens=children[0], recurrent_indices=children[1])
 
 
 @dataclass
 class LinearRecurrentAttnBackend(AttentionBackend):
-    """Stub base class for linear-recurrent backends (KDA, etc.).
+    """Base class for linear recurrent attention backends (KDA, GDN, Mamba2).
 
-    Inherits AttentionBackend (nnx.Module) — auto-registered as a pytree by
-    nnx's metaclass; no explicit @register_pytree_node_class needed (and adding
-    one would raise a duplicate-registration error).
+    Provides metadata computation and pytree infrastructure.
+    Subclasses implement ``__call__`` with model-specific forward logic.
     """
 
-    def get_forward_metadata(self, batch):
-        # Concrete subclasses (KDAAttnBackend, ...) override this. The stub
-        # returns an empty metadata so it can be instantiated for tests.
-        return LinearRecurrentAttnBackendMetadata()
+    def __init__(
+        self,
+        mesh: jax.sharding.Mesh | None = None,
+    ):
+        self.mesh = mesh
+        self.forward_metadata = nnx.data(LinearRecurrentAttnBackendMetadata())
+
+    def get_forward_metadata(
+        self,
+        req_to_token_pool: ReqToTokenPool,
+        batch: ModelWorkerBatch,
+    ) -> LinearRecurrentAttnBackendMetadata:
+        """Return the metadata for a forward pass."""
+        metadata = LinearRecurrentAttnBackendMetadata()
+
+        # cu_q_lens
+        if batch.forward_mode == ForwardMode.EXTEND:
+            cu_q_lens = np.concatenate(
+                [
+                    np.array([0], dtype=np.int32),
+                    np.cumsum(batch.extend_seq_lens, dtype=np.int32),
+                ]
+            )
+        elif batch.forward_mode == ForwardMode.DECODE:
+            cu_q_lens = np.arange(len(batch.seq_lens) + 1, dtype=np.int32)
+        else:
+            raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
+
+        # recurrent_indices
+        recurrent_indices = req_to_token_pool.get_linear_recurrent_indices(batch.req_pool_indices)
+        # put array to devices
+        (
+            metadata.cu_q_lens,
+            metadata.recurrent_indices,
+        ) = device_array(
+            (cu_q_lens, recurrent_indices),
+            sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
+        )
+
+        self.forward_metadata = nnx.data(metadata)
+        return metadata
+
+    def tree_flatten(self):
+        children = (self.forward_metadata,)
+        aux_data = {"mesh": self.mesh}
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = cls(
+            mesh=aux_data["mesh"],
+        )
+        obj.forward_metadata = children[0]
+        return obj
+
+    @staticmethod
+    def get_layer_cache(recurrent_state_pool, layer_id: int):
+        """Returns (recurrent_cache, conv_cache) for the given layer.
+
+        Matches RecurrentStatePool.get_linear_recurrent_layer_cache (PR #966)
+        which returns a (recurrent, conv) tuple.
+        """
+        return recurrent_state_pool.get_linear_recurrent_layer_cache(layer_id)
+
+    @staticmethod
+    def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
+        # hack setting to 1024, because linear attention backend has no limitation
+        return 1024
 
 
 # --- HybridLinearAttnBackend -----------------------------------------------
@@ -195,3 +270,44 @@ def attn_backend_wrapper(
     return HybridLinearAttnBackend(
         full_attn_backend, linear_attn_backend, cfg.full_attention_layer_ids
     )
+
+
+# --- Helpers ----------------------------------------------------------------
+
+
+class MockRecurrentStatePool:
+    def __init__(self, layer_caches: dict[int, tuple[jax.Array, jax.Array | None]] | None = None):
+        logger.warning(
+            "Using MockRecurrentStatePool; replace with HybridReqToTokenPool + "
+            "RecurrentStatePool when PR #966 lands"
+        )
+        self.layer_caches = {} if layer_caches is None else dict(layer_caches)
+
+    def get_linear_recurrent_indices(self, req_pool_indices: np.ndarray) -> np.ndarray:
+        """Identity mapping — slot i maps to recurrent index i."""
+        return np.asarray(req_pool_indices, dtype=np.int32)
+
+    def get_linear_recurrent_layer_cache(self, layer_id: int):
+        return self.layer_caches[layer_id]
+
+    def set_linear_recurrent_layer_cache(
+        self,
+        layer_id: int,
+        indices: jax.Array,
+        recurrent: jax.Array,
+        conv: jax.Array | None,
+    ) -> None:
+        if layer_id not in self.layer_caches:
+            self.layer_caches[layer_id] = (recurrent, conv)
+            return
+
+        recurrent_cache, conv_cache = self.layer_caches[layer_id]
+        recurrent_cache = recurrent_cache.at[indices].set(recurrent)
+        if conv is not None:
+            if conv_cache is None:
+                conv_cache = jnp.zeros(
+                    (recurrent_cache.shape[0],) + conv.shape[1:],
+                    dtype=conv.dtype,
+                )
+            conv_cache = conv_cache.at[indices].set(conv)
+        self.layer_caches[layer_id] = (recurrent_cache, conv_cache)
