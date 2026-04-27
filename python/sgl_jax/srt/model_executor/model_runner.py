@@ -40,6 +40,15 @@ from sgl_jax.srt.mem_cache.memory_pool import (
 )
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
+    _build_hybrid_pools,
+    _build_non_hybrid_memory_pools,
+    _check_state_to_kv_ratio_for_hybrid,
+    _compute_max_num_reqs_from_state_budget,
+    _enforce_recurrent_state_server_constraints,
+    _per_req_state_bytes_from_config,
+    _split_state_kv_budget,
+)
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
@@ -203,7 +212,7 @@ class ModelRunner(BaseModelRunner):
 
         @partial(
             jax.jit,
-            donate_argnames=["token_to_kv_pool"],  # just donate KV cache
+            donate_argnames=["memory_pools"],
             static_argnames=["model_state_def"],
             compiler_options=jit_compiler_options,
         )
@@ -212,13 +221,13 @@ class ModelRunner(BaseModelRunner):
             model_state_def,
             model_state_leaves,
             forward_batch,
-            token_to_kv_pool,
+            memory_pools,
             logits_metadata,
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             with LoraBatchContext.set_batch(forward_batch):
-                return model(forward_batch, token_to_kv_pool, logits_metadata)
+                return model(forward_batch, memory_pools, logits_metadata)
 
         # Capture base RNG key as a constant in the JIT closure.
         # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
@@ -247,13 +256,13 @@ class ModelRunner(BaseModelRunner):
             return compute_logprobs(mesh, logits, next_tokens)
 
         def run_model_wrapper(forward_batch, logits_metadata):
-            token_to_kv_pool = self.token_to_kv_pool
+            memory_pools = self.memory_pools
             return jitted_run_model(
                 model_def,
                 model_state_def,
                 self.model_state_leaves,
                 forward_batch,
-                token_to_kv_pool,
+                memory_pools,
                 logits_metadata,
             )
 
@@ -550,8 +559,99 @@ class ModelRunner(BaseModelRunner):
 
         logger.info("ModelRunner max_total_num_tokens: %s", self.max_total_num_tokens)
 
-        # Create request to token pool if not already created
-        if self.req_to_token_pool is None:
+        # Detect hybrid recurrent state (e.g. Kimi-Linear KDA layers) via the
+        # ModelRunner.linear_recurrent_config property: type-checked + gated on
+        # the config's own is_linear_attn flag, so a degenerate KimiLinearConfig
+        # without a populated linear_attn_config does NOT trigger the hybrid path.
+        recurrent_cfg = self.linear_recurrent_config
+        has_recurrent_state = recurrent_cfg is not None
+        if has_recurrent_state:
+            _enforce_recurrent_state_server_constraints(self.server_args)
+            _check_state_to_kv_ratio_for_hybrid(self.server_args.state_to_kv_ratio)
+
+            # Budget split must happen BEFORE token_to_kv_pool construction
+            # so the KV pool is sized against kv_budget instead of the full
+            # profile (otherwise state_to_kv_ratio is dead code: KV pool keeps
+            # all HBM and the state pool starves at runtime).
+            if self.is_hybrid:
+                # SWA-hybrid keeps two KV pools (full + swa) with independent
+                # per-token sizes; the single-pool budget arithmetic below
+                # would size both against the same `per_token` and over-
+                # commit. Out of scope for the initial recurrent wiring.
+                raise NotImplementedError(
+                    "state_to_kv_ratio budget split is implemented for the "
+                    "MHA / MLA + recurrent_state paths; SWA-hybrid is TODO."
+                )
+
+            # Use the project's existing _compute_cell_size helper so per-token
+            # KV bytes match what the KV pool actually consumes per device.
+            # Single source of truth for KV byte arithmetic — handles both
+            # MHA/GQA (per-device head count + align128 + K+V *2) and
+            # absorbed-MLA (align128(lkv) + align128(rope), no *2 since V is
+            # not cached) via _compute_cell_size's MLA fast path.
+            per_token_kv_bytes = self._compute_cell_size()
+            available_bytes = self.max_total_num_tokens * per_token_kv_bytes
+            state_budget, kv_budget = _split_state_kv_budget(
+                available_bytes, self.server_args.state_to_kv_ratio
+            )
+
+            # Re-derive max_total_num_tokens from kv_budget; re-align to page
+            # size since the prior alignment was over the full profile.
+            new_max_tokens = kv_budget // per_token_kv_bytes
+            new_max_tokens = (
+                new_max_tokens // self.server_args.page_size * self.server_args.page_size
+            )
+            if new_max_tokens <= 0:
+                raise RuntimeError(
+                    "state_to_kv_ratio split left no KV budget; "
+                    f"kv_budget={kv_budget} bytes, per_token={per_token_kv_bytes} bytes. "
+                    "Lower --state-to-kv-ratio or increase --mem-fraction-static."
+                )
+            logger.info(
+                "Hybrid budget split (state_to_kv_ratio=%s): "
+                "max_total_num_tokens %s -> %s (kv_budget=%s bytes)",
+                self.server_args.state_to_kv_ratio,
+                self.max_total_num_tokens,
+                new_max_tokens,
+                kv_budget,
+            )
+            self.max_total_num_tokens = new_max_tokens
+
+            # Re-derive max_num_reqs from state_budget so RecurrentStatePool is
+            # sized against actual recurrent + conv per-request bytes.
+            per_req_state_bytes = _per_req_state_bytes_from_config(
+                recurrent_cfg.linear_attn_config, self.tp_size
+            )
+            state_max_reqs = _compute_max_num_reqs_from_state_budget(
+                state_budget, per_req_state_bytes
+            )
+            if state_max_reqs <= 0:
+                raise RuntimeError(
+                    "state_to_kv_ratio split left no recurrent state budget; "
+                    f"state_budget={state_budget} bytes, "
+                    f"per_req_state={per_req_state_bytes} bytes. "
+                    "Raise --state-to-kv-ratio or increase --mem-fraction-static."
+                )
+            logger.info(
+                "Hybrid budget split: max_num_reqs %s -> %s "
+                "(state_budget=%s bytes, per_req=%s bytes)",
+                max_num_reqs,
+                min(max_num_reqs, state_max_reqs),
+                state_budget,
+                per_req_state_bytes,
+            )
+            # Take the smaller of the previously computed max_num_reqs (KV-side
+            # budget / context-len heuristic) and the recurrent-state budget cap.
+            # Mirrors sglang upstream model_runner_kv_cache_mixin._resolve_max_num_reqs:
+            #     max_num_reqs = min(max_num_reqs, max_mamba_cache_size // ratio)
+            # Direct override would silently raise the cap when the recurrent
+            # budget exceeds the KV-side cap; min() preserves the tighter bound.
+            max_num_reqs = min(max_num_reqs, state_max_reqs)
+
+        # Create request to token pool if not already created.
+        # For hybrid models, defer to after token_to_kv_pool is built so we can
+        # construct HybridReqToTokenPool with both pool references.
+        if self.req_to_token_pool is None and not has_recurrent_state:
             self.req_to_token_pool = ReqToTokenPool(
                 size=max_num_reqs + 1,
                 max_context_len=self.model_config.context_len + 4,
@@ -615,6 +715,19 @@ class ModelRunner(BaseModelRunner):
                 mesh=self.mesh,
             )
 
+        # Wrap KV pool in MemoryPools (uniform replace_all path for _forward).
+        if has_recurrent_state:
+            _, self.req_to_token_pool, self.memory_pools = _build_hybrid_pools(
+                cfg=recurrent_cfg,
+                max_num_reqs=max_num_reqs,
+                max_context_len=self.model_config.context_len + 4,
+                tp_size=self.tp_size,
+                token_to_kv_pool=self.token_to_kv_pool,
+                mesh=self.mesh,
+            )
+        else:
+            self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)
+
         # Create KV pool allocator
         if self.token_to_kv_pool_allocator is None:
             if self.is_hybrid:
@@ -649,6 +762,35 @@ class ModelRunner(BaseModelRunner):
         """Init attention kernel backend."""
         self.attn_backend = self._get_attention_backend()
 
+    @property
+    def kimi_linear_config(self):
+        """Return the Kimi-Linear config when the model is Kimi-Linear, else None."""
+        from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
+
+        if isinstance(self.model_config.hf_config, KimiLinearConfig):
+            return self.model_config.hf_config
+        return None
+
+    @property
+    def linear_recurrent_config(self):
+        """OR over all hybrid linear-recurrent configs supported on this runner.
+
+        Cheap detector for `attn_backend_wrapper` to decide whether to wrap.
+        Dispatch to a concrete sub-backend uses the specific properties (e.g.
+        `kimi_linear_config`) — do not switch on this.
+
+        A KimiLinearConfig instance whose ``is_linear_attn`` flag is False
+        (e.g. a default-constructed config without ``linear_attn_config``)
+        is NOT considered a hybrid model — it returns None. This keeps the
+        umbrella detector consistent with the per-config truth and prevents
+        ``attn_backend_wrapper`` from wrapping a non-hybrid runtime while
+        ``init_memory_pool`` would skip the hybrid pool path.
+        """
+        cfg = self.kimi_linear_config
+        if cfg is not None and cfg.is_linear_attn:
+            return cfg
+        return None  # add `or self.hybrid_gdn_config` etc. later
+
     def _get_attention_backend(self):
         backend = self.server_args.attention_backend
         if self.server_args.device == "cpu" and backend in ("fa", "fa_mha"):
@@ -660,14 +802,14 @@ class ModelRunner(BaseModelRunner):
         if backend == "native":
             from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 
-            return NativeAttention(self.num_attn_heads, self.num_kv_heads, self.mesh)
+            full_attn_backend = NativeAttention(self.num_attn_heads, self.num_kv_heads, self.mesh)
 
-        # Absorbed MLA is the only branch that does not use FlashAttention.
-        if backend == "fa" and self.use_mla_backend:
+        elif backend == "fa" and self.use_mla_backend:
+            # Absorbed MLA is the only branch that does not use FlashAttention.
             from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
 
             cfg = self.model_config.hf_text_config
-            return MLAAttentionBackend(
+            full_attn_backend = MLAAttentionBackend(
                 num_attn_heads=self.num_attn_heads,
                 kv_lora_rank=cfg.kv_lora_rank,
                 qk_nope_head_dim=cfg.qk_nope_head_dim,
@@ -677,30 +819,40 @@ class ModelRunner(BaseModelRunner):
                 mesh=self.mesh,
             )
 
-        if backend not in ("fa", "fa_mha"):
+        elif backend in ("fa", "fa_mha"):
+            # fa_mha on an MLA model: decompress latent KV via kv_b_proj per-forward
+            # and run standard FlashAttention with per-head K/V (num_kv_heads ==
+            # num_attn_heads). All other (backend, model) combinations use the
+            # model's native MHA/GQA dims.
+            from sgl_jax.srt.layers.attention.flashattention_backend import (
+                FlashAttention,
+            )
+
+            if backend == "fa_mha" and self.use_mla_backend:
+                cfg = self.model_config.hf_text_config
+                head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim
+                num_kv_heads = self.num_attn_heads
+            else:
+                head_dim = self.model_config.head_dim
+                num_kv_heads = self.num_kv_heads
+
+            full_attn_backend = FlashAttention(
+                self.num_attn_heads,
+                num_kv_heads,
+                head_dim,
+                page_size=self.page_size,
+                mesh=self.mesh,
+            )
+
+        else:
             raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
 
-        # fa_mha on an MLA model: decompress latent KV via kv_b_proj per-forward
-        # and run standard FlashAttention with per-head K/V (num_kv_heads ==
-        # num_attn_heads). All other (backend, model) combinations use the
-        # model's native MHA/GQA dims.
-        from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
-
-        if backend == "fa_mha" and self.use_mla_backend:
-            cfg = self.model_config.hf_text_config
-            head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim
-            num_kv_heads = self.num_attn_heads
-        else:
-            head_dim = self.model_config.head_dim
-            num_kv_heads = self.num_kv_heads
-
-        return FlashAttention(
-            self.num_attn_heads,
-            num_kv_heads,
-            head_dim,
-            page_size=self.page_size,
-            mesh=self.mesh,
+        # Always go through the wrapper — it's a no-op when no hybrid config is set.
+        from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
+            attn_backend_wrapper,
         )
+
+        return attn_backend_wrapper(self, full_attn_backend)
 
     def _forward(
         self,
@@ -735,32 +887,15 @@ class ModelRunner(BaseModelRunner):
                 logger.debug("logits_metadata %s: %s", key, value)
 
         with jtu.count_pjit_cpp_cache_miss() as count:
-            output, layers_kv_fused, _, layers_topk_ids = self.jitted_run_model(
+            output, pool_updates, _, layers_topk_ids = self.jitted_run_model(
                 forward_batch, logits_metadata
             )
             cache_miss_count = count()
-        self._set_kv_cache_after_forward(layers_kv_fused)
+        #  done: models now return pool_updates dict directly at idx 1.
+        self.memory_pools.replace_all(pool_updates)
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
         return output, cache_miss_count, layers_topk_ids
-
-    def _set_kv_cache_after_forward(self, layers_kv_fused):
-        # Note: For tp_size == 1, we need to put the layers_kv_fused on the device with the target_sharding
-        # because sharding P(None, 'tensor') constraint has lost and this results in cache_miss for first prefill phase.
-        # Issue: https://github.com/sgl-project/sglang-jax/issues/233
-        # Q: Why does not call device_put in every layer?
-        # A: Because it does not work and cache_miss still happens. According to benchmark(https://github.com/sgl-project/sglang-jax/pull/234), the performance is not influenced.
-        if self.tp_size == 1:
-            # MHA pool is 5D `(pages, page_size, kv_packing, num_kv_heads*2, head_dim)`,
-            # MLA pool is 4D `(pages, page_size, kv_packing, kv_lora_rank+qk_rope)`.
-            # Take the spec directly from the pool's buffer instead of hardcoding.
-            target_sharding = self.token_to_kv_pool.kv_sharding
-            layers_kv_fused = [
-                jax.device_put(layer_kv_fused, target_sharding)
-                for layer_kv_fused in layers_kv_fused
-            ]
-
-        self.token_to_kv_pool.replace_kv_buffer(layers_kv_fused)
 
     def forward_idle(
         self,
@@ -970,3 +1105,8 @@ class MockModelRunner(ModelRunner):
             layer_num=self.model_config.num_hidden_layers,
             mesh=mesh,
         )
+
+        # D5: MockModelRunner doesn't go through init_memory_pool, so wrap
+        # token_to_kv_pool in MemoryPools manually so the inherited _forward
+        # can dispatch via self.memory_pools.replace_all(...).
+        self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)

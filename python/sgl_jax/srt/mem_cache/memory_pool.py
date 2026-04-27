@@ -121,25 +121,219 @@ class ReqToTokenPool:
         """Return number of available request slots"""
         return len(self.free_slots)
 
-    def alloc(self, need_size: int = 1) -> list[int]:
-        """Allocate request slots"""
-        if need_size > len(self.free_slots):
+    def alloc(self, reqs) -> list[int] | None:
+        """Allocate request slots for a list of Req-like objects.
+
+        Chunked-prefill semantics:
+        - Reqs already holding a req_pool_idx are skipped (must satisfy
+          is_chunked > 0 -- safety assert).
+        - Reqs with no req_pool_idx are allocated from free_slots and have
+          req.req_pool_idx written back.
+        - If capacity is insufficient, return None and leave every req field
+          untouched (atomic semantics).
+
+        Returns: list[int] (the slot per req), or None if capacity is insufficient.
+        """
+        # Pass 1: count slots that need fresh allocation; assert safety on reuses.
+        new_count = 0
+        for req in reqs:
+            if req.req_pool_idx is None:
+                new_count += 1
+            else:
+                assert req.is_chunked > 0, (
+                    "ReqToTokenPool.alloc: req with existing req_pool_idx must have "
+                    f"is_chunked > 0 (chunked prefill); got is_chunked={req.is_chunked!r}"
+                )
+
+        if new_count > len(self.free_slots):
             return None
 
-        select_indices = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
-        return select_indices
+        # Pass 2: atomic allocation.
+        new_slots = self.free_slots[:new_count]
+        self.free_slots = self.free_slots[new_count:]
 
-    def free(self, free_index: int | list[int]):
-        """Free request slots"""
-        if isinstance(free_index, int):
-            self.free_slots.append(free_index)
-        else:
-            self.free_slots.extend(free_index)
+        result = []
+        cursor = 0
+        for req in reqs:
+            if req.req_pool_idx is None:
+                req.req_pool_idx = new_slots[cursor]
+                cursor += 1
+            result.append(req.req_pool_idx)
+        return result
+
+    def free(self, req):
+        """Free request slot held by ``req``.
+
+        Accepts a Req-like object with a ``req_pool_idx`` attribute (matches
+        ``alloc(reqs)`` signature symmetry). Subclasses (HybridReqToTokenPool)
+        override to release additional state slots (recurrent state) before
+        delegating here.
+        """
+        # Defensive type check: legacy callers passing bare int / list[int]
+        # hit an immediate, clear error instead of silent AttributeError
+        # downstream when self.free_slots.append(req.req_pool_idx) accesses
+        # a missing attribute.
+        if not hasattr(req, "req_pool_idx"):
+            raise TypeError(
+                f"ReqToTokenPool.free expects a Req object with req_pool_idx attr; "
+                f"got {type(req).__name__}. Legacy int/list[int] callers must migrate."
+            )
+        self.free_slots.append(req.req_pool_idx)
+        # Clear the slot ref on the req so a stale value can't leak into a
+        # later caller (the slot may already be re-handed to another req by
+        # then). Keeps free / free_chunked / free_recurrent_cache symmetric.
+        req.req_pool_idx = None
+
+    def free_chunked(self, chunked_req) -> None:
+        """Release for chunked-prefill. Default: identical to free.
+        HybridReqToTokenPool overrides to preserve slots across chunks.
+        """
+        self.free(chunked_req)
 
     def clear(self):
         """Clear all allocation states"""
         self.free_slots = list(range(self.size))
+
+
+class HybridReqToTokenPool(ReqToTokenPool):
+    """Coordinates KV slot + recurrent state slot allocation for hybrid models.
+
+    - Owns `recurrent_free_slots` (slot 0 dummy, valid 1..max). Allocator
+      state lives here, not on RecurrentStatePool — so the buffer pool stays
+      a pytree leaf safe for JIT donate.
+    - Maintains `req_index_to_recurrent_index_mapping` bridging
+      req_pool_idx -> recurrent_pool_idx (defaults to 0 = dummy).
+    - NOT registered as a pytree node: the host-side allocator state
+      must not enter JIT donate (would otherwise reset on tree_unflatten).
+    """
+
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        dtype: np.dtype,
+        recurrent_state_pool,
+    ):
+        super().__init__(size=size, max_context_len=max_context_len, dtype=dtype)
+        self.recurrent_state_pool = recurrent_state_pool
+        # Recurrent slot allocator state. 1-indexed because slot 0 is reserved as
+        # the dummy slot in the underlying RecurrentStatePool buffers; mapping
+        # entries default to 0 so an unallocated req lands on the dummy slot.
+        # Mirrors sglang PyTorch MambaPool free_slots semantics.
+        self.recurrent_free_slots: list[int] = list(range(1, recurrent_state_pool.max_num_reqs + 1))
+        # mapping[req_pool_idx] = recurrent_pool_idx; initialized to 0 (dummy slot).
+        self.req_index_to_recurrent_index_mapping = np.zeros(size, dtype=np.int32)
+
+    def alloc(self, reqs):
+        """Coordinate allocation: KV slot first, then recurrent slot; atomic semantics.
+
+        Mirrors the "all-or-nothing" coordinated allocation from sglang PyTorch
+        HybridReqToTokenPool.alloc and the parent ReqToTokenPool.alloc Pass-2
+        batch-slice pattern.
+
+        Strategy:
+        1. Pre-check the local recurrent_free_slots capacity for fresh allocs.
+        2. super().alloc(reqs) -- KV slot path is already atomic.
+        3. Batch-slice the needed recurrent slots, clear-on-alloc all of them in
+           one recurrent_state_pool.clear_slot call (avoids per-slot JIT scatter
+           overhead), then assign + write mapping.
+
+        On any resource shortage we return None; req fields, recurrent_free_slots
+        and mapping all stay completely untouched before the KV alloc succeeds
+        (recurrent writes only happen after KV passes).
+        """
+        # 1. Pre-check recurrent capacity (only fresh reqs consume a slot).
+        needed_recurrent = sum(1 for req in reqs if req.recurrent_pool_idx is None)
+        if needed_recurrent > len(self.recurrent_free_slots):
+            return None
+
+        # 2. KV slot (parent is atomic).
+        kv_indices = super().alloc(reqs)
+        if kv_indices is None:
+            return None
+
+        # 3. Atomic batch slice (mirrors parent's Pass-2 pattern), then a single
+        #    clear-on-alloc call covering every newly-handed-out slot.
+        new_recurrent_slots = self.recurrent_free_slots[:needed_recurrent]
+        self.recurrent_free_slots = self.recurrent_free_slots[needed_recurrent:]
+
+        if new_recurrent_slots:
+            self.recurrent_state_pool.clear_slot(new_recurrent_slots)
+
+        cursor = 0
+        for req in reqs:
+            if req.recurrent_pool_idx is None:
+                req.recurrent_pool_idx = new_recurrent_slots[cursor]
+                cursor += 1
+            self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = req.recurrent_pool_idx
+
+        return kv_indices
+
+    def free(self, req) -> None:
+        """Coordinate release: recurrent slot first, then KV slot.
+
+        Idempotent when ``req.recurrent_pool_idx`` is None (free_recurrent_cache
+        no-op). Mirrors the alloc(reqs) coordination pattern (KV first then
+        recurrent on alloc; recurrent first then KV on free, so a partially
+        constructed req can never end up with a freed KV slot but a still-held
+        recurrent slot).
+        """
+        # Defensive type check at the override entry too: free_recurrent_cache
+        # touches req.recurrent_pool_idx before super().free reaches its own
+        # type check, so without this guard a legacy int caller would fail
+        # with AttributeError instead of the explicit TypeError contract.
+        if not hasattr(req, "req_pool_idx"):
+            raise TypeError(
+                f"HybridReqToTokenPool.free expects a Req object with req_pool_idx attr; "
+                f"got {type(req).__name__}. Legacy int/list[int] callers must migrate."
+            )
+        self.free_recurrent_cache(req)
+        super().free(req)
+
+    def free_chunked(self, chunked_req) -> None:
+        """Hybrid override: keep both KV slot AND recurrent slot so the next
+        alloc(reqs) reuses them -- preserves the recurrent state across
+        chunks without an alloc/free roundtrip.
+
+        No-op by design: req keeps both req_pool_idx and recurrent_pool_idx;
+        alloc(reqs) sees them set and skips re-allocation, returning the same
+        indices.
+        """
+        # Intentional no-op (see docstring).
+
+    def free_recurrent_cache(self, req) -> None:
+        """Release the recurrent state slot held by `req`. Idempotent.
+
+        Returns the slot to recurrent_free_slots, sets req.recurrent_pool_idx
+        back to None and clears the corresponding mapping entry to the dummy
+        slot (0). Safe to call when the req has no recurrent slot allocated.
+        """
+        if req.recurrent_pool_idx is None:
+            return
+        self.recurrent_free_slots.append(req.recurrent_pool_idx)
+        self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = 0
+        req.recurrent_pool_idx = None
+
+    def get_linear_recurrent_indices(self, req_pool_indices):
+        """Look up linear recurrent slot indices via the CPU-side mapping table.
+
+        Accepts an np.ndarray (or list[int]) of req_pool_idx and returns
+        the same-shape np.ndarray of recurrent_pool_idx values.
+        """
+        return self.req_index_to_recurrent_index_mapping[req_pool_indices]
+
+    def clear(self) -> None:
+        """Full reset: parent clear + recurrent buffer clear + recurrent allocator
+        reset + mapping zeroed.
+
+        Called from flush_cache; resets KV slot allocator, recurrent slot
+        allocator, recurrent + conv buffers, and the req_pool_idx ->
+        recurrent_pool_idx mapping.
+        """
+        super().clear()
+        self.recurrent_state_pool.clear()
+        self.recurrent_free_slots = list(range(1, self.recurrent_state_pool.max_num_reqs + 1))
+        self.req_index_to_recurrent_index_mapping[:] = 0
 
 
 @register_pytree_node_class
@@ -216,7 +410,7 @@ class KVCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def replace_kv_buffer(self, kv_buffer: list[jax.Array]) -> None:
+    def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
         """Replace the internal KV buffer with a new one.
 
         This method is essential for JAX jit compatibility since JAX functions
@@ -440,7 +634,19 @@ class MHATokenToKVPool(KVCache):
             mesh=self.mesh,
         )
 
-    def replace_kv_buffer(self, fused_kv_buffer: list[jax.Array]) -> None:
+    def replace_buffer(self, fused_kv_buffer: list[jax.Array]) -> None:
+        # tp_size==1 sharding fix (issue #233): when the tp axis is degenerate
+        # (size 1), JAX optimizes away the P(None, "tensor") constraint on
+        # JIT output; explicit device_put with self.kv_sharding restores it
+        # before the slice assign so the next JIT trace sees a stable shape.
+        # Trigger condition is `mesh.shape["tensor"] == 1` (== ServerArgs
+        # tp_size == 1), which is what aolemila's original fix in
+        # _set_kv_cache_after_forward used. NOT `len(device_set) == 1` —
+        # that's mesh-total-devices, which differs in multi-device tp_size=1
+        # deployments (e.g. 8 devices with tp=1 → device_set=8 but tensor
+        # axis still degenerate, fix still required).
+        if self.mesh.shape.get("tensor", 1) == 1 and hasattr(self, "kv_sharding"):
+            fused_kv_buffer = [jax.device_put(buf, self.kv_sharding) for buf in fused_kv_buffer]
         self.kv_buffer[self.start_layer : self.start_layer + len(fused_kv_buffer)] = fused_kv_buffer
 
     def get_cpu_copy(self, indices):
@@ -638,7 +844,7 @@ class SWAKVPool(KVCache):
         else:
             self.full_kv_pool.set_kv_buffer(layer_id_pool, loc, cache_k, cache_v, is_decode)
 
-    def replace_kv_buffer(self, kv_buffer: list[jax.Array]):
+    def replace_buffer(self, kv_buffer: list[jax.Array]):
         assert len(kv_buffer) == len(self.layers_mapping)
 
         full_kv_buffer = []
@@ -650,8 +856,8 @@ class SWAKVPool(KVCache):
             else:
                 full_kv_buffer.append(layer_kv_buffer)
 
-        self.swa_kv_pool.replace_kv_buffer(swa_kv_buffer)
-        self.full_kv_pool.replace_kv_buffer(full_kv_buffer)
+        self.swa_kv_pool.replace_buffer(swa_kv_buffer)
+        self.full_kv_pool.replace_buffer(full_kv_buffer)
 
     def remap_cache_loc(self, loc: jax.Array, layer_id: int) -> jax.Array:
         """
@@ -1072,7 +1278,14 @@ class MLATokenToKVPool(KVCache):
             "the MLA v2 kernel writes the cache in-place via input_output_aliases."
         )
 
-    def replace_kv_buffer(self, kv_buffer: list[jax.Array]) -> None:
+    def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
+        # tp_size==1 sharding fix (issue #233): see MHATokenToKVPool.replace_buffer
+        # for full rationale. MLA's kv_sharding is fully replicated (P(None)*4),
+        # but the same JIT-output constraint loss happens on the tensor axis when
+        # it's degenerate; trigger condition matches aolemila's original
+        # _set_kv_cache_after_forward fix (mesh.shape["tensor"] == 1).
+        if self.mesh.shape.get("tensor", 1) == 1 and hasattr(self, "kv_sharding"):
+            kv_buffer = [jax.device_put(buf, self.kv_sharding) for buf in kv_buffer]
         self.kv_buffer[self.start_layer : self.start_layer + len(kv_buffer)] = kv_buffer
 
     def get_cpu_copy(self, indices):
@@ -1092,3 +1305,69 @@ class MLATokenToKVPool(KVCache):
             kv_host = kv_cache_host[layer_id]
             kv_device = jax.device_put(kv_host, self.kv_sharding)
             self.kv_buffer[layer_id] = self.kv_buffer[layer_id].at[indices].set(kv_device)
+
+
+@register_pytree_node_class
+class MemoryPools:
+    """Pytree container that uniformly manages multiple pool replace operations.
+
+    Single JIT function + fixed donate_argnames; O(1) extension as new pools are added.
+
+    - Construct: MemoryPools(token_to_kv_pool=..., recurrent_state_pool=...)
+    - Each pool exposed via __getattr__ (mp.token_to_kv_pool / mp.recurrent_state_pool)
+    - tree_flatten yields children sorted by pool name; aux_data is the sorted key tuple
+    - replace_all(updates) does NOT unpack values; each value is forwarded as-is to
+      the corresponding pool.replace_buffer(value) (each pool interprets its own type)
+    """
+
+    def __init__(self, **pools):
+        self._pools = pools
+
+    def __getattr__(self, name):
+        # Block dunder/private lookups so we never confuse Python internals.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            return self._pools[name]
+        except KeyError:
+            raise AttributeError(f"MemoryPools has no pool '{name}'") from None
+
+    def tree_flatten(self):
+        keys = sorted(self._pools.keys())
+        return [self._pools[k] for k in keys], tuple(keys)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(**dict(zip(aux_data, children)))
+
+    def replace_all(self, updates) -> None:
+        """Mirror _set_kv_cache_after_forward semantics for the multi-pool world.
+
+        Single-pool legacy shape (bare list of per-layer KV arrays) is
+        normalized to dict internally so the caller never needs to know
+        whether the workload is hybrid; multi-pool dict shape is required
+        only when the caller actually updates multiple pools (hybrid
+        recurrent state).
+
+        Each pool's replace_buffer carries its own implementation details
+        (tp_size==1 device_put, sharding fix, ...); replace_all only does
+        shape normalization and key dispatch.
+
+        Constraints (after normalization):
+        - updates.keys() must exactly match self._pools.keys() (count + names).
+        - value is NOT unpacked: token_to_kv_pool receives list[jax.Array],
+          recurrent_state_pool receives tuple[list[jax.Array], list[list[jax.Array]]],
+          etc. Each pool interprets its own value shape.
+        - Strict key matching is required because after JIT donate the old buffers
+          are invalidated; any pool not present in `updates` would hold a dangling
+          reference.
+        """
+        if isinstance(updates, list):
+            updates = {"token_to_kv_pool": updates}
+        if set(updates.keys()) != set(self._pools.keys()):
+            raise ValueError(
+                f"replace_all: updates keys {sorted(updates.keys())} "
+                f"must exactly match MemoryPools keys {sorted(self._pools.keys())}"
+            )
+        for key, value in updates.items():
+            self._pools[key].replace_buffer(value)
