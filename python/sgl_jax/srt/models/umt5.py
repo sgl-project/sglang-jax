@@ -460,10 +460,11 @@ class UMT5EncoderModel(nnx.Module):
             m.update(_block_mappings(self.config, i, False, "encoder.block", "encoder.blocks"))
         return m
 
-    def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool=None, logits_metadata=None):
+    def __call__(self, forward_batch: ForwardBatch, memory_pools=None, logits_metadata=None):
+        kv_pool = memory_pools.token_to_kv_pool if memory_pools is not None else None
         x = self.shared(forward_batch.input_ids)
         deterministic = getattr(forward_batch, "deterministic", True)
-        hidden = self.encoder(x, forward_batch, token_to_kv_pool, deterministic)
+        hidden = self.encoder(x, forward_batch, kv_pool, deterministic)
 
         # Dummy logits for interface compatibility
         bs = forward_batch.seq_lens.shape[0]
@@ -505,10 +506,11 @@ class UMT5DecoderModel(nnx.Module):
             m.update(_block_mappings(self.config, i, True, "decoder.block", "decoder.blocks"))
         return m
 
-    def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool=None):
+    def __call__(self, forward_batch: ForwardBatch, memory_pools=None):
+        kv_pool = memory_pools.token_to_kv_pool if memory_pools is not None else None
         x = self.shared(forward_batch.input_ids)
         deterministic = getattr(forward_batch, "deterministic", True)
-        return self.decoder(x, forward_batch, token_to_kv_pool, deterministic)
+        return self.decoder(x, forward_batch, kv_pool, deterministic)
 
 
 class UMT5Model(nnx.Module):
@@ -554,7 +556,8 @@ class UMT5Model(nnx.Module):
             m.update(_block_mappings(self.config, i, True, "decoder.block", "decoder.blocks"))
         return m
 
-    def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool=None):
+    def __call__(self, forward_batch: ForwardBatch, memory_pools=None):
+        kv_pool = memory_pools.token_to_kv_pool if memory_pools is not None else None
         deterministic = getattr(forward_batch, "deterministic", True)
 
         # Encoder pass - save state immediately
@@ -574,7 +577,7 @@ class UMT5Model(nnx.Module):
         ):
             update_decoder_seq_lens(forward_batch, dec_ids)
 
-        return self.decoder(self.shared(dec_ids), forward_batch, token_to_kv_pool, deterministic)
+        return self.decoder(self.shared(dec_ids), forward_batch, kv_pool, deterministic)
 
 
 class UMT5ForConditionalGeneration(nnx.Module):
@@ -631,7 +634,10 @@ class UMT5ForConditionalGeneration(nnx.Module):
             m.update(_block_mappings(self.config, i, True, "decoder.block", "decoder.blocks"))
         return m
 
-    def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool=None, logits_metadata=None):
+    def __call__(self, forward_batch: ForwardBatch, memory_pools=None, logits_metadata=None):
+        # encoder model: rebind to local kv_pool (None when memory_pools is None,
+        # which is the typical encoder-only call site).
+        kv_pool = memory_pools.token_to_kv_pool if memory_pools is not None else None
         deterministic = getattr(forward_batch, "deterministic", True)
 
         # Encoder pass (cache if needed)
@@ -655,7 +661,7 @@ class UMT5ForConditionalGeneration(nnx.Module):
         ):
             update_decoder_seq_lens(forward_batch, dec_ids)
 
-        dec_h = self.decoder(self.shared(dec_ids), forward_batch, token_to_kv_pool, deterministic)
+        dec_h = self.decoder(self.shared(dec_ids), forward_batch, kv_pool, deterministic)
 
         if logits_metadata is not None:
             logits = self.logits_processor(dec_h, self.lm_head, logits_metadata)

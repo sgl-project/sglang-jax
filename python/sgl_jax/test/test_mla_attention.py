@@ -232,7 +232,7 @@ def create_mla_forward_batch(
 
     cache_jnp = jnp.asarray(cache_np, dtype=dtype)
     cache_jnp = jax.device_put(cache_jnp, pool.kv_sharding)
-    pool.replace_kv_buffer([cache_jnp])
+    pool.replace_buffer([cache_jnp])
 
     seq_lens = np.array([kv_len for _, kv_len in lens], dtype=np.int32)
     q_lens = np.array([q_len for q_len, _ in lens], dtype=np.int32)

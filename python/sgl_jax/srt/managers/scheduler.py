@@ -1126,8 +1126,12 @@ class Scheduler(
             # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
             self.tree_cache.cache_unfinished_req(self.chunked_req)
-            # chunked request keeps its rid but will get a new req_pool_idx
-            self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+            # Polymorphic release for the chunked req's slot:
+            # - ReqToTokenPool.free_chunked: free + clear req_pool_idx so
+            #   alloc(reqs) treats this req as fresh next round.
+            # - HybridReqToTokenPool.free_chunked: no-op so both KV slot and
+            #   recurrent_pool_idx survive across chunks (alloc reuses them).
+            self.req_to_token_pool.free_chunked(self.chunked_req)
 
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():

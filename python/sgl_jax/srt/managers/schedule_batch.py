@@ -208,6 +208,8 @@ class Req:
 
         # Memory pool info
         self.req_pool_idx: int | None = None
+        # Slot in HybridReqToTokenPool's recurrent state pool; None for non-hybrid models.
+        self.recurrent_pool_idx: int | None = None
 
         # Check finish
         self.tokenizer = None
@@ -510,6 +512,7 @@ class Req:
         self.extend_logprob_start_len = 0
         self.is_chunked = 0
         self.req_pool_idx = None
+        self.recurrent_pool_idx = None
         self.already_computed = 0
         self.routed_experts = None
         self.latest_bid = None
@@ -687,14 +690,21 @@ class ScheduleBatch:
     def is_empty(self):
         return len(self.reqs) == 0
 
-    def alloc_req_slots(self, num_reqs: int):
-        req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
+    def alloc_req_slots(self, reqs):
+        """Allocate per-request memory pool slots.
+
+        For non-hybrid models: passes through to ReqToTokenPool.alloc which
+        ignores per-Req state and returns fresh slots for every entry in reqs.
+        For hybrid models: HybridReqToTokenPool.alloc inspects each req and
+        reuses slots for reqs whose req_pool_idx is set (chunked prefill).
+        """
+        req_pool_indices = self.req_to_token_pool.alloc(reqs)
         if req_pool_indices is None:
             raise RuntimeError(
                 "alloc_req_slots runs out of memory. "
                 "Please set a smaller number for `--max-running-requests`. "
                 f"{self.req_to_token_pool.available_size()=}, "
-                f"{num_reqs=}, "
+                f"{len(reqs)=}, "
             )
         return req_pool_indices
 
@@ -818,7 +828,7 @@ class ScheduleBatch:
 
         # Allocate req slots
         bs = len(self.reqs)
-        req_pool_indices = self.alloc_req_slots(bs)
+        req_pool_indices = self.alloc_req_slots(self.reqs)
 
         # Init arrays
         reqs = self.reqs
@@ -1048,7 +1058,7 @@ class ScheduleBatch:
                 req.req_pool_idx, : seq_lens_cpu[idx]
             ]
             self.token_to_kv_pool_allocator.free(token_indices)
-            self.req_to_token_pool.free(req.req_pool_idx)
+            self.req_to_token_pool.free(req)
         else:
             last_uncached_pos = (
                 len(req.prefix_indices) // server_args.page_size
@@ -1057,7 +1067,7 @@ class ScheduleBatch:
                 req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
             ]
             self.token_to_kv_pool_allocator.free(token_indices)
-            self.req_to_token_pool.free(req.req_pool_idx)
+            self.req_to_token_pool.free(req)
 
             # release the last node
             if self.is_hybrid:
