@@ -146,6 +146,22 @@ class TestPenalty(CustomTestCase):
         penalty_params = {"presence_penalty": 1.99}
         self._test_penalty_effect(prompt, baseline_params, penalty_params, "machine learning")
 
+    def test_combined_penalties_reduce_repetition(self):
+        """Combined frequency + presence penalties should reduce repetition."""
+        prompt = (
+            "Write exactly 10 short sentences, each containing the word 'data'. "
+            "Use the word 'data' as much as possible."
+        )
+        baseline_params = {
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+        }
+        penalty_params = {
+            "frequency_penalty": 1.99,
+            "presence_penalty": 1.99,
+        }
+        self._test_penalty_effect(prompt, baseline_params, penalty_params, "data", max_tokens=100)
+
     def test_server_alive(self):
         """Sanity check: server is up and /v1/chat/completions responds."""
         resp = requests.post(
