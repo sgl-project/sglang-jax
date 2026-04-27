@@ -1,3 +1,5 @@
+# Adapted from https://github.com/primatrix/pallas-kernel
+# Vendored to remove external dependency after the upstream repository went private.
 """KDA chunked forward pass for variable-length sequences (self-contained)."""
 
 from __future__ import annotations
@@ -349,66 +351,30 @@ def _kda_fwd_intra_kernel(
     k_f32 = k.astype(jnp.float32)
     beta_f32 = beta.astype(jnp.float32)
 
-    causal_bc = jnp.tril(jnp.ones((BC, BC), dtype=jnp.float32))
-    strict_bc = jnp.tril(jnp.ones((BC, BC), dtype=jnp.float32), k=-1)
-    zeros_bc = jnp.zeros((BC, BC), dtype=jnp.float32)
+    # Build Aqk and L directly using exp2(g[i] - g[j]).
+    # For causal (i >= j): g_cumsum[i] <= g_cumsum[j], so g[i]-g[j] <= 0,
+    # giving exp2 in (0, 1].  This avoids the split-normalization overflow
+    # that occurs with exp2(g-gn) when per-step gate changes exceed ~127.
+    causal_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32))
+    strict_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32), k=-1)
 
-    Aqk_rows = []
-    L_rows = []
-    for i_sc in range(NC):
-        i_s = i_sc * BC
-        q_i = q_f32[i_s : i_s + BC]
-        k_i = k_f32[i_s : i_s + BC]
-        g_i = g_f32[i_s : i_s + BC]
-        beta_i = beta_f32[i_s : i_s + BC]
-        gn_i = g_i[BC // 2 : BC // 2 + 1, :] if safe_gate else g_i[0:1, :]
+    # g_diff[i, j, k] = g[i, k] - g[j, k];  shape [BT, BT, K]
+    g_diff = g_f32[:, None, :] - g_f32[None, :, :]
+    # Mask anti-causal entries to -126 before exp2 to prevent overflow;
+    # they will be zeroed by causal_bt / strict_bt anyway.
+    g_diff = jnp.where(causal_bt[:, :, None] > 0, g_diff, -126.0)
+    decay = exp2(jnp.maximum(g_diff, -126.0))  # [BT, BT, K]
 
-        Aqk_blks = []
-        L_blks = []
-        for j_sc in range(NC):
-            if j_sc > i_sc:
-                Aqk_blks.append(zeros_bc)
-                L_blks.append(zeros_bc)
-            else:
-                j_s = j_sc * BC
-                k_j = k_f32[j_s : j_s + BC]
-                g_j = g_f32[j_s : j_s + BC]
+    # Aqk[i, j] = scale * sum_k q[i,k] * k[j,k] * decay[i,j,k]
+    Aqk = scale * jnp.sum(
+        q_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1
+    )
+    Aqk = (Aqk * causal_bt).astype(dtype)
 
-                q_eg_i = q_i * exp2(g_i - gn_i)
-                k_eg_i = k_i * exp2(g_i - gn_i)
-                k_eng_j = k_j * exp2(gn_i - g_j)
-
-                Aqk_blk = (
-                    jax.lax.dot_general(
-                        q_eg_i,
-                        k_eng_j,
-                        (((1,), (1,)), ((), ())),
-                        preferred_element_type=jnp.float32,
-                    )
-                    * scale
-                )
-                Akk_blk = (
-                    jax.lax.dot_general(
-                        k_eg_i,
-                        k_eng_j,
-                        (((1,), (1,)), ((), ())),
-                        preferred_element_type=jnp.float32,
-                    )
-                    * beta_i
-                )
-
-                if i_sc == j_sc:
-                    Aqk_blk = Aqk_blk * causal_bc
-                    Akk_blk = Akk_blk * strict_bc
-
-                Aqk_blks.append(Aqk_blk)
-                L_blks.append(Akk_blk)
-
-        Aqk_rows.append(jnp.concatenate(Aqk_blks, axis=1))
-        L_rows.append(jnp.concatenate(L_blks, axis=1))
-
-    Aqk = jnp.concatenate(Aqk_rows, axis=0).astype(dtype)
-    L = jnp.concatenate(L_rows, axis=0)
+    # L[i, j] = beta[i] * sum_k k[i,k] * k[j,k] * decay[i,j,k]   (i > j)
+    L = jnp.sum(
+        k_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1
+    ) * beta_f32 * strict_bt
 
     v_beta = v.astype(jnp.float32) * beta_f32
     k_eg_beta = k_f32 * exp2(g_f32) * beta_f32
@@ -879,10 +845,16 @@ def _chunk_kda_fwd_o_gk_pl_kernel(
 
     b_g_f32 = b_g.astype(jnp.float32)
     b_q_f32 = b_q.astype(jnp.float32)
-    g_mid = (b_g_f32[0:1, :] + b_g_f32[-1:, :]) * 0.5
+    # Compute inter-chunk output: o = scale * q * exp2(g) @ h.
+    # Use g[0] (first position, largest cumsum) as reference to avoid overflow/underflow:
+    #   exp2(g[t]) = exp2(g[t] - g[0]) * exp2(g[0])
+    # g[t] - g[0] ≤ 0 for all t (cumsum is monotonically decreasing), so exp2 is safe.
+    # Factor exp2(g[0]) into h to preserve the matmul structure.
     _exp_fn = exp2 if USE_EXP2 else exp
-    b_qg = b_q_f32 * _exp_fn(b_g_f32 - g_mid)
-    b_h_scaled = b_h.astype(jnp.float32) * _exp_fn(g_mid[0, :])[:, None]
+    b_g_ref = b_g_f32[0:1, :]  # [1, K] — reference point
+    b_qg = b_q_f32 * _exp_fn(jnp.maximum(b_g_f32 - b_g_ref, -126.0))
+    # Scale h rows: h_scaled[k, v] = h[k, v] * exp2(g_ref[k])
+    b_h_scaled = b_h.astype(jnp.float32) * _exp_fn(jnp.maximum(b_g_ref[0], -126.0))[:, None]
     b_o = jnp.dot(
         b_qg, b_h_scaled, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32
     )
@@ -1203,10 +1175,24 @@ def chunk_kda_fwd(
         align=BT,
     )
     T = q.shape[1]
-    if chunk_indices is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT, max_T=T)
+    chunk_indices = prepare_chunk_indices(cu_seqlens, BT, max_T=T)
 
     assert T % BT == 0
+
+    # Fix: _align_seqs pads g with 0, but softplus(0 + dt_bias) != 0 when
+    # use_gate_in_kernel=True, producing non-zero gate activation at padding
+    # positions.  This corrupts g_last (used for state propagation in Stage 3)
+    # and kg (used for state update).  Set padding g to a large negative so
+    # softplus(large_neg + dt_bias) ≈ 0, neutralising padding positions.
+    if use_gate_in_kernel:
+        orig_lens = _orig_cu_seqlens[1:] - _orig_cu_seqlens[:-1]
+        aligned_starts = cu_seqlens[:-1]
+        pos = jnp.arange(T)
+        in_range = (pos[None, :] >= aligned_starts[:, None]) & (
+            pos[None, :] < (aligned_starts + orig_lens)[:, None]
+        )
+        valid_mask = in_range.any(axis=0)  # [T]
+        g = jnp.where(valid_mask[None, :, None, None], g, -1e4)
 
     # Step 1: Gate cumsum
     if use_gate_in_kernel:
