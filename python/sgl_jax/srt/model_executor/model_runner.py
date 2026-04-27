@@ -621,6 +621,7 @@ class ModelRunner(BaseModelRunner):
                 qk_rope_head_dim=qk_rope_head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 mesh=self.mesh,
+                dp_size=dp_size,
             )
         else:
             # Non-MLA model, OR an MLA model running fa_mha / native (both
@@ -701,6 +702,7 @@ class ModelRunner(BaseModelRunner):
                 v_head_dim=cfg.v_head_dim,
                 page_size=self.page_size,
                 mesh=self.mesh,
+                attention_data_partition_axis="data",
             )
 
         if backend not in ("fa", "fa_mha"):

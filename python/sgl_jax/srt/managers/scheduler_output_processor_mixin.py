@@ -109,9 +109,7 @@ class SchedulerOutputProcessorMixin:
 
                 req.latest_bid = result.bid
 
-                if (
-                    self.is_mixed_chunk and self.enable_overlap and req.finished()
-                ):  # TODO @Brian fix it
+                if self.is_mixed_chunk and self.enable_overlap and req.finished():
                     if info.decoding_reqs and req in info.decoding_reqs:
                         decode_count = len(info.decoding_reqs)
                         first_decode_idx = len(reqs) - decode_count

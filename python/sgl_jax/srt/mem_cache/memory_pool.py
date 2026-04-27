@@ -932,7 +932,8 @@ class MLATokenToKVPool(KVCache):
         qk_rope_head_dim: int,
         layer_num: int,
         mesh: Mesh,
-        kv_partition_axis: str = "data",  # ignored: MLA cache is replicated
+        kv_partition_axis: str = "data",
+        dp_size: int = 1,
         start_layer: int | None = None,
         end_layer: int | None = None,
     ):
@@ -940,6 +941,7 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.kv_partition_axis = kv_partition_axis
+        self.dp_size = dp_size
 
         from sgl_jax.srt.kernels.mla.v2.kernel import align_to
 
@@ -959,6 +961,7 @@ class MLATokenToKVPool(KVCache):
             "kv_lora_rank": self.kv_lora_rank,
             "qk_rope_head_dim": self.qk_rope_head_dim,
             "kv_partition_axis": self.kv_partition_axis,
+            "dp_size": self.dp_size,
             "nope_dim": self.nope_dim,
             "rope_dim": self.rope_dim,
             "kv_dim": self.kv_dim,
@@ -989,6 +992,7 @@ class MLATokenToKVPool(KVCache):
         obj.kv_lora_rank = aux_data["kv_lora_rank"]
         obj.qk_rope_head_dim = aux_data["qk_rope_head_dim"]
         obj.kv_partition_axis = aux_data["kv_partition_axis"]
+        obj.dp_size = aux_data.get("dp_size", 1)
         obj.nope_dim = aux_data["nope_dim"]
         obj.rope_dim = aux_data["rope_dim"]
         obj.kv_dim = aux_data["kv_dim"]
@@ -1017,12 +1021,12 @@ class MLATokenToKVPool(KVCache):
         """
         from sgl_jax.srt.kernels.mla.v2.kernel import get_kv_cache_shape
 
-        # MLA cache has no head axis to shard; replicate across the mesh.
-        self.kv_sharding = NamedSharding(self.mesh, P(None, None, None, None))
+        # MLA cache has no head axis to shard; page axis is sharded by DP.
+        self.kv_sharding = NamedSharding(self.mesh, P("data", None, None, None))
 
         assert self.size % self.page_size == 0, "Cache size must be divisible by page size"
 
-        total_num_pages = (self.size + self.page_size) // self.page_size
+        total_num_pages = (self.size + self.page_size * self.dp_size) // self.page_size
         buffer_shape = get_kv_cache_shape(
             total_num_pages=total_num_pages,
             page_size=self.page_size,
@@ -1065,7 +1069,7 @@ class MLATokenToKVPool(KVCache):
         )
 
     def _buffer_bytes(self) -> int:
-        total_num_pages = (self.size + self.page_size) // self.page_size
+        total_num_pages = (self.size + self.page_size * self.dp_size) // self.page_size
         from sgl_jax.srt.kernels.mla.v2.kernel import get_kv_cache_shape
 
         shape = get_kv_cache_shape(

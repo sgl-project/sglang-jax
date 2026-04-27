@@ -278,6 +278,7 @@ def create_mla_forward_batch(
         v_head_dim=v_head_dim,
         page_size=page_size,
         mesh=mesh,
+        attention_data_partition_axis="data",
     )
 
     mwb = ModelWorkerBatch(
@@ -299,7 +300,11 @@ def create_mla_forward_batch(
         token_ids_logprobs=None,
         extend_logprob_start_lens=None,
         extend_input_logprob_token_ids=None,
+        logits_indices=np.cumsum(q_lens) - 1 if mode == "prefill" else None,
         real_bs=len(lens),
+        real_bs_per_dp=[len(lens)],
+        dp_size=1,
+        per_dp_bs_size=len(lens),
         spec_info=None,
     )
 
@@ -455,7 +460,7 @@ class TestMLAAttention(CustomTestCase):
             q_pe,
             new_kv_c,
             new_k_pe,
-            cache_jnp,
+            jax.device_put(cache_jnp, NamedSharding(mesh, P())),
             jnp.asarray(seq_lens_np, dtype=jnp.int32),
             jnp.asarray(padded_page_indices, dtype=jnp.int32),
             jnp.asarray(cu_q_lens_np, dtype=jnp.int32),
