@@ -436,6 +436,21 @@ class MockRequest:
         self.prefix_indices = prefix_indices
         self.last_node = last_node
         self.extra_key = extra_key
+        self.rid = "mock-req"
+        self.kv_committed_len = len(origin_input_ids) + max(len(output_ids) - 1, 0)
+        self.kv_allocated_len = self.kv_committed_len
+        self.kv_committed_freed = False
+        self.kv_overallocated_freed = False
+
+    def pop_committed_kv_cache(self) -> int:
+        assert not self.kv_committed_freed
+        self.kv_committed_freed = True
+        return self.kv_committed_len
+
+    def pop_overallocated_kv_cache(self):
+        assert not self.kv_overallocated_freed
+        self.kv_overallocated_freed = True
+        return self.kv_committed_len, self.kv_allocated_len
 
 
 class TestRadixCacheWithRequests(unittest.TestCase):
