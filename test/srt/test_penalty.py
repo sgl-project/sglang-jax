@@ -162,6 +162,26 @@ class TestPenalty(CustomTestCase):
         }
         self._test_penalty_effect(prompt, baseline_params, penalty_params, "data", max_tokens=100)
 
+    def test_penalty_edge_cases_negative_penalty_values(self):
+        """Negative penalty values should increase repetition (expected_reduction=False)."""
+        prompt = "Write the word 'test' exactly 15 times in a row, separated by spaces."
+        baseline_params = {
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+        }
+        negative_penalty_params = {
+            "frequency_penalty": -0.5,
+            "presence_penalty": -0.25,
+        }
+        self._test_penalty_effect(
+            prompt,
+            baseline_params,
+            negative_penalty_params,
+            "test",
+            expected_reduction=False,
+            max_tokens=60,
+        )
+
     def test_server_alive(self):
         """Sanity check: server is up and /v1/chat/completions responds."""
         resp = requests.post(
