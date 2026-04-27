@@ -138,7 +138,6 @@ class SamplingMetadata:
         )
 
         # Extract penalty information from penalizer orchestrator
-        # TODO: @Brian fix penalty with DataParallel
         linear_penalty_device = None
         do_penalties = False
         linear_penalty_sharding = NamedSharding(mesh, PartitionSpec("data", "tensor"))
@@ -347,7 +346,7 @@ class SamplingBatchInfo:
         cls,
         info: ScheduleReqsInfo,
         vocab_size: int,
-        batch: ScheduleBatch = None,  # Optional: needed for penalizer_orchestrator
+        batch: ScheduleBatch = None,  # Unused; kept for backward-compat with callers
     ):
         global_server_args_dict = cls._get_global_server_args_dict()
         enable_deterministic = global_server_args_dict["enable_deterministic_sampling"]
@@ -369,13 +368,10 @@ class SamplingBatchInfo:
             else None
         )
 
-        # Initialize penalty orchestrator
-        # Note: penalizer_orchestrator requires the full ScheduleBatch object to access
-        # global batch state for penalties (frequency, presence, min_new_tokens).
-        # In DP mode, pass the full batch; the orchestrator will handle per-request penalties.
+        # Per-DP penalty orchestrator: scoped to this rank's reqs only.
         penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
             vocab_size=vocab_size,
-            batch=batch,  # Full ScheduleBatch needed for global state
+            reqs_info=info,
             penalizers={
                 penaltylib.BatchedFrequencyPenalizer,
                 penaltylib.BatchedMinNewTokensPenalizer,
