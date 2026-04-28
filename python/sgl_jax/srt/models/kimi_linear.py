@@ -608,6 +608,9 @@ class KimiLinearForCausalLM(nnx.Module):
         )
         weight_mappings = self._create_weight_mappings()
         loader.load_weights_from_safetensors(weight_mappings)
+        for layer in self.model.layers:
+            if not layer.is_kda:
+                layer.self_attn.post_load_weights()
         logger.info("Weights loaded successfully!")
 
     def _create_weight_mappings(self) -> dict:
