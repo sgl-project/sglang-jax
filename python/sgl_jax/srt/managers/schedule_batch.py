@@ -1357,10 +1357,10 @@ class ScheduleBatch:
 
         chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
         for dp_rank, info in enumerate(self.reqs_info):
-            if not info.reqs or info.prefix_lens is None:
+            if not info.reqs:
                 continue
-            for i, req in enumerate(info.reqs):
-                pre_len = info.prefix_lens[i]
+            for req in info.reqs:
+                pre_len = len(req.prefix_indices)
                 if self.enable_overlap and req.is_chunked > 0:
                     if chunked_prefill_size is not None and chunked_prefill_size > 0:
                         pre_len -= chunked_prefill_size

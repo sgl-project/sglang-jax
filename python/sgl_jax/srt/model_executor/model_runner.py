@@ -391,7 +391,6 @@ class ModelRunner(BaseModelRunner):
         if swa_num_kv_heads is None:
             return self.model_config.num_hidden_layers
 
-        num_kv_heads = self.model_config.hf_config.num_key_value_heads
         # Compute SWA vs full layer counts from hybrid_layer_pattern
         pattern = getattr(self.model_config.hf_config, "hybrid_layer_pattern", None)
         if pattern is None:
@@ -399,8 +398,12 @@ class ModelRunner(BaseModelRunner):
         swa_layers = sum(1 for p in pattern if p == 1)
         full_layers = sum(1 for p in pattern if p == 0)
 
-        # Effective layer count weighted by KV head ratio
-        effective = (swa_num_kv_heads / num_kv_heads) * swa_layers + full_layers
+        from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
+
+        full_heads_per_device = self.model_config.get_num_kv_heads(self.attention_tp_size)
+        swa_heads_per_device = get_num_kv_heads_by_tp(swa_num_kv_heads, self.attention_tp_size)
+        ratio = swa_heads_per_device / full_heads_per_device
+        effective = ratio * swa_layers + full_layers
         return effective
 
     def _compute_cell_size(self) -> int:
@@ -435,7 +438,7 @@ class ModelRunner(BaseModelRunner):
             )
 
         return (
-            self.model_config.get_num_kv_heads(self.tp_size)
+            self.model_config.get_num_kv_heads(self.attention_tp_size)
             * align128(self.model_config.head_dim)
             * 2
             * num_layers

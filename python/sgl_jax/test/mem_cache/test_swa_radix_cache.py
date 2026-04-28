@@ -139,8 +139,8 @@ class TestSWARadixCache(CustomTestCase):
                     swa_total += len(node.value)
             stack.extend(node.children.values())
 
-        actual_full = cache.full_evictable_size_ + cache.full_protected_size_
-        actual_swa = cache.swa_evictable_size_ + cache.swa_protected_size_
+        actual_full = sum(cache.full_evictable_size_.values()) + sum(cache.full_protected_size_.values())
+        actual_swa = sum(cache.swa_evictable_size_.values()) + sum(cache.swa_protected_size_.values())
         self.assertEqual(
             full_total, actual_full,
             f"full size mismatch: tree={full_total}, tracked={actual_full}. {msg}",
