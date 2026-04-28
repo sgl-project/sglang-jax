@@ -34,7 +34,9 @@ from sgl_jax.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sgl_jax.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
     MHATokenToKVPool,
+    MLATokenToKVPool,
     ReqToTokenPool,
     SWAKVPool,
 )
@@ -404,8 +406,19 @@ class ModelRunner(BaseModelRunner):
         effective = (swa_num_kv_heads / num_kv_heads) * swa_layers + full_layers
         return effective
 
+    def _kv_pool_layer_count(self) -> int:
+        """Layers that allocate KV slots; for hybrid linear-recurrent models
+        KDA layers write RecurrentStatePool instead so are excluded.
+        Falls back to adjust_layer_num() (SWA-effective or num_hidden_layers).
+        """
+        cfg = self.linear_recurrent_config
+        if cfg is not None:
+            return len(cfg.full_attention_layer_ids)
+        return self.adjust_layer_num()
+
     def _compute_cell_size(self) -> int:
-        """Per-token KV cache cost in bytes per device, summed across layers.
+        """Per-token KV cache cost in bytes per device, summed across layers
+        that actually use the KV pool.
 
         Two layouts:
         - absorbed MLA (`fa` on MLA model): only the latent c_kv is cached
@@ -422,7 +435,7 @@ class ModelRunner(BaseModelRunner):
             return (x + 127) // 128 * 128
 
         dtype_size = jnp.dtype(self.kv_cache_dtype).itemsize
-        num_layers = self.adjust_layer_num()
+        num_layers = self._kv_pool_layer_count()
 
         if self.use_mla_backend and self.server_args.attention_backend == "fa":
             # Two-segment alignment matches the MLA v2 kernel ABI: lkv and rope
@@ -691,29 +704,57 @@ class ModelRunner(BaseModelRunner):
                     "model config; got "
                     f"kv_lora_rank={kv_lora_rank}, qk_rope_head_dim={qk_rope_head_dim}."
                 )
-            from sgl_jax.srt.mem_cache.memory_pool import MLATokenToKVPool
 
-            self.token_to_kv_pool = MLATokenToKVPool(
-                size=self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                layer_num=self.model_config.num_hidden_layers,
-                mesh=self.mesh,
-            )
+            if recurrent_cfg is not None:
+                # Hybrid recurrent: wrap to allocate only L_full KV slots.
+                self.token_to_kv_pool = HybridLinearKVPool(
+                    size=self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    full_attention_layer_ids=recurrent_cfg.full_attention_layer_ids,
+                    mesh=self.mesh,
+                    token_to_kv_pool_class=MLATokenToKVPool,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                )
+            else:
+                self.token_to_kv_pool = MLATokenToKVPool(
+                    size=self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    layer_num=self.model_config.num_hidden_layers,
+                    mesh=self.mesh,
+                )
         else:
             # Non-MLA model, OR an MLA model running fa_mha / native (both
             # decompress latent KV per-forward and store full per-head K/V).
-            self.token_to_kv_pool = MHATokenToKVPool(
-                size=self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
-                head_dim=(self.model_config.head_dim + 127) // 128 * 128,
-                layer_num=self.model_config.num_hidden_layers,
-                mesh=self.mesh,
-            )
+            if recurrent_cfg is not None:
+                self.token_to_kv_pool = HybridLinearKVPool(
+                    size=self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    full_attention_layer_ids=recurrent_cfg.full_attention_layer_ids,
+                    mesh=self.mesh,
+                    token_to_kv_pool_class=MHATokenToKVPool,
+                    head_num=self.model_config.get_total_num_kv_heads_with_replication(
+                        self.tp_size
+                    ),
+                    head_dim=(self.model_config.head_dim + 127) // 128 * 128,
+                )
+            else:
+                self.token_to_kv_pool = MHATokenToKVPool(
+                    size=self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_total_num_kv_heads_with_replication(
+                        self.tp_size
+                    ),
+                    head_dim=(self.model_config.head_dim + 127) // 128 * 128,
+                    layer_num=self.model_config.num_hidden_layers,
+                    mesh=self.mesh,
+                )
 
         # Wrap KV pool in MemoryPools (uniform replace_all path for _forward).
         if has_recurrent_state:

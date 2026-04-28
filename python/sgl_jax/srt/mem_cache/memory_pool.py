@@ -882,6 +882,132 @@ class SWAKVPool(KVCache):
         return mapping_jax[loc]
 
 
+@register_pytree_node_class
+class HybridLinearKVPool(KVCache):
+    """KV cache wrapper for hybrid linear-recurrent models (e.g. Kimi-Linear).
+
+    Composition + global->physical id translation. Owns ONE inner KV pool
+    sized to len(full_attention_layer_ids); KDA / linear-recurrent layers do
+    not allocate KV slots here (they live in RecurrentStatePool).
+
+    Translates GLOBAL layer_id -> inner-pool physical index in every
+    accessor, so attention backends and models stay global-`layer_id`-aware.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: jnp.dtype,
+        full_attention_layer_ids: list[int],
+        mesh: Mesh,
+        token_to_kv_pool_class: type[KVCache] = MHATokenToKVPool,
+        **kvcache_kwargs,
+    ):
+        self.mesh = mesh
+        self.full_attention_layer_ids = list(full_attention_layer_ids)
+        self.full_layer_nums = len(self.full_attention_layer_ids)
+
+        self.full_kv_pool = token_to_kv_pool_class(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            layer_num=self.full_layer_nums,
+            mesh=mesh,
+            **kvcache_kwargs,
+        )
+
+        self.full_attention_layer_id_mapping: dict[int, int] = {
+            global_id: i for i, global_id in enumerate(self.full_attention_layer_ids)
+        }
+        self.mem_usage = self.full_kv_pool.mem_usage
+
+    # ---- accessors (translate then delegate) -------------------------------
+
+    def _to_physical(self, layer_id: int) -> int:
+        if layer_id not in self.full_attention_layer_id_mapping:
+            raise ValueError(
+                f"layer_id {layer_id} is not a full-attention layer "
+                f"(KDA/linear-recurrent layers do not use the KV pool); "
+                f"full_attention_layer_ids={self.full_attention_layer_ids}"
+            )
+        return self.full_attention_layer_id_mapping[layer_id]
+
+    def get_fused_kv_buffer(self, layer_id: int) -> jax.Array:
+        return self.full_kv_pool.get_fused_kv_buffer(self._to_physical(layer_id))
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.full_kv_pool.get_kv_buffer(self._to_physical(layer_id))
+
+    def set_kv_buffer(
+        self,
+        layer_id: int,
+        loc: jax.Array,
+        cache_k: jax.Array,
+        cache_v: jax.Array,
+        is_decode: bool = False,
+    ) -> None:
+        self.full_kv_pool.set_kv_buffer(
+            self._to_physical(layer_id), loc, cache_k, cache_v, is_decode
+        )
+
+    def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
+        """Accept COMPACTED list (length L_full, in full_attention_layer_ids order).
+
+        Differs from SWAKVPool.replace_buffer which expects full-length input —
+        KDA layers don't write KV pool, so the model emits a compacted list.
+        """
+        if len(kv_buffer) != self.full_layer_nums:
+            raise ValueError(
+                f"HybridLinearKVPool.replace_buffer expects compacted list of "
+                f"length {self.full_layer_nums} "
+                f"(= len(full_attention_layer_ids)={self.full_attention_layer_ids}), "
+                f"got {len(kv_buffer)}"
+            )
+        self.full_kv_pool.replace_buffer(kv_buffer)
+
+    # ---- delegated bulk ops ------------------------------------------------
+
+    def get_kv_size_bytes(self):
+        return self.full_kv_pool.get_kv_size_bytes()
+
+    def get_cpu_copy(self, indices):
+        return self.full_kv_pool.get_cpu_copy(indices)
+
+    def load_cpu_copy(self, kv_cache_host, indices):
+        return self.full_kv_pool.load_cpu_copy(kv_cache_host, indices)
+
+    def clear_cache(self, indices: jax.Array):
+        return self.full_kv_pool.clear_cache(indices)
+
+    # full_kv_pool MUST be a pytree child (not aux_data): MemoryPools'
+    # donate_argnames=["memory_pools"] needs the inner KV buffers as leaves.
+
+    def tree_flatten(self):
+        children = (self.full_kv_pool,)
+        aux_data = {
+            "mesh": self.mesh,
+            "mem_usage": self.mem_usage,
+            "full_attention_layer_ids": tuple(self.full_attention_layer_ids),
+            "full_layer_nums": self.full_layer_nums,
+            "full_attention_layer_id_mapping": tuple(
+                sorted(self.full_attention_layer_id_mapping.items())
+            ),
+        }
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = object.__new__(cls)
+        obj.mesh = aux_data["mesh"]
+        obj.mem_usage = aux_data["mem_usage"]
+        obj.full_attention_layer_ids = list(aux_data["full_attention_layer_ids"])
+        obj.full_layer_nums = aux_data["full_layer_nums"]
+        obj.full_attention_layer_id_mapping = dict(aux_data["full_attention_layer_id_mapping"])
+        obj.full_kv_pool = children[0]
+        return obj
+
+
 def _set_fused_kv_buffer(
     fused_kv: jax.Array,
     loc: jax.Array,
