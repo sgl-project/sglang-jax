@@ -1430,7 +1430,7 @@ class ScheduleBatch:
 
         if bs_padding_size > 0:
             invalid_req_pool_indices = np.array(
-                [-1] * bs_padding_size, dtype=req_pool_indices_cpu.dtype
+                [0] * bs_padding_size, dtype=req_pool_indices_cpu.dtype
             )
             req_pool_indices_cpu = np.concat(
                 [
@@ -1617,7 +1617,7 @@ class ScheduleBatch:
             apply_for_deepstack=self.apply_for_deepstack,
             deepstack_visual_embedding=self.deepstack_visual_embedding,
             recurrent_indices=(
-                self.req_to_token_pool.get_linear_recurrent_indices(self.req_pool_indices)
+                self.req_to_token_pool.get_linear_recurrent_indices(req_pool_indices_cpu)
                 if isinstance(self.req_to_token_pool, HybridReqToTokenPool)
                 else None
             ),
