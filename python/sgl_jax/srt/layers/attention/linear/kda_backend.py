@@ -45,7 +45,8 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         ssm_states, conv_states = self.get_state(
             recurrent_state_pool, layer.layer_id, recurrent_indices
         )
-        q_state, k_state, v_state = self._unpack_conv_states(conv_states, layer)
+        # TODO: add v_head_num_per_device, etc to make it more compatible
+        q_state, k_state, v_state = self._unpack_conv_states(conv_states)
 
         # Conv weights are stored directly in depthwise ``[D, K]`` layout —
         # the format ``short_convolution`` consumes — so no reshape needed.
