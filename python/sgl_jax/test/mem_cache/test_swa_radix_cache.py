@@ -109,9 +109,7 @@ class TestSWARadixCache(CustomTestCase):
     def _find_node_by_key_prefix(self, start_token):
         """Walk tree from root to find the node whose key starts with start_token."""
         root = self.cache.root_node
-        child_key = self.cache.get_child_key_fn(
-            RadixKey([start_token], None)
-        )
+        child_key = self.cache.get_child_key_fn(RadixKey([start_token], None))
         if child_key in root.children:
             return root.children[child_key]
         return None
@@ -139,14 +137,20 @@ class TestSWARadixCache(CustomTestCase):
                     swa_total += len(node.value)
             stack.extend(node.children.values())
 
-        actual_full = sum(cache.full_evictable_size_.values()) + sum(cache.full_protected_size_.values())
-        actual_swa = sum(cache.swa_evictable_size_.values()) + sum(cache.swa_protected_size_.values())
+        actual_full = sum(cache.full_evictable_size_.values()) + sum(
+            cache.full_protected_size_.values()
+        )
+        actual_swa = sum(cache.swa_evictable_size_.values()) + sum(
+            cache.swa_protected_size_.values()
+        )
         self.assertEqual(
-            full_total, actual_full,
+            full_total,
+            actual_full,
             f"full size mismatch: tree={full_total}, tracked={actual_full}. {msg}",
         )
         self.assertEqual(
-            swa_total, actual_swa,
+            swa_total,
+            actual_swa,
             f"swa size mismatch: tree={swa_total}, tracked={actual_swa}. {msg}",
         )
 
@@ -574,7 +578,6 @@ class TestSWARadixCache(CustomTestCase):
         self.assertEqual(allocator.swa_available_size(dp_rank=0), initial_swa[0])
         self.assertEqual(allocator.swa_available_size(dp_rank=1), initial_swa[1])
 
-
     def test_evictable_size_returns_min(self):
         cache = self.cache
         indices = self._alloc_indices(10)
@@ -644,9 +647,7 @@ class TestSWARadixCache(CustomTestCase):
 
         # Re-insert key_a with swa_evicted_seqlen=0 (Branch 1: not evicted)
         new_val = self._alloc_indices(len(key_a))
-        cache.insert(
-            key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=0
-        )
+        cache.insert(key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=0)
 
         # The tombstone should be healed (revived)
         healed_node = cache.root_node.children[child_key]
@@ -666,9 +667,7 @@ class TestSWARadixCache(CustomTestCase):
         # Re-insert with swa_evicted_seqlen=5 (in the middle of shared[0:10])
         # Branch 2: split at position 5, revive [5:10], keep [0:5] as tombstone
         new_val = self._alloc_indices(len(key_a))
-        cache.insert(
-            key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=5
-        )
+        cache.insert(key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=5)
 
         # Walk tree: root → [0:5] (tombstone) → [5:10] (revived) → {[10:15], [20:24]}
         front_node = cache.root_node.children[child_key]
@@ -698,9 +697,7 @@ class TestSWARadixCache(CustomTestCase):
         # Re-insert with swa_evicted_seqlen=15 (>= node_end=10)
         # Branch 3: entire node already evicted → keep tombstone
         new_val = self._alloc_indices(len(key_a))
-        cache.insert(
-            key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=15
-        )
+        cache.insert(key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=15)
 
         # The shared prefix should still be tombstone
         self.assertTrue(cache.root_node.children[child_key].swa_tombstone)
@@ -771,9 +768,7 @@ class TestSWARadixCache(CustomTestCase):
         # Second insert with protected_prefix_len=10 (prev_prefix_len) and swa_evicted_seqlen=5
         # Branch 2 applies: swa_evicted_seqlen(5) < node_end(20), split at 5, revive [5:20]
         val_second = self._alloc_indices(len(key))
-        cache.insert(
-            key, value=val_second, prev_prefix_len=10, swa_evicted_seqlen=5
-        )
+        cache.insert(key, value=val_second, prev_prefix_len=10, swa_evicted_seqlen=5)
 
         # Match should still return 20 tokens (sliding_window=4, suffix > 4)
         match2 = cache.match_prefix(key)
@@ -860,9 +855,7 @@ class TestSWARadixCache(CustomTestCase):
 
             # Re-insert with new values (simulating healing)
             new_val = self._alloc_indices(len(key))
-            cache.insert(
-                key, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=0
-            )
+            cache.insert(key, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=0)
             self._verify_size_consistency_for(cache, f"cycle {cycle} re-insert")
 
         # Final full evict
@@ -889,7 +882,9 @@ class TestSWARadixCache(CustomTestCase):
                 val = self._alloc_indices(length)
                 swa_evicted = rng.choice([0, 0, 0, rng.randint(0, length)])
                 cache.insert(
-                    key, value=val, prev_prefix_len=0,
+                    key,
+                    value=val,
+                    prev_prefix_len=0,
                     swa_evicted_seqlen=swa_evicted,
                 )
             elif op == "evict_swa":
@@ -1133,9 +1128,7 @@ class TestSWARadixCache(CustomTestCase):
         # Re-inserting with non-page-aligned swa_evicted_seqlen should assert
         new_val = self._alloc_indices(len(key_a))
         with self.assertRaises(AssertionError):
-            paged_cache.insert(
-                key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=3
-            )
+            paged_cache.insert(key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=3)
 
     def test_cache_unfinished_req_writeback_range(self):
         """T22: cache_unfinished_req writes back from last_matched_prefix_len, not len(prefix_indices)."""
@@ -1153,9 +1146,7 @@ class TestSWARadixCache(CustomTestCase):
         # Insert extended sequence (simulating cache_unfinished_req)
         key_full = list(range(0, 20))
         val2 = self._alloc_indices(len(key_full))
-        new_prefix_len = cache.insert(
-            key_full, value=val2, prev_prefix_len=10, swa_evicted_seqlen=0
-        )
+        cache.insert(key_full, value=val2, prev_prefix_len=10, swa_evicted_seqlen=0)
 
         # Match the full key
         match2 = cache.match_prefix(key_full)

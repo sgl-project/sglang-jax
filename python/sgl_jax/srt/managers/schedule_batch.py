@@ -19,6 +19,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 import dataclasses
 import logging
+import os
 import threading
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
@@ -1333,7 +1334,9 @@ class ScheduleBatch:
         )
 
         if self.forward_mode is not None and self.forward_mode.is_decode():
-            evict_interval = max(min(sliding_window_size, page_size), 1)
+            multiplier = float(os.environ.get("SGL_JAX_SWA_EVICTION_INTERVAL_MULTIPLIER", "1.0"))
+            evict_interval = max(page_size, int(sliding_window_size * multiplier))
+            evict_interval = (evict_interval // page_size) * page_size
             for dp_rank, info in enumerate(self.reqs_info):
                 if not info.reqs:
                     continue
@@ -1361,9 +1364,13 @@ class ScheduleBatch:
                 continue
             for req in info.reqs:
                 pre_len = len(req.prefix_indices)
-                if self.enable_overlap and req.is_chunked > 0:
-                    if chunked_prefill_size is not None and chunked_prefill_size > 0:
-                        pre_len -= chunked_prefill_size
+                if (
+                    self.enable_overlap
+                    and req.is_chunked > 0
+                    and chunked_prefill_size is not None
+                    and chunked_prefill_size > 0
+                ):
+                    pre_len -= chunked_prefill_size
                 self._evict_swa(req, pre_len, sliding_window_size, page_size, dp_rank)
 
     def _evict_swa(

@@ -584,11 +584,15 @@ class TestSWAOverlapSafety(CustomTestCase):
         from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ScheduleReqsInfo
         from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 
-        tree_cache = ChunkCache(
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.alloc,
-            page_size=self.page_size,
-        ) if forward_mode.is_extend() else None
+        tree_cache = (
+            ChunkCache(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.alloc,
+                page_size=self.page_size,
+            )
+            if forward_mode.is_extend()
+            else None
+        )
 
         reqs_info = ScheduleReqsInfo(
             reqs=[req],

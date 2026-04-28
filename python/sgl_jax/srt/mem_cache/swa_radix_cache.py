@@ -371,8 +371,13 @@ class SWARadixCache(BasePrefixCache):
             last_host_node=last_node,
         )
 
-    def insert(self, key: RadixKey | list, value=None, prev_prefix_len: int = 0,
-               swa_evicted_seqlen: int = 0) -> int:
+    def insert(
+        self,
+        key: RadixKey | list,
+        value=None,
+        prev_prefix_len: int = 0,
+        swa_evicted_seqlen: int = 0,
+    ) -> int:
         if self.disable:
             return 0
 
@@ -382,8 +387,9 @@ class SWARadixCache(BasePrefixCache):
 
         if value is None:
             value = [x for x in key.token_ids]
-        return self._insert_helper(self.root_node, key, value, prev_prefix_len,
-                                    swa_evicted_seqlen=swa_evicted_seqlen)
+        return self._insert_helper(
+            self.root_node, key, value, prev_prefix_len, swa_evicted_seqlen=swa_evicted_seqlen
+        )
 
     def cache_finished_req(self, req: Req) -> None:
         """Cache request when it finishes."""
@@ -468,7 +474,7 @@ class SWARadixCache(BasePrefixCache):
         swa_uuid_for_lock = self.inc_lock_ref(new_last_node)
 
         if self.page_size != 1:
-            req.prefix_indices = np.concatenate([new_indices, kv_indices[len(new_indices):]])
+            req.prefix_indices = np.concatenate([new_indices, kv_indices[len(new_indices) :]])
         else:
             req.prefix_indices = new_indices
         req.last_node = new_last_node
@@ -864,8 +870,9 @@ class SWARadixCache(BasePrefixCache):
             self.swa_lru_list.insert_mru(child)
         return new_node
 
-    def _add_new_node(self, parent: TreeNode, key: RadixKey, value,
-                      swa_tombstone: bool = False) -> TreeNode:
+    def _add_new_node(
+        self, parent: TreeNode, key: RadixKey, value, swa_tombstone: bool = False
+    ) -> TreeNode:
         assert len(key) > 0
         child_key = self.get_child_key_fn(key)
         new_node = TreeNode()
@@ -882,8 +889,14 @@ class SWARadixCache(BasePrefixCache):
             self.swa_evictable_size_[new_node_dp_rank] += len(value)
         return new_node
 
-    def _insert_helper(self, node: TreeNode, key: RadixKey, value,
-                        update_kv_after_len: int, swa_evicted_seqlen: int = 0) -> int:
+    def _insert_helper(
+        self,
+        node: TreeNode,
+        key: RadixKey,
+        value,
+        update_kv_after_len: int,
+        swa_evicted_seqlen: int = 0,
+    ) -> int:
         # Update the last access time from root to leaf, so that
         # swa will tombstone the node closer to root first
         node.last_access_time = time.monotonic()
@@ -975,11 +988,14 @@ class SWARadixCache(BasePrefixCache):
                 self.token_to_kv_pool_allocator.free(value, dp_rank=value_dp_rank)
                 return total_prefix_length
 
-            if (swa_evicted_seqlen > total_prefix_length
-                    and swa_evicted_seqlen < total_prefix_length + len(key)):
+            if (
+                swa_evicted_seqlen > total_prefix_length
+                and swa_evicted_seqlen < total_prefix_length + len(key)
+            ):
                 swa_tombstone_len = swa_evicted_seqlen - total_prefix_length
-                node = self._add_new_node(node, key[:swa_tombstone_len],
-                                          value[:swa_tombstone_len], swa_tombstone=True)
+                node = self._add_new_node(
+                    node, key[:swa_tombstone_len], value[:swa_tombstone_len], swa_tombstone=True
+                )
                 key = key[swa_tombstone_len:]
                 value = value[swa_tombstone_len:]
 
