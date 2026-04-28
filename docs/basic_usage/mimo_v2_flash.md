@@ -16,13 +16,13 @@ Uses the fused Pallas kernel which combines expert computation and all-to-all co
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache uv run python -u -m sgl_jax.launch_server \
     --model-path XiaomiMiMo/MiMo-V2-Flash \
     --trust-remote-code \
-    --tp-size 16 --ep-size 16 \
+    --tp-size 16 --dp-size 4 --ep-size 16 \
     --moe-backend fused \
     --nnodes 4 --node-rank $RANK \
     --dist-init-addr $MASTER_IP:30000 \
     --host 0.0.0.0 --port 30271 \
     --page-size 256 --context-length 262144 \
-    --disable-radix-cache --chunked-prefill-size 2048 \
+    --chunked-prefill-size 2048 \
     --dtype bfloat16 --mem-fraction-static 0.95 \
     --swa-full-tokens-ratio 0.2 --skip-server-warmup \
     --max-running-requests 128 \
@@ -37,13 +37,13 @@ Uses GMM-based expert-parallel dispatch with separate all-to-all communication:
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache uv run python -u -m sgl_jax.launch_server \
     --model-path XiaomiMiMo/MiMo-V2-Flash \
     --trust-remote-code \
-    --tp-size 16 --ep-size 16 \
+    --tp-size 16 --dp-size 4 --ep-size 16 \
     --moe-backend epmoe \
     --nnodes 4 --node-rank $RANK \
     --dist-init-addr $MASTER_IP:30000 \
     --host 0.0.0.0 --port 30271 \
     --page-size 256 --context-length 262144 \
-    --disable-radix-cache --chunked-prefill-size 2048 \
+    --chunked-prefill-size 2048 \
     --dtype bfloat16 --mem-fraction-static 0.95 \
     --swa-full-tokens-ratio 0.2 --skip-server-warmup \
     --max-running-requests 128 \
@@ -52,10 +52,10 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache uv run python -u -m sgl_jax.launch_serv
 
 Key flags:
 - `--tp-size / --ep-size`: Match your total TPU chip count across all nodes
+- `--dp-size`: Enables data parallelism for the attention path. The attention TP degree becomes `tp_size / dp_size` (e.g. `16 / 4 = 4`). MoE layers still run with full `ep_size`.
 - `--moe-backend fused|epmoe`: `fused` uses an optimized Pallas kernel; `epmoe` uses GMM-based expert dispatch
 - `--swa-full-tokens-ratio 0.2`: Allocates 20% of KV cache pool to full-attention layers, 80% to SWA layers
 - `--page-size 256`: Recommended page size for SWA eviction efficiency
-- `--disable-radix-cache`: Recommended for multi-node deployments
 
 ### Single-node (TPU v7x-8)
 
@@ -63,11 +63,11 @@ Key flags:
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache uv run python -u -m sgl_jax.launch_server \
     --model-path XiaomiMiMo/MiMo-V2-Flash \
     --trust-remote-code \
-    --tp-size 8 --ep-size 8 \
+    --tp-size 8 --dp-size 2 --ep-size 8 \
     --moe-backend fused \
     --host 0.0.0.0 --port 30271 \
     --page-size 256 --context-length 262144 \
-    --disable-radix-cache --chunked-prefill-size 4096 \
+    --chunked-prefill-size 4096 \
     --dtype bfloat16 --mem-fraction-static 0.95 \
     --swa-full-tokens-ratio 0.2 --skip-server-warmup \
     --max-running-requests 128 \
@@ -126,10 +126,10 @@ evalscope eval \
 
 ### TPU Configuration Guide
 
-| TPU Type | Nodes | TP Size | EP Size | chunked-prefill-size | mem-fraction-static | max-running-requests |
-|----------|-------|---------|---------|----------------------|--------------------|-----------------------|
-| v6e-16   | 4     | 16      | 16      | 2048                 | 0.95               | 128                   |
-| v7x-8    | 1     | 8       | 8       | 4096                 | 0.95               | 128                   |
+| TPU Type | Nodes | TP Size | DP Size | EP Size | chunked-prefill-size | mem-fraction-static | max-running-requests |
+|----------|-------|---------|---------|---------|----------------------|--------------------|-----------------------|
+| v6e-16   | 4     | 16      | 4       | 16      | 2048                 | 0.95               | 128                   |
+| v7x-8    | 1     | 8       | 2       | 8       | 4096                 | 0.95               | 128                   |
 
 ### SWA Pool Tuning
 - Monitor SWA pool usage via server logs: `swa token usage` and `full token usage`

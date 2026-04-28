@@ -57,10 +57,9 @@ Run the **same** command on every node, only varying `${NODE_RANK}` and pointing
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
     --model-path XiaomiMiMo/MiMo-V2.5-Pro \
     --trust-remote-code \
-    --tp-size 32 --ep-size 32 \
+    --tp-size 32 --dp-size 4 --ep-size 32 \
     --moe-backend fused \
     --host 0.0.0.0 --port 30271 \
-    --disable-radix-cache \
     --page-size 256 --context-length 262144 \
     --chunked-prefill-size 4096 \
     --dtype bfloat16 --mem-fraction-static 0.95 \
@@ -79,7 +78,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
     --model-path XiaomiMiMo/MiMo-V2.5-Pro \
     --trust-remote-code \
     --port 30271 \
-    --tp-size 64 --ep-size 64 \
+    --tp-size 64 --dp-size 8 --ep-size 64 \
     --context-length 262144 --max-seq-len 4096 \
     --chunked-prefill-size 4096 --max-prefill-tokens 16384 \
     --page-size 256 \
@@ -87,7 +86,6 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
     --max-running-requests 512 \
     --swa-full-tokens-ratio 0.15 \
     --attention-backend fa --moe-backend fused \
-    --disable-radix-cache \
     --nnodes 16 --node-rank ${NODE_RANK} \
     --dist-init-addr ${MASTER_ADDR}
 ```
@@ -97,6 +95,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
 ### Key flags
 
 - `--tp-size / --ep-size`: Match the total JAX device count across all nodes. v7x exposes 2 logical devices per chip (32 = 16 chips × 2); v6e exposes 1 (64 = 64 chips × 1).
+- `--dp-size`: Enables data parallelism for the attention path. The attention TP degree becomes `tp_size / dp_size` (8 for both recipes here). MoE layers still run with full `ep_size`.
 - `--moe-backend fused`: Uses the fused Pallas MoE kernel (recommended). `epmoe` is also supported but slower at this scale.
 - `--page-size 256`: Required page size for the SWA pool's eviction logic. Smaller page sizes are not supported with MiMo-V2.5-Pro.
 - `--context-length 262144`: 256K context. Match this to your workload's max prompt + output length.
@@ -104,7 +103,6 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
 - `--swa-full-tokens-ratio`: Fraction of the KV cache pool reserved for full-attention layers. `0.25` for v7x, `0.15` for v6e.
 - `--mem-fraction-static`: Fraction of HBM reserved for weights + KV cache. Lower if the host shares the TPU.
 - `--max-running-requests 512`: Upper bound on concurrent decoding requests.
-- `--disable-radix-cache`: Required for now — radix cache is not yet supported.
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache`: Persists XLA / Pallas compilation cache so subsequent restarts skip the ~4-minute precompile step.
 
 ## Running on GKE (Indexed Job)
@@ -168,10 +166,9 @@ spec:
           JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
               --model-path /models/MiMo-V2.5-Pro \
               --trust-remote-code \
-              --tp-size 32 --ep-size 32 \
+              --tp-size 32 --dp-size 4 --ep-size 32 \
               --moe-backend fused \
               --host 0.0.0.0 --port 30271 \
-              --disable-radix-cache \
               --page-size 256 --context-length 262144 \
               --chunked-prefill-size 4096 \
               --dtype bfloat16 --mem-fraction-static 0.95 \
@@ -265,10 +262,6 @@ Reference numbers measured on TPU v7x-16 (`2x2x4`, `tp=32 ep=32`):
 | MiMo-V2.5-Pro   | aime25  | AveragePass@1 | AIME2025-I  | 15  | 0.8667  |
 | MiMo-V2.5-Pro   | aime25  | AveragePass@1 | AIME2025-II | 15  | 1.0000  |
 | MiMo-V2.5-Pro   | aime25  | AveragePass@1 | OVERALL     | 30  | 0.9334  |
-
-## Known Issues
-
-- Radix cache cannot be enabled yet — always pass `--disable-radix-cache`.
 
 ## Additional Resources
 
