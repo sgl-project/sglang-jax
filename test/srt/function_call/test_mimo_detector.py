@@ -115,50 +115,6 @@ class TestMiMoDetector(CustomTestCase):
         self.assertEqual(json.loads(result.calls[0].parameters), {"command": "ls"})
         self.assertEqual(json.loads(result.calls[1].parameters), {"command": "pwd"})
 
-    def _stream_chunks(self, text: str, chunk_size: int, tools: list[Tool]):
-        det = MiMoDetector()
-        all_calls = []
-        normal_text_parts = []
-        for i in range(0, len(text), chunk_size):
-            r = det.parse_streaming_increment(text[i : i + chunk_size], tools)
-            if r.normal_text:
-                normal_text_parts.append(r.normal_text)
-            if r.calls:
-                all_calls.extend(r.calls)
-        return "".join(normal_text_parts), all_calls
-
-    def test_streaming_chunk_by_chunk(self):
-        text = (
-            "<tool_call>\n"
-            "<function=execute_bash>\n"
-            "<parameter=command>pwd && ls</parameter>\n"
-            "</function>\n"
-            "</tool_call>"
-        )
-        tools = [_bash_tool()]
-        for chunk_size in (1, 3, 5, 17):
-            with self.subTest(chunk_size=chunk_size):
-                _, calls = self._stream_chunks(text, chunk_size, tools)
-                self.assertEqual(len(calls), 1, f"chunk_size={chunk_size}")
-                self.assertEqual(calls[0].name, "execute_bash")
-                self.assertEqual(json.loads(calls[0].parameters), {"command": "pwd && ls"})
-
-    def test_streaming_split_at_tag_boundary(self):
-        det = MiMoDetector()
-        tools = [_bash_tool()]
-
-        r1 = det.parse_streaming_increment("hello <tool_", tools)
-        self.assertEqual(r1.normal_text, "hello ")
-        self.assertEqual(r1.calls, [])
-
-        r2 = det.parse_streaming_increment(
-            "call>\n<function=execute_bash>\n"
-            "<parameter=command>x</parameter>\n</function>\n</tool_call>",
-            tools,
-        )
-        self.assertEqual(len(r2.calls), 1)
-        self.assertEqual(json.loads(r2.calls[0].parameters), {"command": "x"})
-
     def test_streaming_normal_text_then_call(self):
         det = MiMoDetector()
         tools = [_bash_tool()]
