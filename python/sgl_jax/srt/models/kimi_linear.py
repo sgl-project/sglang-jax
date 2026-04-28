@@ -688,7 +688,7 @@ class KimiLinearForCausalLM(nnx.Module):
                 sharding=("tensor", None),
                 transpose=True,
             )
-            # Conv1d weights: HF shape (projection_size, 1, conv_size) -> JAX (conv_size, projection_size)
+            # Conv1d weights: HF shape (projection_size, 1, conv_size) -> JAX (conv_size, projection_size) -> (projection_size, conv_size)
             # These live under self_attn.attn (RadixLinearAttention), not self_attn directly.
             conv_size = self.config.linear_attn_config["short_conv_kernel_size"]
             num_heads = self.config.linear_attn_config["num_heads"]
@@ -697,10 +697,10 @@ class KimiLinearForCausalLM(nnx.Module):
             for conv_name in ("q_conv1d", "k_conv1d", "v_conv1d"):
                 mappings[f"{prefix}.self_attn.{conv_name}.weight"] = WeightMapping(
                     target_path=f"{attn_target}.attn.{conv_name}.weight",
-                    sharding=(None, "tensor"),
+                    sharding=("tensor", None),
                     transpose=False,
-                    transpose_axes=(2, 0, 1),
-                    reshape=(conv_size, projection_size),
+                    # transpose_axes=(2, 0, 1),
+                    reshape=(projection_size, conv_size),
                 )
             mappings[f"{prefix}.self_attn.o_norm.weight"] = WeightMapping(
                 target_path=f"{attn_target}.o_norm.weight",
