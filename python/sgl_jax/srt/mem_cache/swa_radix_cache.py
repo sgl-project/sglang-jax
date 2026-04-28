@@ -733,7 +733,7 @@ class SWARadixCache(BasePrefixCache):
             node = node.parent
         return prefix_len
 
-    def evict_req_swa(self, req: "Req", pre_len: int, dp_rank: int = 0) -> None:
+    def evict_req_swa(self, req: Req, pre_len: int, dp_rank: int = 0) -> None:
         """Free request-owned SWA slots while preserving the tree-owned prefix."""
         protected_prefix_len = self._node_prefix_len(req.last_node)
         assert (

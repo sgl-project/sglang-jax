@@ -1341,9 +1341,7 @@ class ScheduleBatch:
                 if not info.reqs:
                     continue
                 for req in info.reqs:
-                    if req.decode_batch_idx > 0 and (
-                        evict_interval <= 1 or req.decode_batch_idx % evict_interval == 1
-                    ):
+                    if req.decode_batch_idx % evict_interval == 1:
                         self._evict_swa(
                             req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
                         )
