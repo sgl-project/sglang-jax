@@ -133,6 +133,7 @@ def _extend_conv(
     bias: jax.Array | None,
     activation_fn: Callable[[jax.Array], jax.Array] | None,
 ) -> tuple[jax.Array, jax.Array]:
+    print(f"[_extend_conv] begin {x.shape=}, {conv_kernel.shape=}, {cache.shape=}", flush=True)
     T = x.shape[0]
     K = conv_kernel.shape[-1]
     W = K - 1  # cache width
@@ -164,6 +165,10 @@ def _extend_conv(
         axis=2,
     )  # [T, D, K]
     window = jnp.where(from_x[:, None, :], x_window, cache_window)  # [T, D, K]
+    print(
+        f"[_extend_conv] 168 {window.shape=}, {conv_kernel.shape=}, {x_window.shape=}, {cache_window.shape}",
+        flush=True,
+    )
     y = jnp.einsum("tck,ck->tc", window, conv_kernel.astype(window.dtype))
     if bias is not None:
         y = y + bias.astype(y.dtype)
