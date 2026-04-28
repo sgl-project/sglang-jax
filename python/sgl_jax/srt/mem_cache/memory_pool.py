@@ -922,6 +922,10 @@ class HybridLinearKVPool(KVCache):
         }
         self.mem_usage = self.full_kv_pool.mem_usage
 
+    @property
+    def size(self):
+        return self.full_kv_pool.size
+
     # ---- accessors (translate then delegate) -------------------------------
 
     def _to_physical(self, layer_id: int) -> int:

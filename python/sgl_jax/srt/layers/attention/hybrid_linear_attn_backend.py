@@ -97,19 +97,16 @@ class LinearRecurrentAttnBackend(AttentionBackend):
             sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
         )
 
-        self.forward_metadata = nnx.data(metadata)
         return metadata
 
     def tree_flatten(self):
         children = (self.forward_metadata,)
-        aux_data = {"mesh": self.mesh}
+        aux_data = {}
         return children, aux_data
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        obj = cls(
-            mesh=aux_data["mesh"],
-        )
+        obj = cls()
         obj.forward_metadata = children[0]
         return obj
 
@@ -164,7 +161,7 @@ class HybridLinearAttnBackend(AttentionBackend):
     def __init__(
         self,
         full_attn_backend: AttentionBackend,
-        linear_attn_backend: nnx.Module,
+        linear_attn_backend: LinearRecurrentAttnBackend,
         full_attn_layers,
     ):
         self.full_attn_backend = full_attn_backend
