@@ -31,6 +31,7 @@ class RadixLinearAttention(nnx.Module):
         dt_bias: nnx.Param | None = None,
         scale: float | None = None,
     ):
+        super().__init__()
         self.layer_id = layer_id
         self.num_q_heads = num_q_heads
         self.num_k_heads = num_k_heads
@@ -63,13 +64,13 @@ class RadixLinearAttention(nnx.Module):
         recurrent_state_pool,
     ):
         output, recurrent_state_pool = forward_batch.attn_backend(
-            q,
-            k,
-            v,
-            a,
-            b,
-            self,
-            forward_batch,
-            recurrent_state_pool,
+            q=q,
+            k=k,
+            v=v,
+            layer=self,
+            forward_batch=forward_batch,
+            pool=recurrent_state_pool,
+            a=a,
+            b=b,
         )
         return output, recurrent_state_pool
