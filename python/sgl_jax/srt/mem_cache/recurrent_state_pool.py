@@ -227,10 +227,13 @@ class RecurrentStatePool:
             return
 
         idx_arr = jnp.asarray(indices, dtype=jnp.int32)
-        for layer in range(self.num_linear_recurrent_layers):
-            self.recurrent_buffers[layer] = self.recurrent_buffers[layer].at[idx_arr].set(0)
-            for inner in range(len(self.conv_buffers[layer])):
-                self.conv_buffers[layer][inner] = self.conv_buffers[layer][inner].at[idx_arr].set(0)
+        with jax.set_mesh(self.mesh):
+            for layer in range(self.num_linear_recurrent_layers):
+                self.recurrent_buffers[layer] = self.recurrent_buffers[layer].at[idx_arr].set(0)
+                for inner in range(len(self.conv_buffers[layer])):
+                    self.conv_buffers[layer][inner] = (
+                        self.conv_buffers[layer][inner].at[idx_arr].set(0)
+                    )
 
     def get_linear_recurrent_layer_cache(self, layer_id: int):
         """Read the per-layer view, keyed by model-global layer_id.
