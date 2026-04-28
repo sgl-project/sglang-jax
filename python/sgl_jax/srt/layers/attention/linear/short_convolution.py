@@ -4,13 +4,14 @@ The convolution is intentionally implemented as a stateless function (not an
 nnx Module) so backends can freely combine it with their own weight containers
 and cache layouts. Two execution paths are provided:
 
-* ``decode`` — single-token step that rolls a per-sequence ``[B, D, K]`` cache
-  left by one and writes the new token at the last slot.
+* ``decode`` — single-token step that appends the new token to a per-sequence
+  ``[B, D, K-1]`` cache, runs the conv on the resulting K-token window, and
+  drops the oldest slot before writing back.
 * ``extend`` — variable-length packed prefill that consumes ``cu_seqlens`` to
   build a per-token sliding window mixing prior cache and in-sequence tokens.
 
-State convention follows FLA's ``ShortConvolution``: cache has width ``K``
-(not ``K-1``) and slot ``K-1`` always holds the most recent input token.
+State convention follows vLLM / Mamba: cache has width ``K-1`` and stores the
+prior ``K-1`` tokens (the current token is supplied via ``x`` at call time).
 """
 
 from __future__ import annotations
@@ -65,8 +66,9 @@ def short_convolution(
     Args:
         x: ``[T, D]`` for ``EXTEND`` (packed varlen) or ``[B, D]`` for ``DECODE``.
         weight: depthwise kernel ``[D, K]``.
-        cache: per-sequence rolling buffer ``[B, D, K]``; slot ``K-1`` is the
-            most recent token of the prior context (zeros for fresh sequences).
+        cache: per-sequence rolling buffer ``[B, D, K-1]`` storing the prior
+            ``K-1`` tokens (zeros for fresh sequences). The current token is
+            supplied via ``x`` and not written into the input cache.
         cu_seqlens: ``[N+1]`` cumulative sequence lengths; required for
             ``EXTEND``, ignored for ``DECODE``.
         forward_mode: ``ForwardMode.DECODE`` or ``ForwardMode.EXTEND``.
@@ -107,31 +109,33 @@ def _apply_activation(
 
 
 def _decode_conv(
-    x: jax.Array,
-    conv_kernel: jax.Array,
-    cache: jax.Array,
+    x: jax.Array,  # [B, D]
+    conv_kernel: jax.Array,  # [D, K]
+    cache: jax.Array,  # [B, D, K-1]
     bias: jax.Array | None,
     activation_fn: Callable[[jax.Array], jax.Array] | None,
 ) -> tuple[jax.Array, jax.Array]:
-    # Roll the cache left by one and append the new token at the last slot.
-    new_cache = jnp.concatenate([cache[:, :, 1:], x[:, :, None]], axis=-1)
+    # expand x shape from [B, D] to [B, D, 1]
+    new_cache = jnp.concatenate([cache, x[..., None]], axis=-1)
     y = jnp.einsum("bck,ck->bc", new_cache, conv_kernel.astype(new_cache.dtype))
     if bias is not None:
         y = y + bias.astype(y.dtype)
     y = _apply_activation(y, activation_fn)
-    return y, new_cache
+    # return the last K-1 conv state
+    return y, new_cache[:, :, 1:]
 
 
 def _extend_conv(
-    x: jax.Array,
-    conv_kernel: jax.Array,
-    cache: jax.Array,
+    x: jax.Array,  # [T, D]
+    conv_kernel: jax.Array,  # [D, K]
+    cache: jax.Array,  # [B, D, K-1]
     cu_seqlens: jax.Array,
     bias: jax.Array | None,
     activation_fn: Callable[[jax.Array], jax.Array] | None,
 ) -> tuple[jax.Array, jax.Array]:
     T = x.shape[0]
     K = conv_kernel.shape[-1]
+    W = K - 1  # cache width
 
     # Locate every output token within its owning sequence.
     token_idx = jnp.arange(T, dtype=cu_seqlens.dtype)
@@ -148,7 +152,9 @@ def _extend_conv(
     safe_x_idx = jnp.clip(source_idx, 0, jnp.maximum(T - 1, 0))
     x_window = x[safe_x_idx]
 
-    cache_pos = jnp.clip(K + source_idx - starts[:, None], 0, K - 1)
+    # cache holds the prior W = K-1 tokens at slots [0, W-1]. Map source
+    # position p (where p < starts[seq]) to cache slot ``W + (p - starts)``.
+    cache_pos = jnp.clip(W + source_idx - starts[:, None], 0, W - 1)
     cache_window = jnp.take_along_axis(
         jnp.swapaxes(cache[seq_ids], 1, 2),
         cache_pos[:, :, None],
@@ -160,16 +166,16 @@ def _extend_conv(
         y = y + bias.astype(y.dtype)
     y = _apply_activation(y, activation_fn)
 
-    # Compute the new per-sequence cache as the last K input tokens of each
-    # sequence, falling back to the prior cache when the sequence is shorter
-    # than K.
+    # Compute the new per-sequence cache: the last W = K-1 input tokens of
+    # each sequence, falling back to the prior cache when the sequence is
+    # shorter than W.
     ends = cu_seqlens[1:]
-    state_offsets = jnp.arange(K, dtype=cu_seqlens.dtype)
-    final_idx = ends[:, None] - K + state_offsets[None, :]
+    state_offsets = jnp.arange(W, dtype=cu_seqlens.dtype)
+    final_idx = ends[:, None] - W + state_offsets[None, :]
     final_from_x = final_idx >= cu_seqlens[:-1, None]
     safe_final_idx = jnp.clip(final_idx, 0, jnp.maximum(T - 1, 0))
     final_x = jnp.swapaxes(x[safe_final_idx], 1, 2)
-    final_cache_pos = jnp.clip(K + final_idx - cu_seqlens[:-1, None], 0, K - 1)
+    final_cache_pos = jnp.clip(W + final_idx - cu_seqlens[:-1, None], 0, W - 1)
     final_cache = jnp.take_along_axis(cache, final_cache_pos[:, None, :], axis=2)
     new_cache = jnp.where(final_from_x[:, None, :], final_x, final_cache)
 

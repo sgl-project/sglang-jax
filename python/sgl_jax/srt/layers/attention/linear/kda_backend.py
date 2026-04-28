@@ -342,8 +342,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
 
     def _unpack_conv_states(
         self,
-        conv_per_req: jax.Array,
-        layer: RadixLinearAttention,
+        conv_states: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Slice ``[B, proj_size, K-1]`` into per-stream ``[B, D, K-1]`` caches.
 
@@ -351,12 +350,13 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         Kimi-Linear, ``num_k_heads == num_heads`` and ``head_k_dim == head_dim``,
         so all three sub-channels collapse to the same width.
         """
-        proj_q = layer.num_q_heads * layer.head_q_dim
-        proj_k = layer.num_k_heads * layer.head_k_dim
-        q_state = conv_per_req[:, :proj_q, :]
-        k_state = conv_per_req[:, proj_q : proj_q + proj_k, :]
-        v_state = conv_per_req[:, proj_q + proj_k :, :]
-        return q_state, k_state, v_state
+        D = conv_states.shape[1]
+        assert D % 3 == 0, (
+            f"conv_states channel dim {D} must be divisible by 3 (Q/K/V "
+            "share head_dim assumption)."
+        )
+        q, k, v = jnp.split(conv_states, 3, axis=1)
+        return q, k, v
 
     def _pack_conv_states(
         self,
