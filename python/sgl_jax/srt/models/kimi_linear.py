@@ -814,4 +814,4 @@ class KimiLinearForCausalLM(nnx.Module):
         return mappings
 
 
-__all__ = ["KimiDeltaAttention"]
+EntryClass = KimiLinearForCausalLM
