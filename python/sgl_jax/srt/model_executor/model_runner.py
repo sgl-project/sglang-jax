@@ -36,6 +36,7 @@ from sgl_jax.srt.mem_cache.allocator import (
 from sgl_jax.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     MHATokenToKVPool,
+    MLATokenToKVPool,
     ReqToTokenPool,
     SWAKVPool,
 )
@@ -406,16 +407,9 @@ class ModelRunner(BaseModelRunner):
         return effective
 
     def _kv_pool_layer_count(self) -> int:
-        """Number of layers that actually allocate KV slots in token_to_kv_pool.
-
-        For hybrid linear-recurrent models (e.g. Kimi-Linear), KDA layers
-        write RecurrentStatePool instead of the KV pool, so they must NOT
-        contribute to per-token KV byte arithmetic or to `layer_num`-sized
-        buffer allocation.
-
-        Falls back to `adjust_layer_num()` for non-hybrid and SWA-hybrid
-        models — `adjust_layer_num` returns an SWA-effective float when SWA
-        is present, or `num_hidden_layers` otherwise.
+        """Layers that allocate KV slots; for hybrid linear-recurrent models
+        KDA layers write RecurrentStatePool instead so are excluded.
+        Falls back to adjust_layer_num() (SWA-effective or num_hidden_layers).
         """
         cfg = self.linear_recurrent_config
         if cfg is not None:
@@ -435,9 +429,6 @@ class ModelRunner(BaseModelRunner):
           K and V stored as independent per-head tensors (*2), MHA pool is
           sharded on the head dim — so use per-device kv head count.
           For MLA models, patch_model_config sets head_dim = qk_nope+qk_rope.
-
-        For hybrid linear-recurrent models, layer count excludes KDA layers
-        (see _kv_pool_layer_count).
         """
 
         def align128(x: int) -> int:
@@ -713,13 +704,9 @@ class ModelRunner(BaseModelRunner):
                     "model config; got "
                     f"kv_lora_rank={kv_lora_rank}, qk_rope_head_dim={qk_rope_head_dim}."
                 )
-            from sgl_jax.srt.mem_cache.memory_pool import MLATokenToKVPool
 
             if recurrent_cfg is not None:
-                # Hybrid linear-recurrent (e.g. Kimi-Linear): KDA layers do
-                # NOT write the KV pool — wrap so we only allocate L_full
-                # slots and translate global layer_id -> compacted physical
-                # index. Preserves global-layer_id contract for backends.
+                # Hybrid recurrent: wrap to allocate only L_full KV slots.
                 self.token_to_kv_pool = HybridLinearKVPool(
                     size=self.max_total_num_tokens,
                     page_size=self.page_size,
