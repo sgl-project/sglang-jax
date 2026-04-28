@@ -257,7 +257,7 @@ def attn_backend_wrapper(
                 "HybridLinearAttnBackend needs KDAAttnBackend " "(delivered by a separate PR)."
             ) from e
 
-        linear_attn_backend = KDAAttnBackend(runner)
+        linear_attn_backend = KDAAttnBackend(runner.mesh)
     else:
         raise NotImplementedError(f"No linear backend wired for hybrid config {type(cfg).__name__}")
     return HybridLinearAttnBackend(
