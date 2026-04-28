@@ -100,3 +100,8 @@ class TestAutoConfigRegistration:
         assert isinstance(cfg, KimiLinearConfig)
         assert cfg.is_kda_layer(1) is True  # 1+1=2 ∈ {2}
         assert cfg.is_kda_layer(0) is False
+
+    def test_kimi_linear_in_local_config_registry(self):
+        from sgl_jax.srt.hf_transformers_utils import _CONFIG_REGISTRY
+
+        assert _CONFIG_REGISTRY.get("kimi_linear") is KimiLinearConfig
