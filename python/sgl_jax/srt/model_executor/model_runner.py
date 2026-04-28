@@ -712,7 +712,6 @@ class ModelRunner(BaseModelRunner):
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     full_attention_layer_ids=recurrent_cfg.full_attention_layer_ids,
-                    num_hidden_layers=self.model_config.num_hidden_layers,
                     mesh=self.mesh,
                     token_to_kv_pool_class=MLATokenToKVPool,
                     kv_lora_rank=kv_lora_rank,
@@ -737,7 +736,6 @@ class ModelRunner(BaseModelRunner):
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     full_attention_layer_ids=recurrent_cfg.full_attention_layer_ids,
-                    num_hidden_layers=self.model_config.num_hidden_layers,
                     mesh=self.mesh,
                     token_to_kv_pool_class=MHATokenToKVPool,
                     head_num=self.model_config.get_total_num_kv_heads_with_replication(

@@ -900,31 +900,13 @@ class HybridLinearKVPool(KVCache):
         page_size: int,
         dtype: jnp.dtype,
         full_attention_layer_ids: list[int],
-        num_hidden_layers: int,
         mesh: Mesh,
         token_to_kv_pool_class: type[KVCache] = MHATokenToKVPool,
         **kvcache_kwargs,
     ):
-        # Global address space; inner pool sees physical indices.
-        start_layer = kvcache_kwargs.pop("start_layer", None)
-        end_layer = kvcache_kwargs.pop("end_layer", None)
-        self.size = size
-        self.page_size = page_size
-        self.dtype = dtype
-        self.layer_num = num_hidden_layers
         self.mesh = mesh
-        self.start_layer = start_layer if start_layer is not None else 0
-        self.end_layer = end_layer if end_layer is not None else num_hidden_layers - 1
-
         self.full_attention_layer_ids = list(full_attention_layer_ids)
         self.full_layer_nums = len(self.full_attention_layer_ids)
-        self.token_to_kv_pool_class = token_to_kv_pool_class
-        self._kvcache_kwargs = dict(kvcache_kwargs)
-        # Values flow into aux_data — must be hashable for treedef equality.
-        assert all(
-            isinstance(v, (int, float, bool, str, tuple, type))
-            for v in self._kvcache_kwargs.values()
-        ), "kvcache_kwargs values must be hashable"
 
         self.full_kv_pool = token_to_kv_pool_class(
             size=size,
@@ -1004,40 +986,24 @@ class HybridLinearKVPool(KVCache):
     def tree_flatten(self):
         children = (self.full_kv_pool,)
         aux_data = {
-            "size": self.size,
-            "page_size": self.page_size,
-            "dtype": self.dtype,
-            "layer_num": self.layer_num,  # global
             "mesh": self.mesh,
-            "start_layer": self.start_layer,
-            "end_layer": self.end_layer,
             "mem_usage": self.mem_usage,
             "full_attention_layer_ids": tuple(self.full_attention_layer_ids),
             "full_layer_nums": self.full_layer_nums,
             "full_attention_layer_id_mapping": tuple(
                 sorted(self.full_attention_layer_id_mapping.items())
             ),
-            "token_to_kv_pool_class": self.token_to_kv_pool_class,
-            "kvcache_kwargs": tuple(sorted(self._kvcache_kwargs.items())),
         }
         return (children, aux_data)
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         obj = object.__new__(cls)
-        obj.size = aux_data["size"]
-        obj.page_size = aux_data["page_size"]
-        obj.dtype = aux_data["dtype"]
-        obj.layer_num = aux_data["layer_num"]
         obj.mesh = aux_data["mesh"]
-        obj.start_layer = aux_data["start_layer"]
-        obj.end_layer = aux_data["end_layer"]
         obj.mem_usage = aux_data["mem_usage"]
         obj.full_attention_layer_ids = list(aux_data["full_attention_layer_ids"])
         obj.full_layer_nums = aux_data["full_layer_nums"]
         obj.full_attention_layer_id_mapping = dict(aux_data["full_attention_layer_id_mapping"])
-        obj.token_to_kv_pool_class = aux_data["token_to_kv_pool_class"]
-        obj._kvcache_kwargs = dict(aux_data["kvcache_kwargs"])
         obj.full_kv_pool = children[0]
         return obj
 

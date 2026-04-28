@@ -45,7 +45,6 @@ def _make_mha_hybrid_pool(mesh):
         page_size=1,
         dtype=jnp.bfloat16,
         full_attention_layer_ids=FULL_ATTN_LAYER_IDS,
-        num_hidden_layers=NUM_HIDDEN_LAYERS,
         mesh=mesh,
         token_to_kv_pool_class=MHATokenToKVPool,
         head_num=2,
@@ -62,10 +61,6 @@ class TestHybridLinearKVPoolConstruction(CustomTestCase):
         """Inner pool layer_num is L_full (4), not num_hidden_layers (16)."""
         self.assertIsInstance(self.pool.full_kv_pool, MHATokenToKVPool)
         self.assertEqual(self.pool.full_kv_pool.layer_num, len(FULL_ATTN_LAYER_IDS))
-
-    def test_wrapper_exposes_global_layer_num(self):
-        """Wrapper's KVCache base sees the global address space."""
-        self.assertEqual(self.pool.layer_num, NUM_HIDDEN_LAYERS)
 
     def test_layer_id_mapping(self):
         """global -> physical mapping is dense from 0."""
@@ -107,10 +102,9 @@ class TestHybridLinearKVPoolAccessorTranslation(CustomTestCase):
 
         for sentinel, layer_id in zip(sentinels, FULL_ATTN_LAYER_IDS):
             buf = self.pool.get_fused_kv_buffer(layer_id)
-            self.assertAlmostEqual(
+            self.assertEqual(
                 float(jnp.max(jnp.abs(buf))),
                 sentinel,
-                places=2,
                 msg=(
                     f"global layer {layer_id} read back wrong sentinel "
                     "(off-by-one in get path's _to_physical mapping)"
@@ -185,10 +179,9 @@ class TestHybridLinearKVPoolReplaceBuffer(CustomTestCase):
 
         for i, global_id in enumerate(FULL_ATTN_LAYER_IDS):
             buf = self.pool.get_fused_kv_buffer(global_id)
-            self.assertAlmostEqual(
+            self.assertEqual(
                 float(jnp.max(jnp.abs(buf))),
                 float(i + 1),
-                places=2,
                 msg=f"global layer {global_id} got wrong buffer",
             )
 
@@ -237,7 +230,7 @@ class TestHybridLinearKVPoolPytree(CustomTestCase):
 
         for i, global_id in enumerate(FULL_ATTN_LAYER_IDS):
             buf = rebuilt.get_fused_kv_buffer(global_id)
-            self.assertAlmostEqual(float(jnp.max(jnp.abs(buf))), float(i + 1), places=2)
+            self.assertEqual(float(jnp.max(jnp.abs(buf))), float(i + 1))
 
         with self.assertRaises(ValueError):
             rebuilt.get_fused_kv_buffer(0)
@@ -252,7 +245,6 @@ def _make_mla_hybrid_pool(mesh):
         page_size=1,
         dtype=jnp.bfloat16,
         full_attention_layer_ids=FULL_ATTN_LAYER_IDS,
-        num_hidden_layers=NUM_HIDDEN_LAYERS,
         mesh=mesh,
         token_to_kv_pool_class=MLATokenToKVPool,
         kv_lora_rank=512,
@@ -280,7 +272,7 @@ class TestHybridLinearKVPoolMLA(CustomTestCase):
 
         for sentinel, layer_id in zip(sentinels, FULL_ATTN_LAYER_IDS):
             buf = self.pool.get_fused_kv_buffer(layer_id)
-            self.assertAlmostEqual(float(jnp.max(jnp.abs(buf))), sentinel, places=2)
+            self.assertEqual(float(jnp.max(jnp.abs(buf))), sentinel)
 
 
 if __name__ == "__main__":
