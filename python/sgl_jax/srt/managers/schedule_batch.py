@@ -40,7 +40,7 @@ from sgl_jax.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
 )
-from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
+from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -1616,8 +1616,10 @@ class ScheduleBatch:
             input_embedding=input_embedding,
             apply_for_deepstack=self.apply_for_deepstack,
             deepstack_visual_embedding=self.deepstack_visual_embedding,
-            recurrent_indices=self.req_to_token_pool.get_linear_recurrent_indices(
-                self.req_pool_indices
+            recurrent_indices=(
+                self.req_to_token_pool.get_linear_recurrent_indices(self.req_pool_indices)
+                if isinstance(self.req_to_token_pool, HybridReqToTokenPool)
+                else None
             ),
         )
 
