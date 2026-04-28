@@ -23,6 +23,9 @@ from sgl_jax.test.test_utils import CustomTestCase
 
 
 def _make_mesh():
+    # SWA pools now use DP-aware sharding specs: P("data", "tensor", None).
+    # Build a degenerate 1x1 mesh so unit tests can exercise that path on a
+    # single local device without needing multi-host setup.
     devices = np.array(jax.devices()[:1], dtype=object).reshape(1, 1)
     return Mesh(devices, axis_names=("data", "tensor"))
 
@@ -60,20 +63,25 @@ class TestSWAAllocatorTokenLevel(CustomTestCase):
         indices = self.alloc.alloc(4)
         self.assertIsNotNone(indices)
         self.assertEqual(len(indices), 4)
+        # Mapping should contain non-zero SWA indices
         swa_indices = self.alloc.full_to_swa_index_mapping[indices]
         self.assertTrue(np.all(swa_indices > 0))
+        # SWA indices should be unique
         self.assertEqual(len(np.unique(swa_indices)), 4)
 
     # 2
     def test_alloc_exceeds_full_returns_none(self):
         """Full pool exhaustion returns None."""
+        # Directly exhaust the full pool via underlying allocator
         self.alloc.full_attn_allocator.alloc(64)
+        # Now full pool is empty, alloc should fail even though SWA has room
         result = self.alloc.alloc(1)
         self.assertIsNone(result)
 
     # 3
     def test_alloc_exceeds_swa_returns_none(self):
         """SWA pool exhaustion returns None (SWA < full)."""
+        # SWA is 32, full is 64 → SWA exhausts first
         result = self.alloc.alloc(32)
         self.assertIsNotNone(result)
         result = self.alloc.alloc(1)
@@ -104,15 +112,19 @@ class TestSWAAllocatorTokenLevel(CustomTestCase):
 
         self.alloc.free_swa(indices)
 
+        # Full pool unchanged
         self.assertEqual(self.alloc.full_available_size(), full_before)
+        # SWA pool restored
         self.assertEqual(self.alloc.swa_available_size(), swa_before + 10)
 
     # 7
     def test_free_swa_clears_mapping(self):
         """free_swa() zeroes out the mapping for freed indices."""
         indices = self.alloc.alloc(5)
+        # Mapping should be non-zero
         self.assertTrue(np.all(self.alloc.full_to_swa_index_mapping[indices] > 0))
         self.alloc.free_swa(indices)
+        # Mapping should be zero
         self.assertTrue(np.all(self.alloc.full_to_swa_index_mapping[indices] == 0))
 
     # 8
@@ -121,6 +133,7 @@ class TestSWAAllocatorTokenLevel(CustomTestCase):
         indices = self.alloc.alloc(5)
         self.alloc.free_swa(indices)
         swa_after_first = self.alloc.swa_available_size()
+        # Second call should be a no-op (mapping is already 0)
         self.alloc.free_swa(indices)
         self.assertEqual(self.alloc.swa_available_size(), swa_after_first)
 
@@ -149,10 +162,12 @@ class TestSWAAllocatorPaged(CustomTestCase):
 
     # 9
     def test_alloc_extend_mapping_correct(self):
-        """alloc_extend() produces correct full->SWA mapping."""
+        """alloc_extend() produces correct full→SWA mapping."""
+        # Allocate initial tokens (simulating a prefix)
         prefix = self.alloc.alloc(8)
         self.assertIsNotNone(prefix)
 
+        # Now extend: prefix_lens=[8], seq_lens=[12], last_loc=[last of prefix]
         last_loc = [int(prefix[-1])]
         full_indices = self.alloc.alloc_extend(
             prefix_lens=[8], seq_lens=[12], last_loc=last_loc, extend_num_tokens=4
@@ -160,13 +175,15 @@ class TestSWAAllocatorPaged(CustomTestCase):
         self.assertIsNotNone(full_indices)
         self.assertEqual(len(full_indices), 4)
 
+        # Each full index should have a valid SWA mapping
         for idx in full_indices:
             swa_idx = self.alloc.full_to_swa_index_mapping[idx]
             self.assertGreater(swa_idx, 0)
 
     # 10
     def test_alloc_decode_mapping_correct(self):
-        """alloc_decode() produces correct full->SWA mapping."""
+        """alloc_decode() produces correct full→SWA mapping."""
+        # Allocate initial 4 tokens (1 page)
         prefix = self.alloc.alloc(4)
         self.assertIsNotNone(prefix)
 
@@ -178,14 +195,17 @@ class TestSWAAllocatorPaged(CustomTestCase):
         swa_idx = self.alloc.full_to_swa_index_mapping[full_indices[0]]
         self.assertGreater(swa_idx, 0)
 
-    # 11 - Rollback on SWA failure (alloc_extend)
+    # 11 — Bug 1 test (should FAIL before fix)
     def test_alloc_extend_rollback_on_swa_failure(self):
         """When SWA pool is exhausted, alloc_extend must roll back full-pool pages."""
+        # Exhaust SWA pool: allocate size_swa tokens
         eaten = self.alloc.alloc(self.size_swa)
         self.assertIsNotNone(eaten)
         self.assertEqual(self.alloc.swa_available_size(), 0)
         full_before = self.alloc.full_available_size()
 
+        # Try to extend — SWA is full, should fail
+        # Set up a valid extend scenario: prefix_lens=[size_swa], seq_lens=[size_swa+4]
         last_loc = [int(eaten[-1])]
         result = self.alloc.alloc_extend(
             prefix_lens=[self.size_swa],
@@ -194,24 +214,37 @@ class TestSWAAllocatorPaged(CustomTestCase):
             extend_num_tokens=4,
         )
         self.assertIsNone(result)
+
+        # Full pool must have been rolled back (no leak)
         self.assertEqual(self.alloc.full_available_size(), full_before)
 
-    # 12 - Rollback on SWA failure (alloc_decode)
+    # 12 — Bug 1 test (should FAIL before fix)
     def test_alloc_decode_rollback_on_swa_failure(self):
         """When SWA pool is exhausted, alloc_decode must roll back full-pool pages."""
+        # Exhaust SWA pool
         eaten = self.alloc.alloc(self.size_swa)
         self.assertIsNotNone(eaten)
         self.assertEqual(self.alloc.swa_available_size(), 0)
         full_before = self.alloc.full_available_size()
 
+        # Try to decode — SWA is full, should fail.
+        # seq_lens=[size_swa+1] means we need the next token after the prefix.
+        # last_loc is the last index of the allocated prefix.
+        # We need the last index to be at a page boundary so decode needs a new page.
+        # With page_size=4 and size_swa=64, last token is at offset 63.
+        # seq_lens = 65 → needs page 17 (index 64 is 65th position → page 16*4=64..67)
+        # Actually, eaten has 64 tokens, so we want seq_lens=65.
+        # last_loc should be the last slot in eaten.
         last_loc = [int(eaten[-1])]
         result = self.alloc.alloc_decode(seq_lens=[self.size_swa + 1], last_loc=last_loc)
         self.assertIsNone(result)
+
+        # Full pool must have been rolled back (no leak)
         self.assertEqual(self.alloc.full_available_size(), full_before)
 
     # 13
     def test_alloc_extend_swa_last_loc_translation(self):
-        """alloc_extend translates last_loc through the full->SWA mapping."""
+        """alloc_extend translates last_loc through the full→SWA mapping."""
         prefix = self.alloc.alloc(4)
         self.assertIsNotNone(prefix)
 
@@ -219,11 +252,13 @@ class TestSWAAllocatorPaged(CustomTestCase):
         expected_swa_last = int(self.alloc.full_to_swa_index_mapping[last_full])
         self.assertGreater(expected_swa_last, 0)
 
+        # Extend by 4 more tokens
         result = self.alloc.alloc_extend(
             prefix_lens=[4], seq_lens=[8], last_loc=[last_full], extend_num_tokens=4
         )
         self.assertIsNotNone(result)
 
+        # Verify new mappings exist
         for idx in result:
             self.assertGreater(int(self.alloc.full_to_swa_index_mapping[idx]), 0)
 
@@ -236,27 +271,37 @@ class TestSWAAllocatorPaged(CustomTestCase):
         self.assertEqual(self.alloc.full_available_size(), self.size)
         self.assertEqual(self.alloc.swa_available_size(), self.size_swa)
 
-    # 15 - Regression test for OOB bug (GH-231)
+    # 15 — Regression test for the OOB bug (GH-231)
     def test_mapping_covers_last_page_indices(self):
-        """full_to_swa_index_mapping must be large enough for max paged token index."""
+        """full_to_swa_index_mapping must be large enough for max paged token index.
+
+        Before the fix, mapping size was size_per_rank+1, but PagedTokenToKVPoolAllocator
+        can produce indices up to size_per_rank + page_size - 1, causing IndexError
+        when alloc_extend or alloc_decode touches the last page.
+        """
+        # Use a small pool so we can easily exhaust pages and hit the last page
         ps = 4
-        size = 32
+        size = 32  # 8 pages (1..8)
         size_swa = 32
         kv = _make_swa_pool(size=size, size_swa=size_swa, page_size=ps, mesh=self.mesh)
         alloc = SWATokenToKVPoolAllocator(size=size, size_swa=size_swa, kvcache=kv, page_size=ps)
 
+        # Verify mapping array is large enough: needs size + page_size
         self.assertGreaterEqual(len(alloc.full_to_swa_index_mapping), size + ps)
 
+        # Allocate all pages (8 pages = 32 tokens)
         all_indices = alloc.alloc(size)
         self.assertIsNotNone(all_indices)
 
+        # Max index = pages_per_rank * ps + ps - 1 = 8*4+3 = 35
         max_idx = int(np.max(all_indices))
         self.assertEqual(max_idx, size + ps - 1)
 
+        # This must NOT raise IndexError
         swa_val = alloc.full_to_swa_index_mapping[max_idx]
         self.assertGreater(swa_val, 0)
 
-    # 15b - Regression: alloc_extend on last page must not OOB (GH-231)
+    # 15b — Regression: alloc_extend on last page must not OOB (GH-231)
     def test_alloc_extend_last_page_no_oob(self):
         """alloc_extend touching the last page must not raise IndexError."""
         ps = 4
@@ -265,20 +310,23 @@ class TestSWAAllocatorPaged(CustomTestCase):
         kv = _make_swa_pool(size=size, size_swa=size_swa, page_size=ps, mesh=self.mesh)
         alloc = SWATokenToKVPoolAllocator(size=size, size_swa=size_swa, kvcache=kv, page_size=ps)
 
+        # Alloc 28 tokens (7 pages), leaving 1 page (page 8) free
         prefix = alloc.alloc(28)
         self.assertIsNotNone(prefix)
         last_loc = [int(prefix[-1])]
 
+        # Extend by 4 tokens → must allocate the 8th (last) page
         result = alloc.alloc_extend(
             prefix_lens=[28], seq_lens=[32], last_loc=last_loc, extend_num_tokens=4
         )
         self.assertIsNotNone(result)
         self.assertEqual(len(result), 4)
 
+        # All returned indices should have valid SWA mappings
         for idx in result:
             self.assertGreater(int(alloc.full_to_swa_index_mapping[idx]), 0)
 
-    # 15c - Regression: alloc_decode on last page must not OOB (GH-231)
+    # 15c — Regression: alloc_decode on last page must not OOB (GH-231)
     def test_alloc_decode_last_page_no_oob(self):
         """alloc_decode allocating the last page must not raise IndexError."""
         ps = 4
@@ -287,14 +335,17 @@ class TestSWAAllocatorPaged(CustomTestCase):
         kv = _make_swa_pool(size=size, size_swa=size_swa, page_size=ps, mesh=self.mesh)
         alloc = SWATokenToKVPoolAllocator(size=size, size_swa=size_swa, kvcache=kv, page_size=ps)
 
+        # Alloc 28 tokens (7 pages), then the last page boundary token
         prefix = alloc.alloc(28)
         self.assertIsNotNone(prefix)
         last_loc = [int(prefix[-1])]
 
+        # Decode: seq_lens=[29] → needs a new page (page 8), the last one
         result = alloc.alloc_decode(seq_lens=[29], last_loc=last_loc)
         self.assertIsNotNone(result)
         self.assertEqual(len(result), 1)
 
+        # The new token should have a valid SWA mapping
         self.assertGreater(int(alloc.full_to_swa_index_mapping[result[0]]), 0)
 
     # 16
@@ -305,6 +356,7 @@ class TestSWAAllocatorPaged(CustomTestCase):
         self.alloc.clear()
         self.assertEqual(self.alloc.full_available_size(), self.size)
         self.assertEqual(self.alloc.swa_available_size(), self.size_swa)
+        # Mapping should be all zeros
         self.assertTrue(np.all(self.alloc.full_to_swa_index_mapping == 0))
 
 
@@ -378,10 +430,10 @@ class TestSWAEviction(CustomTestCase):
 
     # 16
     def test_evict_basic(self):
-        """100 tokens, window=64 -> evicts [0, 36)."""
+        """100 tokens, window=64 → evicts [0, 36)."""
         req = self._make_req(origin_len=100, output_len=0)
         self._setup_req_tokens(req, 100)
-        pre_len = 100
+        pre_len = 100  # len(origin) + len(output) - 1 = 100 + 0 - 1, but for extend pre_len=100
 
         swa_before = self.alloc.swa_available_size()
         self._evict(req, pre_len)
@@ -402,7 +454,7 @@ class TestSWAEviction(CustomTestCase):
 
     # 18
     def test_evict_incremental(self):
-        """Decode step +1 -> evicts exactly 1 slot."""
+        """Decode step +1 → evicts exactly 1 slot."""
         req = self._make_req(origin_len=100, output_len=0)
         self._setup_req_tokens(req, 100)
 
@@ -410,6 +462,7 @@ class TestSWAEviction(CustomTestCase):
         evicted_1 = req.swa_evicted_seqlen
         swa_1 = self.alloc.swa_available_size()
 
+        # Simulate one decode step
         self._evict(req, 101)
         self.assertEqual(req.swa_evicted_seqlen, evicted_1 + 1)
         self.assertEqual(self.alloc.swa_available_size(), swa_1 + 1)
@@ -417,6 +470,7 @@ class TestSWAEviction(CustomTestCase):
     # 19
     def test_evict_page_aligned(self):
         """page_size=4: frontier aligns down to page boundary."""
+        # Recreate with page_size=4
         page_size = 4
         kvcache = _make_swa_pool(size=256, size_swa=256, page_size=page_size, mesh=self.mesh)
         alloc = SWATokenToKVPoolAllocator(
@@ -429,24 +483,24 @@ class TestSWAEviction(CustomTestCase):
         self.assertIsNotNone(indices)
         req_pool.req_to_token[req.req_pool_idx, :100] = indices
 
-        # pre_len=100, window=64 -> raw evicted=36 -> page-aligned=36//4*4=36
+        # pre_len=100, window=64 → raw evicted=36 → page-aligned=36//4*4=36
         new_evicted = max(req.swa_evicted_seqlen, 100 - self.sliding_window)
         new_evicted = (new_evicted // page_size) * page_size  # 36
         self.assertEqual(new_evicted, 36)
 
-        # pre_len=101 -> raw=37 -> aligned=36 (no change from 36)
+        # pre_len=101 → raw=37 → aligned=36 (no change from 36)
         new_evicted2 = max(36, 101 - self.sliding_window)
         new_evicted2 = (new_evicted2 // page_size) * page_size
         self.assertEqual(new_evicted2, 36)
 
-        # pre_len=104 -> raw=40 -> aligned=40
+        # pre_len=104 → raw=40 → aligned=40
         new_evicted3 = max(36, 104 - self.sliding_window)
         new_evicted3 = (new_evicted3 // page_size) * page_size
         self.assertEqual(new_evicted3, 40)
 
     # 20
     def test_evict_within_window_noop(self):
-        """pre_len <= window -> nothing evicted."""
+        """pre_len <= window → nothing evicted."""
         req = self._make_req(origin_len=50, output_len=0)
         self._setup_req_tokens(req, 50)
         swa_before = self.alloc.swa_available_size()
@@ -528,10 +582,15 @@ class TestSWAOverlapSafety(CustomTestCase):
         return indices
 
     def _make_batch(self, req, *, enable_overlap, forward_mode, prefix_lens=None, chunked_req=None):
-        from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
+        from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ScheduleReqsInfo
 
-        batch = ScheduleBatch(
+        reqs_info = ScheduleReqsInfo(
             reqs=[req],
+            chunked_req=chunked_req,
+            prefix_lens=prefix_lens,
+        )
+        return ScheduleBatch(
+            reqs_info=[reqs_info],
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.alloc,
             tree_cache=None,
@@ -539,14 +598,11 @@ class TestSWAOverlapSafety(CustomTestCase):
             model_config=SimpleNamespace(sliding_window=self.sliding_window),
             forward_mode=forward_mode,
             enable_overlap=enable_overlap,
-            chunked_req=chunked_req,
+            dp_size=1,
         )
-        if prefix_lens is not None:
-            batch.prefix_lens = prefix_lens
-        return batch
 
     def test_overlap_decode_first_batch_skips_reclaim(self):
-        """Overlap decode should skip reclaim while previous batch may still read SWA pages."""
+        """Overlap decode should skip reclaim while the previous batch may still read SWA pages."""
         from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
         req = self._make_req(origin_len=100, output_len=1)

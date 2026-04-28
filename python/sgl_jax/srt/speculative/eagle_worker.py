@@ -82,22 +82,14 @@ class EAGLEWorker(ModelWorker):
             if self.draft_model_runner.model.hot_token_ids is not None:
                 self.hot_token_ids = device_array(
                     self.draft_model_runner.model.hot_token_ids,
-                    sharding=(
-                        NamedSharding(self.model_runner.mesh, P())
-                        if jax.process_count() == 1
-                        else None
-                    ),
+                    sharding=(NamedSharding(self.model_runner.mesh, P())),
                 )
         else:
             if self.hot_token_ids is not None:
                 head = head.clone()
                 self.hot_token_ids = device_array(
                     self.draft_model_runner.model.hot_token_ids,
-                    sharding=(
-                        NamedSharding(self.model_runner.mesh, P())
-                        if jax.process_count() == 1
-                        else None
-                    ),
+                    sharding=(NamedSharding(self.model_runner.mesh, P())),
                 )
                 head.data = head.data[self.hot_token_ids]
 
@@ -122,6 +114,7 @@ class EAGLEWorker(ModelWorker):
             # FIXME(pc) add padding logic here
             # Only reshape temperatures if they're 1D (from_schedule_batch produces 1D,
             # but generate_for_precompile_all_greedy produces 2D with shape (bs, 1))
+
             if model_worker_batch.sampling_info.temperatures.ndim == 1:
                 model_worker_batch.sampling_info.temperatures = (
                     model_worker_batch.sampling_info.temperatures[:, None]
@@ -535,7 +528,12 @@ class EAGLEWorker(ModelWorker):
         for token_ids, num_tokens in zip(token_ids_logprobs, num_tokens_per_req):
             token_ids_logprobs_repeat_interleaved.extend([token_ids] * num_tokens)
 
-        # Extract logprobs
+        # Extract logprobs.
+        # NOTE: get_top_logprobs / get_token_ids_logprobs now return device
+        # dense tensors; per-req trimming happens on host downstream. This
+        # spec-decode path doesn't currently route through that host
+        # slicing, so it is best-effort and may need follow-up alongside
+        # the broader spec+DP+logprob unification.
         if any(x > 0 for x in top_logprobs_nums):
             (
                 logits_output.next_token_top_logprobs_val,
@@ -546,13 +544,12 @@ class EAGLEWorker(ModelWorker):
             )
 
         if any(x is not None for x in token_ids_logprobs):
-            (
-                logits_output.next_token_token_ids_logprobs_val,
-                logits_output.next_token_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs(
+            logits_output.next_token_token_ids_logprobs_val = get_token_ids_logprobs(
                 logprobs,
                 token_ids_logprobs_repeat_interleaved,
+                None,
             )
+            logits_output.next_token_token_ids_logprobs_idx = None
 
         logits_output.next_token_logprobs = logprobs[
             jnp.arange(len(batch_next_token_ids), device=batch.sampling_info.device),
@@ -638,9 +635,7 @@ class EAGLEWorker(ModelWorker):
         scores = None
         positions_base = device_array(
             np.repeat(model_worker_batch.seq_lens, self.topk),
-            sharding=(
-                NamedSharding(self.model_runner.mesh, P()) if jax.process_count() == 1 else None
-            ),
+            sharding=(NamedSharding(self.model_runner.mesh, P())),
         )
         logits_metadata = None
         metadata_per_step = self.draft_model_runner.attn_backend.get_eagle_multi_step_metadata(

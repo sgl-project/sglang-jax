@@ -4,16 +4,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import nnx
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
 
-def get_cosine_similarity(a, b):
-    a_flat = a.flatten().astype(jnp.float32)
-    b_flat = b.flatten().astype(jnp.float32)
+def get_cosine_similarity(a, b, mesh: Mesh):
+    a_flat = jax.sharding.reshard(a.flatten().astype(jnp.float32), NamedSharding(mesh, P()))
+    b_flat = jax.sharding.reshard(b.flatten().astype(jnp.float32), NamedSharding(mesh, P()))
     return jnp.dot(a_flat, b_flat) / (jnp.linalg.norm(a_flat) * jnp.linalg.norm(b_flat))
 
 
@@ -206,7 +206,7 @@ def test_epmoe_block_quant_accuracy(scale_format, weight_block_size):
         out_ref = moe_ref(x, topk_weights, topk_ids)
         out_quant = moe_quant(x, topk_weights, topk_ids)
 
-    cos_sim = get_cosine_similarity(out_ref, out_quant)
+    cos_sim = get_cosine_similarity(out_ref, out_quant, mesh)
     mae = jnp.mean(jnp.abs(out_ref - out_quant))
     rel_error = mae / jnp.mean(jnp.abs(out_ref))
 

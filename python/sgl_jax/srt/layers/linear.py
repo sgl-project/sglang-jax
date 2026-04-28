@@ -70,7 +70,7 @@ class LinearBase(nnx.Module):
     @named_scope
     def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass of the linear layer."""
-        output_pspec = P(*([None] * (x.ndim - 1)), self.kernel_axes[-1])
+        output_pspec = P("data", *([None] * (x.ndim - 2)), self.kernel_axes[-1])
         output_sharding = NamedSharding(self.mesh, output_pspec)
         out = lax.dot_general(
             x,
@@ -328,8 +328,8 @@ class QuantizedLinear(nnx.Module):
         else:
             # Per-channel scale: [n_out]
             w_scale_spec = P(output_axis)
-        in_specs = (P(None, input_axis), P(output_axis, input_axis), w_scale_spec)
-        out_specs = P(None, output_axis)
+        in_specs = (P("data", input_axis), P(output_axis, input_axis), w_scale_spec)
+        out_specs = P("data", output_axis)
 
         output = shard_map(
             partial(
