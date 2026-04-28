@@ -343,8 +343,6 @@ def _kda_fwd_intra_kernel(
     v = v_ref[0, 0, 0]
 
     BT = chunk_size
-    BC = 16
-    NC = BT // BC
 
     g_f32 = g.astype(jnp.float32)
     q_f32 = q.astype(jnp.float32)
@@ -366,15 +364,11 @@ def _kda_fwd_intra_kernel(
     decay = exp2(jnp.maximum(g_diff, -126.0))  # [BT, BT, K]
 
     # Aqk[i, j] = scale * sum_k q[i,k] * k[j,k] * decay[i,j,k]
-    Aqk = scale * jnp.sum(
-        q_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1
-    )
+    Aqk = scale * jnp.sum(q_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1)
     Aqk = (Aqk * causal_bt).astype(dtype)
 
     # L[i, j] = beta[i] * sum_k k[i,k] * k[j,k] * decay[i,j,k]   (i > j)
-    L = jnp.sum(
-        k_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1
-    ) * beta_f32 * strict_bt
+    L = jnp.sum(k_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1) * beta_f32 * strict_bt
 
     v_beta = v.astype(jnp.float32) * beta_f32
     k_eg_beta = k_f32 * exp2(g_f32) * beta_f32
