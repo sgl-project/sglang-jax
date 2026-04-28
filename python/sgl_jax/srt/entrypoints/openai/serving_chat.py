@@ -833,8 +833,6 @@ Assistant: {% endif %}"""
             return kwargs.get("enable_thinking") is not False
         if parser == "mimo":
             return kwargs.get("enable_thinking") is True
-        # deepseek-r1 and kimi (◁think▷ old format) have no enable_thinking
-        # toggle; reasoning is always on (matches upstream sglang behavior).
         return True
 
     async def _process_tool_call_stream(
