@@ -23,7 +23,6 @@ from sgl_jax.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     AttentionBackendMetadata,
 )
-from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -71,7 +70,6 @@ class LinearRecurrentAttnBackend(AttentionBackend):
 
     def get_forward_metadata(
         self,
-        req_to_token_pool: ReqToTokenPool,
         batch: ModelWorkerBatch,
     ) -> LinearRecurrentAttnBackendMetadata:
         """Return the metadata for a forward pass."""
@@ -90,30 +88,25 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-        # recurrent_indices
-        recurrent_indices = req_to_token_pool.get_linear_recurrent_indices(batch.req_pool_indices)
         # put array to devices
         (
             metadata.cu_q_lens,
             metadata.recurrent_indices,
         ) = device_array(
-            (cu_q_lens, recurrent_indices),
+            (cu_q_lens, batch.recurrent_indices),
             sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
         )
 
-        self.forward_metadata = nnx.data(metadata)
         return metadata
 
     def tree_flatten(self):
         children = (self.forward_metadata,)
-        aux_data = {"mesh": self.mesh}
+        aux_data = {}
         return children, aux_data
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        obj = cls(
-            mesh=aux_data["mesh"],
-        )
+        obj = cls()
         obj.forward_metadata = children[0]
         return obj
 
@@ -168,7 +161,7 @@ class HybridLinearAttnBackend(AttentionBackend):
     def __init__(
         self,
         full_attn_backend: AttentionBackend,
-        linear_attn_backend: nnx.Module,
+        linear_attn_backend: LinearRecurrentAttnBackend,
         full_attn_layers,
     ):
         self.full_attn_backend = full_attn_backend
@@ -264,7 +257,7 @@ def attn_backend_wrapper(
                 "HybridLinearAttnBackend needs KDAAttnBackend " "(delivered by a separate PR)."
             ) from e
 
-        linear_attn_backend = KDAAttnBackend(runner)
+        linear_attn_backend = KDAAttnBackend(runner.mesh)
     else:
         raise NotImplementedError(f"No linear backend wired for hybrid config {type(cfg).__name__}")
     return HybridLinearAttnBackend(

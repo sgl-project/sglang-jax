@@ -25,7 +25,7 @@ from sgl_jax.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sgl_jax.srt.managers.utils import resolve_future_token_ids, set_future_token_ids
-from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
+from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sgl_jax.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -463,6 +463,13 @@ class ModelWorker:
                 if mode == ForwardMode.EXTEND
                 and self.server_args.multimodal
                 and has_deepstack_visual_embedding
+                else None
+            ),
+            recurrent_indices=(
+                self.model_runner.req_to_token_pool.get_linear_recurrent_indices(
+                    np.arange(bs, dtype=np.int32)
+                )
+                if isinstance(self.model_runner.req_to_token_pool, HybridReqToTokenPool)
                 else None
             ),
         )

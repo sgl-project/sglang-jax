@@ -18,10 +18,16 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
+from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
 from sgl_jax.srt.utils.common_utils import is_remote_url, lru_cache_frozenset
 
-_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {}
+_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
+    cls.model_type: cls
+    for cls in [
+        KimiLinearConfig,
+    ]
+}
 
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):

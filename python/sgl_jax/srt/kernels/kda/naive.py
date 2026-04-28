@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
 
 
 def acc_dtype(input_dtype) -> jnp.dtype:
@@ -102,7 +103,9 @@ def naive_recurrent_kda(
         S = S + jnp.einsum("bhk,bhv->bhkv", b_i[..., None] * k_i, residual)  # [B, H, K, V]
 
         # 3. Compute output: einsum [B,H,K] x [B,H,K,V] -> [B, H, V]
-        o = o.at[:, :, i].set(jnp.einsum("bhk,bhkv->bhv", q_i, S))  # [B, H, V]
+        o = o.at[:, :, i].set(
+            jnp.einsum("bhk,bhkv->bhv", q_i, S), out_sharding=P(None, "tensor", None, None)
+        )  # [B, H, V]
 
     final_state = S if output_final_state else None  # [B, H, K, V] or None
     # [B, H, T, V] -> [B, T, H, V], cast back to orig_dtype

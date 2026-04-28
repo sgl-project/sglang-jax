@@ -2,7 +2,7 @@
 
 - Dual list containers:
     recurrent_buffers: list[jax.Array] of length L, each [N+1, H, D, D] (default f32)
-    conv_buffers: list[list[jax.Array]] outer L, inner currently 1, each [N+1, K-1, proj] (default bf16)
+    conv_buffers: list[list[jax.Array]] outer L, inner currently 1, each [N+1, proj, K-1] (default bf16)
 - Slot 0 is reserved as dummy; valid slots start from 1 (aligned with sglang PyTorch MambaPool).
 - Pure buffer pool: slot allocator state lives in HybridReqToTokenPool, mirroring
   the MHATokenToKVPool / TokenToKVPoolAllocator separation. This pool only
@@ -123,7 +123,7 @@ class RecurrentStatePool:
         assert head_dim > 0, f"head_dim must be > 0, got {head_dim}"
         assert num_k_heads > 0, f"num_k_heads must be > 0, got {num_k_heads}"
         assert head_k_dim > 0, f"head_k_dim must be > 0, got {head_k_dim}"
-        # K=1 would make conv_buffers[l][i] second dim (K-1) zero; min meaningful value is 2.
+        # K=1 would make conv_buffers[l][i] last dim (K-1) zero; min meaningful value is 2.
         assert conv_kernel_size >= 2, (
             f"conv_kernel_size must be >= 2 (got {conv_kernel_size}); "
             "K=1 produces empty conv buffers."
@@ -153,9 +153,9 @@ class RecurrentStatePool:
         )
         # recurrent_buffers shape: [N+1, H, D, D] -> partition H on tensor axis.
         self.recurrent_sharding = NamedSharding(mesh, P(None, recurrent_partition_axis, None, None))
-        # conv_buffers[layer][inner] shape: [N+1, K-1, proj_size] -> partition
+        # conv_buffers[layer][inner] shape: [N+1, proj_size, K-1] -> partition
         # proj_size on tensor axis (matches the projection's TP split).
-        self.conv_sharding = NamedSharding(mesh, P(None, None, conv_partition_axis))
+        self.conv_sharding = NamedSharding(mesh, P(None, conv_partition_axis, None))
 
         # Dual list containers; each element has +1 row reserved for dummy slot 0.
         self.recurrent_buffers, self.conv_buffers = self._create_buffers()
@@ -176,7 +176,7 @@ class RecurrentStatePool:
             self.head_dim,
             self.head_dim,
         )
-        conv_shape = (self.max_num_reqs + 1, self.conv_kernel_size - 1, self.proj_size)
+        conv_shape = (self.max_num_reqs + 1, self.proj_size, self.conv_kernel_size - 1)
         temporal_dtype = self.temporal_dtype
         conv_dtype = self.conv_dtype
 
@@ -227,10 +227,13 @@ class RecurrentStatePool:
             return
 
         idx_arr = jnp.asarray(indices, dtype=jnp.int32)
-        for layer in range(self.num_linear_recurrent_layers):
-            self.recurrent_buffers[layer] = self.recurrent_buffers[layer].at[idx_arr].set(0)
-            for inner in range(len(self.conv_buffers[layer])):
-                self.conv_buffers[layer][inner] = self.conv_buffers[layer][inner].at[idx_arr].set(0)
+        with jax.set_mesh(self.mesh):
+            for layer in range(self.num_linear_recurrent_layers):
+                self.recurrent_buffers[layer] = self.recurrent_buffers[layer].at[idx_arr].set(0)
+                for inner in range(len(self.conv_buffers[layer])):
+                    self.conv_buffers[layer][inner] = (
+                        self.conv_buffers[layer][inner].at[idx_arr].set(0)
+                    )
 
     def get_linear_recurrent_layer_cache(self, layer_id: int):
         """Read the per-layer view, keyed by model-global layer_id.

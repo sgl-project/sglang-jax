@@ -62,8 +62,10 @@ def _baseline_extend(
 ) -> jax.Array:
     """Run nnx.Conv per sequence and concat outputs back to packed layout.
 
-    For each sequence, prepend the last ``K-1`` tokens of its initial cache
-    so the causal conv sees the same history as ``short_convolution``.
+    For each sequence, prepend the K-1 tokens of its initial cache so the
+    causal conv sees the same history as ``short_convolution``. The cache
+    width is ``K-1`` (vLLM convention) and stores the prior K-1 tokens
+    in temporal order.
     """
     K = conv.kernel.value.shape[0]
     pieces = []
@@ -71,9 +73,8 @@ def _baseline_extend(
     for i in range(len(cu) - 1):
         start, end = int(cu[i]), int(cu[i + 1])
         seq = x_packed[start:end]  # [T_i, D]
-        # Cache slot K-1 is the most recent prior token; we need the K-1
-        # most recent prior tokens, which sit in slots [1, K-1].
-        history = initial_cache[i, :, 1:]  # [D, K-1]
+        # Cache holds the prior K-1 tokens; use them all as history.
+        history = initial_cache[i]  # [D, K-1]
         history_t = jnp.swapaxes(history, 0, 1)  # [K-1, D]
         seq_with_history = jnp.concatenate([history_t, seq], axis=0)  # [K-1+T_i, D]
         # nnx.Conv expects [B, T, D]; we used left-pad of K-1 already, but
@@ -131,13 +132,14 @@ class ShortConvolutionTest(CustomTestCase):
         weight = _make_weight(self.rng, hidden, kernel, self.dtype)
 
         B = len(seq_lens)
+        W = kernel - 1  # vLLM-style cache width
         if has_prior_cache:
             cache = jnp.asarray(
-                self.rng.standard_normal((B, hidden, kernel)).astype(np.float32),
+                self.rng.standard_normal((B, hidden, W)).astype(np.float32),
                 dtype=self.dtype,
             )
         else:
-            cache = jnp.zeros((B, hidden, kernel), dtype=self.dtype)
+            cache = jnp.zeros((B, hidden, W), dtype=self.dtype)
 
         # short_convolution: one shot over the packed batch.
         y_short, new_cache = short_convolution(
@@ -150,7 +152,7 @@ class ShortConvolutionTest(CustomTestCase):
             activation="silu",
         )
         self.assertEqual(y_short.shape, (total, hidden))
-        self.assertEqual(new_cache.shape, (B, hidden, kernel))
+        self.assertEqual(new_cache.shape, (B, hidden, W))
 
         # Baseline: nnx.Conv per sequence with injected history.
         conv = _make_nnx_conv(weight, kernel, hidden)
@@ -163,18 +165,19 @@ class ShortConvolutionTest(CustomTestCase):
             rtol=self.rtol,
         )
 
-        # New cache should be the last K input tokens of each sequence,
+        # New cache should be the last W = K-1 input tokens of each sequence,
         # falling back to prior cache slots when the sequence is shorter.
         cu = np.asarray(cu_seqlens)
         for i in range(B):
             start, end = int(cu[i]), int(cu[i + 1])
             T_i = end - start
             seq = np.asarray(x[start:end])  # [T_i, D]
-            old = np.asarray(cache[i])  # [D, K]
-            if T_i >= kernel:
-                expected = seq[-kernel:].T  # [D, K]
-            else:
-                expected = np.concatenate([old[:, T_i:], seq.T], axis=1)  # [D, K]
+            old = np.asarray(cache[i])  # [D, W]
+            expected = (
+                seq[-W:].T  # [D, W]
+                if T_i >= W
+                else np.concatenate([old[:, T_i:], seq.T], axis=1)  # [D, W]
+            )
             np.testing.assert_allclose(
                 np.asarray(new_cache[i]),
                 expected,
@@ -205,6 +208,7 @@ class ShortConvolutionTest(CustomTestCase):
 
     def test_decode_single_step_against_baseline(self):
         B, hidden, kernel = 3, 1024, 4
+        W = kernel - 1
         weight = _make_weight(self.rng, hidden, kernel, self.dtype)
 
         # Build a per-sequence prior history of varying lengths so the cache
@@ -216,13 +220,15 @@ class ShortConvolutionTest(CustomTestCase):
             )
             for L in [5, 2, 7]
         ]
-        # Construct the cache: slot K-1 = most recent prior token.
-        cache = np.zeros((B, hidden, kernel), dtype=np.float32)
+        # Construct the cache: width W = K-1, holds the last W prior tokens
+        # in temporal order. If the history is shorter than W, left-pad with
+        # zeros (slot W-1 is the most recent).
+        cache = np.zeros((B, hidden, W), dtype=np.float32)
         for i, h in enumerate(histories):
             h_np = np.asarray(h)
-            take = min(kernel, h_np.shape[0])
+            take = min(W, h_np.shape[0])
             # Place the last `take` tokens into the rightmost slots.
-            cache[i, :, kernel - take :] = h_np[-take:].T
+            cache[i, :, W - take :] = h_np[-take:].T
         cache = jnp.asarray(cache, dtype=self.dtype)
 
         x_step = jnp.asarray(
@@ -240,7 +246,7 @@ class ShortConvolutionTest(CustomTestCase):
             activation="silu",
         )
         self.assertEqual(y_short.shape, (B, hidden))
-        self.assertEqual(new_cache.shape, (B, hidden, kernel))
+        self.assertEqual(new_cache.shape, (B, hidden, W))
 
         conv = _make_nnx_conv(weight, kernel, hidden)
         y_ref = _baseline_decode(x_step, histories, conv)
@@ -252,7 +258,7 @@ class ShortConvolutionTest(CustomTestCase):
             rtol=self.rtol,
         )
 
-        # New cache should equal old cache shifted left + new x at slot K-1.
+        # New cache should equal old cache shifted left + new x at slot W-1.
         for i in range(B):
             old = np.asarray(cache[i])
             expected = np.concatenate([old[:, 1:], np.asarray(x_step[i])[:, None]], axis=1)
@@ -267,6 +273,7 @@ class ShortConvolutionTest(CustomTestCase):
         """Decoding token-by-token should match running extend on the full
         sequence in one shot."""
         T, hidden, kernel = 6, 1024, 4
+        W = kernel - 1
         seq = jnp.asarray(
             self.rng.standard_normal((T, hidden)).astype(np.float32),
             dtype=self.dtype,
@@ -278,7 +285,7 @@ class ShortConvolutionTest(CustomTestCase):
         y_extend, _ = short_convolution(
             seq,
             weight,
-            jnp.zeros((1, hidden, kernel), dtype=self.dtype),
+            jnp.zeros((1, hidden, W), dtype=self.dtype),
             cu,
             ForwardMode.EXTEND,
             bias=None,
@@ -286,7 +293,7 @@ class ShortConvolutionTest(CustomTestCase):
         )
 
         # Token-by-token decode starting from a zero cache.
-        cache = jnp.zeros((1, hidden, kernel), dtype=self.dtype)
+        cache = jnp.zeros((1, hidden, W), dtype=self.dtype)
         outs = []
         for t in range(T):
             y_step, cache = short_convolution(
@@ -323,7 +330,7 @@ class ShortConvolutionTest(CustomTestCase):
             self.rng.standard_normal((hidden,)).astype(np.float32),
             dtype=self.dtype,
         )
-        cache = jnp.zeros((1, hidden, kernel), dtype=self.dtype)
+        cache = jnp.zeros((1, hidden, kernel - 1), dtype=self.dtype)
         cu = jnp.asarray([0, T], dtype=jnp.int32)
 
         y_with_bias, _ = short_convolution(
@@ -344,7 +351,7 @@ class ShortConvolutionTest(CustomTestCase):
             dtype=self.dtype,
         )
         weight = _make_weight(self.rng, hidden, kernel, self.dtype)
-        cache = jnp.zeros((1, hidden, kernel), dtype=self.dtype)
+        cache = jnp.zeros((1, hidden, kernel - 1), dtype=self.dtype)
         cu = jnp.asarray([0, T], dtype=jnp.int32)
 
         y_silu, _ = short_convolution(
@@ -365,7 +372,7 @@ class ShortConvolutionTest(CustomTestCase):
             short_convolution(
                 jnp.zeros((1, 4)),
                 jnp.zeros((4, 3)),
-                jnp.zeros((1, 4, 3)),
+                jnp.zeros((1, 4, 2)),
                 jnp.asarray([0, 1], dtype=jnp.int32),
                 ForwardMode.EXTEND,
                 activation="not_a_real_activation",
@@ -378,7 +385,7 @@ class ShortConvolutionTest(CustomTestCase):
             dtype=self.dtype,
         )
         weight = _make_weight(self.rng, hidden, kernel, self.dtype)
-        cache = jnp.zeros((1, hidden, kernel), dtype=self.dtype)
+        cache = jnp.zeros((1, hidden, kernel - 1), dtype=self.dtype)
         cu = jnp.asarray([0, T], dtype=jnp.int32)
 
         y_relu, _ = short_convolution(
@@ -401,7 +408,7 @@ class ShortConvolutionTest(CustomTestCase):
             dtype=self.dtype,
         )
         weight = _make_weight(self.rng, hidden, kernel, self.dtype)
-        cache = jnp.zeros((1, hidden, kernel), dtype=self.dtype)
+        cache = jnp.zeros((1, hidden, kernel - 1), dtype=self.dtype)
         cu = jnp.asarray([0, T], dtype=jnp.int32)
 
         y_callable, _ = short_convolution(
@@ -422,7 +429,7 @@ class ShortConvolutionTest(CustomTestCase):
             short_convolution(
                 jnp.zeros((1, 4)),
                 jnp.zeros((4, 3)),
-                jnp.zeros((1, 4, 3)),
+                jnp.zeros((1, 4, 2)),
                 cu_seqlens=None,
                 forward_mode=ForwardMode.EXTEND,
             )

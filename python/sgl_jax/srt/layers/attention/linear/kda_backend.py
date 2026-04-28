@@ -45,6 +45,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         ssm_states, conv_states = self.get_state(
             recurrent_state_pool, layer.layer_id, recurrent_indices
         )
+        # TODO: add v_head_num_per_device, etc to make it more compatible
         q_state, k_state, v_state = self._unpack_conv_states(conv_states)
 
         # Conv weights are stored directly in depthwise ``[D, K]`` layout —
@@ -79,7 +80,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             forward_batch.forward_mode,
             activation=layer.activation,
         )
-        new_conv_states = jnp.stack([q_state_new, k_state_new, v_state_new], axis=1)
+        new_conv_packed = self._pack_conv_states(q_state_new, k_state_new, v_state_new)
 
         q = q.reshape(q.shape[0], layer.num_q_heads, layer.head_q_dim)
         k = k.reshape(k.shape[0], layer.num_k_heads, layer.head_k_dim)
@@ -118,22 +119,54 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         else:
             raise NotImplementedError(f"KDA does not support {forward_batch.forward_mode}")
 
-        new_ssm_states = self.set_ssm_state(ssm_states, recurrent_indices, new_recurrent)
-        new_conv_states = self.set_conv_state(conv_states, recurrent_indices, new_conv_states)
-        return output.reshape(output.shape[0], -1), (new_ssm_states, new_conv_states)
+        new_ssm_full = self.set_ssm_state(
+            recurrent_state_pool, layer.layer_id, recurrent_indices, new_recurrent
+        )
+        new_conv_full_list = self.set_conv_state(
+            recurrent_state_pool, layer.layer_id, recurrent_indices, new_conv_packed
+        )
+        return output.reshape(output.shape[0], -1), (new_ssm_full, new_conv_full_list)
 
     def get_state(self, recurrent_state_pool, layer_id, recurrent_indices):
-        recurrent_buffers, conv_buffers = self.get_layer_cache(
+        """Return per-request views of (ssm, conv) state for this layer.
+
+        Pool stores conv as ``list[list[jax.Array]]`` (outer per-layer, inner
+        currently length 1; reserved for future multi-segment expansion). We
+        unwrap that length-1 inner list so the rest of the backend treats
+        conv as a single ``[N+1, proj_size, K-1]`` array.
+        """
+        recurrent_buffer, conv_buffer_list = self.get_layer_cache(
             recurrent_state_pool,
             layer_id,
         )
-        return recurrent_buffers[recurrent_indices], conv_buffers[recurrent_indices]
+        assert len(conv_buffer_list) == 1, (
+            f"KDA expects exactly 1 conv buffer per layer "
+            f"(reserved RecurrentStatePool inner-list length); got {len(conv_buffer_list)}"
+        )
+        conv_buffer = conv_buffer_list[0]
+        return recurrent_buffer[recurrent_indices], conv_buffer[recurrent_indices]
 
-    def set_conv_state(self, conv_buffers, recurrent_indices, new_conv_states):
-        return conv_buffers.at[recurrent_indices].set(new_conv_states)
+    def set_ssm_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_recurrent):
+        """Scatter per-request ``new_recurrent`` into the FULL pool buffer.
 
-    def set_ssm_state(self, recurrent_buffers, recurrent_indices, new_ssm_states):
-        return recurrent_buffers.at[recurrent_indices].set(new_ssm_states)
+        Returns the full ``[N+1, H, D, D]`` recurrent buffer for this layer
+        so the caller can bubble it up to ``MemoryPools.replace_all`` for
+        rebinding ``RecurrentStatePool.recurrent_buffers[idx]``.
+        """
+        full_recurrent, _ = self.get_layer_cache(recurrent_state_pool, layer_id)
+        return full_recurrent.at[recurrent_indices].set(new_recurrent)
+
+    def set_conv_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_conv_packed):
+        """Scatter per-request packed conv state into the FULL pool buffer.
+
+        ``new_conv_packed`` is ``[B, proj_size, K-1]``; the full conv buffer
+        is ``[N+1, proj_size, K-1]``. Returns a length-1 list to match the
+        pool's per-layer ``list[list[jax.Array]]`` layout.
+        """
+        _, conv_buffer_list = self.get_layer_cache(recurrent_state_pool, layer_id)
+        assert len(conv_buffer_list) == 1
+        full_conv = conv_buffer_list[0]
+        return [full_conv.at[recurrent_indices].set(new_conv_packed)]
 
     # ------------------------------------------------------------------
     # Forward mode implementations
@@ -308,19 +341,32 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         seq_offsets = token_idx - cu_seqlens[:-1][seq_ids]
         return output[seq_ids, seq_offsets]
 
-    @staticmethod
     def _unpack_conv_states(
-        conv_states,
+        self,
+        conv_states: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Pull per-stream conv caches out of the pool layout.
+        """Slice ``[B, proj_size, K-1]`` into per-stream ``[B, D, K-1]`` caches.
 
-        Accepts either a ``(qs, ks, vs)`` tuple or a stacked ``[B, 3, C, K]``
-        array (the layout written back by ``__call__``).
+        Q-K-V order along ``proj_size`` (matches ``_pack_conv_states``). For
+        Kimi-Linear, ``num_k_heads == num_heads`` and ``head_k_dim == head_dim``,
+        so all three sub-channels collapse to the same width.
         """
-        if isinstance(conv_states, (tuple, list)) and len(conv_states) == 3:
-            return tuple(conv_states)
-        # Expect [B, 3, C, K] stacked layout.
-        return conv_states[:, 0], conv_states[:, 1], conv_states[:, 2]
+        D = conv_states.shape[1]
+        assert D % 3 == 0, (
+            f"conv_states channel dim {D} must be divisible by 3 (Q/K/V "
+            "share head_dim assumption)."
+        )
+        q, k, v = jnp.split(conv_states, 3, axis=1)
+        return q, k, v
+
+    def _pack_conv_states(
+        self,
+        q_state: jax.Array,
+        k_state: jax.Array,
+        v_state: jax.Array,
+    ) -> jax.Array:
+        """Concat per-stream ``[B, D, K-1]`` caches → packed ``[B, proj_size, K-1]``."""
+        return jnp.concatenate([q_state, k_state, v_state], axis=1)
 
 
 __all__ = ["KDAAttnBackend"]

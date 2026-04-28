@@ -445,7 +445,7 @@ class TestAttnBackendWrapper:
         )
 
         cfg = SimpleNamespace(full_attention_layer_ids=[0, 2])
-        runner = SimpleNamespace(linear_recurrent_config=cfg, kimi_linear_config=cfg)
+        runner = SimpleNamespace(linear_recurrent_config=cfg, kimi_linear_config=cfg, mesh=None)
         full = _FakeFullBackend()
 
         result = attn_backend_wrapper(runner, full)

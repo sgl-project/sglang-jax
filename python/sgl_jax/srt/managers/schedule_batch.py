@@ -40,7 +40,7 @@ from sgl_jax.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
 )
-from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
+from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -1430,7 +1430,7 @@ class ScheduleBatch:
 
         if bs_padding_size > 0:
             invalid_req_pool_indices = np.array(
-                [-1] * bs_padding_size, dtype=req_pool_indices_cpu.dtype
+                [0] * bs_padding_size, dtype=req_pool_indices_cpu.dtype
             )
             req_pool_indices_cpu = np.concat(
                 [
@@ -1616,6 +1616,11 @@ class ScheduleBatch:
             input_embedding=input_embedding,
             apply_for_deepstack=self.apply_for_deepstack,
             deepstack_visual_embedding=self.deepstack_visual_embedding,
+            recurrent_indices=(
+                self.req_to_token_pool.get_linear_recurrent_indices(req_pool_indices_cpu)
+                if isinstance(self.req_to_token_pool, HybridReqToTokenPool)
+                else None
+            ),
         )
 
     def get_spec_model_worker_batch(
@@ -2064,6 +2069,9 @@ class ModelWorkerBatch:
 
     # MRoPE position information [3, total_tokens]
     mrope_positions: np.ndarray | None = None
+
+    # recurrent_state indices
+    recurrent_indices: np.ndarray | None = None
 
     def get_original_input_len(self):
         """
