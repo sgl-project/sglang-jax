@@ -150,18 +150,21 @@ def _extend_conv(
     from_x = source_idx >= starts[:, None]
 
     safe_x_idx = jnp.clip(source_idx, 0, jnp.maximum(T - 1, 0))
-    x_window = x[safe_x_idx]
+    # x[safe_x_idx]: [T, K, D] (advanced indexing puts the index axes first).
+    # Swap to [T, D, K] so the einsum spec matches the decode path's "bck,ck".
+    x_window = jnp.swapaxes(x[safe_x_idx], 1, 2)  # [T, D, K]
 
     # cache holds the prior W = K-1 tokens at slots [0, W-1]. Map source
     # position p (where p < starts[seq]) to cache slot ``W + (p - starts)``.
+    # cache[seq_ids] is already [T, D, W]; gather along the time axis (=2).
     cache_pos = jnp.clip(W + source_idx - starts[:, None], 0, W - 1)
     cache_window = jnp.take_along_axis(
-        jnp.swapaxes(cache[seq_ids], 1, 2),
-        cache_pos[:, :, None],
-        axis=1,
-    )
-    window = jnp.where(from_x[:, :, None], x_window, cache_window)
-    y = jnp.einsum("tkc,ck->tc", window, conv_kernel.astype(window.dtype))
+        cache[seq_ids],  # [T, D, W]
+        cache_pos[:, None, :],  # [T, 1, K] -> broadcasts over D
+        axis=2,
+    )  # [T, D, K]
+    window = jnp.where(from_x[:, None, :], x_window, cache_window)  # [T, D, K]
+    y = jnp.einsum("tck,ck->tc", window, conv_kernel.astype(window.dtype))
     if bias is not None:
         y = y + bias.astype(y.dtype)
     y = _apply_activation(y, activation_fn)
