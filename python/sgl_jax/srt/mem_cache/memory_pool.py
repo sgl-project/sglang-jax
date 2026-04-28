@@ -882,6 +882,202 @@ class SWAKVPool(KVCache):
         return mapping_jax[loc]
 
 
+@register_pytree_node_class
+class HybridLinearKVPool(KVCache):
+    """KV cache wrapper for hybrid linear-recurrent models (e.g. Kimi-Linear).
+
+    Composition + global->physical id translation. The wrapper owns ONE inner
+    KV pool sized to len(full_attention_layer_ids); KDA / linear-recurrent
+    layers do not allocate KV slots here (they live in RecurrentStatePool).
+
+    Translates GLOBAL layer_id -> inner-pool physical index via
+    `full_attention_layer_id_mapping`. All KVCache accessor signatures are
+    preserved so attention backends and models remain global-`layer_id`-aware.
+
+    Pattern mirrors:
+    - sglang upstream `HybridLinearKVPool` (composition + dict mapping)
+    - sgl-jax `SWAKVPool` (same wrapper pattern + `token_to_kv_pool_class`
+      constructor injection, different layer semantics: SWA writes every
+      layer; hybrid-linear KDA writes zero)
+
+    Why a separate `replace_buffer` contract from SWAKVPool: hybrid-linear
+    models emit a COMPACTED layers_kv_fused list (length = L_full, in
+    full_attention_layer_ids order) because KDA layer outputs are routed to
+    recurrent_state_pool instead. SWAKVPool expects a FULL-LENGTH list because
+    SWA writes some KV in every layer.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: jnp.dtype,
+        full_attention_layer_ids: list[int],
+        num_hidden_layers: int,
+        mesh: Mesh,
+        token_to_kv_pool_class: type[KVCache] = MHATokenToKVPool,
+        **kvcache_kwargs,
+    ):
+        # KVCache base address-space fields are set directly (mirroring
+        # SWAKVPool's pattern of bypassing super().__init__). The wrapper
+        # exposes the GLOBAL address space (so PP start_layer / end_layer /
+        # layer_num bounds keep matching the model's global layer numbering);
+        # the inner pool sees ONLY physical (compacted) indices.
+        start_layer = kvcache_kwargs.pop("start_layer", None)
+        end_layer = kvcache_kwargs.pop("end_layer", None)
+        self.size = size
+        self.page_size = page_size
+        self.dtype = dtype
+        self.layer_num = num_hidden_layers
+        self.mesh = mesh
+        self.start_layer = start_layer if start_layer is not None else 0
+        self.end_layer = end_layer if end_layer is not None else num_hidden_layers - 1
+
+        self.full_attention_layer_ids = list(full_attention_layer_ids)
+        self.full_layer_nums = len(self.full_attention_layer_ids)
+        self.token_to_kv_pool_class = token_to_kv_pool_class
+        # Persist for tree_unflatten + introspection.
+        self._kvcache_kwargs = dict(kvcache_kwargs)
+
+        # Build inner pool sized to L_full. The wrapper does NOT enumerate MLA
+        # vs MHA params — caller chose `token_to_kv_pool_class` and supplied
+        # the matching kwargs (mirrors SWAKVPool wiring).
+        self.full_kv_pool = token_to_kv_pool_class(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            layer_num=self.full_layer_nums,
+            mesh=mesh,
+            **kvcache_kwargs,
+        )
+
+        self.full_attention_layer_id_mapping: dict[int, int] = {
+            global_id: i for i, global_id in enumerate(self.full_attention_layer_ids)
+        }
+        # mem_usage reflects ACTUAL HBM footprint of the inner pool
+        # (= L_full * per_layer_bytes). The wrapper IS the canonical KV pool
+        # for this runner, so logs reading `pool.mem_usage` get the post-fix
+        # correct number.
+        self.mem_usage = self.full_kv_pool.mem_usage
+
+    # ---- accessors (translate then delegate) -------------------------------
+
+    def _to_physical(self, layer_id: int) -> int:
+        if layer_id not in self.full_attention_layer_id_mapping:
+            raise ValueError(
+                f"layer_id {layer_id} is not a full-attention layer "
+                f"(KDA/linear-recurrent layers do not use the KV pool); "
+                f"full_attention_layer_ids={self._format_full_layer_ids()}"
+            )
+        return self.full_attention_layer_id_mapping[layer_id]
+
+    def _format_full_layer_ids(self) -> str:
+        # Truncate the layer-id list in error messages to avoid log spam on
+        # large models (production Kimi-Linear-48B has 12 entries; future
+        # hybrids may have more).
+        ids = self.full_attention_layer_ids
+        if len(ids) <= 20:
+            return str(ids)
+        head = ", ".join(str(i) for i in ids[:10])
+        tail = ", ".join(str(i) for i in ids[-5:])
+        return f"[{head}, ... ({len(ids) - 15} more) ..., {tail}]"
+
+    def get_fused_kv_buffer(self, layer_id: int) -> jax.Array:
+        return self.full_kv_pool.get_fused_kv_buffer(self._to_physical(layer_id))
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.full_kv_pool.get_kv_buffer(self._to_physical(layer_id))
+
+    def set_kv_buffer(
+        self,
+        layer_id: int,
+        loc: jax.Array,
+        cache_k: jax.Array,
+        cache_v: jax.Array,
+        is_decode: bool = False,
+    ) -> None:
+        self.full_kv_pool.set_kv_buffer(
+            self._to_physical(layer_id), loc, cache_k, cache_v, is_decode
+        )
+
+    def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
+        """Accept COMPACTED list (length L_full, in full_attention_layer_ids order).
+
+        Hybrid-linear models emit a compacted layers_kv_fused list because
+        KDA layer outputs go to recurrent_state_pool. Differs from
+        SWAKVPool.replace_buffer which expects full-length input.
+        """
+        if len(kv_buffer) != self.full_layer_nums:
+            raise ValueError(
+                f"HybridLinearKVPool.replace_buffer expects compacted list of "
+                f"length {self.full_layer_nums} "
+                f"(= len(full_attention_layer_ids)={self._format_full_layer_ids()}), "
+                f"got {len(kv_buffer)}"
+            )
+        self.full_kv_pool.replace_buffer(kv_buffer)
+
+    # ---- delegated bulk ops ------------------------------------------------
+
+    def get_kv_size_bytes(self):
+        return self.full_kv_pool.get_kv_size_bytes()
+
+    def get_cpu_copy(self, indices):
+        return self.full_kv_pool.get_cpu_copy(indices)
+
+    def load_cpu_copy(self, kv_cache_host, indices):
+        return self.full_kv_pool.load_cpu_copy(kv_cache_host, indices)
+
+    def clear_cache(self, indices: jax.Array):
+        return self.full_kv_pool.clear_cache(indices)
+
+    # ---- pytree (mirror SWAKVPool's pattern) -------------------------------
+    # IMPORTANT: children = (full_kv_pool,) — the inner pool MUST be a pytree
+    # child (not aux_data), because PR #966's MemoryPools `donate_argnames=
+    # ["memory_pools"]` JIT donate path relies on the inner pool's KV buffers
+    # being pytree leaves of the wrapper. If full_kv_pool were stuffed into
+    # aux_data, JIT donate would fail to identify the buffers as donatable.
+
+    def tree_flatten(self):
+        children = (self.full_kv_pool,)
+        aux_data = {
+            "size": self.size,
+            "page_size": self.page_size,
+            "dtype": self.dtype,
+            "layer_num": self.layer_num,  # global
+            "mesh": self.mesh,
+            "start_layer": self.start_layer,
+            "end_layer": self.end_layer,
+            "mem_usage": self.mem_usage,
+            "full_attention_layer_ids": tuple(self.full_attention_layer_ids),
+            "full_layer_nums": self.full_layer_nums,
+            "full_attention_layer_id_mapping": tuple(
+                sorted(self.full_attention_layer_id_mapping.items())
+            ),
+            "token_to_kv_pool_class": self.token_to_kv_pool_class,
+            "kvcache_kwargs": tuple(sorted(self._kvcache_kwargs.items())),
+        }
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = object.__new__(cls)
+        obj.size = aux_data["size"]
+        obj.page_size = aux_data["page_size"]
+        obj.dtype = aux_data["dtype"]
+        obj.layer_num = aux_data["layer_num"]
+        obj.mesh = aux_data["mesh"]
+        obj.start_layer = aux_data["start_layer"]
+        obj.end_layer = aux_data["end_layer"]
+        obj.mem_usage = aux_data["mem_usage"]
+        obj.full_attention_layer_ids = list(aux_data["full_attention_layer_ids"])
+        obj.full_layer_nums = aux_data["full_layer_nums"]
+        obj.full_attention_layer_id_mapping = dict(aux_data["full_attention_layer_id_mapping"])
+        obj.token_to_kv_pool_class = aux_data["token_to_kv_pool_class"]
+        obj._kvcache_kwargs = dict(aux_data["kvcache_kwargs"])
+        obj.full_kv_pool = children[0]
+        return obj
+
+
 def _set_fused_kv_buffer(
     fused_kv: jax.Array,
     loc: jax.Array,
