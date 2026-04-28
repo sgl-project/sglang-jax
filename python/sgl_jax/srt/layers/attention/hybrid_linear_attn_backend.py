@@ -23,7 +23,6 @@ from sgl_jax.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     AttentionBackendMetadata,
 )
-from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -71,7 +70,6 @@ class LinearRecurrentAttnBackend(AttentionBackend):
 
     def get_forward_metadata(
         self,
-        req_to_token_pool: ReqToTokenPool,
         batch: ModelWorkerBatch,
     ) -> LinearRecurrentAttnBackendMetadata:
         """Return the metadata for a forward pass."""
@@ -90,14 +88,12 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-        # recurrent_indices
-        recurrent_indices = req_to_token_pool.get_linear_recurrent_indices(batch.req_pool_indices)
         # put array to devices
         (
             metadata.cu_q_lens,
             metadata.recurrent_indices,
         ) = device_array(
-            (cu_q_lens, recurrent_indices),
+            (cu_q_lens, batch.recurrent_indices),
             sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
         )
 

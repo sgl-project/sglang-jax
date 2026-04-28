@@ -1616,6 +1616,9 @@ class ScheduleBatch:
             input_embedding=input_embedding,
             apply_for_deepstack=self.apply_for_deepstack,
             deepstack_visual_embedding=self.deepstack_visual_embedding,
+            recurrent_indices=self.req_to_token_pool.get_linear_recurrent_indices(
+                self.req_pool_indices
+            ),
         )
 
     def get_spec_model_worker_batch(
@@ -2064,6 +2067,9 @@ class ModelWorkerBatch:
 
     # MRoPE position information [3, total_tokens]
     mrope_positions: np.ndarray | None = None
+
+    # recurrent_state indices
+    recurrent_indices: np.ndarray | None = None
 
     def get_original_input_len(self):
         """

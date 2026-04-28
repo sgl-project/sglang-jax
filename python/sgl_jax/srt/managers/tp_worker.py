@@ -465,6 +465,9 @@ class ModelWorker:
                 and has_deepstack_visual_embedding
                 else None
             ),
+            recurrent_indices=self.model_runner.req_to_token_pool.get_linear_recurrent_indices(
+                np.arange(bs, dtype=np.int32)
+            ),
         )
 
     def get_model_runner(self):
