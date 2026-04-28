@@ -184,6 +184,7 @@ class ReasoningParser:
     DetectorMap: dict[str, type[BaseReasoningFormatDetector]] = {
         "deepseek-r1": DeepSeekR1Detector,
         "qwen3": Qwen3Detector,
+        "mimo": Qwen3Detector,
         "kimi": KimiDetector,
     }
 
