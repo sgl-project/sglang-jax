@@ -495,6 +495,115 @@ class TestSWARadixCache(CustomTestCase):
         self.assertEqual(allocator.swa_available_size(dp_rank=1), initial_swa[1])
 
 
+    def test_delete_leaf_updates_swa_evictable_size(self):
+        cache = self.cache
+        indices = self._alloc_indices(10)
+        cache.insert(RadixKey(list(range(10)), None), indices)
+        self.assertEqual(cache.swa_evictable_size_, 10)
+        cache.evict(10, 0)
+        self.assertEqual(cache.swa_evictable_size_, 0)
+        self.assertEqual(cache.full_evictable_size_, 0)
+
+    def test_tombstone_internal_updates_swa_evictable_size(self):
+        cache = self.cache
+        indices_a = self._alloc_indices(10)
+        cache.insert(RadixKey(list(range(10)), None), indices_a)
+        indices_b = self._alloc_indices(5)
+        cache.insert(RadixKey(list(range(10)) + list(range(100, 105)), None), indices_b)
+        initial_swa = cache.swa_evictable_size_
+        cache.evict(0, 10)
+        self.assertEqual(cache.swa_evictable_size_, initial_swa - 10)
+
+    def test_insert_tombstone_full_revive(self):
+        """swa_evicted_seqlen=0 -> fully revive tombstone."""
+        cache = self.cache
+        idx1 = self._alloc_indices(10)
+        cache.insert(RadixKey(list(range(10)), None), idx1)
+        idx2 = self._alloc_indices(5)
+        cache.insert(RadixKey(list(range(10)) + list(range(100, 105)), None), idx2)
+        cache.evict(0, 10)  # tombstone the shared prefix
+        swa_after = cache.swa_evictable_size_
+        new_idx = self._alloc_indices(10)
+        cache.insert(
+            RadixKey(list(range(10)), None),
+            new_idx,
+            prev_prefix_len=0,
+            swa_evicted_seqlen=0,
+        )
+        self.assertEqual(cache.swa_evictable_size_, swa_after + 10)
+
+    def test_insert_tombstone_no_revive(self):
+        """swa_evicted_seqlen past node -> keep tombstone."""
+        cache = self.cache
+        idx1 = self._alloc_indices(10)
+        cache.insert(RadixKey(list(range(10)), None), idx1)
+        idx2 = self._alloc_indices(5)
+        cache.insert(RadixKey(list(range(10)) + list(range(100, 105)), None), idx2)
+        cache.evict(0, 10)
+        swa_after = cache.swa_evictable_size_
+        new_idx = self._alloc_indices(10)
+        cache.insert(
+            RadixKey(list(range(10)), None),
+            new_idx,
+            prev_prefix_len=0,
+            swa_evicted_seqlen=10,
+        )
+        self.assertEqual(cache.swa_evictable_size_, swa_after)
+
+    def test_new_node_all_swa_evicted(self):
+        """All in evicted range -> don't create node (no tombstone leaf)."""
+        cache = self.cache
+        idx = self._alloc_indices(10)
+        cache.insert(RadixKey(list(range(10)), None), idx, swa_evicted_seqlen=10)
+        self.assertEqual(cache.full_evictable_size_, 0)
+
+    def test_new_node_split_at_eviction_boundary(self):
+        """Eviction boundary in middle -> front tombstone + back live."""
+        cache = self.cache
+        idx = self._alloc_indices(10)
+        cache.insert(RadixKey(list(range(10)), None), idx, swa_evicted_seqlen=5)
+        self.assertEqual(cache.full_evictable_size_, 10)
+        self.assertEqual(cache.swa_evictable_size_, 5)
+
+    def test_evictable_size_returns_min(self):
+        cache = self.cache
+        indices = self._alloc_indices(10)
+        cache.insert(RadixKey(list(range(10)), None), indices)
+        self.assertEqual(cache.evictable_size(), 10)
+
+    def test_insert_then_evict_then_reinsert_cycle(self):
+        """Full cycle: insert -> tombstone -> re-insert with swa_evicted_seqlen."""
+        cache = self.cache
+        idx1 = self._alloc_indices(15)
+        cache.insert(RadixKey(list(range(15)), None), idx1)
+        idx2 = self._alloc_indices(5)
+        cache.insert(RadixKey(list(range(10)) + list(range(200, 205)), None), idx2)
+        cache.evict(0, 10)  # tombstone shared prefix
+        new_idx = self._alloc_indices(15)
+        cache.insert(
+            RadixKey(list(range(15)), None),
+            new_idx,
+            prev_prefix_len=0,
+            swa_evicted_seqlen=5,
+        )
+        cache.sanity_check()
+
+    def test_sanity_check_after_complex_operations(self):
+        cache = self.cache
+        for i in range(5):
+            idx = self._alloc_indices(10)
+            cache.insert(RadixKey(list(range(i * 3, i * 3 + 10)), None), idx)
+        cache.evict(5, 5)
+        for i in range(3):
+            idx = self._alloc_indices(8)
+            cache.insert(
+                RadixKey(list(range(i * 3, i * 3 + 8)), None),
+                idx,
+                swa_evicted_seqlen=3,
+            )
+        cache.sanity_check()
+
+
 class TestSchedulerCacheInit(CustomTestCase):
     """Tests for scheduler cache type selection with hybrid models (#202)."""
 

@@ -1045,8 +1045,7 @@ class ScheduleBatch:
             )
 
         # Evict SWA tokens outside sliding window
-        if self.is_hybrid:
-            self.maybe_evict_swa()
+        self.maybe_evict_swa()
 
     def new_page_count_next_decode(
         self,
@@ -1264,7 +1263,7 @@ class ScheduleBatch:
             self.req_to_token_pool.free(req.req_pool_idx)
         else:
             last_uncached_pos = (
-                len(req.prefix_indices) // server_args.page_size
+                req.last_matched_prefix_len // server_args.page_size
             ) * server_args.page_size
             token_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
@@ -1334,10 +1333,6 @@ class ScheduleBatch:
         )
 
         if self.forward_mode is not None and self.forward_mode.is_decode():
-            # Evict at the smaller of sliding_window_size and page_size to avoid
-            # stale SWA slot accumulation. For large windows (e.g., 4096) this
-            # prevents holding memory far beyond what's needed; for small windows
-            # (e.g., 128) it aligns with the natural eviction boundary.
             evict_interval = max(min(sliding_window_size, page_size), 1)
             for dp_rank, info in enumerate(self.reqs_info):
                 if not info.reqs:
@@ -1354,19 +1349,19 @@ class ScheduleBatch:
         if self.forward_mode is None or not self.forward_mode.is_extend():
             return
 
+        # Only do per-request SWA eviction during extend for ChunkCache.
+        # For SWARadixCache, extend-time ownership stays with the tree and
+        # eviction is deferred to tree insert / tree-pressure handling.
+        if not isinstance(self.tree_cache, ChunkCache):
+            return
+
+        chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
         for dp_rank, info in enumerate(self.reqs_info):
-            if not info.reqs:
+            if not info.reqs or info.prefix_lens is None:
                 continue
-            for req in info.reqs:
-                pre_len = len(req.prefix_indices)
+            for i, req in enumerate(info.reqs):
+                pre_len = info.prefix_lens[i]
                 if self.enable_overlap and req.is_chunked > 0:
-                    # In overlap mode, the previous chunk's forward may still be
-                    # in-flight reading SWA pages for positions
-                    # [len_{N-2} - sliding_window, len_{N-1}). Subtracting
-                    # chunked_prefill_size from pre_len shifts the eviction
-                    # boundary back by exactly one chunk, which mathematically
-                    # keeps new_evicted <= len_{N-2} - sliding_window.
-                    chunked_prefill_size = global_server_args_dict.get("chunked_prefill_size")
                     if chunked_prefill_size is not None and chunked_prefill_size > 0:
                         pre_len -= chunked_prefill_size
                 self._evict_swa(req, pre_len, sliding_window_size, page_size, dp_rank)
@@ -1380,7 +1375,11 @@ class ScheduleBatch:
         dp_rank: int = 0,
     ):
         """Free SWA pool slots for tokens outside the sliding window."""
-        new_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size)
+        if isinstance(self.tree_cache, SWARadixCache):
+            self.tree_cache.evict_req_swa(req, pre_len, dp_rank=dp_rank)
+            return
+
+        new_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size - page_size)
         if page_size > 1:
             new_evicted = (new_evicted // page_size) * page_size
         if new_evicted <= req.swa_evicted_seqlen:
@@ -1388,15 +1387,7 @@ class ScheduleBatch:
         free_slots = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, req.swa_evicted_seqlen : new_evicted
         ]
-        # Count actual SWA slots that will be freed (those with active mapping)
-        num_swa_freed = self.token_to_kv_pool_allocator.count_swa_mapped(
-            free_slots, dp_rank=dp_rank
-        )
         self.token_to_kv_pool_allocator.free_swa(free_slots, dp_rank=dp_rank)
-        # Notify cache layer: these slots were protected (node is locked),
-        # so adjust swa_protected_size_ to prevent bookkeeping leak.
-        if num_swa_freed > 0 and isinstance(self.tree_cache, SWARadixCache):
-            self.tree_cache.adjust_swa_protected_size(-num_swa_freed, dp_rank=dp_rank)
         req.swa_evicted_seqlen = new_evicted
 
     def prepare_for_decode(self):
@@ -1407,8 +1398,7 @@ class ScheduleBatch:
         """
         self.forward_mode = ForwardMode.DECODE
 
-        if self.is_hybrid:
-            self.maybe_evict_swa()
+        self.maybe_evict_swa()
 
         # Process each DP rank
         for dp_rank in range(self.dp_size):
