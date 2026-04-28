@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, ModelConfig, MoEBackend
@@ -163,8 +164,20 @@ class KimiDeltaAttention(nnx.Module):
             scope_name="v_conv1d",
         )
 
-        self.A_log = nnx.Param(jnp.zeros((1, 1, self.num_heads, 1), dtype=jnp.float32))
-        self.dt_bias = nnx.Param(jnp.zeros((self.projection_size,), dtype=jnp.float32))
+        self.A_log = nnx.Param(
+            jnp.zeros(
+                (1, 1, self.num_heads, 1),
+                dtype=jnp.float32,
+                out_sharding=P(None, None, "tensor", None),
+            )
+        )
+        self.dt_bias = nnx.Param(
+            jnp.zeros(
+                (self.projection_size,),
+                dtype=jnp.float32,
+                out_sharding=P("tensor"),
+            )
+        )
 
         self.f_a_proj = LinearBase(
             self.hidden_size,
