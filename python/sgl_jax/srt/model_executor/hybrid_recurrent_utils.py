@@ -37,7 +37,7 @@ def _build_hybrid_pools(
     """
     linear_attn_config = cfg.linear_attn_config  # dict
     rsp = RecurrentStatePool(
-        linear_recurrent_layer_ids=list(linear_attn_config["kda_layers"]),
+        linear_recurrent_layer_ids=cfg.linear_layer_ids,
         max_num_reqs=max_num_reqs,
         num_heads=linear_attn_config["num_heads"],
         head_dim=linear_attn_config["head_dim"],
