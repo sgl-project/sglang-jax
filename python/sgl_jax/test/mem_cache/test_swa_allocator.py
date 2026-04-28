@@ -417,7 +417,7 @@ class TestSWAEviction(CustomTestCase):
 
     def _evict(self, req, pre_len):
         """Wrapper around the eviction logic matching _evict_swa."""
-        new_evicted = max(req.swa_evicted_seqlen, pre_len - self.sliding_window)
+        new_evicted = max(req.swa_evicted_seqlen, pre_len - self.sliding_window - self.page_size)
         if self.page_size > 1:
             new_evicted = (new_evicted // self.page_size) * self.page_size
         if new_evicted <= req.swa_evicted_seqlen:
@@ -430,14 +430,14 @@ class TestSWAEviction(CustomTestCase):
 
     # 16
     def test_evict_basic(self):
-        """100 tokens, window=64 → evicts [0, 36)."""
+        """100 tokens, window=64, page_size=1 → evicts [0, 35)."""
         req = self._make_req(origin_len=100, output_len=0)
         self._setup_req_tokens(req, 100)
         pre_len = 100  # len(origin) + len(output) - 1 = 100 + 0 - 1, but for extend pre_len=100
 
         swa_before = self.alloc.swa_available_size()
         self._evict(req, pre_len)
-        expected_evicted = pre_len - self.sliding_window  # 36
+        expected_evicted = pre_len - self.sliding_window - self.page_size  # 35
         self.assertEqual(req.swa_evicted_seqlen, expected_evicted)
         self.assertEqual(self.alloc.swa_available_size(), swa_before + expected_evicted)
 
@@ -469,8 +469,7 @@ class TestSWAEviction(CustomTestCase):
 
     # 19
     def test_evict_page_aligned(self):
-        """page_size=4: frontier aligns down to page boundary."""
-        # Recreate with page_size=4
+        """page_size=4: frontier includes the extra safety page and aligns down."""
         page_size = 4
         kvcache = _make_swa_pool(size=256, size_swa=256, page_size=page_size, mesh=self.mesh)
         alloc = SWATokenToKVPoolAllocator(
@@ -483,20 +482,20 @@ class TestSWAEviction(CustomTestCase):
         self.assertIsNotNone(indices)
         req_pool.req_to_token[req.req_pool_idx, :100] = indices
 
-        # pre_len=100, window=64 → raw evicted=36 → page-aligned=36//4*4=36
-        new_evicted = max(req.swa_evicted_seqlen, 100 - self.sliding_window)
-        new_evicted = (new_evicted // page_size) * page_size  # 36
-        self.assertEqual(new_evicted, 36)
+        # pre_len=100, window=64, page=4 → raw evicted=32 → page-aligned=32
+        new_evicted = max(req.swa_evicted_seqlen, 100 - self.sliding_window - page_size)
+        new_evicted = (new_evicted // page_size) * page_size
+        self.assertEqual(new_evicted, 32)
 
-        # pre_len=101 → raw=37 → aligned=36 (no change from 36)
-        new_evicted2 = max(36, 101 - self.sliding_window)
+        # pre_len=101 → raw=33 → aligned=32 (no change from 32)
+        new_evicted2 = max(32, 101 - self.sliding_window - page_size)
         new_evicted2 = (new_evicted2 // page_size) * page_size
-        self.assertEqual(new_evicted2, 36)
+        self.assertEqual(new_evicted2, 32)
 
-        # pre_len=104 → raw=40 → aligned=40
-        new_evicted3 = max(36, 104 - self.sliding_window)
+        # pre_len=104 → raw=36 → aligned=36
+        new_evicted3 = max(32, 104 - self.sliding_window - page_size)
         new_evicted3 = (new_evicted3 // page_size) * page_size
-        self.assertEqual(new_evicted3, 40)
+        self.assertEqual(new_evicted3, 36)
 
     # 20
     def test_evict_within_window_noop(self):
@@ -517,7 +516,7 @@ class TestSWAEviction(CustomTestCase):
         swa_before = self.alloc.swa_available_size()
 
         self._evict(req, 128)
-        expected_freed = 128 - self.sliding_window  # 64
+        expected_freed = 128 - self.sliding_window - self.page_size  # 63
         self.assertEqual(self.alloc.swa_available_size(), swa_before + expected_freed)
 
 
@@ -583,6 +582,17 @@ class TestSWAOverlapSafety(CustomTestCase):
 
     def _make_batch(self, req, *, enable_overlap, forward_mode, prefix_lens=None, chunked_req=None):
         from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ScheduleReqsInfo
+        from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
+
+        tree_cache = (
+            ChunkCache(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.alloc,
+                page_size=self.page_size,
+            )
+            if forward_mode.is_extend()
+            else None
+        )
 
         reqs_info = ScheduleReqsInfo(
             reqs=[req],
@@ -593,7 +603,7 @@ class TestSWAOverlapSafety(CustomTestCase):
             reqs_info=[reqs_info],
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.alloc,
-            tree_cache=None,
+            tree_cache=tree_cache,
             is_hybrid=True,
             model_config=SimpleNamespace(sliding_window=self.sliding_window),
             forward_mode=forward_mode,
@@ -636,7 +646,7 @@ class TestSWAOverlapSafety(CustomTestCase):
         swa_before = self.alloc.swa_available_size()
         batch.maybe_evict_swa()
 
-        expected = req.seqlen - 1 - self.sliding_window
+        expected = req.seqlen - 1 - self.sliding_window - self.page_size
         self.assertEqual(req.swa_evicted_seqlen, expected)
         self.assertEqual(self.alloc.swa_available_size(), swa_before + expected)
 
@@ -698,7 +708,7 @@ class TestSWAOverlapSafety(CustomTestCase):
                 # len_{N-2} = max(0, cumulative - chunked_prefill_size).
                 in_flight_low = max(
                     0,
-                    cumulative - self.chunked_prefill_size - self.sliding_window,
+                    cumulative - self.chunked_prefill_size - self.sliding_window - self.page_size,
                 )
                 self.assertLessEqual(
                     req.swa_evicted_seqlen,

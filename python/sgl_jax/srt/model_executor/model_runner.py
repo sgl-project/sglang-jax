@@ -391,7 +391,6 @@ class ModelRunner(BaseModelRunner):
         if swa_num_kv_heads is None:
             return self.model_config.num_hidden_layers
 
-        num_kv_heads = self.model_config.hf_config.num_key_value_heads
         # Compute SWA vs full layer counts from hybrid_layer_pattern
         pattern = getattr(self.model_config.hf_config, "hybrid_layer_pattern", None)
         if pattern is None:
@@ -399,8 +398,12 @@ class ModelRunner(BaseModelRunner):
         swa_layers = sum(1 for p in pattern if p == 1)
         full_layers = sum(1 for p in pattern if p == 0)
 
-        # Effective layer count weighted by KV head ratio
-        effective = (swa_num_kv_heads / num_kv_heads) * swa_layers + full_layers
+        from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
+
+        full_heads_per_device = self.model_config.get_num_kv_heads(self.attention_tp_size)
+        swa_heads_per_device = get_num_kv_heads_by_tp(swa_num_kv_heads, self.attention_tp_size)
+        ratio = swa_heads_per_device / full_heads_per_device
+        effective = ratio * swa_layers + full_layers
         return effective
 
     def _compute_cell_size(self) -> int:
@@ -435,7 +438,7 @@ class ModelRunner(BaseModelRunner):
             )
 
         return (
-            self.model_config.get_num_kv_heads(self.tp_size)
+            self.model_config.get_num_kv_heads(self.attention_tp_size)
             * align128(self.model_config.head_dim)
             * 2
             * num_layers
@@ -898,18 +901,26 @@ class ModelRunner(BaseModelRunner):
         self.model_config.full_attention_layer_ids = full_attention_layer_ids
 
         # Algorithm:
-        # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
-        # - Find total # of tokens available across layers.
-        # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
+        # total_tokens is in "full-layer-equivalent token-layer" units,
+        # when swa kv_head_num is not same as full kv_head_num, the constraint is:
+        #   swa_tokens * swa_layers * ratio + full_tokens * full_layers = total_tokens
+        #   swa_tokens = full_tokens * swa_full_tokens_ratio
         total_tokens = self.max_total_num_tokens * self.adjust_layer_num()
         full_layers_num = len(full_attention_layer_ids)
         swa_layers_num = len(swa_attention_layer_ids)
         swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
 
-        # Solve the equations:
-        # 1. swa_max_total_num_tokens * swa_layers_num + full_max_total_num_tokens * full_layers_num == total_tokens
-        # 2. full_max_total_num_tokens * swa_full_tokens_ratio == swa_max_total_num_tokens
-        denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
+        swa_num_kv_heads = getattr(self.model_config.hf_config, "swa_num_key_value_heads", None)
+        if swa_num_kv_heads is not None:
+            from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
+
+            full_heads = self.model_config.get_num_kv_heads(self.attention_tp_size)
+            swa_heads = get_num_kv_heads_by_tp(swa_num_kv_heads, self.attention_tp_size)
+            ratio = swa_heads / full_heads
+        else:
+            ratio = 1.0
+
+        denominator = swa_full_tokens_ratio * swa_layers_num * ratio + full_layers_num
         self.full_max_total_num_tokens = int(total_tokens / denominator)
         self.swa_max_total_num_tokens = int(self.full_max_total_num_tokens * swa_full_tokens_ratio)
 
