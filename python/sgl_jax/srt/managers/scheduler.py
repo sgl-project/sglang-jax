@@ -1588,6 +1588,16 @@ class Scheduler(
                     self.chunked_reqs[dp_rank] is None
                 ), f"Chunked request already exists for DP rank {dp_rank} when adding new chunked req"
                 self.chunked_reqs[dp_rank] = adder.new_chunked_reqs[dp_rank]
+            # NOTE: increment is_chunked for any chunked req (new OR continuing).
+            # Mirrors upstream sglang: process_batch_result_prefill skips
+            # output_ids.append iff is_chunked > 0. Without this increment for
+            # continuing chunks, the second+ chunk would be treated as the
+            # final chunk and a partial-prefix sample would leak into output_ids,
+            # extending fill_ids by one fake token and shifting all later
+            # decoding by one position. (Visible as "Once" instead of " in" at
+            # decode start when the same prompt is replayed against a tree
+            # baseline that mis-sampled mid-prefill.)
+            if self.chunked_reqs[dp_rank] is not None:
                 self.chunked_reqs[dp_rank].is_chunked += 1
 
         self.log_prefill_stats(adder, all_can_run_reqs, running_bs)
