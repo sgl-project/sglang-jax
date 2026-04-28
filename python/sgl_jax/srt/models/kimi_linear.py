@@ -518,7 +518,8 @@ class KimiModel(nnx.Module):
 
         residual = None
         layers_kv_fused = []
-        layers_recurrent_state = []
+        layers_recurrent_buffers = []
+        layers_conv_buffers = []
         layers_topk_ids = []
 
         for layer in self.layers:
@@ -531,7 +532,9 @@ class KimiModel(nnx.Module):
                 dispatch_info=forward_batch.expert_location_metadata,
             )
             if layer.is_kda:
-                layers_recurrent_state.append(attn_state)
+                rec_buf, conv_buf_list = attn_state
+                layers_recurrent_buffers.append(rec_buf)
+                layers_conv_buffers.append(conv_buf_list)
             else:
                 layers_kv_fused.append(attn_state)
             layers_topk_ids.append(topk_ids)
@@ -540,7 +543,12 @@ class KimiModel(nnx.Module):
             hidden_states += residual
 
         hidden_states = self.norm(hidden_states)
-        return hidden_states, layers_kv_fused, layers_recurrent_state, layers_topk_ids
+        return (
+            hidden_states,
+            layers_kv_fused,
+            (layers_recurrent_buffers, layers_conv_buffers),
+            layers_topk_ids,
+        )
 
 
 class KimiLinearForCausalLM(nnx.Module):
