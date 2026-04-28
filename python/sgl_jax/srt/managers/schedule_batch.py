@@ -40,6 +40,7 @@ from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
+    release_kv_cache,
 )
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
@@ -261,6 +262,16 @@ class Req:
         # The prefix length of the last prefix matching
         self.last_matched_prefix_len: int = 0
 
+        # For req-level memory management (single release entry point).
+        self.kv_committed_len = 0
+        self.kv_allocated_len = 0
+        self.kv_committed_freed = False
+        self.kv_overallocated_freed = False
+        # Page-aligned tree-tracked prefix length; differs from
+        # len(prefix_indices) when an unaligned tail is owned by the req
+        # but not by the tree (page_size > 1 chunked prefill).
+        self.cache_protected_len = 0
+
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
         # processed.
@@ -410,6 +421,21 @@ class Req:
         max_prefix_len = max(max_prefix_len, 0)
         return self.fill_ids[:max_prefix_len]
 
+    def pop_committed_kv_cache(self) -> int:
+        assert (
+            not self.kv_committed_freed
+        ), f"Committed KV cache already freed ({self.kv_committed_len=})"
+        self.kv_committed_freed = True
+        return self.kv_committed_len
+
+    def pop_overallocated_kv_cache(self) -> tuple[int, int]:
+        assert not self.kv_overallocated_freed, (
+            "Overallocated KV cache already freed, "
+            f"{self.kv_committed_len=}, {self.kv_allocated_len=}"
+        )
+        self.kv_overallocated_freed = True
+        return self.kv_committed_len, self.kv_allocated_len
+
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
         first_iter = self.surr_offset is None or self.read_offset is None
@@ -526,6 +552,14 @@ class Req:
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
+
+        # NOTE: output_ids is intentionally preserved -- partial-rollout /
+        # retract-decode resume via fill_ids = origin_input_ids + output_ids.
+        self.kv_committed_len = 0
+        self.kv_allocated_len = 0
+        self.kv_committed_freed = False
+        self.kv_overallocated_freed = False
+        self.cache_protected_len = 0
 
     def set_finish_with_abort(self, error_msg: str):
         # set it to one token to skip the long prefill
@@ -924,6 +958,10 @@ class ScheduleBatch:
             for req, seq_len, pre_len in zip(reqs, seq_lens, prefix_lens):
                 assert seq_len - pre_len == req.extend_input_len
 
+                req.kv_committed_len = seq_len
+                req.kv_allocated_len = seq_len
+                req.cache_protected_len = pre_len
+
                 prefix_indices = req.prefix_indices
                 if pre_len > 0:
                     # note: prefix_indices has to locate on device, or will meet Received incompatible devices for jitted computation
@@ -1242,41 +1280,12 @@ class ScheduleBatch:
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
     def release_req(self, idx: int, dp_rank: int, remaing_req_count: int, server_args: ServerArgs):
-        """Release a request and free its resources.
-
-        Args:
-            idx: Index of the request within the DP rank's request list
-            dp_rank: The DP rank this request belongs to
-            remaing_req_count: Number of remaining requests
-            server_args: Server arguments
-        """
         info = self.reqs_info[dp_rank]
         req = info.reqs[idx]
-        seq_lens_cpu = info.seq_lens
 
-        if isinstance(self.tree_cache, ChunkCache):
-            # ChunkCache does not have eviction
-            token_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : seq_lens_cpu[idx]
-            ]
-            self.token_to_kv_pool_allocator.free(token_indices, dp_rank)
-            self.req_to_token_pool.free(req)
-        else:
-            last_uncached_pos = (
-                req.last_matched_prefix_len // server_args.page_size
-            ) * server_args.page_size
-            token_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
-            ]
-            self.token_to_kv_pool_allocator.free(token_indices, dp_rank)
-            self.req_to_token_pool.free(req)
+        release_kv_cache(req, self.tree_cache, is_insert=False)
 
-            # release the last node
-            if self.is_hybrid:
-                self.tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
-            else:
-                self.tree_cache.dec_lock_ref(req.last_node)
-
+        if not isinstance(self.tree_cache, ChunkCache):
             num_tokens = remaing_req_count * global_config.retract_decode_steps
             self._evict_tree_cache_if_needed({dp_rank: num_tokens})
 
@@ -1484,6 +1493,8 @@ class ScheduleBatch:
             )
             for req in reqs:
                 req.decode_batch_idx += 1
+                req.kv_committed_len += 1
+                req.kv_allocated_len += 1
 
     def filter_batch(
         self,
