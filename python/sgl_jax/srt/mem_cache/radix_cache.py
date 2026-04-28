@@ -274,25 +274,25 @@ class RadixCache(BasePrefixCache):
 
         return self._insert_helper(self.root_node, converted_key, value)
 
-    def cache_finished_req(self, req: Req):
-        """Cache completed requests"""
-        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+    def cache_finished_req(self, req: Req, is_insert: bool = True):
+        """Cache completed requests. ``is_insert=False`` skips the radix
+        insert (retract path) and frees the would-be-cached range directly."""
+        committed_kv_len = req.pop_committed_kv_cache()
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
         if self.disable:
             kv_indices = self.req_to_token_pool.read(
                 req.req_pool_idx,
-                all_token_len,
+                committed_kv_len,
             )
             kv_indices = kv_indices[kv_indices != 0]
             self.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
-            self.req_to_token_pool.free(req.req_pool_idx)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:all_token_len]
+        token_ids = (req.origin_input_ids + req.output_ids)[:committed_kv_len]
         # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
         # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
-        actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
-        kv_indices = self.req_to_token_pool.read(req.req_pool_idx, all_token_len)
+        actual_kv_len = committed_kv_len - 1 if self.is_eagle else committed_kv_len
+        kv_indices = self.req_to_token_pool.read(req.req_pool_idx, committed_kv_len)
         kv_indices = kv_indices[kv_indices != 0]
 
         if self.page_size != 1:
@@ -304,27 +304,27 @@ class RadixCache(BasePrefixCache):
             page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
 
         page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
-        old_prefix_len = len(req.prefix_indices)
+        # cache_protected_len, not len(prefix_indices): the latter may include
+        # an unaligned tail owned by the req but not by the tree.
+        old_prefix_len = req.cache_protected_len
         if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
             # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
             # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
             old_prefix_len -= 1
 
-        # Radix Cache takes over one reference from memory pool
-        new_prefix_len = self.insert(
-            RadixKey(token_ids[:page_aligned_token_len], req.extra_key, req.dp_rank),
-            page_aligned_kv_indices,
-        )
-
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[old_prefix_len:new_prefix_len], dp_rank=dp_rank
-        )
-        # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:], dp_rank=dp_rank)
-
-        # Remove request slot and release cache lock
-        self.req_to_token_pool.free(req.req_pool_idx)
-        self.dec_lock_ref(req.last_node)
+        if is_insert:
+            # Radix Cache takes over one reference from memory pool
+            new_prefix_len = self.insert(
+                RadixKey(token_ids[:page_aligned_token_len], req.extra_key, req.dp_rank),
+                page_aligned_kv_indices,
+            )
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[old_prefix_len:new_prefix_len], dp_rank=dp_rank
+            )
+        else:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[old_prefix_len:page_aligned_len], dp_rank=dp_rank
+            )
 
     def cache_unfinished_req(self, req: Req):
         """Cache incomplete requests"""
@@ -350,7 +350,8 @@ class RadixCache(BasePrefixCache):
         page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
         page_aligned_token_ids = token_ids[:page_aligned_token_len]
 
-        old_prefix_len = len(req.prefix_indices)
+        # cache_protected_len, not len(prefix_indices): see cache_finished_req above.
+        old_prefix_len = req.cache_protected_len
         if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
             # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
             # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
@@ -373,6 +374,7 @@ class RadixCache(BasePrefixCache):
             new_indices[old_prefix_len:],
         )
         req.last_matched_prefix_len = len(new_indices)
+        req.cache_protected_len = len(new_indices)
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 

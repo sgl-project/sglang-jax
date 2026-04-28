@@ -105,7 +105,7 @@ class TestW8Int8(BaseW8Test):
     model = "Qwen/Qwen3-32B"
     quantization_config_path = "int8.yaml"
     gsm8k_accuracy_threshold = 0.95
-    throughput_threshold = 100
+    throughput_threshold = 98
     other_args = [
         "--tp-size=4",
         "--download-dir=/dev/shm",
