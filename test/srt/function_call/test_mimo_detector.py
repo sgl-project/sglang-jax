@@ -173,6 +173,35 @@ class TestMiMoDetector(CustomTestCase):
         )
         self.assertEqual(len(r2.calls), 1)
         self.assertEqual(r2.calls[0].name, "execute_bash")
+        self.assertEqual(json.loads(r2.calls[0].parameters), {"command": "ls"})
+        self.assertNotIn("<tool_call>", r2.normal_text)
+        self.assertNotIn("</tool_call>", r2.normal_text)
+
+    def test_param_value_python_literal(self):
+        text = (
+            "<tool_call>\n"
+            "<function=do_thing>\n"
+            "<parameter=obj>{'k': 1, 'v': [1, 2]}</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = MiMoDetector().detect_and_parse(text, [_typed_tool()])
+        self.assertEqual(len(result.calls), 1)
+        args = json.loads(result.calls[0].parameters)
+        self.assertEqual(args["obj"], {"k": 1, "v": [1, 2]})
+
+    def test_param_value_html_unescape(self):
+        text = (
+            "<tool_call>\n"
+            "<function=execute_bash>\n"
+            "<parameter=command>echo &quot;hi&quot; &amp;&amp; ls</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = MiMoDetector().detect_and_parse(text, [_bash_tool()])
+        self.assertEqual(len(result.calls), 1)
+        args = json.loads(result.calls[0].parameters)
+        self.assertEqual(args["command"], 'echo "hi" && ls')
 
 
 if __name__ == "__main__":
