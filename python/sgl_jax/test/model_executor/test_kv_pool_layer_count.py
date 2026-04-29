@@ -166,6 +166,37 @@ class TestInitMemoryPoolHybridRecurrent(CustomTestCase):
         finally:
             ModelRunner.linear_recurrent_config = original_property
 
+    def test_init_memory_pool_rejects_zero_full_attn_layers(self):
+        """Hybrid recurrent path must fail-fast (not crash with
+        ZeroDivisionError) when full_attention_layer_ids is empty."""
+        linear_attn_config = {
+            "kda_layers": [1, 2, 3],
+            "full_attn_layers": [],
+            "num_heads": 8,
+            "head_dim": 128,
+            "short_conv_kernel_size": 4,
+        }
+        cfg = SimpleNamespace(
+            full_attention_layer_ids=[],
+            linear_attn_config=linear_attn_config,
+            is_linear_attn=True,
+        )
+
+        mesh = _mesh_1()
+        runner = self._make_runner(mesh)
+
+        original_property = ModelRunner.linear_recurrent_config
+        try:
+            ModelRunner.linear_recurrent_config = property(lambda self: cfg)
+            with self.assertRaisesRegex(RuntimeError, "0 full-attention layers"):
+                runner.init_memory_pool(
+                    max_num_reqs=8,
+                    max_total_tokens=4096,
+                    total_device_memory=16 * 1024**3,
+                )
+        finally:
+            ModelRunner.linear_recurrent_config = original_property
+
 
 if __name__ == "__main__":
     unittest.main()

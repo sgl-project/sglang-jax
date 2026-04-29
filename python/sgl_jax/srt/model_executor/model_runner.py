@@ -514,6 +514,12 @@ class ModelRunner(BaseModelRunner):
         if has_recurrent_state:
             _enforce_recurrent_state_server_constraints(self.server_args)
             _check_state_to_kv_ratio_for_hybrid(self.server_args.state_to_kv_ratio)
+            if len(recurrent_cfg.full_attention_layer_ids) == 0:
+                raise RuntimeError(
+                    "Hybrid recurrent model has 0 full-attention layers; "
+                    "pure-recurrent inference is not supported. "
+                    "Increase num_hidden_layers."
+                )
             if self.is_hybrid:
                 raise NotImplementedError(
                     "state_to_kv_ratio budget split is implemented for the "
