@@ -297,6 +297,23 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             allocated_pages, prefix_lens_np, extend_lens, last_loc_np, extend_num_tokens
         )
         self.free_pages[dp_rank] = self.free_pages[dp_rank][pages_used:]
+
+        # Validate: allocated pages should not be in free or release
+        if pages_used > 0:
+            used_pages = allocated_pages[:pages_used]
+            overlap_free = np.intersect1d(used_pages, self.free_pages[dp_rank])
+            overlap_rel = np.intersect1d(used_pages, self.release_pages[dp_rank])
+            if len(overlap_free) > 0 or len(overlap_rel) > 0:
+                import logging as _logging
+
+                _logging.getLogger(__name__).error(
+                    "ALLOC_BUG: allocated pages overlap with free/release! "
+                    "overlap_free=%s overlap_release=%s allocated=%s",
+                    overlap_free.tolist(),
+                    overlap_rel.tolist(),
+                    used_pages.tolist()[:10],
+                )
+
         return out_indices
 
     def _alloc_decode_impl(

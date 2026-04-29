@@ -959,6 +959,23 @@ class ScheduleBatch:
                 req.req_pool_idx = req_pool_indices[i]
                 assert seq_len - pre_len == req.extend_input_len
 
+                if req.is_retracted:
+                    logger.info(
+                        "RETRACT re-extend: rid=%s seq_len=%d pre_len=%d "
+                        "extend_input_len=%d output_ids_len=%d "
+                        "origin_input_ids_len=%d is_chunked=%d "
+                        "fill_ids_len=%d page_size=%d",
+                        req.rid,
+                        seq_len,
+                        pre_len,
+                        req.extend_input_len,
+                        len(req.output_ids),
+                        len(req.origin_input_ids),
+                        req.is_chunked,
+                        len(req.fill_ids),
+                        self.token_to_kv_pool_allocator.page_size,
+                    )
+
                 req.kv_committed_len = seq_len
                 req.kv_allocated_len = seq_len
                 req.cache_protected_len = pre_len
@@ -1076,6 +1093,52 @@ class ScheduleBatch:
                 )
 
                 pt += extend_lens[i]
+
+            # Validate page consistency for paged allocation
+            page_size = self.token_to_kv_pool_allocator.page_size
+            if page_size > 1:
+                for i in range(bs):
+                    req = reqs[i]
+                    sl = seq_lens[i]
+                    row = self.req_to_token_pool.req_to_token[req_pool_indices[i], :sl]
+                    row_pages = row // page_size
+                    for pg_start in range(0, sl, page_size):
+                        pg_end = min(pg_start + page_size, sl)
+                        pg_slice = row[pg_start:pg_end]
+                        pg_pages = pg_slice // page_size
+                        pg_offsets = pg_slice % page_size
+                        if len(pg_pages) > 0 and not np.all(pg_pages == pg_pages[0]):
+                            logger.error(
+                                "PAGE_BUG: rid=%s positions [%d:%d] span multiple pages: %s indices=%s",
+                                req.rid,
+                                pg_start,
+                                pg_end,
+                                pg_pages.tolist(),
+                                pg_slice.tolist(),
+                            )
+                        expected_offsets = (
+                            np.arange(pg_start % page_size, pg_start % page_size + len(pg_offsets))
+                            % page_size
+                        )
+                        if not np.array_equal(pg_offsets, expected_offsets):
+                            logger.error(
+                                "PAGE_BUG: rid=%s positions [%d:%d] offsets mismatch: got=%s expected=%s indices=%s",
+                                req.rid,
+                                pg_start,
+                                pg_end,
+                                pg_offsets.tolist(),
+                                expected_offsets.tolist(),
+                                pg_slice.tolist(),
+                            )
+
+                    # Check for page 0 (sentinel) in valid positions
+                    if np.any(row_pages == 0):
+                        zero_positions = np.where(row_pages == 0)[0]
+                        logger.error(
+                            "PAGE_BUG: rid=%s has page 0 (sentinel) at positions %s",
+                            req.rid,
+                            zero_positions.tolist()[:10],
+                        )
 
             info.sampling_info = SamplingBatchInfo.from_schedule_batch(
                 info,
@@ -1283,6 +1346,21 @@ class ScheduleBatch:
     def release_req(self, idx: int, dp_rank: int, remaing_req_count: int, server_args: ServerArgs):
         info = self.reqs_info[dp_rank]
         req = info.reqs[idx]
+
+        logger.info(
+            "RETRACT release_req: rid=%s idx=%d dp_rank=%d seqlen=%d "
+            "kv_committed_len=%d kv_allocated_len=%d output_ids_len=%d "
+            "origin_input_ids_len=%d page_size=%d",
+            req.rid,
+            idx,
+            dp_rank,
+            req.seqlen,
+            req.kv_committed_len,
+            req.kv_allocated_len,
+            len(req.output_ids),
+            len(req.origin_input_ids),
+            self.token_to_kv_pool_allocator.page_size,
+        )
 
         release_kv_cache(req, self.tree_cache, dp_rank=dp_rank, is_insert=False)
 
@@ -1496,6 +1574,27 @@ class ScheduleBatch:
                 req.decode_batch_idx += 1
                 req.kv_committed_len += 1
                 req.kv_allocated_len += 1
+
+            # Validate: no page shared between different requests
+            page_size = self.token_to_kv_pool_allocator.page_size
+            if page_size > 1 and len(reqs) > 1:
+                all_pages_sets = []
+                for req_i, req in enumerate(reqs):
+                    sl = req.kv_committed_len
+                    row = self.req_to_token_pool.req_to_token[req.req_pool_idx, :sl]
+                    pages = set(int(x) for x in np.unique(row // page_size) if x != 0)
+                    all_pages_sets.append((req.rid, pages))
+
+                for i_a in range(len(all_pages_sets)):
+                    for i_b in range(i_a + 1, len(all_pages_sets)):
+                        overlap = all_pages_sets[i_a][1] & all_pages_sets[i_b][1]
+                        if overlap:
+                            logger.error(
+                                "PAGE_OVERLAP: reqs %s and %s share pages: %s",
+                                all_pages_sets[i_a][0],
+                                all_pages_sets[i_b][0],
+                                sorted(overlap)[:10],
+                            )
 
     def filter_batch(
         self,
