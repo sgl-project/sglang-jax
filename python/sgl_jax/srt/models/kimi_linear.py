@@ -21,10 +21,19 @@ from sgl_jax.srt.layers.moe import EPMoE, create_moe_weights_mapping
 from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention as KimiMLAAttention
-from sgl_jax.srt.utils.debug_utils import dump_array
+from sgl_jax.srt.utils.debug_utils import dump_array, is_dump_enabled
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
+
+
+def _replicate_for_dump(x: jax.Array) -> jax.Array:
+    """Force ``x`` to a fully-replicated sharding so heterogeneously-sharded
+    operands (e.g. tensor-sharded q/k/v vs replicated f_a/g_a) can be
+    concatenated for the GPU-style fused-proj dumps."""
+    return jax.lax.with_sharding_constraint(
+        x, jax.sharding.NamedSharding(x.sharding.mesh, jax.sharding.PartitionSpec())
+    )
 
 
 class KimiMLP(nnx.Module):
@@ -74,9 +83,14 @@ class KimiMLP(nnx.Module):
         up, _ = self.up_proj(hidden_states)
         dump_array(f"{p}_up_proj_out", up, forward_mode)
         # GPU equivalent: fused gate_up_proj.output = concat([gate, up], -1)
-        dump_array(
-            f"{p}_gate_up_proj_out", jnp.concatenate([gate, up], axis=-1), forward_mode
-        )
+        if is_dump_enabled():
+            dump_array(
+                f"{p}_gate_up_proj_out",
+                jnp.concatenate(
+                    [_replicate_for_dump(gate), _replicate_for_dump(up)], axis=-1
+                ),
+                forward_mode,
+            )
         act = jax.nn.silu(gate) * up
         dump_array(f"{p}_act_fn_out", act, forward_mode)
         output, _ = self.down_proj(act)
@@ -287,11 +301,22 @@ class KimiDeltaAttention(nnx.Module):
         dump_array(f"{p}_g_a_proj_out", g_a, fm)
 
         # GPU equivalent: fused_qkvbfg_a_proj.output = concat([Q, K, V, B, F_a, G_a], -1)
-        dump_array(
-            f"{p}_fused_qkvbfg_a_proj_out",
-            jnp.concatenate([q, k, v, b_out, f_a_out, g_a], axis=-1),
-            fm,
-        )
+        if is_dump_enabled():
+            dump_array(
+                f"{p}_fused_qkvbfg_a_proj_out",
+                jnp.concatenate(
+                    [
+                        _replicate_for_dump(q),
+                        _replicate_for_dump(k),
+                        _replicate_for_dump(v),
+                        _replicate_for_dump(b_out),
+                        _replicate_for_dump(f_a_out),
+                        _replicate_for_dump(g_a),
+                    ],
+                    axis=-1,
+                ),
+                fm,
+            )
 
         o, recurrent_state_pool = self.attn(
             forward_batch,
@@ -309,11 +334,15 @@ class KimiDeltaAttention(nnx.Module):
         dump_array(f"{p}_g_b_proj_out", output_gate, fm)
 
         # GPU equivalent: fused_fg_b_proj.output = concat([F_b, G_b], -1)
-        dump_array(
-            f"{p}_fused_fg_b_proj_out",
-            jnp.concatenate([raw_gate, output_gate], axis=-1),
-            fm,
-        )
+        if is_dump_enabled():
+            dump_array(
+                f"{p}_fused_fg_b_proj_out",
+                jnp.concatenate(
+                    [_replicate_for_dump(raw_gate), _replicate_for_dump(output_gate)],
+                    axis=-1,
+                ),
+                fm,
+            )
 
         output_gate_3d = output_gate.reshape(
             hidden_states.shape[0], self.num_heads, self.head_dim

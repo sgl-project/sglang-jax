@@ -57,6 +57,13 @@ def _dump_dir() -> Path | None:
     return Path(raw) if raw else None
 
 
+def is_dump_enabled() -> bool:
+    """True when SGL_DUMP_DIR is set. Use at call sites to gate any extra
+    array construction (e.g. fused-proj concats) so unused work is never
+    traced when dumping is off."""
+    return _dump_dir() is not None
+
+
 def _local_device_count() -> int:
     global _local_dev_n
     if _local_dev_n is None:
