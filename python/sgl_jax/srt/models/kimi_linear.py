@@ -475,6 +475,7 @@ class KimiDecoderLayer(nnx.Module):
 
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
+                dump_array(f"{tag}_moe_plus_shared_experts", hidden_states)
         else:
             hidden_states = self.mlp(hidden_states)
             dump_array(f"{tag}_mlp", hidden_states)
