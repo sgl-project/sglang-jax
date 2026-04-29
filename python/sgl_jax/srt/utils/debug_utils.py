@@ -8,21 +8,21 @@ Each forward writes into a per-mode subdir (``prefill`` / ``decode_1`` /
 "begin forward" call is required — each ``dump_array`` invocation carries
 ``forward_mode`` (or a mode-string) so the bucket can be computed independently.
 
-Multi-device caveat: ``jax.debug.callback`` does not support ``ordered=True``
-when the jit runs on more than one device, so callbacks fire **once per local
-device** with no inter-callback ordering guarantee. The host computes
-``forward_idx`` and ``shard_idx`` from the per-tag counter divided by the
-local device count, which is robust to interleaving::
+Under SPMD jit each program-level ``dump_array`` call fires the host
+callback exactly once per process (the array is gathered to host before
+the callback runs), so the per-tag counter advances by 1 per forward and
+``forward_idx = counter + 1`` directly. Each process writes one file per
+forward::
 
     SGL_DUMP_DIR/
         prefill/
-            embed_tokens_p0_s0.npy        # shard 0
-            embed_tokens_p0_s1.npy        # shard 1, ...
-            layer_00_attn_out_p0_s0.npy
+            embed_tokens_p0.npy
+            layer_00_attn_out_p0.npy
             ...
         decode_1/
             ...
         decode_2/
+            ...
             ...
 
 Usage inside a jitted model::
@@ -48,7 +48,6 @@ import numpy as np
 _DUMP_DIR_ENV = "SGL_DUMP_DIR"
 _lock = threading.Lock()
 _tag_counter: dict[tuple[str, str], int] = {}
-_local_dev_n: int | None = None
 _warmup_complete: bool = False
 
 
@@ -62,16 +61,6 @@ def is_dump_enabled() -> bool:
     array construction (e.g. fused-proj concats) so unused work is never
     traced when dumping is off."""
     return _dump_dir() is not None
-
-
-def _local_device_count() -> int:
-    global _local_dev_n
-    if _local_dev_n is None:
-        try:
-            _local_dev_n = max(1, jax.local_device_count())
-        except Exception:
-            _local_dev_n = 1
-    return _local_dev_n
 
 
 def _resolve_mode_kind(forward_mode) -> str:
@@ -98,21 +87,24 @@ def _host_save(tag: str, mode_kind: str, summary: bool, array: np.ndarray) -> No
         return
     if not _warmup_complete:
         # Precompile / warmup pass: callback fires but we drop the write so
-        # the real first forward starts from idx 0 (subdir "prefill" /
-        # "decode_1") instead of being shifted by the precompile count.
+        # the real first forward starts from forward_idx 1 instead of being
+        # shifted by the precompile count.
         return
-    n = _local_device_count()
     with _lock:
         key = (tag, mode_kind)
         idx = _tag_counter.get(key, 0)
         _tag_counter[key] = idx + 1
-    forward_idx = idx // n + 1
-    shard_idx = idx % n
+    # Under SPMD jit each program-level dump_array call fires the host
+    # callback exactly once per process (the array is gathered to host
+    # before the callback runs), so the per-tag counter advances by 1 per
+    # forward and `idx + 1` is the forward index directly. No shard split
+    # in the filename: each process writes one file per forward.
+    forward_idx = idx + 1
     sub = _format_subdir(mode_kind, forward_idx)
     full_dir = out_dir / sub
     full_dir.mkdir(parents=True, exist_ok=True)
     proc = jax.process_index()
-    path = full_dir / f"{tag}_p{proc}_s{shard_idx}.npy"
+    path = full_dir / f"{tag}_p{proc}.npy"
     np.save(path, array)
     if summary:
         is_float = np.issubdtype(array.dtype, np.floating)
@@ -146,16 +138,17 @@ def dump_array(
 ) -> None:
     """Dump a (possibly sharded) array to disk from inside jit.
 
-    Files land under ``$SGL_DUMP_DIR/<subdir>/<tag>_p<process>_s<shard>.npy``.
-    The subdir is derived from ``forward_mode`` plus a host counter that
-    advances every time the same tag is dumped; once the counter wraps past
-    the local device count, ``forward_idx`` increments and a new subdir is
-    used.
+    Files land under ``$SGL_DUMP_DIR/<subdir>/<tag>_p<process>.npy``. The
+    subdir is derived from ``forward_mode`` plus a host counter that
+    advances every time the same tag is dumped (one increment per
+    program-level forward).
 
     Args:
         tag: Logical name; used in the filename and to sequence dumps.
-        array: jax array. Sharded arrays dump per-shard local data by default;
-            set ``gather=True`` to first replicate (single content per shard).
+        array: jax array. SPMD jit gathers it to host before the callback
+            runs, so each process sees its full local view; on a single
+            process this is the full unsharded tensor. ``gather=True``
+            forces an explicit fully-replicated reshard first.
         forward_mode: A ``ForwardMode`` enum (must expose ``is_prefill()``),
             a string like ``"prefill"`` / ``"decode"``, or ``None`` (bucket
             is named ``"default"``). Pass ``forward_batch.forward_mode`` from
