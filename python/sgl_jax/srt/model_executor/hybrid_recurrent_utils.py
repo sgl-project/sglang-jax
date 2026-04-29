@@ -45,7 +45,7 @@ def _build_hybrid_pools(
         mesh=mesh,
     )
     hybrid_pool = HybridReqToTokenPool(
-        size=max_num_reqs + 1,  # +1 for dummy slot 0
+        size=max_num_reqs,
         max_context_len=max_context_len,
         dtype=np.int32,
         recurrent_state_pool=rsp,

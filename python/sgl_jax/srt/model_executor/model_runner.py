@@ -435,7 +435,6 @@ class ModelRunner(BaseModelRunner):
 
         dtype_size = jnp.dtype(self.kv_cache_dtype).itemsize
         num_layers = self._kv_pool_layer_count()
-
         if self.use_mla_backend and self.server_args.attention_backend == "fa":
             # Two-segment alignment matches the MLA v2 kernel ABI: lkv and rope
             # are independent buffers each padded to 128, NOT align(lkv+rope).
