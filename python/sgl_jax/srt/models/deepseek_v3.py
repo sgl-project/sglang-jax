@@ -5,7 +5,7 @@ with shared experts and dense layers for the first K layers.
 
 Reference: deepseek_jax.py (pure JAX/NNX reference implementation).
 This file adapts that reference to the sglang-jax serving infrastructure,
-reusing existing modules: MLAAttention, GateLogit, TopK, EPMoE/FusedEPMoE.
+reusing existing modules: RadixAttention, GateLogit, TopK, EPMoE/FusedEPMoE.
 """
 
 import logging

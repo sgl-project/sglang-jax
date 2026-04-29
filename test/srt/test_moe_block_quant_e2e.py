@@ -12,6 +12,18 @@ from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
 
 def get_cosine_similarity(a, b, mesh: Mesh):
+    """Cosine similarity in fp32, used as the bf16/quantised numerical-correctness metric.
+
+    Why not allclose: at production-scale dimensions with bf16 / FP8 matmuls,
+    element-wise tolerances are either too strict (false positives) or too
+    loose to discriminate. Cosine similarity measures directional agreement
+    and is invariant to per-element magnitude noise, which is the failure
+    mode bf16 matmul chains actually exhibit.
+
+    Threshold convention in this repo: assert >= 0.99. FlashInfer uses the
+    same approach in their absorbed-MLA decode kernel tests
+    (flashinfer-ai/flashinfer#551).
+    """
     a_flat = jax.sharding.reshard(a.flatten().astype(jnp.float32), NamedSharding(mesh, P()))
     b_flat = jax.sharding.reshard(b.flatten().astype(jnp.float32), NamedSharding(mesh, P()))
     return jnp.dot(a_flat, b_flat) / (jnp.linalg.norm(a_flat) * jnp.linalg.norm(b_flat))
