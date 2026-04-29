@@ -1588,6 +1588,9 @@ class Scheduler(
                     self.chunked_reqs[dp_rank] is None
                 ), f"Chunked request already exists for DP rank {dp_rank} when adding new chunked req"
                 self.chunked_reqs[dp_rank] = adder.new_chunked_reqs[dp_rank]
+            # Increment for any chunked req (new OR continuing) to keep
+            # process_batch_result_prefill from sampling on intermediate chunks.
+            if self.chunked_reqs[dp_rank] is not None:
                 self.chunked_reqs[dp_rank].is_chunked += 1
 
         self.log_prefill_stats(adder, all_can_run_reqs, running_bs)
