@@ -1282,7 +1282,7 @@ class ScheduleBatch:
         info = self.reqs_info[dp_rank]
         req = info.reqs[idx]
 
-        release_kv_cache(req, self.tree_cache, dp_rank=dp_rank, is_insert=False)
+        release_kv_cache(req, self.tree_cache, is_insert=False)
 
         if not isinstance(self.tree_cache, ChunkCache):
             num_tokens = remaing_req_count * global_config.retract_decode_steps

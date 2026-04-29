@@ -112,12 +112,13 @@ def available_and_evictable_str(tree_cache, dp_rank: int = 0) -> str:
 def release_kv_cache(
     req,
     tree_cache: BasePrefixCache,
-    dp_rank: int = 0,
     is_insert: bool = True,
 ) -> None:
     """Single entry point for releasing a request's KV cache (sglang #12224)."""
     if req.req_pool_idx is None:
         return
+
+    dp_rank = req.dp_rank if req.dp_rank is not None else 0
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
