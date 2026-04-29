@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.kda import chunk_kda, fused_recurrent_kda
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -204,23 +205,71 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         layer: RadixLinearAttention,
         scale: float | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        """Chunked prefill via Pallas kernel.  Returns (output, new_state)."""
+        """Chunked prefill via Pallas kernel.  Returns (output, new_state).
+
+        chunk_kda calls pallas_call internally, so we wrap it in shard_map
+        (rpav3 pattern) — H is sharded on "tensor", cu_seqlens replicated.
+        scale is a static argname of chunk_kda and must be a Python float;
+        binding it via closure here is fine because jax.jit caches the
+        compiled product across calls.
+        """
         if layer.A_log is None or layer.dt_bias is None:
             raise ValueError("KDA gate activation requires layer.A_log and layer.dt_bias")
+        H = q.shape[-2]
+        # kda_gate_chunk_cumsum requires A_log shape (H,); the layer stores
+        # it as [1, 1, H, 1] (broadcast-friendly for naive paths).
+        A_log = layer.A_log.value.reshape(H)
+        dt_bias = layer.dt_bias.value
+        scale = scale if scale is not None else layer.scale
+
+        def _chunk_kda_call(q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias):
+            o, final_state, *_ = chunk_kda(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=True,
+                cu_seqlens=cu_seqlens,
+                use_gate_in_kernel=True,
+                A_log=A_log,
+                dt_bias=dt_bias,
+            )
+            return o, final_state
+
+        sharded = jax.shard_map(
+            _chunk_kda_call,
+            mesh=self.mesh,
+            in_specs=(
+                P(None, None, "tensor", None),  # q [1, T, H, K]
+                P(None, None, "tensor", None),  # k [1, T, H, K]
+                P(None, None, "tensor", None),  # v [1, T, H, V]
+                P(None, None, "tensor", None),  # g [1, T, H, K]
+                P(None, None, "tensor"),  # beta [1, T, H]
+                P(None, "tensor", None, None),  # initial_state [N, H, K, V]
+                P(),  # cu_seqlens [N+1]
+                P("tensor"),  # A_log [H]
+                P("tensor"),  # dt_bias [H*K]
+            ),
+            out_specs=(
+                P(None, None, "tensor", None),  # output [1, T, H, V]
+                P(None, "tensor", None, None),  # final_state [N, H, K, V]
+            ),
+            check_vma=False,
+        )
         # Kernel expects [1, T_packed, H, K] packed layout.
-        o, final_state, *_ = chunk_kda(
+        o, final_state = sharded(
             q[None, ...],
             k[None, ...],
             v[None, ...],
             g[None, ...],
             beta[None, ...],
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=True,
-            cu_seqlens=cu_seqlens,
-            use_gate_in_kernel=True,
-            A_log=layer.A_log.value,
-            dt_bias=layer.dt_bias.value,
+            initial_state,
+            cu_seqlens,
+            A_log,
+            dt_bias,
         )
         # Remove the B=1 packed dim: [1, T, H, V] -> [T, H, V]
         return o[0], final_state
