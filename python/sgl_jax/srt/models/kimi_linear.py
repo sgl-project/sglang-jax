@@ -30,10 +30,10 @@ logger = logging.getLogger(__name__)
 def _replicate_for_dump(x: jax.Array, mesh: jax.sharding.Mesh) -> jax.Array:
     """Force ``x`` to a fully-replicated sharding so heterogeneously-sharded
     operands (e.g. tensor-sharded q/k/v vs replicated f_a/g_a) can be
-    concatenated for the GPU-style fused-proj dumps. ``mesh`` must be the
-    same mesh used to build the module (tracer.sharding is unavailable
-    under explicit-sharding jit, so we pass it explicitly)."""
-    return jax.lax.with_sharding_constraint(
+    concatenated for the GPU-style fused-proj dumps. Uses
+    ``jax.sharding.reshard`` because ``with_sharding_constraint`` degrades
+    to a same-sharding assertion under fully explicit-sharding meshes."""
+    return jax.sharding.reshard(
         x, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
     )
 
