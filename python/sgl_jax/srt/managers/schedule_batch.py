@@ -784,7 +784,7 @@ class ScheduleBatch:
         """Check if batch is empty (no requests in any DP rank)."""
         return self.batch_size() == 0
 
-    def alloc_req_slots(self, reqs):
+    def alloc_req_slots(self, reqs: list[Req]):
         req_pool_indices = self.req_to_token_pool.alloc(reqs)
         if req_pool_indices is None:
             raise RuntimeError(
@@ -937,7 +937,6 @@ class ScheduleBatch:
                 continue
 
             # Allocate req slots
-            bs = len(reqs)
             req_pool_indices = self.alloc_req_slots(reqs)
 
             # Init arrays
@@ -955,7 +954,7 @@ class ScheduleBatch:
             # Copy prefix and do some basic check
             extend_input_logprob_token_ids = []
 
-            for req, seq_len, pre_len in zip(reqs, seq_lens, prefix_lens):
+            for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
                 assert seq_len - pre_len == req.extend_input_len
 
                 req.kv_committed_len = seq_len
@@ -1068,7 +1067,7 @@ class ScheduleBatch:
 
             # Write to req_to_token_pool
             pt = 0
-            for i in range(bs):
+            for i in range(len(reqs)):
                 self.req_to_token_pool.write(
                     (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
                     out_cache_loc[pt : pt + extend_lens[i]],

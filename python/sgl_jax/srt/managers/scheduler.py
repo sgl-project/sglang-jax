@@ -1422,8 +1422,6 @@ class Scheduler(
                 # only finished requests to running_batch.
                 chunked_req_to_exclude[dp_rank] = self.chunked_reqs[dp_rank]
                 self.tree_cache.cache_unfinished_req(self.chunked_reqs[dp_rank])
-                # The chunked req keeps its req_pool_idx across batches; the
-                # next alloc(reqs) reuses the slot in place.
 
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():

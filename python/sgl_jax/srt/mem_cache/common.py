@@ -116,6 +116,9 @@ def release_kv_cache(
     is_insert: bool = True,
 ) -> None:
     """Single entry point for releasing a request's KV cache (sglang #12224)."""
+    if req.req_pool_idx is None:
+        return
+
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
     start_p, end_p = req.pop_overallocated_kv_cache()
@@ -128,10 +131,10 @@ def release_kv_cache(
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx, start_p:end_p]
         tree_cache.token_to_kv_pool_allocator.free(indices_to_free, dp_rank=dp_rank)
 
-    tree_cache.req_to_token_pool.free(req.req_pool_idx)
-
     # SWA needs swa_uuid_for_lock; ChunkCache has no prefix tree to lock.
     if isinstance(tree_cache, SWARadixCache):
         tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
     elif not isinstance(tree_cache, ChunkCache):
         tree_cache.dec_lock_ref(req.last_node)
+
+    tree_cache.req_to_token_pool.free(req)
