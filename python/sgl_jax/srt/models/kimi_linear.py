@@ -27,12 +27,14 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 logger = logging.getLogger(__name__)
 
 
-def _replicate_for_dump(x: jax.Array) -> jax.Array:
+def _replicate_for_dump(x: jax.Array, mesh: jax.sharding.Mesh) -> jax.Array:
     """Force ``x`` to a fully-replicated sharding so heterogeneously-sharded
     operands (e.g. tensor-sharded q/k/v vs replicated f_a/g_a) can be
-    concatenated for the GPU-style fused-proj dumps."""
+    concatenated for the GPU-style fused-proj dumps. ``mesh`` must be the
+    same mesh used to build the module (tracer.sharding is unavailable
+    under explicit-sharding jit, so we pass it explicitly)."""
     return jax.lax.with_sharding_constraint(
-        x, jax.sharding.NamedSharding(x.sharding.mesh, jax.sharding.PartitionSpec())
+        x, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
     )
 
 
@@ -46,6 +48,7 @@ class KimiMLP(nnx.Module):
         dump_prefix: str = "",
     ):
         super().__init__()
+        self.mesh = mesh
         self.dump_prefix = dump_prefix
         self.gate_proj = LinearBase(
             input_size=hidden_size,
@@ -87,7 +90,11 @@ class KimiMLP(nnx.Module):
             dump_array(
                 f"{p}_gate_up_proj_out",
                 jnp.concatenate(
-                    [_replicate_for_dump(gate), _replicate_for_dump(up)], axis=-1
+                    [
+                        _replicate_for_dump(gate, self.mesh),
+                        _replicate_for_dump(up, self.mesh),
+                    ],
+                    axis=-1,
                 ),
                 forward_mode,
             )
@@ -306,12 +313,12 @@ class KimiDeltaAttention(nnx.Module):
                 f"{p}_fused_qkvbfg_a_proj_out",
                 jnp.concatenate(
                     [
-                        _replicate_for_dump(q),
-                        _replicate_for_dump(k),
-                        _replicate_for_dump(v),
-                        _replicate_for_dump(b_out),
-                        _replicate_for_dump(f_a_out),
-                        _replicate_for_dump(g_a),
+                        _replicate_for_dump(q, self.mesh),
+                        _replicate_for_dump(k, self.mesh),
+                        _replicate_for_dump(v, self.mesh),
+                        _replicate_for_dump(b_out, self.mesh),
+                        _replicate_for_dump(f_a_out, self.mesh),
+                        _replicate_for_dump(g_a, self.mesh),
                     ],
                     axis=-1,
                 ),
@@ -338,7 +345,10 @@ class KimiDeltaAttention(nnx.Module):
             dump_array(
                 f"{p}_fused_fg_b_proj_out",
                 jnp.concatenate(
-                    [_replicate_for_dump(raw_gate), _replicate_for_dump(output_gate)],
+                    [
+                        _replicate_for_dump(raw_gate, self.mesh),
+                        _replicate_for_dump(output_gate, self.mesh),
+                    ],
                     axis=-1,
                 ),
                 fm,
