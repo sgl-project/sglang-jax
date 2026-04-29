@@ -140,7 +140,7 @@ class SchedulerOutputProcessorMixin:
                                 >= precision_tracer.get_max_requests()
                             ):
                                 precision_tracer.stop_trace()
-                        release_kv_cache(req, self.tree_cache, dp_rank=dp_rank)
+                        release_kv_cache(req, self.tree_cache)
                     elif not info.decoding_reqs or req not in info.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
@@ -382,7 +382,7 @@ class SchedulerOutputProcessorMixin:
                             >= precision_tracer.get_max_requests()
                         ):
                             precision_tracer.stop_trace()
-                    release_kv_cache(req, self.tree_cache, dp_rank=dp_rank)
+                    release_kv_cache(req, self.tree_cache)
 
                 if req.return_output_logprob_only:
                     req.output_token_logprobs_val.append(next_token_logprobs[req_idx])
