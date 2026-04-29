@@ -49,6 +49,7 @@ _DUMP_DIR_ENV = "SGL_DUMP_DIR"
 _lock = threading.Lock()
 _tag_counter: dict[tuple[str, str], int] = {}
 _local_dev_n: int | None = None
+_warmup_complete: bool = False
 
 
 def _dump_dir() -> Path | None:
@@ -87,6 +88,11 @@ def _format_subdir(mode_kind: str, forward_idx: int) -> str:
 def _host_save(tag: str, mode_kind: str, summary: bool, array: np.ndarray) -> None:
     out_dir = _dump_dir()
     if out_dir is None:
+        return
+    if not _warmup_complete:
+        # Precompile / warmup pass: callback fires but we drop the write so
+        # the real first forward starts from idx 0 (subdir "prefill" /
+        # "decode_1") instead of being shifted by the precompile count.
         return
     n = _local_device_count()
     with _lock:
@@ -170,5 +176,23 @@ def dump_array(
 
 def reset_dump_state() -> None:
     """Reset all host-side counters. For tests."""
+    global _warmup_complete
     with _lock:
         _tag_counter.clear()
+        _warmup_complete = False
+
+
+def mark_warmup_complete() -> None:
+    """Signal that precompile / warmup is done. Until this is called,
+    ``dump_array`` callbacks still fire but the host drops every write, so
+    precompile forwards do not consume the ``prefill`` / ``decode_N`` slots.
+    On call, per-tag counters are cleared so the first real forward starts
+    at ``forward_idx = 1``.
+
+    Hook point: call once at the end of ``tp_worker.run_precompile()``.
+    Idempotent.
+    """
+    global _warmup_complete
+    with _lock:
+        _tag_counter.clear()
+        _warmup_complete = True

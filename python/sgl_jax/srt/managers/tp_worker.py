@@ -248,6 +248,9 @@ class ModelWorker:
     def run_precompile(self, future_token_ids_map=None):
         self.precompile_extend(future_token_ids_map)
         self.precompile_decode(future_token_ids_map)
+        from sgl_jax.srt.utils.debug_utils import mark_warmup_complete
+
+        mark_warmup_complete()
 
     def precompile_extend(self, future_token_ids_map=None):
         start_time = time.perf_counter()
