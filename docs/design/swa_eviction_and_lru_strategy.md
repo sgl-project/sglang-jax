@@ -1,5 +1,19 @@
 # SWA Eviction and LRU Strategy
 
+## 0. Overview
+
+Hybrid models (e.g. MiMo-V2-Flash with 9 full-attention + 39 SWA layers) mix
+full-attention and sliding-window-attention (SWA) layers. Full-attention layers
+retain all historical KV; SWA layers only need the most recent `W` tokens.
+The dual-pool KV cache exploits this asymmetry to reduce memory.
+
+### Cache Mode Support
+
+| Cache Mode | SWA Support | Path |
+|------------|-------------|------|
+| **ChunkCache** (`--disable-radix-cache`) | Supported | Per-request proactive eviction (`ScheduleBatch._evict_swa`). |
+| **SWARadixCache** (default) | Supported | Per-request eviction during decode delegates to `SWARadixCache.evict_req_swa`; tree-pressure eviction handles the rest (Phase 1 / Phase 2). |
+
 ## 1. Dual-Pool Architecture
 
 ```
@@ -28,7 +42,54 @@
 | `last_matched_prefix_len` | Page-aligned cached prefix length kept on the request for writeback / retract bookkeeping |
 | `tombstone` | Tree node: full KV retained, SWA KV freed |
 
-## 2. Two Cache Modes at a Glance
+### Memory Layout Example
+
+For MiMo-V2-Flash on TPU v6e-16 (TP=16, 1 KV head, head_dim=192+128=320, bf16):
+
+```
+Full pool:  104,704 tokens x  9 FA  layers x 640 B/token = ~603 MB
+SWA  pool:   83,840 tokens x 39 SWA layers x 640 B/token = ~2.1 GB
+SWA held per request: ~256 tokens (sliding_window=128 + page_size=128 alignment)
+```
+
+The SWA pool dominates per-layer cost (39 layers vs. 9), so freeing
+out-of-window SWA slots aggressively is the lever the hybrid design pulls.
+
+## 2. Allocator: `SWATokenToKVPoolAllocator`
+
+Lives in `python/sgl_jax/srt/mem_cache/allocator.py`. Wraps two independent
+sub-allocators (one per pool) and the `full_to_swa_index_mapping` array.
+
+### Allocation (atomic across pools)
+
+```
+alloc_extend / alloc_decode:
+  1. full_indices = full_attn_allocator.alloc_*(...)
+     if None: return None                       # full pool exhausted
+  2. swa_indices  = swa_attn_allocator.alloc_*(...)
+     if None:                                   # SWA exhausted after full succeeded
+        full_attn_allocator.free(full_indices)  # rollback
+        return None
+  3. mapping[full_indices] = swa_indices
+  4. return full_indices                        # SWA indices stay private to the pool
+```
+
+The rollback is what makes the dual-pool allocation atomic: callers see
+either both pools advanced or neither.
+
+### Freeing
+
+| Method | Frees | Called from |
+|--------|-------|-------------|
+| `free(indices)` | Both pools (delegates to `free_swa` for SWA side) | Request completion, retract |
+| `free_swa(indices)` | SWA pool only — looks up mapping, frees entries with `mapping > 0`, then zeroes those mapping entries | Per-request SWA eviction (`_evict_swa`, `evict_req_swa`) and tombstone Phase 2 |
+| `count_swa_mapped(indices)` | Read-only — counts indices whose mapping is still `> 0` | Bookkeeping before `free_swa` |
+
+A mapping value of `0` means "SWA slot already freed for this full slot",
+which is why `free_swa` must filter `> 0` before delegating to the SWA
+sub-allocator.
+
+## 3. Two Cache Modes at a Glance
 
 ```
 ChunkCache (--disable-radix-cache)       SWARadixCache (radix cache enabled)
@@ -39,7 +100,7 @@ ChunkCache (--disable-radix-cache)       SWARadixCache (radix cache enabled)
 +-------------------------------+        +-------------------------------+
 ```
 
-## 3. Per-Request SWA Eviction
+## 4. Per-Request SWA Eviction
 
 Frees SWA slots outside the sliding window from a request's `req_to_token` buffer.
 
@@ -92,9 +153,9 @@ Example (sliding_window=128, page_size=256, seqlen=2049, decode pre_len=2048):
 | Extend | Yes        | **No** (skipped; `isinstance(tree_cache, ChunkCache)` gate) |
 | Decode | Yes        | Yes (delegates to `evict_req_swa` with tree-derived protected prefix) |
 
-## 4. Extend Phase Behavior
+## 5. Extend Phase Behavior
 
-### 4.1 ChunkCache -- Proactive Eviction
+### 5.1 ChunkCache -- Proactive Eviction
 
 With overlap scheduling, `pre_len` is shifted back by `chunked_prefill_size`
 when `enable_overlap=True` and `req.is_chunked > 0`.
@@ -133,7 +194,7 @@ Chk 2: |........|################|             pre_len=2048, evict [0,1536)
 Chk 3: |.................|################|    pre_len=4096, evict [1536,3584)
 ```
 
-### 4.2 SWARadixCache -- Deferred to Tree
+### 5.2 SWARadixCache -- Deferred to Tree
 
 ```
 8K tokens, chunk_size=2048, sliding_window=128, page_size=256
@@ -165,7 +226,35 @@ First decode step:
 tree-level eviction. The ownership boundary now lives inside the cache layer
 instead of a request field, but prefill is still less SWA-efficient than ChunkCache.
 
-## 5. Tree-Level Eviction (SWARadixCache)
+## 6. Decode Phase Behavior
+
+`maybe_evict_swa` runs on every decode batch, but the per-request
+`_evict_swa` call is throttled by an `evict_interval` derived from
+`page_size` and `sliding_window_size`:
+
+```python
+multiplier      = float(os.environ.get("SGL_JAX_SWA_EVICTION_INTERVAL_MULTIPLIER", "1.0"))
+evict_interval  = max(page_size, int(sliding_window_size * multiplier))
+evict_interval  = (evict_interval // page_size) * page_size   # snap down to a page multiple
+trigger         = (req.decode_batch_idx % evict_interval == 1)
+```
+
+The `% == 1` rather than `% == 0` choice means the very first decode step
+(`decode_batch_idx == 0`) does not evict — the previous extend batch may
+still be reading SWA pages on device, so we defer one step. Subsequent
+triggers fire on `decode_batch_idx == 1, 1 + evict_interval, 1 + 2*evict_interval, ...`.
+
+`SGL_JAX_SWA_EVICTION_INTERVAL_MULTIPLIER` lets operators relax the
+interval (e.g. evict less frequently to amortise host-side bookkeeping at
+the cost of a larger transient SWA footprint). The default `1.0` evicts
+every `sliding_window_size` decode steps.
+
+For SWARadixCache, `_evict_swa` delegates to `evict_req_swa`, which clamps
+`swa_evicted_seqlen` against the tree-derived `protected_prefix_len`
+before computing the new frontier — so a long shared prefix held by the
+tree blocks per-request SWA reclamation until tree Phase 2 runs.
+
+## 7. Tree-Level Eviction (SWARadixCache)
 
 Triggered by allocation pressure (`evict_from_tree_cache` when pool space < needed).
 
@@ -226,14 +315,14 @@ Round 3:  TOMBSTONE--> TOMBSTONE --> TOMBSTONE --> full+SWA
                                                      retains SWA
 ```
 
-## 6. Tombstone Insert Logic
+## 8. Tombstone Insert Logic
 
 `_insert_helper` has two sets of tombstone branch logic:
 
 - **Inside the while loop**: healing of **existing** tombstone nodes
 - **After the while loop**: tombstone split when creating **new** nodes
 
-### 6.1 Existing Tombstone Healing (while loop)
+### 8.1 Existing Tombstone Healing (while loop)
 
 When insert walks through an existing tombstone node beyond
 `update_kv_after_len`, it checks `swa_evicted_seqlen` against
@@ -252,7 +341,7 @@ Branches 2/3 fire during `cache_finished_req` when a prior request's
 decode nodes have been tombstoned and the current request generated
 identical decode tokens (e.g. greedy decoding with the same prefix).
 
-### 6.2 New Node Tombstone Split (after while loop)
+### 8.2 New Node Tombstone Split (after while loop)
 
 When insert has remaining unmatched tokens (`len(key) > 0`), it creates
 new nodes.  Invariant: **leaf nodes must never be tombstone**.
@@ -271,14 +360,14 @@ new nodes.  Invariant: **leaf nodes must never be tombstone**.
               by the extra `- page_size` in `_evict_swa` frontier)
 ```
 
-### 6.3 Trigger Conditions
+### 8.3 Trigger Conditions
 
 | Call site | `swa_evicted_seqlen` | Existing tombstone | New nodes |
 |-----------|---------------------|--------------------|-----------|
 | `cache_unfinished_req` | Always 0 | Branch 1 only | Case 1 only |
 | `cache_finished_req` | >= protected prefix length | Prefill nodes: skip zone. Prior req's decode nodes: Branch 1/2/3 | Case 2 (normal), Case 3 (defensive) |
 
-## 7. LRU Policy
+## 9. LRU Policy
 
 ```
 +-----------------------------------------------------+
@@ -302,7 +391,7 @@ new nodes.  Invariant: **leaf nodes must never be tombstone**.
 On prefix match, the **deepest matched node** and all ancestors are
 reset to MRU in both lists, keeping frequently accessed prefixes fresh.
 
-## 8. Summary
+## 10. Summary
 
 ```
 +-------------------+-----------------+------------------------+
