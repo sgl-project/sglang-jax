@@ -97,23 +97,25 @@ def _compute_recurrent_per_req_bytes(
     return per_req_recurrent + per_req_conv
 
 
-def _split_state_kv_budget(available_bytes: int, ratio: float) -> tuple[int, int]:
-    """Split available HBM into (state_budget, kv_budget).
+def _split_state_kv_budget(
+    available_bytes: int, ratio: float, per_req_state_bytes: int
+) -> tuple[int, int]:
+    """Split available HBM into (state_max_reqs, kv_budget).
 
-    state_budget = available * r/(1+r), where r = state_to_kv_ratio
-    (matches sglang PyTorch mamba_full_memory_ratio formula).
+    Mirrors sglang `handle_max_mamba_cache`: state count is floored by
+    per_req first, then KV reclaims the leftover (state floor remainder
+    goes back to KV instead of being wasted).
+
+    state_budget_raw = available × r/(1+r), where r = state_to_kv_ratio
+    state_max_reqs = state_budget_raw // per_req_state_bytes
+    kv_budget = available - state_max_reqs × per_req_state_bytes
     """
     assert ratio >= 0.0, f"state_to_kv_ratio must be >= 0, got {ratio}"
-    state_budget = int(available_bytes * ratio / (1.0 + ratio))
-    kv_budget = available_bytes - state_budget
-    return state_budget, kv_budget
-
-
-def _compute_max_num_reqs_from_state_budget(state_budget: int, per_req_bytes: int) -> int:
-    """Floor division; returns 0 if state_budget is 0 (degenerate)."""
-    if per_req_bytes <= 0:
-        return 0
-    return state_budget // per_req_bytes
+    assert per_req_state_bytes > 0, f"per_req_state_bytes must be > 0, got {per_req_state_bytes}"
+    state_budget_raw = int(available_bytes * ratio / (1.0 + ratio))
+    state_max_reqs = state_budget_raw // per_req_state_bytes
+    kv_budget = available_bytes - state_max_reqs * per_req_state_bytes
+    return state_max_reqs, kv_budget
 
 
 def _per_req_state_bytes_from_config(linear_attn_config: dict, tp_size: int) -> int:

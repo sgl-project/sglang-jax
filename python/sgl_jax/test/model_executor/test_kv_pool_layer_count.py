@@ -121,8 +121,8 @@ class TestInitMemoryPoolHybridRecurrent(CustomTestCase):
         runner.req_to_token_pool = None
         runner.token_to_kv_pool_allocator = None
         runner.attn_backend = MagicMock()
-        # Stub profile_max_num_token (avoids get_available_device_memory).
-        runner.profile_max_num_token = lambda total_device_memory: 4096
+        # Stub HBM-profiling helper (avoid real get_available_device_memory).
+        runner._profile_available_kv_cache_bytes = lambda total_device_memory: 8 * 1024**3
         return runner
 
     def test_init_memory_pool_constructs_hybrid_linear_kv_pool(self):

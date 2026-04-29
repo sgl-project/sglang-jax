@@ -46,7 +46,6 @@ from sgl_jax.srt.model_executor.hybrid_recurrent_utils import (
     _build_hybrid_pools,
     _build_non_hybrid_memory_pools,
     _check_state_to_kv_ratio_for_hybrid,
-    _compute_max_num_reqs_from_state_budget,
     _enforce_recurrent_state_server_constraints,
     _per_req_state_bytes_from_config,
     _split_state_kv_budget,
@@ -456,28 +455,27 @@ class ModelRunner(BaseModelRunner):
             * dtype_size
         )
 
+    def _profile_available_kv_cache_bytes(self, total_device_memory: int) -> int:
+        """Mirror of sglang `_profile_available_bytes` (model_runner_kv_cache_mixin.py)."""
+        device_memory = self.get_available_device_memory()
+        kv_cache_bytes = device_memory - total_device_memory * (1 - self.mem_fraction_static)
+        if kv_cache_bytes <= 0:
+            raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
+        return int(kv_cache_bytes)
+
     def profile_max_num_token(self, total_device_memory: int):
         """
         Profile the maximum number of tokens that can fit in memory.
         Uses tpu_info to get accurate TPU memory information.
         """
-        # Get accurate memory information using TPU-specific methods
-        # Use tpu_info for memory information
-        available_device_memory = self.get_available_device_memory()
-        available_kv_cache_bytes = available_device_memory - total_device_memory * (
-            1 - self.mem_fraction_static
-        )
-
-        if available_kv_cache_bytes <= 0:
-            raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
+        available_kv_cache_bytes = self._profile_available_kv_cache_bytes(total_device_memory)
         cell_size = self._compute_cell_size()
 
         # Calculate max tokens that can fit in available memory
         max_tokens = max(1, int(available_kv_cache_bytes // cell_size))
 
         logger.info(
-            "TPU Memory profiling: available_device_memory=%.1fGB, available_kv_cache=%.1fGB, max_tokens=%d, cell_size=%dbytes",
-            available_device_memory / (1024**3),
+            "TPU Memory profiling: available_kv_cache=%.1fGB, max_tokens=%d, cell_size=%dbytes",
             available_kv_cache_bytes / (1024**3),
             max_tokens,
             cell_size,
@@ -507,18 +505,74 @@ class ModelRunner(BaseModelRunner):
         else:
             raise ValueError(f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}.")
         logger.info("ModelRunner kv_cache_dtype: %s", self.kv_cache_dtype)
-        # Profile maximum number of tokens
-        self.max_total_num_tokens = self.profile_max_num_token(total_device_memory)
+        # Detect hybrid recurrent state (e.g. Kimi-Linear KDA layers) via the
+        # ModelRunner.linear_recurrent_config property: type-checked + gated on
+        # the config's own is_linear_attn flag, so a degenerate KimiLinearConfig
+        # without a populated linear_attn_config does NOT trigger the hybrid path.
+        recurrent_cfg = self.linear_recurrent_config
+        has_recurrent_state = recurrent_cfg is not None
 
-        # Calculate max number of requests if not provided
-        if max_num_reqs is None:
-            max_num_reqs = min(
-                max(
-                    int(self.max_total_num_tokens / self.model_config.context_len * 512),
-                    2048,
-                ),
-                4096,
+        if has_recurrent_state:
+            _enforce_recurrent_state_server_constraints(self.server_args)
+            _check_state_to_kv_ratio_for_hybrid(self.server_args.state_to_kv_ratio)
+            if self.is_hybrid:
+                raise NotImplementedError(
+                    "state_to_kv_ratio budget split is implemented for the "
+                    "MHA / MLA + recurrent_state paths; SWA-hybrid is TODO."
+                )
+
+            available_bytes = self._profile_available_kv_cache_bytes(total_device_memory)
+            per_req_state_bytes = _per_req_state_bytes_from_config(
+                recurrent_cfg.linear_attn_config, self.tp_size
             )
+            state_max_reqs, kv_budget = _split_state_kv_budget(
+                available_bytes,
+                self.server_args.state_to_kv_ratio,
+                per_req_state_bytes,
+            )
+            self.max_total_num_tokens = kv_budget // self._compute_cell_size()
+            if max_num_reqs is None:
+                heuristic = min(
+                    max(
+                        int(self.max_total_num_tokens / self.model_config.context_len * 512),
+                        2048,
+                    ),
+                    4096,
+                )
+                max_num_reqs = min(heuristic, state_max_reqs)
+            else:
+                max_num_reqs = min(max_num_reqs, state_max_reqs)
+            if self.max_total_num_tokens <= 0:
+                raise RuntimeError(
+                    "state_to_kv_ratio split left no KV budget. "
+                    "Lower --state-to-kv-ratio or increase --mem-fraction-static."
+                )
+            if max_num_reqs <= 0:
+                raise RuntimeError(
+                    "state_to_kv_ratio split left no recurrent state budget. "
+                    "Increase --state-to-kv-ratio or increase --mem-fraction-static."
+                )
+            logger.info(
+                "Hybrid recurrent budget split (state_to_kv_ratio=%s): "
+                "available=%.2fGiB -> kv=%.2fGiB state=%.2fGiB, "
+                "max_total_num_tokens=%s, max_num_reqs=%s",
+                self.server_args.state_to_kv_ratio,
+                available_bytes / (1024**3),
+                kv_budget / (1024**3),
+                (available_bytes - kv_budget) / (1024**3),
+                self.max_total_num_tokens,
+                max_num_reqs,
+            )
+        else:
+            self.max_total_num_tokens = self.profile_max_num_token(total_device_memory)
+            if max_num_reqs is None:
+                max_num_reqs = min(
+                    max(
+                        int(self.max_total_num_tokens / self.model_config.context_len * 512),
+                        2048,
+                    ),
+                    4096,
+                )
 
         # Handle CI environment variable for testing
         SGLANG_CI_SMALL_KV_SIZE = os.environ.get("SGLANG_CI_SMALL_KV_SIZE")
@@ -571,95 +625,6 @@ class ModelRunner(BaseModelRunner):
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
 
         logger.info("ModelRunner max_total_num_tokens: %s", self.max_total_num_tokens)
-
-        # Detect hybrid recurrent state (e.g. Kimi-Linear KDA layers) via the
-        # ModelRunner.linear_recurrent_config property: type-checked + gated on
-        # the config's own is_linear_attn flag, so a degenerate KimiLinearConfig
-        # without a populated linear_attn_config does NOT trigger the hybrid path.
-        recurrent_cfg = self.linear_recurrent_config
-        has_recurrent_state = recurrent_cfg is not None
-        if has_recurrent_state:
-            _enforce_recurrent_state_server_constraints(self.server_args)
-            _check_state_to_kv_ratio_for_hybrid(self.server_args.state_to_kv_ratio)
-
-            # Budget split must happen BEFORE token_to_kv_pool construction
-            # so the KV pool is sized against kv_budget instead of the full
-            # profile (otherwise state_to_kv_ratio is dead code: KV pool keeps
-            # all HBM and the state pool starves at runtime).
-            if self.is_hybrid:
-                # SWA-hybrid keeps two KV pools (full + swa) with independent
-                # per-token sizes; the single-pool budget arithmetic below
-                # would size both against the same `per_token` and over-
-                # commit. Out of scope for the initial recurrent wiring.
-                raise NotImplementedError(
-                    "state_to_kv_ratio budget split is implemented for the "
-                    "MHA / MLA + recurrent_state paths; SWA-hybrid is TODO."
-                )
-
-            # Use the project's existing _compute_cell_size helper so per-token
-            # KV bytes match what the KV pool actually consumes per device.
-            # Single source of truth for KV byte arithmetic — handles both
-            # MHA/GQA (per-device head count + align128 + K+V *2) and
-            # absorbed-MLA (align128(lkv) + align128(rope), no *2 since V is
-            # not cached) via _compute_cell_size's MLA fast path.
-            per_token_kv_bytes = self._compute_cell_size()
-            available_bytes = self.max_total_num_tokens * per_token_kv_bytes
-            state_budget, kv_budget = _split_state_kv_budget(
-                available_bytes, self.server_args.state_to_kv_ratio
-            )
-
-            # Re-derive max_total_num_tokens from kv_budget; re-align to page
-            # size since the prior alignment was over the full profile.
-            new_max_tokens = kv_budget // per_token_kv_bytes
-            new_max_tokens = (
-                new_max_tokens // self.server_args.page_size * self.server_args.page_size
-            )
-            if new_max_tokens <= 0:
-                raise RuntimeError(
-                    "state_to_kv_ratio split left no KV budget; "
-                    f"kv_budget={kv_budget} bytes, per_token={per_token_kv_bytes} bytes. "
-                    "Lower --state-to-kv-ratio or increase --mem-fraction-static."
-                )
-            logger.info(
-                "Hybrid budget split (state_to_kv_ratio=%s): "
-                "max_total_num_tokens %s -> %s (kv_budget=%s bytes)",
-                self.server_args.state_to_kv_ratio,
-                self.max_total_num_tokens,
-                new_max_tokens,
-                kv_budget,
-            )
-            self.max_total_num_tokens = new_max_tokens
-
-            # Re-derive max_num_reqs from state_budget so RecurrentStatePool is
-            # sized against actual recurrent + conv per-request bytes.
-            per_req_state_bytes = _per_req_state_bytes_from_config(
-                recurrent_cfg.linear_attn_config, self.tp_size
-            )
-            state_max_reqs = _compute_max_num_reqs_from_state_budget(
-                state_budget, per_req_state_bytes
-            )
-            if state_max_reqs <= 0:
-                raise RuntimeError(
-                    "state_to_kv_ratio split left no recurrent state budget; "
-                    f"state_budget={state_budget} bytes, "
-                    f"per_req_state={per_req_state_bytes} bytes. "
-                    "Raise --state-to-kv-ratio or increase --mem-fraction-static."
-                )
-            logger.info(
-                "Hybrid budget split: max_num_reqs %s -> %s "
-                "(state_budget=%s bytes, per_req=%s bytes)",
-                max_num_reqs,
-                min(max_num_reqs, state_max_reqs),
-                state_budget,
-                per_req_state_bytes,
-            )
-            # Take the smaller of the previously computed max_num_reqs (KV-side
-            # budget / context-len heuristic) and the recurrent-state budget cap.
-            # Mirrors sglang upstream model_runner_kv_cache_mixin._resolve_max_num_reqs:
-            #     max_num_reqs = min(max_num_reqs, max_mamba_cache_size // ratio)
-            # Direct override would silently raise the cap when the recurrent
-            # budget exceeds the KV-side cap; min() preserves the tighter bound.
-            max_num_reqs = min(max_num_reqs, state_max_reqs)
 
         # Create request to token pool if not already created.
         # For hybrid models, defer to after token_to_kv_pool is built so we can
