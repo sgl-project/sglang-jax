@@ -3,13 +3,22 @@
 Set ``SGL_DUMP_DIR`` to enable dumping; unset/empty disables it at trace time
 so there is zero runtime overhead in production.
 
-Each forward writes into a per-mode subdir, automatically rolled by a host
-counter every time ``begin_forward`` is called::
+Each forward writes into a per-mode subdir (``prefill`` / ``decode_1`` /
+``decode_2``...) auto-derived from a host-side per-tag counter. No explicit
+"begin forward" call is required — each ``dump_array`` invocation carries
+``forward_mode`` (or a mode-string) so the bucket can be computed independently.
+
+Multi-device caveat: ``jax.debug.callback`` does not support ``ordered=True``
+when the jit runs on more than one device, so callbacks fire **once per local
+device** with no inter-callback ordering guarantee. The host computes
+``forward_idx`` and ``shard_idx`` from the per-tag counter divided by the
+local device count, which is robust to interleaving::
 
     SGL_DUMP_DIR/
         prefill/
-            embed_tokens_p0_i0000.npy
-            layer_00_input_layernorm_p0_i0000.npy
+            embed_tokens_p0_s0.npy        # shard 0
+            embed_tokens_p0_s1.npy        # shard 1, ...
+            layer_00_attn_out_p0_s0.npy
             ...
         decode_1/
             ...
@@ -18,13 +27,11 @@ counter every time ``begin_forward`` is called::
 
 Usage inside a jitted model::
 
-    from sgl_jax.srt.utils.debug_utils import begin_forward, dump_array
+    from sgl_jax.srt.utils.debug_utils import dump_array
 
     def __call__(self, forward_batch, ...):
-        begin_forward("prefill" if forward_batch.forward_mode.is_prefill()
-                      else "decode")
         x = self.embed(forward_batch.input_ids)
-        dump_array("embed_tokens", x)
+        dump_array("embed_tokens", x, forward_batch.forward_mode)
         ...
 """
 
@@ -40,9 +47,8 @@ import numpy as np
 
 _DUMP_DIR_ENV = "SGL_DUMP_DIR"
 _lock = threading.Lock()
-_tag_counter: dict[str, int] = {}
-_mode_counter: dict[str, int] = {}
-_current_subdir: str | None = None
+_tag_counter: dict[tuple[str, str], int] = {}
+_local_dev_n: int | None = None
 
 
 def _dump_dir() -> Path | None:
@@ -50,40 +56,56 @@ def _dump_dir() -> Path | None:
     return Path(raw) if raw else None
 
 
-def _format_subdir(mode_kind: str, idx: int) -> str:
-    # idx is 1-based. Match user-requested layout: "prefill" (no suffix on
-    # first occurrence) and "decode_1", "decode_2", ...
-    if mode_kind == "prefill" and idx == 1:
+def _local_device_count() -> int:
+    global _local_dev_n
+    if _local_dev_n is None:
+        try:
+            _local_dev_n = max(1, jax.local_device_count())
+        except Exception:
+            _local_dev_n = 1
+    return _local_dev_n
+
+
+def _resolve_mode_kind(forward_mode) -> str:
+    if forward_mode is None:
+        return "default"
+    if isinstance(forward_mode, str):
+        return forward_mode
+    if hasattr(forward_mode, "is_prefill"):
+        return "prefill" if forward_mode.is_prefill() else "decode"
+    return str(forward_mode)
+
+
+def _format_subdir(mode_kind: str, forward_idx: int) -> str:
+    # Match user-requested layout: "prefill" (no suffix on first occurrence)
+    # and "decode_1", "decode_2", ...
+    if mode_kind == "prefill" and forward_idx == 1:
         return "prefill"
-    return f"{mode_kind}_{idx}"
+    return f"{mode_kind}_{forward_idx}"
 
 
-def _host_begin_forward(mode_kind: str) -> None:
-    global _current_subdir
-    with _lock:
-        idx = _mode_counter.get(mode_kind, 0) + 1
-        _mode_counter[mode_kind] = idx
-        _tag_counter.clear()
-        _current_subdir = _format_subdir(mode_kind, idx)
-
-
-def _host_save(tag: str, summary: bool, array: np.ndarray) -> None:
+def _host_save(tag: str, mode_kind: str, summary: bool, array: np.ndarray) -> None:
     out_dir = _dump_dir()
     if out_dir is None:
         return
-    sub = _current_subdir or "default"
+    n = _local_device_count()
+    with _lock:
+        key = (tag, mode_kind)
+        idx = _tag_counter.get(key, 0)
+        _tag_counter[key] = idx + 1
+    forward_idx = idx // n + 1
+    shard_idx = idx % n
+    sub = _format_subdir(mode_kind, forward_idx)
     full_dir = out_dir / sub
     full_dir.mkdir(parents=True, exist_ok=True)
-    with _lock:
-        idx = _tag_counter.get(tag, 0)
-        _tag_counter[tag] = idx + 1
     proc = jax.process_index()
-    path = full_dir / f"{tag}_p{proc}_i{idx:04d}.npy"
+    path = full_dir / f"{tag}_p{proc}_s{shard_idx}.npy"
     np.save(path, array)
     if summary:
-        n_nan = int(np.isnan(array).sum()) if np.issubdtype(array.dtype, np.floating) else 0
-        n_inf = int(np.isinf(array).sum()) if np.issubdtype(array.dtype, np.floating) else 0
-        finite = np.isfinite(array) if np.issubdtype(array.dtype, np.floating) else None
+        is_float = np.issubdtype(array.dtype, np.floating)
+        n_nan = int(np.isnan(array).sum()) if is_float else 0
+        n_inf = int(np.isinf(array).sum()) if is_float else 0
+        finite = np.isfinite(array) if is_float else None
         if finite is not None and finite.any():
             vals = array[finite].astype(np.float32)
             stats = (
@@ -101,44 +123,38 @@ def _host_save(tag: str, summary: bool, array: np.ndarray) -> None:
         )
 
 
-def begin_forward(mode_kind: str, *, ordered: bool = True) -> None:
-    """Roll the per-mode counter and switch to a fresh subdir for this forward.
-
-    Call once at the top of the model's ``__call__``. ``mode_kind`` should be
-    a short string like ``"prefill"`` or ``"decode"``. The host counter
-    derives the actual subdir name (``prefill``, ``decode_1``, ``decode_2`` ...).
-
-    No-op if ``SGL_DUMP_DIR`` is unset (decided at trace time).
-    """
-    if _dump_dir() is None:
-        return
-    jax.debug.callback(_host_begin_forward, mode_kind, ordered=ordered)
-
-
 def dump_array(
     tag: str,
     array,
+    forward_mode=None,
     *,
     summary: bool = True,
     gather: bool = False,
-    ordered: bool = True,
 ) -> None:
     """Dump a (possibly sharded) array to disk from inside jit.
 
-    Files land under ``$SGL_DUMP_DIR/<subdir>/<tag>_p<process>_i<NNNN>.npy``,
-    where ``<subdir>`` is set by the most recent :func:`begin_forward` call.
+    Files land under ``$SGL_DUMP_DIR/<subdir>/<tag>_p<process>_s<shard>.npy``.
+    The subdir is derived from ``forward_mode`` plus a host counter that
+    advances every time the same tag is dumped; once the counter wraps past
+    the local device count, ``forward_idx`` increments and a new subdir is
+    used.
 
     Args:
-        tag: Logical name; used in the filename and to sequence repeated dumps.
-        array: jax array. Sharded arrays dump per-process local shards by
-            default; set ``gather=True`` to first replicate.
-        summary: Print a one-line min/max/nan summary alongside the file write.
-        gather: Replicate to a fully-replicated layout before dumping. Requires
-            being inside a mesh context.
-        ordered: Pass through to ``jax.debug.callback`` to preserve order.
+        tag: Logical name; used in the filename and to sequence dumps.
+        array: jax array. Sharded arrays dump per-shard local data by default;
+            set ``gather=True`` to first replicate (single content per shard).
+        forward_mode: A ``ForwardMode`` enum (must expose ``is_prefill()``),
+            a string like ``"prefill"`` / ``"decode"``, or ``None`` (bucket
+            is named ``"default"``). Pass ``forward_batch.forward_mode`` from
+            inside the model for automatic ``prefill`` / ``decode_N`` buckets.
+        summary: Print a one-line min/max/nan summary per file.
+        gather: Replicate to a fully-replicated layout before dumping.
+            Requires being inside a mesh context.
     """
     if _dump_dir() is None:
         return
+
+    mode_kind = _resolve_mode_kind(forward_mode)
 
     if gather and hasattr(array, "sharding") and hasattr(array.sharding, "mesh"):
         replicated = jax.sharding.NamedSharding(
@@ -147,13 +163,12 @@ def dump_array(
         array = jax.lax.with_sharding_constraint(array, replicated)
 
     array = jnp.asarray(array)
-    jax.debug.callback(_host_save, tag, summary, array, ordered=ordered)
+    # ordered=False is required: ordered debug effects raise
+    # `ValueError: ordered effects are not supported for more than 1 device`.
+    jax.debug.callback(_host_save, tag, mode_kind, summary, array, ordered=False)
 
 
 def reset_dump_state() -> None:
-    """Reset all host-side counters and current subdir. For tests."""
-    global _current_subdir
+    """Reset all host-side counters. For tests."""
     with _lock:
         _tag_counter.clear()
-        _mode_counter.clear()
-        _current_subdir = None
