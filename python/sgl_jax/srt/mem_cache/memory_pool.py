@@ -125,8 +125,9 @@ class ReqToTokenPool:
         """Allocate request slots for a list of Req-like objects.
 
         Chunked-prefill semantics:
-        - Reqs already holding a req_pool_idx are skipped (must satisfy
-          is_chunked > 0 -- safety assert).
+        - Reqs already holding a req_pool_idx are skipped iff their slot was
+          explicitly pinned by a previous free_chunked() (req._chunked_slot_pinned).
+          The pin stays sticky until free() clears it on the final chunk.
         - Reqs with no req_pool_idx are allocated from free_slots and have
           req.req_pool_idx written back.
         - If capacity is insufficient, return None and leave every req field
@@ -140,9 +141,10 @@ class ReqToTokenPool:
             if req.req_pool_idx is None:
                 new_count += 1
             else:
-                assert req.is_chunked > 0, (
+                assert getattr(req, "_chunked_slot_pinned", False), (
                     "ReqToTokenPool.alloc: req with existing req_pool_idx must have "
-                    f"is_chunked > 0 (chunked prefill); got is_chunked={req.is_chunked!r}"
+                    "_chunked_slot_pinned=True (slot retained by a previous "
+                    "free_chunked); got an unpinned reuse -- likely a missing free()"
                 )
 
         if new_count > len(self.free_slots):
@@ -183,6 +185,8 @@ class ReqToTokenPool:
         # later caller (the slot may already be re-handed to another req by
         # then). Keeps free / free_chunked / free_recurrent_cache symmetric.
         req.req_pool_idx = None
+        # Defensively clear the pin: a freed slot is never a "retained" slot.
+        req._chunked_slot_pinned = False
 
     def free_chunked(self, chunked_req) -> None:
         """Release for chunked-prefill. Default: identical to free.
@@ -295,11 +299,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
         alloc(reqs) reuses them -- preserves the recurrent state across
         chunks without an alloc/free roundtrip.
 
-        No-op by design: req keeps both req_pool_idx and recurrent_pool_idx;
-        alloc(reqs) sees them set and skips re-allocation, returning the same
-        indices.
+        Pins the slot so alloc(reqs) recognises this as a legitimate reuse
+        (decoupled from the is_chunked counter -- works for the FINAL chunk
+        too, where is_chunked is intentionally 0 to drive output_processor
+        finalize).
         """
-        # Intentional no-op (see docstring).
+        chunked_req._chunked_slot_pinned = True
 
     def free_recurrent_cache(self, req) -> None:
         """Release the recurrent state slot held by `req`. Idempotent.

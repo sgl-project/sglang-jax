@@ -210,6 +210,9 @@ class Req:
         self.req_pool_idx: int | None = None
         # Slot in HybridReqToTokenPool's recurrent state pool; None for non-hybrid models.
         self.recurrent_pool_idx: int | None = None
+        # True iff the slot(s) were retained by a free_chunked() call and the
+        # next alloc(reqs) should reuse them instead of fresh-allocating.
+        self._chunked_slot_pinned: bool = False
 
         # Check finish
         self.tokenizer = None
@@ -513,6 +516,7 @@ class Req:
         self.is_chunked = 0
         self.req_pool_idx = None
         self.recurrent_pool_idx = None
+        self._chunked_slot_pinned = False
         self.already_computed = 0
         self.routed_experts = None
         self.latest_bid = None
