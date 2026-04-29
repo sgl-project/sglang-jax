@@ -21,6 +21,7 @@ from sgl_jax.srt.layers.moe import EPMoE, create_moe_weights_mapping
 from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention as KimiMLAAttention
+from sgl_jax.srt.utils.debug_utils import begin_forward, dump_array
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -285,6 +286,7 @@ class KimiDecoderLayer(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
     ):
         super().__init__()
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.is_kda = config.is_kda_layer(layer_idx)
 
@@ -416,6 +418,8 @@ class KimiDecoderLayer(nnx.Module):
         residual: jax.Array | None = None,
         dispatch_info: ExpertLocationMetadata | None = None,
     ):
+        tag = f"layer_{self.layer_idx:02d}"
+
         # Pre-norm residual pattern
         if residual is None:
             residual = hidden_states
@@ -424,6 +428,7 @@ class KimiDecoderLayer(nnx.Module):
             hidden_states += residual
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        dump_array(f"{tag}_input_layernorm", hidden_states)
 
         # Attention
         if self.is_kda:
@@ -437,34 +442,42 @@ class KimiDecoderLayer(nnx.Module):
             forward_batch,
             kv_pool,
         )
+        dump_array(f"{tag}_attn_out", hidden_states)
         # Post-attention residual + norm
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        dump_array(f"{tag}_post_attention_layernorm", hidden_states)
 
         # MLP (MoE or dense)
         if self.is_moe_layer:
             if self.shared_experts is not None:
                 shared_output = self.shared_experts(hidden_states)
+                dump_array(f"{tag}_shared_experts", shared_output)
             else:
                 shared_output = None
 
             router_logits = self.moe_gate(hidden_states)
+            dump_array(f"{tag}_moe_gate", router_logits)
             correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
             topk_weights, topk_ids = self.topk(
                 router_logits, correction_bias, dispatch_info=dispatch_info
             )
+            dump_array(f"{tag}_topk_weights", topk_weights)
+            dump_array(f"{tag}_topk_ids", topk_ids)
 
             if self.use_fused:
                 token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
                 topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
 
             hidden_states = self.block_sparse_moe(hidden_states, topk_weights, topk_ids)
+            dump_array(f"{tag}_block_sparse_moe", hidden_states)
 
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
         else:
             hidden_states = self.mlp(hidden_states)
+            dump_array(f"{tag}_mlp", hidden_states)
             topk_ids = None
 
         return hidden_states, residual, kv_fused, topk_ids
@@ -515,6 +528,7 @@ class KimiModel(nnx.Module):
         memory_pools,
     ) -> tuple[jax.Array, list, list, list]:
         hidden_states = self.embed_tokens(forward_batch.input_ids)
+        dump_array("embed_tokens", hidden_states)
 
         residual = None
         layers_kv_fused = []
@@ -522,7 +536,7 @@ class KimiModel(nnx.Module):
         layers_conv_buffers = []
         layers_topk_ids = []
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             hidden_states, residual, attn_state, topk_ids = layer(
                 forward_batch.positions,
                 hidden_states,
@@ -531,6 +545,7 @@ class KimiModel(nnx.Module):
                 residual,
                 dispatch_info=forward_batch.expert_location_metadata,
             )
+            dump_array(f"layer_{i:02d}_out", hidden_states)
             if layer.is_kda:
                 rec_buf, conv_buf_list = attn_state
                 layers_recurrent_buffers.append(rec_buf)
@@ -543,6 +558,7 @@ class KimiModel(nnx.Module):
             hidden_states += residual
 
         hidden_states = self.norm(hidden_states)
+        dump_array("model_norm", hidden_states)
         return (
             hidden_states,
             layers_kv_fused,
@@ -589,6 +605,9 @@ class KimiLinearForCausalLM(nnx.Module):
         memory_pools,
         logits_metadata: LogitsMetadata,
     ):
+        begin_forward(
+            "prefill" if forward_batch.forward_mode.is_prefill() else "decode"
+        )
         hidden_states, layers_kv_fused, layers_recurrent_state, layers_topk_ids = self.model(
             forward_batch,
             memory_pools,
@@ -597,6 +616,7 @@ class KimiLinearForCausalLM(nnx.Module):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
+        dump_array("logits", output.next_token_logits)
         return (
             output,
             {
