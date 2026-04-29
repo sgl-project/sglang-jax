@@ -34,8 +34,10 @@ class KimiMLP(nnx.Module):
         intermediate_size: int,
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
+        dump_prefix: str = "",
     ):
         super().__init__()
+        self.dump_prefix = dump_prefix
         self.gate_proj = LinearBase(
             input_size=hidden_size,
             output_size=intermediate_size,
@@ -64,10 +66,21 @@ class KimiMLP(nnx.Module):
             scope_name="down_proj",
         )
 
-    def __call__(self, hidden_states: jax.Array) -> jax.Array:
+    def __call__(self, hidden_states: jax.Array, forward_mode=None) -> jax.Array:
+        p = self.dump_prefix
+        dump_array(f"{p}_inputs", hidden_states, forward_mode)
         gate, _ = self.gate_proj(hidden_states)
+        dump_array(f"{p}_gate_proj_out", gate, forward_mode)
         up, _ = self.up_proj(hidden_states)
-        output, _ = self.down_proj(jax.nn.silu(gate) * up)
+        dump_array(f"{p}_up_proj_out", up, forward_mode)
+        # GPU equivalent: fused gate_up_proj.output = concat([gate, up], -1)
+        dump_array(
+            f"{p}_gate_up_proj_out", jnp.concatenate([gate, up], axis=-1), forward_mode
+        )
+        act = jax.nn.silu(gate) * up
+        dump_array(f"{p}_act_fn_out", act, forward_mode)
+        output, _ = self.down_proj(act)
+        dump_array(f"{p}_down_proj_out", output, forward_mode)
         return output
 
 
@@ -248,31 +261,69 @@ class KimiDeltaAttention(nnx.Module):
         recurrent_state_pool,
     ) -> tuple[jax.Array, object]:
         del positions
+        fm = forward_batch.forward_mode
+        p = f"layer_{self.layer_idx:02d}_self_attn"
+
+        dump_array(f"{p}_inputs_hidden_states", hidden_states, fm)
 
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
+        dump_array(f"{p}_q_proj_out", q, fm)
+        dump_array(f"{p}_k_proj_out", k, fm)
+        dump_array(f"{p}_v_proj_out", v, fm)
 
-        raw_gate, _ = self.f_b_proj(self.f_a_proj(hidden_states)[0])
-        raw_gate = raw_gate.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
-        beta = jax.nn.sigmoid(self.b_proj(hidden_states)[0].astype(jnp.float32))
+        f_a_out, _ = self.f_a_proj(hidden_states)
+        dump_array(f"{p}_f_a_proj_out", f_a_out, fm)
+        raw_gate, _ = self.f_b_proj(f_a_out)
+        dump_array(f"{p}_f_b_proj_out", raw_gate, fm)
+        raw_gate_3d = raw_gate.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
+
+        b_out, _ = self.b_proj(hidden_states)
+        dump_array(f"{p}_b_proj_out", b_out, fm)
+        beta = jax.nn.sigmoid(b_out.astype(jnp.float32))
+
+        g_a, _ = self.g_a_proj(hidden_states)
+        dump_array(f"{p}_g_a_proj_out", g_a, fm)
+
+        # GPU equivalent: fused_qkvbfg_a_proj.output = concat([Q, K, V, B, F_a, G_a], -1)
+        dump_array(
+            f"{p}_fused_qkvbfg_a_proj_out",
+            jnp.concatenate([q, k, v, b_out, f_a_out, g_a], axis=-1),
+            fm,
+        )
 
         o, recurrent_state_pool = self.attn(
             forward_batch,
             q,
             k,
             v,
-            raw_gate,
+            raw_gate_3d,
             beta,
             recurrent_state_pool,
         )
+        dump_array(f"{p}_attn_kernel_out", o, fm)
         o = o.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
 
-        g_a, _ = self.g_a_proj(hidden_states)
         output_gate, _ = self.g_b_proj(g_a)
-        output_gate = output_gate.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
-        o = self.o_norm(o, output_gate).reshape(hidden_states.shape[0], self.projection_size)
+        dump_array(f"{p}_g_b_proj_out", output_gate, fm)
+
+        # GPU equivalent: fused_fg_b_proj.output = concat([F_b, G_b], -1)
+        dump_array(
+            f"{p}_fused_fg_b_proj_out",
+            jnp.concatenate([raw_gate, output_gate], axis=-1),
+            fm,
+        )
+
+        output_gate_3d = output_gate.reshape(
+            hidden_states.shape[0], self.num_heads, self.head_dim
+        )
+        o_normed = self.o_norm(o, output_gate_3d)
+        dump_array(f"{p}_o_norm_out", o_normed, fm)
+        o = o_normed.reshape(hidden_states.shape[0], self.projection_size)
+        dump_array(f"{p}_o_proj_in", o, fm)
         o, _ = self.o_proj(o)
+        dump_array(f"{p}_o_proj_out", o, fm)
 
         return o, recurrent_state_pool
 
@@ -330,6 +381,7 @@ class KimiDecoderLayer(nnx.Module):
                 intermediate_size=config.intermediate_size,
                 mesh=mesh,
                 dtype=dtype,
+                dump_prefix=f"layer_{layer_idx:02d}_mlp",
             )
             self.moe_gate = None
         else:
@@ -392,6 +444,7 @@ class KimiDecoderLayer(nnx.Module):
                     intermediate_size=config.moe_intermediate_size * config.num_shared_experts,
                     mesh=mesh,
                     dtype=dtype,
+                    dump_prefix=f"layer_{layer_idx:02d}_shared_experts",
                 )
             else:
                 self.shared_experts = None
@@ -420,6 +473,10 @@ class KimiDecoderLayer(nnx.Module):
     ):
         tag = f"layer_{self.layer_idx:02d}"
         fm = forward_batch.forward_mode
+
+        dump_array(f"{tag}_inputs_hidden_states", hidden_states, fm)
+        if residual is not None:
+            dump_array(f"{tag}_inputs_residual", residual, fm)
 
         # Pre-norm residual pattern
         if residual is None:
@@ -453,7 +510,7 @@ class KimiDecoderLayer(nnx.Module):
         # MLP (MoE or dense)
         if self.is_moe_layer:
             if self.shared_experts is not None:
-                shared_output = self.shared_experts(hidden_states)
+                shared_output = self.shared_experts(hidden_states, fm)
                 dump_array(f"{tag}_shared_experts", shared_output, fm)
             else:
                 shared_output = None
@@ -478,7 +535,7 @@ class KimiDecoderLayer(nnx.Module):
                 hidden_states = hidden_states + shared_output
                 dump_array(f"{tag}_moe_plus_shared_experts", hidden_states, fm)
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(hidden_states, fm)
             dump_array(f"{tag}_mlp", hidden_states, fm)
             topk_ids = None
 
