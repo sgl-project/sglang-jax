@@ -169,17 +169,13 @@ def _assert_blockwise_tuning_fallback_uses_compatible_seed():
     }
 
     saved_state = {
-        "_TRIED_LOADING_BLOCKWISE_TUNING": blockwise_utils._TRIED_LOADING_BLOCKWISE_TUNING,
-        "_BLOCKWISE_TUNED_VALUE_CLS": blockwise_utils._BLOCKWISE_TUNED_VALUE_CLS,
-        "_BLOCKWISE_GET_TUNED_BLOCK_SIZES": blockwise_utils._BLOCKWISE_GET_TUNED_BLOCK_SIZES,
-        "_BLOCKWISE_TUNED_BLOCK_SIZES": blockwise_utils._BLOCKWISE_TUNED_BLOCK_SIZES,
+        "TUNED_BLOCK_SIZES": blockwise_utils.TUNED_BLOCK_SIZES,
+        "get_tuned_block_sizes": blockwise_utils.get_tuned_block_sizes,
     }
     saved_tpu_version = blockwise_utils._get_current_tpu_version
     try:
-        blockwise_utils._TRIED_LOADING_BLOCKWISE_TUNING = True
-        blockwise_utils._BLOCKWISE_TUNED_VALUE_CLS = tuned_value_cls
-        blockwise_utils._BLOCKWISE_GET_TUNED_BLOCK_SIZES = None
-        blockwise_utils._BLOCKWISE_TUNED_BLOCK_SIZES = fake_tuned_table
+        blockwise_utils.TUNED_BLOCK_SIZES = fake_tuned_table
+        blockwise_utils.get_tuned_block_sizes = None
         blockwise_utils._get_current_tpu_version = lambda: 6
 
         tuned = blockwise_utils.get_safe_blockwise_tuned_value(
