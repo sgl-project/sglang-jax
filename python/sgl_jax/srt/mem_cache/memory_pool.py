@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import abc
 import logging
 import time
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -8,6 +11,9 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
+
+if TYPE_CHECKING:
+    from sgl_jax.srt.managers.schedule_batch import Req
 
 from sgl_jax.srt.kernels.ragged_paged_attention.util import get_dtype_packing
 from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
@@ -121,21 +127,31 @@ class ReqToTokenPool:
         """Return number of available request slots"""
         return len(self.free_slots)
 
-    def alloc(self, need_size: int = 1) -> list[int]:
-        """Allocate request slots"""
+    def alloc(self, reqs: list[Req]) -> list[int] | None:
+        """Allocate request slots, reusing existing slot for chunked reqs."""
+        chunked = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
+        assert len(chunked) <= 1, "only one chunked request may reuse req_pool_idx in a batch"
+        assert all(
+            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in chunked
+        ), "request has req_pool_idx but is not chunked"
+
+        need_size = len(reqs) - len(chunked)
         if need_size > len(self.free_slots):
             return None
-
         select_indices = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-        return select_indices
+        offset = 0
+        for r in reqs:
+            if r.req_pool_idx is None:
+                r.req_pool_idx = select_indices[offset]
+                offset += 1
+        return [r.req_pool_idx for r in reqs]
 
-    def free(self, free_index: int | list[int]):
-        """Free request slots"""
-        if isinstance(free_index, int):
-            self.free_slots.append(free_index)
-        else:
-            self.free_slots.extend(free_index)
+    def free(self, req: Req):
+        """Free request slot and clear req.req_pool_idx."""
+        assert req.req_pool_idx is not None, "request must have req_pool_idx"
+        self.free_slots.append(req.req_pool_idx)
+        req.req_pool_idx = None
 
     def clear(self):
         """Clear all allocation states"""

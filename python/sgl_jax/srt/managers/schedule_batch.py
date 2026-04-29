@@ -784,14 +784,14 @@ class ScheduleBatch:
         """Check if batch is empty (no requests in any DP rank)."""
         return self.batch_size() == 0
 
-    def alloc_req_slots(self, num_reqs: int):
-        req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
+    def alloc_req_slots(self, reqs: list[Req]):
+        req_pool_indices = self.req_to_token_pool.alloc(reqs)
         if req_pool_indices is None:
             raise RuntimeError(
                 "alloc_req_slots runs out of memory. "
                 "Please set a smaller number for `--max-running-requests`. "
                 f"{self.req_to_token_pool.available_size()=}, "
-                f"{num_reqs=}, "
+                f"{len(reqs)=}, "
             )
         return req_pool_indices
 
@@ -937,8 +937,7 @@ class ScheduleBatch:
                 continue
 
             # Allocate req slots
-            bs = len(reqs)
-            req_pool_indices = self.alloc_req_slots(bs)
+            req_pool_indices = self.alloc_req_slots(reqs)
 
             # Init arrays
             input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
@@ -956,7 +955,6 @@ class ScheduleBatch:
             extend_input_logprob_token_ids = []
 
             for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
-                req.req_pool_idx = req_pool_indices[i]
                 assert seq_len - pre_len == req.extend_input_len
 
                 req.kv_committed_len = seq_len
@@ -1069,7 +1067,7 @@ class ScheduleBatch:
 
             # Write to req_to_token_pool
             pt = 0
-            for i in range(bs):
+            for i in range(len(reqs)):
                 self.req_to_token_pool.write(
                     (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
                     out_cache_loc[pt : pt + extend_lens[i]],
