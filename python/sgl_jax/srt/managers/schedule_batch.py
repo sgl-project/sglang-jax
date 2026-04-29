@@ -1443,6 +1443,7 @@ class ScheduleBatch:
                 ],
                 axis=0,
             )
+
             invalid_seq_lens = np.array([0] * bs_padding_size, dtype=seq_lens_cpu.dtype)
             seq_lens_cpu = np.concat([seq_lens_cpu, invalid_seq_lens], axis=0)
             if self.forward_mode.is_extend():
@@ -1620,12 +1621,25 @@ class ScheduleBatch:
             input_embedding=input_embedding,
             apply_for_deepstack=self.apply_for_deepstack,
             deepstack_visual_embedding=self.deepstack_visual_embedding,
-            recurrent_indices=(
-                self.req_to_token_pool.get_linear_recurrent_indices(req_pool_indices_cpu)
-                if isinstance(self.req_to_token_pool, HybridReqToTokenPool)
-                else None
-            ),
+            recurrent_indices=self.get_recurrent_indices(seq_lens_cpu),
         )
+
+    def get_recurrent_indices(self, seq_lens_cpu: np.ndarray):
+        actual_recurrent_indices = (
+            self.req_to_token_pool.get_linear_recurrent_indices(self.req_pool_indices)
+            if isinstance(self.req_to_token_pool, HybridReqToTokenPool)
+            else None
+        )
+        if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+            # init full 0, dummy req set 0
+            recurrent_indices = np.zeros(len(seq_lens_cpu), dtype=jnp.int32)
+            # set real req indices
+            actual_recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
+                self.req_pool_indices
+            )
+            recurrent_indices[: len(self.req_pool_indices)] = actual_recurrent_indices
+            return recurrent_indices
+        return None
 
     def get_spec_model_worker_batch(
         self,
