@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 class KDAAttnBackend(LinearRecurrentAttnBackend):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
-    def __init__(self, mesh: jax.sharding.Mesh = None, use_pallas_prefill: bool = False):
+    def __init__(self, mesh: jax.sharding.Mesh = None, use_pallas_prefill: bool = True):
         super().__init__(
             mesh=mesh,
         )
@@ -221,6 +221,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         A_log = layer.A_log.value.reshape(H)
         dt_bias = layer.dt_bias.value
         scale = scale if scale is not None else layer.scale
+        g = self._fused_kda_gate(layer, g)
 
         def _chunk_kda_call(q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias):
             o, final_state, *_ = chunk_kda(
@@ -233,9 +234,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 initial_state=initial_state,
                 output_final_state=True,
                 cu_seqlens=cu_seqlens,
-                use_gate_in_kernel=True,
-                A_log=A_log,
-                dt_bias=dt_bias,
+                use_gate_in_kernel=False,
             )
             return o, final_state
 
