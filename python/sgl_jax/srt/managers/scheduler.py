@@ -543,8 +543,6 @@ class Scheduler(
                 is_eagle=self.spec_algorithm is not None and self.spec_algorithm.is_eagle(),
             )
 
-        self.decode_mem_cache_buf_multiplier = 1
-
     def _select_round_robin_dp(self) -> int:
         dp_rank = self.dp_round_robin_counter % self.dp_size
         self.dp_round_robin_counter += 1
