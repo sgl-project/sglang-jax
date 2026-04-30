@@ -305,7 +305,27 @@ class DeepseekV3Attention(nnx.Module):
         """
         if not self.use_absorbed:
             return
-        w_kv = self.kv_b_proj.weight.value.reshape(
+        if hasattr(self.kv_b_proj, "weight"):
+            # Non-quantized LinearBase: weight is [kv_lora_rank, n_h * (qk_nope+v)]
+            raw_weight = self.kv_b_proj.weight.value
+        else:
+            # QuantizedLinear: weight_q is [n_h * (qk_nope+v), kv_lora_rank] (transposed).
+            # weight_scale is [in_blocks, 1, n_out] (block-wise) or [n_out] (per-channel).
+            # Dequantize back to bf16 then transpose to [kv_lora_rank, n_h * (qk_nope+v)].
+            wq = self.kv_b_proj.weight_q.value   # [out, in]
+            ws = self.kv_b_proj.weight_scale.value
+            wq_f32 = wq.T.astype(jnp.float32)    # [in, out]
+            if ws.ndim == 3:
+                # Block-wise: [in_blocks, 1, out] → dequantize block by block
+                in_blocks, _, n_out = ws.shape
+                block_k = wq.shape[1] // in_blocks
+                wq_f32 = wq_f32.reshape(in_blocks, block_k, n_out)
+                wq_f32 = (wq_f32 * ws.astype(jnp.float32)).reshape(in_blocks * block_k, n_out)
+            else:
+                # Per-channel: [out]
+                wq_f32 = wq_f32 * ws.astype(jnp.float32)[None, :]
+            raw_weight = wq_f32.astype(jnp.bfloat16)
+        w_kv = raw_weight.reshape(
             self.kv_lora_rank,
             self.num_heads,
             self.qk_nope_head_dim + self.v_head_dim,

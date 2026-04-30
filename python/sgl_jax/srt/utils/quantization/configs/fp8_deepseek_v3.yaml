@@ -18,8 +18,8 @@ quantization:
     rules:
       - module_path: '.*'
         weight_dtype: 'float8_e4m3fn'
-        activation_dtype: null
+        activation_dtype: 'float8_e4m3fn'
 
   moe:
     weight_dtype: 'float8_e4m3fn'
-    activation_dtype: null
+    activation_dtype: 'float8_e4m3fn'

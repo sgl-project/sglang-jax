@@ -8,7 +8,6 @@ from jax import lax
 from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
     get_blockwise_kernel,
     get_safe_blockwise_tuned_value,
-    should_use_blockwise_kernel,
 )
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor_simple
 
@@ -20,7 +19,6 @@ def xla_quantized_matmul_local(
     quantize_activation: bool = True,
     reduce_axis: str | None = None,
     compute_dtype: jnp.dtype | None = None,
-    weight_block_size: tuple[int, int] | None = None,
     activation_quant_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
     """
@@ -58,26 +56,12 @@ def xla_quantized_matmul_local(
         in_blocks = w_scale.shape[0]
         block_size_in = in_dim // in_blocks
 
-        if weight_block_size is not None:
-            block_size_out = int(weight_block_size[0])
-        else:
-            block_size_out = block_size_in
-
         blockwise_kernel = get_blockwise_kernel()
         if blockwise_kernel is None:
             raise RuntimeError(
                 "Block-wise quantized matmul requires the blockwise kernel, "
                 "but it failed to load. Please check your installation."
             )
-        if not should_use_blockwise_kernel(
-            out_dim=int(out_dim),
-            block_size_out=int(block_size_out),
-        ):
-            raise RuntimeError(
-                f"Block-wise kernel does not support out_dim={out_dim} with "
-                f"block_size_out={block_size_out} (known to cause NaNs)."
-            )
-
         # w_scale is already in kernel-ready layout [in_blocks, 1, n_out].
         x_q_dtype = act_quant_dtype if quantize_activation else x.dtype
         tuned_value = get_safe_blockwise_tuned_value(
