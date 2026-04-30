@@ -1284,9 +1284,8 @@ class ScheduleBatch:
 
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
-        if not isinstance(self.tree_cache, ChunkCache):
-            num_tokens = remaing_req_count * global_config.retract_decode_steps
-            self._evict_tree_cache_if_needed({dp_rank: num_tokens})
+        num_tokens = remaing_req_count * global_config.retract_decode_steps
+        self._evict_tree_cache_if_needed({dp_rank: num_tokens})
 
         req.reset_for_retract()
 
