@@ -43,7 +43,7 @@ The following sglang-jax components are directly compatible:
 
 ##### 2.2 New Developments
 
-* **kimi\_vit.py**: A full implementation of MoonViT-3D, including the divided positional embeddings and the 2 \times 2 patch merger.  
+* **kimi\_vit.py**: A full implementation of MoonViT-3D, including the divided positional embeddings and the 2 times 2 patch merger.  
 * **kimi\_k2\_5\_generation.py**: A KimiK25LLMModel subclass that enables the multimodal prefill path (using input\_embedding instead of token IDs for the vision sequence).  
 * **Stage Config:** A new YAML defining the Stage 0 (ViT) and Stage 1 (LLM) pipeline topology.
 
