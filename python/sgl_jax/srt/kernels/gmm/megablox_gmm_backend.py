@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 
@@ -23,6 +27,7 @@ def gmm(
     zero_initialize: bool = True,
     acc_dtype: jnp.dtype | None = None,
     activation_quantized_dtype: jnp.dtype | None = None,
+    v2_tile_info: Any = None,
 ) -> jax.Array:
     """Dispatch GMM to v2 or v1, with optional activation quantization.
 
@@ -50,6 +55,8 @@ def gmm(
         activation_quantized_dtype: When set, quantize the LHS activations to
             this dtype before the kernel call (v1 path only) and rescale the
             output afterwards.
+        v2_tile_info: Optional TileSizes or TileFn for v2 kernel tiling.
+            Defaults to calculate_tiling (auto-tiler) when None.
     """
     if interpret is None:
         interpret = not is_tpu_runtime()
@@ -70,6 +77,9 @@ def gmm(
         lhs = lhs_q
 
     if use_gmm_v2:
+        v2_kwargs = {}
+        if v2_tile_info is not None:
+            v2_kwargs["tile_info"] = v2_tile_info
         out = gmm_v2_kernel(
             lhs,
             rhs,
@@ -81,6 +91,7 @@ def gmm(
             maybe_quantize_lhs=maybe_quantize_lhs,
             zero_initialize=zero_initialize,
             acc_dtype=acc_dtype,
+            **v2_kwargs,
         )
     else:
         out = gmm_v1_kernel(

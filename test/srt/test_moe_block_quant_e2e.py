@@ -4,16 +4,28 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import nnx
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
 
-def get_cosine_similarity(a, b):
-    a_flat = a.flatten().astype(jnp.float32)
-    b_flat = b.flatten().astype(jnp.float32)
+def get_cosine_similarity(a, b, mesh: Mesh):
+    """Cosine similarity in fp32, used as the bf16/quantised numerical-correctness metric.
+
+    Why not allclose: at production-scale dimensions with bf16 / FP8 matmuls,
+    element-wise tolerances are either too strict (false positives) or too
+    loose to discriminate. Cosine similarity measures directional agreement
+    and is invariant to per-element magnitude noise, which is the failure
+    mode bf16 matmul chains actually exhibit.
+
+    Threshold convention in this repo: assert >= 0.99. FlashInfer uses the
+    same approach in their absorbed-MLA decode kernel tests
+    (flashinfer-ai/flashinfer#551).
+    """
+    a_flat = jax.sharding.reshard(a.flatten().astype(jnp.float32), NamedSharding(mesh, P()))
+    b_flat = jax.sharding.reshard(b.flatten().astype(jnp.float32), NamedSharding(mesh, P()))
     return jnp.dot(a_flat, b_flat) / (jnp.linalg.norm(a_flat) * jnp.linalg.norm(b_flat))
 
 
@@ -206,7 +218,7 @@ def test_epmoe_block_quant_accuracy(scale_format, weight_block_size):
         out_ref = moe_ref(x, topk_weights, topk_ids)
         out_quant = moe_quant(x, topk_weights, topk_ids)
 
-    cos_sim = get_cosine_similarity(out_ref, out_quant)
+    cos_sim = get_cosine_similarity(out_ref, out_quant, mesh)
     mae = jnp.mean(jnp.abs(out_ref - out_quant))
     rel_error = mae / jnp.mean(jnp.abs(out_ref))
 

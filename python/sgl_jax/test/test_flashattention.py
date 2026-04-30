@@ -3,15 +3,21 @@ import unittest
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
+from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
     ref_ragged_paged_attention,
 )
 from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
-from sgl_jax.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
+from sgl_jax.srt.mem_cache.memory_pool import (
+    KVCache,
+    MHATokenToKVPool,
+    _set_fused_kv_buffer,
+    merge_kv,
+)
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.speculative.eagle_util import EagleVerifyInput
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -98,36 +104,65 @@ def create_custom_mask(lens):
 
 
 def write_prefix_tokens_for_kv(forward_batch, token_to_kv_pool: KVCache, lens, k, v):
+    """Write prefix tokens to KV cache and return extend tokens.
+
+    k, v should be numpy arrays (or unsharded JAX arrays) to allow safe slicing.
+    Prefix data is resharded to match KV cache sharding before writing.
+    """
     page_size = forward_batch.attn_backend.page_size
+    # 5D fused KV cache sharding: P(data, None, tensor, None, None)
+    kv_sharding = token_to_kv_pool.kv_sharding
+
     # Use aligned positions for k/v indexing since k/v arrays are created with alignment gaps
-    aligned_seq_lens = ((forward_batch.seq_lens + page_size - 1) // page_size) * page_size
-    aligned_cache_loc_idx = jnp.concatenate(
-        [jnp.array([0], dtype=jnp.int32), jnp.cumsum(aligned_seq_lens)]
-    )
+    seq_lens_np = np.asarray(forward_batch.seq_lens)
+    aligned_seq_lens = ((seq_lens_np + page_size - 1) // page_size) * page_size
+    aligned_cache_loc_idx = np.concatenate([[0], np.cumsum(aligned_seq_lens)])
+
+    cache_loc_np = np.asarray(forward_batch.cache_loc)
 
     extend_k = []
     extend_v = []
+    # Convert k, v to numpy for safe slicing (avoid JAX sharding issues)
+    k_np = np.asarray(k)
+    v_np = np.asarray(v)
+
+    # loc is sharded by data axis only (1D)
+    loc_sharding = NamedSharding(kv_sharding.mesh, P(kv_sharding.spec[0]))
+
     for i, (q_len, kv_len) in enumerate(lens):
-        start = aligned_cache_loc_idx[i]
+        start = int(aligned_cache_loc_idx[i])
         prefix_end = start + (kv_len - q_len)
         extend_start = prefix_end
         extend_end = start + kv_len
 
-        print(
-            f"start: {start}, prefix_end: {prefix_end}, extend_start: {extend_start}, extend_end: {extend_end}"
-        )
-
         if kv_len > q_len:
-            # write prefix token
-            prefix_cache_loc = forward_batch.cache_loc[start:prefix_end]
-            prefix_k = k[start:prefix_end]
-            prefix_v = v[start:prefix_end]
-            token_to_kv_pool.set_kv_buffer(0, prefix_cache_loc, prefix_k, prefix_v)
+            # Build fused 5D KV [tokens, 1, heads*2//packing, packing, head_dim]
+            prefix_k_3d = jnp.array(k_np[start:prefix_end], dtype=k.dtype)
+            prefix_v_3d = jnp.array(v_np[start:prefix_end], dtype=v.dtype)
+            prefix_fused = merge_kv(prefix_k_3d, prefix_v_3d)
+            prefix_fused = jax.device_put(prefix_fused, kv_sharding)
 
-        extend_k.append(k[extend_start:extend_end])
-        extend_v.append(v[extend_start:extend_end])
+            prefix_cache_loc = jnp.array(cache_loc_np[start:prefix_end], dtype=jnp.int32)
+            prefix_cache_loc = jax.device_put(prefix_cache_loc, loc_sharding)
 
-    return jnp.concatenate(extend_k), jnp.concatenate(extend_v)
+            # Update fused KV cache directly via 5D path
+            token_to_kv_pool.kv_buffer[0] = _set_fused_kv_buffer(
+                fused_kv=prefix_fused,
+                loc=prefix_cache_loc,
+                kv_cache=token_to_kv_pool.kv_buffer[0],
+                page_size=token_to_kv_pool.page_size,
+                kv_partition_axis=token_to_kv_pool.kv_partition_axis,
+                attention_data_partition_axis=token_to_kv_pool.attention_data_partition_axis,
+                mesh=token_to_kv_pool.mesh,
+            )
+
+        extend_k.append(k_np[extend_start:extend_end])
+        extend_v.append(v_np[extend_start:extend_end])
+
+    return (
+        jnp.array(np.concatenate(extend_k), dtype=k.dtype),
+        jnp.array(np.concatenate(extend_v), dtype=v.dtype),
+    )
 
 
 def create_test_data(
@@ -140,7 +175,7 @@ def create_test_data(
     causal=True,
     input_ids=None,
     model_config=None,
-    max_total_token_size=710016,
+    max_total_token_size=200000,
 ):
     """Create a real ForwardBatch for testing."""
     assert mode in ["prefill", "decode"]
@@ -287,8 +322,12 @@ def create_test_data(
         token_ids_logprobs=None,
         extend_logprob_start_lens=None,
         extend_input_logprob_token_ids=None,
+        logits_indices=np.asarray(extend_seq_lens),
         real_bs=seq_lens.shape[0],
+        real_bs_per_dp=[seq_lens.shape[0]],
         spec_info=spec_info,
+        dp_size=1,
+        per_dp_bs_size=seq_lens.shape[0],
     )
 
     fb = ForwardBatch(
@@ -308,16 +347,11 @@ def create_test_data(
     )
     fb.attn_backend.forward_metadata = attention_backend.get_forward_metadata(mwb)
     if fb.spec_info is not None:
-        from jax.sharding import NamedSharding
-        from jax.sharding import PartitionSpec as P
-
         from sgl_jax.srt.utils.jax_utils import device_array
 
         fb.attn_backend.forward_metadata.custom_mask = device_array(
             (fb.spec_info.custom_mask),
-            sharding=(
-                NamedSharding(attention_backend.mesh, P()) if jax.process_count() == 1 else None
-            ),
+            sharding=(NamedSharding(attention_backend.mesh, P())),
         )
     return fb, current_kv_cache, q, k, v
 
@@ -338,10 +372,11 @@ class TestAttention(CustomTestCase):
         mode,
         lens,
         mode_args,
-        max_total_token_size=710016,
+        max_total_token_size=200000,
         sliding_window=None,
         logit_cap=None,
         xai_temperature_len=None,
+        attention_sink=None,
     ):
         # Create mock forward_batch
         if len(mode_args) == 5:
@@ -379,16 +414,14 @@ class TestAttention(CustomTestCase):
         print(f"cache_loc[100:200]: {forward_batch.cache_loc[100:200]}")
         print(f"out_cache_loc: {forward_batch.out_cache_loc[:100]}")
 
-        # Create test data
-        shading = jax.sharding.NamedSharding(mesh, P(None, "tensor"))
-        q_shard = jax.device_put(q.copy(), shading)
-        k_cache_shard = jax.device_put(k.copy(), shading)
-        v_cache_shard = jax.device_put(v.copy(), shading)
+        # write prefix tokens (k, v are unsharded for safe slicing)
+        extend_k, extend_v = write_prefix_tokens_for_kv(forward_batch, token_to_kv_pool, lens, k, v)
 
-        # write prefix tokens
-        extend_k, extend_v = write_prefix_tokens_for_kv(
-            forward_batch, token_to_kv_pool, lens, k_cache_shard, v_cache_shard
-        )
+        # Shard q/extend_k/extend_v with P("data", "tensor") to match production in_specs
+        dp_sharding = NamedSharding(mesh, P("data", "tensor"))
+        q_shard = jax.device_put(q, dp_sharding)
+        extend_k = jax.device_put(extend_k, dp_sharding)
+        extend_v = jax.device_put(extend_v, dp_sharding)
 
         # JAX attention
         attn = RadixAttention(
@@ -429,8 +462,7 @@ class TestAttention(CustomTestCase):
             forward_batch.seq_lens,
             page_table,
             forward_batch.attn_backend.forward_metadata.cu_q_lens,
-            # forward_batch.attn_backend.forward_metadata.cu_kv_lens,
-            forward_batch.attn_backend.forward_metadata.num_seqs,
+            jnp.array([forward_batch.batch_size], dtype=jnp.int32),
             custom_mask=(
                 forward_batch.spec_info.custom_mask if forward_batch.spec_info is not None else None
             ),
@@ -439,6 +471,7 @@ class TestAttention(CustomTestCase):
             sliding_window=sliding_window,
             soft_cap=logit_cap,
             xai_temperature_len=xai_temperature_len,
+            attention_sink=attention_sink,
         )
         jax.block_until_ready(expected)
 
@@ -447,7 +480,7 @@ class TestAttention(CustomTestCase):
 
         @jax.jit
         def jit_attn(q, k, v, forward_batch, token_to_kv_pool: KVCache):
-            out = attn(q, k, v, forward_batch, token_to_kv_pool)
+            out = attn(q, k, v, forward_batch, token_to_kv_pool, attention_sink=attention_sink)
             return out
 
         # run
@@ -525,7 +558,11 @@ class TestAttention(CustomTestCase):
             (512, 1024),
         ]
 
-        self.run_test("prefill", lens, (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16))
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+        )
 
     def test_mha_decode_accuracy_page_size_1(self):
         """Test JAX attention accuracy against native fa"""
@@ -545,7 +582,11 @@ class TestAttention(CustomTestCase):
             (1, 1025),
         ]
 
-        self.run_test("decode", lens, (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16))
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+        )
 
     def test_mha_prefill_accuracy_page_size_8(self):
         """
@@ -561,7 +602,11 @@ class TestAttention(CustomTestCase):
             (5, 33),
             (5, 5),
         ]
-        self.run_test("prefill", lens, (num_heads, head_dim, num_kv_heads, 8, jnp.bfloat16))
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 8, jnp.bfloat16),
+        )
 
     def test_mha_decode_accuracy_page_size_8(self):
         """Test JAX attention accuracy against native fa"""
@@ -574,7 +619,11 @@ class TestAttention(CustomTestCase):
             (1, 6),
             (1, 5),
         ]
-        self.run_test("decode", lens, (num_heads, head_dim, num_kv_heads, 8, jnp.bfloat16))
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 8, jnp.bfloat16),
+        )
 
     def test_mha_prefill_accuracy_page_size_64(self):
         """Test JAX attention accuracy against PyTorch reference"""
@@ -592,7 +641,11 @@ class TestAttention(CustomTestCase):
             (123, 522),
             (1, 511),
         ]
-        self.run_test("prefill", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16))
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16),
+        )
 
     def test_mha_decode_accuracy_page_size_64(self):
         """Test JAX attention accuracy against native fa"""
@@ -611,7 +664,11 @@ class TestAttention(CustomTestCase):
             (1, 1024),
             (1, 1025),
         ]
-        self.run_test("decode", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16))
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16),
+        )
 
     def test_gqa_prefill_accuracy_page_size_64(self):
         """Test JAX attention accuracy against PyTorch reference"""
@@ -674,7 +731,6 @@ class TestAttention(CustomTestCase):
             (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
             sliding_window=sliding_window_size,
             logit_cap=logit_cap,
-            max_total_token_size=200000,
         )
 
     def test_sliding_window_and_soft_cap_decode_accuracy(self):
@@ -699,7 +755,6 @@ class TestAttention(CustomTestCase):
             (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
             sliding_window=sliding_window_size,
             logit_cap=logit_cap,
-            max_total_token_size=200000,
         )
 
     def test_gqa_prefill_accuracy_page_size_64_temperature(self):
@@ -843,6 +898,190 @@ class TestAttention(CustomTestCase):
 
     def test_gqa_decode_with_custom_mask(self):
         pass
+
+    def test_attention_sink_decode_accuracy(self):
+        """Test attention sink accuracy in decode mode with per-head sink logits"""
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+
+        lens = [
+            (1, 256),
+            (1, 512),
+            (1, 1024),
+        ]
+
+        # Per-head sink logits
+        rng = np.random.RandomState(123)
+        attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
+
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            attention_sink=attention_sink,
+        )
+
+    def test_attention_sink_prefill_accuracy(self):
+        """Test attention sink accuracy in prefill mode with per-head sink logits"""
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+
+        lens = [
+            (1, 128),
+            (64, 64),
+            (128, 256),
+        ]
+
+        # Per-head sink logits
+        rng = np.random.RandomState(456)
+        attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
+
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            attention_sink=attention_sink,
+        )
+
+    def test_mha_attention_sink_decode_accuracy(self):
+        """Test attention sink accuracy in decode mode with MHA (num_heads == num_kv_heads)"""
+        num_heads = 32
+        num_kv_heads = 32
+        head_dim = 128
+
+        lens = [
+            (1, 256),
+            (1, 512),
+            (1, 1024),
+        ]
+
+        rng = np.random.RandomState(789)
+        attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
+
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            max_total_token_size=200000,
+            attention_sink=attention_sink,
+        )
+
+    def test_mha_attention_sink_prefill_accuracy(self):
+        """Test attention sink accuracy in prefill mode with MHA (num_heads == num_kv_heads)"""
+        num_heads = 32
+        num_kv_heads = 32
+        head_dim = 128
+
+        lens = [
+            (1, 128),
+            (64, 64),
+            (128, 256),
+        ]
+
+        rng = np.random.RandomState(101)
+        attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
+
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            max_total_token_size=200000,
+            attention_sink=attention_sink,
+        )
+
+    def test_gqa_4q1kv_attention_sink_decode_accuracy(self):
+        """Test attention sink with GQA (4 q_heads, 1 kv_head) in decode mode"""
+        num_heads = 4
+        num_kv_heads = 1
+        head_dim = 128
+
+        lens = [
+            (1, 256),
+            (1, 512),
+            (1, 1024),
+        ]
+
+        rng = np.random.RandomState(202)
+        attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
+
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            max_total_token_size=200000,
+            attention_sink=attention_sink,
+        )
+
+    def test_gqa_4q1kv_attention_sink_prefill_accuracy(self):
+        """Test attention sink with GQA (4 q_heads, 1 kv_head) in prefill mode"""
+        num_heads = 4
+        num_kv_heads = 1
+        head_dim = 128
+
+        lens = [
+            (1, 128),
+            (64, 64),
+            (128, 256),
+        ]
+
+        rng = np.random.RandomState(303)
+        attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
+
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            max_total_token_size=200000,
+            attention_sink=attention_sink,
+        )
+
+    def test_single_head_attention_sink_decode_accuracy(self):
+        """Test attention sink with single head MHA (1 q_head, 1 kv_head) in decode mode"""
+        num_heads = 1
+        num_kv_heads = 1
+        head_dim = 128
+
+        lens = [
+            (1, 256),
+            (1, 512),
+            (1, 1024),
+        ]
+
+        rng = np.random.RandomState(404)
+        attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
+
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            max_total_token_size=200000,
+            attention_sink=attention_sink,
+        )
+
+    def test_single_head_attention_sink_prefill_accuracy(self):
+        """Test attention sink with single head MHA (1 q_head, 1 kv_head) in prefill mode"""
+        num_heads = 1
+        num_kv_heads = 1
+        head_dim = 128
+
+        lens = [
+            (1, 128),
+            (64, 64),
+            (128, 256),
+        ]
+
+        rng = np.random.RandomState(505)
+        attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
+
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            max_total_token_size=200000,
+            attention_sink=attention_sink,
+        )
 
 
 if __name__ == "__main__":

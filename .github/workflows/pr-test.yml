@@ -71,12 +71,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1]
+        part: [0, 1, 2]
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
       - name: Run unit test
-        timeout-minutes: 30
+        timeout-minutes: 60
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
@@ -85,7 +85,7 @@ jobs:
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
-          python test/srt/run_suite.py --suite unit-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          python test/srt/run_suite.py --suite unit-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
   unit-test-4-tpu:
     needs: [check-changes]

@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import nnx
-from jax.sharding import Mesh
+from jax.sharding import AxisType, Mesh
 
 import sgl_jax.srt.kernels.quantized_matmul.blockwise_utils as blockwise_utils
 from sgl_jax.srt.configs.quantization_config import QuantizationConfig
@@ -25,7 +25,11 @@ blockwise_quant_util = importlib.import_module(
 
 
 def _create_single_device_mesh():
-    return Mesh(np.array(jax.devices()[:1]).reshape(1, 1), axis_names=("data", "tensor"))
+    return Mesh(
+        np.array(jax.devices()[:1]).reshape(1, 1),
+        axis_names=("data", "tensor"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
 
 
 def _make_linear_test_inputs():

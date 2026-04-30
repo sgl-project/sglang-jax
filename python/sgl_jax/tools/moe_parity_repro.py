@@ -845,7 +845,7 @@ def main() -> int:
         help="Dtype for router logits passed to the MoE kernels.",
     )
     parser.add_argument(
-        "--subc-quant-wsz",
+        "--quant-block-k",
         type=int,
         default=256,
         help="Sub-channel quantization block size used when --moe-weight-dtype is set.",
@@ -1355,9 +1355,9 @@ def main() -> int:
             moe_weight_dtype = jnp.float8_e5m2
         else:
             raise ValueError(f"Unsupported static checkpoint weight dtype: {w_dtype}")
-        subc_quant_wsz = 256
+        quant_block_k = 256
     else:
-        subc_quant_wsz = int(args.subc_quant_wsz) if moe_weight_dtype is not None else None
+        quant_block_k = int(args.quant_block_k) if moe_weight_dtype is not None else None
     quant_config = QuantizationConfig(
         linear_rules=[],
         moe_weight_dtype=moe_weight_dtype,
@@ -1549,7 +1549,7 @@ def main() -> int:
     print("load epmoe scales")
     if use_static:
         wi_0_scale_np, wi_1_scale_np, wo_scale_np = static_scales
-        subc_quant_wsz = 256
+        quant_block_k = 256
 
         # Prepare epmoe scale params (E, 1, 1, out_dim). Use `quantize_weights(is_static=True)`
         # to create nnx.Params with the correct pytree status, then overwrite their values.
@@ -1574,20 +1574,20 @@ def main() -> int:
         # Prepare fused scales (E, hidden//256, 1, inter) etc.
         fused_scale_sharding = NamedSharding(mesh, P(("data", "tensor"), None, None, None))
         w1_scale_np = _repeat_scales_for_fused(
-            wi_0_scale_np, num_blocks=hidden_size // subc_quant_wsz
+            wi_0_scale_np, num_blocks=hidden_size // quant_block_k
         )
         w3_scale_np = _repeat_scales_for_fused(
-            wi_1_scale_np, num_blocks=hidden_size // subc_quant_wsz
+            wi_1_scale_np, num_blocks=hidden_size // quant_block_k
         )
         w2_scale_np = _repeat_scales_for_fused(
-            wo_scale_np, num_blocks=intermediate_size // subc_quant_wsz
+            wo_scale_np, num_blocks=intermediate_size // quant_block_k
         )
         w1_scale = jax.device_put(w1_scale_np, fused_scale_sharding)
         w3_scale = jax.device_put(w3_scale_np, fused_scale_sharding)
         w2_scale = jax.device_put(w2_scale_np, fused_scale_sharding)
 
         print(
-            f"[static] checkpoint=yes weight_dtype={np.asarray(wi_0_np).dtype} subc_quant_wsz={subc_quant_wsz}"
+            f"[static] checkpoint=yes weight_dtype={np.asarray(wi_0_np).dtype} quant_block_k={quant_block_k}"
         )
     else:
         if static_requested:
@@ -1601,7 +1601,7 @@ def main() -> int:
                 w1,
                 w2,
                 w3,
-                block_size=subc_quant_wsz,
+                block_size=quant_block_k,
             )
         else:
             w1_scale = w2_scale = w3_scale = None
@@ -1633,7 +1633,7 @@ def main() -> int:
         topk_ids=topk_ids,
         top_k=args.top_k,
         act_fn=args.act_fn,
-        subc_quant_wsz=subc_quant_wsz,
+        quant_block_k=quant_block_k,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         w3_scale=w3_scale,
@@ -1665,7 +1665,7 @@ def main() -> int:
             topk_ids=topk_ids,
             top_k=args.top_k,
             act_fn=args.act_fn,
-            subc_quant_wsz=subc_quant_wsz,
+            quant_block_k=quant_block_k,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w3_scale=w3_scale,
@@ -1690,7 +1690,7 @@ def main() -> int:
             topk_ids=topk_ids,
             top_k=args.top_k,
             act_fn=args.act_fn,
-            subc_quant_wsz=subc_quant_wsz,
+            quant_block_k=quant_block_k,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w3_scale=w3_scale,

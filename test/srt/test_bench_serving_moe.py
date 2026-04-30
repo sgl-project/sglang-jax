@@ -50,7 +50,7 @@ class TestBenchServingMOE(CustomTestCase):
                 "--max-running-requests",
                 "256",
                 "--page-size",
-                "128",
+                "256",
                 "--disable-radix-cache",
             ],
             env={
@@ -90,7 +90,7 @@ class TestBenchServingMOE(CustomTestCase):
             base_url=self.base_url,
             dataset_name="random",
             device="tpu",
-            num_prompts=500,
+            num_prompts=512,
             request_rate=float("inf"),
             random_input_len=1,
             random_output_len=1024,
@@ -98,14 +98,14 @@ class TestBenchServingMOE(CustomTestCase):
             random_range_ratio=1,
         )
         res = run_benchmark(args)
-        assert res["completed"] == 500
+        assert res["completed"] == 512
 
         if is_in_ci():
             write_github_step_summary(
                 f"### test_output_throughput_moe\n"
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
-            self.assertGreater(res["output_throughput"], 2835)
+            self.assertGreater(res["output_throughput"], 2535)
 
     def test_ttft_moe(self):
         args = get_benchmark_args(

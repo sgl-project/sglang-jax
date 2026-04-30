@@ -196,20 +196,12 @@ class TokenizerManager:
         self.current_load_lock = asyncio.Lock()
 
         # Communicators
-        self.release_memory_occupation_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
-        self.resume_memory_occupation_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
-        self.flush_cache_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
-        self.profile_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
-        self.get_internal_state_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
-        self.set_internal_state_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
+        self.release_memory_occupation_communicator = _Communicator(self.send_to_scheduler, 1)
+        self.resume_memory_occupation_communicator = _Communicator(self.send_to_scheduler, 1)
+        self.flush_cache_communicator = _Communicator(self.send_to_scheduler, 1)
+        self.profile_communicator = _Communicator(self.send_to_scheduler, 1)
+        self.get_internal_state_communicator = _Communicator(self.send_to_scheduler, 1)
+        self.set_internal_state_communicator = _Communicator(self.send_to_scheduler, 1)
 
         # LoRA
         self.lora_registry = LoRARegistry(self.server_args.lora_paths)
@@ -658,6 +650,11 @@ class TokenizerManager:
     async def stop_profile(self):
         self.auto_create_handle_loop()
         req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
+        return await self._execute_profile(req)
+
+    async def get_profile_status(self):
+        self.auto_create_handle_loop()
+        req = ProfileReq(type=ProfileReqType.GET_STATUS)
         return await self._execute_profile(req)
 
     async def _execute_profile(self, req: ProfileReq):

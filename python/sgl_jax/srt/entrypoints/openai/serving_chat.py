@@ -474,6 +474,7 @@ Assistant: {% endif %}"""
                 if (
                     self.tokenizer_manager.server_args.reasoning_parser
                     and request.separate_reasoning
+                    and self._get_reasoning_from_request(request)
                 ):
                     reasoning_text, delta = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
@@ -649,7 +650,11 @@ Assistant: {% endif %}"""
             # Handle reasoning content
             reasoning_text = None
             reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
-            if reasoning_parser and request.separate_reasoning:
+            if (
+                reasoning_parser
+                and request.separate_reasoning
+                and self._get_reasoning_from_request(request)
+            ):
                 try:
                     parser = ReasoningParser(model_type=reasoning_parser, stream_reasoning=False)
                     reasoning_text, text = parser.parse_non_stream(text)
@@ -812,23 +817,22 @@ Assistant: {% endif %}"""
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
 
-    def _get_enable_thinking_from_request(request: ChatCompletionRequest) -> bool:
-        """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
+    def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
+        """Decide whether reasoning should be parsed for this request.
 
-        NOTE: This parameter is only useful for models that support enable_thinking
-        flag, such as Qwen3.
-
-        Args:
-            request_obj: The request object (or an item from a list of requests).
-        Returns:
-            The boolean value of 'enable_thinking' if found and not True, otherwise True.
+        MIMO's chat template defaults enable_thinking=False; user must explicitly
+        set True to opt into reasoning. Qwen3 is reverse (default True, opt-out
+        via False). Both reuse the same Qwen3Detector, but the enable_thinking
+        semantics are inverted, so the serving layer must gate.
         """
-        if (
-            hasattr(request, "chat_template_kwargs")
-            and request.chat_template_kwargs
-            and request.chat_template_kwargs.get("enable_thinking") is not None
-        ):
-            return request.chat_template_kwargs.get("enable_thinking")
+        parser = self.tokenizer_manager.server_args.reasoning_parser
+        if not parser:
+            return False
+        kwargs = request.chat_template_kwargs or {}
+        if parser == "qwen3":
+            return kwargs.get("enable_thinking") is not False
+        if parser == "mimo":
+            return kwargs.get("enable_thinking") is True
         return True
 
     async def _process_tool_call_stream(

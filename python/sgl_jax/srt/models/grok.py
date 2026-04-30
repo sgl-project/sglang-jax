@@ -6,6 +6,8 @@ import jax
 import jax.lax
 from flax import nnx
 from jax import numpy as jnp
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -18,8 +20,8 @@ from sgl_jax.srt.layers.embeddings import (
     Embed,
     ParallelLMHead,
     RotaryEmbedding,
+    _grok_yarn_get_mscale,
     _yarn_find_correction_range,
-    _yarn_get_mscale,
 )
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import RMSNorm, dual_rmsnorm_forward
@@ -103,7 +105,7 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
         # Get n-d magnitude scaling corrected for interpolation
-        self.mscale = float(_yarn_get_mscale(self.scaling_factor) * attn_factor)
+        self.mscale = float(_grok_yarn_get_mscale(self.scaling_factor) * attn_factor)
         super().__init__(head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype)
 
     def _compute_inv_freq(self, scaling_factor: float) -> jax.Array:
@@ -491,9 +493,42 @@ class Grok1Attention(nnx.Module):
         # Apply rotary position embeddings
         q, k = self.rotary_emb(positions, q, k)
 
-        q = q.reshape(-1, self.num_heads, self.head_dim)
-        k = k.reshape(-1, self.num_kv_heads, self.head_dim)
-        v = v.reshape(-1, self.num_kv_heads, self.head_dim)
+        q = q.reshape(
+            -1,
+            self.num_heads,
+            self.head_dim,
+            out_sharding=NamedSharding(
+                self.mesh,
+                P(
+                    "data",
+                    "tensor",
+                ),
+            ),
+        )
+        k = k.reshape(
+            -1,
+            self.num_kv_heads,
+            self.head_dim,
+            out_sharding=NamedSharding(
+                self.mesh,
+                P(
+                    "data",
+                    "tensor",
+                ),
+            ),
+        )
+        v = v.reshape(
+            -1,
+            self.num_kv_heads,
+            self.head_dim,
+            out_sharding=NamedSharding(
+                self.mesh,
+                P(
+                    "data",
+                    "tensor",
+                ),
+            ),
+        )
 
         # Apply attention (backend may return tuple)
         attn_ret, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
@@ -668,7 +703,13 @@ class Grok1DecoderLayer(nnx.Module):
             )
 
         # Return with deferred post-MoE norm (matching PyTorch)
-        return hidden_states, residual, self.post_moe_norm, kv_fused, topk_ids
+        return (
+            hidden_states,
+            residual,
+            self.post_moe_norm,
+            kv_fused,
+            jax.sharding.reshard(topk_ids, P(None)),
+        )
 
 
 class Grok1Model(nnx.Module):

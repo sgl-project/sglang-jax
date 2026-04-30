@@ -29,7 +29,7 @@ class GateLogit(nnx.Module):
             jax.random.normal(
                 jax.random.PRNGKey(0),
                 (input_size, num_experts),
-                dtype=self.weight_dtype,
+                dtype=jnp.float32,
                 out_sharding=P(None, None),
             ),
         )
@@ -47,7 +47,7 @@ class GateLogit(nnx.Module):
 
     @named_scope
     def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:
-        logits = jnp.dot(hidden_states, self.kernel.value)
+        logits = jnp.dot(hidden_states, self.kernel.value, precision=jax.lax.Precision.HIGHEST)
 
         if self.score_func:
             if self.score_func == "softmax":

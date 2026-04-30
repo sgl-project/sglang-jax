@@ -31,7 +31,7 @@ class Sampler(nnx.Module):
         """Regular sampling branch"""
         logits, sampling_metadata, rng, use_sort_for_toppk_minp = operands
 
-        logits = lax.with_sharding_constraint(logits, NamedSharding(self.mesh, P(None, None)))
+        logits = jax.sharding.reshard(logits, NamedSharding(self.mesh, P("data", None)))
 
         # Validate broadcast compatibility for temperature division
         logits_batch_size = logits.shape[0]
@@ -65,7 +65,10 @@ class Sampler(nnx.Module):
         )
 
         log_probs = jnp.log(probs).clip(min=jnp.finfo(probs.dtype).min)
-        return batch_next_token_ids, log_probs
+        return (
+            jax.sharding.reshard(batch_next_token_ids, NamedSharding(self.mesh, P("data"))),
+            jax.sharding.reshard(log_probs, NamedSharding(self.mesh, P("data", "tensor"))),
+        )
 
     def _process_logprob_results(self, operands):
         """Process logprob results when return_logprob=True"""
@@ -92,14 +95,16 @@ class Sampler(nnx.Module):
                 next_token_top_logprobs_idx,
             ) = get_top_logprobs(logprobs, sampling_metadata.top_logprobs_nums)
 
-        # Set token_ids_logprobs if needed
+        # Set token_ids_logprobs if needed.
+        # Device side returns the full logprobs[B, vocab]; host slices
+        # ragged per-req token_ids columns after device_get.
         if sampling_metadata.token_ids_logprobs is not None and any(
             x is not None for x in sampling_metadata.token_ids_logprobs
         ):
-            (
-                next_token_token_ids_logprobs_val,
-                next_token_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs(logprobs, sampling_metadata.token_ids_logprobs, self.mesh)
+            next_token_token_ids_logprobs_val = get_token_ids_logprobs(
+                logprobs, sampling_metadata.token_ids_logprobs, self.mesh
+            )
+            next_token_token_ids_logprobs_idx = None
 
         return LogitsProcessorOutput(
             next_token_logits=logits_output.next_token_logits,
@@ -163,6 +168,7 @@ class Sampler(nnx.Module):
         logits_output: LogitsProcessorOutput,
         sampling_metadata: SamplingMetadata,
         use_sort_for_toppk_minp: bool,
+        rng_override: jax.Array | None = None,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
@@ -188,7 +194,7 @@ class Sampler(nnx.Module):
             (logits, sampling_metadata.vocab_mask),
         )
 
-        _, rng = jax.random.split(self.rngs.params())
+        _, rng = jax.random.split(rng_override if rng_override is not None else self.rngs.params())
         operands = (logits, sampling_metadata, rng)
         regular_fn = lambda op: self._regular_sampling((*op, use_sort_for_toppk_minp))
         batch_next_token_ids, logprobs = lax.cond(
@@ -212,32 +218,20 @@ class Sampler(nnx.Module):
 
 
 def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int]):
+    # Return device-side dense `[B, max_k]`. Per-req trimming to k_i is
+    # done on host in tp_worker after device_get.
     max_k = max(top_logprobs_nums)
     values, indices = jax.lax.top_k(logprobs, max_k)
-
-    output_top_logprobs_val = []
-    output_top_logprobs_idx = []
-    for i, k in enumerate(top_logprobs_nums):
-        output_top_logprobs_val.append(values[i][:k])
-        output_top_logprobs_idx.append(indices[i][:k])
-    return jnp.array(output_top_logprobs_val), jnp.array(output_top_logprobs_idx)
+    return values, indices
 
 
 def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[int]], mesh: Mesh):
-    output_token_ids_logprobs_val = []
-    output_token_ids_logprobs_idx = []
-    out_sharding = NamedSharding(mesh, P(None))
-    for i, token_ids in enumerate(token_ids_logprobs):
-        if token_ids is not None:
-            output_token_ids_logprobs_val.append(
-                logprobs.at[i, token_ids].get(out_sharding=out_sharding)
-            )
-            output_token_ids_logprobs_idx.append(token_ids)
-        else:
-            output_token_ids_logprobs_val.append([])
-            output_token_ids_logprobs_idx.append([])
-
-    return jnp.array(output_token_ids_logprobs_val), jnp.array(output_token_ids_logprobs_idx)
+    # Return the full per-req `logprobs[B, vocab]` so host can gather the
+    # ragged per-req `token_ids` columns after device_get. Device side
+    # can't produce a static per-req dense tensor because token_ids
+    # length varies per req.
+    del token_ids_logprobs, mesh  # unused; kept for API parity
+    return logprobs
 
 
 def multinomial(

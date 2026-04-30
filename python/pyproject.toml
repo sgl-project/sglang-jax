@@ -44,6 +44,7 @@ dependencies = [
     "omegaconf",
     "imageio[ffmpeg]",
     "librosa",
+    "datasets",
 ]
 
 [project.optional-dependencies]
@@ -130,6 +131,12 @@ ignore = [
     # Function call in argument defaults (FastAPI uses this pattern)
     "B008",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# Pallas kernels: Python for-loops are statically unrolled at trace time,
+# so closures capturing loop variables is intentional and correct.
+"sgl_jax/srt/kernels/fused_moe/v1/kernel.py" = ["B023"]
+"sgl_jax/srt/kernels/mla/v2/kernel.py" = ["B023"]
 
 [tool.ruff.format]
 docstring-code-format = true
