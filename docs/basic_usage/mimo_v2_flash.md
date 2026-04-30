@@ -64,21 +64,23 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache uv run python -u -m sgl_jax.launch_serv
     --model-path XiaomiMiMo/MiMo-V2-Flash \
     --trust-remote-code \
     --tp-size 8 --dp-size 2 --ep-size 8 \
-    --moe-backend fused \
+    --moe-backend epmoe \
     --host 0.0.0.0 --port 30271 \
     --page-size 256 --context-length 262144 \
     --chunked-prefill-size 4096 \
     --dtype bfloat16 --mem-fraction-static 0.95 \
-    --swa-full-tokens-ratio 0.2 --skip-server-warmup \
+    --swa-full-tokens-ratio 0.25 --skip-server-warmup \
     --max-running-requests 128 \
     --attention-backend fa
 ```
+
+> **MoE backend on single-host v7x**: at EP=8 (32 experts/device), `epmoe` consistently outperforms `fused` by ~18-26% on long-context throughput. See [MoE Backend Selection](#moe-backend-selection) below. The `fused` backend remains the recommendation for multi-host slices (EP≥16).
 
 ## Configuration Tips
 
 ### Memory Management
 - **mem-fraction-static**: Use `0.9`-`0.95` for dedicated serving. MiMo-V2-Flash weights are ~20 GB/chip in FP8.
-- **swa-full-tokens-ratio**: Controls the split between full-attention (9 layers) and SWA (39 layers) KV cache pools. Default `0.2` works well for most workloads.
+- **swa-full-tokens-ratio**: Controls the split between full-attention (9 layers) and SWA (39 layers) KV cache pools. `0.2` works well on v6e-16; `0.25` is slightly better on v7x-8.
 - **max-running-requests**: Limit concurrent decoding requests to prevent OOM. `128` is a good starting point for v6e-16.
 
 ### Model-Specific Features
@@ -126,10 +128,25 @@ evalscope eval \
 
 ### TPU Configuration Guide
 
-| TPU Type | Nodes | TP Size | DP Size | EP Size | chunked-prefill-size | mem-fraction-static | max-running-requests |
-|----------|-------|---------|---------|---------|----------------------|--------------------|-----------------------|
-| v6e-16   | 4     | 16      | 4       | 16      | 2048                 | 0.95               | 128                   |
-| v7x-8    | 1     | 8       | 2       | 8       | 4096                 | 0.95               | 128                   |
+| TPU Type | Nodes | TP Size | DP Size | EP Size | moe-backend | chunked-prefill-size | mem-fraction-static | max-running-requests |
+|----------|-------|---------|---------|---------|-------------|----------------------|--------------------|-----------------------|
+| v6e-16   | 4     | 16      | 4       | 16      | fused       | 2048                 | 0.95               | 128                   |
+| v7x-8    | 1     | 8       | 2       | 8       | **epmoe**   | 4096                 | 0.95               | 128                   |
+
+### MoE Backend Selection
+
+The optimal `--moe-backend` is **scale-dependent**. On single-host v7x-8 (EP=8, 32 experts/device), `epmoe` outperforms `fused`; on larger slices (EP≥16), `fused` is recommended.
+
+Measured on v7x-8 @ `b787fdef` (dp=1), 256 prompts × 16K input / 1K output, concurrency 64:
+
+| moe-backend | chunked-prefill-size | swa-full-tokens-ratio | mem-fraction-static | Output tok/s | Median ITL |
+|-------------|---------------------|-----------------------|--------------------|--------------|-----------|
+| **epmoe**   | 4096                | 0.25                  | 0.95               | **480.04**   | 37.84 ms  |
+| epmoe       | 2048                | 0.2                   | 0.90               | 467.32       | 36.90 ms  |
+| fused       | 2048                | 0.2                   | 0.90               | 396.75       | 38.19 ms  |
+| fused       | 4096                | 0.25                  | 0.95               | 382.32       | 42.45 ms  |
+
+The fused MoE tuned config table covers the EP=8 shapes (server logs show `Using tuned block config` for the precompiled buckets), so the gap is not a tuner-coverage issue. See discussion in [#931](https://github.com/sgl-project/sglang-jax/pull/931).
 
 ### SWA Pool Tuning
 - Monitor SWA pool usage via server logs: `swa token usage` and `full token usage`
