@@ -285,7 +285,7 @@ class RadixCache(BasePrefixCache):
             )
             kv_indices = kv_indices[kv_indices != 0]
             self.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
-            self.req_to_token_pool.free(req.req_pool_idx)
+            self.req_to_token_pool.free(req)
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:all_token_len]
@@ -323,7 +323,7 @@ class RadixCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:], dp_rank=dp_rank)
 
         # Remove request slot and release cache lock
-        self.req_to_token_pool.free(req.req_pool_idx)
+        self.req_to_token_pool.free(req)
         self.dec_lock_ref(req.last_node)
 
     def cache_unfinished_req(self, req: Req):

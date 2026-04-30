@@ -400,7 +400,7 @@ class SWARadixCache(BasePrefixCache):
                 : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
             ]
             self.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
-            self.req_to_token_pool.free(req.req_pool_idx)
+            self.req_to_token_pool.free(req)
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:-1]
@@ -426,7 +426,7 @@ class SWARadixCache(BasePrefixCache):
         )
 
         # Remove req slot release the cache lock
-        self.req_to_token_pool.free(req.req_pool_idx)
+        self.req_to_token_pool.free(req)
         self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
