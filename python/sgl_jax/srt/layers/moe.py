@@ -580,7 +580,10 @@ class EPMoE(nnx.Module):
         from jax.experimental.pallas import tpu as pltpu
 
         sublane_align = pltpu.get_tpu_info().get_sublane_tiling(x.dtype)
-        kernel_tile_align = 32 if is_supported_by_gmm_v2(w0_kernel_scale) else 128
+        gmm_scales = (w0_kernel_scale, w1_kernel_scale, wo_kernel_scale)
+        kernel_tile_align = (
+            32 if all(is_supported_by_gmm_v2(scale) for scale in gmm_scales) else 128
+        )
         required_align = max(sublane_align, kernel_tile_align)
         pad_size = (-x.shape[0]) % required_align
         if pad_size > 0:
