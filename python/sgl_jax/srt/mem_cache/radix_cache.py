@@ -326,6 +326,8 @@ class RadixCache(BasePrefixCache):
                 kv_indices[old_prefix_len:page_aligned_len], dp_rank=dp_rank
             )
 
+        self.dec_lock_ref(req.last_node)
+
     def cache_unfinished_req(self, req: Req):
         """Cache incomplete requests"""
         if self.disable:

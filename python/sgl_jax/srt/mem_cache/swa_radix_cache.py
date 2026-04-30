@@ -433,6 +433,8 @@ class SWARadixCache(BasePrefixCache):
                     kv_indices[old_prefix_len:page_aligned_len], dp_rank=dp_rank
                 )
 
+        self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
         if self.disable:

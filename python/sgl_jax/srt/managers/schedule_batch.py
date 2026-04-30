@@ -40,6 +40,7 @@ from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
+    evict_from_tree_cache,
     release_kv_cache,
 )
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -541,24 +542,16 @@ class Req:
         self.temp_input_top_logprobs_idx = None
         self.extend_logprob_start_len = 0
         self.is_chunked = 0
-        self.req_pool_idx = None
         self.already_computed = 0
+        self.kv_allocated_len = 0
+        self.kv_committed_len = 0
+        self.kv_committed_freed = False
+        self.kv_overallocated_freed = False
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
         self.routed_experts = None
         self.latest_bid = None
-
-        self.swa_evicted_seqlen = 0
-        self.extend_batch_idx = 0
-        self.decode_batch_idx = 0
-
-        # NOTE: output_ids is intentionally preserved -- partial-rollout /
-        # retract-decode resume via fill_ids = origin_input_ids + output_ids.
-        self.kv_committed_len = 0
-        self.kv_allocated_len = 0
-        self.kv_committed_freed = False
-        self.kv_overallocated_freed = False
         self.cache_protected_len = 0
 
     def set_finish_with_abort(self, error_msg: str):
@@ -1084,19 +1077,22 @@ class ScheduleBatch:
         # Evict SWA tokens outside sliding window
         self.maybe_evict_swa()
 
-    def new_page_count_next_decode(
+    def new_tokens_required_next_decode(
         self,
         dp_rank: int,
         selected_indices: list[int] | None = None,
     ) -> int:
-        """Calculate new page count for next decode for a specific DP rank.
+        """Calculate tokens required for next decode for a specific DP rank.
+
+        Follows upstream sglang: uses kv_committed_len to determine page
+        boundary crossings.
 
         Args:
             dp_rank: DP rank to calculate for
             selected_indices: Optional local indices within this DP rank
 
         Returns:
-            Number of new pages needed for this DP rank.
+            Number of new tokens needed for this DP rank.
         """
         page_size = self.token_to_kv_pool_allocator.page_size
         info = self.reqs_info[dp_rank]
@@ -1108,22 +1104,15 @@ class ScheduleBatch:
             info.reqs if selected_indices is None else [info.reqs[i] for i in selected_indices]
         )
 
-        if page_size == 1:
-            return len(requests)
+        new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
+        return new_pages * page_size
 
-        return (
-            sum(1 for req in requests if req.seqlen % page_size == 0)
-            if self.enable_overlap
-            else sum(1 for req in requests if (req.seqlen - 1) % page_size == 0)
-        )
-
-    def check_decode_mem(
-        self, buf_multiplier=1, selected_indices: dict[int, list[int]] | None = None
-    ):
+    def check_decode_mem(self, selected_indices: dict[int, list[int]] | None = None):
         """Check if all DP ranks have sufficient memory for next decode step.
 
+        Follows upstream sglang: compute tokens needed, evict, check available.
+
         Args:
-            buf_multiplier: Buffer multiplier for memory calculation
             selected_indices: Optional per-DP indices to check
                               Format: {dp_rank: [local_index_0, local_index_1, ...]}
                               If None, checks all requests in all DP ranks
@@ -1131,23 +1120,14 @@ class ScheduleBatch:
         Returns:
             False if any DP rank has insufficient memory.
         """
-        # Calculate tokens needed per DP rank
         num_tokens_per_dp = {}
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
             if not info.reqs:
                 continue
-
-            # Get indices for this specific DP rank
             indices = selected_indices.get(dp_rank) if selected_indices else None
+            num_tokens_per_dp[dp_rank] = self.new_tokens_required_next_decode(dp_rank, indices)
 
-            # Calculate tokens needed for THIS specific DP rank
-            num_pages = self.new_page_count_next_decode(dp_rank, indices)
-            num_tokens_per_dp[dp_rank] = (
-                num_pages * buf_multiplier * self.token_to_kv_pool_allocator.page_size
-            )
-
-        # Try to evict if needed, then check if sufficient
         self._evict_tree_cache_if_needed(num_tokens_per_dp)
         return self._is_available_size_sufficient(num_tokens_per_dp)
 
@@ -1167,28 +1147,10 @@ class ScheduleBatch:
 
         # Helper function: check if memory is sufficient for given DP rank
         def has_sufficient_memory(dp_rank: int, indices: list[int]) -> bool:
-            num_pages = self.new_page_count_next_decode(dp_rank, indices)
-            num_tokens = num_pages * self.token_to_kv_pool_allocator.page_size
+            num_tokens = self.new_tokens_required_next_decode(dp_rank, indices)
 
-            # Evict if needed
-            if not isinstance(self.tree_cache, ChunkCache) and self.tree_cache:
-                if self.is_hybrid:
-                    full_avail = self.token_to_kv_pool_allocator.full_available_size(
-                        dp_rank=dp_rank
-                    )
-                    swa_avail = self.token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
-                    if full_avail < num_tokens or swa_avail < num_tokens:
-                        self.tree_cache.evict(
-                            max(0, num_tokens - full_avail),
-                            max(0, num_tokens - swa_avail),
-                            dp_rank=dp_rank,
-                        )
-                else:
-                    avail = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
-                    if avail < num_tokens:
-                        self.tree_cache.evict(num_tokens, dp_rank=dp_rank)
+            evict_from_tree_cache(self.tree_cache, num_tokens, dp_rank=dp_rank)
 
-            # Check if sufficient
             if self.is_hybrid:
                 full_ok = (
                     self.token_to_kv_pool_allocator.full_available_size(dp_rank=dp_rank)
