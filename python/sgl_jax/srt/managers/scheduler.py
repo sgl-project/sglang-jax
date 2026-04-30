@@ -1466,15 +1466,22 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
+        # For prefill-only batch, filter out finished requests since they
+        # won't go through the decode step.
+        if self.running_batch.is_prefill_only:
+            self.running_batch.filter_batch()
+            if self.running_batch.is_empty():
+                for info in self.running_batch.reqs_info:
+                    info.batch_is_full = False
+
         new_batch = self.get_new_batch_prefill()
 
-        # if new_batch is not None:
         if new_batch:
             # Run prefill first if possible
             ret = new_batch
         else:
-            # Run decode
-            if not self.running_batch.is_empty():
+            # Run decode (skip for prefill-only batches)
+            if not self.running_batch.is_empty() and not self.running_batch.is_prefill_only:
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
@@ -1665,7 +1672,7 @@ class Scheduler(
             return batch
 
         # Check if decode out of memory
-        if not batch.check_decode_mem(self.decode_mem_cache_buf_multiplier) or (
+        if not batch.check_decode_mem() or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             old_ratio = self.new_token_ratio
