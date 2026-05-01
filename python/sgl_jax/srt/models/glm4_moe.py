@@ -213,7 +213,7 @@ class Glm4MoeDecoderLayer(nnx.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings", 131072)
         self.head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
         use_qk_norm = getattr(config, "use_qk_norm", True)
-        
+
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
         rotary_dim = int(self.head_dim * partial_rotary_factor)
 
@@ -440,9 +440,9 @@ class Glm4MoeModel(nnx.Module):
         residual = None
         layers_kv_fused = []
         layers_topk_ids = []
-        
+
         token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
-        
+
         for layer in self.layers:
             hidden_states, residual, kv_fused, topk_ids = layer(
                 forward_batch.positions,
@@ -464,7 +464,7 @@ class Glm4MoeModel(nnx.Module):
             hidden_states = rmsnorm_forward(
                 hidden_states, None, self.norm.scale, self.norm.epsilon
             )
-            
+
         return hidden_states, layers_kv_fused, layers_topk_ids
 
 class Glm4MoeForCausalLM(nnx.Module):
