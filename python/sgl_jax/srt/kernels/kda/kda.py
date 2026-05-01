@@ -592,7 +592,7 @@ def _chunk_gated_delta_rule_fwd_kernel(
 
     @pl.when(idx_nt < real_NT)
     def _():
-        h_ref[0, boh + idx_nt, 0] = scratch_ref[...].astype(h_ref.dtype)
+        h_ref[0, 0, 0] = scratch_ref[...].astype(h_ref.dtype)
 
         b_w = w_ref[0, 0]
         b_v = jnp.dot(
@@ -743,6 +743,11 @@ def chunk_gated_delta_rule_fwd_h(
         bos = pl.multiple_of(seqlens_ref[n], BT)
         block_idx = jnp.minimum(bos // BT + nt, T // BT)
         return (0, h, block_idx, 0)
+    
+    def _h_index_map(n, h, nt, seqlens_ref, chunk_offsets_ref):
+        bos = pl.multiple_of(seqlens_ref[n], BT)
+        chunk_idx = jnp.minimum(bos // BT + nt, NT - 1)
+        return (0, chunk_idx, h, 0, 0)
 
     k_blockspec = pl.BlockSpec([1, 1, BT, K_PADSIZE], index_map=_t_index_map)
     v_blockspec = pl.BlockSpec([1, 1, BT, V_ALIGNED], index_map=_t_index_map)
@@ -760,7 +765,7 @@ def chunk_gated_delta_rule_fwd_h(
     )
 
     h_blockspec_out = pl.BlockSpec(
-        [1, NT, 1, K_PADSIZE, V_ALIGNED], index_map=lambda n, h, nt, *_: (0, 0, h, 0, 0)
+        [1, 1, 1, K_PADSIZE, V_ALIGNED], index_map=_h_index_map
     )
     v_new_blockspec_out = (
         pl.BlockSpec([1, 1, BT, V_ALIGNED], index_map=_t_index_map) if save_new_value else None
