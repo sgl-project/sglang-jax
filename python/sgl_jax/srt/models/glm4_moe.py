@@ -2,14 +2,13 @@ import logging
 from typing import Any
 
 import jax
-import numpy as np
 from flax import nnx
 from jax import numpy as jnp
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
 from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
-from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
+from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
 from sgl_jax.srt.layers.layernorm import RMSNorm, rmsnorm_forward
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -105,12 +104,13 @@ class Glm4MoeAttention(nnx.Module):
             mesh=mesh,
             scope_name="c_proj",
         )
-        self.rotary_emb = RotaryEmbedding(
+        self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=rotary_dim,
-            max_position_embeddings=max_position_embeddings,
+            max_position=max_position_embeddings,
             base=rope_theta,
             is_neox_style=True,
+            rope_scaling=rope_scaling,
             dtype=dtype,
         )
         self.attn = RadixAttention(

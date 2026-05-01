@@ -69,7 +69,7 @@ def gmm(
     alignment = 32 if use_gmm_v2 else 128
     if not interpret and m % alignment != 0:
         pad_size = alignment - (m % alignment)
-        lhs = jnp.pad(lhs, ((0, pad_size), (0, 0)))
+        lhs = jax.lax.pad(lhs, jnp.zeros((), dtype=lhs.dtype), ((0, pad_size, 0), (0, 0, 0)))
         group_sizes = group_sizes.at[-1].add(pad_size)
 
     lhs_scale = None
