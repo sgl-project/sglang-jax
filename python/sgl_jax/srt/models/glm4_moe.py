@@ -26,6 +26,7 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
+
 class Glm4MoeAttention(nnx.Module):
     def __init__(
         self,
@@ -148,6 +149,7 @@ class Glm4MoeAttention(nnx.Module):
         output, _ = self.c_proj(attn_output)
         return output, kv_fused
 
+
 class Glm4MoeMLP(nnx.Module):
     def __init__(
         self,
@@ -198,6 +200,7 @@ class Glm4MoeMLP(nnx.Module):
         output, _ = self.down_proj(intermediate_parallel)
         return output
 
+
 class Glm4MoeDecoderLayer(nnx.Module):
     def __init__(
         self,
@@ -211,7 +214,9 @@ class Glm4MoeDecoderLayer(nnx.Module):
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 131072)
-        self.head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
+        self.head_dim = getattr(config, "head_dim", None) or (
+            config.hidden_size // config.num_attention_heads
+        )
         use_qk_norm = getattr(config, "use_qk_norm", True)
 
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
@@ -395,6 +400,7 @@ class Glm4MoeDecoderLayer(nnx.Module):
 
         return hidden_states, residual, kv_fused, topk_ids
 
+
 class Glm4MoeModel(nnx.Module):
     def __init__(
         self,
@@ -461,11 +467,10 @@ class Glm4MoeModel(nnx.Module):
                 hidden_states, residual, self.norm.scale, self.norm.epsilon
             )
         else:
-            hidden_states = rmsnorm_forward(
-                hidden_states, None, self.norm.scale, self.norm.epsilon
-            )
+            hidden_states = rmsnorm_forward(hidden_states, None, self.norm.scale, self.norm.epsilon)
 
         return hidden_states, layers_kv_fused, layers_topk_ids
+
 
 class Glm4MoeForCausalLM(nnx.Module):
     def __init__(
@@ -693,7 +698,7 @@ class Glm4MoeForCausalLM(nnx.Module):
                 num_experts=num_logical_experts,
                 expert_type_names=("gate_proj", "up_proj", "down_proj"),
                 moe_backend=moe_backend,
-                physical_to_logical_map=None, # Handle physical mapping if needed later
+                physical_to_logical_map=None,  # Handle physical mapping if needed later
             )
 
             if is_static_quant:
@@ -701,7 +706,7 @@ class Glm4MoeForCausalLM(nnx.Module):
                 BLOCK_SIZE = 256
                 hidden_size = self.config.hidden_size
                 inter_size = self.config.moe_intermediate_size
-                num_physical_experts = num_logical_experts # Assuming no redundant experts for now
+                num_physical_experts = num_logical_experts  # Assuming no redundant experts for now
                 use_fused = moe_backend == "fused"
 
                 for key, mapping in moe_mappings.items():
@@ -807,5 +812,6 @@ class Glm4MoeForCausalLM(nnx.Module):
                     )
 
         return mappings
+
 
 EntryClass = Glm4MoeForCausalLM
