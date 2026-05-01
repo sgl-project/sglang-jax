@@ -195,7 +195,7 @@ class Grok1MLP(nnx.Module):
             params_dtype=dtype,
             kernel_axes=("tensor", None),
             mesh=mesh,
-            output_scatter_dimension=0,
+            output_scatter_dimension=0 if enable_sequence_parallel else None,
         )
         self.act_fn = GeluAndMul(approximate="tanh")
         self.layer_id = layer_id
@@ -401,7 +401,7 @@ class Grok1Attention(nnx.Module):
         layer_id: int = 0,
         max_position: int = 4096 * 32,
         rope_theta: float = 10000,
-        enable_sequence_parallel: int | None = None,
+        enable_sequence_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -457,7 +457,7 @@ class Grok1Attention(nnx.Module):
             params_dtype=jnp.bfloat16,
             kernel_axes=("tensor", None),
             mesh=mesh,
-            output_scatter_dimension=0,
+            output_scatter_dimension=0 if enable_sequence_parallel else None,
         )
 
         # Initialize rotary embeddings based on scaling configuration
@@ -598,6 +598,7 @@ class Grok1DecoderLayer(nnx.Module):
             layer_id=layer_id,
             rope_theta=rope_theta,
             mesh=mesh,
+            enable_sequence_parallel=getattr(config, "enable_sequence_parallel", False),
         )
 
         # Feed-forward networks
