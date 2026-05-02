@@ -340,7 +340,7 @@ class QuantizedLinear(nnx.Module):
 
         # When ``output_scatter_dimension`` is set, stack ``input_axis`` onto
         # whatever already partitions that dim (e.g. ``"data"`` from DP) so
-        # DP+SP compose. 
+        # DP+SP compose.
         if self.output_scatter_dimension is not None:
             out_specs, do_scatter = prepare_scattered_spec_if_needed(
                 out_specs,

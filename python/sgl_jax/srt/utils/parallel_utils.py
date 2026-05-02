@@ -31,8 +31,8 @@ def prepare_scattered_spec_if_needed(
     """Stack ``scatter_axis`` onto ``out_specs[scatter_dim]`` if scatter fires.
 
     The decision uses the *local* shard size — ``full_dim_size`` divided by
-    however many mesh axes already partition ``scatter_dim``. 
-    
+    however many mesh axes already partition ``scatter_dim``.
+
     In the cases like DP attention, there's existing DP sharding on the sequences dimension. This
     will influence sequence parallel behavior
 
@@ -46,9 +46,7 @@ def prepare_scattered_spec_if_needed(
     else:
         existing_factor = mesh.shape[existing]
 
-    if not should_scatter(
-        full_dim_size // existing_factor, mesh.shape[scatter_axis]
-    ):
+    if not should_scatter(full_dim_size // existing_factor, mesh.shape[scatter_axis]):
         return out_specs, False
 
     if existing is None:
@@ -58,7 +56,5 @@ def prepare_scattered_spec_if_needed(
     else:
         combined = (existing, scatter_axis)
 
-    new_out_specs = P(
-        *(combined if i == scatter_dim else axis for i, axis in enumerate(out_specs))
-    )
+    new_out_specs = P(*(combined if i == scatter_dim else axis for i, axis in enumerate(out_specs)))
     return new_out_specs, True
