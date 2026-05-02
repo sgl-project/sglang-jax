@@ -335,9 +335,12 @@ class TestGrokLayerSequenceParallelWiring(CustomTestCase):
 
         kwargs_by_callee: dict[str, list[str]] = {}
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                if node.func.id in {"Grok1Attention", "Grok1MLP"}:
-                    kwargs_by_callee[node.func.id] = [kw.arg for kw in node.keywords]
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in {"Grok1Attention", "Grok1MLP"}
+            ):
+                kwargs_by_callee[node.func.id] = [kw.arg for kw in node.keywords]
 
         self.assertIn(
             "Grok1Attention",
@@ -430,9 +433,7 @@ class TestDpSpComposition(CustomTestCase):
         mesh = _make_dp_tp_mesh(dp_size=2, tp_size=4)
         # EPMoE.tp_size = world_size / ep_size = 8 → SP threshold = 8 * 128.
         batch = 8 * _MIN_LOCAL
-        x, topk_weights, topk_ids = _make_moe_inputs(
-            batch, self.HIDDEN_SIZE, self.NUM_EXPERTS
-        )
+        x, topk_weights, topk_ids = _make_moe_inputs(batch, self.HIDDEN_SIZE, self.NUM_EXPERTS)
 
         with jax.set_mesh(mesh):
             moe_sp = self._build_moe(mesh, enable_sequence_parallel=True)
@@ -446,9 +447,7 @@ class TestDpSpComposition(CustomTestCase):
 
         # See TestEPMoESequenceParallel for the noise-floor rationale (atol
         # sized to bf16 reduction-order drift on tens-of-thousands magnitudes).
-        np.testing.assert_allclose(
-            _as_fp32(out_sp), _as_fp32(out_base), rtol=0.1, atol=2048.0
-        )
+        np.testing.assert_allclose(_as_fp32(out_sp), _as_fp32(out_base), rtol=0.1, atol=2048.0)
 
     def _build_moe(self, mesh: Mesh, *, enable_sequence_parallel: bool) -> EPMoE:
         return EPMoE(
