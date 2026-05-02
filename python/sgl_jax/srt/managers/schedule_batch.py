@@ -750,14 +750,14 @@ class ScheduleBatch:
         """Check if batch is empty (no requests in any DP rank)."""
         return self.batch_size() == 0
 
-    def alloc_req_slots(self, num_reqs: int):
-        req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
+    def alloc_req_slots(self, reqs):
+        req_pool_indices = self.req_to_token_pool.alloc(reqs)
         if req_pool_indices is None:
             raise RuntimeError(
                 "alloc_req_slots runs out of memory. "
                 "Please set a smaller number for `--max-running-requests`. "
                 f"{self.req_to_token_pool.available_size()=}, "
-                f"{num_reqs=}, "
+                f"{len(reqs)=}, "
             )
         return req_pool_indices
 
@@ -904,7 +904,7 @@ class ScheduleBatch:
 
             # Allocate req slots
             bs = len(reqs)
-            req_pool_indices = self.alloc_req_slots(bs)
+            req_pool_indices = self.alloc_req_slots(reqs)
 
             # Init arrays
             input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
@@ -921,8 +921,7 @@ class ScheduleBatch:
             # Copy prefix and do some basic check
             extend_input_logprob_token_ids = []
 
-            for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
-                req.req_pool_idx = req_pool_indices[i]
+            for req, seq_len, pre_len in zip(reqs, seq_lens, prefix_lens):
                 assert seq_len - pre_len == req.extend_input_len
 
                 prefix_indices = req.prefix_indices
@@ -1261,7 +1260,7 @@ class ScheduleBatch:
                 req.req_pool_idx, : seq_lens_cpu[idx]
             ]
             self.token_to_kv_pool_allocator.free(token_indices, dp_rank)
-            self.req_to_token_pool.free(req.req_pool_idx)
+            self.req_to_token_pool.free(req)
         else:
             last_uncached_pos = (
                 req.last_matched_prefix_len // server_args.page_size
@@ -1270,7 +1269,7 @@ class ScheduleBatch:
                 req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
             ]
             self.token_to_kv_pool_allocator.free(token_indices, dp_rank)
-            self.req_to_token_pool.free(req.req_pool_idx)
+            self.req_to_token_pool.free(req)
 
             # release the last node
             if self.is_hybrid:

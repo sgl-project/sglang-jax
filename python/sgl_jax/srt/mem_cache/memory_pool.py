@@ -121,21 +121,39 @@ class ReqToTokenPool:
         """Return number of available request slots"""
         return len(self.free_slots)
 
-    def alloc(self, need_size: int = 1) -> list[int]:
-        """Allocate request slots"""
-        if need_size > len(self.free_slots):
+    def alloc(self, reqs: list) -> list[int] | None:
+        """Allocate request slots for a batch of reqs.
+
+        Reqs whose ``req_pool_idx`` is already non-None keep their slot
+        (in-place reuse for chunked-prefill follow-ups); only reqs without
+        a slot consume from ``free_slots``.
+
+        Atomic: returns None and leaves every req field untouched if the
+        remaining capacity cannot satisfy the fresh allocations.
+        """
+        new_count = sum(1 for r in reqs if r.req_pool_idx is None)
+        if new_count > len(self.free_slots):
             return None
 
-        select_indices = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
-        return select_indices
+        new_slots = self.free_slots[:new_count]
+        self.free_slots = self.free_slots[new_count:]
 
-    def free(self, free_index: int | list[int]):
-        """Free request slots"""
-        if isinstance(free_index, int):
-            self.free_slots.append(free_index)
-        else:
-            self.free_slots.extend(free_index)
+        cursor = 0
+        for r in reqs:
+            if r.req_pool_idx is None:
+                r.req_pool_idx = new_slots[cursor]
+                cursor += 1
+        return [r.req_pool_idx for r in reqs]
+
+    def free(self, req):
+        """Release ``req``'s slot and clear ``req.req_pool_idx``.
+
+        Clearing the field prevents a stale idx from leaking to a later
+        caller after the slot is re-handed.
+        """
+        assert req.req_pool_idx is not None, "double free or free of an unallocated req"
+        self.free_slots.append(req.req_pool_idx)
+        req.req_pool_idx = None
 
     def clear(self):
         """Clear all allocation states"""
