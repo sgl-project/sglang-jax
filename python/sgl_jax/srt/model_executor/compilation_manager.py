@@ -245,12 +245,12 @@ class CompilationManager:
     ):
         import jax.numpy as jnp
 
-        from sgl_jax.srt.layers.logits_processor import CaptureHiddenMode
         from sgl_jax.srt.managers.schedule_batch import (
             ForwardMode,
             ModelWorkerBatch,
             ModelWorkerSamplingInfo,
         )
+        from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
         valid_input_ids = np.array([1] * bs, dtype=jnp.int32)
