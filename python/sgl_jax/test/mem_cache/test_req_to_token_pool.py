@@ -16,8 +16,10 @@ from sgl_jax.test.test_utils import CustomTestCase
 class FakeReq:
     """Minimal Req surrogate exposing only the attributes ReqToTokenPool reads."""
 
-    def __init__(self, req_pool_idx=None):
+    def __init__(self, req_pool_idx=None, is_chunked=0, kv_committed_len=0):
         self.req_pool_idx = req_pool_idx
+        self.is_chunked = is_chunked
+        self.kv_committed_len = kv_committed_len
 
 
 class TestReqToTokenPoolAlloc(CustomTestCase):
@@ -51,7 +53,7 @@ class TestReqToTokenPoolAlloc(CustomTestCase):
         self.assertEqual(self.pool.free_slots, [0, 1])
 
     def test_alloc_mixed_reuse_and_fresh(self):
-        retained = FakeReq(req_pool_idx=0)
+        retained = FakeReq(req_pool_idx=0, is_chunked=1)
         fresh_a = FakeReq()
         fresh_b = FakeReq()
         self.pool.free_slots = [1, 2, 3]
@@ -68,7 +70,7 @@ class TestReqToTokenPoolAlloc(CustomTestCase):
         self.assertEqual(self.pool.free_slots, [3])
 
     def test_alloc_atomic_with_partial_reuse(self):
-        retained = FakeReq(req_pool_idx=5)  # outside [0, size); ok for the test
+        retained = FakeReq(req_pool_idx=5, is_chunked=1)  # outside [0, size); ok for the test
         # Only one fresh slot left, but two fresh reqs requested -> overflow.
         self.pool.free_slots = [0]
         fresh_a = FakeReq()
@@ -131,6 +133,7 @@ class TestReqToTokenPoolChunkedReqLifecycle(CustomTestCase):
         # its slot; the peer finishes and is freed normally.
         self.pool.free(peer)
         self.assertIsNone(peer.req_pool_idx)
+        chunked.is_chunked = 1
 
         # Round 2: chunked req comes back with req_pool_idx still set;
         # alloc must treat this as in-place reuse, not a fresh alloc.
