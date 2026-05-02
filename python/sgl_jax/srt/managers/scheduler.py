@@ -89,6 +89,8 @@ logger = logging.getLogger(__name__)
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
+TEST_RETRACT_INTERVAL = int(os.environ.get("SGLANG_TEST_RETRACT_INTERVAL", "3"))
+TEST_RETRACT_NO_PREFILL_BS = int(os.environ.get("SGLANG_TEST_RETRACT_NO_PREFILL_BS", str(2**31)))
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
@@ -540,8 +542,6 @@ class Scheduler(
                 max_seq_len=server_args.max_seq_len,
                 is_eagle=self.spec_algorithm is not None and self.spec_algorithm.is_eagle(),
             )
-
-        self.decode_mem_cache_buf_multiplier = 1
 
     def _select_round_robin_dp(self) -> int:
         dp_rank = self.dp_round_robin_counter % self.dp_size
@@ -1422,8 +1422,6 @@ class Scheduler(
                 # only finished requests to running_batch.
                 chunked_req_to_exclude[dp_rank] = self.chunked_reqs[dp_rank]
                 self.tree_cache.cache_unfinished_req(self.chunked_reqs[dp_rank])
-                # The chunked req keeps its req_pool_idx across batches; the
-                # next alloc(reqs) reuses the slot in place.
 
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
@@ -1466,15 +1464,22 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
+        # For prefill-only batch, filter out finished requests since they
+        # won't go through the decode step.
+        if self.running_batch.is_prefill_only:
+            self.running_batch.filter_batch()
+            if self.running_batch.is_empty():
+                for info in self.running_batch.reqs_info:
+                    info.batch_is_full = False
+
         new_batch = self.get_new_batch_prefill()
 
-        # if new_batch is not None:
         if new_batch:
             # Run prefill first if possible
             ret = new_batch
         else:
-            # Run decode
-            if not self.running_batch.is_empty():
+            # Run decode (skip for prefill-only batches)
+            if not self.running_batch.is_empty() and not self.running_batch.is_prefill_only:
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
@@ -1497,6 +1502,9 @@ class Scheduler(
         running_bs_per_dp = [
             len(info.reqs) if info.reqs else 0 for info in self.running_batch.reqs_info
         ]
+
+        if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
+            return None
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue)
@@ -1588,6 +1596,9 @@ class Scheduler(
                     self.chunked_reqs[dp_rank] is None
                 ), f"Chunked request already exists for DP rank {dp_rank} when adding new chunked req"
                 self.chunked_reqs[dp_rank] = adder.new_chunked_reqs[dp_rank]
+            # Increment for any chunked req (new OR continuing) to keep
+            # process_batch_result_prefill from sampling on intermediate chunks.
+            if self.chunked_reqs[dp_rank] is not None:
                 self.chunked_reqs[dp_rank].is_chunked += 1
 
         self.log_prefill_stats(adder, all_can_run_reqs, running_bs)
@@ -1659,8 +1670,8 @@ class Scheduler(
             return batch
 
         # Check if decode out of memory
-        if not batch.check_decode_mem(self.decode_mem_cache_buf_multiplier) or (
-            TEST_RETRACT and batch.batch_size() > 10
+        if not batch.check_decode_mem() or (
+            TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             old_ratio = self.new_token_ratio
 

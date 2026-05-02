@@ -2,6 +2,8 @@ import logging
 
 from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
+from sgl_jax.srt.utils.common_utils import cdiv
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +73,13 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int, d
     if tree_cache is None:
         return
 
+    if isinstance(tree_cache, ChunkCache):
+        return
+
     allocator = tree_cache.token_to_kv_pool_allocator
 
     # Check if this is a hybrid allocator
-    if hasattr(allocator, "full_available_size"):
+    if isinstance(allocator, SWATokenToKVPoolAllocator):
         # Hybrid allocator
         full_available_size = allocator.full_available_size(dp_rank=dp_rank)
         swa_available_size = allocator.swa_available_size(dp_rank=dp_rank)
@@ -104,3 +109,32 @@ def available_and_evictable_str(tree_cache, dp_rank: int = 0) -> str:
         available_size = token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
         evictable_size = tree_cache.evictable_size(dp_rank=dp_rank)
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+
+
+def release_kv_cache(
+    req,
+    tree_cache: BasePrefixCache,
+    is_insert: bool = True,
+) -> None:
+    """Single entry point for releasing a request's KV cache (sglang #12224)."""
+    if req.req_pool_idx is None:
+        return
+
+    dp_rank = req.dp_rank if req.dp_rank is not None else 0
+
+    tree_cache.cache_finished_req(req, is_insert=is_insert)
+
+    start_p, end_p = req.pop_overallocated_kv_cache()
+    assert (
+        start_p == end_p
+    ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
+
+    page_size = tree_cache.page_size
+    if page_size > 1:
+        start_p = cdiv(start_p, page_size) * page_size
+
+    if start_p < end_p:
+        indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx, start_p:end_p]
+        tree_cache.token_to_kv_pool_allocator.free(indices_to_free, dp_rank=dp_rank)
+
+    tree_cache.req_to_token_pool.free(req)

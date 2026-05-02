@@ -11,6 +11,7 @@ from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sgl_jax.srt.mem_cache.common import release_kv_cache
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.utils.common_utils import cdiv
 
@@ -112,25 +113,12 @@ class SchedulerOutputProcessorMixin:
 
             # Check finish conditions for each request in this DP rank
             for i, (req, next_token_id) in enumerate(zip(reqs, dp_output_ids)):
-                if req.is_retracted:
+                if req.finished() or req.is_retracted:
+                    # release_kv_cache owns over-allocated KV; freeing here would double-free.
                     req_idx += 1
                     continue
 
                 req.latest_bid = result.bid
-
-                if self.is_mixed_chunk and self.enable_overlap and req.finished():
-                    if info.decoding_reqs and req in info.decoding_reqs:
-                        decode_count = len(info.decoding_reqs)
-                        first_decode_idx = len(reqs) - decode_count
-                        if i >= first_decode_idx:
-                            local_decode_idx = i - first_decode_idx
-                            out_cache_start = len(info.out_cache_loc) - decode_count
-                            j = out_cache_start + local_decode_idx
-                            self.token_to_kv_pool_allocator.free(
-                                info.out_cache_loc[j : j + 1], dp_rank
-                            )
-                    req_idx += 1
-                    continue
 
                 if req.is_chunked <= 0:
                     req.output_ids.append(next_token_id)
@@ -152,7 +140,7 @@ class SchedulerOutputProcessorMixin:
                                 >= precision_tracer.get_max_requests()
                             ):
                                 precision_tracer.stop_trace()
-                        self.tree_cache.cache_finished_req(req)
+                        release_kv_cache(req, self.tree_cache)
                     elif not info.decoding_reqs or req not in info.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
@@ -339,25 +327,16 @@ class SchedulerOutputProcessorMixin:
             # Check finish condition for each request in this DP rank
             for i, (req, next_token_id) in enumerate(zip(reqs, dp_output_ids)):
                 req: Req
+                if self.enable_overlap and (req.finished() or req.is_retracted):
+                    # release_kv_cache owns over-allocated KV; freeing here would double-free.
+                    req_idx += 1
+                    continue
+
                 if req.is_retracted:
                     req_idx += 1
                     continue
 
                 req.latest_bid = result.bid
-
-                indices_to_free = None
-                if self.enable_overlap and req.finished():
-                    if self.page_size == 1:
-                        indices_to_free = info.out_cache_loc[i : i + 1]
-                    else:
-                        if (
-                            len(req.origin_input_ids) + len(req.output_ids) - 1
-                        ) % self.page_size == 0:
-                            indices_to_free = info.out_cache_loc[i : i + 1]
-                    if indices_to_free is not None:
-                        self.token_to_kv_pool_allocator.free(indices_to_free, dp_rank)
-                    req_idx += 1
-                    continue
 
                 new_accepted_len = 1
                 if batch.spec_algorithm is None or batch.spec_algorithm.is_none():
@@ -403,7 +382,7 @@ class SchedulerOutputProcessorMixin:
                             >= precision_tracer.get_max_requests()
                         ):
                             precision_tracer.stop_trace()
-                    self.tree_cache.cache_finished_req(req)
+                    release_kv_cache(req, self.tree_cache)
 
                 if req.return_output_logprob_only:
                     req.output_token_logprobs_val.append(next_token_logprobs[req_idx])

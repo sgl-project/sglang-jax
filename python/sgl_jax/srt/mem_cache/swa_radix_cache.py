@@ -391,19 +391,20 @@ class SWARadixCache(BasePrefixCache):
             self.root_node, key, value, prev_prefix_len, swa_evicted_seqlen=swa_evicted_seqlen
         )
 
-    def cache_finished_req(self, req: Req) -> None:
-        """Cache request when it finishes."""
+    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
+        """Cache request when it finishes. ``is_insert=False`` skips the
+        radix insert (retract path)."""
+        committed_kv_len = req.pop_committed_kv_cache()
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx,
-                : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
+                :committed_kv_len,
             ]
             self.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
-            self.req_to_token_pool.free(req)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+        token_ids = (req.origin_input_ids + req.output_ids)[:committed_kv_len]
         kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, : len(token_ids)]
 
         if self.page_size != 1:
@@ -415,18 +416,23 @@ class SWARadixCache(BasePrefixCache):
             # Make a copy to avoid aliasing tree node values with req_to_token rows
             page_aligned_kv_indices = kv_indices.copy()
 
-        # Radix Cache takes one ref in memory pool
-        # insert the token_ids and kv_indices into the radix tree
-        # Note: the insert function already frees the overlapped kv_indices
-        self.insert(
-            RadixKey(token_ids[:page_aligned_len], req.extra_key, req.dp_rank),
-            page_aligned_kv_indices,
-            req.last_matched_prefix_len,
-            swa_evicted_seqlen=req.swa_evicted_seqlen,
-        )
+        if is_insert:
+            # Radix Cache takes one ref in memory pool
+            # Note: the insert function already frees the overlapped kv_indices
+            self.insert(
+                RadixKey(token_ids[:page_aligned_len], req.extra_key, req.dp_rank),
+                page_aligned_kv_indices,
+                req.cache_protected_len,
+                swa_evicted_seqlen=req.swa_evicted_seqlen,
+            )
+        else:
+            # cache_protected_len, not len(prefix_indices); see RadixCache.cache_finished_req.
+            old_prefix_len = req.cache_protected_len
+            if old_prefix_len < page_aligned_len:
+                self.token_to_kv_pool_allocator.free(
+                    kv_indices[old_prefix_len:page_aligned_len], dp_rank=dp_rank
+                )
 
-        # Remove req slot release the cache lock
-        self.req_to_token_pool.free(req)
         self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
@@ -450,7 +456,7 @@ class SWARadixCache(BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
-        old_prefix_len = req.last_matched_prefix_len
+        old_prefix_len = req.cache_protected_len
         new_prefix_len = self.insert(
             RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank),
             page_aligned_kv_indices,
@@ -480,6 +486,7 @@ class SWARadixCache(BasePrefixCache):
         req.last_node = new_last_node
         req.swa_uuid_for_lock = swa_uuid_for_lock
         req.last_matched_prefix_len = len(new_indices)
+        req.cache_protected_len = len(new_indices)
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)
