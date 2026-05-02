@@ -32,6 +32,7 @@ from sgl_jax.test.test_utils import CustomTestCase
 _MESH = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 _TP_SIZE = _MESH.shape.get("tensor", 1)
 _MIN_LOCAL = 128  # default tpu_scatter_min_local_size
+_TOTAL_DEVICES = len(jax.devices())
 
 
 def _spec_dim(sharding, dim):
@@ -63,10 +64,13 @@ class TestQuantizedLinearScatter(CustomTestCase):
         batch = _TP_SIZE * _MIN_LOCAL  # exactly at threshold
         scatter_out, baseline_out = self._run_pair(batch)
 
-        # Scatter path: output sharded on dim 0 over the tensor axis.
-        self.assertEqual(_spec_dim(scatter_out.sharding, 0), "tensor")
-        # Baseline: fully replicated (psum without scatter).
-        self.assertIsNone(_spec_dim(baseline_out.sharding, 0))
+        # Scatter path: dim 0 stripes across the data and tensor axes
+        # (data axis is size 1 here so it's effectively just "tensor", but
+        # the spec records both names — see TestDpSpComposition for the
+        # observable dp>1 case).
+        self.assertEqual(_spec_dim(scatter_out.sharding, 0), ("data", "tensor"))
+        # Baseline: DP-only sharding (no SP combine).
+        self.assertEqual(_spec_dim(baseline_out.sharding, 0), "data")
 
         # Same math, just different communication pattern. Tolerances cover
         # bf16 reduction-order drift over a 256-wide row-parallel sum (max
@@ -82,12 +86,12 @@ class TestQuantizedLinearScatter(CustomTestCase):
         batch = _TP_SIZE * (_MIN_LOCAL // 2)
         scatter_out, _ = self._run_pair(batch)
 
-        # Falls back to fully-replicated (no scatter).
-        self.assertIsNone(_spec_dim(scatter_out.sharding, 0))
+        # Falls back to DP-only sharding (no scatter combine).
+        self.assertEqual(_spec_dim(scatter_out.sharding, 0), "data")
 
     @unittest.skipIf(_TP_SIZE < 2, "Needs >=2 tensor-parallel devices.")
     def test_scatter_disabled_when_dimension_is_none(self):
-        """``output_scatter_dimension=None`` always replicates regardless of size."""
+        """``output_scatter_dimension=None`` keeps the DP-only spec regardless of size."""
         batch = _TP_SIZE * _MIN_LOCAL  # would-be scatter size
         x_host, weight_q, weight_scale = _make_quant_linear_inputs(batch, in_dim=256, out_dim=512)
 
@@ -96,7 +100,8 @@ class TestQuantizedLinearScatter(CustomTestCase):
             x = jax.device_put(x_host, NamedSharding(_MESH, P(None, "tensor")))
             out, _ = ql(x)
 
-        self.assertIsNone(_spec_dim(out.sharding, 0))
+        # No combine: dim 0 keeps the baseline ``"data"`` axis.
+        self.assertEqual(_spec_dim(out.sharding, 0), "data")
 
     def _run_pair(self, batch: int):
         in_dim, out_dim = 256, 512
@@ -185,15 +190,19 @@ class TestEPMoESequenceParallel(CustomTestCase):
                 out_sp = moe_sp(x, topk_weights, topk_ids)
                 out_base = moe_base(x, topk_weights, topk_ids)
 
-        self.assertEqual(_spec_dim(out_sp.sharding, 0), "tensor")
-        self.assertIsNone(_spec_dim(out_base.sharding, 0))
+        # Post-MoE reshard combines ``"data"`` (DP, size 1 here) with
+        # ``"tensor"`` (SP) on dim 0. With dp=1 the data axis is just a
+        # label, but the spec still records both names.
+        self.assertEqual(_spec_dim(out_sp.sharding, 0), ("data", "tensor"))
+        # SP off → DP-only spec on dim 0.
+        self.assertEqual(_spec_dim(out_base.sharding, 0), "data")
 
         np.testing.assert_allclose(_as_fp32(out_sp), _as_fp32(out_base), rtol=0.1, atol=2048.0)
 
     @unittest.skipIf(_TP_SIZE < 2, "Needs >=2 tensor-parallel devices.")
     def test_seq_parallel_replicates_below_threshold(self):
         """With seq-parallel ON but a tiny batch, ``should_scatter`` returns
-        False and we fall back to the fully-replicated psum path."""
+        False and we fall back to the DP-only psum path."""
         mesh = _make_moe_mesh(ep_size=1, tp_size=_TP_SIZE)
         batch = _TP_SIZE  # 8 tokens with tp=8 → way below 8*128
         x, topk_weights, topk_ids = _make_moe_inputs(batch, self.HIDDEN_SIZE, self.NUM_EXPERTS)
@@ -203,12 +212,13 @@ class TestEPMoESequenceParallel(CustomTestCase):
             with jax.set_mesh(moe_sp.moe_mesh):
                 out_sp = moe_sp(x, topk_weights, topk_ids)
 
-        self.assertIsNone(_spec_dim(out_sp.sharding, 0))
+        # Below threshold → no SP combine, dim 0 keeps the DP-only spec.
+        self.assertEqual(_spec_dim(out_sp.sharding, 0), "data")
 
     @unittest.skipIf(_TP_SIZE < 2, "Needs >=2 tensor-parallel devices.")
     def test_seq_parallel_disabled_always_replicates(self):
-        """``enable_sequence_parallel=False`` is the pre-21a6cf8d behavior:
-        the output is always fully replicated, regardless of batch size."""
+        """``enable_sequence_parallel=False`` keeps the DP-only spec on dim 0
+        regardless of batch size — the pre-feature behavior."""
         mesh = _make_moe_mesh(ep_size=1, tp_size=_TP_SIZE)
         batch = _TP_SIZE * _MIN_LOCAL  # would otherwise scatter
         x, topk_weights, topk_ids = _make_moe_inputs(batch, self.HIDDEN_SIZE, self.NUM_EXPERTS)
@@ -218,7 +228,7 @@ class TestEPMoESequenceParallel(CustomTestCase):
             with jax.set_mesh(moe.moe_mesh):
                 out = moe(x, topk_weights, topk_ids)
 
-        self.assertIsNone(_spec_dim(out.sharding, 0))
+        self.assertEqual(_spec_dim(out.sharding, 0), "data")
 
     def _build_moe(self, mesh: Mesh, *, enable_sequence_parallel: bool) -> EPMoE:
         return EPMoE(
@@ -347,6 +357,110 @@ class TestGrokLayerSequenceParallelWiring(CustomTestCase):
                 kwargs_by_callee["Grok1MLP"],
                 "Grok1DecoderLayer must thread enable_sequence_parallel into Grok1MLP.",
             )
+
+
+def _make_dp_tp_mesh(dp_size: int, tp_size: int) -> Mesh:
+    """Make a ``(dp_size, tp_size)`` mesh with axis names ``("data", "tensor")``.
+
+    Used to exercise the DP+SP composition path where the scatter dim must
+    combine ``"data"`` (from DP) with ``"tensor"`` (from SP) instead of
+    clobbering the former.
+    """
+    devices = np.array(jax.devices()[: dp_size * tp_size]).reshape(dp_size, tp_size)
+    return Mesh(
+        devices,
+        axis_names=("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+    )
+
+
+class TestDpSpComposition(CustomTestCase):
+    """Verify scatter dim stripes across BOTH ``data`` and ``tensor`` under DP+SP.
+
+    The dp_size=1 tests above can't catch the wrong code path
+    ``out_specs[scatter_dim] = input_axis`` (clobbers ``"data"``) vs the
+    correct one ``out_specs[scatter_dim] = ("data", input_axis)`` (combines).
+    With dp_size>1 the difference becomes observable on the output sharding.
+    """
+
+    HIDDEN_SIZE = 512
+    INTERMEDIATE_DIM = 1024
+    NUM_EXPERTS = 4
+
+    @unittest.skipIf(_TOTAL_DEVICES < 8, "Needs >=8 devices for dp=2, tp=4.")
+    def test_quantized_linear_scatter_combines_data_and_tensor(self):
+        """SP firing under DP shards dim 0 across ``("data", "tensor")``."""
+        mesh = _make_dp_tp_mesh(dp_size=2, tp_size=4)
+        # Per-device local size after both splits must be >= _MIN_LOCAL for
+        # ``should_scatter`` to fire, so batch >= dp * tp * _MIN_LOCAL.
+        batch = 2 * 4 * _MIN_LOCAL
+        in_dim, out_dim = 256, 512
+        x_host, weight_q, weight_scale = _make_quant_linear_inputs(batch, in_dim, out_dim)
+
+        with jax.set_mesh(mesh):
+            ql_scatter = _build_quant_linear(
+                weight_q, weight_scale, mesh, output_scatter_dimension=0
+            )
+            ql_baseline = _build_quant_linear(
+                weight_q, weight_scale, mesh, output_scatter_dimension=None
+            )
+            x = jax.device_put(x_host, NamedSharding(mesh, P("data", "tensor")))
+            out_scatter, _ = ql_scatter(x)
+            out_baseline, _ = ql_baseline(x)
+
+        # The whole point of this test: dim 0 should stripe across BOTH axes,
+        # not have "data" replaced by "tensor".
+        self.assertEqual(_spec_dim(out_scatter.sharding, 0), ("data", "tensor"))
+        # Baseline keeps the DP-only sharding.
+        self.assertEqual(_spec_dim(out_baseline.sharding, 0), "data")
+
+        np.testing.assert_allclose(
+            _as_fp32(out_scatter), _as_fp32(out_baseline), rtol=0.05, atol=1.0
+        )
+
+    @unittest.skipIf(_TOTAL_DEVICES < 8, "Needs >=8 devices for dp=2, tp=4.")
+    def test_epmoe_seq_parallel_combines_data_and_tensor(self):
+        """SP firing inside EPMoE under DP preserves the scatter post-reshard.
+
+        With ep_size=1, ``EPMoE.tp_size`` collapses to ``world_size`` (= 8).
+        The post-shard_map reshard must target ``P(("data", "tensor"), None)``
+        on the original mesh; otherwise the SP scatter is all-gathered away
+        at the MoE→next-layer seam.
+        """
+        mesh = _make_dp_tp_mesh(dp_size=2, tp_size=4)
+        # EPMoE.tp_size = world_size / ep_size = 8 → SP threshold = 8 * 128.
+        batch = 8 * _MIN_LOCAL
+        x, topk_weights, topk_ids = _make_moe_inputs(
+            batch, self.HIDDEN_SIZE, self.NUM_EXPERTS
+        )
+
+        with jax.set_mesh(mesh):
+            moe_sp = self._build_moe(mesh, enable_sequence_parallel=True)
+            moe_base = self._build_moe(mesh, enable_sequence_parallel=False)
+            with jax.set_mesh(moe_sp.moe_mesh):
+                out_sp = moe_sp(x, topk_weights, topk_ids)
+                out_base = moe_base(x, topk_weights, topk_ids)
+
+        self.assertEqual(_spec_dim(out_sp.sharding, 0), ("data", "tensor"))
+        self.assertEqual(_spec_dim(out_base.sharding, 0), "data")
+
+        # See TestEPMoESequenceParallel for the noise-floor rationale (atol
+        # sized to bf16 reduction-order drift on tens-of-thousands magnitudes).
+        np.testing.assert_allclose(
+            _as_fp32(out_sp), _as_fp32(out_base), rtol=0.1, atol=2048.0
+        )
+
+    def _build_moe(self, mesh: Mesh, *, enable_sequence_parallel: bool) -> EPMoE:
+        return EPMoE(
+            hidden_size=self.HIDDEN_SIZE,
+            num_experts=self.NUM_EXPERTS,
+            num_experts_per_tok=1,
+            ep_size=1,
+            mesh=mesh,
+            intermediate_dim=self.INTERMEDIATE_DIM,
+            quantization_config=None,
+            enable_sequence_parallel=enable_sequence_parallel,
+        )
 
 
 if __name__ == "__main__":

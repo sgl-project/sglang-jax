@@ -10,7 +10,6 @@ from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
     get_safe_blockwise_tuned_value,
     should_use_blockwise_kernel,
 )
-from sgl_jax.srt.utils.parallel_utils import should_scatter
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor_simple
 
 
@@ -124,12 +123,12 @@ def xla_quantized_matmul_local(
             out = out.astype(compute_dtype) * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
 
     out = out.astype(out_dtype)
-    # Sum partial results across devices (single all-reduce)
+    # Reduce across the contracted (input) axis. Caller passes
+    # ``output_scatter_dimension`` only when it has already decided that a
+    # reduce-scatter on that dim is appropriate AND wired ``out_specs``
+    # accordingly; otherwise we do a plain all-reduce.
     if reduce_axis is not None:
-        mesh = jax.sharding.get_abstract_mesh()
-        if output_scatter_dimension is not None and should_scatter(
-            out.shape[output_scatter_dimension], mesh.shape[reduce_axis]
-        ):
+        if output_scatter_dimension is not None:
             out = lax.psum_scatter(
                 out, axis_name=reduce_axis, scatter_dimension=output_scatter_dimension, tiled=True
             )

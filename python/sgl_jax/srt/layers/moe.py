@@ -1,5 +1,7 @@
 """GMM-based Expert-Parallel MoE layer and weight mapping utilities."""
 
+from functools import partial
+
 import jax
 from flax import nnx
 from jax import numpy as jnp
@@ -407,6 +409,20 @@ class EPMoE(nnx.Module):
         # Activation quantization is now handled per-GEMM inside _gmm_compute
         # (aligned with sglang-gpu scheme: quantize before each GEMM, dequantize after)
 
+        # Decide once whether SP should reduce-scatter the post-MoE result.
+        # Three things downstream consume this: the shard_map ``out_specs``,
+        # ``_forward``'s ``psum`` vs ``psum_scatter`` choice, and the
+        # post-shard_map reshard back to the original mesh. They MUST agree
+        # — if they ever diverge, ``out_specs`` lies about what the kernel
+        # produced and shard_map concatenates duplicates (see the bug fixed
+        # in ``QuantizedLinear``). Safe today only because input is
+        # pre-replicated to ``P(None)``; hoisting the decision keeps it safe
+        # if that ever changes.
+        do_scatter = (
+            self.enable_sequence_parallel
+            and should_scatter(hidden_states.shape[0], self.tp_size)
+        )
+
         # Run MoE computation on the expert-parallel mesh
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
@@ -430,14 +446,9 @@ class EPMoE(nnx.Module):
                 scale_name="wo_scale",
             )
 
-            if self.enable_sequence_parallel and should_scatter(
-                hidden_states.shape[0], self.tp_size
-            ):
-                out_specs = P("tensor", None)
-            else:
-                out_specs = P(None)
+            out_specs = P("tensor", None) if do_scatter else P(None)
             result = shard_map(
-                self._forward,
+                partial(self._forward, do_scatter=do_scatter),
                 mesh=self.moe_mesh,
                 in_specs=(
                     P(None),
@@ -473,18 +484,12 @@ class EPMoE(nnx.Module):
                 None,
             )
 
-        # Reshard result back to original mesh.
-        # When sequence parallel is on AND the scatter fired inside shard_map,
-        # the token dim is already striped across the moe_mesh "tensor" axis;
-        # preserve that by also striping it across the original mesh's
-        # ("data", "tensor") so the next decoder layer keeps the SP shard.
-        # Otherwise fall back to DP-only sharding on "data".
-        if self.enable_sequence_parallel and should_scatter(
-            hidden_states.shape[0], self.tp_size
-        ):
-            token_axis = ("data", "tensor")
-        else:
-            token_axis = "data"
+        # Reshard result back to original mesh. When the scatter fired inside
+        # shard_map the token dim is already striped across moe_mesh's
+        # "tensor" axis; preserve that by combining ``"data"`` with
+        # ``"tensor"`` on the original mesh so the next decoder layer keeps
+        # the SP shard. Otherwise fall back to DP-only on ``"data"``.
+        token_axis = ("data", "tensor") if do_scatter else "data"
         out_pspec = P(token_axis, *([None] * (result.ndim - 1)))
         return jax.sharding.reshard(result, jax.sharding.NamedSharding(self.mesh, out_pspec))
 
@@ -502,6 +507,8 @@ class EPMoE(nnx.Module):
         w0_kernel_bias=None,
         w1_kernel_bias=None,
         wo_kernel_bias=None,
+        *,
+        do_scatter: bool = False,
     ):
         expert_shard_id = jax.lax.axis_index("expert")
 
@@ -546,8 +553,10 @@ class EPMoE(nnx.Module):
 
         # All-reduce after unpermute: communication volume is (T, hidden_size)
         # instead of (T * top_k, hidden_size), reducing by a factor of top_k.
+        # ``do_scatter`` is decided once in ``__call__`` so this branch and
+        # the outer ``out_specs`` can never disagree.
         if self.tp_size > 1:
-            if self.enable_sequence_parallel and should_scatter(output.shape[0], self.tp_size):
+            if do_scatter:
                 # scatter on sequence/token dimension
                 output = jax.lax.psum_scatter(output, "tensor", scatter_dimension=0, tiled=True)
             else:

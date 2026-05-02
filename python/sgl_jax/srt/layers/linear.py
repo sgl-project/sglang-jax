@@ -11,7 +11,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import expand_block_scale
 from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
-from sgl_jax.srt.utils.parallel_utils import should_scatter
+from sgl_jax.srt.utils.parallel_utils import prepare_scattered_spec_if_needed
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
@@ -338,26 +338,19 @@ class QuantizedLinear(nnx.Module):
 
         out_specs = P("data", output_axis)
 
-        if self.output_scatter_dimension is not None and should_scatter(
-            x.shape[self.output_scatter_dimension], self.mesh.shape[input_axis]
-        ):
-            # Stack ``input_axis`` on top of any existing partition (e.g.
-            # ``"data"`` from DP) on the scatter dim so DP+SP compose. Each
-            # (dp, tp) rank then owns 1/(dp*tp) of that dim.
-            #
-            existing = out_specs[self.output_scatter_dimension]
-            if existing is None:
-                combined = input_axis
-            elif isinstance(existing, tuple):
-                combined = existing + (input_axis,)
-            else:
-                combined = (existing, input_axis)
-            out_specs = P(
-                *(
-                    combined if i == self.output_scatter_dimension else axis
-                    for i, axis in enumerate(out_specs)
-                )
+        # When ``output_scatter_dimension`` is set, stack ``input_axis`` onto
+        # whatever already partitions that dim (e.g. ``"data"`` from DP) so
+        # DP+SP compose. 
+        if self.output_scatter_dimension is not None:
+            out_specs, do_scatter = prepare_scattered_spec_if_needed(
+                out_specs,
+                self.output_scatter_dimension,
+                scatter_axis=input_axis,
+                full_dim_size=x.shape[self.output_scatter_dimension],
+                mesh=self.mesh,
             )
+        else:
+            do_scatter = False
 
         output = shard_map(
             partial(
@@ -367,7 +360,9 @@ class QuantizedLinear(nnx.Module):
                 compute_dtype=self.compute_dtype,
                 weight_block_size=self.weight_block_size,
                 activation_quant_dtype=self.activation_dtype,
-                output_scatter_dimension=self.output_scatter_dimension,
+                # Pass the dim only when we've actually decided to scatter,
+                # so the kernel doesn't need to second-guess us.
+                output_scatter_dimension=self.output_scatter_dimension if do_scatter else None,
             ),
             mesh=self.mesh,
             in_specs=in_specs,
