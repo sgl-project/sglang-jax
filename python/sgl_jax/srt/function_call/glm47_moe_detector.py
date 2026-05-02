@@ -785,3 +785,6 @@ class Glm47MoeDetector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError()
+
+    def build_ebnf(self, tools: List[Tool]) -> str:
+        raise NotImplementedError()
