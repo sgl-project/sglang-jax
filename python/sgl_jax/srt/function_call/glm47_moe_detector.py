@@ -240,7 +240,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                 calls.extend(self.parse_base_json(match_result, tools))
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
-            logger.error(f"Error in detect_and_parse: {e}", exc_info=True)
+            logger.exception("Error in detect_and_parse: %s", e)
             # return the normal text if parsing fails
             return StreamingParseResult(normal_text=text)
 
@@ -317,7 +317,7 @@ class Glm47MoeDetector(BaseFormatDetector):
             except (ValueError, AttributeError):
                 # Fallback to string if not a valid number
                 logger.warning(
-                    f"Failed to parse '{value}' as number, treating as string"
+                    "Failed to parse '%s' as number, treating as string", value
                 )
                 return json.dumps(str(value) if value else "", ensure_ascii=False)
         else:
@@ -602,7 +602,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                         "arguments"
                     ] = arguments
             except Exception as e:
-                logger.debug(f"Failed to parse arguments: {e}", exc_info=True)
+                logger.debug("Failed to parse arguments: %s", e, exc_info=True)
 
         # Clean buffer
         self._buffer = current_text[match_end_pos:]
@@ -738,7 +738,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                     return StreamingParseResult(normal_text=normal_text, calls=calls)
 
         except Exception as e:
-            logger.error(f"Error in parse_streaming_increment: {e}", exc_info=True)
+            logger.exception("Error in parse_streaming_increment: %s", e)
             return StreamingParseResult(normal_text=current_text)
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
