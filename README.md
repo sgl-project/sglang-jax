@@ -57,7 +57,7 @@ SGL-JAX is designed for easy extension to new model architectures. It currently 
 -   **GLM-4 MoE**
 -   **Grok-2**
 -   **Bailing MoE** / **Bailing MoE V2**
--   **MiMo-7B** (supports Eagle speculative decoding)
+-   **MiMo-7B**
 -   **MiMo-V2-Flash**
 -   **MiMo-V2.5-Pro**
 
