@@ -41,16 +41,11 @@ class BaseReasoningFormatDetector:
 
         if self.think_end_token not in processed_text:
             # Check for tool_start_token interruption
-            if (
-                self.tool_start_token is not None
-                and self.tool_start_token in processed_text
-            ):
+            if self.tool_start_token is not None and self.tool_start_token in processed_text:
                 tool_idx = processed_text.find(self.tool_start_token)
                 reasoning_text = processed_text[:tool_idx].strip()
                 normal_text = processed_text[tool_idx:]
-                return StreamingParseResult(
-                    normal_text=normal_text, reasoning_text=reasoning_text
-                )
+                return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text)
             # Assume reasoning was truncated before `</think>` token
             return StreamingParseResult(reasoning_text=processed_text)
 
@@ -79,8 +74,7 @@ class BaseReasoningFormatDetector:
         if self.tool_start_token:
             tokens_to_check.append(self.tool_start_token)
         if any(
-            token.startswith(current_text) and token != current_text
-            for token in tokens_to_check
+            token.startswith(current_text) and token != current_text for token in tokens_to_check
         ):
             return StreamingParseResult()
 
@@ -113,9 +107,7 @@ class BaseReasoningFormatDetector:
                 normal_text = current_text[tool_idx:]
                 self._buffer = ""
                 self._in_reasoning = False
-                return StreamingParseResult(
-                    normal_text=normal_text, reasoning_text=reasoning_text
-                )
+                return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text)
             if self.stream_reasoning:
                 # Stream the content immediately
                 self._buffer = ""

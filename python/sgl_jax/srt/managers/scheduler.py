@@ -2,8 +2,8 @@
 
 import concurrent.futures as futures
 import dataclasses
-import json
 import faulthandler
+import json
 import logging
 import os
 import pickle

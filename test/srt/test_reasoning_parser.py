@@ -7,7 +7,9 @@ from sgl_jax.test.test_utils import CustomTestCase
 class TestReasoningParserGlm(CustomTestCase):
     def test_glm47_reasoning(self):
         parser = ReasoningParser(model_type="glm47")
-        reasoning, normal = parser.parse_non_stream("<think>this is reasoning</think>this is normal")
+        reasoning, normal = parser.parse_non_stream(
+            "<think>this is reasoning</think>this is normal"
+        )
         self.assertEqual(reasoning, "this is reasoning")
         self.assertEqual(normal, "this is normal")
 

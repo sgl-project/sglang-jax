@@ -3,7 +3,7 @@ import json
 import logging
 import re
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from sgl_jax.srt.entrypoints.openai.protocol import Tool
 from sgl_jax.srt.function_call.base_format_detector import BaseFormatDetector
@@ -27,9 +27,7 @@ class StreamState(str, Enum):
     IN_VALUE = "IN_VALUE"
 
 
-def get_argument_type(
-    func_name: str, arg_key: str, defined_tools: List[Tool]
-) -> Optional[str]:
+def get_argument_type(func_name: str, arg_key: str, defined_tools: list[Tool]) -> str | None:
     """Get the expected type of a function argument from tool definitions.
 
     Supports complex JSON Schema definitions including:
@@ -91,9 +89,7 @@ def _convert_to_number(value: str) -> Any:
         return value
 
 
-def parse_arguments(
-    json_value: str, arg_type: Optional[str] = None
-) -> Tuple[Any, bool]:
+def parse_arguments(json_value: str, arg_type: str | None = None) -> tuple[Any, bool]:
     """Parse argument value with multiple fallback strategies.
 
     Args:
@@ -166,9 +162,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         self.current_tool_name_sent = False
         self._streamed_raw_length = 0
         self._tool_call_completed = False  # Track if tool call has been completed
-        self._sent_empty_object = (
-            False  # Track if empty object has been sent for no-arg functions
-        )
+        self._sent_empty_object = False  # Track if empty object has been sent for no-arg functions
         self._reset_streaming_state()
 
     def _reset_streaming_state(self) -> None:
@@ -179,9 +173,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         self._xml_tag_buffer = ""
         self._is_first_param = True
         self._value_started = False
-        self._cached_value_type: Optional[str] = (
-            None  # Cache the value type for consistency
-        )
+        self._cached_value_type: str | None = None  # Cache the value type for consistency
         self._tool_call_completed = False  # Reset tool call completion status
         self._sent_empty_object = False  # Reset empty object sent status
 
@@ -189,7 +181,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
         return self.bot_token in text
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
 
@@ -244,7 +236,7 @@ class Glm47MoeDetector(BaseFormatDetector):
             # return the normal text if parsing fails
             return StreamingParseResult(normal_text=text)
 
-    def _get_value_type(self, func_name: str, key: str, tools: List[Tool]) -> str:
+    def _get_value_type(self, func_name: str, key: str, tools: list[Tool]) -> str:
         """Get parameter type from tool definition, with fallback to auto-detection.
 
         Args:
@@ -278,9 +270,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                 return "number"
             # For string values, check if they look like numbers
             elif isinstance(parsed, str):
-                if parsed.isdigit() or (
-                    parsed.startswith("-") and parsed[1:].isdigit()
-                ):
+                if parsed.isdigit() or (parsed.startswith("-") and parsed[1:].isdigit()):
                     return "number"
                 return "string"
         except json.JSONDecodeError:
@@ -316,16 +306,14 @@ class Glm47MoeDetector(BaseFormatDetector):
                 return str(num)
             except (ValueError, AttributeError):
                 # Fallback to string if not a valid number
-                logger.warning(
-                    "Failed to parse '%s' as number, treating as string", value
-                )
+                logger.warning("Failed to parse '%s' as number, treating as string", value)
                 return json.dumps(str(value) if value else "", ensure_ascii=False)
         else:
             # For object/array types, return as-is (should already be valid JSON)
             return value
 
     def _process_xml_to_json_streaming(
-        self, raw_increment: str, func_name: str, tools: List[Tool]
+        self, raw_increment: str, func_name: str, tools: list[Tool]
     ) -> str:
         """Convert XML increment to JSON streaming output using state machine.
 
@@ -359,9 +347,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                     self._current_key = self._xml_tag_buffer[:-10].strip()
                     self._xml_tag_buffer = ""
                     self._stream_state = StreamState.WAITING_VALUE
-                    json_output += (
-                        json.dumps(self._current_key, ensure_ascii=False) + ": "
-                    )
+                    json_output += json.dumps(self._current_key, ensure_ascii=False) + ": "
 
             elif self._stream_state == StreamState.WAITING_VALUE:
                 if self._xml_tag_buffer.endswith("<arg_value>"):
@@ -386,9 +372,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                         # Output any remaining content
                         if final_value:
                             if value_type == "string":
-                                json_output += json.dumps(
-                                    final_value, ensure_ascii=False
-                                )[1:-1]
+                                json_output += json.dumps(final_value, ensure_ascii=False)[1:-1]
                             else:
                                 json_output += final_value
                         # Always output closing quote for string type when value was started
@@ -396,9 +380,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                             json_output += '"'
                     else:
                         # Value was never started (empty or complete in one chunk)
-                        json_output += self._format_value_complete(
-                            self._current_value, value_type
-                        )
+                        json_output += self._format_value_complete(self._current_value, value_type)
 
                     self._xml_tag_buffer = ""
                     self._stream_state = StreamState.BETWEEN
@@ -421,9 +403,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                                 json_output += '"'
                                 self._value_started = True
                             if content:
-                                json_output += json.dumps(content, ensure_ascii=False)[
-                                    1:-1
-                                ]
+                                json_output += json.dumps(content, ensure_ascii=False)[1:-1]
                                 self._current_value += content
                                 self._xml_tag_buffer = ""
                         elif value_type == "number":
@@ -460,7 +440,7 @@ class Glm47MoeDetector(BaseFormatDetector):
 
     def _send_tool_name_if_needed(
         self, func_name: str, has_arg_key: bool, is_tool_end: str
-    ) -> Optional[ToolCallItem]:
+    ) -> ToolCallItem | None:
         """Send tool name if needed.
 
         Args:
@@ -502,8 +482,8 @@ class Glm47MoeDetector(BaseFormatDetector):
         )
 
     def _process_arguments_streaming(
-        self, func_name: str, func_args_raw: str, tools: List[Tool]
-    ) -> Optional[ToolCallItem]:
+        self, func_name: str, func_args_raw: str, tools: list[Tool]
+    ) -> ToolCallItem | None:
         """Process streaming arguments.
 
         Args:
@@ -523,9 +503,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         raw_increment = func_args_raw[self._streamed_raw_length :]
 
         # Convert XML to JSON using state machine
-        json_increment = self._process_xml_to_json_streaming(
-            raw_increment, func_name, tools
-        )
+        json_increment = self._process_xml_to_json_streaming(raw_increment, func_name, tools)
 
         # CRITICAL: Update streamed length BEFORE early return
         # Even if json_increment is empty, the input has been consumed by the state machine
@@ -548,10 +526,10 @@ class Glm47MoeDetector(BaseFormatDetector):
         self,
         func_name: str,
         func_args_raw: str,
-        tools: List[Tool],
+        tools: list[Tool],
         match_end_pos: int,
         current_text: str,
-    ) -> List[ToolCallItem]:
+    ) -> list[ToolCallItem]:
         """Complete tool call processing.
 
         Args:
@@ -598,9 +576,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                 pairs = self.func_arg_regex.findall(func_args_raw)
                 if pairs:
                     arguments = self._parse_argument_pairs(pairs, func_name, tools)
-                    self.prev_tool_call_arr[self.current_tool_id][
-                        "arguments"
-                    ] = arguments
+                    self.prev_tool_call_arr[self.current_tool_id]["arguments"] = arguments
             except Exception as e:
                 logger.debug("Failed to parse arguments: %s", e, exc_info=True)
 
@@ -617,9 +593,7 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         return calls
 
-    def parse_streaming_increment(
-        self, new_text: str, tools: List[Tool]
-    ) -> StreamingParseResult:
+    def parse_streaming_increment(self, new_text: str, tools: list[Tool]) -> StreamingParseResult:
         """
         Streaming incremental parsing tool calls for GLM-4.5 and GLM-4.6 format.
         Uses a state machine to convert XML to JSON incrementally for true character-by-character streaming.
@@ -679,9 +653,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                 return StreamingParseResult(normal_text=normal_text, calls=[])
 
             # Extract match groups using helper method
-            func_name, func_args_raw, is_tool_end = self._extract_match_groups(
-                partial_match
-            )
+            func_name, func_args_raw, is_tool_end = self._extract_match_groups(partial_match)
 
             # Initialize tool call state if needed (keeping existing logic)
             if self.current_tool_id == -1:
@@ -711,17 +683,13 @@ class Glm47MoeDetector(BaseFormatDetector):
             has_arg_key = "<arg_key" in current_text
 
             # Send tool name if needed
-            tool_name_item = self._send_tool_name_if_needed(
-                func_name, has_arg_key, is_tool_end
-            )
+            tool_name_item = self._send_tool_name_if_needed(func_name, has_arg_key, is_tool_end)
             if tool_name_item:
                 calls.append(tool_name_item)
 
             # Process streaming arguments if tool name has been sent
             if self.current_tool_name_sent:
-                arg_item = self._process_arguments_streaming(
-                    func_name, func_args_raw, tools
-                )
+                arg_item = self._process_arguments_streaming(func_name, func_args_raw, tools)
                 if arg_item:
                     calls.append(arg_item)
 
@@ -744,8 +712,8 @@ class Glm47MoeDetector(BaseFormatDetector):
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def _parse_argument_pairs(
-        self, pairs: List[Tuple[str, str]], func_name: str, tools: List[Tool]
-    ) -> Dict[str, Any]:
+        self, pairs: list[tuple[str, str]], func_name: str, tools: list[Tool]
+    ) -> dict[str, Any]:
         """Parse argument key-value pairs with type coercion.
 
         Args:
@@ -786,5 +754,5 @@ class Glm47MoeDetector(BaseFormatDetector):
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError()
 
-    def build_ebnf(self, tools: List[Tool]) -> str:
+    def build_ebnf(self, tools: list[Tool]) -> str:
         raise NotImplementedError()

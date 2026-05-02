@@ -1,6 +1,6 @@
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Literal
 
 import orjson
 import partial_json_parser
@@ -143,7 +143,7 @@ def get_json_schema_constraint(
     return None
 
 
-def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
+def infer_type_from_json_schema(schema: dict[str, Any]) -> str | None:
     """
     Infer the primary type of a parameter from JSON Schema.
 
