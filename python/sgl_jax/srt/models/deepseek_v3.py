@@ -310,8 +310,6 @@ class DeepseekV3Attention(nnx.Module):
             raw_weight = self.kv_b_proj.weight.value
         else:
             # QuantizedLinear: weight_q is [n_h * (qk_nope+v), kv_lora_rank] (transposed).
-            # weight_scale is [in_blocks, 1, n_out] (block-wise) or [n_out] (per-channel).
-            # Dequantize back to bf16 then transpose to [kv_lora_rank, n_h * (qk_nope+v)].
             wq = self.kv_b_proj.weight_q.value   # [out, in]
             ws = self.kv_b_proj.weight_scale.value
             wq_f32 = wq.T.astype(jnp.float32)    # [in, out]
