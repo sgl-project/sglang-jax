@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
+from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.utils.common_utils import pad_to_bucket
 
 
@@ -147,6 +148,98 @@ class TestLazyCompilation(unittest.TestCase):
         assert cm.is_new_variant(key1) is True
         assert cm.is_new_variant(key2) is True
         assert cm.is_new_variant(key1) is False
+
+
+class TestDummyBatch(unittest.TestCase):
+    """Verify _make_dummy_batch produces correct shapes and metadata."""
+
+    def setUp(self):
+        self.cm = CompilationManager(
+            server_args=_make_server_args(),
+            max_padded_batch_size=128,
+            max_padded_num_tokens=2048,
+            dp_size=1,
+            tp_size=4,
+            page_size=128,
+            max_req_len=4096,
+            vocab_size=32000,
+        )
+
+    def test_extend_batch_shapes(self):
+        bs, num_tokens = 32, 256
+        cache_loc_size = 1024
+        batch = self.cm._make_dummy_batch(bs, num_tokens, ForwardMode.EXTEND, cache_loc_size)
+        assert batch.forward_mode == ForwardMode.EXTEND
+        assert batch.real_bs == bs
+        assert batch.real_input_ids_len == bs
+        assert batch.input_ids.shape == (num_tokens,)
+        assert batch.out_cache_loc.shape == (num_tokens,)
+        assert batch.positions.shape == (num_tokens,)
+        assert batch.cache_loc.shape == (cache_loc_size,)
+        assert batch.req_pool_indices.shape == (bs,)
+        assert batch.seq_lens.shape == (bs,)
+        assert batch.extend_seq_lens is not None
+        assert batch.extend_seq_lens.shape == (bs,)
+        assert batch.extend_prefix_lens.shape == (bs,)
+        assert batch.logits_indices.shape == (bs,)
+        assert batch.capture_hidden_mode == CaptureHiddenMode.NULL
+
+    def test_decode_batch_shapes(self):
+        bs = 64
+        cache_loc_size = 2048
+        batch = self.cm._make_dummy_batch(bs, bs, ForwardMode.DECODE, cache_loc_size)
+        assert batch.forward_mode == ForwardMode.DECODE
+        assert batch.real_bs == bs
+        assert batch.input_ids.shape == (bs,)
+        assert batch.out_cache_loc.shape == (bs,)
+        assert batch.positions.shape == (bs,)
+        assert batch.cache_loc.shape == (cache_loc_size,)
+        assert batch.extend_seq_lens is None
+        assert batch.extend_prefix_lens is None
+        assert batch.logits_indices is None
+
+    def test_dp_metadata(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(),
+            max_padded_batch_size=64,
+            max_padded_num_tokens=1024,
+            dp_size=4,
+            tp_size=4,
+            page_size=128,
+            max_req_len=4096,
+            vocab_size=32000,
+        )
+        bs = 64
+        batch = cm._make_dummy_batch(
+            bs,
+            bs,
+            ForwardMode.DECODE,
+            2048,
+            dp_size=4,
+            per_dp_bs_size=16,
+        )
+        assert batch.dp_size == 4
+        assert batch.per_dp_bs_size == 16
+        assert batch.real_bs_per_dp == [64, 64, 64, 64]
+
+    def test_multimodal_capture_hidden(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(),
+            max_padded_batch_size=32,
+            max_padded_num_tokens=512,
+            dp_size=1,
+            tp_size=4,
+            page_size=128,
+            max_req_len=4096,
+            vocab_size=32000,
+            multimodal=True,
+        )
+        batch = cm._make_dummy_batch(32, 128, ForwardMode.EXTEND, 512)
+        assert batch.capture_hidden_mode == CaptureHiddenMode.FULL
+
+    def test_invalid_cache_loc_raises(self):
+        with self.assertRaises(ValueError):
+            self.cm._make_dummy_batch(64, 128, ForwardMode.EXTEND, 32)
 
 
 if __name__ == "__main__":

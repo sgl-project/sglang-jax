@@ -11,13 +11,10 @@ from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import
 )
 from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
 from sgl_jax.srt.layers.radix_attention import RadixAttention
-from sgl_jax.srt.managers.schedule_batch import (
-    PADDING_BUCKETS,
-    ModelWorkerBatch,
-    find_padding_size,
-)
+from sgl_jax.srt.managers.schedule_batch import PADDING_BUCKETS, ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.utils.common_utils import pad_to_bucket
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import CustomTestCase
 
@@ -93,8 +90,8 @@ def create_test_data(
         max_tokens_per_dp = max(max_tokens_per_dp, dp_tokens)
         max_bs_per_dp = max(max_bs_per_dp, len(reqs))
 
-    per_dp_token_padding, _ = find_padding_size(max_tokens_per_dp, PADDING_BUCKETS)
-    per_dp_bs_padding, _ = find_padding_size(max_bs_per_dp, [1, 2, 4, 8, 16, 32, 64])
+    per_dp_token_padding, _ = pad_to_bucket(max_tokens_per_dp, PADDING_BUCKETS)
+    per_dp_bs_padding, _ = pad_to_bucket(max_bs_per_dp, [1, 2, 4, 8, 16, 32, 64])
 
     total_token_size = per_dp_token_padding * dp_size
     total_bs = per_dp_bs_padding * dp_size
@@ -246,7 +243,7 @@ def create_test_data(
 
     # 5. Build Final Batch Objects
     max_loc_len = max(len(locs) for locs in dp_cache_locs_flat)
-    per_dp_cache_loc_size, _ = find_padding_size(max_loc_len, PADDING_BUCKETS)
+    per_dp_cache_loc_size, _ = pad_to_bucket(max_loc_len, PADDING_BUCKETS)
     cache_loc_cpu = np.zeros(per_dp_cache_loc_size * dp_size, dtype=np.int32)
     for r, locs in enumerate(dp_cache_locs_flat):
         cache_loc_cpu[r * per_dp_cache_loc_size : r * per_dp_cache_loc_size + len(locs)] = locs

@@ -52,6 +52,7 @@ def pad_to_bucket(value: int, buckets: list[int]) -> tuple[int, int]:
     Raises:
         ValueError: If value exceeds all buckets.
     """
+    assert buckets == sorted(buckets), f"buckets must be sorted, got {buckets}"
     idx = bisect.bisect_left(buckets, value)
     if idx < len(buckets):
         return buckets[idx], idx
