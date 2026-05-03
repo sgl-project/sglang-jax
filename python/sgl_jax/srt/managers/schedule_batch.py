@@ -2568,31 +2568,6 @@ def _compute_mrope_positions_for_batch(
     return mrope_positions
 
 
-def pad_array_to_size(
-    arr: np.ndarray, target_size: int, pad_value: int = 0, dtype: np.dtype = None
-) -> np.ndarray:
-    """Pad numpy array to target size.
-
-    Args:
-        arr: Array to pad
-        target_size: Target size after padding
-        pad_value: Value to use for padding
-        dtype: Data type for padding values (defaults to arr.dtype)
-
-    Returns:
-        Padded array
-    """
-    if len(arr) >= target_size:
-        return arr
-
-    if dtype is None:
-        dtype = arr.dtype
-
-    padding_size = target_size - len(arr)
-    padding = np.array([pad_value] * padding_size, dtype=dtype)
-    return np.concatenate([arr, padding], axis=0)
-
-
 @dataclasses.dataclass
 class ModelWorkerSamplingInfo:
     """Unified sampling information for a generation batch."""
