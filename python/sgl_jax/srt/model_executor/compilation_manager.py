@@ -94,13 +94,6 @@ class CompilationManager:
         pages_per_req = (self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
         return [bs * pages_per_req for bs in self.bs_buckets]
 
-    @staticmethod
-    def pad_to_bucket(value: int, buckets: list[int]) -> int:
-        for b in buckets:
-            if b >= value:
-                return b
-        return buckets[-1] if buckets else value
-
     # ---- Pre-compilation ----
 
     def precompile_all(

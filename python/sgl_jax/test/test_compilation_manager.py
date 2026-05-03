@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
+from sgl_jax.srt.utils.common_utils import pad_to_bucket
 
 
 def _make_server_args(**overrides):
@@ -89,11 +90,12 @@ class TestBucketComputation(unittest.TestCase):
 
     def test_pad_to_bucket(self):
         buckets = [64, 128, 256, 512]
-        assert CompilationManager.pad_to_bucket(1, buckets) == 64
-        assert CompilationManager.pad_to_bucket(64, buckets) == 64
-        assert CompilationManager.pad_to_bucket(65, buckets) == 128
-        assert CompilationManager.pad_to_bucket(500, buckets) == 512
-        assert CompilationManager.pad_to_bucket(999, buckets) == 512
+        assert pad_to_bucket(1, buckets) == (64, 0)
+        assert pad_to_bucket(64, buckets) == (64, 0)
+        assert pad_to_bucket(65, buckets) == (128, 1)
+        assert pad_to_bucket(500, buckets) == (512, 3)
+        with self.assertRaises(ValueError):
+            pad_to_bucket(999, buckets)
 
     def test_user_specified_paddings(self):
         cm = CompilationManager(
