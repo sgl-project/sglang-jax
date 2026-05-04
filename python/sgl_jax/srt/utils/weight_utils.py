@@ -37,12 +37,14 @@ if not hasattr(np, "float8_e5m2"):
     np.float8_e5m2 = ml_dtypes.float8_e5m2
 
 
-def _view_as_fp8_if_needed(data: np.ndarray, target_dtype: jnp.dtype) -> np.ndarray:
+def _reinterpret_dtype_if_needed(data: np.ndarray, target_dtype: jnp.dtype) -> np.ndarray:
     if data.dtype == np.uint8:
         if target_dtype == jnp.float8_e4m3fn:
             return data.view(ml_dtypes.float8_e4m3fn)
         elif target_dtype == jnp.float8_e5m2:
             return data.view(ml_dtypes.float8_e5m2)
+    elif data.dtype == np.dtype("V2"):
+        return data.view(ml_dtypes.bfloat16)
     return data
 
 
@@ -1062,7 +1064,7 @@ class WeightLoader:
                 def _load_slice(index):
                     f = fm.get_handle(fname)
                     data = f.get_slice(hf_key)[index]
-                    return _view_as_fp8_if_needed(data, target_dtype)
+                    return _reinterpret_dtype_if_needed(data, target_dtype)
 
                 return _load_slice
 
@@ -1168,7 +1170,7 @@ class WeightLoader:
             else:
                 # Cross-file boundary (rare if TP matches), needs stitching
                 result = np.concatenate(collected_chunks, axis=concat_axis)
-            return _view_as_fp8_if_needed(result, target_dtype)
+            return _reinterpret_dtype_if_needed(result, target_dtype)
 
         return jax.make_array_from_callback(global_shape, sharding, _smart_load_slice).astype(
             target_dtype
@@ -1267,7 +1269,7 @@ class WeightLoader:
                 result = np.concatenate(collected_chunks, axis=concat_axis)
             else:
                 result = collected_chunks[0]
-            result = _view_as_fp8_if_needed(result, target_dtype)
+            result = _reinterpret_dtype_if_needed(result, target_dtype)
             return result
 
         MAX_WORKERS = 128
@@ -1480,7 +1482,7 @@ class WeightLoader:
                 first_chunk = first_f.get_slice(first_hf_key)[inner_slice]
                 _t_getslice = time.monotonic() - _t1
                 _t2 = time.monotonic()
-                first_chunk = _view_as_fp8_if_needed(first_chunk, target_dtype)
+                first_chunk = _reinterpret_dtype_if_needed(first_chunk, target_dtype)
                 _t_fp8 = time.monotonic() - _t2
                 _t_transpose = 0.0
             else:
@@ -1488,7 +1490,7 @@ class WeightLoader:
                 data = first_f.get_slice(first_hf_key)[:]
                 _t_getslice = time.monotonic() - _t1
                 _t2 = time.monotonic()
-                data = _view_as_fp8_if_needed(data, target_dtype)
+                data = _reinterpret_dtype_if_needed(data, target_dtype)
                 _t_fp8 = time.monotonic() - _t2
                 _t3 = time.monotonic()
                 first_chunk = np.transpose(data)[inner_slice]
@@ -1547,7 +1549,7 @@ class WeightLoader:
                     chunk = f.get_slice(hf_k)[inner_slice]
                     t_c = time.monotonic()
                     _thread_stats["get_slice"].append(t_c - t_b)
-                    chunk = _view_as_fp8_if_needed(chunk, target_dtype)
+                    chunk = _reinterpret_dtype_if_needed(chunk, target_dtype)
                     t_d = time.monotonic()
                     _thread_stats["fp8"].append(t_d - t_c)
                     _thread_stats["transpose"].append(0.0)
@@ -1555,7 +1557,7 @@ class WeightLoader:
                     data = f.get_slice(hf_k)[:]
                     t_c = time.monotonic()
                     _thread_stats["get_slice"].append(t_c - t_b)
-                    data = _view_as_fp8_if_needed(data, target_dtype)
+                    data = _reinterpret_dtype_if_needed(data, target_dtype)
                     t_d = time.monotonic()
                     _thread_stats["fp8"].append(t_d - t_c)
                     chunk = np.transpose(data)[inner_slice]
@@ -1707,7 +1709,7 @@ class WeightLoader:
                         else p
                     )
                     shard[pos] = expert_data_map[log_idx]
-                shard = _view_as_fp8_if_needed(shard, target_dtype)
+                shard = _reinterpret_dtype_if_needed(shard, target_dtype)
                 return jax.device_put(shard, dev)
 
             with ThreadPoolExecutor(max_workers=n_local) as ex:
