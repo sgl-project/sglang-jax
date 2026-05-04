@@ -188,13 +188,13 @@ class KimiDetector(BaseReasoningFormatDetector):
         )
 
 
-class Glm47Detector(BaseReasoningFormatDetector):
+class Glm45Detector(BaseReasoningFormatDetector):
     """
-    Detector for GLM-4.7 models.
+    Detector for GLM-4.5 / 4.6 / 4.7 models.
     Assumes reasoning format:
       (<think>)*(.*)</think>
 
-    GLM-4.7 uses `<tool_call>` as the tool start token to switch from reasoning mode to normal mode.
+    GLM models use `<tool_call>` as the tool start token to switch from reasoning mode to normal mode.
 
     Args:
         stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
@@ -227,7 +227,7 @@ class ReasoningParser:
         "qwen3": Qwen3Detector,
         "mimo": Qwen3Detector,
         "kimi": KimiDetector,
-        "glm47": Glm47Detector,
+        "glm45": Glm45Detector,
     }
 
     def __init__(self, model_type: str | None = None, stream_reasoning: bool = True):
