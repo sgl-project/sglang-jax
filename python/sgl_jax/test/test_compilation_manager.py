@@ -117,7 +117,7 @@ class TestBucketComputation(unittest.TestCase):
 
 
 class TestLazyCompilation(unittest.TestCase):
-    def test_is_new_variant_first_time(self):
+    def test_register_variant_if_new_first_time(self):
         cm = CompilationManager(
             server_args=_make_server_args(),
             max_padded_batch_size=128,
@@ -129,8 +129,8 @@ class TestLazyCompilation(unittest.TestCase):
             vocab_size=32000,
         )
         key = ("DECODE", 128, 128, True)
-        assert cm.is_new_variant(key) is True
-        assert cm.is_new_variant(key) is False
+        assert cm.register_variant_if_new(key) is True
+        assert cm.register_variant_if_new(key) is False
 
     def test_different_variants_are_independent(self):
         cm = CompilationManager(
@@ -145,9 +145,9 @@ class TestLazyCompilation(unittest.TestCase):
         )
         key1 = ("DECODE", 128, 128, False)
         key2 = ("DECODE", 128, 128, True)
-        assert cm.is_new_variant(key1) is True
-        assert cm.is_new_variant(key2) is True
-        assert cm.is_new_variant(key1) is False
+        assert cm.register_variant_if_new(key1) is True
+        assert cm.register_variant_if_new(key2) is True
+        assert cm.register_variant_if_new(key1) is False
 
 
 class TestDummyBatch(unittest.TestCase):

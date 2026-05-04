@@ -207,9 +207,6 @@ class ModelWorker:
             vocab_size=self.model_config.vocab_size,
             multimodal=server_args.multimodal,
         )
-        self.precompile_token_paddings = self.compilation_manager.token_buckets
-        self.precompile_bs_paddings = self.compilation_manager.bs_buckets
-        self.precompile_cache_loc_paddings = self.compilation_manager.cache_loc_buckets
 
         self.parent_process = psutil.Process().parent()
         self.sync_queue = Queue()
@@ -276,9 +273,9 @@ class ModelWorker:
 
     def get_precompile_paddings(self):
         return (
-            self.precompile_token_paddings,
-            self.precompile_bs_paddings,
-            self.precompile_cache_loc_paddings,
+            self.compilation_manager.token_buckets,
+            self.compilation_manager.bs_buckets,
+            self.compilation_manager.cache_loc_buckets,
         )
 
     def get_model_runner(self):

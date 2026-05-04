@@ -159,7 +159,12 @@ class CompilationManager:
                     batch.forward_batch.input_ids = resolve_future_token_ids(
                         batch.forward_batch.input_ids, future_token_ids_map, mesh
                     )
-                forward_fn(batch, None, False, sampling_metadata)
+                forward_fn(
+                    batch,
+                    launch_done=None,
+                    skip_sample=False,
+                    sampling_metadata=sampling_metadata,
+                )
                 self._compiled_variants.add((ForwardMode.EXTEND, num_tokens, bs_val, False))
 
         end_time = time.perf_counter()
@@ -215,7 +220,12 @@ class CompilationManager:
                     batch.forward_batch.input_ids = resolve_future_token_ids(
                         batch.forward_batch.input_ids, future_token_ids_map, mesh
                     )
-                result = forward_fn(batch, None, False, sampling_metadata)
+                result = forward_fn(
+                    batch,
+                    launch_done=None,
+                    skip_sample=False,
+                    sampling_metadata=sampling_metadata,
+                )
                 if future_token_ids_map is not None:
                     _, next_token_ids, _ = result
                     set_future_token_ids(future_token_ids_map, 0, next_token_ids, mesh)
@@ -304,8 +314,13 @@ class CompilationManager:
 
     # ---- Lazy compilation tracking ----
 
-    def is_new_variant(self, variant_key: tuple) -> bool:
-        """Returns True if this variant has not been compiled yet."""
+    def register_variant_if_new(self, variant_key: tuple) -> bool:
+        """Register a compilation variant and return True if it was not seen before.
+
+        Used to detect first-time compilation of a (mode, num_tokens, bs, logprob)
+        shape tuple so the caller can log or act on cold-compile events.
+        TODO: add runtime consumer that warns on cache misses (issue #609).
+        """
         if variant_key in self._compiled_variants:
             return False
         self._compiled_variants.add(variant_key)
