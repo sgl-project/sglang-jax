@@ -200,6 +200,7 @@ class RotaryEmbedding:
         base: int,
         is_neox_style: bool,
         dtype: jnp.dtype,
+        scaling_factor: float = 1.0,
     ):
         self.head_size = head_size
         self.rotary_dim = rotary_dim
@@ -209,6 +210,8 @@ class RotaryEmbedding:
         self.dtype = dtype
 
         inv_freq_np = 1.0 / (base ** (np.arange(0, rotary_dim, 2, dtype=np.float32) / rotary_dim))
+        if scaling_factor != 1.0:
+            inv_freq_np = inv_freq_np / scaling_factor
         self._inv_freq_np = inv_freq_np  # shape: (rotary_dim // 2,)
 
     @named_scope

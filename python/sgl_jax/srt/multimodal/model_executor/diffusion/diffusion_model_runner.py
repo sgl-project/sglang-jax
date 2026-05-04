@@ -68,8 +68,10 @@ class DiffusionModelRunner(BaseModelRunner):
             mesh=self.mesh, load_config=LoadConfig(sub_dir=load_sub_dir)
         )
         self.model = self.model_loader.load_model(model_config=self.model_config)
+        use_dynamic_shifting = getattr(self.model_config, "use_dynamic_shifting", False)
         self.solver: FlowUniPCMultistepScheduler = FlowUniPCMultistepScheduler(
-            shift=self.model_config.flow_shift
+            shift=self.model_config.flow_shift if not use_dynamic_shifting else None,
+            use_dynamic_shifting=use_dynamic_shifting,
         )
         # self.solver_state = self.solver.create_state()
         # Any additional initialization specific to diffusion models
@@ -145,7 +147,9 @@ class DiffusionModelRunner(BaseModelRunner):
         """
         num_inference_steps = batch.num_inference_steps
         guidance_scale = batch.guidance_scale
-        do_classifier_free_guidance = guidance_scale > 1.0
+        stg_scale = getattr(batch, "stg_scale", 1.0)
+        do_spatio_temporal_guidance = stg_scale > 1.0 and getattr(self.model_config, "stg_mode", False)
+        do_classifier_free_guidance = guidance_scale > 1.0 and not do_spatio_temporal_guidance
 
         # Handle prompt embeddings
 
@@ -156,16 +160,26 @@ class DiffusionModelRunner(BaseModelRunner):
 
         # Pad to 512 tokens (do this first for both positive and negative)
         def pad_to_512(embeds):
-            if embeds.shape[1] < 512:
-                pad_width = 512 - embeds.shape[1]
+            # LTX2 does not pad to 512, Wan does. We pad if configured.
+            pad_dim = getattr(self.model_config, "max_sequence_length", 512)
+            if embeds.shape[1] < pad_dim:
+                pad_width = pad_dim - embeds.shape[1]
                 return jnp.pad(
                     embeds, ((0, 0), (0, pad_width), (0, 0)), mode="constant", constant_values=0
                 )
             return embeds
 
-        # text_embeds shape: (B, 512, D)
+        # text_embeds shape: (B, max_len, D)
         prompt_embeds = pad_to_512(prompt_embeds)
-        if do_classifier_free_guidance:
+        if do_spatio_temporal_guidance:
+            if batch.negative_prompt_embeds is not None:
+                neg_embeds = batch.negative_prompt_embeds
+                if neg_embeds.ndim == 2:
+                    neg_embeds = jnp.expand_dims(neg_embeds, axis=0)
+                neg_embeds = pad_to_512(neg_embeds)
+                # STG concatenates [pos, neg, pos]
+                prompt_embeds = jnp.concatenate([prompt_embeds, neg_embeds, prompt_embeds], axis=0)
+        elif do_classifier_free_guidance:
             if batch.negative_prompt_embeds is not None:
                 neg_embeds = batch.negative_prompt_embeds
                 # Add batch dimension to negative embeds if needed
@@ -175,7 +189,7 @@ class DiffusionModelRunner(BaseModelRunner):
                 # Pad negative embeds to 512 as well
                 neg_embeds = pad_to_512(neg_embeds)
 
-                # Now both are (1, 512, D), concatenate to (2, 512, D)
+                # Now both are (1, max_len, D), concatenate to (2, max_len, D)
                 prompt_embeds = jnp.concatenate([prompt_embeds, neg_embeds], axis=0)
             else:
                 pass
@@ -186,9 +200,23 @@ class DiffusionModelRunner(BaseModelRunner):
 
         self.prepare_latents(batch)
         latents = device_array(batch.latents, sharding=NamedSharding(self.mesh, PartitionSpec()))
+        
+        # Calculate mu for dynamic shifting if needed
+        mu = None
+        if getattr(self.model_config, "use_dynamic_shifting", False):
+            # LTX-2 token calculation: T * H * W
+            shape = latents.transpose(0, 4, 1, 2, 3).shape
+            tokens = shape[2] * shape[3] * shape[4]
+            base_shift = getattr(self.model_config, "base_shift", 0.95)
+            max_shift = getattr(self.model_config, "max_shift", 2.05)
+            mm = (max_shift - base_shift) / (4096 - 1024)
+            b = base_shift - mm * 1024
+            mu = tokens * mm + b
+
         self.solver.set_timesteps(
             num_inference_steps=num_inference_steps,
             shape=latents.transpose(0, 4, 1, 2, 3).shape,
+            mu=mu,
         )
         self.solver.set_begin_index(0)
         start_time = time.time()
@@ -207,12 +235,16 @@ class DiffusionModelRunner(BaseModelRunner):
 
             jax.profiler.StepTraceAnnotation("diffusion_step", step_num=step)
             t_scalar = jnp.array(self.solver.timesteps, dtype=jnp.int32)[step]
-            if do_classifier_free_guidance:
-                latents = jnp.concatenate([latents] * 2, axis=0)
+            if do_spatio_temporal_guidance:
+                latents_in = jnp.concatenate([latents] * 3, axis=0)
+            elif do_classifier_free_guidance:
+                latents_in = jnp.concatenate([latents] * 2, axis=0)
+            else:
+                latents_in = latents
             # Create timestep batch AFTER latents concat to match batch size
-            t_batch = jnp.broadcast_to(t_scalar, (latents.shape[0],))
+            t_batch = jnp.broadcast_to(t_scalar, (latents_in.shape[0],))
             # Transpose to channel-first (B, T, H, W, C) -> (B, C, T, H, W) for model
-            latents_cf = latents.transpose(0, 4, 1, 2, 3)
+            latents_cf = latents_in.transpose(0, 4, 1, 2, 3)
             # Perform denoising step
             with jtu.count_pjit_cpp_cache_miss() as count:
                 noise_pred: jax.Array = self.jitted_forward(
@@ -222,14 +254,33 @@ class DiffusionModelRunner(BaseModelRunner):
                     encoder_hidden_states_image=None,
                     guidance_scale=None,
                 )
-                if count() > 0:
-                    logger.info("diffusion cache miss count: %d", count())
-            if do_classifier_free_guidance:
-                bsz = latents.shape[0] // 2
+                logger.info("diffusion cache miss count: %d", count())
+
+            if do_spatio_temporal_guidance:
+                bsz = latents_in.shape[0] // 3
+                v_cond, v_uncond, v_ptb = noise_pred[:bsz], noise_pred[bsz:2*bsz], noise_pred[2*bsz:]
+
+                # Flow matching x0 prediction
+                sigma = float(self.solver._sigmas[step])
+                latents_slice = latents_cf[:bsz]
+
+                x0_cond = latents_slice - v_cond * sigma
+                x0_uncond = latents_slice - v_uncond * sigma
+                x0_ptb = latents_slice - v_ptb * sigma
+                x0_pred = x0_cond + (guidance_scale - 1.0) * (x0_cond - x0_uncond) + stg_scale * (x0_cond - x0_ptb)
+
+                rescale_scale = getattr(batch, "rescale_scale", 0.7)
+                factor = jnp.std(x0_cond, ddof=1) / jnp.maximum(jnp.std(x0_pred, ddof=1), 1e-6)
+                factor = rescale_scale * factor + (1.0 - rescale_scale)
+                x0_pred *= factor
+
+                noise_pred = (latents_slice - x0_pred) / sigma
+            elif do_classifier_free_guidance:
+                bsz = latents_in.shape[0] // 2
                 noise_uncond = noise_pred[bsz:]
                 noise_pred = noise_pred[:bsz]
                 noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
-                latents = latents[:bsz]
+
             # noise_pred is already channel-first (B, C, T, H, W) from model
             # latents is channel-last (B, T, H, W, C), need to transpose for solver
             latents = self.solver.step(

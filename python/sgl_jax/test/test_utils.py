@@ -48,6 +48,7 @@ QWEN3_32B_EAGLE3 = "AngelSlim/Qwen3-32B_eagle3"
 
 WAN2_1_T2V_1_3B = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 WAN2_1_T2V_14B = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+LTX2_MODEL = "Lightricks/LTX-2"
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
 

@@ -236,16 +236,14 @@ def forward_attention(
         q_heads = jnp.pad(q_heads, ((0, 0), (0, 0), (0, pad_size)))
         head_dim = k_cache_head_dim
 
+    # For GQA, repeat k and v heads to match the number of query heads.
     # Transpose for efficient matrix operations
     # q: shape of (num_heads, num_tokens, head_dim)
     # k, v: shape of (total_prefix_len, num_heads, head_dim)
     if num_kv_heads != num_heads:
-        # For GQA attention, we need to copy k and v heads to match the number of query heads
         num_copies = num_heads // num_kv_heads
-        # Use repeat to copy k and v heads
-        # [total_prefix_len, num_kv_heads, head_dim] -> [total_prefix_len, num_heads, head_dim]
-        k_heads = jnp.repeat(k_heads, num_copies, axis=1, out_sharding=kv_sharding)
-        v_heads = jnp.repeat(v_heads, num_copies, axis=1, out_sharding=kv_sharding)
+        k_heads = jnp.repeat(k_heads, num_copies, axis=1)
+        v_heads = jnp.repeat(v_heads, num_copies, axis=1)
 
     if scale is None:
         scale = 1.0 / jnp.sqrt(head_dim)

@@ -11,3 +11,4 @@ class MultiModalModelConfigs:
     model_path: str | None = None
     revision: str | None = None
     dtype: jnp.dtype = jnp.bfloat16
+    model_type: str = "wan"  # Identifies the model family ("wan", "ltx2", etc.)

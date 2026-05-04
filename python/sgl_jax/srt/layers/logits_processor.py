@@ -31,6 +31,8 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: jax.Array | None = None
+    # Audio text embeddings from audio connector (LTX-2 audio diffusion)
+    audio_hidden_states: jax.Array | None = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # The logprobs of the next tokens.                              shape: [#seq]
@@ -66,6 +68,7 @@ class LogitsProcessorOutput:
             self.input_top_logprobs_idx,
             self.input_token_ids_logprobs_val,
             self.input_token_ids_logprobs_idx,
+            self.audio_hidden_states,
         )
 
         aux_data = {}
@@ -88,6 +91,7 @@ class LogitsProcessorOutput:
         obj.input_top_logprobs_idx = children[9]
         obj.input_token_ids_logprobs_val = children[10]
         obj.input_token_ids_logprobs_idx = children[11]
+        obj.audio_hidden_states = children[12] if len(children) > 12 else None
 
         return obj
 

@@ -263,7 +263,7 @@ class ServerArgs:
             logger.warning("In a multi-machine scenario, device_indexes will be set to None.")
             self.device_indexes = None
         if self.multimodal:
-            self.model_path = download_from_hf(self.model_path, allow_patterns=None)
+            self.model_path = download_from_hf(self.model_path, allow_patterns=None, cache_dir=self.download_dir)
 
         if self.ep_num_redundant_experts < 0:
             raise ValueError("ep_num_redundant_experts must be non-negative")

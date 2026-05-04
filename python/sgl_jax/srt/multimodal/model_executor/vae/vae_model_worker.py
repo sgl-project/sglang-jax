@@ -34,9 +34,8 @@ class VaeModelWorker:
         # Initialize model here based on model_config
 
     def forward(self, batch: Req):
-        # Implement the vae model inference logic here
-        # return batch
-        return self.model_runner.forward(batch.latents, "decode")
+        output, cache_miss = self.model_runner.forward(batch.latents, "decode")
+        return output, cache_miss
 
     def run_precompile(self):
         self.decode_precompile()

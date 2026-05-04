@@ -116,9 +116,17 @@ class GlobalScheduler:
         dispatcher mapping.
         """
 
+        # Pre-allocate devices for each stage sequentially (largest first)
+        # to ensure valid TPU mesh topologies before parallel stage building.
+        stage_devices = {}
+        configs_by_size = sorted(enumerate(self.stage_configs), key=lambda x: x[1].runtime.num_tpus, reverse=True)
+        for idx, cfg in configs_by_size:
+            stage_devices[idx] = self.device_manager.allocate(cfg.runtime.num_tpus)
+
         def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, Stage]:
             idx, cfg = idx_cfg
-            return idx, Stage(cfg, device_manager=self.device_manager, server_args=self.server_args)
+            return idx, Stage(cfg, device_manager=self.device_manager, server_args=self.server_args,
+                              pre_allocated_devices=stage_devices[idx])
 
         with ThreadPoolExecutor(
             max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))
@@ -239,8 +247,8 @@ class GlobalScheduler:
             input_ids=input.input_ids,
             negative_input_ids=input.negative_input_ids,
             num_outputs_per_prompt=input.n,
-            width=int(size_str.split("*")[0]),
-            height=int(size_str.split("*")[1]),
+            width=int(size_str.replace("*", "x").split("x")[0]),
+            height=int(size_str.replace("*", "x").split("x")[1]),
             num_frames=input.num_frames,
             num_inference_steps=(
                 input.num_inference_steps if input.num_inference_steps is not None else 50
@@ -248,6 +256,14 @@ class GlobalScheduler:
             data_type=input.data_type,
             save_output=input.save_output,
         )
+        if getattr(input, "guidance_scale", None) is not None:
+            req.guidance_scale = input.guidance_scale
+        if getattr(input, "stg_scale", None) is not None:
+            req.stg_scale = input.stg_scale
+        if getattr(input, "rescale_scale", None) is not None:
+            req.rescale_scale = input.rescale_scale
+        if getattr(input, "fps", None) is not None:
+            req.fps = input.fps
         if input.mm_inputs is not None:
             req.extra["mm_inputs"] = input.mm_inputs
         if req.rid in self.req_store:

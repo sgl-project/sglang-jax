@@ -68,11 +68,16 @@ class Req:
     # without extension
     output_file_name: str | None = None
     output_file_ext: str | None = None
-    # Primary encoder embeddings
+    # Primary encoder embeddings (video)
     prompt_embeds: list[jax.Array] | jax.Array = field(default_factory=list)
     negative_prompt_embeds: list[jax.Array] | None = None
     prompt_attention_mask: list[jax.Array] | None = None
     negative_attention_mask: list[jax.Array] | None = None
+    # Audio encoder embeddings (from audio_embeddings_connector)
+    audio_prompt_embeds: jax.Array | None = None
+    audio_negative_prompt_embeds: jax.Array | None = None
+    # Audio latents (from diffusion denoise, to be decoded by audio VAE)
+    audio_latents: jax.Array | None = None
     clip_embedding_pos: list[jax.Array] | None = None
     clip_embedding_neg: list[jax.Array] | None = None
 
@@ -137,6 +142,13 @@ class Req:
     guidance_rescale: float = 0.0
     eta: float = 0.0
     sigmas: list[float] | None = None
+    stg_scale: float = 1.0
+    rescale_scale: float = 0.7
+
+    # Audio-specific guidance (PyTorch defaults from DEFAULT_AUDIO_GUIDER_PARAMS)
+    audio_guidance_scale: float = 7.0
+    audio_stg_scale: float = 1.0
+    audio_rescale_scale: float = 0.7
 
     true_cfg_scale: float | None = None  # qwen-image specific now
 
@@ -222,7 +234,12 @@ class Req:
             self.audio_codes is not None,
             self.input_ids is not None,
         )
-        if scheduler == "auto_regressive":
+        if scheduler == "text_encoder":
+            # TextEncoderScheduler receives Req directly and runs the
+            # text encoder without KV cache. It sets prompt_embeds and
+            # negative_prompt_embeds on the Req before forwarding.
+            return [self]
+        elif scheduler == "auto_regressive":
             is_omni_request = (
                 self.omni_inputs is not None or self.extra.get("sampling_params") is not None
             )
@@ -248,10 +265,13 @@ class Req:
                 )
                 tokenized_req.mm_inputs = self.omni_inputs
                 return [tokenized_req]
+            # Auto-regressive text encoder (e.g. WAN 2.1 with UMT5):
+            # Send both positive and negative prompts so that from_stage()
+            # populates both prompt_embeds and negative_prompt_embeds.
             return [
                 TokenizedGenerateReqInput(
                     rid=self.rid,
-                    input_ids=self.input_ids,
+                    input_ids=self.input_ids or self.origin_input_ids,
                     sampling_params=SamplingParams(max_new_tokens=1),
                     return_hidden_states=True,
                 ),

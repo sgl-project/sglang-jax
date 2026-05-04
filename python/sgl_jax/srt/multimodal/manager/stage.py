@@ -11,6 +11,11 @@ from sgl_jax.srt.managers.communication import QueueBackend
 from sgl_jax.srt.managers.scheduler import Scheduler as AutoRegressiveScheduler
 from sgl_jax.srt.models.qwen2 import Qwen2ForCausalLM
 from sgl_jax.srt.models.umt5 import UMT5EncoderModel
+from sgl_jax.srt.multimodal.models.ltx2.text_encoders.ltx2_text_encoder import LTX2GemmaTextEncoder
+from sgl_jax.srt.multimodal.models.ltx2.diffusion.ltx2_dit import LTX2Transformer3DModel
+from sgl_jax.srt.multimodal.models.ltx2.audio_vae.ltx2_audio_vae import AudioDecoder, AudioEncoder
+from sgl_jax.srt.multimodal.models.ltx2.audio_vae.vocoder import Vocoder
+from sgl_jax.srt.multimodal.models.ltx2.vaes.ltx2_vae_decoder import VideoDecoder
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
 from sgl_jax.srt.multimodal.manager.scheduler.audio_backbone_scheduler import (
     AudioBackboneScheduler,
@@ -20,6 +25,9 @@ from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
     DiffusionScheduler,
 )
 from sgl_jax.srt.multimodal.manager.scheduler.embed_scheduler import EmbedScheduler
+from sgl_jax.srt.multimodal.manager.scheduler.text_encoder_scheduler import (
+    TextEncoderScheduler,
+)
 from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
 from sgl_jax.srt.multimodal.manager.scheduler.vit_scheduler import VitScheduler
 from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_backbone import (
@@ -69,7 +77,8 @@ class Stage:
     """
 
     def __init__(
-        self, stage_config: Any, *, device_manager: DeviceManager, server_args: ServerArgs
+        self, stage_config: Any, *, device_manager: DeviceManager, server_args: ServerArgs,
+        pre_allocated_devices=None,
     ):
         """Initialize stage resources and create the device mesh.
 
@@ -78,6 +87,8 @@ class Stage:
                 scheduler information).
             device_manager: `DeviceManager` used to reserve device indices.
             server_args: Global server arguments passed to schedulers.
+            pre_allocated_devices: Optional pre-allocated device indices. If provided,
+                skips device_manager.allocate and uses these directly.
         """
         self._in_queue = None
         self._out_queue = None
@@ -96,11 +107,11 @@ class Stage:
                 devices=cpu_devices[:num_devices],
             )
         else:
-            # this parallelism setting is accord to stage config
+            device_indexes = pre_allocated_devices if pre_allocated_devices is not None else device_manager.allocate(num_devices)
             self.mesh = create_device_mesh(
                 ici_parallelism=[-1, num_devices],
                 dcn_parallelism=[1, 1],
-                device_indexes=device_manager.allocate(num_devices),
+                device_indexes=device_indexes,
             )
         self.stage_config = stage_config
         self.server_args = server_args
@@ -221,6 +232,8 @@ def get_scheduler_class(name: str):
         return VitScheduler
     elif name == "embedding":
         return EmbedScheduler
+    elif name == "text_encoder":
+        return TextEncoderScheduler
     elif name in ["audio_encoder", "audio_decoder"]:
         return AudioScheduler
     elif name == "audio_backbone":
@@ -252,5 +265,17 @@ def get_model_class(name: str):
         return MiMoAudioTokenizer
     elif name == "MiMoAudioForCausalLM":
         return MiMoAudioForCausalLM
+    elif name == "LTX2GemmaTextEncoder":
+        return LTX2GemmaTextEncoder
+    elif name == "LTX2Transformer3DModel":
+        return LTX2Transformer3DModel
+    elif name in ["AutoencoderKLLTX2", "AutoencoderKLLTX2Video"]:
+        return VideoDecoder
+    elif name == "AutoencoderKLLTX2Audio":
+        return AudioDecoder
+    elif name == "LTX2AudioEncoder":
+        return AudioEncoder
+    elif name == "LTX2Vocoder":
+        return Vocoder
     else:
         raise ValueError(f"Unknown model name: {name}")

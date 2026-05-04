@@ -161,6 +161,18 @@ class FlowUniPCMultistepScheduler:
         # Apply shifting
         if self.use_dynamic_shifting:
             sigmas = self.time_shift(mu, 1.0, sigmas)
+
+            # Apply stretch to match PyTorch LTX2Scheduler behavior.
+            # Without stretch, dynamic shifting compresses the sigma range
+            # (e.g. [1.0, 0.899] instead of [1.0, 0.1]), barely denoising.
+            # Stretch rescales so the last non-zero sigma maps to `terminal`.
+            terminal = 0.1
+            non_zero_mask = sigmas > 0
+            non_zero_sigmas = sigmas[non_zero_mask]
+            one_minus_z = 1.0 - non_zero_sigmas
+            scale_factor = one_minus_z[-1] / (1.0 - terminal)
+            stretched = 1.0 - (one_minus_z / scale_factor)
+            sigmas = jnp.where(non_zero_mask, stretched, sigmas)
         else:
             if shift is None:
                 shift = self.shift
