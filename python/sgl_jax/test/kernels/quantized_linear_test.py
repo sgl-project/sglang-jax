@@ -139,7 +139,6 @@ def _run_block_quant_kernel_test(weight_dtype, dtype_name):
         w_scale=weight_scale,
         quantize_activation=False,
         compute_dtype=compute_dtype,
-        weight_block_size=weight_block_size,
     )
 
     _assert_close(f"Block Quant Kernel ({dtype_name})", out, ref_out)
