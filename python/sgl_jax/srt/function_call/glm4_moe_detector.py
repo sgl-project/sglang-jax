@@ -517,9 +517,7 @@ class Glm4MoeDetector(BaseFormatDetector):
                                 )
                             )
                             self._last_arguments += json_increment
-                            self.streamed_args_for_tool[
-                                self.current_tool_id
-                            ] += json_increment
+                            self.streamed_args_for_tool[self.current_tool_id] += json_increment
 
                     if is_tool_end == self.eot_token:
                         if self._is_first_param:
@@ -542,16 +540,12 @@ class Glm4MoeDetector(BaseFormatDetector):
                                 )
                             )
                             self._last_arguments += closing_brace
-                            self.streamed_args_for_tool[
-                                self.current_tool_id
-                            ] += closing_brace
+                            self.streamed_args_for_tool[self.current_tool_id] += closing_brace
 
                         try:
                             pairs = self.func_arg_regex.findall(func_args_raw)
                             if pairs:
-                                arguments = self._parse_argument_pairs(
-                                    pairs, func_name, tools
-                                )
+                                arguments = self._parse_argument_pairs(pairs, func_name, tools)
                                 self.prev_tool_call_arr[self.current_tool_id][
                                     "arguments"
                                 ] = arguments
