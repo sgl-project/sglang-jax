@@ -958,6 +958,81 @@ def _fused_ep_moe_kernel(
         )
         a2a_s_sends_x2_smem[e_sem_id] = send_sz
 
+    def start_a2a_scatter_batch(*, bt_sem_id, bt_start):
+        if disable_a2a:
+            return
+        for slot in range(expert_buffer_count):
+            a2a_s_sends_x2_smem[slot] = jnp.int32(0)
+
+        def _scatter_one_batch(t_id, _, bt_start=bt_start):
+            src_t_id = bt_start + t_id
+            for k_id in range(top_k):
+                e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
+                is_valid = e_id >= 0
+                e_id_safe = lax.select(is_valid, e_id, jnp.int32(0))
+                e_sem_id_k = e_id_safe % jnp.int32(local_num_experts)
+                recv_id = e_id_safe // local_num_experts
+                offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe]
+                sz = lax.select(is_valid, jnp.int32(1), jnp.int32(0))
+                is_local = recv_id == my_id
+                local_sz = lax.select(is_local, sz, jnp.int32(0))
+                remote_sz = lax.select(is_local, jnp.int32(0), sz)
+                expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe] = offset + local_sz + remote_sz
+                start = expert_starts_x2_smem[bt_sem_id, 0, e_id_safe] + offset
+                cur_sends = a2a_s_sends_x2_smem[e_sem_id_k]
+                a2a_s_sends_x2_smem[e_sem_id_k] = cur_sends + remote_sz
+
+                @pl.when(local_sz != 0)
+                def _local_copy(
+                    src_t_id=src_t_id, start=start, local_sz=local_sz, e_sem_id_k=e_sem_id_k
+                ):
+                    pltpu.make_async_copy(
+                        src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
+                        dst_ref=a2a_s_x2_hbm.at[e_sem_id_k, pl.ds(start, local_sz)],
+                        sem=recv_x2_sems.at[e_sem_id_k],
+                    ).start()
+
+                @pl.when(remote_sz != 0)
+                def _remote_copy(
+                    src_t_id=src_t_id,
+                    start=start,
+                    remote_sz=remote_sz,
+                    e_sem_id_k=e_sem_id_k,
+                    recv_id=recv_id,
+                ):
+                    pltpu.make_async_remote_copy(
+                        src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
+                        dst_ref=a2a_s_x2_hbm.at[e_sem_id_k, pl.ds(start, remote_sz)],
+                        send_sem=send_x2_sems.at[e_sem_id_k],
+                        recv_sem=recv_x2_sems.at[e_sem_id_k],
+                        device_id=get_mesh_device_id(recv_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
+
+            return None
+
+        lax.fori_loop(0, bt, _scatter_one_batch, None, unroll=False)
+
+    def wait_a2a_scatter_send_batch():
+        if disable_a2a:
+            return
+
+        def _wait_one(slot, _):
+            scatter_send_sz = a2a_s_sends_x2_smem[slot]
+
+            @pl.when(scatter_send_sz != 0)
+            def _():
+                ref = a2a_s_x2_hbm.at[slot, pl.ds(0, scatter_send_sz)]
+                pltpu.make_async_copy(
+                    src_ref=ref,
+                    dst_ref=ref,
+                    sem=send_x2_sems.at[slot],
+                ).wait()
+
+            return None
+
+        lax.fori_loop(0, jnp.int32(expert_buffer_count), _wait_one, None, unroll=False)
+
     def wait_a2a_scatter_recv(*, bt_sem_id, e_sem_id, local_e_id):
         if disable_a2a:
             return
@@ -2598,121 +2673,190 @@ def _fused_ep_moe_kernel(
             starts=expert_starts,
             sizes=expert_sizes,
         )
-        sync_barrier()
 
         wait_store_output(bt_id=bt_id - 2)
 
-        start_a2a_scatter(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=0, bt_start=bt_start)
-
-        init_carry = (e_sem_id, jnp.int32(0))
-
-        def run_per_expert_pipelined(local_e_id, carry):
-            curr_e_sem_id, curr_se_block = carry
-
-            @pl.when(local_e_id == 0)
-            def _first_load():
-                e_id = my_id * local_num_experts + local_e_id
-                sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
-
-                @pl.when(sz != 0)
-                def _():
-                    start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
-                    start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
-
-            @pl.when(curr_se_block == 0)
-            def _():
-                run_shared_expert_slice(0, bt_id, bt_sem_id, out_buf_id)
-
-            curr_se_block = lax.select(curr_se_block == 0, jnp.int32(1), curr_se_block)
-
-            next_e_sem_id = (curr_e_sem_id + jnp.int32(1)) % jnp.int32(expert_buffer_count)
-            next_local_e_id = local_e_id + 1
-
-            @pl.when(next_local_e_id < local_num_experts)
-            def _():
-                # A single barrier at each full-ring boundary is sufficient:
-                # it guarantees ALL devices have finished with the previous
-                # round of experts that occupied these buffers, so every
-                # buffer in the ring can be safely reused for the next round.
-                # With expert_buffer_count=B, barriers fire at expert IDs
-                # B, 2B, 3B, ... — saving (B-1) barriers per round compared
-                # to the previous per-expert barrier.
-                @pl.when(
-                    (next_local_e_id >= expert_buffer_count)
-                    & (next_local_e_id % expert_buffer_count == 0)
-                )
-                def _wait_before_buffer_reuse():
-                    sync_barrier()
-
-                start_a2a_scatter(
-                    bt_sem_id=bt_sem_id,
-                    e_sem_id=next_e_sem_id,
-                    local_e_id=next_local_e_id,
-                    bt_start=bt_start,
-                )
-
-            run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
-            curr_se_block += 1
-
-            wait_a2a_scatter_recv(
-                bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id
-            )
-            expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id)
-
-            start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id)
-
-            run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
-            curr_se_block += 1
-
-            wait_a2a_scatter_send(
-                bt_sem_id=bt_sem_id,
-                e_sem_id=curr_e_sem_id,
-                local_e_id=local_e_id,
-            )
-            # Expert A2A scratch uses a ring buffer.  A single barrier at each
-            # full-ring boundary (every `expert_buffer_count` experts) is
-            # sufficient to prevent buffer reuse races across devices.
-            return (next_e_sem_id, curr_se_block)
-
-        final_carry = lax.fori_loop(
-            0, local_num_experts, run_per_expert_pipelined, init_carry, unroll=False
+        se_per_expert = (
+            max(2, cdiv(se_total_blocks, local_num_experts)) if se_total_blocks > 0 else 2
         )
-        final_e_sem_id, final_se_block = final_carry
+        se_before = se_per_expert // 2
+        se_after = se_per_expert - se_before
 
-        def cleanup_body(block_idx, _):
-            run_shared_expert_slice(block_idx, bt_id, bt_sem_id, out_buf_id)
-            return None
+        if expert_buffer_count >= local_num_experts:
+            # === BATCH SCATTER PATH ===
+            # Issue all scatter DMAs in one token-loop pass (bt iterations
+            # instead of bt * local_num_experts), then run a tight compute loop
+            # where each expert waits only its own recv semaphore.
+            start_a2a_scatter_batch(bt_sem_id=bt_sem_id, bt_start=bt_start)
 
-        lax.fori_loop(final_se_block, se_total_blocks, cleanup_body, None)
+            init_carry = jnp.int32(0)
 
-        wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
-        sync_barrier()
+            def compute_expert_batch(local_e_id, curr_se_block):
+                e_sem_id_local = local_e_id
 
-        acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
+                @pl.when(local_e_id == 0)
+                def _first_load():
+                    e_id = my_id * local_num_experts
+                    sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
 
-        start_send_bo(bt_id=bt_id)
+                    @pl.when(sz != 0)
+                    def _():
+                        start_fetch_bw1(0, bw1_sem_id=0, bf_id=0, bd1_id=0)
+                        start_fetch_bw3(0, bw3_sem_id=0, bf_id=0, bd3_id=0)
 
-        # Do NOT re-wait scatter send semaphores here. The per-expert pipeline already
-        # drains scatter sends via `wait_a2a_scatter_send(...)`. Re-waiting can
-        # deadlock when the semaphore has been fully consumed.
-        #
-        # Gather sends are drained when their accumulator buffer is reused. Flush the
-        # tail experts whose buffers are not reused within this bt tile.
-        tail_start = max(local_num_experts - expert_buffer_count, 0)
-        for tail_local_e_id in range(tail_start, local_num_experts):
-            tail_sem_id = (e_sem_id + tail_local_e_id) % expert_buffer_count
-            wait_a2a_gather_send(
-                bt_sem_id=bt_sem_id,
-                e_sem_id=tail_sem_id,
-                local_e_id=tail_local_e_id,
+                for _ in range(se_before):
+                    run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
+                    curr_se_block += 1
+
+                wait_a2a_scatter_recv(
+                    bt_sem_id=bt_sem_id,
+                    e_sem_id=e_sem_id_local,
+                    local_e_id=local_e_id,
+                )
+                expert_ffn(bt_sem_id, e_sem_id_local, local_e_id)
+
+                start_a2a_gather(
+                    bt_sem_id=bt_sem_id,
+                    e_sem_id=e_sem_id_local,
+                    local_e_id=local_e_id,
+                )
+
+                for _ in range(se_after):
+                    run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
+                    curr_se_block += 1
+
+                return curr_se_block
+
+            final_se_block = lax.fori_loop(
+                0, local_num_experts, compute_expert_batch, init_carry, unroll=False
             )
 
-        # The end-of-bt barrier ensures gather-send completion is visible to
-        # the next bt tile's metadata exchange.  For the very last tile there is
-        # no next iteration, so the barrier is unnecessary.
-        @pl.when(bt_id + 1 < num_bt)
-        def _():
-            sync_barrier()
+            def cleanup_body_batch(block_idx, _):
+                run_shared_expert_slice(block_idx, bt_id, bt_sem_id, out_buf_id)
+                return None
+
+            lax.fori_loop(final_se_block, se_total_blocks, cleanup_body_batch, None)
+
+            wait_a2a_scatter_send_batch()
+            wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
+
+            acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
+
+            start_send_bo(bt_id=bt_id)
+
+            tail_start = max(local_num_experts - expert_buffer_count, 0)
+            for tail_local_e_id in range(tail_start, local_num_experts):
+                wait_a2a_gather_send(
+                    bt_sem_id=bt_sem_id,
+                    e_sem_id=tail_local_e_id,
+                    local_e_id=tail_local_e_id,
+                )
+
+            @pl.when(bt_id + 1 < num_bt)
+            def _():
+                sync_barrier()
+
+            final_e_sem_id = e_sem_id
+
+        else:
+            # === EXISTING PIPELINED PATH ===
+            start_a2a_scatter(
+                bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=0, bt_start=bt_start
+            )
+
+            init_carry = (e_sem_id, jnp.int32(0))
+
+            def run_per_expert_pipelined(local_e_id, carry):
+                curr_e_sem_id, curr_se_block = carry
+
+                @pl.when(local_e_id == 0)
+                def _first_load():
+                    e_id = my_id * local_num_experts + local_e_id
+                    sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
+
+                    @pl.when(sz != 0)
+                    def _():
+                        start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
+                        start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
+
+                @pl.when(curr_se_block == 0)
+                def _():
+                    run_shared_expert_slice(0, bt_id, bt_sem_id, out_buf_id)
+
+                curr_se_block = lax.select(curr_se_block == 0, jnp.int32(1), curr_se_block)
+
+                next_e_sem_id = (curr_e_sem_id + jnp.int32(1)) % jnp.int32(expert_buffer_count)
+                next_local_e_id = local_e_id + 1
+
+                @pl.when(next_local_e_id < local_num_experts)
+                def _():
+                    @pl.when(
+                        (next_local_e_id >= expert_buffer_count)
+                        & (next_local_e_id % expert_buffer_count == 0)
+                    )
+                    def _wait_before_buffer_reuse():
+                        sync_barrier()
+
+                    start_a2a_scatter(
+                        bt_sem_id=bt_sem_id,
+                        e_sem_id=next_e_sem_id,
+                        local_e_id=next_local_e_id,
+                        bt_start=bt_start,
+                    )
+
+                for _ in range(se_before):
+                    run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
+                    curr_se_block += 1
+
+                wait_a2a_scatter_recv(
+                    bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id
+                )
+                expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id)
+
+                start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id)
+
+                for _ in range(se_after):
+                    run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
+                    curr_se_block += 1
+
+                wait_a2a_scatter_send(
+                    bt_sem_id=bt_sem_id,
+                    e_sem_id=curr_e_sem_id,
+                    local_e_id=local_e_id,
+                )
+                return (next_e_sem_id, curr_se_block)
+
+            final_carry = lax.fori_loop(
+                0, local_num_experts, run_per_expert_pipelined, init_carry, unroll=False
+            )
+            final_e_sem_id, final_se_block = final_carry
+
+            def cleanup_body(block_idx, _):
+                run_shared_expert_slice(block_idx, bt_id, bt_sem_id, out_buf_id)
+                return None
+
+            lax.fori_loop(final_se_block, se_total_blocks, cleanup_body, None)
+
+            wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
+
+            acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
+
+            start_send_bo(bt_id=bt_id)
+
+            tail_start = max(local_num_experts - expert_buffer_count, 0)
+            for tail_local_e_id in range(tail_start, local_num_experts):
+                tail_sem_id = (e_sem_id + tail_local_e_id) % expert_buffer_count
+                wait_a2a_gather_send(
+                    bt_sem_id=bt_sem_id,
+                    e_sem_id=tail_sem_id,
+                    local_e_id=tail_local_e_id,
+                )
+
+            @pl.when(bt_id + 1 < num_bt)
+            def _():
+                sync_barrier()
+
+            final_e_sem_id = final_e_sem_id
 
         return final_e_sem_id
 
