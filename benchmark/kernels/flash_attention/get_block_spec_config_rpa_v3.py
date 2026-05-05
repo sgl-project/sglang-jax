@@ -28,6 +28,7 @@ def benchmark_backend(
     bq_csz,
     page_size,
     static_q_len,
+    sliding_window_len,
 ):
     scale = head_dim**-0.5
     m_block_config = (bq_sz, bkv_sz, bq_csz, bkv_csz)
@@ -85,8 +86,6 @@ def benchmark_backend(
             page_size=page_size,
         )
 
-        static_q_len = 1
-
     @functools.partial(
         jax.jit,
         static_argnames=[
@@ -95,6 +94,7 @@ def benchmark_backend(
             "m_block_config",
             "d_block_config",
             "p_block_config",
+            "sliding_window_len",
         ],
     )
     def jitted_attn(
@@ -109,9 +109,10 @@ def benchmark_backend(
         distribution,
         sm_scale,
         chunk_prefill_size,
-        m_block_config,
         p_block_config,
+        m_block_config,
         d_block_config,
+        sliding_window_len,
     ):
         return ragged_paged_attention(
             q,
@@ -130,6 +131,7 @@ def benchmark_backend(
             p_block_sizes=p_block_config,
             m_block_sizes=m_block_config,
             d_block_sizes=d_block_config,
+            sliding_window=sliding_window_len,
         )
 
     attn = functools.partial(
@@ -148,6 +150,7 @@ def benchmark_backend(
         p_block_config,
         m_block_config,
         d_block_config,
+        sliding_window_len,
     )
 
     # Warmup
@@ -184,6 +187,7 @@ def get_tuned_value(
     page_size,
     static_q_len,
     block_spec_configs,
+    sliding_window_len,
 ):
     best_output = inf
     best_config = None
@@ -207,6 +211,7 @@ def get_tuned_value(
                 bq_csz,
                 page_size,
                 static_q_len,
+                sliding_window_len,
             )
 
             if flash_time < best_output:
@@ -216,7 +221,7 @@ def get_tuned_value(
             pass
     if best_config:
         print(
-            f"('{q_dtype}', '{k_dtype}', {q_head_num}, {kv_head_num}, {head_dim}, {page_size}, {max_num_batched_tokens}, {static_q_len}): ({best_config[0]}, {best_config[1]}, {best_config[2]}, {best_config[3]}),"
+            f"('{q_dtype}', '{k_dtype}', {q_head_num}, {kv_head_num}, {head_dim}, {page_size}, {max_num_batched_tokens}, {static_q_len} , {sliding_window_len}): ({best_config[0]}, {best_config[1]}, {best_config[2]}, {best_config[3]}),"
         )
 
 
@@ -241,7 +246,6 @@ def main():
         2048,
         4096,
         8192,
-        16384,
     ]
     q_head_num_config = [1, 2, 4, 8, 16, 32]
     kv_head_num_config = [1, 2, 4, 8, 16, 32]
@@ -249,6 +253,7 @@ def main():
     max_kv_cache_tokens_config = [600000]
     all_combinations = []
     max_context_len = 40960
+    sliding_window_len_config = [None]
     prefill_kernel_chunk_size = [8192]
 
     for q_head_num in q_head_num_config:
@@ -258,19 +263,21 @@ def main():
                     for max_kv_cache_tokens in max_kv_cache_tokens_config:
                         for max_num_batched_tokens in max_num_batched_tokens_config:
                             for chunk in prefill_kernel_chunk_size:
-                                if q_head_num < kv_head_num or q_head_num % kv_head_num != 0:
-                                    continue
-                                all_combinations.append(
-                                    (
-                                        page_size,
-                                        max_kv_cache_tokens,
-                                        max_num_batched_tokens,
-                                        q_head_num,
-                                        kv_head_num,
-                                        head_dim,
-                                        chunk,
+                                for sliding_window_len in sliding_window_len_config:
+                                    if q_head_num < kv_head_num or q_head_num % kv_head_num != 0:
+                                        continue
+                                    all_combinations.append(
+                                        (
+                                            page_size,
+                                            max_kv_cache_tokens,
+                                            max_num_batched_tokens,
+                                            q_head_num,
+                                            kv_head_num,
+                                            head_dim,
+                                            chunk,
+                                            sliding_window_len,
+                                        )
                                     )
-                                )
 
     num_kv_per_blk_config = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
     bkv_csz = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
@@ -299,6 +306,7 @@ def main():
         kv_head_num,
         head_dim,
         chunk_prefill_size,
+        sliding_window_len,
     ) in enumerate(all_combinations):
         if is_decode_only(max_num_batched_tokens):
             block_spec_configs = decode_only_block_spec_configs
@@ -314,6 +322,7 @@ def main():
                 page_size,
                 1,
                 block_spec_configs,
+                sliding_window_len,
             )
         else:
             block_spec_configs = prefill_only_block_spec_configs
@@ -329,6 +338,7 @@ def main():
                 page_size,
                 None,
                 block_spec_configs,
+                sliding_window_len,
             )
 
             # Prefill kernel tuning
@@ -342,6 +352,7 @@ def main():
                 page_size,
                 chunk_prefill_size,
                 block_spec_configs,
+                sliding_window_len,
             )
 
 
