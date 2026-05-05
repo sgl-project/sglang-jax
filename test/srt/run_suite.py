@@ -519,6 +519,8 @@ suites = {
         TestFile("test/srt/openai_server/features/test_json_mode.py", 2),
         TestFile("test/srt/openai_server/features/test_structural_tag.py", 2),
         TestFile("test/srt/function_call/test_mimo_detector.py", 0.1),
+        TestFile("test/srt/function_call/test_glm47_detector.py", 0.1),
+        TestFile("test/srt/test_reasoning_parser.py", 0.1),
         TestFile("test/srt/test_srt_engine.py", 1),
         TestFile("test/srt/test_logprobs.py", 3),
         TestFile("test/srt/test_penalty.py", 12),

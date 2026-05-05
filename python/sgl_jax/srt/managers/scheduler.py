@@ -3,6 +3,7 @@
 import concurrent.futures as futures
 import dataclasses
 import faulthandler
+import json
 import logging
 import os
 import pickle
@@ -1029,13 +1030,21 @@ class Scheduler(
                 req.set_finish_with_abort(error_msg)
             else:
                 if req.sampling_params.json_schema is not None:
-                    key = ("json", req.sampling_params.json_schema)
+                    schema = req.sampling_params.json_schema
+                    if isinstance(schema, dict):
+                        schema = json.dumps(schema, sort_keys=True)
+                    key = ("json", schema)
                 elif req.sampling_params.regex is not None:
                     key = ("regex", req.sampling_params.regex)
                 elif req.sampling_params.ebnf is not None:
                     key = ("ebnf", req.sampling_params.ebnf)
                 elif req.sampling_params.structural_tag:
-                    key = ("structural_tag", req.sampling_params.structural_tag)
+                    tag = req.sampling_params.structural_tag
+                    if hasattr(tag, "model_dump_json"):
+                        tag = tag.model_dump_json()
+                    elif isinstance(tag, dict):
+                        tag = json.dumps(tag, sort_keys=True)
+                    key = ("structural_tag", tag)
 
                 value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
                 req.grammar = value
