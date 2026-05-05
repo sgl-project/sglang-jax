@@ -78,6 +78,7 @@ class ServerArgs:
     ep_size: int = 1
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: str | None = None
+    enable_sequence_parallel: bool = False
     stream_interval: int = 1
     stream_output: bool = False
     random_seed: int | None = None
@@ -604,6 +605,12 @@ class ServerArgs:
             choices=["static", "dynamic", "fake"],
             default=ServerArgs.ep_dispatch_algorithm,
             help="Expert parallel dispatch algorithm.",
+        )
+        parser.add_argument(
+            "--enable-sequence-parallel",
+            action="store_true",
+            default=ServerArgs.enable_sequence_parallel,
+            help="Enable sequence parallelism.",
         )
         parser.add_argument(
             "--stream-interval",

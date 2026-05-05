@@ -168,6 +168,7 @@ class Grok1MLP(nnx.Module):
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
         reduce_results: bool = True,
+        enable_sequence_parallel: bool = False,
     ) -> None:
         super().__init__()
 
@@ -194,13 +195,21 @@ class Grok1MLP(nnx.Module):
             params_dtype=dtype,
             kernel_axes=("tensor", None),
             mesh=mesh,
+            output_scatter_dimension=0 if enable_sequence_parallel else None,
         )
         self.act_fn = GeluAndMul(approximate="tanh")
         self.layer_id = layer_id
         self.reduce_results = reduce_results
+        self.mesh = mesh
+        self.enable_sequence_parallel = enable_sequence_parallel
 
     @log_shardings("GrokMLP")
     def __call__(self, x: jax.Array) -> jax.Array:
+        # Unshard activations if sequence parallel enabled, otherwise no-op
+        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+            spec = jax.sharding.PartitionSpec(*([None] * len(x.shape)))
+            x = jax.sharding.reshard(x, spec)
+
         gate, _ = self.gate_proj(x)
         up, _ = self.up_proj(x)
         x, _ = self.act_fn(gate, up)
@@ -280,6 +289,7 @@ class Grok1MoE(nnx.Module):
                 dtype=dtype,
                 layer_id=layer_id,
                 quantization_config=getattr(config, "quantization_config", None),
+                enable_sequence_parallel=getattr(config, "enable_sequence_parallel", False),
             )
 
     @log_shardings("GrokMoE")
@@ -288,6 +298,11 @@ class Grok1MoE(nnx.Module):
         hidden_states: jax.Array,
         dispatch_info: ExpertLocationMetadata | None = None,
     ) -> tuple[jax.Array, jax.Array | None]:
+        # Unshard activations if sequence parallel enabled, otherwise no-op
+        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+            spec = jax.sharding.PartitionSpec(*([None] * len(hidden_states.shape)))
+            hidden_states = jax.sharding.reshard(hidden_states, spec)
+
         # Router computation with soft capping
         router_logits, _ = self.gate(hidden_states)
 
@@ -386,6 +401,7 @@ class Grok1Attention(nnx.Module):
         layer_id: int = 0,
         max_position: int = 4096 * 32,
         rope_theta: float = 10000,
+        enable_sequence_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -401,6 +417,7 @@ class Grok1Attention(nnx.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.mesh = mesh
+        self.enable_sequence_parallel = enable_sequence_parallel
 
         rope_scaling = get_rope_scaling(config)
         self.rope_rotate_half_dims = getattr(config, "rope_rotate_half_dims", False)
@@ -440,6 +457,7 @@ class Grok1Attention(nnx.Module):
             params_dtype=jnp.bfloat16,
             kernel_axes=("tensor", None),
             mesh=mesh,
+            output_scatter_dimension=0 if enable_sequence_parallel else None,
         )
 
         # Initialize rotary embeddings based on scaling configuration
@@ -488,6 +506,11 @@ class Grok1Attention(nnx.Module):
         # Short circuit for empty sequences
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
+
+        # Unshard activations if sequence parallel enabled, otherwise no-op
+        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+            spec = jax.sharding.PartitionSpec(*([None] * len(hidden_states.shape)))
+            hidden_states = jax.sharding.reshard(hidden_states, spec)
 
         # Project Q, K, V separately
         q, _ = self.q_proj(hidden_states)
@@ -540,6 +563,7 @@ class Grok1Attention(nnx.Module):
 
         # Project output
         output, _ = self.o_proj(attn_output)
+
         return output, kv_fused
 
 
@@ -574,6 +598,7 @@ class Grok1DecoderLayer(nnx.Module):
             layer_id=layer_id,
             rope_theta=rope_theta,
             mesh=mesh,
+            enable_sequence_parallel=getattr(config, "enable_sequence_parallel", False),
         )
 
         # Feed-forward networks
@@ -603,6 +628,7 @@ class Grok1DecoderLayer(nnx.Module):
                     layer_id=layer_id,
                     reduce_results=False,
                     mesh=mesh,
+                    enable_sequence_parallel=getattr(config, "enable_sequence_parallel", False),
                 )
         else:
             raise NotImplementedError()
@@ -901,6 +927,11 @@ class Grok1ForCausalLM(nnx.Module):
             token_to_kv_pool,
             None,
         )
+
+        # Unshard activations if sequence parallel enabled, otherwise no-op
+        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+            hidden_states = jax.sharding.reshard(hidden_states, jax.sharding.PartitionSpec(None))
+
         output = self.logits_processor(hidden_states, cast(Embed, self.lm_head), logits_metadata)
 
         return output, layers_kv_fused, True, layers_topk_ids

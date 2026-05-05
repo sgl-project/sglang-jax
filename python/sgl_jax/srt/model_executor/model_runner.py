@@ -318,6 +318,9 @@ class ModelRunner(BaseModelRunner):
         # DeepseekV3DecoderLayer to construct DeepseekV3Attention; harmless on
         # non-MLA models that ignore the attribute.
         self.model_config.hf_config.use_absorbed_mla = self.server_args.attention_backend == "fa"
+        self.model_config.hf_config.enable_sequence_parallel = (
+            self.server_args.enable_sequence_parallel
+        )
 
         if self.server_args.ep_dispatch_algorithm:
             with jax.set_mesh(self.mesh):
