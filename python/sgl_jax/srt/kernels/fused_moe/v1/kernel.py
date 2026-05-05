@@ -2739,6 +2739,7 @@ def _fused_ep_moe_kernel(
 
             wait_a2a_scatter_send_batch()
             wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
+            sync_barrier()
 
             acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
 
@@ -2838,6 +2839,7 @@ def _fused_ep_moe_kernel(
             lax.fori_loop(final_se_block, se_total_blocks, cleanup_body, None)
 
             wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
+            sync_barrier()
 
             acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
 
