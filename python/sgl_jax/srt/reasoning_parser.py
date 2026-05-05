@@ -201,7 +201,7 @@ class Glm45Detector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
         super().__init__(
             "<think>",
             "</think>",
