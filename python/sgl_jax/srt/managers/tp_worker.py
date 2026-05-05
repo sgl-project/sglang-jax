@@ -1,11 +1,9 @@
 """A tensor parallel worker."""
 
-import itertools
 import logging
 import os
 import signal
 import threading
-import time
 from queue import Queue
 
 import jax
@@ -14,7 +12,6 @@ import numpy as np
 import psutil
 from flax import nnx
 from jax.experimental.multihost_utils import broadcast_one_to_all
-from tqdm import tqdm
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.constrained.bitmask_ops import allocate_token_bitmask
@@ -22,23 +19,13 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorO
 from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
-    ModelWorkerSamplingInfo,
     global_server_args_dict,
 )
-from sgl_jax.srt.managers.utils import resolve_future_token_ids, set_future_token_ids
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
-from sgl_jax.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_executor.model_runner import MockModelRunner, ModelRunner
-from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingMetadata
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
-from sgl_jax.srt.utils.common_utils import (
-    PRECOMPILE_DEFAULT_BS_PADDINGS,
-    PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
-)
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -207,38 +194,19 @@ class ModelWorker:
         self.max_padded_batch_size, self.max_padded_num_tokens = self.get_max_padded_size()
 
         # precompile
-        self.precompile_token_paddings = server_args.precompile_token_paddings
+        from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 
-        # normalize server_args.precompile_token_paddings
-        # ensure every token padding value is not less than max_runnig_requests
-        self.normalize_token_paddings()
-
-        bs_padding_list = (
-            server_args.precompile_bs_paddings
-            if server_args.precompile_bs_paddings is not None
-            else PRECOMPILE_DEFAULT_BS_PADDINGS
+        self.compilation_manager = CompilationManager(
+            server_args=server_args,
+            max_padded_batch_size=self.max_padded_batch_size,
+            max_padded_num_tokens=self.max_padded_num_tokens,
+            dp_size=self.dp_size,
+            tp_size=self.tp_size,
+            page_size=self.page_size,
+            max_req_len=self.max_req_len,
+            vocab_size=self.model_config.vocab_size,
+            multimodal=server_args.multimodal,
         )
-        self.precompile_bs_paddings = []
-        for bs in bs_padding_list:
-            if (
-                bs <= self.max_padded_batch_size
-                and (server_args.moe_backend != "fused" or bs >= self.tp_size * 2)
-                and bs >= self.dp_size
-            ):
-                self.precompile_bs_paddings.append(bs)
-        self.precompile_bs_paddings.sort()
-        if (
-            len(self.precompile_bs_paddings) == 0
-            or self.precompile_bs_paddings[-1] < self.max_padded_batch_size
-        ):
-            self.precompile_bs_paddings.append(self.max_padded_batch_size)
-
-        # padding cache_loc_paddings
-        # note: the length of following two cache_loc_paddings must keep the same to length of separate bs_paddings.
-        self.precompile_cache_loc_paddings = [
-            item * ((self.max_req_len + self.page_size - 1) // self.page_size * self.page_size)
-            for item in self.precompile_bs_paddings
-        ]
 
         self.parent_process = psutil.Process().parent()
         self.sync_queue = Queue()
@@ -261,141 +229,15 @@ class ModelWorker:
             layers_topk_ids, model_worker_batch = self.sync_queue.get()
             get_global_experts_capturer().on_forward_end(layers_topk_ids, model_worker_batch)
 
-    def normalize_token_paddings(self):
-        normalized_token_paddings = []
-        dp_size = self.dp_size
-
-        if self.precompile_token_paddings is None:
-            # Multiply default token paddings by dp_size for DP mode
-            self.precompile_token_paddings = [
-                item * dp_size for item in PRECOMPILE_DEFAULT_TOKEN_PADDINGS
-            ]
-
-        for item in self.precompile_token_paddings:
-            # Ensure item is divisible by dp_size
-            if item % dp_size != 0:
-                item = (item // dp_size) * dp_size
-            if (
-                item >= self.max_padded_batch_size
-                and item <= self.max_padded_num_tokens
-                and item >= dp_size
-            ):
-                normalized_token_paddings.append(item)
-
-        normalized_token_paddings.sort()
-        if (
-            len(normalized_token_paddings) == 0
-            or normalized_token_paddings[-1] < self.max_padded_num_tokens
-        ):
-            # max_padded_num_tokens is already multiplied by dp_size in get_max_padded_size
-            normalized_token_paddings.append(self.max_padded_num_tokens)
-
-        self.precompile_token_paddings = normalized_token_paddings
-
     def run_precompile(self, future_token_ids_map=None):
-        self.precompile_extend(future_token_ids_map)
-        self.precompile_decode(future_token_ids_map)
-
-    def precompile_extend(self, future_token_ids_map=None):
-        start_time = time.perf_counter()
-        logger.info(
-            "[EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s",
-            self.precompile_bs_paddings[-1:],
-            self.precompile_token_paddings,
+        prepare_lora = self.prepare_lora_batch if self.server_args.enable_lora else None
+        self.compilation_manager.precompile_all(
+            forward_fn=self.forward_batch_generation,
+            model_runner=self.model_runner,
+            mesh=self.mesh,
+            prepare_lora_fn=prepare_lora,
+            future_token_ids_map=future_token_ids_map,
         )
-
-        bs, _ = self.get_max_padded_size()
-        pairs = list(itertools.product([bs], self.precompile_token_paddings))
-
-        with tqdm(pairs, desc="[EXTEND] PRECOMPILE", leave=False) as pbar:
-            for pair in pbar:
-                pair = list(pair)
-                bs, num_tokens = pair[0], pair[1]
-                pbar.set_postfix(bs=bs, tokens=num_tokens)
-                if bs > num_tokens:
-                    logger.warning("bs=%s > num_tokens=%s, skip this pair", bs, num_tokens)
-                    continue
-                model_worker_batch = self.generate_model_worker_batch(
-                    bs,
-                    num_tokens,
-                    ForwardMode.EXTEND,
-                    self.precompile_cache_loc_paddings[-1],
-                    enable_static_lora=self.server_args.enable_static_lora,
-                    dp_size=self.dp_size,
-                    per_dp_bs_size=bs // self.dp_size,
-                )
-                # Prepare LoRA batch if LoRA is enabled
-                if self.server_args.enable_lora:
-                    self.prepare_lora_batch(model_worker_batch)
-                sampling_metadata = SamplingMetadata.from_model_worker_batch(
-                    model_worker_batch,
-                    0,
-                    self.mesh,
-                    self.model_config.vocab_size,
-                )
-                model_worker_batch.forward_batch = ForwardBatch.init_new(
-                    model_worker_batch, self.model_runner
-                )
-                if future_token_ids_map is not None:
-                    model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
-                        model_worker_batch.forward_batch.input_ids,
-                        future_token_ids_map,
-                        self.mesh,
-                    )
-
-                self.forward_batch_generation(model_worker_batch, None, False, sampling_metadata)
-        end_time = time.perf_counter()
-        logger.info("[EXTEND] Precompile finished in %.0f secs", end_time - start_time)
-
-    def precompile_decode(self, future_token_ids_map=None):
-        start_time = time.perf_counter()
-        logger.info(
-            "[DECODE] Begin to precompile bs_paddings=%s",
-            self.precompile_bs_paddings,
-        )
-
-        with tqdm(
-            enumerate(self.precompile_bs_paddings),
-            desc="[DECODE] PRECOMPILE",
-            leave=False,
-            total=len(self.precompile_bs_paddings),
-        ) as pbar:
-            for i, bs in pbar:
-                pbar.set_postfix(bs=bs)
-                # use precompile_cache_loc_paddings directly to ensure consistency
-                aligned_cache_loc_size = self.precompile_cache_loc_paddings[i]
-                model_worker_batch = self.generate_model_worker_batch(
-                    bs,
-                    bs,
-                    ForwardMode.DECODE,
-                    aligned_cache_loc_size,
-                    enable_static_lora=self.server_args.enable_static_lora,
-                    dp_size=self.dp_size,
-                    per_dp_bs_size=bs // self.dp_size,
-                )
-                # Prepare LoRA batch if LoRA is enabled
-                if self.server_args.enable_lora:
-                    self.prepare_lora_batch(model_worker_batch)
-                sampling_metadata = SamplingMetadata.from_model_worker_batch(
-                    model_worker_batch, 0, self.mesh, self.model_config.vocab_size
-                )
-                model_worker_batch.forward_batch = ForwardBatch.init_new(
-                    model_worker_batch, self.model_runner
-                )
-                if future_token_ids_map is not None:
-                    model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
-                        model_worker_batch.forward_batch.input_ids,
-                        future_token_ids_map,
-                        self.mesh,
-                    )
-                _, next_token_ids, _ = self.forward_batch_generation(
-                    model_worker_batch, None, False, sampling_metadata
-                )
-                if future_token_ids_map is not None:
-                    set_future_token_ids(future_token_ids_map, 0, next_token_ids, self.mesh)
-
-        end_time = time.perf_counter()
-        logger.info("[DECODE] Precompile finished in %.0f secs", end_time - start_time)
 
     def set_forward_metadata(self, model_worker_batch: ModelWorkerBatch):
         self.model_runner.attn_backend.forward_metadata = (
@@ -431,80 +273,9 @@ class ModelWorker:
 
     def get_precompile_paddings(self):
         return (
-            self.precompile_token_paddings,
-            self.precompile_bs_paddings,
-            self.precompile_cache_loc_paddings,
-        )
-
-    def generate_model_worker_batch(
-        self,
-        bs: int,
-        num_tokens: int,
-        mode: ForwardMode,
-        max_cache_loc_size: int,
-        do_penalties: bool = False,
-        speculative_algotithm=None,
-        enable_static_lora: bool = None,
-        dp_size: int = 1,
-        per_dp_bs_size: int = 0,
-    ) -> ModelWorkerBatch:
-        valid_input_ids = np.array([1] * bs, dtype=jnp.int32)
-        invalid_input_ids = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
-        # TokenToKVPoolAllocator uses 1..N indices (0 is reserved as a "dummy" slot).
-        # Keep precompile batches consistent with the real allocator so that
-        # per-token validity masks (out_cache_loc > 0) and KV updates behave as
-        # expected, especially for small bs (e.g. bs=1).
-        valid_out_cache_loc = np.arange(1, bs + 1, dtype=jnp.int32)
-        invalid_out_cache_loc = np.array([-1] * (num_tokens - bs), dtype=jnp.int32)
-        valid_positions = np.array([0] * bs, dtype=jnp.int32)
-        invalid_positions = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
-        invalid_cache_loc_size = max_cache_loc_size - bs
-        if invalid_cache_loc_size < 0:
-            raise ValueError(f"padding cache_loc_size {invalid_cache_loc_size} < 0!")
-
-        valid_cache_loc = np.arange(bs)
-        invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
-        lora_ids = ["0"] * bs
-
-        extend_seq_lens = np.array([1] * bs) if mode == ForwardMode.EXTEND else None
-        logits_indices = np.array([0] * bs) if mode == ForwardMode.EXTEND else None
-
-        return ModelWorkerBatch(
-            bid=1,
-            forward_mode=mode,
-            input_ids=np.concat([valid_input_ids, invalid_input_ids], axis=0),
-            real_input_ids_len=len(valid_input_ids),
-            real_bs=bs,
-            req_pool_indices=np.arange(bs, dtype=np.int32),
-            seq_lens=np.array([1] * bs, dtype=np.int32),
-            out_cache_loc=np.concat([valid_out_cache_loc, invalid_out_cache_loc], axis=0),
-            return_logprob=False,
-            return_output_logprob_only=True,
-            sampling_info=(
-                ModelWorkerSamplingInfo.generate_for_precompile(bs, self.model_config.vocab_size)
-                if speculative_algotithm is None
-                else SamplingBatchInfo.generate_for_precompile_all_greedy(
-                    bs, self.model_config.vocab_size
-                )
-            ),
-            extend_input_logprob_token_ids=None,
-            positions=np.concat([valid_positions, invalid_positions], axis=0),
-            cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
-            extend_prefix_lens=(np.array([0] * bs) if mode == ForwardMode.EXTEND else None),
-            extend_seq_lens=extend_seq_lens,
-            top_logprobs_nums=None,
-            token_ids_logprobs=None,
-            extend_logprob_start_lens=None,
-            logits_indices=logits_indices,
-            capture_hidden_mode=(
-                CaptureHiddenMode.FULL if self.server_args.multimodal else CaptureHiddenMode.NULL
-            ),
-            spec_algorithm=speculative_algotithm,
-            lora_ids=lora_ids,  # Already set to [None] * bs above
-            dp_size=dp_size,
-            per_dp_bs_size=per_dp_bs_size,
-            real_bs_per_dp=[bs] * dp_size,
-            logits_indices_selector=np.arange(bs, dtype=np.int32),
+            self.compilation_manager.token_buckets,
+            self.compilation_manager.bs_buckets,
+            self.compilation_manager.cache_loc_buckets,
         )
 
     def get_model_runner(self):

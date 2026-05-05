@@ -54,7 +54,7 @@ from sgl_jax.srt.precision_tracer import (
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.sampling.sampling_params import DEFAULT_SAMPLING_SEED, SamplingParams
 from sgl_jax.srt.server_args import ServerArgs
-from sgl_jax.srt.utils.common_utils import get_bool_env_var
+from sgl_jax.srt.utils.common_utils import get_bool_env_var, pad_to_bucket
 
 if TYPE_CHECKING:
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
@@ -1694,8 +1694,8 @@ class ScheduleBatch:
             if info.seq_lens is not None:
                 max_bs_per_dp = max(max_bs_per_dp, len(info.seq_lens))
 
-        token_padding, _ = find_padding_size(max_tokens_per_dp * self.dp_size, token_paddings)
-        bs_padding, _ = find_padding_size(max_bs_per_dp * self.dp_size, bs_paddings)
+        token_padding, _ = pad_to_bucket(max_tokens_per_dp * self.dp_size, token_paddings)
+        bs_padding, _ = pad_to_bucket(max_bs_per_dp * self.dp_size, bs_paddings)
 
         return (
             token_padding // self.dp_size,
@@ -1869,7 +1869,7 @@ class ScheduleBatch:
         else:
             # For decode mode, use the cache_loc_padding that corresponds to the bs bucket.
             total_bs = per_dp_bs_size * self.dp_size
-            _, bs_index = find_padding_size(total_bs, bs_paddings)
+            _, bs_index = pad_to_bucket(total_bs, bs_paddings)
             total_cache_loc_size = cache_loc_paddings[bs_index]
 
         per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
@@ -2566,57 +2566,6 @@ def _compute_mrope_positions_for_batch(
         pad = np.zeros((3, pad_len), dtype=mrope_positions.dtype)
         mrope_positions = np.concatenate([mrope_positions, pad], axis=1)
     return mrope_positions
-
-
-def find_padding_size(current_len: int, size_buckets: list[int]) -> tuple[int, int]:
-    """Find appropriate padding size from sorted size buckets.
-
-    Args:
-        current_len: Current length of the array
-        size_buckets: Sorted list of size buckets
-
-    Returns:
-        (target_size, index): Target size (bucket size) and index in sorted size_buckets
-
-    Raises:
-        AssertionError: If current_len exceeds all available buckets
-    """
-    size_buckets_sorted = sorted(size_buckets)
-    for index, size in enumerate(size_buckets_sorted):
-        if size >= current_len:
-            return size, index
-
-    # No suitable bucket found - this is a configuration error
-    raise AssertionError(
-        f"No suitable padding bucket found for length {current_len}. "
-        f"Available buckets: {size_buckets_sorted}. "
-        f"Please increase bucket sizes in configuration."
-    )
-
-
-def pad_array_to_size(
-    arr: np.ndarray, target_size: int, pad_value: int = 0, dtype: np.dtype = None
-) -> np.ndarray:
-    """Pad numpy array to target size.
-
-    Args:
-        arr: Array to pad
-        target_size: Target size after padding
-        pad_value: Value to use for padding
-        dtype: Data type for padding values (defaults to arr.dtype)
-
-    Returns:
-        Padded array
-    """
-    if len(arr) >= target_size:
-        return arr
-
-    if dtype is None:
-        dtype = arr.dtype
-
-    padding_size = target_size - len(arr)
-    padding = np.array([pad_value] * padding_size, dtype=dtype)
-    return np.concatenate([arr, padding], axis=0)
 
 
 @dataclasses.dataclass
