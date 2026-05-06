@@ -257,6 +257,12 @@ class MMReqState(ReqState):
     rid: str = ""
 
 
+@dataclasses.dataclass(frozen=True)
+class _LoadedMultimodalPayload:
+    data: Any
+    hash: int | None
+
+
 class MultimodalTokenizer(TokenizerManager):
     """Tokenization manager for multimodal requests.
 
@@ -346,7 +352,7 @@ class MultimodalTokenizer(TokenizerManager):
         """
         if hasattr(reqs, "__len__") and len(reqs) > 0 and self.server_args.log_requests:
             logger.info("handle_batch_output %s, self.rid_to_state %s", reqs, self.rid_to_state)
-        if isinstance(reqs, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)):
+        if isinstance(reqs, BatchStrOut | BatchEmbeddingOut | BatchTokenIDOut):
             return super()._handle_batch_output(reqs)
 
         for req in reqs:
@@ -481,18 +487,35 @@ class MultimodalTokenizer(TokenizerManager):
                 "Check model_path and trust_remote_code settings."
             )
         if image_data or video_data or audio_data:
-            images = [
-                self._load_image_from_source(item) for item in image_data
+            image_payloads = [
+                self._load_image_with_hash(item) for item in image_data
             ]  # note: We did not perform a resize operation
+            images = [payload.data for payload in image_payloads]
+            image_hash = self._combine_mm_hashes(
+                [payload.hash for payload in image_payloads],
+                "image",
+            )
             processor_kwargs = {}
             if video_data and self._is_qwen_video_processor():
                 video_config = self._build_qwen_video_config(obj)
-                videos = [self._preprocess_qwen_video(item, video_config) for item in video_data]
+                video_payloads = [
+                    self._preprocess_qwen_video_with_hash(item, video_config) for item in video_data
+                ]
                 processor_kwargs["videos_kwargs"] = {"do_sample_frames": False}
                 processor_kwargs["videos_kwargs"]["fps"] = video_config.get("fps", _QWEN_FPS)
             else:
-                videos = [self._load_video_from_source(item) for item in video_data]
-            audios = [self._load_audio_from_source(item) for item in audio_data]
+                video_payloads = [self._load_video_with_hash(item) for item in video_data]
+            videos = [payload.data for payload in video_payloads]
+            video_hash = self._combine_mm_hashes(
+                [payload.hash for payload in video_payloads],
+                "video",
+            )
+            audio_payloads = [self._load_audio_with_hash(item) for item in audio_data]
+            audios = [payload.data for payload in audio_payloads]
+            audio_hash = self._combine_mm_hashes(
+                [payload.hash for payload in audio_payloads],
+                "audio",
+            )
             processor_out = self.mm_processor(
                 images=images or None,
                 videos=videos or None,
@@ -546,6 +569,7 @@ class MultimodalTokenizer(TokenizerManager):
                 mm_items.append(
                     MultimodalDataItem(
                         modality=Modality.IMAGE,
+                        hash=image_hash,
                         feature=np.asarray(pixel_values),
                     )
                 )
@@ -553,6 +577,7 @@ class MultimodalTokenizer(TokenizerManager):
                 mm_items.append(
                     MultimodalDataItem(
                         modality=Modality.VIDEO,
+                        hash=video_hash,
                         feature=np.asarray(pixel_values_videos),
                     )
                 )
@@ -563,6 +588,7 @@ class MultimodalTokenizer(TokenizerManager):
                 mm_items.append(
                     MultimodalDataItem(
                         modality=Modality.AUDIO,
+                        hash=audio_hash,
                         feature=np.asarray(audio_features),
                     )
                 )
@@ -642,8 +668,17 @@ class MultimodalTokenizer(TokenizerManager):
     def _preprocess_qwen_video(
         self, source: str | bytes | np.ndarray, video_config: dict
     ) -> np.ndarray:
+        return self._preprocess_qwen_video_with_hash(source, video_config).data
+
+    def _preprocess_qwen_video_with_hash(
+        self, source: str | bytes | np.ndarray, video_config: dict
+    ) -> _LoadedMultimodalPayload:
         if isinstance(source, np.ndarray):
-            return self._resize_video_frames(source, video_config)
+            video = self._resize_video_frames(source, video_config)
+            return _LoadedMultimodalPayload(
+                data=video,
+                hash=self._hash_array_payload(video, "qwen_video", video_config),
+            )
 
         if isinstance(source, dict) and "url" in source:
             source = source["url"]
@@ -656,24 +691,49 @@ class MultimodalTokenizer(TokenizerManager):
         tmp_path = None
         try:
             ctx = cpu(0)
+            payload_hash = None
 
             if isinstance(source, bytes):
+                payload_hash = self._hash_payload(source, "qwen_video", video_config)
                 tmp_path = self._write_temp_video(source)
                 vr = VideoReader(tmp_path, ctx=ctx)
             elif isinstance(source, str):
                 if os.path.exists(source):
+                    with open(source, "rb") as video_file:
+                        payload_hash = self._hash_payload(
+                            video_file.read(),
+                            "qwen_video",
+                            video_config,
+                        )
                     vr = VideoReader(source, ctx=ctx)
                 elif source.startswith(("http://", "https://")):
                     resp = requests.get(source, timeout=10)
                     resp.raise_for_status()
+                    payload_hash = self._hash_payload(
+                        resp.content,
+                        "qwen_video",
+                        video_config,
+                    )
                     tmp_path = self._write_temp_video(resp.content)
                     vr = VideoReader(tmp_path, ctx=ctx)
                 elif source.startswith("data:") and "base64," in source:
                     payload = source.split("base64,", 1)[1]
-                    tmp_path = self._write_temp_video(base64.b64decode(payload))
+                    decoded_payload = base64.b64decode(payload)
+                    payload_hash = self._hash_payload(
+                        decoded_payload,
+                        "qwen_video",
+                        video_config,
+                    )
+                    tmp_path = self._write_temp_video(decoded_payload)
                     vr = VideoReader(tmp_path, ctx=ctx)
                 else:
-                    tmp_path = self._write_temp_video(base64.b64decode(source, validate=True))
+                    decoded_payload = base64.b64decode(source, validate=True)
+                    payload_hash = self._hash_payload(
+                        decoded_payload,
+                        "qwen_video",
+                        video_config,
+                    )
+                    tmp_path = self._write_temp_video(decoded_payload)
                     vr = VideoReader(tmp_path, ctx=ctx)
             else:
                 raise ValueError(f"Unsupported video input type: {type(source)}")
@@ -686,7 +746,10 @@ class MultimodalTokenizer(TokenizerManager):
             idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
             idx = np.unique(idx)
             video_np = vr.get_batch(idx).asnumpy()
-            return self._resize_video_frames(video_np, video_config)
+            return _LoadedMultimodalPayload(
+                data=self._resize_video_frames(video_np, video_config),
+                hash=payload_hash,
+            )
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
@@ -748,61 +811,103 @@ class MultimodalTokenizer(TokenizerManager):
         return np.stack(resized_frames, axis=0)
 
     def _load_image_from_source(self, source: str | bytes) -> Image.Image:
+        return self._load_image_with_hash(source).data
+
+    def _load_image_with_hash(self, source: str | bytes) -> _LoadedMultimodalPayload:
         if isinstance(source, dict) and "url" in source:
             source = source["url"]
         if hasattr(source, "url"):
             source = source.url
         if isinstance(source, bytes):
-            return Image.open(io.BytesIO(source)).convert("RGB")
+            return _LoadedMultimodalPayload(
+                data=Image.open(io.BytesIO(source)).convert("RGB"),
+                hash=self._hash_payload(source, "image"),
+            )
         if os.path.exists(source):
-            return Image.open(source).convert("RGB")
+            with open(source, "rb") as image_file:
+                payload = image_file.read()
+            return _LoadedMultimodalPayload(
+                data=Image.open(io.BytesIO(payload)).convert("RGB"),
+                hash=self._hash_payload(payload, "image"),
+            )
         if source.startswith(("http://", "https://")):
             resp = requests.get(source, timeout=10)
             resp.raise_for_status()
-            return Image.open(io.BytesIO(resp.content)).convert("RGB")
+            return _LoadedMultimodalPayload(
+                data=Image.open(io.BytesIO(resp.content)).convert("RGB"),
+                hash=self._hash_payload(resp.content, "image"),
+            )
         if source.startswith("data:") and "base64," in source:
             payload = source.split("base64,", 1)[1]
-            return Image.open(io.BytesIO(base64.b64decode(payload))).convert("RGB")
+            decoded_payload = base64.b64decode(payload)
+            return _LoadedMultimodalPayload(
+                data=Image.open(io.BytesIO(decoded_payload)).convert("RGB"),
+                hash=self._hash_payload(decoded_payload, "image"),
+            )
         try:
-            return Image.open(io.BytesIO(base64.b64decode(source, validate=True))).convert("RGB")
+            decoded_payload = base64.b64decode(source, validate=True)
+            return _LoadedMultimodalPayload(
+                data=Image.open(io.BytesIO(decoded_payload)).convert("RGB"),
+                hash=self._hash_payload(decoded_payload, "image"),
+            )
         except Exception as exc:
             raise ValueError("Unsupported image source format") from exc
 
     def _load_video_from_source(self, source: str | bytes) -> np.ndarray:
+        return self._load_video_with_hash(source).data
+
+    def _load_video_with_hash(self, source: str | bytes) -> _LoadedMultimodalPayload:
         if isinstance(source, dict) and "url" in source:
             source = source["url"]
         if hasattr(source, "url"):
             source = source.url
         if isinstance(source, bytes):
+            payload_hash = self._hash_payload(source, "video")
             with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
                 tmp.write(source)
                 tmp_path = tmp.name
             try:
-                return iio.imread(tmp_path, index=None)
+                return _LoadedMultimodalPayload(
+                    data=iio.imread(tmp_path, index=None),
+                    hash=payload_hash,
+                )
             finally:
                 os.unlink(tmp_path)
         if os.path.exists(source):
-            return iio.imread(source, index=None)
+            with open(source, "rb") as video_file:
+                payload_hash = self._hash_payload(video_file.read(), "video")
+            return _LoadedMultimodalPayload(
+                data=iio.imread(source, index=None),
+                hash=payload_hash,
+            )
         if source.startswith(("http://", "https://")):
             resp = requests.get(source, timeout=10)
             resp.raise_for_status()
+            payload_hash = self._hash_payload(resp.content, "video")
             with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
                 tmp.write(resp.content)
                 tmp_path = tmp.name
             try:
-                return iio.imread(tmp_path, index=None)
+                return _LoadedMultimodalPayload(
+                    data=iio.imread(tmp_path, index=None),
+                    hash=payload_hash,
+                )
             finally:
                 os.unlink(tmp_path)
         raise ValueError("Unsupported video source format")
 
     def _load_audio_from_source(self, source: str | bytes) -> np.ndarray:
+        return self._load_audio_with_hash(source).data
+
+    def _load_audio_with_hash(self, source: str | bytes) -> _LoadedMultimodalPayload:
         if not hasattr(self.mm_processor, "feature_extractor"):
-            return None
+            return _LoadedMultimodalPayload(data=None, hash=None)
         if isinstance(source, dict) and "url" in source:
             source = source["url"]
         if hasattr(source, "url"):
             source = source.url
         if isinstance(source, bytes):
+            payload_hash = self._hash_payload(source, "audio")
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
                 tmp.write(source)
                 tmp_path = tmp.name
@@ -810,33 +915,56 @@ class MultimodalTokenizer(TokenizerManager):
                 audio_data, _ = librosa.load(
                     tmp_path, self.mm_processor.feature_extractor.sampling_rate
                 )
-                return audio_data
+                return _LoadedMultimodalPayload(data=audio_data, hash=payload_hash)
             finally:
                 os.unlink(tmp_path)
         if os.path.exists(source):
+            with open(source, "rb") as audio_file:
+                payload_hash = self._hash_payload(audio_file.read(), "audio")
             audio_data, _ = librosa.load(source, self.mm_processor.feature_extractor.sampling_rate)
-            return audio_data
+            return _LoadedMultimodalPayload(data=audio_data, hash=payload_hash)
         if source.startswith(("http://", "https://")):
-            try:
-                audio_data, _ = librosa.load(
-                    BytesIO(urlopen(source, timeout=10).read()),
-                    sr=self.mm_processor.feature_extractor.sampling_rate,
-                )
-                return audio_data
-            finally:
-                pass
+            payload = urlopen(source, timeout=10).read()
+            audio_data, _ = librosa.load(
+                BytesIO(payload),
+                sr=self.mm_processor.feature_extractor.sampling_rate,
+            )
+            return _LoadedMultimodalPayload(
+                data=audio_data,
+                hash=self._hash_payload(payload, "audio"),
+            )
         raise ValueError("Unsupported audio source format")
 
-    def _hash_payload(self, payload: bytes) -> int:
-        digest = hashlib.sha256(payload).digest()[:8]
+    def _hash_payload(self, payload: bytes, *metadata: Any) -> int:
+        hasher = hashlib.sha256()
+        for item in metadata:
+            hasher.update(repr(item).encode())
+            hasher.update(b"\0")
+        hasher.update(payload)
+        digest = hasher.digest()[:8]
         return int.from_bytes(digest, byteorder="big", signed=False) % (1 << 31)
+
+    def _hash_array_payload(self, value: np.ndarray, *metadata: Any) -> int:
+        array = np.ascontiguousarray(value)
+        return self._hash_payload(
+            array.tobytes(),
+            *metadata,
+            str(array.dtype),
+            tuple(int(dim) for dim in array.shape),
+        )
+
+    def _combine_mm_hashes(self, hashes: list[int | None], modality: str) -> int | None:
+        valid_hashes = [value for value in hashes if value is not None]
+        if not valid_hashes:
+            return None
+        return self._hash_payload(repr(tuple(valid_hashes)).encode(), modality)
 
     def _hash_mm_items(self, images: list[Image.Image], videos: list[np.ndarray]) -> list[int]:
         pad_values = []
         for image in images:
-            pad_values.append(self._hash_payload(image.tobytes()))
+            pad_values.append(self._hash_payload(image.tobytes(), "image"))
         for video in videos:
-            pad_values.append(self._hash_payload(video.tobytes()))
+            pad_values.append(self._hash_array_payload(video, "video"))
         return pad_values
 
     def _to_grid_list(self, grid_thw: Any) -> list[tuple[int, int, int]] | None:
