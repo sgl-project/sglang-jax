@@ -1,16 +1,4 @@
-"""RecurrentStatePool -- recurrent + conv state buffer pool for linear recurrent layers.
-
-Dual list containers:
-    recurrent_buffers: list[jax.Array], length L, each [total_slots, H, D, D]
-    conv_buffers: list[list[jax.Array]], outer L, inner 1, each [total_slots, proj_size, K-1]
-
-Slot 0 reserved as dummy; valid slots start from 1 (aligned with sglang MambaPool).
-total_slots = ceil_to_dp(size + 1, dp_size) so the slot dim is evenly divisible
-by dp_size for P("data", ...) sharding.
-
-Pure buffer pool: slot allocator state lives in HybridReqToTokenPool.
-Does NOT inherit from KVCache.
-"""
+"""RecurrentStatePool -- buffer pool for linear recurrent layers (KDA/Mamba/GDN)."""
 
 from __future__ import annotations
 
@@ -40,7 +28,6 @@ def _ceil_to(value: int, divisor: int) -> int:
 
 @register_pytree_node_class
 class RecurrentStatePool:
-    """Recurrent + conv state buffer pool (per-slot indexing, no slot allocator)."""
 
     def __init__(
         self,
@@ -161,7 +148,6 @@ class RecurrentStatePool:
         return recurrent_buffers, conv_buffers
 
     def clear_slot(self, idx_or_indices) -> None:
-        """Zero the per-slot buffers for the given slot(s). Used for clear-on-alloc."""
         indices = [idx_or_indices] if isinstance(idx_or_indices, int) else list(idx_or_indices)
         if not indices:
             return
@@ -176,10 +162,6 @@ class RecurrentStatePool:
                     )
 
     def get_linear_recurrent_layer_cache(self, layer_id: int):
-        """Read the per-layer view, keyed by model-global layer_id.
-
-        Returns (recurrent_per_layer, conv_per_layer).
-        """
         if layer_id not in self.layers_mapping:
             raise ValueError(
                 f"layer_id={layer_id} is not a registered linear recurrent layer. "
@@ -189,10 +171,6 @@ class RecurrentStatePool:
         return self.recurrent_buffers[idx], self.conv_buffers[idx]
 
     def replace_buffer(self, buffers) -> None:
-        """Update both buffer-list references after a JIT donate.
-
-        buffers: tuple[list[jax.Array], list[list[jax.Array]]]
-        """
         new_recurrent, new_conv = buffers
 
         assert len(new_recurrent) == self.num_linear_recurrent_layers
@@ -215,7 +193,6 @@ class RecurrentStatePool:
                 self.conv_buffers[layer][i] = buf
 
     def clear(self) -> None:
-        """Full reset: zero out every layer's recurrent + conv buffer."""
         for layer in range(self.num_linear_recurrent_layers):
             self.recurrent_buffers[layer] = jnp.zeros_like(self.recurrent_buffers[layer])
             for inner in range(len(self.conv_buffers[layer])):
