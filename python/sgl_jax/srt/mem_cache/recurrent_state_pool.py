@@ -194,6 +194,7 @@ class RecurrentStatePool:
             tuple(self.linear_recurrent_layer_ids),
             self.size,
             self.dp_size,
+            self.total_slots,
             self.num_heads,
             self.head_dim,
             self.num_k_heads,
@@ -205,6 +206,8 @@ class RecurrentStatePool:
             self.recurrent_partition_axis,
             self.conv_partition_axis,
             self.data_partition_axis,
+            self.recurrent_sharding,
+            self.conv_sharding,
         )
         return children, aux
 
@@ -214,6 +217,7 @@ class RecurrentStatePool:
             linear_recurrent_layer_ids_tup,
             size,
             dp_size,
+            total_slots,
             num_heads,
             head_dim,
             num_k_heads,
@@ -225,6 +229,8 @@ class RecurrentStatePool:
             recurrent_partition_axis,
             conv_partition_axis,
             data_partition_axis,
+            recurrent_sharding,
+            conv_sharding,
         ) = aux_data
         obj = cls.__new__(cls)
         obj.linear_recurrent_layer_ids = list(linear_recurrent_layer_ids_tup)
@@ -234,7 +240,7 @@ class RecurrentStatePool:
         obj.num_linear_recurrent_layers = len(obj.linear_recurrent_layer_ids)
         obj.size = size
         obj.dp_size = dp_size
-        obj.total_slots = _ceil_to(size + 1, dp_size)
+        obj.total_slots = total_slots
         obj.num_heads = num_heads
         obj.head_dim = head_dim
         obj.num_k_heads = num_k_heads
@@ -249,10 +255,8 @@ class RecurrentStatePool:
         obj.recurrent_partition_axis = recurrent_partition_axis
         obj.conv_partition_axis = conv_partition_axis
         obj.data_partition_axis = data_partition_axis
-        obj.recurrent_sharding = NamedSharding(
-            mesh, P(data_partition_axis, recurrent_partition_axis, None, None)
-        )
-        obj.conv_sharding = NamedSharding(mesh, P(data_partition_axis, conv_partition_axis, None))
+        obj.recurrent_sharding = recurrent_sharding
+        obj.conv_sharding = conv_sharding
         new_recurrent, new_conv = children
         obj.recurrent_buffers = list(new_recurrent)
         obj.conv_buffers = [list(inner) for inner in new_conv]
