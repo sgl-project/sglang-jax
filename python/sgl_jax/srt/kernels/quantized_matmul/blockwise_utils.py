@@ -1,33 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Utilities for the TPU blockwise quantized matmul kernel.
-
-This module provides lazy-loading and safe parameter resolution for the
-TPU blockwise quantized matmul kernel.  The overall call flow is:
-
-    kernel.py (xla_quantized_matmul_local)
-        |
-        |-- get_blockwise_kernel()                   # lazy-load the kernel function
-        |-- should_use_blockwise_kernel()            # narrow-N shape guard
-        |-- convert_block_scale_to_kernel_layout()   # scale format conversion
-        |-- get_safe_blockwise_tuned_value()          # resolve TPU tile sizes
-        |       |
-        |       |-- _get_blockwise_tuning_api()          # lazy-load tuning tables
-        |       |-- _iter_blockwise_tuned_candidates()   # find best match in table
-        |       +-- clamp / snap sizes to local matrix   # ensure launch safety
-        |
-        +-- blockwise_kernel(...)                    # invoke the kernel
-
-The tuned value resolution follows a 3-tier fallback strategy:
-  1. Look up a compatible entry from a pre-computed tuning table (best).
-  2. Query ``get_tuned_block_sizes()`` API at runtime.
-  3. Fall back to a conservative default seed ``(128, 128, 128, 1)``.
-
-After obtaining a seed, the final tile sizes are clamped and snapped to
-the actual local matrix dimensions so that the kernel launch is always valid.
-"""
+"""Utilities for the TPU blockwise quantized matmul kernel."""
 
 import functools
-import importlib
 import logging
 import math
 import re
@@ -35,78 +9,19 @@ import re
 import jax
 import jax.numpy as jnp
 
+from .quantized_matmul_kernels import quantized_matmul as blockwise_quantized_matmul
+from .quantized_matmul_kernels.tuned_block_sizes import (
+    TUNED_BLOCK_SIZES,
+    TunedValue,
+    get_tuned_block_sizes,
+)
+
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Lazy-loaded blockwise kernel and tuning state.
-#
-# These globals are populated on first access via get_blockwise_kernel()
-# and _get_blockwise_tuning_api().  The ``_TRIED_LOADING_*`` flags ensure
-# we only attempt the import once per process, even if it fails.
-# ---------------------------------------------------------------------------
-
-# The loaded kernel callable, or None if unavailable.
-_BLOCKWISE_KERNEL = None
-_TRIED_LOADING_BLOCKWISE_KERNEL = False
-
-# Tuning metadata: the namedtuple class, the runtime query function, and
-# the static lookup table from the tuned_block_sizes module.
-_BLOCKWISE_TUNED_VALUE_CLS = None  # e.g. TunedValue namedtuple class
-_BLOCKWISE_GET_TUNED_BLOCK_SIZES = None  # e.g. get_tuned_block_sizes()
-_BLOCKWISE_TUNED_BLOCK_SIZES = None  # e.g. TUNED_BLOCK_SIZES dict
-_TRIED_LOADING_BLOCKWISE_TUNING = False
 
 
 def get_blockwise_kernel():
-    """Lazily load the blockwise kernel implementation."""
-    global _BLOCKWISE_KERNEL, _TRIED_LOADING_BLOCKWISE_KERNEL
-
-    if _TRIED_LOADING_BLOCKWISE_KERNEL:
-        return _BLOCKWISE_KERNEL
-    _TRIED_LOADING_BLOCKWISE_KERNEL = True
-
-    try:
-        package = __package__ or "sgl_jax.srt.kernels.quantized_matmul"
-        module = importlib.import_module(f"{package}.quantized_matmul_kernels")
-        _BLOCKWISE_KERNEL = getattr(module, "quantized_matmul", None)
-    except Exception:
-        logger.debug("Failed to import blockwise quantized matmul kernel.", exc_info=True)
-        _BLOCKWISE_KERNEL = None
-    return _BLOCKWISE_KERNEL
-
-
-def _get_blockwise_tuning_api():
-    """Lazily load tuned-size helpers for the blockwise kernel."""
-    global _BLOCKWISE_TUNED_VALUE_CLS
-    global _BLOCKWISE_GET_TUNED_BLOCK_SIZES
-    global _BLOCKWISE_TUNED_BLOCK_SIZES
-    global _TRIED_LOADING_BLOCKWISE_TUNING
-
-    if _TRIED_LOADING_BLOCKWISE_TUNING:
-        return (
-            _BLOCKWISE_TUNED_VALUE_CLS,
-            _BLOCKWISE_GET_TUNED_BLOCK_SIZES,
-            _BLOCKWISE_TUNED_BLOCK_SIZES,
-        )
-    _TRIED_LOADING_BLOCKWISE_TUNING = True
-
-    try:
-        package = __package__ or "sgl_jax.srt.kernels.quantized_matmul"
-        module = importlib.import_module(f"{package}.quantized_matmul_kernels.tuned_block_sizes")
-        _BLOCKWISE_TUNED_VALUE_CLS = getattr(module, "TunedValue", None)
-        _BLOCKWISE_GET_TUNED_BLOCK_SIZES = getattr(module, "get_tuned_block_sizes", None)
-        _BLOCKWISE_TUNED_BLOCK_SIZES = getattr(module, "TUNED_BLOCK_SIZES", None)
-    except Exception:
-        logger.debug("Failed to import blockwise tuning metadata.", exc_info=True)
-        _BLOCKWISE_TUNED_VALUE_CLS = None
-        _BLOCKWISE_GET_TUNED_BLOCK_SIZES = None
-        _BLOCKWISE_TUNED_BLOCK_SIZES = None
-
-    return (
-        _BLOCKWISE_TUNED_VALUE_CLS,
-        _BLOCKWISE_GET_TUNED_BLOCK_SIZES,
-        _BLOCKWISE_TUNED_BLOCK_SIZES,
-    )
+    """Return the blockwise kernel implementation."""
+    return blockwise_quantized_matmul
 
 
 def _next_multiple(x: int, m: int) -> int:
@@ -317,15 +232,10 @@ def get_safe_blockwise_tuned_value(
     After obtaining a seed, every dimension is clamped and aligned to the
     local matrix so the kernel launch never exceeds the actual tensor bounds.
     """
-    # --- Tier 0: load tuning metadata (lazy, once per process) ---
-    tuned_value_cls, get_tuned_block_sizes, tuned_block_sizes = _get_blockwise_tuning_api()
-    if tuned_value_cls is None:
-        return None
-
     tuned = None
     # --- Tier 1: look up from pre-computed tuning table ---
     compatible_candidates = _iter_blockwise_tuned_candidates(
-        tuned_block_sizes=tuned_block_sizes,
+        tuned_block_sizes=TUNED_BLOCK_SIZES,
         n_batch=n_batch,
         n_out=n_out,
         n_in=n_in,
@@ -336,7 +246,7 @@ def get_safe_blockwise_tuned_value(
     if compatible_candidates:
         tuned = compatible_candidates[0]
     # --- Tier 2: query the tuning API at runtime ---
-    elif get_tuned_block_sizes is not None:
+    else:
         try:
             tuned = get_tuned_block_sizes(
                 n_batch=n_batch,
@@ -352,7 +262,7 @@ def get_safe_blockwise_tuned_value(
         # --- Tier 3: conservative default seed ---
         # Final sizes are still clamped to the current local shape below,
         # so this does not force a fixed launch shape.
-        tuned = tuned_value_cls(128, 128, 128, 1)
+        tuned = TunedValue(128, 128, 128, 1)
 
     # ------------------------------------------------------------------
     # Clamp and align tile sizes to the actual local matrix dimensions.
@@ -382,4 +292,4 @@ def get_safe_blockwise_tuned_value(
     in_block_size = _next_multiple(in_block_size, int(block_size_in))
     in_block_size = min(in_block_size, _floor_multiple(int(n_in), int(block_size_in)))
 
-    return tuned_value_cls(batch_block_size, out_block_size, in_block_size, n_lane_multiplier)
+    return TunedValue(batch_block_size, out_block_size, in_block_size, n_lane_multiplier)
