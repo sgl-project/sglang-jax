@@ -1,5 +1,7 @@
 import base64
 import io
+import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -102,6 +104,42 @@ class TestMultimodalPadValueHash(unittest.TestCase):
         data_url_payload = tokenizer._load_image_with_hash(data_url)
 
         self.assertEqual(direct_payload.hash, data_url_payload.hash)
+
+    def test_local_image_file_hash_matches_payload_hash(self):
+        tokenizer = object.__new__(MultimodalTokenizer)
+        image_bytes = _png_bytes((64, 80, 96))
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp.write(image_bytes)
+            path = tmp.name
+
+        try:
+            direct_payload = tokenizer._load_image_with_hash(image_bytes)
+            file_payload = tokenizer._load_image_with_hash(path)
+        finally:
+            os.unlink(path)
+
+        self.assertEqual(direct_payload.hash, file_payload.hash)
+
+    def test_hash_metadata_is_canonical_for_dict_order(self):
+        tokenizer = object.__new__(MultimodalTokenizer)
+        payload = b"payload"
+
+        self.assertEqual(
+            tokenizer._hash_payload(payload, {"fps": 2.0, "max_pixels": 123}),
+            tokenizer._hash_payload(payload, {"max_pixels": 123, "fps": 2.0}),
+        )
+
+    def test_combined_hash_preserves_order_and_modality(self):
+        tokenizer = object.__new__(MultimodalTokenizer)
+
+        self.assertNotEqual(
+            tokenizer._combine_mm_hashes([1, 2], "image"),
+            tokenizer._combine_mm_hashes([2, 1], "image"),
+        )
+        self.assertNotEqual(
+            tokenizer._combine_mm_hashes([1, 2], "image"),
+            tokenizer._combine_mm_hashes([1, 2], "video"),
+        )
 
 
 if __name__ == "__main__":
