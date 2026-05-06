@@ -2356,19 +2356,20 @@ class WeightLoader:
 
             if mapping.sharding and "expert" in mapping.sharding:
                 ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
-                if ep_size > 1:
-                    world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
-                    tp_size = world_size // ep_size
+                world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
+                tp_size = world_size // ep_size
 
-                    devices = self.mesh.devices.flatten()
-                    moe_mesh = jax.sharding.Mesh(
-                        devices.reshape(ep_size, tp_size), axis_names=("expert", "tensor")
-                    )
-                    final_sharding_spec = P(*mapping.sharding)
-                    final_sharding = jax.sharding.NamedSharding(moe_mesh, final_sharding_spec)
-                else:
-                    final_sharding_spec = P(*mapping.sharding)
-                    final_sharding = jax.sharding.NamedSharding(self.mesh, final_sharding_spec)
+                devices = self.mesh.devices.flatten()
+                moe_mesh = jax.sharding.Mesh(
+                    devices.reshape(ep_size, tp_size),
+                    axis_names=("expert", "tensor"),
+                    axis_types=(
+                        jax.sharding.AxisType.Explicit,
+                        jax.sharding.AxisType.Explicit,
+                    ),
+                )
+                final_sharding_spec = P(*mapping.sharding)
+                final_sharding = jax.sharding.NamedSharding(moe_mesh, final_sharding_spec)
             else:
                 final_sharding_spec = P(*mapping.sharding) if mapping.sharding else P()
                 final_sharding = jax.sharding.NamedSharding(self.mesh, final_sharding_spec)
