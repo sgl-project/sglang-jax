@@ -3,6 +3,7 @@ import base64
 import dataclasses
 import hashlib
 import io
+import json
 import logging
 import math
 import os
@@ -699,12 +700,11 @@ class MultimodalTokenizer(TokenizerManager):
                 vr = VideoReader(tmp_path, ctx=ctx)
             elif isinstance(source, str):
                 if os.path.exists(source):
-                    with open(source, "rb") as video_file:
-                        payload_hash = self._hash_payload(
-                            video_file.read(),
-                            "qwen_video",
-                            video_config,
-                        )
+                    payload_hash = self._hash_file_payload(
+                        source,
+                        "qwen_video",
+                        video_config,
+                    )
                     vr = VideoReader(source, ctx=ctx)
                 elif source.startswith(("http://", "https://")):
                     resp = requests.get(source, timeout=10)
@@ -824,11 +824,11 @@ class MultimodalTokenizer(TokenizerManager):
                 hash=self._hash_payload(source, "image"),
             )
         if os.path.exists(source):
-            with open(source, "rb") as image_file:
-                payload = image_file.read()
+            with Image.open(source) as image:
+                image_data = image.convert("RGB")
             return _LoadedMultimodalPayload(
-                data=Image.open(io.BytesIO(payload)).convert("RGB"),
-                hash=self._hash_payload(payload, "image"),
+                data=image_data,
+                hash=self._hash_file_payload(source, "image"),
             )
         if source.startswith(("http://", "https://")):
             resp = requests.get(source, timeout=10)
@@ -874,11 +874,9 @@ class MultimodalTokenizer(TokenizerManager):
             finally:
                 os.unlink(tmp_path)
         if os.path.exists(source):
-            with open(source, "rb") as video_file:
-                payload_hash = self._hash_payload(video_file.read(), "video")
             return _LoadedMultimodalPayload(
                 data=iio.imread(source, index=None),
-                hash=payload_hash,
+                hash=self._hash_file_payload(source, "video"),
             )
         if source.startswith(("http://", "https://")):
             resp = requests.get(source, timeout=10)
@@ -919,10 +917,11 @@ class MultimodalTokenizer(TokenizerManager):
             finally:
                 os.unlink(tmp_path)
         if os.path.exists(source):
-            with open(source, "rb") as audio_file:
-                payload_hash = self._hash_payload(audio_file.read(), "audio")
             audio_data, _ = librosa.load(source, self.mm_processor.feature_extractor.sampling_rate)
-            return _LoadedMultimodalPayload(data=audio_data, hash=payload_hash)
+            return _LoadedMultimodalPayload(
+                data=audio_data,
+                hash=self._hash_file_payload(source, "audio"),
+            )
         if source.startswith(("http://", "https://")):
             payload = urlopen(source, timeout=10).read()
             audio_data, _ = librosa.load(
@@ -937,10 +936,32 @@ class MultimodalTokenizer(TokenizerManager):
 
     def _hash_payload(self, payload: bytes, *metadata: Any) -> int:
         hasher = hashlib.sha256()
-        for item in metadata:
-            hasher.update(repr(item).encode())
-            hasher.update(b"\0")
+        self._update_hash_metadata(hasher, *metadata)
         hasher.update(payload)
+        return self._hash_digest(hasher)
+
+    def _hash_file_payload(self, path: str, *metadata: Any) -> int:
+        hasher = hashlib.sha256()
+        self._update_hash_metadata(hasher, *metadata)
+        with open(path, "rb") as file:
+            for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        return self._hash_digest(hasher)
+
+    @staticmethod
+    def _update_hash_metadata(hasher: Any, *metadata: Any) -> None:
+        for item in metadata:
+            metadata_payload = json.dumps(
+                item,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode()
+            hasher.update(len(metadata_payload).to_bytes(8, byteorder="big", signed=False))
+            hasher.update(metadata_payload)
+
+    @staticmethod
+    def _hash_digest(hasher: Any) -> int:
         digest = hasher.digest()[:8]
         return int.from_bytes(digest, byteorder="big", signed=False) % (1 << 31)
 
@@ -957,14 +978,17 @@ class MultimodalTokenizer(TokenizerManager):
         valid_hashes = [value for value in hashes if value is not None]
         if not valid_hashes:
             return None
-        return self._hash_payload(repr(tuple(valid_hashes)).encode(), modality)
+        payload = b"".join(
+            value.to_bytes(8, byteorder="big", signed=False) for value in valid_hashes
+        )
+        return self._hash_payload(payload, modality)
 
     def _hash_mm_items(self, images: list[Image.Image], videos: list[np.ndarray]) -> list[int]:
         pad_values = []
         for image in images:
-            pad_values.append(self._hash_payload(image.tobytes(), "image"))
+            pad_values.append(self._hash_payload(image.tobytes()))
         for video in videos:
-            pad_values.append(self._hash_array_payload(video, "video"))
+            pad_values.append(self._hash_payload(video.tobytes()))
         return pad_values
 
     def _to_grid_list(self, grid_thw: Any) -> list[tuple[int, int, int]] | None:
