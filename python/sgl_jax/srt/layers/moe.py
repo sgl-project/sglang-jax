@@ -9,6 +9,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import is_supported_by_gmm_v2
 
 # Re-export for backward compatibility: external code imports from this module.
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE  # noqa: F401
@@ -564,15 +565,27 @@ class EPMoE(nnx.Module):
         else:
             x = inputs_2d[token_indices].astype(self.dtype)
 
-        # TODO(Qinghan): DeepSeek-V2-Lite has num_experts_per_tok=6, so with
-        # the default power-of-2 bs bucketing `padded_bs * 6` can land on a
-        # value > 16 that isn't a multiple of 16 (e.g. bs=4 -> size_m=24),
-        # which is why this padding is necessary. Models with power-of-2
-        # top_k (Grok=2, DeepSeek-V3=8, Qwen3-MoE=8) wouldn't need it.
+        # Pad x once to the GMM kernel's row-tile alignment so the three
+        # downstream gmm() calls (w0, w1, wo via intermediate_layer) all see
+        # aligned m and skip their own pad paths.
+        #
+        # gmm_v2 requires m to be a multiple of 32: out_index_map uses floor
+        # for non-last groups vs cdiv for the last group, which produces NaNs
+        # when intermediate group ends fall on sub-tile boundaries.
+        # gmm_v1 prefers a multiple of 128 to fully utilize the MXU.
+        #
+        # Sublane alignment is also required for the LHS layout (e.g. for
+        # DeepSeek-V2-Lite top_k=6 with bs=4, raw size_m=24 isn't sublane
+        # aligned). The kernel-tile alignments above already cover sublane.
         from jax.experimental.pallas import tpu as pltpu
 
         sublane_align = pltpu.get_tpu_info().get_sublane_tiling(x.dtype)
-        pad_size = (-x.shape[0]) % sublane_align
+        gmm_scales = (w0_kernel_scale, w1_kernel_scale, wo_kernel_scale)
+        kernel_tile_align = (
+            32 if all(is_supported_by_gmm_v2(scale) for scale in gmm_scales) else 128
+        )
+        required_align = max(sublane_align, kernel_tile_align)
+        pad_size = (-x.shape[0]) % required_align
         if pad_size > 0:
             x = jnp.pad(x, ((0, pad_size), (0, 0)))
             group_sizes = group_sizes.at[-1].add(pad_size)
