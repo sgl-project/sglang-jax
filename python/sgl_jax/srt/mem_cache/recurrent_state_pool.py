@@ -83,16 +83,6 @@ class RecurrentStatePool:
         # total_slots: size+1 (for dummy slot 0), ceil to dp_size
         self.total_slots = _ceil_to(size + 1, dp_size)
 
-        assert size > 0, f"size must be > 0, got {size}"
-        assert num_heads > 0
-        assert head_dim > 0
-        assert num_k_heads > 0
-        assert head_k_dim > 0
-        assert (
-            conv_kernel_size >= 2
-        ), f"conv_kernel_size must be >= 2 (got {conv_kernel_size}); K=1 produces empty conv buffers."
-        assert self.proj_size > 0
-
         self.mesh = mesh
         self.recurrent_partition_axis = recurrent_partition_axis
         self.conv_partition_axis = conv_partition_axis
