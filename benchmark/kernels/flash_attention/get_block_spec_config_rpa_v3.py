@@ -57,11 +57,9 @@ def benchmark_backend(
             kv_head_num,
             head_dim,
             page_size=page_size,
+            static_q_len=static_q_len,
         )
 
-        if static_q_len is None:
-            # Updating distribution for mixed kernel
-            distribution = distribution.at[1].set(0)
     else:
         (
             q,
@@ -160,7 +158,6 @@ def benchmark_backend(
     # Benchmark
     rpa_case = "d" if static_q_len == 1 else "m" if static_q_len is None else "p"
     scope_name = f"RPA{rpa_case}-p_{page_size}-bq_{bq_sz}_{bq_csz}-bkv_{bkv_sz}_{bkv_csz}"
-    print(scope_name)
     times = multiple_iteration_timeit_from_trace(
         compute_func=lambda: attn(),
         data_generator=lambda: (),
