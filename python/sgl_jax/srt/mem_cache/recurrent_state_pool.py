@@ -165,22 +165,21 @@ class RecurrentStatePool:
 
         assert len(new_recurrent) == self.num_linear_recurrent_layers
         assert len(new_conv) == self.num_linear_recurrent_layers
-        for layer in range(self.num_linear_recurrent_layers):
-            assert len(new_conv[layer]) == len(self.conv_buffers[layer])
 
+        # tp_size==1 sharding fix: see MHATokenToKVPool.replace_buffer
         tp_degenerate = self.mesh.shape.get("tensor", 1) == 1
         for layer in range(self.num_linear_recurrent_layers):
             buf = new_recurrent[layer]
-            if tp_degenerate and hasattr(self, "recurrent_sharding"):
+            if tp_degenerate:
                 buf = jax.device_put(buf, self.recurrent_sharding)
             self.recurrent_buffers[layer] = buf
 
-        for layer in range(self.num_linear_recurrent_layers):
+            assert len(new_conv[layer]) == len(self.conv_buffers[layer])
             for i in range(len(new_conv[layer])):
-                buf = new_conv[layer][i]
-                if tp_degenerate and hasattr(self, "conv_sharding"):
-                    buf = jax.device_put(buf, self.conv_sharding)
-                self.conv_buffers[layer][i] = buf
+                cbuf = new_conv[layer][i]
+                if tp_degenerate:
+                    cbuf = jax.device_put(cbuf, self.conv_sharding)
+                self.conv_buffers[layer][i] = cbuf
 
     def clear(self) -> None:
         for layer in range(self.num_linear_recurrent_layers):
@@ -195,7 +194,6 @@ class RecurrentStatePool:
             tuple(self.linear_recurrent_layer_ids),
             self.size,
             self.dp_size,
-            self.total_slots,
             self.num_heads,
             self.head_dim,
             self.num_k_heads,
@@ -207,8 +205,6 @@ class RecurrentStatePool:
             self.recurrent_partition_axis,
             self.conv_partition_axis,
             self.data_partition_axis,
-            self.recurrent_sharding,
-            self.conv_sharding,
         )
         return children, aux
 
@@ -218,7 +214,6 @@ class RecurrentStatePool:
             linear_recurrent_layer_ids_tup,
             size,
             dp_size,
-            total_slots,
             num_heads,
             head_dim,
             num_k_heads,
@@ -230,8 +225,6 @@ class RecurrentStatePool:
             recurrent_partition_axis,
             conv_partition_axis,
             data_partition_axis,
-            recurrent_sharding,
-            conv_sharding,
         ) = aux_data
         obj = cls.__new__(cls)
         obj.linear_recurrent_layer_ids = list(linear_recurrent_layer_ids_tup)
@@ -241,7 +234,7 @@ class RecurrentStatePool:
         obj.num_linear_recurrent_layers = len(obj.linear_recurrent_layer_ids)
         obj.size = size
         obj.dp_size = dp_size
-        obj.total_slots = total_slots
+        obj.total_slots = _ceil_to(size + 1, dp_size)
         obj.num_heads = num_heads
         obj.head_dim = head_dim
         obj.num_k_heads = num_k_heads
@@ -256,8 +249,10 @@ class RecurrentStatePool:
         obj.recurrent_partition_axis = recurrent_partition_axis
         obj.conv_partition_axis = conv_partition_axis
         obj.data_partition_axis = data_partition_axis
-        obj.recurrent_sharding = recurrent_sharding
-        obj.conv_sharding = conv_sharding
+        obj.recurrent_sharding = NamedSharding(
+            mesh, P(data_partition_axis, recurrent_partition_axis, None, None)
+        )
+        obj.conv_sharding = NamedSharding(mesh, P(data_partition_axis, conv_partition_axis, None))
         new_recurrent, new_conv = children
         obj.recurrent_buffers = list(new_recurrent)
         obj.conv_buffers = [list(inner) for inner in new_conv]
