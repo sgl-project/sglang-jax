@@ -36,6 +36,13 @@ _LOCAL_MODEL_LOG_ONCE: set[str] = set()
 def _validate_local_snapshot(d: Path) -> bool:
     if not (d / "config.json").is_file():
         return False
+
+    has_tokenizer = (d / "tokenizer.json").is_file() or (
+        (d / "tokenizer_config.json").is_file() and (d / "vocab.json").is_file()
+    )
+    if not has_tokenizer:
+        return False
+
     index = d / "model.safetensors.index.json"
     if index.is_file():
         try:
@@ -46,8 +53,12 @@ def _validate_local_snapshot(d: Path) -> bool:
         if not shards:
             return False
         return all((d / s).is_file() for s in shards)
-    weights = list(d.glob("*.safetensors")) + list(d.glob("*.bin"))
-    return len(weights) > 0
+
+    has_single_weight_file = (d / "model.safetensors").is_file() or any(d.glob("*.bin"))
+    has_sharded_weight_file = any(d.glob("*-of-*.safetensors")) or any(d.glob("*-of-*.bin"))
+    if has_sharded_weight_file and not index.is_file():
+        return False
+    return has_single_weight_file
 
 
 def _local_or_hf(repo: str) -> str:
