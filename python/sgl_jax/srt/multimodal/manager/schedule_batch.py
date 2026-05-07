@@ -213,6 +213,9 @@ class Req:
     is_prefill: bool = True  # True for first forward pass, False for decode steps
     is_finished: bool = False  # True when EOS token is generated
 
+    def __post_init__(self):
+        self.initialize_dependent_fields()
+
     def to_stage_reqs(self, scheduler: str):
         logger.debug(
             "to_stage_reqs: scheduler=%s, rid=%s, output=%s, audio_codes=%s, input_ids=%s",
@@ -550,3 +553,9 @@ class Req:
                 rows.append(row)
 
         return jnp.stack(rows, axis=0)[None, :, :]
+
+    def initialize_dependent_fields(self):
+        """Initialize dependent fields after dataclass initialization."""
+        # Set do_classifier_free_guidance based on guidance scale and negative prompt
+        if self.guidance_scale > 1.0 and self.negative_prompt is not None:
+            self.do_classifier_free_guidance = True
