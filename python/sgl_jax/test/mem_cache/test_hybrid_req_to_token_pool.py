@@ -37,14 +37,12 @@ class FakeReq:
         kv_committed_len=0,
         dp_rank=None,
         recurrent_pool_idx=None,
-        _chunked_slot_pinned=False,
     ):
         self.req_pool_idx = req_pool_idx
         self.is_chunked = is_chunked
         self.kv_committed_len = kv_committed_len
         self.dp_rank = dp_rank
         self.recurrent_pool_idx = recurrent_pool_idx
-        self._chunked_slot_pinned = _chunked_slot_pinned
 
 
 # ---------------------------------------------------------------------------
@@ -172,45 +170,6 @@ class TestHybridPoolFreeSingleDP(CustomTestCase):
         self.assertIsNotNone(indices)
         self.assertIsNotNone(req2.req_pool_idx)
         self.assertIsNotNone(req2.recurrent_pool_idx)
-
-
-class TestHybridPoolChunkedSingleDP(CustomTestCase):
-    """Chunked request lifecycle with dp_size=1."""
-
-    def setUp(self):
-        self.state_pool = FakeRecurrentStatePool(size=8)
-        self.pool = HybridReqToTokenPool(
-            size=8,
-            max_context_len=32,
-            dtype=np.int32,
-            recurrent_state_pool=self.state_pool,
-            dp_size=1,
-        )
-
-    def test_free_chunked_pins_recurrent_slot(self):
-        req = FakeReq(dp_rank=0)
-        self.pool.alloc([req])
-        recurrent_idx = req.recurrent_pool_idx
-        recurrent_avail = self.pool.recurrent_available_size(0)
-
-        self.pool.free_chunked(req)
-
-        self.assertTrue(req._chunked_slot_pinned)
-        self.assertEqual(req.recurrent_pool_idx, recurrent_idx)
-        self.assertEqual(self.pool.recurrent_available_size(0), recurrent_avail)
-
-    def test_pinned_req_free_skips_recurrent_release(self):
-        req = FakeReq(dp_rank=0)
-        self.pool.alloc([req])
-        recurrent_idx = req.recurrent_pool_idx
-
-        self.pool.free_chunked(req)
-        recurrent_avail = self.pool.recurrent_available_size(0)
-
-        self.pool.free_recurrent_cache(req)
-
-        self.assertEqual(req.recurrent_pool_idx, recurrent_idx)
-        self.assertEqual(self.pool.recurrent_available_size(0), recurrent_avail)
 
 
 class TestHybridPoolGetIndicesSingleDP(CustomTestCase):
@@ -362,21 +321,7 @@ class TestHybridPoolAllocMultiDP(CustomTestCase):
         self.assertEqual(result[0], req0.recurrent_pool_idx)
         self.assertEqual(result[1], req1.recurrent_pool_idx)
 
-
-class TestHybridPoolChunkedMultiDP(CustomTestCase):
-    """Chunked request lifecycle with dp_size=2."""
-
-    def setUp(self):
-        self.state_pool = FakeRecurrentStatePool(size=8)
-        self.pool = HybridReqToTokenPool(
-            size=8,
-            max_context_len=32,
-            dtype=np.int32,
-            recurrent_state_pool=self.state_pool,
-            dp_size=2,
-        )
-
-    def test_chunked_survives_across_batches_multi_dp(self):
+    def test_chunked_reuses_recurrent_slot_across_batches(self):
         chunked = FakeReq(dp_rank=0)
         peer = FakeReq(dp_rank=0)
         self.pool.alloc([chunked, peer])
@@ -391,21 +336,6 @@ class TestHybridPoolChunkedMultiDP(CustomTestCase):
         self.assertIsNotNone(indices)
         self.assertEqual(chunked.recurrent_pool_idx, chunked_recurrent)
         self.assertIsNotNone(new_peer.recurrent_pool_idx)
-
-    def test_free_chunked_then_free_on_different_dp_rank(self):
-        req0 = FakeReq(dp_rank=0)
-        req1 = FakeReq(dp_rank=1)
-        self.pool.alloc([req0])
-        self.pool.alloc([req1])
-
-        self.pool.free_chunked(req0)
-        avail_dp0 = self.pool.recurrent_available_size(0)
-
-        self.pool.free(req1)
-
-        self.assertEqual(self.pool.recurrent_available_size(0), avail_dp0)
-        self.assertTrue(req0._chunked_slot_pinned)
-        self.assertIsNone(req1.recurrent_pool_idx)
 
 
 if __name__ == "__main__":

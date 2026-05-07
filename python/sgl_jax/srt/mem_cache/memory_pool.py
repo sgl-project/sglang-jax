@@ -153,9 +153,6 @@ class ReqToTokenPool:
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
 
-    def free_chunked(self, chunked_req: Req):
-        self.free(chunked_req)
-
     def clear(self):
         """Clear all allocation states"""
         self.free_slots = list(range(self.size))
@@ -210,14 +207,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.free_recurrent_cache(req)
         super().free(req)
 
-    def free_chunked(self, chunked_req: Req):
-        chunked_req._chunked_slot_pinned = True
-
     def free_recurrent_cache(self, req: Req):
-        recurrent_idx = getattr(req, "recurrent_pool_idx", None)
+        recurrent_idx = req.recurrent_pool_idx
         if recurrent_idx is None:
-            return
-        if getattr(req, "_chunked_slot_pinned", False):
             return
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
         self.recurrent_free_slots[dp_rank].append(recurrent_idx)

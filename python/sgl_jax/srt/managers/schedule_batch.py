@@ -215,7 +215,6 @@ class Req:
         # Memory pool info
         self.req_pool_idx: int | None = None
         self.recurrent_pool_idx: int | None = None
-        self._chunked_slot_pinned: bool = False
 
         # Check finish
         self.tokenizer = None
@@ -556,7 +555,6 @@ class Req:
         self.latest_bid = None
         self.cache_protected_len = 0
         self.recurrent_pool_idx = None
-        self._chunked_slot_pinned = False
 
     def set_finish_with_abort(self, error_msg: str):
         # set it to one token to skip the long prefill
