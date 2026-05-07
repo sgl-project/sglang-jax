@@ -572,7 +572,10 @@ class EPMoE(nnx.Module):
         from jax.experimental.pallas import tpu as pltpu
 
         sublane_align = pltpu.get_tpu_info().get_sublane_tiling(x.dtype)
-        pad_size = (-x.shape[0]) % sublane_align
+        # TODO: remove once bucketing guarantees total_tokens*top_k divisible by GMM tile_m=128.
+        gmm_tile_m = 128
+        align = max(sublane_align, gmm_tile_m)
+        pad_size = (-x.shape[0]) % align
         if pad_size > 0:
             x = jnp.pad(x, ((0, pad_size), (0, 0)))
             group_sizes = group_sizes.at[-1].add(pad_size)

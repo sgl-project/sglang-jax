@@ -104,7 +104,11 @@ def quantized_matmul_kernel(
 
     # TODO(amandaliang): Make this configurable.
     acc_dtype = jnp.bfloat16
-    if quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer):
+    if (
+        quantize_activation
+        and jnp.issubdtype(w_q.dtype, jnp.integer)
+        and jnp.issubdtype(x_q_dtype, jnp.integer)
+    ):
         acc_dtype = jnp.int32
 
     vmem_limit_bytes = util.get_vmem_limit(
@@ -130,12 +134,12 @@ def quantized_matmul_kernel(
     # allowing the compiler to overlap output fusion and packing overhead with MXU computation
     # TODO(amandaliang): use pltpu.get_tpu_info().mxu_column_size when JAX version is newer
     compute_tile_n = MXU_SIZE * n_lane_multiplier
-    steps_n = out_block_size // compute_tile_n
+    steps_n = max(1, out_block_size // compute_tile_n)
 
     def kernel(lhs_ref, rhs_ref, w_scales_ref, out_ref, acc_scratch):
         pid_k = pl.program_id(2)
         is_first_step = pid_k == 0
-        is_last_step = pid_k == (n_in - 1)
+        is_last_step = pid_k == (orig_n_in // in_block_size - 1)
 
         def accum(is_first_step, is_last_step):
             accumulators = [None] * steps_n
