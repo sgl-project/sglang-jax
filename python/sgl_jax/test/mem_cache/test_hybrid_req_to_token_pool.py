@@ -32,13 +32,14 @@ def _mesh_dp_tp(dp_size):
     return Mesh(devices, ("data", "tensor"))
 
 
-def _make_req(req_pool_idx=None, is_chunked=0, kv_committed_len=0):
+def _make_req(req_pool_idx=None, is_chunked=0, kv_committed_len=0, dp_rank=None):
     """Minimal Req surrogate exposing only the attributes hybrid pool reads."""
     return SimpleNamespace(
         req_pool_idx=req_pool_idx,
         recurrent_pool_idx=None,
         is_chunked=is_chunked,
         kv_committed_len=kv_committed_len,
+        dp_rank=dp_rank,
     )
 
 
@@ -59,6 +60,7 @@ def _make_pool(size=4, mesh=None, dp_size=1):
         max_context_len=8,
         dtype=np.int32,
         recurrent_state_pool=rsp,
+        dp_size=dp_size,
     )
     return pool, rsp
 
@@ -99,16 +101,16 @@ class TestHybridReqToTokenPool(CustomTestCase):
                 rsp.recurrent_buffers[0] = rsp.recurrent_buffers[0].at[slot].set(7.5)
 
                 req_a.is_chunked = 1
-                rec_before = list(pool.recurrent_free_slots)
+                rec_before = list(pool.recurrent_free_slots[0])
 
                 if case == "partial_reuse":
                     req_b = _make_req()
                     pool.alloc([req_a, req_b])
-                    self.assertEqual(len(pool.recurrent_free_slots), len(rec_before) - 1)
+                    self.assertEqual(len(pool.recurrent_free_slots[0]), len(rec_before) - 1)
                     self.assertNotEqual(req_b.recurrent_pool_idx, slot)
                 else:
                     pool.alloc([req_a])
-                    self.assertEqual(pool.recurrent_free_slots, rec_before)
+                    self.assertEqual(pool.recurrent_free_slots[0], rec_before)
 
                 # Reused slot retains its sentinel (not cleared on alloc).
                 self.assertEqual(req_a.recurrent_pool_idx, slot)
@@ -132,7 +134,7 @@ class TestHybridReqToTokenPool(CustomTestCase):
                     reqs = [_make_req() for _ in range(4)]
 
                 kv_before = list(pool.free_slots)
-                rec_before = list(pool.recurrent_free_slots)
+                rec_before = list(pool.recurrent_free_slots[0])
                 mapping_before = pool.req_index_to_recurrent_index_mapping.copy()
 
                 self.assertIsNone(pool.alloc(reqs))
@@ -140,7 +142,7 @@ class TestHybridReqToTokenPool(CustomTestCase):
                     self.assertIsNone(req.req_pool_idx)
                     self.assertIsNone(req.recurrent_pool_idx)
                 self.assertEqual(pool.free_slots, kv_before)
-                self.assertEqual(pool.recurrent_free_slots, rec_before)
+                self.assertEqual(pool.recurrent_free_slots[0], rec_before)
                 self.assertTrue(
                     bool((pool.req_index_to_recurrent_index_mapping == mapping_before).all())
                 )
@@ -150,7 +152,7 @@ class TestHybridReqToTokenPool(CustomTestCase):
         pool, _ = _make_pool(size=3)
         reqs = [_make_req() for _ in range(3)]
         self.assertIsNotNone(pool.alloc(reqs))
-        self.assertEqual(pool.recurrent_free_slots, [])
+        self.assertEqual(pool.recurrent_free_slots[0], [])
 
     def test_alloc_assert_on_unsanctioned_reuse(self):
         """Inherits parent assert: a req holding req_pool_idx but is_chunked
@@ -175,7 +177,7 @@ class TestHybridReqToTokenPool(CustomTestCase):
 
                 if case == "no_recurrent_slot":
                     pool.free_recurrent_cache(req)
-                    rec_free_before = list(pool.recurrent_free_slots)
+                    rec_free_before = list(pool.recurrent_free_slots[0])
 
                 kv_free_before = len(pool.free_slots)
                 pool.free(req)
@@ -185,10 +187,10 @@ class TestHybridReqToTokenPool(CustomTestCase):
                 self.assertIsNone(req.req_pool_idx)
                 self.assertIsNone(req.recurrent_pool_idx)
                 if case == "full":
-                    self.assertIn(rec_slot, pool.recurrent_free_slots)
+                    self.assertIn(rec_slot, pool.recurrent_free_slots[0])
                 else:
-                    # no_recurrent_slot: recurrent_free_slots unchanged by free()
-                    self.assertEqual(pool.recurrent_free_slots, rec_free_before)
+                    # no_recurrent_slot: rank's free list unchanged by free()
+                    self.assertEqual(pool.recurrent_free_slots[0], rec_free_before)
 
     def test_alloc_after_free_clears_recurrent_buffer(self):
         """clear-on-alloc reuse path: write non-zero, free, re-alloc -> zeroed.
@@ -214,7 +216,7 @@ class TestHybridReqToTokenPool(CustomTestCase):
         pool.clear()
 
         self.assertEqual(pool.free_slots, list(range(pool.size)))
-        self.assertEqual(pool.recurrent_free_slots, [1, 2, 3, 4])
+        self.assertEqual(pool.recurrent_free_slots, [[1, 2, 3, 4]])
         self.assertTrue(bool(jnp.all(rsp.recurrent_buffers[0] == 0)))
         self.assertTrue(bool((pool.req_index_to_recurrent_index_mapping == 0).all()))
 
@@ -250,13 +252,13 @@ class TestHybridReqToTokenPool(CustomTestCase):
         """Sanity for the smallest usable pool. Confirms there is no implicit
         assumption that size > 1 in alloc / free / mapping paths."""
         pool, rsp = _make_pool(size=1)
-        self.assertEqual(pool.recurrent_free_slots, [1])
+        self.assertEqual(pool.recurrent_free_slots, [[1]])
         self.assertEqual(pool.req_index_to_recurrent_index_mapping.shape, (1,))
 
         req = _make_req()
         self.assertIsNotNone(pool.alloc([req]))
         self.assertEqual(req.recurrent_pool_idx, 1)
-        self.assertEqual(pool.recurrent_free_slots, [])
+        self.assertEqual(pool.recurrent_free_slots, [[]])
 
         # Second alloc on a drained size=1 pool must fail atomically.
         req2 = _make_req()
@@ -265,36 +267,86 @@ class TestHybridReqToTokenPool(CustomTestCase):
         self.assertIsNone(req2.recurrent_pool_idx)
 
         pool.free(req)
-        self.assertEqual(pool.recurrent_free_slots, [1])
+        self.assertEqual(pool.recurrent_free_slots, [[1]])
 
 
 class TestHybridReqToTokenPoolDP(CustomTestCase):
+    """dp_size > 1 contracts: per-rank allocator state, LOCAL slot indexing,
+    cross-rank isolation."""
+
     @classmethod
     def setUpClass(cls):
         if len(jax.devices()) < 2:
             raise unittest.SkipTest("DP tests need >= 2 devices")
 
-    def test_dp_capacity_decoupled_from_total_slots(self):
-        """Host-side allocator capacity is decoupled from RecurrentStatePool's
-        DP-padded total_slots. With dp_size=2 and size=3, total_slots ceils
-        to 4 for buffer divisibility; recurrent_free_slots still hands out
-        exactly 3 valid slots [1..3]. Full alloc/free roundtrip must work
-        identically to the dp_size=1 case.
+    def test_init_per_rank_local_indexing(self):
+        """Each rank gets its own free list of LOCAL indices [1..slots_per_rank].
+        slots_per_rank = rsp.size // dp_size; the rank's local view of the
+        DP-sharded buffer indexes into its own slice."""
+        mesh = _mesh_dp_tp(dp_size=2)
+        pool, rsp = _make_pool(size=4, mesh=mesh, dp_size=2)
+        self.assertEqual(pool.dp_size, 2)
+        self.assertEqual(pool.slots_per_rank, 2)  # 4 // 2
+        self.assertEqual(pool.recurrent_free_slots, [[1, 2], [1, 2]])
+
+    def test_alloc_routes_to_req_dp_rank(self):
+        """alloc(reqs) draws slots from the rank named by reqs[0].dp_rank;
+        the other rank's free list stays untouched. Slots returned are
+        per-rank local indices (so two reqs on different ranks can both
+        legitimately hold local slot 1)."""
+        mesh = _mesh_dp_tp(dp_size=2)
+        pool, _ = _make_pool(size=4, mesh=mesh, dp_size=2)
+
+        reqs_rank0 = [_make_req(dp_rank=0), _make_req(dp_rank=0)]
+        self.assertIsNotNone(pool.alloc(reqs_rank0))
+        self.assertEqual(pool.recurrent_free_slots[0], [])
+        self.assertEqual(pool.recurrent_free_slots[1], [1, 2])
+        self.assertEqual(sorted(r.recurrent_pool_idx for r in reqs_rank0), [1, 2])
+
+        reqs_rank1 = [_make_req(dp_rank=1)]
+        self.assertIsNotNone(pool.alloc(reqs_rank1))
+        # rank 1 gets local slot 1 (independent allocator state).
+        self.assertEqual(reqs_rank1[0].recurrent_pool_idx, 1)
+        self.assertEqual(pool.recurrent_free_slots[1], [2])
+
+    def test_alloc_capacity_miss_is_per_rank(self):
+        """A capacity miss on one rank must not mutate the other rank's
+        free list or any req fields (atomic per-rank semantics)."""
+        mesh = _mesh_dp_tp(dp_size=2)
+        pool, _ = _make_pool(size=4, mesh=mesh, dp_size=2)
+
+        # Drain rank 0.
+        pool.alloc([_make_req(dp_rank=0), _make_req(dp_rank=0)])
+        rank1_before = list(pool.recurrent_free_slots[1])
+
+        # Third rank-0 req triggers per-rank capacity miss.
+        third = _make_req(dp_rank=0)
+        self.assertIsNone(pool.alloc([third]))
+        self.assertIsNone(third.req_pool_idx)
+        self.assertIsNone(third.recurrent_pool_idx)
+        # Rank 1 untouched.
+        self.assertEqual(pool.recurrent_free_slots[1], rank1_before)
+
+    def test_free_routes_to_req_dp_rank(self):
+        """free(req) returns the slot to the rank named by req.dp_rank.
+        Cross-rank free routing must not corrupt the other rank's free list.
         """
         mesh = _mesh_dp_tp(dp_size=2)
-        pool, rsp = _make_pool(size=3, mesh=mesh, dp_size=2)
-        self.assertEqual(rsp.size, 3)
-        self.assertEqual(rsp.total_slots, 4)  # ceil(3+1, 2)
-        self.assertEqual(pool.recurrent_free_slots, [1, 2, 3])
+        pool, _ = _make_pool(size=4, mesh=mesh, dp_size=2)
 
-        reqs = [_make_req(), _make_req(), _make_req()]
-        self.assertIsNotNone(pool.alloc(reqs))
-        self.assertEqual(pool.recurrent_free_slots, [])
+        req0 = _make_req(dp_rank=0)
+        req1 = _make_req(dp_rank=1)
+        pool.alloc([req0])
+        pool.alloc([req1])
+        # Both got local slot 1.
+        self.assertEqual(req0.recurrent_pool_idx, 1)
+        self.assertEqual(req1.recurrent_pool_idx, 1)
+        self.assertEqual(pool.recurrent_free_slots, [[2], [2]])
 
-        pool.free(reqs[0])
-        req_new = _make_req()
-        self.assertIsNotNone(pool.alloc([req_new]))
-        self.assertEqual(pool.recurrent_free_slots, [])
+        pool.free(req0)
+        # Rank 0 reclaims slot 1; rank 1 still holds slot 1.
+        self.assertEqual(pool.recurrent_free_slots[0], [2, 1])
+        self.assertEqual(pool.recurrent_free_slots[1], [2])
 
 
 if __name__ == "__main__":

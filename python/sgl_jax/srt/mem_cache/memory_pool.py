@@ -161,15 +161,18 @@ class ReqToTokenPool:
 class HybridReqToTokenPool(ReqToTokenPool):
     """Coordinates KV slot + recurrent state slot allocation for hybrid models.
 
-    Owns the recurrent slot allocator state (recurrent_free_slots and the
-    req_pool_idx -> recurrent_pool_idx mapping) so RecurrentStatePool stays a
-    pure pytree leaf safe for JIT donate. The host-side allocator state must
+    Owns the recurrent slot allocator state (per-DP recurrent_free_slots and
+    the req_pool_idx -> recurrent_pool_idx mapping) so RecurrentStatePool stays
+    a pure pytree leaf safe for JIT donate. The host-side allocator state must
     NOT enter a JIT-donated pytree (would otherwise reset on tree_unflatten),
     therefore this class is intentionally NOT registered as a pytree node.
 
-    Slot 0 of RecurrentStatePool is reserved as the dummy slot; the mapping
-    defaults to 0 so an unallocated req lands on the dummy slot. Mirrors the
-    sglang PyTorch MambaPool free_slots semantics.
+    DP indexing: recurrent_pool_idx is a per-rank LOCAL index, not global.
+    RecurrentStatePool's first buffer dim is sharded on the 'data' axis, so
+    each DP rank's local view is the slice [0, slots_per_rank). Slot 0 of
+    that local view is the dummy slot; valid local slots are 1..slots_per_rank.
+    The mapping defaults to 0 so an unallocated req lands on the dummy slot.
+    Mirrors the sglang PyTorch MambaPool free_slots semantics.
     """
 
     def __init__(
@@ -178,34 +181,54 @@ class HybridReqToTokenPool(ReqToTokenPool):
         max_context_len: int,
         dtype: np.dtype,
         recurrent_state_pool,
+        dp_size: int = 1,
     ):
         super().__init__(size=size, max_context_len=max_context_len, dtype=dtype)
         self.recurrent_state_pool = recurrent_state_pool
-        # 1-indexed: slot 0 in RecurrentStatePool buffers is the dummy slot;
-        # valid slots are 1..size. Mapping entries default to 0 so an
-        # unallocated req lands on the dummy slot.
-        self.recurrent_free_slots: list[int] = list(range(1, recurrent_state_pool.size + 1))
+        self.dp_size = dp_size
+        # Per-rank capacity. RecurrentStatePool ceil-pads its physical buffer
+        # to (size+1) for DP divisibility; valid slots per rank are
+        # 1..slots_per_rank in that rank's local buffer view.
+        self.slots_per_rank = recurrent_state_pool.size // dp_size
+        self.recurrent_free_slots: list[list[int]] = [
+            list(range(1, self.slots_per_rank + 1)) for _ in range(dp_size)
+        ]
         self.req_index_to_recurrent_index_mapping = np.zeros(size, dtype=np.int32)
+
+    @staticmethod
+    def _dp_rank(req: Req) -> int:
+        return req.dp_rank if req.dp_rank is not None else 0
 
     def alloc(self, reqs: list[Req]) -> list[int] | None:
         """Coordinate KV slot + recurrent slot allocation; atomic semantics.
 
+        Callers (prepare_for_extend / decode) iterate per-DP, so all reqs in
+        a single alloc() call share the same dp_rank — the slot is drawn
+        from that rank's free list.
+
         Strategy:
-          1. Pre-check recurrent capacity for fresh allocs.
+          1. Pre-check recurrent capacity on the target rank.
           2. super().alloc(reqs) — KV slot path is already atomic (returns
              None and leaves req fields untouched on capacity miss).
-          3. Batch-slice the needed recurrent slots, clear-on-alloc all of
-             them in one recurrent_state_pool.clear_slot call (avoids
-             per-slot JIT scatter overhead), then assign + write mapping.
+          3. Pop recurrent slots, clear-on-alloc all of them in one
+             recurrent_state_pool.clear_slot call (avoids per-slot JIT
+             scatter overhead), then assign + write mapping.
 
         Reuse path: a req that already holds recurrent_pool_idx (e.g. the
-        next chunk of a chunked prefill) keeps its slot — recurrent_free_slots
-        is untouched and the mapping entry is rewritten to the same value.
-        Mirrors the parent's "req_pool_idx is not None -> reuse" contract.
+        next chunk of a chunked prefill) keeps its slot — the rank's free
+        list is untouched and the mapping entry is rewritten to the same
+        value. Mirrors the parent's "req_pool_idx is not None -> reuse"
+        contract.
         """
-        # Pre-check recurrent capacity (only fresh reqs consume a slot).
+        if not reqs:
+            return []
+
+        dp_rank = self._dp_rank(reqs[0])
+        free = self.recurrent_free_slots[dp_rank]
+
+        # Pre-check recurrent capacity on this rank (only fresh reqs consume).
         needed_recurrent = sum(1 for req in reqs if req.recurrent_pool_idx is None)
-        if needed_recurrent > len(self.recurrent_free_slots):
+        if needed_recurrent > len(free):
             return None
 
         # KV slot (parent is atomic). On capacity miss req fields stay untouched
@@ -214,20 +237,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
         if kv_indices is None:
             return None
 
-        # Atomic batch slice + single clear-on-alloc covering every newly-
-        # handed-out slot.
-        new_recurrent_slots = self.recurrent_free_slots[:needed_recurrent]
-        self.recurrent_free_slots = self.recurrent_free_slots[needed_recurrent:]
+        new_recurrent_slots: list[int] = []
+        for req in reqs:
+            if req.recurrent_pool_idx is None:
+                slot = free.pop(0)
+                req.recurrent_pool_idx = slot
+                new_recurrent_slots.append(slot)
+            self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = req.recurrent_pool_idx
 
         if new_recurrent_slots:
             self.recurrent_state_pool.clear_slot(new_recurrent_slots)
-
-        cursor = 0
-        for req in reqs:
-            if req.recurrent_pool_idx is None:
-                req.recurrent_pool_idx = new_recurrent_slots[cursor]
-                cursor += 1
-            self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = req.recurrent_pool_idx
 
         return kv_indices
 
@@ -246,13 +265,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def free_recurrent_cache(self, req: Req) -> None:
         """Release the recurrent state slot held by req. Idempotent.
 
-        Returns the slot to recurrent_free_slots, sets req.recurrent_pool_idx
+        Returns the slot to the rank's free list, sets req.recurrent_pool_idx
         back to None and resets the mapping entry to the dummy slot (0).
         Safe to call when the req has no recurrent slot allocated.
         """
         if req.recurrent_pool_idx is None:
             return
-        self.recurrent_free_slots.append(req.recurrent_pool_idx)
+        dp_rank = self._dp_rank(req)
+        self.recurrent_free_slots[dp_rank].append(req.recurrent_pool_idx)
         self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = 0
         req.recurrent_pool_idx = None
 
@@ -260,18 +280,22 @@ class HybridReqToTokenPool(ReqToTokenPool):
         """Translate req_pool_idx -> recurrent_pool_idx via the host mapping.
 
         Accepts an np.ndarray (or list[int]) and returns the same-shape
-        np.ndarray of recurrent_pool_idx values.
+        np.ndarray of recurrent_pool_idx values (per-rank local indices).
         """
         return self.req_index_to_recurrent_index_mapping[req_pool_indices]
 
+    def recurrent_available_size(self, dp_rank: int = 0) -> int:
+        return len(self.recurrent_free_slots[dp_rank])
+
     def clear(self) -> None:
-        """Full reset: KV slot allocator + recurrent slot allocator + recurrent
-        buffers + mapping zeroed. Called from flush_cache.
+        """Full reset: KV slot allocator + per-rank recurrent slot allocators
+        + recurrent buffers + mapping zeroed. Called from flush_cache.
         """
         super().clear()
         self.recurrent_state_pool.clear()
-        self.recurrent_free_slots = list(range(1, self.recurrent_state_pool.size + 1))
-        self.req_index_to_recurrent_index_mapping[:] = 0
+        for rank in range(self.dp_size):
+            self.recurrent_free_slots[rank] = list(range(1, self.slots_per_rank + 1))
+        self.req_index_to_recurrent_index_mapping.fill(0)
 
 
 @register_pytree_node_class
