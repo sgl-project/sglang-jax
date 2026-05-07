@@ -18,13 +18,9 @@ class FakeRecurrentStatePool:
 
     def __init__(self, size: int):
         self.size = size
-        self.cleared_slots: list[list[int]] = []
-
-    def clear_slot(self, indices: list[int]):
-        self.cleared_slots.append(list(indices))
 
     def clear(self):
-        self.cleared_slots.clear()
+        pass
 
 
 class FakeReq:
@@ -73,14 +69,6 @@ class TestHybridPoolAllocSingleDP(CustomTestCase):
             self.assertIsNotNone(req.req_pool_idx)
             self.assertIsNotNone(req.recurrent_pool_idx)
         self.assertNotEqual(reqs[0].recurrent_pool_idx, reqs[1].recurrent_pool_idx)
-
-    def test_alloc_clears_newly_assigned_slots(self):
-        reqs = [FakeReq(dp_rank=0), FakeReq(dp_rank=0)]
-        self.pool.alloc(reqs)
-
-        self.assertEqual(len(self.state_pool.cleared_slots), 1)
-        cleared = self.state_pool.cleared_slots[0]
-        self.assertEqual(sorted(cleared), sorted([r.recurrent_pool_idx for r in reqs]))
 
     def test_alloc_updates_mapping(self):
         reqs = [FakeReq(dp_rank=0)]

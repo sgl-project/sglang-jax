@@ -628,6 +628,9 @@ class ScheduleReqsInfo:
     # Recurrent state indices for hybrid recurrent models (per DP)
     recurrent_indices: np.ndarray | None = None
 
+    # Whether each request has prior recurrent state (lazy zero-on-read)
+    has_initial_state: np.ndarray | None = None
+
 
 @dataclasses.dataclass
 class ScheduleBatch:
@@ -1067,6 +1070,8 @@ class ScheduleBatch:
             info.extend_lens = extend_lens
             info.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
+            info.has_initial_state = np.array([r.is_chunked > 0 for r in reqs], dtype=np.bool_)
+
             if self.is_hybrid_recurrent:
                 info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
                     req_pool_indices_cpu
@@ -1447,6 +1452,8 @@ class ScheduleBatch:
             else:
                 info.seq_lens = np.add(info.seq_lens, 1)
             info.seq_lens_sum += bs
+
+            info.has_initial_state = np.ones(bs, dtype=np.bool_)
 
             if self.is_hybrid_recurrent:
                 info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
@@ -2080,6 +2087,17 @@ class ScheduleBatch:
                         )
                 offset_bs += per_dp_bs_padding
 
+        # Step 5.6: Merge has_initial_state from all DP ranks
+        has_initial_state_cpu = np.ones(total_bs, dtype=np.bool_)
+        offset_bs = 0
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+            if info.seq_lens is not None and len(info.seq_lens) > 0:
+                dp_bs = len(info.seq_lens)
+                if info.has_initial_state is not None:
+                    has_initial_state_cpu[offset_bs : offset_bs + dp_bs] = info.has_initial_state
+            offset_bs += per_dp_bs_padding
+
         # Step 6: Generate trace info if needed
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
@@ -2153,6 +2171,7 @@ class ScheduleBatch:
             apply_for_deepstack=False,
             deepstack_visual_embedding=None,
             recurrent_indices=recurrent_indices_cpu,
+            has_initial_state=has_initial_state_cpu,
         )
 
     def get_spec_model_worker_batch(
@@ -2825,6 +2844,9 @@ class ModelWorkerBatch:
 
     # Recurrent state indices for hybrid recurrent models
     recurrent_indices: np.ndarray | None = None
+
+    # Whether each request has prior recurrent state (lazy zero-on-read)
+    has_initial_state: np.ndarray | None = None
 
     def get_original_input_len(self):
         """

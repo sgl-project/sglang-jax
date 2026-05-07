@@ -137,20 +137,6 @@ class RecurrentStatePool:
 
         return recurrent_buffers, conv_buffers
 
-    def clear_slot(self, idx_or_indices) -> None:
-        indices = [idx_or_indices] if isinstance(idx_or_indices, int) else list(idx_or_indices)
-        if not indices:
-            return
-
-        idx_arr = jnp.asarray(indices, dtype=jnp.int32)
-        with jax.set_mesh(self.mesh):
-            for layer in range(self.num_linear_recurrent_layers):
-                self.recurrent_buffers[layer] = self.recurrent_buffers[layer].at[idx_arr].set(0)
-                for inner in range(len(self.conv_buffers[layer])):
-                    self.conv_buffers[layer][inner] = (
-                        self.conv_buffers[layer][inner].at[idx_arr].set(0)
-                    )
-
     def get_linear_recurrent_layer_cache(self, layer_id: int):
         if layer_id not in self.layers_mapping:
             raise ValueError(
