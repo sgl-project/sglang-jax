@@ -129,11 +129,13 @@ jobs:
           SGLANG_JAX_IS_IN_CI: true
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
+          HF_XET_HIGH_PERFORMANCE: "1"
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
+          uv pip install "huggingface_hub[hf_xet]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite e2e-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
@@ -156,11 +158,13 @@ jobs:
           SGLANG_JAX_IS_IN_CI: true
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
+          HF_XET_HIGH_PERFORMANCE: "1"
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
+          uv pip install "huggingface_hub[hf_xet]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite e2e-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
@@ -183,11 +187,13 @@ jobs:
           SGLANG_JAX_IS_IN_CI: true
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
+          HF_XET_HIGH_PERFORMANCE: "1"
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
+          uv pip install "huggingface_hub[hf_xet]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
@@ -210,11 +216,13 @@ jobs:
           SGLANG_JAX_IS_IN_CI: true
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
+          HF_XET_HIGH_PERFORMANCE: "1"
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
+          uv pip install "huggingface_hub[hf_xet]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-4 --timeout-per-file 3000 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
@@ -238,11 +246,13 @@ jobs:
           SGLANG_JAX_IS_IN_CI: true
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
+          HF_XET_HIGH_PERFORMANCE: "1"
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
+          uv pip install "huggingface_hub[hf_xet]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite performance-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
@@ -266,11 +276,13 @@ jobs:
           SGLANG_JAX_IS_IN_CI: true
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
+          HF_XET_HIGH_PERFORMANCE: "1"
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
+          uv pip install "huggingface_hub[hf_xet]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite performance-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3000
 

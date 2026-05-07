@@ -201,6 +201,9 @@ class ForwardBatch:
     apply_for_deepstack: bool = False
     deepstack_visual_embedding: jax.Array | None = None
 
+    # Recurrent state indices [batch_size]
+    recurrent_indices: jax.Array | None = None
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -222,6 +225,7 @@ class ForwardBatch:
             self.mrope_positions,
             self.apply_for_deepstack,
             self.deepstack_visual_embedding,
+            self.recurrent_indices,
         )
 
         aux_data = {
@@ -265,6 +269,7 @@ class ForwardBatch:
 
         obj.apply_for_deepstack = children[17]
         obj.deepstack_visual_embedding = children[18]
+        obj.recurrent_indices = children[19]
         return obj
 
     def __repr__(self) -> str:
@@ -379,6 +384,13 @@ class ForwardBatch:
 
         expert_location_metadata = get_global_expert_location_metadata()
 
+        recurrent_indices = None
+        if batch.recurrent_indices is not None:
+            (recurrent_indices,) = device_array(
+                (batch.recurrent_indices,),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
+            )
+
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
@@ -404,6 +416,7 @@ class ForwardBatch:
             apply_for_deepstack=batch.apply_for_deepstack,
             deepstack_visual_embedding=deepstack_visual_embedding,
             expert_location_metadata=expert_location_metadata,
+            recurrent_indices=recurrent_indices,
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)
