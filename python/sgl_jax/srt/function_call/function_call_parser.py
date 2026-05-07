@@ -9,6 +9,9 @@ from sgl_jax.srt.entrypoints.openai.protocol import (
 )
 from sgl_jax.srt.function_call.base_format_detector import BaseFormatDetector
 from sgl_jax.srt.function_call.core_types import ToolCallItem
+from sgl_jax.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sgl_jax.srt.function_call.glm47_moe_detector import Glm47MoeDetector
+from sgl_jax.srt.function_call.mimo_detector import MiMoDetector
 from sgl_jax.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sgl_jax.srt.function_call.utils import get_json_schema_constraint
 
@@ -26,6 +29,9 @@ class FunctionCallParser:
 
     ToolCallParserEnum: dict[str, type[BaseFormatDetector]] = {
         "qwen3_coder": Qwen3CoderDetector,
+        "mimo": MiMoDetector,
+        "glm47": Glm47MoeDetector,
+        "glm45": Glm4MoeDetector,
     }
 
     def __init__(self, tools: list[Tool], tool_call_parser: str):

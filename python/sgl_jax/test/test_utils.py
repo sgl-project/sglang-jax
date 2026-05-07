@@ -40,6 +40,8 @@ GEMMA2_2B_IT = "google/gemma-2-2b-it"
 
 BAILING_MOE = "inclusionAI/Ling-mini-2.0"
 DEEPSEEK_R1_DISTILL_QWEN_1_5B = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+DEEPSEEK_V2_LITE = "deepseek-ai/DeepSeek-V2-Lite"
+DEEPSEEK_CODER_V2_LITE_INSTRUCT = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 
 QWEN3_32B = "google/gemma-2-2b-it"
 QWEN3_32B_EAGLE3 = "AngelSlim/Qwen3-32B_eagle3"
@@ -418,6 +420,8 @@ def get_benchmark_args(
     device="auto",
     pd_separated: bool = False,
     lora_name=None,
+    lora_request_distribution="uniform",
+    lora_zipf_alpha=1.5,
     backend="sgl-jax",
     warmup_requests=1,
     return_routed_experts=False,
@@ -450,6 +454,8 @@ def get_benchmark_args(
         apply_chat_template=False,
         profile=None,
         lora_name=lora_name,
+        lora_request_distribution="uniform",
+        lora_zipf_alpha=1.5,
         prompt_suffix="",
         device=device,
         pd_separated=pd_separated,

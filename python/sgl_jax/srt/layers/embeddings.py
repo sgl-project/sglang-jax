@@ -232,16 +232,22 @@ class RotaryEmbedding:
         num_tokens = positions.shape[0]
         query = query.reshape(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
-        query_pass = query[..., self.rotary_dim :]
         query_rot = apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
-        query = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
+        if self.rotary_dim < self.head_size:
+            query_pass = query[..., self.rotary_dim :]
+            query = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
+        else:
+            query = query_rot.reshape(query_shape)
 
         key_shape = key.shape
         key = key.reshape(num_tokens, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
-        key_pass = key[..., self.rotary_dim :]
         key_rot = apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
-        key = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
+        if self.rotary_dim < self.head_size:
+            key_pass = key[..., self.rotary_dim :]
+            key = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
+        else:
+            key = key_rot.reshape(key_shape)
 
         return query, key
 
@@ -630,14 +636,37 @@ def get_rope(
                 high_freq_factor,
                 original_max_position,
             )
+        elif scaling_type == "yarn":
+            scaling_factor = rope_scaling["factor"]
+            original_max_position = rope_scaling.get(
+                "original_max_position_embeddings", max_position
+            )
+            beta_fast = rope_scaling.get("beta_fast", 32.0)
+            beta_slow = rope_scaling.get("beta_slow", 1.0)
+            mscale = rope_scaling.get("mscale", 1.0)
+            mscale_all_dim = rope_scaling.get("mscale_all_dim", 0.0)
+            rotary_emb = YarnRotaryEmbedding(
+                head_size,
+                rotary_dim,
+                max_position,
+                base,
+                is_neox_style,
+                dtype,
+                scaling_factor,
+                original_max_position,
+                beta_fast,
+                beta_slow,
+                mscale,
+                mscale_all_dim,
+            )
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb
 
 
-def _yarn_get_mscale(scaling_factor: float) -> float:
-    # Approximate magnitude scaling correction used by YaRN
+def _grok_yarn_get_mscale(scaling_factor: float) -> float:
+    """YaRN mscale variant used by Grok (sqrt form)."""
     if scaling_factor <= 1:
         return 1.0
     return math.sqrt(scaling_factor)
@@ -665,3 +694,108 @@ def _yarn_find_correction_range(
     low = math.floor(_yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings))
     high = math.ceil(_yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings))
     return max(low, 0), min(high, dim - 1)  # Clamp values just in case
+
+
+def _deepseek_yarn_get_mscale(scale: float, mscale: float) -> float:
+    """Compute mscale factor for DeepSeek-style YaRN (parameterized by mscale coefficient)."""
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
+class YarnRotaryEmbedding(RotaryEmbedding):
+    """YaRN (Yet another RoPE extensioN) rotary embeddings.
+
+    Blends original and scaled inverse frequencies using a correction range
+    derived from beta_fast/beta_slow, and optionally applies an mscale factor
+    to cos/sin values (used by DeepSeek V2/V3).
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: jnp.dtype,
+        scaling_factor: float,
+        original_max_position_embeddings: int,
+        beta_fast: float = 32.0,
+        beta_slow: float = 1.0,
+        mscale: float = 1.0,
+        mscale_all_dim: float = 0.0,
+    ):
+        self.scaling_factor = scaling_factor
+        self.original_max_position_embeddings = original_max_position_embeddings
+        self.beta_fast = beta_fast
+        self.beta_slow = beta_slow
+        self.yarn_mscale = mscale
+        self.yarn_mscale_all_dim = mscale_all_dim
+
+        super().__init__(head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype)
+
+        # Replace inv_freq with YaRN blended version
+        self._inv_freq_np = self._compute_yarn_inv_freq()
+
+        # Precompute cos/sin magnitude scaling factor
+        m_num = _deepseek_yarn_get_mscale(self.scaling_factor, self.yarn_mscale)
+        m_den = _deepseek_yarn_get_mscale(self.scaling_factor, self.yarn_mscale_all_dim)
+        self._rope_mscale = m_num / m_den if m_den != 0 else m_num
+
+    def _compute_yarn_inv_freq(self) -> np.ndarray:
+        dim = self.rotary_dim
+        base = self.base
+
+        freq_extra = 1.0 / (base ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+        freq_inter = freq_extra / self.scaling_factor
+
+        low, high = _yarn_find_correction_range(
+            self.beta_fast,
+            self.beta_slow,
+            dim,
+            base,
+            self.original_max_position_embeddings,
+        )
+        # Linear ramp mask: 1 in the extrapolation region, 0 in the interpolation region
+        max_val = max(high - low, 0.001)
+        inv_freq_mask = 1.0 - np.clip((np.arange(dim // 2, dtype=np.float32) - low) / max_val, 0, 1)
+        return freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+
+    @named_scope
+    def __call__(
+        self,
+        positions: jax.Array,
+        query: jax.Array,
+        key: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        positions = positions.flatten()
+
+        inv_freq = jnp.asarray(self._inv_freq_np, dtype=self.dtype)
+        freqs = jnp.einsum("n,d->nd", positions.astype(jnp.float32), inv_freq)
+
+        cos = (jnp.cos(freqs) * self._rope_mscale).astype(self.dtype)
+        sin = (jnp.sin(freqs) * self._rope_mscale).astype(self.dtype)
+
+        query_shape = query.shape
+        num_tokens = positions.shape[0]
+        query = query.reshape(num_tokens, -1, self.head_size)
+        query_rot = query[..., : self.rotary_dim]
+        query_rot = apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        if self.rotary_dim < self.head_size:
+            query_pass = query[..., self.rotary_dim :]
+            query = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
+        else:
+            query = query_rot.reshape(query_shape)
+
+        key_shape = key.shape
+        key = key.reshape(num_tokens, -1, self.head_size)
+        key_rot = key[..., : self.rotary_dim]
+        key_rot = apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        if self.rotary_dim < self.head_size:
+            key_pass = key[..., self.rotary_dim :]
+            key = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
+        else:
+            key = key_rot.reshape(key_shape)
+
+        return query, key

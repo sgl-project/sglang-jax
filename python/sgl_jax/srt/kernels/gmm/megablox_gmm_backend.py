@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 
@@ -23,6 +27,7 @@ def gmm(
     zero_initialize: bool = True,
     acc_dtype: jnp.dtype | None = None,
     activation_quantized_dtype: jnp.dtype | None = None,
+    v2_tile_info: Any = None,
 ) -> jax.Array:
     """Dispatch GMM to v2 or v1, with optional activation quantization.
 
@@ -50,11 +55,22 @@ def gmm(
         activation_quantized_dtype: When set, quantize the LHS activations to
             this dtype before the kernel call (v1 path only) and rescale the
             output afterwards.
+        v2_tile_info: Optional TileSizes or TileFn for v2 kernel tiling.
+            Defaults to calculate_tiling (auto-tiler) when None.
     """
     if interpret is None:
         interpret = not is_tpu_runtime()
 
     use_gmm_v2 = not interpret and is_supported_by_gmm_v2(rhs_scale)
+
+    # Pad LHS to multiple of 128 (or 32 for v2) on TPU to avoid small/unaligned tiles
+    m = lhs.shape[0]
+    pad_size = 0
+    alignment = 32 if use_gmm_v2 else 128
+    if not interpret and m % alignment != 0:
+        pad_size = alignment - (m % alignment)
+        lhs = jax.lax.pad(lhs, jnp.zeros((), dtype=lhs.dtype), ((0, pad_size, 0), (0, 0, 0)))
+        group_sizes = group_sizes.at[-1].add(pad_size)
 
     lhs_scale = None
     if not use_gmm_v2 and activation_quantized_dtype is not None:
@@ -62,6 +78,9 @@ def gmm(
         lhs = lhs_q
 
     if use_gmm_v2:
+        v2_kwargs = {}
+        if v2_tile_info is not None:
+            v2_kwargs["tile_info"] = v2_tile_info
         out = gmm_v2_kernel(
             lhs,
             rhs,
@@ -73,6 +92,7 @@ def gmm(
             maybe_quantize_lhs=maybe_quantize_lhs,
             zero_initialize=zero_initialize,
             acc_dtype=acc_dtype,
+            **v2_kwargs,
         )
     else:
         out = gmm_v1_kernel(
@@ -90,5 +110,9 @@ def gmm(
 
     if lhs_scale is not None:
         out = out * lhs_scale
+
+    # Slice output back to original size if padded
+    if pad_size > 0:
+        out = out[:m]
 
     return out

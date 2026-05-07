@@ -1,11 +1,9 @@
 """A tensor parallel worker."""
 
-import itertools
 import logging
 import os
 import signal
 import threading
-import time
 from queue import Queue
 
 import jax
@@ -14,7 +12,6 @@ import numpy as np
 import psutil
 from flax import nnx
 from jax.experimental.multihost_utils import broadcast_one_to_all
-from tqdm import tqdm
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.constrained.bitmask_ops import allocate_token_bitmask
@@ -24,20 +21,11 @@ from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
     global_server_args_dict,
 )
-from sgl_jax.srt.managers.utils import resolve_future_token_ids, set_future_token_ids
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
-from sgl_jax.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_executor.model_runner import MockModelRunner, ModelRunner
-from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingMetadata
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
-from sgl_jax.srt.utils.common_utils import (
-    PRECOMPILE_DEFAULT_BS_PADDINGS,
-    PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
-)
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -57,6 +45,7 @@ class ModelWorker:
     ):
         # Parse args
         self.tp_size = server_args.tp_size
+        self.dp_size = server_args.dp_size
         from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -110,6 +99,7 @@ class ModelWorker:
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
             tp_size=server_args.tp_size,
+            dp_size=server_args.dp_size,
             server_args=server_args,
             mesh=self.mesh,
             is_draft_worker=is_draft_worker,
@@ -126,8 +116,12 @@ class ModelWorker:
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
 
         # Calculate max_running_requests from different constraints
-        attn_backend_limit = self.model_runner.attn_backend.get_max_running_reqests(
-            self.model_config.context_len, self.page_size
+        attn_backend_limit = (
+            self.model_runner.attn_backend.get_max_running_reqests(
+                self.model_config.context_len,
+                self.page_size,
+            )
+            * self.dp_size
         )
         server_limit = (
             self.max_total_num_tokens // 2
@@ -156,11 +150,36 @@ class ModelWorker:
             self.page_size,
         )
         logger.info("  → Final max_running_requests: %s", self.max_running_requests)
+
+        # Validate and adjust max_running_requests for Data Parallelism
+        dp_size = server_args.dp_size
+        if self.max_running_requests < dp_size:
+            raise ValueError(
+                f"max_running_requests ({self.max_running_requests}) is less than dp_size ({dp_size}). "
+                f"Please increase memory allocation or reduce dp_size."
+            )
+        if self.max_running_requests % dp_size != 0:
+            original_value = self.max_running_requests
+            self.max_running_requests = (self.max_running_requests // dp_size) * dp_size
+            logger.warning(
+                "Adjusted max_running_requests from %s to %s to be divisible by dp_size (%s)",
+                original_value,
+                self.max_running_requests,
+                dp_size,
+            )
+
         assert self.max_running_requests > 0, "max_running_request is zero"
 
+        # A single request lives on one DP rank, so max_req_len is bounded
+        # by per-rank pool size, not the global (dp-scaled) pool size.
+        per_rank_tokens = (
+            self.max_total_num_tokens // self.dp_size
+            if self.dp_size > 1
+            else self.max_total_num_tokens
+        )
         self.max_req_len = min(
             self.model_config.context_len - 1,
-            self.max_total_num_tokens - 1,
+            per_rank_tokens - 1,
         )
         self.max_req_input_len = self.max_req_len - 5
         assert self.max_req_len > 0 and self.max_req_input_len > 0, "Memory pool size is too small"
@@ -175,36 +194,19 @@ class ModelWorker:
         self.max_padded_batch_size, self.max_padded_num_tokens = self.get_max_padded_size()
 
         # precompile
-        self.precompile_token_paddings = server_args.precompile_token_paddings
+        from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 
-        # normalize server_args.precompile_token_paddings
-        # ensure every token padding value is not less than max_runnig_requests
-        self.normalize_token_paddings()
-
-        bs_padding_list = (
-            server_args.precompile_bs_paddings
-            if server_args.precompile_bs_paddings is not None
-            else PRECOMPILE_DEFAULT_BS_PADDINGS
+        self.compilation_manager = CompilationManager(
+            server_args=server_args,
+            max_padded_batch_size=self.max_padded_batch_size,
+            max_padded_num_tokens=self.max_padded_num_tokens,
+            dp_size=self.dp_size,
+            tp_size=self.tp_size,
+            page_size=self.page_size,
+            max_req_len=self.max_req_len,
+            vocab_size=self.model_config.vocab_size,
+            multimodal=server_args.multimodal,
         )
-        self.precompile_bs_paddings = []
-        for bs in bs_padding_list:
-            if bs <= self.max_padded_batch_size and (
-                server_args.moe_backend != "fused" or bs >= self.tp_size * 2
-            ):
-                self.precompile_bs_paddings.append(bs)
-        self.precompile_bs_paddings.sort()
-        if (
-            len(self.precompile_bs_paddings) == 0
-            or self.precompile_bs_paddings[-1] < self.max_padded_batch_size
-        ):
-            self.precompile_bs_paddings.append(self.max_padded_batch_size)
-
-        # padding cache_loc_paddings
-        # note: the length of following two cache_loc_paddings must keep the same to length of separate bs_paddings.
-        self.precompile_cache_loc_paddings = [
-            (item * self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
-            for item in self.precompile_bs_paddings
-        ]
 
         self.parent_process = psutil.Process().parent()
         self.sync_queue = Queue()
@@ -227,123 +229,19 @@ class ModelWorker:
             layers_topk_ids, model_worker_batch = self.sync_queue.get()
             get_global_experts_capturer().on_forward_end(layers_topk_ids, model_worker_batch)
 
-    def normalize_token_paddings(self):
-        normalized_token_paddings = []
-
-        if self.precompile_token_paddings is None:
-            self.precompile_token_paddings = PRECOMPILE_DEFAULT_TOKEN_PADDINGS
-        for item in self.precompile_token_paddings:
-            if item >= self.max_padded_batch_size and item <= self.max_padded_num_tokens:
-                normalized_token_paddings.append(item)
-
-        normalized_token_paddings.sort()
-        if (
-            len(normalized_token_paddings) == 0
-            or normalized_token_paddings[-1] < self.max_padded_num_tokens
-        ):
-            normalized_token_paddings.append(self.max_padded_num_tokens)
-
-        self.precompile_token_paddings = normalized_token_paddings
-
     def run_precompile(self, future_token_ids_map=None):
-        self.precompile_extend(future_token_ids_map)
-        self.precompile_decode(future_token_ids_map)
-
-    def precompile_extend(self, future_token_ids_map=None):
-        start_time = time.perf_counter()
-        logger.info(
-            "[EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s",
-            self.precompile_bs_paddings[-1:],
-            self.precompile_token_paddings,
+        prepare_lora = self.prepare_lora_batch if self.server_args.enable_lora else None
+        self.compilation_manager.precompile_all(
+            forward_fn=self.forward_batch_generation,
+            model_runner=self.model_runner,
+            mesh=self.mesh,
+            prepare_lora_fn=prepare_lora,
+            future_token_ids_map=future_token_ids_map,
         )
-
-        bs, _ = self.get_max_padded_size()
-        pairs = list(itertools.product([bs], self.precompile_token_paddings))
-
-        with tqdm(pairs, desc="[EXTEND] PRECOMPILE", leave=False) as pbar:
-            for pair in pbar:
-                pair = list(pair)
-                bs, num_tokens = pair[0], pair[1]
-                pbar.set_postfix(bs=bs, tokens=num_tokens)
-                if bs > num_tokens:
-                    logger.warning("bs=%s > num_tokens=%s, skip this pair", bs, num_tokens)
-                    continue
-                model_worker_batch = self.generate_model_worker_batch(
-                    bs,
-                    num_tokens,
-                    ForwardMode.EXTEND,
-                    self.precompile_cache_loc_paddings[-1],
-                    enable_static_lora=self.server_args.enable_static_lora,
-                )
-                # Prepare LoRA batch if LoRA is enabled
-                if self.server_args.enable_lora:
-                    self.prepare_lora_batch(model_worker_batch)
-                sampling_metadata = SamplingMetadata.from_model_worker_batch(
-                    model_worker_batch,
-                    0,
-                    self.mesh,
-                    self.model_config.vocab_size,
-                )
-                model_worker_batch.forward_batch = ForwardBatch.init_new(
-                    model_worker_batch, self.model_runner
-                )
-                if future_token_ids_map is not None:
-                    model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
-                        model_worker_batch.forward_batch.input_ids,
-                        future_token_ids_map,
-                    )
-
-                self.forward_batch_generation(model_worker_batch, None, False, sampling_metadata)
-        end_time = time.perf_counter()
-        logger.info("[EXTEND] Precompile finished in %.0f secs", end_time - start_time)
-
-    def precompile_decode(self, future_token_ids_map=None):
-        start_time = time.perf_counter()
-        logger.info(
-            "[DECODE] Begin to precompile bs_paddings=%s",
-            self.precompile_bs_paddings,
-        )
-
-        with tqdm(self.precompile_bs_paddings, desc="[DECODE] PRECOMPILE", leave=False) as pbar:
-            for bs in pbar:
-                pbar.set_postfix(bs=bs)
-                # use same page aligned with precompile cache_loc_paddings
-                aligned_cache_loc_size = (
-                    (bs * self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
-                )
-                model_worker_batch = self.generate_model_worker_batch(
-                    bs,
-                    bs,
-                    ForwardMode.DECODE,
-                    aligned_cache_loc_size,
-                    enable_static_lora=self.server_args.enable_static_lora,
-                )
-                # Prepare LoRA batch if LoRA is enabled
-                if self.server_args.enable_lora:
-                    self.prepare_lora_batch(model_worker_batch)
-                sampling_metadata = SamplingMetadata.from_model_worker_batch(
-                    model_worker_batch, 0, self.mesh, self.model_config.vocab_size
-                )
-                model_worker_batch.forward_batch = ForwardBatch.init_new(
-                    model_worker_batch, self.model_runner
-                )
-                if future_token_ids_map is not None:
-                    model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
-                        model_worker_batch.forward_batch.input_ids,
-                        future_token_ids_map,
-                    )
-                _, next_token_ids, _ = self.forward_batch_generation(
-                    model_worker_batch, None, False, sampling_metadata
-                )
-                if future_token_ids_map is not None:
-                    set_future_token_ids(future_token_ids_map, 0, next_token_ids)
-
-        end_time = time.perf_counter()
-        logger.info("[DECODE] Precompile finished in %.0f secs", end_time - start_time)
 
     def set_forward_metadata(self, model_worker_batch: ModelWorkerBatch):
         self.model_runner.attn_backend.forward_metadata = (
-            self.worker.model_runner.attn_backend.get_forward_metadata(model_worker_batch)
+            self.model_runner.attn_backend.get_forward_metadata(model_worker_batch)
         )
 
     def get_max_padded_size(self):
@@ -352,119 +250,32 @@ class ModelWorker:
         Returns:
             tuple: (max_padded_batch_size, max_padded_num_tokens)
                 - max_padded_batch_size: Maximum batch size, constrained by max_running_requests
-                - max_padded_num_tokens: Maximum tokens, using chunked_prefill_size if enabled
+                - max_padded_num_tokens: Maximum tokens for all DP ranks (multiplied by dp_size for prefill)
         """
         # Use chunked prefill size if enabled (> 0), otherwise use max prefill tokens
         # Take minimum with max_prefill_tokens as upper bound
-        max_padded_num_tokens = self.max_prefill_tokens
-        if self.chunked_prefill_size > 0 and max_padded_num_tokens > self.chunked_prefill_size:
-            max_padded_num_tokens = self.chunked_prefill_size
+        per_dp_num_tokens = self.max_prefill_tokens
+        if self.chunked_prefill_size > 0 and per_dp_num_tokens > self.chunked_prefill_size:
+            per_dp_num_tokens = self.chunked_prefill_size
+
+        # For prefill, total tokens = per_dp_tokens * dp_size
+        max_padded_num_tokens = per_dp_num_tokens * self.dp_size
 
         # Batch size is constrained by both max_running_requests and available tokens divide by page_size
         max_padded_batch_size = min(self.max_running_requests, max_padded_num_tokens)
+
+        assert max_padded_batch_size % self.dp_size == 0, (
+            "max_padded_batch_size must be divisible by dp_size, "
+            f"but got max_padded_batch_size={max_padded_batch_size}, dp_size={self.dp_size}"
+        )
 
         return max_padded_batch_size, max_padded_num_tokens
 
     def get_precompile_paddings(self):
         return (
-            self.precompile_token_paddings,
-            self.precompile_bs_paddings,
-            self.precompile_cache_loc_paddings,
-        )
-
-    def generate_model_worker_batch(
-        self,
-        bs: int,
-        num_tokens: int,
-        mode: ForwardMode,
-        max_cache_loc_size: int,
-        do_penalties: bool = False,
-        speculative_algotithm=None,
-        enable_static_lora: bool = None,
-    ) -> ModelWorkerBatch:
-        valid_input_ids = np.array([1] * bs, dtype=jnp.int32)
-        invalid_input_ids = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
-        # TokenToKVPoolAllocator uses 1..N indices (0 is reserved as a "dummy" slot).
-        # Keep precompile batches consistent with the real allocator so that
-        # per-token validity masks (out_cache_loc > 0) and KV updates behave as
-        # expected, especially for small bs (e.g. bs=1).
-        valid_out_cache_loc = np.arange(1, bs + 1, dtype=jnp.int32)
-        invalid_out_cache_loc = np.array([-1] * (num_tokens - bs), dtype=jnp.int32)
-        valid_positions = np.array([0] * bs, dtype=jnp.int32)
-        invalid_positions = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
-        invalid_cache_loc_size = max_cache_loc_size - bs
-        if invalid_cache_loc_size < 0:
-            raise ValueError(f"padding cache_loc_size {invalid_cache_loc_size} < 0!")
-
-        valid_cache_loc = np.arange(bs)
-        invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
-        lora_ids = ["0"] * bs
-        capture_hidden_mode = CaptureHiddenMode.NULL
-        has_input_embedding = False
-        has_deepstack_visual_embedding = False
-        is_mrope_position = False
-        if self.precompile_params is not None:
-            capture_hidden_mode_int = self.precompile_params.get("capture_hidden_mode", 0)
-            capture_hidden_mode = CaptureHiddenMode.parse(capture_hidden_mode_int)
-            has_input_embedding = self.precompile_params.get("input_embedding", False)
-            has_deepstack_visual_embedding = self.precompile_params.get(
-                "deepstack_visual_embedding", False
-            )
-            is_mrope_position = self.precompile_params.get("mrope", False)
-
-        return ModelWorkerBatch(
-            bid=1,
-            forward_mode=mode,
-            input_ids=np.concat([valid_input_ids, invalid_input_ids], axis=0),
-            real_input_ids_len=len(valid_input_ids),
-            real_bs=bs,
-            req_pool_indices=np.arange(bs, dtype=np.int32),
-            seq_lens=np.array([1] * bs, dtype=np.int32),
-            out_cache_loc=np.concat([valid_out_cache_loc, invalid_out_cache_loc], axis=0),
-            return_logprob=False,
-            return_output_logprob_only=True,
-            sampling_info=(
-                SamplingBatchInfo.generate_for_precompile(bs, self.model_config.vocab_size)
-                if speculative_algotithm is None
-                else SamplingBatchInfo.generate_for_precompile_all_greedy(
-                    bs, self.model_config.vocab_size
-                )
-            ),
-            extend_input_logprob_token_ids=None,
-            positions=np.concat([valid_positions, invalid_positions], axis=0),
-            mrope_positions=(
-                np.broadcast_to(np.arange(num_tokens, dtype=np.int32), (3, num_tokens))
-                if is_mrope_position
-                else None
-            ),
-            cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
-            extend_prefix_lens=(np.array([0] * bs) if mode == ForwardMode.EXTEND else None),
-            extend_seq_lens=np.array([1] * bs) if mode == ForwardMode.EXTEND else None,
-            top_logprobs_nums=None,
-            token_ids_logprobs=None,
-            extend_logprob_start_lens=None,
-            capture_hidden_mode=capture_hidden_mode,
-            spec_algorithm=speculative_algotithm,
-            lora_ids=lora_ids,  # Already set to [None] * bs above
-            apply_for_deepstack=(
-                mode == ForwardMode.EXTEND
-                and self.server_args.multimodal
-                and has_deepstack_visual_embedding
-            ),
-            input_embedding=(
-                np.zeros((num_tokens, self.model_config.hidden_size), dtype=np.float16)
-                if mode == ForwardMode.EXTEND
-                and self.server_args.multimodal
-                and has_input_embedding
-                else None
-            ),
-            deepstack_visual_embedding=(
-                np.zeros((3, num_tokens, self.model_config.hidden_size), dtype=np.float16)
-                if mode == ForwardMode.EXTEND
-                and self.server_args.multimodal
-                and has_deepstack_visual_embedding
-                else None
-            ),
+            self.compilation_manager.token_buckets,
+            self.compilation_manager.bs_buckets,
+            self.compilation_manager.cache_loc_buckets,
         )
 
     def get_model_runner(self):
@@ -501,8 +312,16 @@ class ModelWorker:
 
     def get_tokens_per_layer_info(self):
         return (
-            self.model_runner.full_max_total_num_tokens,
-            self.model_runner.swa_max_total_num_tokens,
+            getattr(
+                self.model_runner,
+                "full_max_total_num_tokens",
+                self.model_runner.max_total_num_tokens,
+            ),
+            getattr(
+                self.model_runner,
+                "swa_max_total_num_tokens",
+                self.model_runner.max_total_num_tokens,
+            ),
         )
 
     def get_pad_input_ids_func(self):
@@ -551,22 +370,23 @@ class ModelWorker:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
         if forward_metadata is None:
-            forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
+            forward_metadata = self.model_runner.attn_backend.get_forward_metadata(
                 model_worker_batch
             )
 
         if sampling_metadata is None:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,
-                len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
+                0,
                 self.mesh,
                 self.model_config.vocab_size,
             )
 
         self.model_runner.attn_backend.forward_metadata = forward_metadata
+        logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh)
         logits_output, cache_miss_count, layers_topk_ids = self.model_runner.forward(
             forward_batch,
-            logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
+            logits_metadata=logits_metadata,
         )
 
         self.dump_topk_ids(layers_topk_ids, model_worker_batch)
@@ -606,43 +426,115 @@ class ModelWorker:
                     sampling_metadata,
                 )
                 cache_miss_count += count()
+            # `selector` reorders DP-interleaved per-req tensors back to
+            # original request order. For DP=1 it's just np.arange(real_bs).
+            selector = model_worker_batch.logits_indices_selector
             if model_worker_batch.return_output_logprob_only:
                 logprobs = self.model_runner.compute_logprobs(token_logprobs, next_token_ids_device)
-                logits_output.next_token_logprobs = logprobs[: model_worker_batch.real_bs]
+                logits_output.next_token_logprobs = jax.device_get(logprobs)[selector]
         if new_logits_output is not None:
             logits_output = new_logits_output
-            if logits_output.next_token_top_logprobs_val is not None:
-                logits_output.next_token_top_logprobs_val = (
-                    logits_output.next_token_top_logprobs_val.astype(jnp.float32).tolist()
-                )
-                logits_output.next_token_top_logprobs_idx = (
-                    logits_output.next_token_top_logprobs_idx.tolist()
-                )
-            if logits_output.next_token_token_ids_logprobs_val is not None:
-                logits_output.next_token_token_ids_logprobs_val = (
-                    logits_output.next_token_token_ids_logprobs_val.astype(jnp.float32).tolist()
-                )
-                logits_output.next_token_token_ids_logprobs_idx = (
-                    logits_output.next_token_token_ids_logprobs_idx.tolist()
-                )
-            if logits_output.input_token_ids_logprobs_val is not None:
-                logits_output.input_token_ids_logprobs_val = (
-                    logits_output.input_token_ids_logprobs_val.astype(jnp.float32).tolist()
-                )
-                logits_output.input_token_ids_logprobs_idx = (
-                    logits_output.input_token_ids_logprobs_idx.tolist()
-                )
-            if logits_output.input_top_logprobs_val is not None:
-                logits_output.input_top_logprobs_val = logits_output.input_top_logprobs_val.astype(
-                    jnp.float32
-                ).tolist()
-                logits_output.input_top_logprobs_idx = logits_output.input_top_logprobs_idx.tolist()
+            self._materialize_logprobs_to_host(
+                logits_output, model_worker_batch, logits_metadata, selector
+            )
 
         return (
             logits_output,
             next_token_ids_device,
             cache_miss_count,
         )
+
+    def _materialize_logprobs_to_host(
+        self,
+        logits_output: LogitsProcessorOutput,
+        model_worker_batch: ModelWorkerBatch,
+        logits_metadata: LogitsMetadata,
+        selector: np.ndarray,
+    ):
+        """Reorder + per-req split logprob tensors from device to host lists.
+
+        `next_token_*` tensors are batch-major and routed through `selector`
+        to recover original-req order. `input_*` tensors are per prompt-token
+        in DP-rank-then-req order which already matches the original-req
+        order, so they are split directly using `extend_logprob_pruned_lens_cpu`.
+        Per-req `top_logprobs_nums` / `token_ids_logprobs` give the trim k_i /
+        gather columns. Output shape is `list[list[float]]` per req, matching
+        the consumer contract in `scheduler_output_processor_mixin`.
+        """
+
+        def gather(arr, *, as_float=False):
+            if as_float:
+                arr = arr.astype(jnp.float32)
+            return jax.device_get(arr)[selector]
+
+        if logits_output.next_token_logprobs is not None:
+            logits_output.next_token_logprobs = jax.device_get(logits_output.next_token_logprobs)[
+                selector
+            ]
+
+        top_nums = model_worker_batch.top_logprobs_nums
+        tok_ids = model_worker_batch.token_ids_logprobs
+
+        if logits_output.next_token_top_logprobs_val is not None:
+            vals = gather(logits_output.next_token_top_logprobs_val, as_float=True)
+            idxs = gather(logits_output.next_token_top_logprobs_idx)
+            logits_output.next_token_top_logprobs_val = [
+                vals[i, : top_nums[orig]].tolist() for i, orig in enumerate(selector)
+            ]
+            logits_output.next_token_top_logprobs_idx = [
+                idxs[i, : top_nums[orig]].tolist() for i, orig in enumerate(selector)
+            ]
+
+        if logits_output.next_token_token_ids_logprobs_val is not None:
+            full = gather(logits_output.next_token_token_ids_logprobs_val, as_float=True)
+            per_req_vals, per_req_idxs = [], []
+            for i, orig in enumerate(selector):
+                ids = tok_ids[orig] if tok_ids else None
+                if ids:
+                    per_req_vals.append(full[i, ids].tolist())
+                    per_req_idxs.append(list(ids))
+                else:
+                    per_req_vals.append([])
+                    per_req_idxs.append([])
+            logits_output.next_token_token_ids_logprobs_val = per_req_vals
+            logits_output.next_token_token_ids_logprobs_idx = per_req_idxs
+
+        pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu
+
+        if logits_output.input_top_logprobs_val is not None:
+            vals = jax.device_get(logits_output.input_top_logprobs_val.astype(jnp.float32))
+            idxs = jax.device_get(logits_output.input_top_logprobs_idx)
+            per_req_vals, per_req_idxs = [], []
+            pt = 0
+            for k, plen in zip(logits_metadata.top_logprobs_nums, pruned_lens):
+                if plen <= 0:
+                    per_req_vals.append([])
+                    per_req_idxs.append([])
+                    continue
+                per_req_vals.append(vals[pt : pt + plen, :k].tolist())
+                per_req_idxs.append(idxs[pt : pt + plen, :k].tolist())
+                pt += plen
+            logits_output.input_top_logprobs_val = per_req_vals
+            logits_output.input_top_logprobs_idx = per_req_idxs
+
+        if logits_output.input_token_ids_logprobs_val is not None:
+            full = jax.device_get(logits_output.input_token_ids_logprobs_val.astype(jnp.float32))
+            per_req_vals, per_req_idxs = [], []
+            pt = 0
+            for ids, plen in zip(logits_metadata.token_ids_logprobs, pruned_lens):
+                if plen <= 0:
+                    per_req_vals.append([])
+                    per_req_idxs.append([])
+                    continue
+                if ids:
+                    per_req_vals.append(full[pt : pt + plen][:, ids].tolist())
+                    per_req_idxs.append([list(ids) for _ in range(plen)])
+                else:
+                    per_req_vals.append([])
+                    per_req_idxs.append([])
+                pt += plen
+            logits_output.input_token_ids_logprobs_val = per_req_vals
+            logits_output.input_token_ids_logprobs_idx = per_req_idxs
 
     def dump_topk_ids(self, layers_topk_ids: list[jax.Array], model_worker_batch: ModelWorkerBatch):
         enable = self.server_args.enable_return_routed_experts
@@ -726,9 +618,13 @@ class MockModelWorker:
             self.model_runner.req_to_token_pool.size,
         )
         assert self.max_running_requests > 0, "max_running_request is zero"
+        dp_size = server_args.dp_size
+        per_rank_tokens = (
+            self.max_total_num_tokens // dp_size if dp_size > 1 else self.max_total_num_tokens
+        )
         self.max_req_len = min(
             self.model_config.context_len - 1,
-            self.max_total_num_tokens - 1,
+            per_rank_tokens - 1,
         )
         self.max_req_input_len = self.max_req_len - 5
         assert self.max_req_len > 0 and self.max_req_input_len > 0, "Memory pool size is too small"

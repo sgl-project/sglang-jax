@@ -15,6 +15,27 @@ MARKER = "SGLANG_JAX_BENCH"
 
 
 def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None) -> list[float]:
+    # When task is provided, prefer matching kernel events by name directly.
+    # This gives accurate device_duration_ps from pallas kernel events,
+    # whereas MARKER scope events (call-done) may report incorrect durations.
+    if task:
+        event_matcher = re.compile(task)
+        events = []
+        for e in trace.get("traceEvents", []):
+            if "name" in e and event_matcher.search(e["name"]):
+                events.append(e)
+        if events:
+            min_pid = min(e["pid"] for e in events)
+            events_from_min_pid = [e for e in events if e["pid"] == min_pid]
+            durations_ms: list[float] = []
+            for e in events_from_min_pid:
+                if e.get("args", {}).get("device_duration_ps"):
+                    durations_ms.append(float(e["args"]["device_duration_ps"]) / 1e9)
+                elif "dur" in e:
+                    durations_ms.append(float(e["dur"]) / 1e3)
+            return durations_ms
+
+    # Fallback: use MARKER-based extraction
     marker_events: list[dict[str, Any]] = []
     for e in trace.get("traceEvents", []):
         args = e.get("args", {})
@@ -27,24 +48,7 @@ def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None)
         marker_events = marker_call_done_events
 
     if not marker_events:
-        if not task:
-            return []
-        event_matcher = re.compile(task)
-        events = []
-        for e in trace.get("traceEvents", []):
-            if "name" in e and event_matcher.match(e["name"]):
-                events.append(e)
-        if not events:
-            return []
-        min_pid = min(e["pid"] for e in events)
-        events_from_min_pid = [e for e in events if e["pid"] == min_pid]
-        durations_ms: list[float] = []
-        for e in events_from_min_pid:
-            if e.get("args", {}).get("device_duration_ps"):
-                durations_ms.append(float(e["args"]["device_duration_ps"]) / 1e9)
-            elif "dur" in e:
-                durations_ms.append(float(e["dur"]) / 1e3)
-        return durations_ms
+        return []
 
     min_pid = min(e["pid"] for e in marker_events)
     events_from_min_pid = [e for e in marker_events if e["pid"] == min_pid]

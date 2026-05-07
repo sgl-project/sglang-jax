@@ -90,6 +90,7 @@ class ServerArgs:
 
     # Data parallel
     dp_size: int = 1
+    dp_schedule_policy: str = "min_running_queue"
 
     # Logging
     log_level: str = "info"
@@ -792,6 +793,13 @@ class ServerArgs:
             default=ServerArgs.dp_size,
             help="The data parallelism size.",
         )
+        parser.add_argument(
+            "--dp-schedule-policy",
+            type=str,
+            choices=["round_robin", "min_running_queue"],
+            default=ServerArgs.dp_schedule_policy,
+            help="DP scheduling policy for assigning dp_rank to new requests.",
+        )
 
         # Multi-node distributed serving
         parser.add_argument(
@@ -910,9 +918,16 @@ class ServerArgs:
             choices=[
                 "native",
                 "fa",
+                "fa_mha",
             ],
             default=ServerArgs.attention_backend,
-            help="Choose the kernels for attention layers.",
+            help=(
+                "Choose the kernels for attention layers. "
+                "'fa' = FlashAttention for MHA models, MLA Pallas kernel (absorbed) for MLA models. "
+                "'fa_mha' = force the MHA FlashAttention path for MLA models too "
+                "(decompress latent KV per-forward via kv_b_proj; ~70x more KV cache than 'fa', "
+                "intended for kernel A/B on short contexts)."
+            ),
         )
         parser.add_argument(
             "--moe-backend",

@@ -200,20 +200,22 @@ class TestModuleStructure:
 
 
 # ---------------------------------------------------------------------------
-# Forward pass tests (require tops library)
+# Forward pass tests (require simple_gla kernel)
 # ---------------------------------------------------------------------------
 
 try:
-    from tops.ops.simple_gla import simple_gla_fwd  # noqa: F401
-    from tops.ops.simple_gla.fused_recurrent import (  # noqa: F401
+    from sgl_jax.srt.kernels.simple_gla.simple_gla import (  # noqa: F401
         fused_recurrent_simple_gla,
+        simple_gla_fwd,
     )
 
-    HAS_TOPS = True
+    HAS_SIMPLE_GLA = True
 except ImportError:
-    HAS_TOPS = False
+    HAS_SIMPLE_GLA = False
 
-requires_tops = pytest.mark.skipif(not HAS_TOPS, reason="tops library not available")
+requires_simple_gla = pytest.mark.skipif(
+    not HAS_SIMPLE_GLA, reason="simple_gla kernel not available"
+)
 
 # Prefill (chunk) kernel uses Pallas TPU primitives and cannot run on CPU.
 _HAS_TPU = any(d.platform == "tpu" for d in jax.devices())
@@ -257,7 +259,7 @@ _SMALL_HIDDEN = 512
 
 
 class TestDecodeForward:
-    @requires_tops
+    @requires_simple_gla
     def test_decode_output_shape(self):
         """Decode forward should return output [T, hidden_size] and new_state [T, H, K, V]."""
         backend = LinearAttentionBackend(mesh=mesh)
@@ -279,7 +281,7 @@ class TestDecodeForward:
         assert output.shape == (T, _SMALL_HIDDEN)
         assert new_state.shape == (T, _SMALL_H, _SMALL_K, _SMALL_K)
 
-    @requires_tops
+    @requires_simple_gla
     def test_decode_state_updates(self):
         """Two decode steps should produce different states."""
         backend = LinearAttentionBackend(mesh=mesh)
@@ -300,7 +302,7 @@ class TestDecodeForward:
 
         assert not jnp.allclose(state1, state2), "States should differ after two steps"
 
-    @requires_tops
+    @requires_simple_gla
     def test_decode_state_affects_output(self):
         """Different initial states should produce different outputs."""
         backend = LinearAttentionBackend(mesh=mesh)
@@ -329,7 +331,7 @@ class TestDecodeForward:
 
 
 class TestPrefillForward:
-    @requires_tops
+    @requires_simple_gla
     @requires_tpu
     def test_prefill_output_shape(self):
         """Prefill forward should return output [T, hidden_size] and new_state [N_padded, H, K, V]."""
@@ -366,7 +368,7 @@ class TestPrefillForward:
         assert jnp.all(jnp.isfinite(output)), "Output contains NaN/Inf"
         assert not jnp.all(output == 0), "Output is all zeros"
 
-    @requires_tops
+    @requires_simple_gla
     @requires_tpu
     def test_prefill_non_chunk_aligned(self):
         """Prefill with non-chunk-aligned seq_len (e.g. 100) should work via scatter/gather."""
@@ -403,7 +405,7 @@ class TestPrefillForward:
         assert jnp.all(jnp.isfinite(output)), "Output contains NaN/Inf"
         assert not jnp.all(output == 0), "Output is all zeros"
 
-    @requires_tops
+    @requires_simple_gla
     @requires_tpu
     def test_prefill_zeros_state_runs(self):
         """Prefill with all-zeros initial state should complete without error."""
@@ -439,7 +441,7 @@ class TestPrefillForward:
 
 
 # ---------------------------------------------------------------------------
-# White-box tests (require tops library)
+# White-box tests (require simple_gla kernel)
 # ---------------------------------------------------------------------------
 
 
@@ -612,12 +614,12 @@ class TestWhiteBox:
 
 
 # ---------------------------------------------------------------------------
-# Multi-request isolation tests (require tops library)
+# Multi-request isolation tests (require simple_gla kernel)
 # ---------------------------------------------------------------------------
 
 
 class TestMultiRequestIsolation:
-    @requires_tops
+    @requires_simple_gla
     def test_decode_multi_request_isolation(self):
         """Two requests decoded separately should match decoded together."""
         backend = LinearAttentionBackend(mesh=mesh)
@@ -652,6 +654,11 @@ class TestMultiRequestIsolation:
             positions_both = jnp.array([0, 0], dtype=jnp.int32)
             out_both, s_both = module(positions_both, hidden_both, fb, state_both)
 
+        # Materialize to host before slicing — Explicit-axis mesh + LinearBase's
+        # P("data", ...) output sharding makes device-side fancy slicing ambiguous.
+        out_both = np.asarray(out_both)
+        s_both = np.asarray(s_both)
+
         # fused_recurrent_simple_gla uses jax.lax.scan — no cross-batch
         # interaction, so B=1 vs B=2 results are mathematically identical.
         # However, XLA generates different tiling for [1,H,K,V] vs [2,H,K,V],
@@ -684,7 +691,7 @@ class TestMultiRequestIsolation:
             err_msg="Request 2 state differs between separate and batched decode",
         )
 
-    @requires_tops
+    @requires_simple_gla
     @requires_tpu
     def test_prefill_multi_request_isolation(self):
         """Two requests prefilled separately should match prefilled together."""
@@ -750,6 +757,11 @@ class TestMultiRequestIsolation:
             fb_ext_both = _make_forward_batch(ForwardMode.EXTEND, linear_attn_metadata=meta_both)
             out_both, s_both = module_both(pos_both, h_both, fb_ext_both, state_both_init)
 
+        # Materialize to host before slicing — Explicit-axis mesh + LinearBase's
+        # P("data", ...) output sharding makes device-side fancy slicing ambiguous.
+        out_both = np.asarray(out_both)
+        s_both = np.asarray(s_both)
+
         # Output tolerance: TPU bf16 matmul uses different tiling strategies for
         # different matrix dimensions.  Single-request (T=128) vs batched (T=256)
         # triggers different XLA tiling → different bf16 accumulation order →
@@ -785,7 +797,7 @@ class TestMultiRequestIsolation:
             err_msg="Request 2 state differs in batched prefill",
         )
 
-    @requires_tops
+    @requires_simple_gla
     @requires_tpu
     def test_prefill_vs_decode_approximate_agreement(self):
         """Prefill and token-by-token decode should produce approximately similar results.
@@ -864,7 +876,7 @@ class TestMultiRequestIsolation:
             err_msg="Prefill output != decode output",
         )
 
-    @requires_tops
+    @requires_simple_gla
     @requires_tpu
     def test_prefill_unequal_length_isolation(self):
         """Two requests with different lengths prefilled together should match separate runs."""
@@ -930,6 +942,11 @@ class TestMultiRequestIsolation:
             fb_ext_both = _make_forward_batch(ForwardMode.EXTEND, linear_attn_metadata=meta_both)
             out_both, s_both = module_both(pos_both, h_both, fb_ext_both, state_both_init)
 
+        # Materialize to host before slicing — Explicit-axis mesh + LinearBase's
+        # P("data", ...) output sharding makes device-side fancy slicing ambiguous.
+        out_both = np.asarray(out_both)
+        s_both = np.asarray(s_both)
+
         # Same tolerance rationale as test_prefill_multi_request_isolation:
         # output atol=1.0 for TPU bf16 dense matmul tiling divergence,
         # state atol=5e-2 (kernel output, no dense matmul involved).
@@ -967,10 +984,9 @@ class TestMultiRequestIsolation:
 class TestGLAWrapper:
     """Verify module forward matches direct kernel call with same inputs."""
 
-    @requires_tops
+    @requires_simple_gla
     def test_decode_wrapper_matches_direct_kernel(self):
         """Module decode output should match direct fused_recurrent_simple_gla call."""
-        from tops.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
 
         T = 2
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
@@ -1044,10 +1060,9 @@ class TestGLAWrapper:
             err_msg="Decode: module state != direct kernel state",
         )
 
-    @requires_tops
+    @requires_simple_gla
     def test_gla_recurrence_matches_numpy(self):
         """fused_recurrent_simple_gla should match pure-numpy step-by-step GLA recurrence."""
-        from tops.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
 
         seq_len, H, K = 8, _SMALL_H, _SMALL_K
         rng = np.random.default_rng(42)
@@ -1090,12 +1105,10 @@ class TestGLAWrapper:
             err_msg="GLA final state != numpy reference",
         )
 
-    @requires_tops
+    @requires_simple_gla
     @requires_tpu
     def test_prefill_wrapper_matches_direct_kernel(self):
         """Module prefill output should match direct scatter + simple_gla_fwd call."""
-        from tops.ops.simple_gla import simple_gla_fwd
-
         from sgl_jax.srt.layers.attention.fla.linear_attention_backend import (
             gather_from_packed,
             scatter_to_packed,
@@ -1294,7 +1307,7 @@ class TestTPConsistency:
     relax to 1e-2 for bf16 (matching design doc cross-framework bf16 tolerance).
     """
 
-    @requires_tops
+    @requires_simple_gla
     @requires_tpu
     @requires_multi_device
     def test_decode_tp_matches_tp1(self):
@@ -1349,7 +1362,7 @@ class TestTPConsistency:
                 err_msg=f"TP={tp} decode state != TP=1",
             )
 
-    @requires_tops
+    @requires_simple_gla
     @requires_tpu
     @requires_multi_device
     def test_prefill_tp_matches_tp1(self):
