@@ -24,6 +24,22 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 
 logger = logging.getLogger(__name__)
 
+# TODO (Qinghan): hardcoded, need to be moved to somewhere else
+# Tuned (bq_sz, bkv_sz, bq_csz, bkv_csz) for the v3 kernel, keyed by max_num_tokens.
+# User-provided values were given as (bkv_sz, bq_sz, bkv_csz, bq_csz); below is the
+# v3 kernel's expected order.
+#   8192 ← user [4096, 512, 1024, 128]    -> bq_sz=512,  bkv_sz=4096, bq_csz=128, bkv_csz=1024
+#   16384 ← user [4096, 1024, 1024, 128] -> bq_sz=1024, bkv_sz=4096, bq_csz=128, bkv_csz=1024
+_TUNED_RPA_V3_BLOCK_SIZES: dict[int, tuple[int, int, int, int]] = {
+    8192: (512, 4096, 128, 1024),
+    16384: (1024, 4096, 128, 1024),
+}
+
+
+def _lookup_tuned_v3_block_sizes(max_num_tokens: int):
+    """Return (bq_sz, bkv_sz, bq_csz, bkv_csz) or None if no tuned entry."""
+    return _TUNED_RPA_V3_BLOCK_SIZES.get(int(max_num_tokens))
+
 
 @register_pytree_node_class
 @dataclass
@@ -473,6 +489,7 @@ class FlashAttention(AttentionBackend):
                 hdim,
             )
 
+            tuned_blk = _lookup_tuned_v3_block_sizes(queries.shape[0])
             result, updated_kv_cache_5d = ragged_paged_attention(
                 queries,
                 keys,
@@ -485,6 +502,9 @@ class FlashAttention(AttentionBackend):
                 soft_cap=layer.logit_cap,
                 xai_temperature_len=xai_temp_len,
                 prefill_size=queries.shape[0],
+                # Apply tuned block sizes to prefill and mixed cases (decode keeps default).
+                p_block_sizes=tuned_blk,
+                m_block_sizes=tuned_blk,
             )
 
             updated_kv_cache_4d = updated_kv_cache_5d.reshape(
