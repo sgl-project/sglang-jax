@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import json
 import logging
 import os
 import re
@@ -11,6 +12,7 @@ import time
 import unittest
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import nullcontext, suppress
+from pathlib import Path
 from types import SimpleNamespace
 
 import jax
@@ -25,29 +27,102 @@ from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.model_executor.model_runner import ModelRunner
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
-from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.common_utils import get_bool_env_var, retry
 
-DEFAULT_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-8B"
-DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-1.7B"
-QWEN3_8B = "Qwen/Qwen3-8B"
-QWEN_7B = "Qwen/Qwen-7B"
+_MODEL_CACHE_ENV = "SGLANG_JAX_MODEL_CACHE"
+_LOCAL_MODEL_LOG_ONCE: set[str] = set()
 
-QWEN3_MOE_30B = "Qwen/Qwen3-30B-A3B"
-QWEN2_5_7B_INSTRUCT = "Qwen/Qwen2.5-7B-Instruct"
-QWEN3_CODER_30B_A3B_INSTRUCT = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
-GEMMA2_2B_IT = "google/gemma-2-2b-it"
 
-BAILING_MOE = "inclusionAI/Ling-mini-2.0"
-DEEPSEEK_R1_DISTILL_QWEN_1_5B = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-DEEPSEEK_V2_LITE = "deepseek-ai/DeepSeek-V2-Lite"
-DEEPSEEK_CODER_V2_LITE_INSTRUCT = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
+def _validate_local_snapshot(d: Path) -> bool:
+    config_path = d / "config.json"
+    if not config_path.is_file():
+        return False
+    if not (d / "tokenizer_config.json").is_file():
+        return False
 
-QWEN3_32B = "google/gemma-2-2b-it"
-QWEN3_32B_EAGLE3 = "AngelSlim/Qwen3-32B_eagle3"
+    has_tokenizer = (
+        any(
+            (d / fname).is_file()
+            for fname in ("tokenizer.json", "tokenizer.model", "tiktoken.model")
+        )
+        or (d / "vocab.json").is_file()
+        or any(d.glob("*.tiktoken"))
+    )
+    if not has_tokenizer:
+        return False
 
-WAN2_1_T2V_1_3B = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
-WAN2_1_T2V_14B = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+    try:
+        config = json.loads(config_path.read_text())
+    except Exception:
+        return False
+    auto_map = config.get("auto_map", {})
+    if isinstance(auto_map, dict):
+        for value in auto_map.values():
+            if isinstance(value, str) and "." in value:
+                module_name = value.split(".")[0]
+                if not (d / f"{module_name}.py").is_file():
+                    return False
+
+    index = d / "model.safetensors.index.json"
+    if index.is_file():
+        try:
+            meta = json.loads(index.read_text())
+        except Exception:
+            return False
+        shards = set(meta.get("weight_map", {}).values())
+        if not shards:
+            return False
+        return all((d / s).is_file() for s in shards)
+
+    has_single_weight_file = (d / "model.safetensors").is_file() or any(d.glob("*.bin"))
+    has_sharded_weight_file = any(d.glob("*-of-*.safetensors")) or any(d.glob("*-of-*.bin"))
+    if has_sharded_weight_file and not index.is_file():
+        return False
+    return has_single_weight_file
+
+
+def _local_or_hf(repo: str) -> str:
+    cache = os.environ.get(_MODEL_CACHE_ENV)
+    if not cache:
+        return repo
+    local = Path(cache) / repo
+    if _validate_local_snapshot(local):
+        return str(local)
+    if repo not in _LOCAL_MODEL_LOG_ONCE:
+        _LOCAL_MODEL_LOG_ONCE.add(repo)
+        print(
+            f"[test_utils] cache miss for {repo} under {cache}, " f"falling back to HF download",
+            file=sys.stderr,
+            flush=True,
+        )
+    return repo
+
+
+DEFAULT_MODEL_NAME_FOR_TEST = _local_or_hf("Qwen/Qwen3-8B")
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST = _local_or_hf("Qwen/Qwen3-1.7B")
+QWEN3_8B = _local_or_hf("Qwen/Qwen3-8B")
+QWEN_7B = _local_or_hf("Qwen/Qwen-7B")
+QWEN3_4B = _local_or_hf("Qwen/Qwen3-4B")
+
+QWEN3_MOE_30B = _local_or_hf("Qwen/Qwen3-30B-A3B")
+QWEN2_5_7B_INSTRUCT = _local_or_hf("Qwen/Qwen2.5-7B-Instruct")
+QWEN3_CODER_30B_A3B_INSTRUCT = _local_or_hf("Qwen/Qwen3-Coder-30B-A3B-Instruct")
+GEMMA2_2B_IT = _local_or_hf("google/gemma-2-2b-it")
+
+BAILING_MOE = _local_or_hf("inclusionAI/Ling-mini-2.0")
+DEEPSEEK_R1_DISTILL_QWEN_1_5B = _local_or_hf("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
+DEEPSEEK_V2_LITE = _local_or_hf("deepseek-ai/DeepSeek-V2-Lite")
+DEEPSEEK_CODER_V2_LITE_INSTRUCT = _local_or_hf("deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct")
+
+QWEN3_32B = _local_or_hf("Qwen/Qwen3-32B")
+QWEN3_32B_EAGLE3 = _local_or_hf("AngelSlim/Qwen3-32B_eagle3")
+
+WAN2_1_T2V_1_3B = _local_or_hf("Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
+WAN2_1_T2V_14B = _local_or_hf("Wan-AI/Wan2.1-T2V-14B-Diffusers")
+
+MIMO_AUDIO_7B_INSTRUCT = _local_or_hf("XiaomiMiMo/MiMo-Audio-7B-Instruct")
+UMT5_BASE = _local_or_hf("google/umt5-base")
+QWEN3_OMNI_30B_A3B_INSTRUCT = _local_or_hf("Qwen/Qwen3-Omni-30B-A3B-Instruct")
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
 
@@ -295,79 +370,6 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             itself.send_signal(signal.SIGQUIT)
 
 
-def generate_server_args() -> ServerArgs:
-    return ServerArgs(
-        model_path="Qwen/Qwen-7B",
-        tokenizer_path="Qwen/Qwen-7B",
-        tokenizer_mode="auto",
-        skip_tokenizer_init=False,
-        load_format="auto",
-        model_loader_extra_config="{}",
-        trust_remote_code=True,
-        context_length=None,
-        is_embedding=False,
-        revision=None,
-        model_impl="auto",
-        host="127.0.0.1",
-        port=30000,
-        skip_server_warmup=True,
-        warmups=None,
-        dtype="bfloat16",
-        quantization=None,
-        quantization_param_path=None,
-        kv_cache_dtype="auto",
-        mem_fraction_static=0.1,
-        max_running_requests=None,
-        max_total_tokens=None,
-        max_prefill_tokens=4096,
-        schedule_policy="fcfs",
-        schedule_conservativeness=1.0,
-        page_size=1,
-        swa_full_tokens_ratio=0.8,
-        disable_hybrid_swa_memory=False,
-        device="tpu",
-        tp_size=4,
-        stream_interval=1,
-        stream_output=False,
-        random_seed=3,
-        constrained_json_whitespace_pattern=None,
-        watchdog_timeout=300,
-        dist_timeout=None,
-        download_dir="/tmp",
-        sleep_on_idle=False,
-        dp_size=1,
-        log_level="info",
-        log_level_http=None,
-        log_requests=False,
-        log_requests_level=0,
-        crash_dump_folder=None,
-        show_time_cost=False,
-        bucket_time_to_first_token=None,
-        bucket_inter_token_latency=None,
-        bucket_e2e_request_latency=None,
-        decode_log_interval=40,
-        enable_request_time_stats_logging=False,
-        kv_events_config=None,
-        api_key=None,
-        served_model_name="Qwen/Qwen-7B",
-        file_storage_path="sglang_storage",
-        enable_cache_report=False,
-        reasoning_parser=None,
-        tool_call_parser=None,
-        dist_init_addr="0.0.0.0:10011",
-        nnodes=1,
-        node_rank=0,
-        json_model_override_args="{}",
-        preferred_sampling_params=None,
-        disable_radix_cache=False,
-        allow_auto_truncate=False,
-        max_seq_len=4096,
-        precompile_token_paddings=[1, 8],
-        disable_precompile=False,
-    )
-
-
-# note: add fields value as you want, decrease existing fields is forbidden
 def generate_schedule_batch(
     bs: int, num_tokens_per_req: int, mode: ForwardMode, model_runner: ModelRunner
 ) -> ScheduleBatch:

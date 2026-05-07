@@ -13,6 +13,7 @@ from sgl_jax.srt.utils import kill_process_tree
 from sgl_jax.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    QWEN3_32B,
     CustomTestCase,
     popen_launch_server,
 )
@@ -102,7 +103,7 @@ class BaseW8Test(CustomTestCase):
 
 
 class TestW8Int8(BaseW8Test):
-    model = "Qwen/Qwen3-32B"
+    model = QWEN3_32B
     quantization_config_path = "int8.yaml"
     gsm8k_accuracy_threshold = 0.95
     throughput_threshold = 98
