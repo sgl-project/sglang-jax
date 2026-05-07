@@ -21,7 +21,14 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
 from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
 from sgl_jax.srt.utils.common_utils import is_remote_url, lru_cache_frozenset
 
-_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {}
+
+class GlmMoeDsaConfig(PretrainedConfig):
+    model_type = "glm_moe_dsa"
+
+
+_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
+    "glm_moe_dsa": GlmMoeDsaConfig,
+}
 
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
@@ -78,9 +85,23 @@ def get_config(
         kwargs["gguf_file"] = model
         model = Path(model).parent
 
-    config = AutoConfig.from_pretrained(
-        model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-    )
+    # Manual check for custom model types to bypass AutoConfig error
+    config_json_path = os.path.join(model, "config.json") if os.path.isdir(model) else None
+    loaded_custom = False
+    if config_json_path and os.path.exists(config_json_path):
+        import json
+        with open(config_json_path) as f:
+            config_dict = json.load(f)
+        if config_dict.get("model_type") in _CONFIG_REGISTRY:
+            config_class = _CONFIG_REGISTRY[config_dict["model_type"]]
+            config = config_class.from_pretrained(model, revision=revision, **kwargs)
+            loaded_custom = True
+            
+    if not loaded_custom:
+        config = AutoConfig.from_pretrained(
+            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+
     text_config = get_hf_text_config(config=config)
 
     if isinstance(model, str) and text_config is not None:
