@@ -34,14 +34,33 @@ _LOCAL_MODEL_LOG_ONCE: set[str] = set()
 
 
 def _validate_local_snapshot(d: Path) -> bool:
-    if not (d / "config.json").is_file():
+    config_path = d / "config.json"
+    if not config_path.is_file():
+        return False
+    if not (d / "tokenizer_config.json").is_file():
         return False
 
-    has_tokenizer = (d / "tokenizer.json").is_file() or (
-        (d / "tokenizer_config.json").is_file() and (d / "vocab.json").is_file()
+    has_tokenizer = (
+        any(
+            (d / fname).is_file()
+            for fname in ("tokenizer.json", "tokenizer.model", "tiktoken.model")
+        )
+        or (d / "vocab.json").is_file()
     )
     if not has_tokenizer:
         return False
+
+    try:
+        config = json.loads(config_path.read_text())
+    except Exception:
+        return False
+    auto_map = config.get("auto_map", {})
+    if isinstance(auto_map, dict):
+        for value in auto_map.values():
+            if isinstance(value, str) and "." in value:
+                module_name = value.split(".")[0]
+                if not (d / f"{module_name}.py").is_file():
+                    return False
 
     index = d / "model.safetensors.index.json"
     if index.is_file():
