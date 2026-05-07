@@ -276,6 +276,11 @@ class DiffusionModelRunner(BaseModelRunner):
         logger.info("Finished FLUX diffusion in %.2f seconds", time.time() - start_time)
 
         # 10. Unpack latents: [B, seq, C] -> [B, C//4, H', W']
+        # Replicate before multi-axis split reshape (Explicit mesh can't infer output sharding).
+        if mesh is not None:
+            latents = jax.sharding.reshard(
+                latents, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+            )
         latents = self._unpack_latents_flux(latents, height_latent, width_latent, in_channels)
 
         # 11. Store 4D result [B, C, H', W']
