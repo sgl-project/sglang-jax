@@ -39,14 +39,14 @@ def _resolve_rngs(rngs: nnx.Rngs | None) -> nnx.Rngs:
 def _no_shard(x: jax.Array, mesh: Mesh | None) -> jax.Array:
     if mesh is None:
         return x
-    return jax.lax.with_sharding_constraint(x, NamedSharding(mesh, P()))
+    return jax.sharding.reshard(x, NamedSharding(mesh, P()))
 
 
 def _data_seq_tensor_shard(x: jax.Array, mesh: Mesh | None) -> jax.Array:
     if mesh is None:
         return x
     output_pspec = P("data", *([None] * (x.ndim - 2)), "tensor")
-    return jax.lax.with_sharding_constraint(x, NamedSharding(mesh, output_pspec))
+    return jax.sharding.reshard(x, NamedSharding(mesh, output_pspec))
 
 
 def _sdpa_attention(
