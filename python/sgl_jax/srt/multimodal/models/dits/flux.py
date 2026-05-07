@@ -42,6 +42,13 @@ def _no_shard(x: jax.Array, mesh: Mesh | None) -> jax.Array:
     return jax.lax.with_sharding_constraint(x, NamedSharding(mesh, P()))
 
 
+def _data_seq_tensor_shard(x: jax.Array, mesh: Mesh | None) -> jax.Array:
+    if mesh is None:
+        return x
+    output_pspec = P("data", *([None] * (x.ndim - 2)), "tensor")
+    return jax.lax.with_sharding_constraint(x, NamedSharding(mesh, output_pspec))
+
+
 def _sdpa_attention(
     query: jax.Array,
     key: jax.Array,
@@ -294,6 +301,7 @@ class FluxAttention(nnx.Module):
 
         hidden_states = hidden_states.reshape(hidden_states.shape[0], hidden_states.shape[1], -1)
         hidden_states = hidden_states.astype(query.dtype)
+        hidden_states = _data_seq_tensor_shard(hidden_states, self.mesh)
 
         if encoder_hidden_states is not None and self.added_kv_proj_dim is not None:
             context_len = encoder_hidden_states.shape[1]
