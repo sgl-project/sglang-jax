@@ -21,7 +21,14 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
 from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
 from sgl_jax.srt.utils.common_utils import is_remote_url, lru_cache_frozenset
 
-_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {}
+
+class GlmMoeDsaConfig(PretrainedConfig):
+    model_type = "glm_moe_dsa"
+
+
+_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
+    "glm_moe_dsa": GlmMoeDsaConfig,
+}
 
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
