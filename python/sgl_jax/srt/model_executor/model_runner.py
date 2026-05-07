@@ -498,33 +498,20 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 logger.debug("logits_metadata %s: %s", key, value)
 
         with jtu.count_pjit_cpp_cache_miss() as count:
-            output, layers_kv_fused, _, layers_topk_ids = self.jitted_run_model(
+            output, pool_updates, _, layers_topk_ids = self.jitted_run_model(
                 forward_batch, logits_metadata
             )
             cache_miss_count = count()
 
-        self._set_kv_cache_after_forward(layers_kv_fused)
+        # tp_size==1: sharding constraint is lost after JIT; re-place explicitly.
+        # See https://github.com/sgl-project/sglang-jax/issues/233
+        if self.tp_size == 1 and isinstance(pool_updates, list):
+            target_sharding = self.token_to_kv_pool.kv_sharding
+            pool_updates = [jax.device_put(kv, target_sharding) for kv in pool_updates]
+        self.memory_pools.replace_all(pool_updates)
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
         return output, cache_miss_count, layers_topk_ids
-
-    def _set_kv_cache_after_forward(self, layers_kv_fused):
-        # Note: For tp_size == 1, we need to put the layers_kv_fused on the device with the target_sharding
-        # because sharding P(None, 'tensor') constraint has lost and this results in cache_miss for first prefill phase.
-        # Issue: https://github.com/sgl-project/sglang-jax/issues/233
-        # Q: Why does not call device_put in every layer?
-        # A: Because it does not work and cache_miss still happens. According to benchmark(https://github.com/sgl-project/sglang-jax/pull/234), the performance is not influenced.
-        if self.tp_size == 1:
-            # MHA pool is 5D `(pages, page_size, kv_packing, num_kv_heads*2, head_dim)`,
-            # MLA pool is 4D `(pages, page_size, kv_packing, kv_lora_rank+qk_rope)`.
-            # Take the spec directly from the pool's buffer instead of hardcoding.
-            target_sharding = self.token_to_kv_pool.kv_sharding
-            layers_kv_fused = [
-                jax.device_put(layer_kv_fused, target_sharding)
-                for layer_kv_fused in layers_kv_fused
-            ]
-
-        self.memory_pools.replace_all(layers_kv_fused)
 
     def forward_idle(
         self,
