@@ -198,9 +198,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 self.req_index_to_recurrent_index_mapping[r.req_pool_idx] = slot
                 new_indices.append(slot)
 
-        if new_indices:
-            self.recurrent_state_pool.clear_slot(new_indices)
-
         return result
 
     def free(self, req: Req):
