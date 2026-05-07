@@ -238,11 +238,13 @@ jobs:
           SGLANG_JAX_IS_IN_CI: true
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
+          HF_HUB_ENABLE_HF_TRANSFER: "1"
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
+          uv pip install hf_transfer
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite performance-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
@@ -266,11 +268,13 @@ jobs:
           SGLANG_JAX_IS_IN_CI: true
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
+          HF_HUB_ENABLE_HF_TRANSFER: "1"
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
+          uv pip install hf_transfer
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite performance-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3000
 
