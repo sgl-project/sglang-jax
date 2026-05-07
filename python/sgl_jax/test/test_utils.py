@@ -34,6 +34,43 @@ _LOCAL_MODEL_LOG_ONCE: set[str] = set()
 
 
 def _validate_local_snapshot(d: Path) -> bool:
+    if not d.is_dir():
+        return False
+
+    if (d / "model_index.json").is_file():
+        try:
+            model_index = json.loads((d / "model_index.json").read_text())
+        except Exception:
+            return False
+        for component, spec in model_index.items():
+            if component.startswith("_"):
+                continue
+            if not isinstance(spec, list) or len(spec) < 2 or spec[1] is None:
+                continue
+            sub = d / component
+            if not sub.is_dir():
+                return False
+            if not any(sub.iterdir()):
+                return False
+            for index_name in (
+                "diffusion_pytorch_model.safetensors.index.json",
+                "model.safetensors.index.json",
+            ):
+                sub_index = sub / index_name
+                if sub_index.is_file():
+                    try:
+                        meta = json.loads(sub_index.read_text())
+                    except Exception:
+                        return False
+                    shards = set(meta.get("weight_map", {}).values())
+                    if shards and not all((sub / s).is_file() for s in shards):
+                        return False
+                    break
+            else:
+                if any(sub.glob("*-of-*.safetensors")) or any(sub.glob("*-of-*.bin")):
+                    return False
+        return True
+
     config_path = d / "config.json"
     if not config_path.is_file():
         return False
