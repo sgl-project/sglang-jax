@@ -27,7 +27,6 @@ from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.model_executor.model_runner import ModelRunner
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
-from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.common_utils import get_bool_env_var, retry
 
 _MODEL_CACHE_ENV = "SGLANG_JAX_MODEL_CACHE"
@@ -340,79 +339,6 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             itself.send_signal(signal.SIGQUIT)
 
 
-def generate_server_args() -> ServerArgs:
-    return ServerArgs(
-        model_path=QWEN_7B,
-        tokenizer_path=QWEN_7B,
-        tokenizer_mode="auto",
-        skip_tokenizer_init=False,
-        load_format="auto",
-        model_loader_extra_config="{}",
-        trust_remote_code=True,
-        context_length=None,
-        is_embedding=False,
-        revision=None,
-        model_impl="auto",
-        host="127.0.0.1",
-        port=30000,
-        skip_server_warmup=True,
-        warmups=None,
-        dtype="bfloat16",
-        quantization=None,
-        quantization_param_path=None,
-        kv_cache_dtype="auto",
-        mem_fraction_static=0.1,
-        max_running_requests=None,
-        max_total_tokens=None,
-        max_prefill_tokens=4096,
-        schedule_policy="fcfs",
-        schedule_conservativeness=1.0,
-        page_size=1,
-        swa_full_tokens_ratio=0.8,
-        disable_hybrid_swa_memory=False,
-        device="tpu",
-        tp_size=4,
-        stream_interval=1,
-        stream_output=False,
-        random_seed=3,
-        constrained_json_whitespace_pattern=None,
-        watchdog_timeout=300,
-        dist_timeout=None,
-        download_dir="/tmp",
-        sleep_on_idle=False,
-        dp_size=1,
-        log_level="info",
-        log_level_http=None,
-        log_requests=False,
-        log_requests_level=0,
-        crash_dump_folder=None,
-        show_time_cost=False,
-        bucket_time_to_first_token=None,
-        bucket_inter_token_latency=None,
-        bucket_e2e_request_latency=None,
-        decode_log_interval=40,
-        enable_request_time_stats_logging=False,
-        kv_events_config=None,
-        api_key=None,
-        served_model_name=QWEN_7B,
-        file_storage_path="sglang_storage",
-        enable_cache_report=False,
-        reasoning_parser=None,
-        tool_call_parser=None,
-        dist_init_addr="0.0.0.0:10011",
-        nnodes=1,
-        node_rank=0,
-        json_model_override_args="{}",
-        preferred_sampling_params=None,
-        disable_radix_cache=False,
-        allow_auto_truncate=False,
-        max_seq_len=4096,
-        precompile_token_paddings=[1, 8],
-        disable_precompile=False,
-    )
-
-
-# note: add fields value as you want, decrease existing fields is forbidden
 def generate_schedule_batch(
     bs: int, num_tokens_per_req: int, mode: ForwardMode, model_runner: ModelRunner
 ) -> ScheduleBatch:
