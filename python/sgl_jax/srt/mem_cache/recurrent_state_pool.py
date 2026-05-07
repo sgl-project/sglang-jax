@@ -22,10 +22,6 @@ def _resolve_dtype(env_var: str, default):
     return _DTYPE_MAP[name] if name else default
 
 
-def _ceil_to(value: int, divisor: int) -> int:
-    return (value + divisor - 1) // divisor * divisor
-
-
 @register_pytree_node_class
 class RecurrentStatePool:
 
@@ -46,6 +42,11 @@ class RecurrentStatePool:
         num_k_heads: int | None = None,
         head_k_dim: int | None = None,
     ):
+        """`size` is the **global** number of valid slots across all DP ranks
+        (mirrors MHATokenToKVPool.size semantics). Internally we partition by
+        DP: each rank gets `size // dp_size` valid slots + 1 dummy slot at
+        index 0, so total buffer slots = size + dp_size.
+        """
         if temporal_dtype is None:
             temporal_dtype = _resolve_dtype("SGLANG_JAX_RECURRENT_STATE_DTYPE", jnp.float32)
         if conv_dtype is None:
@@ -68,8 +69,13 @@ class RecurrentStatePool:
         }
         self.num_linear_recurrent_layers: int = len(self.linear_recurrent_layer_ids)
 
+        assert (
+            size % dp_size == 0
+        ), f"RecurrentStatePool size ({size}) must be divisible by dp_size ({dp_size})."
+
         self.size = size
         self.dp_size = dp_size
+        self.slots_per_rank = size // dp_size
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.num_k_heads = num_k_heads
@@ -80,8 +86,8 @@ class RecurrentStatePool:
         proj_k = num_k_heads * head_k_dim
         self.proj_size = proj_v + 2 * proj_k
 
-        # total_slots: size+1 (for dummy slot 0), ceil to dp_size
-        self.total_slots = _ceil_to(size + 1, dp_size)
+        # Each rank reserves slot 0 as a dummy → +1 per rank.
+        self.total_slots = size + dp_size
 
         self.mesh = mesh
         self.recurrent_partition_axis = recurrent_partition_axis
@@ -226,6 +232,7 @@ class RecurrentStatePool:
         obj.num_linear_recurrent_layers = len(obj.linear_recurrent_layer_ids)
         obj.size = size
         obj.dp_size = dp_size
+        obj.slots_per_rank = size // dp_size
         obj.total_slots = total_slots
         obj.num_heads = num_heads
         obj.head_dim = head_dim

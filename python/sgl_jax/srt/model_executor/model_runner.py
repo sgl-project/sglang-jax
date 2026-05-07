@@ -219,7 +219,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             with LoraBatchContext.set_batch(forward_batch):
-                return model(forward_batch, memory_pools.token_to_kv_pool, logits_metadata)
+                return model(forward_batch, memory_pools, logits_metadata)
 
         # Capture base RNG key as a constant in the JIT closure.
         # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
