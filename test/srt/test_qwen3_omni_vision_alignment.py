@@ -24,6 +24,7 @@ from sgl_jax.srt.configs.model_config import _get_and_verify_dtype
 from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker_embedding import (
     Qwen3OmniMoeThinkerEmbedding,
 )
+from sgl_jax.test.test_utils import QWEN3_OMNI_30B_A3B_INSTRUCT
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../python"))
 if project_root not in sys.path:
@@ -1319,7 +1320,7 @@ def main():
     parser = argparse.ArgumentParser(description="Qwen3OmniMoe Vision Encoder alignment tests")
     parser.add_argument(
         "--model_path",
-        default=os.environ.get("QWEN3_OMNI_MODEL_PATH", "/models/Qwen/Qwen3-Omni-30B-A3B-Instruct"),
+        default=os.environ.get("QWEN3_OMNI_MODEL_PATH", QWEN3_OMNI_30B_A3B_INSTRUCT),
     )
     parser.add_argument("--test_type", default="all", choices=["all"] + list(TESTS.keys()))
     parser.add_argument("--tp_size", type=int, default=4)

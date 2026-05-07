@@ -29,6 +29,7 @@ from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    QWEN3_4B,
     CustomTestCase,
     kill_process_tree,
     popen_launch_server,
@@ -36,7 +37,7 @@ from sgl_jax.test.test_utils import (
 
 LORA_SETS = [
     {
-        "base": "Qwen/Qwen3-4B",
+        "base": QWEN3_4B,
         "loras": [
             "nissenj/Qwen3-4B-lora-v2",
             "y9760210/Qwen3-4B-lora_model",
