@@ -41,12 +41,12 @@ class GlmNorm(nnx.Module):
         return normalized * self.weight.value + self.bias.value
 
 
-
 def get_hadamard_matrix(n):
     if n == 1:
         return jnp.array([[1.0]])
     h = get_hadamard_matrix(n // 2)
     return jnp.block([[h, h], [h, -h]])
+
 
 class GlmDsaIndexer(nnx.Module):
     def __init__(
@@ -62,7 +62,6 @@ class GlmDsaIndexer(nnx.Module):
         self.head_dim = index_head_dim
         self.n_head = index_n_heads
         self.mesh = mesh
-
 
         self.wq_b = LinearBase(
             input_size=q_lora_rank,
@@ -94,50 +93,53 @@ class GlmDsaIndexer(nnx.Module):
             scope_name="weights_proj",
         )
 
-    def __call__(self, hidden_states: jax.Array, qr: jax.Array, positions: jax.Array, rotary_emb: Any) -> jax.Array:
+    def __call__(
+        self, hidden_states: jax.Array, qr: jax.Array, positions: jax.Array, rotary_emb: Any
+    ) -> jax.Array:
         # 1. Project Query and Key
         query, _ = self.wq_b(qr)
         query = query.reshape(-1, self.n_head, self.head_dim)
-        
+
         key, _ = self.wk(hidden_states)
         key = self.k_norm(key)
-        
+
         # Apply RoPE
         rope_dim = 64
         q_rope = query[:, :, :rope_dim]
         k_rope = key[:, :rope_dim]
-        k_rope = k_rope[:, None, :] # Add head dim for RoPE
-        
+        k_rope = k_rope[:, None, :]  # Add head dim for RoPE
+
         q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
-        k_rope = k_rope.squeeze(1) # Remove head dim
-        
+        k_rope = k_rope.squeeze(1)  # Remove head dim
+
         query = query.at[:, :, :rope_dim].set(q_rope)
         key = key.at[:, :rope_dim].set(k_rope)
-        
+
         # Apply Hadamard Transform
         h_matrix = get_hadamard_matrix(128)
         h_matrix = h_matrix * (128**-0.5)
-        
+
         query = jnp.einsum("thd,de->the", query, h_matrix)
         key = jnp.einsum("td,de->te", key, h_matrix)
-        
+
         # 2. Compute Logits (simplified dense dot product)
-        key_replicated = jax.sharding.reshard(key, jax.sharding.NamedSharding(self.mesh, P(None, None)))
-        logits = jnp.einsum("thd,sd->ths", query, key_replicated)
-        
+        key_replicated = jax.sharding.reshard(
+            key, jax.sharding.NamedSharding(self.mesh, P(None, None))
+        )
+        logits = jnp.einsum("ijk,lk->ijl", query, key_replicated)
+
         # 3. Apply weights_proj
         weights, _ = self.weights_proj(hidden_states)
-        
+
         # Scale and apply weights
         scaling = self.head_dim**-0.5
         logits = logits * scaling * weights[:, :, None]
-        
+
         # 4. Top-K Selection (Top-1 for now to match dummy shape [T, n_head])
         _, topk_ids = jax.lax.top_k(logits, 1)
         topk_ids = topk_ids.squeeze(-1)
-        
-        return topk_ids
 
+        return topk_ids
 
 
 class Glm5Attention(nnx.Module):
@@ -306,7 +308,7 @@ class Glm5Attention(nnx.Module):
         q_compressed = self.q_a_layernorm(q_compressed)
         q, _ = self.q_b_proj(q_compressed)
         q = q.reshape(-1, self.q_head_num, self.qk_head_dim)
-        
+
         # Call indexer (result not used yet)
         _ = self.indexer(hidden_states, q_compressed, positions, self.rotary_emb)
 
