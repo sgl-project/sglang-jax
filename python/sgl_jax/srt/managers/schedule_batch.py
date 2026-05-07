@@ -214,6 +214,10 @@ class Req:
 
         # Memory pool info
         self.req_pool_idx: int | None = None
+        # Recurrent state slot for hybrid linear-recurrent models (e.g.
+        # Kimi-Linear / Mamba). None when the model has no linear recurrent
+        # layers; HybridReqToTokenPool.alloc/free maintain this field.
+        self.recurrent_pool_idx: int | None = None
 
         # Check finish
         self.tokenizer = None

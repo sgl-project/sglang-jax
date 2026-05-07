@@ -158,6 +158,122 @@ class ReqToTokenPool:
         self.free_slots = list(range(self.size))
 
 
+class HybridReqToTokenPool(ReqToTokenPool):
+    """Coordinates KV slot + recurrent state slot allocation for hybrid models.
+
+    Owns the recurrent slot allocator state (recurrent_free_slots and the
+    req_pool_idx -> recurrent_pool_idx mapping) so RecurrentStatePool stays a
+    pure pytree leaf safe for JIT donate. The host-side allocator state must
+    NOT enter a JIT-donated pytree (would otherwise reset on tree_unflatten),
+    therefore this class is intentionally NOT registered as a pytree node.
+
+    Slot 0 of RecurrentStatePool is reserved as the dummy slot; the mapping
+    defaults to 0 so an unallocated req lands on the dummy slot. Mirrors the
+    sglang PyTorch MambaPool free_slots semantics.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        dtype: np.dtype,
+        recurrent_state_pool,
+    ):
+        super().__init__(size=size, max_context_len=max_context_len, dtype=dtype)
+        self.recurrent_state_pool = recurrent_state_pool
+        # 1-indexed: slot 0 in RecurrentStatePool buffers is the dummy slot;
+        # valid slots are 1..size. Mapping entries default to 0 so an
+        # unallocated req lands on the dummy slot.
+        self.recurrent_free_slots: list[int] = list(range(1, recurrent_state_pool.size + 1))
+        self.req_index_to_recurrent_index_mapping = np.zeros(size, dtype=np.int32)
+
+    def alloc(self, reqs: list[Req]) -> list[int] | None:
+        """Coordinate KV slot + recurrent slot allocation; atomic semantics.
+
+        Strategy:
+          1. Pre-check recurrent capacity for fresh allocs.
+          2. super().alloc(reqs) — KV slot path is already atomic (returns
+             None and leaves req fields untouched on capacity miss).
+          3. Batch-slice the needed recurrent slots, clear-on-alloc all of
+             them in one recurrent_state_pool.clear_slot call (avoids
+             per-slot JIT scatter overhead), then assign + write mapping.
+
+        Reuse path: a req that already holds recurrent_pool_idx (e.g. the
+        next chunk of a chunked prefill) keeps its slot — recurrent_free_slots
+        is untouched and the mapping entry is rewritten to the same value.
+        Mirrors the parent's "req_pool_idx is not None -> reuse" contract.
+        """
+        # Pre-check recurrent capacity (only fresh reqs consume a slot).
+        needed_recurrent = sum(1 for req in reqs if req.recurrent_pool_idx is None)
+        if needed_recurrent > len(self.recurrent_free_slots):
+            return None
+
+        # KV slot (parent is atomic). On capacity miss req fields stay untouched
+        # and we have not yet mutated any recurrent state.
+        kv_indices = super().alloc(reqs)
+        if kv_indices is None:
+            return None
+
+        # Atomic batch slice + single clear-on-alloc covering every newly-
+        # handed-out slot.
+        new_recurrent_slots = self.recurrent_free_slots[:needed_recurrent]
+        self.recurrent_free_slots = self.recurrent_free_slots[needed_recurrent:]
+
+        if new_recurrent_slots:
+            self.recurrent_state_pool.clear_slot(new_recurrent_slots)
+
+        cursor = 0
+        for req in reqs:
+            if req.recurrent_pool_idx is None:
+                req.recurrent_pool_idx = new_recurrent_slots[cursor]
+                cursor += 1
+            self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = req.recurrent_pool_idx
+
+        return kv_indices
+
+    def free(self, req: Req) -> None:
+        """Release recurrent slot first, then KV slot.
+
+        Recurrent-first / KV-second is the inverse of alloc (KV-first /
+        recurrent-second), so a partially constructed req can never end up
+        with a freed KV slot but a still-held recurrent slot.
+
+        Idempotent on the recurrent side when req.recurrent_pool_idx is None.
+        """
+        self.free_recurrent_cache(req)
+        super().free(req)
+
+    def free_recurrent_cache(self, req: Req) -> None:
+        """Release the recurrent state slot held by req. Idempotent.
+
+        Returns the slot to recurrent_free_slots, sets req.recurrent_pool_idx
+        back to None and resets the mapping entry to the dummy slot (0).
+        Safe to call when the req has no recurrent slot allocated.
+        """
+        if req.recurrent_pool_idx is None:
+            return
+        self.recurrent_free_slots.append(req.recurrent_pool_idx)
+        self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = 0
+        req.recurrent_pool_idx = None
+
+    def get_linear_recurrent_indices(self, req_pool_indices):
+        """Translate req_pool_idx -> recurrent_pool_idx via the host mapping.
+
+        Accepts an np.ndarray (or list[int]) and returns the same-shape
+        np.ndarray of recurrent_pool_idx values.
+        """
+        return self.req_index_to_recurrent_index_mapping[req_pool_indices]
+
+    def clear(self) -> None:
+        """Full reset: KV slot allocator + recurrent slot allocator + recurrent
+        buffers + mapping zeroed. Called from flush_cache.
+        """
+        super().clear()
+        self.recurrent_state_pool.clear()
+        self.recurrent_free_slots = list(range(1, self.recurrent_state_pool.size + 1))
+        self.req_index_to_recurrent_index_mapping[:] = 0
+
+
 @register_pytree_node_class
 class KVCache(abc.ABC):
     @abc.abstractmethod
