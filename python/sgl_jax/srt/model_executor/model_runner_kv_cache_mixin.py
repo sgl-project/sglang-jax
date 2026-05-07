@@ -126,7 +126,7 @@ def _build_hybrid_pools(
         dp_size=dp_size,
     )
     hybrid_pool = HybridReqToTokenPool(
-        size=max_num_reqs + 1,
+        size=max_num_reqs,
         max_context_len=max_context_len,
         dtype=np.int32,
         recurrent_state_pool=rsp,
@@ -332,7 +332,7 @@ class ModelRunnerKVCacheMixin:
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(
-                    size=max_num_reqs + 1,
+                    size=max_num_reqs,
                     max_context_len=self.model_config.context_len + 4,
                     dtype=np.int32,
                 )
