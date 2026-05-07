@@ -153,9 +153,89 @@ class ReqToTokenPool:
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
 
+    def free_chunked(self, chunked_req: Req):
+        self.free(chunked_req)
+
     def clear(self):
         """Clear all allocation states"""
         self.free_slots = list(range(self.size))
+
+
+class HybridReqToTokenPool(ReqToTokenPool):
+    """Coordinates KV slot + recurrent state slot allocation for hybrid models."""
+
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        dtype: np.dtype,
+        recurrent_state_pool,
+        dp_size: int = 1,
+    ):
+        super().__init__(size=size, max_context_len=max_context_len, dtype=dtype)
+        self.recurrent_state_pool = recurrent_state_pool
+        self.dp_size = dp_size
+        self.slots_per_rank = recurrent_state_pool.size // dp_size
+        self.recurrent_free_slots: list[list[int]] = [
+            list(range(1, self.slots_per_rank + 1)) for _ in range(dp_size)
+        ]
+        self.req_index_to_recurrent_index_mapping = np.zeros(size, dtype=np.int32)
+
+    def alloc(self, reqs: list[Req]) -> list[int] | None:
+        # dp_rank from reqs[0]: callers (prepare_for_extend/decode) iterate per-DP,
+        # so all reqs in a single alloc() call share the same dp_rank.
+        dp_rank = reqs[0].dp_rank if reqs and reqs[0].dp_rank is not None else 0
+        needed = sum(1 for r in reqs if r.recurrent_pool_idx is None)
+        if needed > len(self.recurrent_free_slots[dp_rank]):
+            return None
+
+        result = super().alloc(reqs)
+        if result is None:
+            return None
+
+        new_indices = []
+        for r in reqs:
+            if r.recurrent_pool_idx is None:
+                slot = self.recurrent_free_slots[dp_rank].pop(0)
+                r.recurrent_pool_idx = slot
+                self.req_index_to_recurrent_index_mapping[r.req_pool_idx] = slot
+                new_indices.append(slot)
+
+        if new_indices:
+            self.recurrent_state_pool.clear_slot(new_indices)
+
+        return result
+
+    def free(self, req: Req):
+        self.free_recurrent_cache(req)
+        super().free(req)
+
+    def free_chunked(self, chunked_req: Req):
+        chunked_req._chunked_slot_pinned = True
+
+    def free_recurrent_cache(self, req: Req):
+        recurrent_idx = getattr(req, "recurrent_pool_idx", None)
+        if recurrent_idx is None:
+            return
+        if getattr(req, "_chunked_slot_pinned", False):
+            return
+        dp_rank = req.dp_rank if req.dp_rank is not None else 0
+        self.recurrent_free_slots[dp_rank].append(recurrent_idx)
+        self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = 0
+        req.recurrent_pool_idx = None
+
+    def get_linear_recurrent_indices(self, req_pool_indices) -> np.ndarray:
+        return self.req_index_to_recurrent_index_mapping[req_pool_indices]
+
+    def recurrent_available_size(self, dp_rank: int = 0) -> int:
+        return len(self.recurrent_free_slots[dp_rank])
+
+    def clear(self):
+        super().clear()
+        self.recurrent_state_pool.clear()
+        for rank in range(self.dp_size):
+            self.recurrent_free_slots[rank] = list(range(1, self.slots_per_rank + 1))
+        self.req_index_to_recurrent_index_mapping.fill(0)
 
 
 @register_pytree_node_class
@@ -232,7 +312,7 @@ class KVCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def replace_kv_buffer(self, kv_buffer: list[jax.Array]) -> None:
+    def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
         """Replace the internal KV buffer with a new one.
 
         This method is essential for JAX jit compatibility since JAX functions
@@ -463,7 +543,7 @@ class MHATokenToKVPool(KVCache):
             mesh=self.mesh,
         )
 
-    def replace_kv_buffer(self, fused_kv_buffer: list[jax.Array]) -> None:
+    def replace_buffer(self, fused_kv_buffer: list[jax.Array]) -> None:
         self.kv_buffer[self.start_layer : self.start_layer + len(fused_kv_buffer)] = fused_kv_buffer
 
     def get_cpu_copy(self, indices):
@@ -694,7 +774,7 @@ class SWAKVPool(KVCache):
         else:
             self.full_kv_pool.set_kv_buffer(layer_id_pool, loc, cache_k, cache_v, is_decode)
 
-    def replace_kv_buffer(self, kv_buffer: list[jax.Array]):
+    def replace_buffer(self, kv_buffer: list[jax.Array]):
         assert len(kv_buffer) == len(self.layers_mapping)
 
         full_kv_buffer = []
@@ -706,8 +786,8 @@ class SWAKVPool(KVCache):
             else:
                 full_kv_buffer.append(layer_kv_buffer)
 
-        self.swa_kv_pool.replace_kv_buffer(swa_kv_buffer)
-        self.full_kv_pool.replace_kv_buffer(full_kv_buffer)
+        self.swa_kv_pool.replace_buffer(swa_kv_buffer)
+        self.full_kv_pool.replace_buffer(full_kv_buffer)
 
     def remap_cache_loc(self, loc: jax.Array, layer_id: int) -> jax.Array:
         """
@@ -1128,7 +1208,7 @@ class MLATokenToKVPool(KVCache):
             "the MLA v2 kernel writes the cache in-place via input_output_aliases."
         )
 
-    def replace_kv_buffer(self, kv_buffer: list[jax.Array]) -> None:
+    def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
         self.kv_buffer[self.start_layer : self.start_layer + len(kv_buffer)] = kv_buffer
 
     def get_cpu_copy(self, indices):
@@ -1148,3 +1228,38 @@ class MLATokenToKVPool(KVCache):
             kv_host = kv_cache_host[layer_id]
             kv_device = jax.device_put(kv_host, self.kv_sharding)
             self.kv_buffer[layer_id] = self.kv_buffer[layer_id].at[indices].set(kv_device)
+
+
+@register_pytree_node_class
+class MemoryPools:
+    """Pytree container that uniformly manages multiple pool replace operations."""
+
+    def __init__(self, **pools):
+        self._pools = pools
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            return self._pools[name]
+        except KeyError:
+            raise AttributeError(f"MemoryPools has no pool '{name}'") from None
+
+    def tree_flatten(self):
+        keys = sorted(self._pools.keys())
+        return [self._pools[k] for k in keys], tuple(keys)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(**dict(zip(aux_data, children)))
+
+    def replace_all(self, updates) -> None:
+        if isinstance(updates, list):
+            updates = {"token_to_kv_pool": updates}
+        if set(updates.keys()) != set(self._pools.keys()):
+            raise ValueError(
+                f"replace_all: updates keys {sorted(updates.keys())} "
+                f"must exactly match MemoryPools keys {sorted(self._pools.keys())}"
+            )
+        for key, value in updates.items():
+            self._pools[key].replace_buffer(value)

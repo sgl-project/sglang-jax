@@ -43,7 +43,7 @@ from sgl_jax.srt.mem_cache.common import (
     evict_from_tree_cache,
     release_kv_cache,
 )
-from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
+from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -214,6 +214,8 @@ class Req:
 
         # Memory pool info
         self.req_pool_idx: int | None = None
+        self.recurrent_pool_idx: int | None = None
+        self._chunked_slot_pinned: bool = False
 
         # Check finish
         self.tokenizer = None
@@ -553,6 +555,8 @@ class Req:
         self.routed_experts = None
         self.latest_bid = None
         self.cache_protected_len = 0
+        self.recurrent_pool_idx = None
+        self._chunked_slot_pinned = False
 
     def set_finish_with_abort(self, error_msg: str):
         # set it to one token to skip the long prefill
@@ -623,6 +627,9 @@ class ScheduleReqsInfo:
     # Whether this DP rank's batch is full
     batch_is_full: bool = False
 
+    # Recurrent state indices for hybrid recurrent models (per DP)
+    recurrent_indices: np.ndarray | None = None
+
 
 @dataclasses.dataclass
 class ScheduleBatch:
@@ -641,6 +648,7 @@ class ScheduleBatch:
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
     is_hybrid: bool = False
+    is_hybrid_recurrent: bool = False
 
     # Batch configs (shared)
     model_config: ModelConfig = None
@@ -732,6 +740,8 @@ class ScheduleBatch:
             ), "SWARadixCache or ChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid = True
 
+        is_hybrid_recurrent = isinstance(req_to_token_pool, HybridReqToTokenPool)
+
         # Initialize reqs_info based on dp_size with pre-distributed reqs
         reqs_info = []
         for dp_rank in range(dp_size):
@@ -746,6 +756,7 @@ class ScheduleBatch:
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
             is_hybrid=is_hybrid,
+            is_hybrid_recurrent=is_hybrid_recurrent,
             model_config=model_config,
             return_logprob=return_logprob,
             return_output_logprob_only=return_output_logprob_only,
@@ -1057,6 +1068,11 @@ class ScheduleBatch:
             info.prefix_lens = prefix_lens
             info.extend_lens = extend_lens
             info.extend_input_logprob_token_ids = extend_input_logprob_token_ids
+
+            if self.is_hybrid_recurrent:
+                info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
+                    req_pool_indices_cpu
+                )
 
             # Write to req_to_token_pool
             pt = 0
@@ -1433,6 +1449,11 @@ class ScheduleBatch:
             else:
                 info.seq_lens = np.add(info.seq_lens, 1)
             info.seq_lens_sum += bs
+
+            if self.is_hybrid_recurrent:
+                info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
+                    info.req_pool_indices
+                )
 
             # Allocate memory for this DP rank
             if self.token_to_kv_pool_allocator.page_size == 1:
@@ -2046,6 +2067,21 @@ class ScheduleBatch:
         # Step 5: Merge sampling info from all DP ranks
         sampling_info = self._merge_sampling_info(per_dp_bs_padding, total_bs)
 
+        # Step 5.5: Merge recurrent_indices from all DP ranks
+        recurrent_indices_cpu = None
+        if any(info.recurrent_indices is not None for info in self.reqs_info):
+            recurrent_indices_cpu = np.zeros(total_bs, dtype=np.int32)
+            offset_bs = 0
+            for dp_rank in range(self.dp_size):
+                info = self.reqs_info[dp_rank]
+                if info.seq_lens is not None and len(info.seq_lens) > 0:
+                    dp_bs = len(info.seq_lens)
+                    if info.recurrent_indices is not None:
+                        recurrent_indices_cpu[offset_bs : offset_bs + dp_bs] = (
+                            info.recurrent_indices
+                        )
+                offset_bs += per_dp_bs_padding
+
         # Step 6: Generate trace info if needed
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
@@ -2118,6 +2154,7 @@ class ScheduleBatch:
             input_embedding=None,
             apply_for_deepstack=False,
             deepstack_visual_embedding=None,
+            recurrent_indices=recurrent_indices_cpu,
         )
 
     def get_spec_model_worker_batch(
@@ -2787,6 +2824,9 @@ class ModelWorkerBatch:
 
     # MRoPE position information [3, total_tokens]
     mrope_positions: np.ndarray | None = None
+
+    # Recurrent state indices for hybrid recurrent models
+    recurrent_indices: np.ndarray | None = None
 
     def get_original_input_len(self):
         """
