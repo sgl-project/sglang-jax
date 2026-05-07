@@ -46,6 +46,7 @@ def _validate_local_snapshot(d: Path) -> bool:
             for fname in ("tokenizer.json", "tokenizer.model", "tiktoken.model")
         )
         or (d / "vocab.json").is_file()
+        or any(d.glob("*.tiktoken"))
     )
     if not has_tokenizer:
         return False
