@@ -33,7 +33,7 @@ from sgl_jax.srt.layers.logits_processor import (
 )
 from sgl_jax.srt.layers.moe import EPMoE, create_moe_weights_mapping
 from sgl_jax.srt.layers.radix_attention import RadixAttention
-from sgl_jax.srt.mem_cache.memory_pool import KVCache
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.debug_utils import log_shardings
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -888,17 +888,18 @@ class Grok1ForCausalLM(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
+        memory_pools: MemoryPools,
         logits_metadata: LogitsMetadata,
     ) -> tuple[LogitsProcessorOutput, list[jax.Array], bool, list[jax.Array | None]]:
         """Forward pass through the model using unified forward_batch API."""
+        kv_pool = memory_pools.token_to_kv_pool
         input_ids = forward_batch.input_ids
         positions = forward_batch.positions
         hidden_states, layers_kv_fused, layers_topk_ids = self.model(
             input_ids,
             positions,
             forward_batch,
-            token_to_kv_pool,
+            kv_pool,
             None,
         )
         output = self.logits_processor(hidden_states, cast(Embed, self.lm_head), logits_metadata)

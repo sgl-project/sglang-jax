@@ -66,7 +66,7 @@ def _split_state_kv_budget(
     state_max_reqs   = state_budget_raw // per_req_state_bytes
     kv_budget        = available - state_max_reqs * per_req_state_bytes
     """
-    assert ratio >= 0.0, f"state_to_kv_ratio must be >= 0, got {ratio}"
+    assert ratio >= 0.0, f"recurrent_state_memory_ratio must be >= 0, got {ratio}"
     assert per_req_state_bytes > 0, f"per_req_state_bytes must be > 0, got {per_req_state_bytes}"
     state_budget_raw = int(available_bytes * ratio / (1.0 + ratio))
     state_max_reqs = state_budget_raw // per_req_state_bytes
@@ -113,12 +113,28 @@ def _build_hybrid_pools(
     token_to_kv_pool,
     mesh,
     dp_size: int = 1,
+    state_size: int | None = None,
 ) -> tuple:
-    """Build RecurrentStatePool + HybridReqToTokenPool + MemoryPools."""
+    """Build RecurrentStatePool + HybridReqToTokenPool + MemoryPools.
+
+    `max_num_reqs` and `state_size` are both **global** capacities across all
+    DP ranks (mirrors MHATokenToKVPool). When `state_size` is None it
+    defaults to `max_num_reqs` (1:1 mapping, used when radix cache is
+    disabled and no explicit state size is supplied).
+    """
+    assert (
+        max_num_reqs % dp_size == 0
+    ), f"max_num_reqs ({max_num_reqs}) must be divisible by dp_size ({dp_size})."
+    if state_size is None:
+        state_size = max_num_reqs
+    assert (
+        state_size % dp_size == 0
+    ), f"recurrent state_size ({state_size}) must be divisible by dp_size ({dp_size})."
+
     linear_attn_config = cfg.linear_attn_config
     rsp = RecurrentStatePool(
         linear_recurrent_layer_ids=cfg.linear_layer_ids,
-        size=max_num_reqs,
+        size=state_size,
         num_heads=linear_attn_config["num_heads"],
         head_dim=linear_attn_config["head_dim"],
         conv_kernel_size=linear_attn_config["short_conv_kernel_size"],
@@ -135,6 +151,14 @@ def _build_hybrid_pools(
     mp = MemoryPools(
         token_to_kv_pool=token_to_kv_pool,
         recurrent_state_pool=rsp,
+    )
+    logger.info(
+        "Hybrid pools built: max_num_reqs=%d (global), "
+        "recurrent_state_size=%d (global) / %d per dp rank, dp_size=%d",
+        max_num_reqs,
+        state_size,
+        state_size // dp_size,
+        dp_size,
     )
     return rsp, hybrid_pool, mp
 
@@ -191,27 +215,61 @@ class ModelRunnerKVCacheMixin:
     def handle_recurrent_cache(self: ModelRunner, total_rest_memory: int) -> int:
         """Split HBM between recurrent state and KV cache.
 
-        Aligns with upstream handle_max_mamba_cache.
+        Resolves server_args.max_recurrent_state_size to a **global** value
+        (across all DP ranks; mirrors MHATokenToKVPool.size semantics) using
+        three-priority logic:
+          1. user-supplied --max-recurrent-state-size
+          2. --disable-radix-cache + --max-running-requests
+          3. derived from --recurrent-state-memory-ratio and available HBM
+             (per-rank state count × dp_size)
+
+        Returns the KV budget in bytes (per-device).
         """
         cfg = self.linear_recurrent_config
-        ratio = self.server_args.state_to_kv_ratio
-        if ratio <= 0:
-            raise ValueError(
-                f"state_to_kv_ratio={ratio} <= 0 is invalid for hybrid recurrent model; "
-                f"set --state-to-kv-ratio > 0 (default 0.9)"
-            )
-
+        sa = self.server_args
+        dp_size = self.dp_size
         per_req_state = _per_req_state_bytes_from_config(
             cfg.linear_attn_config, self.attention_tp_size
         )
-        state_max_reqs, kv_budget = _split_state_kv_budget(total_rest_memory, ratio, per_req_state)
-        self._recurrent_state_max_reqs = state_max_reqs
+
+        if sa.max_recurrent_state_size is not None:
+            assert sa.max_recurrent_state_size % dp_size == 0, (
+                f"--max-recurrent-state-size ({sa.max_recurrent_state_size}) "
+                f"must be divisible by dp_size ({dp_size})."
+            )
+            # already global, leave as-is
+        elif sa.disable_radix_cache and sa.max_running_requests is not None:
+            assert sa.max_running_requests % dp_size == 0, (
+                f"--max-running-requests ({sa.max_running_requests}) "
+                f"must be divisible by dp_size ({dp_size}) when "
+                f"--disable-radix-cache is set for hybrid recurrent models."
+            )
+            sa.max_recurrent_state_size = sa.max_running_requests
+        else:
+            ratio = sa.recurrent_state_memory_ratio
+            if ratio <= 0:
+                raise ValueError(
+                    f"recurrent_state_memory_ratio={ratio} <= 0 is invalid for "
+                    f"hybrid recurrent model; set --recurrent-state-memory-ratio > 0 "
+                    f"(default 0.9)."
+                )
+            # _split_state_kv_budget runs against per-device memory, so its
+            # output is per-rank — multiply back to global.
+            state_max_reqs_per_rank, _ = _split_state_kv_budget(
+                total_rest_memory, ratio, per_req_state
+            )
+            sa.max_recurrent_state_size = state_max_reqs_per_rank * dp_size
+
+        state_memory_per_rank = (sa.max_recurrent_state_size // dp_size) * per_req_state
+        kv_budget = total_rest_memory - state_memory_per_rank
 
         logger.info(
-            "Hybrid recurrent budget split: per_req_state=%d bytes, "
-            "state_max_reqs=%d, kv_budget=%.1f GB",
+            "Hybrid recurrent budget: per_req_state=%d bytes, "
+            "max_recurrent_state_size=%d (global) / %d per dp rank, "
+            "kv_budget=%.1f GB",
             per_req_state,
-            state_max_reqs,
+            sa.max_recurrent_state_size,
+            sa.max_recurrent_state_size // dp_size,
             kv_budget / (1024**3),
         )
 
@@ -297,9 +355,13 @@ class ModelRunnerKVCacheMixin:
         ):
             max_num_reqs = self.server_args.max_num_reqs
 
-        # Cap by recurrent state budget
-        if hasattr(self, "_recurrent_state_max_reqs"):
-            max_num_reqs = min(max_num_reqs, self._recurrent_state_max_reqs)
+        # Cap by recurrent state budget. server_args.max_recurrent_state_size
+        # is global (set by handle_recurrent_cache).
+        if (
+            self.linear_recurrent_config is not None
+            and self.server_args.max_recurrent_state_size is not None
+        ):
+            max_num_reqs = min(max_num_reqs, self.server_args.max_recurrent_state_size)
 
         return max_num_reqs
 
@@ -318,24 +380,13 @@ class ModelRunnerKVCacheMixin:
 
         has_recurrent_state = self.linear_recurrent_config is not None
 
-        # --- ReqToTokenPool ---
-        if self.req_to_token_pool is None:
-            if has_recurrent_state:
-                _, self.req_to_token_pool, _ = _build_hybrid_pools(
-                    cfg=self.linear_recurrent_config,
-                    max_num_reqs=max_num_reqs,
-                    max_context_len=self.model_config.context_len + 4,
-                    tp_size=self.attention_tp_size,
-                    token_to_kv_pool=None,
-                    mesh=self.mesh,
-                    dp_size=dp_size,
-                )
-            else:
-                self.req_to_token_pool = ReqToTokenPool(
-                    size=max_num_reqs,
-                    max_context_len=self.model_config.context_len + 4,
-                    dtype=np.int32,
-                )
+        # --- ReqToTokenPool (non-hybrid only; hybrid defers to after KV pool) ---
+        if self.req_to_token_pool is None and not has_recurrent_state:
+            self.req_to_token_pool = ReqToTokenPool(
+                size=max_num_reqs,
+                max_context_len=self.model_config.context_len + 4,
+                dtype=np.int32,
+            )
 
         # --- KV pool ---
         if self.is_hybrid:
@@ -396,6 +447,22 @@ class ModelRunnerKVCacheMixin:
                 dp_size=dp_size,
             )
 
+        # --- MemoryPools wrapper (+ hybrid ReqToTokenPool) ---
+        if has_recurrent_state:
+            state_size = self.server_args.max_recurrent_state_size
+            _, self.req_to_token_pool, self.memory_pools = _build_hybrid_pools(
+                cfg=self.linear_recurrent_config,
+                max_num_reqs=max_num_reqs,
+                max_context_len=self.model_config.context_len + 4,
+                tp_size=self.attention_tp_size,
+                token_to_kv_pool=self.token_to_kv_pool,
+                mesh=self.mesh,
+                dp_size=dp_size,
+                state_size=state_size,
+            )
+        else:
+            self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)
+
         # --- Allocator ---
         if self.token_to_kv_pool_allocator is None:
             if self.is_hybrid:
@@ -420,16 +487,6 @@ class ModelRunnerKVCacheMixin:
                     debug_mode=False,
                     dp_size=dp_size,
                 )
-
-        # --- MemoryPools wrapper ---
-        if has_recurrent_state:
-            rsp = self.req_to_token_pool.recurrent_state_pool
-            self.memory_pools = MemoryPools(
-                token_to_kv_pool=self.token_to_kv_pool,
-                recurrent_state_pool=rsp,
-            )
-        else:
-            self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)
 
     def init_memory_pool(
         self: ModelRunner,

@@ -172,6 +172,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         super().__init__(size=size, max_context_len=max_context_len, dtype=dtype)
         self.recurrent_state_pool = recurrent_state_pool
         self.dp_size = dp_size
+        # recurrent_state_pool.size is global (mirrors MHATokenToKVPool).
+        # Divisibility is asserted inside RecurrentStatePool.__init__.
         self.slots_per_rank = recurrent_state_pool.size // dp_size
         self.recurrent_free_slots: list[list[int]] = [
             list(range(1, self.slots_per_rank + 1)) for _ in range(dp_size)

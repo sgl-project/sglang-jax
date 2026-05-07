@@ -14,7 +14,11 @@ from sgl_jax.test.test_utils import CustomTestCase
 
 
 class FakeRecurrentStatePool:
-    """Stub exposing only the interface HybridReqToTokenPool reads."""
+    """Stub exposing only the interface HybridReqToTokenPool reads.
+
+    `size` is **global** (mirrors MHATokenToKVPool). HybridReqToTokenPool
+    internally splits it as size // dp_size per rank.
+    """
 
     def __init__(self, size: int):
         self.size = size
@@ -79,7 +83,7 @@ class TestHybridPoolAllocSingleDP(CustomTestCase):
         self.assertEqual(mapped, req.recurrent_pool_idx)
 
     def test_alloc_fails_when_recurrent_slots_exhausted(self):
-        slots_per_rank = self.state_pool.size // 1
+        slots_per_rank = self.state_pool.size // 1  # global // dp_size
         exhaust = [FakeReq(dp_rank=0) for _ in range(slots_per_rank)]
         self.pool.alloc(exhaust)
 
@@ -225,6 +229,7 @@ class TestHybridPoolAllocMultiDP(CustomTestCase):
     """Alloc tests with dp_size=2."""
 
     def setUp(self):
+        # Global size=8, dp_size=2 → 4 slots/rank.
         self.state_pool = FakeRecurrentStatePool(size=8)
         self.pool = HybridReqToTokenPool(
             size=8,

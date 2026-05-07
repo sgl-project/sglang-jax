@@ -69,7 +69,8 @@ class ServerArgs:
     schedule_conservativeness: float = 1.0
     page_size: int = 1
     swa_full_tokens_ratio: float = 0.8
-    state_to_kv_ratio: float = 0.9
+    recurrent_state_memory_ratio: float = 0.9
+    max_recurrent_state_size: int | None = None
     disable_hybrid_swa_memory: bool = False
 
     # Runtime options
@@ -559,11 +560,21 @@ class ServerArgs:
             "E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens.",
         )
         parser.add_argument(
-            "--state-to-kv-ratio",
+            "--recurrent-state-memory-ratio",
             type=float,
-            default=ServerArgs.state_to_kv_ratio,
-            help="Ratio of recurrent state budget to KV cache budget for hybrid recurrent models (e.g. Kimi-Linear). "
-            "state_budget = available * ratio / (1 + ratio). Default 0.9.",
+            default=ServerArgs.recurrent_state_memory_ratio,
+            help="Ratio of recurrent state memory to KV cache memory for hybrid recurrent models (e.g. Kimi-Linear). "
+            "state_budget = available * ratio / (1 + ratio). Used only when --max-recurrent-state-size is unset "
+            "and either radix cache is enabled or --max-running-requests is unset. Default 0.9.",
+        )
+        parser.add_argument(
+            "--max-recurrent-state-size",
+            type=int,
+            default=ServerArgs.max_recurrent_state_size,
+            help="Total recurrent state slots across all DP ranks for hybrid models. "
+            "Resolution priority: (1) this flag, (2) --max-running-requests when --disable-radix-cache, "
+            "(3) derived from --recurrent-state-memory-ratio and available HBM. "
+            "Must be divisible by dp_size when set explicitly.",
         )
         parser.add_argument(
             "--disable-hybrid-swa-memory",
