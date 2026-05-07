@@ -498,19 +498,11 @@ class ModelRunnerKVCacheMixin:
 
     @property
     def linear_recurrent_config(self: ModelRunner):
-        """Return KimiLinearConfig if it has linear attention, else None."""
-        cfg = self.kimi_linear_config
-        if cfg is not None and cfg.is_linear_attn:
-            return cfg
-        return None
+        """Return linear recurrent config if the model has linear attention, else None.
 
-    @property
-    def kimi_linear_config(self: ModelRunner):
-        """Return KimiLinearConfig if model uses one, else None."""
-        from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
-
-        if isinstance(self.model_config.hf_config, KimiLinearConfig):
-            return self.model_config.hf_config
+        Currently returns None unconditionally — KimiLinearConfig detection
+        will be wired up when the modeling layer lands.
+        """
         return None
 
     def _kv_pool_layer_count(self: ModelRunner):
