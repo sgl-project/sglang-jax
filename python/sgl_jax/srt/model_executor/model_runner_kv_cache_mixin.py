@@ -378,7 +378,7 @@ class ModelRunnerKVCacheMixin:
                 dtype=self.kv_cache_dtype,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
-                layer_num=self.model_config.num_hidden_layers,
+                layer_num=self._kv_pool_layer_count(),
                 mesh=self.mesh,
                 dp_size=dp_size,
             )
@@ -391,7 +391,7 @@ class ModelRunnerKVCacheMixin:
                     self.attention_tp_size
                 ),
                 head_dim=(self.model_config.head_dim + 127) // 128 * 128,
-                layer_num=self.model_config.num_hidden_layers,
+                layer_num=self._kv_pool_layer_count(),
                 mesh=self.mesh,
                 dp_size=dp_size,
             )
