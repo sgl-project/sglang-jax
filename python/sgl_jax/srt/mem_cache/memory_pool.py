@@ -1259,7 +1259,23 @@ class HybridLinearKVPool(KVCache):
         self.full_attention_layer_id_mapping: dict[int, int] = {
             global_id: i for i, global_id in enumerate(self.full_attention_layer_ids)
         }
+        self._sync_inner_pool_attrs()
+
+    def _sync_inner_pool_attrs(self) -> None:
+        """Sync public KVCache attributes from inner pool.
+
+        Called in __init__ and tree_unflatten to ensure HybridLinearKVPool
+        exposes the same interface as other KVCache implementations.
+        """
+        self.size = self.full_kv_pool.size
+        self.page_size = self.full_kv_pool.page_size
+        self.dtype = self.full_kv_pool.dtype
+        self.layer_num = self.full_kv_pool.layer_num
+        self.mesh = self.full_kv_pool.mesh
+        self.start_layer = self.full_kv_pool.start_layer
+        self.end_layer = self.full_kv_pool.end_layer
         self.mem_usage = self.full_kv_pool.mem_usage
+        self.kv_sharding = getattr(self.full_kv_pool, "kv_sharding", None)
 
     def _to_physical(self, layer_id: int) -> int:
         if layer_id not in self.full_attention_layer_id_mapping:
@@ -1321,25 +1337,20 @@ class HybridLinearKVPool(KVCache):
     def tree_flatten(self):
         children = (self.full_kv_pool,)
         aux_data = {
-            "mesh": self.mesh,
-            "mem_usage": self.mem_usage,
             "full_attention_layer_ids": tuple(self.full_attention_layer_ids),
-            "full_layer_nums": self.full_layer_nums,
-            "full_attention_layer_id_mapping": tuple(
-                sorted(self.full_attention_layer_id_mapping.items())
-            ),
         }
         return (children, aux_data)
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         obj = object.__new__(cls)
-        obj.mesh = aux_data["mesh"]
-        obj.mem_usage = aux_data["mem_usage"]
         obj.full_attention_layer_ids = list(aux_data["full_attention_layer_ids"])
-        obj.full_layer_nums = aux_data["full_layer_nums"]
-        obj.full_attention_layer_id_mapping = dict(aux_data["full_attention_layer_id_mapping"])
+        obj.full_layer_nums = len(obj.full_attention_layer_ids)
+        obj.full_attention_layer_id_mapping = {
+            global_id: i for i, global_id in enumerate(obj.full_attention_layer_ids)
+        }
         obj.full_kv_pool = children[0]
+        obj._sync_inner_pool_attrs()
         return obj
 
 
