@@ -1333,18 +1333,24 @@ class HybridLinearKVPool(KVCache):
     def tree_flatten(self):
         children = (self.full_kv_pool,)
         aux_data = {
+            "mesh": self.mesh,
+            "mem_usage": self.mem_usage,
             "full_attention_layer_ids": tuple(self.full_attention_layer_ids),
+            "full_layer_nums": self.full_layer_nums,
+            "full_attention_layer_id_mapping": tuple(
+                sorted(self.full_attention_layer_id_mapping.items())
+            ),
         }
         return (children, aux_data)
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         obj = object.__new__(cls)
+        obj.mesh = aux_data["mesh"]
+        obj.mem_usage = aux_data["mem_usage"]
         obj.full_attention_layer_ids = list(aux_data["full_attention_layer_ids"])
-        obj.full_layer_nums = len(obj.full_attention_layer_ids)
-        obj.full_attention_layer_id_mapping = {
-            global_id: i for i, global_id in enumerate(obj.full_attention_layer_ids)
-        }
+        obj.full_layer_nums = aux_data["full_layer_nums"]
+        obj.full_attention_layer_id_mapping = dict(aux_data["full_attention_layer_id_mapping"])
         obj.full_kv_pool = children[0]
         obj._sync_inner_pool_attrs()
         return obj
