@@ -160,11 +160,77 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
 
     def get_state(self, recurrent_state_pool, layer_id, recurrent_indices):
         recurrent_buffer, _ = self.get_layer_cache(recurrent_state_pool, layer_id)
-        return recurrent_buffer[recurrent_indices]
+        dp_size = self.mesh.shape["data"]
+        # Production recurrent buffers are DP-local and divisible by dp_size.
+        # Tiny mock buffers in unit tests can still use global indices.
+        if dp_size == 1 or recurrent_buffer.shape[0] % dp_size != 0:
+            # Non-DP path: ensure recurrent_indices is not sharded
+            recurrent_indices = jax.sharding.reshard(
+                recurrent_indices,
+                NamedSharding(self.mesh, P()),
+            )
+            return recurrent_buffer[recurrent_indices]
+
+        recurrent_buffer = jax.sharding.reshard(
+            recurrent_buffer,
+            NamedSharding(self.mesh, P("data", "tensor", None, None)),
+        )
+        recurrent_indices = jax.sharding.reshard(
+            recurrent_indices,
+            NamedSharding(self.mesh, P("data")),
+        )
+
+        def _gather_local(buf, indices):
+            return buf[indices]
+
+        return jax.shard_map(
+            _gather_local,
+            mesh=self.mesh,
+            in_specs=(P("data", "tensor", None, None), P("data")),
+            out_specs=P("data", "tensor", None, None),
+            check_vma=False,
+        )(recurrent_buffer, recurrent_indices)
 
     def set_ssm_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_recurrent):
         recurrent_buffer, _ = self.get_layer_cache(recurrent_state_pool, layer_id)
-        return recurrent_buffer.at[recurrent_indices].set(new_recurrent)
+        dp_size = self.mesh.shape["data"]
+        # Production recurrent buffers are DP-local and divisible by dp_size.
+        # Tiny mock buffers in unit tests can still use global indices.
+        if dp_size == 1 or recurrent_buffer.shape[0] % dp_size != 0:
+            # Non-DP path: ensure recurrent_indices is not sharded
+            recurrent_indices = jax.sharding.reshard(
+                recurrent_indices,
+                NamedSharding(self.mesh, P()),
+            )
+            return recurrent_buffer.at[recurrent_indices].set(new_recurrent)
+
+        recurrent_buffer = jax.sharding.reshard(
+            recurrent_buffer,
+            NamedSharding(self.mesh, P("data", "tensor", None, None)),
+        )
+        recurrent_indices = jax.sharding.reshard(
+            recurrent_indices,
+            NamedSharding(self.mesh, P("data")),
+        )
+        new_recurrent = jax.sharding.reshard(
+            new_recurrent,
+            NamedSharding(self.mesh, P("data", "tensor", None, None)),
+        )
+
+        def _scatter_local(buf, indices, state):
+            return buf.at[indices].set(state)
+
+        return jax.shard_map(
+            _scatter_local,
+            mesh=self.mesh,
+            in_specs=(
+                P("data", "tensor", None, None),
+                P("data"),
+                P("data", "tensor", None, None),
+            ),
+            out_specs=P("data", "tensor", None, None),
+            check_vma=False,
+        )(recurrent_buffer, recurrent_indices, new_recurrent)
 
     def _forward_decode(
         self,
@@ -177,25 +243,71 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         if fused_recurrent_simple_gla is None:
             raise ImportError("simple_gla kernel is required for GLA decode")
 
+        dp_size = self.mesh.shape["data"]
         ssm_states = ssm_states.astype(jnp.float32)
-        ssm_states = jax.sharding.reshard(
-            ssm_states,
-            NamedSharding(self.mesh, P(None, "tensor", None, None)),
-        )
 
-        q_d = q[:, None, :, :]
-        k_d = k[:, None, :, :]
-        v_d = v[:, None, :, :]
-        output_d, new_state = fused_recurrent_simple_gla(
-            q_d,
-            k_d,
-            v_d,
-            g_gamma=slope,
-            initial_state=ssm_states,
-            output_final_state=True,
-            scale=None,
-        )
-        return output_d[:, 0, :, :], new_state
+        if dp_size == 1:
+            # Original non-DP path
+            ssm_states = jax.sharding.reshard(
+                ssm_states,
+                NamedSharding(self.mesh, P(None, "tensor", None, None)),
+            )
+
+            q_d = q[:, None, :, :]
+            k_d = k[:, None, :, :]
+            v_d = v[:, None, :, :]
+            output_d, new_state = fused_recurrent_simple_gla(
+                q_d,
+                k_d,
+                v_d,
+                g_gamma=slope,
+                initial_state=ssm_states,
+                output_final_state=True,
+                scale=None,
+            )
+            return output_d[:, 0, :, :], new_state
+        else:
+            # DP path: shard batch dimension along "data" axis
+            # Following FlashAttention pattern: P("data", "tensor", ...)
+            slope_sm = jax.sharding.reshard(slope, NamedSharding(self.mesh, P("tensor")))
+            ssm_states_sm = jax.sharding.reshard(
+                ssm_states,
+                NamedSharding(self.mesh, P("data", "tensor", None, None)),
+            )
+
+            def _decode_fn(q_local, k_local, v_local, gamma, h0):
+                q_d = q_local[:, None, :, :]
+                k_d = k_local[:, None, :, :]
+                v_d = v_local[:, None, :, :]
+                output_d, new_state = fused_recurrent_simple_gla(
+                    q_d,
+                    k_d,
+                    v_d,
+                    g_gamma=gamma,
+                    initial_state=h0,
+                    output_final_state=True,
+                    scale=None,
+                )
+                return output_d[:, 0, :, :], new_state
+
+            output, new_state = jax.shard_map(
+                _decode_fn,
+                mesh=self.mesh,
+                in_specs=(
+                    P("data", "tensor", None),
+                    P("data", "tensor", None),
+                    P("data", "tensor", None),
+                    P("tensor"),
+                    P("data", "tensor", None, None),
+                ),
+                out_specs=(
+                    P("data", "tensor", None),
+                    P("data", "tensor", None, None),
+                ),
+                check_vma=False,
+            )(q, k, v, slope_sm, ssm_states_sm)
+
+            return output, new_state
 
     def _forward_extend(
         self,
@@ -209,53 +321,101 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             raise ImportError("simple_gla kernel is required for GLA prefill")
 
         cu_seqlens = self.forward_metadata.cu_q_lens
+        dp_size = self.mesh.shape["data"]
         ssm_states = ssm_states.astype(jnp.float32)
 
         slope_sm = jax.sharding.reshard(slope, NamedSharding(self.mesh, P("tensor")))
-        h0_sm = jax.sharding.reshard(
-            ssm_states,
-            NamedSharding(self.mesh, P(None, "tensor", None, None)),
-        )
-
         chunk_size = self.chunk_size
 
-        def _prefill_fn(q_local, k_local, v_local, gamma, h0, cu_seqlens_p):
-            return simple_gla_fwd(
-                q_local,
-                k_local,
-                v_local,
-                g_gamma=gamma,
-                h0=h0,
-                cu_seqlens_dev=cu_seqlens_p,
-                scale=None,
-                use_ht=True,
-                chunk_size=chunk_size,
+        if dp_size == 1:
+            # Original non-DP path
+            h0_sm = jax.sharding.reshard(
+                ssm_states,
+                NamedSharding(self.mesh, P(None, "tensor", None, None)),
             )
 
-        # q/k/v come in as [T_outer, H, K]; the kernel expects [1, T_outer, H, K].
-        q_b = q[None]
-        k_b = k[None]
-        v_b = v[None]
+            def _prefill_fn(q_local, k_local, v_local, gamma, h0, cu_seqlens_p):
+                return simple_gla_fwd(
+                    q_local,
+                    k_local,
+                    v_local,
+                    g_gamma=gamma,
+                    h0=h0,
+                    cu_seqlens_dev=cu_seqlens_p,
+                    scale=None,
+                    use_ht=True,
+                    chunk_size=chunk_size,
+                )
 
-        output, new_state = jax.shard_map(
-            _prefill_fn,
-            mesh=self.mesh,
-            in_specs=(
-                P(None, None, "tensor", None),
-                P(None, None, "tensor", None),
-                P(None, None, "tensor", None),
-                P("tensor"),
-                P(None, "tensor", None, None),
-                P(),
-            ),
-            out_specs=(
-                P(None, None, "tensor", None),
-                P(None, "tensor", None, None),
-            ),
-            check_vma=False,
-        )(q_b, k_b, v_b, slope_sm, h0_sm, cu_seqlens)
+            # q/k/v come in as [T_outer, H, K]; the kernel expects [1, T_outer, H, K].
+            q_b = q[None]
+            k_b = k[None]
+            v_b = v[None]
 
-        return output[0], new_state
+            output, new_state = jax.shard_map(
+                _prefill_fn,
+                mesh=self.mesh,
+                in_specs=(
+                    P(None, None, "tensor", None),
+                    P(None, None, "tensor", None),
+                    P(None, None, "tensor", None),
+                    P("tensor"),
+                    P(None, "tensor", None, None),
+                    P(),
+                ),
+                out_specs=(
+                    P(None, None, "tensor", None),
+                    P(None, "tensor", None, None),
+                ),
+                check_vma=False,
+            )(q_b, k_b, v_b, slope_sm, h0_sm, cu_seqlens)
+
+            return output[0], new_state
+        else:
+            # DP path: following FlashAttention pattern
+            # ssm_states and cu_seqlens are sharded along "data" axis
+            # Each DP shard processes its portion of requests
+            # NOTE: q/k/v stay replicated (not sharded) because they are in varlen
+            # packed format. Each shard uses local cu_seqlens to index into the
+            # global packed array.
+            h0_sm = jax.sharding.reshard(
+                ssm_states,
+                NamedSharding(self.mesh, P("data", "tensor", None, None)),
+            )
+
+            def _prefill_fn_dp(q_local, k_local, v_local, gamma, h0, cu_seqlens_p):
+                output, ht = simple_gla_fwd(
+                    q_local[None],
+                    k_local[None],
+                    v_local[None],
+                    g_gamma=gamma,
+                    h0=h0,
+                    cu_seqlens_dev=cu_seqlens_p,
+                    scale=None,
+                    use_ht=True,
+                    chunk_size=chunk_size,
+                )
+                return output[0], ht
+
+            output, new_state = jax.shard_map(
+                _prefill_fn_dp,
+                mesh=self.mesh,
+                in_specs=(
+                    P("data", "tensor", None),
+                    P("data", "tensor", None),
+                    P("data", "tensor", None),
+                    P("tensor"),
+                    P("data", "tensor", None, None),
+                    P("data"),
+                ),
+                out_specs=(
+                    P("data", "tensor", None),
+                    P("data", "tensor", None, None),
+                ),
+                check_vma=False,
+            )(q, k, v, slope_sm, h0_sm, cu_seqlens)
+
+            return output, new_state
 
 
 __all__ = ["LightningAttnBackend"]

@@ -342,7 +342,6 @@ class TestExtendSharded:
             output_np = np.array(output)
             states_np = np.array(_extract_state(pool_updates, rec_indices))
 
-        cs = _CHUNK_SIZE
         ref_outputs = []
         ref_states = []
         offset = 0

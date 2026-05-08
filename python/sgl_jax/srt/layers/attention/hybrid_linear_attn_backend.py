@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -19,10 +19,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
-from sgl_jax.srt.layers.attention.base_attn_backend import (
-    AttentionBackend,
-    AttentionBackendMetadata,
-)
+from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -77,29 +74,57 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         self,
         batch: ModelWorkerBatch,
     ) -> LinearRecurrentAttnBackendMetadata:
-        """Return the metadata for a forward pass."""
+        """Return the metadata for a forward pass.
+
+        For DP > 1, cu_q_lens is a 1D array of length dp_size * (per_dp_bs_size+1),
+        logically representing [dp_size, per_dp_bs_size+1] in row-major order.
+        Each DP shard gets its slice via P("data") sharding in shard_map.
+        """
         metadata = LinearRecurrentAttnBackendMetadata()
 
-        # cu_q_lens per DP rank section (each section starts from 0)
-        if batch.forward_mode == ForwardMode.EXTEND:
-            ext_2d = batch.extend_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
-            cu_q_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)
-            cu_q_2d[:, 1:] = np.cumsum(ext_2d, axis=1)
-            cu_q_lens = cu_q_2d.ravel()
-        elif batch.forward_mode == ForwardMode.DECODE:
-            single_cu = np.arange(batch.per_dp_bs_size + 1, dtype=np.int32)
-            cu_q_lens = np.tile(single_cu, batch.dp_size)
+        dp_size = getattr(batch, "dp_size", 1)
+        per_dp_bs_size = getattr(
+            batch,
+            "per_dp_bs_size",
+            len(batch.seq_lens) if hasattr(batch, "seq_lens") else 0,
+        )
+
+        if dp_size == 1:
+            # Original 1D path for backward compatibility
+            if batch.forward_mode == ForwardMode.EXTEND:
+                cu_q_lens = np.concatenate(
+                    [
+                        np.array([0], dtype=np.int32),
+                        np.cumsum(batch.extend_seq_lens, dtype=np.int32),
+                    ]
+                )
+            elif batch.forward_mode == ForwardMode.DECODE:
+                cu_q_lens = np.arange(len(batch.seq_lens) + 1, dtype=np.int32)
+            else:
+                raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
         else:
-            raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
+            # DP > 1: build cu_q_lens per DP rank, then ravel
+            # Following FlashAttention pattern
+            if batch.forward_mode == ForwardMode.EXTEND:
+                ext_2d = batch.extend_seq_lens.reshape(dp_size, per_dp_bs_size)
+                cu_q_2d = np.zeros((dp_size, per_dp_bs_size + 1), dtype=np.int32)
+                cu_q_2d[:, 1:] = np.cumsum(ext_2d, axis=1)
+                cu_q_lens = cu_q_2d.ravel()
+            elif batch.forward_mode == ForwardMode.DECODE:
+                single_cu = np.arange(per_dp_bs_size + 1, dtype=np.int32)
+                cu_q_lens = np.tile(single_cu, dp_size)
+            else:
+                raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
         # put array to devices
+        sharding_spec = P() if dp_size == 1 else P("data")
         (
             metadata.cu_q_lens,
             metadata.recurrent_indices,
             metadata.has_initial_state,
         ) = device_array(
             (cu_q_lens, batch.recurrent_indices, batch.has_initial_state),
-            sharding=(NamedSharding(self.mesh, P("data"))),
+            sharding=NamedSharding(self.mesh, sharding_spec),
         )
 
         return metadata
@@ -138,7 +163,7 @@ class HybridLinearAttnBackendMetadata:
     fields and assigns them to the corresponding sub-backend's forward_metadata.
     """
 
-    full_attn_metadata: AttentionBackendMetadata = field(default=None)
+    full_attn_metadata: Any = field(default=None)
     linear_attn_metadata: LinearRecurrentAttnBackendMetadata = field(default=None)
 
     def tree_flatten(self):
