@@ -1,10 +1,3 @@
-"""HybridLinearAttnBackend — dispatches per-layer to a full-attention sub-backend
-(MLA / FlashAttention) or a linear-attention sub-backend (KDA).
-
-The class itself owns no memory pool and allocates no device buffers; it only
-holds two sub-backends + a `full_attn_layers` whitelist and routes calls.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -98,15 +91,7 @@ class LinearRecurrentAttnBackend(AttentionBackend):
             metadata.has_initial_state,
         ) = device_array(
             (cu_q_lens, batch.recurrent_indices, batch.has_initial_state),
-            sharding=(
-                (
-                    NamedSharding(self.mesh, P("data")),  # cu_q_lens
-                    NamedSharding(self.mesh, P("data")),  # recurrent_indices
-                    NamedSharding(self.mesh, P("data")),  # has_initial_state
-                )
-                if self.mesh is not None and jax.process_count() > 1
-                else None
-            ),
+            sharding=(NamedSharding(self.mesh, P("data"))),
         )
 
         return metadata
@@ -124,11 +109,7 @@ class LinearRecurrentAttnBackend(AttentionBackend):
 
     @staticmethod
     def get_layer_cache(recurrent_state_pool, layer_id: int):
-        """Returns (recurrent_cache, conv_cache) for the given layer.
-
-        Matches RecurrentStatePool.get_linear_recurrent_layer_cache (PR #966)
-        which returns a (recurrent, conv) tuple.
-        """
+        """Returns (recurrent_cache, conv_cache) for the given layer."""
         return recurrent_state_pool.get_linear_recurrent_layer_cache(layer_id)
 
     @staticmethod
@@ -249,29 +230,5 @@ def attn_backend_wrapper(
     runner: ModelRunner,
     full_attn_backend: AttentionBackend,
 ):
-    """Wrap full_attn_backend in HybridLinearAttnBackend for hybrid models.
-
-    Mirrors upstream `sglang/srt/layers/attention/attention_registry.py:attn_backend_wrapper`.
-    `runner.linear_recurrent_config` is the cheap "is this hybrid?" detector;
-    dispatch to a concrete sub-backend uses the specific config properties
-    (e.g. `runner.kimi_linear_config`).
-    """
-    cfg = runner.linear_recurrent_config
-    if cfg is None:
-        return full_attn_backend
-    if runner.kimi_linear_config is not None:
-        # KDAAttnBackend lives in a separate PR — lazy import keeps this PR
-        # self-contained.
-        try:
-            from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
-        except ImportError as e:
-            raise ImportError(
-                "HybridLinearAttnBackend needs KDAAttnBackend " "(delivered by a separate PR)."
-            ) from e
-
-        linear_attn_backend = KDAAttnBackend(runner.mesh)
-    else:
-        raise NotImplementedError(f"No linear backend wired for hybrid config {type(cfg).__name__}")
-    return HybridLinearAttnBackend(
-        full_attn_backend, linear_attn_backend, cfg.full_attention_layer_ids
-    )
+    """Wrap full_attn_backend in HybridLinearAttnBackend for hybrid models."""
+    return full_attn_backend
