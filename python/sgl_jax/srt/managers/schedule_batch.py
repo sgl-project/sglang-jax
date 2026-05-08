@@ -914,6 +914,16 @@ class ScheduleBatch:
                 info.extend_logprob_start_lens = []
             info.extend_logprob_start_lens.extend([0] * added_count)
 
+            if info.has_initial_state is not None:
+                info.has_initial_state = np.concatenate(
+                    [info.has_initial_state, np.ones(added_count, dtype=np.bool_)]
+                )
+
+            if self.is_hybrid_recurrent:
+                info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
+                    info.req_pool_indices
+                )
+
             info.extend_num_tokens = (info.extend_num_tokens or 0) + added_count
 
     def prepare_for_extend(self):
