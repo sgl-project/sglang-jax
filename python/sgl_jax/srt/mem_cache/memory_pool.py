@@ -1261,8 +1261,6 @@ class HybridLinearKVPool(KVCache):
         }
         self.mem_usage = self.full_kv_pool.mem_usage
 
-    # ---- accessors (translate then delegate) -------------------------------
-
     def _to_physical(self, layer_id: int) -> int:
         if layer_id not in self.full_attention_layer_id_mapping:
             raise ValueError(
@@ -1304,8 +1302,6 @@ class HybridLinearKVPool(KVCache):
                 f"got {len(kv_buffer)}"
             )
         self.full_kv_pool.replace_buffer(kv_buffer)
-
-    # ---- delegated bulk ops ------------------------------------------------
 
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
