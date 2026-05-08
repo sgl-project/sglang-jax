@@ -313,7 +313,12 @@ class TestExtendSharded:
         h0_padded[:B_real] = h0_np
 
         with jax.set_mesh(mesh):
-            backend = LightningAttnBackend(mesh=mesh)
+            backend = LightningAttnBackend(
+                mesh=mesh,
+                linear_recurrent_layer_ids=[layer_id],
+                num_hidden_layers=80,
+                num_heads=H,
+            )
             rec_indices = np.arange(1, B_padded + 1, dtype=np.int32)
             pool, _ = _make_mock_pool(layer_id, jnp.array(h0_padded), rec_indices)
             _setup_backend(
@@ -343,16 +348,8 @@ class TestExtendSharded:
         offset = 0
         for i, (qi, ki, vi) in enumerate(per_req):
             seq_len = extend_seq_lens_real[i]
-            aligned_len = ((seq_len + cs - 1) // cs) * cs
-            # Pad to chunk-aligned length so numpy sees the same decay steps as the kernel
-            qi_pad = np.zeros((1, aligned_len, H, K), dtype=np.float32)
-            ki_pad = np.zeros((1, aligned_len, H, K), dtype=np.float32)
-            vi_pad = np.zeros((1, aligned_len, H, K), dtype=np.float32)
-            qi_pad[:, :seq_len] = qi
-            ki_pad[:, :seq_len] = ki
-            vi_pad[:, :seq_len] = vi
             h0_i = h0_np[i : i + 1]
-            ref_out_i, ref_state_i = numpy_gla_recurrent(qi_pad, ki_pad, vi_pad, g_gamma, h0=h0_i)
+            ref_out_i, ref_state_i = numpy_gla_recurrent(qi, ki, vi, g_gamma, h0=h0_i)
             ref_outputs.append(ref_out_i[0, :seq_len])
             ref_states.append(ref_state_i[0])
 
@@ -415,7 +412,12 @@ class TestEndToEndBackend:
         _, ref_state = numpy_gla_recurrent(q_ext_np, k_ext_np, v_ext_np, g_gamma, h0=h0_np)
 
         with jax.set_mesh(mesh):
-            backend = LightningAttnBackend(mesh=mesh)
+            backend = LightningAttnBackend(
+                mesh=mesh,
+                linear_recurrent_layer_ids=[layer_id],
+                num_hidden_layers=80,
+                num_heads=H,
+            )
             padded_seq_lens, input_ids, T_outer = _build_extend_batch([seq_len])
             B_padded = len(padded_seq_lens)
 

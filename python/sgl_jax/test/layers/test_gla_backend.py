@@ -157,7 +157,10 @@ class TestForwardDecode:
 
 class TestHybridIntegration:
     def test_dispatch_routes_to_lightning(self):
-        from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
+        try:
+            from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
+        except (ImportError, ModuleNotFoundError):
+            pytest.skip("FlashAttention import chain requires full sglang install")
 
         with jax.set_mesh(mesh):
             full_backend = FlashAttention(
