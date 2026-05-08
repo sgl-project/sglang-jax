@@ -311,7 +311,27 @@ scheduler overlap 兼容归入 Phase 3；是否前置重构 overlap 逻辑、采
 
 ## 文件级改动计划
 
-按以下顺序拆 PR 或 commit。
+按以下顺序拆 PR 或 commit。Phase 1 采用“先架构后功能”的推进方式，但不保留当前普通 EAGLE 旧实现的兼容路径；当前普通 EAGLE 性能不可用，允许在 PR1 中用组合式新路径整体替换。
+
+### PR1 骨架重写：Base worker + 单层 EAGLE 新路径
+
+PR1 只建立全新的 worker 边界和普通 EAGLE 最小新路径，不接入 `mimo-v2.5-pro` 多层 MTP。验收目标是让 scheduler、spec worker、draft worker、verify/result contract 的职责边界先稳定下来，后续 PR 再在同一契约上接入 MultiLayer MTP。
+
+PR1 范围：
+
+1. 新增 `BaseSpecWorker` / `BaseDraftWorker` 接口。
+2. 新增 `EagleDraftWorker`，承接 draft prefill、draft decode、draft extend 和 draft runner 相关 helper。
+3. 重写 `EAGLEWorker` 为组合式 spec worker，只负责编排 target prefill、draft、target verify、draft extend 和 `GenerationBatchResult` 组装。
+4. 显式化 `EagleDraftInput`、`EagleVerifyInput`、`GenerationBatchResult` 在 PR1 路径中的 ownership、host/device 边界和跨轮状态归属。
+5. scheduler 只切到新的 `EAGLEWorker` 入口，不保留旧 `EAGLEWorker` 双路径或兼容 shim。
+6. PR1 不启用 scheduler overlap，不接入 MultiLayer MTP，不要求普通 EAGLE 与旧实现数值/性能兼容。
+
+PR1 非目标：
+
+1. 不新增 `MultiLayerEAGLEWorker` / `MultiLayerDraftWorker` 的可运行 MTP 路径。
+2. 不做性能优化或 kernel 重写。
+3. 不放开 spec decode 与 overlap scheduler 的互斥。
+4. 不为旧普通 EAGLE 行为增加兼容层。
 
 ### 1. 新增 base worker 抽象
 
@@ -335,7 +355,7 @@ BaseSpecWorker
   - forward_batch_speculative_generation(model_worker_batch)
 ```
 
-这里只定义接口，不改变运行路径。
+这里定义 PR1 所需接口，并让 `EAGLEWorker` 在同一个 PR 内切到新接口；不保留旧 `EAGLEWorker` 运行路径。
 
 ### 2. 拆出 EagleDraftWorker
 
@@ -345,7 +365,7 @@ BaseSpecWorker
 python/sgl_jax/srt/speculative/eagle_draft_worker.py
 ```
 
-从现有 `EAGLEWorker` 迁移以下职责：
+从现有 `EAGLEWorker` 迁移以下职责。迁移时允许重排方法签名和数据流，不要求保持旧 worker 内部结构兼容：
 
 | 当前方法 | Phase 1 归属 |
 |---|---|
@@ -359,6 +379,8 @@ python/sgl_jax/srt/speculative/eagle_draft_worker.py
 | `select_top_k_tokens*` | 可保留在 utility 层或继续放同文件 |
 
 ### 3. 接入 MultiLayerEAGLEWorker / MultiLayerDraftWorker
+
+该部分从 PR2 开始推进。PR1 只保证 `BaseSpecWorker` / `BaseDraftWorker` 的接口足够承载该路径，不在 PR1 中实现可运行的多层 MTP。
 
 新增文件：
 
@@ -406,11 +428,11 @@ if spec_algorithm.is_eagle():
     self.draft_worker = EAGLEWorker(...)
 ```
 
-Phase 1 普通 EAGLE 仍然使用 `EAGLEWorker(...)`；多层Eagle 使用 `MultiLayerEAGLEWorker(...)`，但二者都挂在当前 scheduler 的 spec/draft worker 字段下。
+Phase 1 普通 EAGLE 使用重写后的 `EAGLEWorker(...)`；多层 EAGLE/MTP 从后续 PR 接入 `MultiLayerEAGLEWorker(...)`。scheduler 不保留旧 `EAGLEWorker` 和新 `EAGLEWorker` 的双路径选择。
 
 ### 6. DP attention 兼容
 
-Phase 1 需要补齐 DP-aware 数据结构处理。重点不是改 worker 主抽象，而是让 target verify 相关的 spec state、scheduler batch、model worker batch 和 attention metadata 能表达 DP padded layout。draft model 仍保持 TP / draft-local batch 语义，不要求 draft runner 自身支持 DP attention。
+Phase 1 需要补齐 DP-aware 数据结构处理。该工作从 PR1 开始固定数据字段语义，但完整 DP attention 兼容可按后续 PR 逐步落地。重点不是改 worker 主抽象，而是让 target verify 相关的 spec state、scheduler batch、model worker batch 和 attention metadata 能表达 DP padded layout。draft model 仍保持 TP / draft-local batch 语义，不要求 draft runner 自身支持 DP attention。
 
 修改文件：
 
