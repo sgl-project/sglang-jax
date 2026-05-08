@@ -195,6 +195,7 @@ def apply_linear_quantization(
                             activation_dtype=rule["activation_dtype"],
                             is_static_input=is_static_input,
                             weight_block_size=rule["weight_block_size"],
+                            allow_narrow_n_blockwise=quant_config.allow_narrow_n_blockwise,
                         )
                         # Replace the attribute and free old weights
                         setattr(obj, attr_name, quantized_linear)

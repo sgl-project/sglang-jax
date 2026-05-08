@@ -13,6 +13,7 @@
 quantization:
   is_static_checkpoint: true
   weight_block_size: [128, 128]
+  allow_narrow_n_blockwise: true
 
   linear:
     rules:
