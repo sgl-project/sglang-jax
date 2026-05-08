@@ -12,13 +12,14 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sgl_jax.srt.utils import kill_process_tree
 from sgl_jax.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
+    QWEN3_MOE_30B,
     CustomTestCase,
     popen_launch_server,
 )
 
 
 class TestW8Int8MoeBlockLinearChannelQuant(CustomTestCase):
-    model = "Qwen/Qwen3-30B-A3B"
+    model = QWEN3_MOE_30B
     quantization_config_path = "int8_moe_block_128_linear_channel_dynamic.yaml"
     other_args = [
         "--tp-size=4",

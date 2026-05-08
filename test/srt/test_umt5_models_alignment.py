@@ -30,6 +30,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import (  # noqa: E402
 from sgl_jax.srt.models.umt5 import UMT5EncoderModel  # noqa: E402
 from sgl_jax.srt.models.umt5 import UMT5ForConditionalGeneration as UMT5Gen
 from sgl_jax.srt.models.umt5 import UMT5Model
+from sgl_jax.test.test_utils import UMT5_BASE  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -515,7 +516,7 @@ def main():
     from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
     parser = argparse.ArgumentParser(description="UMT5 alignment tests (JAX vs PyTorch)")
-    parser.add_argument("--model_path", default="google/umt5-base", help="Model path or HF name")
+    parser.add_argument("--model_path", default=UMT5_BASE, help="Model path or HF name")
     parser.add_argument(
         "--test_type", default="all", choices=["all"] + list(TESTS.keys()), help="Test type to run"
     )

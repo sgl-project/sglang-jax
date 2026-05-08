@@ -1357,7 +1357,7 @@ class TestModelPerf(CustomTestCase):
                 writer.writerows(results_summary)
 
     def test_qwen3_32B_lora_r32_performance_tp_4(self):
-        model = "Qwen/Qwen3-32B"
+        model = QWEN3_32B
         lora_path = "flyfishxu/DeepNews-LoRA-Qwen3-32B"
         lora_name = ["DeepNews-LoRA-Qwen3-32B"]
         base_url = DEFAULT_URL_FOR_TEST

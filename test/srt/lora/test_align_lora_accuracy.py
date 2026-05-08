@@ -6,11 +6,11 @@ import unittest
 import numpy as np
 
 from sgl_jax.srt.entrypoints.engine import Engine
-from sgl_jax.test.test_utils import CustomTestCase
+from sgl_jax.test.test_utils import QWEN3_4B, CustomTestCase
 
 LORA_SETS = [
     {
-        "base": "Qwen/Qwen3-4B",
+        "base": QWEN3_4B,
         "lora": [
             "y9760210/Qwen3-4B-lora_model",
         ],
@@ -18,7 +18,7 @@ LORA_SETS = [
 ]
 
 LORA_PATHS = ["Qwen3-4B-lora_model", None, "Qwen3-4B-lora_model"]
-BASE_MODEL = "Qwen/Qwen3-4B"
+BASE_MODEL = QWEN3_4B
 DTYPE = "float32"
 NPDTYPE = np.float32
 
@@ -35,7 +35,7 @@ THRESHOLD = 2e-3
 class TestAlignLoRAAccuracy(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model_path = "Qwen/Qwen3-4B"
+        cls.model_path = QWEN3_4B
         cls.lora_target_modules = ["all"]
         import os
 
