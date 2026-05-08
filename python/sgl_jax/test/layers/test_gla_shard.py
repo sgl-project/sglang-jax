@@ -17,29 +17,18 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.layers.attention.linear.gla_metadata import (
-    gather_from_packed,
-    scatter_to_packed,
-)
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     MockRecurrentStatePool,
 )
-from sgl_jax.srt.layers.attention.linear.lightning_backend import (
-    LightningAttnBackend,
-)
+from sgl_jax.srt.layers.attention.linear.lightning_backend import LightningAttnBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
 mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 
 try:
-    from sgl_jax.srt.kernels.simple_gla.simple_gla import (
-        fused_recurrent_simple_gla,
-        simple_gla_fwd,
-    )
+    from sgl_jax.srt.kernels.simple_gla.simple_gla import fused_recurrent_simple_gla
 
     HAS_SIMPLE_GLA = True
 except ImportError:
@@ -259,7 +248,6 @@ class TestDecodeSharded:
         np.testing.assert_allclose(np.array(out_jax), ref_out, atol=1e-3)
         np.testing.assert_allclose(np.array(state_jax), ref_state, atol=1e-3)
 
-
     def test_decode_multi_step(self):
         """32-step autoregressive decode, B=4."""
         B, H, K, steps = 4, _H, _K, 32
@@ -453,13 +441,19 @@ class TestEndToEndBackend:
             v_ext = v_ext.at[:seq_len].set(jnp.array(v_ext_np[0]))
 
             _, pool_updates = backend(
-                q_ext, k_ext, v_ext,
-                layer=layer, forward_batch=fb_ext, recurrent_state_pool=pool,
+                q_ext,
+                k_ext,
+                v_ext,
+                layer=layer,
+                forward_batch=fb_ext,
+                recurrent_state_pool=pool,
             )
             extend_state = np.array(_extract_state(pool_updates, rec_indices))
 
         np.testing.assert_allclose(
-            extend_state[0], ref_state[0], atol=5e-2,
+            extend_state[0],
+            ref_state[0],
+            atol=5e-2,
             err_msg="Extend state != numpy reference before decode",
         )
 
@@ -473,7 +467,9 @@ class TestEndToEndBackend:
             _, h_ref = numpy_gla_recurrent(q_d, k_d, v_d, g_gamma, h0=h_ref)
 
             _, h_jax = fused_recurrent_simple_gla(
-                jnp.array(q_d), jnp.array(k_d), jnp.array(v_d),
+                jnp.array(q_d),
+                jnp.array(k_d),
+                jnp.array(v_d),
                 g_gamma=jnp.array(g_gamma),
                 initial_state=h_jax[:1],
                 output_final_state=True,
@@ -481,7 +477,8 @@ class TestEndToEndBackend:
             )
 
         np.testing.assert_allclose(
-            np.array(h_jax), h_ref, atol=5e-2,
+            np.array(h_jax),
+            h_ref,
+            atol=5e-2,
             err_msg="State diverged after extend + 32 decode steps",
         )
-
