@@ -373,6 +373,7 @@ class ModelRunnerKVCacheMixin:
             TokenToKVPoolAllocator,
         )
         from sgl_jax.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
             MHATokenToKVPool,
             ReqToTokenPool,
             SWAKVPool,
@@ -423,29 +424,62 @@ class ModelRunnerKVCacheMixin:
                     "model config; got "
                     f"kv_lora_rank={kv_lora_rank}, qk_rope_head_dim={qk_rope_head_dim}."
                 )
-            self.token_to_kv_pool = MLATokenToKVPool(
-                size=self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                layer_num=self._kv_pool_layer_count(),
-                mesh=self.mesh,
-                dp_size=dp_size,
-            )
+
+            if has_recurrent_state:
+                # Hybrid recurrent: wrap to allocate only L_full KV slots
+                recurrent_cfg = self.linear_recurrent_config
+                self.token_to_kv_pool = HybridLinearKVPool(
+                    size=self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    full_attention_layer_ids=recurrent_cfg.full_attention_layer_ids,
+                    mesh=self.mesh,
+                    token_to_kv_pool_class=MLATokenToKVPool,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    dp_size=dp_size,
+                )
+            else:
+                self.token_to_kv_pool = MLATokenToKVPool(
+                    size=self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    layer_num=self._kv_pool_layer_count(),
+                    mesh=self.mesh,
+                    dp_size=dp_size,
+                )
         else:
-            self.token_to_kv_pool = MHATokenToKVPool(
-                size=self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_total_num_kv_heads_with_replication(
-                    self.attention_tp_size
-                ),
-                head_dim=(self.model_config.head_dim + 127) // 128 * 128,
-                layer_num=self._kv_pool_layer_count(),
-                mesh=self.mesh,
-                dp_size=dp_size,
-            )
+            if has_recurrent_state:
+                # Hybrid recurrent: wrap to allocate only L_full KV slots
+                recurrent_cfg = self.linear_recurrent_config
+                self.token_to_kv_pool = HybridLinearKVPool(
+                    size=self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    full_attention_layer_ids=recurrent_cfg.full_attention_layer_ids,
+                    mesh=self.mesh,
+                    token_to_kv_pool_class=MHATokenToKVPool,
+                    head_num=self.model_config.get_total_num_kv_heads_with_replication(
+                        self.attention_tp_size
+                    ),
+                    head_dim=(self.model_config.head_dim + 127) // 128 * 128,
+                    dp_size=dp_size,
+                )
+            else:
+                self.token_to_kv_pool = MHATokenToKVPool(
+                    size=self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_total_num_kv_heads_with_replication(
+                        self.attention_tp_size
+                    ),
+                    head_dim=(self.model_config.head_dim + 127) // 128 * 128,
+                    layer_num=self._kv_pool_layer_count(),
+                    mesh=self.mesh,
+                    dp_size=dp_size,
+                )
 
         # --- MemoryPools wrapper (+ hybrid ReqToTokenPool) ---
         if has_recurrent_state:
