@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.sharding import NamedSharding
@@ -80,16 +79,15 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         """Return the metadata for a forward pass."""
         metadata = LinearRecurrentAttnBackendMetadata()
 
-        # cu_q_lens
+        # cu_q_lens per DP rank section (each section starts from 0)
         if batch.forward_mode == ForwardMode.EXTEND:
-            cu_q_lens = np.concatenate(
-                [
-                    np.array([0], dtype=np.int32),
-                    np.cumsum(batch.extend_seq_lens, dtype=np.int32),
-                ]
-            )
+            ext_2d = batch.extend_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
+            cu_q_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)
+            cu_q_2d[:, 1:] = np.cumsum(ext_2d, axis=1)
+            cu_q_lens = cu_q_2d.ravel()
         elif batch.forward_mode == ForwardMode.DECODE:
-            cu_q_lens = np.arange(len(batch.seq_lens) + 1, dtype=np.int32)
+            single_cu = np.arange(batch.per_dp_bs_size + 1, dtype=np.int32)
+            cu_q_lens = np.tile(single_cu, batch.dp_size)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
@@ -102,9 +100,9 @@ class LinearRecurrentAttnBackend(AttentionBackend):
             (cu_q_lens, batch.recurrent_indices, batch.has_initial_state),
             sharding=(
                 (
-                    NamedSharding(self.mesh, P()),          # cu_q_lens: replicated
-                    NamedSharding(self.mesh, P("data")),    # recurrent_indices
-                    NamedSharding(self.mesh, P("data")),    # has_initial_state
+                    NamedSharding(self.mesh, P("data")),  # cu_q_lens
+                    NamedSharding(self.mesh, P("data")),  # recurrent_indices
+                    NamedSharding(self.mesh, P("data")),  # has_initial_state
                 )
                 if self.mesh is not None and jax.process_count() > 1
                 else None
