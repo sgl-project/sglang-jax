@@ -253,7 +253,7 @@ class AudioBackboneModelRunner(BaseModelRunner):
                 jax.device_put(layer_kv_fused, target_sharding)
                 for layer_kv_fused in layers_kv_fused
             ]
-        self.token_to_kv_pool.replace_kv_buffer(layers_kv_fused)
+        self.token_to_kv_pool.replace_buffer(layers_kv_fused)
 
     def patch_decode(
         self,
