@@ -628,9 +628,6 @@ class ScheduleReqsInfo:
     # Recurrent state indices for hybrid recurrent models (per DP)
     recurrent_indices: np.ndarray | None = None
 
-    # Whether each request has prior recurrent state (lazy zero-on-read)
-    has_initial_state: np.ndarray | None = None
-
 
 @dataclasses.dataclass
 class ScheduleBatch:
@@ -914,11 +911,6 @@ class ScheduleBatch:
                 info.extend_logprob_start_lens = []
             info.extend_logprob_start_lens.extend([0] * added_count)
 
-            if info.has_initial_state is not None:
-                info.has_initial_state = np.concatenate(
-                    [info.has_initial_state, np.ones(added_count, dtype=np.bool_)]
-                )
-
             if self.is_hybrid_recurrent:
                 info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
                     info.req_pool_indices
@@ -1079,8 +1071,6 @@ class ScheduleBatch:
             info.prefix_lens = prefix_lens
             info.extend_lens = extend_lens
             info.extend_input_logprob_token_ids = extend_input_logprob_token_ids
-
-            info.has_initial_state = np.array([r.is_chunked > 0 for r in reqs], dtype=np.bool_)
 
             if self.is_hybrid_recurrent:
                 info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
@@ -1462,8 +1452,6 @@ class ScheduleBatch:
             else:
                 info.seq_lens = np.add(info.seq_lens, 1)
             info.seq_lens_sum += bs
-
-            info.has_initial_state = np.ones(bs, dtype=np.bool_)
 
             if self.is_hybrid_recurrent:
                 info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
@@ -2097,16 +2085,18 @@ class ScheduleBatch:
                         )
                 offset_bs += per_dp_bs_padding
 
-        # Step 5.6: Merge has_initial_state from all DP ranks
+        # Step 5.6: has_initial_state[i] = True iff slot i already holds
+        # prior KV/recurrent state (extend with prefix, or any decode slot).
         has_initial_state_cpu = np.ones(total_bs, dtype=np.bool_)
-        offset_bs = 0
-        for dp_rank in range(self.dp_size):
-            info = self.reqs_info[dp_rank]
-            if info.seq_lens is not None and len(info.seq_lens) > 0:
-                dp_bs = len(info.seq_lens)
-                if info.has_initial_state is not None:
-                    has_initial_state_cpu[offset_bs : offset_bs + dp_bs] = info.has_initial_state
-            offset_bs += per_dp_bs_padding
+        if self.forward_mode.is_extend():
+            offset_bs = 0
+            for dp_rank in range(self.dp_size):
+                dp_bs = real_bs_per_dp[dp_rank]
+                if dp_bs > 0:
+                    has_initial_state_cpu[offset_bs : offset_bs + dp_bs] = (
+                        extend_prefix_lens[offset_bs : offset_bs + dp_bs] > 0
+                    )
+                offset_bs += per_dp_bs_padding
 
         # Step 6: Generate trace info if needed
         if precision_tracer.get_trace_active():
