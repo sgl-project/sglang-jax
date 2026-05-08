@@ -136,7 +136,7 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
         qkv = jax.lax.reshape(
             qkv,
             (T, 3, self.num_heads, self.head_dim),
-            out_sharding=NamedSharding(self.mesh, P(None, None, "tensor", None)),
+            out_sharding=NamedSharding(self.mesh, P("data", None, "tensor", None)),
         )
         q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
 
