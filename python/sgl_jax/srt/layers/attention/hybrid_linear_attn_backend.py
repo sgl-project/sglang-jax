@@ -8,7 +8,7 @@ holds two sub-backends + a `full_attn_layers` whitelist and routes calls.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -18,10 +18,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
-from sgl_jax.srt.layers.attention.base_attn_backend import (
-    AttentionBackend,
-    AttentionBackendMetadata,
-)
+from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -74,7 +71,12 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         self,
         batch: ModelWorkerBatch,
     ) -> LinearRecurrentAttnBackendMetadata:
-        """Return the metadata for a forward pass."""
+        """Return the metadata for a forward pass.
+
+        For DP > 1, cu_q_lens is a 1D array of length dp_size * (per_dp_bs_size+1),
+        logically representing [dp_size, per_dp_bs_size+1] in row-major order.
+        Each DP shard gets its slice via P("data") sharding in shard_map.
+        """
         metadata = LinearRecurrentAttnBackendMetadata()
 
         # Unified 2D reshape logic for all dp_size (including dp_size=1)
@@ -90,13 +92,14 @@ class LinearRecurrentAttnBackend(AttentionBackend):
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
         # put array to devices
+        sharding_spec = P() if batch.dp_size == 1 else P("data")
         (
             metadata.cu_q_lens,
             metadata.recurrent_indices,
             metadata.has_initial_state,
         ) = device_array(
             (cu_q_lens, batch.recurrent_indices, batch.has_initial_state),
-            sharding=(NamedSharding(self.mesh, P("data"))),
+            sharding=NamedSharding(self.mesh, sharding_spec),
         )
 
         return metadata
@@ -135,7 +138,7 @@ class HybridLinearAttnBackendMetadata:
     fields and assigns them to the corresponding sub-backend's forward_metadata.
     """
 
-    full_attn_metadata: AttentionBackendMetadata = field(default=None)
+    full_attn_metadata: Any = field(default=None)
     linear_attn_metadata: LinearRecurrentAttnBackendMetadata = field(default=None)
 
     def tree_flatten(self):
