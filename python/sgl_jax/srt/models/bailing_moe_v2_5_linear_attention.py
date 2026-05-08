@@ -1,14 +1,13 @@
 """BailingMoeV2_5LinearAttention: linear attention layer for BailingMoeV2.5.
 
-Pure model layer responsible for projections, norms, and gating.
-Attention dispatch (GLA kernel) is delegated to LightningAttnBackend.
+Pure model layer responsible for projections, norms, and gating. Attention
+dispatch (GLA kernel) is delegated to ``LightningAttnBackend`` via the
+``RadixLightningAttention`` Radix wrapper, mirroring how ``KimiDeltaAttention``
+delegates to ``KDAAttnBackend`` via ``RadixLinearAttention``.
 """
-
-import math
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -17,18 +16,21 @@ from sgl_jax.srt.layers.attention.fla.group_rmsnorm import GroupRMSNorm
 from sgl_jax.srt.layers.embeddings import get_rope
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.layers.radix_lightning_attention import RadixLightningAttention
 
 
 class BailingMoeV2_5LinearAttention(nnx.Module):
     """Linear attention layer for BailingMoeV2.5.
 
     Implements the fused-QKV linear attention variant with:
-    - ALiBi slopes (per-layer decay)
+    - ALiBi slopes (per-layer decay) — owned by the backend, indexed by layer_id
     - Optional QK RMSNorm
     - Partial rotary positional embeddings
     - GroupRMSNorm on the gate output
 
-    Attention dispatch is handled by the backend (LightningAttnBackend).
+    Attention dispatch goes through ``self.attn = RadixLightningAttention(...)``,
+    which forwards to ``forward_batch.attn_backend`` (HybridLinearAttnBackend ->
+    LightningAttnBackend).
     """
 
     def __init__(
@@ -36,16 +38,13 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
         config,
         layer_id: int,
         mesh,
-        backend,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
-        self.num_hidden_layers = config.num_hidden_layers
         self.mesh = mesh
-        self.backend = backend
 
         self.qkv_proj = LinearBase(
             input_size=self.hidden_size,
@@ -111,36 +110,11 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
             scope_name="g_norm",
         )
 
-        self.slope = self._compute_slope()
-
-    def _compute_slope(self) -> jnp.ndarray:
-        """Compute per-head ALiBi slopes with per-layer decay."""
-        base_slopes = np.array(self.build_slope_tensor(self.num_heads), dtype=np.float32)
-        slope = -base_slopes * (1 - (self.layer_id - 1) / (self.num_hidden_layers - 1) + 1e-5)
-        return jnp.array(slope, dtype=jnp.float32)
-
-    @staticmethod
-    def build_slope_tensor(num_heads: int) -> list[float]:
-        """Compute ALiBi base slopes for the given number of heads.
-
-        Matches the HuggingFace reference implementation exactly.
-        """
-
-        def get_slopes_power_of_2(n):
-            start = 2 ** (-(2 ** -(math.log2(n) - 3)))
-            ratio = start
-            return [start * ratio**i for i in range(n)]
-
-        if math.log2(num_heads).is_integer():
-            return get_slopes_power_of_2(num_heads)
-        else:
-            closest_power_of_2 = 2 ** math.floor(math.log2(num_heads))
-            return (
-                get_slopes_power_of_2(closest_power_of_2)
-                + BailingMoeV2_5LinearAttention.build_slope_tensor(2 * closest_power_of_2)[0::2][
-                    : num_heads - closest_power_of_2
-                ]
-            )
+        self.attn = RadixLightningAttention(
+            layer_id=layer_id,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+        )
 
     def __call__(
         self,
@@ -174,15 +148,8 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
         # 3. Partial RoPE
         q, k = self.rotary_emb(positions, q, k)
 
-        # 4. Delegate attention to backend
-        attn_output, pool_updates = self.backend(
-            q,
-            k,
-            v,
-            layer=self,
-            forward_batch=forward_batch,
-            recurrent_state_pool=recurrent_state_pool,
-        )
+        # 4. Delegate attention to backend via RadixLightningAttention dispatcher
+        attn_output, pool_updates = self.attn(forward_batch, q, k, v, recurrent_state_pool)
 
         # 5. Gating: GroupRMSNorm(attn_output) * sigmoid(g_proj(hidden_states))
         g, _ = self.g_proj(hidden_states)

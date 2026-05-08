@@ -1,28 +1,28 @@
 """LightningAttnBackend — GLA (Gated Linear Attention) backend for BailingMoeV2.5.
 
 Extends LinearRecurrentAttnBackend to provide:
-- Chunked prefill via simple_gla_fwd (Pallas kernel) with scatter/gather packing
+- Chunked prefill via simple_gla_fwd (Pallas kernel, varlen — kernel pads each
+  sequence internally, so cu_seqlens carries real lengths)
 - Decode via fused_recurrent_simple_gla (jax.lax.scan)
 - Recurrent state management through RecurrentStatePool (no conv state)
 
 Aligns with upstream sglang's LightningAttentionBackend(MambaAttnBackendBase) pattern.
+Per-layer ALiBi slope decay is owned here (indexed by layer_id), mirroring
+upstream's ``self.tp_slope[layer.layer_id]``; the model layer only carries
+identification + head shape via ``RadixLightningAttention``.
 """
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.layers.attention.linear.gla_metadata import (
-    gather_from_packed,
-    scatter_to_packed,
-)
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
 )
@@ -38,91 +38,116 @@ except ModuleNotFoundError:
     fused_recurrent_simple_gla = None
 
 if TYPE_CHECKING:
+    from sgl_jax.srt.layers.radix_lightning_attention import RadixLightningAttention
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
 _CHUNK_SIZE = 64
 
 
-class LightningAttnBackend(LinearRecurrentAttnBackend):
-    """Attention backend for GLA (Gated Linear Attention) used by BailingMoeV2.5."""
+def _build_alibi_base_slopes(num_heads: int) -> list[float]:
+    """ALiBi base slopes matching the HF BailingMoeV2.5 reference."""
 
-    def __init__(self, mesh: jax.sharding.Mesh = None, chunk_size: int = _CHUNK_SIZE):
+    def get_slopes_power_of_2(n: int) -> list[float]:
+        start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+        ratio = start
+        return [start * ratio**i for i in range(n)]
+
+    if math.log2(num_heads).is_integer():
+        return get_slopes_power_of_2(num_heads)
+    closest_power_of_2 = 2 ** math.floor(math.log2(num_heads))
+    return (
+        get_slopes_power_of_2(closest_power_of_2)
+        + _build_alibi_base_slopes(2 * closest_power_of_2)[0::2][: num_heads - closest_power_of_2]
+    )
+
+
+def _compute_layer_slope(layer_id: int, num_hidden_layers: int, num_heads: int) -> jnp.ndarray:
+    """Per-layer slope decay used as ``g_gamma`` by the simple_gla kernels."""
+    base_slopes = jnp.asarray(_build_alibi_base_slopes(num_heads), dtype=jnp.float32)
+    return -base_slopes * (1 - (layer_id - 1) / (num_hidden_layers - 1) + 1e-5)
+
+
+class LightningAttnBackend(LinearRecurrentAttnBackend):
+    """Attention backend for GLA (Gated Linear Attention) used by BailingMoeV2.5.
+
+    Per-layer slope (g_gamma) is pre-computed once in __init__ and indexed by
+    ``layer.layer_id`` at call time, matching upstream
+    ``LightningAttentionBackend.tp_slope`` ownership.
+    """
+
+    def __init__(
+        self,
+        mesh: jax.sharding.Mesh = None,
+        chunk_size: int = _CHUNK_SIZE,
+        linear_recurrent_layer_ids: list[int] | None = None,
+        num_hidden_layers: int | None = None,
+        num_heads: int | None = None,
+    ):
+        """Construct a LightningAttnBackend.
+
+        Args:
+            mesh: Required for production forward (used by ``reshard`` and
+                ``shard_map``). May be ``None`` only for construction-only
+                smoke tests that do not invoke ``__call__``.
+            chunk_size: simple_gla kernel chunk size.
+            linear_recurrent_layer_ids: Global layer ids of every Lightning
+                attention layer in the model. Required for production use.
+                When omitted, ``self.tp_slope`` stays empty and any later
+                ``__call__`` will fail-fast with ``KeyError`` on
+                ``self.tp_slope[layer.layer_id]``. The fail-fast is
+                intentional — silently using a zero/missing slope would
+                make state divergence very hard to debug.
+            num_hidden_layers: Total transformer layer count, used to scale
+                the per-layer slope. Required iff
+                ``linear_recurrent_layer_ids`` is provided.
+            num_heads: Per-layer head count, used to size the slope vector.
+                Required iff ``linear_recurrent_layer_ids`` is provided.
+        """
         super().__init__(mesh=mesh)
         self.chunk_size = chunk_size
-        self.T_packed_bucket: int = 0
-        self.scatter_idx = nnx.data(None)
-        self.cu_seqlens_aligned = nnx.data(None)
-
-    def get_forward_metadata(self, batch):
-        metadata = super().get_forward_metadata(batch)
-
-        if batch.forward_mode == ForwardMode.EXTEND:
-            self._compute_scatter_metadata(batch)
-        else:
-            self.scatter_idx = nnx.data(None)
-            self.cu_seqlens_aligned = nnx.data(None)
-
-        return metadata
-
-    def _compute_scatter_metadata(self, batch):
-        extend_seq_lens = np.asarray(batch.extend_seq_lens, dtype=np.int32)
-        cs = self.chunk_size
-
-        aligned_lens = np.where(
-            extend_seq_lens == 0,
-            0,
-            ((extend_seq_lens + cs - 1) // cs) * cs,
-        ).astype(np.int32)
-
-        cu_seqlens = np.concatenate(
-            [np.array([0], dtype=np.int32), np.cumsum(aligned_lens, dtype=np.int32)]
-        )
-
-        T_pb = int(cu_seqlens[-1])
-        T_outer = len(batch.input_ids)
-
-        scatter_idx = np.full(T_outer, T_pb, dtype=np.int32)
-
-        offset_tight = 0
-        for i in range(len(extend_seq_lens)):
-            seq_len = int(extend_seq_lens[i])
-            if seq_len == 0:
-                continue
-            scatter_idx[offset_tight : offset_tight + seq_len] = np.arange(
-                cu_seqlens[i], cu_seqlens[i] + seq_len, dtype=np.int32
+        if (
+            linear_recurrent_layer_ids is not None
+            and num_hidden_layers is not None
+            and num_heads is not None
+        ):
+            # NNX wraps dicts of jax.Array as data so the leaves participate in
+            # the pytree (replicated across devices); the dict keys are static
+            # layer ids, so this does not trigger recompiles.
+            self.tp_slope = nnx.data(
+                {
+                    lid: _compute_layer_slope(lid, num_hidden_layers, num_heads)
+                    for lid in linear_recurrent_layer_ids
+                }
             )
-            offset_tight += seq_len
-
-        self.T_packed_bucket = T_pb
-
-        sharding = (
-            NamedSharding(self.mesh, P())
-            if self.mesh is not None and jax.process_count() == 1
-            else None
-        )
-        from sgl_jax.srt.utils.jax_utils import device_array
-
-        cu_dev, scatter_dev = device_array((cu_seqlens, scatter_idx), sharding=sharding)
-        self.cu_seqlens_aligned = nnx.data(cu_dev)
-        self.scatter_idx = nnx.data(scatter_dev)
+        else:
+            self.tp_slope = nnx.data({})
 
     def __call__(
         self,
         q: jax.Array,
         k: jax.Array,
         v: jax.Array,
-        layer,
+        layer: RadixLightningAttention,
         forward_batch: ForwardBatch,
         recurrent_state_pool,
         **kwargs,
     ) -> tuple[jax.Array, tuple]:
         recurrent_indices = self.forward_metadata.recurrent_indices
         ssm_states = self.get_state(recurrent_state_pool, layer.layer_id, recurrent_indices)
+        try:
+            slope = self.tp_slope[layer.layer_id]
+        except KeyError:
+            raise KeyError(
+                f"LightningAttnBackend has no slope for layer_id={layer.layer_id}; "
+                f"registered ids: {sorted(self.tp_slope.keys())}. "
+                f"Was this backend created via attn_backend_wrapper with a "
+                f"non-empty linear_recurrent_layer_ids?"
+            ) from None
 
-        if forward_batch.forward_mode.is_decode():
-            output, new_recurrent = self._forward_decode(q, k, v, ssm_states, layer)
+        if forward_batch.forward_mode == ForwardMode.DECODE:
+            output, new_recurrent = self._forward_decode(q, k, v, ssm_states, slope)
         elif forward_batch.forward_mode == ForwardMode.EXTEND:
-            output, new_recurrent = self._forward_extend(q, k, v, ssm_states, layer)
+            output, new_recurrent = self._forward_extend(q, k, v, ssm_states, slope)
         else:
             raise NotImplementedError(
                 f"LightningAttnBackend does not support {forward_batch.forward_mode}"
@@ -147,7 +172,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         k: jax.Array,
         v: jax.Array,
         ssm_states: jax.Array,
-        layer,
+        slope: jnp.ndarray,
     ) -> tuple[jax.Array, jax.Array]:
         if fused_recurrent_simple_gla is None:
             raise ImportError("simple_gla kernel is required for GLA decode")
@@ -155,7 +180,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         ssm_states = ssm_states.astype(jnp.float32)
         ssm_states = jax.sharding.reshard(
             ssm_states,
-            NamedSharding(layer.mesh, P(None, "tensor", None, None)),
+            NamedSharding(self.mesh, P(None, "tensor", None, None)),
         )
 
         q_d = q[:, None, :, :]
@@ -165,7 +190,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             q_d,
             k_d,
             v_d,
-            g_gamma=layer.slope,
+            g_gamma=slope,
             initial_state=ssm_states,
             output_final_state=True,
             scale=None,
@@ -178,35 +203,27 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         k: jax.Array,
         v: jax.Array,
         ssm_states: jax.Array,
-        layer,
+        slope: jnp.ndarray,
     ) -> tuple[jax.Array, jax.Array]:
         if simple_gla_fwd is None:
             raise ImportError("simple_gla kernel is required for GLA prefill")
 
-        T_pb = self.T_packed_bucket
-        scatter_idx = self.scatter_idx
-        cu_seqlens = self.cu_seqlens_aligned
-
+        cu_seqlens = self.forward_metadata.cu_q_lens
         ssm_states = ssm_states.astype(jnp.float32)
 
-        slope_sm = jax.sharding.reshard(
-            layer.slope, NamedSharding(layer.mesh, P("tensor"))
-        )
+        slope_sm = jax.sharding.reshard(slope, NamedSharding(self.mesh, P("tensor")))
         h0_sm = jax.sharding.reshard(
             ssm_states,
-            NamedSharding(layer.mesh, P(None, "tensor", None, None)),
+            NamedSharding(self.mesh, P(None, "tensor", None, None)),
         )
 
         chunk_size = self.chunk_size
 
-        def _prefill_fn(q_local, k_local, v_local, gamma, h0, scatter_idx_p, cu_seqlens_p):
-            q_p = scatter_to_packed(q_local, scatter_idx_p, T_pb)
-            k_p = scatter_to_packed(k_local, scatter_idx_p, T_pb)
-            v_p = scatter_to_packed(v_local, scatter_idx_p, T_pb)
+        def _prefill_fn(q_local, k_local, v_local, gamma, h0, cu_seqlens_p):
             return simple_gla_fwd(
-                q_p,
-                k_p,
-                v_p,
+                q_local,
+                k_local,
+                v_local,
                 g_gamma=gamma,
                 h0=h0,
                 cu_seqlens_dev=cu_seqlens_p,
@@ -215,16 +232,20 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
                 chunk_size=chunk_size,
             )
 
-        output_packed, new_state = jax.shard_map(
+        # q/k/v come in as [T_outer, H, K]; the kernel expects [1, T_outer, H, K].
+        q_b = q[None]
+        k_b = k[None]
+        v_b = v[None]
+
+        output, new_state = jax.shard_map(
             _prefill_fn,
-            mesh=layer.mesh,
+            mesh=self.mesh,
             in_specs=(
-                P(None, "tensor", None),
-                P(None, "tensor", None),
-                P(None, "tensor", None),
+                P(None, None, "tensor", None),
+                P(None, None, "tensor", None),
+                P(None, None, "tensor", None),
                 P("tensor"),
                 P(None, "tensor", None, None),
-                P(),
                 P(),
             ),
             out_specs=(
@@ -232,10 +253,9 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
                 P(None, "tensor", None, None),
             ),
             check_vma=False,
-        )(q, k, v, slope_sm, h0_sm, scatter_idx, cu_seqlens)
+        )(q_b, k_b, v_b, slope_sm, h0_sm, cu_seqlens)
 
-        attn_output = gather_from_packed(output_packed, scatter_idx)
-        return attn_output, new_state
+        return output[0], new_state
 
 
 __all__ = ["LightningAttnBackend"]

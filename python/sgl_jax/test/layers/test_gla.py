@@ -18,9 +18,7 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     MockRecurrentStatePool,
 )
-from sgl_jax.srt.layers.attention.linear.lightning_backend import (
-    LightningAttnBackend,
-)
+from sgl_jax.srt.layers.attention.linear.lightning_backend import LightningAttnBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.models.bailing_moe_v2_5_linear_attention import (
     BailingMoeV2_5LinearAttention,
@@ -115,18 +113,28 @@ def _expected_slope(num_heads, layer_id, num_hidden_layers):
 
 
 def _make_module(layer_id=1, config=None):
-    """Construct a BailingMoeV2_5LinearAttention on CPU under the global mesh."""
+    """Construct a BailingMoeV2_5LinearAttention on CPU under the global mesh.
+
+    Returns (module, backend). The backend is wired to dispatch via
+    forward_batch.attn_backend; pass it through ``_make_forward_batch(...,
+    backend=backend)`` so the module's RadixLightningAttention dispatcher can
+    reach it.
+    """
     if config is None:
         config = _make_config()
-    backend = LightningAttnBackend(mesh=mesh)
+    backend = LightningAttnBackend(
+        mesh=mesh,
+        linear_recurrent_layer_ids=list(range(config.num_hidden_layers)),
+        num_hidden_layers=config.num_hidden_layers,
+        num_heads=config.num_attention_heads,
+    )
     with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
         module = BailingMoeV2_5LinearAttention(
             config=config,
             layer_id=layer_id,
             mesh=mesh,
-            backend=backend,
         )
-    return module
+    return module, backend
 
 
 def _make_mock_pool(layer_id, recurrent_state, recurrent_indices=None):
@@ -146,8 +154,9 @@ def _extract_state(pool_updates, recurrent_indices):
     return new_ssm_full[jnp.array(recurrent_indices)]
 
 
-def _setup_backend_metadata(backend, forward_mode, recurrent_indices,
-                            extend_seq_lens=None, input_ids=None):
+def _setup_backend_metadata(
+    backend, forward_mode, recurrent_indices, extend_seq_lens=None, input_ids=None
+):
     """Set up backend forward_metadata for the given forward mode."""
     batch = SimpleNamespace(forward_mode=forward_mode, recurrent_indices=recurrent_indices)
     if forward_mode == ForwardMode.DECODE:
@@ -161,8 +170,31 @@ def _setup_backend_metadata(backend, forward_mode, recurrent_indices,
     return metadata
 
 
-def _make_forward_batch(forward_mode):
-    return SimpleNamespace(forward_mode=forward_mode)
+def _make_forward_batch(forward_mode, backend=None):
+    """Build a fake forward_batch for module-level tests.
+
+    The model layer dispatches via ``self.attn`` (RadixLightningAttention),
+    which calls ``forward_batch.attn_backend(..., pool=...)``. In production
+    that's HybridLinearAttnBackend, which routes to the linear sub-backend
+    with ``recurrent_state_pool=pool``. Here we adapt LightningAttnBackend
+    directly with the same keyword translation.
+    """
+    fb = SimpleNamespace(forward_mode=forward_mode)
+    if backend is not None:
+
+        def attn_backend_call(q, k, v, layer, forward_batch, pool, **kw):
+            return backend(
+                q,
+                k,
+                v,
+                layer=layer,
+                forward_batch=forward_batch,
+                recurrent_state_pool=pool,
+                **kw,
+            )
+
+        fb.attn_backend = attn_backend_call
+    return fb
 
 
 def _reshape_qkv(qkv, T, num_heads, head_dim, m=None):
@@ -235,13 +267,19 @@ def _make_cf_config():
 
 
 def _make_cf_module(layer_idx=5, dtype=jnp.float32):
+    """Same shape as _make_module but with the cross-framework config; returns (module, backend)."""
     config = _make_cf_config()
-    backend = LightningAttnBackend(mesh=mesh)
+    backend = LightningAttnBackend(
+        mesh=mesh,
+        linear_recurrent_layer_ids=list(range(config.num_hidden_layers)),
+        num_hidden_layers=config.num_hidden_layers,
+        num_heads=config.num_attention_heads,
+    )
     with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
         module = BailingMoeV2_5LinearAttention(
-            config=config, layer_id=layer_idx, mesh=mesh, backend=backend, dtype=dtype
+            config=config, layer_id=layer_idx, mesh=mesh, dtype=dtype
         )
-    return module
+    return module, backend
 
 
 # ---------------------------------------------------------------------------
@@ -326,11 +364,16 @@ def jax_to_numpy(x):
 
 class TestSlopes:
     def test_slopes_match_hf_formula(self):
-        """Slope tensor must exactly match the reference formula for several layers."""
+        """Slope tensor must exactly match the reference formula for several layers.
+
+        Slope is now owned by the backend (per upstream LightningAttention
+        pattern), so we read it from ``backend.tp_slope[layer_id]`` rather
+        than ``module.slope``.
+        """
         config = _make_config()
         for layer_idx in [1, 10, 40, 79]:
-            module = _make_module(layer_id=layer_idx, config=config)
-            actual = np.asarray(module.slope)
+            module, backend = _make_module(layer_id=layer_idx, config=config)
+            actual = np.asarray(backend.tp_slope[layer_idx])
             expected = _expected_slope(
                 config.num_attention_heads, layer_idx, config.num_hidden_layers
             )
@@ -356,7 +399,7 @@ class TestModuleLevelMockKernel:
         rng = np.random.default_rng(100)
 
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
-            module = _make_cf_module(dtype=jnp.float32)
+            module, _ = _make_cf_module(dtype=jnp.float32)
 
             hidden_np = rng.standard_normal((T, _CF_HIDDEN)).astype(np.float32)
             dummy_attn_np = rng.standard_normal((T, _CF_H * _CF_K)).astype(np.float32)
@@ -415,7 +458,9 @@ class TestModuleLevelMockKernel:
         k_pt = torch_rmsnorm(k_pt, torch.tensor(k_norm_w), _CF_EPS)
 
         # 3. RoPE
-        q_pt, k_pt = torch_rope_neox(positions_pt, q_pt, k_pt, _CF_K, _CF_ROTARY_DIM, _CF_ROPE_THETA)
+        q_pt, k_pt = torch_rope_neox(
+            positions_pt, q_pt, k_pt, _CF_K, _CF_ROTARY_DIM, _CF_ROPE_THETA
+        )
 
         # 4. Mock kernel: same dummy
         attn_pt = torch.tensor(dummy_attn_np)
@@ -423,7 +468,9 @@ class TestModuleLevelMockKernel:
         # 5. Gating
         g_pt = F.linear(hidden_pt, torch.tensor(g_proj_w.T))
         gate_pt = torch.sigmoid(g_pt)
-        gated_pt = torch_group_rmsnorm(attn_pt, torch.tensor(g_norm_w), _CF_NUM_GROUPS, _CF_EPS) * gate_pt
+        gated_pt = (
+            torch_group_rmsnorm(attn_pt, torch.tensor(g_norm_w), _CF_NUM_GROUPS, _CF_EPS) * gate_pt
+        )
 
         # 6. Dense
         output_pt = F.linear(gated_pt, torch.tensor(dense_w.T))
@@ -454,13 +501,10 @@ class TestMultiRequestIsolation:
     @requires_simple_gla
     def test_decode_multi_request_isolation(self):
         """Two requests decoded separately should match decoded together."""
-        backend = LightningAttnBackend(mesh=mesh)
         layer_id = 5
 
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
-            module = BailingMoeV2_5LinearAttention(
-                config=_SMALL_CONFIG, layer_id=layer_id, mesh=mesh, backend=backend
-            )
+            module, backend = _make_module(layer_id=layer_id, config=_SMALL_CONFIG)
 
             hidden1 = jax.random.normal(
                 jax.random.PRNGKey(42), (1, _SMALL_HIDDEN), dtype=jnp.bfloat16
@@ -475,7 +519,7 @@ class TestMultiRequestIsolation:
                 jax.random.PRNGKey(45), (1, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.bfloat16
             )
 
-            fb = _make_forward_batch(ForwardMode.DECODE)
+            fb = _make_forward_batch(ForwardMode.DECODE, backend=backend)
 
             # Separate
             pool1, rec1 = _make_mock_pool(layer_id, state1)
@@ -551,10 +595,7 @@ class TestGLAWrapper:
         T = 2
         layer_id = 5
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
-            backend = LightningAttnBackend(mesh=mesh)
-            module = BailingMoeV2_5LinearAttention(
-                config=_SMALL_CONFIG, layer_id=layer_id, mesh=mesh, backend=backend
-            )
+            module, backend = _make_module(layer_id=layer_id, config=_SMALL_CONFIG)
 
             hidden = jax.random.normal(
                 jax.random.PRNGKey(0), (T, _SMALL_HIDDEN), dtype=jnp.bfloat16
@@ -563,7 +604,7 @@ class TestGLAWrapper:
             state_init = jnp.zeros((T, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.float32)
             pool, rec_indices = _make_mock_pool(layer_id, state_init)
             _setup_backend_metadata(backend, ForwardMode.DECODE, rec_indices)
-            fb = _make_forward_batch(ForwardMode.DECODE)
+            fb = _make_forward_batch(ForwardMode.DECODE, backend=backend)
 
             # --- Module forward ---
             out_module, pool_updates = module(positions, hidden, fb, pool)
@@ -586,8 +627,13 @@ class TestGLAWrapper:
                 NamedSharding(mesh, P(None, "tensor", None, None)),
             )
 
-            # Direct kernel call (same args as module code)
-            slope_sm = jax.sharding.reshard(module.slope, NamedSharding(mesh, P("tensor")))
+            # Direct kernel call (same args as module code).
+            # Slope now lives on the backend (mirrors upstream
+            # LightningAttention.tp_slope) — read it from there to ensure
+            # the direct kernel call uses exactly the same g_gamma the
+            # module's backend dispatch uses.
+            slope = backend.tp_slope[layer_id]
+            slope_sm = jax.sharding.reshard(slope, NamedSharding(mesh, P("tensor")))
             q_d = q[:, None, :, :]
             k_d = k[:, None, :, :]
             v_d = v[:, None, :, :]
@@ -622,16 +668,10 @@ class TestGLAWrapper:
             err_msg="Decode: module state != direct kernel state",
         )
 
-
     @requires_simple_gla
     @requires_tpu
     def test_prefill_wrapper_matches_direct_kernel(self):
-        """Module prefill output should match direct scatter + simple_gla_fwd call."""
-        from sgl_jax.srt.layers.attention.linear.gla_metadata import (
-            gather_from_packed,
-            scatter_to_packed,
-        )
-
+        """Module prefill output should match a direct simple_gla_fwd call (varlen kernel)."""
         seq_len = 128
         layer_id = 5
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
@@ -643,7 +683,9 @@ class TestGLAWrapper:
             state_init = jnp.zeros((1, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.float32)
             pool, rec_indices = _make_mock_pool(layer_id, state_init)
             _setup_backend_metadata(
-                backend, ForwardMode.EXTEND, rec_indices,
+                backend,
+                ForwardMode.EXTEND,
+                rec_indices,
                 extend_seq_lens=np.array([seq_len], dtype=np.int32),
                 input_ids=np.zeros(seq_len, dtype=np.int32),
             )
@@ -675,19 +717,14 @@ class TestGLAWrapper:
                 NamedSharding(mesh, P(None, "tensor", None, None)),
             )
 
-            scatter_idx = backend.scatter_idx
-            T_pb = backend.T_packed_bucket
-            cu_seqlens = backend.cu_seqlens_aligned
+            cu_seqlens = backend.forward_metadata.cu_q_lens
             slope_sm = jax.sharding.reshard(module.slope, NamedSharding(mesh, P("tensor")))
 
-            def _direct_prefill_fn(q_l, k_l, v_l, gamma, h0, scatter_idx_p, cu_seqlens_p):
-                q_p = scatter_to_packed(q_l, scatter_idx_p, T_pb)
-                k_p = scatter_to_packed(k_l, scatter_idx_p, T_pb)
-                v_p = scatter_to_packed(v_l, scatter_idx_p, T_pb)
+            def _direct_prefill_fn(q_l, k_l, v_l, gamma, h0, cu_seqlens_p):
                 return simple_gla_fwd(
-                    q_p,
-                    k_p,
-                    v_p,
+                    q_l,
+                    k_l,
+                    v_l,
                     g_gamma=gamma,
                     h0=h0,
                     cu_seqlens_dev=cu_seqlens_p,
@@ -700,21 +737,20 @@ class TestGLAWrapper:
                 _direct_prefill_fn,
                 mesh=mesh,
                 in_specs=(
-                    P(None, "tensor", None),  # q
-                    P(None, "tensor", None),  # k
-                    P(None, "tensor", None),  # v
+                    P(None, None, "tensor", None),  # q
+                    P(None, None, "tensor", None),  # k
+                    P(None, None, "tensor", None),  # v
                     P("tensor"),  # slope
                     P(None, "tensor", None, None),  # h0
-                    P(),  # scatter_idx
                     P(),  # cu_seqlens
                 ),
                 out_specs=(
-                    P(None, None, "tensor", None),  # output_packed
+                    P(None, None, "tensor", None),  # output
                     P(None, "tensor", None, None),  # new_state
                 ),
                 check_vma=False,
-            )(q, k, v, slope_sm, recurrent_state, scatter_idx, cu_seqlens)
-            attn_output = gather_from_packed(output_packed, scatter_idx)
+            )(q[None], k[None], v[None], slope_sm, recurrent_state, cu_seqlens)
+            attn_output = output_packed[0]
 
             # Apply same gating and dense as module
             attn_output = attn_output.reshape(seq_len, -1)
@@ -727,7 +763,7 @@ class TestGLAWrapper:
             np.array(out_module),
             np.array(out_direct),
             atol=1e-6,
-            err_msg="Prefill: module output != direct scatter + kernel + gather + gating",
+            err_msg="Prefill: module output != direct kernel + gating",
         )
         np.testing.assert_allclose(
             np.array(state_module),
@@ -774,9 +810,10 @@ def _copy_weights_across_meshes(target_module, source_module):
     existing sharding (which is already on the correct mesh).
 
     Skips the backend sub-module (LightningAttnBackend) because its state
-    (scatter_idx, cu_seqlens_dev) is runtime metadata, not model weights.
-    Overwriting it would corrupt the target's pre-computed metadata and
-    replace nnx.Variable with plain arrays (causing .value AttributeError).
+    (forward_metadata: cu_q_lens, recurrent_indices) is runtime metadata, not
+    model weights. Overwriting it would corrupt the target's pre-computed
+    metadata and replace nnx.Variable with plain arrays (causing .value
+    AttributeError).
     """
     # Temporarily detach backends so nnx.state doesn't traverse them
     src_backend = source_module.backend
@@ -893,7 +930,9 @@ class TestTPConsistency:
             )
             pool1, rec1 = _make_mock_pool(layer_id, state_init)
             _setup_backend_metadata(
-                backend1, ForwardMode.EXTEND, rec1,
+                backend1,
+                ForwardMode.EXTEND,
+                rec1,
                 extend_seq_lens=np.array([seq_len], dtype=np.int32),
                 input_ids=np.zeros(seq_len, dtype=np.int32),
             )
@@ -911,7 +950,9 @@ class TestTPConsistency:
                 _copy_weights_across_meshes(module_n, module1)
                 pool_n, rec_n = _make_mock_pool(layer_id, state_init)
                 _setup_backend_metadata(
-                    backend_n, ForwardMode.EXTEND, rec_n,
+                    backend_n,
+                    ForwardMode.EXTEND,
+                    rec_n,
                     extend_seq_lens=np.array([seq_len], dtype=np.int32),
                     input_ids=np.zeros(seq_len, dtype=np.int32),
                 )
