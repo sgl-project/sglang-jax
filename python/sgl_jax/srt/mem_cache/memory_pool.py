@@ -1262,11 +1262,7 @@ class HybridLinearKVPool(KVCache):
         self._sync_inner_pool_attrs()
 
     def _sync_inner_pool_attrs(self) -> None:
-        """Sync public KVCache attributes from inner pool.
-
-        Called in __init__ and tree_unflatten to ensure HybridLinearKVPool
-        exposes the same interface as other KVCache implementations.
-        """
+        """Sync public attributes from inner pool for interface compatibility."""
         self.size = self.full_kv_pool.size
         self.page_size = self.full_kv_pool.page_size
         self.dtype = self.full_kv_pool.dtype
@@ -1275,7 +1271,7 @@ class HybridLinearKVPool(KVCache):
         self.start_layer = self.full_kv_pool.start_layer
         self.end_layer = self.full_kv_pool.end_layer
         self.mem_usage = self.full_kv_pool.mem_usage
-        self.kv_sharding = getattr(self.full_kv_pool, "kv_sharding", None)
+        self.kv_sharding = self.full_kv_pool.kv_sharding
 
     def _to_physical(self, layer_id: int) -> int:
         if layer_id not in self.full_attention_layer_id_mapping:
