@@ -1,4 +1,5 @@
 import logging
+from abc import ABC, abstractmethod
 from enum import IntEnum, auto
 
 import jax
@@ -6,6 +7,27 @@ import jax
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 
 logger = logging.getLogger(__name__)
+
+
+class SpecInputType(IntEnum):
+    EAGLE_DRAFT = auto()
+    EAGLE_VERIFY = auto()
+
+
+class SpecInput(ABC):
+    def __init__(self, spec_input_type: SpecInputType):
+        self.spec_input_type = spec_input_type
+
+    def is_draft_input(self) -> bool:
+        return self.spec_input_type == SpecInputType.EAGLE_DRAFT
+
+    def is_verify_input(self) -> bool:
+        return self.spec_input_type == SpecInputType.EAGLE_VERIFY
+
+    @abstractmethod
+    def get_spec_adjust_token_coefficient(self) -> tuple[int, int]:
+        """Return multipliers for scheduler token accounting and logprob token accounting."""
+        raise NotImplementedError
 
 
 class SpeculativeAlgorithm(IntEnum):

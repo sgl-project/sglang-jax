@@ -42,6 +42,7 @@ from sgl_jax.srt.mem_cache.common import (
     alloc_token_slots,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sgl_jax.srt.speculative.spec_info import SpecInput, SpecInputType
 
 logger = logging.getLogger(__name__)
 
@@ -370,7 +371,9 @@ def build_tree_kernel_efficient(
 
 @register_pytree_node_class
 @dataclass
-class EagleDraftInput:
+class EagleDraftInput(SpecInput):
+    """Cross-round draft state kept in draft-local request order."""
+
     # Constant: alloc length per decode step
     ALLOC_LEN_PER_DECODE: ClassVar[int] = None
 
@@ -408,6 +411,13 @@ class EagleDraftInput:
     new_seq_lens: np.ndarray | None = None
     # verify_done: Optional[torch.cuda.Event] = None
 
+    def __post_init__(self):
+        SpecInput.__init__(self, SpecInputType.EAGLE_DRAFT)
+
+    def get_spec_adjust_token_coefficient(self) -> tuple[int, int]:
+        """Draft input advances one logical token per request."""
+        return 1, 1
+
     def tree_flatten(self):
         accept_length_cpu_arr = (
             jnp.empty((0,), dtype=jnp.int32)
@@ -441,6 +451,7 @@ class EagleDraftInput:
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         obj = cls.__new__(cls)
+        obj.spec_input_type = SpecInputType.EAGLE_DRAFT
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
         obj.topk_p = children[0]
         obj.topk_index = children[1]
@@ -674,7 +685,9 @@ class EagleVerifyOutput:
 
 @register_pytree_node_class
 @dataclass
-class EagleVerifyInput:
+class EagleVerifyInput(SpecInput):
+    """Target verify input; fields define the explicit verify token/layout boundary."""
+
     # container type for pytree
     draft_token: jax.Array
     custom_mask: jax.Array
@@ -691,6 +704,13 @@ class EagleVerifyInput:
     seq_lens_sum: int
     capture_hidden_mode: CaptureHiddenMode
     # grammar: BaseGrammarObject = None
+
+    def __post_init__(self):
+        SpecInput.__init__(self, SpecInputType.EAGLE_VERIFY)
+
+    def get_spec_adjust_token_coefficient(self) -> tuple[int, int]:
+        """Verify input expands each request into draft_token_num target tokens."""
+        return self.draft_token_num, self.draft_token_num
 
     def tree_flatten(self):
         seq_lens_sum_arr = _as_int32_array(self.seq_lens_sum, fallback=0)
@@ -718,6 +738,7 @@ class EagleVerifyInput:
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         obj = cls.__new__(cls)
+        obj.spec_input_type = SpecInputType.EAGLE_VERIFY
         obj.spec_steps = aux_data["spec_steps"]
         obj.topk = aux_data["topk"]
         obj.draft_token_num = aux_data["draft_token_num"]
