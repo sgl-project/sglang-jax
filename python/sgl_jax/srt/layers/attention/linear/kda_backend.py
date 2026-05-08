@@ -149,6 +149,8 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             f"(reserved RecurrentStatePool inner-list length); got {len(conv_buffer_list)}"
         )
         conv_buffer = conv_buffer_list[0]
+        ## TODO: get has_init_states bool array and excute buffer clearance for recurrent_state_pool
+
         return recurrent_buffer[recurrent_indices], conv_buffer[recurrent_indices]
 
     def set_ssm_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_recurrent):
