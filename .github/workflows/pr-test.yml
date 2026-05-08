@@ -148,7 +148,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1]
+        part: [0, 1, 2]
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -166,7 +166,7 @@ jobs:
           pip install uv
           uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
-          python test/srt/run_suite.py --suite e2e-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          python test/srt/run_suite.py --suite e2e-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
   # =============================================== accurancy-test ===============================================
   accurancy-test-1-tpu:
