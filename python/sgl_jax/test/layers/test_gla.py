@@ -675,10 +675,7 @@ class TestGLAWrapper:
         seq_len = 128
         layer_id = 5
         with jax.default_device(jax.devices("cpu")[0]), jax.set_mesh(mesh):
-            backend = LightningAttnBackend(mesh=mesh)
-            module = BailingMoeV2_5LinearAttention(
-                config=_SMALL_CONFIG, layer_id=layer_id, mesh=mesh, backend=backend
-            )
+            module, backend = _make_module(layer_id=layer_id, config=_SMALL_CONFIG)
 
             state_init = jnp.zeros((1, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.float32)
             pool, rec_indices = _make_mock_pool(layer_id, state_init)
@@ -694,7 +691,7 @@ class TestGLAWrapper:
                 jax.random.PRNGKey(0), (seq_len, _SMALL_HIDDEN), dtype=jnp.bfloat16
             )
             positions = jnp.arange(seq_len, dtype=jnp.int32)
-            fb = _make_forward_batch(ForwardMode.EXTEND)
+            fb = _make_forward_batch(ForwardMode.EXTEND, backend=backend)
 
             # --- Module forward ---
             out_module, pool_updates = module(positions, hidden, fb, pool)
@@ -718,7 +715,8 @@ class TestGLAWrapper:
             )
 
             cu_seqlens = backend.forward_metadata.cu_q_lens
-            slope_sm = jax.sharding.reshard(module.slope, NamedSharding(mesh, P("tensor")))
+            slope = backend.tp_slope[layer_id]
+            slope_sm = jax.sharding.reshard(slope, NamedSharding(mesh, P("tensor")))
 
             def _direct_prefill_fn(q_l, k_l, v_l, gamma, h0, cu_seqlens_p):
                 return simple_gla_fwd(
@@ -808,33 +806,15 @@ def _copy_weights_across_meshes(target_module, source_module):
     Instead of nnx.update + reshard (which fights JAX's mesh-bound avals),
     we extract source values as numpy and place them using the target's
     existing sharding (which is already on the correct mesh).
-
-    Skips the backend sub-module (LightningAttnBackend) because its state
-    (forward_metadata: cu_q_lens, recurrent_indices) is runtime metadata, not
-    model weights. Overwriting it would corrupt the target's pre-computed
-    metadata and replace nnx.Variable with plain arrays (causing .value
-    AttributeError).
     """
-    # Temporarily detach backends so nnx.state doesn't traverse them
-    src_backend = source_module.backend
-    tgt_backend = target_module.backend
-    source_module.backend = None
-    target_module.backend = None
+    source_state = nnx.state(source_module)
+    target_state = nnx.state(target_module)
 
-    try:
-        source_state = nnx.state(source_module)
-        target_state = nnx.state(target_module)
+    def _copy_leaf(src, tgt):
+        return jax.device_put(np.array(src), tgt.sharding)
 
-        def _copy_leaf(src, tgt):
-            # tgt.sharding is on target_mesh (correct), src value is what we want
-            return jax.device_put(np.array(src), tgt.sharding)
-
-        new_state = jax.tree.map(_copy_leaf, source_state, target_state)
-        nnx.update(target_module, new_state)
-    finally:
-        # Restore backends
-        source_module.backend = src_backend
-        target_module.backend = tgt_backend
+    new_state = jax.tree.map(_copy_leaf, source_state, target_state)
+    nnx.update(target_module, new_state)
 
 
 class TestTPConsistency:
@@ -865,31 +845,42 @@ class TestTPConsistency:
         hidden = jax.random.normal(jax.random.PRNGKey(0), (T, _SMALL_HIDDEN), dtype=jnp.bfloat16)
         positions = jnp.arange(T, dtype=jnp.int32)
         state_init = jnp.zeros((T, _SMALL_H, _SMALL_K, _SMALL_K), dtype=jnp.float32)
-        fb = _make_forward_batch(ForwardMode.DECODE)
 
         # --- TP=1 baseline ---
         _, mesh_tp1 = tp_meshes[0]
         with jax.set_mesh(mesh_tp1):
-            backend1 = LightningAttnBackend(mesh=mesh_tp1)
+            backend1 = LightningAttnBackend(
+                mesh=mesh_tp1,
+                linear_recurrent_layer_ids=list(range(_SMALL_CONFIG.num_hidden_layers)),
+                num_hidden_layers=_SMALL_CONFIG.num_hidden_layers,
+                num_heads=_SMALL_CONFIG.num_attention_heads,
+            )
             module1 = BailingMoeV2_5LinearAttention(
-                config=_SMALL_CONFIG, layer_id=layer_id, mesh=mesh_tp1, backend=backend1
+                config=_SMALL_CONFIG, layer_id=layer_id, mesh=mesh_tp1,
             )
             pool1, rec1 = _make_mock_pool(layer_id, state_init)
             _setup_backend_metadata(backend1, ForwardMode.DECODE, rec1)
+            fb = _make_forward_batch(ForwardMode.DECODE, backend=backend1)
             out_tp1, pu_tp1 = module1(positions, hidden, fb, pool1)
             state_tp1 = _extract_state(pu_tp1, rec1)
 
         # --- TP=N comparisons ---
         for tp, mesh_tpn in tp_meshes[1:]:
             with jax.set_mesh(mesh_tpn):
-                backend_n = LightningAttnBackend(mesh=mesh_tpn)
+                backend_n = LightningAttnBackend(
+                    mesh=mesh_tpn,
+                    linear_recurrent_layer_ids=list(range(_SMALL_CONFIG.num_hidden_layers)),
+                    num_hidden_layers=_SMALL_CONFIG.num_hidden_layers,
+                    num_heads=_SMALL_CONFIG.num_attention_heads,
+                )
                 module_n = BailingMoeV2_5LinearAttention(
-                    config=_SMALL_CONFIG, layer_id=layer_id, mesh=mesh_tpn, backend=backend_n
+                    config=_SMALL_CONFIG, layer_id=layer_id, mesh=mesh_tpn,
                 )
                 _copy_weights_across_meshes(module_n, module1)
                 pool_n, rec_n = _make_mock_pool(layer_id, state_init)
                 _setup_backend_metadata(backend_n, ForwardMode.DECODE, rec_n)
-                out_tpn, pu_tpn = module_n(positions, hidden, fb, pool_n)
+                fb_n = _make_forward_batch(ForwardMode.DECODE, backend=backend_n)
+                out_tpn, pu_tpn = module_n(positions, hidden, fb_n, pool_n)
                 state_tpn = _extract_state(pu_tpn, rec_n)
 
             np.testing.assert_allclose(
@@ -924,9 +915,14 @@ class TestTPConsistency:
         # --- TP=1 baseline ---
         _, mesh_tp1 = tp_meshes[0]
         with jax.set_mesh(mesh_tp1):
-            backend1 = LightningAttnBackend(mesh=mesh_tp1)
+            backend1 = LightningAttnBackend(
+                mesh=mesh_tp1,
+                linear_recurrent_layer_ids=list(range(_SMALL_CONFIG.num_hidden_layers)),
+                num_hidden_layers=_SMALL_CONFIG.num_hidden_layers,
+                num_heads=_SMALL_CONFIG.num_attention_heads,
+            )
             module1 = BailingMoeV2_5LinearAttention(
-                config=_SMALL_CONFIG, layer_id=layer_id, mesh=mesh_tp1, backend=backend1
+                config=_SMALL_CONFIG, layer_id=layer_id, mesh=mesh_tp1,
             )
             pool1, rec1 = _make_mock_pool(layer_id, state_init)
             _setup_backend_metadata(
@@ -936,16 +932,21 @@ class TestTPConsistency:
                 extend_seq_lens=np.array([seq_len], dtype=np.int32),
                 input_ids=np.zeros(seq_len, dtype=np.int32),
             )
-            fb_tp1 = _make_forward_batch(ForwardMode.EXTEND)
+            fb_tp1 = _make_forward_batch(ForwardMode.EXTEND, backend=backend1)
             out_tp1, pu_tp1 = module1(positions, hidden, fb_tp1, pool1)
             state_tp1 = _extract_state(pu_tp1, rec1)
 
         # --- TP=N comparisons ---
         for tp, mesh_tpn in tp_meshes[1:]:
             with jax.set_mesh(mesh_tpn):
-                backend_n = LightningAttnBackend(mesh=mesh_tpn)
+                backend_n = LightningAttnBackend(
+                    mesh=mesh_tpn,
+                    linear_recurrent_layer_ids=list(range(_SMALL_CONFIG.num_hidden_layers)),
+                    num_hidden_layers=_SMALL_CONFIG.num_hidden_layers,
+                    num_heads=_SMALL_CONFIG.num_attention_heads,
+                )
                 module_n = BailingMoeV2_5LinearAttention(
-                    config=_SMALL_CONFIG, layer_id=layer_id, mesh=mesh_tpn, backend=backend_n
+                    config=_SMALL_CONFIG, layer_id=layer_id, mesh=mesh_tpn,
                 )
                 _copy_weights_across_meshes(module_n, module1)
                 pool_n, rec_n = _make_mock_pool(layer_id, state_init)
@@ -956,7 +957,7 @@ class TestTPConsistency:
                     extend_seq_lens=np.array([seq_len], dtype=np.int32),
                     input_ids=np.zeros(seq_len, dtype=np.int32),
                 )
-                fb_tpn = _make_forward_batch(ForwardMode.EXTEND)
+                fb_tpn = _make_forward_batch(ForwardMode.EXTEND, backend=backend_n)
                 out_tpn, pu_tpn = module_n(positions, hidden, fb_tpn, pool_n)
                 state_tpn = _extract_state(pu_tpn, rec_n)
 
