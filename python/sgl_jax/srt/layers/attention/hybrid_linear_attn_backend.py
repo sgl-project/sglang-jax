@@ -42,15 +42,20 @@ logger = logging.getLogger(__name__)
 class LinearRecurrentAttnBackendMetadata:
     cu_q_lens: jax.Array = None
     recurrent_indices: jax.Array = None
+    has_initial_state: jax.Array = None
 
     def tree_flatten(self):
-        children = (self.cu_q_lens, self.recurrent_indices)
+        children = (self.cu_q_lens, self.recurrent_indices, self.has_initial_state)
         aux_data = {}
         return children, aux_data
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        return cls(cu_q_lens=children[0], recurrent_indices=children[1])
+        return cls(
+            cu_q_lens=children[0],
+            recurrent_indices=children[1],
+            has_initial_state=children[2],
+        )
 
 
 @dataclass
@@ -92,9 +97,18 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         (
             metadata.cu_q_lens,
             metadata.recurrent_indices,
+            metadata.has_initial_state,
         ) = device_array(
-            (cu_q_lens, batch.recurrent_indices),
-            sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
+            (cu_q_lens, batch.recurrent_indices, batch.has_initial_state),
+            sharding=(
+                (
+                    NamedSharding(self.mesh, P()),          # cu_q_lens: replicated
+                    NamedSharding(self.mesh, P("data")),    # recurrent_indices
+                    NamedSharding(self.mesh, P("data")),    # has_initial_state
+                )
+                if self.mesh is not None and jax.process_count() > 1
+                else None
+            ),
         )
 
         return metadata
