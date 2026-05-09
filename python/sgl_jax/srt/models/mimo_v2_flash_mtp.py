@@ -106,15 +106,13 @@ class MiMoV2FlashMTPLayer(nnx.Module):
         token_mask = (forward_batch.positions != 0).astype(token_embeds.dtype)[:, None]
         token_embeds = token_embeds * token_mask
 
-        hidden_states, _ = self.eh_proj(
-            jnp.concatenate(
-                (
-                    self.enorm(token_embeds),
-                    self.hnorm(forward_batch.spec_info.hidden_states),
-                ),
-                axis=-1,
-            )
-        )
+        e = self.enorm(token_embeds)
+        h = self.hnorm(forward_batch.spec_info.hidden_states.astype(e.dtype))
+        # spec_info.hidden_states arrives with whatever sharding the host-side
+        # eagle orchestration left it (P() after verify, P("data",None) after
+        # target extend). Align to the embed sharding before concat.
+        h = jax.sharding.reshard(h, jax.typeof(e).sharding)
+        hidden_states, _ = self.eh_proj(jnp.concatenate((e, h), axis=-1))
 
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)

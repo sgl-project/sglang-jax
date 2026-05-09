@@ -60,15 +60,10 @@ class MiMoMTPLayer(nnx.Module):
         hidden_states = hidden_states * token_mask
         layers_kv_fused = []
 
-        hidden_states, _ = self.input_proj(
-            jnp.concatenate(
-                (
-                    self.hidden_layernorm(forward_batch.spec_info.hidden_states),
-                    self.token_layernorm(hidden_states),
-                ),
-                axis=-1,
-            )
-        )
+        e = self.token_layernorm(hidden_states)
+        h = self.hidden_layernorm(forward_batch.spec_info.hidden_states.astype(e.dtype))
+        h = jax.sharding.reshard(h, jax.typeof(e).sharding)
+        hidden_states, _ = self.input_proj(jnp.concatenate((h, e), axis=-1))
         hidden_states, residual, kv_fused, _ = self.mtp_layers(
             forward_batch.positions, hidden_states, forward_batch, token_to_kv_pool, None
         )
