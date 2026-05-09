@@ -249,10 +249,10 @@ class TestDPDecode:
         B, H, K = 4, _H, _K
         rng = np.random.default_rng(5001)
 
-        q_np = rng.standard_normal((B, 1, H, K)).astype(np.float32) * 0.1
-        k_np = rng.standard_normal((B, 1, H, K)).astype(np.float32) * 0.1
-        v_np = rng.standard_normal((B, 1, H, K)).astype(np.float32) * 0.1
-        h0_np = rng.standard_normal((B, H, K, K)).astype(np.float32) * 0.01
+        q_np = rng.standard_normal((B, 1, H, K)).astype(np.float32)
+        k_np = rng.standard_normal((B, 1, H, K)).astype(np.float32)
+        v_np = rng.standard_normal((B, 1, H, K)).astype(np.float32)
+        h0_np = rng.standard_normal((B, H, K, K)).astype(np.float32)
 
         # Reference: DP=1×TP=4
         mesh_tp4 = create_device_mesh(ici_parallelism=[1, 4], dcn_parallelism=[1, 1])
@@ -344,13 +344,13 @@ class TestDPDecode:
         B, H, K = 4, _H, _K
         rng = np.random.default_rng(5002)
 
-        q_np = rng.standard_normal((B, 1, H, K)).astype(np.float32) * 0.1
-        k_np = rng.standard_normal((B, 1, H, K)).astype(np.float32) * 0.1
-        v_np = rng.standard_normal((B, 1, H, K)).astype(np.float32) * 0.1
+        q_np = rng.standard_normal((B, 1, H, K)).astype(np.float32)
+        k_np = rng.standard_normal((B, 1, H, K)).astype(np.float32)
+        v_np = rng.standard_normal((B, 1, H, K)).astype(np.float32)
 
         # Different initial states per DP shard
-        h0_shard0 = rng.standard_normal((2, H, K, K)).astype(np.float32) * 0.01
-        h0_shard1 = rng.standard_normal((2, H, K, K)).astype(np.float32) * 0.02
+        h0_shard0 = rng.standard_normal((2, H, K, K)).astype(np.float32)
+        h0_shard1 = rng.standard_normal((2, H, K, K)).astype(np.float32)
         h0_np = np.concatenate([h0_shard0, h0_shard1], axis=0)
 
         mesh_dp = create_device_mesh(ici_parallelism=[2, 2], dcn_parallelism=[1, 1])
@@ -418,9 +418,9 @@ class TestDPExtend:
 
         # Pack for backend (varlen format)
         total_tokens = sum(seq_lens)
-        q_packed = rng.standard_normal((total_tokens, H, K)).astype(np.float32) * 0.1
-        k_packed = rng.standard_normal((total_tokens, H, K)).astype(np.float32) * 0.1
-        v_packed = rng.standard_normal((total_tokens, H, K)).astype(np.float32) * 0.1
+        q_packed = rng.standard_normal((total_tokens, H, K)).astype(np.float32)
+        k_packed = rng.standard_normal((total_tokens, H, K)).astype(np.float32)
+        v_packed = rng.standard_normal((total_tokens, H, K)).astype(np.float32)
 
         B = len(seq_lens)
         h0_np = np.zeros((B, H, K, K), dtype=np.float32)
@@ -578,9 +578,9 @@ class TestDPExtend:
         H, K = _H, _K
         rng = np.random.default_rng(6002)
 
-        q_list = [rng.standard_normal((1, sl, H, K)).astype(np.float32) * 0.1 for sl in seq_lens]
-        k_list = [rng.standard_normal((1, sl, H, K)).astype(np.float32) * 0.1 for sl in seq_lens]
-        v_list = [rng.standard_normal((1, sl, H, K)).astype(np.float32) * 0.1 for sl in seq_lens]
+        q_list = [rng.standard_normal((1, sl, H, K)).astype(np.float32) for sl in seq_lens]
+        k_list = [rng.standard_normal((1, sl, H, K)).astype(np.float32) for sl in seq_lens]
+        v_list = [rng.standard_normal((1, sl, H, K)).astype(np.float32) for sl in seq_lens]
 
         total_tokens = sum(seq_lens)
         q_packed = np.zeros((total_tokens, H, K), dtype=np.float32)
@@ -665,13 +665,13 @@ class TestDPEndToEnd:
 
         # Two requests
         q_ext_list = [
-            rng.standard_normal((1, sl, H, K)).astype(np.float32) * 0.1 for sl in seq_lens
+            rng.standard_normal((1, sl, H, K)).astype(np.float32) for sl in seq_lens
         ]
         k_ext_list = [
-            rng.standard_normal((1, sl, H, K)).astype(np.float32) * 0.1 for sl in seq_lens
+            rng.standard_normal((1, sl, H, K)).astype(np.float32) for sl in seq_lens
         ]
         v_ext_list = [
-            rng.standard_normal((1, sl, H, K)).astype(np.float32) * 0.1 for sl in seq_lens
+            rng.standard_normal((1, sl, H, K)).astype(np.float32) for sl in seq_lens
         ]
 
         # Pack for varlen format
@@ -736,9 +736,9 @@ class TestDPEndToEnd:
             state_after_ext_np = np.array(state_after_ext)
             h_jax = jnp.array(state_after_ext_np[0:1])
             for step in range(decode_steps):
-                q_d = rng.standard_normal((1, 1, H, K)).astype(np.float32) * 0.1
-                k_d = rng.standard_normal((1, 1, H, K)).astype(np.float32) * 0.1
-                v_d = rng.standard_normal((1, 1, H, K)).astype(np.float32) * 0.1
+                q_d = rng.standard_normal((1, 1, H, K)).astype(np.float32)
+                k_d = rng.standard_normal((1, 1, H, K)).astype(np.float32)
+                v_d = rng.standard_normal((1, 1, H, K)).astype(np.float32)
 
                 _, h_jax = fused_recurrent_simple_gla(
                     jnp.array(q_d),
@@ -763,7 +763,7 @@ class TestDPEndToEnd:
         B, H, K = 4, _H, _K
         rng = np.random.default_rng(7002)
 
-        h0_np = rng.standard_normal((B, H, K, K)).astype(np.float32) * 0.01
+        h0_np = rng.standard_normal((B, H, K, K)).astype(np.float32)
 
         mesh_dp = create_device_mesh(ici_parallelism=[2, 2], dcn_parallelism=[1, 1])
         with jax.set_mesh(mesh_dp):
