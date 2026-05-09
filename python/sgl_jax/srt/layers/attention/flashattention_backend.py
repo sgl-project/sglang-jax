@@ -293,6 +293,7 @@ class FlashAttention(AttentionBackend):
         cu_kv_lens = np.array(cu_kv_lens)
         page_indices = np.array(page_indices)
         seq_lens = np.array(seq_lens)
+
         (
             metadata.cu_q_lens,
             metadata.cu_kv_lens,
@@ -303,6 +304,17 @@ class FlashAttention(AttentionBackend):
             (cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
             sharding=(NamedSharding(self.mesh, P("data"))),
         )
+        # Hybrid SWA targets need swa_page_indices for TARGET_VERIFY too,
+        # otherwise SWA layers index the swa sub-pool with full-pool page ids.
+        swa_mapping = getattr(self, "swa_index_mapping", None)
+        if swa_mapping is not None:
+            mapping = swa_mapping[0] if isinstance(swa_mapping, list) else swa_mapping
+            swa_page_indices = (
+                mapping[batch.cache_loc[indices]] // self.page_size
+            ).astype(np.int32)
+            metadata.swa_page_indices = device_array(
+                swa_page_indices, sharding=NamedSharding(self.mesh, P("data"))
+            )
         return metadata
 
     def get_eagle_multi_step_metadata(self, batch: ModelWorkerBatch):

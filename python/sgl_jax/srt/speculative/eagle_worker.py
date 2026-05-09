@@ -778,6 +778,11 @@ def topk_probs_from_logits(
 ) -> tuple[jax.Array, jax.Array]:
     """Return top-k probabilities without materializing the full softmax tensor."""
     working_logits = jnp.moveaxis(logits, axis, -1) if axis != -1 else logits
+    # logits arrive vocab-sharded P("data","tensor"); top_k output (bs, k) would
+    # inherit that spec and fail when k % tp != 0. Replicate vocab first
+    # (matches Sampler.__call__ reshard at sampler.py:34).
+    if working_logits.ndim == 2:
+        working_logits = jax.sharding.reshard(working_logits, P("data", None))
     topk_logits, topk_index = jax.lax.top_k(working_logits, topk)
     logsumexp = jax.nn.logsumexp(working_logits, axis=-1, keepdims=True)
     topk_probs = jnp.exp(topk_logits - logsumexp)
