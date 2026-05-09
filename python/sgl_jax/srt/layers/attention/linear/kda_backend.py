@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import os
-
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
@@ -13,7 +11,6 @@ from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
 )
 from sgl_jax.srt.layers.attention.linear.short_convolution import (
-    l2_normalize,
     short_convolution,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
@@ -23,16 +20,19 @@ if TYPE_CHECKING:
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+def l2_normalize(x: jax.Array, epsilon: float = 1e-6) -> jax.Array:
+    """L2-normalize along the last axis. Computed in fp32, cast back to input dtype."""
+    norm = jnp.linalg.norm(x.astype(jnp.float32), axis=-1, keepdims=True)
+    return (x.astype(jnp.float32) / jnp.maximum(norm, epsilon)).astype(x.dtype)
+
+
 class KDAAttnBackend(LinearRecurrentAttnBackend):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
-    def __init__(self, mesh: jax.sharding.Mesh = None, use_pallas_prefill: bool | None = None):
+    def __init__(self, mesh: jax.sharding.Mesh = None):
         super().__init__(
             mesh=mesh,
         )
-        if use_pallas_prefill is None:
-            use_pallas_prefill = os.environ.get("SGLANG_KDA_PALLAS_PREFILL", "0") == "1"
-        self.use_pallas_prefill = use_pallas_prefill
 
     def __call__(
         self,
@@ -191,26 +191,6 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         layer: RadixLinearAttention,
         scale: float | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        if self.use_pallas_prefill:
-            return self._forward_extend_pallas(
-                q, k, v, g, beta, initial_state, cu_seqlens, layer, scale=scale
-            )
-        return self._forward_extend_naive(
-            q, k, v, g, beta, initial_state, cu_seqlens, layer, scale=scale
-        )
-
-    def _forward_extend_pallas(
-        self,
-        q: jax.Array,
-        k: jax.Array,
-        v: jax.Array,
-        g: jax.Array,
-        beta: jax.Array,
-        initial_state: jax.Array,
-        cu_seqlens: jax.Array,
-        layer: RadixLinearAttention,
-        scale: float | None = None,
-    ) -> tuple[jax.Array, jax.Array]:
         """Chunked prefill via Pallas kernel.  Returns (output, new_state).
 
         chunk_kda calls pallas_call internally, so we wrap it in shard_map
@@ -280,46 +260,6 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         # Remove the B=1 packed dim: [1, T, H, V] -> [T, H, V]
         return o[0], final_state
 
-    def _forward_extend_naive(
-        self,
-        q: jax.Array,
-        k: jax.Array,
-        v: jax.Array,
-        g: jax.Array,
-        beta: jax.Array,
-        initial_state: jax.Array,
-        cu_seqlens: jax.Array,
-        layer: RadixLinearAttention,
-        scale: float | None = None,
-    ) -> tuple[jax.Array, jax.Array]:
-        """Prefill fallback via naive recurrent kernel."""
-        g = self._fused_kda_gate(layer, g)
-        if cu_seqlens.shape[0] == 2:
-            o, final_state = fused_recurrent_kda(
-                q[None, ...],
-                k[None, ...],
-                v[None, ...],
-                g[None, ...],
-                beta[None, ...],
-                scale=scale,
-                initial_state=initial_state,
-                output_final_state=True,
-            )
-            return o[0], final_state
-
-        q_b, k_b, v_b, g_b, beta_b = self._unpack_varlen(q, k, v, g, beta, cu_seqlens)
-        o_b, final_state = fused_recurrent_kda(
-            q_b,
-            k_b,
-            v_b,
-            g_b,
-            beta_b,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=True,
-        )
-        return self._repack_varlen(o_b, cu_seqlens, q.shape[0]), final_state
-
     def _forward_decode(
         self,
         q: jax.Array,
@@ -331,7 +271,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         layer: RadixLinearAttention,
         scale: float | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        """Single-step decode via naive JAX recurrence.  Returns (output, new_state)."""
+        """Single-step decode via naive JAX recurrence (Pallas decode TBD).  Returns (output, new_state)."""
         g = self._fused_kda_gate(layer, g)
         # Kernel expects [B, T=1, H, K].
         o, final_state = fused_recurrent_kda(
@@ -359,42 +299,6 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         g32 = g.astype(jnp.float32) + layer.dt_bias.value.reshape(H, -1).astype(jnp.float32)
         out = -jnp.exp(layer.A_log.value.reshape(H, 1).astype(jnp.float32)) * jax.nn.softplus(g32)
         return out.astype(orig_dtype)
-
-    @staticmethod
-    def _unpack_varlen(
-        q: jax.Array,
-        k: jax.Array,
-        v: jax.Array,
-        g: jax.Array,
-        beta: jax.Array,
-        cu_seqlens: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-        T = q.shape[0]
-        positions = jnp.arange(T, dtype=cu_seqlens.dtype)
-        starts = cu_seqlens[:-1]
-        lens = cu_seqlens[1:] - starts
-        token_idx = starts[:, None] + positions[None, :]
-        valid = positions[None, :] < lens[:, None]
-        safe_idx = jnp.where(valid, token_idx, 0)
-
-        def gather(x):
-            padded = x[safe_idx]
-            return jnp.where(valid[(...,) + (None,) * (x.ndim - 1)], padded, 0)
-
-        beta_b = beta[safe_idx]
-        beta_b = jnp.where(valid[..., None], beta_b, 0)
-        return gather(q), gather(k), gather(v), gather(g), beta_b
-
-    @staticmethod
-    def _repack_varlen(
-        output: jax.Array,
-        cu_seqlens: jax.Array,
-        total_tokens: int,
-    ) -> jax.Array:
-        token_idx = jnp.arange(total_tokens, dtype=cu_seqlens.dtype)
-        seq_ids = jnp.searchsorted(cu_seqlens[1:], token_idx, side="right")
-        seq_offsets = token_idx - cu_seqlens[:-1][seq_ids]
-        return output[seq_ids, seq_offsets]
 
     def _unpack_conv_states(
         self,

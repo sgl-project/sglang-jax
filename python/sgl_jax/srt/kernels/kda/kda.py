@@ -1,5 +1,15 @@
-# Adapted from https://github.com/primatrix/pallas-kernel
+# Adapted from https://github.com/primatrix/pallas-kernel (rev 3c691ad3)
 # Vendored to remove external dependency after the upstream repository went private.
+#
+# This file merges the following modules into a single file:
+#   - tops/utils.py (cdiv, align_up, pad_to_multiple, prepare_lens, prepare_chunk_indices, assert_shape, assert_shape_or_none)
+#   - tops/ops/utils.py (exp, exp2, get_interpret)
+#   - tops/ops/common/cumsum.py (chunk_local_cumsum_vector via _chunk_cumsum_kernel)
+#   - tops/ops/kda/chunk_intra_fwd.py (_solve_unit_lower_triangular, _kda_fwd_intra_kernel, kda_fwd_intra)
+#   - tops/ops/common/chunk_delta_h.py (_prepare_chunk_offsets, _chunk_gated_delta_rule_fwd_kernel, chunk_gated_delta_rule_fwd_h)
+#   - tops/ops/gla/chunk.py (_chunk_kda_fwd_o_gk_varlen_kernel renamed to _chunk_kda_fwd_o_gk_pl_kernel, chunk_kda_fwd_o_gk_varlen renamed to chunk_kda_fwd_o_gk)
+#   - tops/ops/kda/gate.py (kda_gate_chunk_cumsum, pallas_kda_gate_cumsum)
+#   - tops/ops/kda/chunk_fwd.py (_align_seqs, _unalign_output, chunk_kda_fwd)
 """KDA chunked forward pass for variable-length sequences (self-contained)."""
 
 from __future__ import annotations

@@ -1,3 +1,8 @@
+# Adapted from https://github.com/primatrix/pallas-kernel (rev 3c691ad3)
+# Vendored to remove external dependency after the upstream repository went private.
+#
+# This file corresponds to tops/ops/kda/naive.py in the upstream repository.
+
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P

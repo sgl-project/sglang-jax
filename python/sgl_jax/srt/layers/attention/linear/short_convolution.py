@@ -185,15 +185,4 @@ def _extend_conv(
     return y, new_cache
 
 
-def l2_normalize(x: jax.Array, epsilon: float = 1e-6) -> jax.Array:
-    """L2-normalize ``x`` along its last axis.
-
-    Computed in float32 for numerical stability and cast back to the input
-    dtype. Used by linear-attention backends (KDA) to unit-norm the per-head
-    Q/K vectors emitted by the short conv before the recurrent kernel.
-    """
-    norm = jnp.linalg.norm(x.astype(jnp.float32), axis=-1, keepdims=True)
-    return (x.astype(jnp.float32) / jnp.maximum(norm, epsilon)).astype(x.dtype)
-
-
-__all__ = ["short_convolution", "l2_normalize"]
+__all__ = ["short_convolution"]

@@ -6,6 +6,9 @@ TODO: test KDAAttnBackend with dp in sgl_jax/srt/layers/attention/linear/kda_bac
     ref short conv: ./test_short_conv.py
     ref kda kernel: _forward_extend_naive
     compare kda kernel: _forward_extend_pallas
+
+NOTE: test_flashattention_dp.py copies unique_in_original_order but never calls it
+    (dead code). Use cache_loc[::page_size] for page_table construction.
 '''
 
 import jax
