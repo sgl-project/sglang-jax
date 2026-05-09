@@ -500,7 +500,7 @@ class Qwen2ForCausalLM(nnx.Module):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
-        return output, {"token_to_kv_pool": layers_kv_fused},layers_callback_flag, None
+        return output, {"token_to_kv_pool": layers_kv_fused}, layers_callback_flag, None
 
 
 EntryClass = Qwen2ForCausalLM

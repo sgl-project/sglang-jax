@@ -817,7 +817,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
 
-        return output, {"token_to_kv_pool": layers_kv_fused},True, layers_topk_ids
+        return output, {"token_to_kv_pool": layers_kv_fused}, True, layers_topk_ids
 
 
 EntryClass = [MiMoV2FlashForCausalLM]
