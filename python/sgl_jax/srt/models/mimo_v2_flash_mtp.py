@@ -223,7 +223,7 @@ class MiMoV2FlashMTPForCausalLM(nnx.Module):
             ),
             f"{prefix}.self_attn.attention_sink_bias": WeightMapping(
                 target_path="model.self_attn.attention_sink_bias",
-                sharding=(None,),
+                sharding=("tensor",),
                 transpose=False,
             ),
         }
@@ -247,9 +247,8 @@ class MiMoV2FlashMTPForCausalLM(nnx.Module):
             if is_fp8 and fp8:
                 m[f"{prefix}.self_attn.{name}.weight_scale_inv"] = WeightMapping(
                     target_path=f"model.self_attn.{name}.weight_scale",
-                    sharding=axes,
-                    transpose=True,
-                    kv_head_padding=kv_pad,
+                    sharding=(None, None),
+                    transpose=False,
                 )
         for name, axes in (
             ("gate_proj", (None, "tensor")),
@@ -265,8 +264,8 @@ class MiMoV2FlashMTPForCausalLM(nnx.Module):
             if is_fp8:
                 m[f"{prefix}.mlp.{name}.weight_scale_inv"] = WeightMapping(
                     target_path=f"model.mlp.{name}.weight_scale",
-                    sharding=axes,
-                    transpose=True,
+                    sharding=(None, None),
+                    transpose=False,
                 )
         return m
 
