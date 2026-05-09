@@ -559,11 +559,7 @@ def _ragged_paged_attention_kernel_loop(
         mask_len = kv_len
         mask_start = bkvmask_idx * bkv_sz
         mask_left = mask_len - mask_start
-        # Mosaic DMA requires the dynamic slice size to be tiling(8)-aligned.
-        # kv_len = seq_len + num_draft at verify time and is not aligned, so
-        # round up; the over-read is ignored by effective_bkv_sz downstream and
-        # the tail padding on custom_mask (added at kernel entry) prevents OOB.
-        load_kvmask_sz = jnp.minimum(bkv_sz, ((mask_left + 7) // 8) * 8)
+        load_kvmask_sz = jnp.minimum(bkv_sz, mask_left)
 
         q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
         q_end = cu_q_lens_ref[seq_idx + 1]
@@ -1754,8 +1750,6 @@ def ragged_paged_attention(
     if custom_mask is not None:
         if custom_mask.dtype == jnp.bool_:
             custom_mask = custom_mask.astype(jnp.int32)
-        # Tail-pad so the 8-aligned over-read in _fetch_mask never goes OOB.
-        custom_mask = jnp.pad(custom_mask, (0, 8))
         custom_mask = jnp.repeat(jnp.expand_dims(custom_mask, axis=1), repeats=head_dim, axis=1)
 
         # Prepare cu_seq_mask_lens for custom mask.

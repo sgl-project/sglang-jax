@@ -232,6 +232,24 @@ class FlashAttention(AttentionBackend):
 
         if batch.forward_mode.is_target_verify():
             seq_lens += extend_seq_lens
+            # rpa_v3 _fetch_mask DMA needs both offset (i*kv_len) and size to be
+            # tiling(8)-aligned. Pad each draft-token row of custom_mask to the
+            # 8-aligned kv_len and pass that aligned kv_len to the kernel.
+            seq_lens_8 = ((seq_lens + 7) // 8 * 8).astype(np.int32)
+            if metadata.custom_mask is not None and np.any(seq_lens_8 != seq_lens):
+                q = batch.spec_info.draft_token_num
+                cm = np.asarray(jax.device_get(metadata.custom_mask))
+                out, off = [], 0
+                for i in range(batch.real_bs):
+                    kl, kl8 = int(seq_lens[i]), int(seq_lens_8[i])
+                    row = cm[off : off + q * kl].reshape(q, kl)
+                    out.append(np.pad(row, ((0, 0), (0, kl8 - kl))).reshape(-1))
+                    off += q * kl
+                metadata.custom_mask = device_array(
+                    np.concatenate(out).astype(np.int32),
+                    sharding=NamedSharding(self.mesh, P()),
+                )
+            seq_lens = seq_lens_8
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
         else:
             aligned_seq_lens = (
