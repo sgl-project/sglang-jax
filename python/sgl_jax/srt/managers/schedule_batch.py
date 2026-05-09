@@ -2346,7 +2346,7 @@ class ScheduleBatch:
             return_output_logprob_only=self.return_output_logprob_only,
             top_logprobs_nums=self.top_logprobs_nums,
             token_ids_logprobs=self.token_ids_logprobs,
-            sampling_info=self.sampling_info,
+            sampling_info=self._merge_sampling_info(real_bs, real_bs),
             positions=positions_cpu,
             mrope_positions=mrope_positions_cpu,
             cache_loc=cache_loc_flat,
