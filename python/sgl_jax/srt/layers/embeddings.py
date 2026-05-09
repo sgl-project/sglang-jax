@@ -208,7 +208,6 @@ class RotaryEmbedding:
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
-        self.mesh = mesh
 
         inv_freq_np = 1.0 / (base ** (np.arange(0, rotary_dim, 2, dtype=np.float32) / rotary_dim))
         self._inv_freq_np = inv_freq_np  # shape: (rotary_dim // 2,)
@@ -232,62 +231,24 @@ class RotaryEmbedding:
 
         query_shape = query.shape
         num_tokens = positions.shape[0]
-        tensor_axis_size = self.mesh.shape.get("tensor", 1)
-        middle_dim = query.size // (num_tokens * self.head_size)
-        if middle_dim % tensor_axis_size == 0:
-            out_sharding = NamedSharding(self.mesh, P("data", "tensor", None))
-        else:
-            out_sharding = NamedSharding(self.mesh, P("data", None, None))
-        query = jax.lax.reshape(
-            query, (num_tokens, middle_dim, self.head_size), None, out_sharding=out_sharding
-        )
+        query = query.reshape(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
         query_rot = apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
-        tensor_axis_size = self.mesh.shape.get("tensor", 1)
-        if query_shape[1] % tensor_axis_size == 0:
-            out_sharding = NamedSharding(self.mesh, P("data", "tensor", None))
-        else:
-            out_sharding = NamedSharding(self.mesh, P("data", None, None))
-
         if self.rotary_dim < self.head_size:
             query_pass = query[..., self.rotary_dim :]
-            query = jax.lax.reshape(
-                jnp.concatenate((query_rot, query_pass), axis=-1),
-                query_shape,
-                None,
-                out_sharding=out_sharding,
-            )
+            query = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
         else:
-            query = jax.lax.reshape(query_rot, query_shape, None, out_sharding=out_sharding)
+            query = query_rot.reshape(query_shape)
 
         key_shape = key.shape
-        tensor_axis_size = self.mesh.shape.get("tensor", 1)
-        middle_dim_key = key.size // (num_tokens * self.head_size)
-        if middle_dim_key % tensor_axis_size == 0:
-            out_sharding = NamedSharding(self.mesh, P("data", "tensor", None))
-        else:
-            out_sharding = NamedSharding(self.mesh, P("data", None, None))
-        key = jax.lax.reshape(
-            key, (num_tokens, middle_dim_key, self.head_size), None, out_sharding=out_sharding
-        )
+        key = key.reshape(num_tokens, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
         key_rot = apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
-        tensor_axis_size = self.mesh.shape.get("tensor", 1)
-        if key_shape[1] % tensor_axis_size == 0:
-            out_sharding = NamedSharding(self.mesh, P("data", "tensor", None))
-        else:
-            out_sharding = NamedSharding(self.mesh, P("data", None, None))
-
         if self.rotary_dim < self.head_size:
             key_pass = key[..., self.rotary_dim :]
-            key = jax.lax.reshape(
-                jnp.concatenate((key_rot, key_pass), axis=-1),
-                key_shape,
-                None,
-                out_sharding=out_sharding,
-            )
+            key = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
         else:
-            key = jax.lax.reshape(key_rot, key_shape, None, out_sharding=out_sharding)
+            key = key_rot.reshape(key_shape)
 
         return query, key
 

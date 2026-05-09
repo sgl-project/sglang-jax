@@ -150,7 +150,7 @@ class Glm5Attention(nnx.Module):
         num_kv_heads: int,
         max_position_embeddings: int,
         mesh: jax.sharding.Mesh,
-        rope_theta: float = 10000,
+        rope_theta: float = 1000000,
         rope_scaling: dict[str, Any] | None = None,
         head_dim: int | None = None,
         rms_norm_eps: float = None,
@@ -159,10 +159,12 @@ class Glm5Attention(nnx.Module):
         layer_id: int = 0,
         attention_bias: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
+        use_absorbed: bool = True,
     ):
+        super().__init__()
         self.layer_id = layer_id
         self.mesh = mesh
-        self.q_head_num = num_heads
+        self.num_heads = num_heads
         self.kv_head_num = num_kv_heads
 
         self.qk_nope_head_dim = 192
@@ -217,7 +219,6 @@ class Glm5Attention(nnx.Module):
             self.kv_lora_rank, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="kv_a_layernorm"
         )
 
-        # kv_b_proj is initialized but will be dropped in post_load_weights
         self.kv_b_proj = LinearBase(
             input_size=self.kv_lora_rank,
             output_size=num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -237,6 +238,7 @@ class Glm5Attention(nnx.Module):
             mesh=mesh,
             scope_name="o_proj",
         )
+
         self.indexer = GlmDsaIndexer(
             hidden_size=hidden_size,
             q_lora_rank=self.q_lora_rank,
@@ -256,83 +258,72 @@ class Glm5Attention(nnx.Module):
             mesh=mesh,
         )
 
-        # Absorbed MLA placeholders
-        uk_axes = (None, "tensor", None)
-        self.w_uk = nnx.Param(
-            jnp.zeros(
-                (self.kv_lora_rank, num_heads, self.qk_nope_head_dim),
-                dtype=dtype,
-                out_sharding=P(*uk_axes),
-            )
-        )
-        self.w_uv = nnx.Param(
-            jnp.zeros(
-                (self.kv_lora_rank, num_heads, self.v_head_dim),
-                dtype=dtype,
-                out_sharding=P(*uk_axes),
-            )
-        )
+        self.use_absorbed = use_absorbed
 
-        # MQA attention on latent states
-        self.attn = RadixAttention(
+        if use_absorbed:
+            uk_axes = (None, "tensor", None)
+            self.w_uk = nnx.Param(
+                jnp.zeros(
+                    (self.kv_lora_rank, num_heads, self.qk_nope_head_dim),
+                    dtype=dtype,
+                    out_sharding=P(*uk_axes),
+                )
+            )
+            self.w_uv = nnx.Param(
+                jnp.zeros(
+                    (self.kv_lora_rank, num_heads, self.v_head_dim),
+                    dtype=dtype,
+                    out_sharding=P(*uk_axes),
+                )
+            )
+            self.attn_mqa = RadixAttention(
+                num_heads=num_heads,
+                head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
+                scaling=self.scaling,
+                num_kv_heads=1,
+                v_head_dim=self.kv_lora_rank,
+                layer_id=layer_id,
+            )
+        else:
+            self.w_uk = None
+            self.w_uv = None
+            self.attn_mqa = None
+
+        self.attn_mha = RadixAttention(
             num_heads=num_heads,
-            head_dim=self.kv_lora_rank + self.qk_rope_head_dim,  # 576
+            head_dim=self.qk_head_dim,
             scaling=self.scaling,
-            num_kv_heads=1,
-            v_head_dim=self.kv_lora_rank,  # 512
+            num_kv_heads=num_heads,
+            v_head_dim=self.qk_head_dim,
             layer_id=layer_id,
         )
 
     def post_load_weights(self):
-        """Split kv_b_proj.weight into absorbed-MLA folded projections."""
+        if not self.use_absorbed:
+            return
         if self.kv_b_proj is None:
             return
         w_kv = self.kv_b_proj.weight.value.reshape(
             self.kv_lora_rank,
-            self.q_head_num,
+            self.num_heads,
             self.qk_nope_head_dim + self.v_head_dim,
         )
         self.w_uk.value = w_kv[:, :, : self.qk_nope_head_dim]
         self.w_uv.value = w_kv[:, :, self.qk_nope_head_dim :]
         self.kv_b_proj = None
 
-    def __call__(
+    def _forward_mqa(
         self,
-        positions: jax.Array,
-        hidden_states: jax.Array,
+        q_nope: jax.Array,
+        q_rope: jax.Array,
+        compressed: jax.Array,
+        k_rope: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-    ) -> jax.Array:
-        # 1. Q projection
-        q_compressed, _ = self.q_a_proj(hidden_states)
-        q_compressed = self.q_a_layernorm(q_compressed)
-        q, _ = self.q_b_proj(q_compressed)
-        q = q.reshape(-1, self.q_head_num, self.qk_head_dim)
-
-        # Call indexer (result not used yet)
-        _ = self.indexer(hidden_states, q_compressed, positions, self.rotary_emb)
-
-        q_nope = q[:, :, : self.qk_nope_head_dim]
-
-        q_rope = q[:, :, self.qk_nope_head_dim :]
-
-        # 2. KV projection (latent)
-        latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
-        compressed, k_rope = jnp.split(latent_cache, [self.kv_lora_rank], axis=-1)
-        compressed = self.kv_a_layernorm(compressed)
-
-        k_rope = k_rope.reshape(-1, 1, self.qk_rope_head_dim)
-
-        # 3. Apply RoPE
-        q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
-
-        # ql_nope[t, h, r] = sum_d q_nope[t, h, d] * w_uk[r, h, d]
+    ) -> tuple[jax.Array, jax.Array]:
         ql_nope = jnp.einsum("thd,rhd->thr", q_nope, self.w_uk.value)
-
-        # Latent K/V are a single shared head — pack into [T, 1, *] for MQA.
         c_kv_3d = compressed[:, None, :]
-
-        attn_output, kv_fused = self.attn(
+        attn_output, kv_fused = self.attn_mqa(
             ql_nope,
             c_kv_3d,
             c_kv_3d,
@@ -341,14 +332,72 @@ class Glm5Attention(nnx.Module):
             q_rope=q_rope,
             k_rope=k_rope,
         )
-
-        # o_v[t, h, d] = sum_r attn_output[t, h, r] * w_uv[r, h, d]
         o_v = jnp.einsum("thr,rhd->thd", attn_output, self.w_uv.value)
+        attn_output = o_v.reshape(-1, self.num_heads * self.v_head_dim)
+        return attn_output, kv_fused
 
-        attn_output = o_v.reshape(-1, self.q_head_num * self.v_head_dim)
+    def _forward_mha(
+        self,
+        q_nope: jax.Array,
+        q_rope: jax.Array,
+        compressed: jax.Array,
+        k_rope: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+    ) -> tuple[jax.Array, jax.Array]:
+        kv, _ = self.kv_b_proj(compressed)
+        kv = kv.reshape(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope, v = jnp.split(kv, [self.qk_nope_head_dim], axis=-1)
+
+        k_rope = jnp.broadcast_to(
+            k_rope,
+            (k_rope.shape[0], self.num_heads, self.qk_rope_head_dim),
+            out_sharding=P("data", "tensor", None),
+        )
+
+        q = jnp.concatenate([q_nope, q_rope], axis=-1)
+        k = jnp.concatenate([k_nope, k_rope], axis=-1)
+
+        attn_output, kv_fused = self.attn_mha(
+            q, k, v, forward_batch=forward_batch, token_to_kv_pool=token_to_kv_pool
+        )
+        attn_output = attn_output.reshape(-1, self.num_heads * self.v_head_dim)
+        return attn_output, kv_fused
+
+    def __call__(
+        self,
+        positions: jax.Array,
+        hidden_states: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+    ) -> tuple[jax.Array, jax.Array]:
+        q_compressed, _ = self.q_a_proj(hidden_states)
+        q_compressed = self.q_a_layernorm(q_compressed)
+        q, _ = self.q_b_proj(q_compressed)
+        q = q.reshape(-1, self.num_heads, self.qk_head_dim)
+
+        _ = self.indexer(hidden_states, q_compressed, positions, self.rotary_emb)
+
+        q_nope = q[:, :, : self.qk_nope_head_dim]
+        q_rope = q[:, :, self.qk_nope_head_dim :]
+
+        latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
+        compressed, k_rope = jnp.split(latent_cache, [self.kv_lora_rank], axis=-1)
+        compressed = self.kv_a_layernorm(compressed)
+
+        k_rope = k_rope.reshape(-1, 1, self.qk_rope_head_dim)
+        q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+
+        if self.use_absorbed:
+            attn_output, kv_fused = self._forward_mqa(
+                q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
+            )
+        else:
+            attn_output, kv_fused = self._forward_mha(
+                q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
+            )
 
         output, _ = self.o_proj(attn_output)
-
         return output, kv_fused
 
 
@@ -437,6 +486,7 @@ class Glm5DecoderLayer(nnx.Module):
             attention_bias=getattr(config, "attention_bias", False),
             dtype=dtype,
             mesh=mesh,
+            use_absorbed=False,
         )
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
