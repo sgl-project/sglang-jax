@@ -469,6 +469,9 @@ class EAGLEWorker(ModelWorker):
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
         )
+        rep = NamedSharding(self.mesh, P())
+        logits_output.next_token_logits = jax.device_put(logits_output.next_token_logits, rep)
+        logits_output.hidden_states = jax.device_put(logits_output.hidden_states, rep)
         spec_info.hidden_states = logits_output.hidden_states
         (
             predict,
