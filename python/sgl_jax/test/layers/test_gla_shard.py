@@ -18,12 +18,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
-    MockRecurrentStatePool,
-)
 from sgl_jax.srt.layers.attention.linear.lightning_backend import LightningAttnBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+from sgl_jax.test.layers.mock_recurrent_state_pool import MockRecurrentStatePool
 
 mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 
