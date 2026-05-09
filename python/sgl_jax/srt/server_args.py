@@ -35,6 +35,7 @@ class ServerArgs:
     model_path: str
     tokenizer_path: str | None = None
     tokenizer_mode: str = "auto"
+    tokenizer_backend: str = "huggingface"
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
@@ -307,6 +308,17 @@ class ServerArgs:
             help="Tokenizer mode. 'auto' will use the fast "
             "tokenizer if available, and 'slow' will "
             "always use the slow tokenizer.",
+        )
+        parser.add_argument(
+            "--tokenizer-backend",
+            type=str,
+            default=ServerArgs.tokenizer_backend,
+            choices=["huggingface", "fastokens"],
+            help="Tokenizer backend. 'huggingface' uses the default HuggingFace "
+            "tokenizers library, and 'fastokens' uses the fastokens library "
+            "for faster tokenization. The fastokens patch is process-wide after "
+            "it is enabled. Requires the fastokens package to be installed: "
+            "pip install 'sglang-jax[fastokens]'.",
         )
         parser.add_argument(
             "--skip-tokenizer-init",

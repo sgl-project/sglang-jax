@@ -2,6 +2,7 @@
 
 import contextlib
 import os
+import threading
 import warnings
 from pathlib import Path
 
@@ -179,6 +180,46 @@ def get_context_length(config):
 
 # A fast LLaMA tokenizer with the pre-processed `tokenizer.json` file.
 _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
+_FASTOKENS_PATCHED = False
+_FASTOKENS_PATCH_LOCK = threading.Lock()
+
+
+def _validate_tokenizer_backend(tokenizer_backend: str):
+    if tokenizer_backend not in {"huggingface", "fastokens"}:
+        raise ValueError(
+            "Unsupported tokenizer_backend "
+            f"{tokenizer_backend!r}. Expected 'huggingface' or 'fastokens'."
+        )
+
+
+def _ensure_fastokens_patched():
+    """Monkey-patch transformers process-wide to use the fastokens backend once."""
+    global _FASTOKENS_PATCHED
+    if _FASTOKENS_PATCHED:
+        return
+
+    with _FASTOKENS_PATCH_LOCK:
+        if _FASTOKENS_PATCHED:
+            return
+
+        try:
+            import fastokens
+        except ImportError:
+            raise ImportError(
+                "The fastokens package is required when tokenizer_backend='fastokens'. "
+                "Install it with: pip install 'sglang-jax[fastokens]'"
+            ) from None
+
+        fastokens.patch_transformers()
+        _FASTOKENS_PATCHED = True
+
+
+def _raise_fastokens_load_error(tokenizer_name: str, error: Exception):
+    raise RuntimeError(
+        f"fastokens failed to load tokenizer for {tokenizer_name!r}. "
+        "This model's tokenizer may not be supported by fastokens. "
+        "Use tokenizer_backend='huggingface' to use the default backend."
+    ) from error
 
 
 def get_tokenizer(
@@ -187,12 +228,19 @@ def get_tokenizer(
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
     tokenizer_revision: str | None = None,
+    tokenizer_backend: str = "huggingface",
     sub_dir: str = "",
     **kwargs,
 ) -> PreTrainedTokenizer | PreTrainedTokenizerFast | TiktokenTokenizer:
     """Gets a tokenizer for the given model name via Huggingface."""
+    _validate_tokenizer_backend(tokenizer_backend)
+
     if tokenizer_name.endswith(".json"):
+        # Tiktoken JSON files use their own backend and do not go through transformers.
         return TiktokenTokenizer(tokenizer_name)
+
+    if tokenizer_backend == "fastokens":
+        _ensure_fastokens_patched()
 
     if tokenizer_mode == "slow":
         if kwargs.get("use_fast", False):
@@ -229,6 +277,9 @@ def get_tokenizer(
             **kwargs,
         )
     except TypeError as e:
+        if tokenizer_backend == "fastokens":
+            _raise_fastokens_load_error(tokenizer_name, e)
+
         # The LLaMA tokenizer causes a protobuf error in some environments.
         err_msg = (
             "Failed to load the tokenizer. If you are using a LLaMA V1 model "
@@ -250,8 +301,15 @@ def get_tokenizer(
                 "or using the `--trust-remote-code` flag in the CLI."
             )
             raise RuntimeError(err_msg) from e
-        else:
-            raise e
+
+        if tokenizer_backend == "fastokens":
+            _raise_fastokens_load_error(tokenizer_name, e)
+
+        raise e
+    except (OSError, RuntimeError) as e:
+        if tokenizer_backend == "fastokens":
+            _raise_fastokens_load_error(tokenizer_name, e)
+        raise
 
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
         warnings.warn(
