@@ -86,8 +86,7 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-        # Shard along "data" axis for DP, replicate for DP=1
-        sharding_spec = P("data") if batch.dp_size > 1 else P()
+        sharding_spec = P("data")
         (
             metadata.cu_q_lens,
             metadata.recurrent_indices,
@@ -234,4 +233,32 @@ def attn_backend_wrapper(
     full_attn_backend: AttentionBackend,
 ):
     """Wrap full_attn_backend in HybridLinearAttnBackend for hybrid models."""
-    return full_attn_backend
+    cfg = runner.linear_recurrent_config
+    if cfg is None:
+        return full_attn_backend
+    if runner.kimi_linear_config is not None:
+        try:
+            from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+        except ImportError as e:
+            raise ImportError(
+                "HybridLinearAttnBackend needs KDAAttnBackend (delivered by a separate PR)."
+            ) from e
+
+        linear_attn_backend = KDAAttnBackend(runner.mesh)
+    elif getattr(runner, "lightning_config", None) is not None:
+        from sgl_jax.srt.layers.attention.linear.lightning_backend import (
+            LightningAttnBackend,
+        )
+
+        cfg_lightning = runner.lightning_config
+        linear_attn_backend = LightningAttnBackend(
+            mesh=runner.mesh,
+            linear_recurrent_layer_ids=cfg_lightning.linear_layer_ids,
+            num_hidden_layers=cfg_lightning.num_hidden_layers,
+            num_heads=cfg_lightning.num_attention_heads,
+        )
+    else:
+        raise NotImplementedError(f"No linear backend wired for hybrid config {type(cfg).__name__}")
+    return HybridLinearAttnBackend(
+        full_attn_backend, linear_attn_backend, cfg.full_attention_layer_ids
+    )
