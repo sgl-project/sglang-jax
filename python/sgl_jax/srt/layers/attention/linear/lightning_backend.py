@@ -1,4 +1,4 @@
-"""LightningAttnBackend — GLA (Gated Linear Attention) backend for BailingMoeV2.5.
+"""LightningAttnBackend — GLA (Gated Linear Attention) backend.
 
 Extends LinearRecurrentAttnBackend to provide:
 - Chunked prefill via simple_gla_fwd (Pallas kernel, varlen — kernel pads each
@@ -150,20 +150,16 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
     def get_state(self, recurrent_state_pool, layer_id, recurrent_indices):
         """Gather recurrent states using shard_map."""
         recurrent_buffer, _ = self.get_layer_cache(recurrent_state_pool, layer_id)
-        dp_size = self.mesh.shape["data"]
 
         def _gather_local(buf, indices):
             return buf[indices]
-
-        # Indices sharding depends on dp_size (set by get_forward_metadata)
-        indices_spec = P("data") if dp_size > 1 else P()
 
         return jax.shard_map(
             _gather_local,
             mesh=self.mesh,
             in_specs=(
                 P("data", "tensor", None, None),
-                indices_spec,
+                P("data"),
             ),
             out_specs=P("data", "tensor", None, None),
             check_vma=False,
@@ -172,20 +168,16 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
     def set_ssm_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_recurrent):
         """Scatter recurrent states using shard_map."""
         recurrent_buffer, _ = self.get_layer_cache(recurrent_state_pool, layer_id)
-        dp_size = self.mesh.shape["data"]
 
         def _scatter_local(buf, indices, state):
             return buf.at[indices].set(state)
-
-        # Indices sharding depends on dp_size (set by get_forward_metadata)
-        indices_spec = P("data") if dp_size > 1 else P()
 
         return jax.shard_map(
             _scatter_local,
             mesh=self.mesh,
             in_specs=(
                 P("data", "tensor", None, None),
-                indices_spec,
+                P("data"),
                 P("data", "tensor", None, None),
             ),
             out_specs=P("data", "tensor", None, None),
@@ -225,10 +217,10 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             _decode_fn,
             mesh=self.mesh,
             in_specs=(
-                P("data", "tensor", None),  # q: always has "data" axis
+                P("data", "tensor", None),  # q
                 P("data", "tensor", None),  # k
                 P("data", "tensor", None),  # v
-                P("tensor"),  # slope: replicated
+                P("tensor"),  # slope
                 P("data", "tensor", None, None),  # ssm_states
             ),
             out_specs=(
@@ -255,7 +247,6 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         cu_seqlens = self.forward_metadata.cu_q_lens
         ssm_states = ssm_states.astype(jnp.float32)
         chunk_size = self.chunk_size
-        dp_size = self.mesh.shape["data"]
 
         def _prefill_fn(q_local, k_local, v_local, gamma, h0, cu_seqlens_p):
             output, ht = simple_gla_fwd(
@@ -271,9 +262,6 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             )
             return output[0], ht
 
-        # cu_seqlens sharding depends on dp_size (set by get_forward_metadata)
-        cu_seqlens_spec = P("data") if dp_size > 1 else P()
-
         output, new_state = jax.shard_map(
             _prefill_fn,
             mesh=self.mesh,
@@ -283,7 +271,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
                 P("data", "tensor", None),  # v
                 P("tensor"),  # slope: replicated
                 P("data", "tensor", None, None),  # ssm_states
-                cu_seqlens_spec,  # cu_seqlens: depends on dp_size
+                P("data"),  # cu_seqlens
             ),
             out_specs=(
                 P("data", "tensor", None),
