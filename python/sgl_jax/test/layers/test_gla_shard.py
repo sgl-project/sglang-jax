@@ -185,12 +185,32 @@ def _make_mock_pool(layer_id, recurrent_state, recurrent_indices=None):
 
 
 def _extract_state(pool_updates, recurrent_indices):
+    """Extract states from pool buffer with explicit output sharding.
+
+    The pool buffer is sharded as P("data", "tensor", None, None).
+    When gathering with indices, we need to specify output sharding explicitly.
+    """
     new_ssm_full, conv_list = pool_updates
-    return new_ssm_full[jnp.array(recurrent_indices)]
+    indices = jnp.array(recurrent_indices)
+    # Specify output sharding to match the buffer's sharding pattern
+    return new_ssm_full.at[indices].get(
+        out_sharding=jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec("data", "tensor", None, None)
+        )
+    )
 
 
 def _setup_backend(backend, forward_mode, recurrent_indices, extend_seq_lens=None, input_ids=None):
-    batch = SimpleNamespace(forward_mode=forward_mode, recurrent_indices=recurrent_indices)
+    """Setup backend with proper ModelWorkerBatch-like object.
+
+    Mirrors test_flashattention.py pattern: batch must have dp_size and per_dp_bs_size.
+    """
+    batch = SimpleNamespace(
+        forward_mode=forward_mode,
+        recurrent_indices=recurrent_indices,
+        dp_size=1,
+        per_dp_bs_size=len(recurrent_indices),
+    )
     if forward_mode == ForwardMode.DECODE:
         batch.seq_lens = np.ones(len(recurrent_indices), dtype=np.int32)
     elif forward_mode == ForwardMode.EXTEND:

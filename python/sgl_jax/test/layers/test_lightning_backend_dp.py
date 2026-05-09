@@ -98,8 +98,22 @@ def _make_mock_pool(layer_id, recurrent_state, recurrent_indices=None, dp_size=1
 
 
 def _extract_state(pool_updates, recurrent_indices):
+    """Extract recurrent state from pool updates with explicit output sharding.
+
+    Infers the mesh from the pool buffer's existing sharding.
+    """
     new_ssm_full, conv_list = pool_updates
-    return new_ssm_full[jnp.array(recurrent_indices)]
+    indices = jnp.array(recurrent_indices)
+    # Infer mesh from the buffer's sharding
+    buffer_sharding = new_ssm_full.sharding
+    if isinstance(buffer_sharding, NamedSharding):
+        mesh = buffer_sharding.mesh
+        return new_ssm_full.at[indices].get(
+            out_sharding=NamedSharding(mesh, P("data", "tensor", None, None))
+        )
+    else:
+        # Fallback for non-NamedSharding (shouldn't happen in these tests)
+        return new_ssm_full[indices]
 
 
 def _make_fake_layer(layer_id=_LAYER_ID, H=_H):
@@ -203,6 +217,8 @@ class TestDPDecode:
                 forward_mode=ForwardMode.DECODE,
                 seq_lens=np.ones(B, dtype=np.int32),
                 recurrent_indices=rec_indices,
+                dp_size=1,
+                per_dp_bs_size=B,
             )
             metadata_tp4 = backend_tp4.get_forward_metadata(batch_tp4)
             backend_tp4.forward_metadata = metadata_tp4
@@ -285,12 +301,14 @@ class TestDPDecode:
                 num_heads=H,
             )
             rec_indices = np.arange(1, B + 1, dtype=np.int32)
-            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, mesh=mesh_dp)
+            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, dp_size=2, mesh=mesh_dp)
 
             batch = SimpleNamespace(
                 forward_mode=ForwardMode.DECODE,
                 seq_lens=np.ones(B, dtype=np.int32),
                 recurrent_indices=rec_indices,
+                dp_size=2,
+                per_dp_bs_size=B // 2,
             )
             metadata = backend.get_forward_metadata(batch)
             backend.forward_metadata = metadata
@@ -515,7 +533,7 @@ class TestDPExtend:
                 num_heads=H,
             )
             rec_indices = np.arange(1, B + 1, dtype=np.int32)
-            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, mesh=mesh_dp)
+            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, dp_size=2, mesh=mesh_dp)
 
             batch = SimpleNamespace(
                 forward_mode=ForwardMode.EXTEND,
@@ -607,7 +625,7 @@ class TestDPEndToEnd:
 
             # Extend
             rec_indices = np.arange(1, B + 1, dtype=np.int32)
-            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, mesh=mesh_dp)
+            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, dp_size=2, mesh=mesh_dp)
 
             batch_ext = SimpleNamespace(
                 forward_mode=ForwardMode.EXTEND,
@@ -669,7 +687,7 @@ class TestDPEndToEnd:
         mesh_dp = create_device_mesh(ici_parallelism=[2, 2], dcn_parallelism=[1, 1])
         with jax.set_mesh(mesh_dp):
             rec_indices = np.arange(1, B + 1, dtype=np.int32)
-            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, mesh=mesh_dp)
+            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, dp_size=2, mesh=mesh_dp)
 
             # Extract state from pool
             extracted = _extract_state((pool.layer_caches[_LAYER_ID][0], []), rec_indices)
