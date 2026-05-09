@@ -12,7 +12,8 @@ import jax.numpy as jnp
 import numpy
 import numpy as np
 from flax import nnx
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
@@ -323,6 +324,10 @@ def build_tree_kernel_efficient(
         tuple of (tree_mask, positions, retrive_index, retrive_next_token,
                  retrive_next_sibling, draft_tokens)
     """
+    rep = NamedSharding(mesh, P())
+    verified_id, score_list, token_list, parents_list, seq_lens = jax.device_put(
+        (verified_id, score_list, token_list, parents_list, seq_lens), rep
+    )
     parent_list, top_scores_index, draft_tokens = build_tree_kernel_efficient_preprocess(
         verified_id,
         score_list,

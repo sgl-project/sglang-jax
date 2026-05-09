@@ -420,7 +420,9 @@ class EAGLEWorker(ModelWorker):
             retrive_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            model_worker_batch.spec_info.verified_id,
+            jax.device_put(
+                model_worker_batch.spec_info.verified_id, NamedSharding(self.mesh, P())
+            ),
             score_list,
             token_list,
             parents_list,
