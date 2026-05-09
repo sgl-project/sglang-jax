@@ -1,10 +1,3 @@
-"""HybridLinearAttnBackend — dispatches per-layer to a full-attention sub-backend
-(MLA / FlashAttention) or a linear-attention sub-backend (KDA).
-
-The class itself owns no memory pool and allocates no device buffers; it only
-holds two sub-backends + a `full_attn_layers` whitelist and routes calls.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -12,7 +5,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.sharding import NamedSharding
@@ -42,15 +34,20 @@ logger = logging.getLogger(__name__)
 class LinearRecurrentAttnBackendMetadata:
     cu_q_lens: jax.Array = None
     recurrent_indices: jax.Array = None
+    has_initial_state: jax.Array = None
 
     def tree_flatten(self):
-        children = (self.cu_q_lens, self.recurrent_indices)
+        children = (self.cu_q_lens, self.recurrent_indices, self.has_initial_state)
         aux_data = {}
         return children, aux_data
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        return cls(cu_q_lens=children[0], recurrent_indices=children[1])
+        return cls(
+            cu_q_lens=children[0],
+            recurrent_indices=children[1],
+            has_initial_state=children[2],
+        )
 
 
 @dataclass
@@ -75,16 +72,15 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         """Return the metadata for a forward pass."""
         metadata = LinearRecurrentAttnBackendMetadata()
 
-        # cu_q_lens
+        # cu_q_lens per DP rank section (each section starts from 0)
         if batch.forward_mode == ForwardMode.EXTEND:
-            cu_q_lens = np.concatenate(
-                [
-                    np.array([0], dtype=np.int32),
-                    np.cumsum(batch.extend_seq_lens, dtype=np.int32),
-                ]
-            )
+            ext_2d = batch.extend_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
+            cu_q_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)
+            cu_q_2d[:, 1:] = np.cumsum(ext_2d, axis=1)
+            cu_q_lens = cu_q_2d.ravel()
         elif batch.forward_mode == ForwardMode.DECODE:
-            cu_q_lens = np.arange(len(batch.seq_lens) + 1, dtype=np.int32)
+            single_cu = np.arange(batch.per_dp_bs_size + 1, dtype=np.int32)
+            cu_q_lens = np.tile(single_cu, batch.dp_size)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
@@ -92,9 +88,10 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         (
             metadata.cu_q_lens,
             metadata.recurrent_indices,
+            metadata.has_initial_state,
         ) = device_array(
-            (cu_q_lens, batch.recurrent_indices),
-            sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
+            (cu_q_lens, batch.recurrent_indices, batch.has_initial_state),
+            sharding=(NamedSharding(self.mesh, P("data"))),
         )
 
         return metadata
@@ -112,11 +109,7 @@ class LinearRecurrentAttnBackend(AttentionBackend):
 
     @staticmethod
     def get_layer_cache(recurrent_state_pool, layer_id: int):
-        """Returns (recurrent_cache, conv_cache) for the given layer.
-
-        Matches RecurrentStatePool.get_linear_recurrent_layer_cache (PR #966)
-        which returns a (recurrent, conv) tuple.
-        """
+        """Returns (recurrent_cache, conv_cache) for the given layer."""
         return recurrent_state_pool.get_linear_recurrent_layer_cache(layer_id)
 
     @staticmethod
@@ -237,70 +230,5 @@ def attn_backend_wrapper(
     runner: ModelRunner,
     full_attn_backend: AttentionBackend,
 ):
-    """Wrap full_attn_backend in HybridLinearAttnBackend for hybrid models.
-
-    Mirrors upstream `sglang/srt/layers/attention/attention_registry.py:attn_backend_wrapper`.
-    `runner.linear_recurrent_config` is the cheap "is this hybrid?" detector;
-    dispatch to a concrete sub-backend uses the specific config properties
-    (e.g. `runner.kimi_linear_config`).
-    """
-    cfg = runner.linear_recurrent_config
-    if cfg is None:
-        return full_attn_backend
-    if runner.kimi_linear_config is not None:
-        # KDAAttnBackend lives in a separate PR — lazy import keeps this PR
-        # self-contained.
-        try:
-            from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
-        except ImportError as e:
-            raise ImportError(
-                "HybridLinearAttnBackend needs KDAAttnBackend " "(delivered by a separate PR)."
-            ) from e
-
-        linear_attn_backend = KDAAttnBackend(runner.mesh)
-    else:
-        raise NotImplementedError(f"No linear backend wired for hybrid config {type(cfg).__name__}")
-    return HybridLinearAttnBackend(
-        full_attn_backend, linear_attn_backend, cfg.full_attention_layer_ids
-    )
-
-
-# --- Helpers ----------------------------------------------------------------
-
-
-class MockRecurrentStatePool:
-    def __init__(self, layer_caches: dict[int, tuple[jax.Array, jax.Array | None]] | None = None):
-        logger.warning(
-            "Using MockRecurrentStatePool; replace with HybridReqToTokenPool + "
-            "RecurrentStatePool when PR #966 lands"
-        )
-        self.layer_caches = {} if layer_caches is None else dict(layer_caches)
-
-    def get_linear_recurrent_indices(self, req_pool_indices: np.ndarray) -> np.ndarray:
-        """Identity mapping — slot i maps to recurrent index i."""
-        return np.asarray(req_pool_indices, dtype=np.int32)
-
-    def get_linear_recurrent_layer_cache(self, layer_id: int):
-        return self.layer_caches[layer_id]
-
-    def set_linear_recurrent_layer_cache(
-        self,
-        layer_id: int,
-        indices: jax.Array,
-        recurrent: jax.Array,
-        conv: jax.Array | None,
-    ) -> None:
-        if layer_id not in self.layer_caches:
-            self.layer_caches[layer_id] = (recurrent, conv)
-            return
-
-        recurrent_cache, conv_cache = self.layer_caches[layer_id]
-        recurrent_cache = recurrent_cache.at[indices].set(recurrent)
-        if conv is not None:
-            if conv_cache is None:
-                conv_cache = jnp.zeros(
-                    (recurrent_cache.shape[0],) + conv.shape[1:],
-                    dtype=conv.dtype,
-                )
-            conv_cache = conv_cache.at[indices].set(conv)
-        self.layer_caches[layer_id] = (recurrent_cache, conv_cache)
+    """Wrap full_attn_backend in HybridLinearAttnBackend for hybrid models."""
+    return full_attn_backend
