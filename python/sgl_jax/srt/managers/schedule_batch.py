@@ -2231,6 +2231,9 @@ class ScheduleBatch:
         out_cache_loc_cpu = self.out_cache_loc
         seq_lens_cpu = self.seq_lens
         real_bs = len(seq_lens_cpu)
+        # process_batch_result_decode slices next_token_ids by per_dp_bs_size;
+        # spec path doesn't pad so per_dp_bs_size == real_bs (dp=1 only).
+        self.per_dp_bs_size = real_bs
         req_pool_indices_cpu = self.req_pool_indices
         token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
         # FIXME @pc, move this to eagle_worker
