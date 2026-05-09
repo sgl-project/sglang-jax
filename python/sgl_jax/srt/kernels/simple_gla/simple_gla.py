@@ -36,8 +36,8 @@ def assert_shape_or_none(
 ):
     if x is None:
         return
-    if isinstance(x, (list, tuple)):
-        has_names = isinstance(name, (list, tuple)) and len(name) == len(x)
+    if isinstance(x, list | tuple):
+        has_names = isinstance(name, list | tuple) and len(name) == len(x)
         for i, tensor in enumerate(x):
             if tensor is not None:
                 curr_name = name[i] if has_names else f"{name}_{i}"
@@ -53,8 +53,8 @@ def assert_shape(
     expected_shape: list[int] | tuple[int, ...],
     name: str | list[str] | tuple[str, ...] = "tensor",
 ):
-    if isinstance(x, (list, tuple)):
-        has_names = isinstance(name, (list, tuple)) and len(name) == len(x)
+    if isinstance(x, list | tuple):
+        has_names = isinstance(name, list | tuple) and len(name) == len(x)
         for i, tensor in enumerate(x):
             curr_name = name[i] if has_names else f"{name}_{i}"
             assert (
