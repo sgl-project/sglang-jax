@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -149,8 +148,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         return output.reshape(output.shape[0], -1), (new_ssm_full, [])
 
     def get_state(self, recurrent_state_pool, layer_id, recurrent_indices):
-        """Gather recurrent states using shard_map.
-        """
+        """Gather recurrent states using shard_map."""
         recurrent_buffer, _ = self.get_layer_cache(recurrent_state_pool, layer_id)
         dp_size = self.mesh.shape["data"]
 
@@ -172,8 +170,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         )(recurrent_buffer, recurrent_indices)
 
     def set_ssm_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_recurrent):
-        """Scatter recurrent states using shard_map.
-        """
+        """Scatter recurrent states using shard_map."""
         recurrent_buffer, _ = self.get_layer_cache(recurrent_state_pool, layer_id)
         dp_size = self.mesh.shape["data"]
 
@@ -203,8 +200,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         ssm_states: jax.Array,
         slope: jnp.ndarray,
     ) -> tuple[jax.Array, jax.Array]:
-        """Decode forward using shard_map.
-        """
+        """Decode forward using shard_map."""
         if fused_recurrent_simple_gla is None:
             raise ImportError("simple_gla kernel is required for GLA decode")
 
@@ -232,7 +228,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
                 P("data", "tensor", None),  # q: always has "data" axis
                 P("data", "tensor", None),  # k
                 P("data", "tensor", None),  # v
-                P("tensor"),                 # slope: replicated
+                P("tensor"),  # slope: replicated
                 P("data", "tensor", None, None),  # ssm_states
             ),
             out_specs=(
@@ -252,8 +248,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         ssm_states: jax.Array,
         slope: jnp.ndarray,
     ) -> tuple[jax.Array, jax.Array]:
-        """Extend forward using shard_map.
-        """
+        """Extend forward using shard_map."""
         if simple_gla_fwd is None:
             raise ImportError("simple_gla kernel is required for GLA prefill")
 
@@ -286,9 +281,9 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
                 P("data", "tensor", None),  # q: always has "data" axis
                 P("data", "tensor", None),  # k
                 P("data", "tensor", None),  # v
-                P("tensor"),                 # slope: replicated
+                P("tensor"),  # slope: replicated
                 P("data", "tensor", None, None),  # ssm_states
-                cu_seqlens_spec,            # cu_seqlens: depends on dp_size
+                cu_seqlens_spec,  # cu_seqlens: depends on dp_size
             ),
             out_specs=(
                 P("data", "tensor", None),
