@@ -86,8 +86,7 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-        # Shard along "data" axis for DP, replicate for DP=1
-        sharding_spec = P("data") if batch.dp_size > 1 else P()
+        sharding_spec = P("data")
         (
             metadata.cu_q_lens,
             metadata.recurrent_indices,
