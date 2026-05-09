@@ -571,6 +571,8 @@ def _ragged_paged_attention_kernel_loop(
         cur_seq_mask_start = pl.multiple_of(cu_seq_mask_lens[seq_idx], 8)
         cur_bq_mask_start = cur_seq_mask_start + bq_idx * bq_sz * kv_len
 
+        zero_sz = pl.multiple_of(bkv_sz - load_kvmask_sz, 8)
+
         def loop_body(i, _):
             start = pl.multiple_of(cur_bq_mask_start + i * kv_len + mask_start, 8)
             _async_copy(
@@ -580,8 +582,8 @@ def _ragged_paged_attention_kernel_loop(
                 wait,
             )
             _async_copy(
-                zero_mask_ref.at[pl.ds(0, bkv_sz - load_kvmask_sz)],
-                kvmask_vmem_ref.at[i, pl.ds(load_kvmask_sz, bkv_sz - load_kvmask_sz)],
+                zero_mask_ref.at[pl.ds(0, zero_sz)],
+                kvmask_vmem_ref.at[i, pl.ds(load_kvmask_sz, zero_sz)],
                 sem,
                 wait,
             )
