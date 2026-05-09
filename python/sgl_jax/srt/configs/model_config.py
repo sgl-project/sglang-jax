@@ -147,6 +147,14 @@ class ModelConfig:
             "MiMoV2ForCausalLM",
         ):
             self.hf_config.architectures[0] = "MiMoV2FlashMTPForCausalLM"
+            if self.quantization_config is not None:
+                # Draft MTP head: eh_proj and o_proj are bf16 in the checkpoint
+                # (no weight_scale_inv); keep them as plain LinearBase so the
+                # weight_mappings can target `.weight` instead of `.weight_q`.
+                self.quantization_config.ignored_layers = [
+                    "model.eh_proj",
+                    "model.self_attn.o_proj",
+                ]
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
         self.is_multimodal = False

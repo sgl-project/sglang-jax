@@ -227,22 +227,26 @@ class MiMoV2FlashMTPForCausalLM(nnx.Module):
                 transpose=False,
             ),
         }
+        is_fp8 = getattr(self.config, "quantization_config", None) is not None
+        # q/k/v_proj + mlp are FP8 (have weight_scale_inv) → QuantizedLinear (weight_q/weight_scale).
+        # o_proj + eh_proj are bf16 → ignored_layers → plain LinearBase (weight).
         attn_projs = (
             ("q_proj", (None, "tensor"), False, True),
             ("k_proj", (None, "tensor"), True, True),
             ("v_proj", (None, "tensor"), True, True),
             ("o_proj", ("tensor", None), False, False),
         )
-        for name, axes, kv_pad, has_scale in attn_projs:
+        for name, axes, kv_pad, fp8 in attn_projs:
+            wsuf = "weight_q" if (is_fp8 and fp8) else "weight"
             m[f"{prefix}.self_attn.{name}.weight"] = WeightMapping(
-                target_path=f"model.self_attn.{name}.weight",
+                target_path=f"model.self_attn.{name}.{wsuf}",
                 sharding=axes,
                 transpose=True,
                 kv_head_padding=kv_pad,
             )
-            if has_scale:
+            if is_fp8 and fp8:
                 m[f"{prefix}.self_attn.{name}.weight_scale_inv"] = WeightMapping(
-                    target_path=f"model.self_attn.{name}.weight_scale_inv",
+                    target_path=f"model.self_attn.{name}.weight_scale",
                     sharding=axes,
                     transpose=True,
                     kv_head_padding=kv_pad,
@@ -252,16 +256,18 @@ class MiMoV2FlashMTPForCausalLM(nnx.Module):
             ("up_proj", (None, "tensor")),
             ("down_proj", ("tensor", None)),
         ):
+            wsuf = "weight_q" if is_fp8 else "weight"
             m[f"{prefix}.mlp.{name}.weight"] = WeightMapping(
-                target_path=f"model.mlp.{name}.weight",
+                target_path=f"model.mlp.{name}.{wsuf}",
                 sharding=axes,
                 transpose=True,
             )
-            m[f"{prefix}.mlp.{name}.weight_scale_inv"] = WeightMapping(
-                target_path=f"model.mlp.{name}.weight_scale_inv",
-                sharding=axes,
-                transpose=True,
-            )
+            if is_fp8:
+                m[f"{prefix}.mlp.{name}.weight_scale_inv"] = WeightMapping(
+                    target_path=f"model.mlp.{name}.weight_scale",
+                    sharding=axes,
+                    transpose=True,
+                )
         return m
 
     def get_embed_and_head(self):
