@@ -365,6 +365,42 @@ class ModelRunnerKVCacheMixin:
 
         return max_num_reqs
 
+    def _maybe_wrap_hybrid_kv_pool(
+        self: ModelRunner,
+        token_to_kv_pool_class: type,
+        **kvcache_kwargs,
+    ):
+        """Wrap KV pool with HybridLinearKVPool if has_recurrent_state.
+
+        Args:
+            token_to_kv_pool_class: The inner KV pool class (MHATokenToKVPool or MLATokenToKVPool)
+            **kvcache_kwargs: Additional kwargs for the inner pool (e.g., kv_lora_rank, head_num)
+
+        Returns:
+            HybridLinearKVPool if linear_recurrent_config is set, otherwise the inner pool directly.
+        """
+        if self.linear_recurrent_config is not None:
+            from sgl_jax.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+            return HybridLinearKVPool(
+                size=self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                full_attention_layer_ids=self.linear_recurrent_config.full_attention_layer_ids,
+                mesh=self.mesh,
+                token_to_kv_pool_class=token_to_kv_pool_class,
+                **kvcache_kwargs,
+            )
+
+        return token_to_kv_pool_class(
+            size=self.max_total_num_tokens,
+            page_size=self.page_size,
+            dtype=self.kv_cache_dtype,
+            layer_num=self._kv_pool_layer_count(),
+            mesh=self.mesh,
+            **kvcache_kwargs,
+        )
+
     def _init_pools(self: ModelRunner, max_num_reqs: int, dp_size: int):
         """Create ReqToTokenPool, KV pool, allocator, and MemoryPools."""
         from sgl_jax.srt.mem_cache.allocator import (
@@ -423,27 +459,20 @@ class ModelRunnerKVCacheMixin:
                     "model config; got "
                     f"kv_lora_rank={kv_lora_rank}, qk_rope_head_dim={qk_rope_head_dim}."
                 )
-            self.token_to_kv_pool = MLATokenToKVPool(
-                size=self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
+
+            self.token_to_kv_pool = self._maybe_wrap_hybrid_kv_pool(
+                MLATokenToKVPool,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
-                layer_num=self._kv_pool_layer_count(),
-                mesh=self.mesh,
                 dp_size=dp_size,
             )
         else:
-            self.token_to_kv_pool = MHATokenToKVPool(
-                size=self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
+            self.token_to_kv_pool = self._maybe_wrap_hybrid_kv_pool(
+                MHATokenToKVPool,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(
                     self.attention_tp_size
                 ),
                 head_dim=(self.model_config.head_dim + 127) // 128 * 128,
-                layer_num=self._kv_pool_layer_count(),
-                mesh=self.mesh,
                 dp_size=dp_size,
             )
 
