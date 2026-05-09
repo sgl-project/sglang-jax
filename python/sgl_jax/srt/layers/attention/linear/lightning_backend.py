@@ -245,6 +245,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             raise ImportError("simple_gla kernel is required for GLA prefill")
 
         cu_seqlens = self.forward_metadata.cu_q_lens
+        ssm_states = ssm_states.astype(jnp.float32)
         chunk_size = self.chunk_size
 
         def _prefill_fn(q_local, k_local, v_local, gamma, h0, cu_seqlens_p):

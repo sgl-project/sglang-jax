@@ -583,13 +583,21 @@ class ModelRunnerKVCacheMixin:
     # ── Properties ──
 
     @property
-    def linear_recurrent_config(self: ModelRunner):
-        """Return linear recurrent config if the model has linear attention, else None.
-
-        Currently returns None unconditionally — KimiLinearConfig detection
-        will be wired up when the modeling layer lands.
-        """
+    def kimi_linear_config(self: ModelRunner):
         return None
+
+    @property
+    def lightning_config(self: ModelRunner):
+        from sgl_jax.srt.configs.bailing_hybrid import get_bailing_hybrid_config
+
+        return get_bailing_hybrid_config(self.model_config.hf_config)
+
+    @property
+    def linear_recurrent_config(self: ModelRunner):
+        """Return linear recurrent config if the model has linear attention, else None."""
+        if self.kimi_linear_config is not None:
+            return self.kimi_linear_config
+        return self.lightning_config
 
     def _kv_pool_layer_count(self: ModelRunner):
         """Layer count for KV pool sizing.
