@@ -768,6 +768,18 @@ class ScheduleBatch:
             dp_size=dp_size,
         )
 
+    def __getattr__(self, name):
+        # Backward-compat shim: the speculative path (get_spec_model_worker_batch
+        # and eagle_util) still references pre-#939 flat attrs. Route them to
+        # reqs_info[0] until spec decode is properly DP-aware.
+        if (
+            "reqs_info" in self.__dict__
+            and self.reqs_info
+            and name in ScheduleReqsInfo.__dataclass_fields__
+        ):
+            return getattr(self.reqs_info[0], name)
+        raise AttributeError(f"{type(self).__name__!r} has no attribute {name!r}")
+
     @property
     def batch_is_full(self) -> bool:
         return all(info.batch_is_full for info in self.reqs_info)
