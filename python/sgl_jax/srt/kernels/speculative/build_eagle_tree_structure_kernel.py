@@ -8,6 +8,18 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
 
+def _get_any_memory_space():
+    memory_space = getattr(pltpu, "MemorySpace", None)
+    if hasattr(pltpu, "ANY"):
+        return pltpu.ANY
+    if memory_space is not None:
+        return getattr(memory_space, "ANY", memory_space.HBM)
+    return pltpu.HBM
+
+
+_ANY_MEMORY_SPACE = _get_any_memory_space()
+
+
 def _build_eagle_tree_structure_kernel(
     # Prefetch
     parents_ref,  # shape: (bs, topk * (depth-1) + 1)
@@ -344,14 +356,14 @@ def build_eagle_tree_structure_pallas_call(
 
     in_specs = [
         # all zero array
-        pl.BlockSpec(memory_space=pltpu.ANY),
+        pl.BlockSpec(memory_space=_ANY_MEMORY_SPACE),
         # all one array
-        pl.BlockSpec(memory_space=pltpu.ANY),
+        pl.BlockSpec(memory_space=_ANY_MEMORY_SPACE),
     ]
 
     out_specs = [
         # tree mask, shape: (draft_token_num, tree_mask_capacity, 128)
-        pl.BlockSpec(memory_space=pltpu.ANY),
+        pl.BlockSpec(memory_space=_ANY_MEMORY_SPACE),
         # positions, shape: (bs*draft_token_num,)
         pl.BlockSpec(memory_space=pltpu.SMEM),
         # retrive_index, shape: (bs, draft_token_num)
