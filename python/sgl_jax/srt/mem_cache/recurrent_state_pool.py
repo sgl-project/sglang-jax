@@ -29,6 +29,15 @@ class RecurrentStateDType:
     temporal: jnp.dtype
 
 
+@dataclass(frozen=True)
+class LinearRecurrentStateParams:
+    layers: list[int]
+    num_heads: int
+    head_dim: int
+    conv_kernel_size: int
+    dtype: RecurrentStateDType
+
+
 def recurrent_state_dtype() -> RecurrentStateDType:
     return RecurrentStateDType(
         conv=_resolve_dtype("SGLANG_JAX_CONV_STATE_DTYPE", jnp.bfloat16),

@@ -74,19 +74,37 @@ def _split_state_kv_budget(
     return state_max_reqs, kv_budget
 
 
-def _per_req_state_bytes_from_config(linear_attn_config: dict, tp_size: int) -> int:
-    """Per-request recurrent + conv state bytes for a hybrid recurrent model."""
-    from sgl_jax.srt.mem_cache.recurrent_state_pool import recurrent_state_dtype
+def _linear_state_params_from_config(cfg):
+    params = getattr(cfg, "linear_state_params", None)
+    if params is not None:
+        return params
 
-    state_dtype = linear_attn_config.get("dtype", recurrent_state_dtype())
-    return _compute_recurrent_per_req_bytes(
-        num_layers=len(linear_attn_config["kda_layers"]),
+    from sgl_jax.srt.mem_cache.recurrent_state_pool import (
+        LinearRecurrentStateParams,
+        recurrent_state_dtype,
+    )
+
+    linear_attn_config = cfg.linear_attn_config
+    return LinearRecurrentStateParams(
+        layers=cfg.linear_layer_ids,
         num_heads=linear_attn_config["num_heads"],
         head_dim=linear_attn_config["head_dim"],
         conv_kernel_size=linear_attn_config["short_conv_kernel_size"],
+        dtype=recurrent_state_dtype(),
+    )
+
+
+def _per_req_state_bytes_from_config(cfg, tp_size: int) -> int:
+    """Per-request recurrent + conv state bytes for a hybrid recurrent model."""
+    state_params = _linear_state_params_from_config(cfg)
+    return _compute_recurrent_per_req_bytes(
+        num_layers=len(state_params.layers),
+        num_heads=state_params.num_heads,
+        head_dim=state_params.head_dim,
+        conv_kernel_size=state_params.conv_kernel_size,
         tp_size=tp_size,
-        temporal_dtype_bytes=jnp.dtype(state_dtype.temporal).itemsize,
-        conv_dtype_bytes=jnp.dtype(state_dtype.conv).itemsize,
+        temporal_dtype_bytes=jnp.dtype(state_params.dtype.temporal).itemsize,
+        conv_dtype_bytes=jnp.dtype(state_params.dtype.conv).itemsize,
     )
 
 
@@ -130,20 +148,17 @@ def _build_hybrid_pools(
         state_size % dp_size == 0
     ), f"recurrent state_size ({state_size}) must be divisible by dp_size ({dp_size})."
 
-    from sgl_jax.srt.mem_cache.recurrent_state_pool import recurrent_state_dtype
-
-    linear_attn_config = cfg.linear_attn_config
-    state_dtype = linear_attn_config.get("dtype", recurrent_state_dtype())
+    state_params = _linear_state_params_from_config(cfg)
     rsp = RecurrentStatePool(
-        linear_recurrent_layer_ids=cfg.linear_layer_ids,
+        linear_recurrent_layer_ids=state_params.layers,
         size=state_size,
-        num_heads=linear_attn_config["num_heads"],
-        head_dim=linear_attn_config["head_dim"],
-        conv_kernel_size=linear_attn_config["short_conv_kernel_size"],
+        num_heads=state_params.num_heads,
+        head_dim=state_params.head_dim,
+        conv_kernel_size=state_params.conv_kernel_size,
         mesh=mesh,
         dp_size=dp_size,
-        temporal_dtype=state_dtype.temporal,
-        conv_dtype=state_dtype.conv,
+        temporal_dtype=state_params.dtype.temporal,
+        conv_dtype=state_params.dtype.conv,
     )
     hybrid_pool = HybridReqToTokenPool(
         size=max_num_reqs,
@@ -232,9 +247,7 @@ class ModelRunnerKVCacheMixin:
         cfg = self.linear_recurrent_config
         sa = self.server_args
         dp_size = self.dp_size
-        per_req_state = _per_req_state_bytes_from_config(
-            cfg.linear_attn_config, self.attention_tp_size
-        )
+        per_req_state = _per_req_state_bytes_from_config(cfg, self.attention_tp_size)
 
         if sa.max_recurrent_state_size is not None:
             assert sa.max_recurrent_state_size % dp_size == 0, (
