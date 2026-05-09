@@ -205,9 +205,12 @@ def _make_mock_pool(layer_id, recurrent_state, recurrent_indices=None):
 
 
 def _extract_state(pool_updates, recurrent_indices):
-    """Extract recurrent state from pool_updates tuple."""
+    """Extract recurrent state from pool_updates tuple with explicit output sharding."""
     new_ssm_full, conv_list = pool_updates
-    return new_ssm_full[jnp.array(recurrent_indices)]
+    indices = jnp.array(recurrent_indices)
+    return new_ssm_full.at[indices].get(
+        out_sharding=NamedSharding(mesh, P("data", "tensor", None, None))
+    )
 
 
 def _setup_backend_metadata(
