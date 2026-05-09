@@ -613,6 +613,13 @@ class EAGLEWorker(ModelWorker):
             forward_batch,
             logits_metadata=logits_meatadata,
         )
+        rep = NamedSharding(self.mesh, P())
+        draft_logits_output.next_token_logits = jax.device_put(
+            draft_logits_output.next_token_logits, rep
+        )
+        draft_logits_output.hidden_states = jax.device_put(
+            draft_logits_output.hidden_states, rep
+        )
         select_index = (
             np.arange(len(model_worker_batch.seq_lens[: model_worker_batch.real_bs]))
             * (self.speculative_num_steps + 1)
@@ -622,16 +629,13 @@ class EAGLEWorker(ModelWorker):
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[select_index]
         draft_logits_output.hidden_states = draft_logits_output.hidden_states[select_index]
         topk_p, topk_index = topk_probs_from_logits(
-            self._reshard_logits(draft_logits_output.next_token_logits), self.topk
+            draft_logits_output.next_token_logits, self.topk
         )
 
         # prepare for next draft decode
-        rep = NamedSharding(self.mesh, P())
-        batch_output.next_draft_input.hidden_states = jax.device_put(
-            draft_logits_output.hidden_states, rep
-        )
-        batch_output.next_draft_input.topk_p = jax.device_put(topk_p, rep)
-        batch_output.next_draft_input.topk_index = jax.device_put(topk_index, rep)
+        batch_output.next_draft_input.hidden_states = draft_logits_output.hidden_states
+        batch_output.next_draft_input.topk_p = topk_p
+        batch_output.next_draft_input.topk_index = topk_index
         batch_output.next_draft_input.verified_id = batch_output.next_draft_input.verified_id[
             select_index
         ]
