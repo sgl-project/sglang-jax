@@ -73,7 +73,7 @@ class LinearRecurrentAttnBackend(AttentionBackend):
     ) -> LinearRecurrentAttnBackendMetadata:
         """Return the metadata for a forward pass.
 
-        For DP > 1, cu_q_lens is a 1D array of length dp_size * (per_dp_bs_size+1),
+        cu_q_lens is a 1D array of length dp_size * (per_dp_bs_size+1),
         logically representing [dp_size, per_dp_bs_size+1] in row-major order.
         Each DP shard gets its slice via P("data") sharding in shard_map.
         """
@@ -91,8 +91,8 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-        # put array to devices
-        sharding_spec = P() if batch.dp_size == 1 else P("data")
+        # Shard along "data" axis for DP, replicate for DP=1
+        sharding_spec = P("data") if batch.dp_size > 1 else P()
         (
             metadata.cu_q_lens,
             metadata.recurrent_indices,

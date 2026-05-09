@@ -17,12 +17,6 @@ class RadixLightningAttention(nnx.Module):
     Used by BailingMoeV2.5 (Simple GLA) and other Lightning-style attention
     where decay is a per-head static constant (ALiBi slope), not a
     data-dependent gate like KDA's A_log/dt_bias.
-
-    Mirrors RadixLinearAttention's dispatch pattern (forward_batch.attn_backend
-    invoked with ``pool=`` keyword) but differs in interface: GLA takes split
-    q/k/v with no delta-rule a/b, so this class carries only layer
-    identification + head shape. Per-layer slope decay is owned by the backend
-    and indexed by ``layer_id``.
     """
 
     def __init__(
