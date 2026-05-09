@@ -7,12 +7,10 @@ holds two sub-backends + a `full_attn_layers` whitelist and routes calls.
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.sharding import NamedSharding
@@ -27,8 +25,6 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
-
-logger = logging.getLogger(__name__)
 
 
 # --- Linear (state-based) attention base classes ----------------------------
@@ -241,86 +237,5 @@ def attn_backend_wrapper(
     runner: ModelRunner,
     full_attn_backend: AttentionBackend,
 ):
-    """Wrap full_attn_backend in HybridLinearAttnBackend for hybrid models.
-
-    Mirrors upstream `sglang/srt/layers/attention/attention_registry.py:attn_backend_wrapper`.
-    `runner.linear_recurrent_config` is the cheap "is this hybrid?" detector;
-    dispatch to a concrete sub-backend uses the specific config properties
-    (e.g. `runner.kimi_linear_config`).
-    """
-    cfg = runner.linear_recurrent_config
-    if cfg is None:
-        return full_attn_backend
-    if runner.kimi_linear_config is not None:
-        # KDAAttnBackend lives in a separate PR — lazy import keeps this PR
-        # self-contained.
-        try:
-            from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
-        except ImportError as e:
-            raise ImportError(
-                "HybridLinearAttnBackend needs KDAAttnBackend " "(delivered by a separate PR)."
-            ) from e
-
-        linear_attn_backend = KDAAttnBackend(runner.mesh)
-    # TODO: Add runner.lightning_config property when BailingMoeV2.5 model
-    # skeleton is integrated. The config detection requires a dedicated HF
-    # config class for Ling-2.5; the implementation here mirrors the KDA
-    # branch above (per-layer slope is pre-computed in __init__).
-    elif getattr(runner, "lightning_config", None) is not None:
-        from sgl_jax.srt.layers.attention.linear.lightning_backend import (
-            LightningAttnBackend,
-        )
-
-        cfg_lightning = runner.lightning_config
-        linear_attn_backend = LightningAttnBackend(
-            mesh=runner.mesh,
-            linear_recurrent_layer_ids=cfg_lightning.linear_layer_ids,
-            num_hidden_layers=cfg_lightning.num_hidden_layers,
-            num_heads=cfg_lightning.num_attention_heads,
-        )
-    else:
-        raise NotImplementedError(f"No linear backend wired for hybrid config {type(cfg).__name__}")
-    return HybridLinearAttnBackend(
-        full_attn_backend, linear_attn_backend, cfg.full_attention_layer_ids
-    )
-
-
-# --- Helpers ----------------------------------------------------------------
-
-
-class MockRecurrentStatePool:
-    def __init__(self, layer_caches: dict[int, tuple[jax.Array, jax.Array | None]] | None = None):
-        logger.warning(
-            "Using MockRecurrentStatePool; replace with HybridReqToTokenPool + "
-            "RecurrentStatePool when PR #966 lands"
-        )
-        self.layer_caches = {} if layer_caches is None else dict(layer_caches)
-
-    def get_linear_recurrent_indices(self, req_pool_indices: np.ndarray) -> np.ndarray:
-        """Identity mapping — slot i maps to recurrent index i."""
-        return np.asarray(req_pool_indices, dtype=np.int32)
-
-    def get_linear_recurrent_layer_cache(self, layer_id: int):
-        return self.layer_caches[layer_id]
-
-    def set_linear_recurrent_layer_cache(
-        self,
-        layer_id: int,
-        indices: jax.Array,
-        recurrent: jax.Array,
-        conv: jax.Array | None,
-    ) -> None:
-        if layer_id not in self.layer_caches:
-            self.layer_caches[layer_id] = (recurrent, conv)
-            return
-
-        recurrent_cache, conv_cache = self.layer_caches[layer_id]
-        recurrent_cache = recurrent_cache.at[indices].set(recurrent)
-        if conv is not None:
-            if conv_cache is None:
-                conv_cache = jnp.zeros(
-                    (recurrent_cache.shape[0],) + conv.shape[1:],
-                    dtype=conv.dtype,
-                )
-            conv_cache = conv_cache.at[indices].set(conv)
-        self.layer_caches[layer_id] = (recurrent_cache, conv_cache)
+    """Return full_attn_backend until model-runner hybrid wiring is available."""
+    return full_attn_backend
