@@ -5,6 +5,7 @@ import numpy as np
 
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sgl_jax.srt.speculative import eagle_draft_worker, eagle_worker, spec_utils
 from sgl_jax.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
@@ -101,8 +102,72 @@ def test_eagle_draft_worker_init_does_not_require_capture_callback():
     assert "capture_for_decode" not in parameters
 
 
-def test_eagle_worker_constructs_draft_worker_without_capture_callback():
-    source = inspect.getsource(EAGLEWorker.__init__)
+def test_task5_spec_utils_exports_draft_decode_helpers():
+    for name in (
+        "topk_probs_from_logits",
+        "fast_topk",
+        "update_eagle_lists",
+        "update_forward_batch_info",
+        "select_top_k_tokens",
+        "select_top_k_tokens_step_0",
+        "select_top_k_tokens_step_greater_0",
+    ):
+        assert callable(getattr(spec_utils, name))
 
-    assert "self.capture_for_decode" not in source
-    assert "capture_for_decode" not in source
+
+def test_task5_draft_decode_methods_owned_by_draft_worker():
+    for name in ("draft", "draft_forward", "padding_for_decode", "get_padding_bs"):
+        assert callable(getattr(EagleDraftWorker, name))
+
+
+def test_task5_precompile_methods_owned_by_draft_worker_with_eagle_worker_wrappers():
+    for name in (
+        "run_spec_decode_precompile",
+        "precompile_spec_extend",
+        "precompile_spec_decode",
+    ):
+        assert callable(getattr(EagleDraftWorker, name))
+        assert callable(getattr(EAGLEWorker, name))
+        source = inspect.getsource(getattr(EAGLEWorker, name))
+        assert "return self.draft_worker" in source
+        assert "tqdm" not in source
+        assert "product" not in source
+        assert "generate_model_worker_batch" not in source
+
+
+def test_task5_eagle_worker_verify_explicitly_accepts_verify_input():
+    parameters = inspect.signature(EAGLEWorker.verify).parameters
+
+    assert "verify_input" in parameters
+
+
+def test_task5_eagle_worker_no_longer_owns_draft_decode_methods():
+    for name in (
+        "draft",
+        "draft_forward",
+        "padding_for_decode",
+        "get_padding_bs",
+        "copy_model_worker_batch_to_cpu",
+    ):
+        assert name not in EAGLEWorker.__dict__
+
+
+def test_task5_eagle_draft_worker_does_not_define_local_topk_helper():
+    source = inspect.getsource(eagle_draft_worker)
+
+    assert "def _topk_probs_from_logits" not in source
+
+
+def test_task5_eagle_worker_does_not_define_moved_helper_functions():
+    source = inspect.getsource(eagle_worker)
+
+    for function_definition in (
+        "def topk_probs_from_logits",
+        "def fast_topk",
+        "def update_eagle_lists",
+        "def update_forward_batch_info",
+        "def select_top_k_tokens",
+        "def select_top_k_tokens_step_0",
+        "def select_top_k_tokens_step_greater_0",
+    ):
+        assert function_definition not in source
