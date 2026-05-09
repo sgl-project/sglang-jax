@@ -2655,6 +2655,9 @@ def _compute_mrope_positions_for_batch(
 class ModelWorkerSamplingInfo:
     """Unified sampling information for a generation batch."""
 
+    def __len__(self) -> int:
+        return len(self.temperatures)
+
     # Basic batched sampling params
     temperatures: np.ndarray
     top_ps: np.ndarray
