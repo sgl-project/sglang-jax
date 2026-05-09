@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -63,13 +64,36 @@ def _make_slopes(H, layer_id=5, num_layers=80):
     return slope
 
 
-def _make_mock_pool(layer_id, recurrent_state, recurrent_indices=None):
+def _make_mock_pool(layer_id, recurrent_state, recurrent_indices=None, dp_size=1, mesh=None):
+    """Create a mock recurrent state pool with buffer size aligned to dp_size.
+
+    Args:
+        layer_id: Layer ID for the cache
+        recurrent_state: Initial state array [B, H, K, K]
+        recurrent_indices: Indices for each request (default: 1..B)
+        dp_size: Data parallelism size (buffer size will be multiple of dp_size)
+        mesh: JAX mesh for sharding the buffer (if None, buffer is replicated)
+    """
     B = recurrent_state.shape[0]
     if recurrent_indices is None:
         recurrent_indices = np.arange(1, B + 1, dtype=np.int32)
     N_plus_1 = int(max(recurrent_indices)) + 1
+    # Ensure buffer size is divisible by dp_size for DP tests
+    if dp_size > 1 and N_plus_1 % dp_size != 0:
+        N_plus_1 = ((N_plus_1 + dp_size - 1) // dp_size) * dp_size
+
     buf = jnp.zeros((N_plus_1,) + recurrent_state.shape[1:], dtype=recurrent_state.dtype)
     buf = buf.at[jnp.array(recurrent_indices)].set(recurrent_state)
+
+    # Apply sharding if mesh is provided
+    if mesh is not None:
+        if dp_size == 1:
+            # TP-only: shard along tensor dimension
+            buf = jax.device_put(buf, NamedSharding(mesh, P(None, "tensor", None, None)))
+        else:
+            # DP: shard along data dimension
+            buf = jax.device_put(buf, NamedSharding(mesh, P("data", "tensor", None, None)))
+
     return MockRecurrentStatePool(layer_caches={layer_id: (buf, [])}), recurrent_indices
 
 
@@ -173,7 +197,7 @@ class TestDPDecode:
                 num_heads=H,
             )
             rec_indices = np.arange(1, B + 1, dtype=np.int32)
-            pool_tp4, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices)
+            pool_tp4, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, mesh=mesh_tp4)
 
             batch_tp4 = SimpleNamespace(
                 forward_mode=ForwardMode.DECODE,
@@ -204,7 +228,7 @@ class TestDPDecode:
                 num_hidden_layers=80,
                 num_heads=H,
             )
-            pool_dp, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices)
+            pool_dp, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, dp_size=2, mesh=mesh_dp)
 
             batch_dp = SimpleNamespace(
                 forward_mode=ForwardMode.DECODE,
@@ -261,7 +285,7 @@ class TestDPDecode:
                 num_heads=H,
             )
             rec_indices = np.arange(1, B + 1, dtype=np.int32)
-            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices)
+            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, mesh=mesh_dp)
 
             batch = SimpleNamespace(
                 forward_mode=ForwardMode.DECODE,
@@ -329,7 +353,7 @@ class TestDPExtend:
                 num_heads=H,
             )
             rec_indices = np.arange(1, B + 1, dtype=np.int32)
-            pool_tp4, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices)
+            pool_tp4, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, mesh=mesh_tp4)
 
             batch_tp4 = SimpleNamespace(
                 forward_mode=ForwardMode.EXTEND,
@@ -365,7 +389,7 @@ class TestDPExtend:
                 num_hidden_layers=80,
                 num_heads=H,
             )
-            pool_dp, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices)
+            pool_dp, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, dp_size=2, mesh=mesh_dp)
 
             batch_dp = SimpleNamespace(
                 forward_mode=ForwardMode.EXTEND,
@@ -491,7 +515,7 @@ class TestDPExtend:
                 num_heads=H,
             )
             rec_indices = np.arange(1, B + 1, dtype=np.int32)
-            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices)
+            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, mesh=mesh_dp)
 
             batch = SimpleNamespace(
                 forward_mode=ForwardMode.EXTEND,
@@ -583,7 +607,7 @@ class TestDPEndToEnd:
 
             # Extend
             rec_indices = np.arange(1, B + 1, dtype=np.int32)
-            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices)
+            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, mesh=mesh_dp)
 
             batch_ext = SimpleNamespace(
                 forward_mode=ForwardMode.EXTEND,
@@ -645,7 +669,7 @@ class TestDPEndToEnd:
         mesh_dp = create_device_mesh(ici_parallelism=[2, 2], dcn_parallelism=[1, 1])
         with jax.set_mesh(mesh_dp):
             rec_indices = np.arange(1, B + 1, dtype=np.int32)
-            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices)
+            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, mesh=mesh_dp)
 
             # Extract state from pool
             extracted = _extract_state((pool.layer_caches[_LAYER_ID][0], []), rec_indices)
