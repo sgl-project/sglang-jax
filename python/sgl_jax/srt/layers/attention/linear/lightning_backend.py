@@ -1,4 +1,4 @@
-"""LightningAttnBackend — GLA (Gated Linear Attention) backend for BailingMoeV2.5.
+"""LightningAttnBackend — GLA (Gated Linear Attention) backend.
 
 Extends LinearRecurrentAttnBackend to provide:
 - Chunked prefill via simple_gla_fwd (Pallas kernel, varlen — kernel pads each
@@ -217,10 +217,10 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             _decode_fn,
             mesh=self.mesh,
             in_specs=(
-                P("data", "tensor", None),  # q: always has "data" axis
+                P("data", "tensor", None),  # q
                 P("data", "tensor", None),  # k
                 P("data", "tensor", None),  # v
-                P("tensor"),  # slope: replicated
+                P("tensor"),  # slope
                 P("data", "tensor", None, None),  # ssm_states
             ),
             out_specs=(
@@ -245,7 +245,6 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             raise ImportError("simple_gla kernel is required for GLA prefill")
 
         cu_seqlens = self.forward_metadata.cu_q_lens
-        ssm_states = ssm_states.astype(jnp.float32)
         chunk_size = self.chunk_size
 
         def _prefill_fn(q_local, k_local, v_local, gamma, h0, cu_seqlens_p):
