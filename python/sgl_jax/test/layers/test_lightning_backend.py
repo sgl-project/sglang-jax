@@ -16,7 +16,7 @@ Tolerance convention — aligned with GPU sglang FLA CI:
 
 Total: 22 tests (1 slope + 11 prefill + 10 decode)
 
-Run with: pytest python/sgl_jax/test/test_lightning_backend.py -v
+Run with: pytest python/sgl_jax/test/layers/test_lightning_backend.py -v
 """
 
 from types import SimpleNamespace
