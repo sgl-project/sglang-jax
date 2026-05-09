@@ -1,8 +1,12 @@
 import jax.numpy as jnp
 import numpy as np
 
+from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sgl_jax.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
+from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker
 from sgl_jax.srt.speculative.spec_info import SpecInput, SpecInputType
 
 
@@ -43,3 +47,41 @@ def test_eagle_verify_input_is_spec_input():
     assert not verify_input.is_draft_input()
     assert verify_input.is_verify_input()
     assert verify_input.get_spec_adjust_token_coefficient() == (4, 4)
+
+
+def test_eagle_draft_worker_implements_base_contract():
+    assert issubclass(EagleDraftWorker, BaseDraftWorker)
+    assert EagleDraftWorker.__mro__.index(ModelWorker) < EagleDraftWorker.__mro__.index(
+        BaseDraftWorker
+    )
+    for name in ("draft", "draft_extend_for_prefill", "draft_extend_for_decode"):
+        assert callable(getattr(EagleDraftWorker, name))
+
+
+def test_eagle_worker_implements_base_contract():
+    assert issubclass(EAGLEWorker, BaseSpecWorker)
+    for name in (
+        "target_worker",
+        "draft_worker",
+        "forward_batch_speculative_generation",
+        "verify",
+    ):
+        assert hasattr(EAGLEWorker, name)
+
+
+def test_eagle_draft_worker_generate_model_worker_batch_delegates_to_compilation_manager():
+    class FakeCompilationManager:
+        def __init__(self):
+            self.calls = []
+
+        def generate_model_worker_batch(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return "batch"
+
+    worker = EagleDraftWorker.__new__(EagleDraftWorker)
+    worker.compilation_manager = FakeCompilationManager()
+
+    result = worker.generate_model_worker_batch(1, "arg", mode="decode")
+
+    assert result == "batch"
+    assert worker.compilation_manager.calls == [((1, "arg"), {"mode": "decode"})]

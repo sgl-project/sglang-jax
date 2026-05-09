@@ -21,6 +21,8 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
+from sgl_jax.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
+from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
 from sgl_jax.srt.speculative.eagle_util import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -36,75 +38,60 @@ logger = logging.getLogger(__name__)
 RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 
-class EAGLEWorker(ModelWorker):
+class EAGLEWorker(BaseSpecWorker):
     def __init__(self, server_args, target_worker: ModelWorker):
         self.server_args = server_args
-        self.target_worker = target_worker
+        self._target_worker = target_worker
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
-        self.topk = server_args.speculative_eagle_topk
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
         self.req_to_token_pool, self.token_to_kv_pool_allocator = target_worker.get_memory_pool()
-        self.hot_token_ids = None
+        self._draft_worker = EagleDraftWorker(server_args, target_worker)
+        self.precompile_bs_paddings = self._draft_worker.precompile_bs_paddings
+        self.precompile_cache_loc_paddings = self._draft_worker.precompile_cache_loc_paddings
+        self.precompile_token_paddings = self._draft_worker.precompile_token_paddings
 
-        # Initialize dummy tensors for EAGLE operations
-        self.num_new_pages_per_topk = None
-        self.extend_lens = None
+    @property
+    def target_worker(self) -> ModelWorker:
+        return self._target_worker
 
-        # this must be put at last to make sure model state is correct
-        super().__init__(
-            server_args,
-            target_worker.mesh,
-            req_to_token_pool=self.req_to_token_pool,
-            is_draft_worker=True,
-        )
-        EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
-            self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
-        )
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+    @property
+    def draft_worker(self) -> BaseDraftWorker:
+        return self._draft_worker
 
-        if self.speculative_algorithm.is_eagle3():
-            # most cases EAGLE3 models don't share lm_head
-            # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
-            if (
-                hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
-                and self.draft_model_runner.model.load_lm_head_from_target
-            ):
-                self.draft_model_runner.model.set_embed_and_head(embed, head)
-            else:
-                self.draft_model_runner.model.set_embed(embed)
+    @property
+    def mesh(self):
+        return self.target_worker.mesh
 
-            # grab hot token ids
-            if self.draft_model_runner.model.hot_token_ids is not None:
-                self.hot_token_ids = device_array(
-                    self.draft_model_runner.model.hot_token_ids,
-                    sharding=(NamedSharding(self.model_runner.mesh, P())),
-                )
-        else:
-            if self.hot_token_ids is not None:
-                head = head.clone()
-                self.hot_token_ids = device_array(
-                    self.draft_model_runner.model.hot_token_ids,
-                    sharding=(NamedSharding(self.model_runner.mesh, P())),
-                )
-                head.data = head.data[self.hot_token_ids]
+    @property
+    def model_config(self):
+        return self.target_worker.model_config
 
-            # Share the embedding and lm_head
-            self.draft_model_runner.model.set_embed_and_head(embed, head)
+    @property
+    def draft_model_runner(self):
+        return self.draft_worker.get_model_runner()
 
-        self.model_runner.initialize_jit()
-        (
-            precompile_token_paddings,
-            precompile_bs_paddings,
-            precompile_cache_loc_paddings,
-        ) = self.target_worker.get_precompile_paddings()
-        self.precompile_bs_paddings = precompile_bs_paddings
-        self.precompile_cache_loc_paddings = precompile_cache_loc_paddings
-        self.precompile_token_paddings = precompile_token_paddings
+    @property
+    def model_runner(self):
+        return self.draft_model_runner
+
+    @property
+    def hot_token_ids(self):
+        return self.draft_worker.hot_token_ids
+
+    @property
+    def max_req_len(self):
+        return self.draft_worker.max_req_len
+
+    def generate_model_worker_batch(self, *args, **kwargs):
+        return self.draft_worker.generate_model_worker_batch(*args, **kwargs)
+
+    def get_max_padded_size(self, *args, **kwargs):
+        return self.draft_worker.get_max_padded_size(*args, **kwargs)
 
     def forward_batch_speculative_generation(
         self,
@@ -258,10 +245,6 @@ class EAGLEWorker(ModelWorker):
             if model_worker_batch.extend_seq_lens is not None
             else None
         )
-
-    @property
-    def draft_model_runner(self):
-        return self.get_model_runner()
 
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
