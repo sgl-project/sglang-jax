@@ -65,55 +65,109 @@ def _make_slopes(H, layer_id=5, num_layers=80):
 
 
 def _make_mock_pool(layer_id, recurrent_state, recurrent_indices=None, dp_size=1, mesh=None):
-    """Create a mock recurrent state pool with buffer size aligned to dp_size.
+    """Create a mock recurrent state pool with DP-local buffers.
 
     Args:
         layer_id: Layer ID for the cache
         recurrent_state: Initial state array [B, H, K, K]
-        recurrent_indices: Indices for each request (default: 1..B)
-        dp_size: Data parallelism size (buffer size will be multiple of dp_size)
-        mesh: JAX mesh for sharding the buffer (if None, buffer is replicated)
+        recurrent_indices: LOCAL indices for each request (default: 1..B_per_rank)
+        dp_size: Data parallelism size
+        mesh: JAX mesh for sharding the buffer
+
+    Returns:
+        (MockRecurrentStatePool, recurrent_indices)
+
+    Note:
+        Mimics production RecurrentStatePool behavior:
+        - Buffer always has P("data", "tensor", None, None) sharding
+        - For DP: each rank has local buffer with local indices [1, slots_per_rank]
+        - For TP-only: "data" axis has size 1, indices are [1, 2, ..., B]
     """
     B = recurrent_state.shape[0]
     if recurrent_indices is None:
-        recurrent_indices = np.arange(1, B + 1, dtype=np.int32)
-    N_plus_1 = int(max(recurrent_indices)) + 1
-    # Ensure buffer size is divisible by dp_size for DP tests
-    if dp_size > 1 and N_plus_1 % dp_size != 0:
-        N_plus_1 = ((N_plus_1 + dp_size - 1) // dp_size) * dp_size
+        # Default: local indices [1, 2, ..., B_per_rank] for each rank
+        B_per_rank = B // dp_size if dp_size > 1 else B
+        recurrent_indices = np.arange(1, B_per_rank + 1, dtype=np.int32)
 
-    buf = jnp.zeros((N_plus_1,) + recurrent_state.shape[1:], dtype=recurrent_state.dtype)
-    buf = buf.at[jnp.array(recurrent_indices)].set(recurrent_state)
+    # For DP, each rank gets a local buffer of size (slots_per_rank + 1)
+    if dp_size > 1:
+        B_per_rank = B // dp_size
+        # Create DP-local buffer: each rank has (B_per_rank + 1) slots
+        local_buf_size = B_per_rank + 1
+        # Stack local buffers for all ranks
+        buf_shape = (dp_size * local_buf_size,) + recurrent_state.shape[1:]
+        buf = jnp.zeros(buf_shape, dtype=recurrent_state.dtype)
 
-    # Apply sharding if mesh is provided
-    if mesh is not None:
-        if dp_size == 1:
-            # TP-only: shard along tensor dimension
-            buf = jax.device_put(buf, NamedSharding(mesh, P(None, "tensor", None, None)))
-        else:
-            # DP: shard along data dimension
-            buf = jax.device_put(buf, NamedSharding(mesh, P("data", "tensor", None, None)))
+        # Fill each rank's local buffer with its portion of recurrent_state
+        for rank in range(dp_size):
+            rank_start = rank * B_per_rank
+            rank_end = rank_start + B_per_rank
+            rank_state = recurrent_state[rank_start:rank_end]
+
+            # Place in local buffer at indices [1, 2, ..., B_per_rank]
+            local_buf_start = rank * local_buf_size
+            for i, idx in enumerate(recurrent_indices):
+                buf = buf.at[local_buf_start + idx].set(rank_state[i])
+    else:
+        # TP-only: single buffer with "data" axis size 1
+        # Buffer size: (B + 1) to match production (slot 0 is dummy)
+        N_plus_1 = int(max(recurrent_indices)) + 1
+        buf = jnp.zeros((N_plus_1,) + recurrent_state.shape[1:], dtype=recurrent_state.dtype)
+        buf = buf.at[jnp.array(recurrent_indices)].set(recurrent_state)
+
+    # Always use P("data", "tensor", None, None) to match production
+    buf = jax.device_put(buf, NamedSharding(mesh, P("data", "tensor", None, None)))
 
     return MockRecurrentStatePool(layer_caches={layer_id: (buf, [])}), recurrent_indices
 
 
-def _extract_state(pool_updates, recurrent_indices):
-    """Extract recurrent state from pool updates with explicit output sharding.
+def _extract_state(pool_updates, recurrent_indices, dp_size=1):
+    """Extract recurrent state from pool updates.
 
-    Infers the mesh from the pool buffer's existing sharding.
+    For DP-local buffers, extracts from each rank's local buffer using local indices.
+
+    Args:
+        pool_updates: (new_ssm_full, conv_list) tuple from backend
+        recurrent_indices: LOCAL indices used for each rank
+        dp_size: Data parallelism size
+
+    Returns:
+        Extracted states with shape [B, H, K, K] where B is total batch size
     """
     new_ssm_full, conv_list = pool_updates
-    indices = jnp.array(recurrent_indices)
-    # Infer mesh from the buffer's sharding
     buffer_sharding = new_ssm_full.sharding
-    if isinstance(buffer_sharding, NamedSharding):
-        mesh = buffer_sharding.mesh
+
+    if not isinstance(buffer_sharding, NamedSharding):
+        # Fallback for non-NamedSharding
+        indices = jnp.array(recurrent_indices)
+        return new_ssm_full[indices]
+
+    mesh = buffer_sharding.mesh
+
+    if dp_size == 1:
+        # TP-only: direct indexing with local indices
+        indices = jnp.array(recurrent_indices)
         return new_ssm_full.at[indices].get(
             out_sharding=NamedSharding(mesh, P("data", "tensor", None, None))
         )
     else:
-        # Fallback for non-NamedSharding (shouldn't happen in these tests)
-        return new_ssm_full[indices]
+        # DP: use shard_map to extract from each rank's local buffer
+        indices = jnp.array(recurrent_indices)
+
+        def _gather_local(buf, idx):
+            # Each rank extracts from its local buffer using local indices
+            return buf[idx]
+
+        return jax.shard_map(
+            _gather_local,
+            mesh=mesh,
+            in_specs=(
+                P("data", "tensor", None, None),  # buffer
+                P(),  # indices are replicated (same local indices on each rank)
+            ),
+            out_specs=P("data", "tensor", None, None),
+            check_vma=False,
+        )(new_ssm_full, indices)
 
 
 def _make_fake_layer(layer_id=_LAYER_ID, H=_H):
@@ -141,13 +195,13 @@ class TestDPMetadata:
                 num_heads=_H,
             )
 
-            # Simulate DP=2: each shard has 2 requests
-            # DP shard 0: req 0,1 with seq_lens [10, 20]
-            # DP shard 1: req 2,3 with seq_lens [15, 25]
+            # Simulate DP=2: each shard has 2 requests with LOCAL indices [1, 2]
+            # DP shard 0: req 0,1 with seq_lens [10, 20], local indices [1, 2]
+            # DP shard 1: req 2,3 with seq_lens [15, 25], local indices [1, 2]
             batch = SimpleNamespace(
                 forward_mode=ForwardMode.DECODE,
                 seq_lens=np.array([10, 20, 15, 25], dtype=np.int32),
-                recurrent_indices=np.array([1, 2, 3, 4], dtype=np.int32),
+                recurrent_indices=np.array([1, 2, 1, 2], dtype=np.int32),  # LOCAL indices per rank
                 dp_size=2,
                 per_dp_bs_size=2,
             )
@@ -244,12 +298,16 @@ class TestDPDecode:
                 num_hidden_layers=80,
                 num_heads=H,
             )
-            pool_dp, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, dp_size=2, mesh=mesh_dp)
+            # For DP: use LOCAL indices [1, 2] per rank
+            local_indices = np.arange(1, B // 2 + 1, dtype=np.int32)
+            pool_dp, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), local_indices, dp_size=2, mesh=mesh_dp)
 
+            # batch.recurrent_indices: repeated local indices [1, 2, 1, 2]
+            batch_rec_indices = np.tile(local_indices, 2)
             batch_dp = SimpleNamespace(
                 forward_mode=ForwardMode.DECODE,
                 seq_lens=np.ones(B, dtype=np.int32),
-                recurrent_indices=rec_indices,
+                recurrent_indices=batch_rec_indices,
                 dp_size=2,
                 per_dp_bs_size=B // 2,
             )
@@ -263,7 +321,7 @@ class TestDPDecode:
             out_dp, pu_dp = backend_dp(
                 q_dp, k_dp, v_dp, layer=layer, forward_batch=fb, recurrent_state_pool=pool_dp
             )
-            state_dp = _extract_state(pu_dp, rec_indices)
+            state_dp = _extract_state(pu_dp, local_indices, dp_size=2)
 
         np.testing.assert_allclose(
             np.array(out_dp),
@@ -407,14 +465,18 @@ class TestDPExtend:
                 num_hidden_layers=80,
                 num_heads=H,
             )
-            pool_dp, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, dp_size=2, mesh=mesh_dp)
+            # For DP: use LOCAL indices [1] per rank (each rank has 1 request)
+            local_indices = np.arange(1, B // 2 + 1, dtype=np.int32)
+            pool_dp, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), local_indices, dp_size=2, mesh=mesh_dp)
 
+            # batch.recurrent_indices: repeated local indices [1, 1]
+            batch_rec_indices = np.tile(local_indices, 2)
             batch_dp = SimpleNamespace(
                 forward_mode=ForwardMode.EXTEND,
                 extend_seq_lens=np.array(seq_lens, dtype=np.int32),
                 seq_lens=np.array(seq_lens, dtype=np.int32),
                 input_ids=np.zeros(total_tokens, dtype=np.int32),
-                recurrent_indices=rec_indices,
+                recurrent_indices=batch_rec_indices,
                 dp_size=2,
                 per_dp_bs_size=B // 2,
             )
@@ -469,7 +531,7 @@ class TestDPExtend:
                 forward_batch=fb,
                 recurrent_state_pool=pool_dp,
             )
-            state_dp = _extract_state(pu_dp, rec_indices)
+            state_dp = _extract_state(pu_dp, local_indices, dp_size=2)
 
             # 提取有效的 tokens（去除 padding）
             # 先转换为 numpy array，再切片
@@ -624,15 +686,16 @@ class TestDPEndToEnd:
             )
 
             # Extend
-            rec_indices = np.arange(1, B + 1, dtype=np.int32)
-            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, dp_size=2, mesh=mesh_dp)
+            local_indices = np.arange(1, B // 2 + 1, dtype=np.int32)
+            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), local_indices, dp_size=2, mesh=mesh_dp)
 
+            batch_rec_indices = np.tile(local_indices, 2)
             batch_ext = SimpleNamespace(
                 forward_mode=ForwardMode.EXTEND,
                 extend_seq_lens=np.array(seq_lens, dtype=np.int32),
                 seq_lens=np.array(seq_lens, dtype=np.int32),
                 input_ids=np.zeros(total_tokens, dtype=np.int32),
-                recurrent_indices=rec_indices,
+                recurrent_indices=batch_rec_indices,
                 dp_size=2,
                 per_dp_bs_size=B // 2,
             )
@@ -650,10 +713,12 @@ class TestDPEndToEnd:
                 forward_batch=fb_ext,
                 recurrent_state_pool=pool,
             )
-            state_after_ext = _extract_state(pu_ext, rec_indices)
+            state_after_ext = _extract_state(pu_ext, local_indices, dp_size=2)
 
             # Decode - test first request only
-            h_jax = jnp.array(state_after_ext[0:1])
+            # Convert to numpy first to avoid sharding issues with slicing
+            state_after_ext_np = np.array(state_after_ext)
+            h_jax = jnp.array(state_after_ext_np[0:1])
             for step in range(decode_steps):
                 q_d = rng.standard_normal((1, 1, H, K)).astype(np.float32) * 0.1
                 k_d = rng.standard_normal((1, 1, H, K)).astype(np.float32) * 0.1
@@ -686,11 +751,11 @@ class TestDPEndToEnd:
 
         mesh_dp = create_device_mesh(ici_parallelism=[2, 2], dcn_parallelism=[1, 1])
         with jax.set_mesh(mesh_dp):
-            rec_indices = np.arange(1, B + 1, dtype=np.int32)
-            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, dp_size=2, mesh=mesh_dp)
+            local_indices = np.arange(1, B // 2 + 1, dtype=np.int32)
+            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), local_indices, dp_size=2, mesh=mesh_dp)
 
             # Extract state from pool
-            extracted = _extract_state((pool.layer_caches[_LAYER_ID][0], []), rec_indices)
+            extracted = _extract_state((pool.layer_caches[_LAYER_ID][0], []), local_indices, dp_size=2)
 
         np.testing.assert_allclose(
             np.array(extracted),
