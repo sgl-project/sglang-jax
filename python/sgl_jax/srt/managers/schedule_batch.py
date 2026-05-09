@@ -780,6 +780,19 @@ class ScheduleBatch:
             return getattr(self.reqs_info[0], name)
         raise AttributeError(f"{type(self).__name__!r} has no attribute {name!r}")
 
+    def __setattr__(self, name, value):
+        # Mirror of __getattr__: spec path writes (scheduler L1817-1821,
+        # eagle_util prepare_for_decode) must land in reqs_info[0] so the
+        # DP-aware reads in prepare_for_decode etc. see them.
+        if (
+            name in ScheduleReqsInfo.__dataclass_fields__
+            and "reqs_info" in self.__dict__
+            and self.__dict__["reqs_info"]
+        ):
+            setattr(self.__dict__["reqs_info"][0], name, value)
+        else:
+            super().__setattr__(name, value)
+
     @property
     def batch_is_full(self) -> bool:
         return all(info.batch_is_full for info in self.reqs_info)
