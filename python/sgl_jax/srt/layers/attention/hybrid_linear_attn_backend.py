@@ -1,14 +1,7 @@
-"""HybridLinearAttnBackend — dispatches per-layer to a full-attention sub-backend
-(MLA / FlashAttention) or a linear-attention sub-backend (KDA).
-
-The class itself owns no memory pool and allocates no device buffers; it only
-holds two sub-backends + a `full_attn_layers` whitelist and routes calls.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import jax
 import numpy as np
@@ -17,7 +10,10 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
-from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
+from sgl_jax.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    AttentionBackendMetadata,
+)
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -137,7 +133,7 @@ class HybridLinearAttnBackendMetadata:
     fields and assigns them to the corresponding sub-backend's forward_metadata.
     """
 
-    full_attn_metadata: Any = field(default=None)
+    full_attn_metadata: AttentionBackendMetadata = field(default=None)
     linear_attn_metadata: LinearRecurrentAttnBackendMetadata = field(default=None)
 
     def tree_flatten(self):
@@ -237,5 +233,5 @@ def attn_backend_wrapper(
     runner: ModelRunner,
     full_attn_backend: AttentionBackend,
 ):
-    """Return full_attn_backend until model-runner hybrid wiring is available."""
+    """Wrap full_attn_backend in HybridLinearAttnBackend for hybrid models."""
     return full_attn_backend
