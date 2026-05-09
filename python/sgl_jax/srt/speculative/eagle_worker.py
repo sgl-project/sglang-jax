@@ -265,19 +265,22 @@ class EAGLEWorker(ModelWorker):
 
     def _reshard_logits(self, logits: jax.Array) -> jax.Array:
         # logits_processor outputs vocab-sharded P("data","tensor"); top_k can't
-        # produce a (bs, k) result with k % tp != 0 under that spec. All-gather
-        # vocab first (mirrors Sampler.__call__ at sampler.py:34).
-        return jax.device_put(logits, NamedSharding(self.mesh, P("data", None)))
+        # produce a (bs, k) result with k % tp != 0 under that spec. Fully
+        # replicate so the downstream eagle host-side orchestration
+        # (select_top_k_tokens / update_eagle_lists / build_tree) never hits
+        # explicit-sharding scatter ambiguities.
+        return jax.device_put(logits, NamedSharding(self.mesh, P()))
 
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
+        rep = NamedSharding(self.mesh, P())
         topk_p, topk_index = topk_probs_from_logits(
             self._reshard_logits(logits_output.next_token_logits), self.topk
         )
-        draft_input.topk_p = topk_p
-        draft_input.topk_index = topk_index
-        draft_input.hidden_states = logits_output.hidden_states
+        draft_input.topk_p = jax.device_put(topk_p, rep)
+        draft_input.topk_index = jax.device_put(topk_index, rep)
+        draft_input.hidden_states = jax.device_put(logits_output.hidden_states, rep)
 
     def get_padding_bs(self, real_bs: int) -> int:
         self.precompile_bs_paddings.sort()
@@ -618,9 +621,12 @@ class EAGLEWorker(ModelWorker):
         )
 
         # prepare for next draft decode
-        batch_output.next_draft_input.hidden_states = draft_logits_output.hidden_states
-        batch_output.next_draft_input.topk_p = topk_p
-        batch_output.next_draft_input.topk_index = topk_index
+        rep = NamedSharding(self.mesh, P())
+        batch_output.next_draft_input.hidden_states = jax.device_put(
+            draft_logits_output.hidden_states, rep
+        )
+        batch_output.next_draft_input.topk_p = jax.device_put(topk_p, rep)
+        batch_output.next_draft_input.topk_index = jax.device_put(topk_index, rep)
         batch_output.next_draft_input.verified_id = batch_output.next_draft_input.verified_id[
             select_index
         ]
@@ -690,7 +696,9 @@ class EAGLEWorker(ModelWorker):
 
             if self.hot_token_ids is not None:
                 topk_index = self.hot_token_ids[topk_index]
-            hidden_states = logits_output.hidden_states
+            hidden_states = jax.device_put(
+                logits_output.hidden_states, NamedSharding(self.mesh, P())
+            )
 
         return score_list, token_list, parents_list
 
