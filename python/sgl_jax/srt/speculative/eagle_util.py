@@ -502,6 +502,9 @@ class EagleDraftInput:
         model_worker_batch.positions = model_worker_batch.positions
         model_worker_batch.extend_seq_lens = np.full((bs,), step_plus_1, dtype=np.int32)
         model_worker_batch.extend_seq_lens[model_worker_batch.real_bs :] = 0
+        model_worker_batch.logits_indices = (
+            np.cumsum(model_worker_batch.extend_seq_lens, dtype=np.int32) - 1
+        )
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
