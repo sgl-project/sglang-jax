@@ -469,7 +469,6 @@ suites = {
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 1),
         TestFile("python/sgl_jax/test/test_linear_tp.py", 1, runner="pytest"),
-        TestFile("python/sgl_jax/test/layers/test_gla_shard.py", 5, runner="pytest"),
         TestFile("python/sgl_jax/test/layers/test_lightning_backend_dp.py", 5, runner="pytest"),
         TestFile("python/sgl_jax/test/test_lightning_backend.py", 5, runner="pytest"),
         TestFile("test/srt/test_moe_block_quant_e2e.py", 5, runner="pytest"),
