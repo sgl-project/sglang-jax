@@ -1,3 +1,5 @@
+import inspect
+
 import jax.numpy as jnp
 import numpy as np
 
@@ -85,3 +87,22 @@ def test_eagle_draft_worker_generate_model_worker_batch_delegates_to_compilation
 
     assert result == "batch"
     assert worker.compilation_manager.calls == [((1, "arg"), {"mode": "decode"})]
+
+
+def test_eagle_worker_does_not_own_draft_prefill_method():
+    assert hasattr(EagleDraftWorker, "draft_extend_for_prefill")
+    assert hasattr(EagleDraftWorker, "capture_for_decode")
+    assert not hasattr(EAGLEWorker, "forward_draft_extend")
+
+
+def test_eagle_draft_worker_init_does_not_require_capture_callback():
+    parameters = inspect.signature(EagleDraftWorker.__init__).parameters
+
+    assert "capture_for_decode" not in parameters
+
+
+def test_eagle_worker_constructs_draft_worker_without_capture_callback():
+    source = inspect.getsource(EAGLEWorker.__init__)
+
+    assert "self.capture_for_decode" not in source
+    assert "capture_for_decode" not in source

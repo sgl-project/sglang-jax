@@ -117,14 +117,14 @@ class EAGLEWorker(BaseSpecWorker):
                 self.forward_target_extend(model_worker_batch, sampling_metadata)
             )
             # draft extend for Update Draft State
-            self.forward_draft_extend(
+            next_draft_input = self.draft_worker.draft_extend_for_prefill(
                 model_worker_batch, logits_output.hidden_states, next_token_ids
             )
             # FIXME(pc) refactor this to batch output
             batch_output = GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                next_draft_input=model_worker_batch.spec_info,
+                next_draft_input=next_draft_input,
                 allocate_lens=model_worker_batch.seq_lens[: model_worker_batch.real_bs],
                 bid=bid,
                 cache_miss_count=cache_miss_count,
@@ -159,54 +159,6 @@ class EAGLEWorker(BaseSpecWorker):
             model_worker_batch.bid,
             model_worker_batch.seq_lens,
         )
-
-    def forward_draft_extend(
-        self,
-        model_worker_batch: ModelWorkerBatch,
-        hidden_states: jax.Array,
-        next_token_ids: jax.Array,
-    ):
-        # FIXME(pc) move this all prepare to prepare_for_extend_after_target_prefill
-        model_worker_batch.spec_info = EagleDraftInput(
-            hidden_states=hidden_states,
-            verified_id=next_token_ids[: model_worker_batch.real_bs],
-            num_tokens_per_batch=np.asarray(1, dtype=jnp.int32),
-            num_tokens_for_logprob_per_batch=np.asarray(1, dtype=jnp.int32),
-            allocate_lens=model_worker_batch.seq_lens,
-        )
-        model_worker_batch.return_hidden_states = False
-        model_worker_batch.spec_info.prepare_for_extend_after_target_prefill(
-            model_worker_batch=model_worker_batch
-        )
-        model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
-        forward_batch.return_logprob = False
-
-        # Set forward_metadata for draft_model_runner's attention backend
-        forward_metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(
-            model_worker_batch
-        )
-
-        self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
-        forward_batch.forward_mode = ForwardMode.EXTEND
-        # last_idx = np.cumsum(model_worker_batch.extend_seq_lens, axis=0) - 1
-
-        logits_output, _, _ = self.draft_model_runner.forward(
-            forward_batch,
-            logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
-        )
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            : model_worker_batch.real_bs, :
-        ]
-        if len(logits_output.hidden_states.shape) == 1:
-            logits_output.hidden_states = jnp.expand_dims(logits_output.hidden_states, axis=0)
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
-        forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens[
-            : model_worker_batch.real_bs
-        ]
-
-        self.capture_for_decode(logits_output, forward_batch.spec_info)
 
     def copy_model_worker_batch_to_cpu(self, model_worker_batch: ModelWorkerBatch):
         model_worker_batch.input_ids = np.array(
