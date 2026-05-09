@@ -16,12 +16,12 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     LinearRecurrentAttnBackend,
-    MockRecurrentStatePool,
     attn_backend_wrapper,
 )
 from sgl_jax.srt.layers.attention.linear.lightning_backend import LightningAttnBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+from sgl_jax.test.layers.mock_recurrent_state_pool import MockRecurrentStatePool
 
 mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 
@@ -55,51 +55,10 @@ class TestHybridIntegration:
         assert 5 not in hybrid.full_attn_layers
         assert isinstance(hybrid.linear_attn_backend, LightningAttnBackend)
 
-    def test_attn_backend_wrapper_lightning_path(self):
-        """attn_backend_wrapper factory builds hybrid stack from runner.lightning_config."""
-        try:
-            from sgl_jax.srt.layers.attention.flashattention_backend import (
-                FlashAttention,
-            )
-        except (ImportError, ModuleNotFoundError):
-            pytest.skip("FlashAttention import chain requires full sglang install")
-
-        # Mock runner with lightning_config
-        mock_runner = SimpleNamespace(
-            mesh=mesh,
-            linear_recurrent_config=SimpleNamespace(
-                full_attention_layer_ids=[0, 1, 2],
-            ),
-            lightning_config=SimpleNamespace(
-                linear_layer_ids=[3, 4, 5, 6],
-                num_hidden_layers=10,
-                num_attention_heads=_H,
-            ),
-            kimi_linear_config=None,
-        )
-
-        with jax.set_mesh(mesh):
-            full_backend = FlashAttention(
-                num_attn_heads=_H,
-                num_kv_heads=_H,
-                head_dim=_K,
-                page_size=1,
-                mesh=mesh,
-            )
-
-            hybrid = attn_backend_wrapper(mock_runner, full_backend)
-
-        # Check hybrid structure
-        assert isinstance(hybrid, HybridLinearAttnBackend)
-        assert isinstance(hybrid.linear_attn_backend, LightningAttnBackend)
-        assert hybrid.full_attn_layers == frozenset([0, 1, 2])
-
-        # Check tp_slope populated with one entry per Lightning layer
-        lightning_backend = hybrid.linear_attn_backend
-        assert len(lightning_backend.tp_slope) == 4
-        for layer_id in [3, 4, 5, 6]:
-            assert layer_id in lightning_backend.tp_slope
-            assert lightning_backend.tp_slope[layer_id].shape == (_H,)
+    def test_attn_backend_wrapper_is_noop_until_model_runner_config_is_wired(self):
+        """attn_backend_wrapper stays conservative until model-runner config is wired."""
+        full_backend = object()
+        assert attn_backend_wrapper(SimpleNamespace(), full_backend) is full_backend
 
 
 class TestTpSlopeFailFast:
@@ -110,9 +69,6 @@ class TestTpSlopeFailFast:
         import jax.numpy as jnp
         import numpy as np
 
-        from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
-            MockRecurrentStatePool,
-        )
         from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
         # Create backend with tp_slope for layers [1, 2, 3]
