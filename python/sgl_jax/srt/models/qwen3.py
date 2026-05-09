@@ -14,7 +14,7 @@ from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
-from sgl_jax.srt.mem_cache.memory_pool import KVCache
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.utils.profiling_utils import named_scope
@@ -570,11 +570,12 @@ class Qwen3ForCausalLM(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
+        memory_pools: MemoryPools,
         logits_metadata: LogitsMetadata,
     ):
+        kv_pool = memory_pools.token_to_kv_pool
         hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag = self.model(
-            forward_batch, token_to_kv_pool
+            forward_batch, kv_pool
         )
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(
