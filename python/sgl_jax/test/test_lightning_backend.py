@@ -416,9 +416,7 @@ class TestDecodePath:
         """h0 flow from pool: batch=2 + nonzero h0 single-step."""
         B, H, K, dtype = 2, _H, _K, jnp.bfloat16
         rng = np.random.default_rng(2015)
-        h0 = jnp.array(
-            rng.standard_normal((B, H, K, K)).astype(np.float32), dtype=jnp.float32
-        )
+        h0 = jnp.array(rng.standard_normal((B, H, K, K)).astype(np.float32), dtype=jnp.float32)
 
         out_backend, state_backend, out_ref, state_ref, _, _ = _run_backend_decode(
             B, H, K, dtype, h0, rng_seed=2015
