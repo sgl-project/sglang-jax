@@ -145,6 +145,7 @@ class MiMoV2FlashMTPForCausalLM(nnx.Module):
         self.config = config
         self.dtype = dtype
         self.mesh = mesh
+        self._kv_buffers: dict = {}
         self.model = MiMoV2FlashMTPLayer(config, dtype=dtype, mesh=mesh)
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -176,13 +177,35 @@ class MiMoV2FlashMTPForCausalLM(nnx.Module):
         return output, layers_kv_fused, True, []
 
     def load_weights(self, model_config: ModelConfig):
-        loader = WeightLoader(
+        self.loader = WeightLoader(
             model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
         )
-        loader.load_weights_from_safetensors(self._create_weight_mappings())
+        is_fp8 = self.loader.is_static_quant
+        self.loader.load_weights_from_safetensors(self._create_weight_mappings(is_fp8))
+        if is_fp8:
+            head_dim = self.config.swa_head_dim
+            v_head_dim = self.config.swa_v_head_dim
+            layers = [self.model]
+            self.loader.dequant_fp8_layers(
+                layers, specs=[("self_attn.q_proj", head_dim)]
+            )
+            self.loader.dequant_fused_kv(self._kv_buffers, layers, self.config)
+            self.loader.dequant_fp8_layers(
+                layers,
+                specs=[
+                    ("mlp.gate_proj", None),
+                    ("mlp.up_proj", None),
+                    ("mlp.down_proj", None),
+                ],
+            )
+            self.loader.replicate_kv_heads(
+                layers,
+                specs=[("self_attn.k_proj", head_dim), ("self_attn.v_proj", v_head_dim)],
+                target_kv_heads_fn=lambda attn: attn.k_head_num,
+            )
         logger.info("MiMo-V2 MTP draft weights loaded successfully!")
 
-    def _create_weight_mappings(self) -> dict:
+    def _create_weight_mappings(self, is_fp8: bool) -> dict:
         prefix = "model.mtp.layers.0"
         m: dict[str, WeightMapping] = {
             "model.embed_tokens.weight": WeightMapping(
@@ -227,29 +250,51 @@ class MiMoV2FlashMTPForCausalLM(nnx.Module):
                 transpose=False,
             ),
         }
-        is_fp8 = getattr(self.config, "quantization_config", None) is not None
-        # q/k/v_proj + mlp are FP8 (have weight_scale_inv) → QuantizedLinear (weight_q/weight_scale).
-        # o_proj + eh_proj are bf16 → ignored_layers → plain LinearBase (weight).
-        attn_projs = (
-            ("q_proj", (None, "tensor"), False, True),
-            ("k_proj", (None, "tensor"), True, True),
-            ("v_proj", (None, "tensor"), True, True),
-            ("o_proj", ("tensor", None), False, False),
-        )
-        for name, axes, kv_pad, fp8 in attn_projs:
-            wsuf = "weight_q" if (is_fp8 and fp8) else "weight"
-            m[f"{prefix}.self_attn.{name}.weight"] = WeightMapping(
-                target_path=f"model.self_attn.{name}.{wsuf}",
-                sharding=axes,
+        # Mirror target weight loading: q_proj loads into QuantizedLinear and is
+        # dequantised to bf16 post-load; K/V go through the fused per-head path
+        # (#969); o_proj is bf16 in the checkpoint (ignored_layers).
+        if is_fp8:
+            m[f"{prefix}.self_attn.q_proj.weight"] = WeightMapping(
+                target_path="model.self_attn.q_proj.weight_q",
+                sharding=(None, "tensor"),
                 transpose=True,
-                kv_head_padding=kv_pad,
+                head_dim_padding=True,
             )
-            if is_fp8 and fp8:
-                m[f"{prefix}.self_attn.{name}.weight_scale_inv"] = WeightMapping(
-                    target_path=f"model.self_attn.{name}.weight_scale",
+            m[f"{prefix}.self_attn.q_proj.weight_scale_inv"] = WeightMapping(
+                target_path="model.self_attn.q_proj.weight_scale",
+                sharding=(None, None),
+                transpose=False,
+            )
+            for kv, name in (("K", "k_proj"), ("V", "v_proj")):
+                m[f"{prefix}.self_attn.{name}.weight"] = WeightMapping(
+                    target_path=f"__KV_{kv}_WEIGHT__0",
                     sharding=(None, None),
                     transpose=False,
                 )
+                m[f"{prefix}.self_attn.{name}.weight_scale_inv"] = WeightMapping(
+                    target_path=f"__KV_{kv}_SCALE__0",
+                    sharding=(None, None),
+                    transpose=False,
+                )
+        else:
+            for name, axes, kv_pad in (
+                ("q_proj", (None, "tensor"), False),
+                ("k_proj", (None, "tensor"), True),
+                ("v_proj", (None, "tensor"), True),
+            ):
+                m[f"{prefix}.self_attn.{name}.weight"] = WeightMapping(
+                    target_path=f"model.self_attn.{name}.weight",
+                    sharding=axes,
+                    transpose=True,
+                    head_dim_padding=True,
+                    kv_head_padding=kv_pad,
+                )
+        m[f"{prefix}.self_attn.o_proj.weight"] = WeightMapping(
+            target_path="model.self_attn.o_proj.weight",
+            sharding=("tensor", None),
+            transpose=True,
+            head_dim_padding=True,
+        )
         for name, axes in (
             ("gate_proj", (None, "tensor")),
             ("up_proj", (None, "tensor")),
