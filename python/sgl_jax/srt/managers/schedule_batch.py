@@ -2357,6 +2357,10 @@ class ScheduleBatch:
             logits_indices=logits_indices,
             lora_ids=lora_ids,
             real_bs=real_bs,
+            real_bs_per_dp=[real_bs],
+            dp_size=self.dp_size,
+            per_dp_bs_size=real_bs,
+            logits_indices_selector=np.arange(real_bs, dtype=np.int32),
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
                 if self.return_hidden_states
