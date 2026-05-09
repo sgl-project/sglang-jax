@@ -4,7 +4,7 @@ Tests validate backend wiring (pool ↔ kernel, metadata ↔ kernel, shard_map �
 cross-call state continuity, slope indexing) combined with kernel output end-to-end.
 
 Reference: JAX naive jit implementation (same dtype as kernel) using per-request scan
-+ jnp.einsum, no Pallas. See gla_reference.py for the naive implementation.
++ jnp.einsum, no Pallas. See simple_gla/native.py for the naive implementation.
 
 Tolerance convention — aligned with GPU sglang FLA CI:
   GPU reference: sglang/python/sglang/srt/layers/attention/fla/utils.py:84-97
@@ -14,7 +14,7 @@ Tolerance convention — aligned with GPU sglang FLA CI:
   fp32 tolerances are tighter: output atol=1e-1 (extend) / 1e-3 (decode),
   state atol=1e-3 (extend) / 1e-4 (decode).
 
-Total: 18 tests (9 prefill + 9 decode)
+Total: 22 tests (1 slope + 11 prefill + 10 decode)
 
 Run with: pytest python/sgl_jax/test/test_lightning_backend.py -v
 """
@@ -26,10 +26,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from sgl_jax.srt.kernels.simple_gla.native import naive_gla_decode, naive_gla_prefill
 from sgl_jax.srt.layers.attention.linear.lightning_backend import LightningAttnBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
-from sgl_jax.test.gla_reference import naive_gla_decode, naive_gla_prefill
 from sgl_jax.test.layers.mock_recurrent_state_pool import MockRecurrentStatePool
 
 mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
@@ -50,6 +50,11 @@ requires_tpu = pytest.mark.skipif(not _HAS_TPU, reason="chunk kernel requires TP
 _LAYER_ID = 5
 _H = 4
 _K = 128
+_SHARD_H = 16
+_SHARD_K = 128
+
+_TOKEN_BUCKETS = [1 << i for i in range(6, 15)]  # [64, ..., 16384]
+_BS_BUCKETS = [1 << i for i in range(0, 9)]  # [1, ..., 256]
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +101,43 @@ def _make_mock_pool(layer_id, recurrent_state, recurrent_indices=None):
     buf = jnp.zeros((N_plus_1,) + recurrent_state.shape[1:], dtype=recurrent_state.dtype)
     buf = buf.at[jnp.array(recurrent_indices)].set(recurrent_state)
     return MockRecurrentStatePool(layer_caches={layer_id: (buf, [])}), recurrent_indices
+
+
+def _pad_to_bucket(n, buckets):
+    for bucket in buckets:
+        if n <= bucket:
+            return bucket
+    return ((n + buckets[-1] - 1) // buckets[-1]) * buckets[-1]
+
+
+def _build_bucket_padded_extend_qkv(lens, H, K, dtype, rng):
+    real_tokens = sum(lens)
+    padded_tokens = _pad_to_bucket(real_tokens, _TOKEN_BUCKETS)
+    padded_batch = _pad_to_bucket(len(lens), _BS_BUCKETS)
+
+    q_np = np.zeros((padded_tokens, H, K), dtype=np.float32)
+    k_np = np.zeros((padded_tokens, H, K), dtype=np.float32)
+    v_np = np.zeros((padded_tokens, H, K), dtype=np.float32)
+
+    offset = 0
+    for seq_len in lens:
+        q_np[offset : offset + seq_len] = rng.standard_normal((seq_len, H, K)).astype(np.float32)
+        k_np[offset : offset + seq_len] = rng.standard_normal((seq_len, H, K)).astype(np.float32)
+        v_np[offset : offset + seq_len] = rng.standard_normal((seq_len, H, K)).astype(np.float32)
+        offset += seq_len
+
+    padded_lens = np.zeros(padded_batch, dtype=np.int32)
+    padded_lens[: len(lens)] = np.asarray(lens, dtype=np.int32)
+    input_ids = np.zeros(padded_tokens, dtype=np.int32)
+
+    return (
+        jnp.array(q_np, dtype=dtype),
+        jnp.array(k_np, dtype=dtype),
+        jnp.array(v_np, dtype=dtype),
+        padded_lens,
+        input_ids,
+        real_tokens,
+    )
 
 
 def _extract_state(pool_updates, recurrent_indices):
@@ -159,6 +201,69 @@ def _run_backend_extend(lens, H, K, dtype, h0, rng_seed, layer_id=_LAYER_ID):
     return out_backend, state_backend, out_ref, state_ref, pool, pu
 
 
+def _run_backend_extend_bucket_padded(lens, H, K, dtype, h0, rng_seed, layer_id=_LAYER_ID):
+    rng = np.random.default_rng(rng_seed)
+    q, k, v, padded_lens, input_ids, real_tokens = _build_bucket_padded_extend_qkv(
+        lens, H, K, dtype, rng
+    )
+
+    B_real = len(lens)
+    B_padded = len(padded_lens)
+    h0_padded = jnp.zeros((B_padded, H, K, K), dtype=jnp.float32)
+    h0_padded = h0_padded.at[:B_real].set(h0)
+    g_gamma = _make_slopes(H, layer_id=layer_id)
+
+    with jax.set_mesh(mesh):
+        backend = LightningAttnBackend(
+            mesh=mesh, linear_recurrent_layer_ids=[layer_id], num_hidden_layers=80, num_heads=H
+        )
+        rec_indices = np.arange(1, B_padded + 1, dtype=np.int32)
+        pool, _ = _make_mock_pool(layer_id, h0_padded, rec_indices)
+
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens=padded_lens,
+            seq_lens=padded_lens,
+            input_ids=input_ids,
+            recurrent_indices=rec_indices,
+            has_initial_state=np.ones(B_padded, dtype=np.bool_),
+            dp_size=1,
+            per_dp_bs_size=B_padded,
+        )
+        metadata = backend.get_forward_metadata(batch)
+        backend.forward_metadata = metadata
+
+        layer = _make_fake_layer(layer_id=layer_id, num_heads=H, head_dim=K)
+        fb = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+
+        out_backend, pu = backend(q, k, v, layer=layer, forward_batch=fb, recurrent_state_pool=pool)
+        state_backend = _extract_state(pu, rec_indices)
+
+    cu_seqlens = np.concatenate([np.array([0], dtype=np.int32), np.cumsum(lens, dtype=np.int32)])
+    scale = K**-0.5
+    out_ref, state_ref = naive_gla_prefill(
+        q[None, :real_tokens],
+        k[None, :real_tokens],
+        v[None, :real_tokens],
+        g_gamma,
+        h0,
+        cu_seqlens,
+        scale=scale,
+    )
+    out_ref = out_ref[0].reshape(real_tokens, -1)
+
+    out_backend_np = np.asarray(out_backend)
+    state_backend_np = np.asarray(state_backend)
+
+    return (
+        out_backend_np[:real_tokens],
+        state_backend_np[:B_real],
+        out_ref,
+        state_ref,
+        state_backend_np[B_real:],
+    )
+
+
 def _run_backend_decode(B, H, K, dtype, h0, rng_seed, layer_id=_LAYER_ID):
     """Helper to run backend decode and return output + state."""
     rng = np.random.default_rng(rng_seed)
@@ -207,7 +312,40 @@ def _run_backend_decode(B, H, K, dtype, h0, rng_seed, layer_id=_LAYER_ID):
 
 
 # ===========================================================================
-# Prefill path tests (9 tests)
+# Slope formula tests
+# ===========================================================================
+
+
+class TestSlopeFormula:
+    def test_slopes_match_hf_formula(self):
+        """Backend-owned ALiBi slopes match the HF formula for representative layers."""
+        num_heads = 64
+        num_hidden_layers = 80
+        layer_ids = [1, 10, 40, 79]
+
+        backend = LightningAttnBackend(
+            mesh=mesh,
+            linear_recurrent_layer_ids=layer_ids,
+            num_hidden_layers=num_hidden_layers,
+            num_heads=num_heads,
+        )
+
+        for layer_id in layer_ids:
+            actual = np.asarray(backend.tp_slope[layer_id])
+            expected = np.asarray(
+                _make_slopes(num_heads, layer_id=layer_id, num_hidden_layers=num_hidden_layers)
+            )
+            np.testing.assert_allclose(
+                actual,
+                expected,
+                rtol=1e-5,
+                atol=1e-7,
+                err_msg=f"Slope mismatch at layer_id={layer_id}",
+            )
+
+
+# ===========================================================================
+# Prefill path tests (11 tests)
 # ===========================================================================
 
 
@@ -290,6 +428,30 @@ class TestPrefillPath:
         np.testing.assert_allclose(out_backend, out_ref, atol=3e-1, rtol=2e-2)
         np.testing.assert_allclose(state_backend, state_ref, atol=1e-1, rtol=2e-2)
 
+    def test_extend_h16_k128_single_short_bucket_padded(self):
+        """Shard-like shape with non-64 token length and token bucket padding."""
+        lens, H, K, dtype = [100], _SHARD_H, _SHARD_K, jnp.bfloat16
+        h0 = jnp.zeros((len(lens), H, K, K), dtype=jnp.float32)
+        out_backend, state_backend, out_ref, state_ref, empty_states = (
+            _run_backend_extend_bucket_padded(lens, H, K, dtype, h0, rng_seed=1010)
+        )
+
+        np.testing.assert_allclose(out_backend, out_ref, atol=3e-1, rtol=2e-2)
+        np.testing.assert_allclose(state_backend, state_ref, atol=1e-1, rtol=2e-2)
+        assert empty_states.shape[0] == 0
+
+    def test_extend_h16_k128_multi_request_bucket_padded(self):
+        """Shard-like shape with variable lengths plus batch/token bucket padding."""
+        lens, H, K, dtype = [256, 100, 512], _SHARD_H, _SHARD_K, jnp.bfloat16
+        h0 = jnp.zeros((len(lens), H, K, K), dtype=jnp.float32)
+        out_backend, state_backend, out_ref, state_ref, empty_states = (
+            _run_backend_extend_bucket_padded(lens, H, K, dtype, h0, rng_seed=1011)
+        )
+
+        np.testing.assert_allclose(out_backend, out_ref, atol=3e-1, rtol=2e-2)
+        np.testing.assert_allclose(state_backend, state_ref, atol=1e-1, rtol=2e-2)
+        assert empty_states.shape == (1, H, K, K)
+
     def test_extend_fp32_strict(self):
         """fp32 numerical path: lens=[128] fp32."""
         lens, H, K, dtype = [128], _H, _K, jnp.float32
@@ -342,7 +504,7 @@ class TestPrefillPath:
 
 
 # ===========================================================================
-# Decode path tests (9 tests)
+# Decode path tests (10 tests)
 # ===========================================================================
 
 
@@ -444,6 +606,18 @@ class TestDecodePath:
 
         out_backend, state_backend, out_ref, state_ref, _, _ = _run_backend_decode(
             B, H, K, dtype, h0, rng_seed=2017
+        )
+
+        np.testing.assert_allclose(out_backend, out_ref, atol=3e-1, rtol=2e-2)
+        np.testing.assert_allclose(state_backend, state_ref, atol=1e-1, rtol=2e-2)
+
+    def test_decode_h16_k128_shard_like_batch_4(self):
+        """Shard-like decode shape: H=16 K=128 batch=4."""
+        B, H, K, dtype = 4, _SHARD_H, _SHARD_K, jnp.bfloat16
+        h0 = jnp.zeros((B, H, K, K), dtype=jnp.float32)
+
+        out_backend, state_backend, out_ref, state_ref, _, _ = _run_backend_decode(
+            B, H, K, dtype, h0, rng_seed=2019
         )
 
         np.testing.assert_allclose(out_backend, out_ref, atol=3e-1, rtol=2e-2)
