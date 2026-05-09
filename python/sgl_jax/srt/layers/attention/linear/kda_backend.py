@@ -61,35 +61,48 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         k_conv_w = layer.k_conv1d.weight.value
         v_conv_w = layer.v_conv1d.weight.value
         cu_q_lens = self.forward_metadata.cu_q_lens
-        q, q_state_new = short_convolution(
-            q,
-            q_conv_w,
-            q_state,
-            cu_q_lens,
-            forward_batch.forward_mode,
-            activation=layer.activation,
-        )
-        k, k_state_new = short_convolution(
-            k,
-            k_conv_w,
-            k_state,
-            cu_q_lens,
-            forward_batch.forward_mode,
-            activation=layer.activation,
-        )
-        v, v_state_new = short_convolution(
-            v,
-            v_conv_w,
-            v_state,
-            cu_q_lens,
-            forward_batch.forward_mode,
-            activation=layer.activation,
-        )
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
+            q, q_state_new = self._short_conv_extend(
+                q, q_conv_w, q_state, cu_q_lens, layer.activation
+            )
+            k, k_state_new = self._short_conv_extend(
+                k, k_conv_w, k_state, cu_q_lens, layer.activation
+            )
+            v, v_state_new = self._short_conv_extend(
+                v, v_conv_w, v_state, cu_q_lens, layer.activation
+            )
+        else:
+            q, q_state_new = short_convolution(
+                q,
+                q_conv_w,
+                q_state,
+                cu_q_lens,
+                forward_batch.forward_mode,
+                activation=layer.activation,
+            )
+            k, k_state_new = short_convolution(
+                k,
+                k_conv_w,
+                k_state,
+                cu_q_lens,
+                forward_batch.forward_mode,
+                activation=layer.activation,
+            )
+            v, v_state_new = short_convolution(
+                v,
+                v_conv_w,
+                v_state,
+                cu_q_lens,
+                forward_batch.forward_mode,
+                activation=layer.activation,
+            )
         new_conv_packed = self._pack_conv_states(q_state_new, k_state_new, v_state_new)
 
         q = q.reshape(q.shape[0], layer.num_q_heads, layer.head_q_dim)
         k = k.reshape(k.shape[0], layer.num_k_heads, layer.head_k_dim)
         v = v.reshape(v.shape[0], layer.num_v_heads, layer.head_v_dim)
+        a = a.reshape(a.shape[0], layer.num_q_heads, layer.head_q_dim)
+        b = b.reshape(b.shape[0], layer.num_q_heads)
 
         # KDA requires L2-normalized q/k for all paths (decode, naive prefill,
         # Pallas prefill). The official implementation does this inside the
@@ -149,9 +162,19 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             f"(reserved RecurrentStatePool inner-list length); got {len(conv_buffer_list)}"
         )
         conv_buffer = conv_buffer_list[0]
-        ## TODO: get has_init_states bool array and excute buffer clearance for recurrent_state_pool
 
-        return recurrent_buffer[recurrent_indices], conv_buffer[recurrent_indices]
+        ssm = recurrent_buffer.at[recurrent_indices].get(
+            out_sharding=recurrent_state_pool.recurrent_sharding
+        )
+        conv = conv_buffer.at[recurrent_indices].get(
+            out_sharding=recurrent_state_pool.conv_sharding
+        )
+        has_initial_state = self.forward_metadata.has_initial_state
+        if has_initial_state is not None:
+            ssm = jnp.where(has_initial_state[:, None, None, None], ssm, 0.0)
+            conv = jnp.where(has_initial_state[:, None, None], conv, 0.0)
+
+        return ssm, conv
 
     def set_ssm_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_recurrent):
         """Scatter per-request ``new_recurrent`` into the FULL pool buffer.
@@ -161,7 +184,9 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         rebinding ``RecurrentStatePool.recurrent_buffers[idx]``.
         """
         full_recurrent, _ = self.get_layer_cache(recurrent_state_pool, layer_id)
-        return full_recurrent.at[recurrent_indices].set(new_recurrent)
+        return full_recurrent.at[recurrent_indices].set(
+            new_recurrent, out_sharding=recurrent_state_pool.recurrent_sharding
+        )
 
     def set_conv_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_conv_packed):
         """Scatter per-request packed conv state into the FULL pool buffer.
@@ -173,11 +198,54 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         _, conv_buffer_list = self.get_layer_cache(recurrent_state_pool, layer_id)
         assert len(conv_buffer_list) == 1
         full_conv = conv_buffer_list[0]
-        return [full_conv.at[recurrent_indices].set(new_conv_packed)]
+        return [
+            full_conv.at[recurrent_indices].set(
+                new_conv_packed, out_sharding=recurrent_state_pool.conv_sharding
+            )
+        ]
 
     # ------------------------------------------------------------------
     # Forward mode implementations
     # ------------------------------------------------------------------
+
+    def _short_conv_extend(
+        self,
+        x: jax.Array,
+        weight: jax.Array,
+        cache: jax.Array,
+        cu_seqlens: jax.Array,
+        activation,
+    ) -> tuple[jax.Array, jax.Array]:
+        """EXTEND-path conv wrapped in shard_map.
+
+        ``short_convolution(EXTEND)`` does many gathers/slices on
+        ``x``/``cache``/``cu_seqlens`` that JAX's explicit-sharding mode
+        cannot resolve unambiguously. Wrapping the call in ``shard_map``
+        gives the inner code per-rank local tensors (effectively replicated
+        from its perspective), bypassing the ambiguity.
+        """
+
+        def _call(x, weight, cache, cu_seqlens):
+            return short_convolution(
+                x, weight, cache, cu_seqlens, ForwardMode.EXTEND, activation=activation
+            )
+
+        sharded = jax.shard_map(
+            _call,
+            mesh=self.mesh,
+            in_specs=(
+                P("data", "tensor"),         # x [T, D]
+                P("tensor", None),            # weight [D, K]
+                P("data", "tensor", None),   # cache [B, D, K-1]
+                P("data"),                    # cu_seqlens [B+1]
+            ),
+            out_specs=(
+                P("data", "tensor"),         # y [T, D]
+                P("data", "tensor", None),   # new_cache [B, D, K-1]
+            ),
+            check_vma=False,
+        )
+        return sharded(x, weight, cache, cu_seqlens)
 
     def _forward_extend(
         self,
@@ -205,7 +273,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         # kda_gate_chunk_cumsum requires A_log shape (H,); the layer stores
         # it as [1, 1, H, 1] (broadcast-friendly for naive paths).
         A_log = layer.A_log.value.reshape(H)
-        dt_bias = layer.dt_bias.value
+        dt_bias = layer.dt_bias.value.reshape(H, -1)
         scale = scale if scale is not None else layer.scale
 
         def _chunk_kda_call(q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias):
@@ -229,19 +297,19 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             _chunk_kda_call,
             mesh=self.mesh,
             in_specs=(
-                P(None, None, "tensor", None),  # q [1, T, H, K]
-                P(None, None, "tensor", None),  # k [1, T, H, K]
-                P(None, None, "tensor", None),  # v [1, T, H, V]
-                P(None, None, "tensor", None),  # g [1, T, H, K]
-                P(None, None, "tensor"),  # beta [1, T, H]
-                P(None, "tensor", None, None),  # initial_state [N, H, K, V]
-                P(),  # cu_seqlens [N+1]
+                P(None, "data", "tensor", None),  # q [1, T, H, K]
+                P(None, "data", "tensor", None),  # k [1, T, H, K]
+                P(None, "data", "tensor", None),  # v [1, T, H, V]
+                P(None, "data", "tensor", None),  # g [1, T, H, K]
+                P(None, "data", "tensor"),  # beta [1, T, H]
+                P("data", "tensor", None, None),  # initial_state [N, H, K, V]
+                P("data"),  # cu_seqlens [N+1]
                 P("tensor"),  # A_log [H]
-                P("tensor"),  # dt_bias [H*K]
+                P("tensor", None),  # dt_bias [H, K]
             ),
             out_specs=(
-                P(None, None, "tensor", None),  # output [1, T, H, V]
-                P(None, "tensor", None, None),  # final_state [N, H, K, V]
+                P(None, "data", "tensor", None),  # output [1, T, H, V]
+                P("data", "tensor", None, None),  # final_state [N, H, K, V]
             ),
             check_vma=False,
         )
