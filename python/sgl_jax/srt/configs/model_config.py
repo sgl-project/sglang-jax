@@ -147,6 +147,10 @@ class ModelConfig:
             "MiMoV2ForCausalLM",
         ):
             self.hf_config.architectures[0] = "MiMoV2FlashMTPForCausalLM"
+            # Draft uses only mtp.layers.0 (single SWA layer); without this the
+            # KV pool sizes for 48 target layers and OOMs.
+            self.hf_config.num_nextn_predict_layers = 1
+            self.hf_config.num_hidden_layers = 1
             if self.quantization_config is not None:
                 # Draft MTP head: eh_proj and o_proj are bf16 in the checkpoint
                 # (no weight_scale_inv); keep them as plain LinearBase so the
