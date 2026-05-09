@@ -8,6 +8,7 @@ from typing import Any
 class BailingHybridLinearConfig:
     num_hidden_layers: int
     num_attention_heads: int
+    num_linear_key_value_heads: int
     head_dim: int
     linear_layer_ids: list[int]
     full_attention_layer_ids: list[int]
@@ -21,7 +22,7 @@ class BailingHybridLinearConfig:
 
         return LinearRecurrentStateParams(
             layers=self.linear_layer_ids,
-            num_heads=self.num_attention_heads,
+            num_heads=self.num_linear_key_value_heads,
             head_dim=self.head_dim,
             conv_kernel_size=1,
             dtype=recurrent_state_dtype(),
@@ -43,6 +44,9 @@ def get_bailing_hybrid_config(hf_config: Any) -> BailingHybridLinearConfig | Non
 
     num_hidden_layers = int(hf_config.num_hidden_layers)
     num_attention_heads = int(hf_config.num_attention_heads)
+    num_linear_key_value_heads = int(
+        getattr(hf_config, "num_linear_key_value_heads", num_attention_heads)
+    )
     head_dim = int(hf_config.head_dim)
     linear_layer_ids, full_attention_layer_ids = _get_layer_ids(hf_config, num_hidden_layers)
     if not linear_layer_ids:
@@ -51,6 +55,7 @@ def get_bailing_hybrid_config(hf_config: Any) -> BailingHybridLinearConfig | Non
     return BailingHybridLinearConfig(
         num_hidden_layers=num_hidden_layers,
         num_attention_heads=num_attention_heads,
+        num_linear_key_value_heads=num_linear_key_value_heads,
         head_dim=head_dim,
         linear_layer_ids=linear_layer_ids,
         full_attention_layer_ids=full_attention_layer_ids,
