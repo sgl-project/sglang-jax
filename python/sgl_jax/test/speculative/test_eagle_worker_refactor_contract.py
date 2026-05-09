@@ -152,6 +152,11 @@ def test_task5_eagle_worker_no_longer_owns_draft_decode_methods():
         assert name not in EAGLEWorker.__dict__
 
 
+def test_task6_eagle_worker_does_not_own_draft_extend_after_verify():
+    assert hasattr(EagleDraftWorker, "draft_extend_for_decode")
+    assert not hasattr(EAGLEWorker, "draft_extend_after_verify")
+
+
 def test_task5_eagle_draft_worker_does_not_define_local_topk_helper():
     source = inspect.getsource(eagle_draft_worker)
 

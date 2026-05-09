@@ -1,6 +1,7 @@
 import itertools
 import logging
 import time
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -33,6 +34,9 @@ from sgl_jax.srt.speculative.spec_utils import (
     update_forward_batch_info,
 )
 from sgl_jax.srt.utils.jax_utils import device_array
+
+if TYPE_CHECKING:
+    from sgl_jax.srt.managers.scheduler import GenerationBatchResult
 
 logger = logging.getLogger(__name__)
 
@@ -386,8 +390,50 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
         draft_input.topk_index = topk_index
         draft_input.hidden_states = logits_output.hidden_states
 
-    def draft_extend_for_decode(self, model_worker_batch, batch_output):
-        raise NotImplementedError
+    def draft_extend_for_decode(
+        self, model_worker_batch: ModelWorkerBatch, batch_output: "GenerationBatchResult"
+    ) -> None:
+        if batch_output.next_draft_input.verified_id.shape[0] <= 0:
+            return
+        draft_input = EagleDraftInput(
+            hidden_states=batch_output.logits_output.hidden_states,
+            allocate_lens=batch_output.allocate_lens,
+        )
+        model_worker_batch, logits_metadata = draft_input.prepare_for_extend_after_verify(
+            model_worker_batch,
+            self.draft_model_runner,
+            batch_output,
+            self.speculative_num_draft_tokens,
+        )
+
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
+        if forward_batch.input_ids.shape[0] <= 0:
+            return
+        draft_logits_output, _, _ = self.draft_model_runner.forward(
+            forward_batch,
+            logits_metadata=logits_metadata,
+        )
+        select_index = (
+            np.arange(len(model_worker_batch.seq_lens[: model_worker_batch.real_bs]))
+            * (self.speculative_num_steps + 1)
+            + batch_output.accept_lens[: model_worker_batch.real_bs]
+            - 1
+        )
+        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[select_index]
+        draft_logits_output.hidden_states = draft_logits_output.hidden_states[select_index]
+        topk_p, topk_index = topk_probs_from_logits(
+            draft_logits_output.next_token_logits, self.topk
+        )
+
+        # prepare for next draft decode
+        batch_output.next_draft_input.hidden_states = draft_logits_output.hidden_states
+        batch_output.next_draft_input.topk_p = topk_p
+        batch_output.next_draft_input.topk_index = topk_index
+        batch_output.next_draft_input.verified_id = batch_output.next_draft_input.verified_id[
+            select_index
+        ]
+        batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
+        batch_output.accept_lens = batch_output.accept_lens[: model_worker_batch.real_bs]
 
     def draft_forward(self, model_worker_batch: ModelWorkerBatch):
         topk_p, topk_index, hidden_states = (
