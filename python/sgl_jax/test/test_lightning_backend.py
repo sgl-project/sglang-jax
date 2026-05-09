@@ -4,7 +4,7 @@ Tests validate backend wiring (pool ↔ kernel, metadata ↔ kernel, shard_map �
 cross-call state continuity, slope indexing) combined with kernel output end-to-end.
 
 Reference: JAX naive jit implementation (same dtype as kernel) using per-request scan
-+ jnp.einsum, no Pallas. See gla_reference.py for the naive implementation.
++ jnp.einsum, no Pallas. See simple_gla/native.py for the naive implementation.
 
 Tolerance convention — aligned with GPU sglang FLA CI:
   GPU reference: sglang/python/sglang/srt/layers/attention/fla/utils.py:84-97
@@ -14,7 +14,7 @@ Tolerance convention — aligned with GPU sglang FLA CI:
   fp32 tolerances are tighter: output atol=1e-1 (extend) / 1e-3 (decode),
   state atol=1e-3 (extend) / 1e-4 (decode).
 
-Total: 18 tests (9 prefill + 9 decode)
+Total: 19 tests (1 slope + 9 prefill + 9 decode)
 
 Run with: pytest python/sgl_jax/test/test_lightning_backend.py -v
 """
@@ -26,10 +26,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from sgl_jax.srt.kernels.simple_gla.native import naive_gla_decode, naive_gla_prefill
 from sgl_jax.srt.layers.attention.linear.lightning_backend import LightningAttnBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
-from sgl_jax.test.gla_reference import naive_gla_decode, naive_gla_prefill
 from sgl_jax.test.layers.mock_recurrent_state_pool import MockRecurrentStatePool
 
 mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
@@ -204,6 +204,39 @@ def _run_backend_decode(B, H, K, dtype, h0, rng_seed, layer_id=_LAYER_ID):
     out_ref = out_ref.reshape(B, -1)
 
     return out_backend, state_backend, out_ref, state_ref, pool, pu
+
+
+# ===========================================================================
+# Slope formula tests
+# ===========================================================================
+
+
+class TestSlopeFormula:
+    def test_slopes_match_hf_formula(self):
+        """Backend-owned ALiBi slopes match the HF formula for representative layers."""
+        num_heads = 64
+        num_hidden_layers = 80
+        layer_ids = [1, 10, 40, 79]
+
+        backend = LightningAttnBackend(
+            mesh=mesh,
+            linear_recurrent_layer_ids=layer_ids,
+            num_hidden_layers=num_hidden_layers,
+            num_heads=num_heads,
+        )
+
+        for layer_id in layer_ids:
+            actual = np.asarray(backend.tp_slope[layer_id])
+            expected = np.asarray(
+                _make_slopes(num_heads, layer_id=layer_id, num_hidden_layers=num_hidden_layers)
+            )
+            np.testing.assert_allclose(
+                actual,
+                expected,
+                rtol=1e-5,
+                atol=1e-7,
+                err_msg=f"Slope mismatch at layer_id={layer_id}",
+            )
 
 
 # ===========================================================================
