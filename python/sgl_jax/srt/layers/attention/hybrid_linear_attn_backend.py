@@ -76,48 +76,26 @@ class LinearRecurrentAttnBackend(AttentionBackend):
     ) -> LinearRecurrentAttnBackendMetadata:
         """Return the metadata for a forward pass.
 
-        For DP > 1, cu_q_lens is a 1D array of length dp_size * (per_dp_bs_size+1),
+        cu_q_lens is a 1D array of length dp_size * (per_dp_bs_size+1),
         logically representing [dp_size, per_dp_bs_size+1] in row-major order.
         Each DP shard gets its slice via P("data") sharding in shard_map.
         """
         metadata = LinearRecurrentAttnBackendMetadata()
 
-        dp_size = getattr(batch, "dp_size", 1)
-        per_dp_bs_size = getattr(
-            batch,
-            "per_dp_bs_size",
-            len(batch.seq_lens) if hasattr(batch, "seq_lens") else 0,
-        )
-
-        if dp_size == 1:
-            # Original 1D path for backward compatibility
-            if batch.forward_mode == ForwardMode.EXTEND:
-                cu_q_lens = np.concatenate(
-                    [
-                        np.array([0], dtype=np.int32),
-                        np.cumsum(batch.extend_seq_lens, dtype=np.int32),
-                    ]
-                )
-            elif batch.forward_mode == ForwardMode.DECODE:
-                cu_q_lens = np.arange(len(batch.seq_lens) + 1, dtype=np.int32)
-            else:
-                raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
+        # Unified 2D reshape logic for all dp_size (including dp_size=1)
+        if batch.forward_mode == ForwardMode.EXTEND:
+            ext_2d = batch.extend_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
+            cu_q_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)
+            cu_q_2d[:, 1:] = np.cumsum(ext_2d, axis=1)
+            cu_q_lens = cu_q_2d.ravel()
+        elif batch.forward_mode == ForwardMode.DECODE:
+            single_cu = np.arange(batch.per_dp_bs_size + 1, dtype=np.int32)
+            cu_q_lens = np.tile(single_cu, batch.dp_size)
         else:
-            # DP > 1: build cu_q_lens per DP rank, then ravel
-            # Following FlashAttention pattern
-            if batch.forward_mode == ForwardMode.EXTEND:
-                ext_2d = batch.extend_seq_lens.reshape(dp_size, per_dp_bs_size)
-                cu_q_2d = np.zeros((dp_size, per_dp_bs_size + 1), dtype=np.int32)
-                cu_q_2d[:, 1:] = np.cumsum(ext_2d, axis=1)
-                cu_q_lens = cu_q_2d.ravel()
-            elif batch.forward_mode == ForwardMode.DECODE:
-                single_cu = np.arange(per_dp_bs_size + 1, dtype=np.int32)
-                cu_q_lens = np.tile(single_cu, dp_size)
-            else:
-                raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
+            raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-        # put array to devices
-        sharding_spec = P() if dp_size == 1 else P("data")
+        # Shard along "data" axis for DP, replicate for DP=1
+        sharding_spec = P("data") if batch.dp_size > 1 else P()
         (
             metadata.cu_q_lens,
             metadata.recurrent_indices,
