@@ -139,6 +139,7 @@ class TestTpSlopeFailFast:
             forward_mode=ForwardMode.DECODE,
             seq_lens=np.ones(B, dtype=np.int32),
             recurrent_indices=rec_indices,
+            has_initial_state=np.ones(B, dtype=np.bool_),
             dp_size=1,
             per_dp_bs_size=B,
         )
@@ -186,6 +187,7 @@ class TestDPShardingContracts:
             extend_seq_lens=np.array([2, 3, 7, 0], dtype=np.int32),
             seq_lens=np.array([2, 3, 7, 0], dtype=np.int32),
             recurrent_indices=np.array([1, 2, 1, 0], dtype=np.int32),
+            has_initial_state=np.ones(4, dtype=np.bool_),
             dp_size=2,
             per_dp_bs_size=2,
         )
@@ -198,6 +200,7 @@ class TestDPShardingContracts:
             np.array([0, 2, 5, 0, 7, 7], dtype=np.int32),
         )
         np.testing.assert_array_equal(metadata.recurrent_indices, batch.recurrent_indices)
+        np.testing.assert_array_equal(metadata.has_initial_state, batch.has_initial_state)
 
     def test_extend_dp_shard_map_uses_local_token_and_state_specs(self, monkeypatch):
         """DP extend must shard q/k/v, state buffer, indices, and cu_lens together."""
@@ -225,7 +228,6 @@ class TestDPShardingContracts:
 
             return runner
 
-        monkeypatch.setattr(lightning_mod, "NamedSharding", lambda mesh, spec: spec)
         monkeypatch.setattr(lightning_mod.jax.sharding, "reshard", lambda value, sharding: value)
         monkeypatch.setattr(lightning_mod.jax, "shard_map", fake_shard_map)
         monkeypatch.setattr(

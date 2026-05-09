@@ -202,6 +202,7 @@ class TestDPMetadata:
                 forward_mode=ForwardMode.DECODE,
                 seq_lens=np.array([10, 20, 15, 25], dtype=np.int32),
                 recurrent_indices=np.array([1, 2, 1, 2], dtype=np.int32),  # LOCAL indices per rank
+                has_initial_state=np.ones(4, dtype=np.bool_),
                 dp_size=2,
                 per_dp_bs_size=2,
             )
@@ -271,6 +272,7 @@ class TestDPDecode:
                 forward_mode=ForwardMode.DECODE,
                 seq_lens=np.ones(B, dtype=np.int32),
                 recurrent_indices=rec_indices,
+                has_initial_state=np.ones(B, dtype=np.bool_),
                 dp_size=1,
                 per_dp_bs_size=B,
             )
@@ -300,7 +302,9 @@ class TestDPDecode:
             )
             # For DP: use LOCAL indices [1, 2] per rank
             local_indices = np.arange(1, B // 2 + 1, dtype=np.int32)
-            pool_dp, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), local_indices, dp_size=2, mesh=mesh_dp)
+            pool_dp, _ = _make_mock_pool(
+                _LAYER_ID, jnp.array(h0_np), local_indices, dp_size=2, mesh=mesh_dp
+            )
 
             # batch.recurrent_indices: repeated local indices [1, 2, 1, 2]
             batch_rec_indices = np.tile(local_indices, 2)
@@ -308,6 +312,7 @@ class TestDPDecode:
                 forward_mode=ForwardMode.DECODE,
                 seq_lens=np.ones(B, dtype=np.int32),
                 recurrent_indices=batch_rec_indices,
+                has_initial_state=np.ones(B, dtype=np.bool_),
                 dp_size=2,
                 per_dp_bs_size=B // 2,
             )
@@ -359,12 +364,15 @@ class TestDPDecode:
                 num_heads=H,
             )
             rec_indices = np.arange(1, B + 1, dtype=np.int32)
-            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, dp_size=2, mesh=mesh_dp)
+            pool, _ = _make_mock_pool(
+                _LAYER_ID, jnp.array(h0_np), rec_indices, dp_size=2, mesh=mesh_dp
+            )
 
             batch = SimpleNamespace(
                 forward_mode=ForwardMode.DECODE,
                 seq_lens=np.ones(B, dtype=np.int32),
                 recurrent_indices=rec_indices,
+                has_initial_state=np.ones(B, dtype=np.bool_),
                 dp_size=2,
                 per_dp_bs_size=B // 2,
             )
@@ -437,6 +445,7 @@ class TestDPExtend:
                 seq_lens=np.array(seq_lens, dtype=np.int32),
                 input_ids=np.zeros(total_tokens, dtype=np.int32),
                 recurrent_indices=rec_indices,
+                has_initial_state=np.ones(B, dtype=np.bool_),
                 dp_size=1,
                 per_dp_bs_size=B,
             )
@@ -467,7 +476,9 @@ class TestDPExtend:
             )
             # For DP: use LOCAL indices [1] per rank (each rank has 1 request)
             local_indices = np.arange(1, B // 2 + 1, dtype=np.int32)
-            pool_dp, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), local_indices, dp_size=2, mesh=mesh_dp)
+            pool_dp, _ = _make_mock_pool(
+                _LAYER_ID, jnp.array(h0_np), local_indices, dp_size=2, mesh=mesh_dp
+            )
 
             # batch.recurrent_indices: repeated local indices [1, 1]
             batch_rec_indices = np.tile(local_indices, 2)
@@ -477,6 +488,7 @@ class TestDPExtend:
                 seq_lens=np.array(seq_lens, dtype=np.int32),
                 input_ids=np.zeros(total_tokens, dtype=np.int32),
                 recurrent_indices=batch_rec_indices,
+                has_initial_state=np.ones(B, dtype=np.bool_),
                 dp_size=2,
                 per_dp_bs_size=B // 2,
             )
@@ -595,7 +607,9 @@ class TestDPExtend:
                 num_heads=H,
             )
             rec_indices = np.arange(1, B + 1, dtype=np.int32)
-            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), rec_indices, dp_size=2, mesh=mesh_dp)
+            pool, _ = _make_mock_pool(
+                _LAYER_ID, jnp.array(h0_np), rec_indices, dp_size=2, mesh=mesh_dp
+            )
 
             batch = SimpleNamespace(
                 forward_mode=ForwardMode.EXTEND,
@@ -603,6 +617,7 @@ class TestDPExtend:
                 seq_lens=np.array(seq_lens, dtype=np.int32),
                 input_ids=np.zeros(total_tokens, dtype=np.int32),
                 recurrent_indices=rec_indices,
+                has_initial_state=np.ones(B, dtype=np.bool_),
                 dp_size=2,
                 per_dp_bs_size=B // 2,
             )
@@ -687,7 +702,9 @@ class TestDPEndToEnd:
 
             # Extend
             local_indices = np.arange(1, B // 2 + 1, dtype=np.int32)
-            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), local_indices, dp_size=2, mesh=mesh_dp)
+            pool, _ = _make_mock_pool(
+                _LAYER_ID, jnp.array(h0_np), local_indices, dp_size=2, mesh=mesh_dp
+            )
 
             batch_rec_indices = np.tile(local_indices, 2)
             batch_ext = SimpleNamespace(
@@ -696,6 +713,7 @@ class TestDPEndToEnd:
                 seq_lens=np.array(seq_lens, dtype=np.int32),
                 input_ids=np.zeros(total_tokens, dtype=np.int32),
                 recurrent_indices=batch_rec_indices,
+                has_initial_state=np.ones(B, dtype=np.bool_),
                 dp_size=2,
                 per_dp_bs_size=B // 2,
             )
@@ -752,10 +770,14 @@ class TestDPEndToEnd:
         mesh_dp = create_device_mesh(ici_parallelism=[2, 2], dcn_parallelism=[1, 1])
         with jax.set_mesh(mesh_dp):
             local_indices = np.arange(1, B // 2 + 1, dtype=np.int32)
-            pool, _ = _make_mock_pool(_LAYER_ID, jnp.array(h0_np), local_indices, dp_size=2, mesh=mesh_dp)
+            pool, _ = _make_mock_pool(
+                _LAYER_ID, jnp.array(h0_np), local_indices, dp_size=2, mesh=mesh_dp
+            )
 
             # Extract state from pool
-            extracted = _extract_state((pool.layer_caches[_LAYER_ID][0], []), local_indices, dp_size=2)
+            extracted = _extract_state(
+                (pool.layer_caches[_LAYER_ID][0], []), local_indices, dp_size=2
+            )
 
         np.testing.assert_allclose(
             np.array(extracted),

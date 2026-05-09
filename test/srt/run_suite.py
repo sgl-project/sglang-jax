@@ -476,6 +476,7 @@ suites = {
         TestFile("python/sgl_jax/test/layers/test_lightning_backend_dp.py", 5, runner="pytest"),
         TestFile("python/sgl_jax/test/test_kda_attention.py", 4),
         TestFile("python/sgl_jax/test/test_kda_attention_dp.py", 4),
+        TestFile("python/sgl_jax/test/test_lightning_backend.py", 5, runner="pytest"),
         TestFile("test/srt/test_moe_block_quant_e2e.py", 5, runner="pytest"),
     ],
     "kernel-performance-test-tpu-v6e-1": [

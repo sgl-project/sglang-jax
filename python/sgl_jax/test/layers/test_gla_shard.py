@@ -208,6 +208,7 @@ def _setup_backend(backend, forward_mode, recurrent_indices, extend_seq_lens=Non
     batch = SimpleNamespace(
         forward_mode=forward_mode,
         recurrent_indices=recurrent_indices,
+        has_initial_state=np.ones(len(recurrent_indices), dtype=np.bool_),
         dp_size=1,
         per_dp_bs_size=len(recurrent_indices),
     )
