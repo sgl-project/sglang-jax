@@ -252,12 +252,15 @@ def _run_backend_extend_bucket_padded(lens, H, K, dtype, h0, rng_seed, layer_id=
     )
     out_ref = out_ref[0].reshape(real_tokens, -1)
 
+    out_backend_np = np.asarray(out_backend)
+    state_backend_np = np.asarray(state_backend)
+
     return (
-        out_backend[:real_tokens],
-        state_backend[:B_real],
+        out_backend_np[:real_tokens],
+        state_backend_np[:B_real],
         out_ref,
         state_ref,
-        state_backend[B_real:],
+        state_backend_np[B_real:],
     )
 
 
