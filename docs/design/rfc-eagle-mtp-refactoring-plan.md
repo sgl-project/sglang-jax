@@ -89,7 +89,7 @@ Phase 3 交付物：
 
 ## Phase 1 类结构重构
 
-Phase 1 的类结构只保留一套新路径，不引入 `V2` 命名，也不保留旧/新双路径。普通 EAGLE 和 MTP 通过相同的 `BaseSpecWorker` / `BaseDraftWorker` 契约接入。
+Phase 1 的类结构只保留一套新路径，不引入 `V2` 命名，也不保留旧实现与新实现并行的双路径。普通 EAGLE 和 MTP 通过相同的 `BaseSpecWorker` / `BaseDraftWorker` 契约接入。
 
 ### Phase 1 类间依赖关系
 
@@ -315,6 +315,8 @@ scheduler overlap 兼容归入 Phase 3；是否前置重构 overlap 逻辑、采
 
 ### PR1 骨架重写：Base worker + 单层 EAGLE 新路径
 
+实现状态：PR1 只落地 worker boundary rewrite 与 contract tests；可运行的 MultiLayer MTP 仍属于后续 PR/PR2；DP attention 当前只保持 contract/边界，不在 PR1 启用完整运行路径。
+
 PR1 只建立全新的 worker 边界和普通 EAGLE 最小新路径，不接入 `mimo-v2.5-pro` 多层 MTP。验收目标是让 scheduler、spec worker、draft worker、verify/result contract 的职责边界先稳定下来，后续 PR 再在同一契约上接入 MultiLayer MTP。
 
 PR1 范围：
@@ -380,7 +382,7 @@ python/sgl_jax/srt/speculative/eagle_draft_worker.py
 
 ### 3. 接入 MultiLayerEAGLEWorker / MultiLayerDraftWorker
 
-该部分从 PR2 开始推进。PR1 只保证 `BaseSpecWorker` / `BaseDraftWorker` 的接口足够承载该路径，不在 PR1 中实现可运行的多层 MTP。
+该部分从 PR2 开始推进。PR1 只保证 `BaseSpecWorker` / `BaseDraftWorker` 的接口足够承载该路径，实际可执行的多层 MTP 路径不属于 PR1 范围。
 
 新增文件：
 
