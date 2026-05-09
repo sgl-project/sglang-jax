@@ -664,15 +664,9 @@ class TestDPEndToEnd:
         g_gamma = _make_slopes(H)
 
         # Two requests
-        q_ext_list = [
-            rng.standard_normal((1, sl, H, K)).astype(np.float32) for sl in seq_lens
-        ]
-        k_ext_list = [
-            rng.standard_normal((1, sl, H, K)).astype(np.float32) for sl in seq_lens
-        ]
-        v_ext_list = [
-            rng.standard_normal((1, sl, H, K)).astype(np.float32) for sl in seq_lens
-        ]
+        q_ext_list = [rng.standard_normal((1, sl, H, K)).astype(np.float32) for sl in seq_lens]
+        k_ext_list = [rng.standard_normal((1, sl, H, K)).astype(np.float32) for sl in seq_lens]
+        v_ext_list = [rng.standard_normal((1, sl, H, K)).astype(np.float32) for sl in seq_lens]
 
         # Pack for varlen format
         total_tokens = sum(seq_lens)
