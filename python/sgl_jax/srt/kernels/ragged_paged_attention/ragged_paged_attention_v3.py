@@ -146,9 +146,9 @@ def ref_ragged_paged_attention(
         v = jnp.repeat(v, num_query_per_kv, axis=1)
         attn = jnp.einsum("qhd,khd->hqk", q, k, preferred_element_type=jnp.float32)
         attn *= sm_scale
+        q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
+        kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
         if causal:
-            q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
-            kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
             mask = q_span < kv_span
         else:
             mask_start = cu_mask_lens[i]
