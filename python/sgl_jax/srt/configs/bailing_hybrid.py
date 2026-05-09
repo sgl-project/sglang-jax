@@ -14,11 +14,14 @@ class BailingHybridLinearConfig:
 
     @property
     def linear_attn_config(self) -> dict[str, Any]:
+        from sgl_jax.srt.mem_cache.recurrent_state_pool import recurrent_state_dtype
+
         return {
             "kda_layers": self.linear_layer_ids,
             "num_heads": self.num_attention_heads,
             "head_dim": self.head_dim,
             "short_conv_kernel_size": 1,
+            "dtype": recurrent_state_dtype(),
         }
 
 
