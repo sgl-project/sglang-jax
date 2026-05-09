@@ -173,7 +173,7 @@ class MiMoV2FlashMTPForCausalLM(nnx.Module):
                 logits_metadata,
                 aux_hidden_states=None,
             )
-        return output, layers_kv_fused, []
+        return output, layers_kv_fused, True, []
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
@@ -280,10 +280,9 @@ class MiMoV2FlashMTPForCausalLM(nnx.Module):
         embed_weight: jax.Array | None = None,
         head_weight: jax.Array | None = None,
     ) -> None:
-        if embed_weight is not None:
-            self.model.embed_tokens.embedding.value = embed_weight
-        if head_weight is not None:
-            self.lm_head.embedding.value = head_weight
+        # embed/lm_head are loaded from the same checkpoint as the target;
+        # avoid re-assigning here to keep the nnx.Param sharding intact.
+        pass
 
 
 EntryClass = MiMoV2FlashMTPForCausalLM
