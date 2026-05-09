@@ -598,7 +598,7 @@ class LlamaForCausalLM(nnx.Module):
                 hidden_states, self.lm_head, logits_metadata, aux_hidden_states=aux_hidden_states
             )
 
-        return output, layers_kv_fused, layers_callback_flag, None
+        return output, {"token_to_kv_pool": layers_kv_fused}, layers_callback_flag, None
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):
