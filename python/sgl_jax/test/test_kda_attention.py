@@ -1,11 +1,3 @@
-"""Backend integration tests for KDAAttnBackend (TP only, no DP).
-
-The structure mirrors ``test_flashattention.py`` / ``test_mla_attention.py``:
-``create_test_data`` builds a real ``ForwardBatch`` and recurrent-state pool,
-``run_test`` executes the backend and compares it against a small reference
-pipeline.
-"""
-
 from __future__ import annotations
 
 import unittest
@@ -235,6 +227,7 @@ def create_test_data(
     has_initial_state_np = np.full(batch_size, has_initial_state, dtype=np.bool_)
 
     backend = KDAAttnBackend(mesh=test_mesh)
+
     mwb = ModelWorkerBatch(
         bid=1,
         forward_mode=forward_mode,
@@ -339,11 +332,12 @@ def ref_kda_attention(
     # Replicate sharded tensors to host so per-seq slicing works under
     # JAX's explicit-sharding mode (slicing a `data`-sharded axis would
     # otherwise raise ShardingTypeError on the gather).
-    g = jnp.asarray(np.asarray(g), dtype=g.dtype)
-    b = jnp.asarray(np.asarray(b), dtype=b.dtype)
-    initial_ssm_state = jnp.asarray(
-        np.asarray(initial_ssm_state), dtype=initial_ssm_state.dtype
-    )
+    def unshard_for_ref(x):
+        return jnp.asarray(np.asarray(x), dtype=x.dtype)
+
+    g = unshard_for_ref(g)
+    b = unshard_for_ref(b)
+    initial_ssm_state = unshard_for_ref(initial_ssm_state)
 
     cu = np.asarray(cu_seqlens)
     outputs = []
