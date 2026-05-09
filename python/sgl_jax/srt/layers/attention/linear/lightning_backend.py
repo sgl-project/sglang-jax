@@ -86,17 +86,10 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         """Construct a LightningAttnBackend.
 
         Args:
-            mesh: Required for production forward (used by ``reshard`` and
-                ``shard_map``). May be ``None`` only for construction-only
-                smoke tests that do not invoke ``__call__``.
+            mesh: Required for production forward.
             chunk_size: simple_gla kernel chunk size.
             linear_recurrent_layer_ids: Global layer ids of every Lightning
-                attention layer in the model. Required for production use.
-                When omitted, ``self.tp_slope`` stays empty and any later
-                ``__call__`` will fail-fast with ``KeyError`` on
-                ``self.tp_slope[layer.layer_id]``. The fail-fast is
-                intentional — silently using a zero/missing slope would
-                make state divergence very hard to debug.
+                attention layer in the model.
             num_hidden_layers: Total transformer layer count, used to scale
                 the per-layer slope. Required iff
                 ``linear_recurrent_layer_ids`` is provided.
@@ -110,9 +103,6 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             and num_hidden_layers is not None
             and num_heads is not None
         ):
-            # NNX wraps dicts of jax.Array as data so the leaves participate in
-            # the pytree (replicated across devices); the dict keys are static
-            # layer ids, so this does not trigger recompiles.
             self.tp_slope = nnx.data(
                 {
                     lid: _compute_layer_slope(lid, num_hidden_layers, num_heads)
@@ -159,63 +149,46 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         return output.reshape(output.shape[0], -1), (new_ssm_full, [])
 
     def get_state(self, recurrent_state_pool, layer_id, recurrent_indices):
-        """Gather recurrent states using shard_map for DP support.
-
-        For dp_size=1, shard_map degenerates to a simple gather with no communication.
+        """Gather recurrent states using shard_map.
         """
         recurrent_buffer, _ = self.get_layer_cache(recurrent_state_pool, layer_id)
         dp_size = self.mesh.shape["data"]
 
-        recurrent_buffer = jax.sharding.reshard(
-            recurrent_buffer,
-            NamedSharding(self.mesh, P("data", "tensor", None, None)),
-        )
-        recurrent_indices = jax.sharding.reshard(
-            recurrent_indices,
-            NamedSharding(self.mesh, P("data")),
-        )
-
         def _gather_local(buf, indices):
             return buf[indices]
+
+        # Indices sharding depends on dp_size (set by get_forward_metadata)
+        indices_spec = P("data") if dp_size > 1 else P()
 
         return jax.shard_map(
             _gather_local,
             mesh=self.mesh,
-            in_specs=(P("data", "tensor", None, None), P("data")),
+            in_specs=(
+                P("data", "tensor", None, None),
+                indices_spec,
+            ),
             out_specs=P("data", "tensor", None, None),
             check_vma=False,
         )(recurrent_buffer, recurrent_indices)
 
     def set_ssm_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_recurrent):
-        """Scatter recurrent states using shard_map for DP support.
-
-        For dp_size=1, shard_map degenerates to a simple scatter with no communication.
+        """Scatter recurrent states using shard_map.
         """
         recurrent_buffer, _ = self.get_layer_cache(recurrent_state_pool, layer_id)
         dp_size = self.mesh.shape["data"]
 
-        recurrent_buffer = jax.sharding.reshard(
-            recurrent_buffer,
-            NamedSharding(self.mesh, P("data", "tensor", None, None)),
-        )
-        recurrent_indices = jax.sharding.reshard(
-            recurrent_indices,
-            NamedSharding(self.mesh, P("data")),
-        )
-        new_recurrent = jax.sharding.reshard(
-            new_recurrent,
-            NamedSharding(self.mesh, P("data", "tensor", None, None)),
-        )
-
         def _scatter_local(buf, indices, state):
             return buf.at[indices].set(state)
+
+        # Indices sharding depends on dp_size (set by get_forward_metadata)
+        indices_spec = P("data") if dp_size > 1 else P()
 
         return jax.shard_map(
             _scatter_local,
             mesh=self.mesh,
             in_specs=(
                 P("data", "tensor", None, None),
-                P("data"),
+                indices_spec,
                 P("data", "tensor", None, None),
             ),
             out_specs=P("data", "tensor", None, None),
@@ -230,19 +203,12 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         ssm_states: jax.Array,
         slope: jnp.ndarray,
     ) -> tuple[jax.Array, jax.Array]:
-        """Decode forward using shard_map for DP support.
-
-        For dp_size=1, shard_map degenerates to a simple call with no communication.
+        """Decode forward using shard_map.
         """
         if fused_recurrent_simple_gla is None:
             raise ImportError("simple_gla kernel is required for GLA decode")
 
         ssm_states = ssm_states.astype(jnp.float32)
-        slope_sm = jax.sharding.reshard(slope, NamedSharding(self.mesh, P("tensor")))
-        ssm_states_sm = jax.sharding.reshard(
-            ssm_states,
-            NamedSharding(self.mesh, P("data", "tensor", None, None)),
-        )
 
         def _decode_fn(q_local, k_local, v_local, gamma, h0):
             q_d = q_local[:, None, :, :]
@@ -263,18 +229,18 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             _decode_fn,
             mesh=self.mesh,
             in_specs=(
-                P("data", "tensor", None),
-                P("data", "tensor", None),
-                P("data", "tensor", None),
-                P("tensor"),
-                P("data", "tensor", None, None),
+                P("data", "tensor", None),  # q: always has "data" axis
+                P("data", "tensor", None),  # k
+                P("data", "tensor", None),  # v
+                P("tensor"),                 # slope: replicated
+                P("data", "tensor", None, None),  # ssm_states
             ),
             out_specs=(
                 P("data", "tensor", None),
                 P("data", "tensor", None, None),
             ),
             check_vma=False,
-        )(q, k, v, slope_sm, ssm_states_sm)
+        )(q, k, v, slope, ssm_states)
 
         return output, new_state
 
@@ -286,22 +252,15 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         ssm_states: jax.Array,
         slope: jnp.ndarray,
     ) -> tuple[jax.Array, jax.Array]:
-        """Extend forward using shard_map for DP support.
-
-        For dp_size=1, shard_map degenerates to a simple call with no communication.
+        """Extend forward using shard_map.
         """
         if simple_gla_fwd is None:
             raise ImportError("simple_gla kernel is required for GLA prefill")
 
         cu_seqlens = self.forward_metadata.cu_q_lens
         ssm_states = ssm_states.astype(jnp.float32)
-
-        slope_sm = jax.sharding.reshard(slope, NamedSharding(self.mesh, P("tensor")))
-        h0_sm = jax.sharding.reshard(
-            ssm_states,
-            NamedSharding(self.mesh, P("data", "tensor", None, None)),
-        )
         chunk_size = self.chunk_size
+        dp_size = self.mesh.shape["data"]
 
         def _prefill_fn(q_local, k_local, v_local, gamma, h0, cu_seqlens_p):
             output, ht = simple_gla_fwd(
@@ -317,23 +276,26 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             )
             return output[0], ht
 
+        # cu_seqlens sharding depends on dp_size (set by get_forward_metadata)
+        cu_seqlens_spec = P("data") if dp_size > 1 else P()
+
         output, new_state = jax.shard_map(
             _prefill_fn,
             mesh=self.mesh,
             in_specs=(
-                P("data", "tensor", None),
-                P("data", "tensor", None),
-                P("data", "tensor", None),
-                P("tensor"),
-                P("data", "tensor", None, None),
-                P("data"),
+                P("data", "tensor", None),  # q: always has "data" axis
+                P("data", "tensor", None),  # k
+                P("data", "tensor", None),  # v
+                P("tensor"),                 # slope: replicated
+                P("data", "tensor", None, None),  # ssm_states
+                cu_seqlens_spec,            # cu_seqlens: depends on dp_size
             ),
             out_specs=(
                 P("data", "tensor", None),
                 P("data", "tensor", None, None),
             ),
             check_vma=False,
-        )(q, k, v, slope_sm, h0_sm, cu_seqlens)
+        )(q, k, v, slope, ssm_states, cu_seqlens)
 
         return output, new_state
 
