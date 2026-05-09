@@ -7,6 +7,11 @@ Ling-2.6-flash production (H_local=4, K=128).
 Production: H=64, K=128, TP=16 → H_local=4
 Test:       H=16, K=128, TP=4  → H_local=4  (same per-shard shape)
 
+Tolerance convention — aligned with GPU sglang FLA CI:
+  GPU reference: sglang/python/sglang/srt/layers/attention/fla/utils.py:84-97
+  ``assert_close`` passes when ``abs_atol <= 0.3`` OR ``error_rate < ratio``
+  (where error_rate = RMSE / RMS(ref), typically ratio < 0.01).
+
 Run with: pytest python/sgl_jax/test/layers/test_gla_shard.py -v
 """
 
@@ -155,9 +160,9 @@ def _build_extend_qkv(extend_seq_lens_real, H, K, rng):
     per_request_qkv = []
     offset = 0
     for seq_len in extend_seq_lens_real:
-        qi = rng.standard_normal((1, seq_len, H, K)).astype(np.float32) * 0.1
-        ki = rng.standard_normal((1, seq_len, H, K)).astype(np.float32) * 0.1
-        vi = rng.standard_normal((1, seq_len, H, K)).astype(np.float32) * 0.1
+        qi = rng.standard_normal((1, seq_len, H, K)).astype(np.float32)
+        ki = rng.standard_normal((1, seq_len, H, K)).astype(np.float32)
+        vi = rng.standard_normal((1, seq_len, H, K)).astype(np.float32)
         q[offset : offset + seq_len] = qi[0]
         k[offset : offset + seq_len] = ki[0]
         v[offset : offset + seq_len] = vi[0]
@@ -247,10 +252,10 @@ class TestDecodeSharded:
         rng = np.random.default_rng(42)
         g_gamma = _make_slopes(H).astype(np.float32)
 
-        q_np = rng.standard_normal((B, 1, H, K)).astype(np.float32) * 0.1
-        k_np = rng.standard_normal((B, 1, H, K)).astype(np.float32) * 0.1
-        v_np = rng.standard_normal((B, 1, H, K)).astype(np.float32) * 0.1
-        h0_np = rng.standard_normal((B, H, K, K)).astype(np.float32) * 0.01
+        q_np = rng.standard_normal((B, 1, H, K)).astype(np.float32)
+        k_np = rng.standard_normal((B, 1, H, K)).astype(np.float32)
+        v_np = rng.standard_normal((B, 1, H, K)).astype(np.float32)
+        h0_np = rng.standard_normal((B, H, K, K)).astype(np.float32)
 
         ref_out, ref_state = numpy_gla_recurrent(q_np, k_np, v_np, g_gamma, h0=h0_np)
 
@@ -264,8 +269,8 @@ class TestDecodeSharded:
             scale=None,
         )
 
-        np.testing.assert_allclose(np.array(out_jax), ref_out, atol=1e-3)
-        np.testing.assert_allclose(np.array(state_jax), ref_state, atol=1e-3)
+        np.testing.assert_allclose(np.array(out_jax), ref_out, atol=5e-2, rtol=2e-2)
+        np.testing.assert_allclose(np.array(state_jax), ref_state, atol=5e-2, rtol=2e-2)
 
     def test_decode_multi_step(self):
         """32-step autoregressive decode, B=4."""
@@ -273,14 +278,14 @@ class TestDecodeSharded:
         rng = np.random.default_rng(200)
         g_gamma = _make_slopes(H).astype(np.float32)
 
-        h_np = rng.standard_normal((B, H, K, K)).astype(np.float32) * 0.01
+        h_np = rng.standard_normal((B, H, K, K)).astype(np.float32)
         h_jax = jnp.array(h_np)
 
         h_ref = h_np.copy()
         for t in range(steps):
-            q_np = rng.standard_normal((B, 1, H, K)).astype(np.float32) * 0.1
-            k_np = rng.standard_normal((B, 1, H, K)).astype(np.float32) * 0.1
-            v_np = rng.standard_normal((B, 1, H, K)).astype(np.float32) * 0.1
+            q_np = rng.standard_normal((B, 1, H, K)).astype(np.float32)
+            k_np = rng.standard_normal((B, 1, H, K)).astype(np.float32)
+            v_np = rng.standard_normal((B, 1, H, K)).astype(np.float32)
 
             _, h_ref = numpy_gla_recurrent(q_np, k_np, v_np, g_gamma, h0=h_ref)
 
@@ -297,7 +302,8 @@ class TestDecodeSharded:
         np.testing.assert_allclose(
             np.array(h_jax),
             h_ref,
-            atol=1e-2,
+            atol=1e-1,
+            rtol=2e-2,
             err_msg="Multi-step decode (32 steps) state diverged",
         )
 
@@ -378,7 +384,8 @@ class TestExtendSharded:
             np.testing.assert_allclose(
                 actual_out,
                 ref_out,
-                atol=5e-2,
+                atol=3e-1,
+                rtol=2e-2,
                 err_msg=f"Extend output mismatch for request {i} (seq_len={seq_len})",
             )
             offset += seq_len
@@ -387,7 +394,8 @@ class TestExtendSharded:
             np.testing.assert_allclose(
                 states_np[i],
                 ref_states[i],
-                atol=5e-2,
+                atol=3e-1,
+                rtol=2e-2,
                 err_msg=f"Extend state mismatch for request {i}",
             )
 
@@ -399,7 +407,7 @@ class TestExtendSharded:
 
     def test_extend_with_nonzero_initial_state(self):
         rng = np.random.default_rng(1009)
-        h0 = rng.standard_normal((1, _H, _K, _K)).astype(np.float32) * 0.01
+        h0 = rng.standard_normal((1, _H, _K, _K)).astype(np.float32)
         self._run_extend_precision_test([4096], rng_seed=1009, h0_np=h0)
 
 
@@ -422,9 +430,9 @@ class TestEndToEndBackend:
         rng = np.random.default_rng(3001)
         g_gamma = _make_slopes(H)
 
-        q_ext_np = rng.standard_normal((1, seq_len, H, K)).astype(np.float32) * 0.1
-        k_ext_np = rng.standard_normal((1, seq_len, H, K)).astype(np.float32) * 0.1
-        v_ext_np = rng.standard_normal((1, seq_len, H, K)).astype(np.float32) * 0.1
+        q_ext_np = rng.standard_normal((1, seq_len, H, K)).astype(np.float32)
+        k_ext_np = rng.standard_normal((1, seq_len, H, K)).astype(np.float32)
+        v_ext_np = rng.standard_normal((1, seq_len, H, K)).astype(np.float32)
         h0_np = np.zeros((1, H, K, K), dtype=np.float32)
 
         _, ref_state = numpy_gla_recurrent(q_ext_np, k_ext_np, v_ext_np, g_gamma, h0=h0_np)
@@ -480,9 +488,9 @@ class TestEndToEndBackend:
         h_ref = ref_state.copy()
         h_jax = jnp.array(extend_state)
         for step in range(decode_steps):
-            q_d = rng.standard_normal((1, 1, H, K)).astype(np.float32) * 0.1
-            k_d = rng.standard_normal((1, 1, H, K)).astype(np.float32) * 0.1
-            v_d = rng.standard_normal((1, 1, H, K)).astype(np.float32) * 0.1
+            q_d = rng.standard_normal((1, 1, H, K)).astype(np.float32)
+            k_d = rng.standard_normal((1, 1, H, K)).astype(np.float32)
+            v_d = rng.standard_normal((1, 1, H, K)).astype(np.float32)
 
             _, h_ref = numpy_gla_recurrent(q_d, k_d, v_d, g_gamma, h0=h_ref)
 

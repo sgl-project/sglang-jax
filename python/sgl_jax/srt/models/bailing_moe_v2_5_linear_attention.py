@@ -131,8 +131,10 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
         """
         T = hidden_states.shape[0]
 
-        # 1. QKV projection
+        # 1. QKV projection (cast to float32 for norm/RoPE/kernel precision,
+        #    matching GPU bailing_moe_linear.py:530)
         qkv, _ = self.qkv_proj(hidden_states)
+        qkv = qkv.astype(jnp.float32)
         qkv = jax.lax.reshape(
             qkv,
             (T, 3, self.num_heads, self.head_dim),
@@ -150,6 +152,7 @@ class BailingMoeV2_5LinearAttention(nnx.Module):
 
         # 4. Delegate attention to backend via RadixLightningAttention dispatcher
         attn_output, pool_updates = self.attn(forward_batch, q, k, v, recurrent_state_pool)
+        attn_output = attn_output.astype(hidden_states.dtype)
 
         # 5. Gating: GroupRMSNorm(attn_output) * sigmoid(g_proj(hidden_states))
         g, _ = self.g_proj(hidden_states)
