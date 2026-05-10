@@ -27,51 +27,6 @@ def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.nda
     return rng.standard_normal(shape).astype(np.float32) * scale
 
 
-def create_random_states(
-    batch_size: int,
-    num_heads: int,
-    head_dim: int,
-    conv_kernel_size: int,
-    dtype,
-    rng: np.random.Generator,
-) -> tuple[jax.Array, jax.Array]:
-    hidden = num_heads * head_dim
-    ssm = jnp.asarray(
-        _scaled_randn(rng, (batch_size, num_heads, head_dim, head_dim)),
-        dtype=jnp.float32,
-    )
-    conv = jnp.asarray(
-        _scaled_randn(rng, (batch_size, hidden * 3, conv_kernel_size - 1)),
-        dtype=dtype,
-    )
-    return ssm, conv
-
-
-def write_initial_state(
-    pool: RecurrentStatePool,
-    layer_id: int,
-    recurrent_indices: np.ndarray,
-    ssm_state: jax.Array,
-    conv_state: jax.Array,
-) -> None:
-    recurrent_buffer, conv_buffer_list = pool.get_linear_recurrent_layer_cache(layer_id)
-    recurrent_buffer = recurrent_buffer.at[recurrent_indices].set(
-        ssm_state, out_sharding=pool.recurrent_sharding
-    )
-    conv_buffer = conv_buffer_list[0].at[recurrent_indices].set(
-        conv_state, out_sharding=pool.conv_sharding
-    )
-    pool.replace_buffer(([recurrent_buffer], [[conv_buffer]]))
-
-
-def gather_ssm(pool: RecurrentStatePool, recurrent_buffer: jax.Array, indices: np.ndarray):
-    return recurrent_buffer.at[indices].get(out_sharding=pool.recurrent_sharding)
-
-
-def gather_conv(pool: RecurrentStatePool, conv_buffer: jax.Array, indices: np.ndarray):
-    return conv_buffer.at[indices].get(out_sharding=pool.conv_sharding)
-
-
 def make_nnx_depthwise_conv(weight_dk: jax.Array) -> nnx.Conv:
     """Build an nnx.Conv matching short_convolution's [D, K] depthwise kernel."""
     weight = jnp.asarray(np.asarray(weight_dk), dtype=weight_dk.dtype)
@@ -133,157 +88,6 @@ def ref_short_convolution(
             new_cache.append(jnp.concatenate([cache[i, :, seq.shape[0] :], seq.T], axis=1))
 
     return jnp.concatenate(pieces, axis=0), jnp.stack(new_cache, axis=0)
-
-
-def create_test_data(
-    mode: str,
-    seq_lens: list[int],
-    num_heads: int,
-    head_dim: int,
-    conv_kernel_size: int,
-    dtype,
-    rng: np.random.Generator,
-    test_mesh: jax.sharding.Mesh = mesh,
-    layer_id: int = 0,
-    has_initial_state: bool = False,
-    initial_ssm_state: jax.Array | None = None,
-    initial_conv_state: jax.Array | None = None,
-):
-    assert mode in ("prefill", "decode")
-    forward_mode = ForwardMode.EXTEND if mode == "prefill" else ForwardMode.DECODE
-    batch_size = len(seq_lens)
-    total_tokens = sum(seq_lens)
-    hidden = num_heads * head_dim
-    conv_sharding = NamedSharding(test_mesh, P("tensor", None))
-    hidden_sharding = NamedSharding(test_mesh, P("data", "tensor"))
-    head_sharding = NamedSharding(test_mesh, P("data", "tensor"))
-    param_head_sharding = NamedSharding(test_mesh, P("tensor", None))
-
-    def normal(shape, scale=0.1):
-        return jnp.asarray(_scaled_randn(rng, shape, scale), dtype=dtype)
-
-    def conv_weight():
-        return jax.device_put(normal((hidden, conv_kernel_size), scale=1.0), conv_sharding)
-
-    layer = RadixLinearAttention(
-        layer_id=layer_id,
-        num_q_heads=num_heads,
-        num_k_heads=num_heads,
-        num_v_heads=num_heads,
-        head_q_dim=head_dim,
-        head_k_dim=head_dim,
-        head_v_dim=head_dim,
-        q_conv1d=SimpleNamespace(weight=SimpleNamespace(value=conv_weight())),
-        k_conv1d=SimpleNamespace(weight=SimpleNamespace(value=conv_weight())),
-        v_conv1d=SimpleNamespace(weight=SimpleNamespace(value=conv_weight())),
-        activation="silu",
-        A_log=SimpleNamespace(
-            value=jax.device_put(normal((num_heads, 1), scale=1.0), param_head_sharding)
-        ),
-        dt_bias=SimpleNamespace(
-            value=jax.device_put(normal((num_heads, head_dim), scale=1.0), param_head_sharding)
-        ),
-        scale=head_dim**-0.5,
-    )
-    pool = RecurrentStatePool(
-        linear_recurrent_layer_ids=[layer_id],
-        size=batch_size,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        conv_kernel_size=conv_kernel_size,
-        mesh=test_mesh,
-        dp_size=1,
-        recurrent_partition_axis="tensor",
-        conv_partition_axis="tensor",
-        data_partition_axis="data",
-        temporal_dtype=jnp.float32,
-        conv_dtype=dtype,
-    )
-    q = jax.device_put(normal((total_tokens, hidden)), hidden_sharding)
-    k = jax.device_put(normal((total_tokens, hidden)), hidden_sharding)
-    v = jax.device_put(normal((total_tokens, hidden)), hidden_sharding)
-    a = jax.device_put(normal((total_tokens, hidden)), hidden_sharding)
-    b = jax.device_put(normal((total_tokens, num_heads)), head_sharding)
-
-    recurrent_indices = np.arange(1, batch_size + 1, dtype=np.int32)
-    if initial_ssm_state is None or initial_conv_state is None:
-        random_ssm, random_conv = create_random_states(
-            batch_size, num_heads, head_dim, conv_kernel_size, dtype, rng
-        )
-        zero_ssm = jnp.zeros_like(random_ssm)
-        zero_conv = jnp.zeros_like(random_conv)
-        if initial_ssm_state is None:
-            initial_ssm_state = zero_ssm if has_initial_state else random_ssm
-        if initial_conv_state is None:
-            initial_conv_state = zero_conv if has_initial_state else random_conv
-
-    initial_ssm_state = jax.device_put(initial_ssm_state, pool.recurrent_sharding)
-    initial_conv_state = jax.device_put(initial_conv_state, pool.conv_sharding)
-    write_initial_state(pool, layer_id, recurrent_indices, initial_ssm_state, initial_conv_state)
-
-    seq_lens_np = np.asarray(seq_lens, dtype=np.int32)
-    input_ids = np.arange(total_tokens, dtype=np.int32)
-    positions = np.arange(total_tokens, dtype=np.int32)
-    out_cache_loc = np.arange(total_tokens, dtype=np.int32)
-    req_pool_indices = np.arange(batch_size, dtype=np.int32)
-    extend_seq_lens = seq_lens_np if mode == "prefill" else None
-    extend_prefix_lens = np.zeros(batch_size, dtype=np.int32) if mode == "prefill" else None
-    has_initial_state_np = np.full(batch_size, has_initial_state, dtype=np.bool_)
-
-    backend = KDAAttnBackend(mesh=test_mesh)
-
-    mwb = ModelWorkerBatch(
-        bid=1,
-        forward_mode=forward_mode,
-        input_ids=input_ids,
-        real_input_ids_len=input_ids.shape[0],
-        seq_lens=seq_lens_np,
-        out_cache_loc=out_cache_loc,
-        req_pool_indices=req_pool_indices,
-        sampling_info=None,
-        positions=positions,
-        cache_loc=out_cache_loc,
-        extend_seq_lens=extend_seq_lens,
-        extend_prefix_lens=extend_prefix_lens,
-        return_logprob=False,
-        return_output_logprob_only=False,
-        top_logprobs_nums=None,
-        token_ids_logprobs=None,
-        extend_logprob_start_lens=None,
-        extend_input_logprob_token_ids=None,
-        logits_indices=np.cumsum(seq_lens_np) - 1 if mode == "prefill" else None,
-        real_bs=batch_size,
-        real_bs_per_dp=[batch_size],
-        dp_size=1,
-        per_dp_bs_size=batch_size,
-        spec_info=None,
-        recurrent_indices=recurrent_indices,
-        has_initial_state=has_initial_state_np,
-    )
-
-    fb = ForwardBatch(
-        bid=1,
-        forward_mode=forward_mode,
-        batch_size=batch_size,
-        input_ids=jnp.asarray(input_ids),
-        req_pool_indices=jnp.asarray(req_pool_indices),
-        seq_lens=jnp.asarray(seq_lens_np),
-        out_cache_loc=jnp.asarray(out_cache_loc),
-        positions=jnp.asarray(positions),
-        attn_backend=backend,
-        cache_loc=jnp.asarray(out_cache_loc),
-        extend_prefix_lens=(
-            jnp.asarray(extend_prefix_lens) if extend_prefix_lens is not None else None
-        ),
-        extend_seq_lens=jnp.asarray(extend_seq_lens) if extend_seq_lens is not None else None,
-        spec_info=None,
-        recurrent_indices=jnp.asarray(recurrent_indices),
-    )
-    fb.attn_backend.forward_metadata = backend.get_forward_metadata(mwb)
-
-    baseline_ssm = initial_ssm_state if has_initial_state else jnp.zeros_like(initial_ssm_state)
-    baseline_conv = initial_conv_state if has_initial_state else jnp.zeros_like(initial_conv_state)
-    return fb, pool, layer, q, k, v, a, b, baseline_ssm, baseline_conv, recurrent_indices
 
 
 def ref_kda_attention(
@@ -367,6 +171,202 @@ def ref_kda_attention(
     return output, ssm_state, conv_state
 
 
+def create_random_states(
+    batch_size: int,
+    num_heads: int,
+    head_dim: int,
+    conv_kernel_size: int,
+    dtype,
+    rng: np.random.Generator,
+) -> tuple[jax.Array, jax.Array]:
+    hidden = num_heads * head_dim
+    ssm = jnp.asarray(
+        _scaled_randn(rng, (batch_size, num_heads, head_dim, head_dim)),
+        dtype=jnp.float32,
+    )
+    conv = jnp.asarray(
+        _scaled_randn(rng, (batch_size, hidden * 3, conv_kernel_size - 1)),
+        dtype=dtype,
+    )
+    return ssm, conv
+
+
+def write_initial_state(
+    pool: RecurrentStatePool,
+    layer_id: int,
+    recurrent_indices: np.ndarray,
+    ssm_state: jax.Array,
+    conv_state: jax.Array,
+) -> None:
+    recurrent_buffer, conv_buffer_list = pool.get_linear_recurrent_layer_cache(layer_id)
+    recurrent_buffer = recurrent_buffer.at[recurrent_indices].set(
+        ssm_state, out_sharding=pool.recurrent_sharding
+    )
+    conv_buffer = conv_buffer_list[0].at[recurrent_indices].set(
+        conv_state, out_sharding=pool.conv_sharding
+    )
+    pool.replace_buffer(([recurrent_buffer], [[conv_buffer]]))
+
+
+def gather_ssm(pool: RecurrentStatePool, recurrent_buffer: jax.Array, indices: np.ndarray):
+    return recurrent_buffer.at[indices].get(out_sharding=pool.recurrent_sharding)
+
+
+def gather_conv(pool: RecurrentStatePool, conv_buffer: jax.Array, indices: np.ndarray):
+    return conv_buffer.at[indices].get(out_sharding=pool.conv_sharding)
+
+
+def create_test_data(
+    mode: str,
+    seq_lens: list[int],
+    num_heads: int,
+    head_dim: int,
+    conv_kernel_size: int,
+    dtype,
+    rng: np.random.Generator,
+    test_mesh: jax.sharding.Mesh = mesh,
+    layer_id: int = 0,
+    all_have_initial_state: bool = False,
+    initial_ssm_state: jax.Array | None = None,
+    initial_conv_state: jax.Array | None = None,
+):
+    assert mode in ("prefill", "decode")
+    forward_mode = ForwardMode.EXTEND if mode == "prefill" else ForwardMode.DECODE
+    batch_size = len(seq_lens)
+    total_tokens = sum(seq_lens)
+    hidden = num_heads * head_dim
+    conv_sharding = NamedSharding(test_mesh, P("tensor", None))
+    hidden_sharding = NamedSharding(test_mesh, P("data", "tensor"))
+    head_sharding = NamedSharding(test_mesh, P("data", "tensor"))
+    param_head_sharding = NamedSharding(test_mesh, P("tensor", None))
+
+    def normal(shape, scale=0.1):
+        return jnp.asarray(_scaled_randn(rng, shape, scale), dtype=dtype)
+
+    def conv_weight():
+        return jax.device_put(normal((hidden, conv_kernel_size), scale=1.0), conv_sharding)
+
+    layer = RadixLinearAttention(
+        layer_id=layer_id,
+        num_q_heads=num_heads,
+        num_k_heads=num_heads,
+        num_v_heads=num_heads,
+        head_q_dim=head_dim,
+        head_k_dim=head_dim,
+        head_v_dim=head_dim,
+        q_conv1d=SimpleNamespace(weight=SimpleNamespace(value=conv_weight())),
+        k_conv1d=SimpleNamespace(weight=SimpleNamespace(value=conv_weight())),
+        v_conv1d=SimpleNamespace(weight=SimpleNamespace(value=conv_weight())),
+        activation="silu",
+        A_log=SimpleNamespace(
+            value=jax.device_put(normal((num_heads, 1), scale=1.0), param_head_sharding)
+        ),
+        dt_bias=SimpleNamespace(
+            value=jax.device_put(normal((num_heads, head_dim), scale=1.0), param_head_sharding)
+        ),
+        scale=head_dim**-0.5,
+    )
+    pool = RecurrentStatePool(
+        linear_recurrent_layer_ids=[layer_id],
+        size=batch_size,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        conv_kernel_size=conv_kernel_size,
+        mesh=test_mesh,
+        dp_size=1,
+        recurrent_partition_axis="tensor",
+        conv_partition_axis="tensor",
+        data_partition_axis="data",
+        temporal_dtype=jnp.float32,
+        conv_dtype=dtype,
+    )
+    q = jax.device_put(normal((total_tokens, hidden)), hidden_sharding)
+    k = jax.device_put(normal((total_tokens, hidden)), hidden_sharding)
+    v = jax.device_put(normal((total_tokens, hidden)), hidden_sharding)
+    a = jax.device_put(normal((total_tokens, hidden)), hidden_sharding)
+    b = jax.device_put(normal((total_tokens, num_heads)), head_sharding)
+
+    recurrent_indices = np.arange(1, batch_size + 1, dtype=np.int32)
+    if initial_ssm_state is None or initial_conv_state is None:
+        random_ssm, random_conv = create_random_states(
+            batch_size, num_heads, head_dim, conv_kernel_size, dtype, rng
+        )
+        zero_ssm = jnp.zeros_like(random_ssm)
+        zero_conv = jnp.zeros_like(random_conv)
+        if initial_ssm_state is None:
+            initial_ssm_state = zero_ssm if all_have_initial_state else random_ssm
+        if initial_conv_state is None:
+            initial_conv_state = zero_conv if all_have_initial_state else random_conv
+
+    initial_ssm_state = jax.device_put(initial_ssm_state, pool.recurrent_sharding)
+    initial_conv_state = jax.device_put(initial_conv_state, pool.conv_sharding)
+    write_initial_state(pool, layer_id, recurrent_indices, initial_ssm_state, initial_conv_state)
+
+    seq_lens_np = np.asarray(seq_lens, dtype=np.int32)
+    input_ids = np.arange(total_tokens, dtype=np.int32)
+    positions = np.arange(total_tokens, dtype=np.int32)
+    out_cache_loc = np.arange(total_tokens, dtype=np.int32)
+    req_pool_indices = np.arange(batch_size, dtype=np.int32)
+    extend_seq_lens = seq_lens_np if mode == "prefill" else None
+    extend_prefix_lens = np.zeros(batch_size, dtype=np.int32) if mode == "prefill" else None
+    has_initial_state_np = np.full(batch_size, all_have_initial_state, dtype=np.bool_)
+
+    backend = KDAAttnBackend(mesh=test_mesh)
+
+    mwb = ModelWorkerBatch(
+        bid=1,
+        forward_mode=forward_mode,
+        input_ids=input_ids,
+        real_input_ids_len=input_ids.shape[0],
+        seq_lens=seq_lens_np,
+        out_cache_loc=out_cache_loc,
+        req_pool_indices=req_pool_indices,
+        sampling_info=None,
+        positions=positions,
+        cache_loc=out_cache_loc,
+        extend_seq_lens=extend_seq_lens,
+        extend_prefix_lens=extend_prefix_lens,
+        return_logprob=False,
+        return_output_logprob_only=False,
+        top_logprobs_nums=None,
+        token_ids_logprobs=None,
+        extend_logprob_start_lens=None,
+        extend_input_logprob_token_ids=None,
+        logits_indices=np.cumsum(seq_lens_np) - 1 if mode == "prefill" else None,
+        real_bs=batch_size,
+        real_bs_per_dp=[batch_size],
+        dp_size=1,
+        per_dp_bs_size=batch_size,
+        spec_info=None,
+        recurrent_indices=recurrent_indices,
+        has_initial_state=has_initial_state_np,
+    )
+
+    fb = ForwardBatch(
+        bid=1,
+        forward_mode=forward_mode,
+        batch_size=batch_size,
+        input_ids=jnp.asarray(input_ids),
+        req_pool_indices=jnp.asarray(req_pool_indices),
+        seq_lens=jnp.asarray(seq_lens_np),
+        out_cache_loc=jnp.asarray(out_cache_loc),
+        positions=jnp.asarray(positions),
+        attn_backend=backend,
+        cache_loc=jnp.asarray(out_cache_loc),
+        extend_prefix_lens=(
+            jnp.asarray(extend_prefix_lens) if extend_prefix_lens is not None else None
+        ),
+        extend_seq_lens=jnp.asarray(extend_seq_lens) if extend_seq_lens is not None else None,
+        spec_info=None,
+        recurrent_indices=jnp.asarray(recurrent_indices),
+    )
+    fb.attn_backend.forward_metadata = backend.get_forward_metadata(mwb)
+
+    baseline_ssm = initial_ssm_state if all_have_initial_state else jnp.zeros_like(initial_ssm_state)
+    baseline_conv = initial_conv_state if all_have_initial_state else jnp.zeros_like(initial_conv_state)
+    return fb, pool, layer, q, k, v, a, b, baseline_ssm, baseline_conv, recurrent_indices
+
+
 class TestKDAAttention(unittest.TestCase):
     NUM_HEADS = 32
     HEAD_DIM = 128
@@ -390,7 +390,7 @@ class TestKDAAttention(unittest.TestCase):
         seq_lens,
         mode_args=None,
         test_mesh: jax.sharding.Mesh = mesh,
-        has_initial_state: bool = False,
+        all_have_initial_state: bool = False,
         initial_ssm_state: jax.Array | None = None,
         initial_conv_state: jax.Array | None = None,
     ):
@@ -422,7 +422,7 @@ class TestKDAAttention(unittest.TestCase):
             dtype,
             self.rng,
             test_mesh=test_mesh,
-            has_initial_state=has_initial_state,
+            all_have_initial_state=all_have_initial_state,
             initial_ssm_state=initial_ssm_state,
             initial_conv_state=initial_conv_state,
         )
@@ -483,7 +483,7 @@ class TestKDAAttention(unittest.TestCase):
         self.run_test(
             "prefill",
             [64],
-            has_initial_state=True,
+            all_have_initial_state=True,
             initial_ssm_state=ssm,
             initial_conv_state=conv,
         )
@@ -496,7 +496,7 @@ class TestKDAAttention(unittest.TestCase):
         self.run_test(
             "decode",
             [1],
-            has_initial_state=True,
+            all_have_initial_state=True,
             initial_ssm_state=ssm,
             initial_conv_state=conv,
         )
@@ -506,7 +506,7 @@ class TestKDAAttention(unittest.TestCase):
         self.run_test(
             "decode",
             [1, 1, 1],
-            has_initial_state=True,
+            all_have_initial_state=True,
             initial_ssm_state=ssm,
             initial_conv_state=conv,
         )
@@ -541,7 +541,7 @@ class TestKDAAttention(unittest.TestCase):
                 self.CONV_KERNEL_SIZE,
                 self.DTYPE,
                 self.rng,
-                has_initial_state=True,
+                all_have_initial_state=True,
                 initial_ssm_state=ssm_ref,
                 initial_conv_state=conv_ref,
             )

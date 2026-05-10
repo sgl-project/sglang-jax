@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
@@ -23,6 +24,153 @@ def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.nda
     #   in the delta-rule recurrence (S = S*exp(g) + beta*k*(v - k^T S))
     #   without it, round-off error will accumulate across K-dim reductions and T recurrent steps.
     return rng.standard_normal(shape).astype(np.float32) * scale
+
+# --- Reference baselines (verbatim from test_kda_attention.py).
+# Note: each test file ships its own ref helpers rather than sharing across tests. Keep these in sync with the TP file if they diverge.
+
+
+def make_nnx_depthwise_conv(weight_dk: jax.Array) -> nnx.Conv:
+    """Build an nnx.Conv matching short_convolution's [D, K] depthwise kernel."""
+    weight = jnp.asarray(np.asarray(weight_dk), dtype=weight_dk.dtype)
+    hidden, kernel_size = weight.shape
+    conv = nnx.Conv(
+        in_features=hidden,
+        out_features=hidden,
+        kernel_size=(kernel_size,),
+        feature_group_count=hidden,
+        padding=[(kernel_size - 1, 0)],
+        use_bias=False,
+        rngs=nnx.Rngs(0),
+        dtype=weight.dtype,
+        param_dtype=weight.dtype,
+    )
+    conv.kernel.value = jnp.transpose(weight, (1, 0))[:, None, :].astype(conv.kernel.value.dtype)
+    return conv
+
+
+def ref_short_convolution(
+    x: jax.Array,
+    weight: jax.Array,
+    cache: jax.Array,
+    cu_seqlens: jax.Array,
+    forward_mode: ForwardMode,
+) -> tuple[jax.Array, jax.Array]:
+    """nnx.Conv baseline copied from test_short_conv.py's construction style."""
+    x = jnp.asarray(np.asarray(x), dtype=x.dtype)
+    cache = jnp.asarray(np.asarray(cache), dtype=cache.dtype)
+    conv = make_nnx_depthwise_conv(weight)
+    kernel_size = conv.kernel.value.shape[0]
+    cache_width = kernel_size - 1
+
+    if forward_mode == ForwardMode.DECODE:
+        outputs = []
+        for i in range(x.shape[0]):
+            history = jnp.swapaxes(cache[i], 0, 1)
+            full = jnp.concatenate([history, x[i : i + 1]], axis=0)
+            y = conv(full[None, ...])[0]
+            outputs.append(jax.nn.silu(y[-1:]))
+        y = jnp.concatenate(outputs, axis=0)
+        new_cache = jnp.concatenate([cache, x[..., None]], axis=-1)[:, :, 1:]
+        return y, new_cache
+
+    pieces = []
+    new_cache = []
+    cu = np.asarray(cu_seqlens)
+    for i in range(len(cu) - 1):
+        start, end = int(cu[i]), int(cu[i + 1])
+        seq = x[start:end]
+        history = jnp.swapaxes(cache[i], 0, 1)
+        seq_with_history = jnp.concatenate([history, seq], axis=0)
+        y = conv(seq_with_history[None, ...])[0][cache_width:]
+        pieces.append(jax.nn.silu(y))
+
+        if seq.shape[0] >= cache_width:
+            new_cache.append(jnp.swapaxes(seq[-cache_width:], 0, 1))
+        else:
+            new_cache.append(jnp.concatenate([cache[i, :, seq.shape[0] :], seq.T], axis=1))
+
+    return jnp.concatenate(pieces, axis=0), jnp.stack(new_cache, axis=0)
+
+
+def ref_kda_attention(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    a: jax.Array,
+    b: jax.Array,
+    layer: RadixLinearAttention,
+    cu_seqlens: jax.Array,
+    initial_ssm_state: jax.Array,
+    initial_conv_state: jax.Array,
+    forward_mode: ForwardMode,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    num_heads = layer.num_q_heads
+    head_dim = layer.head_q_dim
+
+    q_state, k_state, v_state = jnp.split(initial_conv_state, 3, axis=1)
+    q, q_state = ref_short_convolution(
+        q,
+        layer.q_conv1d.weight.value,
+        q_state,
+        cu_seqlens,
+        forward_mode,
+    )
+    k, k_state = ref_short_convolution(
+        k,
+        layer.k_conv1d.weight.value,
+        k_state,
+        cu_seqlens,
+        forward_mode,
+    )
+    v, v_state = ref_short_convolution(
+        v,
+        layer.v_conv1d.weight.value,
+        v_state,
+        cu_seqlens,
+        forward_mode,
+    )
+
+    q = l2_normalize(q.reshape(q.shape[0], num_heads, head_dim))
+    k = l2_normalize(k.reshape(k.shape[0], num_heads, head_dim))
+    v = v.reshape(v.shape[0], num_heads, head_dim)
+    g = a.reshape(a.shape[0], num_heads, head_dim)
+    g = -jnp.exp(layer.A_log.value.reshape(num_heads, 1).astype(jnp.float32)) * jax.nn.softplus(
+        g.astype(jnp.float32) + layer.dt_bias.value.reshape(num_heads, head_dim).astype(jnp.float32)
+    )
+    g = g.astype(q.dtype)
+
+    # Replicate sharded tensors to host so per-seq slicing works under
+    # JAX's explicit-sharding mode (slicing a `data`-sharded axis would
+    # otherwise raise ShardingTypeError on the gather).
+    def unshard_for_ref(x):
+        return jnp.asarray(np.asarray(x), dtype=x.dtype)
+
+    g = unshard_for_ref(g)
+    b = unshard_for_ref(b)
+    initial_ssm_state = unshard_for_ref(initial_ssm_state)
+
+    cu = np.asarray(cu_seqlens)
+    outputs = []
+    states = []
+    for i in range(len(cu) - 1):
+        start, end = int(cu[i]), int(cu[i + 1])
+        o_i, state_i = naive_recurrent_kda(
+            q[start:end][None],
+            k[start:end][None],
+            v[start:end][None],
+            g[start:end][None],
+            b[start:end][None],
+            scale=layer.scale,
+            initial_state=initial_ssm_state[i : i + 1],
+            output_final_state=True,
+        )
+        outputs.append(o_i[0])
+        states.append(state_i[0])
+
+    output = jnp.concatenate(outputs, axis=0).reshape(q.shape[0], -1)
+    ssm_state = jnp.stack(states, axis=0)
+    conv_state = jnp.concatenate([q_state, k_state, v_state], axis=1)
+    return output, ssm_state, conv_state
 
 
 def set_mesh(tp_size: int, dp_size: int):
@@ -323,51 +471,6 @@ def create_test_data(
     )
 
 
-def _ref_short_convolution_per_seq(
-    x: np.ndarray,
-    weight: np.ndarray,
-    cache: np.ndarray,
-    activation_silu: bool = True,
-) -> tuple[np.ndarray, np.ndarray]:
-    """nnx-equivalent depthwise causal conv on a single packed sequence.
-
-    Mirrors test_kda_attention.ref_short_convolution but takes a single
-    contiguous [T, D] input + [D, K-1] history cache (no cu_seqlens loop —
-    we run this per-request).
-    """
-    from flax import nnx
-
-    weight_j = jnp.asarray(weight)
-    cache_j = jnp.asarray(cache)
-    hidden, kernel_size = weight_j.shape
-    cache_width = kernel_size - 1
-    conv = nnx.Conv(
-        in_features=hidden,
-        out_features=hidden,
-        kernel_size=(kernel_size,),
-        feature_group_count=hidden,
-        padding=[(kernel_size - 1, 0)],
-        use_bias=False,
-        rngs=nnx.Rngs(0),
-        dtype=weight_j.dtype,
-        param_dtype=weight_j.dtype,
-    )
-    conv.kernel.value = jnp.transpose(weight_j, (1, 0))[:, None, :].astype(conv.kernel.value.dtype)
-
-    history = jnp.swapaxes(cache_j, 0, 1)  # [K-1, D]
-    seq_with_history = jnp.concatenate([history, jnp.asarray(x, dtype=weight_j.dtype)], axis=0)
-    y = conv(seq_with_history[None, ...])[0][cache_width:]
-    if activation_silu:
-        y = jax.nn.silu(y)
-
-    seq = jnp.asarray(x, dtype=weight_j.dtype)
-    if seq.shape[0] >= cache_width:
-        new_cache = jnp.swapaxes(seq[-cache_width:], 0, 1)
-    else:
-        new_cache = jnp.concatenate([cache_j[:, seq.shape[0]:], seq.T], axis=1)
-    return np.asarray(y), np.asarray(new_cache)
-
-
 def compute_dp_reference_kda(
     mode: str,
     per_dp_infos: dict,
@@ -377,27 +480,22 @@ def compute_dp_reference_kda(
     per_dp_token_padding: int,
     num_heads: int,
     head_dim: int,
-    conv_kernel_size: int,
     dtype,
 ):
     """Per-rank baseline composed into a global padded layout.
 
-    Mirrors test_kda_attention.ref_kda_attention but scoped per-rank, with
-    results written into the rank's stride in the global output buffer.
+    For each dp_rank, pack its per-request blocks into the same (q/k/v/a/b
+    + cu_seqlens + stacked initial states) interface that ``ref_kda_attention``
+    consumes in the TP test, run the ref once per rank, and write the result
+    into the rank's stride in the global output buffer.
     """
     is_prefill = mode == "prefill"
+    forward_mode = ForwardMode.EXTEND if is_prefill else ForwardMode.DECODE
     hidden = num_heads * head_dim
     global_output_size = (
         dp_size * per_dp_token_padding if is_prefill else dp_size * per_dp_bs_padding
     )
     global_out = np.zeros((global_output_size, hidden), dtype=np.float32)
-
-    # Pull replicated layer params to host.
-    q_w = np.asarray(layer.q_conv1d.weight.value)
-    k_w = np.asarray(layer.k_conv1d.weight.value)
-    v_w = np.asarray(layer.v_conv1d.weight.value)
-    A_log = np.asarray(layer.A_log.value).reshape(num_heads, 1).astype(np.float32)
-    dt_bias = np.asarray(layer.dt_bias.value).reshape(num_heads, head_dim).astype(np.float32)
 
     for dp_rank in range(dp_size):
         info = per_dp_infos[dp_rank]
@@ -406,47 +504,37 @@ def compute_dp_reference_kda(
         token_offset = dp_rank * per_dp_token_padding
         bs_offset = dp_rank * per_dp_bs_padding
 
-        cursor = 0
-        for i, q_len in enumerate(info["seq_lens"]):
-            q_i = info["q"][i]
-            k_i = info["k"][i]
-            v_i = info["v"][i]
-            a_i = info["a"][i]
-            b_i = info["b"][i]
-            ssm0 = info["initial_ssm"][i]
-            conv0 = info["initial_conv"][i]
+        # Pack per-request blocks into [T, hidden] (or [N, hidden] for decode)
+        # plus a cu_seqlens index, and stack per-request initial states.
+        q_packed = jnp.asarray(np.concatenate(info["q"], axis=0), dtype=dtype)
+        k_packed = jnp.asarray(np.concatenate(info["k"], axis=0), dtype=dtype)
+        v_packed = jnp.asarray(np.concatenate(info["v"], axis=0), dtype=dtype)
+        a_packed = jnp.asarray(np.concatenate(info["a"], axis=0), dtype=dtype)
+        b_packed = jnp.asarray(np.concatenate(info["b"], axis=0), dtype=dtype)
+        cu_seqlens = jnp.asarray([0] + np.cumsum(info["seq_lens"]).tolist(), dtype=jnp.int32)
+        initial_ssm = jnp.asarray(np.stack(info["initial_ssm"], axis=0), dtype=jnp.float32)
+        initial_conv = jnp.asarray(np.stack(info["initial_conv"], axis=0), dtype=dtype)
 
-            q_state, k_state, v_state = np.split(conv0, 3, axis=0)
-            q_post, _ = _ref_short_convolution_per_seq(q_i, q_w, q_state)
-            k_post, _ = _ref_short_convolution_per_seq(k_i, k_w, k_state)
-            v_post, _ = _ref_short_convolution_per_seq(v_i, v_w, v_state)
+        rank_out, _, _ = ref_kda_attention(
+            q_packed,
+            k_packed,
+            v_packed,
+            a_packed,
+            b_packed,
+            layer,
+            cu_seqlens,
+            initial_ssm,
+            initial_conv,
+            forward_mode,
+        )
+        rank_out_np = np.asarray(rank_out).reshape(-1, hidden)
 
-            q_h = l2_normalize(jnp.asarray(q_post).reshape(q_len, num_heads, head_dim))
-            k_h = l2_normalize(jnp.asarray(k_post).reshape(q_len, num_heads, head_dim))
-            v_h = jnp.asarray(v_post).reshape(q_len, num_heads, head_dim)
-
-            g = a_i.reshape(q_len, num_heads, head_dim).astype(np.float32)
-            g_act = -np.exp(A_log) * jax.nn.softplus(g + dt_bias)
-            g_act = jnp.asarray(g_act, dtype=q_h.dtype)
-            beta = jnp.asarray(b_i.reshape(q_len, num_heads), dtype=q_h.dtype)
-
-            o_i, _ = naive_recurrent_kda(
-                q_h[None],
-                k_h[None],
-                v_h[None],
-                g_act[None],
-                beta[None],
-                scale=layer.scale,
-                initial_state=jnp.asarray(ssm0[None], dtype=jnp.float32),
-                output_final_state=True,
-            )
-            o_i = np.asarray(o_i[0]).reshape(q_len, hidden)
-
-            if is_prefill:
-                global_out[token_offset + cursor : token_offset + cursor + q_len] = o_i
-                cursor += q_len
-            else:
-                global_out[bs_offset + i] = o_i[0]
+        if is_prefill:
+            valid = sum(info["seq_lens"])
+            global_out[token_offset : token_offset + valid] = rank_out_np
+        else:
+            num_seqs = len(info["seq_lens"])
+            global_out[bs_offset : bs_offset + num_seqs] = rank_out_np
     return global_out
 
 
@@ -495,7 +583,6 @@ class TestKDAAttentionDP(CustomTestCase):
             per_dp_token_padding=per_dp_token_padding,
             num_heads=self.NUM_HEADS,
             head_dim=self.HEAD_DIM,
-            conv_kernel_size=self.CONV_KERNEL_SIZE,
             dtype=self.DTYPE,
         )
         actual, _ = layer(fb, q, k, v, a, b, pool)
