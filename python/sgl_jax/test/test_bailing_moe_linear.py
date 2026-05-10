@@ -1,7 +1,10 @@
 import jax
 import jax.numpy as jnp
 
-from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
+from sgl_jax.srt.configs.bailing_hybrid import (
+    BailingHybridConfig,
+    get_bailing_hybrid_config,
+)
 from sgl_jax.srt.model_loader.arch import get_model_architecture
 from sgl_jax.srt.models.bailing_moe_linear import (
     BailingMoEGQAAttention,
@@ -55,6 +58,24 @@ def test_layer_group_size_builds_upstream_linear_and_full_ids():
     cfg = _tiny_config(num_hidden_layers=16, layer_group_size=8)
     assert cfg.linear_layer_ids == [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14]
     assert cfg.full_attention_layer_ids == [7, 15]
+
+
+def test_bailing_hybrid_config_exposes_runner_linear_state_params():
+    cfg = _tiny_config(num_hidden_layers=8, layer_group_size=2)
+
+    assert get_bailing_hybrid_config(cfg) is cfg
+    assert cfg.linear_attn_config == {
+        "kda_layers": [0, 2, 4, 6],
+        "num_heads": 2,
+        "head_dim": 8,
+        "short_conv_kernel_size": 1,
+    }
+
+    state_params = cfg.linear_state_params
+    assert state_params.layers == [0, 2, 4, 6]
+    assert state_params.num_heads == 2
+    assert state_params.head_dim == 8
+    assert state_params.conv_kernel_size == 1
 
 
 def test_bailing_moe_v2_5_resolves_from_bailing_moe_linear_file():
