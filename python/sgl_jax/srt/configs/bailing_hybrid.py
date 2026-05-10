@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 from transformers import PretrainedConfig
@@ -143,16 +142,6 @@ class BailingHybridConfig(PretrainedConfig):
             if str(block_type).lower() in {"attention", "full_attention"}
         ]
 
-
-@dataclass(frozen=True)
-class BailingHybridLinearConfig:
-    num_hidden_layers: int
-    num_attention_heads: int
-    num_linear_key_value_heads: int
-    head_dim: int
-    linear_layer_ids: list[int]
-    full_attention_layer_ids: list[int]
-
     @property
     def linear_state_params(self):
         from sgl_jax.srt.mem_cache.recurrent_state_pool import (
@@ -178,28 +167,21 @@ class BailingHybridLinearConfig:
         }
 
 
-def get_bailing_hybrid_config(hf_config: Any) -> BailingHybridLinearConfig | None:
+def get_bailing_hybrid_config(hf_config: Any) -> BailingHybridConfig | None:
     if not _is_bailing_hybrid_config(hf_config):
         return None
 
     num_hidden_layers = int(hf_config.num_hidden_layers)
-    num_attention_heads = int(hf_config.num_attention_heads)
-    num_linear_key_value_heads = int(
-        getattr(hf_config, "num_linear_key_value_heads", num_attention_heads)
-    )
-    head_dim = int(hf_config.head_dim)
-    linear_layer_ids, full_attention_layer_ids = _get_layer_ids(hf_config, num_hidden_layers)
+    linear_layer_ids, _ = _get_layer_ids(hf_config, num_hidden_layers)
     if not linear_layer_ids:
         return None
 
-    return BailingHybridLinearConfig(
-        num_hidden_layers=num_hidden_layers,
-        num_attention_heads=num_attention_heads,
-        num_linear_key_value_heads=num_linear_key_value_heads,
-        head_dim=head_dim,
-        linear_layer_ids=linear_layer_ids,
-        full_attention_layer_ids=full_attention_layer_ids,
-    )
+    if isinstance(hf_config, BailingHybridConfig):
+        return hf_config
+
+    config_kwargs = hf_config.to_dict() if hasattr(hf_config, "to_dict") else dict(vars(hf_config))
+    config_kwargs["layers_block_type"] = list(hf_config.layers_block_type)
+    return BailingHybridConfig(**config_kwargs)
 
 
 def _is_bailing_hybrid_config(hf_config: Any) -> bool:
@@ -245,6 +227,5 @@ def _get_layer_ids(hf_config: Any, num_hidden_layers: int) -> tuple[list[int], l
 
 __all__ = [
     "BailingHybridConfig",
-    "BailingHybridLinearConfig",
     "get_bailing_hybrid_config",
 ]
