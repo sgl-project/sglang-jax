@@ -1,21 +1,532 @@
 import unittest
-
-'''
-TODO: test KDAAttnBackend with dp in sgl_jax/srt/layers/attention/linear/kda_backend.py
-    test structure: sgl_jax/test/test_flashattention_dp.py
-    ref short conv: ./test_short_conv.py
-    ref kda kernel: _forward_extend_naive
-    compare kda kernel: _forward_extend_pallas
-
-NOTE: test_flashattention_dp.py copies unique_in_original_order but never calls it
-    (dead code). Use cache_loc[::page_size] for page_table construction.
-'''
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
+
+from sgl_jax.srt.kernels.kda import naive_recurrent_kda
+from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend, l2_normalize
+from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
+from sgl_jax.srt.managers.schedule_batch import PADDING_BUCKETS, ModelWorkerBatch
+from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.utils.common_utils import pad_to_bucket
+from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+from sgl_jax.test.test_utils import CustomTestCase
+
+
+def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.ndarray:
+    # @Scale: 0.1 for kernel inputs/initial states to keep bf16 mantissa precision
+    #   in the delta-rule recurrence (S = S*exp(g) + beta*k*(v - k^T S))
+    #   without it, round-off error will accumulate across K-dim reductions and T recurrent steps.
+    return rng.standard_normal(shape).astype(np.float32) * scale
+
+
+def set_mesh(tp_size: int, dp_size: int):
+    if tp_size * dp_size != jax.device_count():
+        raise RuntimeError(
+            f"tp_size * dp_size must equal to available device count {jax.device_count()}, but got tp_size {tp_size}, dp_size {dp_size}"
+        )
+    mesh = create_device_mesh(ici_parallelism=[dp_size, tp_size], dcn_parallelism=[1, 1])
+    jax.sharding.set_mesh(mesh)
+    return mesh
+
+
+def create_test_data(
+    mode: str,
+    lens_dict: dict[int, list[int]],  # {dp_rank: [seq_len, ...]}
+    num_heads: int,
+    head_dim: int,
+    conv_kernel_size: int,
+    dtype,
+    mesh,
+    dp_size: int,
+    seed: int = 0,
+):
+    """Build a ForwardBatch + RecurrentStatePool + global padded q/k/v/a/b for DP testing.
+
+    Layout strides:
+      - prefill: token-axis strided by per_dp_token_padding
+      - decode:  batch-axis strided by per_dp_bs_padding (q/k/v are [B,...])
+    Per-rank initial states are written into the pool buffer slots
+    `[dp_rank * (slots_per_rank + 1) + 1, ...]` (slot 0 of each rank reserved).
+    """
+    assert mode in ("prefill", "decode")
+    is_prefill = mode == "prefill"
+    forward_mode = ForwardMode.EXTEND if is_prefill else ForwardMode.DECODE
+    hidden = num_heads * head_dim
+    layer_id = 0
+
+    # 1. Padding: per-DP token / bs buckets.
+    max_tokens_per_dp = 0
+    max_bs_per_dp = 0
+    for reqs in lens_dict.values():
+        toks = sum(reqs) if is_prefill else len(reqs)
+        max_tokens_per_dp = max(max_tokens_per_dp, toks)
+        max_bs_per_dp = max(max_bs_per_dp, len(reqs))
+    per_dp_token_padding, _ = pad_to_bucket(max(max_tokens_per_dp, 1), PADDING_BUCKETS)
+    per_dp_bs_padding, _ = pad_to_bucket(max(max_bs_per_dp, 1), [1, 2, 4, 8, 16, 32, 64])
+
+    total_tokens = per_dp_token_padding * dp_size
+    total_bs = per_dp_bs_padding * dp_size
+
+    # In prefill q/k/v are [T, hidden]; in decode they are [B, hidden].
+    global_input_size = total_tokens if is_prefill else total_bs
+
+    # 2. Pool. Pool size must be divisible by dp_size; use per_dp_bs_padding * dp_size.
+    pool_size = per_dp_bs_padding * dp_size
+    pool = RecurrentStatePool(
+        linear_recurrent_layer_ids=[layer_id],
+        size=pool_size,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        conv_kernel_size=conv_kernel_size,
+        mesh=mesh,
+        dp_size=dp_size,
+        recurrent_partition_axis="tensor",
+        conv_partition_axis="tensor",
+        data_partition_axis="data",
+        temporal_dtype=jnp.float32,
+        conv_dtype=dtype,
+    )
+    slots_per_rank = pool.slots_per_rank  # valid slots per rank (excl. dummy)
+    rank_stride = slots_per_rank + 1  # +1 dummy at index 0 per rank
+
+    # 3. Layer (RadixLinearAttention) with sharded random params.
+    rng = np.random.default_rng(seed)
+    conv_sharding = NamedSharding(mesh, P("tensor", None))
+    param_head_sharding = NamedSharding(mesh, P("tensor", None))
+
+    def normal(shape, scale=0.1):
+        return jnp.asarray(_scaled_randn(rng, shape, scale), dtype=dtype)
+
+    def conv_weight():
+        return jax.device_put(normal((hidden, conv_kernel_size), scale=1.0), conv_sharding)
+
+    layer = RadixLinearAttention(
+        layer_id=layer_id,
+        num_q_heads=num_heads,
+        num_k_heads=num_heads,
+        num_v_heads=num_heads,
+        head_q_dim=head_dim,
+        head_k_dim=head_dim,
+        head_v_dim=head_dim,
+        q_conv1d=SimpleNamespace(weight=SimpleNamespace(value=conv_weight())),
+        k_conv1d=SimpleNamespace(weight=SimpleNamespace(value=conv_weight())),
+        v_conv1d=SimpleNamespace(weight=SimpleNamespace(value=conv_weight())),
+        activation="silu",
+        A_log=SimpleNamespace(value=jax.device_put(normal((num_heads, 1), scale=1.0), param_head_sharding)),
+        dt_bias=SimpleNamespace(
+            value=jax.device_put(normal((num_heads, head_dim), scale=1.0), param_head_sharding)
+        ),
+        scale=head_dim**-0.5,
+    )
+
+    # 4. Per-rank random data + initial state. Buffers built on host (NumPy),
+    # transferred to device with proper sharding at the end.
+    q_global = np.zeros((global_input_size, hidden), dtype=np.float32)
+    k_global = np.zeros((global_input_size, hidden), dtype=np.float32)
+    v_global = np.zeros((global_input_size, hidden), dtype=np.float32)
+    a_global = np.zeros((global_input_size, hidden), dtype=np.float32)
+    b_global = np.zeros((global_input_size, num_heads), dtype=np.float32)
+
+    seq_lens_cpu = np.zeros(total_bs, dtype=np.int32)
+    extend_seq_lens_cpu = np.zeros(total_bs, dtype=np.int32) if is_prefill else None
+    extend_prefix_lens_cpu = np.zeros(total_bs, dtype=np.int32) if is_prefill else None
+    recurrent_indices_cpu = np.zeros(total_bs, dtype=np.int32)
+    has_initial_state_cpu = np.zeros(total_bs, dtype=np.bool_)
+
+    # Pool init state buffers: full [total_slots, ...] layout, per-rank shards.
+    ssm_init_full = np.zeros(
+        (pool.total_slots, num_heads, head_dim, head_dim), dtype=np.float32
+    )
+    conv_init_full = np.zeros(
+        (pool.total_slots, pool.proj_size, conv_kernel_size - 1), dtype=np.float32
+    )
+
+    per_dp_infos = {}
+    for dp_rank in range(dp_size):
+        reqs = lens_dict.get(dp_rank, [])
+        rank_rng = np.random.default_rng(seed + dp_rank * 100 + 1)
+
+        bs_offset = dp_rank * per_dp_bs_padding
+        token_offset = dp_rank * per_dp_token_padding
+        slot_base = dp_rank * rank_stride  # dummy at slot_base, valid at slot_base+1 ..
+
+        rank_q_blocks, rank_k_blocks, rank_v_blocks = [], [], []
+        rank_a_blocks, rank_b_blocks = [], []
+        rank_seq_lens = []
+        rank_initial_ssm = []
+        rank_initial_conv = []
+        rank_indices = []
+        cursor = 0
+        for i, q_len in enumerate(reqs):
+            q_i = _scaled_randn(rank_rng, (q_len, hidden))
+            k_i = _scaled_randn(rank_rng, (q_len, hidden))
+            v_i = _scaled_randn(rank_rng, (q_len, hidden))
+            a_i = _scaled_randn(rank_rng, (q_len, hidden))
+            b_i = _scaled_randn(rank_rng, (q_len, num_heads))
+
+            # Initial state for this request: zero (has_initial_state=False).
+            # Test #1 uses fresh requests — h0 = 0 across the board.
+            ssm_i = np.zeros((num_heads, head_dim, head_dim), dtype=np.float32)
+            conv_i = np.zeros((pool.proj_size, conv_kernel_size - 1), dtype=np.float32)
+
+            # Per-rank local slot index: 1..slots_per_rank.
+            local_slot = i + 1
+            global_slot = slot_base + local_slot
+            recurrent_indices_cpu[bs_offset + i] = local_slot
+            seq_lens_cpu[bs_offset + i] = q_len
+            if is_prefill:
+                extend_seq_lens_cpu[bs_offset + i] = q_len
+                extend_prefix_lens_cpu[bs_offset + i] = 0
+            has_initial_state_cpu[bs_offset + i] = False
+
+            ssm_init_full[global_slot] = ssm_i
+            conv_init_full[global_slot] = conv_i
+
+            if is_prefill:
+                slc = slice(token_offset + cursor, token_offset + cursor + q_len)
+                q_global[slc] = q_i
+                k_global[slc] = k_i
+                v_global[slc] = v_i
+                a_global[slc] = a_i
+                b_global[slc] = b_i
+                cursor += q_len
+            else:
+                # Decode: q_len must be 1; place at batch slot.
+                assert q_len == 1, f"decode requires q_len=1, got {q_len}"
+                idx = bs_offset + i
+                q_global[idx] = q_i[0]
+                k_global[idx] = k_i[0]
+                v_global[idx] = v_i[0]
+                a_global[idx] = a_i[0]
+                b_global[idx] = b_i[0]
+
+            rank_q_blocks.append(q_i)
+            rank_k_blocks.append(k_i)
+            rank_v_blocks.append(v_i)
+            rank_a_blocks.append(a_i)
+            rank_b_blocks.append(b_i)
+            rank_seq_lens.append(q_len)
+            rank_initial_ssm.append(ssm_i)
+            rank_initial_conv.append(conv_i)
+            rank_indices.append(local_slot)
+        per_dp_infos[dp_rank] = {
+            "q": rank_q_blocks,
+            "k": rank_k_blocks,
+            "v": rank_v_blocks,
+            "a": rank_a_blocks,
+            "b": rank_b_blocks,
+            "seq_lens": rank_seq_lens,
+            "initial_ssm": rank_initial_ssm,
+            "initial_conv": rank_initial_conv,
+            "indices": rank_indices,
+        }
+
+    # 5. Push pool init state (full buffer, sharded P("data","tensor",None,None)).
+    ssm_init_dev = jax.device_put(
+        jnp.asarray(ssm_init_full, dtype=pool.temporal_dtype), pool.recurrent_sharding
+    )
+    conv_init_dev = jax.device_put(
+        jnp.asarray(conv_init_full, dtype=pool.conv_dtype), pool.conv_sharding
+    )
+    pool.replace_buffer(([ssm_init_dev], [[conv_init_dev]]))
+
+    # 6. Build mwb + ForwardBatch.
+    input_ids_cpu = np.zeros(global_input_size, dtype=np.int32)
+    positions_cpu = np.zeros(global_input_size, dtype=np.int32)
+    out_cache_loc_cpu = np.arange(global_input_size, dtype=np.int32)
+    req_pool_indices_cpu = np.arange(total_bs, dtype=np.int32)
+
+    real_bs_per_dp = [len(lens_dict.get(r, [])) for r in range(dp_size)]
+    backend = KDAAttnBackend(mesh=mesh)
+
+    mwb = ModelWorkerBatch(
+        bid=1,
+        forward_mode=forward_mode,
+        input_ids=input_ids_cpu,
+        real_input_ids_len=input_ids_cpu.shape[0],
+        seq_lens=seq_lens_cpu,
+        out_cache_loc=out_cache_loc_cpu,
+        req_pool_indices=req_pool_indices_cpu,
+        positions=positions_cpu,
+        cache_loc=out_cache_loc_cpu,
+        extend_seq_lens=extend_seq_lens_cpu,
+        extend_prefix_lens=extend_prefix_lens_cpu,
+        sampling_info=None,
+        return_logprob=False,
+        return_output_logprob_only=False,
+        top_logprobs_nums=None,
+        token_ids_logprobs=None,
+        extend_logprob_start_lens=None,
+        extend_input_logprob_token_ids=None,
+        logits_indices=(
+            np.zeros(total_bs, dtype=np.int32) if is_prefill else None
+        ),
+        real_bs=total_bs,
+        real_bs_per_dp=real_bs_per_dp,
+        dp_size=dp_size,
+        per_dp_bs_size=per_dp_bs_padding,
+        spec_info=None,
+        recurrent_indices=recurrent_indices_cpu,
+        has_initial_state=has_initial_state_cpu,
+    )
+
+    fb = ForwardBatch(
+        bid=1,
+        forward_mode=forward_mode,
+        batch_size=total_bs,
+        input_ids=jnp.asarray(input_ids_cpu),
+        req_pool_indices=jnp.asarray(req_pool_indices_cpu),
+        seq_lens=jnp.asarray(seq_lens_cpu),
+        out_cache_loc=jnp.asarray(out_cache_loc_cpu),
+        positions=jnp.asarray(positions_cpu),
+        attn_backend=backend,
+        cache_loc=jnp.asarray(out_cache_loc_cpu),
+        extend_prefix_lens=(
+            jnp.asarray(extend_prefix_lens_cpu) if extend_prefix_lens_cpu is not None else None
+        ),
+        extend_seq_lens=(
+            jnp.asarray(extend_seq_lens_cpu) if extend_seq_lens_cpu is not None else None
+        ),
+        spec_info=None,
+        recurrent_indices=jnp.asarray(recurrent_indices_cpu),
+    )
+    fb.attn_backend.forward_metadata = backend.get_forward_metadata(mwb)
+
+    # Shard global tensors as the backend expects: q/k/v/a [*, hidden] sharded
+    # P("data","tensor"); b [*, H] sharded P("data","tensor").
+    hidden_sharding = NamedSharding(mesh, P("data", "tensor"))
+    head_sharding = NamedSharding(mesh, P("data", "tensor"))
+    q_dev = jax.device_put(jnp.asarray(q_global, dtype=dtype), hidden_sharding)
+    k_dev = jax.device_put(jnp.asarray(k_global, dtype=dtype), hidden_sharding)
+    v_dev = jax.device_put(jnp.asarray(v_global, dtype=dtype), hidden_sharding)
+    a_dev = jax.device_put(jnp.asarray(a_global, dtype=dtype), hidden_sharding)
+    b_dev = jax.device_put(jnp.asarray(b_global, dtype=dtype), head_sharding)
+
+    return (
+        fb,
+        pool,
+        layer,
+        q_dev,
+        k_dev,
+        v_dev,
+        a_dev,
+        b_dev,
+        per_dp_infos,
+        per_dp_bs_padding,
+        per_dp_token_padding,
+    )
+
+
+def _ref_short_convolution_per_seq(
+    x: np.ndarray,
+    weight: np.ndarray,
+    cache: np.ndarray,
+    activation_silu: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """nnx-equivalent depthwise causal conv on a single packed sequence.
+
+    Mirrors test_kda_attention.ref_short_convolution but takes a single
+    contiguous [T, D] input + [D, K-1] history cache (no cu_seqlens loop —
+    we run this per-request).
+    """
+    from flax import nnx
+
+    weight_j = jnp.asarray(weight)
+    cache_j = jnp.asarray(cache)
+    hidden, kernel_size = weight_j.shape
+    cache_width = kernel_size - 1
+    conv = nnx.Conv(
+        in_features=hidden,
+        out_features=hidden,
+        kernel_size=(kernel_size,),
+        feature_group_count=hidden,
+        padding=[(kernel_size - 1, 0)],
+        use_bias=False,
+        rngs=nnx.Rngs(0),
+        dtype=weight_j.dtype,
+        param_dtype=weight_j.dtype,
+    )
+    conv.kernel.value = jnp.transpose(weight_j, (1, 0))[:, None, :].astype(conv.kernel.value.dtype)
+
+    history = jnp.swapaxes(cache_j, 0, 1)  # [K-1, D]
+    seq_with_history = jnp.concatenate([history, jnp.asarray(x, dtype=weight_j.dtype)], axis=0)
+    y = conv(seq_with_history[None, ...])[0][cache_width:]
+    if activation_silu:
+        y = jax.nn.silu(y)
+
+    seq = jnp.asarray(x, dtype=weight_j.dtype)
+    if seq.shape[0] >= cache_width:
+        new_cache = jnp.swapaxes(seq[-cache_width:], 0, 1)
+    else:
+        new_cache = jnp.concatenate([cache_j[:, seq.shape[0]:], seq.T], axis=1)
+    return np.asarray(y), np.asarray(new_cache)
+
+
+def compute_dp_reference_kda(
+    mode: str,
+    per_dp_infos: dict,
+    layer: RadixLinearAttention,
+    dp_size: int,
+    per_dp_bs_padding: int,
+    per_dp_token_padding: int,
+    num_heads: int,
+    head_dim: int,
+    conv_kernel_size: int,
+    dtype,
+):
+    """Per-rank baseline composed into a global padded layout.
+
+    Mirrors test_kda_attention.ref_kda_attention but scoped per-rank, with
+    results written into the rank's stride in the global output buffer.
+    """
+    is_prefill = mode == "prefill"
+    hidden = num_heads * head_dim
+    global_output_size = (
+        dp_size * per_dp_token_padding if is_prefill else dp_size * per_dp_bs_padding
+    )
+    global_out = np.zeros((global_output_size, hidden), dtype=np.float32)
+
+    # Pull replicated layer params to host.
+    q_w = np.asarray(layer.q_conv1d.weight.value)
+    k_w = np.asarray(layer.k_conv1d.weight.value)
+    v_w = np.asarray(layer.v_conv1d.weight.value)
+    A_log = np.asarray(layer.A_log.value).reshape(num_heads, 1).astype(np.float32)
+    dt_bias = np.asarray(layer.dt_bias.value).reshape(num_heads, head_dim).astype(np.float32)
+
+    for dp_rank in range(dp_size):
+        info = per_dp_infos[dp_rank]
+        if not info["seq_lens"]:
+            continue
+        token_offset = dp_rank * per_dp_token_padding
+        bs_offset = dp_rank * per_dp_bs_padding
+
+        cursor = 0
+        for i, q_len in enumerate(info["seq_lens"]):
+            q_i = info["q"][i]
+            k_i = info["k"][i]
+            v_i = info["v"][i]
+            a_i = info["a"][i]
+            b_i = info["b"][i]
+            ssm0 = info["initial_ssm"][i]
+            conv0 = info["initial_conv"][i]
+
+            q_state, k_state, v_state = np.split(conv0, 3, axis=0)
+            q_post, _ = _ref_short_convolution_per_seq(q_i, q_w, q_state)
+            k_post, _ = _ref_short_convolution_per_seq(k_i, k_w, k_state)
+            v_post, _ = _ref_short_convolution_per_seq(v_i, v_w, v_state)
+
+            q_h = l2_normalize(jnp.asarray(q_post).reshape(q_len, num_heads, head_dim))
+            k_h = l2_normalize(jnp.asarray(k_post).reshape(q_len, num_heads, head_dim))
+            v_h = jnp.asarray(v_post).reshape(q_len, num_heads, head_dim)
+
+            g = a_i.reshape(q_len, num_heads, head_dim).astype(np.float32)
+            g_act = -np.exp(A_log) * jax.nn.softplus(g + dt_bias)
+            g_act = jnp.asarray(g_act, dtype=q_h.dtype)
+            beta = jnp.asarray(b_i.reshape(q_len, num_heads), dtype=q_h.dtype)
+
+            o_i, _ = naive_recurrent_kda(
+                q_h[None],
+                k_h[None],
+                v_h[None],
+                g_act[None],
+                beta[None],
+                scale=layer.scale,
+                initial_state=jnp.asarray(ssm0[None], dtype=jnp.float32),
+                output_final_state=True,
+            )
+            o_i = np.asarray(o_i[0]).reshape(q_len, hidden)
+
+            if is_prefill:
+                global_out[token_offset + cursor : token_offset + cursor + q_len] = o_i
+                cursor += q_len
+            else:
+                global_out[bs_offset + i] = o_i[0]
+    return global_out
+
+
+class TestKDAAttentionDP(CustomTestCase):
+    NUM_HEADS = 32
+    HEAD_DIM = 128
+    CONV_KERNEL_SIZE = 4
+    DTYPE = jnp.bfloat16
+
+    def setUp(self):
+        if not jax.devices():
+            self.skipTest("JAX not available")
+        if jax.default_backend() != "tpu":
+            self.skipTest("KDA chunked EXTEND kernel uses TPU Pallas primitives")
+
+    def _run(self, mode: str, lens_dict: dict[int, list[int]], dp_size: int, tp_size: int):
+        mesh = set_mesh(tp_size=tp_size, dp_size=dp_size)
+        (
+            fb,
+            pool,
+            layer,
+            q,
+            k,
+            v,
+            a,
+            b,
+            per_dp_infos,
+            per_dp_bs_padding,
+            per_dp_token_padding,
+        ) = create_test_data(
+            mode,
+            lens_dict,
+            self.NUM_HEADS,
+            self.HEAD_DIM,
+            self.CONV_KERNEL_SIZE,
+            self.DTYPE,
+            mesh,
+            dp_size=dp_size,
+        )
+        expected = compute_dp_reference_kda(
+            mode,
+            per_dp_infos,
+            layer,
+            dp_size=dp_size,
+            per_dp_bs_padding=per_dp_bs_padding,
+            per_dp_token_padding=per_dp_token_padding,
+            num_heads=self.NUM_HEADS,
+            head_dim=self.HEAD_DIM,
+            conv_kernel_size=self.CONV_KERNEL_SIZE,
+            dtype=self.DTYPE,
+        )
+        actual, _ = layer(fb, q, k, v, a, b, pool)
+        actual_np = np.asarray(actual)
+
+        # Only compare rank-valid token / batch positions; padded slots in
+        # the global buffer hold garbage from the kernel and are ignored.
+        is_prefill = mode == "prefill"
+        for dp_rank in range(dp_size):
+            info = per_dp_infos[dp_rank]
+            if not info["seq_lens"]:
+                continue
+            valid = sum(info["seq_lens"]) if is_prefill else len(info["seq_lens"])
+            offset = (
+                dp_rank * per_dp_token_padding if is_prefill else dp_rank * per_dp_bs_padding
+            )
+            np.testing.assert_allclose(
+                actual_np[offset : offset + valid],
+                expected[offset : offset + valid],
+                rtol=2e-2,
+                atol=2e-2,
+                err_msg=f"DP rank {dp_rank} output mismatch",
+            )
+
+    def test_extend_dp4_tp1(self):
+        self._run(
+            "prefill",
+            {0: [128], 1: [64], 2: [32, 64], 3: [128]},
+            dp_size=4,
+            tp_size=1,
+        )
 
 
 if __name__ == "__main__":

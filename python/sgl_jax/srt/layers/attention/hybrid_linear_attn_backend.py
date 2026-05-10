@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -22,8 +21,6 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
-
-logger = logging.getLogger(__name__)
 
 
 # --- Linear (state-based) attention base classes ----------------------------
@@ -72,7 +69,7 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         """Return the metadata for a forward pass."""
         metadata = LinearRecurrentAttnBackendMetadata()
 
-        # cu_q_lens per DP rank section (each section starts from 0)
+        # Unified 2D reshape logic for all dp_size (including dp_size=1)
         if batch.forward_mode == ForwardMode.EXTEND:
             ext_2d = batch.extend_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
             cu_q_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)

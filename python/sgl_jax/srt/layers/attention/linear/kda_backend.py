@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.kernels.kda import chunk_kda, fused_recurrent_kda
+from sgl_jax.srt.kernels.kda import chunk_kda, naive_recurrent_kda
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
 )
@@ -163,12 +163,22 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         )
         conv_buffer = conv_buffer_list[0]
 
-        ssm = recurrent_buffer.at[recurrent_indices].get(
-            out_sharding=recurrent_state_pool.recurrent_sharding
-        )
-        conv = conv_buffer.at[recurrent_indices].get(
-            out_sharding=recurrent_state_pool.conv_sharding
-        )
+        ssm = jax.shard_map(
+            lambda buf, idx: buf[idx],
+            mesh=self.mesh,
+            in_specs=(P("data", "tensor", None, None), P("data")),
+            out_specs=P("data", "tensor", None, None),
+            check_vma=False,
+        )(recurrent_buffer, recurrent_indices)
+
+        conv = jax.shard_map(
+            lambda buf, idx: buf[idx],
+            mesh=self.mesh,
+            in_specs=(P("data", "tensor", None), P("data")),
+            out_specs=P("data", "tensor", None),
+            check_vma=False,
+        )(conv_buffer, recurrent_indices)
+
         has_initial_state = self.forward_metadata.has_initial_state
         if has_initial_state is not None:
             ssm = jnp.where(has_initial_state[:, None, None, None], ssm, 0.0)
@@ -184,9 +194,18 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         rebinding ``RecurrentStatePool.recurrent_buffers[idx]``.
         """
         full_recurrent, _ = self.get_layer_cache(recurrent_state_pool, layer_id)
-        return full_recurrent.at[recurrent_indices].set(
-            new_recurrent, out_sharding=recurrent_state_pool.recurrent_sharding
-        )
+
+        return jax.shard_map(
+            lambda buf, idx, val: buf.at[idx].set(val),
+            mesh=self.mesh,
+            in_specs=(
+                P("data", "tensor", None, None),
+                P("data"),
+                P("data", "tensor", None, None),
+            ),
+            out_specs=P("data", "tensor", None, None),
+            check_vma=False,
+        )(full_recurrent, recurrent_indices, new_recurrent)
 
     def set_conv_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_conv_packed):
         """Scatter per-request packed conv state into the FULL pool buffer.
@@ -198,11 +217,19 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         _, conv_buffer_list = self.get_layer_cache(recurrent_state_pool, layer_id)
         assert len(conv_buffer_list) == 1
         full_conv = conv_buffer_list[0]
-        return [
-            full_conv.at[recurrent_indices].set(
-                new_conv_packed, out_sharding=recurrent_state_pool.conv_sharding
-            )
-        ]
+
+        new_conv_full = jax.shard_map(
+            lambda buf, idx, val: buf.at[idx].set(val),
+            mesh=self.mesh,
+            in_specs=(
+                P("data", "tensor", None),
+                P("data"),
+                P("data", "tensor", None),
+            ),
+            out_specs=P("data", "tensor", None),
+            check_vma=False,
+        )(full_conv, recurrent_indices, new_conv_packed)
+        return [new_conv_full]
 
     # ------------------------------------------------------------------
     # Forward mode implementations
@@ -341,19 +368,39 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
     ) -> tuple[jax.Array, jax.Array]:
         """Single-step decode via naive JAX recurrence (Pallas decode TBD).  Returns (output, new_state)."""
         g = self._fused_kda_gate(layer, g)
-        # Kernel expects [B, T=1, H, K].
-        o, final_state = fused_recurrent_kda(
-            q[:, None, ...],
-            k[:, None, ...],
-            v[:, None, ...],
-            g[:, None, ...],
-            beta[:, None, ...],
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=True,
+
+        def _decode_kernel(q_d, k_d, v_d, g_d, beta_d, h0):
+            # T=1 unsqueeze inside so in_specs stay 3-D for q/k/v/g and 2-D for beta.
+            o, final_state = naive_recurrent_kda(
+                q_d[:, None, ...],
+                k_d[:, None, ...],
+                v_d[:, None, ...],
+                g_d[:, None, ...],
+                beta_d[:, None, ...],
+                scale=scale,
+                initial_state=h0,
+                output_final_state=True,
+            )
+            return o[:, 0], final_state
+
+        sharded = jax.shard_map(
+            _decode_kernel,
+            mesh=self.mesh,
+            in_specs=(
+                P("data", "tensor", None),        # q [B, H, K]
+                P("data", "tensor", None),        # k [B, H, K]
+                P("data", "tensor", None),        # v [B, H, V]
+                P("data", "tensor", None),        # g [B, H, K]
+                P("data", "tensor"),               # beta [B, H]
+                P("data", "tensor", None, None),  # h0 [B, H, K, V]
+            ),
+            out_specs=(
+                P("data", "tensor", None),        # o [B, H, V]
+                P("data", "tensor", None, None),  # final_state [B, H, K, V]
+            ),
+            check_vma=False,
         )
-        # Remove the T=1 dim: [B, 1, H, V] -> [B, H, V]
-        return o[:, 0], final_state
+        return sharded(q, k, v, g, beta, initial_state)
 
     def _fused_kda_gate(
         self,

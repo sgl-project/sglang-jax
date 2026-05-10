@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import unittest
 from types import SimpleNamespace
 
@@ -10,7 +8,7 @@ from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.kernels.kda import fused_recurrent_kda
+from sgl_jax.srt.kernels.kda import naive_recurrent_kda
 from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend, l2_normalize
 from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -20,6 +18,13 @@ from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
 mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 jax.sharding.set_mesh(mesh)
+
+
+def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.ndarray:
+    # @Scale: 0.1 for kernel inputs/initial states to keep bf16 mantissa precision
+    #   in the delta-rule recurrence (S = S*exp(g) + beta*k*(v - k^T S))
+    #   without it, round-off error will accumulate across K-dim reductions and T recurrent steps.
+    return rng.standard_normal(shape).astype(np.float32) * scale
 
 
 def create_random_states(
@@ -32,12 +37,11 @@ def create_random_states(
 ) -> tuple[jax.Array, jax.Array]:
     hidden = num_heads * head_dim
     ssm = jnp.asarray(
-        rng.standard_normal((batch_size, num_heads, head_dim, head_dim)).astype(np.float32) * 0.1,
+        _scaled_randn(rng, (batch_size, num_heads, head_dim, head_dim)),
         dtype=jnp.float32,
     )
     conv = jnp.asarray(
-        rng.standard_normal((batch_size, hidden * 3, conv_kernel_size - 1)).astype(np.float32)
-        * 0.1,
+        _scaled_randn(rng, (batch_size, hidden * 3, conv_kernel_size - 1)),
         dtype=dtype,
     )
     return ssm, conv
@@ -155,11 +159,11 @@ def create_test_data(
     head_sharding = NamedSharding(test_mesh, P("data", "tensor"))
     param_head_sharding = NamedSharding(test_mesh, P("tensor", None))
 
-    def normal(shape):
-        return jnp.asarray(rng.standard_normal(shape).astype(np.float32) * 0.1, dtype=dtype)
+    def normal(shape, scale=0.1):
+        return jnp.asarray(_scaled_randn(rng, shape, scale), dtype=dtype)
 
     def conv_weight():
-        return jax.device_put(normal((hidden, conv_kernel_size)), conv_sharding)
+        return jax.device_put(normal((hidden, conv_kernel_size), scale=1.0), conv_sharding)
 
     layer = RadixLinearAttention(
         layer_id=layer_id,
@@ -174,10 +178,10 @@ def create_test_data(
         v_conv1d=SimpleNamespace(weight=SimpleNamespace(value=conv_weight())),
         activation="silu",
         A_log=SimpleNamespace(
-            value=jax.device_put(normal((num_heads, 1)), param_head_sharding)
+            value=jax.device_put(normal((num_heads, 1), scale=1.0), param_head_sharding)
         ),
         dt_bias=SimpleNamespace(
-            value=jax.device_put(normal((num_heads, head_dim)), param_head_sharding)
+            value=jax.device_put(normal((num_heads, head_dim), scale=1.0), param_head_sharding)
         ),
         scale=head_dim**-0.5,
     )
@@ -344,7 +348,7 @@ def ref_kda_attention(
     states = []
     for i in range(len(cu) - 1):
         start, end = int(cu[i]), int(cu[i + 1])
-        o_i, state_i = fused_recurrent_kda(
+        o_i, state_i = naive_recurrent_kda(
             q[start:end][None],
             k[start:end][None],
             v[start:end][None],
@@ -377,7 +381,7 @@ class TestKDAAttention(unittest.TestCase):
         self.atol = 1e-2
 
     def _skip_extend_without_tpu(self):
-        if jax.default_backend() != "tpu":
+        if jax.default_backend() != "tpu": # TODO: Is this check necessary ?
             self.skipTest("KDA chunked EXTEND kernel uses TPU Pallas primitives")
 
     def run_test(
@@ -541,8 +545,9 @@ class TestKDAAttention(unittest.TestCase):
                 initial_ssm_state=ssm_ref,
                 initial_conv_state=conv_ref,
             )
-            forward_batch.attn_backend.forward_metadata.recurrent_indices = jnp.asarray(
-                recurrent_indices
+            forward_batch.attn_backend.forward_metadata.recurrent_indices = jax.device_put(
+                jnp.asarray(recurrent_indices),
+                NamedSharding(mesh, P("data")),
             )
             expected, ssm_ref, conv_ref = ref_kda_attention(
                 q,
