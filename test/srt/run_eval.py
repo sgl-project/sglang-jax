@@ -52,6 +52,10 @@ def run_eval(args):
         from eval.simple_eval_gsm8k import GSM8KEval
 
         eval_obj = GSM8KEval(args.num_examples, args.num_threads)
+    elif args.eval_name == "aime25":
+        from eval.simple_eval_aime25 import AIME25Eval
+
+        eval_obj = AIME25Eval(args.num_examples, args.num_threads)
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
