@@ -18,10 +18,13 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
+from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
 from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
 from sgl_jax.srt.utils.common_utils import is_remote_url, lru_cache_frozenset
 
-_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {}
+_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
+    BailingHybridConfig.model_type: BailingHybridConfig,
+}
 
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
