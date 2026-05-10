@@ -555,13 +555,13 @@ def _ragged_paged_attention_kernel_loop(
         sem = sems.at[4, bkvmask_sem_idx]
         kvmask_vmem_ref = bkvmask_ref.at[bkvmask_sem_idx]
 
-        # Host side (get_eagle_forward_metadata) 8-aligns kv_lens and pads
-        # custom_mask rows accordingly; hint Mosaic so it can prove the DMA
-        # slice offset/size are tiling(8)-divisible.
-        kv_len = pl.multiple_of(kv_lens_ref[seq_idx], 8)
-        mask_len = kv_len
+        # custom_mask rows are host-padded to 8-aligned kv_len (so mask DMA
+        # offset/size are tiling(8)-divisible) while kv_lens_ref keeps the
+        # unaligned value for _fetch_bkv. Derive the mask stride locally.
+        kv_len_raw = kv_lens_ref[seq_idx]
+        mask_kv_len = pl.multiple_of((kv_len_raw + 7) // 8 * 8, 8)
         mask_start = bkvmask_idx * bkv_sz
-        mask_left = mask_len - mask_start
+        mask_left = mask_kv_len - mask_start
         load_kvmask_sz = pl.multiple_of(jnp.minimum(bkv_sz, mask_left), 8)
 
         q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
@@ -569,12 +569,12 @@ def _ragged_paged_attention_kernel_loop(
         load_q_sz = jnp.minimum(bq_sz, q_end - q_len_start)
 
         cur_seq_mask_start = pl.multiple_of(cu_seq_mask_lens[seq_idx], 8)
-        cur_bq_mask_start = cur_seq_mask_start + bq_idx * bq_sz * kv_len
+        cur_bq_mask_start = cur_seq_mask_start + bq_idx * bq_sz * mask_kv_len
 
         zero_sz = pl.multiple_of(bkv_sz - load_kvmask_sz, 8)
 
         def loop_body(i, _):
-            start = pl.multiple_of(cur_bq_mask_start + i * kv_len + mask_start, 8)
+            start = pl.multiple_of(cur_bq_mask_start + i * mask_kv_len + mask_start, 8)
             _async_copy(
                 custom_mask_ref.at[pl.ds(start, load_kvmask_sz)],
                 kvmask_vmem_ref.at[i, pl.ds(0, load_kvmask_sz)],
@@ -1757,9 +1757,10 @@ def ragged_paged_attention(
             custom_mask = custom_mask.astype(jnp.int32)
         custom_mask = jnp.repeat(jnp.expand_dims(custom_mask, axis=1), repeats=head_dim, axis=1)
 
-        # Prepare cu_seq_mask_lens for custom mask.
+        # Prepare cu_seq_mask_lens for custom mask. Host pads each mask row
+        # to 8-aligned kv_len, so the per-seq stride uses the aligned length.
         q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-        seq_mask_lens = kv_lens * q_lens
+        seq_mask_lens = ((kv_lens + 7) // 8 * 8) * q_lens
         cu_seq_mask_lens = jnp.concatenate(
             [jnp.array([0], dtype=jnp.int32), jnp.cumsum(seq_mask_lens)]
         )
