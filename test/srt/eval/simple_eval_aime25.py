@@ -1,9 +1,9 @@
 # Adapted from https://github.com/openai/simple-evals/ in sglang-jax
 
 import json
+import os
 import re
 import urllib.request
-import os
 
 import eval.simple_eval_common as common
 from eval.simple_eval_common import (
