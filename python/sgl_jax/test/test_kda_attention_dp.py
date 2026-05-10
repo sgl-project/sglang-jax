@@ -185,7 +185,7 @@ def set_mesh(tp_size: int, dp_size: int):
 
 def create_test_data(
     mode: str,
-    lens_dict: dict[int, list[int]],  # {dp_rank: [seq_len, ...]}
+    lens_per_rank: dict[int, list[int]],  # {dp_rank: [seq_len, ...]}
     num_heads: int,
     head_dim: int,
     conv_kernel_size: int,
@@ -193,6 +193,7 @@ def create_test_data(
     mesh,
     dp_size: int,
     seed: int = 0,
+    has_initial_state_per_rank: dict[int, list[bool]] | None = None,  # {dp_rank: [has_initial_state per request]}
 ):
     """Build a ForwardBatch + RecurrentStatePool + global padded q/k/v/a/b for DP testing.
 
@@ -211,7 +212,7 @@ def create_test_data(
     # 1. Padding: per-DP token / bs buckets.
     max_tokens_per_dp = 0
     max_bs_per_dp = 0
-    for reqs in lens_dict.values():
+    for reqs in lens_per_rank.values():
         toks = sum(reqs) if is_prefill else len(reqs)
         max_tokens_per_dp = max(max_tokens_per_dp, toks)
         max_bs_per_dp = max(max_bs_per_dp, len(reqs))
@@ -297,7 +298,7 @@ def create_test_data(
 
     per_dp_infos = {}
     for dp_rank in range(dp_size):
-        reqs = lens_dict.get(dp_rank, [])
+        reqs = lens_per_rank.get(dp_rank, [])
         rank_rng = np.random.default_rng(seed + dp_rank * 100 + 1)
 
         bs_offset = dp_rank * per_dp_bs_padding
@@ -318,10 +319,21 @@ def create_test_data(
             a_i = _scaled_randn(rank_rng, (q_len, hidden))
             b_i = _scaled_randn(rank_rng, (q_len, num_heads))
 
-            # Initial state for this request: zero (has_initial_state=False).
-            # Test #1 uses fresh requests — h0 = 0 across the board.
-            ssm_i = np.zeros((num_heads, head_dim, head_dim), dtype=np.float32)
-            conv_i = np.zeros((pool.proj_size, conv_kernel_size - 1), dtype=np.float32)
+            # Per-request initial state. ``has_initial_state_per_rank`` (when
+            # provided) names the requests that should carry a random initial
+            # state; everything else stays zero, matching codebase semantics
+            # (False = new request, True = continuing).
+            req_has_initial_state = (
+                has_initial_state_per_rank is not None
+                and i < len(has_initial_state_per_rank.get(dp_rank, []))
+                and bool(has_initial_state_per_rank[dp_rank][i])
+            )
+            if req_has_initial_state:
+                ssm_i = _scaled_randn(rank_rng, (num_heads, head_dim, head_dim))
+                conv_i = _scaled_randn(rank_rng, (pool.proj_size, conv_kernel_size - 1))
+            else:
+                ssm_i = np.zeros((num_heads, head_dim, head_dim), dtype=np.float32)
+                conv_i = np.zeros((pool.proj_size, conv_kernel_size - 1), dtype=np.float32)
 
             # Per-rank local slot index: 1..slots_per_rank.
             local_slot = i + 1
@@ -331,7 +343,7 @@ def create_test_data(
             if is_prefill:
                 extend_seq_lens_cpu[bs_offset + i] = q_len
                 extend_prefix_lens_cpu[bs_offset + i] = 0
-            has_initial_state_cpu[bs_offset + i] = False
+            has_initial_state_cpu[bs_offset + i] = req_has_initial_state
 
             ssm_init_full[global_slot] = ssm_i
             conv_init_full[global_slot] = conv_i
@@ -390,7 +402,7 @@ def create_test_data(
     out_cache_loc_cpu = np.arange(global_input_size, dtype=np.int32)
     req_pool_indices_cpu = np.arange(total_bs, dtype=np.int32)
 
-    real_bs_per_dp = [len(lens_dict.get(r, [])) for r in range(dp_size)]
+    real_bs_per_dp = [len(lens_per_rank.get(r, [])) for r in range(dp_size)]
     backend = KDAAttnBackend(mesh=mesh)
 
     mwb = ModelWorkerBatch(
@@ -481,13 +493,17 @@ def compute_dp_reference_kda(
     num_heads: int,
     head_dim: int,
     dtype,
-):
+) -> tuple[np.ndarray, dict[int, tuple[np.ndarray, np.ndarray]]]:
     """Per-rank baseline composed into a global padded layout.
 
     For each dp_rank, pack its per-request blocks into the same (q/k/v/a/b
     + cu_seqlens + stacked initial states) interface that ``ref_kda_attention``
     consumes in the TP test, run the ref once per rank, and write the result
     into the rank's stride in the global output buffer.
+
+    Returns:
+        global_out: [global_output_size, hidden] padded output
+        per_dp_final_states: {dp_rank: (final_ssm, final_conv)} for continuing
     """
     is_prefill = mode == "prefill"
     forward_mode = ForwardMode.EXTEND if is_prefill else ForwardMode.DECODE
@@ -496,6 +512,7 @@ def compute_dp_reference_kda(
         dp_size * per_dp_token_padding if is_prefill else dp_size * per_dp_bs_padding
     )
     global_out = np.zeros((global_output_size, hidden), dtype=np.float32)
+    per_dp_final_states = {}
 
     for dp_rank in range(dp_size):
         info = per_dp_infos[dp_rank]
@@ -515,7 +532,7 @@ def compute_dp_reference_kda(
         initial_ssm = jnp.asarray(np.stack(info["initial_ssm"], axis=0), dtype=jnp.float32)
         initial_conv = jnp.asarray(np.stack(info["initial_conv"], axis=0), dtype=dtype)
 
-        rank_out, _, _ = ref_kda_attention(
+        rank_out, final_ssm, final_conv = ref_kda_attention(
             q_packed,
             k_packed,
             v_packed,
@@ -528,6 +545,7 @@ def compute_dp_reference_kda(
             forward_mode,
         )
         rank_out_np = np.asarray(rank_out).reshape(-1, hidden)
+        per_dp_final_states[dp_rank] = (np.asarray(final_ssm), np.asarray(final_conv))
 
         if is_prefill:
             valid = sum(info["seq_lens"])
@@ -535,7 +553,7 @@ def compute_dp_reference_kda(
         else:
             num_seqs = len(info["seq_lens"])
             global_out[bs_offset : bs_offset + num_seqs] = rank_out_np
-    return global_out
+    return global_out, per_dp_final_states
 
 
 class TestKDAAttentionDP(CustomTestCase):
@@ -547,10 +565,17 @@ class TestKDAAttentionDP(CustomTestCase):
     def setUp(self):
         if not jax.devices():
             self.skipTest("JAX not available")
-        if jax.default_backend() != "tpu":
-            self.skipTest("KDA chunked EXTEND kernel uses TPU Pallas primitives")
+        self.rtol = 2e-2
+        self.atol = 2e-2
 
-    def _run(self, mode: str, lens_dict: dict[int, list[int]], dp_size: int, tp_size: int):
+    def _run_test(
+        self,
+        mode: str,
+        lens_per_rank: dict[int, list[int]],
+        dp_size: int,
+        tp_size: int,
+        has_initial_state_per_rank: dict[int, list[bool]] | None = None,
+    ):
         mesh = set_mesh(tp_size=tp_size, dp_size=dp_size)
         (
             fb,
@@ -566,15 +591,16 @@ class TestKDAAttentionDP(CustomTestCase):
             per_dp_token_padding,
         ) = create_test_data(
             mode,
-            lens_dict,
+            lens_per_rank,
             self.NUM_HEADS,
             self.HEAD_DIM,
             self.CONV_KERNEL_SIZE,
             self.DTYPE,
             mesh,
             dp_size=dp_size,
+            has_initial_state_per_rank=has_initial_state_per_rank,
         )
-        expected = compute_dp_reference_kda(
+        expected, _ = compute_dp_reference_kda(
             mode,
             per_dp_infos,
             layer,
@@ -602,18 +628,216 @@ class TestKDAAttentionDP(CustomTestCase):
             np.testing.assert_allclose(
                 actual_np[offset : offset + valid],
                 expected[offset : offset + valid],
-                rtol=2e-2,
-                atol=2e-2,
+                rtol=self.rtol,
+                atol=self.atol,
                 err_msg=f"DP rank {dp_rank} output mismatch",
             )
 
     def test_extend_dp4_tp1(self):
-        self._run(
+        self._run_test(
             "prefill",
             {0: [128], 1: [64], 2: [32, 64], 3: [128]},
             dp_size=4,
             tp_size=1,
         )
+
+    def test_extend_sparse_ranks_dp4(self):
+        self._run_test(
+            "prefill",
+            {0: [64], 1: [], 2: [128], 3: []},
+            dp_size=4,
+            tp_size=1,
+        )
+
+    def test_decode_dp4_tp1(self):
+        self._run_test(
+            "decode",
+            {0: [1, 1], 1: [1], 2: [1, 1], 3: [1]},
+            dp_size=4,
+            tp_size=1,
+        )
+
+    def test_decode_sparse_ranks_dp4(self):
+        self._run_test(
+            "decode",
+            {0: [], 1: [1, 1], 2: [], 3: [1]},
+            dp_size=4,
+            tp_size=1,
+        )
+
+    def test_decode_unbalanced_dp4(self):
+        # Unbalanced bs across DP ranks (1..4 reqs/rank). per_dp_bs_padding
+        # = bucket(max=4) so all ranks pad to the same width.
+        self._run_test(
+            "decode",
+            {0: [1], 1: [1, 1, 1], 2: [1], 3: [1, 1, 1, 1]},
+            dp_size=4,
+            tp_size=1,
+        )
+
+    def test_extend_dp2_tp2(self):
+        self._run_test(
+            "prefill",
+            {0: [128, 64], 1: [32]},
+            dp_size=2,
+            tp_size=2,
+        )
+
+    def test_dp_state_isolation_dp4(self):
+        # Per-rank distinct initial state (each rank has its own random seed via
+        # ``rank_rng``); validates that DP gather only pulls each rank's
+        # own pool slots — no cross-rank state leakage.
+        lens = {0: [1, 1], 1: [1], 2: [1, 1], 3: [1]}
+        has_initial_state_per_rank = {rank: [True] * len(reqs) for rank, reqs in lens.items()}
+        self._run_test(
+            "decode",
+            lens,
+            dp_size=4,
+            tp_size=1,
+            has_initial_state_per_rank=has_initial_state_per_rank,
+        )
+
+    def test_dp_mixed_new_continuing_dp4(self):
+        lens = {0: [1, 1], 1: [1, 1], 2: [1, 1], 3: [1, 1]}
+        has_initial_state_per_rank = {
+            0: [False, False],
+            1: [True, True],
+            2: [True, False],
+            3: [False, True],
+        }
+        self._run_test(
+            "decode",
+            lens,
+            dp_size=4,
+            tp_size=1,
+            has_initial_state_per_rank=has_initial_state_per_rank,
+        )
+
+    def test_dp_extend_then_decode_dp4(self):
+        # Multi-round prefill -> decode handover under DP.
+        dp_size, tp_size = 4, 1
+        lens_prefill = {0: [128], 1: [64], 2: [32, 64], 3: [128]}
+        mesh = set_mesh(tp_size=tp_size, dp_size=dp_size)
+
+        # Prefill round.
+        (
+            fb,
+            pool,
+            layer,
+            q,
+            k,
+            v,
+            a,
+            b,
+            per_dp_infos,
+            per_dp_bs_padding,
+            per_dp_token_padding,
+        ) = create_test_data(
+            "prefill",
+            lens_prefill,
+            self.NUM_HEADS,
+            self.HEAD_DIM,
+            self.CONV_KERNEL_SIZE,
+            self.DTYPE,
+            mesh,
+            dp_size=dp_size,
+        )
+        expected, ref_states = compute_dp_reference_kda(
+            "prefill",
+            per_dp_infos,
+            layer,
+            dp_size=dp_size,
+            per_dp_bs_padding=per_dp_bs_padding,
+            per_dp_token_padding=per_dp_token_padding,
+            num_heads=self.NUM_HEADS,
+            head_dim=self.HEAD_DIM,
+            dtype=self.DTYPE,
+        )
+        actual, (rec_buf, conv_buf_list) = layer(fb, q, k, v, a, b, pool)
+        actual_np = np.asarray(actual)
+
+        for dp_rank in range(dp_size):
+            info = per_dp_infos[dp_rank]
+            if not info["seq_lens"]:
+                continue
+            valid = sum(info["seq_lens"])
+            offset = dp_rank * per_dp_token_padding
+            np.testing.assert_allclose(
+                actual_np[offset : offset + valid],
+                expected[offset : offset + valid],
+                rtol=self.rtol,
+                atol=self.atol,
+                err_msg=f"prefill: rank {dp_rank}",
+            )
+
+        ref_ssm_per_rank = {r: s for r, (s, _) in ref_states.items()}
+        ref_conv_per_rank = {r: c for r, (_, c) in ref_states.items()}
+
+        # 4 decode rounds.
+        decode_lens = {r: [1] * len(reqs) for r, reqs in lens_prefill.items()}
+        for step in range(4):
+            (
+                fb_d,
+                pool_d,
+                _layer_d,
+                q_d, k_d, v_d, a_d, b_d,
+                per_dp_infos_d,
+                per_dp_bs_padding_d,
+                per_dp_token_padding_d,
+            ) = create_test_data(
+                "decode",
+                decode_lens,
+                self.NUM_HEADS,
+                self.HEAD_DIM,
+                self.CONV_KERNEL_SIZE,
+                self.DTYPE,
+                mesh,
+                dp_size=dp_size,
+                seed=100 + step,
+                has_initial_state_per_rank={r: [True] * len(reqs) for r, reqs in decode_lens.items()},
+            )
+
+            fb_d.attn_backend = fb.attn_backend
+            pool.replace_buffer(([rec_buf], [conv_buf_list]))
+
+            actual_d, (rec_buf, conv_buf_list) = layer(fb_d, q_d, k_d, v_d, a_d, b_d, pool)
+            actual_d_np = np.asarray(actual_d)
+
+            # Inject carried-forward ref states into per_dp_infos_d.
+            for dp_rank in range(dp_size):
+                if dp_rank in ref_ssm_per_rank:
+                    ssm_stack = ref_ssm_per_rank[dp_rank]
+                    conv_stack = ref_conv_per_rank[dp_rank]
+                    per_dp_infos_d[dp_rank]["initial_ssm"] = [ssm_stack[i] for i in range(ssm_stack.shape[0])]
+                    per_dp_infos_d[dp_rank]["initial_conv"] = [conv_stack[i] for i in range(conv_stack.shape[0])]
+
+            expected_d, ref_states_d = compute_dp_reference_kda(
+                "decode",
+                per_dp_infos_d,
+                layer,
+                dp_size=dp_size,
+                per_dp_bs_padding=per_dp_bs_padding_d,
+                per_dp_token_padding=per_dp_token_padding_d,
+                num_heads=self.NUM_HEADS,
+                head_dim=self.HEAD_DIM,
+                dtype=self.DTYPE,
+            )
+            ref_ssm_per_rank = {r: s for r, (s, _) in ref_states_d.items()}
+            ref_conv_per_rank = {r: c for r, (_, c) in ref_states_d.items()}
+
+            for dp_rank in range(dp_size):
+                info_d = per_dp_infos_d[dp_rank]
+                if not info_d["seq_lens"]:
+                    continue
+                num_seqs = len(info_d["seq_lens"])
+                offset = dp_rank * per_dp_bs_padding_d
+                np.testing.assert_allclose(
+                    actual_d_np[offset : offset + num_seqs],
+                    expected_d[offset : offset + num_seqs],
+                    rtol=self.rtol,
+                    atol=self.atol,
+                    err_msg=f"decode round {step}: rank {dp_rank}",
+                )
 
 
 if __name__ == "__main__":

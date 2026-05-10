@@ -380,10 +380,6 @@ class TestKDAAttention(unittest.TestCase):
         self.rtol = 2e-2
         self.atol = 1e-2
 
-    def _skip_extend_without_tpu(self):
-        if jax.default_backend() != "tpu": # TODO: Is this check necessary ?
-            self.skipTest("KDA chunked EXTEND kernel uses TPU Pallas primitives")
-
     def run_test(
         self,
         mode,
@@ -394,9 +390,6 @@ class TestKDAAttention(unittest.TestCase):
         initial_ssm_state: jax.Array | None = None,
         initial_conv_state: jax.Array | None = None,
     ):
-        if mode == "prefill":
-            self._skip_extend_without_tpu()
-
         if mode_args is None:
             mode_args = (self.NUM_HEADS, self.HEAD_DIM, self.CONV_KERNEL_SIZE, self.DTYPE)
         num_heads, head_dim, conv_kernel_size, dtype = mode_args
@@ -512,7 +505,6 @@ class TestKDAAttention(unittest.TestCase):
         )
 
     def test_extend_then_decode(self):
-        self._skip_extend_without_tpu()
         layer, pool, recurrent_indices, recurrent_buffer, conv_buffer_list = self.run_test(
             "prefill", [128]
         )
