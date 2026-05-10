@@ -202,8 +202,8 @@ def write_initial_state(
     recurrent_buffer = recurrent_buffer.at[recurrent_indices].set(
         ssm_state, out_sharding=pool.recurrent_sharding
     )
-    conv_buffer = conv_buffer_list[0].at[recurrent_indices].set(
-        conv_state, out_sharding=pool.conv_sharding
+    conv_buffer = (
+        conv_buffer_list[0].at[recurrent_indices].set(conv_state, out_sharding=pool.conv_sharding)
     )
     pool.replace_buffer(([recurrent_buffer], [[conv_buffer]]))
 
@@ -362,8 +362,12 @@ def create_test_data(
     )
     fb.attn_backend.forward_metadata = backend.get_forward_metadata(mwb)
 
-    baseline_ssm = initial_ssm_state if all_have_initial_state else jnp.zeros_like(initial_ssm_state)
-    baseline_conv = initial_conv_state if all_have_initial_state else jnp.zeros_like(initial_conv_state)
+    baseline_ssm = (
+        initial_ssm_state if all_have_initial_state else jnp.zeros_like(initial_ssm_state)
+    )
+    baseline_conv = (
+        initial_conv_state if all_have_initial_state else jnp.zeros_like(initial_conv_state)
+    )
     return fb, pool, layer, q, k, v, a, b, baseline_ssm, baseline_conv, recurrent_indices
 
 
@@ -437,8 +441,12 @@ class TestKDAAttention(unittest.TestCase):
         actual_conv = gather_conv(pool, conv_buffer_list[0], recurrent_indices)
 
         np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), self.rtol, self.atol)
-        np.testing.assert_allclose(np.asarray(actual_ssm), np.asarray(expected_ssm), self.rtol, self.atol)
-        np.testing.assert_allclose(np.asarray(actual_conv), np.asarray(expected_conv), self.rtol, self.atol)
+        np.testing.assert_allclose(
+            np.asarray(actual_ssm), np.asarray(expected_ssm), self.rtol, self.atol
+        )
+        np.testing.assert_allclose(
+            np.asarray(actual_conv), np.asarray(expected_conv), self.rtol, self.atol
+        )
         return layer, pool, recurrent_indices, recurrent_buffer, conv_buffer_list
 
     def random_states(self, batch_size: int):
@@ -553,10 +561,10 @@ class TestKDAAttention(unittest.TestCase):
                 conv_ref,
                 ForwardMode.DECODE,
             )
-            actual, (recurrent_buffer, conv_buffer_list) = layer(
-                forward_batch, q, k, v, a, b, pool
+            actual, (recurrent_buffer, conv_buffer_list) = layer(forward_batch, q, k, v, a, b, pool)
+            np.testing.assert_allclose(
+                np.asarray(actual), np.asarray(expected), self.rtol, self.atol
             )
-            np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), self.rtol, self.atol)
             np.testing.assert_allclose(
                 np.asarray(gather_ssm(pool, recurrent_buffer, recurrent_indices)),
                 np.asarray(ssm_ref),

@@ -25,6 +25,7 @@ def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.nda
     #   without it, round-off error will accumulate across K-dim reductions and T recurrent steps.
     return rng.standard_normal(shape).astype(np.float32) * scale
 
+
 # --- Reference baselines (verbatim from test_kda_attention.py).
 # Note: each test file ships its own ref helpers rather than sharing across tests. Keep these in sync with the TP file if they diverge.
 
@@ -193,7 +194,9 @@ def create_test_data(
     mesh,
     dp_size: int,
     seed: int = 0,
-    has_initial_state_per_rank: dict[int, list[bool]] | None = None,  # {dp_rank: [has_initial_state per request]}
+    has_initial_state_per_rank: (
+        dict[int, list[bool]] | None
+    ) = None,  # {dp_rank: [has_initial_state per request]}
 ):
     """Build a ForwardBatch + RecurrentStatePool + global padded q/k/v/a/b for DP testing.
 
@@ -267,7 +270,9 @@ def create_test_data(
         k_conv1d=SimpleNamespace(weight=SimpleNamespace(value=conv_weight())),
         v_conv1d=SimpleNamespace(weight=SimpleNamespace(value=conv_weight())),
         activation="silu",
-        A_log=SimpleNamespace(value=jax.device_put(normal((num_heads, 1), scale=1.0), param_head_sharding)),
+        A_log=SimpleNamespace(
+            value=jax.device_put(normal((num_heads, 1), scale=1.0), param_head_sharding)
+        ),
         dt_bias=SimpleNamespace(
             value=jax.device_put(normal((num_heads, head_dim), scale=1.0), param_head_sharding)
         ),
@@ -289,9 +294,7 @@ def create_test_data(
     has_initial_state_cpu = np.zeros(total_bs, dtype=np.bool_)
 
     # Pool init state buffers: full [total_slots, ...] layout, per-rank shards.
-    ssm_init_full = np.zeros(
-        (pool.total_slots, num_heads, head_dim, head_dim), dtype=np.float32
-    )
+    ssm_init_full = np.zeros((pool.total_slots, num_heads, head_dim, head_dim), dtype=np.float32)
     conv_init_full = np.zeros(
         (pool.total_slots, pool.proj_size, conv_kernel_size - 1), dtype=np.float32
     )
@@ -424,9 +427,7 @@ def create_test_data(
         token_ids_logprobs=None,
         extend_logprob_start_lens=None,
         extend_input_logprob_token_ids=None,
-        logits_indices=(
-            np.zeros(total_bs, dtype=np.int32) if is_prefill else None
-        ),
+        logits_indices=(np.zeros(total_bs, dtype=np.int32) if is_prefill else None),
         real_bs=total_bs,
         real_bs_per_dp=real_bs_per_dp,
         dp_size=dp_size,
@@ -622,9 +623,7 @@ class TestKDAAttentionDP(CustomTestCase):
             if not info["seq_lens"]:
                 continue
             valid = sum(info["seq_lens"]) if is_prefill else len(info["seq_lens"])
-            offset = (
-                dp_rank * per_dp_token_padding if is_prefill else dp_rank * per_dp_bs_padding
-            )
+            offset = dp_rank * per_dp_token_padding if is_prefill else dp_rank * per_dp_bs_padding
             np.testing.assert_allclose(
                 actual_np[offset : offset + valid],
                 expected[offset : offset + valid],
@@ -780,7 +779,11 @@ class TestKDAAttentionDP(CustomTestCase):
                 fb_d,
                 pool_d,
                 _layer_d,
-                q_d, k_d, v_d, a_d, b_d,
+                q_d,
+                k_d,
+                v_d,
+                a_d,
+                b_d,
                 per_dp_infos_d,
                 per_dp_bs_padding_d,
                 per_dp_token_padding_d,
@@ -794,7 +797,9 @@ class TestKDAAttentionDP(CustomTestCase):
                 mesh,
                 dp_size=dp_size,
                 seed=100 + step,
-                has_initial_state_per_rank={r: [True] * len(reqs) for r, reqs in decode_lens.items()},
+                has_initial_state_per_rank={
+                    r: [True] * len(reqs) for r, reqs in decode_lens.items()
+                },
             )
 
             fb_d.attn_backend = fb.attn_backend
@@ -808,8 +813,12 @@ class TestKDAAttentionDP(CustomTestCase):
                 if dp_rank in ref_ssm_per_rank:
                     ssm_stack = ref_ssm_per_rank[dp_rank]
                     conv_stack = ref_conv_per_rank[dp_rank]
-                    per_dp_infos_d[dp_rank]["initial_ssm"] = [ssm_stack[i] for i in range(ssm_stack.shape[0])]
-                    per_dp_infos_d[dp_rank]["initial_conv"] = [conv_stack[i] for i in range(conv_stack.shape[0])]
+                    per_dp_infos_d[dp_rank]["initial_ssm"] = [
+                        ssm_stack[i] for i in range(ssm_stack.shape[0])
+                    ]
+                    per_dp_infos_d[dp_rank]["initial_conv"] = [
+                        conv_stack[i] for i in range(conv_stack.shape[0])
+                    ]
 
             expected_d, ref_states_d = compute_dp_reference_kda(
                 "decode",

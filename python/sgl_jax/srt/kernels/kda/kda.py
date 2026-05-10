@@ -495,7 +495,7 @@ def kda_fwd_intra(
             index_map=lambda i, j, n: (i, j, n, 0, 0), block_shape=(1, 1, 1, BT, last_dim)
         )
 
-    (u_r, w_r, qg_r, kg_r, Aqk_r, Akk_inv_r) = pl.pallas_call(
+    u_r, w_r, qg_r, kg_r, Aqk_r, Akk_inv_r = pl.pallas_call(
         functools.partial(
             _kda_fwd_intra_kernel,
             chunk_size=BT,
@@ -588,7 +588,6 @@ def _chunk_gated_delta_rule_fwd_kernel(
     bos = seqlens_ref[idx_n]
     eos = seqlens_ref[idx_n + 1]
     real_NT = (eos - bos) // k_ref.shape[2]
-    boh = chunk_offsets_ref[idx_n]
 
     BT = k_ref.shape[2]
     K, V = k_ref.shape[-1], v_ref.shape[-1]
@@ -774,9 +773,7 @@ def chunk_gated_delta_rule_fwd_h(
         else None
     )
 
-    h_blockspec_out = pl.BlockSpec(
-        [1, 1, 1, K_PADSIZE, V_ALIGNED], index_map=_h_index_map
-    )
+    h_blockspec_out = pl.BlockSpec([1, 1, 1, K_PADSIZE, V_ALIGNED], index_map=_h_index_map)
     v_new_blockspec_out = (
         pl.BlockSpec([1, 1, BT, V_ALIGNED], index_map=_t_index_map) if save_new_value else None
     )

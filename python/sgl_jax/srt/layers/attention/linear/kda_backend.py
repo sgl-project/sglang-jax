@@ -10,9 +10,7 @@ from sgl_jax.srt.kernels.kda import chunk_kda, naive_recurrent_kda
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
 )
-from sgl_jax.srt.layers.attention.linear.short_convolution import (
-    short_convolution,
-)
+from sgl_jax.srt.layers.attention.linear.short_convolution import short_convolution
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 if TYPE_CHECKING:
@@ -261,14 +259,14 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             _call,
             mesh=self.mesh,
             in_specs=(
-                P("data", "tensor"),         # x [T, D]
-                P("tensor", None),            # weight [D, K]
-                P("data", "tensor", None),   # cache [B, D, K-1]
-                P("data"),                    # cu_seqlens [B+1]
+                P("data", "tensor"),  # x [T, D]
+                P("tensor", None),  # weight [D, K]
+                P("data", "tensor", None),  # cache [B, D, K-1]
+                P("data"),  # cu_seqlens [B+1]
             ),
             out_specs=(
-                P("data", "tensor"),         # y [T, D]
-                P("data", "tensor", None),   # new_cache [B, D, K-1]
+                P("data", "tensor"),  # y [T, D]
+                P("data", "tensor", None),  # new_cache [B, D, K-1]
             ),
             check_vma=False,
         )
@@ -387,15 +385,15 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             _decode_kernel,
             mesh=self.mesh,
             in_specs=(
-                P("data", "tensor", None),        # q [B, H, K]
-                P("data", "tensor", None),        # k [B, H, K]
-                P("data", "tensor", None),        # v [B, H, V]
-                P("data", "tensor", None),        # g [B, H, K]
-                P("data", "tensor"),               # beta [B, H]
+                P("data", "tensor", None),  # q [B, H, K]
+                P("data", "tensor", None),  # k [B, H, K]
+                P("data", "tensor", None),  # v [B, H, V]
+                P("data", "tensor", None),  # g [B, H, K]
+                P("data", "tensor"),  # beta [B, H]
                 P("data", "tensor", None, None),  # h0 [B, H, K, V]
             ),
             out_specs=(
-                P("data", "tensor", None),        # o [B, H, V]
+                P("data", "tensor", None),  # o [B, H, V]
                 P("data", "tensor", None, None),  # final_state [B, H, K, V]
             ),
             check_vma=False,
