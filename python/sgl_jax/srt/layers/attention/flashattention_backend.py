@@ -232,26 +232,31 @@ class FlashAttention(AttentionBackend):
 
         if batch.forward_mode.is_target_verify():
             seq_lens += extend_seq_lens
-            # rpa_v3 _fetch_mask DMA needs offset/size tiling(8)-aligned. Pad
-            # each draft-token row of custom_mask to 8-aligned kv_len. Do NOT
-            # alter seq_lens itself: _fetch_bkv uses kv_len to split cache/new
-            # KV and would mis-place new tokens if aligned. The kernel computes
-            # the mask stride independently from the (unaligned) kv_len.
-            seq_lens_8 = ((seq_lens + 7) // 8 * 8).astype(np.int32)
+            aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
+            # rpa_v3 _fetch_mask DMA needs offset/size tiling(8)-aligned, and we
+            # also want a stable mask shape across decode steps to avoid
+            # per-step recompiles. Pad each draft-token row to the page-aligned
+            # kv_len (multiple of 8, and constant within a page). seq_lens
+            # itself stays unaligned for _fetch_bkv's cache/new split.
             if metadata.custom_mask is not None:
                 q = batch.spec_info.draft_token_num
                 cm = np.asarray(jax.device_get(metadata.custom_mask))
                 out, off = [], 0
                 for i in range(batch.real_bs):
-                    kl, kl8 = int(seq_lens[i]), int(seq_lens_8[i])
+                    kl, kla = int(seq_lens[i]), int(aligned_seq_lens[i])
                     row = cm[off : off + q * kl].reshape(q, kl)
-                    out.append(np.pad(row, ((0, 0), (0, kl8 - kl))).reshape(-1))
+                    out.append(np.pad(row, ((0, 0), (0, kla - kl))).reshape(-1))
                     off += q * kl
+                # Pad tail for padded-bs slots so total shape stays bucket-stable.
+                padded_tail = (
+                    q * int(aligned_seq_lens[batch.real_bs :].sum())
+                    if padded_batch_size > batch.real_bs
+                    else 0
+                )
                 metadata.custom_mask = device_array(
-                    np.concatenate(out).astype(np.int32),
+                    np.pad(np.concatenate(out), (0, padded_tail)).astype(np.int32),
                     sharding=NamedSharding(self.mesh, P()),
                 )
-            aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
         else:
             aligned_seq_lens = (
                 (batch.seq_lens + self.page_size - 1) // self.page_size
