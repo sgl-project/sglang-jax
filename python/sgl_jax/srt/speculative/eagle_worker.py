@@ -420,9 +420,7 @@ class EAGLEWorker(ModelWorker):
             retrive_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            jax.device_put(
-                model_worker_batch.spec_info.verified_id, NamedSharding(self.mesh, P())
-            ),
+            jax.device_put(model_worker_batch.spec_info.verified_id, NamedSharding(self.mesh, P())),
             score_list,
             token_list,
             parents_list,
@@ -617,9 +615,7 @@ class EAGLEWorker(ModelWorker):
         draft_logits_output.next_token_logits = jax.device_put(
             draft_logits_output.next_token_logits, rep
         )
-        draft_logits_output.hidden_states = jax.device_put(
-            draft_logits_output.hidden_states, rep
-        )
+        draft_logits_output.hidden_states = jax.device_put(draft_logits_output.hidden_states, rep)
         select_index = (
             np.arange(len(model_worker_batch.seq_lens[: model_worker_batch.real_bs]))
             * (self.speculative_num_steps + 1)

@@ -184,9 +184,7 @@ class MiMoV2FlashMTPForCausalLM(nnx.Module):
             head_dim = self.config.swa_head_dim
             v_head_dim = self.config.swa_v_head_dim
             layers = [self.model]
-            self.loader.dequant_fp8_layers(
-                layers, specs=[("self_attn.q_proj", head_dim)]
-            )
+            self.loader.dequant_fp8_layers(layers, specs=[("self_attn.q_proj", head_dim)])
             self.loader.dequant_fused_kv(self._kv_buffers, layers, self.config)
             self.loader.dequant_fp8_layers(
                 layers,

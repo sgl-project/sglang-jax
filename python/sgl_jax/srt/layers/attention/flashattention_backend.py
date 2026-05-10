@@ -333,9 +333,9 @@ class FlashAttention(AttentionBackend):
         swa_mapping = getattr(self, "swa_index_mapping", None)
         if swa_mapping is not None:
             mapping = swa_mapping[0] if isinstance(swa_mapping, list) else swa_mapping
-            swa_page_indices = (
-                mapping[batch.cache_loc[indices]] // self.page_size
-            ).astype(np.int32)
+            swa_page_indices = (mapping[batch.cache_loc[indices]] // self.page_size).astype(
+                np.int32
+            )
             metadata.swa_page_indices = device_array(
                 swa_page_indices, sharding=NamedSharding(self.mesh, P("data"))
             )

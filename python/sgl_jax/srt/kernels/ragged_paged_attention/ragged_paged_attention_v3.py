@@ -558,9 +558,7 @@ def _ragged_paged_attention_kernel_loop(
         # custom_mask rows are host-padded to page-aligned kv_len (8-divisible
         # and shape-stable within a page) while kv_lens_ref keeps the unaligned
         # value for _fetch_bkv. Mask stride = cu_kv_lens delta (page-aligned).
-        mask_kv_len = pl.multiple_of(
-            cu_kv_lens_ref[seq_idx + 1] - cu_kv_lens_ref[seq_idx], 8
-        )
+        mask_kv_len = pl.multiple_of(cu_kv_lens_ref[seq_idx + 1] - cu_kv_lens_ref[seq_idx], 8)
         mask_start = bkvmask_idx * bkv_sz
         mask_left = mask_kv_len - mask_start
         load_kvmask_sz = pl.multiple_of(jnp.minimum(bkv_sz, mask_left), 8)
