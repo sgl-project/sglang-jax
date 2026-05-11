@@ -285,8 +285,10 @@ def create_test_data(
     has_initial_state_cpu = np.zeros(total_bs, dtype=np.bool_)
 
     # Pool init state buffers: full [total_slots, ...] layout, per-rank shards.
-    ssm_init_full = np.zeros((pool.total_slots, num_heads, head_dim, head_dim), dtype=np.float32)
-    conv_init_full = np.zeros(
+    ssm_init_full_dev = np.zeros(
+        (pool.total_slots, num_heads, head_dim, head_dim), dtype=np.float32
+    )
+    conv_init_full_dev = np.zeros(
         (pool.total_slots, pool.proj_size, conv_kernel_size - 1), dtype=np.float32
     )
 
@@ -302,8 +304,8 @@ def create_test_data(
         rank_q_blocks, rank_k_blocks, rank_v_blocks = [], [], []
         rank_a_blocks, rank_b_blocks = [], []
         rank_seq_lens = []
-        rank_initial_ssm = []
-        rank_initial_conv = []
+        rank_initial_ssm_ref = []
+        rank_initial_conv_ref = []
         rank_indices = []
         cursor = 0
         for i, q_len in enumerate(reqs):
@@ -313,18 +315,15 @@ def create_test_data(
             a_i = _scaled_randn(rank_rng, (q_len, hidden))
             b_i = _scaled_randn(rank_rng, (q_len, num_heads))
 
-            # True = continuing (random init state); False = new request (zero).
             req_has_initial_state = (
                 has_initial_state_per_rank is not None
                 and i < len(has_initial_state_per_rank.get(dp_rank, []))
                 and bool(has_initial_state_per_rank[dp_rank][i])
             )
-            if req_has_initial_state:
-                ssm_i = _scaled_randn(rank_rng, (num_heads, head_dim, head_dim))
-                conv_i = _scaled_randn(rank_rng, (pool.proj_size, conv_kernel_size - 1))
-            else:
-                ssm_i = np.zeros((num_heads, head_dim, head_dim), dtype=np.float32)
-                conv_i = np.zeros((pool.proj_size, conv_kernel_size - 1), dtype=np.float32)
+            ssm_i_dev = _scaled_randn(rank_rng, (num_heads, head_dim, head_dim))
+            conv_i_dev = _scaled_randn(rank_rng, (pool.proj_size, conv_kernel_size - 1))
+            ssm_i_ref = ssm_i_dev if req_has_initial_state else np.zeros_like(ssm_i_dev)
+            conv_i_ref = conv_i_dev if req_has_initial_state else np.zeros_like(conv_i_dev)
 
             # Per-rank local slot index: 1..slots_per_rank.
             local_slot = i + 1
@@ -336,8 +335,8 @@ def create_test_data(
                 extend_prefix_lens_cpu[bs_offset + i] = 0
             has_initial_state_cpu[bs_offset + i] = req_has_initial_state
 
-            ssm_init_full[global_slot] = ssm_i
-            conv_init_full[global_slot] = conv_i
+            ssm_init_full_dev[global_slot] = ssm_i_dev
+            conv_init_full_dev[global_slot] = conv_i_dev
 
             if is_prefill:
                 slc = slice(token_offset + cursor, token_offset + cursor + q_len)
@@ -363,8 +362,8 @@ def create_test_data(
             rank_a_blocks.append(a_i)
             rank_b_blocks.append(b_i)
             rank_seq_lens.append(q_len)
-            rank_initial_ssm.append(ssm_i)
-            rank_initial_conv.append(conv_i)
+            rank_initial_ssm_ref.append(ssm_i_ref)
+            rank_initial_conv_ref.append(conv_i_ref)
             rank_indices.append(local_slot)
         per_dp_infos[dp_rank] = {
             "q": rank_q_blocks,
@@ -373,17 +372,17 @@ def create_test_data(
             "a": rank_a_blocks,
             "b": rank_b_blocks,
             "seq_lens": rank_seq_lens,
-            "initial_ssm": rank_initial_ssm,
-            "initial_conv": rank_initial_conv,
+            "initial_ssm_ref": rank_initial_ssm_ref,
+            "initial_conv_ref": rank_initial_conv_ref,
             "indices": rank_indices,
         }
 
     # 5. Push pool init state (full buffer, sharded P("data","tensor",None,None)).
     ssm_init_dev = jax.device_put(
-        jnp.asarray(ssm_init_full, dtype=pool.temporal_dtype), pool.recurrent_sharding
+        jnp.asarray(ssm_init_full_dev, dtype=pool.temporal_dtype), pool.recurrent_sharding
     )
     conv_init_dev = jax.device_put(
-        jnp.asarray(conv_init_full, dtype=pool.conv_dtype), pool.conv_sharding
+        jnp.asarray(conv_init_full_dev, dtype=pool.conv_dtype), pool.conv_sharding
     )
     pool.replace_buffer(([ssm_init_dev], [[conv_init_dev]]))
 
@@ -504,8 +503,8 @@ def compute_dp_reference_kda(
         a_packed = jnp.asarray(np.concatenate(info["a"], axis=0), dtype=dtype)
         b_packed = jnp.asarray(np.concatenate(info["b"], axis=0), dtype=dtype)
         cu_seqlens = jnp.asarray([0] + np.cumsum(info["seq_lens"]).tolist(), dtype=jnp.int32)
-        initial_ssm = jnp.asarray(np.stack(info["initial_ssm"], axis=0), dtype=jnp.float32)
-        initial_conv = jnp.asarray(np.stack(info["initial_conv"], axis=0), dtype=dtype)
+        initial_ssm = jnp.asarray(np.stack(info["initial_ssm_ref"], axis=0), dtype=jnp.float32)
+        initial_conv = jnp.asarray(np.stack(info["initial_conv_ref"], axis=0), dtype=dtype)
 
         rank_out, final_ssm, final_conv = ref_kda_attention(
             q_packed,
@@ -801,10 +800,10 @@ class TestKDAAttentionDP(CustomTestCase):
                 if dp_rank in ref_ssm_per_rank:
                     ssm_stack = ref_ssm_per_rank[dp_rank]
                     conv_stack = ref_conv_per_rank[dp_rank]
-                    per_dp_infos_d[dp_rank]["initial_ssm"] = [
+                    per_dp_infos_d[dp_rank]["initial_ssm_ref"] = [
                         ssm_stack[i] for i in range(ssm_stack.shape[0])
                     ]
-                    per_dp_infos_d[dp_rank]["initial_conv"] = [
+                    per_dp_infos_d[dp_rank]["initial_conv_ref"] = [
                         conv_stack[i] for i in range(conv_stack.shape[0])
                     ]
 

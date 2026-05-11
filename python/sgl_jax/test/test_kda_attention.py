@@ -289,23 +289,27 @@ def create_test_data(
     b = normal((total_tokens, num_heads))
 
     recurrent_indices = np.arange(1, batch_size + 1, dtype=np.int32)
-    if initial_ssm_state is None or initial_conv_state is None:
+    initial_ssm_state_dev = initial_ssm_state
+    initial_conv_state_dev = initial_conv_state
+
+    if initial_ssm_state_dev is None or initial_conv_state_dev is None:
         random_ssm, random_conv = create_random_states(
             batch_size, num_heads, head_dim, conv_kernel_size, dtype, rng
         )
-        zero_ssm = jnp.zeros_like(random_ssm)
-        zero_conv = jnp.zeros_like(random_conv)
-        all_true = all(has_initial_state_per_req)
-        if initial_ssm_state is None:
-            initial_ssm_state = zero_ssm if all_true else random_ssm
-        if initial_conv_state is None:
-            initial_conv_state = zero_conv if all_true else random_conv
+        if initial_ssm_state_dev is None:
+            initial_ssm_state_dev = random_ssm
+        if initial_conv_state_dev is None:
+            initial_conv_state_dev = random_conv
 
     # Reshard initial state for the (sharded) pool; keep host copies for ref.
-    initial_ssm_state_sharded = jax.device_put(initial_ssm_state, pool.recurrent_sharding)
-    initial_conv_state_sharded = jax.device_put(initial_conv_state, pool.conv_sharding)
+    initial_ssm_state_dev_sharded = jax.device_put(initial_ssm_state_dev, pool.recurrent_sharding)
+    initial_conv_state_dev_sharded = jax.device_put(initial_conv_state_dev, pool.conv_sharding)
     write_initial_state(
-        pool, layer_id, recurrent_indices, initial_ssm_state_sharded, initial_conv_state_sharded
+        pool,
+        layer_id,
+        recurrent_indices,
+        initial_ssm_state_dev_sharded,
+        initial_conv_state_dev_sharded,
     )
 
     seq_lens_np = np.asarray(seq_lens, dtype=np.int32)
@@ -361,15 +365,14 @@ def create_test_data(
     fb = ForwardBatch.init_new(mwb, dummy_runner)
     fb.attn_backend.forward_metadata = backend.get_forward_metadata(mwb)
 
-    # Mirrors backend's get_state mask: True rows pass through, False rows zero.
     mask = jnp.asarray(has_initial_state_per_req, dtype=jnp.bool_)
-    baseline_ssm = jnp.where(
-        mask[:, None, None, None], initial_ssm_state, jnp.zeros_like(initial_ssm_state)
+    initial_ssm_ref = jnp.where(
+        mask[:, None, None, None], initial_ssm_state_dev, jnp.zeros_like(initial_ssm_state_dev)
     )
-    baseline_conv = jnp.where(
-        mask[:, None, None], initial_conv_state, jnp.zeros_like(initial_conv_state)
+    initial_conv_ref = jnp.where(
+        mask[:, None, None], initial_conv_state_dev, jnp.zeros_like(initial_conv_state_dev)
     )
-    return fb, pool, layer, q, k, v, a, b, baseline_ssm, baseline_conv, recurrent_indices
+    return fb, pool, layer, q, k, v, a, b, initial_ssm_ref, initial_conv_ref, recurrent_indices
 
 
 class TestKDAAttention(unittest.TestCase):
@@ -408,8 +411,8 @@ class TestKDAAttention(unittest.TestCase):
             v,
             a,
             b,
-            baseline_ssm,
-            baseline_conv,
+            initial_ssm_ref,
+            initial_conv_ref,
             recurrent_indices,
         ) = create_test_data(
             mode,
@@ -433,8 +436,8 @@ class TestKDAAttention(unittest.TestCase):
             b,
             layer,
             forward_batch.attn_backend.forward_metadata.cu_q_lens,
-            baseline_ssm,
-            baseline_conv,
+            initial_ssm_ref,
+            initial_conv_ref,
             forward_batch.forward_mode,
         )
 
@@ -551,8 +554,8 @@ class TestKDAAttention(unittest.TestCase):
                 v,
                 a,
                 b,
-                _baseline_ssm,
-                _baseline_conv,
+                _initial_ssm_ref,
+                _initial_conv_ref,
                 _recurrent_indices,
             ) = create_test_data(
                 "decode",
