@@ -205,11 +205,15 @@ class ModelRunnerKVCacheMixin:
 
         if self.use_mla_backend and self.server_args.attention_backend == "fa":
             cfg = self.model_config.hf_text_config
-            return (
-                (align128(cfg.kv_lora_rank) + align128(cfg.qk_rope_head_dim))
-                * num_layers
-                * dtype_size
-            )
+            kv_dim = align128(cfg.kv_lora_rank) + align128(cfg.qk_rope_head_dim)
+            # MLA v2 kernel packs page_size up to kv_packing boundary.
+            # With bf16 (packing=2) and page_size=1, each page stores 2
+            # slots but only 1 token of data — must account for the padding.
+            dtype_bits = dtype_size * 8
+            kv_packing = 32 // dtype_bits
+            aligned_ps = (self.page_size + kv_packing - 1) // kv_packing * kv_packing
+            per_token = kv_dim * aligned_ps * dtype_size // self.page_size
+            return per_token * num_layers
 
         return (
             self.model_config.get_num_kv_heads(self.attention_tp_size)
