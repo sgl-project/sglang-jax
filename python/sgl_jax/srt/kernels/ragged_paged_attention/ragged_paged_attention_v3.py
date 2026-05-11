@@ -1966,6 +1966,7 @@ def ragged_paged_attention(
                 if case == RpaCase.MIXED
                 else 1 if case == RpaCase.DECODE else chunk_prefill_size
             ),
+            sliding_window=sliding_window,
         )
 
         if tuned_values is not None:

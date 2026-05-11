@@ -19,12 +19,40 @@ logger = logging.getLogger(__name__)
 #     - page_size
 #     - max_num_tokens
 #     - static_q_len (Mixed: None, Prefill: Chunked_size, Decode: 1)
+#     - sliding windown length
 # value:
 #   - (num_kv_per_block, num_queries_per_block, num_compute_kv_per_block, num_compute_queries_per_block)
 TUNED_BLOCK_SIZES = {
     "TPU v7": {
-        ("bfloat16", "bfloat16", 8, 1, 128, 128, 8192, None): (4096, 512, 1024, 128),
-        ("bfloat16", "bfloat16", 8, 1, 128, 128, 16384, None): (4096, 1024, 1024, 128),
+        ("bfloat16", "bfloat16", 1, 1, 128, 128, 1, 1, None): (1024, 1, 1024, 1),
+        ("bfloat16", "bfloat16", 1, 1, 128, 128, 2, 1, None): (2048, 1, 2048, 1),
+        ("bfloat16", "bfloat16", 1, 1, 128, 128, 4, 1, None): (2048, 1, 2048, 1),
+        ("bfloat16", "bfloat16", 1, 1, 128, 128, 8, 1, None): (2048, 1, 2048, 1),
+        ("bfloat16", "bfloat16", 1, 1, 128, 128, 16, 1, None): (2048, 1, 2048, 1),
+        ("bfloat16", "bfloat16", 1, 1, 128, 128, 32, 1, None): (2048, 1, 2048, 1),
+        ("bfloat16", "bfloat16", 1, 1, 128, 128, 64, 1, None): (2048, 1, 2048, 1),
+        ("bfloat16", "bfloat16", 1, 1, 128, 128, 128, 1, None): (4096, 1, 2048, 1),
+        ("bfloat16", "bfloat16", 1, 1, 128, 128, 256, 1, None): (4096, 1, 2048, 1),
+        ("bfloat16", "bfloat16", 1, 1, 128, 128, 512, None, None): (512, 512, 512, 256),
+        ("bfloat16", "bfloat16", 1, 1, 128, 128, 512, 8192, None): (2048, 1024, 1024, 512),
+        ("bfloat16", "bfloat16", 1, 1, 128, 128, 1024, None, None): (512, 512, 512, 256),
+        ("bfloat16", "bfloat16", 1, 1, 128, 128, 1024, 8192, None): (2048, 1024, 1024, 512),
+        ("bfloat16", "bfloat16", 1, 1, 128, 128, 2048, None, None): (1024, 1024, 1024, 512),
+        ("bfloat16", "bfloat16", 1, 1, 128, 128, 2048, 8192, None): (2048, 1024, 1024, 512),
+        ("bfloat16", "bfloat16", 1, 1, 128, 128, 4096, None, None): (1024, 1024, 1024, 512),
+        ("bfloat16", "bfloat16", 1, 1, 128, 128, 4096, 8192, None): (2048, 1024, 1024, 512),
+        ("bfloat16", "bfloat16", 1, 1, 128, 128, 8192, None, None): (2048, 1024, 1024, 512),
+        ("bfloat16", "bfloat16", 8, 1, 128, 128, 1, 1, None): (1024, 1, 1024, 1),
+        ("bfloat16", "bfloat16", 8, 1, 128, 128, 2, 1, None): (2048, 1, 2048, 1),
+        ("bfloat16", "bfloat16", 8, 1, 128, 128, 4, 1, None): (2048, 1, 2048, 1),
+        ("bfloat16", "bfloat16", 8, 1, 128, 128, 8, 1, None): (2048, 1, 2048, 1),
+        ("bfloat16", "bfloat16", 8, 1, 128, 128, 16, 1, None): (2048, 1, 2048, 1),
+        ("bfloat16", "bfloat16", 8, 1, 128, 128, 32, 1, None): (2048, 1, 2048, 1),
+        ("bfloat16", "bfloat16", 8, 1, 128, 128, 64, 1, None): (2048, 1, 2048, 1),
+        ("bfloat16", "bfloat16", 8, 1, 128, 128, 128, 1, None): (2048, 1, 2048, 1),
+        ("bfloat16", "bfloat16", 8, 1, 128, 128, 256, 1, None): (2048, 1, 2048, 1),
+        ("bfloat16", "bfloat16", 8, 1, 128, 128, 8192, None, None): (4096, 512, 1024, 128),
+        ("bfloat16", "bfloat16", 8, 1, 128, 128, 16384, None, None): (4096, 1024, 1024, 128),
     },
 }
 
@@ -39,6 +67,7 @@ def get_tuned_block_sizes(
     max_num_tokens,
     pages_per_seq,
     static_q_len,
+    sliding_window,
 ) -> tuple[int, int, int, int]:
     tpu_version = get_tpu_version()
 
@@ -53,6 +82,7 @@ def get_tuned_block_sizes(
         head_dim,
         max_num_tokens,
         static_q_len,
+        sliding_window,
     )
 
     device_name = keys[0]
@@ -85,6 +115,7 @@ def get_simplified_key(
     head_dim,
     max_num_tokens,
     static_q_len,
+    sliding_window,
 ):
     """Get the simplified key to reduce the number of combinations."""
     assert num_q_heads % num_kv_heads == 0
@@ -104,4 +135,5 @@ def get_simplified_key(
         next_power_of_2(page_size),
         next_power_of_2(max_num_tokens),
         static_q_len,
+        sliding_window,
     )
