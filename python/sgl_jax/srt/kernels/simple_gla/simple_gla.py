@@ -903,6 +903,16 @@ def chunk_simple_gla_fwd_varlen(
         chunk_size=chunk_size,
         seq_real_lens=real_seq_lens,
     )
+    # Pallas output buffers are NOT zero-initialized on TPU. Zero-length
+    # sequences are skipped by @pl.when(bos != eos), leaving their ht
+    # entries undefined. Replace with h0 (or zeros) so downstream scatter
+    # doesn't write garbage into the recurrent state pool.
+    if use_ht and ht is not None:
+        zero_len_mask = (real_seq_lens == 0)[:, None, None, None]
+        if h0 is not None:
+            ht = jnp.where(zero_len_mask, h0, ht)
+        else:
+            ht = jnp.where(zero_len_mask, 0.0, ht)
     o = chunk_fwd_o(
         q=q_a,
         k=k_a,
