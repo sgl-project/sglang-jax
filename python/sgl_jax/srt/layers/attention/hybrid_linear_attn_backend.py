@@ -91,6 +91,23 @@ class LinearRecurrentAttnBackend(AttentionBackend):
             sharding=(NamedSharding(self.mesh, P("data"))),
         )
 
+        # [KDA-E2E DEBUG] log per-rank metadata sharding once per call (remove after validation)
+        import os as _os
+
+        if (
+            not getattr(self, "_kda_dbg_logged", False)
+            and _os.environ.get("KDA_E2E_DEBUG", "0") == "1"
+        ):
+            print(
+                f"[KDA-E2E DEBUG][get_forward_metadata] mode={batch.forward_mode} "
+                f"dp_size={batch.dp_size} per_dp_bs={batch.per_dp_bs_size} "
+                f"cu_q_lens.shape={metadata.cu_q_lens.shape} "
+                f"recurrent_indices.shape={metadata.recurrent_indices.shape} "
+                f"sharding={metadata.cu_q_lens.sharding}",
+                flush=True,
+            )
+            self._kda_dbg_logged = True
+
         return metadata
 
     def tree_flatten(self):

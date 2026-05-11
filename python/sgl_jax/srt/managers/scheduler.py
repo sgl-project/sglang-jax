@@ -274,6 +274,17 @@ class Scheduler(
                 dcn_parallelism=[1, 1],
                 device_indexes=server_args.device_indexes,
             )
+        # [KDA-E2E DEBUG] mesh shape sanity print (one-line, removed after validation)
+        logger.info(
+            "[KDA-E2E DEBUG] mesh axis_names=%s shape=%s device_count=%d "
+            "tp_size=%d dp_size=%d node_rank=%s",
+            self.mesh.axis_names,
+            dict(self.mesh.shape),
+            len(self.mesh.devices.flatten()),
+            self.tp_size,
+            self.dp_size,
+            getattr(server_args, "node_rank", None),
+        )
 
         if server_args.moe_backend == "fused":
             mesh_ep_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
