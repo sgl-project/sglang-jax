@@ -49,7 +49,7 @@ class GroupRMSNorm(nnx.Module):
             hidden_states = lax.reshape(
                 hidden_states,
                 (*orig_shape[:-1], self.num_groups, self.group_size),
-                out_sharding=NamedSharding(self.mesh, P("data", None, "tensor")),
+                out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
             ).astype(jnp.float32)
         variance = jnp.mean(lax.square(hidden_states), axis=-1, keepdims=True)
         hidden_states = hidden_states * lax.rsqrt(variance + self.epsilon)
@@ -61,7 +61,7 @@ class GroupRMSNorm(nnx.Module):
             weight = lax.reshape(
                 weight,
                 (self.num_groups, self.group_size),
-                out_sharding=NamedSharding(self.mesh, P(None, "tensor")),
+                out_sharding=NamedSharding(self.mesh, P("tensor", None)),
             )
         if self.mesh is None:
             hidden_states = (weight * hidden_states).reshape(orig_shape).astype(orig_dtype)
