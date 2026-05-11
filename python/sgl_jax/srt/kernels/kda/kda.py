@@ -577,7 +577,6 @@ def _chunk_gated_delta_rule_fwd_kernel(
     bos = seqlens_ref[seq_idx]
     eos = seqlens_ref[seq_idx + 1]
 
-
     BT = k_ref.shape[2]
     t0 = i_c * BT
     K, V = k_ref.shape[-1], v_ref.shape[-1]
@@ -751,7 +750,10 @@ def chunk_gated_delta_rule_fwd_h(
         pl.BlockSpec([1, 1, BT, K_PADSIZE], index_map=_t_index_map) if gk is not None else None
     )
     h0_blockspec = (
-        pl.BlockSpec([1, 1, K_PADSIZE, V_ALIGNED], index_map=lambda h, c, seqlens_ref, chunk_to_seq_ref: (chunk_to_seq_ref[c], h, 0, 0))
+        pl.BlockSpec(
+            [1, 1, K_PADSIZE, V_ALIGNED],
+            index_map=lambda h, c, seqlens_ref, chunk_to_seq_ref: (chunk_to_seq_ref[c], h, 0, 0),
+        )
         if initial_state is not None
         else None
     )
@@ -761,7 +763,10 @@ def chunk_gated_delta_rule_fwd_h(
         pl.BlockSpec([1, 1, BT, V_ALIGNED], index_map=_t_index_map) if save_new_value else None
     )
     ht_blockspec_out = (
-        pl.BlockSpec([1, 1, K_PADSIZE, V_ALIGNED], index_map=lambda h, c, seqlens_ref, chunk_to_seq_ref: (chunk_to_seq_ref[c], h, 0, 0))
+        pl.BlockSpec(
+            [1, 1, K_PADSIZE, V_ALIGNED],
+            index_map=lambda h, c, seqlens_ref, chunk_to_seq_ref: (chunk_to_seq_ref[c], h, 0, 0),
+        )
         if output_final_state
         else None
     )
@@ -795,9 +800,7 @@ def chunk_gated_delta_rule_fwd_h(
             out_specs=[h_blockspec_out, v_new_blockspec_out, ht_blockspec_out],
             scratch_shapes=[scratch],
         ),
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "arbitrary")
-        ),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "arbitrary")),
         out_shape=[h_spec, v_new_spec, ht_spec],
         interpret=interpret,
     )(cu_seqlens, chunk_to_seq, k_t, v_t, w_t, g_t, gk_t, h0)
@@ -811,12 +814,13 @@ def chunk_gated_delta_rule_fwd_h(
         # Handle empty sequences: sequences with no chunks never execute kernel code,
         # so their final_state is uninitialized. Fill them with initial_state or zeros.
         seq_lens = jnp.diff(cu_seqlens)
-        empty_mask = (seq_lens == 0)  # [N]
+        empty_mask = seq_lens == 0  # [N]
         if initial_state is not None:
-        # For empty sequences, final_state should equal initial_state
+            # For empty sequences, final_state should equal initial_state
             fill_value = initial_state[:, :, :K, :V]
         else:
-        # For empty sequences without initial_state, final_state should be zeros
+            # For empty sequences without initial_state, final_state should be zeros
+            fill_value = jnp.zeros((N, H, K, V), dtype=ht_out.dtype)
             fill_value = jnp.zeros((N, H, K, V), dtype=ht_out.dtype)
         # Use where to selectively replace empty sequence states
         ht_out = jnp.where(empty_mask[:, None, None, None], fill_value, ht_out)
