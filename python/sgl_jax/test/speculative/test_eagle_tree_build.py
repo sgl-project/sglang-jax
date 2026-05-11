@@ -13,6 +13,42 @@ mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 
 
 class TestDraftDecodeMask(CustomTestCase):
+    def test_build_tree_kernel_efficient_topk1_uses_linear_tree(self):
+        verified_id = jnp.array([10, 20], dtype=jnp.int32)
+        score_list = jnp.ones((2, 3, 1), dtype=jnp.float32)
+        token_list = jnp.array([[11, 12, 13], [21, 22, 23]], dtype=jnp.int32)
+        parents_list = jnp.array([[-1, 0, 1, 2], [-1, 0, 1, 2]], dtype=jnp.int32)
+        seq_lens = jnp.array([5, 7], dtype=jnp.int32)
+
+        (
+            tree_mask,
+            positions,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            draft_tokens,
+        ) = build_tree_kernel_efficient(
+            verified_id=verified_id,
+            score_list=score_list,
+            token_list=token_list,
+            parents_list=parents_list,
+            seq_lens=seq_lens,
+            seq_lens_sum=12,
+            topk=1,
+            num_verify_tokens=4,
+            max_seq_len_per_req=4096,
+            batch_size=2,
+            speculative_num_steps=3,
+            mesh=mesh,
+        )
+
+        assert tree_mask is None
+        assert jnp.array_equal(draft_tokens, jnp.array([10, 11, 12, 13, 20, 21, 22, 23]))
+        assert jnp.array_equal(positions, jnp.array([5, 6, 7, 8, 7, 8, 9, 10]))
+        assert jnp.array_equal(retrive_index, jnp.array([[0, 1, 2, 3], [4, 5, 6, 7]]))
+        assert jnp.array_equal(retrive_next_token, jnp.array([[1, 2, 3, -1], [1, 2, 3, -1]]))
+        assert jnp.array_equal(retrive_next_sibling, jnp.full((2, 4), -1))
+
     def test_build_tree_kernel_efficient(self):
         """Test JAX implementation of build_tree_kernel_efficient function."""
 

@@ -80,6 +80,16 @@ global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS
 logger = logging.getLogger(__name__)
 
 
+def _take_with_same_sharding(array: Any, indices: np.ndarray):
+    if isinstance(array, jax.Array):
+        index = jnp.asarray(indices, dtype=jnp.int32)
+        try:
+            return array.at[index].get(out_sharding=array.sharding)
+        except ValueError:
+            return array[index]
+    return array[indices]
+
+
 class BaseFinishReason:
     def __init__(self, is_error: bool = False):
         self.is_error = is_error
@@ -1517,17 +1527,20 @@ class ScheduleBatch:
 
             # Filter reqs list
             info.reqs = [info.reqs[i] for i in keep_indices_dp]
+            keep_indices_np = np.asarray(keep_indices_dp, dtype=np.int32)
 
             # Filter memory pool indices
             if info.req_pool_indices is not None:
-                info.req_pool_indices = info.req_pool_indices[keep_indices_dp]
+                info.req_pool_indices = _take_with_same_sharding(
+                    info.req_pool_indices, keep_indices_np
+                )
 
             # Filter sequence data
             if info.seq_lens is not None:
-                info.seq_lens = info.seq_lens[keep_indices_dp]
+                info.seq_lens = _take_with_same_sharding(info.seq_lens, keep_indices_np)
 
             if info.output_ids is not None:
-                info.output_ids = info.output_ids[keep_indices_dp]
+                info.output_ids = _take_with_same_sharding(info.output_ids, keep_indices_np)
 
             # Reset cache location (will be recomputed)
             info.out_cache_loc = None
@@ -1537,15 +1550,6 @@ class ScheduleBatch:
                 info.seq_lens_sum = info.seq_lens.sum().item()
             else:
                 info.seq_lens_sum = 0
-
-            # Filter speculative decoding arrays manually (if present)
-            if info.spec_info is not None and info.spec_info.topk_p is not None:
-                keep_indices_jax = jnp.asarray(keep_indices_dp, dtype=jnp.int32)
-                info.spec_info.topk_p = info.spec_info.topk_p[keep_indices_jax]
-                info.spec_info.topk_index = info.spec_info.topk_index[keep_indices_jax]
-                info.spec_info.hidden_states = info.spec_info.hidden_states[keep_indices_jax]
-                info.spec_info.verified_id = info.spec_info.verified_id[keep_indices_jax]
-                info.spec_info.allocate_lens = info.spec_info.allocate_lens[keep_indices_jax]
 
             # Filter logprob lists
             if info.top_logprobs_nums is not None:
@@ -1564,7 +1568,7 @@ class ScheduleBatch:
                 else:
                     has_been_filtered = True
                 info.spec_info.filter_batch(
-                    new_indices=keep_indices_dp, has_been_filtered=has_been_filtered
+                    new_indices=keep_indices_np, has_been_filtered=has_been_filtered
                 )
 
         # Recalculate global batch flags from all remaining requests
@@ -2128,6 +2132,23 @@ class ScheduleBatch:
         page_size: int,
         enable_static_lora: bool = False,
     ) -> ModelWorkerBatch:
+        if self.dp_size == 1:
+            info = self.reqs_info[0]
+            self.input_ids = info.input_ids
+            self.req_pool_indices = info.req_pool_indices
+            self.seq_lens = info.seq_lens
+            self.out_cache_loc = info.out_cache_loc
+            self.prefix_lens = info.prefix_lens
+            self.extend_lens = info.extend_lens
+            self.extend_logprob_start_lens = info.extend_logprob_start_lens
+            self.extend_input_logprob_token_ids = info.extend_input_logprob_token_ids
+            self.sampling_info = info.sampling_info
+            self.top_logprobs_nums = info.top_logprobs_nums
+            self.token_ids_logprobs = info.token_ids_logprobs
+            self.reqs = info.reqs or []
+            if not hasattr(self, "spec_info") or self.spec_info is None:
+                self.spec_info = info.spec_info
+
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
@@ -2152,6 +2173,7 @@ class ScheduleBatch:
         out_cache_loc_cpu = self.out_cache_loc
         seq_lens_cpu = self.seq_lens
         real_bs = len(seq_lens_cpu)
+        self.per_dp_bs_size = real_bs
         req_pool_indices_cpu = self.req_pool_indices
         token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
         # FIXME @pc, move this to eagle_worker
@@ -2291,6 +2313,10 @@ class ScheduleBatch:
             logits_indices=logits_indices,
             lora_ids=lora_ids,
             real_bs=real_bs,
+            real_bs_per_dp=[real_bs],
+            logits_indices_selector=np.arange(real_bs, dtype=np.int32),
+            dp_size=self.dp_size,
+            per_dp_bs_size=real_bs,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
                 if self.return_hidden_states

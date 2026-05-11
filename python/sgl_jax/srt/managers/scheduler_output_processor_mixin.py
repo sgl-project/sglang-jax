@@ -344,13 +344,19 @@ class SchedulerOutputProcessorMixin:
                 elif self.spec_algorithm.is_eagle():
                     req.output_ids.extend([int(t) for t in next_token_id])
                     new_accepted_len = len(next_token_id)
+                    committed_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+                    req.kv_committed_len = max(req.kv_committed_len, committed_len)
+                    # EAGLE verifies a draft span but the sampled tail token has no
+                    # committed target KV yet. Redundant preallocated slots are
+                    # released below before release_kv_cache() runs.
+                    req.kv_allocated_len = req.kv_committed_len
 
                 req.check_finished(new_accepted_len)
 
                 if req.finished():
                     self.maybe_collect_routed_experts(req)
                     if batch.spec_algorithm is not None and batch.spec_algorithm.is_eagle():
-                        cur_allocate_len = info.spec_info.allocate_lens[i]
+                        cur_allocate_len = int(np.asarray(info.spec_info.allocate_lens)[i])
                         all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
                         if self.page_size > 1:
                             all_token_len = cdiv(all_token_len, self.page_size) * self.page_size

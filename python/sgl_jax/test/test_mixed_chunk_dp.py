@@ -1,11 +1,16 @@
 import unittest
 from types import SimpleNamespace
 
+import jax
 import numpy as np
+from jax import numpy as jnp
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
 from sgl_jax.srt.managers.schedule_policy import PrefillAdder
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
+from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 
 
 class _DummyAllocator:
@@ -163,6 +168,95 @@ class TestMixedChunkDP(unittest.TestCase):
         self.assertEqual(adder.cur_rem_token_offset, [3, 1])
         self.assertEqual(adder.rem_input_tokens, 96)
         self.assertEqual(adder.rem_chunk_tokens_list, [17, 19])
+
+    def test_filter_batch_uses_array_indices_for_jax_state(self):
+        mesh = Mesh(np.array(jax.devices()).reshape((1,)), ("data",))
+        vector_sharding = NamedSharding(mesh, P("data"))
+        matrix_sharding = NamedSharding(mesh, P("data", None))
+        reqs = [_make_req(f"req-{i}", dp_rank=0) for i in range(3)]
+        batch = ScheduleBatch.init_new(
+            reqs=[reqs],
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            tree_cache=None,
+            model_config=SimpleNamespace(vocab_size=32000),
+            enable_overlap=False,
+            dp_size=1,
+            spec_algorithm=None,
+            mesh=None,
+        )
+        info = batch.reqs_info[0]
+        info.req_pool_indices = jax.device_put(
+            jnp.array([10, 11, 12], dtype=jnp.int32), vector_sharding
+        )
+        info.seq_lens = jax.device_put(jnp.array([20, 21, 22], dtype=jnp.int32), vector_sharding)
+        info.output_ids = jax.device_put(jnp.array([30, 31, 32], dtype=jnp.int32), vector_sharding)
+        info.spec_info = EagleDraftInput(
+            topk_p=jax.device_put(jnp.arange(6, dtype=jnp.float32).reshape(3, 2), matrix_sharding),
+            topk_index=jax.device_put(
+                jnp.arange(6, dtype=jnp.int32).reshape(3, 2), matrix_sharding
+            ),
+            hidden_states=jax.device_put(
+                jnp.arange(12, dtype=jnp.float32).reshape(3, 4), matrix_sharding
+            ),
+            verified_id=jax.device_put(jnp.array([40, 41, 42], dtype=jnp.int32), vector_sharding),
+            allocate_lens=jax.device_put(jnp.array([50, 51, 52], dtype=jnp.int32), vector_sharding),
+            new_seq_lens=jax.device_put(jnp.array([60, 61, 62], dtype=jnp.int32), vector_sharding),
+        )
+
+        batch.filter_batch(
+            keep_indices={0: [0, 2]},
+            chunked_req_to_exclude={0: None},
+        )
+
+        self.assertEqual([r.rid for r in info.reqs], ["req-0", "req-2"])
+        np.testing.assert_array_equal(np.asarray(info.req_pool_indices), [10, 12])
+        np.testing.assert_array_equal(np.asarray(info.seq_lens), [20, 22])
+        np.testing.assert_array_equal(np.asarray(info.output_ids), [30, 32])
+        np.testing.assert_array_equal(np.asarray(info.spec_info.verified_id), [40, 42])
+        np.testing.assert_array_equal(np.asarray(info.spec_info.allocate_lens), [50, 52])
+        np.testing.assert_array_equal(np.asarray(info.spec_info.new_seq_lens), [60, 62])
+
+    def test_filter_batch_slices_already_filtered_jax_spec_state(self):
+        mesh = Mesh(np.array(jax.devices()).reshape((1,)), ("data",))
+        vector_sharding = NamedSharding(mesh, P("data"))
+        matrix_sharding = NamedSharding(mesh, P("data", None))
+        reqs = [_make_req(f"req-{i}", dp_rank=0) for i in range(3)]
+        batch = ScheduleBatch.init_new(
+            reqs=[reqs],
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            tree_cache=None,
+            model_config=SimpleNamespace(vocab_size=32000),
+            enable_overlap=False,
+            dp_size=1,
+            spec_algorithm=None,
+            mesh=None,
+        )
+        info = batch.reqs_info[0]
+        info.req_pool_indices = jax.device_put(
+            jnp.array([10, 11, 12], dtype=jnp.int32), vector_sharding
+        )
+        info.seq_lens = jax.device_put(jnp.array([20, 21, 22], dtype=jnp.int32), vector_sharding)
+        info.output_ids = jax.device_put(jnp.array([30, 31, 32], dtype=jnp.int32), vector_sharding)
+        info.spec_info = EagleDraftInput(
+            topk_p=jax.device_put(jnp.arange(6, dtype=jnp.float32).reshape(3, 2), matrix_sharding),
+            topk_index=jax.device_put(
+                jnp.arange(6, dtype=jnp.int32).reshape(3, 2), matrix_sharding
+            ),
+            hidden_states=jax.device_put(
+                jnp.arange(12, dtype=jnp.float32).reshape(3, 4), matrix_sharding
+            ),
+            verified_id=jax.device_put(jnp.array([40, 41, 42], dtype=jnp.int32), vector_sharding),
+            allocate_lens=jax.device_put(jnp.array([50, 51, 52], dtype=jnp.int32), vector_sharding),
+            new_seq_lens=jax.device_put(jnp.array([60, 61, 62], dtype=jnp.int32), vector_sharding),
+        )
+
+        batch.filter_batch(keep_indices={0: [0, 2]})
+
+        self.assertEqual([r.rid for r in info.reqs], ["req-0", "req-2"])
+        np.testing.assert_array_equal(np.asarray(info.spec_info.verified_id), [40, 42])
+        np.testing.assert_array_equal(np.asarray(info.spec_info.allocate_lens), [50, 52])
 
 
 if __name__ == "__main__":

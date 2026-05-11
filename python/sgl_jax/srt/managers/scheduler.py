@@ -1812,13 +1812,22 @@ class Scheduler(
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch
             )
-            if batch_output.accept_lens is not None:
-                # Decode
-                batch.seq_lens = batch.seq_lens + batch_output.accept_lens
+            if self.dp_size == 1:
+                info = batch.reqs_info[0]
+                if batch_output.accept_lens is not None:
+                    info.seq_lens = info.seq_lens + batch_output.accept_lens[: len(info.seq_lens)]
+                else:
+                    info.seq_lens = info.seq_lens + 1
+                info.spec_info = batch_output.next_draft_input
+                batch.spec_info = batch_output.next_draft_input
             else:
-                # Prefill
-                batch.seq_lens = batch.seq_lens + 1
-            batch.spec_info = batch_output.next_draft_input
+                if batch_output.accept_lens is not None:
+                    # Decode
+                    batch.seq_lens = batch.seq_lens + batch_output.accept_lens
+                else:
+                    # Prefill
+                    batch.seq_lens = batch.seq_lens + 1
+                batch.spec_info = batch_output.next_draft_input
             next_token_ids = batch_output.next_token_ids
             self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
             logits_output = batch_output.logits_output

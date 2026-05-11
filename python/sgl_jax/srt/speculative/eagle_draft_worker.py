@@ -41,6 +41,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _take_with_optional_out_sharding(array: jax.Array, index: jax.Array, trailing_slice=False):
+    out_sharding = getattr(array, "sharding", None)
+    if not isinstance(out_sharding, (NamedSharding, P)):
+        return array[index, :] if trailing_slice else array[index]
+    if trailing_slice:
+        return array.at[index, :].get(out_sharding=out_sharding)
+    return array.at[index].get(out_sharding=out_sharding)
+
+
 class EagleDraftWorker(ModelWorker, BaseDraftWorker):
     def __init__(self, server_args, target_worker: ModelWorker):
         self.server_args = server_args
@@ -97,7 +106,7 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
 
             if self.draft_model_runner.model.hot_token_ids is not None:
                 self.hot_token_ids = device_array(
-                    self.draft_model_runner.model.hot_token_ids,
+                    self.draft_model_runner.model.hot_token_ids.value,
                     sharding=(
                         NamedSharding(self.model_runner.mesh, P())
                         if jax.process_count() == 1
@@ -108,7 +117,7 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
             if self.draft_model_runner.model.hot_token_ids is not None:
                 head = head.clone()
                 self.hot_token_ids = device_array(
-                    self.draft_model_runner.model.hot_token_ids,
+                    self.draft_model_runner.model.hot_token_ids.value,
                     sharding=(
                         NamedSharding(self.model_runner.mesh, P())
                         if jax.process_count() == 1
@@ -120,6 +129,13 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
 
     def generate_model_worker_batch(self, *args, **kwargs):
         return self.compilation_manager.generate_model_worker_batch(*args, **kwargs)
+
+    def _remap_hot_token_ids(self, token_ids: jax.Array) -> jax.Array:
+        out_sharding = NamedSharding(
+            self.model_runner.mesh,
+            P("data", None) if token_ids.ndim == 2 else P("data"),
+        )
+        return self.hot_token_ids.at[token_ids].get(out_sharding=out_sharding)
 
     def copy_model_worker_batch_to_cpu(self, model_worker_batch: ModelWorkerBatch):
         model_worker_batch.input_ids = np.array(
@@ -225,7 +241,7 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
         # out_cache_loc = model_worker_batch.out_cache_loc
         topk_index = spec_info.topk_index
         if self.hot_token_ids is not None:
-            model_worker_batch.spec_info.topk_index = self.hot_token_ids[topk_index]
+            model_worker_batch.spec_info.topk_index = self._remap_hot_token_ids(topk_index)
         # if we need custom mask, we should create for all at once and update it within loop
         # we should optimize build_tree_mask_for_draft_decode to a kernel
         if self.topk > 1:
@@ -419,8 +435,12 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
             + batch_output.accept_lens[: model_worker_batch.real_bs]
             - 1
         )
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[select_index]
-        draft_logits_output.hidden_states = draft_logits_output.hidden_states[select_index]
+        draft_logits_output.next_token_logits = _take_with_optional_out_sharding(
+            draft_logits_output.next_token_logits, select_index, trailing_slice=True
+        )
+        draft_logits_output.hidden_states = _take_with_optional_out_sharding(
+            draft_logits_output.hidden_states, select_index, trailing_slice=True
+        )
         topk_p, topk_index = topk_probs_from_logits(
             draft_logits_output.next_token_logits, self.topk
         )
@@ -429,9 +449,9 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
         batch_output.next_draft_input.hidden_states = draft_logits_output.hidden_states
         batch_output.next_draft_input.topk_p = topk_p
         batch_output.next_draft_input.topk_index = topk_index
-        batch_output.next_draft_input.verified_id = batch_output.next_draft_input.verified_id[
-            select_index
-        ]
+        batch_output.next_draft_input.verified_id = _take_with_optional_out_sharding(
+            batch_output.next_draft_input.verified_id, select_index
+        )
         batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
         batch_output.accept_lens = batch_output.accept_lens[: model_worker_batch.real_bs]
 
@@ -443,11 +463,18 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
         )
         bs = model_worker_batch.seq_lens.shape[0]
         step_min_1 = self.speculative_num_steps - 1
-        score_list: jax.Array = jnp.empty((bs, 1 + step_min_1 * self.topk, self.topk))
-        token_list: jax.Array = jnp.empty(
-            (bs, self.topk + step_min_1 * self.topk * self.topk), dtype=jnp.int32
+        score_list: jax.Array = device_array(
+            np.empty((bs, 1 + step_min_1 * self.topk, self.topk), dtype=np.float32),
+            sharding=NamedSharding(self.model_runner.mesh, P("data", None, None)),
         )
-        parents_list: jax.Array = jnp.empty((bs, self.topk + 1 + step_min_1 * self.topk))
+        token_list: jax.Array = device_array(
+            np.empty((bs, self.topk + step_min_1 * self.topk * self.topk), dtype=np.int32),
+            sharding=NamedSharding(self.model_runner.mesh, P("data", None)),
+        )
+        parents_list: jax.Array = device_array(
+            np.empty((bs, self.topk + 1 + step_min_1 * self.topk), dtype=np.int32),
+            sharding=NamedSharding(self.model_runner.mesh, P("data", None)),
+        )
         scores = None
         positions_base = device_array(
             np.repeat(model_worker_batch.seq_lens, self.topk),
@@ -495,7 +522,7 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
             topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
 
             if self.hot_token_ids is not None:
-                topk_index = self.hot_token_ids[topk_index]
+                topk_index = self._remap_hot_token_ids(topk_index)
             hidden_states = logits_output.hidden_states
 
         return score_list, token_list, parents_list
@@ -542,6 +569,7 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
                     self.mesh,
                     vocab_size=self.model_config.vocab_size,
                 )
+                model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
                 logits_output, next_token_ids, _ = self.target_worker.forward_batch_generation(
                     model_worker_batch, sampling_metadata=sampling_metadata
                 )

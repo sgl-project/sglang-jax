@@ -78,6 +78,18 @@ def _as_int32_array(value: Any, *, fallback: int = -1) -> jax.Array:
         ) from exc
 
 
+def _take_with_same_sharding(array: Any, indices: np.ndarray):
+    if array is None:
+        return None
+    if isinstance(array, jax.Array):
+        index = jnp.asarray(indices, dtype=jnp.int32)
+        try:
+            return array.at[index].get(out_sharding=array.sharding)
+        except ValueError:
+            return array[index]
+    return array[indices]
+
+
 def get_last_loc_jax_array(
     req_to_token: jax.Array,
     req_pool_indices: jax.Array,
@@ -324,6 +336,38 @@ def build_tree_kernel_efficient(
         tuple of (tree_mask, positions, retrive_index, retrive_next_token,
                  retrive_next_sibling, draft_tokens)
     """
+    if topk == 1:
+        draft_tokens = jnp.concatenate(
+            [
+                jnp.expand_dims(verified_id, axis=1),
+                token_list[:, : num_verify_tokens - 1],
+            ],
+            axis=1,
+        ).flatten()
+        positions = (
+            jnp.expand_dims(seq_lens, axis=1)
+            + jnp.arange(num_verify_tokens, dtype=jnp.int32)[None, :]
+        ).flatten()
+        retrive_index = jnp.arange(batch_size * num_verify_tokens, dtype=jnp.int32).reshape(
+            batch_size, num_verify_tokens
+        )
+        retrive_next_token = jnp.concatenate(
+            [
+                jnp.arange(1, num_verify_tokens, dtype=jnp.int32),
+                jnp.array([-1], dtype=jnp.int32),
+            ]
+        )
+        retrive_next_token = jnp.broadcast_to(retrive_next_token, (batch_size, num_verify_tokens))
+        retrive_next_sibling = jnp.full((batch_size, num_verify_tokens), -1, dtype=jnp.int32)
+        return (
+            None,
+            positions,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            draft_tokens,
+        )
+
     parent_list, top_scores_index, draft_tokens = build_tree_kernel_efficient_preprocess(
         verified_id,
         score_list,
@@ -479,6 +523,7 @@ class EagleDraftInput(SpecInput):
             self.verified_id.shape[0] == model_worker_batch.real_bs
         ), f"{self.verified_id.shape=} {model_worker_batch.real_bs=}"
 
+        verified_id_cpu = np.asarray(jax.device_get(self.verified_id))[: model_worker_batch.real_bs]
         pt = 0
         for i in range(model_worker_batch.real_bs):
             extend_len = model_worker_batch.extend_seq_lens[i]
@@ -486,7 +531,7 @@ class EagleDraftInput(SpecInput):
 
             # TODO: batch.input_ids should on tpu
             model_worker_batch.input_ids[pt : pt + extend_len] = np.concatenate(
-                (input_ids[1:], self.verified_id[i].reshape(1))
+                (input_ids[1:], verified_id_cpu[i : i + 1])
             )
             pt += extend_len
 
@@ -508,6 +553,9 @@ class EagleDraftInput(SpecInput):
         model_worker_batch.positions = model_worker_batch.positions
         model_worker_batch.extend_seq_lens = np.full((bs,), step_plus_1, dtype=np.int32)
         model_worker_batch.extend_seq_lens[model_worker_batch.real_bs :] = 0
+        model_worker_batch.logits_indices = (
+            np.cumsum(model_worker_batch.extend_seq_lens, dtype=np.int32) - 1
+        )
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
@@ -527,7 +575,14 @@ class EagleDraftInput(SpecInput):
         return model_worker_batch, logits_metadata
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
-        new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE - 1
+        if schedule_batch.dp_size == 1:
+            batch_seq_lens = schedule_batch.reqs_info[0].seq_lens
+            req_pool_indices = schedule_batch.reqs_info[0].req_pool_indices
+        else:
+            batch_seq_lens = schedule_batch.seq_lens
+            req_pool_indices = schedule_batch.req_pool_indices
+
+        new_allocate_lens = batch_seq_lens + self.ALLOC_LEN_PER_DECODE - 1
         bs = schedule_batch.batch_size()
         assert (
             self.allocate_lens.shape[0] == bs
@@ -540,7 +595,7 @@ class EagleDraftInput(SpecInput):
         else:
             last_loc = get_last_loc(
                 schedule_batch.req_to_token_pool.req_to_token,
-                schedule_batch.req_pool_indices,
+                req_pool_indices,
                 self.allocate_lens,
             )
             extend_num_tokens = sum(new_allocate_lens - self.allocate_lens).item()
@@ -553,7 +608,7 @@ class EagleDraftInput(SpecInput):
             )
 
         assign_req_to_token_pool(
-            schedule_batch.req_pool_indices,
+            req_pool_indices,
             schedule_batch.req_to_token_pool,
             self.allocate_lens,
             new_allocate_lens,
@@ -562,8 +617,12 @@ class EagleDraftInput(SpecInput):
 
         self.allocate_lens = new_allocate_lens
 
-        schedule_batch.seq_lens_sum = np.sum(schedule_batch.seq_lens).item()
-        schedule_batch.out_cache_loc = out_cache_loc
+        if schedule_batch.dp_size == 1:
+            schedule_batch.reqs_info[0].seq_lens_sum = np.sum(batch_seq_lens).item()
+            schedule_batch.reqs_info[0].out_cache_loc = out_cache_loc
+        else:
+            schedule_batch.seq_lens_sum = np.sum(batch_seq_lens).item()
+            schedule_batch.out_cache_loc = out_cache_loc
 
     def prepare_for_draft_decode(
         self, model_worker_batch: ModelWorkerBatch, topk: int, num_steps: int
@@ -630,26 +689,34 @@ class EagleDraftInput(SpecInput):
         self.accept_length_cpu = np.asarray(accept_length_cpu_host, dtype=np.int32)
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True):
+        new_indices = np.asarray(new_indices, dtype=np.int32)
 
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
             if len(new_indices) != len(self.topk_p):
-                logger.warning(
-                    "length of new_indices: %d != length of topk_p: %d, this should not happen",
+                logger.debug(
+                    "length of new_indices: %d != length of topk_p: %d; filtering EAGLE state by indices",
                     len(new_indices),
                     len(self.topk_p),
                 )
-            self.topk_p = self.topk_p[: len(new_indices)]
-            self.topk_index = self.topk_index[: len(new_indices)]
-            self.hidden_states = self.hidden_states[: len(new_indices)]
-            self.verified_id = self.verified_id[: len(new_indices)]
+                kept_indices = new_indices
+            else:
+                kept_indices = np.arange(len(new_indices), dtype=np.int32)
+            self.topk_p = _take_with_same_sharding(self.topk_p, kept_indices)
+            self.topk_index = _take_with_same_sharding(self.topk_index, kept_indices)
+            self.hidden_states = _take_with_same_sharding(self.hidden_states, kept_indices)
+            self.verified_id = _take_with_same_sharding(self.verified_id, kept_indices)
+            self.allocate_lens = _take_with_same_sharding(self.allocate_lens, kept_indices)
+            self.new_seq_lens = _take_with_same_sharding(self.new_seq_lens, kept_indices)
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
-            self.topk_p = self.topk_p[new_indices]
-            self.topk_index = self.topk_index[new_indices]
-            self.hidden_states = self.hidden_states[new_indices]
-            self.verified_id = self.verified_id[new_indices]
+            self.topk_p = _take_with_same_sharding(self.topk_p, new_indices)
+            self.topk_index = _take_with_same_sharding(self.topk_index, new_indices)
+            self.hidden_states = _take_with_same_sharding(self.hidden_states, new_indices)
+            self.verified_id = _take_with_same_sharding(self.verified_id, new_indices)
+            self.allocate_lens = _take_with_same_sharding(self.allocate_lens, new_indices)
+            self.new_seq_lens = _take_with_same_sharding(self.new_seq_lens, new_indices)
 
     def merge_batch(self, spec_info: EagleDraftInput):
         # FIXME(pc) need support overlap here

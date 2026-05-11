@@ -1,17 +1,35 @@
-import functools
+from contextlib import nullcontext
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-@functools.partial(jax.jit, static_argnames=["topk"])
+def _mesh_context_from_sharding(sharding):
+    if not isinstance(sharding, NamedSharding):
+        return nullcontext()
+    try:
+        return jax.sharding.use_mesh(sharding.mesh)
+    except AttributeError:
+        try:
+            return jax.set_mesh(sharding.mesh)
+        except AttributeError:
+            return sharding.mesh
+
+
 def topk_probs_from_logits(
     logits: jax.Array, topk: int, axis: int = -1
 ) -> tuple[jax.Array, jax.Array]:
     """Return top-k probabilities without materializing the full softmax tensor."""
     working_logits = jnp.moveaxis(logits, axis, -1) if axis != -1 else logits
+    if isinstance(working_logits.sharding, NamedSharding):
+        working_logits = jax.sharding.reshard(
+            working_logits,
+            NamedSharding(working_logits.sharding.mesh, P("data", None)),
+        )
     topk_logits, topk_index = jax.lax.top_k(working_logits, topk)
     logsumexp = jax.nn.logsumexp(working_logits, axis=-1, keepdims=True)
     topk_probs = jnp.exp(topk_logits - logsumexp)
@@ -46,22 +64,38 @@ def update_eagle_lists(
 ):
     bs = score_list.shape[0]
     scores_update, tokens_update, parents_update = tree_info
-    if i == 0:
-        score_list = score_list.at[:bs, :1, :].set(scores_update[:bs])
-        token_list = token_list.at[:bs, :topk].set(tokens_update[:bs])
-        parents_list = parents_list.at[:bs, : topk + 1].set(parents_update[:bs])
-    else:
-        score_start = 1 + (i - 1) * topk
-        token_start = topk + (i - 1) * topk * topk
-        parent_start = topk + 1 + (i - 1) * topk
+    with _mesh_context_from_sharding(score_list.sharding):
+        if isinstance(score_list.sharding, NamedSharding):
+            scores_update = jax.sharding.reshard(scores_update, score_list.sharding)
+        if isinstance(token_list.sharding, NamedSharding):
+            tokens_update = jax.sharding.reshard(tokens_update, token_list.sharding)
+        if isinstance(parents_list.sharding, NamedSharding):
+            parents_update = jax.sharding.reshard(parents_update, parents_list.sharding)
 
-        score_list = score_list.at[:bs, score_start : score_start + topk, :].set(scores_update[:bs])
-        token_list = token_list.at[:bs, token_start : token_start + topk * topk].set(
-            tokens_update[:bs]
-        )
-        parents_list = parents_list.at[:bs, parent_start : parent_start + topk].set(
-            parents_update[:bs]
-        )
+        if i == 0:
+            score_list = score_list.at[:bs, :1, :].set(
+                scores_update[:bs], out_sharding=score_list.sharding
+            )
+            token_list = token_list.at[:bs, :topk].set(
+                tokens_update[:bs], out_sharding=token_list.sharding
+            )
+            parents_list = parents_list.at[:bs, : topk + 1].set(
+                parents_update[:bs], out_sharding=parents_list.sharding
+            )
+        else:
+            score_start = 1 + (i - 1) * topk
+            token_start = topk + (i - 1) * topk * topk
+            parent_start = topk + 1 + (i - 1) * topk
+
+            score_list = score_list.at[:bs, score_start : score_start + topk, :].set(
+                scores_update[:bs], out_sharding=score_list.sharding
+            )
+            token_list = token_list.at[:bs, token_start : token_start + topk * topk].set(
+                tokens_update[:bs], out_sharding=token_list.sharding
+            )
+            parents_list = parents_list.at[:bs, parent_start : parent_start + topk].set(
+                parents_update[:bs], out_sharding=parents_list.sharding
+            )
     return score_list, token_list, parents_list
 
 
@@ -97,7 +131,6 @@ def select_top_k_tokens(
         )
 
 
-@functools.partial(jax.jit, static_argnames=["topk"])
 def select_top_k_tokens_step_0(
     topk_p: jax.Array,
     topk_index: jax.Array,
@@ -113,14 +146,13 @@ def select_top_k_tokens_step_0(
         jnp.expand_dims(topk_p, axis=1),  # shape: (b, 1, topk)
         topk_index,  # shape: (b, topk)
         jnp.tile(
-            jnp.expand_dims(jnp.arange(-1, topk, dtype=jnp.float32), axis=0),
+            jnp.expand_dims(jnp.arange(-1, topk, dtype=jnp.int32), axis=0),
             (topk_p.shape[0], 1),
         ),  # shape: (b, topk + 1)
     )
     return input_ids, hidden_states, scores, tree_info
 
 
-@functools.partial(jax.jit, static_argnames=["topk"])
 def select_top_k_tokens_step_greater_0(
     i: jax.Array,
     topk_p: jax.Array,
@@ -143,7 +175,12 @@ def select_top_k_tokens_step_greater_0(
         selected_input_index = topk_cs_index.flatten() // topk + jnp.repeat(
             jnp.arange(0, hidden_states.shape[0], topk), topk
         )
-        hidden_states = hidden_states[selected_input_index, :]
+        if isinstance(hidden_states.sharding, NamedSharding):
+            hidden_states = hidden_states.at[selected_input_index, :].get(
+                out_sharding=NamedSharding(hidden_states.sharding.mesh, P("data", None))
+            )
+        else:
+            hidden_states = hidden_states[selected_input_index, :]
     tree_info = (
         expand_scores,  # shape: (b, topk, topk)
         topk_index,  # shape: (b, topk * topk)

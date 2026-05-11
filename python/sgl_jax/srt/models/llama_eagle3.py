@@ -18,6 +18,8 @@ import logging
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from transformers import LlamaConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -135,6 +137,7 @@ class LlamaEagleModel(LlamaModel):
     ) -> None:
         super().__init__(config=config, dtype=dtype, is_draft_model=True, mesh=mesh)
         self.config = config
+        self.mesh = mesh
 
         self.is_mrope_enabled = (
             hasattr(config, "rope_scaling")
@@ -197,6 +200,10 @@ class LlamaEagleModel(LlamaModel):
 
         if hidden_states.shape[-1] != embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)[0]
+
+        token_sharding = NamedSharding(self.mesh, P("data", None))
+        embeds = jax.sharding.reshard(embeds, token_sharding)
+        hidden_states = jax.sharding.reshard(hidden_states, token_sharding)
 
         residual = None
         hidden_states, residual, kv_fused = self.midlayer(

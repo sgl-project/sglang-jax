@@ -190,6 +190,11 @@ class ModelRunner(BaseModelRunner):
         )
 
     def initialize_jit(self):
+        if not hasattr(self, "_sampler_base_rng"):
+            self._sampler_base_rng = jax.random.PRNGKey(self.server_args.random_seed)
+        if not hasattr(self, "_sampler_step"):
+            self._sampler_step = 0
+
         model_def, model_state = nnx.split(self.model)
         # note export for external modification
         self.model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)

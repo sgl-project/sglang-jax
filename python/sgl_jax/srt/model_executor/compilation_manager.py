@@ -312,6 +312,30 @@ class CompilationManager:
             logits_indices_selector=np.arange(bs, dtype=np.int32),
         )
 
+    def generate_model_worker_batch(
+        self,
+        bs: int,
+        num_tokens: int,
+        mode,
+        max_cache_loc_size: int,
+        do_penalties: bool = False,
+        speculative_algorithm=None,
+        speculative_algotithm=None,
+    ):
+        if do_penalties:
+            logger.warning("Precompile dummy batch penalties are not supported; ignoring.")
+        if speculative_algorithm is None:
+            speculative_algorithm = speculative_algotithm
+        return self._make_dummy_batch(
+            bs,
+            num_tokens,
+            mode,
+            max_cache_loc_size,
+            speculative_algorithm=speculative_algorithm,
+            dp_size=self.dp_size,
+            per_dp_bs_size=bs // self.dp_size,
+        )
+
     # ---- Lazy compilation tracking ----
 
     def register_variant_if_new(self, variant_key: tuple) -> bool:

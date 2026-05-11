@@ -198,6 +198,23 @@ class TestDummyBatch(unittest.TestCase):
         assert batch.extend_prefix_lens is None
         assert batch.logits_indices is None
 
+    def test_generate_model_worker_batch_compatibility(self):
+        batch = self.cm.generate_model_worker_batch(
+            32,
+            128,
+            ForwardMode.EXTEND,
+            512,
+            speculative_algotithm="EAGLE3",
+        )
+
+        assert batch.forward_mode == ForwardMode.EXTEND
+        assert batch.real_bs == 32
+        assert batch.input_ids.shape == (128,)
+        assert batch.cache_loc.shape == (512,)
+        assert batch.spec_algorithm == "EAGLE3"
+        assert hasattr(batch.sampling_info, "grammars")
+        assert hasattr(batch.sampling_info, "vocab_mask")
+
     def test_dp_metadata(self):
         cm = CompilationManager(
             server_args=_make_server_args(),

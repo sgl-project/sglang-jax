@@ -202,7 +202,9 @@ class FlashAttention(AttentionBackend):
 
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
             # convert custom_mask from bool to int32, because dma not support bool type
-            if batch.spec_info.custom_mask.dtype == jnp.bool:
+            if batch.spec_info.custom_mask is None:
+                metadata.custom_mask = None
+            elif batch.spec_info.custom_mask.dtype == jnp.bool:
                 # FIXME(pc) rm this dtype convert
                 logger.warning(
                     "batch.spec_info.custom_mask type is  %s, it may make performance very low",

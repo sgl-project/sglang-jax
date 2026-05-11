@@ -273,6 +273,11 @@ class SamplingBatchInfo:
     penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator | None = None
     linear_penalty: np.ndarray = None
 
+    grammars: list | None = None
+
+    # Grammar vocab mask, if any. Kept for ModelWorkerBatch -> SamplingMetadata.
+    vocab_mask: np.ndarray | None = None
+
     @classmethod
     def _get_global_server_args_dict(cls):
         from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
@@ -308,6 +313,8 @@ class SamplingBatchInfo:
             sampling_seeds=sampling_seeds,
             penalizer_orchestrator=None,
             linear_penalty=None,
+            grammars=None,
+            vocab_mask=None,
         )
         return ret
 
@@ -338,6 +345,8 @@ class SamplingBatchInfo:
             sampling_seeds=sampling_seeds,
             penalizer_orchestrator=None,
             linear_penalty=None,
+            grammars=None,
+            vocab_mask=None,
         )
         return ret
 
@@ -391,6 +400,8 @@ class SamplingBatchInfo:
             sampling_seeds=sampling_seeds,
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
+            grammars=[r.grammar for r in reqs] if any(r.grammar for r in reqs) else None,
+            vocab_mask=None,
         )
         return ret
 
@@ -414,10 +425,13 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seeds",
+            "vocab_mask",
         ]:
             value = getattr(self, item, None)
             if value is not None:
                 setattr(self, item, value[keep_indices])
+        if self.grammars is not None:
+            self.grammars = [self.grammars[i] for i in keep_indices]
 
     def merge_batch(self, other: SamplingBatchInfo):
         if self.penalizer_orchestrator is not None:
@@ -425,17 +439,24 @@ class SamplingBatchInfo:
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
         # the merge operation of the temperatures tensor below.
+        self_len = len(self)
+        other_len = len(other)
         for item in [
             "temperatures",
             "top_ps",
             "top_ks",
             "min_ps",
             "sampling_seeds",
+            "vocab_mask",
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
             if self_val is not None and other_val is not None:
                 setattr(self, item, np.concat([self_val, other_val]))
+        if self.grammars is not None or other.grammars is not None:
+            self_grammars = self.grammars or [None] * self_len
+            other_grammars = other.grammars or [None] * other_len
+            self.grammars = self_grammars + other_grammars
 
         self.is_all_greedy &= other.is_all_greedy
         self.need_top_p_sampling |= other.need_top_p_sampling

@@ -3,6 +3,8 @@ import logging
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
@@ -23,6 +25,15 @@ from sgl_jax.srt.utils.common_utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
+
+
+def _take_with_optional_out_sharding(array: jax.Array, index: jax.Array, trailing_slice=False):
+    out_sharding = getattr(array, "sharding", None)
+    if not isinstance(out_sharding, (NamedSharding, P)):
+        return array[index, :] if trailing_slice else array[index]
+    if trailing_slice:
+        return array.at[index, :].get(out_sharding=out_sharding)
+    return array.at[index].get(out_sharding=out_sharding)
 
 
 class EAGLEWorker(BaseSpecWorker):
@@ -171,9 +182,15 @@ class EAGLEWorker(BaseSpecWorker):
             self.model_runner.rngs,
             self.mesh,
         )
-        logits_output.next_token_logits = logits_output.next_token_logits[accept_index, :]
-        logits_output.hidden_states = logits_output.hidden_states[accept_index, :]
-        model_worker_batch.positions = model_worker_batch.positions[accept_index]
+        logits_output.next_token_logits = _take_with_optional_out_sharding(
+            logits_output.next_token_logits, accept_index, trailing_slice=True
+        )
+        logits_output.hidden_states = _take_with_optional_out_sharding(
+            logits_output.hidden_states, accept_index, trailing_slice=True
+        )
+        model_worker_batch.positions = _take_with_optional_out_sharding(
+            model_worker_batch.positions, accept_index
+        )
         new_seq_lens = model_worker_batch.seq_lens + accept_length
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
