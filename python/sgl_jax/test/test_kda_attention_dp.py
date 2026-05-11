@@ -20,14 +20,12 @@ from sgl_jax.test.test_utils import CustomTestCase
 
 
 def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.ndarray:
-    # @Scale: 0.1 for kernel inputs/initial states to keep bf16 mantissa precision
-    #   in the delta-rule recurrence (S = S*exp(g) + beta*k*(v - k^T S))
-    #   without it, round-off error will accumulate across K-dim reductions and T recurrent steps.
+    # scale=0.1 keeps bf16 mantissa precision in the delta-rule recurrence
+    # S = S*exp(g) + beta*k*(v - k^T S); larger values overflow.
     return rng.standard_normal(shape).astype(np.float32) * scale
 
 
-# --- Reference baselines (verbatim from test_kda_attention.py).
-# Note: each test file ships its own ref helpers rather than sharing across tests. Keep these in sync with the TP file if they diverge.
+# Reference baselines duplicated from test_kda_attention.py — keep in sync.
 
 
 def make_nnx_depthwise_conv(weight_dk: jax.Array) -> nnx.Conv:
@@ -56,9 +54,7 @@ def ref_short_convolution(
     cu_seqlens: jax.Array,
     forward_mode: ForwardMode,
 ) -> tuple[jax.Array, jax.Array]:
-    """nnx.Conv baseline copied from test_short_conv.py's construction style."""
-    x = jnp.asarray(np.asarray(x), dtype=x.dtype)
-    cache = jnp.asarray(np.asarray(cache), dtype=cache.dtype)
+    """nnx.Conv baseline. All inputs must be unsharded host tensors."""
     conv = make_nnx_depthwise_conv(weight)
     kernel_size = conv.kernel.value.shape[0]
     cache_width = kernel_size - 1
@@ -105,8 +101,14 @@ def ref_kda_attention(
     initial_conv_state: jax.Array,
     forward_mode: ForwardMode,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """KDA reference. All tensor inputs (q/k/v/a/b/initial_*) must be
+    unsharded host arrays. Layer params are unsharded locally.
+    """
     num_heads = layer.num_q_heads
     head_dim = layer.head_q_dim
+
+    a_log = jnp.asarray(np.asarray(layer.A_log.value), dtype=layer.A_log.value.dtype)
+    dt_bias = jnp.asarray(np.asarray(layer.dt_bias.value), dtype=layer.dt_bias.value.dtype)
 
     q_state, k_state, v_state = jnp.split(initial_conv_state, 3, axis=1)
     q, q_state = ref_short_convolution(
@@ -135,20 +137,10 @@ def ref_kda_attention(
     k = l2_normalize(k.reshape(k.shape[0], num_heads, head_dim))
     v = v.reshape(v.shape[0], num_heads, head_dim)
     g = a.reshape(a.shape[0], num_heads, head_dim)
-    g = -jnp.exp(layer.A_log.value.reshape(num_heads, 1).astype(jnp.float32)) * jax.nn.softplus(
-        g.astype(jnp.float32) + layer.dt_bias.value.reshape(num_heads, head_dim).astype(jnp.float32)
+    g = -jnp.exp(a_log.reshape(num_heads, 1).astype(jnp.float32)) * jax.nn.softplus(
+        g.astype(jnp.float32) + dt_bias.reshape(num_heads, head_dim).astype(jnp.float32)
     )
     g = g.astype(q.dtype)
-
-    # Replicate sharded tensors to host so per-seq slicing works under
-    # JAX's explicit-sharding mode (slicing a `data`-sharded axis would
-    # otherwise raise ShardingTypeError on the gather).
-    def unshard_for_ref(x):
-        return jnp.asarray(np.asarray(x), dtype=x.dtype)
-
-    g = unshard_for_ref(g)
-    b = unshard_for_ref(b)
-    initial_ssm_state = unshard_for_ref(initial_ssm_state)
 
     cu = np.asarray(cu_seqlens)
     outputs = []
@@ -279,8 +271,7 @@ def create_test_data(
         scale=head_dim**-0.5,
     )
 
-    # 4. Per-rank random data + initial state. Buffers built on host (NumPy),
-    # transferred to device with proper sharding at the end.
+    # 4. Per-rank random data + initial state (host NumPy; resharded later).
     q_global = np.zeros((global_input_size, hidden), dtype=np.float32)
     k_global = np.zeros((global_input_size, hidden), dtype=np.float32)
     v_global = np.zeros((global_input_size, hidden), dtype=np.float32)
@@ -322,10 +313,7 @@ def create_test_data(
             a_i = _scaled_randn(rank_rng, (q_len, hidden))
             b_i = _scaled_randn(rank_rng, (q_len, num_heads))
 
-            # Per-request initial state. ``has_initial_state_per_rank`` (when
-            # provided) names the requests that should carry a random initial
-            # state; everything else stays zero, matching codebase semantics
-            # (False = new request, True = continuing).
+            # True = continuing (random init state); False = new request (zero).
             req_has_initial_state = (
                 has_initial_state_per_rank is not None
                 and i < len(has_initial_state_per_rank.get(dp_rank, []))
@@ -437,30 +425,21 @@ def create_test_data(
         has_initial_state=has_initial_state_cpu,
     )
 
-    fb = ForwardBatch(
-        bid=1,
-        forward_mode=forward_mode,
-        batch_size=total_bs,
-        input_ids=jnp.asarray(input_ids_cpu),
-        req_pool_indices=jnp.asarray(req_pool_indices_cpu),
-        seq_lens=jnp.asarray(seq_lens_cpu),
-        out_cache_loc=jnp.asarray(out_cache_loc_cpu),
-        positions=jnp.asarray(positions_cpu),
-        attn_backend=backend,
-        cache_loc=jnp.asarray(out_cache_loc_cpu),
-        extend_prefix_lens=(
-            jnp.asarray(extend_prefix_lens_cpu) if extend_prefix_lens_cpu is not None else None
-        ),
-        extend_seq_lens=(
-            jnp.asarray(extend_seq_lens_cpu) if extend_seq_lens_cpu is not None else None
-        ),
-        spec_info=None,
-        recurrent_indices=jnp.asarray(recurrent_indices_cpu),
-    )
+    # ForwardBatch.init_new is the production entrypoint (see test_flashattention_dp.py).
+    dummy_model_config = type(
+        "DummyModelConfig",
+        (),
+        {"is_embedding": False, "hf_config": type("DummyHFConfig", (), {"architectures": []})()},
+    )()
+    dummy_runner = type(
+        "DummyRunner",
+        (),
+        {"mesh": mesh, "attn_backend": backend, "model_config": dummy_model_config},
+    )()
+    fb = ForwardBatch.init_new(mwb, dummy_runner)
     fb.attn_backend.forward_metadata = backend.get_forward_metadata(mwb)
 
-    # Shard global tensors as the backend expects: q/k/v/a [*, hidden] sharded
-    # P("data","tensor"); b [*, H] sharded P("data","tensor").
+    # Shard q/k/v/a/b for the actual backend call.
     hidden_sharding = NamedSharding(mesh, P("data", "tensor"))
     head_sharding = NamedSharding(mesh, P("data", "tensor"))
     q_dev = jax.device_put(jnp.asarray(q_global, dtype=dtype), hidden_sharding)
@@ -497,14 +476,10 @@ def compute_dp_reference_kda(
 ) -> tuple[np.ndarray, dict[int, tuple[np.ndarray, np.ndarray]]]:
     """Per-rank baseline composed into a global padded layout.
 
-    For each dp_rank, pack its per-request blocks into the same (q/k/v/a/b
-    + cu_seqlens + stacked initial states) interface that ``ref_kda_attention``
-    consumes in the TP test, run the ref once per rank, and write the result
-    into the rank's stride in the global output buffer.
+    For each dp_rank: pack per-request blocks, run ref_kda_attention once,
+    write result into the rank's stride in the global output.
 
-    Returns:
-        global_out: [global_output_size, hidden] padded output
-        per_dp_final_states: {dp_rank: (final_ssm, final_conv)} for continuing
+    Returns (global_out, {dp_rank: (final_ssm, final_conv)}).
     """
     is_prefill = mode == "prefill"
     forward_mode = ForwardMode.EXTEND if is_prefill else ForwardMode.DECODE
@@ -522,8 +497,7 @@ def compute_dp_reference_kda(
         token_offset = dp_rank * per_dp_token_padding
         bs_offset = dp_rank * per_dp_bs_padding
 
-        # Pack per-request blocks into [T, hidden] (or [N, hidden] for decode)
-        # plus a cu_seqlens index, and stack per-request initial states.
+        # Pack per-request blocks + cu_seqlens + stacked initial states.
         q_packed = jnp.asarray(np.concatenate(info["q"], axis=0), dtype=dtype)
         k_packed = jnp.asarray(np.concatenate(info["k"], axis=0), dtype=dtype)
         v_packed = jnp.asarray(np.concatenate(info["v"], axis=0), dtype=dtype)
@@ -555,6 +529,44 @@ def compute_dp_reference_kda(
             num_seqs = len(info["seq_lens"])
             global_out[bs_offset : bs_offset + num_seqs] = rank_out_np
     return global_out, per_dp_final_states
+
+
+def assert_pool_state_per_rank(
+    rec_buf: jax.Array,
+    conv_buf: jax.Array,
+    ref_ssm_per_rank: dict[int, np.ndarray],
+    ref_conv_per_rank: dict[int, np.ndarray],
+    per_dp_infos: dict,
+    dp_size: int,
+    rtol: float,
+    atol: float,
+    err_prefix: str,
+):
+    rec_np = np.asarray(rec_buf)
+    conv_np = np.asarray(conv_buf)
+    rank_stride = rec_np.shape[0] // dp_size
+    for dp_rank in range(dp_size):
+        info = per_dp_infos[dp_rank]
+        if not info["seq_lens"]:
+            continue
+        slot_base = dp_rank * rank_stride
+        global_slots = [slot_base + s for s in info["indices"]]
+        actual_ssm = rec_np[global_slots]
+        actual_conv = conv_np[global_slots]
+        np.testing.assert_allclose(
+            actual_ssm,
+            ref_ssm_per_rank[dp_rank],
+            rtol=rtol,
+            atol=atol,
+            err_msg=f"{err_prefix}: pool ssm rank {dp_rank}",
+        )
+        np.testing.assert_allclose(
+            actual_conv,
+            ref_conv_per_rank[dp_rank],
+            rtol=rtol,
+            atol=atol,
+            err_msg=f"{err_prefix}: pool conv rank {dp_rank}",
+        )
 
 
 class TestKDAAttentionDP(CustomTestCase):
@@ -601,7 +613,7 @@ class TestKDAAttentionDP(CustomTestCase):
             dp_size=dp_size,
             has_initial_state_per_rank=has_initial_state_per_rank,
         )
-        expected, _ = compute_dp_reference_kda(
+        expected, ref_states = compute_dp_reference_kda(
             mode,
             per_dp_infos,
             layer,
@@ -612,11 +624,10 @@ class TestKDAAttentionDP(CustomTestCase):
             head_dim=self.HEAD_DIM,
             dtype=self.DTYPE,
         )
-        actual, _ = layer(fb, q, k, v, a, b, pool)
+        actual, (rec_buf, conv_buf_list) = layer(fb, q, k, v, a, b, pool)
         actual_np = np.asarray(actual)
 
-        # Only compare rank-valid token / batch positions; padded slots in
-        # the global buffer hold garbage from the kernel and are ignored.
+        # Compare only rank-valid positions; padded slots hold kernel garbage.
         is_prefill = mode == "prefill"
         for dp_rank in range(dp_size):
             info = per_dp_infos[dp_rank]
@@ -631,6 +642,34 @@ class TestKDAAttentionDP(CustomTestCase):
                 atol=self.atol,
                 err_msg=f"DP rank {dp_rank} output mismatch",
             )
+
+        ref_ssm_per_rank = {r: s for r, (s, _) in ref_states.items()}
+        ref_conv_per_rank = {r: c for r, (_, c) in ref_states.items()}
+        assert_pool_state_per_rank(
+            rec_buf,
+            conv_buf_list[0],
+            ref_ssm_per_rank,
+            ref_conv_per_rank,
+            per_dp_infos,
+            dp_size=dp_size,
+            rtol=self.rtol,
+            atol=self.atol,
+            err_prefix=mode,
+        )
+        # Returned for chained tests like extend_then_decode.
+        return SimpleNamespace(
+            mesh=mesh,
+            fb=fb,
+            pool=pool,
+            layer=layer,
+            rec_buf=rec_buf,
+            conv_buf_list=conv_buf_list,
+            per_dp_infos=per_dp_infos,
+            per_dp_bs_padding=per_dp_bs_padding,
+            per_dp_token_padding=per_dp_token_padding,
+            ref_ssm_per_rank=ref_ssm_per_rank,
+            ref_conv_per_rank=ref_conv_per_rank,
+        )
 
     def test_extend_dp4_tp1(self):
         self._run_test(
@@ -665,8 +704,7 @@ class TestKDAAttentionDP(CustomTestCase):
         )
 
     def test_decode_unbalanced_dp4(self):
-        # Unbalanced bs across DP ranks (1..4 reqs/rank). per_dp_bs_padding
-        # = bucket(max=4) so all ranks pad to the same width.
+        # Unbalanced bs across DP ranks; per_dp_bs_padding bucketed to max.
         self._run_test(
             "decode",
             {0: [1], 1: [1, 1, 1], 2: [1], 3: [1, 1, 1, 1]},
@@ -683,9 +721,7 @@ class TestKDAAttentionDP(CustomTestCase):
         )
 
     def test_dp_state_isolation_dp4(self):
-        # Per-rank distinct initial state (each rank has its own random seed via
-        # ``rank_rng``); validates that DP gather only pulls each rank's
-        # own pool slots — no cross-rank state leakage.
+        # Per-rank distinct initial state; verifies no cross-rank state leakage.
         lens = {0: [1, 1], 1: [1], 2: [1, 1], 3: [1]}
         has_initial_state_per_rank = {rank: [True] * len(reqs) for rank, reqs in lens.items()}
         self._run_test(
@@ -713,71 +749,20 @@ class TestKDAAttentionDP(CustomTestCase):
         )
 
     def test_dp_extend_then_decode_dp4(self):
-        # Multi-round prefill -> decode handover under DP.
+        # Multi-round prefill -> decode handover under DP; reuses _run_test for prefill.
         dp_size, tp_size = 4, 1
         lens_prefill = {0: [128], 1: [64], 2: [32, 64], 3: [128]}
-        mesh = set_mesh(tp_size=tp_size, dp_size=dp_size)
+        prefill = self._run_test("prefill", lens_prefill, dp_size=dp_size, tp_size=tp_size)
+        rec_buf = prefill.rec_buf
+        conv_buf_list = prefill.conv_buf_list
+        ref_ssm_per_rank = prefill.ref_ssm_per_rank
+        ref_conv_per_rank = prefill.ref_conv_per_rank
 
-        # Prefill round.
-        (
-            fb,
-            pool,
-            layer,
-            q,
-            k,
-            v,
-            a,
-            b,
-            per_dp_infos,
-            per_dp_bs_padding,
-            per_dp_token_padding,
-        ) = create_test_data(
-            "prefill",
-            lens_prefill,
-            self.NUM_HEADS,
-            self.HEAD_DIM,
-            self.CONV_KERNEL_SIZE,
-            self.DTYPE,
-            mesh,
-            dp_size=dp_size,
-        )
-        expected, ref_states = compute_dp_reference_kda(
-            "prefill",
-            per_dp_infos,
-            layer,
-            dp_size=dp_size,
-            per_dp_bs_padding=per_dp_bs_padding,
-            per_dp_token_padding=per_dp_token_padding,
-            num_heads=self.NUM_HEADS,
-            head_dim=self.HEAD_DIM,
-            dtype=self.DTYPE,
-        )
-        actual, (rec_buf, conv_buf_list) = layer(fb, q, k, v, a, b, pool)
-        actual_np = np.asarray(actual)
-
-        for dp_rank in range(dp_size):
-            info = per_dp_infos[dp_rank]
-            if not info["seq_lens"]:
-                continue
-            valid = sum(info["seq_lens"])
-            offset = dp_rank * per_dp_token_padding
-            np.testing.assert_allclose(
-                actual_np[offset : offset + valid],
-                expected[offset : offset + valid],
-                rtol=self.rtol,
-                atol=self.atol,
-                err_msg=f"prefill: rank {dp_rank}",
-            )
-
-        ref_ssm_per_rank = {r: s for r, (s, _) in ref_states.items()}
-        ref_conv_per_rank = {r: c for r, (_, c) in ref_states.items()}
-
-        # 4 decode rounds.
         decode_lens = {r: [1] * len(reqs) for r, reqs in lens_prefill.items()}
         for step in range(4):
             (
                 fb_d,
-                pool_d,
+                _pool_d,
                 _layer_d,
                 q_d,
                 k_d,
@@ -794,7 +779,7 @@ class TestKDAAttentionDP(CustomTestCase):
                 self.HEAD_DIM,
                 self.CONV_KERNEL_SIZE,
                 self.DTYPE,
-                mesh,
+                prefill.mesh,
                 dp_size=dp_size,
                 seed=100 + step,
                 has_initial_state_per_rank={
@@ -802,13 +787,16 @@ class TestKDAAttentionDP(CustomTestCase):
                 },
             )
 
-            fb_d.attn_backend = fb.attn_backend
-            pool.replace_buffer(([rec_buf], [conv_buf_list]))
+            round_metadata = fb_d.attn_backend.forward_metadata
+            fb_d.attn_backend = prefill.fb.attn_backend
+            fb_d.attn_backend.forward_metadata = round_metadata
+            prefill.pool.replace_buffer(([rec_buf], [conv_buf_list]))
 
-            actual_d, (rec_buf, conv_buf_list) = layer(fb_d, q_d, k_d, v_d, a_d, b_d, pool)
+            actual_d, (rec_buf, conv_buf_list) = prefill.layer(
+                fb_d, q_d, k_d, v_d, a_d, b_d, prefill.pool
+            )
             actual_d_np = np.asarray(actual_d)
 
-            # Inject carried-forward ref states into per_dp_infos_d.
             for dp_rank in range(dp_size):
                 if dp_rank in ref_ssm_per_rank:
                     ssm_stack = ref_ssm_per_rank[dp_rank]
@@ -823,7 +811,7 @@ class TestKDAAttentionDP(CustomTestCase):
             expected_d, ref_states_d = compute_dp_reference_kda(
                 "decode",
                 per_dp_infos_d,
-                layer,
+                prefill.layer,
                 dp_size=dp_size,
                 per_dp_bs_padding=per_dp_bs_padding_d,
                 per_dp_token_padding=per_dp_token_padding_d,
@@ -847,6 +835,18 @@ class TestKDAAttentionDP(CustomTestCase):
                     atol=self.atol,
                     err_msg=f"decode round {step}: rank {dp_rank}",
                 )
+
+            assert_pool_state_per_rank(
+                rec_buf,
+                conv_buf_list[0],
+                ref_ssm_per_rank,
+                ref_conv_per_rank,
+                per_dp_infos_d,
+                dp_size=dp_size,
+                rtol=self.rtol,
+                atol=self.atol,
+                err_prefix=f"decode round {step}",
+            )
 
 
 if __name__ == "__main__":

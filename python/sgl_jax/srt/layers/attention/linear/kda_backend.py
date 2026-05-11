@@ -48,16 +48,16 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         ssm_states, conv_states = self.get_state(
             recurrent_state_pool, layer.layer_id, recurrent_indices
         )
-        # TODO: add v_head_num_per_device, etc to make it more compatible
-        q_state, k_state, v_state = self._unpack_conv_states(conv_states)
-
-        # Conv weights are stored directly in depthwise ``[D, K]`` layout —
-        # the format ``short_convolution`` consumes — so no reshape needed.
-        # Reading ``.value`` keeps us tied to the live nnx.Param so checkpoint
-        # loads done after backend construction are picked up automatically.
         q_conv_w = layer.q_conv1d.weight.value
         k_conv_w = layer.k_conv1d.weight.value
         v_conv_w = layer.v_conv1d.weight.value
+        # _unpack_conv_states splits proj_size in 3 equal pieces; only valid
+        # when proj_q == proj_k == proj_v (Kimi-Linear shape).
+        assert (
+            q_conv_w.shape[0] == k_conv_w.shape[0] == v_conv_w.shape[0]
+        ), f"unequal Q/K/V proj widths: {q_conv_w.shape[0]}/{k_conv_w.shape[0]}/{v_conv_w.shape[0]}"
+        q_state, k_state, v_state = self._unpack_conv_states(conv_states)
+
         cu_q_lens = self.forward_metadata.cu_q_lens
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             q, q_state_new = self._short_conv_extend(
@@ -102,10 +102,8 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         a = a.reshape(a.shape[0], layer.num_q_heads, layer.head_q_dim)
         b = b.reshape(b.shape[0], layer.num_q_heads)
 
-        # KDA requires L2-normalized q/k for all paths (decode, naive prefill,
-        # Pallas prefill). The official implementation does this inside the
-        # kernel via use_qk_l2norm_in_kernel=True; our kernels don't expose
-        # that flag yet, so we normalize in JAX up front.
+        # KDA requires L2-normalized q/k for all paths; upstream fuses this
+        # via use_qk_l2norm_in_kernel=True, while current kernel doesn't support.
         q = l2_normalize(q)
         k = l2_normalize(k)
 
@@ -144,13 +142,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         return output.reshape(output.shape[0], -1), (new_ssm_full, new_conv_full_list)
 
     def get_state(self, recurrent_state_pool, layer_id, recurrent_indices):
-        """Return per-request views of (ssm, conv) state for this layer.
-
-        Pool stores conv as ``list[list[jax.Array]]`` (outer per-layer, inner
-        currently length 1; reserved for future multi-segment expansion). We
-        unwrap that length-1 inner list so the rest of the backend treats
-        conv as a single ``[N+1, proj_size, K-1]`` array.
-        """
+        """Return per-request views of (ssm, conv) state for this layer."""
         recurrent_buffer, conv_buffer_list = self.get_layer_cache(
             recurrent_state_pool,
             layer_id,
@@ -185,12 +177,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         return ssm, conv
 
     def set_ssm_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_recurrent):
-        """Scatter per-request ``new_recurrent`` into the FULL pool buffer.
-
-        Returns the full ``[N+1, H, D, D]`` recurrent buffer for this layer
-        so the caller can bubble it up to ``MemoryPools.replace_all`` for
-        rebinding ``RecurrentStatePool.recurrent_buffers[idx]``.
-        """
+        """Scatter per-request ``new_recurrent`` into the FULL pool buffer."""
         full_recurrent, _ = self.get_layer_cache(recurrent_state_pool, layer_id)
 
         return jax.shard_map(
@@ -206,12 +193,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         )(full_recurrent, recurrent_indices, new_recurrent)
 
     def set_conv_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_conv_packed):
-        """Scatter per-request packed conv state into the FULL pool buffer.
-
-        ``new_conv_packed`` is ``[B, proj_size, K-1]``; the full conv buffer
-        is ``[N+1, proj_size, K-1]``. Returns a length-1 list to match the
-        pool's per-layer ``list[list[jax.Array]]`` layout.
-        """
+        """Scatter per-request packed conv state into the FULL pool buffer."""
         _, conv_buffer_list = self.get_layer_cache(recurrent_state_pool, layer_id)
         assert len(conv_buffer_list) == 1
         full_conv = conv_buffer_list[0]
@@ -241,14 +223,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         cu_seqlens: jax.Array,
         activation,
     ) -> tuple[jax.Array, jax.Array]:
-        """EXTEND-path conv wrapped in shard_map.
-
-        ``short_convolution(EXTEND)`` does many gathers/slices on
-        ``x``/``cache``/``cu_seqlens`` that JAX's explicit-sharding mode
-        cannot resolve unambiguously. Wrapping the call in ``shard_map``
-        gives the inner code per-rank local tensors (effectively replicated
-        from its perspective), bypassing the ambiguity.
-        """
+        """EXTEND-path conv wrapped in shard_map."""
 
         def _call(x, weight, cache, cu_seqlens):
             return short_convolution(
@@ -259,14 +234,14 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             _call,
             mesh=self.mesh,
             in_specs=(
-                P("data", "tensor"),  # x [T, D]
-                P("tensor", None),  # weight [D, K]
-                P("data", "tensor", None),  # cache [B, D, K-1]
+                P("data", "tensor"),  # x [T, hidden]
+                P("tensor", None),  # weight [hidden, K]
+                P("data", "tensor", None),  # cache [B, hidden, K-1]
                 P("data"),  # cu_seqlens [B+1]
             ),
             out_specs=(
-                P("data", "tensor"),  # y [T, D]
-                P("data", "tensor", None),  # new_cache [B, D, K-1]
+                P("data", "tensor"),  # y [T, hidden]
+                P("data", "tensor", None),  # new_cache [B, hidden, K-1]
             ),
             check_vma=False,
         )
@@ -284,19 +259,11 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         layer: RadixLinearAttention,
         scale: float | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        """Chunked prefill via Pallas kernel.  Returns (output, new_state).
-
-        chunk_kda calls pallas_call internally, so we wrap it in shard_map
-        (rpav3 pattern) — H is sharded on "tensor", cu_seqlens replicated.
-        scale is a static argname of chunk_kda and must be a Python float;
-        binding it via closure here is fine because jax.jit caches the
-        compiled product across calls.
-        """
+        """Chunked prefill via Pallas kernel."""
         if layer.A_log is None or layer.dt_bias is None:
             raise ValueError("KDA gate activation requires layer.A_log and layer.dt_bias")
         H = q.shape[-2]
-        # kda_gate_chunk_cumsum requires A_log shape (H,); the layer stores
-        # it as [1, 1, H, 1] (broadcast-friendly for naive paths).
+        # kda_gate_chunk_cumsum requires A_log shape (H,); layer stores [1,1,H,1].
         A_log = layer.A_log.value.reshape(H)
         dt_bias = layer.dt_bias.value.reshape(H, -1)
         scale = scale if scale is not None else layer.scale
@@ -338,7 +305,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             ),
             check_vma=False,
         )
-        # Kernel expects [1, T_packed, H, K] packed layout.
+        # Kernel expects [1, T_packed, H, K] packed layout; strip after.
         o, final_state = sharded(
             q[None, ...],
             k[None, ...],
@@ -350,7 +317,6 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             A_log,
             dt_bias,
         )
-        # Remove the B=1 packed dim: [1, T, H, V] -> [T, H, V]
         return o[0], final_state
 
     def _forward_decode(
@@ -364,11 +330,10 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         layer: RadixLinearAttention,
         scale: float | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        """Single-step decode via naive JAX recurrence (Pallas decode TBD).  Returns (output, new_state)."""
+        """Single-step decode via naive JAX recurrence (Pallas decode TBD)."""
         g = self._fused_kda_gate(layer, g)
 
         def _decode_kernel(q_d, k_d, v_d, g_d, beta_d, h0):
-            # T=1 unsqueeze inside so in_specs stay 3-D for q/k/v/g and 2-D for beta.
             o, final_state = naive_recurrent_kda(
                 q_d[:, None, ...],
                 k_d[:, None, ...],
@@ -405,6 +370,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         layer: RadixLinearAttention,
         g: jax.Array,
     ) -> jax.Array:
+        """JAX-side gate activation used by the DECODE path."""
         if layer.A_log is None or layer.dt_bias is None:
             raise ValueError("KDA gate activation requires layer.A_log and layer.dt_bias")
         H = g.shape[-2]
@@ -417,17 +383,9 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         self,
         conv_states: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Slice ``[B, proj_size, K-1]`` into per-stream ``[B, D, K-1]`` caches.
-
-        Q-K-V order along ``proj_size`` (matches ``_pack_conv_states``). For
-        Kimi-Linear, ``num_k_heads == num_heads`` and ``head_k_dim == head_dim``,
-        so all three sub-channels collapse to the same width.
-        """
+        """Slice ``[B, proj_size, K-1]`` into per-stream Q/K/V caches."""
         D = conv_states.shape[1]
-        assert D % 3 == 0, (
-            f"conv_states channel dim {D} must be divisible by 3 (Q/K/V "
-            "share head_dim assumption)."
-        )
+        assert D % 3 == 0, f"conv_states channel dim {D} must be divisible by 3"
         q, k, v = jnp.split(conv_states, 3, axis=1)
         return q, k, v
 
