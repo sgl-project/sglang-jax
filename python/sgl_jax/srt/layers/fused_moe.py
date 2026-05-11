@@ -75,6 +75,7 @@ class FusedEPMoE(nnx.Module):
         disable_shared_expert: bool = False,
         disable_all_reduce_metadata: bool = False,
         disable_sync_barrier: bool = False,
+        use_jax_allreduce_metadata: bool = True,
     ):
         self.hidden_size = hidden_size
         self.num_experts_per_tok = num_experts_per_tok
@@ -103,6 +104,7 @@ class FusedEPMoE(nnx.Module):
         self.disable_shared_expert = disable_shared_expert
         self.disable_all_reduce_metadata = disable_all_reduce_metadata
         self.disable_sync_barrier = disable_sync_barrier
+        self.use_jax_allreduce_metadata = use_jax_allreduce_metadata
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -487,6 +489,7 @@ class FusedEPMoE(nnx.Module):
             disable_shared_expert=self.disable_shared_expert,
             disable_all_reduce_metadata=self.disable_all_reduce_metadata,
             disable_sync_barrier=self.disable_sync_barrier,
+            use_jax_allreduce_metadata=self.use_jax_allreduce_metadata,
             # Optional parameters (not used in basic case)
             quant_block_k=quant_block_k,
             w1_scale=w1_scale,

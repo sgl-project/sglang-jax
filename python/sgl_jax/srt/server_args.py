@@ -135,6 +135,7 @@ class ServerArgs:
     # Kernel backend
     attention_backend: str | None = "fa"
     moe_backend: str = "epmoe"
+    disable_jax_allreduce_metadata: bool = False
 
     grammar_backend: str | None = None
 
@@ -954,6 +955,17 @@ class ServerArgs:
             choices=["epmoe", "fused", "auto"],
             default=ServerArgs.moe_backend,
             help="The backend to use for MoE models.",
+        )
+
+        parser.add_argument(
+            "--disable-jax-allreduce-metadata",
+            action="store_true",
+            default=ServerArgs.disable_jax_allreduce_metadata,
+            help=(
+                "Disable the pure JAX allreduce metadata path for fused EP-MoE; "
+                "fall back to the Pallas DMA-based allgather. "
+                "Default uses JAX path (recommended)."
+            ),
         )
 
         parser.add_argument(

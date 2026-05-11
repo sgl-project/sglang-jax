@@ -119,6 +119,7 @@ class MiMoV2Moe(nnx.Module):
                 layer_id=layer_id,
                 renormalize_topk_logits=getattr(config, "norm_topk_prob", True),
                 quantization_config=getattr(config, "quantization_config", None),
+                use_jax_allreduce_metadata=getattr(config, "use_jax_allreduce_metadata", True),
             )
         else:
             self.experts = EPMoE(
