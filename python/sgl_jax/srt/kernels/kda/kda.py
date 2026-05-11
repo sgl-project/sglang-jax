@@ -751,7 +751,7 @@ def chunk_gated_delta_rule_fwd_h(
         pl.BlockSpec([1, 1, BT, K_PADSIZE], index_map=_t_index_map) if gk is not None else None
     )
     h0_blockspec = (
-        pl.BlockSpec([1, 1, 1, K_PADSIZE, V_ALIGNED], index_map=lambda h, c, seqlens_ref, chunk_to_seq_ref: (chunk_to_seq_ref[c], h, 0, 0))
+        pl.BlockSpec([1, 1, K_PADSIZE, V_ALIGNED], index_map=lambda h, c, seqlens_ref, chunk_to_seq_ref: (chunk_to_seq_ref[c], h, 0, 0))
         if initial_state is not None
         else None
     )
