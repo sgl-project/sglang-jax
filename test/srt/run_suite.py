@@ -473,6 +473,14 @@ suites = {
         TestFile("python/sgl_jax/test/layers/test_linear_attention.py", 1.5, runner="pytest"),
         TestFile("test/srt/lora/test_bgmv_backend.py", 4),
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 3.5),
+        # GDN (gated DeltaNet) — CPU-only unit tests; each pins
+        # JAX_PLATFORMS=cpu + 8 fake devices in its header, so they run on
+        # any TPU runner without consuming TPU chips.
+        TestFile("test/srt/test_gated_delta.py", 1),
+        TestFile("test/srt/test_gdn_backend.py", 1),
+        TestFile("test/srt/test_gdn_metadata.py", 1),
+        TestFile("test/srt/test_qwen3_5_gated_delta_net.py", 1),
+        TestFile("test/srt/test_ragged_gated_delta_rule_ref.py", 1),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 1),

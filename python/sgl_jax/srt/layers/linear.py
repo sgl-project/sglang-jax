@@ -86,6 +86,87 @@ class LinearBase(nnx.Module):
         return out, None
 
 
+class MergedColumnParallelLinear(LinearBase):
+    """Column-parallel linear with multiple logical outputs merged into one weight.
+
+    Equivalent to ``N`` independent column-parallel ``LinearBase``s with the
+    same ``input_size`` but different ``output_size``, fused into one larger
+    GEMM. A single large matmul on TPU's MXU is consistently faster than ``N``
+    smaller ones — fewer kernel launches, better pipelining of weight reads,
+    and a single MXU pass amortizes the input-side broadcast.
+
+    Sharding contract (mirrors sglang / vLLM's ``MergedColumnParallelLinear``):
+    each device's local weight columns hold
+    ``[comp_0_my_heads | comp_1_my_heads | ...]`` block-concat. Splitting the
+    merged output into per-component pieces must therefore happen on
+    per-device data (typically inside :func:`jax.shard_map`) using **per-shard**
+    sizes — the global merged tensor is stripe-interleaved across devices,
+    not a true ``[comp_0 | comp_1 | ...]`` block-concat.
+
+    Each entry of ``output_sizes`` must be divisible by the mesh's ``"tensor"``
+    axis size so the per-shard block-concat boundary aligns with the TP cut.
+    Without this, GQA-style projections (where components have different
+    head counts) would put a shard boundary mid-component — exactly the
+    failure mode this layer exists to avoid.
+
+    Weight loading is the caller's responsibility — there's no built-in
+    loader yet because the simple host-side scatter (collect HF tensors,
+    stripe them per-rank on host, single ``device_put``) costs N host
+    buffers and a full-tensor staging copy. A device-side scatter
+    (writing each HF tensor into a sharded merged param via
+    ``jax.lax.dynamic_update_slice`` under the right sharding context)
+    is the right shape for production but needs more design — left as a
+    follow-up.
+
+    Args:
+        input_size: Input dimension.
+        output_sizes: Per-component output dimensions. Must each be
+            divisible by the mesh's ``"tensor"`` axis size.
+        mesh: Device mesh (must expose a ``"tensor"`` axis for sharding;
+            falls back to TP=1 if absent or ``mesh is None``).
+        use_bias / skip_bias_add / params_dtype: forwarded to ``LinearBase``.
+        scope_name: profiling scope.
+    """
+
+    @staticmethod
+    def _mesh_tp_size(mesh: jax.sharding.Mesh | None) -> int:
+        """TP size = mesh size on the ``"tensor"`` axis (1 if absent)."""
+        if mesh is None:
+            return 1
+        shape = getattr(mesh, "shape", None)
+        if shape is None or "tensor" not in shape:
+            return 1
+        return int(shape["tensor"])
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: Sequence[int],
+        mesh: jax.sharding.Mesh,
+        use_bias: bool = False,
+        skip_bias_add: bool = False,
+        params_dtype: jnp.dtype | None = jnp.bfloat16,
+        scope_name: str = "merged_column_parallel_linear",
+    ):
+        self.output_sizes = list(output_sizes)
+        tp_size = self._mesh_tp_size(mesh)
+        for i, sz in enumerate(self.output_sizes):
+            if sz % tp_size != 0:
+                raise ValueError(
+                    f"MergedColumnParallelLinear: output_sizes[{i}]={sz} must be "
+                    f"divisible by TP={tp_size} for clean per-shard block-concat layout."
+                )
+        super().__init__(
+            input_size=input_size,
+            output_size=sum(self.output_sizes),
+            mesh=mesh,
+            use_bias=use_bias,
+            skip_bias_add=skip_bias_add,
+            params_dtype=params_dtype,
+            kernel_axes=(None, "tensor"),
+            scope_name=scope_name,
+        )
+
 class QuantizedLinear(nnx.Module):
     """Quantized linear layer using native quantized matmul.
 
