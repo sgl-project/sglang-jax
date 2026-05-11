@@ -136,6 +136,10 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         if forward_batch.forward_mode == ForwardMode.DECODE:
             output, new_recurrent = self._forward_decode(q, k, v, ssm_states, slope)
         elif forward_batch.forward_mode == ForwardMode.EXTEND:
+            has_init = self.forward_metadata.has_initial_state
+            if has_init is not None:
+                mask = has_init[:, None, None, None].astype(ssm_states.dtype)
+                ssm_states = ssm_states * mask
             output, new_recurrent = self._forward_extend(q, k, v, ssm_states, slope)
         else:
             raise NotImplementedError(
