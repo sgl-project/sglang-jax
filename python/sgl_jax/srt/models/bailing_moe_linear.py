@@ -1,4 +1,5 @@
 import copy
+import functools
 import logging
 
 import jax
@@ -152,6 +153,10 @@ class BailingMoELinearAttention(nnx.Module):
         forward_batch: ForwardBatch,
         recurrent_state_pool,
     ) -> tuple[jax.Array, tuple]:
+        _dump = functools.partial(
+            maybe_dump_jax_array, component="gla_attn_detail", layer_id=self.layer_id
+        )
+
         qkv, _ = self.qkv_proj(hidden_states)
         qkv = qkv.astype(jnp.float32)
         if self.linear_silu:
@@ -163,20 +168,33 @@ class BailingMoELinearAttention(nnx.Module):
             out_sharding=NamedSharding(self.mesh, P("data", None, "tensor", None)),
         )
         q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+        _dump(q, name="q_raw")
+        _dump(k, name="k_raw")
+        _dump(v, name="v_raw")
 
         if self.q_norm is not None:
             q = self.q_norm(q)
             k = self.k_norm(k)
+            _dump(q, name="q_after_norm")
+            _dump(k, name="k_after_norm")
 
         if self.linear_rope:
             q, k = self.rotary_emb(positions, q, k)
+            _dump(q, name="q_after_rope")
+            _dump(k, name="k_after_rope")
 
         attn_output, pool_updates = self.attn(forward_batch, q, k, v, recurrent_state_pool)
+        _dump(attn_output, name="attn_output")
         attn_output = attn_output.astype(hidden_states.dtype)
 
         gate, _ = self.g_proj(hidden_states)
-        attn_output = self.g_norm(attn_output) * jax.nn.sigmoid(gate)
+        _dump(gate, name="gate")
+        g_normed = self.g_norm(attn_output)
+        _dump(g_normed, name="g_norm_output")
+        attn_output = g_normed * jax.nn.sigmoid(gate)
+        _dump(attn_output, name="gated_output")
         output, _ = self.dense(attn_output)
+        _dump(output, name="final_output")
         return output, pool_updates
 
 
