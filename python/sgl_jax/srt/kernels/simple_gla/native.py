@@ -40,13 +40,14 @@ def naive_gla_decode(
     g_gamma = g_gamma.astype(jnp.float32)
     h0 = h0.astype(jnp.float32)
 
+    if scale is None:
+        scale = K**-0.5
+
     decay = jnp.exp(g_gamma)[None, :, None, None]
     kv = jnp.einsum("bhk,bhv->bhkv", k_t, v_t)
     h1 = decay * h0 + kv
     o = jnp.einsum("bhk,bhkv->bhv", q_t, h1)
-
-    if scale is not None:
-        o = o * scale
+    o = o * scale
 
     output = o[:, None, :, :]
 
@@ -86,6 +87,11 @@ def naive_gla_prefill(
     h0 = h0.astype(jnp.float32)
 
     T = q.shape[0]
+    _, K = q.shape[1], q.shape[2]
+
+    if scale is None:
+        scale = K**-0.5
+
     token_idx = jnp.arange(T, dtype=cu_seqlens.dtype)
     seq_ids = jnp.searchsorted(cu_seqlens[1:], token_idx, side="right")
     reset_mask = token_idx == cu_seqlens[:-1][seq_ids]
@@ -111,8 +117,7 @@ def naive_gla_prefill(
         (seq_ids, reset_mask, q, k, v),
     )
 
-    if scale is not None:
-        output = output * scale
+    output = output * scale
 
     return output[None, :, :, :], h_final
 
