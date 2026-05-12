@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import logging
 import os
 from collections.abc import Sequence
@@ -12,7 +13,8 @@ import jax.numpy as jnp
 import numpy
 import numpy as np
 from flax import nnx
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
@@ -179,7 +181,9 @@ def get_last_loc_large_page_size_large_top_k(
     return prefix_lens, new_seq_lens, last_loc, num_new_pages_per_topk, extend_lens
 
 
-@jax.jit(static_argnames=["num_verify_tokens", "batch_size", "speculative_num_steps"])
+@functools.partial(
+    jax.jit, static_argnames=["num_verify_tokens", "batch_size", "speculative_num_steps"]
+)
 def build_tree_kernel_efficient_preprocess(
     verified_id: jax.Array,
     scores: jax.Array,
@@ -323,6 +327,10 @@ def build_tree_kernel_efficient(
         tuple of (tree_mask, positions, retrive_index, retrive_next_token,
                  retrive_next_sibling, draft_tokens)
     """
+    rep = NamedSharding(mesh, P())
+    verified_id, score_list, token_list, parents_list, seq_lens = jax.device_put(
+        (verified_id, score_list, token_list, parents_list, seq_lens), rep
+    )
     parent_list, top_scores_index, draft_tokens = build_tree_kernel_efficient_preprocess(
         verified_id,
         score_list,
@@ -497,6 +505,9 @@ class EagleDraftInput:
         model_worker_batch.positions = model_worker_batch.positions
         model_worker_batch.extend_seq_lens = np.full((bs,), step_plus_1, dtype=np.int32)
         model_worker_batch.extend_seq_lens[model_worker_batch.real_bs :] = 0
+        model_worker_batch.logits_indices = (
+            np.cumsum(model_worker_batch.extend_seq_lens, dtype=np.int32) - 1
+        )
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
@@ -551,8 +562,9 @@ class EagleDraftInput:
 
         self.allocate_lens = new_allocate_lens
 
-        schedule_batch.seq_lens_sum = np.sum(schedule_batch.seq_lens).item()
-        schedule_batch.out_cache_loc = out_cache_loc
+        info = schedule_batch.reqs_info[0]
+        info.seq_lens_sum = np.sum(info.seq_lens).item()
+        info.out_cache_loc = out_cache_loc
 
     def prepare_for_draft_decode(
         self, model_worker_batch: ModelWorkerBatch, topk: int, num_steps: int
@@ -619,7 +631,7 @@ class EagleDraftInput:
         self.accept_length_cpu = np.asarray(accept_length_cpu_host, dtype=np.int32)
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True):
-
+        new_indices = np.asarray(new_indices)
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
