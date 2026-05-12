@@ -971,6 +971,8 @@ def run_all(
                     all_disable=all_disable,
                 ),
                 use_batch_dma_scatter=_env_bool("FUSED_MOE_BENCHMARK_USE_BATCH_DMA_SCATTER"),
+                use_vmem_permute_scatter=_env_bool("FUSED_MOE_BENCHMARK_USE_VMEM_PERMUTE_SCATTER"),
+                use_overlap_scatter=_env_bool("FUSED_MOE_BENCHMARK_USE_OVERLAP_SCATTER"),
             )
             if quantization_config is not None:
                 if quant_block_k is not None:

@@ -37,6 +37,22 @@ from benchmark.utils import multiple_iteration_timeit_from_trace
 P = jax.sharding.PartitionSpec
 
 
+def wallclock_timeit(run_fn, src, dst, *, num_repeats, warmup=3, iters=5):
+    """Wall-clock timing fallback for when jax.profiler.trace crashes."""
+    for _ in range(warmup):
+        out = run_fn(src, dst)
+        jax.block_until_ready(out)
+
+    times_ms = []
+    for _ in range(iters):
+        start = time.perf_counter()
+        out = run_fn(src, dst)
+        jax.block_until_ready(out)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        times_ms.append(elapsed_ms / num_repeats)
+    return times_ms
+
+
 def _local_small_dma_kernel(
     src_hbm,
     dst_hbm,
@@ -358,7 +374,7 @@ def run_benchmark(args):
                 mesh_axes=("data", "tensor"),
             )
             print(f"\n{'=' * 70}")
-            print(f"REMOTE DMA benchmark (hidden_size={hidden_size}, ep_size={ep_size})")
+            print(f"REMOTE DMA benchmark (hidden_size={hidden_size}, ep_size={ep_size}, wallclock)")
             print("=" * 70)
             print(f"{'tokens':>8} {'small_dma(ms)':>14} {'batch_dma(ms)':>14} {'speedup':>10}")
             print("-" * 50)
@@ -369,13 +385,11 @@ def run_benchmark(args):
                     run_fn, src, dst = build_remote_benchmark(
                         num_tokens, hidden_size, num_repeats, mode, mesh
                     )
-                    task = f"remote-{mode}-{num_tokens}"
-                    times = multiple_iteration_timeit_from_trace(
-                        compute_func=lambda s=src, d=dst: run_fn(s, d),
-                        data_generator=lambda: (),
-                        task=task,
-                        tries=iters,
+                    times = wallclock_timeit(
+                        run_fn, src, dst,
+                        num_repeats=num_repeats,
                         warmup=warmup,
+                        iters=iters,
                     )
                     if len(times) > 1:
                         times = times[1:]
@@ -412,7 +426,7 @@ def run_benchmark(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="DMA size micro-benchmark")
-    parser.add_argument("--hidden-size", type=int, default=7168)
+    parser.add_argument("--hidden-size", type=int, default=6144)
     parser.add_argument(
         "--sizes",
         type=int,

@@ -576,6 +576,8 @@ def _fused_ep_moe_kernel(
     disable_sync_barrier: bool = False,
     use_jax_allreduce_metadata: bool = True,
     use_batch_dma_scatter: bool = False,
+    use_vmem_permute_scatter: bool = False,
+    use_overlap_scatter: bool = False,
     quant_block_k: int | None = None,
     # Kernel tuning params.
     bt: int,  # Outer token tile size (output tiling).
@@ -1228,6 +1230,299 @@ def _fused_ep_moe_kernel(
             _body,
             pltpu.SMEM((padded_num_experts,), jnp.int32),
             pltpu.SMEM((padded_num_experts,), jnp.int32),
+            pltpu.SemaphoreType.DMA,
+        )
+
+    def start_a2a_scatter_vmem_permute(*, bt_sem_id, bt_start):
+        """Load tokens to VMEM, reorder with vector ops, scatter from VMEM."""
+        if disable_a2a or not use_vmem_permute_scatter:
+            return
+        for slot in range(expert_buffer_count):
+            a2a_s_sends_x2_smem[slot] = jnp.int32(0)
+
+        num_global_experts = local_num_experts * num_devices
+
+        def _body(
+            vmem_src,
+            vmem_permuted,
+            permute_starts_smem,
+            permute_offsets_smem,
+            load_sem,
+        ):
+            # Phase 0: prefix sum of per-expert counts.
+            def _prefix_sum(e_id, acc):
+                permute_starts_smem[e_id] = acc
+                count = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id]
+                return acc + count
+
+            lax.fori_loop(
+                0, jnp.int32(padded_num_experts), _prefix_sum, jnp.int32(0),
+                unroll=False,
+            )
+
+            for e_id in range(padded_num_experts):
+                permute_offsets_smem[e_id] = jnp.int32(0)
+
+            # Phase 1: load all bt tokens from HBM to VMEM (one DMA).
+            pltpu.make_async_copy(
+                src_ref=tokens_hbm.at[pl.ds(bt_start, bt)],
+                dst_ref=vmem_src.at[pl.ds(0, bt)],
+                sem=load_sem,
+            ).start()
+            ref = vmem_src.at[pl.ds(0, bt)]
+            pltpu.make_async_copy(src_ref=ref, dst_ref=ref, sem=load_sem).wait()
+
+            # Phase 2: permute in VMEM - vector scatter, no DMA per token.
+            def _permute_one(t_id, _):
+                for k_id in range(top_k):
+                    e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
+                    is_valid = e_id >= 0
+                    e_id_safe = lax.select(is_valid, e_id, jnp.int32(0))
+                    offset = permute_offsets_smem[e_id_safe]
+                    sz = lax.select(is_valid, jnp.int32(1), jnp.int32(0))
+                    permute_offsets_smem[e_id_safe] = offset + sz
+                    pos = permute_starts_smem[e_id_safe] + offset
+
+                    @pl.when(sz != 0)
+                    def _copy(t_id=t_id, pos=pos):
+                        val = vmem_src[pl.ds(t_id, 1)]
+                        vmem_permuted[pl.ds(pos, 1)] = val
+
+                return None
+
+            lax.fori_loop(0, bt, _permute_one, None, unroll=False)
+
+            # Phase 3: batch scatter from VMEM.
+            def _batch_scatter(e_id, _):
+                e_id_safe = lax.select(
+                    e_id < num_global_experts, e_id, jnp.int32(0)
+                )
+                e_sem_id_k = e_id_safe % jnp.int32(local_num_experts)
+                recv_id = e_id_safe // jnp.int32(local_num_experts)
+                count = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id_safe]
+                src_start = permute_starts_smem[e_id_safe]
+                dst_start = expert_starts_x2_smem[bt_sem_id, 0, e_id_safe]
+                is_in_range = e_id < num_global_experts
+                is_local = (recv_id == my_id) & is_in_range & (count > 0)
+                is_remote = (recv_id != my_id) & is_in_range & (count > 0)
+
+                @pl.when(is_local)
+                def _local(
+                    src_start=src_start,
+                    dst_start=dst_start,
+                    count=count,
+                    e_sem_id_k=e_sem_id_k,
+                ):
+                    pltpu.make_async_copy(
+                        src_ref=vmem_permuted.at[pl.ds(src_start, count)],
+                        dst_ref=a2a_s_x2_hbm.at[
+                            e_sem_id_k, pl.ds(dst_start, count)
+                        ],
+                        sem=recv_x2_sems.at[e_sem_id_k],
+                    ).start()
+
+                @pl.when(is_remote)
+                def _remote(
+                    src_start=src_start,
+                    dst_start=dst_start,
+                    count=count,
+                    e_sem_id_k=e_sem_id_k,
+                    recv_id=recv_id,
+                ):
+                    a2a_s_sends_x2_smem[e_sem_id_k] = (
+                        a2a_s_sends_x2_smem[e_sem_id_k] + count
+                    )
+                    pltpu.make_async_remote_copy(
+                        src_ref=vmem_permuted.at[pl.ds(src_start, count)],
+                        dst_ref=a2a_s_x2_hbm.at[
+                            e_sem_id_k, pl.ds(dst_start, count)
+                        ],
+                        send_sem=send_x2_sems.at[e_sem_id_k],
+                        recv_sem=recv_x2_sems.at[e_sem_id_k],
+                        device_id=get_mesh_device_id(recv_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
+
+                return None
+
+            lax.fori_loop(
+                0, jnp.int32(padded_num_experts), _batch_scatter, None,
+                unroll=False,
+            )
+
+        pl.run_scoped(
+            _body,
+            pltpu.VMEM((bt, t_packing, h_per_t_packing), t_dtype),
+            pltpu.VMEM((bt * top_k, t_packing, h_per_t_packing), t_dtype),
+            pltpu.SMEM((padded_num_experts,), jnp.int32),
+            pltpu.SMEM((padded_num_experts,), jnp.int32),
+            pltpu.SemaphoreType.DMA,
+        )
+
+    def start_a2a_scatter_overlap(*, bt_sem_id, bt_start):
+        """Double-buffered VMEM gather overlapped with DMA scatter."""
+        if disable_a2a or not use_overlap_scatter:
+            return
+        for slot in range(expert_buffer_count):
+            a2a_s_sends_x2_smem[slot] = jnp.int32(0)
+
+        num_global_experts = local_num_experts * num_devices
+
+        def _body(
+            vmem_src,
+            vmem_buf_0,
+            vmem_buf_1,
+            gather_count_smem,
+            load_sem,
+            overlap_sem,
+        ):
+            # Load all bt tokens from HBM to VMEM.
+            pltpu.make_async_copy(
+                src_ref=tokens_hbm.at[pl.ds(bt_start, bt)],
+                dst_ref=vmem_src.at[pl.ds(0, bt)],
+                sem=load_sem,
+            ).start()
+            ref = vmem_src.at[pl.ds(0, bt)]
+            pltpu.make_async_copy(src_ref=ref, dst_ref=ref, sem=load_sem).wait()
+
+            def _gather_into(e_id, vmem_dst):
+                """Gather tokens for expert e_id into vmem_dst, return count."""
+                gather_count_smem[0] = jnp.int32(0)
+
+                def _scan_token(t_id, _):
+                    for k_id in range(top_k):
+                        routed_e = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
+                        is_match = (routed_e == e_id) & (routed_e >= 0)
+
+                        @pl.when(is_match)
+                        def _cp(t_id=t_id):
+                            pos = gather_count_smem[0]
+                            val = vmem_src[pl.ds(t_id, 1)]
+                            vmem_dst[pl.ds(pos, 1)] = val
+                            gather_count_smem[0] = pos + jnp.int32(1)
+
+                    return None
+
+                lax.fori_loop(0, bt, _scan_token, None, unroll=False)
+
+            def _start_scatter(e_id, vmem_buf, count):
+                """Start DMA scatter for one expert from vmem_buf."""
+                e_id_safe = lax.select(
+                    e_id < num_global_experts, e_id, jnp.int32(0)
+                )
+                e_sem_id_k = e_id_safe % jnp.int32(local_num_experts)
+                recv_id = e_id_safe // jnp.int32(local_num_experts)
+                dst_start = expert_starts_x2_smem[bt_sem_id, 0, e_id_safe]
+                is_in_range = e_id < num_global_experts
+                is_local = (recv_id == my_id) & is_in_range & (count > 0)
+                is_remote = (recv_id != my_id) & is_in_range & (count > 0)
+
+                @pl.when(is_local)
+                def _local(
+                    dst_start=dst_start,
+                    count=count,
+                    e_sem_id_k=e_sem_id_k,
+                ):
+                    pltpu.make_async_copy(
+                        src_ref=vmem_buf.at[pl.ds(0, count)],
+                        dst_ref=a2a_s_x2_hbm.at[
+                            e_sem_id_k, pl.ds(dst_start, count)
+                        ],
+                        sem=recv_x2_sems.at[e_sem_id_k],
+                    ).start()
+
+                @pl.when(is_remote)
+                def _remote(
+                    dst_start=dst_start,
+                    count=count,
+                    e_sem_id_k=e_sem_id_k,
+                    recv_id=recv_id,
+                ):
+                    a2a_s_sends_x2_smem[e_sem_id_k] = (
+                        a2a_s_sends_x2_smem[e_sem_id_k] + count
+                    )
+                    pltpu.make_async_remote_copy(
+                        src_ref=vmem_buf.at[pl.ds(0, count)],
+                        dst_ref=a2a_s_x2_hbm.at[
+                            e_sem_id_k, pl.ds(dst_start, count)
+                        ],
+                        send_sem=send_x2_sems.at[e_sem_id_k],
+                        recv_sem=recv_x2_sems.at[e_sem_id_k],
+                        device_id=get_mesh_device_id(recv_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
+
+            # Process expert pairs: gather E into buf_0, scatter buf_0,
+            # gather E+1 into buf_1 (overlaps DMA), scatter buf_1, ...
+            def _process_pair(pair_id, _):
+                e0 = pair_id * jnp.int32(2)
+                e1 = e0 + jnp.int32(1)
+
+                # Gather expert e0 into buf_0.
+                _gather_into(e0, vmem_buf_0)
+                count_0 = gather_count_smem[0]
+
+                # Start scatter for e0 (async DMA).
+                _start_scatter(e0, vmem_buf_0, count_0)
+
+                # Fence: start a self-copy on buf_0 to serialize after scatter.
+                @pl.when((e0 < num_global_experts) & (count_0 > 0))
+                def _fence_e0(count_0=count_0):
+                    pltpu.make_async_copy(
+                        src_ref=vmem_buf_0.at[pl.ds(0, count_0)],
+                        dst_ref=vmem_buf_0.at[pl.ds(0, count_0)],
+                        sem=overlap_sem,
+                    ).start()
+
+                # Gather expert e1 into buf_1 (vector ops overlap with e0 DMA).
+                @pl.when(e1 < num_global_experts)
+                def _do_e1():
+                    _gather_into(e1, vmem_buf_1)
+
+                count_1 = gather_count_smem[0]
+
+                # Wait for e0's fence to complete so buf_0 is safe to reuse.
+                @pl.when((e0 < num_global_experts) & (count_0 > 0))
+                def _wait_e0(count_0=count_0):
+                    pltpu.make_async_copy(
+                        src_ref=vmem_buf_0.at[pl.ds(0, count_0)],
+                        dst_ref=vmem_buf_0.at[pl.ds(0, count_0)],
+                        sem=overlap_sem,
+                    ).wait()
+
+                # Start scatter for e1.
+                @pl.when(e1 < num_global_experts)
+                def _scatter_e1(count_1=count_1):
+                    _start_scatter(e1, vmem_buf_1, count_1)
+
+                # Fence + wait for e1 so buf_1 is safe to reuse next iteration.
+                @pl.when((e1 < num_global_experts) & (count_1 > 0))
+                def _fence_wait_e1(count_1=count_1):
+                    pltpu.make_async_copy(
+                        src_ref=vmem_buf_1.at[pl.ds(0, count_1)],
+                        dst_ref=vmem_buf_1.at[pl.ds(0, count_1)],
+                        sem=overlap_sem,
+                    ).start()
+                    pltpu.make_async_copy(
+                        src_ref=vmem_buf_1.at[pl.ds(0, count_1)],
+                        dst_ref=vmem_buf_1.at[pl.ds(0, count_1)],
+                        sem=overlap_sem,
+                    ).wait()
+
+                return None
+
+            num_pairs = (padded_num_experts + 1) // 2
+            lax.fori_loop(
+                0, jnp.int32(num_pairs), _process_pair, None, unroll=False,
+            )
+
+        pl.run_scoped(
+            _body,
+            pltpu.VMEM((bt, t_packing, h_per_t_packing), t_dtype),
+            pltpu.VMEM((bt, t_packing, h_per_t_packing), t_dtype),
+            pltpu.VMEM((bt, t_packing, h_per_t_packing), t_dtype),
+            pltpu.SMEM((1,), jnp.int32),
+            pltpu.SemaphoreType.DMA,
             pltpu.SemaphoreType.DMA,
         )
 
@@ -2891,6 +3186,10 @@ def _fused_ep_moe_kernel(
             # where each expert waits only its own recv semaphore.
             if use_batch_dma_scatter:
                 start_a2a_scatter_batch_dma(bt_sem_id=bt_sem_id, bt_start=bt_start)
+            elif use_vmem_permute_scatter:
+                start_a2a_scatter_vmem_permute(bt_sem_id=bt_sem_id, bt_start=bt_start)
+            elif use_overlap_scatter:
+                start_a2a_scatter_overlap(bt_sem_id=bt_sem_id, bt_start=bt_start)
             else:
                 start_a2a_scatter_batch(bt_sem_id=bt_sem_id, bt_start=bt_start)
 
@@ -3373,6 +3672,8 @@ def jax_allreduce_metadata_by_bt(
         "disable_sync_barrier",
         "use_jax_allreduce_metadata",
         "use_batch_dma_scatter",
+        "use_vmem_permute_scatter",
+        "use_overlap_scatter",
         "quant_block_k",
         "block_config",
         "dp_axis_name",
@@ -3407,6 +3708,8 @@ def fused_ep_moe(
     disable_sync_barrier: bool = False,
     use_jax_allreduce_metadata: bool = True,
     use_batch_dma_scatter: bool = False,
+    use_vmem_permute_scatter: bool = False,
+    use_overlap_scatter: bool = False,
     # Quantization block size along the K (reduction) dimension.  Models with
     # 2D block-wise quantization (block_k, block_n) have their scales expanded
     # to 1D format at weight-loading time by _expand_moe_block_scale(), so the
@@ -3686,6 +3989,8 @@ def fused_ep_moe(
                 disable_sync_barrier=disable_sync_barrier,
                 use_jax_allreduce_metadata=use_jax_allreduce_metadata,
                 use_batch_dma_scatter=use_batch_dma_scatter,
+                use_vmem_permute_scatter=use_vmem_permute_scatter,
+                use_overlap_scatter=use_overlap_scatter,
                 quant_block_k=quant_block_k,
                 bt=bt,
                 bf=block_config.bf,
