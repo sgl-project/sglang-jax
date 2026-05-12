@@ -35,7 +35,8 @@ from sgl_jax.srt.layers.linear import MergedColumnParallelLinear
 def _mesh_1x1():
     devices = mesh_utils.create_device_mesh((8,))[:1].reshape((1, 1))
     return Mesh(
-        devices, ("data", "tensor"),
+        devices,
+        ("data", "tensor"),
         axis_types=(AxisType.Explicit, AxisType.Explicit),
     )
 
@@ -43,7 +44,8 @@ def _mesh_1x1():
 def _mesh_1xN(n: int):
     devices = mesh_utils.create_device_mesh((8,))[:n].reshape((1, n))
     return Mesh(
-        devices, ("data", "tensor"),
+        devices,
+        ("data", "tensor"),
         axis_types=(AxisType.Explicit, AxisType.Explicit),
     )
 
@@ -54,7 +56,9 @@ class MergedColumnParallelInitTest(unittest.TestCase):
         mesh = _mesh_1x1()
         with jax.set_mesh(mesh):
             layer = MergedColumnParallelLinear(
-                input_size=32, output_sizes=[64, 64, 128], mesh=mesh,
+                input_size=32,
+                output_sizes=[64, 64, 128],
+                mesh=mesh,
             )
             self.assertEqual(layer.weight.value.shape, (32, 64 + 64 + 128))
             self.assertEqual(layer.output_sizes, [64, 64, 128])
@@ -63,7 +67,9 @@ class MergedColumnParallelInitTest(unittest.TestCase):
         mesh = _mesh_1x1()
         with jax.set_mesh(mesh):
             layer = MergedColumnParallelLinear(
-                input_size=8, output_sizes=[4, 4], mesh=mesh,
+                input_size=8,
+                output_sizes=[4, 4],
+                mesh=mesh,
             )
             self.assertIsNone(layer.bias)
 
@@ -74,7 +80,9 @@ class MergedColumnParallelInitTest(unittest.TestCase):
         with jax.set_mesh(mesh):
             with self.assertRaises(ValueError) as ctx:
                 MergedColumnParallelLinear(
-                    input_size=16, output_sizes=[3, 4], mesh=mesh,  # 3 % 2 == 1
+                    input_size=16,
+                    output_sizes=[3, 4],
+                    mesh=mesh,  # 3 % 2 == 1
                 )
             self.assertIn("divisible by TP=2", str(ctx.exception))
 

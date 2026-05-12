@@ -77,6 +77,7 @@ def _gated_delta_step(
 # Causal conv1d (depthwise, kernel_size=K, stride=1, dilation=1)
 # ---------------------------------------------------------------------------
 
+
 def jax_causal_conv1d_prefill(
     x: jax.Array,  # [D, T]  packed activations
     weight: jax.Array,  # [D, kernel_size]  depthwise weight
@@ -108,17 +109,18 @@ def jax_causal_conv1d_prefill(
     assert cu_seqlens is not None, "cu_seqlens is required"
     B = int(cu_seqlens.shape[0]) - 1
     assert weight.shape == (D, K), f"weight {weight.shape} vs x {x.shape}"
-    assert (conv_state is None) == (state_indices is None), (
-        "conv_state and state_indices must be provided together"
-    )
+    assert (conv_state is None) == (
+        state_indices is None
+    ), "conv_state and state_indices must be provided together"
 
     if conv_state is not None:
-        assert conv_state.shape[1:] == (D, K - 1), (
-            f"conv_state {conv_state.shape} channels/kernel != ({D}, {K - 1})"
-        )
-        assert state_indices.shape == (B,), (
-            f"state_indices {state_indices.shape} != expected ({B},)"
-        )
+        assert conv_state.shape[1:] == (
+            D,
+            K - 1,
+        ), f"conv_state {conv_state.shape} channels/kernel != ({D}, {K - 1})"
+        assert state_indices.shape == (
+            B,
+        ), f"state_indices {state_indices.shape} != expected ({B},)"
         # Gather per-seq prior state once up front; later lookups index by
         # local seq id rather than walking the full table per token.
         state = conv_state[state_indices]  # [B, D, K-1]
@@ -189,9 +191,7 @@ def jax_causal_conv1d_prefill(
             from_init = jnp.transpose(from_init, (0, 2, 1))  # [B, D, K-1]
             final_state = jnp.where(take_from_x[:, None, :], from_x, from_init)
         else:
-            final_state = jnp.where(
-                take_from_x[:, None, :], from_x, jnp.zeros_like(from_x)
-            )
+            final_state = jnp.where(take_from_x[:, None, :], from_x, jnp.zeros_like(from_x))
     else:
         # K == 1: the conv has no left context, so the "state" is empty.
         final_state = jnp.zeros((B, D, 0), dtype=x.dtype)
@@ -233,6 +233,7 @@ def jax_causal_conv1d_update(
 # ---------------------------------------------------------------------------
 # Recurrence kernels (extend + decode reference implementations)
 # ---------------------------------------------------------------------------
+
 
 def ragged_gated_delta_rule_ref(
     mixed_qkv: jax.Array,

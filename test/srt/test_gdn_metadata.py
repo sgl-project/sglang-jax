@@ -56,6 +56,7 @@ class GDNAttnMetadataPytreeTest(unittest.TestCase):
     def test_jit_through_pytree(self):
         """Passing GDNAttnMetadata through a jit'd function preserves the
         array — exercises the pytree registration on a real jit boundary."""
+
         @jax.jit
         def f(md):
             return md.cu_seqlens + 1
@@ -82,9 +83,7 @@ class GDNMetadataBuilderTest(unittest.TestCase):
             extend_seq_lens=np.array([3, 5, 2], dtype=np.int32),
         )
         md = builder.get_forward_metadata(batch)
-        np.testing.assert_array_equal(
-            md.cu_seqlens, np.array([0, 3, 8, 10], dtype=np.int32)
-        )
+        np.testing.assert_array_equal(md.cu_seqlens, np.array([0, 3, 8, 10], dtype=np.int32))
         self.assertEqual(md.cu_seqlens.dtype, jnp.int32)
 
     def test_extend_single_request(self):

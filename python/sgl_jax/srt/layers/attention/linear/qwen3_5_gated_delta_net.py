@@ -213,9 +213,9 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         # Fused Q/K/V via a single GEMM. Per-device output is per-shard
         # block-concat `[q_tp | k_tp | v_tp]`, exactly what conv1d wants.
         mixed_qkv, _ = self.in_proj_qkv(hidden_states)  # [T, conv_dim]
-        z, _ = self.in_proj_z(hidden_states)            # [T, value_dim]
-        b, _ = self.in_proj_b(hidden_states)            # [T, num_v_heads]
-        a, _ = self.in_proj_a(hidden_states)            # [T, num_v_heads]
+        z, _ = self.in_proj_z(hidden_states)  # [T, value_dim]
+        b, _ = self.in_proj_b(hidden_states)  # [T, num_v_heads]
+        a, _ = self.in_proj_a(hidden_states)  # [T, num_v_heads]
 
         # Reshape z for the post-recurrence gate; sharding stays on n_v.
         z = jax.lax.reshape(
@@ -225,7 +225,12 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         )
 
         core_attn_out, new_conv, new_rec = self.attention(
-            forward_batch, mixed_qkv, conv_state_in, recurrent_state_in, b, a,
+            forward_batch,
+            mixed_qkv,
+            conv_state_in,
+            recurrent_state_in,
+            b,
+            a,
         )
         # core_attn_out: [T, num_v_heads, head_v_dim]
 

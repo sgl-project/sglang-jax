@@ -32,15 +32,16 @@ from sgl_jax.srt.layers.attention.linear.qwen3_5_gated_delta_net import (
     Qwen3_5GatedDeltaNet,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 def _make_mesh():
     devices = mesh_utils.create_device_mesh((8,))[:1].reshape((1, 1))
     return Mesh(
-        devices, ("data", "tensor"),
+        devices,
+        ("data", "tensor"),
         axis_types=(AxisType.Explicit, AxisType.Explicit),
     )
 
@@ -82,6 +83,7 @@ class _FakeForwardBatch:
 # Tests
 # ---------------------------------------------------------------------------
 
+
 class Qwen3_5GatedDeltaNetInitTest(unittest.TestCase):
     def test_projection_shapes_match_hf_layout(self):
         """``in_proj_qkv`` is a merged Q/K/V GEMM; z/b/a stay separate. Param
@@ -99,11 +101,17 @@ class Qwen3_5GatedDeltaNetInitTest(unittest.TestCase):
             self.assertEqual(layer.in_proj_qkv.output_sizes, [key_dim, key_dim, value_dim])
             # z/b/a stay separate.
             self.assertEqual(layer.in_proj_z.weight.value.shape, (cfg.hidden_size, value_dim))
-            self.assertEqual(layer.in_proj_b.weight.value.shape, (cfg.hidden_size, cfg.linear_num_value_heads))
-            self.assertEqual(layer.in_proj_a.weight.value.shape, (cfg.hidden_size, cfg.linear_num_value_heads))
+            self.assertEqual(
+                layer.in_proj_b.weight.value.shape, (cfg.hidden_size, cfg.linear_num_value_heads)
+            )
+            self.assertEqual(
+                layer.in_proj_a.weight.value.shape, (cfg.hidden_size, cfg.linear_num_value_heads)
+            )
             self.assertEqual(layer.out_proj.weight.value.shape, (value_dim, cfg.hidden_size))
-            self.assertEqual(layer.attention.conv1d_weight.value.shape,
-                             (layer.conv_dim, cfg.linear_conv_kernel_dim))
+            self.assertEqual(
+                layer.attention.conv1d_weight.value.shape,
+                (layer.conv_dim, cfg.linear_conv_kernel_dim),
+            )
             self.assertEqual(layer.attention.A_log.value.shape, (cfg.linear_num_value_heads,))
             self.assertEqual(layer.attention.dt_bias.value.shape, (cfg.linear_num_value_heads,))
             self.assertEqual(layer.rms_scale.value.shape, (cfg.linear_value_head_dim,))
@@ -152,7 +160,10 @@ class Qwen3_5GatedDeltaNetEndToEndTest(unittest.TestCase):
             layer = Qwen3_5GatedDeltaNet(cfg, 0, 0, mesh)
             conv_dim = layer.conv_dim
             layer.attention.conv1d_weight = nnx.Param(
-                jax.random.normal(jax.random.key(0), (conv_dim, cfg.linear_conv_kernel_dim), dtype=jnp.bfloat16) * 0.05
+                jax.random.normal(
+                    jax.random.key(0), (conv_dim, cfg.linear_conv_kernel_dim), dtype=jnp.bfloat16
+                )
+                * 0.05
             )
 
             # 3 reqs of length [3, 2] for extend, B=3 for decode.
@@ -167,13 +178,21 @@ class Qwen3_5GatedDeltaNetEndToEndTest(unittest.TestCase):
                 cu_seqlens = jnp.array([0, 3, 5], dtype=jnp.int32)
                 extend_prefix_lens = jnp.array([0, 0], dtype=jnp.int32)
 
-            hidden = jax.random.normal(jax.random.key(1), (T, cfg.hidden_size), dtype=jnp.bfloat16) * 0.3
+            hidden = (
+                jax.random.normal(jax.random.key(1), (T, cfg.hidden_size), dtype=jnp.bfloat16) * 0.3
+            )
             conv_state = jnp.zeros(
-                (B + 1, conv_dim, cfg.linear_conv_kernel_dim - 1), dtype=jnp.bfloat16,
+                (B + 1, conv_dim, cfg.linear_conv_kernel_dim - 1),
+                dtype=jnp.bfloat16,
                 out_sharding=NamedSharding(mesh, P(None, "tensor", None)),
             )
             rec_state = jnp.zeros(
-                (B + 1, cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim),
+                (
+                    B + 1,
+                    cfg.linear_num_value_heads,
+                    cfg.linear_key_head_dim,
+                    cfg.linear_value_head_dim,
+                ),
                 dtype=jnp.float32,
                 out_sharding=NamedSharding(mesh, P(None, "tensor", None, None)),
             )
@@ -190,8 +209,10 @@ class Qwen3_5GatedDeltaNetEndToEndTest(unittest.TestCase):
         self.assertEqual(out.shape, (T, cfg.hidden_size))
         self.assertEqual(out.dtype, jnp.bfloat16)
         self.assertEqual(new_conv.shape, (B, conv_dim, cfg.linear_conv_kernel_dim - 1))
-        self.assertEqual(new_rec.shape,
-                         (B, cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim))
+        self.assertEqual(
+            new_rec.shape,
+            (B, cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim),
+        )
         self.assertTrue(bool(jnp.all(jnp.isfinite(out))))
 
     def test_extend_path(self):
@@ -199,8 +220,10 @@ class Qwen3_5GatedDeltaNetEndToEndTest(unittest.TestCase):
         self.assertEqual(out.shape, (T, cfg.hidden_size))
         self.assertEqual(out.dtype, jnp.bfloat16)
         self.assertEqual(new_conv.shape, (B, conv_dim, cfg.linear_conv_kernel_dim - 1))
-        self.assertEqual(new_rec.shape,
-                         (B, cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim))
+        self.assertEqual(
+            new_rec.shape,
+            (B, cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim),
+        )
         self.assertTrue(bool(jnp.all(jnp.isfinite(out))))
 
 

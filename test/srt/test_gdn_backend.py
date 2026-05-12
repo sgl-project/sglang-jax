@@ -34,26 +34,30 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 def _make_mesh():
     """Single-device 1×1 mesh with both 'data' and 'tensor' axes."""
     devices = mesh_utils.create_device_mesh((8,))[:1].reshape((1, 1))
     return Mesh(
-        devices, ("data", "tensor"),
+        devices,
+        ("data", "tensor"),
         axis_types=(AxisType.Explicit, AxisType.Explicit),
     )
 
 
 def _make_backend(mesh, n_kq=1, n_v=2, d_k=4, d_v=8, K=3):
     backend = GDNAttnBackend(
-        num_k_heads=n_kq, num_v_heads=n_v,
-        head_k_dim=d_k, head_v_dim=d_v,
+        num_k_heads=n_kq,
+        num_v_heads=n_v,
+        head_k_dim=d_k,
+        head_v_dim=d_v,
         conv_kernel_size=K,
-        mesh=mesh, dtype=jnp.bfloat16,
+        mesh=mesh,
+        dtype=jnp.bfloat16,
     )
     rng = jax.random.split(jax.random.key(0), 3)
     backend.conv1d_weight = nnx.Param(
@@ -102,15 +106,21 @@ def _sharded_state(mesh, shape, spec, dtype, rng=None):
 
 def _sharded_proj(mesh, shape, spec, rng, scale=0.3):
     """Mimic a `LinearBase` output: sharded on the last (head/channel) axis."""
-    return jax.random.normal(
-        rng, shape, dtype=jnp.bfloat16,
-        out_sharding=NamedSharding(mesh, spec),
-    ) * scale
+    return (
+        jax.random.normal(
+            rng,
+            shape,
+            dtype=jnp.bfloat16,
+            out_sharding=NamedSharding(mesh, spec),
+        )
+        * scale
+    )
 
 
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 class GDNAttnBackendInitTest(unittest.TestCase):
     def test_param_shapes_match_config(self):
@@ -119,10 +129,13 @@ class GDNAttnBackendInitTest(unittest.TestCase):
         with jax.set_mesh(mesh):
             n_kq, n_v, d_k, d_v, K = 2, 4, 8, 16, 4
             backend = GDNAttnBackend(
-                num_k_heads=n_kq, num_v_heads=n_v,
-                head_k_dim=d_k, head_v_dim=d_v,
+                num_k_heads=n_kq,
+                num_v_heads=n_v,
+                head_k_dim=d_k,
+                head_v_dim=d_v,
                 conv_kernel_size=K,
-                mesh=mesh, dtype=jnp.bfloat16,
+                mesh=mesh,
+                dtype=jnp.bfloat16,
             )
             self.assertEqual(backend.key_dim, n_kq * d_k)
             self.assertEqual(backend.value_dim, n_v * d_v)
@@ -149,12 +162,16 @@ class GDNAttnBackendDispatchTest(unittest.TestCase):
             B = 2
             mixed_qkv, b, a = self._make_inputs(mesh, B, backend, jax.random.key(1))
             cs = _sharded_state(
-                mesh, (B + 1, backend.conv_dim, backend.conv_kernel_size - 1),
-                P(None, "tensor", None), jnp.bfloat16,
+                mesh,
+                (B + 1, backend.conv_dim, backend.conv_kernel_size - 1),
+                P(None, "tensor", None),
+                jnp.bfloat16,
             )
             rs = _sharded_state(
-                mesh, (B + 1, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim),
-                P(None, "tensor", None, None), jnp.float32,
+                mesh,
+                (B + 1, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim),
+                P(None, "tensor", None, None),
+                jnp.float32,
             )
             fb = _FakeForwardBatch(
                 is_decode=True,
@@ -163,7 +180,9 @@ class GDNAttnBackendDispatchTest(unittest.TestCase):
             out, new_conv, new_rec = backend(fb, mixed_qkv, cs, rs, b, a)
             self.assertEqual(out.shape, (B, backend.num_v_heads, backend.head_v_dim))
             self.assertEqual(new_conv.shape, (B, backend.conv_dim, backend.conv_kernel_size - 1))
-            self.assertEqual(new_rec.shape, (B, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim))
+            self.assertEqual(
+                new_rec.shape, (B, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim)
+            )
 
     def test_extend_dispatch(self):
         mesh = _make_mesh()
@@ -173,12 +192,16 @@ class GDNAttnBackendDispatchTest(unittest.TestCase):
             B = 2
             mixed_qkv, b, a = self._make_inputs(mesh, T, backend, jax.random.key(2))
             cs = _sharded_state(
-                mesh, (B + 1, backend.conv_dim, backend.conv_kernel_size - 1),
-                P(None, "tensor", None), jnp.bfloat16,
+                mesh,
+                (B + 1, backend.conv_dim, backend.conv_kernel_size - 1),
+                P(None, "tensor", None),
+                jnp.bfloat16,
             )
             rs = _sharded_state(
-                mesh, (B + 1, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim),
-                P(None, "tensor", None, None), jnp.float32,
+                mesh,
+                (B + 1, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim),
+                P(None, "tensor", None, None),
+                jnp.float32,
             )
             fb = _FakeForwardBatch(
                 is_decode=False,
@@ -189,7 +212,9 @@ class GDNAttnBackendDispatchTest(unittest.TestCase):
             out, new_conv, new_rec = backend(fb, mixed_qkv, cs, rs, b, a)
             self.assertEqual(out.shape, (T, backend.num_v_heads, backend.head_v_dim))
             self.assertEqual(new_conv.shape, (B, backend.conv_dim, backend.conv_kernel_size - 1))
-            self.assertEqual(new_rec.shape, (B, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim))
+            self.assertEqual(
+                new_rec.shape, (B, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim)
+            )
 
 
 class GDNAttnBackendExtendStateTest(unittest.TestCase):
@@ -207,12 +232,18 @@ class GDNAttnBackendExtendStateTest(unittest.TestCase):
             b = _sharded_proj(mesh, (T, backend.num_v_heads), P(None, "tensor"), rng[1])
             a = _sharded_proj(mesh, (T, backend.num_v_heads), P(None, "tensor"), rng[2])
             cs = _sharded_state(
-                mesh, (B + 1, backend.conv_dim, backend.conv_kernel_size - 1),
-                P(None, "tensor", None), jnp.bfloat16, rng=jax.random.key(60),
+                mesh,
+                (B + 1, backend.conv_dim, backend.conv_kernel_size - 1),
+                P(None, "tensor", None),
+                jnp.bfloat16,
+                rng=jax.random.key(60),
             )
             rs = _sharded_state(
-                mesh, (B + 1, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim),
-                P(None, "tensor", None, None), jnp.float32, rng=jax.random.key(61),
+                mesh,
+                (B + 1, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim),
+                P(None, "tensor", None, None),
+                jnp.float32,
+                rng=jax.random.key(61),
             )
             fb = _FakeForwardBatch(
                 is_decode=False,
@@ -223,7 +254,9 @@ class GDNAttnBackendExtendStateTest(unittest.TestCase):
             out, new_conv, new_rec = backend(fb, mixed_qkv, cs, rs, b, a)
             self.assertEqual(out.shape, (T, backend.num_v_heads, backend.head_v_dim))
             self.assertEqual(new_conv.shape, (B, backend.conv_dim, backend.conv_kernel_size - 1))
-            self.assertEqual(new_rec.shape, (B, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim))
+            self.assertEqual(
+                new_rec.shape, (B, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim)
+            )
             self.assertTrue(bool(jnp.all(jnp.isfinite(out))))
             self.assertTrue(bool(jnp.all(jnp.isfinite(new_rec))))
 

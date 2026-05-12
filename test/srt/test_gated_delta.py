@@ -114,9 +114,7 @@ class GatedDeltaStepTest(unittest.TestCase):
         # Per-element calls.
         ns_each, out_each = [], []
         for i in range(B):
-            ns, o = _gated_delta_step(
-                state[i], q[i], k[i], v[i], g[i], beta[i]
-            )
+            ns, o = _gated_delta_step(state[i], q[i], k[i], v[i], g[i], beta[i])
             ns_each.append(ns)
             out_each.append(o)
         ns_stack = jnp.stack(ns_each, axis=0)
@@ -183,13 +181,16 @@ class CausalConv1dPrefillTest(unittest.TestCase):
         weight = jax.random.normal(rng[1], (D, K), dtype=jnp.float32)
 
         y, final = jax_causal_conv1d_prefill(
-            x, weight, bias=None,
+            x,
+            weight,
+            bias=None,
             cu_seqlens=jnp.array([0, T], dtype=jnp.int32),
-            conv_state=None, state_indices=None,
+            conv_state=None,
+            state_indices=None,
         )
         np.testing.assert_allclose(y, self._naive_conv(x, weight), atol=1e-5)
         # Final state should be the last K-1 tokens of x.
-        np.testing.assert_allclose(final[0], x[:, -(K - 1):], atol=1e-5)
+        np.testing.assert_allclose(final[0], x[:, -(K - 1) :], atol=1e-5)
 
     def test_initial_state_carried_in(self):
         """First K-1 outputs should mix in conv_state contents."""
@@ -203,14 +204,16 @@ class CausalConv1dPrefillTest(unittest.TestCase):
         conv_state = jnp.zeros((2, D, K - 1)).at[1].set(prior)
 
         y, final = jax_causal_conv1d_prefill(
-            x, weight, bias=None,
+            x,
+            weight,
+            bias=None,
             cu_seqlens=jnp.array([0, T], dtype=jnp.int32),
             conv_state=conv_state,
             state_indices=jnp.array([1], dtype=jnp.int32),
         )
         np.testing.assert_allclose(y, self._naive_conv(x, weight, init_left=prior), atol=1e-5)
         # Final state still equals the last K-1 of x (request is long enough).
-        np.testing.assert_allclose(final[0], x[:, -(K - 1):], atol=1e-5)
+        np.testing.assert_allclose(final[0], x[:, -(K - 1) :], atol=1e-5)
 
     def test_multi_request_boundary_isolation(self):
         """Token 0 of request 1 must NOT see any token from request 0."""
@@ -223,9 +226,12 @@ class CausalConv1dPrefillTest(unittest.TestCase):
         weight = jnp.ones((D, K))  # straight sum of window
 
         y, _ = jax_causal_conv1d_prefill(
-            x, weight, bias=None,
+            x,
+            weight,
+            bias=None,
             cu_seqlens=jnp.array([0, 3, 6], dtype=jnp.int32),
-            conv_state=None, state_indices=None,
+            conv_state=None,
+            state_indices=None,
         )
         # Req1's token 0 (global idx 3) should sum [0, 0, 1] = 1, NOT 100+1+1.
         # Req1's token 1 should sum [0, 1, 1] = 2.
@@ -245,7 +251,9 @@ class CausalConv1dPrefillTest(unittest.TestCase):
 
         conv_state = jnp.zeros((1, D, K - 1)).at[0].set(prior)
         _, final = jax_causal_conv1d_prefill(
-            x, weight, bias=None,
+            x,
+            weight,
+            bias=None,
             cu_seqlens=jnp.array([0, T], dtype=jnp.int32),
             conv_state=conv_state,
             state_indices=jnp.array([0], dtype=jnp.int32),
@@ -265,9 +273,12 @@ class CausalConv1dPrefillTest(unittest.TestCase):
         weight = jnp.zeros((D, K))
 
         _, final = jax_causal_conv1d_prefill(
-            x, weight, bias=None,
+            x,
+            weight,
+            bias=None,
             cu_seqlens=jnp.array([0, T], dtype=jnp.int32),
-            conv_state=None, state_indices=None,
+            conv_state=None,
+            state_indices=None,
         )
         # Logical stream is [pad=0, 10, 20]; last K-1=3 = [0, 10, 20].
         np.testing.assert_allclose(final[0, 0], [0.0, 10.0, 20.0], atol=1e-5)
@@ -282,9 +293,12 @@ class CausalConv1dPrefillTest(unittest.TestCase):
         weight = jax.random.normal(rng[1], (D, K))
 
         y, final = jax_causal_conv1d_prefill(
-            x, weight, bias=None,
+            x,
+            weight,
+            bias=None,
             cu_seqlens=jnp.array([0, T], dtype=jnp.int32),
-            conv_state=None, state_indices=None,
+            conv_state=None,
+            state_indices=None,
         )
         # y[d, t] = x[d, t] * weight[d, 0].
         np.testing.assert_allclose(y, x * weight, atol=1e-5)
@@ -312,15 +326,32 @@ class DecodeGatedDeltaRuleRefTest(unittest.TestCase):
         si = jnp.array([1, 2, 3, 4, 5], dtype=jnp.int32)
 
         nr_d, out_d = decode_gated_delta_rule_ref(
-            mq, b, a, rec, A_log, dt_bias, si,
-            n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v,
+            mq,
+            b,
+            a,
+            rec,
+            A_log,
+            dt_bias,
+            si,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
         )
         nr_r, out_r = ragged_gated_delta_rule_ref(
-            mq, b, a, rec, A_log, dt_bias,
+            mq,
+            b,
+            a,
+            rec,
+            A_log,
+            dt_bias,
             cu_seqlens=jnp.arange(B + 1, dtype=jnp.int32),
             state_indices=si,
             has_initial_state=jnp.ones((B,), dtype=jnp.bool_),
-            n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
         )
         np.testing.assert_allclose(out_d, out_r, atol=1e-3, rtol=1e-3)
         np.testing.assert_allclose(nr_d, nr_r, atol=1e-4, rtol=1e-4)
@@ -339,8 +370,17 @@ class DecodeGatedDeltaRuleRefTest(unittest.TestCase):
         si = jnp.array([1, 2, 3], dtype=jnp.int32)
 
         new_rec, out = decode_gated_delta_rule_ref(
-            mq, b, a, rec, A_log, dt_bias, si,
-            n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v,
+            mq,
+            b,
+            a,
+            rec,
+            A_log,
+            dt_bias,
+            si,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
         )
         self.assertEqual(out.shape, (B, n_v, d_v))
         self.assertEqual(out.dtype, jnp.bfloat16)
@@ -364,15 +404,32 @@ class DecodeGatedDeltaRuleRefTest(unittest.TestCase):
         si = jnp.array([1, 2, 3], dtype=jnp.int32)
 
         nr_d, out_d = decode_gated_delta_rule_ref(
-            mq, b, a, rec, A_log, dt_bias, si,
-            n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v,
+            mq,
+            b,
+            a,
+            rec,
+            A_log,
+            dt_bias,
+            si,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
         )
         nr_r, out_r = ragged_gated_delta_rule_ref(
-            mq, b, a, rec, A_log, dt_bias,
+            mq,
+            b,
+            a,
+            rec,
+            A_log,
+            dt_bias,
             cu_seqlens=jnp.arange(B + 1, dtype=jnp.int32),
             state_indices=si,
             has_initial_state=jnp.ones((B,), dtype=jnp.bool_),
-            n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
         )
         np.testing.assert_allclose(out_d, out_r, atol=1e-3, rtol=1e-3)
         np.testing.assert_allclose(nr_d, nr_r, atol=1e-4, rtol=1e-4)

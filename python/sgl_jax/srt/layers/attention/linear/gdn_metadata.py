@@ -11,7 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.sharding import NamedSharding

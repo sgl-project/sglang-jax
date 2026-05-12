@@ -167,6 +167,7 @@ class MergedColumnParallelLinear(LinearBase):
             scope_name=scope_name,
         )
 
+
 class QuantizedLinear(nnx.Module):
     """Quantized linear layer using native quantized matmul.
 

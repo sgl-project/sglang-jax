@@ -80,13 +80,11 @@ class GDNAttnBackend(nnx.Module):
         tp = _mesh_tp_size(mesh)
         if num_k_heads % tp != 0:
             raise ValueError(
-                f"GDNAttnBackend: num_k_heads={num_k_heads} must be divisible "
-                f"by TP={tp}."
+                f"GDNAttnBackend: num_k_heads={num_k_heads} must be divisible " f"by TP={tp}."
             )
         if num_v_heads % tp != 0:
             raise ValueError(
-                f"GDNAttnBackend: num_v_heads={num_v_heads} must be divisible "
-                f"by TP={tp}."
+                f"GDNAttnBackend: num_v_heads={num_v_heads} must be divisible " f"by TP={tp}."
             )
         if self.conv_dim % tp != 0:
             raise ValueError(
@@ -129,9 +127,7 @@ class GDNAttnBackend(nnx.Module):
         # A TP > 1 numerical test against an fp32 reference is the canary
         # for getting this wrong — at TP = 1 the two layouts coincide and
         # bugs hide.
-        self.conv1d_weight = nnx.Param(
-            jnp.zeros((self.conv_dim, conv_kernel_size), dtype=dtype)
-        )
+        self.conv1d_weight = nnx.Param(jnp.zeros((self.conv_dim, conv_kernel_size), dtype=dtype))
         # Delta-rule params, sharded per-head. Storage dtypes follow the HF
         # Qwen3.5 checkpoint exactly:
         #   A_log:   fp32 (the recurrence's ``-exp(A_log)`` factor is
@@ -151,11 +147,11 @@ class GDNAttnBackend(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
-        mixed_qkv: jax.Array,            # [T, conv_dim]                  (None, "tensor")
-        conv_state_in: jax.Array,        # [num_blocks, conv_dim, K-1]    (None, "tensor", None)
-        recurrent_state_in: jax.Array,   # [num_blocks, n_v, d_k, d_v]    (None, "tensor", None, None)
-        b: jax.Array,                    # [T, n_v]                       (None, "tensor")
-        a: jax.Array,                    # [T, n_v]                       (None, "tensor")
+        mixed_qkv: jax.Array,  # [T, conv_dim]                  (None, "tensor")
+        conv_state_in: jax.Array,  # [num_blocks, conv_dim, K-1]    (None, "tensor", None)
+        recurrent_state_in: jax.Array,  # [num_blocks, n_v, d_k, d_v]    (None, "tensor", None, None)
+        b: jax.Array,  # [T, n_v]                       (None, "tensor")
+        a: jax.Array,  # [T, n_v]                       (None, "tensor")
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         if forward_batch.forward_mode.is_decode():
             return self.forward_decode(
@@ -188,8 +184,15 @@ class GDNAttnBackend(nnx.Module):
         d_v = self.head_v_dim
 
         def _decode_local(
-            mixed_qkv_l, conv_state_l, rec_state_l,
-            conv_weight_l, A_log_l, dt_bias_l, b_l, a_l, state_indices_l,
+            mixed_qkv_l,
+            conv_state_l,
+            rec_state_l,
+            conv_weight_l,
+            A_log_l,
+            dt_bias_l,
+            b_l,
+            a_l,
+            state_indices_l,
         ):
             per_req_conv = conv_state_l[state_indices_l]
             conv_out, new_conv = jax_causal_conv1d_update(
@@ -200,9 +203,17 @@ class GDNAttnBackend(nnx.Module):
                 activation="silu",
             )
             new_rec, out = decode_gated_delta_rule_ref(
-                conv_out, b_l, a_l, rec_state_l, A_log_l, dt_bias_l,
+                conv_out,
+                b_l,
+                a_l,
+                rec_state_l,
+                A_log_l,
+                dt_bias_l,
                 state_indices_l,
-                n_kq=n_kq_tp, n_v=n_v_tp, d_k=d_k, d_v=d_v,
+                n_kq=n_kq_tp,
+                n_v=n_v_tp,
+                d_k=d_k,
+                d_v=d_v,
             )
             return out, new_conv, new_rec
 
@@ -210,26 +221,32 @@ class GDNAttnBackend(nnx.Module):
             _decode_local,
             mesh=self.mesh,
             in_specs=(
-                P(None, "tensor"),                  # mixed_qkv
-                P(None, "tensor", None),            # conv_state
-                P(None, "tensor", None, None),      # recurrent_state
-                P("tensor", None),                  # conv1d weight
-                P("tensor"),                        # A_log
-                P("tensor"),                        # dt_bias
-                P(None, "tensor"),                  # b
-                P(None, "tensor"),                  # a
-                P(),                                # state_indices (replicated)
+                P(None, "tensor"),  # mixed_qkv
+                P(None, "tensor", None),  # conv_state
+                P(None, "tensor", None, None),  # recurrent_state
+                P("tensor", None),  # conv1d weight
+                P("tensor"),  # A_log
+                P("tensor"),  # dt_bias
+                P(None, "tensor"),  # b
+                P(None, "tensor"),  # a
+                P(),  # state_indices (replicated)
             ),
             out_specs=(
-                P(None, "tensor", None),            # out [B, n_v, d_v]
-                P(None, "tensor", None),            # new_conv [B, conv_dim, K-1]
-                P(None, "tensor", None, None),      # new_rec  [B, n_v, d_k, d_v]
+                P(None, "tensor", None),  # out [B, n_v, d_v]
+                P(None, "tensor", None),  # new_conv [B, conv_dim, K-1]
+                P(None, "tensor", None, None),  # new_rec  [B, n_v, d_k, d_v]
             ),
             check_vma=False,
         )(
-            mixed_qkv, conv_state_in, recurrent_state_in,
-            self.conv1d_weight.value, self.A_log.value, self.dt_bias.value,
-            b, a, state_indices,
+            mixed_qkv,
+            conv_state_in,
+            recurrent_state_in,
+            self.conv1d_weight.value,
+            self.A_log.value,
+            self.dt_bias.value,
+            b,
+            a,
+            state_indices,
         )
 
     # ------------------------------------------------------------------
@@ -256,9 +273,17 @@ class GDNAttnBackend(nnx.Module):
         d_v = self.head_v_dim
 
         def _extend_local(
-            mixed_qkv_l, conv_state_l, rec_state_l,
-            conv_weight_l, A_log_l, dt_bias_l, b_l, a_l,
-            cu_seqlens_l, state_indices_l, prefix_lens_l,
+            mixed_qkv_l,
+            conv_state_l,
+            rec_state_l,
+            conv_weight_l,
+            A_log_l,
+            dt_bias_l,
+            b_l,
+            a_l,
+            cu_seqlens_l,
+            state_indices_l,
+            prefix_lens_l,
         ):
             # jax_causal_conv1d_prefill operates on [D, T] (channel-first).
             conv_out_dt, new_conv = jax_causal_conv1d_prefill(
@@ -273,11 +298,19 @@ class GDNAttnBackend(nnx.Module):
             conv_out = conv_out_dt.T  # [T, D]
             has_initial_state = prefix_lens_l > 0
             new_rec, out = ragged_gated_delta_rule_ref(
-                conv_out, b_l, a_l, rec_state_l, A_log_l, dt_bias_l,
+                conv_out,
+                b_l,
+                a_l,
+                rec_state_l,
+                A_log_l,
+                dt_bias_l,
                 cu_seqlens=cu_seqlens_l,
                 state_indices=state_indices_l,
                 has_initial_state=has_initial_state,
-                n_kq=n_kq_tp, n_v=n_v_tp, d_k=d_k, d_v=d_v,
+                n_kq=n_kq_tp,
+                n_v=n_v_tp,
+                d_k=d_k,
+                d_v=d_v,
             )
             return out, new_conv, new_rec
 
@@ -285,26 +318,34 @@ class GDNAttnBackend(nnx.Module):
             _extend_local,
             mesh=self.mesh,
             in_specs=(
-                P(None, "tensor"),                  # mixed_qkv
-                P(None, "tensor", None),            # conv_state
-                P(None, "tensor", None, None),      # recurrent_state
-                P("tensor", None),                  # conv1d weight
-                P("tensor"),                        # A_log
-                P("tensor"),                        # dt_bias
-                P(None, "tensor"),                  # b
-                P(None, "tensor"),                  # a
-                P(),                                # cu_seqlens (replicated)
-                P(),                                # state_indices (replicated)
-                P(),                                # extend_prefix_lens (replicated)
+                P(None, "tensor"),  # mixed_qkv
+                P(None, "tensor", None),  # conv_state
+                P(None, "tensor", None, None),  # recurrent_state
+                P("tensor", None),  # conv1d weight
+                P("tensor"),  # A_log
+                P("tensor"),  # dt_bias
+                P(None, "tensor"),  # b
+                P(None, "tensor"),  # a
+                P(),  # cu_seqlens (replicated)
+                P(),  # state_indices (replicated)
+                P(),  # extend_prefix_lens (replicated)
             ),
             out_specs=(
-                P(None, "tensor", None),            # out [T, n_v, d_v]
-                P(None, "tensor", None),            # new_conv [B, conv_dim, K-1]
-                P(None, "tensor", None, None),      # new_rec  [B, n_v, d_k, d_v]
+                P(None, "tensor", None),  # out [T, n_v, d_v]
+                P(None, "tensor", None),  # new_conv [B, conv_dim, K-1]
+                P(None, "tensor", None, None),  # new_rec  [B, n_v, d_k, d_v]
             ),
             check_vma=False,
         )(
-            mixed_qkv, conv_state_in, recurrent_state_in,
-            self.conv1d_weight.value, self.A_log.value, self.dt_bias.value,
-            b, a, cu_seqlens, state_indices, extend_prefix_lens,
+            mixed_qkv,
+            conv_state_in,
+            recurrent_state_in,
+            self.conv1d_weight.value,
+            self.A_log.value,
+            self.dt_bias.value,
+            b,
+            a,
+            cu_seqlens,
+            state_indices,
+            extend_prefix_lens,
         )
