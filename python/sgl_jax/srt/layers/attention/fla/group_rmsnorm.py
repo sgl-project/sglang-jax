@@ -1,3 +1,5 @@
+from collections.abc import Sequence
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -23,6 +25,7 @@ class GroupRMSNorm(nnx.Module):
         epsilon: float = 1e-6,
         param_dtype: Dtype = jnp.float32,
         scope_name: str = "group_rms_norm",
+        kernel_axes: Sequence[str | None] | None = None,
         mesh: Mesh | None = None,
     ):
         if hidden_size % num_groups != 0:
@@ -34,42 +37,37 @@ class GroupRMSNorm(nnx.Module):
         self.epsilon = epsilon
         self.name = scope_name
         self.mesh = mesh
-        self.weight = nnx.Param(jnp.ones(hidden_size, dtype=param_dtype))
+        self.weight = nnx.Param(
+            jax.random.normal(
+                jax.random.PRNGKey(0),
+                (hidden_size,),
+                dtype=param_dtype,
+                out_sharding=P(*kernel_axes),
+            ),
+        )
 
     @named_scope
     def __call__(self, hidden_states: jax.Array) -> jax.Array:
         orig_dtype = hidden_states.dtype
         orig_shape = hidden_states.shape
 
-        if self.mesh is None:
-            hidden_states = hidden_states.reshape(
-                *orig_shape[:-1], self.num_groups, self.group_size
-            ).astype(jnp.float32)
-        else:
-            hidden_states = lax.reshape(
-                hidden_states,
-                (*orig_shape[:-1], self.num_groups, self.group_size),
-                out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
-            ).astype(jnp.float32)
+        hidden_states = hidden_states.reshape(
+            orig_shape[0],
+            self.num_groups,
+            self.group_size,
+            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
+        ).astype(jnp.float32)
         variance = jnp.mean(lax.square(hidden_states), axis=-1, keepdims=True)
         hidden_states = hidden_states * lax.rsqrt(variance + self.epsilon)
 
-        weight = jnp.asarray(self.weight[...], jnp.float32)
-        if self.mesh is None:
-            weight = weight.reshape(self.num_groups, self.group_size)
-        else:
-            weight = lax.reshape(
-                weight,
-                (self.num_groups, self.group_size),
-                out_sharding=NamedSharding(self.mesh, P("tensor", None)),
-            )
-        if self.mesh is None:
-            hidden_states = (weight * hidden_states).reshape(orig_shape).astype(orig_dtype)
-        else:
-            hidden_states = lax.reshape(
-                weight * hidden_states,
-                orig_shape,
-                out_sharding=NamedSharding(self.mesh, P("data", "tensor")),
-            ).astype(orig_dtype)
+        nw = self.weight.value.reshape(
+            self.num_groups,
+            self.group_size,
+            out_sharding=NamedSharding(self.mesh, P("tensor", None)),
+        ).astype(jnp.float32)
+        hidden_states = (nw * hidden_states).astype(orig_dtype)
 
-        return hidden_states
+        return hidden_states.reshape(
+            orig_shape,
+            out_sharding=NamedSharding(self.mesh, P("data", "tensor")),
+        )

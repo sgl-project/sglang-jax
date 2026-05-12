@@ -134,6 +134,8 @@ class BailingMoELinearAttention(nnx.Module):
             num_groups=getattr(config, "group_norm_size", 1),
             epsilon=config.rms_norm_eps,
             scope_name="g_norm",
+            param_dtype=dtype,
+            kernel_axes=("tensor",),
             mesh=mesh,
         )
         self.attn = RadixLightningAttention(
