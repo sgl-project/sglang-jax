@@ -784,9 +784,12 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
             sharding=("tensor", None),
             transpose=True,
         )
+        num_groups = getattr(self.config, "group_norm_size", 1)
+        tp_size = self.mesh.shape.get("tensor", 1)
+        g_norm_sharding = ("tensor",) if num_groups % tp_size == 0 else (None,)
         mappings[f"{ap}.g_norm.weight"] = WeightMapping(
             target_path=f"{tp}.g_norm.weight",
-            sharding=("tensor",),
+            sharding=g_norm_sharding,
             transpose=False,
         )
         if getattr(self.config, "use_qk_norm", True):

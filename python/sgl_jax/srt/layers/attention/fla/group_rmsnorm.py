@@ -37,6 +37,13 @@ class GroupRMSNorm(nnx.Module):
         self.epsilon = epsilon
         self.name = scope_name
         self.mesh = mesh
+
+        tp_size = mesh.shape.get("tensor", 1) if mesh is not None else 1
+        self._shard_groups = num_groups % tp_size == 0
+
+        if not self._shard_groups:
+            kernel_axes = (None,)
+
         self.weight = nnx.Param(
             jax.random.normal(
                 jax.random.PRNGKey(0),
@@ -51,11 +58,18 @@ class GroupRMSNorm(nnx.Module):
         orig_dtype = hidden_states.dtype
         orig_shape = hidden_states.shape
 
+        if self._shard_groups:
+            group_spec = P("data", "tensor", None)
+            weight_spec = P("tensor", None)
+        else:
+            group_spec = P("data", None, None)
+            weight_spec = P(None, None)
+
         hidden_states = hidden_states.reshape(
             orig_shape[0],
             self.num_groups,
             self.group_size,
-            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
+            out_sharding=NamedSharding(self.mesh, group_spec),
         ).astype(jnp.float32)
         variance = jnp.mean(lax.square(hidden_states), axis=-1, keepdims=True)
         hidden_states = hidden_states * lax.rsqrt(variance + self.epsilon)
@@ -63,7 +77,7 @@ class GroupRMSNorm(nnx.Module):
         nw = self.weight.value.reshape(
             self.num_groups,
             self.group_size,
-            out_sharding=NamedSharding(self.mesh, P("tensor", None)),
+            out_sharding=NamedSharding(self.mesh, weight_spec),
         ).astype(jnp.float32)
         hidden_states = (nw * hidden_states).astype(orig_dtype)
 
