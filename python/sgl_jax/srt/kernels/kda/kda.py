@@ -552,7 +552,7 @@ def _prepare_chunk_offsets(seqlens, chunk_size):
 
 def _chunk_gated_delta_rule_fwd_kernel(
     seqlens_ref,
-    chunk_offsets_ref,
+    chunk_to_seq_ref,
     k_ref,
     v_ref,
     w_ref,
@@ -572,64 +572,61 @@ def _chunk_gated_delta_rule_fwd_kernel(
     SAVE_NEW_VALUE,
     USE_EXP2,
 ):
-    idx_n = pl.program_id(0)
-    idx_nt = pl.program_id(2)
-
-    bos = seqlens_ref[idx_n]
-    eos = seqlens_ref[idx_n + 1]
-    real_NT = (eos - bos) // k_ref.shape[2]
+    i_c = pl.program_id(1)
+    seq_idx = chunk_to_seq_ref[i_c]
+    bos = seqlens_ref[seq_idx]
+    eos = seqlens_ref[seq_idx + 1]
 
     BT = k_ref.shape[2]
+    t0 = i_c * BT
     K, V = k_ref.shape[-1], v_ref.shape[-1]
     b_k = k_ref[0, 0]
 
-    @pl.when(idx_nt == 0)
+    @pl.when(t0 == bos)
     def _():
         scratch_ref[...] = jnp.zeros([K, V], dtype=jnp.float32)
         if USE_INITIAL_STATE:
             scratch_ref[...] = h0_ref[0, 0].astype(jnp.float32)
 
-    @pl.when(idx_nt < real_NT)
-    def _():
-        h_ref[0, 0, 0] = scratch_ref[...].astype(h_ref.dtype)
+    h_ref[0, 0, 0] = scratch_ref[...].astype(h_ref.dtype)
 
-        b_w = w_ref[0, 0]
-        b_v = jnp.dot(
-            b_w.astype(jnp.float32),
-            scratch_ref[...],
-            precision=jax.lax.Precision.HIGHEST,
-            preferred_element_type=jnp.float32,
-        )
-        b_u = v_ref[0, 0]
-        b_v = b_u.astype(b_v.dtype) - b_v
-        if SAVE_NEW_VALUE:
-            v_new_ref[0, 0] = b_v.astype(v_new_ref.dtype)
+    b_w = w_ref[0, 0]
+    b_v = jnp.dot(
+        b_w.astype(jnp.float32),
+        scratch_ref[...],
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    )
+    b_u = v_ref[0, 0]
+    b_v = b_u.astype(b_v.dtype) - b_v
+    if SAVE_NEW_VALUE:
+        v_new_ref[0, 0] = b_v.astype(v_new_ref.dtype)
 
-        if USE_G:
-            b_g = g_ref[0, 0, :, 0]
-            b_g_last = g_ref[0, 0, BT - 1, 0].astype(jnp.float32)
-            if USE_EXP2:
-                b_v = b_v * exp2(b_g_last - b_g)[:, None]
-                b_g_last = exp2(b_g_last)
-            else:
-                b_v = b_v * exp(b_g_last - b_g)[:, None]
-                b_g_last = exp(b_g_last)
-            scratch_ref[...] *= b_g_last
-        if USE_GK:
-            b_gk_last = gk_ref[0, 0, BT - 1].astype(jnp.float32)
-            if USE_EXP2:
-                scratch_ref[...] *= exp2(b_gk_last)[:, None]
-            else:
-                scratch_ref[...] *= exp(b_gk_last)[:, None]
+    if USE_G:
+        b_g = g_ref[0, 0, :, 0]
+        b_g_last = g_ref[0, 0, BT - 1, 0].astype(jnp.float32)
+        if USE_EXP2:
+            b_v = b_v * exp2(b_g_last - b_g)[:, None]
+            b_g_last = exp2(b_g_last)
+        else:
+            b_v = b_v * exp(b_g_last - b_g)[:, None]
+            b_g_last = exp(b_g_last)
+        scratch_ref[...] *= b_g_last
+    if USE_GK:
+        b_gk_last = gk_ref[0, 0, BT - 1].astype(jnp.float32)
+        if USE_EXP2:
+            scratch_ref[...] *= exp2(b_gk_last)[:, None]
+        else:
+            scratch_ref[...] *= exp(b_gk_last)[:, None]
 
-        scratch_ref[...] += jnp.dot(
-            b_k.astype(jnp.float32).T,
-            b_v.astype(jnp.float32),
-            precision=jax.lax.Precision.HIGHEST,
-            preferred_element_type=jnp.float32,
-        )
+    scratch_ref[...] += jnp.dot(
+        b_k.astype(jnp.float32).T,
+        b_v.astype(jnp.float32),
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    )
 
-    @pl.when(idx_nt == real_NT - 1)
+    @pl.when(t0 + BT >= eos)
     def _():
         if STORE_FINAL_STATE:
             ht_ref[0, 0] = scratch_ref[...].astype(ht_ref.dtype)
@@ -675,8 +672,7 @@ def chunk_gated_delta_rule_fwd_h(
 
     assert chunk_indices is not None
     NT = len(chunk_indices)
-    NT_max = T // BT
-    chunk_offsets = _prepare_chunk_offsets(cu_seqlens, BT)
+    chunk_to_seq = chunk_indices[:, 0].astype(jnp.int32)
     assert initial_state is None or initial_state.shape == (N, H, K, V)
 
     T_alloc = T + BT
@@ -738,15 +734,11 @@ def chunk_gated_delta_rule_fwd_h(
         else None
     )
 
-    def _t_index_map(n, h, nt, seqlens_ref, chunk_offsets_ref):
-        bos = pl.multiple_of(seqlens_ref[n], BT)
-        block_idx = jnp.minimum(bos // BT + nt, T // BT)
-        return (0, h, block_idx, 0)
+    def _t_index_map(h, c, seqlens_ref, chunk_to_seq_ref):
+        return (0, h, c, 0)
 
-    def _h_index_map(n, h, nt, seqlens_ref, chunk_offsets_ref):
-        bos = pl.multiple_of(seqlens_ref[n], BT)
-        chunk_idx = jnp.minimum(bos // BT + nt, NT - 1)
-        return (0, chunk_idx, h, 0, 0)
+    def _h_index_map(h, c, seqlens_ref, chunk_to_seq_ref):
+        return (0, c, h, 0, 0)
 
     k_blockspec = pl.BlockSpec([1, 1, BT, K_PADSIZE], index_map=_t_index_map)
     v_blockspec = pl.BlockSpec([1, 1, BT, V_ALIGNED], index_map=_t_index_map)
@@ -758,7 +750,10 @@ def chunk_gated_delta_rule_fwd_h(
         pl.BlockSpec([1, 1, BT, K_PADSIZE], index_map=_t_index_map) if gk is not None else None
     )
     h0_blockspec = (
-        pl.BlockSpec([1, 1, K_PADSIZE, V_ALIGNED], index_map=lambda n, h, nt, *_: (n, h, 0, 0))
+        pl.BlockSpec(
+            [1, 1, K_PADSIZE, V_ALIGNED],
+            index_map=lambda h, c, seqlens_ref, chunk_to_seq_ref: (chunk_to_seq_ref[c], h, 0, 0),
+        )
         if initial_state is not None
         else None
     )
@@ -768,13 +763,16 @@ def chunk_gated_delta_rule_fwd_h(
         pl.BlockSpec([1, 1, BT, V_ALIGNED], index_map=_t_index_map) if save_new_value else None
     )
     ht_blockspec_out = (
-        pl.BlockSpec([1, 1, K_PADSIZE, V_ALIGNED], index_map=lambda n, h, nt, *_: (n, h, 0, 0))
+        pl.BlockSpec(
+            [1, 1, K_PADSIZE, V_ALIGNED],
+            index_map=lambda h, c, seqlens_ref, chunk_to_seq_ref: (chunk_to_seq_ref[c], h, 0, 0),
+        )
         if output_final_state
         else None
     )
 
     scratch = pltpu.VMEM((K_PADSIZE, V_ALIGNED), jnp.float32)
-    grid = (N, H, NT_max)
+    grid = (H, NT)
     interpret = get_interpret()
 
     h_out, v_new_out, ht_out = pl.pallas_call(
@@ -802,16 +800,32 @@ def chunk_gated_delta_rule_fwd_h(
             out_specs=[h_blockspec_out, v_new_blockspec_out, ht_blockspec_out],
             scratch_shapes=[scratch],
         ),
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "parallel", "arbitrary")
-        ),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "arbitrary")),
         out_shape=[h_spec, v_new_spec, ht_spec],
         interpret=interpret,
-    )(cu_seqlens, chunk_offsets, k_t, v_t, w_t, g_t, gk_t, h0)
+    )(cu_seqlens, chunk_to_seq, k_t, v_t, w_t, g_t, gk_t, h0)
 
     h_out = h_out[:, :, :, :K, :V]
     v_new_out = jnp.transpose(v_new_out[:, :, :T, :V], (0, 2, 1, 3)) if save_new_value else None
     ht_out = ht_out[:, :, :K, :V] if output_final_state else None
+
+    if output_final_state and ht_out is not None:
+        ht_out = ht_out[:, :, :K, :V]
+        # Handle empty sequences: sequences with no chunks never execute kernel code,
+        # so their final_state is uninitialized. Fill them with initial_state or zeros.
+        seq_lens = jnp.diff(cu_seqlens)
+        empty_mask = seq_lens == 0  # [N]
+        if initial_state is not None:
+            # For empty sequences, final_state should equal initial_state
+            fill_value = initial_state[:, :, :K, :V]
+        else:
+            # For empty sequences without initial_state, final_state should be zeros
+            fill_value = jnp.zeros((N, H, K, V), dtype=ht_out.dtype)
+            fill_value = jnp.zeros((N, H, K, V), dtype=ht_out.dtype)
+        # Use where to selectively replace empty sequence states
+        ht_out = jnp.where(empty_mask[:, None, None, None], fill_value, ht_out)
+    else:
+        ht_out = None
 
     return h_out, v_new_out, ht_out
 
