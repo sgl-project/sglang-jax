@@ -1163,6 +1163,17 @@ class ServerArgs:
                 "Please pass --disable-overlap-schedule when using --speculative-algorithm."
             )
 
+        if (
+            self.speculative_algorithm is not None
+            and self.speculative_algorithm.upper() in ("EAGLE", "EAGLE3")
+            and self.enable_mixed_chunk
+        ):
+            raise ValueError(
+                "EAGLE speculative decoding does not support mixed chunk batches. "
+                "Please disable --enable-mixed-chunk when using --speculative-algorithm "
+                "EAGLE or EAGLE3."
+            )
+
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""
         # Import LoRARef here to avoid circular imports
