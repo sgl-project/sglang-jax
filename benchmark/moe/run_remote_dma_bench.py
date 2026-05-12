@@ -15,6 +15,9 @@ def run_single(num_tokens, hidden_size, num_repeats, mode, ep_size):
     """Run a single benchmark in a subprocess and parse the result."""
     script = f"""
 import sys, os, time
+os.environ.setdefault("JAX_PLATFORMS", "tpu")
+if os.path.exists("/tmp/libtpu_lockfile"):
+    os.remove("/tmp/libtpu_lockfile")
 sys.path.insert(0, ".")
 import jax, jax.numpy as jnp, numpy as np
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -47,8 +50,12 @@ print(f"RESULT={{med:.6f}}")
 
 
 def main():
-    import jax
-    ep_size = jax.device_count()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ep-size", type=int, default=8)
+    args = parser.parse_args()
+
+    ep_size = args.ep_size
     hidden_size = 6144
     num_repeats = 100
     sizes = [1, 4, 16, 64, 128]
