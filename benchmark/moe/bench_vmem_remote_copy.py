@@ -158,7 +158,7 @@ def _pallas_body(src, dst):
 
 @jax.jit
 def run(src, dst):
-    return jax.shard_map.shard_map(
+    return jax.experimental.shard_map.shard_map(
         _pallas_body, mesh=mesh,
         in_specs=(P("tensor"), P("tensor")),
         out_specs=P("tensor"), check_rep=False,
