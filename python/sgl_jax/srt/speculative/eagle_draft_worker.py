@@ -248,9 +248,7 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
         # out_cache_loc = model_worker_batch.out_cache_loc
-        topk_index = spec_info.topk_index
-        if self.hot_token_ids is not None:
-            model_worker_batch.spec_info.topk_index = self._remap_hot_token_ids(topk_index)
+        topk_index = model_worker_batch.spec_info.topk_index
         # if we need custom mask, we should create for all at once and update it within loop
         # we should optimize build_tree_mask_for_draft_decode to a kernel
         if self.topk > 1:
@@ -380,8 +378,15 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
         next_token_ids: jax.Array,
     ) -> EagleDraftInput:
         # FIXME(pc) move this all prepare to prepare_for_extend_after_target_prefill
-        real_indices = jnp.arange(model_worker_batch.real_bs, dtype=jnp.int32)
-        padded_indices = jnp.arange(model_worker_batch.seq_lens.shape[0], dtype=jnp.int32)
+        index_sharding = NamedSharding(self.model_runner.mesh, P("data"))
+        real_indices = device_array(
+            np.arange(model_worker_batch.real_bs, dtype=np.int32),
+            sharding=index_sharding,
+        )
+        padded_indices = device_array(
+            np.arange(model_worker_batch.seq_lens.shape[0], dtype=np.int32),
+            sharding=index_sharding,
+        )
         model_worker_batch.spec_info = EagleDraftInput(
             hidden_states=target_hidden_states,
             verified_id=_take_with_optional_out_sharding(next_token_ids, padded_indices),
@@ -432,6 +437,9 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
 
     def capture_for_decode(self, logits_output, draft_input: EagleDraftInput):
         topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
+        if self.hot_token_ids is not None:
+            topk_index = self._remap_hot_token_ids(topk_index)
+        topk_index = np.asarray(jax.device_get(topk_index))
         draft_input.topk_p = topk_p
         draft_input.topk_index = topk_index
         draft_input.hidden_states = logits_output.hidden_states
@@ -474,6 +482,9 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
         topk_p, topk_index = topk_probs_from_logits(
             draft_logits_output.next_token_logits, self.topk
         )
+        if self.hot_token_ids is not None:
+            topk_index = self._remap_hot_token_ids(topk_index)
+        topk_index = np.asarray(jax.device_get(topk_index))
 
         # prepare for next draft decode
         batch_output.next_draft_input.hidden_states = draft_logits_output.hidden_states
@@ -560,18 +571,278 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
     def run_spec_decode_precompile(self):
         self.precompile_spec_extend()
         self.precompile_spec_decode()
-        # FIXME precompile some kernel
+        self.precompile_runtime_jax_helpers()
+
+    def precompile_runtime_jax_helpers(self):
+        """Warm EAGLE runtime helper ops whose shapes follow real batch size.
+
+        The model forward itself is padded to the configured precompile buckets, but
+        several EAGLE post-processing helpers intentionally operate on the real
+        number of active requests. Without warming these shapes, the first request
+        drain through batch sizes such as 15, 13, or 6 can trigger persistent-cache
+        misses for small JAX gather/top-k/reshard kernels.
+        """
+        max_bs = max(self.precompile_bs_paddings) if self.precompile_bs_paddings else 0
+        if max_bs <= 0:
+            return
+
+        start_time = time.perf_counter()
+        # The 4K/1K Phase-1 cache gate exercises bsz up to 16.  Larger buckets
+        # such as max-running-requests=256 are still covered by the normal
+        # padded model-forward precompile, but warming every real drain size up
+        # to 256 would add excessive startup work for tiny helper kernels.
+        max_runtime_bs = min(max_bs, 16)
+        bs_candidates = list(range(1, max_runtime_bs + 1))
+        logger.info("[SPEC_RUNTIME] Begin to precompile real_bs=%s", bs_candidates)
+
+        data_sharding = NamedSharding(self.mesh, P("data"))
+        data_2d_sharding = NamedSharding(self.mesh, P("data", None))
+        replicated_sharding = NamedSharding(self.mesh, P(None))
+        replicated_2d_sharding = NamedSharding(self.mesh, P(None, None))
+        logits_sharding = NamedSharding(self.mesh, P("data", "tensor"))
+
+        dtype = jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32
+        hidden_size = self.model_config.hidden_size
+        vocab_size = self.model_config.vocab_size
+
+        with tqdm(bs_candidates, desc="[SPEC_RUNTIME] PRECOMPILE", leave=False) as pbar:
+            for bs in pbar:
+                pbar.set_postfix(real_bs=bs)
+                indices = device_array(
+                    np.arange(bs, dtype=np.int32),
+                    sharding=data_sharding,
+                )
+
+                logits = device_array(
+                    np.zeros((bs, vocab_size), dtype=np.float32),
+                    sharding=logits_sharding,
+                ).astype(dtype)
+                topk_p, topk_index = topk_probs_from_logits(logits, self.topk)
+                topk_p.block_until_ready()
+                topk_index.block_until_ready()
+                if self.hot_token_ids is not None:
+                    token_ids_2d_host = np.zeros((bs, self.topk), dtype=np.int32)
+                    token_ids_1d_host = np.zeros((bs * self.topk,), dtype=np.int32)
+                    token_ids_2d_data = device_array(token_ids_2d_host, sharding=data_2d_sharding)
+                    token_ids_1d_data = device_array(token_ids_1d_host, sharding=data_sharding)
+                    token_ids_2d_replicated = device_array(
+                        token_ids_2d_host, sharding=replicated_2d_sharding
+                    )
+                    token_ids_1d_replicated = device_array(
+                        token_ids_1d_host, sharding=replicated_sharding
+                    )
+                    for token_ids in (
+                        topk_index,
+                        topk_index.flatten(),
+                        token_ids_2d_data,
+                        token_ids_1d_data,
+                        token_ids_2d_replicated,
+                        token_ids_1d_replicated,
+                        token_ids_2d_host,
+                        token_ids_1d_host,
+                    ):
+                        remapped_token_ids = self._remap_hot_token_ids(token_ids)
+                        remapped_token_ids.block_until_ready()
+                        np.asarray(jax.device_get(remapped_token_ids))
+
+                hidden = device_array(
+                    np.zeros((bs, hidden_size), dtype=np.float32),
+                    sharding=data_2d_sharding,
+                ).astype(dtype)
+                verified_id = device_array(
+                    np.zeros((bs,), dtype=np.int32),
+                    sharding=data_sharding,
+                )
+                replicated_hidden = device_array(
+                    np.zeros((bs, hidden_size), dtype=np.float32),
+                    sharding=replicated_2d_sharding,
+                ).astype(dtype)
+                replicated_verified_id = device_array(
+                    np.zeros((bs,), dtype=np.int32),
+                    sharding=replicated_sharding,
+                )
+                _take_with_optional_out_sharding(
+                    logits, indices, trailing_slice=True
+                ).block_until_ready()
+                _take_with_optional_out_sharding(
+                    hidden, indices, trailing_slice=True
+                ).block_until_ready()
+                _take_with_optional_out_sharding(verified_id, indices).block_until_ready()
+                _take_with_optional_out_sharding(
+                    replicated_hidden, indices, trailing_slice=True
+                ).block_until_ready()
+                _take_with_optional_out_sharding(
+                    replicated_verified_id, indices
+                ).block_until_ready()
+
+                for keep_bs in range(1, bs + 1):
+                    keep_indices = device_array(
+                        np.arange(keep_bs, dtype=np.int32),
+                        sharding=data_sharding,
+                    )
+                    keep_indices_replicated = device_array(
+                        np.arange(keep_bs, dtype=np.int32),
+                        sharding=replicated_sharding,
+                    )
+                    keep_indices_host = np.arange(keep_bs, dtype=np.int32)
+                    for keep_index in (
+                        keep_indices,
+                        keep_indices_replicated,
+                        keep_indices_host,
+                    ):
+                        _take_with_optional_out_sharding(
+                            logits, keep_index, trailing_slice=True
+                        ).block_until_ready()
+                        _take_with_optional_out_sharding(
+                            topk_p, keep_index, trailing_slice=True
+                        ).block_until_ready()
+                        _take_with_optional_out_sharding(
+                            topk_index, keep_index, trailing_slice=True
+                        ).block_until_ready()
+                        _take_with_optional_out_sharding(
+                            hidden, keep_index, trailing_slice=True
+                        ).block_until_ready()
+                        _take_with_optional_out_sharding(
+                            verified_id, keep_index
+                        ).block_until_ready()
+                        _take_with_optional_out_sharding(
+                            replicated_hidden, keep_index, trailing_slice=True
+                        ).block_until_ready()
+                        _take_with_optional_out_sharding(
+                            replicated_verified_id, keep_index
+                        ).block_until_ready()
+
+                if bs == max_runtime_bs and max_bs > max_runtime_bs:
+                    padded_bs = max_bs
+                    padded_logits = device_array(
+                        np.zeros((padded_bs, vocab_size), dtype=np.float32),
+                        sharding=logits_sharding,
+                    ).astype(dtype)
+                    padded_hidden = device_array(
+                        np.zeros((padded_bs, hidden_size), dtype=np.float32),
+                        sharding=data_2d_sharding,
+                    ).astype(dtype)
+                    padded_ids = device_array(
+                        np.zeros((padded_bs,), dtype=np.int32),
+                        sharding=data_sharding,
+                    )
+                    padded_indices = device_array(
+                        np.arange(padded_bs, dtype=np.int32),
+                        sharding=data_sharding,
+                    )
+                    _take_with_optional_out_sharding(padded_ids, padded_indices).block_until_ready()
+                    for keep_bs in bs_candidates:
+                        keep_indices = device_array(
+                            np.arange(keep_bs, dtype=np.int32),
+                            sharding=data_sharding,
+                        )
+                        _take_with_optional_out_sharding(
+                            padded_logits, keep_indices, trailing_slice=True
+                        ).block_until_ready()
+                        _take_with_optional_out_sharding(
+                            padded_hidden, keep_indices, trailing_slice=True
+                        ).block_until_ready()
+                        _take_with_optional_out_sharding(
+                            padded_ids, keep_indices
+                        ).block_until_ready()
+
+                draft_extend_slots = bs * (self.speculative_num_steps + 1)
+                draft_extend_logits = device_array(
+                    np.zeros((draft_extend_slots, vocab_size), dtype=np.float32),
+                    sharding=logits_sharding,
+                ).astype(dtype)
+                draft_extend_hidden = device_array(
+                    np.zeros((draft_extend_slots, hidden_size), dtype=np.float32),
+                    sharding=data_2d_sharding,
+                ).astype(dtype)
+                draft_extend_ids = device_array(
+                    np.zeros((draft_extend_slots,), dtype=np.int32),
+                    sharding=data_sharding,
+                )
+                for keep_bs in range(1, bs + 1):
+                    select_index_host = np.arange(keep_bs, dtype=np.int32) * (
+                        self.speculative_num_steps + 1
+                    )
+                    select_index_data = device_array(
+                        select_index_host,
+                        sharding=data_sharding,
+                    )
+                    select_index_replicated = device_array(
+                        select_index_host,
+                        sharding=replicated_sharding,
+                    )
+                    for select_index in (
+                        select_index_host,
+                        select_index_data,
+                        select_index_replicated,
+                    ):
+                        selected_logits = _take_with_optional_out_sharding(
+                            draft_extend_logits, select_index, trailing_slice=True
+                        )
+                        selected_logits.block_until_ready()
+                        _take_with_optional_out_sharding(
+                            draft_extend_hidden, select_index, trailing_slice=True
+                        ).block_until_ready()
+                        _take_with_optional_out_sharding(
+                            draft_extend_ids, select_index
+                        ).block_until_ready()
+                        selected_topk_p, selected_topk_index = topk_probs_from_logits(
+                            selected_logits, self.topk
+                        )
+                        selected_topk_p.block_until_ready()
+                        selected_topk_index.block_until_ready()
+                        if self.hot_token_ids is not None:
+                            selected_topk_index = self._remap_hot_token_ids(selected_topk_index)
+                            selected_topk_index.block_until_ready()
+
+                if self.topk == 1:
+                    continue
+
+                step_min_1 = self.speculative_num_steps - 1
+                score_list = device_array(
+                    np.zeros((bs, 1 + step_min_1 * self.topk, self.topk), dtype=np.float32),
+                    sharding=NamedSharding(self.mesh, P("data", None, None)),
+                )
+                token_list = device_array(
+                    np.zeros(
+                        (bs, self.topk + step_min_1 * self.topk * self.topk),
+                        dtype=np.int32,
+                    ),
+                    sharding=data_2d_sharding,
+                )
+                parents_list = device_array(
+                    np.zeros((bs, self.topk + 1 + step_min_1 * self.topk), dtype=np.int32),
+                    sharding=data_2d_sharding,
+                )
+                hidden_states = device_array(
+                    np.zeros((bs, hidden_size), dtype=dtype),
+                    sharding=data_2d_sharding,
+                )
+                scores = None
+                for i in range(self.speculative_num_steps):
+                    _, hidden_states, scores, tree_info = select_top_k_tokens(
+                        i, topk_p, topk_index, hidden_states, scores, self.topk
+                    )
+                    score_list, token_list, parents_list = update_eagle_lists(
+                        i, score_list, token_list, parents_list, tree_info, self.topk
+                    )
+                    score_list.block_until_ready()
+                    token_list.block_until_ready()
+                    parents_list.block_until_ready()
+
+        end_time = time.perf_counter()
+        logger.info("[SPEC_RUNTIME] Precompile finished in %.0f secs", end_time - start_time)
 
     def precompile_spec_extend(self):
         start_time = time.perf_counter()
         logger.info(
             "[SPEC_EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s",
-            self.precompile_bs_paddings[-1:],
+            self.precompile_bs_paddings,
             self.precompile_token_paddings,
         )
 
-        bs, _ = self.get_max_padded_size()
-        pairs = list(itertools.product([bs], self.precompile_token_paddings))
+        pairs = list(itertools.product(self.precompile_bs_paddings, self.precompile_token_paddings))
+        cache_loc_by_bs = dict(zip(self.precompile_bs_paddings, self.precompile_cache_loc_paddings))
 
         with tqdm(pairs, desc="[SPEC_EXTEND] PRECOMPILE", leave=False) as pbar:
             for pair in pbar:
@@ -585,10 +856,11 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
                     bs,
                     num_tokens,
                     ForwardMode.EXTEND,
-                    self.precompile_cache_loc_paddings[-1],
+                    cache_loc_by_bs[bs],
                     do_penalties=False,
                     speculative_algotithm=self.speculative_algorithm,
                 )
+                model_worker_batch.return_output_logprob_only = False
                 model_worker_batch.real_bs = 1
                 model_worker_batch.real_input_ids_len = num_tokens
                 model_worker_batch.seq_lens = np.zeros(bs, dtype=np.int32)
@@ -619,19 +891,23 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
                 self.draft_extend_for_prefill(
                     model_worker_batch, logits_output.hidden_states, next_token_ids
                 )
+                np.asarray(jax.device_get(next_token_ids))
         end_time = time.perf_counter()
         logger.info("[SPEC_EXTEND] Precompile finished in %.0f secs", end_time - start_time)
 
     def precompile_spec_decode(self):
         start_time = time.perf_counter()
+        max_bs = max(self.precompile_bs_paddings) if self.precompile_bs_paddings else 0
+        runtime_bs_candidates = list(range(1, min(max_bs, 16) + 1))
+        decode_bs_candidates = sorted(
+            set(runtime_bs_candidates + list(self.precompile_bs_paddings))
+        )
         logger.info(
             "[SPEC_DECODE] Begin to precompile bs_paddings=%s",
-            self.precompile_bs_paddings,
+            decode_bs_candidates,
         )
 
-        with tqdm(
-            self.precompile_bs_paddings, desc="[SPEC_DECODE] PRECOMPILE", leave=False
-        ) as pbar:
+        with tqdm(decode_bs_candidates, desc="[SPEC_DECODE] PRECOMPILE", leave=False) as pbar:
             for bs in pbar:
                 pbar.set_postfix(bs=bs)
                 # use same page aligned with precompile cache_loc_paddings
