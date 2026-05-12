@@ -15,7 +15,6 @@ def run_single(num_tokens, hidden_size, num_repeats, mode, ep_size):
     """Run a single benchmark in a subprocess and parse the result."""
     script = f"""
 import sys, os, time
-sys.path.insert(0, os.path.join(os.path.dirname("{__file__}"), "..", ".."))
 sys.path.insert(0, ".")
 import jax, jax.numpy as jnp, numpy as np
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -30,7 +29,7 @@ times = wallclock_timeit(run_fn, src, dst, num_repeats={num_repeats}, warmup=3, 
 if len(times) > 1:
     times = times[1:]
 med = float(np.median(times))
-print(f"RESULT={med:.6f}")
+print(f"RESULT={{med:.6f}}")
 """
     result = subprocess.run(
         [sys.executable, "-c", script],
