@@ -139,7 +139,7 @@ def quantized_matmul_kernel(
     def kernel(lhs_ref, rhs_ref, w_scales_ref, out_ref, acc_scratch):
         pid_k = pl.program_id(2)
         is_first_step = pid_k == 0
-        is_last_step = pid_k == (orig_n_in // in_block_size - 1)
+        is_last_step = pid_k == (n_in - 1)
 
         def accum(is_first_step, is_last_step):
             accumulators = [None] * steps_n
