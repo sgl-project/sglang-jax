@@ -536,6 +536,18 @@ class BailingMoELinearDecoderLayer(nnx.Module):
 
         if self.is_moe_layer:
             shared_output = self.shared_experts(hidden_states) if self.shared_experts else None
+            raw_logits = jnp.dot(
+                hidden_states,
+                self.moe_gate.kernel.value,
+                precision=jax.lax.Precision.HIGHEST,
+            )
+            maybe_dump_jax_array(
+                raw_logits,
+                component="moe_detail",
+                name="router_logits_raw",
+                layer_id=self.layer_id,
+                forward_mode=forward_batch.forward_mode,
+            )
             router_logits = self.moe_gate(hidden_states)
             correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
             topk_weights, topk_ids = self.topk(
@@ -546,7 +558,7 @@ class BailingMoELinearDecoderLayer(nnx.Module):
             maybe_dump_jax_array(
                 router_logits,
                 component="moe_detail",
-                name="router_logits",
+                name="router_logits_post_act",
                 layer_id=self.layer_id,
                 forward_mode=forward_batch.forward_mode,
             )
