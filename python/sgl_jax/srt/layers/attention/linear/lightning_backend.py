@@ -151,6 +151,16 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             if has_init is not None:
                 mask = has_init[:, None, None, None].astype(ssm_states.dtype)
                 ssm_states = ssm_states * mask
+            logger.info(
+                "extend shapes: q=%s k=%s v=%s ssm_states=%s slope=%s cu_q_lens=%s recurrent_indices=%s",
+                q.shape,
+                k.shape,
+                v.shape,
+                ssm_states.shape,
+                slope.shape,
+                self.forward_metadata.cu_q_lens.shape,
+                recurrent_indices.shape,
+            )
             output, new_recurrent = self._forward_extend(q, k, v, ssm_states, slope)
         else:
             raise NotImplementedError(
@@ -274,6 +284,14 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         chunk_size = self.chunk_size
 
         def _prefill_fn(q_local, k_local, v_local, gamma, h0, cu_seqlens_p):
+            jax.debug.print(
+                "shard_map local: q={q} k={k} v={v} h0={h0} cu={cu}",
+                q=jnp.array(q_local.shape),
+                k=jnp.array(k_local.shape),
+                v=jnp.array(v_local.shape),
+                h0=jnp.array(h0.shape),
+                cu=jnp.array(cu_seqlens_p.shape),
+            )
             if self.use_native_gla:
                 output, ht = naive_gla_prefill(
                     q_local[None],
