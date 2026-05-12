@@ -3372,6 +3372,7 @@ def jax_allreduce_metadata_by_bt(
         "disable_all_reduce_metadata",
         "disable_sync_barrier",
         "use_jax_allreduce_metadata",
+        "use_batch_dma_scatter",
         "quant_block_k",
         "block_config",
         "dp_axis_name",
