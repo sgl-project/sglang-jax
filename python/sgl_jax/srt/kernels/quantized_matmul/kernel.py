@@ -20,6 +20,7 @@ def xla_quantized_matmul_local(
     quantize_activation: bool = True,
     reduce_axis: str | None = None,
     compute_dtype: jnp.dtype | None = None,
+    weight_block_size: tuple[int, int] | None = None,
     activation_quant_dtype: jnp.dtype | None = None,
     allow_narrow_n_blockwise: bool = False,
 ) -> jax.Array:
@@ -58,6 +59,11 @@ def xla_quantized_matmul_local(
         in_blocks = w_scale.shape[0]
         block_size_in = in_dim // in_blocks
 
+        if weight_block_size is not None:
+            block_size_out = int(weight_block_size[0])
+        else:
+            block_size_out = block_size_in
+
         blockwise_kernel = get_blockwise_kernel()
         if blockwise_kernel is None:
             raise RuntimeError(
@@ -72,7 +78,7 @@ def xla_quantized_matmul_local(
         # allow_narrow_n_blockwise=True to bypass this guard. The guard on the quant config is temporary
         if not allow_narrow_n_blockwise and not should_use_blockwise_kernel(
             out_dim=int(out_dim),
-            block_size_out=block_size_in,
+            block_size_out=block_size_out,
         ):
             raise RuntimeError(
                 f"Block-wise kernel does not support out_dim={out_dim} with "

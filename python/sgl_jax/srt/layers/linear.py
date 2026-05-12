@@ -341,6 +341,7 @@ class QuantizedLinear(nnx.Module):
                 quantize_activation=quantize_activation,
                 reduce_axis=input_axis,
                 compute_dtype=self.compute_dtype,
+                weight_block_size=self.weight_block_size,
                 activation_quant_dtype=self.activation_dtype,
                 allow_narrow_n_blockwise=self.allow_narrow_n_blockwise,
             ),
