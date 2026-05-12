@@ -78,7 +78,7 @@ def xla_quantized_matmul_local(
         # allow_narrow_n_blockwise=True to bypass this guard. The guard on the quant config is temporary
         if not allow_narrow_n_blockwise and not should_use_blockwise_kernel(
             out_dim=int(out_dim),
-            block_size_out=block_size_out,
+            block_size_out=int(block_size_out),
         ):
             raise RuntimeError(
                 f"Block-wise kernel does not support out_dim={out_dim} with "
