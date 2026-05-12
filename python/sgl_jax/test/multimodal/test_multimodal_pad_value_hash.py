@@ -120,6 +120,24 @@ class TestMultimodalPadValueHash(unittest.TestCase):
 
         self.assertEqual(direct_payload.hash, file_payload.hash)
 
+    def test_file_payload_snapshot_hashes_copied_bytes(self):
+        tokenizer = object.__new__(MultimodalTokenizer)
+        payload = b"media-payload" * 1024
+        snapshot_path = None
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
+            tmp.write(payload)
+            path = tmp.name
+
+        try:
+            snapshot_path, snapshot_hash = tokenizer._snapshot_file_payload(path, "image")
+            with open(snapshot_path, "rb") as snapshot_file:
+                self.assertEqual(snapshot_file.read(), payload)
+            self.assertEqual(snapshot_hash, tokenizer._hash_payload(payload, "image"))
+        finally:
+            os.unlink(path)
+            if snapshot_path and os.path.exists(snapshot_path):
+                os.unlink(snapshot_path)
+
     def test_hash_metadata_is_canonical_for_dict_order(self):
         tokenizer = object.__new__(MultimodalTokenizer)
         payload = b"payload"

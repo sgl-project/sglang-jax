@@ -700,14 +700,12 @@ class MultimodalTokenizer(TokenizerManager):
                 vr = VideoReader(tmp_path, ctx=ctx)
             elif isinstance(source, str):
                 if os.path.exists(source):
-                    payload = self._read_file_payload(source)
-                    payload_hash = self._hash_payload(
-                        payload,
+                    tmp_path, payload_hash = self._snapshot_file_payload(
+                        source,
                         "qwen_video",
                         video_config,
+                        default_suffix=".mp4",
                     )
-                    suffix = os.path.splitext(source)[1] or ".mp4"
-                    tmp_path = self._write_temp_video(payload, suffix=suffix)
                     vr = VideoReader(tmp_path, ctx=ctx)
                 elif source.startswith(("http://", "https://")):
                     resp = requests.get(source, timeout=10)
@@ -827,13 +825,16 @@ class MultimodalTokenizer(TokenizerManager):
                 hash=self._hash_payload(source, "image"),
             )
         if os.path.exists(source):
-            payload = self._read_file_payload(source)
-            with Image.open(io.BytesIO(payload)) as image:
-                image_data = image.convert("RGB")
-            return _LoadedMultimodalPayload(
-                data=image_data,
-                hash=self._hash_payload(payload, "image"),
-            )
+            tmp_path, payload_hash = self._snapshot_file_payload(source, "image")
+            try:
+                with Image.open(tmp_path) as image:
+                    image_data = image.convert("RGB")
+                return _LoadedMultimodalPayload(
+                    data=image_data,
+                    hash=payload_hash,
+                )
+            finally:
+                os.unlink(tmp_path)
         if source.startswith(("http://", "https://")):
             resp = requests.get(source, timeout=10)
             resp.raise_for_status()
@@ -878,12 +879,11 @@ class MultimodalTokenizer(TokenizerManager):
             finally:
                 os.unlink(tmp_path)
         if os.path.exists(source):
-            payload = self._read_file_payload(source)
-            payload_hash = self._hash_payload(payload, "video")
-            suffix = os.path.splitext(source)[1] or ".mp4"
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                tmp.write(payload)
-                tmp_path = tmp.name
+            tmp_path, payload_hash = self._snapshot_file_payload(
+                source,
+                "video",
+                default_suffix=".mp4",
+            )
             try:
                 return _LoadedMultimodalPayload(
                     data=iio.imread(tmp_path, index=None),
@@ -924,21 +924,29 @@ class MultimodalTokenizer(TokenizerManager):
                 tmp_path = tmp.name
             try:
                 audio_data, _ = librosa.load(
-                    tmp_path, sr=self.mm_processor.feature_extractor.sampling_rate
+                    tmp_path,
+                    sr=self.mm_processor.feature_extractor.sampling_rate,
                 )
                 return _LoadedMultimodalPayload(data=audio_data, hash=payload_hash)
             finally:
                 os.unlink(tmp_path)
         if os.path.exists(source):
-            payload = self._read_file_payload(source)
-            audio_data, _ = librosa.load(
-                BytesIO(payload),
-                sr=self.mm_processor.feature_extractor.sampling_rate,
+            tmp_path, payload_hash = self._snapshot_file_payload(
+                source,
+                "audio",
+                default_suffix=".mp3",
             )
-            return _LoadedMultimodalPayload(
-                data=audio_data,
-                hash=self._hash_payload(payload, "audio"),
-            )
+            try:
+                audio_data, _ = librosa.load(
+                    tmp_path,
+                    sr=self.mm_processor.feature_extractor.sampling_rate,
+                )
+                return _LoadedMultimodalPayload(
+                    data=audio_data,
+                    hash=payload_hash,
+                )
+            finally:
+                os.unlink(tmp_path)
         if source.startswith(("http://", "https://")):
             payload = urlopen(source, timeout=10).read()
             audio_data, _ = librosa.load(
@@ -957,10 +965,31 @@ class MultimodalTokenizer(TokenizerManager):
         hasher.update(payload)
         return self._hash_digest(hasher)
 
-    @staticmethod
-    def _read_file_payload(path: str) -> bytes:
-        with open(path, "rb") as file:
-            return file.read()
+    def _snapshot_file_payload(
+        self,
+        path: str,
+        *metadata: Any,
+        default_suffix: str = ".tmp",
+    ) -> tuple[str, int]:
+        """Create a temp-file snapshot while hashing the exact bytes copied."""
+        hasher = hashlib.sha256()
+        self._update_hash_metadata(hasher, *metadata)
+        suffix = os.path.splitext(path)[1] or default_suffix
+        tmp_path = None
+        try:
+            with (
+                open(path, "rb") as source_file,
+                tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp,
+            ):
+                tmp_path = tmp.name
+                for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+                    tmp.write(chunk)
+            return tmp_path, self._hash_digest(hasher)
+        except Exception:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
 
     @staticmethod
     def _update_hash_metadata(hasher: Any, *metadata: Any) -> None:
