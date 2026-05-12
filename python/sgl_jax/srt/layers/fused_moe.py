@@ -79,6 +79,7 @@ class FusedEPMoE(nnx.Module):
         use_batch_dma_scatter: bool = False,
         use_vmem_permute_scatter: bool = False,
         use_overlap_scatter: bool = False,
+        use_vmem_preload_scatter: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_experts_per_tok = num_experts_per_tok
@@ -111,6 +112,7 @@ class FusedEPMoE(nnx.Module):
         self.use_batch_dma_scatter = use_batch_dma_scatter
         self.use_vmem_permute_scatter = use_vmem_permute_scatter
         self.use_overlap_scatter = use_overlap_scatter
+        self.use_vmem_preload_scatter = use_vmem_preload_scatter
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -499,6 +501,7 @@ class FusedEPMoE(nnx.Module):
             use_batch_dma_scatter=self.use_batch_dma_scatter,
             use_vmem_permute_scatter=self.use_vmem_permute_scatter,
             use_overlap_scatter=self.use_overlap_scatter,
+            use_vmem_preload_scatter=self.use_vmem_preload_scatter,
             # Optional parameters (not used in basic case)
             quant_block_k=quant_block_k,
             w1_scale=w1_scale,
