@@ -310,6 +310,8 @@ class CompilationManager:
             per_dp_bs_size=per_dp_bs_size,
             real_bs_per_dp=[bs] * dp_size,
             logits_indices_selector=np.arange(bs, dtype=np.int32),
+            recurrent_indices=np.zeros(bs, dtype=np.int32),
+            has_initial_state=np.zeros(bs, dtype=np.bool_),
         )
 
     # ---- Lazy compilation tracking ----
