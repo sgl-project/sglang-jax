@@ -127,6 +127,7 @@ class QuantizedLinear(nnx.Module):
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         compute_dtype: jnp.dtype | None = None,
         weight_block_size: tuple[int, int] | None = None,
+        allow_narrow_n_blockwise: bool = False,
         scope_name: str = "quantized_linear",
     ):
         """Initialize the quantized linear layer with pre-quantized weights."""
@@ -153,6 +154,7 @@ class QuantizedLinear(nnx.Module):
         self.params_dtype = params_dtype
         self.compute_dtype = compute_dtype
         self.weight_block_size = weight_block_size
+        self.allow_narrow_n_blockwise = allow_narrow_n_blockwise
         self.name = scope_name
 
     @classmethod
@@ -163,6 +165,7 @@ class QuantizedLinear(nnx.Module):
         activation_dtype: jnp.dtype | None = None,
         is_static_input: bool = False,
         weight_block_size: Sequence[int] | None = None,
+        allow_narrow_n_blockwise: bool = False,
     ) -> "QuantizedLinear":
         """Convert a LinearBase layer to a QuantizedLinear layer.
 
@@ -289,6 +292,7 @@ class QuantizedLinear(nnx.Module):
             skip_bias_add=linear.skip_bias_add,
             params_dtype=linear.params_dtype,
             weight_block_size=effective_weight_block_size,
+            allow_narrow_n_blockwise=allow_narrow_n_blockwise,
             scope_name=f"quantized_{linear.name}",
         )
 
@@ -339,6 +343,7 @@ class QuantizedLinear(nnx.Module):
                 compute_dtype=self.compute_dtype,
                 weight_block_size=self.weight_block_size,
                 activation_quant_dtype=self.activation_dtype,
+                allow_narrow_n_blockwise=self.allow_narrow_n_blockwise,
             ),
             mesh=self.mesh,
             in_specs=in_specs,
