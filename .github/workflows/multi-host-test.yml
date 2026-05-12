@@ -1,0 +1,389 @@
+name: TPU Multi Test
+
+on:
+  push:
+    paths:
+      - "multi-host-test.yml"
+      - "test/srt/multi_host/**"
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: "GCP project ID. Defaults to vars.GCP_PROJECT_ID."
+        required: false
+        type: string
+      cluster_name:
+        description: "GKE cluster name. Defaults to vars.GKE_CLUSTER_NAME."
+        required: false
+        type: string
+      cluster_location:
+        description: "GKE cluster zone or region. Defaults to vars.GKE_CLUSTER_LOCATION."
+        required: false
+        type: string
+      workload_identity_provider:
+        description: "Workload Identity Provider. Defaults to vars.GCP_WORKLOAD_IDENTITY_PROVIDER."
+        required: false
+        type: string
+      node_pool:
+        description: "Existing GKE node pool to verify."
+        required: true
+        default: "v6e-4x4-on-demand-np"
+        type: string
+      namespace:
+        description: "Namespace for Kubernetes RBAC checks."
+        required: true
+        default: "default"
+        type: string
+      bucket_name:
+        description: "GCS bucket mounted at /models for model cache."
+        required: false
+        default: "model-storage-sglang"
+        type: string
+      service_account_name:
+        description: "Kubernetes service account for GCSFuse access."
+        required: false
+        default: "gcs-account"
+        type: string
+      repo_ref:
+        description: "Git ref to test. Defaults to current workflow SHA."
+        required: false
+        type: string
+
+concurrency:
+  group: gke-run-test-caces-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  run-test-caces:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      PROJECT_ID: ${{ inputs.project_id || vars.GCP_PROJECT_ID }}
+      CLUSTER_NAME: ${{ inputs.cluster_name || vars.GKE_CLUSTER_NAME }}
+      CLUSTER_LOCATION: ${{ inputs.cluster_location || vars.GKE_CLUSTER_LOCATION }}
+      WORKLOAD_IDENTITY_PROVIDER: ${{ inputs.workload_identity_provider || vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      NODE_POOL: ${{ inputs.node_pool || 'v6e-4x4-on-demand-np' }}
+      NAMESPACE: ${{ inputs.namespace || 'default' }}
+      BUCKET_NAME: ${{ inputs.bucket_name || 'model-storage-sglang' }}
+      K8S_SERVICE_ACCOUNT: ${{ inputs.service_account_name || 'gcs-account' }}
+      REPO_REF: ${{ inputs.repo_ref || github.sha }}
+      WORKLOAD_NAME: gke-run-test-caces-${{ github.run_id }}
+    steps:
+      - name: Validate smoke test configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          missing=0
+          for name in PROJECT_ID CLUSTER_NAME CLUSTER_LOCATION WORKLOAD_IDENTITY_PROVIDER NODE_POOL NAMESPACE BUCKET_NAME K8S_SERVICE_ACCOUNT; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::${name} is required. Set the workflow input or the matching repository variable."
+              missing=1
+            fi
+          done
+
+          if [[ "${missing}" -ne 0 ]]; then
+            exit 1
+          fi
+
+          echo "project=${PROJECT_ID}"
+          echo "cluster=${CLUSTER_NAME}"
+          echo "location=${CLUSTER_LOCATION}"
+          echo "node_pool=${NODE_POOL}"
+          echo "namespace=${NAMESPACE}"
+          echo "bucket=${BUCKET_NAME}"
+          echo "repo_ref=${REPO_REF}"
+
+      - name: Authenticate to Google Cloud
+        if: env.SERVICE_ACCOUNT == ''
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+
+      - name: Authenticate to Google Cloud with service account
+        if: env.SERVICE_ACCOUNT != ''
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: ">= 490.0.0"
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Verify GKE node pool through GCP API
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gcloud container node-pools describe "${NODE_POOL}" \
+            --project="${PROJECT_ID}" \
+            --cluster="${CLUSTER_NAME}" \
+            --location="${CLUSTER_LOCATION}" \
+            --format="table(name,status,config.machineType,autoscaling.enabled,autoscaling.minNodeCount,autoscaling.maxNodeCount)"
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          location: ${{ env.CLUSTER_LOCATION }}
+
+      - name: Verify Kubernetes access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl cluster-info
+          kubectl auth can-i get nodes
+          kubectl auth can-i create jobs --namespace "${NAMESPACE}"
+          kubectl auth can-i create services --namespace "${NAMESPACE}"
+          kubectl get nodes -l "cloud.google.com/gke-nodepool=${NODE_POOL}" -o wide
+
+      - name: Cleanup leftover workloads from prior runs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LEFTOVER_JOBS=$(kubectl get jobs --namespace "${NAMESPACE}" \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+            | grep '^gke-run-test-caces-' \
+            | grep -v "^${WORKLOAD_NAME}$" || true)
+
+          if [[ -n "${LEFTOVER_JOBS}" ]]; then
+            echo "Found leftover jobs from prior runs:"
+            printf '%s\n' "${LEFTOVER_JOBS}"
+            while IFS= read -r job; do
+              [[ -z "${job}" ]] && continue
+              kubectl delete job "${job}" --namespace "${NAMESPACE}" \
+                --ignore-not-found=true --wait=true --timeout=5m
+            done <<< "${LEFTOVER_JOBS}"
+          else
+            echo "No leftover jobs from prior runs."
+          fi
+
+          LEFTOVER_SVCS=$(kubectl get services --namespace "${NAMESPACE}" \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+            | grep '^gke-run-test-caces-.*-headless$' \
+            | grep -v "^${WORKLOAD_NAME}-headless$" || true)
+
+          if [[ -n "${LEFTOVER_SVCS}" ]]; then
+            echo "Found leftover headless services from prior runs:"
+            printf '%s\n' "${LEFTOVER_SVCS}"
+            while IFS= read -r svc; do
+              [[ -z "${svc}" ]] && continue
+              kubectl delete service "${svc}" --namespace "${NAMESPACE}" --ignore-not-found=true
+            done <<< "${LEFTOVER_SVCS}"
+          else
+            echo "No leftover headless services from prior runs."
+          fi
+
+      - name: Run multi-host test cases
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          HEADLESS_SERVICE_NAME="${WORKLOAD_NAME}-headless"
+          TPU_PROCESS_ADDRESSES="${WORKLOAD_NAME}-0.${HEADLESS_SERVICE_NAME}:8471,${WORKLOAD_NAME}-1.${HEADLESS_SERVICE_NAME}:8471,${WORKLOAD_NAME}-2.${HEADLESS_SERVICE_NAME}:8471,${WORKLOAD_NAME}-3.${HEADLESS_SERVICE_NAME}:8471"
+          TPU_WORKER_HOSTNAMES="${WORKLOAD_NAME}-0.${HEADLESS_SERVICE_NAME},${WORKLOAD_NAME}-1.${HEADLESS_SERVICE_NAME},${WORKLOAD_NAME}-2.${HEADLESS_SERVICE_NAME},${WORKLOAD_NAME}-3.${HEADLESS_SERVICE_NAME}"
+
+          cat > /tmp/tpu-smoke.yaml <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${HEADLESS_SERVICE_NAME}
+            namespace: ${NAMESPACE}
+          spec:
+            clusterIP: None
+            selector:
+              job-name: ${WORKLOAD_NAME}
+            ports:
+            - name: http
+              port: 30000
+            - name: dist-init
+              port: 10011
+            - name: tpu-process
+              port: 8471
+            - name: control
+              port: 18080
+          ---
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${WORKLOAD_NAME}
+            namespace: ${NAMESPACE}
+          spec:
+            completionMode: Indexed
+            parallelism: 4
+            completions: 4
+            backoffLimit: 0
+            activeDeadlineSeconds: 7200
+            ttlSecondsAfterFinished: 3600
+            template:
+              metadata:
+                annotations:
+                  gke-gcsfuse/volumes: "true"
+              spec:
+                subdomain: ${HEADLESS_SERVICE_NAME}
+                restartPolicy: Never
+                serviceAccountName: ${K8S_SERVICE_ACCOUNT}
+                nodeSelector:
+                  cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+                  cloud.google.com/gke-tpu-topology: 4x4
+                  cloud.google.com/gke-nodepool: ${NODE_POOL}
+                tolerations:
+                - key: google.com/tpu
+                  operator: Equal
+                  value: present
+                  effect: NoSchedule
+                containers:
+                - name: run-test-caces
+                  image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+                  command:
+                  - /bin/bash
+                  - -lc
+                  - |
+                    set -euxo pipefail
+                    git clone https://github.com/sgl-project/sglang-jax.git /tmp/sglang-jax
+                    cd /tmp/sglang-jax
+                    git fetch origin "${REPO_REF}" || true
+                    git checkout "${REPO_REF}"
+                    python3 -m pip install --upgrade pip
+                    python3 -m pip install -e "python[all]"
+                    python3 -m pip install evalscope
+                    python3 test/srt/multi_host/run_suite.py
+                  env:
+                  - name: JOB_COMPLETION_INDEX
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
+                  - name: TPU_WORKER_ID
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
+                  - name: TPU_PROCESS_PORT
+                    value: "8471"
+                  - name: TPU_PROCESS_ADDRESSES
+                    value: "${TPU_PROCESS_ADDRESSES}"
+                  - name: TPU_WORKER_HOSTNAMES
+                    value: "${TPU_WORKER_HOSTNAMES}"
+                  - name: WORKLOAD_NAME
+                    value: "${WORKLOAD_NAME}"
+                  - name: HEADLESS_SERVICE_NAME
+                    value: "${HEADLESS_SERVICE_NAME}"
+                  - name: NNODES
+                    value: "4"
+                  - name: CI_MOUNT_ROOT
+                    value: "/models"
+                  - name: SGLANG_JAX_MODEL_CACHE
+                    value: "/models/model_scope"
+                  - name: JAX_COMPILATION_CACHE_DIR
+                    value: "/tmp/jax_compilation_cache"
+                  - name: HF_HUB_DOWNLOAD_TIMEOUT
+                    value: "600"
+                  ports:
+                  - containerPort: 30000
+                    name: http
+                  - containerPort: 10011
+                    name: dist-init
+                  - containerPort: 8471
+                    name: tpu-process
+                  - containerPort: 18080
+                    name: control
+                  resources:
+                    requests:
+                      google.com/tpu: "4"
+                    limits:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                  - mountPath: /models
+                    name: model-storage
+                    readOnly: true
+                  - mountPath: /dev/shm
+                    name: dev-shm
+                  - mountPath: /tmp/jax_compilation_cache
+                    name: jax-cache
+                volumes:
+                - name: dev-shm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 64Gi
+                - name: jax-cache
+                  emptyDir: {}
+                - name: gke-gcsfuse-cache
+                  emptyDir: {}
+                - name: model-storage
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: ${BUCKET_NAME}
+                      mountOptions: implicit-dirs,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:-1,metadata-cache:type-cache-max-size-mb:-1,file-cache:max-size-mb:0,file-system:kernel-list-cache-ttl-secs:-1,read_ahead_kb=1024
+          EOF
+
+          kubectl apply -f /tmp/tpu-smoke.yaml
+          kubectl get job "${WORKLOAD_NAME}" --namespace "${NAMESPACE}" -o wide
+          kubectl wait --for=condition=Ready pod \
+            --selector="job-name=${WORKLOAD_NAME}" \
+            --namespace "${NAMESPACE}" \
+            --timeout=45m
+          kubectl logs --selector="job-name=${WORKLOAD_NAME}" \
+            --namespace "${NAMESPACE}" \
+            --all-containers=true \
+            --prefix=true \
+            --follow=true \
+            --max-log-requests=8
+
+          # Wait for Job to reach a terminal state (Complete or Failed). Plain
+          # `kubectl wait --for=condition=complete` only matches success and
+          # would block until --timeout even if the Job has already Failed.
+          deadline=$(($(date +%s) + 5400))
+          while [[ $(date +%s) -lt $deadline ]]; do
+            conds=$(kubectl get job "${WORKLOAD_NAME}" --namespace "${NAMESPACE}" \
+              -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}|{.status.conditions[?(@.type=="Failed")].status}')
+            case "${conds}" in
+              True\|*)
+                echo "Job completed successfully"
+                exit 0
+                ;;
+              \|True)
+                echo "Job failed (condition=Failed). See diagnose step for details."
+                exit 1
+                ;;
+            esac
+            sleep 10
+          done
+          echo "Timed out waiting for Job to reach a terminal state"
+          exit 1
+
+      - name: Diagnose TPU workload failure
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl get pods --namespace "${NAMESPACE}" --selector="job-name=${WORKLOAD_NAME}" -o wide || true
+          kubectl describe pods --namespace "${NAMESPACE}" --selector="job-name=${WORKLOAD_NAME}" || true
+          kubectl describe job "${WORKLOAD_NAME}" --namespace "${NAMESPACE}" || true
+          kubectl get events --namespace "${NAMESPACE}" --sort-by='.lastTimestamp' \
+            --field-selector="involvedObject.name=${WORKLOAD_NAME}" || true
+          kubectl get events --namespace "${NAMESPACE}" --sort-by='.lastTimestamp' \
+            | grep -E "${WORKLOAD_NAME}|Evicted|DiskPressure|MemoryPressure|OOMKill|FailedScheduling" || true
+          kubectl logs --namespace "${NAMESPACE}" --selector="job-name=${WORKLOAD_NAME}" --all-containers=true --prefix=true || true
+
+      - name: Cleanup TPU workload smoke test
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl delete job "${WORKLOAD_NAME}" --namespace "${NAMESPACE}" --ignore-not-found=true
+          kubectl delete service "${WORKLOAD_NAME}-headless" --namespace "${NAMESPACE}" --ignore-not-found=true

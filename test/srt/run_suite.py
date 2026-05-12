@@ -186,6 +186,13 @@ def run_unittest_files(files: list[TestFile], timeout_per_file: float):
 
 
 suites = {
+    "perf-test-models-tpu-v6e-4x4": [
+        TestFile(
+            "test_large_model_gke.py",
+            estimated_time=600,
+            test_methods=["TestModelAccuracy.test_deepseek_v2_lite_16b"],
+        )
+    ],
     "nightly-test-accuracy-text-models-tpu-v6e-1": [
         TestFile(
             "nightly-test/test_accuracy.py",

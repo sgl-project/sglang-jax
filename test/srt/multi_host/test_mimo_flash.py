@@ -1,0 +1,84 @@
+from multi_host_suite import (
+    AccuracyCase,
+    ModelRun,
+    ModelRunConfig,
+    MultiHostSuite,
+    PerfCase,
+)
+
+
+def get_suites() -> list[MultiHostSuite]:
+    return [
+        MultiHostSuite(
+            name="mimo-flash-pref-test",
+            target="v6e-4x4",
+            runs=[
+                ModelRun(
+                    name="mimo_flash-tp16-dp4-ep16",
+                    model=ModelRunConfig(
+                        model_path="/models/MiMo-V2-Flash",
+                        tp_size=16,
+                        dp_size=4,
+                        ep_size=16,
+                        port=30271,
+                        server_args=(
+                            "--trust-remote-code",
+                            "--moe-backend",
+                            "fused",
+                            "--page-size",
+                            "256",
+                            "--context-length",
+                            "262144",
+                            "--chunked-prefill-size",
+                            "2048",
+                            "--dtype",
+                            "bfloat16",
+                            "--mem-fraction-static",
+                            "0.90",  # 0.95 oom
+                            "--swa-full-tokens-ratio",
+                            "0.2",
+                            "--skip-server-warmup",
+                            "--max-running-requests",
+                            "128",
+                            "--attention-backend",
+                            "fa",
+                            "--dp-schedule-policy",
+                            "round_robin",
+                        ),
+                    ),
+                    cases=[
+                        # PerfCase(
+                        #     name="mimo-flash-benchmark",
+                        #     input_len=16384,
+                        #     output_len=1024,
+                        #     num_prompts=256,
+                        #     max_concurrency=64,
+                        #     request_rate=100,
+                        #     seed=12345,
+                        #     flush_cache=True,
+                        # ),
+                        AccuracyCase(
+                            name="mimo-flash-gsm8k",
+                            dataset="gsm8k",
+                            model_id="XiaomiMiMo/MiMo-V2-Flash",
+                            eval_batch_size=32,
+                            generation_config={"temperature": 0.8, "top_p": 0.95},
+                        ),
+                        AccuracyCase(
+                            name="mimo-flash-aime25",
+                            dataset="aime25",
+                            model_id="XiaomiMiMo/MiMo-V2-Flash",
+                            eval_batch_size=16,
+                            timeout=6000000,
+                            generation_config={
+                                "temperature": 1,
+                                "top_p": 0.95,
+                                "max_tokens": 131072,
+                                "chat_template_kwargs": {"enable_thinking": True},
+                            },
+                        ),
+                    ],
+                )
+            ],
+        )
+    ]
