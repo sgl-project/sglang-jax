@@ -295,7 +295,7 @@ def build_remote_benchmark(
 
 
 def run_benchmark(args):
-    from jax._src.mesh_utils import create_device_mesh
+    from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
     sizes = args.sizes
     hidden_size = args.hidden_size
