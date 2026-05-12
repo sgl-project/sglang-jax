@@ -1,0 +1,152 @@
+name: GKE Connectivity Smoke
+
+on:
+  push:
+    paths:
+      - ".github/workflows/gke-connectivity-smoke.yml"
+  pull_request:
+    paths:
+      - ".github/workflows/gke-connectivity-smoke.yml"
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: "GCP project ID. Defaults to vars.GCP_PROJECT_ID."
+        required: false
+        type: string
+      cluster_name:
+        description: "GKE cluster name. Defaults to vars.GKE_CLUSTER_NAME."
+        required: false
+        type: string
+      cluster_location:
+        description: "GKE cluster zone or region. Defaults to vars.GKE_CLUSTER_LOCATION."
+        required: false
+        type: string
+      workload_identity_provider:
+        description: "Workload Identity Provider. Defaults to vars.GCP_WORKLOAD_IDENTITY_PROVIDER."
+        required: false
+        type: string
+      node_pool:
+        description: "Existing GKE node pool to verify."
+        required: true
+        default: "v6e-16-chips-performance-accuracy-tests"
+        type: string
+      namespace:
+        description: "Namespace for Kubernetes RBAC checks."
+        required: true
+        default: "default"
+        type: string
+
+concurrency:
+  group: gke-connectivity-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  connectivity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PROJECT_ID: ${{ inputs.project_id || vars.GCP_PROJECT_ID }}
+      CLUSTER_NAME: ${{ inputs.cluster_name || vars.GKE_CLUSTER_NAME }}
+      CLUSTER_LOCATION: ${{ inputs.cluster_location || vars.GKE_CLUSTER_LOCATION }}
+      WORKLOAD_IDENTITY_PROVIDER: ${{ inputs.workload_identity_provider || vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      NODE_POOL: ${{ inputs.node_pool || 'v6e-16-chips-performance-accuracy-tests' }}
+      NAMESPACE: ${{ inputs.namespace || 'default' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Inspect repository variable visibility
+        shell: bash
+        env:
+          VAR_GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          VAR_GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+          VAR_GKE_CLUSTER_LOCATION: ${{ vars.GKE_CLUSTER_LOCATION }}
+          VAR_GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          VAR_GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+
+          for name in VAR_GCP_PROJECT_ID VAR_GKE_CLUSTER_NAME VAR_GKE_CLUSTER_LOCATION VAR_GCP_WORKLOAD_IDENTITY_PROVIDER VAR_GCP_SERVICE_ACCOUNT; do
+            if [[ -n "${!name}" ]]; then
+              echo "${name}=SET"
+            else
+              echo "${name}=EMPTY"
+            fi
+          done
+
+      - name: Validate smoke test configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          missing=0
+          for name in PROJECT_ID CLUSTER_NAME CLUSTER_LOCATION WORKLOAD_IDENTITY_PROVIDER NODE_POOL NAMESPACE; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::${name} is required. Set the workflow input or the matching repository variable."
+              missing=1
+            fi
+          done
+
+          if [[ "${missing}" -ne 0 ]]; then
+            exit 1
+          fi
+
+          echo "project=${PROJECT_ID}"
+          echo "cluster=${CLUSTER_NAME}"
+          echo "location=${CLUSTER_LOCATION}"
+          echo "node_pool=${NODE_POOL}"
+          echo "namespace=${NAMESPACE}"
+
+      - name: Authenticate to Google Cloud
+        if: env.SERVICE_ACCOUNT == ''
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+
+      - name: Authenticate to Google Cloud with service account
+        if: env.SERVICE_ACCOUNT != ''
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: ">= 490.0.0"
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Verify GKE node pool through GCP API
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gcloud container node-pools describe "${NODE_POOL}" \
+            --project="${PROJECT_ID}" \
+            --cluster="${CLUSTER_NAME}" \
+            --location="${CLUSTER_LOCATION}" \
+            --format="table(name,status,config.machineType,autoscaling.enabled,autoscaling.minNodeCount,autoscaling.maxNodeCount)"
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          location: ${{ env.CLUSTER_LOCATION }}
+
+      - name: Verify Kubernetes access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl cluster-info
+          kubectl auth can-i get nodes
+          kubectl auth can-i create jobs --namespace "${NAMESPACE}"
+          kubectl get nodes -l "cloud.google.com/gke-nodepool=${NODE_POOL}" -o wide
