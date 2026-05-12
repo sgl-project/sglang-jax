@@ -543,11 +543,46 @@ class BailingMoELinearDecoderLayer(nnx.Module):
                 correction_bias,
                 dispatch_info=dispatch_info,
             )
+            maybe_dump_jax_array(
+                router_logits,
+                component="moe_detail",
+                name="router_logits",
+                layer_id=self.layer_id,
+                forward_mode=forward_batch.forward_mode,
+            )
+            maybe_dump_jax_array(
+                topk_ids,
+                component="moe_detail",
+                name="topk_ids",
+                layer_id=self.layer_id,
+                forward_mode=forward_batch.forward_mode,
+            )
+            maybe_dump_jax_array(
+                topk_weights,
+                component="moe_detail",
+                name="topk_weights",
+                layer_id=self.layer_id,
+                forward_mode=forward_batch.forward_mode,
+            )
             if self.use_fused:
                 token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
                 topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
             hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+            maybe_dump_jax_array(
+                hidden_states,
+                component="moe_detail",
+                name="routed_output",
+                layer_id=self.layer_id,
+                forward_mode=forward_batch.forward_mode,
+            )
             if shared_output is not None:
+                maybe_dump_jax_array(
+                    shared_output,
+                    component="moe_detail",
+                    name="shared_expert_output",
+                    layer_id=self.layer_id,
+                    forward_mode=forward_batch.forward_mode,
+                )
                 hidden_states = hidden_states + shared_output
         else:
             hidden_states = self.mlp(hidden_states)
@@ -557,6 +592,20 @@ class BailingMoELinearDecoderLayer(nnx.Module):
             hidden_states,
             component="mlp",
             name="output",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
+        maybe_dump_jax_array(
+            residual,
+            component="decoder_layer",
+            name="residual_post_mlp",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
+        maybe_dump_jax_array(
+            hidden_states,
+            component="decoder_layer",
+            name="hidden_states_post_mlp",
             layer_id=self.layer_id,
             forward_mode=forward_batch.forward_mode,
         )
