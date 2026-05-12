@@ -33,6 +33,7 @@ from sgl_jax.srt.layers.radix_lightning_attention import RadixLightningAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention, DeepseekV3MLP
+from sgl_jax.srt.utils.debug_utils import maybe_dump_jax_array
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -485,6 +486,13 @@ class BailingMoELinearDecoderLayer(nnx.Module):
                 forward_batch=forward_batch,
                 recurrent_state_pool=recurrent_state_pool,
             )
+            maybe_dump_jax_array(
+                hidden_states,
+                component="gla_attention",
+                name="output",
+                layer_id=self.layer_id,
+                forward_mode=forward_batch.forward_mode,
+            )
             kv_fused = None
         else:
             hidden_states, kv_fused = self.self_attn(
@@ -492,6 +500,13 @@ class BailingMoELinearDecoderLayer(nnx.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
                 token_to_kv_pool=token_to_kv_pool,
+            )
+            maybe_dump_jax_array(
+                hidden_states,
+                component="mla_attention" if self.use_mla else "gqa_attention",
+                name="output",
+                layer_id=self.layer_id,
+                forward_mode=forward_batch.forward_mode,
             )
             pool_update = None
 
@@ -517,6 +532,14 @@ class BailingMoELinearDecoderLayer(nnx.Module):
         else:
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
+
+        maybe_dump_jax_array(
+            hidden_states,
+            component="mlp",
+            name="output",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
 
         return (
             hidden_states,
@@ -583,7 +606,19 @@ class BailingMoELinearModel(nnx.Module):
         forward_batch: ForwardBatch,
         memory_pools: MemoryPools,
     ):
+        maybe_dump_jax_array(
+            forward_batch.input_ids,
+            component="embed",
+            name="input_ids",
+            forward_mode=forward_batch.forward_mode,
+        )
         hidden_states = self.embed_tokens(forward_batch.input_ids)
+        maybe_dump_jax_array(
+            hidden_states,
+            component="embed",
+            name="hidden_states",
+            forward_mode=forward_batch.forward_mode,
+        )
         residual = None
         layers_kv_fused = []
         layers_topk_ids = []
