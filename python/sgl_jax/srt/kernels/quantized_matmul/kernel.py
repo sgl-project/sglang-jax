@@ -69,8 +69,7 @@ def xla_quantized_matmul_local(
         # achieve GSM8K 0.489 vs 0.938 for per-channel). Either fix the blockwise
         # kernel for out_dim <= block_size_out, or fall back to per-channel for those
         # layers. Models known to be unaffected (e.g. DeepSeek V3/R1) can set
-        # allow_narrow_n_blockwise=True to bypass this guard. The guard on the quant config be
-        # temporary
+        # allow_narrow_n_blockwise=True to bypass this guard. The guard on the quant config is temporary
         if not allow_narrow_n_blockwise and not should_use_blockwise_kernel(
             out_dim=int(out_dim),
             block_size_out=block_size_in,
