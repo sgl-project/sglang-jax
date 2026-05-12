@@ -82,7 +82,7 @@ def xla_quantized_matmul_local(
         ):
             raise RuntimeError(
                 f"Block-wise kernel does not support out_dim={out_dim} with "
-                f"block_size_out={block_size_in} (known to cause accuracy collapse). "
+                f"block_size_out={block_size_out} (known to cause accuracy collapse). "
                 "Set allow_narrow_n_blockwise=True in your quantization config to override."
             )
         # w_scale is already in kernel-ready layout [in_blocks, 1, n_out].
