@@ -476,11 +476,11 @@ suites = {
         # GDN (gated DeltaNet) — CPU-only unit tests; each pins
         # JAX_PLATFORMS=cpu + 8 fake devices in its header, so they run on
         # any TPU runner without consuming TPU chips.
-        TestFile("test/srt/test_gated_delta.py", 1),
-        TestFile("test/srt/test_gdn_backend.py", 1),
-        TestFile("test/srt/test_gdn_metadata.py", 1),
-        TestFile("test/srt/test_qwen3_5_gated_delta_net.py", 1),
-        TestFile("test/srt/test_ragged_gated_delta_rule_ref.py", 1),
+        TestFile("python/sgl_jax/test/kernels/gdn/test_gated_delta.py", 1),
+        TestFile("python/sgl_jax/test/kernels/gdn/test_ragged_gated_delta_rule_ref.py", 1),
+        TestFile("python/sgl_jax/test/layers/test_gdn_backend.py", 1),
+        TestFile("python/sgl_jax/test/layers/test_merged_column_parallel_linear.py", 1),
+        TestFile("python/sgl_jax/test/layers/test_qwen3_5_gated_delta_net.py", 1),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 1),

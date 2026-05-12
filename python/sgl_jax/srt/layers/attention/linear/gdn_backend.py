@@ -1,9 +1,13 @@
 """Gated-DeltaNet attention backend.
 
-Owns the conv1d weight + delta-rule params (``A_log``, ``dt_bias``); the
-parent layer hands in ``mixed_qkv`` (already a per-device block-concat
-``[Q | K | V]`` of size ``conv_dim`` channels) plus ``b``, ``a``, and the
-full per-layer ``conv_state`` / ``recurrent_state`` tables.
+Inherits :class:`LinearRecurrentAttnBackend` for shared metadata
+(``cu_q_lens`` / ``recurrent_indices`` / ``has_initial_state``) and
+pytree boilerplate. Owns the (fused) conv1d weight + delta-rule params
+(``A_log``, ``dt_bias``); the parent layer hands in ``mixed_qkv``
+(a per-device block-concat ``[Q | K | V]`` of size ``conv_dim``
+channels) plus ``b``, ``a``, and a :class:`RecurrentStatePool`. State
+(conv + recurrent) is fetched from the pool internally via the base
+class's :meth:`get_layer_cache` helper.
 
 Sharding pattern: the conv + recurrence pipeline runs inside
 :func:`jax.shard_map` with explicit ``in_specs`` / ``out_specs``, with
@@ -21,11 +25,14 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.layers.attention.linear.gated_delta import (
+from sgl_jax.srt.kernels.gdn import (
     decode_gated_delta_rule_ref,
     jax_causal_conv1d_prefill,
     jax_causal_conv1d_update,
     ragged_gated_delta_rule_ref,
+)
+from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
+    LinearRecurrentAttnBackend,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -40,12 +47,14 @@ def _mesh_tp_size(mesh: jax.sharding.Mesh) -> int:
     return int(shape["tensor"])
 
 
-class GDNAttnBackend(nnx.Module):
+class GDNAttnBackend(LinearRecurrentAttnBackend):
     """Gated-DeltaNet attention backend.
 
     Owns the conv1d weight + delta-rule params; dispatches conv1d + ragged
     delta-rule (extend) or single-step delta-rule (decode) under
-    ``jax.shard_map``.
+    ``jax.shard_map``. Reads ``cu_q_lens`` / ``recurrent_indices`` /
+    ``has_initial_state`` from ``self.forward_metadata``, populated by
+    the base class's :meth:`get_forward_metadata` before each forward.
     """
 
     def __init__(
@@ -58,12 +67,12 @@ class GDNAttnBackend(nnx.Module):
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
+        super().__init__(mesh=mesh)
         self.num_k_heads = num_k_heads
         self.num_v_heads = num_v_heads
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
         self.conv_kernel_size = conv_kernel_size
-        self.mesh = mesh
 
         self.key_dim = num_k_heads * head_k_dim
         self.value_dim = num_v_heads * head_v_dim
@@ -148,18 +157,28 @@ class GDNAttnBackend(nnx.Module):
         self,
         forward_batch: ForwardBatch,
         mixed_qkv: jax.Array,  # [T, conv_dim]                  (None, "tensor")
-        conv_state_in: jax.Array,  # [num_blocks, conv_dim, K-1]    (None, "tensor", None)
-        recurrent_state_in: jax.Array,  # [num_blocks, n_v, d_k, d_v]    (None, "tensor", None, None)
         b: jax.Array,  # [T, n_v]                       (None, "tensor")
         a: jax.Array,  # [T, n_v]                       (None, "tensor")
+        recurrent_state_pool,
+        layer_id: int,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Dispatch by ``forward_batch.forward_mode``.
+
+        Fetches per-layer ``(recurrent_state, conv_state)`` from the pool
+        via the base class's :meth:`get_layer_cache`. ``conv_state`` is the
+        first (only) entry of the per-layer conv-state list — GDN uses a
+        single fused conv1d, so it needs exactly one conv buffer per layer
+        (vs. KDA, which keeps q/k/v conv states as three list entries).
+
+        Returns ``(core_attn_out, new_conv, new_rec)`` per-request, shaped
+        for ``RecurrentStatePool.write_layer``.
+        """
+        recurrent_state, conv_states = self.get_layer_cache(recurrent_state_pool, layer_id)
+        conv_state = conv_states[0]
+
         if forward_batch.forward_mode.is_decode():
-            return self.forward_decode(
-                forward_batch, mixed_qkv, conv_state_in, recurrent_state_in, b, a
-            )
-        return self.forward_extend(
-            forward_batch, mixed_qkv, conv_state_in, recurrent_state_in, b, a
-        )
+            return self.forward_decode(mixed_qkv, conv_state, recurrent_state, b, a)
+        return self.forward_extend(mixed_qkv, conv_state, recurrent_state, b, a)
 
     # ------------------------------------------------------------------
     # Decode fast path
@@ -167,7 +186,6 @@ class GDNAttnBackend(nnx.Module):
 
     def forward_decode(
         self,
-        forward_batch: ForwardBatch,
         mixed_qkv: jax.Array,
         conv_state_in: jax.Array,
         recurrent_state_in: jax.Array,
@@ -176,7 +194,7 @@ class GDNAttnBackend(nnx.Module):
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """One token per request — single conv1d update + parallel single
         recurrence step across the batch, all inside a shard_map."""
-        state_indices = forward_batch.mamba_cache_indices
+        state_indices = self.forward_metadata.recurrent_indices
         tp = _mesh_tp_size(self.mesh)
         n_kq_tp = self.num_k_heads // tp
         n_v_tp = self.num_v_heads // tp
@@ -255,7 +273,6 @@ class GDNAttnBackend(nnx.Module):
 
     def forward_extend(
         self,
-        forward_batch: ForwardBatch,
         mixed_qkv: jax.Array,
         conv_state_in: jax.Array,
         recurrent_state_in: jax.Array,
@@ -263,9 +280,10 @@ class GDNAttnBackend(nnx.Module):
         a: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Packed ragged batch through ``ragged_gated_delta_rule_ref``."""
-        cu_seqlens = forward_batch.gdn_metadata.cu_seqlens
-        state_indices = forward_batch.mamba_cache_indices
-        extend_prefix_lens = forward_batch.extend_prefix_lens
+        meta = self.forward_metadata
+        cu_seqlens = meta.cu_q_lens
+        state_indices = meta.recurrent_indices
+        has_initial_state = meta.has_initial_state
         tp = _mesh_tp_size(self.mesh)
         n_kq_tp = self.num_k_heads // tp
         n_v_tp = self.num_v_heads // tp
@@ -283,7 +301,7 @@ class GDNAttnBackend(nnx.Module):
             a_l,
             cu_seqlens_l,
             state_indices_l,
-            prefix_lens_l,
+            has_initial_state_l,
         ):
             # jax_causal_conv1d_prefill operates on [D, T] (channel-first).
             conv_out_dt, new_conv = jax_causal_conv1d_prefill(
@@ -296,7 +314,6 @@ class GDNAttnBackend(nnx.Module):
                 activation="silu",
             )
             conv_out = conv_out_dt.T  # [T, D]
-            has_initial_state = prefix_lens_l > 0
             new_rec, out = ragged_gated_delta_rule_ref(
                 conv_out,
                 b_l,
@@ -306,7 +323,7 @@ class GDNAttnBackend(nnx.Module):
                 dt_bias_l,
                 cu_seqlens=cu_seqlens_l,
                 state_indices=state_indices_l,
-                has_initial_state=has_initial_state,
+                has_initial_state=has_initial_state_l,
                 n_kq=n_kq_tp,
                 n_v=n_v_tp,
                 d_k=d_k,
@@ -328,7 +345,7 @@ class GDNAttnBackend(nnx.Module):
                 P(None, "tensor"),  # a
                 P(),  # cu_seqlens (replicated)
                 P(),  # state_indices (replicated)
-                P(),  # extend_prefix_lens (replicated)
+                P(),  # has_initial_state (replicated)
             ),
             out_specs=(
                 P(None, "tensor", None),  # out [T, n_v, d_v]
@@ -347,5 +364,5 @@ class GDNAttnBackend(nnx.Module):
             a,
             cu_seqlens,
             state_indices,
-            extend_prefix_lens,
+            has_initial_state,
         )

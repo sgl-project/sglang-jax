@@ -185,28 +185,26 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         self,
         hidden_states: jax.Array,  # [T, hidden]
         forward_batch: ForwardBatch,
-        conv_state_in: jax.Array,
-        recurrent_state_in: jax.Array,
+        recurrent_state_pool,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Returns ``(output [T, hidden], new_conv [B, conv_dim, K-1], new_rec [B, H, K, V])``.
 
-        ``conv_state_in`` and ``recurrent_state_in`` are the full per-layer
-        state tables; the backend gathers per-request state internally and
+        The backend fetches this layer's ``(recurrent_state, conv_state)``
+        from ``recurrent_state_pool`` via its base class's
+        :meth:`get_layer_cache` helper (keyed on ``self.layer_id``) and
         returns per-request new states ready for
         ``RecurrentStatePool.write_layer``.
 
-        Donation contract: ``conv_state_in`` and ``recurrent_state_in`` are
-        not read by this layer after the call returns — the backend gathers
-        per-request state up front and then only emits the new per-request
-        slices. The outer jitted forward step should mark the *pool buffers*
-        carrying these tensors as ``donate_argnames=`` (or
-        ``donate_argnums=``) on its ``jax.jit``, so XLA can reuse their HBM
-        for the next step's pool. Per-layer state copies across dozens of
-        GDN layers are the dominant per-step HBM traffic on large models;
-        without donation each layer pays a full pool copy. The caller must
-        also guarantee it does not read the donated buffers after the
-        forward step returns, or JAX will raise
-        ``Donated buffer has been deleted``.
+        Donation contract: ``recurrent_state_pool`` is read inside the
+        backend and then only the per-request new slices are emitted. The
+        outer jitted forward step should mark the pool buffers as
+        ``donate_argnames=`` (or ``donate_argnums=``) on its ``jax.jit``
+        so XLA can reuse their HBM for the next step's pool. Per-layer
+        state copies across dozens of GDN layers are the dominant per-step
+        HBM traffic on large models; without donation each layer pays a
+        full pool copy. The caller must guarantee it does not read the
+        donated pool buffers after the forward step returns, or JAX will
+        raise ``Donated buffer has been deleted``.
         """
         T = hidden_states.shape[0]
 
@@ -227,10 +225,10 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         core_attn_out, new_conv, new_rec = self.attention(
             forward_batch,
             mixed_qkv,
-            conv_state_in,
-            recurrent_state_in,
             b,
             a,
+            recurrent_state_pool,
+            self.layer_id,
         )
         # core_attn_out: [T, num_v_heads, head_v_dim]
 

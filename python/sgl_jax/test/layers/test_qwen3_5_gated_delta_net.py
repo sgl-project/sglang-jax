@@ -28,6 +28,9 @@ from jax.experimental import mesh_utils
 from jax.sharding import AxisType, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
+    LinearRecurrentAttnBackendMetadata,
+)
 from sgl_jax.srt.layers.attention.linear.qwen3_5_gated_delta_net import (
     Qwen3_5GatedDeltaNet,
 )
@@ -66,17 +69,27 @@ class _FakeForwardMode:
         return self._decode
 
 
-class _FakeGDNMetadata:
-    def __init__(self, cu_seqlens):
-        self.cu_seqlens = cu_seqlens
-
-
 class _FakeForwardBatch:
-    def __init__(self, is_decode, mamba_cache_indices, cu_seqlens=None, extend_prefix_lens=None):
+    """Minimal forward batch — the layer only reads forward_mode here.
+
+    All ragged-batch info now lives on ``backend.forward_metadata``; the
+    test sets that directly.
+    """
+
+    def __init__(self, is_decode: bool):
         self.forward_mode = _FakeForwardMode(is_decode)
-        self.mamba_cache_indices = mamba_cache_indices
-        self.gdn_metadata = _FakeGDNMetadata(cu_seqlens)
-        self.extend_prefix_lens = extend_prefix_lens
+
+
+class _FakePool:
+    """Stand-in for :class:`RecurrentStatePool` exposing only
+    ``get_linear_recurrent_layer_cache``."""
+
+    def __init__(self, recurrent_buffer, conv_buffer):
+        self._rec = recurrent_buffer
+        self._conv_list = [conv_buffer]
+
+    def get_linear_recurrent_layer_cache(self, layer_id: int):
+        return self._rec, self._conv_list
 
 
 # ---------------------------------------------------------------------------
@@ -170,13 +183,13 @@ class Qwen3_5GatedDeltaNetEndToEndTest(unittest.TestCase):
             if is_decode:
                 T = 3
                 B = 3
-                cu_seqlens = None
-                extend_prefix_lens = None
+                cu_q_lens = None
+                has_initial_state = None
             else:
                 T = 5
                 B = 2
-                cu_seqlens = jnp.array([0, 3, 5], dtype=jnp.int32)
-                extend_prefix_lens = jnp.array([0, 0], dtype=jnp.int32)
+                cu_q_lens = jnp.array([0, 3, 5], dtype=jnp.int32)
+                has_initial_state = jnp.array([False, False], dtype=jnp.bool_)
 
             hidden = (
                 jax.random.normal(jax.random.key(1), (T, cfg.hidden_size), dtype=jnp.bfloat16) * 0.3
@@ -196,13 +209,14 @@ class Qwen3_5GatedDeltaNetEndToEndTest(unittest.TestCase):
                 dtype=jnp.float32,
                 out_sharding=NamedSharding(mesh, P(None, "tensor", None, None)),
             )
-            fb = _FakeForwardBatch(
-                is_decode=is_decode,
-                mamba_cache_indices=jnp.arange(1, B + 1, dtype=jnp.int32),
-                cu_seqlens=cu_seqlens,
-                extend_prefix_lens=extend_prefix_lens,
+            pool = _FakePool(recurrent_buffer=rec_state, conv_buffer=conv_state)
+            layer.attention.forward_metadata = LinearRecurrentAttnBackendMetadata(
+                cu_q_lens=cu_q_lens,
+                recurrent_indices=jnp.arange(1, B + 1, dtype=jnp.int32),
+                has_initial_state=has_initial_state,
             )
-            return layer(hidden, fb, conv_state, rec_state), B, T, cfg, conv_dim
+            fb = _FakeForwardBatch(is_decode=is_decode)
+            return layer(hidden, fb, pool), B, T, cfg, conv_dim
 
     def test_decode_path(self):
         (out, new_conv, new_rec), B, T, cfg, conv_dim = self._run_layer(is_decode=True)

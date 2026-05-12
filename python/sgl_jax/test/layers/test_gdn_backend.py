@@ -5,11 +5,12 @@ The kernels themselves are covered in ``test_gated_delta.py`` and
 glue: ``__init__`` parameter ownership, decode/extend dispatch, and the
 ``shard_map``-wrapped conv + recurrence pipeline.
 
-The backend takes pre-projected ``q``, ``k``, ``v`` (each already sharded
-on its head axis), forms ``mixed_qkv`` locally inside ``shard_map``,
-runs the conv1d + delta-rule, and returns per-request
-``(core_attn_out, new_conv, new_rec)`` shaped for
-``RecurrentStatePool.write_layer``.
+The backend inherits ``LinearRecurrentAttnBackend`` and reads
+``cu_q_lens`` / ``recurrent_indices`` / ``has_initial_state`` from
+``self.forward_metadata`` (normally populated by
+``get_forward_metadata(batch)`` before the forward; we set it directly
+here for unit testing). State is fetched from a
+``recurrent_state_pool``-shaped object via ``get_layer_cache``.
 
 Run with:
     JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=8 \\
@@ -26,12 +27,14 @@ os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import nnx
 from jax.experimental import mesh_utils
 from jax.sharding import AxisType, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
+    LinearRecurrentAttnBackendMetadata,
+)
 from sgl_jax.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 
 # ---------------------------------------------------------------------------
@@ -76,23 +79,40 @@ class _FakeForwardMode:
         return self._decode
 
 
-class _FakeGDNMetadata:
-    def __init__(self, cu_seqlens):
-        self.cu_seqlens = cu_seqlens
-
-
 class _FakeForwardBatch:
-    def __init__(
-        self,
-        is_decode: bool,
-        mamba_cache_indices,
-        cu_seqlens=None,
-        extend_prefix_lens=None,
-    ):
+    """Minimal forward batch — the new backend only reads forward_mode here.
+
+    All ragged-batch info (cu_seqlens, recurrent_indices, has_initial_state)
+    is read from ``backend.forward_metadata`` instead, which the tests set
+    directly via ``_set_metadata``.
+    """
+
+    def __init__(self, is_decode: bool):
         self.forward_mode = _FakeForwardMode(is_decode)
-        self.mamba_cache_indices = mamba_cache_indices
-        self.gdn_metadata = _FakeGDNMetadata(cu_seqlens)
-        self.extend_prefix_lens = extend_prefix_lens
+
+
+class _FakePool:
+    """Stand-in for :class:`RecurrentStatePool` that exposes the single
+    method ``get_linear_recurrent_layer_cache`` the backend uses.
+
+    Holds one ``recurrent_buffer`` and a one-element conv-buffer list per
+    layer (GDN has a single fused conv per layer; KDA would have three).
+    """
+
+    def __init__(self, recurrent_buffer, conv_buffer):
+        self._rec = recurrent_buffer
+        self._conv_list = [conv_buffer]
+
+    def get_linear_recurrent_layer_cache(self, layer_id: int):
+        return self._rec, self._conv_list
+
+
+def _set_metadata(backend, cu_q_lens=None, recurrent_indices=None, has_initial_state=None):
+    backend.forward_metadata = LinearRecurrentAttnBackendMetadata(
+        cu_q_lens=cu_q_lens,
+        recurrent_indices=recurrent_indices,
+        has_initial_state=has_initial_state,
+    )
 
 
 def _sharded_state(mesh, shape, spec, dtype, rng=None):
@@ -155,29 +175,34 @@ class GDNAttnBackendDispatchTest(unittest.TestCase):
         a = _sharded_proj(mesh, (T, backend.num_v_heads), P(None, "tensor"), rng[2])
         return mixed_qkv, b, a
 
+    def _make_pool(self, mesh, backend, B):
+        cs = _sharded_state(
+            mesh,
+            (B + 1, backend.conv_dim, backend.conv_kernel_size - 1),
+            P(None, "tensor", None),
+            jnp.bfloat16,
+        )
+        rs = _sharded_state(
+            mesh,
+            (B + 1, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim),
+            P(None, "tensor", None, None),
+            jnp.float32,
+        )
+        return _FakePool(recurrent_buffer=rs, conv_buffer=cs)
+
     def test_decode_dispatch(self):
         mesh = _make_mesh()
         with jax.set_mesh(mesh):
             backend = _make_backend(mesh)
             B = 2
             mixed_qkv, b, a = self._make_inputs(mesh, B, backend, jax.random.key(1))
-            cs = _sharded_state(
-                mesh,
-                (B + 1, backend.conv_dim, backend.conv_kernel_size - 1),
-                P(None, "tensor", None),
-                jnp.bfloat16,
+            pool = self._make_pool(mesh, backend, B)
+            _set_metadata(
+                backend,
+                recurrent_indices=jnp.array([1, 2], dtype=jnp.int32),
             )
-            rs = _sharded_state(
-                mesh,
-                (B + 1, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim),
-                P(None, "tensor", None, None),
-                jnp.float32,
-            )
-            fb = _FakeForwardBatch(
-                is_decode=True,
-                mamba_cache_indices=jnp.array([1, 2], dtype=jnp.int32),
-            )
-            out, new_conv, new_rec = backend(fb, mixed_qkv, cs, rs, b, a)
+            fb = _FakeForwardBatch(is_decode=True)
+            out, new_conv, new_rec = backend(fb, mixed_qkv, b, a, pool, layer_id=0)
             self.assertEqual(out.shape, (B, backend.num_v_heads, backend.head_v_dim))
             self.assertEqual(new_conv.shape, (B, backend.conv_dim, backend.conv_kernel_size - 1))
             self.assertEqual(
@@ -191,25 +216,15 @@ class GDNAttnBackendDispatchTest(unittest.TestCase):
             T = 5  # 2 reqs of lengths [3, 2]
             B = 2
             mixed_qkv, b, a = self._make_inputs(mesh, T, backend, jax.random.key(2))
-            cs = _sharded_state(
-                mesh,
-                (B + 1, backend.conv_dim, backend.conv_kernel_size - 1),
-                P(None, "tensor", None),
-                jnp.bfloat16,
+            pool = self._make_pool(mesh, backend, B)
+            _set_metadata(
+                backend,
+                cu_q_lens=jnp.array([0, 3, 5], dtype=jnp.int32),
+                recurrent_indices=jnp.array([1, 2], dtype=jnp.int32),
+                has_initial_state=jnp.array([False, False], dtype=jnp.bool_),
             )
-            rs = _sharded_state(
-                mesh,
-                (B + 1, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim),
-                P(None, "tensor", None, None),
-                jnp.float32,
-            )
-            fb = _FakeForwardBatch(
-                is_decode=False,
-                mamba_cache_indices=jnp.array([1, 2], dtype=jnp.int32),
-                cu_seqlens=jnp.array([0, 3, 5], dtype=jnp.int32),
-                extend_prefix_lens=jnp.array([0, 0], dtype=jnp.int32),
-            )
-            out, new_conv, new_rec = backend(fb, mixed_qkv, cs, rs, b, a)
+            fb = _FakeForwardBatch(is_decode=False)
+            out, new_conv, new_rec = backend(fb, mixed_qkv, b, a, pool, layer_id=0)
             self.assertEqual(out.shape, (T, backend.num_v_heads, backend.head_v_dim))
             self.assertEqual(new_conv.shape, (B, backend.conv_dim, backend.conv_kernel_size - 1))
             self.assertEqual(
@@ -245,13 +260,15 @@ class GDNAttnBackendExtendStateTest(unittest.TestCase):
                 jnp.float32,
                 rng=jax.random.key(61),
             )
-            fb = _FakeForwardBatch(
-                is_decode=False,
-                mamba_cache_indices=jnp.array([1, 2, 3], dtype=jnp.int32),
-                cu_seqlens=jnp.array([0, 4, 6, 7], dtype=jnp.int32),
-                extend_prefix_lens=jnp.array([0, 0, 0], dtype=jnp.int32),
+            pool = _FakePool(recurrent_buffer=rs, conv_buffer=cs)
+            _set_metadata(
+                backend,
+                cu_q_lens=jnp.array([0, 4, 6, 7], dtype=jnp.int32),
+                recurrent_indices=jnp.array([1, 2, 3], dtype=jnp.int32),
+                has_initial_state=jnp.array([False, False, False], dtype=jnp.bool_),
             )
-            out, new_conv, new_rec = backend(fb, mixed_qkv, cs, rs, b, a)
+            fb = _FakeForwardBatch(is_decode=False)
+            out, new_conv, new_rec = backend(fb, mixed_qkv, b, a, pool, layer_id=0)
             self.assertEqual(out.shape, (T, backend.num_v_heads, backend.head_v_dim))
             self.assertEqual(new_conv.shape, (B, backend.conv_dim, backend.conv_kernel_size - 1))
             self.assertEqual(

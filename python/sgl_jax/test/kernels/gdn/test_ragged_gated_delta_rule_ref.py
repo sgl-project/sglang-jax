@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.layers.attention.linear.gated_delta import ragged_gated_delta_rule_ref
+from sgl_jax.srt.kernels.gdn import ragged_gated_delta_rule_ref
 
 # ---------------------------------------------------------------------------
 # Helpers: a straight-Python reference for one request and a small fixture.

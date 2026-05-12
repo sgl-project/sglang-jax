@@ -39,7 +39,6 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
-    from sgl_jax.srt.layers.attention.linear.gdn_metadata import GDNAttnMetadata
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
@@ -205,12 +204,6 @@ class ForwardBatch:
     # Recurrent state indices [batch_size]
     recurrent_indices: jax.Array | None = None
 
-    ## for Gated-Delta-Net layers (Qwen3-Next). Populated by the model
-    ## runner when GDN layers are present; None otherwise so other models
-    ## pay nothing.
-    mamba_cache_indices: jax.Array | None = None  # [batch_size] int32
-    gdn_metadata: GDNAttnMetadata | None = None  # type: ignore[name-defined]
-
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -233,8 +226,6 @@ class ForwardBatch:
             self.apply_for_deepstack,
             self.deepstack_visual_embedding,
             self.recurrent_indices,
-            self.mamba_cache_indices,
-            self.gdn_metadata,
         )
 
         aux_data = {
@@ -279,8 +270,6 @@ class ForwardBatch:
         obj.apply_for_deepstack = children[17]
         obj.deepstack_visual_embedding = children[18]
         obj.recurrent_indices = children[19]
-        obj.mamba_cache_indices = children[20]
-        obj.gdn_metadata = children[21]
         return obj
 
     def __repr__(self) -> str:

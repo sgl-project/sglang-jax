@@ -21,14 +21,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.layers.attention.linear.gated_delta import (
-    _gated_delta_step,
-    _l2norm,
+from sgl_jax.srt.kernels.gdn import (
     decode_gated_delta_rule_ref,
     jax_causal_conv1d_prefill,
     jax_causal_conv1d_update,
     ragged_gated_delta_rule_ref,
 )
+from sgl_jax.srt.kernels.gdn.gated_delta import _gated_delta_step, _l2norm
 
 
 class L2NormTest(unittest.TestCase):
