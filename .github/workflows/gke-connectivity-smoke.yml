@@ -1,10 +1,7 @@
 name: GKE Connectivity Smoke
 
 on:
-  push:
-    paths:
-      - ".github/workflows/gke-connectivity-smoke.yml"
-  pull_request:
+  pull_request_target:
     paths:
       - ".github/workflows/gke-connectivity-smoke.yml"
   workflow_dispatch:
@@ -49,17 +46,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      PROJECT_ID: ${{ inputs.project_id || vars.GCP_PROJECT_ID }}
-      CLUSTER_NAME: ${{ inputs.cluster_name || vars.GKE_CLUSTER_NAME }}
-      CLUSTER_LOCATION: ${{ inputs.cluster_location || vars.GKE_CLUSTER_LOCATION }}
-      WORKLOAD_IDENTITY_PROVIDER: ${{ inputs.workload_identity_provider || vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-      SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      PROJECT_ID: ${{ inputs.project_id || vars.GCP_PROJECT_ID || 'tpu-service-473302' }}
+      CLUSTER_NAME: ${{ inputs.cluster_name || vars.GKE_CLUSTER_NAME || 'tpu-service' }}
+      CLUSTER_LOCATION: ${{ inputs.cluster_location || vars.GKE_CLUSTER_LOCATION || 'us-east5' }}
+      WORKLOAD_IDENTITY_PROVIDER: ${{ inputs.workload_identity_provider || vars.GCP_WORKLOAD_IDENTITY_PROVIDER || 'projects/785128357837/locations/global/workloadIdentityPools/github-actions/providers/github' }}
+      SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT || 'github-ci-sa@tpu-service-473302.iam.gserviceaccount.com' }}
       NODE_POOL: ${{ inputs.node_pool || 'v6e-16-chips-performance-accuracy-tests' }}
       NAMESPACE: ${{ inputs.namespace || 'default' }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-
       - name: Inspect repository variable visibility
         shell: bash
         env:
