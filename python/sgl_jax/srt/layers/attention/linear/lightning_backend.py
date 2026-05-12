@@ -158,8 +158,8 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
                 v.shape,
                 ssm_states.shape,
                 slope.shape,
-                self.forward_metadata.cu_q_lens.shape,
-                recurrent_indices.shape,
+                getattr(self.forward_metadata.cu_q_lens, "shape", None),
+                getattr(recurrent_indices, "shape", None),
             )
             output, new_recurrent = self._forward_extend(q, k, v, ssm_states, slope)
         else:
