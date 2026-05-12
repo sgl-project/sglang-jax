@@ -504,6 +504,7 @@ def _fused_ep_moe_kernel(
     a2a_s_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
     a2a_s_acc_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
     a2a_g_hbm,  # (num_experts, bt, t_packing, hidden_size // t_packing)
+    permuted_tokens_hbm,  # (bt * top_k, t_packing, hidden_size // t_packing) | (1,...)
     w1_shared_hbm,  # None | (hidden_size, se_intermediate_size)
     w3_shared_hbm,  # None | (hidden_size, se_intermediate_size)
     w2_shared_hbm,  # None | (se_intermediate_size, hidden_size)
@@ -574,6 +575,7 @@ def _fused_ep_moe_kernel(
     disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
     use_jax_allreduce_metadata: bool = True,
+    use_batch_dma_scatter: bool = False,
     quant_block_k: int | None = None,
     # Kernel tuning params.
     bt: int,  # Outer token tile size (output tiling).
@@ -1115,6 +1117,119 @@ def _fused_ep_moe_kernel(
             return None
 
         lax.fori_loop(0, jnp.int32(expert_buffer_count), _wait_one, None, unroll=False)
+
+    def start_a2a_scatter_batch_dma(*, bt_sem_id, bt_start):
+        """Permute tokens by expert into permuted_tokens_hbm, then batch DMA."""
+        if disable_a2a or not use_batch_dma_scatter:
+            return
+        for slot in range(expert_buffer_count):
+            a2a_s_sends_x2_smem[slot] = jnp.int32(0)
+
+        num_global_experts = local_num_experts * num_devices
+
+        def _body(permute_starts_smem, permute_offsets_smem, permute_sem):
+            # Phase 0: compute prefix sum of this device's per-expert counts.
+            def _prefix_sum(e_id, acc):
+                permute_starts_smem[e_id] = acc
+                count = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id]
+                return acc + count
+
+            total_count = lax.fori_loop(
+                0, jnp.int32(padded_num_experts), _prefix_sum, jnp.int32(0), unroll=False
+            )
+
+            # Phase 1: permute tokens to contiguous buffer grouped by expert.
+            for e_id in range(padded_num_experts):
+                permute_offsets_smem[e_id] = jnp.int32(0)
+
+            def _permute_one(t_id, _, bt_start=bt_start):
+                src_t_id = bt_start + t_id
+                for k_id in range(top_k):
+                    e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
+                    is_valid = e_id >= 0
+                    e_id_safe = lax.select(is_valid, e_id, jnp.int32(0))
+                    offset = permute_offsets_smem[e_id_safe]
+                    sz = lax.select(is_valid, jnp.int32(1), jnp.int32(0))
+                    permute_offsets_smem[e_id_safe] = offset + sz
+                    pos = permute_starts_smem[e_id_safe] + offset
+
+                    @pl.when(sz != 0)
+                    def _copy(src_t_id=src_t_id, pos=pos):
+                        pltpu.make_async_copy(
+                            src_ref=tokens_hbm.at[pl.ds(src_t_id, 1)],
+                            dst_ref=permuted_tokens_hbm.at[pl.ds(pos, 1)],
+                            sem=permute_sem,
+                        ).start()
+
+                return None
+
+            lax.fori_loop(0, bt, _permute_one, None, unroll=False)
+
+            # Phase 1.5: wait for all permute copies to complete.
+            @pl.when(total_count != 0)
+            def _wait_permute():
+                ref = permuted_tokens_hbm.at[pl.ds(0, total_count)]
+                pltpu.make_async_copy(
+                    src_ref=ref, dst_ref=ref, sem=permute_sem
+                ).wait()
+
+            # Phase 2: batch DMA scatter - one DMA per global expert.
+            def _batch_scatter(e_id, _):
+                e_id_safe = lax.select(e_id < num_global_experts, e_id, jnp.int32(0))
+                e_sem_id_k = e_id_safe % jnp.int32(local_num_experts)
+                recv_id = e_id_safe // jnp.int32(local_num_experts)
+                count = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id_safe]
+                src_start = permute_starts_smem[e_id_safe]
+                dst_start = expert_starts_x2_smem[bt_sem_id, 0, e_id_safe]
+                is_in_range = e_id < num_global_experts
+                is_local = (recv_id == my_id) & is_in_range & (count > 0)
+                is_remote = (recv_id != my_id) & is_in_range & (count > 0)
+
+                @pl.when(is_local)
+                def _local(
+                    src_start=src_start,
+                    dst_start=dst_start,
+                    count=count,
+                    e_sem_id_k=e_sem_id_k,
+                ):
+                    pltpu.make_async_copy(
+                        src_ref=permuted_tokens_hbm.at[pl.ds(src_start, count)],
+                        dst_ref=a2a_s_x2_hbm.at[e_sem_id_k, pl.ds(dst_start, count)],
+                        sem=recv_x2_sems.at[e_sem_id_k],
+                    ).start()
+
+                @pl.when(is_remote)
+                def _remote(
+                    src_start=src_start,
+                    dst_start=dst_start,
+                    count=count,
+                    e_sem_id_k=e_sem_id_k,
+                    recv_id=recv_id,
+                ):
+                    a2a_s_sends_x2_smem[e_sem_id_k] = (
+                        a2a_s_sends_x2_smem[e_sem_id_k] + count
+                    )
+                    pltpu.make_async_remote_copy(
+                        src_ref=permuted_tokens_hbm.at[pl.ds(src_start, count)],
+                        dst_ref=a2a_s_x2_hbm.at[e_sem_id_k, pl.ds(dst_start, count)],
+                        send_sem=send_x2_sems.at[e_sem_id_k],
+                        recv_sem=recv_x2_sems.at[e_sem_id_k],
+                        device_id=get_mesh_device_id(recv_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
+
+                return None
+
+            lax.fori_loop(
+                0, jnp.int32(padded_num_experts), _batch_scatter, None, unroll=False
+            )
+
+        pl.run_scoped(
+            _body,
+            pltpu.SMEM((padded_num_experts,), jnp.int32),
+            pltpu.SMEM((padded_num_experts,), jnp.int32),
+            pltpu.SemaphoreType.DMA,
+        )
 
     def wait_a2a_scatter_recv(*, bt_sem_id, e_sem_id, local_e_id):
         if disable_a2a:
@@ -2774,7 +2889,10 @@ def _fused_ep_moe_kernel(
             # Issue all scatter DMAs in one token-loop pass (bt iterations
             # instead of bt * local_num_experts), then run a tight compute loop
             # where each expert waits only its own recv semaphore.
-            start_a2a_scatter_batch(bt_sem_id=bt_sem_id, bt_start=bt_start)
+            if use_batch_dma_scatter:
+                start_a2a_scatter_batch_dma(bt_sem_id=bt_sem_id, bt_start=bt_start)
+            else:
+                start_a2a_scatter_batch(bt_sem_id=bt_sem_id, bt_start=bt_start)
 
             init_carry = jnp.int32(0)
 
@@ -3287,6 +3405,7 @@ def fused_ep_moe(
     disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
     use_jax_allreduce_metadata: bool = True,
+    use_batch_dma_scatter: bool = False,
     # Quantization block size along the K (reduction) dimension.  Models with
     # 2D block-wise quantization (block_k, block_n) have their scales expanded
     # to 1D format at weight-loading time by _expand_moe_block_scale(), so the
@@ -3565,6 +3684,7 @@ def fused_ep_moe(
                 disable_all_reduce_metadata=disable_all_reduce_metadata,
                 disable_sync_barrier=disable_sync_barrier,
                 use_jax_allreduce_metadata=use_jax_allreduce_metadata,
+                use_batch_dma_scatter=use_batch_dma_scatter,
                 quant_block_k=quant_block_k,
                 bt=bt,
                 bf=block_config.bf,
@@ -3596,6 +3716,7 @@ def fused_ep_moe(
                     hbm_block_spec,  # a2a_s_x2_hbm
                     hbm_block_spec,  # a2a_s_acc_x2_hbm
                     hbm_block_spec,  # a2a_g_hbm
+                    hbm_block_spec,  # permuted_tokens_hbm
                     None if w1_shared is None else hbm_block_spec,  # w1_shared_hbm
                     None if w3_shared is None else hbm_block_spec,  # w3_shared_hbm
                     None if w2_shared is None else hbm_block_spec,  # w2_shared_hbm
@@ -3686,6 +3807,7 @@ def fused_ep_moe(
             P(),  # a2a_s_x2_hbm
             P(),  # a2a_s_acc_x2_hbm
             P(),  # a2a_g_hbm
+            P(),  # permuted_tokens_hbm
             None if w1_shared is None else P(),  # w1_shared
             None if w3_shared is None else P(),  # w3_shared
             None if w2_shared is None else P(),  # w2_shared
@@ -3712,6 +3834,7 @@ def fused_ep_moe(
         a2a_s_x2_hbm_scratch,
         a2a_s_acc_x2_hbm_scratch,
         a2a_g_hbm_scratch,
+        permuted_tokens_hbm_scratch,
         w1_shared=None,
         w3_shared=None,
         w2_shared=None,
@@ -3769,6 +3892,7 @@ def fused_ep_moe(
                 a2a_s_acc_x2_hbm_scratch, pltpu.HBM
             ),  # a2a_s_acc_x2_hbm
             pltpu.with_memory_space_constraint(a2a_g_hbm_scratch, pltpu.HBM),  # a2a_g_hbm
+            pltpu.with_memory_space_constraint(permuted_tokens_hbm_scratch, pltpu.HBM),  # permuted_tokens_hbm
             (
                 None
                 if w1_shared is None
@@ -3814,6 +3938,10 @@ def fused_ep_moe(
         t_dtype,
     )
     a2a_g_hbm_scratch = pl.empty((num_experts, bt, t_packing, hidden_size // t_packing), t_dtype)
+    permuted_tokens_hbm_scratch = pl.empty(
+        (bt * top_k if use_batch_dma_scatter else 1, t_packing, hidden_size // t_packing),
+        t_dtype,
+    )
 
     return kernel(
         tokens,
@@ -3831,6 +3959,7 @@ def fused_ep_moe(
         a2a_s_x2_hbm_scratch,
         a2a_s_acc_x2_hbm_scratch,
         a2a_g_hbm_scratch,
+        permuted_tokens_hbm_scratch,
         w1_shared,
         w3_shared,
         w2_shared,
