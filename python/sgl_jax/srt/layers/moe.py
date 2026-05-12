@@ -696,7 +696,7 @@ class EPMoE(nnx.Module):
                 padding = jnp.zeros((padding_size, intermediate.shape[1]), dtype=intermediate.dtype)
                 intermediate = jnp.concatenate([intermediate, padding], axis=0)
 
-         # Unsort: gather directly into (N, K, H) by reshaping the small index array.
+        # Unsort: gather directly into (N, K, H) by reshaping the small index array.
         argsort_indices = jnp.argsort(sorted_selected_experts, stable=True)
         total_tokens = weights.shape[0] * weights.shape[1] // self.num_experts_per_tok
         grouped_indices = jnp.reshape(argsort_indices, (total_tokens, self.num_experts_per_tok))
