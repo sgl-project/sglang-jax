@@ -397,7 +397,7 @@ class BailingMoELinearDecoderLayer(nnx.Module):
         )
         self.topk = TopK(
             topk=config.num_experts_per_tok,
-            renormalize=getattr(config, "norm_topk_prob", False),
+            renormalize=True,
             num_expert_group=getattr(config, "n_group", 0),
             topk_group=getattr(config, "topk_group", 0),
             routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
@@ -417,7 +417,7 @@ class BailingMoELinearDecoderLayer(nnx.Module):
                 weight_dtype=dtype,
                 dtype=dtype,
                 layer_id=layer_id,
-                renormalize_topk_logits=getattr(config, "norm_topk_prob", False),
+                renormalize_topk_logits=True,
                 routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
                 use_grouped_topk=getattr(config, "n_group", 0) > 0,
                 num_groups=getattr(config, "n_group", 0),
