@@ -1,4 +1,5 @@
 import copy
+import functools
 import logging
 
 import jax
@@ -33,6 +34,7 @@ from sgl_jax.srt.layers.radix_lightning_attention import RadixLightningAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention, DeepseekV3MLP
+from sgl_jax.srt.utils.debug_utils import maybe_dump_jax_array
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -151,6 +153,10 @@ class BailingMoELinearAttention(nnx.Module):
         forward_batch: ForwardBatch,
         recurrent_state_pool,
     ) -> tuple[jax.Array, tuple]:
+        _dump = functools.partial(
+            maybe_dump_jax_array, component="gla_attn_detail", layer_id=self.layer_id
+        )
+
         qkv, _ = self.qkv_proj(hidden_states)
         qkv = qkv.astype(jnp.float32)
         if self.linear_silu:
@@ -162,20 +168,33 @@ class BailingMoELinearAttention(nnx.Module):
             out_sharding=NamedSharding(self.mesh, P("data", None, "tensor", None)),
         )
         q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+        _dump(q, name="q_raw")
+        _dump(k, name="k_raw")
+        _dump(v, name="v_raw")
 
         if self.q_norm is not None:
             q = self.q_norm(q)
             k = self.k_norm(k)
+            _dump(q, name="q_after_norm")
+            _dump(k, name="k_after_norm")
 
         if self.linear_rope:
             q, k = self.rotary_emb(positions, q, k)
+            _dump(q, name="q_after_rope")
+            _dump(k, name="k_after_rope")
 
         attn_output, pool_updates = self.attn(forward_batch, q, k, v, recurrent_state_pool)
+        _dump(attn_output, name="attn_output")
         attn_output = attn_output.astype(hidden_states.dtype)
 
         gate, _ = self.g_proj(hidden_states)
-        attn_output = self.g_norm(attn_output) * jax.nn.sigmoid(gate)
+        _dump(gate, name="gate")
+        g_normed = self.g_norm(attn_output)
+        _dump(g_normed, name="g_norm_output")
+        attn_output = g_normed * jax.nn.sigmoid(gate)
+        _dump(attn_output, name="gated_output")
         output, _ = self.dense(attn_output)
+        _dump(output, name="final_output")
         return output, pool_updates
 
 
@@ -397,7 +416,7 @@ class BailingMoELinearDecoderLayer(nnx.Module):
         )
         self.topk = TopK(
             topk=config.num_experts_per_tok,
-            renormalize=getattr(config, "norm_topk_prob", False),
+            renormalize=True,
             num_expert_group=getattr(config, "n_group", 0),
             topk_group=getattr(config, "topk_group", 0),
             routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
@@ -417,7 +436,7 @@ class BailingMoELinearDecoderLayer(nnx.Module):
                 weight_dtype=dtype,
                 dtype=dtype,
                 layer_id=layer_id,
-                renormalize_topk_logits=getattr(config, "norm_topk_prob", False),
+                renormalize_topk_logits=True,
                 routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
                 use_grouped_topk=getattr(config, "n_group", 0) > 0,
                 num_groups=getattr(config, "n_group", 0),
@@ -487,6 +506,13 @@ class BailingMoELinearDecoderLayer(nnx.Module):
                 forward_batch=forward_batch,
                 recurrent_state_pool=recurrent_state_pool,
             )
+            maybe_dump_jax_array(
+                hidden_states,
+                component="gla_attention",
+                name="output",
+                layer_id=self.layer_id,
+                forward_mode=forward_batch.forward_mode,
+            )
             kv_fused = None
         else:
             hidden_states, kv_fused = self.self_attn(
@@ -494,6 +520,13 @@ class BailingMoELinearDecoderLayer(nnx.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
                 token_to_kv_pool=token_to_kv_pool,
+            )
+            maybe_dump_jax_array(
+                hidden_states,
+                component="mla_attention" if self.use_mla else "gqa_attention",
+                name="output",
+                layer_id=self.layer_id,
+                forward_mode=forward_batch.forward_mode,
             )
             pool_update = None
 
@@ -503,6 +536,18 @@ class BailingMoELinearDecoderLayer(nnx.Module):
 
         if self.is_moe_layer:
             shared_output = self.shared_experts(hidden_states) if self.shared_experts else None
+            raw_logits = jnp.dot(
+                hidden_states,
+                self.moe_gate.kernel.value,
+                precision=jax.lax.Precision.HIGHEST,
+            )
+            maybe_dump_jax_array(
+                raw_logits,
+                component="moe_detail",
+                name="router_logits_raw",
+                layer_id=self.layer_id,
+                forward_mode=forward_batch.forward_mode,
+            )
             router_logits = self.moe_gate(hidden_states)
             correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
             topk_weights, topk_ids = self.topk(
@@ -510,15 +555,72 @@ class BailingMoELinearDecoderLayer(nnx.Module):
                 correction_bias,
                 dispatch_info=dispatch_info,
             )
+            maybe_dump_jax_array(
+                router_logits,
+                component="moe_detail",
+                name="router_logits_post_act",
+                layer_id=self.layer_id,
+                forward_mode=forward_batch.forward_mode,
+            )
+            maybe_dump_jax_array(
+                topk_ids,
+                component="moe_detail",
+                name="topk_ids",
+                layer_id=self.layer_id,
+                forward_mode=forward_batch.forward_mode,
+            )
+            maybe_dump_jax_array(
+                topk_weights,
+                component="moe_detail",
+                name="topk_weights",
+                layer_id=self.layer_id,
+                forward_mode=forward_batch.forward_mode,
+            )
             if self.use_fused:
                 token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
                 topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
             hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+            maybe_dump_jax_array(
+                hidden_states,
+                component="moe_detail",
+                name="routed_output",
+                layer_id=self.layer_id,
+                forward_mode=forward_batch.forward_mode,
+            )
             if shared_output is not None:
+                maybe_dump_jax_array(
+                    shared_output,
+                    component="moe_detail",
+                    name="shared_expert_output",
+                    layer_id=self.layer_id,
+                    forward_mode=forward_batch.forward_mode,
+                )
                 hidden_states = hidden_states + shared_output
         else:
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
+
+        maybe_dump_jax_array(
+            hidden_states,
+            component="mlp",
+            name="output",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
+        maybe_dump_jax_array(
+            residual,
+            component="decoder_layer",
+            name="residual_post_mlp",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
+        maybe_dump_jax_array(
+            hidden_states,
+            component="decoder_layer",
+            name="hidden_states_post_mlp",
+            layer_id=self.layer_id,
+            forward_mode=forward_batch.forward_mode,
+        )
 
         return (
             hidden_states,
@@ -585,7 +687,19 @@ class BailingMoELinearModel(nnx.Module):
         forward_batch: ForwardBatch,
         memory_pools: MemoryPools,
     ):
+        maybe_dump_jax_array(
+            forward_batch.input_ids,
+            component="embed",
+            name="input_ids",
+            forward_mode=forward_batch.forward_mode,
+        )
         hidden_states = self.embed_tokens(forward_batch.input_ids)
+        maybe_dump_jax_array(
+            hidden_states,
+            component="embed",
+            name="hidden_states",
+            forward_mode=forward_batch.forward_mode,
+        )
         residual = None
         layers_kv_fused = []
         layers_topk_ids = []

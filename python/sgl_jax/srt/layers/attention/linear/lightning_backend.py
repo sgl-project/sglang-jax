@@ -14,6 +14,7 @@ identification + head shape via ``RadixLightningAttention``.
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import os
@@ -28,6 +29,7 @@ from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.utils.debug_utils import maybe_dump_jax_array
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +146,15 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
                 f"non-empty linear_recurrent_layer_ids?"
             ) from None
 
+        _dump = functools.partial(
+            maybe_dump_jax_array, component="gla_backend_input", layer_id=layer.layer_id
+        )
+        _dump(q, name="q")
+        _dump(k, name="k")
+        _dump(v, name="v")
+        _dump(slope, name="slope")
+        _dump(ssm_states, name="ssm_states")
+
         if forward_batch.forward_mode == ForwardMode.DECODE:
             output, new_recurrent = self._forward_decode(q, k, v, ssm_states, slope)
         elif forward_batch.forward_mode == ForwardMode.EXTEND:
@@ -151,6 +162,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             if has_init is not None:
                 mask = has_init[:, None, None, None].astype(ssm_states.dtype)
                 ssm_states = ssm_states * mask
+                _dump(ssm_states, name="ssm_states_after_mask")
             output, new_recurrent = self._forward_extend(q, k, v, ssm_states, slope)
         else:
             raise NotImplementedError(
