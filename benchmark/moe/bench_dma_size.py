@@ -219,7 +219,7 @@ def build_local_benchmark(num_tokens: int, hidden_size: int, num_repeats: int, m
                 out_specs=hbm_spec,
                 scratch_shapes=(pltpu.SemaphoreType.DMA,),
             ),
-            compiler_params=pltpu.TPUCompilerParams(vmem_limit_bytes=96 * 1024 * 1024),
+            compiler_params=pltpu.CompilerParams(vmem_limit_bytes=96 * 1024 * 1024),
         )(src, dst)
 
     buf_shape = (num_tokens, t_packing, hidden_per_pack)
@@ -271,7 +271,7 @@ def build_remote_benchmark(
                     pltpu.SemaphoreType.DMA,
                 ),
             ),
-            compiler_params=pltpu.TPUCompilerParams(vmem_limit_bytes=96 * 1024 * 1024),
+            compiler_params=pltpu.CompilerParams(vmem_limit_bytes=96 * 1024 * 1024),
         )(src_hbm, dst_hbm)
 
     @jax.jit
