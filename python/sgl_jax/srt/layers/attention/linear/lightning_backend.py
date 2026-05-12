@@ -14,7 +14,9 @@ identification + head shape via ``RadixLightningAttention``.
 
 from __future__ import annotations
 
+import logging
 import math
+import os
 from typing import TYPE_CHECKING
 
 import jax
@@ -27,7 +29,13 @@ from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
+logger = logging.getLogger(__name__)
+
 try:
+    from sgl_jax.srt.kernels.simple_gla.native import (
+        naive_gla_decode,
+        naive_gla_prefill,
+    )
     from sgl_jax.srt.kernels.simple_gla.simple_gla import (
         fused_recurrent_simple_gla,
         simple_gla_fwd,
@@ -35,6 +43,8 @@ try:
 except ModuleNotFoundError:
     simple_gla_fwd = None
     fused_recurrent_simple_gla = None
+    naive_gla_decode = None
+    naive_gla_prefill = None
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.radix_lightning_attention import RadixLightningAttention
@@ -97,6 +107,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         """
         super().__init__(mesh=mesh)
         self.chunk_size = chunk_size
+        self.use_native_gla = os.environ.get("SGLANG_JAX_GLA_BACKEND", "").lower() == "native"
         if (
             linear_recurrent_layer_ids is not None
             and num_hidden_layers is not None
@@ -197,7 +208,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         slope: jnp.ndarray,
     ) -> tuple[jax.Array, jax.Array]:
         """Decode forward using shard_map."""
-        if fused_recurrent_simple_gla is None:
+        if fused_recurrent_simple_gla is None or naive_gla_decode is None:
             raise ImportError("simple_gla kernel is required for GLA decode")
 
         ssm_states = ssm_states.astype(jnp.float32)
@@ -206,15 +217,25 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             q_d = q_local[:, None, :, :]
             k_d = k_local[:, None, :, :]
             v_d = v_local[:, None, :, :]
-            output_d, new_state = fused_recurrent_simple_gla(
-                q_d,
-                k_d,
-                v_d,
-                g_gamma=gamma,
-                initial_state=h0,
-                output_final_state=True,
-                scale=None,
-            )
+            if self.use_native_gla:
+                output_d, new_state = naive_gla_decode(
+                    q_d,
+                    k_d,
+                    v_d,
+                    g_gamma=gamma,
+                    h0=h0,
+                    scale=None,
+                )
+            else:
+                output_d, new_state = fused_recurrent_simple_gla(
+                    q_d,
+                    k_d,
+                    v_d,
+                    g_gamma=gamma,
+                    initial_state=h0,
+                    output_final_state=True,
+                    scale=None,
+                )
             return output_d[:, 0, :, :], new_state
 
         output, new_state = jax.shard_map(
@@ -245,7 +266,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         slope: jnp.ndarray,
     ) -> tuple[jax.Array, jax.Array]:
         """Extend forward using shard_map."""
-        if simple_gla_fwd is None:
+        if simple_gla_fwd is None or naive_gla_prefill is None:
             raise ImportError("simple_gla kernel is required for GLA prefill")
 
         cu_seqlens = self.forward_metadata.cu_q_lens
@@ -253,17 +274,28 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         chunk_size = self.chunk_size
 
         def _prefill_fn(q_local, k_local, v_local, gamma, h0, cu_seqlens_p):
-            output, ht = simple_gla_fwd(
-                q_local[None],
-                k_local[None],
-                v_local[None],
-                g_gamma=gamma,
-                h0=h0,
-                cu_seqlens_dev=cu_seqlens_p,
-                scale=None,
-                use_ht=True,
-                chunk_size=chunk_size,
-            )
+            if self.use_native_gla:
+                output, ht = naive_gla_prefill(
+                    q_local[None],
+                    k_local[None],
+                    v_local[None],
+                    g_gamma=gamma,
+                    h0=h0,
+                    cu_seqlens=cu_seqlens_p,
+                    scale=None,
+                )
+            else:
+                output, ht = simple_gla_fwd(
+                    q_local[None],
+                    k_local[None],
+                    v_local[None],
+                    g_gamma=gamma,
+                    h0=h0,
+                    cu_seqlens_dev=cu_seqlens_p,
+                    scale=None,
+                    use_ht=True,
+                    chunk_size=chunk_size,
+                )
             return output[0], ht
 
         output, new_state = jax.shard_map(

@@ -34,27 +34,21 @@ def naive_gla_decode(
     B, T, H, K = q.shape
     assert T == 1, f"Decode expects T=1, got {T}"
 
-    # Squeeze time dimension
-    q_t = q[:, 0]  # [B, H, K]
-    k_t = k[:, 0]  # [B, H, K]
-    v_t = v[:, 0]  # [B, H, K]
+    q_t = q[:, 0].astype(jnp.float32)
+    k_t = k[:, 0].astype(jnp.float32)
+    v_t = v[:, 0].astype(jnp.float32)
+    g_gamma = g_gamma.astype(jnp.float32)
+    h0 = h0.astype(jnp.float32)
 
-    # Update state first: h1 = exp(g_gamma) * h0 + k^T @ v
-    # g_gamma: [H] -> decay: [1, H, 1, 1]
     decay = jnp.exp(g_gamma)[None, :, None, None]
-    # k: [B, H, K], v: [B, H, K] -> kv: [B, H, K, K]
     kv = jnp.einsum("bhk,bhv->bhkv", k_t, v_t)
     h1 = decay * h0 + kv
-
-    # Compute output using updated state: o = q @ h1
-    # q: [B, H, K], h1: [B, H, K, K] -> o: [B, H, K]
     o = jnp.einsum("bhk,bhkv->bhv", q_t, h1)
 
     if scale is not None:
         o = o * scale
 
-    # Restore time dimension
-    output = o[:, None, :, :]  # [B, 1, H, K]
+    output = o[:, None, :, :]
 
     return output, h1
 
@@ -85,63 +79,42 @@ def naive_gla_prefill(
     """
     assert q.shape[0] == 1, f"Prefill expects batch=1 (varlen), got {q.shape[0]}"
 
-    # Squeeze batch dimension
-    q = q[0]  # [T_total, H, K]
-    k = k[0]  # [T_total, H, K]
-    v = v[0]  # [T_total, H, K]
+    q = q[0].astype(jnp.float32)
+    k = k[0].astype(jnp.float32)
+    v = v[0].astype(jnp.float32)
+    g_gamma = g_gamma.astype(jnp.float32)
+    h0 = h0.astype(jnp.float32)
 
-    B = len(cu_seqlens) - 1
-    decay = jnp.exp(g_gamma)  # [H]
+    T = q.shape[0]
+    token_idx = jnp.arange(T, dtype=cu_seqlens.dtype)
+    seq_ids = jnp.searchsorted(cu_seqlens[1:], token_idx, side="right")
+    reset_mask = token_idx == cu_seqlens[:-1][seq_ids]
+    decay = jnp.exp(g_gamma)
 
-    output_list = []
-    h_final_list = []
+    def scan_fn(carry, inputs):
+        h_prev, final_states = carry
+        seq_id, do_reset, q_t, k_t, v_t = inputs
+        h = jnp.where(do_reset, h0[seq_id], h_prev)
+        kv = jnp.einsum("hk,hv->hkv", k_t, v_t)
+        h = decay[:, None, None] * h + kv
+        o_t = jnp.einsum("hk,hkv->hv", q_t, h)
+        final_states = final_states.at[seq_id].set(h)
+        return (h, final_states), o_t
 
-    for i in range(B):
-        start = cu_seqlens[i]
-        end = cu_seqlens[i + 1]
+    init_carry = (
+        jnp.zeros_like(h0[0]),
+        h0,
+    )
+    (_, h_final), output = jax.lax.scan(
+        scan_fn,
+        init_carry,
+        (seq_ids, reset_mask, q, k, v),
+    )
 
-        q_seq = q[start:end]  # [T, H, K]
-        k_seq = k[start:end]  # [T, H, K]
-        v_seq = v[start:end]  # [T, H, K]
-        h_init = h0[i]  # [H, K, K]
+    if scale is not None:
+        output = output * scale
 
-        # Scan over time steps
-        def scan_fn(h_prev, inputs):
-            q_t, k_t, v_t = inputs
-            # q_t, k_t, v_t: [H, K]
-            # h_prev: [H, K, K]
-
-            # Update state first: h_next = decay * h + k^T @ v
-            kv = jnp.einsum("hk,hv->hkv", k_t, v_t)  # [H, K, K]
-            h_next = decay[:, None, None] * h_prev + kv  # [H, K, K]
-
-            # Compute output using updated state: o = q @ h_next
-            o = jnp.einsum("hk,hkv->hv", q_t, h_next)  # [H, K]
-
-            return h_next, o
-
-        h_final, o_seq = jax.lax.scan(
-            scan_fn,
-            h_init,
-            (q_seq, k_seq, v_seq),
-        )
-        # o_seq: [T, H, K]
-        # h_final: [H, K, K]
-
-        if scale is not None:
-            o_seq = o_seq * scale
-
-        output_list.append(o_seq)
-        h_final_list.append(h_final)
-
-    # Concatenate outputs
-    output = jnp.concatenate(output_list, axis=0)  # [T_total, H, K]
-    output = output[None, :, :, :]  # [1, T_total, H, K]
-
-    # Stack final states
-    h_final = jnp.stack(h_final_list, axis=0)  # [B, H, K, K]
-
-    return output, h_final
+    return output[None, :, :, :], h_final
 
 
 __all__ = ["naive_gla_decode", "naive_gla_prefill"]
