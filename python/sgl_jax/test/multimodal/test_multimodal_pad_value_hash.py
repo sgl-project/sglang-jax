@@ -141,6 +141,12 @@ class TestMultimodalPadValueHash(unittest.TestCase):
             tokenizer._combine_mm_hashes([1, 2], "video"),
         )
 
+    def test_combined_hash_falls_back_when_any_payload_hash_is_missing(self):
+        tokenizer = object.__new__(MultimodalTokenizer)
+
+        self.assertIsNone(tokenizer._combine_mm_hashes([1, None], "image"))
+        self.assertIsNone(tokenizer._combine_mm_hashes([None], "image"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -700,12 +700,15 @@ class MultimodalTokenizer(TokenizerManager):
                 vr = VideoReader(tmp_path, ctx=ctx)
             elif isinstance(source, str):
                 if os.path.exists(source):
-                    payload_hash = self._hash_file_payload(
-                        source,
+                    payload = self._read_file_payload(source)
+                    payload_hash = self._hash_payload(
+                        payload,
                         "qwen_video",
                         video_config,
                     )
-                    vr = VideoReader(source, ctx=ctx)
+                    suffix = os.path.splitext(source)[1] or ".mp4"
+                    tmp_path = self._write_temp_video(payload, suffix=suffix)
+                    vr = VideoReader(tmp_path, ctx=ctx)
                 elif source.startswith(("http://", "https://")):
                     resp = requests.get(source, timeout=10)
                     resp.raise_for_status()
@@ -754,8 +757,8 @@ class MultimodalTokenizer(TokenizerManager):
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
-    def _write_temp_video(self, payload: bytes) -> str:
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+    def _write_temp_video(self, payload: bytes, suffix: str = ".mp4") -> str:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp.write(payload)
             return tmp.name
 
@@ -824,11 +827,12 @@ class MultimodalTokenizer(TokenizerManager):
                 hash=self._hash_payload(source, "image"),
             )
         if os.path.exists(source):
-            with Image.open(source) as image:
+            payload = self._read_file_payload(source)
+            with Image.open(io.BytesIO(payload)) as image:
                 image_data = image.convert("RGB")
             return _LoadedMultimodalPayload(
                 data=image_data,
-                hash=self._hash_file_payload(source, "image"),
+                hash=self._hash_payload(payload, "image"),
             )
         if source.startswith(("http://", "https://")):
             resp = requests.get(source, timeout=10)
@@ -874,10 +878,19 @@ class MultimodalTokenizer(TokenizerManager):
             finally:
                 os.unlink(tmp_path)
         if os.path.exists(source):
-            return _LoadedMultimodalPayload(
-                data=iio.imread(source, index=None),
-                hash=self._hash_file_payload(source, "video"),
-            )
+            payload = self._read_file_payload(source)
+            payload_hash = self._hash_payload(payload, "video")
+            suffix = os.path.splitext(source)[1] or ".mp4"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(payload)
+                tmp_path = tmp.name
+            try:
+                return _LoadedMultimodalPayload(
+                    data=iio.imread(tmp_path, index=None),
+                    hash=payload_hash,
+                )
+            finally:
+                os.unlink(tmp_path)
         if source.startswith(("http://", "https://")):
             resp = requests.get(source, timeout=10)
             resp.raise_for_status()
@@ -917,13 +930,14 @@ class MultimodalTokenizer(TokenizerManager):
             finally:
                 os.unlink(tmp_path)
         if os.path.exists(source):
+            payload = self._read_file_payload(source)
             audio_data, _ = librosa.load(
-                source,
+                BytesIO(payload),
                 sr=self.mm_processor.feature_extractor.sampling_rate,
             )
             return _LoadedMultimodalPayload(
                 data=audio_data,
-                hash=self._hash_file_payload(source, "audio"),
+                hash=self._hash_payload(payload, "audio"),
             )
         if source.startswith(("http://", "https://")):
             payload = urlopen(source, timeout=10).read()
@@ -943,13 +957,10 @@ class MultimodalTokenizer(TokenizerManager):
         hasher.update(payload)
         return self._hash_digest(hasher)
 
-    def _hash_file_payload(self, path: str, *metadata: Any) -> int:
-        hasher = hashlib.sha256()
-        self._update_hash_metadata(hasher, *metadata)
+    @staticmethod
+    def _read_file_payload(path: str) -> bytes:
         with open(path, "rb") as file:
-            for chunk in iter(lambda: file.read(1024 * 1024), b""):
-                hasher.update(chunk)
-        return self._hash_digest(hasher)
+            return file.read()
 
     @staticmethod
     def _update_hash_metadata(hasher: Any, *metadata: Any) -> None:
@@ -978,9 +989,13 @@ class MultimodalTokenizer(TokenizerManager):
         )
 
     def _combine_mm_hashes(self, hashes: list[int | None], modality: str) -> int | None:
-        valid_hashes = [value for value in hashes if value is not None]
-        if not valid_hashes:
+        if not hashes:
             return None
+        valid_hashes = []
+        for value in hashes:
+            if value is None:
+                return None
+            valid_hashes.append(value)
         payload = b"".join(
             value.to_bytes(8, byteorder="big", signed=False) for value in valid_hashes
         )
