@@ -1,6 +1,7 @@
 import itertools
 import logging
 import time
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import jax
@@ -48,6 +49,14 @@ def _take_with_optional_out_sharding(array: jax.Array, index: jax.Array, trailin
     if trailing_slice:
         return array.at[index, :].get(out_sharding=out_sharding)
     return array.at[index].get(out_sharding=out_sharding)
+
+
+def _pad_1d_array(value, target_size: int, pad_value: int = -1) -> np.ndarray:
+    value = np.asarray(value)
+    pad_size = target_size - value.shape[0]
+    if pad_size <= 0:
+        return value
+    return np.pad(value, (0, pad_size), constant_values=pad_value)
 
 
 class EagleDraftWorker(ModelWorker, BaseDraftWorker):
@@ -271,6 +280,11 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
             model_worker_batch.seq_lens = np.pad(
                 model_worker_batch.seq_lens, ((0, bs - model_worker_batch.seq_lens.shape[0]),)
             )
+            model_worker_batch.req_pool_indices = np.pad(
+                model_worker_batch.req_pool_indices,
+                ((0, bs - model_worker_batch.req_pool_indices.shape[0]),),
+                constant_values=-1,
+            )
             if model_worker_batch.spec_info.allocate_lens is not None:
                 model_worker_batch.spec_info.allocate_lens = np.pad(
                     model_worker_batch.spec_info.allocate_lens,
@@ -343,6 +357,14 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
         )
         return model_worker_batch.spec_info
 
+    def pad_out_cache_loc_for_verify(self, model_worker_batch: ModelWorkerBatch) -> None:
+        target_size = model_worker_batch.seq_lens.shape[0] * self.speculative_num_draft_tokens
+        model_worker_batch.out_cache_loc = _pad_1d_array(
+            model_worker_batch.out_cache_loc,
+            target_size,
+            -1,
+        )
+
     def _pick_context_len(self, max_seq_len: int) -> int:
         max_seq_len = max(int(max_seq_len), 1)
         if self.precompile_token_paddings:
@@ -358,9 +380,11 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
         next_token_ids: jax.Array,
     ) -> EagleDraftInput:
         # FIXME(pc) move this all prepare to prepare_for_extend_after_target_prefill
+        real_indices = jnp.arange(model_worker_batch.real_bs, dtype=jnp.int32)
+        padded_indices = jnp.arange(model_worker_batch.seq_lens.shape[0], dtype=jnp.int32)
         model_worker_batch.spec_info = EagleDraftInput(
             hidden_states=target_hidden_states,
-            verified_id=next_token_ids[: model_worker_batch.real_bs],
+            verified_id=_take_with_optional_out_sharding(next_token_ids, padded_indices),
             num_tokens_per_batch=np.asarray(1, dtype=jnp.int32),
             num_tokens_for_logprob_per_batch=np.asarray(1, dtype=jnp.int32),
             allocate_lens=model_worker_batch.seq_lens,
@@ -387,12 +411,18 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            : model_worker_batch.real_bs, :
-        ]
+        logits_output.next_token_logits = _take_with_optional_out_sharding(
+            logits_output.next_token_logits, real_indices, trailing_slice=True
+        )
         if len(logits_output.hidden_states.shape) == 1:
             logits_output.hidden_states = jnp.expand_dims(logits_output.hidden_states, axis=0)
+        logits_output.hidden_states = _take_with_optional_out_sharding(
+            logits_output.hidden_states, real_indices, trailing_slice=True
+        )
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
+        forward_batch.spec_info.verified_id = _take_with_optional_out_sharding(
+            forward_batch.spec_info.verified_id, real_indices
+        )
         forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens[
             : model_worker_batch.real_bs
         ]
@@ -559,6 +589,19 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
                     do_penalties=False,
                     speculative_algotithm=self.speculative_algorithm,
                 )
+                model_worker_batch.real_bs = 1
+                model_worker_batch.real_input_ids_len = num_tokens
+                model_worker_batch.seq_lens = np.zeros(bs, dtype=np.int32)
+                model_worker_batch.seq_lens[0] = num_tokens
+                model_worker_batch.req_pool_indices = np.full(bs, -1, dtype=np.int32)
+                model_worker_batch.req_pool_indices[0] = 0
+                model_worker_batch.extend_seq_lens = np.zeros(bs, dtype=np.int32)
+                model_worker_batch.extend_seq_lens[0] = num_tokens
+                model_worker_batch.extend_prefix_lens = np.zeros(bs, dtype=np.int32)
+                model_worker_batch.logits_indices = np.zeros(bs, dtype=np.int32)
+                model_worker_batch.logits_indices[0] = num_tokens - 1
+                model_worker_batch.positions = np.arange(num_tokens, dtype=np.int32)
+                model_worker_batch.out_cache_loc = np.arange(1, num_tokens + 1, dtype=np.int32)
                 if model_worker_batch.sampling_info.temperatures.ndim == 1:
                     model_worker_batch.sampling_info.temperatures = (
                         model_worker_batch.sampling_info.temperatures[:, None]
@@ -625,7 +668,58 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
                 model_worker_batch.speculative_eagle_topk = self.topk
                 model_worker_batch.speculative_num_draft_tokens = self.speculative_num_draft_tokens
                 model_worker_batch.speculative_num_steps = self.speculative_num_steps
-                self.draft(model_worker_batch)
+                cur_allocate_lens = model_worker_batch.spec_info.allocate_lens
+                verify_input = self.draft(model_worker_batch)
+                model_worker_batch.spec_info = verify_input
+                self.pad_out_cache_loc_for_verify(model_worker_batch)
+
+                verify_input.allocate_lens = cur_allocate_lens
+                verify_input.prepare_for_verify(
+                    model_worker_batch, self.page_size, self.target_worker
+                )
+                forward_metadata = (
+                    self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
+                        model_worker_batch
+                    )
+                )
+                logits_output, _, _ = self.target_worker.forward_batch_generation(
+                    model_worker_batch,
+                    skip_sample=True,
+                    forward_metadata=forward_metadata,
+                )
+                verify_input.hidden_states = logits_output.hidden_states
+                (
+                    _predict,
+                    verified_id,
+                    accept_length,
+                    accept_index,
+                ) = verify_input.sample(
+                    model_worker_batch,
+                    logits_output,
+                    self.model_runner.rngs,
+                    self.mesh,
+                )
+                logits_output.next_token_logits = _take_with_optional_out_sharding(
+                    logits_output.next_token_logits, accept_index, trailing_slice=True
+                )
+                logits_output.hidden_states = _take_with_optional_out_sharding(
+                    logits_output.hidden_states, accept_index, trailing_slice=True
+                )
+                model_worker_batch.positions = _take_with_optional_out_sharding(
+                    model_worker_batch.positions, accept_index
+                )
+                batch_output = SimpleNamespace(
+                    logits_output=logits_output,
+                    next_draft_input=EagleDraftInput(
+                        verified_id=verified_id,
+                        new_seq_lens=model_worker_batch.seq_lens + accept_length,
+                        allocate_lens=cur_allocate_lens,
+                        hidden_states=logits_output.hidden_states,
+                    ),
+                    allocate_lens=cur_allocate_lens,
+                    accept_lens=accept_length,
+                )
+                self.draft_extend_for_decode(model_worker_batch, batch_output)
 
         end_time = time.perf_counter()
         logger.info("[SPEC_DECODE] Precompile finished in %.0f secs", end_time - start_time)

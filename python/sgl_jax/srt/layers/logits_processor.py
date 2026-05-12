@@ -205,7 +205,11 @@ class LogitsMetadata:
                 if batch.spec_info is not None
                 and hasattr(batch.spec_info, "accept_length")
                 and batch.spec_info.accept_length is not None
-                else None
+                else (
+                    device_array(np.zeros_like(batch.seq_lens), sharding=sharding)
+                    if batch.spec_algorithm is not None and not batch.spec_algorithm.is_none()
+                    else None
+                )
             ),
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=(

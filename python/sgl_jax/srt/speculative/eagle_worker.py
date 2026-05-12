@@ -162,6 +162,7 @@ class EAGLEWorker(BaseSpecWorker):
     ):
         spec_info = verify_input
         spec_info.allocate_lens = cur_allocate_lens
+        self.draft_worker.pad_out_cache_loc_for_verify(model_worker_batch)
         spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.target_worker)
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch

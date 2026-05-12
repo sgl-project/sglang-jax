@@ -108,6 +108,7 @@ def update_forward_batch_info(
     hidden_states: jax.Array,
     positions_base: jax.Array,
 ) -> ForwardBatch:
+    input_ids = jax.device_get(input_ids)
     forward_batch.input_ids = input_ids
     # FIXME(pc) hiddenstate will become NAN when forward path is very long, we still have no reason for this
     forward_batch.spec_info.hidden_states = hidden_states

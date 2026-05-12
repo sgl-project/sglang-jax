@@ -2221,6 +2221,31 @@ class ScheduleBatch:
             extend_seq_lens,
         )
 
+        if self.forward_mode.is_extend():
+            token_padding, _ = pad_to_bucket(real_input_ids_len, token_paddings)
+            bs_padding, _ = pad_to_bucket(real_bs, bs_paddings[-1:])
+            cache_loc_padding = cache_loc_paddings[-1]
+
+            input_ids_cpu = _pad_first_dim(input_ids_cpu, token_padding, 0)
+            positions_cpu = _pad_first_dim(positions_cpu, token_padding, 0)
+            out_cache_loc_cpu = _pad_first_dim(out_cache_loc_cpu, token_padding, -1)
+            if mrope_positions_cpu is not None:
+                mrope_pad_size = token_padding - mrope_positions_cpu.shape[1]
+                if mrope_pad_size > 0:
+                    mrope_positions_cpu = np.pad(
+                        mrope_positions_cpu,
+                        ((0, 0), (0, mrope_pad_size)),
+                        constant_values=0,
+                    )
+
+            seq_lens_cpu = _pad_first_dim(seq_lens_cpu, bs_padding, 0)
+            req_pool_indices_cpu = _pad_first_dim(req_pool_indices_cpu, bs_padding, -1)
+            extend_seq_lens = _pad_first_dim(extend_seq_lens, bs_padding, 0)
+            extend_prefix_lens = _pad_first_dim(extend_prefix_lens, bs_padding, 0)
+            extend_logprob_start_lens = _pad_first_dim(extend_logprob_start_lens, bs_padding, 0)
+            logits_indices = _pad_first_dim(logits_indices, bs_padding, 0)
+            self.per_dp_bs_size = bs_padding
+
         cache_loc_flat = np.array([], dtype=np.int32)
 
         if len(seq_lens_cpu) > 0:
@@ -2285,10 +2310,34 @@ class ScheduleBatch:
                     # Assign
                     cache_loc_flat[dst_indices] = source_data
 
+        if self.forward_mode.is_extend():
+            if len(cache_loc_flat) > cache_loc_padding:
+                raise ValueError(
+                    f"Spec extend cache_loc length {len(cache_loc_flat)} exceeds "
+                    f"precompile cache_loc bucket {cache_loc_padding}."
+                )
+            cache_loc_padded = np.zeros(cache_loc_padding, dtype=np.int32)
+            cache_loc_padded[: len(cache_loc_flat)] = cache_loc_flat
+            cache_loc_flat = cache_loc_padded
+
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
         # Extract lora_ids from requests
         lora_ids = [req.lora_id for req in self.reqs]
+        if self.forward_mode.is_extend() and len(lora_ids) < len(seq_lens_cpu):
+            lora_ids = lora_ids + ["0"] * (len(seq_lens_cpu) - len(lora_ids))
+
+        top_logprobs_nums = self.top_logprobs_nums
+        token_ids_logprobs = self.token_ids_logprobs
+        if self.forward_mode.is_extend():
+            if top_logprobs_nums is not None and len(top_logprobs_nums) < len(seq_lens_cpu):
+                top_logprobs_nums = top_logprobs_nums + [0] * (
+                    len(seq_lens_cpu) - len(top_logprobs_nums)
+                )
+            if token_ids_logprobs is not None and len(token_ids_logprobs) < len(seq_lens_cpu):
+                token_ids_logprobs = token_ids_logprobs + [None] * (
+                    len(seq_lens_cpu) - len(token_ids_logprobs)
+                )
 
         return ModelWorkerBatch(
             bid=bid,
@@ -2300,9 +2349,13 @@ class ScheduleBatch:
             out_cache_loc=out_cache_loc_cpu,
             return_logprob=self.return_logprob,
             return_output_logprob_only=self.return_output_logprob_only,
-            top_logprobs_nums=self.top_logprobs_nums,
-            token_ids_logprobs=self.token_ids_logprobs,
-            sampling_info=self.sampling_info,
+            top_logprobs_nums=top_logprobs_nums,
+            token_ids_logprobs=token_ids_logprobs,
+            sampling_info=(
+                _pad_sampling_info_for_spec_extend(self.sampling_info, len(seq_lens_cpu))
+                if self.forward_mode.is_extend()
+                else self.sampling_info
+            ),
             positions=positions_cpu,
             mrope_positions=mrope_positions_cpu,
             cache_loc=cache_loc_flat,
@@ -2316,7 +2369,7 @@ class ScheduleBatch:
             real_bs_per_dp=[real_bs],
             logits_indices_selector=np.arange(real_bs, dtype=np.int32),
             dp_size=self.dp_size,
-            per_dp_bs_size=real_bs,
+            per_dp_bs_size=self.per_dp_bs_size if self.forward_mode.is_extend() else real_bs,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
                 if self.return_hidden_states
@@ -2495,6 +2548,39 @@ class ScheduleBatch:
 def align_to_size(lst: list, size: int, value: int = 0) -> list:
     align_len = (len(lst) + size - 1) // size * size
     return lst[:] + [value] * (align_len - len(lst))
+
+
+def _pad_first_dim(value: Any, target_size: int, pad_value: int | float = 0):
+    if value is None:
+        return None
+    value = np.asarray(value)
+    pad_size = target_size - value.shape[0]
+    if pad_size <= 0:
+        return value
+    pad_width = [(0, 0)] * value.ndim
+    pad_width[0] = (0, pad_size)
+    return np.pad(value, pad_width, constant_values=pad_value)
+
+
+def _pad_sampling_info_for_spec_extend(sampling_info: Any, target_bs: int):
+    if sampling_info is None:
+        return None
+
+    padded = dataclasses.replace(sampling_info)
+    padded.temperatures = _pad_first_dim(padded.temperatures, target_bs, 1.0)
+    padded.top_ps = _pad_first_dim(padded.top_ps, target_bs, 1.0)
+    padded.top_ks = _pad_first_dim(padded.top_ks, target_bs, 1)
+    padded.min_ps = _pad_first_dim(padded.min_ps, target_bs, 0.0)
+    padded.sampling_seeds = _pad_first_dim(
+        padded.sampling_seeds,
+        target_bs,
+        DEFAULT_SAMPLING_SEED,
+    )
+    padded.linear_penalty = _pad_first_dim(padded.linear_penalty, target_bs, 0.0)
+    padded.vocab_mask = _pad_first_dim(padded.vocab_mask, target_bs, 0)
+    if padded.grammars is not None and len(padded.grammars) < target_bs:
+        padded.grammars = padded.grammars + [None] * (target_bs - len(padded.grammars))
+    return padded
 
 
 def _extract_mm_value(mm_inputs: Any, key: str):

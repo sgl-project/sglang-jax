@@ -9,8 +9,11 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
 from sgl_jax.srt.managers.schedule_policy import PrefillAdder
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 class _DummyAllocator:
@@ -257,6 +260,59 @@ class TestMixedChunkDP(unittest.TestCase):
         self.assertEqual([r.rid for r in info.reqs], ["req-0", "req-2"])
         np.testing.assert_array_equal(np.asarray(info.spec_info.verified_id), [40, 42])
         np.testing.assert_array_equal(np.asarray(info.spec_info.allocate_lens), [50, 52])
+
+    def test_spec_extend_model_worker_batch_uses_precompile_buckets(self):
+        reqs = [_make_req(f"req-{i}", dp_rank=0) for i in range(2)]
+        req_to_token_pool = SimpleNamespace(
+            req_to_token=np.arange(32, dtype=np.int32).reshape(2, 16)
+        )
+        batch = ScheduleBatch.init_new(
+            reqs=[reqs],
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=None,
+            tree_cache=None,
+            model_config=SimpleNamespace(vocab_size=32000),
+            enable_overlap=False,
+            dp_size=1,
+            spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+            mesh=None,
+        )
+        batch.forward_mode = ForwardMode.EXTEND
+
+        info = batch.reqs_info[0]
+        info.input_ids = np.arange(6, dtype=np.int32)
+        info.out_cache_loc = np.arange(100, 106, dtype=np.int32)
+        info.req_pool_indices = np.array([0, 1], dtype=np.int32)
+        info.seq_lens = np.array([3, 5], dtype=np.int32)
+        info.prefix_lens = [0, 2]
+        info.extend_lens = [3, 3]
+        info.extend_logprob_start_lens = [0, 0]
+        info.sampling_info = SamplingBatchInfo.from_schedule_batch(info, vocab_size=32000)
+
+        model_worker_batch = batch.get_spec_model_worker_batch(
+            token_paddings=[4, 8],
+            bs_paddings=[4],
+            cache_loc_paddings=[32],
+            page_size=4,
+        )
+
+        self.assertEqual(model_worker_batch.real_input_ids_len, 6)
+        self.assertEqual(model_worker_batch.real_bs, 2)
+        self.assertEqual(model_worker_batch.per_dp_bs_size, 4)
+        self.assertEqual(model_worker_batch.input_ids.shape, (8,))
+        self.assertEqual(model_worker_batch.out_cache_loc.shape, (8,))
+        self.assertEqual(model_worker_batch.seq_lens.shape, (4,))
+        self.assertEqual(model_worker_batch.req_pool_indices.shape, (4,))
+        self.assertEqual(model_worker_batch.cache_loc.shape, (32,))
+        self.assertEqual(model_worker_batch.sampling_info.temperatures.shape, (4, 1))
+        self.assertEqual(model_worker_batch.logits_indices.shape, (4,))
+        self.assertEqual(model_worker_batch.lora_ids, ["0", "0", "0", "0"])
+        np.testing.assert_array_equal(model_worker_batch.input_ids[:6], np.arange(6))
+        np.testing.assert_array_equal(model_worker_batch.out_cache_loc[:6], np.arange(100, 106))
+        np.testing.assert_array_equal(model_worker_batch.seq_lens, [3, 5, 0, 0])
+        np.testing.assert_array_equal(model_worker_batch.req_pool_indices, [0, 1, -1, -1])
+        np.testing.assert_array_equal(model_worker_batch.extend_seq_lens, [3, 3, 0, 0])
+        np.testing.assert_array_equal(model_worker_batch.logits_indices, [2, 5, 0, 0])
 
 
 if __name__ == "__main__":

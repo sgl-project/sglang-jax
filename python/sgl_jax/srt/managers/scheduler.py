@@ -1828,7 +1828,15 @@ class Scheduler(
                     # Prefill
                     batch.seq_lens = batch.seq_lens + 1
                 batch.spec_info = batch_output.next_draft_input
-            next_token_ids = batch_output.next_token_ids
+            next_token_ids_device = batch_output.next_token_ids
+            if isinstance(next_token_ids_device, jax.Array):
+                if self.dp_size > 1:
+                    from jax.experimental.multihost_utils import process_allgather
+
+                    next_token_ids_device = process_allgather(next_token_ids_device, tiled=True)
+                next_token_ids = np.array(jax.device_get(next_token_ids_device))
+            else:
+                next_token_ids = next_token_ids_device
             self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
             logits_output = batch_output.logits_output
             cache_miss_count = batch_output.cache_miss_count
