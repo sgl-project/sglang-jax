@@ -94,8 +94,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         q = l2_normalize(q)
         k = l2_normalize(k)
 
-        if forward_batch.forward_mode == ForwardMode.EXTEND:
-            output, new_recurrent = self._forward_extend(
+        output, new_recurrent = self._forward(
                 q,
                 k,
                 v,
@@ -105,20 +104,33 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 cu_q_lens,
                 layer,
                 scale=layer.scale,
-            )
-        elif forward_batch.forward_mode == ForwardMode.DECODE:
-            output, new_recurrent = self._forward_decode(
-                q,
-                k,
-                v,
-                a,
-                b,
-                ssm_states,
-                layer,
-                scale=layer.scale,
-            )
-        else:
-            raise NotImplementedError(f"KDA does not support {forward_batch.forward_mode}")
+            ) 
+
+        # if forward_batch.forward_mode == ForwardMode.EXTEND:
+        #     output, new_recurrent = self._forward_extend(
+        #         q,
+        #         k,
+        #         v,
+        #         a,
+        #         b,
+        #         ssm_states,
+        #         cu_q_lens,
+        #         layer,
+        #         scale=layer.scale,
+        #     )
+        # elif forward_batch.forward_mode == ForwardMode.DECODE:
+        #     output, new_recurrent = self._forward_decode(
+        #         q,
+        #         k,
+        #         v,
+        #         a,
+        #         b,
+        #         ssm_states,
+        #         layer,
+        #         scale=layer.scale,
+        #     )
+        # else:
+        #     raise NotImplementedError(f"KDA does not support {forward_batch.forward_mode}")
 
         new_ssm_full = self.set_ssm_state(
             recurrent_state_pool, layer.layer_id, recurrent_indices, new_recurrent
@@ -313,6 +325,22 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             output_final_state=True,
         )
         return self._repack_varlen(o_b, cu_seqlens, q.shape[0]), final_state
+
+    def _forward(
+        self,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        g: jax.Array,
+        beta: jax.Array,
+        initial_state: jax.Array,
+        cu_seqlens: jax.Array,
+        layer: RadixLinearAttention,
+        scale: float | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
+        return self._forward_extend_pallas(
+            q, k, v, g, beta, initial_state, cu_seqlens, layer, scale=scale
+        )
 
     def _forward_decode(
         self,
