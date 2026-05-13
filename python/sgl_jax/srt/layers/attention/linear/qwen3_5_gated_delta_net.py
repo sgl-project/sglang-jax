@@ -118,6 +118,18 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
 
         # Backend owns conv1d_weight + A_log + dt_bias and runs the
         # conv+recurrence under shard_map.
+        #
+        # TODO(post-qwen3.5+kimi-linear): wrap this through
+        # ``RadixLinearAttention`` so all linear-attention layers in the
+        # repo share the same dispatch shape (matches the sglang attention
+        # backend pattern). The interface contract today is shaped around
+        # KDA's split-stream layout (three separate
+        # ``q_conv1d`` / ``k_conv1d`` / ``v_conv1d`` ``LinearBase``
+        # containers, ``(q, k, v, a, b)`` call signature), while GDN runs
+        # one fused conv1d on ``mixed_qkv``. The reviewer flagged that
+        # the unified shape should be designed after both qwen3.5 and
+        # kimi-linear land, with both use cases visible — keeping the
+        # fused-vs-split decision open until then.
         self.attention = GDNAttnBackend(
             num_k_heads=self.num_k_heads,
             num_v_heads=self.num_v_heads,
