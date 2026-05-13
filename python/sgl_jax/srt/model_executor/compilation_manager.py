@@ -35,6 +35,7 @@ class CompilationManager:
         max_req_len: int,
         vocab_size: int,
         multimodal: bool = False,
+        is_hybrid_recurrent: bool = False,
     ):
         self.dp_size = dp_size
         self.tp_size = tp_size
@@ -46,6 +47,7 @@ class CompilationManager:
         self.multimodal = multimodal
         self.moe_backend = server_args.moe_backend
         self.enable_static_lora = server_args.enable_static_lora
+        self.is_hybrid_recurrent = is_hybrid_recurrent
 
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)
         self.bs_buckets = self._compute_bs_buckets(server_args.precompile_bs_paddings)
@@ -310,8 +312,8 @@ class CompilationManager:
             per_dp_bs_size=per_dp_bs_size,
             real_bs_per_dp=[bs] * dp_size,
             logits_indices_selector=np.arange(bs, dtype=np.int32),
-            recurrent_indices=np.zeros(bs, dtype=np.int32),
-            has_initial_state=np.zeros(bs, dtype=np.bool_),
+            recurrent_indices=(np.zeros(bs, dtype=np.int32) if self.is_hybrid_recurrent else None),
+            has_initial_state=(np.zeros(bs, dtype=np.bool_) if self.is_hybrid_recurrent else None),
         )
 
     # ---- Lazy compilation tracking ----

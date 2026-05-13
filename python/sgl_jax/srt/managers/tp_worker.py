@@ -194,6 +194,7 @@ class ModelWorker:
         self.max_padded_batch_size, self.max_padded_num_tokens = self.get_max_padded_size()
 
         # precompile
+        from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool
         from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 
         self.compilation_manager = CompilationManager(
@@ -206,6 +207,9 @@ class ModelWorker:
             max_req_len=self.max_req_len,
             vocab_size=self.model_config.vocab_size,
             multimodal=server_args.multimodal,
+            is_hybrid_recurrent=isinstance(
+                self.model_runner.req_to_token_pool, HybridReqToTokenPool
+            ),
         )
 
         self.parent_process = psutil.Process().parent()
