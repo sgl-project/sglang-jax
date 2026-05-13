@@ -23,6 +23,7 @@ def xla_quantized_matmul_local(
     weight_block_size: tuple[int, int] | None = None,
     activation_quant_dtype: jnp.dtype | None = None,
     allow_narrow_n_blockwise: bool = False,
+    output_scatter_dimension: int | None = None,
 ) -> jax.Array:
     """
     Local quantized matmul for use inside shard_map.
@@ -129,8 +130,16 @@ def xla_quantized_matmul_local(
             out = out.astype(compute_dtype) * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
 
     out = out.astype(out_dtype)
-    # Sum partial results across devices (single all-reduce)
+    # Reduce across the contracted (input) axis. Caller passes
+    # ``output_scatter_dimension`` only when it has already decided that a
+    # reduce-scatter on that dim is appropriate AND wired ``out_specs``
+    # accordingly; otherwise we do a plain all-reduce.
     if reduce_axis is not None:
-        out = lax.psum(out, axis_name=reduce_axis)
+        if output_scatter_dimension is not None:
+            out = lax.psum_scatter(
+                out, axis_name=reduce_axis, scatter_dimension=output_scatter_dimension, tiled=True
+            )
+        else:
+            out = lax.psum(out, axis_name=reduce_axis)
 
     return out
