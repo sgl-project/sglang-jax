@@ -179,9 +179,9 @@ def _estimate_vmem_bytes(
 
     # b_acc_vmem is F32(2, a2a_max_tokens, 1, bf)
     b_acc = 2 * a2a_max_tokens * bf * 4
-    # U32 token staging for FFN1: (2, bts, bd1 // t_packing)
+    # U32 token staging for FFN1: (2, bts, hidden // t_packing) — full-hidden staging
     # Note: Using 4 bytes for packing factor adjustment roughly
-    t_stage_b32 = 2 * bts * (bd1 // 2) * 4  # Approximation
+    t_stage_b32 = 2 * bts * (hidden // 2) * 4  # Approximation
     # Kernel uses triple-buffering for a2a_s_acc staging: (3, bts, bd2 // t_packing)
     a2a_s_acc_stage_b32 = 3 * bts * (bd2 // 2) * 4  # Approximation
 
@@ -309,7 +309,7 @@ def _estimate_vmem_bytes(
             f"      a2a_g_acc_vmem:         {_mb(a2a_g_acc)} MB  (2, {top_k}, {acc_bt}, {t_packing}, {hidden // t_packing})"
         )
         print(
-            f"      b_stage_x2_vmem:        {_mb(t_stage_b32)} MB  (2, {bts}, {t_packing}, {bd1 // t_packing})"
+            f"      b_stage_x2_vmem:        {_mb(t_stage_b32)} MB  (2, {bts}, {t_packing}, {hidden // t_packing})"
         )
         print(
             f"      a2a_s_acc_stage_x3:     {_mb(a2a_s_acc_stage_b32)} MB  (3, {bts}, {t_packing}, {bd2 // t_packing})"
