@@ -233,6 +233,38 @@ def build_tree_kernel_efficient_preprocess(
     return parent_list, top_scores_index, draft_tokens
 
 
+@jax.jit(static_argnames=["num_verify_tokens", "batch_size"])
+def build_tree_kernel_topk1_linear(
+    verified_id: jax.Array,
+    token_list: jax.Array,
+    seq_lens: jax.Array,
+    num_verify_tokens: int,
+    batch_size: int,
+):
+    draft_tokens = jnp.concatenate(
+        [
+            jnp.expand_dims(verified_id, axis=1),
+            token_list[:, : num_verify_tokens - 1],
+        ],
+        axis=1,
+    ).flatten()
+    positions = (
+        jnp.expand_dims(seq_lens, axis=1) + jnp.arange(num_verify_tokens, dtype=jnp.int32)[None, :]
+    ).flatten()
+    retrive_index = jnp.arange(batch_size * num_verify_tokens, dtype=jnp.int32).reshape(
+        batch_size, num_verify_tokens
+    )
+    retrive_next_token = jnp.concatenate(
+        [
+            jnp.arange(1, num_verify_tokens, dtype=jnp.int32),
+            jnp.array([-1], dtype=jnp.int32),
+        ]
+    )
+    retrive_next_token = jnp.broadcast_to(retrive_next_token, (batch_size, num_verify_tokens))
+    retrive_next_sibling = jnp.full((batch_size, num_verify_tokens), -1, dtype=jnp.int32)
+    return positions, retrive_index, retrive_next_token, retrive_next_sibling, draft_tokens
+
+
 def _extract_parent_branch_indices(
     parents_entry: np.ndarray, step_index: int, topk: int
 ) -> np.ndarray:
@@ -337,28 +369,19 @@ def build_tree_kernel_efficient(
                  retrive_next_sibling, draft_tokens)
     """
     if topk == 1:
-        draft_tokens = jnp.concatenate(
-            [
-                jnp.expand_dims(verified_id, axis=1),
-                token_list[:, : num_verify_tokens - 1],
-            ],
-            axis=1,
-        ).flatten()
-        positions = (
-            jnp.expand_dims(seq_lens, axis=1)
-            + jnp.arange(num_verify_tokens, dtype=jnp.int32)[None, :]
-        ).flatten()
-        retrive_index = jnp.arange(batch_size * num_verify_tokens, dtype=jnp.int32).reshape(
-            batch_size, num_verify_tokens
+        (
+            positions,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            draft_tokens,
+        ) = build_tree_kernel_topk1_linear(
+            verified_id,
+            token_list,
+            seq_lens,
+            num_verify_tokens,
+            batch_size,
         )
-        retrive_next_token = jnp.concatenate(
-            [
-                jnp.arange(1, num_verify_tokens, dtype=jnp.int32),
-                jnp.array([-1], dtype=jnp.int32),
-            ]
-        )
-        retrive_next_token = jnp.broadcast_to(retrive_next_token, (batch_size, num_verify_tokens))
-        retrive_next_sibling = jnp.full((batch_size, num_verify_tokens), -1, dtype=jnp.int32)
         return (
             None,
             positions,
