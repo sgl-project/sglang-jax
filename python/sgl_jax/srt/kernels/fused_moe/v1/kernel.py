@@ -2161,15 +2161,13 @@ def _fused_ep_moe_kernel(
                         next_buf_id = token_buf_id ^ jnp.int32(1)
                         next_start = next_tile_id * token_tile
 
-                        @pl.when((next_tile_id < num_token_tiles) & (bd1_id == 0))
+                        @pl.when(next_tile_id < num_token_tiles)
                         def _prefetch_tokens_for_next_bts(
                             next_start=next_start, next_buf_id=next_buf_id, bd1_id=bd1_id
                         ):
                             start_stage_a2a_s_tile_from_hbm(next_start, bd1_id, next_buf_id)
 
-                        @pl.when(bd1_id == 0)
-                        def _wait_stage(token_buf_id=token_buf_id):
-                            wait_stage_a2a_s_tile(token_buf_id)
+                        wait_stage_a2a_s_tile(token_buf_id)
 
                         tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
                         if disable_dynamic_ffn1:
@@ -2204,6 +2202,14 @@ def _fused_ep_moe_kernel(
                         jnp.int32(token_buf_offset),
                         unroll=False,
                     )
+
+                    # Cross-bd1 token prefetch: stage next bd1's tile0 into the idle
+                    # token buffer returned by the inner tile loop.
+                    @pl.when((num_token_tiles > 0) & (bd1_id + 1 < num_bd1))
+                    def _prefetch_bts0_tokens_for_next_bd():
+                        start_stage_a2a_s_tile_from_hbm(
+                            jnp.int32(0), bd1_id + jnp.int32(1), token_buf_after
+                        )
 
                     return (jnp.int32(next_bw_sem_id), token_buf_after)
 
