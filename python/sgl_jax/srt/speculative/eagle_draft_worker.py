@@ -431,6 +431,7 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
         forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens[:runtime_bs]
 
         self.capture_for_decode(logits_output, forward_batch.spec_info)
+        self._trim_prefill_spec_info_to_real_bs(forward_batch.spec_info, model_worker_batch.real_bs)
         return forward_batch.spec_info
 
     def capture_for_decode(self, logits_output, draft_input: EagleDraftInput):
@@ -441,6 +442,30 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
         draft_input.topk_p = topk_p
         draft_input.topk_index = topk_index
         draft_input.hidden_states = logits_output.hidden_states
+
+    def _trim_prefill_spec_info_to_real_bs(
+        self, draft_input: EagleDraftInput, real_bs: int
+    ) -> None:
+        keep_indices_host = np.arange(real_bs, dtype=np.int32)
+        keep_indices = device_array(
+            keep_indices_host,
+            sharding=NamedSharding(self.model_runner.mesh, P("data")),
+        )
+
+        def take_rows(value):
+            if value is None:
+                return None
+            if isinstance(value, jax.Array):
+                return _take_with_optional_out_sharding(
+                    value, keep_indices, trailing_slice=value.ndim > 1
+                )
+            return value[:real_bs]
+
+        draft_input.hidden_states = take_rows(draft_input.hidden_states)
+        draft_input.verified_id = take_rows(draft_input.verified_id)
+        draft_input.topk_p = take_rows(draft_input.topk_p)
+        draft_input.topk_index = take_rows(draft_input.topk_index)
+        draft_input.allocate_lens = take_rows(draft_input.allocate_lens)
 
     def draft_extend_for_decode(
         self, model_worker_batch: ModelWorkerBatch, batch_output: "GenerationBatchResult"

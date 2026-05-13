@@ -165,6 +165,18 @@ def test_eagle_prefill_runtime_state_uses_histogram_padded_indices():
     assert "_get_phase1_runtime_indices(model_worker_batch.real_bs)" in source
     assert "runtime_bs = real_indices.shape[0]" in source
     assert "model_worker_batch.seq_lens[:runtime_bs]" in source
+    assert "_trim_prefill_spec_info_to_real_bs" in source
+
+
+def test_eagle_prefill_bucket_padding_keeps_logical_state_real_bs():
+    source = inspect.getsource(EagleDraftWorker._trim_prefill_spec_info_to_real_bs)
+
+    assert "np.arange(real_bs" in source
+    assert "draft_input.hidden_states = take_rows" in source
+    assert "draft_input.verified_id = take_rows" in source
+    assert "draft_input.topk_p = take_rows" in source
+    assert "draft_input.topk_index = take_rows" in source
+    assert "draft_input.allocate_lens = take_rows" in source
 
 
 def test_task5_eagle_worker_verify_explicitly_accepts_verify_input():
