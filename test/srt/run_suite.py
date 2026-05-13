@@ -478,6 +478,8 @@ suites = {
         TestFile("python/sgl_jax/test/test_mesh.py", 1),
         TestFile("python/sgl_jax/test/test_linear_tp.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/layers/test_linear_attention.py", 5, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_kda_attention.py", 4),
+        TestFile("python/sgl_jax/test/test_kda_attention_dp.py", 4),
         TestFile("test/srt/test_moe_block_quant_e2e.py", 5, runner="pytest"),
     ],
     "kernel-performance-test-tpu-v6e-1": [
