@@ -184,6 +184,8 @@ def _estimate_vmem_bytes(
     t_stage_b32 = 2 * bts * (bd1 // 2) * 4  # Approximation
     # Kernel uses triple-buffering for a2a_s_acc staging: (3, bts, bd2 // t_packing)
     a2a_s_acc_stage_b32 = 3 * bts * (bd2 // 2) * 4  # Approximation
+    # Per-tile scatter recv VMEM buffer: (3, bts, t_packing, hidden // t_packing)
+    a2a_s_recv_x3 = 3 * bts * hidden * token_bytes
 
     # Routing / top-k temporaries in kernel (best-effort conservative estimate):
     b_topk_weights_x2_vmem = 2 * bt * padded_top_k * 4  # (2, bt, padded_top_k)
@@ -213,6 +215,7 @@ def _estimate_vmem_bytes(
         + b_acc
         + t_stage_b32
         + a2a_s_acc_stage_b32
+        + a2a_s_recv_x3
         + routing_temporaries
     )
 
@@ -313,6 +316,9 @@ def _estimate_vmem_bytes(
         )
         print(
             f"      a2a_s_acc_stage_x3:     {_mb(a2a_s_acc_stage_b32)} MB  (3, {bts}, {t_packing}, {bd2 // t_packing})"
+        )
+        print(
+            f"      a2a_s_recv_x3_vmem:     {_mb(a2a_s_recv_x3)} MB  (3, {bts}, {t_packing}, {hidden // t_packing})"
         )
         print(f"      routing_temporaries:    {_mb(routing_temporaries)} MB")
         if compute_intermediaries > 0:

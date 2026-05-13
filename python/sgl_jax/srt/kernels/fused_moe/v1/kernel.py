@@ -539,6 +539,7 @@ def _fused_ep_moe_kernel(
     b_b2_x2_vmem,  # None | <bw_sem_id> (2, t_packing, 1, bd2 // t_packing)
     b_acc_vmem,  # F32(2, align_to(bt * num_devices, bts), 1, bf)
     b_stage_x2_vmem,  # <token_buf_id> (2, bts, t_packing, bd1 // t_packing)
+    a2a_s_recv_x3_vmem,  # (3, bts, t_packing, hidden_size // t_packing) per-tile scatter recv
     a2a_s_acc_stage_x3_vmem,  # <acc_buf_id> (3, bts, t_packing, bd2 // t_packing)
     b_se_tokens_vmem,  # None | (2, 2, bt, t_packing, bd1 // t_packing) [Input Buffer: bt ping-pong x bd1-slice ping-pong]
     b_se_w1_x2_vmem,  # <sew_sem_id> (2, t_packing, bd1 // t_packing, bf)
@@ -557,6 +558,7 @@ def _fused_ep_moe_kernel(
     gather_send_x2_sems,  # <e_sem_id> (expert_buffer_count,)
     a2a_gather_sem,
     a2a_acc_sems,  # DMA(1,)
+    tile_recv_x3_sems,  # DMA(3,): per-tile scatter recv semaphores
     barrier_sem,
     *,
     top_k: int,
@@ -1040,6 +1042,89 @@ def _fused_ep_moe_kernel(
             unroll=False,
         )
         a2a_s_sends_x2_smem[e_sem_id] = send_sz
+
+    def reset_expert_offsets_for_scatter(*, bt_sem_id, local_e_id):
+        for d_id in range(num_devices):
+            e_id = jnp.int32(d_id * local_num_experts) + local_e_id
+            expert_offsets_x2_smem[bt_sem_id, 0, e_id] = jnp.int32(0)
+
+    def start_scatter_tile(*, bt_sem_id, e_sem_id, local_e_id, bt_start, tile_id, vmem_slot):
+        if disable_a2a:
+            return
+
+        tile_start_i = tile_id * jnp.int32(bts)
+        tile_end_i = tile_start_i + jnp.int32(bts)
+
+        def _scatter_one_tile(
+            t_id, send_sz, e_sem_id=e_sem_id, local_e_id=local_e_id,
+            bt_start=bt_start, tile_start_i=tile_start_i, tile_end_i=tile_end_i,
+            vmem_slot=vmem_slot,
+        ):
+            src_t_id = bt_start + t_id
+            for k_id in range(top_k):
+                e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
+                is_valid = e_id >= 0
+                e_id_safe = lax.select(is_valid, e_id, jnp.int32(0))
+                is_active_expert = is_valid & (e_id_safe % local_num_experts == local_e_id)
+                recv_id = e_id_safe // local_num_experts
+                offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe]
+                sz = lax.select(is_active_expert, jnp.int32(1), jnp.int32(0))
+                is_local = recv_id == my_id
+                local_sz = lax.select(is_local, sz, jnp.int32(0))
+                remote_sz = lax.select(is_local, jnp.int32(0), sz)
+                expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe] = offset + local_sz + remote_sz
+
+                in_tile = is_active_expert & (offset >= tile_start_i) & (offset < tile_end_i)
+                local_pos = offset - tile_start_i
+                in_tile_local = in_tile & (local_sz != 0)
+                in_tile_remote = in_tile & (remote_sz != 0)
+                send_sz += lax.select(in_tile_remote, jnp.int32(1), jnp.int32(0))
+
+                @pl.when(in_tile_local)
+                def _local_copy(
+                    src_t_id=src_t_id, local_pos=local_pos, local_sz=local_sz,
+                    vmem_slot=vmem_slot,
+                ):
+                    pltpu.make_async_copy(
+                        src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
+                        dst_ref=a2a_s_recv_x3_vmem.at[vmem_slot, pl.ds(local_pos, local_sz)],
+                        sem=tile_recv_x3_sems.at[vmem_slot],
+                    ).start()
+
+                @pl.when(in_tile_remote)
+                def _remote_copy(
+                    src_t_id=src_t_id, local_pos=local_pos, remote_sz=remote_sz,
+                    e_sem_id=e_sem_id, recv_id=recv_id, vmem_slot=vmem_slot,
+                ):
+                    pltpu.make_async_remote_copy(
+                        src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
+                        dst_ref=a2a_s_recv_x3_vmem.at[vmem_slot, pl.ds(local_pos, remote_sz)],
+                        send_sem=send_x2_sems.at[e_sem_id],
+                        recv_sem=tile_recv_x3_sems.at[vmem_slot],
+                        device_id=get_mesh_device_id(recv_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
+
+            return send_sz
+
+        tile_send_sz = lax.fori_loop(
+            0, bt, _scatter_one_tile, jnp.int32(0), unroll=False,
+        )
+        a2a_s_sends_x2_smem[e_sem_id] = a2a_s_sends_x2_smem[e_sem_id] + tile_send_sz
+
+    def wait_tile_recv(*, bt_sem_id, vmem_slot, e_id, tile_id):
+        if disable_a2a:
+            return
+        total_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
+        tile_start_i = tile_id * jnp.int32(bts)
+        tile_count = jnp.maximum(jnp.minimum(total_sz - tile_start_i, jnp.int32(bts)), jnp.int32(0))
+
+        @pl.when(tile_count > 0)
+        def _():
+            ref = a2a_s_recv_x3_vmem.at[vmem_slot, pl.ds(0, tile_count)]
+            pltpu.make_async_copy(
+                src_ref=ref, dst_ref=ref, sem=tile_recv_x3_sems.at[vmem_slot],
+            ).wait()
 
     def start_a2a_scatter_batch(*, bt_sem_id, bt_start):
         if disable_a2a:
@@ -1991,25 +2076,36 @@ def _fused_ep_moe_kernel(
 
         lax.fori_loop(0, num_loops, body, None)
 
-    def expert_ffn(bt_sem_id, e_sem_id, local_e_id):
+    def expert_ffn(
+        bt_sem_id, e_sem_id, local_e_id, *,
+        vmem_tile_slot=None, acc_offset=0,
+        drain_gather_flag=True, prefetch_next_flag=True,
+    ):
         b_acc_vmem_2d = b_acc_vmem.reshape(2, a2a_max_tokens, bf)
         b_acc1_vmem = b_acc_vmem_2d.at[0]
         b_acc3_vmem = b_acc_vmem_2d.at[1]
 
         e_id = my_id * local_num_experts + local_e_id
-        dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
-        dyn_sz_i32 = dyn_sz.astype(jnp.int32)
-        has_tokens = dyn_sz_i32 != 0
 
         # bd1_per_t_packing = bd1 // t_packing
         bd2_per_t_packing = bd2 // t_packing
-        # Stage tokens in bt-sized tiles from HBM -> VMEM (to reduce staging frequency),
-        # while keeping `btc` as the inner compute block size.
         token_tile = bts
-        num_token_tiles = (dyn_sz_i32 + (token_tile - 1)) // token_tile
+
+        if vmem_tile_slot is not None:
+            total_expert_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
+            dyn_sz_i32 = jnp.maximum(
+                jnp.minimum(total_expert_sz - acc_offset, jnp.int32(bts)), jnp.int32(0)
+            )
+            has_tokens = dyn_sz_i32 != 0
+            num_token_tiles = lax.select(has_tokens, jnp.int32(1), jnp.int32(0))
+        else:
+            dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
+            dyn_sz_i32 = dyn_sz.astype(jnp.int32)
+            has_tokens = dyn_sz_i32 != 0
+            num_token_tiles = (dyn_sz_i32 + (token_tile - 1)) // token_tile
 
         def start_stage_a2a_s_tile_from_hbm(tile_start, bd1_id, buf_id):
-            if disable_a2a_s_tile_read:
+            if disable_a2a_s_tile_read or vmem_tile_slot is not None:
                 return
             pltpu.make_async_copy(
                 src_ref=a2a_s_x2_hbm.at[
@@ -2028,7 +2124,7 @@ def _fused_ep_moe_kernel(
             ).start()
 
         def wait_stage_a2a_s_tile(buf_id):
-            if disable_a2a_s_tile_read:
+            if disable_a2a_s_tile_read or vmem_tile_slot is not None:
                 return
             pltpu.make_async_copy(
                 src_ref=b_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
@@ -2039,10 +2135,11 @@ def _fused_ep_moe_kernel(
         def start_load_stage_a2a_s_acc_tile_from_hbm(tile_start, bd2_start, buf_id):
             if disable_a2a_s_acc_tile_write:
                 return
+            hbm_start = tile_start + acc_offset
             pltpu.make_async_copy(
                 src_ref=a2a_s_acc_x2_hbm.at[
                     e_sem_id,
-                    pl.ds(tile_start, token_tile),
+                    pl.ds(hbm_start, token_tile),
                     pl.ds(0, t_packing),
                     pl.ds(bd2_start, bd2_per_t_packing),
                 ],
@@ -2073,6 +2170,7 @@ def _fused_ep_moe_kernel(
         def start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_id):
             if disable_a2a_s_acc_tile_write:
                 return
+            hbm_start = tile_start + acc_offset
             pltpu.make_async_copy(
                 src_ref=a2a_s_acc_stage_x3_vmem.at[
                     buf_id,
@@ -2082,7 +2180,7 @@ def _fused_ep_moe_kernel(
                 ],
                 dst_ref=a2a_s_acc_x2_hbm.at[
                     e_sem_id,
-                    pl.ds(tile_start, token_tile),
+                    pl.ds(hbm_start, token_tile),
                     pl.ds(0, t_packing),
                     pl.ds(bd2_start, bd2_per_t_packing),
                 ],
@@ -2173,8 +2271,18 @@ def _fused_ep_moe_kernel(
                         if disable_dynamic_ffn1:
                             return next_buf_id
 
+                        if vmem_tile_slot is not None:
+                            t_vmem_ref = a2a_s_recv_x3_vmem.at[
+                                vmem_tile_slot,
+                                pl.ds(0, bts),
+                                pl.ds(0, t_packing),
+                                pl.ds(bd1_id * bd1_per_t_packing, bd1_per_t_packing),
+                            ]
+                        else:
+                            t_vmem_ref = b_stage_x2_vmem.at[token_buf_id]
+
                         dynamic_ffn1(
-                            t_vmem=b_stage_x2_vmem.at[token_buf_id],
+                            t_vmem=t_vmem_ref,
                             w1_vmem=w1_vmem,
                             w1_scale_vmem=w1_scale_vmem,
                             b1_vmem=b1_vmem,
@@ -2267,7 +2375,10 @@ def _fused_ep_moe_kernel(
                     has_next_expert = local_e_id + 1 < local_num_experts
 
                     @pl.when(
-                        jnp.logical_and(jnp.logical_and(is_last_bf, is_last_bd2), has_next_expert)
+                        jnp.logical_and(
+                            jnp.logical_and(is_last_bf, is_last_bd2),
+                            has_next_expert,
+                        ) & prefetch_next_flag
                     )
                     def _prefetch_next_expert():
                         next_e_id = local_e_id + 1
@@ -2282,7 +2393,7 @@ def _fused_ep_moe_kernel(
 
                     if should_init_ffn2:
 
-                        @pl.when(bd2_id == 0)
+                        @pl.when((bd2_id == 0) & drain_gather_flag)
                         def _():
                             wait_a2a_gather_send(
                                 bt_sem_id=bt_sem_id,
@@ -2417,14 +2528,16 @@ def _fused_ep_moe_kernel(
                     start_fetch_bw3(next_local_e_id, jnp.int32(0), jnp.int32(0), jnp.int32(0))
 
         def _run_inactive(_):
-            # Preserve the gather-send drain and next-expert prefetch side effects so
-            # we can skip the bd1/bd2 loops when this expert receives no tokens.
-            wait_a2a_gather_send(
-                bt_sem_id=bt_sem_id,
-                e_sem_id=e_sem_id,
-                local_e_id=local_e_id - expert_buffer_count,
-            )
-            _prefetch_next_expert_if_needed()
+            @pl.when(drain_gather_flag)
+            def _():
+                wait_a2a_gather_send(
+                    bt_sem_id=bt_sem_id,
+                    e_sem_id=e_sem_id,
+                    local_e_id=local_e_id - expert_buffer_count,
+                )
+            @pl.when(prefetch_next_flag)
+            def _():
+                _prefetch_next_expert_if_needed()
             return jnp.int32(0)
 
         def _run_active(_):
@@ -2769,183 +2882,182 @@ def _fused_ep_moe_kernel(
         se_before = se_per_expert // 2
         se_after = se_per_expert - se_before
 
-        if expert_buffer_count >= local_num_experts:
-            # === BATCH SCATTER PATH ===
-            # Issue all scatter DMAs in one token-loop pass (bt iterations
-            # instead of bt * local_num_experts), then run a tight compute loop
-            # where each expert waits only its own recv semaphore.
-            start_a2a_scatter_batch(bt_sem_id=bt_sem_id, bt_start=bt_start)
+        # === PER-TILE SCATTER-TO-VMEM PIPELINED PATH ===
+        # 3-buffer scheme: slots 0,1 for intra-expert ping-pong,
+        # slot 2 for cross-expert tile-0 prefetch.
 
-            init_carry = jnp.int32(0)
+        # Kickoff: scatter tile 0 of expert 0 to VMEM[2].
+        a2a_s_sends_x2_smem[e_sem_id] = jnp.int32(0)
+        reset_expert_offsets_for_scatter(bt_sem_id=bt_sem_id, local_e_id=jnp.int32(0))
+        start_scatter_tile(
+            bt_sem_id=bt_sem_id, e_sem_id=e_sem_id,
+            local_e_id=jnp.int32(0), bt_start=bt_start,
+            tile_id=jnp.int32(0), vmem_slot=jnp.int32(2),
+        )
 
-            def compute_expert_batch(local_e_id, curr_se_block):
-                e_sem_id_local = local_e_id
+        init_carry = (e_sem_id, jnp.int32(0))
 
-                @pl.when(local_e_id == 0)
-                def _first_load():
-                    e_id = my_id * local_num_experts
-                    sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
+        def run_per_expert_pipelined(local_e_id, carry):
+            curr_e_sem_id, curr_se_block = carry
 
-                    @pl.when(sz != 0)
-                    def _():
-                        start_fetch_bw1(0, bw1_sem_id=0, bf_id=0, bd1_id=0)
-                        start_fetch_bw3(0, bw3_sem_id=0, bf_id=0, bd3_id=0)
-
-                for _ in range(se_before):
-                    run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
-                    curr_se_block += 1
-
-                wait_a2a_scatter_recv(
-                    bt_sem_id=bt_sem_id,
-                    e_sem_id=e_sem_id_local,
-                    local_e_id=local_e_id,
-                )
-                expert_ffn(bt_sem_id, e_sem_id_local, local_e_id)
-
-                start_a2a_gather(
-                    bt_sem_id=bt_sem_id,
-                    e_sem_id=e_sem_id_local,
-                    local_e_id=local_e_id,
-                )
-
-                for _ in range(se_after):
-                    run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
-                    curr_se_block += 1
-
-                return curr_se_block
-
-            final_se_block = lax.fori_loop(
-                0, local_num_experts, compute_expert_batch, init_carry, unroll=False
+            e_id_local = my_id * local_num_experts + local_e_id
+            total_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id_local]
+            num_tiles = lax.select(
+                total_sz > 0,
+                (total_sz + jnp.int32(bts - 1)) // jnp.int32(bts),
+                jnp.int32(0),
             )
 
-            def cleanup_body_batch(block_idx, _):
-                run_shared_expert_slice(block_idx, bt_id, bt_sem_id, out_buf_id)
-                return None
+            next_e_sem_id = (curr_e_sem_id + jnp.int32(1)) % jnp.int32(
+                expert_buffer_count
+            )
+            next_local_e_id = local_e_id + 1
 
-            lax.fori_loop(final_se_block, se_total_blocks, cleanup_body_batch, None)
-
-            wait_a2a_scatter_send_batch()
-            wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
-            sync_barrier()
-
-            acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
-
-            start_send_bo(bt_id=bt_id)
-
-            tail_start = max(local_num_experts - expert_buffer_count, 0)
-            for tail_local_e_id in range(tail_start, local_num_experts):
-                wait_a2a_gather_send(
-                    bt_sem_id=bt_sem_id,
-                    e_sem_id=tail_local_e_id,
-                    local_e_id=tail_local_e_id,
-                )
-
-            @pl.when(bt_id + 1 < num_bt)
+            @pl.when(curr_se_block == 0)
             def _():
-                sync_barrier()
+                run_shared_expert_slice(0, bt_id, bt_sem_id, out_buf_id)
 
-            final_e_sem_id = e_sem_id
+            curr_se_block = lax.select(curr_se_block == 0, jnp.int32(1), curr_se_block)
 
-        else:
-            # === EXISTING PIPELINED PATH ===
-            start_a2a_scatter(
-                bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=0, bt_start=bt_start
-            )
+            # --- Per-tile loop with 3-buffer overlap ---
+            def run_tile(tile_t, read_slot):
+                # Reload initial weights for this tile.
+                # tile 0 of expert 0: first-ever load.
+                # tile 0 of expert N>0: loaded by previous expert's prefetch (skip).
+                # tile 1+: reload needed (same expert, fresh sem cycle).
+                need_weight_load = (tile_t > 0) | (local_e_id == 0)
 
-            init_carry = (e_sem_id, jnp.int32(0))
-
-            def run_per_expert_pipelined(local_e_id, carry):
-                curr_e_sem_id, curr_se_block = carry
-
-                @pl.when(local_e_id == 0)
-                def _first_load():
-                    e_id = my_id * local_num_experts + local_e_id
-                    sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
-
-                    @pl.when(sz != 0)
-                    def _():
-                        start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
-                        start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
-
-                @pl.when(curr_se_block == 0)
+                @pl.when((total_sz > 0) & need_weight_load)
                 def _():
-                    run_shared_expert_slice(0, bt_id, bt_sem_id, out_buf_id)
+                    start_fetch_bw1(local_e_id, 0, 0, jnp.int32(0))
+                    start_fetch_bw3(local_e_id, 0, 0, jnp.int32(0))
 
-                curr_se_block = lax.select(curr_se_block == 0, jnp.int32(1), curr_se_block)
+                # Overlap: scatter next tile while computing current tile.
+                next_tile = tile_t + 1
+                has_next_tile = next_tile < num_tiles
+                write_slot = tile_t % 2
 
-                next_e_sem_id = (curr_e_sem_id + jnp.int32(1)) % jnp.int32(expert_buffer_count)
-                next_local_e_id = local_e_id + 1
-
-                @pl.when(next_local_e_id < local_num_experts)
+                @pl.when(has_next_tile)
                 def _():
-                    @pl.when(
-                        (next_local_e_id >= expert_buffer_count)
-                        & (next_local_e_id % expert_buffer_count == 0)
+                    reset_expert_offsets_for_scatter(
+                        bt_sem_id=bt_sem_id, local_e_id=local_e_id
                     )
-                    def _wait_before_buffer_reuse():
-                        sync_barrier()
-
-                    start_a2a_scatter(
-                        bt_sem_id=bt_sem_id,
-                        e_sem_id=next_e_sem_id,
-                        local_e_id=next_local_e_id,
-                        bt_start=bt_start,
+                    start_scatter_tile(
+                        bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id,
+                        local_e_id=local_e_id, bt_start=bt_start,
+                        tile_id=next_tile, vmem_slot=write_slot,
                     )
 
-                for _ in range(se_before):
-                    run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
-                    curr_se_block += 1
-
-                wait_a2a_scatter_recv(
-                    bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id
+                # Wait for current tile data.
+                wait_tile_recv(
+                    bt_sem_id=bt_sem_id, vmem_slot=read_slot,
+                    e_id=e_id_local, tile_id=tile_t,
                 )
-                expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id)
 
-                start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id)
+                # FFN on current tile.
+                is_first_tile = tile_t == 0
+                is_last_tile = ~has_next_tile
+                expert_ffn(
+                    bt_sem_id, curr_e_sem_id, local_e_id,
+                    vmem_tile_slot=read_slot,
+                    acc_offset=tile_t * jnp.int32(bts),
+                    drain_gather_flag=is_first_tile,
+                    prefetch_next_flag=is_last_tile,
+                )
 
-                for _ in range(se_after):
-                    run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
-                    curr_se_block += 1
+                return lax.select(has_next_tile, write_slot, jnp.int32(2))
 
-                wait_a2a_scatter_send(
+            lax.fori_loop(0, num_tiles, run_tile, jnp.int32(2), unroll=False)
+
+            # Zero-token experts: drain gather-send and prefetch next expert.
+            @pl.when(num_tiles == 0)
+            def _():
+                wait_a2a_gather_send(
                     bt_sem_id=bt_sem_id,
                     e_sem_id=curr_e_sem_id,
-                    local_e_id=local_e_id,
+                    local_e_id=local_e_id - expert_buffer_count,
                 )
-                return (next_e_sem_id, curr_se_block)
+                next_local_e = local_e_id + jnp.int32(1)
 
-            final_carry = lax.fori_loop(
-                0, local_num_experts, run_per_expert_pipelined, init_carry, unroll=False
-            )
-            final_e_sem_id, final_se_block = final_carry
+                @pl.when(next_local_e < local_num_experts)
+                def _():
+                    next_global_e = my_id * local_num_experts + next_local_e
+                    next_sz = expert_sizes_x2_smem[bt_sem_id, 0, next_global_e]
 
-            def cleanup_body(block_idx, _):
-                run_shared_expert_slice(block_idx, bt_id, bt_sem_id, out_buf_id)
-                return None
+                    @pl.when(next_sz != 0)
+                    def _():
+                        start_fetch_bw1(next_local_e, 0, 0, jnp.int32(0))
+                        start_fetch_bw3(next_local_e, 0, 0, jnp.int32(0))
 
-            lax.fori_loop(final_se_block, se_total_blocks, cleanup_body, None)
-
-            wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
-            sync_barrier()
-
-            acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
-
-            start_send_bo(bt_id=bt_id)
-
-            tail_start = max(local_num_experts - expert_buffer_count, 0)
-            for tail_local_e_id in range(tail_start, local_num_experts):
-                tail_sem_id = (e_sem_id + tail_local_e_id) % expert_buffer_count
-                wait_a2a_gather_send(
-                    bt_sem_id=bt_sem_id,
-                    e_sem_id=tail_sem_id,
-                    local_e_id=tail_local_e_id,
-                )
-
-            @pl.when(bt_id + 1 < num_bt)
+            # Cross-expert: scatter tile 0 of next expert to VMEM[2].
+            @pl.when(next_local_e_id < local_num_experts)
             def _():
-                sync_barrier()
+                @pl.when(
+                    (next_local_e_id >= expert_buffer_count)
+                    & (next_local_e_id % expert_buffer_count == 0)
+                )
+                def _wait_before_buffer_reuse():
+                    sync_barrier()
 
-            final_e_sem_id = final_e_sem_id
+                a2a_s_sends_x2_smem[next_e_sem_id] = jnp.int32(0)
+                reset_expert_offsets_for_scatter(
+                    bt_sem_id=bt_sem_id, local_e_id=next_local_e_id
+                )
+                start_scatter_tile(
+                    bt_sem_id=bt_sem_id, e_sem_id=next_e_sem_id,
+                    local_e_id=next_local_e_id, bt_start=bt_start,
+                    tile_id=jnp.int32(0), vmem_slot=jnp.int32(2),
+                )
+
+            for _ in range(se_before):
+                run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
+                curr_se_block += 1
+
+            start_a2a_gather(
+                bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id,
+            )
+
+            for _ in range(se_after):
+                run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
+                curr_se_block += 1
+
+            wait_a2a_scatter_send(
+                bt_sem_id=bt_sem_id,
+                e_sem_id=curr_e_sem_id,
+                local_e_id=local_e_id,
+            )
+            return (next_e_sem_id, curr_se_block)
+
+        final_carry = lax.fori_loop(
+            0, local_num_experts, run_per_expert_pipelined, init_carry, unroll=False,
+        )
+        final_e_sem_id, final_se_block = final_carry
+
+        def cleanup_body(block_idx, _):
+            run_shared_expert_slice(block_idx, bt_id, bt_sem_id, out_buf_id)
+            return None
+
+        lax.fori_loop(final_se_block, se_total_blocks, cleanup_body, None)
+
+        wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
+        sync_barrier()
+
+        acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
+
+        start_send_bo(bt_id=bt_id)
+
+        tail_start = max(local_num_experts - expert_buffer_count, 0)
+        for tail_local_e_id in range(tail_start, local_num_experts):
+            tail_sem_id = (e_sem_id + tail_local_e_id) % expert_buffer_count
+            wait_a2a_gather_send(
+                bt_sem_id=bt_sem_id,
+                e_sem_id=tail_sem_id,
+                local_e_id=tail_local_e_id,
+            )
+
+        @pl.when(bt_id + 1 < num_bt)
+        def _():
+            sync_barrier()
 
         return final_e_sem_id
 
@@ -3496,6 +3608,9 @@ def fused_ep_moe(
         pltpu.VMEM((2, a2a_max_tokens, 1, block_config.bf), jnp.float32),  # b_acc_vmem
         pltpu.VMEM((2, block_config.bts, t_packing, bd1_per_pack), t_dtype),  # b_stage_x2_vmem
         pltpu.VMEM(
+            (3, block_config.bts, t_packing, hidden_per_pack), t_dtype
+        ),  # a2a_s_recv_x3_vmem
+        pltpu.VMEM(
             (3, block_config.bts, t_packing, bd2_per_pack),
             t_dtype,
         ),  # a2a_s_acc_stage_x3_vmem
@@ -3544,6 +3659,7 @@ def fused_ep_moe(
         pltpu.SemaphoreType.DMA((expert_buffer_count,)),  # gather_send_x2_sems
         pltpu.SemaphoreType.DMA,  # a2a_gather_sem
         pltpu.SemaphoreType.DMA((1,)),  # a2a_acc_sems
+        pltpu.SemaphoreType.DMA((3,)),  # tile_recv_x3_sems
         pltpu.SemaphoreType.BARRIER,  # barrier_sem
     )
 
