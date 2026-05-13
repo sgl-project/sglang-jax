@@ -201,6 +201,11 @@ def _estimate_vmem_bytes(
         + expert_metadata_vmem
     )
 
+    # Scoped VMEM expert prefetch buffer (allocated via pl.run_scoped per expert):
+    # vmem_expert_tokens: (a2a_max_tokens, t_packing, h_per_t_packing) bf16
+    # prefetch_sem: 1 DMA semaphore
+    vmem_expert_prefetch = a2a_max_tokens * t_packing * (hidden // t_packing) * token_bytes
+
     total_bytes = (
         a2a_g_acc
         + b_output
@@ -215,6 +220,7 @@ def _estimate_vmem_bytes(
         + t_stage_b32
         + a2a_s_acc_stage_b32
         + routing_temporaries
+        + vmem_expert_prefetch
     )
 
     # Estimate compute intermediaries from scale-group fori_loops.
@@ -323,6 +329,10 @@ def _estimate_vmem_bytes(
             f"      a2a_s_acc_stage_x3:     {_mb(a2a_s_acc_stage_b32)} MB  (3, {bts}, {t_packing}, {bd2 // t_packing})"
         )
         print(f"      routing_temporaries:    {_mb(routing_temporaries)} MB")
+        print(
+            f"      vmem_expert_prefetch:   {_mb(vmem_expert_prefetch)} MB  "
+            f"({a2a_max_tokens}, {t_packing}, {hidden // t_packing}) scoped"
+        )
         if compute_intermediaries > 0:
             print(
                 f"      compute_intermediaries: {_mb(compute_intermediaries)} MB  (fori_loop single-iteration dot products)"
