@@ -202,9 +202,9 @@ def _estimate_vmem_bytes(
     )
 
     # Scoped VMEM expert prefetch buffer (allocated via pl.run_scoped per expert):
-    # vmem_expert_tokens: (a2a_max_tokens, t_packing, h_per_t_packing) bf16
+    # vmem_expert_tokens: (a2a_max_tokens, t_packing, bd1_per_t_packing) bf16
     # prefetch_sem: 1 DMA semaphore
-    vmem_expert_prefetch = a2a_max_tokens * t_packing * (hidden // t_packing) * token_bytes
+    vmem_expert_prefetch = a2a_max_tokens * t_packing * (bd1 // t_packing) * token_bytes
 
     total_bytes = (
         a2a_g_acc

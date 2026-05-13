@@ -2400,7 +2400,7 @@ def _fused_ep_moe_kernel(
 
         lax.fori_loop(0, num_loops, body, None)
 
-    def expert_ffn(bt_sem_id, e_sem_id, local_e_id, vmem_expert_tokens):
+    def expert_ffn(bt_sem_id, e_sem_id, local_e_id, vmem_expert_tokens, prefetch_sem):
         b_acc_vmem_2d = b_acc_vmem.reshape(2, a2a_max_tokens, bf)
         b_acc1_vmem = b_acc_vmem_2d.at[0]
         b_acc3_vmem = b_acc_vmem_2d.at[1]
@@ -2489,6 +2489,19 @@ def _fused_ep_moe_kernel(
                         start_fetch_bw1(local_e_id, next_bw_sem_id, bf_id, next_bd1_id)
                         start_fetch_bw3(local_e_id, next_bw_sem_id, bf_id, next_bd1_id)
 
+                    @pl.when(dyn_sz_i32 > 0)
+                    def _():
+                        pltpu.make_async_copy(
+                            src_ref=a2a_s_x2_hbm.at[
+                                e_sem_id,
+                                pl.ds(0, dyn_sz_i32),
+                                pl.ds(0, t_packing),
+                                pl.ds(bd1_id * bd1_per_t_packing, bd1_per_t_packing),
+                            ],
+                            dst_ref=vmem_expert_tokens.at[pl.ds(0, dyn_sz_i32)],
+                            sem=prefetch_sem,
+                        ).start()
+
                     w1_scale_vmem = (
                         None if b_w1_scale_x2_vmem is None else b_w1_scale_x2_vmem.at[bw_sem_id]
                     )
@@ -2502,6 +2515,13 @@ def _fused_ep_moe_kernel(
                     def _():
                         wait_fetch_bw1(local_e_id, bw_sem_id, bf_id, bd1_id)
                         wait_fetch_bw3(local_e_id, bw_sem_id, bf_id, bd1_id)
+
+                    @pl.when(dyn_sz_i32 > 0)
+                    def _():
+                        ref = vmem_expert_tokens.at[pl.ds(0, dyn_sz_i32)]
+                        pltpu.make_async_copy(
+                            src_ref=ref, dst_ref=ref, sem=prefetch_sem,
+                        ).wait()
 
                     w1_vmem = b_w1_x2_vmem.at[bw_sem_id]
                     w3_vmem = b_w3_x2_vmem.at[bw_sem_id]
@@ -2536,7 +2556,7 @@ def _fused_ep_moe_kernel(
                         t_vmem_arg = vmem_expert_tokens.at[
                             pl.ds(tile_start, token_tile),
                             pl.ds(0, t_packing),
-                            pl.ds(bd1_id * bd1_per_t_packing, bd1_per_t_packing),
+                            pl.ds(0, bd1_per_t_packing),
                         ]
 
                         dynamic_ffn1(
@@ -3168,30 +3188,12 @@ def _fused_ep_moe_kernel(
                 def _vmem_prefetch_body(vmem_expert_tokens, prefetch_sem,
                                         e_sem_id_local=e_sem_id_local,
                                         local_e_id=local_e_id):
-                    e_id = my_id * local_num_experts + local_e_id
-                    dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
-
-                    @pl.when(dyn_sz > 0)
-                    def _start_prefetch():
-                        pltpu.make_async_copy(
-                            src_ref=a2a_s_x2_hbm.at[
-                                e_sem_id_local, pl.ds(0, dyn_sz),
-                            ],
-                            dst_ref=vmem_expert_tokens.at[pl.ds(0, dyn_sz)],
-                            sem=prefetch_sem,
-                        ).start()
-
-                        ref = vmem_expert_tokens.at[pl.ds(0, dyn_sz)]
-                        pltpu.make_async_copy(
-                            src_ref=ref, dst_ref=ref, sem=prefetch_sem,
-                        ).wait()
-
                     expert_ffn(bt_sem_id, e_sem_id_local, local_e_id,
-                               vmem_expert_tokens)
+                               vmem_expert_tokens, prefetch_sem)
 
                 pl.run_scoped(
                     _vmem_prefetch_body,
-                    pltpu.VMEM((a2a_max_tokens, t_packing, h_per_t_packing), t_dtype),
+                    pltpu.VMEM((a2a_max_tokens, t_packing, bd1_per_t_packing), t_dtype),
                     pltpu.SemaphoreType.DMA,
                 )
 
@@ -3296,30 +3298,12 @@ def _fused_ep_moe_kernel(
                 def _vmem_prefetch_body_pip(vmem_expert_tokens, prefetch_sem,
                                             curr_e_sem_id=curr_e_sem_id,
                                             local_e_id=local_e_id):
-                    e_id = my_id * local_num_experts + local_e_id
-                    dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
-
-                    @pl.when(dyn_sz > 0)
-                    def _start_prefetch():
-                        pltpu.make_async_copy(
-                            src_ref=a2a_s_x2_hbm.at[
-                                curr_e_sem_id, pl.ds(0, dyn_sz),
-                            ],
-                            dst_ref=vmem_expert_tokens.at[pl.ds(0, dyn_sz)],
-                            sem=prefetch_sem,
-                        ).start()
-
-                        ref = vmem_expert_tokens.at[pl.ds(0, dyn_sz)]
-                        pltpu.make_async_copy(
-                            src_ref=ref, dst_ref=ref, sem=prefetch_sem,
-                        ).wait()
-
                     expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id,
-                               vmem_expert_tokens)
+                               vmem_expert_tokens, prefetch_sem)
 
                 pl.run_scoped(
                     _vmem_prefetch_body_pip,
-                    pltpu.VMEM((a2a_max_tokens, t_packing, h_per_t_packing), t_dtype),
+                    pltpu.VMEM((a2a_max_tokens, t_packing, bd1_per_t_packing), t_dtype),
                     pltpu.SemaphoreType.DMA,
                 )
 
