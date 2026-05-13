@@ -880,6 +880,50 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
                         ),
                         sharding=data_2d_sharding,
                     )
+                    select_hidden_states = hidden
+                    select_scores = None
+                    select_topk_p = topk_p
+                    select_topk_index = np.zeros((bs, self.topk), dtype=np.int32)
+                    for i in range(self.speculative_num_steps):
+                        input_ids, select_hidden_states, select_scores, tree_info = (
+                            select_top_k_tokens(
+                                i,
+                                select_topk_p,
+                                select_topk_index,
+                                select_hidden_states,
+                                select_scores,
+                                self.topk,
+                            )
+                        )
+                        if isinstance(input_ids, jax.Array):
+                            input_ids.block_until_ready()
+                        if isinstance(select_hidden_states, jax.Array):
+                            select_hidden_states.block_until_ready()
+                        if isinstance(select_scores, jax.Array):
+                            select_scores.block_until_ready()
+                        for tree_item in tree_info:
+                            if isinstance(tree_item, jax.Array):
+                                tree_item.block_until_ready()
+                        score_list, token_list, parents_list = update_eagle_lists(
+                            i, score_list, token_list, parents_list, tree_info, self.topk
+                        )
+                        score_list.block_until_ready()
+                        token_list.block_until_ready()
+                        parents_list.block_until_ready()
+                        if i == self.speculative_num_steps - 1:
+                            break
+                        select_topk_p = device_array(
+                            np.zeros((bs * self.topk, self.topk), dtype=np.float32),
+                            sharding=data_2d_sharding,
+                        ).astype(dtype)
+                        select_topk_index = device_array(
+                            np.zeros((bs * self.topk, self.topk), dtype=np.int32),
+                            sharding=data_2d_sharding,
+                        )
+                        select_hidden_states = device_array(
+                            np.zeros((bs * self.topk, hidden_size), dtype=np.float32),
+                            sharding=data_2d_sharding,
+                        ).astype(dtype)
                     for context_len in self.precompile_token_paddings:
                         verified_id_host = np.zeros((bs,), dtype=np.int32)
                         seq_lens_host = np.full((bs,), context_len, dtype=np.int32)
