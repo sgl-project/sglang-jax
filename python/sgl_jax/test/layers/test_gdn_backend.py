@@ -204,9 +204,13 @@ class GDNAttnBackendDispatchTest(unittest.TestCase):
             fb = _FakeForwardBatch(is_decode=True)
             out, new_conv, new_rec = backend(fb, mixed_qkv, b, a, pool, layer_id=0)
             self.assertEqual(out.shape, (B, backend.num_v_heads, backend.head_v_dim))
-            self.assertEqual(new_conv.shape, (B, backend.conv_dim, backend.conv_kernel_size - 1))
+            # `new_conv` / `new_rec` are the full pool tables (kernel scatters
+            # per-request slots in place). Pool was sized `B + 1`.
             self.assertEqual(
-                new_rec.shape, (B, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim)
+                new_conv.shape, (B + 1, backend.conv_dim, backend.conv_kernel_size - 1)
+            )
+            self.assertEqual(
+                new_rec.shape, (B + 1, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim)
             )
 
     def test_extend_dispatch(self):
@@ -226,9 +230,11 @@ class GDNAttnBackendDispatchTest(unittest.TestCase):
             fb = _FakeForwardBatch(is_decode=False)
             out, new_conv, new_rec = backend(fb, mixed_qkv, b, a, pool, layer_id=0)
             self.assertEqual(out.shape, (T, backend.num_v_heads, backend.head_v_dim))
-            self.assertEqual(new_conv.shape, (B, backend.conv_dim, backend.conv_kernel_size - 1))
             self.assertEqual(
-                new_rec.shape, (B, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim)
+                new_conv.shape, (B + 1, backend.conv_dim, backend.conv_kernel_size - 1)
+            )
+            self.assertEqual(
+                new_rec.shape, (B + 1, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim)
             )
 
 
@@ -270,9 +276,11 @@ class GDNAttnBackendExtendStateTest(unittest.TestCase):
             fb = _FakeForwardBatch(is_decode=False)
             out, new_conv, new_rec = backend(fb, mixed_qkv, b, a, pool, layer_id=0)
             self.assertEqual(out.shape, (T, backend.num_v_heads, backend.head_v_dim))
-            self.assertEqual(new_conv.shape, (B, backend.conv_dim, backend.conv_kernel_size - 1))
             self.assertEqual(
-                new_rec.shape, (B, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim)
+                new_conv.shape, (B + 1, backend.conv_dim, backend.conv_kernel_size - 1)
+            )
+            self.assertEqual(
+                new_rec.shape, (B + 1, backend.num_v_heads, backend.head_k_dim, backend.head_v_dim)
             )
             self.assertTrue(bool(jnp.all(jnp.isfinite(out))))
             self.assertTrue(bool(jnp.all(jnp.isfinite(new_rec))))

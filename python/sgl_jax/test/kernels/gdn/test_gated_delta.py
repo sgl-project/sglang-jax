@@ -124,6 +124,16 @@ class GatedDeltaStepTest(unittest.TestCase):
 
 
 class CausalConv1dUpdateTest(unittest.TestCase):
+    """Tests for the decode-path conv1d update.
+
+    State contract matches :func:`jax_causal_conv1d_prefill`: caller passes
+    the full per-layer ``conv_state`` table plus ``state_indices``; the
+    kernel gathers per-request state internally. Tests wrap the
+    ``[B, D, K-1]`` per-request state into a single-slot ``[1, D, K-1]``
+    table with ``state_indices=[0]`` … or, with multi-slot scenarios, place
+    each request's state in a distinct slot to verify the gather.
+    """
+
     def test_matches_window_dot(self):
         """y = window · weight (per-channel) where window = [state, x_new]."""
         B, D, K = 2, 3, 4
@@ -132,7 +142,11 @@ class CausalConv1dUpdateTest(unittest.TestCase):
         state = jax.random.normal(rng[1], (B, D, K - 1), dtype=jnp.float32)
         weight = jax.random.normal(rng[2], (D, K), dtype=jnp.float32)
 
-        y, new_state = jax_causal_conv1d_update(x, state, weight, bias=None)
+        # Pack the per-request state into a 1-slot-per-request pool.
+        conv_state = state  # [B, D, K-1] doubles as a B-slot table
+        state_indices = jnp.arange(B, dtype=jnp.int32)
+
+        y, new_state = jax_causal_conv1d_update(x, conv_state, state_indices, weight, bias=None)
 
         # Reference: window = [state | x_new], y = sum(window * weight) over K.
         window = jnp.concatenate([state, x[..., None]], axis=-1)  # [B, D, K]
@@ -148,9 +162,50 @@ class CausalConv1dUpdateTest(unittest.TestCase):
         state = jax.random.normal(rng[1], (B, D, K - 1))
         weight = jax.random.normal(rng[2], (D, K))
 
-        y_lin, _ = jax_causal_conv1d_update(x, state, weight, bias=None)
-        y_silu, _ = jax_causal_conv1d_update(x, state, weight, bias=None, activation="silu")
+        conv_state = state
+        state_indices = jnp.arange(B, dtype=jnp.int32)
+
+        y_lin, _ = jax_causal_conv1d_update(x, conv_state, state_indices, weight, bias=None)
+        y_silu, _ = jax_causal_conv1d_update(
+            x, conv_state, state_indices, weight, bias=None, activation="silu"
+        )
         np.testing.assert_allclose(y_silu, jax.nn.silu(y_lin), atol=1e-5)
+
+    def test_gather_picks_correct_slot(self):
+        """Per-request state must come from `state_indices[b]`, not from
+        positional alignment — verifies the gather is real."""
+        D, K = 2, 3
+        # Build a 4-slot pool with distinct, recognisable contents per slot.
+        pool = jnp.stack(
+            [
+                jnp.full((D, K - 1), 0.0),
+                jnp.full((D, K - 1), 1.0),
+                jnp.full((D, K - 1), 2.0),
+                jnp.full((D, K - 1), 3.0),
+            ]
+        )  # [4, D, K-1]
+        weight = jnp.ones((D, K))  # straight sum
+        x = jnp.zeros((2, D))  # only state should contribute to output
+        # Two requests pulling from slots 3 and 1, respectively.
+        state_indices = jnp.array([3, 1], dtype=jnp.int32)
+
+        y, new_state = jax_causal_conv1d_update(x, pool, state_indices, weight, bias=None)
+        # y[b, d] = sum(state[b] | x_new[b]) = sum(state[b]) since x=0.
+        # state[req0] = slot 3 = all 3.0 → window sum = 3 * (K-1) = 6.0.
+        # state[req1] = slot 1 = all 1.0 → window sum = 1 * (K-1) = 2.0.
+        np.testing.assert_allclose(y[0], 6.0 * jnp.ones(D), atol=1e-5)
+        np.testing.assert_allclose(y[1], 2.0 * jnp.ones(D), atol=1e-5)
+        # new_state is now the full pool table with per-request scatter-back.
+        # Slot 3 (req 0): old state = 3.0; window[..., 1:] keeps the K-2 newer
+        # taps (still 3.0) and the newest tap is the new token x = 0.
+        # Slot 1 (req 1): old state = 1.0; same pattern.
+        # Slots 0, 2 were not touched — unchanged from input pool.
+        np.testing.assert_allclose(new_state[3, :, :-1], 3.0, atol=1e-5)
+        np.testing.assert_allclose(new_state[1, :, :-1], 1.0, atol=1e-5)
+        np.testing.assert_allclose(new_state[3, :, -1], 0.0, atol=1e-5)
+        np.testing.assert_allclose(new_state[1, :, -1], 0.0, atol=1e-5)
+        np.testing.assert_allclose(new_state[0], 0.0, atol=1e-5)
+        np.testing.assert_allclose(new_state[2], 2.0, atol=1e-5)
 
 
 class CausalConv1dPrefillTest(unittest.TestCase):
@@ -211,8 +266,8 @@ class CausalConv1dPrefillTest(unittest.TestCase):
             state_indices=jnp.array([1], dtype=jnp.int32),
         )
         np.testing.assert_allclose(y, self._naive_conv(x, weight, init_left=prior), atol=1e-5)
-        # Final state still equals the last K-1 of x (request is long enough).
-        np.testing.assert_allclose(final[0], x[:, -(K - 1) :], atol=1e-5)
+        # Final state lives at the request's slot in the full table (state_indices=[1]).
+        np.testing.assert_allclose(final[1], x[:, -(K - 1) :], atol=1e-5)
 
     def test_multi_request_boundary_isolation(self):
         """Token 0 of request 1 must NOT see any token from request 0."""
@@ -303,6 +358,144 @@ class CausalConv1dPrefillTest(unittest.TestCase):
         np.testing.assert_allclose(y, x * weight, atol=1e-5)
         self.assertEqual(final.shape, (1, D, 0))
 
+    def test_has_initial_state_false_ignores_slot(self):
+        """For a brand-new prefill (has_initial_state=False) the gathered
+        slot must be treated as zeros — output should match a fresh prefill
+        with no prior state, regardless of what's in the slot.
+        """
+        D, K = 2, 3
+        T = 4
+        rng = jax.random.split(jax.random.key(40), 3)
+        x = jax.random.normal(rng[0], (D, T))
+        weight = jax.random.normal(rng[1], (D, K))
+        # Put non-zero "stale" data in the slot — must NOT leak into output.
+        stale = jax.random.normal(rng[2], (D, K - 1)) * 5.0
+        conv_state = jnp.zeros((2, D, K - 1)).at[1].set(stale)
+
+        y_masked, final_masked = jax_causal_conv1d_prefill(
+            x,
+            weight,
+            bias=None,
+            cu_seqlens=jnp.array([0, T], dtype=jnp.int32),
+            conv_state=conv_state,
+            state_indices=jnp.array([1], dtype=jnp.int32),
+            has_initial_state=jnp.array([False], dtype=jnp.bool_),
+        )
+        # Reference: same conv with NO prior state at all.
+        y_fresh, final_fresh = jax_causal_conv1d_prefill(
+            x,
+            weight,
+            bias=None,
+            cu_seqlens=jnp.array([0, T], dtype=jnp.int32),
+            conv_state=None,
+            state_indices=None,
+        )
+        np.testing.assert_allclose(y_masked, y_fresh, atol=1e-5)
+        # `final_masked` is the full pool table (scatter inside kernel); pluck
+        # the request's slot. `final_fresh` is the per-request fallback because
+        # `conv_state=None` skipped the scatter.
+        np.testing.assert_allclose(final_masked[1], final_fresh[0], atol=1e-5)
+
+    def test_has_initial_state_true_uses_slot(self):
+        """has_initial_state=True should be equivalent to the legacy
+        behavior (no mask) — verifies the mask is the *only* difference
+        introduced by the new arg.
+        """
+        D, K = 2, 3
+        T = 4
+        rng = jax.random.split(jax.random.key(41), 3)
+        x = jax.random.normal(rng[0], (D, T))
+        weight = jax.random.normal(rng[1], (D, K))
+        prior = jax.random.normal(rng[2], (D, K - 1))
+        conv_state = jnp.zeros((2, D, K - 1)).at[1].set(prior)
+
+        y_with_mask, final_with_mask = jax_causal_conv1d_prefill(
+            x,
+            weight,
+            bias=None,
+            cu_seqlens=jnp.array([0, T], dtype=jnp.int32),
+            conv_state=conv_state,
+            state_indices=jnp.array([1], dtype=jnp.int32),
+            has_initial_state=jnp.array([True], dtype=jnp.bool_),
+        )
+        y_no_arg, final_no_arg = jax_causal_conv1d_prefill(
+            x,
+            weight,
+            bias=None,
+            cu_seqlens=jnp.array([0, T], dtype=jnp.int32),
+            conv_state=conv_state,
+            state_indices=jnp.array([1], dtype=jnp.int32),
+        )
+        np.testing.assert_allclose(y_with_mask, y_no_arg, atol=1e-5)
+        np.testing.assert_allclose(final_with_mask, final_no_arg, atol=1e-5)
+
+    def test_has_initial_state_mixed_per_request(self):
+        """Two requests packed together: req0 has prior state and uses it;
+        req1 is a brand-new prefill and must NOT see its slot's contents."""
+        D, K = 1, 3
+        # Two requests of length 4 each.
+        x = jnp.concatenate(
+            [jnp.array([[1.0, 2.0, 3.0, 4.0]]), jnp.array([[5.0, 6.0, 7.0, 8.0]])], axis=-1
+        )  # [D=1, T=8]
+        weight = jnp.ones((D, K))  # straight sum of K-window
+        # Slot 1 holds prior=[10, 20] for req0; slot 2 has poison [99, 99] for req1.
+        prior_req0 = jnp.array([[10.0, 20.0]])
+        poison_req1 = jnp.array([[99.0, 99.0]])
+        conv_state = jnp.zeros((3, D, K - 1)).at[1].set(prior_req0).at[2].set(poison_req1)
+
+        y, final = jax_causal_conv1d_prefill(
+            x,
+            weight,
+            bias=None,
+            cu_seqlens=jnp.array([0, 4, 8], dtype=jnp.int32),
+            conv_state=conv_state,
+            state_indices=jnp.array([1, 2], dtype=jnp.int32),
+            has_initial_state=jnp.array([True, False], dtype=jnp.bool_),
+        )
+        # Req0 token 0 sums [prior_req0[1]=20, prior_req0[2]... wait, K-1=2 only.
+        # Logical pre-batch stream for req0: ..., 10, 20 (newest at idx 1).
+        # Window for req0[0] = [10, 20, x[0]=1] sum = 31.
+        # Window for req0[1] = [20, 1, 2] sum = 23.
+        # Window for req0[2] = [1, 2, 3] sum = 6.
+        # Window for req0[3] = [2, 3, 4] sum = 9.
+        np.testing.assert_allclose(y[0, :4], [31.0, 23.0, 6.0, 9.0], atol=1e-5)
+        # Req1 token 0: poison must be masked → treated as [0, 0, x[4]=5] sum = 5.
+        # NOT [99, 99, 5] = 203.
+        # Req1 token 1 = [0, 5, 6] sum = 11.
+        # Req1 token 2 = [5, 6, 7] sum = 18.
+        # Req1 token 3 = [6, 7, 8] sum = 21.
+        np.testing.assert_allclose(y[0, 4:], [5.0, 11.0, 18.0, 21.0], atol=1e-5)
+        # Final states scattered back into slots 1 and 2 (state_indices=[1, 2]).
+        np.testing.assert_allclose(final[1, 0], [3.0, 4.0], atol=1e-5)
+        np.testing.assert_allclose(final[2, 0], [7.0, 8.0], atol=1e-5)
+        # Slot 0 was unused — unchanged from input (zeros).
+        np.testing.assert_allclose(final[0], 0.0, atol=1e-5)
+
+    def test_has_initial_state_false_short_request_zero_padded(self):
+        """Regression test for the bug: a request shorter than K-1 with
+        has_initial_state=False must produce a final_state that's
+        left-padded with ZEROS, not with stale slot contents."""
+        D, K = 1, 4  # K-1 = 3 left-pad slots needed
+        T = 2  # request shorter than K-1
+        x = jnp.array([[10.0, 20.0]])
+        weight = jnp.zeros((D, K))  # output unused, focus on final_state
+        # Stale slot contents — must NOT leak into final_state.
+        stale = jnp.array([[77.0, 88.0, 99.0]])
+        conv_state = jnp.zeros((1, D, K - 1)).at[0].set(stale)
+
+        _, final = jax_causal_conv1d_prefill(
+            x,
+            weight,
+            bias=None,
+            cu_seqlens=jnp.array([0, T], dtype=jnp.int32),
+            conv_state=conv_state,
+            state_indices=jnp.array([0], dtype=jnp.int32),
+            has_initial_state=jnp.array([False], dtype=jnp.bool_),
+        )
+        # Logical stream for a fresh prefill of 2 tokens is [pad=0, 10, 20];
+        # last K-1=3 = [0, 10, 20]. The stale 77/88/99 must be invisible.
+        np.testing.assert_allclose(final[0, 0], [0.0, 10.0, 20.0], atol=1e-5)
+
 
 class DecodeGatedDeltaRuleRefTest(unittest.TestCase):
     """The decode kernel is the parallel-across-B specialisation of the
@@ -383,7 +576,8 @@ class DecodeGatedDeltaRuleRefTest(unittest.TestCase):
         )
         self.assertEqual(out.shape, (B, n_v, d_v))
         self.assertEqual(out.dtype, jnp.bfloat16)
-        self.assertEqual(new_rec.shape, (B, n_v, d_k, d_v))
+        # `new_rec` is the full pool table (kernel scatters internally).
+        self.assertEqual(new_rec.shape, (B + 1, n_v, d_k, d_v))
         self.assertEqual(new_rec.dtype, jnp.float32)
 
     def test_gqa_matches_ragged_with_singletons(self):

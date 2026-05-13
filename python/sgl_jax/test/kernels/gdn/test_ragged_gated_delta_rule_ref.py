@@ -156,7 +156,9 @@ class RaggedGatedDeltaRuleRefTest(unittest.TestCase):
         )
 
         np.testing.assert_allclose(out, ref_out, atol=1e-3, rtol=1e-3)
-        np.testing.assert_allclose(new_rec[0], ref_state, atol=1e-4, rtol=1e-4)
+        # `new_rec` is the full pool table (kernel scatters internally).
+        # state_indices=[1] → the updated slot is index 1.
+        np.testing.assert_allclose(new_rec[1], ref_state, atol=1e-4, rtol=1e-4)
 
     # --- Case 2: with initial state ----------------------------------------
     def test_initial_state_is_picked_up(self):
@@ -292,8 +294,10 @@ class RaggedGatedDeltaRuleRefTest(unittest.TestCase):
         )
         ref_out = jnp.concatenate([ref_out_0, ref_out_1], axis=0)
         np.testing.assert_allclose(out, ref_out, atol=1e-3, rtol=1e-3)
-        np.testing.assert_allclose(new_rec[0], ref_state_0, atol=1e-4, rtol=1e-4)
-        np.testing.assert_allclose(new_rec[1], ref_state_1, atol=1e-4, rtol=1e-4)
+        # `new_rec` is the full pool table; pluck the per-request slots
+        # (state_indices=[1, 2]).
+        np.testing.assert_allclose(new_rec[1], ref_state_0, atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(new_rec[2], ref_state_1, atol=1e-4, rtol=1e-4)
 
     # --- Case 4: padding tokens are ignored --------------------------------
     def test_padding_tokens_do_not_mutate_state(self):
@@ -453,13 +457,13 @@ class RaggedGatedDeltaRuleRefTest(unittest.TestCase):
             d_k=self.d_k,
             d_v=self.d_v,
         )
-        # Plant the prefill's final state back into the table at slot 1.
-        rec_for_decode = rec.at[1].set(new_rec_pref[0])
+        # `new_rec_pref` is already the full pool table with slot 1 updated —
+        # pass it straight in as the state table for the decode step.
         new_rec_dec, out_dec = ragged_gated_delta_rule_ref(
             mixed_qkv[T - 1 :],
             b[T - 1 :],
             a[T - 1 :],
-            rec_for_decode,
+            new_rec_pref,
             A_log,
             dt_bias,
             cu_seqlens=jnp.array([0, 1], dtype=jnp.int32),
@@ -471,9 +475,10 @@ class RaggedGatedDeltaRuleRefTest(unittest.TestCase):
             d_v=self.d_v,
         )
 
-        # Last-token output and final state should coincide.
+        # Last-token output and final state should coincide; per-request slot
+        # is index 1 in the full pool table.
         np.testing.assert_allclose(out_full[-1], out_dec[0], atol=1e-3, rtol=1e-3)
-        np.testing.assert_allclose(new_rec_full[0], new_rec_dec[0], atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(new_rec_full[1], new_rec_dec[1], atol=1e-4, rtol=1e-4)
 
 
 if __name__ == "__main__":

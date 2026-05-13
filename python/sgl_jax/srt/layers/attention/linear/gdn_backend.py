@@ -170,8 +170,13 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         single fused conv1d, so it needs exactly one conv buffer per layer
         (vs. KDA, which keeps q/k/v conv states as three list entries).
 
-        Returns ``(core_attn_out, new_conv, new_rec)`` per-request, shaped
-        for ``RecurrentStatePool.write_layer``.
+        Returns ``(core_attn_out, new_conv_state, new_rec_state)`` where
+        ``new_conv_state`` and ``new_rec_state`` are the full pool tables
+        with this layer's per-request slots updated (scatter happens
+        inside the kernel — see :func:`ragged_gated_delta_rule_ref` /
+        :func:`jax_causal_conv1d_prefill` and the decode-path equivalents).
+        Caller writes these back onto the pool (e.g. via
+        ``RecurrentStatePool.replace_buffer``).
         """
         recurrent_state, conv_states = self.get_layer_cache(recurrent_state_pool, layer_id)
         conv_state = conv_states[0]
@@ -212,10 +217,10 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             a_l,
             state_indices_l,
         ):
-            per_req_conv = conv_state_l[state_indices_l]
             conv_out, new_conv = jax_causal_conv1d_update(
                 mixed_qkv_l,
-                per_req_conv,
+                conv_state_l,
+                state_indices_l,
                 conv_weight_l,
                 bias=None,
                 activation="silu",
@@ -251,8 +256,8 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             ),
             out_specs=(
                 P(None, "tensor", None),  # out [B, n_v, d_v]
-                P(None, "tensor", None),  # new_conv [B, conv_dim, K-1]
-                P(None, "tensor", None, None),  # new_rec  [B, n_v, d_k, d_v]
+                P(None, "tensor", None),  # new_conv_state [num_blocks, conv_dim, K-1]
+                P(None, "tensor", None, None),  # new_rec_state [num_blocks, n_v, d_k, d_v]
             ),
             check_vma=False,
         )(
@@ -304,6 +309,9 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             has_initial_state_l,
         ):
             # jax_causal_conv1d_prefill operates on [D, T] (channel-first).
+            # Pass `has_initial_state` so brand-new prefills don't pick up
+            # stale conv state from a freshly-allocated slot (same mask
+            # contract as `ragged_gated_delta_rule_ref`).
             conv_out_dt, new_conv = jax_causal_conv1d_prefill(
                 x=mixed_qkv_l.T,
                 weight=conv_weight_l,
@@ -311,6 +319,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 cu_seqlens=cu_seqlens_l,
                 conv_state=conv_state_l,
                 state_indices=state_indices_l,
+                has_initial_state=has_initial_state_l,
                 activation="silu",
             )
             conv_out = conv_out_dt.T  # [T, D]
@@ -349,8 +358,8 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             ),
             out_specs=(
                 P(None, "tensor", None),  # out [T, n_v, d_v]
-                P(None, "tensor", None),  # new_conv [B, conv_dim, K-1]
-                P(None, "tensor", None, None),  # new_rec  [B, n_v, d_k, d_v]
+                P(None, "tensor", None),  # new_conv_state [num_blocks, conv_dim, K-1]
+                P(None, "tensor", None, None),  # new_rec_state [num_blocks, n_v, d_k, d_v]
             ),
             check_vma=False,
         )(

@@ -85,6 +85,7 @@ def jax_causal_conv1d_prefill(
     cu_seqlens: jax.Array | None = None,  # [B+1]
     conv_state: jax.Array | None = None,  # [num_blocks, D, kernel_size-1] full per-layer table
     state_indices: jax.Array | None = None,  # [B] req → slot
+    has_initial_state: jax.Array | None = None,  # [B] bool
     activation: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Depthwise causal conv1d over a ragged-batched packed sequence.
@@ -95,11 +96,26 @@ def jax_causal_conv1d_prefill(
     from ``conv_state`` (gathered via ``state_indices``) if provided, else
     zero.
 
-    Returns ``(y [D, T], final_state [B, D, K-1])``. ``final_state`` holds
-    the last ``K-1`` logical tokens of each request, with left-padding (zero
-    or from the gathered initial state) when the request is shorter than
-    ``K-1``. Scattering ``final_state`` back into the pool is the caller's
-    responsibility (``RecurrentStatePool.write_layer``).
+    ``has_initial_state``: ``[B]`` bool. ``True`` when the slot already
+    holds valid conv state from a previous chunk (chunked-prefill
+    continuation, prefix-cache hit, or running decode). ``False`` for
+    brand-new prefills, in which case the gathered slot is masked to
+    zero before use — the slot may hold stale state from a previously-
+    freed request and reading it would corrupt both the per-token
+    lookback AND the final-state left-pad for short requests. Mirrors
+    the same mask the recurrence ref applies. If ``None`` (the default),
+    behavior is "all True" (existing-state mode) to preserve backward
+    compatibility with callers that don't track this.
+
+    Returns ``(y [D, T], new_conv_state)``. ``new_conv_state`` holds the
+    last ``K-1`` logical tokens of each request, scattered back into the
+    full pool table at ``state_indices`` — its shape is
+    ``[num_blocks, D, K-1]`` (the input ``conv_state``'s shape) and its
+    dtype matches the pool. When ``conv_state`` is ``None`` (test
+    fixture mode with no pool), ``new_conv_state`` falls back to the
+    per-request ``[B, D, K-1]`` slice. The scatter happens inside the
+    kernel so the same shape contract holds when this ref is later
+    replaced by a Pallas kernel that writes directly into pool buffers.
     """
     if activation not in (None, "silu"):
         raise ValueError(f"Unsupported causal conv1d activation: {activation}")
@@ -124,6 +140,19 @@ def jax_causal_conv1d_prefill(
         # Gather per-seq prior state once up front; later lookups index by
         # local seq id rather than walking the full table per token.
         state = conv_state[state_indices]  # [B, D, K-1]
+        # Brand-new prefills (has_initial_state=False) must not read stale
+        # slot contents — the slot was previously owned by another request
+        # before allocation. Zero them out so both the per-token lookback
+        # gather AND the final-state left-pad treat them as fresh.
+        if has_initial_state is not None and K > 1:
+            assert has_initial_state.shape == (
+                B,
+            ), f"has_initial_state {has_initial_state.shape} != expected ({B},)"
+            state = jnp.where(
+                has_initial_state[:, None, None],
+                state,
+                jnp.zeros_like(state),
+            )
     else:
         state = None
 
@@ -196,25 +225,51 @@ def jax_causal_conv1d_prefill(
         # K == 1: the conv has no left context, so the "state" is empty.
         final_state = jnp.zeros((B, D, 0), dtype=x.dtype)
 
-    return y, final_state
+    # Scatter the per-request final state back into the full pool table.
+    # The fixture-only `conv_state is None` path returns the per-request
+    # slice as-is for tests that don't construct a pool.
+    if conv_state is not None:
+        new_conv_state = conv_state.at[state_indices].set(final_state.astype(conv_state.dtype))
+    else:
+        new_conv_state = final_state
+    return y, new_conv_state
 
 
 def jax_causal_conv1d_update(
     x: jax.Array,  # [B, D]  one new token per batch element
-    state: jax.Array,  # [B, D, kernel_size-1]
+    conv_state: jax.Array,  # [num_blocks, D, kernel_size-1]  full per-layer table
+    state_indices: jax.Array,  # [B]  req → slot
     weight: jax.Array,  # [D, kernel_size]
     bias: jax.Array | None = None,  # [D]
     activation: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Single-token causal conv1d update.
 
-    Returns ``(y [B, D], new_state [B, D, kernel_size-1])``.
+    State contract mirrors :func:`jax_causal_conv1d_prefill`: the caller
+    passes the full per-layer ``conv_state`` table plus ``state_indices``;
+    the per-request slice is gathered, updated, and scattered back inside
+    the kernel. Returns ``(y [B, D], new_conv_state)`` where
+    ``new_conv_state`` is the full pool table
+    ``[num_blocks, D, kernel_size-1]`` with the per-request slots
+    updated. Doing the scatter inside the kernel keeps the same shape
+    contract when this ref is later replaced by a Pallas kernel.
+
+    No ``has_initial_state`` mask here: decode always runs after at least
+    one extend chunk, so every slot's conv state is valid by invariant
+    (same lifecycle argument as :func:`decode_gated_delta_rule_ref`).
+    Brand-new prefills are routed through :func:`jax_causal_conv1d_prefill`,
+    which *does* honor ``has_initial_state``.
     """
     assert x.ndim == 2, f"x must be [B, D], got shape {x.shape}"
     B, D = x.shape
     kernel = int(weight.shape[1])
-    assert state.shape == (B, D, kernel - 1)
+    assert conv_state.shape[1:] == (
+        D,
+        kernel - 1,
+    ), f"conv_state {conv_state.shape} channels/kernel != ({D}, {kernel - 1})"
+    assert state_indices.shape == (B,), f"state_indices {state_indices.shape} != expected ({B},)"
 
+    state = conv_state[state_indices]  # [B, D, K-1]
     # Rolling buffer: [state(kernel-1), x_new] → window of length kernel.
     window = jnp.concatenate([state, x[..., None]], axis=-1)  # [B, D, K]
     y = jnp.einsum("bdk,dk->bd", window, weight.astype(x.dtype))
@@ -227,7 +282,10 @@ def jax_causal_conv1d_update(
     else:
         raise ValueError(f"Unsupported causal conv1d activation: {activation}")
     new_state = window[..., 1:]  # drop oldest
-    return y, new_state
+
+    # Scatter the per-request new state back into the full pool table.
+    new_conv_state = conv_state.at[state_indices].set(new_state.astype(conv_state.dtype))
+    return y, new_conv_state
 
 
 # ---------------------------------------------------------------------------
@@ -258,10 +316,15 @@ def ragged_gated_delta_rule_ref(
     count (tokens past it are padding and have their state writes gated
     off by ``valid_mask``).
 
-    Contract: the full per-layer recurrent-state table is passed in and
-    the gather to per-request state happens inside the kernel. Returns
-    per-request new state (matching ``RecurrentStatePool.write_layer``);
-    the caller owns the scatter back into the pool.
+    Contract: the kernel both gathers from and scatters back into the
+    full per-layer recurrent-state table — callers receive an updated
+    full table, no per-request scatter step needed at the caller. This
+    matches what an eventual Pallas kernel would do at the HLO boundary
+    (kernels output into pool buffers directly) and mirrors
+    ``tpu_inference.layers.common.ragged_conv1d_jax``'s
+    gather-once / scatter-once shape (we avoid tpu-inference's
+    full-table scan-carry pattern because the scan can keep its small
+    ``[B, ...]`` working buffer; we only scatter at the end).
 
     Args:
         mixed_qkv: Packed ``(Q | K | V)`` tokens of shape
@@ -291,9 +354,11 @@ def ragged_gated_delta_rule_ref(
         d_v: Per-head value dim.
 
     Returns:
-        ``(new_recurrent_state, output)`` where ``new_recurrent_state`` is
-        per-request, shape ``[B, n_v, d_k, d_v]`` (fp32), and ``output``
-        has shape ``[num_tokens, n_v, d_v]`` in ``mixed_qkv.dtype``.
+        ``(new_recurrent_state, output)`` where ``new_recurrent_state``
+        is the full pool table ``[num_blocks, n_v, d_k, d_v]`` (same
+        dtype as the input ``recurrent_state``) with the per-request
+        slots updated in place, and ``output`` has shape
+        ``[num_tokens, n_v, d_v]`` in ``mixed_qkv.dtype``.
     """
     num_tokens = mixed_qkv.shape[0]
     B = state_indices.shape[0]
@@ -367,7 +432,17 @@ def ragged_gated_delta_rule_ref(
         init_state,
         (query, key, value, b, a, req_indices, valid_mask),
     )
-    return new_state_buf, output
+
+    # Scatter the per-request final states back into the full pool table
+    # in one shot. The scan body kept its working buffer small
+    # (``[B, n_v, d_k, d_v]``); only this one ``at[].set`` touches the
+    # ``[num_blocks, ...]`` table. Cast to the pool's dtype (the scan
+    # carries fp32; the pool is typically fp32 too, but
+    # ``SGLANG_JAX_RECURRENT_STATE_DTYPE=bfloat16`` can override).
+    new_recurrent_state = recurrent_state.at[state_indices].set(
+        new_state_buf.astype(recurrent_state.dtype)
+    )
+    return new_recurrent_state, output
 
 
 def decode_gated_delta_rule_ref(
@@ -410,9 +485,11 @@ def decode_gated_delta_rule_ref(
             :func:`ragged_gated_delta_rule_ref`).
 
     Returns:
-        ``(new_recurrent_state, output)`` where ``new_recurrent_state`` is
-        per-request, shape ``[B, n_v, d_k, d_v]`` (fp32), and ``output``
-        has shape ``[B, n_v, d_v]`` in ``mixed_qkv.dtype``.
+        ``(new_recurrent_state, output)`` where ``new_recurrent_state``
+        is the full pool table ``[num_blocks, n_v, d_k, d_v]`` (same
+        dtype as the input ``recurrent_state``) with the per-request
+        slots updated in place, and ``output`` has shape
+        ``[B, n_v, d_v]`` in ``mixed_qkv.dtype``.
     """
     B = mixed_qkv.shape[0]
     key_dim = n_kq * d_k
@@ -437,4 +514,9 @@ def decode_gated_delta_rule_ref(
 
     state = recurrent_state[state_indices].astype(jnp.float32)
     new_state, out = _gated_delta_step(state, q_h, k_h, v_h, g, beta)
-    return new_state, out.astype(mixed_qkv.dtype)
+
+    # Scatter the per-request new state back into the full pool table.
+    new_recurrent_state = recurrent_state.at[state_indices].set(
+        new_state.astype(recurrent_state.dtype)
+    )
+    return new_recurrent_state, out.astype(mixed_qkv.dtype)

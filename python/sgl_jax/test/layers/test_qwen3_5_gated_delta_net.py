@@ -222,10 +222,12 @@ class Qwen3_5GatedDeltaNetEndToEndTest(unittest.TestCase):
         (out, new_conv, new_rec), B, T, cfg, conv_dim = self._run_layer(is_decode=True)
         self.assertEqual(out.shape, (T, cfg.hidden_size))
         self.assertEqual(out.dtype, jnp.bfloat16)
-        self.assertEqual(new_conv.shape, (B, conv_dim, cfg.linear_conv_kernel_dim - 1))
+        # `new_conv` / `new_rec` are full pool tables (kernel scatters
+        # per-request slots in place). Fake pool was sized `B + 1`.
+        self.assertEqual(new_conv.shape, (B + 1, conv_dim, cfg.linear_conv_kernel_dim - 1))
         self.assertEqual(
             new_rec.shape,
-            (B, cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim),
+            (B + 1, cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim),
         )
         self.assertTrue(bool(jnp.all(jnp.isfinite(out))))
 
@@ -233,10 +235,10 @@ class Qwen3_5GatedDeltaNetEndToEndTest(unittest.TestCase):
         (out, new_conv, new_rec), B, T, cfg, conv_dim = self._run_layer(is_decode=False)
         self.assertEqual(out.shape, (T, cfg.hidden_size))
         self.assertEqual(out.dtype, jnp.bfloat16)
-        self.assertEqual(new_conv.shape, (B, conv_dim, cfg.linear_conv_kernel_dim - 1))
+        self.assertEqual(new_conv.shape, (B + 1, conv_dim, cfg.linear_conv_kernel_dim - 1))
         self.assertEqual(
             new_rec.shape,
-            (B, cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim),
+            (B + 1, cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim),
         )
         self.assertTrue(bool(jnp.all(jnp.isfinite(out))))
 
