@@ -147,10 +147,6 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         if forward_batch.forward_mode == ForwardMode.DECODE:
             output, new_recurrent = self._forward_decode(q, k, v, ssm_states, slope)
         elif forward_batch.forward_mode == ForwardMode.EXTEND:
-            has_init = self.forward_metadata.has_initial_state
-            if has_init is not None:
-                mask = has_init[:, None, None, None].astype(ssm_states.dtype)
-                ssm_states = ssm_states * mask
             output, new_recurrent = self._forward_extend(q, k, v, ssm_states, slope)
         else:
             raise NotImplementedError(
@@ -169,7 +165,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         def _gather_local(buf, indices):
             return buf[indices]
 
-        return jax.shard_map(
+        state = jax.shard_map(
             _gather_local,
             mesh=self.mesh,
             in_specs=(
@@ -179,13 +175,21 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             out_specs=P("data", "tensor", None, None),
             check_vma=False,
         )(recurrent_buffer, recurrent_indices)
+        has_initial_state = self.forward_metadata.has_initial_state
+        if has_initial_state is not None:
+            state = jnp.where(has_initial_state[:, None, None, None], state, 0.0)
+        return state
 
     def set_ssm_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_recurrent):
         """Scatter recurrent states using shard_map."""
         recurrent_buffer, _ = self.get_layer_cache(recurrent_state_pool, layer_id)
 
         def _scatter_local(buf, indices, state):
-            return buf.at[indices].set(state)
+            # whenever indices == 0, write val otherwise
+            keep_mask = (indices == 0).reshape(-1, 1, 1, 1)
+            old = buf[indices]
+            safe_val = jnp.where(keep_mask, old, state)
+            return buf.at[indices].set(safe_val)
 
         return jax.shard_map(
             _scatter_local,
