@@ -278,13 +278,6 @@ def _estimate_vmem_bytes(
     total_bytes += se_w1 + se_w3 + se_w2 + se_tokens + se_acc
     total_bytes += se_w1_scale + se_w3_scale + se_w2_scale
 
-    # XLA's Memory Space Assignment (MSA) allocates significantly more VMEM
-    # than the sum of explicit scratch shapes due to buffer alignment, While
-    # loop state copies, and packing fragmentation.  Empirically measured at
-    # ~1.5x on TPU v6e with the fused MoE megakernel (67 MB scratch → 104 MB
-    # XLA actual).
-    total_bytes = int(total_bytes * 1.5)
-
     if verbose:
 
         def _mb(b: int) -> str:
@@ -337,7 +330,7 @@ def _estimate_vmem_bytes(
             print(
                 f"      compute_intermediaries: {_mb(compute_intermediaries)} MB  (fori_loop single-iteration dot products)"
             )
-        print("      xla_msa_overhead (1.5x): included in total")
+
         if use_shared_expert:
             bse = cfg.bse
             print(
