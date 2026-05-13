@@ -929,7 +929,18 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
 
         num_shared = getattr(self.config, "num_shared_experts", 0)
         use_fused = moe_backend == "fused"
-        if num_shared > 0 and not use_fused:
+        if num_shared > 0 and use_fused:
+            for hf_name, target_name in [
+                ("gate_proj", "w1_shared"),
+                ("up_proj", "w3_shared"),
+                ("down_proj", "w2_shared"),
+            ]:
+                mappings[f"{prefix}.mlp.shared_experts.{hf_name}.weight"] = WeightMapping(
+                    target_path=f"{target}.mlp.{target_name}",
+                    sharding=(None, None),
+                    transpose=True,
+                )
+        elif num_shared > 0:
             for proj, sharding in [
                 ("gate_proj", (None, "tensor")),
                 ("up_proj", (None, "tensor")),
