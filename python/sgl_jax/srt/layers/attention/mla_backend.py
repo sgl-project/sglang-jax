@@ -105,6 +105,12 @@ class MLAAttentionBackend(AttentionBackend):
         # TODO(tuner): hardcoded 4, matches upstream — should be autotuned.
         decode_batch_size: int = 4,
     ):
+        assert page_size > 1, (
+            "MLA attention backend does not support page_size=1. "
+            "The MLA v2 kernel packs KV slots and infers the effective page size "
+            "from cache_kv.shape[1] * kv_packing, which makes page_size=1 "
+            "inconsistent with allocator and metadata page semantics."
+        )
         self.num_heads = num_attn_heads
         self.kv_lora_rank = kv_lora_rank
         self.qk_nope_head_dim = qk_nope_head_dim
