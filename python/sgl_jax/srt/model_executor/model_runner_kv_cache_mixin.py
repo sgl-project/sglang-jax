@@ -109,16 +109,11 @@ def _per_req_state_bytes_from_config(cfg, tp_size: int) -> int:
 
 
 def _enforce_recurrent_state_server_constraints(server_args) -> None:
-    """Assert both disable_radix_cache=True and disable_overlap_schedule=True
-    for hybrid recurrent state models."""
+    """Assert server constraints for hybrid recurrent state models."""
     assert server_args.disable_radix_cache, (
         "Hybrid recurrent state models require --disable-radix-cache "
         "(prefix sharing is unsafe with recurrent state). Please pass "
         "--disable-radix-cache explicitly."
-    )
-    assert server_args.disable_overlap_schedule, (
-        "Hybrid recurrent state models require --disable-overlap-schedule "
-        "(this version does not support double-buffer ping-pong for recurrent state)."
     )
 
 
