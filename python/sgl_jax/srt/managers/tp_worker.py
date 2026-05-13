@@ -206,6 +206,7 @@ class ModelWorker:
             max_req_len=self.max_req_len,
             vocab_size=self.model_config.vocab_size,
             multimodal=server_args.multimodal,
+            has_recurrent_state=self.model_runner.linear_recurrent_config is not None,
         )
 
         self.parent_process = psutil.Process().parent()

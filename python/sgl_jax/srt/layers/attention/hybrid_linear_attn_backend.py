@@ -227,5 +227,22 @@ def attn_backend_wrapper(
     runner: ModelRunner,
     full_attn_backend: AttentionBackend,
 ):
-    """Wrap full_attn_backend in HybridLinearAttnBackend for hybrid models."""
-    return full_attn_backend
+    """Wrap full_attn_backend in HybridLinearAttnBackend for hybrid models.
+
+    For hybrid recurrent models (e.g. Kimi-Linear: KDA + MLA), build the
+    matching linear sub-backend and route by layer_id. For pure full-attn
+    models, return the full_attn_backend unchanged.
+    """
+    cfg = runner.linear_recurrent_config
+    if cfg is None:
+        return full_attn_backend
+
+    # Only supported linear sub-backend today is KDA.
+    from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+
+    linear_attn_backend = KDAAttnBackend(mesh=runner.mesh)
+    return HybridLinearAttnBackend(
+        full_attn_backend=full_attn_backend,
+        linear_attn_backend=linear_attn_backend,
+        full_attn_layers=cfg.full_attention_layer_ids,
+    )
