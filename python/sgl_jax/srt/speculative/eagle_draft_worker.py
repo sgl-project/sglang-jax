@@ -379,7 +379,7 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
         # FIXME(pc) move this all prepare to prepare_for_extend_after_target_prefill
         index_sharding = NamedSharding(self.model_runner.mesh, P("data"))
         real_indices = device_array(
-            np.arange(model_worker_batch.real_bs, dtype=np.int32),
+            self._get_phase1_runtime_indices(model_worker_batch.real_bs),
             sharding=index_sharding,
         )
         padded_indices = device_array(
@@ -427,9 +427,8 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
         forward_batch.spec_info.verified_id = _take_with_optional_out_sharding(
             forward_batch.spec_info.verified_id, real_indices
         )
-        forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens[
-            : model_worker_batch.real_bs
-        ]
+        runtime_bs = real_indices.shape[0]
+        forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens[:runtime_bs]
 
         self.capture_for_decode(logits_output, forward_batch.spec_info)
         return forward_batch.spec_info
@@ -577,6 +576,19 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
         if max_bs <= 0:
             return []
         return [bs for bs in (1, 2, 4, 8, 16) if bs <= max_bs]
+
+    def _get_phase1_runtime_bs_padding(self, real_bs: int) -> int:
+        for bs in self._get_phase1_runtime_bs_candidates():
+            if bs >= real_bs:
+                return bs
+        return real_bs
+
+    def _get_phase1_runtime_indices(self, real_bs: int) -> np.ndarray:
+        padded_bs = self._get_phase1_runtime_bs_padding(real_bs)
+        indices = np.arange(padded_bs, dtype=np.int32)
+        if padded_bs > real_bs:
+            indices[real_bs:] = max(real_bs - 1, 0)
+        return indices
 
     def _get_padding_bs_for_real_bs(self, real_bs: int) -> int:
         for bs in sorted(self.precompile_bs_paddings):

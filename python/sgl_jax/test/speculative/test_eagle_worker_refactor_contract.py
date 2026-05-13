@@ -140,6 +140,12 @@ def test_eagle_extend_precompile_uses_phase1_real_batch_candidates():
     worker.precompile_bs_paddings = [16]
 
     assert worker._get_phase1_runtime_bs_candidates() == [1, 2, 4, 8, 16]
+    assert worker._get_phase1_runtime_bs_padding(6) == 8
+    assert worker._get_phase1_runtime_bs_padding(15) == 16
+    np.testing.assert_array_equal(
+        worker._get_phase1_runtime_indices(6),
+        np.array([0, 1, 2, 3, 4, 5, 5, 5], dtype=np.int32),
+    )
     assert worker._get_padding_bs_for_real_bs(1) == 16
     assert worker._get_padding_bs_for_real_bs(16) == 16
 
@@ -151,6 +157,14 @@ def test_eagle_extend_precompile_models_multiple_real_batch_shapes():
     assert "model_worker_batch.real_bs = real_bs" in source
     assert "model_worker_batch.seq_lens[:real_bs] = tokens_per_req" in source
     assert "model_worker_batch.logits_indices[real_bs:] = 0" in source
+
+
+def test_eagle_prefill_runtime_state_uses_histogram_padded_indices():
+    source = inspect.getsource(EagleDraftWorker.draft_extend_for_prefill)
+
+    assert "_get_phase1_runtime_indices(model_worker_batch.real_bs)" in source
+    assert "runtime_bs = real_indices.shape[0]" in source
+    assert "model_worker_batch.seq_lens[:runtime_bs]" in source
 
 
 def test_task5_eagle_worker_verify_explicitly_accepts_verify_input():
