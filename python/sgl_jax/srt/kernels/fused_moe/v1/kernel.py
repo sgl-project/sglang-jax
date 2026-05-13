@@ -579,6 +579,7 @@ def _fused_ep_moe_kernel(
     use_vmem_permute_scatter: bool = False,
     use_overlap_scatter: bool = False,
     use_vmem_preload_scatter: bool = False,
+    use_vmem_expert_prefetch: bool = False,
     quant_block_k: int | None = None,
     # Kernel tuning params.
     bt: int,  # Outer token tile size (output tiling).
@@ -1100,61 +1101,6 @@ def _fused_ep_moe_kernel(
             return None
 
         lax.fori_loop(0, bt, _scatter_one_batch, None, unroll=False)
-
-    def start_a2a_scatter_vmem_preload(*, bt_sem_id, bt_start, vmem_tokens):
-        """Scatter from pre-loaded VMEM buffer instead of HBM."""
-        if disable_a2a:
-            return
-        for slot in range(expert_buffer_count):
-            a2a_s_sends_x2_smem[slot] = jnp.int32(0)
-
-        def _scatter_one_vmem(t_id, _):
-            for k_id in range(top_k):
-                e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
-                is_valid = e_id >= 0
-                e_id_safe = lax.select(is_valid, e_id, jnp.int32(0))
-                e_sem_id_k = e_id_safe % jnp.int32(local_num_experts)
-                recv_id = e_id_safe // local_num_experts
-                offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe]
-                sz = lax.select(is_valid, jnp.int32(1), jnp.int32(0))
-                is_local = recv_id == my_id
-                local_sz = lax.select(is_local, sz, jnp.int32(0))
-                remote_sz = lax.select(is_local, jnp.int32(0), sz)
-                expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe] = offset + local_sz + remote_sz
-                start = expert_starts_x2_smem[bt_sem_id, 0, e_id_safe] + offset
-                cur_sends = a2a_s_sends_x2_smem[e_sem_id_k]
-                a2a_s_sends_x2_smem[e_sem_id_k] = cur_sends + remote_sz
-
-                @pl.when(local_sz != 0)
-                def _local_copy(
-                    t_id=t_id, start=start, local_sz=local_sz, e_sem_id_k=e_sem_id_k
-                ):
-                    pltpu.make_async_copy(
-                        src_ref=vmem_tokens.at[pl.ds(t_id, local_sz)],
-                        dst_ref=a2a_s_x2_hbm.at[e_sem_id_k, pl.ds(start, local_sz)],
-                        sem=recv_x2_sems.at[e_sem_id_k],
-                    ).start()
-
-                @pl.when(remote_sz != 0)
-                def _remote_copy(
-                    t_id=t_id,
-                    start=start,
-                    remote_sz=remote_sz,
-                    e_sem_id_k=e_sem_id_k,
-                    recv_id=recv_id,
-                ):
-                    pltpu.make_async_remote_copy(
-                        src_ref=vmem_tokens.at[pl.ds(t_id, remote_sz)],
-                        dst_ref=a2a_s_x2_hbm.at[e_sem_id_k, pl.ds(start, remote_sz)],
-                        send_sem=send_x2_sems.at[e_sem_id_k],
-                        recv_sem=recv_x2_sems.at[e_sem_id_k],
-                        device_id=get_mesh_device_id(recv_id),
-                        device_id_type=pltpu.DeviceIdType.MESH,
-                    ).start()
-
-            return None
-
-        lax.fori_loop(0, bt, _scatter_one_vmem, None, unroll=False)
 
     def wait_a2a_scatter_send_batch():
         if disable_a2a:
@@ -2457,7 +2403,8 @@ def _fused_ep_moe_kernel(
 
         lax.fori_loop(0, num_loops, body, None)
 
-    def expert_ffn(bt_sem_id, e_sem_id, local_e_id):
+    def expert_ffn(bt_sem_id, e_sem_id, local_e_id,
+                   vmem_expert_tokens=None, vmem_prefetch_sem=None, vmem_prefetch_dyn_sz=None):
         b_acc_vmem_2d = b_acc_vmem.reshape(2, a2a_max_tokens, bf)
         b_acc1_vmem = b_acc_vmem_2d.at[0]
         b_acc3_vmem = b_acc_vmem_2d.at[1]
@@ -2467,6 +2414,8 @@ def _fused_ep_moe_kernel(
         dyn_sz_i32 = dyn_sz.astype(jnp.int32)
         has_tokens = dyn_sz_i32 != 0
 
+        use_vmem_tokens = vmem_expert_tokens is not None
+
         # bd1_per_t_packing = bd1 // t_packing
         bd2_per_t_packing = bd2 // t_packing
         # Stage tokens in bt-sized tiles from HBM -> VMEM (to reduce staging frequency),
@@ -2475,7 +2424,7 @@ def _fused_ep_moe_kernel(
         num_token_tiles = (dyn_sz_i32 + (token_tile - 1)) // token_tile
 
         def start_stage_a2a_s_tile_from_hbm(tile_start, bd1_id, buf_id):
-            if disable_a2a_s_tile_read:
+            if disable_a2a_s_tile_read or use_vmem_tokens:
                 return
             pltpu.make_async_copy(
                 src_ref=a2a_s_x2_hbm.at[
@@ -2494,7 +2443,7 @@ def _fused_ep_moe_kernel(
             ).start()
 
         def wait_stage_a2a_s_tile(buf_id):
-            if disable_a2a_s_tile_read:
+            if disable_a2a_s_tile_read or use_vmem_tokens:
                 return
             pltpu.make_async_copy(
                 src_ref=b_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
@@ -2573,9 +2522,17 @@ def _fused_ep_moe_kernel(
                     # prefetched by the previous bd1 into the idle token buffer.
                     @pl.when((num_token_tiles > 0) & (bd1_id == 0))
                     def _prefetch_tokens_for_bd0_bts0():
-                        start_stage_a2a_s_tile_from_hbm(
-                            jnp.int32(0), bd1_id, jnp.int32(token_buf_offset)
-                        )
+                        if use_vmem_tokens and vmem_prefetch_sem is not None:
+                            @pl.when(vmem_prefetch_dyn_sz > 0)
+                            def _():
+                                ref = vmem_expert_tokens.at[pl.ds(0, vmem_prefetch_dyn_sz)]
+                                pltpu.make_async_copy(
+                                    src_ref=ref, dst_ref=ref, sem=vmem_prefetch_sem,
+                                ).wait()
+                        else:
+                            start_stage_a2a_s_tile_from_hbm(
+                                jnp.int32(0), bd1_id, jnp.int32(token_buf_offset)
+                            )
 
                     @pl.when(has_tokens & (next_bd1_id < num_bd1))
                     def _():
@@ -2639,8 +2596,17 @@ def _fused_ep_moe_kernel(
                         if disable_dynamic_ffn1:
                             return next_buf_id
 
+                        if use_vmem_tokens:
+                            t_vmem_arg = vmem_expert_tokens.at[
+                                pl.ds(tile_start, token_tile),
+                                pl.ds(0, t_packing),
+                                pl.ds(bd1_id * bd1_per_t_packing, bd1_per_t_packing),
+                            ]
+                        else:
+                            t_vmem_arg = b_stage_x2_vmem.at[token_buf_id]
+
                         dynamic_ffn1(
-                            t_vmem=b_stage_x2_vmem.at[token_buf_id],
+                            t_vmem=t_vmem_arg,
                             w1_vmem=w1_vmem,
                             w1_scale_vmem=w1_scale_vmem,
                             b1_vmem=b1_vmem,
@@ -3219,41 +3185,14 @@ def _fused_ep_moe_kernel(
 
         expert_starts = jnp.zeros_like(expert_sizes)
 
-        if use_vmem_preload_scatter and expert_buffer_count >= local_num_experts:
-            def _vmem_preload_body(vmem_tokens, preload_sem):
-                pltpu.make_async_copy(
-                    src_ref=tokens_hbm.at[pl.ds(bt_start, bt)],
-                    dst_ref=vmem_tokens.at[pl.ds(0, bt)],
-                    sem=preload_sem,
-                ).start()
-                all_reduce_metadata(
-                    bt_id=bt_id,
-                    bt_sem_id=bt_sem_id,
-                    t2e_routing=t2e_routing,
-                    starts=expert_starts,
-                    sizes=expert_sizes,
-                )
-                wait_store_output(bt_id=bt_id - 2)
-                ref = vmem_tokens.at[pl.ds(0, bt)]
-                pltpu.make_async_copy(src_ref=ref, dst_ref=ref, sem=preload_sem).wait()
-                start_a2a_scatter_vmem_preload(
-                    bt_sem_id=bt_sem_id, bt_start=bt_start, vmem_tokens=vmem_tokens,
-                )
-
-            pl.run_scoped(
-                _vmem_preload_body,
-                pltpu.VMEM((bt, t_packing, h_per_t_packing), t_dtype),
-                pltpu.SemaphoreType.DMA,
-            )
-        else:
-            all_reduce_metadata(
-                bt_id=bt_id,
-                bt_sem_id=bt_sem_id,
-                t2e_routing=t2e_routing,
-                starts=expert_starts,
-                sizes=expert_sizes,
-            )
-            wait_store_output(bt_id=bt_id - 2)
+        all_reduce_metadata(
+            bt_id=bt_id,
+            bt_sem_id=bt_sem_id,
+            t2e_routing=t2e_routing,
+            starts=expert_starts,
+            sizes=expert_sizes,
+        )
+        wait_store_output(bt_id=bt_id - 2)
 
         se_per_expert = (
             max(2, cdiv(se_total_blocks, local_num_experts)) if se_total_blocks > 0 else 2
@@ -3266,15 +3205,14 @@ def _fused_ep_moe_kernel(
             # Issue all scatter DMAs in one token-loop pass (bt iterations
             # instead of bt * local_num_experts), then run a tight compute loop
             # where each expert waits only its own recv semaphore.
-            if not use_vmem_preload_scatter:
-                if use_batch_dma_scatter:
-                    start_a2a_scatter_batch_dma(bt_sem_id=bt_sem_id, bt_start=bt_start)
-                elif use_vmem_permute_scatter:
-                    start_a2a_scatter_vmem_permute(bt_sem_id=bt_sem_id, bt_start=bt_start)
-                elif use_overlap_scatter:
-                    start_a2a_scatter_overlap(bt_sem_id=bt_sem_id, bt_start=bt_start)
-                else:
-                    start_a2a_scatter_batch(bt_sem_id=bt_sem_id, bt_start=bt_start)
+            if use_batch_dma_scatter:
+                start_a2a_scatter_batch_dma(bt_sem_id=bt_sem_id, bt_start=bt_start)
+            elif use_vmem_permute_scatter:
+                start_a2a_scatter_vmem_permute(bt_sem_id=bt_sem_id, bt_start=bt_start)
+            elif use_overlap_scatter:
+                start_a2a_scatter_overlap(bt_sem_id=bt_sem_id, bt_start=bt_start)
+            else:
+                start_a2a_scatter_batch(bt_sem_id=bt_sem_id, bt_start=bt_start)
 
             init_carry = jnp.int32(0)
 
@@ -3300,7 +3238,39 @@ def _fused_ep_moe_kernel(
                     e_sem_id=e_sem_id_local,
                     local_e_id=local_e_id,
                 )
-                expert_ffn(bt_sem_id, e_sem_id_local, local_e_id)
+
+                if use_vmem_expert_prefetch:
+                    def _vmem_prefetch_body(vmem_expert_tokens, prefetch_sem,
+                                            e_sem_id_local=e_sem_id_local,
+                                            local_e_id=local_e_id):
+                        e_id = my_id * local_num_experts + local_e_id
+                        dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
+
+                        @pl.when(dyn_sz > 0)
+                        def _start_prefetch():
+                            pltpu.make_async_copy(
+                                src_ref=a2a_s_x2_hbm.at[
+                                    e_sem_id_local, pl.ds(0, dyn_sz),
+                                ],
+                                dst_ref=vmem_expert_tokens.at[pl.ds(0, dyn_sz)],
+                                sem=prefetch_sem,
+                            ).start()
+
+                            ref = vmem_expert_tokens.at[pl.ds(0, dyn_sz)]
+                            pltpu.make_async_copy(
+                                src_ref=ref, dst_ref=ref, sem=prefetch_sem,
+                            ).wait()
+
+                        expert_ffn(bt_sem_id, e_sem_id_local, local_e_id,
+                                   vmem_expert_tokens=vmem_expert_tokens)
+
+                    pl.run_scoped(
+                        _vmem_prefetch_body,
+                        pltpu.VMEM((a2a_max_tokens, t_packing, h_per_t_packing), t_dtype),
+                        pltpu.SemaphoreType.DMA,
+                    )
+                else:
+                    expert_ffn(bt_sem_id, e_sem_id_local, local_e_id)
 
                 start_a2a_gather(
                     bt_sem_id=bt_sem_id,
@@ -3399,7 +3369,39 @@ def _fused_ep_moe_kernel(
                 wait_a2a_scatter_recv(
                     bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id
                 )
-                expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id)
+
+                if use_vmem_expert_prefetch:
+                    def _vmem_prefetch_body_pip(vmem_expert_tokens, prefetch_sem,
+                                                curr_e_sem_id=curr_e_sem_id,
+                                                local_e_id=local_e_id):
+                        e_id = my_id * local_num_experts + local_e_id
+                        dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
+
+                        @pl.when(dyn_sz > 0)
+                        def _start_prefetch():
+                            pltpu.make_async_copy(
+                                src_ref=a2a_s_x2_hbm.at[
+                                    curr_e_sem_id, pl.ds(0, dyn_sz),
+                                ],
+                                dst_ref=vmem_expert_tokens.at[pl.ds(0, dyn_sz)],
+                                sem=prefetch_sem,
+                            ).start()
+
+                            ref = vmem_expert_tokens.at[pl.ds(0, dyn_sz)]
+                            pltpu.make_async_copy(
+                                src_ref=ref, dst_ref=ref, sem=prefetch_sem,
+                            ).wait()
+
+                        expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id,
+                                   vmem_expert_tokens=vmem_expert_tokens)
+
+                    pl.run_scoped(
+                        _vmem_prefetch_body_pip,
+                        pltpu.VMEM((a2a_max_tokens, t_packing, h_per_t_packing), t_dtype),
+                        pltpu.SemaphoreType.DMA,
+                    )
+                else:
+                    expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id)
 
                 start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id)
 
@@ -3758,6 +3760,7 @@ def jax_allreduce_metadata_by_bt(
         "use_vmem_permute_scatter",
         "use_overlap_scatter",
         "use_vmem_preload_scatter",
+        "use_vmem_expert_prefetch",
         "quant_block_k",
         "block_config",
         "dp_axis_name",
@@ -3795,6 +3798,7 @@ def fused_ep_moe(
     use_vmem_permute_scatter: bool = False,
     use_overlap_scatter: bool = False,
     use_vmem_preload_scatter: bool = False,
+    use_vmem_expert_prefetch: bool = False,
     # Quantization block size along the K (reduction) dimension.  Models with
     # 2D block-wise quantization (block_k, block_n) have their scales expanded
     # to 1D format at weight-loading time by _expand_moe_block_scale(), so the
@@ -4077,6 +4081,7 @@ def fused_ep_moe(
                 use_vmem_permute_scatter=use_vmem_permute_scatter,
                 use_overlap_scatter=use_overlap_scatter,
                 use_vmem_preload_scatter=use_vmem_preload_scatter,
+                use_vmem_expert_prefetch=use_vmem_expert_prefetch,
                 quant_block_k=quant_block_k,
                 bt=bt,
                 bf=block_config.bf,

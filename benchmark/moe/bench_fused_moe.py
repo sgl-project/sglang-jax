@@ -974,6 +974,7 @@ def run_all(
                 use_vmem_permute_scatter=_env_bool("FUSED_MOE_BENCHMARK_USE_VMEM_PERMUTE_SCATTER"),
                 use_overlap_scatter=_env_bool("FUSED_MOE_BENCHMARK_USE_OVERLAP_SCATTER"),
                 use_vmem_preload_scatter=_env_bool("FUSED_MOE_BENCHMARK_USE_VMEM_PRELOAD_SCATTER"),
+                use_vmem_expert_prefetch=_env_bool("FUSED_MOE_BENCHMARK_USE_VMEM_EXPERT_PREFETCH"),
             )
             if quantization_config is not None:
                 if quant_block_k is not None:
