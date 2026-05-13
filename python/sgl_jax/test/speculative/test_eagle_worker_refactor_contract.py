@@ -179,6 +179,14 @@ def test_eagle_prefill_bucket_padding_keeps_logical_state_real_bs():
     assert "draft_input.allocate_lens = take_rows" in source
 
 
+def test_eagle_runtime_precompile_warms_topk1_tree_helpers():
+    source = inspect.getsource(EagleDraftWorker.precompile_runtime_jax_helpers)
+
+    assert "if self.topk == 1" in source
+    assert "build_tree_kernel_efficient" in source
+    assert "self.precompile_token_paddings" in source
+
+
 def test_task5_eagle_worker_verify_explicitly_accepts_verify_input():
     parameters = inspect.signature(EAGLEWorker.verify).parameters
 
