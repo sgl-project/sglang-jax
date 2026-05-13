@@ -187,6 +187,7 @@ def test_eagle_runtime_precompile_warms_topk1_tree_helpers():
     assert "self.precompile_token_paddings" in source
     assert "seq_lens_host" in source
     assert "replicated_verified_id" in source
+    assert "token_list_replicated" in source
 
 
 def test_task5_eagle_worker_verify_explicitly_accepts_verify_input():
