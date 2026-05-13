@@ -870,27 +870,26 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
                         sharding=data_2d_sharding,
                     )
                     for context_len in self.precompile_token_paddings:
-                        seq_lens = device_array(
-                            np.full((bs,), context_len, dtype=np.int32),
-                            sharding=data_sharding,
-                        )
-                        tree_outputs = build_tree_kernel_efficient(
-                            verified_id,
-                            score_list,
-                            token_list,
-                            parents_list,
-                            seq_lens,
-                            np.asarray(context_len * bs, dtype=np.int32),
-                            self.topk,
-                            self.speculative_num_draft_tokens,
-                            self._pick_context_len(context_len),
-                            bs,
-                            self.speculative_num_steps,
-                            self.mesh,
-                        )
-                        for output in tree_outputs:
-                            if output is not None:
-                                output.block_until_ready()
+                        seq_lens_host = np.full((bs,), context_len, dtype=np.int32)
+                        seq_lens_device = device_array(seq_lens_host, sharding=data_sharding)
+                        for seq_lens in (seq_lens_host, seq_lens_device):
+                            tree_outputs = build_tree_kernel_efficient(
+                                verified_id,
+                                score_list,
+                                token_list,
+                                parents_list,
+                                seq_lens,
+                                np.asarray(context_len * bs, dtype=np.int32),
+                                self.topk,
+                                self.speculative_num_draft_tokens,
+                                self._pick_context_len(context_len),
+                                bs,
+                                self.speculative_num_steps,
+                                self.mesh,
+                            )
+                            for output in tree_outputs:
+                                if output is not None:
+                                    output.block_until_ready()
                     continue
 
                 step_min_1 = self.speculative_num_steps - 1

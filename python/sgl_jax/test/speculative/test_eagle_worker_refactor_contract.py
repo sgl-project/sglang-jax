@@ -185,6 +185,7 @@ def test_eagle_runtime_precompile_warms_topk1_tree_helpers():
     assert "if self.topk == 1" in source
     assert "build_tree_kernel_efficient" in source
     assert "self.precompile_token_paddings" in source
+    assert "seq_lens_host" in source
 
 
 def test_task5_eagle_worker_verify_explicitly_accepts_verify_input():
