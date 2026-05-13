@@ -1,4 +1,3 @@
-import itertools
 import logging
 import time
 from types import SimpleNamespace
@@ -573,6 +572,18 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
         self.precompile_spec_decode()
         self.precompile_runtime_jax_helpers()
 
+    def _get_phase1_runtime_bs_candidates(self) -> list[int]:
+        max_bs = max(self.precompile_bs_paddings) if self.precompile_bs_paddings else 0
+        if max_bs <= 0:
+            return []
+        return [bs for bs in (1, 2, 4, 8, 16) if bs <= max_bs]
+
+    def _get_padding_bs_for_real_bs(self, real_bs: int) -> int:
+        for bs in sorted(self.precompile_bs_paddings):
+            if bs >= real_bs:
+                return bs
+        raise RuntimeError("did not get comperate padding bs, it should not happened")
+
     def precompile_runtime_jax_helpers(self):
         """Warm EAGLE runtime helper ops whose shapes follow real batch size.
 
@@ -835,43 +846,60 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
 
     def precompile_spec_extend(self):
         start_time = time.perf_counter()
+        real_bs_candidates = self._get_phase1_runtime_bs_candidates()
+        precompile_pairs = []
+        for num_tokens in self.precompile_token_paddings:
+            for real_bs in real_bs_candidates:
+                if num_tokens % real_bs != 0:
+                    continue
+                precompile_pairs.append(
+                    (self._get_padding_bs_for_real_bs(real_bs), real_bs, num_tokens)
+                )
+
         logger.info(
-            "[SPEC_EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s",
-            self.precompile_bs_paddings,
+            "[SPEC_EXTEND] Begin to precompile bs_paddings=%s real_bs=%s token_paddings=%s",
+            sorted(set(padded_bs for padded_bs, _, _ in precompile_pairs)),
+            real_bs_candidates,
             self.precompile_token_paddings,
         )
 
-        pairs = list(itertools.product(self.precompile_bs_paddings, self.precompile_token_paddings))
         cache_loc_by_bs = dict(zip(self.precompile_bs_paddings, self.precompile_cache_loc_paddings))
 
-        with tqdm(pairs, desc="[SPEC_EXTEND] PRECOMPILE", leave=False) as pbar:
-            for pair in pbar:
-                pair = list(pair)
-                bs, num_tokens = pair[0], pair[1]
-                pbar.set_postfix(bs=bs, tokens=num_tokens)
-                if bs > num_tokens:
-                    logger.warning("bs=%s > num_tokens=%s, skip this pair", bs, num_tokens)
+        with tqdm(precompile_pairs, desc="[SPEC_EXTEND] PRECOMPILE", leave=False) as pbar:
+            for padded_bs, real_bs, num_tokens in pbar:
+                pbar.set_postfix(bs=padded_bs, real_bs=real_bs, tokens=num_tokens)
+                tokens_per_req = num_tokens // real_bs
+                if tokens_per_req <= 0:
+                    continue
+                if padded_bs > num_tokens:
+                    logger.warning(
+                        "bs=%s > num_tokens=%s, skip this pair",
+                        padded_bs,
+                        num_tokens,
+                    )
                     continue
                 model_worker_batch = self.generate_model_worker_batch(
-                    bs,
+                    padded_bs,
                     num_tokens,
                     ForwardMode.EXTEND,
-                    cache_loc_by_bs[bs],
+                    cache_loc_by_bs[padded_bs],
                     do_penalties=False,
                     speculative_algotithm=self.speculative_algorithm,
                 )
                 model_worker_batch.return_output_logprob_only = False
-                model_worker_batch.real_bs = 1
+                model_worker_batch.real_bs = real_bs
                 model_worker_batch.real_input_ids_len = num_tokens
-                model_worker_batch.seq_lens = np.zeros(bs, dtype=np.int32)
-                model_worker_batch.seq_lens[0] = num_tokens
-                model_worker_batch.req_pool_indices = np.full(bs, -1, dtype=np.int32)
-                model_worker_batch.req_pool_indices[0] = 0
-                model_worker_batch.extend_seq_lens = np.zeros(bs, dtype=np.int32)
-                model_worker_batch.extend_seq_lens[0] = num_tokens
-                model_worker_batch.extend_prefix_lens = np.zeros(bs, dtype=np.int32)
-                model_worker_batch.logits_indices = np.zeros(bs, dtype=np.int32)
-                model_worker_batch.logits_indices[0] = num_tokens - 1
+                model_worker_batch.seq_lens = np.zeros(padded_bs, dtype=np.int32)
+                model_worker_batch.seq_lens[:real_bs] = tokens_per_req
+                model_worker_batch.req_pool_indices = np.full(padded_bs, -1, dtype=np.int32)
+                model_worker_batch.req_pool_indices[:real_bs] = np.arange(real_bs, dtype=np.int32)
+                model_worker_batch.extend_seq_lens = np.zeros(padded_bs, dtype=np.int32)
+                model_worker_batch.extend_seq_lens[:real_bs] = tokens_per_req
+                model_worker_batch.extend_prefix_lens = np.zeros(padded_bs, dtype=np.int32)
+                model_worker_batch.logits_indices = (
+                    np.cumsum(model_worker_batch.extend_seq_lens, dtype=np.int32) - 1
+                )
+                model_worker_batch.logits_indices[real_bs:] = 0
                 model_worker_batch.positions = np.arange(num_tokens, dtype=np.int32)
                 model_worker_batch.out_cache_loc = np.arange(1, num_tokens + 1, dtype=np.int32)
                 if model_worker_batch.sampling_info.temperatures.ndim == 1:

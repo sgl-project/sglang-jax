@@ -135,6 +135,24 @@ def test_task5_precompile_methods_owned_by_draft_worker_with_eagle_worker_wrappe
         assert "generate_model_worker_batch" not in source
 
 
+def test_eagle_extend_precompile_uses_phase1_real_batch_candidates():
+    worker = EagleDraftWorker.__new__(EagleDraftWorker)
+    worker.precompile_bs_paddings = [16]
+
+    assert worker._get_phase1_runtime_bs_candidates() == [1, 2, 4, 8, 16]
+    assert worker._get_padding_bs_for_real_bs(1) == 16
+    assert worker._get_padding_bs_for_real_bs(16) == 16
+
+
+def test_eagle_extend_precompile_models_multiple_real_batch_shapes():
+    source = inspect.getsource(EagleDraftWorker.precompile_spec_extend)
+
+    assert "real_bs_candidates" in source
+    assert "model_worker_batch.real_bs = real_bs" in source
+    assert "model_worker_batch.seq_lens[:real_bs] = tokens_per_req" in source
+    assert "model_worker_batch.logits_indices[real_bs:] = 0" in source
+
+
 def test_task5_eagle_worker_verify_explicitly_accepts_verify_input():
     parameters = inspect.signature(EAGLEWorker.verify).parameters
 
