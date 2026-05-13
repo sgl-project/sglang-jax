@@ -381,11 +381,13 @@ def _chunk_fwd_h_kernel_varlen(
             else:
                 effective_remaining = eos - t0
             # tpu not support scalar bf16 mul
-            b_g_last = (
-                g_gamma_ref[i_h].astype(jnp.float32) * jnp.minimum(BT, effective_remaining)
-            ).astype(g_gamma_ref.dtype)
+            L_chunk = jnp.minimum(BT, effective_remaining)
+            b_g_last = (g_gamma_ref[i_h].astype(jnp.float32) * L_chunk).astype(g_gamma_ref.dtype)
             scratch_ref[...] *= exp(b_g_last)
-            v_tile = (v_tile * exp(b_g_last - b_g)[:, None]).astype(v_tile.dtype)
+            # Mask exponent to avoid NaN (0 * inf) in padding positions
+            v_decay_exp = b_g_last - b_g
+            v_decay_exp = jnp.where(jnp.arange(BT) < L_chunk, v_decay_exp, -1e9)
+            v_tile = (v_tile * exp(v_decay_exp)[:, None]).astype(v_tile.dtype)
 
         if gk_ref is not None:
             gk_tile = gk_ref[(0, slice(None), slice(None))]  # BT * BK
