@@ -70,7 +70,6 @@ class FusedEPMoE(nnx.Module):
         disable_dynamic_ffn1: bool = False,
         disable_dynamic_ffn2: bool = False,
         disable_weight_load: bool = False,
-        disable_a2a_s_tile_read: bool = False,
         disable_a2a_s_acc_tile_write: bool = False,
         disable_shared_expert: bool = False,
         disable_all_reduce_metadata: bool = False,
@@ -79,8 +78,6 @@ class FusedEPMoE(nnx.Module):
         use_batch_dma_scatter: bool = False,
         use_vmem_permute_scatter: bool = False,
         use_overlap_scatter: bool = False,
-        use_vmem_preload_scatter: bool = False,
-        use_vmem_expert_prefetch: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_experts_per_tok = num_experts_per_tok
@@ -104,7 +101,6 @@ class FusedEPMoE(nnx.Module):
         self.disable_dynamic_ffn1 = disable_dynamic_ffn1
         self.disable_dynamic_ffn2 = disable_dynamic_ffn2
         self.disable_weight_load = disable_weight_load
-        self.disable_a2a_s_tile_read = disable_a2a_s_tile_read
         self.disable_a2a_s_acc_tile_write = disable_a2a_s_acc_tile_write
         self.disable_shared_expert = disable_shared_expert
         self.disable_all_reduce_metadata = disable_all_reduce_metadata
@@ -113,8 +109,6 @@ class FusedEPMoE(nnx.Module):
         self.use_batch_dma_scatter = use_batch_dma_scatter
         self.use_vmem_permute_scatter = use_vmem_permute_scatter
         self.use_overlap_scatter = use_overlap_scatter
-        self.use_vmem_preload_scatter = use_vmem_preload_scatter
-        self.use_vmem_expert_prefetch = use_vmem_expert_prefetch
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -494,7 +488,6 @@ class FusedEPMoE(nnx.Module):
             disable_dynamic_ffn1=self.disable_dynamic_ffn1,
             disable_dynamic_ffn2=self.disable_dynamic_ffn2,
             disable_weight_load=self.disable_weight_load,
-            disable_a2a_s_tile_read=self.disable_a2a_s_tile_read,
             disable_a2a_s_acc_tile_write=self.disable_a2a_s_acc_tile_write,
             disable_shared_expert=self.disable_shared_expert,
             disable_all_reduce_metadata=self.disable_all_reduce_metadata,
@@ -503,8 +496,6 @@ class FusedEPMoE(nnx.Module):
             use_batch_dma_scatter=self.use_batch_dma_scatter,
             use_vmem_permute_scatter=self.use_vmem_permute_scatter,
             use_overlap_scatter=self.use_overlap_scatter,
-            use_vmem_preload_scatter=self.use_vmem_preload_scatter,
-            use_vmem_expert_prefetch=self.use_vmem_expert_prefetch,
             # Optional parameters (not used in basic case)
             quant_block_k=quant_block_k,
             w1_scale=w1_scale,

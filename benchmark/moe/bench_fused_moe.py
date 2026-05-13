@@ -950,10 +950,6 @@ def run_all(
                     "FUSED_MOE_BENCHMARK_DISABLE_WEIGHT_LOAD",
                     all_disable=all_disable,
                 ),
-                disable_a2a_s_tile_read=_with_all_disable(
-                    "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_TILE_READ",
-                    all_disable=all_disable,
-                ),
                 disable_a2a_s_acc_tile_write=_with_all_disable(
                     "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_ACC_TILE_WRITE",
                     all_disable=all_disable,
@@ -973,8 +969,6 @@ def run_all(
                 use_batch_dma_scatter=_env_bool("FUSED_MOE_BENCHMARK_USE_BATCH_DMA_SCATTER"),
                 use_vmem_permute_scatter=_env_bool("FUSED_MOE_BENCHMARK_USE_VMEM_PERMUTE_SCATTER"),
                 use_overlap_scatter=_env_bool("FUSED_MOE_BENCHMARK_USE_OVERLAP_SCATTER"),
-                use_vmem_preload_scatter=_env_bool("FUSED_MOE_BENCHMARK_USE_VMEM_PRELOAD_SCATTER"),
-                use_vmem_expert_prefetch=_env_bool("FUSED_MOE_BENCHMARK_USE_VMEM_EXPERT_PREFETCH"),
             )
             if quantization_config is not None:
                 if quant_block_k is not None:
