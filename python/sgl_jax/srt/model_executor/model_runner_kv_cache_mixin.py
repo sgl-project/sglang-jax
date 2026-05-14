@@ -618,11 +618,9 @@ class ModelRunnerKVCacheMixin:
 
     @property
     def kimi_linear_config(self: ModelRunner):
-        """Return Kimi-Linear hf_config if the model has KDA linear attention, else None."""
-        hf_cfg = getattr(self.model_config, "hf_config", None)
-        if hf_cfg is not None and getattr(hf_cfg, "linear_attn_config", None) is not None:
-            return hf_cfg
-        return None
+        from sgl_jax.srt.configs.kimi_linear import get_kimi_linear_config
+
+        return get_kimi_linear_config(self.model_config.hf_config)
 
     @property
     def lightning_config(self: ModelRunner):
