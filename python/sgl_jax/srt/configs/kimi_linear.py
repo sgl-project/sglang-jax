@@ -1,5 +1,9 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/configs/kimi_linear.py
 # (which itself is adapted from vllm's kimi_linear config).
+from __future__ import annotations
+
+from typing import Any
+
 from transformers.configuration_utils import PretrainedConfig
 
 
@@ -143,3 +147,27 @@ class KimiLinearConfig(PretrainedConfig):
     @property
     def full_attention_layer_ids(self):
         return [i for i in range(self.num_hidden_layers) if not self.is_kda_layer(i)]
+
+
+def _is_kimi_linear_config(hf_config: Any) -> bool:
+    if getattr(hf_config, "model_type", None) == "kimi_linear":
+        return True
+    architectures = getattr(hf_config, "architectures", None) or []
+    return any(str(arch).startswith("KimiLinear") for arch in architectures)
+
+
+def get_kimi_linear_config(hf_config: Any) -> KimiLinearConfig | None:
+    """Return a KimiLinearConfig if hf_config describes a Kimi-Linear model, else None.
+
+    Mirrors ``configs.bailing_hybrid.get_bailing_hybrid_config`` so the dispatch
+    layer can detect Kimi-Linear and Bailing-hybrid through symmetric helpers
+    instead of comparing model_type strings inline.
+    """
+    if not _is_kimi_linear_config(hf_config):
+        return None
+    if getattr(hf_config, "linear_attn_config", None) is None:
+        return None
+    if isinstance(hf_config, KimiLinearConfig):
+        return hf_config
+    config_kwargs = hf_config.to_dict() if hasattr(hf_config, "to_dict") else dict(vars(hf_config))
+    return KimiLinearConfig(**config_kwargs)
