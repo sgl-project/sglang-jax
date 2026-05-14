@@ -146,8 +146,8 @@ def _fused_ep_moe_v2_kernel(
     a2a_s_sends_x2_smem,     # (2,) int32 — per x_buf_id
     # VMEM Scratch — token double buffer (v2 innovation).
     b_x_x2_vmem,             # (2, a2a_max_tokens, t_packing, h_per_t) bf16
-    b_y_acc_vmem,            # (a2a_max_tokens, hidden_size) f32 — compute-only, no DMA alignment
-    b_y_out_vmem,            # (a2a_max_tokens, t_packing, h_per_t) bf16
+    b_y_acc_vmem,            # (a2a_max_tokens, hidden_size) f32
+    b_y_out_vmem,            # (a2a_max_tokens, t_packing, h_per_t) bf16 — staging for DMA
     # VMEM Scratch — weight double buffer.
     b_w1_x2_vmem,            # (2, hidden_size, bf) weight_dtype
     b_w3_x2_vmem,            # (2, hidden_size, bf) weight_dtype
@@ -558,7 +558,7 @@ def _fused_ep_moe_v2_kernel(
 
             wait_fetch_w1(0)
             wait_fetch_w3(0)
-            compute_tile(x_buf_id, 0, is_first_tile=True)
+            compute_tile(x_buf_id, slot=0, is_first_tile=True)
 
             for tile in range(1, n_w - 1):
                 slot = tile % 2
