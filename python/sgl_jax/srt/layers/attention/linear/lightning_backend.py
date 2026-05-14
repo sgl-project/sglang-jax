@@ -27,6 +27,7 @@ from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.utils.profiling_utils import named_scope
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +196,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             check_vma=False,
         )(recurrent_buffer, recurrent_indices, new_recurrent)
 
+    @named_scope("lightning_decode")
     def _forward_decode(
         self,
         q: jax.Array,
@@ -243,6 +245,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
 
         return output, new_state
 
+    @named_scope("lightning_extend")
     def _forward_extend(
         self,
         q: jax.Array,
