@@ -247,7 +247,7 @@ def attn_backend_wrapper(
         from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 
         linear_attn_backend = KDAAttnBackend(mesh=runner.mesh)
-    elif getattr(runner, "lightning_config", None) is not None:
+    elif runner.lightning_config is not None:
         from sgl_jax.srt.layers.attention.linear.lightning_backend import (
             LightningAttnBackend,
         )
