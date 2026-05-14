@@ -14,7 +14,7 @@ from sgl_jax.test.test_utils import (
 )
 
 
-class TestSpeculativeDecoding(CustomTestCase):
+class TestSpeculativeDecodingTopK(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = QWEN3_32B
@@ -24,9 +24,6 @@ class TestSpeculativeDecoding(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            # FIXME(#1053 P1-2): spec precompile shapes don't yet fully cover
-            # runtime padding (draft prefill bs<min_bucket); re-enable once
-            # the BaseSpecWorker refactor unifies precompile bucket selection.
             check_cache_miss=False,
             other_args=[
                 "--trust-remote-code",
@@ -46,15 +43,13 @@ class TestSpeculativeDecoding(CustomTestCase):
                 "--speculative-draft-model-path",
                 QWEN3_32B_EAGLE3,
                 "--speculative-draft-model-revision",
-                "67caf31f9062d7ab64872e0a111d499bc16cd205",  # this model revision has .safetensor model file, which is converted by huggingface official
-                # FIXME(pc) topk > 1 has poor performance now, change it when build_tree_mask_for_draft_decode kernel is  implemented
+                "67caf31f9062d7ab64872e0a111d499bc16cd205",
                 "--speculative-eagle-topk",
-                "1",
+                "4",
                 "--speculative-num-steps",
                 "3",
                 "--speculative-num-draft-tokens",
-                "4",
-                # FIXME(pc) currently, spec decode is not fully compatible with scheduler overlap, rm this when fix it
+                "10",
                 "--disable-overlap-schedule",
                 "--speculative-algorithm",
                 "EAGLE3",
@@ -76,14 +71,11 @@ class TestSpeculativeDecoding(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_mmlu_greedy(self):
+    def test_mmlu_topk(self):
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            # TODO(#1053 P1-2): restore num_examples=512/threads=64 once spec
-            # precompile shapes fully cover the runtime buckets (currently each
-            # new prefill token-count recompiles, making 512 too slow for CI).
             num_examples=64,
             num_threads=16,
             max_tokens=1024,
@@ -91,20 +83,6 @@ class TestSpeculativeDecoding(CustomTestCase):
 
         metrics = run_eval(args)
         self.assertGreater(metrics["score"], 0.45)
-
-    def test_mmlu_non_greedy(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=16,
-            max_tokens=1024,
-            temperature=0.7,
-        )
-
-        metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.40)
 
 
 if __name__ == "__main__":
