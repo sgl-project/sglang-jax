@@ -112,7 +112,13 @@ class BailingHybridConfig(PretrainedConfig):
         # accepted by __init__. The model only constructs layers 0..num_hidden_layers-1.
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.mtp_loss_scaling_factor = mtp_loss_scaling_factor
-        self.quantization_config = quantization_config
+        # NOTE: only set quantization_config when non-None. transformers'
+        # `to_diff_dict` constructs a default `__class__()` to compute the diff;
+        # in that default instance `to_dict` calls `self.quantization_config.to_dict()`
+        # without a None guard (see configuration_utils.py:961-966), so always
+        # assigning a None attribute would crash any repr / json serialization.
+        if quantization_config is not None:
+            self.quantization_config = quantization_config
 
         super().__init__(
             pad_token_id=pad_token_id,
