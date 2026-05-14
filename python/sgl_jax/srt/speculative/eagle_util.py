@@ -922,7 +922,6 @@ class EagleVerifyInput:
                     retrive_next_sibling=self.retrive_next_sibling,
                     next_token_logits=logits_output.next_token_logits,
                 )
-        # 明确位置，此处是 non-greedy
         else:
             bs = self.retrive_index.shape[0]
             candidates = self.draft_token.reshape(bs, self.draft_token_num)
