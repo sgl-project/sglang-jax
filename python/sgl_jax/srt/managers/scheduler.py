@@ -299,9 +299,14 @@ class Scheduler(
 
         # launch draft worker
         if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
-            from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker
+            if self.spec_algorithm.is_nextn():
+                from sgl_jax.srt.speculative.multi_layer_eagle_worker import (
+                    MultiLayerEAGLEWorker as _SpecWorkerCls,
+                )
+            else:
+                from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker as _SpecWorkerCls
 
-            self.draft_worker = EAGLEWorker(
+            self.draft_worker = _SpecWorkerCls(
                 server_args=server_args,
                 target_worker=self.tp_worker,
             )
@@ -1802,7 +1807,15 @@ class Scheduler(
                 next_token_ids = np.array(jax.device_get(next_token_ids_device))
                 self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
         else:
-            model_worker_batch = batch.get_spec_model_worker_batch(
+            # Spec prefill must use the same padded mwb as nospec so target
+            # forward sees identical input shapes; get_spec_model_worker_batch
+            # skips token/bs padding which can shift logits via MoE EP dispatch.
+            _get = (
+                batch.get_model_worker_batch
+                if batch.forward_mode.is_extend()
+                else batch.get_spec_model_worker_batch
+            )
+            model_worker_batch = _get(
                 precompile_token_paddings,
                 precompile_bs_paddings,
                 precompile_cache_loc_paddings,

@@ -35,10 +35,10 @@ class EAGLEWorker(BaseSpecWorker):
     scheduler interface is unchanged.
     """
 
-    def __init__(self, server_args, target_worker: ModelWorker):
+    def __init__(self, server_args, target_worker: ModelWorker, draft_worker=None):
         self.server_args = server_args
         self._target_worker = target_worker
-        self._draft_worker = EagleDraftWorker(server_args, target_worker)
+        self._draft_worker = draft_worker or EagleDraftWorker(server_args, target_worker)
 
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps

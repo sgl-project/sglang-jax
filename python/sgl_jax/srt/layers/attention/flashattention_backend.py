@@ -233,6 +233,29 @@ class FlashAttention(AttentionBackend):
         if batch.forward_mode.is_target_verify():
             seq_lens += extend_seq_lens
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
+            # rpa_v3 _fetch_mask DMA needs the per-row slice size 8-aligned. Pad
+            # each draft-token row from kv_len to page-aligned kv_len (multiple
+            # of 8, and constant within a page so the mask shape is bucket-stable
+            # across decode steps). seq_lens itself stays unaligned for
+            # _fetch_bkv's cache/new split.
+            if metadata.custom_mask is not None:
+                q = batch.spec_info.draft_token_num
+                cm = np.asarray(jax.device_get(metadata.custom_mask))
+                out, off = [], 0
+                for i in range(batch.real_bs):
+                    kl, kla = int(seq_lens[i]), int(aligned_seq_lens[i])
+                    row = cm[off : off + q * kl].reshape(q, kl)
+                    out.append(np.pad(row, ((0, 0), (0, kla - kl))).reshape(-1))
+                    off += q * kl
+                padded_tail = (
+                    q * int(aligned_seq_lens[batch.real_bs :].sum())
+                    if padded_batch_size > batch.real_bs
+                    else 0
+                )
+                metadata.custom_mask = device_array(
+                    np.pad(np.concatenate(out), (0, padded_tail)).astype(np.int32),
+                    sharding=NamedSharding(self.mesh, P()),
+                )
         else:
             aligned_seq_lens = (
                 (batch.seq_lens + self.page_size - 1) // self.page_size
@@ -303,6 +326,16 @@ class FlashAttention(AttentionBackend):
             (cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
             sharding=(NamedSharding(self.mesh, P("data"))),
         )
+        # Hybrid SWA targets need swa_page_indices for TARGET_VERIFY too,
+        # otherwise SWA layers index the swa sub-pool with full-pool page ids.
+        swa_mapping = getattr(self, "swa_index_mapping", None)
+        if swa_mapping is not None:
+            mapping = swa_mapping[0] if isinstance(swa_mapping, list) else swa_mapping
+            full_loc = (page_indices.astype(np.int64) * self.page_size).astype(np.int32)
+            metadata.swa_page_indices = device_array(
+                (np.asarray(mapping)[full_loc] // self.page_size).astype(np.int32),
+                sharding=NamedSharding(self.mesh, P("data")),
+            )
         return metadata
 
     def get_eagle_multi_step_metadata(self, batch: ModelWorkerBatch):
