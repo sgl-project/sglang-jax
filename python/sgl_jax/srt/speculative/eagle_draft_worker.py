@@ -31,11 +31,12 @@ logger = logging.getLogger(__name__)
 RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 
-class EagleDraftWorker(ModelWorker, BaseDraftWorker):
+class EagleDraftWorker(BaseDraftWorker):
     """EAGLE draft model worker.
 
-    Holds the draft model runner and implements draft-specific logic:
-    multi-step decode, tree building, prefill extend, and decode extend.
+    Holds a ``ModelWorker`` (the draft model runner) via composition and
+    implements draft-specific logic: multi-step decode, tree building,
+    prefill extend, and decode extend.
     """
 
     def __init__(self, server_args, target_worker: ModelWorker):
@@ -52,9 +53,9 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
 
         req_to_token_pool, _ = target_worker.get_memory_pool()
 
-        # ModelWorker.__init__ creates the draft model runner
-        # (must be called last to ensure model state is correct)
-        super().__init__(
+        # Compose a ModelWorker for the draft model (instead of inheriting)
+        # Must be created last to ensure model state is correct.
+        self._worker = ModelWorker(
             server_args,
             target_worker.mesh,
             req_to_token_pool=req_to_token_pool,
@@ -75,7 +76,7 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
             "Check --mem-fraction-static or --kv-cache-dtype."
         )
 
-        self.model_runner.initialize_jit()
+        self._worker.model_runner.initialize_jit()
 
         (
             precompile_token_paddings,
@@ -101,14 +102,14 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
             if self.draft_model_runner.model.hot_token_ids is not None:
                 self.hot_token_ids = device_array(
                     self.draft_model_runner.model.hot_token_ids,
-                    sharding=(NamedSharding(self.model_runner.mesh, P())),
+                    sharding=(NamedSharding(self._worker.mesh, P())),
                 )
         else:
             if self.hot_token_ids is not None:
                 head = head.clone()
                 self.hot_token_ids = device_array(
                     self.draft_model_runner.model.hot_token_ids,
-                    sharding=(NamedSharding(self.model_runner.mesh, P())),
+                    sharding=(NamedSharding(self._worker.mesh, P())),
                 )
                 head.data = head.data[self.hot_token_ids]
 
@@ -116,7 +117,26 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
 
     @property
     def draft_model_runner(self):
-        return self.get_model_runner()
+        return self._worker.get_model_runner()
+
+    @property
+    def mesh(self):
+        return self._worker.mesh
+
+    @property
+    def model_config(self):
+        return self._worker.model_config
+
+    @property
+    def compilation_manager(self):
+        return self._worker.compilation_manager
+
+    @property
+    def max_req_len(self):
+        return self._worker.max_req_len
+
+    def get_max_padded_size(self):
+        return self._worker.get_max_padded_size()
 
     # -- BaseDraftWorker interface --
 
@@ -387,7 +407,7 @@ class EagleDraftWorker(ModelWorker, BaseDraftWorker):
         scores = None
         positions_base = device_array(
             np.repeat(model_worker_batch.seq_lens, self.topk),
-            sharding=(NamedSharding(self.model_runner.mesh, P())),
+            sharding=(NamedSharding(self.mesh, P())),
         )
         logits_metadata = None
         metadata_per_step = self.draft_model_runner.attn_backend.get_eagle_multi_step_metadata(
