@@ -159,9 +159,7 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         forward_batch.out_cache_loc = np.empty((1,))
         forward_batch.cache_loc = np.empty((1,))
         forward_batch.spec_info = EagleDraftInput()
-        forward_batch.spec_info.hidden_states = jnp.empty(
-            (bs * self.topk, hidden_states.shape[1])
-        )
+        forward_batch.spec_info.hidden_states = jnp.empty((bs * self.topk, hidden_states.shape[1]))
 
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
@@ -181,9 +179,7 @@ class MultiLayerDraftWorker(EagleDraftWorker):
             forward_batch.bid = model_worker_batch.bid
             logits_output, _, _ = mr.forward(forward_batch, logits_metadata=logits_metadata)
 
-            topk_p, topk_index = topk_probs_from_logits(
-                logits_output.next_token_logits, self.topk
-            )
+            topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
             if self.hot_token_ids is not None:
                 topk_index = self.hot_token_ids[topk_index]
             hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
@@ -245,8 +241,7 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         # starts from layer 0 with target's last hidden, so we cache layer 0's
         # output here so step 0 can be skipped).
         rep_logits, rep_hidden = replicate_to_mesh(
-            self.mesh,
-            layer0_out.next_token_logits, layer0_out.hidden_states
+            self.mesh, layer0_out.next_token_logits, layer0_out.hidden_states
         )
         layer0_out.next_token_logits = rep_logits[: model_worker_batch.real_bs, :]
         layer0_out.hidden_states = rep_hidden[last_idx][: model_worker_batch.real_bs]
@@ -304,8 +299,7 @@ class MultiLayerDraftWorker(EagleDraftWorker):
             - 1
         )
         rep_logits, rep_hidden = replicate_to_mesh(
-            self.mesh,
-            layer0_logits.next_token_logits, layer0_logits.hidden_states
+            self.mesh, layer0_logits.next_token_logits, layer0_logits.hidden_states
         )
         topk_p, topk_index = topk_probs_from_logits(rep_logits[select_index], self.topk)
         batch_output.next_draft_input.hidden_states = rep_hidden[select_index]

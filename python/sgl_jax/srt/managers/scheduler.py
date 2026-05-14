@@ -304,7 +304,9 @@ class Scheduler(
                     MultiLayerEAGLEWorker as _SpecWorkerCls,
                 )
             else:
-                from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker as _SpecWorkerCls
+                from sgl_jax.srt.speculative.eagle_worker import (
+                    EAGLEWorker as _SpecWorkerCls,
+                )
 
             self.draft_worker = _SpecWorkerCls(
                 server_args=server_args,
