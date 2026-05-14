@@ -12,6 +12,7 @@ from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sgl_jax.srt.layers.attention.linear.short_convolution import short_convolution
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.utils.profiling_utils import named_scope
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -262,6 +263,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         )
         return sharded(x, weight, cache, cu_seqlens)
 
+    @named_scope("kda_extend")
     def _forward_extend(
         self,
         q: jax.Array,
@@ -334,6 +336,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         )
         return o[0], final_state
 
+    @named_scope("kda_decode")
     def _forward_decode(
         self,
         q: jax.Array,

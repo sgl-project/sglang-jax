@@ -212,6 +212,10 @@ class ModelWorkerClient:
         self.worker.run_precompile(self.future_token_ids_map)
 
     @property
+    def page_size(self) -> int:
+        return self.worker.page_size
+
+    @property
     def sliding_window_size(self) -> int | None:
         return self.worker.sliding_window_size
 

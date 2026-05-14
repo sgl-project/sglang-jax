@@ -66,7 +66,12 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         self,
         batch: ModelWorkerBatch,
     ) -> LinearRecurrentAttnBackendMetadata:
-        """Return the metadata for a forward pass."""
+        """Return the metadata for a forward pass.
+
+        cu_q_lens is a 1D array of length dp_size * (per_dp_bs_size+1),
+        logically representing [dp_size, per_dp_bs_size+1] in row-major order.
+        Each DP shard gets its slice via P("data") sharding in shard_map.
+        """
         metadata = LinearRecurrentAttnBackendMetadata()
 
         # Unified 2D reshape logic for all dp_size (including dp_size=1)
@@ -81,14 +86,14 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-        # put array to devices
+        sharding_spec = P("data")
         (
             metadata.cu_q_lens,
             metadata.recurrent_indices,
             metadata.has_initial_state,
         ) = device_array(
             (cu_q_lens, batch.recurrent_indices, batch.has_initial_state),
-            sharding=(NamedSharding(self.mesh, P("data"))),
+            sharding=NamedSharding(self.mesh, sharding_spec),
         )
 
         return metadata
@@ -229,18 +234,34 @@ def attn_backend_wrapper(
 ):
     """Wrap full_attn_backend in HybridLinearAttnBackend for hybrid models.
 
-    For hybrid recurrent models (e.g. Kimi-Linear: KDA + MLA), build the
-    matching linear sub-backend and route by layer_id. For pure full-attn
-    models, return the full_attn_backend unchanged.
+    For hybrid recurrent models (e.g. Kimi-Linear: KDA + MLA, or Bailing
+    hybrid: Lightning linear + full attention), build the matching linear
+    sub-backend and route by layer_id. For pure full-attn models, return
+    the full_attn_backend unchanged.
     """
     cfg = runner.linear_recurrent_config
     if cfg is None:
         return full_attn_backend
 
-    # Only supported linear sub-backend today is KDA.
-    from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+    if runner.kimi_linear_config is not None:
+        from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 
-    linear_attn_backend = KDAAttnBackend(mesh=runner.mesh)
+        linear_attn_backend = KDAAttnBackend(mesh=runner.mesh)
+    elif runner.lightning_config is not None:
+        from sgl_jax.srt.layers.attention.linear.lightning_backend import (
+            LightningAttnBackend,
+        )
+
+        cfg_lightning = runner.lightning_config
+        linear_attn_backend = LightningAttnBackend(
+            mesh=runner.mesh,
+            linear_recurrent_layer_ids=cfg_lightning.linear_layer_ids,
+            num_hidden_layers=cfg_lightning.num_hidden_layers,
+            num_heads=cfg_lightning.num_attention_heads,
+        )
+    else:
+        raise NotImplementedError(f"No linear backend wired for hybrid config {type(cfg).__name__}")
+
     return HybridLinearAttnBackend(
         full_attn_backend=full_attn_backend,
         linear_attn_backend=linear_attn_backend,

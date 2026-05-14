@@ -74,34 +74,46 @@ def _split_state_kv_budget(
     return state_max_reqs, kv_budget
 
 
-def _per_req_state_bytes_from_config(linear_attn_config: dict, tp_size: int) -> int:
-    """Per-request recurrent + conv state bytes for a hybrid recurrent model."""
-    from sgl_jax.srt.mem_cache.recurrent_state_pool import _resolve_dtype
+def _linear_state_params_from_config(cfg):
+    params = getattr(cfg, "linear_state_params", None)
+    if params is not None:
+        return params
 
-    temporal_dtype = _resolve_dtype("SGLANG_JAX_RECURRENT_STATE_DTYPE", jnp.float32)
-    conv_dtype = _resolve_dtype("SGLANG_JAX_CONV_STATE_DTYPE", jnp.bfloat16)
-    return _compute_recurrent_per_req_bytes(
-        num_layers=len(linear_attn_config["kda_layers"]),
+    from sgl_jax.srt.mem_cache.recurrent_state_pool import (
+        LinearRecurrentStateParams,
+        recurrent_state_dtype,
+    )
+
+    linear_attn_config = cfg.linear_attn_config
+    return LinearRecurrentStateParams(
+        layers=cfg.linear_layer_ids,
         num_heads=linear_attn_config["num_heads"],
         head_dim=linear_attn_config["head_dim"],
         conv_kernel_size=linear_attn_config["short_conv_kernel_size"],
+        dtype=recurrent_state_dtype(),
+    )
+
+
+def _per_req_state_bytes_from_config(cfg, tp_size: int) -> int:
+    """Per-request recurrent + conv state bytes for a hybrid recurrent model."""
+    state_params = _linear_state_params_from_config(cfg)
+    return _compute_recurrent_per_req_bytes(
+        num_layers=len(state_params.layers),
+        num_heads=state_params.num_heads,
+        head_dim=state_params.head_dim,
+        conv_kernel_size=state_params.conv_kernel_size,
         tp_size=tp_size,
-        temporal_dtype_bytes=jnp.dtype(temporal_dtype).itemsize,
-        conv_dtype_bytes=jnp.dtype(conv_dtype).itemsize,
+        temporal_dtype_bytes=jnp.dtype(state_params.dtype.temporal).itemsize,
+        conv_dtype_bytes=jnp.dtype(state_params.dtype.conv).itemsize,
     )
 
 
 def _enforce_recurrent_state_server_constraints(server_args) -> None:
-    """Assert both disable_radix_cache=True and disable_overlap_schedule=True
-    for hybrid recurrent state models."""
+    """Assert server constraints for hybrid recurrent state models."""
     assert server_args.disable_radix_cache, (
         "Hybrid recurrent state models require --disable-radix-cache "
         "(prefix sharing is unsafe with recurrent state). Please pass "
         "--disable-radix-cache explicitly."
-    )
-    assert server_args.disable_overlap_schedule, (
-        "Hybrid recurrent state models require --disable-overlap-schedule "
-        "(this version does not support double-buffer ping-pong for recurrent state)."
     )
 
 
@@ -131,15 +143,17 @@ def _build_hybrid_pools(
         state_size % dp_size == 0
     ), f"recurrent state_size ({state_size}) must be divisible by dp_size ({dp_size})."
 
-    linear_attn_config = cfg.linear_attn_config
+    state_params = _linear_state_params_from_config(cfg)
     rsp = RecurrentStatePool(
-        linear_recurrent_layer_ids=cfg.linear_layer_ids,
+        linear_recurrent_layer_ids=state_params.layers,
         size=state_size,
-        num_heads=linear_attn_config["num_heads"],
-        head_dim=linear_attn_config["head_dim"],
-        conv_kernel_size=linear_attn_config["short_conv_kernel_size"],
+        num_heads=state_params.num_heads,
+        head_dim=state_params.head_dim,
+        conv_kernel_size=state_params.conv_kernel_size,
         mesh=mesh,
         dp_size=dp_size,
+        temporal_dtype=state_params.dtype.temporal,
+        conv_dtype=state_params.dtype.conv,
     )
     hybrid_pool = HybridReqToTokenPool(
         size=max_num_reqs,
@@ -186,11 +200,15 @@ class ModelRunnerKVCacheMixin:
 
         if self.use_mla_backend and self.server_args.attention_backend == "fa":
             cfg = self.model_config.hf_text_config
-            return (
-                (align128(cfg.kv_lora_rank) + align128(cfg.qk_rope_head_dim))
-                * num_layers
-                * dtype_size
-            )
+            kv_dim = align128(cfg.kv_lora_rank) + align128(cfg.qk_rope_head_dim)
+            # MLA v2 kernel packs page_size up to kv_packing boundary.
+            # With bf16 (packing=2) and page_size=1, each page stores 2
+            # slots but only 1 token of data — must account for the padding.
+            dtype_bits = dtype_size * 8
+            kv_packing = 32 // dtype_bits
+            aligned_ps = (self.page_size + kv_packing - 1) // kv_packing * kv_packing
+            per_token = kv_dim * aligned_ps * dtype_size // self.page_size
+            return per_token * num_layers
 
         return (
             self.model_config.get_num_kv_heads(self.attention_tp_size)
@@ -228,9 +246,7 @@ class ModelRunnerKVCacheMixin:
         cfg = self.linear_recurrent_config
         sa = self.server_args
         dp_size = self.dp_size
-        per_req_state = _per_req_state_bytes_from_config(
-            cfg.linear_attn_config, self.attention_tp_size
-        )
+        per_req_state = _per_req_state_bytes_from_config(cfg, self.attention_tp_size)
 
         if sa.max_recurrent_state_size is not None:
             assert sa.max_recurrent_state_size % dp_size == 0, (
@@ -601,12 +617,25 @@ class ModelRunnerKVCacheMixin:
     # ── Properties ──
 
     @property
-    def linear_recurrent_config(self: ModelRunner):
-        """Return linear recurrent config if the model has linear attention, else None."""
+    def kimi_linear_config(self: ModelRunner):
+        """Return Kimi-Linear hf_config if the model has KDA linear attention, else None."""
         hf_cfg = getattr(self.model_config, "hf_config", None)
         if hf_cfg is not None and getattr(hf_cfg, "linear_attn_config", None) is not None:
             return hf_cfg
         return None
+
+    @property
+    def lightning_config(self: ModelRunner):
+        from sgl_jax.srt.configs.bailing_hybrid import get_bailing_hybrid_config
+
+        return get_bailing_hybrid_config(self.model_config.hf_config)
+
+    @property
+    def linear_recurrent_config(self: ModelRunner):
+        """Return linear recurrent config if the model has linear attention, else None."""
+        if self.kimi_linear_config is not None:
+            return self.kimi_linear_config
+        return self.lightning_config
 
     def _kv_pool_layer_count(self: ModelRunner):
         """Layer count for KV pool sizing.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
@@ -20,6 +21,28 @@ _DTYPE_MAP = {
 def _resolve_dtype(env_var: str, default):
     name = os.environ.get(env_var)
     return _DTYPE_MAP[name] if name else default
+
+
+@dataclass(frozen=True)
+class RecurrentStateDType:
+    conv: jnp.dtype
+    temporal: jnp.dtype
+
+
+@dataclass(frozen=True)
+class LinearRecurrentStateParams:
+    layers: list[int]
+    num_heads: int
+    head_dim: int
+    conv_kernel_size: int
+    dtype: RecurrentStateDType
+
+
+def recurrent_state_dtype() -> RecurrentStateDType:
+    return RecurrentStateDType(
+        conv=_resolve_dtype("SGLANG_JAX_CONV_STATE_DTYPE", jnp.bfloat16),
+        temporal=_resolve_dtype("SGLANG_JAX_RECURRENT_STATE_DTYPE", jnp.float32),
+    )
 
 
 @register_pytree_node_class
@@ -47,10 +70,11 @@ class RecurrentStatePool:
         DP: each rank gets `size // dp_size` valid slots + 1 dummy slot at
         index 0, so total buffer slots = size + dp_size.
         """
+        state_dtype = recurrent_state_dtype()
         if temporal_dtype is None:
-            temporal_dtype = _resolve_dtype("SGLANG_JAX_RECURRENT_STATE_DTYPE", jnp.float32)
+            temporal_dtype = state_dtype.temporal
         if conv_dtype is None:
-            conv_dtype = _resolve_dtype("SGLANG_JAX_CONV_STATE_DTYPE", jnp.bfloat16)
+            conv_dtype = state_dtype.conv
         self.temporal_dtype = temporal_dtype
         self.conv_dtype = conv_dtype
 

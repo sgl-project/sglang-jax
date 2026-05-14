@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.utils.profiling_utils import named_scope
 
 # Map of supported activation names → callable. ``None`` means identity.
 _ACTIVATION_FNS: dict[str | None, Callable[[jax.Array], jax.Array] | None] = {
@@ -108,6 +109,7 @@ def _apply_activation(
     return activation_fn(y)
 
 
+@named_scope("short_conv_decode")
 def _decode_conv(
     x: jax.Array,  # [B, D]
     conv_kernel: jax.Array,  # [D, K]
@@ -125,6 +127,7 @@ def _decode_conv(
     return y, new_cache[:, :, 1:]
 
 
+@named_scope("short_conv_extend")
 def _extend_conv(
     x: jax.Array,  # [T, D]
     conv_kernel: jax.Array,  # [D, K]
