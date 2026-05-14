@@ -4,11 +4,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    import jax
-
-    from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
-    from sgl_jax.srt.managers.scheduler import GenerationBatchResult
-    from sgl_jax.srt.model_executor.model_runner import ModelRunner
+    from sgl_jax.srt.managers.tp_worker import ModelWorker
 
 
 class BaseDraftWorker(ABC):
@@ -20,74 +16,37 @@ class BaseDraftWorker(ABC):
     ``MultiLayerDraftWorker``.
     """
 
-    @property
     @abstractmethod
-    def draft_model_runner(self) -> ModelRunner: ...
-
-    @abstractmethod
-    def draft(self, model_worker_batch: ModelWorkerBatch) -> None:
-        """Run multi-step draft decode.
-
-        Mutates ``model_worker_batch.spec_info`` from an
-        ``EagleDraftInput`` to an ``EagleVerifyInput``.
-        """
-
-    @abstractmethod
-    def draft_extend_for_prefill(
-        self,
-        model_worker_batch: ModelWorkerBatch,
-        hidden_states: jax.Array,
-        next_token_ids: jax.Array,
-    ) -> None:
-        """Run draft model extend after target prefill.
-
-        Populates ``model_worker_batch.spec_info`` with the draft state
-        needed for the next decode round.
-        """
-
-    @abstractmethod
-    def draft_extend_for_decode(
-        self,
-        model_worker_batch: ModelWorkerBatch,
-        batch_output: GenerationBatchResult,
-    ) -> None:
-        """Run draft extend after target verify.
-
-        Updates ``batch_output.next_draft_input`` with hidden_states,
-        topk_p, topk_index for the next decode iteration.
-        """
+    def draft(self):
+        pass
 
 
 class BaseSpecWorker(ABC):
     """Speculative decode orchestrator.
 
     Owns a ``target_worker`` (the full model) and a ``draft_worker``
-    (the draft/MTP model).  Subclasses implement the top-level
-    ``forward_batch_speculative_generation`` entry point; shared logic
-    such as ``verify`` lives here.
+    (the draft/MTP model).  Concrete subclasses implement the main
+    entry point and connect their specific draft/verify logic.
     """
 
-    def __init__(self, server_args, target_worker, draft_worker: BaseDraftWorker):
-        self.server_args = server_args
-        self.target_worker = target_worker
-        self.draft_worker = draft_worker
+    @property
+    @abstractmethod
+    def target_worker(self) -> ModelWorker:
+        pass
 
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.page_size = server_args.page_size
-        self.mesh = target_worker.mesh
-
-        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
-
-        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
-
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = target_worker.get_memory_pool()
+    @property
+    @abstractmethod
+    def draft_worker(self) -> BaseDraftWorker:
+        pass
 
     @abstractmethod
-    def forward_batch_speculative_generation(
-        self, model_worker_batch: ModelWorkerBatch
-    ) -> GenerationBatchResult:
-        """Main entry point called by the scheduler."""
+    def clear_cache_pool(self):
+        pass
+
+    def on_verify_complete_cpu(self, num_correct_drafts_per_req: list[int]) -> None:  # noqa: B027
+        """Hook called after verify finishes and accept counts are on CPU.
+
+        Default no-op. Adaptive-aware workers override this to feed the
+        controller without forcing a GPU->CPU sync in the worker hot path.
+        """
+        pass

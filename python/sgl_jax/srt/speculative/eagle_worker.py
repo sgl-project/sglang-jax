@@ -38,8 +38,23 @@ class EAGLEWorker(BaseSpecWorker):
     """
 
     def __init__(self, server_args, target_worker: ModelWorker):
-        draft_worker = EagleDraftWorker(server_args, target_worker)
-        super().__init__(server_args, target_worker, draft_worker)
+        self.server_args = server_args
+        self._target_worker = target_worker
+        self._draft_worker = EagleDraftWorker(server_args, target_worker)
+
+        self.topk = server_args.speculative_eagle_topk
+        self.speculative_num_steps = server_args.speculative_num_steps
+        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.page_size = server_args.page_size
+        self.mesh = target_worker.mesh
+
+        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
+
+        self.req_to_token_pool, self.token_to_kv_pool_allocator = target_worker.get_memory_pool()
 
         (
             precompile_token_paddings,
@@ -51,6 +66,18 @@ class EAGLEWorker(BaseSpecWorker):
         self.precompile_token_paddings = precompile_token_paddings
 
     # -- BaseSpecWorker interface --
+
+    @property
+    def target_worker(self) -> ModelWorker:
+        return self._target_worker
+
+    @property
+    def draft_worker(self) -> EagleDraftWorker:
+        return self._draft_worker
+
+    def clear_cache_pool(self):
+        # TODO: implement when scheduler/runtime needs explicit pool clearing
+        pass
 
     def forward_batch_speculative_generation(
         self,
