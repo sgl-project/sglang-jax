@@ -121,10 +121,6 @@ class EagleDraftWorker(BaseDraftWorker):
         return self._worker.get_model_runner()
 
     @property
-    def sampling_rngs(self):
-        return self.draft_model_runner.rngs
-
-    @property
     def mesh(self):
         return self._worker.mesh
 

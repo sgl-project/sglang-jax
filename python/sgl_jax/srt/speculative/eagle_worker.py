@@ -164,7 +164,7 @@ class EAGLEWorker(BaseSpecWorker):
         ) = spec_info.sample(
             model_worker_batch,
             logits_output,
-            self.draft_worker.sampling_rngs,
+            self.draft_worker.draft_model_runner.rngs,
             self.mesh,
         )
         # accept_index uses -1 for rejected slots; gathering with -1 picks the

@@ -36,16 +36,6 @@ class BaseDraftWorker(ABC):
     def draft(self):
         pass
 
-    @property
-    @abstractmethod
-    def sampling_rngs(self):
-        """RNGs used by the spec worker's tree-sampling step.
-
-        Concrete implementations decide which runner's rngs to expose.
-        Single-runner workers usually return ``self.draft_model_runner.rngs``;
-        multi-runner workers (MTP) return the rngs from a designated runner.
-        """
-
 
 class BaseSpecWorker(ABC):
     """Speculative decode orchestrator.
