@@ -52,6 +52,8 @@ class TestBenchServingDenseTp4(CustomTestCase):
                 "--page-size",
                 "256",
                 "--disable-radix-cache",
+                "--context-length",
+                "3072",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -105,7 +107,7 @@ class TestBenchServingDenseTp4(CustomTestCase):
                 f"### test_output_throughput_default_tp_4\n"
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
-            self.assertGreater(res["output_throughput"], 9866)
+            self.assertGreater(res["output_throughput"], 11000)
 
     def test_ttft_default_tp_4(self):
         args = get_benchmark_args(
