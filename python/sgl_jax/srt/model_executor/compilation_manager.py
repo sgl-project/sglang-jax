@@ -254,7 +254,6 @@ class CompilationManager:
             ModelWorkerSamplingInfo,
         )
         from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
-        from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
         valid_input_ids = np.array([1] * bs, dtype=jnp.int32)
         invalid_input_ids = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
@@ -276,7 +275,7 @@ class CompilationManager:
         if speculative_algorithm is None:
             sampling_info = ModelWorkerSamplingInfo.generate_for_precompile(bs, self.vocab_size)
         else:
-            sampling_info = SamplingBatchInfo.generate_for_precompile_all_greedy(
+            sampling_info = ModelWorkerSamplingInfo.generate_for_precompile_all_greedy(
                 bs, self.vocab_size
             )
 

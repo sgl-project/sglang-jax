@@ -358,7 +358,7 @@ class ModelWorker:
         skip_sample: bool = False,
         sampling_metadata: SamplingMetadata = None,
         forward_metadata=None,
-    ) -> tuple[LogitsProcessorOutput | jax.Array | int, jax.Array | None]:
+    ) -> tuple[LogitsProcessorOutput, jax.Array | None, int]:
         # Prepare LoRA batch if LoRA is enabled
         if self.worker.server_args.enable_lora and self.need_prepare_lora_batch:
             self.prepare_lora_batch(model_worker_batch)

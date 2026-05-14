@@ -500,6 +500,7 @@ suites = {
             40,
             ["TestMoEEvalAccuracyLarge.test_mmlu"],
         ),
+        TestFile("test/srt/test_speculative_decoding.py", 30),
     ],
     "performance-test-tpu-v6e-1": [TestFile("test/srt/test_bench_serving_dense.py", 7)],
     "performance-test-tpu-v6e-4": [
