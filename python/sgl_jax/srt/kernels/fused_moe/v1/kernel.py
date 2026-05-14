@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 
 import jax
@@ -578,6 +579,8 @@ def _fused_ep_moe_kernel(
     disable_shared_expert: bool = False,
     disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
+    disable_e2t_scatter: bool = False,
+    disable_full_width_stage: bool = False,
     use_jax_allreduce_metadata: bool = True,
     quant_block_k: int | None = None,
     # Kernel tuning params.
@@ -793,7 +796,7 @@ def _fused_ep_moe_kernel(
                 pltpu.VMEM(expert_starts_x2_smem.shape[1:], expert_starts_x2_smem.dtype),
                 pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
             )
-            if not disable_a2a:
+            if not disable_a2a and not disable_e2t_scatter:
                 build_e2t_scatter_plan(bt_sem_id=bt_sem_id, bt_id=bt_id)
             return
 
@@ -855,7 +858,7 @@ def _fused_ep_moe_kernel(
                 pltpu.VMEM(expert_starts_x2_smem.shape[1:], expert_starts_x2_smem.dtype),
                 pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
             )
-            if not disable_a2a:
+            if not disable_a2a and not disable_e2t_scatter:
                 build_e2t_scatter_plan(bt_sem_id=bt_sem_id, bt_id=bt_id)
             return
 
@@ -986,7 +989,7 @@ def _fused_ep_moe_kernel(
             pltpu.VMEM(expert_starts_x2_smem.shape[1:], expert_starts_x2_smem.dtype),
             pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
         )
-        if not disable_a2a:
+        if not disable_a2a and not disable_e2t_scatter:
             build_e2t_scatter_plan(bt_sem_id=bt_sem_id, bt_id=bt_id)
 
     def build_e2t_scatter_plan(*, bt_sem_id, bt_id):
@@ -2062,18 +2065,24 @@ def _fused_ep_moe_kernel(
         def start_stage_a2a_s_tile_from_hbm(tile_start, bd1_id, buf_id):
             if disable_a2a_s_tile_read:
                 return
+            if disable_full_width_stage:
+                stage_src_offset = bd1_id * bd1_per_t_packing
+                stage_width = bd1_per_t_packing
+            else:
+                stage_src_offset = 0
+                stage_width = h_per_t_packing
             pltpu.make_async_copy(
                 src_ref=a2a_s_x2_hbm.at[
                     e_sem_id,
                     pl.ds(tile_start, token_tile),
                     pl.ds(0, t_packing),
-                    pl.ds(0, h_per_t_packing),
+                    pl.ds(stage_src_offset, stage_width),
                 ],
                 dst_ref=b_stage_x2_vmem.at[
                     buf_id,
                     pl.ds(0, token_tile),
                     pl.ds(0, t_packing),
-                    pl.ds(0, h_per_t_packing),
+                    pl.ds(0, stage_width),
                 ],
                 sem=token_stage_x2_sems.at[buf_id],
             ).start()
@@ -2225,7 +2234,7 @@ def _fused_ep_moe_kernel(
                             return next_buf_id
 
                         dynamic_ffn1(
-                            t_vmem=b_stage_x2_vmem.at[
+                            t_vmem=b_stage_x2_vmem.at[token_buf_id] if disable_full_width_stage else b_stage_x2_vmem.at[
                                 token_buf_id,
                                 pl.ds(0, token_tile),
                                 pl.ds(0, t_packing),
@@ -2784,6 +2793,7 @@ def _fused_ep_moe_kernel(
         start_fetch_se_tokens(bt_id=jnp.int32(0))
 
     def run_bt(bt_id, e_sem_id):
+        bt_start = bt_id * bt
         bt_sem_id = bt_id & jnp.int32(1)
         next_bt_id = bt_id + jnp.int32(1)
         out_buf_id = bt_id & jnp.int32(1)
@@ -2824,10 +2834,15 @@ def _fused_ep_moe_kernel(
         se_before = se_per_expert // 2
         se_after = se_per_expert - se_before
 
-        # === PIPELINED PATH with E2T fast scatter ===
-        start_a2a_scatter_fast(
-            bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=0,
-        )
+        # === PIPELINED PATH ===
+        if disable_e2t_scatter:
+            start_a2a_scatter(
+                bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=0, bt_start=bt_start,
+            )
+        else:
+            start_a2a_scatter_fast(
+                bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=0,
+            )
 
         init_carry = (e_sem_id, jnp.int32(0))
 
@@ -2862,11 +2877,19 @@ def _fused_ep_moe_kernel(
                 def _wait_before_buffer_reuse():
                     sync_barrier()
 
-                start_a2a_scatter_fast(
-                    bt_sem_id=bt_sem_id,
-                    e_sem_id=next_e_sem_id,
-                    local_e_id=next_local_e_id,
-                )
+                if disable_e2t_scatter:
+                    start_a2a_scatter(
+                        bt_sem_id=bt_sem_id,
+                        e_sem_id=next_e_sem_id,
+                        local_e_id=next_local_e_id,
+                        bt_start=bt_start,
+                    )
+                else:
+                    start_a2a_scatter_fast(
+                        bt_sem_id=bt_sem_id,
+                        e_sem_id=next_e_sem_id,
+                        local_e_id=next_local_e_id,
+                    )
 
             for _ in range(se_before):
                 run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
@@ -3229,6 +3252,8 @@ def jax_allreduce_metadata_by_bt(
         "disable_shared_expert",
         "disable_all_reduce_metadata",
         "disable_sync_barrier",
+        "disable_e2t_scatter",
+        "disable_full_width_stage",
         "use_jax_allreduce_metadata",
         "quant_block_k",
         "block_config",
@@ -3262,6 +3287,8 @@ def fused_ep_moe(
     disable_shared_expert: bool = False,
     disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
+    disable_e2t_scatter: bool = os.environ.get("DISABLE_E2T_SCATTER", "0") == "1",
+    disable_full_width_stage: bool = os.environ.get("DISABLE_FULL_WIDTH_STAGE", "0") == "1",
     use_jax_allreduce_metadata: bool = True,
     # Quantization block size along the K (reduction) dimension.  Models with
     # 2D block-wise quantization (block_k, block_n) have their scales expanded
@@ -3475,7 +3502,7 @@ def fused_ep_moe(
         b3_scratch,  # b_b3_x2_vmem
         b2_scratch,  # b_b2_x2_vmem
         pltpu.VMEM((2, a2a_max_tokens, 1, block_config.bf), jnp.float32),  # b_acc_vmem
-        pltpu.VMEM((2, block_config.bts, t_packing, hidden_per_pack), t_dtype),  # b_stage_x2_vmem
+        pltpu.VMEM((2, block_config.bts, t_packing, bd1_per_pack if disable_full_width_stage else hidden_per_pack), t_dtype),  # b_stage_x2_vmem
         pltpu.VMEM(
             (3, block_config.bts, t_packing, bd2_per_pack),
             t_dtype,
