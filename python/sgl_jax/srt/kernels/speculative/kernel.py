@@ -140,7 +140,7 @@ def top_k_top_p_renorm_prob(probs, top_k_values, top_p_values, max_k=1024):
         cutoff_idx = jnp.where(
             p >= 1.0,
             jnp.sum(mask_k) - 1,  # Keep all k tokens
-            jnp.argmax(cumsum_probs >= p * total_prob)
+            jnp.argmax(cumsum_probs >= p * total_prob),
         )
 
         # Step 4: Combine both masks
@@ -237,7 +237,7 @@ def top_p_renorm_prob(probs, top_p_values, max_top_k=1024):
         cutoff_idx = jnp.where(
             top_p >= 1.0,
             num_nonzero - 1,  # Keep all non-zero tokens
-            jnp.argmax(cumsum_probs >= top_p)
+            jnp.argmax(cumsum_probs >= top_p),
         )
 
         # Step 3: Create mask for tokens within top-p threshold
@@ -301,7 +301,7 @@ def _sampling_from_prob(probs: jax.Array, threshold: jax.Array):
     sampled_id = jnp.where(
         found_valid_sample,
         selected_idx,
-        jnp.where(last_valid_id >= 0, last_valid_id, vocab_size - 1)
+        jnp.where(last_valid_id >= 0, last_valid_id, vocab_size - 1),
     )
 
     return sampled_id
@@ -449,14 +449,14 @@ def tree_speculative_sampling_target_only_jit(
 
         # --- Step loop (fori_loop over speculation steps) ---
         def step_body(step, step_state):
-            (cur_idx, last_acc, n_acc, stop_fori,
-             p_acc, coin, cp_off,
-             dp_s, pred_s, ai_s) = step_state
+            (cur_idx, last_acc, n_acc, stop_fori, p_acc, coin, cp_off, dp_s, pred_s, ai_s) = (
+                step_state
+            )
 
             def verify(v_state):
-                (cur_idx, last_acc, n_acc, stop_fori,
-                 p_acc, coin, cp_off,
-                 dp_s, pred_s, ai_s) = v_state
+                (cur_idx, last_acc, n_acc, stop_fori, p_acc, coin, cp_off, dp_s, pred_s, ai_s) = (
+                    v_state
+                )
 
                 cur_idx = retrive_next_token[bid, cur_idx]
 
@@ -477,48 +477,101 @@ def tree_speculative_sampling_target_only_jit(
                         pr_ = pr_.at[la_].set(d_tok_)
                         na_ = na_ + 1
                         ai_ = ai_.at[bid, na_].set(d_idx_)
-                        return (ci_, jnp.int32(1), d_idx_, na_,
-                                jnp.array(0, dtype=dtype),
-                                uniform_samples[bid, ci_],
-                                bid * num_draft_tokens + ci_,
-                                d_idx_, d_tok_, dp_, pr_, ai_)
+                        return (
+                            ci_,
+                            jnp.int32(1),
+                            d_idx_,
+                            na_,
+                            jnp.array(0, dtype=dtype),
+                            uniform_samples[bid, ci_],
+                            bid * num_draft_tokens + ci_,
+                            d_idx_,
+                            d_tok_,
+                            dp_,
+                            pr_,
+                            ai_,
+                        )
 
                     def reject_fn(ops):
                         ci_, sw_, la_, na_, pa_, co_, cpo_, d_idx_, d_tok_, dp_, pr_, ai_ = ops
                         dp_ = dp_.at[cpo_, d_tok_].set(target_probs[cpo_, d_tok_])
                         ci_ = retrive_next_sibling[bid, ci_]
-                        return (ci_, sw_, la_, na_, pa_, co_, cpo_,
-                                d_idx_, d_tok_, dp_, pr_, ai_)
+                        return (ci_, sw_, la_, na_, pa_, co_, cpo_, d_idx_, d_tok_, dp_, pr_, ai_)
 
-                    (ci, sw, la, na, pa, co, cpo,
-                     _, _, dp, pr, ai) = jax.lax.cond(
-                        do_accept, accept_fn, reject_fn,
+                    (ci, sw, la, na, pa, co, cpo, _, _, dp, pr, ai) = jax.lax.cond(
+                        do_accept,
+                        accept_fn,
+                        reject_fn,
                         (ci, sw, la, na, pa, co, cpo, d_idx, d_tok, dp, pr, ai),
                     )
                     return (ci, sw, la, na, pa, co, cpo, dp, pr, ai)
 
-                (cur_idx, _, last_acc, n_acc, p_acc, coin, cp_off,
-                 dp_s, pred_s, ai_s) = jax.lax.while_loop(
-                    while_cond, while_body,
-                    (cur_idx, jnp.int32(0), last_acc, n_acc, p_acc, coin, cp_off,
-                     dp_s, pred_s, ai_s),
+                (cur_idx, _, last_acc, n_acc, p_acc, coin, cp_off, dp_s, pred_s, ai_s) = (
+                    jax.lax.while_loop(
+                        while_cond,
+                        while_body,
+                        (
+                            cur_idx,
+                            jnp.int32(0),
+                            last_acc,
+                            n_acc,
+                            p_acc,
+                            coin,
+                            cp_off,
+                            dp_s,
+                            pred_s,
+                            ai_s,
+                        ),
+                    )
                 )
                 stop_fori = jax.lax.select(cur_idx == -1, 1, 0)
-                return (cur_idx, last_acc, n_acc, stop_fori,
-                        p_acc, coin, cp_off, dp_s, pred_s, ai_s)
+                return (
+                    cur_idx,
+                    last_acc,
+                    n_acc,
+                    stop_fori,
+                    p_acc,
+                    coin,
+                    cp_off,
+                    dp_s,
+                    pred_s,
+                    ai_s,
+                )
 
             return jax.lax.cond(
-                stop_fori != 1, verify, lambda x: x,
-                (cur_idx, last_acc, n_acc, stop_fori,
-                 p_acc, coin, cp_off, dp_s, pred_s, ai_s),
+                stop_fori != 1,
+                verify,
+                lambda x: x,
+                (cur_idx, last_acc, n_acc, stop_fori, p_acc, coin, cp_off, dp_s, pred_s, ai_s),
             )
 
-        (_, last_acc_final, n_acc_final, _, _, _, cp_off_final,
-         draft_probs_s, predicts_s, accept_index_s) = jax.lax.fori_loop(
-            1, num_spec_step, step_body,
-            (cur_index_init, last_accepted_init, num_acc_init, jnp.int32(0),
-             prob_acc_init, coin_init, cur_prob_offset_init,
-             draft_probs_s, predicts_s, accept_index_s),
+        (
+            _,
+            last_acc_final,
+            n_acc_final,
+            _,
+            _,
+            _,
+            cp_off_final,
+            draft_probs_s,
+            predicts_s,
+            accept_index_s,
+        ) = jax.lax.fori_loop(
+            1,
+            num_spec_step,
+            step_body,
+            (
+                cur_index_init,
+                last_accepted_init,
+                num_acc_init,
+                jnp.int32(0),
+                prob_acc_init,
+                coin_init,
+                cur_prob_offset_init,
+                draft_probs_s,
+                predicts_s,
+                accept_index_s,
+            ),
         )
 
         # --- Final sampling ---
@@ -539,7 +592,9 @@ def tree_speculative_sampling_target_only_jit(
         return predicts_s, accept_index_s, accept_token_num_s, draft_probs_s
 
     predicts, accept_index, accept_token_num, _ = jax.lax.fori_loop(
-        0, bs, batch_loop,
+        0,
+        bs,
+        batch_loop,
         (predicts, accept_index, accept_token_num, draft_probs),
     )
 

@@ -27,10 +27,7 @@ from sgl_jax.srt.kernels.speculative.build_eagle_tree_structure_kernel import (
 )
 from sgl_jax.srt.kernels.speculative.kernel import (
     create_extend_after_decode_spec_info,
-    top_k_renorm_prob,
-    top_p_renorm_prob,
     top_k_top_p_renorm_prob,
-    tree_speculative_sampling_target_only,
     tree_speculative_sampling_target_only_jit,
 )
 from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import verify_tree_greedy
@@ -939,16 +936,20 @@ class EagleVerifyInput:
             with ctx:
                 logits_bs = logits_output.next_token_logits.shape[0]
                 # Pad sampling params to match logits batch size (verify phase pads the batch)
-                expanded_temperature = jnp.repeat(
-                    sampling_info.temperatures, self.draft_token_num
-                )
+                expanded_temperature = jnp.repeat(sampling_info.temperatures, self.draft_token_num)
                 expanded_top_ks = jnp.repeat(sampling_info.top_ks, self.draft_token_num)
                 expanded_top_ps = jnp.repeat(sampling_info.top_ps, self.draft_token_num)
                 pad_len = logits_bs - expanded_temperature.shape[0]
                 if pad_len > 0:
-                    expanded_temperature = jnp.pad(expanded_temperature, (0, pad_len), constant_values=1.0)
-                    expanded_top_ks = jnp.concatenate([expanded_top_ks, jnp.full((pad_len,), expanded_top_ks[0])])
-                    expanded_top_ps = jnp.concatenate([expanded_top_ps, jnp.full((pad_len,), expanded_top_ps[0])])
+                    expanded_temperature = jnp.pad(
+                        expanded_temperature, (0, pad_len), constant_values=1.0
+                    )
+                    expanded_top_ks = jnp.concatenate(
+                        [expanded_top_ks, jnp.full((pad_len,), expanded_top_ks[0])]
+                    )
+                    expanded_top_ps = jnp.concatenate(
+                        [expanded_top_ps, jnp.full((pad_len,), expanded_top_ps[0])]
+                    )
                 expanded_temperature = jnp.expand_dims(expanded_temperature, axis=-1)
 
                 # Temperature scaling + softmax
@@ -957,7 +958,9 @@ class EagleVerifyInput:
                 )
 
                 # Replicate target_probs for top_k_top_p (eager-mode vocab-dim ops need full data)
-                from jax.sharding import NamedSharding, PartitionSpec as P
+                from jax.sharding import NamedSharding
+                from jax.sharding import PartitionSpec as P
+
                 jax_mesh = ctx if isinstance(ctx, jax.sharding.Mesh) else mesh
                 target_probs = jax.device_put(target_probs, NamedSharding(jax_mesh, P()))
 
