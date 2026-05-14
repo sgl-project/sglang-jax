@@ -5,8 +5,6 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
 from tqdm import tqdm
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
@@ -16,7 +14,7 @@ from sgl_jax.srt.managers.scheduler import GenerationBatchResult
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
-from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
+from sgl_jax.srt.speculative.base_worker import BaseSpecWorker, replicate_to_mesh
 from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
 from sgl_jax.srt.speculative.eagle_util import (
     EagleDraftInput,
@@ -143,11 +141,6 @@ class EAGLEWorker(BaseSpecWorker):
 
     # -- Verify --
 
-    def _replicate(self, *arrs: jax.Array) -> tuple[jax.Array, ...] | jax.Array:
-        rep = NamedSharding(self.mesh, P())
-        out = jax.device_put(arrs, rep)
-        return out[0] if len(out) == 1 else out
-
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
         spec_info: EagleVerifyInput = model_worker_batch.spec_info
         spec_info.allocate_lens = cur_allocate_lens
@@ -159,8 +152,8 @@ class EAGLEWorker(BaseSpecWorker):
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
         )
-        logits_output.next_token_logits, logits_output.hidden_states = self._replicate(
-            logits_output.next_token_logits, logits_output.hidden_states
+        logits_output.next_token_logits, logits_output.hidden_states = replicate_to_mesh(
+            self.mesh, logits_output.next_token_logits, logits_output.hidden_states
         )
         spec_info.hidden_states = logits_output.hidden_states
         (
@@ -171,7 +164,7 @@ class EAGLEWorker(BaseSpecWorker):
         ) = spec_info.sample(
             model_worker_batch,
             logits_output,
-            self.draft_worker.draft_model_runner.rngs,
+            self.draft_worker.sampling_rngs,
             self.mesh,
         )
         # accept_index uses -1 for rejected slots; gathering with -1 picks the

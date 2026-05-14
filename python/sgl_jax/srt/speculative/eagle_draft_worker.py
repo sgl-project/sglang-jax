@@ -16,7 +16,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sgl_jax.srt.speculative.base_worker import BaseDraftWorker
+from sgl_jax.srt.speculative.base_worker import BaseDraftWorker, replicate_to_mesh
 from sgl_jax.srt.speculative.eagle_util import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -71,9 +71,10 @@ class EagleDraftWorker(BaseDraftWorker):
         target_slot_range = target_worker.model_runner.max_total_num_tokens
         draft_pool_size = self.draft_model_runner.max_total_num_tokens
         assert draft_pool_size >= target_slot_range, (
-            f"Draft KV pool ({draft_pool_size}) must be >= "
-            f"target slot range ({target_slot_range}). "
-            "Check --mem-fraction-static or --kv-cache-dtype."
+            f"draft KV pool ({draft_pool_size}) < target allocator slot range "
+            f"({target_slot_range}); high-slot draft KV reads/writes will be "
+            f"garbage. Hybrid target without the post-set_num_token_hybrid "
+            f"draft_runner_cache_size overwrite hits this."
         )
 
         self._worker.model_runner.initialize_jit()
@@ -118,6 +119,10 @@ class EagleDraftWorker(BaseDraftWorker):
     @property
     def draft_model_runner(self):
         return self._worker.get_model_runner()
+
+    @property
+    def sampling_rngs(self):
+        return self.draft_model_runner.rngs
 
     @property
     def mesh(self):
@@ -258,8 +263,8 @@ class EagleDraftWorker(BaseDraftWorker):
             + batch_output.accept_lens[: model_worker_batch.real_bs]
             - 1
         )
-        rep_logits, rep_hidden = self._replicate(
-            draft_logits_output.next_token_logits, draft_logits_output.hidden_states
+        rep_logits, rep_hidden = replicate_to_mesh(
+            self.mesh, draft_logits_output.next_token_logits, draft_logits_output.hidden_states
         )
         draft_logits_output.next_token_logits = rep_logits[select_index]
         draft_logits_output.hidden_states = rep_hidden[select_index]
@@ -278,18 +283,13 @@ class EagleDraftWorker(BaseDraftWorker):
 
     # -- Internal draft helpers --
 
-    def _replicate(self, *arrs: jax.Array) -> tuple[jax.Array, ...] | jax.Array:
-        rep = NamedSharding(self.mesh, P())
-        out = jax.device_put(arrs, rep)
-        return out[0] if len(out) == 1 else out
-
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
         topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
         draft_input.topk_p = topk_p
         draft_input.topk_index = topk_index
-        draft_input.hidden_states = self._replicate(logits_output.hidden_states)
+        draft_input.hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
 
     def padding_for_decode(self, model_worker_batch: ModelWorkerBatch):
         _, padding_bs_index = self.get_padding_bs(model_worker_batch.real_bs)
@@ -448,7 +448,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
             if self.hot_token_ids is not None:
                 topk_index = self.hot_token_ids[topk_index]
-            hidden_states = self._replicate(logits_output.hidden_states)
+            hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
 
         return score_list, token_list, parents_list
 

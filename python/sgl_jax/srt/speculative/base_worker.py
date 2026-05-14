@@ -3,8 +3,24 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
+import jax
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
+
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.tp_worker import ModelWorker
+
+
+def replicate_to_mesh(
+    mesh: jax.sharding.Mesh, *arrs: jax.Array
+) -> tuple[jax.Array, ...] | jax.Array:
+    """Replicate arrays across a mesh under explicit sharding.
+
+    JIT outputs are typically vocab/data-sharded; spec-decode host orchestration
+    (top_k, gather, build_tree) needs replicated arrays.
+    """
+    out = jax.device_put(arrs, NamedSharding(mesh, P()))
+    return out[0] if len(out) == 1 else out
 
 
 class BaseDraftWorker(ABC):
@@ -19,6 +35,16 @@ class BaseDraftWorker(ABC):
     @abstractmethod
     def draft(self):
         pass
+
+    @property
+    @abstractmethod
+    def sampling_rngs(self):
+        """RNGs used by the spec worker's tree-sampling step.
+
+        Concrete implementations decide which runner's rngs to expose.
+        Single-runner workers usually return ``self.draft_model_runner.rngs``;
+        multi-runner workers (MTP) return the rngs from a designated runner.
+        """
 
 
 class BaseSpecWorker(ABC):
