@@ -571,14 +571,32 @@ class ModelRunnerKVCacheMixin:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 self.server_args.max_num_reqs = max_num_reqs
 
-        # 6. Apply constraints (CI, user cap, page align, dp)
+        # 6. Apply constraints (CI, user cap, page align, dp). Draft worker's
+        # pool size is target-derived (must cover target's allocator slot
+        # range), so the user --max-total-tokens cap is not re-applied — it
+        # could otherwise shrink the draft pool below the (post-hybrid) target
+        # range and reintroduce the high-slot garbage this commit fixes.
         self.max_total_num_tokens = self._apply_token_constraints(
-            self.max_total_num_tokens, max_total_tokens, dp_size
+            self.max_total_num_tokens,
+            None if self.is_draft_worker else max_total_tokens,
+            dp_size,
         )
 
         # 7. Hybrid SWA token split (existing logic, not moved)
         if self.is_hybrid:
             self.set_num_token_hybrid()
+            if (
+                not self.is_draft_worker
+                and self.spec_algorithm is not None
+                and not self.spec_algorithm.is_none()
+            ):
+                # Draft shares target's allocator, whose slot range is the
+                # *post-hybrid* full-pool size. The draft_runner_cache_size set
+                # in step 5 was pre-hybrid; without this overwrite, draft's own
+                # KV pool is smaller than the slot range it indexes into, so any
+                # slot >= pre-hybrid size reads/writes garbage (manifests as
+                # accept[1:]=1 for reqs allocated at high slots).
+                self.server_args.draft_runner_cache_size = self.max_total_num_tokens
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
@@ -600,6 +618,10 @@ class ModelRunnerKVCacheMixin:
 
     @property
     def kimi_linear_config(self: ModelRunner):
+        """Return Kimi-Linear hf_config if the model has KDA linear attention, else None."""
+        hf_cfg = getattr(self.model_config, "hf_config", None)
+        if hf_cfg is not None and getattr(hf_cfg, "linear_attn_config", None) is not None:
+            return hf_cfg
         return None
 
     @property

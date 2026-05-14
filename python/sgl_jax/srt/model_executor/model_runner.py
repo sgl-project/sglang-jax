@@ -147,9 +147,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         if server_args.enable_lora:
             self.init_lora_manager()
 
+        self._sampler_base_rng = jax.random.PRNGKey(server_args.random_seed)
+        self._sampler_step = 0
         if not self.is_draft_worker:
-            self._sampler_base_rng = jax.random.PRNGKey(server_args.random_seed)
-            self._sampler_step = 0
             self.initialize_jit()
 
         # Init memory pool and attention backends

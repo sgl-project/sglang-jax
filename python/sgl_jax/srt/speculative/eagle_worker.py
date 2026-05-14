@@ -96,6 +96,15 @@ class EAGLEWorker(ModelWorker):
             # Share the embedding and lm_head
             self.draft_model_runner.model.set_embed_and_head(embed, head)
 
+        target_slot_range = self.target_worker.model_runner.max_total_num_tokens
+        draft_pool_size = self.draft_model_runner.max_total_num_tokens
+        assert draft_pool_size >= target_slot_range, (
+            f"draft KV pool ({draft_pool_size}) < target allocator slot range "
+            f"({target_slot_range}); high-slot draft KV reads/writes will be "
+            f"garbage. Hybrid target without the post-set_num_token_hybrid "
+            f"draft_runner_cache_size overwrite hits this."
+        )
+
         self.model_runner.initialize_jit()
         (
             precompile_token_paddings,
@@ -180,9 +189,10 @@ class EAGLEWorker(ModelWorker):
         next_token_ids: jax.Array,
     ):
         # FIXME(pc) move this all prepare to prepare_for_extend_after_target_prefill
+        verified_id_np = np.asarray(jax.device_get(next_token_ids))[: model_worker_batch.real_bs]
         model_worker_batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
-            verified_id=next_token_ids[: model_worker_batch.real_bs],
+            verified_id=verified_id_np,
             num_tokens_per_batch=np.asarray(1, dtype=jnp.int32),
             num_tokens_for_logprob_per_batch=np.asarray(1, dtype=jnp.int32),
             allocate_lens=model_worker_batch.seq_lens,
@@ -263,13 +273,20 @@ class EAGLEWorker(ModelWorker):
     def draft_model_runner(self):
         return self.get_model_runner()
 
+    def _replicate(self, *arrs: jax.Array) -> tuple[jax.Array, ...] | jax.Array:
+        # jit outputs are vocab/data-sharded; eagle host orchestration (top_k,
+        # gather, build_tree) needs replicated arrays under explicit-sharding.
+        rep = NamedSharding(self.mesh, P())
+        out = jax.device_put(arrs, rep)
+        return out[0] if len(out) == 1 else out
+
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
         topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
         draft_input.topk_p = topk_p
         draft_input.topk_index = topk_index
-        draft_input.hidden_states = logits_output.hidden_states
+        draft_input.hidden_states = self._replicate(logits_output.hidden_states)
 
     def get_padding_bs(self, real_bs: int) -> int:
         self.precompile_bs_paddings.sort()
@@ -458,6 +475,9 @@ class EAGLEWorker(ModelWorker):
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
         )
+        logits_output.next_token_logits, logits_output.hidden_states = self._replicate(
+            logits_output.next_token_logits, logits_output.hidden_states
+        )
         spec_info.hidden_states = logits_output.hidden_states
         (
             predict,
@@ -470,9 +490,20 @@ class EAGLEWorker(ModelWorker):
             self.model_runner.rngs,
             self.mesh,
         )
-        logits_output.next_token_logits = logits_output.next_token_logits[accept_index, :]
-        logits_output.hidden_states = logits_output.hidden_states[accept_index, :]
-        model_worker_batch.positions = model_worker_batch.positions[accept_index]
+        # accept_index uses -1 for rejected slots; gathering with -1 picks the
+        # global last element, so dext later writes rejected tokens' draft-KV at
+        # a foreign position inside each req's page (corrupts prefix KV for all
+        # but the last req at bs>1). Redirect -1 to each req's own last slot.
+        # accept_index has length bs*(spec_steps+1); the gathered tensors have
+        # length bs*draft_token_num — equal at topk=1, distinct at topk>1.
+        draft_n = self.speculative_num_draft_tokens
+        accept_width = self.speculative_num_steps + 1
+        req_ids = np.arange(len(accept_index)) // accept_width
+        per_req_last = req_ids * draft_n + draft_n - 1
+        safe_index = np.where(accept_index >= 0, accept_index, per_req_last)
+        logits_output.next_token_logits = logits_output.next_token_logits[safe_index, :]
+        logits_output.hidden_states = logits_output.hidden_states[safe_index, :]
+        model_worker_batch.positions = model_worker_batch.positions[safe_index]
         new_seq_lens = model_worker_batch.seq_lens + accept_length
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
@@ -603,8 +634,11 @@ class EAGLEWorker(ModelWorker):
             + batch_output.accept_lens[: model_worker_batch.real_bs]
             - 1
         )
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[select_index]
-        draft_logits_output.hidden_states = draft_logits_output.hidden_states[select_index]
+        rep_logits, rep_hidden = self._replicate(
+            draft_logits_output.next_token_logits, draft_logits_output.hidden_states
+        )
+        draft_logits_output.next_token_logits = rep_logits[select_index]
+        draft_logits_output.hidden_states = rep_hidden[select_index]
         topk_p, topk_index = topk_probs_from_logits(
             draft_logits_output.next_token_logits, self.topk
         )
@@ -680,7 +714,7 @@ class EAGLEWorker(ModelWorker):
 
             if self.hot_token_ids is not None:
                 topk_index = self.hot_token_ids[topk_index]
-            hidden_states = logits_output.hidden_states
+            hidden_states = self._replicate(logits_output.hidden_states)
 
         return score_list, token_list, parents_list
 
@@ -708,13 +742,14 @@ class EAGLEWorker(ModelWorker):
                 if bs > num_tokens:
                     logger.warning("bs=%s > num_tokens=%s, skip this pair", bs, num_tokens)
                     continue
-                model_worker_batch = self.generate_model_worker_batch(
+                model_worker_batch = self.compilation_manager._make_dummy_batch(
                     bs,
                     num_tokens,
                     ForwardMode.EXTEND,
                     self.precompile_cache_loc_paddings[-1],
-                    do_penalties=False,
-                    speculative_algotithm=self.speculative_algorithm,
+                    speculative_algorithm=self.speculative_algorithm,
+                    dp_size=1,
+                    per_dp_bs_size=bs,
                 )
                 self.forward_batch_speculative_generation(model_worker_batch)
         end_time = time.perf_counter()
@@ -736,13 +771,14 @@ class EAGLEWorker(ModelWorker):
                 aligned_cache_loc_size = (
                     (bs * self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
                 )
-                model_worker_batch = self.generate_model_worker_batch(
+                model_worker_batch = self.compilation_manager._make_dummy_batch(
                     bs,
                     bs,
                     ForwardMode.DECODE,
                     aligned_cache_loc_size,
-                    do_penalties=False,
-                    speculative_algotithm=self.speculative_algorithm,
+                    speculative_algorithm=self.speculative_algorithm,
+                    dp_size=1,
+                    per_dp_bs_size=bs,
                 )
                 spec_info = EagleDraftInput(
                     # FIXME(pc) dtype should according to serverargs
@@ -778,6 +814,11 @@ def topk_probs_from_logits(
 ) -> tuple[jax.Array, jax.Array]:
     """Return top-k probabilities without materializing the full softmax tensor."""
     working_logits = jnp.moveaxis(logits, axis, -1) if axis != -1 else logits
+    # TODO(#1053 Phase 2): replace this all-gather with a sharded top-k +
+    # logsumexp over the vocab axis for DP/TP scalability.
+    sh = jax.typeof(working_logits).sharding
+    if isinstance(sh, NamedSharding):
+        working_logits = jax.sharding.reshard(working_logits, NamedSharding(sh.mesh, P()))
     topk_logits, topk_index = jax.lax.top_k(working_logits, topk)
     logsumexp = jax.nn.logsumexp(working_logits, axis=-1, keepdims=True)
     topk_probs = jnp.exp(topk_logits - logsumexp)
@@ -800,8 +841,7 @@ def fast_topk(values, topk, axis=-1):
     return result_vals, result_indices
 
 
-# FIXME(pc) this should be jitted or convert as np.ndarray
-# @functools.partial(jax.jit, static_argnames=["i", "topk"])
+@functools.partial(jax.jit, static_argnames=["i", "topk"])
 def update_eagle_lists(
     i: int,
     score_list: jax.Array,

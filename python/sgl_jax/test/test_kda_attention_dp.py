@@ -16,7 +16,7 @@ from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils.common_utils import pad_to_bucket
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
-from sgl_jax.test.test_utils import CustomTestCase
+from sgl_jax.test.test_utils import CustomTestCase, KDAAttnBackendForTest
 
 
 def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.ndarray:
@@ -395,7 +395,7 @@ def create_test_data(
     req_pool_indices_cpu = np.arange(total_bs, dtype=np.int32)
 
     real_bs_per_dp = [len(lens_per_rank.get(r, [])) for r in range(dp_size)]
-    backend = KDAAttnBackend(mesh=mesh)
+    backend = KDAAttnBackendForTest(KDAAttnBackend(mesh=mesh))
 
     mwb = ModelWorkerBatch(
         bid=1,

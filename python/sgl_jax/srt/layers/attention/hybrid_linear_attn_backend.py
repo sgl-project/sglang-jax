@@ -232,19 +232,21 @@ def attn_backend_wrapper(
     runner: ModelRunner,
     full_attn_backend: AttentionBackend,
 ):
-    """Wrap full_attn_backend in HybridLinearAttnBackend for hybrid models."""
+    """Wrap full_attn_backend in HybridLinearAttnBackend for hybrid models.
+
+    For hybrid recurrent models (e.g. Kimi-Linear: KDA + MLA, or Bailing
+    hybrid: Lightning linear + full attention), build the matching linear
+    sub-backend and route by layer_id. For pure full-attn models, return
+    the full_attn_backend unchanged.
+    """
     cfg = runner.linear_recurrent_config
     if cfg is None:
         return full_attn_backend
-    if runner.kimi_linear_config is not None:
-        try:
-            from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
-        except ImportError as e:
-            raise ImportError(
-                "HybridLinearAttnBackend needs KDAAttnBackend (delivered by a separate PR)."
-            ) from e
 
-        linear_attn_backend = KDAAttnBackend(runner.mesh)
+    if runner.kimi_linear_config is not None:
+        from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+
+        linear_attn_backend = KDAAttnBackend(mesh=runner.mesh)
     elif getattr(runner, "lightning_config", None) is not None:
         from sgl_jax.srt.layers.attention.linear.lightning_backend import (
             LightningAttnBackend,
@@ -259,6 +261,9 @@ def attn_backend_wrapper(
         )
     else:
         raise NotImplementedError(f"No linear backend wired for hybrid config {type(cfg).__name__}")
+
     return HybridLinearAttnBackend(
-        full_attn_backend, linear_attn_backend, cfg.full_attention_layer_ids
+        full_attn_backend=full_attn_backend,
+        linear_attn_backend=linear_attn_backend,
+        full_attn_layers=cfg.full_attention_layer_ids,
     )

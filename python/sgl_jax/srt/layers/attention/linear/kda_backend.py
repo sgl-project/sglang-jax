@@ -42,11 +42,13 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         b: jax.Array,
         layer: RadixLinearAttention,
         forward_batch: ForwardBatch,
-        pool: RecurrentStatePool,
+        recurrent_state_pool: RecurrentStatePool,
         **kwargs,
     ) -> jax.Array:
         recurrent_indices = self.forward_metadata.recurrent_indices
-        ssm_states, conv_states = self.get_state(pool, layer.layer_id, recurrent_indices)
+        ssm_states, conv_states = self.get_state(
+            recurrent_state_pool, layer.layer_id, recurrent_indices
+        )
         q_conv_w = layer.q_conv1d.weight.value
         k_conv_w = layer.k_conv1d.weight.value
         v_conv_w = layer.v_conv1d.weight.value
@@ -132,9 +134,11 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         else:
             raise NotImplementedError(f"KDA does not support {forward_batch.forward_mode}")
 
-        new_ssm_full = self.set_ssm_state(pool, layer.layer_id, recurrent_indices, new_recurrent)
+        new_ssm_full = self.set_ssm_state(
+            recurrent_state_pool, layer.layer_id, recurrent_indices, new_recurrent
+        )
         new_conv_full_list = self.set_conv_state(
-            pool, layer.layer_id, recurrent_indices, new_conv_packed
+            recurrent_state_pool, layer.layer_id, recurrent_indices, new_conv_packed
         )
         return output.reshape(output.shape[0], -1), (new_ssm_full, new_conv_full_list)
 
@@ -174,11 +178,20 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         return ssm, conv
 
     def set_ssm_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_recurrent):
-        """Scatter per-request ``new_recurrent`` into the FULL pool buffer."""
+        """Scatter per-request ``new_recurrent`` into the FULL pool buffer.
+
+        Suppress writes at idx==0: padding rows carry idx=0 and would otherwise
+        pollute the per-rank dummy slot, leaking garbage back as initial state.
+        """
         full_recurrent, _ = self.get_layer_cache(recurrent_state_pool, layer_id)
 
+        def _scatter(buf, idx, val):
+            keep_mask = (idx == 0).reshape(-1, 1, 1, 1)
+            safe_val = jnp.where(keep_mask, buf[idx], val)
+            return buf.at[idx].set(safe_val)
+
         return jax.shard_map(
-            lambda buf, idx, val: buf.at[idx].set(val),
+            _scatter,
             mesh=self.mesh,
             in_specs=(
                 P("data", "tensor", None, None),
@@ -190,13 +203,18 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         )(full_recurrent, recurrent_indices, new_recurrent)
 
     def set_conv_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_conv_packed):
-        """Scatter per-request packed conv state into the FULL pool buffer."""
+        """Scatter per-request packed conv state. Same idx==0 guard as set_ssm_state."""
         _, conv_buffer_list = self.get_layer_cache(recurrent_state_pool, layer_id)
         assert len(conv_buffer_list) == 1
         full_conv = conv_buffer_list[0]
 
+        def _scatter(buf, idx, val):
+            keep_mask = (idx == 0).reshape(-1, 1, 1)
+            safe_val = jnp.where(keep_mask, buf[idx], val)
+            return buf.at[idx].set(safe_val)
+
         new_conv_full = jax.shard_map(
-            lambda buf, idx, val: buf.at[idx].set(val),
+            _scatter,
             mesh=self.mesh,
             in_specs=(
                 P("data", "tensor", None),

@@ -22,7 +22,7 @@ import logging
 import os
 import threading
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import jax
 import numpy as np
@@ -767,6 +767,32 @@ class ScheduleBatch:
             return_routed_experts=any(req.return_routed_experts for req in all_reqs),
             dp_size=dp_size,
         )
+
+    # dp=1 spec-decode compat: pre-#939 spec code reads these as flat
+    # ScheduleBatch attrs; passthrough to reqs_info[0] until the DP-aware
+    # spec data contract (#1053 P1-5) replaces the callers.
+    _SPEC_DP1_COMPAT_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        f.name for f in dataclasses.fields(ScheduleReqsInfo)
+    ) - frozenset({"batch_is_full"})
+
+    def __getattr__(self, name: str):
+        if name in ScheduleBatch._SPEC_DP1_COMPAT_FIELDS:
+            assert self.dp_size == 1, (
+                f"ScheduleBatch.{name} flat access is a dp=1 spec-decode shim; "
+                f"dp={self.dp_size}>1 must use reqs_info[dp_rank].{name} (#1053 P1-5)"
+            )
+            return getattr(self.reqs_info[0], name)
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+    def __setattr__(self, name: str, value):
+        if (
+            name in ScheduleBatch._SPEC_DP1_COMPAT_FIELDS
+            and "reqs_info" in self.__dict__
+            and self.__dict__["reqs_info"]
+        ):
+            setattr(self.__dict__["reqs_info"][0], name, value)
+        else:
+            super().__setattr__(name, value)
 
     @property
     def batch_is_full(self) -> bool:
@@ -2206,6 +2232,7 @@ class ScheduleBatch:
         out_cache_loc_cpu = self.out_cache_loc
         seq_lens_cpu = self.seq_lens
         real_bs = len(seq_lens_cpu)
+        self.per_dp_bs_size = real_bs
         req_pool_indices_cpu = self.req_pool_indices
         token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
         # FIXME @pc, move this to eagle_worker
@@ -2334,7 +2361,7 @@ class ScheduleBatch:
             return_output_logprob_only=self.return_output_logprob_only,
             top_logprobs_nums=self.top_logprobs_nums,
             token_ids_logprobs=self.token_ids_logprobs,
-            sampling_info=self.sampling_info,
+            sampling_info=self._merge_sampling_info(real_bs, real_bs),
             positions=positions_cpu,
             mrope_positions=mrope_positions_cpu,
             cache_loc=cache_loc_flat,
@@ -2345,6 +2372,10 @@ class ScheduleBatch:
             logits_indices=logits_indices,
             lora_ids=lora_ids,
             real_bs=real_bs,
+            real_bs_per_dp=[real_bs],
+            dp_size=self.dp_size,
+            per_dp_bs_size=real_bs,
+            logits_indices_selector=np.arange(real_bs, dtype=np.int32),
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
                 if self.return_hidden_states
@@ -2625,6 +2656,15 @@ def _compute_mrope_positions_for_batch(
 @dataclasses.dataclass
 class ModelWorkerSamplingInfo:
     """Unified sampling information for a generation batch."""
+
+    def __len__(self) -> int:
+        return len(self.temperatures)
+
+    def filter_batch(self, indices) -> None:
+        self.temperatures = self.temperatures[indices]
+        self.top_ps = self.top_ps[indices]
+        self.top_ks = self.top_ks[indices]
+        self.min_ps = self.min_ps[indices]
 
     # Basic batched sampling params
     temperatures: np.ndarray
