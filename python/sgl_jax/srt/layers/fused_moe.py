@@ -209,6 +209,62 @@ class FusedEPMoE(nnx.Module):
         if self.quantized_dtype is None:
             return
 
+        # Per-channel static path: quant_block_k/n both None means K is not
+        # blocked, scales live as [E, out_dim] in the checkpoint and the kernel
+        # consumes [E, 1, 1, out_dim] (k_blocks=1 degenerate form).
+        is_per_channel_static = (
+            is_static and self.quant_block_k is None and self.quant_block_n is None
+        )
+        if is_per_channel_static:
+            with jax.set_mesh(self.mesh):
+                ep_scale_sharding = P(("data", "tensor"), None, None, None)
+                w1_scale_shape = (self.num_experts, 1, 1, self.intermediate_dim)
+                w3_scale_shape = w1_scale_shape
+                w2_scale_shape = (self.num_experts, 1, 1, self.hidden_size)
+
+                if hasattr(self, "w1_scale"):
+                    del self.w1_scale
+                self.w1_scale = nnx.Param(
+                    jnp.zeros(w1_scale_shape, dtype=jnp.float32),
+                    out_sharding=ep_scale_sharding,
+                )
+
+                if hasattr(self, "w3_scale"):
+                    del self.w3_scale
+                self.w3_scale = nnx.Param(
+                    jnp.zeros(w3_scale_shape, dtype=jnp.float32),
+                    out_sharding=ep_scale_sharding,
+                )
+
+                if hasattr(self, "w2_scale"):
+                    del self.w2_scale
+                self.w2_scale = nnx.Param(
+                    jnp.zeros(w2_scale_shape, dtype=jnp.float32),
+                    out_sharding=ep_scale_sharding,
+                )
+
+                if self.num_shared_experts > 0:
+                    shared_scale_sharding = P(
+                        None,
+                    )
+                    shared_int = self.intermediate_dim * self.num_shared_experts
+                    for name, out_dim in [
+                        ("w1_shared_scale", shared_int),
+                        ("w3_shared_scale", shared_int),
+                        ("w2_shared_scale", self.hidden_size),
+                    ]:
+                        if hasattr(self, name):
+                            delattr(self, name)
+                        setattr(
+                            self,
+                            name,
+                            nnx.Param(
+                                jnp.zeros((out_dim,), dtype=jnp.float32),
+                                out_sharding=shared_scale_sharding,
+                            ),
+                        )
+            return
+
         # Default quant_block_k to 256 if not explicitly set.
         wsz = self.quant_block_k if self.quant_block_k is not None else 256
         if hasattr(self, "quant_block_k"):
