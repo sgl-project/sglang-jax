@@ -146,8 +146,7 @@ def _fused_ep_moe_v2_kernel(
     a2a_s_sends_x2_smem,     # (2,) int32 — per x_buf_id
     # VMEM Scratch — token double buffer (v2 innovation).
     b_x_x2_vmem,             # (2, a2a_max_tokens, t_packing, h_per_t) bf16
-    b_y_acc_vmem,            # (a2a_max_tokens, hidden_size) f32
-    b_y_out_vmem,            # (a2a_max_tokens, t_packing, h_per_t) bf16 — staging for DMA
+    b_y_acc_vmem,            # (a2a_max_tokens, t_packing, h_per_t) bf16 — accumulate in bf16, DMA directly
     # VMEM Scratch — weight double buffer.
     b_w1_x2_vmem,            # (2, hidden_size, bf) weight_dtype
     b_w3_x2_vmem,            # (2, hidden_size, bf) weight_dtype
@@ -390,31 +389,20 @@ def _fused_ep_moe_v2_kernel(
 
         @pl.when(total != 0)
         def _():
-            def _wait_one(_, __):
-                pltpu.make_async_copy(
-                    src_ref=b_x_x2_vmem.at[x_buf_id, pl.ds(0, 1)],
-                    dst_ref=b_x_x2_vmem.at[x_buf_id, pl.ds(0, 1)],
-                    sem=x_recv_sems.at[x_buf_id],
-                ).wait()
-                return None
-            lax.fori_loop(0, total, _wait_one, None, unroll=False)
+            ref = a2a_s_acc_x2_hbm.at[0, pl.ds(0, total)]
+            pltpu.make_async_copy(
+                src_ref=ref, dst_ref=ref, sem=x_recv_sems.at[x_buf_id],
+            ).wait()
 
     def wait_a2a_scatter_send(*, x_buf_id):
         send_sz = a2a_s_sends_x2_smem[x_buf_id]
 
         @pl.when(send_sz != 0)
         def _():
-            def _wait_one(_, __):
-                pltpu.make_async_remote_copy(
-                    src_ref=tokens_hbm.at[pl.ds(0, 1)],
-                    dst_ref=b_x_x2_vmem.at[x_buf_id, pl.ds(0, 1)],
-                    send_sem=x_send_sems.at[x_buf_id],
-                    recv_sem=x_recv_sems.at[x_buf_id],
-                    device_id=get_mesh_device_id(0),
-                    device_id_type=pltpu.DeviceIdType.MESH,
-                ).wait()
-                return None
-            lax.fori_loop(0, send_sz, _wait_one, None, unroll=False)
+            ref = a2a_s_acc_x2_hbm.at[0, pl.ds(0, send_sz)]
+            pltpu.make_async_copy(
+                src_ref=ref, dst_ref=ref, sem=x_send_sems.at[x_buf_id],
+            ).wait()
 
     # -- Gather (Step 6) --
 
@@ -527,66 +515,61 @@ def _fused_ep_moe_v2_kernel(
             sem=weight_sems.at[w_slot, 2],
         ).wait()
 
-    def compute_tile(x_buf_id, w_slot, is_first_tile):
-        x = b_x_x2_vmem[x_buf_id].reshape(a2a_max_tokens, hidden_size)
-        w1 = b_w1_x2_vmem[w_slot]
-        w3 = b_w3_x2_vmem[w_slot]
-        gate = jnp.dot(x, w1, preferred_element_type=jnp.float32)
-        up = jnp.dot(x, w3, preferred_element_type=jnp.float32)
-        act = activation_fn(gate, up, act_fn)
-        wait_fetch_w2(w_slot)
-        w2 = b_w2_x2_vmem[w_slot]
-        partial = jnp.dot(act, w2, preferred_element_type=jnp.float32)
-        if is_first_tile:
-            b_y_acc_vmem[...] = partial
-        else:
-            b_y_acc_vmem[...] = b_y_acc_vmem[...] + partial
-
     def expert_ffn_v2(bt_sem_id, x_buf_id, e_sem_id, local_e_id):
         e_id = my_id * jnp.int32(local_num_experts) + local_e_id
         dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id].astype(jnp.int32)
         has_tokens = dyn_sz != 0
 
         def _run_active(_):
-            start_fetch_w1(0, local_e_id, 0, priority=1)
-            start_fetch_w3(0, local_e_id, 0, priority=1)
-            start_fetch_w2(0, local_e_id, 0, priority=1)
-            if n_w >= 2:
-                start_fetch_w1(1, local_e_id, 1)
-                start_fetch_w3(1, local_e_id, 1)
-                start_fetch_w2(1, local_e_id, 1)
+            x = b_x_x2_vmem[x_buf_id].reshape(a2a_max_tokens, hidden_size)
 
-            wait_fetch_w1(0)
-            wait_fetch_w3(0)
-            compute_tile(x_buf_id, slot=0, is_first_tile=True)
+            b_y_acc_vmem[...] = jnp.zeros(b_y_acc_vmem.shape, dtype=t_dtype)
 
-            for tile in range(1, n_w - 1):
-                slot = tile % 2
-                next_slot = 1 - slot
-                start_fetch_w1(next_slot, local_e_id, tile + 1)
-                start_fetch_w3(next_slot, local_e_id, tile + 1)
-                start_fetch_w2(next_slot, local_e_id, tile + 1)
+            start_fetch_w1(0, local_e_id, 0)
+            start_fetch_w3(0, local_e_id, 0)
+            start_fetch_w2(0, local_e_id, 0)
+
+            def _weight_tile_body(tile, _):
+                slot = tile & jnp.int32(1)
+                next_slot = jnp.int32(1) - slot
+                next_tile = tile + jnp.int32(1)
+
+                @pl.when(next_tile < n_w)
+                def _():
+                    start_fetch_w1(next_slot, local_e_id, next_tile)
+                    start_fetch_w3(next_slot, local_e_id, next_tile)
+                    start_fetch_w2(next_slot, local_e_id, next_tile)
+
                 wait_fetch_w1(slot)
                 wait_fetch_w3(slot)
-                compute_tile(x_buf_id, slot, is_first_tile=False)
 
-            if n_w >= 2:
-                last_slot = (n_w - 1) % 2
-                wait_fetch_w1(last_slot)
-                wait_fetch_w3(last_slot)
-                compute_tile(x_buf_id, last_slot, is_first_tile=False)
+                w1 = b_w1_x2_vmem[slot]
+                w3 = b_w3_x2_vmem[slot]
+                gate = jnp.dot(x, w1, preferred_element_type=jnp.float32)
+                up = jnp.dot(x, w3, preferred_element_type=jnp.float32)
+                act = activation_fn(gate, up, act_fn)
+                wait_fetch_w2(slot)
+                w2 = b_w2_x2_vmem[slot]
+                partial = jnp.dot(act, w2, preferred_element_type=jnp.float32)
 
-            b_y_out_vmem[...] = b_y_acc_vmem[...].astype(t_dtype).reshape(
-                a2a_max_tokens, t_packing, h_per_t
-            )
+                acc = b_y_acc_vmem[...].reshape(
+                    a2a_max_tokens, hidden_size
+                ).astype(jnp.float32)
+                b_y_acc_vmem[...] = (acc + partial).astype(t_dtype).reshape(
+                    a2a_max_tokens, t_packing, h_per_t
+                )
+                return None
+
+            lax.fori_loop(0, n_w, _weight_tile_body, None, unroll=False)
+
             pltpu.make_async_copy(
-                src_ref=b_y_out_vmem,
+                src_ref=b_y_acc_vmem,
                 dst_ref=a2a_s_acc_x2_hbm.at[e_sem_id, pl.ds(0, a2a_max_tokens)],
                 sem=y_out_sem.at[0],
             ).start()
             pltpu.make_async_copy(
-                src_ref=b_y_out_vmem,
-                dst_ref=b_y_out_vmem,
+                src_ref=b_y_acc_vmem,
+                dst_ref=b_y_acc_vmem,
                 sem=y_out_sem.at[0],
             ).wait()
 
@@ -905,7 +888,6 @@ def fused_ep_moe_v2(
         pltpu.SMEM((2, 1, padded_num_experts), jnp.int32),
         pltpu.SMEM((2,), jnp.int32),
         pltpu.VMEM((2, a2a_max_tokens, t_packing, h_per_t), t_dtype),
-        pltpu.VMEM((a2a_max_tokens, hidden_size), jnp.float32),
         pltpu.VMEM((a2a_max_tokens, t_packing, h_per_t), t_dtype),
         pltpu.VMEM((2, hidden_size, bf), w1.dtype),
         pltpu.VMEM((2, hidden_size, bf), w3.dtype),
@@ -961,7 +943,7 @@ def fused_ep_moe_v2(
                 collective_id=0,
                 allow_collective_id_without_custom_barrier=True,
                 has_side_effects=True,
-                vmem_limit_bytes=64 * 1024 * 1024,
+                vmem_limit_bytes=96 * 1024 * 1024,
             ),
             name=scope_name,
         )
