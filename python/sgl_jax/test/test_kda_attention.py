@@ -20,6 +20,31 @@ mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 jax.sharding.set_mesh(mesh)
 
 
+class _KDAAttnBackendForTest:
+    """Test wrapper that translates `pool=` kwarg to `recurrent_state_pool=`.
+
+    Production routes through HybridLinearAttnBackend, which accepts `pool=`
+    (RadixLinearAttention's call convention) and forwards it to KDA as
+    `recurrent_state_pool=`. These tests assign the raw KDA backend as
+    `forward_batch.attn_backend`, bypassing that wrapper, so we replicate the
+    same translation here.
+    """
+
+    def __init__(self, backend):
+        object.__setattr__(self, "_backend", backend)
+
+    def __call__(self, *args, **kwargs):
+        if "pool" in kwargs:
+            kwargs["recurrent_state_pool"] = kwargs.pop("pool")
+        return self._backend(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._backend, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._backend, name, value)
+
+
 def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.ndarray:
     # scale=0.1 is a test-only hack: it shrinks the recurrent state so bf16 noise
     # in the delta-rule update fits the global atol=1e-2 (shared with flashattn).
@@ -323,7 +348,7 @@ def create_test_data(
     extend_prefix_lens = np.zeros(batch_size, dtype=np.int32) if mode == "prefill" else None
     has_initial_state_np = np.asarray(has_initial_state_per_req, dtype=np.bool_)
 
-    backend = KDAAttnBackend(mesh=test_mesh)
+    backend = _KDAAttnBackendForTest(KDAAttnBackend(mesh=test_mesh))
 
     mwb = ModelWorkerBatch(
         bid=1,

@@ -27,6 +27,31 @@ def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.nda
     return rng.standard_normal(shape).astype(np.float32) * scale
 
 
+class _KDAAttnBackendForTest:
+    """Test wrapper that translates `pool=` kwarg to `recurrent_state_pool=`.
+
+    Production routes through HybridLinearAttnBackend, which accepts `pool=`
+    (RadixLinearAttention's call convention) and forwards it to KDA as
+    `recurrent_state_pool=`. These tests assign the raw KDA backend as
+    `forward_batch.attn_backend`, bypassing that wrapper, so we replicate the
+    same translation here.
+    """
+
+    def __init__(self, backend):
+        object.__setattr__(self, "_backend", backend)
+
+    def __call__(self, *args, **kwargs):
+        if "pool" in kwargs:
+            kwargs["recurrent_state_pool"] = kwargs.pop("pool")
+        return self._backend(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._backend, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._backend, name, value)
+
+
 # Reference baselines duplicated from test_kda_attention.py — keep in sync.
 
 
@@ -395,7 +420,7 @@ def create_test_data(
     req_pool_indices_cpu = np.arange(total_bs, dtype=np.int32)
 
     real_bs_per_dp = [len(lens_per_rank.get(r, [])) for r in range(dp_size)]
-    backend = KDAAttnBackend(mesh=mesh)
+    backend = _KDAAttnBackendForTest(KDAAttnBackend(mesh=mesh))
 
     mwb = ModelWorkerBatch(
         bid=1,
