@@ -993,7 +993,8 @@ def _fused_ep_moe_kernel(
         bt_start = bt_id * bt
 
         def _build_e2t(counts_smem):
-            counts_smem[...] = jnp.zeros_like(counts_smem)
+            for i in range(local_num_experts):
+                counts_smem[i] = jnp.int32(0)
 
             def _count(t_id, _):
                 for k_id in range(top_k):
@@ -1015,7 +1016,8 @@ def _fused_ep_moe_kernel(
                 e2t_starts_x2_smem[bt_sem_id, i] = running
                 running = running + counts_smem[i]
             e2t_starts_x2_smem[bt_sem_id, local_num_experts] = running
-            counts_smem[...] = jnp.zeros_like(counts_smem)
+            for i in range(local_num_experts):
+                counts_smem[i] = jnp.int32(0)
 
             def _place(t_id, _):
                 src_t_id = bt_start + t_id
