@@ -441,7 +441,7 @@ class EAGLEWorker(ModelWorker):
         )
         model_worker_batch.spec_info = EagleVerifyInput(
             draft_token=draft_tokens,
-            custom_mask=tree_mask,
+            custom_mask=tree_mask, # tree mask 在这里使用，后续的 verify 和 sample 都会使用这个 mask 来保证正确的依赖关系
             positions=position,
             retrive_index=retrive_index,
             retrive_next_token=retrive_next_token,

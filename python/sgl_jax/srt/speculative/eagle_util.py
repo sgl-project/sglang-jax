@@ -29,7 +29,9 @@ from sgl_jax.srt.kernels.speculative.kernel import (
     create_extend_after_decode_spec_info,
     top_k_renorm_prob,
     top_p_renorm_prob,
+    top_k_top_p_renorm_prob,
     tree_speculative_sampling_target_only,
+    tree_speculative_sampling_target_only_jit,
 )
 from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import verify_tree_greedy
 from sgl_jax.srt.managers.schedule_batch import (
@@ -920,6 +922,7 @@ class EagleVerifyInput:
                     retrive_next_sibling=self.retrive_next_sibling,
                     next_token_logits=logits_output.next_token_logits,
                 )
+        # 明确位置，此处是 non-greedy
         else:
             bs = self.retrive_index.shape[0]
             candidates = self.draft_token.reshape(bs, self.draft_token_num)
@@ -929,48 +932,65 @@ class EagleVerifyInput:
 
             accept_index = jnp.full((bs, self.spec_steps + 1), -1, dtype=jnp.int32)
             accept_length = jnp.zeros((bs,), dtype=jnp.int32)
-            # apply temperature and get target probs
-            expanded_temperature = jnp.repeat(
-                sampling_info.temperatures, self.draft_token_num
-            )  # (bs * draft_token_num, 1)
-            expanded_temperature = jnp.expand_dims(expanded_temperature, axis=-1)
-            target_probs = jax.nn.softmax(
-                logits_output.next_token_logits / expanded_temperature, axis=-1
-            )  # (bs * draft_token_num, vocab_size)
-            target_probs = top_k_renorm_prob(
-                target_probs, jnp.repeat(sampling_info.top_ks, self.draft_token_num)
-            )
+            # Enter mesh context for TP compatibility (same as greedy path)
+            try:
+                ctx = mesh.to_jax_mesh()
+            except AttributeError:
+                ctx = mesh
+            with ctx:
+                logits_bs = logits_output.next_token_logits.shape[0]
+                # Pad sampling params to match logits batch size (verify phase pads the batch)
+                expanded_temperature = jnp.repeat(
+                    sampling_info.temperatures, self.draft_token_num
+                )
+                expanded_top_ks = jnp.repeat(sampling_info.top_ks, self.draft_token_num)
+                expanded_top_ps = jnp.repeat(sampling_info.top_ps, self.draft_token_num)
+                pad_len = logits_bs - expanded_temperature.shape[0]
+                if pad_len > 0:
+                    expanded_temperature = jnp.pad(expanded_temperature, (0, pad_len), constant_values=1.0)
+                    expanded_top_ks = jnp.concatenate([expanded_top_ks, jnp.full((pad_len,), expanded_top_ks[0])])
+                    expanded_top_ps = jnp.concatenate([expanded_top_ps, jnp.full((pad_len,), expanded_top_ps[0])])
+                expanded_temperature = jnp.expand_dims(expanded_temperature, axis=-1)
 
-            if not jnp.all(sampling_info.top_ps == 1.0):
-                target_probs = top_p_renorm_prob(
-                    target_probs, jnp.repeat(sampling_info.top_ps, self.draft_token_num)
+                # Temperature scaling + softmax
+                target_probs = jax.nn.softmax(
+                    logits_output.next_token_logits / expanded_temperature, axis=-1
                 )
 
-            # TODO: optimize top_k and top_p by avoiding sort
-            rngs = jax.random.split(rng.params(), 3)
+                # Replicate target_probs for top_k_top_p (eager-mode vocab-dim ops need full data)
+                from jax.sharding import NamedSharding, PartitionSpec as P
+                jax_mesh = ctx if isinstance(ctx, jax.sharding.Mesh) else mesh
+                target_probs = jax.device_put(target_probs, NamedSharding(jax_mesh, P()))
 
-            draft_probs = jnp.zeros(target_probs.shape, dtype=jnp.float32)
+                # Apply top-k and top-p filtering
+                target_probs = top_k_top_p_renorm_prob(
+                    target_probs,
+                    expanded_top_ks,
+                    expanded_top_ps,
+                )
 
-            # coins for rejection sampling
-            coins = jax.random.uniform(rngs[1], candidates.shape, dtype=jnp.float32)
-            # coins for final sampling
-            coins_for_final_sampling = jax.random.uniform(rngs[2], (bs,), dtype=jnp.float32)
-            accept_index, accept_length, predict = tree_speculative_sampling_target_only(
-                predicts=predict,
-                accept_index=accept_index,
-                accept_token_num=accept_length,
-                candidates=candidates,
-                retrive_index=self.retrive_index,
-                retrive_next_token=self.retrive_next_token,
-                retrive_next_sibling=self.retrive_next_sibling,
-                uniform_samples=coins,
-                uniform_samples_for_final_sampling=coins_for_final_sampling,
-                target_probs=target_probs,
-                draft_probs=draft_probs,
-                threshold_single=global_server_args_dict["speculative_accept_threshold_single"],
-                threshold_acc=global_server_args_dict["speculative_accept_threshold_acc"],
-                deterministic=True,
-            )
+                rngs = jax.random.split(rng.params(), 3)
+                draft_probs = jnp.zeros(target_probs.shape, dtype=jnp.float32)
+                coins = jax.random.uniform(rngs[1], candidates.shape, dtype=jnp.float32)
+                coins_for_final_sampling = jax.random.uniform(rngs[2], (bs,), dtype=jnp.float32)
+
+                # JIT inside mesh context so XLA can resolve sharding
+                _jit_fn = jax.jit(tree_speculative_sampling_target_only_jit)
+                accept_index, accept_length, predict = _jit_fn(
+                    predicts=predict,
+                    accept_index=accept_index,
+                    accept_token_num=accept_length,
+                    candidates=candidates,
+                    retrive_index=self.retrive_index,
+                    retrive_next_token=self.retrive_next_token,
+                    retrive_next_sibling=self.retrive_next_sibling,
+                    uniform_samples=coins,
+                    uniform_samples_for_final_sampling=coins_for_final_sampling,
+                    target_probs=target_probs,
+                    draft_probs=draft_probs,
+                    threshold_single=global_server_args_dict["speculative_accept_threshold_single"],
+                    threshold_acc=global_server_args_dict["speculative_accept_threshold_acc"],
+                )
         if SIMULATE_ACC_LEN:
             # Do simulation
             _, rng = jax.random.split(rng.params())
