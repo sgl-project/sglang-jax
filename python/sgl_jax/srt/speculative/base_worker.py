@@ -38,7 +38,3 @@ class BaseSpecWorker(ABC):
     @abstractmethod
     def draft_worker(self) -> BaseDraftWorker:
         pass
-
-    @abstractmethod
-    def clear_cache_pool(self):
-        pass

@@ -75,10 +75,6 @@ class EAGLEWorker(BaseSpecWorker):
     def draft_worker(self) -> EagleDraftWorker:
         return self._draft_worker
 
-    def clear_cache_pool(self):
-        # TODO: implement when scheduler/runtime needs explicit pool clearing
-        pass
-
     def forward_batch_speculative_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
