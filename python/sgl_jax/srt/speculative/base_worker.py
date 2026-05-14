@@ -42,11 +42,3 @@ class BaseSpecWorker(ABC):
     @abstractmethod
     def clear_cache_pool(self):
         pass
-
-    def on_verify_complete_cpu(self, num_correct_drafts_per_req: list[int]) -> None:  # noqa: B027
-        """Hook called after verify finishes and accept counts are on CPU.
-
-        Default no-op. Adaptive-aware workers override this to feed the
-        controller without forcing a GPU->CPU sync in the worker hot path.
-        """
-        pass
