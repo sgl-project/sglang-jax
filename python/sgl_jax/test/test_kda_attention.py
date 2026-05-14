@@ -15,6 +15,7 @@ from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+from sgl_jax.test.test_utils import KDAAttnBackendForTest
 
 mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 jax.sharding.set_mesh(mesh)
@@ -323,7 +324,7 @@ def create_test_data(
     extend_prefix_lens = np.zeros(batch_size, dtype=np.int32) if mode == "prefill" else None
     has_initial_state_np = np.asarray(has_initial_state_per_req, dtype=np.bool_)
 
-    backend = KDAAttnBackend(mesh=test_mesh)
+    backend = KDAAttnBackendForTest(KDAAttnBackend(mesh=test_mesh))
 
     mwb = ModelWorkerBatch(
         bid=1,
