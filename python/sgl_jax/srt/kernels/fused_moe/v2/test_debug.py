@@ -34,9 +34,9 @@ devices = np.array(jax.devices()).reshape(1, num_devices)
 mesh = jax.sharding.Mesh(devices, ("data", "tensor"))
 ep_size = num_devices
 
-# Small shape for quick correctness check
+# bt must be >= 128 for btc=128 alignment
 d, f, E, top_k = 768, 256, 64, 2
-bt, bf, btc = 16, 256, 128
+bt, bf, btc = 128, 256, 128
 num_tokens = bt * ep_size
 
 log(f"config: E={E} d={d} f={f} k={top_k} bt={bt} ep={ep_size} tokens={num_tokens}")
