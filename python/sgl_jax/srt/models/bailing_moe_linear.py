@@ -996,9 +996,12 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
                     out_dim = hidden_size if is_w2 else inter_size
                     in_dim = inter_size if is_w2 else hidden_size
                     num_blocks = in_dim // BLOCK_SIZE
+                    # Mirror the fused weight sharding (("data", "tensor"), ...)
+                    # promoted to 4D for the [E, K_blocks, 1, out_dim] scale.
+                    fused_weight_shard = wm.sharding[0] if wm.sharding else ("data", "tensor")
                     scale_extra_mappings[f"__MOE_EXPERTS__{scale_target}"] = WeightMapping(
                         target_path=[scale_target] + expert_scale_keys,
-                        sharding=("expert", None, None, None),
+                        sharding=(fused_weight_shard, None, None, None),
                         transpose=False,
                         reshape=(num_physical_experts, 1, 1, out_dim),
                         repeat=(1, num_blocks),
