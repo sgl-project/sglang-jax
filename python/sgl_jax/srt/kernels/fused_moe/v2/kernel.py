@@ -1328,7 +1328,7 @@ def fused_ep_moe_v2(
         dtype=tokens.dtype, ep_size=ep_size, block_config=block_config,
     )
 
-    needs_jax_allreduce = use_jax_allreduce_metadata and ep_size > 1 and not disable_a2a
+    needs_jax_allreduce = use_jax_allreduce_metadata and ep_size > 1
 
     padded_num_experts = align_to(num_experts, 128)
     padded_top_k = align_to(top_k, 128)
