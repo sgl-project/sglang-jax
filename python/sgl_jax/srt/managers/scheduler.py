@@ -1809,22 +1809,26 @@ class Scheduler(
                 next_token_ids = np.array(jax.device_get(next_token_ids_device))
                 self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
         else:
-            # NEXTN (MoE+EP target) prefill must use the same padded mwb as
-            # nospec so target forward sees identical input shapes (#1090).
-            # Dense EAGLE/EAGLE3 targets don't need this and EagleDraftWorker
-            # doesn't yet handle padded prefill mwb, so keep the unpadded path.
-            _get = (
-                batch.get_model_worker_batch
-                if batch.forward_mode.is_extend() and self.spec_algorithm.is_nextn()
-                else batch.get_spec_model_worker_batch
-            )
-            model_worker_batch = _get(
-                precompile_token_paddings,
-                precompile_bs_paddings,
-                precompile_cache_loc_paddings,
-                self.page_size,
-                self.server_args.enable_static_lora,
-            )
+            if batch.forward_mode.is_extend() and self.spec_algorithm.is_nextn():
+                # NEXTN (MoE+EP target) prefill must use the same padded mwb as
+                # nospec so target forward sees identical input shapes (#1090).
+                # Dense EAGLE/EAGLE3 targets don't need this and EagleDraftWorker
+                # doesn't yet handle padded prefill mwb.
+                model_worker_batch = batch.get_model_worker_batch(
+                    precompile_token_paddings,
+                    precompile_bs_paddings,
+                    precompile_cache_loc_paddings,
+                    self.page_size,
+                    self.server_args.enable_static_lora,
+                )
+            else:
+                model_worker_batch = batch.get_spec_model_worker_batch(
+                    precompile_token_paddings,
+                    precompile_bs_paddings,
+                    precompile_cache_loc_paddings,
+                    self.page_size,
+                    self.server_args.enable_static_lora,
+                )
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch
             )
