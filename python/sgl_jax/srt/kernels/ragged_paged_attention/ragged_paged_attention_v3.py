@@ -114,7 +114,7 @@ def ref_ragged_paged_attention(
         ), f"use custom_mask, custom_mask length {custom_mask.size=} must larger than total kv length {jnp.cumsum(kv_lens)[-1]=}"
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
-    _, _, num_kv_heads, head_dim = k_pages.shape
+    _, page_size, num_kv_heads, head_dim = k_pages.shape
     num_q_heads = queries.shape[1]
     assert num_q_heads % num_kv_heads == 0
     num_query_per_kv = num_q_heads // num_kv_heads
@@ -122,8 +122,11 @@ def ref_ragged_paged_attention(
     mask_len_list = []
     for i in range(num_seqs[0]):
         kv_len = kv_lens[i]
+        # custom_mask rows are padded to the page-aligned kv_len so the kernel's
+        # DMA offset/size are 8-divisible; ref must use the same stride.
+        aligned_kv_len = ((kv_len + page_size - 1) // page_size) * page_size
         q_len = cu_q_lens[i + 1] - cu_q_lens[i]
-        mask_len_list.append(q_len * kv_len)
+        mask_len_list.append(q_len * aligned_kv_len)
     mask_lens = jnp.array(mask_len_list, dtype=jnp.int32)
     cu_mask_lens = jnp.concatenate([jnp.array([0], dtype=jnp.int32), jnp.cumsum(mask_lens)])
 
@@ -151,13 +154,14 @@ def ref_ragged_paged_attention(
             kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
             mask = q_span < kv_span
         else:
+            aligned_kv_len = ((kv_len + page_size - 1) // page_size) * page_size
             mask_start = cu_mask_lens[i]
             mask_end = cu_mask_lens[i + 1]
             mask = custom_mask[mask_start:mask_end]
             mask = (
                 jnp.repeat(jnp.expand_dims(mask, axis=0), num_q_heads, axis=0).reshape(
-                    num_q_heads, q_len, kv_len
-                )
+                    num_q_heads, q_len, aligned_kv_len
+                )[:, :, :kv_len]
                 < 1
             )
         if sliding_window is not None:
