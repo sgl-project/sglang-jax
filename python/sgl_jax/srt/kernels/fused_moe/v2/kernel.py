@@ -650,7 +650,7 @@ def _fused_ep_moe_kernel(
             return
 
         def _wait_one_expert(e_id, _):
-            sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
+            sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id]
 
             @pl.when(sz != 0)
             def _():
