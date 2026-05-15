@@ -633,6 +633,28 @@ class BailingMoELinearModel(nnx.Module):
 class BailingMoeV2_5ForCausalLM(nnx.Module):
     @classmethod
     def patch_model_config(cls, mc: ModelConfig) -> None:
+        # Reject `--moe-backend=fused` for compressed-tensors per-channel
+        # checkpoints (e.g. Ling-2.6-1T): the fused MoE kernel requires
+        # `quant_block_k % 128 == 0` but per-channel scales are 1D
+        # `[E, out_dim]`, which the kernel rejects at forward time
+        # (`_validate_fused_ep_moe_args` raises). Surface this at config
+        # resolution so the user does not waste a 5-min weight load before
+        # the first forward call crashes.
+        quant_cfg = getattr(mc, "quantization_config", None)
+        if (
+            quant_cfg is not None
+            and quant_cfg.is_static_checkpoint
+            and quant_cfg.weight_block_size is None
+            and quant_cfg.moe_weight_dtype is not None
+            and getattr(mc, "moe_backend", None) in (MoEBackend.FUSED, "fused")
+        ):
+            raise ValueError(
+                "Ling-2.6-1T uses compressed-tensors per-channel FP8 weights, "
+                "which the fused MoE kernel does not support "
+                "(requires quant_block_k % 128 == 0). "
+                "Use --moe-backend=epmoe instead."
+            )
+
         cfg = mc.hf_text_config
         if getattr(cfg, "full_attention_type", "mla") != "mla":
             return
