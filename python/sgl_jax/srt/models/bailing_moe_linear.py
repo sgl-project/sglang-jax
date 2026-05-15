@@ -633,28 +633,6 @@ class BailingMoELinearModel(nnx.Module):
 class BailingMoeV2_5ForCausalLM(nnx.Module):
     @classmethod
     def patch_model_config(cls, mc: ModelConfig) -> None:
-        # Reject `--moe-backend=fused` for compressed-tensors per-channel
-        # checkpoints (e.g. Ling-2.6-1T): the fused MoE kernel requires
-        # `quant_block_k % 128 == 0` but per-channel scales are 1D
-        # `[E, out_dim]`, which the kernel rejects at forward time
-        # (`_validate_fused_ep_moe_args` raises). Surface this at config
-        # resolution so the user does not waste a 5-min weight load before
-        # the first forward call crashes.
-        quant_cfg = getattr(mc, "quantization_config", None)
-        if (
-            quant_cfg is not None
-            and quant_cfg.is_static_checkpoint
-            and quant_cfg.weight_block_size is None
-            and quant_cfg.moe_weight_dtype is not None
-            and getattr(mc, "moe_backend", None) in (MoEBackend.FUSED, "fused")
-        ):
-            raise ValueError(
-                "Ling-2.6-1T uses compressed-tensors per-channel FP8 weights, "
-                "which the fused MoE kernel does not support "
-                "(requires quant_block_k % 128 == 0). "
-                "Use --moe-backend=epmoe instead."
-            )
-
         cfg = mc.hf_text_config
         if getattr(cfg, "full_attention_type", "mla") != "mla":
             return
@@ -967,14 +945,18 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
 
         phy_to_log = None
         metadata = get_global_expert_location_metadata()
+        num_logical_experts = getattr(self.config, "num_experts", 256)
+        num_physical_experts = num_logical_experts
         if metadata is not None:
             phy_to_log = np.array(jax.device_get(metadata.physical_to_logical_map))[layer_idx]
+            num_physical_experts = metadata.num_physical_experts
 
         moe_backend = getattr(self.config, "moe_backend", "epmoe")
+        use_fused = moe_backend == "fused"
         moe_mappings = create_moe_weights_mapping(
             prefix=prefix,
             target_prefix=target,
-            num_experts=getattr(self.config, "num_experts", 256),
+            num_experts=num_logical_experts,
             expert_type_names=("gate_proj", "up_proj", "down_proj"),
             moe_backend=moe_backend,
             physical_to_logical_map=phy_to_log,
@@ -982,12 +964,24 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
         mappings.update(moe_mappings)
 
         # Routed expert weight-scale sidecars (compressed-tensors per-channel).
-        # For each `__MOE_EXPERTS__<target>` group emitted above, register a
-        # parallel scale group. WeightLoader stacks per-expert scales into
-        # ``[E, out_dim]`` and ``_maybe_convert_epmoe_scale_for_kernel`` then
-        # reshapes that into the kernel-ready ``[E, 1, 1, out_dim]`` layout for
-        # both EPMoE (``wi_*_scale``) and FusedEPMoE (``w*_scale``) backends.
+        # Each `__MOE_EXPERTS__<target>` group emitted above gets a parallel
+        # scale group whose HF source is the per-expert `*.weight_scale` tensor.
+        # Layout depends on the backend:
+        #   EPMoE: stack to `[E, out_dim]`;
+        #     `_maybe_convert_epmoe_scale_for_kernel` then reshapes into the
+        #     GMM-ready `[E, 1, 1, out_dim]` (k_blocks=1) layout.
+        #   FusedEPMoE: the Pallas kernel `_validate_fused_ep_moe_args`
+        #     requires `quant_block_k % 128 == 0`. Per-channel scales have no
+        #     K blocking, so we reshape to `[E, 1, 1, out_dim]` and tile
+        #     `num_blocks = in_dim / 256` times along the K axis
+        #     (`repeat=(1, num_blocks)`) so the kernel sees the expected
+        #     `[E, K // 256, 1, out_dim]` shape. The scale value is identical
+        #     across every K block, so this is mathematically equivalent to
+        #     per-channel scaling. Mirrors `bailing_moe.py`.
         if is_static_quant:
+            BLOCK_SIZE = 256  # fused MoE kernel default quant_block_k
+            hidden_size = self.config.hidden_size
+            inter_size = getattr(self.config, "moe_intermediate_size", 2048)
             scale_extra_mappings = {}
             for moe_key, wm in moe_mappings.items():
                 if not moe_key.startswith("__MOE_EXPERTS__"):
@@ -997,17 +991,42 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
                 expert_scale_keys = [
                     k.replace(".weight", ".weight_scale") for k in wm.target_path[1:]
                 ]
-                scale_extra_mappings[f"__MOE_EXPERTS__{scale_target}"] = WeightMapping(
-                    target_path=[scale_target] + expert_scale_keys,
-                    sharding=("expert", None),
-                    transpose=False,
-                    physical_to_logical_map=wm.physical_to_logical_map,
-                )
+                if use_fused:
+                    is_w2 = target_base.endswith("w2")
+                    out_dim = hidden_size if is_w2 else inter_size
+                    in_dim = inter_size if is_w2 else hidden_size
+                    num_blocks = in_dim // BLOCK_SIZE
+                    scale_extra_mappings[f"__MOE_EXPERTS__{scale_target}"] = WeightMapping(
+                        target_path=[scale_target] + expert_scale_keys,
+                        sharding=("expert", None, None, None),
+                        transpose=False,
+                        reshape=(num_physical_experts, 1, 1, out_dim),
+                        repeat=(1, num_blocks),
+                        physical_to_logical_map=wm.physical_to_logical_map,
+                    )
+                else:
+                    scale_extra_mappings[f"__MOE_EXPERTS__{scale_target}"] = WeightMapping(
+                        target_path=[scale_target] + expert_scale_keys,
+                        sharding=("expert", None),
+                        transpose=False,
+                        physical_to_logical_map=wm.physical_to_logical_map,
+                    )
             mappings.update(scale_extra_mappings)
 
         num_shared = getattr(self.config, "num_shared_experts", 0)
-        use_fused = moe_backend == "fused"
         if num_shared > 0 and use_fused:
+            # FusedEPMoE: shared experts live as nnx.Param `w*_shared`/`w*_shared_scale`
+            # on the layer's `mlp` module. Per-channel shared scale `[out_dim]` is
+            # reshaped to `[1, 1, out_dim]` to match the kernel placeholder.
+            shared_inter = (
+                getattr(
+                    self.config,
+                    "moe_shared_expert_intermediate_size",
+                    self.config.moe_intermediate_size,
+                )
+                * num_shared
+            )
+            shared_hidden = self.config.hidden_size
             for hf_name, target_name in [
                 ("gate_proj", "w1_shared"),
                 ("up_proj", "w3_shared"),
@@ -1019,10 +1038,13 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
                     transpose=True,
                 )
                 if is_static_quant:
+                    is_w2 = "down_proj" in hf_name
+                    out_dim = shared_hidden if is_w2 else shared_inter
                     mappings[f"{prefix}.mlp.shared_experts.{hf_name}.weight_scale"] = WeightMapping(
                         target_path=f"{target}.mlp.{target_name}_scale",
-                        sharding=(None,),
+                        sharding=(None, None, None),
                         transpose=False,
+                        reshape=(1, 1, out_dim),
                     )
         elif num_shared > 0:
             # EPMoE backend stores shared experts as a DeepseekV3MLP (LinearBase)
