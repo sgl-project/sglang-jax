@@ -19,7 +19,7 @@ from sgl_jax.srt.layers.embeddings import (
     get_rope,
 )
 from sgl_jax.srt.layers.layernorm import RMSNorm
-from sgl_jax.srt.layers.linear import LinearBase, MergedColumnParallelLinear
+from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import (
     EPMoE,
@@ -123,21 +123,28 @@ class BailingMoELinearAttention(nnx.Module):
         )
         self.mesh = mesh
         self.tp_size = mesh.shape.get("tensor", 1)
+        assert self.num_heads % self.tp_size == 0, (
+            f"BailingMoE GLA: num_heads={self.num_heads} must divide TP={self.tp_size} "
+            f"(restripe assumes num_heads_local = num_heads // tp_size is integral)."
+        )
         self.linear_silu = getattr(config, "use_linear_silu", getattr(config, "linear_silu", False))
         self.linear_rope = getattr(config, "linear_rope", True)
 
         inner_size = self.num_heads * self.head_dim
         qkv_bias = getattr(config, "use_bias", False) or getattr(config, "use_qkv_bias", False)
-        # Fused Q/K/V with stripe-interleaved per-rank layout
-        # ``[Q_my | K_my | V_my]``: keeps the post-projection split contiguous
-        # within each TP shard, so the ``[T, num_heads, head_dim]`` reshape
-        # below is a pure no-op slice on local data instead of an all-to-all.
-        # ``post_load_weights`` rewrites the loaded HF block-concat weight
-        # into that layout; see the docstring there for the column permutation.
-        self.qkv_proj = MergedColumnParallelLinear(
+        # Fused Q/K/V: weight is [hidden, 3*inner_size] with stripe-interleaved
+        # per-rank layout ``[Q_my | K_my | V_my]``, enforced by
+        # ``post_load_weights`` rewriting the loaded HF block-concat columns.
+        # Keeps the post-projection split contiguous within each TP shard, so
+        # the ``[T, num_heads, head_dim]`` reshape below is a pure no-op slice
+        # on local data instead of an all-to-all. Q/K/V are equal-sized here,
+        # so plain ``LinearBase`` suffices (no need for
+        # ``MergedColumnParallelLinear``'s per-component metadata).
+        self.qkv_proj = LinearBase(
             input_size=self.hidden_size,
-            output_sizes=[inner_size, inner_size, inner_size],
+            output_size=3 * inner_size,
             use_bias=qkv_bias,
+            kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
             scope_name="query_key_value",
