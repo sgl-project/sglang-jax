@@ -746,7 +746,8 @@ def _fused_ep_moe_kernel(
                 ).wait()
 
         def _run_inactive(_):
-            if local_e_id >= expert_buffer_count:
+            @pl.when(local_e_id >= expert_buffer_count)
+            def _():
                 wait_a2a_gather_send(
                     bt_sem_id=bt_sem_id,
                     e_sem_id=e_sem_id,
