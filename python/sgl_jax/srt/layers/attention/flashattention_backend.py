@@ -233,6 +233,29 @@ class FlashAttention(AttentionBackend):
         if batch.forward_mode.is_target_verify():
             seq_lens += extend_seq_lens
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
+            # Hybrid-SWA targets at page_size>=256 hit Mosaic's tiling(8) proof
+            # in rpa_v3._fetch_mask. Pad each mask row to page-aligned kv_len so
+            # the kernel can use cu_kv_lens delta as a statically-8-divisible
+            # stride. Dense targets (EAGLE3) keep the unpadded path so accept-
+            # rate / cache-hit behavior is unchanged.
+            if metadata.custom_mask is not None and self.page_size >= 256:
+                q = batch.spec_info.draft_token_num
+                cm = np.asarray(jax.device_get(metadata.custom_mask))
+                out, off = [], 0
+                for i in range(batch.real_bs):
+                    kl, kla = int(seq_lens[i]), int(aligned_seq_lens[i])
+                    row = cm[off : off + q * kl].reshape(q, kl)
+                    out.append(np.pad(row, ((0, 0), (0, kla - kl))).reshape(-1))
+                    off += q * kl
+                padded_tail = (
+                    q * int(aligned_seq_lens[batch.real_bs :].sum())
+                    if padded_batch_size > batch.real_bs
+                    else 0
+                )
+                metadata.custom_mask = device_array(
+                    np.pad(np.concatenate(out), (0, padded_tail)).astype(np.int32),
+                    sharding=NamedSharding(self.mesh, P()),
+                )
         else:
             aligned_seq_lens = (
                 (batch.seq_lens + self.page_size - 1) // self.page_size
