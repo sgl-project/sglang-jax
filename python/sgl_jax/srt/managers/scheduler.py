@@ -1809,12 +1809,13 @@ class Scheduler(
                 next_token_ids = np.array(jax.device_get(next_token_ids_device))
                 self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
         else:
-            # Spec prefill must use the same padded mwb as nospec so target
-            # forward sees identical input shapes; get_spec_model_worker_batch
-            # skips token/bs padding which can shift logits via MoE EP dispatch.
+            # NEXTN (MoE+EP target) prefill must use the same padded mwb as
+            # nospec so target forward sees identical input shapes (#1090).
+            # Dense EAGLE/EAGLE3 targets don't need this and EagleDraftWorker
+            # doesn't yet handle padded prefill mwb, so keep the unpadded path.
             _get = (
                 batch.get_model_worker_batch
-                if batch.forward_mode.is_extend()
+                if batch.forward_mode.is_extend() and self.spec_algorithm.is_nextn()
                 else batch.get_spec_model_worker_batch
             )
             model_worker_batch = _get(
