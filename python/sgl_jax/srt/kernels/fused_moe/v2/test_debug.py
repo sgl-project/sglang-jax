@@ -35,7 +35,7 @@ mesh = jax.sharding.Mesh(devices, ("data", "tensor"))
 ep_size = num_devices
 
 # bt must be >= 128 for btc=128 alignment
-d, f, E, top_k = 768, 256, 8, 2
+d, f, E, top_k = 768, 256, 64, 2
 bt, bf, btc = 128, 256, 128
 num_tokens = bt * ep_size
 
