@@ -475,6 +475,7 @@ suites = {
         TestFile("python/sgl_jax/test/layers/test_gdn_backend.py", 1),
         TestFile("python/sgl_jax/test/layers/test_merged_column_parallel_linear.py", 1),
         TestFile("python/sgl_jax/test/layers/test_qwen3_5_gated_delta_net.py", 1),
+        TestFile("test/srt/test_tokenizer_manager_event.py", 0.1),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 1),
