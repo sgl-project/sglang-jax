@@ -260,24 +260,30 @@ class FusedEPMoE(nnx.Module):
                 )
 
                 if self.num_shared_experts > 0:
+                    # fused kernel expects per-channel shared scale (1, 1, se_inter)
+                    # — see _validate_fused_ep_moe_args / kernel.py:455-470
                     shared_scale_sharding = P(None, None, None)
+                    se_inter = self.moe_shared_expert_intermediate_size * self.num_shared_experts
 
                     if hasattr(self, "w1_shared_scale"):
                         del self.w1_shared_scale
                     self.w1_shared_scale = nnx.Param(
-                        jnp.zeros((1,), dtype=jnp.float32), out_sharding=shared_scale_sharding
+                        jnp.zeros((1, 1, se_inter), dtype=jnp.float32),
+                        out_sharding=shared_scale_sharding,
                     )
 
                     if hasattr(self, "w3_shared_scale"):
                         del self.w3_shared_scale
                     self.w3_shared_scale = nnx.Param(
-                        jnp.zeros((1,), dtype=jnp.float32), out_sharding=shared_scale_sharding
+                        jnp.zeros((1, 1, se_inter), dtype=jnp.float32),
+                        out_sharding=shared_scale_sharding,
                     )
 
                     if hasattr(self, "w2_shared_scale"):
                         del self.w2_shared_scale
                     self.w2_shared_scale = nnx.Param(
-                        jnp.zeros((1,), dtype=jnp.float32), out_sharding=shared_scale_sharding
+                        jnp.zeros((1, 1, self.hidden_size), dtype=jnp.float32),
+                        out_sharding=shared_scale_sharding,
                     )
 
                 return
