@@ -1059,6 +1059,7 @@ class GlmMoeDsaForCausalLM(Glm5ForCausalLM):
     @classmethod
     def patch_model_config(cls, mc: ModelConfig) -> None:
         from sgl_jax.srt.configs.model_config import AttentionArch
+
         # GLM-5 uses 256 for attention head dim (192 nope + 64 pe)
         mc.head_dim = 256
         mc.hf_config.head_dim = 256
