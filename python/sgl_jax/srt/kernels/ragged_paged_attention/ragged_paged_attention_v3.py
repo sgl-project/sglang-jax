@@ -555,25 +555,21 @@ def _ragged_paged_attention_kernel_loop(
         sem = sems.at[4, bkvmask_sem_idx]
         kvmask_vmem_ref = bkvmask_ref.at[bkvmask_sem_idx]
 
-        # custom_mask rows are host-padded to page-aligned kv_len (8-divisible
-        # and shape-stable within a page) while kv_lens_ref keeps the unaligned
-        # value for _fetch_bkv. Mask stride = cu_kv_lens delta (page-aligned).
-        mask_kv_len = pl.multiple_of(cu_kv_lens_ref[seq_idx + 1] - cu_kv_lens_ref[seq_idx], 8)
+        kv_len = kv_lens_ref[seq_idx]
+        mask_len = kv_len
         mask_start = bkvmask_idx * bkv_sz
-        mask_left = mask_kv_len - mask_start
-        load_kvmask_sz = pl.multiple_of(jnp.minimum(bkv_sz, mask_left), 8)
+        mask_left = mask_len - mask_start
+        load_kvmask_sz = jnp.minimum(bkv_sz, mask_left)
 
         q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
         q_end = cu_q_lens_ref[seq_idx + 1]
         load_q_sz = jnp.minimum(bq_sz, q_end - q_len_start)
 
-        cur_seq_mask_start = pl.multiple_of(cu_seq_mask_lens[seq_idx], 8)
-        cur_bq_mask_start = cur_seq_mask_start + bq_idx * bq_sz * mask_kv_len
-
-        zero_sz = pl.multiple_of(bkv_sz - load_kvmask_sz, 8)
+        cur_seq_mask_start = cu_seq_mask_lens[seq_idx]
+        cur_bq_mask_start = cur_seq_mask_start + bq_idx * bq_sz * kv_len
 
         def loop_body(i, _):
-            start = pl.multiple_of(cur_bq_mask_start + i * mask_kv_len + mask_start, 8)
+            start = cur_bq_mask_start + i * kv_len + mask_start
             _async_copy(
                 custom_mask_ref.at[pl.ds(start, load_kvmask_sz)],
                 kvmask_vmem_ref.at[i, pl.ds(0, load_kvmask_sz)],
@@ -581,8 +577,8 @@ def _ragged_paged_attention_kernel_loop(
                 wait,
             )
             _async_copy(
-                zero_mask_ref.at[pl.ds(0, zero_sz)],
-                kvmask_vmem_ref.at[i, pl.ds(load_kvmask_sz, zero_sz)],
+                zero_mask_ref.at[pl.ds(0, bkv_sz - load_kvmask_sz)],
+                kvmask_vmem_ref.at[i, pl.ds(load_kvmask_sz, bkv_sz - load_kvmask_sz)],
                 sem,
                 wait,
             )
@@ -1756,12 +1752,9 @@ def ragged_paged_attention(
             custom_mask = custom_mask.astype(jnp.int32)
         custom_mask = jnp.repeat(jnp.expand_dims(custom_mask, axis=1), repeats=head_dim, axis=1)
 
-        # Prepare cu_seq_mask_lens for custom mask. Host pads each mask row
-        # to page-aligned kv_len (= cu_kv_lens delta), so per-seq stride uses
-        # that aligned length to keep DMA offset/size tiling(8)-divisible.
+        # Prepare cu_seq_mask_lens for custom mask.
         q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-        aligned_kv_lens = cu_kv_lens[1:] - cu_kv_lens[:-1]
-        seq_mask_lens = aligned_kv_lens * q_lens
+        seq_mask_lens = kv_lens * q_lens
         cu_seq_mask_lens = jnp.concatenate(
             [jnp.array([0], dtype=jnp.int32), jnp.cumsum(seq_mask_lens)]
         )
