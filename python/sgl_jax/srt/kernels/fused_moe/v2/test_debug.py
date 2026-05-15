@@ -67,11 +67,13 @@ topk_idx_s = jax.device_put(topk_idx, ep_sharding)
 
 bc = FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=256)
 
-log("calling fused_ep_moe_v2 (compile + run)...")
+log("calling fused_ep_moe_v2 (compile + run) with disable_a2a=True...")
 result = fused_ep_moe_v2(
     mesh, tokens_s, w1_s, w2_s, w3_s,
     topk_wts_s, topk_idx_s, top_k,
     block_config=bc,
+    disable_a2a=True,
+    disable_sync_barrier=True,
 )
 log("blocking on result...")
 result.block_until_ready()
