@@ -23,11 +23,17 @@ from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
 from sgl_jax.srt.utils.common_utils import is_remote_url, lru_cache_frozenset
 
+
+class GlmMoeDsaConfig(PretrainedConfig):
+    model_type = "glm_moe_dsa"
+
+
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     cls.model_type: cls
     for cls in [
         BailingHybridConfig,
         KimiLinearConfig,
+        GlmMoeDsaConfig,
     ]
 }
 

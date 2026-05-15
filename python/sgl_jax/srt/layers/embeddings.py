@@ -200,6 +200,7 @@ class RotaryEmbedding:
         base: int,
         is_neox_style: bool,
         dtype: jnp.dtype,
+        mesh: jax.sharding.Mesh | None = None,
     ):
         self.head_size = head_size
         self.rotary_dim = rotary_dim
