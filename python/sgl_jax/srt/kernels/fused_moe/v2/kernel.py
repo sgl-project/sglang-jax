@@ -256,7 +256,7 @@ def _fused_ep_moe_kernel(
     # --- Semaphores ---
     x_stage_sem,           # DMA(1,) — token staging
     y_store_sem,           # DMA(1,) — output store from y_acc
-    local_sems,            # DMA(2, 8) — weight + topk + output double-buffer
+    local_sems,            # DMA(2, 10) — weight + topk + output + metadata
     send_x2_sems,         # DMA(expert_buffer_count,)
     recv_x2_sems,         # DMA(expert_buffer_count,)
     gather_send_x2_sems,  # DMA(expert_buffer_count,)
@@ -365,7 +365,8 @@ def _fused_ep_moe_kernel(
                 "Use use_jax_allreduce_metadata=True (default)."
             )
 
-        send_sem = send_x2_sems.at[0]
+        offsets_sem = local_sems.at[bt_sem_id, 8]
+        routing_sem = local_sems.at[bt_sem_id, 9]
 
         def _copy_precomputed(
             t2e_routing_vmem,
@@ -396,12 +397,12 @@ def _fused_ep_moe_kernel(
             offsets_copy = pltpu.async_copy(
                 src_ref=offsets_vmem,
                 dst_ref=expert_offsets_x2_smem.at[bt_sem_id],
-                sem=send_sem,
+                sem=offsets_sem,
             )
             t2e_routing_copy = pltpu.async_copy(
                 src_ref=t2e_routing_vmem,
                 dst_ref=t2e_routing_x2_smem.at[bt_sem_id],
-                sem=send_sem,
+                sem=routing_sem,
             )
 
             starts_load.wait()
@@ -443,6 +444,8 @@ def _fused_ep_moe_kernel(
     def start_a2a_scatter_batch(*, bt_sem_id, bt_start):
         if disable_a2a:
             return
+        for slot in range(expert_buffer_count):
+            a2a_s_sends_x2_smem[slot] = jnp.int32(0)
 
         def _scatter_one_batch(t_id, _, bt_start=bt_start):
             src_t_id = bt_start + t_id
@@ -1401,7 +1404,7 @@ def fused_ep_moe_v2(
         # Semaphores
         pltpu.SemaphoreType.DMA((1,)),                                      # x_stage
         pltpu.SemaphoreType.DMA((1,)),                                      # y_store
-        pltpu.SemaphoreType.DMA((2, 8)),                                    # local_sems
+        pltpu.SemaphoreType.DMA((2, 10)),                                   # local_sems
         pltpu.SemaphoreType.DMA((expert_buffer_count,)),                    # send
         pltpu.SemaphoreType.DMA((expert_buffer_count,)),                    # recv
         pltpu.SemaphoreType.DMA((expert_buffer_count,)),                    # gather_send
