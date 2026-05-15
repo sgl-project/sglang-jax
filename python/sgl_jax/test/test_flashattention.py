@@ -90,22 +90,15 @@ def create_qkv_cache(
     return q, k, v
 
 
-def create_custom_mask(lens, page_size):
-    # Kernel contract: each sequence's mask rows are padded to the page-aligned
-    # kv_len (cu_kv_lens stride), so DMA offset/size stay 8-divisible. Pad with
-    # False (=0 → masked out) and flatten.
+def create_custom_mask(lens):
     q_lens = [q_len for q_len, _ in lens]
     custom_masks = []
     for bid, seq_len in enumerate([kv_len for _, kv_len in lens]):
         q_len = q_lens[bid]
         prefix_len = seq_len - q_len
-        aligned_kv_len = ((seq_len + page_size - 1) // page_size) * page_size
         prefix_mask = jnp.full((q_len, prefix_len), True, dtype=jnp.bool)
         random_q_mask = jax.random.uniform(jax.random.PRNGKey(42), (q_len, q_len)) < 0.5
-        pad_mask = jnp.full((q_len, aligned_kv_len - seq_len), False, dtype=jnp.bool)
-        custom_masks.append(
-            jnp.concatenate([prefix_mask, random_q_mask, pad_mask], axis=1).flatten()
-        )
+        custom_masks.append(jnp.concatenate([prefix_mask, random_q_mask], axis=1).flatten())
 
     return jnp.concatenate(custom_masks)
 
@@ -287,7 +280,7 @@ def create_test_data(
 
     if not causal:
         forward_mode = ForwardMode.EXTEND
-        custom_mask = create_custom_mask(lens, page_size)
+        custom_mask = create_custom_mask(lens)
         spec_info = EagleVerifyInput(
             draft_token=None,
             custom_mask=custom_mask,
