@@ -1,17 +1,23 @@
 import unittest
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.kernels.speculative.tree_speculative_sampling_target_only_kernel import (
     tree_speculative_sampling_target_only_pallas_call,
 )
 from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import verify_tree_greedy
 from sgl_jax.srt.speculative.eagle_util import (
+    EagleDraftInput,
     build_tree_mask_for_draft_decode,
     create_extend_after_decode_spec_info,
 )
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import CustomTestCase
 
 
@@ -381,6 +387,39 @@ class TestDraftDecodeMask(CustomTestCase):
         print(f"====test_batch_concatenation========{mask=}================")
 
         self.assertEqual(mask.tolist(), expected.tolist())
+
+
+class TestEagleMultiStepMetadata(CustomTestCase):
+    def test_topk_metadata_uses_full_tree_kv_span(self):
+        mesh = create_device_mesh(ici_parallelism=[-1, 1], dcn_parallelism=[1, 1])
+        backend = FlashAttention(
+            num_attn_heads=1,
+            num_kv_heads=1,
+            head_dim=1,
+            page_size=4,
+            mesh=mesh,
+        )
+        batch = SimpleNamespace(
+            cache_loc=np.arange(8, dtype=np.int32),
+            forward_mode=ForwardMode.DECODE,
+            seq_lens=np.array([4], dtype=np.int32),
+            real_bs=1,
+            spec_info=EagleDraftInput(allocate_lens=np.array([8], dtype=np.int32)),
+            speculative_num_steps=2,
+            speculative_eagle_topk=2,
+            spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+        )
+
+        metadata = backend.get_eagle_multi_step_metadata(batch)
+        step0_seq_lens = np.asarray(jax.device_get(metadata[0].seq_lens))
+        step1_seq_lens = np.asarray(jax.device_get(metadata[1].seq_lens))
+        step0_cu_kv_lens = np.asarray(jax.device_get(metadata[0].cu_kv_lens))
+        step0_pages = np.asarray(jax.device_get(metadata[0].page_indices))[:2]
+
+        self.assertEqual(step0_seq_lens.tolist(), [6])
+        self.assertEqual(step1_seq_lens.tolist(), [8])
+        self.assertEqual(step0_cu_kv_lens.tolist(), [0, 8])
+        self.assertEqual(step0_pages.tolist(), [0, 1])
 
 
 if __name__ == "__main__":

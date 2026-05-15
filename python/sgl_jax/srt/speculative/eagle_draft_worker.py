@@ -418,11 +418,13 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch.cache_loc = np.empty((1,))
         forward_batch.spec_info = EagleDraftInput()
         forward_batch.spec_info.hidden_states = jnp.empty((bs * self.topk, hidden_states.shape[1]))
+        parents_history: list[jax.Array] = []
         for i in range(self.speculative_num_steps):
 
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
+            parents_history.append(tree_info[2])
             score_list, token_list, parents_list = update_eagle_lists(
                 i, score_list, token_list, parents_list, tree_info, self.topk
             )
@@ -432,7 +434,15 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch = update_forward_batch_info(
                 forward_batch, i, input_ids, hidden_states, positions_base
             )
-            self.draft_model_runner.attn_backend.forward_metadata = metadata_per_step[i]
+            metadata = metadata_per_step[i]
+            if self.topk > 1:
+                metadata.custom_mask = build_tree_mask_for_draft_decode(
+                    model_worker_batch.seq_lens,
+                    topk=self.topk,
+                    speculative_step_id=i,
+                    parents_list=parents_history,
+                )
+            self.draft_model_runner.attn_backend.forward_metadata = metadata
 
             forward_batch.bid = model_worker_batch.bid
             logits_output, _, _ = self.draft_model_runner.forward(

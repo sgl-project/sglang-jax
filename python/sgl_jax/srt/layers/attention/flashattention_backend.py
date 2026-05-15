@@ -366,7 +366,14 @@ class FlashAttention(AttentionBackend):
         full_size = len(original_selected_cache_locs)
         seq_lens_list = []
         for speculative_step_id in range(batch.speculative_num_steps):
-            seq_lens = batch.seq_lens + (speculative_step_id)
+            # Each draft step processes ``topk`` sibling tokens in parallel.
+            # The attention metadata must therefore expose the full KV length
+            # (prefix + all sibling tokens materialized up to and including the
+            # current step), otherwise custom masks are sliced against a
+            # shorter-than-real ``kv_len`` and branches can attend incorrectly.
+            seq_lens = batch.seq_lens + (
+                (speculative_step_id + 1) * batch.speculative_eagle_topk
+            )
             seq_lens[batch.real_bs :] = 0
             seq_lens_list.append(seq_lens)
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
@@ -381,7 +388,7 @@ class FlashAttention(AttentionBackend):
 
             # Vectorized calculation of spec_pages
             step_spec_tokens = (
-                current_seq_lens + (speculative_step_id) * batch.speculative_eagle_topk
+                current_seq_lens + (speculative_step_id + 1) * batch.speculative_eagle_topk
             )
             step_spec_pages = cdiv(step_spec_tokens, self.page_size)
 
