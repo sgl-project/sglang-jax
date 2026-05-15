@@ -20,7 +20,9 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -64,10 +66,25 @@ def _build_alibi_base_slopes(num_heads: int) -> list[float]:
     )
 
 
-def _compute_layer_slope(layer_id: int, num_hidden_layers: int, num_heads: int) -> jnp.ndarray:
-    """Per-layer slope decay used as ``g_gamma`` by the simple_gla kernels."""
-    base_slopes = jnp.asarray(_build_alibi_base_slopes(num_heads), dtype=jnp.float32)
-    return -base_slopes * (1 - (layer_id - 1) / (num_hidden_layers - 1) + 1e-5)
+def _compute_layer_slope(
+    layer_id: int,
+    num_hidden_layers: int,
+    num_heads: int,
+    mesh: jax.sharding.Mesh | None = None,
+) -> jax.Array:
+    """Per-layer slope decay used as ``g_gamma`` by the simple_gla kernels.
+
+    Returned array is sharded along the ``tensor`` axis when ``mesh`` is
+    provided, matching how the slope is consumed inside the jitted forward
+    (``P("tensor")``). Constructing it as single-device on the host caused
+    ``shard_device_array`` to reshard it on every forward step.
+    """
+    base = np.asarray(_build_alibi_base_slopes(num_heads), dtype=np.float32)
+    slope_np = -base * (1 - (layer_id - 1) / (num_hidden_layers - 1) + 1e-5)
+    if mesh is None:
+        return jnp.asarray(slope_np)
+    sharding = NamedSharding(mesh, P("tensor"))
+    return jax.make_array_from_callback(slope_np.shape, sharding, lambda idx: slope_np[idx])
 
 
 class LightningAttnBackend(LinearRecurrentAttnBackend):
@@ -108,7 +125,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         ):
             self.tp_slope = nnx.data(
                 {
-                    lid: _compute_layer_slope(lid, num_hidden_layers, num_heads)
+                    lid: _compute_layer_slope(lid, num_hidden_layers, num_heads, mesh)
                     for lid in linear_recurrent_layer_ids
                 }
             )
