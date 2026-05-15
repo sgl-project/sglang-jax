@@ -1056,7 +1056,15 @@ class Glm5ForCausalLM(nnx.Module):
 
 
 class GlmMoeDsaForCausalLM(Glm5ForCausalLM):
-    pass
+    @classmethod
+    def patch_model_config(cls, mc: ModelConfig) -> None:
+        from sgl_jax.srt.configs.model_config import AttentionArch
+        # GLM-5 uses 256 for attention head dim (192 nope + 64 pe)
+        mc.head_dim = 256
+        mc.hf_config.head_dim = 256
+        mc.v_head_dim = getattr(mc.hf_text_config, "v_head_dim", 256)
+        # GLM-5 uses MLA architecture
+        mc.attention_arch = AttentionArch.MLA
 
 
 EntryClass = [Glm5ForCausalLM, GlmMoeDsaForCausalLM]
