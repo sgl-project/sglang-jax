@@ -350,8 +350,11 @@ class SchedulerOutputProcessorMixin:
                 if req.finished():
                     self.maybe_collect_routed_experts(req)
                     if batch.spec_algorithm is not None and batch.spec_algorithm.is_eagle():
-                        cur_allocate_len = info.spec_info.allocate_lens[i]
-                        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+                        cur_allocate_len = int(info.spec_info.allocate_lens[i])
+                        actual_token_len = len(req.origin_input_ids) + max(
+                            len(req.output_ids) - 1, 0
+                        )
+                        all_token_len = actual_token_len
                         if self.page_size > 1:
                             all_token_len = cdiv(all_token_len, self.page_size) * self.page_size
                         kv_indices = self.req_to_token_pool.req_to_token[
@@ -366,6 +369,16 @@ class SchedulerOutputProcessorMixin:
                         ), f"redundant kv indices {len(kv_indices)=} should less than {EagleDraftInput.ALLOC_LEN_PER_DECODE=}"
 
                         self.token_to_kv_pool_allocator.free(kv_indices, dp_rank)
+                        # Spec decode allocates via EagleDraftInput.prepare_for_decode,
+                        # not ScheduleBatch.prepare_for_decode, so kv_committed_len is
+                        # never bumped past prefill. cache_finished_req would then
+                        # free only the prefill page and leak every decode-allocated
+                        # page (visible on idle check_memory at bs=1). Use the
+                        # *unaligned* actual token count: ChunkCache.cache_finished_req
+                        # does NOT filter 0-valued req_to_token entries, so a
+                        # page-aligned length would free the page-0 sentinel.
+                        req.kv_committed_len = actual_token_len
+                        req.kv_allocated_len = actual_token_len
                     # End trace for finished request
                     if precision_tracer.get_trace_active():
                         precision_tracer.set_request_status_to_completed(req.rid)
