@@ -8,6 +8,7 @@ from jax.lax import Precision
 
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
+from sgl_jax.test.test_utils import WAN2_1_T2V_1_3B
 
 
 # Small config for unit testing to avoid OOM
@@ -53,7 +54,7 @@ class TestDiffusionScheduler(unittest.TestCase):
     def setUpClass(cls):
         cls.mesh = jax.sharding.Mesh(jax.devices(), ("data",))
         cls.server_args = MultimodalServerArgs(
-            model_path="Wan-AI/Wan2.1-T2V-1.3B",
+            model_path=WAN2_1_T2V_1_3B,
             download_dir="/tmp",
         )
         # Patch WanModelConfig with small config before importing DiffusionScheduler

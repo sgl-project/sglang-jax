@@ -102,7 +102,7 @@ class Embed(nnx.Module):
         if self.num_embeddings == 1:
             return jnp.broadcast_to(embedding, inputs.shape + (self.features,))
 
-        output_pspec = P(*([None] * inputs.ndim), self.kernel_axes[-1])
+        output_pspec = P("data", *([None] * (inputs.ndim - 1)), self.kernel_axes[-1])
         output_sharding = NamedSharding(self.mesh, output_pspec)
         output = embedding.at[inputs].get(out_sharding=output_sharding)
         return output

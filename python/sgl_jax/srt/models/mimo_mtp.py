@@ -10,7 +10,7 @@ from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.mem_cache.memory_pool import KVCache
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen2 import Qwen2DecoderLayer
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -234,10 +234,11 @@ class MiMoMTPForCausalLM(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
+        memory_pools: MemoryPools,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.model(forward_batch, token_to_kv_pool)
+        kv_pool = memory_pools.token_to_kv_pool
+        hidden_states, layers_kv_fused = self.model(forward_batch, kv_pool)
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(
                 hidden_states, self.lm_head, logits_metadata, aux_hidden_states=None
@@ -250,7 +251,7 @@ class MiMoMTPForCausalLM(nnx.Module):
                 aux_hidden_states=None,
             )
 
-        return output, layers_kv_fused, []
+        return output, {"token_to_kv_pool": layers_kv_fused}, []
 
     def get_embed_and_head(self):
         return (

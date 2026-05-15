@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import logging
 import os
 from collections.abc import Sequence
@@ -12,7 +13,8 @@ import jax.numpy as jnp
 import numpy
 import numpy as np
 from flax import nnx
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
@@ -179,7 +181,9 @@ def get_last_loc_large_page_size_large_top_k(
     return prefix_lens, new_seq_lens, last_loc, num_new_pages_per_topk, extend_lens
 
 
-@jax.jit(static_argnames=["num_verify_tokens", "batch_size", "speculative_num_steps"])
+@functools.partial(
+    jax.jit, static_argnames=["num_verify_tokens", "batch_size", "speculative_num_steps"]
+)
 def build_tree_kernel_efficient_preprocess(
     verified_id: jax.Array,
     scores: jax.Array,
@@ -323,6 +327,10 @@ def build_tree_kernel_efficient(
         tuple of (tree_mask, positions, retrive_index, retrive_next_token,
                  retrive_next_sibling, draft_tokens)
     """
+    rep = NamedSharding(mesh, P())
+    verified_id, score_list, token_list, parents_list, seq_lens = jax.device_put(
+        (verified_id, score_list, token_list, parents_list, seq_lens), rep
+    )
     parent_list, top_scores_index, draft_tokens = build_tree_kernel_efficient_preprocess(
         verified_id,
         score_list,
@@ -371,42 +379,75 @@ def build_tree_kernel_efficient(
 @register_pytree_node_class
 @dataclass
 class EagleDraftInput:
-    # Constant: alloc length per decode step
+    """Next-round draft state — the only persistent cross-round spec state.
+
+    Implements ``SpecInput``. MUST NOT hold worker/runner/pool/future handles.
+    Under DP (Route 1), per-request fields use DP-padded order.
+    """
+
     ALLOC_LEN_PER_DECODE: ClassVar[int] = None
 
-    # The inputs for decode
-    # shape: (b, topk)
-    topk_p: np.ndarray = None
-    topk_index: np.ndarray = None
-    # shape: (b, hidden_size)
-    hidden_states: np.ndarray = None
+    # --- Cross-round draft state (device arrays, consumed by next draft) ---
+    #: device ``(b, topk)`` — top-k probs from previous draft/draft_extend.
+    topk_p: jax.Array | None = None
+    #: device ``(b, topk)`` — top-k token ids.
+    topk_index: jax.Array | None = None
+    #: device ``(b, hidden_size)`` — minimal hidden state for next draft step.
+    #: Multi-layer MTP keeps per-step hidden locally inside one
+    #: ``MultiLayerDraftWorker.draft()``; only this cross-round slice persists.
+    hidden_states: jax.Array | None = None
+    #: static metadata (pytree aux); changing it triggers a new compile shape.
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
-    # Inputs for extend
-    # shape: (b,)
-    verified_id: np.ndarray = None
-    accept_length: np.ndarray = None
+    # --- Draft-extend inputs (device unless ``_cpu`` suffixed) ---
+    #: device ``(b,)`` — verified token starting the next draft.
+    verified_id: jax.Array | None = None
+    #: device ``(b,)`` — accepted length used to select hidden in draft-extend.
+    accept_length: jax.Array | None = None
+    #: host ``(b,)`` int32 mirror of ``accept_length`` for scheduler bookkeeping.
     accept_length_cpu: np.ndarray | None = None
 
-    # Inputs for the attention backends
-    # shape: (b + 1,)
-    kv_indptr: np.ndarray = None
-    kv_indices: np.ndarray = None
+    # --- Attention-backend metadata (host, participates in metadata build) ---
+    kv_indptr: np.ndarray | None = None
+    kv_indices: np.ndarray | None = None
 
-    # Shape info for padding
+    # --- Padding shape (static; participates in JIT cache key) ---
     num_tokens_per_batch: int = -1
     num_tokens_for_logprob_per_batch: int = -1
 
-    # Inputs for draft extend
-    # shape: (b,)
-    seq_lens_for_draft_extend: np.ndarray = None
-    req_pool_indices_for_draft_extend: np.ndarray = None
+    # --- Draft-extend bookkeeping (host) ---
+    seq_lens_for_draft_extend: np.ndarray | None = None
+    req_pool_indices_for_draft_extend: np.ndarray | None = None
 
-    # Inputs for V2 overlap worker
-    # future_indices: Optional[FutureIndices] = None
+    # --- KV lifetime (host, scheduler-visible) ---
+    #: host ``(b,)`` — KV length already allocated in ``req_to_token_pool`` for
+    #: next-round pre-allocation and over-allocated slot release. Distinct from
+    #: ``accept_length`` (logical) and ``new_seq_lens`` (scheduler-visible).
     allocate_lens: np.ndarray | None = None
+    #: host ``(b,)`` — scheduler-visible logical length after verify. May be
+    #: derived from ``old_seq_lens + accept_length`` if not stored.
     new_seq_lens: np.ndarray | None = None
-    # verify_done: Optional[torch.cuda.Event] = None
+
+    # ---- SpecInput protocol -------------------------------------------------
+    def is_draft_input(self) -> bool:
+        return True
+
+    def is_verify_input(self) -> bool:
+        return False
+
+    def get_spec_adjust_token_coefficient(self) -> int:
+        return EagleDraftInput.ALLOC_LEN_PER_DECODE or 1
+
+    def get_logical_token_num(self, bs: int) -> np.ndarray:
+        if self.accept_length_cpu is not None:
+            return self.accept_length_cpu
+        return np.ones(bs, dtype=np.int32)
+
+    def get_allocated_token_num(self) -> np.ndarray | None:
+        return self.allocate_lens
+
+    def get_verify_token_num(self, bs: int) -> int:
+        return 0
 
     def tree_flatten(self):
         accept_length_cpu_arr = (
@@ -497,6 +538,9 @@ class EagleDraftInput:
         model_worker_batch.positions = model_worker_batch.positions
         model_worker_batch.extend_seq_lens = np.full((bs,), step_plus_1, dtype=np.int32)
         model_worker_batch.extend_seq_lens[model_worker_batch.real_bs :] = 0
+        model_worker_batch.logits_indices = (
+            np.cumsum(model_worker_batch.extend_seq_lens, dtype=np.int32) - 1
+        )
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
@@ -551,8 +595,9 @@ class EagleDraftInput:
 
         self.allocate_lens = new_allocate_lens
 
-        schedule_batch.seq_lens_sum = np.sum(schedule_batch.seq_lens).item()
-        schedule_batch.out_cache_loc = out_cache_loc
+        info = schedule_batch.reqs_info[0]
+        info.seq_lens_sum = np.sum(info.seq_lens).item()
+        info.out_cache_loc = out_cache_loc
 
     def prepare_for_draft_decode(
         self, model_worker_batch: ModelWorkerBatch, topk: int, num_steps: int
@@ -619,7 +664,7 @@ class EagleDraftInput:
         self.accept_length_cpu = np.asarray(accept_length_cpu_host, dtype=np.int32)
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True):
-
+        new_indices = np.asarray(new_indices)
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
@@ -650,11 +695,10 @@ class EagleDraftInput:
             return
         if spec_info.hidden_states is None:
             return
-        # FIXME(pc) this operate should be put on cpu
-        self.hidden_states = np.concatenate([self.hidden_states, spec_info.hidden_states], axis=0)
-        self.verified_id = np.concatenate([self.verified_id, spec_info.verified_id], axis=0)
-        self.topk_p = np.concatenate([self.topk_p, spec_info.topk_p])
-        self.topk_index = np.concatenate([self.topk_index, spec_info.topk_index])
+        self.hidden_states = jnp.concatenate([self.hidden_states, spec_info.hidden_states], axis=0)
+        self.verified_id = jnp.concatenate([self.verified_id, spec_info.verified_id], axis=0)
+        self.topk_p = jnp.concatenate([self.topk_p, spec_info.topk_p])
+        self.topk_index = jnp.concatenate([self.topk_index, spec_info.topk_index])
         self.allocate_lens = np.concatenate([self.allocate_lens, spec_info.allocate_lens])
 
 
@@ -675,22 +719,65 @@ class EagleVerifyOutput:
 @register_pytree_node_class
 @dataclass
 class EagleVerifyInput:
-    # container type for pytree
+    """Target-verify input. Implements ``SpecInput``.
+
+    Fully describes token/position/mask/tree-index for verify so
+    ``BaseSpecWorker.verify()`` never reads draft-worker internal state.
+    Under DP (Route 1), per-request fields use DP-padded order; verify
+    metadata must reshape to per-DP view before generating cu_q/kv_lens.
+    """
+
+    # --- Device arrays (enter target verify forward / sampling) ---
+    #: device ``(b*draft_token_num,)`` — flattened draft tokens to verify.
     draft_token: jax.Array
+    #: device ``(sum(q_i*kv_i),)`` — tree attention mask; shape participates
+    #: in the JIT cache key.
     custom_mask: jax.Array
+    #: device ``(b*draft_token_num,)`` — verify positions (follows
+    #: ``ForwardBatch`` host/device convention).
     positions: jax.Array
+    #: device — tree verify index (sampling-kernel convention).
     retrive_index: jax.Array
+    #: device — tree child pointer for tree sampling.
     retrive_next_token: jax.Array
+    #: device — tree sibling pointer for tree sampling.
     retrive_next_sibling: jax.Array
     retrive_cum_len: jax.Array
+    #: host ``(b,)`` — for verify attention metadata + DP token accounting.
     seq_lens_cpu: np.ndarray
-    # common type for pytree
+
+    # --- Static metadata (pytree aux; changes trigger new compile shape) ---
     spec_steps: int
     topk: int
+    #: per-request verify token count (constant within a precompile shape).
     draft_token_num: int
     seq_lens_sum: int
     capture_hidden_mode: CaptureHiddenMode
-    # grammar: BaseGrammarObject = None
+
+    # ---- SpecInput protocol -------------------------------------------------
+    def is_draft_input(self) -> bool:
+        return False
+
+    def is_verify_input(self) -> bool:
+        return True
+
+    def get_spec_adjust_token_coefficient(self) -> int:
+        return self.draft_token_num
+
+    def get_logical_token_num(self, bs: int) -> np.ndarray:
+        return np.ones(bs, dtype=np.int32)
+
+    def get_allocated_token_num(self) -> np.ndarray | None:
+        return None
+
+    def get_verify_token_num(self, bs: int) -> int:
+        return bs * self.draft_token_num
+
+    def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True) -> None:
+        raise NotImplementedError("EagleVerifyInput is consumed within one round")
+
+    def merge_batch(self, other) -> None:
+        raise NotImplementedError("EagleVerifyInput is consumed within one round")
 
     def tree_flatten(self):
         seq_lens_sum_arr = _as_int32_array(self.seq_lens_sum, fallback=0)

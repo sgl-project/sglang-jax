@@ -69,6 +69,8 @@ class ServerArgs:
     schedule_conservativeness: float = 1.0
     page_size: int = 1
     swa_full_tokens_ratio: float = 0.8
+    recurrent_state_memory_ratio: float = 0.9
+    max_recurrent_state_size: int | None = None
     disable_hybrid_swa_memory: bool = False
 
     # Runtime options
@@ -78,6 +80,7 @@ class ServerArgs:
     ep_size: int = 1
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: str | None = None
+    enable_sequence_parallel: bool = False
     stream_interval: int = 1
     stream_output: bool = False
     random_seed: int | None = None
@@ -133,6 +136,7 @@ class ServerArgs:
     # Kernel backend
     attention_backend: str | None = "fa"
     moe_backend: str = "epmoe"
+    disable_jax_allreduce_metadata: bool = False
 
     grammar_backend: str | None = None
 
@@ -558,6 +562,23 @@ class ServerArgs:
             "E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens.",
         )
         parser.add_argument(
+            "--recurrent-state-memory-ratio",
+            type=float,
+            default=ServerArgs.recurrent_state_memory_ratio,
+            help="Ratio of recurrent state memory to KV cache memory for hybrid recurrent models (e.g. Kimi-Linear). "
+            "state_budget = available * ratio / (1 + ratio). Used only when --max-recurrent-state-size is unset "
+            "and either radix cache is enabled or --max-running-requests is unset. Default 0.9.",
+        )
+        parser.add_argument(
+            "--max-recurrent-state-size",
+            type=int,
+            default=ServerArgs.max_recurrent_state_size,
+            help="Total recurrent state slots across all DP ranks for hybrid models. "
+            "Resolution priority: (1) this flag, (2) --max-running-requests when --disable-radix-cache, "
+            "(3) derived from --recurrent-state-memory-ratio and available HBM. "
+            "Must be divisible by dp_size when set explicitly.",
+        )
+        parser.add_argument(
             "--disable-hybrid-swa-memory",
             action="store_true",
             help="Disable the hybrid SWA memory.",
@@ -604,6 +625,12 @@ class ServerArgs:
             choices=["static", "dynamic", "fake"],
             default=ServerArgs.ep_dispatch_algorithm,
             help="Expert parallel dispatch algorithm.",
+        )
+        parser.add_argument(
+            "--enable-sequence-parallel",
+            action="store_true",
+            default=ServerArgs.enable_sequence_parallel,
+            help="Enable sequence parallelism.",
         )
         parser.add_argument(
             "--stream-interval",
@@ -935,6 +962,17 @@ class ServerArgs:
             choices=["epmoe", "fused", "auto"],
             default=ServerArgs.moe_backend,
             help="The backend to use for MoE models.",
+        )
+
+        parser.add_argument(
+            "--disable-jax-allreduce-metadata",
+            action="store_true",
+            default=ServerArgs.disable_jax_allreduce_metadata,
+            help=(
+                "Disable the pure JAX allreduce metadata path for fused EP-MoE; "
+                "fall back to the Pallas DMA-based allgather. "
+                "Default uses JAX path (recommended)."
+            ),
         )
 
         parser.add_argument(
