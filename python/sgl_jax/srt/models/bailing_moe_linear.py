@@ -6,7 +6,6 @@ import jax
 import numpy as np
 from flax import nnx
 from jax import numpy as jnp
-from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
@@ -53,30 +52,57 @@ def is_linear_layer(layer_idx: int | None, layer_group_size: int) -> bool:
 def _restripe_qkv_weight(w, *, mesh, tp_size, num_heads_local, head_dim):
     """HF ``[Q_full|K_full|V_full]`` → stripe-interleaved ``[Q_r0|K_r0|V_r0|...]``.
 
+    Each TP rank gathers the full QKV along the ``tensor`` axis, applies the
+    column permutation locally, then slices out its own stripe block. Wrapping
+    the data movement in :func:`jax.shard_map` keeps it valid under JAX's
+    explicit-sharding mode (where a bare ``with_sharding_constraint`` + reshape
+    is rejected because the reshape crosses a sharded axis).
+
     Hoisted to module scope so all decoder layers share one jit cache entry
     (closure-captured Python ints would otherwise force a recompile per layer).
     """
-    hidden = w.shape[0]
-    full_qkv = w.shape[1]
-    w_full = jax.lax.with_sharding_constraint(w, NamedSharding(mesh, P(None, None)))
-    w_full = w_full.reshape(hidden, 3, tp_size, num_heads_local, head_dim)
-    w_full = jnp.transpose(w_full, (0, 2, 1, 3, 4))
-    w_full = w_full.reshape(hidden, full_qkv)
-    return jax.lax.with_sharding_constraint(
-        w_full, NamedSharding(mesh, P(None, "tensor"))
-    )
+
+    def _local(w_local):
+        w_full = jax.lax.all_gather(w_local, axis_name="tensor", axis=1, tiled=True)
+        hidden = w_full.shape[0]
+        full_qkv = w_full.shape[1]
+        w_full = w_full.reshape(hidden, 3, tp_size, num_heads_local, head_dim)
+        w_full = jnp.transpose(w_full, (0, 2, 1, 3, 4))
+        w_full = w_full.reshape(hidden, full_qkv)
+        rank = jax.lax.axis_index("tensor")
+        block = full_qkv // tp_size
+        return jax.lax.dynamic_slice_in_dim(w_full, rank * block, block, axis=1)
+
+    return jax.shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=P(None, "tensor"),
+        out_specs=P(None, "tensor"),
+        check_vma=False,
+    )(w)
 
 
 @functools.partial(
     jax.jit, static_argnames=("mesh", "tp_size", "num_heads_local", "head_dim")
 )
 def _restripe_qkv_bias(b, *, mesh, tp_size, num_heads_local, head_dim):
-    full_qkv = b.shape[0]
-    b_full = jax.lax.with_sharding_constraint(b, NamedSharding(mesh, P(None)))
-    b_full = b_full.reshape(3, tp_size, num_heads_local, head_dim)
-    b_full = jnp.transpose(b_full, (1, 0, 2, 3))
-    b_full = b_full.reshape(full_qkv)
-    return jax.lax.with_sharding_constraint(b_full, NamedSharding(mesh, P("tensor")))
+    def _local(b_local):
+        b_full = jax.lax.all_gather(b_local, axis_name="tensor", axis=0, tiled=True)
+        full_qkv = b_full.shape[0]
+        b_full = b_full.reshape(3, tp_size, num_heads_local, head_dim)
+        b_full = jnp.transpose(b_full, (1, 0, 2, 3))
+        b_full = b_full.reshape(full_qkv)
+        rank = jax.lax.axis_index("tensor")
+        block = full_qkv // tp_size
+        return jax.lax.dynamic_slice_in_dim(b_full, rank * block, block, axis=0)
+
+    return jax.shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=P("tensor"),
+        out_specs=P("tensor"),
+        check_vma=False,
+    )(b)
 
 
 class BailingMoELinearAttention(nnx.Module):
