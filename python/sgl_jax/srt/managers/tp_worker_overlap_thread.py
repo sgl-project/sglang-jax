@@ -134,19 +134,41 @@ class ModelWorkerClient:
         """
         This function is called to resolve the last batch result and
         wait for the current batch to be launched. Used in overlap mode.
+
+        Uses jax.copy_to_host_async to start all device-to-host copies in
+        parallel, then materializes them. This lets the four arrays we need
+        overlap on PCIe rather than serializing the per-array sync that
+        jax.device_get does.
         """
         _, logits_output, next_token_ids, cache_miss_count = self.output_queue.get()
-        if logits_output.next_token_logprobs is not None:
-            logits_output.next_token_logprobs = jax.device_get(
-                logits_output.next_token_logprobs
-            ).tolist()
-        if logits_output.input_token_logprobs is not None:
-            logits_output.input_token_logprobs = jax.device_get(
-                logits_output.input_token_logprobs
-            ).tolist()
-        if logits_output.hidden_states is not None:
-            logits_output.hidden_states = jax.device_get(logits_output.hidden_states)
-        next_token_ids = jax.device_get(next_token_ids).tolist()
+        # Step 1: kick off async D2H copies for everything we need
+        async_next_logprobs = (
+            jax.copy_to_host_async(logits_output.next_token_logprobs)
+            if logits_output.next_token_logprobs is not None
+            else None
+        )
+        async_input_logprobs = (
+            jax.copy_to_host_async(logits_output.input_token_logprobs)
+            if logits_output.input_token_logprobs is not None
+            else None
+        )
+        async_hidden_states = (
+            jax.copy_to_host_async(logits_output.hidden_states)
+            if logits_output.hidden_states is not None
+            else None
+        )
+        async_next_tokens = jax.copy_to_host_async(next_token_ids)
+
+        # Step 2: materialize. The first np.asarray waits for that array's
+        # copy; the others have been making progress in parallel.
+        if async_next_logprobs is not None:
+            logits_output.next_token_logprobs = np.asarray(async_next_logprobs).tolist()
+        if async_input_logprobs is not None:
+            logits_output.input_token_logprobs = np.asarray(async_input_logprobs).tolist()
+        if async_hidden_states is not None:
+            logits_output.hidden_states = np.asarray(async_hidden_states)
+        next_token_ids = np.asarray(async_next_tokens).tolist()
+
         if launch_done is not None:
             launch_done.wait()
 
