@@ -46,6 +46,11 @@ if TYPE_CHECKING:
 _CHUNK_SIZE = 64
 
 
+def _head_axis(mesh: jax.sharding.Mesh | None, num_heads: int) -> str | None:
+    tensor_size = mesh.shape.get("tensor", 1) if mesh else 1
+    return "tensor" if num_heads % tensor_size == 0 else None
+
+
 def _build_alibi_base_slopes(num_heads: int) -> list[float]:
     """ALiBi base slopes matching the HF BailingMoeV2.5 reference."""
 
@@ -79,7 +84,7 @@ def _compute_layer_slope(
     slope_np = -base * (1 - (layer_id - 1) / (num_hidden_layers - 1) + 1e-5)
     if mesh is None:
         return jnp.asarray(slope_np)
-    sharding = NamedSharding(mesh, P("tensor"))
+    sharding = NamedSharding(mesh, P(_head_axis(mesh, num_heads)))
     return jax.make_array_from_callback(slope_np.shape, sharding, lambda idx: slope_np[idx])
 
 
@@ -193,6 +198,8 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         if decode_simple_gla_fused is None:
             raise ImportError("simple_gla_fused kernel is required for GLA decode")
 
+        head_axis = _head_axis(self.mesh, q.shape[1])
+
         def _decode_fn(q_l, k_l, v_l, gamma, buf_l, idx_l, has_l):
             return decode_simple_gla_fused(
                 q_l,
@@ -209,17 +216,17 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             _decode_fn,
             mesh=self.mesh,
             in_specs=(
-                P("data", "tensor", None),
-                P("data", "tensor", None),
-                P("data", "tensor", None),
-                P("tensor"),
-                P("data", "tensor", None, None),
+                P("data", head_axis, None),
+                P("data", head_axis, None),
+                P("data", head_axis, None),
+                P(head_axis),
+                P("data", head_axis, None, None),
                 P("data"),
                 P("data"),
             ),
             out_specs=(
-                P("data", "tensor", None),
-                P("data", "tensor", None, None),
+                P("data", head_axis, None),
+                P("data", head_axis, None, None),
             ),
             check_vma=False,
         )(q, k, v, slope, recurrent_buffer, recurrent_indices, has_initial_state)
@@ -241,6 +248,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
 
         cu_seqlens = self.forward_metadata.cu_q_lens
         chunk_size = self.chunk_size
+        head_axis = _head_axis(self.mesh, q.shape[1])
 
         def _prefill_fn(q_l, k_l, v_l, gamma, buf_l, idx_l, has_l, cu_l):
             h0 = buf_l[idx_l]
@@ -268,18 +276,18 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             _prefill_fn,
             mesh=self.mesh,
             in_specs=(
-                P("data", "tensor", None),
-                P("data", "tensor", None),
-                P("data", "tensor", None),
-                P("tensor"),
-                P("data", "tensor", None, None),
+                P("data", head_axis, None),
+                P("data", head_axis, None),
+                P("data", head_axis, None),
+                P(head_axis),
+                P("data", head_axis, None, None),
                 P("data"),
                 P("data"),
                 P("data"),
             ),
             out_specs=(
-                P("data", "tensor", None),
-                P("data", "tensor", None, None),
+                P("data", head_axis, None),
+                P("data", head_axis, None, None),
             ),
             check_vma=False,
         )(q, k, v, slope, recurrent_buffer, recurrent_indices, has_initial_state, cu_seqlens)
