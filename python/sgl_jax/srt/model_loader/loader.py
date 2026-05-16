@@ -130,6 +130,15 @@ class DefaultModelLoader(BaseModelLoader):
         if is_local:
             hf_folder = model_name_or_path
         else:
+            if os.path.isabs(model_name_or_path):
+                models_prefix = os.path.join(os.path.sep, "models") + os.path.sep
+                if model_name_or_path.startswith(models_prefix):
+                    model_name_or_path = model_name_or_path[len(models_prefix) :].rstrip(
+                        os.path.sep
+                    )
+                # else: not a /models/… path — fall through to snapshot_download
+                # which will resolve the repo id or raise appropriately.
+
             from huggingface_hub import snapshot_download
 
             hf_folder = snapshot_download(

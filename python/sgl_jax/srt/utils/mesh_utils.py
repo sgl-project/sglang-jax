@@ -33,6 +33,14 @@ def create_device_mesh(
         devices_dict = {device.id: device for device in devices}
         devices = [devices_dict.get(i) for i in list(set(device_indexes))]
     ici_parallelism = fill_unspecified_parallelism(ici_parallelism, len(devices))
+    mesh_device_count = int(np.prod(ici_parallelism))
+    if num_slices == 1 and mesh_device_count < len(devices):
+        devices = devices[:mesh_device_count]
+    elif num_slices == 1 and mesh_device_count > len(devices):
+        raise RuntimeError(
+            f"Requested mesh shape {tuple(ici_parallelism)} needs {mesh_device_count} devices, "
+            f"but only {len(devices)} are available."
+        )
     if num_slices > 1:
         dcn_parallelism = fill_unspecified_parallelism(dcn_parallelism, num_slices)
         devices_array = mesh_utils.create_hybrid_device_mesh(
