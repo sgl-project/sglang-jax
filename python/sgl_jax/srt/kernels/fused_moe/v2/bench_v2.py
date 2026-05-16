@@ -122,6 +122,19 @@ def trace_timeit(run_fn, warmup: int, iters: int) -> list[float]:
         return []
 
 
+def wall_timeit(run_fn, warmup: int, iters: int) -> list[float]:
+    for _ in range(warmup):
+        out = run_fn()
+        jax.block_until_ready(out)
+    times = []
+    for _ in range(iters):
+        t_start = time.monotonic()
+        out = run_fn()
+        jax.block_until_ready(out)
+        times.append((time.monotonic() - t_start) * 1e3)
+    return times
+
+
 # ---------------------------------------------------------------------------
 # Env parsing helpers
 # ---------------------------------------------------------------------------
@@ -166,6 +179,9 @@ check_correctness = os.environ.get("BENCH_CHECK", "0") == "1"
 use_fp8 = os.environ.get("BENCH_FP8", "0") == "1"
 quant_block_k = int(os.environ.get("BENCH_QBK", "128"))
 tune_mode = os.environ.get("BENCH_TUNE", "0") == "1"
+use_wall = os.environ.get("BENCH_WALL", "0") == "1"
+timeit_fn = wall_timeit if use_wall else trace_timeit
+timing_label = "wall" if use_wall else "trace"
 
 bt_candidates = parse_csv_int("BENCH_BT", [128])
 bf_candidates = parse_csv_int("BENCH_BF", [256])
@@ -174,19 +190,29 @@ bts_candidates = parse_csv_int_or_none("BENCH_BTS")
 token_candidates = parse_csv_int("BENCH_TOKENS", [4096])
 
 
-def generate_tune_candidates(intermediate_size, local_num_tokens):
-    bts = [128]
+def generate_tune_candidates(intermediate_size, local_num_tokens, ep_size):
     bfs = sorted(set(
         v for v in [128, 256, 512, 1024, 2048]
         if v <= intermediate_size and intermediate_size % v == 0
     ))
-    p = 128
-    bts_list = []
+    bt_list = []
+    p = 2
     while p <= local_num_tokens:
         if local_num_tokens % p == 0:
-            bts_list.append(p)
+            bt_list.append(p)
         p *= 2
-    return bts_list, bfs, [128], [None]
+    if not bt_list:
+        bt_list = [local_num_tokens]
+    max_bt = max(bt_list)
+    if max_bt < 8:
+        bts_list = [8, 16, 32]
+        bts_list = [b for b in bts_list if b <= max_bt * ep_size]
+        if not bts_list:
+            bts_list = [None]
+    else:
+        bts_list = [None]
+    return bt_list, bfs, [128], bts_list
+
 
 
 if tune_mode:
@@ -257,8 +283,10 @@ for num_tokens in token_candidates:
 
     if tune_mode:
         local_nt = num_tokens // ep_size
-        bt_candidates, bf_candidates, btc_candidates, bts_candidates = generate_tune_candidates(f, local_nt)
-        log(f"  tune: bt={bt_candidates} bf={bf_candidates}")
+        pad_local_nt = (8 - local_nt % 8) % 8
+        padded_local_nt = local_nt + pad_local_nt
+        bt_candidates, bf_candidates, btc_candidates, bts_candidates = generate_tune_candidates(f, padded_local_nt, ep_size)
+        log(f"  tune: bt={bt_candidates} bf={bf_candidates} (local_nt={local_nt}→{padded_local_nt})")
 
     tokens = make_sharded(k1, (num_tokens, d), jnp.bfloat16)
     gating_local_shape = (num_tokens // num_devices, E)
@@ -281,8 +309,15 @@ for num_tokens in token_candidates:
         bc = FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse, bts=bts)
         tag = f"bt={bt},bf={bf},btc={btc},bts={bts}"
 
+        padded_nt = num_tokens
+        local_nt_raw = num_tokens // ep_size
+        pad_align = 8
+        pad_local = (pad_align - local_nt_raw % pad_align) % pad_align
+        if pad_local > 0:
+            padded_nt = (local_nt_raw + pad_local) * ep_size
+
         try:
-            bc_resolved = bc.effective_for(num_tokens=num_tokens, ep_size=ep_size)
+            bc_resolved = bc.effective_for(num_tokens=padded_nt, ep_size=ep_size)
         except ValueError as e:
             log(f"  SKIP {tag}: {e}")
             continue
@@ -299,7 +334,7 @@ for num_tokens in token_candidates:
             )
 
         try:
-            times = trace_timeit(run_fn, warmup=warmup, iters=iters)
+            times = timeit_fn(run_fn, warmup=warmup, iters=iters)
         except Exception as e:
             log(f"  FAIL {tag}: {e}")
             continue
@@ -307,10 +342,10 @@ for num_tokens in token_candidates:
         if jax.process_index() == 0:
             if times:
                 avg = np.mean(times)
-                log(f"  {tag_resolved}: {avg:.3f} ms (trace) | samples={[round(t, 3) for t in times]}")
+                log(f"  {tag_resolved}: {avg:.3f} ms ({timing_label}) | samples={[round(t, 3) for t in times]}")
                 results.append((num_tokens, tag_resolved, avg, times))
             else:
-                log(f"  {tag_resolved}: no trace data (profiler may not have captured events)")
+                log(f"  {tag_resolved}: no timing data")
 
 # --- Summary ---
 if jax.process_index() == 0 and results:
