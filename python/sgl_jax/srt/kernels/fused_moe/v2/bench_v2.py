@@ -183,6 +183,24 @@ use_wall = os.environ.get("BENCH_WALL", "0") == "1"
 timeit_fn = wall_timeit if use_wall else trace_timeit
 timing_label = "wall" if use_wall else "trace"
 
+# Ablation flags
+all_disable = os.environ.get("FUSED_MOE_BENCHMARK_ALL_DISABLE", "0") == "1"
+disable_a2a = all_disable or os.environ.get("DISABLE_A2A", "0") == "1"
+disable_sync_barrier = all_disable or os.environ.get("DISABLE_SYNC_BARRIER", "0") == "1"
+disable_weight_load = all_disable or os.environ.get("DISABLE_WEIGHT_LOAD", "0") == "1"
+disable_dynamic_ffn1 = all_disable or os.environ.get("DISABLE_DYNAMIC_FFN1", "0") == "1"
+disable_dynamic_ffn2 = all_disable or os.environ.get("DISABLE_DYNAMIC_FFN2", "0") == "1"
+ablation_flags = {
+    "disable_a2a": disable_a2a,
+    "disable_sync_barrier": disable_sync_barrier,
+    "disable_weight_load": disable_weight_load,
+    "disable_dynamic_ffn1": disable_dynamic_ffn1,
+    "disable_dynamic_ffn2": disable_dynamic_ffn2,
+}
+active_ablation = [k for k, v in ablation_flags.items() if v]
+if active_ablation:
+    log(f"ablation flags: {active_ablation}")
+
 bt_candidates = parse_csv_int("BENCH_BT", [128])
 bf_candidates = parse_csv_int("BENCH_BF", [256])
 btc_candidates = parse_csv_int("BENCH_BTC", [128])
@@ -331,6 +349,11 @@ for num_tokens in token_candidates:
                 block_config=bc,
                 quant_block_k=qbk_arg,
                 w1_scale=w1_scale_s, w2_scale=w2_scale_s, w3_scale=w3_scale_s,
+                disable_a2a=disable_a2a,
+                disable_sync_barrier=disable_sync_barrier,
+                disable_weight_load=disable_weight_load,
+                disable_dynamic_ffn1=disable_dynamic_ffn1,
+                disable_dynamic_ffn2=disable_dynamic_ffn2,
             )
 
         try:
