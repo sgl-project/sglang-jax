@@ -862,10 +862,10 @@ def _fused_ep_moe_kernel(
                         gate = jnp.zeros((btc, bf), dtype=jnp.float32)
                         up = jnp.zeros((btc, bf), dtype=jnp.float32)
                         for p_id in range(t_packing):
-                            x_slice = b_x_vmem[
-                                pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
-                            ]
                             if w1_scale_hbm is None:
+                                x_slice = b_x_vmem[
+                                    pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
+                                ]
                                 w1_slice = b_w1_x2_vmem[slot, p_id]
                                 w3_slice = b_w3_x2_vmem[slot, p_id]
                                 gate += jnp.dot(x_slice, w1_slice, preferred_element_type=jnp.float32)
@@ -874,21 +874,25 @@ def _fused_ep_moe_kernel(
                                 def _sg_body_gu(sg_id, carry):
                                     g, u = carry
                                     sg_off = sg_id * quant_block_k
-                                    x_g = x_slice[:, pl.ds(sg_off, quant_block_k)]
+                                    x_g = b_x_vmem[
+                                        pl.ds(btc_id * btc, btc),
+                                        p_id,
+                                        pl.ds(sg_off, quant_block_k),
+                                    ]
                                     d1 = jnp.dot(
                                         x_g,
-                                        b_w1_x2_vmem[slot, p_id, pl.ds(sg_off, quant_block_k), :],
+                                        b_w1_x2_vmem[slot, p_id, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)],
                                         preferred_element_type=jnp.float32,
                                     )
-                                    s1 = b_w1_scale_x2_vmem[slot, p_id, sg_id, 0, pl.ds(0, bf)]
+                                    s1 = b_w1_scale_x2_vmem[slot, p_id, pl.ds(sg_id, 1), 0, pl.ds(0, bf)]
                                     s1 = s1.reshape(1, bf)
                                     g = g + d1 * jnp.broadcast_to(s1, d1.shape)
                                     d3 = jnp.dot(
                                         x_g,
-                                        b_w3_x2_vmem[slot, p_id, pl.ds(sg_off, quant_block_k), :],
+                                        b_w3_x2_vmem[slot, p_id, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)],
                                         preferred_element_type=jnp.float32,
                                     )
-                                    s3 = b_w3_scale_x2_vmem[slot, p_id, sg_id, 0, pl.ds(0, bf)]
+                                    s3 = b_w3_scale_x2_vmem[slot, p_id, pl.ds(sg_id, 1), 0, pl.ds(0, bf)]
                                     s3 = s3.reshape(1, bf)
                                     u = u + d3 * jnp.broadcast_to(s3, d3.shape)
                                     return (g, u)
@@ -904,9 +908,9 @@ def _fused_ep_moe_kernel(
 
                     # Act+down — accumulate in VMEM f32 across bf tiles
                     def act_down_btc(btc_id, ___):
-                        gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
-                        up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
                         if w2_scale_hbm is None:
+                            gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
+                            up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
                             act = activation_fn(gate, up_val, act_fn)
                             for p_id in range(t_packing):
                                 w2_slice = b_w2_x2_vmem[slot, p_id]
@@ -924,8 +928,14 @@ def _fused_ep_moe_kernel(
                             for p_id in range(t_packing):
                                 def _sg2_body(sg_id, sg_acc):
                                     sg_off = sg_id * quant_block_k
-                                    gate_g = gate[:, pl.ds(sg_off, quant_block_k)]
-                                    up_g = up_val[:, pl.ds(sg_off, quant_block_k)]
+                                    gate_g = b_gate_acc_vmem[
+                                        pl.ds(btc_id * btc, btc),
+                                        pl.ds(sg_off, quant_block_k),
+                                    ]
+                                    up_g = b_up_acc_vmem[
+                                        pl.ds(btc_id * btc, btc),
+                                        pl.ds(sg_off, quant_block_k),
+                                    ]
                                     act_g = activation_fn(gate_g, up_g, act_fn)
                                     w2_g = b_w2_x2_vmem[
                                         slot, p_id,
@@ -937,7 +947,7 @@ def _fused_ep_moe_kernel(
                                         preferred_element_type=jnp.float32,
                                     )
                                     s = b_w2_scale_x2_vmem[
-                                        slot, p_id, sg_id, 0, pl.ds(0, h_per_t)
+                                        slot, p_id, pl.ds(sg_id, 1), 0, pl.ds(0, h_per_t)
                                     ]
                                     s = s.reshape(1, h_per_t)
                                     return sg_acc + d * jnp.broadcast_to(s, d.shape)
