@@ -12,6 +12,7 @@ Env vars:
   BENCH_BSE     — bse value (default: 256)
   BENCH_FP8     — 1 to enable fp8 weights
   BENCH_QBK     — quant_block_k for fp8 (default: 128)
+  BENCH_TUNE    — 1 to auto-generate bt/bf candidates
   BENCH_WARMUP  — warmup iterations (default: 2)
   BENCH_ITERS   — timed iterations (default: 5)
   BENCH_CHECK   — 1 to run correctness check (single-host only)
@@ -164,12 +165,32 @@ iters = int(os.environ.get("BENCH_ITERS", "5"))
 check_correctness = os.environ.get("BENCH_CHECK", "0") == "1"
 use_fp8 = os.environ.get("BENCH_FP8", "0") == "1"
 quant_block_k = int(os.environ.get("BENCH_QBK", "128"))
+tune_mode = os.environ.get("BENCH_TUNE", "0") == "1"
 
 bt_candidates = parse_csv_int("BENCH_BT", [128])
 bf_candidates = parse_csv_int("BENCH_BF", [256])
 btc_candidates = parse_csv_int("BENCH_BTC", [128])
 bts_candidates = parse_csv_int_or_none("BENCH_BTS")
 token_candidates = parse_csv_int("BENCH_TOKENS", [4096])
+
+
+def generate_tune_candidates(intermediate_size, local_num_tokens):
+    bts = [128]
+    bfs = sorted(set(
+        v for v in [128, 256, 512, 1024, 2048]
+        if v <= intermediate_size and intermediate_size % v == 0
+    ))
+    p = 128
+    bts_list = []
+    while p <= local_num_tokens:
+        if local_num_tokens % p == 0:
+            bts_list.append(p)
+        p *= 2
+    return bts_list, bfs, [128], [None]
+
+
+if tune_mode:
+    log(f"tune mode: auto-generating candidates for f={f}, ep={ep_size}")
 
 ep_sharding = jax.sharding.NamedSharding(mesh, P(("data", "tensor")))
 
@@ -233,6 +254,11 @@ results: list[tuple[int, str, float, list[float]]] = []
 
 for num_tokens in token_candidates:
     log(f"--- tokens={num_tokens} ---")
+
+    if tune_mode:
+        local_nt = num_tokens // ep_size
+        bt_candidates, bf_candidates, btc_candidates, bts_candidates = generate_tune_candidates(f, local_nt)
+        log(f"  tune: bt={bt_candidates} bf={bf_candidates}")
 
     tokens = make_sharded(k1, (num_tokens, d), jnp.bfloat16)
     gating_local_shape = (num_tokens // num_devices, E)
