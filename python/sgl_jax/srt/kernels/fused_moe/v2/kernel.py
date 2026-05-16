@@ -130,6 +130,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 def ref_moe(
     tokens, w1, w2, w3, topk_weights, topk_ids, top_k, *, act_fn="silu",
     w1_shared=None, w2_shared=None, w3_shared=None,
+    quant_block_k=None, w1_scale=None, w2_scale=None, w3_scale=None,
 ):
     num_tokens = tokens.shape[0]
     hidden_size = tokens.shape[1]
@@ -138,6 +139,13 @@ def ref_moe(
     tokens_f32 = tokens.astype(jnp.float32)
     output = jnp.zeros_like(tokens_f32)
 
+    def _dequant(w, scale, qbk):
+        if scale is None:
+            return w.astype(jnp.float32)
+        w_f32 = w.astype(jnp.float32)
+        s = jnp.repeat(scale, qbk, axis=0).squeeze(1)
+        return w_f32 * s
+
     for t_id in range(num_tokens):
         for k_id in range(top_k):
             e_id = int(topk_ids[t_id, k_id])
@@ -145,10 +153,10 @@ def ref_moe(
                 continue
             weight = float(topk_weights[t_id, k_id])
             x = tokens_f32[t_id : t_id + 1]
-            gate = x @ w1[e_id].astype(jnp.float32)
-            up = x @ w3[e_id].astype(jnp.float32)
+            gate = x @ _dequant(w1[e_id], w1_scale[e_id] if w1_scale is not None else None, quant_block_k)
+            up = x @ _dequant(w3[e_id], w3_scale[e_id] if w3_scale is not None else None, quant_block_k)
             act = activation_fn(gate, up, act_fn)
-            out = act @ w2[e_id].astype(jnp.float32)
+            out = act @ _dequant(w2[e_id], w2_scale[e_id] if w2_scale is not None else None, quant_block_k)
             output = output.at[t_id].add(out[0] * weight)
 
     if w1_shared is not None:
@@ -211,6 +219,9 @@ def _fused_ep_moe_kernel(
     w1_hbm,               # (local_num_experts, hidden_size, intermediate_size)
     w2_hbm,               # (local_num_experts, intermediate_size, hidden_size)
     w3_hbm,               # (local_num_experts, hidden_size, intermediate_size)
+    w1_scale_hbm,         # None | (local_num_experts, H // quant_block_k, 1, I)
+    w2_scale_hbm,         # None | (local_num_experts, I // quant_block_k, 1, H)
+    w3_scale_hbm,         # None | (local_num_experts, H // quant_block_k, 1, I)
     topk_weights_hbm,     # (local_num_tokens, top_k)
     topk_ids_hbm,         # (local_num_tokens, top_k)
     a2a_s_x2_hbm,         # (expert_buffer_count, a2a_max_tokens, t_packing, h_per_t)
@@ -240,6 +251,10 @@ def _fused_ep_moe_kernel(
     b_w1_x2_vmem,          # (2, t_packing, h_per_t, bf)
     b_w3_x2_vmem,          # (2, t_packing, h_per_t, bf)
     b_w2_x2_vmem,          # (2, t_packing, bf, h_per_t)
+    # Scale double buffers (None when not quantized)
+    b_w1_scale_x2_vmem,    # None | (2, t_packing, h_per_t // qbk, 1, bf) f32
+    b_w3_scale_x2_vmem,    # None | (2, t_packing, h_per_t // qbk, 1, bf) f32
+    b_w2_scale_x2_vmem,    # None | (2, t_packing, bf // qbk, 1, h_per_t) f32
     # Gate/up accumulators (per bts tile)
     b_gate_acc_vmem,       # (bts, bf) f32
     b_up_acc_vmem,         # (bts, bf) f32
@@ -280,6 +295,7 @@ def _fused_ep_moe_kernel(
     btc: int,
     bts: int,
     bse: int,
+    quant_block_k: int | None = None,
 ):
     # ===== Dimension extraction =====
     dp_rank = lax.axis_index(dp_axis_name)
@@ -307,6 +323,9 @@ def _fused_ep_moe_kernel(
     h_per_t = hidden_size // t_packing
 
     num_bf = cdiv(intermediate_size, bf)
+
+    n_sg = h_per_t // quant_block_k if quant_block_k is not None else 1
+    n_sg2 = bf // quant_block_k if quant_block_k is not None else 1
 
     se_inter_size = 0
     se_total_blocks = 0
@@ -684,6 +703,17 @@ def _fused_ep_moe_kernel(
                 dst_ref=b_w1_x2_vmem.at[slot, p],
                 sem=local_sems.at[slot, 4],
             ).start(priority=priority)
+            if w1_scale_hbm is not None:
+                pltpu.make_async_copy(
+                    src_ref=w1_scale_hbm.at[
+                        local_e_id,
+                        pl.ds(p * h_per_t // quant_block_k, h_per_t // quant_block_k),
+                        pl.ds(0, 1),
+                        pl.ds(bf_id * bf, bf),
+                    ],
+                    dst_ref=b_w1_scale_x2_vmem.at[slot, p],
+                    sem=local_sems.at[slot, 4],
+                ).start(priority=priority)
 
     def wait_fetch_w1(slot):
         pltpu.make_async_copy(
@@ -691,6 +721,12 @@ def _fused_ep_moe_kernel(
             dst_ref=b_w1_x2_vmem.at[slot],
             sem=local_sems.at[slot, 4],
         ).wait()
+        if w1_scale_hbm is not None:
+            pltpu.make_async_copy(
+                src_ref=b_w1_scale_x2_vmem.at[slot],
+                dst_ref=b_w1_scale_x2_vmem.at[slot],
+                sem=local_sems.at[slot, 4],
+            ).wait()
 
     def start_fetch_w3(local_e_id, slot, bf_id, priority=1):
         for p in range(t_packing):
@@ -703,6 +739,17 @@ def _fused_ep_moe_kernel(
                 dst_ref=b_w3_x2_vmem.at[slot, p],
                 sem=local_sems.at[slot, 5],
             ).start(priority=priority)
+            if w3_scale_hbm is not None:
+                pltpu.make_async_copy(
+                    src_ref=w3_scale_hbm.at[
+                        local_e_id,
+                        pl.ds(p * h_per_t // quant_block_k, h_per_t // quant_block_k),
+                        pl.ds(0, 1),
+                        pl.ds(bf_id * bf, bf),
+                    ],
+                    dst_ref=b_w3_scale_x2_vmem.at[slot, p],
+                    sem=local_sems.at[slot, 5],
+                ).start(priority=priority)
 
     def wait_fetch_w3(slot):
         pltpu.make_async_copy(
@@ -710,6 +757,12 @@ def _fused_ep_moe_kernel(
             dst_ref=b_w3_x2_vmem.at[slot],
             sem=local_sems.at[slot, 5],
         ).wait()
+        if w3_scale_hbm is not None:
+            pltpu.make_async_copy(
+                src_ref=b_w3_scale_x2_vmem.at[slot],
+                dst_ref=b_w3_scale_x2_vmem.at[slot],
+                sem=local_sems.at[slot, 5],
+            ).wait()
 
     def start_fetch_w2(local_e_id, slot, bf_id, priority=0):
         for p in range(t_packing):
@@ -722,6 +775,17 @@ def _fused_ep_moe_kernel(
                 dst_ref=b_w2_x2_vmem.at[slot, p],
                 sem=local_sems.at[slot, 6],
             ).start(priority=priority)
+            if w2_scale_hbm is not None:
+                pltpu.make_async_copy(
+                    src_ref=w2_scale_hbm.at[
+                        local_e_id,
+                        pl.ds(bf_id * bf // quant_block_k, bf // quant_block_k),
+                        pl.ds(0, 1),
+                        pl.ds(p * h_per_t, h_per_t),
+                    ],
+                    dst_ref=b_w2_scale_x2_vmem.at[slot, p],
+                    sem=local_sems.at[slot, 6],
+                ).start(priority=priority)
 
     def wait_fetch_w2(slot):
         pltpu.make_async_copy(
@@ -729,6 +793,12 @@ def _fused_ep_moe_kernel(
             dst_ref=b_w2_x2_vmem.at[slot],
             sem=local_sems.at[slot, 6],
         ).wait()
+        if w2_scale_hbm is not None:
+            pltpu.make_async_copy(
+                src_ref=b_w2_scale_x2_vmem.at[slot],
+                dst_ref=b_w2_scale_x2_vmem.at[slot],
+                sem=local_sems.at[slot, 6],
+            ).wait()
 
     # ===== Expert FFN: Strix-style double-buffer pipeline =====
 
@@ -795,10 +865,37 @@ def _fused_ep_moe_kernel(
                             x_slice = b_x_vmem[
                                 pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
                             ]
-                            w1_slice = b_w1_x2_vmem[slot, p_id]
-                            w3_slice = b_w3_x2_vmem[slot, p_id]
-                            gate += jnp.dot(x_slice, w1_slice, preferred_element_type=jnp.float32)
-                            up += jnp.dot(x_slice, w3_slice, preferred_element_type=jnp.float32)
+                            if w1_scale_hbm is None:
+                                w1_slice = b_w1_x2_vmem[slot, p_id]
+                                w3_slice = b_w3_x2_vmem[slot, p_id]
+                                gate += jnp.dot(x_slice, w1_slice, preferred_element_type=jnp.float32)
+                                up += jnp.dot(x_slice, w3_slice, preferred_element_type=jnp.float32)
+                            else:
+                                def _sg_body_gu(sg_id, carry):
+                                    g, u = carry
+                                    sg_off = sg_id * quant_block_k
+                                    x_g = x_slice[:, pl.ds(sg_off, quant_block_k)]
+                                    d1 = jnp.dot(
+                                        x_g,
+                                        b_w1_x2_vmem[slot, p_id, pl.ds(sg_off, quant_block_k), :],
+                                        preferred_element_type=jnp.float32,
+                                    )
+                                    s1 = b_w1_scale_x2_vmem[slot, p_id, sg_id, 0, pl.ds(0, bf)]
+                                    s1 = s1.reshape(1, bf)
+                                    g = g + d1 * jnp.broadcast_to(s1, d1.shape)
+                                    d3 = jnp.dot(
+                                        x_g,
+                                        b_w3_x2_vmem[slot, p_id, pl.ds(sg_off, quant_block_k), :],
+                                        preferred_element_type=jnp.float32,
+                                    )
+                                    s3 = b_w3_scale_x2_vmem[slot, p_id, sg_id, 0, pl.ds(0, bf)]
+                                    s3 = s3.reshape(1, bf)
+                                    u = u + d3 * jnp.broadcast_to(s3, d3.shape)
+                                    return (g, u)
+                                gate, up = lax.fori_loop(
+                                    0, n_sg, _sg_body_gu,
+                                    (gate, up), unroll=n_sg,
+                                )
                         b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
                         b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
                         return None
@@ -809,19 +906,53 @@ def _fused_ep_moe_kernel(
                     def act_down_btc(btc_id, ___):
                         gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
                         up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
-                        act = activation_fn(gate, up_val, act_fn)
-                        for p_id in range(t_packing):
-                            w2_slice = b_w2_x2_vmem[slot, p_id]
-                            partial = jnp.dot(
-                                act, w2_slice, preferred_element_type=jnp.float32,
-                            )
-                            acc_ref = b_y_acc_vmem.at[
-                                pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
-                            ]
-                            if bf_id == 0:
-                                acc_ref[...] = partial
-                            else:
-                                acc_ref[...] = acc_ref[...] + partial
+                        if w2_scale_hbm is None:
+                            act = activation_fn(gate, up_val, act_fn)
+                            for p_id in range(t_packing):
+                                w2_slice = b_w2_x2_vmem[slot, p_id]
+                                partial = jnp.dot(
+                                    act, w2_slice, preferred_element_type=jnp.float32,
+                                )
+                                acc_ref = b_y_acc_vmem.at[
+                                    pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
+                                ]
+                                if bf_id == 0:
+                                    acc_ref[...] = partial
+                                else:
+                                    acc_ref[...] = acc_ref[...] + partial
+                        else:
+                            for p_id in range(t_packing):
+                                def _sg2_body(sg_id, sg_acc):
+                                    sg_off = sg_id * quant_block_k
+                                    gate_g = gate[:, pl.ds(sg_off, quant_block_k)]
+                                    up_g = up_val[:, pl.ds(sg_off, quant_block_k)]
+                                    act_g = activation_fn(gate_g, up_g, act_fn)
+                                    w2_g = b_w2_x2_vmem[
+                                        slot, p_id,
+                                        pl.ds(sg_off, quant_block_k),
+                                        pl.ds(0, h_per_t),
+                                    ]
+                                    d = jnp.dot(
+                                        act_g, w2_g,
+                                        preferred_element_type=jnp.float32,
+                                    )
+                                    s = b_w2_scale_x2_vmem[
+                                        slot, p_id, sg_id, 0, pl.ds(0, h_per_t)
+                                    ]
+                                    s = s.reshape(1, h_per_t)
+                                    return sg_acc + d * jnp.broadcast_to(s, d.shape)
+                                partial = lax.fori_loop(
+                                    0, n_sg2, _sg2_body,
+                                    jnp.zeros((btc, h_per_t), dtype=jnp.float32),
+                                    unroll=n_sg2,
+                                )
+                                acc_ref = b_y_acc_vmem.at[
+                                    pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
+                                ]
+                                if bf_id == 0:
+                                    acc_ref[...] = partial
+                                else:
+                                    acc_ref[...] = acc_ref[...] + partial
                         return None
 
                     lax.fori_loop(0, num_btc_per_bts, act_down_btc, None)
@@ -1282,6 +1413,7 @@ def jax_allreduce_metadata_by_bt(
         "disable_a2a", "disable_shared_expert", "disable_sync_barrier",
         "use_jax_allreduce_metadata",
         "block_config", "dp_axis_name", "tp_axis_name",
+        "quant_block_k",
     ],
 )
 def fused_ep_moe_v2(
@@ -1302,6 +1434,10 @@ def fused_ep_moe_v2(
     w1_shared: jax.Array | None = None,
     w2_shared: jax.Array | None = None,
     w3_shared: jax.Array | None = None,
+    quant_block_k: int | None = None,
+    w1_scale: jax.Array | None = None,
+    w2_scale: jax.Array | None = None,
+    w3_scale: jax.Array | None = None,
     block_config: FusedMoEBlockConfig | None = None,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
@@ -1338,6 +1474,28 @@ def fused_ep_moe_v2(
         hidden_size=hidden_size, intermediate_size=intermediate_size,
         dtype=tokens.dtype, ep_size=ep_size, block_config=block_config,
     )
+
+    if w1_scale is not None:
+        if quant_block_k is None:
+            raise ValueError("quant_block_k required when w1_scale is provided.")
+    if quant_block_k is not None:
+        if quant_block_k % 128 != 0:
+            raise ValueError(f"{quant_block_k=} must be aligned to 128.")
+        _qbk_t_packing = get_dtype_packing(tokens.dtype)
+        _qbk_h_per_t = hidden_size // _qbk_t_packing
+        if _qbk_h_per_t % quant_block_k != 0:
+            raise ValueError(f"h_per_t={_qbk_h_per_t} must be divisible by {quant_block_k=}.")
+        if bf % quant_block_k != 0:
+            raise ValueError(f"{bf=} must be divisible by {quant_block_k=}.")
+        expected_w1_scale = (num_experts, hidden_size // quant_block_k, 1, intermediate_size)
+        if w1_scale is not None and w1_scale.shape != expected_w1_scale:
+            raise ValueError(f"{w1_scale.shape=} != {expected_w1_scale}")
+        expected_w2_scale = (num_experts, intermediate_size // quant_block_k, 1, hidden_size)
+        if w2_scale is not None and w2_scale.shape != expected_w2_scale:
+            raise ValueError(f"{w2_scale.shape=} != {expected_w2_scale}")
+        expected_w3_scale = (num_experts, hidden_size // quant_block_k, 1, intermediate_size)
+        if w3_scale is not None and w3_scale.shape != expected_w3_scale:
+            raise ValueError(f"{w3_scale.shape=} != {expected_w3_scale}")
 
     needs_jax_allreduce = use_jax_allreduce_metadata and ep_size > 1
 
@@ -1391,6 +1549,13 @@ def fused_ep_moe_v2(
         pltpu.VMEM((2, t_packing, h_per_t, bf), w1.dtype),                 # W1
         pltpu.VMEM((2, t_packing, h_per_t, bf), w3.dtype),                 # W3
         pltpu.VMEM((2, t_packing, bf, h_per_t), w2.dtype),                 # W2
+        # VMEM: scale double buffers (None when not quantized)
+        (None if w1_scale is None else
+            pltpu.VMEM((2, t_packing, h_per_t // quant_block_k, 1, bf), jnp.float32)),  # W1 scale
+        (None if w3_scale is None else
+            pltpu.VMEM((2, t_packing, h_per_t // quant_block_k, 1, bf), jnp.float32)),  # W3 scale
+        (None if w2_scale is None else
+            pltpu.VMEM((2, t_packing, bf // quant_block_k, 1, h_per_t), jnp.float32)),  # W2 scale
         # VMEM: gate/up accumulators (per bts tile)
         pltpu.VMEM((bts, bf), jnp.float32),                                 # gate_acc
         pltpu.VMEM((bts, bf), jnp.float32),                                 # up_acc
@@ -1436,6 +1601,7 @@ def fused_ep_moe_v2(
                 disable_sync_barrier=disable_sync_barrier,
                 use_jax_allreduce_metadata=use_jax_allreduce_metadata,
                 bt=bt, bf=bf, btc=btc, bts=bts, bse=bse,
+                quant_block_k=quant_block_k,
             ),
             out_shape=jax.ShapeDtypeStruct((local_num_tokens, hidden_size), t_dtype),
             grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -1445,6 +1611,9 @@ def fused_ep_moe_v2(
                     hbm_spec,                                               # w1
                     hbm_spec,                                               # w2
                     hbm_spec,                                               # w3
+                    None if w1_scale is None else hbm_spec,                 # w1_scale
+                    None if w2_scale is None else hbm_spec,                 # w2_scale
+                    None if w3_scale is None else hbm_spec,                 # w3_scale
                     hbm_spec,                                               # topk_weights
                     hbm_spec,                                               # topk_ids
                     hbm_spec,                                               # a2a_s
@@ -1478,6 +1647,9 @@ def fused_ep_moe_v2(
             P((dp_axis_name, tp_axis_name)),     # w1
             P((dp_axis_name, tp_axis_name)),     # w2
             P((dp_axis_name, tp_axis_name)),     # w3
+            None if w1_scale is None else P((dp_axis_name, tp_axis_name)),  # w1_scale
+            None if w2_scale is None else P((dp_axis_name, tp_axis_name)),  # w2_scale
+            None if w3_scale is None else P((dp_axis_name, tp_axis_name)),  # w3_scale
             P((dp_axis_name, tp_axis_name)),     # topk_weights
             P((dp_axis_name, tp_axis_name)),     # topk_ids
             P(),                                  # a2a_s
@@ -1491,7 +1663,9 @@ def fused_ep_moe_v2(
         check_vma=False,
     )
     def kernel(
-        tokens, w1, w2, w3, topk_weights, topk_ids,
+        tokens, w1, w2, w3,
+        w1_scale_arg, w2_scale_arg, w3_scale_arg,
+        topk_weights, topk_ids,
         a2a_s_hbm_scratch, a2a_s_acc_hbm_scratch, a2a_g_hbm_scratch,
         w1_shared=None, w3_shared=None, w2_shared=None,
     ):
@@ -1513,6 +1687,12 @@ def fused_ep_moe_v2(
             pltpu.with_memory_space_constraint(w1, pltpu.HBM),
             pltpu.with_memory_space_constraint(w2, pltpu.HBM),
             pltpu.with_memory_space_constraint(w3, pltpu.HBM),
+            (None if w1_scale_arg is None else
+                pltpu.with_memory_space_constraint(w1_scale_arg, pltpu.HBM)),
+            (None if w2_scale_arg is None else
+                pltpu.with_memory_space_constraint(w2_scale_arg, pltpu.HBM)),
+            (None if w3_scale_arg is None else
+                pltpu.with_memory_space_constraint(w3_scale_arg, pltpu.HBM)),
             pltpu.with_memory_space_constraint(topk_weights, pltpu.HBM),
             pltpu.with_memory_space_constraint(topk_ids, pltpu.HBM),
             pltpu.with_memory_space_constraint(a2a_s_hbm_scratch, pltpu.HBM),
@@ -1540,7 +1720,9 @@ def fused_ep_moe_v2(
     )
 
     return kernel(
-        tokens, w1, w2, w3, topk_weights, topk_ids,
+        tokens, w1, w2, w3,
+        w1_scale, w2_scale, w3_scale,
+        topk_weights, topk_ids,
         a2a_s_hbm_scratch, a2a_s_acc_hbm_scratch, a2a_g_hbm_scratch,
         w1_shared, w3_shared, w2_shared,
     )
