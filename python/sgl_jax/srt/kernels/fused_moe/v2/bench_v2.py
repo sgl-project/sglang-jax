@@ -24,8 +24,7 @@ import itertools
 import json
 import os
 import pathlib
-import random
-import string
+import re
 import sys
 import time
 from typing import Any
@@ -36,7 +35,7 @@ import jax.numpy as jnp
 from jax import lax
 
 t0 = time.time()
-MARKER = "V2_BENCH"
+KERNEL_NAME_RE = re.compile(r"fused-moe-v2-k_.*")
 TRACE_ROOT = "/tmp/tpu_logs/v2_trace"
 
 
@@ -67,18 +66,17 @@ def _load_trace(trace_root: str) -> dict[str, Any]:
 
 
 def _extract_durations_ms(trace: dict[str, Any]) -> list[float]:
-    marker_events = []
-    for e in trace.get("traceEvents", []):
-        tf_op = e.get("args", {}).get("tf_op", "")
-        if MARKER in tf_op:
-            marker_events.append(e)
-    call_done = [e for e in marker_events if e.get("name", "").endswith("call-done")]
-    if call_done:
-        marker_events = call_done
-    if not marker_events:
+    """Extract per-iteration device durations for the v2 kernel from trace.
+
+    Matches events by kernel name regex (same approach as v1 bench),
+    extracts device_duration_ps for accurate on-device timing.
+    """
+    matched = [e for e in trace.get("traceEvents", [])
+               if "name" in e and KERNEL_NAME_RE.match(e["name"])]
+    if not matched:
         return []
     by_pid: dict[int, list[dict[str, Any]]] = {}
-    for e in marker_events:
+    for e in matched:
         pid = e.get("pid")
         if isinstance(pid, int):
             by_pid.setdefault(pid, []).append(e)
@@ -105,16 +103,14 @@ def trace_timeit(run_fn, warmup: int, iters: int) -> list[float]:
         out = run_fn()
         jax.block_until_ready(out)
 
-    tag = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    tag = f"{os.getpid()}_{int(time.time())}"
     trace_dir = os.path.join(TRACE_ROOT, f"run_{tag}")
     os.makedirs(trace_dir, exist_ok=True)
 
     with jax.profiler.trace(trace_dir):
         for i in range(iters):
-            with jax.profiler.StepTraceAnnotation(MARKER, step_num=i):
-                with jax.named_scope(f"{MARKER}_{i}"):
-                    out = run_fn()
-                    jax.block_until_ready(out)
+            out = run_fn()
+            jax.block_until_ready(out)
 
     if jax.process_index() != 0:
         return []
