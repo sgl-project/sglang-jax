@@ -691,6 +691,9 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
         logger.info("BailingMoeV2.5 weights loaded successfully!")
 
     def _create_bailing_moe_linear_weight_mappings(self, model_config: ModelConfig) -> dict:
+        quant_config = getattr(model_config, "quantization_config", None)
+        is_static_quant = quant_config is not None and quant_config.is_static_checkpoint
+
         mappings = {
             "model.word_embeddings.weight": WeightMapping(
                 target_path="model.embed_tokens.embedding",
@@ -727,6 +730,7 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
                     attention_type=attention_type,
                     is_mlp_layer=is_mlp_layer,
                     model_config=model_config,
+                    is_static_quant=is_static_quant,
                 )
             )
         return mappings
@@ -737,6 +741,7 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
         attention_type: int,
         is_mlp_layer: bool,
         model_config: ModelConfig,
+        is_static_quant: bool = False,
     ) -> dict:
         prefix = f"model.layers.{layer_idx}"
         target = f"model.layers.{layer_idx}"
@@ -754,36 +759,70 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
         }
 
         if attention_type == 0:
-            self._add_linear_attention_mappings(mappings, prefix, target)
+            self._add_linear_attention_mappings(mappings, prefix, target, is_static_quant)
         elif getattr(self.config, "full_attention_type", "mla") == "mla":
-            self._add_mla_attention_mappings(mappings, prefix, target)
+            self._add_mla_attention_mappings(mappings, prefix, target, is_static_quant)
         else:
-            self._add_gqa_attention_mappings(mappings, prefix, target)
+            self._add_gqa_attention_mappings(mappings, prefix, target, is_static_quant)
 
         if is_mlp_layer:
-            self._add_dense_mlp_mappings(mappings, prefix, target)
+            self._add_dense_mlp_mappings(mappings, prefix, target, is_static_quant)
         else:
-            self._add_moe_mappings(mappings, prefix, target, layer_idx, model_config)
+            self._add_moe_mappings(
+                mappings, prefix, target, layer_idx, model_config, is_static_quant
+            )
         return mappings
 
-    def _add_linear_attention_mappings(self, mappings: dict, prefix: str, target: str) -> None:
+    @staticmethod
+    def _add_linear(
+        mappings: dict,
+        hf_path: str,
+        target_path: str,
+        sharding: tuple,
+        is_static_quant: bool,
+    ) -> None:
+        """Register a Linear-layer weight mapping, with FP8 sidecar if static quant.
+
+        ``sharding`` follows LinearBase ``kernel_axes`` = (input_axis, output_axis).
+          - col-parallel (e.g. q_proj/wi/up_proj):  (None, "tensor")
+          - row-parallel (e.g. o_proj/wo/down_proj): ("tensor", None)
+
+        Unquantized: HF ``[out, in]`` is transposed into LinearBase.weight ``[in, out]``.
+        Static FP8:  HF ``[out, in]`` flows directly into QuantizedLinear.weight_q
+                     (no transpose) and a per-channel ``weight_scale`` ``[out_dim]``
+                     sidecar is registered alongside.
+        """
+        if not is_static_quant:
+            mappings[f"{hf_path}.weight"] = WeightMapping(
+                target_path=f"{target_path}.weight",
+                sharding=sharding,
+                transpose=True,
+            )
+            return
+        sharding_quant = (sharding[1], sharding[0])
+        mappings[f"{hf_path}.weight"] = WeightMapping(
+            target_path=f"{target_path}.weight_q",
+            sharding=sharding_quant,
+            transpose=False,
+        )
+        mappings[f"{hf_path}.weight_scale"] = WeightMapping(
+            target_path=f"{target_path}.weight_scale",
+            sharding=(sharding[1],),
+            transpose=False,
+        )
+
+    def _add_linear_attention_mappings(
+        self, mappings: dict, prefix: str, target: str, is_static_quant: bool = False
+    ) -> None:
         ap = f"{prefix}.attention"
         tp = f"{target}.self_attn"
-        mappings[f"{ap}.query_key_value.weight"] = WeightMapping(
-            target_path=f"{tp}.qkv_proj.weight",
-            sharding=(None, "tensor"),
-            transpose=True,
+        self._add_linear(
+            mappings, f"{ap}.query_key_value", f"{tp}.qkv_proj", (None, "tensor"), is_static_quant
         )
-        mappings[f"{ap}.g_proj.weight"] = WeightMapping(
-            target_path=f"{tp}.g_proj.weight",
-            sharding=(None, "tensor"),
-            transpose=True,
+        self._add_linear(
+            mappings, f"{ap}.g_proj", f"{tp}.g_proj", (None, "tensor"), is_static_quant
         )
-        mappings[f"{ap}.dense.weight"] = WeightMapping(
-            target_path=f"{tp}.dense.weight",
-            sharding=("tensor", None),
-            transpose=True,
-        )
+        self._add_linear(mappings, f"{ap}.dense", f"{tp}.dense", ("tensor", None), is_static_quant)
         mappings[f"{ap}.g_norm.weight"] = WeightMapping(
             target_path=f"{tp}.g_norm.weight",
             sharding=("tensor",),
@@ -801,70 +840,56 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
                 transpose=False,
             )
 
-    def _add_mla_attention_mappings(self, mappings: dict, prefix: str, target: str) -> None:
+    def _add_mla_attention_mappings(
+        self, mappings: dict, prefix: str, target: str, is_static_quant: bool = False
+    ) -> None:
         ap = f"{prefix}.attention"
         tp = f"{target}.self_attn"
         if getattr(self.config, "q_lora_rank", None) is None:
-            mappings[f"{ap}.q_proj.weight"] = WeightMapping(
-                target_path=f"{tp}.q_proj.weight",
-                sharding=(None, "tensor"),
-                transpose=True,
+            self._add_linear(
+                mappings, f"{ap}.q_proj", f"{tp}.q_proj", (None, "tensor"), is_static_quant
             )
         else:
-            mappings[f"{ap}.q_a_proj.weight"] = WeightMapping(
-                target_path=f"{tp}.q_a_proj.weight",
-                sharding=(None, None),
-                transpose=True,
+            self._add_linear(
+                mappings, f"{ap}.q_a_proj", f"{tp}.q_a_proj", (None, None), is_static_quant
             )
             mappings[f"{ap}.q_a_layernorm.weight"] = WeightMapping(
                 target_path=f"{tp}.q_a_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             )
-            mappings[f"{ap}.q_b_proj.weight"] = WeightMapping(
-                target_path=f"{tp}.q_b_proj.weight",
-                sharding=(None, "tensor"),
-                transpose=True,
+            self._add_linear(
+                mappings, f"{ap}.q_b_proj", f"{tp}.q_b_proj", (None, "tensor"), is_static_quant
             )
-        mappings[f"{ap}.kv_a_proj_with_mqa.weight"] = WeightMapping(
-            target_path=f"{tp}.kv_a_proj.weight",
-            sharding=(None, None),
-            transpose=True,
+        self._add_linear(
+            mappings, f"{ap}.kv_a_proj_with_mqa", f"{tp}.kv_a_proj", (None, None), is_static_quant
         )
         mappings[f"{ap}.kv_a_layernorm.weight"] = WeightMapping(
             target_path=f"{tp}.kv_a_layernorm.scale",
             sharding=(None,),
             transpose=False,
         )
-        mappings[f"{ap}.kv_b_proj.weight"] = WeightMapping(
-            target_path=f"{tp}.kv_b_proj.weight",
-            sharding=(None, "tensor"),
-            transpose=True,
+        self._add_linear(
+            mappings, f"{ap}.kv_b_proj", f"{tp}.kv_b_proj", (None, "tensor"), is_static_quant
         )
-        mappings[f"{ap}.dense.weight"] = WeightMapping(
-            target_path=f"{tp}.o_proj.weight",
-            sharding=("tensor", None),
-            transpose=True,
-        )
-        mappings[f"{ap}.o_proj.weight"] = WeightMapping(
-            target_path=f"{tp}.o_proj.weight",
-            sharding=("tensor", None),
-            transpose=True,
+        # HF emits the MLA output projection as `attention.dense`; the JAX
+        # implementation calls it `o_proj`. Register both source names so a
+        # single HF tensor lands in the JAX `o_proj` slot regardless of which
+        # variant the checkpoint exposes.
+        self._add_linear(mappings, f"{ap}.dense", f"{tp}.o_proj", ("tensor", None), is_static_quant)
+        self._add_linear(
+            mappings, f"{ap}.o_proj", f"{tp}.o_proj", ("tensor", None), is_static_quant
         )
 
-    def _add_gqa_attention_mappings(self, mappings: dict, prefix: str, target: str) -> None:
+    def _add_gqa_attention_mappings(
+        self, mappings: dict, prefix: str, target: str, is_static_quant: bool = False
+    ) -> None:
         ap = f"{prefix}.attention"
         tp = f"{target}.self_attn"
-        mappings[f"{ap}.query_key_value.weight"] = WeightMapping(
-            target_path=f"{tp}.qkv_proj.weight",
-            sharding=(None, "tensor"),
-            transpose=True,
+        self._add_linear(
+            mappings, f"{ap}.query_key_value", f"{tp}.qkv_proj", (None, "tensor"), is_static_quant
         )
-        mappings[f"{ap}.dense.weight"] = WeightMapping(
-            target_path=f"{tp}.dense.weight",
-            sharding=("tensor", None),
-            transpose=True,
-        )
+        self._add_linear(mappings, f"{ap}.dense", f"{tp}.dense", ("tensor", None), is_static_quant)
         if getattr(self.config, "use_qk_norm", True):
             mappings[f"{ap}.query_layernorm.weight"] = WeightMapping(
                 target_path=f"{tp}.q_norm.scale",
@@ -877,16 +902,20 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
                 transpose=False,
             )
 
-    def _add_dense_mlp_mappings(self, mappings: dict, prefix: str, target: str) -> None:
+    def _add_dense_mlp_mappings(
+        self, mappings: dict, prefix: str, target: str, is_static_quant: bool = False
+    ) -> None:
         for proj, sharding in [
             ("gate_proj", (None, "tensor")),
             ("up_proj", (None, "tensor")),
             ("down_proj", ("tensor", None)),
         ]:
-            mappings[f"{prefix}.mlp.{proj}.weight"] = WeightMapping(
-                target_path=f"{target}.mlp.{proj}.weight",
-                sharding=sharding,
-                transpose=True,
+            self._add_linear(
+                mappings,
+                f"{prefix}.mlp.{proj}",
+                f"{target}.mlp.{proj}",
+                sharding,
+                is_static_quant,
             )
 
     def _add_moe_mappings(
@@ -896,7 +925,10 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
         target: str,
         layer_idx: int,
         model_config: ModelConfig,
+        is_static_quant: bool = False,
     ) -> None:
+        # Router (`mlp.gate`) is in the HF ignore list and the JAX side is
+        # GateLogit (not LinearBase) — load as bf16/fp32 always.
         mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(
             target_path=f"{target}.moe_gate.kernel",
             sharding=(None, None),
@@ -913,23 +945,91 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
 
         phy_to_log = None
         metadata = get_global_expert_location_metadata()
+        num_logical_experts = getattr(self.config, "num_experts", 256)
+        num_physical_experts = num_logical_experts
         if metadata is not None:
             phy_to_log = np.array(jax.device_get(metadata.physical_to_logical_map))[layer_idx]
+            num_physical_experts = metadata.num_physical_experts
 
         moe_backend = getattr(self.config, "moe_backend", "epmoe")
+        use_fused = moe_backend == "fused"
         moe_mappings = create_moe_weights_mapping(
             prefix=prefix,
             target_prefix=target,
-            num_experts=getattr(self.config, "num_experts", 256),
+            num_experts=num_logical_experts,
             expert_type_names=("gate_proj", "up_proj", "down_proj"),
             moe_backend=moe_backend,
             physical_to_logical_map=phy_to_log,
         )
         mappings.update(moe_mappings)
 
+        # Routed expert weight-scale sidecars (compressed-tensors per-channel).
+        # Each `__MOE_EXPERTS__<target>` group emitted above gets a parallel
+        # scale group whose HF source is the per-expert `*.weight_scale` tensor.
+        # Layout depends on the backend:
+        #   EPMoE: stack to `[E, out_dim]`;
+        #     `_maybe_convert_epmoe_scale_for_kernel` then reshapes into the
+        #     GMM-ready `[E, 1, 1, out_dim]` (k_blocks=1) layout.
+        #   FusedEPMoE: the Pallas kernel `_validate_fused_ep_moe_args`
+        #     requires `quant_block_k % 128 == 0`. Per-channel scales have no
+        #     K blocking, so we reshape to `[E, 1, 1, out_dim]` and tile
+        #     `num_blocks = in_dim / 256` times along the K axis
+        #     (`repeat=(1, num_blocks)`) so the kernel sees the expected
+        #     `[E, K // 256, 1, out_dim]` shape. The scale value is identical
+        #     across every K block, so this is mathematically equivalent to
+        #     per-channel scaling. Mirrors `bailing_moe.py`.
+        if is_static_quant:
+            BLOCK_SIZE = 256  # fused MoE kernel default quant_block_k
+            hidden_size = self.config.hidden_size
+            inter_size = getattr(self.config, "moe_intermediate_size", 2048)
+            scale_extra_mappings = {}
+            for moe_key, wm in moe_mappings.items():
+                if not moe_key.startswith("__MOE_EXPERTS__"):
+                    continue
+                target_base = wm.target_path[0]
+                scale_target = f"{target_base}_scale"
+                expert_scale_keys = [
+                    k.replace(".weight", ".weight_scale") for k in wm.target_path[1:]
+                ]
+                if use_fused:
+                    is_w2 = target_base.endswith("w2")
+                    out_dim = hidden_size if is_w2 else inter_size
+                    in_dim = inter_size if is_w2 else hidden_size
+                    num_blocks = in_dim // BLOCK_SIZE
+                    # Mirror the fused weight sharding (("data", "tensor"), ...)
+                    # promoted to 4D for the [E, K_blocks, 1, out_dim] scale.
+                    fused_weight_shard = wm.sharding[0] if wm.sharding else ("data", "tensor")
+                    scale_extra_mappings[f"__MOE_EXPERTS__{scale_target}"] = WeightMapping(
+                        target_path=[scale_target] + expert_scale_keys,
+                        sharding=(fused_weight_shard, None, None, None),
+                        transpose=False,
+                        reshape=(num_physical_experts, 1, 1, out_dim),
+                        repeat=(1, num_blocks),
+                        physical_to_logical_map=wm.physical_to_logical_map,
+                    )
+                else:
+                    scale_extra_mappings[f"__MOE_EXPERTS__{scale_target}"] = WeightMapping(
+                        target_path=[scale_target] + expert_scale_keys,
+                        sharding=("expert", None),
+                        transpose=False,
+                        physical_to_logical_map=wm.physical_to_logical_map,
+                    )
+            mappings.update(scale_extra_mappings)
+
         num_shared = getattr(self.config, "num_shared_experts", 0)
-        use_fused = moe_backend == "fused"
         if num_shared > 0 and use_fused:
+            # FusedEPMoE: shared experts live as nnx.Param `w*_shared`/`w*_shared_scale`
+            # on the layer's `mlp` module. Per-channel shared scale `[out_dim]` is
+            # reshaped to `[1, 1, out_dim]` to match the kernel placeholder.
+            shared_inter = (
+                getattr(
+                    self.config,
+                    "moe_shared_expert_intermediate_size",
+                    self.config.moe_intermediate_size,
+                )
+                * num_shared
+            )
+            shared_hidden = self.config.hidden_size
             for hf_name, target_name in [
                 ("gate_proj", "w1_shared"),
                 ("up_proj", "w3_shared"),
@@ -940,16 +1040,30 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
                     sharding=(None, None),
                     transpose=True,
                 )
+                if is_static_quant:
+                    is_w2 = "down_proj" in hf_name
+                    out_dim = shared_hidden if is_w2 else shared_inter
+                    mappings[f"{prefix}.mlp.shared_experts.{hf_name}.weight_scale"] = WeightMapping(
+                        target_path=f"{target}.mlp.{target_name}_scale",
+                        sharding=(None, None, None),
+                        transpose=False,
+                        reshape=(1, 1, out_dim),
+                    )
         elif num_shared > 0:
+            # EPMoE backend stores shared experts as a DeepseekV3MLP (LinearBase)
+            # — `apply_linear_quantization` will swap each to QuantizedLinear and
+            # the standard `_add_linear` path handles the FP8 sidecars.
             for proj, sharding in [
                 ("gate_proj", (None, "tensor")),
                 ("up_proj", (None, "tensor")),
                 ("down_proj", ("tensor", None)),
             ]:
-                mappings[f"{prefix}.mlp.shared_experts.{proj}.weight"] = WeightMapping(
-                    target_path=f"{target}.shared_experts.{proj}.weight",
-                    sharding=sharding,
-                    transpose=True,
+                self._add_linear(
+                    mappings,
+                    f"{prefix}.mlp.shared_experts.{proj}",
+                    f"{target}.shared_experts.{proj}",
+                    sharding,
+                    is_static_quant,
                 )
 
 

@@ -56,6 +56,9 @@ class BailingHybridConfig(PretrainedConfig):
         qk_nope_head_dim: int = 128,
         v_head_dim: int = 128,
         rope_interleave: bool = True,
+        num_nextn_predict_layers: int = 0,
+        mtp_loss_scaling_factor: float = 0.0,
+        quantization_config: dict | None = None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -103,6 +106,19 @@ class BailingHybridConfig(PretrainedConfig):
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.v_head_dim = v_head_dim
         self.rope_interleave = rope_interleave
+
+        # NextN/MTP fields — base inference does not use them, but transformers'
+        # `from_dict` will fail if the keys are present in the HF config and not
+        # accepted by __init__. The model only constructs layers 0..num_hidden_layers-1.
+        self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.mtp_loss_scaling_factor = mtp_loss_scaling_factor
+        # NOTE: only set quantization_config when non-None. transformers'
+        # `to_diff_dict` constructs a default `__class__()` to compute the diff;
+        # in that default instance `to_dict` calls `self.quantization_config.to_dict()`
+        # without a None guard (see configuration_utils.py:961-966), so always
+        # assigning a None attribute would crash any repr / json serialization.
+        if quantization_config is not None:
+            self.quantization_config = quantization_config
 
         super().__init__(
             pad_token_id=pad_token_id,
