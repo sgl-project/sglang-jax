@@ -198,8 +198,8 @@ def validate_fused_moe_block_config(
         raise ValueError(f"{hidden_size=} must be aligned to 128.")
     if bf % 128 != 0:
         raise ValueError(f"{bf=} must be aligned to 128.")
-    if btc % 128 != 0:
-        raise ValueError(f"{btc=} must be aligned to 128.")
+    if btc % 8 != 0:
+        raise ValueError(f"{btc=} must be aligned to 8 (VREG sublane).")
     if bts % btc != 0:
         raise ValueError(f"{bts=} must be divisible by {btc=}.")
 
@@ -1444,6 +1444,19 @@ def fused_ep_moe_v2(
 
     local_num_tokens = num_tokens // ep_size
 
+    _BTC_ALIGN = 8
+    orig_num_tokens = num_tokens
+    pad_local = (_BTC_ALIGN - local_num_tokens % _BTC_ALIGN) % _BTC_ALIGN
+    if pad_local > 0:
+        pad_global = pad_local * ep_size
+        num_tokens = num_tokens + pad_global
+        local_num_tokens = local_num_tokens + pad_local
+        tokens = jnp.pad(tokens, ((0, pad_global), (0, 0)))
+        topk_ids = jnp.pad(topk_ids, ((0, pad_global), (0, 0)),
+                           constant_values=0)
+        topk_weights = jnp.pad(topk_weights, ((0, pad_global), (0, 0)),
+                               constant_values=0.0)
+
     if block_config is None:
         block_config = FusedMoEBlockConfig(
             bt=min(16, local_num_tokens),
@@ -1718,10 +1731,13 @@ def fused_ep_moe_v2(
         (num_experts, bt, t_packing, h_per_t), t_dtype,
     )
 
-    return kernel(
+    result = kernel(
         tokens, w1, w2, w3,
         w1_scale, w2_scale, w3_scale,
         topk_weights, topk_ids,
         a2a_s_hbm_scratch, a2a_s_acc_hbm_scratch, a2a_g_hbm_scratch,
         w1_shared, w3_shared, w2_shared,
     )
+    if pad_local > 0:
+        result = result[:orig_num_tokens]
+    return result
