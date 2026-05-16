@@ -1739,5 +1739,17 @@ def fused_ep_moe_v2(
         w1_shared, w3_shared, w2_shared,
     )
     if pad_local > 0:
-        result = result[:orig_num_tokens]
+        orig_local = orig_num_tokens // ep_size
+        ep_spec = P((dp_axis_name, tp_axis_name))
+
+        @jax.shard_map(
+            mesh=mesh,
+            in_specs=(ep_spec,),
+            out_specs=ep_spec,
+            check_vma=False,
+        )
+        def _unpad(x):
+            return x[:orig_local]
+
+        result = _unpad(result)
     return result
