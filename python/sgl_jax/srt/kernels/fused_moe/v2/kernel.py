@@ -753,10 +753,10 @@ def _fused_ep_moe_kernel(
             num_bts_tiles = (dyn_sz_i32 + (bts - 1)) // bts
             num_btc_per_bts = bts // btc
 
-            # bts loop is OUTER (dynamic), bf loop is INNER (dynamic).
+            # bts loop is OUTER (dynamic), bf loop is INNER (static unroll).
             # Tokens load once per bts tile, reused across all bf tiles.
-            # bf is a fori_loop (not static unroll) to keep code size small,
-            # enabling bt=512 to compile (1 A2A round on ep=32).
+            # Weights re-prefetch per bts tile (redundant when num_bts_tiles=1,
+            # which is the common case — avg ~20 tokens per expert).
             def bts_body(bts_id, __):
                 tile_start = bts_id * bts
 
@@ -780,7 +780,7 @@ def _fused_ep_moe_kernel(
                     start_fetch_w3(local_e_id, 1, 1)
                     start_fetch_w2(local_e_id, 1, 1, priority=0)
 
-                def bf_body(bf_id, ___):
+                for bf_id in range(num_bf):
                     slot = bf_id % 2
 
                     wait_fetch_w1(slot)
@@ -788,7 +788,7 @@ def _fused_ep_moe_kernel(
                     wait_fetch_w2(slot)
 
                     # Gate/up
-                    def gate_up_btc(btc_id, ____):
+                    def gate_up_btc(btc_id, ___):
                         gate = jnp.zeros((btc, bf), dtype=jnp.float32)
                         up = jnp.zeros((btc, bf), dtype=jnp.float32)
                         for p_id in range(t_packing):
@@ -805,9 +805,8 @@ def _fused_ep_moe_kernel(
 
                     lax.fori_loop(0, num_btc_per_bts, gate_up_btc, None)
 
-                    # Load prev partial from HBM (bf_id > 0 only)
-                    @pl.when(bf_id > 0)
-                    def _():
+                    # Load prev partial from HBM (bf_id > 0)
+                    if bf_id > 0:
                         pltpu.make_async_copy(
                             src_ref=a2a_s_acc_x2_hbm.at[e_sem_id, pl.ds(tile_start, bts)],
                             dst_ref=b_y_stage_vmem,
@@ -819,7 +818,7 @@ def _fused_ep_moe_kernel(
                         ).wait()
 
                     # Act+down
-                    def act_down_btc(btc_id, ____):
+                    def act_down_btc(btc_id, ___):
                         gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
                         up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
                         act = activation_fn(gate, up_val, act_fn)
@@ -831,16 +830,19 @@ def _fused_ep_moe_kernel(
                             acc_ref = b_y_acc_vmem.at[
                                 pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
                             ]
-                            prev = b_y_stage_vmem[
-                                pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
-                            ].astype(jnp.float32)
-                            acc_ref[...] = jnp.where(bf_id == 0, partial, prev + partial)
+                            if bf_id == 0:
+                                acc_ref[...] = partial
+                            else:
+                                prev = b_y_stage_vmem[
+                                    pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
+                                ]
+                                acc_ref[...] = prev.astype(jnp.float32) + partial
                         return None
 
                     lax.fori_loop(0, num_btc_per_bts, act_down_btc, None)
 
                     # Writeback: f32 → bf16, then DMA to HBM
-                    def writeback_btc(btc_id, ____):
+                    def writeback_btc(btc_id, ___):
                         for p_id in range(t_packing):
                             acc_slice = b_y_acc_vmem[
                                 pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
@@ -863,15 +865,11 @@ def _fused_ep_moe_kernel(
                     ).wait()
 
                     # Prefetch next bf tile
-                    @pl.when(bf_id + 2 < num_bf)
-                    def _():
-                        start_fetch_w1(local_e_id, slot, bf_id + 2)
-                        start_fetch_w3(local_e_id, slot, bf_id + 2)
-                        start_fetch_w2(local_e_id, slot, bf_id + 2, priority=0)
-
-                    return None
-
-                lax.fori_loop(0, num_bf, bf_body, None)
+                    next_bf_id = bf_id + 2
+                    if next_bf_id < num_bf:
+                        start_fetch_w1(local_e_id, slot, next_bf_id)
+                        start_fetch_w3(local_e_id, slot, next_bf_id)
+                        start_fetch_w2(local_e_id, slot, next_bf_id, priority=0)
 
                 return None
 
