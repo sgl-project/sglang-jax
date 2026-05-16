@@ -3465,6 +3465,39 @@ def fused_ep_moe(
             topk_weights, ((0, 0), (0, padded_top_k - top_k)), mode="constant", constant_values=0
         )
 
+    def _reshard_ep(x):
+        if x is None:
+            return None
+        sharding = jax.sharding.NamedSharding(
+            mesh, P((dp_axis_name, tp_axis_name), *([None] * (x.ndim - 1)))
+        )
+        return jax.reshard(x, sharding)
+
+    def _reshard_replicated(x):
+        if x is None:
+            return None
+        sharding = jax.sharding.NamedSharding(mesh, P(*([None] * x.ndim)))
+        return jax.reshard(x, sharding)
+
+    tokens = _reshard_ep(tokens)
+    w1 = _reshard_ep(w1)
+    w2 = _reshard_ep(w2)
+    w3 = _reshard_ep(w3)
+    w1_scale = _reshard_ep(w1_scale)
+    w2_scale = _reshard_ep(w2_scale)
+    w3_scale = _reshard_ep(w3_scale)
+    b1 = _reshard_ep(b1)
+    b2 = _reshard_ep(b2)
+    b3 = _reshard_ep(b3)
+    topk_weights = _reshard_ep(topk_weights)
+    topk_ids = _reshard_ep(topk_ids)
+    w1_shared = _reshard_replicated(w1_shared)
+    w3_shared = _reshard_replicated(w3_shared)
+    w2_shared = _reshard_replicated(w2_shared)
+    w1_shared_scale = _reshard_replicated(w1_shared_scale)
+    w3_shared_scale = _reshard_replicated(w3_shared_scale)
+    w2_shared_scale = _reshard_replicated(w2_shared_scale)
+
     b1_scratch = None if b1 is None else pltpu.VMEM((2, 1, block_config.bf), jnp.float32)
     b3_scratch = None if b3 is None else pltpu.VMEM((2, 1, block_config.bf), jnp.float32)
     b2_scratch = None if b2 is None else pltpu.VMEM((2, t_packing, 1, bd2_per_pack), jnp.float32)

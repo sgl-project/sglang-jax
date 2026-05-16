@@ -10,7 +10,6 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest, parameterized
 from jax import lax
-from jax._src import test_util as jtu
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
@@ -32,6 +31,14 @@ def cdiv(a, b):
 
 def align_to(x, a):
     return cdiv(x, a) * a
+
+
+def is_tpu_at_least(version):
+    if not jax.devices():
+        return False
+    device_kind = jax.devices()[0].device_kind
+    match = re.search(r"TPU\s*v?(\d+)", device_kind)
+    return match is not None and int(match.group(1)) >= version
 
 
 def gen_moe_inputs(
@@ -133,8 +140,7 @@ def sub_channel_quantize(x, quant_dtype, wsz=256):
     return jnp.concat(w_lst, axis=-2), jnp.expand_dims(jnp.concat(scale_lst, axis=-2), axis=-2)
 
 
-@jtu.with_config(jax_numpy_dtype_promotion="standard")
-class MoEKernelTest(jtu.JaxTestCase):
+class MoEKernelTest(parameterized.TestCase):
 
     def setUp(self):
         super().setUp()
@@ -316,9 +322,12 @@ class MoEKernelTest(jtu.JaxTestCase):
             x = lax.all_gather(x, axis_name="data", axis=0, tiled=True)
             return x
 
+        expected = jax.reshard(
+            expected, jax.sharding.NamedSharding(self.mesh, P(("data", "tensor"), None))
+        )
         actual_host = np.asarray(jax.device_get(_replicate_tokens(actual)))
         expected_host = np.asarray(jax.device_get(_replicate_tokens(expected)))
-        self.assertAllClose(actual_host, expected_host, atol=atol, rtol=rtol)
+        np.testing.assert_allclose(actual_host, expected_host, atol=atol, rtol=rtol)
 
     @parameterized.product(
         renormalize_topk_logits=[True, False],
@@ -498,7 +507,7 @@ class MoEKernelTest(jtu.JaxTestCase):
         w_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2, jnp.float4_e2m1fn],
     )
     def test_sub_channel_quantization(self, w_dtype):
-        if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
+        if w_dtype == jnp.float4_e2m1fn and not is_tpu_at_least(version=7):
             self.skipTest("float4 requires TPUv7+")
         dtype = jnp.bfloat16
         top_k = 8
@@ -539,7 +548,7 @@ class MoEKernelTest(jtu.JaxTestCase):
         With bd1c=1024 and quant_block_k=256, n_sg = 1024/2/256 = 2.
         With bfc=1024 and quant_block_k=256, n_sg2 = 1024/256 = 4.
         """
-        if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
+        if w_dtype == jnp.float4_e2m1fn and not is_tpu_at_least(version=7):
             self.skipTest("float4 requires TPUv7+")
         dtype = jnp.bfloat16
         top_k = 8
@@ -578,7 +587,7 @@ class MoEKernelTest(jtu.JaxTestCase):
         With bd1c=512 and quant_block_k=128, n_sg = 512/2/128 = 2.
         With bfc=256 and quant_block_k=128, n_sg2 = 256/128 = 2.
         """
-        if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
+        if w_dtype == jnp.float4_e2m1fn and not is_tpu_at_least(version=7):
             self.skipTest("float4 requires TPUv7+")
         dtype = jnp.bfloat16
         top_k = 8
@@ -617,7 +626,7 @@ class MoEKernelTest(jtu.JaxTestCase):
         With bd1c=1024 and quant_block_k=128, n_sg = 1024/2/128 = 4.
         With bfc=1024 and quant_block_k=128, n_sg2 = 1024/128 = 8.
         """
-        if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
+        if w_dtype == jnp.float4_e2m1fn and not is_tpu_at_least(version=7):
             self.skipTest("float4 requires TPUv7+")
         dtype = jnp.bfloat16
         top_k = 8
@@ -651,7 +660,7 @@ class MoEKernelTest(jtu.JaxTestCase):
         w_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2, jnp.float4_e2m1fn],
     )
     def test_shared_expert_quantized(self, w_dtype):
-        if w_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(version=7):
+        if w_dtype == jnp.float4_e2m1fn and not is_tpu_at_least(version=7):
             self.skipTest("float4 requires TPUv7+")
         dtype = jnp.bfloat16
         top_k = 8
@@ -719,7 +728,7 @@ class MoEKernelTest(jtu.JaxTestCase):
         except Exception as e:
             self.skipTest(f"safetensors is required for this test: {e}")
 
-        if not jtu.is_device_tpu_at_least(version=7):
+        if not is_tpu_at_least(version=7):
             self.skipTest("Expect TPUv7+ for fused MoE kernel.")
 
         layer_idx = int(os.getenv("SGLANG_TEST_LAYER_IDX", "0"))
@@ -860,7 +869,7 @@ class MoEKernelTest(jtu.JaxTestCase):
         )
 
         # Bring both to host for comparison (single-host smoke).
-        self.assertAllClose(
+        np.testing.assert_allclose(
             np.asarray(jax.device_get(actual)),
             np.asarray(jax.device_get(expected)),
             atol=3e-1,
@@ -897,4 +906,4 @@ class MoEKernelTest(jtu.JaxTestCase):
 
 
 if __name__ == "__main__":
-    absltest.main(testLoader=jtu.JaxTestLoader())
+    absltest.main()
