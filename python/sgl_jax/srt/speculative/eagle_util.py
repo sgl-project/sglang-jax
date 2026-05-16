@@ -241,6 +241,7 @@ def build_tree_mask_for_draft_decode(
     topk: int,
     speculative_step_id: int,
     parents_list: Sequence[jax.Array],
+    max_mask_len: int = 0,
 ) -> jax.Array:
     """
     Build flattened custom mask for draft decode that respects branch ancestry.
@@ -250,6 +251,8 @@ def build_tree_mask_for_draft_decode(
         topk: Number of speculative branches processed in parallel.
         speculative_step_id: Current speculative step (0-indexed).
         parents_list: List of parent index tensors produced by ``select_top_k_tokens``.
+        max_mask_len: If positive, pad the output to this fixed length with zeros
+            to keep the shape stable across decode steps and avoid JAX recompilation.
 
     Returns:
         Flattened boolean mask concatenating ``topk`` rows per request.
@@ -295,6 +298,14 @@ def build_tree_mask_for_draft_decode(
         return jnp.zeros((0,), dtype=jnp.bool_)
 
     concatenated = np.concatenate(masks)
+    if max_mask_len > 0:
+        pad_len = max_mask_len - len(concatenated)
+        if pad_len < 0:
+            raise ValueError(
+                f"mask length {len(concatenated)} exceeds max_mask_len {max_mask_len}"
+            )
+        if pad_len > 0:
+            concatenated = np.pad(concatenated, (0, pad_len))
     return jnp.asarray(concatenated, dtype=jnp.int32)
 
 

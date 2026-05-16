@@ -88,6 +88,8 @@ class EagleDraftWorker(BaseDraftWorker):
         self.precompile_cache_loc_paddings = precompile_cache_loc_paddings
         self.precompile_token_paddings = precompile_token_paddings
 
+        self._max_kv_per_req = self.max_req_len + self.speculative_num_steps * self.topk
+
     def _share_embed_head(self, target_worker: ModelWorker):
         embed, head = target_worker.model_runner.model.get_embed_and_head()
 
@@ -333,15 +335,6 @@ class EagleDraftWorker(BaseDraftWorker):
         topk_index = spec_info.topk_index
         if self.hot_token_ids is not None:
             model_worker_batch.spec_info.topk_index = self.hot_token_ids[topk_index]
-        if self.topk > 1:
-            self.draft_model_runner.attn_backend.forward_metadata.custom_mask = (
-                build_tree_mask_for_draft_decode(
-                    model_worker_batch.seq_lens,
-                    topk=topk_index.shape[1],
-                    speculative_step_id=0,
-                    parents_list=None,
-                )
-            )
         bs = self.precompile_bs_paddings[padding_bs_index]
         if bs - model_worker_batch.spec_info.verified_id.shape[0] > 0:
             model_worker_batch.spec_info.verified_id = np.pad(
@@ -394,6 +387,7 @@ class EagleDraftWorker(BaseDraftWorker):
             model_worker_batch.spec_info.hidden_states,
         )
         bs = model_worker_batch.seq_lens.shape[0]
+        max_mask_len = bs * self.topk * self._max_kv_per_req
         step_min_1 = self.speculative_num_steps - 1
         score_list: jax.Array = jnp.empty((bs, 1 + step_min_1 * self.topk, self.topk))
         token_list: jax.Array = jnp.empty(
@@ -441,6 +435,7 @@ class EagleDraftWorker(BaseDraftWorker):
                     topk=self.topk,
                     speculative_step_id=i,
                     parents_list=parents_history,
+                    max_mask_len=max_mask_len,
                 )
             self.draft_model_runner.attn_backend.forward_metadata = metadata
 

@@ -388,10 +388,28 @@ class TestDraftDecodeMask(CustomTestCase):
 
         self.assertEqual(mask.tolist(), expected.tolist())
 
-
-class TestEagleMultiStepMetadata(CustomTestCase):
+    def test_padding_to_fixed_size(self):
+        mask_unpadded = build_tree_mask_for_draft_decode(
+            seq_lens=jnp.array([6]),
+            topk=3,
+            speculative_step_id=0,
+            parents_list=[jnp.arange(-1, 3, dtype=jnp.int32)[None, :]],
+        )
+        fixed_len = len(mask_unpadded) + 100
+        mask_padded = build_tree_mask_for_draft_decode(
+            seq_lens=jnp.array([6]),
+            topk=3,
+            speculative_step_id=0,
+            parents_list=[jnp.arange(-1, 3, dtype=jnp.int32)[None, :]],
+            max_mask_len=fixed_len,
+        )
+        self.assertEqual(mask_padded.shape[0], fixed_len)
+        self.assertEqual(
+            mask_padded[: len(mask_unpadded)].tolist(), mask_unpadded.tolist()
+        )
+        self.assertTrue(all(v == 0 for v in mask_padded[len(mask_unpadded) :].tolist()))
     def test_topk_metadata_uses_full_tree_kv_span(self):
-        mesh = create_device_mesh(ici_parallelism=[-1, 1], dcn_parallelism=[1, 1])
+        mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
         backend = FlashAttention(
             num_attn_heads=1,
             num_kv_heads=1,
