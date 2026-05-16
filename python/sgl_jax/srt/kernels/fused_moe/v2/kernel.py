@@ -1679,11 +1679,12 @@ def fused_ep_moe_v2(
             tokens = jnp.pad(tokens, ((0, pad_local), (0, 0), (0, 0)))
             topk_weights = jnp.pad(topk_weights, ((0, pad_local), (0, 0)),
                                    constant_values=0.0)
-            # Spread padded expert IDs across all experts to avoid
-            # overflowing any single expert's a2a buffer.
-            n_cols = topk_ids.shape[1]
-            pad_ids = (jnp.arange(pad_local * n_cols, dtype=jnp.int32)
-                       .reshape(pad_local, n_cols) % num_experts)
+            # Route padded tokens to the same experts as real tokens
+            # (cyclic repeat) so no NEW experts are activated.
+            pad_ids = jnp.tile(
+                topk_ids,
+                (-(-pad_local // orig_local_num_tokens), 1),
+            )[:pad_local]
             topk_ids = jnp.concatenate([topk_ids, pad_ids], axis=0)
 
         if needs_jax_allreduce:
