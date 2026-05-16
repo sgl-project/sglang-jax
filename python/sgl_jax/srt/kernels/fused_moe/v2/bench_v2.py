@@ -46,25 +46,50 @@ key = jax.random.key(42)
 k1, k2, k3, k4, k5 = jax.random.split(key, 5)
 
 log("creating arrays...")
-tokens = jax.random.normal(k1, (num_tokens, d), dtype=jnp.bfloat16)
-w1 = jax.random.normal(k2, (E, d, f), dtype=jnp.bfloat16) * 0.01
-w2 = jax.random.normal(k3, (E, f, d), dtype=jnp.bfloat16) * 0.01
-w3 = jax.random.normal(k4, (E, d, f), dtype=jnp.bfloat16) * 0.01
 
-gating = jax.random.normal(k5, (num_tokens, E), dtype=jnp.float32)
+def make_sharded(key, shape, dtype, scale=1.0):
+    """Create a sharded array — each process generates only its local shard."""
+    local_shape = (shape[0] // num_devices, *shape[1:])
+    per_device_arrays = []
+    for i, dev in enumerate(jax.local_devices()):
+        shard_key = jax.random.fold_in(key, jax.process_index() * len(jax.local_devices()) + i)
+        shard = jax.device_put(
+            jax.random.normal(shard_key, local_shape, dtype=dtype) * scale,
+            dev,
+        )
+        per_device_arrays.append(shard)
+    return jax.make_array_from_single_device_arrays(
+        shape, ep_sharding, per_device_arrays,
+    )
+
+tokens = make_sharded(k1, (num_tokens, d), jnp.bfloat16)
+w1 = make_sharded(k2, (E, d, f), jnp.bfloat16, 0.01)
+w2 = make_sharded(k3, (E, f, d), jnp.bfloat16, 0.01)
+w3 = make_sharded(k4, (E, d, f), jnp.bfloat16, 0.01)
+
+gating_local_shape = (num_tokens // num_devices,  E)
+gating_per_dev = []
+for i, dev in enumerate(jax.local_devices()):
+    shard_key = jax.random.fold_in(k5, jax.process_index() * len(jax.local_devices()) + i)
+    gating_per_dev.append(jax.device_put(
+        jax.random.normal(shard_key, gating_local_shape, dtype=jnp.float32), dev,
+    ))
+gating = jax.make_array_from_single_device_arrays(
+    (num_tokens, E), ep_sharding, gating_per_dev,
+)
 _, topk_idx = lax.top_k(gating, top_k)
 topk_logits = jnp.take_along_axis(gating, topk_idx, axis=-1)
 topk_wts = jax.nn.softmax(topk_logits, axis=-1)
 
 ep_sharding = jax.sharding.NamedSharding(mesh, P(("data", "tensor")))
 
-log("sharding arrays...")
-tokens_s = jax.device_put(tokens, ep_sharding)
-w1_s = jax.device_put(w1, ep_sharding)
-w2_s = jax.device_put(w2, ep_sharding)
-w3_s = jax.device_put(w3, ep_sharding)
-topk_wts_s = jax.device_put(topk_wts, ep_sharding)
-topk_idx_s = jax.device_put(topk_idx, ep_sharding)
+log("arrays ready (pre-sharded)")
+tokens_s = tokens
+w1_s = w1
+w2_s = w2
+w3_s = w3
+topk_wts_s = topk_wts
+topk_idx_s = topk_idx
 
 bc = FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse)
 
@@ -97,12 +122,18 @@ if jax.process_index() == 0:
     log(f"wall time: min={min(times_ms):.2f} ms, avg={np.mean(times_ms):.2f} ms, max={max(times_ms):.2f} ms")
 
 if check_correctness:
-    log("computing reference...")
-    ref = ref_moe(tokens, w1, w2, w3, topk_wts, topk_idx, top_k)
-    result_gathered = jax.device_get(
-        jax.device_put(result, jax.sharding.NamedSharding(mesh, P()))
-    )
-    if jax.process_index() == 0:
+    if jax.process_count() > 1:
+        log("SKIP correctness check in multi-host mode (use single-host ep=8)")
+    else:
+        log("computing reference...")
+        ref = ref_moe(
+            jax.device_get(tokens), jax.device_get(w1),
+            jax.device_get(w2), jax.device_get(w3),
+            jax.device_get(topk_wts), jax.device_get(topk_idx), top_k,
+        )
+        result_gathered = jax.device_get(
+            jax.device_put(result, jax.sharding.NamedSharding(mesh, P()))
+        )
         result_f32 = result_gathered.astype(np.float32)
         ref_f32 = np.asarray(ref).astype(np.float32)
         max_err = np.max(np.abs(result_f32 - ref_f32))
