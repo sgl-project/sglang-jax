@@ -11,6 +11,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import expand_block_scale
 from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
+from sgl_jax.srt.utils.jax_utils import effective_axis
 from sgl_jax.srt.utils.parallel_utils import prepare_scattered_spec_if_needed
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
@@ -294,8 +295,9 @@ class QuantizedLinear(nnx.Module):
                     effective_weight_block_size is not None
                     and len(effective_weight_block_size) == 2
                 ):
-                    block_n, block_k = int(effective_weight_block_size[0]), int(
-                        effective_weight_block_size[1]
+                    block_n, block_k = (
+                        int(effective_weight_block_size[0]),
+                        int(effective_weight_block_size[1]),
                     )
                     in_blocks = (in_features + block_k - 1) // block_k
                     # Pre-expanded kernel-ready layout: [in_blocks, 1, n_out].
@@ -325,8 +327,9 @@ class QuantizedLinear(nnx.Module):
                     effective_weight_block_size is not None
                     and len(effective_weight_block_size) == 2
                 ):
-                    block_n, block_k = int(effective_weight_block_size[0]), int(
-                        effective_weight_block_size[1]
+                    block_n, block_k = (
+                        int(effective_weight_block_size[0]),
+                        int(effective_weight_block_size[1]),
                     )
                     out_blocks = (weight_q.shape[0] + block_n - 1) // block_n
                     in_blocks = (weight_q.shape[1] + block_k - 1) // block_k
@@ -413,16 +416,22 @@ class QuantizedLinear(nnx.Module):
         # kernel_axes = (input_axis, output_axis):
         #   row-parallel  (e.g., o_proj): ("tensor", None)
         #   col-parallel  (e.g., q_proj): (None, "tensor")
+        # JAX 0.9.1+ enforces in_specs match actual input sharding.
         input_axis, output_axis = self.kernel_axes[0], self.kernel_axes[1]
+        eff_data = effective_axis(x_2d, 0, "data")
+        eff_w_out = effective_axis(self.weight_q.value, 0, output_axis)
+        eff_w_in = effective_axis(self.weight_q.value, 1, input_axis)
         if scale_val.ndim == 3:  # noqa: SIM108
             # Pre-expanded block scale: [in_blocks, 1, n_out]
-            w_scale_spec = P(input_axis, None, output_axis)
+            scale_in = effective_axis(scale_val, 0, input_axis)
+            scale_out = effective_axis(scale_val, 2, output_axis)
+            w_scale_spec = P(scale_in, None, scale_out)
         else:
             # Per-channel scale: [n_out]
-            w_scale_spec = P(output_axis)
-        in_specs = (P("data", input_axis), P(output_axis, input_axis), w_scale_spec)
-
-        out_specs = P("data", output_axis)
+            scale_out = effective_axis(scale_val, 0, output_axis)
+            w_scale_spec = P(scale_out)
+        in_specs = (P(eff_data, eff_w_in), P(eff_w_out, eff_w_in), w_scale_spec)
+        out_specs = P(eff_data, eff_w_out)
 
         # When ``output_scatter_dimension`` is set, stack ``input_axis`` onto
         # whatever already partitions that dim (e.g. ``"data"`` from DP) so

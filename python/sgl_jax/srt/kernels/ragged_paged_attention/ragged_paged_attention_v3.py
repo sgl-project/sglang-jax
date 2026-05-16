@@ -27,6 +27,7 @@ from enum import Enum
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -108,30 +109,39 @@ def ref_ragged_paged_attention(
     attention_sink: jax.Array | float | None = None,
 ):
     """Reference implementation for ragged paged attention."""
+    # Move metadata to host first. This is a non-jitted reference function
+    # and should not depend on device sharding for scalar indexing.
+    kv_lens = np.asarray(jax.device_get(kv_lens))
+    cu_q_lens = np.asarray(jax.device_get(cu_q_lens))
+    page_indices = np.asarray(jax.device_get(page_indices))
+    num_seqs = np.asarray(jax.device_get(num_seqs))
+
     if not causal:
+        total_kv_len = int(np.cumsum(kv_lens)[-1])
         assert (
-            custom_mask is not None and custom_mask.size > jnp.cumsum(kv_lens)[-1]
-        ), f"use custom_mask, custom_mask length {custom_mask.size=} must larger than total kv length {jnp.cumsum(kv_lens)[-1]=}"
+            custom_mask is not None and custom_mask.size > total_kv_len
+        ), f"use custom_mask, custom_mask length {custom_mask.size=} must larger than total kv length {total_kv_len=}"
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
     _, _, num_kv_heads, head_dim = k_pages.shape
     num_q_heads = queries.shape[1]
     assert num_q_heads % num_kv_heads == 0
     num_query_per_kv = num_q_heads // num_kv_heads
+
     outputs = []
     mask_len_list = []
-    for i in range(num_seqs[0]):
-        kv_len = kv_lens[i]
-        q_len = cu_q_lens[i + 1] - cu_q_lens[i]
+    for i in range(int(num_seqs[0])):
+        kv_len = int(kv_lens[i])
+        q_len = int(cu_q_lens[i + 1] - cu_q_lens[i])
         mask_len_list.append(q_len * kv_len)
     mask_lens = jnp.array(mask_len_list, dtype=jnp.int32)
     cu_mask_lens = jnp.concatenate([jnp.array([0], dtype=jnp.int32), jnp.cumsum(mask_lens)])
 
-    for i in range(num_seqs[0]):
-        q_start = cu_q_lens[i]
-        q_end = cu_q_lens[i + 1]
+    for i in range(int(num_seqs[0])):
+        q_start = int(cu_q_lens[i])
+        q_end = int(cu_q_lens[i + 1])
         q_len = q_end - q_start
-        kv_len = kv_lens[i]
+        kv_len = int(kv_lens[i])
         indices = page_indices[i]
         q = queries[q_start:q_end]
         k = k_pages[indices, :, :, :].reshape(-1, num_kv_heads, head_dim)[:kv_len]

@@ -417,11 +417,22 @@ class TestAttention(CustomTestCase):
         # write prefix tokens (k, v are unsharded for safe slicing)
         extend_k, extend_v = write_prefix_tokens_for_kv(forward_batch, token_to_kv_pool, lens, k, v)
 
-        # Shard q/extend_k/extend_v with P("data", "tensor") to match production in_specs
-        dp_sharding = NamedSharding(mesh, P("data", "tensor"))
-        q_shard = jax.device_put(q, dp_sharding)
-        extend_k = jax.device_put(extend_k, dp_sharding)
-        extend_v = jax.device_put(extend_v, dp_sharding)
+        # Shard q/extend_k/extend_v with P("data", "tensor") to match production in_specs.
+        # Fall back to P("data") when head count is not divisible by tensor axis size,
+        # or when local q heads would not be divisible by local kv heads (GQA constraint).
+        axis_size = mesh.shape.get("tensor", 1)
+        kv_tensor = "tensor" if num_kv_heads % axis_size == 0 else None
+        if num_heads % axis_size == 0:
+            local_q = num_heads // axis_size
+            local_kv = num_kv_heads // axis_size if kv_tensor is not None else num_kv_heads
+            q_tensor = "tensor" if local_q % local_kv == 0 else None
+        else:
+            q_tensor = None
+        q_sharding = NamedSharding(mesh, P("data", q_tensor, None))
+        kv_sharding = NamedSharding(mesh, P("data", kv_tensor, None))
+        q_shard = jax.device_put(q, q_sharding)
+        extend_k = jax.device_put(extend_k, kv_sharding)
+        extend_v = jax.device_put(extend_v, kv_sharding)
 
         # JAX attention
         attn = RadixAttention(

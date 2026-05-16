@@ -19,7 +19,7 @@ from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.utils import cdiv
-from sgl_jax.srt.utils.jax_utils import device_array
+from sgl_jax.srt.utils.jax_utils import device_array, effective_axis
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 logger = logging.getLogger(__name__)
@@ -537,33 +537,78 @@ class FlashAttention(AttentionBackend):
         elif hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
             page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
 
+        # JAX 0.9.1+ enforces shard_map in_specs match actual input sharding.
+        # Derive effective axes from the actual array sharding rather than
+        # divisibility, so specs always match what JAX assigned.
+        axis = self.kv_partition_axis
+        dpa = self.attention_data_partition_axis
+
+        # q and kv may have different head counts (GQA), so compute axes
+        # independently. q_axis also requires local_q_heads % local_kv_heads
+        # == 0 after sharding, otherwise the kernel sees an invalid head ratio.
+        q_data = effective_axis(q, 0, dpa)
+        q_axis = effective_axis(q, 1, axis)
+        kv_data = effective_axis(k, 0, dpa)
+        kv_axis = effective_axis(k, 1, axis)
+        v_data = effective_axis(v, 0, dpa)
+        v_axis = effective_axis(v, 1, axis)
+        # GQA head ratio: if q is tensor-sharded, verify local heads are valid.
+        if q_axis is not None:
+            axis_size = self.mesh.shape.get(axis, 1) if self.mesh else 1
+            local_q = q.shape[1] // axis_size
+            local_kv = k.shape[1] // axis_size if kv_axis is not None else k.shape[1]
+            if local_q % local_kv != 0:
+                if self.mesh is not None and q_data is not None:
+                    q = jax.reshard(q, NamedSharding(self.mesh, P(q_data, None, None)))
+                q_axis = None
+        # v must be consistent with k on the tensor axis.
+        if kv_axis != v_axis:
+            v_axis = kv_axis
+
+        # kv_cache: [pages, page_size, heads*2//packing, packing, head_dim]
+        cache_data = effective_axis(kv_cache_fused, 0, dpa)
+        cache_axis = effective_axis(kv_cache_fused, 2, axis)
+
+        # attention_sink: [num_q_heads] — derive from actual sharding
+        sink_axis = effective_axis(attention_sink, 0, axis) if attention_sink is not None else None
+        if attention_sink is not None and q_axis is None and sink_axis is not None:
+            if self.mesh is not None:
+                attention_sink = jax.reshard(attention_sink, NamedSharding(self.mesh, P()))
+            sink_axis = None
+
+        # Metadata arrays: derive from actual sharding
+        kv_lens_dpa = effective_axis(self.forward_metadata.seq_lens, 0, dpa)
+        page_idx_dpa = effective_axis(page_indices_arg, 0, dpa)
+        cu_q_dpa = effective_axis(self.forward_metadata.cu_q_lens, 0, dpa)
+        cu_kv_dpa = effective_axis(self.forward_metadata.cu_kv_lens, 0, dpa)
+        dist_dpa = effective_axis(self.forward_metadata.distribution, 0, dpa)
+        custom_mask_dpa = (
+            effective_axis(self.forward_metadata.custom_mask, 0, dpa)
+            if self.forward_metadata.custom_mask is not None
+            else None
+        )
+
         in_specs = (
-            P(self.attention_data_partition_axis, self.kv_partition_axis),  # queries
-            P(self.attention_data_partition_axis, self.kv_partition_axis),  # keys (new tokens)
-            P(self.attention_data_partition_axis, self.kv_partition_axis),  # values (new tokens)
-            P(
-                self.attention_data_partition_axis, None, self.kv_partition_axis, None, None
-            ),  # kv_cache_fused (head interleaved)
-            P(self.attention_data_partition_axis),  # kv_lens
-            P(self.attention_data_partition_axis),  # page_indices
-            P(self.attention_data_partition_axis),  # cu_q_lens
-            P(self.attention_data_partition_axis),  # cu_kv_lens
-            P(self.attention_data_partition_axis),  # distribution
+            P(q_data, q_axis),  # queries
+            P(kv_data, kv_axis),  # keys (new tokens)
+            P(v_data, v_axis),  # values (new tokens)
+            P(cache_data, None, cache_axis, None, None),  # kv_cache_fused
+            P(kv_lens_dpa),  # kv_lens
+            P(page_idx_dpa),  # page_indices
+            P(cu_q_dpa),  # cu_q_lens
+            P(cu_kv_dpa),  # cu_kv_lens
+            P(dist_dpa),  # distribution
             (
-                P(self.attention_data_partition_axis)
+                P(custom_mask_dpa)
                 if self.forward_metadata.custom_mask is not None
                 else P()
-            ),  # custom_mask: DP-segmented per-rank (cu_seq_mask_lens is rank-local)
-            (
-                P(self.kv_partition_axis) if attention_sink is not None else P()
-            ),  # attention sink: (num_q_heads,), sharded by heads
+            ),  # custom_mask: DP-segmented per-rank when present
+            P(sink_axis) if attention_sink is not None else P(),  # attention sink
         )
 
         out_specs = (
-            P(self.attention_data_partition_axis, self.kv_partition_axis),  # attention output
-            P(
-                self.attention_data_partition_axis, None, self.kv_partition_axis, None, None
-            ),  # updated kv_cache_fused (head interleaved) - 3D: [total_tokens, num_kv_heads*2, head_dim]
+            P(q_data, q_axis),  # attention output
+            P(cache_data, None, cache_axis, None, None),  # updated kv_cache_fused
         )
 
         mask_aligned_to_cu_kv = (
@@ -571,9 +616,27 @@ class FlashAttention(AttentionBackend):
             and forward_batch.forward_mode.is_target_verify()
         )
 
+        # args layout follows in_specs order: q, k, v, kv_cache, ...,
+        # attention_sink (always last, may be None with P() spec).
         def _ragged_paged_attention_with_fused_kv(*args):
             queries, keys, values, kv_cache_fused = args[:4]
-            other_args = args[4:]
+            other_args = args[4:-1]
+            local_attention_sink = args[-1]
+
+            # When q is tensor-sharded and attention_sink is replicated,
+            # slice to the local shard's heads so the kernel sees aligned dims.
+            if (
+                local_attention_sink is not None
+                and q_axis is not None
+                and sink_axis is None
+                and local_attention_sink.shape[0] >= queries.shape[1]
+            ):
+                local_q_heads = queries.shape[1]
+                tensor_idx = jax.lax.axis_index(axis)
+                start = tensor_idx * local_q_heads
+                local_attention_sink = jax.lax.dynamic_slice_in_dim(
+                    local_attention_sink, start, local_q_heads, axis=0
+                )
 
             # Call fused KV kernel with head interleaving
             result, updated_kv_cache_fused = ragged_paged_attention_v3(
@@ -582,6 +645,7 @@ class FlashAttention(AttentionBackend):
                 values,
                 kv_cache_fused,
                 *other_args,
+                attention_sink=local_attention_sink,
                 causal=causal,
                 sm_scale=scale,
                 sliding_window=layer.sliding_window_size,

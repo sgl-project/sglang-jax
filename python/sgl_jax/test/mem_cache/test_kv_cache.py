@@ -2,18 +2,12 @@ import unittest
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.ragged_paged_attention.util import align_to, get_dtype_packing
 from sgl_jax.srt.mem_cache.memory_pool import merge_kv
 from sgl_jax.srt.mem_cache.memory_pool import (
     update_fused_kv_cache_vectorized as update_fused_kv_cache,
 )
-from sgl_jax.srt.utils.mesh_utils import create_device_mesh
-
-mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
-jax.sharding.set_mesh(mesh)
 
 
 def _make_fused_cache(cache_size, num_heads, head_dim, page_size, dtype=jnp.bfloat16):
@@ -22,8 +16,7 @@ def _make_fused_cache(cache_size, num_heads, head_dim, page_size, dtype=jnp.bflo
     head_dim_aligned = align_to(head_dim, 128)
     num_pages = (cache_size + page_size - 1) // page_size + 1  # +1 sentinel page
     shape = (num_pages, page_size, num_heads * 2 // packing, packing, head_dim_aligned)
-    cache = jnp.zeros(shape, dtype=dtype)
-    return jax.device_put(cache, P(None, None, "tensor", None, None))
+    return jnp.zeros(shape, dtype=dtype)
 
 
 def _extract_kv_from_fused(fused_cache):
@@ -33,14 +26,9 @@ def _extract_kv_from_fused(fused_cache):
     """
     num_pages, page_size, heads_x2_per_pack, packing, head_dim = fused_cache.shape
     total_tokens = num_pages * page_size
-    flat = jax.lax.reshape(
-        fused_cache,
-        (total_tokens, heads_x2_per_pack * packing, head_dim),
-        out_sharding=P(None, "tensor", None),
-    )
-    kv_sharding = NamedSharding(mesh, P(None, "tensor", None))
-    k = flat.at[:, ::2, :].get(out_sharding=kv_sharding)
-    v = flat.at[:, 1::2, :].get(out_sharding=kv_sharding)
+    flat = fused_cache.reshape(total_tokens, heads_x2_per_pack * packing, head_dim)
+    k = flat[:, ::2, :]
+    v = flat[:, 1::2, :]
     return k, v
 
 
@@ -97,12 +85,9 @@ class TestKVCache(unittest.TestCase):
 
         # Merge k/v into 5D fused format
         fused_kv = merge_kv(k, v)
-        fused_kv = jax.device_put(fused_kv, P(None, None, "tensor", None, None))
 
         # Create 5D fused cache
         kv_cache = _make_fused_cache(cache_size, self.num_heads, self.head_dim, page_size)
-
-        loc = jax.device_put(loc, P(None))
 
         return fused_kv, loc, kv_cache, k, v
 
@@ -208,7 +193,6 @@ class TestKVCache(unittest.TestCase):
 
         cache_size = total_tokens + 50
         fused_kv = merge_kv(k, v)
-        fused_kv = jax.device_put(fused_kv, P(None, None, "tensor", None, None))
 
         for page_size in [1, 2, 4, 8]:
             with self.subTest(page_size=page_size):

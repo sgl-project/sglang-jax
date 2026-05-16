@@ -354,6 +354,7 @@ class MHATokenToKVPool(KVCache):
         self.head_dim = head_dim
         self.dp_size = dp_size
         self.kv_partition_axis = "tensor"
+        self.effective_kv_partition_axis = "tensor"
         self.attention_data_partition_axis = "data"
 
         self._create_buffers()
@@ -369,6 +370,7 @@ class MHATokenToKVPool(KVCache):
             "head_dim": self.head_dim,
             "dp_size": self.dp_size,
             "kv_partition_axis": self.kv_partition_axis,
+            "effective_kv_partition_axis": self.effective_kv_partition_axis,
             "attention_data_partition_axis": self.attention_data_partition_axis,
             "kv_sharding": self.kv_sharding,
         }
@@ -398,6 +400,9 @@ class MHATokenToKVPool(KVCache):
         obj.head_dim = aux_data["head_dim"]
         obj.dp_size = aux_data.get("dp_size", 1)
         obj.kv_partition_axis = aux_data["kv_partition_axis"]
+        obj.effective_kv_partition_axis = aux_data.get(
+            "effective_kv_partition_axis", aux_data["kv_partition_axis"]
+        )
         obj.attention_data_partition_axis = aux_data.get("attention_data_partition_axis", "data")
         obj.kv_sharding = aux_data["kv_sharding"]
 
@@ -407,9 +412,25 @@ class MHATokenToKVPool(KVCache):
 
     def _create_buffers(self):
         """Create sharded fused KV cache buffers with proper distributed allocation"""
+        # Determine if the tensor axis dimension is large enough to shard.
+        # When head_num * 2 // packing is not divisible by the mesh tensor axis
+        # size (e.g. num_kv_heads=1 on 8 devices), fall back to replicated.
+        packing = get_dtype_packing(self.dtype)
+        tensor_dim = self.head_num * 2 // packing
+        tensor_axis_size = self.mesh.shape.get(self.kv_partition_axis, 1)
+        self.effective_kv_partition_axis = (
+            self.kv_partition_axis if tensor_dim % tensor_axis_size == 0 else None
+        )
+
         self.kv_sharding = NamedSharding(
             self.mesh,
-            P(self.attention_data_partition_axis, None, self.kv_partition_axis, None, None),
+            P(
+                self.attention_data_partition_axis,
+                None,
+                self.effective_kv_partition_axis,
+                None,
+                None,
+            ),
         )
 
         logger.info("Creating fused KV buffers for %s layers", self.layer_num)
@@ -420,7 +441,6 @@ class MHATokenToKVPool(KVCache):
         ), "Cache size must be divisible by dp_size and size must be divisible by page size"
 
         # Hack: this shape is more friendly to rpav3
-        packing = get_dtype_packing(self.dtype)
         fused_buffer_shape = (
             (self.size + self.page_size * self.dp_size) // self.page_size,
             self.page_size,
@@ -529,7 +549,7 @@ class MHATokenToKVPool(KVCache):
             loc=loc,
             kv_cache=self.kv_buffer[layer_idx],
             page_size=page_size,
-            kv_partition_axis=self.kv_partition_axis,
+            kv_partition_axis=self.effective_kv_partition_axis,
             attention_data_partition_axis=self.attention_data_partition_axis,
             mesh=self.mesh,
         )
@@ -586,21 +606,21 @@ class MHATokenToKVPool(KVCache):
         cache_3d = jax.lax.reshape(
             cache_5d,
             (total_cache_tokens, heads_x2_per_pack * packing, head_dim),
-            out_sharding=P(None, self.kv_partition_axis, None),
+            out_sharding=P(None, self.effective_kv_partition_axis, None),
         )
 
         num_tokens, _one, fkv_h, fkv_p, fkv_d = fused_kv.shape
         fused_kv_3d = jax.lax.reshape(
             fused_kv,
             (num_tokens, fkv_h * fkv_p, fkv_d),
-            out_sharding=P(None, self.kv_partition_axis, None),
+            out_sharding=P(None, self.effective_kv_partition_axis, None),
         )
 
         safe_loc = jnp.where(loc >= 0, loc, jnp.int32(total_cache_tokens))
         updated_3d = cache_3d.at[safe_loc].set(
             fused_kv_3d,
             mode="drop",
-            out_sharding=P(None, self.kv_partition_axis, None),
+            out_sharding=P(None, self.effective_kv_partition_axis, None),
         )
 
         # Reshape back to 5D
@@ -608,7 +628,11 @@ class MHATokenToKVPool(KVCache):
             updated_3d,
             (num_pages, page_size, heads_x2_per_pack, packing, head_dim),
             out_sharding=P(
-                self.attention_data_partition_axis, None, self.kv_partition_axis, None, None
+                self.attention_data_partition_axis,
+                None,
+                self.effective_kv_partition_axis,
+                None,
+                None,
             ),
         )
 
@@ -803,7 +827,7 @@ def _set_fused_kv_buffer(
     loc: jax.Array,
     kv_cache: jax.Array,
     page_size: int,
-    kv_partition_axis: str = "tensor",
+    kv_partition_axis: str | None = "tensor",
     attention_data_partition_axis: str = "data",
     mesh: Mesh = None,
 ) -> jax.Array:
@@ -815,7 +839,7 @@ def _set_fused_kv_buffer(
         loc: Location indices [total_tokens], -1 for padding tokens
         kv_cache: Fused KV cache buffer, 5D [pages, page_size, heads//pack, pack, hdim]
         page_size: Page size for vectorized updates
-        kv_partition_axis: Partition axis for sharding
+        kv_partition_axis: Partition axis for sharding (None = replicated)
 
     Returns:
         Updated fused KV cache (5D)
@@ -836,7 +860,7 @@ def update_fused_kv_cache(
     loc: jax.Array,  # [total_tokens], -1 for padding
     kv_cache: jax.Array,  # [num_pages, page_size, heads*2//packing, packing, head_dim]
     page_size: int = 1,
-    kv_partition_axis: str = "tensor",
+    kv_partition_axis: str | None = "tensor",
     data_partition_axis: str = "data",
     mesh: Mesh = None,
 ) -> jax.Array:
@@ -939,7 +963,7 @@ def update_fused_kv_cache_vectorized(
     loc: jax.Array,  # [total_tokens], -1 for padding
     kv_cache: jax.Array,  # [num_pages, page_size, heads*2//packing, packing, head_dim]
     page_size: int,
-    kv_partition_axis: str = "tensor",
+    kv_partition_axis: str | None = "tensor",
     data_partition_axis: str = "data",
     mesh: Mesh = None,
 ) -> jax.Array:
@@ -948,20 +972,7 @@ def update_fused_kv_cache_vectorized(
     by grouping contiguous tokens into page-sized chunks for efficient updates.
     """
 
-    @jax.shard_map(
-        in_specs=(
-            # fused_kv: 5D sharded by data and tensor
-            P(data_partition_axis, None, kv_partition_axis, None, None),
-            # loc: sharded by data
-            P(data_partition_axis),
-            # kv_cache: 5D sharded by data and tensor
-            P(data_partition_axis, None, kv_partition_axis, None, None),
-        ),
-        out_specs=P(data_partition_axis, None, kv_partition_axis, None, None),
-        mesh=mesh,
-        check_vma=False,
-    )
-    def _sharded_update(local_fused_kv, local_loc, local_kv_cache):
+    def _local_update(local_fused_kv, local_loc, local_kv_cache):
         total_tokens = local_loc.shape[0]
         local_loc_int = local_loc.astype(jnp.int32)
 
@@ -994,7 +1005,34 @@ def update_fused_kv_cache_vectorized(
             num_slices_per_block=num_slices_per_block,
         )
 
-    return _sharded_update(fused_kv, loc, kv_cache)
+    if mesh is None:
+        # Local/reference path used by tests and non-distributed callers.
+        # Do not wrap with shard_map because inputs may be replicated on data axis.
+        return _local_update(fused_kv, loc, kv_cache)
+
+    # JAX 0.9.1+ enforces that in_specs match actual input sharding.
+    # Defensive check: if the tensor axis dimension is not divisible by the
+    # mesh axis size, fall back to replicated. This handles callers that pass
+    # kv_partition_axis="tensor" without checking divisibility (e.g. tests).
+    if kv_partition_axis is not None:
+        tensor_dim = fused_kv.shape[2]
+        axis_size = mesh.shape.get(kv_partition_axis, 1)
+        if tensor_dim % axis_size != 0:
+            kv_partition_axis = None
+
+    # Multi-device: wrap with shard_map for SPMD execution.
+    sharded = jax.shard_map(
+        _local_update,
+        in_specs=(
+            P(data_partition_axis, None, kv_partition_axis, None, None),
+            P(data_partition_axis),
+            P(data_partition_axis, None, kv_partition_axis, None, None),
+        ),
+        out_specs=P(data_partition_axis, None, kv_partition_axis, None, None),
+        mesh=mesh,
+        check_vma=False,
+    )
+    return sharded(fused_kv, loc, kv_cache)
 
 
 @register_pytree_node_class

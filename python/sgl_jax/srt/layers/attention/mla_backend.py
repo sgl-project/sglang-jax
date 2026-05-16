@@ -28,7 +28,7 @@ from jax.tree_util import register_pytree_node_class
 from sgl_jax.srt.kernels.mla.v2.kernel import cdiv, mla_ragged_paged_attention
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
-from sgl_jax.srt.utils.jax_utils import device_array
+from sgl_jax.srt.utils.jax_utils import device_array, effective_axis
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 if TYPE_CHECKING:
@@ -307,21 +307,33 @@ class MLAAttentionBackend(AttentionBackend):
 
         dpa = self.attention_data_partition_axis
 
+        # JAX 0.9.1+ enforces shard_map in_specs match actual input sharding.
+        # Derive effective axes from the actual array sharding rather than
+        # divisibility, so specs always match what JAX assigned.
+        effective_dpa = effective_axis(ql_nope, 0, dpa)
+        effective_tensor = effective_axis(ql_nope, 1, "tensor")
+        cache_dpa = effective_axis(cache, 0, dpa)
+        seq_lens_dpa = effective_axis(self.forward_metadata.seq_lens, 0, dpa)
+        page_idx_dpa = effective_axis(self.forward_metadata.page_indices, 0, dpa)
+        cu_q_dpa = effective_axis(self.forward_metadata.cu_q_lens, 0, dpa)
+        cu_kv_dpa = effective_axis(self.forward_metadata.cu_kv_lens, 0, dpa)
+        dist_dpa = effective_axis(self.forward_metadata.distribution, 0, dpa)
+
         in_specs = (
-            P(dpa, "tensor", None),  # ql_nope    [T, n_h/tp, lkv]
-            P(dpa, "tensor", None),  # q_pe       [T, n_h/tp, r]
-            P(dpa, None),  # new_kv_c   [T, lkv]  (single latent, no head axis)
-            P(dpa, None),  # new_k_pe   [T, r]    (single latent)
-            P(dpa, None, None, None),  # cache (page axis sharded by data)
-            P(dpa),  # seq_lens
-            P(dpa),  # page_indices
-            P(dpa),  # cu_q_lens
-            P(dpa),  # cu_kv_lens
-            P(dpa),  # distribution
+            P(effective_dpa, effective_tensor, None),  # ql_nope    [T, n_h/tp, lkv]
+            P(effective_dpa, effective_tensor, None),  # q_pe       [T, n_h/tp, r]
+            P(effective_dpa, None),  # new_kv_c   [T, lkv]  (single latent)
+            P(effective_dpa, None),  # new_k_pe   [T, r]    (single latent)
+            P(cache_dpa, None, None, None),  # cache (page axis)
+            P(seq_lens_dpa),  # seq_lens
+            P(page_idx_dpa),  # page_indices
+            P(cu_q_dpa),  # cu_q_lens
+            P(cu_kv_dpa),  # cu_kv_lens
+            P(dist_dpa),  # distribution
         )
         out_specs = (
-            P(dpa, "tensor", None),  # o_latent       [T, n_h/tp, lkv]
-            P(dpa, None, None, None),  # updated cache  4D
+            P(effective_dpa, effective_tensor, None),  # o_latent  [T, n_h/tp, lkv]
+            P(cache_dpa, None, None, None),  # updated cache  4D
         )
 
         def _run(
