@@ -1679,8 +1679,11 @@ def fused_ep_moe_v2(
             tokens = jnp.pad(tokens, ((0, pad_local), (0, 0), (0, 0)))
             topk_weights = jnp.pad(topk_weights, ((0, pad_local), (0, 0)),
                                    constant_values=0.0)
-            topk_ids = jnp.pad(topk_ids, ((0, pad_local), (0, 0)),
-                               constant_values=0)
+            # Spread padded expert IDs across all experts to avoid
+            # overflowing any single expert's a2a buffer.
+            pad_ids = (jnp.arange(pad_local * top_k, dtype=jnp.int32)
+                       .reshape(pad_local, top_k) % num_experts)
+            topk_ids = jnp.concatenate([topk_ids, pad_ids], axis=0)
 
         if needs_jax_allreduce:
             md_starts, md_sizes, md_d2e = jax_allreduce_metadata_by_bt(
