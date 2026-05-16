@@ -1445,17 +1445,11 @@ def fused_ep_moe_v2(
     local_num_tokens = num_tokens // ep_size
 
     _BTC_ALIGN = 8
-    orig_num_tokens = num_tokens
+    orig_local_num_tokens = local_num_tokens
     pad_local = (_BTC_ALIGN - local_num_tokens % _BTC_ALIGN) % _BTC_ALIGN
     if pad_local > 0:
-        pad_global = pad_local * ep_size
-        num_tokens = num_tokens + pad_global
         local_num_tokens = local_num_tokens + pad_local
-        tokens = jnp.pad(tokens, ((0, pad_global), (0, 0)))
-        topk_ids = jnp.pad(topk_ids, ((0, pad_global), (0, 0)),
-                           constant_values=0)
-        topk_weights = jnp.pad(topk_weights, ((0, pad_global), (0, 0)),
-                               constant_values=0.0)
+        num_tokens = local_num_tokens * ep_size
 
     if block_config is None:
         block_config = FusedMoEBlockConfig(
@@ -1681,6 +1675,13 @@ def fused_ep_moe_v2(
         a2a_s_hbm_scratch, a2a_s_acc_hbm_scratch, a2a_g_hbm_scratch,
         w1_shared=None, w3_shared=None, w2_shared=None,
     ):
+        if pad_local > 0:
+            tokens = jnp.pad(tokens, ((0, pad_local), (0, 0), (0, 0)))
+            topk_weights = jnp.pad(topk_weights, ((0, pad_local), (0, 0)),
+                                   constant_values=0.0)
+            topk_ids = jnp.pad(topk_ids, ((0, pad_local), (0, 0)),
+                               constant_values=0)
+
         if needs_jax_allreduce:
             md_starts, md_sizes, md_d2e = jax_allreduce_metadata_by_bt(
                 topk_ids[:, :top_k], padded_num_experts, bt,
@@ -1694,7 +1695,7 @@ def fused_ep_moe_v2(
             md_sizes_arg = None
             md_d2e_arg = None
 
-        return fused_moe(
+        out = fused_moe(
             pltpu.with_memory_space_constraint(tokens, pltpu.HBM),
             pltpu.with_memory_space_constraint(w1, pltpu.HBM),
             pltpu.with_memory_space_constraint(w2, pltpu.HBM),
@@ -1720,6 +1721,9 @@ def fused_ep_moe_v2(
             md_sizes_arg,
             md_d2e_arg,
         )
+        if pad_local > 0:
+            out = out[:orig_local_num_tokens]
+        return out
 
     a2a_s_hbm_scratch = pl.empty(
         (expert_buffer_count, a2a_max_tokens, t_packing, h_per_t), t_dtype,
@@ -1731,25 +1735,10 @@ def fused_ep_moe_v2(
         (num_experts, bt, t_packing, h_per_t), t_dtype,
     )
 
-    result = kernel(
+    return kernel(
         tokens, w1, w2, w3,
         w1_scale, w2_scale, w3_scale,
         topk_weights, topk_ids,
         a2a_s_hbm_scratch, a2a_s_acc_hbm_scratch, a2a_g_hbm_scratch,
         w1_shared, w3_shared, w2_shared,
     )
-    if pad_local > 0:
-        orig_local = orig_num_tokens // ep_size
-        ep_spec = P((dp_axis_name, tp_axis_name))
-
-        @jax.shard_map(
-            mesh=mesh,
-            in_specs=(ep_spec,),
-            out_specs=ep_spec,
-            check_vma=False,
-        )
-        def _unpad(x):
-            return x[:orig_local]
-
-        result = _unpad(result)
-    return result
