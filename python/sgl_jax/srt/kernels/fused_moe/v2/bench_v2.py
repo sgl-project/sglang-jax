@@ -35,6 +35,8 @@ bt = int(os.environ.get("BENCH_BT", "128"))
 bf = int(os.environ.get("BENCH_BF", "256"))
 btc = int(os.environ.get("BENCH_BTC", "128"))
 bse = int(os.environ.get("BENCH_BSE", "256"))
+bts_env = os.environ.get("BENCH_BTS")
+bts = int(bts_env) if bts_env else None
 num_tokens = int(os.environ.get("BENCH_TOKENS", str(bt * ep_size)))
 warmup = int(os.environ.get("BENCH_WARMUP", "2"))
 iters = int(os.environ.get("BENCH_ITERS", "5"))
@@ -91,7 +93,7 @@ w3_s = w3
 topk_wts_s = topk_wts
 topk_idx_s = topk_idx
 
-bc = FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse)
+bc = FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse, bts=bts)
 
 log("warmup (compile + run)...")
 for i in range(warmup):
