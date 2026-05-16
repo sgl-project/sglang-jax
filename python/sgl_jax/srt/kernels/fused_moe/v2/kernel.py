@@ -753,39 +753,41 @@ def _fused_ep_moe_kernel(
             num_bts_tiles = (dyn_sz_i32 + (bts - 1)) // bts
             num_btc_per_bts = bts // btc
 
-            # --- Prologue: prefetch first bf tile weights ---
-            start_fetch_w1(local_e_id, 0, 0, priority=1)
-            start_fetch_w3(local_e_id, 0, 0, priority=1)
-            start_fetch_w2(local_e_id, 0, 0, priority=1)
-            if num_bf >= 2:
-                start_fetch_w1(local_e_id, 1, 1)
-                start_fetch_w3(local_e_id, 1, 1)
-                start_fetch_w2(local_e_id, 1, 1, priority=0)
+            # bts loop is OUTER (dynamic), bf loop is INNER (static unroll).
+            # Tokens load once per bts tile, reused across all bf tiles.
+            # Weights re-prefetch per bts tile (redundant when num_bts_tiles=1,
+            # which is the common case — avg ~20 tokens per expert).
+            def bts_body(bts_id, __):
+                tile_start = bts_id * bts
 
-            # --- Process bf tiles ---
-            for bf_id in range(num_bf):
-                slot = bf_id % 2
+                # Load tokens for this bts tile (once, reused across all bf tiles)
+                pltpu.make_async_copy(
+                    src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(tile_start, bts)],
+                    dst_ref=b_x_vmem,
+                    sem=x_stage_sem.at[0],
+                ).start(priority=1)
+                pltpu.make_async_copy(
+                    src_ref=b_x_vmem, dst_ref=b_x_vmem,
+                    sem=x_stage_sem.at[0],
+                ).wait()
 
-                wait_fetch_w1(slot)
-                wait_fetch_w3(slot)
-                wait_fetch_w2(slot)
+                # Weight prologue: prefetch first bf tile
+                start_fetch_w1(local_e_id, 0, 0, priority=1)
+                start_fetch_w3(local_e_id, 0, 0, priority=1)
+                start_fetch_w2(local_e_id, 0, 0, priority=1)
+                if num_bf >= 2:
+                    start_fetch_w1(local_e_id, 1, 1)
+                    start_fetch_w3(local_e_id, 1, 1)
+                    start_fetch_w2(local_e_id, 1, 1, priority=0)
 
-                # --- bts-tiled processing ---
-                def bts_body(bts_id, __):
-                    tile_start = bts_id * bts
+                for bf_id in range(num_bf):
+                    slot = bf_id % 2
 
-                    # Load tokens for this bts tile from HBM
-                    pltpu.make_async_copy(
-                        src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(tile_start, bts)],
-                        dst_ref=b_x_vmem,
-                        sem=x_stage_sem.at[0],
-                    ).start(priority=1)
-                    pltpu.make_async_copy(
-                        src_ref=b_x_vmem, dst_ref=b_x_vmem,
-                        sem=x_stage_sem.at[0],
-                    ).wait()
+                    wait_fetch_w1(slot)
+                    wait_fetch_w3(slot)
+                    wait_fetch_w2(slot)
 
-                    # Phase 1: gate/up for this bts tile
+                    # Gate/up
                     def gate_up_btc(btc_id, ___):
                         gate = jnp.zeros((btc, bf), dtype=jnp.float32)
                         up = jnp.zeros((btc, bf), dtype=jnp.float32)
@@ -803,7 +805,7 @@ def _fused_ep_moe_kernel(
 
                     lax.fori_loop(0, num_btc_per_bts, gate_up_btc, None)
 
-                    # Load prev partial from HBM (bf_id > 0 only)
+                    # Load prev partial from HBM (bf_id > 0)
                     if bf_id > 0:
                         pltpu.make_async_copy(
                             src_ref=a2a_s_acc_x2_hbm.at[e_sem_id, pl.ds(tile_start, bts)],
@@ -815,7 +817,7 @@ def _fused_ep_moe_kernel(
                             sem=x_stage_sem.at[0],
                         ).wait()
 
-                    # Phase 2: activation + down projection for this bts tile
+                    # Act+down
                     def act_down_btc(btc_id, ___):
                         gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
                         up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
@@ -839,7 +841,7 @@ def _fused_ep_moe_kernel(
 
                     lax.fori_loop(0, num_btc_per_bts, act_down_btc, None)
 
-                    # Writeback: cast f32 → bf16 into y_stage, then DMA to HBM
+                    # Writeback: f32 → bf16, then DMA to HBM
                     def writeback_btc(btc_id, ___):
                         for p_id in range(t_packing):
                             acc_slice = b_y_acc_vmem[
@@ -862,16 +864,16 @@ def _fused_ep_moe_kernel(
                         sem=y_store_sem.at[0],
                     ).wait()
 
-                    return None
+                    # Prefetch next bf tile
+                    next_bf_id = bf_id + 2
+                    if next_bf_id < num_bf:
+                        start_fetch_w1(local_e_id, slot, next_bf_id)
+                        start_fetch_w3(local_e_id, slot, next_bf_id)
+                        start_fetch_w2(local_e_id, slot, next_bf_id, priority=0)
 
-                lax.fori_loop(0, num_bts_tiles, bts_body, None)
+                return None
 
-                # Prefetch next bf tile into SAME slot (now freed)
-                next_bf_id = bf_id + 2
-                if next_bf_id < num_bf:
-                    start_fetch_w1(local_e_id, slot, next_bf_id)
-                    start_fetch_w3(local_e_id, slot, next_bf_id)
-                    start_fetch_w2(local_e_id, slot, next_bf_id, priority=0)
+            lax.fori_loop(0, num_bts_tiles, bts_body, None)
 
             return jnp.int32(0)
 
