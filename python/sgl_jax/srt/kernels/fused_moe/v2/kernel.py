@@ -805,19 +805,7 @@ def _fused_ep_moe_kernel(
 
                     lax.fori_loop(0, num_btc_per_bts, gate_up_btc, None)
 
-                    # Load prev partial from HBM (bf_id > 0)
-                    if bf_id > 0:
-                        pltpu.make_async_copy(
-                            src_ref=a2a_s_acc_x2_hbm.at[e_sem_id, pl.ds(tile_start, bts)],
-                            dst_ref=b_y_stage_vmem,
-                            sem=x_stage_sem.at[0],
-                        ).start()
-                        pltpu.make_async_copy(
-                            src_ref=b_y_stage_vmem, dst_ref=b_y_stage_vmem,
-                            sem=x_stage_sem.at[0],
-                        ).wait()
-
-                    # Act+down
+                    # Act+down — accumulate in VMEM f32 across bf tiles
                     def act_down_btc(btc_id, ___):
                         gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
                         up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
@@ -833,36 +821,10 @@ def _fused_ep_moe_kernel(
                             if bf_id == 0:
                                 acc_ref[...] = partial
                             else:
-                                prev = b_y_stage_vmem[
-                                    pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
-                                ]
-                                acc_ref[...] = prev.astype(jnp.float32) + partial
+                                acc_ref[...] = acc_ref[...] + partial
                         return None
 
                     lax.fori_loop(0, num_btc_per_bts, act_down_btc, None)
-
-                    # Writeback: f32 → bf16, then DMA to HBM
-                    def writeback_btc(btc_id, ___):
-                        for p_id in range(t_packing):
-                            acc_slice = b_y_acc_vmem[
-                                pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
-                            ]
-                            b_y_stage_vmem.at[
-                                pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
-                            ][...] = acc_slice.astype(t_dtype)
-                        return None
-
-                    lax.fori_loop(0, num_btc_per_bts, writeback_btc, None)
-
-                    pltpu.make_async_copy(
-                        src_ref=b_y_stage_vmem,
-                        dst_ref=a2a_s_acc_x2_hbm.at[e_sem_id, pl.ds(tile_start, bts)],
-                        sem=y_store_sem.at[0],
-                    ).start()
-                    pltpu.make_async_copy(
-                        src_ref=b_y_stage_vmem, dst_ref=b_y_stage_vmem,
-                        sem=y_store_sem.at[0],
-                    ).wait()
 
                     # Prefetch next bf tile
                     next_bf_id = bf_id + 2
@@ -870,6 +832,29 @@ def _fused_ep_moe_kernel(
                         start_fetch_w1(local_e_id, slot, next_bf_id)
                         start_fetch_w3(local_e_id, slot, next_bf_id)
                         start_fetch_w2(local_e_id, slot, next_bf_id, priority=0)
+
+                # Final writeback: f32 → bf16, then DMA to HBM (once per bts tile)
+                def writeback_btc(btc_id, ___):
+                    for p_id in range(t_packing):
+                        acc_slice = b_y_acc_vmem[
+                            pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
+                        ]
+                        b_y_stage_vmem.at[
+                            pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
+                        ][...] = acc_slice.astype(t_dtype)
+                    return None
+
+                lax.fori_loop(0, num_btc_per_bts, writeback_btc, None)
+
+                pltpu.make_async_copy(
+                    src_ref=b_y_stage_vmem,
+                    dst_ref=a2a_s_acc_x2_hbm.at[e_sem_id, pl.ds(tile_start, bts)],
+                    sem=y_store_sem.at[0],
+                ).start()
+                pltpu.make_async_copy(
+                    src_ref=b_y_stage_vmem, dst_ref=b_y_stage_vmem,
+                    sem=y_store_sem.at[0],
+                ).wait()
 
                 return None
 
