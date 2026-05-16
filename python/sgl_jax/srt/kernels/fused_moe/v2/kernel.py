@@ -1,11 +1,12 @@
-"""Fused EP MoE v2 kernel — bf16 only, Strix-style double-buffer expert FFN.
+"""Fused EP MoE v2 kernel — Strix-style double-buffer expert FFN.
 
 Key differences from v1:
-- bf16 weights only (no fp8 quantization, no biases)
 - Strix-style weight streaming: tile along intermediate dim (bf), keep tokens
   persistent in VMEM, double-buffer W1/W3/W2 with deferred W2 wait
 - No bd1/bd2 hidden-dim tiling for weights — full hidden_size loaded per bf tile
 - Gate/up accumulators enable W2 DMA overlap with gate/up MXU compute
+- fp8 support via dequant-in-VMEM: load fp8 from HBM, dequant to bf16 in VMEM,
+  then single large dot (same compute path as bf16)
 """
 
 from __future__ import annotations
@@ -255,6 +256,10 @@ def _fused_ep_moe_kernel(
     b_w1_scale_x2_vmem,    # None | (2, t_packing, h_per_t // qbk, 1, bf) f32
     b_w3_scale_x2_vmem,    # None | (2, t_packing, h_per_t // qbk, 1, bf) f32
     b_w2_scale_x2_vmem,    # None | (2, t_packing, bf // qbk, 1, h_per_t) f32
+    # Dequant scratch (single-buf, populated after DMA wait, None when not quantized)
+    b_w1_dq_vmem,          # None | (t_packing, h_per_t, bf) bf16
+    b_w3_dq_vmem,          # None | (t_packing, h_per_t, bf) bf16
+    b_w2_dq_vmem,          # None | (t_packing, bf, h_per_t) bf16
     # Gate/up accumulators (per bts tile)
     b_gate_acc_vmem,       # (bts, bf) f32
     b_up_acc_vmem,         # (bts, bf) f32
@@ -800,6 +805,50 @@ def _fused_ep_moe_kernel(
                 sem=local_sems.at[slot, 6],
             ).wait()
 
+    # ===== Dequant fp8 → bf16 in VMEM (after DMA wait, before dot) =====
+
+    def dequant_w1(slot):
+        if w1_scale_hbm is None:
+            return
+        for p in range(t_packing):
+            def _dq_w1(sg_id, _):
+                sg_off = sg_id * quant_block_k
+                w_fp8 = b_w1_x2_vmem[slot, p, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)]
+                s = b_w1_scale_x2_vmem[slot, p, pl.ds(sg_id, 1), 0, pl.ds(0, bf)]
+                s = s.reshape(1, bf)
+                w_bf16 = (w_fp8.astype(jnp.float32) * jnp.broadcast_to(s, (quant_block_k, bf))).astype(jnp.bfloat16)
+                b_w1_dq_vmem.at[p, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)][...] = w_bf16
+                return None
+            lax.fori_loop(0, n_sg, _dq_w1, None, unroll=n_sg)
+
+    def dequant_w3(slot):
+        if w3_scale_hbm is None:
+            return
+        for p in range(t_packing):
+            def _dq_w3(sg_id, _):
+                sg_off = sg_id * quant_block_k
+                w_fp8 = b_w3_x2_vmem[slot, p, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)]
+                s = b_w3_scale_x2_vmem[slot, p, pl.ds(sg_id, 1), 0, pl.ds(0, bf)]
+                s = s.reshape(1, bf)
+                w_bf16 = (w_fp8.astype(jnp.float32) * jnp.broadcast_to(s, (quant_block_k, bf))).astype(jnp.bfloat16)
+                b_w3_dq_vmem.at[p, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)][...] = w_bf16
+                return None
+            lax.fori_loop(0, n_sg, _dq_w3, None, unroll=n_sg)
+
+    def dequant_w2(slot):
+        if w2_scale_hbm is None:
+            return
+        for p in range(t_packing):
+            def _dq_w2(sg_id, _):
+                sg_off = sg_id * quant_block_k
+                w_fp8 = b_w2_x2_vmem[slot, p, pl.ds(sg_off, quant_block_k), pl.ds(0, h_per_t)]
+                s = b_w2_scale_x2_vmem[slot, p, pl.ds(sg_id, 1), 0, pl.ds(0, h_per_t)]
+                s = s.reshape(1, h_per_t)
+                w_bf16 = (w_fp8.astype(jnp.float32) * jnp.broadcast_to(s, (quant_block_k, h_per_t))).astype(jnp.bfloat16)
+                b_w2_dq_vmem.at[p, pl.ds(sg_off, quant_block_k), pl.ds(0, h_per_t)][...] = w_bf16
+                return None
+            lax.fori_loop(0, n_sg2, _dq_w2, None, unroll=n_sg2)
+
     # ===== Expert FFN: Strix-style double-buffer pipeline =====
 
     def expert_ffn(bt_sem_id, e_sem_id, local_e_id):
@@ -857,49 +906,22 @@ def _fused_ep_moe_kernel(
                     wait_fetch_w3(slot)
                     wait_fetch_w2(slot)
 
+                    dequant_w1(slot)
+                    dequant_w3(slot)
+                    dequant_w2(slot)
+
                     # Gate/up
                     def gate_up_btc(btc_id, ___):
                         gate = jnp.zeros((btc, bf), dtype=jnp.float32)
                         up = jnp.zeros((btc, bf), dtype=jnp.float32)
                         for p_id in range(t_packing):
-                            if w1_scale_hbm is None:
-                                x_slice = b_x_vmem[
-                                    pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
-                                ]
-                                w1_slice = b_w1_x2_vmem[slot, p_id]
-                                w3_slice = b_w3_x2_vmem[slot, p_id]
-                                gate += jnp.dot(x_slice, w1_slice, preferred_element_type=jnp.float32)
-                                up += jnp.dot(x_slice, w3_slice, preferred_element_type=jnp.float32)
-                            else:
-                                def _sg_body_gu(sg_id, carry):
-                                    g, u = carry
-                                    sg_off = sg_id * quant_block_k
-                                    x_g = b_x_vmem[
-                                        pl.ds(btc_id * btc, btc),
-                                        p_id,
-                                        pl.ds(sg_off, quant_block_k),
-                                    ]
-                                    d1 = jnp.dot(
-                                        x_g,
-                                        b_w1_x2_vmem[slot, p_id, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)],
-                                        preferred_element_type=jnp.float32,
-                                    )
-                                    s1 = b_w1_scale_x2_vmem[slot, p_id, pl.ds(sg_id, 1), 0, pl.ds(0, bf)]
-                                    s1 = s1.reshape(1, bf)
-                                    g = g + d1 * jnp.broadcast_to(s1, d1.shape)
-                                    d3 = jnp.dot(
-                                        x_g,
-                                        b_w3_x2_vmem[slot, p_id, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)],
-                                        preferred_element_type=jnp.float32,
-                                    )
-                                    s3 = b_w3_scale_x2_vmem[slot, p_id, pl.ds(sg_id, 1), 0, pl.ds(0, bf)]
-                                    s3 = s3.reshape(1, bf)
-                                    u = u + d3 * jnp.broadcast_to(s3, d3.shape)
-                                    return (g, u)
-                                gate, up = lax.fori_loop(
-                                    0, n_sg, _sg_body_gu,
-                                    (gate, up), unroll=n_sg,
-                                )
+                            x_slice = b_x_vmem[
+                                pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
+                            ]
+                            w1_tile = b_w1_dq_vmem[p_id] if w1_scale_hbm is not None else b_w1_x2_vmem[slot, p_id]
+                            w3_tile = b_w3_dq_vmem[p_id] if w3_scale_hbm is not None else b_w3_x2_vmem[slot, p_id]
+                            gate += jnp.dot(x_slice, w1_tile, preferred_element_type=jnp.float32)
+                            up += jnp.dot(x_slice, w3_tile, preferred_element_type=jnp.float32)
                         b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
                         b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
                         return None
@@ -908,61 +930,21 @@ def _fused_ep_moe_kernel(
 
                     # Act+down — accumulate in VMEM f32 across bf tiles
                     def act_down_btc(btc_id, ___):
-                        if w2_scale_hbm is None:
-                            gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
-                            up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
-                            act = activation_fn(gate, up_val, act_fn)
-                            for p_id in range(t_packing):
-                                w2_slice = b_w2_x2_vmem[slot, p_id]
-                                partial = jnp.dot(
-                                    act, w2_slice, preferred_element_type=jnp.float32,
-                                )
-                                acc_ref = b_y_acc_vmem.at[
-                                    pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
-                                ]
-                                if bf_id == 0:
-                                    acc_ref[...] = partial
-                                else:
-                                    acc_ref[...] = acc_ref[...] + partial
-                        else:
-                            for p_id in range(t_packing):
-                                def _sg2_body(sg_id, sg_acc):
-                                    sg_off = sg_id * quant_block_k
-                                    gate_g = b_gate_acc_vmem[
-                                        pl.ds(btc_id * btc, btc),
-                                        pl.ds(sg_off, quant_block_k),
-                                    ]
-                                    up_g = b_up_acc_vmem[
-                                        pl.ds(btc_id * btc, btc),
-                                        pl.ds(sg_off, quant_block_k),
-                                    ]
-                                    act_g = activation_fn(gate_g, up_g, act_fn)
-                                    w2_g = b_w2_x2_vmem[
-                                        slot, p_id,
-                                        pl.ds(sg_off, quant_block_k),
-                                        pl.ds(0, h_per_t),
-                                    ]
-                                    d = jnp.dot(
-                                        act_g, w2_g,
-                                        preferred_element_type=jnp.float32,
-                                    )
-                                    s = b_w2_scale_x2_vmem[
-                                        slot, p_id, pl.ds(sg_id, 1), 0, pl.ds(0, h_per_t)
-                                    ]
-                                    s = s.reshape(1, h_per_t)
-                                    return sg_acc + d * jnp.broadcast_to(s, d.shape)
-                                partial = lax.fori_loop(
-                                    0, n_sg2, _sg2_body,
-                                    jnp.zeros((btc, h_per_t), dtype=jnp.float32),
-                                    unroll=n_sg2,
-                                )
-                                acc_ref = b_y_acc_vmem.at[
-                                    pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
-                                ]
-                                if bf_id == 0:
-                                    acc_ref[...] = partial
-                                else:
-                                    acc_ref[...] = acc_ref[...] + partial
+                        gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
+                        up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
+                        act = activation_fn(gate, up_val, act_fn)
+                        for p_id in range(t_packing):
+                            w2_tile = b_w2_dq_vmem[p_id] if w2_scale_hbm is not None else b_w2_x2_vmem[slot, p_id]
+                            partial = jnp.dot(
+                                act, w2_tile, preferred_element_type=jnp.float32,
+                            )
+                            acc_ref = b_y_acc_vmem.at[
+                                pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
+                            ]
+                            if bf_id == 0:
+                                acc_ref[...] = partial
+                            else:
+                                acc_ref[...] = acc_ref[...] + partial
                         return None
 
                     lax.fori_loop(0, num_btc_per_bts, act_down_btc, None)
@@ -1566,6 +1548,13 @@ def fused_ep_moe_v2(
             pltpu.VMEM((2, t_packing, h_per_t // quant_block_k, 1, bf), jnp.float32)),  # W3 scale
         (None if w2_scale is None else
             pltpu.VMEM((2, t_packing, bf // quant_block_k, 1, h_per_t), jnp.float32)),  # W2 scale
+        # VMEM: dequant scratch (single-buf, None when not quantized)
+        (None if w1_scale is None else
+            pltpu.VMEM((t_packing, h_per_t, bf), jnp.bfloat16)),                    # W1 dequant
+        (None if w3_scale is None else
+            pltpu.VMEM((t_packing, h_per_t, bf), jnp.bfloat16)),                    # W3 dequant
+        (None if w2_scale is None else
+            pltpu.VMEM((t_packing, bf, h_per_t), jnp.bfloat16)),                    # W2 dequant
         # VMEM: gate/up accumulators (per bts tile)
         pltpu.VMEM((bts, bf), jnp.float32),                                 # gate_acc
         pltpu.VMEM((bts, bf), jnp.float32),                                 # up_acc
