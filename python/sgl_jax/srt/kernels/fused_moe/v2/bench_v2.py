@@ -42,6 +42,8 @@ check_correctness = os.environ.get("BENCH_CHECK", "0") == "1"
 
 log(f"config: E={E} d={d} f={f} k={top_k} bt={bt} bf={bf} btc={btc} ep={ep_size} tokens={num_tokens}")
 
+ep_sharding = jax.sharding.NamedSharding(mesh, P(("data", "tensor")))
+
 key = jax.random.key(42)
 k1, k2, k3, k4, k5 = jax.random.split(key, 5)
 
@@ -80,8 +82,6 @@ gating = jax.make_array_from_single_device_arrays(
 _, topk_idx = lax.top_k(gating, top_k)
 topk_logits = jnp.take_along_axis(gating, topk_idx, axis=-1)
 topk_wts = jax.nn.softmax(topk_logits, axis=-1)
-
-ep_sharding = jax.sharding.NamedSharding(mesh, P(("data", "tensor")))
 
 log("arrays ready (pre-sharded)")
 tokens_s = tokens
