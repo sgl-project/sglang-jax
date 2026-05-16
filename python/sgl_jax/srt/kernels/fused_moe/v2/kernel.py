@@ -294,6 +294,9 @@ def _fused_ep_moe_kernel(
     disable_a2a: bool = False,
     disable_shared_expert: bool = False,
     disable_sync_barrier: bool = False,
+    disable_weight_load: bool = False,
+    disable_dynamic_ffn1: bool = False,
+    disable_dynamic_ffn2: bool = False,
     use_jax_allreduce_metadata: bool = True,
     bt: int,
     bf: int,
@@ -698,6 +701,8 @@ def _fused_ep_moe_kernel(
     # ===== Weight DMA (per-t_packing loop, matching v1 pattern) =====
 
     def start_fetch_w1(local_e_id, slot, bf_id, priority=1):
+        if disable_weight_load:
+            return
         for p in range(t_packing):
             pltpu.make_async_copy(
                 src_ref=w1_hbm.at[
@@ -721,6 +726,8 @@ def _fused_ep_moe_kernel(
                 ).start(priority=priority)
 
     def wait_fetch_w1(slot):
+        if disable_weight_load:
+            return
         pltpu.make_async_copy(
             src_ref=b_w1_x2_vmem.at[slot],
             dst_ref=b_w1_x2_vmem.at[slot],
@@ -734,6 +741,8 @@ def _fused_ep_moe_kernel(
             ).wait()
 
     def start_fetch_w3(local_e_id, slot, bf_id, priority=1):
+        if disable_weight_load:
+            return
         for p in range(t_packing):
             pltpu.make_async_copy(
                 src_ref=w3_hbm.at[
@@ -757,6 +766,8 @@ def _fused_ep_moe_kernel(
                 ).start(priority=priority)
 
     def wait_fetch_w3(slot):
+        if disable_weight_load:
+            return
         pltpu.make_async_copy(
             src_ref=b_w3_x2_vmem.at[slot],
             dst_ref=b_w3_x2_vmem.at[slot],
@@ -770,6 +781,8 @@ def _fused_ep_moe_kernel(
             ).wait()
 
     def start_fetch_w2(local_e_id, slot, bf_id, priority=0):
+        if disable_weight_load:
+            return
         for p in range(t_packing):
             pltpu.make_async_copy(
                 src_ref=w2_hbm.at[
@@ -793,6 +806,8 @@ def _fused_ep_moe_kernel(
                 ).start(priority=priority)
 
     def wait_fetch_w2(slot):
+        if disable_weight_load:
+            return
         pltpu.make_async_copy(
             src_ref=b_w2_x2_vmem.at[slot],
             dst_ref=b_w2_x2_vmem.at[slot],
@@ -914,14 +929,15 @@ def _fused_ep_moe_kernel(
                     def gate_up_btc(btc_id, ___):
                         gate = jnp.zeros((btc, bf), dtype=jnp.float32)
                         up = jnp.zeros((btc, bf), dtype=jnp.float32)
-                        for p_id in range(t_packing):
-                            x_slice = b_x_vmem[
-                                pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
-                            ]
-                            w1_tile = b_w1_dq_vmem[p_id] if w1_scale_hbm is not None else b_w1_x2_vmem[slot, p_id]
-                            w3_tile = b_w3_dq_vmem[p_id] if w3_scale_hbm is not None else b_w3_x2_vmem[slot, p_id]
-                            gate += jnp.dot(x_slice, w1_tile, preferred_element_type=jnp.float32)
-                            up += jnp.dot(x_slice, w3_tile, preferred_element_type=jnp.float32)
+                        if not disable_dynamic_ffn1:
+                            for p_id in range(t_packing):
+                                x_slice = b_x_vmem[
+                                    pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
+                                ]
+                                w1_tile = b_w1_dq_vmem[p_id] if w1_scale_hbm is not None else b_w1_x2_vmem[slot, p_id]
+                                w3_tile = b_w3_dq_vmem[p_id] if w3_scale_hbm is not None else b_w3_x2_vmem[slot, p_id]
+                                gate += jnp.dot(x_slice, w1_tile, preferred_element_type=jnp.float32)
+                                up += jnp.dot(x_slice, w3_tile, preferred_element_type=jnp.float32)
                         b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
                         b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
                         return None
@@ -933,18 +949,19 @@ def _fused_ep_moe_kernel(
                         gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
                         up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
                         act = activation_fn(gate, up_val, act_fn)
-                        for p_id in range(t_packing):
-                            w2_tile = b_w2_dq_vmem[p_id] if w2_scale_hbm is not None else b_w2_x2_vmem[slot, p_id]
-                            partial = jnp.dot(
-                                act, w2_tile, preferred_element_type=jnp.float32,
-                            )
-                            acc_ref = b_y_acc_vmem.at[
-                                pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
-                            ]
-                            if bf_id == 0:
-                                acc_ref[...] = partial
-                            else:
-                                acc_ref[...] = acc_ref[...] + partial
+                        if not disable_dynamic_ffn2:
+                            for p_id in range(t_packing):
+                                w2_tile = b_w2_dq_vmem[p_id] if w2_scale_hbm is not None else b_w2_x2_vmem[slot, p_id]
+                                partial = jnp.dot(
+                                    act, w2_tile, preferred_element_type=jnp.float32,
+                                )
+                                acc_ref = b_y_acc_vmem.at[
+                                    pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
+                                ]
+                                if bf_id == 0:
+                                    acc_ref[...] = partial
+                                else:
+                                    acc_ref[...] = acc_ref[...] + partial
                         return None
 
                     lax.fori_loop(0, num_btc_per_bts, act_down_btc, None)
@@ -1403,6 +1420,7 @@ def jax_allreduce_metadata_by_bt(
     static_argnames=[
         "mesh", "top_k", "act_fn",
         "disable_a2a", "disable_shared_expert", "disable_sync_barrier",
+        "disable_weight_load", "disable_dynamic_ffn1", "disable_dynamic_ffn2",
         "use_jax_allreduce_metadata",
         "block_config", "dp_axis_name", "tp_axis_name",
         "quant_block_k",
@@ -1422,6 +1440,9 @@ def fused_ep_moe_v2(
     disable_a2a: bool = False,
     disable_shared_expert: bool = False,
     disable_sync_barrier: bool = False,
+    disable_weight_load: bool = False,
+    disable_dynamic_ffn1: bool = False,
+    disable_dynamic_ffn2: bool = False,
     use_jax_allreduce_metadata: bool = True,
     w1_shared: jax.Array | None = None,
     w2_shared: jax.Array | None = None,
@@ -1605,6 +1626,9 @@ def fused_ep_moe_v2(
                 disable_a2a=disable_a2a,
                 disable_shared_expert=disable_shared_expert,
                 disable_sync_barrier=disable_sync_barrier,
+                disable_weight_load=disable_weight_load,
+                disable_dynamic_ffn1=disable_dynamic_ffn1,
+                disable_dynamic_ffn2=disable_dynamic_ffn2,
                 use_jax_allreduce_metadata=use_jax_allreduce_metadata,
                 bt=bt, bf=bf, btc=btc, bts=bts, bse=bse,
                 quant_block_k=quant_block_k,
