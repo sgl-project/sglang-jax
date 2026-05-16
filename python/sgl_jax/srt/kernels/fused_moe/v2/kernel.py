@@ -240,13 +240,15 @@ def _fused_ep_moe_kernel(
     b_w1_x2_vmem,          # (2, t_packing, h_per_t, bf)
     b_w3_x2_vmem,          # (2, t_packing, h_per_t, bf)
     b_w2_x2_vmem,          # (2, t_packing, bf, h_per_t)
-    # Gate/up accumulators (for W2 overlap)
-    b_gate_acc_vmem,       # (a2a_max_tokens, bf) f32
-    b_up_acc_vmem,         # (a2a_max_tokens, bf) f32
-    # Token staging from A2A scatter (persistent per expert)
+    # Gate/up accumulators (per bts tile)
+    b_gate_acc_vmem,       # (bts, bf) f32
+    b_up_acc_vmem,         # (bts, bf) f32
+    # Token staging from A2A scatter (full expert buffer)
     b_x_vmem,              # (a2a_max_tokens, t_packing, h_per_t) bf16
-    # Output accumulator across bf tiles
-    b_y_acc_vmem,          # (a2a_max_tokens, t_packing, h_per_t) f32
+    # Output accumulator per bts tile
+    b_y_acc_vmem,          # (bts, t_packing, h_per_t) f32
+    # Output staging for HBM read-modify-write per bts tile
+    b_y_stage_vmem,        # (bts, t_packing, h_per_t) bf16
     # Shared expert buffers
     b_se_tokens_vmem,      # None | (2, 2, bt, t_packing, h_per_t)
     b_se_w1_x2_vmem,       # None | (2, t_packing, h_per_t, bse)
@@ -767,7 +769,8 @@ def _fused_ep_moe_kernel(
             wait_load_x()
 
             dyn_sz_i32 = dyn_sz.astype(jnp.int32)
-            num_btc_loops = (dyn_sz_i32 + (btc - 1)) // btc
+            num_bts_tiles = (dyn_sz_i32 + (bts - 1)) // bts
+            num_btc_per_bts = bts // btc
 
             # --- Prologue: prefetch first bf tile weights ---
             start_fetch_w1(local_e_id, 0, 0, priority=1)
@@ -784,47 +787,93 @@ def _fused_ep_moe_kernel(
 
                 wait_fetch_w1(slot)
                 wait_fetch_w3(slot)
-
-                # Phase 1: gate/up compute (W2 DMA overlaps)
-                def gate_up_body(btc_id, __):
-                    gate = jnp.zeros((btc, bf), dtype=jnp.float32)
-                    up = jnp.zeros((btc, bf), dtype=jnp.float32)
-                    for p_id in range(t_packing):
-                        x_slice = b_x_vmem[
-                            pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
-                        ]
-                        w1_slice = b_w1_x2_vmem[slot, p_id]
-                        w3_slice = b_w3_x2_vmem[slot, p_id]
-                        gate += jnp.dot(x_slice, w1_slice, preferred_element_type=jnp.float32)
-                        up += jnp.dot(x_slice, w3_slice, preferred_element_type=jnp.float32)
-                    b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
-                    b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
-                    return None
-
-                lax.fori_loop(0, num_btc_loops, gate_up_body, None)
-
                 wait_fetch_w2(slot)
 
-                # Phase 2: activation + down projection
-                def act_down_body(btc_id, __):
-                    gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
-                    up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
-                    act = activation_fn(gate, up_val, act_fn)
-                    for p_id in range(t_packing):
-                        w2_slice = b_w2_x2_vmem[slot, p_id]
-                        partial = jnp.dot(
-                            act, w2_slice, preferred_element_type=jnp.float32,
-                        )
-                        acc_ref = b_y_acc_vmem.at[
-                            pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
-                        ]
-                        if bf_id == 0:
-                            acc_ref[...] = partial
-                        else:
-                            acc_ref[...] = acc_ref[...] + partial
+                # --- bts-tiled processing ---
+                def bts_body(bts_id, __):
+                    tile_start = bts_id * bts
+
+                    # Phase 1: gate/up for this bts tile
+                    def gate_up_btc(btc_id, ___):
+                        global_idx = tile_start + btc_id * btc
+                        gate = jnp.zeros((btc, bf), dtype=jnp.float32)
+                        up = jnp.zeros((btc, bf), dtype=jnp.float32)
+                        for p_id in range(t_packing):
+                            x_slice = b_x_vmem[
+                                pl.ds(global_idx, btc), p_id, pl.ds(0, h_per_t)
+                            ]
+                            w1_slice = b_w1_x2_vmem[slot, p_id]
+                            w3_slice = b_w3_x2_vmem[slot, p_id]
+                            gate += jnp.dot(x_slice, w1_slice, preferred_element_type=jnp.float32)
+                            up += jnp.dot(x_slice, w3_slice, preferred_element_type=jnp.float32)
+                        b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
+                        b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
+                        return None
+
+                    lax.fori_loop(0, num_btc_per_bts, gate_up_btc, None)
+
+                    # Load prev partial from HBM (bf_id > 0 only)
+                    if bf_id > 0:
+                        pltpu.make_async_copy(
+                            src_ref=a2a_s_acc_x2_hbm.at[e_sem_id, pl.ds(tile_start, bts)],
+                            dst_ref=b_y_stage_vmem,
+                            sem=x_stage_sem.at[0],
+                        ).start()
+                        pltpu.make_async_copy(
+                            src_ref=b_y_stage_vmem, dst_ref=b_y_stage_vmem,
+                            sem=x_stage_sem.at[0],
+                        ).wait()
+
+                    # Phase 2: activation + down projection for this bts tile
+                    def act_down_btc(btc_id, ___):
+                        gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
+                        up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
+                        act = activation_fn(gate, up_val, act_fn)
+                        for p_id in range(t_packing):
+                            w2_slice = b_w2_x2_vmem[slot, p_id]
+                            partial = jnp.dot(
+                                act, w2_slice, preferred_element_type=jnp.float32,
+                            )
+                            acc_ref = b_y_acc_vmem.at[
+                                pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
+                            ]
+                            if bf_id == 0:
+                                acc_ref[...] = partial
+                            else:
+                                prev = b_y_stage_vmem[
+                                    pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
+                                ]
+                                acc_ref[...] = prev.astype(jnp.float32) + partial
+                        return None
+
+                    lax.fori_loop(0, num_btc_per_bts, act_down_btc, None)
+
+                    # Writeback: cast f32 → bf16 into y_stage, then DMA to HBM
+                    def writeback_btc(btc_id, ___):
+                        for p_id in range(t_packing):
+                            acc_slice = b_y_acc_vmem[
+                                pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
+                            ]
+                            b_y_stage_vmem.at[
+                                pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
+                            ][...] = acc_slice.astype(t_dtype)
+                        return None
+
+                    lax.fori_loop(0, num_btc_per_bts, writeback_btc, None)
+
+                    pltpu.make_async_copy(
+                        src_ref=b_y_stage_vmem,
+                        dst_ref=a2a_s_acc_x2_hbm.at[e_sem_id, pl.ds(tile_start, bts)],
+                        sem=y_store_sem.at[0],
+                    ).start()
+                    pltpu.make_async_copy(
+                        src_ref=b_y_stage_vmem, dst_ref=b_y_stage_vmem,
+                        sem=y_store_sem.at[0],
+                    ).wait()
+
                     return None
 
-                lax.fori_loop(0, num_btc_loops, act_down_body, None)
+                lax.fori_loop(0, num_bts_tiles, bts_body, None)
 
                 # Prefetch next bf tile into SAME slot (now freed)
                 next_bf_id = bf_id + 2
@@ -832,29 +881,6 @@ def _fused_ep_moe_kernel(
                     start_fetch_w1(local_e_id, slot, next_bf_id)
                     start_fetch_w3(local_e_id, slot, next_bf_id)
                     start_fetch_w2(local_e_id, slot, next_bf_id, priority=0)
-
-            # --- Writeback: y_acc (f32) → cast to bf16 → A2A acc HBM ---
-            def writeback_body(btc_id, __):
-                for p_id in range(t_packing):
-                    acc_slice = b_y_acc_vmem[
-                        pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
-                    ]
-                    b_x_vmem.at[
-                        pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
-                    ][...] = acc_slice.astype(t_dtype)
-                return None
-
-            lax.fori_loop(0, num_btc_loops, writeback_body, None)
-
-            pltpu.make_async_copy(
-                src_ref=b_x_vmem,
-                dst_ref=a2a_s_acc_x2_hbm.at[e_sem_id, pl.ds(0, a2a_max_tokens)],
-                sem=y_store_sem.at[0],
-            ).start()
-            pltpu.make_async_copy(
-                src_ref=b_x_vmem, dst_ref=b_x_vmem,
-                sem=y_store_sem.at[0],
-            ).wait()
 
             return jnp.int32(0)
 
@@ -1387,13 +1413,15 @@ def fused_ep_moe_v2(
         pltpu.VMEM((2, t_packing, h_per_t, bf), w1.dtype),                 # W1
         pltpu.VMEM((2, t_packing, h_per_t, bf), w3.dtype),                 # W3
         pltpu.VMEM((2, t_packing, bf, h_per_t), w2.dtype),                 # W2
-        # VMEM: gate/up accumulators (for W2 overlap)
-        pltpu.VMEM((a2a_max_tokens, bf), jnp.float32),                     # gate_acc
-        pltpu.VMEM((a2a_max_tokens, bf), jnp.float32),                     # up_acc
-        # VMEM: token staging (persistent per expert)
+        # VMEM: gate/up accumulators (per bts tile)
+        pltpu.VMEM((bts, bf), jnp.float32),                                 # gate_acc
+        pltpu.VMEM((bts, bf), jnp.float32),                                 # up_acc
+        # VMEM: token staging (full expert buffer)
         pltpu.VMEM((a2a_max_tokens, t_packing, h_per_t), t_dtype),         # x
-        # VMEM: output accumulator (fp32)
-        pltpu.VMEM((a2a_max_tokens, t_packing, h_per_t), jnp.float32),     # y_acc
+        # VMEM: output accumulator per bts tile (fp32)
+        pltpu.VMEM((bts, t_packing, h_per_t), jnp.float32),                # y_acc
+        # VMEM: output staging for HBM read-modify-write per bts tile
+        pltpu.VMEM((bts, t_packing, h_per_t), t_dtype),                    # y_stage
         # VMEM: shared expert
         (None if w1_shared is None else
             pltpu.VMEM((2, 2, bt, t_packing, h_per_t), t_dtype)),           # se_tokens
