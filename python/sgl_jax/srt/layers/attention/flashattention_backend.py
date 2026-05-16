@@ -537,6 +537,10 @@ class FlashAttention(AttentionBackend):
         elif hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
             page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
 
+        q_arg = q.reshape(q.shape[0], -1, self.head_dim)
+        k_arg = k.reshape(k.shape[0], -1, self.head_dim)
+        v_arg = v.reshape(v.shape[0], -1, self.head_dim)
+
         # JAX 0.9.1+ enforces shard_map in_specs match actual input sharding.
         # Derive effective axes from the actual array sharding rather than
         # divisibility, so specs always match what JAX assigned.
@@ -546,23 +550,25 @@ class FlashAttention(AttentionBackend):
         # q and kv may have different head counts (GQA), so compute axes
         # independently. q_axis also requires local_q_heads % local_kv_heads
         # == 0 after sharding, otherwise the kernel sees an invalid head ratio.
-        q_data = effective_axis(q, 0, dpa)
-        q_axis = effective_axis(q, 1, axis)
-        kv_data = effective_axis(k, 0, dpa)
-        kv_axis = effective_axis(k, 1, axis)
-        v_data = effective_axis(v, 0, dpa)
-        v_axis = effective_axis(v, 1, axis)
+        q_data = effective_axis(q_arg, 0, dpa)
+        q_axis = effective_axis(q_arg, 1, axis)
+        kv_data = effective_axis(k_arg, 0, dpa)
+        kv_axis = effective_axis(k_arg, 1, axis)
+        v_data = effective_axis(v_arg, 0, dpa)
+        v_axis = effective_axis(v_arg, 1, axis)
         # GQA head ratio: if q is tensor-sharded, verify local heads are valid.
         if q_axis is not None:
             axis_size = self.mesh.shape.get(axis, 1) if self.mesh else 1
-            local_q = q.shape[1] // axis_size
-            local_kv = k.shape[1] // axis_size if kv_axis is not None else k.shape[1]
+            local_q = q_arg.shape[1] // axis_size
+            local_kv = k_arg.shape[1] // axis_size if kv_axis is not None else k_arg.shape[1]
             if local_q % local_kv != 0:
                 if self.mesh is not None and q_data is not None:
-                    q = jax.reshard(q, NamedSharding(self.mesh, P(q_data, None, None)))
+                    q_arg = jax.reshard(q_arg, NamedSharding(self.mesh, P(q_data, None, None)))
                 q_axis = None
         # v must be consistent with k on the tensor axis.
         if kv_axis != v_axis:
+            if self.mesh is not None:
+                v_arg = jax.reshard(v_arg, NamedSharding(self.mesh, P(v_data, kv_axis, None)))
             v_axis = kv_axis
 
         # kv_cache: [pages, page_size, heads*2//packing, packing, head_dim]
@@ -667,9 +673,9 @@ class FlashAttention(AttentionBackend):
             out_specs=out_specs,
             check_vma=False,
         )(
-            q.reshape(q.shape[0], -1, self.head_dim),
-            k.reshape(k.shape[0], -1, self.head_dim),
-            v.reshape(v.shape[0], -1, self.head_dim),
+            q_arg,
+            k_arg,
+            v_arg,
             kv_cache_fused,
             self.forward_metadata.seq_lens,
             page_indices_arg,
@@ -681,7 +687,7 @@ class FlashAttention(AttentionBackend):
         )
 
         return (
-            attn_output.reshape(q.shape[0], -1),
+            attn_output.reshape(q_arg.shape[0], -1),
             updated_kv_cache_fused,
         )
 

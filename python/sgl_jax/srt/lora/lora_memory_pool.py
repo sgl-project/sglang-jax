@@ -24,6 +24,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 from jax.tree_util import register_pytree_node_class
 
+from sgl_jax.srt.lora.constants import BASE_LORA_ID, BASE_LORA_SLOT, is_base_lora_id
 from sgl_jax.srt.lora.utils import get_lora_a_sharding, get_lora_b_sharding
 
 if TYPE_CHECKING:
@@ -63,7 +64,8 @@ class LoRAMemoryPool:
     incremental buffer allocation.
 
     Attributes:
-        max_loras_per_batch: Maximum number of LoRA adapters per batch
+        max_loras_per_batch: Maximum number of real LoRA adapters per batch
+        num_lora_slots: Number of device buffer slots, including the base slot
         max_lora_rank: Maximum LoRA rank supported
         num_layers: Number of transformer layers
         target_modules: Set of target module names (e.g., {"qkv_proj", "o_proj"})
@@ -90,12 +92,13 @@ class LoRAMemoryPool:
         head_dim: int | None = None,
         original_num_kv_heads: int | None = None,
         tp_size: int = 1,
+        reserve_base_slot: bool = True,
     ):
         """
         Initialize LoRA memory pool.
 
         Args:
-            max_loras_per_batch: Maximum number of LoRA adapters in a batch
+            max_loras_per_batch: Maximum number of real LoRA adapters in a batch
             max_lora_rank: Maximum LoRA rank to support
             num_layers: Number of transformer layers
             target_modules: Set of target module names
@@ -110,6 +113,8 @@ class LoRAMemoryPool:
             tp_size: Tensor parallel size (for calculating replication)
         """
         self.max_loras_per_batch = max_loras_per_batch
+        self.reserve_base_slot = reserve_base_slot
+        self.num_lora_slots = max_loras_per_batch + int(reserve_base_slot)
         self.max_lora_rank = max_lora_rank
         self.num_layers = num_layers
         self.target_modules = target_modules
@@ -140,7 +145,15 @@ class LoRAMemoryPool:
         # CPU-side tracking (not in pytree)
         # These are mutable Python objects used for bookkeeping
         self.uid_to_buffer_id: dict[str | None, int] = {}
-        self.buffer_id_to_uid: list[str | None | EmptySlot] = [EMPTY_SLOT] * max_loras_per_batch
+        self.buffer_id_to_uid: list[str | None | EmptySlot] = [EMPTY_SLOT] * self.num_lora_slots
+        if reserve_base_slot:
+            self.uid_to_buffer_id.update(
+                {
+                    BASE_LORA_ID: BASE_LORA_SLOT,
+                    None: BASE_LORA_SLOT,
+                }
+            )
+            self.buffer_id_to_uid[BASE_LORA_SLOT] = BASE_LORA_ID
 
         # Device buffers (in pytree) - initialized in init_buffers()
         self.A_buffer: dict[str, list[jax.Array]] = {}
@@ -160,6 +173,8 @@ class LoRAMemoryPool:
         children = (a_buffer_flat, b_buffer_flat)
         aux_data = {
             "max_loras_per_batch": self.max_loras_per_batch,
+            "reserve_base_slot": self.reserve_base_slot,
+            "num_lora_slots": self.num_lora_slots,
             "max_lora_rank": self.max_lora_rank,
             "num_layers": self.num_layers,
             "target_modules": self.target_modules,
@@ -187,6 +202,11 @@ class LoRAMemoryPool:
 
         # Restore attributes
         obj.max_loras_per_batch = aux_data["max_loras_per_batch"]
+        obj.reserve_base_slot = aux_data.get("reserve_base_slot", True)
+        obj.num_lora_slots = aux_data.get(
+            "num_lora_slots",
+            obj.max_loras_per_batch + int(obj.reserve_base_slot),
+        )
         obj.max_lora_rank = aux_data["max_lora_rank"]
         obj.num_layers = aux_data["num_layers"]
         obj.target_modules = aux_data["target_modules"]
@@ -233,7 +253,7 @@ class LoRAMemoryPool:
         """
         Get shape for LoRA A matrix.
 
-        Returns: (max_loras_per_batch, max_lora_rank, input_dim)
+        Returns: (num_lora_slots, max_lora_rank, input_dim)
 
         Note: Shape is global in JAX. Sharding is controlled by sharding spec,
         not by dividing dimensions in the shape.
@@ -254,13 +274,13 @@ class LoRAMemoryPool:
             # Default: hidden_size
             input_dim = self.hidden_size
 
-        return (self.max_loras_per_batch, self.max_lora_rank, input_dim)
+        return (self.num_lora_slots, self.max_lora_rank, input_dim)
 
     def _get_lora_b_shape(self, module_name: str) -> tuple[int, int, int]:
         """
         Get shape for LoRA B matrix.
 
-        Returns: (max_loras_per_batch, output_dim, max_lora_rank)
+        Returns: (num_lora_slots, output_dim, max_lora_rank)
 
         Note: Shape is global in JAX. Sharding is controlled by sharding spec,
         not by dividing dimensions in the shape.
@@ -291,7 +311,7 @@ class LoRAMemoryPool:
             # Default: hidden_size
             output_dim = self.hidden_size
 
-        return (self.max_loras_per_batch, output_dim, self.max_lora_rank)
+        return (self.num_lora_slots, output_dim, self.max_lora_rank)
 
     def _get_lora_a_sharding(self, module_name: str) -> NamedSharding:
         return get_lora_a_sharding(module_name, self.mesh)
@@ -306,9 +326,10 @@ class LoRAMemoryPool:
         Creates A_buffer and B_buffer with proper sharding.
         """
         logger.info(
-            "Initializing LoRA memory pool buffers: num_layers=%d, max_loras_per_batch=%d, max_lora_rank=%d, dtype=%s",
+            "Initializing LoRA memory pool buffers: num_layers=%d, max_loras_per_batch=%d, num_lora_slots=%d, max_lora_rank=%d, dtype=%s",
             self.num_layers,
             self.max_loras_per_batch,
+            self.num_lora_slots,
             self.max_lora_rank,
             self.dtype,
         )
@@ -355,7 +376,7 @@ class LoRAMemoryPool:
 
     def prepare_lora_batch(
         self,
-        cur_uids: set[str | None],
+        cur_uids: list[str | None],
         lora_adapters: dict[str | None, LoRAAdapter],
     ) -> bool:
         """
@@ -376,23 +397,27 @@ class LoRAMemoryPool:
 
         def get_available_buffer_slot(uid: str) -> int:
             """Find next available buffer slot (simple incremental allocation)."""
-            # 0 is reserved for request without LoRA
-            if uid == "0":
-                return 0
-            for buffer_id in range(1, self.max_loras_per_batch + 1):
-                # 0 is reserved for zeros, so add 1 to match user's expectation.
+            # Slot 0 is reserved for requests without LoRA when enabled.
+            if is_base_lora_id(uid):
+                if not self.reserve_base_slot:
+                    raise ValueError("Base LoRA slot is not reserved in this memory pool")
+                return BASE_LORA_SLOT
+            first_adapter_slot = BASE_LORA_SLOT + int(self.reserve_base_slot)
+            for buffer_id in range(first_adapter_slot, self.num_lora_slots):
                 if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
                     return buffer_id
 
             raise ValueError(
-                "No available buffer slots. Max %d LoRA adapters per batch exceeded.",
+                "No available buffer slots. Max %d LoRA adapters per batch exceeded; %d total slots are available.",
                 self.max_loras_per_batch,
+                self.num_lora_slots,
             )
 
         has_new_weights = False
 
         # Load each adapter that's not already loaded
         for uid in cur_uids:
+            uid = BASE_LORA_ID if uid is None else uid
             if uid not in self.uid_to_buffer_id:
                 buffer_id = get_available_buffer_slot(uid)
                 self.uid_to_buffer_id[uid] = buffer_id
@@ -403,6 +428,13 @@ class LoRAMemoryPool:
                 logger.info("Loaded LoRA %s into buffer slot %d", uid, buffer_id)
             else:
                 logger.debug("LoRA %s already in buffer slot %d", uid, self.uid_to_buffer_id[uid])
+
+        if has_new_weights and self.reserve_base_slot:
+            # Slot 0 is the serving-wide no-LoRA sentinel.  Adapter loading is
+            # implemented as functional updates over large sharded buffers; keep
+            # the sentinel invariant explicit so mixed LoRA/base batches never
+            # depend on earlier buffer contents.
+            self.load_lora_weight_to_buffer(BASE_LORA_ID, BASE_LORA_SLOT, None)
 
         return has_new_weights
 
@@ -429,7 +461,7 @@ class LoRAMemoryPool:
             return a_zero_matrix_shape, b_zero_matrix_shape
 
         with jax.set_mesh(self.mesh):
-            if uid is None:
+            if is_base_lora_id(uid):
                 # Base model: zero out the buffer slot
                 logger.debug("Loading base model (zeros) into buffer slot %d", buffer_id)
                 for module_name in self.target_modules:
@@ -865,8 +897,8 @@ class LoRAMemoryPool:
 
         Returns:
             JAX array with shape:
-            - A: (max_loras_per_batch, max_lora_rank, input_dim)
-            - B: (max_loras_per_batch, output_dim, max_lora_rank)
+            - A: (num_lora_slots, max_lora_rank, input_dim)
+            - B: (num_lora_slots, output_dim, max_lora_rank)
         """
         if is_lora_a:
             return self.A_buffer[module_name][layer_id]

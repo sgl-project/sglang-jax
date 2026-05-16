@@ -30,6 +30,7 @@ from sgl_jax.srt.constrained.base_grammar_backend import (
 )
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
+from sgl_jax.srt.lora.constants import is_base_lora_id
 from sgl_jax.srt.managers.communication import CommunicationBackend
 from sgl_jax.srt.managers.io_struct import (
     AbortReq,
@@ -404,6 +405,7 @@ class Scheduler(
         self.last_batch: ScheduleBatch | None = None
         self.forward_ct = 0
         self.forward_ct_decode = 0
+        self.request_arrival_index = 0
         self.num_generated_tokens = 0
         self.last_prefill_tokens = 0
         self.last_decode_stats_tic = time.perf_counter()
@@ -1000,6 +1002,9 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        arrival_index = self.request_arrival_index
+        self.request_arrival_index += 1
+
         # Create a new request
         req = Req(
             recv_req.rid,
@@ -1014,6 +1019,7 @@ class Scheduler(
             lora_id=recv_req.lora_id,
             extra_key=recv_req.extra_key,
             dp_rank=recv_req.dp_rank,
+            arrival_index=arrival_index,
             eos_token_ids=self.model_config.hf_eos_token_id,
             vocab_size=self.model_config.vocab_size,
             return_routed_experts=recv_req.return_routed_experts,
@@ -1592,7 +1598,9 @@ class Scheduler(
             if self.running_batch is not None:
                 for info in self.running_batch.reqs_info:
                     if info.reqs:
-                        lora_set.update([req.lora_id for req in info.reqs])
+                        lora_set.update(
+                            req.lora_id for req in info.reqs if not is_base_lora_id(req.lora_id)
+                        )
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
@@ -1614,14 +1622,20 @@ class Scheduler(
             if self.chunked_reqs[dp_rank] is not None:
                 continue
 
-            # Check LoRA constraint: ensure we don't exceed max_loras_per_batch
+            # Check LoRA constraint: ensure we don't exceed max_loras_per_batch.
+            # Base-model requests use a reserved slot and do not count as adapters.
             # This is GLOBAL - must be same across all DP ranks
             if (
                 self.lora_paths is not None
                 and len(
                     lora_set
-                    | set([req.lora_id for reqs in adder.can_run_list.values() for req in reqs])
-                    | set([req.lora_id])
+                    | set(
+                        pending_req.lora_id
+                        for reqs in adder.can_run_list.values()
+                        for pending_req in reqs
+                        if not is_base_lora_id(pending_req.lora_id)
+                    )
+                    | ({req.lora_id} if not is_base_lora_id(req.lora_id) else set())
                 )
                 > self.max_loras_per_batch
             ):

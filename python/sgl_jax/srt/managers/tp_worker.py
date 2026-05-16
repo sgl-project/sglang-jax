@@ -406,9 +406,11 @@ class ModelWorker:
         save_logits_file_info = os.getenv("DUMP_LAST_LAYER_LOGITS_FILENAMES", None)
         if save_logits_file_info:
             save_logits_with_txt(
-                logits_output.next_token_logits[: model_worker_batch.real_bs, :],
+                logits_output.next_token_logits,
                 save_logits_file_info,
                 forward_batch.forward_mode,
+                selector=model_worker_batch.output_order_selector,
+                real_bs=model_worker_batch.real_bs,
             )
 
         if skip_sample:
@@ -669,9 +671,15 @@ def save_logits_with_txt(
     arr: jax.Array,
     file_info: str,
     forward_mode: ForwardMode,
+    selector: np.ndarray | None = None,
+    real_bs: int | None = None,
 ):
     # format: {prefill_file_name},{decode_file_name}
     file_slice = file_info.split(",")
+    if len(file_slice) != 2:
+        raise ValueError(
+            f"Expected logits dump file_info to contain prefill and decode paths, got {file_info!r}"
+        )
     if forward_mode.is_extend():
         file_name = file_slice[0]
     elif forward_mode.is_decode():
@@ -679,5 +687,31 @@ def save_logits_with_txt(
     else:
         raise ValueError(f"Unsupported {forward_mode} to save logits with txt")
 
-    os.makedirs(os.path.dirname(file_name), exist_ok=True)
-    np.savetxt(file_name, np.asarray(jax.device_get(arr)).flatten(), fmt="%.15f")
+    dump_dir = os.path.dirname(file_name)
+    if dump_dir:
+        os.makedirs(dump_dir, exist_ok=True)
+    arr_host = np.asarray(jax.device_get(arr))
+    if selector is not None and len(selector) > 0:
+        selector = np.asarray(selector, dtype=np.int64)
+        if selector.ndim != 1:
+            raise ValueError(
+                f"Logits dump selector for {forward_mode} must be 1D, got shape {selector.shape}"
+            )
+        if real_bs is not None and len(selector) != real_bs:
+            raise ValueError(
+                f"Logits dump selector length {len(selector)} does not match real_bs={real_bs} "
+                f"for {forward_mode}"
+            )
+        if selector.size and (selector.min() < 0 or selector.max() >= arr_host.shape[0]):
+            raise ValueError(
+                f"Logits dump selector out of bounds for {forward_mode}: "
+                f"selector range=[{selector.min()}, {selector.max()}], rows={arr_host.shape[0]}"
+            )
+        arr_host = arr_host[selector]
+    elif real_bs is not None:
+        if real_bs < 0 or real_bs > arr_host.shape[0]:
+            raise ValueError(
+                f"Invalid real_bs={real_bs} for logits dump with {arr_host.shape[0]} rows"
+            )
+        arr_host = arr_host[:real_bs]
+    np.savetxt(file_name, arr_host.flatten(), fmt="%.15f")

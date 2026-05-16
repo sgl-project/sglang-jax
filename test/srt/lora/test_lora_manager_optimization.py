@@ -1,11 +1,13 @@
+import asyncio
 import unittest
 from unittest.mock import MagicMock, patch
 
-import jax
 import jax.numpy as jnp
 
+from sgl_jax.srt.lora.constants import BASE_LORA_ID, BASE_LORA_SLOT
 from sgl_jax.srt.lora.lora_manager import LoRAManager
 from sgl_jax.srt.lora.lora_memory_pool import EMPTY_SLOT, LoRAMemoryPool
+from sgl_jax.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 
 
@@ -18,8 +20,9 @@ class TestLoRAManagerOptimization(unittest.TestCase):
         # Mock LoRAMemoryPool
         self.pool = MagicMock(spec=LoRAMemoryPool)
         self.pool.uid_to_buffer_id = {}
-        self.pool.buffer_id_to_uid = [EMPTY_SLOT] * 4
+        self.pool.buffer_id_to_uid = [EMPTY_SLOT] * 5
         self.pool.max_loras_per_batch = 4
+        self.pool.num_lora_slots = 5
         self.pool.target_modules = {"q_proj"}
         self.pool.get_buffer_id.side_effect = lambda uid: self.pool.uid_to_buffer_id.get(uid, 0)
 
@@ -55,8 +58,8 @@ class TestLoRAManagerOptimization(unittest.TestCase):
         lora_adapters = {"lora1": MagicMock()}
 
         # Reset state
-        pool.uid_to_buffer_id = {}
-        pool.buffer_id_to_uid = [EMPTY_SLOT] * 4
+        pool.uid_to_buffer_id = {BASE_LORA_ID: BASE_LORA_SLOT, None: BASE_LORA_SLOT}
+        pool.buffer_id_to_uid = [BASE_LORA_ID] + [EMPTY_SLOT] * pool.max_loras_per_batch
 
         has_new = pool.prepare_lora_batch(cur_uids, lora_adapters)
         self.assertTrue(has_new, "Should return True when loading new LoRA")
@@ -74,6 +77,68 @@ class TestLoRAManagerOptimization(unittest.TestCase):
         has_new = pool.prepare_lora_batch(cur_uids, lora_adapters)
         self.assertTrue(has_new, "Should return True when loading at least one new LoRA")
         self.assertIn("lora2", pool.uid_to_buffer_id)
+
+    def test_memory_pool_capacity_excludes_base_slot(self):
+        """max_loras_per_batch counts real adapters; slot 0 is reserved for base."""
+        pool = LoRAMemoryPool(
+            max_loras_per_batch=2,
+            max_lora_rank=8,
+            num_layers=1,
+            target_modules={"q_proj"},
+            mesh=self.mock_mesh,
+            dtype=jnp.float32,
+        )
+        pool.load_lora_weight_to_buffer = MagicMock()
+
+        self.assertEqual(pool.num_lora_slots, 3)
+        has_new = pool.prepare_lora_batch(
+            [None, "lora1", "lora2"],
+            {"lora1": MagicMock(), "lora2": MagicMock()},
+        )
+
+        self.assertTrue(has_new)
+        self.assertEqual(pool.get_buffer_id(None), BASE_LORA_SLOT)
+        self.assertNotEqual(pool.get_buffer_id("lora1"), BASE_LORA_SLOT)
+        self.assertNotEqual(pool.get_buffer_id("lora2"), BASE_LORA_SLOT)
+
+        with self.assertRaises(ValueError):
+            pool.prepare_lora_batch(
+                [None, "lora1", "lora2", "lora3"],
+                {"lora1": MagicMock(), "lora2": MagicMock(), "lora3": MagicMock()},
+            )
+
+    def test_base_lora_id_uses_reserved_pool_slot(self):
+        """Base-model requests use reserved slot 0 without loading adapter weights."""
+        pool = LoRAMemoryPool(
+            max_loras_per_batch=4,
+            max_lora_rank=8,
+            num_layers=1,
+            target_modules={"q_proj"},
+            mesh=self.mock_mesh,
+            dtype=jnp.float32,
+        )
+        pool.load_lora_weight_to_buffer = MagicMock()
+
+        has_new = pool.prepare_lora_batch([None, BASE_LORA_ID], {})
+
+        self.assertFalse(has_new)
+        self.assertEqual(pool.get_buffer_id(None), BASE_LORA_SLOT)
+        self.assertEqual(pool.get_buffer_id(BASE_LORA_ID), BASE_LORA_SLOT)
+        pool.load_lora_weight_to_buffer.assert_not_called()
+
+    def test_registry_treats_base_lora_id_as_sentinel(self):
+        """The registry should not create counters for base-model requests."""
+        lora_ref = LoRARef(lora_name="adapter", lora_path="/tmp/adapter")
+        registry = LoRARegistry([lora_ref])
+
+        acquired_ids = asyncio.run(registry.acquire([None, "adapter"]))
+
+        self.assertEqual(acquired_ids, [BASE_LORA_ID, lora_ref.lora_id])
+        asyncio.run(registry.release(acquired_ids))
+        asyncio.run(registry.release(BASE_LORA_ID))
+
+        with self.assertRaises(ValueError):
+            LoRARef(lora_id=BASE_LORA_ID, lora_name="reserved")
 
     @patch("sgl_jax.srt.lora.lora_manager.LoRAMemoryPool")
     def test_manager_conditional_update(self, MockPoolClass):

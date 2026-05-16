@@ -37,20 +37,19 @@ class TestAlignLoRAAccuracy(CustomTestCase):
     def setUpClass(cls):
         cls.model_path = QWEN3_4B
         cls.lora_target_modules = ["all"]
-        import os
 
         os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jit_cache"
         cls.single_prompt_prefill_logits_cpu_dump_filename = (
-            f"./lora_data/sglangjax/single_prompt_prefill_logits_cpu.txt"
+            "./lora_data/sglangjax/single_prompt_prefill_logits_cpu.txt"
         )
         cls.single_prompt_decode_logits_cpu_dump_filename = (
-            f"./lora_data/sglangjax/single_prompt_decode_logits_cpu.txt"
+            "./lora_data/sglangjax/single_prompt_decode_logits_cpu.txt"
         )
         cls.multi_prompts_prefill_logits_tpu_dump_filename = (
-            f"./lora_data/sglangjax/multi_prompts_prefill_logits_tpu.txt"
+            "./lora_data/sglangjax/multi_prompts_prefill_logits_tpu.txt"
         )
         cls.multi_prompts_decode_logits_tpu_dump_filename = (
-            f"./lora_data/sglangjax/multi_prompts_decode_logits_tpu.txt"
+            "./lora_data/sglangjax/multi_prompts_decode_logits_tpu.txt"
         )
 
     def get_sglang_jax_last_layer_logits_hidden_states(
@@ -75,7 +74,7 @@ class TestAlignLoRAAccuracy(CustomTestCase):
         if device == "cpu":
             os.environ["JAX_PLATFORMS"] = "cpu"
         else:
-            del os.environ["JAX_PLATFORMS"]
+            os.environ.pop("JAX_PLATFORMS", None)
         engine = Engine(
             model_path=self.model_path,
             trust_remote_code=True,
@@ -166,7 +165,7 @@ class TestAlignLoRAAccuracy(CustomTestCase):
             prefill_logits, decode_logits = None, None
 
         if return_hidden_states:
-            raise NotImplemented
+            raise NotImplementedError
 
         engine.shutdown()
 
@@ -212,7 +211,8 @@ python3 dump_hf_lora_output.py --model Qwen/Qwen3-4B \
             )
         except BaseException as e:
             print(
-                f"{hf_lora_prefill_logits_file} or {hf_lora_decode_logits_file} does not exist, please generate them firstly with following commands: \n{hf_generate_commands}",
+                f"{hf_lora_prefill_logits_file} or {hf_lora_decode_logits_file} does not exist, "
+                f"please generate them firstly with following commands: \n{hf_generate_commands}\n{e}",
                 flush=True,
             )
             raise
@@ -296,7 +296,8 @@ python3 dump_hf_lora_output.py --model Qwen/Qwen3-4B \
             assert os.path.exists(hf_lora_decode_logits_file)
         except BaseException as e:
             print(
-                f"{hf_lora_decode_logits_file} does not exist, please generate it firstly with following commands: \n{hf_generate_commands}",
+                f"{hf_lora_decode_logits_file} does not exist, "
+                f"please generate it firstly with following commands: \n{hf_generate_commands}\n{e}",
                 flush=True,
             )
             raise
@@ -377,7 +378,8 @@ python3 dump_hf_lora_output.py --model Qwen/Qwen3-4B \
             assert os.path.exists(hf_lora_decode_logits_file)
         except BaseException as e:
             print(
-                f"{hf_lora_decode_logits_file} does not exist, please generate it firstly with following commands: \n{hf_generate_commands}",
+                f"{hf_lora_decode_logits_file} does not exist, "
+                f"please generate it firstly with following commands: \n{hf_generate_commands}\n{e}",
                 flush=True,
             )
             raise

@@ -207,12 +207,13 @@ def device_array(*data, sharding=None, **kwargs) -> jax.Array:
     return jax.tree.map(_to_device, *data)
 
 
-def effective_axis(x, dim, expected):
-    """Read the actual NamedSharding spec from an array to derive shard_map in_specs.
+def effective_axis(x, dim: int, expected: str):
+    """Return ``expected`` only when an array is exactly sharded that way.
 
     Inside jax.jit the concrete Array sharding may be carried by the tracer
     aval instead of x.sharding; shard_map still validates against that aval
-    sharding.  Returns ``expected`` when the spec matches, ``None`` otherwise.
+    sharding. This helper intentionally does not infer or simplify composite
+    axes; it only mirrors exact per-dimension axis matches for shard_map specs.
     """
     for sharding in (
         getattr(x, "sharding", None),

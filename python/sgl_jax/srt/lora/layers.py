@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import jax
+import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import Mesh
 
@@ -104,7 +105,7 @@ class LoRALinear(BaseLayerWithLoRA):
             self.A_buffer = nnx.Param(A_buffer)
             self.B_buffer = nnx.Param(B_buffer)
 
-    def apply_lora(self, base_output, x, scalings, token_indices) -> jax.Array:
+    def apply_lora(self, base_output, x, scalings, token_indices, ranks) -> jax.Array:
         lora_a_output = self.lora_backend.run_lora_a_gemm(
             x=x,
             weights=self.A_buffer,
@@ -119,6 +120,11 @@ class LoRALinear(BaseLayerWithLoRA):
             sharding=self.lora_b_output_sharding,
             token_indices=token_indices,
         )
+        if ranks is not None:
+            base_mask = ranks == 0
+            while base_mask.ndim < lora_output.ndim:
+                base_mask = base_mask[..., jnp.newaxis]
+            lora_output = jnp.where(base_mask, base_output, lora_output)
         return lora_output
 
     def __call__(
@@ -139,7 +145,11 @@ class LoRALinear(BaseLayerWithLoRA):
         base_output, output_bias = self.base_layer(x)
 
         output = self.apply_lora(
-            base_output, x, forward_batch.lora_scalings, forward_batch.lora_token_indices
+            base_output,
+            x,
+            forward_batch.lora_scalings,
+            forward_batch.lora_token_indices,
+            forward_batch.lora_ranks,
         )
         return output, output_bias
 

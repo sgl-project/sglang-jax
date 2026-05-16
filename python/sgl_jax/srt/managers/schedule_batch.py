@@ -45,6 +45,7 @@ from sgl_jax.srt.mem_cache.common import (
 from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sgl_jax.srt.lora.constants import BASE_LORA_ID
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.precision_tracer import (
     PrecisionTracerRequestMetadata,
@@ -168,6 +169,7 @@ class Req:
         lora_id: str | None = None,
         extra_key: str | None = None,
         dp_rank: int | None = None,
+        arrival_index: int = 0,
         origin_input_ids_unpadded: tuple[int] | None = None,
         eos_token_ids: set[int] | None = None,
         vocab_size: int | None = None,
@@ -208,8 +210,9 @@ class Req:
             extra_key = (extra_key or "") + lora_id  # lora_id is concatenated to the extra key
 
         self.extra_key = extra_key
-        self.lora_id = lora_id if lora_id is not None else "0"
+        self.lora_id = lora_id if lora_id is not None else BASE_LORA_ID
         self.dp_rank = dp_rank
+        self.arrival_index = arrival_index
 
         # Memory pool info
         self.req_pool_idx: int | None = None
@@ -1833,13 +1836,18 @@ class ScheduleBatch:
         Returns:
             (req_pool_indices, seq_lens, extend_prefix_lens,
              extend_seq_lens, extend_logprob_start_lens, logits_indices, real_bs,
-             real_bs_per_dp, logits_indices_selector)
+             real_bs_per_dp, logits_indices_selector, output_order_selector)
 
         logits_indices_selector maps "original request order"
         (i.e., DP-rank-then-req flat order) to the DP-interleaved padded
         slot in the global batch. It lets host-side code reorder per-req
         outputs (e.g. logprobs) back to original order with one numpy
         gather, instead of rederiving per-rank offsets at every callsite.
+
+        output_order_selector maps request arrival order to the same padded
+        slots. This is used by debug dumps that are consumed outside the
+        scheduler's request loop and therefore need stable client-visible
+        ordering even if scheduling reorders the batch.
         """
         req_pool_indices_cpu = np.full(total_bs, -1, dtype=np.int32)
         seq_lens_cpu = np.zeros(total_bs, dtype=np.int32)
@@ -1859,6 +1867,7 @@ class ScheduleBatch:
         real_bs = 0
         real_bs_per_dp = [0] * self.dp_size
         selector_chunks: list[np.ndarray] = []
+        output_order_pairs: list[tuple[int, int]] = []
 
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
@@ -1895,12 +1904,22 @@ class ScheduleBatch:
                     )
 
             selector_chunks.append(np.arange(offset_bs, offset_bs + dp_bs, dtype=np.int32))
+            output_order_pairs.extend(
+                (req.arrival_index, offset_bs + local_idx)
+                for local_idx, req in enumerate(info.reqs[:dp_bs])
+            )
             offset_bs += per_dp_bs_size
 
         if selector_chunks:
             logits_indices_selector = np.concatenate(selector_chunks)
         else:
             logits_indices_selector = np.empty(0, dtype=np.int32)
+        if output_order_pairs:
+            output_order_selector = np.array(
+                [slot for _, slot in sorted(output_order_pairs)], dtype=np.int32
+            )
+        else:
+            output_order_selector = np.empty(0, dtype=np.int32)
 
         return (
             req_pool_indices_cpu,
@@ -1912,6 +1931,7 @@ class ScheduleBatch:
             real_bs,
             real_bs_per_dp,
             logits_indices_selector,
+            output_order_selector,
         )
 
     def _merge_cache_loc(
@@ -2335,6 +2355,7 @@ class ScheduleBatch:
             real_bs,
             real_bs_per_dp,
             logits_indices_selector,
+            output_order_selector,
         ) = self._merge_batch_metadata(per_dp_bs_padding, total_bs)
 
         # Step 4: Merge cache_loc from all DP ranks
@@ -2384,11 +2405,15 @@ class ScheduleBatch:
                 all_reqs.extend(info.reqs)
 
         if enable_static_lora:
-            lora_ids = ["0"] * total_bs
+            lora_ids = [BASE_LORA_ID] * total_bs
         else:
-            lora_ids = [req.lora_id for req in all_reqs[:real_bs]]
-            # Pad to total_bs
-            lora_ids = lora_ids + ["0"] * (total_bs - real_bs)
+            lora_ids = [BASE_LORA_ID] * total_bs
+            offset_bs = 0
+            for info in self.reqs_info:
+                if info.reqs:
+                    for local_idx, req in enumerate(info.reqs):
+                        lora_ids[offset_bs + local_idx] = req.lora_id
+                offset_bs += per_dp_bs_padding
 
         # input_embedding = None
 
@@ -2487,6 +2512,7 @@ class ScheduleBatch:
             real_bs=real_bs,
             real_bs_per_dp=real_bs_per_dp,
             logits_indices_selector=logits_indices_selector,
+            output_order_selector=output_order_selector,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
                 if self.return_hidden_states
@@ -2967,6 +2993,8 @@ class ModelWorkerBatch:
     # `arr[selector]` once after device_get to put per-req outputs back
     # into original order, removing the need for per-rank index math.
     logits_indices_selector: np.ndarray | None = None
+    # Maps client arrival order to padded batch slots for out-of-band debug dumps.
+    output_order_selector: np.ndarray | None = None
 
     # Pre-bucketed per-token gather indices for the padded logprob path; None on
     # the legacy variable-shape path and on non-extend batches.

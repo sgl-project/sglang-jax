@@ -15,6 +15,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.lora.backend.bgmv_backend import BgmvLoRABackend
+from sgl_jax.srt.lora.layers import LoRALinear
 from sgl_jax.srt.lora.utils import (
     get_lora_a_output_sharding,
     get_lora_b_output_sharding,
@@ -31,6 +32,16 @@ def safe_matmul(a: jax.Array, b: jax.Array) -> jax.Array:
     """Matrix multiplication with mixed precision handling for bfloat16."""
     result = jnp.matmul(a.astype(jnp.float32), b.astype(jnp.float32))
     return result.astype(a.dtype)
+
+
+class FakeLoRABackend:
+    def run_lora_a_gemm(self, x, weights, sharding, scalings, token_indices):
+        del weights, sharding, scalings, token_indices
+        return x
+
+    def run_lora_b_gemm(self, x, weights, base_output, sharding, token_indices):
+        del x, weights, sharding, token_indices
+        return base_output + 100
 
 
 class BatchComposition(Enum):
@@ -263,6 +274,31 @@ class TestBgmvLoRABackend(CustomTestCase):
         self.mesh = create_device_mesh(
             ici_parallelism=[1, 1],
             dcn_parallelism=[1, 1],
+        )
+
+    def test_lora_linear_rank_zero_rows_return_base_output(self):
+        layer = LoRALinear(base_layer=None, lora_backend=FakeLoRABackend())
+        layer.A_buffer = jnp.empty((0,), dtype=jnp.float32)
+        layer.B_buffer = jnp.empty((0,), dtype=jnp.float32)
+        layer.lora_a_output_sharding = None
+        layer.lora_b_output_sharding = None
+
+        base_output = jnp.arange(12, dtype=jnp.float32).reshape(3, 4)
+        x = jnp.ones((3, 4), dtype=jnp.float32)
+        ranks = jnp.array([8, 0, 8], dtype=jnp.int32)
+
+        output = layer.apply_lora(
+            base_output=base_output,
+            x=x,
+            scalings=jnp.ones((3,), dtype=jnp.float32),
+            token_indices=jnp.array([1, 0, 1], dtype=jnp.int32),
+            ranks=ranks,
+        )
+
+        np.testing.assert_array_equal(np.asarray(output[1]), np.asarray(base_output[1]))
+        lora_rows = jnp.array([0, 2], dtype=jnp.int32)
+        np.testing.assert_array_equal(
+            np.asarray(output[lora_rows]), np.asarray(base_output[lora_rows] + 100)
         )
 
     def get_lora_batch_info_on_device(self, batch: ModelWorkerBatch):

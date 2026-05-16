@@ -23,6 +23,7 @@ from jax.sharding import Mesh
 
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.lora.backend.bgmv_backend import BgmvLoRABackend
+from sgl_jax.srt.lora.constants import is_base_lora_id, normalize_lora_id
 from sgl_jax.srt.lora.layers import BaseLayerWithLoRA
 from sgl_jax.srt.lora.lora import LoRAAdapter
 from sgl_jax.srt.lora.lora_config import LoRAConfig
@@ -98,6 +99,8 @@ class LoRAManager:
         self.mesh = mesh
         self.server_args = server_args
         self.model_config = model_config
+        self.static_lora = bool(getattr(server_args, "enable_static_lora", False))
+        self.num_lora_slots = max_loras_per_batch if self.static_lora else max_loras_per_batch + 1
 
         # Extract model architecture from hf_config
         self.num_layers = base_hf_config.num_hidden_layers
@@ -110,7 +113,6 @@ class LoRAManager:
         self.head_dim = getattr(base_hf_config, "head_dim", None)
         if self.head_dim is None:
             self.head_dim = self.hidden_size // self.num_attention_heads
-        self.static_lora = server_args.enable_static_lora
 
         # Get original num_kv_heads and tp_size for replication
         if model_config is not None:
@@ -263,9 +265,10 @@ class LoRAManager:
     def init_memory_pool(self):
         """Initialize the LoRA memory pool with proper sharding."""
         logger.info(
-            "Initializing LoRA memory pool: num_layers=%d, max_loras_per_batch=%d, max_lora_rank=%d",
+            "Initializing LoRA memory pool: num_layers=%d, max_loras_per_batch=%d, num_lora_slots=%d, max_lora_rank=%d",
             self.num_layers,
             self.max_loras_per_batch,
+            self.num_lora_slots,
             self.max_lora_rank,
         )
         logger.info(
@@ -292,6 +295,7 @@ class LoRAManager:
             head_dim=self.head_dim,
             original_num_kv_heads=self.original_num_kv_heads,
             tp_size=self.tp_size,
+            reserve_base_slot=not self.static_lora,
         )
         self.memory_pool.init_buffers()
 
@@ -371,7 +375,7 @@ class LoRAManager:
 
         # Create LoRA backend
         lora_backend = BgmvLoRABackend(
-            max_loras_per_batch=self.max_loras_per_batch,
+            max_loras_per_batch=self.num_lora_slots,
             max_lora_rank=self.max_lora_rank,
         )
 
@@ -421,22 +425,32 @@ class LoRAManager:
         Raises:
             ValueError: If batch exceeds max_loras_per_batch or adapter not loaded
         """
-        # Load active loras into lora memory pool
-        cur_uids = set(model_worker_batch.lora_ids)
+        # Load active LoRAs into the memory pool. Normalize the base-model
+        # sentinel and keep first-seen order stable so adapter slots are
+        # deterministic across batches.
+        model_worker_batch.lora_ids = [
+            normalize_lora_id(uid) for uid in model_worker_batch.lora_ids
+        ]
+        cur_uids = list(dict.fromkeys(model_worker_batch.lora_ids))
+        real_uids = [uid for uid in cur_uids if not is_base_lora_id(uid)]
 
-        assert len(cur_uids) <= self.max_loras_per_batch
+        if len(real_uids) > self.max_loras_per_batch:
+            raise ValueError(
+                f"Batch uses {len(real_uids)} LoRA adapters, exceeding "
+                f"max_loras_per_batch={self.max_loras_per_batch}"
+            )
 
         weight_indices = [0] * len(model_worker_batch.lora_ids)
-        lora_ranks = [0] * self.max_loras_per_batch
-        scalings = [0] * self.max_loras_per_batch
+        lora_ranks = [0] * self.num_lora_slots
+        scalings = [0] * self.num_lora_slots
         has_new_weights = False
 
         def prepare_static_lora_batch():
             self.lora_backend.prepare_lora_batch(
                 model_worker_batch=model_worker_batch,
                 weight_indices=[0] * len(model_worker_batch.lora_ids),
-                lora_ranks=[self.max_lora_rank] * self.max_loras_per_batch,
-                scalings=[self.server_args.lora_scaling] * self.max_loras_per_batch,
+                lora_ranks=[self.max_lora_rank] * self.num_lora_slots,
+                scalings=[self.server_args.lora_scaling] * self.num_lora_slots,
             )
 
         def prepare_dynamic_lora_batch():
@@ -608,7 +622,7 @@ class LoRAManager:
             from sgl_jax.srt.lora.backend.bgmv_backend import BgmvLoRABackend
 
             self.lora_backend = BgmvLoRABackend(
-                max_loras_per_batch=self.max_loras_per_batch,
+                max_loras_per_batch=self.num_lora_slots,
                 max_lora_rank=self.max_lora_rank,
             )
 

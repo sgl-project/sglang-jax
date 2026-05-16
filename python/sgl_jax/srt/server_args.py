@@ -1091,7 +1091,10 @@ class ServerArgs:
             "--max-loras-per-batch",
             type=int,
             default=8,
-            help="Maximum number of different LoRA adapters that can be used in a single batch.",
+            help=(
+                "Maximum number of different real LoRA adapters that can be used in a "
+                "single batch. Base-model requests do not count toward this limit."
+            ),
         )
         parser.add_argument(
             "--max-lora-rank",

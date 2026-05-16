@@ -25,6 +25,7 @@ from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.utils.jax_utils import effective_axis
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 logger = logging.getLogger(__name__)
@@ -76,9 +77,9 @@ def _compute_layer_slope(
 ) -> jax.Array:
     """Per-layer slope decay used as ``g_gamma`` by the simple_gla kernels.
 
-    Sharded along the ``tensor`` axis when ``mesh`` is provided, matching
-    the ``P("tensor")`` spec the slope is consumed with inside the jitted
-    forward.
+    Returned array is sharded along the ``tensor`` axis when the head count is
+    divisible by TP. Otherwise it stays replicated so shard_map specs can
+    match the actual array sharding under JAX 0.9.2.
     """
     base = np.asarray(_build_alibi_base_slopes(num_heads), dtype=np.float32)
     slope_np = -base * (1 - (layer_id - 1) / (num_hidden_layers - 1) + 1e-5)
@@ -198,7 +199,17 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         if decode_simple_gla_fused is None:
             raise ImportError("simple_gla_fused kernel is required for GLA decode")
 
-        head_axis = _head_axis(self.mesh, q.shape[1])
+        q_data = effective_axis(q, 0, "data")
+        q_head = effective_axis(q, 1, "tensor")
+        k_data = effective_axis(k, 0, "data")
+        k_head = effective_axis(k, 1, "tensor")
+        v_data = effective_axis(v, 0, "data")
+        v_head = effective_axis(v, 1, "tensor")
+        slope_head = effective_axis(slope, 0, "tensor")
+        state_data = effective_axis(recurrent_buffer, 0, "data")
+        state_head = effective_axis(recurrent_buffer, 1, "tensor")
+        idx_data = effective_axis(recurrent_indices, 0, "data")
+        has_data = effective_axis(has_initial_state, 0, "data")
 
         def _decode_fn(q_l, k_l, v_l, gamma, buf_l, idx_l, has_l):
             return decode_simple_gla_fused(
@@ -216,17 +227,17 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             _decode_fn,
             mesh=self.mesh,
             in_specs=(
-                P("data", head_axis, None),
-                P("data", head_axis, None),
-                P("data", head_axis, None),
-                P(head_axis),
-                P("data", head_axis, None, None),
-                P("data"),
-                P("data"),
+                P(q_data, q_head, None),  # q
+                P(k_data, k_head, None),  # k
+                P(v_data, v_head, None),  # v
+                P(slope_head),  # slope
+                P(state_data, state_head, None, None),  # recurrent_buffer
+                P(idx_data),  # recurrent_indices
+                P(has_data),  # has_initial_state
             ),
             out_specs=(
-                P("data", head_axis, None),
-                P("data", head_axis, None, None),
+                P(q_data, q_head, None),
+                P(state_data, state_head, None, None),
             ),
             check_vma=False,
         )(q, k, v, slope, recurrent_buffer, recurrent_indices, has_initial_state)
@@ -248,7 +259,18 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
 
         cu_seqlens = self.forward_metadata.cu_q_lens
         chunk_size = self.chunk_size
-        head_axis = _head_axis(self.mesh, q.shape[1])
+        q_data = effective_axis(q, 0, "data")
+        q_head = effective_axis(q, 1, "tensor")
+        k_data = effective_axis(k, 0, "data")
+        k_head = effective_axis(k, 1, "tensor")
+        v_data = effective_axis(v, 0, "data")
+        v_head = effective_axis(v, 1, "tensor")
+        slope_head = effective_axis(slope, 0, "tensor")
+        state_data = effective_axis(recurrent_buffer, 0, "data")
+        state_head = effective_axis(recurrent_buffer, 1, "tensor")
+        idx_data = effective_axis(recurrent_indices, 0, "data")
+        has_data = effective_axis(has_initial_state, 0, "data")
+        cu_data = effective_axis(cu_seqlens, 0, "data")
 
         def _prefill_fn(q_l, k_l, v_l, gamma, buf_l, idx_l, has_l, cu_l):
             h0 = buf_l[idx_l]
@@ -276,18 +298,18 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             _prefill_fn,
             mesh=self.mesh,
             in_specs=(
-                P("data", head_axis, None),
-                P("data", head_axis, None),
-                P("data", head_axis, None),
-                P(head_axis),
-                P("data", head_axis, None, None),
-                P("data"),
-                P("data"),
-                P("data"),
+                P(q_data, q_head, None),  # q
+                P(k_data, k_head, None),  # k
+                P(v_data, v_head, None),  # v
+                P(slope_head),  # slope
+                P(state_data, state_head, None, None),  # recurrent_buffer
+                P(idx_data),  # recurrent_indices
+                P(has_data),  # has_initial_state
+                P(cu_data),  # cu_seqlens
             ),
             out_specs=(
-                P("data", head_axis, None),
-                P("data", head_axis, None, None),
+                P(q_data, q_head, None),
+                P(state_data, state_head, None, None),
             ),
             check_vma=False,
         )(q, k, v, slope, recurrent_buffer, recurrent_indices, has_initial_state, cu_seqlens)

@@ -10,8 +10,8 @@ class BaseLoRABackend(nnx.Module):
        Each backend has its own implementation of Lora kernels.
 
     Args:
-        max_loras_per_batch: maximum number of different lora weights
-                             that can be applied in a single forward batch.
+        max_loras_per_batch: number of LoRA buffer slots available to the backend.
+                             Dynamic LoRA reserves one slot for base-model requests.
         device: the device where the backend runs.
     """
 
