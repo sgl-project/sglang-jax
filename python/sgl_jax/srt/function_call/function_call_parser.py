@@ -12,6 +12,7 @@ from sgl_jax.srt.function_call.core_types import ToolCallItem
 from sgl_jax.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sgl_jax.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sgl_jax.srt.function_call.mimo_detector import MiMoDetector
+from sgl_jax.srt.function_call.qwen25_detector import Qwen25Detector
 from sgl_jax.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sgl_jax.srt.function_call.utils import get_json_schema_constraint
 
@@ -28,6 +29,7 @@ class FunctionCallParser:
     """
 
     ToolCallParserEnum: dict[str, type[BaseFormatDetector]] = {
+        "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,
         "mimo": MiMoDetector,
         "glm47": Glm47MoeDetector,
