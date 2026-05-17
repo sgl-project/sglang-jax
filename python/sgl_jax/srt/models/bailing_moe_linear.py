@@ -1,5 +1,4 @@
 import copy
-import functools
 import logging
 
 import jax
@@ -20,7 +19,7 @@ from sgl_jax.srt.layers.embeddings import (
     get_rope,
 )
 from sgl_jax.srt.layers.layernorm import RMSNorm
-from sgl_jax.srt.layers.linear import LinearBase, MergedColumnParallelLinear
+from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import (
     EPMoE,
@@ -47,38 +46,6 @@ def is_linear_layer(layer_idx: int | None, layer_group_size: int) -> bool:
     return (layer_idx + 1) % layer_group_size != 0
 
 
-@functools.partial(
-    jax.jit, static_argnames=("mesh", "tp_size", "num_heads_local", "head_dim")
-)
-def _restripe_qkv_weight(w, *, mesh, tp_size, num_heads_local, head_dim):
-    """HF ``[Q_full|K_full|V_full]`` → stripe-interleaved ``[Q_r0|K_r0|V_r0|...]``.
-
-    Hoisted to module scope so all decoder layers share one jit cache entry
-    (closure-captured Python ints would otherwise force a recompile per layer).
-    """
-    hidden = w.shape[0]
-    full_qkv = w.shape[1]
-    w_full = jax.lax.with_sharding_constraint(w, NamedSharding(mesh, P(None, None)))
-    w_full = w_full.reshape(hidden, 3, tp_size, num_heads_local, head_dim)
-    w_full = jnp.transpose(w_full, (0, 2, 1, 3, 4))
-    w_full = w_full.reshape(hidden, full_qkv)
-    return jax.lax.with_sharding_constraint(
-        w_full, NamedSharding(mesh, P(None, "tensor"))
-    )
-
-
-@functools.partial(
-    jax.jit, static_argnames=("mesh", "tp_size", "num_heads_local", "head_dim")
-)
-def _restripe_qkv_bias(b, *, mesh, tp_size, num_heads_local, head_dim):
-    full_qkv = b.shape[0]
-    b_full = jax.lax.with_sharding_constraint(b, NamedSharding(mesh, P(None)))
-    b_full = b_full.reshape(3, tp_size, num_heads_local, head_dim)
-    b_full = jnp.transpose(b_full, (1, 0, 2, 3))
-    b_full = b_full.reshape(full_qkv)
-    return jax.lax.with_sharding_constraint(b_full, NamedSharding(mesh, P("tensor")))
-
-
 class BailingMoELinearAttention(nnx.Module):
     """BailingMoeV2.5 GLA block wired through RadixLightningAttention."""
 
@@ -96,22 +63,16 @@ class BailingMoELinearAttention(nnx.Module):
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
         self.mesh = mesh
-        self.tp_size = mesh.shape.get("tensor", 1)
         self.linear_silu = getattr(config, "use_linear_silu", getattr(config, "linear_silu", False))
         self.linear_rope = getattr(config, "linear_rope", True)
 
         inner_size = self.num_heads * self.head_dim
         qkv_bias = getattr(config, "use_bias", False) or getattr(config, "use_qkv_bias", False)
-        # Fused Q/K/V with stripe-interleaved per-rank layout
-        # ``[Q_my | K_my | V_my]``: keeps the post-projection split contiguous
-        # within each TP shard, so the ``[T, num_heads, head_dim]`` reshape
-        # below is a pure no-op slice on local data instead of an all-to-all.
-        # ``post_load_weights`` rewrites the loaded HF block-concat weight
-        # into that layout; see the docstring there for the column permutation.
-        self.qkv_proj = MergedColumnParallelLinear(
+        self.qkv_proj = LinearBase(
             input_size=self.hidden_size,
-            output_sizes=[inner_size, inner_size, inner_size],
+            output_size=3 * inner_size,
             use_bias=qkv_bias,
+            kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
             scope_name="query_key_value",
@@ -195,31 +156,12 @@ class BailingMoELinearAttention(nnx.Module):
         if self.linear_silu:
             qkv = jax.nn.silu(qkv)
 
-        tp_size = self.tp_size
-        num_heads_local = self.num_heads // tp_size
-        head_dim = self.head_dim
-
-        def _split_local(qkv_local):
-            # Per-shard layout is ``[Q_my | K_my | V_my]`` along the last axis,
-            # so a contiguous 3-way split is a pure local op (no all-to-all).
-            t_local = qkv_local.shape[0]
-            q_local, k_local, v_local = jnp.split(qkv_local, 3, axis=-1)
-            q_local = q_local.reshape(t_local, num_heads_local, head_dim)
-            k_local = k_local.reshape(t_local, num_heads_local, head_dim)
-            v_local = v_local.reshape(t_local, num_heads_local, head_dim)
-            return q_local, k_local, v_local
-
-        q, k, v = jax.shard_map(
-            _split_local,
-            mesh=self.mesh,
-            in_specs=P("data", "tensor"),
-            out_specs=(
-                P("data", "tensor", None),
-                P("data", "tensor", None),
-                P("data", "tensor", None),
-            ),
-            check_vma=False,
-        )(qkv)
+        qkv = jax.lax.reshape(
+            qkv,
+            (hidden_states.shape[0], 3, self.num_heads, self.head_dim),
+            out_sharding=NamedSharding(self.mesh, P("data", None, "tensor", None)),
+        )
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
 
         if self.q_norm is not None:
             q = self.q_norm(q)
@@ -235,49 +177,6 @@ class BailingMoELinearAttention(nnx.Module):
         attn_output = self.g_norm(attn_output) * jax.nn.sigmoid(gate)
         output, _ = self.dense(attn_output)
         return output, pool_updates
-
-    def post_load_weights(self) -> None:
-        """Permute the loaded HF block-concat QKV weight into stripe-interleaved layout.
-
-        ``WeightLoader`` lands the HuggingFace ``query_key_value`` weight as
-        ``[hidden, 3*M]`` with HF-native column order
-        ``[Q_full | K_full | V_full]`` and TP shard ``(None, "tensor")``.
-        That layout cuts each TP rank's local columns mid-component (rank 0
-        sees only Q heads), so the per-shard ``[T_local, H_local, head_dim]``
-        view assumed by :meth:`__call__` would require an all-to-all.
-
-        We rearrange columns to the stripe-interleaved layout
-        ``[Q_rank0 | K_rank0 | V_rank0 | Q_rank1 | ...]`` so the same
-        ``(None, "tensor")`` shard places ``[Q_my | K_my | V_my]`` contiguously
-        on each device. The reshape runs once per layer at load time inside a
-        single jit; the temporary fully-replicated tensor is one layer's QKV
-        weight (~96 MiB at bf16 for Ling-2.6-flash).
-
-        Bias follows the same layout when present.
-        """
-        tp_size = self.tp_size
-        if tp_size == 1:
-            return
-        num_heads_local = self.num_heads // tp_size
-        head_dim = self.head_dim
-        mesh = self.mesh
-
-        self.qkv_proj.weight.value = _restripe_qkv_weight(
-            self.qkv_proj.weight.value,
-            mesh=mesh,
-            tp_size=tp_size,
-            num_heads_local=num_heads_local,
-            head_dim=head_dim,
-        )
-
-        if self.qkv_proj.bias is not None:
-            self.qkv_proj.bias.value = _restripe_qkv_bias(
-                self.qkv_proj.bias.value,
-                mesh=mesh,
-                tp_size=tp_size,
-                num_heads_local=num_heads_local,
-                head_dim=head_dim,
-            )
 
 
 class BailingMoEGQAAttention(nnx.Module):
@@ -788,8 +687,6 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
         loader.load_weights_from_safetensors(mappings)
         for layer in self.model.layers:
             if isinstance(layer.self_attn, DeepseekV3Attention):
-                layer.self_attn.post_load_weights()
-            elif isinstance(layer.self_attn, BailingMoELinearAttention):
                 layer.self_attn.post_load_weights()
         logger.info("BailingMoeV2.5 weights loaded successfully!")
 
