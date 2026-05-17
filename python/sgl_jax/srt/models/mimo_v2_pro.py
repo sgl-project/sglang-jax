@@ -194,7 +194,7 @@ class MiMoV2ForCausalLM(MiMoV2FlashForCausalLM):
 
             if is_fp8:
                 augmented = {}
-                use_model_mesh_for_scale = moe_backend == "fused"
+                use_model_mesh_for_scale = moe_backend in ("fused", "fused_v2")
                 for key, mapping in moe_mappings.items():
                     augmented[key] = mapping
                     target_param = mapping.target_path[0]
