@@ -298,8 +298,14 @@ class Scheduler(
         )
 
         # launch draft worker
+        self._spec_multi_layer = False
         if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
-            if self.spec_algorithm.is_nextn():
+            # Multi-layer vs single-layer is a model property (how many MTP heads
+            # the target ships), not a CLI-algorithm property. NEXTN with a single
+            # MTP head behaves exactly like EAGLE (same head run N times).
+            n_mtp = getattr(self.tp_worker.model_config.hf_config, "num_nextn_predict_layers", None)
+            self._spec_multi_layer = n_mtp is not None and n_mtp > 1
+            if self._spec_multi_layer:
                 from sgl_jax.srt.speculative.multi_layer_eagle_worker import (
                     MultiLayerEAGLEWorker as _SpecWorkerCls,
                 )
@@ -1809,11 +1815,11 @@ class Scheduler(
                 next_token_ids = np.array(jax.device_get(next_token_ids_device))
                 self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
         else:
-            if batch.forward_mode.is_extend() and self.spec_algorithm.is_nextn():
-                # NEXTN (MoE+EP target) prefill must use the same padded mwb as
-                # nospec so target forward sees identical input shapes (#1090).
-                # Dense EAGLE/EAGLE3 targets don't need this and EagleDraftWorker
-                # doesn't yet handle padded prefill mwb.
+            if batch.forward_mode.is_extend() and self._spec_multi_layer:
+                # Multi-layer-MTP (MoE+EP target) prefill must use the same padded
+                # mwb as nospec so target forward sees identical shapes (#1090).
+                # EagleDraftWorker doesn't yet handle padded prefill mwb, so gate
+                # on the worker selection rather than the algorithm flag.
                 model_worker_batch = batch.get_model_worker_batch(
                     precompile_token_paddings,
                     precompile_bs_paddings,

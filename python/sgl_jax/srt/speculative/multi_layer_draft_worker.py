@@ -76,7 +76,7 @@ class MultiLayerDraftWorker(EagleDraftWorker):
 
         self.num_mtp_layers = self.speculative_num_steps
         cfg_mtp = getattr(target_worker.model_config.hf_config, "num_nextn_predict_layers", None)
-        assert cfg_mtp is None or cfg_mtp == self.num_mtp_layers, (
+        assert cfg_mtp is not None and cfg_mtp > 1 and cfg_mtp == self.num_mtp_layers, (
             f"--speculative-num-steps={self.speculative_num_steps} must equal the "
             f"model's num_nextn_predict_layers={cfg_mtp} (one runner per MTP layer)"
         )
