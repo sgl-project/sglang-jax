@@ -952,7 +952,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-backend",
             type=str,
-            choices=["epmoe", "fused", "auto"],
+            choices=["epmoe", "fused", "fused_v2", "auto"],
             default=ServerArgs.moe_backend,
             help="The backend to use for MoE models.",
         )
