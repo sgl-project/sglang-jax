@@ -35,8 +35,8 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         # Prefill configs
         ('bfloat16', 'float8_e4m3fn', 2048, 384, 8, 6144, 2048, 32, False, False): (128, 512, 128, 256, None),
         ('bfloat16', 'float8_e4m3fn', 4096, 384, 8, 6144, 2048, 32, False, False): (128, 512, 128, 256, None),
-        ('bfloat16', 'float8_e4m3fn', 8192, 384, 8, 6144, 2048, 32, False, False): (128, 512, 128, 256, None),
-        ('bfloat16', 'float8_e4m3fn', 16384, 384, 8, 6144, 2048, 32, False, False): (128, 512, 128, 256, None),
+        ('bfloat16', 'float8_e4m3fn', 8192, 384, 8, 6144, 2048, 32, False, False): (128, 1024, 128, 256, None),
+        ('bfloat16', 'float8_e4m3fn', 16384, 384, 8, 6144, 2048, 32, False, False): (128, 1024, 128, 256, None),
     },
     "*": {},
 }
@@ -124,6 +124,14 @@ def get_tuned_fused_moe_v2_block_config(
         raise ValueError(f"Unexpected v2 tuned config tuple length: {len(cfg_tuple)}")
 
     bt, bf, btc, bse, bts = cfg_tuple
-    logger.info("Using v2 tuned block config: bt=%d bf=%d btc=%d bse=%d bts=%s", bt, bf, btc, bse, bts)
+    logger.info(
+        "Using v2 tuned block config: num_tokens=%d bt=%d bf=%d btc=%d bse=%d bts=%s",
+        num_tokens,
+        bt,
+        bf,
+        btc,
+        bse,
+        bts,
+    )
 
     return FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse, bts=bts)
