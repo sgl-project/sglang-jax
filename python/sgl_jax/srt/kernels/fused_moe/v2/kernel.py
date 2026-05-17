@@ -124,6 +124,16 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return val.strip().lower() in ("1", "true", "t", "yes", "y", "on")
 
 
+def _align_local_tokens_for_decode(local_num_tokens: int) -> int:
+    if local_num_tokens <= 0:
+        raise ValueError(f"Expected {local_num_tokens=} > 0.")
+    # TPU Mosaic lowering needs the token x hidden tile shape to preserve the
+    # small-dimension alignment; keep decode shapes at least 8 x 128 aligned.
+    if local_num_tokens <= 8:
+        return 8
+    return ((local_num_tokens + 7) // 8) * 8
+
+
 # ---------------------------------------------------------------------------
 # Reference implementation
 # ---------------------------------------------------------------------------
@@ -300,6 +310,8 @@ def _fused_ep_moe_kernel(
     disable_acc_and_store: bool = False,
     use_jax_allreduce_metadata: bool = True,
     decode_mode: bool = False,
+    direct_scaled_dot: bool = False,
+    skip_decode_sync_barrier: bool = False,
     bt: int,
     bf: int,
     btc: int,
@@ -348,8 +360,10 @@ def _fused_ep_moe_kernel(
         return (ep_rank // tp_size, ep_rank % tp_size)
 
     # ===== Sync barrier — signal ALL devices =====
-    def sync_barrier():
-        if disable_sync_barrier:
+    skip_sync_barrier = skip_decode_sync_barrier and num_bt == 1
+
+    def sync_barrier(*, force: bool = False):
+        if disable_sync_barrier or (skip_sync_barrier and not force):
             return
         for i in range(num_devices):
             pltpu.semaphore_signal(
@@ -507,12 +521,12 @@ def _fused_ep_moe_kernel(
             d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
             d2e_count_vmem[my_id] = local_sizes
 
-            sync_barrier()
+            sync_barrier(force=True)
 
             if num_devices > 0 and (num_devices & (num_devices - 1)) == 0:
                 rounds = int(math.log2(num_devices))
                 for round_id in range(rounds):
-                    sync_barrier()
+                    sync_barrier(force=True)
 
                     chunk = 1 << round_id
                     chunk_i32 = jnp.int32(chunk)
@@ -598,7 +612,7 @@ def _fused_ep_moe_kernel(
                         sem=md_send_sem,
                     ).wait()
 
-            sync_barrier()
+            sync_barrier(force=True)
 
             reduced_sizes = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
             reduced_starts = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
@@ -999,7 +1013,7 @@ def _fused_ep_moe_kernel(
     # ===== Dequant fp8 → bf16 in VMEM (after DMA wait, before dot) =====
 
     def dequant_w1(slot):
-        if w1_scale_hbm is None:
+        if w1_scale_hbm is None or direct_scaled_dot:
             return
         for p in range(t_packing):
             def _dq_w1(sg_id, _):
@@ -1013,7 +1027,7 @@ def _fused_ep_moe_kernel(
             lax.fori_loop(0, n_sg, _dq_w1, None, unroll=n_sg)
 
     def dequant_w3(slot):
-        if w3_scale_hbm is None:
+        if w3_scale_hbm is None or direct_scaled_dot:
             return
         for p in range(t_packing):
             def _dq_w3(sg_id, _):
@@ -1027,7 +1041,7 @@ def _fused_ep_moe_kernel(
             lax.fori_loop(0, n_sg, _dq_w3, None, unroll=n_sg)
 
     def dequant_w2(slot):
-        if w2_scale_hbm is None:
+        if w2_scale_hbm is None or direct_scaled_dot:
             return
         for p in range(t_packing):
             def _dq_w2(sg_id, _):
@@ -1089,7 +1103,7 @@ def _fused_ep_moe_kernel(
                     if num_bf >= 2:
                         start_fetch_w1(local_e_id, 1, 1)
                         start_fetch_w3(local_e_id, 1, 1)
-                        start_fetch_w2(local_e_id, 1, 1, priority=0)
+                        start_fetch_w2(local_e_id, 1, 1, priority=1)
 
                 for bf_id in range(num_bf):
                     if decode_mode:
@@ -1102,42 +1116,139 @@ def _fused_ep_moe_kernel(
 
                     wait_fetch_w1(slot)
                     wait_fetch_w3(slot)
-                    wait_fetch_w2(slot)
 
                     dequant_w1(slot)
                     dequant_w3(slot)
-                    dequant_w2(slot)
 
                     # Gate/up
                     def gate_up_btc(btc_id, ___):
                         gate = jnp.zeros((btc, bf), dtype=jnp.float32)
                         up = jnp.zeros((btc, bf), dtype=jnp.float32)
                         if not disable_dynamic_ffn1:
-                            for p_id in range(t_packing):
-                                x_slice = b_x_vmem[
-                                    pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
-                                ]
-                                w1_tile = b_w1_dq_vmem[p_id] if w1_scale_hbm is not None else b_w1_x2_vmem[slot, p_id]
-                                w3_tile = b_w3_dq_vmem[p_id] if w3_scale_hbm is not None else b_w3_x2_vmem[slot, p_id]
-                                gate += jnp.dot(x_slice, w1_tile, preferred_element_type=jnp.float32)
-                                up += jnp.dot(x_slice, w3_tile, preferred_element_type=jnp.float32)
+                            if direct_scaled_dot and w1_scale_hbm is not None:
+                                for p_id in range(t_packing):
+                                    def _ffn1_sg_body(sg_id, carry):
+                                        gate_acc, up_acc = carry
+                                        sg_off = sg_id * quant_block_k
+                                        x_slice = b_x_vmem[
+                                            pl.ds(btc_id * btc, btc),
+                                            p_id,
+                                            pl.ds(sg_off, quant_block_k),
+                                        ]
+                                        w1_tile = b_w1_x2_vmem[
+                                            slot,
+                                            p_id,
+                                            pl.ds(sg_off, quant_block_k),
+                                            pl.ds(0, bf),
+                                        ]
+                                        w3_tile = b_w3_x2_vmem[
+                                            slot,
+                                            p_id,
+                                            pl.ds(sg_off, quant_block_k),
+                                            pl.ds(0, bf),
+                                        ]
+                                        d1 = jnp.dot(
+                                            x_slice, w1_tile,
+                                            preferred_element_type=jnp.float32,
+                                        )
+                                        s1 = b_w1_scale_x2_vmem[
+                                            slot,
+                                            p_id,
+                                            pl.ds(sg_id, 1),
+                                            0,
+                                            pl.ds(0, bf),
+                                        ].reshape(1, bf)
+                                        gate_acc += d1 * jnp.broadcast_to(s1, d1.shape)
+
+                                        d3 = jnp.dot(
+                                            x_slice, w3_tile,
+                                            preferred_element_type=jnp.float32,
+                                        )
+                                        s3 = b_w3_scale_x2_vmem[
+                                            slot,
+                                            p_id,
+                                            pl.ds(sg_id, 1),
+                                            0,
+                                            pl.ds(0, bf),
+                                        ].reshape(1, bf)
+                                        up_acc += d3 * jnp.broadcast_to(s3, d3.shape)
+                                        return gate_acc, up_acc
+
+                                    gate, up = lax.fori_loop(
+                                        0, n_sg, _ffn1_sg_body, (gate, up), unroll=n_sg,
+                                    )
+                            else:
+                                for p_id in range(t_packing):
+                                    x_slice = b_x_vmem[
+                                        pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
+                                    ]
+                                    w1_tile = b_w1_dq_vmem[p_id] if w1_scale_hbm is not None else b_w1_x2_vmem[slot, p_id]
+                                    w3_tile = b_w3_dq_vmem[p_id] if w3_scale_hbm is not None else b_w3_x2_vmem[slot, p_id]
+                                    gate += jnp.dot(x_slice, w1_tile, preferred_element_type=jnp.float32)
+                                    up += jnp.dot(x_slice, w3_tile, preferred_element_type=jnp.float32)
                         b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
                         b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
                         return None
 
                     lax.fori_loop(0, num_btc_per_bts, gate_up_btc, None)
 
+                    # W2 DMA is started with W1/W3. Defer its wait until the
+                    # down projection so W2 transfer can overlap gate/up.
+                    wait_fetch_w2(slot)
+                    dequant_w2(slot)
+
                     # Act+down — accumulate in VMEM f32 across bf tiles
                     def act_down_btc(btc_id, ___):
-                        gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
-                        up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
-                        act = activation_fn(gate, up_val, act_fn)
+                        use_direct_w2 = direct_scaled_dot and w2_scale_hbm is not None
+                        if not use_direct_w2:
+                            gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
+                            up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
+                            act = activation_fn(gate, up_val, act_fn)
                         if not disable_dynamic_ffn2:
                             for p_id in range(t_packing):
-                                w2_tile = b_w2_dq_vmem[p_id] if w2_scale_hbm is not None else b_w2_x2_vmem[slot, p_id]
-                                partial = jnp.dot(
-                                    act, w2_tile, preferred_element_type=jnp.float32,
-                                )
+                                if use_direct_w2:
+                                    def _ffn2_sg_body(sg_id, partial_acc):
+                                        sg_off = sg_id * quant_block_k
+                                        gate_slice = b_gate_acc_vmem[
+                                            pl.ds(btc_id * btc, btc),
+                                            pl.ds(sg_off, quant_block_k),
+                                        ]
+                                        up_slice = b_up_acc_vmem[
+                                            pl.ds(btc_id * btc, btc),
+                                            pl.ds(sg_off, quant_block_k),
+                                        ]
+                                        act_slice = activation_fn(gate_slice, up_slice, act_fn)
+                                        w2_tile = b_w2_x2_vmem[
+                                            slot,
+                                            p_id,
+                                            pl.ds(sg_off, quant_block_k),
+                                            pl.ds(0, h_per_t),
+                                        ]
+                                        d = jnp.dot(
+                                            act_slice, w2_tile,
+                                            preferred_element_type=jnp.float32,
+                                        )
+                                        s = b_w2_scale_x2_vmem[
+                                            slot,
+                                            p_id,
+                                            pl.ds(sg_id, 1),
+                                            0,
+                                            pl.ds(0, h_per_t),
+                                        ].reshape(1, h_per_t)
+                                        return partial_acc + d * jnp.broadcast_to(s, d.shape)
+
+                                    partial = lax.fori_loop(
+                                        0,
+                                        n_sg2,
+                                        _ffn2_sg_body,
+                                        jnp.zeros((btc, h_per_t), dtype=jnp.float32),
+                                        unroll=n_sg2,
+                                    )
+                                else:
+                                    w2_tile = b_w2_dq_vmem[p_id] if w2_scale_hbm is not None else b_w2_x2_vmem[slot, p_id]
+                                    partial = jnp.dot(
+                                        act, w2_tile, preferred_element_type=jnp.float32,
+                                    )
                                 acc_ref = b_y_acc_vmem.at[
                                     pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
                                 ]
@@ -1155,7 +1266,7 @@ def _fused_ep_moe_kernel(
                         if next_bf_id < num_bf:
                             start_fetch_w1(local_e_id, slot, next_bf_id)
                             start_fetch_w3(local_e_id, slot, next_bf_id)
-                            start_fetch_w2(local_e_id, slot, next_bf_id, priority=0)
+                            start_fetch_w2(local_e_id, slot, next_bf_id, priority=1)
 
                 # Final writeback: f32 → bf16, then DMA to HBM (once per bts tile)
                 def writeback_btc(btc_id, ___):
@@ -1610,7 +1721,8 @@ def jax_allreduce_metadata_by_bt(
         "disable_acc_and_store",
         "use_jax_allreduce_metadata",
         "block_config", "dp_axis_name", "tp_axis_name",
-        "quant_block_k", "decode_mode",
+        "quant_block_k", "decode_mode", "direct_scaled_dot",
+        "skip_decode_sync_barrier",
     ],
 )
 def fused_ep_moe_v2(
@@ -1641,6 +1753,8 @@ def fused_ep_moe_v2(
     w3_scale: jax.Array | None = None,
     block_config: FusedMoEBlockConfig | None = None,
     decode_mode: bool = False,
+    direct_scaled_dot: bool = False,
+    skip_decode_sync_barrier: bool = False,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
 ):
@@ -1654,9 +1768,9 @@ def fused_ep_moe_v2(
 
     local_num_tokens = num_tokens // ep_size
 
-    _BTC_ALIGN = 8
     orig_local_num_tokens = local_num_tokens
-    pad_local = (_BTC_ALIGN - local_num_tokens % _BTC_ALIGN) % _BTC_ALIGN
+    aligned_local_num_tokens = _align_local_tokens_for_decode(local_num_tokens)
+    pad_local = aligned_local_num_tokens - local_num_tokens
     if pad_local > 0:
         local_num_tokens = local_num_tokens + pad_local
         num_tokens = local_num_tokens * ep_size
@@ -1735,8 +1849,15 @@ def fused_ep_moe_v2(
     acc_bt = math.gcd(bt, 16)
     hbm_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     wb_slots = 1 if decode_mode else 2
+    use_w1_dequant_scratch = w1_scale is not None and not direct_scaled_dot
+    use_w3_dequant_scratch = w3_scale is not None and not direct_scaled_dot
+    use_w2_dequant_scratch = w2_scale is not None and not direct_scaled_dot
 
     scope_name = f"fused-moe-v2-k_{top_k}-bt_{bt}_{bts}_{btc}-bf_{bf}"
+    if direct_scaled_dot:
+        scope_name += "-direct_scaled_dot"
+    if skip_decode_sync_barrier:
+        scope_name += "-skip_decode_sync"
     if w1_shared is not None:
         scope_name += f"-se_bse_{bse}"
 
@@ -1767,11 +1888,11 @@ def fused_ep_moe_v2(
         (None if w2_scale is None else
             pltpu.VMEM((wb_slots, t_packing, bf // quant_block_k, 1, h_per_t), jnp.float32)),  # W2 scale
         # VMEM: dequant scratch (single-buf, None when not quantized)
-        (None if w1_scale is None else
+        (None if not use_w1_dequant_scratch else
             pltpu.VMEM((t_packing, h_per_t, bf), jnp.bfloat16)),                    # W1 dequant
-        (None if w3_scale is None else
+        (None if not use_w3_dequant_scratch else
             pltpu.VMEM((t_packing, h_per_t, bf), jnp.bfloat16)),                    # W3 dequant
-        (None if w2_scale is None else
+        (None if not use_w2_dequant_scratch else
             pltpu.VMEM((t_packing, bf, h_per_t), jnp.bfloat16)),                    # W2 dequant
         # VMEM: gate/up accumulators (per bts tile)
         pltpu.VMEM((bts, bf), jnp.float32),                                 # gate_acc
@@ -1822,6 +1943,8 @@ def fused_ep_moe_v2(
                 disable_acc_and_store=disable_acc_and_store,
                 use_jax_allreduce_metadata=use_jax_allreduce_metadata,
                 decode_mode=decode_mode,
+                direct_scaled_dot=direct_scaled_dot,
+                skip_decode_sync_barrier=skip_decode_sync_barrier,
                 bt=bt, bf=bf, btc=btc, bts=bts, bse=bse,
                 quant_block_k=quant_block_k,
             ),
@@ -1895,13 +2018,12 @@ def fused_ep_moe_v2(
             tokens = jnp.pad(tokens, ((0, pad_local), (0, 0), (0, 0)))
             topk_weights = jnp.pad(topk_weights, ((0, pad_local), (0, 0)),
                                    constant_values=0.0)
-            # Route padded tokens to the same experts as real tokens
-            # (cyclic repeat) so no NEW experts are activated.
-            pad_ids = jnp.tile(
+            topk_ids = jnp.pad(
                 topk_ids,
-                (-(-pad_local // orig_local_num_tokens), 1),
-            )[:pad_local]
-            topk_ids = jnp.concatenate([topk_ids, pad_ids], axis=0)
+                ((0, pad_local), (0, 0)),
+                mode="constant",
+                constant_values=-1,
+            )
 
         if needs_jax_allreduce:
             md_starts, md_sizes, md_d2e = jax_allreduce_metadata_by_bt(
