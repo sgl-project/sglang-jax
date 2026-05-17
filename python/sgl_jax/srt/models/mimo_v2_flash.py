@@ -782,7 +782,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                 # FusedEPMoE scales must live on the model mesh (data, tensor)
                 # to avoid expert-mesh NamedSharding conflicts in shard_map.
                 # EPMoE scales stay on the expert mesh.
-                use_model_mesh_for_scale = moe_backend == "fused"
+                use_model_mesh_for_scale = moe_backend in ("fused", "fused_v2")
                 for key, mapping in moe_mappings.items():
                     augmented[key] = mapping
                     # Add scale mapping for each MoE group
