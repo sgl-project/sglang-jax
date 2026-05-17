@@ -36,6 +36,7 @@ class MoEBackend(str, Enum):
 
     EPMOE = "epmoe"  # Native Expert Parallel MoE (default)
     FUSED = "fused"  # Fused Kernel (TPU-optimized)
+    FUSED_V2 = "fused_v2"  # Fused Kernel V2 (Strix-style double-buffer)
     AUTO = "auto"  # Automatically select based on ep_size
 
 

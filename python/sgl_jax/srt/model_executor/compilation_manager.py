@@ -83,7 +83,7 @@ class CompilationManager:
         for bs in bs_list:
             if (
                 bs <= self.max_padded_batch_size
-                and (self.moe_backend != "fused" or bs >= self.tp_size * 2)
+                and (self.moe_backend not in ("fused", "fused_v2") or bs >= self.tp_size * 2)
                 and bs >= self.dp_size
             ):
                 buckets.append(bs)
