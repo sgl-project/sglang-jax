@@ -37,7 +37,7 @@ class Qwen25Detector(BaseFormatDetector):
 
     def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         idx = text.find(self.bot_token)
-        normal_text = text[:idx] if idx != -1 else text
+        normal_text = text[:idx].strip() if idx != -1 else text
         if idx == -1:
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
@@ -51,9 +51,7 @@ class Qwen25Detector(BaseFormatDetector):
                 logger.warning("Failed to parse Qwen25 tool_call JSON: %s (%s)", match, e)
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
-    def parse_streaming_increment(
-        self, new_text: str, tools: list[Tool]
-    ) -> StreamingParseResult:
+    def parse_streaming_increment(self, new_text: str, tools: list[Tool]) -> StreamingParseResult:
         result = super().parse_streaming_increment(new_text, tools)
         if not result.normal_text:
             return result

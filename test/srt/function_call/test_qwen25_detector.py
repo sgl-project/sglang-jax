@@ -53,7 +53,7 @@ class TestQwen25Detector(CustomTestCase):
             "</tool_call>"
         )
         result = Qwen25Detector().detect_and_parse(text, [_weather_tool()])
-        self.assertEqual(result.normal_text, "thinking done\n")
+        self.assertEqual(result.normal_text, "thinking done")
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(json.loads(result.calls[0].parameters), {"location": "Beijing"})
@@ -79,11 +79,7 @@ class TestQwen25Detector(CustomTestCase):
         self.assertEqual(result.calls, [])
 
     def test_detect_and_parse_unknown_function(self):
-        text = (
-            "<tool_call>\n"
-            '{"name": "mystery", "arguments": {"x": 1}}\n'
-            "</tool_call>"
-        )
+        text = "<tool_call>\n" '{"name": "mystery", "arguments": {"x": 1}}\n' "</tool_call>"
         result = Qwen25Detector().detect_and_parse(text, [_weather_tool()])
         # Unknown function: parse_base_json logs a warning and drops it.
         self.assertEqual(result.calls, [])
@@ -130,9 +126,7 @@ class TestQwen25Detector(CustomTestCase):
         self.assertEqual(r1.normal_text, "plain text. ")
         self.assertEqual(r1.calls, [])
         r2 = det.parse_streaming_increment(
-            "<tool_call>\n"
-            '{"name": "square", "arguments": {"x": 3}}\n'
-            "</tool_call>",
+            "<tool_call>\n" '{"name": "square", "arguments": {"x": 3}}\n' "</tool_call>",
             tools,
         )
         names = [c.name for c in r2.calls if c.name]
@@ -150,6 +144,15 @@ class TestQwen25Detector(CustomTestCase):
         grammar = Qwen25Detector().build_ebnf([_weather_tool(), _square_tool()])
         self.assertIn("get_weather", grammar)
         self.assertIn("square", grammar)
+
+    def test_build_ebnf_compiles(self):
+        """Compile the grammar with llguidance to catch escape/syntax bugs
+        that a substring check would miss (a malformed grammar would still
+        contain the tool name but raise GrammarError at request time)."""
+        from llguidance import grammar_from
+
+        grammar = Qwen25Detector().build_ebnf([_weather_tool(), _square_tool()])
+        grammar_from("lark", grammar)
 
 
 if __name__ == "__main__":
