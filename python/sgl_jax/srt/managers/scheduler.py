@@ -298,7 +298,7 @@ class Scheduler(
                 device_indexes=server_args.device_indexes,
             )
 
-        if server_args.moe_backend == "fused":
+        if server_args.moe_backend in ("fused", "fused_v2"):
             mesh_ep_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
             if server_args.ep_size != mesh_ep_size:
                 logger.warning(

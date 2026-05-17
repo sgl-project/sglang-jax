@@ -516,3 +516,87 @@ class FusedEPMoE(nnx.Module):
 
         output = jax.sharding.reshard(output, NamedSharding(self.mesh, P("data", None)))
         return output
+
+
+class FusedEPMoEV2(FusedEPMoE):
+    """V2 fused EP-MoE layer using the Strix-style double-buffer kernel.
+
+    Inherits weight init and quantization from FusedEPMoE. Overrides __call__
+    to dispatch to fused_ep_moe_v2 with v2-specific flags.
+    """
+
+    def __call__(
+        self,
+        hidden_states: jax.Array,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        *,
+        block_config=None,
+    ) -> jax.Array:
+        from sgl_jax.srt.kernels.fused_moe.v2.kernel import (
+            FusedMoEBlockConfig as V2BlockConfig,
+            fused_ep_moe_v2,
+        )
+        from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
+            get_tuned_fused_moe_v2_block_config,
+        )
+
+        assert hidden_states.ndim == 2
+
+        w1_scale = self.w1_scale.value if self.w1_scale is not None else None
+        w3_scale = self.w3_scale.value if self.w3_scale is not None else None
+        w2_scale = self.w2_scale.value if self.w2_scale is not None else None
+
+        w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
+        w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
+        w2_shared_val = self.w2_shared.value if self.w2_shared is not None else None
+
+        if block_config is None:
+            block_config = get_tuned_fused_moe_v2_block_config(
+                num_tokens=hidden_states.shape[0],
+                num_experts=self.num_experts,
+                top_k=self.num_experts_per_tok,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_dim,
+                dtype=hidden_states.dtype,
+                weight_dtype=self.w1.value.dtype,
+                ep_size=self.ep_size,
+                use_shared_expert=self.w1_shared is not None,
+                use_grouped_topk=self.use_grouped_topk,
+            )
+
+        direct_scaled_dot = w1_scale is not None
+
+        output = fused_ep_moe_v2(
+            self.mesh,
+            hidden_states,
+            self.w1.value,
+            self.w2.value,
+            self.w3.value,
+            topk_weights,
+            topk_ids,
+            self.num_experts_per_tok,
+            act_fn=self.activation,
+            block_config=block_config,
+            disable_a2a=self.disable_a2a,
+            disable_dynamic_ffn1=self.disable_dynamic_ffn1,
+            disable_dynamic_ffn2=self.disable_dynamic_ffn2,
+            disable_weight_load=self.disable_weight_load,
+            disable_shared_expert=self.disable_shared_expert,
+            disable_sync_barrier=self.disable_sync_barrier,
+            use_jax_allreduce_metadata=self.use_jax_allreduce_metadata,
+            quant_block_k=self.quant_block_k if hasattr(self, "quant_block_k") else None,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w3_scale=w3_scale,
+            w1_shared=w1_shared_val,
+            w2_shared=w2_shared_val,
+            w3_shared=w3_shared_val,
+            direct_scaled_dot=direct_scaled_dot,
+            skip_decode_sync_barrier=True,
+            dp_axis_name="data",
+            tp_axis_name="tensor",
+        )
+
+        output = jax.sharding.reshard(output, NamedSharding(self.mesh, P("data", None)))
+        return output

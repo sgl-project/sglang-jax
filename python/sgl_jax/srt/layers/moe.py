@@ -784,7 +784,7 @@ def create_moe_weights_mapping(
             expert_type_names[1]: "wi_1",
             expert_type_names[2]: "wo",
         }
-    elif moe_backend == "fused":
+    elif moe_backend in ("fused", "fused_v2"):
         expert_type_map = {
             expert_type_names[0]: "w1",
             expert_type_names[1]: "w3",
@@ -815,7 +815,7 @@ def create_moe_weights_mapping(
                 ("expert", "tensor", None) if target_name == "wo" else ("expert", None, "tensor")
             )
             transpose = True
-        elif moe_backend == "fused":
+        elif moe_backend in ("fused", "fused_v2"):
             # Fused MoE kernel shards experts across the full EP mesh, i.e. the
             # product of ("data", "tensor"). Shard expert dim (axis=0) across
             # both mesh axes so each device owns a disjoint expert slice.
