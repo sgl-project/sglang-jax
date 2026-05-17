@@ -135,7 +135,11 @@ def test_weight_mapping_contains_linear_mla_dense_and_shared_mlp_keys():
 
     assert (
         mappings["model.layers.0.attention.query_key_value.weight"].target_path
-        == "model.layers.0.self_attn.qkv_proj.weight"
+        == [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+        ]
     )
     assert (
         mappings["model.layers.0.attention.g_norm.weight"].target_path
