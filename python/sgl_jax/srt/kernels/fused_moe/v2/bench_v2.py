@@ -135,6 +135,24 @@ def wall_timeit(run_fn, warmup: int, iters: int) -> list[float]:
     return times
 
 
+def split_timeit(run_fn, warmup: int, iters: int) -> tuple[list[float], list[float]]:
+    """Measure dispatch and block_until_ready separately."""
+    for _ in range(warmup):
+        out = run_fn()
+        jax.block_until_ready(out)
+    dispatch_times = []
+    wait_times = []
+    for _ in range(iters):
+        t0 = time.monotonic()
+        out = run_fn()
+        t1 = time.monotonic()
+        jax.block_until_ready(out)
+        t2 = time.monotonic()
+        dispatch_times.append((t1 - t0) * 1e3)
+        wait_times.append((t2 - t1) * 1e3)
+    return dispatch_times, wait_times
+
+
 # ---------------------------------------------------------------------------
 # Env parsing helpers
 # ---------------------------------------------------------------------------
@@ -180,8 +198,15 @@ use_fp8 = os.environ.get("BENCH_FP8", "0") == "1"
 quant_block_k = int(os.environ.get("BENCH_QBK", "128"))
 tune_mode = os.environ.get("BENCH_TUNE", "0") == "1"
 use_wall = os.environ.get("BENCH_WALL", "0") == "1"
-timeit_fn = wall_timeit if use_wall else trace_timeit
-timing_label = "wall" if use_wall else "trace"
+use_split = os.environ.get("BENCH_SPLIT", "0") == "1"
+decode_mode = os.environ.get("BENCH_DECODE_MODE", "0") == "1"
+inkernel_metadata = os.environ.get("BENCH_INKERNEL_MD", "0") == "1"
+if use_split:
+    timeit_fn = None
+    timing_label = "split"
+else:
+    timeit_fn = wall_timeit if use_wall else trace_timeit
+    timing_label = "wall" if use_wall else "trace"
 
 # Ablation flags
 all_disable = os.environ.get("FUSED_MOE_BENCHMARK_ALL_DISABLE", "0") == "1"
@@ -190,16 +215,22 @@ disable_sync_barrier = all_disable or os.environ.get("DISABLE_SYNC_BARRIER", "0"
 disable_weight_load = all_disable or os.environ.get("DISABLE_WEIGHT_LOAD", "0") == "1"
 disable_dynamic_ffn1 = all_disable or os.environ.get("DISABLE_DYNAMIC_FFN1", "0") == "1"
 disable_dynamic_ffn2 = all_disable or os.environ.get("DISABLE_DYNAMIC_FFN2", "0") == "1"
+disable_acc_and_store = all_disable or os.environ.get("DISABLE_ACC_AND_STORE", "0") == "1"
 ablation_flags = {
     "disable_a2a": disable_a2a,
     "disable_sync_barrier": disable_sync_barrier,
     "disable_weight_load": disable_weight_load,
     "disable_dynamic_ffn1": disable_dynamic_ffn1,
     "disable_dynamic_ffn2": disable_dynamic_ffn2,
+    "disable_acc_and_store": disable_acc_and_store,
 }
 active_ablation = [k for k, v in ablation_flags.items() if v]
 if active_ablation:
     log(f"ablation flags: {active_ablation}")
+if decode_mode:
+    log("decode_mode=True (single-buffer weights, serial bf loop)")
+if inkernel_metadata:
+    log("inkernel_metadata=True (in-kernel ICI allgather, no JAX lax.all_gather)")
 
 bt_candidates = parse_csv_int("BENCH_BT", [128])
 bf_candidates = parse_csv_int("BENCH_BF", [256])
@@ -354,21 +385,34 @@ for num_tokens in token_candidates:
                 disable_weight_load=disable_weight_load,
                 disable_dynamic_ffn1=disable_dynamic_ffn1,
                 disable_dynamic_ffn2=disable_dynamic_ffn2,
+                disable_acc_and_store=disable_acc_and_store,
+                decode_mode=decode_mode,
+                use_jax_allreduce_metadata=not inkernel_metadata,
             )
 
         try:
-            times = timeit_fn(run_fn, warmup=warmup, iters=iters)
+            if use_split:
+                dispatch_times, wait_times = split_timeit(run_fn, warmup=warmup, iters=iters)
+                if jax.process_index() == 0 and dispatch_times:
+                    d_avg = np.mean(dispatch_times)
+                    w_avg = np.mean(wait_times)
+                    wall_avg = d_avg + w_avg
+                    log(f"  {tag_resolved}: wall={wall_avg:.3f}ms = dispatch={d_avg:.3f}ms + wait={w_avg:.3f}ms")
+                    log(f"    dispatch: {[round(t, 3) for t in dispatch_times]}")
+                    log(f"    wait:     {[round(t, 3) for t in wait_times]}")
+                    results.append((num_tokens, tag_resolved, wall_avg, [d + w for d, w in zip(dispatch_times, wait_times)]))
+            else:
+                times = timeit_fn(run_fn, warmup=warmup, iters=iters)
+                if jax.process_index() == 0:
+                    if times:
+                        avg = np.mean(times)
+                        log(f"  {tag_resolved}: {avg:.3f} ms ({timing_label}) | samples={[round(t, 3) for t in times]}")
+                        results.append((num_tokens, tag_resolved, avg, times))
+                    else:
+                        log(f"  {tag_resolved}: no timing data")
         except Exception as e:
             log(f"  FAIL {tag}: {e}")
             continue
-
-        if jax.process_index() == 0:
-            if times:
-                avg = np.mean(times)
-                log(f"  {tag_resolved}: {avg:.3f} ms ({timing_label}) | samples={[round(t, 3) for t in times]}")
-                results.append((num_tokens, tag_resolved, avg, times))
-            else:
-                log(f"  {tag_resolved}: no timing data")
 
 # --- Summary ---
 if jax.process_index() == 0 and results:
@@ -413,6 +457,7 @@ if check_correctness:
             block_config=bc0,
             quant_block_k=qbk_arg,
             w1_scale=w1_scale_s, w2_scale=w2_scale_s, w3_scale=w3_scale_s,
+            use_jax_allreduce_metadata=not inkernel_metadata,
         )
         ref_kwargs = {}
         if use_fp8:
