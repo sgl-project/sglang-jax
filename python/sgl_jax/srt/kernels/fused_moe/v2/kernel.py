@@ -1114,18 +1114,51 @@ def _fused_ep_moe_kernel(
                     else:
                         slot = bf_id % 2
 
-                    wait_fetch_w1(slot)
-                    wait_fetch_w3(slot)
+                    if direct_scaled_dot and w1_scale_hbm is not None and bt <= 16:
+                        wait_fetch_w1(slot)
 
-                    dequant_w1(slot)
-                    dequant_w3(slot)
+                        def _gate_only_btc(btc_id, ___):
+                            gate = jnp.zeros((btc, bf), dtype=jnp.float32)
+                            if not disable_dynamic_ffn1:
+                                for p_id in range(t_packing):
+                                    def _ffn1_gate_sg(sg_id, gate_acc, _pid=p_id):
+                                        sg_off = sg_id * quant_block_k
+                                        x_slice = b_x_vmem[pl.ds(btc_id * btc, btc), _pid, pl.ds(sg_off, quant_block_k)]
+                                        w1_tile = b_w1_x2_vmem[slot, _pid, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)]
+                                        d1 = jnp.dot(x_slice, w1_tile, preferred_element_type=jnp.float32)
+                                        s1 = b_w1_scale_x2_vmem[slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)].reshape(1, bf)
+                                        return gate_acc + d1 * jnp.broadcast_to(s1, d1.shape)
+                                    gate = lax.fori_loop(0, n_sg, _ffn1_gate_sg, gate, unroll=n_sg)
+                            b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
+                            return None
+                        lax.fori_loop(0, num_btc_per_bts, _gate_only_btc, None)
 
-                    # Gate/up
-                    def gate_up_btc(btc_id, ___):
-                        gate = jnp.zeros((btc, bf), dtype=jnp.float32)
-                        up = jnp.zeros((btc, bf), dtype=jnp.float32)
-                        if not disable_dynamic_ffn1:
-                            if direct_scaled_dot and w1_scale_hbm is not None:
+                        wait_fetch_w3(slot)
+
+                        def _up_only_btc(btc_id, ___):
+                            up = jnp.zeros((btc, bf), dtype=jnp.float32)
+                            if not disable_dynamic_ffn1:
+                                for p_id in range(t_packing):
+                                    def _ffn1_up_sg(sg_id, up_acc, _pid=p_id):
+                                        sg_off = sg_id * quant_block_k
+                                        x_slice = b_x_vmem[pl.ds(btc_id * btc, btc), _pid, pl.ds(sg_off, quant_block_k)]
+                                        w3_tile = b_w3_x2_vmem[slot, _pid, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)]
+                                        d3 = jnp.dot(x_slice, w3_tile, preferred_element_type=jnp.float32)
+                                        s3 = b_w3_scale_x2_vmem[slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)].reshape(1, bf)
+                                        return up_acc + d3 * jnp.broadcast_to(s3, d3.shape)
+                                    up = lax.fori_loop(0, n_sg, _ffn1_up_sg, up, unroll=n_sg)
+                            b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
+                            return None
+                        lax.fori_loop(0, num_btc_per_bts, _up_only_btc, None)
+
+                    elif direct_scaled_dot and w1_scale_hbm is not None:
+                        wait_fetch_w1(slot)
+                        wait_fetch_w3(slot)
+
+                        def gate_up_btc_direct(btc_id, ___):
+                            gate = jnp.zeros((btc, bf), dtype=jnp.float32)
+                            up = jnp.zeros((btc, bf), dtype=jnp.float32)
+                            if not disable_dynamic_ffn1:
                                 for p_id in range(t_packing):
                                     def _ffn1_sg_body(sg_id, carry):
                                         gate_acc, up_acc = carry
@@ -1177,7 +1210,22 @@ def _fused_ep_moe_kernel(
                                     gate, up = lax.fori_loop(
                                         0, n_sg, _ffn1_sg_body, (gate, up), unroll=n_sg,
                                     )
-                            else:
+                            b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
+                            b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
+                            return None
+
+                        lax.fori_loop(0, num_btc_per_bts, gate_up_btc_direct, None)
+
+                    else:
+                        wait_fetch_w1(slot)
+                        wait_fetch_w3(slot)
+                        dequant_w1(slot)
+                        dequant_w3(slot)
+
+                        def gate_up_btc(btc_id, ___):
+                            gate = jnp.zeros((btc, bf), dtype=jnp.float32)
+                            up = jnp.zeros((btc, bf), dtype=jnp.float32)
+                            if not disable_dynamic_ffn1:
                                 for p_id in range(t_packing):
                                     x_slice = b_x_vmem[
                                         pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
@@ -1186,11 +1234,11 @@ def _fused_ep_moe_kernel(
                                     w3_tile = b_w3_dq_vmem[p_id] if w3_scale_hbm is not None else b_w3_x2_vmem[slot, p_id]
                                     gate += jnp.dot(x_slice, w1_tile, preferred_element_type=jnp.float32)
                                     up += jnp.dot(x_slice, w3_tile, preferred_element_type=jnp.float32)
-                        b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
-                        b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
-                        return None
+                            b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
+                            b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
+                            return None
 
-                    lax.fori_loop(0, num_btc_per_bts, gate_up_btc, None)
+                        lax.fori_loop(0, num_btc_per_bts, gate_up_btc, None)
 
                     # W2 DMA is started with W1/W3. Defer its wait until the
                     # down projection so W2 transfer can overlap gate/up.
