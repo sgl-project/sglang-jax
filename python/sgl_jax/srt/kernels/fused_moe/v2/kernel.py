@@ -297,7 +297,9 @@ def _fused_ep_moe_kernel(
     disable_weight_load: bool = False,
     disable_dynamic_ffn1: bool = False,
     disable_dynamic_ffn2: bool = False,
+    disable_acc_and_store: bool = False,
     use_jax_allreduce_metadata: bool = True,
+    decode_mode: bool = False,
     bt: int,
     bf: int,
     btc: int,
@@ -388,16 +390,90 @@ def _fused_ep_moe_kernel(
     # ===== All-reduce metadata =====
     # Copies routing + metadata into SMEM via VMEM staging (HBM→VMEM→SMEM).
     def all_reduce_metadata(*, bt_id, bt_sem_id, t2e_routing):
-        if not (use_jax_allreduce_metadata and metadata_starts_hbm is not None):
-            raise NotImplementedError(
-                "In-kernel metadata fallback not implemented in v2. "
-                "Use use_jax_allreduce_metadata=True (default)."
-            )
+        if disable_a2a:
+            return
 
         offsets_sem = local_sems.at[bt_sem_id, 8]
         routing_sem = local_sems.at[bt_sem_id, 9]
 
-        def _copy_precomputed(
+        if use_jax_allreduce_metadata and metadata_starts_hbm is not None:
+            def _copy_precomputed(
+                t2e_routing_vmem,
+                d2e_count_vmem,
+                offsets_vmem,
+                starts_vmem,
+                sizes_vmem,
+            ):
+                offsets_vmem[...] = jnp.zeros_like(offsets_vmem)
+                t2e_routing_vmem[...] = t2e_routing
+
+                starts_load = pltpu.async_copy(
+                    src_ref=metadata_starts_hbm.at[bt_id],
+                    dst_ref=starts_vmem,
+                    sem=local_sems.at[bt_sem_id, 1],
+                )
+                sizes_load = pltpu.async_copy(
+                    src_ref=metadata_sizes_hbm.at[bt_id],
+                    dst_ref=sizes_vmem,
+                    sem=local_sems.at[bt_sem_id, 2],
+                )
+                d2e_count_load = pltpu.async_copy(
+                    src_ref=metadata_d2e_counts_hbm.at[bt_id],
+                    dst_ref=d2e_count_vmem,
+                    sem=local_sems.at[bt_sem_id, 3],
+                )
+
+                offsets_copy = pltpu.async_copy(
+                    src_ref=offsets_vmem,
+                    dst_ref=expert_offsets_x2_smem.at[bt_sem_id],
+                    sem=offsets_sem,
+                )
+                t2e_routing_copy = pltpu.async_copy(
+                    src_ref=t2e_routing_vmem,
+                    dst_ref=t2e_routing_x2_smem.at[bt_sem_id],
+                    sem=routing_sem,
+                )
+
+                starts_load.wait()
+                sizes_load.wait()
+                d2e_count_load.wait()
+                starts_copy = pltpu.async_copy(
+                    src_ref=starts_vmem,
+                    dst_ref=expert_starts_x2_smem.at[bt_sem_id],
+                    sem=local_sems.at[bt_sem_id, 1],
+                )
+                sizes_copy = pltpu.async_copy(
+                    src_ref=sizes_vmem,
+                    dst_ref=expert_sizes_x2_smem.at[bt_sem_id],
+                    sem=local_sems.at[bt_sem_id, 2],
+                )
+                d2e_count_copy = pltpu.async_copy(
+                    src_ref=d2e_count_vmem,
+                    dst_ref=d2e_count_x2_smem.at[bt_sem_id],
+                    sem=local_sems.at[bt_sem_id, 3],
+                )
+
+                t2e_routing_copy.wait()
+                offsets_copy.wait()
+                starts_copy.wait()
+                sizes_copy.wait()
+                d2e_count_copy.wait()
+
+            pl.run_scoped(
+                _copy_precomputed,
+                pltpu.VMEM(t2e_routing_x2_smem.shape[1:], t2e_routing_x2_smem.dtype),
+                pltpu.VMEM(d2e_count_x2_smem.shape[1:], d2e_count_x2_smem.dtype),
+                pltpu.VMEM(expert_offsets_x2_smem.shape[1:], expert_offsets_x2_smem.dtype),
+                pltpu.VMEM(expert_starts_x2_smem.shape[1:], expert_starts_x2_smem.dtype),
+                pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
+            )
+            return
+
+        # --- In-kernel metadata allreduce (no JAX-level lax.all_gather) ---
+        md_send_sem = send_x2_sems.at[0]
+        md_recv_sem = recv_x2_sems.at[0]
+
+        def _inkernel_allreduce(
             t2e_routing_vmem,
             d2e_count_vmem,
             offsets_vmem,
@@ -405,38 +481,138 @@ def _fused_ep_moe_kernel(
             sizes_vmem,
         ):
             offsets_vmem[...] = jnp.zeros_like(offsets_vmem)
-            t2e_routing_vmem[...] = t2e_routing
-
-            starts_load = pltpu.async_copy(
-                src_ref=metadata_starts_hbm.at[bt_id],
-                dst_ref=starts_vmem,
-                sem=local_sems.at[bt_sem_id, 1],
-            )
-            sizes_load = pltpu.async_copy(
-                src_ref=metadata_sizes_hbm.at[bt_id],
-                dst_ref=sizes_vmem,
-                sem=local_sems.at[bt_sem_id, 2],
-            )
-            d2e_count_load = pltpu.async_copy(
-                src_ref=metadata_d2e_counts_hbm.at[bt_id],
-                dst_ref=d2e_count_vmem,
-                sem=local_sems.at[bt_sem_id, 3],
-            )
-
             offsets_copy = pltpu.async_copy(
                 src_ref=offsets_vmem,
                 dst_ref=expert_offsets_x2_smem.at[bt_sem_id],
                 sem=offsets_sem,
             )
+            t2e_routing_vmem[...] = t2e_routing
             t2e_routing_copy = pltpu.async_copy(
                 src_ref=t2e_routing_vmem,
                 dst_ref=t2e_routing_x2_smem.at[bt_sem_id],
                 sem=routing_sem,
             )
 
-            starts_load.wait()
-            sizes_load.wait()
-            d2e_count_load.wait()
+            expert_iota = lax.broadcasted_iota(
+                jnp.int32, (1, 1, padded_num_experts), 2,
+            )
+            routing_expanded = jnp.expand_dims(
+                t2e_routing[:, :top_k], axis=2,
+            )
+            mask = (routing_expanded == expert_iota).astype(jnp.int32)
+            local_sizes = jnp.sum(
+                mask, axis=(0, 1), keepdims=True,
+            ).reshape(1, padded_num_experts)
+
+            d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
+            d2e_count_vmem[my_id] = local_sizes
+
+            sync_barrier()
+
+            if num_devices > 0 and (num_devices & (num_devices - 1)) == 0:
+                rounds = int(math.log2(num_devices))
+                for round_id in range(rounds):
+                    sync_barrier()
+
+                    chunk = 1 << round_id
+                    chunk_i32 = jnp.int32(chunk)
+                    peer_id = my_id ^ chunk_i32
+
+                    send_start = (my_id >> round_id) << round_id
+                    recv_start = (peer_id >> round_id) << round_id
+
+                    pltpu.make_async_remote_copy(
+                        src_ref=d2e_count_vmem.at[
+                            pl.ds(send_start, chunk),
+                            pl.ds(0, 1),
+                            pl.ds(0, padded_num_experts),
+                        ],
+                        dst_ref=d2e_count_vmem.at[
+                            pl.ds(send_start, chunk),
+                            pl.ds(0, 1),
+                            pl.ds(0, padded_num_experts),
+                        ],
+                        send_sem=md_send_sem,
+                        recv_sem=md_recv_sem,
+                        device_id=get_mesh_device_id(peer_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
+
+                    recv_ref = d2e_count_vmem.at[
+                        pl.ds(recv_start, chunk),
+                        pl.ds(0, 1),
+                        pl.ds(0, padded_num_experts),
+                    ]
+                    pltpu.make_async_copy(
+                        src_ref=recv_ref, dst_ref=recv_ref,
+                        sem=md_recv_sem,
+                    ).wait()
+
+                    send_ref = d2e_count_vmem.at[
+                        pl.ds(send_start, chunk),
+                        pl.ds(0, 1),
+                        pl.ds(0, padded_num_experts),
+                    ]
+                    pltpu.make_async_copy(
+                        src_ref=send_ref, dst_ref=send_ref,
+                        sem=md_send_sem,
+                    ).wait()
+            else:
+                for step in range(1, num_devices):
+                    peer_id = (my_id + step) % num_devices
+                    pltpu.make_async_remote_copy(
+                        src_ref=d2e_count_vmem.at[
+                            my_id,
+                            pl.ds(0, 1),
+                            pl.ds(0, padded_num_experts),
+                        ],
+                        dst_ref=d2e_count_vmem.at[
+                            my_id,
+                            pl.ds(0, 1),
+                            pl.ds(0, padded_num_experts),
+                        ],
+                        send_sem=md_send_sem,
+                        recv_sem=md_recv_sem,
+                        device_id=get_mesh_device_id(peer_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
+
+                    src_peer = (my_id + num_devices - step) % num_devices
+                    recv_ref = d2e_count_vmem.at[
+                        src_peer,
+                        pl.ds(0, 1),
+                        pl.ds(0, padded_num_experts),
+                    ]
+                    pltpu.make_async_copy(
+                        src_ref=recv_ref, dst_ref=recv_ref,
+                        sem=md_recv_sem,
+                    ).wait()
+
+                    send_ref = d2e_count_vmem.at[
+                        my_id,
+                        pl.ds(0, 1),
+                        pl.ds(0, padded_num_experts),
+                    ]
+                    pltpu.make_async_copy(
+                        src_ref=send_ref, dst_ref=send_ref,
+                        sem=md_send_sem,
+                    ).wait()
+
+            sync_barrier()
+
+            reduced_sizes = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
+            reduced_starts = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
+            for dev_id in range(num_devices):
+                dev_sizes = d2e_count_vmem[dev_id]
+                reduced_sizes += dev_sizes
+                reduced_starts += lax.select(
+                    dev_id < my_id, dev_sizes,
+                    jnp.zeros_like(dev_sizes),
+                )
+
+            starts_vmem[...] = reduced_starts
+            sizes_vmem[...] = reduced_sizes
+
             starts_copy = pltpu.async_copy(
                 src_ref=starts_vmem,
                 dst_ref=expert_starts_x2_smem.at[bt_sem_id],
@@ -460,7 +636,7 @@ def _fused_ep_moe_kernel(
             d2e_count_copy.wait()
 
         pl.run_scoped(
-            _copy_precomputed,
+            _inkernel_allreduce,
             pltpu.VMEM(t2e_routing_x2_smem.shape[1:], t2e_routing_x2_smem.dtype),
             pltpu.VMEM(d2e_count_x2_smem.shape[1:], d2e_count_x2_smem.dtype),
             pltpu.VMEM(expert_offsets_x2_smem.shape[1:], expert_offsets_x2_smem.dtype),
@@ -905,17 +1081,24 @@ def _fused_ep_moe_kernel(
                     sem=x_stage_sem.at[0],
                 ).wait()
 
-                # Weight prologue: prefetch first bf tile
-                start_fetch_w1(local_e_id, 0, 0, priority=1)
-                start_fetch_w3(local_e_id, 0, 0, priority=1)
-                start_fetch_w2(local_e_id, 0, 0, priority=1)
-                if num_bf >= 2:
-                    start_fetch_w1(local_e_id, 1, 1)
-                    start_fetch_w3(local_e_id, 1, 1)
-                    start_fetch_w2(local_e_id, 1, 1, priority=0)
+                # Weight prologue (double-buffer only)
+                if not decode_mode:
+                    start_fetch_w1(local_e_id, 0, 0, priority=1)
+                    start_fetch_w3(local_e_id, 0, 0, priority=1)
+                    start_fetch_w2(local_e_id, 0, 0, priority=1)
+                    if num_bf >= 2:
+                        start_fetch_w1(local_e_id, 1, 1)
+                        start_fetch_w3(local_e_id, 1, 1)
+                        start_fetch_w2(local_e_id, 1, 1, priority=0)
 
                 for bf_id in range(num_bf):
-                    slot = bf_id % 2
+                    if decode_mode:
+                        slot = 0
+                        start_fetch_w1(local_e_id, 0, bf_id, priority=1)
+                        start_fetch_w3(local_e_id, 0, bf_id, priority=1)
+                        start_fetch_w2(local_e_id, 0, bf_id, priority=1)
+                    else:
+                        slot = bf_id % 2
 
                     wait_fetch_w1(slot)
                     wait_fetch_w3(slot)
@@ -966,12 +1149,13 @@ def _fused_ep_moe_kernel(
 
                     lax.fori_loop(0, num_btc_per_bts, act_down_btc, None)
 
-                    # Prefetch next bf tile
-                    next_bf_id = bf_id + 2
-                    if next_bf_id < num_bf:
-                        start_fetch_w1(local_e_id, slot, next_bf_id)
-                        start_fetch_w3(local_e_id, slot, next_bf_id)
-                        start_fetch_w2(local_e_id, slot, next_bf_id, priority=0)
+                    # Prefetch next bf tile (double-buffer only)
+                    if not decode_mode:
+                        next_bf_id = bf_id + 2
+                        if next_bf_id < num_bf:
+                            start_fetch_w1(local_e_id, slot, next_bf_id)
+                            start_fetch_w3(local_e_id, slot, next_bf_id)
+                            start_fetch_w2(local_e_id, slot, next_bf_id, priority=0)
 
                 # Final writeback: f32 → bf16, then DMA to HBM (once per bts tile)
                 def writeback_btc(btc_id, ___):
@@ -1258,7 +1442,8 @@ def _fused_ep_moe_kernel(
             wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
             sync_barrier()
 
-            acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
+            if not disable_acc_and_store:
+                acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
             start_send_bo(bt_id=bt_id)
 
             tail_start = max(local_num_experts - expert_buffer_count, 0)
@@ -1340,7 +1525,8 @@ def _fused_ep_moe_kernel(
             wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
             sync_barrier()
 
-            acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
+            if not disable_acc_and_store:
+                acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
             start_send_bo(bt_id=bt_id)
 
             tail_start = max(local_num_experts - expert_buffer_count, 0)
@@ -1421,9 +1607,10 @@ def jax_allreduce_metadata_by_bt(
         "mesh", "top_k", "act_fn",
         "disable_a2a", "disable_shared_expert", "disable_sync_barrier",
         "disable_weight_load", "disable_dynamic_ffn1", "disable_dynamic_ffn2",
+        "disable_acc_and_store",
         "use_jax_allreduce_metadata",
         "block_config", "dp_axis_name", "tp_axis_name",
-        "quant_block_k",
+        "quant_block_k", "decode_mode",
     ],
 )
 def fused_ep_moe_v2(
@@ -1443,6 +1630,7 @@ def fused_ep_moe_v2(
     disable_weight_load: bool = False,
     disable_dynamic_ffn1: bool = False,
     disable_dynamic_ffn2: bool = False,
+    disable_acc_and_store: bool = False,
     use_jax_allreduce_metadata: bool = True,
     w1_shared: jax.Array | None = None,
     w2_shared: jax.Array | None = None,
@@ -1452,6 +1640,7 @@ def fused_ep_moe_v2(
     w2_scale: jax.Array | None = None,
     w3_scale: jax.Array | None = None,
     block_config: FusedMoEBlockConfig | None = None,
+    decode_mode: bool = False,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
 ):
@@ -1545,6 +1734,7 @@ def fused_ep_moe_v2(
 
     acc_bt = math.gcd(bt, 16)
     hbm_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+    wb_slots = 1 if decode_mode else 2
 
     scope_name = f"fused-moe-v2-k_{top_k}-bt_{bt}_{bts}_{btc}-bf_{bf}"
     if w1_shared is not None:
@@ -1566,16 +1756,16 @@ def fused_ep_moe_v2(
         # VMEM: output double buffer
         pltpu.VMEM((2, bt, hidden_size), t_dtype),                          # output
         # VMEM: weight double buffers
-        pltpu.VMEM((2, t_packing, h_per_t, bf), w1.dtype),                 # W1
-        pltpu.VMEM((2, t_packing, h_per_t, bf), w3.dtype),                 # W3
-        pltpu.VMEM((2, t_packing, bf, h_per_t), w2.dtype),                 # W2
+        pltpu.VMEM((wb_slots, t_packing, h_per_t, bf), w1.dtype),                 # W1
+        pltpu.VMEM((wb_slots, t_packing, h_per_t, bf), w3.dtype),                 # W3
+        pltpu.VMEM((wb_slots, t_packing, bf, h_per_t), w2.dtype),                 # W2
         # VMEM: scale double buffers (None when not quantized)
         (None if w1_scale is None else
-            pltpu.VMEM((2, t_packing, h_per_t // quant_block_k, 1, bf), jnp.float32)),  # W1 scale
+            pltpu.VMEM((wb_slots, t_packing, h_per_t // quant_block_k, 1, bf), jnp.float32)),  # W1 scale
         (None if w3_scale is None else
-            pltpu.VMEM((2, t_packing, h_per_t // quant_block_k, 1, bf), jnp.float32)),  # W3 scale
+            pltpu.VMEM((wb_slots, t_packing, h_per_t // quant_block_k, 1, bf), jnp.float32)),  # W3 scale
         (None if w2_scale is None else
-            pltpu.VMEM((2, t_packing, bf // quant_block_k, 1, h_per_t), jnp.float32)),  # W2 scale
+            pltpu.VMEM((wb_slots, t_packing, bf // quant_block_k, 1, h_per_t), jnp.float32)),  # W2 scale
         # VMEM: dequant scratch (single-buf, None when not quantized)
         (None if w1_scale is None else
             pltpu.VMEM((t_packing, h_per_t, bf), jnp.bfloat16)),                    # W1 dequant
@@ -1629,7 +1819,9 @@ def fused_ep_moe_v2(
                 disable_weight_load=disable_weight_load,
                 disable_dynamic_ffn1=disable_dynamic_ffn1,
                 disable_dynamic_ffn2=disable_dynamic_ffn2,
+                disable_acc_and_store=disable_acc_and_store,
                 use_jax_allreduce_metadata=use_jax_allreduce_metadata,
+                decode_mode=decode_mode,
                 bt=bt, bf=bf, btc=btc, bts=bts, bse=bse,
                 quant_block_k=quant_block_k,
             ),
