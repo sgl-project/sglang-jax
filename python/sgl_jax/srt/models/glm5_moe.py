@@ -486,7 +486,7 @@ class Glm5DecoderLayer(nnx.Module):
             attention_bias=getattr(config, "attention_bias", False),
             dtype=dtype,
             mesh=mesh,
-            use_absorbed=False,
+            use_absorbed=True,
         )
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
@@ -727,12 +727,13 @@ class Glm5ForCausalLM(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
+        memory_pools,
         logits_metadata: LogitsMetadata,
     ):
+        kv_pool = memory_pools.token_to_kv_pool
         hidden_states, layers_kv_fused, layers_topk_ids = self.model(
             forward_batch,
-            token_to_kv_pool,
+            kv_pool,
         )
 
         if not getattr(self.config, "tie_word_embeddings", False):
@@ -740,7 +741,7 @@ class Glm5ForCausalLM(nnx.Module):
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
 
-        return output, layers_kv_fused, True, layers_topk_ids
+        return output, {"token_to_kv_pool": layers_kv_fused}, True, layers_topk_ids
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
