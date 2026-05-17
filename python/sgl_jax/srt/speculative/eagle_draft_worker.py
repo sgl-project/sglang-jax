@@ -8,6 +8,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
+
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.scheduler import GenerationBatchResult
 from sgl_jax.srt.managers.tp_worker import ModelWorker
@@ -251,13 +252,14 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         if forward_batch.input_ids.shape[0] <= 0:
             return
+        step_plus_1 = self.speculative_num_steps + 1
         draft_logits_output, _, _ = self.draft_model_runner.forward(
             forward_batch,
             logits_metadata=logits_metadata,
         )
         select_index = (
             np.arange(len(model_worker_batch.seq_lens[: model_worker_batch.real_bs]))
-            * (self.speculative_num_steps + 1)
+            * step_plus_1
             + batch_output.accept_lens[: model_worker_batch.real_bs]
             - 1
         )

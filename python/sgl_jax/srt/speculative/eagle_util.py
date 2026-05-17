@@ -546,9 +546,9 @@ class EagleDraftInput:
             + speculative_num_draft_tokens
             - 1
         )
+        model_worker_batch.input_ids = batch_output.next_draft_input.verified_id
         bs = batch_output.accept_lens.shape[0]
         step_plus_1 = model_worker_batch.input_ids.shape[0] // bs
-        model_worker_batch.positions = model_worker_batch.positions
         model_worker_batch.extend_seq_lens = np.full((bs,), step_plus_1, dtype=np.int32)
         model_worker_batch.extend_seq_lens[model_worker_batch.real_bs :] = 0
         model_worker_batch.logits_indices = (
@@ -559,7 +559,6 @@ class EagleDraftInput:
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
         model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
         model_worker_batch.spec_info.accept_length = batch_output.accept_lens
-        model_worker_batch.input_ids = batch_output.next_draft_input.verified_id
         forward_metadata = draft_model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )

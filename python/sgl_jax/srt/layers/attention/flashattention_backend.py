@@ -267,8 +267,13 @@ class FlashAttention(AttentionBackend):
             ]
         )
 
-        if batch.forward_mode == ForwardMode.DRAFT_EXTEND:
-            # Reconstruct page_indices properly respecting ragged allocation
+        if batch.forward_mode == ForwardMode.DRAFT_EXTEND or batch.forward_mode.is_target_verify():
+            # Reconstruct page_indices properly respecting ragged allocation.
+            # cache_loc is packed per-request with page-aligned strides from
+            # allocate_lens, but cu_kv_lens counts only the pages actually
+            # needed (from seq_lens).  A naive global stride through cache_loc
+            # mis-assigns pages when allocate_lens > seq_lens (the extra pages
+            # of earlier requests shift later requests' page_indices).
             page_indices_list = []
             offset = 0
             allocate_lens = batch.spec_info.allocate_lens
