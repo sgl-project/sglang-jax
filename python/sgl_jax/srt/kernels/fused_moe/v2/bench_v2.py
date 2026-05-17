@@ -171,6 +171,12 @@ def parse_csv_int_or_none(env_key: str) -> list[int | None]:
     return [int(x.strip()) for x in v.split(",")]
 
 
+def align_local_tokens_for_v2(local_num_tokens: int) -> int:
+    if local_num_tokens <= 8:
+        return 8
+    return ((local_num_tokens + 7) // 8) * 8
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -200,6 +206,8 @@ tune_mode = os.environ.get("BENCH_TUNE", "0") == "1"
 use_wall = os.environ.get("BENCH_WALL", "0") == "1"
 use_split = os.environ.get("BENCH_SPLIT", "0") == "1"
 decode_mode = os.environ.get("BENCH_DECODE_MODE", "0") == "1"
+direct_scaled_dot = os.environ.get("BENCH_DIRECT_SCALED_DOT", "0") == "1"
+skip_decode_sync = os.environ.get("BENCH_SKIP_DECODE_SYNC", "0") == "1"
 inkernel_metadata = os.environ.get("BENCH_INKERNEL_MD", "0") == "1"
 if use_split:
     timeit_fn = None
@@ -229,6 +237,10 @@ if active_ablation:
     log(f"ablation flags: {active_ablation}")
 if decode_mode:
     log("decode_mode=True (single-buffer weights, serial bf loop)")
+if direct_scaled_dot:
+    log("direct_scaled_dot=True (fp8 dot per quant group, scale after dot)")
+if skip_decode_sync:
+    log("skip_decode_sync=True (skip kernel barriers only when num_bt=1)")
 if inkernel_metadata:
     log("inkernel_metadata=True (in-kernel ICI allgather, no JAX lax.all_gather)")
 
@@ -245,7 +257,7 @@ def generate_tune_candidates(intermediate_size, local_num_tokens, ep_size):
         if v <= intermediate_size and intermediate_size % v == 0
     ))
     bt_list = []
-    p = 2
+    p = 8
     while p <= local_num_tokens:
         if local_num_tokens % p == 0:
             bt_list.append(p)
@@ -260,7 +272,8 @@ def generate_tune_candidates(intermediate_size, local_num_tokens, ep_size):
             bts_list = [None]
     else:
         bts_list = [None]
-    return bt_list, bfs, [128], bts_list
+    btc_list = [128]
+    return bt_list, bfs, btc_list, bts_list
 
 
 
@@ -332,8 +345,7 @@ for num_tokens in token_candidates:
 
     if tune_mode:
         local_nt = num_tokens // ep_size
-        pad_local_nt = (8 - local_nt % 8) % 8
-        padded_local_nt = local_nt + pad_local_nt
+        padded_local_nt = align_local_tokens_for_v2(local_nt)
         bt_candidates, bf_candidates, btc_candidates, bts_candidates = generate_tune_candidates(f, padded_local_nt, ep_size)
         log(f"  tune: bt={bt_candidates} bf={bf_candidates} (local_nt={local_nt}→{padded_local_nt})")
 
@@ -353,6 +365,7 @@ for num_tokens in token_candidates:
     topk_wts = jax.nn.softmax(topk_logits, axis=-1)
 
     configs_to_try = list(itertools.product(bt_candidates, bf_candidates, btc_candidates, bts_candidates))
+    seen_resolved_configs = set()
 
     for bt, bf, btc, bts in configs_to_try:
         bc = FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse, bts=bts)
@@ -360,8 +373,8 @@ for num_tokens in token_candidates:
 
         padded_nt = num_tokens
         local_nt_raw = num_tokens // ep_size
-        pad_align = 8
-        pad_local = (pad_align - local_nt_raw % pad_align) % pad_align
+        aligned_local_nt = align_local_tokens_for_v2(local_nt_raw)
+        pad_local = aligned_local_nt - local_nt_raw
         if pad_local > 0:
             padded_nt = (local_nt_raw + pad_local) * ep_size
 
@@ -372,6 +385,11 @@ for num_tokens in token_candidates:
             continue
 
         tag_resolved = f"bt={bc_resolved.bt},bf={bc_resolved.bf},btc={bc_resolved.btc},bts={bc_resolved.bts}"
+        resolved_key = (bc_resolved.bt, bc_resolved.bf, bc_resolved.btc, bc_resolved.bts)
+        if resolved_key in seen_resolved_configs:
+            log(f"  SKIP duplicate resolved config {tag} -> {tag_resolved}")
+            continue
+        seen_resolved_configs.add(resolved_key)
 
         def run_fn():
             return fused_ep_moe_v2(
@@ -387,6 +405,8 @@ for num_tokens in token_candidates:
                 disable_dynamic_ffn2=disable_dynamic_ffn2,
                 disable_acc_and_store=disable_acc_and_store,
                 decode_mode=decode_mode,
+                direct_scaled_dot=direct_scaled_dot,
+                skip_decode_sync_barrier=skip_decode_sync,
                 use_jax_allreduce_metadata=not inkernel_metadata,
             )
 
@@ -457,6 +477,8 @@ if check_correctness:
             block_config=bc0,
             quant_block_k=qbk_arg,
             w1_scale=w1_scale_s, w2_scale=w2_scale_s, w3_scale=w3_scale_s,
+            direct_scaled_dot=direct_scaled_dot,
+            skip_decode_sync_barrier=skip_decode_sync,
             use_jax_allreduce_metadata=not inkernel_metadata,
         )
         ref_kwargs = {}
