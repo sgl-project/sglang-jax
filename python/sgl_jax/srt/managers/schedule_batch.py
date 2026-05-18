@@ -2087,6 +2087,12 @@ class ScheduleBatch:
         out_cache_loc = self.reqs_info[0].out_cache_loc
         if out_cache_loc is None:
             out_cache_loc = np.empty(0, dtype=np.int32)
+        # out_cache_loc length == extend_num_tokens (depends on per-round
+        # accept_len) and is sharded P("data") in ForwardBatch.init_new — pad
+        # to a dp-divisible length with -1 (sentinel; KV write skips it).
+        pad = (-len(out_cache_loc)) % self.dp_size
+        if pad:
+            out_cache_loc = np.pad(out_cache_loc, (0, pad), constant_values=-1)
         return ModelWorkerBatch(
             bid=acc_global_bid(),
             forward_mode=self.forward_mode,
