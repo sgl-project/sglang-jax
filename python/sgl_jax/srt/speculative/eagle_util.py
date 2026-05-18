@@ -560,11 +560,13 @@ class EagleDraftInput:
         return model_worker_batch, logits_metadata
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
-        new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE - 1
         bs = schedule_batch.batch_size()
         assert (
             self.allocate_lens.shape[0] == bs
         ), f" {self.allocate_lens.shape[0]=} but batch_size is {bs} "
+        info = schedule_batch.reqs_info[0]
+
+        new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE - 1
         page_size = schedule_batch.token_to_kv_pool_allocator.page_size
 
         if page_size == 1:
@@ -595,9 +597,11 @@ class EagleDraftInput:
 
         self.allocate_lens = new_allocate_lens
 
-        info = schedule_batch.reqs_info[0]
         info.seq_lens_sum = np.sum(info.seq_lens).item()
         info.out_cache_loc = out_cache_loc
+
+        for i, req in enumerate(info.reqs):
+            req.kv_allocated_len = int(new_allocate_lens[i])
 
     def prepare_for_draft_decode(
         self, model_worker_batch: ModelWorkerBatch, topk: int, num_steps: int
