@@ -1,6 +1,8 @@
 """Perf case runner: drives bench_serving against a given server URL."""
 
 import json
+import os
+from pathlib import Path
 
 from multi_host_suite import PerfCase
 from profile_loader import LaunchProfile
@@ -39,7 +41,10 @@ def run_perf_case(case: PerfCase, profile: LaunchProfile) -> None:
     metrics = run_benchmark(args)
 
     summary = {
+        "type": "perf",
         "case": case.name,
+        "profile": profile.name,
+        "target": profile.target,
         "completed": metrics.get("completed"),
         "median_ttft_ms": metrics.get("median_ttft_ms"),
         "median_itl_ms": metrics.get("median_itl_ms"),
@@ -49,6 +54,12 @@ def run_perf_case(case: PerfCase, profile: LaunchProfile) -> None:
     }
     print("[multi-host-suite] Perf summary:", flush=True)
     print(f"[multi-host-suite] {json.dumps(summary, indent=2, sort_keys=True)}", flush=True)
+
+    results_dir = os.environ.get("RESULTS_DIR")
+    if results_dir:
+        out_path = Path(results_dir) / f"{case.name}.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
 
     if metrics.get("completed") != case.num_prompts:
         raise RuntimeError(f"Expected completed={case.num_prompts}, got {metrics.get('completed')}")
