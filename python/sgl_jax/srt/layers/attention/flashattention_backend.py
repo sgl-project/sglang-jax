@@ -374,10 +374,13 @@ class FlashAttention(AttentionBackend):
         cu_kv_lens = []
         seq_lens = np.copy(batch.seq_lens)
 
-        # Vectorized preparation
+        # Vectorized preparation. selector maps global-flat req k → DP-padded
+        # slot s_k; cache_loc/page_indices are laid out in valid-slot order
+        # (== selector order), so the per-req gather below stays aligned.
+        sel = np.asarray(batch.logits_indices_selector)
         real_bs = batch.real_bs
-        current_seq_lens = batch.seq_lens[:real_bs]
-        allocate_lens = batch.spec_info.allocate_lens[:real_bs]
+        current_seq_lens = np.asarray(batch.seq_lens)[sel]
+        allocate_lens = np.asarray(batch.spec_info.allocate_lens)[sel]
 
         draft_allocs = allocate_lens - current_seq_lens
 
@@ -391,9 +394,9 @@ class FlashAttention(AttentionBackend):
         seq_lens_list = []
         dp_size = batch.dp_size
         per_dp_bs = batch.per_dp_bs_size if dp_size > 1 else len(batch.seq_lens)
+        valid_slot = np.asarray(batch.seq_lens) > 0
         for speculative_step_id in range(batch.speculative_num_steps):
-            seq_lens = batch.seq_lens + (speculative_step_id)
-            seq_lens[batch.real_bs :] = 0
+            seq_lens = np.where(valid_slot, batch.seq_lens + speculative_step_id, 0)
             seq_lens_list.append(seq_lens)
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
             if dp_size > 1:
