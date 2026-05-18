@@ -13,10 +13,15 @@ import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ScheduleReqsInfo
+from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
+    SchedulerOutputProcessorMixin,
+)
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -261,3 +266,46 @@ def test_spec_info_aligns_with_dp_padded_slots(dp, bs_per_rank):
         f"expected {list(range(100, 100 + real_bs))}. "
         f"spec_info is global-flat but mwb is DP-padded — needs scatter."
     )
+
+
+@pytest.mark.parametrize(
+    "dp,bs_per_rank,accept_per_slot",
+    [
+        (1, [2], [3, 2]),
+        (2, [1, 1], [3, 2]),
+        (2, [1, 2], [3, 0, 2, 1]),  # per_dp=2: slot 1 is rank-0 pad (accept=0)
+        (4, [1, 0, 1, 0], [2, 0, 3, 0]),  # per_dp=1
+    ],
+)
+def test_resolve_spec_decode_token_ids(dp, bs_per_rank, accept_per_slot):
+    """`_resolve_spec_decode_token_ids` must slice next_token_ids by DP-padded
+    slot (not contiguous req index) and return a (total_bs,)-length list with
+    [] at padding slots so the per-rank slice in process_batch_result_decode
+    lands on the right reqs."""
+    sb = _mk_batch(dp, bs_per_rank)
+    total_bs = len(accept_per_slot)
+    sb.per_dp_bs_size = total_bs // dp
+    # Tag next_token_ids so slot s tokens are [s*1000+0, s*1000+1, ...]
+    nt = np.concatenate(
+        [np.arange(s * 1000, s * 1000 + DRAFT_N, dtype=np.int32) for s in range(total_bs)]
+    )
+    result = SimpleNamespace(
+        next_token_ids=nt,
+        accept_lens=np.asarray(accept_per_slot, dtype=np.int32),
+        num_accepted_tokens=None,
+    )
+    sched = SimpleNamespace(draft_worker=SimpleNamespace(speculative_num_draft_tokens=DRAFT_N))
+    out = SchedulerOutputProcessorMixin._resolve_spec_decode_token_ids(sched, result, sb)
+    assert len(out) == total_bs
+    per_dp = sb.per_dp_bs_size
+    for r, bs in enumerate(bs_per_rank):
+        for j in range(per_dp):
+            slot = r * per_dp + j
+            if j < bs:
+                a = accept_per_slot[slot]
+                assert out[slot] == list(
+                    range(slot * 1000, slot * 1000 + a)
+                ), f"slot {slot}: got {out[slot]}, want {a} tokens from {slot*1000}"
+                assert sb.reqs_info[r].reqs[j].spec_accepted_tokens == a
+            else:
+                assert out[slot] == [], f"pad slot {slot} should be []"
