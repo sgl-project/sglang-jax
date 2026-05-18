@@ -116,6 +116,10 @@ class BaseSpecWorker:
             logits_output, next_token_ids, cache_miss_count, bid, _seq_lens = (
                 self.forward_target_extend(model_worker_batch, sampling_metadata)
             )
+            if model_worker_batch.dp_size > 1:
+                from jax.experimental.multihost_utils import process_allgather
+
+                next_token_ids = process_allgather(next_token_ids, tiled=True)
             self.draft_worker.draft_extend_for_prefill(
                 model_worker_batch, logits_output.hidden_states, next_token_ids
             )
