@@ -207,7 +207,6 @@ use_wall = os.environ.get("BENCH_WALL", "0") == "1"
 use_split = os.environ.get("BENCH_SPLIT", "0") == "1"
 decode_mode = os.environ.get("BENCH_DECODE_MODE", "0") == "1"
 direct_scaled_dot = os.environ.get("BENCH_DIRECT_SCALED_DOT", "0") == "1"
-skip_decode_sync = os.environ.get("BENCH_SKIP_DECODE_SYNC", "0") == "1"
 inkernel_metadata = os.environ.get("BENCH_INKERNEL_MD", "0") == "1"
 if use_split:
     timeit_fn = None
@@ -239,8 +238,6 @@ if decode_mode:
     log("decode_mode=True (single-buffer weights, serial bf loop)")
 if direct_scaled_dot:
     log("direct_scaled_dot=True (fp8 dot per quant group, scale after dot)")
-if skip_decode_sync:
-    log("skip_decode_sync=True (skip kernel barriers only when num_bt=1)")
 if inkernel_metadata:
     log("inkernel_metadata=True (in-kernel ICI allgather, no JAX lax.all_gather)")
 
@@ -406,7 +403,6 @@ for num_tokens in token_candidates:
                 disable_acc_and_store=disable_acc_and_store,
                 decode_mode=decode_mode,
                 direct_scaled_dot=direct_scaled_dot,
-                skip_decode_sync_barrier=skip_decode_sync,
                 use_jax_allreduce_metadata=not inkernel_metadata,
             )
 
@@ -478,7 +474,6 @@ if check_correctness:
             quant_block_k=qbk_arg,
             w1_scale=w1_scale_s, w2_scale=w2_scale_s, w3_scale=w3_scale_s,
             direct_scaled_dot=direct_scaled_dot,
-            skip_decode_sync_barrier=skip_decode_sync,
             use_jax_allreduce_metadata=not inkernel_metadata,
         )
         ref_kwargs = {}
