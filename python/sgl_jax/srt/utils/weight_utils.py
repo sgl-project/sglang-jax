@@ -2551,6 +2551,10 @@ class WeightLoader:
     def _split_qkv_weight(
         self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
     ):
+        # Hybrid-attention models (MLA + GLA, etc.) should set mapping.head_context
+        # (see HeadContext / _resolve_heads). Without it, head dims fall back to the
+        # loader-global cache from __init__, which patch_model_config may have
+        # overwritten to a different arch's head_dim — silently mis-slicing weights.
         jax_paths = mapping.target_path
 
         num_heads, num_kv_heads, head_dim_original, v_head_dim = self._resolve_heads(mapping)

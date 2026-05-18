@@ -14,6 +14,7 @@ from sgl_jax.srt.models.bailing_moe_linear import (
 )
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+from sgl_jax.srt.utils.weight_utils import HeadContext
 
 
 def _tiny_config(**overrides):
@@ -133,14 +134,21 @@ def test_weight_mapping_contains_linear_mla_dense_and_shared_mlp_keys():
         type("DummyModelConfig", (), {"quantization_config": None})()
     )
 
-    assert (
-        mappings["model.layers.0.attention.query_key_value.weight"].target_path
-        == [
-            "model.layers.0.self_attn.q_proj.weight",
-            "model.layers.0.self_attn.k_proj.weight",
-            "model.layers.0.self_attn.v_proj.weight",
-        ]
+    assert mappings["model.layers.0.attention.query_key_value.weight"].target_path == [
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+    ]
+    gla_ctx = mappings["model.layers.0.attention.query_key_value.weight"].head_context
+    assert isinstance(gla_ctx, HeadContext), (
+        "GLA QKV-split mapping must carry head_context — without it, the loader "
+        "falls back to model_config.head_dim which patch_model_config overwrites "
+        "to MLA's qk_head_dim, silently mis-slicing GLA weights."
     )
+    assert gla_ctx.num_heads == cfg.num_attention_heads
+    assert gla_ctx.num_kv_heads == cfg.num_attention_heads
+    assert gla_ctx.head_dim == cfg.head_dim
+    assert gla_ctx.v_head_dim == cfg.head_dim
     assert (
         mappings["model.layers.0.attention.g_norm.weight"].target_path
         == "model.layers.0.self_attn.g_norm.weight"
