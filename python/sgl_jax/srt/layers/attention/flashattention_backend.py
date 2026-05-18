@@ -218,9 +218,8 @@ class FlashAttention(AttentionBackend):
         per_dp_bs = batch.per_dp_bs_size if dp_size > 1 else len(batch.seq_lens)
         if batch.forward_mode.is_target_verify():
             padded_batch_size = len(batch.seq_lens)
-            real_batch_size = batch.real_bs
-            q_lens = np.array([batch.spec_info.draft_token_num] * real_batch_size, dtype=np.int32)
-            extend_seq_lens = np.pad(q_lens, (0, padded_batch_size - real_batch_size))
+            extend_seq_lens = np.zeros(padded_batch_size, dtype=np.int32)
+            extend_seq_lens[batch.logits_indices_selector] = batch.spec_info.draft_token_num
         else:
             extend_seq_lens = batch.extend_seq_lens
         if dp_size > 1:
