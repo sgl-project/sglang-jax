@@ -303,7 +303,12 @@ class Scheduler(
             # Multi-layer vs single-layer is a model property (how many MTP heads
             # the target ships), not a CLI-algorithm property. NEXTN with a single
             # MTP head behaves exactly like EAGLE (same head run N times).
+            # DeepSeek-style configs expose num_nextn_predict_layers; MiMo-style
+            # configs don't, so fall back to --speculative-num-steps under NEXTN
+            # (one MTP weight set per step).
             n_mtp = getattr(self.tp_worker.model_config.hf_config, "num_nextn_predict_layers", None)
+            if n_mtp is None and self.spec_algorithm.is_nextn():
+                n_mtp = server_args.speculative_num_steps
             self._spec_multi_layer = n_mtp is not None and n_mtp > 1
             if self._spec_multi_layer:
                 from sgl_jax.srt.speculative.multi_layer_eagle_worker import (
