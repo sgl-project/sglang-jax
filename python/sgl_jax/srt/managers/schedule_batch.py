@@ -2046,6 +2046,73 @@ class ScheduleBatch:
             grammars=[req.grammar for req in all_reqs] if self.has_grammar else None,
         )
 
+    def _get_spec_decode_mwb_dp(
+        self, bs_paddings: list, enable_static_lora: bool
+    ) -> ModelWorkerBatch:
+        """DP-aware spec-decode ModelWorkerBatch (#1053 P1-5b).
+
+        Reuses the nospec ``_merge_*`` helpers for per-rank seq_lens /
+        req_pool_indices / sampling_info. ``spec_info`` is global (DP-padded
+        order, see ``EagleDraftInput`` docstring) and lives only on
+        ``reqs_info[0]``. ``input_ids``/``positions``/``cache_loc`` are
+        placeholders — ``EagleDraftWorker.padding_for_decode`` rebuilds them.
+        """
+        max_bs_per_dp = max(
+            (len(i.seq_lens) if i.seq_lens is not None else 0) for i in self.reqs_info
+        )
+        total_bs, _ = pad_to_bucket(max(max_bs_per_dp, 1) * self.dp_size, bs_paddings)
+        per_dp_bs = total_bs // self.dp_size
+        self.per_dp_bs_size = per_dp_bs
+        (
+            req_pool_indices_cpu,
+            seq_lens_cpu,
+            _ext_prefix,
+            _ext_seq,
+            _ext_logprob,
+            _logits_idx,
+            real_bs,
+            real_bs_per_dp,
+            logits_indices_selector,
+        ) = self._merge_batch_metadata(per_dp_bs, total_bs)
+        sampling_info = self._merge_sampling_info(per_dp_bs, total_bs)
+        spec_info = self.reqs_info[0].spec_info
+        out_cache_loc = self.reqs_info[0].out_cache_loc
+        if out_cache_loc is None:
+            out_cache_loc = np.empty(0, dtype=np.int32)
+        return ModelWorkerBatch(
+            bid=acc_global_bid(),
+            forward_mode=self.forward_mode,
+            input_ids=np.empty(0, dtype=np.int32),
+            real_input_ids_len=0,
+            req_pool_indices=req_pool_indices_cpu,
+            seq_lens=seq_lens_cpu,
+            out_cache_loc=out_cache_loc,
+            return_logprob=self.return_logprob,
+            return_output_logprob_only=self.return_output_logprob_only,
+            top_logprobs_nums=self.top_logprobs_nums,
+            token_ids_logprobs=self.token_ids_logprobs,
+            sampling_info=sampling_info,
+            positions=np.empty(0, dtype=np.int32),
+            cache_loc=np.empty(0, dtype=np.int32),
+            extend_prefix_lens=None,
+            extend_seq_lens=None,
+            extend_logprob_start_lens=None,
+            extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+            logits_indices=None,
+            lora_ids=["0"] * total_bs,
+            real_bs=real_bs,
+            real_bs_per_dp=real_bs_per_dp,
+            dp_size=self.dp_size,
+            per_dp_bs_size=per_dp_bs,
+            logits_indices_selector=logits_indices_selector,
+            capture_hidden_mode=getattr(spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL),
+            launch_done=self.launch_done,
+            spec_info=spec_info,
+            spec_algorithm=self.spec_algorithm,
+            tree_cache=self.tree_cache,
+            mrope_positions=None,
+        )
+
     def get_model_worker_batch(
         self,
         token_paddings: list,
@@ -2208,6 +2275,13 @@ class ScheduleBatch:
         page_size: int,
         enable_static_lora: bool = False,
     ) -> ModelWorkerBatch:
+        if self.dp_size > 1:
+            # dp>1 spec extend goes through get_model_worker_batch (padded prefill,
+            # see scheduler._spec_multi_layer); only decode reaches here.
+            assert (
+                self.forward_mode.is_decode_or_idle()
+            ), "spec extend at dp>1 must use get_model_worker_batch (#1053 P1-5b)"
+            return self._get_spec_decode_mwb_dp(bs_paddings, enable_static_lora)
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:

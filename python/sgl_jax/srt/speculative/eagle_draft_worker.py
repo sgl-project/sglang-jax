@@ -288,7 +288,12 @@ class EagleDraftWorker(BaseDraftWorker):
         draft_input.hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
 
     def padding_for_decode(self, model_worker_batch: ModelWorkerBatch):
-        _, padding_bs_index = self.get_padding_bs(model_worker_batch.real_bs)
+        # At dp>1 the incoming mwb is already DP-padded to total_bs (== a bucket
+        # value, see _get_spec_decode_mwb_dp); use the larger of real_bs and the
+        # incoming seq_lens length so we don't shrink below the DP layout.
+        _, padding_bs_index = self.get_padding_bs(
+            max(model_worker_batch.real_bs, len(model_worker_batch.seq_lens))
+        )
         self.copy_model_worker_batch_to_cpu(model_worker_batch)
         model_worker_batch.spec_info.prepare_for_draft_decode(
             model_worker_batch, self.topk, self.speculative_num_steps
