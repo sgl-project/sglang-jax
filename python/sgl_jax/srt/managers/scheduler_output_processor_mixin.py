@@ -248,18 +248,31 @@ class SchedulerOutputProcessorMixin:
     def _resolve_spec_decode_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> list[list[int]]:
-        """Resolve the padding next token ids for speculative decoding with overlap."""
+        """Resolve per-req accepted token lists from the verify output.
 
-        next_token_ids = result.next_token_ids
-        accept_lens = result.accept_lens.tolist()
-        result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
-        predict_tokens = []
+        Returns a list of length ``per_dp_bs * dp_size`` (DP-padded order),
+        with ``[]`` at padding slots, so the per-rank slice in
+        ``process_batch_result_decode`` works for any ``dp_size``.
+        """
+        next_token_ids = np.asarray(jax.device_get(result.next_token_ids))
+        accept_lens = np.asarray(jax.device_get(result.accept_lens)).tolist()
         stride = self.draft_worker.speculative_num_draft_tokens
-        for i, req in enumerate(batch.reqs):
-            predict_tokens.append(next_token_ids[i * stride : i * stride + accept_lens[i]])
-            req.spec_verify_ct += 1
-            req.spec_accepted_tokens += accept_lens[i]
-
+        per_dp_bs = batch.per_dp_bs_size
+        total_bs = per_dp_bs * batch.dp_size
+        predict_tokens: list[list[int]] = [[] for _ in range(total_bs)]
+        n_real = 0
+        total_accepted = 0
+        for dp_rank, info in enumerate(batch.reqs_info):
+            base = dp_rank * per_dp_bs
+            for j, req in enumerate(info.reqs or []):
+                i = base + j
+                a = accept_lens[i]
+                predict_tokens[i] = next_token_ids[i * stride : i * stride + a].tolist()
+                req.spec_verify_ct += 1
+                req.spec_accepted_tokens += a
+                total_accepted += a
+                n_real += 1
+        result.num_accepted_tokens = total_accepted - n_real
         return predict_tokens
 
     def process_batch_result_decode(
