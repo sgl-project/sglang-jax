@@ -152,6 +152,17 @@ def reference_gmm(
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
 class GmmTest(jtu.JaxTestCase):
 
+    @parameterized.product(m=[128, 512, 896, 1024, 1152, 2048], g=[6, 8, 384])
+    def test_default_block_m_divides_m(self, m, g):
+        # Regression for #1099: dp=2 V2.5-Pro hits m=1024,g=6 -> tm=384 (no divide).
+        from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.tuned_block_sizes import (
+            get_default_gmm_block_sizes,
+        )
+
+        tm, _, _ = get_default_gmm_block_sizes(m, 6144, 2048, g)
+        self.assertEqual(m % tm, 0, f"m={m} g={g} -> tm={tm} does not divide m")
+        self.assertEqual(tm % 128, 0)
+
     @parameterized.product(
         batch_size=[128],
         in_size=[512, 1024],
