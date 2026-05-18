@@ -874,7 +874,10 @@ class Glm5ForCausalLM(nnx.Module):
         add_linear(f"{ap}.indexer.wk", f"{tp}.indexer.wk", (None, None))
         # weights_proj is in modules_to_not_convert (HF: indexers_proj) → unquantized.
         add_linear(
-            f"{ap}.indexer.weights_proj", f"{tp}.indexer.weights_proj", (None, None), force_unquant=True
+            f"{ap}.indexer.weights_proj",
+            f"{tp}.indexer.weights_proj",
+            (None, None),
+            force_unquant=True,
         )
         mappings[f"{ap}.indexer.k_norm.weight"] = WeightMapping(
             target_path=f"{tp}.indexer.k_norm.weight", sharding=(None,)
@@ -884,9 +887,13 @@ class Glm5ForCausalLM(nnx.Module):
         )
 
         if is_mlp_layer:
-            add_linear(f"{prefix}.mlp.gate_proj", f"{target_prefix}.mlp.gate_proj", (None, "tensor"))
+            add_linear(
+                f"{prefix}.mlp.gate_proj", f"{target_prefix}.mlp.gate_proj", (None, "tensor")
+            )
             add_linear(f"{prefix}.mlp.up_proj", f"{target_prefix}.mlp.up_proj", (None, "tensor"))
-            add_linear(f"{prefix}.mlp.down_proj", f"{target_prefix}.mlp.down_proj", ("tensor", None))
+            add_linear(
+                f"{prefix}.mlp.down_proj", f"{target_prefix}.mlp.down_proj", ("tensor", None)
+            )
         else:
             mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.moe_gate.kernel",
