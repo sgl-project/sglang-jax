@@ -1,0 +1,12 @@
+model_arch: Kimi-K2.5
+stage_args:
+ - stage_id: 0
+   stage_sub_dir: ""
+   runtime:
+     num_tpus: 1
+     max_batch_size: 1
+     device_kind: tpu
+   scheduler: vit
+   final_output: false
+   scheduler_params: {}
+   model_class: Kimi_K25_VisionModel
