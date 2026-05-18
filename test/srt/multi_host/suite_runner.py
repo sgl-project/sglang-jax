@@ -164,8 +164,16 @@ def run_model_run(model_run: ModelRun, runtime_cfg: RuntimeConfig) -> int:
         )
 
         if is_rank0:
+            failed_cases: list[tuple[str, BaseException]] = []
             for case in model_run.cases:
-                run_case(case, model_run.model.model_path, runtime_cfg.port)
+                try:
+                    run_case(case, model_run.model.model_path, runtime_cfg.port)
+                except Exception as exc:
+                    failed_cases.append((case.name, exc))
+                    _log(f"Case {case.name} failed: {exc!r}")
+            if failed_cases:
+                exit_code = 1
+                _log(f"Run {model_run.name} failed cases: " f"{[name for name, _ in failed_cases]}")
         else:
             workload_name = _get_env("WORKLOAD_NAME")
             headless_service_name = _get_env("HEADLESS_SERVICE_NAME")
