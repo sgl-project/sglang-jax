@@ -535,8 +535,8 @@ class EagleDraftInput:
         bs = batch_output.accept_lens.shape[0]
         step_plus_1 = model_worker_batch.input_ids.shape[0] // bs
         model_worker_batch.positions = model_worker_batch.positions
-        model_worker_batch.extend_seq_lens = np.full((bs,), step_plus_1, dtype=np.int32)
-        model_worker_batch.extend_seq_lens[model_worker_batch.real_bs :] = 0
+        model_worker_batch.extend_seq_lens = np.zeros((bs,), dtype=np.int32)
+        model_worker_batch.extend_seq_lens[sel] = step_plus_1
         model_worker_batch.logits_indices = (
             np.cumsum(model_worker_batch.extend_seq_lens, dtype=np.int32) - 1
         )
