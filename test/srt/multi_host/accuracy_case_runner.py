@@ -1,7 +1,9 @@
 """Accuracy case runner: drives run_eval against a given server URL."""
 
+import json
 import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 _TEST_SRT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
@@ -36,7 +38,23 @@ def run_accuracy_case(case: AccuracyCase, profile: LaunchProfile) -> None:
         f"limit={case.limit}",
         flush=True,
     )
-    run_eval(args)
+    metrics = run_eval(args)
+
+    results_dir = os.environ.get("RESULTS_DIR")
+    if results_dir:
+        summary = {
+            "type": "accuracy",
+            "case": case.name,
+            "profile": profile.name,
+            "target": profile.target,
+            "dataset": case.dataset,
+            "model_id": case.model_id,
+            "score": metrics.get("score") if isinstance(metrics, dict) else None,
+        }
+        out_path = Path(results_dir) / f"{case.name}.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
+
     print(
         f"[multi-host-suite] Accuracy case {case.name} finished "
         "(warn-only mode, accuracy not gated)",

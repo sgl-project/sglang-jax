@@ -192,6 +192,7 @@ jobs:
           set -euo pipefail
 
           HEADLESS_SERVICE_NAME="${WORKLOAD_NAME}-headless"
+          RESULTS_DATE="$(date +'%Y-%m-%d')"
           TPU_PROCESS_ADDRESSES="${WORKLOAD_NAME}-0.${HEADLESS_SERVICE_NAME}:8471,${WORKLOAD_NAME}-1.${HEADLESS_SERVICE_NAME}:8471,${WORKLOAD_NAME}-2.${HEADLESS_SERVICE_NAME}:8471,${WORKLOAD_NAME}-3.${HEADLESS_SERVICE_NAME}:8471"
           TPU_WORKER_HOSTNAMES="${WORKLOAD_NAME}-0.${HEADLESS_SERVICE_NAME},${WORKLOAD_NAME}-1.${HEADLESS_SERVICE_NAME},${WORKLOAD_NAME}-2.${HEADLESS_SERVICE_NAME},${WORKLOAD_NAME}-3.${HEADLESS_SERVICE_NAME}"
 
@@ -287,6 +288,8 @@ jobs:
                     value: "30000"
                   - name: CONTROL_PORT
                     value: "18080"
+                  - name: RESULTS_DIR
+                    value: "/observability/${RESULTS_DATE}/${WORKLOAD_NAME}"
                   - name: CI_MOUNT_ROOT
                     value: "/models"
                   - name: SGLANG_JAX_MODEL_CACHE
@@ -313,6 +316,8 @@ jobs:
                   - mountPath: /models
                     name: model-storage
                     readOnly: true
+                  - mountPath: /observability
+                    name: observability-storage
                   - mountPath: /dev/shm
                     name: dev-shm
                   - mountPath: /tmp/jax_compilation_cache
@@ -333,6 +338,12 @@ jobs:
                     volumeAttributes:
                       bucketName: ${BUCKET_NAME}
                       mountOptions: implicit-dirs,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:-1,metadata-cache:type-cache-max-size-mb:-1,file-cache:max-size-mb:0,file-system:kernel-list-cache-ttl-secs:-1,read_ahead_kb=1024
+                - name: observability-storage
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    volumeAttributes:
+                      bucketName: observability-storage-sglang
+                      mountOptions: implicit-dirs
           EOF
 
           kubectl apply -f /tmp/tpu-smoke.yaml
