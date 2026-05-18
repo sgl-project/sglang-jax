@@ -326,6 +326,10 @@ class SchedulerOutputProcessorMixin:
         # aligned with the selector.
         req_idx = 0
 
+        # spec_info is global (on reqs_info[0]); track flat index across ranks
+        # so the finished-req KV-free below can index allocate_lens correctly.
+        global_spec = batch.reqs_info[0].spec_info
+        global_req_base = 0
         for dp_rank in range(batch.dp_size):
             info = batch.reqs_info[dp_rank]
             reqs = info.reqs
@@ -335,6 +339,7 @@ class SchedulerOutputProcessorMixin:
 
             # Skip empty DP ranks
             if not reqs or not dp_output_ids:
+                global_req_base += len(reqs or [])
                 continue
 
             # Check finish condition for each request in this DP rank
@@ -363,7 +368,7 @@ class SchedulerOutputProcessorMixin:
                 if req.finished():
                     self.maybe_collect_routed_experts(req)
                     if batch.spec_algorithm is not None and batch.spec_algorithm.is_eagle():
-                        cur_allocate_len = int(info.spec_info.allocate_lens[i])
+                        cur_allocate_len = int(global_spec.allocate_lens[global_req_base + i])
                         actual_token_len = len(req.origin_input_ids) + max(
                             len(req.output_ids) - 1, 0
                         )
@@ -458,6 +463,7 @@ class SchedulerOutputProcessorMixin:
                     # Tracking as a follow-up; not in scope for this fix.
                     req.hidden_states.append(logits_output.hidden_states[i])
                 req_idx += 1
+            global_req_base += len(reqs)
 
         # Collect all requests from all DP ranks for stream output
         all_reqs = []

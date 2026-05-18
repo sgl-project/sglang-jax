@@ -1530,6 +1530,14 @@ class ScheduleBatch:
         if chunked_req_to_exclude is None:
             chunked_req_to_exclude = {}
 
+        # spec_info is global (flat across ranks, on reqs_info[0]); pull it out
+        # so the per-rank loop doesn't clear/filter it with rank-local indices,
+        # accumulate global flat keep-indices, then filter once after the loop.
+        _global_spec = self.reqs_info[0].spec_info
+        self.reqs_info[0].spec_info = None
+        _global_keep: list[int] = []
+        _flat_base = 0
+
         # Unified DP filtering logic (works for all dp_size including 1)
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
@@ -1554,6 +1562,9 @@ class ScheduleBatch:
                     if not info.reqs[i].finished()
                     and (chunked_req is None or info.reqs[i] != chunked_req)
                 ]
+
+            _global_keep.extend(_flat_base + i for i in keep_indices_dp)
+            _flat_base += len(info.reqs)
 
             # Early exit: Clear all if nothing to keep
             if len(keep_indices_dp) == 0:
@@ -1624,6 +1635,20 @@ class ScheduleBatch:
                 info.spec_info.filter_batch(
                     new_indices=keep_indices_dp, has_been_filtered=has_been_filtered
                 )
+
+        # Restore + filter the global spec_info with cross-rank flat indices.
+        if _global_spec is not None and len(_global_keep) > 0:
+            gk = np.asarray(_global_keep, dtype=np.int32)
+            if _global_spec.topk_p is not None:
+                _global_spec.topk_p = _global_spec.topk_p[gk]
+                _global_spec.topk_index = _global_spec.topk_index[gk]
+                _global_spec.hidden_states = _global_spec.hidden_states[gk]
+                _global_spec.verified_id = _global_spec.verified_id[gk]
+            if _global_spec.allocate_lens is not None:
+                _global_spec.allocate_lens = np.asarray(_global_spec.allocate_lens)[gk]
+            self.reqs_info[0].spec_info = _global_spec
+        elif _global_spec is not None and len(_global_keep) == 0:
+            self.reqs_info[0].spec_info = None
 
         # Recalculate global batch flags from all remaining requests
         all_reqs = [req for info in self.reqs_info for req in (info.reqs if info.reqs else [])]
