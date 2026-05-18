@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import logging
-import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
@@ -13,8 +11,6 @@ from jax.sharding import PartitionSpec as P
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.managers.tp_worker import ModelWorker
-
-logger = logging.getLogger(__name__)
 
 
 def replicate_to_mesh(
@@ -147,13 +143,7 @@ class BaseSpecWorker:
         cur_allocate_lens = np.asarray(model_worker_batch.spec_info.allocate_lens)[sel]
         self.draft_worker.draft(model_worker_batch)
         batch_output = self.verify(model_worker_batch, cur_allocate_lens)
-        if os.environ.get("P15B_SYNC"):
-            jax.block_until_ready(batch_output.logits_output.next_token_logits)
-            logger.warning("[P15B-SYNC] verify OK accept=%s", batch_output.accept_lens)
         self.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
-        if os.environ.get("P15B_SYNC"):
-            jax.block_until_ready(batch_output.next_draft_input.hidden_states)
-            logger.warning("[P15B-SYNC] draft_extend_for_decode OK")
         return batch_output
 
     def forward_target_extend(self, model_worker_batch: ModelWorkerBatch, sampling_metadata):
