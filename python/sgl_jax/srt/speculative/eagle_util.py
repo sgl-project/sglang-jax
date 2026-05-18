@@ -560,7 +560,14 @@ class EagleDraftInput:
         return model_worker_batch, logits_metadata
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
-        new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE - 1
+        # spec_info / allocate_lens are global (flat across DP ranks); aggregate
+        # per-rank seq_lens / req_pool_indices to match (#1053 P1-5b).
+        active = [
+            i for i in schedule_batch.reqs_info if i.seq_lens is not None and len(i.seq_lens) > 0
+        ]
+        seq_lens = np.concatenate([i.seq_lens for i in active])
+        req_pool_indices = np.concatenate([i.req_pool_indices for i in active])
+        new_allocate_lens = seq_lens + self.ALLOC_LEN_PER_DECODE - 1
         bs = schedule_batch.batch_size()
         assert (
             self.allocate_lens.shape[0] == bs
@@ -573,7 +580,7 @@ class EagleDraftInput:
         else:
             last_loc = get_last_loc(
                 schedule_batch.req_to_token_pool.req_to_token,
-                schedule_batch.req_pool_indices,
+                req_pool_indices,
                 self.allocate_lens,
             )
             extend_num_tokens = sum(new_allocate_lens - self.allocate_lens).item()
@@ -586,7 +593,7 @@ class EagleDraftInput:
             )
 
         assign_req_to_token_pool(
-            schedule_batch.req_pool_indices,
+            req_pool_indices,
             schedule_batch.req_to_token_pool,
             self.allocate_lens,
             new_allocate_lens,
@@ -595,9 +602,11 @@ class EagleDraftInput:
 
         self.allocate_lens = new_allocate_lens
 
-        info = schedule_batch.reqs_info[0]
-        info.seq_lens_sum = np.sum(info.seq_lens).item()
-        info.out_cache_loc = out_cache_loc
+        # out_cache_loc is global; store on rank 0 (consumed by
+        # _get_spec_decode_mwb_dp). seq_lens_sum stays per-rank.
+        schedule_batch.reqs_info[0].out_cache_loc = out_cache_loc
+        for info in active:
+            info.seq_lens_sum = np.sum(info.seq_lens).item()
 
     def prepare_for_draft_decode(
         self, model_worker_batch: ModelWorkerBatch, topk: int, num_steps: int

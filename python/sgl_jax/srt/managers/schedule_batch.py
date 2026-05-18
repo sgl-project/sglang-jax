@@ -1418,6 +1418,21 @@ class ScheduleBatch:
 
         self.maybe_evict_swa()
 
+        # Spec decode: spec_info is global (DP-padded order, on reqs_info[0]);
+        # allocate KV once across all ranks, then return — input_ids/positions
+        # are rebuilt inside forward_batch_speculative_generation.
+        if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+            for info in self.reqs_info:
+                if not info.reqs:
+                    info.input_ids = None
+                    info.output_ids = None
+                    info.seq_lens = None
+                    info.out_cache_loc = None
+                    info.seq_lens_sum = 0
+            draft_input: EagleDraftInput = self.reqs_info[0].spec_info
+            draft_input.prepare_for_decode(self)
+            return
+
         # Process each DP rank
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
@@ -1434,13 +1449,6 @@ class ScheduleBatch:
                 continue
 
             bs = len(reqs)
-
-            # Handle spec decoding if enabled
-            if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
-                # if spec decoding is used, the decode batch is prepared inside
-                # `forward_batch_speculative_generation` after running draft models.
-                draft_input: EagleDraftInput = info.spec_info
-                draft_input.prepare_for_decode(self)
 
             if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
                 continue  # Skip to next DP rank
