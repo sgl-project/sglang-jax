@@ -244,20 +244,38 @@ class FlashAttention(AttentionBackend):
             if metadata.custom_mask is not None and self.page_size >= 256:
                 q = batch.spec_info.draft_token_num
                 cm = np.asarray(jax.device_get(metadata.custom_mask))
-                out, off = [], 0
-                for i in range(batch.real_bs):
-                    kl, kla = int(seq_lens[i]), int(aligned_seq_lens[i])
-                    row = cm[off : off + q * kl].reshape(q, kl)
-                    out.append(np.pad(row, ((0, 0), (0, kla - kl))).reshape(-1))
-                    off += q * kl
-                padded_tail = (
-                    q * int(aligned_seq_lens[batch.real_bs :].sum())
-                    if padded_batch_size > batch.real_bs
-                    else 0
-                )
+                # cm is DP-slot-ordered (build_tree got verified_seq_len = mwb.seq_lens-1
+                # over total_bs). Per-slot cm length = q*(verified_seq_len[s]+q); for pad
+                # slots verified_seq_len=-1 → q*(q-1). Repack per DP rank (real slots'
+                # rows padded to aligned kv, pad slots = zeros), then pad each rank's
+                # section to a common length so the result shards P("data") and each
+                # rank's locally-computed cu_seq_mask_lens (starting at 0) indexes its
+                # own shard. (#1108 P1-7 — n>1 dp>1 verify mask cross-rank read.)
+                cm_kl = np.where(seq_lens > 0, seq_lens, q - 1).astype(np.int64)
+                cm_off = np.concatenate([[0], np.cumsum(q * cm_kl)])
+                rank_chunks: list[np.ndarray] = []
+                for r in range(dp_size):
+                    parts = []
+                    for j in range(per_dp_bs):
+                        s = r * per_dp_bs + j
+                        kla = int(aligned_seq_lens[s])
+                        if seq_lens[s] > 0:
+                            kl = int(seq_lens[s])
+                            row = cm[cm_off[s] : cm_off[s] + q * kl].reshape(q, kl)
+                            parts.append(np.pad(row, ((0, 0), (0, kla - kl))).reshape(-1))
+                        elif kla > 0:
+                            parts.append(np.zeros(q * kla, dtype=cm.dtype))
+                    rank_chunks.append(
+                        np.concatenate(parts) if parts else np.zeros(0, dtype=cm.dtype)
+                    )
+                max_len = max((len(c) for c in rank_chunks), default=0)
+                max_len = ((max_len + 7) // 8) * 8 or 8
+                packed = np.concatenate(
+                    [np.pad(c, (0, max_len - len(c))) for c in rank_chunks]
+                ).astype(np.int32)
                 metadata.custom_mask = device_array(
-                    np.pad(np.concatenate(out), (0, padded_tail)).astype(np.int32),
-                    sharding=NamedSharding(self.mesh, P()),
+                    packed,
+                    sharding=NamedSharding(self.mesh, P("data") if dp_size > 1 else P()),
                 )
         else:
             aligned_seq_lens = (
