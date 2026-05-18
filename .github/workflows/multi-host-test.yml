@@ -259,7 +259,7 @@ jobs:
                     python3 -m pip install --upgrade pip
                     python3 -m pip install -e "python[all]"
                     python3 -m pip install evalscope
-                    python3 test/srt/multi_host/run_suite.py
+                    python3 test/srt/multi_host/suite_runner.py
                   env:
                   - name: JOB_COMPLETION_INDEX
                     valueFrom:

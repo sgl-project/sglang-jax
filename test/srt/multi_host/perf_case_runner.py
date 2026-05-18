@@ -1,0 +1,59 @@
+"""Perf case runner: drives bench_serving against a given server URL."""
+
+import json
+
+from multi_host_suite import PerfCase
+
+
+def run_perf_case(case: PerfCase, model_path: str, port: int) -> None:
+    from sgl_jax.bench_serving import run_benchmark
+    from sgl_jax.test.test_utils import get_benchmark_args
+
+    base_url = f"http://127.0.0.1:{port}"
+    args = get_benchmark_args(
+        base_url=base_url,
+        dataset_name="random",
+        tokenizer=model_path,
+        num_prompts=case.num_prompts,
+        random_input_len=case.input_len,
+        random_output_len=case.output_len,
+        max_concurrency=case.max_concurrency,
+        random_range_ratio=1.0,
+        request_rate=case.request_rate,
+        seed=case.seed,
+        warmup_requests=0,
+        backend="sgl-jax",
+    )
+    args.output_file = "/dev/null"
+    args.flush_cache = case.flush_cache
+
+    print(
+        "[multi-host-suite] Running perf case "
+        f"name={case.name}, num_prompts={case.num_prompts}, "
+        f"concurrency={case.max_concurrency}, input_len={case.input_len}, "
+        f"output_len={case.output_len}, request_rate={case.request_rate}, "
+        f"seed={case.seed}, flush_cache={case.flush_cache}",
+        flush=True,
+    )
+    metrics = run_benchmark(args)
+
+    summary = {
+        "case": case.name,
+        "completed": metrics.get("completed"),
+        "median_ttft_ms": metrics.get("median_ttft_ms"),
+        "median_itl_ms": metrics.get("median_itl_ms"),
+        "input_throughput": metrics.get("input_throughput"),
+        "output_throughput": metrics.get("output_throughput"),
+        "request_throughput": metrics.get("request_throughput"),
+    }
+    print("[multi-host-suite] Perf summary:", flush=True)
+    print(f"[multi-host-suite] {json.dumps(summary, indent=2, sort_keys=True)}", flush=True)
+
+    if metrics.get("completed") != case.num_prompts:
+        raise RuntimeError(f"Expected completed={case.num_prompts}, got {metrics.get('completed')}")
+    if metrics.get("output_throughput", 0) <= 0:
+        raise RuntimeError(
+            f"Expected positive output_throughput, got {metrics.get('output_throughput')}"
+        )
+    if metrics.get("median_ttft_ms", 0) <= 0:
+        raise RuntimeError(f"Expected positive median_ttft_ms, got {metrics.get('median_ttft_ms')}")

@@ -19,6 +19,7 @@ _SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SELF_DIR not in sys.path:
     sys.path.insert(0, _SELF_DIR)
 
+from accuracy_case_runner import run_accuracy_case
 from multi_host_suite import (
     AccuracyCase,
     ModelRun,
@@ -28,6 +29,7 @@ from multi_host_suite import (
     build_other_server_args,
     dry_run_suite,
 )
+from perf_case_runner import run_perf_case
 
 DIST_INIT_PORT = 10011
 SERVER_PORT = 30000
@@ -136,100 +138,6 @@ def run_case(case: PerfCase | AccuracyCase, model_path: str, port: int) -> None:
         return
 
     raise NotImplementedError(f"Unsupported case type: {type(case).__name__}")
-
-
-def run_perf_case(case: PerfCase, model_path: str, port: int) -> None:
-    from sgl_jax.bench_serving import run_benchmark
-    from sgl_jax.test.test_utils import get_benchmark_args
-
-    base_url = f"http://127.0.0.1:{port}"
-    args = get_benchmark_args(
-        base_url=base_url,
-        dataset_name="random",
-        tokenizer=model_path,
-        num_prompts=case.num_prompts,
-        random_input_len=case.input_len,
-        random_output_len=case.output_len,
-        max_concurrency=case.max_concurrency,
-        random_range_ratio=1.0,
-        request_rate=case.request_rate,
-        seed=case.seed,
-        warmup_requests=0,
-        backend="sgl-jax",
-    )
-    args.output_file = "/dev/null"
-    args.flush_cache = case.flush_cache
-
-    _log(
-        "Running perf case "
-        f"name={case.name}, num_prompts={case.num_prompts}, "
-        f"concurrency={case.max_concurrency}, input_len={case.input_len}, "
-        f"output_len={case.output_len}, request_rate={case.request_rate}, "
-        f"seed={case.seed}, flush_cache={case.flush_cache}"
-    )
-    metrics = run_benchmark(args)
-
-    summary = {
-        "case": case.name,
-        "completed": metrics.get("completed"),
-        "median_ttft_ms": metrics.get("median_ttft_ms"),
-        "median_itl_ms": metrics.get("median_itl_ms"),
-        "input_throughput": metrics.get("input_throughput"),
-        "output_throughput": metrics.get("output_throughput"),
-        "request_throughput": metrics.get("request_throughput"),
-    }
-    _log("Perf summary:")
-    _log(json.dumps(summary, indent=2, sort_keys=True))
-
-    if metrics.get("completed") != case.num_prompts:
-        raise RuntimeError(f"Expected completed={case.num_prompts}, got {metrics.get('completed')}")
-    if metrics.get("output_throughput", 0) <= 0:
-        raise RuntimeError(
-            f"Expected positive output_throughput, got {metrics.get('output_throughput')}"
-        )
-    if metrics.get("median_ttft_ms", 0) <= 0:
-        raise RuntimeError(f"Expected positive median_ttft_ms, got {metrics.get('median_ttft_ms')}")
-
-
-def run_accuracy_case(case: AccuracyCase, port: int) -> None:
-    api_url = f"http://127.0.0.1:{port}/v1"
-    cmd = [
-        "evalscope",
-        "eval",
-        "--model",
-        case.model_id,
-        "--api-url",
-        api_url,
-        "--api-key",
-        "EMPTY",
-        "--eval-type",
-        "openai_api",
-        "--datasets",
-        case.dataset,
-        "--eval-batch-size",
-        str(case.eval_batch_size),
-    ]
-    if case.generation_config:
-        cmd.extend(["--generation-config", json.dumps(case.generation_config)])
-    if case.limit is not None:
-        cmd.extend(["--limit", str(case.limit)])
-    if case.timeout is not None:
-        cmd.extend(["--timeout", str(case.timeout)])
-
-    _log(
-        "Running accuracy case "
-        f"name={case.name}, dataset={case.dataset}, "
-        f"eval_batch_size={case.eval_batch_size}, "
-        f"generation_config={case.generation_config}, limit={case.limit}, "
-        f"timeout={case.timeout}"
-    )
-    _log(f"Command: {' '.join(cmd)}")
-    completed = subprocess.run(cmd, check=False)
-    if completed.returncode != 0:
-        raise RuntimeError(
-            f"evalscope exited with code {completed.returncode} for case={case.name}"
-        )
-    _log(f"Accuracy case {case.name} completed (warn-only mode, accuracy not gated)")
 
 
 def run_model_run(model_run: ModelRun, runtime_cfg: RuntimeConfig) -> int:
