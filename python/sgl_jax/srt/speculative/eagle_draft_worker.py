@@ -307,6 +307,13 @@ class EagleDraftWorker(BaseDraftWorker):
         ]
         spec_info = model_worker_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
+        # At dp>1 spec_info arrays arrive at (real_bs,) but seq_lens_cpu is
+        # (total_bs,); pad allocate_lens up front so valid_mask indexing works
+        # (the per-field bs-padding loop below would do this anyway, just later).
+        if len(spec_info.allocate_lens) < len(seq_lens_cpu):
+            spec_info.allocate_lens = np.pad(
+                spec_info.allocate_lens, (0, len(seq_lens_cpu) - len(spec_info.allocate_lens))
+            )
         cache_loc_flat = np.array([], dtype=np.int32)
         if len(seq_lens_cpu) > 0:
             valid_mask = seq_lens_cpu > 0
