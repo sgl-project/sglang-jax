@@ -214,6 +214,8 @@ class FlashAttention(AttentionBackend):
         else:
             metadata.custom_mask = None
 
+        dp_size = batch.dp_size
+        per_dp_bs = batch.per_dp_bs_size if dp_size > 1 else len(batch.seq_lens)
         if batch.forward_mode.is_target_verify():
             padded_batch_size = len(batch.seq_lens)
             real_batch_size = batch.real_bs
@@ -221,12 +223,13 @@ class FlashAttention(AttentionBackend):
             extend_seq_lens = np.pad(q_lens, (0, padded_batch_size - real_batch_size))
         else:
             extend_seq_lens = batch.extend_seq_lens
-        cu_q_lens = np.concatenate(
-            [
-                np.array([0], dtype=np.int32),
-                np.cumsum(extend_seq_lens),
-            ]
-        )
+        if dp_size > 1:
+            ext_2d = np.asarray(extend_seq_lens, dtype=np.int32).reshape(dp_size, per_dp_bs)
+            cu_q_2d = np.zeros((dp_size, per_dp_bs + 1), dtype=np.int32)
+            cu_q_2d[:, 1:] = np.cumsum(ext_2d, axis=1)
+            cu_q_lens = cu_q_2d.ravel()
+        else:
+            cu_q_lens = np.concatenate([np.array([0], dtype=np.int32), np.cumsum(extend_seq_lens)])
 
         seq_lens = np.copy(batch.seq_lens)
 
@@ -260,12 +263,15 @@ class FlashAttention(AttentionBackend):
             aligned_seq_lens = (
                 (batch.seq_lens + self.page_size - 1) // self.page_size
             ) * self.page_size
-        cu_kv_lens = np.concatenate(
-            [
-                np.array([0], dtype=np.int32),
-                np.cumsum(aligned_seq_lens),
-            ]
-        )
+        if dp_size > 1:
+            kv_2d = np.asarray(aligned_seq_lens, dtype=np.int32).reshape(dp_size, per_dp_bs)
+            cu_kv_2d = np.zeros((dp_size, per_dp_bs + 1), dtype=np.int32)
+            cu_kv_2d[:, 1:] = np.cumsum(kv_2d, axis=1)
+            cu_kv_lens = cu_kv_2d.ravel()
+        else:
+            cu_kv_lens = np.concatenate(
+                [np.array([0], dtype=np.int32), np.cumsum(aligned_seq_lens)]
+            )
 
         if batch.forward_mode == ForwardMode.DRAFT_EXTEND:
             # Reconstruct page_indices properly respecting ragged allocation
@@ -304,13 +310,13 @@ class FlashAttention(AttentionBackend):
                 (0, page_indices.shape[0] - len(page_indices_list)),
             )
 
-        num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32).reshape(
-            1,
-        )
-        # Construct distribution for V2 kernel: [decode_end, prefill_end, mixed_end]
-
-        # All sequences are prefill mode
-        distribution = np.array([0, num_seqs.item(), num_seqs.item()], dtype=np.int32)
+        if dp_size > 1:
+            seq_2d = np.asarray(batch.seq_lens).reshape(dp_size, per_dp_bs)
+            local_n = np.sum(seq_2d > 0, axis=1, dtype=np.int32)
+            distribution = np.column_stack([np.zeros_like(local_n), local_n, local_n]).ravel()
+        else:
+            num_seqs = int(np.sum(batch.seq_lens > 0))
+            distribution = np.array([0, num_seqs, num_seqs], dtype=np.int32)
 
         cu_q_lens = np.array(cu_q_lens)
         cu_kv_lens = np.array(cu_kv_lens)
@@ -365,19 +371,22 @@ class FlashAttention(AttentionBackend):
 
         full_size = len(original_selected_cache_locs)
         seq_lens_list = []
+        dp_size = batch.dp_size
+        per_dp_bs = batch.per_dp_bs_size if dp_size > 1 else len(batch.seq_lens)
         for speculative_step_id in range(batch.speculative_num_steps):
             seq_lens = batch.seq_lens + (speculative_step_id)
             seq_lens[batch.real_bs :] = 0
             seq_lens_list.append(seq_lens)
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
-            cu_kv_lens.append(
-                np.concatenate(
-                    [
-                        np.array([0], dtype=np.int32),
-                        np.cumsum(aligned_seq_lens),
-                    ]
+            if dp_size > 1:
+                kv_2d = aligned_seq_lens.reshape(dp_size, per_dp_bs)
+                cu_2d = np.zeros((dp_size, per_dp_bs + 1), dtype=np.int32)
+                cu_2d[:, 1:] = np.cumsum(kv_2d, axis=1)
+                cu_kv_lens.append(cu_2d.ravel())
+            else:
+                cu_kv_lens.append(
+                    np.concatenate([np.array([0], dtype=np.int32), np.cumsum(aligned_seq_lens)])
                 )
-            )
 
             # Vectorized calculation of spec_pages
             step_spec_tokens = (
@@ -413,20 +422,20 @@ class FlashAttention(AttentionBackend):
 
         if batch.spec_algorithm.is_none():
             raise RuntimeError("should not reach here")
+        assert isinstance(batch.spec_info, EagleDraftInput)
+        topk = batch.speculative_eagle_topk
+        if dp_size > 1:
+            single_cu = np.arange(0, per_dp_bs * topk + 1, topk, dtype=np.int32)
+            cu_q_lens = np.tile(single_cu, dp_size)
+            seq_2d = np.asarray(batch.seq_lens).reshape(dp_size, per_dp_bs)
+            local_n = np.sum(seq_2d > 0, axis=1, dtype=np.int32)
+            distribution = np.column_stack(
+                [np.zeros_like(local_n), np.zeros_like(local_n), local_n]
+            ).ravel()
         else:
-            assert isinstance(batch.spec_info, EagleDraftInput)
-            # it is same across every step
-            cu_q_lens = np.arange(
-                0,
-                len(batch.seq_lens) * batch.speculative_eagle_topk + 1,
-                step=batch.speculative_eagle_topk,
-                dtype=np.int32,
-            )
-        num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32).reshape(
-            1,
-        )
-
-        distribution = np.array([0, 0, num_seqs.item()], dtype=np.int32)
+            cu_q_lens = np.arange(0, len(batch.seq_lens) * topk + 1, topk, dtype=np.int32)
+            num_seqs = int(np.sum(batch.seq_lens > 0))
+            distribution = np.array([0, 0, num_seqs], dtype=np.int32)
         metadata = []
         for i in range(batch.speculative_num_steps):
             metadata_tmp = FlashAttentionMetadata()
