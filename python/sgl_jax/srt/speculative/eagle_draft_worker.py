@@ -144,6 +144,9 @@ class EagleDraftWorker(BaseDraftWorker):
     def draft(self, model_worker_batch: ModelWorkerBatch) -> None:
         self.padding_for_decode(model_worker_batch)
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
+        if get_bool_env_var("P15B_SYNC"):
+            jax.block_until_ready((score_list, token_list, parents_list))
+            logger.warning("[P15B-SYNC] draft_forward OK")
         verified_seq_lens = model_worker_batch.seq_lens - 1
         max_seq_len = int(np.max(verified_seq_lens)) if verified_seq_lens.size > 0 else 1
         max_context_len = self._pick_context_len(max_seq_len)
