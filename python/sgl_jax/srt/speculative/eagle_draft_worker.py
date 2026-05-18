@@ -190,7 +190,8 @@ class EagleDraftWorker(BaseDraftWorker):
         hidden_states: jax.Array,
         next_token_ids: jax.Array,
     ) -> None:
-        verified_id_np = np.asarray(jax.device_get(next_token_ids))[: model_worker_batch.real_bs]
+        sel = np.asarray(model_worker_batch.logits_indices_selector)
+        verified_id_np = np.asarray(jax.device_get(next_token_ids))[sel]
         model_worker_batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=verified_id_np,
@@ -253,12 +254,9 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch,
             logits_metadata=logits_metadata,
         )
-        select_index = (
-            np.arange(len(model_worker_batch.seq_lens[: model_worker_batch.real_bs]))
-            * (self.speculative_num_steps + 1)
-            + batch_output.accept_lens[: model_worker_batch.real_bs]
-            - 1
-        )
+        sel = np.asarray(model_worker_batch.logits_indices_selector)
+        accept_host = np.asarray(jax.device_get(batch_output.accept_lens))
+        select_index = sel * (self.speculative_num_steps + 1) + accept_host[sel] - 1
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, draft_logits_output.next_token_logits, draft_logits_output.hidden_states
         )
@@ -275,7 +273,7 @@ class EagleDraftWorker(BaseDraftWorker):
             select_index
         ]
         batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
-        batch_output.accept_lens = batch_output.accept_lens[: model_worker_batch.real_bs]
+        batch_output.accept_lens = accept_host[sel]
 
     # -- Internal draft helpers --
 

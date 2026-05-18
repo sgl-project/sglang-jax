@@ -207,7 +207,8 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         prefix KV. Only layer 0's topk/hidden are kept as the next-round
         draft state (draft step 0 starts from layer 0).
         """
-        verified_id_np = np.asarray(jax.device_get(next_token_ids))[: model_worker_batch.real_bs]
+        sel = np.asarray(model_worker_batch.logits_indices_selector)
+        verified_id_np = np.asarray(jax.device_get(next_token_ids))[sel]
         model_worker_batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=verified_id_np,
@@ -251,12 +252,10 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, layer0_out.next_token_logits, layer0_out.hidden_states
         )
-        layer0_out.next_token_logits = rep_logits[: model_worker_batch.real_bs, :]
-        layer0_out.hidden_states = rep_hidden[last_idx][: model_worker_batch.real_bs]
+        layer0_out.next_token_logits = rep_logits[sel, :]
+        layer0_out.hidden_states = rep_hidden[last_idx][sel]
         model_worker_batch.spec_info.hidden_states = hidden_states
-        model_worker_batch.spec_info.allocate_lens = model_worker_batch.seq_lens[
-            : model_worker_batch.real_bs
-        ]
+        model_worker_batch.spec_info.allocate_lens = np.asarray(model_worker_batch.seq_lens)[sel]
         self.capture_for_decode(layer0_out, model_worker_batch.spec_info)
 
     def draft_extend_for_decode(
@@ -300,12 +299,13 @@ class MultiLayerDraftWorker(EagleDraftWorker):
                 layer0_logits = logits_output
             cur_hidden = logits_output.hidden_states
 
-        select_index = (
-            np.arange(len(model_worker_batch.seq_lens[: model_worker_batch.real_bs]))
-            * (self.speculative_num_steps + 1)
-            + batch_output.accept_lens[: model_worker_batch.real_bs]
-            - 1
-        )
+        # logits_indices_selector maps global-flat req k → DP-padded slot s_k.
+        # rep_logits/rep_hidden are DP-padded (total_bs*(steps+1), …); gather
+        # each req's accept_len-th entry by slot, producing global-flat
+        # (real_bs, …) for the cross-round spec_info.
+        sel = np.asarray(model_worker_batch.logits_indices_selector)
+        accept_host = np.asarray(jax.device_get(batch_output.accept_lens))
+        select_index = sel * (self.speculative_num_steps + 1) + accept_host[sel] - 1
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, layer0_logits.next_token_logits, layer0_logits.hidden_states
         )
@@ -317,4 +317,4 @@ class MultiLayerDraftWorker(EagleDraftWorker):
             select_index
         ]
         batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
-        batch_output.accept_lens = batch_output.accept_lens[: model_worker_batch.real_bs]
+        batch_output.accept_lens = accept_host[sel]

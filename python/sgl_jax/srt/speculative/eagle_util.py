@@ -528,10 +528,9 @@ class EagleDraftInput:
         speculative_num_draft_tokens: int,
     ):
         model_worker_batch.spec_info = self
-        model_worker_batch.seq_lens[: model_worker_batch.real_bs] = (
-            model_worker_batch.seq_lens[: model_worker_batch.real_bs]
-            + speculative_num_draft_tokens
-            - 1
+        sel = model_worker_batch.logits_indices_selector
+        model_worker_batch.seq_lens[sel] = (
+            model_worker_batch.seq_lens[sel] + speculative_num_draft_tokens - 1
         )
         bs = batch_output.accept_lens.shape[0]
         step_plus_1 = model_worker_batch.input_ids.shape[0] // bs
@@ -837,9 +836,8 @@ class EagleVerifyInput:
         if model_worker_batch.forward_mode.is_idle():
             return
 
-        model_worker_batch.seq_lens[: model_worker_batch.real_bs] = (
-            model_worker_batch.seq_lens[: model_worker_batch.real_bs] - 1
-        )
+        sel = model_worker_batch.logits_indices_selector
+        model_worker_batch.seq_lens[sel] = model_worker_batch.seq_lens[sel] - 1
         model_worker_batch.input_ids = self.draft_token
         model_worker_batch.positions = self.positions
         # bs = batch.batch_size()
