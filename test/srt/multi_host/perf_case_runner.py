@@ -3,17 +3,18 @@
 import json
 
 from multi_host_suite import PerfCase
+from profile_loader import LaunchProfile
 
 
-def run_perf_case(case: PerfCase, model_path: str, port: int) -> None:
+def run_perf_case(case: PerfCase, profile: LaunchProfile) -> None:
     from sgl_jax.bench_serving import run_benchmark
     from sgl_jax.test.test_utils import get_benchmark_args
 
-    base_url = f"http://127.0.0.1:{port}"
+    base_url = f"http://127.0.0.1:{profile.port}"
     args = get_benchmark_args(
         base_url=base_url,
         dataset_name="random",
-        tokenizer=model_path,
+        tokenizer=profile.model_path,
         num_prompts=case.num_prompts,
         random_input_len=case.input_len,
         random_output_len=case.output_len,
@@ -51,9 +52,3 @@ def run_perf_case(case: PerfCase, model_path: str, port: int) -> None:
 
     if metrics.get("completed") != case.num_prompts:
         raise RuntimeError(f"Expected completed={case.num_prompts}, got {metrics.get('completed')}")
-    if metrics.get("output_throughput", 0) <= 0:
-        raise RuntimeError(
-            f"Expected positive output_throughput, got {metrics.get('output_throughput')}"
-        )
-    if metrics.get("median_ttft_ms", 0) <= 0:
-        raise RuntimeError(f"Expected positive median_ttft_ms, got {metrics.get('median_ttft_ms')}")

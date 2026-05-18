@@ -12,10 +12,6 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-# Make sibling modules (multi_host_suite, test_*.py suites) importable regardless
-# of cwd or invocation style. Python normally only adds the script's directory
-# to sys.path[0] when run as `python file.py`; this ensures other entry points
-# (e.g. `python -c`, runners that change cwd) still work.
 _SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SELF_DIR not in sys.path:
     sys.path.insert(0, _SELF_DIR)
@@ -30,11 +26,7 @@ from multi_host_suite import (
     dry_run_suite,
 )
 from perf_case_runner import run_perf_case
-from profile_loader import build_other_server_args, load_profile
-
-DIST_INIT_PORT = 10011
-SERVER_PORT = 30000
-CONTROL_PORT = 18080
+from profile_loader import LaunchProfile, build_other_server_args, load_profile
 
 _control_state = {"done": False, "exit_code": 0}
 
@@ -86,10 +78,11 @@ class ControlHandler(BaseHTTPRequestHandler):
 
 
 def start_control_server() -> ThreadingHTTPServer:
-    server = ThreadingHTTPServer(("0.0.0.0", CONTROL_PORT), ControlHandler)
+    control_port = int(_get_env("CONTROL_PORT"))
+    server = ThreadingHTTPServer(("0.0.0.0", control_port), ControlHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    _log(f"Control server started on port {CONTROL_PORT}")
+    _log(f"Control server started on port {control_port}")
     return server
 
 
@@ -121,21 +114,23 @@ def build_runtime_config(node_rank: int | None = None) -> RuntimeConfig:
     headless_service_name = _get_env("HEADLESS_SERVICE_NAME")
     resolved_node_rank = int(_get_env("JOB_COMPLETION_INDEX") if node_rank is None else node_rank)
     nnodes = int(_get_env("NNODES", "4"))
+    dist_init_port = int(_get_env("DIST_INIT_PORT"))
+    server_port = int(_get_env("SERVER_PORT"))
     return RuntimeConfig(
         nnodes=nnodes,
         node_rank=resolved_node_rank,
-        dist_init_addr=f"{workload_name}-0.{headless_service_name}:{DIST_INIT_PORT}",
+        dist_init_addr=f"{workload_name}-0.{headless_service_name}:{dist_init_port}",
         host="0.0.0.0",
-        port=SERVER_PORT,
+        port=server_port,
     )
 
 
-def run_case(case: PerfCase | AccuracyCase, model_path: str, port: int) -> None:
+def run_case(case: PerfCase | AccuracyCase, profile: LaunchProfile) -> None:
     if isinstance(case, PerfCase):
-        run_perf_case(case, model_path, port)
+        run_perf_case(case, profile)
         return
     if isinstance(case, AccuracyCase):
-        run_accuracy_case(case, port)
+        run_accuracy_case(case, profile)
         return
 
     raise NotImplementedError(f"Unsupported case type: {type(case).__name__}")
@@ -170,7 +165,7 @@ def run_model_run(model_run: ModelRun, runtime_cfg: RuntimeConfig) -> int:
             failed_cases: list[tuple[str, BaseException]] = []
             for case in model_run.cases:
                 try:
-                    run_case(case, profile.model_path, runtime_cfg.port)
+                    run_case(case, profile)
                 except Exception as exc:
                     failed_cases.append((case.name, exc))
                     _log(f"Case {case.name} failed: {exc!r}")
@@ -180,7 +175,10 @@ def run_model_run(model_run: ModelRun, runtime_cfg: RuntimeConfig) -> int:
         else:
             workload_name = _get_env("WORKLOAD_NAME")
             headless_service_name = _get_env("HEADLESS_SERVICE_NAME")
-            control_url = f"http://{workload_name}-0.{headless_service_name}:{CONTROL_PORT}/status"
+            control_url = (
+                f"http://{workload_name}-0.{headless_service_name}:"
+                f"{int(_get_env('CONTROL_PORT'))}/status"
+            )
             exit_code = wait_for_done(control_url, server_process)
     except Exception:
         exit_code = 1
