@@ -261,6 +261,7 @@ suites = {
         TestFile("python/sgl_jax/test/layers/test_group_rmsnorm.py", 0.1, runner="pytest"),
         TestFile("test/srt/lora/test_bgmv_backend.py", 7),
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 5.5),
+        TestFile("python/sgl_jax/test/kernels/simple_gla_fused_test.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/layers/test_gdn_backend.py", 0.6),
         TestFile("python/sgl_jax/test/layers/test_merged_column_parallel_linear.py", 0.1),
         TestFile("python/sgl_jax/test/layers/test_qwen3_5_gated_delta_net.py", 0.5),
