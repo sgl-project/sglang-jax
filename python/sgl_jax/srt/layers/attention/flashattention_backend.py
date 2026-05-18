@@ -25,6 +25,17 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 logger = logging.getLogger(__name__)
 
 
+def _per_dp_cumsum(lens, dp_size: int, per_dp_bs: int) -> np.ndarray:
+    """`(dp*(per_dp_bs+1),)` row-wise cumsum with leading 0 per DP rank.
+
+    At dp=1 reduces to `[0, *cumsum(lens)]`. Replaces the previous
+    ``if dp>1: 2D else: 1D`` branches (review #1108).
+    """
+    cu = np.zeros((dp_size, per_dp_bs + 1), dtype=np.int32)
+    cu[:, 1:] = np.cumsum(np.asarray(lens, dtype=np.int32).reshape(dp_size, per_dp_bs), axis=1)
+    return cu.ravel()
+
+
 @register_pytree_node_class
 @dataclass
 class FlashAttentionMetadata:
@@ -222,13 +233,7 @@ class FlashAttention(AttentionBackend):
             extend_seq_lens[batch.logits_indices_selector] = batch.spec_info.draft_token_num
         else:
             extend_seq_lens = batch.extend_seq_lens
-        if dp_size > 1:
-            ext_2d = np.asarray(extend_seq_lens, dtype=np.int32).reshape(dp_size, per_dp_bs)
-            cu_q_2d = np.zeros((dp_size, per_dp_bs + 1), dtype=np.int32)
-            cu_q_2d[:, 1:] = np.cumsum(ext_2d, axis=1)
-            cu_q_lens = cu_q_2d.ravel()
-        else:
-            cu_q_lens = np.concatenate([np.array([0], dtype=np.int32), np.cumsum(extend_seq_lens)])
+        cu_q_lens = _per_dp_cumsum(extend_seq_lens, dp_size, per_dp_bs)
 
         seq_lens = np.copy(batch.seq_lens)
 
@@ -280,15 +285,7 @@ class FlashAttention(AttentionBackend):
             aligned_seq_lens = (
                 (batch.seq_lens + self.page_size - 1) // self.page_size
             ) * self.page_size
-        if dp_size > 1:
-            kv_2d = np.asarray(aligned_seq_lens, dtype=np.int32).reshape(dp_size, per_dp_bs)
-            cu_kv_2d = np.zeros((dp_size, per_dp_bs + 1), dtype=np.int32)
-            cu_kv_2d[:, 1:] = np.cumsum(kv_2d, axis=1)
-            cu_kv_lens = cu_kv_2d.ravel()
-        else:
-            cu_kv_lens = np.concatenate(
-                [np.array([0], dtype=np.int32), np.cumsum(aligned_seq_lens)]
-            )
+        cu_kv_lens = _per_dp_cumsum(aligned_seq_lens, dp_size, per_dp_bs)
 
         if batch.forward_mode == ForwardMode.DRAFT_EXTEND:
             # Reconstruct page_indices properly respecting ragged allocation
@@ -327,16 +324,9 @@ class FlashAttention(AttentionBackend):
                 (0, page_indices.shape[0] - len(page_indices_list)),
             )
 
-        if dp_size > 1:
-            seq_2d = np.asarray(batch.seq_lens).reshape(dp_size, per_dp_bs)
-            local_n = np.sum(seq_2d > 0, axis=1, dtype=np.int32)
-            distribution = np.column_stack([np.zeros_like(local_n), local_n, local_n]).ravel()
-        else:
-            num_seqs = int(np.sum(batch.seq_lens > 0))
-            distribution = np.array([0, num_seqs, num_seqs], dtype=np.int32)
-
-        cu_q_lens = np.array(cu_q_lens)
-        cu_kv_lens = np.array(cu_kv_lens)
+        seq_2d = np.asarray(batch.seq_lens).reshape(dp_size, per_dp_bs)
+        local_n = np.sum(seq_2d > 0, axis=1, dtype=np.int32)
+        distribution = np.column_stack([np.zeros_like(local_n), local_n, local_n]).ravel()
         page_indices = np.array(page_indices)
         seq_lens = np.array(seq_lens)
         (
@@ -397,15 +387,7 @@ class FlashAttention(AttentionBackend):
             seq_lens = np.where(valid_slot, batch.seq_lens + speculative_step_id, 0)
             seq_lens_list.append(seq_lens)
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
-            if dp_size > 1:
-                kv_2d = aligned_seq_lens.reshape(dp_size, per_dp_bs)
-                cu_2d = np.zeros((dp_size, per_dp_bs + 1), dtype=np.int32)
-                cu_2d[:, 1:] = np.cumsum(kv_2d, axis=1)
-                cu_kv_lens.append(cu_2d.ravel())
-            else:
-                cu_kv_lens.append(
-                    np.concatenate([np.array([0], dtype=np.int32), np.cumsum(aligned_seq_lens)])
-                )
+            cu_kv_lens.append(_per_dp_cumsum(aligned_seq_lens, dp_size, per_dp_bs))
 
             # Vectorized calculation of spec_pages
             step_spec_tokens = (
@@ -443,18 +425,12 @@ class FlashAttention(AttentionBackend):
             raise RuntimeError("should not reach here")
         assert isinstance(batch.spec_info, EagleDraftInput)
         topk = batch.speculative_eagle_topk
-        if dp_size > 1:
-            single_cu = np.arange(0, per_dp_bs * topk + 1, topk, dtype=np.int32)
-            cu_q_lens = np.tile(single_cu, dp_size)
-            seq_2d = np.asarray(batch.seq_lens).reshape(dp_size, per_dp_bs)
-            local_n = np.sum(seq_2d > 0, axis=1, dtype=np.int32)
-            distribution = np.column_stack(
-                [np.zeros_like(local_n), np.zeros_like(local_n), local_n]
-            ).ravel()
-        else:
-            cu_q_lens = np.arange(0, len(batch.seq_lens) * topk + 1, topk, dtype=np.int32)
-            num_seqs = int(np.sum(batch.seq_lens > 0))
-            distribution = np.array([0, 0, num_seqs], dtype=np.int32)
+        cu_q_lens = np.tile(np.arange(0, per_dp_bs * topk + 1, topk, dtype=np.int32), dp_size)
+        seq_2d = np.asarray(batch.seq_lens).reshape(dp_size, per_dp_bs)
+        local_n = np.sum(seq_2d > 0, axis=1, dtype=np.int32)
+        distribution = np.column_stack(
+            [np.zeros_like(local_n), np.zeros_like(local_n), local_n]
+        ).ravel()
         metadata = []
         for i in range(batch.speculative_num_steps):
             metadata_tmp = FlashAttentionMetadata()
