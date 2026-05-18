@@ -298,10 +298,28 @@ class Scheduler(
         )
 
         # launch draft worker
+        self._spec_multi_layer = False
         if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
-            from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker
+            # Multi-layer vs single-layer is a model property (how many MTP heads
+            # the target ships), not a CLI-algorithm property. NEXTN with a single
+            # MTP head behaves exactly like EAGLE (same head run N times).
+            # DeepSeek-style configs expose num_nextn_predict_layers; MiMo-style
+            # configs don't, so fall back to --speculative-num-steps under NEXTN
+            # (one MTP weight set per step).
+            n_mtp = getattr(self.tp_worker.model_config.hf_config, "num_nextn_predict_layers", None)
+            if n_mtp is None and self.spec_algorithm.is_nextn():
+                n_mtp = server_args.speculative_num_steps
+            self._spec_multi_layer = n_mtp is not None and n_mtp > 1
+            if self._spec_multi_layer:
+                from sgl_jax.srt.speculative.multi_layer_eagle_worker import (
+                    MultiLayerEAGLEWorker as _SpecWorkerCls,
+                )
+            else:
+                from sgl_jax.srt.speculative.eagle_worker import (
+                    EAGLEWorker as _SpecWorkerCls,
+                )
 
-            self.draft_worker = EAGLEWorker(
+            self.draft_worker = _SpecWorkerCls(
                 server_args=server_args,
                 target_worker=self.tp_worker,
             )
@@ -1802,13 +1820,26 @@ class Scheduler(
                 next_token_ids = np.array(jax.device_get(next_token_ids_device))
                 self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
         else:
-            model_worker_batch = batch.get_spec_model_worker_batch(
-                precompile_token_paddings,
-                precompile_bs_paddings,
-                precompile_cache_loc_paddings,
-                self.page_size,
-                self.server_args.enable_static_lora,
-            )
+            if batch.forward_mode.is_extend() and self._spec_multi_layer:
+                # Multi-layer-MTP (MoE+EP target) prefill must use the same padded
+                # mwb as nospec so target forward sees identical shapes (#1090).
+                # EagleDraftWorker doesn't yet handle padded prefill mwb, so gate
+                # on the worker selection rather than the algorithm flag.
+                model_worker_batch = batch.get_model_worker_batch(
+                    precompile_token_paddings,
+                    precompile_bs_paddings,
+                    precompile_cache_loc_paddings,
+                    self.page_size,
+                    self.server_args.enable_static_lora,
+                )
+            else:
+                model_worker_batch = batch.get_spec_model_worker_batch(
+                    precompile_token_paddings,
+                    precompile_bs_paddings,
+                    precompile_cache_loc_paddings,
+                    self.page_size,
+                    self.server_args.enable_static_lora,
+                )
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch
             )

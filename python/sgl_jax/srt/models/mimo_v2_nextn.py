@@ -146,6 +146,9 @@ class MiMoV2ModelNextN(nnx.Module):
     ) -> tuple[jax.Array, list[jax.Array]]:
         embed = self.embed_tokens(forward_batch.input_ids)
         hidden_in = forward_batch.spec_info.hidden_states
+        emb_sh = jax.typeof(embed).sharding
+        if isinstance(emb_sh, jax.sharding.NamedSharding):
+            hidden_in = jax.sharding.reshard(hidden_in, emb_sh)
         hidden_states, _ = self.eh_proj(
             jnp.concatenate((self.enorm(embed), self.hnorm(hidden_in)), axis=-1)
         )
@@ -192,7 +195,7 @@ class MiMoV2MTPForCausalLM(nnx.Module):
         output = self.logits_processor(
             hidden_states, self.lm_head, logits_metadata, aux_hidden_states=None
         )
-        return output, layers_kv_fused, []
+        return output, layers_kv_fused, True, None
 
     def load_weights(self, model_config: ModelConfig):
         self.loader = WeightLoader(
