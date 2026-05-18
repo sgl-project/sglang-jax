@@ -2108,7 +2108,16 @@ class ScheduleBatch:
             logits_indices_selector,
         ) = self._merge_batch_metadata(per_dp_bs, total_bs)
         sampling_info = self._merge_sampling_info(per_dp_bs, total_bs)
-        spec_info = self.reqs_info[0].spec_info
+        # spec_info arrays live global-flat (rank-then-req contiguous, shape
+        # (real_bs,)) on reqs_info[0]. Scatter into DP-padded (total_bs,) slots
+        # via logits_indices_selector so spec_info[i] aligns with seq_lens[i].
+        # padding_for_decode then gathers via valid_mask=seq_lens>0 and gets
+        # back exactly the global-flat order. New object — don't mutate the
+        # cross-round state on reqs_info[0].
+        flat_spec = self.reqs_info[0].spec_info
+        spec_info = self._scatter_spec_info_to_dp_slots(
+            flat_spec, logits_indices_selector, total_bs
+        )
         out_cache_loc = self.reqs_info[0].out_cache_loc
         if out_cache_loc is None:
             out_cache_loc = np.empty(0, dtype=np.int32)
@@ -2150,6 +2159,34 @@ class ScheduleBatch:
             spec_algorithm=self.spec_algorithm,
             tree_cache=self.tree_cache,
             mrope_positions=None,
+        )
+
+    @staticmethod
+    def _scatter_spec_info_to_dp_slots(flat, selector: np.ndarray, total_bs: int):
+        """Scatter global-flat spec_info arrays into DP-padded ``(total_bs, …)``.
+
+        ``selector[k]`` is the DP-padded slot of the k-th global-flat req
+        (== ``logits_indices_selector``). Returns a new ``EagleDraftInput``;
+        the cross-round flat state on ``reqs_info[0].spec_info`` is unchanged.
+        """
+
+        def _scatter1(arr):
+            if arr is None:
+                return None
+            a = np.asarray(arr)
+            out = np.zeros((total_bs,) + a.shape[1:], dtype=a.dtype)
+            out[selector] = a
+            return out
+
+        return type(flat)(
+            topk_p=_scatter1(flat.topk_p),
+            topk_index=_scatter1(flat.topk_index),
+            hidden_states=_scatter1(flat.hidden_states),
+            verified_id=_scatter1(flat.verified_id),
+            allocate_lens=_scatter1(flat.allocate_lens),
+            capture_hidden_mode=flat.capture_hidden_mode,
+            accept_length=flat.accept_length,
+            accept_length_cpu=flat.accept_length_cpu,
         )
 
     def get_model_worker_batch(

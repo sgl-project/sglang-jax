@@ -26,6 +26,25 @@ TOPK = 1
 DRAFT_N = 4
 
 
+class _Req:
+    def __init__(self, rid: int):
+        self.rid = rid
+        self._done = False
+        self.output_ids: list[int] = []
+        self.origin_input_ids = [1, 2, 3, 4, 5]
+        self.spec_verify_ct = 0
+        self.spec_accepted_tokens = 0
+        self.is_retracted = False
+        self.return_logprob = False
+        self.return_output_logprob_only = False
+        self.stream = False
+        self.grammar = None
+        self.return_hidden_states = False
+
+    def finished(self) -> bool:
+        return self._done
+
+
 def _mk_spec_info(real_bs: int) -> EagleDraftInput:
     return EagleDraftInput(
         topk_p=np.ones((real_bs, TOPK), np.float32),
@@ -48,7 +67,7 @@ def _mk_batch(dp_size: int, bs_per_rank: list[int]) -> ScheduleBatch:
     for r, bs in enumerate(bs_per_rank):
         info = ScheduleReqsInfo()
         if bs > 0:
-            info.reqs = [object()] * bs  # placeholder; only len() is read
+            info.reqs = [_Req(r * 100 + j) for j in range(bs)]
             info.seq_lens = np.full((bs,), 6 + r, np.int32)
             info.req_pool_indices = np.arange(r * 10, r * 10 + bs, dtype=np.int32)
         else:
@@ -83,9 +102,7 @@ def _mk_batch(dp_size: int, bs_per_rank: list[int]) -> ScheduleBatch:
 
 @pytest.fixture(autouse=True)
 def _stub_sampling(monkeypatch):
-    monkeypatch.setattr(
-        ScheduleBatch, "_merge_sampling_info", lambda self, per_dp, total: None
-    )
+    monkeypatch.setattr(ScheduleBatch, "_merge_sampling_info", lambda self, per_dp, total: None)
 
 
 BS_BUCKETS = [1, 2, 4, 8, 16]
@@ -126,3 +143,121 @@ def test_get_spec_decode_mwb_dp_shapes(dp, bs_per_rank):
         assert np.all(seg[:bs] > 0), f"rank {r} real slots zero: {seg}"
         assert np.all(seg[bs:] == 0), f"rank {r} pad slots nonzero: {seg}"
     assert mwb.spec_info is not None
+
+
+@pytest.mark.parametrize(
+    "dp,bs_per_rank,finish",
+    [
+        (2, [1, 1], [(0, 0)]),  # rank 0 finishes → rank 1 survives (r9 crash repro)
+        (2, [1, 1], [(1, 0)]),  # rank 1 finishes → rank 0 survives
+        (2, [2, 1], [(0, 0)]),  # rank 0 partial → keep rank0[1] + rank1[0]
+        (4, [1, 1, 1, 1], [(0, 0), (2, 0)]),  # ranks 0,2 finish
+        (1, [3], [(0, 1)]),  # dp=1 regression
+    ],
+)
+def test_filter_batch_preserves_global_spec_info(dp, bs_per_rank, finish):
+    sb = _mk_batch(dp, bs_per_rank)
+    real_bs = sum(bs_per_rank)
+    # Tag spec_info arrays so we can verify which entries survive.
+    spec = sb.reqs_info[0].spec_info
+    spec.allocate_lens = np.arange(100, 100 + real_bs, dtype=np.int32)
+    spec.verified_id = np.arange(200, 200 + real_bs, dtype=np.int32)
+    spec.hidden_states = np.arange(real_bs, dtype=np.float32).reshape(real_bs, 1).repeat(HIDDEN, 1)
+    # Compute expected survivors in global-flat order BEFORE marking finished.
+    finish_set = set(finish)
+    expected_keep = []
+    flat = 0
+    for r, bs in enumerate(bs_per_rank):
+        for j in range(bs):
+            if (r, j) not in finish_set:
+                expected_keep.append(flat)
+            flat += 1
+    for r, j in finish:
+        sb.reqs_info[r].reqs[j]._done = True
+
+    sb.filter_batch()
+
+    new_spec = sb.reqs_info[0].spec_info
+    assert new_spec is not None, "global spec_info dropped after partial-finish"
+    assert new_spec.allocate_lens.shape == (len(expected_keep),)
+    assert list(new_spec.allocate_lens) == [100 + i for i in expected_keep]
+    assert list(new_spec.verified_id) == [200 + i for i in expected_keep]
+    assert new_spec.hidden_states.shape == (len(expected_keep), HIDDEN)
+    # Surviving reqs per rank should match.
+    for r, bs in enumerate(bs_per_rank):
+        kept = bs - sum(1 for fr, fj in finish if fr == r)
+        assert len(sb.reqs_info[r].reqs or []) == kept
+
+
+def test_filter_batch_then_decode_mwb_round_trip():
+    """Regression for 2-req partial-finish → next-round decode mwb (r9 crash).
+
+    After rank 0 empties, the next `_get_spec_decode_mwb_dp` must still produce
+    a dp-divisible mwb whose spec_info aligns with the DP-padded seq_lens slots.
+    """
+    dp, bs_per_rank = 2, [1, 1]
+    sb = _mk_batch(dp, bs_per_rank)
+    spec = sb.reqs_info[0].spec_info
+    spec.allocate_lens = np.array([110, 120], dtype=np.int32)
+    sb.reqs_info[0].reqs[0]._done = True
+    sb.filter_batch()
+    # rank 0 empty, rank 1 has 1 req; spec_info global-flat now [120].
+    buckets = [b for b in BS_BUCKETS if b >= dp]
+    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False)
+    assert mwb.real_bs == 1
+    assert mwb.real_bs_per_dp == [0, 1]
+    assert len(mwb.seq_lens) % dp == 0
+    per_dp = mwb.per_dp_bs_size
+    # rank 0 slot(s) all-zero, rank 1 slot 0 has data.
+    assert np.all(mwb.seq_lens[:per_dp] == 0)
+    assert mwb.seq_lens[per_dp] > 0
+    # spec_info is now DP-padded (total_bs,); rank 1's data must be at slot per_dp.
+    al = np.asarray(mwb.spec_info.allocate_lens)
+    assert al.shape[0] == per_dp * dp
+    assert int(al[per_dp]) == 120
+    assert int(al[0]) == 0  # rank-0 padding slot
+
+
+@pytest.mark.parametrize(
+    "dp,bs_per_rank",
+    [
+        (2, [0, 1]),  # rank 0 empty (post-partial-finish shape)
+        (2, [1, 2]),  # unbalanced, rank 1 heavier
+        (4, [0, 1, 0, 2]),
+    ],
+)
+def test_spec_info_aligns_with_dp_padded_slots(dp, bs_per_rank):
+    """Core layout invariant: after `_get_spec_decode_mwb_dp`, spec_info arrays
+    must index-align with DP-padded mwb.seq_lens — i.e., spec_info[i] is the
+    data for the req at slot i (or padding). `padding_for_decode` then uses
+    `valid_mask = seq_lens > 0` to index spec_info.allocate_lens; if spec_info
+    is global-flat (no inter-rank padding) this picks wrong entries.
+
+    Current impl stores spec_info global-flat → this test FAILS for unbalanced
+    bs_per_rank → drives the layout fix (scatter via logits_indices_selector,
+    PR #1108 design question option A).
+    """
+    sb = _mk_batch(dp, bs_per_rank)
+    real_bs = sum(bs_per_rank)
+    spec = sb.reqs_info[0].spec_info
+    # Tag allocate_lens with global-flat indices so we know which req each is.
+    spec.allocate_lens = np.arange(100, 100 + real_bs, dtype=np.int32)
+    buckets = [b for b in BS_BUCKETS if b >= dp]
+    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False)
+    per_dp = mwb.per_dp_bs_size
+    total_bs = per_dp * dp
+
+    # Simulate padding_for_decode's pad-then-valid_mask gather:
+    al = np.asarray(mwb.spec_info.allocate_lens)
+    if len(al) < total_bs:
+        al = np.pad(al, (0, total_bs - len(al)))
+    valid_mask = mwb.seq_lens > 0
+    picked = al[valid_mask]
+
+    # Expected: picked[k] == 100 + k (global-flat order of survivors).
+    assert list(picked) == list(range(100, 100 + real_bs)), (
+        f"layout mismatch: valid_mask picked {list(picked)} from "
+        f"allocate_lens (DP-padded)={list(al)}, seq_lens={list(mwb.seq_lens)}; "
+        f"expected {list(range(100, 100 + real_bs))}. "
+        f"spec_info is global-flat but mwb is DP-padded — needs scatter."
+    )
