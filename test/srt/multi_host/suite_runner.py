@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 # Make sibling modules (multi_host_suite, test_*.py suites) importable regardless
 # of cwd or invocation style. Python normally only adds the script's directory
@@ -26,10 +27,10 @@ from multi_host_suite import (
     MultiHostSuite,
     PerfCase,
     RuntimeConfig,
-    build_other_server_args,
     dry_run_suite,
 )
 from perf_case_runner import run_perf_case
+from profile_loader import build_other_server_args, load_profile
 
 DIST_INIT_PORT = 10011
 SERVER_PORT = 30000
@@ -144,9 +145,11 @@ def run_model_run(model_run: ModelRun, runtime_cfg: RuntimeConfig) -> int:
     from sgl_jax.srt.utils import kill_process_tree
     from sgl_jax.test.test_utils import popen_launch_server
 
-    runtime_cfg = dataclasses.replace(runtime_cfg, port=model_run.model.port)
+    profile = load_profile(model_run.launch_profile)
+    runtime_cfg = dataclasses.replace(runtime_cfg, port=profile.port)
     _log(
-        f"Launching model run={model_run.name}, rank={runtime_cfg.node_rank}, port={runtime_cfg.port}"
+        f"Launching model run={profile.name}, target={profile.target}, "
+        f"rank={runtime_cfg.node_rank}, port={runtime_cfg.port}"
     )
     is_rank0 = runtime_cfg.node_rank == 0
     _reset_state()
@@ -157,23 +160,23 @@ def run_model_run(model_run: ModelRun, runtime_cfg: RuntimeConfig) -> int:
     try:
         base_url = f"http://{runtime_cfg.host}:{runtime_cfg.port}"
         server_process = popen_launch_server(
-            model=model_run.model.model_path,
+            model=profile.model_path,
             base_url=base_url,
             timeout=1800,
-            other_args=build_other_server_args(model_run.model, runtime_cfg),
+            other_args=build_other_server_args(profile, runtime_cfg),
         )
 
         if is_rank0:
             failed_cases: list[tuple[str, BaseException]] = []
             for case in model_run.cases:
                 try:
-                    run_case(case, model_run.model.model_path, runtime_cfg.port)
+                    run_case(case, profile.model_path, runtime_cfg.port)
                 except Exception as exc:
                     failed_cases.append((case.name, exc))
                     _log(f"Case {case.name} failed: {exc!r}")
             if failed_cases:
                 exit_code = 1
-                _log(f"Run {model_run.name} failed cases: " f"{[name for name, _ in failed_cases]}")
+                _log(f"Run {profile.name} failed cases: " f"{[name for name, _ in failed_cases]}")
         else:
             workload_name = _get_env("WORKLOAD_NAME")
             headless_service_name = _get_env("HEADLESS_SERVICE_NAME")
@@ -206,7 +209,7 @@ def run_model_run(model_run: ModelRun, runtime_cfg: RuntimeConfig) -> int:
 
 
 def run_suite(suite: MultiHostSuite, runtime_cfg: RuntimeConfig) -> int:
-    _log(f"Running suite={suite.name}, target={suite.target}, rank={runtime_cfg.node_rank}")
+    _log(f"Running suite={suite.name}, rank={runtime_cfg.node_rank}")
     exit_code = 0
     for model_run in suite.runs:
         exit_code = run_model_run(model_run, runtime_cfg)
@@ -222,13 +225,22 @@ def _discover_suite_modules() -> list[str]:
     )
 
 
+def _resolve_launch_profile(run: ModelRun, base_dir: Path) -> ModelRun:
+    if Path(run.launch_profile).is_absolute():
+        return run
+    return dataclasses.replace(run, launch_profile=str(base_dir / run.launch_profile))
+
+
 def get_suites() -> dict[str, MultiHostSuite]:
     suites = {}
     for module_name in _discover_suite_modules():
         module = importlib.import_module(module_name)
         if not hasattr(module, "get_suites"):
             continue
+        base_dir = Path(module.__file__).parent
         for suite in module.get_suites():
+            resolved_runs = [_resolve_launch_profile(r, base_dir) for r in suite.runs]
+            suite = dataclasses.replace(suite, runs=resolved_runs)
             if suite.name in suites:
                 raise ValueError(f"Duplicate multi-host suite name: {suite.name}")
             suites[suite.name] = suite

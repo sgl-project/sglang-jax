@@ -1,51 +1,13 @@
-from multi_host_suite import (
-    AccuracyCase,
-    ModelRun,
-    ModelRunConfig,
-    MultiHostSuite,
-    PerfCase,
-)
+from multi_host_suite import AccuracyCase, ModelRun, MultiHostSuite, PerfCase
 
 
 def get_suites() -> list[MultiHostSuite]:
     return [
         MultiHostSuite(
             name="mimo-flash-pref-test",
-            target="v6e-4x4",
             runs=[
                 ModelRun(
-                    name="mimo_flash-tp16-dp4-ep16",
-                    model=ModelRunConfig(
-                        model_path="/models/MiMo-V2-Flash",
-                        tp_size=16,
-                        dp_size=4,
-                        ep_size=16,
-                        port=30271,
-                        server_args=(
-                            "--trust-remote-code",
-                            "--moe-backend",
-                            "fused",
-                            "--page-size",
-                            "256",
-                            "--context-length",
-                            "262144",
-                            "--chunked-prefill-size",
-                            "2048",
-                            "--dtype",
-                            "bfloat16",
-                            "--mem-fraction-static",
-                            "0.90",
-                            "--swa-full-tokens-ratio",
-                            "0.2",
-                            "--skip-server-warmup",
-                            "--max-running-requests",
-                            "128",
-                            "--attention-backend",
-                            "fa",
-                            "--dp-schedule-policy",
-                            "round_robin",
-                        ),
-                    ),
+                    launch_profile="launch_profiles/mimo-flash-v6e-4x4.yaml",
                     cases=[
                         PerfCase(
                             name="mimo-flash-benchmark",
