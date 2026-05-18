@@ -10,27 +10,11 @@ if _TEST_SRT not in sys.path:
 
 from multi_host_suite import AccuracyCase
 
-_SUPPORTED_GEN_FIELDS = ("temperature", "max_tokens")
-
 
 def run_accuracy_case(case: AccuracyCase, port: int) -> None:
     from run_eval import run_eval
 
     gen = case.generation_config or {}
-    unsupported_gen = sorted(k for k in gen if k not in _SUPPORTED_GEN_FIELDS)
-    if unsupported_gen:
-        print(
-            f"[multi-host-suite] Warning: generation_config fields "
-            f"{unsupported_gen} are not supported by run_eval and will be ignored",
-            flush=True,
-        )
-    if case.timeout is not None:
-        print(
-            "[multi-host-suite] Warning: AccuracyCase.timeout is not supported by "
-            "run_eval and will be ignored",
-            flush=True,
-        )
-
     args = SimpleNamespace(
         base_url=f"http://127.0.0.1:{port}",
         host=None,
@@ -51,9 +35,9 @@ def run_accuracy_case(case: AccuracyCase, port: int) -> None:
         f"limit={case.limit}",
         flush=True,
     )
-    metrics = run_eval(args)
+    run_eval(args)
     print(
-        f"[multi-host-suite] Accuracy case {case.name} score={metrics.get('score')} "
+        f"[multi-host-suite] Accuracy case {case.name} finished "
         "(warn-only mode, accuracy not gated)",
         flush=True,
     )
