@@ -28,16 +28,6 @@ class AccuracyCase:
 
 
 @dataclass(frozen=True)
-class ModelRunConfig:
-    model_path: str
-    tp_size: int
-    dp_size: int
-    ep_size: int | None = None
-    port: int = 30000
-    server_args: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
 class RuntimeConfig:
     nnodes: int
     node_rank: int
@@ -47,7 +37,7 @@ class RuntimeConfig:
 
 
 # --host / --port / --model-path are passed to popen_launch_server through
-# dedicated kwargs and must not be set again via ModelRunConfig.server_args.
+# dedicated kwargs and must not be set again via LaunchProfile.server_args.
 _RUNTIME_MANAGED_SERVER_ARGS = frozenset(
     {
         "--model-path",
@@ -72,48 +62,15 @@ def _validate_user_server_args(server_args: tuple[str, ...]) -> None:
             raise ValueError(f"{name} is managed by the multi-host runtime")
 
 
-def build_other_server_args(model_cfg: ModelRunConfig, runtime_cfg: RuntimeConfig) -> list[str]:
-    """Build the ``other_args`` list for popen_launch_server.
-
-    --model-path / --host / --port are passed via dedicated popen_launch_server
-    kwargs and are intentionally absent here.
-    """
-    _validate_user_server_args(model_cfg.server_args)
-
-    args = [
-        "--tp-size",
-        str(model_cfg.tp_size),
-        "--dp-size",
-        str(model_cfg.dp_size),
-    ]
-    if model_cfg.ep_size is not None:
-        args.extend(["--ep-size", str(model_cfg.ep_size)])
-
-    args.extend(
-        [
-            "--nnodes",
-            str(runtime_cfg.nnodes),
-            "--node-rank",
-            str(runtime_cfg.node_rank),
-            "--dist-init-addr",
-            runtime_cfg.dist_init_addr,
-        ]
-    )
-    args.extend(model_cfg.server_args)
-    return args
-
-
 @dataclass(frozen=True)
 class ModelRun:
-    name: str
-    model: ModelRunConfig
+    launch_profile: str  # path to YAML profile; suite_runner resolves to absolute
     cases: list[PerfCase | AccuracyCase]
 
 
 @dataclass(frozen=True)
 class MultiHostSuite:
     name: str
-    target: str
     runs: list[ModelRun]
 
 
@@ -123,23 +80,27 @@ def dry_run_suite(suite: MultiHostSuite) -> dict:
 
     return {
         "suite": suite.name,
-        "target": suite.target,
         "result": result,
         "runs": runs,
     }
 
 
 def _dry_run_model_run(run: ModelRun) -> dict:
+    from profile_loader import load_profile
+
+    profile = load_profile(run.launch_profile)
     cases = [_dry_run_case(case) for case in run.cases]
     result = "failed" if any(case["result"] == "failed" for case in cases) else "success"
 
     return {
-        "name": run.name,
-        "model_path": run.model.model_path,
+        "name": profile.name,
+        "target": profile.target,
+        "launch_profile": run.launch_profile,
+        "model_path": profile.model_path,
         "parallelism": {
-            "tp_size": run.model.tp_size,
-            "dp_size": run.model.dp_size,
-            "ep_size": run.model.ep_size,
+            "tp_size": profile.tp_size,
+            "dp_size": profile.dp_size,
+            "ep_size": profile.ep_size,
         },
         "result": result,
         "cases": cases,
