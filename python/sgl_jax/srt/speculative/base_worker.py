@@ -7,14 +7,14 @@ from typing import TYPE_CHECKING
 
 import jax
 import numpy as np
-
-logger = logging.getLogger(__name__)
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.managers.tp_worker import ModelWorker
+
+logger = logging.getLogger(__name__)
 
 
 def replicate_to_mesh(
