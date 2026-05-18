@@ -311,7 +311,6 @@ def _fused_ep_moe_kernel(
     use_jax_allreduce_metadata: bool = True,
     decode_mode: bool = False,
     direct_scaled_dot: bool = False,
-    skip_decode_sync_barrier: bool = False,
     bt: int,
     bf: int,
     btc: int,
@@ -348,6 +347,19 @@ def _fused_ep_moe_kernel(
 
     n_sg = h_per_t // quant_block_k if quant_block_k is not None else 1
     n_sg2 = bf // quant_block_k if quant_block_k is not None else 1
+    # This is a legality guard, not a tuning flag. The rolling slot reuse below
+    # is valid only when next expert bf0 lands in slot0 and will not be clobbered
+    # by another bts tile of the current expert.
+    can_cross_expert_prefetch = (
+        not decode_mode
+        and not disable_weight_load
+        and direct_scaled_dot
+        and w1_scale_hbm is not None
+        and w2_scale_hbm is not None
+        and w3_scale_hbm is not None
+        and num_bf >= 2
+        and num_bf % 2 == 0
+    )
 
     se_inter_size = 0
     se_total_blocks = 0
@@ -359,11 +371,8 @@ def _fused_ep_moe_kernel(
     def get_mesh_device_id(ep_rank):
         return (ep_rank // tp_size, ep_rank % tp_size)
 
-    # ===== Sync barrier — signal ALL devices =====
-    skip_sync_barrier = skip_decode_sync_barrier and num_bt == 1
-
-    def sync_barrier(*, force: bool = False):
-        if disable_sync_barrier or (skip_sync_barrier and not force):
+    def sync_barrier():
+        if disable_sync_barrier:
             return
         for i in range(num_devices):
             pltpu.semaphore_signal(
@@ -521,12 +530,12 @@ def _fused_ep_moe_kernel(
             d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
             d2e_count_vmem[my_id] = local_sizes
 
-            sync_barrier(force=True)
+            sync_barrier()
 
             if num_devices > 0 and (num_devices & (num_devices - 1)) == 0:
                 rounds = int(math.log2(num_devices))
                 for round_id in range(rounds):
-                    sync_barrier(force=True)
+                    sync_barrier()
 
                     chunk = 1 << round_id
                     chunk_i32 = jnp.int32(chunk)
@@ -612,7 +621,7 @@ def _fused_ep_moe_kernel(
                         sem=md_send_sem,
                     ).wait()
 
-            sync_barrier(force=True)
+            sync_barrier()
 
             reduced_sizes = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
             reduced_starts = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
@@ -1010,6 +1019,28 @@ def _fused_ep_moe_kernel(
                 sem=local_sems.at[slot, 6],
             ).wait()
 
+    def start_prefetch_expert_bf0(
+        bt_sem_id, local_e_id, *, slot=0, priority=1, enabled=True,
+    ):
+        if not can_cross_expert_prefetch:
+            return jnp.bool_(False)
+
+        local_e_valid = local_e_id < local_num_experts
+        safe_local_e_id = jnp.minimum(local_e_id, jnp.int32(local_num_experts - 1))
+        e_id = my_id * local_num_experts + safe_local_e_id
+        has_tokens_to_prefetch = jnp.logical_and(
+            jnp.logical_and(enabled, local_e_valid),
+            expert_sizes_x2_smem[bt_sem_id, 0, e_id] > 0,
+        )
+
+        @pl.when(has_tokens_to_prefetch)
+        def _():
+            start_fetch_w1(safe_local_e_id, slot, 0, priority=priority)
+            start_fetch_w3(safe_local_e_id, slot, 0, priority=priority)
+            start_fetch_w2(safe_local_e_id, slot, 0, priority=priority)
+
+        return has_tokens_to_prefetch
+
     # ===== Dequant fp8 → bf16 in VMEM (after DMA wait, before dot) =====
 
     def dequant_w1(slot):
@@ -1056,7 +1087,7 @@ def _fused_ep_moe_kernel(
 
     # ===== Expert FFN: Strix-style double-buffer pipeline =====
 
-    def expert_ffn(bt_sem_id, e_sem_id, local_e_id):
+    def expert_ffn(bt_sem_id, e_sem_id, local_e_id, bf0_prefetched):
         e_id = my_id * local_num_experts + local_e_id
         dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
         has_tokens = dyn_sz > 0
@@ -1069,7 +1100,7 @@ def _fused_ep_moe_kernel(
                     e_sem_id=e_sem_id,
                     local_e_id=local_e_id - expert_buffer_count,
                 )
-            return jnp.int32(0)
+            return start_prefetch_expert_bf0(bt_sem_id, local_e_id + jnp.int32(1))
 
         def _run_active(_):
 
@@ -1081,7 +1112,7 @@ def _fused_ep_moe_kernel(
             # Tokens load once per bts tile, reused across all bf tiles.
             # Weights re-prefetch per bts tile (redundant when num_bts_tiles=1,
             # which is the common case — avg ~20 tokens per expert).
-            def bts_body(bts_id, __):
+            def bts_body(bts_id, next_bf0_prefetched):
                 tile_start = bts_id * bts
 
                 # Load tokens for this bts tile (once, reused across all bf tiles)
@@ -1097,9 +1128,20 @@ def _fused_ep_moe_kernel(
 
                 # Weight prologue (double-buffer only)
                 if not decode_mode:
-                    start_fetch_w1(local_e_id, 0, 0, priority=1)
-                    start_fetch_w3(local_e_id, 0, 0, priority=1)
-                    start_fetch_w2(local_e_id, 0, 0, priority=1)
+                    if can_cross_expert_prefetch:
+                        use_prefetched_bf0 = jnp.logical_and(
+                            bf0_prefetched, bts_id == jnp.int32(0)
+                        )
+
+                        @pl.when(jnp.logical_not(use_prefetched_bf0))
+                        def _():
+                            start_fetch_w1(local_e_id, 0, 0, priority=1)
+                            start_fetch_w3(local_e_id, 0, 0, priority=1)
+                            start_fetch_w2(local_e_id, 0, 0, priority=1)
+                    else:
+                        start_fetch_w1(local_e_id, 0, 0, priority=1)
+                        start_fetch_w3(local_e_id, 0, 0, priority=1)
+                        start_fetch_w2(local_e_id, 0, 0, priority=1)
                     if num_bf >= 2:
                         start_fetch_w1(local_e_id, 1, 1)
                         start_fetch_w3(local_e_id, 1, 1)
@@ -1315,6 +1357,17 @@ def _fused_ep_moe_kernel(
                             start_fetch_w1(local_e_id, slot, next_bf_id)
                             start_fetch_w3(local_e_id, slot, next_bf_id)
                             start_fetch_w2(local_e_id, slot, next_bf_id, priority=1)
+                        if can_cross_expert_prefetch and bf_id == num_bf - 2:
+                            next_has_prefetch = start_prefetch_expert_bf0(
+                                bt_sem_id,
+                                local_e_id + jnp.int32(1),
+                                slot=slot,
+                                priority=1,
+                                enabled=(num_bts_tiles == jnp.int32(1)),
+                            )
+                            next_bf0_prefetched = jnp.logical_or(
+                                next_bf0_prefetched, next_has_prefetch
+                            )
 
                 # Final writeback: f32 → bf16, then DMA to HBM (once per bts tile)
                 def writeback_btc(btc_id, ___):
@@ -1339,13 +1392,13 @@ def _fused_ep_moe_kernel(
                     sem=y_store_sem.at[0],
                 ).wait()
 
-                return None
+                return next_bf0_prefetched
 
-            lax.fori_loop(0, num_bts_tiles, bts_body, None)
+            return lax.fori_loop(
+                0, num_bts_tiles, bts_body, jnp.bool_(False), unroll=False,
+            )
 
-            return jnp.int32(0)
-
-        lax.cond(has_tokens, _run_active, _run_inactive, None)
+        return lax.cond(has_tokens, _run_active, _run_inactive, None)
 
     # ===== Output accumulation =====
 
@@ -1562,9 +1615,10 @@ def _fused_ep_moe_kernel(
             # === BATCH SCATTER ===
             start_a2a_scatter_batch(bt_sem_id=bt_sem_id, bt_start=bt_start)
 
-            init_carry = jnp.int32(0)
+            init_carry = (jnp.int32(0), jnp.bool_(False))
 
-            def compute_expert_batch(local_e_id, curr_se_block):
+            def compute_expert_batch(local_e_id, carry):
+                curr_se_block, bf0_prefetched = carry
                 e_sem_id_local = local_e_id
 
                 for _ in range(se_before):
@@ -1575,7 +1629,9 @@ def _fused_ep_moe_kernel(
                     bt_sem_id=bt_sem_id, e_sem_id=e_sem_id_local,
                     local_e_id=local_e_id,
                 )
-                expert_ffn(bt_sem_id, e_sem_id_local, local_e_id)
+                next_bf0_prefetched = expert_ffn(
+                    bt_sem_id, e_sem_id_local, local_e_id, bf0_prefetched,
+                )
                 start_a2a_gather(
                     bt_sem_id=bt_sem_id, e_sem_id=e_sem_id_local,
                     local_e_id=local_e_id,
@@ -1585,11 +1641,12 @@ def _fused_ep_moe_kernel(
                     run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
                     curr_se_block += 1
 
-                return curr_se_block
+                return (curr_se_block, next_bf0_prefetched)
 
-            final_se_block = lax.fori_loop(
+            final_carry = lax.fori_loop(
                 0, local_num_experts, compute_expert_batch, init_carry, unroll=False,
             )
+            final_se_block, _ = final_carry
 
             def cleanup_body(block_idx, _):
                 run_shared_expert_slice(block_idx, bt_id, bt_sem_id, out_buf_id)
@@ -1625,10 +1682,10 @@ def _fused_ep_moe_kernel(
                 local_e_id=0, bt_start=bt_start,
             )
 
-            init_carry = (e_sem_id, jnp.int32(0))
+            init_carry = (e_sem_id, jnp.int32(0), jnp.bool_(False))
 
             def run_per_expert_pipelined(local_e_id, carry):
-                curr_e_sem_id, curr_se_block = carry
+                curr_e_sem_id, curr_se_block, bf0_prefetched = carry
                 next_e_sem_id = (curr_e_sem_id + jnp.int32(1)) % jnp.int32(expert_buffer_count)
                 next_local_e_id = local_e_id + 1
 
@@ -1654,7 +1711,9 @@ def _fused_ep_moe_kernel(
                     bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id,
                     local_e_id=local_e_id,
                 )
-                expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id)
+                next_bf0_prefetched = expert_ffn(
+                    bt_sem_id, curr_e_sem_id, local_e_id, bf0_prefetched,
+                )
                 start_a2a_gather(
                     bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id,
                     local_e_id=local_e_id,
@@ -1668,12 +1727,12 @@ def _fused_ep_moe_kernel(
                     bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id,
                     local_e_id=local_e_id,
                 )
-                return (next_e_sem_id, curr_se_block)
+                return (next_e_sem_id, curr_se_block, next_bf0_prefetched)
 
             final_carry = lax.fori_loop(
                 0, local_num_experts, run_per_expert_pipelined, init_carry, unroll=False,
             )
-            final_e_sem_id, final_se_block = final_carry
+            final_e_sem_id, final_se_block, _ = final_carry
 
             def cleanup_body(block_idx, _):
                 run_shared_expert_slice(block_idx, bt_id, bt_sem_id, out_buf_id)
@@ -1770,7 +1829,6 @@ def jax_allreduce_metadata_by_bt(
         "use_jax_allreduce_metadata",
         "block_config", "dp_axis_name", "tp_axis_name",
         "quant_block_k", "decode_mode", "direct_scaled_dot",
-        "skip_decode_sync_barrier",
     ],
 )
 def fused_ep_moe_v2(
@@ -1802,7 +1860,6 @@ def fused_ep_moe_v2(
     block_config: FusedMoEBlockConfig | None = None,
     decode_mode: bool = False,
     direct_scaled_dot: bool = False,
-    skip_decode_sync_barrier: bool = False,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
 ):
@@ -1904,8 +1961,6 @@ def fused_ep_moe_v2(
     scope_name = f"fused-moe-v2-k_{top_k}-bt_{bt}_{bts}_{btc}-bf_{bf}"
     if direct_scaled_dot:
         scope_name += "-direct_scaled_dot"
-    if skip_decode_sync_barrier:
-        scope_name += "-skip_decode_sync"
     if w1_shared is not None:
         scope_name += f"-se_bse_{bse}"
 
@@ -1992,7 +2047,6 @@ def fused_ep_moe_v2(
                 use_jax_allreduce_metadata=use_jax_allreduce_metadata,
                 decode_mode=decode_mode,
                 direct_scaled_dot=direct_scaled_dot,
-                skip_decode_sync_barrier=skip_decode_sync_barrier,
                 bt=bt, bf=bf, btc=btc, bts=bts, bse=bse,
                 quant_block_k=quant_block_k,
             ),
