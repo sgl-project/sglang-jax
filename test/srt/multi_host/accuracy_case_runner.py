@@ -9,14 +9,15 @@ if _TEST_SRT not in sys.path:
     sys.path.insert(0, _TEST_SRT)
 
 from multi_host_suite import AccuracyCase
+from profile_loader import LaunchProfile
 
 
-def run_accuracy_case(case: AccuracyCase, port: int) -> None:
+def run_accuracy_case(case: AccuracyCase, profile: LaunchProfile) -> None:
     from run_eval import run_eval
 
     gen = case.generation_config or {}
     args = SimpleNamespace(
-        base_url=f"http://127.0.0.1:{port}",
+        base_url=f"http://127.0.0.1:{profile.port}",
         host=None,
         port=None,
         model=case.model_id,

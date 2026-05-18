@@ -281,6 +281,12 @@ jobs:
                     value: "${HEADLESS_SERVICE_NAME}"
                   - name: NNODES
                     value: "4"
+                  - name: DIST_INIT_PORT
+                    value: "10011"
+                  - name: SERVER_PORT
+                    value: "30000"
+                  - name: CONTROL_PORT
+                    value: "18080"
                   - name: CI_MOUNT_ROOT
                     value: "/models"
                   - name: SGLANG_JAX_MODEL_CACHE
