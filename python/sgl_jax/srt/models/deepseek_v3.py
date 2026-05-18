@@ -267,6 +267,26 @@ class DeepseekV3Attention(nnx.Module):
         - `fa_mha` (non-absorbed): kv_b_proj decompresses to per-head K/V, run
           FlashAttention. ~70x more KV memory; for A/B and short-context only.
         """
+        attn_output, kv_fused = self._attention_core(
+            positions, hidden_states, forward_batch, token_to_kv_pool
+        )
+        output = self._apply_o_proj(attn_output, hidden_states)
+        return output, kv_fused
+
+    def _attention_core(
+        self,
+        positions: jax.Array,
+        hidden_states: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+    ) -> tuple[jax.Array, jax.Array]:
+        """MLA front-half: Q/KV projection, RoPE, attention. No o_proj.
+
+        Split out of `__call__` so subclasses (e.g. Ling3 BailingMLA) can insert
+        a head-wise gate between attention and o_proj. Returns the flat
+        `[T, num_heads * v_head_dim]` pre-o_proj tensor (same contract whether
+        absorbed or non-absorbed path is taken).
+        """
         # Shared front-half: project Q, project KV-A latent, apply RoPE.
         if self.q_lora_rank is None:
             q, _ = self.q_proj(hidden_states)
@@ -296,8 +316,20 @@ class DeepseekV3Attention(nnx.Module):
                 q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
             )
 
-        output, _ = self.o_proj(attn_output)
-        return output, kv_fused
+        return attn_output, kv_fused
+
+    def _apply_o_proj(
+        self,
+        pre_o_proj: jax.Array,
+        hidden_states: jax.Array,
+    ) -> jax.Array:
+        """Apply o_proj. Subclasses can override to inject a head-wise gate
+        before this call. `hidden_states` is provided so subclasses can compute
+        gate logits from the layer input; the base implementation ignores it.
+        """
+        del hidden_states
+        output, _ = self.o_proj(pre_o_proj)
+        return output
 
     def post_load_weights(self):
         """Split kv_b_proj.weight into absorbed-MLA folded projections.

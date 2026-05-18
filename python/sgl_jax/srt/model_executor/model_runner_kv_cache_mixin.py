@@ -836,6 +836,13 @@ class ModelRunnerKVCacheMixin:
         return get_kimi_linear_config(self.model_config.hf_config)
 
     @property
+    def bailing_moe_v3_config(self: ModelRunner):
+        from sgl_jax.srt.configs.bailing_moe_v3 import BailingMoeV3Config
+
+        cfg = self.model_config.hf_config
+        return cfg if isinstance(cfg, BailingMoeV3Config) else None
+
+    @property
     def lightning_config(self: ModelRunner):
         from sgl_jax.srt.configs.bailing_hybrid import get_bailing_hybrid_config
 
@@ -852,6 +859,8 @@ class ModelRunnerKVCacheMixin:
         """Return linear recurrent config if the model has linear attention, else None."""
         if self.kimi_linear_config is not None:
             return self.kimi_linear_config
+        if self.bailing_moe_v3_config is not None:
+            return self.bailing_moe_v3_config
         if self.qwen3_5_hybrid_config is not None:
             return self.qwen3_5_hybrid_config.text_config
         return self.lightning_config

@@ -22,6 +22,7 @@ from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
+from sgl_jax.srt.configs.bailing_moe_v3 import BailingMoeV3Config
 from sgl_jax.srt.configs.gemma4 import Gemma4Config
 from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 from sgl_jax.srt.configs.qwen3_5 import Qwen3_5DenseConfig, Qwen3_5HybridConfig
@@ -41,6 +42,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     cls.model_type: cls
     for cls in [
         BailingHybridConfig,
+        BailingMoeV3Config,
         KimiLinearConfig,
         GlmMoeDsaConfig,
         Qwen3_5HybridConfig,
@@ -132,7 +134,15 @@ def get_config(
                 setattr(config, key, val)
 
     if config.model_type in _CONFIG_REGISTRY:
-        config_class = _CONFIG_REGISTRY[config.model_type]
+        # Ling-3 shares model_type="bailing_hybrid" with Ling-2.5/2.6; disambiguate by architectures.
+        architectures = getattr(config, "architectures", None) or []
+        if (
+            config.model_type == BailingHybridConfig.model_type
+            and any(str(a) == "BailingMoeV3ForCausalLM" for a in architectures)
+        ):
+            config_class = BailingMoeV3Config
+        else:
+            config_class = _CONFIG_REGISTRY[config.model_type]
         config = config_class.from_pretrained(model, revision=revision)
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
         config._name_or_path = model

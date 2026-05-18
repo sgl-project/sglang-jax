@@ -353,6 +353,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         A_log = layer.A_log.value.reshape(H)
         dt_bias = layer.dt_bias.value.reshape(H, -1)
         scale = scale if scale is not None else layer.scale
+        lower_bound = getattr(layer, "kda_lower_bound", None)
 
         def _chunk_kda_call(q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias):
             o, final_state, *_ = chunk_kda(
@@ -368,6 +369,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 use_gate_in_kernel=True,
                 A_log=A_log,
                 dt_bias=dt_bias,
+                lower_bound=lower_bound,
             )
             return o, final_state
 
@@ -463,7 +465,12 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         H = g.shape[-2]
         orig_dtype = g.dtype
         g32 = g.astype(jnp.float32) + layer.dt_bias.value.reshape(H, -1).astype(jnp.float32)
-        out = -jnp.exp(layer.A_log.value.reshape(H, 1).astype(jnp.float32)) * jax.nn.softplus(g32)
+        exp_A = jnp.exp(layer.A_log.value.reshape(H, 1).astype(jnp.float32))
+        lower_bound = getattr(layer, "kda_lower_bound", None)
+        if lower_bound is None:
+            out = -exp_A * jax.nn.softplus(g32)
+        else:
+            out = lower_bound * jax.nn.sigmoid(exp_A * g32)
         return out.astype(orig_dtype)
 
     def _unpack_conv_states(

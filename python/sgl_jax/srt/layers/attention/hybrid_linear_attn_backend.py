@@ -267,7 +267,7 @@ def attn_backend_wrapper(
     if cfg is None:
         return full_attn_backend
 
-    if runner.kimi_linear_config is not None:
+    if runner.kimi_linear_config is not None or runner.bailing_moe_v3_config is not None:
         from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 
         linear_attn_backend = KDAAttnBackend(mesh=runner.mesh)
