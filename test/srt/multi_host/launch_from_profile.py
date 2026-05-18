@@ -11,10 +11,6 @@ if _SELF_DIR not in sys.path:
 from profile_loader import load_profile
 
 
-def _format_command(argv: list[str]) -> str:
-    return " \\\n  ".join(argv)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Print the sgl_jax.launch_server command for a launch profile"
@@ -40,12 +36,7 @@ def main() -> int:
     argv.extend(["--host", "0.0.0.0", "--port", str(profile.port)])
     argv.extend(profile.server_args)
 
-    print(f"# Profile: {profile.name}")
-    print(f"# Target:  {profile.target}")
-    print(_format_command(argv))
-    print()
-    print("# Add at launch time (multi-host orchestration not part of profile):")
-    print("#   --nnodes <N> --node-rank <RANK> --dist-init-addr <ADDR>")
+    print(" ".join(argv))
     return 0
 
 
