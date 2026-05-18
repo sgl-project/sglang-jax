@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -12,7 +12,6 @@ class PerfCase:
     request_rate: float = float("inf")
     seed: int = 42
     flush_cache: bool = False
-    dry_run_result: Literal["success", "failed"] = "success"
 
 
 @dataclass(frozen=True)
@@ -24,7 +23,6 @@ class AccuracyCase:
     generation_config: dict[str, Any] = field(default_factory=dict)
     limit: int | None = None
     timeout: int | None = None
-    dry_run_result: Literal["success", "failed"] = "success"
 
 
 @dataclass(frozen=True)
@@ -75,13 +73,9 @@ class MultiHostSuite:
 
 
 def dry_run_suite(suite: MultiHostSuite) -> dict:
-    runs = [_dry_run_model_run(run) for run in suite.runs]
-    result = "failed" if any(run["result"] == "failed" for run in runs) else "success"
-
     return {
         "suite": suite.name,
-        "result": result,
-        "runs": runs,
+        "runs": [_dry_run_model_run(run) for run in suite.runs],
     }
 
 
@@ -89,9 +83,6 @@ def _dry_run_model_run(run: ModelRun) -> dict:
     from profile_loader import load_profile
 
     profile = load_profile(run.launch_profile)
-    cases = [_dry_run_case(case) for case in run.cases]
-    result = "failed" if any(case["result"] == "failed" for case in cases) else "success"
-
     return {
         "name": profile.name,
         "target": profile.target,
@@ -102,21 +93,12 @@ def _dry_run_model_run(run: ModelRun) -> dict:
             "dp_size": profile.dp_size,
             "ep_size": profile.ep_size,
         },
-        "result": result,
-        "cases": cases,
+        "cases": [_dry_run_case(case) for case in run.cases],
     }
 
 
 def _dry_run_case(case: PerfCase | AccuracyCase) -> dict:
-    if isinstance(case, PerfCase):
-        return {
-            "name": case.name,
-            "type": "perf",
-            "result": case.dry_run_result,
-        }
-
     return {
         "name": case.name,
-        "type": "accuracy",
-        "result": case.dry_run_result,
+        "type": "perf" if isinstance(case, PerfCase) else "accuracy",
     }
