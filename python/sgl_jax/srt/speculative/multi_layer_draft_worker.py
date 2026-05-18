@@ -163,6 +163,20 @@ class MultiLayerDraftWorker(EagleDraftWorker):
             for w in self._workers
         ]
 
+        _mwb = model_worker_batch
+        logger.warning(
+            "[P15B-DBG] draft_forward init_new shapes: input_ids=%s seq_lens=%s "
+            "out_cache_loc=%s positions=%s req_pool_indices=%s cache_loc=%s "
+            "ext_prefix=%s ext_seq=%s",
+            getattr(_mwb.input_ids, "shape", None),
+            getattr(_mwb.seq_lens, "shape", None),
+            getattr(_mwb.out_cache_loc, "shape", None),
+            getattr(_mwb.positions, "shape", None),
+            getattr(_mwb.req_pool_indices, "shape", None),
+            getattr(_mwb.cache_loc, "shape", None),
+            getattr(_mwb.extend_prefix_lens, "shape", None),
+            getattr(_mwb.extend_seq_lens, "shape", None),
+        )
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         forward_batch.out_cache_loc = np.empty((1,))
         forward_batch.cache_loc = np.empty((1,))
