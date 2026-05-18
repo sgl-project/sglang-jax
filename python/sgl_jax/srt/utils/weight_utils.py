@@ -49,6 +49,28 @@ def _reinterpret_dtype_if_needed(data: np.ndarray, target_dtype: jnp.dtype) -> n
 
 
 @dataclass
+class HeadContext:
+    """Per-mapping override for the loader's head-config globals.
+
+    Why: Hybrid-attention models (MLA + GLA, MoE + dense, ...) cache one
+    (num_heads, num_kv_heads, head_dim, v_head_dim) tuple at WeightLoader
+    init time from model_config. If a layer's true head config diverges
+    from that tuple — e.g. BailingMoE V2.5's patch_model_config sets
+    head_dim to MLA's qk_head_dim=192 while GLA layers stay at 128 —
+    every head_dim-derived computation in _split_qkv_weight /
+    _apply_kv_head_padding silently mis-slices the weight.
+
+    Any field left None falls back to the loader-global value, so this
+    is opt-in and backward-compatible for Qwen/Llama/MLA mappings.
+    """
+
+    num_heads: int | None = None
+    num_kv_heads: int | None = None
+    head_dim: int | None = None  # unpadded; loader applies TPU 128-padding on top
+    v_head_dim: int | None = None
+
+
+@dataclass
 class WeightMapping:
     target_path: str | list[str]
     sharding: tuple | None = None
@@ -63,6 +85,7 @@ class WeightMapping:
     concat_axis: int | None = None
     is_eagle3: bool = False
     physical_to_logical_map: np.ndarray | None = None
+    head_context: HeadContext | None = None
 
     def __post_init__(self):
         if self.sharding is None:
@@ -2471,7 +2494,7 @@ class WeightLoader:
             axis, times = mapping.repeat
             processed_weight = jnp.repeat(processed_weight, times, axis=axis)
         if mapping.kv_head_padding:
-            processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
+            processed_weight = self._apply_kv_head_padding(processed_weight, hf_key, mapping)
 
         sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
 
@@ -2503,37 +2526,61 @@ class WeightLoader:
     ):
         self._split_qkv_weight(params, hf_key, weight, mapping)
 
+    def _resolve_heads(self, mapping: WeightMapping) -> tuple[int, int, int, int]:
+        """Return (num_heads, num_kv_heads, head_dim_original, v_head_dim).
+
+        Per-mapping `head_context` fields override the loader-global head
+        config; unset (None) fields fall back to the loader defaults so
+        mappings without a head_context keep their previous behavior.
+        """
+        ctx = mapping.head_context
+        if ctx is None:
+            return (
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim_original,
+                self.v_head_dim,
+            )
+        return (
+            ctx.num_heads if ctx.num_heads is not None else self.num_heads,
+            ctx.num_kv_heads if ctx.num_kv_heads is not None else self.num_kv_heads,
+            ctx.head_dim if ctx.head_dim is not None else self.head_dim_original,
+            ctx.v_head_dim if ctx.v_head_dim is not None else self.v_head_dim,
+        )
+
     def _split_qkv_weight(
         self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
     ):
         jax_paths = mapping.target_path
 
-        v_head_dim = getattr(self, "v_head_dim", self.head_dim_original)
+        num_heads, num_kv_heads, head_dim_original, v_head_dim = self._resolve_heads(mapping)
+        head_dim_pad = (head_dim_original + 127) // 128 * 128 - head_dim_original
+        head_dim_padded = head_dim_original + head_dim_pad
         v_head_dim_pad = (v_head_dim + 127) // 128 * 128 - v_head_dim
         v_head_dim_padded = v_head_dim + v_head_dim_pad
 
         if hf_key.endswith(".bias"):
-            q_dim = self.num_heads * self.head_dim_original
-            k_dim = self.num_kv_heads * self.head_dim_original
-            v_dim = self.num_kv_heads * v_head_dim
+            q_dim = num_heads * head_dim_original
+            k_dim = num_kv_heads * head_dim_original
+            v_dim = num_kv_heads * v_head_dim
 
             q_bias = weight[:q_dim]
             k_bias = weight[q_dim : q_dim + k_dim]
             v_bias = weight[q_dim + k_dim : q_dim + k_dim + v_dim]
 
-            if mapping.head_dim_padding and self.head_dim_pad > 0:
-                q_bias = jnp.reshape(q_bias, (self.num_heads, self.head_dim_original))
-                q_bias = jnp.pad(q_bias, ((0, 0), (0, self.head_dim_pad)))
-                q_bias = jnp.reshape(q_bias, (self.num_heads * self.head_dim,))
+            if mapping.head_dim_padding and head_dim_pad > 0:
+                q_bias = jnp.reshape(q_bias, (num_heads, head_dim_original))
+                q_bias = jnp.pad(q_bias, ((0, 0), (0, head_dim_pad)))
+                q_bias = jnp.reshape(q_bias, (num_heads * head_dim_padded,))
 
-                k_bias = jnp.reshape(k_bias, (self.num_kv_heads, self.head_dim_original))
-                k_bias = jnp.pad(k_bias, ((0, 0), (0, self.head_dim_pad)))
-                k_bias = jnp.reshape(k_bias, (self.num_kv_heads * self.head_dim,))
+                k_bias = jnp.reshape(k_bias, (num_kv_heads, head_dim_original))
+                k_bias = jnp.pad(k_bias, ((0, 0), (0, head_dim_pad)))
+                k_bias = jnp.reshape(k_bias, (num_kv_heads * head_dim_padded,))
 
             if mapping.head_dim_padding and v_head_dim_pad > 0:
-                v_bias = jnp.reshape(v_bias, (self.num_kv_heads, v_head_dim))
+                v_bias = jnp.reshape(v_bias, (num_kv_heads, v_head_dim))
                 v_bias = jnp.pad(v_bias, ((0, 0), (0, v_head_dim_pad)))
-                v_bias = jnp.reshape(v_bias, (self.num_kv_heads * v_head_dim_padded,))
+                v_bias = jnp.reshape(v_bias, (num_kv_heads * v_head_dim_padded,))
 
             splits = [q_bias, k_bias, v_bias]
         elif "scale" in hf_key and weight.ndim == 2:
@@ -2545,8 +2592,8 @@ class WeightLoader:
             quant_cfg = getattr(self.model_config, "quantization_config", None)
             block_size = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
 
-            q_dim = self.num_heads * self.head_dim_original
-            k_dim = self.num_kv_heads * self.head_dim_original
+            q_dim = num_heads * head_dim_original
+            k_dim = num_kv_heads * head_dim_original
 
             q_blocks = math.ceil(q_dim / block_size)
             k_blocks = math.ceil(k_dim / block_size)
@@ -2568,9 +2615,9 @@ class WeightLoader:
 
             splits = [q_scale, k_scale, v_scale]
         else:
-            q_dim = self.num_heads * self.head_dim_original
-            k_dim = self.num_kv_heads * self.head_dim_original
-            v_dim = self.num_kv_heads * v_head_dim
+            q_dim = num_heads * head_dim_original
+            k_dim = num_kv_heads * head_dim_original
+            v_dim = num_kv_heads * v_head_dim
 
             if mapping.transpose:
                 q_weight = weight[:, :q_dim]
@@ -2581,62 +2628,62 @@ class WeightLoader:
                 k_weight = weight[q_dim : q_dim + k_dim, :]
                 v_weight = weight[q_dim + k_dim : q_dim + k_dim + v_dim, :]
 
-            if mapping.head_dim_padding and self.head_dim_pad > 0:
+            if mapping.head_dim_padding and head_dim_pad > 0:
                 if mapping.transpose:
                     q_weight = jnp.reshape(
                         q_weight,
-                        (self.hidden_size, self.num_heads, self.head_dim_original),
+                        (self.hidden_size, num_heads, head_dim_original),
                     )
-                    q_weight = jnp.pad(q_weight, ((0, 0), (0, 0), (0, self.head_dim_pad)))
+                    q_weight = jnp.pad(q_weight, ((0, 0), (0, 0), (0, head_dim_pad)))
                     q_weight = jnp.reshape(
-                        q_weight, (self.hidden_size, self.num_heads * self.head_dim)
+                        q_weight, (self.hidden_size, num_heads * head_dim_padded)
                     )
 
                     k_weight = jnp.reshape(
                         k_weight,
-                        (self.hidden_size, self.num_kv_heads, self.head_dim_original),
+                        (self.hidden_size, num_kv_heads, head_dim_original),
                     )
-                    k_weight = jnp.pad(k_weight, ((0, 0), (0, 0), (0, self.head_dim_pad)))
+                    k_weight = jnp.pad(k_weight, ((0, 0), (0, 0), (0, head_dim_pad)))
                     k_weight = jnp.reshape(
-                        k_weight, (self.hidden_size, self.num_kv_heads * self.head_dim)
+                        k_weight, (self.hidden_size, num_kv_heads * head_dim_padded)
                     )
                 else:
                     q_weight = jnp.reshape(
                         q_weight,
-                        (self.num_heads, self.head_dim_original, self.hidden_size),
+                        (num_heads, head_dim_original, self.hidden_size),
                     )
-                    q_weight = jnp.pad(q_weight, ((0, 0), (0, self.head_dim_pad), (0, 0)))
+                    q_weight = jnp.pad(q_weight, ((0, 0), (0, head_dim_pad), (0, 0)))
                     q_weight = jnp.reshape(
-                        q_weight, (self.num_heads * self.head_dim, self.hidden_size)
+                        q_weight, (num_heads * head_dim_padded, self.hidden_size)
                     )
 
                     k_weight = jnp.reshape(
                         k_weight,
-                        (self.num_kv_heads, self.head_dim_original, self.hidden_size),
+                        (num_kv_heads, head_dim_original, self.hidden_size),
                     )
-                    k_weight = jnp.pad(k_weight, ((0, 0), (0, self.head_dim_pad), (0, 0)))
+                    k_weight = jnp.pad(k_weight, ((0, 0), (0, head_dim_pad), (0, 0)))
                     k_weight = jnp.reshape(
-                        k_weight, (self.num_kv_heads * self.head_dim, self.hidden_size)
+                        k_weight, (num_kv_heads * head_dim_padded, self.hidden_size)
                     )
 
             if mapping.head_dim_padding and v_head_dim_pad > 0:
                 if mapping.transpose:
                     v_weight = jnp.reshape(
                         v_weight,
-                        (self.hidden_size, self.num_kv_heads, v_head_dim),
+                        (self.hidden_size, num_kv_heads, v_head_dim),
                     )
                     v_weight = jnp.pad(v_weight, ((0, 0), (0, 0), (0, v_head_dim_pad)))
                     v_weight = jnp.reshape(
-                        v_weight, (self.hidden_size, self.num_kv_heads * v_head_dim_padded)
+                        v_weight, (self.hidden_size, num_kv_heads * v_head_dim_padded)
                     )
                 else:
                     v_weight = jnp.reshape(
                         v_weight,
-                        (self.num_kv_heads, v_head_dim, self.hidden_size),
+                        (num_kv_heads, v_head_dim, self.hidden_size),
                     )
                     v_weight = jnp.pad(v_weight, ((0, 0), (0, v_head_dim_pad), (0, 0)))
                     v_weight = jnp.reshape(
-                        v_weight, (self.num_kv_heads * v_head_dim_padded, self.hidden_size)
+                        v_weight, (num_kv_heads * v_head_dim_padded, self.hidden_size)
                     )
 
             splits = [q_weight, k_weight, v_weight]
@@ -2645,7 +2692,7 @@ class WeightLoader:
             processed_weight = split_weight
 
             if mapping.kv_head_padding and ("k_proj" in jax_path or "v_proj" in jax_path):
-                processed_weight = self._apply_kv_head_padding(processed_weight, jax_path)
+                processed_weight = self._apply_kv_head_padding(processed_weight, jax_path, mapping)
 
             sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
 
@@ -2692,22 +2739,48 @@ class WeightLoader:
 
         return current_level
 
-    def _apply_kv_head_padding(self, weight: jax.Array, hf_key: str) -> jax.Array:
+    def _apply_kv_head_padding(
+        self,
+        weight: jax.Array,
+        hf_key: str,
+        mapping: WeightMapping | None = None,
+    ) -> jax.Array:
         """Apply KV head padding/replication when tp_size > total_kv_heads.
 
         Handles:
         1. Bias/Scale (1D or 2D with shape[0]=heads) -> Pad Axis 0
         2. Standard Weight (2D with shape[1]=heads*dim) -> Pad Axis 1
         3. Static Quant Weight (2D with shape[0]=heads*dim) -> Pad Axis 0
+
+        When `mapping.head_context` is set, derive total_kv_heads and the
+        head_dim used for stride/dimension matching from the per-mapping
+        override instead of the loader-global model_config tuple. This is
+        what lets hybrid-attention models (e.g. MLA + GLA) share one
+        loader without one branch's head config silently corrupting the
+        other.
         """
-        if not (
-            any(proj in hf_key for proj in ["k_proj", "v_proj"])
-            and self.model_config.needs_kv_head_replication(self.sharding_size)
-        ):
+        if not any(proj in hf_key for proj in ["k_proj", "v_proj"]):
             return weight
 
-        total_kv_heads = self.model_config.get_total_num_kv_heads()
-        num_replicas = self.model_config.get_num_kv_head_replicas(self.sharding_size)
+        ctx = mapping.head_context if mapping is not None else None
+        if ctx is not None and (ctx.num_kv_heads is not None or ctx.head_dim is not None):
+            _, total_kv_heads, head_dim_original, _ = self._resolve_heads(mapping)
+            if self.sharding_size <= total_kv_heads:
+                return weight
+            num_replicas = (self.sharding_size + total_kv_heads - 1) // total_kv_heads
+            head_dim_pad = (head_dim_original + 127) // 128 * 128 - head_dim_original
+            head_dim = (
+                head_dim_original + head_dim_pad
+                if (mapping is not None and mapping.head_dim_padding)
+                else head_dim_original
+            )
+        else:
+            if not self.model_config.needs_kv_head_replication(self.sharding_size):
+                return weight
+            total_kv_heads = self.model_config.get_total_num_kv_heads()
+            num_replicas = self.model_config.get_num_kv_head_replicas(self.sharding_size)
+            head_dim = self.head_dim
+
         padding_strategy = self.model_config.get_kv_padding_strategy()
 
         target_axis = -1
@@ -2717,15 +2790,15 @@ class WeightLoader:
         if dim0 == total_kv_heads:
             target_axis = 0
             step_size = 1
-        elif dim0 == total_kv_heads * self.head_dim:
+        elif dim0 == total_kv_heads * head_dim:
             target_axis = 0
-            step_size = self.head_dim
+            step_size = head_dim
 
         if target_axis == -1 and weight.ndim > 1:
             dim1 = weight.shape[1]
-            if dim1 == total_kv_heads * self.head_dim:
+            if dim1 == total_kv_heads * head_dim:
                 target_axis = 1
-                step_size = self.head_dim
+                step_size = head_dim
 
         if target_axis == -1:
             return weight
@@ -2747,10 +2820,7 @@ class WeightLoader:
         elif padding_strategy == "zero":
             target_heads_total = total_kv_heads * num_replicas
 
-            if step_size == 1:
-                target_len = target_heads_total
-            else:
-                target_len = target_heads_total * self.head_dim
+            target_len = target_heads_total if step_size == 1 else target_heads_total * head_dim
 
             current_len = weight.shape[target_axis]
             padding_len = target_len - current_len

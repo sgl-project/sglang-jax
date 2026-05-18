@@ -33,7 +33,7 @@ from sgl_jax.srt.layers.radix_lightning_attention import RadixLightningAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention, DeepseekV3MLP
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+from sgl_jax.srt.utils.weight_utils import HeadContext, WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -186,12 +186,15 @@ class BailingMoELinearAttention(nnx.Module):
             v = jax.nn.silu(v)
 
         head_shard = NamedSharding(self.mesh, P("data", "tensor", None))
-        q = q.reshape(hidden_states.shape[0], self.num_heads, self.head_dim,
-                      out_sharding=head_shard)
-        k = k.reshape(hidden_states.shape[0], self.num_heads, self.head_dim,
-                      out_sharding=head_shard)
-        v = v.reshape(hidden_states.shape[0], self.num_heads, self.head_dim,
-                      out_sharding=head_shard)
+        q = q.reshape(
+            hidden_states.shape[0], self.num_heads, self.head_dim, out_sharding=head_shard
+        )
+        k = k.reshape(
+            hidden_states.shape[0], self.num_heads, self.head_dim, out_sharding=head_shard
+        )
+        v = v.reshape(
+            hidden_states.shape[0], self.num_heads, self.head_dim, out_sharding=head_shard
+        )
 
         if self.q_norm is not None:
             q = self.q_norm(q)
@@ -799,6 +802,23 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
     def _add_linear_attention_mappings(self, mappings: dict, prefix: str, target: str) -> None:
         ap = f"{prefix}.attention"
         tp = f"{target}.self_attn"
+        # GLA layers use the unpatched hf_text_config head dims (head_dim=128,
+        # num_kv_heads_for_linear_attn=num_attention_heads). model_config.head_dim
+        # has been overwritten to MLA's qk_head_dim by patch_model_config — pin
+        # the loader to the layer-local truth so QKV slicing matches the layer
+        # weights actually built for this projection.
+        gla_head_dim = getattr(
+            self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads
+        )
+        gla_kv_heads = getattr(
+            self.config, "num_kv_heads_for_linear_attn", self.config.num_attention_heads
+        )
+        gla_heads = HeadContext(
+            num_heads=self.config.num_attention_heads,
+            num_kv_heads=gla_kv_heads,
+            head_dim=gla_head_dim,
+            v_head_dim=gla_head_dim,
+        )
         mappings[f"{ap}.query_key_value.weight"] = WeightMapping(
             target_path=[
                 f"{tp}.q_proj.weight",
@@ -807,6 +827,7 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
             ],
             sharding=(None, "tensor"),
             transpose=True,
+            head_context=gla_heads,
         )
         mappings[f"{ap}.g_proj.weight"] = WeightMapping(
             target_path=f"{tp}.g_proj.weight",
