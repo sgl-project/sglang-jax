@@ -378,7 +378,6 @@ class FlashAttention(AttentionBackend):
         # slot s_k; cache_loc/page_indices are laid out in valid-slot order
         # (== selector order), so the per-req gather below stays aligned.
         sel = np.asarray(batch.logits_indices_selector)
-        real_bs = batch.real_bs
         current_seq_lens = np.asarray(batch.seq_lens)[sel]
         allocate_lens = np.asarray(batch.spec_info.allocate_lens)[sel]
 
