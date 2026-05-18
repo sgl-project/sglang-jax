@@ -276,7 +276,7 @@ class EagleDraftWorker(BaseDraftWorker):
             select_index
         ]
         batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
-        batch_output.accept_lens = accept_host[sel]
+        batch_output.accept_lens = accept_host
 
     # -- Internal draft helpers --
 

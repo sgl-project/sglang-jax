@@ -317,4 +317,6 @@ class MultiLayerDraftWorker(EagleDraftWorker):
             select_index
         ]
         batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
-        batch_output.accept_lens = accept_host[sel]
+        # accept_lens stays DP-padded (total_bs,) — scheduler per-rank seq_lens
+        # update and _resolve_spec_decode_token_ids both index by DP slot.
+        batch_output.accept_lens = accept_host
