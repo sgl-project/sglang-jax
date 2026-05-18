@@ -1,52 +1,59 @@
-"""Accuracy case runner: drives evalscope against a given server URL."""
+"""Accuracy case runner: drives run_eval against a given server URL."""
 
-import json
-import subprocess
+import os
+import sys
+from types import SimpleNamespace
+
+_TEST_SRT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
+if _TEST_SRT not in sys.path:
+    sys.path.insert(0, _TEST_SRT)
 
 from multi_host_suite import AccuracyCase
 
+_SUPPORTED_GEN_FIELDS = ("temperature", "max_tokens")
+
 
 def run_accuracy_case(case: AccuracyCase, port: int) -> None:
-    api_url = f"http://127.0.0.1:{port}/v1"
-    cmd = [
-        "evalscope",
-        "eval",
-        "--model",
-        case.model_id,
-        "--api-url",
-        api_url,
-        "--api-key",
-        "EMPTY",
-        "--eval-type",
-        "openai_api",
-        "--datasets",
-        case.dataset,
-        "--eval-batch-size",
-        str(case.eval_batch_size),
-    ]
-    if case.generation_config:
-        cmd.extend(["--generation-config", json.dumps(case.generation_config)])
-    if case.limit is not None:
-        cmd.extend(["--limit", str(case.limit)])
+    from run_eval import run_eval
+
+    gen = case.generation_config or {}
+    unsupported_gen = sorted(k for k in gen if k not in _SUPPORTED_GEN_FIELDS)
+    if unsupported_gen:
+        print(
+            f"[multi-host-suite] Warning: generation_config fields "
+            f"{unsupported_gen} are not supported by run_eval and will be ignored",
+            flush=True,
+        )
     if case.timeout is not None:
-        cmd.extend(["--timeout", str(case.timeout)])
+        print(
+            "[multi-host-suite] Warning: AccuracyCase.timeout is not supported by "
+            "run_eval and will be ignored",
+            flush=True,
+        )
+
+    args = SimpleNamespace(
+        base_url=f"http://127.0.0.1:{port}",
+        host=None,
+        port=None,
+        model=case.model_id,
+        eval_name=case.dataset,
+        num_examples=case.limit,
+        num_threads=case.eval_batch_size,
+        temperature=gen.get("temperature", 0.0),
+        max_tokens=gen.get("max_tokens", 2048),
+    )
 
     print(
-        "[multi-host-suite] Running accuracy case "
+        f"[multi-host-suite] Running accuracy case "
         f"name={case.name}, dataset={case.dataset}, "
-        f"eval_batch_size={case.eval_batch_size}, "
-        f"generation_config={case.generation_config}, limit={case.limit}, "
-        f"timeout={case.timeout}",
+        f"num_threads={args.num_threads}, "
+        f"temperature={args.temperature}, max_tokens={args.max_tokens}, "
+        f"limit={case.limit}",
         flush=True,
     )
-    print(f"[multi-host-suite] Command: {' '.join(cmd)}", flush=True)
-    completed = subprocess.run(cmd, check=False)
-    if completed.returncode != 0:
-        raise RuntimeError(
-            f"evalscope exited with code {completed.returncode} for case={case.name}"
-        )
+    metrics = run_eval(args)
     print(
-        f"[multi-host-suite] Accuracy case {case.name} completed "
+        f"[multi-host-suite] Accuracy case {case.name} score={metrics.get('score')} "
         "(warn-only mode, accuracy not gated)",
         flush=True,
     )
