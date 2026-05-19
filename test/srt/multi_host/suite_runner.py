@@ -1,6 +1,5 @@
 import argparse
 import dataclasses
-import importlib
 import json
 import os
 import subprocess
@@ -216,32 +215,29 @@ def run_suite(suite: MultiHostSuite, runtime_cfg: RuntimeConfig) -> int:
     return exit_code
 
 
-def _discover_suite_modules() -> list[str]:
-    """List sibling test_*.py files (without .py), sorted for determinism."""
-    return sorted(
-        f[:-3] for f in os.listdir(_SELF_DIR) if f.startswith("test_") and f.endswith(".py")
-    )
-
-
 def _resolve_launch_profile(run: ModelRun, base_dir: Path) -> ModelRun:
     if Path(run.launch_profile).is_absolute():
         return run
     return dataclasses.replace(run, launch_profile=str(base_dir / run.launch_profile))
 
 
+# Explicit suite registry. To add a new suite: import the module above and
+# extend this list with its get_suites() result.
+import test_mimo_flash  # noqa: E402
+
+_REGISTERED_SUITES: list[MultiHostSuite] = [
+    *test_mimo_flash.get_suites(),
+]
+
+
 def get_suites() -> dict[str, MultiHostSuite]:
-    suites = {}
-    for module_name in _discover_suite_modules():
-        module = importlib.import_module(module_name)
-        if not hasattr(module, "get_suites"):
-            continue
-        base_dir = Path(module.__file__).parent
-        for suite in module.get_suites():
-            resolved_runs = [_resolve_launch_profile(r, base_dir) for r in suite.runs]
-            suite = dataclasses.replace(suite, runs=resolved_runs)
-            if suite.name in suites:
-                raise ValueError(f"Duplicate multi-host suite name: {suite.name}")
-            suites[suite.name] = suite
+    suites: dict[str, MultiHostSuite] = {}
+    base_dir = Path(_SELF_DIR)
+    for suite in _REGISTERED_SUITES:
+        if suite.name in suites:
+            raise ValueError(f"Duplicate multi-host suite name: {suite.name}")
+        resolved_runs = [_resolve_launch_profile(r, base_dir) for r in suite.runs]
+        suites[suite.name] = dataclasses.replace(suite, runs=resolved_runs)
     return suites
 
 
