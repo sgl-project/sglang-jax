@@ -6,18 +6,22 @@ on:
       - main
       - "epic/*"
     paths:
-      - "python/**"
+      - "python/sgl_jax/**"
+      - "python/*.toml"
       - "scripts/**"
       - "test/**"
+      - "benchmark/kernels/**"
       - ".github/workflows/pr-test.yml"
   pull_request:
     branches:
       - main
       - "epic/*"
     paths:
-      - "python/**"
+      - "python/sgl_jax/**"
+      - "python/*.toml"
       - "scripts/**"
       - "test/**"
+      - "benchmark/kernels/**"
       - ".github/workflows/pr-test.yml"
 
 concurrency:
