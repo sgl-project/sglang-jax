@@ -142,7 +142,7 @@ jobs:
       nightly-test-perf-text-models-1-tpu-daily,
       nightly-test-perf-trace-text-models-1-tpu-daily,
     ]
-    if: always()
+    if: always() && github.repository == 'sgl-project/sglang-jax'
     runs-on: ubuntu-latest
     steps:
       - name: Check all daily job statuses
