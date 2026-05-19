@@ -8,7 +8,7 @@ This guide provides step-by-step instructions for deploying and serving Large La
 ## Prerequisites
 
 1.  **Google Cloud Project**: An active GCP project (eg: `your-project-id`).
-2.  **TPU Quota**: Ensure you have quota for Cloud TPU v5e (specifically `ct5lp-hightpu-8t` machine type) in your chosen region (eg: `us-west1-c`).
+2.  **TPU Quota**: Ensure you have quota for Cloud TPUs in your chosen region. *(Example: Cloud TPU v5e `ct5lp-hightpu-8t` machine type in `us-west1-c`).*
 3.  **gcloud CLI & kubectl**: Installed and authenticated.
 
 
@@ -20,8 +20,10 @@ First, set up your GKE cluster and provision a dedicated Cloud TPU v5e node pool
 
 ```bash
 export PROJECT_ID="your-project-id"
-export ZONE="us-west1-c" # or whatever location has available TPUs
+export ZONE="us-west1-c" # Replace with your chosen region/zone (eg: us-west1-c)
 export CLUSTER_NAME="sglang-tpu-cluster"
+export MACHINE_TYPE="ct5lp-hightpu-8t" # Replace with your allocated TPU machine type (eg: ct5lp-hightpu-8t for TPU v5e, 8 chips)
+export NODE_POOL_NAME="tpu-node-pool"
 ```
 
 ### 2. Create the Cluster
@@ -46,16 +48,16 @@ gcloud container clusters get-credentials $CLUSTER_NAME --location $ZONE --proje
 
 ### 4. Create the TPU Node Pool
 
-Provision a single-host Spot TPU v5e node pool containing 8 TPU chips (`ct5lp-hightpu-8t`):
+Provision a single-host Spot TPU node pool using your allocated machine type (the example below creates a Spot node pool for cost savings):
 
 ```bash
-gcloud container node-pools create tpu-v5-single-host-spot \
+gcloud container node-pools create $NODE_POOL_NAME \
   --location=$ZONE \
   --cluster=$CLUSTER_NAME \
   --spot \
   --num-nodes=1 \
   --reservation-affinity=none \
-  --machine-type=ct5lp-hightpu-8t \
+  --machine-type=$MACHINE_TYPE \
   --project=$PROJECT_ID
 ```
 
@@ -94,6 +96,8 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
 
 ## Step 3: Build and Push the Docker Image
 
+*(Note: The sgl-jax team is actively working on an official release pipeline. Once it lands, you will be able to pull the official image directly from Docker Hub and skip this build step).*
+
 Use the provided `Dockerfile` in the root of the `sglang-jax` repository to build and push the image.
 
 ```bash
@@ -113,7 +117,7 @@ docker push $REGISTRY_URL/sglang-jax:latest
 
 Save the following manifest as `sglang-tpu-deployment.yaml`. This manifest includes critical JAX/TPU optimizations explained in the **Friction Points & Key Insights** section below.
 
-**NOTE**: the example YAML below stubs out the `image:` as `us-west1-docker.pkg.dev/your-project-id/sglang-jax-repo/sglang-jax:latest`. You will need to replace this with the correct value for the image you built and pushed to artifact registry (ie: `$REGISTRY_URL/sglang-jax:latest` from the above step).
+**NOTE**: the example YAML below has some sections that you will need to update based on the image you pushed, your machine-type, and node pool capacity.  Look for the "NOTE:" comments in the YAML below and update as needed.
 
 ```yaml
 apiVersion: apps/v1
@@ -135,6 +139,8 @@ spec:
       labels:
         app: sglang-tpu
     spec:
+      # NOTE: The nodeSelector below is configured for TPU v5e (2x4 topology). 
+      # Adjust these labels to match your allocated TPU type and topology (eg: v4, v6e).
       nodeSelector:
         cloud.google.com/gke-tpu-accelerator: tpu-v5-lite-podslice
         cloud.google.com/gke-tpu-topology: 2x4
@@ -145,7 +151,8 @@ spec:
         effect: "NoSchedule"
       containers:
       - name: sglang-container
-        image: us-west1-docker.pkg.dev/your-project-id/sglang-jax-repo/sglang-jax:latest # Replace with your image path
+        # NOTE: Adjust the image as needed
+        image: us-west1-docker.pkg.dev/your-project-id/sglang-jax-repo/sglang-jax:latest
         imagePullPolicy: Always
         command:
         - python3
@@ -195,11 +202,12 @@ spec:
             port: 30000
           initialDelaySeconds: 600
           periodSeconds: 30
+        # NOTE: Adjust TPU resource requests to match your allocated node pool capacity.
         resources:
           requests:
             cpu: "10"
             memory: "128Gi"
-            google.com/tpu: "8"
+            google.com/tpu: "8" # Match this to your node pool capacity
           limits:
             cpu: "10"
             memory: "128Gi"
@@ -336,7 +344,7 @@ gcloud container clusters delete $CLUSTER_NAME \
 *   **The Issue**: In `sglang-jax`, the `--tp-size` CLI argument represents the total number of TPU devices (world size) you wish to allocate to the job, *not* the final Tensor Parallelism size.
 *   **The Math**: The actual Tensor Parallel size is calculated internally as `tp_size // dp_size`.
 *   **The Divisibility Rule**: The model's number of attention heads must be divisible by the *actual* Tensor Parallel size. For `Qwen2.5-7B` (28 heads), an actual TP size of 8 is invalid (28 % 8 != 0), causing an assertion crash.
-*   **The Fix**: To utilize all 8 chips of `ct5lp-hightpu-8t` for Qwen 7B, configure `--tp-size 8 --dp-size 2`. This correctly yields `dp_size = 2` and `actual_tp_size = 4` (which divides 28 perfectly).
+*   **The Fix**: As an example, to utilize all 8 chips of `ct5lp-hightpu-8t` for Qwen 7B, configure `--tp-size 8 --dp-size 2`. This correctly yields `dp_size = 2` and `actual_tp_size = 4` (which divides 28 perfectly).
 
 ### 4. Silent Python Buffering
 
