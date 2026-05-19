@@ -221,24 +221,46 @@ def _resolve_launch_profile(run: ModelRun, base_dir: Path) -> ModelRun:
     return dataclasses.replace(run, launch_profile=str(base_dir / run.launch_profile))
 
 
-# Explicit suite registry. To add a new suite: import the module above and
-# extend this list with its get_suites() result.
-import test_mimo_flash  # noqa: E402
-
-_REGISTERED_SUITES: list[MultiHostSuite] = [
-    *test_mimo_flash.get_suites(),
-]
+# Explicit suite registry. To add a new suite: insert a new entry below.
+SUITES: dict[str, MultiHostSuite] = {
+    "mimo-flash-pref-test": MultiHostSuite(
+        name="mimo-flash-pref-test",
+        runs=[
+            ModelRun(
+                launch_profile="launch_profiles/mimo-flash-v6e-4x4.yaml",
+                cases=[
+                    PerfCase(
+                        name="mimo-flash-benchmark",
+                        input_len=16384,
+                        output_len=1024,
+                        num_prompts=256,
+                        max_concurrency=64,
+                        request_rate=100,
+                        seed=12345,
+                        flush_cache=True,
+                    ),
+                    AccuracyCase(
+                        name="mimo-flash-gsm8k",
+                        dataset="gsm8k",
+                        model_id="XiaomiMiMo/MiMo-V2-Flash",
+                        eval_batch_size=32,
+                        generation_config={"temperature": 0.8, "top_p": 0.95},
+                    ),
+                ],
+            ),
+        ],
+    ),
+}
 
 
 def get_suites() -> dict[str, MultiHostSuite]:
-    suites: dict[str, MultiHostSuite] = {}
     base_dir = Path(_SELF_DIR)
-    for suite in _REGISTERED_SUITES:
-        if suite.name in suites:
-            raise ValueError(f"Duplicate multi-host suite name: {suite.name}")
-        resolved_runs = [_resolve_launch_profile(r, base_dir) for r in suite.runs]
-        suites[suite.name] = dataclasses.replace(suite, runs=resolved_runs)
-    return suites
+    return {
+        name: dataclasses.replace(
+            suite, runs=[_resolve_launch_profile(r, base_dir) for r in suite.runs]
+        )
+        for name, suite in SUITES.items()
+    }
 
 
 def parse_args() -> argparse.Namespace:
