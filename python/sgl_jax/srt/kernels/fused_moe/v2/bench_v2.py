@@ -12,6 +12,8 @@ Env vars:
   BENCH_BSE     — bse value (default: 256)
   BENCH_FP8     — 1 to enable fp8 weights
   BENCH_QBK     — quant_block_k for fp8 (default: 128)
+  BENCH_DIRECT_SCALED_DOT — 1 to use fp8 direct-scaled-dot path
+  BENCH_BT_SCATTER_OVERLAP — 1 to overlap next-BT scatter with current BT
   BENCH_TUNE    — 1 to auto-generate bt/bf candidates
   BENCH_WARMUP  — warmup iterations (default: 2)
   BENCH_ITERS   — timed iterations (default: 5)
@@ -208,6 +210,7 @@ use_split = os.environ.get("BENCH_SPLIT", "0") == "1"
 decode_mode = os.environ.get("BENCH_DECODE_MODE", "0") == "1"
 direct_scaled_dot = os.environ.get("BENCH_DIRECT_SCALED_DOT", "0") == "1"
 inkernel_metadata = os.environ.get("BENCH_INKERNEL_MD", "0") == "1"
+enable_bt_scatter_overlap = os.environ.get("BENCH_BT_SCATTER_OVERLAP", "1") == "1"
 if use_split:
     timeit_fn = None
     timing_label = "split"
@@ -240,6 +243,8 @@ if direct_scaled_dot:
     log("direct_scaled_dot=True (fp8 dot per quant group, scale after dot)")
 if inkernel_metadata:
     log("inkernel_metadata=True (in-kernel ICI allgather, no JAX lax.all_gather)")
+if enable_bt_scatter_overlap:
+    log("bt_scatter_overlap=True (next-BT scatter HBM bank overlap)")
 
 bt_candidates = parse_csv_int("BENCH_BT", [128])
 bf_candidates = parse_csv_int("BENCH_BF", [256])
@@ -403,6 +408,7 @@ for num_tokens in token_candidates:
                 disable_acc_and_store=disable_acc_and_store,
                 decode_mode=decode_mode,
                 direct_scaled_dot=direct_scaled_dot,
+                enable_bt_scatter_overlap=enable_bt_scatter_overlap,
                 use_jax_allreduce_metadata=not inkernel_metadata,
             )
 
@@ -474,6 +480,7 @@ if check_correctness:
             quant_block_k=qbk_arg,
             w1_scale=w1_scale_s, w2_scale=w2_scale_s, w3_scale=w3_scale_s,
             direct_scaled_dot=direct_scaled_dot,
+            enable_bt_scatter_overlap=enable_bt_scatter_overlap,
             use_jax_allreduce_metadata=not inkernel_metadata,
         )
         ref_kwargs = {}
