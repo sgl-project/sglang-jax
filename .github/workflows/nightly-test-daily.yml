@@ -28,7 +28,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
-        timeout-minutes: 3000
+        timeout-minutes: 60
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
@@ -63,7 +63,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Run performance test for text models
-        timeout-minutes: 1800
+        timeout-minutes: 60
         env:
 
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
@@ -107,7 +107,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Run performance test for text models
-        timeout-minutes: 18000
+        timeout-minutes: 60
         env:
 
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
