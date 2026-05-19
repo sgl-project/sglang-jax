@@ -20,7 +20,8 @@ jobs:
     if: >-
       github.repository == 'sgl-project/sglang-jax' &&
       github.event.workflow_run.conclusion != 'success' &&
-      github.event.workflow_run.conclusion != 'skipped'
+      github.event.workflow_run.conclusion != 'skipped' &&
+      (github.event.workflow_run.name != 'PR Test' || github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
