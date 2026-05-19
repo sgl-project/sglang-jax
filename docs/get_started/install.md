@@ -32,7 +32,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache uv run python -u -m sgl_jax.launch_serv
 
 ## Method 4: Using Kubernetes
 
-🚧 **Under Construction** 🚧
+For deploying SGLang-Jax on Google Kubernetes Engine (GKE) with Cloud TPUs, please follow our [GKE TPU Getting Started Guide](gke-tpu-install.md).
 
 ## Method 5: Run on Cloud TPU with SkyPilot
 
