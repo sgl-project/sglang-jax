@@ -1369,6 +1369,9 @@ class MemoryPools:
         try:
             return self._pools[name]
         except KeyError:
+            primary = self._pools.get("token_to_kv_pool")
+            if primary is not None:
+                return getattr(primary, name)
             raise AttributeError(f"MemoryPools has no pool '{name}'") from None
 
     def tree_flatten(self):
