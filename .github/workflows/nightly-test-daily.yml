@@ -10,7 +10,7 @@ on:
       - "python/sgl_jax/version.py"
   workflow_dispatch:
 concurrency:
-  group: nightly-test-${{ github.ref }}
+  group: nightly-test-daily-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
