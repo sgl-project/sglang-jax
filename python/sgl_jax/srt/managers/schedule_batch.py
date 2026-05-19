@@ -2118,15 +2118,26 @@ class ScheduleBatch:
         spec_info = self._scatter_spec_info_to_dp_slots(
             flat_spec, logits_indices_selector, total_bs
         )
-        out_cache_loc = self.reqs_info[0].out_cache_loc
-        if out_cache_loc is None:
-            out_cache_loc = np.empty(0, dtype=np.int32)
-        # out_cache_loc length == extend_num_tokens (depends on per-round
-        # accept_len) and is sharded P("data") in ForwardBatch.init_new — pad
-        # to a dp-divisible length with -1 (sentinel; KV write skips it).
-        pad = (-len(out_cache_loc)) % self.dp_size
-        if pad:
-            out_cache_loc = np.pad(out_cache_loc, (0, pad), constant_values=-1)
+        # Per-rank out_cache_loc chunks (set in spec prepare_for_decode) have
+        # variable length (∝ accept_len). DP-segment: pad each to max_len with
+        # -1 so the P("data") shard in ForwardBatch.init_new gives rank r its
+        # own slots (fa_backend doesn't use it, but native_backend would).
+        ocl_chunks = [
+            (
+                np.asarray(i.out_cache_loc, dtype=np.int32)
+                if i.out_cache_loc is not None and len(i.out_cache_loc) > 0
+                else np.empty(0, dtype=np.int32)
+            )
+            for i in self.reqs_info
+        ]
+        max_ocl = max((len(c) for c in ocl_chunks), default=0)
+        out_cache_loc = (
+            np.concatenate(
+                [np.pad(c, (0, max_ocl - len(c)), constant_values=-1) for c in ocl_chunks]
+            )
+            if max_ocl > 0
+            else np.empty(0, dtype=np.int32)
+        )
         return ModelWorkerBatch(
             bid=acc_global_bid(),
             forward_mode=self.forward_mode,

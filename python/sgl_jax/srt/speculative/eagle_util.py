@@ -575,7 +575,7 @@ class EagleDraftInput:
             self.allocate_lens.shape[0] == bs
         ), f" {self.allocate_lens.shape[0]=} but batch_size is {bs} "
         page_size = schedule_batch.token_to_kv_pool_allocator.page_size
-        new_alloc_chunks, ocl_chunks = [], []
+        new_alloc_chunks = []
         flat_off = 0
         for dp_rank, info in enumerate(schedule_batch.reqs_info):
             if info.seq_lens is None or len(info.seq_lens) == 0:
@@ -605,15 +605,13 @@ class EagleDraftInput:
                 info.req_pool_indices, schedule_batch.req_to_token_pool, old_r, new_r, ocl_r
             )
             new_alloc_chunks.append(new_r)
-            ocl_chunks.append(np.asarray(ocl_r, dtype=np.int32))
+            # Per-rank store (matches nospec extend); _get_spec_decode_mwb_dp
+            # DP-segments these so each rank's P("data") shard = its own slots.
+            info.out_cache_loc = np.asarray(ocl_r, dtype=np.int32)
             flat_off += bs_r
             info.seq_lens_sum = np.sum(info.seq_lens).item()
 
         self.allocate_lens = np.concatenate(new_alloc_chunks)
-        # out_cache_loc global-flat; consumed by _get_spec_decode_mwb_dp.
-        schedule_batch.reqs_info[0].out_cache_loc = (
-            np.concatenate(ocl_chunks) if ocl_chunks else np.empty(0, dtype=np.int32)
-        )
 
     def prepare_for_draft_decode(
         self, model_worker_batch: ModelWorkerBatch, topk: int, num_steps: int

@@ -79,12 +79,13 @@ def _mk_batch(dp_size: int, bs_per_rank: list[int]) -> ScheduleBatch:
             info.reqs = []
             info.seq_lens = None
             info.req_pool_indices = None
-        info.out_cache_loc = None
+        info.out_cache_loc = (
+            np.arange(r * 1000, r * 1000 + bs * DRAFT_N, dtype=np.int32) if bs > 0 else None
+        )
         info.spec_info = None
         info.sampling_info = None
         reqs_info.append(info)
     reqs_info[0].spec_info = _mk_spec_info(real_bs)
-    reqs_info[0].out_cache_loc = np.arange(real_bs * DRAFT_N, dtype=np.int32)
 
     sb = ScheduleBatch.__new__(ScheduleBatch)
     sb.__dict__.update(
@@ -141,6 +142,12 @@ def test_get_spec_decode_mwb_dp_shapes(dp, bs_per_rank):
     for name in ("seq_lens", "req_pool_indices", "out_cache_loc"):
         arr = getattr(mwb, name)
         assert len(arr) % dp == 0, f"{name} len={len(arr)} not %dp={dp}"
+    # out_cache_loc DP-segmented: rank r's section = its own slots then -1 pad
+    ocl = np.asarray(mwb.out_cache_loc).reshape(dp, -1)
+    for r, bs in enumerate(bs_per_rank):
+        n = bs * DRAFT_N
+        assert list(ocl[r, :n]) == list(range(r * 1000, r * 1000 + n)), (r, ocl[r])
+        assert np.all(ocl[r, n:] == -1), f"rank {r} pad not -1: {ocl[r, n:]}"
     # seq_lens slot layout: rank r's reqs at [r*per_dp_bs : r*per_dp_bs+bs_r]
     per_dp = mwb.per_dp_bs_size
     for r, bs in enumerate(bs_per_rank):
