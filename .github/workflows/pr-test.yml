@@ -6,18 +6,22 @@ on:
       - main
       - "epic/*"
     paths:
-      - "python/**"
+      - "python/sgl_jax/**"
+      - "python/*.toml"
       - "scripts/**"
       - "test/**"
+      - "benchmark/kernels/**"
       - ".github/workflows/pr-test.yml"
   pull_request:
     branches:
       - main
       - "epic/*"
     paths:
-      - "python/**"
+      - "python/sgl_jax/**"
+      - "python/*.toml"
       - "scripts/**"
       - "test/**"
+      - "benchmark/kernels/**"
       - ".github/workflows/pr-test.yml"
 
 concurrency:
@@ -311,6 +315,7 @@ jobs:
 
   pr-test-finish:
     needs: [
+      check-changes,
       performance-test-1-tpu,
       performance-test-4-tpu,
       accurancy-test-1-tpu,
@@ -321,16 +326,71 @@ jobs:
       e2e-test-4-tpu,
       pallas-kernel-benchmark,
     ]
-    runs-on: arc-runner-v6e-1
+    if: always()
+    runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
         run: |
-          results=(${{ join(needs.*.result, ' ') }})
-          for result in "${results[@]}"; do
-            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
-              echo "Job failed with result: $result"
-              exit 1
+          echo "=== Job Results ==="
+          echo "check-changes: ${{ needs.check-changes.result }}"
+          echo "unit-test-1-tpu: ${{ needs.unit-test-1-tpu.result }}"
+          echo "unit-test-4-tpu: ${{ needs.unit-test-4-tpu.result }}"
+          echo "e2e-test-1-tpu: ${{ needs.e2e-test-1-tpu.result }}"
+          echo "e2e-test-4-tpu: ${{ needs.e2e-test-4-tpu.result }}"
+          echo "accurancy-test-1-tpu: ${{ needs.accurancy-test-1-tpu.result }}"
+          echo "accurancy-test-4-tpu: ${{ needs.accurancy-test-4-tpu.result }}"
+          echo "performance-test-1-tpu: ${{ needs.performance-test-1-tpu.result }}"
+          echo "performance-test-4-tpu: ${{ needs.performance-test-4-tpu.result }}"
+          echo "pallas-kernel-benchmark: ${{ needs.pallas-kernel-benchmark.result }}"
+          echo ""
+
+          # check-changes must succeed
+          if [ "${{ needs.check-changes.result }}" != "success" ]; then
+            echo "::error::check-changes did not succeed: ${{ needs.check-changes.result }}"
+            exit 1
+          fi
+
+          # If no relevant files changed, all test skips are by-design
+          main_package="${{ needs.check-changes.outputs.main_package }}"
+          pallas_kernel="${{ needs.check-changes.outputs.pallas_kernel }}"
+
+          if [ "$main_package" != "true" ] && [ "$pallas_kernel" != "true" ]; then
+            echo "No relevant file changes detected — all test skips are by design"
+            exit 0
+          fi
+
+          # Check jobs that should have run
+          has_failure=false
+
+          if [ "$main_package" = "true" ]; then
+            for job_result in \
+              "unit-test-1-tpu=${{ needs.unit-test-1-tpu.result }}" \
+              "unit-test-4-tpu=${{ needs.unit-test-4-tpu.result }}" \
+              "e2e-test-1-tpu=${{ needs.e2e-test-1-tpu.result }}" \
+              "e2e-test-4-tpu=${{ needs.e2e-test-4-tpu.result }}" \
+              "accurancy-test-1-tpu=${{ needs.accurancy-test-1-tpu.result }}" \
+              "accurancy-test-4-tpu=${{ needs.accurancy-test-4-tpu.result }}" \
+              "performance-test-1-tpu=${{ needs.performance-test-1-tpu.result }}" \
+              "performance-test-4-tpu=${{ needs.performance-test-4-tpu.result }}"; do
+              job_name="${job_result%%=*}"
+              result="${job_result#*=}"
+              if [ "$result" != "success" ]; then
+                echo "::error::${job_name} did not succeed: ${result}"
+                has_failure=true
+              fi
+            done
+          fi
+
+          if [ "$pallas_kernel" = "true" ]; then
+            result="${{ needs.pallas-kernel-benchmark.result }}"
+            if [ "$result" != "success" ]; then
+              echo "::error::pallas-kernel-benchmark did not succeed: ${result}"
+              has_failure=true
             fi
-          done
-          echo "All jobs completed successfully"
-          exit 0
+          fi
+
+          if [ "$has_failure" = "true" ]; then
+            exit 1
+          fi
+
+          echo "All required test jobs passed"
