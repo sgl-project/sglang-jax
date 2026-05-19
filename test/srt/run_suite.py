@@ -483,11 +483,6 @@ suites = {
         TestFile("python/sgl_jax/test/test_utils.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_kv_cache.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_radix_cache.py", 1),
-        TestFile("python/sgl_jax/test/mem_cache/test_swa_radix_cache.py", 1),
-        TestFile("python/sgl_jax/test/mem_cache/test_swa_allocator.py", 1),
-        TestFile("python/sgl_jax/test/mem_cache/test_req_to_token_pool.py", 1),
-        TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
-        TestFile("python/sgl_jax/test/mem_cache/test_hybrid_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/speculative/test_eagle_tree_build.py", 1),
         TestFile("python/sgl_jax/test/speculative/test_eagle_utils.py", 1),
         TestFile("python/sgl_jax/test/multimodal/test_wan_vae_precision.py", 1),
@@ -504,7 +499,9 @@ suites = {
     # CPU runner so they don't consume TPU capacity. Either pure
     # Python / numpy / mocks (no JAX device ops) or JAX kernels whose
     # header already pins JAX_PLATFORMS=cpu and which target CPU
-    # reference implementations.
+    # reference implementations. mem_cache pool/allocator/cache tests
+    # have a conditional CPU pin gated on USE_DEVICE_TYPE=cpu — the
+    # cpu-test CI job sets that env var.
     "unit-test-cpu": [
         TestFile("test/srt/test_tokenizer_manager_event.py", 0.1),
         TestFile("python/sgl_jax/test/test_compilation_manager.py", 1),
@@ -513,6 +510,11 @@ suites = {
         TestFile("python/sgl_jax/test/models/test_mimo_v2_nextn.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/gdn/test_gated_delta.py", 1),
         TestFile("python/sgl_jax/test/kernels/gdn/test_ragged_gated_delta_rule_ref.py", 1),
+        TestFile("python/sgl_jax/test/mem_cache/test_req_to_token_pool.py", 1),
+        TestFile("python/sgl_jax/test/mem_cache/test_hybrid_req_to_token_pool.py", 1),
+        TestFile("python/sgl_jax/test/mem_cache/test_swa_allocator.py", 1),
+        TestFile("python/sgl_jax/test/mem_cache/test_swa_radix_cache.py", 1),
+        TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 1),

@@ -126,6 +126,7 @@ jobs:
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          USE_DEVICE_TYPE: cpu
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
