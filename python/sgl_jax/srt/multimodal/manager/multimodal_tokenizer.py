@@ -814,7 +814,9 @@ class MultimodalTokenizer(TokenizerManager):
             finally:
                 os.unlink(tmp_path)
         if os.path.exists(source):
-            audio_data, _ = librosa.load(source, sr=self.mm_processor.feature_extractor.sampling_rate)
+            audio_data, _ = librosa.load(
+                source, sr=self.mm_processor.feature_extractor.sampling_rate
+            )
             return audio_data
         if source.startswith(("http://", "https://")):
             try:
