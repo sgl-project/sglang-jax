@@ -40,26 +40,26 @@ def run_perf_case(case: PerfCase, profile: LaunchProfile) -> None:
     )
     metrics = run_benchmark(args)
 
+    # bench_serving returns scalar metrics + per-request lists (ttfts/itls/
+    # generated_texts/errors). The lists can be megabytes; keep only scalars
+    # for the summary going to GCS.
     summary = {
         "type": "perf",
         "case": case.name,
         "profile": profile.name,
         "target": profile.target,
-        "completed": metrics.get("completed"),
-        "median_ttft_ms": metrics.get("median_ttft_ms"),
-        "median_itl_ms": metrics.get("median_itl_ms"),
-        "input_throughput": metrics.get("input_throughput"),
-        "output_throughput": metrics.get("output_throughput"),
-        "request_throughput": metrics.get("request_throughput"),
+        **{k: v for k, v in metrics.items() if not isinstance(v, (list, dict))},
     }
+    # default=float handles numpy scalars returned by bench_serving.
+    summary_json = json.dumps(summary, indent=2, sort_keys=True, default=float)
     print("[multi-host-suite] Perf summary:", flush=True)
-    print(f"[multi-host-suite] {json.dumps(summary, indent=2, sort_keys=True)}", flush=True)
+    print(f"[multi-host-suite] {summary_json}", flush=True)
 
     results_dir = os.environ.get("RESULTS_DIR")
     if results_dir:
         out_path = Path(results_dir) / f"{case.name}.json"
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
+        out_path.write_text(summary_json)
 
     if metrics.get("completed") != case.num_prompts:
         raise RuntimeError(f"Expected completed={case.num_prompts}, got {metrics.get('completed')}")
