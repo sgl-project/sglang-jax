@@ -269,6 +269,81 @@ def test_spec_info_aligns_with_dp_padded_slots(dp, bs_per_rank):
 
 
 @pytest.mark.parametrize(
+    "dp,bs_per_rank",
+    [
+        (1, [3]),
+        (2, [1, 1]),
+        (2, [2, 1]),
+        (2, [0, 2]),
+        (4, [1, 1, 1, 1]),
+        (4, [2, 1, 0, 3]),
+    ],
+)
+def test_draft_page_indices_dp_segmented(dp, bs_per_rank):
+    """multi_step page_indices must be DP-segmented so the P("data") shard at
+    [r*per_dp_dst:(r+1)*per_dp_dst) gives rank r exactly its own reqs' pages.
+
+    Regression for the rank>0-reads-padding bug (dp=4 garbage output +
+    accept-len ~1): pre-fix the gather wrote contiguous-then-pad, so rank>0's
+    shard landed in the all-zero padding region.
+    """
+    sb = _mk_batch(dp, bs_per_rank)
+    real_bs = sum(bs_per_rank)
+    spec = sb.reqs_info[0].spec_info
+    # Distinct seq_len per req so page boundaries are observable.
+    spec.allocate_lens = np.asarray([256 * (k + 1) + 4 for k in range(real_bs)], dtype=np.int32)
+    buckets = [b for b in BS_BUCKETS if b >= dp]
+    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False)
+    per_dp = mwb.per_dp_bs_size
+    sel = np.asarray(mwb.logits_indices_selector)
+    assert sel.shape == (real_bs,)
+    rank_of = sel // per_dp
+    # cache_loc layout: rank r section = [r*L : (r+1)*L), tokens tagged with
+    # global-flat req id k so we can verify which req each page belongs to.
+    L_tok, page = 8192, 256
+    cache_loc = np.full(L_tok * dp, -1, dtype=np.int32)
+    al = np.asarray(mwb.spec_info.allocate_lens)
+    aligned = ((al + page - 1) // page) * page
+    intra = np.zeros(dp, dtype=np.int64)
+    for s in np.where(mwb.seq_lens > 0)[0]:
+        r = int(s) // per_dp
+        k = int(np.where(sel == s)[0][0])
+        b = r * L_tok + intra[r]
+        cache_loc[b : b + al[s]] = k
+        intra[r] += aligned[s]
+    # multi_step gather (mirror of get_eagle_multi_step_metadata step 0).
+    src_locs = cache_loc[::page]
+    L_pg = L_tok // page
+    alloc_pg = ((al[sel] + page - 1) // page).astype(np.int64)
+    spec_pg = ((mwb.seq_lens[sel] + page - 1) // page).astype(np.int64)
+
+    def starts(pages, base):
+        out = np.zeros(len(pages), dtype=np.int64)
+        for r in range(dp):
+            m = rank_of == r
+            if np.any(m):
+                c = np.cumsum(pages[m])
+                out[m] = r * base + np.concatenate(([0], c[:-1]))
+        return out
+
+    DST, per_dst = 16384, 16384 // dp
+    flat_cum = np.concatenate(([0], np.cumsum(spec_pg)[:-1]))
+    off = np.arange(int(spec_pg.sum())) - np.repeat(flat_cum, spec_pg)
+    gi = np.repeat(starts(alloc_pg, L_pg), spec_pg) + off
+    wi = np.repeat(starts(spec_pg, per_dst), spec_pg) + off
+    result = np.full(DST, -1, dtype=np.int32)
+    result[wi] = src_locs[gi]
+    # Invariant: rank r's section contains exactly rank r's req-ids (in
+    # global-flat order), then -1 padding; never another rank's id or 0-from-pad.
+    for r in range(dp):
+        seg = result[r * per_dst : (r + 1) * per_dst]
+        ks = [k for k in range(real_bs) if rank_of[k] == r]
+        want = np.concatenate([np.full(int(spec_pg[k]), k) for k in ks] or [np.array([], int)])
+        assert list(seg[: len(want)]) == list(want), (r, seg[: len(want) + 2], want)
+        assert np.all(seg[len(want) :] == -1), f"rank {r} pad region nonempty"
+
+
+@pytest.mark.parametrize(
     "dp,bs_per_rank,accept_per_slot",
     [
         (1, [2], [3, 2]),

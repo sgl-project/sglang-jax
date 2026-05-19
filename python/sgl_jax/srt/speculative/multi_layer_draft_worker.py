@@ -309,7 +309,10 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, layer0_logits.next_token_logits, layer0_logits.hidden_states
         )
-        topk_p, topk_index = topk_probs_from_logits(rep_logits[select_index], self.topk)
+        # next_token_logits is pruned to (total_bs, vocab) (one entry per slot,
+        # already the last-accepted token via logits_indices); hidden_states is
+        # FULL (total_bs*(steps+1), H). Index logits by slot, hidden by token.
+        topk_p, topk_index = topk_probs_from_logits(rep_logits[sel], self.topk)
         batch_output.next_draft_input.hidden_states = rep_hidden[select_index]
         batch_output.next_draft_input.topk_p = topk_p
         batch_output.next_draft_input.topk_index = topk_index

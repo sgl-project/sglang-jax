@@ -537,8 +537,15 @@ class EagleDraftInput:
         model_worker_batch.positions = model_worker_batch.positions
         model_worker_batch.extend_seq_lens = np.zeros((bs,), dtype=np.int32)
         model_worker_batch.extend_seq_lens[sel] = step_plus_1
+        # Per-rank-local cumsum: _select_hidden_states is a shard_map rank-local
+        # gather, so indices must be offsets into each rank's own hidden shard.
+        dp = model_worker_batch.dp_size
+        per_dp = model_worker_batch.per_dp_bs_size if dp > 1 else bs
         model_worker_batch.logits_indices = (
-            np.cumsum(model_worker_batch.extend_seq_lens, dtype=np.int32) - 1
+            model_worker_batch.extend_seq_lens.reshape(dp, per_dp)
+            .cumsum(axis=1, dtype=np.int32)
+            .ravel()
+            - 1
         )
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
