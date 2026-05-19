@@ -150,9 +150,9 @@ class T5Attention(nnx.Module):
         pb = jnp.transpose(self.rel_bias(buckets), (2, 0, 1))
         # Pin layout to [H@tensor, Sq, Sk] so GSPMD can't auto-assign `data`
         # to Sq, which would clash with the batch dim of `scores` at line 171.
-        return jax.lax.with_sharding_constraint(
-            pb, NamedSharding(self.mesh, P("tensor", None, None))
-        )
+        # Mesh is in Explicit sharding mode, so use `reshard`, not
+        # `with_sharding_constraint`.
+        return jax.sharding.reshard(pb, NamedSharding(self.mesh, P("tensor", None, None)))
 
     def __call__(self, x, attention_mask=None, position_bias=None, deterministic=True):
         batch_size, seq_len, _ = x.shape
