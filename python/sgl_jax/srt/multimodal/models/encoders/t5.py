@@ -15,6 +15,7 @@ import os
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import NamedSharding, PartitionSpec as P
 from transformers import T5Config
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -145,7 +146,12 @@ class T5Attention(nnx.Module):
             num_buckets=self.num_buckets,
             max_distance=self.max_distance,
         )
-        return jnp.transpose(self.rel_bias(buckets), (2, 0, 1))
+        pb = jnp.transpose(self.rel_bias(buckets), (2, 0, 1))
+        # Pin layout to [H@tensor, Sq, Sk] so GSPMD can't auto-assign `data`
+        # to Sq, which would clash with the batch dim of `scores` at line 171.
+        return jax.lax.with_sharding_constraint(
+            pb, NamedSharding(self.mesh, P("tensor", None, None))
+        )
 
     def __call__(self, x, attention_mask=None, position_bias=None, deterministic=True):
         batch_size, seq_len, _ = x.shape
