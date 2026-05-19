@@ -219,15 +219,15 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            : model_worker_batch.real_bs, :
-        ]
-        if len(logits_output.hidden_states.shape) == 1:
-            logits_output.hidden_states = jnp.expand_dims(logits_output.hidden_states, axis=0)
+        rep_logits, rep_hidden = replicate_to_mesh(
+            self.mesh, logits_output.next_token_logits, logits_output.hidden_states
+        )
+        logits_output.next_token_logits = rep_logits[sel, :]
+        if len(rep_hidden.shape) == 1:
+            rep_hidden = jnp.expand_dims(rep_hidden, axis=0)
+        logits_output.hidden_states = rep_hidden[sel]
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
-        forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens[
-            : model_worker_batch.real_bs
-        ]
+        forward_batch.spec_info.allocate_lens = np.asarray(model_worker_batch.seq_lens)[sel]
 
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 

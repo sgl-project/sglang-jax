@@ -34,6 +34,7 @@ DRAFT_N = 4
 class _Req:
     def __init__(self, rid: int):
         self.rid = rid
+        self.lora_id = "0"
         self._done = False
         self.output_ids: list[int] = []
         self.origin_input_ids = [1, 2, 3, 4, 5]

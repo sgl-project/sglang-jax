@@ -2158,7 +2158,12 @@ class ScheduleBatch:
             extend_logprob_start_lens=None,
             extend_input_logprob_token_ids=None,
             logits_indices=None,
-            lora_ids=["0"] * total_bs,
+            lora_ids=(
+                ["0"] * total_bs
+                if enable_static_lora
+                else [r.lora_id for i in self.reqs_info for r in (i.reqs or [])]
+                + ["0"] * (total_bs - real_bs)
+            ),
             real_bs=real_bs,
             real_bs_per_dp=real_bs_per_dp,
             dp_size=self.dp_size,
