@@ -18,7 +18,6 @@ jobs:
   nightly-test-accuracy-text-models-1-tpu-daily:
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: arc-runner-v6e-1
-    continue-on-error: true
     env:
       TZ: Asia/Shanghai
     steps:
@@ -56,7 +55,6 @@ jobs:
   nightly-test-perf-text-models-1-tpu-daily:
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: arc-runner-v6e-1
-    continue-on-error: true
     env:
       TZ: Asia/Shanghai
     steps:
@@ -100,7 +98,6 @@ jobs:
   nightly-test-perf-trace-text-models-1-tpu-daily:
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: arc-runner-v6e-1
-    continue-on-error: true
     env:
       TZ: Asia/Shanghai
     steps:
@@ -138,3 +135,40 @@ jobs:
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
           python3 scripts/ci/publish_traces.py --traces-dir ./test/nightly_test_output
+
+  nightly-test-daily-finish:
+    needs: [
+      nightly-test-accuracy-text-models-1-tpu-daily,
+      nightly-test-perf-text-models-1-tpu-daily,
+      nightly-test-perf-trace-text-models-1-tpu-daily,
+    ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all daily job statuses
+        run: |
+          echo "=== Daily Test Results ==="
+          echo "accuracy-1-tpu-daily: ${{ needs.nightly-test-accuracy-text-models-1-tpu-daily.result }}"
+          echo "perf-text-1-tpu-daily: ${{ needs.nightly-test-perf-text-models-1-tpu-daily.result }}"
+          echo "perf-trace-1-tpu-daily: ${{ needs.nightly-test-perf-trace-text-models-1-tpu-daily.result }}"
+          echo ""
+
+          has_failure=false
+          for job_result in \
+            "accuracy-1-tpu-daily=${{ needs.nightly-test-accuracy-text-models-1-tpu-daily.result }}" \
+            "perf-text-1-tpu-daily=${{ needs.nightly-test-perf-text-models-1-tpu-daily.result }}" \
+            "perf-trace-1-tpu-daily=${{ needs.nightly-test-perf-trace-text-models-1-tpu-daily.result }}"; do
+            job_name="${job_result%%=*}"
+            result="${job_result#*=}"
+            if [ "$result" != "success" ]; then
+              echo "::error::${job_name} did not succeed: ${result}"
+              has_failure=true
+            fi
+          done
+
+          if [ "$has_failure" = "true" ]; then
+            echo "::error::One or more daily test jobs failed"
+            exit 1
+          fi
+
+          echo "All daily test jobs passed"

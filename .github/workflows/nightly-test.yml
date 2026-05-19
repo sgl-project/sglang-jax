@@ -22,7 +22,6 @@ jobs:
       fail-fast: false
       matrix:
         part: [0, 1 , 2, 3]
-    continue-on-error: true
     env:
       TZ: Asia/Shanghai
     steps:
@@ -86,7 +85,6 @@ jobs:
       fail-fast: false
       matrix:
         part: [0, 1 , 2, 3 , 4, 5]
-    continue-on-error: true
     env:
       TZ: Asia/Shanghai
     steps:
@@ -129,7 +127,6 @@ jobs:
       fail-fast: false
       matrix:
         part: [0, 1 , 2, 3, 4, 5, 6, 7]
-    continue-on-error: true
     env:
       TZ: Asia/Shanghai
     steps:
@@ -173,7 +170,6 @@ jobs:
   nightly-test-perf-text-models-4-tpu-part1:
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: arc-runner-v6e-4
-    continue-on-error: true
     env:
       TZ: Asia/Shanghai
     steps:
@@ -239,7 +235,6 @@ jobs:
   nightly-test-perf-text-models-4-tpu-part2:
       if: github.repository == 'sgl-project/sglang-jax'
       runs-on: arc-runner-v6e-4
-      continue-on-error: true
       env:
         TZ: Asia/Shanghai
       steps:
@@ -283,7 +278,6 @@ jobs:
   nightly-test-perf-text-models-4-tpu-part3:
         if: github.repository == 'sgl-project/sglang-jax'
         runs-on: arc-runner-v6e-4
-        continue-on-error: true
         env:
           TZ: Asia/Shanghai
         steps:
@@ -331,7 +325,6 @@ jobs:
       fail-fast: false
       matrix:
         part: [0, 1 , 2, 3, 4, 5, 6, 7]
-    continue-on-error: true
     env:
       TZ: Asia/Shanghai
     steps:
@@ -374,7 +367,6 @@ jobs:
   nightly-test-perf-trace-text-models-4-tpu-part1:
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: arc-runner-v6e-4
-    continue-on-error: true
     env:
       TZ: Asia/Shanghai
     steps:
@@ -418,7 +410,6 @@ jobs:
   nightly-test-perf-trace-text-models-4-tpu-part2:
       if: github.repository == 'sgl-project/sglang-jax'
       runs-on: arc-runner-v6e-4
-      continue-on-error: true
       env:
         TZ: Asia/Shanghai
       steps:
@@ -479,3 +470,58 @@ jobs:
             echo "$SHA,$AUTHOR,$MSG,$RUN_URL" >> $FILE
             echo "CSV line added: $SHA, $AUTHOR, $MSG"
             python3 scripts/ci/publish_bench_and_perf.py --source-dir ./meta
+
+  nightly-test-finish:
+    needs: [
+      nightly-test-accuracy-text-models-1-tpu,
+      nightly-test-accuracy-text-models-4-tpu,
+      nightly-test-perf-text-models-1-tpu,
+      nightly-test-perf-text-models-4-tpu-part1,
+      nightly-test-perf-text-models-4-tpu-part2,
+      nightly-test-perf-text-models-4-tpu-part3,
+      nightly-test-perf-trace-text-models-1-tpu,
+      nightly-test-perf-trace-text-models-4-tpu-part1,
+      nightly-test-perf-trace-text-models-4-tpu-part2,
+    ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all nightly job statuses
+        run: |
+          echo "=== Nightly Test Results ==="
+          echo "accuracy-1-tpu: ${{ needs.nightly-test-accuracy-text-models-1-tpu.result }}"
+          echo "accuracy-4-tpu: ${{ needs.nightly-test-accuracy-text-models-4-tpu.result }}"
+          echo "perf-text-1-tpu: ${{ needs.nightly-test-perf-text-models-1-tpu.result }}"
+          echo "perf-text-4-tpu-part1: ${{ needs.nightly-test-perf-text-models-4-tpu-part1.result }}"
+          echo "perf-text-4-tpu-part2: ${{ needs.nightly-test-perf-text-models-4-tpu-part2.result }}"
+          echo "perf-text-4-tpu-part3: ${{ needs.nightly-test-perf-text-models-4-tpu-part3.result }}"
+          echo "perf-trace-1-tpu: ${{ needs.nightly-test-perf-trace-text-models-1-tpu.result }}"
+          echo "perf-trace-4-tpu-part1: ${{ needs.nightly-test-perf-trace-text-models-4-tpu-part1.result }}"
+          echo "perf-trace-4-tpu-part2: ${{ needs.nightly-test-perf-trace-text-models-4-tpu-part2.result }}"
+          echo ""
+
+          has_failure=false
+          for job_result in \
+            "accuracy-1-tpu=${{ needs.nightly-test-accuracy-text-models-1-tpu.result }}" \
+            "accuracy-4-tpu=${{ needs.nightly-test-accuracy-text-models-4-tpu.result }}" \
+            "perf-text-1-tpu=${{ needs.nightly-test-perf-text-models-1-tpu.result }}" \
+            "perf-text-4-tpu-part1=${{ needs.nightly-test-perf-text-models-4-tpu-part1.result }}" \
+            "perf-text-4-tpu-part2=${{ needs.nightly-test-perf-text-models-4-tpu-part2.result }}" \
+            "perf-text-4-tpu-part3=${{ needs.nightly-test-perf-text-models-4-tpu-part3.result }}" \
+            "perf-trace-1-tpu=${{ needs.nightly-test-perf-trace-text-models-1-tpu.result }}" \
+            "perf-trace-4-tpu-part1=${{ needs.nightly-test-perf-trace-text-models-4-tpu-part1.result }}" \
+            "perf-trace-4-tpu-part2=${{ needs.nightly-test-perf-trace-text-models-4-tpu-part2.result }}"; do
+            job_name="${job_result%%=*}"
+            result="${job_result#*=}"
+            if [ "$result" != "success" ]; then
+              echo "::error::${job_name} did not succeed: ${result}"
+              has_failure=true
+            fi
+          done
+
+          if [ "$has_failure" = "true" ]; then
+            echo "::error::One or more nightly test jobs failed"
+            exit 1
+          fi
+
+          echo "All nightly test jobs passed"
