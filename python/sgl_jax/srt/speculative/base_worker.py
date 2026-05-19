@@ -182,6 +182,21 @@ class BaseSpecWorker:
             self.draft_worker.draft_model_runner.rngs,
             self.mesh,
         )
+        # For topk>1, accepted tokens follow non-consecutive retrive_index
+        # positions (e.g. [0,1,3] instead of [0,1,2]) because the tree
+        # branches.  _resolve_spec_decode_token_ids reads at consecutive
+        # stride offsets, so compact the predict array accordingly.
+        if self.topk > 1:
+            predict = predict.copy()
+            draft_n = self.speculative_num_draft_tokens
+            accept_width = self.speculative_num_steps + 1
+            bs = accept_length.shape[0]
+            for bid in range(bs):
+                for step in range(int(accept_length[bid])):
+                    src = accept_index[bid * accept_width + step]
+                    dst = bid * draft_n + step
+                    if src >= 0 and src != dst:
+                        predict[dst] = predict[src]
         # accept_index uses -1 for rejected slots; gathering with -1 picks the
         # global last element, so dext later writes rejected tokens' draft-KV at
         # a foreign position inside each req's page (corrupts prefix KV for all

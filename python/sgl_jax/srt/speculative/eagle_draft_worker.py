@@ -266,7 +266,8 @@ class EagleDraftWorker(BaseDraftWorker):
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, draft_logits_output.next_token_logits, draft_logits_output.hidden_states
         )
-        draft_logits_output.next_token_logits = rep_logits[select_index]
+        real_bs = len(model_worker_batch.seq_lens[: model_worker_batch.real_bs])
+        draft_logits_output.next_token_logits = rep_logits[:real_bs]
         draft_logits_output.hidden_states = rep_hidden[select_index]
         topk_p, topk_index = topk_probs_from_logits(
             draft_logits_output.next_token_logits, self.topk
