@@ -23,42 +23,196 @@ init_fn = nnx.initializers.uniform()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+
+def tpool_patch_merger(
+    x: jax.Array,
+    grid_thws: jax.Array,
+    merge_kernel_size: tuple[int, int] = (2, 2),
+) -> list[jax.Array]:
+
+    d_model = x.size(-1) 
+
+    outputs = []
+    pre_sum = 0
+
+    for t, h, w in grid_thws.tolist():
+        seq = x[pre_sum : pre_sum + t * h * w]
+
+        kernel_height, kernel_width = merge_kernel_size
+        new_height, new_width = h // kernel_height, w // kernel_width
+
+        reshaped_seq = seq.view(
+            t, new_height, kernel_height, new_width, kernel_width, d_model
+        )
+
+        reshared_seq = (
+            reshared_seq.permute(0, 1, 3, 2, 4, 5).contiguous().mean(axis=0)
+        )
+
+        padded_seq = reshared_seq.view(
+            new_height * new_width, kernel_height * kernel_width, -1
+        )
+
+        outputs.append(padded_seq)
+        pre_sum += t * h * w
+
+    return outputs
+
+class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
+
+    def __init__(
+        self,
+        height: int,
+        width: int,
+        num_frames: int,
+        dim: int,
+        interpolation_mode: str = "bicubic",
+    ) -> None:
+        self.height = height
+        self.width = width
+        self.num_frames = num_frames
+        self.dim = dim
+        self.interpolation_mode = interpolation_mode
+        self.weight = nn.params(
+            'weight',
+            nn.initializers.normal(stddev=1.0),
+            (height, width, dim)
+        )
+
+    def __call__(
+        self,
+        x: jax.Array,
+        grid_thws: jax.Array
+    ) -> jax.Array:
+
+        pos_embs = []
+        for t, h, w in grid_thws.tolist():
+            assert t <= self.num_frames, f"t:{t} > self.num_frames:{self.num_frames}"
+            if (h, w) == self.weight.shape[:-1]:
+                pos_emb_2d = self.weight.flatten(end_dim=1)
+            else:
+                # TODO: Implement interpolation mode
+
+            if t == 1:
+                pos_emb_3d = pos_emb_2d
+            else:
+                pos_emb_3d = (
+                    pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) # Add self.time_weight[0:t] for temporal axis
+                )
+
+            pos_embs.append(pos_emb_3d.reshape(-1, pos_emb_3d.shape[-1]))
+
+        out = x + jnp.concatenate(pos_embs, axis=0)
+        return out
+
+class Rope2DPosEmbRepeated(nnx.Module):
+
+    def __init__(
+        self,
+        dim: int,
+        max_height: int,
+        max_width: int,
+        theta_base: int,
+    ):
+        self.dim = dim
+        assert self.dim % 4 == 0, "dim must be divisible by 4"
+        self.max_height = max_height
+        self.max_width = max_width
+        self.theta_base = theta_base
+
+    def __precompute_freqs_cis(self) -> None:
+        N = self.max_height * self.max_width
+        flat_pos = jnp.arange(0, N).float()
+        x_pos = flat_pos % self.max_width
+        y_pos = flat_pos % self.max_height
+
+        dim_range = (
+            jnp.arange(0, self.dim, 4)[:, (self.dim // 4)].float()
+        )
+
+        freqs = 1.0 / (self.theta_base ** (dim_range / self.dim))
+        x_freqs = jnp.outer(x_pos, freqs).astype(jnp.float32)
+        y_freqs = jnp.outer(y_pos, freqs).astype(jnp.float32)
+
+        x_cis = jnp.exp(1j * x_freqs)
+        y_cis = jnp.exp(1j * y_freqs)
+
+        freqs_cis = jnp.concatenate(
+            [x_cis.unsqueeze(dim=-1), y_cis.unsqueeze(dim=-1)], dim=-1
+        )
+
+        freqs_cis = freqs_cis.reshape(self.max_height, self.max_width, -1)
+        return freqs_cis
+
+    def __get_freqs_cis(
+        self,
+        grid_thws: jax.Array,
+    ) -> jax.Array:
+
+        freqs_cis = self._precompute_freqs_cis()
+
+        shapes = grid_thws.to_list()
+        assert all(
+            1 <= h <= self.max_height and 1 <= 2 <= self.max_width for t, h, w in shapes
+        ), (
+            shapes,
+            self.max_height,
+            self.max_widht,
+        )
+
+        freqs_cis = jnp.concatenate(
+            [
+                freqs_cis[:h, :w].reshape(-1, self.dim // 2).repeat(t, 1)
+                for t, h, w in shapes
+            ], 
+            axis=0
+        )
+
+        return freqs_cis
+
+
 class KimiK25VisionPatchEmbed(nnx.Module):
+
     def __init__(
         self,
         rngs: nnx.Rngs = None,
         patch_size: int = 14,
         in_channels: int = 3, # TODO: check which model config this corresponds to
-        temporal_patch_size: int = 2,
+        pos_emb_height: int = 64,
+        pos_emb_width: int = 64,
+        pos_emb_time: int = 4,
+        pos_emb_type: str = "divided_fixed",
         hidden_size: int = 1152,
         dtype: jnp.dtype = jnp.bfloat16,
     ) -> None:
         self.patch_size = patch_size
         self.hidden_size = hidden_size
-        self.kernel_size = (patch_size, patch_size) # TODO: Verify if the temporal dimension to include
-        self.temporal_patch_size = temporal_patch_size
+        self.kernel_size = (patch_size, patch_size)
 
-        self.pos_emb = None # TODO: Implement position embedding
-        
+        if pos_emb_type == "divided_fixed":
+            self.pos_emb = Learnable2DInterPosEmbDivided_fixed(
+                height=pos_emb_height,
+                width=pos_emb_width,
+                num_frames=pos_emb_time,
+                dim=hidden_size
+            )
+        else:
+            raise NotImplementedError(f"No support for pos_emb_type: {pos_emb_type}")
+
         self.proj = nnx.Conv(
             in_features=in_channels,
             out_features=hidden_size,
-            kernel_size=kernel_size,
-            strides=kernel_size,
+            kernel_size=self.kernel_size,
+            strides=self.kernel_size,
             use_bias=True,
             param_dtype=dtype,
             rngs=rngs or nnx.Rngs(0),
         )
 
-    def __call__(self, x: jax.Array) -> jax.Array:
-        L, dim = x.shape
-        channels = dim // (self.patch_size**2 * self.temporal_patch_size)
-
-        x = x.reshape(L, channels, self.temporal_patch_size, self.patch_size, self.patch_size)
-        x = jnp.transpose(x, (0, 2, 3, 4, 1))
-
+    def __call__(self, x: jax.Array, grid_thws: jax.Array) -> jax.Array:
         x = self.proj(x)
-        return x.reshape(L, self.hidden_size)
+        return self.pos_emb(x, grid_thws)
+
 
 class KimiK25VisionAttention(nnx.Module):
     def __init__(
@@ -79,6 +233,16 @@ class KimiK25VisionAttention(nnx.Module):
             param_dtype=dtype,
             rngs=_rngs,
         )
+
+    def __call__(
+        self,
+        hidden_states: jax.Array,
+        cu_seqlens: jax.Array,
+        rope_freqs_cis: jax.Array,
+    ):
+        # TODO: Implement the attention layer
+        return hidden_states
+
 
 
 class KimiK25VisionMLP(nnx.Module):
@@ -131,30 +295,47 @@ class KimiK25VisionBlock(nnx.Module):
         rngs: nnx.Rngs = None,
     ):
 
-        norm_layer = partial(
-            nnx.RMSNorm,
-            epsilon=config.projector_ln_eps,
-            scale_init=nnx.with_partitioning(init_fn, (None, )), # TODO: validate this initialize
-        )
-
-        self.attn = KimiK25VisionAttention(config, dtype, mesh, rngs)
+        self.attn = KimiK25VisionAttention(config, dtype, mesh, rngs) # TODO: Investigate the working of the Attention with RoPE
 
         self.mlp = KimiK25VisionMLP(config, dtype, mesh, rngs)
 
         _rngs = rngs or nnx.Rngs(0)
-        self.pre_norm = norm_layer(config.vt_hidden_size, dtype=dtype, rngs=_rngs)
+        self.pre_norm = nnx.LayerNorm(config.vt_hidden_size, param_dtype=dtype, rngs=_rngs)
 
-        self.proj = nnx.Linear(
-            self.vt_hidden_size,
-            self.vt_hidden_size,
+        self.proj = nnx.Linear( # TODO: Add activation function too
+            config.vt_hidden_size,
+            config.vt_hidden_size,
             use_bias=True,
-            param_dtpe=dtype,
+            param_dtype=dtype,
             rngs=_rngs,
         )
 
-        self.post_norm = norm_layer(config.vt_hidden_size, dtype=dtype, rngs=_rngs)
+        self.post_norm = nnx.LayerNorm(config.vt_hidden_size, param_dtype=dtype, rngs=_rngs)
 
-    def __call__(self, x:jnp.Array):
+    def __call__(
+        self, 
+        hidden_states: jax.Array,
+        cu_seqlens: jax.Array,
+        max_seqlen: int,
+        rope_freqs_cis: jax.Array
+    ):
+        residual = hidden_states
+        hidden_states = self.pre_norm(hidden_states)
+
+        hidden_states = self.attn(
+            hidden_states,
+            cu_seqlens=cu_seqlens,
+            position_embeddings=rope_freqs_cis,
+        )
+
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_norm(hidden_states)
+        hidden_states = self.proj(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
 
 
 class VisionTowerEncoder(nnx.Module):
@@ -163,12 +344,17 @@ class VisionTowerEncoder(nnx.Module):
         self,
         config: KimiK25ModelVitConfig,
         dtype: jnp.dtype,
+        video_attn_type: str = "spatial_temporal",
         mesh: Mesh = None,
         norm_eps: float = 1e-6,
         rngs: nnx.Rngs = None,
     ):
         self.config = config
         self.dtype = dtype
+
+        assert (video_attn_type == "spatial_temporal"), f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
+
+        self.rope_2d = Rope2DPosEmbRepeated(config.vt_hidden_size // config.vt_num_attention_heads, 512, 512) 
 
         self.blocks = nnx.List(
             [
@@ -182,15 +368,37 @@ class VisionTowerEncoder(nnx.Module):
             ]
         )
 
-        norm_layer = partial(
-            nnx.RMSNorm,
-            epsilon=config.projector_ln_eps,
-            scale_init=nnx.with_partitioning(init_fn, (None, )), # TODO: validate this initialize
-        )
-
         _rngs = rngs or nnx.Rngs(0)
 
-        self.final_layernorm = norm_layer(config.vt_hidden_size, dtype=dtype, rngs=_rngs)
+        self.final_layernorm = nnx.LayerNorm(config.vt_hidden_size, param_dtype=dtype, rngs=_rngs)
+
+    def __call__(
+        self,
+        hidden_states: jax.Array,
+        grid_thws: jax.Array,
+    ) -> jax.Array:
+
+        rope_freqs_cis = self.rope_2d.get_freqs_cis(grid_thws=grid_thws)
+
+        lengths = torch.concatenate(
+            (
+                jnp.zeros(1, dtype=grid_thws.dtype),
+                grid_thws[:, 0] * grid_thws[:, 1] * grid[: 2],
+            )
+        )
+
+        max_seqlen = lengths_max()
+        cu_seqlens = lengths.cumsum(axis=0, dtype=int32)
+
+        for block in self.blocks:
+            hidden_states = block(
+                hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis=rope_freqs_cis
+            )
+
+        hidden_states = self.final_layernorm(hidden_states)
+
+        return hidden_states
+
 
 class VisionTower(nnx.Module):
     
@@ -205,14 +413,41 @@ class VisionTower(nnx.Module):
         self.config = config
         self.dtype = dtype
 
-        self.patch_embed = KimiK25PatchEmbed(rngs, config.patch_size, 3, config.vt_hidden_size, dtype) 
+        self.merge_kernel_size = config.merge_kernel_size
+
+        self.patch_embed = KimiK25VisionPatchEmbed(
+            rngs,
+            config.patch_size,
+            3,
+            config.init_pos_emb_height, 
+            config.init_pos_emb_width,
+            config.init_pos_emb_time,
+            config.pos_emb_type,
+            config.vt_hidden_size, 
+            dtype)
 
         self.encoder = VisionTowerEncoder(config, dtype, mesh, norm_eps, rngs)
+
+    def __call(
+        self,
+        pixel_values: jax.Array,
+        grid_thws: jax.Array,
+    ) -> jax.Array:
+
+        # TODO: Add assertions
+        hidden_states = self.patch_embed(pixel_values, grid_thws)
+        hidden_states = self.encoder(hidden_states, grid_thws)
+
+        hidden_states = tpool_patch_merger( # TODO: Implement and see if it should go into patcher.
+            hidden_states, grid_thws, merge_kernel_size=self.merge_kernel_size
+        )
+
+        return hidden_states
+
 
 class Kimi_K25_VisionModel(nnx.Module):
     '''
     Placeholder model class for the ViT stage.
-    - Call encode_vision() to get vision embeddings
     '''
 
     def __init__(
@@ -279,7 +514,7 @@ class Kimi_K25_VisionModel(nnx.Module):
                 ),
             })
 
-        for layer_idx in range(self.config):
+        for layer_idx in range(self.config.vt_num_hidden_layers):
             vision_layer_mappings = self._create_vision_layer_mappings(layer_idx)
             mappings.update(vision_layer_mappings)
 
@@ -352,33 +587,3 @@ class Kimi_K25_VisionModel(nnx.Module):
         }
 
         return mappings
-
-                    
-
-            
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
