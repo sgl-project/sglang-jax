@@ -49,11 +49,11 @@ def run_accuracy_case(case: AccuracyCase, profile: LaunchProfile) -> None:
             "target": profile.target,
             "dataset": case.dataset,
             "model_id": case.model_id,
-            "score": metrics.get("score") if isinstance(metrics, dict) else None,
+            **(metrics if isinstance(metrics, dict) else {}),
         }
         out_path = Path(results_dir) / f"{case.name}.json"
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
+        out_path.write_text(json.dumps(summary, indent=2, sort_keys=True, default=float))
 
     print(
         f"[multi-host-suite] Accuracy case {case.name} finished "
