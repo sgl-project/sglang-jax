@@ -546,7 +546,11 @@ class FlashAttention(AttentionBackend):
             P(self.attention_data_partition_axis),  # cu_q_lens
             P(self.attention_data_partition_axis),  # cu_kv_lens
             P(self.attention_data_partition_axis),  # distribution
-            P(),  # custom_mask
+            (
+                P(self.attention_data_partition_axis)
+                if self.forward_metadata.custom_mask is not None
+                else P()
+            ),  # custom_mask: DP-segmented per-rank (cu_seq_mask_lens is rank-local)
             (
                 P(self.kv_partition_axis) if attention_sink is not None else P()
             ),  # attention sink: (num_q_heads,), sharded by heads
