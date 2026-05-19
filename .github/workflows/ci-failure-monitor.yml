@@ -1,0 +1,52 @@
+name: CI Failure Monitor
+
+on:
+  workflow_run:
+    workflows:
+      - "Nightly Test"
+      - "Nightly Test Daily"
+      - "PR Test"
+      - "Release PyPI"
+    types:
+      - completed
+
+permissions:
+  issues: write
+  actions: read
+  contents: read
+
+jobs:
+  monitor:
+    if: >-
+      github.repository == 'sgl-project/sglang-jax' &&
+      github.event.workflow_run.conclusion != 'success' &&
+      github.event.workflow_run.conclusion != 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Get commit author
+        id: author
+        run: |
+          AUTHOR=$(gh api repos/${{ github.repository }}/commits/${{ github.event.workflow_run.head_sha }} --jq '.commit.author.name // "unknown"' 2>/dev/null || echo "unknown")
+          echo "name=$AUTHOR" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run failure monitor
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/ci/ci_failure_monitor.py \
+            --run-id "${{ github.event.workflow_run.id }}" \
+            --repo "${{ github.repository }}" \
+            --workflow-name "${{ github.event.workflow_run.name }}" \
+            --run-url "${{ github.event.workflow_run.html_url }}" \
+            --commit-sha "${{ github.event.workflow_run.head_sha }}" \
+            --commit-author "${{ steps.author.outputs.name }}"
