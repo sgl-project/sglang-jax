@@ -114,6 +114,25 @@ jobs:
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite unit-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
+  unit-test-cpu:
+    needs: [check-changes]
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    runs-on: arc-runner-cpu
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+      - name: Run unit test
+        timeout-minutes: 30
+        shell: bash
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[cpu]"
+          python test/srt/run_suite.py --suite unit-test-cpu
+
   # =============================================== e2e-test ===============================================
   e2e-test-1-tpu:
     needs: [check-changes]
@@ -306,6 +325,7 @@ jobs:
       accurancy-test-4-tpu,
       unit-test-1-tpu,
       unit-test-4-tpu,
+      unit-test-cpu,
       e2e-test-1-tpu,
       e2e-test-4-tpu,
       pallas-kernel-benchmark,
@@ -319,6 +339,7 @@ jobs:
           echo "check-changes: ${{ needs.check-changes.result }}"
           echo "unit-test-1-tpu: ${{ needs.unit-test-1-tpu.result }}"
           echo "unit-test-4-tpu: ${{ needs.unit-test-4-tpu.result }}"
+          echo "unit-test-cpu: ${{ needs.unit-test-cpu.result }}"
           echo "e2e-test-1-tpu: ${{ needs.e2e-test-1-tpu.result }}"
           echo "e2e-test-4-tpu: ${{ needs.e2e-test-4-tpu.result }}"
           echo "accurancy-test-1-tpu: ${{ needs.accurancy-test-1-tpu.result }}"
@@ -350,6 +371,7 @@ jobs:
             for job_result in \
               "unit-test-1-tpu=${{ needs.unit-test-1-tpu.result }}" \
               "unit-test-4-tpu=${{ needs.unit-test-4-tpu.result }}" \
+              "unit-test-cpu=${{ needs.unit-test-cpu.result }}" \
               "e2e-test-1-tpu=${{ needs.e2e-test-1-tpu.result }}" \
               "e2e-test-4-tpu=${{ needs.e2e-test-4-tpu.result }}" \
               "accurancy-test-1-tpu=${{ needs.accurancy-test-1-tpu.result }}" \

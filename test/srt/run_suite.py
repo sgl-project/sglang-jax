@@ -480,9 +480,7 @@ suites = {
         TestFile("python/sgl_jax/test/test_moe_topk.py", 1),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 9),
         TestFile("python/sgl_jax/test/test_sampler.py", 1),
-        TestFile("python/sgl_jax/test/test_compilation_manager.py", 1),
         TestFile("python/sgl_jax/test/test_utils.py", 1),
-        TestFile("python/sgl_jax/test/test_kernel_utils.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_kv_cache.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_radix_cache.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_swa_radix_cache.py", 1),
@@ -492,23 +490,29 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_hybrid_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/speculative/test_eagle_tree_build.py", 1),
         TestFile("python/sgl_jax/test/speculative/test_eagle_utils.py", 1),
-        TestFile("python/sgl_jax/test/speculative/test_spec_info.py", 0.2, runner="pytest"),
-        TestFile("python/sgl_jax/test/models/test_mimo_v2_nextn.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/multimodal/test_wan_vae_precision.py", 1),
         TestFile("python/sgl_jax/test/multimodal/test_vae_scheduler.py", 2.5),
         TestFile("python/sgl_jax/test/multimodal/test_flash_attention_kernel.py", 1),
         TestFile("python/sgl_jax/test/layers/test_group_rmsnorm.py", 1, runner="pytest"),
         TestFile("test/srt/lora/test_bgmv_backend.py", 4),
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 3.5),
-        # GDN (gated DeltaNet) — CPU-only unit tests; each pins
-        # JAX_PLATFORMS=cpu + 8 fake devices in its header, so they run on
-        # any TPU runner without consuming TPU chips.
-        TestFile("python/sgl_jax/test/kernels/gdn/test_gated_delta.py", 1),
-        TestFile("python/sgl_jax/test/kernels/gdn/test_ragged_gated_delta_rule_ref.py", 1),
         TestFile("python/sgl_jax/test/layers/test_gdn_backend.py", 1),
         TestFile("python/sgl_jax/test/layers/test_merged_column_parallel_linear.py", 1),
         TestFile("python/sgl_jax/test/layers/test_qwen3_5_gated_delta_net.py", 1),
+    ],
+    # CPU-only unit tests — moved off arc-runner-v6e-1 to a dedicated
+    # CPU runner so they don't consume TPU capacity. Either pure
+    # Python / numpy / mocks (no JAX device ops) or JAX kernels whose
+    # header already pins JAX_PLATFORMS=cpu and which target CPU
+    # reference implementations.
+    "unit-test-cpu": [
         TestFile("test/srt/test_tokenizer_manager_event.py", 0.1),
+        TestFile("python/sgl_jax/test/test_compilation_manager.py", 1),
+        TestFile("python/sgl_jax/test/test_kernel_utils.py", 1),
+        TestFile("python/sgl_jax/test/speculative/test_spec_info.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/models/test_mimo_v2_nextn.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/kernels/gdn/test_gated_delta.py", 1),
+        TestFile("python/sgl_jax/test/kernels/gdn/test_ragged_gated_delta_rule_ref.py", 1),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 1),
