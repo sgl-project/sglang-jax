@@ -1,0 +1,155 @@
+name: Coordinator
+
+on:
+  workflow_call:
+    outputs:
+      main_package:
+        description: "PR changed main package code"
+        value: ${{ jobs.decide.outputs.main_package }}
+      pallas_kernel:
+        description: "PR changed Pallas kernel code"
+        value: ${{ jobs.decide.outputs.pallas_kernel }}
+      is_draft:
+        description: "PR is a draft"
+        value: ${{ jobs.decide.outputs.is_draft }}
+      is_fork_pr:
+        description: "PR comes from a fork"
+        value: ${{ jobs.decide.outputs.is_fork_pr }}
+      run_full:
+        description: "Run full test suite (label test:full or [full-ci] in commit msg)"
+        value: ${{ jobs.decide.outputs.run_full }}
+      requires_4tpu:
+        description: "Run 4-TPU tests (label test:multi-chip or distributed path changes)"
+        value: ${{ jobs.decide.outputs.requires_4tpu }}
+      run_perf:
+        description: "Run performance tests (label test:perf)"
+        value: ${{ jobs.decide.outputs.run_perf }}
+      run_perf_trace:
+        description: "Run performance trace tests (label test:perf-trace)"
+        value: ${{ jobs.decide.outputs.run_perf_trace }}
+      run_accuracy_extra:
+        description: "Run extra accuracy tests (label test:accuracy-extra)"
+        value: ${{ jobs.decide.outputs.run_accuracy_extra }}
+      should_run:
+        description: "Should any tests run (not draft AND has relevant changes)"
+        value: ${{ jobs.decide.outputs.should_run }}
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    outputs:
+      main_package: ${{ steps.filter.outputs.main_package }}
+      pallas_kernel: ${{ steps.filter.outputs.pallas_kernel }}
+      is_draft: ${{ steps.meta.outputs.is_draft }}
+      is_fork_pr: ${{ steps.meta.outputs.is_fork_pr }}
+      run_full: ${{ steps.labels.outputs.run_full }}
+      requires_4tpu: ${{ steps.labels.outputs.requires_4tpu }}
+      run_perf: ${{ steps.labels.outputs.run_perf }}
+      run_perf_trace: ${{ steps.labels.outputs.run_perf_trace }}
+      run_accuracy_extra: ${{ steps.labels.outputs.run_accuracy_extra }}
+      should_run: ${{ steps.summary.outputs.should_run }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            main_package:
+              - "python/sgl_jax/**"
+              - "python/*.toml"
+              - "scripts/**"
+              - "test/**"
+              - ".github/workflows/pr-test.yml"
+            pallas_kernel:
+              - "python/sgl_jax/kernels/**"
+              - "benchmark/kernels/**"
+              - ".github/workflows/pr-test.yml"
+
+      - name: Detect PR metadata
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            is_draft="${{ github.event.pull_request.draft }}"
+            head_repo="${{ github.event.pull_request.head.repo.full_name }}"
+            base_repo="${{ github.event.pull_request.base.repo.full_name }}"
+            if [ "$head_repo" != "$base_repo" ]; then
+              is_fork="true"
+            else
+              is_fork="false"
+            fi
+          else
+            is_draft="false"
+            is_fork="false"
+          fi
+          echo "is_draft=$is_draft" >> $GITHUB_OUTPUT
+          echo "is_fork_pr=$is_fork" >> $GITHUB_OUTPUT
+
+      - name: Detect labels and commit message
+        id: labels
+        run: |
+          run_full="false"
+          requires_4tpu="false"
+          run_perf="false"
+          run_perf_trace="false"
+          run_accuracy_extra="false"
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            LABELS='${{ toJSON(github.event.pull_request.labels.*.name) }}'
+            if echo "$LABELS" | grep -q '"test:full"'; then
+              run_full="true"
+            fi
+            if echo "$LABELS" | grep -q '"test:multi-chip"'; then
+              requires_4tpu="true"
+            fi
+            if echo "$LABELS" | grep -q '"test:perf"'; then
+              run_perf="true"
+            fi
+            if echo "$LABELS" | grep -q '"test:perf-trace"'; then
+              run_perf_trace="true"
+            fi
+            if echo "$LABELS" | grep -q '"test:accuracy-extra"'; then
+              run_accuracy_extra="true"
+            fi
+          fi
+
+          COMMIT_MSG=$(git log -1 --format='%s %b')
+          if echo "$COMMIT_MSG" | grep -qi '\[full-ci\]'; then
+            run_full="true"
+          fi
+
+          echo "run_full=$run_full" >> $GITHUB_OUTPUT
+          echo "requires_4tpu=$requires_4tpu" >> $GITHUB_OUTPUT
+          echo "run_perf=$run_perf" >> $GITHUB_OUTPUT
+          echo "run_perf_trace=$run_perf_trace" >> $GITHUB_OUTPUT
+          echo "run_accuracy_extra=$run_accuracy_extra" >> $GITHUB_OUTPUT
+
+      - name: Summarize decisions
+        id: summary
+        run: |
+          is_draft="${{ steps.meta.outputs.is_draft }}"
+          main_package="${{ steps.filter.outputs.main_package }}"
+          pallas_kernel="${{ steps.filter.outputs.pallas_kernel }}"
+
+          if [ "$is_draft" = "true" ]; then
+            should_run="false"
+          elif [ "$main_package" = "true" ] || [ "$pallas_kernel" = "true" ]; then
+            should_run="true"
+          else
+            should_run="false"
+          fi
+          echo "should_run=$should_run" >> $GITHUB_OUTPUT
+
+          echo "=== Coordinator Decisions ==="
+          echo "main_package: $main_package"
+          echo "pallas_kernel: $pallas_kernel"
+          echo "is_draft: $is_draft"
+          echo "is_fork_pr: ${{ steps.meta.outputs.is_fork_pr }}"
+          echo "run_full: ${{ steps.labels.outputs.run_full }}"
+          echo "requires_4tpu: ${{ steps.labels.outputs.requires_4tpu }}"
+          echo "run_perf: ${{ steps.labels.outputs.run_perf }}"
+          echo "run_perf_trace: ${{ steps.labels.outputs.run_perf_trace }}"
+          echo "run_accuracy_extra: ${{ steps.labels.outputs.run_accuracy_extra }}"
+          echo "should_run: $should_run"

@@ -29,47 +29,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # =============================================== check changes ====================================================
-  check-changes:
-    runs-on: ubuntu-latest
-    outputs:
-      main_package: ${{ steps.filter.outputs.main_package }}
-      pallas_kernel: ${{ steps.filter.outputs.pallas_kernel }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-      # TODO: use run-ci label when sglang-jax-bot exists
-      # - name: Fail if the PR does not have the 'run-ci' label
-      #   if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'run-ci')
-      #   run: |
-      #     echo "This pull request does not have the 'run-ci' label. Failing the workflow."
-      #     exit 1
-
-      - name: Fail if the PR is a draft
-        if: github.event_name == 'pull_request' && github.event.pull_request.draft == true
-        run: |
-          echo "This pull request is a draft. Failing the workflow."
-          exit 1
-
-      - name: Detect file changes
-        id: filter
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            main_package:
-              - "python/sgl_jax/**"
-              - "python/*.toml"
-              - "scripts/**"
-              - "test/**"
-              - ".github/workflows/pr-test.yml"
-            pallas_kernel:
-              - "python/sgl_jax/kernels/**"
-              - "benchmark/kernels/**"
-              - ".github/workflows/pr-test.yml"
+  # =============================================== coordinator ====================================================
+  coordinator:
+    uses: ./.github/workflows/coordinator.yml
   # =============================================== unit-test ====================================================
   unit-test-1-tpu:
-    needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    needs: [coordinator]
+    if: needs.coordinator.outputs.should_run == 'true' && needs.coordinator.outputs.main_package == 'true'
     runs-on: arc-runner-v6e-1
     #runs-on: ubuntu-slim
     strategy:
@@ -93,8 +59,8 @@ jobs:
           python test/srt/run_suite.py --suite unit-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
   unit-test-4-tpu:
-    needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    needs: [coordinator]
+    if: needs.coordinator.outputs.should_run == 'true' && needs.coordinator.outputs.main_package == 'true'
     runs-on: arc-runner-v6e-4
     strategy:
       fail-fast: false
@@ -118,8 +84,8 @@ jobs:
 
   # =============================================== e2e-test ===============================================
   e2e-test-1-tpu:
-    needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    needs: [coordinator]
+    if: needs.coordinator.outputs.should_run == 'true' && needs.coordinator.outputs.main_package == 'true'
     runs-on: arc-runner-v6e-1
     strategy:
       fail-fast: false
@@ -146,8 +112,8 @@ jobs:
 
 
   e2e-test-4-tpu:
-    needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    needs: [coordinator]
+    if: needs.coordinator.outputs.should_run == 'true' && needs.coordinator.outputs.main_package == 'true'
     runs-on: arc-runner-v6e-4
     strategy:
       fail-fast: false
@@ -174,8 +140,8 @@ jobs:
 
   # =============================================== accurancy-test ===============================================
   accurancy-test-1-tpu:
-    needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    needs: [coordinator]
+    if: needs.coordinator.outputs.should_run == 'true' && needs.coordinator.outputs.main_package == 'true'
     runs-on: arc-runner-v6e-1
     strategy:
       fail-fast: false
@@ -201,8 +167,8 @@ jobs:
           python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   accurancy-test-4-tpu:
-    needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    needs: [coordinator]
+    if: needs.coordinator.outputs.should_run == 'true' && needs.coordinator.outputs.main_package == 'true'
 
     runs-on: arc-runner-v6e-4
     strategy:
@@ -230,8 +196,8 @@ jobs:
 
   # =============================================== performance-test ===============================================
   performance-test-1-tpu:
-    needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    needs: [coordinator]
+    if: needs.coordinator.outputs.should_run == 'true' && needs.coordinator.outputs.main_package == 'true'
 
     runs-on: arc-runner-v6e-1
     strategy:
@@ -258,8 +224,8 @@ jobs:
           python test/srt/run_suite.py --suite performance-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   performance-test-4-tpu:
-    needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    needs: [coordinator]
+    if: needs.coordinator.outputs.should_run == 'true' && needs.coordinator.outputs.main_package == 'true'
 
     runs-on: arc-runner-v6e-4
     strategy:
@@ -288,8 +254,8 @@ jobs:
 
   # =============================================== kernel-benchmark ===============================================
   pallas-kernel-benchmark:
-    needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.pallas_kernel == 'true'
+    needs: [coordinator]
+    if: needs.coordinator.outputs.should_run == 'true' && needs.coordinator.outputs.pallas_kernel == 'true'
     runs-on: arc-runner-v6e-1
     strategy:
       fail-fast: false
@@ -315,7 +281,7 @@ jobs:
 
   pr-test-finish:
     needs: [
-      check-changes,
+      coordinator,
       performance-test-1-tpu,
       performance-test-4-tpu,
       accurancy-test-1-tpu,
@@ -332,7 +298,7 @@ jobs:
       - name: Check all dependent job statuses
         run: |
           echo "=== Job Results ==="
-          echo "check-changes: ${{ needs.check-changes.result }}"
+          echo "coordinator: ${{ needs.coordinator.result }}"
           echo "unit-test-1-tpu: ${{ needs.unit-test-1-tpu.result }}"
           echo "unit-test-4-tpu: ${{ needs.unit-test-4-tpu.result }}"
           echo "e2e-test-1-tpu: ${{ needs.e2e-test-1-tpu.result }}"
@@ -344,15 +310,15 @@ jobs:
           echo "pallas-kernel-benchmark: ${{ needs.pallas-kernel-benchmark.result }}"
           echo ""
 
-          # check-changes must succeed
-          if [ "${{ needs.check-changes.result }}" != "success" ]; then
-            echo "::error::check-changes did not succeed: ${{ needs.check-changes.result }}"
+          # coordinator must succeed
+          if [ "${{ needs.coordinator.result }}" != "success" ]; then
+            echo "::error::coordinator did not succeed: ${{ needs.coordinator.result }}"
             exit 1
           fi
 
           # If no relevant files changed, all test skips are by-design
-          main_package="${{ needs.check-changes.outputs.main_package }}"
-          pallas_kernel="${{ needs.check-changes.outputs.pallas_kernel }}"
+          main_package="${{ needs.coordinator.outputs.main_package }}"
+          pallas_kernel="${{ needs.coordinator.outputs.pallas_kernel }}"
 
           if [ "$main_package" != "true" ] && [ "$pallas_kernel" != "true" ]; then
             echo "No relevant file changes detected — all test skips are by design"
