@@ -290,6 +290,8 @@ jobs:
                     value: "18080"
                   - name: RESULTS_DIR
                     value: "/observability/${RESULTS_DATE}/${WORKLOAD_NAME}"
+                  - name: TARGET
+                    value: "v6e-4x4"
                   - name: CI_MOUNT_ROOT
                     value: "/models"
                   - name: SGLANG_JAX_MODEL_CACHE

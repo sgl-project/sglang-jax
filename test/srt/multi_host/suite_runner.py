@@ -244,20 +244,34 @@ def get_suites() -> dict[str, MultiHostSuite]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run multi-host SGL-JAX suites")
     parser.add_argument("--suite", choices=sorted(get_suites()))
+    parser.add_argument(
+        "--target",
+        default=os.environ.get("TARGET"),
+        help="Filter suites by launch profile target (e.g. v6e-4x4). Defaults to $TARGET.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
 
-def select_suites(suite_name: str | None) -> list[MultiHostSuite]:
+def select_suites(suite_name: str | None, target: str | None) -> list[MultiHostSuite]:
     suites = get_suites()
     if suite_name is not None:
         return [suites[suite_name]]
+    if target:
+        filtered = [
+            s
+            for s in suites.values()
+            if all(load_profile(r.launch_profile).target == target for r in s.runs)
+        ]
+        if not filtered:
+            raise ValueError(f"No suite matched target={target}")
+        return filtered
     return list(suites.values())
 
 
 def main() -> int:
     args = parse_args()
-    suites = select_suites(args.suite)
+    suites = select_suites(args.suite, args.target)
 
     if args.dry_run:
         print(json.dumps([dry_run_suite(suite) for suite in suites], indent=2, sort_keys=True))
