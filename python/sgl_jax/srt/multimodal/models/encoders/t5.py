@@ -15,7 +15,8 @@ import os
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import NamedSharding, PartitionSpec as P
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from transformers import T5Config
 
 from sgl_jax.srt.configs.model_config import ModelConfig
