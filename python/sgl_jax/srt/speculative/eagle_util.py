@@ -566,53 +566,54 @@ class EagleDraftInput:
         return model_worker_batch, logits_metadata
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
-        # spec_info / allocate_lens are global (flat across DP ranks); aggregate
-        # per-rank seq_lens / req_pool_indices to match (#1053 P1-5b).
-        active = [
-            i for i in schedule_batch.reqs_info if i.seq_lens is not None and len(i.seq_lens) > 0
-        ]
-        seq_lens = np.concatenate([i.seq_lens for i in active])
-        req_pool_indices = np.concatenate([i.req_pool_indices for i in active])
-        new_allocate_lens = seq_lens + self.ALLOC_LEN_PER_DECODE - 1
+        # spec_info / allocate_lens are global (flat across DP ranks). Allocate
+        # per-rank (allocator + swa_mapping are per-dp_rank at dp>1); concat
+        # back to global-flat. (#1053 P1-5b — was dp_rank=0 for all, so rank>0
+        # reqs allocated from rank 0's pool / updated swa_mapping[0].)
         bs = schedule_batch.batch_size()
         assert (
             self.allocate_lens.shape[0] == bs
         ), f" {self.allocate_lens.shape[0]=} but batch_size is {bs} "
         page_size = schedule_batch.token_to_kv_pool_allocator.page_size
-
-        if page_size == 1:
-            num_needed_tokens = (new_allocate_lens - self.allocate_lens).sum().item()
-            out_cache_loc = alloc_token_slots(schedule_batch.tree_cache, num_needed_tokens)
-        else:
-            last_loc = get_last_loc(
-                schedule_batch.req_to_token_pool.req_to_token,
-                req_pool_indices,
-                self.allocate_lens,
+        new_alloc_chunks, ocl_chunks = [], []
+        flat_off = 0
+        for dp_rank, info in enumerate(schedule_batch.reqs_info):
+            if info.seq_lens is None or len(info.seq_lens) == 0:
+                continue
+            bs_r = len(info.seq_lens)
+            seq_r = np.asarray(info.seq_lens)
+            new_r = seq_r + self.ALLOC_LEN_PER_DECODE - 1
+            old_r = self.allocate_lens[flat_off : flat_off + bs_r]
+            ext_r = int((new_r - old_r).sum())
+            if page_size == 1:
+                ocl_r = alloc_token_slots(schedule_batch.tree_cache, ext_r, dp_rank=dp_rank)
+            else:
+                last_loc_r = get_last_loc(
+                    schedule_batch.req_to_token_pool.req_to_token,
+                    info.req_pool_indices,
+                    old_r,
+                )
+                ocl_r = alloc_paged_token_slots_extend(
+                    schedule_batch.tree_cache,
+                    old_r,
+                    new_r,
+                    last_loc_r,
+                    ext_r,
+                    dp_rank=dp_rank,
+                )
+            assign_req_to_token_pool(
+                info.req_pool_indices, schedule_batch.req_to_token_pool, old_r, new_r, ocl_r
             )
-            extend_num_tokens = sum(new_allocate_lens - self.allocate_lens).item()
-            out_cache_loc = alloc_paged_token_slots_extend(
-                schedule_batch.tree_cache,
-                self.allocate_lens,
-                new_allocate_lens,
-                last_loc,
-                extend_num_tokens,
-            )
-
-        assign_req_to_token_pool(
-            req_pool_indices,
-            schedule_batch.req_to_token_pool,
-            self.allocate_lens,
-            new_allocate_lens,
-            out_cache_loc,
-        )
-
-        self.allocate_lens = new_allocate_lens
-
-        # out_cache_loc is global; store on rank 0 (consumed by
-        # _get_spec_decode_mwb_dp). seq_lens_sum stays per-rank.
-        schedule_batch.reqs_info[0].out_cache_loc = out_cache_loc
-        for info in active:
+            new_alloc_chunks.append(new_r)
+            ocl_chunks.append(np.asarray(ocl_r, dtype=np.int32))
+            flat_off += bs_r
             info.seq_lens_sum = np.sum(info.seq_lens).item()
+
+        self.allocate_lens = np.concatenate(new_alloc_chunks)
+        # out_cache_loc global-flat; consumed by _get_spec_decode_mwb_dp.
+        schedule_batch.reqs_info[0].out_cache_loc = (
+            np.concatenate(ocl_chunks) if ocl_chunks else np.empty(0, dtype=np.int32)
+        )
 
     def prepare_for_draft_decode(
         self, model_worker_batch: ModelWorkerBatch, topk: int, num_steps: int
