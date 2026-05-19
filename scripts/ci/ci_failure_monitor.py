@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 EXCLUDED_JOBS = frozenset(
     {
         "check-changes",
+        "coordinator",
+        "decide",
         "pr-test-finish",
         "nightly-test-finish",
         "nightly-test-daily-finish",
@@ -28,30 +30,41 @@ LABEL = "ci-failure"
 
 def gh(*args: str, json_output: bool = False) -> str | dict | list:
     cmd = ["gh"] + list(args)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     if result.returncode != 0:
         print(f"gh command failed: {' '.join(cmd)}", file=sys.stderr)
         print(f"stderr: {result.stderr}", file=sys.stderr)
         raise RuntimeError(f"gh exited {result.returncode}")
     if json_output:
-        return json.loads(result.stdout)
+        text = result.stdout.strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return [json.loads(line) for line in text.splitlines() if line.strip()]
     return result.stdout.strip()
 
 
 def get_failed_jobs(run_id: str, repo: str) -> list[dict]:
-    jobs = gh(
+    response = gh(
         "api",
         f"repos/{repo}/actions/runs/{run_id}/jobs",
         "--paginate",
-        "--jq",
-        ".jobs[]",
         json_output=True,
     )
-    if isinstance(jobs, dict):
-        jobs = [jobs]
+    if isinstance(response, dict):
+        all_jobs = response.get("jobs", [])
+    elif isinstance(response, list):
+        all_jobs = []
+        for item in response:
+            if isinstance(item, dict) and "jobs" in item:
+                all_jobs.extend(item["jobs"])
+            elif isinstance(item, dict):
+                all_jobs.append(item)
+    else:
+        all_jobs = []
 
     failed = []
-    for job in jobs:
+    for job in all_jobs:
         name = job.get("name", "")
         conclusion = job.get("conclusion", "")
         if name in EXCLUDED_JOBS:
@@ -85,7 +98,7 @@ def find_open_issue(repo: str, job_name: str) -> dict | None:
         "--json",
         "number,title",
         "--limit",
-        "5",
+        "20",
         json_output=True,
     )
     if not issues:
