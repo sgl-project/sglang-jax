@@ -949,10 +949,20 @@ class MultimodalTokenizer(TokenizerManager):
                     ) from None
                 continue
 
-            out = state.out_list[-1]
-
+            # Drain in one sync block so a deferred cross-loop set cannot
+            # wake the next wait_for against an empty list. See
+            # ``TokenizerManager._wait_one_response`` for the rationale.
+            out_list = state.out_list
             state.out_list = []
-            if state.finished:
+            finished = state.finished
+            state.event.clear()
+
+            if not out_list:
+                continue
+
+            out = out_list[-1]
+
+            if finished:
                 if self.log_requests:
                     max_length, skip_names, out_skip_names = self.log_request_metadata
                     msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
@@ -968,8 +978,6 @@ class MultimodalTokenizer(TokenizerManager):
 
                 yield out
                 break
-
-            state.event.clear()
 
             if obj.stream:
                 yield out

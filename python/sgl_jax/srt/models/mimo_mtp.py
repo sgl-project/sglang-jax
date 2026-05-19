@@ -251,7 +251,7 @@ class MiMoMTPForCausalLM(nnx.Module):
                 aux_hidden_states=None,
             )
 
-        return output, layers_kv_fused, []
+        return output, {"token_to_kv_pool": layers_kv_fused}, []
 
     def get_embed_and_head(self):
         return (

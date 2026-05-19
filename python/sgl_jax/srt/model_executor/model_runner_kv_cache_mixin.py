@@ -74,34 +74,46 @@ def _split_state_kv_budget(
     return state_max_reqs, kv_budget
 
 
-def _per_req_state_bytes_from_config(linear_attn_config: dict, tp_size: int) -> int:
-    """Per-request recurrent + conv state bytes for a hybrid recurrent model."""
-    from sgl_jax.srt.mem_cache.recurrent_state_pool import _resolve_dtype
+def _linear_state_params_from_config(cfg):
+    params = getattr(cfg, "linear_state_params", None)
+    if params is not None:
+        return params
 
-    temporal_dtype = _resolve_dtype("SGLANG_JAX_RECURRENT_STATE_DTYPE", jnp.float32)
-    conv_dtype = _resolve_dtype("SGLANG_JAX_CONV_STATE_DTYPE", jnp.bfloat16)
-    return _compute_recurrent_per_req_bytes(
-        num_layers=len(linear_attn_config["kda_layers"]),
+    from sgl_jax.srt.mem_cache.recurrent_state_pool import (
+        LinearRecurrentStateParams,
+        recurrent_state_dtype,
+    )
+
+    linear_attn_config = cfg.linear_attn_config
+    return LinearRecurrentStateParams(
+        layers=cfg.linear_layer_ids,
         num_heads=linear_attn_config["num_heads"],
         head_dim=linear_attn_config["head_dim"],
         conv_kernel_size=linear_attn_config["short_conv_kernel_size"],
+        dtype=recurrent_state_dtype(),
+    )
+
+
+def _per_req_state_bytes_from_config(cfg, tp_size: int) -> int:
+    """Per-request recurrent + conv state bytes for a hybrid recurrent model."""
+    state_params = _linear_state_params_from_config(cfg)
+    return _compute_recurrent_per_req_bytes(
+        num_layers=len(state_params.layers),
+        num_heads=state_params.num_heads,
+        head_dim=state_params.head_dim,
+        conv_kernel_size=state_params.conv_kernel_size,
         tp_size=tp_size,
-        temporal_dtype_bytes=jnp.dtype(temporal_dtype).itemsize,
-        conv_dtype_bytes=jnp.dtype(conv_dtype).itemsize,
+        temporal_dtype_bytes=jnp.dtype(state_params.dtype.temporal).itemsize,
+        conv_dtype_bytes=jnp.dtype(state_params.dtype.conv).itemsize,
     )
 
 
 def _enforce_recurrent_state_server_constraints(server_args) -> None:
-    """Assert both disable_radix_cache=True and disable_overlap_schedule=True
-    for hybrid recurrent state models."""
+    """Assert server constraints for hybrid recurrent state models."""
     assert server_args.disable_radix_cache, (
         "Hybrid recurrent state models require --disable-radix-cache "
         "(prefix sharing is unsafe with recurrent state). Please pass "
         "--disable-radix-cache explicitly."
-    )
-    assert server_args.disable_overlap_schedule, (
-        "Hybrid recurrent state models require --disable-overlap-schedule "
-        "(this version does not support double-buffer ping-pong for recurrent state)."
     )
 
 
@@ -131,15 +143,17 @@ def _build_hybrid_pools(
         state_size % dp_size == 0
     ), f"recurrent state_size ({state_size}) must be divisible by dp_size ({dp_size})."
 
-    linear_attn_config = cfg.linear_attn_config
+    state_params = _linear_state_params_from_config(cfg)
     rsp = RecurrentStatePool(
-        linear_recurrent_layer_ids=cfg.linear_layer_ids,
+        linear_recurrent_layer_ids=state_params.layers,
         size=state_size,
-        num_heads=linear_attn_config["num_heads"],
-        head_dim=linear_attn_config["head_dim"],
-        conv_kernel_size=linear_attn_config["short_conv_kernel_size"],
+        num_heads=state_params.num_heads,
+        head_dim=state_params.head_dim,
+        conv_kernel_size=state_params.conv_kernel_size,
         mesh=mesh,
         dp_size=dp_size,
+        temporal_dtype=state_params.dtype.temporal,
+        conv_dtype=state_params.dtype.conv,
     )
     hybrid_pool = HybridReqToTokenPool(
         size=max_num_reqs,
@@ -186,11 +200,15 @@ class ModelRunnerKVCacheMixin:
 
         if self.use_mla_backend and self.server_args.attention_backend == "fa":
             cfg = self.model_config.hf_text_config
-            return (
-                (align128(cfg.kv_lora_rank) + align128(cfg.qk_rope_head_dim))
-                * num_layers
-                * dtype_size
-            )
+            kv_dim = align128(cfg.kv_lora_rank) + align128(cfg.qk_rope_head_dim)
+            # MLA v2 kernel packs page_size up to kv_packing boundary.
+            # With bf16 (packing=2) and page_size=1, each page stores 2
+            # slots but only 1 token of data — must account for the padding.
+            dtype_bits = dtype_size * 8
+            kv_packing = 32 // dtype_bits
+            aligned_ps = (self.page_size + kv_packing - 1) // kv_packing * kv_packing
+            per_token = kv_dim * aligned_ps * dtype_size // self.page_size
+            return per_token * num_layers
 
         return (
             self.model_config.get_num_kv_heads(self.attention_tp_size)
@@ -228,9 +246,7 @@ class ModelRunnerKVCacheMixin:
         cfg = self.linear_recurrent_config
         sa = self.server_args
         dp_size = self.dp_size
-        per_req_state = _per_req_state_bytes_from_config(
-            cfg.linear_attn_config, self.attention_tp_size
-        )
+        per_req_state = _per_req_state_bytes_from_config(cfg, self.attention_tp_size)
 
         if sa.max_recurrent_state_size is not None:
             assert sa.max_recurrent_state_size % dp_size == 0, (
@@ -365,6 +381,42 @@ class ModelRunnerKVCacheMixin:
 
         return max_num_reqs
 
+    def _maybe_wrap_hybrid_kv_pool(
+        self: ModelRunner,
+        token_to_kv_pool_class: type,
+        **kvcache_kwargs,
+    ):
+        """Wrap KV pool with HybridLinearKVPool if has_recurrent_state.
+
+        Args:
+            token_to_kv_pool_class: The inner KV pool class (MHATokenToKVPool or MLATokenToKVPool)
+            **kvcache_kwargs: Additional kwargs for the inner pool (e.g., kv_lora_rank, head_num)
+
+        Returns:
+            HybridLinearKVPool if linear_recurrent_config is set, otherwise the inner pool directly.
+        """
+        if self.linear_recurrent_config is not None:
+            from sgl_jax.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+            return HybridLinearKVPool(
+                size=self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                full_attention_layer_ids=self.linear_recurrent_config.full_attention_layer_ids,
+                mesh=self.mesh,
+                token_to_kv_pool_class=token_to_kv_pool_class,
+                **kvcache_kwargs,
+            )
+
+        return token_to_kv_pool_class(
+            size=self.max_total_num_tokens,
+            page_size=self.page_size,
+            dtype=self.kv_cache_dtype,
+            layer_num=self._kv_pool_layer_count(),
+            mesh=self.mesh,
+            **kvcache_kwargs,
+        )
+
     def _init_pools(self: ModelRunner, max_num_reqs: int, dp_size: int):
         """Create ReqToTokenPool, KV pool, allocator, and MemoryPools."""
         from sgl_jax.srt.mem_cache.allocator import (
@@ -423,27 +475,20 @@ class ModelRunnerKVCacheMixin:
                     "model config; got "
                     f"kv_lora_rank={kv_lora_rank}, qk_rope_head_dim={qk_rope_head_dim}."
                 )
-            self.token_to_kv_pool = MLATokenToKVPool(
-                size=self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
+
+            self.token_to_kv_pool = self._maybe_wrap_hybrid_kv_pool(
+                MLATokenToKVPool,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
-                layer_num=self._kv_pool_layer_count(),
-                mesh=self.mesh,
                 dp_size=dp_size,
             )
         else:
-            self.token_to_kv_pool = MHATokenToKVPool(
-                size=self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
+            self.token_to_kv_pool = self._maybe_wrap_hybrid_kv_pool(
+                MHATokenToKVPool,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(
                     self.attention_tp_size
                 ),
                 head_dim=(self.model_config.head_dim + 127) // 128 * 128,
-                layer_num=self._kv_pool_layer_count(),
-                mesh=self.mesh,
                 dp_size=dp_size,
             )
 
@@ -526,14 +571,32 @@ class ModelRunnerKVCacheMixin:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 self.server_args.max_num_reqs = max_num_reqs
 
-        # 6. Apply constraints (CI, user cap, page align, dp)
+        # 6. Apply constraints (CI, user cap, page align, dp). Draft worker's
+        # pool size is target-derived (must cover target's allocator slot
+        # range), so the user --max-total-tokens cap is not re-applied — it
+        # could otherwise shrink the draft pool below the (post-hybrid) target
+        # range and reintroduce the high-slot garbage this commit fixes.
         self.max_total_num_tokens = self._apply_token_constraints(
-            self.max_total_num_tokens, max_total_tokens, dp_size
+            self.max_total_num_tokens,
+            None if self.is_draft_worker else max_total_tokens,
+            dp_size,
         )
 
         # 7. Hybrid SWA token split (existing logic, not moved)
         if self.is_hybrid:
             self.set_num_token_hybrid()
+            if (
+                not self.is_draft_worker
+                and self.spec_algorithm is not None
+                and not self.spec_algorithm.is_none()
+            ):
+                # Draft shares target's allocator, whose slot range is the
+                # *post-hybrid* full-pool size. The draft_runner_cache_size set
+                # in step 5 was pre-hybrid; without this overwrite, draft's own
+                # KV pool is smaller than the slot range it indexes into, so any
+                # slot >= pre-hybrid size reads/writes garbage (manifests as
+                # accept[1:]=1 for reqs allocated at high slots).
+                self.server_args.draft_runner_cache_size = self.max_total_num_tokens
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
@@ -554,13 +617,23 @@ class ModelRunnerKVCacheMixin:
     # ── Properties ──
 
     @property
-    def linear_recurrent_config(self: ModelRunner):
-        """Return linear recurrent config if the model has linear attention, else None.
+    def kimi_linear_config(self: ModelRunner):
+        from sgl_jax.srt.configs.kimi_linear import get_kimi_linear_config
 
-        Currently returns None unconditionally — KimiLinearConfig detection
-        will be wired up when the modeling layer lands.
-        """
-        return None
+        return get_kimi_linear_config(self.model_config.hf_config)
+
+    @property
+    def lightning_config(self: ModelRunner):
+        from sgl_jax.srt.configs.bailing_hybrid import get_bailing_hybrid_config
+
+        return get_bailing_hybrid_config(self.model_config.hf_config)
+
+    @property
+    def linear_recurrent_config(self: ModelRunner):
+        """Return linear recurrent config if the model has linear attention, else None."""
+        if self.kimi_linear_config is not None:
+            return self.kimi_linear_config
+        return self.lightning_config
 
     def _kv_pool_layer_count(self: ModelRunner):
         """Layer count for KV pool sizing.

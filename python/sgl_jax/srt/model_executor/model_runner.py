@@ -147,9 +147,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         if server_args.enable_lora:
             self.init_lora_manager()
 
+        self._sampler_base_rng = jax.random.PRNGKey(server_args.random_seed)
+        self._sampler_step = 0
         if not self.is_draft_worker:
-            self._sampler_base_rng = jax.random.PRNGKey(server_args.random_seed)
-            self._sampler_step = 0
             self.initialize_jit()
 
         # Init memory pool and attention backends
@@ -306,12 +306,18 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             self.server_args.ep_num_redundant_experts
         )
         self.model_config.hf_config.moe_backend = self.model_config.moe_backend.value
+        self.model_config.hf_config.use_jax_allreduce_metadata = (
+            not self.server_args.disable_jax_allreduce_metadata
+        )
         # Pick MLA forward path at server start. Only `fa` selects absorbed
         # (the MLA Pallas kernel); `fa_mha` and `native` both decompress latent
         # KV via kv_b_proj and run standard attention. Read by
         # DeepseekV3DecoderLayer to construct DeepseekV3Attention; harmless on
         # non-MLA models that ignore the attribute.
         self.model_config.hf_config.use_absorbed_mla = self.server_args.attention_backend == "fa"
+        self.model_config.hf_config.enable_sequence_parallel = (
+            self.server_args.enable_sequence_parallel
+        )
 
         if self.server_args.ep_dispatch_algorithm:
             with jax.set_mesh(self.mesh):
@@ -422,14 +428,13 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         if backend == "native":
             from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 
-            return NativeAttention(self.num_attn_heads, self.num_kv_heads, self.mesh)
+            full_attn_backend = NativeAttention(self.num_attn_heads, self.num_kv_heads, self.mesh)
 
-        # Absorbed MLA is the only branch that does not use FlashAttention.
-        if backend == "fa" and self.use_mla_backend:
+        elif backend == "fa" and self.use_mla_backend:
             from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
 
             cfg = self.model_config.hf_text_config
-            return MLAAttentionBackend(
+            full_attn_backend = MLAAttentionBackend(
                 num_attn_heads=self.num_attn_heads,
                 kv_lora_rank=cfg.kv_lora_rank,
                 qk_nope_head_dim=cfg.qk_nope_head_dim,
@@ -440,30 +445,36 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 attention_data_partition_axis="data",
             )
 
-        if backend not in ("fa", "fa_mha"):
+        elif backend in ("fa", "fa_mha"):
+            from sgl_jax.srt.layers.attention.flashattention_backend import (
+                FlashAttention,
+            )
+
+            if backend == "fa_mha" and self.use_mla_backend:
+                cfg = self.model_config.hf_text_config
+                head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim
+                num_kv_heads = self.num_attn_heads
+            else:
+                head_dim = self.model_config.head_dim
+                num_kv_heads = self.num_kv_heads
+
+            full_attn_backend = FlashAttention(
+                self.num_attn_heads,
+                num_kv_heads,
+                head_dim,
+                page_size=self.page_size,
+                mesh=self.mesh,
+            )
+
+        else:
             raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
 
-        # fa_mha on an MLA model: decompress latent KV via kv_b_proj per-forward
-        # and run standard FlashAttention with per-head K/V (num_kv_heads ==
-        # num_attn_heads). All other (backend, model) combinations use the
-        # model's native MHA/GQA dims.
-        from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
-
-        if backend == "fa_mha" and self.use_mla_backend:
-            cfg = self.model_config.hf_text_config
-            head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim
-            num_kv_heads = self.num_attn_heads
-        else:
-            head_dim = self.model_config.head_dim
-            num_kv_heads = self.num_kv_heads
-
-        return FlashAttention(
-            self.num_attn_heads,
-            num_kv_heads,
-            head_dim,
-            page_size=self.page_size,
-            mesh=self.mesh,
+        # Always go through the wrapper — it's a no-op when no hybrid config is set.
+        from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
+            attn_backend_wrapper,
         )
+
+        return attn_backend_wrapper(self, full_attn_backend)
 
     def _forward(
         self,
@@ -472,30 +483,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
     ):
         cache_miss_count = 0
         import jax._src.test_util as jtu
-
-        for key, value in forward_batch.__dict__.items():
-            if isinstance(value, jax.Array):
-                logger.debug(
-                    "forward_batch %s: shape=%s, sharding=%s, dtype=%s",
-                    key,
-                    value.shape,
-                    value.sharding,
-                    value.dtype,
-                )
-            else:
-                logger.debug("forward_batch %s: %s", key, value)
-
-        for key, value in logits_metadata.__dict__.items():
-            if isinstance(value, jax.Array):
-                logger.debug(
-                    "logits_metadata %s: shape=%s, sharding=%s, dtype=%s",
-                    key,
-                    value.shape,
-                    value.sharding,
-                    value.dtype,
-                )
-            else:
-                logger.debug("logits_metadata %s: %s", key, value)
 
         with jtu.count_pjit_cpp_cache_miss() as count:
             output, pool_updates, _, layers_topk_ids = self.jitted_run_model(

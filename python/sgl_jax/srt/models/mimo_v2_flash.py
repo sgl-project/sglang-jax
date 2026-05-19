@@ -119,6 +119,7 @@ class MiMoV2Moe(nnx.Module):
                 layer_id=layer_id,
                 renormalize_topk_logits=getattr(config, "norm_topk_prob", True),
                 quantization_config=getattr(config, "quantization_config", None),
+                use_jax_allreduce_metadata=getattr(config, "use_jax_allreduce_metadata", True),
             )
         else:
             self.experts = EPMoE(
@@ -816,7 +817,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
 
-        return output, layers_kv_fused, True, layers_topk_ids
+        return output, {"token_to_kv_pool": layers_kv_fused}, True, layers_topk_ids
 
 
 EntryClass = [MiMoV2FlashForCausalLM]

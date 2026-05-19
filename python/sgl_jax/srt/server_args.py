@@ -80,6 +80,7 @@ class ServerArgs:
     ep_size: int = 1
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: str | None = None
+    enable_sequence_parallel: bool = False
     stream_interval: int = 1
     stream_output: bool = False
     random_seed: int | None = None
@@ -135,6 +136,7 @@ class ServerArgs:
     # Kernel backend
     attention_backend: str | None = "fa"
     moe_backend: str = "epmoe"
+    disable_jax_allreduce_metadata: bool = False
 
     grammar_backend: str | None = None
 
@@ -625,6 +627,12 @@ class ServerArgs:
             help="Expert parallel dispatch algorithm.",
         )
         parser.add_argument(
+            "--enable-sequence-parallel",
+            action="store_true",
+            default=ServerArgs.enable_sequence_parallel,
+            help="Enable sequence parallelism.",
+        )
+        parser.add_argument(
             "--stream-interval",
             type=int,
             default=ServerArgs.stream_interval,
@@ -954,6 +962,17 @@ class ServerArgs:
             choices=["epmoe", "fused", "auto"],
             default=ServerArgs.moe_backend,
             help="The backend to use for MoE models.",
+        )
+
+        parser.add_argument(
+            "--disable-jax-allreduce-metadata",
+            action="store_true",
+            default=ServerArgs.disable_jax_allreduce_metadata,
+            help=(
+                "Disable the pure JAX allreduce metadata path for fused EP-MoE; "
+                "fall back to the Pallas DMA-based allgather. "
+                "Default uses JAX path (recommended)."
+            ),
         )
 
         parser.add_argument(

@@ -24,6 +24,11 @@ def run_eval(args):
 
         filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
         eval_obj = MMLUEval(filename, args.num_examples, args.num_threads)
+    elif args.eval_name == "sglang_mmlu":
+        from eval.sglang_mmlu import SglangMMLUEval
+
+        filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
+        eval_obj = SglangMMLUEval(filename, args.num_examples, args.num_threads)
     elif args.eval_name == "math":
         from eval.simple_eval_math import MathEval
 
@@ -52,6 +57,26 @@ def run_eval(args):
         from eval.simple_eval_gsm8k import GSM8KEval
 
         eval_obj = GSM8KEval(args.num_examples, args.num_threads)
+    elif args.eval_name == "aime25":
+        from eval.simple_eval_aime25 import AIME25Eval
+
+        eval_obj = AIME25Eval(args.num_examples, args.num_threads)
+    elif args.eval_name == "aime26":
+        from eval.simple_eval_aime26 import AIME26Eval
+
+        eval_obj = AIME26Eval(args.num_examples, args.num_threads)
+    elif args.eval_name == "csimpleqa":
+        from eval.simple_eval_csimpleqa import ChineseSimpleQAEval
+
+        # Self-grading: same served endpoint, deterministic, only one of A/B/C
+        # is needed so an 8-token cap is more than enough.
+        grader = ChatCompletionSampler(
+            base_url=base_url,
+            model=args.model,
+            temperature=0.0,
+            max_tokens=8,
+        )
+        eval_obj = ChineseSimpleQAEval(grader, args.num_examples, args.num_threads)
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 

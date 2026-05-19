@@ -141,6 +141,9 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTPForCausalLM"
+
+        if is_draft_model and self.hf_config.architectures[0] == "MiMoV2ForCausalLM":
+            self.hf_config.architectures[0] = "MiMoV2MTPForCausalLM"
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
         self.is_multimodal = False
@@ -172,8 +175,10 @@ class ModelConfig:
             "head_dim",
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
         )
+
         self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", self.head_dim)
         self.attention_arch = AttentionArch.MHA
+
         self._apply_model_specific_config()
         self.num_attention_heads = self.hf_text_config.num_attention_heads
         self.num_key_value_heads = getattr(self.hf_text_config, "num_key_value_heads", None)
@@ -278,10 +283,6 @@ class ModelConfig:
                         "Creating QuantizationConfig for static fp8."
                     )
 
-                    # Determine activation quantization from config
-                    activation_dtype_str = None
-                    moe_activation_dtype_jax = None
-
                     def is_dynamic_fp8_act(cfg):
                         if not cfg:
                             return False
@@ -311,10 +312,54 @@ class ModelConfig:
                                     break
 
                     if found_act_config:
-                        activation_dtype_str = "float8_e4m3fn"
-                        moe_activation_dtype_jax = jnp.float8_e4m3fn
+                        # Align with sglang `CompressedTensorsW8A16Fp8`: log the
+                        # checkpoint's dynamic activation config but skip enabling
+                        # it — we run weight-only FP8 (BF16 activations).
                         logger.info(
-                            "Enabling dynamic activation quantization (float8_e4m3fn) based on config."
+                            "Detected dynamic per-token FP8 activation in checkpoint, "
+                            "but using weight-only mode (W8A16) for this run"
+                        )
+
+                    # Detect weight strategy from config_groups (per-channel vs block).
+                    # Ling-2.6-1T uses strategy="channel" → weight_block_size=None.
+                    weight_strategy = None
+                    weight_block_size = None
+                    if "config_groups" in hf_quant_config and isinstance(
+                        hf_quant_config["config_groups"], dict
+                    ):
+                        for group in hf_quant_config["config_groups"].values():
+                            weights_cfg = group.get("weights") if isinstance(group, dict) else None
+                            if not weights_cfg:
+                                continue
+                            weight_strategy = weights_cfg.get("strategy")
+                            block_structure = weights_cfg.get("block_structure")
+                            if (
+                                weight_strategy == "block"
+                                and isinstance(block_structure, (list, tuple))
+                                and len(block_structure) == 2
+                            ):
+                                weight_block_size = (
+                                    int(block_structure[0]),
+                                    int(block_structure[1]),
+                                )
+                            break
+                    logger.info(
+                        "Compressed-tensors weight strategy=%s, weight_block_size=%s",
+                        weight_strategy,
+                        weight_block_size,
+                    )
+                    if weight_strategy not in (None, "channel", "block", "tensor"):
+                        raise NotImplementedError(
+                            f"Unsupported compressed-tensors weight strategy: "
+                            f"{weight_strategy!r}"
+                        )
+
+                    # Read ignore list (e.g. router gates, lm_head, MTP layer).
+                    ignored_layers = hf_quant_config.get("ignore") or []
+                    if ignored_layers:
+                        logger.info(
+                            "Loaded %d ignored layer entries from compressed-tensors config",
+                            len(ignored_layers),
                         )
 
                     quant_config = QuantizationConfig(
@@ -323,11 +368,13 @@ class ModelConfig:
                             {
                                 "module_path": ".*",
                                 "weight_dtype": "float8_e4m3fn",
-                                "activation_dtype": activation_dtype_str,
+                                "activation_dtype": None,
                             }
                         ],
                         moe_weight_dtype=jnp.float8_e4m3fn,
-                        moe_activation_dtype=moe_activation_dtype_jax,
+                        moe_activation_dtype=None,
+                        ignored_layers=list(ignored_layers),
+                        weight_block_size=weight_block_size,
                     )
                     return quant_config
                 else:

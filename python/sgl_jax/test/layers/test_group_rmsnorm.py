@@ -1,5 +1,9 @@
+import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
+from jax.sharding import AxisType, Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.fla.group_rmsnorm import GroupRMSNorm
 
@@ -39,17 +43,42 @@ def _make_weight(rng, hidden_size=HIDDEN_SIZE):
     return rng.standard_normal(hidden_size).astype(np.float32)
 
 
+def _make_mesh(num_groups=NUM_GROUPS):
+    devices = np.array(jax.devices())
+    if devices.size < num_groups:
+        pytest.skip(
+            f"GroupRMSNorm sharded test requires at least {num_groups} devices, got {devices.size}"
+        )
+    return Mesh(
+        devices[:num_groups].reshape(1, num_groups),
+        axis_names=("data", "tensor"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+
+
 def _make_jax_model(hidden_size=HIDDEN_SIZE, num_groups=NUM_GROUPS, weight=None):
     """Create a JAX GroupRMSNorm model, optionally with custom weight."""
-    model = GroupRMSNorm(hidden_size, num_groups=num_groups, epsilon=EPSILON)
+    mesh = _make_mesh(num_groups)
+    with jax.set_mesh(mesh):
+        model = GroupRMSNorm(
+            hidden_size,
+            num_groups=num_groups,
+            epsilon=EPSILON,
+            kernel_axes=("tensor",),
+            mesh=mesh,
+        )
     if weight is not None:
-        model.weight[...] = jnp.array(weight)
+        model.weight[...] = jax.device_put(
+            jnp.array(weight),
+            NamedSharding(mesh, P("tensor")),
+        )
     return model
 
 
 def _run_jax(model, input_np, dtype=jnp.float32):
     """Run JAX model and return numpy array."""
-    return np.array(model(jnp.array(input_np, dtype=dtype)))
+    with jax.set_mesh(model.mesh):
+        return np.array(model(jnp.array(input_np, dtype=dtype)))
 
 
 class TestGroupRMSNorm:
@@ -58,10 +87,10 @@ class TestGroupRMSNorm:
     def test_output_shape_matches_input(self):
         """Output shape must match input shape."""
         rng = np.random.default_rng(SEED)
-        input_data = jnp.array(_make_input(rng, (BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE)))
+        input_data = _make_input(rng, (BATCH_SIZE * SEQ_LEN, HIDDEN_SIZE))
 
         model = _make_jax_model()
-        output = model(input_data)
+        output = _run_jax(model, input_data)
 
         assert output.shape == input_data.shape
 
@@ -69,7 +98,7 @@ class TestGroupRMSNorm:
         """Modifying one group must not affect other groups' outputs."""
         rng = np.random.default_rng(SEED)
 
-        input_original = _make_input(rng, (1, 1, HIDDEN_SIZE))
+        input_original = _make_input(rng, (1, HIDDEN_SIZE))
         input_modified = input_original.copy()
         input_modified[..., :GROUP_SIZE] = _make_input(rng, (GROUP_SIZE,))  # perturb group 0 only
 
@@ -93,7 +122,7 @@ class TestGroupRMSNorm:
     def test_weight_participates_in_computation(self):
         """Weight parameter must participate in computation correctly."""
         rng = np.random.default_rng(SEED)
-        input_data = _make_input(rng, (BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE))
+        input_data = _make_input(rng, (BATCH_SIZE * SEQ_LEN, HIDDEN_SIZE))
         weight = _make_weight(rng)
 
         model = _make_jax_model(weight=weight)
@@ -101,3 +130,23 @@ class TestGroupRMSNorm:
         expected = _numpy_group_rmsnorm_fp64(input_data, weight, NUM_GROUPS, EPSILON)
 
         np.testing.assert_allclose(jax_output, expected, rtol=FP32_RTOL, atol=FP32_ATOL)
+
+    def test_rejects_tp_smaller_than_num_groups(self):
+        """Tensor parallelism must be at least the number of RMS groups."""
+        mesh = Mesh(
+            np.array(jax.devices()[:1]).reshape(1, 1),
+            axis_names=("data", "tensor"),
+            axis_types=(AxisType.Explicit, AxisType.Explicit),
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="tensor parallel size.*num_groups",
+        ):
+            GroupRMSNorm(
+                HIDDEN_SIZE,
+                num_groups=NUM_GROUPS,
+                epsilon=EPSILON,
+                kernel_axes=("tensor",),
+                mesh=mesh,
+            )

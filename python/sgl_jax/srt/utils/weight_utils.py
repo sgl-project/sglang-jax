@@ -800,6 +800,14 @@ class WeightLoader:
         param_shape = model_param.value.shape
         num_experts = param_shape[0]
 
+        # Compressed-tensors per-channel checkpoints (e.g. Ling-2.6-1T) emit
+        # each expert's scale as ``[out_dim, 1]``; after stacking they show up
+        # here as ``[E, out_dim, 1]``. The kernel still wants
+        # ``[E, 1, 1, out_dim]`` (k_blocks=1), so squeeze the trailing 1 first
+        # and let the per-channel path below handle the 4D promotion.
+        if weight.ndim == 3 and weight.shape[0] == num_experts and weight.shape[-1] == 1:
+            weight = jnp.squeeze(weight, axis=-1)
+
         # --- FusedEPMoE legacy 2D block-wise placeholder ---
         # Older placeholders may use (E, K_groups, N_groups, 1).
         if param_shape[3] == 1 and param_shape[2] > 1 and weight.ndim == 3:
@@ -910,6 +918,19 @@ class WeightLoader:
         """Expand 2D block-quant scale [out_blocks, in_blocks] to 3D [in_blocks, 1, n_out] at load time."""
         if not target_path.endswith("weight_scale"):
             return weight
+
+        # Per-channel compressed-tensors checkpoints (e.g. Ling-2.6-1T) ship the
+        # weight scale as a 2D ``[out_dim, 1]`` tensor while the model placeholder
+        # is a 1D ``[out_dim]``. Squeeze the trailing singleton so the shapes
+        # line up — this is the per-channel sibling of the block-quant expand
+        # path below.
+        if (
+            weight.ndim == 2
+            and weight.shape[-1] == 1
+            and model_param.value.ndim == 1
+            and model_param.value.shape[0] == weight.shape[0]
+        ):
+            return jnp.squeeze(weight, axis=-1)
 
         # Only convert when checkpoint has 2D scale and model expects 3D.
         if weight.ndim != 2 or model_param.value.ndim != 3:

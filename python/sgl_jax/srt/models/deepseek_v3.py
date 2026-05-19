@@ -124,6 +124,7 @@ class DeepseekV3Attention(nnx.Module):
         max_position_embeddings: int = 163840,
         dtype: jnp.dtype = jnp.bfloat16,
         use_absorbed: bool = True,
+        skip_rope: bool = False,
     ):
         super().__init__()
         self.mesh = mesh
@@ -196,15 +197,18 @@ class DeepseekV3Attention(nnx.Module):
             scope_name="o_proj",
         )
 
-        self.rotary_emb = get_rope(
-            head_size=qk_rope_head_dim,
-            rotary_dim=qk_rope_head_dim,
-            max_position=max_position_embeddings,
-            base=int(rope_theta),
-            is_neox_style=not rope_interleave,
-            rope_scaling=rope_scaling,
-            dtype=dtype,
-        )
+        if not skip_rope:
+            self.rotary_emb = get_rope(
+                head_size=qk_rope_head_dim,
+                rotary_dim=qk_rope_head_dim,
+                max_position=max_position_embeddings,
+                base=int(rope_theta),
+                is_neox_style=not rope_interleave,
+                rope_scaling=rope_scaling,
+                dtype=dtype,
+            )
+        else:
+            self.rotary_emb = None
 
         self.attn_mqa = RadixAttention(
             num_heads=num_heads,
@@ -280,7 +284,8 @@ class DeepseekV3Attention(nnx.Module):
         compressed = self.kv_a_layernorm(compressed)
 
         k_rope = k_rope_raw.reshape(-1, 1, self.qk_rope_head_dim)
-        q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+        if self.rotary_emb is not None:
+            q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
 
         if self.use_absorbed:
             attn_output, kv_fused = self._forward_mqa(
@@ -305,7 +310,25 @@ class DeepseekV3Attention(nnx.Module):
         """
         if not self.use_absorbed:
             return
-        w_kv = self.kv_b_proj.weight.value.reshape(
+        if hasattr(self.kv_b_proj, "weight"):
+            # Non-quantized LinearBase: weight is [kv_lora_rank, n_h * (qk_nope+v)]
+            raw_weight = self.kv_b_proj.weight.value
+        else:
+            # QuantizedLinear: weight_q is [n_h * (qk_nope+v), kv_lora_rank] (transposed).
+            wq = self.kv_b_proj.weight_q.value  # [out, in]
+            ws = self.kv_b_proj.weight_scale.value
+            wq_f32 = wq.T.astype(jnp.float32)  # [in, out]
+            if ws.ndim == 3:
+                # Block-wise: [in_blocks, 1, out] → dequantize block by block
+                in_blocks, _, n_out = ws.shape
+                block_k = wq.shape[1] // in_blocks
+                wq_f32 = wq_f32.reshape(in_blocks, block_k, n_out)
+                wq_f32 = (wq_f32 * ws.astype(jnp.float32)).reshape(in_blocks * block_k, n_out)
+            else:
+                # Per-channel: [out]
+                wq_f32 = wq_f32 * ws.astype(jnp.float32)[None, :]
+            raw_weight = wq_f32.astype(jnp.bfloat16)
+        w_kv = raw_weight.reshape(
             self.kv_lora_rank,
             self.num_heads,
             self.qk_nope_head_dim + self.v_head_dim,
@@ -725,7 +748,7 @@ class DeepseekV3ForCausalLM(nnx.Module):
         kv_pool = memory_pools.token_to_kv_pool
         hidden_states, layers_kv_fused, layers_topk_ids = self.model(forward_batch, kv_pool)
         output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
-        return output, layers_kv_fused, True, layers_topk_ids
+        return output, {"token_to_kv_pool": layers_kv_fused}, True, layers_topk_ids
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
