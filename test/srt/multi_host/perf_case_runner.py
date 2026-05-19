@@ -40,15 +40,12 @@ def run_perf_case(case: PerfCase, profile: LaunchProfile) -> None:
     )
     metrics = run_benchmark(args)
 
-    # bench_serving returns scalar metrics + per-request lists (ttfts/itls/
-    # generated_texts/errors). The lists can be megabytes; keep only scalars
-    # for the summary going to GCS.
     summary = {
         "type": "perf",
         "case": case.name,
         "profile": profile.name,
         "target": profile.target,
-        **{k: v for k, v in metrics.items() if not isinstance(v, (list, dict))},
+        **metrics,
     }
     # default=float handles numpy scalars returned by bench_serving.
     summary_json = json.dumps(summary, indent=2, sort_keys=True, default=float)
