@@ -1,0 +1,25 @@
+name: 'Setup Python venv'
+description: 'Create Python 3.12 venv, install uv and project dependencies'
+inputs:
+  extra-packages:
+    description: 'Space-separated list of extra pip packages to install (e.g. "evalscope==1.0.0")'
+    required: false
+    default: ''
+runs:
+  using: "composite"
+  steps:
+    - name: Create venv and install dependencies
+      shell: bash
+      run: |
+        python3.12 -m venv .venv
+        source .venv/bin/activate
+        pip install uv
+        uv pip install -e "python[all]"
+        if [ -n "${{ inputs.extra-packages }}" ]; then
+          for pkg in ${{ inputs.extra-packages }}; do
+            uv pip install "$pkg"
+          done
+        fi
+    - name: Add venv to PATH
+      shell: bash
+      run: echo "${{ github.workspace }}/.venv/bin" >> $GITHUB_PATH

@@ -27,18 +27,16 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+        with:
+          extra-packages: 'evalscope==1.0.0'
       - name: Run eval test for text models
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
         timeout-minutes: 1000
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
-          uv pip install evalscope==1.0.0
-
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
           export BENCH_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/benchmark/$OUTPUT_DIR_NAME"
           echo "BENCH_OUTPUT_DIR=$BENCH_OUTPUT_DIR" >> $GITHUB_ENV
@@ -90,19 +88,16 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+        with:
+          extra-packages: 'evalscope==1.0.0'
       - name: Run eval test for text models
         env:
             HF_TOKEN: ${{ secrets.HF_TOKEN }}
             HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
         timeout-minutes: 1200
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
-          uv pip install evalscope==1.0.0
-
-
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
           export BENCH_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/benchmark/$OUTPUT_DIR_NAME"
           echo "BENCH_OUTPUT_DIR=$BENCH_OUTPUT_DIR" >> $GITHUB_ENV
@@ -132,6 +127,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Run performance test for text models
         timeout-minutes: 840
         env:
@@ -141,11 +138,6 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
-
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
           export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/perf/$OUTPUT_DIR_NAME"
           echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
@@ -176,6 +168,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Run performance test for text models
         timeout-minutes: 430
         env:
@@ -185,11 +179,6 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
-
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
           export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/perf/$OUTPUT_DIR_NAME"
           echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
@@ -241,6 +230,8 @@ jobs:
         - name: Checkout code
           uses: actions/checkout@v4
 
+        - name: Setup Python environment
+          uses: ./.github/actions/setup-venv
         - name: Run performance test for text models
           timeout-minutes: 390
           env:
@@ -250,11 +241,6 @@ jobs:
             HF_TOKEN: ${{ secrets.HF_TOKEN }}
             HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
           run: |
-            python3.12 -m venv .venv
-            source .venv/bin/activate
-            pip install uv
-            uv pip install -e "python[all]"
-
             export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
             export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/perf/$OUTPUT_DIR_NAME"
             echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
@@ -284,6 +270,8 @@ jobs:
           - name: Checkout code
             uses: actions/checkout@v4
 
+          - name: Setup Python environment
+            uses: ./.github/actions/setup-venv
           - name: Run performance test for text models
             timeout-minutes: 400
             env:
@@ -293,11 +281,6 @@ jobs:
               HF_TOKEN: ${{ secrets.HF_TOKEN }}
               HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
             run: |
-              python3.12 -m venv .venv
-              source .venv/bin/activate
-              pip install uv
-              uv pip install -e "python[all]"
-
               export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
               export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/perf/$OUTPUT_DIR_NAME"
               echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
@@ -330,6 +313,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Run performance test for text models
         timeout-minutes: 120
         env:
@@ -339,11 +324,6 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
-
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
           export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/trace/$OUTPUT_DIR_NAME"
           echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
@@ -373,6 +353,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Run performance test trace for text models
         timeout-minutes: 365
         env:
@@ -382,11 +364,6 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
-
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
           export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/trace/$OUTPUT_DIR_NAME"
           echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
@@ -416,6 +393,8 @@ jobs:
         - name: Checkout code
           uses: actions/checkout@v4
 
+        - name: Setup Python environment
+          uses: ./.github/actions/setup-venv
         - name: Run performance test trace for text models
           timeout-minutes: 230
           env:
@@ -425,11 +404,6 @@ jobs:
             HF_TOKEN: ${{ secrets.HF_TOKEN }}
             HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
           run: |
-            python3.12 -m venv .venv
-            source .venv/bin/activate
-            pip install uv
-            uv pip install -e "python[all]"
-
             export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
             export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/trace/$OUTPUT_DIR_NAME"
             echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV

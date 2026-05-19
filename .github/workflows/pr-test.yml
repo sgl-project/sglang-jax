@@ -79,6 +79,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Run unit test
         timeout-minutes: 60
         shell: bash
@@ -86,10 +88,6 @@ jobs:
           SGLANG_JAX_IS_IN_CI: true
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
           python test/srt/run_suite.py --suite unit-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
   unit-test-4-tpu:
@@ -103,16 +101,14 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Run unit test
         timeout-minutes: 30
         env:
           SGLANG_JAX_IS_IN_CI: true
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite unit-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
@@ -128,6 +124,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Run e2e test
         timeout-minutes: 120
         shell: bash
@@ -137,10 +135,6 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite e2e-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
@@ -156,6 +150,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Run e2e test
         timeout-minutes: 120
         shell: bash
@@ -165,10 +161,6 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite e2e-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
@@ -185,6 +177,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Evaluate accuracy
         timeout-minutes: 20
         env:
@@ -193,10 +187,6 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
@@ -213,6 +203,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Evaluate MoE accuracy (TP=4)
         timeout-minutes: 50
         env:
@@ -221,10 +213,6 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-4 --timeout-per-file 3000 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
@@ -242,6 +230,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Benchmark performance
         timeout-minutes: 30
         env:
@@ -250,10 +240,6 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite performance-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
@@ -270,6 +256,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Benchmark performance (tp=4)
         timeout-minutes: 50
 
@@ -279,10 +267,6 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite performance-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3000
 
@@ -298,6 +282,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Run test
         timeout-minutes: 120
         shell: bash
@@ -307,10 +293,6 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
           python test/srt/run_suite.py --suite kernel-performance-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   pr-test-finish:
