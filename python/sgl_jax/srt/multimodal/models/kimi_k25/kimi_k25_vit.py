@@ -67,16 +67,17 @@ class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
         num_frames: int,
         dim: int,
         interpolation_mode: str = "bicubic",
+        rngs: nnx.Rngs = None,
     ) -> None:
         self.height = height
         self.width = width
         self.num_frames = num_frames
         self.dim = dim
         self.interpolation_mode = interpolation_mode
-        self.weight = nn.params(
-            'weight',
-            nn.initializers.normal(stddev=1.0),
-            (height, width, dim)
+
+        _rngs = rngs or nnx.Rngs(0) 
+        self.weight = nnx.Param(
+            nnx.initializers.normal()(_rngs.params(), (height, width, dim))
         )
 
     def __call__(
@@ -90,8 +91,7 @@ class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
             assert t <= self.num_frames, f"t:{t} > self.num_frames:{self.num_frames}"
             if (h, w) == self.weight.shape[:-1]:
                 pos_emb_2d = self.weight.flatten(end_dim=1)
-            else:
-                # TODO: Implement interpolation mode
+            # TODO: Implement interpolation mode
 
             if t == 1:
                 pos_emb_3d = pos_emb_2d
@@ -112,7 +112,7 @@ class Rope2DPosEmbRepeated(nnx.Module):
         dim: int,
         max_height: int,
         max_width: int,
-        theta_base: int,
+        theta_base: int = 10000, # Verify this value with config
     ):
         self.dim = dim
         assert self.dim % 4 == 0, "dim must be divisible by 4"
@@ -227,8 +227,8 @@ class KimiK25VisionAttention(nnx.Module):
         _rngs = rngs or nnx.Rngs(0)
 
         self.qkv_proj = nnx.Linear(
-            self.vt_hidden_size,
-            3 * self.vt_hidden_size,
+            config.vt_hidden_size,
+            3 * config.vt_hidden_size,
             use_bias=True,
             param_dtype=dtype,
             rngs=_rngs,
@@ -344,10 +344,10 @@ class VisionTowerEncoder(nnx.Module):
         self,
         config: KimiK25ModelVitConfig,
         dtype: jnp.dtype,
-        video_attn_type: str = "spatial_temporal",
         mesh: Mesh = None,
         norm_eps: float = 1e-6,
         rngs: nnx.Rngs = None,
+        video_attn_type: str = "spatial_temporal",
     ):
         self.config = config
         self.dtype = dtype
@@ -428,7 +428,7 @@ class VisionTower(nnx.Module):
 
         self.encoder = VisionTowerEncoder(config, dtype, mesh, norm_eps, rngs)
 
-    def __call(
+    def __call__(
         self,
         pixel_values: jax.Array,
         grid_thws: jax.Array,
