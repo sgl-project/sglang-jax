@@ -12,6 +12,7 @@ on:
       - "test/**"
       - "benchmark/kernels/**"
       - ".github/workflows/pr-test.yml"
+      - ".github/actions/**"
   pull_request:
     branches:
       - main
@@ -23,6 +24,7 @@ on:
       - "test/**"
       - "benchmark/kernels/**"
       - ".github/workflows/pr-test.yml"
+      - ".github/actions/**"
 
 concurrency:
   group: pr-test-${{ github.ref }}
