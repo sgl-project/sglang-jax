@@ -33,6 +33,7 @@ on:
       should_run:
         description: "Should any tests run (not draft AND has relevant changes)"
         value: ${{ jobs.decide.outputs.should_run }}
+  workflow_dispatch:
 
 jobs:
   decide:
@@ -70,12 +71,15 @@ jobs:
 
       - name: Detect PR metadata
         id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_BASE_REPO: ${{ github.event.pull_request.base.repo.full_name }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            is_draft="${{ github.event.pull_request.draft }}"
-            head_repo="${{ github.event.pull_request.head.repo.full_name }}"
-            base_repo="${{ github.event.pull_request.base.repo.full_name }}"
-            if [ "$head_repo" != "$base_repo" ]; then
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            is_draft="$PR_DRAFT"
+            if [ "$PR_HEAD_REPO" != "$PR_BASE_REPO" ]; then
               is_fork="true"
             else
               is_fork="false"
@@ -89,6 +93,9 @@ jobs:
 
       - name: Detect labels and commit message
         id: labels
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: |
           run_full="false"
           requires_4tpu="false"
@@ -96,21 +103,20 @@ jobs:
           run_perf_trace="false"
           run_accuracy_extra="false"
 
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            LABELS='${{ toJSON(github.event.pull_request.labels.*.name) }}'
-            if echo "$LABELS" | grep -q '"test:full"'; then
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if echo "$PR_LABELS" | grep -q '"test:full"'; then
               run_full="true"
             fi
-            if echo "$LABELS" | grep -q '"test:multi-chip"'; then
+            if echo "$PR_LABELS" | grep -q '"test:multi-chip"'; then
               requires_4tpu="true"
             fi
-            if echo "$LABELS" | grep -q '"test:perf"'; then
+            if echo "$PR_LABELS" | grep -q '"test:perf"'; then
               run_perf="true"
             fi
-            if echo "$LABELS" | grep -q '"test:perf-trace"'; then
+            if echo "$PR_LABELS" | grep -q '"test:perf-trace"'; then
               run_perf_trace="true"
             fi
-            if echo "$LABELS" | grep -q '"test:accuracy-extra"'; then
+            if echo "$PR_LABELS" | grep -q '"test:accuracy-extra"'; then
               run_accuracy_extra="true"
             fi
           fi
