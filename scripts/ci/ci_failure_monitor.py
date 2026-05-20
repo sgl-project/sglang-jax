@@ -9,7 +9,6 @@ run-level, since continue-on-error masks failures) and manages issues:
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
