@@ -1,7 +1,11 @@
 import unittest
 
+import pytest
+
 from sgl_jax.srt.reasoning_parser import ReasoningParser
 from sgl_jax.test.test_utils import CustomTestCase
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestReasoningParserGlm(CustomTestCase):

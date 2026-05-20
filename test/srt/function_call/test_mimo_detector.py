@@ -6,9 +6,13 @@ Run with:
 
 import json
 
+import pytest
+
 from sgl_jax.srt.entrypoints.openai.protocol import Function, Tool
 from sgl_jax.srt.function_call.mimo_detector import MiMoDetector
 from sgl_jax.test.test_utils import CustomTestCase
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _tool(name: str, properties: dict | None = None) -> Tool:

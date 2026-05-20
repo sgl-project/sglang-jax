@@ -1,7 +1,11 @@
 import unittest
 from unittest.mock import patch
 
+import pytest
+
 from sgl_jax.srt.utils.parallel_utils import should_scatter
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestShouldScatter(unittest.TestCase):

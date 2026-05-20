@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from sgl_jax.srt.configs import ForwardMode
 from sgl_jax.srt.constrained.jump_forward import JumpForwardMap
@@ -13,6 +14,8 @@ from sgl_jax.srt.managers.schedule_batch import (
     find_padding_size,
 )
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestScheduleBatchDPMerging(unittest.TestCase):
