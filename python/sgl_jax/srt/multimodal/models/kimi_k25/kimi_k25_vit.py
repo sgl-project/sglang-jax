@@ -41,7 +41,7 @@ def tpool_patch_merger(
         kernel_height, kernel_width = merge_kernel_size
         new_height, new_width = h // kernel_height, w // kernel_width
 
-        reshaped_seq = seq.view(
+        reshaped_seq = seq.reshape(
             t, new_height, kernel_height, new_width, kernel_width, d_model
         )
 
@@ -49,7 +49,7 @@ def tpool_patch_merger(
             reshared_seq.permute(0, 1, 3, 2, 4, 5).contiguous().mean(axis=0)
         )
 
-        padded_seq = reshared_seq.view(
+        padded_seq = reshared_seq.reshape(
             new_height * new_width, kernel_height * kernel_width, -1
         )
 
