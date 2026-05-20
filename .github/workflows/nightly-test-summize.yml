@@ -16,6 +16,7 @@ concurrency:
 
 permissions:
   contents: write
+  issues: write
 
 jobs:
   generate-summary:
@@ -125,3 +126,19 @@ jobs:
           name: trend-charts
           path: summary_images/
           retention-days: 7
+
+      - name: Check Trend Thresholds
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          source .venv/bin/activate
+          for metric in gsm8k in_tps out_tps ttft_ms itl_ms; do
+            echo "Checking metric: $metric"
+            python scripts/ci/check_trend_threshold.py \
+              --metric "$metric" \
+              --window 5 \
+              --threshold-pct 10 \
+              --token "$GITHUB_TOKEN" || true
+          done
