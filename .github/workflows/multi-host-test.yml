@@ -69,7 +69,7 @@ jobs:
       NODE_POOL: ${{ inputs.node_pool || vars.GKE_NODE_POOL || 'v6e-4x4-on-demand-np' }}
       NAMESPACE: ${{ inputs.namespace || 'default' }}
       BUCKET_NAME: ${{ inputs.bucket_name || 'model-storage-sglang' }}
-      K8S_SERVICE_ACCOUNT: ${{ inputs.service_account_name || 'gcs-account' }}
+      K8S_SERVICE_ACCOUNT: ${{ inputs.service_account_name || vars.GKE_SERVICE_ACCOUNT || 'default' }}
       REPO_REF: ${{ inputs.repo_ref || github.sha }}
       WORKLOAD_NAME: gke-run-test-caces-${{ github.run_id }}
     steps:
