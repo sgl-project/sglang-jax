@@ -94,16 +94,6 @@ exclude = [
     "tests*",
 ]
 
-[tool.pytest.ini_options]
-markers = [
-    "cpu_only: test runs only on CPU, no TPU/GPU hardware required",
-    "tpu_only: test requires TPU hardware",
-    "slow: test takes a long time to run",
-]
-addopts = [
-    "--strict-markers",
-]
-
 [tool.black]
 line-length = 100
 

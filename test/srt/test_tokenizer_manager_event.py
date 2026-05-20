@@ -4,11 +4,7 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 
-import pytest
-
 from sgl_jax.srt.managers.tokenizer_manager import ReqState, TokenizerManager
-
-pytestmark = pytest.mark.cpu_only
 
 
 def _make_state(loop):
