@@ -190,7 +190,8 @@ class EagleDraftWorker(BaseDraftWorker):
         hidden_states: jax.Array,
         next_token_ids: jax.Array,
     ) -> None:
-        verified_id_np = np.asarray(jax.device_get(next_token_ids))[: model_worker_batch.real_bs]
+        sel = np.asarray(model_worker_batch.logits_indices_selector)
+        verified_id_np = np.asarray(jax.device_get(next_token_ids))[sel]
         model_worker_batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=verified_id_np,
@@ -218,15 +219,15 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            : model_worker_batch.real_bs, :
-        ]
-        if len(logits_output.hidden_states.shape) == 1:
-            logits_output.hidden_states = jnp.expand_dims(logits_output.hidden_states, axis=0)
+        rep_logits, rep_hidden = replicate_to_mesh(
+            self.mesh, logits_output.next_token_logits, logits_output.hidden_states
+        )
+        logits_output.next_token_logits = rep_logits[sel, :]
+        if len(rep_hidden.shape) == 1:
+            rep_hidden = jnp.expand_dims(rep_hidden, axis=0)
+        logits_output.hidden_states = rep_hidden[sel]
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
-        forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens[
-            : model_worker_batch.real_bs
-        ]
+        forward_batch.spec_info.allocate_lens = np.asarray(model_worker_batch.seq_lens)[sel]
 
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
@@ -253,16 +254,15 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch,
             logits_metadata=logits_metadata,
         )
-        select_index = (
-            np.arange(len(model_worker_batch.seq_lens[: model_worker_batch.real_bs]))
-            * (self.speculative_num_steps + 1)
-            + batch_output.accept_lens[: model_worker_batch.real_bs]
-            - 1
-        )
+        sel = np.asarray(model_worker_batch.logits_indices_selector)
+        accept_host = np.asarray(jax.device_get(batch_output.accept_lens))
+        select_index = sel * (self.speculative_num_steps + 1) + accept_host[sel] - 1
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, draft_logits_output.next_token_logits, draft_logits_output.hidden_states
         )
-        draft_logits_output.next_token_logits = rep_logits[select_index]
+        # next_token_logits is pruned to (total_bs, vocab); hidden_states is FULL
+        # (total_bs*(steps+1), H). Index logits by slot, hidden by token.
+        draft_logits_output.next_token_logits = rep_logits[sel]
         draft_logits_output.hidden_states = rep_hidden[select_index]
         topk_p, topk_index = topk_probs_from_logits(
             draft_logits_output.next_token_logits, self.topk
@@ -275,7 +275,7 @@ class EagleDraftWorker(BaseDraftWorker):
             select_index
         ]
         batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
-        batch_output.accept_lens = batch_output.accept_lens[: model_worker_batch.real_bs]
+        batch_output.accept_lens = accept_host
 
     # -- Internal draft helpers --
 
@@ -288,7 +288,12 @@ class EagleDraftWorker(BaseDraftWorker):
         draft_input.hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
 
     def padding_for_decode(self, model_worker_batch: ModelWorkerBatch):
-        _, padding_bs_index = self.get_padding_bs(model_worker_batch.real_bs)
+        # At dp>1 the incoming mwb is already DP-padded to total_bs (== a bucket
+        # value, see _get_spec_decode_mwb_dp); use the larger of real_bs and the
+        # incoming seq_lens length so we don't shrink below the DP layout.
+        _, padding_bs_index = self.get_padding_bs(
+            max(model_worker_batch.real_bs, len(model_worker_batch.seq_lens))
+        )
         self.copy_model_worker_batch_to_cpu(model_worker_batch)
         model_worker_batch.spec_info.prepare_for_draft_decode(
             model_worker_batch, self.topk, self.speculative_num_steps
@@ -302,30 +307,41 @@ class EagleDraftWorker(BaseDraftWorker):
         ]
         spec_info = model_worker_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
-        cache_loc_flat = np.array([], dtype=np.int32)
-        if len(seq_lens_cpu) > 0:
-            valid_mask = seq_lens_cpu > 0
-            if np.any(valid_mask):
-                valid_indices = np.where(valid_mask)[0]
-                valid_allocate_lens = spec_info.allocate_lens[valid_mask]
-                aligned_lengths = ((valid_allocate_lens + page_size - 1) // page_size) * page_size
-                total_aligned_length = np.sum(aligned_lengths)
-                cache_loc_flat = np.zeros(total_aligned_length, dtype=np.int32)
-                offset = 0
-                for i, (seq_idx, allocate_len, aligned_len) in enumerate(
-                    zip(valid_indices, valid_allocate_lens, aligned_lengths)
-                ):
-                    cache_loc_flat[offset : offset + allocate_len] = token_indices_with_all_reqs[
-                        seq_idx, :allocate_len
-                    ]
-                    offset += aligned_len
+        # At dp>1 spec_info arrays arrive at (real_bs,) but seq_lens_cpu is
+        # (total_bs,); pad allocate_lens up front so valid_mask indexing works
+        # (the per-field bs-padding loop below would do this anyway, just later).
+        if len(spec_info.allocate_lens) < len(seq_lens_cpu):
+            spec_info.allocate_lens = np.pad(
+                spec_info.allocate_lens, (0, len(seq_lens_cpu) - len(spec_info.allocate_lens))
+            )
+        # DP-segmented cache_loc: rank r's slots occupy
+        # [r*per_dp_cache_len : (r+1)*per_dp_cache_len) so the P("data") shard
+        # gives each rank its own page_indices (not the contiguous-then-padding
+        # layout where rank>0's shard lands in the padding region).
         total_cache_loc_size = self.precompile_cache_loc_paddings[padding_bs_index]
-        assert total_cache_loc_size >= len(cache_loc_flat)
-        cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
-        if len(cache_loc_flat) > 0:
-            cache_loc_cpu[: len(cache_loc_flat)] = cache_loc_flat
-        if len(cache_loc_flat) < total_cache_loc_size:
-            cache_loc_cpu[len(cache_loc_flat) :] = 0
+        dp_size = model_worker_batch.dp_size
+        per_dp_bs = model_worker_batch.per_dp_bs_size if dp_size > 1 else len(seq_lens_cpu)
+        assert total_cache_loc_size % dp_size == 0
+        per_dp_cache_len = total_cache_loc_size // dp_size
+        cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
+        valid_mask = seq_lens_cpu > 0
+        if np.any(valid_mask):
+            valid_indices = np.where(valid_mask)[0]
+            valid_allocate_lens = spec_info.allocate_lens[valid_mask]
+            aligned_lengths = ((valid_allocate_lens + page_size - 1) // page_size) * page_size
+            intra_rank_off = np.zeros(dp_size, dtype=np.int64)
+            for seq_idx, allocate_len, aligned_len in zip(
+                valid_indices, valid_allocate_lens, aligned_lengths
+            ):
+                r = int(seq_idx) // per_dp_bs
+                base = r * per_dp_cache_len + intra_rank_off[r]
+                assert (
+                    base + aligned_len <= (r + 1) * per_dp_cache_len
+                ), f"rank {r} cache_loc overflow: {intra_rank_off[r]+aligned_len} > {per_dp_cache_len}"
+                cache_loc_cpu[base : base + allocate_len] = token_indices_with_all_reqs[
+                    seq_idx, :allocate_len
+                ]
+                intra_rank_off[r] += aligned_len
 
         model_worker_batch.cache_loc = cache_loc_cpu
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST

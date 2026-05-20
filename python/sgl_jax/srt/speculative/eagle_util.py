@@ -528,18 +528,24 @@ class EagleDraftInput:
         speculative_num_draft_tokens: int,
     ):
         model_worker_batch.spec_info = self
-        model_worker_batch.seq_lens[: model_worker_batch.real_bs] = (
-            model_worker_batch.seq_lens[: model_worker_batch.real_bs]
-            + speculative_num_draft_tokens
-            - 1
+        sel = model_worker_batch.logits_indices_selector
+        model_worker_batch.seq_lens[sel] = (
+            model_worker_batch.seq_lens[sel] + speculative_num_draft_tokens - 1
         )
         bs = batch_output.accept_lens.shape[0]
         step_plus_1 = model_worker_batch.input_ids.shape[0] // bs
         model_worker_batch.positions = model_worker_batch.positions
-        model_worker_batch.extend_seq_lens = np.full((bs,), step_plus_1, dtype=np.int32)
-        model_worker_batch.extend_seq_lens[model_worker_batch.real_bs :] = 0
+        model_worker_batch.extend_seq_lens = np.zeros((bs,), dtype=np.int32)
+        model_worker_batch.extend_seq_lens[sel] = step_plus_1
+        # Per-rank-local cumsum: _select_hidden_states is a shard_map rank-local
+        # gather, so indices must be offsets into each rank's own hidden shard.
+        dp = model_worker_batch.dp_size
+        per_dp = model_worker_batch.per_dp_bs_size if dp > 1 else bs
         model_worker_batch.logits_indices = (
-            np.cumsum(model_worker_batch.extend_seq_lens, dtype=np.int32) - 1
+            model_worker_batch.extend_seq_lens.reshape(dp, per_dp)
+            .cumsum(axis=1, dtype=np.int32)
+            .ravel()
+            - 1
         )
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
@@ -560,44 +566,52 @@ class EagleDraftInput:
         return model_worker_batch, logits_metadata
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
-        new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE - 1
+        # spec_info / allocate_lens are global (flat across DP ranks). Allocate
+        # per-rank (allocator + swa_mapping are per-dp_rank at dp>1); concat
+        # back to global-flat. (#1053 P1-5b — was dp_rank=0 for all, so rank>0
+        # reqs allocated from rank 0's pool / updated swa_mapping[0].)
         bs = schedule_batch.batch_size()
         assert (
             self.allocate_lens.shape[0] == bs
         ), f" {self.allocate_lens.shape[0]=} but batch_size is {bs} "
         page_size = schedule_batch.token_to_kv_pool_allocator.page_size
-
-        if page_size == 1:
-            num_needed_tokens = (new_allocate_lens - self.allocate_lens).sum().item()
-            out_cache_loc = alloc_token_slots(schedule_batch.tree_cache, num_needed_tokens)
-        else:
-            last_loc = get_last_loc(
-                schedule_batch.req_to_token_pool.req_to_token,
-                schedule_batch.req_pool_indices,
-                self.allocate_lens,
+        new_alloc_chunks = []
+        flat_off = 0
+        for dp_rank, info in enumerate(schedule_batch.reqs_info):
+            if info.seq_lens is None or len(info.seq_lens) == 0:
+                continue
+            bs_r = len(info.seq_lens)
+            seq_r = np.asarray(info.seq_lens)
+            new_r = seq_r + self.ALLOC_LEN_PER_DECODE - 1
+            old_r = self.allocate_lens[flat_off : flat_off + bs_r]
+            ext_r = int((new_r - old_r).sum())
+            if page_size == 1:
+                ocl_r = alloc_token_slots(schedule_batch.tree_cache, ext_r, dp_rank=dp_rank)
+            else:
+                last_loc_r = get_last_loc(
+                    schedule_batch.req_to_token_pool.req_to_token,
+                    info.req_pool_indices,
+                    old_r,
+                )
+                ocl_r = alloc_paged_token_slots_extend(
+                    schedule_batch.tree_cache,
+                    old_r,
+                    new_r,
+                    last_loc_r,
+                    ext_r,
+                    dp_rank=dp_rank,
+                )
+            assign_req_to_token_pool(
+                info.req_pool_indices, schedule_batch.req_to_token_pool, old_r, new_r, ocl_r
             )
-            extend_num_tokens = sum(new_allocate_lens - self.allocate_lens).item()
-            out_cache_loc = alloc_paged_token_slots_extend(
-                schedule_batch.tree_cache,
-                self.allocate_lens,
-                new_allocate_lens,
-                last_loc,
-                extend_num_tokens,
-            )
+            new_alloc_chunks.append(new_r)
+            # Per-rank store (matches nospec extend); _get_spec_decode_mwb_dp
+            # DP-segments these so each rank's P("data") shard = its own slots.
+            info.out_cache_loc = np.asarray(ocl_r, dtype=np.int32)
+            flat_off += bs_r
+            info.seq_lens_sum = np.sum(info.seq_lens).item()
 
-        assign_req_to_token_pool(
-            schedule_batch.req_pool_indices,
-            schedule_batch.req_to_token_pool,
-            self.allocate_lens,
-            new_allocate_lens,
-            out_cache_loc,
-        )
-
-        self.allocate_lens = new_allocate_lens
-
-        info = schedule_batch.reqs_info[0]
-        info.seq_lens_sum = np.sum(info.seq_lens).item()
-        info.out_cache_loc = out_cache_loc
+        self.allocate_lens = np.concatenate(new_alloc_chunks)
 
     def prepare_for_draft_decode(
         self, model_worker_batch: ModelWorkerBatch, topk: int, num_steps: int
@@ -828,9 +842,8 @@ class EagleVerifyInput:
         if model_worker_batch.forward_mode.is_idle():
             return
 
-        model_worker_batch.seq_lens[: model_worker_batch.real_bs] = (
-            model_worker_batch.seq_lens[: model_worker_batch.real_bs] - 1
-        )
+        sel = model_worker_batch.logits_indices_selector
+        model_worker_batch.seq_lens[sel] = model_worker_batch.seq_lens[sel] - 1
         model_worker_batch.input_ids = self.draft_token
         model_worker_batch.positions = self.positions
         # bs = batch.batch_size()
