@@ -2578,6 +2578,35 @@ class WeightLoader:
                 v_bias = jnp.reshape(v_bias, (self.num_kv_heads * v_head_dim_padded,))
 
             splits = [q_bias, k_bias, v_bias]
+        elif "scale" in hf_key and weight.ndim == 1:
+            # Per-channel weight_scale (e.g. compressed-tensors W8A16): 1-D
+            # shape [Q_out + K_out + V_out,]. Splits along the single axis with
+            # the same Q/K/V offsets the bias branch uses; applies per-head pad
+            # the same way if mapping.head_dim_padding is set. Falls through to
+            # the 2-D scale branch below for block-quant scales (ndim == 2).
+            q_dim = self.num_heads * self.head_dim_original
+            k_dim = self.num_kv_heads * self.head_dim_original
+            v_dim = self.num_kv_heads * v_head_dim
+
+            q_scale = weight[:q_dim]
+            k_scale = weight[q_dim : q_dim + k_dim]
+            v_scale = weight[q_dim + k_dim : q_dim + k_dim + v_dim]
+
+            if mapping.head_dim_padding and self.head_dim_pad > 0:
+                q_scale = jnp.reshape(q_scale, (self.num_heads, self.head_dim_original))
+                q_scale = jnp.pad(q_scale, ((0, 0), (0, self.head_dim_pad)))
+                q_scale = jnp.reshape(q_scale, (self.num_heads * self.head_dim,))
+
+                k_scale = jnp.reshape(k_scale, (self.num_kv_heads, self.head_dim_original))
+                k_scale = jnp.pad(k_scale, ((0, 0), (0, self.head_dim_pad)))
+                k_scale = jnp.reshape(k_scale, (self.num_kv_heads * self.head_dim,))
+
+            if mapping.head_dim_padding and v_head_dim_pad > 0:
+                v_scale = jnp.reshape(v_scale, (self.num_kv_heads, v_head_dim))
+                v_scale = jnp.pad(v_scale, ((0, 0), (0, v_head_dim_pad)))
+                v_scale = jnp.reshape(v_scale, (self.num_kv_heads * v_head_dim_padded,))
+
+            splits = [q_scale, k_scale, v_scale]
         elif "scale" in hf_key and weight.ndim == 2:
             # Block-quant scale: split along block dimension, not element dimension.
             # The fused QKV scale has shape [total_blocks, in_blocks] where blocks
