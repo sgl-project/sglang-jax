@@ -323,8 +323,12 @@ def main():
 
     # 4. Fetch commit diff
     sha = run_info.get("head_sha", "")
-    print(f"Fetching diff for commit {sha[:12]}...")
-    diff = fetch_commit_diff(args.repo, sha, github_token)
+    if sha:
+        print(f"Fetching diff for commit {sha[:12]}...")
+        diff = fetch_commit_diff(args.repo, sha, github_token)
+    else:
+        print("Warning: head_sha is empty, skipping commit diff fetch.")
+        diff = ""
 
     # 5. Analyze with Claude
     print("Analyzing with Claude...")
@@ -332,8 +336,13 @@ def main():
     parsed = parse_claude_response(raw_response)
 
     # 6. Build result
+    try:
+        run_id_int = int(args.run_id)
+    except ValueError:
+        print(f"Error: run_id must be numeric, got: {args.run_id!r}")
+        sys.exit(1)
     result = AnalysisResult(
-        run_id=int(args.run_id),
+        run_id=run_id_int,
         run_url=run_info.get("html_url", ""),
         classification=parsed.get("classification", "unknown"),
         confidence=parsed.get("confidence", "low"),
@@ -363,7 +372,11 @@ def main():
 
     print("Analysis complete!")
     # Exit with non-zero if it's a confirmed regression, to signal urgency to callers
-    if parsed.get("classification") == "code_regression" and parsed.get("confidence") == "high":
+    known_classifications = {"code_regression", "flaky_test", "infrastructure", "environment"}
+    classification = parsed.get("classification")
+    if classification not in known_classifications:
+        classification = "unknown"
+    if classification == "code_regression" and parsed.get("confidence") == "high":
         sys.exit(1)
 
 

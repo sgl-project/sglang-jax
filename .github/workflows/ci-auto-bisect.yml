@@ -49,12 +49,25 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          INPUT_RUN_ID: ${{ inputs.run_id || github.event.client_payload.run_id }}
+          INPUT_ISSUE_NUMBER: ${{ inputs.issue_number || github.event.client_payload.issue_number }}
         run: |
+          if [[ ! "$INPUT_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "Error: run_id must be numeric, got: $INPUT_RUN_ID"
+            exit 1
+          fi
+          if [[ -n "$INPUT_ISSUE_NUMBER" && ! "$INPUT_ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "Error: issue_number must be numeric, got: $INPUT_ISSUE_NUMBER"
+            exit 1
+          fi
+          ISSUE_ARG=""
+          if [[ -n "$INPUT_ISSUE_NUMBER" ]]; then
+            ISSUE_ARG="--issue-number $INPUT_ISSUE_NUMBER"
+          fi
           python scripts/ci/ci_auto_bisect.py \
-            --repo ${{ github.repository }} \
-            --run-id ${{ inputs.run_id || github.event.client_payload.run_id }} \
-            ${{ inputs.issue_number && format('--issue-number {0}', inputs.issue_number) || '' }} \
-            ${{ github.event.client_payload.issue_number && format('--issue-number {0}', github.event.client_payload.issue_number) || '' }}
+            --repo "${{ github.repository }}" \
+            --run-id "$INPUT_RUN_ID" \
+            $ISSUE_ARG
 
       - name: Upload Analysis Results
         if: always()
