@@ -514,7 +514,9 @@ class EagleDraftInput:
         # indexing extend_seq_lens by `i` skipped real reqs whose padded slot
         # index > i (e.g. dp>1 prefill with only rank>0 active).
         dp_size = model_worker_batch.dp_size
-        per_dp_bs = model_worker_batch.per_dp_bs_size if dp_size > 1 else 1
+        # per_dp_bs_size already covers both dp=1 (= total_bs) and dp>1
+        # (= total_bs / dp). Hardcoding 1 here drops dp=1 multi-req.
+        per_dp_bs = model_worker_batch.per_dp_bs_size
         total_tok = len(model_worker_batch.input_ids)
         per_dp_tok = total_tok // dp_size if dp_size > 0 else total_tok
         extend_seq_lens = model_worker_batch.extend_seq_lens
