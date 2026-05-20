@@ -444,6 +444,48 @@ class VisionTower(nnx.Module):
 
         return hidden_states
 
+class Kimi_K25_MultiModalProjector(nnx.Module):
+
+    def __init__(
+        self,
+        config: KimiK25ModelVitConfig,
+        dtype: jnp.dtype,
+        rngs: nnx.Rngs = None,
+    ):
+        merge_h, merge_w = config.merge_kernel_size
+        self.hidden_size = config.vt_hidden_size * merge_h * merge_w
+
+        _rngs = rngs or nnx.Rngs(0)
+        self.pre_norm = nnx.LayerNorm(config.vt_hidden_size, param_dtype=dtype, rngs=_rngs)
+
+        self.proj_0 = nnx.Linear(
+            self.hidden_size,
+            self.hidden_size,
+            use_bias=True,
+            param_dtype=dtype,
+            rngs=_rngs,
+        )
+
+        self.proj_1 = nnx.Linear(
+            self.hidden_size,
+            config.text_hidden_size,
+            use_bias=True,
+            param_dtype=dtype,
+            rngs=_rngs,
+        )
+
+        self.act = nnx.GELU()
+
+    def __call__(
+        self,
+        image_features: jax.Array,
+    ) -> jax.Array:
+        hidden_states = self.pre_norm(image_features).reshape(-1, self.hidden_size)
+        hidden_states = self.proj_0(hidden_states)
+        hidden_states = self.act(hidden_states)
+        return self.proj_1(hidden_states)
+
+
 
 class Kimi_K25_VisionModel(nnx.Module):
     '''
