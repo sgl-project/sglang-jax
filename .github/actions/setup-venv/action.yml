@@ -18,8 +18,11 @@ runs:
         pip install uv
         uv pip install -e "python[all]"
         if [ -n "$EXTRA_PACKAGES" ]; then
+          set -f
+          # shellcheck disable=SC2086
           uv pip install $EXTRA_PACKAGES
+          set +f
         fi
     - name: Add venv to PATH
       shell: bash
-      run: echo "${{ github.workspace }}/.venv/bin" >> $GITHUB_PATH
+      run: echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH

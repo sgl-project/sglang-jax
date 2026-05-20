@@ -66,7 +66,7 @@ def run_unittest_files(
     files: list[TestFile],
     timeout_per_file: float,
     reruns: int = 0,
-    reruns_delay: int = 10,
+    reruns_delay: float = 10,
     only_rerun: list[str] | None = None,
 ):
     tic = time.perf_counter()
@@ -692,7 +692,7 @@ if __name__ == "__main__":
     )
     arg_parser.add_argument(
         "--reruns-delay",
-        type=int,
+        type=float,
         default=10,
         help="Delay in seconds between reruns (default: 10).",
     )
@@ -701,7 +701,9 @@ if __name__ == "__main__":
         type=str,
         nargs="+",
         default=None,
-        help="Only rerun tests matching these error patterns (e.g. TimeoutError ConnectionError). Passed to pytest-rerunfailures --only-rerun.",
+        help="Only rerun tests matching these error patterns (e.g. TimeoutError ConnectionError). "
+        "Passed to pytest-rerunfailures --only-rerun. Only effective for pytest runner files; "
+        "file-level retry for unittest runner is not filtered by this option.",
     )
     args = arg_parser.parse_args()
     print(f"{args=}")
