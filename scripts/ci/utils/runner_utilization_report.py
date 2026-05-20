@@ -47,45 +47,27 @@ def get_workflow_runs(repo, hours=24):
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    output = run_gh_command(
+        [
+            "api",
+            f"/repos/{repo}/actions/runs",
+            "--paginate",
+            "-f",
+            f"created=>={cutoff_str}",
+            "-f",
+            "per_page=100",
+            "--jq",
+            ".workflow_runs[]",
+        ]
+    )
+
     runs = []
-    page = 1
-    per_page = 100
-
-    while True:
-        output = run_gh_command(
-            [
-                "api",
-                f"/repos/{repo}/actions/runs",
-                "--paginate",
-                "-f",
-                f"created=>={cutoff_str}",
-                "-f",
-                f"per_page={per_page}",
-                "-f",
-                f"page={page}",
-                "--jq",
-                ".workflow_runs[]",
-            ]
-        )
-
-        if not output.strip():
-            break
-
-        page_runs = []
-        for line in output.strip().splitlines():
-            if line.strip():
-                try:
-                    page_runs.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-
-        if not page_runs:
-            break
-
-        runs.extend(page_runs)
-
-        # gh --paginate handles pagination automatically; break after first call
-        break
+    for line in output.strip().splitlines():
+        if line.strip():
+            try:
+                runs.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
 
     return runs
 

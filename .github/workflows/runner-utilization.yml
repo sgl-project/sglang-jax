@@ -37,8 +37,13 @@ jobs:
         timeout-minutes: 30
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUNNER_FILTER: ${{ inputs.filter || '' }}
         run: |
+          FILTER_ARG=""
+          if [ -n "$RUNNER_FILTER" ]; then
+            FILTER_ARG="--filter $RUNNER_FILTER"
+          fi
           python scripts/ci/utils/runner_utilization_report.py \
             --repo ${{ github.repository }} \
             --hours ${{ inputs.hours || '24' }} \
-            ${{ inputs.filter && format('--filter {0}', inputs.filter) || '' }}
+            $FILTER_ARG
