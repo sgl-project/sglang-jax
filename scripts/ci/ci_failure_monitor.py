@@ -10,6 +10,7 @@ run-level, since continue-on-error masks failures) and manages issues:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -27,10 +28,16 @@ EXCLUDED_JOBS = frozenset(
 
 LABEL = "ci-failure"
 
+MATRIX_SUFFIX_RE = re.compile(r"\s*\(.*\)$")
+
 
 def gh(*args: str, json_output: bool = False) -> str | dict | list:
     cmd = ["gh"] + list(args)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        print(f"gh command timed out: {' '.join(cmd)}", file=sys.stderr)
+        raise RuntimeError(f"gh timed out after 180s: {' '.join(cmd)}")
     if result.returncode != 0:
         print(f"gh command failed: {' '.join(cmd)}", file=sys.stderr)
         print(f"stderr: {result.stderr}", file=sys.stderr)
@@ -66,8 +73,9 @@ def get_failed_jobs(run_id: str, repo: str) -> list[dict]:
     failed = []
     for job in all_jobs:
         name = job.get("name", "")
+        base_name = MATRIX_SUFFIX_RE.sub("", name)
         conclusion = job.get("conclusion", "")
-        if name in EXCLUDED_JOBS:
+        if base_name in EXCLUDED_JOBS:
             continue
         if conclusion in ("failure", "timed_out"):
             failed.append(
@@ -225,7 +233,8 @@ def main():
 
     jobs_by_name: dict[str, list[dict]] = {}
     for j in failed_jobs:
-        jobs_by_name.setdefault(j["name"], []).append(j)
+        base_name = MATRIX_SUFFIX_RE.sub("", j["name"])
+        jobs_by_name.setdefault(base_name, []).append(j)
 
     for job_name, jobs in jobs_by_name.items():
         existing = find_open_issue(args.repo, job_name)
