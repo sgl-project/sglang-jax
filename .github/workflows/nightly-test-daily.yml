@@ -78,7 +78,7 @@ jobs:
 
           bash scripts/killall_sglang.sh
           cd test/srt
-          python3 run_suite.py --suite nightly-test-perf-text-models-tpu-v6e-1-daily --reruns 2
+          python3 run_suite.py --suite nightly-test-perf-text-models-tpu-v6e-1-daily
 
       - name: Publish traces to storage repo
         env:
@@ -118,7 +118,7 @@ jobs:
 
           bash scripts/killall_sglang.sh
           cd test/srt
-          python3 run_suite.py --suite nightly-test-perf-trace-text-models-tpu-v6e-1-daily --reruns 2
+          python3 run_suite.py --suite nightly-test-perf-trace-text-models-tpu-v6e-1-daily
 
       - name: Publish traces to storage repo
         env:

@@ -18,9 +18,7 @@ runs:
         pip install uv
         uv pip install -e "python[all]"
         if [ -n "$EXTRA_PACKAGES" ]; then
-          for pkg in $EXTRA_PACKAGES; do
-            uv pip install "$pkg"
-          done
+          uv pip install $EXTRA_PACKAGES
         fi
     - name: Add venv to PATH
       shell: bash

@@ -63,7 +63,11 @@ def cleanup_model_cache():
 
 
 def run_unittest_files(
-    files: list[TestFile], timeout_per_file: float, reruns: int = 0, reruns_delay: int = 0
+    files: list[TestFile],
+    timeout_per_file: float,
+    reruns: int = 0,
+    reruns_delay: int = 10,
+    only_rerun: list[str] | None = None,
 ):
     tic = time.perf_counter()
     success = True
@@ -130,7 +134,7 @@ def run_unittest_files(
                         "pytest",
                     ]
                     if reruns > 0:
-                        cmd.extend(["--with", "pytest-rerunfailures"])
+                        cmd.extend(["--with", "pytest-rerunfailures==14.0"])
                     for dep in file_entry.extra_deps or []:
                         cmd.extend(["--with", dep])
                     cmd.extend(
@@ -144,6 +148,8 @@ def run_unittest_files(
                     )
                     if reruns > 0:
                         cmd.extend(["--reruns", str(reruns), "--reruns-delay", str(reruns_delay)])
+                        for pattern in only_rerun or []:
+                            cmd.extend(["--only-rerun", pattern])
                 else:
                     cmd = [sys.executable, filename]
 
@@ -172,21 +178,27 @@ def run_unittest_files(
 
         try:
             ret_code = run_with_timeout(run_one_file, args=(filename,), timeout=timeout_per_file)
-            if ret_code != 0 and reruns > 0 and file_entry.runner != "pytest":
-                for attempt in range(1, reruns + 1):
-                    print(
-                        f"\n[rerun {attempt}/{reruns}] {filename} failed, retrying after {reruns_delay}s...\n",
-                        flush=True,
-                    )
-                    time.sleep(reruns_delay)
-                    ret_code = run_with_timeout(
-                        run_one_file, args=(filename,), timeout=timeout_per_file
-                    )
-                    if ret_code == 0:
+            if ret_code != 0 and reruns > 0:
+                # pytest exit 1 = test case failures already retried by pytest-rerunfailures;
+                # only file-level retry on infrastructure errors (exit 2/3/5)
+                if file_entry.runner == "pytest" and ret_code == 1:
+                    pass
+                else:
+                    for attempt in range(1, reruns + 1):
                         print(
-                            f"\n[rerun {attempt}/{reruns}] {filename} passed on retry\n", flush=True
+                            f"\n[rerun {attempt}/{reruns}] {filename} failed (exit {ret_code}), retrying after {reruns_delay}s...\n",
+                            flush=True,
                         )
-                        break
+                        time.sleep(reruns_delay)
+                        ret_code = run_with_timeout(
+                            run_one_file, args=(filename,), timeout=timeout_per_file
+                        )
+                        if ret_code == 0:
+                            print(
+                                f"\n[rerun {attempt}/{reruns}] {filename} passed on retry\n",
+                                flush=True,
+                            )
+                            break
             assert ret_code == 0, f"expected return code 0, but {filename} returned {ret_code}"
         except TimeoutError:
             kill_process_tree(process.pid)
@@ -684,6 +696,13 @@ if __name__ == "__main__":
         default=10,
         help="Delay in seconds between reruns (default: 10).",
     )
+    arg_parser.add_argument(
+        "--only-rerun",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Only rerun tests matching these error patterns (e.g. TimeoutError ConnectionError). Passed to pytest-rerunfailures --only-rerun.",
+    )
     args = arg_parser.parse_args()
     print(f"{args=}")
 
@@ -697,6 +716,10 @@ if __name__ == "__main__":
     print("The running tests are ", [f.name for f in files])
 
     exit_code = run_unittest_files(
-        files, args.timeout_per_file, reruns=args.reruns, reruns_delay=args.reruns_delay
+        files,
+        args.timeout_per_file,
+        reruns=args.reruns,
+        reruns_delay=args.reruns_delay,
+        only_rerun=args.only_rerun,
     )
     exit(exit_code)

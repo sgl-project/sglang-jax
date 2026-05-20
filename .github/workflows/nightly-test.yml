@@ -147,7 +147,7 @@ jobs:
 
           bash scripts/killall_sglang.sh
           cd test/srt
-          python3 run_suite.py --suite nightly-test-perf-text-models-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 8 --reruns 2
+          python3 run_suite.py --suite nightly-test-perf-text-models-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 8
 
       - name: Publish traces to storage repo
         env:
@@ -188,7 +188,7 @@ jobs:
 
           bash scripts/killall_sglang.sh
           cd test/srt
-          python3 run_suite.py --suite  nightly-test-perf-text-models-tpu-v6e-4-part1 --reruns 2
+          python3 run_suite.py --suite  nightly-test-perf-text-models-tpu-v6e-4-part1
 
       - name: Publish traces to storage repo
         env:
@@ -250,7 +250,7 @@ jobs:
 
             bash scripts/killall_sglang.sh
             cd test/srt
-            python3 run_suite.py --suite  nightly-test-perf-text-models-tpu-v6e-4-part2 --reruns 2
+            python3 run_suite.py --suite  nightly-test-perf-text-models-tpu-v6e-4-part2
 
         - name: Publish traces to storage repo
           env:
@@ -290,7 +290,7 @@ jobs:
 
               bash scripts/killall_sglang.sh
               cd test/srt
-              python3 run_suite.py --suite  nightly-test-perf-text-models-tpu-v6e-4-part3 --reruns 2
+              python3 run_suite.py --suite  nightly-test-perf-text-models-tpu-v6e-4-part3
 
           - name: Publish traces to storage repo
             env:
@@ -333,7 +333,7 @@ jobs:
 
           bash scripts/killall_sglang.sh
           cd test/srt
-          python3 run_suite.py --suite nightly-test-perf-trace-text-models-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 8 --reruns 2
+          python3 run_suite.py --suite nightly-test-perf-trace-text-models-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 8
 
       - name: Publish traces to storage repo
         env:
@@ -373,7 +373,7 @@ jobs:
 
           bash scripts/killall_sglang.sh
           cd test/srt
-          python3 run_suite.py --suite  nightly-test-perf-trace-text-models-tpu-v6e-4-part1 --reruns 2
+          python3 run_suite.py --suite  nightly-test-perf-trace-text-models-tpu-v6e-4-part1
 
       - name: Publish traces to storage repo
         env:
@@ -413,7 +413,7 @@ jobs:
 
             bash scripts/killall_sglang.sh
             cd test/srt
-            python3 run_suite.py --suite  nightly-test-perf-trace-text-models-tpu-v6e-4-part2 --reruns 2
+            python3 run_suite.py --suite  nightly-test-perf-trace-text-models-tpu-v6e-4-part2
 
         - name: Publish traces to storage repo
           env:
