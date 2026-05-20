@@ -244,6 +244,15 @@ class SchedulerOutputProcessorMixin:
         )
 
         batch.spec_info = result.next_draft_input
+        # Option C: also write per-rank reqs_info[r].spec_info. Keep the
+        # batch.spec_info double-write for now; step E drops it.
+        if result.next_draft_input is not None:
+            real_bs_per_dp = [len(info.reqs) if info.reqs else 0 for info in batch.reqs_info]
+            per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
+                result.next_draft_input, real_bs_per_dp
+            )
+            for r, s in enumerate(per_rank_spec):
+                batch.reqs_info[r].spec_info = s
 
     def _resolve_spec_decode_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
@@ -326,10 +335,6 @@ class SchedulerOutputProcessorMixin:
         # aligned with the selector.
         req_idx = 0
 
-        # spec_info is global (on reqs_info[0]); track flat index across ranks
-        # so the finished-req KV-free below can index allocate_lens correctly.
-        global_spec = batch.reqs_info[0].spec_info
-        global_req_base = 0
         for dp_rank in range(batch.dp_size):
             info = batch.reqs_info[dp_rank]
             reqs = info.reqs
@@ -339,7 +344,6 @@ class SchedulerOutputProcessorMixin:
 
             # Skip empty DP ranks
             if not reqs or not dp_output_ids:
-                global_req_base += len(reqs or [])
                 continue
 
             # Check finish condition for each request in this DP rank
@@ -368,7 +372,7 @@ class SchedulerOutputProcessorMixin:
                 if req.finished():
                     self.maybe_collect_routed_experts(req)
                     if batch.spec_algorithm is not None and batch.spec_algorithm.is_eagle():
-                        cur_allocate_len = int(global_spec.allocate_lens[global_req_base + i])
+                        cur_allocate_len = int(info.spec_info.allocate_lens[i])
                         actual_token_len = len(req.origin_input_ids) + max(
                             len(req.output_ids) - 1, 0
                         )
@@ -463,7 +467,6 @@ class SchedulerOutputProcessorMixin:
                     # Tracking as a follow-up; not in scope for this fix.
                     req.hidden_states.append(logits_output.hidden_states[i])
                 req_idx += 1
-            global_req_base += len(reqs)
 
         # Collect all requests from all DP ranks for stream output
         all_reqs = []

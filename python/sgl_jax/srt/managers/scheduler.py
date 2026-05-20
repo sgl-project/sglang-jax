@@ -1820,11 +1820,10 @@ class Scheduler(
                 next_token_ids = np.array(jax.device_get(next_token_ids_device))
                 self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
         else:
-            if batch.forward_mode.is_extend() and self._spec_multi_layer:
-                # Multi-layer-MTP (MoE+EP target) prefill must use the same padded
-                # mwb as nospec so target forward sees identical shapes (#1090).
-                # EagleDraftWorker doesn't yet handle padded prefill mwb, so gate
-                # on the worker selection rather than the algorithm flag.
+            if batch.forward_mode.is_extend():
+                # Spec extend always uses the padded mwb so target and draft
+                # see identical shapes regardless of dp_size / multi-layer
+                # (#1090 + #1053 P1-5b assert dp>1 spec extend must go here).
                 model_worker_batch = batch.get_model_worker_batch(
                     precompile_token_paddings,
                     precompile_bs_paddings,
@@ -1843,8 +1842,13 @@ class Scheduler(
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch
             )
-            # spec_info is global (DP-padded order), stored on rank 0 only.
-            batch.reqs_info[0].spec_info = batch_output.next_draft_input
+            # Option C: split cross-rank-flat next_draft_input back to per-rank
+            # reqs_info[r].spec_info (symmetric with seq_lens / req_pool_indices).
+            per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
+                batch_output.next_draft_input, model_worker_batch.real_bs_per_dp
+            )
+            for r, s in enumerate(per_rank_spec):
+                batch.reqs_info[r].spec_info = s
             accept = batch_output.accept_lens
             if accept is not None:
                 accept = np.asarray(jax.device_get(accept))
