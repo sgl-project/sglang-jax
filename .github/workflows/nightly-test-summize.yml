@@ -133,6 +133,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
+          if [ ! -d .venv ]; then
+            echo "Python venv not available, skipping trend threshold check"
+            exit 0
+          fi
           source .venv/bin/activate
           for metric in gsm8k in_tps out_tps ttft_ms itl_ms; do
             echo "Checking metric: $metric"

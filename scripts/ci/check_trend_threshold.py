@@ -156,7 +156,9 @@ def create_alert_issue(repo, details, token):
         text=True,
         env=env,
     )
-    if check.returncode == 0:
+    if check.returncode != 0:
+        print(f"Warning: failed to check existing issues: {check.stderr.strip()}")
+    else:
         try:
             existing = json.loads(check.stdout)
             if existing:
