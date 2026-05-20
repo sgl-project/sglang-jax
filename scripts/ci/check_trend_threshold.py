@@ -88,7 +88,8 @@ def check_threshold(values, window, threshold_pct, metric_name, higher_is_better
     recent_avg = sum(v["value"] for v in recent) / len(recent)
     baseline_avg = sum(v["value"] for v in baseline_values) / len(baseline_values)
 
-    if baseline_avg == 0:
+    if abs(baseline_avg) < 1e-9:
+        print(f"Baseline average near zero ({baseline_avg}), skipping threshold check")
         return False, {}
 
     pct_change = ((recent_avg - baseline_avg) / abs(baseline_avg)) * 100
