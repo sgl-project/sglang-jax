@@ -24,6 +24,9 @@ jobs:
     name: Generate Report
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
