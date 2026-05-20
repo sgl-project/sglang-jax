@@ -187,7 +187,9 @@ def calculate_concurrency_metrics(jobs, window_start, window_end, num_runners):
             "peak_queue": 0,
         }
 
-    events.sort(key=lambda e: (e[0], e[1]))
+    # At equal timestamps, process end events (delta=-1) before start events
+    # (delta=+1) to avoid transiently inflating the concurrent count.
+    events.sort(key=lambda e: (e[0], -e[1]))
 
     current = 0
     peak = 0
