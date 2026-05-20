@@ -2434,9 +2434,13 @@ class ScheduleBatch:
         req_pool_indices_cpu = self.req_pool_indices
         token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
         # FIXME @pc, move this to eagle_worker
-        # If enable spec inference, use positions in spec info firstly
-        if self.spec_info is not None and getattr(self.spec_info, "positions", None) is not None:
-            positions_cpu = self.spec_info.positions
+        # If enable spec inference, use positions in spec info firstly.
+        # Option C: dp=1 fast path reads per-rank reqs_info[0].spec_info.
+        spec_info_local = (
+            self.reqs_info[0].spec_info if self.reqs_info and self.reqs_info[0] else None
+        )
+        if spec_info_local is not None and getattr(spec_info_local, "positions", None) is not None:
+            positions_cpu = spec_info_local.positions
         else:
             # Decode: each sequence contributes one token at the next position.
             batch_positions = np.maximum(0, seq_lens_cpu - 1)
@@ -2472,10 +2476,11 @@ class ScheduleBatch:
                 if (
                     self.forward_mode == ForwardMode.DECODE
                     and not self.spec_algorithm.is_none()
-                    and self.spec_info.allocate_lens is not None
+                    and spec_info_local is not None
+                    and spec_info_local.allocate_lens is not None
                 ):
                     # Explicitly convert to numpy to avoid JAX device synchronization overhead
-                    allocated_len_cpu = np.array(self.spec_info.allocate_lens)
+                    allocated_len_cpu = np.array(spec_info_local.allocate_lens)
                     allocated_len = allocated_len_cpu[: len(self.reqs)]
                     aligned_lengths = ((allocated_len + page_size - 1) // page_size) * page_size
                     alread_allocated_lens = allocated_len
@@ -2553,13 +2558,13 @@ class ScheduleBatch:
                 CaptureHiddenMode.FULL
                 if self.return_hidden_states
                 else (
-                    getattr(self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL)
-                    if self.spec_info
+                    getattr(spec_info_local, "capture_hidden_mode", CaptureHiddenMode.NULL)
+                    if spec_info_local
                     else CaptureHiddenMode.NULL
                 )
             ),
             launch_done=self.launch_done,
-            spec_info_padded=self.spec_info,
+            spec_info_padded=spec_info_local,
             spec_algorithm=self.spec_algorithm,
             tree_cache=self.tree_cache,
         )

@@ -243,9 +243,8 @@ class SchedulerOutputProcessorMixin:
             cache_miss_count,
         )
 
-        batch.spec_info = result.next_draft_input
-        # Option C: also write per-rank reqs_info[r].spec_info. Keep the
-        # batch.spec_info double-write for now; step E drops it.
+        # Option C: write per-rank reqs_info[r].spec_info; spec_info on
+        # ScheduleBatch itself was removed in step E.
         if result.next_draft_input is not None:
             real_bs_per_dp = [len(info.reqs) if info.reqs else 0 for info in batch.reqs_info]
             per_rank_spec = ScheduleBatch._split_spec_info_per_rank(

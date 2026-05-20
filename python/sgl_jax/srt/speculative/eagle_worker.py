@@ -53,7 +53,9 @@ class EAGLEWorker(BaseSpecWorker):
         assert len(accepted_indices) == len(logits_output.next_token_logits)
 
         temperatures = batch.sampling_info.temperatures
-        num_draft_tokens = batch.spec_info.draft_token_num
+        # Option C: draft_token_num is a scalar shared across ranks; reqs_info[0]
+        # is guaranteed to have spec_info populated when this path runs.
+        num_draft_tokens = batch.reqs_info[0].spec_info.draft_token_num
         temperatures = temperatures[accepted_indices // num_draft_tokens]
         if RETURN_ORIGINAL_LOGPROB:
             logprobs = jax.nn.log_softmax(logits_output.next_token_logits, axis=-1)
@@ -117,10 +119,12 @@ class EAGLEWorker(BaseSpecWorker):
 
     def precompile_spec_extend(self):
         start_time = time.perf_counter()
+        dp_size = self.server_args.dp_size
         logger.info(
-            "[SPEC_EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s",
+            "[SPEC_EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s dp_size=%d",
             self.precompile_bs_paddings[-1:],
             self.precompile_token_paddings,
+            dp_size,
         )
 
         bs, _ = self.draft_worker.get_max_padded_size()
@@ -130,18 +134,24 @@ class EAGLEWorker(BaseSpecWorker):
             for pair in pbar:
                 pair = list(pair)
                 bs, num_tokens = pair[0], pair[1]
-                pbar.set_postfix(bs=bs, tokens=num_tokens)
+                pbar.set_postfix(bs=bs, tokens=num_tokens, dp_size=dp_size)
                 if bs > num_tokens:
                     logger.warning("bs=%s > num_tokens=%s, skip this pair", bs, num_tokens)
                     continue
+                if bs % dp_size != 0:
+                    logger.warning(
+                        "[SPEC_EXTEND] skip bs=%d (not divisible by dp_size=%d)", bs, dp_size
+                    )
+                    continue
+                per_dp_bs = bs // dp_size
                 model_worker_batch = self.draft_worker.compilation_manager._make_dummy_batch(
                     bs,
                     num_tokens,
                     ForwardMode.EXTEND,
                     self.precompile_cache_loc_paddings[-1],
                     speculative_algorithm=self.speculative_algorithm,
-                    dp_size=1,
-                    per_dp_bs_size=bs,
+                    dp_size=dp_size,
+                    per_dp_bs_size=per_dp_bs,
                 )
                 self.forward_batch_speculative_generation(model_worker_batch)
         end_time = time.perf_counter()
@@ -149,16 +159,24 @@ class EAGLEWorker(BaseSpecWorker):
 
     def precompile_spec_decode(self):
         start_time = time.perf_counter()
+        dp_size = self.server_args.dp_size
         logger.info(
-            "[SPEC_DECODE] Begin to precompile bs_paddings=%s",
+            "[SPEC_DECODE] Begin to precompile bs_paddings=%s dp_size=%d",
             self.precompile_bs_paddings,
+            dp_size,
         )
 
         with tqdm(
             self.precompile_bs_paddings, desc="[SPEC_DECODE] PRECOMPILE", leave=False
         ) as pbar:
             for bs in pbar:
-                pbar.set_postfix(bs=bs)
+                pbar.set_postfix(bs=bs, dp_size=dp_size)
+                if bs % dp_size != 0:
+                    logger.warning(
+                        "[SPEC_DECODE] skip bs=%d (not divisible by dp_size=%d)", bs, dp_size
+                    )
+                    continue
+                per_dp_bs = bs // dp_size
                 aligned_cache_loc_size = (
                     (bs * self.draft_worker.max_req_len + self.page_size - 1)
                     // self.page_size
@@ -170,8 +188,8 @@ class EAGLEWorker(BaseSpecWorker):
                     ForwardMode.DECODE,
                     aligned_cache_loc_size,
                     speculative_algorithm=self.speculative_algorithm,
-                    dp_size=1,
-                    per_dp_bs_size=bs,
+                    dp_size=dp_size,
+                    per_dp_bs_size=per_dp_bs,
                 )
                 spec_info = EagleDraftInput(
                     # FIXME(pc) dtype should according to serverargs

@@ -651,16 +651,20 @@ class EagleDraftInput:
             return
 
         batch.input_ids = self.verified_id
-        accept_length_cpu_arr = batch.spec_info.accept_length_cpu
+        # Option C: deprecated path; read per-rank spec_info via reqs_info[0].
+        rank0_spec = batch.reqs_info[0].spec_info if batch.reqs_info else None
+        accept_length_cpu_arr = rank0_spec.accept_length_cpu if rank0_spec else None
         if accept_length_cpu_arr is None:
             accept_length_cpu_host = np.asarray([], dtype=np.int32)
         else:
             accept_length_cpu_host = accept_length_cpu_arr
         batch.extend_lens = (accept_length_cpu_host + 1).tolist()
         batch.extend_num_tokens = sum(batch.extend_lens)
-        batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
+        batch.seq_lens = rank0_spec.seq_lens_for_draft_extend if rank0_spec else None
         batch.seq_lens_sum = batch.seq_lens.sum().item()
-        batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
+        batch.req_pool_indices = (
+            rank0_spec.req_pool_indices_for_draft_extend if rank0_spec else None
+        )
         batch.return_logprob = False
         batch.return_hidden_states = False
 
