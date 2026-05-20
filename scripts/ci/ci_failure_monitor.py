@@ -69,7 +69,7 @@ def get_failed_jobs(run_id: str, repo: str) -> list[dict]:
         conclusion = job.get("conclusion", "")
         if name in EXCLUDED_JOBS:
             continue
-        if conclusion in ("failure", "cancelled", "timed_out"):
+        if conclusion in ("failure", "timed_out"):
             failed.append(
                 {
                     "name": name,
