@@ -191,7 +191,7 @@ class EAGLEWorker(BaseSpecWorker):
                     + EagleDraftInput.ALLOC_LEN_PER_DECODE,
                 )
                 model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-                model_worker_batch.spec_info = spec_info
+                model_worker_batch.spec_info_padded = spec_info
                 model_worker_batch.speculative_eagle_topk = self.topk
                 model_worker_batch.speculative_num_draft_tokens = self.speculative_num_draft_tokens
                 model_worker_batch.speculative_num_steps = self.speculative_num_steps

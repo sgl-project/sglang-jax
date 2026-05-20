@@ -161,7 +161,7 @@ def test_get_spec_decode_mwb_dp_shapes(dp, bs_per_rank):
         seg = mwb.seq_lens[r * per_dp : r * per_dp + per_dp]
         assert np.all(seg[:bs] > 0), f"rank {r} real slots zero: {seg}"
         assert np.all(seg[bs:] == 0), f"rank {r} pad slots nonzero: {seg}"
-    assert mwb.spec_info is not None
+    assert mwb.spec_info_padded is not None
 
 
 @pytest.mark.parametrize(
@@ -250,7 +250,7 @@ def test_filter_batch_then_decode_mwb_round_trip():
     assert np.all(mwb.seq_lens[:per_dp] == 0)
     assert mwb.seq_lens[per_dp] > 0
     # spec_info is now DP-padded (total_bs,); rank 1's data must be at slot per_dp.
-    al = np.asarray(mwb.spec_info.allocate_lens)
+    al = np.asarray(mwb.spec_info_padded.allocate_lens)
     assert al.shape[0] == per_dp * dp
     assert int(al[per_dp]) == 120
     assert int(al[0]) == 0  # rank-0 padding slot
@@ -293,7 +293,7 @@ def test_spec_info_aligns_with_dp_padded_slots(dp, bs_per_rank):
     total_bs = per_dp * dp
 
     # Simulate padding_for_decode's pad-then-valid_mask gather:
-    al = np.asarray(mwb.spec_info.allocate_lens)
+    al = np.asarray(mwb.spec_info_padded.allocate_lens)
     if len(al) < total_bs:
         al = np.pad(al, (0, total_bs - len(al)))
     valid_mask = mwb.seq_lens > 0
@@ -348,7 +348,7 @@ def test_draft_page_indices_dp_segmented(dp, bs_per_rank):
     # global-flat req id k so we can verify which req each page belongs to.
     L_tok, page = 8192, 256
     cache_loc = np.full(L_tok * dp, -1, dtype=np.int32)
-    al = np.asarray(mwb.spec_info.allocate_lens)
+    al = np.asarray(mwb.spec_info_padded.allocate_lens)
     aligned = ((al + page - 1) // page) * page
     intra = np.zeros(dp, dtype=np.int64)
     for s in np.where(mwb.seq_lens > 0)[0]:

@@ -213,15 +213,15 @@ class FlashAttention(AttentionBackend):
 
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
             # convert custom_mask from bool to int32, because dma not support bool type
-            if batch.spec_info.custom_mask.dtype == jnp.bool:
+            if batch.spec_info_padded.custom_mask.dtype == jnp.bool:
                 # FIXME(pc) rm this dtype convert
                 logger.warning(
-                    "batch.spec_info.custom_mask type is  %s, it may make performance very low",
-                    batch.spec_info.custom_mask.dtype,
+                    "batch.spec_info_padded.custom_mask type is  %s, it may make performance very low",
+                    batch.spec_info_padded.custom_mask.dtype,
                 )
-                metadata.custom_mask = batch.spec_info.custom_mask.astype(jnp.int32)
+                metadata.custom_mask = batch.spec_info_padded.custom_mask.astype(jnp.int32)
             else:
-                metadata.custom_mask = batch.spec_info.custom_mask
+                metadata.custom_mask = batch.spec_info_padded.custom_mask
         else:
             metadata.custom_mask = None
 
@@ -230,7 +230,7 @@ class FlashAttention(AttentionBackend):
         if batch.forward_mode.is_target_verify():
             padded_batch_size = len(batch.seq_lens)
             extend_seq_lens = np.zeros(padded_batch_size, dtype=np.int32)
-            extend_seq_lens[batch.logits_indices_selector] = batch.spec_info.draft_token_num
+            extend_seq_lens[batch.logits_indices_selector] = batch.spec_info_padded.draft_token_num
         else:
             extend_seq_lens = batch.extend_seq_lens
         cu_q_lens = _per_dp_cumsum(extend_seq_lens, dp_size, per_dp_bs)
@@ -246,7 +246,7 @@ class FlashAttention(AttentionBackend):
             # stride. Dense targets (EAGLE3) keep the unpadded path so accept-
             # rate / cache-hit behavior is unchanged.
             if metadata.custom_mask is not None and self.page_size >= 256:
-                q = batch.spec_info.draft_token_num
+                q = batch.spec_info_padded.draft_token_num
                 cm = np.asarray(jax.device_get(metadata.custom_mask))
                 # cm is DP-slot-ordered (build_tree got verified_seq_len = mwb.seq_lens-1
                 # over total_bs). Per-slot cm length = q*(verified_seq_len[s]+q); for pad
@@ -292,7 +292,7 @@ class FlashAttention(AttentionBackend):
             # the DP-segmented layout from padding_for_decode (rank r's pages
             # at [r*per_dp_pg : ...]). page_indices (line 212) is already
             # cache_loc[::page_size]//page_size, so re-gather from it per-rank.
-            allocate_lens = batch.spec_info.allocate_lens
+            allocate_lens = batch.spec_info_padded.allocate_lens
             if hasattr(allocate_lens, "device"):
                 allocate_lens = jax.device_get(allocate_lens)
             allocate_lens = np.asarray(allocate_lens)
@@ -370,7 +370,7 @@ class FlashAttention(AttentionBackend):
         # (== selector order), so the per-req gather below stays aligned.
         sel = np.asarray(batch.logits_indices_selector)
         current_seq_lens = np.asarray(batch.seq_lens)[sel]
-        allocate_lens = np.asarray(batch.spec_info.allocate_lens)[sel]
+        allocate_lens = np.asarray(batch.spec_info_padded.allocate_lens)[sel]
 
         draft_allocs = allocate_lens - current_seq_lens
 
@@ -432,7 +432,7 @@ class FlashAttention(AttentionBackend):
 
         if batch.spec_algorithm.is_none():
             raise RuntimeError("should not reach here")
-        assert isinstance(batch.spec_info, EagleDraftInput)
+        assert isinstance(batch.spec_info_padded, EagleDraftInput)
         topk = batch.speculative_eagle_topk
         cu_q_lens = np.tile(np.arange(0, per_dp_bs * topk + 1, topk, dtype=np.int32), dp_size)
         seq_2d = np.asarray(batch.seq_lens).reshape(dp_size, per_dp_bs)

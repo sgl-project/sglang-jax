@@ -527,7 +527,7 @@ class EagleDraftInput:
         batch_output: GenerationBatchResult,
         speculative_num_draft_tokens: int,
     ):
-        model_worker_batch.spec_info = self
+        model_worker_batch.spec_info_padded = self
         sel = model_worker_batch.logits_indices_selector
         model_worker_batch.seq_lens[sel] = (
             model_worker_batch.seq_lens[sel] + speculative_num_draft_tokens - 1
@@ -548,10 +548,12 @@ class EagleDraftInput:
             - 1
         )
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
+        model_worker_batch.spec_info_padded.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
-        model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
-        model_worker_batch.spec_info.accept_length = batch_output.accept_lens
+        model_worker_batch.spec_info_padded.hidden_states = (
+            batch_output.next_draft_input.hidden_states
+        )
+        model_worker_batch.spec_info_padded.accept_length = batch_output.accept_lens
         model_worker_batch.input_ids = batch_output.next_draft_input.verified_id
         forward_metadata = draft_model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
@@ -852,7 +854,7 @@ class EagleVerifyInput:
         # extend_lens = jnp.array([self.draft_token_num] * bs)
         model_worker_batch.return_hidden_states = False
         model_worker_batch.forward_mode = ForwardMode.TARGET_VERIFY
-        model_worker_batch.spec_info = self
+        model_worker_batch.spec_info_padded = self
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.extend_seq_lens = self.draft_token
         # assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode

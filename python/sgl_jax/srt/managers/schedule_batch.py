@@ -2155,7 +2155,6 @@ class ScheduleBatch:
             logits_indices_selector=logits_indices_selector,
             capture_hidden_mode=getattr(spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL),
             launch_done=self.launch_done,
-            spec_info=spec_info,
             spec_info_padded=spec_info,
             spec_algorithm=self.spec_algorithm,
             tree_cache=self.tree_cache,
@@ -2570,7 +2569,6 @@ class ScheduleBatch:
                 )
             ),
             launch_done=self.launch_done,
-            spec_info=self.spec_info,
             spec_info_padded=self.spec_info,
             spec_algorithm=self.spec_algorithm,
             tree_cache=self.tree_cache,
@@ -3050,11 +3048,11 @@ class ModelWorkerBatch:
     # Pre-initialized ForwardBatch for overlap scheduling optimization
     forward_batch: Any | None = None
 
-    spec_info: EagleDraftInput | EagleVerifyInput | None = None
-    # Option C boundary field: cross-rank-flat (or scatter-padded under dp>1)
-    # spec input prepared by `_get_spec_decode_mwb_dp`. Forward path reads/
-    # mutates this; the legacy `spec_info` field is being phased out (step C
-    # renames forward-internal references; step E drops `spec_info`).
+    # Option C: spec_info_padded is the only spec field on ModelWorkerBatch.
+    # Layout is cross-rank-flat (or scatter-padded under dp>1) at forward
+    # entry; forward internals may mutate it through EagleVerifyInput before
+    # returning a fresh EagleDraftInput. Scheduler-persisted per-rank spec
+    # state lives on ScheduleBatch.reqs_info[r].spec_info instead.
     spec_info_padded: EagleDraftInput | EagleVerifyInput | None = None
     spec_algorithm: SpeculativeAlgorithm = None
     speculative_num_steps: int = 0
