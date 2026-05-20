@@ -34,20 +34,28 @@ jobs:
 
       - name: Get commit author
         id: author
-        run: |
-          AUTHOR=$(gh api repos/${{ github.repository }}/commits/${{ github.event.workflow_run.head_sha }} --jq '.commit.author.name // "unknown"' 2>/dev/null || echo "unknown")
-          echo "name=$AUTHOR" >> $GITHUB_OUTPUT
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          AUTHOR=$(gh api "repos/$REPO/commits/$COMMIT_SHA" --jq '.commit.author.name // "unknown"' 2>/dev/null || echo "unknown")
+          echo "name=$AUTHOR" >> $GITHUB_OUTPUT
 
       - name: Run failure monitor
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_RUN_ID: ${{ github.event.workflow_run.id }}
+          INPUT_REPO: ${{ github.repository }}
+          INPUT_WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          INPUT_RUN_URL: ${{ github.event.workflow_run.html_url }}
+          INPUT_COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
+          INPUT_COMMIT_AUTHOR: ${{ steps.author.outputs.name }}
         run: |
           python scripts/ci/ci_failure_monitor.py \
-            --run-id "${{ github.event.workflow_run.id }}" \
-            --repo "${{ github.repository }}" \
-            --workflow-name "${{ github.event.workflow_run.name }}" \
-            --run-url "${{ github.event.workflow_run.html_url }}" \
-            --commit-sha "${{ github.event.workflow_run.head_sha }}" \
-            --commit-author "${{ steps.author.outputs.name }}"
+            --run-id "$INPUT_RUN_ID" \
+            --repo "$INPUT_REPO" \
+            --workflow-name "$INPUT_WORKFLOW_NAME" \
+            --run-url "$INPUT_RUN_URL" \
+            --commit-sha "$INPUT_COMMIT_SHA" \
+            --commit-author "$INPUT_COMMIT_AUTHOR"
