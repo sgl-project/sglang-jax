@@ -116,6 +116,10 @@ class BaseSpecWorker:
             logits_output, next_token_ids, cache_miss_count, bid, _seq_lens = (
                 self.forward_target_extend(model_worker_batch, sampling_metadata)
             )
+            if model_worker_batch.dp_size > 1:
+                from jax.experimental.multihost_utils import process_allgather
+
+                next_token_ids = process_allgather(next_token_ids, tiled=True)
             self.draft_worker.draft_extend_for_prefill(
                 model_worker_batch, logits_output.hidden_states, next_token_ids
             )
@@ -123,14 +127,20 @@ class BaseSpecWorker:
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
                 next_draft_input=model_worker_batch.spec_info,
-                allocate_lens=model_worker_batch.seq_lens[: model_worker_batch.real_bs],
+                allocate_lens=np.asarray(model_worker_batch.seq_lens)[
+                    model_worker_batch.logits_indices_selector
+                ],
                 bid=bid,
                 cache_miss_count=cache_miss_count,
                 extend_input_len_per_req=None,
                 extend_logprob_start_len_per_req=None,
             )
 
-        cur_allocate_lens = model_worker_batch.spec_info.allocate_lens
+        # spec_info.allocate_lens is DP-padded (total_bs,) at dp>1 (scattered in
+        # _get_spec_decode_mwb_dp); gather back to global-flat (real_bs,) so the
+        # cross-round state on reqs_info[0].spec_info stays flat-ordered.
+        sel = model_worker_batch.logits_indices_selector
+        cur_allocate_lens = np.asarray(model_worker_batch.spec_info.allocate_lens)[sel]
         self.draft_worker.draft(model_worker_batch)
         batch_output = self.verify(model_worker_batch, cur_allocate_lens)
         self.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
