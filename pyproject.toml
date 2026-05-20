@@ -5,3 +5,4 @@ markers = [
     "slow: test takes a long time to run",
 ]
 addopts = ["--strict-markers"]
+strict_markers = true
