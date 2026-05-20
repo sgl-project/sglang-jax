@@ -18,7 +18,6 @@ import time
 import unittest
 from typing import Dict, List, Optional
 
-import pytest
 from pydantic import ValidationError
 
 from sgl_jax.srt.entrypoints.openai.protocol import (
@@ -63,8 +62,6 @@ from sgl_jax.srt.entrypoints.openai.protocol import (
     TopLogprob,
     UsageInfo,
 )
-
-pytestmark = pytest.mark.cpu_only
 
 
 class TestModelCard(unittest.TestCase):

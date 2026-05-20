@@ -4,5 +4,4 @@ markers = [
     "tpu_only: test requires TPU hardware",
     "slow: test takes a long time to run",
 ]
-addopts = ["--strict-markers"]
 strict_markers = true
