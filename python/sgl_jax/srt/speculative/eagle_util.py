@@ -509,16 +509,33 @@ class EagleDraftInput:
             self.verified_id.shape[0] == model_worker_batch.real_bs
         ), f"{self.verified_id.shape=} {model_worker_batch.real_bs=}"
 
-        pt = 0
-        for i in range(model_worker_batch.real_bs):
-            extend_len = model_worker_batch.extend_seq_lens[i]
-            input_ids = model_worker_batch.input_ids[pt : pt + extend_len]
-
-            # TODO: batch.input_ids should on tpu
-            model_worker_batch.input_ids[pt : pt + extend_len] = np.concatenate(
-                (input_ids[1:], self.verified_id[i].reshape(1))
-            )
-            pt += extend_len
+        # Walk the DP-padded layout in (rank, slot) order so token offsets line
+        # up with mwb.input_ids' token-major DP layout. Iterating real_bs and
+        # indexing extend_seq_lens by `i` skipped real reqs whose padded slot
+        # index > i (e.g. dp>1 prefill with only rank>0 active).
+        dp_size = model_worker_batch.dp_size
+        per_dp_bs = model_worker_batch.per_dp_bs_size if dp_size > 1 else 1
+        total_tok = len(model_worker_batch.input_ids)
+        per_dp_tok = total_tok // dp_size if dp_size > 0 else total_tok
+        extend_seq_lens = model_worker_batch.extend_seq_lens
+        flat_idx = 0  # index into self.verified_id (cross-rank flat)
+        for dp_rank in range(dp_size):
+            pt = dp_rank * per_dp_tok
+            for slot_in_rank in range(per_dp_bs):
+                slot = dp_rank * per_dp_bs + slot_in_rank
+                extend_len = int(extend_seq_lens[slot])
+                if extend_len == 0:
+                    continue
+                input_ids = model_worker_batch.input_ids[pt : pt + extend_len]
+                model_worker_batch.input_ids[pt : pt + extend_len] = np.concatenate(
+                    (input_ids[1:], self.verified_id[flat_idx].reshape(1))
+                )
+                pt += extend_len
+                flat_idx += 1
+        assert flat_idx == model_worker_batch.real_bs, (
+            f"prepare_for_extend_after_target_prefill mismatch: walked {flat_idx} "
+            f"real reqs but real_bs={model_worker_batch.real_bs}"
+        )
 
     def prepare_for_extend_after_verify(
         self,
