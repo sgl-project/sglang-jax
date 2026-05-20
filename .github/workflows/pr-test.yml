@@ -25,8 +25,8 @@ on:
       - ".github/workflows/pr-test.yml"
 
 concurrency:
-  group: pr-test-${{ github.ref }}
-  cancel-in-progress: true
+  group: pr-test-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # =============================================== coordinator ====================================================
