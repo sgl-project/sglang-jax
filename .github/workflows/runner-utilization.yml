@@ -38,12 +38,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUNNER_FILTER: ${{ inputs.filter || '' }}
+          REPORT_HOURS: ${{ inputs.hours || '24' }}
         run: |
+          if ! [[ "$REPORT_HOURS" =~ ^[0-9]+$ ]]; then
+            echo "Error: hours must be numeric, got: $REPORT_HOURS"
+            exit 1
+          fi
           FILTER_ARG=""
           if [ -n "$RUNNER_FILTER" ]; then
             FILTER_ARG="--filter $RUNNER_FILTER"
           fi
           python scripts/ci/utils/runner_utilization_report.py \
             --repo ${{ github.repository }} \
-            --hours ${{ inputs.hours || '24' }} \
+            --hours "$REPORT_HOURS" \
             $FILTER_ARG
