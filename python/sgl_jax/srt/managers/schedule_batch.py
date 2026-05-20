@@ -2205,6 +2205,76 @@ class ScheduleBatch:
             accept_length_cpu=flat.accept_length_cpu,
         )
 
+    @staticmethod
+    def _split_spec_info_per_rank(flat, real_bs_per_dp: list[int]) -> list:
+        """Slice a cross-rank-flat EagleDraftInput into per-rank EagleDraftInputs.
+
+        ``flat`` layout is ``[rank0 reqs ++ rank1 reqs ++ …]`` with total length
+        ``sum(real_bs_per_dp)``. Empty ranks (``real_bs == 0``) yield ``None``.
+        Used at forward output boundary to write back ``reqs_info[r].spec_info``.
+        """
+        if flat is None:
+            return [None] * len(real_bs_per_dp)
+
+        per_req_fields = (
+            "topk_p",
+            "topk_index",
+            "hidden_states",
+            "verified_id",
+            "allocate_lens",
+            "accept_length",
+            "accept_length_cpu",
+        )
+
+        out = []
+        offset = 0
+        for n in real_bs_per_dp:
+            if n == 0:
+                out.append(None)
+                continue
+            kwargs = {"capture_hidden_mode": flat.capture_hidden_mode}
+            for f in per_req_fields:
+                v = getattr(flat, f, None)
+                kwargs[f] = None if v is None else v[offset : offset + n]
+            out.append(type(flat)(**kwargs))
+            offset += n
+        return out
+
+    @staticmethod
+    def _concat_spec_info_per_rank(per_rank: list):
+        """Concat per-rank EagleDraftInputs into a single cross-rank-flat one.
+
+        ``None`` entries are skipped. Returns ``None`` if every entry is ``None``.
+        Used at forward input boundary (``_get_spec_decode_mwb_dp``) to build the
+        flat shape ``_scatter_spec_info_to_dp_slots`` expects.
+        """
+        nonempty = [s for s in per_rank if s is not None]
+        if not nonempty:
+            return None
+
+        per_req_fields = (
+            "topk_p",
+            "topk_index",
+            "hidden_states",
+            "verified_id",
+            "allocate_lens",
+            "accept_length",
+            "accept_length_cpu",
+        )
+
+        kwargs = {"capture_hidden_mode": nonempty[0].capture_hidden_mode}
+        for f in per_req_fields:
+            vals = [getattr(s, f, None) for s in nonempty]
+            nonnull = [v for v in vals if v is not None]
+            if not nonnull:
+                kwargs[f] = None
+                continue
+            if isinstance(nonnull[0], np.ndarray):
+                kwargs[f] = np.concatenate(nonnull, axis=0)
+            else:
+                kwargs[f] = jnp.concatenate(nonnull, axis=0)
+        return type(nonempty[0])(**kwargs)
+
     def get_model_worker_batch(
         self,
         token_paddings: list,

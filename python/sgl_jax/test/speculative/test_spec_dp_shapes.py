@@ -392,3 +392,77 @@ def test_resolve_spec_decode_token_ids(dp, bs_per_rank, accept_per_slot):
                 assert sb.reqs_info[r].reqs[j].spec_accepted_tokens == a
             else:
                 assert out[slot] == [], f"pad slot {slot} should be []"
+
+
+# ---------------------------------------------------------------------------
+# Option C helpers: split / concat per-rank round-trip
+# ---------------------------------------------------------------------------
+
+
+def _mk_distinct_spec_info(real_bs: int, seed: int = 0) -> EagleDraftInput:
+    """Like ``_mk_spec_info`` but with distinct values so we can detect
+    row reordering / mis-slicing after round-trip."""
+    rng = np.random.default_rng(seed)
+    base = np.arange(real_bs, dtype=np.int32) + seed * 1000
+    return EagleDraftInput(
+        topk_p=rng.random((real_bs, TOPK), dtype=np.float32),
+        topk_index=np.tile(base[:, None], (1, TOPK)).astype(np.int32),
+        hidden_states=np.tile(base[:, None], (1, HIDDEN)).astype(np.float32),
+        verified_id=base.copy(),
+        allocate_lens=(base + 8).astype(np.int32),
+    )
+
+
+@pytest.mark.parametrize(
+    "real_bs_per_dp",
+    [
+        [4],
+        [2, 2],
+        [3, 0],
+        [0, 3],
+        [1, 1, 1, 1],
+        [0, 2, 0, 3],
+    ],
+    ids=["dp1-4", "dp2-2+2", "dp2-3+0", "dp2-0+3", "dp4-1x4", "dp4-mixed"],
+)
+def test_split_concat_spec_info_round_trip(real_bs_per_dp):
+    """split → concat should reproduce the original cross-rank-flat layout."""
+    total = sum(real_bs_per_dp)
+    flat = _mk_distinct_spec_info(total, seed=1)
+
+    parts = ScheduleBatch._split_spec_info_per_rank(flat, real_bs_per_dp)
+    assert len(parts) == len(real_bs_per_dp)
+    for n, p in zip(real_bs_per_dp, parts):
+        if n == 0:
+            assert p is None
+        else:
+            assert p is not None
+            assert p.topk_p.shape == (n, TOPK)
+            assert p.verified_id.shape == (n,)
+            assert p.capture_hidden_mode == flat.capture_hidden_mode
+
+    back = ScheduleBatch._concat_spec_info_per_rank(parts)
+    assert back is not None
+    np.testing.assert_array_equal(np.asarray(back.topk_index), np.asarray(flat.topk_index))
+    np.testing.assert_array_equal(np.asarray(back.verified_id), np.asarray(flat.verified_id))
+    np.testing.assert_array_equal(np.asarray(back.allocate_lens), np.asarray(flat.allocate_lens))
+    np.testing.assert_array_equal(np.asarray(back.hidden_states), np.asarray(flat.hidden_states))
+    np.testing.assert_allclose(np.asarray(back.topk_p), np.asarray(flat.topk_p))
+
+
+def test_split_spec_info_none_passthrough():
+    parts = ScheduleBatch._split_spec_info_per_rank(None, [2, 3])
+    assert parts == [None, None]
+
+
+def test_concat_spec_info_all_none():
+    assert ScheduleBatch._concat_spec_info_per_rank([None, None]) is None
+
+
+def test_concat_spec_info_some_none_skips():
+    """Non-empty rank's data should be preserved when others are None."""
+    s = _mk_distinct_spec_info(3, seed=2)
+    out = ScheduleBatch._concat_spec_info_per_rank([None, s, None])
+    assert out is not None
+    np.testing.assert_array_equal(np.asarray(out.verified_id), np.asarray(s.verified_id))
+    assert out.verified_id.shape == (3,)
