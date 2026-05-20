@@ -552,8 +552,11 @@ class WeightLoader:
 
         head_dim = config.head_dim
         v_head_dim = getattr(config, "v_head_dim", head_dim)
-        num_heads = config.num_attention_heads
-        num_kv_heads = config.num_key_value_heads
+        full_num_heads = config.num_attention_heads
+        full_num_kv_heads = config.num_key_value_heads
+        swa_num_heads = getattr(config, "swa_num_attention_heads", full_num_heads)
+        swa_num_kv_heads = getattr(config, "swa_num_key_value_heads", full_num_kv_heads)
+        hybrid_layer_pattern = getattr(config, "hybrid_layer_pattern", None)
 
         quant_cfg = getattr(config, "quantization_config", None)
         block_size = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
@@ -561,6 +564,17 @@ class WeightLoader:
         tp_sharding = NamedSharding(self.mesh, P(None, "tensor"))
 
         for layer_idx in sorted(fused_qkv_buffers.keys()):
+            # Hybrid SWA/full-attn models (e.g. MiMo-V2.5) can have different
+            # num_kv_heads per layer; pick the correct head counts based on
+            # hybrid_layer_pattern (1=SWA, 0=full).
+            is_swa = (
+                hybrid_layer_pattern is not None
+                and layer_idx < len(hybrid_layer_pattern)
+                and hybrid_layer_pattern[layer_idx] == 1
+            )
+            num_heads = swa_num_heads if is_swa else full_num_heads
+            num_kv_heads = swa_num_kv_heads if is_swa else full_num_kv_heads
+
             buf = fused_qkv_buffers[layer_idx]
             fused_weight = buf["weight"]  # numpy, [total_qkv, hidden], FP8
             fused_scale = buf["scale"]  # numpy, [total_blocks, in_blocks], f32
@@ -699,8 +713,15 @@ class WeightLoader:
         # Try config value first, then smaller divisors (descending)
         kv_candidates = sorted(set(kv_candidates), reverse=True)
 
-        # TP candidates: all divisors of num_heads (covers any quantization-time TP)
-        tp_candidates = sorted(d for d in range(1, num_heads + 1) if num_heads % d == 0)
+        # TP candidates: all divisors of num_heads, descending.  Prefer the
+        # largest TP that matches because the Q/K/V split must reflect the
+        # actual quantization-time sharding.  When per_shard_total is a
+        # multiple of block_size, smaller TP values also satisfy the
+        # dimension check but produce an incorrect Q/K/V split.
+        tp_candidates = sorted(
+            (d for d in range(1, num_heads + 1) if num_heads % d == 0),
+            reverse=True,
+        )
 
         for orig_kv in kv_candidates:
             for tp in tp_candidates:
