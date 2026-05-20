@@ -66,7 +66,7 @@ jobs:
       CLUSTER_LOCATION: ${{ inputs.cluster_location || vars.GKE_CLUSTER_LOCATION }}
       WORKLOAD_IDENTITY_PROVIDER: ${{ inputs.workload_identity_provider || vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
       SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
-      NODE_POOL: ${{ inputs.node_pool || 'v6e-4x4-on-demand-np' }}
+      NODE_POOL: ${{ inputs.node_pool || vars.GKE_NODE_POOL || 'v6e-4x4-on-demand-np' }}
       NAMESPACE: ${{ inputs.namespace || 'default' }}
       BUCKET_NAME: ${{ inputs.bucket_name || 'model-storage-sglang' }}
       K8S_SERVICE_ACCOUNT: ${{ inputs.service_account_name || 'gcs-account' }}
