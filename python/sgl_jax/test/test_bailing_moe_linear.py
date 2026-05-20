@@ -133,10 +133,11 @@ def test_weight_mapping_contains_linear_mla_dense_and_shared_mlp_keys():
         type("DummyModelConfig", (), {"quantization_config": None})()
     )
 
-    assert (
-        mappings["model.layers.0.attention.query_key_value.weight"].target_path
-        == "model.layers.0.self_attn.qkv_proj.weight"
-    )
+    assert mappings["model.layers.0.attention.query_key_value.weight"].target_path == [
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+    ]
     assert (
         mappings["model.layers.0.attention.g_norm.weight"].target_path
         == "model.layers.0.self_attn.g_norm.weight"
@@ -157,6 +158,42 @@ def test_weight_mapping_contains_linear_mla_dense_and_shared_mlp_keys():
         mappings["model.layers.0.mlp.down_proj.weight"].target_path
         == "model.layers.0.mlp.down_proj.weight"
     )
+
+
+def test_weight_mapping_static_quant_gla_splits_into_weight_q_and_scale():
+    cfg = _tiny_config(num_hidden_layers=2, layer_group_size=2, full_attention_type="mla")
+    model = object.__new__(BailingMoeV2_5ForCausalLM)
+    object.__setattr__(model, "config", cfg)
+    object.__setattr__(
+        model,
+        "model",
+        type("DummyInnerModel", (), {"decoder_attention_types": [0, 1]})(),
+    )
+
+    class _FakeQuantCfg:
+        is_static_checkpoint = True
+
+    mappings = model._create_bailing_moe_linear_weight_mappings(
+        type("DummyModelConfig", (), {"quantization_config": _FakeQuantCfg()})()
+    )
+
+    qkv_w = mappings["model.layers.0.attention.query_key_value.weight"]
+    assert qkv_w.target_path == [
+        "model.layers.0.self_attn.q_proj.weight_q",
+        "model.layers.0.self_attn.k_proj.weight_q",
+        "model.layers.0.self_attn.v_proj.weight_q",
+    ]
+    assert qkv_w.sharding == ("tensor", None)
+    assert qkv_w.transpose is False
+
+    qkv_s = mappings["model.layers.0.attention.query_key_value.weight_scale"]
+    assert qkv_s.target_path == [
+        "model.layers.0.self_attn.q_proj.weight_scale",
+        "model.layers.0.self_attn.k_proj.weight_scale",
+        "model.layers.0.self_attn.v_proj.weight_scale",
+    ]
+    assert qkv_s.sharding == ("tensor", None)
+    assert qkv_s.transpose is False
 
 
 def test_weight_mapping_contains_moe_shared_expert_and_gqa_fallback_keys():

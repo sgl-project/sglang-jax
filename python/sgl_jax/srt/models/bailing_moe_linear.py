@@ -68,14 +68,35 @@ class BailingMoELinearAttention(nnx.Module):
 
         inner_size = self.num_heads * self.head_dim
         qkv_bias = getattr(config, "use_bias", False) or getattr(config, "use_qkv_bias", False)
-        self.qkv_proj = LinearBase(
+        # Separate Q/K/V projections: each per-head TP shard already aligns with
+        # the [T, num_heads, head_dim] reshape, so the reshape is a metadata op
+        # (no all-gather).
+        self.q_proj = LinearBase(
             input_size=self.hidden_size,
-            output_size=3 * inner_size,
+            output_size=inner_size,
             use_bias=qkv_bias,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
-            scope_name="query_key_value",
+            scope_name="q_proj",
+        )
+        self.k_proj = LinearBase(
+            input_size=self.hidden_size,
+            output_size=inner_size,
+            use_bias=qkv_bias,
+            kernel_axes=(None, "tensor"),
+            params_dtype=dtype,
+            mesh=mesh,
+            scope_name="k_proj",
+        )
+        self.v_proj = LinearBase(
+            input_size=self.hidden_size,
+            output_size=inner_size,
+            use_bias=qkv_bias,
+            kernel_axes=(None, "tensor"),
+            params_dtype=dtype,
+            mesh=mesh,
+            scope_name="v_proj",
         )
         self.g_proj = LinearBase(
             input_size=self.hidden_size,
@@ -151,17 +172,28 @@ class BailingMoELinearAttention(nnx.Module):
         forward_batch: ForwardBatch,
         recurrent_state_pool,
     ) -> tuple[jax.Array, tuple]:
-        qkv, _ = self.qkv_proj(hidden_states)
-        qkv = qkv.astype(jnp.float32)
-        if self.linear_silu:
-            qkv = jax.nn.silu(qkv)
+        q, _ = self.q_proj(hidden_states)
+        k, _ = self.k_proj(hidden_states)
+        v, _ = self.v_proj(hidden_states)
 
-        qkv = jax.lax.reshape(
-            qkv,
-            (hidden_states.shape[0], 3, self.num_heads, self.head_dim),
-            out_sharding=NamedSharding(self.mesh, P("data", None, "tensor", None)),
+        q = q.astype(jnp.float32)
+        k = k.astype(jnp.float32)
+        v = v.astype(jnp.float32)
+        if self.linear_silu:
+            q = jax.nn.silu(q)
+            k = jax.nn.silu(k)
+            v = jax.nn.silu(v)
+
+        head_shard = NamedSharding(self.mesh, P("data", "tensor", None))
+        q = q.reshape(
+            hidden_states.shape[0], self.num_heads, self.head_dim, out_sharding=head_shard
         )
-        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+        k = k.reshape(
+            hidden_states.shape[0], self.num_heads, self.head_dim, out_sharding=head_shard
+        )
+        v = v.reshape(
+            hidden_states.shape[0], self.num_heads, self.head_dim, out_sharding=head_shard
+        )
 
         if self.q_norm is not None:
             q = self.q_norm(q)
@@ -816,9 +848,40 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
     ) -> None:
         ap = f"{prefix}.attention"
         tp = f"{target}.self_attn"
-        self._add_linear(
-            mappings, f"{ap}.query_key_value", f"{tp}.qkv_proj", (None, "tensor"), is_static_quant
-        )
+        if is_static_quant:
+            # Static FP8: apply_linear_quantization swaps each q/k/v_proj LinearBase
+            # into a QuantizedLinear pair, so the fused HF QKV must fan out to six
+            # targets (q/k/v × {weight_q, weight_scale}). Sharding axis is swapped
+            # and transpose=False because static-FP8 stores [out, in] directly into
+            # weight_q.
+            mappings[f"{ap}.query_key_value.weight"] = WeightMapping(
+                target_path=[
+                    f"{tp}.q_proj.weight_q",
+                    f"{tp}.k_proj.weight_q",
+                    f"{tp}.v_proj.weight_q",
+                ],
+                sharding=("tensor", None),
+                transpose=False,
+            )
+            mappings[f"{ap}.query_key_value.weight_scale"] = WeightMapping(
+                target_path=[
+                    f"{tp}.q_proj.weight_scale",
+                    f"{tp}.k_proj.weight_scale",
+                    f"{tp}.v_proj.weight_scale",
+                ],
+                sharding=("tensor", None),
+                transpose=False,
+            )
+        else:
+            mappings[f"{ap}.query_key_value.weight"] = WeightMapping(
+                target_path=[
+                    f"{tp}.q_proj.weight",
+                    f"{tp}.k_proj.weight",
+                    f"{tp}.v_proj.weight",
+                ],
+                sharding=(None, "tensor"),
+                transpose=True,
+            )
         self._add_linear(
             mappings, f"{ap}.g_proj", f"{tp}.g_proj", (None, "tensor"), is_static_quant
         )
