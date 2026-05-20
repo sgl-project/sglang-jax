@@ -62,7 +62,9 @@ def cleanup_model_cache():
                         print(f"Failed to clean model cache: {e}\n", flush=True)
 
 
-def run_unittest_files(files: list[TestFile], timeout_per_file: float):
+def run_unittest_files(
+    files: list[TestFile], timeout_per_file: float, reruns: int = 0, reruns_delay: int = 0
+):
     tic = time.perf_counter()
     success = True
 
@@ -127,6 +129,8 @@ def run_unittest_files(files: list[TestFile], timeout_per_file: float):
                         "--with",
                         "pytest",
                     ]
+                    if reruns > 0:
+                        cmd.extend(["--with", "pytest-rerunfailures"])
                     for dep in file_entry.extra_deps or []:
                         cmd.extend(["--with", dep])
                     cmd.extend(
@@ -138,6 +142,8 @@ def run_unittest_files(files: list[TestFile], timeout_per_file: float):
                             filename,
                         ]
                     )
+                    if reruns > 0:
+                        cmd.extend(["--reruns", str(reruns), "--reruns-delay", str(reruns_delay)])
                 else:
                     cmd = [sys.executable, filename]
 
@@ -166,6 +172,21 @@ def run_unittest_files(files: list[TestFile], timeout_per_file: float):
 
         try:
             ret_code = run_with_timeout(run_one_file, args=(filename,), timeout=timeout_per_file)
+            if ret_code != 0 and reruns > 0 and file_entry.runner != "pytest":
+                for attempt in range(1, reruns + 1):
+                    print(
+                        f"\n[rerun {attempt}/{reruns}] {filename} failed, retrying after {reruns_delay}s...\n",
+                        flush=True,
+                    )
+                    time.sleep(reruns_delay)
+                    ret_code = run_with_timeout(
+                        run_one_file, args=(filename,), timeout=timeout_per_file
+                    )
+                    if ret_code == 0:
+                        print(
+                            f"\n[rerun {attempt}/{reruns}] {filename} passed on retry\n", flush=True
+                        )
+                        break
             assert ret_code == 0, f"expected return code 0, but {filename} returned {ret_code}"
         except TimeoutError:
             kill_process_tree(process.pid)
@@ -651,6 +672,18 @@ if __name__ == "__main__":
         type=int,
         help="Use auto load balancing. The number of parts.",
     )
+    arg_parser.add_argument(
+        "--reruns",
+        type=int,
+        default=0,
+        help="Number of times to retry a failed test file (0 = no retry). For pytest runner, also enables per-test retry via pytest-rerunfailures.",
+    )
+    arg_parser.add_argument(
+        "--reruns-delay",
+        type=int,
+        default=10,
+        help="Delay in seconds between reruns (default: 10).",
+    )
     args = arg_parser.parse_args()
     print(f"{args=}")
 
@@ -663,5 +696,7 @@ if __name__ == "__main__":
 
     print("The running tests are ", [f.name for f in files])
 
-    exit_code = run_unittest_files(files, args.timeout_per_file)
+    exit_code = run_unittest_files(
+        files, args.timeout_per_file, reruns=args.reruns, reruns_delay=args.reruns_delay
+    )
     exit(exit_code)
