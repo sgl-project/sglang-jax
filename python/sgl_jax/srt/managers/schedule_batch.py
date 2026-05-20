@@ -1418,12 +1418,9 @@ class ScheduleBatch:
 
         self.maybe_evict_swa()
 
-        # Spec decode: option C — spec_info is per-rank on reqs_info[r].
-        # prepare_for_decode operates on a cross-rank-flat EagleDraftInput
-        # (asserts allocate_lens.shape[0] == batch_size); rebuild the flat
-        # view via _concat, run prepare_for_decode (mutates allocate_lens +
-        # writes info.out_cache_loc per rank), then split allocate_lens back
-        # to per-rank.
+        # prepare_for_decode requires cross-rank-flat allocate_lens
+        # (asserts shape[0] == batch_size); rebuild via _concat, run it, then
+        # split allocate_lens back to per-rank.
         if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
             for info in self.reqs_info:
                 if not info.reqs:
@@ -1538,8 +1535,6 @@ class ScheduleBatch:
             chunked_req_to_exclude = {}
 
         # Unified DP filtering logic (works for all dp_size including 1).
-        # Option C: spec_info is per-rank now (lives on reqs_info[r].spec_info),
-        # so it filters naturally inside the per-rank loop below.
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
 
@@ -2082,12 +2077,10 @@ class ScheduleBatch:
             logits_indices_selector,
         ) = self._merge_batch_metadata(per_dp_bs, total_bs)
         sampling_info = self._merge_sampling_info(per_dp_bs, total_bs)
-        # Option C: per-rank spec_info lives on reqs_info[r].spec_info. Concat
-        # them into a cross-rank-flat EagleDraftInput, then scatter into
-        # DP-padded (total_bs, ...) slots via logits_indices_selector so
-        # spec_info[i] aligns with seq_lens[i]. padding_for_decode gathers via
-        # valid_mask=seq_lens>0 and gets back the global-flat order. New object
-        # — does not mutate the per-rank cross-round state.
+        # Concat per-rank spec_info into a cross-rank-flat EagleDraftInput,
+        # then scatter into DP-padded (total_bs, ...) slots so spec_info[i]
+        # aligns with seq_lens[i]. Returns a new object — does not mutate
+        # the per-rank cross-round state on reqs_info[r].spec_info.
         flat_spec = self._concat_spec_info_per_rank([info.spec_info for info in self.reqs_info])
         spec_info = self._scatter_spec_info_to_dp_slots(
             flat_spec, logits_indices_selector, total_bs
@@ -2435,7 +2428,6 @@ class ScheduleBatch:
         token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
         # FIXME @pc, move this to eagle_worker
         # If enable spec inference, use positions in spec info firstly.
-        # Option C: dp=1 fast path reads per-rank reqs_info[0].spec_info.
         spec_info_local = (
             self.reqs_info[0].spec_info if self.reqs_info and self.reqs_info[0] else None
         )
@@ -3043,11 +3035,10 @@ class ModelWorkerBatch:
     # Pre-initialized ForwardBatch for overlap scheduling optimization
     forward_batch: Any | None = None
 
-    # Option C: spec_info_padded is the only spec field on ModelWorkerBatch.
-    # Layout is cross-rank-flat (or scatter-padded under dp>1) at forward
-    # entry; forward internals may mutate it through EagleVerifyInput before
+    # Cross-rank-flat (or scatter-padded under dp>1) spec input at forward
+    # entry. Forward internals may mutate it through EagleVerifyInput before
     # returning a fresh EagleDraftInput. Scheduler-persisted per-rank spec
-    # state lives on ScheduleBatch.reqs_info[r].spec_info instead.
+    # state lives on ScheduleBatch.reqs_info[r].spec_info.
     spec_info_padded: EagleDraftInput | EagleVerifyInput | None = None
     spec_algorithm: SpeculativeAlgorithm = None
     speculative_num_steps: int = 0

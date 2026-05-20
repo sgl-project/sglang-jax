@@ -53,8 +53,6 @@ class EAGLEWorker(BaseSpecWorker):
         assert len(accepted_indices) == len(logits_output.next_token_logits)
 
         temperatures = batch.sampling_info.temperatures
-        # Option C: draft_token_num is a scalar shared across ranks; reqs_info[0]
-        # is guaranteed to have spec_info populated when this path runs.
         num_draft_tokens = batch.reqs_info[0].spec_info.draft_token_num
         temperatures = temperatures[accepted_indices // num_draft_tokens]
         if RETURN_ORIGINAL_LOGPROB:

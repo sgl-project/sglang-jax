@@ -86,9 +86,8 @@ def _mk_batch(dp_size: int, bs_per_rank: list[int]) -> ScheduleBatch:
         info.spec_info = None
         info.sampling_info = None
         reqs_info.append(info)
-    # Option C: spec_info is per-rank (symmetric with reqs/seq_lens). Build a
-    # cross-rank-flat one then split into reqs_info[r].spec_info so tests
-    # exercise the same layout the production producer/consumer pair uses.
+    # Build a cross-rank-flat EagleDraftInput then split into per-rank slots
+    # so tests exercise the same layout the production producer/consumer uses.
     flat_spec = _mk_spec_info(real_bs)
     per_rank_spec = ScheduleBatch._split_spec_info_per_rank(flat_spec, bs_per_rank)
     for r, s in enumerate(per_rank_spec):
@@ -175,7 +174,7 @@ def test_get_spec_decode_mwb_dp_shapes(dp, bs_per_rank):
     ],
 )
 def test_filter_batch_preserves_global_spec_info(dp, bs_per_rank, finish):
-    """Option C: spec_info filters naturally per-rank in the loop.
+    """spec_info filters naturally per-rank inside the loop.
 
     Tag each rank's spec arrays with a stable offset so we can verify which
     entries survive partial-finish.
@@ -226,7 +225,7 @@ def test_filter_batch_then_decode_mwb_round_trip():
 
     After rank 0 empties, the next `_get_spec_decode_mwb_dp` must still produce
     a dp-divisible mwb whose spec_info aligns with the DP-padded seq_lens slots.
-    Option C: per-rank spec_info on reqs_info[r].spec_info; the concat helper
+    Per-rank spec_info on reqs_info[r].spec_info; the concat helper
     rebuilds the cross-rank-flat view consumed by the scatter helper.
     """
     dp, bs_per_rank = 2, [1, 1]
@@ -277,8 +276,8 @@ def test_spec_info_aligns_with_dp_padded_slots(dp, bs_per_rank):
     """
     sb = _mk_batch(dp, bs_per_rank)
     real_bs = sum(bs_per_rank)
-    # Option C: tag per-rank allocate_lens with global-flat-style indices so
-    # _concat re-assembles the cross-rank-flat view the scatter helper expects.
+    # Tag per-rank allocate_lens with global-flat-style indices so _concat
+    # re-assembles the cross-rank-flat view the scatter helper expects.
     flat_base = 0
     for r, bs in enumerate(bs_per_rank):
         if bs == 0:
@@ -329,7 +328,7 @@ def test_draft_page_indices_dp_segmented(dp, bs_per_rank):
     """
     sb = _mk_batch(dp, bs_per_rank)
     real_bs = sum(bs_per_rank)
-    # Option C: distinct allocate_lens per rank so page boundaries observable.
+    # Distinct allocate_lens per rank so page boundaries are observable.
     flat_base = 0
     for r, bs in enumerate(bs_per_rank):
         if bs == 0:
@@ -433,7 +432,7 @@ def test_resolve_spec_decode_token_ids(dp, bs_per_rank, accept_per_slot):
 
 
 # ---------------------------------------------------------------------------
-# Option C helpers: split / concat per-rank round-trip
+# split / concat per-rank round-trip helpers
 # ---------------------------------------------------------------------------
 
 

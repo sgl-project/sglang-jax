@@ -651,7 +651,6 @@ class EagleDraftInput:
             return
 
         batch.input_ids = self.verified_id
-        # Option C: deprecated path; read per-rank spec_info via reqs_info[0].
         rank0_spec = batch.reqs_info[0].spec_info if batch.reqs_info else None
         accept_length_cpu_arr = rank0_spec.accept_length_cpu if rank0_spec else None
         if accept_length_cpu_arr is None:
@@ -685,12 +684,10 @@ class EagleDraftInput:
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True):
         new_indices = np.asarray(new_indices)
-        # Option C: dispatch on whether self has already been trimmed to the
-        # surviving subset. Verify path produces a pre-trimmed next_draft_input
-        # so len matches len(new_indices) — truncate is a no-op. Other paths
-        # (draft_extend) leave self at full per-rank size — fall back to fancy
-        # index. has_been_filtered is kept for backward signalling but the
-        # length check is the real guard.
+        # Verify path produces a pre-trimmed next_draft_input so len matches
+        # and truncate is a no-op. Other paths (draft_extend) leave self at
+        # full per-rank size and need fancy-index; the length check is the
+        # real guard, has_been_filtered is kept for backward signalling.
         if has_been_filtered and len(new_indices) == len(self.topk_p):
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]

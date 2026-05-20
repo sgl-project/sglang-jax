@@ -1842,8 +1842,6 @@ class Scheduler(
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch
             )
-            # Option C: split cross-rank-flat next_draft_input back to per-rank
-            # reqs_info[r].spec_info (symmetric with seq_lens / req_pool_indices).
             per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
                 batch_output.next_draft_input, model_worker_batch.real_bs_per_dp
             )
