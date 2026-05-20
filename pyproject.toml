@@ -1,4 +1,5 @@
 [tool.pytest.ini_options]
+testpaths = ["test"]
 markers = [
     "cpu_only: test runs only on CPU, no TPU/GPU hardware required",
     "tpu_only: test requires TPU hardware",
