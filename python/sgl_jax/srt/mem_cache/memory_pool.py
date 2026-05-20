@@ -1369,7 +1369,9 @@ class MemoryPools:
         try:
             return self._pools[name]
         except KeyError:
-            raise AttributeError(f"MemoryPools has no pool '{name}'") from None
+            raise AttributeError(
+                f"MemoryPools has no pool '{name}'. " f"Available pools: {sorted(self._pools)}"
+            ) from None
 
     def tree_flatten(self):
         keys = sorted(self._pools.keys())
