@@ -141,13 +141,17 @@ class WeightLoader:
             # Use original count for replication logic
             self.num_kv_heads = model_config.get_total_num_kv_heads()
             self.hidden_size = model_config.hidden_size
-            self.head_dim_original = getattr(
-                model_config, "head_dim", self.hidden_size // self.num_heads
-            )
+            # Read head_dim / v_head_dim from hf_text_config rather than model_config:
+            # patch_model_config writes mc.head_dim for KV-cache / MemoryPools sizing,
+            # but the loader needs the per-layer truth for split-QKV weight slicing.
+            # hf_text_config stays unpatched so split-QKV slicing is correct for
+            # hybrid-attention models.
+            hf_cfg = getattr(model_config, "hf_text_config", model_config)
+            self.head_dim_original = getattr(hf_cfg, "head_dim", self.hidden_size // self.num_heads)
 
             self.head_dim_pad = (self.head_dim_original + 127) // 128 * 128 - self.head_dim_original
             self.head_dim = self.head_dim_original
-            self.v_head_dim = getattr(model_config, "v_head_dim", self.head_dim_original)
+            self.v_head_dim = getattr(hf_cfg, "v_head_dim", self.head_dim_original)
         if hasattr(self.mesh, "shape") and "tensor" in self.mesh.shape:
             self.sharding_size = self.mesh.shape["tensor"]
         else:
@@ -2818,10 +2822,9 @@ class WeightLoader:
         elif padding_strategy == "zero":
             target_heads_total = total_kv_heads * num_replicas
 
-            if step_size == 1:
-                target_len = target_heads_total
-            else:
-                target_len = target_heads_total * self.head_dim
+            target_len = (
+                target_heads_total if step_size == 1 else target_heads_total * self.head_dim
+            )
 
             current_len = weight.shape[target_axis]
             padding_len = target_len - current_len
