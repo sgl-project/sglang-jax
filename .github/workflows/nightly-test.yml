@@ -32,6 +32,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
         timeout-minutes: 3000
         run: |
           python3.12 -m venv .venv
@@ -54,7 +55,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
+          python3 scripts/ci/publish.py --data-type bench --source-dir ./test/nightly_test_output
 
       - name: Generate CSV Entry and publish
         env:
@@ -76,7 +77,7 @@ jobs:
           fi
           echo "$SHA,$AUTHOR,$MSG,$RUN_URL" >> $FILE
           echo "CSV line added: $SHA, $AUTHOR, $MSG"
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./meta
+          python3 scripts/ci/publish.py --data-type bench --source-dir ./meta
 
 
   nightly-test-accuracy-text-models-4-tpu:
@@ -96,6 +97,7 @@ jobs:
         env:
             HF_TOKEN: ${{ secrets.HF_TOKEN }}
             HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+            JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
         timeout-minutes: 1200
         run: |
           python3.12 -m venv .venv
@@ -119,7 +121,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
+          python3 scripts/ci/publish.py --data-type bench --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-text-models-1-tpu:
@@ -143,6 +145,7 @@ jobs:
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
@@ -167,7 +170,7 @@ jobs:
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
 
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
+          python3 scripts/ci/publish.py --data-type perf --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-text-models-4-tpu-part1:
@@ -188,6 +191,7 @@ jobs:
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
@@ -211,7 +215,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
+          python3 scripts/ci/publish.py --data-type perf --source-dir ./test/nightly_test_output
 
       - name: Generate CSV Entry and publish
         env:
@@ -233,7 +237,7 @@ jobs:
           fi
           echo "$SHA,$AUTHOR,$MSG,$RUN_URL" >> $FILE
           echo "CSV line added: $SHA, $AUTHOR, $MSG"
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./meta
+          python3 scripts/ci/publish.py --data-type perf --source-dir ./meta
 
 
   nightly-test-perf-text-models-4-tpu-part2:
@@ -254,6 +258,7 @@ jobs:
             PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
             HF_TOKEN: ${{ secrets.HF_TOKEN }}
             HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+            JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
           run: |
             python3.12 -m venv .venv
             source .venv/bin/activate
@@ -277,7 +282,7 @@ jobs:
             GITHUB_RUN_ID: ${{ github.run_id }}
             GITHUB_RUN_NUMBER: ${{ github.run_number }}
           run: |
-            python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
+            python3 scripts/ci/publish.py --data-type perf --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-text-models-4-tpu-part3:
@@ -298,6 +303,7 @@ jobs:
               PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
               HF_TOKEN: ${{ secrets.HF_TOKEN }}
               HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+              JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
             run: |
               python3.12 -m venv .venv
               source .venv/bin/activate
@@ -321,7 +327,7 @@ jobs:
               GITHUB_RUN_ID: ${{ github.run_id }}
               GITHUB_RUN_NUMBER: ${{ github.run_number }}
             run: |
-              python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
+              python3 scripts/ci/publish.py --data-type perf --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-trace-text-models-1-tpu:
@@ -345,6 +351,7 @@ jobs:
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
@@ -368,7 +375,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir ./test/nightly_test_output
+          python3 scripts/ci/publish.py --data-type trace --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-trace-text-models-4-tpu-part1:
@@ -389,6 +396,7 @@ jobs:
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
@@ -412,7 +420,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir ./test/nightly_test_output
+          python3 scripts/ci/publish.py --data-type trace --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-trace-text-models-4-tpu-part2:
@@ -433,6 +441,7 @@ jobs:
             PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
             HF_TOKEN: ${{ secrets.HF_TOKEN }}
             HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+            JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
           run: |
             python3.12 -m venv .venv
             source .venv/bin/activate
@@ -456,7 +465,7 @@ jobs:
             GITHUB_RUN_ID: ${{ github.run_id }}
             GITHUB_RUN_NUMBER: ${{ github.run_number }}
           run: |
-            python3 scripts/ci/publish_traces.py --traces-dir ./test/nightly_test_output
+            python3 scripts/ci/publish.py --data-type trace --source-dir ./test/nightly_test_output
 
         - name: Generate CSV Entry and publish
           env:
@@ -478,4 +487,4 @@ jobs:
             fi
             echo "$SHA,$AUTHOR,$MSG,$RUN_URL" >> $FILE
             echo "CSV line added: $SHA, $AUTHOR, $MSG"
-            python3 scripts/ci/publish_bench_and_perf.py --source-dir ./meta
+            python3 scripts/ci/publish.py --data-type bench --source-dir ./meta
