@@ -316,6 +316,13 @@ jobs:
             exit 1
           fi
 
+          # If coordinator decided not to run tests (e.g. draft PR), skips are by-design
+          should_run="${{ needs.coordinator.outputs.should_run }}"
+          if [ "$should_run" != "true" ]; then
+            echo "should_run is false (e.g. draft PR) — all test skips are by design"
+            exit 0
+          fi
+
           # If no relevant files changed, all test skips are by-design
           main_package="${{ needs.coordinator.outputs.main_package }}"
           pallas_kernel="${{ needs.coordinator.outputs.pallas_kernel }}"
