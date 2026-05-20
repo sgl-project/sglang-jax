@@ -1,0 +1,36 @@
+name: Nightly Slack Notify
+
+on:
+  workflow_run:
+    workflows:
+      - "Nightly Test"
+      - "Nightly Test Daily"
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Workflow run ID to check (for manual testing)"
+        required: true
+
+jobs:
+  notify-failure:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for failures and notify
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id || github.event.inputs.run_id }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name || 'Manual Check' }}
+          RUN_URL: ${{ github.event.workflow_run.html_url || format('https://github.com/{0}/actions/runs/{1}', github.repository, github.event.inputs.run_id) }}
+          COMMIT_SHA: ${{ github.event.workflow_run.head_sha || 'N/A' }}
+          COMMIT_AUTHOR: ${{ github.event.workflow_run.head_commit.author.name || github.event.workflow_run.actor.login || 'unknown' }}
+        run: python3 scripts/ci/slack_notify.py
