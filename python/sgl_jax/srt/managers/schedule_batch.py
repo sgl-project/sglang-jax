@@ -1605,15 +1605,6 @@ class ScheduleBatch:
             else:
                 info.seq_lens_sum = 0
 
-            # Filter speculative decoding arrays manually (if present)
-            if info.spec_info is not None and info.spec_info.topk_p is not None:
-                keep_indices_jax = jnp.asarray(keep_indices_dp, dtype=jnp.int32)
-                info.spec_info.topk_p = info.spec_info.topk_p[keep_indices_jax]
-                info.spec_info.topk_index = info.spec_info.topk_index[keep_indices_jax]
-                info.spec_info.hidden_states = info.spec_info.hidden_states[keep_indices_jax]
-                info.spec_info.verified_id = info.spec_info.verified_id[keep_indices_jax]
-                info.spec_info.allocate_lens = info.spec_info.allocate_lens[keep_indices_jax]
-
             # Filter logprob lists
             if info.top_logprobs_nums is not None:
                 info.top_logprobs_nums = [info.top_logprobs_nums[i] for i in keep_indices_dp]
@@ -1623,9 +1614,8 @@ class ScheduleBatch:
             if info.sampling_info is not None:
                 info.sampling_info.filter_batch(np.array(keep_indices_dp))
 
-            # Filter spec_info (method call)
+            # Filter spec_info (per-rank EagleDraftInput; handles all 5 spec arrays).
             if info.spec_info is not None:
-                # Note: has_been_filtered logic matches original implementation
                 if chunked_req_to_exclude is not None and len(chunked_req_to_exclude) > 0:
                     has_been_filtered = False
                 else:

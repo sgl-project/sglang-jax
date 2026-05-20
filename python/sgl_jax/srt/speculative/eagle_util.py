@@ -681,25 +681,26 @@ class EagleDraftInput:
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True):
         new_indices = np.asarray(new_indices)
-        if has_been_filtered:
-            # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
-            # therefore, we don't need to filter the batch again in scheduler
-            if len(new_indices) != len(self.topk_p):
-                logger.warning(
-                    "length of new_indices: %d != length of topk_p: %d, this should not happen",
-                    len(new_indices),
-                    len(self.topk_p),
-                )
+        # Option C: dispatch on whether self has already been trimmed to the
+        # surviving subset. Verify path produces a pre-trimmed next_draft_input
+        # so len matches len(new_indices) — truncate is a no-op. Other paths
+        # (draft_extend) leave self at full per-rank size — fall back to fancy
+        # index. has_been_filtered is kept for backward signalling but the
+        # length check is the real guard.
+        if has_been_filtered and len(new_indices) == len(self.topk_p):
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]
             self.verified_id = self.verified_id[: len(new_indices)]
+            if self.allocate_lens is not None:
+                self.allocate_lens = np.asarray(self.allocate_lens)[: len(new_indices)]
         else:
-            # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
             self.hidden_states = self.hidden_states[new_indices]
             self.verified_id = self.verified_id[new_indices]
+            if self.allocate_lens is not None:
+                self.allocate_lens = np.asarray(self.allocate_lens)[new_indices]
 
     def merge_batch(self, spec_info: EagleDraftInput):
         # FIXME(pc) need support overlap here

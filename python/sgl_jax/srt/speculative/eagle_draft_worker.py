@@ -359,44 +359,38 @@ class EagleDraftWorker(BaseDraftWorker):
                 )
             )
         bs = self.precompile_bs_paddings[padding_bs_index]
-        if bs - model_worker_batch.spec_info_padded.verified_id.shape[0] > 0:
-            model_worker_batch.spec_info_padded.verified_id = np.pad(
-                model_worker_batch.spec_info_padded.verified_id,
-                ((0, bs - model_worker_batch.spec_info_padded.verified_id.shape[0]),),
-            )
-        if bs - model_worker_batch.spec_info_padded.topk_p.shape[0] > 0:
-            model_worker_batch.spec_info_padded.topk_p = np.pad(
-                model_worker_batch.spec_info_padded.topk_p,
-                (
-                    (0, bs - model_worker_batch.spec_info_padded.topk_p.shape[0]),
-                    (0, 0),
-                ),
-            )
+        dp_size = model_worker_batch.dp_size
+        per_dp_padded = bs // dp_size
+
+        def _dp_segment_pad(arr, target_bs):
+            """DP-segmented pad: pad each rank's section separately to per_dp_padded.
+
+            Input arr shape (curr_bs, ...) with curr_bs = per_dp_curr * dp_size.
+            Returns (target_bs, ...) with each rank's slice padded at the end.
+            End-padding the whole array would let shard_map(P("data")) hand a
+            following rank's data to a prior rank.
+            """
+            if arr is None or arr.shape[0] >= target_bs:
+                return arr
+            per_dp_curr = max(arr.shape[0] // dp_size, 1) if dp_size > 0 else arr.shape[0]
+            if dp_size <= 1 or arr.shape[0] % dp_size != 0:
+                # Fallback to end-pad if layout isn't DP-divisible (dp=1 path).
+                pad_widths = [(0, target_bs - arr.shape[0])] + [(0, 0)] * (arr.ndim - 1)
+                return np.pad(arr, pad_widths)
+            reshaped = arr.reshape((dp_size, per_dp_curr) + arr.shape[1:])
+            pad_widths = [(0, 0), (0, per_dp_padded - per_dp_curr)] + [(0, 0)] * (arr.ndim - 1)
+            padded = np.pad(reshaped, pad_widths)
+            return padded.reshape((target_bs,) + arr.shape[1:])
+
+        spec_info_padded = model_worker_batch.spec_info_padded
+        spec_info_padded.verified_id = _dp_segment_pad(spec_info_padded.verified_id, bs)
+        spec_info_padded.topk_p = _dp_segment_pad(spec_info_padded.topk_p, bs)
         if bs - model_worker_batch.seq_lens.shape[0] > 0:
-            model_worker_batch.seq_lens = np.pad(
-                model_worker_batch.seq_lens, ((0, bs - model_worker_batch.seq_lens.shape[0]),)
-            )
-            if model_worker_batch.spec_info_padded.allocate_lens is not None:
-                model_worker_batch.spec_info_padded.allocate_lens = np.pad(
-                    model_worker_batch.spec_info_padded.allocate_lens,
-                    ((0, bs - model_worker_batch.spec_info_padded.allocate_lens.shape[0]),),
-                )
-        if bs - model_worker_batch.spec_info_padded.topk_index.shape[0] > 0:
-            model_worker_batch.spec_info_padded.topk_index = np.pad(
-                model_worker_batch.spec_info_padded.topk_index,
-                (
-                    (0, bs - model_worker_batch.spec_info_padded.topk_index.shape[0]),
-                    (0, 0),
-                ),
-            )
-        if bs - model_worker_batch.spec_info_padded.hidden_states.shape[0] > 0:
-            model_worker_batch.spec_info_padded.hidden_states = np.pad(
-                model_worker_batch.spec_info_padded.hidden_states,
-                (
-                    (0, bs - model_worker_batch.spec_info_padded.hidden_states.shape[0]),
-                    (0, 0),
-                ),
-            )
+            model_worker_batch.seq_lens = _dp_segment_pad(model_worker_batch.seq_lens, bs)
+            if spec_info_padded.allocate_lens is not None:
+                spec_info_padded.allocate_lens = _dp_segment_pad(spec_info_padded.allocate_lens, bs)
+        spec_info_padded.topk_index = _dp_segment_pad(spec_info_padded.topk_index, bs)
+        spec_info_padded.hidden_states = _dp_segment_pad(spec_info_padded.hidden_states, bs)
         model_worker_batch.speculative_eagle_topk = self.topk
         model_worker_batch.speculative_num_steps = self.speculative_num_steps
         model_worker_batch.speculative_num_draft_tokens = self.speculative_num_draft_tokens
