@@ -25,6 +25,8 @@ jobs:
     continue-on-error: true
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -89,6 +91,8 @@ jobs:
     continue-on-error: true
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -132,6 +136,8 @@ jobs:
     continue-on-error: true
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -176,6 +182,8 @@ jobs:
     continue-on-error: true
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -242,6 +250,8 @@ jobs:
       continue-on-error: true
       env:
         TZ: Asia/Shanghai
+        JAX_COMPILATION_CACHE_DIR: /xla-cache
+        SGLANG_JAX_MODEL_CACHE: /models/model_scope
       steps:
         - name: Checkout code
           uses: actions/checkout@v4
@@ -286,6 +296,8 @@ jobs:
         continue-on-error: true
         env:
           TZ: Asia/Shanghai
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
+          SGLANG_JAX_MODEL_CACHE: /models/model_scope
         steps:
           - name: Checkout code
             uses: actions/checkout@v4
@@ -334,6 +346,8 @@ jobs:
     continue-on-error: true
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -377,6 +391,8 @@ jobs:
     continue-on-error: true
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -421,6 +437,8 @@ jobs:
       continue-on-error: true
       env:
         TZ: Asia/Shanghai
+        JAX_COMPILATION_CACHE_DIR: /xla-cache
+        SGLANG_JAX_MODEL_CACHE: /models/model_scope
       steps:
         - name: Checkout code
           uses: actions/checkout@v4
