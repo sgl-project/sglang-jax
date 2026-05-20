@@ -32,12 +32,12 @@ jobs:
   # =============================================== coordinator ====================================================
   coordinator:
     uses: ./.github/workflows/coordinator.yml
-  # =============================================== unit-test ====================================================
+
+  # =============================================== Stage 1: fast unit tests ========================================
   unit-test-1-tpu:
     needs: [coordinator]
     if: needs.coordinator.outputs.should_run == 'true' && needs.coordinator.outputs.main_package == 'true'
     runs-on: arc-runner-v6e-1
-    #runs-on: ubuntu-slim
     strategy:
       fail-fast: false
       matrix:
@@ -58,8 +58,19 @@ jobs:
           uv pip install -e "python[all]"
           python test/srt/run_suite.py --suite unit-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
-  unit-test-4-tpu:
+  cpu-test:
     needs: [coordinator]
+    if: needs.coordinator.outputs.should_run == 'true' && needs.coordinator.outputs.main_package == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run CPU tests (placeholder)
+        timeout-minutes: 10
+        run: |
+          echo "cpu-test suite not yet available, skipping"
+
+  # =============================================== Stage 2: multi-chip + e2e + accuracy ============================
+  unit-test-4-tpu:
+    needs: [coordinator, unit-test-1-tpu, cpu-test]
     if: needs.coordinator.outputs.should_run == 'true' && needs.coordinator.outputs.main_package == 'true'
     runs-on: arc-runner-v6e-4
     strategy:
@@ -82,9 +93,8 @@ jobs:
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite unit-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
-  # =============================================== e2e-test ===============================================
   e2e-test-1-tpu:
-    needs: [coordinator]
+    needs: [coordinator, unit-test-1-tpu, cpu-test]
     if: needs.coordinator.outputs.should_run == 'true' && needs.coordinator.outputs.main_package == 'true'
     runs-on: arc-runner-v6e-1
     strategy:
@@ -110,9 +120,8 @@ jobs:
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite e2e-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
-
   e2e-test-4-tpu:
-    needs: [coordinator]
+    needs: [coordinator, unit-test-1-tpu, cpu-test]
     if: needs.coordinator.outputs.should_run == 'true' && needs.coordinator.outputs.main_package == 'true'
     runs-on: arc-runner-v6e-4
     strategy:
@@ -138,9 +147,8 @@ jobs:
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite e2e-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
-  # =============================================== accurancy-test ===============================================
-  accurancy-test-1-tpu:
-    needs: [coordinator]
+  accuracy-test-1-tpu:
+    needs: [coordinator, unit-test-1-tpu, cpu-test]
     if: needs.coordinator.outputs.should_run == 'true' && needs.coordinator.outputs.main_package == 'true'
     runs-on: arc-runner-v6e-1
     strategy:
@@ -149,8 +157,7 @@ jobs:
         part: [0]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@v5
       - name: Evaluate accuracy
         timeout-minutes: 20
         env:
@@ -166,10 +173,9 @@ jobs:
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
-  accurancy-test-4-tpu:
-    needs: [coordinator]
+  accuracy-test-4-tpu:
+    needs: [coordinator, unit-test-1-tpu, cpu-test]
     if: needs.coordinator.outputs.should_run == 'true' && needs.coordinator.outputs.main_package == 'true'
-
     runs-on: arc-runner-v6e-4
     strategy:
       fail-fast: false
@@ -177,8 +183,7 @@ jobs:
         part: [0]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@v5
       - name: Evaluate MoE accuracy (TP=4)
         timeout-minutes: 50
         env:
@@ -194,11 +199,10 @@ jobs:
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-4 --timeout-per-file 3000 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
-  # =============================================== performance-test ===============================================
+  # =============================================== Stage 3: performance benchmarks =================================
   performance-test-1-tpu:
-    needs: [coordinator]
+    needs: [coordinator, unit-test-4-tpu, e2e-test-1-tpu, e2e-test-4-tpu, accuracy-test-1-tpu, accuracy-test-4-tpu]
     if: needs.coordinator.outputs.should_run == 'true' && needs.coordinator.outputs.main_package == 'true'
-
     runs-on: arc-runner-v6e-1
     strategy:
       fail-fast: false
@@ -206,8 +210,7 @@ jobs:
         part: [0]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@v5
       - name: Benchmark performance
         timeout-minutes: 30
         env:
@@ -224,9 +227,8 @@ jobs:
           python test/srt/run_suite.py --suite performance-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   performance-test-4-tpu:
-    needs: [coordinator]
+    needs: [coordinator, unit-test-4-tpu, e2e-test-1-tpu, e2e-test-4-tpu, accuracy-test-1-tpu, accuracy-test-4-tpu]
     if: needs.coordinator.outputs.should_run == 'true' && needs.coordinator.outputs.main_package == 'true'
-
     runs-on: arc-runner-v6e-4
     strategy:
       fail-fast: false
@@ -234,11 +236,9 @@ jobs:
         part: [0, 1]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@v5
       - name: Benchmark performance (tp=4)
         timeout-minutes: 50
-
         env:
           SGLANG_JAX_IS_IN_CI: true
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
@@ -252,7 +252,8 @@ jobs:
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite performance-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3000
 
-  # =============================================== kernel-benchmark ===============================================
+  # =============================================== kernel benchmark (independent) ==================================
+  # Independent of the stage chain: triggered by pallas_kernel changes, not main_package.
   pallas-kernel-benchmark:
     needs: [coordinator]
     if: needs.coordinator.outputs.should_run == 'true' && needs.coordinator.outputs.pallas_kernel == 'true'
@@ -279,17 +280,19 @@ jobs:
           uv pip install -e "python[all]"
           python test/srt/run_suite.py --suite kernel-performance-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
+  # =============================================== finish gate =====================================================
   pr-test-finish:
     needs: [
       coordinator,
-      performance-test-1-tpu,
-      performance-test-4-tpu,
-      accurancy-test-1-tpu,
-      accurancy-test-4-tpu,
       unit-test-1-tpu,
+      cpu-test,
       unit-test-4-tpu,
       e2e-test-1-tpu,
       e2e-test-4-tpu,
+      accuracy-test-1-tpu,
+      accuracy-test-4-tpu,
+      performance-test-1-tpu,
+      performance-test-4-tpu,
       pallas-kernel-benchmark,
     ]
     if: always()
@@ -299,14 +302,23 @@ jobs:
         run: |
           echo "=== Job Results ==="
           echo "coordinator: ${{ needs.coordinator.result }}"
+          echo ""
+          echo "--- Stage 1 ---"
           echo "unit-test-1-tpu: ${{ needs.unit-test-1-tpu.result }}"
+          echo "cpu-test: ${{ needs.cpu-test.result }}"
+          echo ""
+          echo "--- Stage 2 ---"
           echo "unit-test-4-tpu: ${{ needs.unit-test-4-tpu.result }}"
           echo "e2e-test-1-tpu: ${{ needs.e2e-test-1-tpu.result }}"
           echo "e2e-test-4-tpu: ${{ needs.e2e-test-4-tpu.result }}"
-          echo "accurancy-test-1-tpu: ${{ needs.accurancy-test-1-tpu.result }}"
-          echo "accurancy-test-4-tpu: ${{ needs.accurancy-test-4-tpu.result }}"
+          echo "accuracy-test-1-tpu: ${{ needs.accuracy-test-1-tpu.result }}"
+          echo "accuracy-test-4-tpu: ${{ needs.accuracy-test-4-tpu.result }}"
+          echo ""
+          echo "--- Stage 3 ---"
           echo "performance-test-1-tpu: ${{ needs.performance-test-1-tpu.result }}"
           echo "performance-test-4-tpu: ${{ needs.performance-test-4-tpu.result }}"
+          echo ""
+          echo "--- Independent ---"
           echo "pallas-kernel-benchmark: ${{ needs.pallas-kernel-benchmark.result }}"
           echo ""
 
@@ -338,11 +350,12 @@ jobs:
           if [ "$main_package" = "true" ]; then
             for job_result in \
               "unit-test-1-tpu=${{ needs.unit-test-1-tpu.result }}" \
+              "cpu-test=${{ needs.cpu-test.result }}" \
               "unit-test-4-tpu=${{ needs.unit-test-4-tpu.result }}" \
               "e2e-test-1-tpu=${{ needs.e2e-test-1-tpu.result }}" \
               "e2e-test-4-tpu=${{ needs.e2e-test-4-tpu.result }}" \
-              "accurancy-test-1-tpu=${{ needs.accurancy-test-1-tpu.result }}" \
-              "accurancy-test-4-tpu=${{ needs.accurancy-test-4-tpu.result }}" \
+              "accuracy-test-1-tpu=${{ needs.accuracy-test-1-tpu.result }}" \
+              "accuracy-test-4-tpu=${{ needs.accuracy-test-4-tpu.result }}" \
               "performance-test-1-tpu=${{ needs.performance-test-1-tpu.result }}" \
               "performance-test-4-tpu=${{ needs.performance-test-4-tpu.result }}"; do
               job_name="${job_result%%=*}"
