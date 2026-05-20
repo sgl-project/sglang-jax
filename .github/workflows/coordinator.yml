@@ -33,7 +33,6 @@ on:
       should_run:
         description: "Should any tests run (not draft AND has relevant changes)"
         value: ${{ jobs.decide.outputs.should_run }}
-  workflow_dispatch:
 
 jobs:
   decide:
