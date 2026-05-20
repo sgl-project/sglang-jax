@@ -7,6 +7,7 @@ averages, and alerts via GitHub issue if metrics deviate beyond threshold.
 """
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -40,10 +41,12 @@ def get_date_folders(session, subdir):
     return sorted([item["name"] for item in resp.json() if item["type"] == "dir"])
 
 
-def fetch_metric_data(session, subdir, filename, metric):
+def fetch_metric_data(session, subdir, filename, metric, filters=None):
     """Fetch all historical data for a specific metric.
 
     Returns a list of {"date": str, "value": float} dicts sorted by date.
+    filters: optional dict of {column: value} to narrow rows before averaging
+             (e.g., {"concurrency": 8, "input": 1024, "output": 1024}).
     """
     dates = get_date_folders(session, subdir)
     if not dates:
@@ -60,6 +63,12 @@ def fetch_metric_data(session, subdir, filename, metric):
             res = session.get(raw_url, timeout=30)
             if res.status_code == 200:
                 df = pd.read_csv(StringIO(res.text))
+                # Apply filters if specified (e.g., concurrency=8, input=1024)
+                if filters:
+                    for col, val in filters.items():
+                        if col in df.columns:
+                            df[col] = pd.to_numeric(df[col], errors="coerce")
+                            df = df[df[col] == val]
                 if metric in df.columns:
                     df[metric] = pd.to_numeric(df[metric], errors="coerce")
                     values = df[metric].dropna().tolist()
@@ -118,9 +127,46 @@ def check_threshold(values, window, threshold_pct, metric_name, higher_is_better
 
 def create_alert_issue(repo, details, token):
     """Create a GitHub issue for a threshold violation."""
+    env = os.environ.copy()
+    if token:
+        env["GH_TOKEN"] = token
+
     title = (
         f"[CI Alert] {details['metric']} regression detected " f"({details['pct_change']:+.1f}%)"
     )
+
+    # Check for existing open issue with same metric to avoid duplicates
+    check = subprocess.run(
+        [
+            "gh",
+            "issue",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--search",
+            f"[CI Alert] {details['metric']} regression",
+            "--json",
+            "number",
+            "--limit",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if check.returncode == 0:
+        try:
+            existing = json.loads(check.stdout)
+            if existing:
+                print(
+                    f"Open alert issue already exists (#{existing[0]['number']}), skipping creation"
+                )
+                return
+        except json.JSONDecodeError:
+            pass
+
     body_lines = [
         "## Metric Regression Alert",
         "",
@@ -159,6 +205,7 @@ def create_alert_issue(repo, details, token):
         ],
         capture_output=True,
         text=True,
+        env=env,
     )
     if result.returncode == 0:
         print(f"Created alert issue: {result.stdout.strip()}")
@@ -177,21 +224,25 @@ METRIC_CONFIGS = {
         "subdir": "perf",
         "filename": "daily_performance_results_QWEN_7B_tp_1.csv",
         "higher_is_better": False,
+        "filters": {"concurrency": 8, "input": 1024, "output": 1024},
     },
     "itl_ms": {
         "subdir": "perf",
         "filename": "daily_performance_results_QWEN_7B_tp_1.csv",
         "higher_is_better": False,
+        "filters": {"concurrency": 8, "input": 1024, "output": 1024},
     },
     "in_tps": {
         "subdir": "perf",
         "filename": "daily_performance_results_QWEN_7B_tp_1.csv",
         "higher_is_better": True,
+        "filters": {"concurrency": 8, "input": 1024, "output": 1024},
     },
     "out_tps": {
         "subdir": "perf",
         "filename": "daily_performance_results_QWEN_7B_tp_1.csv",
         "higher_is_better": True,
+        "filters": {"concurrency": 8, "input": 1024, "output": 1024},
     },
 }
 
@@ -240,7 +291,9 @@ def main():
     print(f"Window: {args.window}, Threshold: {args.threshold_pct}%")
 
     session = get_session(token)
-    values = fetch_metric_data(session, config["subdir"], config["filename"], args.metric)
+    values = fetch_metric_data(
+        session, config["subdir"], config["filename"], args.metric, filters=config.get("filters")
+    )
 
     if not values:
         print("No data available, skipping check")
