@@ -191,7 +191,7 @@ def analyze_with_claude(failed_jobs_info, commit_diff, run_info, api_key):
             return response.content[0].text
         except anthropic.RateLimitError:
             if attempt < 2:
-                time.sleep(2**attempt)
+                time.sleep(4**attempt)
             else:
                 raise
         except Exception as e:
@@ -349,10 +349,10 @@ def main():
         failed_jobs=[j["name"] for j in failed_jobs_info],
         root_cause=parsed.get("root_cause", ""),
         suggested_fix=parsed.get("suggested_fix", ""),
-        raw_response=raw_response,
+        raw_response="",  # intentionally omitted from artifact
     )
 
-    # 7. Save result
+    # 7. Save result (raw_response excluded to avoid leaking log content)
     with open(args.output, "w") as f:
         json.dump(asdict(result), f, indent=2, default=str)
     print(f"Results saved to {args.output}")
