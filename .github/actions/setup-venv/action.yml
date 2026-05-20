@@ -10,13 +10,15 @@ runs:
   steps:
     - name: Create venv and install dependencies
       shell: bash
+      env:
+        EXTRA_PACKAGES: ${{ inputs.extra-packages }}
       run: |
         python3.12 -m venv .venv
         source .venv/bin/activate
         pip install uv
         uv pip install -e "python[all]"
-        if [ -n "${{ inputs.extra-packages }}" ]; then
-          for pkg in ${{ inputs.extra-packages }}; do
+        if [ -n "$EXTRA_PACKAGES" ]; then
+          for pkg in $EXTRA_PACKAGES; do
             uv pip install "$pkg"
           done
         fi
