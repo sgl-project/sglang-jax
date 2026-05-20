@@ -1843,14 +1843,20 @@ class Scheduler(
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch
             )
-            info = batch.reqs_info[0]
-            if batch_output.accept_lens is not None:
-                # Decode
-                info.seq_lens = info.seq_lens + batch_output.accept_lens
-            else:
-                # Prefill
-                info.seq_lens = info.seq_lens + 1
-            info.spec_info = batch_output.next_draft_input
+            # spec_info is global (DP-padded order), stored on rank 0 only.
+            batch.reqs_info[0].spec_info = batch_output.next_draft_input
+            accept = batch_output.accept_lens
+            if accept is not None:
+                accept = np.asarray(jax.device_get(accept))
+            per_dp_bs = model_worker_batch.per_dp_bs_size
+            for dp_rank, info in enumerate(batch.reqs_info):
+                if info.seq_lens is None or len(info.seq_lens) == 0:
+                    continue
+                if accept is not None:
+                    off = dp_rank * per_dp_bs
+                    info.seq_lens = info.seq_lens + accept[off : off + len(info.seq_lens)]
+                else:
+                    info.seq_lens = info.seq_lens + 1
             next_token_ids = np.asarray(jax.device_get(batch_output.next_token_ids))
             self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
             logits_output = batch_output.logits_output

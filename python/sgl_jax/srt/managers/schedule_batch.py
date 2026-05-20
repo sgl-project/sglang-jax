@@ -1418,6 +1418,21 @@ class ScheduleBatch:
 
         self.maybe_evict_swa()
 
+        # Spec decode: spec_info is global (DP-padded order, on reqs_info[0]);
+        # allocate KV once across all ranks, then return — input_ids/positions
+        # are rebuilt inside forward_batch_speculative_generation.
+        if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+            for info in self.reqs_info:
+                if not info.reqs:
+                    info.input_ids = None
+                    info.output_ids = None
+                    info.seq_lens = None
+                    info.out_cache_loc = None
+                    info.seq_lens_sum = 0
+            draft_input: EagleDraftInput = self.reqs_info[0].spec_info
+            draft_input.prepare_for_decode(self)
+            return
+
         # Process each DP rank
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
@@ -1434,13 +1449,6 @@ class ScheduleBatch:
                 continue
 
             bs = len(reqs)
-
-            # Handle spec decoding if enabled
-            if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
-                # if spec decoding is used, the decode batch is prepared inside
-                # `forward_batch_speculative_generation` after running draft models.
-                draft_input: EagleDraftInput = info.spec_info
-                draft_input.prepare_for_decode(self)
 
             if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
                 continue  # Skip to next DP rank
@@ -1522,6 +1530,14 @@ class ScheduleBatch:
         if chunked_req_to_exclude is None:
             chunked_req_to_exclude = {}
 
+        # spec_info is global (flat across ranks, on reqs_info[0]); pull it out
+        # so the per-rank loop doesn't clear/filter it with rank-local indices,
+        # accumulate global flat keep-indices, then filter once after the loop.
+        _global_spec = self.reqs_info[0].spec_info
+        self.reqs_info[0].spec_info = None
+        _global_keep: list[int] = []
+        _flat_base = 0
+
         # Unified DP filtering logic (works for all dp_size including 1)
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
@@ -1546,6 +1562,9 @@ class ScheduleBatch:
                     if not info.reqs[i].finished()
                     and (chunked_req is None or info.reqs[i] != chunked_req)
                 ]
+
+            _global_keep.extend(_flat_base + i for i in keep_indices_dp)
+            _flat_base += len(info.reqs)
 
             # Early exit: Clear all if nothing to keep
             if len(keep_indices_dp) == 0:
@@ -1616,6 +1635,20 @@ class ScheduleBatch:
                 info.spec_info.filter_batch(
                     new_indices=keep_indices_dp, has_been_filtered=has_been_filtered
                 )
+
+        # Restore + filter the global spec_info with cross-rank flat indices.
+        if _global_spec is not None and len(_global_keep) > 0:
+            gk = np.asarray(_global_keep, dtype=np.int32)
+            if _global_spec.topk_p is not None:
+                _global_spec.topk_p = _global_spec.topk_p[gk]
+                _global_spec.topk_index = _global_spec.topk_index[gk]
+                _global_spec.hidden_states = _global_spec.hidden_states[gk]
+                _global_spec.verified_id = _global_spec.verified_id[gk]
+            if _global_spec.allocate_lens is not None:
+                _global_spec.allocate_lens = np.asarray(_global_spec.allocate_lens)[gk]
+            self.reqs_info[0].spec_info = _global_spec
+        elif _global_spec is not None and len(_global_keep) == 0:
+            self.reqs_info[0].spec_info = None
 
         # Recalculate global batch flags from all remaining requests
         all_reqs = [req for info in self.reqs_info for req in (info.reqs if info.reqs else [])]
@@ -2046,6 +2079,132 @@ class ScheduleBatch:
             grammars=[req.grammar for req in all_reqs] if self.has_grammar else None,
         )
 
+    def _get_spec_decode_mwb_dp(
+        self, bs_paddings: list, enable_static_lora: bool
+    ) -> ModelWorkerBatch:
+        """DP-aware spec-decode ModelWorkerBatch (#1053 P1-5b).
+
+        Reuses the nospec ``_merge_*`` helpers for per-rank seq_lens /
+        req_pool_indices / sampling_info. ``spec_info`` is global (DP-padded
+        order, see ``EagleDraftInput`` docstring) and lives only on
+        ``reqs_info[0]``. ``input_ids``/``positions``/``cache_loc`` are
+        placeholders — ``EagleDraftWorker.padding_for_decode`` rebuilds them.
+        """
+        max_bs_per_dp = max(
+            (len(i.seq_lens) if i.seq_lens is not None else 0) for i in self.reqs_info
+        )
+        total_bs, _ = pad_to_bucket(max(max_bs_per_dp, 1) * self.dp_size, bs_paddings)
+        per_dp_bs = total_bs // self.dp_size
+        self.per_dp_bs_size = per_dp_bs
+        (
+            req_pool_indices_cpu,
+            seq_lens_cpu,
+            _ext_prefix,
+            _ext_seq,
+            _ext_logprob,
+            _logits_idx,
+            real_bs,
+            real_bs_per_dp,
+            logits_indices_selector,
+        ) = self._merge_batch_metadata(per_dp_bs, total_bs)
+        sampling_info = self._merge_sampling_info(per_dp_bs, total_bs)
+        # spec_info arrays live global-flat (rank-then-req contiguous, shape
+        # (real_bs,)) on reqs_info[0]. Scatter into DP-padded (total_bs,) slots
+        # via logits_indices_selector so spec_info[i] aligns with seq_lens[i].
+        # padding_for_decode then gathers via valid_mask=seq_lens>0 and gets
+        # back exactly the global-flat order. New object — don't mutate the
+        # cross-round state on reqs_info[0].
+        flat_spec = self.reqs_info[0].spec_info
+        spec_info = self._scatter_spec_info_to_dp_slots(
+            flat_spec, logits_indices_selector, total_bs
+        )
+        # Per-rank out_cache_loc chunks (set in spec prepare_for_decode) have
+        # variable length (∝ accept_len). DP-segment: pad each to max_len with
+        # -1 so the P("data") shard in ForwardBatch.init_new gives rank r its
+        # own slots (fa_backend doesn't use it, but native_backend would).
+        ocl_chunks = [
+            (
+                np.asarray(i.out_cache_loc, dtype=np.int32)
+                if i.out_cache_loc is not None and len(i.out_cache_loc) > 0
+                else np.empty(0, dtype=np.int32)
+            )
+            for i in self.reqs_info
+        ]
+        max_ocl = max((len(c) for c in ocl_chunks), default=0)
+        out_cache_loc = (
+            np.concatenate(
+                [np.pad(c, (0, max_ocl - len(c)), constant_values=-1) for c in ocl_chunks]
+            )
+            if max_ocl > 0
+            else np.empty(0, dtype=np.int32)
+        )
+        return ModelWorkerBatch(
+            bid=acc_global_bid(),
+            forward_mode=self.forward_mode,
+            input_ids=np.empty(0, dtype=np.int32),
+            real_input_ids_len=0,
+            req_pool_indices=req_pool_indices_cpu,
+            seq_lens=seq_lens_cpu,
+            out_cache_loc=out_cache_loc,
+            return_logprob=self.return_logprob,
+            return_output_logprob_only=self.return_output_logprob_only,
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            sampling_info=sampling_info,
+            positions=np.empty(0, dtype=np.int32),
+            cache_loc=np.empty(0, dtype=np.int32),
+            extend_prefix_lens=None,
+            extend_seq_lens=None,
+            extend_logprob_start_lens=None,
+            extend_input_logprob_token_ids=None,
+            logits_indices=None,
+            lora_ids=(
+                ["0"] * total_bs
+                if enable_static_lora
+                else [r.lora_id for i in self.reqs_info for r in (i.reqs or [])]
+                + ["0"] * (total_bs - real_bs)
+            ),
+            real_bs=real_bs,
+            real_bs_per_dp=real_bs_per_dp,
+            dp_size=self.dp_size,
+            per_dp_bs_size=per_dp_bs,
+            logits_indices_selector=logits_indices_selector,
+            capture_hidden_mode=getattr(spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL),
+            launch_done=self.launch_done,
+            spec_info=spec_info,
+            spec_algorithm=self.spec_algorithm,
+            tree_cache=self.tree_cache,
+            mrope_positions=None,
+        )
+
+    @staticmethod
+    def _scatter_spec_info_to_dp_slots(flat, selector: np.ndarray, total_bs: int):
+        """Scatter global-flat spec_info arrays into DP-padded ``(total_bs, …)``.
+
+        ``selector[k]`` is the DP-padded slot of the k-th global-flat req
+        (== ``logits_indices_selector``). Returns a new ``EagleDraftInput``;
+        the cross-round flat state on ``reqs_info[0].spec_info`` is unchanged.
+        """
+
+        def _scatter1(arr):
+            if arr is None:
+                return None
+            a = np.asarray(arr)
+            out = np.zeros((total_bs,) + a.shape[1:], dtype=a.dtype)
+            out[selector] = a
+            return out
+
+        return type(flat)(
+            topk_p=_scatter1(flat.topk_p),
+            topk_index=_scatter1(flat.topk_index),
+            hidden_states=_scatter1(flat.hidden_states),
+            verified_id=_scatter1(flat.verified_id),
+            allocate_lens=_scatter1(flat.allocate_lens),
+            capture_hidden_mode=flat.capture_hidden_mode,
+            accept_length=flat.accept_length,
+            accept_length_cpu=flat.accept_length_cpu,
+        )
+
     def get_model_worker_batch(
         self,
         token_paddings: list,
@@ -2208,6 +2367,13 @@ class ScheduleBatch:
         page_size: int,
         enable_static_lora: bool = False,
     ) -> ModelWorkerBatch:
+        if self.dp_size > 1:
+            # dp>1 spec extend goes through get_model_worker_batch (padded prefill,
+            # see scheduler._spec_multi_layer); only decode reaches here.
+            assert (
+                self.forward_mode.is_decode_or_idle()
+            ), "spec extend at dp>1 must use get_model_worker_batch (#1053 P1-5b)"
+            return self._get_spec_decode_mwb_dp(bs_paddings, enable_static_lora)
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
