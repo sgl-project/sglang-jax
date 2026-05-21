@@ -48,7 +48,8 @@ jobs:
         id: bisect
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
           INPUT_RUN_ID: ${{ inputs.run_id || github.event.client_payload.run_id }}
           INPUT_ISSUE_NUMBER: ${{ inputs.issue_number || github.event.client_payload.issue_number }}
         run: |

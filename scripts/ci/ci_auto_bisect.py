@@ -116,9 +116,12 @@ def fetch_commit_diff(repo, sha, token):
     return ""
 
 
-def analyze_with_claude(failed_jobs_info, commit_diff, run_info, api_key):
+def analyze_with_claude(failed_jobs_info, commit_diff, run_info, api_key, base_url=None):
     """Call Claude API to analyze the failure."""
-    client = anthropic.Anthropic(api_key=api_key)
+    kwargs = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    client = anthropic.Anthropic(**kwargs)
 
     prompt_parts = [
         "You are a CI failure analyst for sglang-jax, a JAX-based LLM inference engine running on Google TPU.",
@@ -287,6 +290,7 @@ def main():
 
     github_token = os.environ.get("GITHUB_TOKEN")
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    anthropic_base_url = os.environ.get("ANTHROPIC_BASE_URL")
 
     if not github_token:
         print("Error: GITHUB_TOKEN not set")
@@ -332,7 +336,9 @@ def main():
 
     # 5. Analyze with Claude
     print("Analyzing with Claude...")
-    raw_response = analyze_with_claude(failed_jobs_info, diff, run_info, anthropic_key)
+    raw_response = analyze_with_claude(
+        failed_jobs_info, diff, run_info, anthropic_key, anthropic_base_url
+    )
     parsed = parse_claude_response(raw_response)
 
     # 6. Build result
