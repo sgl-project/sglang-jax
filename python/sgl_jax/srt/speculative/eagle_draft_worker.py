@@ -205,6 +205,13 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         model_worker_batch.spec_info_padded.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+
+        padded_bs = int(model_worker_batch.seq_lens.shape[0])
+        if verified_id_np.shape[0] < padded_bs:
+            model_worker_batch.spec_info_padded.verified_id = np.pad(
+                verified_id_np, ((0, padded_bs - verified_id_np.shape[0]),)
+            )
+
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         forward_batch.return_logprob = False
 
@@ -219,6 +226,8 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
+        # Restore real_bs so split_spec_info_per_rank cuts on real_bs_per_dp.
+        model_worker_batch.spec_info_padded.verified_id = verified_id_np
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, logits_output.next_token_logits, logits_output.hidden_states
         )
