@@ -476,11 +476,9 @@ class EagleDraftWorker(BaseDraftWorker):
         return score_list, token_list, parents_list
 
     def _pick_context_len(self, max_seq_len: int) -> int:
-        max_seq_len = max(int(max_seq_len), 1)
         if self.precompile_token_paddings:
-            for padding in self.precompile_token_paddings:
-                if padding >= max_seq_len:
-                    return padding
+            return self.precompile_token_paddings[-1]
+        max_seq_len = max(int(max_seq_len), 1)
         return 1 << (max_seq_len - 1).bit_length()
 
     def copy_model_worker_batch_to_cpu(self, model_worker_batch: ModelWorkerBatch):
