@@ -1,6 +1,10 @@
 name: 'Setup Python venv'
 description: 'Create Python 3.12 venv, install uv and project dependencies'
 inputs:
+  install-target:
+    description: 'Project install target passed to `uv pip install -e` (e.g. "python[cpu]", "python[all]")'
+    required: false
+    default: 'python[all]'
   extra-packages:
     description: 'Space-separated list of extra pip packages to install (e.g. "evalscope==1.0.0")'
     required: false
@@ -11,12 +15,13 @@ runs:
     - name: Create venv and install dependencies
       shell: bash
       env:
+        INSTALL_TARGET: ${{ inputs.install-target }}
         EXTRA_PACKAGES: ${{ inputs.extra-packages }}
       run: |
         python3.12 -m venv .venv
         source .venv/bin/activate
         pip install uv
-        uv pip install -e "python[all]"
+        uv pip install -e "$INSTALL_TARGET"
         if [ -n "$EXTRA_PACKAGES" ]; then
           set -f
           # shellcheck disable=SC2086
