@@ -312,6 +312,7 @@ class CompilationManager:
             token_ids_logprobs=None,
             extend_logprob_start_lens=None,
             logits_indices=logits_indices,
+            input_logprob_indices=None,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL if self.multimodal else CaptureHiddenMode.NULL
             ),

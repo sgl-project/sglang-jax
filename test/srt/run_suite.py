@@ -353,6 +353,7 @@ suites = {
         TestFile("test/srt/test_features.py", 10),
         TestFile("test/srt/test_chunked_prefill_size.py", 5),
         # TestFile("test/srt/test_sliding_window_attention.py", 30), # add after gpt-oss supported
+        TestFile("test/srt/test_logprobs_dp.py", 8),
         TestFile("test/srt/test_model_loader.py", 5),
         TestFile("test/srt/test_deepseek_v2_lite_models.py", 10),
         TestFile("test/srt/quantization/test_w8_quantization.py", 10),
