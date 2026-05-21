@@ -45,15 +45,12 @@ def run_gh_command(args, max_retries=10):
 def get_workflow_runs(repo, hours=24):
     """Fetch workflow runs from the past N hours with pagination."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     output = run_gh_command(
         [
             "api",
             f"/repos/{repo}/actions/runs",
             "--paginate",
-            "-f",
-            f"created=>={cutoff_str}",
             "-f",
             "per_page=100",
             "--jq",
@@ -65,7 +62,11 @@ def get_workflow_runs(repo, hours=24):
     for line in output.strip().splitlines():
         if line.strip():
             try:
-                runs.append(json.loads(line))
+                run = json.loads(line)
+                created = parse_time(run.get("created_at"))
+                if created and created < cutoff:
+                    continue
+                runs.append(run)
             except json.JSONDecodeError:
                 continue
 
@@ -142,7 +143,13 @@ def get_runners(repo, online_only=True):
                     continue
         return runners
     except subprocess.CalledProcessError as e:
-        if "403" in str(e.stderr) or "Must have admin rights" in str(e.stderr):
+        err_str = str(e.stderr)
+        if "rate limit" in err_str.lower():
+            print(
+                "Warning: GitHub API rate limit hit while listing runners; runner count will be unavailable."
+            )
+            return []
+        if "403" in err_str or "Must have admin rights" in err_str:
             print(
                 "Note: No admin access to list runners; runner count will be estimated from job data."
             )
@@ -282,7 +289,12 @@ def calculate_utilization(repo, hours=24, runner_filter=None):
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(fetch_run_jobs, run): run for run in runs}
         for future in as_completed(futures):
-            run_id, jobs = future.result()
+            try:
+                run_id, jobs = future.result()
+            except Exception as e:
+                print(f"Warning: unexpected error fetching jobs: {e}")
+                fetch_failures += 1
+                continue
             if jobs is None:
                 fetch_failures += 1
                 continue
@@ -329,7 +341,7 @@ def calculate_utilization(repo, hours=24, runner_filter=None):
             if merged and start <= merged[-1][1]:
                 merged[-1] = (merged[-1][0], max(merged[-1][1], end))
             else:
-                merged.append([start, end])
+                merged.append((start, end))
 
         busy_seconds = sum((e - s).total_seconds() for s, e in merged)
 
