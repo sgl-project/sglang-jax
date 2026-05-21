@@ -194,13 +194,15 @@ def analyze_with_claude(failed_jobs_info, commit_diff, run_info, api_key, base_u
             return response.content[0].text
         except anthropic.RateLimitError:
             if attempt < 2:
-                time.sleep(4**attempt)
+                delay = 30 * (attempt + 1)
+                print(f"Rate limited, waiting {delay}s before retry...")
+                time.sleep(delay)
             else:
                 raise
         except Exception as e:
             print(f"Claude API error (attempt {attempt + 1}): {e}")
             if attempt < 2:
-                time.sleep(2**attempt)
+                time.sleep(5 * (attempt + 1))
             else:
                 raise
 
@@ -377,13 +379,17 @@ def main():
             f.write(report)
 
     print("Analysis complete!")
-    # Exit with non-zero if it's a confirmed regression, to signal urgency to callers
     known_classifications = {"code_regression", "flaky_test", "infrastructure", "environment"}
     classification = parsed.get("classification")
     if classification not in known_classifications:
         classification = "unknown"
-    if classification == "code_regression" and parsed.get("confidence") == "high":
-        sys.exit(1)
+
+    # Write classification to GITHUB_OUTPUT for downstream steps
+    output_file = os.environ.get("GITHUB_OUTPUT")
+    if output_file:
+        with open(output_file, "a") as f:
+            f.write(f"classification={classification}\n")
+            f.write(f"confidence={parsed.get('confidence', 'unknown')}\n")
 
 
 if __name__ == "__main__":

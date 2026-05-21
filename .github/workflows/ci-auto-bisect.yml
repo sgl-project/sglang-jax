@@ -15,8 +15,8 @@ on:
     types: [analysis_request]
 
 concurrency:
-  group: ci-auto-bisect
-  cancel-in-progress: true
+  group: ci-auto-bisect-${{ inputs.run_id || github.event.client_payload.run_id || github.run_id }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -31,8 +31,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -52,7 +50,12 @@ jobs:
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
           INPUT_RUN_ID: ${{ inputs.run_id || github.event.client_payload.run_id }}
           INPUT_ISSUE_NUMBER: ${{ inputs.issue_number || github.event.client_payload.issue_number }}
+          INPUT_REPO: ${{ github.repository }}
         run: |
+          if [[ -z "$INPUT_RUN_ID" ]]; then
+            echo "Error: run_id is required but was not provided"
+            exit 1
+          fi
           if [[ ! "$INPUT_RUN_ID" =~ ^[0-9]+$ ]]; then
             echo "Error: run_id must be numeric, got: $INPUT_RUN_ID"
             exit 1
@@ -61,14 +64,14 @@ jobs:
             echo "Error: issue_number must be numeric, got: $INPUT_ISSUE_NUMBER"
             exit 1
           fi
-          ISSUE_ARG=""
+          ISSUE_ARGS=()
           if [[ -n "$INPUT_ISSUE_NUMBER" ]]; then
-            ISSUE_ARG="--issue-number $INPUT_ISSUE_NUMBER"
+            ISSUE_ARGS=(--issue-number "$INPUT_ISSUE_NUMBER")
           fi
           python scripts/ci/ci_auto_bisect.py \
-            --repo "${{ github.repository }}" \
+            --repo "$INPUT_REPO" \
             --run-id "$INPUT_RUN_ID" \
-            $ISSUE_ARG
+            "${ISSUE_ARGS[@]}"
 
       - name: Upload Analysis Results
         if: always()
