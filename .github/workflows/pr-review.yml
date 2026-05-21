@@ -13,7 +13,17 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pr-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  group: >-
+    pr-review-${{ github.event.pull_request.number || github.event.issue.number }}-${{
+      (
+        (github.event_name == 'pull_request')
+        || (github.event_name == 'issue_comment'
+            && startsWith(github.event.comment.body, '/review')
+            && contains(fromJSON('["OWNER","COLLABORATOR"]'), github.event.comment.author_association))
+      )
+      && 'active'
+      || github.run_id
+    }}
   cancel-in-progress: true
 
 jobs:
