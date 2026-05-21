@@ -8,7 +8,7 @@ End-to-end recipes for serving specific models on specific TPU (or GPU) topologi
 
 | Section | What's inside |
 |---|---|
-| [`autoregressive/`](autoregressive/index.md) | LLM recipes (Qwen / Llama / Gemma / GLM / DeepSeek / Grok / MiMo / Bailing / Kimi / ...). One page per model. |
+| [`autoregressive/`](autoregressive/index.md) | LLM recipes (Qwen / Llama / Gemma / GLM / DeepSeek / Grok / MiMo / Ling / Kimi / ...). One page per model. |
 | [`multimodal/`](multimodal/index.md) | Vision-language, audio, and text-to-video recipes (Qwen2.5-VL, Qwen3-Omni MoE, Wan 2.1/2.2 T2V, MiMo Audio). |
 | [`base/`](base/) | Cross-cutting references shared by every recipe: TPU topology table, launch flag reference. |
 | [`deployment/`](deployment/) | Launcher templates (single-host Docker / GKE Indexed Job / SkyPilot) referenced by recipes. |
@@ -47,9 +47,9 @@ Status prefix: ✅ validated · 🚧 starter (not yet measured). See [`autoregre
 
 | TPU | Topology | Nodes | Recipes |
 |---|---|---|---|
-| v6e-16 | 4x4 | 4 | ✅ [MiMo-V2-Flash](autoregressive/mimo-v2-flash.md) · 🚧 [Qwen3-30B-A3B MoE](autoregressive/qwen3-moe.md) · 🚧 [Kimi-Linear](autoregressive/kimi-linear.md) · 🚧 [Bailing MoE (small)](autoregressive/bailing-moe.md) |
+| v6e-16 | 4x4 | 4 | ✅ [MiMo-V2-Flash](autoregressive/mimo-v2-flash.md) · 🚧 [Qwen3-30B-A3B MoE](autoregressive/qwen3-moe.md) · 🚧 [Kimi-Linear](autoregressive/kimi-linear.md) |
 | v6e-32 | 4x8 | 8 | ✅ [Grok-2](autoregressive/grok2.md) · 🚧 [Llama 3.3 70B](autoregressive/llama.md) · 🚧 [DeepSeek V2](autoregressive/deepseek-v3.md) · 🚧 [GLM-4.5-Air](autoregressive/glm4-moe.md) |
-| v6e-64 | 4x4x4 | 16 | ✅ [MiMo-V2.5-Pro](autoregressive/mimo-v2.5-pro.md) · 🚧 [Qwen3-235B MoE](autoregressive/qwen3-moe.md) · 🚧 [DeepSeek V3 / R1](autoregressive/deepseek-v3.md) · 🚧 [GLM-4.5](autoregressive/glm4-moe.md) · 🚧 [Bailing MoE Linear](autoregressive/bailing-moe-linear.md) · 🚧 [Ling-2.6](autoregressive/ling-2.6.md) |
+| v6e-64 | 4x4x4 | 16 | ✅ [MiMo-V2.5-Pro](autoregressive/mimo-v2.5-pro.md) · 🚧 [Qwen3-235B MoE](autoregressive/qwen3-moe.md) · 🚧 [DeepSeek V3 / R1](autoregressive/deepseek-v3.md) · 🚧 [GLM-4.5](autoregressive/glm4-moe.md) · 🚧 [Ling-2.6](autoregressive/ling-2.6.md) |
 | v7x-16 | 2x2x4 | 4 | ✅ [MiMo-V2.5-Pro](autoregressive/mimo-v2.5-pro.md) · 🚧 [Ling-2.6](autoregressive/ling-2.6.md) · 🚧 [DeepSeek V3 / R1](autoregressive/deepseek-v3.md) |
 
 For TPU generation/HBM/per-chip-device specs, see [`base/tpu-topology-reference.md`](base/tpu-topology-reference.md).

@@ -26,14 +26,13 @@ End-to-end serving recipes for text-only autoregressive LLMs on SGL-JAX.
 | 🚧 | DeepSeek V2 / V3 / R1 | [`deepseek-v3.md`](deepseek-v3.md) | v6e-4 (Lite) / v6e-64 (V3) | MoE + MLA | `DeepseekV3ForCausalLM` / `DeepseekV2ForCausalLM` |
 | 🚧 | GLM-4.5 MoE | [`glm4-moe.md`](glm4-moe.md) | v6e-32 / v6e-64 | MoE | `Glm4MoeForCausalLM` |
 | 🚧 | GLM-5 MoE | [`glm5-moe.md`](glm5-moe.md) | TODO | MoE (+ DSA variant) | `Glm5ForCausalLM` / `GlmMoeDsaForCausalLM` |
-| 🚧 | Bailing MoE (family) | [`bailing-moe.md`](bailing-moe.md) | v6e-16+ | MoE | `BailingMoeForCausalLM` / `BailingMoeV2ForCausalLM` |
-| 🚧 | Bailing MoE Linear (family) | [`bailing-moe-linear.md`](bailing-moe-linear.md) | v6e-64 / v7x-16 | MoE + linear attn | `BailingMoeV2_5ForCausalLM` |
-| 🚧 | Ling-2.6 (Bailing-Linear instance) | [`ling-2.6.md`](ling-2.6.md) | v6e-64 / v7x-16 | MoE + linear attn | `BailingMoeV2_5ForCausalLM` |
+| 🚧 | Ling-2.6 | [`ling-2.6.md`](ling-2.6.md) | v6e-64 / v7x-16 | MoE + linear attn | `BailingMoeV2_5ForCausalLM` |
 | 🚧 | Kimi-Linear | [`kimi-linear.md`](kimi-linear.md) | v6e-16 | dense + linear attn | `KimiLinearForCausalLM` |
 | 📝 | Qwen2 | _no recipe_ | — | dense | `Qwen2ForCausalLM` |
 | 📝 | Qwen2-MoE | _no recipe_ | — | MoE | `Qwen2MoeForCausalLM` |
 | 📝 | Phi-3 | _no recipe_ | — | dense (Llama alias) | `Phi3ForCausalLM` |
 | 📝 | InternLM 3 | _no recipe_ | — | dense (Llama alias) | `InternLM3ForCausalLM` |
+| 📝 | Ling V2 / Ring | _no recipe_ | — | MoE | `BailingMoeForCausalLM` / `BailingMoeV2ForCausalLM` |
 
 > Upgrade path: 🚧 → ✅ requires real `evalscope` (accuracy) or `bench_serving` (throughput) output in §6, structured as **Test Environment → Deployment Command → Benchmark Command → Test Results**. See [`mimo-v2-flash.md` §6](mimo-v2-flash.md#6-benchmark) for the canonical four-section form.
 
@@ -55,7 +54,7 @@ Diffusion / TTS / VLM models live in [`../multimodal/`](../multimodal/index.md).
 | Single-host MoE with backend choice | [`mimo-v2-flash.md`](mimo-v2-flash.md) ✅ |
 | Large multi-node MoE with GKE manifest | [`mimo-v2.5-pro.md`](mimo-v2.5-pro.md) ✅ |
 | SkyPilot multi-node dense | [`grok2.md`](grok2.md) ✅ (+ [`../deployment/skypilot.md`](../deployment/skypilot.md)) |
-| Linear-attention model with recurrent state | [`bailing-moe-linear.md`](bailing-moe-linear.md) 🚧 or [`kimi-linear.md`](kimi-linear.md) 🚧 |
+| Linear-attention model with recurrent state | [`ling-2.6.md`](ling-2.6.md) 🚧 or [`kimi-linear.md`](kimi-linear.md) 🚧 |
 | Reasoning / DSA variant | [`deepseek-v3.md`](deepseek-v3.md) 🚧 (V3 / R1) |
 
 ## Architecture coverage vs codebase

@@ -10,7 +10,7 @@
 
 - [**moonshotai/Kimi-Linear-48B-A3B-Instruct**](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct) — 48B total / 3B activated, instruction-tuned.
 
-For other linear-attention models in the cookbook see [`bailing-moe-linear.md`](bailing-moe-linear.md) (different family).
+For other linear-attention models in the cookbook see [`ling-2.6.md`](ling-2.6.md) (InclusionAI's trillion-scale linear-attention MoE).
 
 **Recommended Generation Parameters**: `temperature=0.6`, `top_p=0.95`, `max_tokens=1024` (Kimi defaults — verify against the model card).
 
@@ -150,6 +150,6 @@ Recommended additional datasets: MMLU, GPQA Diamond, RULER (to exercise long-con
 ## Additional Resources
 
 - [Kimi-Linear model card](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct)
-- [`bailing-moe-linear.md`](bailing-moe-linear.md) — another linear-attention model (different family).
+- [`ling-2.6.md`](ling-2.6.md) — InclusionAI's trillion-scale linear-attention MoE.
 - [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md)
 - [`../troubleshooting.md`](../troubleshooting.md) — cross-recipe generic issues.

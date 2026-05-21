@@ -1,17 +1,22 @@
 # Ling-2.6 on SGL-JAX
 
 > **Starter recipe** — derived from the HuggingFace model card; not yet empirically validated on TPU. Tune values for your hardware and PR-back tested numbers.
->
-> **Model-card view.** Concrete deployment guide for the Ling-2.6 checkpoint, which uses the **Bailing MoE Linear** architecture. For the architecture-family view (flag semantics, recurrent-state notes, alternative checkpoints) see [`bailing-moe-linear.md`](bailing-moe-linear.md).
 
 ## 1. Model Introduction
 
-[**inclusionAI/Ling-2.6-1T**](https://huggingface.co/inclusionAI/Ling-2.6-1T) is the 1T-parameter Ling 2.6 release — InclusionAI's trillion-scale MoE built on linear / delta attention with a hybrid recurrent state. Smaller siblings (e.g. `Ling-2.6-flash`) are released under the same [InclusionAI HF collection](https://huggingface.co/inclusionAI).
+[**inclusionAI/Ling-2.6-1T**](https://huggingface.co/inclusionAI/Ling-2.6-1T) is InclusionAI's 1T-parameter Ling 2.6 release — a trillion-scale MoE built on **linear / delta attention** with a **hybrid recurrent state** pool that shares HBM with the KV cache. Smaller siblings (e.g. `Ling-2.6-flash`) are released under the same [InclusionAI HF collection](https://huggingface.co/inclusionAI).
+
+**Architectural distinguishers**:
+
+- **Linear / delta attention** in place of standard softmax attention — most of the long-context benefit shows up here.
+- **Hybrid recurrent state pool** — budgeted against the KV cache via `--recurrent-state-memory-ratio` (default `0.9`).
 
 **Variants**:
 
 - [**inclusionAI/Ling-2.6-1T**](https://huggingface.co/inclusionAI/Ling-2.6-1T) — full trillion-scale flagship; default focus of this page.
 - Smaller Ling-2.6 variants — adapt the §2.3 launch command after picking a checkpoint.
+
+For Moonshot AI's separate linear-attention model see [`kimi-linear.md`](kimi-linear.md).
 
 **Recommended Generation Parameters**: see the Ling-2.6 model card for authoritative defaults. As a starter: `temperature=0.7`, `top_p=0.95`, `max_tokens=2048+` (give room if you enable reasoning mode).
 
@@ -39,9 +44,58 @@ Install per [`../../get_started/install.md`](../../get_started/install.md). Mult
 
 ### 2.3 Launch
 
-Use the launch commands in [`bailing-moe-linear.md` §2.3](bailing-moe-linear.md#23-launch) with `--model-path inclusionAI/Ling-2.6-1T`. Flag semantics (recurrent state, MoE backend, memory tuning) are owned by that page — this page intentionally does not duplicate them.
+#### Multi-host (SkyPilot) — TPU v6e-64
 
-### 2.4 Configuration Tips (Ling-2.6 specifics)
+**Step 1** — provision the cluster:
+
+```bash
+cd ${WORKSPACE_DIR}/sglang-jax
+bash scripts/launch_tpu.sh tpu-v6e-64 main
+```
+
+**Step 2** — launch the server:
+
+```bash
+CLUSTER_NAME=$(cat .cluster_name)
+sky exec ${CLUSTER_NAME} -- "cd sglang-jax && source .venv/bin/activate && \
+  JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
+  --model-path inclusionAI/Ling-2.6-1T \
+  --trust-remote-code \
+  --tp-size 64 --ep-size 64 \
+  --moe-backend fused \
+  --recurrent-state-memory-ratio 0.9 \
+  --device tpu \
+  --dtype bfloat16 \
+  --mem-fraction-static 0.92 \
+  --chunked-prefill-size 2048 \
+  --page-size 128 \
+  --max-running-requests 256 \
+  --skip-server-warmup \
+  --dist-init-addr <NODE_0_IP_ADDRESS>:5000 \
+  --nnodes 16 --node-rank \${SKYPILOT_NODE_RANK} \
+  --host 0.0.0.0 --port 30000"
+```
+
+#### Multi-host (SkyPilot) — TPU v7x-16
+
+Swap the topology to `tpu-v7x-16` and use:
+
+```text
+  --tp-size 32 --ep-size 32 \
+  --nnodes 4 --node-rank \${SKYPILOT_NODE_RANK} \
+```
+
+For GKE, adapt the manifest pattern from [`mimo-v2.5-pro.md` §2.3 Multi-host](mimo-v2.5-pro.md#23-launch) with `<JOB>=ling-2-6`, `<ACCELERATOR>=tpu-v6e-slice` (or `tpu7x` for v7x), and the launch flags above.
+
+### 2.4 Configuration Tips
+
+**Recurrent State Pool (linear-attention specific):**
+- `--recurrent-state-memory-ratio 0.9` (default) budgets the recurrent state pool against the KV cache. The recurrent pool gets `available * ratio / (1 + ratio)` of free HBM.
+- Lower the ratio (e.g. `0.5`) if KV cache is your bottleneck — long prompts with small recurrent state benefit from more KV.
+- `--max-recurrent-state-size` (unset by default — auto) caps recurrent state slots across DP ranks; set only when you need a hard ceiling.
+
+**MoE Backend:**
+- `--moe-backend fused` for `--ep-size ≥ 16` (both configs above). Switch to `epmoe` only at EP ≤ 8.
 
 **Reasoning Mode:**
 - If the Ling-2.6 checkpoint supports `<think>` blocks, add `--reasoning-parser <key>` to the launch command — run `python -m sgl_jax.launch_server --help` to see registered parser keys. The streaming Python client from [`qwen3.md` §3.2](qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) applies directly once the parser is set.
@@ -49,7 +103,16 @@ Use the launch commands in [`bailing-moe-linear.md` §2.3](bailing-moe-linear.md
 **Context Length:**
 - Pin via `--context-length` to your workload's longest prompt + output. Smaller values reduce KV cache footprint at trillion-scale.
 
-**All other tuning** (recurrent state ratio, MoE backend, memory fraction, page size, chunked prefill, compilation cache) — see [`bailing-moe-linear.md` §2.4](bailing-moe-linear.md#24-configuration-tips).
+**Memory Management:**
+- `--mem-fraction-static 0.92` for dedicated multi-host serving. Drop to `0.9` if you hit OOM at startup.
+
+**Throughput vs Latency:**
+- `--page-size 128` reduces KV page-table overhead at trillion-scale.
+- `--chunked-prefill-size 2048` bounds peak HBM during long-prompt prefill.
+
+**Compilation Cache Hygiene:**
+- `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
+- Mount a shared PVC across the cluster's nodes to amortize compilation.
 
 For full flag definitions see [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md).
 
@@ -57,7 +120,7 @@ For full flag definitions see [`../base/launch-flags-reference.md`](../base/laun
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`qwen3.md` §3.1](qwen3.md#31-basic-chat-completion). Substitute `model="inclusionAI/Ling-2.6-1T"`.
+Standard OpenAI-compatible request — see [`qwen3.md` §3.1](qwen3.md#31-basic-chat-completion). Substitute `model="inclusionAI/Ling-2.6-1T"` (or your chosen Ling-2.6 checkpoint).
 
 ### 3.2 Reasoning (if supported by the checkpoint)
 
@@ -73,13 +136,14 @@ If you launched with `--reasoning-parser <key>`, mirror the thinking-on streamin
 
 | Field | Value |
 |---|---|
-| Hardware | TPU v6e-64 or v7x-16 |
+| Hardware | TPU v6e-64 (16 nodes × 4 chips) or v7x-16 |
 | Model | inclusionAI/Ling-2.6-1T (BF16) |
 | Tensor Parallelism | 64 (v6e) / 32 (v7x) |
 | Expert Parallelism | 64 (v6e) / 32 (v7x) |
+| Recurrent State Memory Ratio | 0.9 |
 | Tested build | _Pending_ |
 
-**Deployment Command** — same as [`bailing-moe-linear.md` §2.3](bailing-moe-linear.md#23-launch) with `--model-path inclusionAI/Ling-2.6-1T`.
+**Deployment Command** — same as [§2.3](#multi-host-skypilot--tpu-v6e-64).
 
 **Benchmark Command** — example for GSM8K:
 
@@ -105,13 +169,18 @@ Recommended additional datasets: AIME 2025, GPQA Diamond (reasoning); MMLU (gene
 
 ## 5. Troubleshooting
 
-See [`bailing-moe-linear.md` §5](bailing-moe-linear.md#5-troubleshooting) for the full troubleshooting matrix — the symptoms / fixes apply directly to Ling-2.6 since the runtime path is shared.
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| OOM at startup | Recurrent state + KV exceed budget | Lower `--recurrent-state-memory-ratio` (e.g. to 0.7) and/or `--mem-fraction-static` to 0.9. |
+| Long-prompt requests stall | KV cache exhausted before recurrent state | Lower `--recurrent-state-memory-ratio` to give the KV cache more headroom. |
+| MoE throughput plateau at EP ≥ 16 | Wrong `--moe-backend` | Switch to `--moe-backend fused`. |
+| Multi-node hang at init | `--dist-init-addr` unreachable from non-rank-0 nodes | Verify the rank-0 internal IP and that the chosen port is open. |
+| First request takes ~4 min per node | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR`; mount a shared PVC for amortized compilation. |
 
 ## Additional Resources
 
 - [Ling-2.6 model card](https://huggingface.co/inclusionAI/Ling-2.6-1T)
 - [InclusionAI HF collection](https://huggingface.co/inclusionAI) — sibling checkpoints.
-- [`bailing-moe-linear.md`](bailing-moe-linear.md) — architecture-family view (flags, semantics, recurrent state).
-- [`bailing-moe.md`](bailing-moe.md) — non-linear Bailing MoE (older Ling variants).
+- [`kimi-linear.md`](kimi-linear.md) — Moonshot AI's separate linear-attention model.
 - [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md)
 - [`../troubleshooting.md`](../troubleshooting.md) — cross-recipe generic issues.
