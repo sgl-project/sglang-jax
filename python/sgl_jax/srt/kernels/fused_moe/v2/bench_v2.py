@@ -472,6 +472,21 @@ def _ladder_div2(start):
     return sorted(set(out), reverse=True)
 
 
+def _aligned_divisors(n, alignment=8):
+    """All divisors of n that are multiples of alignment, descending."""
+    if n <= 0:
+        return []
+    divs = set()
+    for i in range(1, int(math.isqrt(n)) + 1):
+        if n % i == 0:
+            if i % alignment == 0:
+                divs.add(i)
+            j = n // i
+            if j % alignment == 0:
+                divs.add(j)
+    return sorted(divs, reverse=True)
+
+
 def _estimate_vmem_bytes_v2(
     *,
     bt,
@@ -657,13 +672,20 @@ def generate_tune_candidates(
         expected = bt * ep_size * top_k / num_experts
         lo = _pow2_floor(expected)
         hi = _pow2_ceil(expected)
-        bts_cands = sorted({v for v in [bt, lo, hi, hi * 2] if 0 < v <= max_bts})
+        # Non-power-of-2 candidates near expected, aligned to 8
+        exp_floor8 = (int(expected) // 8) * 8
+        exp_ceil8 = _align_to(int(math.ceil(expected)), 8)
+        # 1.25x expected covers routing imbalance
+        exp_hi8 = _align_to(int(math.ceil(expected * 1.25)), 8)
+        bts_cands = sorted({
+            v for v in [bt, lo, hi, hi * 2, exp_floor8, exp_ceil8, exp_hi8]
+            if 0 < v <= max_bts and v % 8 == 0
+        })
         if not bts_cands:
             bts_cands = [bt]
 
         for bts_val in bts_cands:
-            btc_cands = _ladder_div2(bts_val)
-            btc_cands = [v for v in btc_cands if v >= 8 and bts_val % v == 0]
+            btc_cands = _aligned_divisors(bts_val, 8)
             if not btc_cands:
                 continue
 
