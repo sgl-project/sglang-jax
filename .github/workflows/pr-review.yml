@@ -12,6 +12,10 @@ permissions:
   issues: write
   id-token: write
 
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
 jobs:
   review:
     if: >
@@ -129,9 +133,9 @@ jobs:
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
           API_TIMEOUT_MS: "3000000"
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
-          ANTHROPIC_MODEL: claude-opus-4-6
-          ANTHROPIC_SMALL_FAST_MODEL: claude-opus-4-6
+          ANTHROPIC_MODEL: claude-opus-4-7
+          ANTHROPIC_SMALL_FAST_MODEL: claude-opus-4-7
           ANTHROPIC_DEFAULT_SONNET_MODEL: claude-sonnet-4-6
-          ANTHROPIC_DEFAULT_OPUS_MODEL: claude-opus-4-6
-          ANTHROPIC_DEFAULT_HAIKU_MODEL: claude-opus-4-6
+          ANTHROPIC_DEFAULT_OPUS_MODEL: claude-opus-4-7
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: claude-opus-4-7
           CLAUDE_CODE_LOG_LEVEL: debug
