@@ -503,3 +503,80 @@ def test_concat_spec_info_some_none_skips():
     assert out is not None
     np.testing.assert_array_equal(np.asarray(out.verified_id), np.asarray(s.verified_id))
     assert out.verified_id.shape == (3,)
+
+
+def _mk_batch_with_tagged_spec(
+    dp_size: int, bs_per_rank: list[int], *, tag_base: int
+) -> ScheduleBatch:
+    """``_mk_batch`` + tag per-rank ``spec_info.verified_id`` so that after a
+    cross-rank merge each entry stays traceable to ``(rank, side, idx)``.
+
+    Tag value for rank ``r`` request ``j`` is ``tag_base + r * 1000 + j``.
+    """
+    sb = _mk_batch(dp_size, bs_per_rank)
+    for r, bs in enumerate(bs_per_rank):
+        if bs == 0:
+            continue
+        sb.reqs_info[r].spec_info.verified_id = np.asarray(
+            [tag_base + r * 1000 + j for j in range(bs)], dtype=np.int32
+        )
+    return sb
+
+
+def _expected_after_merge(
+    bs_self: list[int], bs_other: list[int], *, self_base: int, other_base: int
+) -> list[list[int] | None]:
+    """Per-rank expected ``verified_id`` after ``self.merge_batch(other)``.
+
+    Matches ``ScheduleBatch.merge_batch`` semantics:
+    - other rank empty → self unchanged
+    - self rank empty (and other non-empty) → take other's spec_info wholesale
+    - both non-empty → ``EagleDraftInput.merge_batch`` concatenates self ++ other
+    """
+    out: list[list[int] | None] = []
+    for r, (ns, no) in enumerate(zip(bs_self, bs_other)):
+        if no == 0:
+            out.append([self_base + r * 1000 + j for j in range(ns)] if ns > 0 else None)
+            continue
+        if ns == 0:
+            out.append([other_base + r * 1000 + j for j in range(no)])
+            continue
+        out.append(
+            [self_base + r * 1000 + j for j in range(ns)]
+            + [other_base + r * 1000 + j for j in range(no)]
+        )
+    return out
+
+
+@pytest.mark.parametrize(
+    "bs_self,bs_other",
+    [
+        # (a) Both ranks non-empty on both sides → per-rank concat via
+        # EagleDraftInput.merge_batch (the path the refactor was motivated by).
+        ([2, 1], [1, 2]),
+        # (b) Other rank0 empty → merge_batch hits the early `continue` (old
+        # L1685 in pre-refactor numbering); self.r0 must stay tagged with
+        # self's values, r1 still concatenates.
+        ([2, 1], [0, 2]),
+        # (c) Self rank0 empty → merge_batch falls into the overwrite branch
+        # (old L1700) and pulls other's spec_info wholesale; r1 has other
+        # empty so stays as self.
+        ([0, 2], [1, 0]),
+    ],
+)
+def test_merge_batch_per_rank_spec_info(bs_self, bs_other):
+    self_base, other_base = 10_000, 20_000
+    self_sb = _mk_batch_with_tagged_spec(2, bs_self, tag_base=self_base)
+    other_sb = _mk_batch_with_tagged_spec(2, bs_other, tag_base=other_base)
+
+    self_sb.merge_batch(other_sb)
+
+    expected = _expected_after_merge(bs_self, bs_other, self_base=self_base, other_base=other_base)
+    for r, want in enumerate(expected):
+        spec = self_sb.reqs_info[r].spec_info
+        if want is None:
+            assert spec is None, f"rank {r}: expected None spec_info, got {spec}"
+            continue
+        assert spec is not None, f"rank {r}: expected spec_info, got None"
+        got = list(np.asarray(spec.verified_id))
+        assert got == want, f"rank {r}: verified_id {got} != expected {want}"

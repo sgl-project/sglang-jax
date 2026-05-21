@@ -2150,7 +2150,7 @@ class ScheduleBatch:
 
         ``selector[k]`` is the DP-padded slot of the k-th global-flat req
         (== ``logits_indices_selector``). Returns a new ``EagleDraftInput``;
-        the cross-round flat state on ``reqs_info[0].spec_info`` is unchanged.
+        the cross-round flat state on ``reqs_info[r].spec_info`` is unchanged.
         """
 
         def _scatter1(arr):
@@ -2236,6 +2236,15 @@ class ScheduleBatch:
             if not nonnull:
                 kwargs[f] = None
                 continue
+            # All nonempty ranks should agree on which optional fields they
+            # carry — they came from the same per-rank verify split. A partial
+            # mix means the concat length would silently drift from
+            # ``sum(real_bs_per_dp)``; fail loudly instead.
+            assert len(nonnull) == len(nonempty), (
+                f"_concat_spec_info_per_rank: field {f!r} is None on "
+                f"{len(nonempty) - len(nonnull)}/{len(nonempty)} nonempty rank(s); "
+                "all-or-nothing required"
+            )
             if isinstance(nonnull[0], np.ndarray):
                 kwargs[f] = np.concatenate(nonnull, axis=0)
             else:
@@ -2412,8 +2421,6 @@ class ScheduleBatch:
         if self.dp_size > 1:
             return self._get_spec_decode_mwb_dp(bs_paddings, enable_static_lora)
 
-        acc_global_bid()
-
         if self.input_ids is None:
             input_ids_cpu = np.empty(0, dtype=np.int32)
         else:
@@ -2452,13 +2459,14 @@ class ScheduleBatch:
 
         if len(seq_lens_cpu) > 0:
             seq_lens = seq_lens_cpu
-            if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
-                if self.forward_mode == ForwardMode.TARGET_VERIFY:
-                    seq_lens = seq_lens_cpu + self.spec_info.draft_token_num
-                elif self.forward_mode == ForwardMode.DECODE:
-                    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+            if (
+                self.spec_algorithm is not None
+                and not self.spec_algorithm.is_none()
+                and self.forward_mode == ForwardMode.DECODE
+            ):
+                from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 
-                    seq_lens = seq_lens_cpu + EagleDraftInput.ALLOC_LEN_PER_DECODE
+                seq_lens = seq_lens_cpu + EagleDraftInput.ALLOC_LEN_PER_DECODE
             # Filter out empty sequences
             valid_mask = seq_lens > 0
             if np.any(valid_mask):
