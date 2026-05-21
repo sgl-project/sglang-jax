@@ -305,9 +305,11 @@ class QuantizedLinear(nnx.Module):
                     tp = linear.mesh.shape.get(input_axis, 1) if input_axis else 1
                     if input_axis is not None and in_blocks % tp != 0:
                         logger.warning(
-                            "QuantizedLinear %s: in_blocks=%d not divisible by "
-                            "TP=%d on axis %r; replicating reduce axis",
+                            "QuantizedLinear %s [in=%d, out=%d]: in_blocks=%d not "
+                            "divisible by TP=%d on axis %r; replicating reduce axis",
                             linear.name,
+                            in_features,
+                            out_features,
                             in_blocks,
                             tp,
                             input_axis,
