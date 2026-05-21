@@ -1,0 +1,237 @@
+# Grok-2 on SGL-JAX
+
+## 1. Model Introduction
+
+[**xai-org/grok-2**](https://huggingface.co/xai-org/grok-2) is xAI's open-weight **314B-parameter dense** model — one of the largest open dense LLMs available. SGL-JAX serves it on TPU v6e-32 (8 nodes × 4 chips) with tensor parallelism. The recommended deployment path is SkyPilot-managed multi-node TPU cluster; GKE is also supported.
+
+**Key Features**:
+
+- **314B dense parameters** — large flagship model from xAI; ~628 GB BF16 weights spread across 32 chips.
+- **Open weights** — community-licensed for self-hosted serving.
+- **Long context** — supports extended context windows (verify on the model card for the exact length).
+
+**Recommended Generation Parameters** (matching the official xAI defaults): `temperature=0.7`, `top_p=0.8`, `top_k=20`, `presence_penalty=0.5`.
+
+**Tokenizer note**: Grok-2 weights ship **without a tokenizer file** — use the community tokenizer `alvarobartt/grok-2-tokenizer` via `--tokenizer-path`. See [Community tokenizer card](https://huggingface.co/alvarobartt/grok-2-tokenizer).
+
+**License**: see the [HuggingFace model card](https://huggingface.co/xai-org/grok-2) for the authoritative xAI Community License terms.
+
+## 2. Deployment
+
+### 2.1 Hardware Matrix
+
+| TPU | Topology | Nodes | Chips per node | Total chips | `--tp-size` | Notes |
+|---|---|---|---|---|---|---|
+| **v6e-32** (minimum, required) | 4x8 | 8 | 4 | 32 | 32 | v6e is 1:1 chip↔device; `--tp-size=32` saturates the slice |
+
+Grok-2 314B requires the full v6e-32 slice — no smaller config fits. See [`../base/tpu-topology-reference.md`](../base/tpu-topology-reference.md) for the TPU generation reference.
+
+### 2.2 Environment
+
+Install per [`../../get_started/install.md`](../../get_started/install.md). For multi-node SkyPilot launches, [`../deployment/skypilot.md`](../deployment/skypilot.md) handles cloning + `pip install` on every node automatically. The required JAX TPU container image:
+
+| Hardware Platform               | Docker Image                                                       |
+|---|---|
+| TPU v5e / v5p / v6e (Trillium)  | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
+| TPU v7x (Ironwood)              | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
+
+The community tokenizer is downloaded on first launch — no extra pip needed.
+
+### 2.3 Launch
+
+Grok-2 314B is multi-host only; cannot fit single-host.
+
+#### Multi-host (SkyPilot, recommended) — TPU v6e-32 (8 nodes)
+
+**Step 1** — provision the cluster:
+
+```bash
+cd ${WORKSPACE_DIR}/sglang-jax
+bash scripts/launch_tpu.sh tpu-v6e-32 main
+```
+
+This provisions an 8-node TPU v6e-32 cluster with SGL-JAX installed and idle. The script writes the cluster name to `./.cluster_name`.
+
+**Step 2** — launch the server (one `sky exec` invocation fans out to all 8 nodes):
+
+```bash
+CLUSTER_NAME=$(cat .cluster_name)
+sky exec ${CLUSTER_NAME} -- "cd sglang-jax && source .venv/bin/activate && \
+  JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
+  --model-path /models/xai-grok-2 \
+  --trust-remote-code \
+  --tokenizer-path alvarobartt/grok-2-tokenizer \
+  --tp-size 32 \
+  --device tpu \
+  --dtype bfloat16 \
+  --mem-fraction-static 0.9 \
+  --chunked-prefill-size 2048 \
+  --page-size 128 \
+  --max-running-requests 256 \
+  --download-dir /dev/shm \
+  --random-seed 3 \
+  --skip-server-warmup \
+  --dist-init-addr <NODE_0_IP_ADDRESS>:5000 \
+  --nnodes 8 --node-rank \${SKYPILOT_NODE_RANK} \
+  --host 0.0.0.0 --port 30000"
+```
+
+Add `-d` to `sky exec` to submit and detach (don't stream logs to the local terminal).
+
+**Substitutions**:
+
+| Placeholder | Where to get it |
+|---|---|
+| `<NODE_0_IP_ADDRESS>` | `sky status -a ${CLUSTER_NAME}` shows per-node internal IPs |
+| `\${SKYPILOT_NODE_RANK}` | Injected by SkyPilot on each node — keep the `\$` escape so the local shell doesn't expand it |
+
+#### Multi-host (GKE) — adapt the manifest template
+
+Adapt the GKE Indexed Job manifest from [`mimo-v2.5-pro.md` §2.3 Multi-host](mimo-v2.5-pro.md#23-launch) with these substitutions:
+
+- `<JOB>=grok-2`
+- `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`
+- `parallelism: 8` / `completions: 8`
+- Swap `--model-path` to `/models/xai-grok-2`, add `--tokenizer-path alvarobartt/grok-2-tokenizer`
+- Use the §2.3 launch flags above (TP=32, no DP/EP)
+
+### 2.4 Configuration Tips
+
+**Memory Management:**
+- `--mem-fraction-static 0.9` is appropriate for a dedicated serving slice (default 0.88 leaves more headroom for unexpected allocations). At 314B BF16 weights split across 32 chips, ~20 GB per chip for weights leaves room for KV cache.
+- `--download-dir /dev/shm` stages weights on tmpfs for fast load (~50% faster cold start than `/tmp`). Switch back to `/tmp` if shared memory is constrained on your host.
+
+**Throughput vs Latency:**
+- `--page-size 128` reduces KV page-table overhead at 314B scale. Default `1` is much slower for this model size.
+- `--chunked-prefill-size 2048` bounds peak HBM during prefill. Larger values (4096) reduce TTFT on long prompts but risk prefill-time OOM.
+- `--max-running-requests 256` is the concurrent decode bound; raise for higher throughput, lower for tighter latency tails.
+
+**Tokenizer:**
+- Without `--tokenizer-path alvarobartt/grok-2-tokenizer`, the server fails at startup since Grok-2 weights ship without a tokenizer file.
+- The tokenizer requires an HF token if your network has rate limits — set `HF_TOKEN` env if needed.
+
+**Compilation Cache Hygiene:**
+- `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
+- On multi-node clusters, the cache is per-node. Mount a shared PVC if you want compilation to amortize across nodes.
+
+For full flag definitions and defaults see [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md).
+
+## 3. Invocation
+
+### 3.1 Basic Chat Completion
+
+```bash
+curl -X POST http://<rank0-ip>:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "xai-org/grok-2",
+    "messages": [{"role": "user", "content": "Hello, who are you?"}]
+  }'
+```
+
+Python OpenAI client equivalent:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://<rank0-ip>:30000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="xai-org/grok-2",
+    messages=[{"role": "user", "content": "Hello, who are you?"}],
+)
+print(resp.choices[0].message.content)
+```
+
+#### Raw `/v1/completions` (legacy text completion)
+
+For non-chat use cases (logprobs eval, raw prompt completion):
+
+```bash
+curl -X POST http://<rank0-ip>:30000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "xai-org/grok-2",
+    "prompt": "The capital city of France is",
+    "max_tokens": 8,
+    "temperature": 0,
+    "top_k": 1
+  }'
+```
+
+> Grok-2 is a base model without hybrid reasoning or native tool-calling formats. For reasoning / tool-call workloads use a model with `--reasoning-parser` / `--tool-call-parser` support (see [`mimo-v2.5-pro.md` §3.2 / §3.3](mimo-v2.5-pro.md) or [`qwen3.md` §3.2 / §3.3](qwen3.md)).
+
+## 4. Benchmark
+
+> Benchmark data below is a snapshot pinned to the `Tested build` listed in each Test Environment; not refreshed on every release.
+
+### 4.1 Accuracy
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-32 (8 nodes × 4 chips) |
+| Model | xai-org/grok-2 (BF16, local path `/models/xai-grok-2`) |
+| Tokenizer | alvarobartt/grok-2-tokenizer |
+| Tensor Parallelism | 32 |
+| Tested build | _Pending_ |
+
+**Deployment Command** — same as [§2.3 Multi-host (SkyPilot)](#multi-host-skypilot-recommended--tpu-v6e-32-8-nodes).
+
+**Benchmark Command — GSM8K** (math reasoning):
+
+```bash
+evalscope eval \
+  --model /models/xai-grok-2 \
+  --api-url http://127.0.0.1:30000/v1/chat/completions \
+  --api-key EMPTY \
+  --eval-type openai_api \
+  --datasets gsm8k \
+  --eval-batch-size 64 \
+  --generation-config '{"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.5}'
+```
+
+**Benchmark Command — GPQA Diamond** (graduate-level science QA):
+
+```bash
+evalscope eval \
+  --model /models/xai-grok-2 \
+  --api-url http://127.0.0.1:30000/v1/chat/completions \
+  --api-key EMPTY \
+  --eval-type openai_api \
+  --datasets gpqa_diamond \
+  --eval-batch-size 198 \
+  --dataset-args '{"gpqa_diamond": {"few_shot_num": 4}}' \
+  --generation-config '{"temperature": 0.5, "top_p": 0.8, "top_k": 40, "max_tokens": 4096}'
+```
+
+**Test Results** — _Pending. Run the commands above and PR back._
+
+### 4.2 Speed — single workload (low-concurrency latency baseline)
+
+**Test Environment** — same as §4.1.
+
+**Deployment Command** — same as [§2.3 Multi-host (SkyPilot)](#multi-host-skypilot-recommended--tpu-v6e-32-8-nodes).
+
+**Benchmark Command** — adapt the driver script from [`qwen3.md` §4.2](qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `xai-org/grok-2`, remove the vLLM half).
+
+**Test Results** — _Pending. Run and PR back the full `============ Serving Benchmark Result ============` block._
+
+## 5. Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Tokenizer load fails at startup | `--tokenizer-path` missing or unreachable | Add `--tokenizer-path alvarobartt/grok-2-tokenizer`; if HF rate-limited, set `HF_TOKEN` env. |
+| Multi-node hang at `jax.distributed.initialize` | `--dist-init-addr` unreachable from non-rank-0 nodes | `sky status -a ${CLUSTER_NAME}` to verify rank-0 internal IP; check firewall on the chosen port. |
+| `sky exec` returns immediately with no output | You passed `-d` (detached mode) | Fetch logs via `sky logs ${CLUSTER_NAME} -f`. |
+| OOM at startup | `--mem-fraction-static 0.9` too high for shared host | Lower to 0.85; verify `--tp-size 32` matches v6e-32 chip count (4 × 8 = 32). |
+| Slow cold start (~4 min per node) on every launch | JIT cache not persisted across launches | Mount a persistent volume at `/tmp/jit_cache` (or a shared PVC across all 8 nodes for amortized compilation). |
+
+## Additional Resources
+
+- [Grok-2 Model Card](https://huggingface.co/xai-org/grok-2)
+- [Community tokenizer](https://huggingface.co/alvarobartt/grok-2-tokenizer)
+- [`../deployment/skypilot.md`](../deployment/skypilot.md) — generic SkyPilot launcher used here.
+- [`mimo-v2.5-pro.md`](mimo-v2.5-pro.md) — GKE Indexed Job manifest reference (adapt for Grok-2).
+- [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md)
+- [`../troubleshooting.md`](../troubleshooting.md) — cross-recipe generic issues.
