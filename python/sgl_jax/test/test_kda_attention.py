@@ -350,7 +350,7 @@ def create_test_data(
         real_bs_per_dp=[batch_size],
         dp_size=1,
         per_dp_bs_size=batch_size,
-        spec_info=None,
+        spec_info_padded=None,
         recurrent_indices=recurrent_indices,
         has_initial_state=has_initial_state_np,
     )
