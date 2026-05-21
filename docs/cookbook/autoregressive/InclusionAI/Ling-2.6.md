@@ -1,6 +1,5 @@
 ---
 title: "Ling 2.6"
-description: "InclusionAI Ling-2.6-1T trillion-scale linear-attention MoE serving on TPU v6e-64 / v7x-16 with SGL-JAX."
 ---
 
 # Ling-2.6 on SGL-JAX
@@ -103,7 +102,7 @@ For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.md` §2.3 Multi-host](.
 - `--moe-backend fused` for `--ep-size ≥ 16` (both configs above). Switch to `epmoe` only at EP ≤ 8.
 
 **Reasoning Mode:**
-- If the Ling-2.6 checkpoint supports `<think>` blocks, add `--reasoning-parser <key>` to the launch command — run `python -m sgl_jax.launch_server --help` to see registered parser keys. The streaming Python client from [`Qwen3.md` §3.2](../Qwen/Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) applies directly once the parser is set.
+- If the Ling-2.6 checkpoint emits `<think>...</think>` blocks (verify per model card; some reasoning-tuned variants do, base instruct variants do not), add `--reasoning-parser deepseek-r1` to the launch command — that's the generic `<think>` parser, since no `ling-2-6` or `bailing` parser key is registered. The streaming Python client from [`Qwen3.md` §3.2](../Qwen/Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) applies directly once the parser is set.
 
 **Context Length:**
 - Pin via `--context-length` to your workload's longest prompt + output. Smaller values reduce KV cache footprint at trillion-scale.
@@ -129,13 +128,21 @@ Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#3
 
 ### 3.2 Reasoning (if supported by the checkpoint)
 
-If you launched with `--reasoning-parser <key>`, mirror the thinking-on streaming pattern from [`Qwen3.md` §3.2](../Qwen/Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) with `extra_body={"chat_template_kwargs": {"enable_thinking": True}}`.
+If you launched with `--reasoning-parser deepseek-r1` (see §2.4 Reasoning Mode), mirror the thinking-on streaming pattern from [`Qwen3.md` §3.2](../Qwen/Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) with `extra_body={"chat_template_kwargs": {"enable_thinking": True}}` if the checkpoint supports per-request thinking toggle.
 
 ## 4. Benchmark
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Accuracy
+### 4.1 Speed
+
+> **Layout B — methodology + command template.** No measured numbers yet; PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` to upgrade to Validated.
+
+**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.1](../Qwen/Qwen3.md#41-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `inclusionAI/Ling-2.6-1T`, remove the vLLM half).
+
+**Test Results** — _Pending._
+
+### 4.2 Accuracy
 
 **Test Environment**
 
@@ -165,12 +172,6 @@ evalscope eval \
 Recommended additional datasets: AIME 2025, GPQA Diamond (reasoning); MMLU (general); RULER (long-context linear-attention).
 
 **Test Results** — _Pending. Run and PR back._
-
-### 4.2 Speed
-
-**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `inclusionAI/Ling-2.6-1T`, remove the vLLM half).
-
-**Test Results** — _Pending._
 
 ## 5. Troubleshooting
 

@@ -1,6 +1,5 @@
 ---
 title: "Kimi-Linear"
-description: "Moonshot AI Kimi-Linear-48B-A3B with delta attention and hybrid recurrent state serving on TPU v6e-16 with SGL-JAX."
 ---
 
 # Kimi-Linear on SGL-JAX
@@ -25,9 +24,10 @@ For other linear-attention models in the cookbook see [`Ling-2.6.md`](../Inclusi
 
 ### 2.1 Hardware Matrix (starter target)
 
-| Model | TPU | Topology | Nodes | Chips | `--tp-size` | Notes |
-|---|---|---|---|---|---|---|
-| Kimi-Linear-48B-A3B | v6e-16 | 4x4 | 4 | 16 | 16 | BF16 ~96 GB — multi-host recommended |
+| Tier | Model | TPU | Topology | Nodes | Chips | `--tp-size` | Notes |
+|---|---|---|---|---|---|---|---|
+| Minimum runnable | Kimi-Linear-48B-A3B | v6e-16 | 4x4 | 4 | 16 | 16 | BF16 ~96 GB — multi-host required to fit weights + recurrent state pool |
+| Recommended production | Kimi-Linear-48B-A3B | v6e-32 | 4x8 | 8 | 32 | 32 | More HBM per active expert and larger recurrent state budget for long-prompt linear-attention workloads |
 
 See [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
@@ -107,7 +107,15 @@ Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#3
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Accuracy
+### 4.1 Speed
+
+> **Layout B — methodology + command template.** No measured numbers yet; PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` to upgrade to Validated.
+
+**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.1](../Qwen/Qwen3.md#41-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `moonshotai/Kimi-Linear-48B-A3B-Instruct`, remove the vLLM half).
+
+**Test Results** — _Pending._
+
+### 4.2 Accuracy
 
 **Test Environment**
 
@@ -136,12 +144,6 @@ evalscope eval \
 Recommended additional datasets: MMLU, GPQA Diamond, RULER (to exercise long-context linear-attention).
 
 **Test Results** — _Pending. Run and PR back._
-
-### 4.2 Speed
-
-**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `moonshotai/Kimi-Linear-48B-A3B-Instruct`, remove the vLLM half).
-
-**Test Results** — _Pending._
 
 ## 5. Troubleshooting
 

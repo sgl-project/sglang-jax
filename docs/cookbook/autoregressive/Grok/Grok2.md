@@ -1,6 +1,5 @@
 ---
 title: "Grok-2"
-description: "xAI Grok-2 314B dense flagship serving on TPU v6e-32 with SGL-JAX via SkyPilot."
 ---
 
 # Grok-2 on SGL-JAX
@@ -169,7 +168,17 @@ curl -X POST http://<rank0-ip>:30000/v1/completions \
 
 > Benchmark data below is a snapshot pinned to the `Tested build` listed in each Test Environment; not refreshed on every release.
 
-### 4.1 Accuracy
+### 4.1 Speed — single workload (low-concurrency latency baseline)
+
+**Test Environment** — same as §4.2.
+
+**Deployment Command** — same as [§2.3 Multi-host (SkyPilot)](#multi-host-skypilot-recommended--tpu-v6e-32-8-nodes).
+
+**Benchmark Command** — adapt the driver script from [`Qwen3.md` §4.1](../Qwen/Qwen3.md#41-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `xai-org/grok-2`, remove the vLLM half).
+
+**Test Results** — _Pending. Run and PR back the full `============ Serving Benchmark Result ============` block._
+
+### 4.2 Accuracy
 
 **Test Environment**
 
@@ -190,7 +199,7 @@ evalscope eval \
   --model /models/xai-grok-2 \
   --api-url http://127.0.0.1:30000/v1/chat/completions \
   --api-key EMPTY \
-  --eval-type openai_api \
+  --eval-type service \
   --datasets gsm8k \
   --eval-batch-size 64 \
   --generation-config '{"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.5}'
@@ -203,7 +212,7 @@ evalscope eval \
   --model /models/xai-grok-2 \
   --api-url http://127.0.0.1:30000/v1/chat/completions \
   --api-key EMPTY \
-  --eval-type openai_api \
+  --eval-type service \
   --datasets gpqa_diamond \
   --eval-batch-size 198 \
   --dataset-args '{"gpqa_diamond": {"few_shot_num": 4}}' \
@@ -211,16 +220,6 @@ evalscope eval \
 ```
 
 **Test Results** — _Pending. Run the commands above and PR back._
-
-### 4.2 Speed — single workload (low-concurrency latency baseline)
-
-**Test Environment** — same as §4.1.
-
-**Deployment Command** — same as [§2.3 Multi-host (SkyPilot)](#multi-host-skypilot-recommended--tpu-v6e-32-8-nodes).
-
-**Benchmark Command** — adapt the driver script from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `xai-org/grok-2`, remove the vLLM half).
-
-**Test Results** — _Pending. Run and PR back the full `============ Serving Benchmark Result ============` block._
 
 ## 5. Troubleshooting
 

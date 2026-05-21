@@ -1,6 +1,5 @@
 ---
 title: "Single-host Docker"
-description: "Generic launcher template for single-host TPU serving via Docker, referenced by single-host recipes."
 ---
 
 # Single-Host Docker Launcher

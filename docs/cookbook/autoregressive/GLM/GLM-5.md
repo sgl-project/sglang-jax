@@ -1,11 +1,10 @@
 ---
 title: "GLM-5"
-description: "Zhipu GLM-5 MoE with DeepSeek Sparse Attention variant serving template — starter recipe, hardware pending public release."
 ---
 
 # GLM-5 MoE on SGL-JAX
 
-> **Starter recipe** — derived from the HuggingFace model card; not yet empirically validated on TPU. Tune values for your hardware and PR-back tested numbers. Some fields are placeholders pending the public release.
+> **Placeholder recipe (📝 planned)** — GLM-5 is supported in the runtime (`Glm5ForCausalLM` / `GlmMoeDsaForCausalLM` are registered), but the public model release pins are not yet known. Hardware Matrix and benchmark cells are placeholders. Once Zhipu publishes the checkpoint, fill in the model path, sizes, and TPU sizing from the model card, then promote to 🚧 Starter.
 
 ## 1. Model Introduction
 
@@ -81,6 +80,9 @@ For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.md` §2.3 Multi-host](.
 - Add `--tool-call-parser glm47` to the launch command. The streaming Python tool-call client from [`Qwen3.md` §3.3](../Qwen/Qwen3.md#33-tool-calling) applies directly — only the server-side parser name differs from Qwen3.
 - For the GLM-4.5 / 4.6 family use `glm45` instead (see [`GLM-4.5.md`](GLM-4.5.md)).
 
+**Reasoning (if GLM-5 emits `<think>` blocks):**
+- The reasoning parser key for GLM-5 is not separately registered; if the public release retains the GLM-4.5 reasoning format, `--reasoning-parser glm45` should apply. Verify against the model card on release.
+
 **Memory Management:**
 - `--mem-fraction-static 0.92` for dedicated multi-host serving. Drop to `0.9` if you hit OOM at startup.
 
@@ -108,7 +110,15 @@ Launch with `--tool-call-parser glm47` and reuse the streaming Python client fro
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Accuracy
+### 4.1 Speed
+
+> **Layout B — methodology + command template.** No measured numbers yet; hardware sizing pending GLM-5 public release.
+
+**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.1](../Qwen/Qwen3.md#41-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the GLM-5 checkpoint, remove the vLLM half).
+
+**Test Results** — _Pending._
+
+### 4.2 Accuracy
 
 **Test Environment**
 
@@ -137,12 +147,6 @@ evalscope eval \
 For DSA variants, add a long-context dataset (e.g. RULER 32K / 128K) to exercise the sparse-attention path.
 
 **Test Results** — _Pending. Run and PR back._
-
-### 4.2 Speed
-
-**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the GLM-5 checkpoint, remove the vLLM half).
-
-**Test Results** — _Pending._
 
 ## 5. Troubleshooting
 

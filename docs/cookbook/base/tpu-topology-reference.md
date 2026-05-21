@@ -1,6 +1,5 @@
 ---
 title: "TPU Topology Reference"
-description: "TPU generation × HBM × devices-per-chip table (v5e / v5p / v6e Trillium / v7x Ironwood) referenced by every recipe."
 ---
 
 # TPU Topology Reference

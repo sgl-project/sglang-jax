@@ -1,6 +1,5 @@
 ---
 title: "Ling 2.0"
-description: "InclusionAI Ling 2.0 family (mini / flash / 1T) — 1/32 sparsity MoE with MTP serving on TPU v6e-4 to v6e-64 with SGL-JAX."
 ---
 
 # Ling 2.0 on SGL-JAX
@@ -144,7 +143,15 @@ Standard OpenAI-compatible request — see [`../Qwen/Qwen3.md` §3.1](../Qwen/Qw
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Accuracy
+### 4.1 Speed
+
+> **Layout B — methodology + command template.** No measured numbers yet; PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` to upgrade to Validated.
+
+**Benchmark Command** — adapt the driver from [`../Qwen/Qwen3.md` §4.1](../Qwen/Qwen3.md#41-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Ling 2.0 checkpoint, remove the vLLM half).
+
+**Test Results** — _Pending._
+
+### 4.2 Accuracy
 
 **Test Environment**
 
@@ -173,12 +180,6 @@ evalscope eval \
 Recommended additional datasets: MMLU, GPQA Diamond, HumanEval (general); for Ling-1T also IFEval (long-context instruction following).
 
 **Test Results** — _Pending. Run and PR back._
-
-### 4.2 Speed
-
-**Benchmark Command** — adapt the driver from [`../Qwen/Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Ling 2.0 checkpoint, remove the vLLM half).
-
-**Test Results** — _Pending._
 
 ## 5. Troubleshooting
 

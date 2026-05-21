@@ -1,6 +1,5 @@
 ---
 title: "MiMo-V2.5-Pro"
-description: "Xiaomi MiMo-V2.5-Pro flagship MoE serving on TPU v7x-16 or v6e-64 with SGL-JAX, including GKE Indexed Job manifest."
 ---
 
 # MiMo-V2.5-Pro on SGL-JAX
@@ -89,7 +88,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
   --tp-size 64 --dp-size 8 --ep-size 64 \
   --moe-backend fused \
   --page-size 256 --context-length 262144 \
-  --chunked-prefill-size 4096 --max-prefill-tokens 16384 --max-seq-len 4096 \
+  --chunked-prefill-size 4096 \
   --dtype bfloat16 --mem-fraction-static 0.92 \
   --swa-full-tokens-ratio 0.15 \
   --max-running-requests 512 \
@@ -239,7 +238,7 @@ Adapt [`../deployment/skypilot.md`](../../deployment/skypilot.md) with `tpu-v7x-
 
 **MoE Backend Selection:**
 - `--moe-backend fused` is the right pick for this recipe (EP ≥ 16) — fused Pallas kernel wins on large EP shapes.
-- For smaller single-host MoE setups (EP ≤ 8), `epmoe` actually wins; see the measured tradeoff in [`MiMo-V2-Flash.md` §4.2](MiMo-V2-Flash.md#42-speed--single-workload-configuration-sweep).
+- For smaller single-host MoE setups (EP ≤ 8), `epmoe` actually wins; see the measured tradeoff in [`MiMo-V2-Flash.md` §4.1](MiMo-V2-Flash.md#41-speed--single-workload-configuration-sweep).
 
 **Speculative Decoding (NEXTN / MTP):**
 - MiMo-V2.5-Pro ships an MTP draft head; enable speculative decoding via:
@@ -510,7 +509,56 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 
 > Benchmark data below is a snapshot pinned to the `Tested build` listed in each Test Environment; not refreshed on every release. New numbers are added via new PRs; older numbers stay as historical records of that build.
 
-### 4.1 Accuracy — AIME 2025 (thinking enabled)
+### 4.1 Speed — scenario × concurrency matrix
+
+This recipe targets the **full 3×3 scenario × concurrency matrix** as the community reference. Most cells are not yet measured — PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` when you run them.
+
+**Scenarios** — pick by your dominant workload:
+
+| Scenario | Random ISL | Random OSL | Stresses |
+|---|---|---|---|
+| **Standard** (chat) | 1000 | 1000 | balanced prefill/decode |
+| **Reasoning** (long output) | 1000 | 8000 | decode throughput + SWA pool eviction |
+| **Summarization** (long input) | 8000 | 1000 | `--chunked-prefill-size` + prefill TPS |
+
+**Concurrency levels** per scenario:
+
+| Level | `--max-concurrency` | `--num-prompts` | Purpose |
+|---|---|---|---|
+| Low | 1 | 10 | latency-optimised baseline (min TTFT / ITL) |
+| Medium | 16 | 80 | balanced — most production workloads |
+| High | 64 (or 100 for Standard) | 320 (or 500) | throughput ceiling |
+
+**Test Environment** — same hardware/parallelism as §4.2, but **do not** set `--reasoning-parser mimo` for throughput benchmarks (the parser adds per-token CPU work that distorts raw token rates).
+
+**Deployment Command** — same as [§2.3 Multi-host (v7x)](#multi-host-gke-或-skypilot--tpu-v7x-16-4-nodes-2x2x4), without `--reasoning-parser`.
+
+**Benchmark Command template**
+
+```bash
+python -m sgl_jax.bench_serving \
+  --backend sgl-jax \
+  --dataset-name random \
+  --random-input <ISL> \
+  --random-output <OSL> \
+  --num-prompts <N> \
+  --max-concurrency <C> \
+  --random-range-ratio 1 \
+  --warmup-requests 0 \
+  --tokenizer XiaomiMiMo/MiMo-V2.5-Pro
+```
+
+Fill `<ISL>` / `<OSL>` from the scenario table, and `<N>` / `<C>` from the concurrency table.
+
+**Test Results** — _Pending. Run the matrix and PR back; each cell should be a full `============ Serving Benchmark Result ============` block._
+
+| Scenario | Low (c=1) | Medium (c=16) | High (c=64) |
+|---|---|---|---|
+| Standard (1K/1K) | _Pending_ | _Pending_ | _Pending_ |
+| Reasoning (1K/8K) | _Pending_ | _Pending_ | _Pending_ |
+| Summarization (8K/1K) | _Pending_ | _Pending_ | _Pending_ |
+
+### 4.2 Accuracy — AIME 2025 (thinking enabled)
 
 **Test Environment**
 
@@ -547,55 +595,6 @@ evalscope eval \
 | MiMo-V2.5-Pro | aime25 | AveragePass@1 | AIME2025-I | 15 | 0.8667 |
 | MiMo-V2.5-Pro | aime25 | AveragePass@1 | AIME2025-II | 15 | 1.0000 |
 | MiMo-V2.5-Pro | aime25 | AveragePass@1 | OVERALL | 30 | **0.9334** |
-
-### 4.2 Speed — scenario × concurrency matrix
-
-This recipe targets the **full 3×3 scenario × concurrency matrix** as the community reference. Most cells are not yet measured — PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` when you run them.
-
-**Scenarios** — pick by your dominant workload:
-
-| Scenario | Random ISL | Random OSL | Stresses |
-|---|---|---|---|
-| **Standard** (chat) | 1000 | 1000 | balanced prefill/decode |
-| **Reasoning** (long output) | 1000 | 8000 | decode throughput + SWA pool eviction |
-| **Summarization** (long input) | 8000 | 1000 | `--chunked-prefill-size` + prefill TPS |
-
-**Concurrency levels** per scenario:
-
-| Level | `--max-concurrency` | `--num-prompts` | Purpose |
-|---|---|---|---|
-| Low | 1 | 10 | latency-optimised baseline (min TTFT / ITL) |
-| Medium | 16 | 80 | balanced — most production workloads |
-| High | 64 (or 100 for Standard) | 320 (or 500) | throughput ceiling |
-
-**Test Environment** — same hardware/parallelism as §4.1, but **do not** set `--reasoning-parser mimo` for throughput benchmarks (the parser adds per-token CPU work that distorts raw token rates).
-
-**Deployment Command** — same as [§2.3 Multi-host (v7x)](#multi-host-gke-或-skypilot--tpu-v7x-16-4-nodes-2x2x4), without `--reasoning-parser`.
-
-**Benchmark Command template**
-
-```bash
-python -m sgl_jax.bench_serving \
-  --backend sgl-jax \
-  --dataset-name random \
-  --random-input <ISL> \
-  --random-output <OSL> \
-  --num-prompts <N> \
-  --max-concurrency <C> \
-  --random-range-ratio 1 \
-  --warmup-requests 0 \
-  --tokenizer XiaomiMiMo/MiMo-V2.5-Pro
-```
-
-Fill `<ISL>` / `<OSL>` from the scenario table, and `<N>` / `<C>` from the concurrency table.
-
-**Test Results** — _Pending. Run the matrix and PR back; each cell should be a full `============ Serving Benchmark Result ============` block._
-
-| Scenario | Low (c=1) | Medium (c=16) | High (c=64) |
-|---|---|---|---|
-| Standard (1K/1K) | _Pending_ | _Pending_ | _Pending_ |
-| Reasoning (1K/8K) | _Pending_ | _Pending_ | _Pending_ |
-| Summarization (8K/1K) | _Pending_ | _Pending_ | _Pending_ |
 
 ## 5. Troubleshooting
 

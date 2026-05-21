@@ -1,6 +1,5 @@
 ---
 title: "Autoregressive Models"
-description: "Text-only autoregressive LLM serving recipes organized by vendor — Qwen / DeepSeek / GLM / Llama / InclusionAI / MiMo and more."
 ---
 
 # Autoregressive Model Recipes
@@ -19,72 +18,69 @@ End-to-end serving recipes for text-only autoregressive LLMs on SGL-JAX, organiz
 
 ### DeepSeek — `DeepSeek/`
 
-| Status | Model | Recipe | Min TPU | Backend | Architecture class |
-|---|---|---|---|---|---|
-| 🚧 | DeepSeek-V2 / V2-Lite | [`DeepSeek/DeepSeek-V2.md`](DeepSeek/DeepSeek-V2.md) | v6e-4 (Lite) / v6e-32 (V2) | MoE + MLA | `DeepseekV2ForCausalLM` |
-| 🚧 | DeepSeek-V3 | [`DeepSeek/DeepSeek-V3.md`](DeepSeek/DeepSeek-V3.md) | v6e-64 / v7x-16 | MoE + MLA | `DeepseekV3ForCausalLM` |
-| 🚧 | DeepSeek-R1 | [`DeepSeek/DeepSeek-R1.md`](DeepSeek/DeepSeek-R1.md) | v6e-64 / v7x-16 | MoE + MLA + reasoning | `DeepseekV3ForCausalLM` |
+| Status | Model | Recipe | Min TPU | Backend |
+|---|---|---|---|---|
+| 🚧 | DeepSeek-V2 / V2-Lite | [`DeepSeek/DeepSeek-V2.md`](DeepSeek/DeepSeek-V2.md) | v6e-4 (Lite) / v6e-32 (V2) | MoE + MLA |
+| 🚧 | DeepSeek-V3 | [`DeepSeek/DeepSeek-V3.md`](DeepSeek/DeepSeek-V3.md) | v6e-64 / v7x-16 | MoE + MLA |
+| 🚧 | DeepSeek-R1 | [`DeepSeek/DeepSeek-R1.md`](DeepSeek/DeepSeek-R1.md) | v6e-64 / v7x-16 | MoE + MLA + reasoning (`deepseek-r1`) |
 
 ### GLM — `GLM/`
 
-| Status | Model | Recipe | Min TPU | Backend | Architecture class |
-|---|---|---|---|---|---|
-| 🚧 | GLM-4.5 / GLM-4.5-Air | [`GLM/GLM-4.5.md`](GLM/GLM-4.5.md) | v6e-32 / v6e-64 | MoE | `Glm4MoeForCausalLM` |
-| 🚧 | GLM-5 | [`GLM/GLM-5.md`](GLM/GLM-5.md) | _pending_ | MoE (+ DSA variant) | `Glm5ForCausalLM` / `GlmMoeDsaForCausalLM` |
+| Status | Model | Recipe | Min TPU | Backend |
+|---|---|---|---|---|
+| 🚧 | GLM-4.5 / GLM-4.5-Air | [`GLM/GLM-4.5.md`](GLM/GLM-4.5.md) | v6e-32 / v6e-64 | MoE + reasoning/tool (`glm45`) |
+| 📝 | GLM-5 | [`GLM/GLM-5.md`](GLM/GLM-5.md) (placeholder pending release) | _Pending_ | MoE (+ DSA variant) + tool (`glm47`) |
 
 ### Google — `Google/`
 
-| Status | Model | Recipe | Min TPU | Backend | Architecture class |
-|---|---|---|---|---|---|
-| 🚧 | Gemma 2 (9B / 27B) | [`Google/Gemma2.md`](Google/Gemma2.md) | v6e-4 | dense (hybrid attn) | `Gemma2ForCausalLM` |
+| Status | Model | Recipe | Min TPU | Backend |
+|---|---|---|---|---|
+| 🚧 | Gemma 2 (9B / 27B) | [`Google/Gemma2.md`](Google/Gemma2.md) | v6e-4 | dense (hybrid attn) |
 
 ### Grok — `Grok/`
 
-| Status | Model | Recipe | Min TPU | Backend | Architecture class |
-|---|---|---|---|---|---|
-| ✅ | Grok-2 | [`Grok/Grok2.md`](Grok/Grok2.md) | v6e-32 | dense | `Grok1ForCausalLM` |
+| Status | Model | Recipe | Min TPU | Backend |
+|---|---|---|---|---|
+| ✅ | Grok-2 | [`Grok/Grok2.md`](Grok/Grok2.md) | v6e-32 | dense |
 
 ### InclusionAI — `InclusionAI/`
 
-| Status | Model | Recipe | Min TPU | Backend | Architecture class |
-|---|---|---|---|---|---|
-| 🚧 | Ling 1.x (lite / plus / Coder-lite) | [`InclusionAI/Ling-1.x.md`](InclusionAI/Ling-1.x.md) | v6e-4 / v6e-32 | MoE | `BailingMoeForCausalLM` |
-| 🚧 | Ling 2.0 (mini / flash / 1T) | [`InclusionAI/Ling-2.md`](InclusionAI/Ling-2.md) | v6e-4 / v6e-16 / v6e-64 | MoE (1/32 sparsity + MTP) | `BailingMoeV2ForCausalLM` |
-| 🚧 | Ring 2.0 (mini / flash / 1T-preview) | [`InclusionAI/Ring-2.md`](InclusionAI/Ring-2.md) | v6e-4 / v6e-16 / v6e-64 | MoE + reasoning | `BailingMoeV2ForCausalLM` |
-| 🚧 | Ling 2.6 (1T / flash) | [`InclusionAI/Ling-2.6.md`](InclusionAI/Ling-2.6.md) | v6e-64 / v7x-16 | MoE + linear attn | `BailingMoeV2_5ForCausalLM` |
+| Status | Model | Recipe | Min TPU | Backend |
+|---|---|---|---|---|
+| 🚧 | Ling 1.x (lite / plus / Coder-lite) | [`InclusionAI/Ling-1.x.md`](InclusionAI/Ling-1.x.md) | v6e-4 / v6e-32 | MoE |
+| 🚧 | Ling 2.0 (mini / flash / 1T) | [`InclusionAI/Ling-2.md`](InclusionAI/Ling-2.md) | v6e-4 / v6e-16 / v6e-64 | MoE (1/32 sparsity + MTP) |
+| 🚧 | Ring 2.0 (mini / flash / 1T-preview) | [`InclusionAI/Ring-2.md`](InclusionAI/Ring-2.md) | v6e-4 / v6e-16 / v6e-64 | MoE + reasoning |
+| 🚧 | Ling 2.6 (1T / flash) | [`InclusionAI/Ling-2.6.md`](InclusionAI/Ling-2.6.md) | v6e-64 / v7x-16 | MoE + linear attn |
 
 ### Llama — `Llama/`
 
-| Status | Model | Recipe | Min TPU | Backend | Architecture class |
-|---|---|---|---|---|---|
-| 🚧 | Llama 3.1 8B (+ Phi-3 / InternLM3 aliases) | [`Llama/Llama3.1.md`](Llama/Llama3.1.md) | v6e-4 | dense | `LlamaForCausalLM` |
-| 🚧 | Llama 3.3 70B | [`Llama/Llama3.3-70B.md`](Llama/Llama3.3-70B.md) | v6e-32 | dense | `LlamaForCausalLM` |
-| 📝 | Phi-3 | _alias under Llama3.1.md_ | — | dense (Llama alias) | `Phi3ForCausalLM` |
-| 📝 | InternLM 3 | _alias under Llama3.1.md_ | — | dense (Llama alias) | `InternLM3ForCausalLM` |
+| Status | Model | Recipe | Min TPU | Backend |
+|---|---|---|---|---|
+| 🚧 | Llama 3.1 8B (+ Phi-3 / InternLM3 aliases) | [`Llama/Llama3.1.md`](Llama/Llama3.1.md) | v6e-4 | dense |
+| 🚧 | Llama 3.3 70B | [`Llama/Llama3.3-70B.md`](Llama/Llama3.3-70B.md) | v6e-32 | dense |
 
 ### Moonshotai — `Moonshotai/`
 
-| Status | Model | Recipe | Min TPU | Backend | Architecture class |
-|---|---|---|---|---|---|
-| 🚧 | Kimi-Linear (48B-A3B) | [`Moonshotai/Kimi-Linear.md`](Moonshotai/Kimi-Linear.md) | v6e-16 | dense + linear attn | `KimiLinearForCausalLM` |
+| Status | Model | Recipe | Min TPU | Backend |
+|---|---|---|---|---|
+| 🚧 | Kimi-Linear (48B-A3B) | [`Moonshotai/Kimi-Linear.md`](Moonshotai/Kimi-Linear.md) | v6e-16 | dense + linear attn |
 
 ### Qwen — `Qwen/`
 
-| Status | Model | Recipe | Min TPU | Backend | Architecture class |
-|---|---|---|---|---|---|
-| ✅ | Qwen-7B-Chat | [`Qwen/Qwen.md`](Qwen/Qwen.md) | v6e-4 | dense | `QWenLMHeadModel` |
-| ✅ | Qwen3-8B / Qwen3-32B | [`Qwen/Qwen3.md`](Qwen/Qwen3.md) | v6e-4 | dense | `Qwen3ForCausalLM` |
-| 🚧 | Qwen3-MoE (30B-A3B / 235B-A22B) | [`Qwen/Qwen3-MoE.md`](Qwen/Qwen3-MoE.md) | v6e-16 / v6e-64 | MoE | `Qwen3MoeForCausalLM` |
-| 📝 | Qwen2 | _no recipe_ | — | dense | `Qwen2ForCausalLM` |
-| 📝 | Qwen2-MoE | _no recipe_ | — | MoE | `Qwen2MoeForCausalLM` |
+| Status | Model | Recipe | Min TPU | Backend |
+|---|---|---|---|---|
+| ✅ | Qwen-7B-Chat | [`Qwen/Qwen.md`](Qwen/Qwen.md) | v6e-4 | dense |
+| ✅ | Qwen3-8B / Qwen3-32B | [`Qwen/Qwen3.md`](Qwen/Qwen3.md) | v6e-4 | dense + reasoning (`qwen3`) + tool (`qwen25`) |
+| 🚧 | Qwen3-MoE (30B-A3B / 235B-A22B) | [`Qwen/Qwen3-MoE.md`](Qwen/Qwen3-MoE.md) | v6e-16 / v6e-64 | MoE + reasoning (`qwen3`) + tool (`qwen25`) |
+| 📝 | Qwen2 / Qwen2-MoE | _no recipe — same family runtime path_ | — | dense / MoE |
 
 ### Xiaomi — `Xiaomi/`
 
-| Status | Model | Recipe | Min TPU | Backend | Architecture class |
-|---|---|---|---|---|---|
-| ✅ | MiMo-V2-Flash | [`Xiaomi/MiMo-V2-Flash.md`](Xiaomi/MiMo-V2-Flash.md) | v7x-8 or v6e-16 | MoE (`fused` / `epmoe`) | `MiMoV2FlashForCausalLM` |
-| ✅ | MiMo-V2.5-Pro | [`Xiaomi/MiMo-V2.5-Pro.md`](Xiaomi/MiMo-V2.5-Pro.md) | v7x-16 or v6e-64 | MoE (`fused`) | `MiMoV2ForCausalLM` |
-| 🚧 | MiMo-7B | [`Xiaomi/MiMo-7B.md`](Xiaomi/MiMo-7B.md) | v6e-4 | dense | `MiMoForCausalLM` |
+| Status | Model | Recipe | Min TPU | Backend |
+|---|---|---|---|---|
+| ✅ | MiMo-V2-Flash | [`Xiaomi/MiMo-V2-Flash.md`](Xiaomi/MiMo-V2-Flash.md) | v7x-8 or v6e-16 | MoE + reasoning/tool (`mimo`) |
+| ✅ | MiMo-V2.5-Pro | [`Xiaomi/MiMo-V2.5-Pro.md`](Xiaomi/MiMo-V2.5-Pro.md) | v7x-16 or v6e-64 | MoE + reasoning/tool (`mimo`) |
+| 🚧 | MiMo-7B | [`Xiaomi/MiMo-7B.md`](Xiaomi/MiMo-7B.md) | v6e-4 | dense + reasoning/tool (`mimo`) |
 
 > Upgrade path: 🚧 → ✅ requires real `evalscope` (accuracy) or `bench_serving` (throughput) output in §4, structured as **Test Environment → Deployment Command → Benchmark Command → Test Results**. See [`Xiaomi/MiMo-V2-Flash.md` §4](Xiaomi/MiMo-V2-Flash.md#4-benchmark) for the canonical four-section form.
 
@@ -109,6 +105,23 @@ Diffusion / TTS / VLM models live in [`../multimodal/`](../multimodal/index.md).
 | Linear-attention model with recurrent state | [`InclusionAI/Ling-2.6.md`](InclusionAI/Ling-2.6.md) 🚧 or [`Moonshotai/Kimi-Linear.md`](Moonshotai/Kimi-Linear.md) 🚧 |
 | Reasoning model (RL-tuned, `<think>` blocks) | [`InclusionAI/Ring-2.md`](InclusionAI/Ring-2.md) 🚧 or [`DeepSeek/DeepSeek-R1.md`](DeepSeek/DeepSeek-R1.md) 🚧 |
 
+## Parser key reference
+
+Reasoning models that emit `<think>` blocks need `--reasoning-parser <key>` at launch; tool-calling models need `--tool-call-parser <key>`. The cookbook recipes pick the key that matches each model's `<think>` / tool-call format:
+
+| Parser key | Reasoning | Tool-call | Where used in cookbook |
+|---|---|---|---|
+| `deepseek-r1` | ✓ (`<think>...</think>`) | — | [DeepSeek-R1](DeepSeek/DeepSeek-R1.md), Ring 2.0 / Ling 2.6 reasoning variants (use as `<think>` parser) |
+| `qwen3` | ✓ (`<think>...</think>` + `enable_thinking` switch) | — | [Qwen3](Qwen/Qwen3.md), [Qwen3-MoE](Qwen/Qwen3-MoE.md) |
+| `qwen25` | — | ✓ | Qwen3 / Qwen3-MoE tool-calling |
+| `qwen3_coder` | — | ✓ | Qwen3-Coder variants |
+| `mimo` | ✓ (alias of `qwen3` parser) | ✓ | [MiMo-V2-Flash](Xiaomi/MiMo-V2-Flash.md), [MiMo-V2.5-Pro](Xiaomi/MiMo-V2.5-Pro.md), [MiMo-7B](Xiaomi/MiMo-7B.md) |
+| `glm45` | ✓ (`<think>...</think>`) | ✓ | [GLM-4.5 / 4.5-Air](GLM/GLM-4.5.md) |
+| `glm47` | — | ✓ | [GLM-5](GLM/GLM-5.md) tool-calling |
+| `kimi` | ✓ (`◁think▷...◁/think▷`) | — | Reserved for Kimi reasoning variants; Kimi-Linear-Instruct is not reasoning |
+
+Run `python -m sgl_jax.launch_server --help` against your checkout to see the full registered set — these keys are the cookbook-relevant subset.
+
 ## Architecture coverage vs codebase
 
-This index lists models with a recipe (✅ / 🚧) plus models the runtime supports but where no curated recipe exists yet (📝). The complete set of registered architectures lives under [`python/sgl_jax/srt/models/`](https://github.com/sgl-project/sglang-jax/tree/main/python/sgl_jax/srt/models). 📝 entries are still served correctly by the runtime — they just don't have a deployment guide.
+This index lists models with a recipe (✅ / 🚧) plus models the runtime supports but where no curated recipe exists yet (📝). 📝 entries are still served correctly by the runtime — they just don't have a deployment guide.

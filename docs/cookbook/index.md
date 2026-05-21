@@ -1,6 +1,5 @@
 ---
 title: "SGL-JAX Cookbook"
-description: "End-to-end recipes for serving LLMs and multimodal models on TPU with SGL-JAX — one page per model and hardware combination."
 ---
 
 # SGL-JAX Cookbook
@@ -50,9 +49,17 @@ Status prefix: ✅ validated · 🚧 starter (not yet measured). See [`autoregre
 | TPU | Topology | Nodes | Recipes |
 |---|---|---|---|
 | v6e-16 | 4x4 | 4 | ✅ [MiMo-V2-Flash](autoregressive/Xiaomi/MiMo-V2-Flash.md) · 🚧 [Qwen3-30B-A3B MoE](autoregressive/Qwen/Qwen3-MoE.md) · 🚧 [Kimi-Linear](autoregressive/Moonshotai/Kimi-Linear.md) · 🚧 [Ling-flash-2.0](autoregressive/InclusionAI/Ling-2.md) · 🚧 [Ring-flash-2.0](autoregressive/InclusionAI/Ring-2.md) |
-| v6e-32 | 4x8 | 8 | ✅ [Grok-2](autoregressive/Grok/Grok2.md) · 🚧 [Llama 3.3 70B](autoregressive/Llama/Llama3.3-70B.md) · 🚧 [DeepSeek-V2](autoregressive/DeepSeek/DeepSeek-V2.md) · 🚧 [GLM-4.5-Air](autoregressive/GLM/GLM-4.5.md) · 🚧 [Ling-plus](autoregressive/InclusionAI/Ling-1.x.md) |
+| v6e-32 | 4x8 | 8 | ✅ [Grok-2](autoregressive/Grok/Grok2.md) · 🚧 [Llama 3.3 70B](autoregressive/Llama/Llama3.3-70B.md) · 🚧 [DeepSeek-V2](autoregressive/DeepSeek/DeepSeek-V2.md) · 🚧 [GLM-4.5-Air](autoregressive/GLM/GLM-4.5.md) · 🚧 [Ling-plus](autoregressive/InclusionAI/Ling-1.x.md) · 🚧 [Qwen2.5-VL-72B](multimodal/Qwen/Qwen2.5-VL.md) |
 | v6e-64 | 4x4x4 | 16 | ✅ [MiMo-V2.5-Pro](autoregressive/Xiaomi/MiMo-V2.5-Pro.md) · 🚧 [Qwen3-235B MoE](autoregressive/Qwen/Qwen3-MoE.md) · 🚧 [DeepSeek-V3](autoregressive/DeepSeek/DeepSeek-V3.md) · 🚧 [DeepSeek-R1](autoregressive/DeepSeek/DeepSeek-R1.md) · 🚧 [GLM-4.5](autoregressive/GLM/GLM-4.5.md) · 🚧 [Ling-1T](autoregressive/InclusionAI/Ling-2.md) · 🚧 [Ring-1T-preview](autoregressive/InclusionAI/Ring-2.md) · 🚧 [Ling-2.6](autoregressive/InclusionAI/Ling-2.6.md) |
 | v7x-16 | 2x2x4 | 4 | ✅ [MiMo-V2.5-Pro](autoregressive/Xiaomi/MiMo-V2.5-Pro.md) · 🚧 [Ling-2.6](autoregressive/InclusionAI/Ling-2.6.md) · 🚧 [Ling-1T](autoregressive/InclusionAI/Ling-2.md) · 🚧 [Ring-1T-preview](autoregressive/InclusionAI/Ring-2.md) · 🚧 [DeepSeek-V3](autoregressive/DeepSeek/DeepSeek-V3.md) · 🚧 [DeepSeek-R1](autoregressive/DeepSeek/DeepSeek-R1.md) |
+
+### Multimodal (`--multimodal` server)
+
+| TPU | Topology | Recipes |
+|---|---|---|
+| v6e-4 | 2x2 | 🚧 [Qwen2.5-VL 3B / 7B / 32B](multimodal/Qwen/Qwen2.5-VL.md) · 🚧 [Wan 2.1 T2V 1.3B / 14B](multimodal/Wan/Wan-2.x.md) |
+| v6e-8 | 2x4 | 🚧 [Wan 2.2 T2V A14B](multimodal/Wan/Wan-2.x.md) |
+| v6e-32 (multi-host) | 4x8 | 🚧 [Qwen2.5-VL 72B](multimodal/Qwen/Qwen2.5-VL.md) |
 
 For TPU generation/HBM/per-chip-device specs, see [`base/tpu-topology-reference.md`](base/tpu-topology-reference.md).
 

@@ -1,6 +1,5 @@
 ---
 title: "Qwen-7B-Chat"
-description: "Qwen-7B-Chat first-generation dense decoder serving on TPU v6e-4 single host with SGL-JAX."
 ---
 
 # Qwen-7B-Chat on SGL-JAX
@@ -60,13 +59,10 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
   --mem-fraction-static 0.8 \
   --max-prefill-tokens 8192 \
   --download-dir /tmp \
-  --dist-init-addr 0.0.0.0:10011 --nnodes 1 --node-rank 0 \
   --random-seed 3 \
   --skip-server-warmup \
   --host 0.0.0.0 --port 30000
 ```
-
-> The `--dist-init-addr` / `--nnodes 1` / `--node-rank 0` trio is required even on a single-host launch — SGL-JAX always initializes JAX distributed.
 
 ### 2.4 Configuration Tips
 
@@ -92,7 +88,7 @@ For full flag definitions and defaults see [`../base/launch-flags-reference.md`]
 curl -X POST http://127.0.0.1:30000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen-7B-Chat",
+    "model": "Qwen/Qwen-7B-Chat",
     "messages": [{"role": "user", "content": "Hello"}]
   }'
 ```
@@ -104,7 +100,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
 
 resp = client.chat.completions.create(
-    model="Qwen-7B-Chat",
+    model="Qwen/Qwen-7B-Chat",
     messages=[{"role": "user", "content": "Hello"}],
 )
 print(resp.choices[0].message.content)
@@ -116,7 +112,30 @@ print(resp.choices[0].message.content)
 
 > Benchmark data below is a snapshot pinned to the `Tested build` listed in each Test Environment; not refreshed on every release.
 
-### 4.1 Accuracy — GSM8K
+### 4.1 Speed — single workload (low-concurrency latency baseline)
+
+**Test Environment** — same as §4.2.
+
+**Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4).
+
+**Benchmark Command**
+
+```bash
+python -m sgl_jax.bench_serving \
+  --backend sgl-jax \
+  --dataset-name random \
+  --num-prompts 100 \
+  --random-input 512 \
+  --random-output 128 \
+  --max-concurrency 8 \
+  --random-range-ratio 1 \
+  --warmup-requests 0 \
+  --tokenizer Qwen/Qwen-7B-Chat
+```
+
+**Test Results** — _Pending. Run the command above and PR back the full `============ Serving Benchmark Result ============` block from `bench_serving`._
+
+### 4.2 Accuracy — GSM8K
 
 **Test Environment**
 
@@ -133,7 +152,7 @@ print(resp.choices[0].message.content)
 
 ```bash
 evalscope eval \
-  --model Qwen-7B-Chat \
+  --model Qwen/Qwen-7B-Chat \
   --api-url http://127.0.0.1:30000/v1/chat/completions \
   --api-key EMPTY \
   --eval-type service \
@@ -147,28 +166,6 @@ evalscope eval \
 | Model | Dataset | Metric | Subset | Num | Score |
 |:---|:---|:---|:---|:---|:---|
 | Qwen-7B-Chat | gsm8k | AverageAccuracy | main | 500 | 0.504 |
-
-### 4.2 Speed — single workload (low-concurrency latency baseline)
-
-**Test Environment** — same as §4.1.
-
-**Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4).
-
-**Benchmark Command**
-
-```bash
-python -m sgl_jax.bench_serving \
-  --backend sgl-jax \
-  --dataset-name random \
-  --num-prompts 100 \
-  --random-input 512 \
-  --random-output 128 \
-  --max-concurrency 8 \
-  --random-range-ratio 1 \
-  --warmup-requests 0
-```
-
-**Test Results** — _Pending. Run the command above and PR back the full `============ Serving Benchmark Result ============` block from `bench_serving`._
 
 ## 5. Troubleshooting
 

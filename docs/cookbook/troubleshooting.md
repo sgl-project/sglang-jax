@@ -1,6 +1,5 @@
 ---
 title: "Troubleshooting"
-description: "Cross-recipe generic failure modes — startup OOM, multi-node hang, JIT cache miss, SWA pool exhaustion."
 ---
 
 # Troubleshooting

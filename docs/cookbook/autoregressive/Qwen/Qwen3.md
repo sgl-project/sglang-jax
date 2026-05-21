@@ -1,6 +1,5 @@
 ---
 title: "Qwen3"
-description: "Qwen3-8B and Qwen3-32B hybrid-reasoning dense decoders serving on TPU v6e-4 with SGL-JAX, with vLLM throughput comparison."
 ---
 
 # Qwen3-8B / Qwen3-32B on SGL-JAX
@@ -15,7 +14,7 @@ description: "Qwen3-8B and Qwen3-32B hybrid-reasoning dense decoders serving on 
 - **Hybrid Reasoning**: Supports thinking-on (default) and thinking-off via `chat_template_kwargs.enable_thinking` per-request.
 - **Tool Calling**: OpenAI-compatible tool/function calling supported.
 - **Long Context**: 128K context window.
-- **Production-validated benchmarks**: §4.2 below has measured throughput vs vLLM on the same hardware.
+- **Production-validated benchmarks**: §4.1 below has measured throughput vs vLLM on the same hardware.
 
 **Recommended Generation Parameters**:
 
@@ -321,11 +320,7 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 
 > Benchmark data below is a snapshot pinned to the `Tested build` listed in each Test Environment; not refreshed on every release. The full archived ISL × OSL × batch matrix and chart images live in [`../../performance/qwen3_benchmark.md`](../../../performance/qwen3_benchmark.md) as a release-notes-style report.
 
-### 4.1 Accuracy
-
-_Not measured in this benchmark run._ Run `evalscope` against the launched server using the four-section pattern from [`Qwen.md` §4.1](Qwen.md#41-accuracy--gsm8k) (Test Environment → Deployment Command → Benchmark Command → Test Results) if you need accuracy numbers.
-
-### 4.2 Speed — SGL-JAX vs vLLM
+### 4.1 Speed — SGL-JAX vs vLLM
 
 **Test Environment**
 
@@ -354,9 +349,10 @@ vllm serve "${MODEL_NAME}" \
 #!/bin/bash
 set -e
 if [ -z "$1" ]; then
-  echo "Usage: $0 <engine>"; echo "engine: sgl-jax or vllm"; exit 1
+  echo "Usage: $0 <engine> [model]"; echo "engine: sgl-jax or vllm"; exit 1
 fi
 backend=${1}
+MODEL_NAME=${2:-Qwen/Qwen3-8B}  # or pass Qwen/Qwen3-32B as 2nd arg
 num_prompts_per_concurrency=3
 input_seq_lens=(1024 4096 8192)
 output_seq_lens=(1 1024)
@@ -374,7 +370,8 @@ for input_seq_len in "${input_seq_lens[@]}"; do
         --random-output ${output_seq_len} \
         --max-concurrency ${max_concurrency} \
         --random-range-ratio 1 \
-        --warmup-requests 0
+        --warmup-requests 0 \
+        --tokenizer "${MODEL_NAME}"
     done
   done
 done
@@ -384,8 +381,8 @@ Run against both engines:
 
 ```bash
 chmod +x benchmark.sh
-./benchmark.sh sgl-jax
-./benchmark.sh vllm
+./benchmark.sh sgl-jax Qwen/Qwen3-8B
+./benchmark.sh vllm Qwen/Qwen3-8B
 ```
 
 **Test Results** (selected representative cells — see [the benchmark report](../../../performance/qwen3_benchmark.md) for the full ISL × OSL × batch matrix)
@@ -410,13 +407,17 @@ Qwen3-32B:
 
 SGL-JAX wins consistently on this hardware across all measured cells: ~1.5–2.2× output throughput, ~1.4–2.0× faster TTFT, ~1.6–2.4× lower ITL.
 
+### 4.2 Accuracy
+
+_Not measured in this benchmark run._ Run `evalscope` against the launched server using the four-section pattern from [`Qwen.md` §4.2](Qwen.md#42-accuracy--gsm8k) (Test Environment → Deployment Command → Benchmark Command → Test Results) if you need accuracy numbers.
+
 ## 5. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | OOM at startup with Qwen3-32B | `--mem-fraction-static 0.8` still too high for 32B + large `--max-running-requests` | Lower `--max-running-requests` to 128, or `--mem-fraction-static` to 0.75. Verify `--tp-size 4` matches v6e-4 chip count. |
 | First request takes ~4 min | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR` across restarts (host volume mount in Docker). |
-| Throughput plateaus below benchmark numbers | RadixAttention prefix caching helping (or not) | If reproducing the §4.2 vLLM comparison, ensure `--disable-radix-cache` is set. For production, leave it off — it's a free win on repeated prefixes. |
+| Throughput plateaus below benchmark numbers | RadixAttention prefix caching helping (or not) | If reproducing the §4.1 vLLM comparison, ensure `--disable-radix-cache` is set. For production, leave it off — it's a free win on repeated prefixes. |
 | Tool calls return empty arguments | `--tool-call-parser` not set | Add `--tool-call-parser qwen25` to the launch command. |
 
 ## Additional Resources

@@ -1,6 +1,5 @@
 ---
 title: "Launch Flags Reference"
-description: "SGL-JAX launch_server flag definitions, defaults, and tuning notes referenced by recipes for non-obvious flags."
 ---
 
 # Launch Flag Reference

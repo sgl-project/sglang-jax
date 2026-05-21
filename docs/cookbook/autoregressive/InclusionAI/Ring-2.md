@@ -1,6 +1,5 @@
 ---
 title: "Ring 2.0"
-description: "InclusionAI Ring 2.0 reasoning-tuned MoE family (mini / flash / 1T-preview) serving on TPU with SGL-JAX."
 ---
 
 # Ring 2.0 on SGL-JAX
@@ -53,7 +52,7 @@ Install per [`../../../get_started/install.md`](../../../get_started/install.md)
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
   --model-path inclusionAI/Ring-mini-2.0 \
   --trust-remote-code \
-  --reasoning-parser <key> \
+  --reasoning-parser deepseek-r1 \
   --tp-size 4 --ep-size 4 \
   --moe-backend epmoe \
   --device tpu \
@@ -63,7 +62,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
   --host 0.0.0.0 --port 30000
 ```
 
-> **`--reasoning-parser <key>`**: Ring emits `<think>` blocks; the appropriate parser key isn't fixed in this starter — run `python -m sgl_jax.launch_server --help` to see the registered keys (e.g. `deepseek-r1`, `qwen3`, `mimo`) and pick whichever matches Ring's `<think>` format per the model card. Without this flag, thinking content stays inline in `content` instead of being split into `reasoning_content`.
+> **`--reasoning-parser deepseek-r1`**: Ring 2.0 emits `<think>...</think>` blocks the same way DeepSeek-R1 does — no `ring` parser key is registered, so reuse `deepseek-r1` (the generic `<think>` block parser). Without this flag, thinking content stays inline in `content` instead of being split into `reasoning_content`.
 
 #### Multi-host (SkyPilot) — TPU v6e-16 (Ring-flash-2.0)
 
@@ -82,7 +81,7 @@ sky exec ${CLUSTER_NAME} -- "cd sglang-jax && source .venv/bin/activate && \
   JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
   --model-path inclusionAI/Ring-flash-2.0 \
   --trust-remote-code \
-  --reasoning-parser <key> \
+  --reasoning-parser deepseek-r1 \
   --tp-size 16 --ep-size 16 \
   --moe-backend fused \
   --device tpu \
@@ -112,7 +111,7 @@ For GKE, adapt the manifest pattern from [`../Xiaomi/MiMo-V2.5-Pro.md` §2.3 Mul
 ### 2.4 Configuration Tips
 
 **Reasoning Parser:**
-- Ring 2.0 is reasoning-tuned and emits `<think>` blocks. Launch with `--reasoning-parser <key>` so the API splits `reasoning_content` from `content` — see the §2.3 note for picking the right key.
+- Ring 2.0 is reasoning-tuned and emits `<think>...</think>` blocks. Launch with `--reasoning-parser deepseek-r1` (the generic `<think>` parser — no Ring-specific key is registered). Without it, thinking content stays inline in `content` instead of being split into `reasoning_content`.
 - The streaming Python client pattern from [`../Qwen/Qwen3.md` §3.2](../Qwen/Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) applies directly once the parser is set.
 
 **MoE Backend:**
@@ -143,7 +142,7 @@ Standard OpenAI-compatible request — see [`../Qwen/Qwen3.md` §3.1](../Qwen/Qw
 
 ### 3.2 Reasoning (thinking-on streaming)
 
-Once you launch with `--reasoning-parser <key>` (see §2.3), use the streaming Python client from [`../Qwen/Qwen3.md` §3.2](../Qwen/Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) to separate `reasoning_content` from `content`. The pattern applies directly — only the model path changes.
+Once you launch with `--reasoning-parser deepseek-r1` (see §2.3 — Ring 2.0 emits `<think>...</think>` blocks; no `ring` parser key is registered, so reuse the generic `deepseek-r1` parser), use the streaming Python client from [`../Qwen/Qwen3.md` §3.2](../Qwen/Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) to separate `reasoning_content` from `content`. The pattern applies directly — only the model path changes.
 
 > Ring 2.0 does not ship with a native tool-call format. For tool-call workloads see [`../Qwen/Qwen3.md` §3.3](../Qwen/Qwen3.md#33-tool-calling) or [`../Xiaomi/MiMo-V2.5-Pro.md` §3.3](../Xiaomi/MiMo-V2.5-Pro.md#33-tool-calling).
 
@@ -151,7 +150,15 @@ Once you launch with `--reasoning-parser <key>` (see §2.3), use the streaming P
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Accuracy
+### 4.1 Speed
+
+> **Layout B — methodology + command template.** Cells below are command templates only; no measured numbers yet. PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` to upgrade to Validated.
+
+**Benchmark Command** — adapt the driver from [`../Qwen/Qwen3.md` §4.1](../Qwen/Qwen3.md#41-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Ring checkpoint, raise `--random-output` to 2048+ to reflect reasoning token budgets, remove the vLLM half).
+
+**Test Results** — _Pending._
+
+### 4.2 Accuracy
 
 **Test Environment**
 
@@ -161,7 +168,7 @@ Once you launch with `--reasoning-parser <key>` (see §2.3), use the streaming P
 | Model | inclusionAI/Ring-mini-2.0 / Ring-flash-2.0 / Ring-1T-preview (BF16) |
 | Tensor Parallelism | 4 / 16 / 64 |
 | Expert Parallelism | 4 / 16 / 64 |
-| Reasoning Parser | `<key>` (see §2.3) |
+| Reasoning Parser | `deepseek-r1` (generic `<think>` parser; no `ring` key registered) |
 | Tested build | _Pending_ |
 
 **Deployment Command** — same as [§2.3](#single-host-docker--tpu-v6e-4-ring-mini-20).
@@ -183,17 +190,11 @@ Recommended primary datasets: **AIME 2025**, **GPQA Diamond**, **LiveCodeBench**
 
 **Test Results** — _Pending. Run and PR back._
 
-### 4.2 Speed
-
-**Benchmark Command** — adapt the driver from [`../Qwen/Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Ring checkpoint, raise `--random-output` to 2048+ to reflect reasoning token budgets, remove the vLLM half).
-
-**Test Results** — _Pending._
-
 ## 5. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Response contains raw `<think>` text instead of `reasoning_content` | `--reasoning-parser` not set | Add `--reasoning-parser <key>` (see §2.3 note for picking the key). |
+| Response contains raw `<think>` text instead of `reasoning_content` | `--reasoning-parser` not set | Add `--reasoning-parser deepseek-r1` (the generic `<think>` parser; no `ring` key is registered today). |
 | MoE throughput plateau (flash / 1T-preview) | Wrong `--moe-backend` for EP size | Use `--moe-backend fused` at EP ≥ 16; `epmoe` only at EP ≤ 8. |
 | Decode tail latency spikes at high concurrency | Reasoning outputs exceed KV budget at chosen `--max-running-requests` | Lower `--max-running-requests` to 128 or 64; reasoning workloads need fewer in-flight requests than chat. |
 | OOM at startup (1T-preview) | `--mem-fraction-static 0.92` too high | Lower to 0.9. Verify `--tp-size` matches chip count (v6e-64 → 64; v7x-16 → 32). |

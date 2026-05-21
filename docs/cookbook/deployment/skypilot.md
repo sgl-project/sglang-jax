@@ -1,6 +1,5 @@
 ---
 title: "SkyPilot"
-description: "Generic launcher template for multi-node TPU serving via SkyPilot, with provisioning + sky exec pattern."
 ---
 
 # SkyPilot Multi-Node TPU Launcher

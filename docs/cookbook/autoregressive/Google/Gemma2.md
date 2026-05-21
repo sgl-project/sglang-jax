@@ -1,6 +1,5 @@
 ---
 title: "Gemma 2"
-description: "Gemma 2 9B and 27B hybrid-attention decoders serving on TPU v6e-4 with SGL-JAX."
 ---
 
 # Gemma 2 on SGL-JAX
@@ -26,10 +25,11 @@ description: "Gemma 2 9B and 27B hybrid-attention decoders serving on TPU v6e-4 
 
 ### 2.1 Hardware Matrix (starter targets)
 
-| Model | TPU | Topology | Chips | `--tp-size` | Notes |
-|---|---|---|---|---|---|
-| Gemma 2 9B / 9B-it  | v6e-4 | 2x2 | 4 | 4 | BF16 ~18 GB — fits with headroom |
-| Gemma 2 27B / 27B-it | v6e-4 | 2x2 | 4 | 4 | BF16 ~54 GB — fits; lower `--mem-fraction-static` |
+| Tier | Model | TPU | Topology | Chips | `--tp-size` | Notes |
+|---|---|---|---|---|---|---|
+| Minimum runnable | Gemma 2 9B / 9B-it | v6e-4 | 2x2 | 4 | 4 | BF16 ~18 GB — fits with headroom; default `--mem-fraction-static 0.88` |
+| Minimum runnable | Gemma 2 27B / 27B-it | v6e-4 | 2x2 | 4 | 4 | BF16 ~54 GB — fits; lower `--mem-fraction-static` to 0.85 to absorb dual KV pools |
+| Recommended production (27B) | Gemma 2 27B-it | v6e-8 | 2x4 | 8 | 8 | More HBM headroom so the global + sliding KV pools both have room; raises `--max-running-requests` ceiling |
 
 See [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
@@ -106,7 +106,15 @@ Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#3
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Accuracy
+### 4.1 Speed
+
+> **Layout B — methodology + command template.** No measured numbers yet; PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` to upgrade to Validated.
+
+**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.1](../Qwen/Qwen3.md#41-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Gemma checkpoint).
+
+**Test Results** — _Pending._
+
+### 4.2 Accuracy
 
 **Test Environment**
 
@@ -134,12 +142,6 @@ evalscope eval \
 Recommended additional datasets: MMLU, GPQA Diamond.
 
 **Test Results** — _Pending. Run and PR back._
-
-### 4.2 Speed
-
-**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Gemma checkpoint).
-
-**Test Results** — _Pending._
 
 ## 5. Troubleshooting
 

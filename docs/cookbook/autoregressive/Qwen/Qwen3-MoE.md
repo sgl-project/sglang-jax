@@ -1,6 +1,5 @@
 ---
 title: "Qwen3-MoE"
-description: "Qwen3-30B-A3B and Qwen3-235B-A22B MoE variants serving on TPU v6e-16 / v6e-64 with SGL-JAX."
 ---
 
 # Qwen3-MoE on SGL-JAX
@@ -102,7 +101,8 @@ For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.md` §2.3 Multi-host](.
 - Lower by 0.02 increments if you hit OOM at startup with high `--max-running-requests`.
 
 **Hybrid Reasoning / Tool Calling:**
-- Qwen3-MoE shares the hybrid reasoning (`--reasoning-parser qwen3`) and tool-call (`--tool-call-parser qwen25`) format with dense Qwen3. Append these flags to the launch command — full streaming Python examples in [`Qwen3.md` §3.2](Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) and [§3.3](Qwen3.md#33-tool-calling) apply directly.
+- Qwen3-MoE shares the hybrid reasoning (`--reasoning-parser qwen3`) and tool-call (`--tool-call-parser qwen25`) format with dense Qwen3. Append both flags to the §2.3 launch command to expose `reasoning_content` and OpenAI-compatible `tool_calls` on the response.
+- Full streaming Python examples (thinking-on + thinking-off, streaming tool-call accumulator, multi-turn Handling Tool Call Results) live in [`Qwen3.md` §3.2](Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) and [§3.3](Qwen3.md#33-tool-calling) — substitute the Qwen3-MoE model path and the §2.3 launch flags above.
 
 **Throughput vs Latency:**
 - `--page-size 128` reduces KV page-table overhead at MoE scale. Default `1` is much slower at high concurrency.
@@ -128,7 +128,15 @@ Qwen3-MoE inherits the dense Qwen3 hybrid-reasoning and tool-call format — the
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Accuracy
+### 4.1 Speed
+
+> **Layout B — methodology + command template.** No measured numbers yet; PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` to upgrade to Validated.
+
+**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.1](Qwen3.md#41-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Qwen3-MoE checkpoint, remove the vLLM half if not comparing).
+
+**Test Results** — _Pending._
+
+### 4.2 Accuracy
 
 **Test Environment**
 
@@ -158,12 +166,6 @@ evalscope eval \
 Recommended additional datasets: AIME 2025, MATH, GPQA Diamond.
 
 **Test Results** — _Pending. Run and PR back._
-
-### 4.2 Speed
-
-**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Qwen3-MoE checkpoint, remove the vLLM half if not comparing).
-
-**Test Results** — _Pending._
 
 ## 5. Troubleshooting
 

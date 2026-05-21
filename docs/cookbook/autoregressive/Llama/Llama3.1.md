@@ -1,6 +1,5 @@
 ---
 title: "Llama 3.1"
-description: "Llama 3.1 8B Instruct (plus Phi-3 / InternLM3 aliases) serving on TPU v6e-4 single host with SGL-JAX."
 ---
 
 # Llama 3.1 on SGL-JAX
@@ -27,9 +26,10 @@ For the 70B size (multi-host required) see [`Llama3.3-70B.md`](Llama3.3-70B.md).
 
 ### 2.1 Hardware Matrix (starter target)
 
-| Model | TPU | Topology | Chips | `--tp-size` | Notes |
-|---|---|---|---|---|---|
-| Llama 3.1 8B / Phi-3.5 / InternLM3-8B | v6e-4 | 2x2 | 4 | 4 | BF16 ~16 GB — fits with headroom |
+| Tier | Model | TPU | Topology | Chips | `--tp-size` | Notes |
+|---|---|---|---|---|---|---|
+| Minimum runnable | Llama 3.1 8B / Phi-3.5 / InternLM3-8B | v6e-4 | 2x2 | 4 | 4 | BF16 ~16 GB — fits with headroom; lowest-cost single-host serving |
+| Recommended production | Llama 3.1 8B / Phi-3.5 / InternLM3-8B | v6e-8 | 2x4 | 8 | 8 | More HBM headroom for higher `--max-running-requests` / longer context — same single-host class, no multi-node coordination |
 
 See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
@@ -82,7 +82,15 @@ Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#3
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Accuracy
+### 4.1 Speed
+
+> **Layout B — methodology + command template.** No measured numbers yet; PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` to upgrade to Validated.
+
+**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.1](../Qwen/Qwen3.md#41-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Llama checkpoint).
+
+**Test Results** — _Pending._
+
+### 4.2 Accuracy
 
 **Test Environment**
 
@@ -110,12 +118,6 @@ evalscope eval \
 Recommended additional datasets: MMLU, HumanEval, IFEval.
 
 **Test Results** — _Pending. Run and PR back._
-
-### 4.2 Speed
-
-**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Llama checkpoint).
-
-**Test Results** — _Pending._
 
 ## 5. Troubleshooting
 

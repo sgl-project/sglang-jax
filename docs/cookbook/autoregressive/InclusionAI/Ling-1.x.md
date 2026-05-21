@@ -1,6 +1,5 @@
 ---
 title: "Ling 1.x"
-description: "InclusionAI Ling-lite, Ling-plus, and Ling-Coder-lite first-generation MoE serving on TPU v6e-4 or v6e-32 with SGL-JAX."
 ---
 
 # Ling 1.x on SGL-JAX
@@ -127,7 +126,15 @@ Standard OpenAI-compatible request — see [`../Qwen/Qwen3.md` §3.1](../Qwen/Qw
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Accuracy
+### 4.1 Speed
+
+> **Layout B — methodology + command template.** No measured numbers yet; PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` to upgrade to Validated.
+
+**Benchmark Command** — adapt the driver from [`../Qwen/Qwen3.md` §4.1](../Qwen/Qwen3.md#41-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Ling checkpoint, remove the vLLM half).
+
+**Test Results** — _Pending._
+
+### 4.2 Accuracy
 
 **Test Environment**
 
@@ -156,12 +163,6 @@ evalscope eval \
 Recommended additional datasets: MMLU (general); for Ling-Coder-lite use HumanEval / MBPP / LiveCodeBench.
 
 **Test Results** — _Pending. Run and PR back._
-
-### 4.2 Speed
-
-**Benchmark Command** — adapt the driver from [`../Qwen/Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Ling checkpoint, remove the vLLM half).
-
-**Test Results** — _Pending._
 
 ## 5. Troubleshooting
 

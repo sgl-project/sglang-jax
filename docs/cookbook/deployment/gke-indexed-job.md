@@ -1,6 +1,5 @@
 ---
 title: "GKE Indexed Job"
-description: "Generic launcher template for multi-node TPU serving via GKE Indexed Job + headless Service."
 ---
 
 # GKE Indexed Job Launcher

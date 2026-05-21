@@ -1,6 +1,5 @@
 ---
 title: "Deployment Templates"
-description: "Launcher templates referenced by recipes — single-host Docker, GKE Indexed Job, SkyPilot multi-node."
 ---
 
 # Deployment Templates

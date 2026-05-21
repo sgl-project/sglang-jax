@@ -1,6 +1,5 @@
 ---
 title: "MiMo-7B"
-description: "Xiaomi MiMo-7B reasoning-tuned 7B dense decoder serving on TPU v6e-4 with SGL-JAX."
 ---
 
 # MiMo-7B on SGL-JAX
@@ -27,9 +26,10 @@ For the larger Xiaomi MoE models, see [`MiMo-V2-Flash.md`](MiMo-V2-Flash.md) and
 
 ### 2.1 Hardware Matrix (starter target)
 
-| Model | TPU | Topology | Chips | `--tp-size` | Notes |
-|---|---|---|---|---|---|
-| MiMo-7B (any variant) | v6e-4 | 2x2 | 4 | 4 | BF16 weights ~14 GB — fits with headroom |
+| Tier | Model | TPU | Topology | Chips | `--tp-size` | Notes |
+|---|---|---|---|---|---|---|
+| Minimum runnable | MiMo-7B (any variant) | v6e-4 | 2x2 | 4 | 4 | BF16 weights ~14 GB — fits with headroom; lowest-cost single-host serving |
+| Recommended production | MiMo-7B (any variant) | v6e-8 | 2x4 | 8 | 8 | More HBM headroom for higher `--max-running-requests` and longer reasoning outputs on RL variant |
 
 See [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
@@ -90,7 +90,15 @@ MiMo-7B shares the `mimo` reasoning and tool-call parser formats with MiMo-V2.5-
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Accuracy
+### 4.1 Speed
+
+> **Layout B — methodology + command template.** No measured numbers yet; PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` to upgrade to Validated.
+
+**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.1](../Qwen/Qwen3.md#41-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `XiaomiMiMo/MiMo-7B-RL`).
+
+**Test Results** — _Pending._
+
+### 4.2 Accuracy
 
 **Test Environment**
 
@@ -118,12 +126,6 @@ evalscope eval \
 Recommended additional datasets for reasoning variants: AIME 2025, MATH.
 
 **Test Results** — _Pending. Run and PR back._
-
-### 4.2 Speed
-
-**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `XiaomiMiMo/MiMo-7B-RL`).
-
-**Test Results** — _Pending._
 
 ## 5. Troubleshooting
 
