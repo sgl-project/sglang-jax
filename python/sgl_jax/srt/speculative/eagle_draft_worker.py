@@ -269,13 +269,15 @@ class EagleDraftWorker(BaseDraftWorker):
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, draft_logits_output.next_token_logits, draft_logits_output.hidden_states
         )
-        # next_token_logits is pruned to (total_bs, vocab); hidden_states is FULL
-        # (total_bs*(steps+1), H). Index logits by slot, hidden by token.
-        draft_logits_output.next_token_logits = rep_logits[sel]
+        # rep_logits stays padded so topk_probs_from_logits jit cache key is
+        # stable; gather to real_bs after the jit. rep_hidden gathered by
+        # token-major select_index already lands at real_bs.
         draft_logits_output.hidden_states = rep_hidden[select_index]
-        topk_p, topk_index = topk_probs_from_logits(
-            draft_logits_output.next_token_logits, self.topk
-        )
+        topk_p, topk_index = topk_probs_from_logits(rep_logits, self.topk)
+        sel_jax = jnp.asarray(sel)
+        topk_p = topk_p[sel_jax]
+        topk_index = topk_index[sel_jax]
+        draft_logits_output.next_token_logits = rep_logits[sel_jax]
 
         batch_output.next_draft_input.hidden_states = draft_logits_output.hidden_states
         batch_output.next_draft_input.topk_p = topk_p
