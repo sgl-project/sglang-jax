@@ -1,3 +1,8 @@
+---
+title: "MiMo-V2.5-Pro"
+description: "Xiaomi MiMo-V2.5-Pro flagship MoE serving on TPU v7x-16 or v6e-64 with SGL-JAX, including GKE Indexed Job manifest."
+---
+
 # MiMo-V2.5-Pro on SGL-JAX
 
 ## 1. Model Introduction
@@ -30,11 +35,11 @@
 
 MiMo-V2.5-Pro requires a full v7x-16 or v6e-64 slice; single-host configurations are not supported. All nodes must be in the same TPU slice and reach each other on the JAX init port (`5000` by default) and the TPU process port (`8471`).
 
-See [`../base/tpu-topology-reference.md`](../base/tpu-topology-reference.md) for the TPU generation / HBM / device-per-chip reference.
+See [`../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx) for the TPU generation / HBM / device-per-chip reference.
 
 ### 2.2 Environment
 
-Install per [`../../get_started/install.md`](../../get_started/install.md) and use one of the launcher templates from [`../deployment/`](../deployment/). The required JAX TPU container image:
+Install per [`../../get_started/install.mdx`](../../../get_started/install.md) and use one of the launcher templates from [`../deployment/`](../../deployment/). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -218,7 +223,7 @@ The server is ready once `mimo-v2-5-pro-0` logs `Uvicorn running on http://0.0.0
 
 ##### Launcher: SkyPilot
 
-Adapt [`../deployment/skypilot.md`](../deployment/skypilot.md) with `tpu-v7x-16` or `tpu-v6e-64` accelerator. `${NODE_RANK}` comes from `${SKYPILOT_NODE_RANK}`.
+Adapt [`../deployment/skypilot.mdx`](../../deployment/skypilot.mdx) with `tpu-v7x-16` or `tpu-v6e-64` accelerator. `${NODE_RANK}` comes from `${SKYPILOT_NODE_RANK}`.
 
 ### 2.4 Configuration Tips
 
@@ -234,7 +239,7 @@ Adapt [`../deployment/skypilot.md`](../deployment/skypilot.md) with `tpu-v7x-16`
 
 **MoE Backend Selection:**
 - `--moe-backend fused` is the right pick for this recipe (EP ≥ 16) — fused Pallas kernel wins on large EP shapes.
-- For smaller single-host MoE setups (EP ≤ 8), `epmoe` actually wins; see the measured tradeoff in [`mimo-v2-flash.md` §4.2](mimo-v2-flash.md#42-speed--single-workload-configuration-sweep).
+- For smaller single-host MoE setups (EP ≤ 8), `epmoe` actually wins; see the measured tradeoff in [`MiMo-V2-Flash.mdx` §4.2](MiMo-V2-Flash.mdx#42-speed--single-workload-configuration-sweep).
 
 **Speculative Decoding (NEXTN / MTP):**
 - MiMo-V2.5-Pro ships an MTP draft head; enable speculative decoding via:
@@ -256,7 +261,7 @@ Adapt [`../deployment/skypilot.md`](../deployment/skypilot.md) with `tpu-v7x-16`
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles every kernel.
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, `--chunked-prefill-size`, or `--context-length` invalidates cached entries. Give each tuning experiment its own cache dir to avoid stale-cache misses across runs.
 
-For full flag definitions and defaults see [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md).
+For full flag definitions and defaults see [`../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx).
 
 ## 3. Invocation
 
@@ -607,8 +612,8 @@ Fill `<ISL>` / `<OSL>` from the scenario table, and `<N>` / `<C>` from the concu
 ## Additional Resources
 
 - [MiMo-V2.5-Pro Model Card](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro)
-- [`mimo-v2-flash.md`](mimo-v2-flash.md) — smaller sibling, same architectural family, has measured MoE backend comparison.
-- [`../base/tpu-topology-reference.md`](../base/tpu-topology-reference.md)
-- [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md)
-- [`../deployment/gke-indexed-job.md`](../deployment/gke-indexed-job.md) / [`../deployment/skypilot.md`](../deployment/skypilot.md)
-- [`../troubleshooting.md`](../troubleshooting.md) — cross-recipe generic issues.
+- [`MiMo-V2-Flash.mdx`](MiMo-V2-Flash.mdx) — smaller sibling, same architectural family, has measured MoE backend comparison.
+- [`../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx)
+- [`../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx)
+- [`../deployment/gke-indexed-job.mdx`](../../deployment/gke-indexed-job.mdx) / [`../deployment/skypilot.mdx`](../../deployment/skypilot.mdx)
+- [`../troubleshooting.mdx`](../../troubleshooting.mdx) — cross-recipe generic issues.

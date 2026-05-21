@@ -1,3 +1,8 @@
+---
+title: "GLM-4.5"
+description: "Zhipu GLM-4.5 and GLM-4.5-Air MoE with hybrid reasoning serving on TPU v6e-32 or v6e-64 with SGL-JAX."
+---
+
 # GLM-4.5 MoE on SGL-JAX
 
 > **Starter recipe** — derived from the HuggingFace model card; not yet empirically validated on TPU. Tune values for your hardware and PR-back tested numbers.
@@ -11,7 +16,7 @@
 - [**zai-org/GLM-4.5**](https://huggingface.co/zai-org/GLM-4.5) — 355B total / 32B activated; multi-host on v6e-64.
 - [**zai-org/GLM-4.5-Air**](https://huggingface.co/zai-org/GLM-4.5-Air) — 106B total / 12B activated; multi-host on v6e-32.
 
-For the newer GLM-5 family with DeepSeek-style sparse attention see [`glm5-moe.md`](glm5-moe.md).
+For the newer GLM-5 family with DeepSeek-style sparse attention see [`GLM-5.mdx`](GLM-5.mdx).
 
 **Recommended Generation Parameters**:
 
@@ -29,11 +34,11 @@ For the newer GLM-5 family with DeepSeek-style sparse attention see [`glm5-moe.m
 | GLM-4.5-Air (106B) | v6e-32 | 4x8 | 8  | 32 | 32 | 32 | BF16 ~210 GB |
 | GLM-4.5 (355B)     | v6e-64 | 8x8 | 16 | 64 | 64 | 64 | BF16 ~710 GB |
 
-See [`../base/tpu-topology-reference.md`](../base/tpu-topology-reference.md) for the TPU generation reference.
+See [`../../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../get_started/install.md`](../../get_started/install.md). Multi-host required at both sizes — use [`../deployment/gke-indexed-job.md`](../deployment/gke-indexed-job.md) or [`../deployment/skypilot.md`](../deployment/skypilot.md). The required JAX TPU container image:
+Install per [`../../../get_started/install.mdx`](../../../get_started/install.md). Multi-host required at both sizes — use [`../../deployment/gke-indexed-job.mdx`](../../deployment/gke-indexed-job.mdx) or [`../../deployment/skypilot.mdx`](../../deployment/skypilot.mdx). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -84,7 +89,7 @@ Swap the topology to `tpu-v6e-64`, the model path to `zai-org/GLM-4.5`, and use:
   --nnodes 16 --node-rank \${SKYPILOT_NODE_RANK} \
 ```
 
-For GKE, adapt the manifest pattern from [`mimo-v2.5-pro.md` §2.3 Multi-host](mimo-v2.5-pro.md#23-launch) with `<JOB>=glm-4-5`, `<ACCELERATOR>=tpu-v6e-slice`, the corresponding topology (`4x8` or `8x8`), and the launch flags above.
+For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.mdx` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.mdx#23-launch) with `<JOB>=glm-4-5`, `<ACCELERATOR>=tpu-v6e-slice`, the corresponding topology (`4x8` or `8x8`), and the launch flags above.
 
 ### 2.4 Configuration Tips
 
@@ -97,7 +102,7 @@ For GKE, adapt the manifest pattern from [`mimo-v2.5-pro.md` §2.3 Multi-host](m
 **Reasoning + Tool Calling (GLM-4.5 parsers):**
 - Add `--reasoning-parser glm45` to expose `reasoning_content` separately from `content`.
 - Add `--tool-call-parser glm45` to parse the GLM-4.5 tool-call format into OpenAI-compatible `tool_calls`.
-- The streaming Python client pattern from [`qwen3.md` §3.2](qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) / [§3.3](qwen3.md#33-tool-calling) applies directly — only the parser names change.
+- The streaming Python client pattern from [`Qwen3.mdx` §3.2](../Qwen/Qwen3.mdx#32-reasoning-thinking-on-default-thinking-off-optional) / [§3.3](../Qwen/Qwen3.mdx#33-tool-calling) applies directly — only the parser names change.
 
 **Throughput vs Latency:**
 - `--page-size 128` reduces KV page-table overhead at MoE scale.
@@ -107,17 +112,17 @@ For GKE, adapt the manifest pattern from [`mimo-v2.5-pro.md` §2.3 Multi-host](m
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 - Mount a shared PVC across the cluster's nodes to amortize compilation.
 
-For full flag definitions see [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md).
+For full flag definitions see [`../../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`qwen3.md` §3.1](qwen3.md#31-basic-chat-completion). Substitute `model="zai-org/GLM-4.5-Air"` (or `GLM-4.5`).
+Standard OpenAI-compatible request — see [`Qwen3.mdx` §3.1](../Qwen/Qwen3.mdx#31-basic-chat-completion). Substitute `model="zai-org/GLM-4.5-Air"` (or `GLM-4.5`).
 
 ### 3.2 Reasoning / Tool Calling
 
-GLM-4.5 uses the `glm45` parsers for both. Launch with `--reasoning-parser glm45 --tool-call-parser glm45` and reuse the streaming clients from [`qwen3.md` §3.2](qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) and [§3.3](qwen3.md#33-tool-calling) (swap the model path; the parser-key change is configured server-side, not per-request).
+GLM-4.5 uses the `glm45` parsers for both. Launch with `--reasoning-parser glm45 --tool-call-parser glm45` and reuse the streaming clients from [`Qwen3.mdx` §3.2](../Qwen/Qwen3.mdx#32-reasoning-thinking-on-default-thinking-off-optional) and [§3.3](../Qwen/Qwen3.mdx#33-tool-calling) (swap the model path; the parser-key change is configured server-side, not per-request).
 
 ## 4. Benchmark
 
@@ -155,7 +160,7 @@ Recommended additional datasets: MMLU, GPQA Diamond, AIME 2025.
 
 ### 4.2 Speed
 
-**Benchmark Command** — adapt the driver from [`qwen3.md` §4.2](qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the GLM-4.5 checkpoint, remove the vLLM half).
+**Benchmark Command** — adapt the driver from [`Qwen3.mdx` §4.2](../Qwen/Qwen3.mdx#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the GLM-4.5 checkpoint, remove the vLLM half).
 
 **Test Results** — _Pending._
 
@@ -173,6 +178,6 @@ Recommended additional datasets: MMLU, GPQA Diamond, AIME 2025.
 ## Additional Resources
 
 - [GLM-4.5 model collection](https://huggingface.co/zai-org)
-- [`glm5-moe.md`](glm5-moe.md) — newer GLM-5 family with DeepSeek-style sparse attention.
-- [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md)
-- [`../troubleshooting.md`](../troubleshooting.md) — cross-recipe generic issues.
+- [`GLM-5.mdx`](GLM-5.mdx) — newer GLM-5 family with DeepSeek-style sparse attention.
+- [`../../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx)
+- [`../../troubleshooting.mdx`](../../troubleshooting.mdx) — cross-recipe generic issues.

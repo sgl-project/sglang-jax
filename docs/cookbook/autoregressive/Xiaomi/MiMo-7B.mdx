@@ -1,3 +1,8 @@
+---
+title: "MiMo-7B"
+description: "Xiaomi MiMo-7B reasoning-tuned 7B dense decoder serving on TPU v6e-4 with SGL-JAX."
+---
+
 # MiMo-7B on SGL-JAX
 
 > **Starter recipe** — derived from the HuggingFace model card; not yet empirically validated on TPU. Tune values for your hardware and PR-back tested numbers.
@@ -12,7 +17,7 @@
 - [**XiaomiMiMo/MiMo-7B-SFT**](https://huggingface.co/XiaomiMiMo/MiMo-7B-SFT) — supervised fine-tuned for instruction following.
 - [**XiaomiMiMo/MiMo-7B-RL**](https://huggingface.co/XiaomiMiMo/MiMo-7B-RL) — RL-tuned for reasoning; default choice for chain-of-thought workloads.
 
-For the larger Xiaomi MoE models, see [`mimo-v2-flash.md`](mimo-v2-flash.md) and [`mimo-v2.5-pro.md`](mimo-v2.5-pro.md) — these are different architectures (256-expert MoE with hybrid attention), not just larger MiMo-7B variants.
+For the larger Xiaomi MoE models, see [`MiMo-V2-Flash.mdx`](MiMo-V2-Flash.mdx) and [`MiMo-V2.5-Pro.mdx`](MiMo-V2.5-Pro.mdx) — these are different architectures (256-expert MoE with hybrid attention), not just larger MiMo-7B variants.
 
 **Recommended Generation Parameters**: `temperature=0.7`, `top_p=0.95`, `max_tokens=2048+` for RL/SFT variants (give room for reasoning).
 
@@ -26,11 +31,11 @@ For the larger Xiaomi MoE models, see [`mimo-v2-flash.md`](mimo-v2-flash.md) and
 |---|---|---|---|---|---|
 | MiMo-7B (any variant) | v6e-4 | 2x2 | 4 | 4 | BF16 weights ~14 GB — fits with headroom |
 
-See [`../base/tpu-topology-reference.md`](../base/tpu-topology-reference.md) for the TPU generation reference.
+See [`../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../get_started/install.md`](../../get_started/install.md) and use [`../deployment/single-host-docker.md`](../deployment/single-host-docker.md) for the container setup. The required JAX TPU container image:
+Install per [`../../get_started/install.mdx`](../../../get_started/install.md) and use [`../deployment/single-host-docker.mdx`](../../deployment/single-host-docker.mdx) for the container setup. The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -61,7 +66,7 @@ Swap `--model-path` to `MiMo-7B-Base` or `MiMo-7B-SFT` as needed.
 - `--mem-fraction-static 0.88` is the TPU default. Raise to `0.9` for dedicated serving / higher concurrency.
 
 **Tool Calling:**
-- MiMo-7B shares the `mimo` tool-call parser format with MiMo-V2.5-Pro. Add `--tool-call-parser mimo` when using the OpenAI tools API. See [`mimo-v2.5-pro.md` §3.3](mimo-v2.5-pro.md#33-tool-calling) for the request/response pattern.
+- MiMo-7B shares the `mimo` tool-call parser format with MiMo-V2.5-Pro. Add `--tool-call-parser mimo` when using the OpenAI tools API. See [`MiMo-V2.5-Pro.mdx` §3.3](MiMo-V2.5-Pro.mdx#33-tool-calling) for the request/response pattern.
 
 **Reasoning (RL / SFT variants):**
 - Pass `extra_body={"chat_template_kwargs": {"enable_thinking": true}}` per-request to unlock chain-of-thought outputs (verify support per checkpoint via model card).
@@ -69,17 +74,17 @@ Swap `--model-path` to `MiMo-7B-Base` or `MiMo-7B-SFT` as needed.
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
 
-For full flag definitions see [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md).
+For full flag definitions see [`../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`mimo-v2.5-pro.md` §3.1](mimo-v2.5-pro.md#31-basic-chat-completion) for the curl / Python pattern. Substitute `model="XiaomiMiMo/MiMo-7B-RL"` (or your chosen variant).
+Standard OpenAI-compatible request — see [`MiMo-V2.5-Pro.mdx` §3.1](MiMo-V2.5-Pro.mdx#31-basic-chat-completion) for the curl / Python pattern. Substitute `model="XiaomiMiMo/MiMo-7B-RL"` (or your chosen variant).
 
 ### 3.2 Reasoning / Tool Calling
 
-MiMo-7B shares the `mimo` reasoning and tool-call parser formats with MiMo-V2.5-Pro — the full streaming Python client + multi-turn `Handling Tool Call Results` pattern in [`mimo-v2.5-pro.md` §3.2](mimo-v2.5-pro.md#32-reasoning-thinking-on-default-thinking-off-optional) and [§3.3](mimo-v2.5-pro.md#33-tool-calling) applies directly. Substitute the model path and the §2.3 launch flags above.
+MiMo-7B shares the `mimo` reasoning and tool-call parser formats with MiMo-V2.5-Pro — the full streaming Python client + multi-turn `Handling Tool Call Results` pattern in [`MiMo-V2.5-Pro.mdx` §3.2](MiMo-V2.5-Pro.mdx#32-reasoning-thinking-on-default-thinking-off-optional) and [§3.3](MiMo-V2.5-Pro.mdx#33-tool-calling) applies directly. Substitute the model path and the §2.3 launch flags above.
 
 ## 4. Benchmark
 
@@ -116,7 +121,7 @@ Recommended additional datasets for reasoning variants: AIME 2025, MATH.
 
 ### 4.2 Speed
 
-**Benchmark Command** — adapt the driver from [`qwen3.md` §4.2](qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `XiaomiMiMo/MiMo-7B-RL`).
+**Benchmark Command** — adapt the driver from [`Qwen3.mdx` §4.2](../Qwen/Qwen3.mdx#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `XiaomiMiMo/MiMo-7B-RL`).
 
 **Test Results** — _Pending._
 
@@ -131,6 +136,6 @@ Recommended additional datasets for reasoning variants: AIME 2025, MATH.
 ## Additional Resources
 
 - [MiMo-7B family on HuggingFace](https://huggingface.co/XiaomiMiMo)
-- [`mimo-v2-flash.md`](mimo-v2-flash.md) and [`mimo-v2.5-pro.md`](mimo-v2.5-pro.md) — larger Xiaomi MoE models (different architecture).
-- [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md)
-- [`../troubleshooting.md`](../troubleshooting.md) — cross-recipe generic issues.
+- [`MiMo-V2-Flash.mdx`](MiMo-V2-Flash.mdx) and [`MiMo-V2.5-Pro.mdx`](MiMo-V2.5-Pro.mdx) — larger Xiaomi MoE models (different architecture).
+- [`../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx)
+- [`../troubleshooting.mdx`](../../troubleshooting.mdx) — cross-recipe generic issues.

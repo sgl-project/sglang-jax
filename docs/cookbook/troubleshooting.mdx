@@ -1,3 +1,8 @@
+---
+title: "Troubleshooting"
+description: "Cross-recipe generic failure modes — startup OOM, multi-node hang, JIT cache miss, SWA pool exhaustion."
+---
+
 # Troubleshooting
 
 Common failure modes across all SGL-JAX cookbook recipes, with the fix and what to grep in logs to confirm. Model-specific gotchas live in each recipe's §7; this page covers everything else.
@@ -24,7 +29,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server ...
 
 **Fix**:
 1. Check `--tp-size` matches device count: `python -c "import jax; print(len(jax.devices()))"` inside the container.
-2. For v7x, remember each chip exposes 2 JAX devices — see [`base/tpu-topology-reference.md`](base/tpu-topology-reference.md).
+2. For v7x, remember each chip exposes 2 JAX devices — see [`base/tpu-topology-reference.mdx`](base/tpu-topology-reference.mdx).
 3. Lower `--mem-fraction-static` (default 0.88 on TPU). 0.85 is conservative; only raise to 0.95 when nothing else runs on the host.
 
 ### "Architecture not supported"
@@ -34,7 +39,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server ...
 **Cause**: The HF config's `architectures` field doesn't match any class registered by `python/sgl_jax/srt/models/registry.py`.
 
 **Fix**:
-- Confirm your model is in the supported list — see the cookbook [autoregressive index](autoregressive/index.md) or [`python/sgl_jax/srt/models/`](https://github.com/sgl-project/sglang-jax/tree/main/python/sgl_jax/srt/models).
+- Confirm your model is in the supported list — see the cookbook [autoregressive index](autoregressive/index.mdx) or [`python/sgl_jax/srt/models/`](https://github.com/sgl-project/sglang-jax/tree/main/python/sgl_jax/srt/models).
 - Some Qwen-derived models (MiMo-7B → Qwen2, MiMo-V2.5-Pro → MiMo-V2) reuse base classes via inheritance — the HF config's `architectures` field still has to match the actual class name SGL-JAX registers, not the inherited one. If your model's config lists a class SGL-JAX doesn't recognise, override `--json-model-override-args '{"architectures": ["<RegisteredClass>"]}'`.
 
 ## Multi-node
@@ -75,7 +80,7 @@ echo $TPU_PROCESS_ADDRESSES | tr ',' '\n' | wc -l   # must equal $NNODES
 
 **Symptom**: Long-running requests start failing; server logs show `swa token usage` consistently near 100%.
 
-**Cause**: Sliding-window-attention pool is too small for the concurrent decode load. The `--swa-full-tokens-ratio` flag controls `swa_tokens_per_layer / full_tokens_per_layer` — see [`base/launch-flags-reference.md`](base/launch-flags-reference.md) for the per-layer semantics (it is **not** a pool fraction).
+**Cause**: Sliding-window-attention pool is too small for the concurrent decode load. The `--swa-full-tokens-ratio` flag controls `swa_tokens_per_layer / full_tokens_per_layer` — see [`base/launch-flags-reference.mdx`](base/launch-flags-reference.mdx) for the per-layer semantics (it is **not** a pool fraction).
 
 **Fix**: Either raise `--swa-full-tokens-ratio` (gives each SWA layer more KV slots relative to full layers) or lower `--max-running-requests`. Conversely, if the full-attention side is the bottleneck (`full token usage` near 100%), lower the ratio.
 
@@ -103,7 +108,7 @@ echo $TPU_PROCESS_ADDRESSES | tr ',' '\n' | wc -l   # must equal $NNODES
 
 **Cause**: At small EP the per-device expert count is high enough that the GMM path (`epmoe`) wins on memory bandwidth. The fused Pallas kernel's overhead pays off when EP ≥ 16.
 
-**Fix**: Use `--moe-backend epmoe` on single-host v7x-8 and small slices; switch to `--moe-backend fused` for multi-host setups. MiMo-V2-Flash recipe has measured numbers — see [its §6.2](autoregressive/mimo-v2-flash.md#62-throughput--bench_serving).
+**Fix**: Use `--moe-backend epmoe` on single-host v7x-8 and small slices; switch to `--moe-backend fused` for multi-host setups. MiMo-V2-Flash recipe has measured numbers — see [its §6.2](autoregressive/Xiaomi/MiMo-V2-Flash.mdx#62-throughput--bench_serving).
 
 ## Tokenizer / model path
 
@@ -113,7 +118,7 @@ echo $TPU_PROCESS_ADDRESSES | tr ',' '\n' | wc -l   # must equal $NNODES
 
 **Cause**: Some model checkpoints (Grok-2) ship without a tokenizer file.
 
-**Fix**: Pass `--tokenizer-path <community-tokenizer-repo>` explicitly. Example: Grok-2 uses `alvarobartt/grok-2-tokenizer` — see [`autoregressive/grok2.md`](autoregressive/grok2.md).
+**Fix**: Pass `--tokenizer-path <community-tokenizer-repo>` explicitly. Example: Grok-2 uses `alvarobartt/grok-2-tokenizer` — see [`autoregressive/grok2.mdx`](autoregressive/Grok/Grok2.mdx).
 
 ### `--trust-remote-code` required
 

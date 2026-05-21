@@ -1,6 +1,11 @@
+---
+title: "Qwen-7B-Chat"
+description: "Qwen-7B-Chat first-generation dense decoder serving on TPU v6e-4 single host with SGL-JAX."
+---
+
 # Qwen-7B-Chat on SGL-JAX
 
-> First-generation Qwen recipe. For Qwen3-8B / Qwen3-32B see [`qwen3.md`](qwen3.md).
+> First-generation Qwen recipe. For Qwen3-8B / Qwen3-32B see [`Qwen3.mdx`](Qwen3.mdx).
 
 ## 1. Model Introduction
 
@@ -24,11 +29,11 @@
 |---|---|---|---|---|
 | **v6e-4** (minimum and recommended) | 2x2 | 4 | 4 | Single host; v6e is 1:1 chip↔device |
 
-See [`../base/tpu-topology-reference.md`](../base/tpu-topology-reference.md) for the TPU generation reference.
+See [`../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../get_started/install.md`](../../get_started/install.md) and use [`../deployment/single-host-docker.md`](../deployment/single-host-docker.md) for the container setup. The required JAX TPU container image:
+Install per [`../../get_started/install.mdx`](../../../get_started/install.md) and use [`../deployment/single-host-docker.mdx`](../../deployment/single-host-docker.mdx) for the container setup. The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -77,7 +82,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, or context length invalidates cached entries.
 
-For full flag definitions and defaults see [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md).
+For full flag definitions and defaults see [`../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx).
 
 ## 3. Invocation
 
@@ -105,7 +110,7 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-> Qwen-7B-Chat is a first-generation chat model without hybrid reasoning or native tool-calling formats. For reasoning / tool-call workloads use [Qwen3](qwen3.md) or a later Qwen series.
+> Qwen-7B-Chat is a first-generation chat model without hybrid reasoning or native tool-calling formats. For reasoning / tool-call workloads use [Qwen3](Qwen3.mdx) or a later Qwen series.
 
 ## 4. Benchmark
 
@@ -176,7 +181,7 @@ python -m sgl_jax.bench_serving \
 ## Additional Resources
 
 - [Qwen Model Cards](https://huggingface.co/Qwen)
-- [`qwen3.md`](qwen3.md) — newer Qwen3 8B/32B recipe with framework comparison numbers.
+- [`Qwen3.mdx`](Qwen3.mdx) — newer Qwen3 8B/32B recipe with framework comparison numbers.
 - [JAX Scaling Book](https://jax-ml.github.io/scaling-book/)
-- [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md)
-- [`../troubleshooting.md`](../troubleshooting.md) — cross-recipe generic issues.
+- [`../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx)
+- [`../troubleshooting.mdx`](../../troubleshooting.mdx) — cross-recipe generic issues.

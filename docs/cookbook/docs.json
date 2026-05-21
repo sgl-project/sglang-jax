@@ -1,0 +1,141 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "aspen",
+  "name": "SGL-JAX Cookbook",
+  "colors": {
+    "primary": "#d55816",
+    "light": "#d55816",
+    "dark": "#d55816"
+  },
+  "favicon": "/favicon.png",
+  "background": {
+    "decoration": "grid",
+    "color": {
+      "dark": "#1d1d1d",
+      "light": "#fffcfb"
+    }
+  },
+  "fonts": {
+    "heading": { "family": "Inter", "weight": 600 },
+    "body": { "family": "Inter", "weight": 400 }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Cookbook",
+        "groups": [
+          {
+            "group": "Overview",
+            "icon": "house",
+            "pages": [
+              "index",
+              "autoregressive/index",
+              "multimodal/index"
+            ]
+          },
+          {
+            "group": "Autoregressive Models",
+            "icon": "book-open",
+            "pages": [
+              {
+                "group": "Qwen",
+                "pages": [
+                  "autoregressive/Qwen/Qwen",
+                  "autoregressive/Qwen/Qwen3",
+                  "autoregressive/Qwen/Qwen3-MoE"
+                ]
+              },
+              {
+                "group": "DeepSeek",
+                "pages": [
+                  "autoregressive/DeepSeek/DeepSeek-V2",
+                  "autoregressive/DeepSeek/DeepSeek-V3",
+                  "autoregressive/DeepSeek/DeepSeek-R1"
+                ]
+              },
+              {
+                "group": "GLM",
+                "pages": [
+                  "autoregressive/GLM/GLM-4.5",
+                  "autoregressive/GLM/GLM-5"
+                ]
+              },
+              {
+                "group": "Google",
+                "pages": [
+                  "autoregressive/Google/Gemma2"
+                ]
+              },
+              {
+                "group": "Grok",
+                "pages": [
+                  "autoregressive/Grok/Grok2"
+                ]
+              },
+              {
+                "group": "InclusionAI",
+                "pages": [
+                  "autoregressive/InclusionAI/Ling-1.x",
+                  "autoregressive/InclusionAI/Ling-2",
+                  "autoregressive/InclusionAI/Ring-2",
+                  "autoregressive/InclusionAI/Ling-2.6"
+                ]
+              },
+              {
+                "group": "Llama",
+                "pages": [
+                  "autoregressive/Llama/Llama3.1",
+                  "autoregressive/Llama/Llama3.3-70B"
+                ]
+              },
+              {
+                "group": "Moonshotai",
+                "pages": [
+                  "autoregressive/Moonshotai/Kimi-Linear"
+                ]
+              },
+              {
+                "group": "Xiaomi",
+                "pages": [
+                  "autoregressive/Xiaomi/MiMo-V2-Flash",
+                  "autoregressive/Xiaomi/MiMo-V2.5-Pro",
+                  "autoregressive/Xiaomi/MiMo-7B"
+                ]
+              }
+            ]
+          },
+          {
+            "group": "Shared References",
+            "icon": "gears",
+            "pages": [
+              "base/tpu-topology-reference",
+              "base/launch-flags-reference"
+            ]
+          },
+          {
+            "group": "Deployment Templates",
+            "icon": "rocket",
+            "pages": [
+              "deployment/index",
+              "deployment/single-host-docker",
+              "deployment/gke-indexed-job",
+              "deployment/skypilot"
+            ]
+          },
+          {
+            "group": "Troubleshooting",
+            "icon": "triangle-exclamation",
+            "pages": [
+              "troubleshooting"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/sgl-project/sglang-jax"
+    }
+  }
+}

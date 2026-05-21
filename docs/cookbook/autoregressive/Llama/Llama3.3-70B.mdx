@@ -1,0 +1,149 @@
+---
+title: "Llama 3.3 70B"
+description: "Llama 3.3 70B Instruct serving on TPU v6e-32 multi-host with SGL-JAX."
+---
+
+# Llama 3.3 70B on SGL-JAX
+
+> **Starter recipe** — derived from the HuggingFace model card; not yet empirically validated on TPU. Tune values for your hardware and PR-back tested numbers.
+
+## 1. Model Introduction
+
+[**meta-llama/Llama-3.3-70B-Instruct**](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct) is Meta's 70B dense decoder from the Llama 3.3 release — multi-host serving required at BF16.
+
+For the 8B size (single host + Phi-3 / InternLM3 alias support) see [`Llama3.1.mdx`](Llama3.1.mdx). For Llama 4 see the upstream sgl-cookbook (`Llama/Llama4.mdx`).
+
+**Recommended Generation Parameters**: `temperature=0.6`, `top_p=0.9`, `max_tokens=1024` (Llama 3 Instruct defaults).
+
+**License**: see the [Llama model card](https://huggingface.co/meta-llama) for the authoritative Meta Llama Community License terms.
+
+## 2. Deployment
+
+### 2.1 Hardware Matrix (starter target)
+
+| Model | TPU | Topology | Nodes | Chips | `--tp-size` | Notes |
+|---|---|---|---|---|---|---|
+| Llama 3.3 70B | v6e-32 | 4x8 | 8 | 32 | 32 | BF16 ~140 GB — multi-host required |
+
+See [`../../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx) for the TPU generation reference.
+
+### 2.2 Environment
+
+Install per [`../../../get_started/install.mdx`](../../../get_started/install.md). Multi-host required — use [`../../deployment/gke-indexed-job.mdx`](../../deployment/gke-indexed-job.mdx) or [`../../deployment/skypilot.mdx`](../../deployment/skypilot.mdx). The required JAX TPU container image:
+
+| Hardware Platform               | Docker Image                                                       |
+|---|---|
+| TPU v5e / v5p / v6e (Trillium)  | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
+| TPU v7x (Ironwood)              | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
+
+### 2.3 Launch
+
+#### Multi-host (SkyPilot) — TPU v6e-32
+
+**Step 1** — provision the cluster:
+
+```bash
+cd ${WORKSPACE_DIR}/sglang-jax
+bash scripts/launch_tpu.sh tpu-v6e-32 main
+```
+
+**Step 2** — launch the server (one `sky exec` fans out to all 8 nodes):
+
+```bash
+CLUSTER_NAME=$(cat .cluster_name)
+sky exec ${CLUSTER_NAME} -- "cd sglang-jax && source .venv/bin/activate && \
+  JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
+  --model-path meta-llama/Llama-3.3-70B-Instruct \
+  --trust-remote-code \
+  --tp-size 32 \
+  --device tpu \
+  --dtype bfloat16 \
+  --mem-fraction-static 0.9 \
+  --chunked-prefill-size 2048 \
+  --page-size 128 \
+  --max-running-requests 256 \
+  --skip-server-warmup \
+  --dist-init-addr <NODE_0_IP_ADDRESS>:5000 \
+  --nnodes 8 --node-rank \${SKYPILOT_NODE_RANK} \
+  --host 0.0.0.0 --port 30000"
+```
+
+For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.mdx` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.mdx#23-launch) with `<JOB>=llama-70b`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8` / `completions: 8`, and the launch flags above.
+
+### 2.4 Configuration Tips
+
+**Memory Management:**
+- `--mem-fraction-static 0.9` leaves ~4 GB per chip for KV at TP=32. Lower to 0.85 if you hit OOM at startup.
+
+**Throughput vs Latency:**
+- `--page-size 128` reduces KV page-table overhead at 70B scale.
+- `--chunked-prefill-size 2048` bounds peak HBM during prefill on long prompts.
+- `--max-running-requests 256` caps concurrent decodes; lower for tighter latency tails.
+
+**Compilation Cache Hygiene:**
+- `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
+- The cache is per-node; mount a shared PVC at the cache directory to amortize compilation across all 8 nodes.
+
+For full flag definitions see [`../../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx).
+
+## 3. Invocation
+
+### 3.1 Basic Chat Completion
+
+Standard OpenAI-compatible request — see [`Qwen3.mdx` §3.1](../Qwen/Qwen3.mdx#31-basic-chat-completion). Substitute `model="meta-llama/Llama-3.3-70B-Instruct"`.
+
+> Llama 3 Instruct does not ship with native hybrid reasoning or a built-in tool-call format. For reasoning / tool-call workloads use a model with `--reasoning-parser` / `--tool-call-parser` support (see [`Qwen3.mdx` §3.2 / §3.3](../Qwen/Qwen3.mdx) or [`MiMo-V2.5-Pro.mdx`](../Xiaomi/MiMo-V2.5-Pro.mdx)).
+
+## 4. Benchmark
+
+> Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
+
+### 4.1 Accuracy
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-32 (8 nodes × 4 chips) |
+| Model | meta-llama/Llama-3.3-70B-Instruct (BF16) |
+| Tensor Parallelism | 32 |
+| Tested build | _Pending_ |
+
+**Deployment Command** — same as [§2.3](#multi-host-skypilot--tpu-v6e-32).
+
+**Benchmark Command** — example for GSM8K:
+
+```bash
+evalscope eval \
+  --model meta-llama/Llama-3.3-70B-Instruct \
+  --api-url http://127.0.0.1:30000/v1/chat/completions \
+  --api-key EMPTY \
+  --eval-type service \
+  --datasets gsm8k \
+  --eval-batch-size 8
+```
+
+Recommended additional datasets: MMLU, GPQA Diamond, IFEval.
+
+**Test Results** — _Pending. Run and PR back._
+
+### 4.2 Speed
+
+**Benchmark Command** — adapt the driver from [`Qwen3.mdx` §4.2](../Qwen/Qwen3.mdx#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `meta-llama/Llama-3.3-70B-Instruct`, remove the vLLM half).
+
+**Test Results** — _Pending._
+
+## 5. Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| OOM at startup | Weights + KV exceed budget at chosen `--mem-fraction-static` | Lower to 0.85. Verify `--tp-size 32` matches v6e-32 chip count (4 × 8 = 32). |
+| Multi-node hang at init | `--dist-init-addr` unreachable from non-rank-0 nodes | Verify the rank-0 internal IP and that the chosen port is open. |
+| First request takes ~4 min per node | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR`; mount a shared PVC across all 8 nodes for amortized compilation. |
+
+## Additional Resources
+
+- [Llama 3.3 70B model card](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct)
+- [`Llama3.1.mdx`](Llama3.1.mdx) — 8B single-host sibling.
+- [`../../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx)
+- [`../../troubleshooting.mdx`](../../troubleshooting.mdx) — cross-recipe generic issues.

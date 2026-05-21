@@ -2,6 +2,8 @@
 
 > 配套规范:[`cookbook-recipe-design.md`](cookbook-recipe-design.md)。
 >
+> 站点改造跟踪:[`mintlify-migration.md`](mintlify-migration.md) —— Mintlify 渲染迁移计划,跨多个 PR 推进。
+>
 > 本文档面向 recipe 作者 / 方案维护者,提供写 recipe 时的设计原则、写作约束、review checklist、设计决策依据,以及方案演进背景。Recipe 作者写新 recipe 时主要看 `cookbook-recipe-design.md`,本文档作为辅助查阅。
 
 ---

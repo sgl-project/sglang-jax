@@ -1,3 +1,8 @@
+---
+title: "Gemma 2"
+description: "Gemma 2 9B and 27B hybrid-attention decoders serving on TPU v6e-4 with SGL-JAX."
+---
+
 # Gemma 2 on SGL-JAX
 
 > **Starter recipe** — derived from the HuggingFace model card; not yet empirically validated on TPU. Tune values for your hardware and PR-back tested numbers.
@@ -26,11 +31,11 @@
 | Gemma 2 9B / 9B-it  | v6e-4 | 2x2 | 4 | 4 | BF16 ~18 GB — fits with headroom |
 | Gemma 2 27B / 27B-it | v6e-4 | 2x2 | 4 | 4 | BF16 ~54 GB — fits; lower `--mem-fraction-static` |
 
-See [`../base/tpu-topology-reference.md`](../base/tpu-topology-reference.md) for the TPU generation reference.
+See [`../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../get_started/install.md`](../../get_started/install.md) and use [`../deployment/single-host-docker.md`](../deployment/single-host-docker.md) for the container setup. The required JAX TPU container image:
+Install per [`../../get_started/install.mdx`](../../../get_started/install.md) and use [`../deployment/single-host-docker.mdx`](../../deployment/single-host-docker.mdx) for the container setup. The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -81,21 +86,21 @@ Not needed at the 9B / 27B scale — both fit single-host on v6e-4.
 
 **Hybrid Attention (Gemma-specific):**
 - Gemma 2 alternates global (8K context) and sliding-window (4K) attention layers. SGL-JAX manages two KV pools — global and sliding — which is more memory-sensitive than uniform-attention models at the same parameter count.
-- `--swa-full-tokens-ratio` (default 0.8) controls the per-layer ratio of sliding-window vs full-attention layers and gates pool sizing. If you see sliding-window pool exhaustion at high concurrency, lower this ratio to give the sliding pool more capacity. See [troubleshooting §SWA pool exhaustion](../troubleshooting.md#swa-pool-exhaustion-mimo-hybrid-attention-models).
+- `--swa-full-tokens-ratio` (default 0.8) controls the per-layer ratio of sliding-window vs full-attention layers and gates pool sizing. If you see sliding-window pool exhaustion at high concurrency, lower this ratio to give the sliding pool more capacity. See [troubleshooting §SWA pool exhaustion](../../troubleshooting.mdx#swa-pool-exhaustion-mimo-hybrid-attention-models).
 
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, or `--swa-full-tokens-ratio` invalidates cached entries.
 
-For full flag definitions see [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md).
+For full flag definitions see [`../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`qwen3.md` §3.1](qwen3.md#31-basic-chat-completion) for the curl / Python pattern. Substitute `model="google/gemma-2-9b-it"` (or your chosen variant).
+Standard OpenAI-compatible request — see [`Qwen3.mdx` §3.1](../Qwen/Qwen3.mdx#31-basic-chat-completion) for the curl / Python pattern. Substitute `model="google/gemma-2-9b-it"` (or your chosen variant).
 
-> Gemma 2 does not ship with native hybrid reasoning or a built-in tool-call format. For reasoning / tool-call workloads use a model with `--reasoning-parser` / `--tool-call-parser` support (see [`qwen3.md` §3.2 / §3.3](qwen3.md) or [`mimo-v2.5-pro.md`](mimo-v2.5-pro.md)).
+> Gemma 2 does not ship with native hybrid reasoning or a built-in tool-call format. For reasoning / tool-call workloads use a model with `--reasoning-parser` / `--tool-call-parser` support (see [`Qwen3.mdx` §3.2 / §3.3](../Qwen/Qwen3.mdx) or [`MiMo-V2.5-Pro.mdx`](../Xiaomi/MiMo-V2.5-Pro.mdx)).
 
 ## 4. Benchmark
 
@@ -132,7 +137,7 @@ Recommended additional datasets: MMLU, GPQA Diamond.
 
 ### 4.2 Speed
 
-**Benchmark Command** — adapt the driver from [`qwen3.md` §4.2](qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Gemma checkpoint).
+**Benchmark Command** — adapt the driver from [`Qwen3.mdx` §4.2](../Qwen/Qwen3.mdx#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Gemma checkpoint).
 
 **Test Results** — _Pending._
 
@@ -141,11 +146,11 @@ Recommended additional datasets: MMLU, GPQA Diamond.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Gemma 2 27B OOM at startup | `--mem-fraction-static 0.88` (default) too high for dual KV pools | Lower to 0.85 or 0.8. Verify `--tp-size 4` matches v6e-4 chip count. |
-| Sliding-window pool exhaustion at high concurrency | `--swa-full-tokens-ratio` mismatches workload sequence-length distribution | Lower the ratio to give the sliding pool more capacity. See [troubleshooting §SWA pool exhaustion](../troubleshooting.md#swa-pool-exhaustion-mimo-hybrid-attention-models). |
+| Sliding-window pool exhaustion at high concurrency | `--swa-full-tokens-ratio` mismatches workload sequence-length distribution | Lower the ratio to give the sliding pool more capacity. See [troubleshooting §SWA pool exhaustion](../../troubleshooting.mdx#swa-pool-exhaustion-mimo-hybrid-attention-models). |
 | First request takes ~4 min | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR` across restarts. |
 
 ## Additional Resources
 
 - [Gemma model collection](https://huggingface.co/google)
-- [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md)
-- [`../troubleshooting.md`](../troubleshooting.md) — cross-recipe generic issues including the SWA pool exhaustion note.
+- [`../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx)
+- [`../troubleshooting.mdx`](../../troubleshooting.mdx) — cross-recipe generic issues including the SWA pool exhaustion note.
