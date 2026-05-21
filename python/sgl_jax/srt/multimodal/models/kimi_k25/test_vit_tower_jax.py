@@ -81,6 +81,10 @@ class TestCase:
   
 TEST_CASES = [  
     TestCase(  
+        name="single_image_valid",  
+        grid_thws=[(1, 64, 64)],          # 56×84 px → 12 output tokens  
+    ),  
+    TestCase(  
         name="single_image_small",  
         grid_thws=[(1, 4, 6)],          # 56×84 px → 12 output tokens  
     ),  

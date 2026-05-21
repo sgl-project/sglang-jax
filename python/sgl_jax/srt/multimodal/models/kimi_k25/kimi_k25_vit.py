@@ -30,7 +30,7 @@ def tpool_patch_merger(
     merge_kernel_size: tuple[int, int] = (2, 2),
 ) -> list[jax.Array]:
 
-    d_model = x.size(-1) 
+    d_model = x.shape[-1]
 
     outputs = []
     pre_sum = 0
@@ -45,11 +45,11 @@ def tpool_patch_merger(
             t, new_height, kernel_height, new_width, kernel_width, d_model
         )
 
-        reshared_seq = (
-            reshared_seq.permute(0, 1, 3, 2, 4, 5).contiguous().mean(axis=0)
+        reshaped_seq = (
+            reshaped_seq.transpose(0, 1, 3, 2, 4, 5).mean(axis=0)
         )
 
-        padded_seq = reshared_seq.reshape(
+        padded_seq = reshaped_seq.reshape(
             new_height * new_width, kernel_height * kernel_width, -1
         )
 
@@ -90,14 +90,17 @@ class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
         for t, h, w in grid_thws.tolist():
             assert t <= self.num_frames, f"t:{t} > self.num_frames:{self.num_frames}"
             if (h, w) == self.weight.shape[:-1]:
-                pos_emb_2d = self.weight.flatten(end_dim=1)
+                pos_emb_2d = self.weight.reshape(-1, self.weight.shape[-1])
+            else:
+                pos_emb_2d = self.weight[:h, :w, :].reshape(-1, self.weight.shape[-1])
+                
             # TODO: Implement interpolation mode
 
             if t == 1:
                 pos_emb_3d = pos_emb_2d
             else:
                 pos_emb_3d = (
-                    pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) # Add self.time_weight[0:t] for temporal axis
+                    jnp.expand_dims(pos_emb_2d, axis=0).repeat(t, 1, 1) # Add self.time_weight[0:t] for temporal axis
                 )
 
             pos_embs.append(pos_emb_3d.reshape(-1, pos_emb_3d.shape[-1]))
@@ -120,14 +123,14 @@ class Rope2DPosEmbRepeated(nnx.Module):
         self.max_width = max_width
         self.theta_base = theta_base
 
-    def __precompute_freqs_cis(self) -> None:
+    def _precompute_freqs_cis(self) -> None:
         N = self.max_height * self.max_width
-        flat_pos = jnp.arange(0, N).float()
+        flat_pos = jnp.arange(0, N).astype(jnp.float32)
         x_pos = flat_pos % self.max_width
         y_pos = flat_pos % self.max_height
 
         dim_range = (
-            jnp.arange(0, self.dim, 4)[:, (self.dim // 4)].float()
+            jnp.arange(0, self.dim, 4)[: (self.dim // 4)].astype(jnp.float32)
         )
 
         freqs = 1.0 / (self.theta_base ** (dim_range / self.dim))
@@ -138,20 +141,20 @@ class Rope2DPosEmbRepeated(nnx.Module):
         y_cis = jnp.exp(1j * y_freqs)
 
         freqs_cis = jnp.concatenate(
-            [x_cis.unsqueeze(dim=-1), y_cis.unsqueeze(dim=-1)], dim=-1
+            [jnp.expand_dims(x_cis, axis=-1), jnp.expand_dims(y_cis, axis=-1)], axis=-1
         )
 
         freqs_cis = freqs_cis.reshape(self.max_height, self.max_width, -1)
         return freqs_cis
 
-    def __get_freqs_cis(
+    def _get_freqs_cis(
         self,
         grid_thws: jax.Array,
     ) -> jax.Array:
 
         freqs_cis = self._precompute_freqs_cis()
 
-        shapes = grid_thws.to_list()
+        shapes = grid_thws.tolist()
         assert all(
             1 <= h <= self.max_height and 1 <= 2 <= self.max_width for t, h, w in shapes
         ), (
@@ -210,7 +213,13 @@ class KimiK25VisionPatchEmbed(nnx.Module):
         )
 
     def __call__(self, x: jax.Array, grid_thws: jax.Array) -> jax.Array:
+        x = jnp.transpose(x, (0, 2, 3, 1))
         x = self.proj(x)
+
+        # After conv, shape is (L, T_out, H_out, W_out, C_out)
+        # With stride=kernel_size, T_out=H_out=W_out=1.
+        # So shape is (L, 1, 1, 1, hidden_size)
+        x = x.reshape(-1, self.hidden_size)
         return self.pos_emb(x, grid_thws)
 
 
@@ -238,7 +247,7 @@ class KimiK25VisionAttention(nnx.Module):
         self,
         hidden_states: jax.Array,
         cu_seqlens: jax.Array,
-        rope_freqs_cis: jax.Array,
+        position_embeddings: jax.Array,
     ):
         # TODO: Implement the attention layer
         return hidden_states
@@ -378,17 +387,17 @@ class VisionTowerEncoder(nnx.Module):
         grid_thws: jax.Array,
     ) -> jax.Array:
 
-        rope_freqs_cis = self.rope_2d.get_freqs_cis(grid_thws=grid_thws)
+        rope_freqs_cis = self.rope_2d._get_freqs_cis(grid_thws=grid_thws)
 
-        lengths = torch.concatenate(
+        lengths = jnp.concatenate(
             (
                 jnp.zeros(1, dtype=grid_thws.dtype),
-                grid_thws[:, 0] * grid_thws[:, 1] * grid[: 2],
+                grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2],
             )
         )
 
-        max_seqlen = lengths_max()
-        cu_seqlens = lengths.cumsum(axis=0, dtype=int32)
+        max_seqlen = lengths.max()
+        cu_seqlens = lengths.cumsum(axis=0, dtype=jnp.int32)
 
         for block in self.blocks:
             hidden_states = block(
@@ -438,7 +447,7 @@ class VisionTower(nnx.Module):
         hidden_states = self.patch_embed(pixel_values, grid_thws)
         hidden_states = self.encoder(hidden_states, grid_thws)
 
-        hidden_states = tpool_patch_merger( # TODO: Implement and see if it should go into patcher.
+        hidden_states = tpool_patch_merger(
             hidden_states, grid_thws, merge_kernel_size=self.merge_kernel_size
         )
 
@@ -534,10 +543,15 @@ class Kimi_K25_VisionModel(nnx.Module):
 
         mappings.update(
             {
+                "vision_tower.patch_embed.pos_emb.weight": WeightMapping(
+                    target_path="vision_tower.patch_embed.pos_emb.weight",
+                    sharding=(None,),
+                    transpose=False,
+                ),
                 "vision_tower.patch_embed.proj.weight": WeightMapping(
                     target_path="vision_tower.patch_embed.proj.kernel",
                     sharding=(None, None, None, None),
-                    transpose=False, # TODO: Verify if this is alright
+                    transpose_axes=(2, 3, 1, 0),
                 ),
                 "vision_tower.patch_embed.proj.bias": WeightMapping(
                     target_path="vision_tower.patch_embed.proj.bias",
