@@ -2403,6 +2403,7 @@ class ScheduleBatch:
             deepstack_visual_embedding=None,
             recurrent_indices=recurrent_indices_cpu,
             has_initial_state=has_initial_state_cpu,
+            spec_algorithm=self.spec_algorithm,
         )
 
     def get_spec_model_worker_batch(
