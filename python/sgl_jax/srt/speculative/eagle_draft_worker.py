@@ -231,14 +231,14 @@ class EagleDraftWorker(BaseDraftWorker):
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, logits_output.next_token_logits, logits_output.hidden_states
         )
-        logits_output.next_token_logits = rep_logits[sel, :]
         if len(rep_hidden.shape) == 1:
             rep_hidden = jnp.expand_dims(rep_hidden, axis=0)
-        logits_output.hidden_states = rep_hidden[sel]
+        logits_output.next_token_logits = rep_logits
+        logits_output.hidden_states = rep_hidden
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         forward_batch.spec_info.allocate_lens = np.asarray(model_worker_batch.seq_lens)[sel]
 
-        self.capture_for_decode(logits_output, forward_batch.spec_info)
+        self.capture_for_decode(logits_output, forward_batch.spec_info, sel=sel)
 
     def draft_extend_for_decode(
         self, model_worker_batch: ModelWorkerBatch, batch_output: GenerationBatchResult
@@ -289,12 +289,18 @@ class EagleDraftWorker(BaseDraftWorker):
     # -- Internal draft helpers --
 
     def capture_for_decode(
-        self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
+        self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput, sel=None
     ):
         topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
+        hidden = replicate_to_mesh(self.mesh, logits_output.hidden_states)
+        if sel is not None:
+            sel_jax = jnp.asarray(sel)
+            topk_p = topk_p[sel_jax]
+            topk_index = topk_index[sel_jax]
+            hidden = hidden[sel_jax]
         draft_input.topk_p = topk_p
         draft_input.topk_index = topk_index
-        draft_input.hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
+        draft_input.hidden_states = hidden
 
     def padding_for_decode(self, model_worker_batch: ModelWorkerBatch):
         # At dp>1 the incoming mwb is already DP-padded to total_bs (== a bucket

@@ -252,13 +252,13 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, layer0_out.next_token_logits, layer0_out.hidden_states
         )
-        layer0_out.next_token_logits = rep_logits[sel, :]
-        layer0_out.hidden_states = rep_hidden[last_idx][sel]
+        layer0_out.next_token_logits = rep_logits
+        layer0_out.hidden_states = rep_hidden[last_idx]
         model_worker_batch.spec_info_padded.hidden_states = hidden_states
         model_worker_batch.spec_info_padded.allocate_lens = np.asarray(model_worker_batch.seq_lens)[
             sel
         ]
-        self.capture_for_decode(layer0_out, model_worker_batch.spec_info_padded)
+        self.capture_for_decode(layer0_out, model_worker_batch.spec_info_padded, sel=sel)
 
     def draft_extend_for_decode(
         self, model_worker_batch: ModelWorkerBatch, batch_output: GenerationBatchResult
