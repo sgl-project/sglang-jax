@@ -1,0 +1,73 @@
+name: Coordinator
+
+on:
+  workflow_call:
+    outputs:
+      run_full:
+        description: "Run full test suite (label test:full)"
+        value: ${{ jobs.decide.outputs.run_full }}
+      requires_4tpu:
+        description: "Run extra 4-TPU tests (label test:multi-chip)"
+        value: ${{ jobs.decide.outputs.requires_4tpu }}
+      run_perf:
+        description: "Run extra performance tests (label test:perf)"
+        value: ${{ jobs.decide.outputs.run_perf }}
+      run_perf_trace:
+        description: "Run performance trace tests (label test:perf-trace)"
+        value: ${{ jobs.decide.outputs.run_perf_trace }}
+      run_accuracy_extra:
+        description: "Run extra accuracy tests (label test:accuracy-extra)"
+        value: ${{ jobs.decide.outputs.run_accuracy_extra }}
+      run_main_test:
+        description: "Run main package tests that do not require secrets"
+        value: ${{ jobs.decide.outputs.run_main_test }}
+      run_pallas_bench:
+        description: "Run Pallas kernel benchmark (requires secrets)"
+        value: ${{ jobs.decide.outputs.run_pallas_bench }}
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    outputs:
+      run_full: ${{ steps.decide.outputs.run_full }}
+      requires_4tpu: ${{ steps.decide.outputs.requires_4tpu }}
+      run_perf: ${{ steps.decide.outputs.run_perf }}
+      run_perf_trace: ${{ steps.decide.outputs.run_perf_trace }}
+      run_accuracy_extra: ${{ steps.decide.outputs.run_accuracy_extra }}
+      run_main_test: ${{ steps.decide.outputs.run_main_test }}
+      run_pallas_bench: ${{ steps.decide.outputs.run_pallas_bench }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            main_package:
+              - "python/sgl_jax/**"
+              - "python/*.toml"
+              - "scripts/**"
+              - "test/**"
+              - ".github/workflows/pr-test.yml"
+              - ".github/workflows/coordinator.yml"
+              - ".github/actions/**"
+            pallas_kernel:
+              - "python/sgl_jax/kernels/**"
+              - "benchmark/kernels/**"
+              - ".github/workflows/pr-test.yml"
+              - ".github/workflows/coordinator.yml"
+              - ".github/actions/**"
+
+      - name: Decide what to run
+        id: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          MAIN_PACKAGE: ${{ steps.filter.outputs.main_package }}
+          PALLAS_KERNEL: ${{ steps.filter.outputs.pallas_kernel }}
+        run: python scripts/ci/coordinator_decide.py
