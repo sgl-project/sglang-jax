@@ -1,8 +1,6 @@
 name: PR Review (Claude)
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
   issue_comment:
     types: [created]
 
@@ -14,12 +12,10 @@ permissions:
 
 concurrency:
   group: >-
-    pr-review-${{ github.event.pull_request.number || github.event.issue.number }}-${{
+    pr-review-${{ github.event.issue.number }}-${{
       (
-        (github.event_name == 'pull_request')
-        || (github.event_name == 'issue_comment'
-            && startsWith(github.event.comment.body, '/review')
-            && contains(fromJSON('["OWNER","COLLABORATOR"]'), github.event.comment.author_association))
+        startsWith(github.event.comment.body, '/review')
+        && contains(fromJSON('["OWNER","COLLABORATOR"]'), github.event.comment.author_association)
       )
       && 'active'
       || github.run_id
@@ -29,11 +25,9 @@ concurrency:
 jobs:
   review:
     if: >
-      (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
-      || (github.event_name == 'issue_comment'
-          && github.event.issue.pull_request != null
-          && startsWith(github.event.comment.body, '/review')
-          && contains(fromJSON('["OWNER","COLLABORATOR"]'), github.event.comment.author_association))
+      github.event.issue.pull_request != null
+      && startsWith(github.event.comment.body, '/review')
+      && contains(fromJSON('["OWNER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -42,15 +36,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ "${{ github.event_name }}" = "issue_comment" ]; then
-            PR_NUMBER=${{ github.event.issue.number }}
-            HEAD_SHA=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json headRefOid -q .headRefOid)
-            HEAD_REF=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json headRefName -q .headRefName)
-          else
-            PR_NUMBER=${{ github.event.pull_request.number }}
-            HEAD_SHA=${{ github.event.pull_request.head.sha }}
-            HEAD_REF=${{ github.event.pull_request.head.ref }}
-          fi
+          PR_NUMBER=${{ github.event.issue.number }}
+          HEAD_SHA=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json headRefOid -q .headRefOid)
+          HEAD_REF=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json headRefName -q .headRefName)
           echo "number=$PR_NUMBER"  >> "$GITHUB_OUTPUT"
           echo "sha=$HEAD_SHA"      >> "$GITHUB_OUTPUT"
           echo "ref=$HEAD_REF"      >> "$GITHUB_OUTPUT"
