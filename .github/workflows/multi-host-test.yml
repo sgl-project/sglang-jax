@@ -50,7 +50,7 @@ on:
 
 concurrency:
   group: gke-run-test-caces-smoke-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: read
