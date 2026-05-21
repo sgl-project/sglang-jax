@@ -2059,10 +2059,13 @@ class ScheduleBatch:
         ``reqs_info[0]``. ``input_ids``/``positions``/``cache_loc`` are
         placeholders — ``EagleDraftWorker.padding_for_decode`` rebuilds them.
         """
-        max_bs_per_dp = max(
-            (len(i.seq_lens) if i.seq_lens is not None else 0) for i in self.reqs_info
-        )
-        total_bs, _ = pad_to_bucket(max(max_bs_per_dp, 1) * self.dp_size, bs_paddings)
+        # Pin total_bs to the largest precompile bucket so every cell shares
+        # one jit cache entry regardless of runtime bs. Without this, each
+        # smaller bucket (bs_paddings[i] < bs_paddings[-1]) triggers a fresh
+        # trace the first time it's hit.
+        total_bs = max(bs_paddings) if bs_paddings else 1
+        if total_bs % self.dp_size != 0:
+            total_bs, _ = pad_to_bucket(max(1, 1) * self.dp_size, bs_paddings)
         per_dp_bs = total_bs // self.dp_size
         self.per_dp_bs_size = per_dp_bs
         (
