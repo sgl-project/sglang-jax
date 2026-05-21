@@ -578,7 +578,7 @@ class FusedEPMoEV2(FusedEPMoE):
             disable_weight_load=self.disable_weight_load,
             disable_shared_expert=self.disable_shared_expert,
             disable_sync_barrier=self.disable_sync_barrier,
-            use_jax_allreduce_metadata=self.use_jax_allreduce_metadata,
+            use_jax_allreduce_metadata=False,
             quant_block_k=self.quant_block_k if hasattr(self, "quant_block_k") else None,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
@@ -587,6 +587,8 @@ class FusedEPMoEV2(FusedEPMoE):
             w2_shared=w2_shared_val,
             w3_shared=w3_shared_val,
             direct_scaled_dot=direct_scaled_dot,
+            skip_post_gather_sync=True,
+            skip_inter_bt_sync=True,
             dp_axis_name="data",
             tp_axis_name="tensor",
         )
