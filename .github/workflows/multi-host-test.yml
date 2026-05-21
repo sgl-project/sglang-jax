@@ -3,7 +3,7 @@ name: TPU Multi Test
 on:
   push:
     paths:
-      - "multi-host-test.yml"
+      - ".github/workflows/multi-host-test.yml"
       - "test/srt/multi_host/**"
   workflow_dispatch:
     inputs:
