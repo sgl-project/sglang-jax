@@ -35,8 +35,8 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         # Prefill configs
         ('bfloat16', 'float8_e4m3fn', 2048, 384, 8, 6144, 2048, 32, False, False): (128, 512, 128, 256, None),
         ('bfloat16', 'float8_e4m3fn', 4096, 384, 8, 6144, 2048, 32, False, False): (128, 512, 128, 256, None),
-        ('bfloat16', 'float8_e4m3fn', 8192, 384, 8, 6144, 2048, 32, False, False): (128, 1024, 112, 256, 112),
-        ('bfloat16', 'float8_e4m3fn', 16384, 384, 8, 6144, 2048, 32, False, False): (256, 1024, 216, 256, 216),
+        ('bfloat16', 'float8_e4m3fn', 8192, 384, 8, 6144, 2048, 32, False, False): (128, 1024, 56, 256, 112),
+        ('bfloat16', 'float8_e4m3fn', 16384, 384, 8, 6144, 2048, 32, False, False): (256, 1024, 72, 256, 216),
         # MiMo V2 Pro: E=384, H=6144, I=2048, top_k=8, fp8 e4m3, ep=8
         # Decode configs (tuned on bench-4 single-host v7x-16, 2026-05-21)
         ('bfloat16', 'float8_e4m3fn', 512, 384, 8, 6144, 2048, 8, False, False): (64, 1024, 32, 256, 32),
