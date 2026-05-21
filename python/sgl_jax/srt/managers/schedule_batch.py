@@ -2097,12 +2097,26 @@ class ScheduleBatch:
             )
             for i in self.reqs_info
         ]
-        max_ocl = max((len(c) for c in ocl_chunks), default=0)
+        # Derive per-req token count from any non-empty rank; pad each rank's
+        # chunk to per_dp_bs * per_req_tokens so the merged out_cache_loc has
+        # a stable bucket-aligned shape across runtime bs. Fall back to max
+        # chunk length if derived target is smaller (defensive).
+        per_req_tokens = 0
+        for chunk, info in zip(ocl_chunks, self.reqs_info):
+            n_real = len(info.reqs) if info.reqs else 0
+            if n_real > 0 and len(chunk) > 0:
+                per_req_tokens = max(per_req_tokens, len(chunk) // n_real)
+        per_req_tokens = max(per_req_tokens, 1)
+        max_chunk_len = max((len(c) for c in ocl_chunks), default=0)
+        target_per_rank_ocl = max(per_dp_bs * per_req_tokens, max_chunk_len)
         out_cache_loc = (
             np.concatenate(
-                [np.pad(c, (0, max_ocl - len(c)), constant_values=-1) for c in ocl_chunks]
+                [
+                    np.pad(c, (0, target_per_rank_ocl - len(c)), constant_values=-1)
+                    for c in ocl_chunks
+                ]
             )
-            if max_ocl > 0
+            if target_per_rank_ocl > 0
             else np.empty(0, dtype=np.int32)
         )
         return ModelWorkerBatch(
