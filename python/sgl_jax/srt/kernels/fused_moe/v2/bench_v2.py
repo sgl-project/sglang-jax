@@ -12,8 +12,15 @@ Env vars:
   BENCH_BSE     — bse value (default: 256)
   BENCH_FP8     — 1 to enable fp8 weights
   BENCH_QBK     — quant_block_k for fp8 (default: 128)
-  BENCH_DIRECT_SCALED_DOT — 1 to use fp8 direct-scaled-dot path
-  BENCH_BT_SCATTER_OVERLAP — 1 to overlap next-BT scatter with current BT
+  BENCH_DIRECT_SCALED_DOT — 1 to use direct-scaled-dot for both FFN1/FFN2
+  BENCH_DIRECT_SCALED_DOT_FFN1/FFN2 — optional comma-separated 0/1 hybrid sweep
+  BENCH_FFN1_DEQUANT_MODE — full or fchunk when FFN1 direct-scaled-dot is off
+  BENCH_FFN1_DEQUANT_CHUNK — comma-separated FFN1 dequant chunk sizes for fchunk
+  BENCH_W2_FETCH_ORDER — after_w13 or before_w13 for current-expert W2 DMA
+  BENCH_W2_FETCH_PRIORITY — comma-separated 0/1 priority for current-expert W2 DMA
+  BENCH_SKIP_POST_GATHER_SYNC — comma-separated 0/1 skip barrier after gather recv wait
+  BENCH_SKIP_INTER_BT_SYNC — comma-separated 0/1 skip inter-BT sync barrier
+  BENCH_INTERLEAVE_BT — comma-separated 0/1 interleave BT gather banking
   BENCH_TUNE    — 1 to auto-generate bt/bf candidates
   BENCH_WARMUP  — warmup iterations (default: 2)
   BENCH_ITERS   — timed iterations (default: 5)
@@ -25,6 +32,7 @@ from __future__ import annotations
 import gzip
 import itertools
 import json
+import math
 import os
 import pathlib
 import re
@@ -166,11 +174,34 @@ def parse_csv_int(env_key: str, default: list[int]) -> list[int]:
     return [int(x.strip()) for x in v.split(",")]
 
 
+def parse_csv_str(env_key: str, default: list[str]) -> list[str]:
+    v = os.environ.get(env_key)
+    if v is None:
+        return default
+    return [x.strip() for x in v.split(",")]
+
+
 def parse_csv_int_or_none(env_key: str) -> list[int | None]:
     v = os.environ.get(env_key)
     if v is None:
         return [None]
     return [int(x.strip()) for x in v.split(",")]
+
+
+def parse_csv_bool(env_key: str, default: list[bool]) -> list[bool]:
+    v = os.environ.get(env_key)
+    if v is None:
+        return default
+    out = []
+    for raw in v.split(","):
+        item = raw.strip().lower()
+        if item in ("1", "true", "t", "yes", "y"):
+            out.append(True)
+        elif item in ("0", "false", "f", "no", "n"):
+            out.append(False)
+        else:
+            raise ValueError(f"Unsupported boolean value {raw!r} for {env_key}")
+    return out
 
 
 def align_local_tokens_for_v2(local_num_tokens: int) -> int:
@@ -198,6 +229,7 @@ d = int(os.environ.get("BENCH_D", "6144"))
 f = int(os.environ.get("BENCH_F", "2048"))
 E = int(os.environ.get("BENCH_E", "384"))
 top_k = int(os.environ.get("BENCH_TOPK", "8"))
+routing_mode = os.environ.get("BENCH_ROUTING_MODE", "random")
 bse = int(os.environ.get("BENCH_BSE", "256"))
 warmup = int(os.environ.get("BENCH_WARMUP", "2"))
 iters = int(os.environ.get("BENCH_ITERS", "5"))
@@ -207,10 +239,79 @@ quant_block_k = int(os.environ.get("BENCH_QBK", "128"))
 tune_mode = os.environ.get("BENCH_TUNE", "0") == "1"
 use_wall = os.environ.get("BENCH_WALL", "0") == "1"
 use_split = os.environ.get("BENCH_SPLIT", "0") == "1"
-decode_mode = os.environ.get("BENCH_DECODE_MODE", "0") == "1"
 direct_scaled_dot = os.environ.get("BENCH_DIRECT_SCALED_DOT", "0") == "1"
-inkernel_metadata = os.environ.get("BENCH_INKERNEL_MD", "0") == "1"
+direct_scaled_dot_ffn1_modes = parse_csv_bool(
+    "BENCH_DIRECT_SCALED_DOT_FFN1", [direct_scaled_dot],
+)
+direct_scaled_dot_ffn2_modes = parse_csv_bool(
+    "BENCH_DIRECT_SCALED_DOT_FFN2", [direct_scaled_dot],
+)
+cast_ffn1_input_fp8 = os.environ.get("BENCH_CAST_FFN1_INPUT_FP8", "0") == "1"
+cast_ffn2_input_fp8 = os.environ.get("BENCH_CAST_FFN2_INPUT_FP8", "0") == "1"
+ffn1_dequant_modes = parse_csv_str("BENCH_FFN1_DEQUANT_MODE", ["full"])
+ffn1_dequant_chunks = parse_csv_int_or_none("BENCH_FFN1_DEQUANT_CHUNK")
+inkernel_metadata = os.environ.get("BENCH_INKERNEL_MD", "1") == "1"
 enable_bt_scatter_overlap = os.environ.get("BENCH_BT_SCATTER_OVERLAP", "1") == "1"
+cross_expert_prefetch_modes = parse_csv_str("BENCH_CROSS_EXPERT_PREFETCH", ["full"])
+next_w2_prologue_priorities = parse_csv_int("BENCH_NEXT_W2_PRIORITY", [1])
+w2_fetch_orders = parse_csv_str("BENCH_W2_FETCH_ORDER", ["after_w13"])
+w2_fetch_priorities = parse_csv_int("BENCH_W2_FETCH_PRIORITY", [1])
+skip_post_gather_sync_modes = parse_csv_bool(
+    "BENCH_SKIP_POST_GATHER_SYNC", [True],
+)
+skip_inter_bt_sync_modes = parse_csv_bool(
+    "BENCH_SKIP_INTER_BT_SYNC", [True],
+)
+interleave_bt_modes = parse_csv_bool(
+    "BENCH_INTERLEAVE_BT", [True],
+)
+valid_ffn1_dequant_modes = {"full", "fchunk"}
+invalid_ffn1_dequant_modes = [
+    mode for mode in ffn1_dequant_modes if mode not in valid_ffn1_dequant_modes
+]
+if invalid_ffn1_dequant_modes:
+    raise ValueError(
+        f"Unsupported BENCH_FFN1_DEQUANT_MODE values {invalid_ffn1_dequant_modes}; "
+        "expected one of full or fchunk."
+    )
+valid_cross_expert_prefetch_modes = {"none", "full", "w13"}
+invalid_modes = [
+    mode for mode in cross_expert_prefetch_modes
+    if mode not in valid_cross_expert_prefetch_modes
+]
+if invalid_modes:
+    raise ValueError(
+        f"Unsupported BENCH_CROSS_EXPERT_PREFETCH values {invalid_modes}; "
+        "expected one of none, full, or w13."
+    )
+invalid_priorities = [
+    priority
+    for priority in (
+        list(next_w2_prologue_priorities)
+        + list(w2_fetch_priorities)
+    )
+    if priority not in (0, 1)
+]
+if invalid_priorities:
+    raise ValueError(
+        f"Unsupported DMA priority values {invalid_priorities}; "
+        "TPU DMA priority supports only 0 or 1."
+    )
+valid_w2_fetch_orders = {"after_w13", "before_w13"}
+invalid_w2_fetch_orders = [
+    mode for mode in w2_fetch_orders if mode not in valid_w2_fetch_orders
+]
+if invalid_w2_fetch_orders:
+    raise ValueError(
+        f"Unsupported BENCH_W2_FETCH_ORDER values {invalid_w2_fetch_orders}; "
+        "expected one of after_w13 or before_w13."
+    )
+valid_routing_modes = {"random", "deterministic"}
+if routing_mode not in valid_routing_modes:
+    raise ValueError(
+        f"Unsupported BENCH_ROUTING_MODE={routing_mode!r}; "
+        "expected one of random or deterministic."
+    )
 if use_split:
     timeit_fn = None
     timing_label = "split"
@@ -221,30 +322,121 @@ else:
 # Ablation flags
 all_disable = os.environ.get("FUSED_MOE_BENCHMARK_ALL_DISABLE", "0") == "1"
 disable_a2a = all_disable or os.environ.get("DISABLE_A2A", "0") == "1"
+disable_a2a_scatter = all_disable or os.environ.get("DISABLE_A2A_SCATTER", "0") == "1"
+disable_a2a_scatter_local_copy = (
+    all_disable or os.environ.get("DISABLE_A2A_SCATTER_LOCAL_COPY", "0") == "1"
+)
+disable_a2a_scatter_remote_copy = (
+    all_disable or os.environ.get("DISABLE_A2A_SCATTER_REMOTE_COPY", "0") == "1"
+)
+disable_a2a_scatter_recv_wait = (
+    all_disable or os.environ.get("DISABLE_A2A_SCATTER_RECV_WAIT", "0") == "1"
+)
+disable_a2a_scatter_send_wait = (
+    all_disable or os.environ.get("DISABLE_A2A_SCATTER_SEND_WAIT", "0") == "1"
+)
+disable_a2a_gather = all_disable or os.environ.get("DISABLE_A2A_GATHER", "0") == "1"
+disable_a2a_gather_local_copy = (
+    all_disable or os.environ.get("DISABLE_A2A_GATHER_LOCAL_COPY", "0") == "1"
+)
+disable_a2a_gather_remote_copy = (
+    all_disable or os.environ.get("DISABLE_A2A_GATHER_REMOTE_COPY", "0") == "1"
+)
 disable_sync_barrier = all_disable or os.environ.get("DISABLE_SYNC_BARRIER", "0") == "1"
 disable_weight_load = all_disable or os.environ.get("DISABLE_WEIGHT_LOAD", "0") == "1"
+disable_w1_load = all_disable or os.environ.get("DISABLE_W1_LOAD", "0") == "1"
+disable_w3_load = all_disable or os.environ.get("DISABLE_W3_LOAD", "0") == "1"
+disable_w2_load = all_disable or os.environ.get("DISABLE_W2_LOAD", "0") == "1"
+disable_expert_x_load = all_disable or os.environ.get("DISABLE_EXPERT_X_LOAD", "0") == "1"
+disable_expert_ffn = all_disable or os.environ.get("DISABLE_EXPERT_FFN", "0") == "1"
 disable_dynamic_ffn1 = all_disable or os.environ.get("DISABLE_DYNAMIC_FFN1", "0") == "1"
 disable_dynamic_ffn2 = all_disable or os.environ.get("DISABLE_DYNAMIC_FFN2", "0") == "1"
+disable_expert_store = all_disable or os.environ.get("DISABLE_EXPERT_STORE", "0") == "1"
+disable_expert_stage_writeback = (
+    all_disable or os.environ.get("DISABLE_EXPERT_STAGE_WRITEBACK", "0") == "1"
+)
+disable_expert_store_dma = (
+    all_disable or os.environ.get("DISABLE_EXPERT_STORE_DMA", "0") == "1"
+)
+disable_expert_store_wait = (
+    all_disable or os.environ.get("DISABLE_EXPERT_STORE_WAIT", "0") == "1"
+)
 disable_acc_and_store = all_disable or os.environ.get("DISABLE_ACC_AND_STORE", "0") == "1"
+disable_acc_load = all_disable or os.environ.get("DISABLE_ACC_LOAD", "0") == "1"
+disable_acc_compute = all_disable or os.environ.get("DISABLE_ACC_COMPUTE", "0") == "1"
+disable_acc_store_vmem = all_disable or os.environ.get("DISABLE_ACC_STORE_VMEM", "0") == "1"
+disable_output_store = all_disable or os.environ.get("DISABLE_OUTPUT_STORE", "0") == "1"
 ablation_flags = {
     "disable_a2a": disable_a2a,
+    "disable_a2a_scatter": disable_a2a_scatter,
+    "disable_a2a_scatter_local_copy": disable_a2a_scatter_local_copy,
+    "disable_a2a_scatter_remote_copy": disable_a2a_scatter_remote_copy,
+    "disable_a2a_scatter_recv_wait": disable_a2a_scatter_recv_wait,
+    "disable_a2a_scatter_send_wait": disable_a2a_scatter_send_wait,
+    "disable_a2a_gather": disable_a2a_gather,
+    "disable_a2a_gather_local_copy": disable_a2a_gather_local_copy,
+    "disable_a2a_gather_remote_copy": disable_a2a_gather_remote_copy,
     "disable_sync_barrier": disable_sync_barrier,
     "disable_weight_load": disable_weight_load,
+    "disable_w1_load": disable_w1_load,
+    "disable_w3_load": disable_w3_load,
+    "disable_w2_load": disable_w2_load,
+    "disable_expert_x_load": disable_expert_x_load,
+    "disable_expert_ffn": disable_expert_ffn,
     "disable_dynamic_ffn1": disable_dynamic_ffn1,
     "disable_dynamic_ffn2": disable_dynamic_ffn2,
+    "disable_expert_store": disable_expert_store,
+    "disable_expert_stage_writeback": disable_expert_stage_writeback,
+    "disable_expert_store_dma": disable_expert_store_dma,
+    "disable_expert_store_wait": disable_expert_store_wait,
     "disable_acc_and_store": disable_acc_and_store,
+    "disable_acc_load": disable_acc_load,
+    "disable_acc_compute": disable_acc_compute,
+    "disable_acc_store_vmem": disable_acc_store_vmem,
+    "disable_output_store": disable_output_store,
 }
 active_ablation = [k for k, v in ablation_flags.items() if v]
 if active_ablation:
     log(f"ablation flags: {active_ablation}")
-if decode_mode:
-    log("decode_mode=True (single-buffer weights, serial bf loop)")
 if direct_scaled_dot:
     log("direct_scaled_dot=True (fp8 dot per quant group, scale after dot)")
+if cast_ffn1_input_fp8 or cast_ffn2_input_fp8:
+    log(
+        "input cast controls: "
+        f"ffn1_fp8={cast_ffn1_input_fp8} ffn2_fp8={cast_ffn2_input_fp8}"
+    )
+if (
+    direct_scaled_dot_ffn1_modes != [direct_scaled_dot]
+    or direct_scaled_dot_ffn2_modes != [direct_scaled_dot]
+):
+    log(
+        "direct_scaled_dot hybrid sweep: "
+        f"ffn1={direct_scaled_dot_ffn1_modes} ffn2={direct_scaled_dot_ffn2_modes}"
+    )
+if ffn1_dequant_modes != ["full"] or ffn1_dequant_chunks != [None]:
+    log(
+        "ffn1_dequant sweep: "
+        f"mode={ffn1_dequant_modes} chunk={ffn1_dequant_chunks}"
+    )
 if inkernel_metadata:
     log("inkernel_metadata=True (in-kernel ICI allgather, no JAX lax.all_gather)")
 if enable_bt_scatter_overlap:
     log("bt_scatter_overlap=True (next-BT scatter HBM bank overlap)")
+log(
+    "cross_expert_prefetch="
+    f"{cross_expert_prefetch_modes} next_w2_priority={next_w2_prologue_priorities}"
+)
+if w2_fetch_orders != ["after_w13"] or w2_fetch_priorities != [1]:
+    log(
+        "w2_fetch sweep: "
+        f"order={w2_fetch_orders} priority={w2_fetch_priorities}"
+    )
+if skip_post_gather_sync_modes != [True]:
+    log(f"skip_post_gather_sync sweep: {skip_post_gather_sync_modes}")
+if skip_inter_bt_sync_modes != [True]:
+    log(f"skip_inter_bt_sync sweep: {skip_inter_bt_sync_modes}")
+if interleave_bt_modes != [True]:
+    log(f"interleave_bt sweep: {interleave_bt_modes}")
 
 bt_candidates = parse_csv_int("BENCH_BT", [128])
 bf_candidates = parse_csv_int("BENCH_BF", [256])
@@ -253,12 +445,200 @@ bts_candidates = parse_csv_int_or_none("BENCH_BTS")
 token_candidates = parse_csv_int("BENCH_TOKENS", [4096])
 
 
-def generate_tune_candidates(intermediate_size, local_num_tokens, ep_size):
-    bfs = sorted(set(
+def _align_to(x, a):
+    return ((x + a - 1) // a) * a
+
+
+def _pow2_floor(x):
+    if x <= 1:
+        return 1
+    return 1 << int(math.floor(math.log2(x)))
+
+
+def _pow2_ceil(x):
+    if x <= 1:
+        return 1
+    return 1 << int(math.ceil(math.log2(x)))
+
+
+def _ladder_div2(start):
+    out = []
+    v = int(start)
+    while v > 0:
+        out.append(v)
+        if v == 1:
+            break
+        v //= 2
+    return sorted(set(out), reverse=True)
+
+
+def _estimate_vmem_bytes_v2(
+    *,
+    bt,
+    bf,
+    btc,
+    bse,
+    bts,
+    hidden_size,
+    intermediate_size,
+    num_experts,
+    top_k,
+    ep_size,
+    num_tokens,
+    use_fp8=False,
+    quant_block_k=128,
+    direct_scaled_dot=True,
+    interleave_bt=True,
+    enable_bt_scatter_overlap=True,
+    verbose=False,
+):
+    local_num_tokens = num_tokens // ep_size
+    t_packing = 1  # bf16 activations
+    w_bytes = 1 if use_fp8 else 2
+    token_bytes = 2  # bf16
+    h_per_t = hidden_size // t_packing
+    padded_num_experts = _align_to(num_experts, 128)
+    padded_top_k = _align_to(top_k, 128)
+    acc_bt = math.gcd(bt, 16)
+    num_bt = local_num_tokens // bt if bt > 0 else 1
+    use_bt_scatter_bank = enable_bt_scatter_overlap and num_bt > 1
+    use_gather_bank = interleave_bt and num_bt > 1
+    smem_banks = num_bt if use_gather_bank else 2
+
+    # Gather accumulation: (2, top_k, acc_bt, t_packing, h_per_t)
+    b_a2a_g_acc = 2 * top_k * acc_bt * hidden_size * token_bytes
+    # TopK weights: (smem_banks, bt, padded_top_k) f32
+    b_topk_w = smem_banks * bt * padded_top_k * 4
+    # TopK ids: (smem_banks, bt, padded_top_k) i32
+    b_topk_id = smem_banks * bt * padded_top_k * 4
+    # Output: (smem_banks, bt, hidden_size) t_dtype
+    b_output = smem_banks * bt * hidden_size * token_bytes
+
+    # Weight double buffers: (2, t_packing, h_per_t, bf) or (2, t_packing, bf, h_per_t)
+    b_w1 = 2 * hidden_size * bf * w_bytes
+    b_w3 = 2 * hidden_size * bf * w_bytes
+    b_w2 = 2 * bf * hidden_size * w_bytes
+
+    # Scale buffers (fp8 only)
+    b_w1_scale = 0
+    b_w3_scale = 0
+    b_w2_scale = 0
+    if use_fp8:
+        b_w1_scale = 2 * t_packing * (h_per_t // quant_block_k) * bf * 4
+        b_w3_scale = b_w1_scale
+        b_w2_scale = 2 * t_packing * (bf // quant_block_k) * h_per_t * 4
+
+    # Dequant scratch (fp8 + not direct_scaled_dot)
+    b_w1_dq = 0
+    b_w3_dq = 0
+    b_w2_dq = 0
+    if use_fp8 and not direct_scaled_dot:
+        b_w1_dq = t_packing * h_per_t * bf * 2  # bf16
+        b_w3_dq = b_w1_dq
+        b_w2_dq = t_packing * bf * h_per_t * 2  # bf16
+
+    # Gate/up accumulators: (bts, bf) f32 each
+    b_gate_acc = bts * bf * 4
+    b_up_acc = bts * bf * 4
+    # Token staging: (bts, t_packing, h_per_t) t_dtype
+    b_x = bts * hidden_size * token_bytes
+    # Output accumulator: (bts, t_packing, h_per_t) f32
+    b_y_acc = bts * hidden_size * 4
+    # Output staging: (bts, t_packing, h_per_t) t_dtype
+    b_y_stage = bts * hidden_size * token_bytes
+
+    # Scoped metadata temporaries (run_scoped, only one path active)
+    local_num_experts = num_experts // ep_size
+    b_scoped = (
+        bt * padded_top_k * 4          # t2e_routing
+        + ep_size * padded_num_experts * 4  # d2e_count
+        + 2 * padded_num_experts * 4    # expert_offsets
+        + padded_num_experts * 4        # expert_starts
+        + padded_num_experts * 4        # expert_sizes
+    )
+
+    # Semaphore overhead (conservative flat estimate)
+    num_bt_banks = num_bt if use_gather_bank else (2 if use_bt_scatter_bank else 1)
+    b_sems = (
+        2 * 4           # x_stage + y_store (1 each)
+        + smem_banks * 10 * 4  # local_sems
+        + 3 * (num_bt_banks * local_num_experts * 4 if (use_bt_scatter_bank or use_gather_bank) else local_num_experts * 4)
+        + (num_bt_banks * 4 if use_gather_bank else 4)  # a2a_gather
+        + 3 * 4         # a2a_acc + md_send + md_recv + barrier
+    )
+
+    # SMEM (not VMEM, but allocated alongside — counts toward compiler budget)
+    b_smem = (
+        smem_banks * bt * padded_top_k * 4     # t2e_routing smem
+        + smem_banks * ep_size * padded_num_experts * 4  # d2e_count smem
+        + smem_banks * 2 * padded_num_experts * 4  # expert_offsets smem
+        + smem_banks * padded_num_experts * 4  # expert_starts smem
+        + smem_banks * padded_num_experts * 4  # expert_sizes smem
+    )
+
+    total = (
+        b_a2a_g_acc + b_topk_w + b_topk_id + b_output
+        + b_w1 + b_w3 + b_w2
+        + b_w1_scale + b_w3_scale + b_w2_scale
+        + b_w1_dq + b_w3_dq + b_w2_dq
+        + b_gate_acc + b_up_acc + b_x + b_y_acc + b_y_stage
+        + b_scoped + b_sems
+    )
+
+    if verbose:
+        mb = lambda b: f"{b / (1024*1024):.2f}"
+        log(f"    VMEM Breakdown (bt={bt} bf={bf} btc={btc} bts={bts}):")
+        log(f"      a2a_g_acc:      {mb(b_a2a_g_acc)} MB  (2,{top_k},{acc_bt},{hidden_size})")
+        log(f"      topk_weights:   {mb(b_topk_w)} MB  ({smem_banks},{bt},{padded_top_k}) f32")
+        log(f"      topk_ids:       {mb(b_topk_id)} MB")
+        log(f"      output:         {mb(b_output)} MB  ({smem_banks},{bt},{hidden_size})")
+        log(f"      W1 x2:          {mb(b_w1)} MB  (2,{hidden_size},{bf})")
+        log(f"      W3 x2:          {mb(b_w3)} MB")
+        log(f"      W2 x2:          {mb(b_w2)} MB")
+        if use_fp8:
+            log(f"      W1/W3 scale:    {mb(b_w1_scale)} MB each")
+            log(f"      W2 scale:       {mb(b_w2_scale)} MB")
+        if b_w1_dq:
+            log(f"      W1/W3 dequant:  {mb(b_w1_dq)} MB each")
+            log(f"      W2 dequant:     {mb(b_w2_dq)} MB")
+        log(f"      gate+up acc:    {mb(b_gate_acc + b_up_acc)} MB  ({bts},{bf}) f32")
+        log(f"      x+y_acc+y_stg:  {mb(b_x + b_y_acc + b_y_stage)} MB")
+        log(f"      scoped+sems:    {mb(b_scoped + b_sems)} MB")
+        log(f"      Total:          {mb(total)} MB")
+
+    return total
+
+
+def generate_tune_candidates(
+    intermediate_size,
+    hidden_size,
+    local_num_tokens,
+    ep_size,
+    num_experts,
+    top_k,
+    *,
+    use_fp8=False,
+    quant_block_k=128,
+    direct_scaled_dot=True,
+    interleave_bt=True,
+    enable_bt_scatter_overlap=True,
+    vmem_budget=64 * 1024 * 1024,
+    vmem_headroom=0.95,
+    max_configs=16,
+    bse=256,
+    verbose=False,
+):
+    effective_budget = int(vmem_budget * vmem_headroom)
+
+    bf_list = sorted(set(
         v for v in [128, 256, 512, 1024, 2048]
         if v <= intermediate_size and intermediate_size % v == 0
     ))
+
     bt_list = []
+    for p_val in [2, 4]:
+        if local_num_tokens == p_val:
+            bt_list.append(p_val)
     p = 8
     while p <= local_num_tokens:
         if local_num_tokens % p == 0:
@@ -266,17 +646,110 @@ def generate_tune_candidates(intermediate_size, local_num_tokens, ep_size):
         p *= 2
     if not bt_list:
         bt_list = [local_num_tokens]
-    max_bt = max(bt_list)
-    if max_bt < 8:
-        bts_list = [8, 16, 32]
-        bts_list = [b for b in bts_list if b <= max_bt * ep_size]
-        if not bts_list:
-            bts_list = [None]
-    else:
-        bts_list = [None]
-    btc_list = [128]
-    return bt_list, bfs, btc_list, bts_list
+    bt_list = sorted(set(bt_list))
 
+    configs = []
+    seen = set()
+    first_verbose = True
+
+    for bt in bt_list:
+        max_bts = bt * ep_size
+        expected = bt * ep_size * top_k / num_experts
+        lo = _pow2_floor(expected)
+        hi = _pow2_ceil(expected)
+        bts_cands = sorted({v for v in [bt, lo, hi, hi * 2] if 0 < v <= max_bts})
+        if not bts_cands:
+            bts_cands = [bt]
+
+        for bts_val in bts_cands:
+            btc_cands = _ladder_div2(bts_val)
+            btc_cands = [v for v in btc_cands if v >= 8 and bts_val % v == 0]
+            if not btc_cands:
+                if bts_val < 8:
+                    btc_cands = [v for v in _ladder_div2(bts_val) if bts_val % v == 0]
+                if not btc_cands:
+                    btc_cands = [bts_val]
+
+            for bf in bf_list:
+                for btc in btc_cands:
+                    bc = FusedMoEBlockConfig(
+                        bt=bt, bf=bf, btc=btc, bse=bse, bts=bts_val,
+                    )
+                    num_tokens_total = local_num_tokens * ep_size
+                    try:
+                        bc_eff = bc.effective_for(
+                            num_tokens=num_tokens_total, ep_size=ep_size,
+                        )
+                    except ValueError:
+                        continue
+
+                    key = (bc_eff.bt, bc_eff.bf, bc_eff.btc, bc_eff.bts)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    est = _estimate_vmem_bytes_v2(
+                        bt=bc_eff.bt, bf=bc_eff.bf, btc=bc_eff.btc,
+                        bse=bc_eff.bse, bts=bc_eff.bts,
+                        hidden_size=hidden_size,
+                        intermediate_size=intermediate_size,
+                        num_experts=num_experts,
+                        top_k=top_k, ep_size=ep_size,
+                        num_tokens=num_tokens_total,
+                        use_fp8=use_fp8,
+                        quant_block_k=quant_block_k,
+                        direct_scaled_dot=direct_scaled_dot,
+                        interleave_bt=interleave_bt,
+                        enable_bt_scatter_overlap=enable_bt_scatter_overlap,
+                        verbose=verbose and first_verbose,
+                    )
+                    first_verbose = False
+                    if est > effective_budget:
+                        log(
+                            f"  VMEM skip bt={bc_eff.bt},bf={bc_eff.bf},"
+                            f"btc={bc_eff.btc},bts={bc_eff.bts}: "
+                            f"{est/(1024*1024):.1f}MB > "
+                            f"{effective_budget/(1024*1024):.1f}MB"
+                        )
+                        continue
+                    configs.append(bc)
+
+    if len(configs) <= max_configs:
+        log(f"  tune: {len(configs)} configs (all pass VMEM filter)")
+        return configs
+
+    buckets = {}
+    for cfg in configs:
+        bk = (cfg.bt, cfg.bts or cfg.bt)
+        buckets.setdefault(bk, []).append(cfg)
+    for bk in buckets:
+        buckets[bk].sort(key=lambda c: (c.bf, c.btc), reverse=True)
+
+    selected = []
+    selected_keys = set()
+    bucket_keys = sorted(buckets.keys(), reverse=True)
+    while len(selected) < max_configs:
+        made_progress = False
+        for bk in bucket_keys:
+            bucket = buckets[bk]
+            if not bucket:
+                continue
+            cfg = bucket.pop(0)
+            key = (cfg.bt, cfg.bf, cfg.btc, cfg.bts)
+            if key not in selected_keys:
+                selected_keys.add(key)
+                selected.append(cfg)
+                made_progress = True
+            if len(selected) >= max_configs:
+                break
+        if not made_progress:
+            break
+
+    log(
+        f"  tune: {len(configs)} valid -> {len(selected)} selected "
+        f"(max={max_configs}, {len(bucket_keys)} bt/bts buckets)"
+    )
+    return selected
 
 
 if tune_mode:
@@ -285,6 +758,8 @@ if tune_mode:
 ep_sharding = jax.sharding.NamedSharding(mesh, P(("data", "tensor")))
 
 log(f"model: E={E} d={d} f={f} k={top_k} ep={ep_size} fp8={use_fp8}")
+if routing_mode != "random":
+    log(f"routing_mode={routing_mode}")
 log(f"sweep: tokens={token_candidates} bt={bt_candidates} bf={bf_candidates} btc={btc_candidates} bts={bts_candidates}")
 
 # --- Create weight arrays (shared across token counts) ---
@@ -302,6 +777,28 @@ def make_sharded(rng_key, shape, dtype, scale=1.0):
         )
         per_device_arrays.append(shard)
     return jax.make_array_from_single_device_arrays(shape, ep_sharding, per_device_arrays)
+
+
+def make_deterministic_topk(num_tokens, top_k, num_experts):
+    local_tokens = num_tokens // num_devices
+    per_device_ids = []
+    per_device_weights = []
+    for i, dev in enumerate(jax.local_devices()):
+        global_device_id = jax.process_index() * len(jax.local_devices()) + i
+        token_start = global_device_id * local_tokens
+        token_ids = jnp.arange(token_start, token_start + local_tokens, dtype=jnp.int32)
+        k_offsets = jnp.arange(top_k, dtype=jnp.int32)
+        ids = (token_ids[:, None] + k_offsets[None, :]) % jnp.int32(num_experts)
+        weights = jnp.full((local_tokens, top_k), 1.0 / top_k, dtype=jnp.float32)
+        per_device_ids.append(jax.device_put(ids, dev))
+        per_device_weights.append(jax.device_put(weights, dev))
+    topk_ids = jax.make_array_from_single_device_arrays(
+        (num_tokens, top_k), ep_sharding, per_device_ids,
+    )
+    topk_weights = jax.make_array_from_single_device_arrays(
+        (num_tokens, top_k), ep_sharding, per_device_weights,
+    )
+    return topk_weights, topk_ids
 
 
 log("creating weight arrays...")
@@ -348,30 +845,98 @@ for num_tokens in token_candidates:
     if tune_mode:
         local_nt = num_tokens // ep_size
         padded_local_nt = align_local_tokens_for_v2(local_nt)
-        bt_candidates, bf_candidates, btc_candidates, bts_candidates = generate_tune_candidates(f, padded_local_nt, ep_size)
-        log(f"  tune: bt={bt_candidates} bf={bf_candidates} (local_nt={local_nt}→{padded_local_nt})")
+        tune_configs = generate_tune_candidates(
+            f, d, padded_local_nt, ep_size, E, top_k,
+            use_fp8=use_fp8,
+            quant_block_k=quant_block_k,
+            direct_scaled_dot=direct_scaled_dot,
+            interleave_bt=interleave_bt_modes[0],
+            enable_bt_scatter_overlap=enable_bt_scatter_overlap,
+            bse=bse,
+            verbose=(num_tokens == token_candidates[0]),
+        )
+        block_configs_to_try = tune_configs
+    else:
+        block_configs_to_try = [
+            FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse, bts=bts)
+            for bt, bf, btc, bts in itertools.product(
+                bt_candidates, bf_candidates, btc_candidates, bts_candidates,
+            )
+        ]
 
     tokens = make_sharded(k1, (num_tokens, d), jnp.bfloat16)
-    gating_local_shape = (num_tokens // num_devices, E)
-    gating_per_dev = []
-    for i, dev in enumerate(jax.local_devices()):
-        shard_key = jax.random.fold_in(k5, jax.process_index() * len(jax.local_devices()) + i)
-        gating_per_dev.append(jax.device_put(
-            jax.random.normal(shard_key, gating_local_shape, dtype=jnp.float32), dev,
-        ))
-    gating = jax.make_array_from_single_device_arrays(
-        (num_tokens, E), ep_sharding, gating_per_dev,
-    )
-    _, topk_idx = lax.top_k(gating, top_k)
-    topk_logits = jnp.take_along_axis(gating, topk_idx, axis=-1)
-    topk_wts = jax.nn.softmax(topk_logits, axis=-1)
+    if routing_mode == "deterministic":
+        topk_wts, topk_idx = make_deterministic_topk(num_tokens, top_k, E)
+    else:
+        gating_local_shape = (num_tokens // num_devices, E)
+        gating_per_dev = []
+        for i, dev in enumerate(jax.local_devices()):
+            shard_key = jax.random.fold_in(k5, jax.process_index() * len(jax.local_devices()) + i)
+            gating_per_dev.append(jax.device_put(
+                jax.random.normal(shard_key, gating_local_shape, dtype=jnp.float32), dev,
+            ))
+        gating = jax.make_array_from_single_device_arrays(
+            (num_tokens, E), ep_sharding, gating_per_dev,
+        )
+        _, topk_idx = lax.top_k(gating, top_k)
+        topk_logits = jnp.take_along_axis(gating, topk_idx, axis=-1)
+        topk_wts = jax.nn.softmax(topk_logits, axis=-1)
 
-    configs_to_try = list(itertools.product(bt_candidates, bf_candidates, btc_candidates, bts_candidates))
+    configs_to_try = [
+        (bc_raw, *flags)
+        for bc_raw in block_configs_to_try
+        for flags in itertools.product(
+            cross_expert_prefetch_modes,
+            next_w2_prologue_priorities,
+            direct_scaled_dot_ffn1_modes,
+            direct_scaled_dot_ffn2_modes,
+            ffn1_dequant_modes,
+            ffn1_dequant_chunks,
+            w2_fetch_orders,
+            w2_fetch_priorities,
+            skip_post_gather_sync_modes,
+            skip_inter_bt_sync_modes,
+            interleave_bt_modes,
+        )
+    ]
     seen_resolved_configs = set()
 
-    for bt, bf, btc, bts in configs_to_try:
-        bc = FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse, bts=bts)
-        tag = f"bt={bt},bf={bf},btc={btc},bts={bts}"
+    for (
+        bc,
+        xprefetch_mode,
+        next_w2_priority,
+        direct_ffn1,
+        direct_ffn2,
+        ffn1_dequant_mode,
+        ffn1_dequant_chunk,
+        w2_fetch_order,
+        w2_fetch_priority,
+        skip_post_gather_sync,
+        skip_inter_bt_sync,
+        interleave_bt,
+    ) in configs_to_try:
+        if xprefetch_mode != "w13" and next_w2_priority != next_w2_prologue_priorities[0]:
+            continue
+        if direct_ffn1 and (
+            ffn1_dequant_mode != ffn1_dequant_modes[0]
+            or ffn1_dequant_chunk != ffn1_dequant_chunks[0]
+        ):
+            continue
+        if ffn1_dequant_mode != "fchunk" and ffn1_dequant_chunk is not None:
+            continue
+        bt, bf, btc, bts = bc.bt, bc.bf, bc.btc, bc.bts
+        ffn1_mode_tag = "direct" if direct_ffn1 else ffn1_dequant_mode
+        tag = (
+            f"bt={bt},bf={bf},btc={btc},bts={bts},"
+            f"xprefetch={xprefetch_mode},w2p={next_w2_priority},"
+            f"w2order={w2_fetch_order},w2fp={w2_fetch_priority},"
+            f"skip_pg_sync={int(skip_post_gather_sync)},"
+            f"direct_f1={int(direct_ffn1)},direct_f2={int(direct_ffn2)},"
+            f"cast_f1={int(cast_ffn1_input_fp8)},cast_f2={int(cast_ffn2_input_fp8)},"
+            f"ffn1dq={ffn1_mode_tag},ffn1chunk={ffn1_dequant_chunk},"
+            f"skip_ibt={int(skip_inter_bt_sync)},"
+            f"ilv_bt={int(interleave_bt)}"
+        )
 
         padded_nt = num_tokens
         local_nt_raw = num_tokens // ep_size
@@ -386,8 +951,35 @@ for num_tokens in token_candidates:
             log(f"  SKIP {tag}: {e}")
             continue
 
-        tag_resolved = f"bt={bc_resolved.bt},bf={bc_resolved.bf},btc={bc_resolved.btc},bts={bc_resolved.bts}"
-        resolved_key = (bc_resolved.bt, bc_resolved.bf, bc_resolved.btc, bc_resolved.bts)
+        tag_resolved = (
+            f"bt={bc_resolved.bt},bf={bc_resolved.bf},"
+            f"btc={bc_resolved.btc},bts={bc_resolved.bts},"
+            f"xprefetch={xprefetch_mode},w2p={next_w2_priority},"
+            f"w2order={w2_fetch_order},w2fp={w2_fetch_priority},"
+            f"skip_pg_sync={int(skip_post_gather_sync)},"
+            f"direct_f1={int(direct_ffn1)},direct_f2={int(direct_ffn2)},"
+            f"cast_f1={int(cast_ffn1_input_fp8)},cast_f2={int(cast_ffn2_input_fp8)},"
+            f"ffn1dq={ffn1_mode_tag},ffn1chunk={ffn1_dequant_chunk},"
+            f"skip_ibt={int(skip_inter_bt_sync)},"
+            f"ilv_bt={int(interleave_bt)}"
+        )
+        resolved_key = (
+            bc_resolved.bt,
+            bc_resolved.bf,
+            bc_resolved.btc,
+            bc_resolved.bts,
+            xprefetch_mode,
+            next_w2_priority,
+            direct_ffn1,
+            direct_ffn2,
+            ffn1_dequant_mode,
+            ffn1_dequant_chunk,
+            w2_fetch_order,
+            w2_fetch_priority,
+            skip_post_gather_sync,
+            skip_inter_bt_sync,
+            interleave_bt,
+        )
         if resolved_key in seen_resolved_configs:
             log(f"  SKIP duplicate resolved config {tag} -> {tag_resolved}")
             continue
@@ -401,13 +993,46 @@ for num_tokens in token_candidates:
                 quant_block_k=qbk_arg,
                 w1_scale=w1_scale_s, w2_scale=w2_scale_s, w3_scale=w3_scale_s,
                 disable_a2a=disable_a2a,
+                disable_a2a_scatter=disable_a2a_scatter,
+                disable_a2a_scatter_local_copy=disable_a2a_scatter_local_copy,
+                disable_a2a_scatter_remote_copy=disable_a2a_scatter_remote_copy,
+                disable_a2a_scatter_recv_wait=disable_a2a_scatter_recv_wait,
+                disable_a2a_scatter_send_wait=disable_a2a_scatter_send_wait,
+                disable_a2a_gather=disable_a2a_gather,
+                disable_a2a_gather_local_copy=disable_a2a_gather_local_copy,
+                disable_a2a_gather_remote_copy=disable_a2a_gather_remote_copy,
                 disable_sync_barrier=disable_sync_barrier,
                 disable_weight_load=disable_weight_load,
+                disable_w1_load=disable_w1_load,
+                disable_w3_load=disable_w3_load,
+                disable_w2_load=disable_w2_load,
+                disable_expert_x_load=disable_expert_x_load,
+                disable_expert_ffn=disable_expert_ffn,
                 disable_dynamic_ffn1=disable_dynamic_ffn1,
                 disable_dynamic_ffn2=disable_dynamic_ffn2,
+                disable_expert_store=disable_expert_store,
+                disable_expert_stage_writeback=disable_expert_stage_writeback,
+                disable_expert_store_dma=disable_expert_store_dma,
+                disable_expert_store_wait=disable_expert_store_wait,
                 disable_acc_and_store=disable_acc_and_store,
-                decode_mode=decode_mode,
+                disable_acc_load=disable_acc_load,
+                disable_acc_compute=disable_acc_compute,
+                disable_acc_store_vmem=disable_acc_store_vmem,
+                disable_output_store=disable_output_store,
                 direct_scaled_dot=direct_scaled_dot,
+                direct_scaled_dot_ffn1=direct_ffn1,
+                direct_scaled_dot_ffn2=direct_ffn2,
+                ffn1_dequant_mode=ffn1_dequant_mode,
+                ffn1_dequant_chunk=ffn1_dequant_chunk,
+                cast_ffn1_input_fp8=cast_ffn1_input_fp8,
+                cast_ffn2_input_fp8=cast_ffn2_input_fp8,
+                cross_expert_prefetch_mode=xprefetch_mode,
+                next_w2_prologue_priority=next_w2_priority,
+                w2_fetch_order=w2_fetch_order,
+                w2_fetch_priority=w2_fetch_priority,
+                skip_post_gather_sync=skip_post_gather_sync,
+                skip_inter_bt_sync=skip_inter_bt_sync,
+                interleave_bt=interleave_bt,
                 enable_bt_scatter_overlap=enable_bt_scatter_overlap,
                 use_jax_allreduce_metadata=not inkernel_metadata,
             )
@@ -480,6 +1105,17 @@ if check_correctness:
             quant_block_k=qbk_arg,
             w1_scale=w1_scale_s, w2_scale=w2_scale_s, w3_scale=w3_scale_s,
             direct_scaled_dot=direct_scaled_dot,
+            direct_scaled_dot_ffn1=direct_scaled_dot_ffn1_modes[0],
+            direct_scaled_dot_ffn2=direct_scaled_dot_ffn2_modes[0],
+            ffn1_dequant_mode=ffn1_dequant_modes[0],
+            ffn1_dequant_chunk=ffn1_dequant_chunks[0],
+            cast_ffn1_input_fp8=cast_ffn1_input_fp8,
+            cast_ffn2_input_fp8=cast_ffn2_input_fp8,
+            w2_fetch_order=w2_fetch_orders[0],
+            w2_fetch_priority=w2_fetch_priorities[0],
+            skip_post_gather_sync=skip_post_gather_sync_modes[0],
+            skip_inter_bt_sync=skip_inter_bt_sync_modes[0],
+            interleave_bt=interleave_bt_modes[0],
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
             use_jax_allreduce_metadata=not inkernel_metadata,
         )
