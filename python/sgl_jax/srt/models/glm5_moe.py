@@ -977,7 +977,9 @@ class GlmMoeDsaForCausalLM(Glm5ForCausalLM):
         # `self_attn.indexers_proj`); translate to sglang-jax module paths so
         # quantize_model leaves the unquantized indexer head-gate as LinearBase.
         if mc.quantization_config is not None and mc.quantization_config.is_static_checkpoint:
-            mc.quantization_config.ignored_layers = ["indexer.weights_proj"]
+            mc.quantization_config.ignored_layers = list(
+                mc.quantization_config.ignored_layers or []
+            ) + ["indexer.weights_proj"]
             # indexer.wk has out_dim=128 == block_size_out (single N-block); the
             # narrow-N guard would reject it but the indexer output is currently
             # discarded so accuracy is unaffected. Match deepseek_v3 config.
