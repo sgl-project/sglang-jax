@@ -733,42 +733,8 @@ def generate_tune_candidates(
                         continue
                     configs.append(bc)
 
-    if len(configs) <= max_configs:
-        log(f"  tune: {len(configs)} configs (all pass VMEM filter)")
-        return configs
-
-    buckets = {}
-    for cfg in configs:
-        bk = (cfg.bt, cfg.bts or cfg.bt)
-        buckets.setdefault(bk, []).append(cfg)
-    for bk in buckets:
-        buckets[bk].sort(key=lambda c: (c.bf, c.btc), reverse=True)
-
-    selected = []
-    selected_keys = set()
-    bucket_keys = sorted(buckets.keys(), reverse=True)
-    while len(selected) < max_configs:
-        made_progress = False
-        for bk in bucket_keys:
-            bucket = buckets[bk]
-            if not bucket:
-                continue
-            cfg = bucket.pop(0)
-            key = (cfg.bt, cfg.bf, cfg.btc, cfg.bts)
-            if key not in selected_keys:
-                selected_keys.add(key)
-                selected.append(cfg)
-                made_progress = True
-            if len(selected) >= max_configs:
-                break
-        if not made_progress:
-            break
-
-    log(
-        f"  tune: {len(configs)} valid -> {len(selected)} selected "
-        f"(max={max_configs}, {len(bucket_keys)} bt/bts buckets)"
-    )
-    return selected
+    log(f"  tune: {len(configs)} configs (all pass VMEM filter)")
+    return configs
 
 
 if tune_mode:
