@@ -665,10 +665,7 @@ def generate_tune_candidates(
             btc_cands = _ladder_div2(bts_val)
             btc_cands = [v for v in btc_cands if v >= 8 and bts_val % v == 0]
             if not btc_cands:
-                if bts_val < 8:
-                    btc_cands = [v for v in _ladder_div2(bts_val) if bts_val % v == 0]
-                if not btc_cands:
-                    btc_cands = [bts_val]
+                continue
 
             for bf in bf_list:
                 for btc in btc_cands:
