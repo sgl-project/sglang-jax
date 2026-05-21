@@ -25,107 +25,103 @@
         "tab": "Cookbook",
         "groups": [
           {
-            "group": "Overview",
-            "icon": "house",
+            "group": "Cookbook",
+            "icon": "book",
             "pages": [
               "index",
-              "autoregressive/index",
-              "multimodal/index"
-            ]
-          },
-          {
-            "group": "Autoregressive Models",
-            "icon": "book-open",
-            "pages": [
               {
-                "group": "Qwen",
+                "group": "Autoregressive Models",
                 "pages": [
-                  "autoregressive/Qwen/Qwen",
-                  "autoregressive/Qwen/Qwen3",
-                  "autoregressive/Qwen/Qwen3-MoE"
+                  "autoregressive/index",
+                  {
+                    "group": "Qwen",
+                    "pages": [
+                      "autoregressive/Qwen/Qwen",
+                      "autoregressive/Qwen/Qwen3",
+                      "autoregressive/Qwen/Qwen3-MoE"
+                    ]
+                  },
+                  {
+                    "group": "DeepSeek",
+                    "pages": [
+                      "autoregressive/DeepSeek/DeepSeek-V2",
+                      "autoregressive/DeepSeek/DeepSeek-V3",
+                      "autoregressive/DeepSeek/DeepSeek-R1"
+                    ]
+                  },
+                  {
+                    "group": "GLM",
+                    "pages": [
+                      "autoregressive/GLM/GLM-4.5",
+                      "autoregressive/GLM/GLM-5"
+                    ]
+                  },
+                  {
+                    "group": "Google",
+                    "pages": [
+                      "autoregressive/Google/Gemma2"
+                    ]
+                  },
+                  {
+                    "group": "Grok",
+                    "pages": [
+                      "autoregressive/Grok/Grok2"
+                    ]
+                  },
+                  {
+                    "group": "InclusionAI",
+                    "pages": [
+                      "autoregressive/InclusionAI/Ling-1.x",
+                      "autoregressive/InclusionAI/Ling-2",
+                      "autoregressive/InclusionAI/Ring-2",
+                      "autoregressive/InclusionAI/Ling-2.6"
+                    ]
+                  },
+                  {
+                    "group": "Llama",
+                    "pages": [
+                      "autoregressive/Llama/Llama3.1",
+                      "autoregressive/Llama/Llama3.3-70B"
+                    ]
+                  },
+                  {
+                    "group": "Moonshotai",
+                    "pages": [
+                      "autoregressive/Moonshotai/Kimi-Linear"
+                    ]
+                  },
+                  {
+                    "group": "Xiaomi",
+                    "pages": [
+                      "autoregressive/Xiaomi/MiMo-V2-Flash",
+                      "autoregressive/Xiaomi/MiMo-V2.5-Pro",
+                      "autoregressive/Xiaomi/MiMo-7B"
+                    ]
+                  }
                 ]
               },
               {
-                "group": "DeepSeek",
+                "group": "Multimodal Models",
                 "pages": [
-                  "autoregressive/DeepSeek/DeepSeek-V2",
-                  "autoregressive/DeepSeek/DeepSeek-V3",
-                  "autoregressive/DeepSeek/DeepSeek-R1"
+                  "multimodal/index"
                 ]
               },
               {
-                "group": "GLM",
+                "group": "Shared References",
                 "pages": [
-                  "autoregressive/GLM/GLM-4.5",
-                  "autoregressive/GLM/GLM-5"
+                  "base/tpu-topology-reference",
+                  "base/launch-flags-reference"
                 ]
               },
               {
-                "group": "Google",
+                "group": "Deployment Templates",
                 "pages": [
-                  "autoregressive/Google/Gemma2"
+                  "deployment/index",
+                  "deployment/single-host-docker",
+                  "deployment/gke-indexed-job",
+                  "deployment/skypilot"
                 ]
               },
-              {
-                "group": "Grok",
-                "pages": [
-                  "autoregressive/Grok/Grok2"
-                ]
-              },
-              {
-                "group": "InclusionAI",
-                "pages": [
-                  "autoregressive/InclusionAI/Ling-1.x",
-                  "autoregressive/InclusionAI/Ling-2",
-                  "autoregressive/InclusionAI/Ring-2",
-                  "autoregressive/InclusionAI/Ling-2.6"
-                ]
-              },
-              {
-                "group": "Llama",
-                "pages": [
-                  "autoregressive/Llama/Llama3.1",
-                  "autoregressive/Llama/Llama3.3-70B"
-                ]
-              },
-              {
-                "group": "Moonshotai",
-                "pages": [
-                  "autoregressive/Moonshotai/Kimi-Linear"
-                ]
-              },
-              {
-                "group": "Xiaomi",
-                "pages": [
-                  "autoregressive/Xiaomi/MiMo-V2-Flash",
-                  "autoregressive/Xiaomi/MiMo-V2.5-Pro",
-                  "autoregressive/Xiaomi/MiMo-7B"
-                ]
-              }
-            ]
-          },
-          {
-            "group": "Shared References",
-            "icon": "gears",
-            "pages": [
-              "base/tpu-topology-reference",
-              "base/launch-flags-reference"
-            ]
-          },
-          {
-            "group": "Deployment Templates",
-            "icon": "rocket",
-            "pages": [
-              "deployment/index",
-              "deployment/single-host-docker",
-              "deployment/gke-indexed-job",
-              "deployment/skypilot"
-            ]
-          },
-          {
-            "group": "Troubleshooting",
-            "icon": "triangle-exclamation",
-            "pages": [
               "troubleshooting"
             ]
           }
