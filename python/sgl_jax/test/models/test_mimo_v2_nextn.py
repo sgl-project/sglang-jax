@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 # Ground truth: keys from XiaomiMiMo/MiMo-V2.5-Pro model_mtp.safetensors header
 # (16 tensors per layer × 3 layers = 48). Derived from the live HF header.
 _PER_LAYER_KEYS = [

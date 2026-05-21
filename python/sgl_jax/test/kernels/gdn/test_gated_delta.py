@@ -20,6 +20,7 @@ os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from sgl_jax.srt.kernels.gdn import (
     decode_gated_delta_rule_ref,
@@ -28,6 +29,8 @@ from sgl_jax.srt.kernels.gdn import (
     ragged_gated_delta_rule_ref,
 )
 from sgl_jax.srt.kernels.gdn.gated_delta import _gated_delta_step, _l2norm
+
+pytestmark = pytest.mark.cpu_only
 
 
 class L2NormTest(unittest.TestCase):

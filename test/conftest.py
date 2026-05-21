@@ -1,3 +1,5 @@
+import warnings
+
 import pytest
 
 
@@ -20,3 +22,10 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.skip(reason="tpu_only: no TPU available"))
         if "cpu_only" in item.keywords and HAS_ACCELERATOR:
             item.add_marker(pytest.mark.skip(reason="cpu_only: running on accelerator"))
+
+        has_hw_marker = "cpu_only" in item.keywords or "tpu_only" in item.keywords
+        if not has_hw_marker:
+            warnings.warn(
+                f"{item.nodeid}: missing cpu_only/tpu_only marker",
+                stacklevel=1,
+            )

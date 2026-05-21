@@ -11,6 +11,7 @@ import unittest
 
 import jax
 import numpy as np
+import pytest
 from jax.sharding import Mesh
 
 from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
@@ -22,6 +23,8 @@ from sgl_jax.srt.mem_cache.memory_pool import (
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.test.test_utils import CustomTestCase
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestSWARadixCache(CustomTestCase):

@@ -8,9 +8,12 @@ if os.environ.get("USE_DEVICE_TYPE") == "cpu":
     os.environ["JAX_PLATFORMS"] = "cpu"
 
 import numpy as np
+import pytest
 
 from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sgl_jax.test.test_utils import CustomTestCase
+
+pytestmark = pytest.mark.cpu_only
 
 
 class FakeRecurrentStatePool:

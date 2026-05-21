@@ -24,3 +24,4 @@ jobs:
         run: |
           source .venv/bin/activate
           python scripts/ci/tests/test_ci_scripts.py -v
+          python scripts/ci/tests/test_markers.py -v

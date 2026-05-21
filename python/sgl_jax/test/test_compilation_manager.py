@@ -1,9 +1,13 @@
 import unittest
 from unittest.mock import MagicMock
 
+import pytest
+
 from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.utils.common_utils import pad_to_bucket
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _make_server_args(**overrides):

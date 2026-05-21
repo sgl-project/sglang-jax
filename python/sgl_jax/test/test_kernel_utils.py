@@ -1,7 +1,11 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from sgl_jax.srt.kernels.ragged_paged_attention.util import get_tpu_version
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestKernelUtils(unittest.TestCase):

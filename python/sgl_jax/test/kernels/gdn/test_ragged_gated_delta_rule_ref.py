@@ -23,8 +23,11 @@ os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from sgl_jax.srt.kernels.gdn import ragged_gated_delta_rule_ref
+
+pytestmark = pytest.mark.cpu_only
 
 # ---------------------------------------------------------------------------
 # Helpers: a straight-Python reference for one request and a small fixture.

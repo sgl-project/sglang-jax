@@ -1,10 +1,13 @@
 """SpecInput protocol conformance for EagleDraftInput / EagleVerifyInput."""
 
 import numpy as np
+import pytest
 
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
 from sgl_jax.srt.speculative.spec_info import SpecInput
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_eagle_draft_input_is_spec_input():
