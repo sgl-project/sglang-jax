@@ -17,7 +17,7 @@ description: "InclusionAI Ring 2.0 reasoning-tuned MoE family (mini / flash / 1T
 - [**inclusionAI/Ring-flash-2.0**](https://huggingface.co/inclusionAI/Ring-flash-2.0) — 100B / 6.1B; high-throughput reasoning derived from Ling-flash-2.0-base.
 - [**inclusionAI/Ring-1T-preview**](https://huggingface.co/inclusionAI/Ring-1T-preview) — 1T total parameters; flagship reasoning preview, RLVR-trained on 20T tokens.
 
-For the non-reasoning Ling 2.0 base family see [`Ling-2.mdx`](Ling-2.mdx). For the Ling 1.x first-generation family see [`Ling-1.x.mdx`](Ling-1.x.mdx). For the linear-attention 2.6 generation (both Ling and Ring linear variants) see [`Ling-2.6.mdx`](Ling-2.6.mdx).
+For the non-reasoning Ling 2.0 base family see [`Ling-2.md`](Ling-2.md). For the Ling 1.x first-generation family see [`Ling-1.x.md`](Ling-1.x.md). For the linear-attention 2.6 generation (both Ling and Ring linear variants) see [`Ling-2.6.md`](Ling-2.6.md).
 
 **Recommended Generation Parameters** (reasoning workloads): `temperature=0.6`, `top_p=0.95`, `max_tokens=4096+`. Give the model room to think — Ring's value is in the chain-of-thought.
 
@@ -34,11 +34,11 @@ For the non-reasoning Ling 2.0 base family see [`Ling-2.mdx`](Ling-2.mdx). For t
 | Ring-1T-preview (1T)         | v6e-64 | 8x8 | 16 | 64 | 64 | 64 | BF16 ~2 TB — multi-host mandatory |
 | Ring-1T-preview (1T)         | v7x-16 | 4x4 | 4  | 16 | 32 | 32 | v7x exposes 2 JAX devices per chip → `--tp-size 32` |
 
-See [`../../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx) for the TPU generation reference.
+See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.mdx`](../../../get_started/install.md). For Ring-mini-2.0 single-host use [`../../deployment/single-host-docker.mdx`](../../deployment/single-host-docker.mdx); for Ring-flash-2.0 / Ring-1T-preview multi-host use [`../../deployment/gke-indexed-job.mdx`](../../deployment/gke-indexed-job.mdx) or [`../../deployment/skypilot.mdx`](../../deployment/skypilot.mdx). The required JAX TPU container image:
+Install per [`../../../get_started/install.md`](../../../get_started/install.md). For Ring-mini-2.0 single-host use [`../../deployment/single-host-docker.md`](../../deployment/single-host-docker.md); for Ring-flash-2.0 / Ring-1T-preview multi-host use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) or [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -107,13 +107,13 @@ Swap the topology to `tpu-v6e-64`, the model path to `inclusionAI/Ring-1T-previe
   --nnodes 16 --node-rank \${SKYPILOT_NODE_RANK} \
 ```
 
-For GKE, adapt the manifest pattern from [`../Xiaomi/MiMo-V2.5-Pro.mdx` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.mdx#23-launch) with `<JOB>=ring-2-0`, `<ACCELERATOR>=tpu-v6e-slice` (or `tpu7x` for v7x), the corresponding topology, and the launch flags above.
+For GKE, adapt the manifest pattern from [`../Xiaomi/MiMo-V2.5-Pro.md` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.md#23-launch) with `<JOB>=ring-2-0`, `<ACCELERATOR>=tpu-v6e-slice` (or `tpu7x` for v7x), the corresponding topology, and the launch flags above.
 
 ### 2.4 Configuration Tips
 
 **Reasoning Parser:**
 - Ring 2.0 is reasoning-tuned and emits `<think>` blocks. Launch with `--reasoning-parser <key>` so the API splits `reasoning_content` from `content` — see the §2.3 note for picking the right key.
-- The streaming Python client pattern from [`../Qwen/Qwen3.mdx` §3.2](../Qwen/Qwen3.mdx#32-reasoning-thinking-on-default-thinking-off-optional) applies directly once the parser is set.
+- The streaming Python client pattern from [`../Qwen/Qwen3.md` §3.2](../Qwen/Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) applies directly once the parser is set.
 
 **MoE Backend:**
 - `--moe-backend epmoe` for `--ep-size ≤ 8` (Ring-mini-2.0).
@@ -133,19 +133,19 @@ For GKE, adapt the manifest pattern from [`../Xiaomi/MiMo-V2.5-Pro.mdx` §2.3 Mu
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 - On multi-node clusters, mount a shared PVC across nodes to amortize compilation.
 
-For full flag definitions see [`../../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx).
+For full flag definitions see [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`../Qwen/Qwen3.mdx` §3.1](../Qwen/Qwen3.mdx#31-basic-chat-completion). Substitute `model="inclusionAI/Ring-mini-2.0"` (or your chosen variant).
+Standard OpenAI-compatible request — see [`../Qwen/Qwen3.md` §3.1](../Qwen/Qwen3.md#31-basic-chat-completion). Substitute `model="inclusionAI/Ring-mini-2.0"` (or your chosen variant).
 
 ### 3.2 Reasoning (thinking-on streaming)
 
-Once you launch with `--reasoning-parser <key>` (see §2.3), use the streaming Python client from [`../Qwen/Qwen3.mdx` §3.2](../Qwen/Qwen3.mdx#32-reasoning-thinking-on-default-thinking-off-optional) to separate `reasoning_content` from `content`. The pattern applies directly — only the model path changes.
+Once you launch with `--reasoning-parser <key>` (see §2.3), use the streaming Python client from [`../Qwen/Qwen3.md` §3.2](../Qwen/Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) to separate `reasoning_content` from `content`. The pattern applies directly — only the model path changes.
 
-> Ring 2.0 does not ship with a native tool-call format. For tool-call workloads see [`../Qwen/Qwen3.mdx` §3.3](../Qwen/Qwen3.mdx#33-tool-calling) or [`../Xiaomi/MiMo-V2.5-Pro.mdx` §3.3](../Xiaomi/MiMo-V2.5-Pro.mdx#33-tool-calling).
+> Ring 2.0 does not ship with a native tool-call format. For tool-call workloads see [`../Qwen/Qwen3.md` §3.3](../Qwen/Qwen3.md#33-tool-calling) or [`../Xiaomi/MiMo-V2.5-Pro.md` §3.3](../Xiaomi/MiMo-V2.5-Pro.md#33-tool-calling).
 
 ## 4. Benchmark
 
@@ -185,7 +185,7 @@ Recommended primary datasets: **AIME 2025**, **GPQA Diamond**, **LiveCodeBench**
 
 ### 4.2 Speed
 
-**Benchmark Command** — adapt the driver from [`../Qwen/Qwen3.mdx` §4.2](../Qwen/Qwen3.mdx#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Ring checkpoint, raise `--random-output` to 2048+ to reflect reasoning token budgets, remove the vLLM half).
+**Benchmark Command** — adapt the driver from [`../Qwen/Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Ring checkpoint, raise `--random-output` to 2048+ to reflect reasoning token budgets, remove the vLLM half).
 
 **Test Results** — _Pending._
 
@@ -204,8 +204,8 @@ Recommended primary datasets: **AIME 2025**, **GPQA Diamond**, **LiveCodeBench**
 
 - [InclusionAI HF collection](https://huggingface.co/inclusionAI)
 - [Ring-V2 GitHub repo](https://github.com/inclusionAI/Ring-V2)
-- [`Ling-2.mdx`](Ling-2.mdx) — non-reasoning Ling 2.0 base family (same architecture).
-- [`Ling-1.x.mdx`](Ling-1.x.mdx) — first-generation Ling.
-- [`Ling-2.6.mdx`](Ling-2.6.mdx) — Ling 2.6 (linear / delta attention; the linear-attention Ring variants share the same runtime path).
-- [`../../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx)
-- [`../../troubleshooting.mdx`](../../troubleshooting.mdx) — cross-recipe generic issues.
+- [`Ling-2.md`](Ling-2.md) — non-reasoning Ling 2.0 base family (same architecture).
+- [`Ling-1.x.md`](Ling-1.x.md) — first-generation Ling.
+- [`Ling-2.6.md`](Ling-2.6.md) — Ling 2.6 (linear / delta attention; the linear-attention Ring variants share the same runtime path).
+- [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
+- [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

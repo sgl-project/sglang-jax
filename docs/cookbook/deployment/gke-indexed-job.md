@@ -5,7 +5,7 @@ description: "Generic launcher template for multi-node TPU serving via GKE Index
 
 # GKE Indexed Job Launcher
 
-Generic GKE template for launching a multi-host TPU slice serving SGL-JAX. The pattern (Indexed Job + headless Service) is what [MiMo-V2.5-Pro §4.4](../autoregressive/Xiaomi/MiMo-V2.5-Pro.mdx#44-gke-indexed-job--headless-service) uses end-to-end — this page distills the reusable parts so other recipes can reference it instead of pasting a full manifest.
+Generic GKE template for launching a multi-host TPU slice serving SGL-JAX. The pattern (Indexed Job + headless Service) is what [MiMo-V2.5-Pro §4.4](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md#44-gke-indexed-job--headless-service) uses end-to-end — this page distills the reusable parts so other recipes can reference it instead of pasting a full manifest.
 
 ## Why Indexed Job + headless Service
 
@@ -146,6 +146,6 @@ The server is ready once `<JOB>-0` logs `Uvicorn running on http://0.0.0.0:<HTTP
 
 ## Related
 
-- [MiMo-V2.5-Pro §4.4](../autoregressive/Xiaomi/MiMo-V2.5-Pro.mdx#44-gke-indexed-job--headless-service) — a fully filled-in instance of this template.
-- [`single-host-docker.mdx`](single-host-docker.mdx) — when you only need one node.
-- [`skypilot.mdx`](skypilot.mdx) — SkyPilot alternative (v6e-only today).
+- [MiMo-V2.5-Pro §4.4](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md#44-gke-indexed-job--headless-service) — a fully filled-in instance of this template.
+- [`single-host-docker.md`](single-host-docker.md) — when you only need one node.
+- [`skypilot.md`](skypilot.md) — SkyPilot alternative (v6e-only today).

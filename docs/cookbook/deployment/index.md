@@ -9,9 +9,9 @@ Launcher / orchestrator templates referenced by cookbook recipes. Each recipe pi
 
 | Template | When to use |
 |---|---|
-| [`single-host-docker.mdx`](single-host-docker.mdx) | One TPU host (v6e-4, v6e-8, v7x-8). Lowest-friction starting point. |
-| [`gke-indexed-job.mdx`](gke-indexed-job.mdx) | Multi-host TPU slice on GKE. Stable pod DNS via Indexed Job + headless Service. |
-| [`skypilot.mdx`](skypilot.mdx) | Multi-host TPU slice via SkyPilot. v6e-only today (template hardcodes `v2-alpha-tpuv6e`). |
+| [`single-host-docker.md`](single-host-docker.md) | One TPU host (v6e-4, v6e-8, v7x-8). Lowest-friction starting point. |
+| [`gke-indexed-job.md`](gke-indexed-job.md) | Multi-host TPU slice on GKE. Stable pod DNS via Indexed Job + headless Service. |
+| [`skypilot.md`](skypilot.md) | Multi-host TPU slice via SkyPilot. v6e-only today (template hardcodes `v2-alpha-tpuv6e`). |
 
 ## Common conventions across all three
 
@@ -23,4 +23,4 @@ Launcher / orchestrator templates referenced by cookbook recipes. Each recipe pi
 
 ## Picking flags
 
-For TP/EP/page-size/SWA-ratio choices, see the per-recipe Key Flags table. For the full flag inventory: [`../base/launch-flags-reference.mdx`](../base/launch-flags-reference.mdx). For TPU generation specs: [`../base/tpu-topology-reference.mdx`](../base/tpu-topology-reference.mdx).
+For TP/EP/page-size/SWA-ratio choices, see the per-recipe Key Flags table. For the full flag inventory: [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md). For TPU generation specs: [`../base/tpu-topology-reference.md`](../base/tpu-topology-reference.md).

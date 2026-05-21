@@ -17,7 +17,7 @@ description: "Llama 3.1 8B Instruct (plus Phi-3 / InternLM3 aliases) serving on 
 - [**microsoft/Phi-3.5-mini-instruct**](https://huggingface.co/microsoft/Phi-3.5-mini-instruct) — 3.8B Phi-3.5 variant; runs on the same Llama path.
 - [**internlm/internlm3-8b-instruct**](https://huggingface.co/internlm/internlm3-8b-instruct) — 8B InternLM3 variant; runs on the same Llama path.
 
-For the 70B size (multi-host required) see [`Llama3.3-70B.mdx`](Llama3.3-70B.mdx). For Llama 4 see the upstream sgl-cookbook (`Llama/Llama4.mdx`).
+For the 70B size (multi-host required) see [`Llama3.3-70B.md`](Llama3.3-70B.md). For Llama 4 see the upstream sgl-cookbook (`Llama/Llama4.md`).
 
 **Recommended Generation Parameters**: `temperature=0.6`, `top_p=0.9`, `max_tokens=1024` (Llama 3 Instruct defaults).
 
@@ -31,11 +31,11 @@ For the 70B size (multi-host required) see [`Llama3.3-70B.mdx`](Llama3.3-70B.mdx
 |---|---|---|---|---|---|
 | Llama 3.1 8B / Phi-3.5 / InternLM3-8B | v6e-4 | 2x2 | 4 | 4 | BF16 ~16 GB — fits with headroom |
 
-See [`../../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx) for the TPU generation reference.
+See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.mdx`](../../../get_started/install.md) and use [`../../deployment/single-host-docker.mdx`](../../deployment/single-host-docker.mdx) for the container setup. The required JAX TPU container image:
+Install per [`../../../get_started/install.md`](../../../get_started/install.md) and use [`../../deployment/single-host-docker.md`](../../deployment/single-host-docker.md) for the container setup. The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -68,15 +68,15 @@ Swap `--model-path` to `microsoft/Phi-3.5-mini-instruct` or `internlm/internlm3-
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
 
-For full flag definitions see [`../../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx).
+For full flag definitions see [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`Qwen3.mdx` §3.1](../Qwen/Qwen3.mdx#31-basic-chat-completion) for the curl / Python pattern. Substitute `model="meta-llama/Llama-3.1-8B-Instruct"` (or your chosen variant).
+Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#31-basic-chat-completion) for the curl / Python pattern. Substitute `model="meta-llama/Llama-3.1-8B-Instruct"` (or your chosen variant).
 
-> Llama 3 Instruct does not ship with native hybrid reasoning or a built-in tool-call format. For reasoning / tool-call workloads use a model with `--reasoning-parser` / `--tool-call-parser` support (see [`Qwen3.mdx` §3.2 / §3.3](../Qwen/Qwen3.mdx) or [`MiMo-V2.5-Pro.mdx`](../Xiaomi/MiMo-V2.5-Pro.mdx)).
+> Llama 3 Instruct does not ship with native hybrid reasoning or a built-in tool-call format. For reasoning / tool-call workloads use a model with `--reasoning-parser` / `--tool-call-parser` support (see [`Qwen3.md` §3.2 / §3.3](../Qwen/Qwen3.md) or [`MiMo-V2.5-Pro.md`](../Xiaomi/MiMo-V2.5-Pro.md)).
 
 ## 4. Benchmark
 
@@ -113,7 +113,7 @@ Recommended additional datasets: MMLU, HumanEval, IFEval.
 
 ### 4.2 Speed
 
-**Benchmark Command** — adapt the driver from [`Qwen3.mdx` §4.2](../Qwen/Qwen3.mdx#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Llama checkpoint).
+**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Llama checkpoint).
 
 **Test Results** — _Pending._
 
@@ -130,6 +130,6 @@ Recommended additional datasets: MMLU, HumanEval, IFEval.
 - [Llama model collection](https://huggingface.co/meta-llama)
 - [Phi-3 model card](https://huggingface.co/microsoft/Phi-3.5-mini-instruct)
 - [InternLM3 model card](https://huggingface.co/internlm/internlm3-8b-instruct)
-- [`Llama3.3-70B.mdx`](Llama3.3-70B.mdx) — 70B multi-host sibling.
-- [`../../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx)
-- [`../../troubleshooting.mdx`](../../troubleshooting.mdx) — cross-recipe generic issues.
+- [`Llama3.3-70B.md`](Llama3.3-70B.md) — 70B multi-host sibling.
+- [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
+- [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

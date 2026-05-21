@@ -33,7 +33,7 @@ grep -n 'add_argument' python/sgl_jax/srt/server_args.py
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--tensor-parallel-size` / `--tp-size` | `1` | Total JAX devices across all nodes. See [`tpu-topology-reference.mdx`](tpu-topology-reference.mdx) for the v7x 2-devices-per-chip rule. |
+| `--tensor-parallel-size` / `--tp-size` | `1` | Total JAX devices across all nodes. See [`tpu-topology-reference.md`](tpu-topology-reference.md) for the v7x 2-devices-per-chip rule. |
 | `--data-parallel-size` / `--dp-size` | `1` | DP factor for the **attention** path only. Attention TP becomes `tp_size / dp_size`. MoE layers still run with full `ep_size`. |
 | `--ep-size` | `1` | Expert parallelism. Typically `--ep-size == --tp-size` for MoE models. |
 
@@ -62,7 +62,7 @@ grep -n 'add_argument' python/sgl_jax/srt/server_args.py
 | Flag | Default | Choices | Notes |
 |---|---|---|---|
 | `--attention-backend` | `fa` | `native` / `fa` / `fa_mha` | `fa` = FlashAttention on Pallas (MHA / MLA). `fa_mha` forces MHA path for MLA models. |
-| `--moe-backend` | `epmoe` | `epmoe` / `fused` / `auto` | Scale-dependent. At EP≤8 (single host v7x-8) `epmoe` wins on MiMo-V2-Flash; at EP≥16 (multi-node) `fused` wins. See [MiMo-V2-Flash recipe](../autoregressive/Xiaomi/MiMo-V2-Flash.mdx) for measured numbers. |
+| `--moe-backend` | `epmoe` | `epmoe` / `fused` / `auto` | Scale-dependent. At EP≤8 (single host v7x-8) `epmoe` wins on MiMo-V2-Flash; at EP≥16 (multi-node) `fused` wins. See [MiMo-V2-Flash recipe](../autoregressive/Xiaomi/MiMo-V2-Flash.md) for measured numbers. |
 
 ## 6. Networking & multi-node
 
@@ -94,14 +94,14 @@ grep -n 'add_argument' python/sgl_jax/srt/server_args.py
 
 | Parser | Cookbook recipes |
 |---|---|
-| `mimo` (reasoning + tool) | [`mimo-v2.5-pro.mdx`](../autoregressive/Xiaomi/MiMo-V2.5-Pro.mdx) · [`mimo-v2-flash.mdx`](../autoregressive/Xiaomi/MiMo-V2-Flash.mdx) · [`mimo-7b.mdx`](../autoregressive/Xiaomi/MiMo-7B.mdx) |
-| `deepseek-r1` (reasoning) | [`deepseek-v3.mdx`](../autoregressive/DeepSeek/DeepSeek-V3.mdx) (R1 / V3.2-Speciale) |
-| `glm45` (reasoning + tool) | [`glm4-moe.mdx`](../autoregressive/GLM/GLM-4.5.mdx) (GLM-4.5 / 4.6) |
-| `glm47` (tool) | [`glm5-moe.mdx`](../autoregressive/GLM/GLM-5.mdx) (GLM-5 family) |
+| `mimo` (reasoning + tool) | [`mimo-v2.5-pro.md`](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md) · [`mimo-v2-flash.md`](../autoregressive/Xiaomi/MiMo-V2-Flash.md) · [`mimo-7b.md`](../autoregressive/Xiaomi/MiMo-7B.md) |
+| `deepseek-r1` (reasoning) | [`deepseek-v3.md`](../autoregressive/DeepSeek/DeepSeek-V3.md) (R1 / V3.2-Speciale) |
+| `glm45` (reasoning + tool) | [`glm4-moe.md`](../autoregressive/GLM/GLM-4.5.md) (GLM-4.5 / 4.6) |
+| `glm47` (tool) | [`glm5-moe.md`](../autoregressive/GLM/GLM-5.md) (GLM-5 family) |
 | `qwen3` (reasoning), `qwen25` / `qwen3_coder` (tool) | _no Qwen recipe currently sets these — pick by model card on a per-checkpoint basis_ |
 | `kimi` (reasoning) | _no Kimi recipe currently sets this_ |
 
-For complete request/response examples see [`mimo-v2.5-pro.mdx` §5.2](../autoregressive/Xiaomi/MiMo-V2.5-Pro.mdx#52-reasoning-thinking-enabled) (reasoning streaming) and [§5.3](../autoregressive/Xiaomi/MiMo-V2.5-Pro.mdx#53-tool-calling) (tool calling).
+For complete request/response examples see [`mimo-v2.5-pro.md` §5.2](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md#52-reasoning-thinking-enabled) (reasoning streaming) and [§5.3](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md#53-tool-calling) (tool calling).
 
 ## 9. Compilation cache (environment, not a flag)
 

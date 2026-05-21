@@ -7,7 +7,7 @@ description: "Qwen3-8B and Qwen3-32B hybrid-reasoning dense decoders serving on 
 
 ## 1. Model Introduction
 
-[**Qwen/Qwen3-8B**](https://huggingface.co/Qwen/Qwen3-8B) (8B) and [**Qwen/Qwen3-32B**](https://huggingface.co/Qwen/Qwen3-32B) (32B) are Alibaba's dense decoder LLMs from the Qwen3 series — strong general-purpose models with hybrid reasoning support, deployable on a single TPU v6e-4 host. SGL-JAX serves both with tensor parallelism. For the Qwen3 MoE variants (30B-A3B / 235B-A22B) see [`Qwen3-MoE.mdx`](Qwen3-MoE.mdx).
+[**Qwen/Qwen3-8B**](https://huggingface.co/Qwen/Qwen3-8B) (8B) and [**Qwen/Qwen3-32B**](https://huggingface.co/Qwen/Qwen3-32B) (32B) are Alibaba's dense decoder LLMs from the Qwen3 series — strong general-purpose models with hybrid reasoning support, deployable on a single TPU v6e-4 host. SGL-JAX serves both with tensor parallelism. For the Qwen3 MoE variants (30B-A3B / 235B-A22B) see [`Qwen3-MoE.md`](Qwen3-MoE.md).
 
 **Key Features**:
 
@@ -33,11 +33,11 @@ description: "Qwen3-8B and Qwen3-32B hybrid-reasoning dense decoders serving on 
 | Qwen3-8B | v6e-4 | 2x2 | 4 | 4 | Single host; ~16 GB BF16 weights |
 | Qwen3-32B | v6e-4 | 2x2 | 4 | 4 | Single host; ~64 GB BF16 weights — fits with `--mem-fraction-static 0.8` |
 
-Both fit on a single v6e-4 host with `bfloat16`. See [`../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx) for the TPU generation reference.
+Both fit on a single v6e-4 host with `bfloat16`. See [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../get_started/install.mdx`](../../../get_started/install.md) and use [`../deployment/single-host-docker.mdx`](../../deployment/single-host-docker.mdx) for the container setup. The required JAX TPU container image:
+Install per [`../../get_started/install.md`](../../../get_started/install.md) and use [`../deployment/single-host-docker.md`](../../deployment/single-host-docker.md) for the container setup. The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -90,7 +90,7 @@ Not needed — both 8B and 32B fit single-host on v6e-4.
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, `--chunked-prefill-size`, or `--context-length` invalidates cached entries.
 
-For full flag definitions and defaults see [`../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx).
+For full flag definitions and defaults see [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
@@ -319,11 +319,11 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 
 ## 4. Benchmark
 
-> Benchmark data below is a snapshot pinned to the `Tested build` listed in each Test Environment; not refreshed on every release. The full archived ISL × OSL × batch matrix and chart images live in [`../../performance/qwen3_benchmark.mdx`](../../../performance/qwen3_benchmark.md) as a release-notes-style report.
+> Benchmark data below is a snapshot pinned to the `Tested build` listed in each Test Environment; not refreshed on every release. The full archived ISL × OSL × batch matrix and chart images live in [`../../performance/qwen3_benchmark.md`](../../../performance/qwen3_benchmark.md) as a release-notes-style report.
 
 ### 4.1 Accuracy
 
-_Not measured in this benchmark run._ Run `evalscope` against the launched server using the four-section pattern from [`Qwen.mdx` §4.1](Qwen.mdx#41-accuracy--gsm8k) (Test Environment → Deployment Command → Benchmark Command → Test Results) if you need accuracy numbers.
+_Not measured in this benchmark run._ Run `evalscope` against the launched server using the four-section pattern from [`Qwen.md` §4.1](Qwen.md#41-accuracy--gsm8k) (Test Environment → Deployment Command → Benchmark Command → Test Results) if you need accuracy numbers.
 
 ### 4.2 Speed — SGL-JAX vs vLLM
 
@@ -422,8 +422,8 @@ SGL-JAX wins consistently on this hardware across all measured cells: ~1.5–2.2
 ## Additional Resources
 
 - [Qwen Model Cards](https://huggingface.co/Qwen)
-- [`../../performance/qwen3_benchmark.mdx`](../../../performance/qwen3_benchmark.md) — full benchmark report with charts.
-- [`Qwen.mdx`](Qwen.mdx) — first-generation Qwen-7B-Chat recipe.
-- [`Qwen3-MoE.mdx`](Qwen3-MoE.mdx) — Qwen3 MoE variants (30B-A3B / 235B-A22B).
-- [`../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx)
-- [`../troubleshooting.mdx`](../../troubleshooting.mdx) — cross-recipe generic issues.
+- [`../../performance/qwen3_benchmark.md`](../../../performance/qwen3_benchmark.md) — full benchmark report with charts.
+- [`Qwen.md`](Qwen.md) — first-generation Qwen-7B-Chat recipe.
+- [`Qwen3-MoE.md`](Qwen3-MoE.md) — Qwen3 MoE variants (30B-A3B / 235B-A22B).
+- [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
+- [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

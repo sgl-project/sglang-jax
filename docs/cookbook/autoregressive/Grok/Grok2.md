@@ -29,11 +29,11 @@ description: "xAI Grok-2 314B dense flagship serving on TPU v6e-32 with SGL-JAX 
 |---|---|---|---|---|---|---|
 | **v6e-32** (minimum, required) | 4x8 | 8 | 4 | 32 | 32 | v6e is 1:1 chip↔device; `--tp-size=32` saturates the slice |
 
-Grok-2 314B requires the full v6e-32 slice — no smaller config fits. See [`../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx) for the TPU generation reference.
+Grok-2 314B requires the full v6e-32 slice — no smaller config fits. See [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../get_started/install.mdx`](../../../get_started/install.md). For multi-node SkyPilot launches, [`../deployment/skypilot.mdx`](../../deployment/skypilot.mdx) handles cloning + `pip install` on every node automatically. The required JAX TPU container image:
+Install per [`../../get_started/install.md`](../../../get_started/install.md). For multi-node SkyPilot launches, [`../deployment/skypilot.md`](../../deployment/skypilot.md) handles cloning + `pip install` on every node automatically. The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -92,7 +92,7 @@ Add `-d` to `sky exec` to submit and detach (don't stream logs to the local term
 
 #### Multi-host (GKE) — adapt the manifest template
 
-Adapt the GKE Indexed Job manifest from [`MiMo-V2.5-Pro.mdx` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.mdx#23-launch) with these substitutions:
+Adapt the GKE Indexed Job manifest from [`MiMo-V2.5-Pro.md` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.md#23-launch) with these substitutions:
 
 - `<JOB>=grok-2`
 - `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`
@@ -119,7 +119,7 @@ Adapt the GKE Indexed Job manifest from [`MiMo-V2.5-Pro.mdx` §2.3 Multi-host](.
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 - On multi-node clusters, the cache is per-node. Mount a shared PVC if you want compilation to amortize across nodes.
 
-For full flag definitions and defaults see [`../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx).
+For full flag definitions and defaults see [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
@@ -163,7 +163,7 @@ curl -X POST http://<rank0-ip>:30000/v1/completions \
   }'
 ```
 
-> Grok-2 is a base model without hybrid reasoning or native tool-calling formats. For reasoning / tool-call workloads use a model with `--reasoning-parser` / `--tool-call-parser` support (see [`MiMo-V2.5-Pro.mdx` §3.2 / §3.3](../Xiaomi/MiMo-V2.5-Pro.mdx) or [`Qwen3.mdx` §3.2 / §3.3](../Qwen/Qwen3.mdx)).
+> Grok-2 is a base model without hybrid reasoning or native tool-calling formats. For reasoning / tool-call workloads use a model with `--reasoning-parser` / `--tool-call-parser` support (see [`MiMo-V2.5-Pro.md` §3.2 / §3.3](../Xiaomi/MiMo-V2.5-Pro.md) or [`Qwen3.md` §3.2 / §3.3](../Qwen/Qwen3.md)).
 
 ## 4. Benchmark
 
@@ -218,7 +218,7 @@ evalscope eval \
 
 **Deployment Command** — same as [§2.3 Multi-host (SkyPilot)](#multi-host-skypilot-recommended--tpu-v6e-32-8-nodes).
 
-**Benchmark Command** — adapt the driver script from [`Qwen3.mdx` §4.2](../Qwen/Qwen3.mdx#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `xai-org/grok-2`, remove the vLLM half).
+**Benchmark Command** — adapt the driver script from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `xai-org/grok-2`, remove the vLLM half).
 
 **Test Results** — _Pending. Run and PR back the full `============ Serving Benchmark Result ============` block._
 
@@ -236,7 +236,7 @@ evalscope eval \
 
 - [Grok-2 Model Card](https://huggingface.co/xai-org/grok-2)
 - [Community tokenizer](https://huggingface.co/alvarobartt/grok-2-tokenizer)
-- [`../deployment/skypilot.mdx`](../../deployment/skypilot.mdx) — generic SkyPilot launcher used here.
-- [`MiMo-V2.5-Pro.mdx`](../Xiaomi/MiMo-V2.5-Pro.mdx) — GKE Indexed Job manifest reference (adapt for Grok-2).
-- [`../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx)
-- [`../troubleshooting.mdx`](../../troubleshooting.mdx) — cross-recipe generic issues.
+- [`../deployment/skypilot.md`](../../deployment/skypilot.md) — generic SkyPilot launcher used here.
+- [`MiMo-V2.5-Pro.md`](../Xiaomi/MiMo-V2.5-Pro.md) — GKE Indexed Job manifest reference (adapt for Grok-2).
+- [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
+- [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

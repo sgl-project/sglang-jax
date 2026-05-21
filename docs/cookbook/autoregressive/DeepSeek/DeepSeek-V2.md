@@ -16,7 +16,7 @@ description: "DeepSeek V2 / V2-Lite MoE with MLA serving on TPU v6e-4 (Lite) or 
 - [**deepseek-ai/DeepSeek-V2-Lite**](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite) — 15.7B total / 2.4B activated; minimal MoE that fits single-host.
 - [**deepseek-ai/DeepSeek-V2**](https://huggingface.co/deepseek-ai/DeepSeek-V2) — 236B total / 21B activated; multi-host on v6e-32.
 
-For the 671B V3 flagship see [`DeepSeek-V3.mdx`](DeepSeek-V3.mdx). For the reasoning-tuned R1 see [`DeepSeek-R1.mdx`](DeepSeek-R1.mdx).
+For the 671B V3 flagship see [`DeepSeek-V3.md`](DeepSeek-V3.md). For the reasoning-tuned R1 see [`DeepSeek-R1.md`](DeepSeek-R1.md).
 
 **Architectural notes**:
 
@@ -36,11 +36,11 @@ For the 671B V3 flagship see [`DeepSeek-V3.mdx`](DeepSeek-V3.mdx). For the reaso
 | DeepSeek-V2-Lite | v6e-4  | 2x2 | 1 | 4  | 4  | 4  | BF16 ~32 GB — single host |
 | DeepSeek-V2      | v6e-32 | 4x8 | 8 | 32 | 32 | 32 | BF16 ~470 GB |
 
-See [`../../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx) for the TPU generation reference.
+See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.mdx`](../../../get_started/install.md). For V2-Lite single-host use [`../../deployment/single-host-docker.mdx`](../../deployment/single-host-docker.mdx); for V2 multi-host use [`../../deployment/gke-indexed-job.mdx`](../../deployment/gke-indexed-job.mdx) or [`../../deployment/skypilot.mdx`](../../deployment/skypilot.mdx). The required JAX TPU container image:
+Install per [`../../../get_started/install.md`](../../../get_started/install.md). For V2-Lite single-host use [`../../deployment/single-host-docker.md`](../../deployment/single-host-docker.md); for V2 multi-host use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) or [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -95,7 +95,7 @@ sky exec ${CLUSTER_NAME} -- "cd sglang-jax && source .venv/bin/activate && \
   --host 0.0.0.0 --port 30000"
 ```
 
-For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.mdx` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.mdx#23-launch) with `<JOB>=deepseek-v2`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8` / `completions: 8`, and the launch flags above.
+For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.md` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.md#23-launch) with `<JOB>=deepseek-v2`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8` / `completions: 8`, and the launch flags above.
 
 ### 2.4 Configuration Tips
 
@@ -118,15 +118,15 @@ For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.mdx` §2.3 Multi-host](
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 - Multi-node clusters: mount a shared PVC at the cache directory to amortize compilation.
 
-For full flag definitions see [`../../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx).
+For full flag definitions see [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`Qwen3.mdx` §3.1](../Qwen/Qwen3.mdx#31-basic-chat-completion). Substitute `model="deepseek-ai/DeepSeek-V2"` (or `DeepSeek-V2-Lite`).
+Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#31-basic-chat-completion). Substitute `model="deepseek-ai/DeepSeek-V2"` (or `DeepSeek-V2-Lite`).
 
-> DeepSeek V2 does not ship with a native tool-call format. For tool-call workloads use [`Qwen3.mdx` §3.3](../Qwen/Qwen3.mdx#33-tool-calling) or [`MiMo-V2.5-Pro.mdx` §3.3](../Xiaomi/MiMo-V2.5-Pro.mdx#33-tool-calling). For reasoning workloads use [`DeepSeek-R1.mdx`](DeepSeek-R1.mdx).
+> DeepSeek V2 does not ship with a native tool-call format. For tool-call workloads use [`Qwen3.md` §3.3](../Qwen/Qwen3.md#33-tool-calling) or [`MiMo-V2.5-Pro.md` §3.3](../Xiaomi/MiMo-V2.5-Pro.md#33-tool-calling). For reasoning workloads use [`DeepSeek-R1.md`](DeepSeek-R1.md).
 
 ## 4. Benchmark
 
@@ -164,7 +164,7 @@ Recommended additional datasets: MMLU, GPQA Diamond, HumanEval.
 
 ### 4.2 Speed
 
-**Benchmark Command** — adapt the driver from [`Qwen3.mdx` §4.2](../Qwen/Qwen3.mdx#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the DeepSeek-V2 checkpoint, remove the vLLM half).
+**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the DeepSeek-V2 checkpoint, remove the vLLM half).
 
 **Test Results** — _Pending._
 
@@ -181,7 +181,7 @@ Recommended additional datasets: MMLU, GPQA Diamond, HumanEval.
 
 - [DeepSeek-V2 model card](https://huggingface.co/deepseek-ai/DeepSeek-V2)
 - [DeepSeek-V2-Lite model card](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite)
-- [`DeepSeek-V3.mdx`](DeepSeek-V3.mdx) — 671B V3 flagship.
-- [`DeepSeek-R1.mdx`](DeepSeek-R1.mdx) — reasoning-tuned V3 derivative.
-- [`../../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx)
-- [`../../troubleshooting.mdx`](../../troubleshooting.mdx) — cross-recipe generic issues.
+- [`DeepSeek-V3.md`](DeepSeek-V3.md) — 671B V3 flagship.
+- [`DeepSeek-R1.md`](DeepSeek-R1.md) — reasoning-tuned V3 derivative.
+- [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
+- [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

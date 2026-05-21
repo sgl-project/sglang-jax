@@ -11,7 +11,7 @@ description: "Llama 3.3 70B Instruct serving on TPU v6e-32 multi-host with SGL-J
 
 [**meta-llama/Llama-3.3-70B-Instruct**](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct) is Meta's 70B dense decoder from the Llama 3.3 release — multi-host serving required at BF16.
 
-For the 8B size (single host + Phi-3 / InternLM3 alias support) see [`Llama3.1.mdx`](Llama3.1.mdx). For Llama 4 see the upstream sgl-cookbook (`Llama/Llama4.mdx`).
+For the 8B size (single host + Phi-3 / InternLM3 alias support) see [`Llama3.1.md`](Llama3.1.md). For Llama 4 see the upstream sgl-cookbook (`Llama/Llama4.md`).
 
 **Recommended Generation Parameters**: `temperature=0.6`, `top_p=0.9`, `max_tokens=1024` (Llama 3 Instruct defaults).
 
@@ -25,11 +25,11 @@ For the 8B size (single host + Phi-3 / InternLM3 alias support) see [`Llama3.1.m
 |---|---|---|---|---|---|---|
 | Llama 3.3 70B | v6e-32 | 4x8 | 8 | 32 | 32 | BF16 ~140 GB — multi-host required |
 
-See [`../../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx) for the TPU generation reference.
+See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.mdx`](../../../get_started/install.md). Multi-host required — use [`../../deployment/gke-indexed-job.mdx`](../../deployment/gke-indexed-job.mdx) or [`../../deployment/skypilot.mdx`](../../deployment/skypilot.mdx). The required JAX TPU container image:
+Install per [`../../../get_started/install.md`](../../../get_started/install.md). Multi-host required — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) or [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -68,7 +68,7 @@ sky exec ${CLUSTER_NAME} -- "cd sglang-jax && source .venv/bin/activate && \
   --host 0.0.0.0 --port 30000"
 ```
 
-For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.mdx` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.mdx#23-launch) with `<JOB>=llama-70b`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8` / `completions: 8`, and the launch flags above.
+For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.md` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.md#23-launch) with `<JOB>=llama-70b`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8` / `completions: 8`, and the launch flags above.
 
 ### 2.4 Configuration Tips
 
@@ -84,15 +84,15 @@ For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.mdx` §2.3 Multi-host](
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 - The cache is per-node; mount a shared PVC at the cache directory to amortize compilation across all 8 nodes.
 
-For full flag definitions see [`../../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx).
+For full flag definitions see [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`Qwen3.mdx` §3.1](../Qwen/Qwen3.mdx#31-basic-chat-completion). Substitute `model="meta-llama/Llama-3.3-70B-Instruct"`.
+Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#31-basic-chat-completion). Substitute `model="meta-llama/Llama-3.3-70B-Instruct"`.
 
-> Llama 3 Instruct does not ship with native hybrid reasoning or a built-in tool-call format. For reasoning / tool-call workloads use a model with `--reasoning-parser` / `--tool-call-parser` support (see [`Qwen3.mdx` §3.2 / §3.3](../Qwen/Qwen3.mdx) or [`MiMo-V2.5-Pro.mdx`](../Xiaomi/MiMo-V2.5-Pro.mdx)).
+> Llama 3 Instruct does not ship with native hybrid reasoning or a built-in tool-call format. For reasoning / tool-call workloads use a model with `--reasoning-parser` / `--tool-call-parser` support (see [`Qwen3.md` §3.2 / §3.3](../Qwen/Qwen3.md) or [`MiMo-V2.5-Pro.md`](../Xiaomi/MiMo-V2.5-Pro.md)).
 
 ## 4. Benchmark
 
@@ -129,7 +129,7 @@ Recommended additional datasets: MMLU, GPQA Diamond, IFEval.
 
 ### 4.2 Speed
 
-**Benchmark Command** — adapt the driver from [`Qwen3.mdx` §4.2](../Qwen/Qwen3.mdx#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `meta-llama/Llama-3.3-70B-Instruct`, remove the vLLM half).
+**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `meta-llama/Llama-3.3-70B-Instruct`, remove the vLLM half).
 
 **Test Results** — _Pending._
 
@@ -144,6 +144,6 @@ Recommended additional datasets: MMLU, GPQA Diamond, IFEval.
 ## Additional Resources
 
 - [Llama 3.3 70B model card](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct)
-- [`Llama3.1.mdx`](Llama3.1.mdx) — 8B single-host sibling.
-- [`../../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx)
-- [`../../troubleshooting.mdx`](../../troubleshooting.mdx) — cross-recipe generic issues.
+- [`Llama3.1.md`](Llama3.1.md) — 8B single-host sibling.
+- [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
+- [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

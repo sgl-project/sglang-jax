@@ -34,11 +34,11 @@ description: "Xiaomi MiMo-V2-Flash 309B MoE with MTP serving on TPU v7x-8 or v6e
 | **v7x-8** (minimum, dev) | 1 host × 4 chips | 4 | 1 | 4 chips → 8 JAX devices | 8 | 2 | 8 | `epmoe` | v7x exposes 2 JAX devices/chip; `--tp-size` counts devices not chips |
 | **v6e-16** (recommended, production) | 4x4 | 4 | 4 | 16 | 16 | 4 | 16 | `fused` | Multi-host required |
 
-See [`../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx) for the TPU generation / HBM / device-per-chip reference.
+See [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation / HBM / device-per-chip reference.
 
 ### 2.2 Environment
 
-Install per [`../../get_started/install.mdx`](../../../get_started/install.md) and use one of the launcher templates from [`../deployment/`](../../deployment/). The required JAX TPU container image:
+Install per [`../../get_started/install.md`](../../../get_started/install.md) and use one of the launcher templates from [`../deployment/`](../../deployment/). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -55,7 +55,7 @@ pip install evalscope==0.17.1
 
 #### Single-host (Docker) — TPU v7x-8
 
-Boot a TPU container per [`../deployment/single-host-docker.mdx`](../../deployment/single-host-docker.mdx), then:
+Boot a TPU container per [`../deployment/single-host-docker.md`](../../deployment/single-host-docker.md), then:
 
 ```bash
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
@@ -97,10 +97,10 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
 
 **Launcher** — wrap the above into either:
 
-- **GKE Indexed Job + headless Service** — adapt [`../deployment/gke-indexed-job.mdx`](../../deployment/gke-indexed-job.mdx). Differences from the template: `<JOB>=mimo-v2-flash`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `<N>=4`, `<MODEL_PATH>=XiaomiMiMo/MiMo-V2-Flash`, `<HTTP_PORT>=30000`, plus the launch flags above. `${NODE_RANK}` comes from `${JOB_COMPLETION_INDEX}`.
-- **SkyPilot** — adapt [`../deployment/skypilot.mdx`](../../deployment/skypilot.mdx) with `tpu-v6e-16`. `${NODE_RANK}` comes from `${SKYPILOT_NODE_RANK}`.
+- **GKE Indexed Job + headless Service** — adapt [`../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md). Differences from the template: `<JOB>=mimo-v2-flash`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `<N>=4`, `<MODEL_PATH>=XiaomiMiMo/MiMo-V2-Flash`, `<HTTP_PORT>=30000`, plus the launch flags above. `${NODE_RANK}` comes from `${JOB_COMPLETION_INDEX}`.
+- **SkyPilot** — adapt [`../deployment/skypilot.md`](../../deployment/skypilot.md) with `tpu-v6e-16`. `${NODE_RANK}` comes from `${SKYPILOT_NODE_RANK}`.
 
-For an end-to-end GKE manifest with the same template applied, see [`MiMo-V2.5-Pro.mdx` §2.3 Multi-host](MiMo-V2.5-Pro.mdx#23-launch) — substitute the model path and TP/DP/EP from above.
+For an end-to-end GKE manifest with the same template applied, see [`MiMo-V2.5-Pro.md` §2.3 Multi-host](MiMo-V2.5-Pro.md#23-launch) — substitute the model path and TP/DP/EP from above.
 
 ### 2.4 Configuration Tips
 
@@ -127,7 +127,7 @@ For an end-to-end GKE manifest with the same template applied, see [`MiMo-V2.5-P
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles every kernel.
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, `--chunked-prefill-size`, or `--context-length` invalidates cached entries. Use a fresh cache dir per tuning experiment to avoid stale-cache cross-pollution.
 
-For full flag definitions and defaults see [`../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx).
+For full flag definitions and defaults see [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
@@ -475,7 +475,7 @@ The fused MoE tuned-config table covers the EP=8 shapes (server logs report `Usi
 ## Additional Resources
 
 - [MiMo-V2-Flash Model Card](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash)
-- [`MiMo-V2.5-Pro.mdx`](MiMo-V2.5-Pro.mdx) — larger sibling model, same architectural family.
-- [`../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx)
-- [`../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx)
-- [`../troubleshooting.mdx`](../../troubleshooting.mdx) — cross-recipe generic issues.
+- [`MiMo-V2.5-Pro.md`](MiMo-V2.5-Pro.md) — larger sibling model, same architectural family.
+- [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md)
+- [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
+- [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

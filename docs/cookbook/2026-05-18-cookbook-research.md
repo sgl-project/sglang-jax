@@ -150,7 +150,7 @@ Benchmark 数据是**测试时快照**,不随 release 实时刷新。
 | 项 | 规则 |
 |---|---|
 | 嵌套 code block | 外层包含 ``` 时用 **4 个 backtick** ```` ``` ```` |
-| 链接风格 | 相对路径(便于 GitHub 渲染 + 重构)。例:`[base/launch-flags-reference.md](../base/launch-flags-reference.md)` |
+| 链接风格 | 相对路径(便于 GitHub 渲染 + 重构)。例:`[base/launch-flags-reference.md](base/launch-flags-reference.md)` |
 | 重要 note | 用 `> blockquote` 或 `**Note:**` 内联(避免 `:::admonition` —— sglang-jax 无 Docusaurus) |
 | Output Example | 用 ```text fenced block,内容 **verbatim from server**(不 paraphrase) |
 | Emoji | **不用于章节标题**;可用于 cookbook/autoregressive/index.md 的 status 列(✅ / 🚧 / 📝)和 output sample 中的装饰 |

@@ -21,7 +21,7 @@ description: "InclusionAI Ling-2.6-1T trillion-scale linear-attention MoE servin
 - [**inclusionAI/Ling-2.6-1T**](https://huggingface.co/inclusionAI/Ling-2.6-1T) — full trillion-scale flagship; default focus of this page.
 - Smaller Ling-2.6 variants — adapt the §2.3 launch command after picking a checkpoint.
 
-For Moonshot AI's separate linear-attention model see [`Kimi-Linear.mdx`](../Moonshotai/Kimi-Linear.mdx).
+For Moonshot AI's separate linear-attention model see [`Kimi-Linear.md`](../Moonshotai/Kimi-Linear.md).
 
 **Recommended Generation Parameters**: see the Ling-2.6 model card for authoritative defaults. As a starter: `temperature=0.7`, `top_p=0.95`, `max_tokens=2048+` (give room if you enable reasoning mode).
 
@@ -36,11 +36,11 @@ For Moonshot AI's separate linear-attention model see [`Kimi-Linear.mdx`](../Moo
 | Ling-2.6-1T | v6e-64 | 8x8 | 16 | 64 | 64 | 64 | Trillion-scale; multi-host mandatory |
 | Ling-2.6-1T | v7x-16 | 4x4 | 4  | 16 | 32 | 32 | v7x exposes 2 JAX devices per chip → `--tp-size 32` |
 
-See [`../../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx) for the TPU generation reference.
+See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.mdx`](../../../get_started/install.md). Multi-host required — use [`../../deployment/gke-indexed-job.mdx`](../../deployment/gke-indexed-job.mdx) or [`../../deployment/skypilot.mdx`](../../deployment/skypilot.mdx). The required JAX TPU container image:
+Install per [`../../../get_started/install.md`](../../../get_started/install.md). Multi-host required — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) or [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -90,7 +90,7 @@ Swap the topology to `tpu-v7x-16` and use:
   --nnodes 4 --node-rank \${SKYPILOT_NODE_RANK} \
 ```
 
-For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.mdx` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.mdx#23-launch) with `<JOB>=ling-2-6`, `<ACCELERATOR>=tpu-v6e-slice` (or `tpu7x` for v7x), and the launch flags above.
+For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.md` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.md#23-launch) with `<JOB>=ling-2-6`, `<ACCELERATOR>=tpu-v6e-slice` (or `tpu7x` for v7x), and the launch flags above.
 
 ### 2.4 Configuration Tips
 
@@ -103,7 +103,7 @@ For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.mdx` §2.3 Multi-host](
 - `--moe-backend fused` for `--ep-size ≥ 16` (both configs above). Switch to `epmoe` only at EP ≤ 8.
 
 **Reasoning Mode:**
-- If the Ling-2.6 checkpoint supports `<think>` blocks, add `--reasoning-parser <key>` to the launch command — run `python -m sgl_jax.launch_server --help` to see registered parser keys. The streaming Python client from [`Qwen3.mdx` §3.2](../Qwen/Qwen3.mdx#32-reasoning-thinking-on-default-thinking-off-optional) applies directly once the parser is set.
+- If the Ling-2.6 checkpoint supports `<think>` blocks, add `--reasoning-parser <key>` to the launch command — run `python -m sgl_jax.launch_server --help` to see registered parser keys. The streaming Python client from [`Qwen3.md` §3.2](../Qwen/Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) applies directly once the parser is set.
 
 **Context Length:**
 - Pin via `--context-length` to your workload's longest prompt + output. Smaller values reduce KV cache footprint at trillion-scale.
@@ -119,17 +119,17 @@ For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.mdx` §2.3 Multi-host](
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 - Mount a shared PVC across the cluster's nodes to amortize compilation.
 
-For full flag definitions see [`../../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx).
+For full flag definitions see [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`Qwen3.mdx` §3.1](../Qwen/Qwen3.mdx#31-basic-chat-completion). Substitute `model="inclusionAI/Ling-2.6-1T"` (or your chosen Ling-2.6 checkpoint).
+Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#31-basic-chat-completion). Substitute `model="inclusionAI/Ling-2.6-1T"` (or your chosen Ling-2.6 checkpoint).
 
 ### 3.2 Reasoning (if supported by the checkpoint)
 
-If you launched with `--reasoning-parser <key>`, mirror the thinking-on streaming pattern from [`Qwen3.mdx` §3.2](../Qwen/Qwen3.mdx#32-reasoning-thinking-on-default-thinking-off-optional) with `extra_body={"chat_template_kwargs": {"enable_thinking": True}}`.
+If you launched with `--reasoning-parser <key>`, mirror the thinking-on streaming pattern from [`Qwen3.md` §3.2](../Qwen/Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) with `extra_body={"chat_template_kwargs": {"enable_thinking": True}}`.
 
 ## 4. Benchmark
 
@@ -168,7 +168,7 @@ Recommended additional datasets: AIME 2025, GPQA Diamond (reasoning); MMLU (gene
 
 ### 4.2 Speed
 
-**Benchmark Command** — adapt the driver from [`Qwen3.mdx` §4.2](../Qwen/Qwen3.mdx#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `inclusionAI/Ling-2.6-1T`, remove the vLLM half).
+**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `inclusionAI/Ling-2.6-1T`, remove the vLLM half).
 
 **Test Results** — _Pending._
 
@@ -186,6 +186,6 @@ Recommended additional datasets: AIME 2025, GPQA Diamond (reasoning); MMLU (gene
 
 - [Ling-2.6 model card](https://huggingface.co/inclusionAI/Ling-2.6-1T)
 - [InclusionAI HF collection](https://huggingface.co/inclusionAI) — sibling checkpoints.
-- [`Kimi-Linear.mdx`](../Moonshotai/Kimi-Linear.mdx) — Moonshot AI's separate linear-attention model.
-- [`../../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx)
-- [`../../troubleshooting.mdx`](../../troubleshooting.mdx) — cross-recipe generic issues.
+- [`Kimi-Linear.md`](../Moonshotai/Kimi-Linear.md) — Moonshot AI's separate linear-attention model.
+- [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
+- [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

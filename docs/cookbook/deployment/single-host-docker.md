@@ -70,10 +70,10 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache \
 | Placeholder | How to fill |
 |---|---|
 | `<HF_REPO_OR_LOCAL_PATH>` | HuggingFace repo id (e.g. `Qwen/Qwen3-8B`) or absolute path inside the container. |
-| `<DEVICE_COUNT>` | Total JAX devices on this host. v6e: number of chips. v7x: number of chips × 2 (see [`../base/tpu-topology-reference.mdx`](../base/tpu-topology-reference.mdx)). |
+| `<DEVICE_COUNT>` | Total JAX devices on this host. v6e: number of chips. v7x: number of chips × 2 (see [`../base/tpu-topology-reference.md`](../base/tpu-topology-reference.md)). |
 | `<0.88-0.95>` | `--mem-fraction-static`. 0.88 is the TPU default; raise to 0.9–0.95 for dedicated serving with no other processes on the host. |
 
-For multi-host launches (TPU slices spanning more than one node), use [`gke-indexed-job.mdx`](gke-indexed-job.mdx) or [`skypilot.mdx`](skypilot.mdx).
+For multi-host launches (TPU slices spanning more than one node), use [`gke-indexed-job.md`](gke-indexed-job.md) or [`skypilot.md`](skypilot.md).
 
 ## Sending a first request
 
@@ -91,6 +91,6 @@ The server is ready once you see `Uvicorn running on http://0.0.0.0:30000` in th
 
 ## Related
 
-- [`gke-indexed-job.mdx`](gke-indexed-job.mdx) — multi-host on Kubernetes.
-- [`skypilot.mdx`](skypilot.mdx) — multi-host via SkyPilot.
-- [`../base/launch-flags-reference.mdx`](../base/launch-flags-reference.mdx) — full launch flag inventory.
+- [`gke-indexed-job.md`](gke-indexed-job.md) — multi-host on Kubernetes.
+- [`skypilot.md`](skypilot.md) — multi-host via SkyPilot.
+- [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md) — full launch flag inventory.

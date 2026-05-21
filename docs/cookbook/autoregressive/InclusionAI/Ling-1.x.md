@@ -17,7 +17,7 @@ description: "InclusionAI Ling-lite, Ling-plus, and Ling-Coder-lite first-genera
 - [**inclusionAI/Ling-plus**](https://huggingface.co/inclusionAI/Ling-plus) — 290B total / 28.8B activated; multi-host required.
 - [**inclusionAI/Ling-Coder-lite**](https://huggingface.co/inclusionAI/Ling-Coder-lite) — 16.8B / 2.75B, further pre-trained on 3T tokens of coding data; same launch path as Ling-lite.
 
-For the Ling 2.0 generation (Ling-mini-2.0 / Ling-flash-2.0 / Ling-1T) see [`Ling-2.mdx`](Ling-2.mdx). For the linear-attention 2.6 generation see [`Ling-2.6.mdx`](Ling-2.6.mdx). For the reasoning-tuned Ring 2.0 series see [`Ring-2.mdx`](Ring-2.mdx).
+For the Ling 2.0 generation (Ling-mini-2.0 / Ling-flash-2.0 / Ling-1T) see [`Ling-2.md`](Ling-2.md). For the linear-attention 2.6 generation see [`Ling-2.6.md`](Ling-2.6.md). For the reasoning-tuned Ring 2.0 series see [`Ring-2.md`](Ring-2.md).
 
 **Recommended Generation Parameters**: `temperature=0.7`, `top_p=0.95`, `max_tokens=1024` (Ling-lite chat defaults). For Ling-Coder-lite raise `max_tokens` to 2048+ to give room for code blocks.
 
@@ -32,11 +32,11 @@ For the Ling 2.0 generation (Ling-mini-2.0 / Ling-flash-2.0 / Ling-1T) see [`Lin
 | Ling-lite / Ling-Coder-lite (16.8B / 2.75B) | v6e-4  | 2x2 | 1 | 4  | 4  | 4  | BF16 ~34 GB — single host |
 | Ling-plus (290B / 28.8B)                    | v6e-32 | 4x8 | 8 | 32 | 32 | 32 | BF16 ~580 GB — multi-host required |
 
-See [`../../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx) for the TPU generation reference.
+See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.mdx`](../../../get_started/install.md). For Ling-lite / Ling-Coder-lite use [`../../deployment/single-host-docker.mdx`](../../deployment/single-host-docker.mdx); for Ling-plus multi-host use [`../../deployment/gke-indexed-job.mdx`](../../deployment/gke-indexed-job.mdx) or [`../../deployment/skypilot.mdx`](../../deployment/skypilot.mdx). The required JAX TPU container image:
+Install per [`../../../get_started/install.md`](../../../get_started/install.md). For Ling-lite / Ling-Coder-lite use [`../../deployment/single-host-docker.md`](../../deployment/single-host-docker.md); for Ling-plus multi-host use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) or [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -93,7 +93,7 @@ sky exec ${CLUSTER_NAME} -- "cd sglang-jax && source .venv/bin/activate && \
   --host 0.0.0.0 --port 30000"
 ```
 
-For GKE, adapt the manifest pattern from [`../Xiaomi/MiMo-V2.5-Pro.mdx` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.mdx#23-launch) with `<JOB>=ling-plus`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8` / `completions: 8`, and the launch flags above.
+For GKE, adapt the manifest pattern from [`../Xiaomi/MiMo-V2.5-Pro.md` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.md#23-launch) with `<JOB>=ling-plus`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8` / `completions: 8`, and the launch flags above.
 
 ### 2.4 Configuration Tips
 
@@ -113,15 +113,15 @@ For GKE, adapt the manifest pattern from [`../Xiaomi/MiMo-V2.5-Pro.mdx` §2.3 Mu
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
 - On multi-node Ling-plus clusters the cache is per-node; mount a shared PVC to amortize compilation across all 8 nodes.
 
-For full flag definitions see [`../../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx).
+For full flag definitions see [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`../Qwen/Qwen3.mdx` §3.1](../Qwen/Qwen3.mdx#31-basic-chat-completion) for the curl / Python pattern. Substitute `model="inclusionAI/Ling-lite"` (or your chosen variant).
+Standard OpenAI-compatible request — see [`../Qwen/Qwen3.md` §3.1](../Qwen/Qwen3.md#31-basic-chat-completion) for the curl / Python pattern. Substitute `model="inclusionAI/Ling-lite"` (or your chosen variant).
 
-> Ling 1.x is an instruct/chat baseline without native hybrid reasoning or built-in tool-call format. For reasoning workloads use [`Ring-2.mdx`](Ring-2.mdx) (the reasoning-tuned sibling line). For tool-call workloads use a model with `--tool-call-parser` support (see [`../Qwen/Qwen3.mdx` §3.3](../Qwen/Qwen3.mdx#33-tool-calling) or [`../Xiaomi/MiMo-V2.5-Pro.mdx` §3.3](../Xiaomi/MiMo-V2.5-Pro.mdx#33-tool-calling)).
+> Ling 1.x is an instruct/chat baseline without native hybrid reasoning or built-in tool-call format. For reasoning workloads use [`Ring-2.md`](Ring-2.md) (the reasoning-tuned sibling line). For tool-call workloads use a model with `--tool-call-parser` support (see [`../Qwen/Qwen3.md` §3.3](../Qwen/Qwen3.md#33-tool-calling) or [`../Xiaomi/MiMo-V2.5-Pro.md` §3.3](../Xiaomi/MiMo-V2.5-Pro.md#33-tool-calling)).
 
 ## 4. Benchmark
 
@@ -159,7 +159,7 @@ Recommended additional datasets: MMLU (general); for Ling-Coder-lite use HumanEv
 
 ### 4.2 Speed
 
-**Benchmark Command** — adapt the driver from [`../Qwen/Qwen3.mdx` §4.2](../Qwen/Qwen3.mdx#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Ling checkpoint, remove the vLLM half).
+**Benchmark Command** — adapt the driver from [`../Qwen/Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Ling checkpoint, remove the vLLM half).
 
 **Test Results** — _Pending._
 
@@ -175,8 +175,8 @@ Recommended additional datasets: MMLU (general); for Ling-Coder-lite use HumanEv
 ## Additional Resources
 
 - [InclusionAI HF collection](https://huggingface.co/inclusionAI)
-- [`Ling-2.mdx`](Ling-2.mdx) — Ling 2.0 generation (1/32 sparsity, MTP).
-- [`Ling-2.6.mdx`](Ling-2.6.mdx) — Ling 2.6 (linear / delta attention).
-- [`Ring-2.mdx`](Ring-2.mdx) — reasoning-tuned Ring 2.0 sibling line.
-- [`../../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx)
-- [`../../troubleshooting.mdx`](../../troubleshooting.mdx) — cross-recipe generic issues.
+- [`Ling-2.md`](Ling-2.md) — Ling 2.0 generation (1/32 sparsity, MTP).
+- [`Ling-2.6.md`](Ling-2.6.md) — Ling 2.6 (linear / delta attention).
+- [`Ring-2.md`](Ring-2.md) — reasoning-tuned Ring 2.0 sibling line.
+- [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
+- [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

@@ -20,9 +20,9 @@
 - **sglang 主仓**用 [Mintlify](https://mintlify.com/) 渲染文档，**不是** Docusaurus（sgl-cookbook 是历史代码库，已迁移到 `sglang/docs_new/`）
 - 主站：[docs.sglang.io](https://docs.sglang.io/)
 - 配置文件：`docs_new/docs.json`（`$schema: https://mintlify.com/docs.json`，`theme: aspen`）
-- 文件后缀：`.mdx`（Markdown + JSX）
+- 文件后缀：`.md`（Markdown + JSX）
 - vendor 目录命名：PascalCase（`Qwen/` `DeepSeek/` `Llama/` `GLM/` `InclusionAI/` `Moonshotai/` `Xiaomi/` `Google/` ...）
-- 文件命名：`Model-Version.mdx`（`GLM-5.mdx`, `Ling-2.6.mdx`, `DeepSeek-R1.mdx`, `Llama3.1.mdx`）
+- 文件命名：`Model-Version.md`（`GLM-5.md`, `Ling-2.6.md`, `DeepSeek-R1.md`, `Llama3.1.md`）
 - 视觉组件：`<Card>` `<CardGroup>` `<Tabs>` `<Steps>` `<CodeGroup>` `<Note>` `<Warning>` `<Tip>` `<Frame>` `<Accordion>`（Mintlify 预设组件库，import 即用）
 - 自定义 React：sglang 团队还为重型 recipe 写了 React 交互组件（如 `<GLM5Deployment />`，按硬件/量化/特性点选生成命令），从 `/src/snippets/` import；这条 sglang-jax 暂不跟进
 
@@ -44,7 +44,7 @@ docs/cookbook/
 ### Step 2 · 文件格式迁移
 
 20 个 recipe + 顶层 index：
-- `git mv X.md X.mdx`
+- `git mv X.md X.md`
 - 顶部加 Mintlify frontmatter：
   ```yaml
   ---

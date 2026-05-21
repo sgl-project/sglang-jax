@@ -33,12 +33,12 @@ v6e (and every other generation) is 1:1 chip→device, so `--tp-size` matches ch
 
 | Slice name | Nodes | Chips/node | JAX devices | Used by |
 |---|---|---|---|---|
-| `v6e-4` | 1 | 4 | 4 | [Qwen-7B-Chat](../autoregressive/Qwen/Qwen.mdx), [Qwen3-8B / 32B](../autoregressive/Qwen/Qwen3.mdx) |
-| `v6e-16` (`4x4`) | 4 | 4 | 16 | [MiMo-V2-Flash](../autoregressive/Xiaomi/MiMo-V2-Flash.mdx) (multi-node) |
-| `v6e-32` | 8 | 4 | 32 | [Grok-2](../autoregressive/Grok/Grok2.mdx) |
-| `v6e-64` (`4x4x4`) | 16 | 4 | 64 | [MiMo-V2.5-Pro](../autoregressive/Xiaomi/MiMo-V2.5-Pro.mdx) |
-| `v7x-8` | 1 | 4 | 8 | [MiMo-V2-Flash](../autoregressive/Xiaomi/MiMo-V2-Flash.mdx) (single-node) |
-| `v7x-16` (`2x2x4`) | 4 | 4 | 32 | [MiMo-V2.5-Pro](../autoregressive/Xiaomi/MiMo-V2.5-Pro.mdx) |
+| `v6e-4` | 1 | 4 | 4 | [Qwen-7B-Chat](../autoregressive/Qwen/Qwen.md), [Qwen3-8B / 32B](../autoregressive/Qwen/Qwen3.md) |
+| `v6e-16` (`4x4`) | 4 | 4 | 16 | [MiMo-V2-Flash](../autoregressive/Xiaomi/MiMo-V2-Flash.md) (multi-node) |
+| `v6e-32` | 8 | 4 | 32 | [Grok-2](../autoregressive/Grok/Grok2.md) |
+| `v6e-64` (`4x4x4`) | 16 | 4 | 64 | [MiMo-V2.5-Pro](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md) |
+| `v7x-8` | 1 | 4 | 8 | [MiMo-V2-Flash](../autoregressive/Xiaomi/MiMo-V2-Flash.md) (single-node) |
+| `v7x-16` (`2x2x4`) | 4 | 4 | 32 | [MiMo-V2.5-Pro](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md) |
 
 ## Choosing `--tp-size`
 
@@ -67,14 +67,14 @@ with `dtype_bytes = 2` for `bfloat16`, `1` for FP8. The MiMo-V2-Flash recipe rec
 
 | Identifier | Value | Used in |
 |---|---|---|
-| GKE accelerator label (v7x) | `cloud.google.com/gke-tpu-accelerator: tpu7x` | [MiMo-V2.5-Pro GKE manifest](../autoregressive/Xiaomi/MiMo-V2.5-Pro.mdx) |
+| GKE accelerator label (v7x) | `cloud.google.com/gke-tpu-accelerator: tpu7x` | [MiMo-V2.5-Pro GKE manifest](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md) |
 | GKE topology label | `cloud.google.com/gke-tpu-topology: 2x2x4` | same |
 | Docker image | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` | same |
-| SkyPilot resource (v6e) | `tpu-v6e-N` (N ∈ {1, 4, 8, 16, 32, 64}) | [SkyPilot deployment](../deployment/skypilot.mdx), `scripts/launch_tpu.sh` |
-| SkyPilot runtime (v6e) | `runtime_version: v2-alpha-tpuv6e` | `scripts/tpu_resource.sky.yaml`, [`developer_guide/tpu_resources_guide.mdx`](../../developer_guide/tpu_resources_guide.md) |
+| SkyPilot resource (v6e) | `tpu-v6e-N` (N ∈ {1, 4, 8, 16, 32, 64}) | [SkyPilot deployment](../deployment/skypilot.md), `scripts/launch_tpu.sh` |
+| SkyPilot runtime (v6e) | `runtime_version: v2-alpha-tpuv6e` | `scripts/tpu_resource.sky.yaml`, [`developer_guide/tpu_resources_guide.md`](../../developer_guide/tpu_resources_guide.md) |
 
 ## What this page intentionally does NOT cover
 
 - Pricing / region availability — see Google Cloud TPU docs.
-- Provisioning / quota workflows — see [`developer_guide/tpu_resources_guide.mdx`](../../developer_guide/tpu_resources_guide.md) (SkyPilot) and per-recipe GKE manifests.
+- Provisioning / quota workflows — see [`developer_guide/tpu_resources_guide.md`](../../developer_guide/tpu_resources_guide.md) (SkyPilot) and per-recipe GKE manifests.
 - Per-recipe TP/DP/EP picks — those live in each recipe's *Hardware Requirements* table.

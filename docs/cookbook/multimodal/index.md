@@ -15,22 +15,22 @@ This section is **scaffolded for P1**. The recipes themselves are migration / ne
 
 | Architecture | Recipe | Notes |
 |---|---|---|
-| `qwen2_5VL` (Qwen2.5-VL) | _planned_ | Vision-language. Existing usage notes live in [`../../mutlimodal/multimodal_usage.mdx`](../../mutlimodal/multimodal_usage.md) until migrated. |
+| `qwen2_5VL` (Qwen2.5-VL) | _planned_ | Vision-language. Existing usage notes live in [`../../mutlimodal/multimodal_usage.md`](../../mutlimodal/multimodal_usage.md) until migrated. |
 | `qwen3_omni_moe` (Qwen3-Omni MoE) | _planned_ | Omni model — not yet in README's supported list but present in the codebase. |
 | `wan` (Wan 2.1 / 2.2 T2V) | _planned_ | Text-to-video diffusion (different DiT per noise stage). |
 | `mimo_audio` | _planned_ | Audio model. |
 
-> **Why the doc/README mismatch**: `README.mdx`'s "Supported Models" section lists only `Qwen2.5-VL` and `Wan 2.1 / 2.2 T2V`. The code has more — `qwen3_omni_moe` and `mimo_audio` are present under `multimodal/models/` but not mentioned upstream. The cookbook follows the code, which is authoritative.
+> **Why the doc/README mismatch**: `README.md`'s "Supported Models" section lists only `Qwen2.5-VL` and `Wan 2.1 / 2.2 T2V`. The code has more — `qwen3_omni_moe` and `mimo_audio` are present under `multimodal/models/` but not mentioned upstream. The cookbook follows the code, which is authoritative.
 
 ## Existing material (pre-cookbook)
 
-- [`../../mutlimodal/multimodal_usage.mdx`](../../mutlimodal/multimodal_usage.md) — generic multimodal usage guide (note: the directory name has a `mutlimodal` typo that predates the cookbook reorganisation; fixing the path is out of scope for P0).
+- [`../../mutlimodal/multimodal_usage.md`](../../mutlimodal/multimodal_usage.md) — generic multimodal usage guide (note: the directory name has a `mutlimodal` typo that predates the cookbook reorganisation; fixing the path is out of scope for P0).
 - [`../../mutlimodal/design/[RFC]multimodal_architechure.md`](../../mutlimodal/design/) — RFC for the multimodal subsystem architecture.
 
 ## Shared references
 
 When recipes land they will reuse the same base material as autoregressive:
 
-- [`../base/tpu-topology-reference.mdx`](../base/tpu-topology-reference.mdx) — TPU generation / HBM / topology.
-- [`../base/launch-flags-reference.mdx`](../base/launch-flags-reference.mdx) — launch flag full table (multimodal-specific flags come from `MultimodalServerArgs`).
+- [`../base/tpu-topology-reference.md`](../base/tpu-topology-reference.md) — TPU generation / HBM / topology.
+- [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md) — launch flag full table (multimodal-specific flags come from `MultimodalServerArgs`).
 - [`../deployment/`](../deployment/) — launcher templates.

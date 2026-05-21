@@ -19,7 +19,7 @@ description: "InclusionAI Ling 2.0 family (mini / flash / 1T) — 1/32 sparsity 
 
 > **FP8 weights note (Ling-1T):** Ling-1T ships natively as FP8 (the largest FP8-trained foundation model to date). For SGL-JAX BF16 serving you'll need to convert weights via InclusionAI's `convert_dcp_to_safe_tensors.py` (see the model card). The hardware sizing below assumes BF16 weights.
 
-For the first-generation Ling 1.x family see [`Ling-1.x.mdx`](Ling-1.x.mdx). For the linear-attention 2.6 generation see [`Ling-2.6.mdx`](Ling-2.6.mdx). For the reasoning-tuned Ring 2.0 sibling line (same architecture, RL post-training) see [`Ring-2.mdx`](Ring-2.mdx).
+For the first-generation Ling 1.x family see [`Ling-1.x.md`](Ling-1.x.md). For the linear-attention 2.6 generation see [`Ling-2.6.md`](Ling-2.6.md). For the reasoning-tuned Ring 2.0 sibling line (same architecture, RL post-training) see [`Ring-2.md`](Ring-2.md).
 
 **Recommended Generation Parameters**: `temperature=0.7`, `top_p=0.95`, `max_tokens=2048` (give room for Ling-1T's long reasoning chains even in non-thinking mode).
 
@@ -36,11 +36,11 @@ For the first-generation Ling 1.x family see [`Ling-1.x.mdx`](Ling-1.x.mdx). For
 | Ling-1T (1T / 50B)           | v6e-64 | 8x8 | 16 | 64 | 64 | 64 | BF16 ~2 TB — multi-host mandatory |
 | Ling-1T (1T / 50B)           | v7x-16 | 4x4 | 4  | 16 | 32 | 32 | v7x exposes 2 JAX devices per chip → `--tp-size 32` |
 
-See [`../../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx) for the TPU generation reference.
+See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.mdx`](../../../get_started/install.md). For Ling-mini-2.0 single-host use [`../../deployment/single-host-docker.mdx`](../../deployment/single-host-docker.mdx); for Ling-flash-2.0 / Ling-1T multi-host use [`../../deployment/gke-indexed-job.mdx`](../../deployment/gke-indexed-job.mdx) or [`../../deployment/skypilot.mdx`](../../deployment/skypilot.mdx). The required JAX TPU container image:
+Install per [`../../../get_started/install.md`](../../../get_started/install.md). For Ling-mini-2.0 single-host use [`../../deployment/single-host-docker.md`](../../deployment/single-host-docker.md); for Ling-flash-2.0 / Ling-1T multi-host use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) or [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -105,7 +105,7 @@ Swap the topology to `tpu-v6e-64`, the model path to `inclusionAI/Ling-1T`, and 
   --nnodes 16 --node-rank \${SKYPILOT_NODE_RANK} \
 ```
 
-For GKE, adapt the manifest pattern from [`../Xiaomi/MiMo-V2.5-Pro.mdx` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.mdx#23-launch) with `<JOB>=ling-2-0`, `<ACCELERATOR>=tpu-v6e-slice` (or `tpu7x` for v7x), the corresponding topology, and the launch flags above.
+For GKE, adapt the manifest pattern from [`../Xiaomi/MiMo-V2.5-Pro.md` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.md#23-launch) with `<JOB>=ling-2-0`, `<ACCELERATOR>=tpu-v6e-slice` (or `tpu7x` for v7x), the corresponding topology, and the launch flags above.
 
 ### 2.4 Configuration Tips
 
@@ -130,15 +130,15 @@ For GKE, adapt the manifest pattern from [`../Xiaomi/MiMo-V2.5-Pro.mdx` §2.3 Mu
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 - On multi-node Ling-flash / Ling-1T clusters, mount a shared PVC at the cache directory to amortize compilation across nodes.
 
-For full flag definitions see [`../../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx).
+For full flag definitions see [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`../Qwen/Qwen3.mdx` §3.1](../Qwen/Qwen3.mdx#31-basic-chat-completion). Substitute `model="inclusionAI/Ling-mini-2.0"` (or your chosen variant).
+Standard OpenAI-compatible request — see [`../Qwen/Qwen3.md` §3.1](../Qwen/Qwen3.md#31-basic-chat-completion). Substitute `model="inclusionAI/Ling-mini-2.0"` (or your chosen variant).
 
-> Ling 2.0 is a non-thinking general-purpose family. For chain-of-thought workloads use the reasoning-tuned [`Ring-2.mdx`](Ring-2.mdx) sibling (same architecture, RL-trained). For tool-call workloads use a model with `--tool-call-parser` support (see [`../Qwen/Qwen3.mdx` §3.3](../Qwen/Qwen3.mdx#33-tool-calling) or [`../Xiaomi/MiMo-V2.5-Pro.mdx` §3.3](../Xiaomi/MiMo-V2.5-Pro.mdx#33-tool-calling)).
+> Ling 2.0 is a non-thinking general-purpose family. For chain-of-thought workloads use the reasoning-tuned [`Ring-2.md`](Ring-2.md) sibling (same architecture, RL-trained). For tool-call workloads use a model with `--tool-call-parser` support (see [`../Qwen/Qwen3.md` §3.3](../Qwen/Qwen3.md#33-tool-calling) or [`../Xiaomi/MiMo-V2.5-Pro.md` §3.3](../Xiaomi/MiMo-V2.5-Pro.md#33-tool-calling)).
 
 ## 4. Benchmark
 
@@ -176,7 +176,7 @@ Recommended additional datasets: MMLU, GPQA Diamond, HumanEval (general); for Li
 
 ### 4.2 Speed
 
-**Benchmark Command** — adapt the driver from [`../Qwen/Qwen3.mdx` §4.2](../Qwen/Qwen3.mdx#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Ling 2.0 checkpoint, remove the vLLM half).
+**Benchmark Command** — adapt the driver from [`../Qwen/Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Ling 2.0 checkpoint, remove the vLLM half).
 
 **Test Results** — _Pending._
 
@@ -193,8 +193,8 @@ Recommended additional datasets: MMLU, GPQA Diamond, HumanEval (general); for Li
 ## Additional Resources
 
 - [InclusionAI HF collection](https://huggingface.co/inclusionAI)
-- [`Ling-1.x.mdx`](Ling-1.x.mdx) — first-generation Ling family.
-- [`Ling-2.6.mdx`](Ling-2.6.mdx) — Ling 2.6 (linear / delta attention).
-- [`Ring-2.mdx`](Ring-2.mdx) — reasoning-tuned Ring 2.0 sibling line.
-- [`../../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx)
-- [`../../troubleshooting.mdx`](../../troubleshooting.mdx) — cross-recipe generic issues.
+- [`Ling-1.x.md`](Ling-1.x.md) — first-generation Ling family.
+- [`Ling-2.6.md`](Ling-2.6.md) — Ling 2.6 (linear / delta attention).
+- [`Ring-2.md`](Ring-2.md) — reasoning-tuned Ring 2.0 sibling line.
+- [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
+- [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

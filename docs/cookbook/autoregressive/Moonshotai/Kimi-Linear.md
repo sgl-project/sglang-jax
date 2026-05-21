@@ -15,7 +15,7 @@ description: "Moonshot AI Kimi-Linear-48B-A3B with delta attention and hybrid re
 
 - [**moonshotai/Kimi-Linear-48B-A3B-Instruct**](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct) — 48B total / 3B activated, instruction-tuned.
 
-For other linear-attention models in the cookbook see [`Ling-2.6.mdx`](../InclusionAI/Ling-2.6.mdx) (InclusionAI's trillion-scale linear-attention MoE).
+For other linear-attention models in the cookbook see [`Ling-2.6.md`](../InclusionAI/Ling-2.6.md) (InclusionAI's trillion-scale linear-attention MoE).
 
 **Recommended Generation Parameters**: `temperature=0.6`, `top_p=0.95`, `max_tokens=1024` (Kimi defaults — verify against the model card).
 
@@ -29,11 +29,11 @@ For other linear-attention models in the cookbook see [`Ling-2.6.mdx`](../Inclus
 |---|---|---|---|---|---|---|
 | Kimi-Linear-48B-A3B | v6e-16 | 4x4 | 4 | 16 | 16 | BF16 ~96 GB — multi-host recommended |
 
-See [`../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx) for the TPU generation reference.
+See [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../get_started/install.mdx`](../../../get_started/install.md). Multi-host recommended at this size — use [`../deployment/gke-indexed-job.mdx`](../../deployment/gke-indexed-job.mdx) or [`../deployment/skypilot.mdx`](../../deployment/skypilot.mdx). The required JAX TPU container image:
+Install per [`../../get_started/install.md`](../../../get_started/install.md). Multi-host recommended at this size — use [`../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) or [`../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -73,7 +73,7 @@ sky exec ${CLUSTER_NAME} -- "cd sglang-jax && source .venv/bin/activate && \
   --host 0.0.0.0 --port 30000"
 ```
 
-For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.mdx` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.mdx#23-launch) with `<JOB>=kimi-linear`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `parallelism: 4` / `completions: 4`, and the launch flags above.
+For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.md` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.md#23-launch) with `<JOB>=kimi-linear`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `parallelism: 4` / `completions: 4`, and the launch flags above.
 
 ### 2.4 Configuration Tips
 
@@ -93,15 +93,15 @@ For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.mdx` §2.3 Multi-host](
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 - Mount a shared PVC across the cluster's 4 nodes to amortize compilation.
 
-For full flag definitions see [`../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx).
+For full flag definitions see [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`Qwen3.mdx` §3.1](../Qwen/Qwen3.mdx#31-basic-chat-completion). Substitute `model="moonshotai/Kimi-Linear-48B-A3B-Instruct"`.
+Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#31-basic-chat-completion). Substitute `model="moonshotai/Kimi-Linear-48B-A3B-Instruct"`.
 
-> Kimi-Linear-Instruct does not ship with a built-in tool-call format. For tool-call workloads use a model with `--tool-call-parser` support (see [`Qwen3.mdx` §3.3](../Qwen/Qwen3.mdx#33-tool-calling) or [`MiMo-V2.5-Pro.mdx` §3.3](../Xiaomi/MiMo-V2.5-Pro.mdx#33-tool-calling)).
+> Kimi-Linear-Instruct does not ship with a built-in tool-call format. For tool-call workloads use a model with `--tool-call-parser` support (see [`Qwen3.md` §3.3](../Qwen/Qwen3.md#33-tool-calling) or [`MiMo-V2.5-Pro.md` §3.3](../Xiaomi/MiMo-V2.5-Pro.md#33-tool-calling)).
 
 ## 4. Benchmark
 
@@ -139,7 +139,7 @@ Recommended additional datasets: MMLU, GPQA Diamond, RULER (to exercise long-con
 
 ### 4.2 Speed
 
-**Benchmark Command** — adapt the driver from [`Qwen3.mdx` §4.2](../Qwen/Qwen3.mdx#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `moonshotai/Kimi-Linear-48B-A3B-Instruct`, remove the vLLM half).
+**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `moonshotai/Kimi-Linear-48B-A3B-Instruct`, remove the vLLM half).
 
 **Test Results** — _Pending._
 
@@ -155,6 +155,6 @@ Recommended additional datasets: MMLU, GPQA Diamond, RULER (to exercise long-con
 ## Additional Resources
 
 - [Kimi-Linear model card](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct)
-- [`Ling-2.6.mdx`](../InclusionAI/Ling-2.6.mdx) — InclusionAI's trillion-scale linear-attention MoE.
-- [`../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx)
-- [`../troubleshooting.mdx`](../../troubleshooting.mdx) — cross-recipe generic issues.
+- [`Ling-2.6.md`](../InclusionAI/Ling-2.6.md) — InclusionAI's trillion-scale linear-attention MoE.
+- [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
+- [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

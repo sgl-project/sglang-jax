@@ -16,7 +16,7 @@ description: "Qwen3-30B-A3B and Qwen3-235B-A22B MoE variants serving on TPU v6e-
 - [**Qwen/Qwen3-30B-A3B**](https://huggingface.co/Qwen/Qwen3-30B-A3B) — 30B total / 3B activated; multi-host on v6e-16.
 - [**Qwen/Qwen3-235B-A22B**](https://huggingface.co/Qwen/Qwen3-235B-A22B) — 235B total / 22B activated; multi-host on v6e-64.
 
-For the dense Qwen3 variants (8B / 32B) see [`Qwen3.mdx`](Qwen3.mdx).
+For the dense Qwen3 variants (8B / 32B) see [`Qwen3.md`](Qwen3.md).
 
 **Recommended Generation Parameters**:
 
@@ -34,11 +34,11 @@ For the dense Qwen3 variants (8B / 32B) see [`Qwen3.mdx`](Qwen3.mdx).
 | Qwen3-30B-A3B   | v6e-16 | 4x4 | 4  | 16 | 16 | 16 | BF16 ~60 GB  |
 | Qwen3-235B-A22B | v6e-64 | 8x8 | 16 | 64 | 64 | 64 | BF16 ~470 GB |
 
-See [`../base/tpu-topology-reference.mdx`](../../base/tpu-topology-reference.mdx) for the TPU generation reference.
+See [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../get_started/install.mdx`](../../../get_started/install.md). For multi-host launches use [`../deployment/gke-indexed-job.mdx`](../../deployment/gke-indexed-job.mdx) or [`../deployment/skypilot.mdx`](../../deployment/skypilot.mdx). The required JAX TPU container image:
+Install per [`../../get_started/install.md`](../../../get_started/install.md). For multi-host launches use [`../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) or [`../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -90,7 +90,7 @@ Swap the topology to `tpu-v6e-64`, the model path to `Qwen/Qwen3-235B-A22B`, and
   --nnodes 16 --node-rank \${SKYPILOT_NODE_RANK} \
 ```
 
-For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.mdx` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.mdx#23-launch) with `<JOB>=qwen3-moe`, `<ACCELERATOR>=tpu-v6e-slice`, the corresponding topology (`4x4` or `8x8`), and the launch flags above.
+For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.md` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.md#23-launch) with `<JOB>=qwen3-moe`, `<ACCELERATOR>=tpu-v6e-slice`, the corresponding topology (`4x4` or `8x8`), and the launch flags above.
 
 ### 2.4 Configuration Tips
 
@@ -102,7 +102,7 @@ For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.mdx` §2.3 Multi-host](
 - Lower by 0.02 increments if you hit OOM at startup with high `--max-running-requests`.
 
 **Hybrid Reasoning / Tool Calling:**
-- Qwen3-MoE shares the hybrid reasoning (`--reasoning-parser qwen3`) and tool-call (`--tool-call-parser qwen25`) format with dense Qwen3. Append these flags to the launch command — full streaming Python examples in [`Qwen3.mdx` §3.2](Qwen3.mdx#32-reasoning-thinking-on-default-thinking-off-optional) and [§3.3](Qwen3.mdx#33-tool-calling) apply directly.
+- Qwen3-MoE shares the hybrid reasoning (`--reasoning-parser qwen3`) and tool-call (`--tool-call-parser qwen25`) format with dense Qwen3. Append these flags to the launch command — full streaming Python examples in [`Qwen3.md` §3.2](Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) and [§3.3](Qwen3.md#33-tool-calling) apply directly.
 
 **Throughput vs Latency:**
 - `--page-size 128` reduces KV page-table overhead at MoE scale. Default `1` is much slower at high concurrency.
@@ -112,17 +112,17 @@ For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.mdx` §2.3 Multi-host](
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 - On multi-node clusters the cache is per-node. Mount a shared PVC to amortize compilation across all nodes.
 
-For full flag definitions see [`../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx).
+For full flag definitions see [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`Qwen3.mdx` §3.1](Qwen3.mdx#31-basic-chat-completion). Substitute `model="Qwen/Qwen3-30B-A3B"` (or `Qwen3-235B-A22B`).
+Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](Qwen3.md#31-basic-chat-completion). Substitute `model="Qwen/Qwen3-30B-A3B"` (or `Qwen3-235B-A22B`).
 
 ### 3.2 Reasoning / Tool Calling
 
-Qwen3-MoE inherits the dense Qwen3 hybrid-reasoning and tool-call format — the full streaming Python clients and multi-turn `Handling Tool Call Results` pattern in [`Qwen3.mdx` §3.2](Qwen3.mdx#32-reasoning-thinking-on-default-thinking-off-optional) and [§3.3](Qwen3.mdx#33-tool-calling) apply directly. Substitute the model path and the §2.3 launch flags above.
+Qwen3-MoE inherits the dense Qwen3 hybrid-reasoning and tool-call format — the full streaming Python clients and multi-turn `Handling Tool Call Results` pattern in [`Qwen3.md` §3.2](Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) and [§3.3](Qwen3.md#33-tool-calling) apply directly. Substitute the model path and the §2.3 launch flags above.
 
 ## 4. Benchmark
 
@@ -161,7 +161,7 @@ Recommended additional datasets: AIME 2025, MATH, GPQA Diamond.
 
 ### 4.2 Speed
 
-**Benchmark Command** — adapt the driver from [`Qwen3.mdx` §4.2](Qwen3.mdx#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Qwen3-MoE checkpoint, remove the vLLM half if not comparing).
+**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Qwen3-MoE checkpoint, remove the vLLM half if not comparing).
 
 **Test Results** — _Pending._
 
@@ -179,6 +179,6 @@ Recommended additional datasets: AIME 2025, MATH, GPQA Diamond.
 ## Additional Resources
 
 - [Qwen3 model collection](https://huggingface.co/Qwen)
-- [`Qwen3.mdx`](Qwen3.mdx) — dense Qwen3-8B / 32B recipe (same reasoning/tool-call format).
-- [`../base/launch-flags-reference.mdx`](../../base/launch-flags-reference.mdx)
-- [`../troubleshooting.mdx`](../../troubleshooting.mdx) — cross-recipe generic issues.
+- [`Qwen3.md`](Qwen3.md) — dense Qwen3-8B / 32B recipe (same reasoning/tool-call format).
+- [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
+- [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
