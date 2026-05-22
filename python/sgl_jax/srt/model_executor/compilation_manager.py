@@ -106,12 +106,14 @@ class CompilationManager:
         prepare_lora_fn: Callable | None = None,
         future_token_ids_map=None,
     ):
+        model_runner._compilation_phase = "precompile"
         self._precompile_extend(
             forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
         )
         self._precompile_decode(
             forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
         )
+        model_runner._compilation_phase = "runtime"
 
     def _precompile_extend(
         self,

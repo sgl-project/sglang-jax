@@ -5,6 +5,7 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding, PartitionSpec
 from tqdm import tqdm
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
@@ -16,6 +17,7 @@ from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
 from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyOutput
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
+from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
 RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
@@ -112,8 +114,15 @@ class EAGLEWorker(BaseSpecWorker):
     # -- Precompilation --
 
     def run_spec_decode_precompile(self):
+        self.target_worker.model_runner._compilation_phase = "spec_precompile"
+        if hasattr(self.draft_worker, "draft_model_runner"):
+            self.draft_worker.draft_model_runner._compilation_phase = "spec_precompile"
         self.precompile_spec_extend()
         self.precompile_spec_decode()
+        self.precompile_real_bs_postprocess_primitives()
+        self.target_worker.model_runner._compilation_phase = "runtime"
+        if hasattr(self.draft_worker, "draft_model_runner"):
+            self.draft_worker.draft_model_runner._compilation_phase = "runtime"
         # FIXME precompile some kernel
 
     def precompile_spec_extend(self):
@@ -227,3 +236,106 @@ class EAGLEWorker(BaseSpecWorker):
 
         end_time = time.perf_counter()
         logger.info("[SPEC_DECODE] Precompile finished in %.0f secs", end_time - start_time)
+
+    def precompile_real_bs_postprocess_primitives(self):
+        """Warm real-bs-indexed postprocess primitives before the server is ready.
+
+        Model forward is padded to the largest bucket, but postprocess code still
+        uses real-bs selectors for per-request state. Without this warmup, the
+        first runtime request for real batch sizes such as 2/3/5/6 creates small
+        persistent-cache misses for gather/scatter-update primitives even though
+        the model HLO is already cached.
+        """
+        start_time = time.perf_counter()
+        total_bs = self.precompile_bs_paddings[-1]
+        if total_bs <= 0:
+            return
+
+        dtype = jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32
+        mesh = self.target_worker.model_runner.mesh
+        sharding = NamedSharding(mesh, PartitionSpec())
+        vocab_size = self.target_worker.model_config.vocab_size
+        hidden_size = self.draft_worker.model_config.hidden_size
+        accept_width = self.speculative_num_steps + 1
+        draft_rows = total_bs * accept_width
+
+        (
+            topk_p,
+            topk_index,
+            logits,
+            hidden,
+            verified_id,
+        ) = device_array(
+            (
+                np.zeros((total_bs, self.topk), dtype=np.float32),
+                np.zeros((total_bs, self.topk), dtype=np.int32),
+                np.zeros((total_bs, vocab_size), dtype=np.float32),
+                np.zeros((draft_rows, hidden_size), dtype=np.float32),
+                np.zeros((draft_rows,), dtype=np.int32),
+            ),
+            sharding=sharding,
+        )
+        topk_p = topk_p.astype(dtype)
+        logits = logits.astype(dtype)
+        hidden = hidden.astype(dtype)
+
+        logger.info(
+            "[SPEC_POSTPROCESS] Begin to precompile real_bs selectors 1..%d",
+            total_bs,
+        )
+        with tqdm(
+            range(1, total_bs + 1),
+            desc="[SPEC_POSTPROCESS] PRECOMPILE",
+            leave=False,
+        ) as pbar:
+            for real_bs in pbar:
+                pbar.set_postfix(real_bs=real_bs)
+                selector = np.arange(real_bs, dtype=np.int32)
+                select_index = selector * accept_width
+                sel_jax = jnp.asarray(selector)
+                select_index_jax = jnp.asarray(select_index)
+
+                accept_length = device_array(
+                    np.zeros((real_bs,), dtype=np.int32),
+                    sharding=sharding,
+                )
+                accept_filter = jnp.zeros_like(accept_length)
+                accept_filter = accept_filter.at[sel_jax].set(accept_length[sel_jax] + 1)
+
+                warmed = (
+                    topk_p[sel_jax],
+                    topk_index[sel_jax],
+                    logits[sel_jax],
+                    hidden[select_index_jax],
+                    verified_id[select_index_jax],
+                    topk_p[selector],
+                    topk_index[selector],
+                    hidden[selector],
+                    verified_id[selector],
+                    accept_filter,
+                )
+                jax.block_until_ready(warmed)
+
+        for left in range(1, total_bs):
+            for right in range(1, total_bs - left + 1):
+                left_hidden = hidden[:left]
+                right_hidden = hidden[:right]
+                left_verified_id = verified_id[:left]
+                right_verified_id = verified_id[:right]
+                left_topk_p = topk_p[:left]
+                right_topk_p = topk_p[:right]
+                left_topk_index = topk_index[:left]
+                right_topk_index = topk_index[:right]
+                warmed = (
+                    jnp.concatenate([left_hidden, right_hidden], axis=0),
+                    jnp.concatenate([left_verified_id, right_verified_id], axis=0),
+                    jnp.concatenate([left_topk_p, right_topk_p], axis=0),
+                    jnp.concatenate([left_topk_index, right_topk_index], axis=0),
+                )
+                jax.block_until_ready(warmed)
+
+        end_time = time.perf_counter()
+        logger.info(
+            "[SPEC_POSTPROCESS] Precompile finished in %.0f secs",
+            end_time - start_time,
+        )

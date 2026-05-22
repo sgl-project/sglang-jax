@@ -1,7 +1,12 @@
 """ModelRunner runs the forward passes of the models."""
 
+import dataclasses
+import hashlib
+import json
 import logging
+import os
 from functools import partial
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -43,6 +48,42 @@ from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 
 logger = logging.getLogger(__name__)
+
+
+def _json_safe(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if hasattr(value, "name"):
+        return value.name
+    return repr(value)
+
+
+def _array_summary(value):
+    if value is None:
+        return None
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
+        return {
+            "type": type(value).__name__,
+            "shape": tuple(value.shape),
+            "dtype": str(value.dtype),
+            "sharding": repr(getattr(value, "sharding", None)),
+        }
+    return {"type": type(value).__name__, "value": _json_safe(value)}
+
+
+def _dataclass_summary(value):
+    if value is None:
+        return None
+    if not dataclasses.is_dataclass(value):
+        return {"type": type(value).__name__, "value": _json_safe(value)}
+    ret = {"type": type(value).__name__}
+    for field in dataclasses.fields(value):
+        ret[field.name] = _array_summary(getattr(value, field.name, None))
+    return ret
 
 
 class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
@@ -249,6 +290,15 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         def run_model_wrapper(forward_batch, logits_metadata):
             memory_pools = self.memory_pools
+            self._maybe_dump_run_model_hlo(
+                jitted_run_model,
+                model_def,
+                model_state_def,
+                self.model_state_leaves,
+                forward_batch,
+                memory_pools,
+                logits_metadata,
+            )
             return jitted_run_model(
                 model_def,
                 model_state_def,
@@ -269,6 +319,70 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         )
 
         self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
+
+    def _maybe_dump_run_model_hlo(
+        self,
+        jitted_run_model,
+        model_def,
+        model_state_def,
+        model_state_leaves,
+        forward_batch,
+        memory_pools,
+        logits_metadata,
+    ):
+        dump_dir = os.getenv("SGLANG_JAX_DUMP_RUN_MODEL_HLO_DIR")
+        if not dump_dir:
+            return
+
+        limit = int(os.getenv("SGLANG_JAX_DUMP_RUN_MODEL_HLO_LIMIT", "64"))
+        dump_index = getattr(self, "_run_model_hlo_dump_index", 0)
+        if dump_index >= limit:
+            return
+        self._run_model_hlo_dump_index = dump_index + 1
+
+        try:
+            lowered = jitted_run_model.lower(
+                model_def,
+                model_state_def,
+                model_state_leaves,
+                forward_batch,
+                memory_pools,
+                logits_metadata,
+            )
+            hlo = lowered.compiler_ir(dialect="hlo").as_hlo_text()
+        except Exception:
+            logger.exception("Failed to dump jitted_run_model HLO")
+            return
+
+        phase = getattr(self, "_compilation_phase", None) or os.getenv(
+            "SGLANG_JAX_DUMP_RUN_MODEL_HLO_PHASE", "unknown"
+        )
+        hlo_hash = hashlib.sha256(hlo.encode("utf-8")).hexdigest()
+        prefix = (
+            f"{dump_index:04d}_{phase}_"
+            f"{getattr(forward_batch.forward_mode, 'name', forward_batch.forward_mode)}_"
+            f"bs{forward_batch.batch_size}_{hlo_hash[:16]}"
+        )
+
+        output_dir = Path(dump_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / f"{prefix}.hlo").write_text(hlo)
+
+        _, fb_aux = forward_batch.tree_flatten()
+        _, logits_aux = logits_metadata.tree_flatten()
+        metadata = {
+            "dump_index": dump_index,
+            "phase": phase,
+            "hlo_sha256": hlo_hash,
+            "is_draft_worker": self.is_draft_worker,
+            "forward_pass_id": self.forward_pass_id,
+            "forward_batch_aux": _json_safe(fb_aux),
+            "logits_metadata_aux": _json_safe(logits_aux),
+            "forward_batch": _dataclass_summary(forward_batch),
+            "logits_metadata": _dataclass_summary(logits_metadata),
+        }
+        (output_dir / f"{prefix}.json").write_text(json.dumps(metadata, indent=2, sort_keys=True))
+        logger.info("Dumped jitted_run_model HLO to %s", output_dir / f"{prefix}.hlo")
 
     def get_available_device_memory(self):
         distributed = jax.process_count() != 1
@@ -489,6 +603,20 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 forward_batch, logits_metadata
             )
             cache_miss_count = count()
+
+        if cache_miss_count > 0:
+            phase = getattr(self, "_compilation_phase", "runtime")
+            _, fb_aux = forward_batch.tree_flatten()
+            _, lm_aux = logits_metadata.tree_flatten()
+            logger.warning(
+                "TRACE CACHE MISS in jitted_run_model: miss=%d phase=%s "
+                "fwd_pass=%d fb_aux=%s lm_aux=%s",
+                cache_miss_count,
+                phase,
+                self.forward_pass_id,
+                fb_aux,
+                lm_aux,
+            )
 
         # tp_size==1: sharding constraint is lost after JIT; re-place explicitly.
         # See https://github.com/sgl-project/sglang-jax/issues/233

@@ -2254,6 +2254,9 @@ class ScheduleBatch:
                 f"{len(nonempty) - len(nonnull)}/{len(nonempty)} nonempty rank(s); "
                 "all-or-nothing required"
             )
+            if len(nonnull) == 1:
+                kwargs[f] = nonnull[0]
+                continue
             if isinstance(nonnull[0], np.ndarray):
                 kwargs[f] = np.concatenate(nonnull, axis=0)
             else:
