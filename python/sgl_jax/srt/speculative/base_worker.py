@@ -126,7 +126,7 @@ class BaseSpecWorker:
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                next_draft_input=model_worker_batch.spec_info,
+                next_draft_input=model_worker_batch.spec_info_padded,
                 allocate_lens=np.asarray(model_worker_batch.seq_lens)[
                     model_worker_batch.logits_indices_selector
                 ],
@@ -140,7 +140,7 @@ class BaseSpecWorker:
         # _get_spec_decode_mwb_dp); gather back to global-flat (real_bs,) so the
         # cross-round state on reqs_info[0].spec_info stays flat-ordered.
         sel = model_worker_batch.logits_indices_selector
-        cur_allocate_lens = np.asarray(model_worker_batch.spec_info.allocate_lens)[sel]
+        cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
         self.draft_worker.draft(model_worker_batch)
         batch_output = self.verify(model_worker_batch, cur_allocate_lens)
         self.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
@@ -167,7 +167,7 @@ class BaseSpecWorker:
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
         from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
 
-        spec_info: EagleVerifyInput = model_worker_batch.spec_info
+        spec_info: EagleVerifyInput = model_worker_batch.spec_info_padded
         spec_info.allocate_lens = cur_allocate_lens
         spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.target_worker)
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
@@ -214,7 +214,7 @@ class BaseSpecWorker:
             hidden_states=logits_output.hidden_states,
         )
 
-        model_worker_batch.spec_info = next_draft_input
+        model_worker_batch.spec_info_padded = next_draft_input
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,
