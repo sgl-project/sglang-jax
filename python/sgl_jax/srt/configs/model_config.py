@@ -142,7 +142,10 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTPForCausalLM"
 
-        if is_draft_model and self.hf_config.architectures[0] == "MiMoV2ForCausalLM":
+        if is_draft_model and self.hf_config.architectures[0] in (
+            "MiMoV2ForCausalLM",
+            "MiMoV2FlashForCausalLM",
+        ):
             self.hf_config.architectures[0] = "MiMoV2MTPForCausalLM"
             # Each draft runner is a single SWA layer; without this the KV pool
             # sizes for all 70 target layers and OOMs.
