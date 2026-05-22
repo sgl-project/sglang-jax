@@ -136,6 +136,7 @@ class WeightLoader:
         self.mesh = mesh
         self.dtype = dtype
         self.dummy_mode = getattr(model_config, "_dummy_mode", False)
+        self._weight_info_cache: dict[str, list[dict]] | None = None
         if hasattr(model_config, "num_attention_heads"):
             self.num_heads = model_config.num_attention_heads
             # Use original count for replication logic
@@ -185,6 +186,10 @@ class WeightLoader:
             return True
         ignored = quant_cfg.ignored_layers or []
         return any(hf_path == ig or hf_path.endswith(f".{ig}") for ig in ignored)
+
+    def has_weight_on_disk(self, hf_key: str) -> bool:
+        """Return whether a concrete HF weight key exists in the safetensors files."""
+        return hf_key in self._scan_weight_info()
 
     # ------------------------------------------------------------------
     # Post-load hooks: dequant FP8 → BF16, KV head replication
@@ -992,6 +997,9 @@ class WeightLoader:
         """
         Scan all safetensors files to build a mapping from HF key to file info.
         """
+        if self._weight_info_cache is not None:
+            return self._weight_info_cache
+
         # 1. Host 0 does the heavy lifting (Scanning)
         if jax.process_index() == 0:
             model_path = self.model_config.model_path
@@ -1066,6 +1074,7 @@ class WeightLoader:
         if jax.process_index() != 0:
             logger.info("Metadata received. Total keys: %s", len(weight_info))
 
+        self._weight_info_cache = weight_info
         return weight_info
 
     def _create_lazy_tensors(
