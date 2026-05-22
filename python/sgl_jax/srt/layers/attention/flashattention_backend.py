@@ -253,6 +253,10 @@ class FlashAttention(AttentionBackend):
             if metadata.custom_mask is not None and dp_size > 1:
                 q = batch.spec_info_padded.draft_token_num
                 cm = np.asarray(jax.device_get(metadata.custom_mask))
+                # Pin per-rank mask target from the pre-repacking mask capacity
+                # (tree_mask_capacity from build_tree, already bucket-stable).
+                cm_total = len(cm)
+                per_rank_mask_target = ((cm_total // dp_size + 7) // 8) * 8 or 8
                 # cm is DP-slot-ordered (build_tree got verified_seq_len = mwb.seq_lens-1
                 # over total_bs). Per-slot cm length = q*(verified_seq_len[s]+q); for pad
                 # slots verified_seq_len=-1 → q*(q-1).
@@ -274,8 +278,7 @@ class FlashAttention(AttentionBackend):
                     rank_chunks.append(
                         np.concatenate(parts) if parts else np.zeros(0, dtype=cm.dtype)
                     )
-                max_len = max((len(c) for c in rank_chunks), default=0)
-                max_len = ((max_len + 7) // 8) * 8 or 8
+                max_len = max(max((len(c) for c in rank_chunks), default=0), per_rank_mask_target)
                 packed = np.concatenate(
                     [np.pad(c, (0, max_len - len(c))) for c in rank_chunks]
                 ).astype(np.int32)
