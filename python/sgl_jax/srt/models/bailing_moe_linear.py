@@ -557,7 +557,7 @@ class BailingMoELinearDecoderLayer(nnx.Module):
             residual,
             kv_fused,
             pool_update,
-            jax.sharding.reshard(topk_ids, P(None)),
+            topk_ids,
         )
 
 

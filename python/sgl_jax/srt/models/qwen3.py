@@ -119,6 +119,8 @@ class QWen3Attention(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
@@ -149,7 +151,7 @@ class QWen3Attention(nnx.Module):
         q, k = self.rotary_emb(positions, q, k)
         attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
 
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output, out_sharding=out_sharding)
         return output, kv_fused
 
 
@@ -197,11 +199,16 @@ class Qwen3MLP(nnx.Module):
         self.act_fn = jax.nn.silu
 
     @named_scope
-    def __call__(self, hidden_states: jnp.ndarray):
+    def __call__(
+        self,
+        hidden_states: jnp.ndarray,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ):
         a1, _ = self.gate_proj(hidden_states)
         a2, _ = self.up_proj(hidden_states)
         intermediate_parallel = a2 * self.act_fn(a1)
-        output, _ = self.down_proj(intermediate_parallel)
+        output, _ = self.down_proj(intermediate_parallel, out_sharding=out_sharding)
         return output
 
 

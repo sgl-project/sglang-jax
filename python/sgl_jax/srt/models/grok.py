@@ -36,6 +36,7 @@ from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.debug_utils import log_shardings
+from sgl_jax.srt.utils.parallel_utils import make_reduce_sharding
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -169,6 +170,7 @@ class Grok1MLP(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         reduce_results: bool = True,
         enable_sequence_parallel: bool = False,
+        input_sharding: jax.sharding.Sharding | None = None,
     ) -> None:
         super().__init__()
 
@@ -195,25 +197,28 @@ class Grok1MLP(nnx.Module):
             params_dtype=dtype,
             kernel_axes=("tensor", None),
             mesh=mesh,
-            output_scatter_dimension=0 if enable_sequence_parallel else None,
         )
         self.act_fn = GeluAndMul(approximate="tanh")
         self.layer_id = layer_id
         self.reduce_results = reduce_results
         self.mesh = mesh
         self.enable_sequence_parallel = enable_sequence_parallel
+        self.input_sharding = input_sharding
 
     @log_shardings("GrokMLP")
     def __call__(self, x: jax.Array) -> jax.Array:
-        # Unshard activations if sequence parallel enabled, otherwise no-op
-        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
-            spec = jax.sharding.PartitionSpec(*([None] * len(x.shape)))
-            x = jax.sharding.reshard(x, spec)
+        if self.input_sharding is not None:
+            x = jax.sharding.reshard(x, self.input_sharding)
 
-        gate, _ = self.gate_proj(x)
-        up, _ = self.up_proj(x)
+        gate, _ = self.gate_proj(x, out_sharding=NamedSharding(self.mesh, P("data", "tensor")))
+        up, _ = self.up_proj(x, out_sharding=NamedSharding(self.mesh, P("data", "tensor")))
         x, _ = self.act_fn(gate, up)
-        x, _ = self.down_proj(x)
+        down_target = (
+            NamedSharding(self.mesh, P(("data", "tensor"), None))
+            if self.enable_sequence_parallel
+            else NamedSharding(self.mesh, P("data", None))
+        )
+        x, _ = self.down_proj(x, out_sharding=down_target)
         return x
 
 
@@ -236,6 +241,7 @@ class Grok1MoE(nnx.Module):
         intermediate_size: int,
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
+        input_sharding: jax.sharding.Sharding | None = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -243,6 +249,7 @@ class Grok1MoE(nnx.Module):
         self.top_k = top_k
         self.layer_id = layer_id
         self.mesh = mesh
+        self.input_sharding = input_sharding
 
         # Gate always runs at full precision for stability
         # (see https://arxiv.org/pdf/2101.03961)
@@ -289,8 +296,8 @@ class Grok1MoE(nnx.Module):
                 dtype=dtype,
                 layer_id=layer_id,
                 quantization_config=getattr(config, "quantization_config", None),
-                enable_sequence_parallel=getattr(config, "enable_sequence_parallel", False),
             )
+        self.enable_sequence_parallel = getattr(config, "enable_sequence_parallel", False)
 
     @log_shardings("GrokMoE")
     def __call__(
@@ -298,13 +305,22 @@ class Grok1MoE(nnx.Module):
         hidden_states: jax.Array,
         dispatch_info: ExpertLocationMetadata | None = None,
     ) -> tuple[jax.Array, jax.Array | None]:
-        # Unshard activations if sequence parallel enabled, otherwise no-op
-        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
-            spec = jax.sharding.PartitionSpec(*([None] * len(hidden_states.shape)))
-            hidden_states = jax.sharding.reshard(hidden_states, spec)
+        hidden_states = (
+            jax.sharding.reshard(hidden_states, self.input_sharding)
+            if self.input_sharding is not None
+            else hidden_states
+        )
+
+        # Per-call SP target: respects should_scatter threshold so small
+        # batches (decode) gracefully fall back to DP.
+        experts_out_sharding = make_reduce_sharding(
+            hidden_states, self.mesh, enable_sp=self.enable_sequence_parallel
+        )
 
         # Router computation with soft capping
-        router_logits, _ = self.gate(hidden_states)
+        router_logits, _ = self.gate(
+            hidden_states, out_sharding=NamedSharding(self.mesh, P("data", None))
+        )
 
         # Apply soft capping for stability (matching sglang implementation)
         if self.router_logit_softcapping != 0:
@@ -325,11 +341,27 @@ class Grok1MoE(nnx.Module):
         if self.use_fused:
             # Fused kernel: pass pre-computed topk_weights/indices
             assert isinstance(self.experts, FusedEPMoE)
-            return self.experts(hidden_states, top_k_weights, top_k_indices), top_k_indices
+            return (
+                self.experts(
+                    hidden_states,
+                    top_k_weights,
+                    top_k_indices,
+                    out_sharding=experts_out_sharding,
+                ),
+                top_k_indices,
+            )
         else:
             # EPMoE: pass pre-computed topk_weights/indices
             assert isinstance(self.experts, EPMoE)
-            return self.experts(hidden_states, top_k_weights, top_k_indices), top_k_indices
+            return (
+                self.experts(
+                    hidden_states,
+                    top_k_weights,
+                    top_k_indices,
+                    out_sharding=experts_out_sharding,
+                ),
+                top_k_indices,
+            )
 
     def _custom_topk(
         self,
@@ -402,6 +434,7 @@ class Grok1Attention(nnx.Module):
         max_position: int = 4096 * 32,
         rope_theta: float = 10000,
         enable_sequence_parallel: bool = False,
+        input_sharding: jax.sharding.Sharding | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -418,6 +451,7 @@ class Grok1Attention(nnx.Module):
         self.rope_theta = rope_theta
         self.mesh = mesh
         self.enable_sequence_parallel = enable_sequence_parallel
+        self.input_sharding = input_sharding
 
         rope_scaling = get_rope_scaling(config)
         self.rope_rotate_half_dims = getattr(config, "rope_rotate_half_dims", False)
@@ -457,7 +491,6 @@ class Grok1Attention(nnx.Module):
             params_dtype=jnp.bfloat16,
             kernel_axes=("tensor", None),
             mesh=mesh,
-            output_scatter_dimension=0 if enable_sequence_parallel else None,
         )
 
         # Initialize rotary embeddings based on scaling configuration
@@ -507,15 +540,22 @@ class Grok1Attention(nnx.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
 
-        # Unshard activations if sequence parallel enabled, otherwise no-op
-        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
-            spec = jax.sharding.PartitionSpec(*([None] * len(hidden_states.shape)))
-            hidden_states = jax.sharding.reshard(hidden_states, spec)
+        hidden_states = (
+            jax.sharding.reshard(hidden_states, self.input_sharding)
+            if self.input_sharding is not None
+            else hidden_states
+        )
 
         # Project Q, K, V separately
-        q, _ = self.q_proj(hidden_states)
-        k, _ = self.k_proj(hidden_states)
-        v, _ = self.v_proj(hidden_states)
+        q, _ = self.q_proj(
+            hidden_states, out_sharding=NamedSharding(self.mesh, P("data", "tensor"))
+        )
+        k, _ = self.k_proj(
+            hidden_states, out_sharding=NamedSharding(self.mesh, P("data", "tensor"))
+        )
+        v, _ = self.v_proj(
+            hidden_states, out_sharding=NamedSharding(self.mesh, P("data", "tensor"))
+        )
 
         # Apply rotary position embeddings
         q, k = self.rotary_emb(positions, q, k)
@@ -562,7 +602,12 @@ class Grok1Attention(nnx.Module):
         attn_output = attn_ret[0] if isinstance(attn_ret, tuple) else attn_ret
 
         # Project output
-        output, _ = self.o_proj(attn_output)
+        o_target = (
+            NamedSharding(self.mesh, P(("data", "tensor"), None))
+            if self.enable_sequence_parallel
+            else NamedSharding(self.mesh, P("data", None))
+        )
+        output, _ = self.o_proj(attn_output, out_sharding=o_target)
 
         return output, kv_fused
 
@@ -585,6 +630,8 @@ class Grok1DecoderLayer(nnx.Module):
 
         # Self-attention
         rope_theta = getattr(config, "rope_theta", 10000)
+        enable_sequence_parallel = getattr(config, "enable_sequence_parallel", False)
+        block_input_sharding = NamedSharding(mesh, P()) if enable_sequence_parallel else None
         self.self_attn = Grok1Attention(
             config=config,
             hidden_size=self.hidden_size,
@@ -598,7 +645,8 @@ class Grok1DecoderLayer(nnx.Module):
             layer_id=layer_id,
             rope_theta=rope_theta,
             mesh=mesh,
-            enable_sequence_parallel=getattr(config, "enable_sequence_parallel", False),
+            enable_sequence_parallel=enable_sequence_parallel,
+            input_sharding=block_input_sharding,
         )
 
         # Feed-forward networks
@@ -620,6 +668,7 @@ class Grok1DecoderLayer(nnx.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
                 mesh=mesh,
+                input_sharding=block_input_sharding,
             )
             if self.residual_moe:
                 self.mlp = Grok1MLP(
@@ -628,7 +677,8 @@ class Grok1DecoderLayer(nnx.Module):
                     layer_id=layer_id,
                     reduce_results=False,
                     mesh=mesh,
-                    enable_sequence_parallel=getattr(config, "enable_sequence_parallel", False),
+                    enable_sequence_parallel=enable_sequence_parallel,
+                    input_sharding=block_input_sharding,
                 )
         else:
             raise NotImplementedError()
@@ -738,7 +788,7 @@ class Grok1DecoderLayer(nnx.Module):
             residual,
             self.post_moe_norm,
             kv_fused,
-            jax.sharding.reshard(topk_ids, P(None)),
+            topk_ids,
         )
 
 

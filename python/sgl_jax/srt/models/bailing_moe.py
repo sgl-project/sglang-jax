@@ -437,7 +437,7 @@ class BailingMoEDecoderLayer(nnx.Module):
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
 
-        return hidden_states, residual, kv_fused, jax.sharding.reshard(topk_ids, P(None))
+        return hidden_states, residual, kv_fused, topk_ids
 
 
 class BailingMoEModel(nnx.Module):

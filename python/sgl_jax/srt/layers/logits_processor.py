@@ -486,6 +486,10 @@ class LogitsProcessor(nnx.Module):
             (hidden_states, lm_head.embedding.value),
             dtype=lm_head.dtype,
         )
+        hidden_states = jax.sharding.reshard(
+            hidden_states,
+            NamedSharding(self.mesh, P("data", None)),
+        )
 
         logits = jnp.dot(
             hidden_states, embedding.T, out_sharding=NamedSharding(self.mesh, P("data", "tensor"))
