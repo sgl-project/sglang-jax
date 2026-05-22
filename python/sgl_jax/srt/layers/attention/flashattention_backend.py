@@ -213,15 +213,15 @@ class FlashAttention(AttentionBackend):
 
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
             # convert custom_mask from bool to int32, because dma not support bool type
-            if batch.spec_info.custom_mask.dtype == jnp.bool:
+            if batch.spec_info_padded.custom_mask.dtype == jnp.bool:
                 # FIXME(pc) rm this dtype convert
                 logger.warning(
-                    "batch.spec_info.custom_mask type is  %s, it may make performance very low",
-                    batch.spec_info.custom_mask.dtype,
+                    "batch.spec_info_padded.custom_mask type is  %s, it may make performance very low",
+                    batch.spec_info_padded.custom_mask.dtype,
                 )
-                metadata.custom_mask = batch.spec_info.custom_mask.astype(jnp.int32)
+                metadata.custom_mask = batch.spec_info_padded.custom_mask.astype(jnp.int32)
             else:
-                metadata.custom_mask = batch.spec_info.custom_mask
+                metadata.custom_mask = batch.spec_info_padded.custom_mask
         else:
             metadata.custom_mask = None
 
@@ -230,7 +230,7 @@ class FlashAttention(AttentionBackend):
         if batch.forward_mode.is_target_verify():
             padded_batch_size = len(batch.seq_lens)
             extend_seq_lens = np.zeros(padded_batch_size, dtype=np.int32)
-            extend_seq_lens[batch.logits_indices_selector] = batch.spec_info.draft_token_num
+            extend_seq_lens[batch.logits_indices_selector] = batch.spec_info_padded.draft_token_num
         else:
             extend_seq_lens = batch.extend_seq_lens
         cu_q_lens = _per_dp_cumsum(extend_seq_lens, dp_size, per_dp_bs)
@@ -240,29 +240,31 @@ class FlashAttention(AttentionBackend):
         if batch.forward_mode.is_target_verify():
             seq_lens += extend_seq_lens
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
-            # Hybrid-SWA targets at page_size>=256 hit Mosaic's tiling(8) proof
-            # in rpa_v3._fetch_mask. Pad each mask row to page-aligned kv_len so
-            # the kernel can use cu_kv_lens delta as a statically-8-divisible
-            # stride. Dense targets (EAGLE3) keep the unpadded path so accept-
-            # rate / cache-hit behavior is unchanged.
-            if metadata.custom_mask is not None and self.page_size >= 256:
-                q = batch.spec_info.draft_token_num
+            # At dp>1 the verify mask must be DP-segmented per rank so each rank's
+            # P("data") shard sees its own slots' mask (the kernel computes
+            # cu_seq_mask_lens from per-rank cu_kv/q starting at 0). Without
+            # repack, the build_tree output sits in cross-rank-flat order, and
+            # rank>0 reads the mask tail (padding zeros) → all-masked verify
+            # → garbage. (#1108 P1-7)
+            #
+            # mask col width depends on rpa_v3's mask_aligned_to_cu_kv switch
+            # (page_size>=256 uses aligned cu_kv_lens; else actual seq_lens),
+            # so pad each row to match — otherwise kernel reads wrong stride.
+            if metadata.custom_mask is not None and dp_size > 1:
+                q = batch.spec_info_padded.draft_token_num
                 cm = np.asarray(jax.device_get(metadata.custom_mask))
                 # cm is DP-slot-ordered (build_tree got verified_seq_len = mwb.seq_lens-1
                 # over total_bs). Per-slot cm length = q*(verified_seq_len[s]+q); for pad
-                # slots verified_seq_len=-1 → q*(q-1). Repack per DP rank (real slots'
-                # rows padded to aligned kv, pad slots = zeros), then pad each rank's
-                # section to a common length so the result shards P("data") and each
-                # rank's locally-computed cu_seq_mask_lens (starting at 0) indexes its
-                # own shard. (#1108 P1-7 — n>1 dp>1 verify mask cross-rank read.)
+                # slots verified_seq_len=-1 → q*(q-1).
                 cm_kl = np.where(seq_lens > 0, seq_lens, q - 1).astype(np.int64)
                 cm_off = np.concatenate([[0], np.cumsum(q * cm_kl)])
+                row_width = aligned_seq_lens if self.page_size >= 256 else seq_lens
                 rank_chunks: list[np.ndarray] = []
                 for r in range(dp_size):
                     parts = []
                     for j in range(per_dp_bs):
                         s = r * per_dp_bs + j
-                        kla = int(aligned_seq_lens[s])
+                        kla = int(row_width[s])
                         if seq_lens[s] > 0:
                             kl = int(seq_lens[s])
                             row = cm[cm_off[s] : cm_off[s] + q * kl].reshape(q, kl)
@@ -279,7 +281,7 @@ class FlashAttention(AttentionBackend):
                 ).astype(np.int32)
                 metadata.custom_mask = device_array(
                     packed,
-                    sharding=NamedSharding(self.mesh, P("data") if dp_size > 1 else P()),
+                    sharding=NamedSharding(self.mesh, P("data")),
                 )
         else:
             aligned_seq_lens = (
@@ -292,7 +294,7 @@ class FlashAttention(AttentionBackend):
             # the DP-segmented layout from padding_for_decode (rank r's pages
             # at [r*per_dp_pg : ...]). page_indices (line 212) is already
             # cache_loc[::page_size]//page_size, so re-gather from it per-rank.
-            allocate_lens = batch.spec_info.allocate_lens
+            allocate_lens = batch.spec_info_padded.allocate_lens
             if hasattr(allocate_lens, "device"):
                 allocate_lens = jax.device_get(allocate_lens)
             allocate_lens = np.asarray(allocate_lens)
@@ -370,7 +372,7 @@ class FlashAttention(AttentionBackend):
         # (== selector order), so the per-req gather below stays aligned.
         sel = np.asarray(batch.logits_indices_selector)
         current_seq_lens = np.asarray(batch.seq_lens)[sel]
-        allocate_lens = np.asarray(batch.spec_info.allocate_lens)[sel]
+        allocate_lens = np.asarray(batch.spec_info_padded.allocate_lens)[sel]
 
         draft_allocs = allocate_lens - current_seq_lens
 
@@ -432,7 +434,7 @@ class FlashAttention(AttentionBackend):
 
         if batch.spec_algorithm.is_none():
             raise RuntimeError("should not reach here")
-        assert isinstance(batch.spec_info, EagleDraftInput)
+        assert isinstance(batch.spec_info_padded, EagleDraftInput)
         topk = batch.speculative_eagle_topk
         cu_q_lens = np.tile(np.arange(0, per_dp_bs * topk + 1, topk, dtype=np.int32), dp_size)
         seq_2d = np.asarray(batch.seq_lens).reshape(dp_size, per_dp_bs)

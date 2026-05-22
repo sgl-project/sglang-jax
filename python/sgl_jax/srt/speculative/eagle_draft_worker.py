@@ -155,7 +155,7 @@ class EagleDraftWorker(BaseDraftWorker):
             retrive_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            model_worker_batch.spec_info.verified_id,
+            model_worker_batch.spec_info_padded.verified_id,
             score_list,
             token_list,
             parents_list,
@@ -168,7 +168,7 @@ class EagleDraftWorker(BaseDraftWorker):
             model_worker_batch.speculative_num_steps,
             self.mesh,
         )
-        model_worker_batch.spec_info = EagleVerifyInput(
+        model_worker_batch.spec_info_padded = EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=position,
@@ -192,7 +192,7 @@ class EagleDraftWorker(BaseDraftWorker):
     ) -> None:
         sel = np.asarray(model_worker_batch.logits_indices_selector)
         verified_id_np = np.asarray(jax.device_get(next_token_ids))[sel]
-        model_worker_batch.spec_info = EagleDraftInput(
+        model_worker_batch.spec_info_padded = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=verified_id_np,
             num_tokens_per_batch=np.asarray(1, dtype=jnp.int32),
@@ -200,10 +200,10 @@ class EagleDraftWorker(BaseDraftWorker):
             allocate_lens=model_worker_batch.seq_lens,
         )
         model_worker_batch.return_hidden_states = False
-        model_worker_batch.spec_info.prepare_for_extend_after_target_prefill(
+        model_worker_batch.spec_info_padded.prepare_for_extend_after_target_prefill(
             model_worker_batch=model_worker_batch
         )
-        model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        model_worker_batch.spec_info_padded.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         forward_batch.return_logprob = False
@@ -295,7 +295,7 @@ class EagleDraftWorker(BaseDraftWorker):
             max(model_worker_batch.real_bs, len(model_worker_batch.seq_lens))
         )
         self.copy_model_worker_batch_to_cpu(model_worker_batch)
-        model_worker_batch.spec_info.prepare_for_draft_decode(
+        model_worker_batch.spec_info_padded.prepare_for_draft_decode(
             model_worker_batch, self.topk, self.speculative_num_steps
         )
         model_worker_batch.seq_lens = model_worker_batch.seq_lens
@@ -305,7 +305,7 @@ class EagleDraftWorker(BaseDraftWorker):
         token_indices_with_all_reqs = req_to_token_pool.req_to_token[
             model_worker_batch.req_pool_indices
         ]
-        spec_info = model_worker_batch.spec_info
+        spec_info = model_worker_batch.spec_info_padded
         assert isinstance(spec_info, EagleDraftInput)
         # At dp>1 spec_info arrays arrive at (real_bs,) but seq_lens_cpu is
         # (total_bs,); pad allocate_lens up front so valid_mask indexing works
@@ -348,7 +348,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         topk_index = spec_info.topk_index
         if self.hot_token_ids is not None:
-            model_worker_batch.spec_info.topk_index = self.hot_token_ids[topk_index]
+            model_worker_batch.spec_info_padded.topk_index = self.hot_token_ids[topk_index]
         if self.topk > 1:
             self.draft_model_runner.attn_backend.forward_metadata.custom_mask = (
                 build_tree_mask_for_draft_decode(
@@ -359,44 +359,38 @@ class EagleDraftWorker(BaseDraftWorker):
                 )
             )
         bs = self.precompile_bs_paddings[padding_bs_index]
-        if bs - model_worker_batch.spec_info.verified_id.shape[0] > 0:
-            model_worker_batch.spec_info.verified_id = np.pad(
-                model_worker_batch.spec_info.verified_id,
-                ((0, bs - model_worker_batch.spec_info.verified_id.shape[0]),),
-            )
-        if bs - model_worker_batch.spec_info.topk_p.shape[0] > 0:
-            model_worker_batch.spec_info.topk_p = np.pad(
-                model_worker_batch.spec_info.topk_p,
-                (
-                    (0, bs - model_worker_batch.spec_info.topk_p.shape[0]),
-                    (0, 0),
-                ),
-            )
+        dp_size = model_worker_batch.dp_size
+        per_dp_padded = bs // dp_size
+
+        def _dp_segment_pad(arr, target_bs):
+            """DP-segmented pad: pad each rank's section separately to per_dp_padded.
+
+            Input arr shape (curr_bs, ...) with curr_bs = per_dp_curr * dp_size.
+            Returns (target_bs, ...) with each rank's slice padded at the end.
+            End-padding the whole array would let shard_map(P("data")) hand a
+            following rank's data to a prior rank.
+            """
+            if arr is None or arr.shape[0] >= target_bs:
+                return arr
+            per_dp_curr = max(arr.shape[0] // dp_size, 1) if dp_size > 0 else arr.shape[0]
+            if dp_size <= 1 or arr.shape[0] % dp_size != 0:
+                # Fallback to end-pad if layout isn't DP-divisible (dp=1 path).
+                pad_widths = [(0, target_bs - arr.shape[0])] + [(0, 0)] * (arr.ndim - 1)
+                return np.pad(arr, pad_widths)
+            reshaped = arr.reshape((dp_size, per_dp_curr) + arr.shape[1:])
+            pad_widths = [(0, 0), (0, per_dp_padded - per_dp_curr)] + [(0, 0)] * (arr.ndim - 1)
+            padded = np.pad(reshaped, pad_widths)
+            return padded.reshape((target_bs,) + arr.shape[1:])
+
+        spec_info_padded = model_worker_batch.spec_info_padded
+        spec_info_padded.verified_id = _dp_segment_pad(spec_info_padded.verified_id, bs)
+        spec_info_padded.topk_p = _dp_segment_pad(spec_info_padded.topk_p, bs)
         if bs - model_worker_batch.seq_lens.shape[0] > 0:
-            model_worker_batch.seq_lens = np.pad(
-                model_worker_batch.seq_lens, ((0, bs - model_worker_batch.seq_lens.shape[0]),)
-            )
-            if model_worker_batch.spec_info.allocate_lens is not None:
-                model_worker_batch.spec_info.allocate_lens = np.pad(
-                    model_worker_batch.spec_info.allocate_lens,
-                    ((0, bs - model_worker_batch.spec_info.allocate_lens.shape[0]),),
-                )
-        if bs - model_worker_batch.spec_info.topk_index.shape[0] > 0:
-            model_worker_batch.spec_info.topk_index = np.pad(
-                model_worker_batch.spec_info.topk_index,
-                (
-                    (0, bs - model_worker_batch.spec_info.topk_index.shape[0]),
-                    (0, 0),
-                ),
-            )
-        if bs - model_worker_batch.spec_info.hidden_states.shape[0] > 0:
-            model_worker_batch.spec_info.hidden_states = np.pad(
-                model_worker_batch.spec_info.hidden_states,
-                (
-                    (0, bs - model_worker_batch.spec_info.hidden_states.shape[0]),
-                    (0, 0),
-                ),
-            )
+            model_worker_batch.seq_lens = _dp_segment_pad(model_worker_batch.seq_lens, bs)
+            if spec_info_padded.allocate_lens is not None:
+                spec_info_padded.allocate_lens = _dp_segment_pad(spec_info_padded.allocate_lens, bs)
+        spec_info_padded.topk_index = _dp_segment_pad(spec_info_padded.topk_index, bs)
+        spec_info_padded.hidden_states = _dp_segment_pad(spec_info_padded.hidden_states, bs)
         model_worker_batch.speculative_eagle_topk = self.topk
         model_worker_batch.speculative_num_steps = self.speculative_num_steps
         model_worker_batch.speculative_num_draft_tokens = self.speculative_num_draft_tokens
@@ -405,9 +399,9 @@ class EagleDraftWorker(BaseDraftWorker):
 
     def draft_forward(self, model_worker_batch: ModelWorkerBatch):
         topk_p, topk_index, hidden_states = (
-            model_worker_batch.spec_info.topk_p,
-            model_worker_batch.spec_info.topk_index,
-            model_worker_batch.spec_info.hidden_states,
+            model_worker_batch.spec_info_padded.topk_p,
+            model_worker_batch.spec_info_padded.topk_index,
+            model_worker_batch.spec_info_padded.hidden_states,
         )
         bs = model_worker_batch.seq_lens.shape[0]
         step_min_1 = self.speculative_num_steps - 1

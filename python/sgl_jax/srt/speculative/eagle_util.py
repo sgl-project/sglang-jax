@@ -509,16 +509,35 @@ class EagleDraftInput:
             self.verified_id.shape[0] == model_worker_batch.real_bs
         ), f"{self.verified_id.shape=} {model_worker_batch.real_bs=}"
 
-        pt = 0
-        for i in range(model_worker_batch.real_bs):
-            extend_len = model_worker_batch.extend_seq_lens[i]
-            input_ids = model_worker_batch.input_ids[pt : pt + extend_len]
-
-            # TODO: batch.input_ids should on tpu
-            model_worker_batch.input_ids[pt : pt + extend_len] = np.concatenate(
-                (input_ids[1:], self.verified_id[i].reshape(1))
-            )
-            pt += extend_len
+        # Walk the DP-padded layout in (rank, slot) order so token offsets line
+        # up with mwb.input_ids' token-major DP layout. Iterating real_bs and
+        # indexing extend_seq_lens by `i` skipped real reqs whose padded slot
+        # index > i (e.g. dp>1 prefill with only rank>0 active).
+        dp_size = model_worker_batch.dp_size
+        # per_dp_bs_size already covers both dp=1 (= total_bs) and dp>1
+        # (= total_bs / dp). Hardcoding 1 here drops dp=1 multi-req.
+        per_dp_bs = model_worker_batch.per_dp_bs_size
+        total_tok = len(model_worker_batch.input_ids)
+        per_dp_tok = total_tok // dp_size if dp_size > 0 else total_tok
+        extend_seq_lens = model_worker_batch.extend_seq_lens
+        flat_idx = 0  # index into self.verified_id (cross-rank flat)
+        for dp_rank in range(dp_size):
+            pt = dp_rank * per_dp_tok
+            for slot_in_rank in range(per_dp_bs):
+                slot = dp_rank * per_dp_bs + slot_in_rank
+                extend_len = int(extend_seq_lens[slot])
+                if extend_len == 0:
+                    continue
+                input_ids = model_worker_batch.input_ids[pt : pt + extend_len]
+                model_worker_batch.input_ids[pt : pt + extend_len] = np.concatenate(
+                    (input_ids[1:], self.verified_id[flat_idx].reshape(1))
+                )
+                pt += extend_len
+                flat_idx += 1
+        assert flat_idx == model_worker_batch.real_bs, (
+            f"prepare_for_extend_after_target_prefill mismatch: walked {flat_idx} "
+            f"real reqs but real_bs={model_worker_batch.real_bs}"
+        )
 
     def prepare_for_extend_after_verify(
         self,
@@ -527,7 +546,7 @@ class EagleDraftInput:
         batch_output: GenerationBatchResult,
         speculative_num_draft_tokens: int,
     ):
-        model_worker_batch.spec_info = self
+        model_worker_batch.spec_info_padded = self
         sel = model_worker_batch.logits_indices_selector
         model_worker_batch.seq_lens[sel] = (
             model_worker_batch.seq_lens[sel] + speculative_num_draft_tokens - 1
@@ -548,10 +567,12 @@ class EagleDraftInput:
             - 1
         )
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
+        model_worker_batch.spec_info_padded.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
-        model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
-        model_worker_batch.spec_info.accept_length = batch_output.accept_lens
+        model_worker_batch.spec_info_padded.hidden_states = (
+            batch_output.next_draft_input.hidden_states
+        )
+        model_worker_batch.spec_info_padded.accept_length = batch_output.accept_lens
         model_worker_batch.input_ids = batch_output.next_draft_input.verified_id
         forward_metadata = draft_model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
@@ -649,16 +670,19 @@ class EagleDraftInput:
             return
 
         batch.input_ids = self.verified_id
-        accept_length_cpu_arr = batch.spec_info.accept_length_cpu
+        rank0_spec = batch.reqs_info[0].spec_info if batch.reqs_info else None
+        accept_length_cpu_arr = rank0_spec.accept_length_cpu if rank0_spec else None
         if accept_length_cpu_arr is None:
             accept_length_cpu_host = np.asarray([], dtype=np.int32)
         else:
             accept_length_cpu_host = accept_length_cpu_arr
         batch.extend_lens = (accept_length_cpu_host + 1).tolist()
         batch.extend_num_tokens = sum(batch.extend_lens)
-        batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
+        batch.seq_lens = rank0_spec.seq_lens_for_draft_extend if rank0_spec else None
         batch.seq_lens_sum = batch.seq_lens.sum().item()
-        batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
+        batch.req_pool_indices = (
+            rank0_spec.req_pool_indices_for_draft_extend if rank0_spec else None
+        )
         batch.return_logprob = False
         batch.return_hidden_states = False
 
@@ -679,25 +703,24 @@ class EagleDraftInput:
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True):
         new_indices = np.asarray(new_indices)
-        if has_been_filtered:
-            # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
-            # therefore, we don't need to filter the batch again in scheduler
-            if len(new_indices) != len(self.topk_p):
-                logger.warning(
-                    "length of new_indices: %d != length of topk_p: %d, this should not happen",
-                    len(new_indices),
-                    len(self.topk_p),
-                )
+        # Verify path produces a pre-trimmed next_draft_input so len matches
+        # and truncate is a no-op. Other paths (draft_extend) leave self at
+        # full per-rank size and need fancy-index; the length check is the
+        # real guard, has_been_filtered is kept for backward signalling.
+        if has_been_filtered and len(new_indices) == len(self.topk_p):
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]
             self.verified_id = self.verified_id[: len(new_indices)]
+            if self.allocate_lens is not None:
+                self.allocate_lens = np.asarray(self.allocate_lens)[: len(new_indices)]
         else:
-            # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
             self.hidden_states = self.hidden_states[new_indices]
             self.verified_id = self.verified_id[new_indices]
+            if self.allocate_lens is not None:
+                self.allocate_lens = np.asarray(self.allocate_lens)[new_indices]
 
     def merge_batch(self, spec_info: EagleDraftInput):
         # FIXME(pc) need support overlap here
@@ -852,7 +875,7 @@ class EagleVerifyInput:
         # extend_lens = jnp.array([self.draft_token_num] * bs)
         model_worker_batch.return_hidden_states = False
         model_worker_batch.forward_mode = ForwardMode.TARGET_VERIFY
-        model_worker_batch.spec_info = self
+        model_worker_batch.spec_info_padded = self
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.extend_seq_lens = self.draft_token
         # assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode

@@ -309,7 +309,7 @@ class CompilationManager:
             lora_ids=lora_ids,
             dp_size=dp_size,
             per_dp_bs_size=per_dp_bs_size,
-            real_bs_per_dp=[bs] * dp_size,
+            real_bs_per_dp=[per_dp_bs_size] * dp_size,
             logits_indices_selector=np.arange(bs, dtype=np.int32),
             # Hybrid recurrent backends (e.g. KDA) require these per-batch
             # arrays even at precompile time; slot 0 is RecurrentStatePool's

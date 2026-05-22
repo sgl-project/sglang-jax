@@ -188,6 +188,13 @@ class EPMoE(nnx.Module):
                         f"Unsupported {scale_name} shape {scale.shape} for weight shape {weight.shape}. "
                         f"Expected k_blocks dimension to be 1 or {expected_k_blocks}."
                     )
+            # FIXME(jax-upgrade): incoming sharding is typically P("expert", None, None, None) —
+            # the EPMoE weight loader passes a 3-tuple ("expert", None, None) that JAX pads
+            # with None on the 4D array — which doesn't textually match the downstream
+            # shard_map in_specs P("expert", None, None, "tensor"). jax 0.8.1 accepts this
+            # because the "tensor" axis is size 1 (ep_size == world_size); jax 0.10.x checks
+            # strictly and will raise. Fix by reshard'ing here like the ndim==3 branches do,
+            # or fix the loader to emit a full 4-tuple.
             return scale
 
         if scale.ndim == 2 and scale.shape == (num_experts, out_dim):
