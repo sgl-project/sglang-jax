@@ -1,6 +1,8 @@
 name: PR Review (Claude)
 
 on:
+  pull_request:
+    types: [opened, ready_for_review]
   issue_comment:
     types: [created]
 
@@ -12,10 +14,13 @@ permissions:
 
 concurrency:
   group: >-
-    pr-review-${{ github.event.issue.number }}-${{
+    pr-review-${{ github.event.pull_request.number || github.event.issue.number }}-${{
       (
-        startsWith(github.event.comment.body, '/review')
-        && contains(fromJSON('["OWNER","COLLABORATOR"]'), github.event.comment.author_association)
+        github.event_name == 'pull_request'
+        || (
+          startsWith(github.event.comment.body, '/review')
+          && contains(fromJSON('["OWNER","COLLABORATOR"]'), github.event.comment.author_association)
+        )
       )
       && 'active'
       || github.run_id
@@ -25,9 +30,11 @@ concurrency:
 jobs:
   review:
     if: >
-      github.event.issue.pull_request != null
-      && startsWith(github.event.comment.body, '/review')
-      && contains(fromJSON('["OWNER","COLLABORATOR"]'), github.event.comment.author_association)
+      (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
+      || (github.event_name == 'issue_comment'
+          && github.event.issue.pull_request != null
+          && startsWith(github.event.comment.body, '/review')
+          && contains(fromJSON('["OWNER","COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -36,9 +43,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PR_NUMBER=${{ github.event.issue.number }}
-          HEAD_SHA=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json headRefOid -q .headRefOid)
-          HEAD_REF=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json headRefName -q .headRefName)
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            PR_NUMBER=${{ github.event.issue.number }}
+            HEAD_SHA=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json headRefOid -q .headRefOid)
+            HEAD_REF=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json headRefName -q .headRefName)
+          else
+            PR_NUMBER=${{ github.event.pull_request.number }}
+            HEAD_SHA=${{ github.event.pull_request.head.sha }}
+            HEAD_REF=${{ github.event.pull_request.head.ref }}
+          fi
           echo "number=$PR_NUMBER"  >> "$GITHUB_OUTPUT"
           echo "sha=$HEAD_SHA"      >> "$GITHUB_OUTPUT"
           echo "ref=$HEAD_REF"      >> "$GITHUB_OUTPUT"
@@ -49,6 +62,7 @@ jobs:
           fetch-depth: 0
 
       - uses: anthropics/claude-code-action@v1
+        continue-on-error: true
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
           track_progress: true
