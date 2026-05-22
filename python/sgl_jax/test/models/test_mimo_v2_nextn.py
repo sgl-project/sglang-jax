@@ -30,9 +30,24 @@ _PER_LAYER_KEYS = [
     "self_attn.qkv_proj.weight_scale_inv",
 ]
 
+_PER_LAYER_SEPARATE_QKV_KEYS = [
+    k for k in _PER_LAYER_KEYS if not k.startswith("self_attn.qkv_proj.")
+] + [
+    "self_attn.q_proj.weight",
+    "self_attn.q_proj.weight_scale_inv",
+    "self_attn.k_proj.weight",
+    "self_attn.k_proj.weight_scale_inv",
+    "self_attn.v_proj.weight",
+    "self_attn.v_proj.weight_scale_inv",
+]
+
 
 def _hf_keys(layer_idx: int) -> set[str]:
     return {f"model.mtp.layers.{layer_idx}.{k}" for k in _PER_LAYER_KEYS}
+
+
+def _separate_qkv_hf_keys(layer_idx: int) -> set[str]:
+    return {f"model.mtp.layers.{layer_idx}.{k}" for k in _PER_LAYER_SEPARATE_QKV_KEYS}
 
 
 @pytest.mark.parametrize("layer_idx", [0, 1, 2])
@@ -41,7 +56,11 @@ def test_weight_mapping_covers_safetensors(layer_idx: int):
 
     model = SimpleNamespace(
         mtp_layer_idx=layer_idx,
-        loader=SimpleNamespace(is_static_quant=True, is_quant_ignored=lambda k: False),
+        loader=SimpleNamespace(
+            is_static_quant=True,
+            is_quant_ignored=lambda k: False,
+            has_weight_on_disk=lambda k: k.endswith("qkv_proj.weight"),
+        ),
     )
     mappings = MiMoV2MTPForCausalLM._create_weight_mappings(model)
 
@@ -61,3 +80,27 @@ def test_weight_mapping_covers_safetensors(layer_idx: int):
         tp = m.target_path
         targets.extend(tp if isinstance(tp, list) else [tp])
     assert len(targets) == len(set(targets)), "duplicate target_path"
+
+
+@pytest.mark.parametrize("layer_idx", [0, 1, 2])
+def test_weight_mapping_supports_separate_fp8_qkv(layer_idx: int):
+    from sgl_jax.srt.models.mimo_v2_nextn import MiMoV2MTPForCausalLM
+
+    model = SimpleNamespace(
+        mtp_layer_idx=layer_idx,
+        loader=SimpleNamespace(
+            is_static_quant=True,
+            is_quant_ignored=lambda k: False,
+            has_weight_on_disk=lambda k: False,
+        ),
+    )
+    mappings = MiMoV2MTPForCausalLM._create_weight_mappings(model)
+
+    assert set(mappings.keys()) == _separate_qkv_hf_keys(layer_idx)
+    assert mappings[f"model.mtp.layers.{layer_idx}.self_attn.q_proj.weight"].target_path.endswith(
+        "q_proj.weight_q"
+    )
+    assert mappings[
+        f"model.mtp.layers.{layer_idx}.self_attn.k_proj.weight_scale_inv"
+    ].target_path.endswith("k_proj.weight_scale")
+    assert model._uses_fused_mtp_qkv is False
