@@ -1385,13 +1385,15 @@ def _fused_ep_moe_kernel(
                             gate = jnp.zeros((btc, bf), dtype=jnp.float32)
                             if not disable_dynamic_ffn1:
                                 for p_id in range(t_packing):
-                                    def _ffn1_gate_sg(sg_id, gate_acc, _pid=p_id):
+                                    w1_scales_all = b_w1_scale_x2_vmem[slot, p_id, pl.ds(0, n_sg), 0, pl.ds(0, bf)]
+                                    w1_s_repl = jnp.broadcast_to(w1_scales_all[:, None, :], (n_sg, btc, bf))
+                                    def _ffn1_gate_sg(sg_id, gate_acc, _pid=p_id, _w1_sr=w1_s_repl):
                                         sg_off = sg_id * quant_block_k
                                         x_slice = b_x_vmem[pl.ds(btc_id * btc, btc), _pid, pl.ds(sg_off, quant_block_k)]
                                         x_slice = maybe_cast_ffn1_input(x_slice)
                                         w1_tile = b_w1_x2_vmem[slot, _pid, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)]
                                         d1 = jnp.dot(x_slice, w1_tile, preferred_element_type=jnp.float32)
-                                        s1 = b_w1_scale_x2_vmem[slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)].reshape(bf)
+                                        s1 = _w1_sr[sg_id]
                                         return gate_acc + d1 * s1
                                     gate = lax.fori_loop(0, n_sg, _ffn1_gate_sg, gate, unroll=n_sg)
                             b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
@@ -1404,13 +1406,15 @@ def _fused_ep_moe_kernel(
                             up = jnp.zeros((btc, bf), dtype=jnp.float32)
                             if not disable_dynamic_ffn1:
                                 for p_id in range(t_packing):
-                                    def _ffn1_up_sg(sg_id, up_acc, _pid=p_id):
+                                    w3_scales_all = b_w3_scale_x2_vmem[slot, p_id, pl.ds(0, n_sg), 0, pl.ds(0, bf)]
+                                    w3_s_repl = jnp.broadcast_to(w3_scales_all[:, None, :], (n_sg, btc, bf))
+                                    def _ffn1_up_sg(sg_id, up_acc, _pid=p_id, _w3_sr=w3_s_repl):
                                         sg_off = sg_id * quant_block_k
                                         x_slice = b_x_vmem[pl.ds(btc_id * btc, btc), _pid, pl.ds(sg_off, quant_block_k)]
                                         x_slice = maybe_cast_ffn1_input(x_slice)
                                         w3_tile = b_w3_x2_vmem[slot, _pid, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)]
                                         d3 = jnp.dot(x_slice, w3_tile, preferred_element_type=jnp.float32)
-                                        s3 = b_w3_scale_x2_vmem[slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)].reshape(bf)
+                                        s3 = _w3_sr[sg_id]
                                         return up_acc + d3 * s3
                                     up = lax.fori_loop(0, n_sg, _ffn1_up_sg, up, unroll=n_sg)
                             b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
@@ -1426,6 +1430,18 @@ def _fused_ep_moe_kernel(
                             up = jnp.zeros((btc, bf), dtype=jnp.float32)
                             if not disable_dynamic_ffn1:
                                 for p_id in range(t_packing):
+                                    w1_scales_all = b_w1_scale_x2_vmem[
+                                        slot, p_id, pl.ds(0, n_sg), 0, pl.ds(0, bf),
+                                    ]
+                                    w1_s_repl = jnp.broadcast_to(
+                                        w1_scales_all[:, None, :], (n_sg, btc, bf),
+                                    )
+                                    w3_scales_all = b_w3_scale_x2_vmem[
+                                        slot, p_id, pl.ds(0, n_sg), 0, pl.ds(0, bf),
+                                    ]
+                                    w3_s_repl = jnp.broadcast_to(
+                                        w3_scales_all[:, None, :], (n_sg, btc, bf),
+                                    )
                                     def _ffn1_sg_body(sg_id, carry):
                                         gate_acc, up_acc = carry
                                         sg_off = sg_id * quant_block_k
@@ -1451,26 +1467,14 @@ def _fused_ep_moe_kernel(
                                             x_slice, w1_tile,
                                             preferred_element_type=jnp.float32,
                                         )
-                                        s1 = b_w1_scale_x2_vmem[
-                                            slot,
-                                            p_id,
-                                            pl.ds(sg_id, 1),
-                                            0,
-                                            pl.ds(0, bf),
-                                        ].reshape(bf)
+                                        s1 = w1_s_repl[sg_id]
                                         gate_acc += d1 * s1
 
                                         d3 = jnp.dot(
                                             x_slice, w3_tile,
                                             preferred_element_type=jnp.float32,
                                         )
-                                        s3 = b_w3_scale_x2_vmem[
-                                            slot,
-                                            p_id,
-                                            pl.ds(sg_id, 1),
-                                            0,
-                                            pl.ds(0, bf),
-                                        ].reshape(bf)
+                                        s3 = w3_s_repl[sg_id]
                                         up_acc += d3 * s3
                                         return gate_acc, up_acc
 
@@ -1689,6 +1693,12 @@ def _fused_ep_moe_kernel(
                         if not disable_dynamic_ffn2:
                             for p_id in range(t_packing):
                                 if use_direct_w2:
+                                    w2_scales_all = b_w2_scale_x2_vmem[
+                                        slot, p_id, pl.ds(0, n_sg2), 0, pl.ds(0, h_per_t),
+                                    ]
+                                    w2_s_repl = jnp.broadcast_to(
+                                        w2_scales_all[:, None, :], (n_sg2, btc, h_per_t),
+                                    )
                                     def _ffn2_sg_body(sg_id, partial_acc):
                                         sg_off = sg_id * quant_block_k
                                         gate_slice = b_gate_acc_vmem[
@@ -1711,13 +1721,7 @@ def _fused_ep_moe_kernel(
                                             act_slice, w2_tile,
                                             preferred_element_type=jnp.float32,
                                         )
-                                        s = b_w2_scale_x2_vmem[
-                                            slot,
-                                            p_id,
-                                            pl.ds(sg_id, 1),
-                                            0,
-                                            pl.ds(0, h_per_t),
-                                        ].reshape(h_per_t)
+                                        s = w2_s_repl[sg_id]
                                         return partial_acc + d * s
 
                                     partial = lax.fori_loop(
