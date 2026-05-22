@@ -2198,6 +2198,7 @@ class ScheduleBatch:
             deepstack_visual_embedding=None,
             recurrent_indices=recurrent_indices_cpu,
             has_initial_state=has_initial_state_cpu,
+            mm_inputs=_collect_mm_inputs(self.reqs),
         )
 
     def get_spec_model_worker_batch(
@@ -2389,6 +2390,7 @@ class ScheduleBatch:
             spec_info=self.spec_info,
             spec_algorithm=self.spec_algorithm,
             tree_cache=self.tree_cache,
+            mm_inputs=_collect_mm_inputs(self.reqs),
         )
 
     def _generate_trace_info(self, real_bs: int, bid: int) -> list[str]:
@@ -2562,6 +2564,26 @@ def _extract_mm_value(mm_inputs: Any, key: str):
     if isinstance(mm_inputs, dict):
         return mm_inputs.get(key)
     return getattr(mm_inputs, key, None)
+
+
+def _collect_mm_inputs(reqs: list) -> list | None:
+    """Gather per-request multimodal inputs for the standard LLM pipeline.
+
+    Returns:
+        A list of length = len(reqs) where each entry is the request's
+        `mm_inputs` (MultimodalInputs or dict) or None for text-only requests.
+        Returns None if no request has multimodal inputs.
+    """
+    if not reqs:
+        return None
+    has_any = False
+    out = []
+    for r in reqs:
+        mm = getattr(r, "mm_inputs", None)
+        out.append(mm)
+        if mm is not None:
+            has_any = True
+    return out if has_any else None
 
 
 def _as_int_scalar(value: Any, default: int = 0) -> int:
@@ -2881,6 +2903,11 @@ class ModelWorkerBatch:
 
     # MRoPE position information [3, total_tokens]
     mrope_positions: np.ndarray | None = None
+
+    # Per-request multimodal inputs (pixel_values + grid_thw + ...).
+    # Carried as a list[MultimodalInputs] (length = batch_size); models that
+    # don't need them (text-only) leave this None. Non-array, lives in pytree aux_data.
+    mm_inputs: list | None = None
 
     # Recurrent state indices for hybrid recurrent models
     recurrent_indices: np.ndarray | None = None

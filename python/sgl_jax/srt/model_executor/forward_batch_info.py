@@ -201,6 +201,13 @@ class ForwardBatch:
     apply_for_deepstack: bool = False
     deepstack_visual_embedding: jax.Array | None = None
 
+    # Per-request multimodal inputs (pixel_values + grid_thw + ...).
+    # list[MultimodalInputs] of length batch_size. Non-array; carried via
+    # pytree aux_data so jax.jit treats it as static (the actual ViT forward
+    # consumes feature tensors that the model module pulls out of these
+    # MultimodalDataItems and converts to jax.Arrays on the fly).
+    mm_inputs: list | None = None
+
     # Recurrent state indices [batch_size]
     recurrent_indices: jax.Array | None = None
 
@@ -234,6 +241,7 @@ class ForwardBatch:
             "spec_algorithm": self.spec_algorithm,
             "capture_hidden_mode": self.capture_hidden_mode,
             "deterministic": self.deterministic,
+            "mm_inputs": self.mm_inputs,
         }
         return (children, aux_data)
 
@@ -246,6 +254,7 @@ class ForwardBatch:
         obj.spec_algorithm = aux_data["spec_algorithm"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
         obj.deterministic = aux_data.get("deterministic", True)
+        obj.mm_inputs = aux_data.get("mm_inputs", None)
         obj.trace_request_ids = None
         obj.trace_request_objects = None
 
@@ -415,6 +424,7 @@ class ForwardBatch:
             input_embedding=input_embedding,
             apply_for_deepstack=batch.apply_for_deepstack,
             deepstack_visual_embedding=deepstack_visual_embedding,
+            mm_inputs=batch.mm_inputs,
             expert_location_metadata=expert_location_metadata,
             recurrent_indices=recurrent_indices,
         )
