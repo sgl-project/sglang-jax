@@ -69,6 +69,11 @@ def run_unittest_files(
     reruns_delay: float = 10,
     only_rerun: list[str] | None = None,
 ):
+    # When JAX_COMPILATION_CACHE_DIR is set (e.g. /xla-cache in CI),
+    # jtu.JaxTestCase.setUp() needs this flag to properly manage cache
+    # lifecycle — without it, lazy cache init trips the global-state assertion.
+    os.environ.setdefault("JAX_TEST_WITH_PERSISTENT_COMPILATION_CACHE", "1")
+
     tic = time.perf_counter()
     success = True
 
