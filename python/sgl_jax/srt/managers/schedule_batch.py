@@ -2049,7 +2049,7 @@ class ScheduleBatch:
         )
 
     def _get_spec_decode_mwb_dp(
-        self, bs_paddings: list, enable_static_lora: bool
+        self, bs_paddings: list, enable_static_lora: bool, draft_token_num: int = 1
     ) -> ModelWorkerBatch:
         """DP-aware spec-decode ModelWorkerBatch (#1053 P1-5b).
 
@@ -2100,18 +2100,10 @@ class ScheduleBatch:
             )
             for i in self.reqs_info
         ]
-        # Derive per-req token count from any non-empty rank; pad each rank's
-        # chunk to per_dp_bs * per_req_tokens so the merged out_cache_loc has
-        # a stable bucket-aligned shape across runtime bs. Fall back to max
-        # chunk length if derived target is smaller (defensive).
-        per_req_tokens = 0
-        for chunk, info in zip(ocl_chunks, self.reqs_info):
-            n_real = len(info.reqs) if info.reqs else 0
-            if n_real > 0 and len(chunk) > 0:
-                per_req_tokens = max(per_req_tokens, len(chunk) // n_real)
-        per_req_tokens = max(per_req_tokens, 1)
+        # Pad each rank's out_cache_loc to per_dp_bs * draft_token_num so the
+        # merged shape is stable across runtime bs. max_chunk_len defensive.
         max_chunk_len = max((len(c) for c in ocl_chunks), default=0)
-        target_per_rank_ocl = max(per_dp_bs * per_req_tokens, max_chunk_len)
+        target_per_rank_ocl = max(per_dp_bs * draft_token_num, max_chunk_len)
         out_cache_loc = (
             np.concatenate(
                 [
@@ -2430,11 +2422,12 @@ class ScheduleBatch:
         cache_loc_paddings: list,
         page_size: int,
         enable_static_lora: bool = False,
+        draft_token_num: int = 1,
     ) -> ModelWorkerBatch:
         assert (
             self.forward_mode.is_decode_or_idle()
         ), "spec extend must use get_model_worker_batch, only decode reaches here"
-        return self._get_spec_decode_mwb_dp(bs_paddings, enable_static_lora)
+        return self._get_spec_decode_mwb_dp(bs_paddings, enable_static_lora, draft_token_num)
 
     def _generate_trace_info(self, real_bs: int, bid: int) -> list[str]:
         """Generate trace information for requests (unified for all dp_size >= 1)."""
