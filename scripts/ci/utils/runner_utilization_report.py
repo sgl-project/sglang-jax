@@ -77,17 +77,18 @@ def get_workflow_runs(repo, hours=24):
         page_count = 0
         hit_cutoff = False
         for line in output.strip().splitlines():
-            if line.strip():
-                try:
-                    run = json.loads(line)
-                    created = parse_time(run.get("created_at"))
-                    if created and created < cutoff:
-                        hit_cutoff = True
-                        continue
-                    runs.append(run)
-                    page_count += 1
-                except json.JSONDecodeError:
+            if not line.strip():
+                continue
+            page_count += 1
+            try:
+                run = json.loads(line)
+                created = parse_time(run.get("created_at"))
+                if created and created < cutoff:
+                    hit_cutoff = True
                     continue
+                runs.append(run)
+            except json.JSONDecodeError:
+                continue
 
         if hit_cutoff or page_count < per_page:
             break
