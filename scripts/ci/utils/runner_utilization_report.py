@@ -20,8 +20,11 @@ DEFAULT_LABELS_TO_IGNORE = {"self-hosted", "Linux", "X64", "ARM64"}
 GITHUB_HOSTED_LABELS = {"ubuntu-latest", "ubuntu-22.04", "ubuntu-24.04"}
 
 
-def run_gh_command(args, max_retries=10):
-    """Run a gh CLI command with exponential backoff retry on failure."""
+_NON_RETRYABLE_PATTERNS = ("401", "403", "404", "422", "not found", "Must have admin")
+
+
+def run_gh_command(args, max_retries=5):
+    """Run a gh CLI command with exponential backoff retry on transient failure."""
     for attempt in range(max_retries):
         try:
             result = subprocess.run(
@@ -32,9 +35,11 @@ def run_gh_command(args, max_retries=10):
             )
             return result.stdout
         except subprocess.CalledProcessError as e:
+            err = str(e.stderr)
+            if any(p in err for p in _NON_RETRYABLE_PATTERNS):
+                raise
             if attempt == max_retries - 1:
                 raise
-            # Exponential backoff with jitter
             wait = (2**attempt) + random.uniform(0, 1)
             print(
                 f"Command failed (attempt {attempt + 1}/{max_retries}), retrying in {wait:.1f}s: {e.stderr.strip()}"
@@ -190,8 +195,8 @@ def calculate_concurrency_metrics(jobs, window_start, window_end, num_runners):
         return {
             "peak_concurrent": 0,
             "avg_concurrent": 0.0,
-            "saturation_pct": 0.0,
-            "peak_queue": 0,
+            "saturation_pct": None,
+            "peak_queue": None,
         }
 
     # At equal timestamps, process end events (delta=-1) before start events
@@ -220,8 +225,8 @@ def calculate_concurrency_metrics(jobs, window_start, window_end, num_runners):
     window_seconds = (window_end - window_start).total_seconds()
     avg_concurrent = weighted_sum / window_seconds if window_seconds > 0 else 0.0
 
-    saturation_pct = (avg_concurrent / num_runners * 100.0) if num_runners > 0 else 0.0
-    peak_queue = max(0, peak - num_runners)
+    saturation_pct = (avg_concurrent / num_runners * 100.0) if num_runners > 0 else None
+    peak_queue = max(0, peak - num_runners) if num_runners > 0 else None
 
     return {
         "peak_concurrent": peak,
@@ -358,7 +363,7 @@ def calculate_utilization(repo, hours=24, runner_filter=None):
             label_jobs.get(label, []),
             window_start,
             window_end,
-            num_runners if num_runners > 0 else 1,
+            num_runners,
         )
 
         results[label] = {
@@ -429,8 +434,10 @@ def format_report(results, hours, fetch_failure_pct=0.0):
         avg = conc["avg_concurrent"]
         sat = conc["saturation_pct"]
         queue = conc["peak_queue"]
+        sat_str = f"{sat:.1f}%" if sat is not None else "N/A"
+        queue_str = str(queue) if queue is not None else "N/A"
 
-        lines.append(f"| `{label}` | {peak} | {avg:.2f} | {sat:.1f}% | {queue} |")
+        lines.append(f"| `{label}` | {peak} | {avg:.2f} | {sat_str} | {queue_str} |")
 
     lines.append("")
 
@@ -454,7 +461,7 @@ def format_report(results, hours, fetch_failure_pct=0.0):
             )
             has_recommendation = True
 
-        if conc["peak_queue"] > 0:
+        if conc["peak_queue"] is not None and conc["peak_queue"] > 0:
             lines.append(
                 f"- **`{label}`**: Peak queue depth of {conc['peak_queue']} job(s) detected. Jobs had to wait for a free runner."
             )
