@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import jax
 import numpy as np
-from jax import numpy as jnp
 from jax._src import mesh as mesh_lib
 
 from sgl_jax.global_config import global_config
@@ -2192,6 +2191,8 @@ class ScheduleBatch:
         if flat is None:
             return [None] * len(real_bs_per_dp)
 
+        flat._ensure_host()
+
         per_req_fields = (
             "topk_p",
             "topk_index",
@@ -2260,7 +2261,8 @@ class ScheduleBatch:
             if isinstance(nonnull[0], np.ndarray):
                 kwargs[f] = np.concatenate(nonnull, axis=0)
             else:
-                kwargs[f] = jnp.concatenate(nonnull, axis=0)
+                nonnull = [np.asarray(v) for v in nonnull]
+                kwargs[f] = np.concatenate(nonnull, axis=0)
         return type(nonempty[0])(**kwargs)
 
     def get_model_worker_batch(

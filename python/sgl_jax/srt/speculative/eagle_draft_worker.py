@@ -269,22 +269,25 @@ class EagleDraftWorker(BaseDraftWorker):
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, draft_logits_output.next_token_logits, draft_logits_output.hidden_states
         )
-        # rep_logits stays padded so topk_probs_from_logits jit cache key is
-        # stable; gather to real_bs after the jit. rep_hidden gathered by
-        # token-major select_index already lands at real_bs.
-        draft_logits_output.hidden_states = rep_hidden[select_index]
+        # topk_probs_from_logits runs as @jax.jit on bucket-shaped rep_logits;
+        # keep this on device with stable shape.
         topk_p, topk_index = topk_probs_from_logits(rep_logits, self.topk)
-        sel_jax = jnp.asarray(sel)
-        topk_p = topk_p[sel_jax]
-        topk_index = topk_index[sel_jax]
-        draft_logits_output.next_token_logits = rep_logits[sel_jax]
+        # Gather to real_bs on host to avoid variable-shape device gathers.
+        jax.copy_to_host_async(topk_p)
+        jax.copy_to_host_async(topk_index)
+        jax.copy_to_host_async(rep_hidden)
+        verified_id_arr = batch_output.next_draft_input.verified_id
+        if hasattr(verified_id_arr, "copy_to_host_async"):
+            jax.copy_to_host_async(verified_id_arr)
+        topk_p = np.asarray(topk_p)[sel]
+        topk_index = np.asarray(topk_index)[sel]
+        hidden = np.asarray(rep_hidden)[select_index]
+        verified_id = np.asarray(verified_id_arr)[select_index]
 
-        batch_output.next_draft_input.hidden_states = draft_logits_output.hidden_states
+        batch_output.next_draft_input.hidden_states = hidden
         batch_output.next_draft_input.topk_p = topk_p
         batch_output.next_draft_input.topk_index = topk_index
-        batch_output.next_draft_input.verified_id = batch_output.next_draft_input.verified_id[
-            select_index
-        ]
+        batch_output.next_draft_input.verified_id = verified_id
         batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
         batch_output.accept_lens = accept_host
 
@@ -296,10 +299,12 @@ class EagleDraftWorker(BaseDraftWorker):
         topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
         hidden = replicate_to_mesh(self.mesh, logits_output.hidden_states)
         if sel is not None:
-            sel_jax = jnp.asarray(sel)
-            topk_p = topk_p[sel_jax]
-            topk_index = topk_index[sel_jax]
-            hidden = hidden[sel_jax]
+            jax.copy_to_host_async(topk_p)
+            jax.copy_to_host_async(topk_index)
+            jax.copy_to_host_async(hidden)
+            topk_p = np.asarray(topk_p)[sel]
+            topk_index = np.asarray(topk_index)[sel]
+            hidden = np.asarray(hidden)[sel]
         draft_input.topk_p = topk_p
         draft_input.topk_index = topk_index
         draft_input.hidden_states = hidden
