@@ -36,7 +36,10 @@ def run_gh_command(args, max_retries=5):
             return result.stdout
         except subprocess.CalledProcessError as e:
             err = str(e.stderr)
-            if any(p in err for p in _NON_RETRYABLE_PATTERNS):
+            err_lower = err.lower()
+            if "rate limit" in err_lower:
+                pass  # fall through to backoff
+            elif any(p in err for p in _NON_RETRYABLE_PATTERNS):
                 raise
             if attempt == max_retries - 1:
                 raise
@@ -48,32 +51,48 @@ def run_gh_command(args, max_retries=5):
 
 
 def get_workflow_runs(repo, hours=24):
-    """Fetch workflow runs from the past N hours with pagination."""
+    """Fetch workflow runs from the past N hours with manual pagination and early stop."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-
-    output = run_gh_command(
-        [
-            "api",
-            f"/repos/{repo}/actions/runs",
-            "--paginate",
-            "-f",
-            "per_page=100",
-            "--jq",
-            ".workflow_runs[]",
-        ]
-    )
-
     runs = []
-    for line in output.strip().splitlines():
-        if line.strip():
-            try:
-                run = json.loads(line)
-                created = parse_time(run.get("created_at"))
-                if created and created < cutoff:
+    page = 1
+    per_page = 100
+
+    while True:
+        output = run_gh_command(
+            [
+                "api",
+                f"/repos/{repo}/actions/runs",
+                "-f",
+                f"per_page={per_page}",
+                "-f",
+                f"page={page}",
+                "--jq",
+                ".workflow_runs[]",
+            ]
+        )
+
+        if not output.strip():
+            break
+
+        page_count = 0
+        hit_cutoff = False
+        for line in output.strip().splitlines():
+            if line.strip():
+                try:
+                    run = json.loads(line)
+                    created = parse_time(run.get("created_at"))
+                    if created and created < cutoff:
+                        hit_cutoff = True
+                        continue
+                    runs.append(run)
+                    page_count += 1
+                except json.JSONDecodeError:
                     continue
-                runs.append(run)
-            except json.JSONDecodeError:
-                continue
+
+        if hit_cutoff or page_count < per_page:
+            break
+
+        page += 1
 
     return runs
 
