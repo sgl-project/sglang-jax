@@ -24,6 +24,8 @@ jobs:
         part: [0, 1 , 2, 3]
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -35,6 +37,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
         timeout-minutes: 1000
         run: |
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
@@ -51,7 +54,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
+          python3 scripts/ci/publish.py --data-type bench --source-dir ./test/nightly_test_output
 
       - name: Generate CSV Entry and publish
         env:
@@ -73,7 +76,7 @@ jobs:
           fi
           echo "$SHA,$AUTHOR,$MSG,$RUN_URL" >> $FILE
           echo "CSV line added: $SHA, $AUTHOR, $MSG"
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./meta
+          python3 scripts/ci/publish.py --data-type bench --source-dir ./meta
 
 
   nightly-test-accuracy-text-models-4-tpu:
@@ -85,6 +88,8 @@ jobs:
         part: [0, 1 , 2, 3 , 4, 5]
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -96,6 +101,7 @@ jobs:
         env:
             HF_TOKEN: ${{ secrets.HF_TOKEN }}
             HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+            JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
         timeout-minutes: 1200
         run: |
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
@@ -112,7 +118,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
+          python3 scripts/ci/publish.py --data-type bench --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-text-models-1-tpu:
@@ -124,6 +130,8 @@ jobs:
         part: [0, 1 , 2, 3, 4, 5, 6, 7]
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -137,6 +145,7 @@ jobs:
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
         run: |
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
           export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/perf/$OUTPUT_DIR_NAME"
@@ -156,7 +165,7 @@ jobs:
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
 
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
+          python3 scripts/ci/publish.py --data-type perf --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-text-models-4-tpu-part1:
@@ -164,6 +173,8 @@ jobs:
     runs-on: arc-runner-v6e-4
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -178,6 +189,7 @@ jobs:
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
         run: |
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
           export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/perf/$OUTPUT_DIR_NAME"
@@ -196,7 +208,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
+          python3 scripts/ci/publish.py --data-type perf --source-dir ./test/nightly_test_output
 
       - name: Generate CSV Entry and publish
         env:
@@ -218,7 +230,7 @@ jobs:
           fi
           echo "$SHA,$AUTHOR,$MSG,$RUN_URL" >> $FILE
           echo "CSV line added: $SHA, $AUTHOR, $MSG"
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./meta
+          python3 scripts/ci/publish.py --data-type perf --source-dir ./meta
 
 
   nightly-test-perf-text-models-4-tpu-part2:
@@ -226,6 +238,8 @@ jobs:
       runs-on: arc-runner-v6e-4
       env:
         TZ: Asia/Shanghai
+        JAX_COMPILATION_CACHE_DIR: /xla-cache
+        SGLANG_JAX_MODEL_CACHE: /models/model_scope
       steps:
         - name: Checkout code
           uses: actions/checkout@v4
@@ -240,6 +254,7 @@ jobs:
             PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
             HF_TOKEN: ${{ secrets.HF_TOKEN }}
             HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+            JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
           run: |
             export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
             export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/perf/$OUTPUT_DIR_NAME"
@@ -258,7 +273,7 @@ jobs:
             GITHUB_RUN_ID: ${{ github.run_id }}
             GITHUB_RUN_NUMBER: ${{ github.run_number }}
           run: |
-            python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
+            python3 scripts/ci/publish.py --data-type perf --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-text-models-4-tpu-part3:
@@ -266,6 +281,8 @@ jobs:
         runs-on: arc-runner-v6e-4
         env:
           TZ: Asia/Shanghai
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
+          SGLANG_JAX_MODEL_CACHE: /models/model_scope
         steps:
           - name: Checkout code
             uses: actions/checkout@v4
@@ -280,6 +297,7 @@ jobs:
               PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
               HF_TOKEN: ${{ secrets.HF_TOKEN }}
               HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+              JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
             run: |
               export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
               export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/perf/$OUTPUT_DIR_NAME"
@@ -298,7 +316,7 @@ jobs:
               GITHUB_RUN_ID: ${{ github.run_id }}
               GITHUB_RUN_NUMBER: ${{ github.run_number }}
             run: |
-              python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
+              python3 scripts/ci/publish.py --data-type perf --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-trace-text-models-1-tpu:
@@ -310,6 +328,8 @@ jobs:
         part: [0, 1 , 2, 3, 4, 5, 6, 7]
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -323,6 +343,7 @@ jobs:
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
         run: |
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
           export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/trace/$OUTPUT_DIR_NAME"
@@ -341,7 +362,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir ./test/nightly_test_output
+          python3 scripts/ci/publish.py --data-type trace --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-trace-text-models-4-tpu-part1:
@@ -349,6 +370,8 @@ jobs:
     runs-on: arc-runner-v6e-4
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -363,6 +386,7 @@ jobs:
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
         run: |
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
           export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/trace/$OUTPUT_DIR_NAME"
@@ -381,7 +405,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir ./test/nightly_test_output
+          python3 scripts/ci/publish.py --data-type trace --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-trace-text-models-4-tpu-part2:
@@ -389,6 +413,8 @@ jobs:
       runs-on: arc-runner-v6e-4
       env:
         TZ: Asia/Shanghai
+        JAX_COMPILATION_CACHE_DIR: /xla-cache
+        SGLANG_JAX_MODEL_CACHE: /models/model_scope
       steps:
         - name: Checkout code
           uses: actions/checkout@v4
@@ -403,6 +429,7 @@ jobs:
             PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
             HF_TOKEN: ${{ secrets.HF_TOKEN }}
             HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+            JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
           run: |
             export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
             export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/trace/$OUTPUT_DIR_NAME"
@@ -421,7 +448,7 @@ jobs:
             GITHUB_RUN_ID: ${{ github.run_id }}
             GITHUB_RUN_NUMBER: ${{ github.run_number }}
           run: |
-            python3 scripts/ci/publish_traces.py --traces-dir ./test/nightly_test_output
+            python3 scripts/ci/publish.py --data-type trace --source-dir ./test/nightly_test_output
 
         - name: Generate CSV Entry and publish
           env:
@@ -443,7 +470,7 @@ jobs:
             fi
             echo "$SHA,$AUTHOR,$MSG,$RUN_URL" >> $FILE
             echo "CSV line added: $SHA, $AUTHOR, $MSG"
-            python3 scripts/ci/publish_bench_and_perf.py --source-dir ./meta
+            python3 scripts/ci/publish.py --data-type bench --source-dir ./meta
 
   nightly-test-finish:
     needs: [

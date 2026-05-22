@@ -39,6 +39,7 @@ jobs:
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
         run: |
           python test/srt/run_suite.py --suite unit-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
@@ -59,8 +60,10 @@ jobs:
         uses: ./.github/actions/setup-venv
       - name: Run unit test
         timeout-minutes: 30
+        shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
         run: |
           bash scripts/killall_sglang.sh
@@ -104,6 +107,7 @@ jobs:
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
@@ -130,6 +134,7 @@ jobs:
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
@@ -153,8 +158,10 @@ jobs:
         uses: ./.github/actions/setup-venv
       - name: Evaluate accuracy
         timeout-minutes: 20
+        shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
@@ -179,8 +186,10 @@ jobs:
         uses: ./.github/actions/setup-venv
       - name: Evaluate MoE accuracy (TP=4)
         timeout-minutes: 50
+        shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
@@ -204,8 +213,10 @@ jobs:
           extra-packages: evalscope==1.0.0
       - name: Run extra multi-chip accuracy tests
         timeout-minutes: 120
+        shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
@@ -229,8 +240,10 @@ jobs:
           extra-packages: evalscope==1.0.0
       - name: Run extra accuracy tests
         timeout-minutes: 60
+        shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
@@ -255,8 +268,10 @@ jobs:
         uses: ./.github/actions/setup-venv
       - name: Benchmark performance
         timeout-minutes: 30
+        shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
@@ -280,9 +295,10 @@ jobs:
         uses: ./.github/actions/setup-venv
       - name: Benchmark performance (tp=4)
         timeout-minutes: 50
-
+        shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
@@ -304,8 +320,10 @@ jobs:
         uses: ./.github/actions/setup-venv
       - name: Run extra performance tests
         timeout-minutes: 120
+        shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
@@ -327,8 +345,10 @@ jobs:
         uses: ./.github/actions/setup-venv
       - name: Run perf trace tests
         timeout-minutes: 60
+        shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
@@ -356,6 +376,7 @@ jobs:
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
