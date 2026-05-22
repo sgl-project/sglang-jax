@@ -138,9 +138,9 @@ class MultiLayerDraftWorker(EagleDraftWorker):
     # ---- per-layer overrides ------------------------------------------------
 
     def draft_forward(self, model_worker_batch: ModelWorkerBatch):
-        topk_p = model_worker_batch.spec_info.topk_p
-        topk_index = model_worker_batch.spec_info.topk_index
-        hidden_states = model_worker_batch.spec_info.hidden_states
+        topk_p = model_worker_batch.spec_info_padded.topk_p
+        topk_index = model_worker_batch.spec_info_padded.topk_index
+        hidden_states = model_worker_batch.spec_info_padded.hidden_states
         bs = model_worker_batch.seq_lens.shape[0]
         step_min_1 = self.speculative_num_steps - 1
         score_list = jnp.empty((bs, 1 + step_min_1 * self.topk, self.topk))
@@ -209,7 +209,7 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         """
         sel = np.asarray(model_worker_batch.logits_indices_selector)
         verified_id_np = np.asarray(jax.device_get(next_token_ids))[sel]
-        model_worker_batch.spec_info = EagleDraftInput(
+        model_worker_batch.spec_info_padded = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=verified_id_np,
             num_tokens_per_batch=np.asarray(1, dtype=jnp.int32),
@@ -217,11 +217,11 @@ class MultiLayerDraftWorker(EagleDraftWorker):
             allocate_lens=model_worker_batch.seq_lens,
         )
         model_worker_batch.return_hidden_states = False
-        model_worker_batch.spec_info.prepare_for_extend_after_target_prefill(
+        model_worker_batch.spec_info_padded.prepare_for_extend_after_target_prefill(
             model_worker_batch=model_worker_batch
         )
         # FULL: layer i+1 needs layer i's per-token hidden over the whole prefix.
-        model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
+        model_worker_batch.spec_info_padded.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         last_idx = model_worker_batch.logits_indices
 
@@ -229,7 +229,7 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         cur_hidden = hidden_states
         for i, w in enumerate(self._workers):
             mr = w.model_runner
-            model_worker_batch.spec_info.hidden_states = cur_hidden
+            model_worker_batch.spec_info_padded.hidden_states = cur_hidden
             forward_batch = ForwardBatch.init_new(model_worker_batch, mr)
             forward_batch.return_logprob = False
             mr.attn_backend.forward_metadata = mr.attn_backend.get_eagle_forward_metadata(
@@ -254,9 +254,11 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         )
         layer0_out.next_token_logits = rep_logits[sel, :]
         layer0_out.hidden_states = rep_hidden[last_idx][sel]
-        model_worker_batch.spec_info.hidden_states = hidden_states
-        model_worker_batch.spec_info.allocate_lens = np.asarray(model_worker_batch.seq_lens)[sel]
-        self.capture_for_decode(layer0_out, model_worker_batch.spec_info)
+        model_worker_batch.spec_info_padded.hidden_states = hidden_states
+        model_worker_batch.spec_info_padded.allocate_lens = np.asarray(model_worker_batch.seq_lens)[
+            sel
+        ]
+        self.capture_for_decode(layer0_out, model_worker_batch.spec_info_padded)
 
     def draft_extend_for_decode(
         self, model_worker_batch: ModelWorkerBatch, batch_output: GenerationBatchResult
@@ -291,7 +293,7 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         cur_hidden = target_hidden
         for i, w in enumerate(self._workers):
             mr = w.model_runner
-            mwb.spec_info.hidden_states = cur_hidden
+            mwb.spec_info_padded.hidden_states = cur_hidden
             mr.attn_backend.forward_metadata = mr.attn_backend.get_eagle_forward_metadata(mwb)
             forward_batch = ForwardBatch.init_new(mwb, mr)
             logits_output, _, _ = mr.forward(forward_batch, logits_metadata=logits_metadata)

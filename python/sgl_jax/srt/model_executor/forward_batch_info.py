@@ -409,7 +409,7 @@ class ForwardBatch:
             lora_token_indices=lora_token_indices,
             lora_ranks=lora_ranks,
             attn_backend=model_runner.attn_backend,
-            spec_info=batch.spec_info,
+            spec_info=batch.spec_info_padded,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embedding=input_embedding,
