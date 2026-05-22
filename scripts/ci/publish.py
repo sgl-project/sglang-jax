@@ -47,6 +47,7 @@ def verify_token_permissions(repo_owner, repo_name, token):
     """Verify that the token has necessary permissions for the repository"""
     print("Verifying token permissions...")
 
+    # Check if we can access the repository
     try:
         url = f"https://api.github.com/repos/{repo_owner}/{repo_name}"
         response = make_github_request(url, token)
@@ -56,6 +57,7 @@ def verify_token_permissions(repo_owner, repo_name, token):
         print(f"Failed to access repository: {e}")
         return False
 
+    # Check if we can read the repository contents
     try:
         url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/contents"
         response = make_github_request(url, token)
@@ -87,6 +89,7 @@ def create_blob(repo_owner, repo_name, content, token, max_retries=3):
     """Create a blob with file content"""
     url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/blobs"
 
+    # Encode content as base64 for GitHub API
     content_b64 = base64.b64encode(content).decode("utf-8")
 
     data = {"content": content_b64, "encoding": "base64"}
@@ -112,6 +115,7 @@ def create_tree(repo_owner, repo_name, base_tree_sha, files, token, max_retries=
 
     tree_items = []
     for i, (file_path, content) in enumerate(files):
+        # Create blob first to get SHA
         blob_sha = create_blob(repo_owner, repo_name, content, token)
         tree_items.append(
             {
@@ -121,6 +125,7 @@ def create_tree(repo_owner, repo_name, base_tree_sha, files, token, max_retries=
                 "sha": blob_sha,
             }
         )
+        # Progress indicator for large uploads
         if (i + 1) % 10 == 0 or (i + 1) == len(files):
             print(f"Created {i + 1}/{len(files)} blobs...")
 
@@ -152,6 +157,7 @@ def create_commit(repo_owner, repo_name, tree_sha, parent_sha, message, token, m
             response = make_github_request(url, token, method="POST", data=data)
             commit_sha = json.loads(response)["sha"]
 
+            # Verify the commit was actually created
             verify_url = (
                 f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/commits/{commit_sha}"
             )
@@ -185,6 +191,7 @@ def update_branch_ref(repo_owner, repo_name, branch, commit_sha, token, max_retr
             make_github_request(url, token, method="PATCH", data=data)
             return
         except HTTPError as e:
+            # Check if this is an "Object does not exist" error
             is_object_not_exist = False
             if hasattr(e, "error_body"):
                 try:
@@ -195,6 +202,7 @@ def update_branch_ref(repo_owner, repo_name, branch, commit_sha, token, max_retr
                     pass
 
             if is_object_not_exist and attempt < max_retries - 1:
+                # This might be a transient consistency issue - wait and retry
                 wait_time = 2**attempt
                 print(
                     f"Branch update failed with 'Object does not exist' (attempt {attempt + 1}/{max_retries}), waiting {wait_time}s for consistency..."
@@ -225,11 +233,13 @@ def collect_files(source_dir, file_extension, target_base_path):
         for file in files:
             if file.endswith(file_extension):
                 source_file = os.path.join(root, file)
+                # Calculate relative path from source_dir
                 rel_path = os.path.relpath(source_file, source_dir)
                 target_path = (
                     f"{target_base_path}/{rel_path}" if target_base_path != "" else rel_path
                 )
 
+                # Read file content as binary
                 with open(source_file, "rb") as f:
                     content = f.read()
 
@@ -274,6 +284,7 @@ def publish(source_dir, data_type, run_id, run_number):
 
     print(f"Found {len(files_to_upload)} files to upload")
 
+    # Verify token permissions before proceeding
     if not verify_token_permissions(repo_owner, repo_name, token):
         print("Token permission verification failed. Please check the token permissions.")
         sys.exit(1)
@@ -283,15 +294,19 @@ def publish(source_dir, data_type, run_id, run_number):
 
     for attempt in range(max_retries):
         try:
+            # Get current branch head
             branch_sha = get_branch_sha(repo_owner, repo_name, branch, token)
             print(f"Current branch head: {branch_sha}")
 
+            # Get current tree
             tree_sha = get_tree_sha(repo_owner, repo_name, branch_sha, token)
             print(f"Current tree SHA: {tree_sha}")
 
+            # Create new tree with all files
             new_tree_sha = create_tree(repo_owner, repo_name, tree_sha, files_to_upload, token)
             print(f"Created new tree: {new_tree_sha}")
 
+            # Create commit
             commit_message = make_commit_message(len(files_to_upload))
             commit_sha = create_commit(
                 repo_owner,
@@ -303,6 +318,7 @@ def publish(source_dir, data_type, run_id, run_number):
             )
             print(f"Created commit: {commit_sha}")
 
+            # Update branch reference
             update_branch_ref(repo_owner, repo_name, branch, commit_sha, token)
             print("Updated branch reference")
 
@@ -310,6 +326,7 @@ def publish(source_dir, data_type, run_id, run_number):
             return
 
         except Exception as e:
+            # Check for retryable errors
             is_retryable = False
             error_type = "unknown"
 
@@ -321,6 +338,7 @@ def publish(source_dir, data_type, run_id, run_number):
                     is_retryable = True
                     error_type = "object consistency"
 
+            # Also retry on HTTP errors that might be transient
             if isinstance(e, HTTPError) and e.code in [422, 500, 502, 503, 504]:
                 is_retryable = True
                 error_type = f"HTTP {e.code}"
