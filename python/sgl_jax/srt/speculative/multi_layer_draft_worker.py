@@ -320,25 +320,31 @@ class MultiLayerDraftWorker(EagleDraftWorker):
             cur_hidden = logits_output.hidden_states
 
         # logits_indices_selector maps global-flat req k → DP-padded slot s_k.
-        # rep_logits/rep_hidden are DP-padded (total_bs*(steps+1), …); gather
-        # each req's accept_len-th entry by slot, producing global-flat
-        # (real_bs, …) for the cross-round spec_info.
+        # rep_logits/rep_hidden are DP-padded (total_bs, …)/(total_bs*(steps+1), …);
+        # keep topk_probs_from_logits running on device with the padded shape
+        # (varying real_bs gather on device would generate a fresh trace per
+        # warmup batch size — see #1090). Gather to real_bs on host.
         sel = np.asarray(model_worker_batch.logits_indices_selector)
         accept_host = np.asarray(jax.device_get(batch_output.accept_lens))
         select_index = sel * (self.speculative_num_steps + 1) + accept_host[sel] - 1
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, layer0_logits.next_token_logits, layer0_logits.hidden_states
         )
-        # next_token_logits is pruned to (total_bs, vocab) (one entry per slot,
-        # already the last-accepted token via logits_indices); hidden_states is
-        # FULL (total_bs*(steps+1), H). Index logits by slot, hidden by token.
-        topk_p, topk_index = topk_probs_from_logits(rep_logits[sel], self.topk)
-        batch_output.next_draft_input.hidden_states = rep_hidden[select_index]
+        topk_p, topk_index = topk_probs_from_logits(rep_logits, self.topk)
+        jax.copy_to_host_async(topk_p)
+        jax.copy_to_host_async(topk_index)
+        jax.copy_to_host_async(rep_hidden)
+        verified_id_arr = batch_output.next_draft_input.verified_id
+        if hasattr(verified_id_arr, "copy_to_host_async"):
+            jax.copy_to_host_async(verified_id_arr)
+        topk_p = np.asarray(topk_p)[sel]
+        topk_index = np.asarray(topk_index)[sel]
+        hidden = np.asarray(rep_hidden)[select_index]
+        verified_id = np.asarray(verified_id_arr)[select_index]
+        batch_output.next_draft_input.hidden_states = hidden
         batch_output.next_draft_input.topk_p = topk_p
         batch_output.next_draft_input.topk_index = topk_index
-        batch_output.next_draft_input.verified_id = batch_output.next_draft_input.verified_id[
-            select_index
-        ]
+        batch_output.next_draft_input.verified_id = verified_id
         batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
         # accept_lens stays DP-padded (total_bs,) — scheduler per-rank seq_lens
         # update and _resolve_spec_decode_token_ids both index by DP slot.
