@@ -757,7 +757,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         denominator = swa_full_tokens_ratio * swa_layers_num * ratio + full_layers_num
         if self.is_draft_worker:
             self.full_max_total_num_tokens = self.max_total_num_tokens
-            self.swa_max_total_num_tokens = self.max_total_num_tokens
+            self.swa_max_total_num_tokens = int(self.max_total_num_tokens * swa_full_tokens_ratio)
         else:
             self.full_max_total_num_tokens = int(total_tokens / denominator)
             self.swa_max_total_num_tokens = int(
