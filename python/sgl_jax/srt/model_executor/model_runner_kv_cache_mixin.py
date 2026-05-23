@@ -584,7 +584,8 @@ class ModelRunnerKVCacheMixin:
             dp_size,
         )
 
-        # 7. Hybrid SWA token split (existing logic, not moved)
+        # 7. Hybrid SWA token split. Draft worker runs layer id discovery
+        # but skips pool size inflation inside set_num_token_hybrid().
         if self.is_hybrid:
             self.set_num_token_hybrid()
 

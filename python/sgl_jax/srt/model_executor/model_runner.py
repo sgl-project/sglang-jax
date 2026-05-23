@@ -755,8 +755,14 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             ratio = 1.0
 
         denominator = swa_full_tokens_ratio * swa_layers_num * ratio + full_layers_num
-        self.full_max_total_num_tokens = int(total_tokens / denominator)
-        self.swa_max_total_num_tokens = int(self.full_max_total_num_tokens * swa_full_tokens_ratio)
+        if self.is_draft_worker:
+            self.full_max_total_num_tokens = self.max_total_num_tokens
+            self.swa_max_total_num_tokens = self.max_total_num_tokens
+        else:
+            self.full_max_total_num_tokens = int(total_tokens / denominator)
+            self.swa_max_total_num_tokens = int(
+                self.full_max_total_num_tokens * swa_full_tokens_ratio
+            )
 
         # Align pool sizes to page_size and dp_size for sharding compatibility
         dp_size = self.server_args.dp_size
