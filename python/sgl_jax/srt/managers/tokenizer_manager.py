@@ -372,9 +372,14 @@ class TokenizerManager:
                 trust_remote_code=self.server_args.trust_remote_code,
             )
             logger.info("Loaded Qwen3VLProcessor for %s", self.server_args.model_path)
-        except Exception:
-            logger.exception("Failed to init Qwen3VLProcessor")
-            self.mm_processor = None
+        except Exception as e:
+            # Loud failure: silent fallback degrades VLMs to text-only and produces
+            # garbage outputs without any signal in normal logs (cf. MMMU 36% vs 70%).
+            raise RuntimeError(
+                "Failed to initialize Qwen3VLProcessor for VLM architecture "
+                f"{archs}. The server cannot serve image requests without it. "
+                "Check that PyTorch / HF processor deps are installed."
+            ) from e
 
     def _has_multimodal_data(self, obj: GenerateReqInput | EmbeddingReqInput) -> bool:
         image_data = getattr(obj, "image_data", None)
