@@ -407,6 +407,17 @@ class PrefillAdder:
 
         return AddReqResult.CONTINUE
 
+    def _budget_state_after_add(self, dp_rank: int):
+        if self.rem_input_tokens <= 0 or (
+            self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0
+        ):
+            return AddReqResult.OTHER
+
+        if self.is_hybrid and self.rem_swa_tokens_for_dp(dp_rank) <= 0:
+            return AddReqResult.NO_TOKEN
+
+        return AddReqResult.CONTINUE
+
     def add_chunked_req(self, req: Req):
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
         _rem_tokens = min(
@@ -557,7 +568,7 @@ class PrefillAdder:
             self.new_chunked_reqs[dp_rank] = req
             self._update_prefill_budget(0, trunc_len, 0, dp_rank)
 
-        return self.budget_state()
+        return self._budget_state_after_add(dp_rank)
 
     def add_one_req(self, req: Req):
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
@@ -640,4 +651,4 @@ class PrefillAdder:
                     self.tree_cache.inc_lock_ref(req.last_node)
                 self._update_prefill_budget(prefix_len, trunc_len, 0, dp_rank)
 
-        return self.budget_state()
+        return self._budget_state_after_add(dp_rank)
