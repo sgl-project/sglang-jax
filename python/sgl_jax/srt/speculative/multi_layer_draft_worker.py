@@ -105,7 +105,11 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         for w in self._workers:
             self._share_embed_head_one(target_worker, w)
 
-        target_slot_range = target_worker.model_runner.max_total_num_tokens
+        target_slot_range = getattr(
+            target_worker.model_runner,
+            "full_max_total_num_tokens",
+            target_worker.model_runner.max_total_num_tokens,
+        )
         for i, w in enumerate(self._workers):
             draft_pool = w.model_runner.max_total_num_tokens
             assert draft_pool >= target_slot_range, (
