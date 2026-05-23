@@ -22,24 +22,24 @@ jobs:
       fail-fast: false
       matrix:
         part: [0, 1 , 2, 3]
-    continue-on-error: true
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+        with:
+          extra-packages: 'evalscope==1.0.0'
       - name: Run eval test for text models
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
-        timeout-minutes: 3000
+          JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
+        timeout-minutes: 1000
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
-          uv pip install evalscope==1.0.0
-
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
           export BENCH_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/benchmark/$OUTPUT_DIR_NAME"
           echo "BENCH_OUTPUT_DIR=$BENCH_OUTPUT_DIR" >> $GITHUB_ENV
@@ -47,14 +47,14 @@ jobs:
 
           bash scripts/killall_sglang.sh
           cd test/srt
-          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4
+          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --reruns 2
       - name: Publish traces to storage repo
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
+          python3 scripts/ci/publish.py --data-type bench --source-dir ./test/nightly_test_output
 
       - name: Generate CSV Entry and publish
         env:
@@ -76,7 +76,7 @@ jobs:
           fi
           echo "$SHA,$AUTHOR,$MSG,$RUN_URL" >> $FILE
           echo "CSV line added: $SHA, $AUTHOR, $MSG"
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./meta
+          python3 scripts/ci/publish.py --data-type bench --source-dir ./meta
 
 
   nightly-test-accuracy-text-models-4-tpu:
@@ -86,25 +86,24 @@ jobs:
       fail-fast: false
       matrix:
         part: [0, 1 , 2, 3 , 4, 5]
-    continue-on-error: true
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+        with:
+          extra-packages: 'evalscope==1.0.0'
       - name: Run eval test for text models
         env:
             HF_TOKEN: ${{ secrets.HF_TOKEN }}
             HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+            JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
         timeout-minutes: 1200
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
-          uv pip install evalscope==1.0.0
-
-
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
           export BENCH_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/benchmark/$OUTPUT_DIR_NAME"
           echo "BENCH_OUTPUT_DIR=$BENCH_OUTPUT_DIR" >> $GITHUB_ENV
@@ -112,14 +111,14 @@ jobs:
 
           bash scripts/killall_sglang.sh
           cd test/srt
-          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 6
+          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 6 --reruns 2
       - name: Publish traces to storage repo
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
+          python3 scripts/ci/publish.py --data-type bench --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-text-models-1-tpu:
@@ -129,26 +128,25 @@ jobs:
       fail-fast: false
       matrix:
         part: [0, 1 , 2, 3, 4, 5, 6, 7]
-    continue-on-error: true
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Run performance test for text models
-        timeout-minutes: 18000
+        timeout-minutes: 840
         env:
 
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
-
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
           export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/perf/$OUTPUT_DIR_NAME"
           echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
@@ -167,33 +165,32 @@ jobs:
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
 
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
+          python3 scripts/ci/publish.py --data-type perf --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-text-models-4-tpu-part1:
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: arc-runner-v6e-4
-    continue-on-error: true
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Run performance test for text models
-        timeout-minutes: 18000
+        timeout-minutes: 430
         env:
 
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
-
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
           export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/perf/$OUTPUT_DIR_NAME"
           echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
@@ -211,7 +208,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
+          python3 scripts/ci/publish.py --data-type perf --source-dir ./test/nightly_test_output
 
       - name: Generate CSV Entry and publish
         env:
@@ -233,33 +230,32 @@ jobs:
           fi
           echo "$SHA,$AUTHOR,$MSG,$RUN_URL" >> $FILE
           echo "CSV line added: $SHA, $AUTHOR, $MSG"
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./meta
+          python3 scripts/ci/publish.py --data-type perf --source-dir ./meta
 
 
   nightly-test-perf-text-models-4-tpu-part2:
       if: github.repository == 'sgl-project/sglang-jax'
       runs-on: arc-runner-v6e-4
-      continue-on-error: true
       env:
         TZ: Asia/Shanghai
+        JAX_COMPILATION_CACHE_DIR: /xla-cache
+        SGLANG_JAX_MODEL_CACHE: /models/model_scope
       steps:
         - name: Checkout code
           uses: actions/checkout@v4
 
+        - name: Setup Python environment
+          uses: ./.github/actions/setup-venv
         - name: Run performance test for text models
-          timeout-minutes: 18000
+          timeout-minutes: 390
           env:
 
             TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
             PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
             HF_TOKEN: ${{ secrets.HF_TOKEN }}
             HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+            JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
           run: |
-            python3.12 -m venv .venv
-            source .venv/bin/activate
-            pip install uv
-            uv pip install -e "python[all]"
-
             export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
             export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/perf/$OUTPUT_DIR_NAME"
             echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
@@ -277,33 +273,32 @@ jobs:
             GITHUB_RUN_ID: ${{ github.run_id }}
             GITHUB_RUN_NUMBER: ${{ github.run_number }}
           run: |
-            python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
+            python3 scripts/ci/publish.py --data-type perf --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-text-models-4-tpu-part3:
         if: github.repository == 'sgl-project/sglang-jax'
         runs-on: arc-runner-v6e-4
-        continue-on-error: true
         env:
           TZ: Asia/Shanghai
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
+          SGLANG_JAX_MODEL_CACHE: /models/model_scope
         steps:
           - name: Checkout code
             uses: actions/checkout@v4
 
+          - name: Setup Python environment
+            uses: ./.github/actions/setup-venv
           - name: Run performance test for text models
-            timeout-minutes: 18000
+            timeout-minutes: 400
             env:
 
               TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
               PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
               HF_TOKEN: ${{ secrets.HF_TOKEN }}
               HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+              JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
             run: |
-              python3.12 -m venv .venv
-              source .venv/bin/activate
-              pip install uv
-              uv pip install -e "python[all]"
-
               export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
               export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/perf/$OUTPUT_DIR_NAME"
               echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
@@ -321,7 +316,7 @@ jobs:
               GITHUB_RUN_ID: ${{ github.run_id }}
               GITHUB_RUN_NUMBER: ${{ github.run_number }}
             run: |
-              python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
+              python3 scripts/ci/publish.py --data-type perf --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-trace-text-models-1-tpu:
@@ -331,26 +326,25 @@ jobs:
       fail-fast: false
       matrix:
         part: [0, 1 , 2, 3, 4, 5, 6, 7]
-    continue-on-error: true
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Run performance test for text models
-        timeout-minutes: 18000
+        timeout-minutes: 120
         env:
 
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
-
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
           export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/trace/$OUTPUT_DIR_NAME"
           echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
@@ -368,33 +362,32 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir ./test/nightly_test_output
+          python3 scripts/ci/publish.py --data-type trace --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-trace-text-models-4-tpu-part1:
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: arc-runner-v6e-4
-    continue-on-error: true
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Run performance test trace for text models
-        timeout-minutes: 18000
+        timeout-minutes: 365
         env:
 
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
-
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
           export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/trace/$OUTPUT_DIR_NAME"
           echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
@@ -412,33 +405,32 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir ./test/nightly_test_output
+          python3 scripts/ci/publish.py --data-type trace --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-trace-text-models-4-tpu-part2:
       if: github.repository == 'sgl-project/sglang-jax'
       runs-on: arc-runner-v6e-4
-      continue-on-error: true
       env:
         TZ: Asia/Shanghai
+        JAX_COMPILATION_CACHE_DIR: /xla-cache
+        SGLANG_JAX_MODEL_CACHE: /models/model_scope
       steps:
         - name: Checkout code
           uses: actions/checkout@v4
 
+        - name: Setup Python environment
+          uses: ./.github/actions/setup-venv
         - name: Run performance test trace for text models
-          timeout-minutes: 18000
+          timeout-minutes: 230
           env:
 
             TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
             PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
             HF_TOKEN: ${{ secrets.HF_TOKEN }}
             HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+            JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
           run: |
-            python3.12 -m venv .venv
-            source .venv/bin/activate
-            pip install uv
-            uv pip install -e "python[all]"
-
             export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
             export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/trace/$OUTPUT_DIR_NAME"
             echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
@@ -456,7 +448,7 @@ jobs:
             GITHUB_RUN_ID: ${{ github.run_id }}
             GITHUB_RUN_NUMBER: ${{ github.run_number }}
           run: |
-            python3 scripts/ci/publish_traces.py --traces-dir ./test/nightly_test_output
+            python3 scripts/ci/publish.py --data-type trace --source-dir ./test/nightly_test_output
 
         - name: Generate CSV Entry and publish
           env:
@@ -478,4 +470,59 @@ jobs:
             fi
             echo "$SHA,$AUTHOR,$MSG,$RUN_URL" >> $FILE
             echo "CSV line added: $SHA, $AUTHOR, $MSG"
-            python3 scripts/ci/publish_bench_and_perf.py --source-dir ./meta
+            python3 scripts/ci/publish.py --data-type bench --source-dir ./meta
+
+  nightly-test-finish:
+    needs: [
+      nightly-test-accuracy-text-models-1-tpu,
+      nightly-test-accuracy-text-models-4-tpu,
+      nightly-test-perf-text-models-1-tpu,
+      nightly-test-perf-text-models-4-tpu-part1,
+      nightly-test-perf-text-models-4-tpu-part2,
+      nightly-test-perf-text-models-4-tpu-part3,
+      nightly-test-perf-trace-text-models-1-tpu,
+      nightly-test-perf-trace-text-models-4-tpu-part1,
+      nightly-test-perf-trace-text-models-4-tpu-part2,
+    ]
+    if: always() && github.repository == 'sgl-project/sglang-jax'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all nightly job statuses
+        run: |
+          echo "=== Nightly Test Results ==="
+          echo "accuracy-1-tpu: ${{ needs.nightly-test-accuracy-text-models-1-tpu.result }}"
+          echo "accuracy-4-tpu: ${{ needs.nightly-test-accuracy-text-models-4-tpu.result }}"
+          echo "perf-text-1-tpu: ${{ needs.nightly-test-perf-text-models-1-tpu.result }}"
+          echo "perf-text-4-tpu-part1: ${{ needs.nightly-test-perf-text-models-4-tpu-part1.result }}"
+          echo "perf-text-4-tpu-part2: ${{ needs.nightly-test-perf-text-models-4-tpu-part2.result }}"
+          echo "perf-text-4-tpu-part3: ${{ needs.nightly-test-perf-text-models-4-tpu-part3.result }}"
+          echo "perf-trace-1-tpu: ${{ needs.nightly-test-perf-trace-text-models-1-tpu.result }}"
+          echo "perf-trace-4-tpu-part1: ${{ needs.nightly-test-perf-trace-text-models-4-tpu-part1.result }}"
+          echo "perf-trace-4-tpu-part2: ${{ needs.nightly-test-perf-trace-text-models-4-tpu-part2.result }}"
+          echo ""
+
+          has_failure=false
+          for job_result in \
+            "accuracy-1-tpu=${{ needs.nightly-test-accuracy-text-models-1-tpu.result }}" \
+            "accuracy-4-tpu=${{ needs.nightly-test-accuracy-text-models-4-tpu.result }}" \
+            "perf-text-1-tpu=${{ needs.nightly-test-perf-text-models-1-tpu.result }}" \
+            "perf-text-4-tpu-part1=${{ needs.nightly-test-perf-text-models-4-tpu-part1.result }}" \
+            "perf-text-4-tpu-part2=${{ needs.nightly-test-perf-text-models-4-tpu-part2.result }}" \
+            "perf-text-4-tpu-part3=${{ needs.nightly-test-perf-text-models-4-tpu-part3.result }}" \
+            "perf-trace-1-tpu=${{ needs.nightly-test-perf-trace-text-models-1-tpu.result }}" \
+            "perf-trace-4-tpu-part1=${{ needs.nightly-test-perf-trace-text-models-4-tpu-part1.result }}" \
+            "perf-trace-4-tpu-part2=${{ needs.nightly-test-perf-trace-text-models-4-tpu-part2.result }}"; do
+            job_name="${job_result%%=*}"
+            result="${job_result#*=}"
+            if [ "$result" != "success" ]; then
+              echo "::error::${job_name} did not succeed: ${result}"
+              has_failure=true
+            fi
+          done
+
+          if [ "$has_failure" = "true" ]; then
+            echo "::error::One or more nightly test jobs failed"
+            exit 1
+          fi
+
+          echo "All nightly test jobs passed"

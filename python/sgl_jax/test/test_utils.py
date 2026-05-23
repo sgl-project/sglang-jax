@@ -788,3 +788,28 @@ def calculate_rouge_l(output_strs_list1, output_strs_list2):
         rouge_l_scores.append(fmeasure)
 
     return rouge_l_scores
+
+
+class KDAAttnBackendForTest:
+    """Test wrapper that translates `pool=` kwarg to `recurrent_state_pool=`.
+
+    Production routes through HybridLinearAttnBackend, which accepts `pool=`
+    (RadixLinearAttention's call convention) and forwards it to the linear
+    sub-backend as `recurrent_state_pool=`. Tests that assign a raw linear
+    backend (e.g. KDAAttnBackend) as `forward_batch.attn_backend` bypass the
+    wrapper, so this shim replicates the same translation.
+    """
+
+    def __init__(self, backend):
+        object.__setattr__(self, "_backend", backend)
+
+    def __call__(self, *args, **kwargs):
+        if "pool" in kwargs:
+            kwargs["recurrent_state_pool"] = kwargs.pop("pool")
+        return self._backend(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._backend, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._backend, name, value)

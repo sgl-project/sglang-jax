@@ -35,6 +35,7 @@ class CompilationManager:
         max_req_len: int,
         vocab_size: int,
         multimodal: bool = False,
+        has_recurrent_state: bool = False,
     ):
         self.dp_size = dp_size
         self.tp_size = tp_size
@@ -44,6 +45,7 @@ class CompilationManager:
         self.max_padded_num_tokens = max_padded_num_tokens
         self.vocab_size = vocab_size
         self.multimodal = multimodal
+        self.has_recurrent_state = has_recurrent_state
         self.moe_backend = server_args.moe_backend
         self.enable_static_lora = server_args.enable_static_lora
 
@@ -254,7 +256,6 @@ class CompilationManager:
             ModelWorkerSamplingInfo,
         )
         from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
-        from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
         valid_input_ids = np.array([1] * bs, dtype=jnp.int32)
         invalid_input_ids = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
@@ -276,7 +277,7 @@ class CompilationManager:
         if speculative_algorithm is None:
             sampling_info = ModelWorkerSamplingInfo.generate_for_precompile(bs, self.vocab_size)
         else:
-            sampling_info = SamplingBatchInfo.generate_for_precompile_all_greedy(
+            sampling_info = ModelWorkerSamplingInfo.generate_for_precompile_all_greedy(
                 bs, self.vocab_size
             )
 
@@ -310,6 +311,12 @@ class CompilationManager:
             per_dp_bs_size=per_dp_bs_size,
             real_bs_per_dp=[bs] * dp_size,
             logits_indices_selector=np.arange(bs, dtype=np.int32),
+            # Hybrid recurrent backends (e.g. KDA) require these per-batch
+            # arrays even at precompile time; slot 0 is RecurrentStatePool's
+            # per-rank dummy slot, safe to point at. Leave None otherwise so
+            # non-recurrent backends are unaffected.
+            recurrent_indices=(np.zeros(bs, dtype=np.int32) if self.has_recurrent_state else None),
+            has_initial_state=(np.zeros(bs, dtype=np.bool_) if self.has_recurrent_state else None),
         )
 
     # ---- Lazy compilation tracking ----

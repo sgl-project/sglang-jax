@@ -102,7 +102,7 @@ class Embed(nnx.Module):
         if self.num_embeddings == 1:
             return jnp.broadcast_to(embedding, inputs.shape + (self.features,))
 
-        output_pspec = P(*([None] * inputs.ndim), self.kernel_axes[-1])
+        output_pspec = P("data", *([None] * (inputs.ndim - 1)), self.kernel_axes[-1])
         output_sharding = NamedSharding(self.mesh, output_pspec)
         output = embedding.at[inputs].get(out_sharding=output_sharding)
         return output
@@ -200,6 +200,7 @@ class RotaryEmbedding:
         base: int,
         is_neox_style: bool,
         dtype: jnp.dtype,
+        mesh: jax.sharding.Mesh | None = None,
     ):
         self.head_size = head_size
         self.rotary_dim = rotary_dim
@@ -619,7 +620,13 @@ def get_rope(
         else:
             raise ValueError("Unknown RoPE scaling type")
 
-        if scaling_type == "llama3":
+        if scaling_type == "default":
+            # HF transformers uses rope_type="default" to mean "no scaling",
+            # equivalent to rope_scaling=None.  Fall back to plain RotaryEmbedding.
+            rotary_emb = RotaryEmbedding(
+                head_size, rotary_dim, max_position, base, is_neox_style, dtype
+            )
+        elif scaling_type == "llama3":
             scaling_factor = rope_scaling["factor"]
             low_freq_factor = rope_scaling["low_freq_factor"]
             high_freq_factor = rope_scaling["high_freq_factor"]

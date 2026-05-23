@@ -147,9 +147,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         if server_args.enable_lora:
             self.init_lora_manager()
 
+        self._sampler_base_rng = jax.random.PRNGKey(server_args.random_seed)
+        self._sampler_step = 0
         if not self.is_draft_worker:
-            self._sampler_base_rng = jax.random.PRNGKey(server_args.random_seed)
-            self._sampler_step = 0
             self.initialize_jit()
 
         # Init memory pool and attention backends
@@ -315,6 +315,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         # DeepseekV3DecoderLayer to construct DeepseekV3Attention; harmless on
         # non-MLA models that ignore the attribute.
         self.model_config.hf_config.use_absorbed_mla = self.server_args.attention_backend == "fa"
+        self.model_config.hf_config.enable_sequence_parallel = (
+            self.server_args.enable_sequence_parallel
+        )
 
         if self.server_args.ep_dispatch_algorithm:
             with jax.set_mesh(self.mesh):
@@ -480,30 +483,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
     ):
         cache_miss_count = 0
         import jax._src.test_util as jtu
-
-        for key, value in forward_batch.__dict__.items():
-            if isinstance(value, jax.Array):
-                logger.debug(
-                    "forward_batch %s: shape=%s, sharding=%s, dtype=%s",
-                    key,
-                    value.shape,
-                    value.sharding,
-                    value.dtype,
-                )
-            else:
-                logger.debug("forward_batch %s: %s", key, value)
-
-        for key, value in logits_metadata.__dict__.items():
-            if isinstance(value, jax.Array):
-                logger.debug(
-                    "logits_metadata %s: shape=%s, sharding=%s, dtype=%s",
-                    key,
-                    value.shape,
-                    value.sharding,
-                    value.dtype,
-                )
-            else:
-                logger.debug("logits_metadata %s: %s", key, value)
 
         with jtu.count_pjit_cpp_cache_miss() as count:
             output, pool_updates, _, layers_topk_ids = self.jitted_run_model(

@@ -1,5 +1,5 @@
 """
-Publish performance traces to GitHub repository
+Unified publish script for CI artifacts (bench, perf, trace) to GitHub repository.
 """
 
 import argparse
@@ -17,7 +17,6 @@ def make_github_request(url, token, method="GET", data=None):
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
-        # "User-Agent": "sglang-ci",
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
@@ -35,7 +34,7 @@ def make_github_request(url, token, method="GET", data=None):
         try:
             error_body = e.read().decode("utf-8")
             print(f"Error response body: {error_body}")
-            e.error_body = error_body  # Attach for later inspection
+            e.error_body = error_body
         except Exception:
             e.error_body = ""
         raise
@@ -101,7 +100,7 @@ def create_blob(repo_owner, repo_name, content, token, max_retries=3):
             return json.loads(response)["sha"]
         except Exception as e:
             if attempt < max_retries - 1:
-                wait_time = 2**attempt  # Exponential backoff: 1s, 2s, 4s
+                wait_time = 2**attempt
                 print(
                     f"Blob creation failed (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s..."
                 )
@@ -222,23 +221,22 @@ def update_branch_ref(repo_owner, repo_name, branch, commit_sha, token, max_retr
                 raise
 
 
-def prepare_files_for_upload(source_dir, target_base_path):
-    """Prepare files from a directory and return a list of files to upload"""
+def collect_files(source_dir, file_extension, target_base_path):
+    """Collect files with the given extension from source_dir for upload."""
     files_to_upload = []
 
     if not os.path.exists(source_dir):
         print(f"Warning: Source directory {source_dir} does not exist")
         return files_to_upload
 
-    # Walk through source directory and find .csv files
     for root, dirs, files in os.walk(source_dir):
         for file in files:
-            if file.endswith(".csv"):
+            if file.endswith(file_extension):
                 source_file = os.path.join(root, file)
                 # Calculate relative path from source_dir
                 rel_path = os.path.relpath(source_file, source_dir)
                 target_path = (
-                    f"{target_base_path}/{rel_path}" if target_base_path != "" else f"{rel_path}"
+                    f"{target_base_path}/{rel_path}" if target_base_path != "" else rel_path
                 )
 
                 # Read file content as binary
@@ -250,28 +248,41 @@ def prepare_files_for_upload(source_dir, target_base_path):
     return files_to_upload
 
 
-def publish_traces(traces_dir, run_id, run_number):
-    """Publish traces to GitHub repository in a single commit"""
-    # Get environment variables
+def publish(source_dir, data_type, run_id, run_number):
+    """Publish files to GitHub repository in a single commit."""
     token = os.getenv("GITHUB_TOKEN")
     if not token:
         print("Error: GITHUB_TOKEN environment variable not set")
         sys.exit(1)
 
-    # Repository configuration
     repo_owner = "pathfinder-pf"
     repo_name = "sglang-jax-ci-data"
     branch = "main"
     target_base_path = ""
 
-    # Copy trace files
-    files_to_upload = prepare_files_for_upload(traces_dir, target_base_path)
+    if data_type == "trace":
+        file_extension = ".json.gz"
+        no_files_msg = "No trace files found to upload"
+        success_msg = "Successfully published all traces in a single commit"
+
+        def make_commit_message(count):
+            return f"Nightly traces for run {run_id} at {run_number} ({count} files)"
+
+    else:  # bench or perf
+        file_extension = ".csv"
+        no_files_msg = "No csv files found to upload"
+        success_msg = "Successfully published all csv files in a single commit"
+
+        def make_commit_message(count):
+            return f"CSV files of Nightly-test for run {run_id} at {run_number} ({count} files)"
+
+    files_to_upload = collect_files(source_dir, file_extension, target_base_path)
 
     if not files_to_upload:
-        print("No csv files found to upload")
+        print(no_files_msg)
         return
 
-    print(f"Found {len(files_to_upload)} CSV files to upload")
+    print(f"Found {len(files_to_upload)} files to upload")
 
     # Verify token permissions before proceeding
     if not verify_token_permissions(repo_owner, repo_name, token):
@@ -296,7 +307,7 @@ def publish_traces(traces_dir, run_id, run_number):
             print(f"Created new tree: {new_tree_sha}")
 
             # Create commit
-            commit_message = f"CSV files of Nightly-test for run {run_id} at {run_number} ({len(files_to_upload)} files)"
+            commit_message = make_commit_message(len(files_to_upload))
             commit_sha = create_commit(
                 repo_owner,
                 repo_name,
@@ -311,7 +322,7 @@ def publish_traces(traces_dir, run_id, run_number):
             update_branch_ref(repo_owner, repo_name, branch, commit_sha, token)
             print("Updated branch reference")
 
-            print("Successfully published all csv files in a single commit")
+            print(success_msg)
             return
 
         except Exception as e:
@@ -338,21 +349,27 @@ def publish_traces(traces_dir, run_id, run_number):
                 )
                 time.sleep(retry_delay)
             else:
-                print(f"Failed to publish traces after {attempt + 1} attempts: {e}")
+                print(f"Failed to publish after {attempt + 1} attempts: {e}")
                 raise
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Publish files to a GitHub repository")
+    parser = argparse.ArgumentParser(description="Publish CI artifacts to a GitHub repository")
     parser.add_argument(
         "--source-dir",
         type=str,
         required=True,
         help="Source directory with files to publish",
     )
+    parser.add_argument(
+        "--data-type",
+        type=str,
+        required=True,
+        choices=["bench", "perf", "trace"],
+        help="Type of data to publish: bench/perf (scans .csv) or trace (scans .json.gz)",
+    )
     args = parser.parse_args()
 
-    # Get environment variables
     run_id = os.getenv("GITHUB_RUN_ID", "test")
     run_number = os.getenv("GITHUB_RUN_NUMBER", "12345")
 
@@ -360,12 +377,8 @@ def main():
         print("Error: GITHUB_RUN_ID and GITHUB_RUN_NUMBER environment variables must be set")
         sys.exit(1)
 
-    # Use source directory
-    source_dir = args.source_dir
-    print(f"Processing files from directory: {source_dir}")
-
-    # Publish files
-    publish_traces(source_dir, run_id, run_number)
+    print(f"Processing files from directory: {args.source_dir}")
+    publish(args.source_dir, args.data_type, run_id, run_number)
 
 
 if __name__ == "__main__":

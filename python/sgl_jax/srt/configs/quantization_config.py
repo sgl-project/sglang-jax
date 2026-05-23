@@ -105,6 +105,7 @@ class QuantizationConfig:
     is_static_checkpoint: bool = False
     ignored_layers: list[str] | None = None
     weight_block_size: tuple[int, int] | None = None
+    allow_narrow_n_blockwise: bool = False
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "QuantizationConfig":
@@ -159,6 +160,7 @@ class QuantizationConfig:
         moe_activation_dtype = _str_to_dtype(moe_section.get("activation_dtype"))
         is_static_checkpoint = quant.get("is_static_checkpoint", False)
         weight_block_size = normalize_weight_block_size(quant.get("weight_block_size"))
+        allow_narrow_n_blockwise = quant.get("allow_narrow_n_blockwise", False)
 
         return cls(
             linear_rules=linear_rules,
@@ -167,6 +169,7 @@ class QuantizationConfig:
             is_static_checkpoint=is_static_checkpoint,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
+            allow_narrow_n_blockwise=allow_narrow_n_blockwise,
         )
 
     @classmethod

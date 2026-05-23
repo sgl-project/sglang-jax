@@ -22,6 +22,8 @@ def xla_quantized_matmul_local(
     compute_dtype: jnp.dtype | None = None,
     weight_block_size: tuple[int, int] | None = None,
     activation_quant_dtype: jnp.dtype | None = None,
+    allow_narrow_n_blockwise: bool = False,
+    output_scatter_dimension: int | None = None,
 ) -> jax.Array:
     """
     Local quantized matmul for use inside shard_map.
@@ -69,15 +71,21 @@ def xla_quantized_matmul_local(
                 "Block-wise quantized matmul requires the blockwise kernel, "
                 "but it failed to load. Please check your installation."
             )
-        if not should_use_blockwise_kernel(
+        # TODO: Investigate root cause of accuracy collapse for narrow-N TP-sharded
+        # layers with block-wise quant (e.g. Qwen3-30B-A3B k/v projections at TP=4
+        # achieve GSM8K 0.489 vs 0.938 for per-channel). Either fix the blockwise
+        # kernel for out_dim <= block_size_out, or fall back to per-channel for those
+        # layers. Models known to be unaffected (e.g. DeepSeek V3/R1) can set
+        # allow_narrow_n_blockwise=True to bypass this guard. The guard on the quant config is temporary
+        if not allow_narrow_n_blockwise and not should_use_blockwise_kernel(
             out_dim=int(out_dim),
             block_size_out=int(block_size_out),
         ):
             raise RuntimeError(
                 f"Block-wise kernel does not support out_dim={out_dim} with "
-                f"block_size_out={block_size_out} (known to cause NaNs)."
+                f"block_size_out={block_size_out} (known to cause accuracy collapse). "
+                "Set allow_narrow_n_blockwise=True in your quantization config to override."
             )
-
         # w_scale is already in kernel-ready layout [in_blocks, 1, n_out].
         x_q_dtype = act_quant_dtype if quantize_activation else x.dtype
         tuned_value = get_safe_blockwise_tuned_value(
@@ -122,8 +130,16 @@ def xla_quantized_matmul_local(
             out = out.astype(compute_dtype) * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
 
     out = out.astype(out_dtype)
-    # Sum partial results across devices (single all-reduce)
+    # Reduce across the contracted (input) axis. Caller passes
+    # ``output_scatter_dimension`` only when it has already decided that a
+    # reduce-scatter on that dim is appropriate AND wired ``out_specs``
+    # accordingly; otherwise we do a plain all-reduce.
     if reduce_axis is not None:
-        out = lax.psum(out, axis_name=reduce_axis)
+        if output_scatter_dimension is not None:
+            out = lax.psum_scatter(
+                out, axis_name=reduce_axis, scatter_dimension=output_scatter_dimension, tiled=True
+            )
+        else:
+            out = lax.psum(out, axis_name=reduce_axis)
 
     return out

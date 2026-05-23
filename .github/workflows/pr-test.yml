@@ -5,69 +5,26 @@ on:
     branches:
       - main
       - "epic/*"
-    paths:
-      - "python/**"
-      - "scripts/**"
-      - "test/**"
-      - ".github/workflows/pr-test.yml"
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
     branches:
       - main
       - "epic/*"
-    paths:
-      - "python/**"
-      - "scripts/**"
-      - "test/**"
-      - ".github/workflows/pr-test.yml"
 
 concurrency:
-  group: pr-test-${{ github.ref }}
-  cancel-in-progress: true
+  group: pr-test-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # =============================================== check changes ====================================================
-  check-changes:
-    runs-on: ubuntu-latest
-    outputs:
-      main_package: ${{ steps.filter.outputs.main_package }}
-      pallas_kernel: ${{ steps.filter.outputs.pallas_kernel }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-      # TODO: use run-ci label when sglang-jax-bot exists
-      # - name: Fail if the PR does not have the 'run-ci' label
-      #   if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'run-ci')
-      #   run: |
-      #     echo "This pull request does not have the 'run-ci' label. Failing the workflow."
-      #     exit 1
+  # =============================================== coordinator ====================================================
+  coordinator:
+    uses: ./.github/workflows/coordinator.yml
 
-      - name: Fail if the PR is a draft
-        if: github.event_name == 'pull_request' && github.event.pull_request.draft == true
-        run: |
-          echo "This pull request is a draft. Failing the workflow."
-          exit 1
-
-      - name: Detect file changes
-        id: filter
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            main_package:
-              - "python/sgl_jax/**"
-              - "python/*.toml"
-              - "scripts/**"
-              - "test/**"
-              - ".github/workflows/pr-test.yml"
-            pallas_kernel:
-              - "python/sgl_jax/kernels/**"
-              - "benchmark/kernels/**"
-              - ".github/workflows/pr-test.yml"
-  # =============================================== unit-test ====================================================
+  # =============================================== Stage 1: fast unit tests ========================================
   unit-test-1-tpu:
-    needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    needs: [coordinator]
+    if: needs.coordinator.outputs.run_main_test == 'true'
     runs-on: arc-runner-v6e-1
-    #runs-on: ubuntu-slim
     strategy:
       fail-fast: false
       matrix:
@@ -75,22 +32,22 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Run unit test
         timeout-minutes: 60
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
           python test/srt/run_suite.py --suite unit-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
+  # =============================================== Stage 2: multi-chip + e2e + accuracy ============================
   unit-test-4-tpu:
-    needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    needs: [coordinator, unit-test-1-tpu]
+    if: needs.coordinator.outputs.run_main_test == 'true'
     runs-on: arc-runner-v6e-4
     strategy:
       fail-fast: false
@@ -99,23 +56,42 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Run unit test
         timeout-minutes: 30
+        shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite unit-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
-  # =============================================== e2e-test ===============================================
+  unit-test-cpu:
+    needs: [coordinator]
+    if: needs.coordinator.outputs.run_main_test == 'true'
+    runs-on: arc-runner-cpu
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+        with:
+          install-target: python[cpu]
+      - name: Run unit test
+        timeout-minutes: 30
+        shell: bash
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+          USE_DEVICE_TYPE: cpu
+        run: |
+          python test/srt/run_suite.py --suite unit-test-cpu
+
   e2e-test-1-tpu:
-    needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    needs: [coordinator, unit-test-1-tpu]
+    if: needs.coordinator.outputs.run_main_test == 'true'
     runs-on: arc-runner-v6e-1
     strategy:
       fail-fast: false
@@ -124,26 +100,25 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Run e2e test
         timeout-minutes: 120
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite e2e-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
 
   e2e-test-4-tpu:
-    needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    needs: [coordinator, unit-test-1-tpu]
+    if: needs.coordinator.outputs.run_main_test == 'true'
     runs-on: arc-runner-v6e-4
     strategy:
       fail-fast: false
@@ -152,26 +127,24 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Run e2e test
         timeout-minutes: 120
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite e2e-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
-  # =============================================== accurancy-test ===============================================
-  accurancy-test-1-tpu:
-    needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+  accuracy-test-1-tpu:
+    needs: [coordinator, unit-test-1-tpu]
+    if: needs.coordinator.outputs.run_main_test == 'true'
     runs-on: arc-runner-v6e-1
     strategy:
       fail-fast: false
@@ -181,24 +154,24 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Evaluate accuracy
         timeout-minutes: 20
+        shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
-  accurancy-test-4-tpu:
-    needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+  accuracy-test-4-tpu:
+    needs: [coordinator, unit-test-1-tpu]
+    if: needs.coordinator.outputs.run_main_test == 'true'
 
     runs-on: arc-runner-v6e-4
     strategy:
@@ -209,26 +182,79 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Evaluate MoE accuracy (TP=4)
         timeout-minutes: 50
+        shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-4 --timeout-per-file 3000 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
-  # =============================================== performance-test ===============================================
-  performance-test-1-tpu:
-    needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+  # ---- Stage 2 optional: multi-chip-extra (label test:multi-chip or test:full) ----
+  multi-chip-extra-test-4-tpu:
+    needs: [coordinator, unit-test-1-tpu]
+    if: >-
+      needs.coordinator.outputs.run_main_test == 'true' &&
+      (needs.coordinator.outputs.requires_4tpu == 'true' || needs.coordinator.outputs.run_full == 'true')
+    runs-on: arc-runner-v6e-4
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+        with:
+          extra-packages: evalscope==1.0.0
+      - name: Run extra multi-chip accuracy tests
+        timeout-minutes: 120
+        shell: bash
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
+          SGLANG_JAX_MODEL_CACHE: /models/model_scope
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DOWNLOAD_TIMEOUT: 300
+        run: |
+          bash scripts/killall_sglang.sh
+          python test/srt/run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-4
 
+  # ---- Stage 2 optional: accuracy-extra (label test:accuracy-extra or test:full) ----
+  accuracy-extra-test-1-tpu:
+    needs: [coordinator, unit-test-1-tpu]
+    if: >-
+      needs.coordinator.outputs.run_main_test == 'true' &&
+      (needs.coordinator.outputs.run_accuracy_extra == 'true' || needs.coordinator.outputs.run_full == 'true')
+    runs-on: arc-runner-v6e-1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+        with:
+          extra-packages: evalscope==1.0.0
+      - name: Run extra accuracy tests
+        timeout-minutes: 60
+        shell: bash
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
+          SGLANG_JAX_MODEL_CACHE: /models/model_scope
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DOWNLOAD_TIMEOUT: 300
+        run: |
+          bash scripts/killall_sglang.sh
+          python test/srt/run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-1
+
+  # =============================================== Stage 3: performance benchmarks =================================
+  performance-test-1-tpu:
+    needs: [coordinator, unit-test-4-tpu, e2e-test-1-tpu, e2e-test-4-tpu, accuracy-test-1-tpu, accuracy-test-4-tpu]
+    if: needs.coordinator.outputs.run_main_test == 'true'
     runs-on: arc-runner-v6e-1
     strategy:
       fail-fast: false
@@ -238,25 +264,24 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Benchmark performance
         timeout-minutes: 30
+        shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite performance-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   performance-test-4-tpu:
-    needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
-
+    needs: [coordinator, unit-test-4-tpu, e2e-test-1-tpu, e2e-test-4-tpu, accuracy-test-1-tpu, accuracy-test-4-tpu]
+    if: needs.coordinator.outputs.run_main_test == 'true'
     runs-on: arc-runner-v6e-4
     strategy:
       fail-fast: false
@@ -266,26 +291,76 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Benchmark performance (tp=4)
         timeout-minutes: 50
-
+        shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite performance-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3000
 
-  # =============================================== kernel-benchmark ===============================================
+  # ---- Stage 3 optional: perf-extra (label test:perf or test:full) ----
+  perf-extra-test-1-tpu:
+    needs: [coordinator, unit-test-4-tpu, e2e-test-1-tpu, e2e-test-4-tpu, accuracy-test-1-tpu, accuracy-test-4-tpu]
+    if: >-
+      needs.coordinator.outputs.run_main_test == 'true' &&
+      (needs.coordinator.outputs.run_perf == 'true' || needs.coordinator.outputs.run_full == 'true')
+    runs-on: arc-runner-v6e-1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+      - name: Run extra performance tests
+        timeout-minutes: 120
+        shell: bash
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
+          SGLANG_JAX_MODEL_CACHE: /models/model_scope
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DOWNLOAD_TIMEOUT: 300
+        run: |
+          bash scripts/killall_sglang.sh
+          python test/srt/run_suite.py --suite nightly-test-perf-text-models-tpu-v6e-1
+
+  # ---- Stage 3 optional: perf-trace (label test:perf-trace or test:full) ----
+  perf-trace-test-1-tpu:
+    needs: [coordinator, unit-test-4-tpu, e2e-test-1-tpu, e2e-test-4-tpu, accuracy-test-1-tpu, accuracy-test-4-tpu]
+    if: >-
+      needs.coordinator.outputs.run_main_test == 'true' &&
+      (needs.coordinator.outputs.run_perf_trace == 'true' || needs.coordinator.outputs.run_full == 'true')
+    runs-on: arc-runner-v6e-1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+      - name: Run perf trace tests
+        timeout-minutes: 60
+        shell: bash
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
+          SGLANG_JAX_MODEL_CACHE: /models/model_scope
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DOWNLOAD_TIMEOUT: 300
+        run: |
+          bash scripts/killall_sglang.sh
+          python test/srt/run_suite.py --suite nightly-test-perf-trace-text-models-tpu-v6e-1
+
+  # =============================================== kernel benchmark (independent) ==================================
+  # Independent of the stage chain: triggered by pallas_kernel changes, not main_package.
   pallas-kernel-benchmark:
-    needs: [check-changes]
-    if: github.event.pull_request.draft == false && needs.check-changes.outputs.pallas_kernel == 'true'
+    needs: [coordinator]
+    if: needs.coordinator.outputs.run_pallas_bench == 'true'
     runs-on: arc-runner-v6e-1
     strategy:
       fail-fast: false
@@ -294,43 +369,68 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
       - name: Run test
         timeout-minutes: 120
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
           python test/srt/run_suite.py --suite kernel-performance-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
+  # =============================================== finish gate =====================================================
   pr-test-finish:
     needs: [
-      performance-test-1-tpu,
-      performance-test-4-tpu,
-      accurancy-test-1-tpu,
-      accurancy-test-4-tpu,
+      coordinator,
       unit-test-1-tpu,
       unit-test-4-tpu,
+      unit-test-cpu,
       e2e-test-1-tpu,
       e2e-test-4-tpu,
+      accuracy-test-1-tpu,
+      accuracy-test-4-tpu,
+      multi-chip-extra-test-4-tpu,
+      accuracy-extra-test-1-tpu,
+      performance-test-1-tpu,
+      performance-test-4-tpu,
+      perf-extra-test-1-tpu,
+      perf-trace-test-1-tpu,
       pallas-kernel-benchmark,
     ]
-    runs-on: arc-runner-v6e-1
+    if: always()
+    runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: scripts/ci
       - name: Check all dependent job statuses
-        run: |
-          results=(${{ join(needs.*.result, ' ') }})
-          for result in "${results[@]}"; do
-            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
-              echo "Job failed with result: $result"
-              exit 1
-            fi
-          done
-          echo "All jobs completed successfully"
-          exit 0
+        env:
+          RUN_MAIN_TEST: ${{ needs.coordinator.outputs.run_main_test }}
+          RUN_PALLAS_BENCH: ${{ needs.coordinator.outputs.run_pallas_bench }}
+          REQUIRES_4TPU: ${{ needs.coordinator.outputs.requires_4tpu }}
+          RUN_FULL: ${{ needs.coordinator.outputs.run_full }}
+          RUN_ACCURACY_EXTRA: ${{ needs.coordinator.outputs.run_accuracy_extra }}
+          RUN_PERF: ${{ needs.coordinator.outputs.run_perf }}
+          RUN_PERF_TRACE: ${{ needs.coordinator.outputs.run_perf_trace }}
+          R_COORDINATOR: ${{ needs.coordinator.result }}
+          R_UNIT_1: ${{ needs.unit-test-1-tpu.result }}
+          R_UNIT_4: ${{ needs.unit-test-4-tpu.result }}
+          R_CPU: ${{ needs.unit-test-cpu.result }}
+          R_E2E_1: ${{ needs.e2e-test-1-tpu.result }}
+          R_E2E_4: ${{ needs.e2e-test-4-tpu.result }}
+          R_ACC_1: ${{ needs.accuracy-test-1-tpu.result }}
+          R_ACC_4: ${{ needs.accuracy-test-4-tpu.result }}
+          R_MULTI_CHIP: ${{ needs.multi-chip-extra-test-4-tpu.result }}
+          R_ACC_EXTRA: ${{ needs.accuracy-extra-test-1-tpu.result }}
+          R_PERF_1: ${{ needs.performance-test-1-tpu.result }}
+          R_PERF_4: ${{ needs.performance-test-4-tpu.result }}
+          R_PERF_EXTRA: ${{ needs.perf-extra-test-1-tpu.result }}
+          R_PERF_TRACE: ${{ needs.perf-trace-test-1-tpu.result }}
+          R_PALLAS: ${{ needs.pallas-kernel-benchmark.result }}
+        run: python scripts/ci/finish_check.py
