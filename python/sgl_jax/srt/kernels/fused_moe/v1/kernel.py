@@ -3320,6 +3320,19 @@ def fused_ep_moe(
                 "disable_sync_barrier is only supported with disable_a2a=True or ep_size=1."
             )
 
+    # Pad tokens to ep_size * t_packing alignment for spec decode compatibility.
+    # Spec decode decode batches can have num_tokens < ep_size * t_packing
+    # (e.g. bs=16 with ep_size=64 → local_num_tokens=0.25, invalid).
+    t_packing = get_dtype_packing(tokens.dtype)
+    min_tokens = ep_size * t_packing
+    orig_num_tokens = tokens.shape[0]
+    if orig_num_tokens % min_tokens != 0:
+        padded_num_tokens = ((orig_num_tokens + min_tokens - 1) // min_tokens) * min_tokens
+        pad_len = padded_num_tokens - orig_num_tokens
+        tokens = jnp.pad(tokens, ((0, pad_len), (0, 0)))
+        topk_weights = jnp.pad(topk_weights, ((0, pad_len), (0, 0)))
+        topk_ids = jnp.pad(topk_ids, ((0, pad_len), (0, 0)))
+
     if block_config is None:
         from .tuned_block_configs import get_tuned_fused_moe_block_config
 
@@ -3815,7 +3828,7 @@ def fused_ep_moe(
     )
     a2a_g_hbm_scratch = pl.empty((num_experts, bt, t_packing, hidden_size // t_packing), t_dtype)
 
-    return kernel(
+    result = kernel(
         tokens,
         w1,
         w2,
@@ -3838,3 +3851,6 @@ def fused_ep_moe(
         w3_shared_scale,
         w2_shared_scale,
     )
+    if result.shape[0] != orig_num_tokens:
+        result = result[:orig_num_tokens]
+    return result
