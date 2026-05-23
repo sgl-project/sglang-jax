@@ -555,20 +555,22 @@ class ModelRunnerKVCacheMixin:
         max_num_reqs = self._resolve_max_num_reqs(max_num_reqs)
 
         # 5. Speculative decoding headroom (needs max_num_reqs)
+        # For target worker: defer max_total_num_tokens inflation until after
+        # hybrid SWA split (step 7) to avoid amplifying spec headroom through
+        # the SWA layer ratio. Only compute the headroom amount here.
+        spec_headroom = 0
         if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
             if self.is_draft_worker:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 max_num_reqs = self.server_args.max_num_reqs
             else:
-                self.server_args.draft_runner_cache_size = (
-                    self.max_total_num_tokens
-                    + max_num_reqs
+                spec_headroom = (
+                    max_num_reqs
                     * self.server_args.speculative_num_steps
                     * self.server_args.speculative_eagle_topk
                     + max_num_reqs * self.server_args.speculative_num_draft_tokens
                     + 100
                 )
-                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 self.server_args.max_num_reqs = max_num_reqs
 
         # 6. Apply constraints (CI, user cap, page align, dp). Draft worker's
@@ -585,18 +587,12 @@ class ModelRunnerKVCacheMixin:
         # 7. Hybrid SWA token split (existing logic, not moved)
         if self.is_hybrid:
             self.set_num_token_hybrid()
-            if (
-                not self.is_draft_worker
-                and self.spec_algorithm is not None
-                and not self.spec_algorithm.is_none()
-            ):
-                # Draft shares target's allocator, whose slot range is the
-                # *post-hybrid* full-pool size. The draft_runner_cache_size set
-                # in step 5 was pre-hybrid; without this overwrite, draft's own
-                # KV pool is smaller than the slot range it indexes into, so any
-                # slot >= pre-hybrid size reads/writes garbage (manifests as
-                # accept[1:]=1 for reqs allocated at high slots).
-                self.server_args.draft_runner_cache_size = self.max_total_num_tokens
+
+        # 7b. Apply spec headroom AFTER hybrid split so it's not amplified
+        # by the SWA layer ratio.
+        if spec_headroom > 0:
+            self.max_total_num_tokens += spec_headroom
+            self.server_args.draft_runner_cache_size = self.max_total_num_tokens
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
