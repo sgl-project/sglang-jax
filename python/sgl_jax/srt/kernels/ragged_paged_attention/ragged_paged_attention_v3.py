@@ -1759,12 +1759,12 @@ def ragged_paged_attention(
     if out_dtype is None:
         out_dtype = jnp.float32 if q.dtype == jnp.float32 else jnp.bfloat16
 
-    # When page_size>=256 the dynamic mask slice in _fetch_mask fails
-    # Mosaic's tiling(8) proof; under that condition the host pads each
-    # mask row to the page-aligned kv_len (= cu_kv_lens delta). Derive
-    # the gate here from kv_cache shape (static) so it survives jit
-    # tracing without an extra kwarg from the backend.
-    mask_aligned_to_cu_kv = int(page_size) >= 256
+    # The dynamic mask slice in _fetch_mask requires mask_kv_len divisible by
+    # tiling(8); cu_kv_lens deltas are page-aligned and host always pads each
+    # mask row to that width, so we always take the aligned path. (Used to be
+    # gated on page_size>=256 which broke dp=1 + spec verify with smaller
+    # pages; host pad is now unconditional.)
+    mask_aligned_to_cu_kv = True
 
     # Prepare custom mask.
     if custom_mask is not None:
