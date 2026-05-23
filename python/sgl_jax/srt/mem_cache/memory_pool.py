@@ -1358,10 +1358,24 @@ class HybridLinearKVPool(KVCache):
 
 @register_pytree_node_class
 class MemoryPools:
-    """Pytree container that uniformly manages multiple pool replace operations."""
+    """Pytree container that uniformly manages multiple pool replace operations.
 
-    def __init__(self, **pools):
+    A reserved ``host_pool`` slot is exposed for the upcoming HiCache L2
+    host-side pool (PR-1-5 ``SingleChipHostPool``). It defaults to
+    ``None`` so existing call sites stay backward-compatible; once the
+    HiCache host pool lands it can be passed via the keyword-only
+    ``host_pool`` argument and participates in the pytree as the last
+    leaf-group.
+
+    Note on donation: ``jax.jit(donate_argnames=["memory_pools"])`` in
+    ``model_runner.initialize_jit`` already donates the whole container.
+    Adding the slot changes the ``PyTreeDef`` so jit caches will retrace
+    once on next launch — that is the validation goal of PR-1-2.
+    """
+
+    def __init__(self, *, host_pool=None, **pools):
         self._pools = pools
+        self.host_pool = host_pool
 
     def __getattr__(self, name):
         if name.startswith("_"):
@@ -1375,11 +1389,15 @@ class MemoryPools:
 
     def tree_flatten(self):
         keys = sorted(self._pools.keys())
-        return [self._pools[k] for k in keys], tuple(keys)
+        children = [self._pools[k] for k in keys] + [self.host_pool]
+        return children, tuple(keys)
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        return cls(**dict(zip(aux_data, children)))
+        pool_count = len(aux_data)
+        pool_children = children[:pool_count]
+        host_pool = children[pool_count]
+        return cls(host_pool=host_pool, **dict(zip(aux_data, pool_children)))
 
     def replace_all(self, updates) -> None:
         if isinstance(updates, list):
