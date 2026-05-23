@@ -67,6 +67,7 @@ from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
 from sgl_jax.srt.managers.utils import validate_input_length
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
+from sgl_jax.srt.mem_cache.kv_cache_builder import build_kv_cache
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
@@ -514,35 +515,18 @@ class Scheduler(
             )
 
     def init_memory_pool_and_cache(self):
-        server_args = self.server_args
         self.req_to_token_pool, self.token_to_kv_pool_allocator = self.tp_worker.get_memory_pool()
-
-        if self.is_hybrid:
-            self.tree_cache = SWARadixCache(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                sliding_window_size=self.sliding_window_size,
-                page_size=self.page_size,
-                disable=server_args.disable_radix_cache,
-            )
-        elif server_args.chunked_prefill_size is not None and server_args.disable_radix_cache:
-            self.tree_cache = ChunkCache(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                page_size=self.page_size,
-            )
-        else:
-            self.tree_cache = RadixCache(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                page_size=self.page_size,
-                disable=server_args.disable_radix_cache,
-                kv_head_num=self.model_config.get_num_kv_heads(self.tp_size),
-                head_dim=self.model_config.head_dim,
-                layer_num=self.model_config.num_hidden_layers,
-                max_seq_len=server_args.max_seq_len,
-                is_eagle=self.spec_algorithm is not None and self.spec_algorithm.is_eagle(),
-            )
+        self.tree_cache = build_kv_cache(
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            server_args=self.server_args,
+            model_config=self.model_config,
+            page_size=self.page_size,
+            tp_size=self.tp_size,
+            is_hybrid=self.is_hybrid,
+            sliding_window_size=self.sliding_window_size,
+            spec_algorithm=self.spec_algorithm,
+        )
 
     def _select_round_robin_dp(self) -> int:
         dp_rank = self.dp_round_robin_counter % self.dp_size
