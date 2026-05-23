@@ -98,6 +98,9 @@ class TestQwen3VLE2E(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
+            # --disable-precompile produces cache misses on first inference;
+            # don't fail the run on that.
+            check_cache_miss=False,
             other_args=[
                 "--trust-remote-code",
                 "--tp-size",
