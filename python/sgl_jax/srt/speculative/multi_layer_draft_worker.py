@@ -229,6 +229,17 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         last_idx = model_worker_batch.logits_indices
 
+        # Pad verified_id from (real_bs,) to (padded_bs,) so jit'd MTP forward
+        # sees the bucket shape every time (forward_batch.spec_info.verified_id
+        # is a pytree leaf; without this each real_bs triggers a fresh trace).
+        # Restored to real_bs after the loop so cross-round flat state stays
+        # flat-ordered. Mirrors single-layer EagleDraftWorker.
+        padded_bs = int(model_worker_batch.seq_lens.shape[0])
+        if verified_id_np.shape[0] < padded_bs:
+            model_worker_batch.spec_info_padded.verified_id = np.pad(
+                verified_id_np, ((0, padded_bs - verified_id_np.shape[0]),)
+            )
+
         layer0_out = None
         cur_hidden = hidden_states
         for i, w in enumerate(self._workers):
@@ -262,6 +273,9 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         model_worker_batch.spec_info_padded.allocate_lens = np.asarray(model_worker_batch.seq_lens)[
             sel
         ]
+        # Restore real_bs verified_id so split_spec_info_per_rank can cut on
+        # real_bs_per_dp without slicing past the valid region.
+        model_worker_batch.spec_info_padded.verified_id = verified_id_np
         self.capture_for_decode(layer0_out, model_worker_batch.spec_info_padded, sel=sel)
 
     def draft_extend_for_decode(
