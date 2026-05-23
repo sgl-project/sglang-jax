@@ -202,6 +202,7 @@ class ModelWorker:
             max_padded_num_tokens=self.max_padded_num_tokens,
             dp_size=self.dp_size,
             tp_size=self.tp_size,
+            ep_size=server_args.ep_size,
             page_size=self.page_size,
             max_req_len=self.max_req_len,
             vocab_size=self.model_config.vocab_size,
