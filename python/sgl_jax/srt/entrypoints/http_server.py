@@ -916,77 +916,7 @@ def _execute_server_warmup(
         kill_process_tree(os.getpid())
         return False
 
-    if server_args.speculative_algorithm and model_info["is_generation"]:
-        _warmup_spec_decode_batch_sizes(url, headers, server_args)
-
     return success
-
-
-def _warmup_spec_decode_batch_sizes(url, headers, server_args):
-    """Send concurrent warmup requests to trigger postprocess primitive compilation
-    for all batch sizes up to max_running_requests.
-
-    Spec decode postprocessing (gather, concat, etc.) uses real_bs-dependent
-    shapes. precompile_real_bs_postprocess_primitives covers many patterns, but
-    arrays from JIT output have different internal metadata than precompile
-    dummies, so the first real request at each batch size triggers a few small
-    compilations. This warmup exercises all batch sizes to front-load those
-    compilations before the server accepts user traffic.
-    """
-    import concurrent.futures
-
-    max_bs = server_args.max_running_requests or 16
-    max_new_tokens = 32
-
-    prompts = [
-        "What is the capital of France?",
-        "Solve: 2+3=",
-        "Name a color.",
-        "Count to five.",
-        "What day is today?",
-        "Hello world.",
-        "Define AI.",
-        "Name a fruit.",
-        "What is 1+1?",
-        "Say hi.",
-        "Explain gravity.",
-        "Name a planet.",
-        "What is water?",
-        "Describe a cat.",
-        "What is math?",
-        "Name a country.",
-    ]
-
-    def send_one(prompt):
-        try:
-            return requests.post(
-                url + "/generate",
-                json={
-                    "text": prompt,
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": max_new_tokens,
-                    },
-                },
-                headers=headers,
-                timeout=120,
-            )
-        except Exception:
-            return None
-
-    logger.info(
-        "[WARMUP] Sending concurrent requests (bs=1..%d) to warm spec decode postprocess primitives",
-        max_bs,
-    )
-
-    for target_bs in range(2, min(max_bs, len(prompts)) + 1):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=target_bs) as executor:
-            futures = [
-                executor.submit(send_one, prompts[i % len(prompts)]) for i in range(target_bs)
-            ]
-            concurrent.futures.wait(futures, timeout=120)
-
-    logger.info("[WARMUP] Spec decode postprocess warmup done")
 
 
 def _wait_and_warmup(
