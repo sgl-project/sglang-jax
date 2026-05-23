@@ -31,7 +31,6 @@ class CompilationManager:
         max_padded_num_tokens: int,
         dp_size: int,
         tp_size: int,
-        ep_size: int,
         page_size: int,
         max_req_len: int,
         vocab_size: int,
@@ -40,7 +39,6 @@ class CompilationManager:
     ):
         self.dp_size = dp_size
         self.tp_size = tp_size
-        self.ep_size = ep_size
         self.page_size = page_size
         self.max_req_len = max_req_len
         self.max_padded_batch_size = max_padded_batch_size
@@ -62,13 +60,10 @@ class CompilationManager:
         if user_paddings is None:
             user_paddings = [item * dp_size for item in PRECOMPILE_DEFAULT_TOKEN_PADDINGS]
 
-        fused_align = self.ep_size * 2 if self.moe_backend == "fused" else 1
         buckets = []
         for item in user_paddings:
             if item % dp_size != 0:
                 item = (item // dp_size) * dp_size
-            if fused_align > 1 and item % fused_align != 0:
-                item = ((item + fused_align - 1) // fused_align) * fused_align
             if (
                 item >= self.max_padded_batch_size
                 and item <= self.max_padded_num_tokens
@@ -84,23 +79,17 @@ class CompilationManager:
 
     def _compute_bs_buckets(self, user_paddings: list[int] | None) -> list[int]:
         bs_list = user_paddings if user_paddings is not None else PRECOMPILE_DEFAULT_BS_PADDINGS
-        # fused MoE requires num_tokens % (ep_size * t_packing) == 0.
-        # bfloat16 → t_packing=2; for decode num_tokens=bs, so min bs = ep_size*t_packing.
-        fused_min = self.ep_size * 2 if self.moe_backend == "fused" else 0
         buckets = []
         for bs in bs_list:
             if (
                 bs <= self.max_padded_batch_size
-                and (self.moe_backend != "fused" or bs >= fused_min)
+                and (self.moe_backend != "fused" or bs >= self.tp_size * 2)
                 and bs >= self.dp_size
             ):
                 buckets.append(bs)
         buckets.sort()
         if len(buckets) == 0 or buckets[-1] < self.max_padded_batch_size:
-            target = max(self.max_padded_batch_size, fused_min)
-            if fused_min > 0 and target % fused_min != 0:
-                target = ((target + fused_min - 1) // fused_min) * fused_min
-            buckets.append(target)
+            buckets.append(self.max_padded_batch_size)
         return buckets
 
     def _compute_cache_loc_buckets(self) -> list[int]:
