@@ -740,10 +740,6 @@ class Qwen3VLLanguageModel(QWen3Model):
 
         if residual is not None:
             hidden_states += residual
-        # Last-layer deepstack: matches upstream's "self.norm(.., post_residual=last)" path
-        last_ds = self._get_deepstack_slice(len(self.layers) - 1, input_deepstack_embeds)
-        if last_ds is not None:
-            hidden_states = hidden_states + last_ds
         hidden_states = self.norm(hidden_states)
 
         return hidden_states, layers_kv_fused, layers_callback_flag

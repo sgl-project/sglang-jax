@@ -372,8 +372,8 @@ class TokenizerManager:
                 trust_remote_code=self.server_args.trust_remote_code,
             )
             logger.info("Loaded Qwen3VLProcessor for %s", self.server_args.model_path)
-        except Exception as e:
-            logger.warning("Failed to init Qwen3VLProcessor: %s", e)
+        except Exception:
+            logger.exception("Failed to init Qwen3VLProcessor")
             self.mm_processor = None
 
     def _has_multimodal_data(self, obj: GenerateReqInput | EmbeddingReqInput) -> bool:
