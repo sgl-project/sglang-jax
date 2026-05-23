@@ -154,6 +154,8 @@ DEEPSEEK_CODER_V2_LITE_INSTRUCT = _local_or_hf("deepseek-ai/DeepSeek-Coder-V2-Li
 QWEN3_32B = _local_or_hf("Qwen/Qwen3-32B")
 QWEN3_32B_EAGLE3 = _local_or_hf("AngelSlim/Qwen3-32B_eagle3")
 
+QWEN3_VL_8B_INSTRUCT = _local_or_hf("Qwen/Qwen3-VL-8B-Instruct")
+
 WAN2_1_T2V_1_3B = _local_or_hf("Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
 WAN2_1_T2V_14B = _local_or_hf("Wan-AI/Wan2.1-T2V-14B-Diffusers")
 
