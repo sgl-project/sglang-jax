@@ -673,6 +673,10 @@ def select_top_k_tokens_step_greater_0(
     scores: jax.Array,
     topk: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    # scores carries the prior step's top-k probs; topk_p comes from the next
+    # draft forward. Target and draft logits can be different dtypes (e.g. MiMo
+    # V2 Flash), so promote before lax.mul which requires matching dtypes.
+    scores = scores.astype(topk_p.dtype)
     expand_scores = jax.lax.mul(jnp.expand_dims(scores, axis=2), topk_p.reshape(-1, topk, topk))
     topk_cs_p, topk_cs_index = fast_topk(
         expand_scores.reshape(expand_scores.shape[0], -1), topk, axis=-1
