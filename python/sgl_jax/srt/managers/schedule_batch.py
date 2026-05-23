@@ -2162,6 +2162,34 @@ class ScheduleBatch:
             top_logprobs_nums = None
             token_ids_logprobs = None
 
+        # Multimodal vision tensors (bucket-padded; None for text-only batches).
+        mm_tensors = _collect_mm_tensors(self.reqs, input_ids_cpu)
+        pixel_values_cpu = image_grid_thw_cpu = placeholder_positions_cpu = cu_seqlens_cpu = (
+            n_real_images_cpu
+        ) = None
+        if mm_tensors is not None:
+            (
+                pixel_values_cpu,
+                image_grid_thw_cpu,
+                placeholder_positions_cpu,
+                cu_seqlens_cpu,
+                n_real_images_cpu,
+            ) = mm_tensors
+
+        # Compute MRoPE positions for VLM models. Without this, image tokens
+        # get 1D linear positions instead of 3D (t, h, w) coordinates, which
+        # destroys the spatial signal that Qwen3-VL needs to count / locate
+        # multiple objects (single-circle prompts still work, but multi-object
+        # layouts get hallucinated as repeating grids).
+        mrope_positions_cpu = _compute_mrope_positions_for_batch(
+            self.reqs,
+            self.forward_mode,
+            seq_lens_cpu,
+            len(input_ids_cpu),
+            extend_prefix_lens,
+            extend_seq_lens,
+        )
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -2176,7 +2204,7 @@ class ScheduleBatch:
             token_ids_logprobs=token_ids_logprobs,
             sampling_info=sampling_info,
             positions=positions_cpu,
-            mrope_positions=None,
+            mrope_positions=mrope_positions_cpu,
             cache_loc=cache_loc_cpu,
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
@@ -2198,7 +2226,11 @@ class ScheduleBatch:
             deepstack_visual_embedding=None,
             recurrent_indices=recurrent_indices_cpu,
             has_initial_state=has_initial_state_cpu,
-            mm_inputs=_collect_mm_inputs(self.reqs),
+            pixel_values=pixel_values_cpu,
+            image_grid_thw=image_grid_thw_cpu,
+            placeholder_positions=placeholder_positions_cpu,
+            cu_seqlens=cu_seqlens_cpu,
+            n_real_images=n_real_images_cpu,
         )
 
     def get_spec_model_worker_batch(
@@ -2390,7 +2422,6 @@ class ScheduleBatch:
             spec_info=self.spec_info,
             spec_algorithm=self.spec_algorithm,
             tree_cache=self.tree_cache,
-            mm_inputs=_collect_mm_inputs(self.reqs),
         )
 
     def _generate_trace_info(self, real_bs: int, bid: int) -> list[str]:
@@ -2567,12 +2598,10 @@ def _extract_mm_value(mm_inputs: Any, key: str):
 
 
 def _collect_mm_inputs(reqs: list) -> list | None:
-    """Gather per-request multimodal inputs for the standard LLM pipeline.
+    """Legacy: list-of-dict mm_inputs (deprecated for monolithic VLM path).
 
-    Returns:
-        A list of length = len(reqs) where each entry is the request's
-        `mm_inputs` (MultimodalInputs or dict) or None for text-only requests.
-        Returns None if no request has multimodal inputs.
+    Kept for callers that still want a per-req dict view. The monolithic VLM
+    code path uses `_collect_mm_tensors` below instead.
     """
     if not reqs:
         return None
@@ -2584,6 +2613,124 @@ def _collect_mm_inputs(reqs: list) -> list | None:
         if mm is not None:
             has_any = True
     return out if has_any else None
+
+
+# Bucket sizes for vision input padding. Each bucket value is in "raw patches"
+# (one patch = one Conv3D input slot, before spatial merging). The selection of
+# 256/1024/4096 covers typical image sizes from ~256x256 to ~1024x1024 at
+# patch_size=16 + spatial_merge=2. Picked first bucket >= n_real_patches.
+_MM_PATCH_BUCKETS = (256, 1024, 4096)
+# Bucket sizes for "how many images in one batch". Most requests carry 1 image.
+_MM_IMAGE_BUCKETS = (1, 2, 4, 8)
+# Patches per LLM image token. For Qwen3-VL, spatial_merge_size=2 -> 4 patches
+# collapse to one image_token via the ViT PatchMerger.
+_MM_PATCHES_PER_TOKEN = 4
+# Pixel-feature dim = in_channels * temporal_patch_size * patch_size**2.
+# For Qwen3-VL Dense this is 3*2*16*16 = 1536. We fix it here for the pad shape.
+_MM_PIXEL_FEATURE_DIM = 1536
+
+
+def _pick_bucket(value: int, buckets: tuple[int, ...]) -> int:
+    """Smallest bucket >= value, or value itself if larger than max bucket."""
+    for b in buckets:
+        if b >= value:
+            return b
+    return value
+
+
+def _collect_mm_tensors(
+    reqs: list,
+    input_ids: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Build bucket-padded vision tensors from per-req mm_inputs.
+
+    Args:
+        reqs: list of Req objects in the batch (may include reqs without mm).
+        input_ids: padded `[padded_seq]` token id array of the whole batch (already
+            packed by ScheduleBatch — same one fed into ForwardBatch.input_ids).
+        The image placeholder token id is read from the first non-empty
+        `req.mm_inputs["im_token_id"]` (populated by the CPU mm processor).
+
+    Returns:
+        (pixel_values, image_grid_thw, placeholder_positions, cu_seqlens,
+         n_real_images), or None if no req carries any image. Shapes:
+          pixel_values:          [N_padded_patches, _MM_PIXEL_FEATURE_DIM]
+          image_grid_thw:        [N_padded_images, 3]
+          placeholder_positions: [N_padded_image_tokens]   (= N_padded_patches // 4)
+          cu_seqlens:            [N_padded_images + 1]     (int32, block-diagonal bounds)
+          n_real_images:         [] int32 scalar
+    """
+    image_token_id = None
+    pieces = []
+    thw_pieces = []
+    for r in reqs:
+        mm = getattr(r, "mm_inputs", None)
+        if mm is None:
+            continue
+        if image_token_id is None:
+            image_token_id = (
+                mm.get("im_token_id") if isinstance(mm, dict) else getattr(mm, "im_token_id", None)
+            )
+        items = mm.get("mm_items") if isinstance(mm, dict) else getattr(mm, "mm_items", None)
+        if not items:
+            continue
+        for item in items:
+            if not item.is_image():
+                continue
+            feat = np.asarray(item.feature)
+            if feat.ndim != 2 or feat.shape[1] != _MM_PIXEL_FEATURE_DIM:
+                continue
+            pieces.append(feat)
+            for thw in item.model_specific_data.get("image_grid_thw", []):
+                thw_pieces.append((int(thw[0]), int(thw[1]), int(thw[2])))
+
+    if not pieces or image_token_id is None:
+        return None
+
+    pixel_real = np.concatenate(pieces, axis=0).astype(np.float32, copy=False)
+    grid_real = np.asarray(thw_pieces, dtype=np.int32)
+    n_real_patches = int(pixel_real.shape[0])
+    n_real_images = int(grid_real.shape[0])
+
+    # Pad pixel_values + grid_thw to bucket sizes.
+    n_padded_patches = _pick_bucket(n_real_patches, _MM_PATCH_BUCKETS)
+    n_padded_images = _pick_bucket(n_real_images, _MM_IMAGE_BUCKETS)
+
+    pixel_padded = np.zeros((n_padded_patches, _MM_PIXEL_FEATURE_DIM), dtype=pixel_real.dtype)
+    pixel_padded[:n_real_patches] = pixel_real
+
+    grid_padded = np.zeros((n_padded_images, 3), dtype=np.int32)
+    grid_padded[:n_real_images] = grid_real
+
+    # Per-image patch counts (t*h*w); padded images contribute 0.
+    patches_per_image = grid_real[:, 0] * grid_real[:, 1] * grid_real[:, 2]
+    cu_seqlens = np.zeros(n_padded_images + 1, dtype=np.int32)
+    cu_seqlens[1 : n_real_images + 1] = np.cumsum(patches_per_image)
+    # Padded segments repeat the last real cumulative count -> zero-length segments.
+    cu_seqlens[n_real_images + 1 :] = cu_seqlens[n_real_images]
+
+    # placeholder_positions: where to scatter ViT outputs into padded input_ids.
+    # The number of *real* image tokens in this batch equals
+    # sum(t*h*w / spatial_merge^2) for each real image = n_real_patches // 4.
+    n_padded_image_tokens = n_padded_patches // _MM_PATCHES_PER_TOKEN
+    n_real_image_tokens = n_real_patches // _MM_PATCHES_PER_TOKEN
+    real_positions = np.where(input_ids == image_token_id)[0].astype(np.int32)
+    if real_positions.size < n_real_image_tokens:
+        # Defensive: should not happen if processor/grid_thw are consistent.
+        n_real_image_tokens = int(real_positions.size)
+    # Sink position = last index of padded input_ids; that slot is a padding
+    # token in the LLM, so overwriting it with zero ViT output has no effect.
+    sink_pos = int(input_ids.shape[0]) - 1
+    positions_padded = np.full(n_padded_image_tokens, sink_pos, dtype=np.int32)
+    positions_padded[:n_real_image_tokens] = real_positions[:n_real_image_tokens]
+
+    return (
+        pixel_padded,
+        grid_padded,
+        positions_padded,
+        cu_seqlens,
+        np.asarray(n_real_images, dtype=np.int32),
+    )
 
 
 def _as_int_scalar(value: Any, default: int = 0) -> int:
@@ -2904,10 +3051,23 @@ class ModelWorkerBatch:
     # MRoPE position information [3, total_tokens]
     mrope_positions: np.ndarray | None = None
 
-    # Per-request multimodal inputs (pixel_values + grid_thw + ...).
-    # Carried as a list[MultimodalInputs] (length = batch_size); models that
-    # don't need them (text-only) leave this None. Non-array, lives in pytree aux_data.
-    mm_inputs: list | None = None
+    # ---- Multimodal (vision) inputs, all bucket-padded to fixed shapes ----
+    # pixel_values: flattened patches [N_padded_patches, C*Tp*P*P], pad with 0
+    pixel_values: np.ndarray | None = None
+    # image_grid_thw: per-image (t,h,w) [N_padded_images, 3], pad with (0,0,0)
+    image_grid_thw: np.ndarray | None = None
+    # placeholder_positions: indices in (padded) input_ids where image tokens go,
+    # length = N_padded_image_tokens = N_padded_patches // spatial_merge_size^2.
+    # The first n_real_image_tokens entries are real; the remainder point to a
+    # sink position (last padding slot) that will be overwritten with zero ViT
+    # output but is itself a padding token that won't affect the LLM forward.
+    placeholder_positions: np.ndarray | None = None
+    # Block-diagonal attention boundaries (cumulative patch counts per image).
+    # Length N_padded_images + 1. Entries beyond n_real_images repeat the last
+    # real boundary, so padded image segments are empty.
+    cu_seqlens: np.ndarray | None = None
+    # n_real_images: int32 scalar -- used inside ViT segment-id construction.
+    n_real_images: np.ndarray | None = None
 
     # Recurrent state indices for hybrid recurrent models
     recurrent_indices: np.ndarray | None = None

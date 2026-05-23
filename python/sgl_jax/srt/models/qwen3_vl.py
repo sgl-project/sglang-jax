@@ -16,6 +16,7 @@ import math
 from functools import partial
 
 import jax
+import jax.experimental
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
@@ -56,14 +57,19 @@ def _apply_rotary_pos_emb_vision(x: jax.Array, cos: jax.Array, sin: jax.Array) -
         x: shape [B, T, N, H] (H == head_dim == 2 * rotary_dim)
         cos, sin: shape [T, head_dim] (we use the first half == rotary_dim)
     """
+    # Match upstream apply_rotary_pos_emb_native: compute in float32 to avoid
+    # bfloat16 accumulation error that destroys 2D spatial RoPE discrimination.
+    orig_dtype = x.dtype
+    x = x.astype(jnp.float32)
     half_dim = x.shape[-1] // 2
     x_real = x[..., :half_dim]
     x_imag = x[..., half_dim:]
     # cos/sin produced by _build_rotary_pos_emb have shape [T, head_dim] but only
     # the first half (rotary_dim) is meaningful; trim to match x_real/x_imag.
-    cos = cos[:, :half_dim][None, :, None, :]
-    sin = sin[:, :half_dim][None, :, None, :]
-    return jnp.concatenate([x_real * cos - x_imag * sin, x_real * sin + x_imag * cos], axis=-1)
+    cos = cos[:, :half_dim][None, :, None, :].astype(jnp.float32)
+    sin = sin[:, :half_dim][None, :, None, :].astype(jnp.float32)
+    out = jnp.concatenate([x_real * cos - x_imag * sin, x_real * sin + x_imag * cos], axis=-1)
+    return out.astype(orig_dtype)
 
 
 def _vision_attention(
@@ -71,11 +77,16 @@ def _vision_attention(
     k: jax.Array,
     v: jax.Array,
     scale: float,
+    attn_mask: jax.Array | None = None,
 ) -> jax.Array:
     """Cacheless full attention for vision tower.
 
     Args:
         q, k, v: shape [B, T, N, H]
+        attn_mask: optional [T, T] bool array. True (i, j) means query i may
+            attend to key j. False positions get a large-negative bias added.
+            Used to express block-diagonal masking (one image per block) plus
+            padding suppression (padded patches belong to no segment).
     Returns:
         [B, T, N, H]
     """
@@ -86,18 +97,29 @@ def _vision_attention(
             q = q.astype(jnp.bfloat16)
             k = k.astype(jnp.bfloat16)
             v = v.astype(jnp.bfloat16)
-        output = flash_mha(q, k, v, softmax_scale=scale, is_causal=False)
-        if output.dtype != original_dtype:
-            output = output.astype(original_dtype)
-        return output
+        # flash_mha doesn't expose an additive 2D mask; fall back to native for masked path.
+        if attn_mask is None:
+            output = flash_mha(q, k, v, softmax_scale=scale, is_causal=False)
+            if output.dtype != original_dtype:
+                output = output.astype(original_dtype)
+            return output
+        # fall through to native einsum path below
     B, T, N, H = q.shape
-    q = jnp.transpose(q, (0, 2, 1, 3))  # [B, N, T, H]
-    k = jnp.transpose(k, (0, 2, 1, 3))
-    v = jnp.transpose(v, (0, 2, 1, 3))
+    # Compute attention in float32 to match upstream / HF semantics.
+    # Bfloat16 attention softmax destroys spatial signal in multi-row layouts.
+    orig_dtype = q.dtype
+    q = jnp.transpose(q, (0, 2, 1, 3)).astype(jnp.float32)  # [B, N, T, H]
+    k = jnp.transpose(k, (0, 2, 1, 3)).astype(jnp.float32)
+    v_f32 = jnp.transpose(v, (0, 2, 1, 3)).astype(jnp.float32)
     attn_weights = jnp.einsum("bnth,bnsh->bnts", q, k) * scale
+    if attn_mask is not None:
+        # Broadcast [T, T] -> [1, 1, T, T]
+        neg = jnp.finfo(attn_weights.dtype).min
+        bias = jnp.where(attn_mask, 0.0, neg).astype(attn_weights.dtype)
+        attn_weights = attn_weights + bias[None, None, :, :]
     attn_weights = jax.nn.softmax(attn_weights, axis=-1)
-    out = jnp.einsum("bnts,bnsh->bnth", attn_weights, v)
-    return jnp.transpose(out, (0, 2, 1, 3))
+    out = jnp.einsum("bnts,bnsh->bnth", attn_weights, v_f32)
+    return jnp.transpose(out, (0, 2, 1, 3)).astype(orig_dtype)
 
 
 class Qwen3VLVisionPatchEmbed(nnx.Module):
@@ -190,6 +212,7 @@ class Qwen3VLVisionAttention(nnx.Module):
         x: jax.Array,
         cos: jax.Array,
         sin: jax.Array,
+        attn_mask: jax.Array | None = None,
     ) -> jax.Array:
         # x: [T, B, D] (matches Qwen2.5-VL convention)
         T, B, D = x.shape
@@ -203,7 +226,7 @@ class Qwen3VLVisionAttention(nnx.Module):
         # cos/sin: [T, head_dim] after concat half+half from rotary_dim=head_dim//2 (see top-level builder)
         q = _apply_rotary_pos_emb_vision(q, cos, sin)
         k = _apply_rotary_pos_emb_vision(k, cos, sin)
-        out = _vision_attention(q, k, v, self.scale)
+        out = _vision_attention(q, k, v, self.scale, attn_mask=attn_mask)
         # [B, T, N, H] -> [T, B, D]
         out = out.transpose(1, 0, 2, 3).reshape(T, B, D)
         return self.proj(out)
@@ -236,8 +259,14 @@ class Qwen3VLVisionBlock(nnx.Module):
         self.attn = Qwen3VLVisionAttention(hidden_size, num_heads, dtype, rngs=rngs)
         self.mlp = Qwen3VLVisionMLP(hidden_size, intermediate_size, hidden_act, dtype, rngs=rngs)
 
-    def __call__(self, x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
-        x = x + self.attn(self.norm1(x), cos, sin)
+    def __call__(
+        self,
+        x: jax.Array,
+        cos: jax.Array,
+        sin: jax.Array,
+        attn_mask: jax.Array | None = None,
+    ) -> jax.Array:
+        x = x + self.attn(self.norm1(x), cos, sin, attn_mask=attn_mask)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -517,21 +546,94 @@ class Qwen3VLVisionModel(nnx.Module):
         self,
         pixel_values: jax.Array,
         grid_thw: tuple[tuple[int, int, int], ...],
+        cu_seqlens: jax.Array | None = None,
+        n_real_images: int = 0,
     ) -> jax.Array:
-        """Run the vision encoder.
+        """Run the vision encoder over a (possibly padded) batch of images.
 
         Args:
-            pixel_values: [num_patches, C * Tp * P * P]
-            grid_thw: per-image (t, h, w) tuples
+            pixel_values:  [N_padded_patches, C*Tp*P*P]  -- bucket-padded; padded
+                           rows are zero. Replicated across the mesh.
+            grid_thw:      Python tuple of (t, h, w) for ONLY the real images.
+                           Used to build RoPE / pos_embed; jit specializes per
+                           unique tuple. May be empty if no real image.
+            cu_seqlens:    [N_padded_images + 1] int32, block-diagonal bounds in
+                           patch units. Entries beyond `n_real_images` repeat the
+                           last real cumsum so padded segments have zero length.
+            n_real_images: number of real images in the batch (Python int).
 
         Returns:
-            [N_merged, out_hidden_size * (1 + num_deepstack)]
+            [N_padded_merged_patches, out_hidden_size * (1 + num_deepstack)]
+            where the first n_real_merged_patches entries are real and the rest
+            are masked-to-zero outputs (and will be scattered into a sink slot).
         """
-        x = self.patch_embed(pixel_values)  # [N, hidden]
-        pos_embeds = self._interpolate_pos_embed(grid_thw)  # [N, hidden]
-        x = x + pos_embeds
+        x = self.patch_embed(pixel_values)  # [N_padded_patches, hidden]
 
-        cos, sin = self._build_rotary_pos_emb(grid_thw)  # [N, head_dim]
+        # ------------- block-diagonal attention mask -------------
+        # Build a 2D bool mask [T, T] where T = N_padded_patches:
+        #   attn_mask[i, j] = True iff token i and token j belong to the same
+        #   image AND that image is real (segment_id < n_real_images).
+        # Implementation: derive a segment_id per token from cu_seqlens via
+        # searchsorted on the right boundaries cu_seqlens[1:].
+        attn_mask = None
+        if cu_seqlens is not None:
+            T = x.shape[0]
+            token_idx = jnp.arange(T, dtype=jnp.int32)
+            # boundaries: cu_seqlens[1:] -> right edges of each segment
+            # searchsorted(side="right") gives the segment id 0..N_padded_images-1
+            seg_ids = jnp.searchsorted(cu_seqlens[1:], token_idx, side="right")
+            # Valid only if segment id < n_real_images (padded segments are
+            # empty so seg_ids of padded tokens land at n_real_images or above).
+            n_real = jnp.asarray(n_real_images, dtype=jnp.int32)
+            valid = seg_ids < n_real  # [T]
+            # same-segment mask, masked off when either side is padded.
+            attn_mask = (seg_ids[:, None] == seg_ids[None, :]) & valid[None, :]
+
+        # ------------- pos_embed + RoPE (built from static grid_thw) -------------
+        # If no real images, skip the static-grid path (would produce empty
+        # tensors and break concat). Pure-text branch never hits this code.
+        if grid_thw is None or len(grid_thw) == 0:
+            # No mm content: ViT outputs zeros at the same shape so the scatter
+            # to the sink slot is a no-op. Use the merger to get the right
+            # final feature dimensionality.
+            zeros_main = jnp.zeros(
+                (
+                    x.shape[0] // self.spatial_merge_unit,
+                    self.merger.linear_fc2.kernel.value.shape[-1],
+                ),
+                dtype=self.dtype,
+            )
+            n_ds = len(self.deepstack_visual_indexes)
+            zeros_ds = jnp.zeros(
+                (zeros_main.shape[0], zeros_main.shape[1] * n_ds), dtype=self.dtype
+            )
+            return jnp.concatenate([zeros_main, zeros_ds], axis=1)
+
+        pos_embeds_real = self._interpolate_pos_embed(grid_thw)  # [N_real_patches, hidden]
+        cos_real, sin_real = self._build_rotary_pos_emb(grid_thw)  # [N_real_patches, head_dim]
+        # Pad pos_embed / cos / sin to the full padded length so all 27 blocks
+        # see fixed-shape tensors. Padded rows get zero pos_embed and identity
+        # RoPE (cos=1, sin=0); the block-diagonal mask already prevents these
+        # rows from contributing to any real token's attention output.
+        N_padded = x.shape[0]
+        N_real = pos_embeds_real.shape[0]
+        pad_len = N_padded - N_real
+        if pad_len > 0:
+            pos_embeds = jnp.concatenate(
+                [pos_embeds_real, jnp.zeros((pad_len, self.hidden_size), dtype=self.dtype)],
+                axis=0,
+            )
+            cos = jnp.concatenate(
+                [cos_real, jnp.ones((pad_len, self.head_dim), dtype=self.dtype)], axis=0
+            )
+            sin = jnp.concatenate(
+                [sin_real, jnp.zeros((pad_len, self.head_dim), dtype=self.dtype)], axis=0
+            )
+        else:
+            pos_embeds = pos_embeds_real
+            cos, sin = cos_real, sin_real
+
+        x = x + pos_embeds
 
         # Add batch dim for attention path: [T, B=1, D]
         x = jnp.expand_dims(x, axis=1)
@@ -539,7 +641,7 @@ class Qwen3VLVisionModel(nnx.Module):
         deepstack_features = []
         num_captured = 0
         for layer_num, blk in enumerate(self.blocks):
-            x = blk(x, cos, sin)
+            x = blk(x, cos, sin, attn_mask=attn_mask)
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_features.append(self.deepstack_merger_list[num_captured](x))
                 num_captured += 1
@@ -705,22 +807,6 @@ class Qwen3VLForConditionalGeneration(nnx.Module):
         self.image_token_id = getattr(self.config, "image_token_id", 151655)
         self.video_token_id = getattr(self.config, "video_token_id", 151656)
 
-    # ---- vision feature extraction ----
-    def get_image_feature(
-        self,
-        pixel_values: jax.Array,
-        image_grid_thw: tuple[tuple[int, int, int], ...],
-    ) -> jax.Array:
-        """Run ViT, return [N_merged, hidden * (1 + N_ds)]."""
-        return self.visual(pixel_values, image_grid_thw)
-
-    def get_video_feature(
-        self,
-        pixel_values: jax.Array,
-        video_grid_thw: tuple[tuple[int, int, int], ...],
-    ) -> jax.Array:
-        return self.visual(pixel_values, video_grid_thw)
-
     def separate_deepstack_embeds(self, vision_features: jax.Array) -> tuple[jax.Array, jax.Array]:
         """Split ViT output into (main_embeds, deepstack_embeds)."""
         hidden = self.text_config.hidden_size
@@ -737,25 +823,55 @@ class Qwen3VLForConditionalGeneration(nnx.Module):
         token_to_kv_pool = memory_pools.token_to_kv_pool
 
         # --- Multimodal splice (extend/prefill only) ---
-        # In decode mode there are no image tokens; pure text path.
-        # In extend mode, if ForwardBatch carries mm_inputs (list of dicts),
-        # run ViT inline, splice main features into input_embeds at
-        # placeholder positions, and route deepstack features to the LLM.
+        # ForwardBatch carries bucket-padded vision tensors as pytree children
+        # (pixel_values / placeholder_positions / cu_seqlens) plus a static
+        # image_grid_thw (Python tuple) in aux_data. In decode mode these are
+        # all None and we fall straight through to the text-only LLM path.
         input_deepstack_embeds = None
         if (
             forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            and forward_batch.mm_inputs is not None
+            and forward_batch.pixel_values is not None
         ):
-            vision_main, vision_deepstack = self._encode_and_splice_mm(forward_batch)
-            if vision_main is not None:
-                input_embeds, input_deepstack_embeds = self._splice_vision_features(
-                    forward_batch, vision_main, vision_deepstack
-                )
-                # Stash on forward_batch so Qwen3VLLanguageModel's input_embeds
-                # bypass picks it up (same convention as Qwen2.5-VL).
-                forward_batch.input_embedding = input_embeds
+            # 1) ViT: pixel_values (padded) -> [N_padded_image_tokens, hidden*(1+N_ds)]
+            vision_features = self.visual(
+                forward_batch.pixel_values,
+                forward_batch.image_grid_thw,
+                cu_seqlens=forward_batch.cu_seqlens,
+                n_real_images=forward_batch.n_real_images,
+            )
+            vision_main, vision_deepstack = self.separate_deepstack_embeds(vision_features)
 
-        # Fall back to whatever ForwardBatch already carries (text-only or pre-spliced).
+            # 2) Splice main features into input_embeds at placeholder positions.
+            #    placeholder_positions is already replicated and bucket-padded:
+            #    real entries point at real image tokens, padded entries point
+            #    at the sink slot (last token), where the ViT output is zero so
+            #    the overwrite is observationally a no-op.
+            input_embeds = self.model.embed_tokens(forward_batch.input_ids)
+            # Reshard to replicated for scatter — placeholder_positions and the
+            # vision feature tensors are all replicated, and the scatter is
+            # simplest on a replicated input_embeds.
+            repl = NamedSharding(self.mesh, P())
+            input_embeds_repl = jax.sharding.reshard(input_embeds, repl)
+            positions = forward_batch.placeholder_positions
+            input_embeds_out = input_embeds_repl.at[positions].set(
+                vision_main.astype(input_embeds_repl.dtype)
+            )
+
+            # 3) Scatter deepstack into a padded zero tensor matching input_embeds
+            #    so the LLM's post-residual addition broadcasts cleanly.
+            full_deepstack = jnp.zeros(
+                (input_embeds_out.shape[0], vision_deepstack.shape[1]),
+                dtype=input_embeds_out.dtype,
+            )
+            full_deepstack = full_deepstack.at[positions].set(
+                vision_deepstack.astype(input_embeds_out.dtype)
+            )
+
+            forward_batch.input_embedding = input_embeds_out
+            input_deepstack_embeds = full_deepstack
+
+        # Fall back to whatever ForwardBatch already carries (text-only or
+        # externally-spliced deepstack).
         if input_deepstack_embeds is None:
             input_deepstack_embeds = getattr(forward_batch, "deepstack_visual_embedding", None)
 
@@ -770,77 +886,6 @@ class Qwen3VLForConditionalGeneration(nnx.Module):
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
         return output, layers_kv_fused, layers_callback_flag, None
-
-    def _encode_and_splice_mm(
-        self, forward_batch: ForwardBatch
-    ) -> tuple[jax.Array | None, jax.Array | None]:
-        """Run the vision tower over all image items in this batch.
-
-        Returns:
-            (main, deepstack):
-              main: [N_image_tokens, hidden_size]
-              deepstack: [N_image_tokens, hidden_size * num_deepstack]
-            Returns (None, None) if no image items present.
-        """
-        all_pixel = []
-        all_grid_thw: list[tuple[int, int, int]] = []
-        for mm in forward_batch.mm_inputs or []:
-            if mm is None:
-                continue
-            # `mm` is the dict produced by Qwen3VLProcessor.process()
-            for item in mm.get("mm_items", []):
-                if not item.is_image():
-                    continue
-                feat = item.feature
-                # Convert numpy -> jax.Array on device when crossing into jit body
-                all_pixel.append(jnp.asarray(feat, dtype=self.dtype))
-                for thw in item.model_specific_data.get("image_grid_thw", []):
-                    all_grid_thw.append(tuple(thw))
-        if not all_pixel:
-            return None, None
-        pixel_values = all_pixel[0] if len(all_pixel) == 1 else jnp.concatenate(all_pixel, axis=0)
-        vision_features = self.get_image_feature(pixel_values, tuple(all_grid_thw))
-        return self.separate_deepstack_embeds(vision_features)
-
-    def _splice_vision_features(
-        self,
-        forward_batch: ForwardBatch,
-        vision_main: jax.Array,
-        vision_deepstack: jax.Array,
-    ) -> tuple[jax.Array, jax.Array]:
-        """Scatter ViT features into LLM input_embeds at image-token positions.
-
-        - main features replace the embed_tokens(input_ids) at placeholder positions.
-        - deepstack features are scattered into a full-length zero tensor (same
-          padded length as input_embeds) so it can be added to LLM hidden_states
-          via `post_residual_addition` without broadcast issues.
-
-        Both reshards run on a replicated mesh slice because
-        `jnp.where(mask, size=N)` requires replicated input.
-        """
-        input_embeds = self.model.embed_tokens(forward_batch.input_ids)
-        # Reshard to replicated for jnp.where(size=N) -> cumsum requirement.
-        repl = NamedSharding(self.mesh, P())
-        input_ids_repl = jax.sharding.reshard(forward_batch.input_ids, repl)
-        input_embeds_repl = jax.sharding.reshard(input_embeds, repl)
-
-        n_image_tokens = vision_main.shape[0]
-        placeholder_mask = input_ids_repl == self.image_token_id
-        indices = jnp.where(placeholder_mask, size=n_image_tokens)[0]
-        input_embeds_out = input_embeds_repl.at[indices].set(
-            vision_main.astype(input_embeds_repl.dtype)
-        )
-
-        # Scatter deepstack into [padded_seq_len, hidden*num_deepstack]
-        # so that downstream `hidden_states + post_residual_addition` broadcasts cleanly.
-        full_deepstack = jnp.zeros(
-            (input_embeds_out.shape[0], vision_deepstack.shape[1]),
-            dtype=input_embeds_out.dtype,
-        )
-        full_deepstack = full_deepstack.at[indices].set(
-            vision_deepstack.astype(input_embeds_out.dtype)
-        )
-        return input_embeds_out, full_deepstack
 
     # ---- weight loading ----
     def load_weights(self, model_config: ModelConfig):
