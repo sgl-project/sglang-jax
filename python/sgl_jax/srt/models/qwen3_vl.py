@@ -81,6 +81,7 @@ def _vit_flash_attention_tpu(
     v: jax.Array,
     scale: float,
     segment_ids_1d: jax.Array,
+    mesh,
 ) -> jax.Array:
     """Pallas TPU flash-attention path for the vision tower.
 
@@ -95,7 +96,14 @@ def _vit_flash_attention_tpu(
     q/k stay fp32, v is cast to bf16 — matches tuned-table dtype config and
     avoids the bf16-softmax spatial-signal regression that the einsum fallback
     explicitly avoids (see comment in `_vision_attention`).
+
+    The kernel call is wrapped in shard_map with replicated specs because
+    Mosaic kernels cannot be auto-partitioned by jit. The Qwen3-VL ViT in this
+    codebase is not tensor-parallel (qkv/proj are plain nnx.Linear), so
+    replicated specs match the actual data layout.
     """
+    from jax.sharding import PartitionSpec as P
+
     from sgl_jax.srt.multimodal.kernels.flash_attention import (
         SegmentIds,
         flash_attention,
@@ -128,14 +136,28 @@ def _vit_flash_attention_tpu(
         seg = jnp.concatenate([seg, jnp.full((pad_len,), -1, dtype=jnp.int32)])
     seg_2d = seg[None, :]  # [B, T_pad]
 
-    out = flash_attention(
-        q_t,
-        k_t,
-        v_t,
-        segment_ids=SegmentIds(q=seg_2d, kv=seg_2d),
-        sm_scale=scale,
-        causal=False,
-    )
+    def _kernel(q_, k_, v_, seg_):
+        return flash_attention(
+            q_,
+            k_,
+            v_,
+            segment_ids=SegmentIds(q=seg_, kv=seg_),
+            sm_scale=scale,
+            causal=False,
+        )
+
+    if mesh is not None:
+        sharded = jax.shard_map(
+            _kernel,
+            mesh=mesh,
+            in_specs=(P(), P(), P(), P()),
+            out_specs=P(),
+            check_vma=False,
+        )
+        out = sharded(q_t, k_t, v_t, seg_2d)
+    else:
+        out = _kernel(q_t, k_t, v_t, seg_2d)
+
     if pad_len > 0:
         out = out[:, :, :T, :]
     return jnp.transpose(out, (0, 2, 1, 3)).astype(orig_dtype)
@@ -148,6 +170,7 @@ def _vision_attention(
     scale: float,
     attn_mask: jax.Array | None = None,
     segment_ids_1d: jax.Array | None = None,
+    mesh=None,
 ) -> jax.Array:
     """Cacheless full attention for vision tower.
 
@@ -180,7 +203,7 @@ def _vision_attention(
         # fall through to native einsum path below
 
     if is_tpu_runtime() and segment_ids_1d is not None:
-        return _vit_flash_attention_tpu(q, k, v, scale, segment_ids_1d)
+        return _vit_flash_attention_tpu(q, k, v, scale, segment_ids_1d, mesh)
 
     B, T, N, H = q.shape
     # Compute attention in float32 to match upstream / HF semantics.
@@ -272,11 +295,13 @@ class Qwen3VLVisionAttention(nnx.Module):
         num_heads: int,
         dtype: jnp.dtype,
         rngs: nnx.Rngs = None,
+        mesh=None,
     ):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.mesh = mesh
         _rngs = rngs or nnx.Rngs(0)
         self.qkv = nnx.Linear(
             hidden_size, 3 * hidden_size, use_bias=True, param_dtype=dtype, rngs=_rngs
@@ -306,7 +331,13 @@ class Qwen3VLVisionAttention(nnx.Module):
         q = _apply_rotary_pos_emb_vision(q, cos, sin)
         k = _apply_rotary_pos_emb_vision(k, cos, sin)
         out = _vision_attention(
-            q, k, v, self.scale, attn_mask=attn_mask, segment_ids_1d=segment_ids_1d
+            q,
+            k,
+            v,
+            self.scale,
+            attn_mask=attn_mask,
+            segment_ids_1d=segment_ids_1d,
+            mesh=self.mesh,
         )
         # [B, T, N, H] -> [T, B, D]
         out = out.transpose(1, 0, 2, 3).reshape(T, B, D)
@@ -325,6 +356,7 @@ class Qwen3VLVisionBlock(nnx.Module):
         norm_eps: float,
         dtype: jnp.dtype,
         rngs: nnx.Rngs = None,
+        mesh=None,
     ):
         _rngs = rngs or nnx.Rngs(0)
         # Qwen3-VL ViT uses nn.LayerNorm (NOT RMSNorm)
@@ -337,7 +369,7 @@ class Qwen3VLVisionBlock(nnx.Module):
         )
         self.norm1 = norm_layer(hidden_size, rngs=_rngs)
         self.norm2 = norm_layer(hidden_size, rngs=_rngs)
-        self.attn = Qwen3VLVisionAttention(hidden_size, num_heads, dtype, rngs=rngs)
+        self.attn = Qwen3VLVisionAttention(hidden_size, num_heads, dtype, rngs=rngs, mesh=mesh)
         self.mlp = Qwen3VLVisionMLP(hidden_size, intermediate_size, hidden_act, dtype, rngs=rngs)
 
     def __call__(
@@ -475,6 +507,7 @@ class Qwen3VLVisionModel(nnx.Module):
                     norm_eps=norm_eps,
                     dtype=dtype,
                     rngs=rngs,
+                    mesh=mesh,
                 )
                 for _ in range(config.depth)
             ]
