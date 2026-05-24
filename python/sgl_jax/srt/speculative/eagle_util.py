@@ -518,7 +518,7 @@ class EagleDraftInput:
         # (= total_bs / dp). Hardcoding 1 here drops dp=1 multi-req.
         per_dp_bs = model_worker_batch.per_dp_bs_size
         total_tok = len(model_worker_batch.input_ids)
-        per_dp_tok = total_tok // dp_size if dp_size > 0 else total_tok
+        per_dp_tok = total_tok // dp_size
         extend_seq_lens = model_worker_batch.extend_seq_lens
         flat_idx = 0  # index into self.verified_id (cross-rank flat)
         for dp_rank in range(dp_size):

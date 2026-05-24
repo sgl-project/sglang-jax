@@ -554,10 +554,10 @@ class ModelRunnerKVCacheMixin:
         # 4. Resolve max_num_reqs (needed for spec dec headroom)
         max_num_reqs = self._resolve_max_num_reqs(max_num_reqs)
 
-        # 5. Speculative decoding headroom (needs max_num_reqs)
-        # For target worker: defer max_total_num_tokens inflation until after
-        # hybrid SWA split (step 7) to avoid amplifying spec headroom through
-        # the SWA layer ratio. Only compute the headroom amount here.
+        # 5. Speculative decoding: resolve draft/target cache sizes and
+        # compute headroom. Following upstream: set draft_runner_cache_size
+        # BEFORE hybrid SWA split so the draft model gets the un-inflated
+        # pool size.
         spec_headroom = 0
         if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
             if self.is_draft_worker:
@@ -573,34 +573,34 @@ class ModelRunnerKVCacheMixin:
                 )
                 self.server_args.max_num_reqs = max_num_reqs
 
-        # 6. Apply constraints (CI, user cap, page align, dp). Draft worker's
-        # pool size is target-derived (must cover target's allocator slot
-        # range), so the user --max-total-tokens cap is not re-applied — it
-        # could otherwise shrink the draft pool below the (post-hybrid) target
-        # range and reintroduce the high-slot garbage this commit fixes.
+        # 6. Apply constraints (CI, user cap, page align, dp).
         self.max_total_num_tokens = self._apply_token_constraints(
             self.max_total_num_tokens,
             None if self.is_draft_worker else max_total_tokens,
             dp_size,
         )
 
-        # 7. Hybrid SWA token split. Draft worker runs layer id discovery
-        # but skips pool size inflation inside set_num_token_hybrid().
+        # 6b. Save draft_runner_cache_size BEFORE hybrid split. The hybrid
+        # split amplifies full-layer tokens by reclaiming SWA memory, but the
+        # draft model (typically 1 layer) doesn't benefit from that — using
+        # the inflated value would OOM the draft worker.
+        if (
+            self.spec_algorithm is not None
+            and not self.spec_algorithm.is_none()
+            and not self.is_draft_worker
+        ):
+            self.server_args.draft_runner_cache_size = self.max_total_num_tokens
+
+        # 7. Hybrid SWA token split. draft_runner_cache_size is already saved
+        # above, so the draft won't see this inflation.
         if self.is_hybrid:
             self.set_num_token_hybrid()
 
         # 7b. Apply spec headroom AFTER hybrid split so it's not amplified
-        # by the SWA layer ratio. Re-align to page_size: _apply_token_constraints
-        # left max_total_num_tokens page-aligned, but spec_headroom (= a function
-        # of max_num_reqs × num_steps × topk + max_num_reqs × num_draft_tokens
-        # + 100) is not generally a page_size multiple, so adding it un-aligns
-        # the pool size and trips the page-divisibility assert in
-        # MHATokenToKVPool._create_buffers (especially for page_size > 1
-        # configs that don't happen to divide the headroom).
+        # by the SWA layer ratio. Re-align to page_size.
         if spec_headroom > 0:
             self.max_total_num_tokens += spec_headroom
             self.max_total_num_tokens = self.max_total_num_tokens // self.page_size * self.page_size
-            self.server_args.draft_runner_cache_size = self.max_total_num_tokens
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")

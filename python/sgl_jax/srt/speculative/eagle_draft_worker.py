@@ -398,7 +398,7 @@ class EagleDraftWorker(BaseDraftWorker):
             """
             if arr is None or arr.shape[0] >= target_bs:
                 return arr
-            per_dp_curr = max(arr.shape[0] // dp_size, 1) if dp_size > 0 else arr.shape[0]
+            per_dp_curr = max(arr.shape[0] // dp_size, 1)
             if dp_size <= 1 or arr.shape[0] % dp_size != 0:
                 # Fallback to end-pad if layout isn't DP-divisible (dp=1 path).
                 pad_widths = [(0, target_bs - arr.shape[0])] + [(0, 0)] * (arr.ndim - 1)
