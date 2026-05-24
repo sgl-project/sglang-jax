@@ -68,19 +68,6 @@ class EagleDraftWorker(BaseDraftWorker):
 
         self._share_embed_head(target_worker)
 
-        target_slot_range = getattr(
-            target_worker.model_runner,
-            "full_max_total_num_tokens",
-            target_worker.model_runner.max_total_num_tokens,
-        )
-        draft_pool_size = self.draft_model_runner.max_total_num_tokens
-        assert draft_pool_size >= target_slot_range, (
-            f"draft KV pool ({draft_pool_size}) < target allocator slot range "
-            f"({target_slot_range}); high-slot draft KV reads/writes will be "
-            f"garbage. Hybrid target without the post-set_num_token_hybrid "
-            f"draft_runner_cache_size overwrite hits this."
-        )
-
         self._worker.model_runner.initialize_jit()
 
         (

@@ -566,6 +566,11 @@ class FlashAttention(AttentionBackend):
             ),  # updated kv_cache_fused (head interleaved) - 3D: [total_tokens, num_kv_heads*2, head_dim]
         )
 
+        mask_aligned_to_cu_kv = (
+            self.forward_metadata.custom_mask is not None
+            and forward_batch.forward_mode.is_target_verify()
+        )
+
         def _ragged_paged_attention_with_fused_kv(*args):
             queries, keys, values, kv_cache_fused = args[:4]
             other_args = args[4:]
@@ -584,6 +589,7 @@ class FlashAttention(AttentionBackend):
                 xai_temperature_len=(
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
                 ),
+                mask_aligned_to_cu_kv=mask_aligned_to_cu_kv,
             )
 
             return result, updated_kv_cache_fused
