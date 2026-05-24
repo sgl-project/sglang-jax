@@ -590,9 +590,16 @@ class ModelRunnerKVCacheMixin:
             self.set_num_token_hybrid()
 
         # 7b. Apply spec headroom AFTER hybrid split so it's not amplified
-        # by the SWA layer ratio.
+        # by the SWA layer ratio. Re-align to page_size: _apply_token_constraints
+        # left max_total_num_tokens page-aligned, but spec_headroom (= a function
+        # of max_num_reqs × num_steps × topk + max_num_reqs × num_draft_tokens
+        # + 100) is not generally a page_size multiple, so adding it un-aligns
+        # the pool size and trips the page-divisibility assert in
+        # MHATokenToKVPool._create_buffers (especially for page_size > 1
+        # configs that don't happen to divide the headroom).
         if spec_headroom > 0:
             self.max_total_num_tokens += spec_headroom
+            self.max_total_num_tokens = self.max_total_num_tokens // self.page_size * self.page_size
             self.server_args.draft_runner_cache_size = self.max_total_num_tokens
 
         if self.max_total_num_tokens <= 0:
