@@ -72,12 +72,82 @@ def _apply_rotary_pos_emb_vision(x: jax.Array, cos: jax.Array, sin: jax.Array) -
     return out.astype(orig_dtype)
 
 
+_VIT_FLASH_BLOCK_Q = 256
+
+
+def _vit_flash_attention_tpu(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    scale: float,
+    segment_ids_1d: jax.Array,
+) -> jax.Array:
+    """Pallas TPU flash-attention path for the vision tower.
+
+    Layout: q/k/v are [B=1, T, N, H]. Returns the same shape.
+
+    Pads T to a multiple of `_VIT_FLASH_BLOCK_Q` (block_q from the tuned table)
+    so the kernel's `q_seq_len % block_q == 0` invariant holds. Padded positions
+    get a sentinel segment id that matches no real id; their outputs are sliced
+    off after the kernel call. NUM_LANES=128 is automatically satisfied because
+    256 is a multiple of 128.
+
+    q/k stay fp32, v is cast to bf16 — matches tuned-table dtype config and
+    avoids the bf16-softmax spatial-signal regression that the einsum fallback
+    explicitly avoids (see comment in `_vision_attention`).
+    """
+    from sgl_jax.srt.multimodal.kernels.flash_attention import (
+        SegmentIds,
+        flash_attention,
+    )
+
+    B, T, N, H = q.shape
+    assert B == 1, "ViT flash path expects batch size 1"
+    orig_dtype = q.dtype
+
+    pad_to = _VIT_FLASH_BLOCK_Q
+    T_pad = ((T + pad_to - 1) // pad_to) * pad_to
+    pad_len = T_pad - T
+
+    # [B, T, N, H] -> [B, N, T, H] (kernel layout)
+    q_t = jnp.transpose(q, (0, 2, 1, 3)).astype(jnp.float32)
+    k_t = jnp.transpose(k, (0, 2, 1, 3)).astype(jnp.float32)
+    v_t = jnp.transpose(v, (0, 2, 1, 3)).astype(jnp.bfloat16)
+
+    if pad_len > 0:
+        zeros_qk = jnp.zeros((B, N, pad_len, H), dtype=q_t.dtype)
+        zeros_v = jnp.zeros((B, N, pad_len, H), dtype=v_t.dtype)
+        q_t = jnp.concatenate([q_t, zeros_qk], axis=2)
+        k_t = jnp.concatenate([k_t, zeros_qk], axis=2)
+        v_t = jnp.concatenate([v_t, zeros_v], axis=2)
+
+    # Sentinel = -1: never matches any non-negative real segment id, so padded
+    # rows are isolated (and their outputs are sliced off below).
+    seg = segment_ids_1d.astype(jnp.int32)
+    if pad_len > 0:
+        seg = jnp.concatenate([seg, jnp.full((pad_len,), -1, dtype=jnp.int32)])
+    seg_2d = seg[None, :]  # [B, T_pad]
+
+    out = flash_attention(
+        q_t,
+        k_t,
+        v_t,
+        segment_ids=SegmentIds(q=seg_2d, kv=seg_2d),
+        sm_scale=scale,
+        causal=False,
+    )
+    if pad_len > 0:
+        out = out[:, :, :T, :]
+    return jnp.transpose(out, (0, 2, 1, 3)).astype(orig_dtype)
+
+
 def _vision_attention(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
     scale: float,
     attn_mask: jax.Array | None = None,
+    segment_ids_1d: jax.Array | None = None,
 ) -> jax.Array:
     """Cacheless full attention for vision tower.
 
@@ -87,6 +157,10 @@ def _vision_attention(
             attend to key j. False positions get a large-negative bias added.
             Used to express block-diagonal masking (one image per block) plus
             padding suppression (padded patches belong to no segment).
+        segment_ids_1d: optional [T] int32 segment ids (one per token). When
+            provided on TPU, routed to the Pallas flash-attention kernel; the
+            same-segment mask replaces the dense [T,T] block-diagonal mask and
+            keeps memory at O(T * block_q) instead of O(T^2).
     Returns:
         [B, T, N, H]
     """
@@ -104,6 +178,10 @@ def _vision_attention(
                 output = output.astype(original_dtype)
             return output
         # fall through to native einsum path below
+
+    if is_tpu_runtime() and segment_ids_1d is not None:
+        return _vit_flash_attention_tpu(q, k, v, scale, segment_ids_1d)
+
     B, T, N, H = q.shape
     # Compute attention in float32 to match upstream / HF semantics.
     # Bfloat16 attention softmax destroys spatial signal in multi-row layouts.
@@ -213,6 +291,7 @@ class Qwen3VLVisionAttention(nnx.Module):
         cos: jax.Array,
         sin: jax.Array,
         attn_mask: jax.Array | None = None,
+        segment_ids_1d: jax.Array | None = None,
     ) -> jax.Array:
         # x: [T, B, D] (matches Qwen2.5-VL convention)
         T, B, D = x.shape
@@ -226,7 +305,9 @@ class Qwen3VLVisionAttention(nnx.Module):
         # cos/sin: [T, head_dim] after concat half+half from rotary_dim=head_dim//2 (see top-level builder)
         q = _apply_rotary_pos_emb_vision(q, cos, sin)
         k = _apply_rotary_pos_emb_vision(k, cos, sin)
-        out = _vision_attention(q, k, v, self.scale, attn_mask=attn_mask)
+        out = _vision_attention(
+            q, k, v, self.scale, attn_mask=attn_mask, segment_ids_1d=segment_ids_1d
+        )
         # [B, T, N, H] -> [T, B, D]
         out = out.transpose(1, 0, 2, 3).reshape(T, B, D)
         return self.proj(out)
@@ -265,8 +346,11 @@ class Qwen3VLVisionBlock(nnx.Module):
         cos: jax.Array,
         sin: jax.Array,
         attn_mask: jax.Array | None = None,
+        segment_ids_1d: jax.Array | None = None,
     ) -> jax.Array:
-        x = x + self.attn(self.norm1(x), cos, sin, attn_mask=attn_mask)
+        x = x + self.attn(
+            self.norm1(x), cos, sin, attn_mask=attn_mask, segment_ids_1d=segment_ids_1d
+        )
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -570,24 +654,29 @@ class Qwen3VLVisionModel(nnx.Module):
         x = self.patch_embed(pixel_values)  # [N_padded_patches, hidden]
 
         # ------------- block-diagonal attention mask -------------
-        # Build a 2D bool mask [T, T] where T = N_padded_patches:
-        #   attn_mask[i, j] = True iff token i and token j belong to the same
-        #   image AND that image is real (segment_id < n_real_images).
-        # Implementation: derive a segment_id per token from cu_seqlens via
-        # searchsorted on the right boundaries cu_seqlens[1:].
+        # Derive a per-token segment id from cu_seqlens via searchsorted on the
+        # right boundaries cu_seqlens[1:]. Real-image tokens get id 0..n_real-1;
+        # tokens in the padded tail land at n_real_images or above.
+        #
+        # We materialize TWO views and pick one depending on backend:
+        # * `attn_mask` [T, T]: dense bool mask used by the einsum fallback (and
+        #   the GPU non-flash path). Padded-key columns are masked off via
+        #   `valid[None, :]` so padded tokens contribute zero to real outputs.
+        # * `seg_ids_for_kernel` [T]: replaces padded segment ids with -1
+        #   (sentinel that never matches any real id) so the Pallas flash
+        #   kernel's segment_ids mask reproduces exactly the same masking
+        #   semantics as the dense mask above without O(T^2) memory.
         attn_mask = None
+        seg_ids_for_kernel = None
         if cu_seqlens is not None:
             T = x.shape[0]
             token_idx = jnp.arange(T, dtype=jnp.int32)
-            # boundaries: cu_seqlens[1:] -> right edges of each segment
-            # searchsorted(side="right") gives the segment id 0..N_padded_images-1
             seg_ids = jnp.searchsorted(cu_seqlens[1:], token_idx, side="right")
-            # Valid only if segment id < n_real_images (padded segments are
-            # empty so seg_ids of padded tokens land at n_real_images or above).
             n_real = jnp.asarray(n_real_images, dtype=jnp.int32)
             valid = seg_ids < n_real  # [T]
-            # same-segment mask, masked off when either side is padded.
-            attn_mask = (seg_ids[:, None] == seg_ids[None, :]) & valid[None, :]
+            seg_ids_for_kernel = jnp.where(valid, seg_ids, jnp.int32(-1))
+            if not is_tpu_runtime():
+                attn_mask = (seg_ids[:, None] == seg_ids[None, :]) & valid[None, :]
 
         # ------------- pos_embed + RoPE (built from static grid_thw) -------------
         # If no real images, skip the static-grid path (would produce empty
@@ -641,7 +730,7 @@ class Qwen3VLVisionModel(nnx.Module):
         deepstack_features = []
         num_captured = 0
         for layer_num, blk in enumerate(self.blocks):
-            x = blk(x, cos, sin, attn_mask=attn_mask)
+            x = blk(x, cos, sin, attn_mask=attn_mask, segment_ids_1d=seg_ids_for_kernel)
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_features.append(self.deepstack_merger_list[num_captured](x))
                 num_captured += 1
