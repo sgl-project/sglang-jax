@@ -330,6 +330,7 @@ def _fused_ep_moe_kernel(
     next_w2_prologue_priority: int = 1,
     w2_fetch_order: str = "after_w13",
     w2_fetch_priority: int = 1,
+    skip_post_gather_sync: bool = True,
     skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
     direct_scaled_dot: bool = False,
@@ -1390,8 +1391,8 @@ def _fused_ep_moe_kernel(
                                         x_slice = maybe_cast_ffn1_input(x_slice)
                                         w1_tile = b_w1_x2_vmem[slot, _pid, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)]
                                         d1 = jnp.dot(x_slice, w1_tile, preferred_element_type=jnp.float32)
-                                        s1 = b_w1_scale_x2_vmem[slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)].reshape(bf)
-                                        return gate_acc + jnp.stack([d1[i] * s1 for i in range(btc)], axis=0)
+                                        s1 = b_w1_scale_x2_vmem[slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)].reshape(1, bf)
+                                        return gate_acc + d1 * jnp.broadcast_to(s1, d1.shape)
                                     gate = lax.fori_loop(0, n_sg, _ffn1_gate_sg, gate, unroll=n_sg)
                             b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
                             return None
@@ -1409,8 +1410,8 @@ def _fused_ep_moe_kernel(
                                         x_slice = maybe_cast_ffn1_input(x_slice)
                                         w3_tile = b_w3_x2_vmem[slot, _pid, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)]
                                         d3 = jnp.dot(x_slice, w3_tile, preferred_element_type=jnp.float32)
-                                        s3 = b_w3_scale_x2_vmem[slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)].reshape(bf)
-                                        return up_acc + jnp.stack([d3[i] * s3 for i in range(btc)], axis=0)
+                                        s3 = b_w3_scale_x2_vmem[slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)].reshape(1, bf)
+                                        return up_acc + d3 * jnp.broadcast_to(s3, d3.shape)
                                     up = lax.fori_loop(0, n_sg, _ffn1_up_sg, up, unroll=n_sg)
                             b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
                             return None
@@ -1456,8 +1457,8 @@ def _fused_ep_moe_kernel(
                                             pl.ds(sg_id, 1),
                                             0,
                                             pl.ds(0, bf),
-                                        ].reshape(bf)
-                                        gate_acc += jnp.stack([d1[i] * s1 for i in range(btc)], axis=0)
+                                        ].reshape(1, bf)
+                                        gate_acc += d1 * jnp.broadcast_to(s1, d1.shape)
 
                                         d3 = jnp.dot(
                                             x_slice, w3_tile,
@@ -1469,8 +1470,8 @@ def _fused_ep_moe_kernel(
                                             pl.ds(sg_id, 1),
                                             0,
                                             pl.ds(0, bf),
-                                        ].reshape(bf)
-                                        up_acc += jnp.stack([d3[i] * s3 for i in range(btc)], axis=0)
+                                        ].reshape(1, bf)
+                                        up_acc += d3 * jnp.broadcast_to(s3, d3.shape)
                                         return gate_acc, up_acc
 
                                     gate, up = lax.fori_loop(
@@ -1716,8 +1717,8 @@ def _fused_ep_moe_kernel(
                                             pl.ds(sg_id, 1),
                                             0,
                                             pl.ds(0, h_per_t),
-                                        ].reshape(h_per_t)
-                                        return partial_acc + jnp.stack([d[i] * s for i in range(btc)], axis=0)
+                                        ].reshape(1, h_per_t)
+                                        return partial_acc + d * jnp.broadcast_to(s, d.shape)
 
                                     partial = lax.fori_loop(
                                         0,
@@ -2105,6 +2106,9 @@ def _fused_ep_moe_kernel(
                 bt_sem_id=bt_sem_id, out_buf_id=out_buf_id,
                 gather_bank_id=gather_bank_id,
             )
+            if not skip_post_gather_sync:
+                sync_barrier()
+
             start_send_bo(bt_id=bt_id)
 
             for tail_e_id in range(local_num_experts):
@@ -2146,6 +2150,8 @@ def _fused_ep_moe_kernel(
                 bt_sem_id=bt_sem_id, out_buf_id=out_buf_id,
                 gather_bank_id=gather_bank_id,
             )
+            if not skip_post_gather_sync:
+                sync_barrier()
             start_send_bo(bt_id=bt_id)
 
             tail_start = max(local_num_experts - expert_buffer_count, 0)
@@ -2242,6 +2248,7 @@ def jax_allreduce_metadata_by_bt(
         "cast_ffn1_input_fp8", "cast_ffn2_input_fp8",
         "cross_expert_prefetch_mode", "next_w2_prologue_priority",
         "w2_fetch_order", "w2_fetch_priority",
+        "skip_post_gather_sync",
         "skip_inter_bt_sync",
         "interleave_bt",
     ],
@@ -2306,6 +2313,7 @@ def fused_ep_moe_v2(
     next_w2_prologue_priority: int = 1,
     w2_fetch_order: str = "after_w13",
     w2_fetch_priority: int = 1,
+    skip_post_gather_sync: bool = True,
     skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
     dp_axis_name: str = "data",
@@ -2512,6 +2520,8 @@ def fused_ep_moe_v2(
         scope_name += f"-w2p_{next_w2_prologue_priority}"
     if w2_fetch_order != "after_w13" or w2_fetch_priority != 1:
         scope_name += f"-w2fetch_{w2_fetch_order}_p{w2_fetch_priority}"
+    if skip_post_gather_sync:
+        scope_name += "-skip_post_gather_sync"
     if skip_inter_bt_sync:
         scope_name += "-skip_inter_bt_sync"
     if interleave_bt:
@@ -2651,6 +2661,7 @@ def fused_ep_moe_v2(
                 next_w2_prologue_priority=next_w2_prologue_priority,
                 w2_fetch_order=w2_fetch_order,
                 w2_fetch_priority=w2_fetch_priority,
+                skip_post_gather_sync=skip_post_gather_sync,
                 skip_inter_bt_sync=skip_inter_bt_sync,
                 interleave_bt=interleave_bt,
                 direct_scaled_dot=direct_scaled_dot,

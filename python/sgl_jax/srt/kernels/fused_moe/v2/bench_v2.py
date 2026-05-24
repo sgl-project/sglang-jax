@@ -18,6 +18,7 @@ Env vars:
   BENCH_FFN1_DEQUANT_CHUNK — comma-separated FFN1 dequant chunk sizes for fchunk
   BENCH_W2_FETCH_ORDER — after_w13 or before_w13 for current-expert W2 DMA
   BENCH_W2_FETCH_PRIORITY — comma-separated 0/1 priority for current-expert W2 DMA
+  BENCH_SKIP_POST_GATHER_SYNC — comma-separated 0/1 skip barrier after gather recv wait
   BENCH_SKIP_INTER_BT_SYNC — comma-separated 0/1 skip inter-BT sync barrier
   BENCH_INTERLEAVE_BT — comma-separated 0/1 interleave BT gather banking
   BENCH_TUNE    — 1 to auto-generate bt/bf candidates
@@ -255,6 +256,9 @@ cross_expert_prefetch_modes = parse_csv_str("BENCH_CROSS_EXPERT_PREFETCH", ["ful
 next_w2_prologue_priorities = parse_csv_int("BENCH_NEXT_W2_PRIORITY", [1])
 w2_fetch_orders = parse_csv_str("BENCH_W2_FETCH_ORDER", ["after_w13"])
 w2_fetch_priorities = parse_csv_int("BENCH_W2_FETCH_PRIORITY", [1])
+skip_post_gather_sync_modes = parse_csv_bool(
+    "BENCH_SKIP_POST_GATHER_SYNC", [True],
+)
 skip_inter_bt_sync_modes = parse_csv_bool(
     "BENCH_SKIP_INTER_BT_SYNC", [True],
 )
@@ -427,6 +431,8 @@ if w2_fetch_orders != ["after_w13"] or w2_fetch_priorities != [1]:
         "w2_fetch sweep: "
         f"order={w2_fetch_orders} priority={w2_fetch_priorities}"
     )
+if skip_post_gather_sync_modes != [True]:
+    log(f"skip_post_gather_sync sweep: {skip_post_gather_sync_modes}")
 if skip_inter_bt_sync_modes != [True]:
     log(f"skip_inter_bt_sync sweep: {skip_inter_bt_sync_modes}")
 if interleave_bt_modes != [True]:
@@ -907,6 +913,7 @@ for num_tokens in token_candidates:
             ffn1_dequant_chunks,
             w2_fetch_orders,
             w2_fetch_priorities,
+            skip_post_gather_sync_modes,
             skip_inter_bt_sync_modes,
             interleave_bt_modes,
         )
@@ -923,6 +930,7 @@ for num_tokens in token_candidates:
         ffn1_dequant_chunk,
         w2_fetch_order,
         w2_fetch_priority,
+        skip_post_gather_sync,
         skip_inter_bt_sync,
         interleave_bt,
     ) in configs_to_try:
@@ -941,6 +949,7 @@ for num_tokens in token_candidates:
             f"bt={bt},bf={bf},btc={btc},bts={bts},"
             f"xprefetch={xprefetch_mode},w2p={next_w2_priority},"
             f"w2order={w2_fetch_order},w2fp={w2_fetch_priority},"
+            f"skip_pg_sync={int(skip_post_gather_sync)},"
             f"direct_f1={int(direct_ffn1)},direct_f2={int(direct_ffn2)},"
             f"cast_f1={int(cast_ffn1_input_fp8)},cast_f2={int(cast_ffn2_input_fp8)},"
             f"ffn1dq={ffn1_mode_tag},ffn1chunk={ffn1_dequant_chunk},"
@@ -966,6 +975,7 @@ for num_tokens in token_candidates:
             f"btc={bc_resolved.btc},bts={bc_resolved.bts},"
             f"xprefetch={xprefetch_mode},w2p={next_w2_priority},"
             f"w2order={w2_fetch_order},w2fp={w2_fetch_priority},"
+            f"skip_pg_sync={int(skip_post_gather_sync)},"
             f"direct_f1={int(direct_ffn1)},direct_f2={int(direct_ffn2)},"
             f"cast_f1={int(cast_ffn1_input_fp8)},cast_f2={int(cast_ffn2_input_fp8)},"
             f"ffn1dq={ffn1_mode_tag},ffn1chunk={ffn1_dequant_chunk},"
@@ -985,6 +995,7 @@ for num_tokens in token_candidates:
             ffn1_dequant_chunk,
             w2_fetch_order,
             w2_fetch_priority,
+            skip_post_gather_sync,
             skip_inter_bt_sync,
             interleave_bt,
         )
@@ -1038,6 +1049,7 @@ for num_tokens in token_candidates:
                 next_w2_prologue_priority=next_w2_priority,
                 w2_fetch_order=w2_fetch_order,
                 w2_fetch_priority=w2_fetch_priority,
+                skip_post_gather_sync=skip_post_gather_sync,
                 skip_inter_bt_sync=skip_inter_bt_sync,
                 interleave_bt=interleave_bt,
                 enable_bt_scatter_overlap=enable_bt_scatter_overlap,
@@ -1120,6 +1132,7 @@ if check_correctness:
             cast_ffn2_input_fp8=cast_ffn2_input_fp8,
             w2_fetch_order=w2_fetch_orders[0],
             w2_fetch_priority=w2_fetch_priorities[0],
+            skip_post_gather_sync=skip_post_gather_sync_modes[0],
             skip_inter_bt_sync=skip_inter_bt_sync_modes[0],
             interleave_bt=interleave_bt_modes[0],
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
