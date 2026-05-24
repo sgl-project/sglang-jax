@@ -2061,10 +2061,19 @@ class ScheduleBatch:
         # Pin total_bs to the largest precompile bucket so every cell shares
         # one jit cache entry regardless of runtime bs. Without this, each
         # smaller bucket (bs_paddings[i] < bs_paddings[-1]) triggers a fresh
-        # trace the first time it's hit.
-        total_bs = max(bs_paddings) if bs_paddings else 1
-        if total_bs % self.dp_size != 0:
-            total_bs, _ = pad_to_bucket(max(1, 1) * self.dp_size, bs_paddings)
+        # trace the first time it's hit. precompile is expected to include a
+        # largest bucket that is a multiple of dp_size; falling back to a
+        # smaller bucket would split the cache key, so assert instead.
+        if not bs_paddings:
+            total_bs = self.dp_size
+        else:
+            total_bs = max(bs_paddings)
+            assert total_bs % self.dp_size == 0, (
+                f"max(bs_paddings)={total_bs} is not divisible by dp_size="
+                f"{self.dp_size}; precompile must include a largest bucket "
+                f"that is a multiple of dp_size to keep the spec decode jit "
+                f"cache key stable. bs_paddings={bs_paddings}"
+            )
         per_dp_bs = total_bs // self.dp_size
         self.per_dp_bs_size = per_dp_bs
         (
