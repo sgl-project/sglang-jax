@@ -5,6 +5,7 @@ from functools import partial
 from typing import Literal, TypedDict
 
 import jax
+import jax.experimental.pallas as pl
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
@@ -15,7 +16,7 @@ from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.multimodal.configs.kimi.kimi_k25_config import (
     KimiK25ModelVitConfig,
 )
-
+from sgl_jax.srt.multimodal.kernels.flash_attention import SegmentIds, flash_attention
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 
@@ -123,11 +124,11 @@ class Rope2DPosEmbRepeated(nnx.Module):
         self.max_width = max_width
         self.theta_base = theta_base
 
-    def _precompute_freqs_cis(self) -> None:
+    def _precompute_freqs_cis(self) -> jax.Array:
         N = self.max_height * self.max_width
         flat_pos = jnp.arange(0, N).astype(jnp.float32)
         x_pos = flat_pos % self.max_width
-        y_pos = flat_pos % self.max_height
+        y_pos = flat_pos // self.max_width
 
         dim_range = (
             jnp.arange(0, self.dim, 4)[: (self.dim // 4)].astype(jnp.float32)
@@ -137,38 +138,39 @@ class Rope2DPosEmbRepeated(nnx.Module):
         x_freqs = jnp.outer(x_pos, freqs).astype(jnp.float32)
         y_freqs = jnp.outer(y_pos, freqs).astype(jnp.float32)
 
-        x_cis = jnp.exp(1j * x_freqs)
-        y_cis = jnp.exp(1j * y_freqs)
+        cos_x = jnp.cos(x_freqs)
+        sin_x = jnp.sin(x_freqs)
+        cos_y = jnp.cos(y_freqs)
+        sin_y = jnp.sin(y_freqs)
 
-        freqs_cis = jnp.concatenate(
-            [jnp.expand_dims(x_cis, axis=-1), jnp.expand_dims(y_cis, axis=-1)], axis=-1
-        )
+        cos_emb = jnp.stack([cos_x, cos_y], axis=-1).reshape(N, -1)
+        sin_emb = jnp.stack([sin_x, sin_y], axis=-1).reshape(N, -1)
 
-        freqs_cis = freqs_cis.reshape(self.max_height, self.max_width, -1)
+        freqs_cis = jnp.stack([cos_emb, sin_emb], axis=0)
+        freqs_cis = freqs_cis.reshape(2, self.max_height, self.max_width, -1)
         return freqs_cis
 
     def _get_freqs_cis(
         self,
         grid_thws: jax.Array,
     ) -> jax.Array:
-
         freqs_cis = self._precompute_freqs_cis()
 
         shapes = grid_thws.tolist()
         assert all(
-            1 <= h <= self.max_height and 1 <= 2 <= self.max_width for t, h, w in shapes
+            1 <= h <= self.max_height and 1 <= w <= self.max_width for t, h, w in shapes
         ), (
             shapes,
             self.max_height,
-            self.max_widht,
+            self.max_width,
         )
 
         freqs_cis = jnp.concatenate(
             [
-                freqs_cis[:h, :w].reshape(-1, self.dim // 2).repeat(t, 1)
+                freqs_cis[:, :h, :w].reshape(2, -1, self.dim // 2).repeat(t, axis=1)
                 for t, h, w in shapes
             ], 
-            axis=0
+            axis=1
         )
 
         return freqs_cis
@@ -223,6 +225,10 @@ class KimiK25VisionPatchEmbed(nnx.Module):
         return self.pos_emb(x, grid_thws)
 
 
+def align_to(x, a):
+    return pl.cdiv(x, a) * a
+
+
 class KimiK25VisionAttention(nnx.Module):
     def __init__(
         self,
@@ -232,12 +238,16 @@ class KimiK25VisionAttention(nnx.Module):
         rngs: nnx.Rngs = None,
     ):
         self.mesh = mesh
+        self.hidden_size = config.vt_hidden_size
+        self.num_heads = config.vt_num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.scale = 1.0 / math.sqrt(self.head_dim)
 
         _rngs = rngs or nnx.Rngs(0)
 
         self.qkv_proj = nnx.Linear(
-            config.vt_hidden_size,
-            3 * config.vt_hidden_size,
+            self.hidden_size,
+            3 * self.hidden_size,
             use_bias=True,
             param_dtype=dtype,
             rngs=_rngs,
@@ -248,9 +258,80 @@ class KimiK25VisionAttention(nnx.Module):
         hidden_states: jax.Array,
         cu_seqlens: jax.Array,
         position_embeddings: jax.Array,
-    ):
-        # TODO: Implement the attention layer
-        return hidden_states
+    ) -> jax.Array:
+        sum_seq_len, D = hidden_states.shape
+
+        # Project to Q, K, V
+        qkv = self.qkv_proj(hidden_states)
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+
+        # Reshape: [S, D] -> [S, N, H_D]
+        q = q.reshape(sum_seq_len, self.num_heads, self.head_dim)
+        k = k.reshape(sum_seq_len, self.num_heads, self.head_dim)
+        v = v.reshape(sum_seq_len, self.num_heads, self.head_dim)
+
+        # Apply 2D RoPE
+        cos_emb, sin_emb = position_embeddings[0], position_embeddings[1]
+
+        q_real = q[..., 0::2]
+        q_imag = q[..., 1::2]
+        q_rot_real = q_real * cos_emb[:, None, :] - q_imag * sin_emb[:, None, :]
+        q_rot_imag = q_real * sin_emb[:, None, :] + q_imag * cos_emb[:, None, :]
+        q = jnp.stack([q_rot_real, q_rot_imag], axis=-1).reshape(sum_seq_len, self.num_heads, self.head_dim)
+
+        k_real = k[..., 0::2]
+        k_imag = k[..., 1::2]
+        k_rot_real = k_real * cos_emb[:, None, :] - k_imag * sin_emb[:, None, :]
+        k_rot_imag = k_real * sin_emb[:, None, :] + k_imag * cos_emb[:, None, :]
+        k = jnp.stack([k_rot_real, k_rot_imag], axis=-1).reshape(sum_seq_len, self.num_heads, self.head_dim)
+
+        # TPU Path: Segmented TPU Pallas FlashAttention
+        
+        # 1. Pad sequence length to multiple of 256
+        align_seq_len = align_to(sum_seq_len, 256)
+        
+        pad_q = q
+        pad_k = k
+        pad_v = v
+        
+        seg_q = None
+        seg_kv = None
+        segment_ids = None
+        
+        if sum_seq_len != align_seq_len:
+            pad_q = jnp.pad(q, ((0, align_seq_len - sum_seq_len), (0, 0), (0, 0)))
+            pad_k = jnp.pad(k, ((0, align_seq_len - sum_seq_len), (0, 0), (0, 0)))
+            pad_v = jnp.pad(v, ((0, align_seq_len - sum_seq_len), (0, 0), (0, 0)))
+            
+            # Generate segment IDs: valid tokens have positive indices, padding has 0
+            indices = jnp.arange(sum_seq_len)
+            item_ids = jnp.sum(indices[:, None] >= cu_seqlens[1:][None, :], axis=-1) + 1
+            
+            seg_q = jnp.pad(item_ids, (0, align_seq_len - sum_seq_len))
+            seg_kv = jnp.pad(item_ids, (0, align_seq_len - sum_seq_len))
+            
+            segment_ids = SegmentIds(q=seg_q[None, :], kv=seg_kv[None, :])
+
+        # Reshape to batch-format expected by Pallas kernel: [B=1, H, S, H_D]
+        pad_q = jnp.transpose(pad_q, (1, 0, 2))[None, ...]
+        pad_k = jnp.transpose(pad_k, (1, 0, 2))[None, ...]
+        pad_v = jnp.transpose(pad_v, (1, 0, 2))[None, ...]
+
+        # Execute TPU Pallas FlashAttention kernel
+        output = flash_attention(
+            pad_q,
+            pad_k,
+            pad_v,
+            segment_ids=segment_ids,
+            causal=False,
+            sm_scale=self.scale,
+        )
+
+        # Reshape back: [B=1, H, S, H_D] -> [S, H, H_D] -> slice back to sum_seq_len -> [S, D]
+        output = jnp.transpose(output[0], (1, 0, 2))
+        output = output[:sum_seq_len, :, :].reshape(sum_seq_len, D)
+
+        return output
 
 
 
