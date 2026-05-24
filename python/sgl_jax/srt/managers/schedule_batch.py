@@ -2182,12 +2182,10 @@ class ScheduleBatch:
         # multiple objects (single-circle prompts still work, but multi-object
         # layouts get hallucinated as repeating grids).
         mrope_positions_cpu = _compute_mrope_positions_for_batch(
-            self.reqs,
+            self.reqs_info,
             self.forward_mode,
-            seq_lens_cpu,
-            len(input_ids_cpu),
-            extend_prefix_lens,
-            extend_seq_lens,
+            per_dp_token_padding,
+            self.dp_size,
         )
 
         return ModelWorkerBatch(
@@ -2305,12 +2303,10 @@ class ScheduleBatch:
                 positions_cpu[: len(batch_positions)] = batch_positions
 
         mrope_positions_cpu = _compute_mrope_positions_for_batch(
-            self.reqs,
+            [self.reqs_info[0]],
             self.forward_mode,
-            seq_lens_cpu,
             len(input_ids_cpu),
-            extend_prefix_lens,
-            extend_seq_lens,
+            1,
         )
 
         cache_loc_flat = np.array([], dtype=np.int32)
@@ -2744,82 +2740,125 @@ def _as_int_scalar(value: Any, default: int = 0) -> int:
     return int(value)
 
 
-def _compute_mrope_positions_for_batch(
+def _mrope_positions_for_rank(
     reqs: list[Req],
     forward_mode: ForwardMode,
-    seq_lens_cpu: np.ndarray,
-    input_ids_len: int,
-    extend_prefix_lens: np.ndarray | None,
-    extend_seq_lens: np.ndarray | None,
-) -> np.ndarray | None:
-    mm_inputs_list = [getattr(req, "mm_inputs", None) for req in reqs]
-    has_mrope = any(
-        _extract_mm_value(mm, "mrope_positions") is not None
-        or _extract_mm_value(mm, "mrope_position_delta") is not None
-        for mm in mm_inputs_list
-    )
-    if not has_mrope:
-        return None
-
+    seq_lens: np.ndarray,
+    prefix_lens: list[int] | np.ndarray | None,
+    extend_lens: list[int] | np.ndarray | None,
+) -> np.ndarray:
+    """Per-DP-rank mrope_positions. Returns shape [3, sum_tokens_in_rank]."""
     if forward_mode.is_decode():
-        mrope_positions_list = []
-        for batch_idx, mm_inputs in enumerate(mm_inputs_list):
-            base_pos = int(seq_lens_cpu[batch_idx]) - 1
+        chunks = []
+        for batch_idx, req in enumerate(reqs):
+            mm_inputs = getattr(req, "mm_inputs", None)
+            base_pos = int(seq_lens[batch_idx]) - 1
             delta = _extract_mm_value(mm_inputs, "mrope_position_delta")
             if delta is not None:
                 base_pos += _as_int_scalar(delta)
-            mrope_positions_list.append(
-                np.full((3, 1), base_pos, dtype=np.int32),
-            )
-        mrope_positions = (
-            np.concatenate(mrope_positions_list, axis=1)
-            if mrope_positions_list
-            else np.zeros((3, 0), dtype=np.int32)
-        )
-    else:
-        if extend_prefix_lens is None or extend_seq_lens is None:
-            return None
-        mrope_positions_list = []
-        for batch_idx, mm_inputs in enumerate(mm_inputs_list):
-            extend_len = int(extend_seq_lens[batch_idx])
-            prefix_len = int(extend_prefix_lens[batch_idx])
-            if extend_len <= 0:
-                mrope_positions_list.append(np.zeros((3, 0), dtype=np.int32))
-                continue
+            chunks.append(np.full((3, 1), base_pos, dtype=np.int32))
+        return np.concatenate(chunks, axis=1) if chunks else np.zeros((3, 0), dtype=np.int32)
 
-            mm_positions = _extract_mm_value(mm_inputs, "mrope_positions")
-            if mm_positions is None:
-                positions = np.arange(prefix_len, prefix_len + extend_len, dtype=np.int32)
-                mrope_positions_list.append(
-                    np.broadcast_to(positions.reshape(1, -1), (3, extend_len))
-                )
-                continue
+    if prefix_lens is None or extend_lens is None:
+        return np.zeros((3, 0), dtype=np.int32)
 
+    chunks = []
+    for batch_idx, req in enumerate(reqs):
+        mm_inputs = getattr(req, "mm_inputs", None)
+        extend_len = int(extend_lens[batch_idx])
+        prefix_len = int(prefix_lens[batch_idx])
+        if extend_len <= 0:
+            chunks.append(np.zeros((3, 0), dtype=np.int32))
+            continue
+
+        delta_val = _as_int_scalar(_extract_mm_value(mm_inputs, "mrope_position_delta"))
+        mm_positions = _extract_mm_value(mm_inputs, "mrope_positions")
+
+        end = prefix_len + extend_len
+        # Split into in-prompt slice (from mm_positions, if any) and past-prompt
+        # suffix (linear positions + delta). When the extend window crosses
+        # the prompt boundary we previously silently truncated to the prompt
+        # length and zero-padded; that misroped the past-prompt tokens.
+        if mm_positions is not None:
             mm_positions = np.asarray(mm_positions)
-            chunk = mm_positions[:, prefix_len : prefix_len + extend_len]
-            if chunk.size == 0:
-                delta = _extract_mm_value(mm_inputs, "mrope_position_delta")
-                if delta is not None:
-                    delta_val = _as_int_scalar(delta)
-                    positions = (
-                        np.arange(prefix_len, prefix_len + extend_len, dtype=np.int32) + delta_val
-                    )
-                else:
-                    positions = np.arange(prefix_len, prefix_len + extend_len, dtype=np.int32)
-                chunk = np.broadcast_to(positions.reshape(1, -1), (3, extend_len))
-            mrope_positions_list.append(chunk.astype(np.int32, copy=False))
+            prompt_len = mm_positions.shape[1]
+        else:
+            prompt_len = 0
 
-        mrope_positions = (
-            np.concatenate(mrope_positions_list, axis=1)
-            if mrope_positions_list
-            else np.zeros((3, 0), dtype=np.int32)
+        parts = []
+        in_prompt_start = min(prefix_len, prompt_len)
+        in_prompt_end = min(end, prompt_len)
+        if in_prompt_end > in_prompt_start:
+            parts.append(mm_positions[:, in_prompt_start:in_prompt_end])
+
+        past_start = max(prefix_len, prompt_len)
+        if end > past_start:
+            past_positions = np.arange(past_start, end, dtype=np.int32) + delta_val
+            parts.append(np.broadcast_to(past_positions.reshape(1, -1), (3, end - past_start)))
+
+        if len(parts) == 1:
+            chunk = parts[0]
+        elif parts:
+            chunk = np.concatenate(parts, axis=1)
+        else:
+            chunk = np.zeros((3, 0), dtype=np.int32)
+        chunks.append(chunk.astype(np.int32, copy=False))
+
+    return np.concatenate(chunks, axis=1) if chunks else np.zeros((3, 0), dtype=np.int32)
+
+
+def _compute_mrope_positions_for_batch(
+    reqs_info: list,
+    forward_mode: ForwardMode,
+    per_dp_token_size: int,
+    dp_size: int,
+) -> np.ndarray | None:
+    """Build mrope_positions in the per-DP-padded layout matching positions_cpu.
+
+    Returns shape [3, per_dp_token_size * dp_size] aligned with positions_cpu,
+    or None if no req in the batch carries mrope info.
+
+    Each DP rank's mrope positions are written into its slot
+    [dp_rank * per_dp_token_size, dp_rank * per_dp_token_size + dp_token_count);
+    the rest of the slot stays zero-padded just like positions_cpu.
+    """
+    has_mrope = False
+    for info in reqs_info:
+        if not info.reqs:
+            continue
+        for req in info.reqs:
+            mm = getattr(req, "mm_inputs", None)
+            if mm is not None and (
+                _extract_mm_value(mm, "mrope_positions") is not None
+                or _extract_mm_value(mm, "mrope_position_delta") is not None
+            ):
+                has_mrope = True
+                break
+        if has_mrope:
+            break
+    if not has_mrope:
+        return None
+
+    total_token_size = per_dp_token_size * dp_size
+    out = np.zeros((3, total_token_size), dtype=np.int32)
+
+    for dp_rank, info in enumerate(reqs_info):
+        if not info.reqs:
+            continue
+        dp_pos = _mrope_positions_for_rank(
+            info.reqs,
+            forward_mode,
+            info.seq_lens,
+            info.prefix_lens,
+            info.extend_lens,
         )
+        if dp_pos.shape[1] == 0:
+            continue
+        dst = dp_rank * per_dp_token_size
+        write_len = min(dp_pos.shape[1], per_dp_token_size)
+        out[:, dst : dst + write_len] = dp_pos[:, :write_len]
 
-    pad_len = input_ids_len - mrope_positions.shape[1]
-    if pad_len > 0:
-        pad = np.zeros((3, pad_len), dtype=mrope_positions.dtype)
-        mrope_positions = np.concatenate([mrope_positions, pad], axis=1)
-    return mrope_positions
+    return out
 
 
 @dataclasses.dataclass
