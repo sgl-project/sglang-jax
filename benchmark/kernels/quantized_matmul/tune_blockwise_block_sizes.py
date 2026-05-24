@@ -161,9 +161,7 @@ def main():
                 best: tuple[int, int, int] | None = None
                 for bb, ob, ib in candidates:
                     tv = TunedValue(bb, ob, ib, 1)
-                    t = benchmark_one(
-                        n_batch, n_out, n_in, args.block_k, x_dtype, w_dtype, tv
-                    )
+                    t = benchmark_one(n_batch, n_out, n_in, args.block_k, x_dtype, w_dtype, tv)
                     if t < best_time:
                         best_time = t
                         best = (bb, ob, ib)
@@ -172,7 +170,7 @@ def main():
                     continue
                 bb, ob, ib = best
                 entry = (
-                    f'    ({tpu_ver}, {n_batch}, {n_out}, {n_in}, '
+                    f"    ({tpu_ver}, {n_batch}, {n_out}, {n_in}, "
                     f'"{x_dtype.name}", "{w_dtype.name}"): ({bb}, {ob}, {ib}),'
                 )
                 fout.write(entry + "\n")
