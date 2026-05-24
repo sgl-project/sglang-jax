@@ -916,6 +916,8 @@ def _execute_server_warmup(
         kill_process_tree(os.getpid())
         return False
 
+    # Debug print
+    # logger.info(f"warmup request returns: {res.json()=}")
     return success
 
 

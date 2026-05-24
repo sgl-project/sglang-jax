@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
@@ -12,8 +11,6 @@ from jax.sharding import PartitionSpec as P
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.managers.tp_worker import ModelWorker
-
-logger = logging.getLogger(__name__)
 
 
 def replicate_to_mesh(
@@ -101,13 +98,10 @@ class BaseSpecWorker:
     # -- Main entry point --
 
     def forward_batch_speculative_generation(self, model_worker_batch: ModelWorkerBatch):
-        import jax._src.test_util as jtu
-
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         if model_worker_batch.forward_mode.is_extend():
-            # FIXME(pc) add padding logic here
             if model_worker_batch.sampling_info.temperatures.ndim == 1:
                 model_worker_batch.sampling_info.temperatures = (
                     model_worker_batch.sampling_info.temperatures[:, None]
@@ -118,27 +112,16 @@ class BaseSpecWorker:
                 self.mesh,
                 vocab_size=self.target_worker.model_config.vocab_size,
             )
-            with jtu.count_pjit_cpp_cache_miss() as spec_count:
-                logits_output, next_token_ids, cache_miss_count, bid, _seq_lens = (
-                    self.forward_target_extend(model_worker_batch, sampling_metadata)
-                )
-                if model_worker_batch.dp_size > 1:
-                    from jax.experimental.multihost_utils import process_allgather
+            logits_output, next_token_ids, cache_miss_count, bid, _seq_lens = (
+                self.forward_target_extend(model_worker_batch, sampling_metadata)
+            )
+            if model_worker_batch.dp_size > 1:
+                from jax.experimental.multihost_utils import process_allgather
 
-                    next_token_ids = process_allgather(next_token_ids, tiled=True)
-                self.draft_worker.draft_extend_for_prefill(
-                    model_worker_batch, logits_output.hidden_states, next_token_ids
-                )
-                outer_miss = spec_count()
-            if outer_miss > cache_miss_count:
-                phase = getattr(self.target_worker.model_runner, "_compilation_phase", "runtime")
-                logger.warning(
-                    "SPEC_EXTEND extra trace miss: outer=%d inner=%d phase=%s",
-                    outer_miss,
-                    cache_miss_count,
-                    phase,
-                )
-            cache_miss_count = outer_miss
+                next_token_ids = process_allgather(next_token_ids, tiled=True)
+            self.draft_worker.draft_extend_for_prefill(
+                model_worker_batch, logits_output.hidden_states, next_token_ids
+            )
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
@@ -152,26 +135,13 @@ class BaseSpecWorker:
                 extend_logprob_start_len_per_req=None,
             )
 
-        # spec_info.allocate_lens is DP-padded (total_bs,) at dp>1 (scattered in
-        # _get_spec_decode_mwb_dp); gather back to global-flat (real_bs,) so the
-        # cross-round state on reqs_info[0].spec_info stays flat-ordered.
+        # spec_info.allocate_lens is DP-padded (total_bs,) at dp>1; gather back
+        # to global-flat (real_bs,) so reqs_info[0].spec_info stays flat-ordered.
         sel = model_worker_batch.logits_indices_selector
         cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
-        with jtu.count_pjit_cpp_cache_miss() as spec_count:
-            self.draft_worker.draft(model_worker_batch)
-            batch_output = self.verify(model_worker_batch, cur_allocate_lens)
-            self.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
-            outer_miss = spec_count()
-        inner_miss = batch_output.cache_miss_count
-        if outer_miss > inner_miss:
-            phase = getattr(self.target_worker.model_runner, "_compilation_phase", "runtime")
-            logger.warning(
-                "SPEC_DECODE extra trace miss: outer=%d inner=%d phase=%s",
-                outer_miss,
-                inner_miss,
-                phase,
-            )
-        batch_output.cache_miss_count = outer_miss
+        self.draft_worker.draft(model_worker_batch)
+        batch_output = self.verify(model_worker_batch, cur_allocate_lens)
+        self.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
         return batch_output
 
     def forward_target_extend(self, model_worker_batch: ModelWorkerBatch, sampling_metadata):
