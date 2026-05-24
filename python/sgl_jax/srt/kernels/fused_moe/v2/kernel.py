@@ -2105,6 +2105,7 @@ def _fused_ep_moe_kernel(
                 bt_sem_id=bt_sem_id, out_buf_id=out_buf_id,
                 gather_bank_id=gather_bank_id,
             )
+            sync_barrier()
             start_send_bo(bt_id=bt_id)
 
             for tail_e_id in range(local_num_experts):
@@ -2146,6 +2147,7 @@ def _fused_ep_moe_kernel(
                 bt_sem_id=bt_sem_id, out_buf_id=out_buf_id,
                 gather_bank_id=gather_bank_id,
             )
+            sync_barrier()
             start_send_bo(bt_id=bt_id)
 
             tail_start = max(local_num_experts - expert_buffer_count, 0)
