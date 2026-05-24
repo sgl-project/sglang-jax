@@ -59,6 +59,30 @@ def tpool_patch_merger(
 
     return outputs
 
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=np.float32)
+    omega /= embed_dim / 2.0
+    omega = 1.0 / 10000**omega  # (D/2,)
+
+    pos = pos.reshape(-1)  # (M,)
+    out = np.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
+
+    emb_sin = np.sin(out)  # (M, D/2)
+    emb_cos = np.cos(out)  # (M, D/2)
+
+    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    return emb
+
+
+def get_1d_sincos_pos_embed(embed_dim, t_size, cls_token=False):
+    grid_t = np.arange(t_size, dtype=np.float32)
+    pos_embed = get_1d_sincos_pos_embed_from_grid(embed_dim, grid_t)
+    if cls_token:
+        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
+    return pos_embed
+
+
 class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
 
     def __init__(
@@ -80,6 +104,9 @@ class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
         self.weight = nnx.Param(
             nnx.initializers.normal()(_rngs.params(), (height, width, dim))
         )
+        self.time_weight = jnp.array(
+            get_1d_sincos_pos_embed(self.dim, self.num_frames)
+        )[:, None, :]
 
     def __call__(
         self,
@@ -93,15 +120,17 @@ class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
             if (h, w) == self.weight.shape[:-1]:
                 pos_emb_2d = self.weight.reshape(-1, self.weight.shape[-1])
             else:
-                pos_emb_2d = self.weight[:h, :w, :].reshape(-1, self.weight.shape[-1])
-                
-            # TODO: Implement interpolation mode
+                pos_emb_2d = jax.image.resize(
+                    self.weight.value,
+                    shape=(h, w, self.dim),
+                    method="bicubic"
+                ).reshape(-1, self.dim)
 
             if t == 1:
                 pos_emb_3d = pos_emb_2d
             else:
                 pos_emb_3d = (
-                    jnp.expand_dims(pos_emb_2d, axis=0).repeat(t, 1, 1) # Add self.time_weight[0:t] for temporal axis
+                    jnp.expand_dims(pos_emb_2d, axis=0).repeat(t, axis=0) + self.time_weight[0:t]
                 )
 
             pos_embs.append(pos_emb_3d.reshape(-1, pos_emb_3d.shape[-1]))
@@ -167,7 +196,7 @@ class Rope2DPosEmbRepeated(nnx.Module):
 
         freqs_cis = jnp.concatenate(
             [
-                freqs_cis[:, :h, :w].reshape(2, -1, self.dim // 2).repeat(t, axis=1)
+                jnp.tile(freqs_cis[:, :h, :w].reshape(2, -1, self.dim // 2), (1, t, 1))
                 for t, h, w in shapes
             ], 
             axis=1
@@ -318,14 +347,52 @@ class KimiK25VisionAttention(nnx.Module):
         pad_v = jnp.transpose(pad_v, (1, 0, 2))[None, ...]
 
         # Execute TPU Pallas FlashAttention kernel
-        output = flash_attention(
-            pad_q,
-            pad_k,
-            pad_v,
-            segment_ids=segment_ids,
-            causal=False,
-            sm_scale=self.scale,
-        )
+        if self.mesh is not None:
+            def local_flash_attention(q, k, v, *seg_args):
+                local_seg_ids = None
+                if len(seg_args) == 2:
+                    local_seg_ids = SegmentIds(q=seg_args[0], kv=seg_args[1])
+                return flash_attention(
+                    q,
+                    k,
+                    v,
+                    segment_ids=local_seg_ids,
+                    causal=False,
+                    sm_scale=self.scale,
+                )
+
+            seg_q = segment_ids.q if segment_ids is not None else None
+            seg_kv = segment_ids.kv if segment_ids is not None else None
+
+            in_specs = (
+                jax.sharding.PartitionSpec(None, None, None, None),
+                jax.sharding.PartitionSpec(None, None, None, None),
+                jax.sharding.PartitionSpec(None, None, None, None),
+            )
+            args = (pad_q, pad_k, pad_v)
+            if seg_q is not None and seg_kv is not None:
+                in_specs = in_specs + (
+                    jax.sharding.PartitionSpec(None, None),
+                    jax.sharding.PartitionSpec(None, None),
+                )
+                args = args + (seg_q, seg_kv)
+
+            output = jax.shard_map(
+                local_flash_attention,
+                mesh=self.mesh,
+                in_specs=in_specs,
+                out_specs=jax.sharding.PartitionSpec(None, None, None, None),
+                check_vma=False,
+            )(*args)
+        else:
+            output = flash_attention(
+                pad_q,
+                pad_k,
+                pad_v,
+                segment_ids=segment_ids,
+                causal=False,
+                sm_scale=self.scale,
+            )
 
         # Reshape back: [B=1, H, S, H_D] -> [S, H, H_D] -> slice back to sum_seq_len -> [S, D]
         output = jnp.transpose(output[0], (1, 0, 2))
@@ -664,7 +731,7 @@ class Kimi_K25_VisionModel(nnx.Module):
             f"{prefix}.wqkv.weight": WeightMapping(
                 target_path=f"{prefix}.attn.qkv_proj.kernel",
                 sharding=(None,),
-                transpose=False,
+                transpose=True,
             ),
             f"{prefix}.wqkv.bias": WeightMapping(
                 target_path=f"{prefix}.attn.qkv_proj.bias",
@@ -674,7 +741,7 @@ class Kimi_K25_VisionModel(nnx.Module):
             f"{prefix}.wo.weight": WeightMapping(
                 target_path=f"{prefix}.proj.kernel",
                 sharding=(None,),
-                transpose=False,
+                transpose=True,
             ),
             f"{prefix}.wo.bias": WeightMapping(
                 target_path=f"{prefix}.proj.bias",
@@ -684,7 +751,7 @@ class Kimi_K25_VisionModel(nnx.Module):
             f"{prefix}.mlp.fc0.weight": WeightMapping(
                 target_path=f"{prefix}.mlp.up_proj.kernel",
                 sharding=(None,),
-                transpose=False,
+                transpose=True,
             ),
             f"{prefix}.mlp.fc0.bias": WeightMapping(
                 target_path=f"{prefix}.mlp.up_proj.bias",
@@ -694,7 +761,7 @@ class Kimi_K25_VisionModel(nnx.Module):
             f"{prefix}.mlp.fc1.weight": WeightMapping(
                 target_path=f"{prefix}.mlp.down_proj.kernel",
                 sharding=(None,),
-                transpose=False,
+                transpose=True,
             ),
             f"{prefix}.mlp.fc1.bias": WeightMapping(
                 target_path=f"{prefix}.mlp.down_proj.bias",

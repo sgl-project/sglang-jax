@@ -10,7 +10,7 @@ from sgl_jax.srt.multimodal.configs.kimi.kimi_k25_config import (
 
 logging.basicConfig(level=logging.INFO)
   
-model_path = "/local/kimi"  
+model_path = "/dsk/models/kimi-bf16/"  
   
 # 1. Build mesh â€” jax.devices() returns TPU cores on a TPU machine  
 devices = jax.devices()  
@@ -21,17 +21,19 @@ config = KimiK25ModelVitConfig
 config.model_path = model_path  
 config.model_class = Kimi_K25_VisionModel  
   
-# 3. Create model structure (no memory allocated yet)  
+# 3. Create model structure and allocate memory on TPU
 with jax.set_mesh(mesh):  
-    model = nnx.eval_shape(  
-        lambda: Kimi_K25_VisionModel(config, dtype=jnp.bfloat16, mesh=mesh)  
-    )  
+    model = Kimi_K25_VisionModel(config, dtype=jnp.bfloat16, mesh=mesh)  
   
 # 4. Sample params before loading  
-#before = model.vision_tower.encoder.blocks[0].attn.qkv_proj.kernel[...].mean().item()  
-  
-# 5. Load weights â€” reads on CPU, shards to TPU  
+before = model.vision_tower.encoder.blocks[0].attn.qkv_proj.kernel.value.mean().item()  
+print(f"Before weight loading, blocks[0].attn.qkv_proj.kernel mean: {before}")
+
+# 5. Load weights — reads on CPU, shards to TPU  
 model.load_weights(config)  
   
 # 6. Verify values changed  
-after = model.vision_tower.encoder.blocks[0].attn.qkv_proj.kernel[...].mean().item()  
+after = model.vision_tower.encoder.blocks[0].attn.qkv_proj.kernel.value.mean().item()  
+print(f"After weight loading, blocks[0].attn.qkv_proj.kernel mean: {after}")
+assert before != after, "Weights did not change!"
+print("SUCCESS: Weights successfully loaded and verified changed!")
