@@ -20,7 +20,7 @@ DEFAULT_LABELS_TO_IGNORE = {"self-hosted", "Linux", "X64", "ARM64"}
 GITHUB_HOSTED_LABELS = {"ubuntu-latest", "ubuntu-22.04", "ubuntu-24.04"}
 
 
-_NON_RETRYABLE_PATTERNS = ("401", "403", "404", "422", "not found", "Must have admin")
+_NON_RETRYABLE_PATTERNS = ("401", "403", "404", "422", "not found", "must have admin")
 
 
 def run_gh_command(args, max_retries=5):
@@ -39,7 +39,7 @@ def run_gh_command(args, max_retries=5):
             err_lower = err.lower()
             if "rate limit" in err_lower:
                 pass  # fall through to backoff
-            elif any(p in err for p in _NON_RETRYABLE_PATTERNS):
+            elif any(p in err_lower for p in _NON_RETRYABLE_PATTERNS):
                 raise
             if attempt == max_retries - 1:
                 raise
@@ -66,6 +66,10 @@ def get_workflow_runs(repo, hours=24):
                 f"per_page={per_page}",
                 "-f",
                 f"page={page}",
+                "-f",
+                "sort=created",
+                "-f",
+                "direction=desc",
                 "--jq",
                 ".workflow_runs[]",
             ]
@@ -174,7 +178,7 @@ def get_runners(repo, online_only=True):
                 "Warning: GitHub API rate limit hit while listing runners; runner count will be unavailable."
             )
             return []
-        if "403" in err_str or "Must have admin rights" in err_str:
+        if "403" in err_str or "must have admin" in err_str.lower():
             print(
                 "Note: No admin access to list runners; runner count will be estimated from job data."
             )
@@ -219,9 +223,7 @@ def calculate_concurrency_metrics(jobs, window_start, window_end, num_runners):
             "peak_queue": None,
         }
 
-    # At equal timestamps, process end events (delta=-1) before start events
-    # (delta=+1) to avoid transiently inflating the concurrent count.
-    events.sort(key=lambda e: (e[0], -e[1]))
+    events.sort(key=lambda e: (e[0], e[1]))
 
     current = 0
     peak = 0
@@ -296,10 +298,9 @@ def calculate_utilization(repo, hours=24, runner_filter=None):
     fetch_failures = 0
     total_runs = len(runs)
 
-    # Per-label: list of (started_at, completed_at) intervals
     label_intervals = defaultdict(list)
-    # Per-label: all jobs (for concurrency sweep)
     label_jobs = defaultdict(list)
+    label_queue_waits = defaultdict(list)
 
     def fetch_run_jobs(run):
         if _likely_no_gpu_jobs(run.get("name", "")):
@@ -336,9 +337,15 @@ def calculate_utilization(repo, hours=24, runner_filter=None):
 
                 started = parse_time(job.get("started_at"))
                 completed = parse_time(job.get("completed_at"))
+                created = parse_time(job.get("created_at"))
                 if not started or not completed or completed <= started:
                     continue
-                # Clamp to window
+
+                if created and started > created:
+                    wait_seconds = (started - created).total_seconds()
+                    for lbl in meaningful:
+                        label_queue_waits[lbl].append(wait_seconds)
+
                 eff_start = max(started, window_start)
                 eff_end = min(completed, window_end)
                 if eff_start >= eff_end:
@@ -369,15 +376,12 @@ def calculate_utilization(repo, hours=24, runner_filter=None):
                 merged.append((start, end))
 
         busy_seconds = sum((e - s).total_seconds() for s, e in merged)
+        total_job_seconds = sum((e - s).total_seconds() for s, e in intervals)
 
-        # Capacity: num_runners * window_seconds (0 if unknown)
         capacity_seconds = num_runners * window_seconds if num_runners > 0 else 0.0
         utilization_pct = (
-            (busy_seconds / capacity_seconds * 100.0) if capacity_seconds > 0 else None
+            (total_job_seconds / capacity_seconds * 100.0) if capacity_seconds > 0 else None
         )
-
-        # Total job seconds (sum of all individual job durations, not merged)
-        total_job_seconds = sum((e - s).total_seconds() for s, e in intervals)
 
         concurrency = calculate_concurrency_metrics(
             label_jobs.get(label, []),
@@ -385,6 +389,10 @@ def calculate_utilization(repo, hours=24, runner_filter=None):
             window_end,
             num_runners,
         )
+
+        waits = label_queue_waits.get(label, [])
+        avg_queue_wait = sum(waits) / len(waits) if waits else 0.0
+        max_queue_wait = max(waits) if waits else 0.0
 
         results[label] = {
             "num_runners": num_runners,
@@ -394,9 +402,22 @@ def calculate_utilization(repo, hours=24, runner_filter=None):
             "total_job_seconds": total_job_seconds,
             "job_count": len(label_jobs.get(label, [])),
             "concurrency": concurrency,
+            "avg_queue_wait": avg_queue_wait,
+            "max_queue_wait": max_queue_wait,
         }
 
     return results, fetch_failure_pct
+
+
+def _format_duration(seconds):
+    """Format seconds into a human-readable string (e.g. '2m 30s', '1h 5m')."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{minutes:.1f}m"
+    hours = minutes / 60
+    return f"{hours:.1f}h"
 
 
 def format_report(results, hours, fetch_failure_pct=0.0):
@@ -445,8 +466,10 @@ def format_report(results, hours, fetch_failure_pct=0.0):
     # Concurrency analysis
     lines.append("## Concurrency Analysis")
     lines.append("")
-    lines.append("| Runner Label | Peak Concurrent | Avg Concurrent | Saturation | Peak Queue |")
-    lines.append("|---|---|---|---|---|")
+    lines.append(
+        "| Runner Label | Peak Concurrent | Avg Concurrent | Saturation | Peak Queue | Avg Wait | Max Wait |"
+    )
+    lines.append("|---|---|---|---|---|---|---|")
 
     for label, data in sorted(results.items()):
         conc = data["concurrency"]
@@ -456,8 +479,12 @@ def format_report(results, hours, fetch_failure_pct=0.0):
         queue = conc["peak_queue"]
         sat_str = f"{sat:.1f}%" if sat is not None else "N/A"
         queue_str = str(queue) if queue is not None else "N/A"
+        avg_wait = _format_duration(data["avg_queue_wait"])
+        max_wait = _format_duration(data["max_queue_wait"])
 
-        lines.append(f"| `{label}` | {peak} | {avg:.2f} | {sat_str} | {queue_str} |")
+        lines.append(
+            f"| `{label}` | {peak} | {avg:.2f} | {sat_str} | {queue_str} | {avg_wait} | {max_wait} |"
+        )
 
     lines.append("")
 
@@ -507,6 +534,9 @@ def main():
     )
     parser.add_argument("--output", type=str, help="Output file path (default: stdout)")
     args = parser.parse_args()
+
+    if args.hours < 1:
+        parser.error("--hours must be a positive integer")
 
     results, fetch_failure_pct = calculate_utilization(
         repo=args.repo,
