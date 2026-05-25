@@ -54,6 +54,38 @@ def validate_run(repo: str, run_id: str) -> Dict:
     return json.loads(raw)
 
 
+def check_draft_pr(repo: str, head_sha: str, issue_number: str) -> Optional[str]:
+    """Return a skip reason if the associated PR is a draft, else None."""
+    if issue_number:
+        try:
+            draft = run_gh(["api", f"repos/{repo}/pulls/{issue_number}", "--jq", ".draft"])
+            if draft == "true":
+                return f"PR #{issue_number} is a draft. Auto-bisect skipped for draft PRs."
+        except RuntimeError:
+            pass
+        return None
+
+    if not head_sha:
+        return None
+
+    try:
+        raw = run_gh(
+            [
+                "api",
+                f"repos/{repo}/commits/{head_sha}/pulls",
+                "--jq",
+                '[.[] | select(.state=="open")] | first | {number, draft}',
+            ]
+        )
+        if raw:
+            pr_info = json.loads(raw)
+            if pr_info.get("draft"):
+                return f"PR #{pr_info['number']} is a draft. Auto-bisect skipped for draft PRs."
+    except (RuntimeError, json.JSONDecodeError):
+        pass
+    return None
+
+
 def find_eligible_run(repo: str, sha: str) -> Tuple[Optional[Dict], List[str]]:
     """Find the most recent eligible failed run on *sha*.
 
@@ -200,6 +232,16 @@ def main() -> int:
             return 0
 
         print(f"Run {run_id} is eligible: {info['name']} / failure")
+        draft_reason = check_draft_pr(repo, info.get("head_sha", ""), issue_number)
+        if draft_reason:
+            print(draft_reason)
+            write_skip_result(
+                draft_reason,
+                run_id=run_id,
+                run_url=info.get("html_url", "none"),
+                issue_number=issue_number,
+            )
+            return 0
         write_outputs(
             {
                 "eligible": "true",
@@ -216,6 +258,11 @@ def main() -> int:
         return 0
 
     print(f"No RUN_ID provided. Auto-detecting from PR #{issue_number}")
+    draft_reason = check_draft_pr(repo, "", issue_number)
+    if draft_reason:
+        print(draft_reason)
+        write_skip_result(draft_reason, issue_number=issue_number)
+        return 0
     try:
         sha = run_gh(["api", f"repos/{repo}/pulls/{issue_number}", "--jq", ".head.sha"])
     except RuntimeError as exc:
