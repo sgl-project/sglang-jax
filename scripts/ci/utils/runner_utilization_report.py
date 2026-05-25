@@ -713,14 +713,11 @@ def format_report(report_data, hours):
     # Hourly Distribution
     lines.append("## Hourly Distribution (UTC)")
     lines.append("")
-    active_hours = [(h, hourly_buckets[h]) for h in range(24) if hourly_buckets.get(h, 0) > 0]
-    if active_hours:
-        lines.append("| Hour | Jobs Started |")
-        lines.append("|---|---|")
-        for h, count in active_hours:
-            lines.append(f"| {h:02d}:00 | {count} |")
-    else:
-        lines.append("No jobs started in this period.")
+    lines.append("| Period (UTC) | Jobs Started |")
+    lines.append("|---|---|")
+    for start, end in [(0, 6), (6, 12), (12, 18), (18, 24)]:
+        count = sum(hourly_buckets.get(h, 0) for h in range(start, end))
+        lines.append(f"| {start:02d}:00–{end - 1:02d}:59 | {count} |")
 
     lines.append("")
 
@@ -728,9 +725,22 @@ def format_report(report_data, hours):
     lines.append("## Recommendations")
     lines.append("")
 
-    has_recommendation = False
+    recs = _generate_recommendations(results, fleet_status, wf_aggregates)
+    if recs:
+        for r in recs:
+            lines.append(f"- {r}")
+    else:
+        lines.append(
+            "No immediate action required. All runner labels appear within normal utilization bounds."
+        )
 
-    # Grand total across all workflows for dominance check
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _generate_recommendations(results, fleet_status, wf_aggregates):
+    """Generate recommendation strings shared by full report and Slack summary."""
+    recs = []
     grand_total_duration = sum(agg["total_duration"] for agg in wf_aggregates.values())
 
     for label, data in sorted(results.items()):
@@ -740,105 +750,133 @@ def format_report(report_data, hours):
         failure_count = data["failure_count"]
 
         if util is not None and util > 80:
-            lines.append(
-                f"- **`{label}`**: High utilization ({util:.1f}%). Consider adding more runners to reduce queue time."
+            recs.append(
+                f"**`{label}`**: High utilization ({util:.1f}%). Consider adding more runners to reduce queue time."
             )
-            has_recommendation = True
         elif util is not None and util < 10 and data["job_count"] > 0:
-            lines.append(
-                f"- **`{label}`**: Low utilization ({util:.1f}%). Runner capacity may be over-provisioned."
+            recs.append(
+                f"**`{label}`**: Low utilization ({util:.1f}%). Runner capacity may be over-provisioned."
             )
-            has_recommendation = True
 
         if conc["peak_queue"] is not None and conc["peak_queue"] > 0:
-            lines.append(
-                f"- **`{label}`**: Peak queue depth of {conc['peak_queue']} job(s) detected. Jobs had to wait for a free runner."
+            recs.append(
+                f"**`{label}`**: Peak queue depth of {conc['peak_queue']} job(s) detected. Jobs had to wait for a free runner."
             )
-            has_recommendation = True
 
         if total_concluded > 5 and failure_count / total_concluded > 0.2:
-            lines.append(
-                f"- **`{label}`**: High failure rate ({failure_count}/{total_concluded} jobs, {failure_count / total_concluded * 100:.1f}%). Investigate job failures."
+            recs.append(
+                f"**`{label}`**: High failure rate ({failure_count}/{total_concluded} jobs, {failure_count / total_concluded * 100:.1f}%). Investigate job failures."
             )
-            has_recommendation = True
 
         if data["wait_p95"] > 600:
-            lines.append(
-                f"- **`{label}`**: Long queue wait detected (P95 wait = {_format_duration(data['wait_p95'])}). Consider scaling runners."
+            recs.append(
+                f"**`{label}`**: Long queue wait detected (P95 wait = {_format_duration(data['wait_p95'])}). Consider scaling runners."
             )
-            has_recommendation = True
 
-    # Fleet offline runner warnings
     for label, s in sorted(fleet_status.items()):
         if s["offline"] > 0:
-            lines.append(
-                f"- **`{label}`**: {s['offline']} runner(s) are offline. Check runner health."
+            recs.append(
+                f"**`{label}`**: {s['offline']} runner(s) are offline. Check runner health."
             )
-            has_recommendation = True
 
-    # Workflow dominance warning
     if grand_total_duration > 0:
+        sorted_wfs = sorted(
+            wf_aggregates.items(), key=lambda x: x[1]["total_duration"], reverse=True
+        )
         for wf_name, agg in sorted_wfs:
             if agg["total_duration"] > 0.5 * grand_total_duration:
-                lines.append(
-                    f"- **Workflow `{wf_name}`** accounts for more than 50% of total runner time ({_format_duration(agg['total_duration'])} of {_format_duration(grand_total_duration)}). Review if this is expected."
+                pct = agg["total_duration"] / grand_total_duration * 100
+                recs.append(
+                    f"Workflow **`{wf_name}`** accounts for {pct:.0f}% of total runner time ({_format_duration(agg['total_duration'])} of {_format_duration(grand_total_duration)})."
                 )
-                has_recommendation = True
 
-    if not has_recommendation:
-        lines.append(
-            "No immediate action required. All runner labels appear within normal utilization bounds."
-        )
-
-    lines.append("")
-    return "\n".join(lines)
+    return recs
 
 
-def format_slack_summary(report_data, hours):
-    """Format a compact plain-text summary for Slack (no markdown tables)."""
+def format_slack_summary(report_data, hours, run_url=""):
+    """Format a Slack mrkdwn summary with fleet status, utilization, and recommendations."""
     results = report_data["per_label"]
     fleet_status = report_data["fleet_status"]
-    recommendations = []
+    workflow_stats = report_data["workflow_stats"]
 
-    lines = [f"*Runner Utilization Report (Past {hours} Hours)*", ""]
+    lines = [f"*Runner Utilization Report (Past {hours} Hours)*"]
 
-    for label in sorted(set(list(results.keys()) + list(fleet_status.keys()))):
-        parts = [f"• *{label}*:"]
-        fs = fleet_status.get(label)
-        if fs:
-            parts.append(f"{fs['total']} runners ({fs['online']} online, {fs['busy']} busy)")
-        data = results.get(label)
-        if data:
-            parts.append(f"{data['job_count']} jobs")
-            util = data["utilization_pct"]
-            if util is not None:
-                parts.append(f"utilization {util:.1f}%")
-            if data["wait_p95"] > 0:
-                parts.append(f"wait P95 {_format_duration(data['wait_p95'])}")
-            rate = (
-                f"{data['success_count'] / data['total_concluded'] * 100:.0f}%"
-                if data["total_concluded"] > 0
-                else "N/A"
+    # Fleet Status
+    lines.append("")
+    lines.append("*Fleet Status*")
+    if fleet_status:
+        for label, s in sorted(fleet_status.items()):
+            lines.append(
+                f"• `{label}`: {s['total']} runners ({s['online']} online, {s['busy']} busy)"
             )
-            parts.append(f"success rate {rate}")
-        lines.append(" | ".join(parts))
-
-    for label, data in sorted(results.items()):
-        if data["wait_p95"] > 600:
-            recommendations.append(
-                f"⚠ {label}: P95 queue wait {_format_duration(data['wait_p95'])}"
-            )
-        if data["total_concluded"] > 5 and data["failure_count"] / data["total_concluded"] > 0.2:
-            recommendations.append(
-                f"⚠ {label}: {data['failure_count']}/{data['total_concluded']} jobs failed"
-            )
-
-    if recommendations:
-        lines.append("")
-        lines.extend(recommendations)
     else:
+        lines.append("Fleet data unavailable (admin token required)")
+
+    if not results:
         lines.append("")
-        lines.append("✓ No issues detected")
+        lines.append("No runner activity in this period.")
+        if run_url:
+            lines.append("")
+            lines.append(f"<{run_url}|View full report>")
+        return "\n".join(lines)
+
+    # Utilization
+    lines.append("")
+    lines.append("*Utilization*")
+    util_parts = []
+    for label, data in sorted(results.items()):
+        util = data["utilization_pct"]
+        util_parts.append(f"`{label}`: {util:.1f}%" if util is not None else f"`{label}`: N/A")
+    lines.append("• " + " | ".join(util_parts))
+
+    # Queue Wait P95
+    lines.append("")
+    lines.append("*Queue Wait (P95)*")
+    wait_parts = []
+    for label, data in sorted(results.items()):
+        wait_parts.append(f"`{label}`: {_format_duration(data['wait_p95'])}")
+    lines.append("• " + " | ".join(wait_parts))
+
+    # Success Rate
+    lines.append("")
+    lines.append("*Success Rate*")
+    rate_parts = []
+    for label, data in sorted(results.items()):
+        if data["total_concluded"] > 0:
+            rate = data["success_count"] / data["total_concluded"] * 100
+            failures = data["failure_count"]
+            part = f"`{label}`: {rate:.1f}%"
+            if failures > 0:
+                part += f" ({failures} failures)"
+            rate_parts.append(part)
+        else:
+            rate_parts.append(f"`{label}`: N/A")
+    lines.append("• " + " | ".join(rate_parts))
+
+    # Recommendations
+    wf_aggregates = {}
+    for wf_name, label_data in workflow_stats.items():
+        total_jobs = sum(v["job_count"] for v in label_data.values())
+        total_duration = sum(v["total_duration"] for v in label_data.values())
+        wf_aggregates[wf_name] = {
+            "total_jobs": total_jobs,
+            "total_duration": total_duration,
+            "labels": sorted(label_data.keys()),
+        }
+
+    recs = _generate_recommendations(results, fleet_status, wf_aggregates)
+    lines.append("")
+    if recs:
+        lines.append("*Recommendations*")
+        for r in recs:
+            clean = r.replace("**", "").replace("`", "`")
+            lines.append(f"• {clean}")
+    else:
+        lines.append("No issues detected.")
+
+    if run_url:
+        lines.append("")
+        lines.append(f"<{run_url}|View full report>")
 
     return "\n".join(lines)
 
@@ -853,7 +891,10 @@ def main():
         "--filter", type=str, dest="filter", help="Filter runner labels (substring match)"
     )
     parser.add_argument("--output", type=str, help="Output file path (default: stdout)")
-    parser.add_argument("--slack-summary", type=str, help="Write Slack summary to this file")
+    parser.add_argument("--slack-output", type=str, help="Slack summary output file path")
+    parser.add_argument(
+        "--run-url", type=str, default="", help="GitHub Actions run URL for Slack link"
+    )
     args = parser.parse_args()
 
     if args.hours < 1:
@@ -874,11 +915,11 @@ def main():
     else:
         print(report)
 
-    if args.slack_summary:
-        slack = format_slack_summary(report_data, hours=args.hours)
-        with open(args.slack_summary, "w") as f:
-            f.write(slack)
-        print(f"Slack summary written to {args.slack_summary}")
+    if args.slack_output:
+        summary = format_slack_summary(report_data, hours=args.hours, run_url=args.run_url)
+        with open(args.slack_output, "w") as f:
+            f.write(summary)
+        print(f"Slack summary written to {args.slack_output}")
 
     # Write to GitHub Actions step summary if available
     step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
