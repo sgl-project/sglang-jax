@@ -151,9 +151,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self._sampler_step = 0
         if not self.is_draft_worker:
             self.initialize_jit()
-        else:
-            self._sampler_base_rng = jax.random.PRNGKey(server_args.random_seed)
-            self._sampler_step = 0
 
         # Init memory pool and attention backends
         self.init_memory_pool(
