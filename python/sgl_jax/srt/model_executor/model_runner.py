@@ -323,10 +323,21 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     vision_deepstack,
                     forward_batch.placeholder_positions,
                 )
+                # CRITICAL: clear ALL visual fields before entering the LLM
+                # JIT. Otherwise pixel_values shape (per-image bucket) and
+                # image_grid_thw (static aux varying per request) leak into
+                # the LLM JIT cache key, defeating the cache-sharing goal
+                # of the three-jit split. After this clear, the LLM JIT
+                # sees an identical pytree footprint to text-only extends.
                 forward_batch = dataclasses.replace(
                     forward_batch,
                     input_embedding=input_embedding,
                     deepstack_visual_embedding=deepstack,
+                    pixel_values=None,
+                    image_grid_thw=None,
+                    cu_seqlens=None,
+                    n_real_images=0,
+                    placeholder_positions=None,
                 )
             return jitted_run_model(
                 model_def,
