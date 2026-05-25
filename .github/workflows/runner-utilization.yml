@@ -61,6 +61,7 @@ jobs:
 
       - name: Post to Slack
         if: success()
+        continue-on-error: true
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |

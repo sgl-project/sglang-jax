@@ -22,7 +22,15 @@ def run_gh_command(args, max_retries=5):
     """Run a gh CLI command with exponential backoff retry on transient failure."""
     for attempt in range(max_retries):
         try:
-            return subprocess.run(["gh"] + args, capture_output=True, text=True, check=True).stdout
+            return subprocess.run(
+                ["gh"] + args, capture_output=True, text=True, check=True, timeout=120
+            ).stdout
+        except subprocess.TimeoutExpired:
+            if attempt == max_retries - 1:
+                raise
+            wait = (2**attempt) + random.uniform(0, 1)
+            print(f"Retry {attempt + 1}/{max_retries} in {wait:.1f}s: command timed out")
+            time.sleep(wait)
         except subprocess.CalledProcessError as e:
             err_lower = str(e.stderr).lower()
             if "rate limit" not in err_lower and any(
@@ -127,14 +135,14 @@ def get_runners(repo, online_only=False):
                 if inferred:
                     runner.setdefault("labels", []).append({"name": inferred})
         return runners
-    except subprocess.CalledProcessError as e:
-        err_str = str(e.stderr)
+    except (subprocess.CalledProcessError, RuntimeError) as e:
+        err_str = str(getattr(e, "stderr", e))
         if "rate limit" in err_str.lower():
             print("Warning: GitHub API rate limit hit; runner count unavailable.")
         elif "403" in err_str or "must have admin" in err_str.lower():
             print("Note: No admin access to list runners; count estimated from job data.")
         else:
-            raise
+            print(f"Warning: Failed to list runners ({e}); count unavailable.")
         return []
 
 
@@ -158,36 +166,20 @@ def calculate_concurrency_metrics(jobs, window_start, window_end, num_runners):
             if s < e:
                 events += [(s, +1), (e, -1)]
     if not events:
-        return {
-            "peak_concurrent": 0,
-            "avg_concurrent": 0.0,
-            "saturation_pct": None,
-            "peak_queue": None,
-        }
+        return {"peak_concurrent": 0, "peak_queue": None}
     events.sort(key=lambda e: (e[0], e[1]))
     current = peak = 0
-    weighted_sum = 0.0
-    prev_time = window_start
     for event_time, delta in events:
-        if event_time > prev_time:
-            weighted_sum += current * (event_time - prev_time).total_seconds()
-            prev_time = event_time
         current += delta
         peak = max(peak, current)
-    if prev_time < window_end:
-        weighted_sum += current * (window_end - prev_time).total_seconds()
-    ws = (window_end - window_start).total_seconds()
-    avg = weighted_sum / ws if ws > 0 else 0.0
     return {
         "peak_concurrent": peak,
-        "avg_concurrent": avg,
-        "saturation_pct": (avg / num_runners * 100) if num_runners > 0 else None,
         "peak_queue": max(0, peak - num_runners) if num_runners > 0 else None,
     }
 
 
 def _percentile(sorted_values, p):
-    """Floor-index percentile: P95 equals max for samples < 20."""
+    """Floor-index percentile: P95 equals max for samples <= 20."""
     if not sorted_values:
         return 0.0
     return sorted_values[min(int(len(sorted_values) * p / 100), len(sorted_values) - 1)]
@@ -560,7 +552,7 @@ def format_slack_summary(report_data, hours, run_url=""):
     text = "\n".join(lines)
     # Slack Block Kit section text has a 3000 character limit
     if len(text) > 2900:
-        text = text[:2900] + "\n… (truncated)"
+        text = text[:2900].rsplit("\n", 1)[0] + "\n… (truncated)"
     return text
 
 
@@ -573,8 +565,8 @@ def main():
     parser.add_argument("--slack-output", type=str, help="Slack summary output file path")
     parser.add_argument("--run-url", type=str, default="", help="Actions run URL for Slack link")
     args = parser.parse_args()
-    if args.hours < 1:
-        parser.error("--hours must be a positive integer")
+    if args.hours < 1 or args.hours > 168:
+        parser.error("--hours must be between 1 and 168")
 
     report_data = calculate_utilization(args.repo, args.hours, args.filter)
     report = format_report(report_data, args.hours)
