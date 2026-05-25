@@ -7,8 +7,11 @@ from sgl_jax.global_config import global_config
 
 def should_scatter(dim_size: int, num_devices: int) -> bool:
     """Return True if a row-parallel output should be reduce-scattered on the
-    token dim. Requires per-device slice to be at least
-    ``tpu_scatter_min_local_size`` and the dim to divide evenly across devices.
+    token dim. ``num_devices`` must be the total number of devices participating
+    in the scatter (i.e. the product of mesh axes named in the partition spec —
+    for ``("data", "tensor")`` that is ``data * tensor``, not ``tensor`` alone).
+    Requires per-device slice to be at least ``tpu_scatter_min_local_size`` and
+    the dim to divide evenly across all participating devices.
     """
     if num_devices <= 1:
         return False
@@ -34,11 +37,12 @@ def make_reduce_sharding(
     All other dims are replicated.
 
     SP triggers only when ``enable_sp`` is True and
-    ``arr.shape[scatter_dim]`` clears the per-device threshold (see
-    ``should_scatter``). Pass ``enable_sp=False`` to force DP regardless
-    of size.
+    ``arr.shape[scatter_dim]`` clears the per-device threshold across the
+    full scatter axis ``data * tensor`` (see ``should_scatter``). Pass
+    ``enable_sp=False`` to force DP regardless of size.
     """
-    if enable_sp and should_scatter(arr.shape[scatter_dim], mesh.shape["tensor"]):
+    scatter_devices = mesh.shape["data"] * mesh.shape["tensor"]
+    if enable_sp and should_scatter(arr.shape[scatter_dim], scatter_devices):
         axes: str | tuple[str, ...] = ("data", "tensor")
     else:
         axes = "data"
