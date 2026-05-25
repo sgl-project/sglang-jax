@@ -2067,12 +2067,16 @@ class ScheduleBatch:
         if not bs_paddings:
             total_bs = self.dp_size
         else:
-            total_bs = max(bs_paddings)
+            max_bs_per_dp = 0
+            for dp_rank in range(self.dp_size):
+                info = self.reqs_info[dp_rank]
+                if info.reqs is not None:
+                    max_bs_per_dp = max(max_bs_per_dp, len(info.reqs))
+            max_bs_per_dp = max(max_bs_per_dp, 1)
+            total_bs, _ = pad_to_bucket(max_bs_per_dp * self.dp_size, bs_paddings)
             assert total_bs % self.dp_size == 0, (
-                f"max(bs_paddings)={total_bs} is not divisible by dp_size="
-                f"{self.dp_size}; precompile must include a largest bucket "
-                f"that is a multiple of dp_size to keep the spec decode jit "
-                f"cache key stable. bs_paddings={bs_paddings}"
+                f"padded total_bs={total_bs} is not divisible by dp_size="
+                f"{self.dp_size}; bs_paddings={bs_paddings}"
             )
         per_dp_bs = total_bs // self.dp_size
         self.per_dp_bs_size = per_dp_bs
@@ -2416,7 +2420,10 @@ class ScheduleBatch:
             real_bs_per_dp=real_bs_per_dp,
             logits_indices_selector=logits_indices_selector,
             capture_hidden_mode=(
-                CaptureHiddenMode.FULL if self.return_hidden_states else CaptureHiddenMode.NULL
+                CaptureHiddenMode.FULL
+                if self.return_hidden_states
+                or (self.spec_algorithm is not None and not self.spec_algorithm.is_none())
+                else CaptureHiddenMode.NULL
             ),
             dp_size=self.dp_size,
             per_dp_bs_size=per_dp_bs_padding,
