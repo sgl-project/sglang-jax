@@ -957,13 +957,6 @@ class EagleVerifyInput:
                     logits_output.next_token_logits / expanded_temperature, axis=-1
                 )
 
-                # Replicate target_probs for top_k_top_p (eager-mode vocab-dim ops need full data)
-                from jax.sharding import NamedSharding
-                from jax.sharding import PartitionSpec as P
-
-                jax_mesh = ctx if isinstance(ctx, jax.sharding.Mesh) else mesh
-                target_probs = jax.device_put(target_probs, NamedSharding(jax_mesh, P()))
-
                 # Apply top-k and top-p filtering
                 target_probs = top_k_top_p_renorm_prob(
                     target_probs,
