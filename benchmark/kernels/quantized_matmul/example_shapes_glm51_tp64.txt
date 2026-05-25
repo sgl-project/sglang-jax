@@ -1,0 +1,12 @@
+# GLM-5.1 FP8 dense-linear local shapes at TP=64 (n_out n_in per line).
+# Collected from `Couldn't find tuned sizes` warnings on a v6e server start.
+# block_k=128, x_q_dtype=bfloat16 (activation not quantized), w_q_dtype=float8_e4m3fn.
+#
+# n_out < 256 (e.g. 32, 128) are omitted: the kernel rejects out_block_size < 256
+# so no valid candidate exists; those layers stay on the safe-clamped fallback.
+256 2048
+576 6144
+2048 6144
+4096 2048
+6144 256
+6144 2048

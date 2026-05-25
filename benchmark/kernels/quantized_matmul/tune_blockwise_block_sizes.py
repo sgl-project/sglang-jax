@@ -8,9 +8,12 @@ sgl_jax.srt.kernels.quantized_matmul.quantized_matmul_kernels.tuned_block_sizes.
 
 Usage (single TPU host):
     python -m benchmark.kernels.quantized_matmul.tune_blockwise_block_sizes \
-        --shapes-file shapes.txt --block-k 128
+        --shapes-file benchmark/kernels/quantized_matmul/example_shapes_glm51_tp64.txt \
+        --block-k 128
 
-shapes.txt format: one "n_out n_in" per line, # for comments.
+shapes file format: one "n_out n_in" per line, # for comments. See
+example_shapes_glm51_tp64.txt for the GLM-5.1 TP=64 shapes used to produce
+the v6e bfloat16/float8_e4m3fn entries in tuned_block_sizes.py.
 """
 
 from __future__ import annotations
@@ -36,11 +39,20 @@ DEFAULT_N_BATCH = (1, 8, 32, 64, 2048)
 OUTPUT_PATH = "tuned_blockwise_block_sizes.txt"
 
 
+def _pow2_range(lo: int, hi: int) -> list[int]:
+    out = []
+    v = lo
+    while v <= hi:
+        out.append(v)
+        v *= 2
+    return out
+
+
 def _make_candidates(
     n_batch: int, n_out: int, n_in: int, block_k: int
 ) -> list[tuple[int, int, int]]:
     """Generate (batch_block, out_block, in_block) candidates."""
-    bb_options = sorted({v for v in (8, 16, 32, 64, 128, 256, n_batch) if v <= max(n_batch, 8)})
+    bb_options = sorted({*_pow2_range(8, n_batch), max(n_batch, 8)})
 
     ob_options: set[int] = set()
     for v in (128, 256, 512, 1024, 2048, 4096):
