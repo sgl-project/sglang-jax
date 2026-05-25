@@ -59,6 +59,7 @@ from sgl_jax.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    has_valid_data,
 )
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
@@ -382,6 +383,16 @@ class TokenizerManager:
             ) from e
 
     def _has_multimodal_data(self, obj: GenerateReqInput | EmbeddingReqInput) -> bool:
+        # Make video/audio failures loud — this pipeline only implements images
+        # right now (see PR #1189 scope). Silently dropping them would route
+        # the request through the text-only path and produce nonsense output.
+        if has_valid_data(getattr(obj, "video_data", None)) or has_valid_data(
+            getattr(obj, "audio_data", None)
+        ):
+            raise NotImplementedError(
+                "video_data / audio_data is not supported by this multimodal "
+                "pipeline yet — only image_data is implemented (PR #1189)."
+            )
         image_data = getattr(obj, "image_data", None)
         if image_data is None:
             return False
