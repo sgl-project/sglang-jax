@@ -971,7 +971,12 @@ class Qwen3VLForConditionalGeneration(nnx.Module):
             and forward_batch.pixel_values is not None
             and forward_batch.input_embedding is None
         ):
-            vision_main, vision_deepstack = self.encode_visual(forward_batch)
+            vision_main, vision_deepstack = self.encode_visual(
+                forward_batch.pixel_values,
+                forward_batch.image_grid_thw,
+                forward_batch.cu_seqlens,
+                forward_batch.n_real_images,
+            )
             input_embedding, full_deepstack = self.splice_embeds(
                 forward_batch.input_ids,
                 vision_main,
@@ -994,20 +999,29 @@ class Qwen3VLForConditionalGeneration(nnx.Module):
         return output, layers_kv_fused, layers_callback_flag, None
 
     # ---- visual pipeline (split into two JIT-friendly methods) ----
-    def encode_visual(self, forward_batch: ForwardBatch):
-        """Pure function: run ViT + deepstack split on the visual fields of
-        forward_batch. Suitable for jit'ing with cache key
-        `(n_patches_bucket, image_grid_thw, n_real_images_bucket)`.
+    def encode_visual(
+        self,
+        pixel_values: jax.Array,
+        image_grid_thw,  # tuple[tuple[int, int, int], ...] — static under jit
+        cu_seqlens: jax.Array,
+        n_real_images: int,  # int — static under jit
+    ):
+        """Pure function: run ViT + deepstack split. Suitable for jit'ing with
+        cache key `(pixel_values.shape, image_grid_thw, n_real_images)`.
+
+        Individual args (rather than a full ForwardBatch) keep the precompile
+        construction simple — no need to synthesize a 25-field dummy batch
+        just to exercise the visual path.
 
         Returns:
             (vision_main      [N_padded_tokens, hidden],
              vision_deepstack [N_padded_tokens, hidden * N_deepstack])
         """
         vision_features = self.visual(
-            forward_batch.pixel_values,
-            forward_batch.image_grid_thw,
-            cu_seqlens=forward_batch.cu_seqlens,
-            n_real_images=forward_batch.n_real_images,
+            pixel_values,
+            image_grid_thw,
+            cu_seqlens=cu_seqlens,
+            n_real_images=n_real_images,
         )
         return self.separate_deepstack_embeds(vision_features)
 

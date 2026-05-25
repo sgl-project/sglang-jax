@@ -233,16 +233,22 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             self.model, "splice_embeds"
         )
 
-        @partial(jax.jit, static_argnames=["model_state_def"])
+        @partial(
+            jax.jit,
+            static_argnames=["model_state_def", "image_grid_thw", "n_real_images"],
+        )
         def jitted_visual_encode(
             model_def,
             model_state_def,
             model_state_leaves,
-            forward_batch,
+            pixel_values,
+            image_grid_thw,
+            cu_seqlens,
+            n_real_images,
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
-            return model.encode_visual(forward_batch)
+            return model.encode_visual(pixel_values, image_grid_thw, cu_seqlens, n_real_images)
 
         @partial(jax.jit, static_argnames=["model_state_def"])
         def jitted_splice_embeds(
@@ -303,7 +309,10 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     model_def,
                     model_state_def,
                     self.model_state_leaves,
-                    forward_batch,
+                    forward_batch.pixel_values,
+                    forward_batch.image_grid_thw,
+                    forward_batch.cu_seqlens,
+                    forward_batch.n_real_images,
                 )
                 input_embedding, deepstack = jitted_splice_embeds(
                     model_def,

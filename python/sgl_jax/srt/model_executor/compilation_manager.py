@@ -112,6 +112,117 @@ class CompilationManager:
         self._precompile_decode(
             forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
         )
+        # Multimodal models additionally need the ViT and splice JITs warmed
+        # up — they are NOT exercised by the text-only dummy batches above.
+        if getattr(model_runner, "is_multimodal_model", False):
+            self._precompile_visual_encode(model_runner)
+            self._precompile_splice(model_runner)
+
+    def _precompile_visual_encode(self, model_runner: ModelRunner):
+        """AOT-compile `jitted_visual_encode` for every power-of-two patch
+        bucket. Fixes `n_real_images=1` (single-image case dominates eval and
+        production traffic); multi-image variants lazy-compile on first
+        occurrence with the `_pick_bucket` warning surfacing the recompile.
+        """
+        import jax.numpy as jnp
+
+        from sgl_jax.srt.managers.schedule_batch import get_multimodal_patch_buckets
+
+        patch_buckets = get_multimodal_patch_buckets()
+        if not patch_buckets:
+            return
+        start_time = time.perf_counter()
+        logger.info(
+            "[VISUAL_ENCODE] Begin to precompile patch_buckets=%s (n_real_images=1)",
+            patch_buckets,
+        )
+        # Read pixel feature dim from the existing scheduler-side constant so
+        # we don't have to duplicate the value across files.
+        from sgl_jax.srt.managers.schedule_batch import _MM_PIXEL_FEATURE_DIM
+
+        with tqdm(patch_buckets, desc="[VISUAL_ENCODE] PRECOMPILE", leave=False) as pbar:
+            for n_patches in pbar:
+                pbar.set_postfix(patches=n_patches)
+                # Pick (h, w) close to a square so the static aux key resembles
+                # real traffic. Any (h, w) with h*w == n_patches and both even
+                # (spatial_merge_size=2) is valid; the ViT input shape only
+                # depends on n_patches, not the (h, w) split.
+                k = n_patches.bit_length() - 1  # floor(log2(n_patches))
+                h = 1 << ((k + 1) // 2)
+                w = 1 << (k // 2)
+                assert h * w == n_patches, (n_patches, h, w)
+                pixel_values = jnp.zeros((n_patches, _MM_PIXEL_FEATURE_DIM), dtype=jnp.bfloat16)
+                cu_seqlens = jnp.array([0, n_patches], dtype=jnp.int32)
+                model_runner.jitted_visual_encode(
+                    pixel_values,
+                    ((1, h, w),),  # image_grid_thw (static)
+                    cu_seqlens,
+                    1,  # n_real_images (static)
+                )
+
+        end_time = time.perf_counter()
+        logger.info("[VISUAL_ENCODE] Precompile finished in %.0f secs", end_time - start_time)
+
+    def _precompile_splice(self, model_runner: ModelRunner):
+        """AOT-compile `jitted_splice_embeds` for the Cartesian product of
+        token_buckets × (patch_buckets / spatial_merge_unit). Each splice
+        compile is a single scatter — cheap, but we cover all combinations so
+        runtime never hits a cold compile.
+        """
+        import jax.numpy as jnp
+
+        from sgl_jax.srt.managers.schedule_batch import (
+            _MM_PATCHES_PER_TOKEN,
+            get_multimodal_patch_buckets,
+        )
+
+        patch_buckets = get_multimodal_patch_buckets()
+        if not patch_buckets:
+            return
+        # N_padded_tokens = n_patches / spatial_merge_unit (4 for Qwen3-VL).
+        token_padding_buckets = tuple(
+            n_patches // _MM_PATCHES_PER_TOKEN for n_patches in patch_buckets
+        )
+        # Read hidden dims from the model. text_config carries hidden_size for
+        # the LLM-side embedding; vision_config carries deepstack count.
+        text_config = getattr(model_runner.model, "text_config", None)
+        vision_config = getattr(model_runner.model, "vision_config", None)
+        if text_config is None or vision_config is None:
+            logger.warning("[SPLICE] model missing text_config / vision_config — skip precompile")
+            return
+        hidden = int(text_config.hidden_size)
+        n_deepstack = len(vision_config.deepstack_visual_indexes)
+        deepstack_dim = hidden * n_deepstack
+
+        start_time = time.perf_counter()
+        pairs = [
+            (seq_len, n_padded)
+            for seq_len in self.token_buckets
+            for n_padded in token_padding_buckets
+            if n_padded <= seq_len
+        ]
+        logger.info(
+            "[SPLICE] Begin to precompile %d (seq_len, n_padded_tokens) pairs",
+            len(pairs),
+        )
+        with tqdm(pairs, desc="[SPLICE] PRECOMPILE", leave=False) as pbar:
+            for seq_len, n_padded in pbar:
+                pbar.set_postfix(seq=seq_len, padded=n_padded)
+                input_ids = jnp.zeros((seq_len,), dtype=jnp.int32)
+                vision_main = jnp.zeros((n_padded, hidden), dtype=jnp.bfloat16)
+                vision_deepstack = jnp.zeros((n_padded, deepstack_dim), dtype=jnp.bfloat16)
+                # Spread placeholder positions across the seq_len so the
+                # scatter exercises non-trivial indices (rather than a tight
+                # block at the front). The actual values don't affect compile.
+                positions = jnp.linspace(0, seq_len - 1, n_padded, dtype=jnp.float32).astype(
+                    jnp.int32
+                )
+                model_runner.jitted_splice_embeds(
+                    input_ids, vision_main, vision_deepstack, positions
+                )
+
+        end_time = time.perf_counter()
+        logger.info("[SPLICE] Precompile finished in %.0f secs", end_time - start_time)
 
     def _precompile_extend(
         self,
