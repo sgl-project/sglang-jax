@@ -26,7 +26,6 @@ from sgl_jax.srt.kernels.speculative.build_eagle_tree_structure_kernel import (
     build_eagle_tree_structure,
 )
 from sgl_jax.srt.kernels.speculative.kernel import (
-    create_extend_after_decode_spec_info,
     top_k_renorm_prob,
     top_p_renorm_prob,
     tree_speculative_sampling_target_only,
@@ -660,46 +659,6 @@ class EagleDraftInput:
             accept_length=np.empty((0,), dtype=np.int32),
             accept_length_cpu=np.empty((0,), dtype=np.int32),
         )
-
-    @DeprecationWarning
-    def prepare_extend_after_decode(
-        self,
-        batch: ScheduleBatch,
-    ):
-        if batch.forward_mode.is_idle():
-            return
-
-        batch.input_ids = self.verified_id
-        rank0_spec = batch.reqs_info[0].spec_info if batch.reqs_info else None
-        accept_length_cpu_arr = rank0_spec.accept_length_cpu if rank0_spec else None
-        if accept_length_cpu_arr is None:
-            accept_length_cpu_host = np.asarray([], dtype=np.int32)
-        else:
-            accept_length_cpu_host = accept_length_cpu_arr
-        batch.extend_lens = (accept_length_cpu_host + 1).tolist()
-        batch.extend_num_tokens = sum(batch.extend_lens)
-        batch.seq_lens = rank0_spec.seq_lens_for_draft_extend if rank0_spec else None
-        batch.seq_lens_sum = batch.seq_lens.sum().item()
-        batch.req_pool_indices = (
-            rank0_spec.req_pool_indices_for_draft_extend if rank0_spec else None
-        )
-        batch.return_logprob = False
-        batch.return_hidden_states = False
-
-        self.capture_hidden_mode = CaptureHiddenMode.LAST
-        self.accept_length = self.accept_length + 1
-        self.positions = np.empty_like(batch.input_ids, dtype=np.int32)
-        self.verified_id = np.empty_like(self.accept_length, dtype=np.int32)
-
-        self.positions, self.verified_id = create_extend_after_decode_spec_info(
-            batch.input_ids,
-            batch.seq_lens,
-            self.accept_length,
-            self.positions,
-            self.verified_id,
-        )
-
-        self.accept_length_cpu = np.asarray(accept_length_cpu_host, dtype=np.int32)
 
     def _ensure_host(self):
         """Move device arrays to host (numpy) to avoid variable-shape device ops.

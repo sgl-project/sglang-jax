@@ -316,6 +316,7 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         # warmup batch size — see #1090). Gather to real_bs on host.
         sel = np.asarray(model_worker_batch.logits_indices_selector)
         accept_host = np.asarray(jax.device_get(batch_output.accept_lens))
+        assert (accept_host[sel] >= 1).all(), f"accept_length < 1: {accept_host[sel]}"
         select_index = sel * (self.speculative_num_steps + 1) + accept_host[sel] - 1
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, layer0_logits.next_token_logits, layer0_logits.hidden_states
