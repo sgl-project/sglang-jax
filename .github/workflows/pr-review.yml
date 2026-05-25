@@ -56,6 +56,12 @@ jobs:
           echo "sha=$HEAD_SHA"      >> "$GITHUB_OUTPUT"
           echo "ref=$HEAD_REF"      >> "$GITHUB_OUTPUT"
 
+      - name: Acknowledge /review command
+        if: github.event_name == 'issue_comment'
+        run: |
+          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -f content='+1' --silent
+
       - uses: actions/checkout@v5
         with:
           ref: ${{ steps.pr.outputs.sha }}
