@@ -2630,10 +2630,22 @@ _MM_PIXEL_FEATURE_DIM = 1536
 
 
 def _pick_bucket(value: int, buckets: tuple[int, ...]) -> int:
-    """Smallest bucket >= value, or value itself if larger than max bucket."""
+    """Smallest bucket >= value, or value itself if larger than max bucket.
+
+    Falling through (value > max bucket) makes the ViT input shape
+    request-dependent — every new size triggers a fresh jit compile. Log a
+    warning so the recompile is visible instead of silent.
+    """
     for b in buckets:
         if b >= value:
             return b
+    logger.warning(
+        "Multimodal bucket overflow: value=%d exceeds max bucket=%d — "
+        "falling back to value itself. This triggers a fresh jit compile. "
+        "Consider adding a larger bucket or reducing image resolution.",
+        value,
+        buckets[-1] if buckets else 0,
+    )
     return value
 
 
