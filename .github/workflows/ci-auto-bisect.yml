@@ -59,7 +59,7 @@ jobs:
         run: python3 scripts/ci/bisect_preflight.py
 
       - name: React to /auto-bisect comment
-        if: github.event_name == 'issue_comment' && steps.parse_comment.outputs.valid == 'true'
+        if: always() && github.event_name == 'issue_comment' && steps.parse_comment.outputs.valid == 'true'
         run: |
           if [ "${{ steps.preflight.outputs.eligible }}" = "true" ]; then
             REACTION="+1"
@@ -144,6 +144,17 @@ jobs:
             `confidence` ∈ {low, medium, high}. Use `low` when only one signal
             supports the classification; reserve `high` for cases where the
             failure log + diff + source tree all converge on the same cause.
+
+            ## Comment verbosity
+
+            Scale detail to classification:
+
+            - `infrastructure` or `flaky_test`: keep the PR comment brief —
+              1–2 sentence root cause, the key log line, and a suggested
+              action. No diff analysis needed.
+            - `code_regression` or `environment`: be thorough — cite the
+              specific commit/diff hunk, the failing assertion or traceback,
+              and the causal chain.
 
             ## Required outputs
 
