@@ -36,7 +36,7 @@ jobs:
         id: report
         timeout-minutes: 30
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RUNNER_LIST_TOKEN || secrets.GITHUB_TOKEN }}
           RUNNER_FILTER: ${{ inputs.filter || '' }}
           REPORT_HOURS: ${{ inputs.hours || '24' }}
           REPO: ${{ github.repository }}
