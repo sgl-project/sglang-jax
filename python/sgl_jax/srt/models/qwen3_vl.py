@@ -950,58 +950,36 @@ class Qwen3VLForConditionalGeneration(nnx.Module):
     ):
         token_to_kv_pool = memory_pools.token_to_kv_pool
 
-        # --- Multimodal splice (extend/prefill only) ---
-        # ForwardBatch carries bucket-padded vision tensors as pytree children
-        # (pixel_values / placeholder_positions / cu_seqlens) plus a static
-        # image_grid_thw (Python tuple) in aux_data. In decode mode these are
-        # all None and we fall straight through to the text-only LLM path.
-        input_deepstack_embeds = None
+        # --- Multimodal splice ---
+        # ViT + splice now live in dedicated JITs (`encode_visual` /
+        # `splice_embeds`) invoked by ModelRunner.run_model_wrapper before this
+        # JIT is entered. When that orchestrator runs the visual pipeline, it
+        # populates `forward_batch.input_embedding` and
+        # `forward_batch.deepstack_visual_embedding`; `Qwen3VLLanguageModel`
+        # consumes both via the existing `input_embedding is None` branch and
+        # the deepstack post-residual hook.
+        #
+        # Fallback: if a caller still wires the model directly (e.g. tests or
+        # legacy callers that haven't switched to the orchestrator), invoke
+        # the in-process visual pipeline so output stays identical. This keeps
+        # `test_qwen3_vl_models.py` and any callers of `model(...)` working
+        # without a flag day. Once the orchestrator is mandatory we can drop
+        # this branch.
+        input_deepstack_embeds = getattr(forward_batch, "deepstack_visual_embedding", None)
         if (
             forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
             and forward_batch.pixel_values is not None
+            and forward_batch.input_embedding is None
         ):
-            # 1) ViT: pixel_values (padded) -> [N_padded_image_tokens, hidden*(1+N_ds)]
-            vision_features = self.visual(
-                forward_batch.pixel_values,
-                forward_batch.image_grid_thw,
-                cu_seqlens=forward_batch.cu_seqlens,
-                n_real_images=forward_batch.n_real_images,
+            vision_main, vision_deepstack = self.encode_visual(forward_batch)
+            input_embedding, full_deepstack = self.splice_embeds(
+                forward_batch.input_ids,
+                vision_main,
+                vision_deepstack,
+                forward_batch.placeholder_positions,
             )
-            vision_main, vision_deepstack = self.separate_deepstack_embeds(vision_features)
-
-            # 2) Splice main features into input_embeds at placeholder positions.
-            #    placeholder_positions is already replicated and bucket-padded:
-            #    real entries point at real image tokens, padded entries point
-            #    at the sink slot (last token), where the ViT output is zero so
-            #    the overwrite is observationally a no-op.
-            input_embeds = self.model.embed_tokens(forward_batch.input_ids)
-            # Reshard to replicated for scatter — placeholder_positions and the
-            # vision feature tensors are all replicated, and the scatter is
-            # simplest on a replicated input_embeds.
-            repl = NamedSharding(self.mesh, P())
-            input_embeds_repl = jax.sharding.reshard(input_embeds, repl)
-            positions = forward_batch.placeholder_positions
-            input_embeds_out = input_embeds_repl.at[positions].set(
-                vision_main.astype(input_embeds_repl.dtype)
-            )
-
-            # 3) Scatter deepstack into a padded zero tensor matching input_embeds
-            #    so the LLM's post-residual addition broadcasts cleanly.
-            full_deepstack = jnp.zeros(
-                (input_embeds_out.shape[0], vision_deepstack.shape[1]),
-                dtype=input_embeds_out.dtype,
-            )
-            full_deepstack = full_deepstack.at[positions].set(
-                vision_deepstack.astype(input_embeds_out.dtype)
-            )
-
-            forward_batch.input_embedding = input_embeds_out
+            forward_batch.input_embedding = input_embedding
             input_deepstack_embeds = full_deepstack
-
-        # Fall back to whatever ForwardBatch already carries (text-only or
-        # externally-spliced deepstack).
-        if input_deepstack_embeds is None:
-            input_deepstack_embeds = getattr(forward_batch, "deepstack_visual_embedding", None)
 
         hidden_states, layers_kv_fused, layers_callback_flag = self.model(
             forward_batch,
@@ -1014,6 +992,66 @@ class Qwen3VLForConditionalGeneration(nnx.Module):
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
         return output, layers_kv_fused, layers_callback_flag, None
+
+    # ---- visual pipeline (split into two JIT-friendly methods) ----
+    def encode_visual(self, forward_batch: ForwardBatch):
+        """Pure function: run ViT + deepstack split on the visual fields of
+        forward_batch. Suitable for jit'ing with cache key
+        `(n_patches_bucket, image_grid_thw, n_real_images_bucket)`.
+
+        Returns:
+            (vision_main      [N_padded_tokens, hidden],
+             vision_deepstack [N_padded_tokens, hidden * N_deepstack])
+        """
+        vision_features = self.visual(
+            forward_batch.pixel_values,
+            forward_batch.image_grid_thw,
+            cu_seqlens=forward_batch.cu_seqlens,
+            n_real_images=forward_batch.n_real_images,
+        )
+        return self.separate_deepstack_embeds(vision_features)
+
+    def splice_embeds(
+        self,
+        input_ids: jax.Array,
+        vision_main: jax.Array,
+        vision_deepstack: jax.Array,
+        placeholder_positions: jax.Array,
+    ):
+        """Pure function: embed text tokens + scatter vision embeddings at
+        placeholder positions. Suitable for jit'ing with cache key
+        `(seq_len_bucket, N_padded_tokens_bucket)`.
+
+        `embed_tokens` lives here (option A, matches tpu-inference) so the
+        downstream LLM JIT cache key is purely a function of seq_len — the
+        same cache key text-only extends use. See
+        docs/design/qwen3vl_three_jit_split.md §4.1.
+
+        Returns:
+            (input_embedding    [seq_len, hidden],
+             deepstack_embedding [seq_len, hidden * N_deepstack])
+        """
+        text_embeds = self.model.embed_tokens(input_ids)
+        # Reshard to replicated for scatter — placeholder_positions and the
+        # vision feature tensors are all replicated, and the scatter is
+        # simplest on a replicated text_embeds.
+        repl = NamedSharding(self.mesh, P())
+        text_embeds_repl = jax.sharding.reshard(text_embeds, repl)
+        input_embedding = text_embeds_repl.at[placeholder_positions].set(
+            vision_main.astype(text_embeds_repl.dtype)
+        )
+
+        # Deepstack: padded zero buffer with the per-layer features scattered
+        # at the same placeholder positions. The LLM's post-residual hook adds
+        # this in at the configured decoder layers.
+        full_deepstack = jnp.zeros(
+            (input_embedding.shape[0], vision_deepstack.shape[1]),
+            dtype=input_embedding.dtype,
+        )
+        full_deepstack = full_deepstack.at[placeholder_positions].set(
+            vision_deepstack.astype(input_embedding.dtype)
+        )
+        return input_embedding, full_deepstack
 
     # ---- weight loading ----
     def load_weights(self, model_config: ModelConfig):
