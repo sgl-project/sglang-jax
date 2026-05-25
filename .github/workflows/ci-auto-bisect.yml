@@ -50,8 +50,29 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
         run: python3 scripts/ci/parse_bisect_comment.py
 
-      - id: bisect
+      - id: preflight
         if: github.event_name != 'issue_comment' || steps.parse_comment.outputs.valid == 'true'
+        env:
+          RUN_ID: ${{ inputs.run_id || github.event.client_payload.run_id || github.event.workflow_run.id || steps.parse_comment.outputs.run_id }}
+          ISSUE_NUMBER: ${{ inputs.issue_number || github.event.client_payload.issue_number || github.event.workflow_run.pull_requests[0].number || github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: python3 scripts/ci/bisect_preflight.py
+
+      - name: React to /auto-bisect comment
+        if: always() && github.event_name == 'issue_comment' && steps.parse_comment.outputs.valid == 'true'
+        run: |
+          if [ "${{ steps.preflight.outputs.eligible }}" = "true" ]; then
+            REACTION="+1"
+          elif [ "${{ steps.preflight.outputs.skip_type }}" = "error" ]; then
+            REACTION="confused"
+          else
+            REACTION="eyes"
+          fi
+          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -f content="$REACTION" --silent
+
+      - id: bisect
+        if: steps.preflight.outputs.eligible == 'true'
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
@@ -60,8 +81,12 @@ jobs:
             # sgl-jax CI Auto Bisect
 
             REPO: ${{ github.repository }}
-            RUN_ID: ${{ inputs.run_id || github.event.client_payload.run_id || github.event.workflow_run.id || steps.parse_comment.outputs.run_id }}
-            ISSUE_NUMBER: ${{ inputs.issue_number || github.event.client_payload.issue_number || github.event.workflow_run.pull_requests[0].number || github.event.issue.number }}
+            RUN_ID: ${{ steps.preflight.outputs.run_id }}
+            ISSUE_NUMBER: ${{ steps.preflight.outputs.issue_number }}
+
+            RUN_ID is a validated failed workflow run in the auto-bisect
+            allowlist (PR Test / Nightly Test / Nightly Test Daily / TPU Multi
+            Test). Do not re-validate or resolve it.
 
             The base repo's `main` is checked out in the current working
             directory. Note that this is *not* the source tree at the failing
@@ -74,25 +99,6 @@ jobs:
 
             Investigate the failed workflow run referenced by RUN_ID, classify
             the root cause, and emit machine-readable results.
-
-            ## Resolving RUN_ID
-
-            If RUN_ID is empty:
-            - If ISSUE_NUMBER is also empty, write analysis_result.json with
-              classification="infrastructure", confidence="high",
-              root_cause="No RUN_ID or ISSUE_NUMBER provided", and stop.
-            - Otherwise auto-detect from the PR:
-              1. Get PR HEAD SHA:
-                 `gh api repos/${{ github.repository }}/pulls/<ISSUE_NUMBER> --jq .head.sha`
-              2. List failed runs on that SHA:
-                 `gh api "repos/${{ github.repository }}/actions/runs?head_sha=<sha>&status=failure&per_page=20" --jq '.workflow_runs[] | {id, name, conclusion, created_at}'`
-              3. Pick the most recent run whose name is one of:
-                 "PR Test", "Nightly Test", "Nightly Test Daily", "TPU Multi Test".
-                 Use its `id` as RUN_ID for the rest of the investigation.
-              4. If no such failed run exists, write analysis_result.json with
-                 classification="infrastructure", confidence="high",
-                 root_cause="No failed CI runs found for PR <ISSUE_NUMBER> head <sha>",
-                 and stop.
 
             ## Investigation steps
 
@@ -132,10 +138,23 @@ jobs:
               e.g. GCS 5xx, TPU pre-emption, runner OOM, GitHub API outage.
             - `environment` — toolchain/dependency drift, e.g. upstream package
               published a breaking version, base image changed, secret rotated.
+            - `not_applicable` — no eligible failed run exists for analysis
+              (used by the preflight step; the agent should never produce this).
 
             `confidence` ∈ {low, medium, high}. Use `low` when only one signal
             supports the classification; reserve `high` for cases where the
             failure log + diff + source tree all converge on the same cause.
+
+            ## Comment verbosity
+
+            Scale detail to classification:
+
+            - `infrastructure` or `flaky_test`: keep the PR comment brief —
+              1–2 sentence root cause, the key log line, and a suggested
+              action. No diff analysis needed.
+            - `code_regression` or `environment`: be thorough — cite the
+              specific commit/diff hunk, the failing assertion or traceback,
+              and the causal chain.
 
             ## Required outputs
 
@@ -146,7 +165,7 @@ jobs:
                {
                  "run_id": "<string>",
                  "run_url": "<string>",
-                 "classification": "code_regression|flaky_test|infrastructure|environment",
+                 "classification": "code_regression|flaky_test|infrastructure|environment|not_applicable",
                  "confidence": "low|medium|high",
                  "failed_jobs": ["<job name>", "..."],
                  "root_cause": "<one-paragraph explanation>",
