@@ -34,6 +34,7 @@ def run_gh_command(args, max_retries=5):
             wait = (2**attempt) + random.uniform(0, 1)
             print(f"Retry {attempt + 1}/{max_retries} in {wait:.1f}s: {e.stderr.strip()}")
             time.sleep(wait)
+    raise RuntimeError("run_gh_command: exhausted retries without raising")
 
 
 def _paginated_gh_api(endpoint, params=None, jq_filter=None, stop_fn=None):
@@ -68,7 +69,7 @@ def _paginated_gh_api(endpoint, params=None, jq_filter=None, stop_fn=None):
                 continue
             if stop_fn and stop_fn(item):
                 stop = True
-                continue
+                break
             all_items.append(item)
         if stop or page_count < per_page:
             break
@@ -186,6 +187,7 @@ def calculate_concurrency_metrics(jobs, window_start, window_end, num_runners):
 
 
 def _percentile(sorted_values, p):
+    """Floor-index percentile: P95 equals max for samples < 20."""
     if not sorted_values:
         return 0.0
     return sorted_values[min(int(len(sorted_values) * p / 100), len(sorted_values) - 1)]
@@ -314,12 +316,6 @@ def calculate_utilization(repo, hours=24, runner_filter=None):
             continue
         intervals = label_intervals.get(label, [])
         num_runners = label_runner_count.get(label, 0)
-        merged = []
-        for s, e in sorted(intervals):
-            if merged and s <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-            else:
-                merged.append((s, e))
         total_job_s = sum((e - s).total_seconds() for s, e in intervals)
         cap_s = num_runners * window_seconds if num_runners > 0 else 0.0
         waits = sorted(label_queue_waits.get(label, []))
@@ -561,7 +557,11 @@ def format_slack_summary(report_data, hours, run_url=""):
         lines.append("No issues detected.")
     if run_url:
         lines += ["", f"<{run_url}|View full report>"]
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    # Slack Block Kit section text has a 3000 character limit
+    if len(text) > 2900:
+        text = text[:2900] + "\n… (truncated)"
+    return text
 
 
 def main():

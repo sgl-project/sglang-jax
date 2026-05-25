@@ -60,12 +60,16 @@ jobs:
           fi
 
       - name: Post to Slack
-        if: success() && secrets.SLACK_WEBHOOK_URL != ''
+        if: success()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "SLACK_WEBHOOK_URL not set, skipping."
+            exit 0
+          fi
           SUMMARY=$(cat slack_summary.txt)
           jq -n --arg text "$SUMMARY" \
             '{"blocks":[{"type":"section","text":{"type":"mrkdwn","text":$text}}]}' | \
-            curl -sf -X POST -H 'Content-type: application/json' \
+            curl --fail-with-body -X POST -H 'Content-type: application/json' \
               -d @- "$SLACK_WEBHOOK_URL"
