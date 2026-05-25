@@ -110,11 +110,15 @@ def write_outputs(outputs: Dict) -> None:
 def write_skip_result(
     reason: str,
     *,
+    skip_type: str = "no_eligible",
     run_id: str = "",
     run_url: str = "none",
     issue_number: str = "",
 ) -> None:
-    """Write analysis_result.json, GITHUB_STEP_SUMMARY, and outputs for a skip."""
+    """Write analysis_result.json, GITHUB_STEP_SUMMARY, and outputs for a skip.
+
+    skip_type: "no_eligible" (nothing to analyze) or "error" (bad input / API failure).
+    """
     result = {
         "run_id": run_id,
         "run_url": run_url,
@@ -143,6 +147,7 @@ def write_skip_result(
             "run_id": run_id,
             "run_url": run_url,
             "issue_number": issue_number,
+            "skip_type": skip_type,
             "classification": "not_applicable",
             "confidence": "high",
             "skip_reason": reason,
@@ -167,6 +172,7 @@ def main() -> int:
         except RuntimeError as exc:
             write_skip_result(
                 f"Run {run_id} not found or API error: {exc}",
+                skip_type="error",
                 run_id=run_id,
                 issue_number=issue_number,
             )
@@ -206,7 +212,7 @@ def main() -> int:
 
     # --- Path 2: no RUN_ID — auto-detect from PR ---
     if not issue_number:
-        write_skip_result("No RUN_ID or ISSUE_NUMBER provided.")
+        write_skip_result("No RUN_ID or ISSUE_NUMBER provided.", skip_type="error")
         return 0
 
     print(f"No RUN_ID provided. Auto-detecting from PR #{issue_number}")
@@ -215,6 +221,7 @@ def main() -> int:
     except RuntimeError as exc:
         write_skip_result(
             f"Could not resolve HEAD SHA for PR #{issue_number}: {exc}",
+            skip_type="error",
             issue_number=issue_number,
         )
         return 0
@@ -222,6 +229,7 @@ def main() -> int:
     if not sha:
         write_skip_result(
             f"PR #{issue_number} returned an empty HEAD SHA.",
+            skip_type="error",
             issue_number=issue_number,
         )
         return 0
@@ -232,6 +240,7 @@ def main() -> int:
     except RuntimeError as exc:
         write_skip_result(
             f"Failed to list runs for SHA {sha}: {exc}",
+            skip_type="error",
             issue_number=issue_number,
         )
         return 0

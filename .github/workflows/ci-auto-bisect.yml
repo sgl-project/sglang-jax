@@ -63,6 +63,8 @@ jobs:
         run: |
           if [ "${{ steps.preflight.outputs.eligible }}" = "true" ]; then
             REACTION="+1"
+          elif [ "${{ steps.preflight.outputs.skip_type }}" = "error" ]; then
+            REACTION="confused"
           else
             REACTION="eyes"
           fi
