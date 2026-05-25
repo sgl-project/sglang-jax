@@ -349,6 +349,35 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 jitted_splice_embeds, model_def, model_state_def, self.model_state_leaves
             )
 
+            # Install the power-of-two patch bucket ladder driven by
+            # chunked_prefill_size + vision spatial_merge_size, replacing the
+            # hardcoded (256, 1024, 4096) fallback. Done HERE (rather than in
+            # scheduler.__init__) so detection doesn't depend on the
+            # `--multimodal` CLI flag — VLM models like Qwen3-VL expose
+            # `encode_visual`/`splice_embeds` regardless of that flag.
+            chunked_prefill_size = self.server_args.chunked_prefill_size
+            if chunked_prefill_size is not None and chunked_prefill_size > 0:
+                from sgl_jax.srt.managers.schedule_batch import (
+                    compute_patch_buckets,
+                    set_multimodal_patch_buckets,
+                )
+
+                vision_config = getattr(self.model_config.hf_config, "vision_config", None)
+                spatial_merge_size = (
+                    getattr(vision_config, "spatial_merge_size", 2)
+                    if vision_config is not None
+                    else 2
+                )
+                patch_buckets = compute_patch_buckets(chunked_prefill_size, spatial_merge_size)
+                set_multimodal_patch_buckets(patch_buckets)
+                logger.info(
+                    "Multimodal patch bucket ladder set to %s "
+                    "(chunked_prefill_size=%d, spatial_merge_size=%d)",
+                    patch_buckets,
+                    chunked_prefill_size,
+                    spatial_merge_size,
+                )
+
         self.jitted_sampler = partial(
             jitted_sampler,
             sampler_def,

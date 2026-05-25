@@ -381,29 +381,11 @@ class Scheduler(
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
 
-        # Multimodal patch bucket ladder is derived from chunked_prefill_size +
-        # vision spatial_merge_size, replacing the hardcoded (256, 1024, 4096)
-        # default. Power-of-two ladder aligns with CompilationManager's
-        # AOT visual-encode precompile pass and tpu-inference's bucketing.
-        if server_args.multimodal and self.chunked_prefill_size is not None:
-            from sgl_jax.srt.managers.schedule_batch import (
-                compute_patch_buckets,
-                set_multimodal_patch_buckets,
-            )
-
-            vision_config = getattr(self.model_config.hf_config, "vision_config", None)
-            spatial_merge_size = (
-                getattr(vision_config, "spatial_merge_size", 2) if vision_config is not None else 2
-            )
-            patch_buckets = compute_patch_buckets(self.chunked_prefill_size, spatial_merge_size)
-            set_multimodal_patch_buckets(patch_buckets)
-            logger.info(
-                "Multimodal patch bucket ladder set to %s (chunked_prefill_size=%d, "
-                "spatial_merge_size=%d)",
-                patch_buckets,
-                self.chunked_prefill_size,
-                spatial_merge_size,
-            )
+        # Note: the multimodal patch bucket ladder is installed by
+        # ModelRunner.initialize_jit (only when the loaded model exposes
+        # `encode_visual` / `splice_embeds`). That's the right hook point
+        # because the multimodal detection needs the model class, not a CLI
+        # flag — `--multimodal` is not required for VLMs like Qwen3-VL.
 
         # Init pause/continue state
         self._engine_paused = False
