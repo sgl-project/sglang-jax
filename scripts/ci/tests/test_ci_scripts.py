@@ -1,13 +1,16 @@
-"""Unit tests for scripts/ci/coordinator_decide.py and scripts/ci/finish_check.py."""
+"""Unit tests for CI scripts: coordinator_decide, finish_check, bisect_preflight."""
 
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, "scripts/ci")
+from bisect_preflight import ELIGIBLE_WORKFLOWS, find_eligible_run, validate_run
+from bisect_preflight import write_outputs as preflight_write_outputs
 from coordinator_decide import detect_draft, detect_labels, summarize, write_outputs
 from finish_check import check_jobs
 
@@ -464,6 +467,145 @@ class TestCoordinatorDecideIntegration(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("run_main_test: false", result.stdout)
         self.assertIn("run_pallas_bench: false", result.stdout)
+
+
+def _gh_run_json(run_id, name, conclusion, status="completed", sha="abc123"):
+    return {
+        "id": str(run_id),
+        "name": name,
+        "conclusion": conclusion,
+        "status": status,
+        "html_url": f"https://github.com/test/repo/actions/runs/{run_id}",
+        "head_sha": sha,
+        "created_at": f"2026-01-01T00:00:{int(run_id) % 60:02d}Z",
+    }
+
+
+class TestValidateRun(unittest.TestCase):
+    @patch("bisect_preflight.run_gh")
+    def test_valid_failed_allowlist_run(self, mock_gh):
+        mock_gh.return_value = json.dumps(
+            {"name": "PR Test", "conclusion": "failure", "html_url": "https://x", "head_sha": "abc"}
+        )
+        info = validate_run("owner/repo", "123")
+        self.assertEqual(info["name"], "PR Test")
+        self.assertEqual(info["conclusion"], "failure")
+
+    @patch("bisect_preflight.run_gh")
+    def test_run_not_found_raises(self, mock_gh):
+        mock_gh.side_effect = RuntimeError("404")
+        with self.assertRaises(RuntimeError):
+            validate_run("owner/repo", "999")
+
+
+class TestFindEligibleRun(unittest.TestCase):
+    @patch("bisect_preflight.run_gh")
+    def test_picks_most_recent_failed(self, mock_gh):
+        runs = [
+            _gh_run_json(10, "PR Test", "failure"),
+            _gh_run_json(20, "PR Test", "failure"),
+        ]
+        mock_gh.return_value = json.dumps(runs)
+        found, in_progress = find_eligible_run("owner/repo", "sha123")
+        self.assertIsNotNone(found)
+        self.assertEqual(found["id"], "20")
+        self.assertEqual(in_progress, [])
+
+    @patch("bisect_preflight.run_gh")
+    def test_ignores_non_allowlist_failures(self, mock_gh):
+        runs = [
+            _gh_run_json(10, "Runner Utilization Report", "failure"),
+            _gh_run_json(20, "Lint", "failure"),
+        ]
+        mock_gh.return_value = json.dumps(runs)
+        found, in_progress = find_eligible_run("owner/repo", "sha123")
+        self.assertIsNone(found)
+        self.assertEqual(in_progress, [])
+
+    @patch("bisect_preflight.run_gh")
+    def test_detects_in_progress(self, mock_gh):
+        runs = [
+            _gh_run_json(10, "PR Test", None, status="in_progress"),
+            _gh_run_json(20, "Nightly Test", None, status="queued"),
+        ]
+        mock_gh.return_value = json.dumps(runs)
+        found, in_progress = find_eligible_run("owner/repo", "sha123")
+        self.assertIsNone(found)
+        self.assertIn("PR Test", in_progress)
+        self.assertIn("Nightly Test", in_progress)
+
+    @patch("bisect_preflight.run_gh")
+    def test_failed_takes_priority_over_in_progress(self, mock_gh):
+        runs = [
+            _gh_run_json(10, "PR Test", None, status="in_progress"),
+            _gh_run_json(20, "Nightly Test", "failure"),
+        ]
+        mock_gh.return_value = json.dumps(runs)
+        found, in_progress = find_eligible_run("owner/repo", "sha123")
+        self.assertIsNotNone(found)
+        self.assertEqual(found["name"], "Nightly Test")
+        self.assertEqual(in_progress, [])
+
+    @patch("bisect_preflight.run_gh")
+    def test_no_runs_at_all(self, mock_gh):
+        mock_gh.return_value = "[]"
+        found, in_progress = find_eligible_run("owner/repo", "sha123")
+        self.assertIsNone(found)
+        self.assertEqual(in_progress, [])
+
+    @patch("bisect_preflight.run_gh")
+    def test_empty_response(self, mock_gh):
+        mock_gh.return_value = ""
+        found, in_progress = find_eligible_run("owner/repo", "sha123")
+        self.assertIsNone(found)
+        self.assertEqual(in_progress, [])
+
+
+class TestBisectPreflightIntegration(unittest.TestCase):
+    def _run_preflight(self, env_overrides):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as out_f:
+            out_path = out_f.name
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as sum_f:
+            sum_path = sum_f.name
+        try:
+            env = {
+                "PATH": os.environ.get("PATH", ""),
+                "RUN_ID": "",
+                "ISSUE_NUMBER": "",
+                "REPO": "test/repo",
+                "GITHUB_OUTPUT": out_path,
+                "GITHUB_STEP_SUMMARY": sum_path,
+            }
+            env.update(env_overrides)
+            result = subprocess.run(
+                [sys.executable, "scripts/ci/bisect_preflight.py"],
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=".",
+            )
+            with open(out_path) as f:
+                outputs_raw = f.read()
+            outputs = {}
+            for line in outputs_raw.strip().splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    outputs[k] = v
+            return result, outputs
+        finally:
+            os.remove(out_path)
+            os.remove(sum_path)
+
+    def test_no_input_skips(self):
+        result, outputs = self._run_preflight({"RUN_ID": "", "ISSUE_NUMBER": ""})
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(outputs.get("eligible"), "false")
+        self.assertEqual(outputs.get("classification"), "not_applicable")
+        self.assertIn("No RUN_ID or ISSUE_NUMBER", outputs.get("skip_reason", ""))
+
+    def test_missing_repo_fails(self):
+        result, _ = self._run_preflight({"REPO": ""})
+        self.assertEqual(result.returncode, 1)
 
 
 if __name__ == "__main__":
