@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 DEFAULT_LABELS_TO_IGNORE = {"self-hosted", "Linux", "X64", "ARM64"}
 GITHUB_HOSTED_LABELS = {"ubuntu-latest", "ubuntu-22.04", "ubuntu-24.04"}
 _NON_RETRYABLE_PATTERNS = ("401", "403", "404", "422", "not found", "must have admin")
-_NON_GPU_HINTS = ("lint", "release", "runner utilization", "summize")
+_NON_GPU_HINTS = ("lint", "release", "runner utilization", "summize")  # nightly-test-summize.yml
 
 
 def run_gh_command(args, max_retries=5):
@@ -167,7 +167,7 @@ def calculate_concurrency_metrics(jobs, window_start, window_end, num_runners):
                 events += [(s, +1), (e, -1)]
     if not events:
         return {"peak_concurrent": 0, "peak_queue": None}
-    events.sort(key=lambda e: (e[0], e[1]))
+    events.sort(key=lambda ev: (ev[0], ev[1]))
     current = peak = 0
     for event_time, delta in events:
         current += delta
@@ -428,7 +428,7 @@ def format_report(report_data, hours):
     lines.append("")
     lines.append(
         "| Runner Label | Runners | Jobs | Utilization | Peak Conc "
-        "| Queue P95 | Duration P50 | Duration P95 | Success Rate |"
+        "| Queue P95* | Duration P50 | Duration P95 | Success Rate |"
     )
     lines.append("|---|---|---|---|---|---|---|---|---|")
     for label, d in sorted(results.items()):
@@ -441,6 +441,8 @@ def format_report(report_data, hours):
             f"| {d['concurrency']['peak_concurrent']} | {_format_duration(d['wait_p95'])} "
             f"| {_format_duration(d['duration_p50'])} | {_format_duration(d['duration_p95'])} | {rate} |"
         )
+    lines.append("")
+    lines.append("_* Queue P95 is computed among jobs that waited (excludes 0s waits)._")
     lines.append("")
 
     # Top 10 Workflows
