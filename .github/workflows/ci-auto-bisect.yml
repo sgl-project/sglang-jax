@@ -50,11 +50,6 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
         run: python3 scripts/ci/parse_bisect_comment.py
 
-      - if: github.event_name == 'issue_comment' && steps.parse_comment.outputs.valid == 'true'
-        run: |
-          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
-            -f content='+1' --silent
-
       - id: preflight
         if: github.event_name != 'issue_comment' || steps.parse_comment.outputs.valid == 'true'
         env:
@@ -63,18 +58,16 @@ jobs:
           REPO: ${{ github.repository }}
         run: python3 scripts/ci/bisect_preflight.py
 
-      - id: skip_comment
-        if: steps.preflight.outputs.eligible == 'false' && steps.preflight.outputs.issue_number != ''
-        env:
-          ISSUE_NUMBER: ${{ steps.preflight.outputs.issue_number }}
-          RUN_ID: ${{ steps.preflight.outputs.run_id }}
-          SKIP_REASON: ${{ steps.preflight.outputs.skip_reason }}
+      - name: React to /auto-bisect comment
+        if: github.event_name == 'issue_comment' && steps.parse_comment.outputs.valid == 'true'
         run: |
-          MARKER="<!-- ci-auto-bisect:skip:${RUN_ID:-none} -->"
-          gh issue comment "$ISSUE_NUMBER" --body "${MARKER}
-          ## CI Auto Bisect — skipped
-          ${SKIP_REASON}
-          "
+          if [ "${{ steps.preflight.outputs.eligible }}" = "true" ]; then
+            REACTION="+1"
+          else
+            REACTION="eyes"
+          fi
+          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -f content="$REACTION" --silent
 
       - id: bisect
         if: steps.preflight.outputs.eligible == 'true'
