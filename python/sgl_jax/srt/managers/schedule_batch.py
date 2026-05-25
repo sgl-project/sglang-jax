@@ -2163,7 +2163,10 @@ class ScheduleBatch:
             token_ids_logprobs = None
 
         # Multimodal vision tensors (bucket-padded; None for text-only batches).
-        mm_tensors = _collect_mm_tensors(self.reqs, input_ids_cpu)
+        # Use `all_reqs` (flattened in DP-rank order, matching the packing in
+        # _merge_input_and_positions) instead of `self.reqs` — the latter is a
+        # dp=1-only shim and asserts on dp_size > 1.
+        mm_tensors = _collect_mm_tensors(all_reqs, input_ids_cpu)
         pixel_values_cpu = image_grid_thw_cpu = placeholder_positions_cpu = cu_seqlens_cpu = (
             n_real_images_cpu
         ) = None
