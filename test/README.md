@@ -21,6 +21,7 @@ python3 test/srt/run_suite.py --suite per-commit-tpu-v6e-1
 - Ensure they are referenced in the respective `run_suite.py` (e.g., `test/srt/run_suite.py`) so they’re picked up in CI. For most small test cases, they can be added to the `per-commit-tpu-v6e-1` suite. Sort the test cases alphabetically.
 - The CI will run the tests in suites automatically. If you need special setup or custom test groups, you may modify the workflows in [`.github/workflows/`](https://github.com/sgl-project/sglang-jax/tree/main/.github/workflows).
   - Tests in suites: please see complete tests in `suites` variable in run_suite.py.
+- For models that require multi-host deployment (DeepSeek, MiMo, etc.), follow the dedicated guide at [`test/srt/multi_host/README.md`](srt/multi_host/README.md) instead — it uses a launch-profile + suite-registry flow tailored to multi-host runs.
 
 
 ## Writing Elegant Test Cases
