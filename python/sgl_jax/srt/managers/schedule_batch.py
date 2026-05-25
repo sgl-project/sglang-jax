@@ -2615,10 +2615,15 @@ def _collect_mm_inputs(reqs: list) -> list | None:
 
 
 # Bucket sizes for vision input padding. Each bucket value is in "raw patches"
-# (one patch = one Conv3D input slot, before spatial merging). The selection of
-# 256/1024/4096 covers typical image sizes from ~256x256 to ~1024x1024 at
+# (one patch = one Conv3D input slot, before spatial merging). The default
+# fallback covers typical image sizes from ~256x256 to ~1024x1024 at
 # patch_size=16 + spatial_merge=2. Picked first bucket >= n_real_patches.
-_MM_PATCH_BUCKETS = (256, 1024, 4096)
+#
+# `compute_patch_buckets` derives a power-of-two ladder from
+# `chunked_prefill_size * spatial_merge_unit` to align the ViT JIT cache key
+# with the scheduler's max-tokens budget. Used by both the runtime padder
+# (_collect_mm_tensors) and CompilationManager's visual-encode precompile pass.
+_MM_PATCH_BUCKETS_FALLBACK = (256, 1024, 4096)
 # Bucket sizes for "how many images in one batch". Most requests carry 1 image.
 _MM_IMAGE_BUCKETS = (1, 2, 4, 8)
 # Patches per LLM image token. For Qwen3-VL, spatial_merge_size=2 -> 4 patches
@@ -2627,6 +2632,55 @@ _MM_PATCHES_PER_TOKEN = 4
 # Pixel-feature dim = in_channels * temporal_patch_size * patch_size**2.
 # For Qwen3-VL Dense this is 3*2*16*16 = 1536. We fix it here for the pad shape.
 _MM_PIXEL_FEATURE_DIM = 1536
+
+
+def compute_patch_buckets(
+    chunked_prefill_size: int,
+    spatial_merge_size: int,
+    min_patches: int = 16,
+) -> tuple[int, ...]:
+    """Power-of-two ladder for vision-patch JIT cache keys.
+
+    Matches the tpu-inference pattern: visual_tokens <= chunked_prefill_size
+    (image tokens are LLM input tokens), so patches <= chunked_prefill_size *
+    spatial_merge_size**2. We return every power of two in
+    [next_pow2(min_patches), next_pow2(max_patches)] so any padded
+    `n_padded_patches` chosen by `_collect_mm_tensors` falls on one of the
+    AOT-compiled bucket sizes.
+
+    Examples:
+        chunked_prefill_size=4096, spatial_merge_size=2 (Qwen3-VL):
+            max_patches = 16384
+            returns (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
+        chunked_prefill_size=2048, spatial_merge_size=2:
+            max_patches = 8192
+            returns (16, 32, ..., 8192)
+    """
+    if chunked_prefill_size <= 0:
+        return _MM_PATCH_BUCKETS_FALLBACK
+    spatial_merge_unit = spatial_merge_size**2
+    max_patches = chunked_prefill_size * spatial_merge_unit
+    min_shift = max(1, (min_patches - 1).bit_length())
+    max_shift = max(min_shift, (max_patches - 1).bit_length())
+    return tuple(1 << i for i in range(min_shift, max_shift + 1))
+
+
+# Active patch-bucket tuple. Computed once at startup from
+# server_args.chunked_prefill_size (see ScheduleBatch.set_multimodal_patch_buckets).
+# Defaults to the fallback so non-multimodal codepaths keep working before
+# any multimodal request arrives.
+_MM_PATCH_BUCKETS: tuple[int, ...] = _MM_PATCH_BUCKETS_FALLBACK
+
+
+def set_multimodal_patch_buckets(buckets: tuple[int, ...]) -> None:
+    """Install a runtime-derived patch bucket ladder. Called once at startup."""
+    global _MM_PATCH_BUCKETS
+    _MM_PATCH_BUCKETS = buckets
+
+
+def get_multimodal_patch_buckets() -> tuple[int, ...]:
+    """Read-only accessor for the active patch bucket ladder."""
+    return _MM_PATCH_BUCKETS
 
 
 def _pick_bucket(value: int, buckets: tuple[int, ...]) -> int:
