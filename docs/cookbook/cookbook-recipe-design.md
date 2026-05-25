@@ -23,7 +23,7 @@
    ### 2.2 Environment
    ### 2.3 Launch
        #### Single-host (Docker)              (如适用)
-       #### Multi-host (GKE 或 SkyPilot)       (如适用)
+       #### Multi-host (GKE Indexed Job)       (如适用)
    ### 2.4 Configuration Tips
 
 ## 3. Invocation
@@ -122,9 +122,10 @@
 - 必带:`JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` / `--trust-remote-code` / `--device tpu` / `--dtype bfloat16` / `--skip-server-warmup` + 模型特有 flag
 - 推荐在 launch 命令前贴单行 `docker run`(含 TPU 必备 flag)
 
-**`#### Multi-host (GKE 或 SkyPilot)`(如适用)**:
+**`#### Multi-host (GKE Indexed Job)`(如适用)**:
 - 多节点 launch 命令,带 `${NODE_RANK}` / `${MASTER_ADDR}` 占位 + rank 范围说明
-- 必须显式 launcher 选择:GKE Indexed Job + headless Service 或 SkyPilot;给出**差异化字段**(model path / TPU label / TP-DP-EP 等),引用 `cookbook/deployment/<launcher>.md` 通用模板,不复制整段未差异化的 manifest
+- 默认 launcher 是 GKE Indexed Job + headless Service;给出**差异化字段**(model path / TPU label / TP-DP-EP 等),引用 `cookbook/deployment/gke-indexed-job.md` 通用模板,不复制整段未差异化的 manifest
+- SkyPilot 只作为高级 v6e 实验备选链接,不在模型 recipe 中作为主路径,也不要求用户直接运行源码仓库内的 SkyPilot helper 脚本
 
 **好模式**(从 sgl-cookbook 对比中固化):
 
@@ -299,30 +300,33 @@
 
 ---
 
-## 3. Starter vs Validated 完成度矩阵
+## 3. Starter / Partially validated / Validated 完成度矩阵
 
-每篇 recipe 有两档状态:
+每篇 recipe 有三档状态:
 - **🚧 Starter**:基础骨架,允许 Pending / TODO
-- **✅ Validated**:有真实实测数据,移除 Starter banner
+- **🧪 Partially validated**:至少一个 variant / hardware path 有真实 benchmark 或 accuracy 输出;其他 variants、matrix cells 或 current-build rerun 可以 Pending,但必须在 banner 写清 verified scope 和 pending scope
+- **✅ Validated**:claimed primary path 有完整真实实测数据;该路径不允许留 Pending / TODO
 
-| 节 | Starter 最低 | Validated 增量 |
-|---|---|---|
-| §1 Introduction | 简介 + variant + HF link | + Key Features bullets + Recommended Generation Parameters |
-| §2.1 Hardware Matrix | 至少一行 starter target(数值可 TODO) | 全部数值实测 |
-| §2.2 Environment | 引用 deployment + install;JAX TPU Image by Hardware 表必填 | 表覆盖所有 §2.1 列出的 TPU 平台 |
-| §2.3 Launch | 至少 single-host 或 multi-host 一个完整命令(含 launcher manifest 如多 host) | 全部支持的 launcher × topology 覆盖 |
-| §2.4 Config Tips | 可选 | 必填 4-6 个主题(含 flag 取值理由) |
-| §3.1 Basic | curl 一个例子 | + 简短 Python client |
-| §3.2 Reasoning | 一句话引用其他 recipe | 完整 Python streaming + Output Example;hybrid 模型必须 thinking-on + off 双例 |
-| §3.3 Tool Calling | §2.4 主题里提一行 parser key | 完整 Python tools + Output + 必备 Handling Tool Call Results 段 |
-| §3.x Multimodal | 仅 VL/Audio 模型 | Single/Multi-Image/Video 三个 block |
-| §4.1 Accuracy | Test Env + 命令模板 + Test Results 标 Pending | 至少 1 个 dataset 真实输出 |
-| §4.2 Speed | Test Env + 命令模板 + 选定 layout 占位结构 | 至少 1 格真实 `============ Serving Benchmark Result ============` 块 |
-| §5 Troubleshooting | 可选 | 列出本模型特有 3-5 条 |
+| 节 | Starter 最低 | Partially validated 增量 | Validated 增量 |
+|---|---|---|---|
+| §1 Introduction | 简介 + variant + HF link | 标明已验证和待验证 variants | + Key Features bullets + Recommended Generation Parameters |
+| §2.1 Hardware Matrix | 至少一行 starter target(数值可 TODO) | 已验证 path 数值实测,未验证 path 可 Pending | claimed primary path 全部数值实测 |
+| §2.2 Environment | 引用 deployment + install;JAX TPU Image by Hardware 表必填 | 已验证 path 填真实 image / commit | 表覆盖所有 §2.1 列出的 TPU 平台 |
+| §2.3 Launch | 至少 single-host 或 multi-host 一个完整命令(含 launcher manifest 如多 host) | 已验证 path 命令可复现 | 全部 claimed launcher × topology 覆盖 |
+| §2.4 Config Tips | 可选 | 解释已验证 path 的关键 flags | 必填 4-6 个主题(含 flag 取值理由) |
+| §3.1 Basic | curl 一个例子 | 已验证 path 至少保留可运行 client 示例 | + 简短 Python client |
+| §3.2 Reasoning | 一句话引用其他 recipe | thinking-on/off 覆盖已验证 reasoning variant | 完整 Python streaming + Output Example;hybrid 模型必须 thinking-on + off 双例 |
+| §3.3 Tool Calling | §2.4 主题里提一行 parser key | parser key 和 output 结构要和已验证 variant 一致 | 完整 Python tools + Output + 必备 Handling Tool Call Results 段 |
+| §3.x Multimodal | 仅 VL/Audio 模型 | 已验证 modality 给出真实 request shape | Single/Multi-Image/Video 三个 block |
+| §4.1 Accuracy | Test Env + 命令模板 + Test Results 标 Pending | 至少 1 个 dataset 真实输出 | claimed primary path 至少 1 个 dataset 真实输出 |
+| §4.2 Speed | Test Env + 命令模板 + 选定 layout 占位结构 | 至少 1 格真实 `============ Serving Benchmark Result ============` 块 | claimed primary path 真实 benchmark 块完整 |
+| §5 Troubleshooting | 可选 | 列出验证中实际遇到的问题 | 列出本模型特有 3-5 条 |
 
 **Banner**:
 - Starter 顶部: `> **Starter recipe** — Not yet empirically validated on TPU. Tune values for your hardware and PR-back tested numbers.`
-- Validated:移除该 banner;在 `autoregressive/index.md` 中 status 从 🚧 升级为 ✅
+- Partially validated 顶部: `> **Partially validated recipe** — <verified variant / hardware path> has measured results; <remaining scope> is still pending.`
+- Validated 顶部: `> **Validated recipe** — empirically validated on <hardware> with sglang-jax <hash> (<date>).`
+- 在 `autoregressive/index.md` 或 `multimodal/index.md` 中同步 status: 🚧 / 🧪 / ✅
 
 ---
 

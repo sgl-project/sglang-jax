@@ -98,9 +98,9 @@ For full flag definitions see [`../base/launch-flags-reference.md`](../../base/l
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#31-basic-chat-completion) for the curl / Python pattern. Substitute `model="google/gemma-2-9b-it"` (or your chosen variant).
+See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="google/gemma-2-9b-it"` (or your chosen variant) with the §1 recommended sampling parameters — pass `top_k` via `extra_body={"top_k": 64}` since the OpenAI schema does not include it.
 
-> Gemma 2 does not ship with native hybrid reasoning or a built-in tool-call format. For reasoning / tool-call workloads use a model with `--reasoning-parser` / `--tool-call-parser` support (see [`Qwen3.md` §3.2 / §3.3](../Qwen/Qwen3.md) or [`MiMo-V2.5-Pro.md`](../Xiaomi/MiMo-V2.5-Pro.md)).
+> Gemma 2 is non-reasoning and has no native tool-call format. For those workloads choose a model with `--reasoning-parser` / `--tool-call-parser` support (e.g., [Qwen3](../Qwen/Qwen3.md), [MiMo-V2.5-Pro](../Xiaomi/MiMo-V2.5-Pro.md)).
 
 ## 4. Benchmark
 

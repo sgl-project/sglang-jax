@@ -35,7 +35,7 @@ See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.m
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.md`](../../../get_started/install.md). Multi-host required — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) or [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
+Install per [`../../../get_started/install.md`](../../../get_started/install.md). Multi-host required — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -44,21 +44,11 @@ Install per [`../../../get_started/install.md`](../../../get_started/install.md)
 
 ### 2.3 Launch
 
-#### Multi-host (SkyPilot) — TPU v6e-64
+#### Multi-host (GKE Indexed Job) — TPU v6e-64
 
-**Step 1** — provision the cluster:
-
-```bash
-cd ${WORKSPACE_DIR}/sglang-jax
-bash scripts/launch_tpu.sh tpu-v6e-64 main
-```
-
-**Step 2** — launch the server:
+Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) with `<JOB>=deepseek-v3`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, and `completions: 16`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
 ```bash
-CLUSTER_NAME=$(cat .cluster_name)
-sky exec ${CLUSTER_NAME} -- "cd sglang-jax && source .venv/bin/activate && \
-  JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
   --model-path deepseek-ai/DeepSeek-V3 \
   --trust-remote-code \
   --tp-size 64 --ep-size 64 \
@@ -69,22 +59,18 @@ sky exec ${CLUSTER_NAME} -- "cd sglang-jax && source .venv/bin/activate && \
   --chunked-prefill-size 2048 \
   --page-size 128 \
   --max-running-requests 256 \
-  --skip-server-warmup \
-  --dist-init-addr <NODE_0_IP_ADDRESS>:5000 \
-  --nnodes 16 --node-rank \${SKYPILOT_NODE_RANK} \
-  --host 0.0.0.0 --port 30000"
+  --skip-server-warmup
 ```
 
-#### Multi-host (SkyPilot) — TPU v7x-16
+#### Multi-host (GKE Indexed Job) — TPU v7x-16
 
-Swap the topology to `tpu-v7x-16` and use:
+Use `<ACCELERATOR>=tpu7x`, `<TOPOLOGY>=4x4`, `parallelism: 4`, and `completions: 4`; change the launch flags above to:
 
 ```text
   --tp-size 32 --ep-size 32 \
-  --nnodes 4 --node-rank \${SKYPILOT_NODE_RANK} \
 ```
 
-For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.md` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.md#23-launch) with `<JOB>=deepseek-v3`, `<ACCELERATOR>=tpu-v6e-slice` (or `tpu7x` for v7x), the corresponding topology, and the launch flags above.
+For temporary v6e experiments, advanced users can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags. The default SkyPilot template is v6e-only; use GKE for v7x.
 
 ### 2.4 Configuration Tips
 
@@ -111,9 +97,9 @@ For full flag definitions see [`../../base/launch-flags-reference.md`](../../bas
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#31-basic-chat-completion). Substitute `model="deepseek-ai/DeepSeek-V3"`.
+See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="deepseek-ai/DeepSeek-V3"` with the §1 recommended sampling parameters.
 
-> DeepSeek V3 does not ship with a native tool-call format. For tool-call workloads use [`Qwen3.md` §3.3](../Qwen/Qwen3.md#33-tool-calling) or [`MiMo-V2.5-Pro.md` §3.3](../Xiaomi/MiMo-V2.5-Pro.md#33-tool-calling). For reasoning workloads use [`DeepSeek-R1.md`](DeepSeek-R1.md).
+> DeepSeek V3 is non-reasoning and has no native tool-call format. For reasoning use [`DeepSeek-R1.md`](DeepSeek-R1.md); for tool-call workloads choose a model with `--tool-call-parser` support (e.g., [Qwen3](../Qwen/Qwen3.md), [MiMo-V2.5-Pro](../Xiaomi/MiMo-V2.5-Pro.md)).
 
 ## 4. Benchmark
 
@@ -139,7 +125,7 @@ Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#3
 | Expert Parallelism | 64 (v6e) / 32 (v7x) |
 | Tested build | _Pending_ |
 
-**Deployment Command** — same as [§2.3](#multi-host-skypilot--tpu-v6e-64).
+**Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-64).
 
 **Benchmark Command** — example for GSM8K:
 

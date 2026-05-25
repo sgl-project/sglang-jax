@@ -4,7 +4,7 @@ title: "DeepSeek V2"
 
 # DeepSeek V2 on SGL-JAX
 
-> **Starter recipe** — derived from the HuggingFace model card; not yet empirically validated on TPU. Tune values for your hardware and PR-back tested numbers.
+> **Partially validated recipe** — DeepSeek-V2-Lite / V2-Lite-Chat has TPU v6e-4 speed and GSM8K results. Full DeepSeek-V2 multi-host validation is still pending.
 
 ## 1. Model Introduction
 
@@ -39,7 +39,7 @@ See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.m
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.md`](../../../get_started/install.md). For V2-Lite single-host use [`../../deployment/single-host-docker.md`](../../deployment/single-host-docker.md); for V2 multi-host use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) or [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
+Install per [`../../../get_started/install.md`](../../../get_started/install.md). For V2-Lite single-host use [`../../deployment/single-host-docker.md`](../../deployment/single-host-docker.md). For V2 multi-host, use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -59,25 +59,18 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
   --device tpu \
   --dtype bfloat16 \
   --mem-fraction-static 0.88 \
+  --page-size 64 \
   --skip-server-warmup \
   --host 0.0.0.0 --port 30000
 ```
 
-#### Multi-host (SkyPilot) — TPU v6e-32 (DeepSeek-V2)
+> **`--page-size` mandatory for MLA**: DeepSeek's MLA backend asserts `page_size > 1` (the MLA v2 kernel packs KV slots and infers effective page size from `cache_kv.shape[1] * kv_packing`). The default `--page-size 1` will hit `AssertionError: MLA attention backend does not support page_size=1` at startup. Use 64 (or any power-of-2 ≥ 2). Same constraint applies to DeepSeek-R1 / V3.
 
-**Step 1** — provision the cluster:
+#### Multi-host (GKE Indexed Job) — TPU v6e-32 (DeepSeek-V2)
 
-```bash
-cd ${WORKSPACE_DIR}/sglang-jax
-bash scripts/launch_tpu.sh tpu-v6e-32 main
-```
-
-**Step 2** — launch the server:
+Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) with `<JOB>=deepseek-v2`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8`, and `completions: 8`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
 ```bash
-CLUSTER_NAME=$(cat .cluster_name)
-sky exec ${CLUSTER_NAME} -- "cd sglang-jax && source .venv/bin/activate && \
-  JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
   --model-path deepseek-ai/DeepSeek-V2 \
   --trust-remote-code \
   --tp-size 32 --ep-size 32 \
@@ -88,13 +81,10 @@ sky exec ${CLUSTER_NAME} -- "cd sglang-jax && source .venv/bin/activate && \
   --chunked-prefill-size 2048 \
   --page-size 128 \
   --max-running-requests 256 \
-  --skip-server-warmup \
-  --dist-init-addr <NODE_0_IP_ADDRESS>:5000 \
-  --nnodes 8 --node-rank \${SKYPILOT_NODE_RANK} \
-  --host 0.0.0.0 --port 30000"
+  --skip-server-warmup
 ```
 
-For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.md` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.md#23-launch) with `<JOB>=deepseek-v2`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8` / `completions: 8`, and the launch flags above.
+For temporary v6e experiments, advanced users can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
 ### 2.4 Configuration Tips
 
@@ -123,9 +113,9 @@ For full flag definitions see [`../../base/launch-flags-reference.md`](../../bas
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#31-basic-chat-completion). Substitute `model="deepseek-ai/DeepSeek-V2"` (or `DeepSeek-V2-Lite`).
+See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="deepseek-ai/DeepSeek-V2"` (or `DeepSeek-V2-Lite`) with the §1 recommended sampling parameters.
 
-> DeepSeek V2 does not ship with a native tool-call format. For tool-call workloads use [`Qwen3.md` §3.3](../Qwen/Qwen3.md#33-tool-calling) or [`MiMo-V2.5-Pro.md` §3.3](../Xiaomi/MiMo-V2.5-Pro.md#33-tool-calling). For reasoning workloads use [`DeepSeek-R1.md`](DeepSeek-R1.md).
+> DeepSeek V2 (and V2-Lite) is non-reasoning and has no native tool-call format. For reasoning use [`DeepSeek-R1.md`](DeepSeek-R1.md); for tool-call workloads choose a model with `--tool-call-parser` support (e.g., [Qwen3](../Qwen/Qwen3.md), [MiMo-V2.5-Pro](../Xiaomi/MiMo-V2.5-Pro.md)).
 
 ## 4. Benchmark
 
@@ -133,11 +123,29 @@ Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#3
 
 ### 4.1 Speed
 
-> **Layout B — methodology + command template.** No measured numbers yet; PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` to upgrade to Validated.
+> **Layout B — single-workload latency baseline.** Measured on V2-Lite v6e-4 with `bench_serving` random 512→128, max-concurrency 8, build `de29d9f0`.
 
 **Benchmark Command** — adapt the driver from [`Qwen3.md` §4.1](../Qwen/Qwen3.md#41-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the DeepSeek-V2 checkpoint, remove the vLLM half).
 
-**Test Results** — _Pending._
+**Test Results** — V2-Lite (TPU v6e-4):
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sgl-jax
+Successful requests:                     100
+Benchmark duration (s):                  14.65
+Request throughput (req/s):              6.83
+Input token throughput (tok/s):          3495.51
+Output token throughput (tok/s):         873.88
+Peak output token throughput (tok/s):    1022.00
+Total token throughput (tok/s):          4369.38
+Mean E2E Latency (ms):                   1136.32
+Mean TTFT (ms):                          194.98
+Mean TPOT (ms):                          7.41
+==================================================
+```
+
+V2 multi-host: _Pending — run on v6e-32 and PR back._
 
 ### 4.2 Accuracy
 
@@ -146,18 +154,20 @@ Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#3
 | Field | Value |
 |---|---|
 | Hardware | TPU v6e-4 (V2-Lite) / v6e-32 (V2) |
-| Model | deepseek-ai/DeepSeek-V2-Lite or DeepSeek-V2 (BF16) |
+| Model | deepseek-ai/DeepSeek-V2-Lite-Chat or DeepSeek-V2-Chat (BF16) |
 | Tensor Parallelism | 4 (Lite) / 32 (V2) |
 | Expert Parallelism | 4 (Lite) / 32 (V2) |
-| Tested build | _Pending_ |
+| Tested build | sglang-jax `de29d9f0` (2026-05-24) |
 
-**Deployment Command** — same as [§2.3](#single-host-docker--tpu-v6e-4-deepseek-v2-lite).
+> **Use the `-Chat` checkpoint for accuracy eval.** The base `DeepSeek-V2-Lite` ships without a chat template; evalscope's few-shot GSM8K prompt loops indefinitely against `/v1/chat/completions` (observed 0.014 score, `finish_reason: length`). The instruct-tuned `DeepSeek-V2-Lite-Chat` has the chat template and parses `\nThe answer is X` reliably.
+
+**Deployment Command** — same as [§2.3](#single-host-docker--tpu-v6e-4-deepseek-v2-lite) but swap `--model-path` to `deepseek-ai/DeepSeek-V2-Lite-Chat` (V2-Lite tier) or `deepseek-ai/DeepSeek-V2-Chat` (V2 multi-host).
 
 **Benchmark Command** — example for GSM8K:
 
 ```bash
 evalscope eval \
-  --model deepseek-ai/DeepSeek-V2 \
+  --model deepseek-ai/DeepSeek-V2-Lite-Chat \
   --api-url http://127.0.0.1:30000/v1/chat/completions \
   --api-key EMPTY \
   --eval-type service \
@@ -167,7 +177,14 @@ evalscope eval \
 
 Recommended additional datasets: MMLU, GPQA Diamond, HumanEval.
 
-**Test Results** — _Pending. Run and PR back._
+**Test Results** — V2-Lite-Chat (TPU v6e-4, sglang-jax `fe092bf`):
+
+| Model | Dataset | Limit | Score |
+|:---|:---|:---|:---|
+| DeepSeek-V2-Lite-Chat | gsm8k | 200 | **0.685** |
+| DeepSeek-V2-Lite (base, anti-pattern reference) | gsm8k | 500 | 0.014 (chat-completions endpoint loops on 4-shot prompt; do not use base for chat-completions eval) |
+
+V2 multi-host accuracy: _Pending — run on v6e-32 and PR back._
 
 ## 5. Troubleshooting
 

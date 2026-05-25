@@ -4,6 +4,8 @@ title: "Qwen-7B-Chat"
 
 # Qwen-7B-Chat on SGL-JAX
 
+> **Validated recipe** — empirically validated on TPU v6e-4 with sglang-jax `fe092bf` (2026-05-22).
+>
 > First-generation Qwen recipe. For Qwen3-8B / Qwen3-32B see [`Qwen3.md`](Qwen3.md).
 
 ## 1. Model Introduction
@@ -84,27 +86,7 @@ For full flag definitions and defaults see [`../base/launch-flags-reference.md`]
 
 ### 3.1 Basic Chat Completion
 
-```bash
-curl -X POST http://127.0.0.1:30000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen/Qwen-7B-Chat",
-    "messages": [{"role": "user", "content": "Hello"}]
-  }'
-```
-
-Python OpenAI client equivalent:
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
-
-resp = client.chat.completions.create(
-    model="Qwen/Qwen-7B-Chat",
-    messages=[{"role": "user", "content": "Hello"}],
-)
-print(resp.choices[0].message.content)
-```
+See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="Qwen/Qwen-7B-Chat"` with the §1 recommended sampling parameters.
 
 > Qwen-7B-Chat is a first-generation chat model without hybrid reasoning or native tool-calling formats. For reasoning / tool-call workloads use [Qwen3](Qwen3.md) or a later Qwen series.
 
@@ -133,7 +115,47 @@ python -m sgl_jax.bench_serving \
   --tokenizer Qwen/Qwen-7B-Chat
 ```
 
-**Test Results** — _Pending. Run the command above and PR back the full `============ Serving Benchmark Result ============` block from `bench_serving`._
+**Test Results**
+
+```text
+============ Serving Benchmark Result ============
+Backend:                                 sgl-jax
+Traffic request rate:                    inf
+Max request concurrency:                 8
+Successful requests:                     100
+Benchmark duration (s):                  15.30
+Total input tokens:                      51200
+Total input text tokens:                 51200
+Total generated tokens:                  12800
+Total generated tokens (retokenized):    11112
+Request throughput (req/s):              6.53
+Input token throughput (tok/s):          3345.64
+Output token throughput (tok/s):         836.41
+Peak output token throughput (tok/s):    941.00
+Peak concurrent requests:                16
+Total token throughput (tok/s):          4182.05
+Concurrency:                             7.76
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   1186.80
+Median E2E Latency (ms):                 1176.99
+P90 E2E Latency (ms):                    1200.73
+P99 E2E Latency (ms):                    1350.29
+---------------Time to First Token----------------
+Mean TTFT (ms):                          88.91
+Median TTFT (ms):                        91.86
+P99 TTFT (ms):                           208.40
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          8.64
+Median TPOT (ms):                        8.53
+P99 TPOT (ms):                           9.14
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           8.65
+Median ITL (ms):                         8.52
+P95 ITL (ms):                            8.64
+P99 ITL (ms):                            9.58
+Max ITL (ms):                            154.39
+==================================================
+```
 
 ### 4.2 Accuracy — GSM8K
 
@@ -144,7 +166,7 @@ python -m sgl_jax.bench_serving \
 | Hardware | TPU v6e-4 (single host, 4 chips) |
 | Model | Qwen/Qwen-7B-Chat (BF16) |
 | Tensor Parallelism | 4 |
-| Tested build | _Pending_ (run pre-dates pin convention) |
+| Tested build | sglang-jax `fe092bf` (2026-05-22) |
 
 **Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4).
 
@@ -165,7 +187,7 @@ evalscope eval \
 
 | Model | Dataset | Metric | Subset | Num | Score |
 |:---|:---|:---|:---|:---|:---|
-| Qwen-7B-Chat | gsm8k | AverageAccuracy | main | 500 | 0.504 |
+| Qwen-7B-Chat | gsm8k | AverageAccuracy | main | 500 | 0.484 |
 
 ## 5. Troubleshooting
 

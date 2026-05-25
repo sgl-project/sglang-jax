@@ -4,6 +4,8 @@ title: "MiMo-V2.5-Pro"
 
 # MiMo-V2.5-Pro on SGL-JAX
 
+> **Partially validated recipe** — AIME 2025 results are available for the TPU v7x-16 path. The speed matrix and current pinned-build rerun are still pending.
+
 ## 1. Model Introduction
 
 [**XiaomiMiMo/MiMo-V2.5-Pro**](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro) is Xiaomi's large-scale inference-centric Mixture-of-Experts model with hybrid attention and natively FP8-quantized weights, designed for long-context reasoning at production throughput. SGL-JAX serves it on TPU v6e and v7x with tensor + expert parallelism + sharded attention.
@@ -45,7 +47,7 @@ Install per [`../../get_started/install.md`](../../../get_started/install.md) an
 | TPU v5e / v5p / v6e (Trillium)  | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
 | TPU v7x (Ironwood)              | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
 
-The `jax0.8.1-rev1` image is what SGL-JAX's GKE / SkyPilot launchers use; pinning it keeps the JAX runtime in lockstep with the SGL-JAX `[tpu]` extras.
+The `jax0.8.1-rev1` image is what SGL-JAX's GKE launcher and advanced SkyPilot path use; pinning it keeps the JAX runtime in lockstep with the SGL-JAX `[tpu]` extras.
 
 Extra pip for accuracy benchmarking only:
 
@@ -57,7 +59,7 @@ pip install evalscope==0.17.1
 
 MiMo-V2.5-Pro is multi-host only. Run the same command on every node; only `${NODE_RANK}` and `${MASTER_ADDR}` vary across nodes.
 
-#### Multi-host (GKE 或 SkyPilot) — TPU v7x-16 (4 nodes, `2x2x4`)
+#### Multi-host (GKE Indexed Job) — TPU v7x-16 (4 nodes, `2x2x4`)
 
 ```bash
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
@@ -220,9 +222,9 @@ kubectl wait --for=condition=Ready pod -l job-name=mimo-v2-5-pro --timeout=600s
 
 The server is ready once `mimo-v2-5-pro-0` logs `Uvicorn running on http://0.0.0.0:30000`. For v6e-64, swap topology to `4x4x4`, parallelism/completions to 16, and use the v6e-64 launch flags from above.
 
-##### Launcher: SkyPilot
+##### Alternative: SkyPilot
 
-Adapt [`../deployment/skypilot.md`](../../deployment/skypilot.md) with `tpu-v7x-16` or `tpu-v6e-64` accelerator. `${NODE_RANK}` comes from `${SKYPILOT_NODE_RANK}`.
+The default SkyPilot template is v6e-only today. For temporary v6e-64 experiments, advanced users can adapt [`../deployment/skypilot.md`](../../deployment/skypilot.md) with the v6e-64 launch flags above. Use GKE for the v7x-16 path unless you maintain a custom v7x SkyPilot template.
 
 ### 2.4 Configuration Tips
 
@@ -266,27 +268,7 @@ For full flag definitions and defaults see [`../base/launch-flags-reference.md`]
 
 ### 3.1 Basic Chat Completion
 
-```bash
-curl -X POST http://<rank0-ip>:30000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "XiaomiMiMo/MiMo-V2.5-Pro",
-    "messages": [{"role": "user", "content": "Prove that sqrt(2) is irrational."}]
-  }'
-```
-
-Python OpenAI client equivalent:
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://<rank0-ip>:30000/v1", api_key="EMPTY")
-
-resp = client.chat.completions.create(
-    model="XiaomiMiMo/MiMo-V2.5-Pro",
-    messages=[{"role": "user", "content": "Prove that sqrt(2) is irrational."}],
-)
-print(resp.choices[0].message.content)
-```
+See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="XiaomiMiMo/MiMo-V2.5-Pro"` and replace `127.0.0.1` with your rank-0 internal IP, with the §1 recommended sampling parameters; for thinking + content streaming see §3.2, for tool calling see §3.3.
 
 ### 3.2 Reasoning (thinking-on default, thinking-off optional)
 
@@ -531,7 +513,7 @@ This recipe targets the **full 3×3 scenario × concurrency matrix** as the comm
 
 **Test Environment** — same hardware/parallelism as §4.2, but **do not** set `--reasoning-parser mimo` for throughput benchmarks (the parser adds per-token CPU work that distorts raw token rates).
 
-**Deployment Command** — same as [§2.3 Multi-host (v7x)](#multi-host-gke-或-skypilot--tpu-v7x-16-4-nodes-2x2x4), without `--reasoning-parser`.
+**Deployment Command** — same as [§2.3 Multi-host (v7x)](#multi-host-gke-indexed-job--tpu-v7x-16-4-nodes-2x2x4), without `--reasoning-parser`.
 
 **Benchmark Command template**
 
@@ -572,7 +554,7 @@ Fill `<ISL>` / `<OSL>` from the scenario table, and `<N>` / `<C>` from the concu
 | Reasoning Parser | `mimo` |
 | Tested build | _Pending_ (run pre-dates pin convention) |
 
-**Deployment Command** — same as [§2.3 Multi-host (v7x)](#multi-host-gke-或-skypilot--tpu-v7x-16-4-nodes-2x2x4), plus `--reasoning-parser mimo`.
+**Deployment Command** — same as [§2.3 Multi-host (v7x)](#multi-host-gke-indexed-job--tpu-v7x-16-4-nodes-2x2x4), plus `--reasoning-parser mimo`.
 
 **Benchmark Command**
 
@@ -614,5 +596,6 @@ evalscope eval \
 - [`MiMo-V2-Flash.md`](MiMo-V2-Flash.md) — smaller sibling, same architectural family, has measured MoE backend comparison.
 - [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md)
 - [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
-- [`../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) / [`../deployment/skypilot.md`](../../deployment/skypilot.md)
+- [`../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) — primary multi-host launcher.
+- [`../deployment/skypilot.md`](../../deployment/skypilot.md) — advanced v6e experiment alternative.
 - [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

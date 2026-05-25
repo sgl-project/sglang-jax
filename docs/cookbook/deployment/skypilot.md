@@ -4,7 +4,7 @@ title: "SkyPilot"
 
 # SkyPilot Multi-Node TPU Launcher
 
-Generic SkyPilot recipe for provisioning a multi-node TPU cluster and launching `sgl_jax.launch_server` on it. Cookbook recipes that use SkyPilot ([Grok-2](../autoregressive/Grok/Grok2.md), and any future multi-node dense / MoE recipe) reference this page instead of duplicating the workflow.
+Advanced SkyPilot recipe for provisioning a multi-node v6e TPU cluster and launching `sgl_jax.launch_server` on it. Model cookbooks use [GKE Indexed Job](gke-indexed-job.md) as the primary multi-host path; use this page only when you already operate SkyPilot or need temporary v6e experiments.
 
 ## Prerequisites
 
@@ -40,7 +40,7 @@ The resolved cluster name is written to `.cluster_name` at the repo root, which 
 
 ### Generation support
 
-`scripts/tpu_resource.sky.yaml` pins `runtime_version: v2-alpha-tpuv6e`, which is **v6e-only**. To use v5e / v5p / v7x you have to fork the template (or pass an alternative resource block via `sky launch` directly) and pick the matching TPU runtime version. The v7x recipes in the cookbook use the GKE path instead — see [MiMo-V2.5-Pro §4.4](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md#44-gke-indexed-job--headless-service).
+`scripts/tpu_resource.sky.yaml` pins `runtime_version: v2-alpha-tpuv6e`, which is **v6e-only**. To use v5e / v5p / v7x you have to fork the template (or pass an alternative resource block via `sky launch` directly) and pick the matching TPU runtime version. The v7x recipes in the cookbook use the GKE path instead — see [MiMo-V2.5-Pro §2.3](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md#23-launch).
 
 ## The cluster template
 

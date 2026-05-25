@@ -74,9 +74,9 @@ For full flag definitions see [`../../base/launch-flags-reference.md`](../../bas
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#31-basic-chat-completion) for the curl / Python pattern. Substitute `model="meta-llama/Llama-3.1-8B-Instruct"` (or your chosen variant).
+See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="meta-llama/Llama-3.1-8B-Instruct"` (or your chosen variant) with the §1 recommended sampling parameters.
 
-> Llama 3 Instruct does not ship with native hybrid reasoning or a built-in tool-call format. For reasoning / tool-call workloads use a model with `--reasoning-parser` / `--tool-call-parser` support (see [`Qwen3.md` §3.2 / §3.3](../Qwen/Qwen3.md) or [`MiMo-V2.5-Pro.md`](../Xiaomi/MiMo-V2.5-Pro.md)).
+> Llama 3 Instruct is non-reasoning and has no native tool-call format. For those workloads choose a model with `--reasoning-parser` / `--tool-call-parser` support (e.g., [Qwen3](../Qwen/Qwen3.md), [MiMo-V2.5-Pro](../Xiaomi/MiMo-V2.5-Pro.md)).
 
 ## 4. Benchmark
 

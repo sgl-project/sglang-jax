@@ -10,8 +10,9 @@ End-to-end serving recipes for text-only autoregressive LLMs on SGL-JAX, organiz
 
 | Emoji | Meaning |
 |---|---|
-| ✅ | **Validated** — empirically tuned on hardware with reference benchmark numbers in §4 |
-| 🚧 | **Starter** — launch command derived from HF model card; not yet measured. PR back tested numbers to upgrade to ✅ |
+| ✅ | **Validated** — primary model / hardware path empirically tuned with reference benchmark numbers in §4 |
+| 🧪 | **Partially validated** — at least one variant / hardware path has real benchmark output; other variants, matrix cells, or current-build reruns are still pending |
+| 🚧 | **Starter** — launch command derived from HF model card; not yet measured. PR back tested numbers to upgrade to 🧪 or ✅ |
 | 📝 | **Planned** — architecture supported by the runtime but no recipe yet |
 
 ## Recipes by vendor
@@ -20,7 +21,7 @@ End-to-end serving recipes for text-only autoregressive LLMs on SGL-JAX, organiz
 
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
-| 🚧 | DeepSeek-V2 / V2-Lite | [`DeepSeek/DeepSeek-V2.md`](DeepSeek/DeepSeek-V2.md) | v6e-4 (Lite) / v6e-32 (V2) | MoE + MLA |
+| 🧪 | DeepSeek-V2 / V2-Lite | [`DeepSeek/DeepSeek-V2.md`](DeepSeek/DeepSeek-V2.md) | v6e-4 (Lite) / v6e-32 (V2) | MoE + MLA |
 | 🚧 | DeepSeek-V3 | [`DeepSeek/DeepSeek-V3.md`](DeepSeek/DeepSeek-V3.md) | v6e-64 / v7x-16 | MoE + MLA |
 | 🚧 | DeepSeek-R1 | [`DeepSeek/DeepSeek-R1.md`](DeepSeek/DeepSeek-R1.md) | v6e-64 / v7x-16 | MoE + MLA + reasoning (`deepseek-r1`) |
 
@@ -29,7 +30,7 @@ End-to-end serving recipes for text-only autoregressive LLMs on SGL-JAX, organiz
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
 | 🚧 | GLM-4.5 / GLM-4.5-Air | [`GLM/GLM-4.5.md`](GLM/GLM-4.5.md) | v6e-32 / v6e-64 | MoE + reasoning/tool (`glm45`) |
-| 📝 | GLM-5 | [`GLM/GLM-5.md`](GLM/GLM-5.md) (placeholder pending release) | _Pending_ | MoE (+ DSA variant) + tool (`glm47`) |
+| 📝 | GLM-5 | _planned; placeholder kept out of public navigation until model details are public_ | _Pending_ | MoE (+ DSA variant) + tool (`glm47`) |
 
 ### Google — `Google/`
 
@@ -41,15 +42,14 @@ End-to-end serving recipes for text-only autoregressive LLMs on SGL-JAX, organiz
 
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
-| ✅ | Grok-2 | [`Grok/Grok2.md`](Grok/Grok2.md) | v6e-32 | dense |
+| 🚧 | Grok-1 (314B MoE / 86B active, base) | [`Grok/Grok1.md`](Grok/Grok1.md) | v6e-32 | MoE |
+| 🚧 | Grok-2 | [`Grok/Grok2.md`](Grok/Grok2.md) | v6e-32 | dense |
 
 ### InclusionAI — `InclusionAI/`
 
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
-| 🚧 | Ling 1.x (lite / plus / Coder-lite) | [`InclusionAI/Ling-1.x.md`](InclusionAI/Ling-1.x.md) | v6e-4 / v6e-32 | MoE |
-| 🚧 | Ling 2.0 (mini / flash / 1T) | [`InclusionAI/Ling-2.md`](InclusionAI/Ling-2.md) | v6e-4 / v6e-16 / v6e-64 | MoE (1/32 sparsity + MTP) |
-| 🚧 | Ring 2.0 (mini / flash / 1T-preview) | [`InclusionAI/Ring-2.md`](InclusionAI/Ring-2.md) | v6e-4 / v6e-16 / v6e-64 | MoE + reasoning |
+| 🚧 | Ling / Ring 2.5 (1T) | [`InclusionAI/Ling2.5.md`](InclusionAI/Ling2.5.md) | v6e-64 / v7x-16 candidate | MoE + hybrid linear attn |
 | 🚧 | Ling 2.6 (1T / flash) | [`InclusionAI/Ling-2.6.md`](InclusionAI/Ling-2.6.md) | v6e-64 / v7x-16 | MoE + linear attn |
 
 ### Llama — `Llama/`
@@ -63,14 +63,14 @@ End-to-end serving recipes for text-only autoregressive LLMs on SGL-JAX, organiz
 
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
-| 🚧 | Kimi-Linear (48B-A3B) | [`Moonshotai/Kimi-Linear.md`](Moonshotai/Kimi-Linear.md) | v6e-16 | dense + linear attn |
+| ✅ | Kimi-Linear (48B-A3B) | [`Moonshotai/Kimi-Linear.md`](Moonshotai/Kimi-Linear.md) | v6e-16 | dense + linear attn |
 
 ### Qwen — `Qwen/`
 
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
 | ✅ | Qwen-7B-Chat | [`Qwen/Qwen.md`](Qwen/Qwen.md) | v6e-4 | dense |
-| ✅ | Qwen3-8B / Qwen3-32B | [`Qwen/Qwen3.md`](Qwen/Qwen3.md) | v6e-4 | dense + reasoning (`qwen3`) + tool (`qwen25`) |
+| 🧪 | Qwen3-8B / Qwen3-32B | [`Qwen/Qwen3.md`](Qwen/Qwen3.md) | v6e-4 | dense + reasoning (`qwen3`) + tool (`qwen25`) |
 | 🚧 | Qwen3-MoE (30B-A3B / 235B-A22B) | [`Qwen/Qwen3-MoE.md`](Qwen/Qwen3-MoE.md) | v6e-16 / v6e-64 | MoE + reasoning (`qwen3`) + tool (`qwen25`) |
 | 📝 | Qwen2 / Qwen2-MoE | _no recipe — same family runtime path_ | — | dense / MoE |
 
@@ -78,18 +78,18 @@ End-to-end serving recipes for text-only autoregressive LLMs on SGL-JAX, organiz
 
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
-| ✅ | MiMo-V2-Flash | [`Xiaomi/MiMo-V2-Flash.md`](Xiaomi/MiMo-V2-Flash.md) | v7x-8 or v6e-16 | MoE + reasoning/tool (`mimo`) |
-| ✅ | MiMo-V2.5-Pro | [`Xiaomi/MiMo-V2.5-Pro.md`](Xiaomi/MiMo-V2.5-Pro.md) | v7x-16 or v6e-64 | MoE + reasoning/tool (`mimo`) |
-| 🚧 | MiMo-7B | [`Xiaomi/MiMo-7B.md`](Xiaomi/MiMo-7B.md) | v6e-4 | dense + reasoning/tool (`mimo`) |
+| 🧪 | MiMo-V2-Flash | [`Xiaomi/MiMo-V2-Flash.md`](Xiaomi/MiMo-V2-Flash.md) | v7x-8 or v6e-16 | MoE + reasoning/tool (`mimo`) |
+| 🧪 | MiMo-V2.5-Pro | [`Xiaomi/MiMo-V2.5-Pro.md`](Xiaomi/MiMo-V2.5-Pro.md) | v7x-16 or v6e-64 | MoE + reasoning/tool (`mimo`) |
+| 🧪 | MiMo-7B | [`Xiaomi/MiMo-7B.md`](Xiaomi/MiMo-7B.md) | v6e-4 | dense + reasoning/tool (`mimo`) |
 
-> Upgrade path: 🚧 → ✅ requires real `evalscope` (accuracy) or `bench_serving` (throughput) output in §4, structured as **Test Environment → Deployment Command → Benchmark Command → Test Results**. See [`Xiaomi/MiMo-V2-Flash.md` §4](Xiaomi/MiMo-V2-Flash.md#4-benchmark) for the canonical four-section form.
+> Upgrade path: 🚧 → 🧪 requires real `evalscope` (accuracy) or `bench_serving` (throughput) output for at least one variant / hardware path. 🧪 → ✅ requires the recipe's claimed primary path to have complete **Test Environment → Deployment Command → Benchmark Command → Test Results** evidence without unresolved required cells. See [`Xiaomi/MiMo-V2-Flash.md` §4](Xiaomi/MiMo-V2-Flash.md#4-benchmark) for the canonical four-section form.
 
 ## What "autoregressive" means here
 
 A model that generates text one token at a time, conditioning on its own previous outputs. Includes:
 
 - **Dense LLMs** — Qwen / Qwen3 / Llama / Gemma 2 / MiMo-7B / Grok-2.
-- **MoE LLMs** — Qwen3-MoE / DeepSeek V2/V3/R1 / GLM-4.5 / GLM-5 / Ling 1.x / Ling 2.0 / Ring 2.0 / Ling 2.6 / MiMo-V2-Flash / MiMo-V2.5-Pro / Kimi-Linear.
+- **MoE LLMs** — Qwen3-MoE / DeepSeek V2/V3/R1 / GLM-4.5 / GLM-5 / Ling 2.5 / Ring 2.5 / Ling 2.6 / MiMo-V2-Flash / MiMo-V2.5-Pro / Kimi-Linear.
 
 Diffusion / TTS / VLM models live in [`../multimodal/`](../multimodal/index.md).
 
@@ -98,12 +98,12 @@ Diffusion / TTS / VLM models live in [`../multimodal/`](../multimodal/index.md).
 | Goal | Clone from |
 |---|---|
 | Single-host dense model | [`Qwen/Qwen.md`](Qwen/Qwen.md) ✅ or [`Llama/Llama3.1.md`](Llama/Llama3.1.md) 🚧 |
-| Dense model with benchmark comparison | [`Qwen/Qwen3.md`](Qwen/Qwen3.md) ✅ |
-| Single-host MoE with backend choice | [`Xiaomi/MiMo-V2-Flash.md`](Xiaomi/MiMo-V2-Flash.md) ✅ |
-| Large multi-node MoE with GKE manifest | [`Xiaomi/MiMo-V2.5-Pro.md`](Xiaomi/MiMo-V2.5-Pro.md) ✅ |
-| SkyPilot multi-node dense | [`Grok/Grok2.md`](Grok/Grok2.md) ✅ (+ [`../deployment/skypilot.md`](../deployment/skypilot.md)) |
-| Linear-attention model with recurrent state | [`InclusionAI/Ling-2.6.md`](InclusionAI/Ling-2.6.md) 🚧 or [`Moonshotai/Kimi-Linear.md`](Moonshotai/Kimi-Linear.md) 🚧 |
-| Reasoning model (RL-tuned, `<think>` blocks) | [`InclusionAI/Ring-2.md`](InclusionAI/Ring-2.md) 🚧 or [`DeepSeek/DeepSeek-R1.md`](DeepSeek/DeepSeek-R1.md) 🚧 |
+| Dense model with benchmark comparison | [`Qwen/Qwen3.md`](Qwen/Qwen3.md) 🧪 |
+| Single-host MoE with backend choice | [`Xiaomi/MiMo-V2-Flash.md`](Xiaomi/MiMo-V2-Flash.md) 🧪 |
+| Large multi-node MoE with GKE manifest | [`Xiaomi/MiMo-V2.5-Pro.md`](Xiaomi/MiMo-V2.5-Pro.md) 🧪 |
+| Multi-node dense | [`Grok/Grok2.md`](Grok/Grok2.md) 🚧 (+ [`../deployment/gke-indexed-job.md`](../deployment/gke-indexed-job.md)) |
+| Linear-attention model with recurrent state | [`Moonshotai/Kimi-Linear.md`](Moonshotai/Kimi-Linear.md) ✅ or [`InclusionAI/Ling-2.6.md`](InclusionAI/Ling-2.6.md) 🚧 |
+| Reasoning model (RL-tuned, `<think>` blocks) | [`InclusionAI/Ling2.5.md`](InclusionAI/Ling2.5.md) 🚧 (Ring-2.5) or [`DeepSeek/DeepSeek-R1.md`](DeepSeek/DeepSeek-R1.md) 🚧 |
 
 ## Parser key reference
 
@@ -111,17 +111,17 @@ Reasoning models that emit `<think>` blocks need `--reasoning-parser <key>` at l
 
 | Parser key | Reasoning | Tool-call | Where used in cookbook |
 |---|---|---|---|
-| `deepseek-r1` | ✓ (`<think>...</think>`) | — | [DeepSeek-R1](DeepSeek/DeepSeek-R1.md), Ring 2.0 / Ling 2.6 reasoning variants (use as `<think>` parser) |
+| `deepseek-r1` | ✓ (`<think>...</think>`) | — | [DeepSeek-R1](DeepSeek/DeepSeek-R1.md), Ring 2.5 / Ling 2.6 reasoning variants (use as `<think>` parser) |
 | `qwen3` | ✓ (`<think>...</think>` + `enable_thinking` switch) | — | [Qwen3](Qwen/Qwen3.md), [Qwen3-MoE](Qwen/Qwen3-MoE.md) |
 | `qwen25` | — | ✓ | Qwen3 / Qwen3-MoE tool-calling |
 | `qwen3_coder` | — | ✓ | Qwen3-Coder variants |
 | `mimo` | ✓ (alias of `qwen3` parser) | ✓ | [MiMo-V2-Flash](Xiaomi/MiMo-V2-Flash.md), [MiMo-V2.5-Pro](Xiaomi/MiMo-V2.5-Pro.md), [MiMo-7B](Xiaomi/MiMo-7B.md) |
 | `glm45` | ✓ (`<think>...</think>`) | ✓ | [GLM-4.5 / 4.5-Air](GLM/GLM-4.5.md) |
-| `glm47` | — | ✓ | [GLM-5](GLM/GLM-5.md) tool-calling |
+| `glm47` | — | ✓ | GLM-5 planned tool-calling variants |
 | `kimi` | ✓ (`◁think▷...◁/think▷`) | — | Reserved for Kimi reasoning variants; Kimi-Linear-Instruct is not reasoning |
 
 Run `python -m sgl_jax.launch_server --help` against your checkout to see the full registered set — these keys are the cookbook-relevant subset.
 
 ## Architecture coverage vs codebase
 
-This index lists models with a recipe (✅ / 🚧) plus models the runtime supports but where no curated recipe exists yet (📝). 📝 entries are still served correctly by the runtime — they just don't have a deployment guide.
+This index lists models with a recipe (✅ / 🧪 / 🚧) plus models the runtime supports but where no curated recipe exists yet (📝). 📝 entries are still served correctly by the runtime — they just don't have a deployment guide.

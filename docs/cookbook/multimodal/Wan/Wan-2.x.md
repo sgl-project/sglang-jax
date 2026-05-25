@@ -13,8 +13,8 @@ title: "Wan 2.x T2V"
 **Variants** (pick by size and noise-stage architecture):
 
 - [**Wan-AI/Wan2.1-T2V-1.3B-Diffusers**](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) — 1.3B; comfortable single-host fit on v6e-4. Default starter target.
-- [**Wan-AI/Wan2.1-T2V-14B-Diffusers**](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers) — 14B; single-host on v6e-4 with reduced batch, or v6e-8 for headroom.
-- [**Wan-AI/Wan2.2-T2V-A14B-Diffusers**](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers) — 14B "MoE-style" dual-transformer (high-noise + low-noise experts run at different denoising stages); needs more HBM than the 2.1-14B for the second transformer.
+- [**Wan-AI/Wan2.1-T2V-14B-Diffusers**](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers) — 14B; current starter path runs on one v6e-4 host with `--tp-size 2`.
+- [**Wan-AI/Wan2.2-T2V-A14B-Diffusers**](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers) — 14B "MoE-style" dual-transformer (high-noise + low-noise experts run at different denoising stages); current starter path runs on one v6e-4 host with `--tp-size 1`.
 
 **Architectural notes**:
 
@@ -34,13 +34,12 @@ title: "Wan 2.x T2V"
 
 ### 2.1 Hardware Matrix (starter targets)
 
-| Tier | Model | TPU | Topology | Chips | `--tp-size` | Notes |
-|---|---|---|---|---|---|---|
-| Minimum runnable | Wan 2.1 1.3B | v6e-4 | 2x2 | 4 | 4 | Smallest model; text encoder + DiT + VAE fit comfortably |
-| Recommended production | Wan 2.1 14B | v6e-4 | 2x2 | 4 | 4 | Fits with `--mem-fraction-static 0.85`; lower `--precompile-width-heights` count to keep cache size manageable |
-| Recommended production | Wan 2.2 A14B | v6e-8 | 2x4 | 8 | 8 | Dual transformers ≈ 2× DiT HBM vs Wan 2.1 14B; v6e-8 leaves headroom |
+| Tier | Model | TPU | Topology | `--tp-size` | Notes |
+|---|---|---|---|---|---|
+| Starter target | Wan 2.1 1.3B / 14B | v6e-4 | 2x2 | 2 | Current built-in staging uses part of the host for text encoding and the rest for video stages |
+| Starter target | Wan 2.2 A14B | v6e-4 | 2x2 | 1 | Current built-in staging uses CPU text encoding and a fixed TPU split for video stages |
 
-> Wan 2.x runs as three SGL-JAX stages (text encoder + DiT + VAE). The bundled stage YAMLs already pin `runtime.num_tpus` per stage — the starter command does not need a custom stage config.
+> Wan 2.x runs through SGL-JAX's built-in staged multimodal runtime. Use the `--tp-size` shown for the model; moving to a larger TPU host or slice does not automatically make every stage use more devices.
 
 See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
@@ -64,7 +63,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
   --multimodal \
   --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers \
   --trust-remote-code \
-  --tp-size 4 \
+  --tp-size 2 \
   --device tpu \
   --dtype bfloat16 \
   --mem-fraction-static 0.85 \
@@ -75,16 +74,16 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
   --host 0.0.0.0 --port 30000
 ```
 
-Swap `--model-path` to `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` for the smaller variant (raise `--mem-fraction-static` to 0.88) or `Wan-AI/Wan2.2-T2V-A14B-Diffusers` for the dual-transformer variant (lower to 0.8 on v6e-4, or use v6e-8 below).
+Swap `--model-path` to `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` for the smaller Wan 2.1 variant. Do not use this command for Wan 2.2 because its text encoder runs on CPU and the stage layout is different.
 
-#### Single-host (Docker) — TPU v6e-8 (Wan 2.2 A14B, recommended)
+#### Single-host (Docker) — TPU v6e-4 (Wan 2.2 A14B)
 
 ```bash
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
   --multimodal \
   --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
   --trust-remote-code \
-  --tp-size 8 \
+  --tp-size 1 \
   --device tpu \
   --dtype bfloat16 \
   --mem-fraction-static 0.88 \
@@ -110,10 +109,14 @@ VAE tiling is enabled by default in the multimodal server (`vae_tiling=True` in 
 - `--precompile-frame-paddings 41` precompiles the 41-frame bucket; add additional values (e.g. `--precompile-frame-paddings 41 81`) if you serve multiple `num_frames` values.
 - Default is `[1]`, which is **only correct for image generation** — T2V workloads must include the actual frame counts they serve, otherwise the first video request stalls on per-frame-count JIT compilation.
 
+**Built-in multimodal staging:**
+- Wan 2.1 and Wan 2.2 use different SGL-JAX staged runtime paths, so their `--tp-size` values differ even when both run on v6e-4.
+- Do not scale Wan by changing only `--tp-size`. Larger TPU slices require SGL-JAX support for a matching staged runtime path.
+
 **VAE Precision and Tiling:**
 - `--vae-precision bf16` is the default for TPU; `fp16` is unsupported on TPU and `fp32` doubles VAE memory with no quality benefit for these checkpoints.
 - **VAE tiling is always on** — `MultimodalServerArgs.vae_tiling` defaults to `True` and there is no CLI toggle to disable it today (no `--no-vae-tiling` flag exists). The server always decodes VAE output in spatial tiles, which keeps peak HBM bounded for high-resolution / long-frame outputs at a small latency cost. Disabling would require source-code patching.
-- `--vae-sp` enables VAE spatial parallelism across `--tp-size` devices — useful only when VAE is the bottleneck (rarely; the DiT dominates).
+- `--vae-sp` should be considered only after validating that the chosen Wan path can actually use VAE spatial parallelism; it is not a generic way to make all stages use a larger TPU slice.
 
 **Text Encoder Precision:**
 - `--text-encoder-precisions fp32` (default) for UMT5 — text encoder is small, fp32 keeps prompt embedding quality high.
@@ -121,7 +124,7 @@ VAE tiling is enabled by default in the multimodal server (`vae_tiling=True` in 
 
 **Memory Management:**
 - `--mem-fraction-static 0.85` on Wan 2.1 14B (v6e-4) leaves room for the DiT activation cache and VAE intermediates.
-- Wan 2.2 A14B's dual transformer **doubles** the DiT weight footprint vs Wan 2.1 14B — use v6e-8 or accept lower `--mem-fraction-static 0.8` on v6e-4.
+- Wan 2.2 A14B's dual transformer **doubles** the DiT weight footprint vs Wan 2.1 14B. Moving to v6e-8 does not help automatically unless SGL-JAX has a matching larger-stage placement for that path.
 
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min **per (resolution × frame-count) bucket** while XLA/Pallas compiles the DiT and VAE kernels.
@@ -246,7 +249,7 @@ Video generation quality is typically evaluated subjectively (FVD, motion smooth
 | First request blocks ~4 min on every new resolution | Resolution not in `--precompile-width-heights` | Add the size you serve (`WIDTH*HEIGHT`) to `--precompile-width-heights` and relaunch; subsequent requests at that size will be cache hits. |
 | First request blocks ~4 min on every new frame count | Frame count not in `--precompile-frame-paddings` | Add the frame count to `--precompile-frame-paddings` and relaunch. |
 | OOM during VAE decode at high resolution | Full VAE decode too large for HBM despite tiling | Lower the request `size` or split the request; VAE tiling is already on by default. Tile size is not currently CLI-tunable — patch the source if you need to shrink tiles further. |
-| Wan 2.2 A14B OOM at startup on v6e-4 | Dual transformer doubles DiT footprint | Move to v6e-8, or lower `--mem-fraction-static` to 0.8 on v6e-4 (accept lower concurrency). |
+| Wan 2.2 A14B OOM at startup on v6e-4 | Dual transformer doubles the DiT footprint | Lower `--mem-fraction-static` first. Moving to v6e-8 only helps after SGL-JAX provides a matching larger-stage placement. |
 | Video response `path` not accessible to client | Server-written file lives on TPU host only | Mount a shared output volume (`-v /shared/videos:/tmp/sglang-jax-videos` in `docker run`) and serve via a separate file server, or stream the file back from the TPU host. |
 | Slow throughput at moderate concurrency | DiT is the bottleneck; concurrency doesn't help if each step saturates compute | Lower request `num_inference_steps` to trade quality for throughput; the DiT stage cannot batch arbitrary concurrent requests at this scale. |
 

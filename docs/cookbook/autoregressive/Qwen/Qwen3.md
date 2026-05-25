@@ -4,6 +4,8 @@ title: "Qwen3"
 
 # Qwen3-8B / Qwen3-32B on SGL-JAX
 
+> **Partially validated recipe** — Qwen3-8B has TPU v6e-4 GSM8K results on sglang-jax `fe092bf` (2026-05-23). The speed matrix covers Qwen3-8B / Qwen3-32B on an older build; Qwen3-32B accuracy and current-build speed reruns are still pending.
+
 ## 1. Model Introduction
 
 [**Qwen/Qwen3-8B**](https://huggingface.co/Qwen/Qwen3-8B) (8B) and [**Qwen/Qwen3-32B**](https://huggingface.co/Qwen/Qwen3-32B) (32B) are Alibaba's dense decoder LLMs from the Qwen3 series — strong general-purpose models with hybrid reasoning support, deployable on a single TPU v6e-4 host. SGL-JAX serves both with tensor parallelism. For the Qwen3 MoE variants (30B-A3B / 235B-A22B) see [`Qwen3-MoE.md`](Qwen3-MoE.md).
@@ -95,27 +97,7 @@ For full flag definitions and defaults see [`../base/launch-flags-reference.md`]
 
 ### 3.1 Basic Chat Completion
 
-```bash
-curl -X POST http://127.0.0.1:30000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen/Qwen3-8B",
-    "messages": [{"role": "user", "content": "Explain mixture-of-experts in 2 sentences."}]
-  }'
-```
-
-Python OpenAI client equivalent:
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
-
-resp = client.chat.completions.create(
-    model="Qwen/Qwen3-8B",
-    messages=[{"role": "user", "content": "Explain mixture-of-experts in 2 sentences."}],
-)
-print(resp.choices[0].message.content)
-```
+See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="Qwen/Qwen3-8B"` (or `Qwen/Qwen3-32B`) with the §1 recommended sampling parameters; for thinking + content streaming see §3.2, for tool calling see §3.3.
 
 ### 3.2 Reasoning (thinking-on default, thinking-off optional)
 
@@ -407,9 +389,40 @@ Qwen3-32B:
 
 SGL-JAX wins consistently on this hardware across all measured cells: ~1.5–2.2× output throughput, ~1.4–2.0× faster TTFT, ~1.6–2.4× lower ITL.
 
-### 4.2 Accuracy
+### 4.2 Accuracy — GSM8K (thinking-on)
 
-_Not measured in this benchmark run._ Run `evalscope` against the launched server using the four-section pattern from [`Qwen.md` §4.2](Qwen.md#42-accuracy--gsm8k) (Test Environment → Deployment Command → Benchmark Command → Test Results) if you need accuracy numbers.
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-4 (single host, 4 chips) |
+| Model | Qwen/Qwen3-8B (BF16) |
+| Tensor Parallelism | 4 |
+| Tested build | sglang-jax `fe092bf` (2026-05-23) |
+
+**Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4).
+
+**Benchmark Command**
+
+```bash
+evalscope eval \
+  --model Qwen/Qwen3-8B \
+  --api-url http://127.0.0.1:30000/v1/chat/completions \
+  --api-key EMPTY \
+  --eval-type service \
+  --datasets gsm8k \
+  --eval-batch-size 8 \
+  --limit 500 \
+  --generation-config '{"chat_template_kwargs": {"enable_thinking": true}, "temperature": 0.7, "top_p": 0.95, "max_tokens": 4096}'
+```
+
+**Test Results**
+
+| Model | Dataset | Metric | Subset | Num | Score |
+|:---|:---|:---|:---|:---|:---|
+| Qwen3-8B | gsm8k | AverageAccuracy | main | 500 | 0.944 |
+
+> Run **with thinking-on** for full reasoning capacity. Thinking-off would yield lower accuracy but ~10× faster wall-clock per question.
 
 ## 5. Troubleshooting
 

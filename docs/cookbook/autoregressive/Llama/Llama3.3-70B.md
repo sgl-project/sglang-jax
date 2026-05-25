@@ -29,7 +29,7 @@ See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.m
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.md`](../../../get_started/install.md). Multi-host required — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) or [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
+Install per [`../../../get_started/install.md`](../../../get_started/install.md). Multi-host required — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -38,21 +38,11 @@ Install per [`../../../get_started/install.md`](../../../get_started/install.md)
 
 ### 2.3 Launch
 
-#### Multi-host (SkyPilot) — TPU v6e-32
+#### Multi-host (GKE Indexed Job) — TPU v6e-32
 
-**Step 1** — provision the cluster:
-
-```bash
-cd ${WORKSPACE_DIR}/sglang-jax
-bash scripts/launch_tpu.sh tpu-v6e-32 main
-```
-
-**Step 2** — launch the server (one `sky exec` fans out to all 8 nodes):
+Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) with `<JOB>=llama-70b`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8`, and `completions: 8`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
 ```bash
-CLUSTER_NAME=$(cat .cluster_name)
-sky exec ${CLUSTER_NAME} -- "cd sglang-jax && source .venv/bin/activate && \
-  JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
   --model-path meta-llama/Llama-3.3-70B-Instruct \
   --trust-remote-code \
   --tp-size 32 \
@@ -62,13 +52,10 @@ sky exec ${CLUSTER_NAME} -- "cd sglang-jax && source .venv/bin/activate && \
   --chunked-prefill-size 2048 \
   --page-size 128 \
   --max-running-requests 256 \
-  --skip-server-warmup \
-  --dist-init-addr <NODE_0_IP_ADDRESS>:5000 \
-  --nnodes 8 --node-rank \${SKYPILOT_NODE_RANK} \
-  --host 0.0.0.0 --port 30000"
+  --skip-server-warmup
 ```
 
-For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.md` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.md#23-launch) with `<JOB>=llama-70b`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8` / `completions: 8`, and the launch flags above.
+For temporary v6e experiments, advanced users can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
 ### 2.4 Configuration Tips
 
@@ -90,9 +77,9 @@ For full flag definitions see [`../../base/launch-flags-reference.md`](../../bas
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#31-basic-chat-completion). Substitute `model="meta-llama/Llama-3.3-70B-Instruct"`.
+See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="meta-llama/Llama-3.3-70B-Instruct"` with the §1 recommended sampling parameters.
 
-> Llama 3 Instruct does not ship with native hybrid reasoning or a built-in tool-call format. For reasoning / tool-call workloads use a model with `--reasoning-parser` / `--tool-call-parser` support (see [`Qwen3.md` §3.2 / §3.3](../Qwen/Qwen3.md) or [`MiMo-V2.5-Pro.md`](../Xiaomi/MiMo-V2.5-Pro.md)).
+> Llama 3 Instruct is non-reasoning and has no native tool-call format. For those workloads choose a model with `--reasoning-parser` / `--tool-call-parser` support (e.g., [Qwen3](../Qwen/Qwen3.md), [MiMo-V2.5-Pro](../Xiaomi/MiMo-V2.5-Pro.md)).
 
 ## 4. Benchmark
 
@@ -117,7 +104,7 @@ Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#3
 | Tensor Parallelism | 32 |
 | Tested build | _Pending_ |
 
-**Deployment Command** — same as [§2.3](#multi-host-skypilot--tpu-v6e-32).
+**Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-32).
 
 **Benchmark Command** — example for GSM8K:
 

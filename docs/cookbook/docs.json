@@ -52,8 +52,7 @@
                   {
                     "group": "GLM",
                     "pages": [
-                      "autoregressive/GLM/GLM-4.5",
-                      "autoregressive/GLM/GLM-5"
+                      "autoregressive/GLM/GLM-4.5"
                     ]
                   },
                   {
@@ -65,15 +64,14 @@
                   {
                     "group": "Grok",
                     "pages": [
+                      "autoregressive/Grok/Grok1",
                       "autoregressive/Grok/Grok2"
                     ]
                   },
                   {
                     "group": "InclusionAI",
                     "pages": [
-                      "autoregressive/InclusionAI/Ling-1.x",
-                      "autoregressive/InclusionAI/Ling-2",
-                      "autoregressive/InclusionAI/Ring-2",
+                      "autoregressive/InclusionAI/Ling2.5",
                       "autoregressive/InclusionAI/Ling-2.6"
                     ]
                   },
@@ -103,7 +101,19 @@
               {
                 "group": "Multimodal Models",
                 "pages": [
-                  "multimodal/index"
+                  "multimodal/index",
+                  {
+                    "group": "Qwen",
+                    "pages": [
+                      "multimodal/Qwen/Qwen2.5-VL"
+                    ]
+                  },
+                  {
+                    "group": "Wan",
+                    "pages": [
+                      "multimodal/Wan/Wan-2.x"
+                    ]
+                  }
                 ]
               },
               {

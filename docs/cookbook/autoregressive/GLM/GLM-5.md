@@ -4,7 +4,7 @@ title: "GLM-5"
 
 # GLM-5 MoE on SGL-JAX
 
-> **Placeholder recipe (📝 planned)** — GLM-5 is supported in the runtime (`Glm5ForCausalLM` / `GlmMoeDsaForCausalLM` are registered), but the public model release pins are not yet known. Hardware Matrix and benchmark cells are placeholders. Once Zhipu publishes the checkpoint, fill in the model path, sizes, and TPU sizing from the model card, then promote to 🚧 Starter.
+> **Planned recipe** — GLM-5 is supported in the runtime (`Glm5ForCausalLM` / `GlmMoeDsaForCausalLM` are registered), but the public model release pins are not yet known. This placeholder stays out of public navigation until model details and validation data are available.
 
 ## 1. Model Introduction
 
@@ -34,7 +34,7 @@ See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.m
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.md`](../../../get_started/install.md). Multi-host likely required — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) or [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
+Install per [`../../../get_started/install.md`](../../../get_started/install.md). Multi-host likely required — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -63,9 +63,9 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
   --host 0.0.0.0 --port 30000
 ```
 
-Fill in `<HF_REPO>`, `<N>` (= chip count), and `<NODES>` from the hardware matrix once the release pins them. For SkyPilot, wrap this in `sky exec ${CLUSTER_NAME} -- "..."` per the [`Grok2.md` §2.3 SkyPilot pattern](../Grok/Grok2.md#multi-host-skypilot-recommended--tpu-v6e-32-8-nodes).
+Fill in `<HF_REPO>`, `<N>` (= chip count), and `<NODES>` from the hardware matrix once the release pins them. For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.md` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.md#23-launch) with `<JOB>=glm-5`, `<ACCELERATOR>=tpu-v6e-slice` (or `tpu7x` for v7x), and the launch flags above.
 
-For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.md` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.md#23-launch) with `<JOB>=glm-5`, `<ACCELERATOR>=tpu-v6e-slice` (or `tpu7x` for v7x), and the launch flags above.
+For temporary v6e experiments, advanced users can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags after the release pins hardware and model implementation details. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
 ### 2.4 Configuration Tips
 
@@ -100,11 +100,63 @@ For full flag definitions see [`../../base/launch-flags-reference.md`](../../bas
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#31-basic-chat-completion). Substitute the GLM-5 model path.
+See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use the GLM-5 model path with the §1 recommended sampling parameters.
 
 ### 3.2 Tool Calling
 
-Launch with `--tool-call-parser glm47` and reuse the streaming Python client from [`Qwen3.md` §3.3](../Qwen/Qwen3.md#33-tool-calling) — only the server-side parser name changes.
+GLM-5 uses the `glm47` tool-call parser. Append `--tool-call-parser glm47` to the §2.3 launch command, then pass `tools=[...]` per the OpenAI function-calling schema:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a location",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "City name"},
+                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+            },
+            "required": ["location"],
+        },
+    },
+}]
+
+response = client.chat.completions.create(
+    model="zai-org/GLM-5",
+    messages=[{"role": "user", "content": "What's the weather in Beijing?"}],
+    tools=tools,
+    tool_choice="auto",
+    stream=True,
+)
+
+tool_calls_accumulator = {}
+for chunk in response:
+    if not chunk.choices:
+        continue
+    delta = chunk.choices[0].delta
+    if hasattr(delta, "tool_calls") and delta.tool_calls:
+        for tc in delta.tool_calls:
+            acc = tool_calls_accumulator.setdefault(tc.index, {"name": None, "arguments": ""})
+            if tc.function:
+                if tc.function.name:
+                    acc["name"] = tc.function.name
+                if tc.function.arguments:
+                    acc["arguments"] += tc.function.arguments
+    if delta.content:
+        print(delta.content, end="", flush=True)
+
+for idx, tc in sorted(tool_calls_accumulator.items()):
+    print(f"🔧 Tool Call: {tc['name']}")
+    print(f"   Arguments: {tc['arguments']}")
+print()
+```
+
+To see the full set of `--tool-call-parser` keys available in your build, run `python -m sgl_jax.launch_server --help`.
 
 ## 4. Benchmark
 

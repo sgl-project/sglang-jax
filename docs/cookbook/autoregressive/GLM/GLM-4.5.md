@@ -37,7 +37,7 @@ See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.m
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.md`](../../../get_started/install.md). Multi-host required at both sizes — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) or [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
+Install per [`../../../get_started/install.md`](../../../get_started/install.md). Multi-host required at both sizes — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -48,21 +48,11 @@ Install per [`../../../get_started/install.md`](../../../get_started/install.md)
 
 GLM-4.5 is multi-host only at both released sizes.
 
-#### Multi-host (SkyPilot) — TPU v6e-32 (GLM-4.5-Air)
+#### Multi-host (GKE Indexed Job) — TPU v6e-32 (GLM-4.5-Air)
 
-**Step 1** — provision the cluster:
-
-```bash
-cd ${WORKSPACE_DIR}/sglang-jax
-bash scripts/launch_tpu.sh tpu-v6e-32 main
-```
-
-**Step 2** — launch the server:
+Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) with `<JOB>=glm-4-5-air`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8`, and `completions: 8`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
 ```bash
-CLUSTER_NAME=$(cat .cluster_name)
-sky exec ${CLUSTER_NAME} -- "cd sglang-jax && source .venv/bin/activate && \
-  JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
   --model-path zai-org/GLM-4.5-Air \
   --trust-remote-code \
   --tp-size 32 --ep-size 32 \
@@ -73,22 +63,18 @@ sky exec ${CLUSTER_NAME} -- "cd sglang-jax && source .venv/bin/activate && \
   --chunked-prefill-size 2048 \
   --page-size 128 \
   --max-running-requests 256 \
-  --skip-server-warmup \
-  --dist-init-addr <NODE_0_IP_ADDRESS>:5000 \
-  --nnodes 8 --node-rank \${SKYPILOT_NODE_RANK} \
-  --host 0.0.0.0 --port 30000"
+  --skip-server-warmup
 ```
 
-#### Multi-host (SkyPilot) — TPU v6e-64 (GLM-4.5)
+#### Multi-host (GKE Indexed Job) — TPU v6e-64 (GLM-4.5)
 
-Swap the topology to `tpu-v6e-64`, the model path to `zai-org/GLM-4.5`, and use:
+Use `<JOB>=glm-4-5`, `<TOPOLOGY>=8x8`, `parallelism: 16`, and `completions: 16`; change the launch flags above to:
 
 ```text
   --tp-size 64 --ep-size 64 \
-  --nnodes 16 --node-rank \${SKYPILOT_NODE_RANK} \
 ```
 
-For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.md` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.md#23-launch) with `<JOB>=glm-4-5`, `<ACCELERATOR>=tpu-v6e-slice`, the corresponding topology (`4x8` or `8x8`), and the launch flags above.
+For temporary v6e experiments, advanced users can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
 ### 2.4 Configuration Tips
 
@@ -117,11 +103,86 @@ For full flag definitions see [`../../base/launch-flags-reference.md`](../../bas
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#31-basic-chat-completion). Substitute `model="zai-org/GLM-4.5-Air"` (or `GLM-4.5`).
+See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="zai-org/GLM-4.5-Air"` (or `GLM-4.5`) with the §1 recommended sampling parameters.
 
-### 3.2 Reasoning / Tool Calling
+### 3.2 Reasoning (thinking streaming)
 
-GLM-4.5 uses the `glm45` parsers for both. Launch with `--reasoning-parser glm45 --tool-call-parser glm45` and reuse the streaming clients from [`Qwen3.md` §3.2](../Qwen/Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) and [§3.3](../Qwen/Qwen3.md#33-tool-calling) (swap the model path; the parser-key change is configured server-side, not per-request).
+GLM-4.5 uses the `glm45` reasoning parser. Append `--reasoning-parser glm45` to the §2.3 launch command, then stream `reasoning_content` separately from `content`:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.5-Air",
+    messages=[{"role": "user", "content": "Solve step by step: what is 15% of 240?"}],
+    temperature=0.6,
+    top_p=0.95,
+    max_tokens=4096,
+    stream=True,
+)
+
+thinking_started = False
+content_started = False
+for chunk in response:
+    if not chunk.choices:
+        continue
+    delta = chunk.choices[0].delta
+    if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+        if not thinking_started:
+            print("=============== Thinking =================", flush=True)
+            thinking_started = True
+        print(delta.reasoning_content, end="", flush=True)
+    if delta.content:
+        if thinking_started and not content_started:
+            print("\n=============== Content =================", flush=True)
+            content_started = True
+        print(delta.content, end="", flush=True)
+print()
+```
+
+For non-streaming requests, the field is on `response.choices[0].message.reasoning_content`.
+
+### 3.3 Tool Calling
+
+GLM-4.5 uses the `glm45` tool-call parser (same key as the reasoning parser). Append `--tool-call-parser glm45` to the §2.3 launch command. Pass `tools=[...]` per the OpenAI function-calling schema:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a location",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "City name"},
+                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+            },
+            "required": ["location"],
+        },
+    },
+}]
+
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.5-Air",
+    messages=[{"role": "user", "content": "What's the weather in Beijing?"}],
+    tools=tools,
+    tool_choice="auto",
+)
+
+msg = response.choices[0].message
+for tc in (msg.tool_calls or []):
+    print(f"🔧 Tool Call: {tc.function.name}")
+    print(f"   Arguments: {tc.function.arguments}")
+```
+
+To run reasoning and tool-calling together, pass both flags (`--reasoning-parser glm45 --tool-call-parser glm45`) and use the streaming pattern from §3.2 — `delta.reasoning_content`, `delta.content`, and `delta.tool_calls` will all appear on the same stream.
+
+To see the full set of `--reasoning-parser` / `--tool-call-parser` keys available in your build, run `python -m sgl_jax.launch_server --help`.
 
 ## 4. Benchmark
 
@@ -147,7 +208,7 @@ GLM-4.5 uses the `glm45` parsers for both. Launch with `--reasoning-parser glm45
 | Expert Parallelism | 32 / 64 |
 | Tested build | _Pending_ |
 
-**Deployment Command** — same as [§2.3](#multi-host-skypilot--tpu-v6e-32-glm-45-air).
+**Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-32-glm-45-air).
 
 **Benchmark Command** — example for GSM8K:
 

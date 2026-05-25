@@ -4,6 +4,8 @@ title: "MiMo-V2-Flash"
 
 # MiMo-V2-Flash on SGL-JAX
 
+> **Partially validated recipe** — TPU v7x-8 configuration sweep and TPU v6e-16 smoke benchmark results are available. The full workload matrix and current pinned accuracy rerun are still pending.
+
 ## 1. Model Introduction
 
 [**XiaomiMiMo/MiMo-V2-Flash**](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash), with **309B total parameters and 15B activated parameters**, is Xiaomi's inference-centric Mixture-of-Experts model designed to maximize decoding efficiency for real-world serving workloads — enabling flexible throughput/latency tradeoffs across different hardware. SGL-JAX serves it on TPU v6e and v7x with tensor + expert parallelism.
@@ -72,7 +74,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
   --host 0.0.0.0 --port 30000
 ```
 
-#### Multi-host (GKE 或 SkyPilot) — TPU v6e-16 (4 nodes)
+#### Multi-host (GKE Indexed Job) — TPU v6e-16 (4 nodes)
 
 The launch command is the same on every node — only `${NODE_RANK}` and `${MASTER_ADDR}` vary. `${NODE_RANK}` ranges from `0` to `3`.
 
@@ -94,12 +96,11 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
   --host 0.0.0.0 --port 30000
 ```
 
-**Launcher** — wrap the above into either:
+**Launcher** — wrap the above into GKE:
 
 - **GKE Indexed Job + headless Service** — adapt [`../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md). Differences from the template: `<JOB>=mimo-v2-flash`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `<N>=4`, `<MODEL_PATH>=XiaomiMiMo/MiMo-V2-Flash`, `<HTTP_PORT>=30000`, plus the launch flags above. `${NODE_RANK}` comes from `${JOB_COMPLETION_INDEX}`.
-- **SkyPilot** — adapt [`../deployment/skypilot.md`](../../deployment/skypilot.md) with `tpu-v6e-16`. `${NODE_RANK}` comes from `${SKYPILOT_NODE_RANK}`.
 
-For an end-to-end GKE manifest with the same template applied, see [`MiMo-V2.5-Pro.md` §2.3 Multi-host](MiMo-V2.5-Pro.md#23-launch) — substitute the model path and TP/DP/EP from above.
+For an end-to-end GKE manifest with the same template applied, see [`MiMo-V2.5-Pro.md` §2.3 Multi-host](MiMo-V2.5-Pro.md#23-launch) — substitute the model path and TP/DP/EP from above. For temporary v6e experiments, advanced users can adapt [`../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags.
 
 ### 2.4 Configuration Tips
 
@@ -132,27 +133,7 @@ For full flag definitions and defaults see [`../base/launch-flags-reference.md`]
 
 ### 3.1 Basic Chat Completion
 
-```bash
-curl -X POST http://<rank0-ip>:30000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "XiaomiMiMo/MiMo-V2-Flash",
-    "messages": [{"role": "user", "content": "Hello, who are you?"}]
-  }'
-```
-
-Python OpenAI client equivalent:
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://<rank0-ip>:30000/v1", api_key="EMPTY")
-
-resp = client.chat.completions.create(
-    model="XiaomiMiMo/MiMo-V2-Flash",
-    messages=[{"role": "user", "content": "Hello, who are you?"}],
-)
-print(resp.choices[0].message.content)
-```
+See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="XiaomiMiMo/MiMo-V2-Flash"` and replace `127.0.0.1` with your rank-0 internal IP, with the §1 recommended sampling parameters; for thinking + content streaming see §3.2, for tool calling see §3.3.
 
 ### 3.2 Reasoning (thinking-on default, thinking-off optional)
 
@@ -423,7 +404,13 @@ python -m sgl_jax.bench_serving \
 
 The fused MoE tuned-config table covers the EP=8 shapes (server logs report `Using tuned block config` for the precompiled buckets), so the gap is not a tuner-coverage issue — it reflects the kernel design balance at small EP.
 
-**Other workload cells**: _Pending_ — multi-host (v6e-16) and other (ISL, OSL, concurrency) combinations not yet measured. PR the full `============ Serving Benchmark Result ============` block from `bench_serving` when measured.
+**Multi-host v6e-16 (4 nodes × 4 chips, `--tp-size 16 --dp-size 4 --ep-size 16 --moe-backend fused`)** — sglang-jax `b2daa46d`, 100 prompts, ISL=1024, OSL=1024, concurrency=16:
+
+| Output tok/s | Peak output tok/s | Mean TTFT | Mean TPOT | Median TPOT |
+|---|---|---|---|---|
+| 1034.44 | 1216.00 | 1093.50 ms | 13.29 ms | 13.33 ms |
+
+**Other workload cells**: _Pending_ — additional v6e-16 (ISL, OSL, concurrency) combinations not yet measured. PR the full `============ Serving Benchmark Result ============` block from `bench_serving` when measured.
 
 ### 4.2 Accuracy — GSM8K
 
@@ -439,7 +426,7 @@ The fused MoE tuned-config table covers the EP=8 shapes (server logs report `Usi
 | Reasoning Parser | `mimo` |
 | Tested build | _Pending_ (run pre-dates pin convention) |
 
-**Deployment Command** — same as [§2.3 Multi-host](#multi-host-gke-或-skypilot--tpu-v6e-16-4-nodes), plus `--reasoning-parser mimo`.
+**Deployment Command** — same as [§2.3 Multi-host](#multi-host-gke-indexed-job--tpu-v6e-16-4-nodes), plus `--reasoning-parser mimo`.
 
 **Benchmark Command**
 
@@ -456,9 +443,10 @@ evalscope eval \
 
 **Test Results**
 
-| Model | Dataset | Metric | Subset | Num | Score |
-|:---|:---|:---|:---|:---|:---|
-| MiMo-V2-Flash | gsm8k | AverageAccuracy | main | 1319 | 0.9401 |
+| Model | Dataset | Metric | Subset | Num | Score | Tested build |
+|:---|:---|:---|:---|:---|:---|:---|
+| MiMo-V2-Flash | gsm8k | AverageAccuracy | main | 1319 | 0.9401 | (pre-pin) |
+| MiMo-V2-Flash | gsm8k | AverageAccuracy | main | 200 | 0.9750 | sglang-jax `b2daa46d` (smoke run, `max_tokens 8192`, no `--reasoning-parser` flag) |
 
 ## 5. Troubleshooting
 

@@ -66,7 +66,7 @@ Recipe 中提到的 launch flag、parser key、模型支持状况等,**作者写
 
 ### 2.6 自包含(每个 launcher 形态自包含完整链路)
 
-§2.3 Launch 内 `#### Single-host (Docker)` 和 `#### Multi-host (GKE 或 SkyPilot)` 各自自包含完整链路——读者按部署规模直接跳到对应子节,不需要跨节拼参数。Multi-host 的 launch 命令和 launcher manifest 在同一节,不分裂。
+§2.3 Launch 内 `#### Single-host (Docker)` 和 `#### Multi-host (GKE Indexed Job)` 各自自包含完整链路——读者按部署规模直接跳到对应子节,不需要跨节拼参数。Multi-host 的 launch 命令和 GKE launcher manifest 差异字段在同一节,不分裂；SkyPilot 只作为高级 v6e 实验备选链接。
 
 ### 2.7 Staleness tolerant
 

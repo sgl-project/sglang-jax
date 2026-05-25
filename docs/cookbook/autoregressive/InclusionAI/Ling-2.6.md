@@ -20,7 +20,7 @@ title: "Ling 2.6"
 - [**inclusionAI/Ling-2.6-1T**](https://huggingface.co/inclusionAI/Ling-2.6-1T) — full trillion-scale flagship; default focus of this page.
 - Smaller Ling-2.6 variants — adapt the §2.3 launch command after picking a checkpoint.
 
-For Moonshot AI's separate linear-attention model see [`Kimi-Linear.md`](../Moonshotai/Kimi-Linear.md).
+For the previous Ling 2.5 hybrid linear-attention generation see [`Ling2.5.md`](Ling2.5.md). For Moonshot AI's separate linear-attention model see [`Kimi-Linear.md`](../Moonshotai/Kimi-Linear.md).
 
 **Recommended Generation Parameters**: see the Ling-2.6 model card for authoritative defaults. As a starter: `temperature=0.7`, `top_p=0.95`, `max_tokens=2048+` (give room if you enable reasoning mode).
 
@@ -39,7 +39,7 @@ See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.m
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.md`](../../../get_started/install.md). Multi-host required — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) or [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
+Install per [`../../../get_started/install.md`](../../../get_started/install.md). Multi-host required — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -48,21 +48,11 @@ Install per [`../../../get_started/install.md`](../../../get_started/install.md)
 
 ### 2.3 Launch
 
-#### Multi-host (SkyPilot) — TPU v6e-64
+#### Multi-host (GKE Indexed Job) — TPU v6e-64
 
-**Step 1** — provision the cluster:
+Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) with `<JOB>=ling-2-6`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, and parallelism/completions set to 16. Add these model flags to the job command:
 
-```bash
-cd ${WORKSPACE_DIR}/sglang-jax
-bash scripts/launch_tpu.sh tpu-v6e-64 main
-```
-
-**Step 2** — launch the server:
-
-```bash
-CLUSTER_NAME=$(cat .cluster_name)
-sky exec ${CLUSTER_NAME} -- "cd sglang-jax && source .venv/bin/activate && \
-  JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
+```text
   --model-path inclusionAI/Ling-2.6-1T \
   --trust-remote-code \
   --tp-size 64 --ep-size 64 \
@@ -74,22 +64,18 @@ sky exec ${CLUSTER_NAME} -- "cd sglang-jax && source .venv/bin/activate && \
   --chunked-prefill-size 2048 \
   --page-size 128 \
   --max-running-requests 256 \
-  --skip-server-warmup \
-  --dist-init-addr <NODE_0_IP_ADDRESS>:5000 \
-  --nnodes 16 --node-rank \${SKYPILOT_NODE_RANK} \
-  --host 0.0.0.0 --port 30000"
+  --skip-server-warmup
 ```
 
-#### Multi-host (SkyPilot) — TPU v7x-16
+#### Multi-host (GKE Indexed Job) — TPU v7x-16
 
-Swap the topology to `tpu-v7x-16` and use:
+Use GKE with `<ACCELERATOR>=tpu7x`, `<TOPOLOGY>=4x4`, and parallelism/completions set to 4. Change the model flags to:
 
 ```text
-  --tp-size 32 --ep-size 32 \
-  --nnodes 4 --node-rank \${SKYPILOT_NODE_RANK} \
+  --tp-size 32 --ep-size 32
 ```
 
-For GKE, adapt the manifest pattern from [`MiMo-V2.5-Pro.md` §2.3 Multi-host](../Xiaomi/MiMo-V2.5-Pro.md#23-launch) with `<JOB>=ling-2-6`, `<ACCELERATOR>=tpu-v6e-slice` (or `tpu7x` for v7x), and the launch flags above.
+For temporary v6e experiments, advanced users can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
 ### 2.4 Configuration Tips
 
@@ -124,11 +110,46 @@ For full flag definitions see [`../../base/launch-flags-reference.md`](../../bas
 
 ### 3.1 Basic Chat Completion
 
-Standard OpenAI-compatible request — see [`Qwen3.md` §3.1](../Qwen/Qwen3.md#31-basic-chat-completion). Substitute `model="inclusionAI/Ling-2.6-1T"` (or your chosen Ling-2.6 checkpoint).
+See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="inclusionAI/Ling-2.6-1T"` with the §1 recommended sampling parameters; for thinking + content streaming see §3.2.
 
 ### 3.2 Reasoning (if supported by the checkpoint)
 
-If you launched with `--reasoning-parser deepseek-r1` (see §2.4 Reasoning Mode), mirror the thinking-on streaming pattern from [`Qwen3.md` §3.2](../Qwen/Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) with `extra_body={"chat_template_kwargs": {"enable_thinking": True}}` if the checkpoint supports per-request thinking toggle.
+Ling-2.6 emits `<think>...</think>` blocks; reuse the generic `deepseek-r1` reasoning parser. Append `--reasoning-parser deepseek-r1` to the §2.3 launch command (see §2.4 Reasoning Mode). If your checkpoint supports the per-request thinking toggle, set `extra_body={"chat_template_kwargs": {"enable_thinking": True}}`; stream `reasoning_content` separately from `content`:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="inclusionAI/Ling-2.6-1T",
+    messages=[{"role": "user", "content": "Solve step by step: what is 15% of 240?"}],
+    extra_body={"chat_template_kwargs": {"enable_thinking": True}},
+    temperature=0.7,
+    top_p=0.95,
+    max_tokens=4096,
+    stream=True,
+)
+
+thinking_started = False
+content_started = False
+for chunk in response:
+    if not chunk.choices:
+        continue
+    delta = chunk.choices[0].delta
+    if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+        if not thinking_started:
+            print("=============== Thinking =================", flush=True)
+            thinking_started = True
+        print(delta.reasoning_content, end="", flush=True)
+    if delta.content:
+        if thinking_started and not content_started:
+            print("\n=============== Content =================", flush=True)
+            content_started = True
+        print(delta.content, end="", flush=True)
+print()
+```
+
+For non-streaming requests, the field appears on `response.choices[0].message.reasoning_content`. To see the full set of `--reasoning-parser` keys available in your build, run `python -m sgl_jax.launch_server --help`.
 
 ## 4. Benchmark
 
@@ -155,7 +176,7 @@ If you launched with `--reasoning-parser deepseek-r1` (see §2.4 Reasoning Mode)
 | Recurrent State Memory Ratio | 0.9 |
 | Tested build | _Pending_ |
 
-**Deployment Command** — same as [§2.3](#multi-host-skypilot--tpu-v6e-64).
+**Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-64).
 
 **Benchmark Command** — example for GSM8K:
 
@@ -187,6 +208,7 @@ Recommended additional datasets: AIME 2025, GPQA Diamond (reasoning); MMLU (gene
 
 - [Ling-2.6 model card](https://huggingface.co/inclusionAI/Ling-2.6-1T)
 - [InclusionAI HF collection](https://huggingface.co/inclusionAI) — sibling checkpoints.
+- [`Ling2.5.md`](Ling2.5.md) — Ling / Ring 2.5 hybrid linear-attention generation.
 - [`Kimi-Linear.md`](../Moonshotai/Kimi-Linear.md) — Moonshot AI's separate linear-attention model.
 - [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
