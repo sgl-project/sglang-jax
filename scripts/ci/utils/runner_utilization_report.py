@@ -62,6 +62,8 @@ def get_workflow_runs(repo, hours=24):
             [
                 "api",
                 f"/repos/{repo}/actions/runs",
+                "--method",
+                "GET",
                 "-f",
                 f"per_page={per_page}",
                 "-f",
@@ -113,6 +115,8 @@ def get_jobs_for_run(repo, run_id):
             [
                 "api",
                 f"/repos/{repo}/actions/runs/{run_id}/jobs",
+                "--method",
+                "GET",
                 "-f",
                 "filter=all",
                 "-f",
