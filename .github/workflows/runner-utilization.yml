@@ -33,6 +33,7 @@ jobs:
           python-version: '3.12'
 
       - name: Generate Utilization Report
+        id: report
         timeout-minutes: 30
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -46,8 +47,25 @@ jobs:
           fi
           if [ -n "$RUNNER_FILTER" ]; then
             python scripts/ci/utils/runner_utilization_report.py \
-              --repo "$REPO" --hours "$REPORT_HOURS" --filter "$RUNNER_FILTER"
+              --repo "$REPO" --hours "$REPORT_HOURS" --filter "$RUNNER_FILTER" \
+              --output report.md
           else
             python scripts/ci/utils/runner_utilization_report.py \
-              --repo "$REPO" --hours "$REPORT_HOURS"
+              --repo "$REPO" --hours "$REPORT_HOURS" \
+              --output report.md
           fi
+
+      - name: Post to Slack
+        if: secrets.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          REPORT=$(cat report.md)
+          jq -n --arg text "${REPORT}"$'\n\n'"<${RUN_URL}|View full report>" \
+            '{text: $text}' | \
+            curl -sf -X POST -H 'Content-type: application/json' \
+              -d @- "$SLACK_WEBHOOK_URL"
