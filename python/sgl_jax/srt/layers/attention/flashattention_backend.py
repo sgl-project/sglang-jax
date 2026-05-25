@@ -240,25 +240,27 @@ class FlashAttention(AttentionBackend):
         if batch.forward_mode.is_target_verify():
             seq_lens += extend_seq_lens
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
-            # At dp>1 the verify mask must be DP-segmented per rank so each rank's
-            # P("data") shard sees its own slots' mask (the kernel computes
-            # cu_seq_mask_lens from per-rank cu_kv/q starting at 0). Without
-            # repack, the build_tree output sits in cross-rank-flat order, and
-            # rank>0 reads the mask tail (padding zeros) → all-masked verify
-            # → garbage. (#1108 P1-7)
-            #
-            # mask col width depends on rpa_v3's mask_aligned_to_cu_kv switch
-            # (page_size>=256 uses aligned cu_kv_lens; else actual seq_lens),
-            # so pad each row to match — otherwise kernel reads wrong stride.
-            if metadata.custom_mask is not None and dp_size > 1:
+            # Verify mask must be (a) DP-segmented per rank when dp>1 so each
+            # rank's P("data") shard sees its own slots, and (b) padded so each
+            # row width = aligned_seq_lens (= cu_kv_lens delta). The RPA kernel
+            # always takes the cu_kv_lens-aligned path now (#1089 used to gate
+            # on page_size>=256, which broke dp=1 + smaller pages — Mosaic
+            # could not prove tiling(8) on the unaligned slice). dp=1 reduces
+            # to a single rank chunk; dp>1 keeps the per-rank repack from
+            # #1108 P1-7.
+            if metadata.custom_mask is not None:
                 q = batch.spec_info_padded.draft_token_num
                 cm = np.asarray(jax.device_get(metadata.custom_mask))
+                # Pin per-rank mask target from the pre-repacking mask capacity
+                # (tree_mask_capacity from build_tree, already bucket-stable).
+                cm_total = len(cm)
+                per_rank_mask_target = ((cm_total // dp_size + 7) // 8) * 8 or 8
                 # cm is DP-slot-ordered (build_tree got verified_seq_len = mwb.seq_lens-1
                 # over total_bs). Per-slot cm length = q*(verified_seq_len[s]+q); for pad
                 # slots verified_seq_len=-1 → q*(q-1).
                 cm_kl = np.where(seq_lens > 0, seq_lens, q - 1).astype(np.int64)
                 cm_off = np.concatenate([[0], np.cumsum(q * cm_kl)])
-                row_width = aligned_seq_lens if self.page_size >= 256 else seq_lens
+                row_width = aligned_seq_lens
                 rank_chunks: list[np.ndarray] = []
                 for r in range(dp_size):
                     parts = []
@@ -274,8 +276,7 @@ class FlashAttention(AttentionBackend):
                     rank_chunks.append(
                         np.concatenate(parts) if parts else np.zeros(0, dtype=cm.dtype)
                     )
-                max_len = max((len(c) for c in rank_chunks), default=0)
-                max_len = ((max_len + 7) // 8) * 8 or 8
+                max_len = max(max((len(c) for c in rank_chunks), default=0), per_rank_mask_target)
                 packed = np.concatenate(
                     [np.pad(c, (0, max_len - len(c))) for c in rank_chunks]
                 ).astype(np.int32)
@@ -565,6 +566,11 @@ class FlashAttention(AttentionBackend):
             ),  # updated kv_cache_fused (head interleaved) - 3D: [total_tokens, num_kv_heads*2, head_dim]
         )
 
+        mask_aligned_to_cu_kv = (
+            self.forward_metadata.custom_mask is not None
+            and forward_batch.forward_mode.is_target_verify()
+        )
+
         def _ragged_paged_attention_with_fused_kv(*args):
             queries, keys, values, kv_cache_fused = args[:4]
             other_args = args[4:]
@@ -583,6 +589,7 @@ class FlashAttention(AttentionBackend):
                 xai_temperature_len=(
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
                 ),
+                mask_aligned_to_cu_kv=mask_aligned_to_cu_kv,
             )
 
             return result, updated_kv_cache_fused

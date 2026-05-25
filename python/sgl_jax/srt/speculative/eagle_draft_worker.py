@@ -68,15 +68,6 @@ class EagleDraftWorker(BaseDraftWorker):
 
         self._share_embed_head(target_worker)
 
-        target_slot_range = target_worker.model_runner.max_total_num_tokens
-        draft_pool_size = self.draft_model_runner.max_total_num_tokens
-        assert draft_pool_size >= target_slot_range, (
-            f"draft KV pool ({draft_pool_size}) < target allocator slot range "
-            f"({target_slot_range}); high-slot draft KV reads/writes will be "
-            f"garbage. Hybrid target without the post-set_num_token_hybrid "
-            f"draft_runner_cache_size overwrite hits this."
-        )
-
         self._worker.model_runner.initialize_jit()
 
         (
@@ -205,6 +196,13 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         model_worker_batch.spec_info_padded.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+
+        padded_bs = int(model_worker_batch.seq_lens.shape[0])
+        if verified_id_np.shape[0] < padded_bs:
+            model_worker_batch.spec_info_padded.verified_id = np.pad(
+                verified_id_np, ((0, padded_bs - verified_id_np.shape[0]),)
+            )
+
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         forward_batch.return_logprob = False
 
@@ -219,17 +217,19 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
+        # Restore real_bs so split_spec_info_per_rank cuts on real_bs_per_dp.
+        model_worker_batch.spec_info_padded.verified_id = verified_id_np
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, logits_output.next_token_logits, logits_output.hidden_states
         )
-        logits_output.next_token_logits = rep_logits[sel, :]
         if len(rep_hidden.shape) == 1:
             rep_hidden = jnp.expand_dims(rep_hidden, axis=0)
-        logits_output.hidden_states = rep_hidden[sel]
+        logits_output.next_token_logits = rep_logits
+        logits_output.hidden_states = rep_hidden
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         forward_batch.spec_info.allocate_lens = np.asarray(model_worker_batch.seq_lens)[sel]
 
-        self.capture_for_decode(logits_output, forward_batch.spec_info)
+        self.capture_for_decode(logits_output, forward_batch.spec_info, sel=sel)
 
     def draft_extend_for_decode(
         self, model_worker_batch: ModelWorkerBatch, batch_output: GenerationBatchResult
@@ -260,32 +260,45 @@ class EagleDraftWorker(BaseDraftWorker):
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, draft_logits_output.next_token_logits, draft_logits_output.hidden_states
         )
-        # next_token_logits is pruned to (total_bs, vocab); hidden_states is FULL
-        # (total_bs*(steps+1), H). Index logits by slot, hidden by token.
-        draft_logits_output.next_token_logits = rep_logits[sel]
-        draft_logits_output.hidden_states = rep_hidden[select_index]
-        topk_p, topk_index = topk_probs_from_logits(
-            draft_logits_output.next_token_logits, self.topk
-        )
+        # topk_probs_from_logits runs as @jax.jit on bucket-shaped rep_logits;
+        # keep this on device with stable shape.
+        topk_p, topk_index = topk_probs_from_logits(rep_logits, self.topk)
+        # Gather to real_bs on host to avoid variable-shape device gathers.
+        jax.copy_to_host_async(topk_p)
+        jax.copy_to_host_async(topk_index)
+        jax.copy_to_host_async(rep_hidden)
+        verified_id_arr = batch_output.next_draft_input.verified_id
+        if hasattr(verified_id_arr, "copy_to_host_async"):
+            jax.copy_to_host_async(verified_id_arr)
+        topk_p = np.asarray(topk_p)[sel]
+        topk_index = np.asarray(topk_index)[sel]
+        hidden = np.asarray(rep_hidden)[select_index]
+        verified_id = np.asarray(verified_id_arr)[select_index]
 
-        batch_output.next_draft_input.hidden_states = draft_logits_output.hidden_states
+        batch_output.next_draft_input.hidden_states = hidden
         batch_output.next_draft_input.topk_p = topk_p
         batch_output.next_draft_input.topk_index = topk_index
-        batch_output.next_draft_input.verified_id = batch_output.next_draft_input.verified_id[
-            select_index
-        ]
+        batch_output.next_draft_input.verified_id = verified_id
         batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
         batch_output.accept_lens = accept_host
 
     # -- Internal draft helpers --
 
     def capture_for_decode(
-        self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
+        self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput, sel=None
     ):
         topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
+        hidden = replicate_to_mesh(self.mesh, logits_output.hidden_states)
+        if sel is not None:
+            jax.copy_to_host_async(topk_p)
+            jax.copy_to_host_async(topk_index)
+            jax.copy_to_host_async(hidden)
+            topk_p = np.asarray(topk_p)[sel]
+            topk_index = np.asarray(topk_index)[sel]
+            hidden = np.asarray(hidden)[sel]
         draft_input.topk_p = topk_p
         draft_input.topk_index = topk_index
-        draft_input.hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
+        draft_input.hidden_states = hidden
 
     def padding_for_decode(self, model_worker_batch: ModelWorkerBatch):
         # At dp>1 the incoming mwb is already DP-padded to total_bs (== a bucket
@@ -372,7 +385,7 @@ class EagleDraftWorker(BaseDraftWorker):
             """
             if arr is None or arr.shape[0] >= target_bs:
                 return arr
-            per_dp_curr = max(arr.shape[0] // dp_size, 1) if dp_size > 0 else arr.shape[0]
+            per_dp_curr = max(arr.shape[0] // dp_size, 1)
             if dp_size <= 1 or arr.shape[0] % dp_size != 0:
                 # Fallback to end-pad if layout isn't DP-divisible (dp=1 path).
                 pad_widths = [(0, target_bs - arr.shape[0])] + [(0, 0)] * (arr.ndim - 1)
@@ -459,11 +472,9 @@ class EagleDraftWorker(BaseDraftWorker):
         return score_list, token_list, parents_list
 
     def _pick_context_len(self, max_seq_len: int) -> int:
-        max_seq_len = max(int(max_seq_len), 1)
         if self.precompile_token_paddings:
-            for padding in self.precompile_token_paddings:
-                if padding >= max_seq_len:
-                    return padding
+            return self.precompile_token_paddings[-1]
+        max_seq_len = max(int(max_seq_len), 1)
         return 1 << (max_seq_len - 1).bit_length()
 
     def copy_model_worker_batch_to_cpu(self, model_worker_batch: ModelWorkerBatch):
@@ -649,6 +660,10 @@ def select_top_k_tokens_step_greater_0(
     scores: jax.Array,
     topk: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    # scores carries the prior step's top-k probs; topk_p comes from the next
+    # draft forward. Target and draft logits can be different dtypes (e.g. MiMo
+    # V2 Flash), so promote before lax.mul which requires matching dtypes.
+    scores = scores.astype(topk_p.dtype)
     expand_scores = jax.lax.mul(jnp.expand_dims(scores, axis=2), topk_p.reshape(-1, topk, topk))
     topk_cs_p, topk_cs_index = fast_topk(
         expand_scores.reshape(expand_scores.shape[0], -1), topk, axis=-1

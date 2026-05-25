@@ -102,7 +102,6 @@ class BaseSpecWorker:
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         if model_worker_batch.forward_mode.is_extend():
-            # FIXME(pc) add padding logic here
             if model_worker_batch.sampling_info.temperatures.ndim == 1:
                 model_worker_batch.sampling_info.temperatures = (
                     model_worker_batch.sampling_info.temperatures[:, None]
@@ -136,9 +135,8 @@ class BaseSpecWorker:
                 extend_logprob_start_len_per_req=None,
             )
 
-        # spec_info.allocate_lens is DP-padded (total_bs,) at dp>1 (scattered in
-        # _get_spec_decode_mwb_dp); gather back to global-flat (real_bs,) so the
-        # cross-round state on reqs_info[0].spec_info stays flat-ordered.
+        # spec_info.allocate_lens is DP-padded (total_bs,) at dp>1; gather back
+        # to global-flat (real_bs,) so reqs_info[0].spec_info stays flat-ordered.
         sel = model_worker_batch.logits_indices_selector
         cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
         self.draft_worker.draft(model_worker_batch)
