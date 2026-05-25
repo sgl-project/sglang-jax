@@ -43,7 +43,7 @@ dependencies = [
     "pathwaysutils",
     "omegaconf",
     "imageio[ffmpeg]",
-    "librosa",
+    "librosa>=0.10",
     "datasets",
 ]
 

@@ -62,7 +62,19 @@ def cleanup_model_cache():
                         print(f"Failed to clean model cache: {e}\n", flush=True)
 
 
-def run_unittest_files(files: list[TestFile], timeout_per_file: float):
+def run_unittest_files(
+    files: list[TestFile],
+    timeout_per_file: float,
+    reruns: int = 0,
+    reruns_delay: float = 10,
+    only_rerun: list[str] | None = None,
+):
+    # When JAX_COMPILATION_CACHE_DIR is set (e.g. /xla-cache in CI),
+    # jtu.JaxTestCase.setUp() needs this flag to properly manage cache
+    # lifecycle — without it, lazy cache init trips the global-state assertion.
+    if os.environ.get("JAX_COMPILATION_CACHE_DIR"):
+        os.environ.setdefault("JAX_TEST_WITH_PERSISTENT_COMPILATION_CACHE", "1")
+
     tic = time.perf_counter()
     success = True
 
@@ -127,6 +139,8 @@ def run_unittest_files(files: list[TestFile], timeout_per_file: float):
                         "--with",
                         "pytest",
                     ]
+                    if reruns > 0:
+                        cmd.extend(["--with", "pytest-rerunfailures==14.0"])
                     for dep in file_entry.extra_deps or []:
                         cmd.extend(["--with", dep])
                     cmd.extend(
@@ -138,6 +152,10 @@ def run_unittest_files(files: list[TestFile], timeout_per_file: float):
                             filename,
                         ]
                     )
+                    if reruns > 0:
+                        cmd.extend(["--reruns", str(reruns), "--reruns-delay", str(reruns_delay)])
+                        for pattern in only_rerun or []:
+                            cmd.extend(["--only-rerun", pattern])
                 else:
                     cmd = [sys.executable, filename]
 
@@ -166,6 +184,27 @@ def run_unittest_files(files: list[TestFile], timeout_per_file: float):
 
         try:
             ret_code = run_with_timeout(run_one_file, args=(filename,), timeout=timeout_per_file)
+            if ret_code != 0 and reruns > 0:
+                # pytest exit 1 = test case failures already retried by pytest-rerunfailures;
+                # only file-level retry on infrastructure errors (exit 2/3/5)
+                if file_entry.runner == "pytest" and ret_code == 1:
+                    pass
+                else:
+                    for attempt in range(1, reruns + 1):
+                        print(
+                            f"\n[rerun {attempt}/{reruns}] {filename} failed (exit {ret_code}), retrying after {reruns_delay}s...\n",
+                            flush=True,
+                        )
+                        time.sleep(reruns_delay)
+                        ret_code = run_with_timeout(
+                            run_one_file, args=(filename,), timeout=timeout_per_file
+                        )
+                        if ret_code == 0:
+                            print(
+                                f"\n[rerun {attempt}/{reruns}] {filename} passed on retry\n",
+                                flush=True,
+                            )
+                            break
             assert ret_code == 0, f"expected return code 0, but {filename} returned {ret_code}"
         except TimeoutError:
             kill_process_tree(process.pid)
@@ -447,35 +486,41 @@ suites = {
         TestFile("python/sgl_jax/test/test_moe_topk.py", 1),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 9),
         TestFile("python/sgl_jax/test/test_sampler.py", 1),
-        TestFile("python/sgl_jax/test/test_compilation_manager.py", 1),
         TestFile("python/sgl_jax/test/test_utils.py", 1),
-        TestFile("python/sgl_jax/test/test_kernel_utils.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_kv_cache.py", 1),
-        TestFile("python/sgl_jax/test/mem_cache/test_radix_cache.py", 1),
-        TestFile("python/sgl_jax/test/mem_cache/test_swa_radix_cache.py", 1),
-        TestFile("python/sgl_jax/test/mem_cache/test_swa_allocator.py", 1),
-        TestFile("python/sgl_jax/test/mem_cache/test_req_to_token_pool.py", 1),
-        TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
-        TestFile("python/sgl_jax/test/mem_cache/test_hybrid_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/speculative/test_eagle_tree_build.py", 1),
         TestFile("python/sgl_jax/test/speculative/test_eagle_utils.py", 1),
-        TestFile("python/sgl_jax/test/speculative/test_spec_info.py", 0.2, runner="pytest"),
-        TestFile("python/sgl_jax/test/models/test_mimo_v2_nextn.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/multimodal/test_wan_vae_precision.py", 1),
         TestFile("python/sgl_jax/test/multimodal/test_vae_scheduler.py", 2.5),
         TestFile("python/sgl_jax/test/multimodal/test_flash_attention_kernel.py", 1),
         TestFile("python/sgl_jax/test/layers/test_group_rmsnorm.py", 1, runner="pytest"),
         TestFile("test/srt/lora/test_bgmv_backend.py", 4),
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 3.5),
-        # GDN (gated DeltaNet) — CPU-only unit tests; each pins
-        # JAX_PLATFORMS=cpu + 8 fake devices in its header, so they run on
-        # any TPU runner without consuming TPU chips.
-        TestFile("python/sgl_jax/test/kernels/gdn/test_gated_delta.py", 1),
-        TestFile("python/sgl_jax/test/kernels/gdn/test_ragged_gated_delta_rule_ref.py", 1),
         TestFile("python/sgl_jax/test/layers/test_gdn_backend.py", 1),
         TestFile("python/sgl_jax/test/layers/test_merged_column_parallel_linear.py", 1),
         TestFile("python/sgl_jax/test/layers/test_qwen3_5_gated_delta_net.py", 1),
+    ],
+    # CPU-only unit tests — moved off arc-runner-v6e-1 to a dedicated
+    # CPU runner so they don't consume TPU capacity. Either pure
+    # Python / numpy / mocks (no JAX device ops) or JAX kernels whose
+    # header already pins JAX_PLATFORMS=cpu and which target CPU
+    # reference implementations. mem_cache pool/allocator/cache tests
+    # have a conditional CPU pin gated on USE_DEVICE_TYPE=cpu — the
+    # cpu-test CI job sets that env var.
+    "unit-test-cpu": [
         TestFile("test/srt/test_tokenizer_manager_event.py", 0.1),
+        TestFile("python/sgl_jax/test/test_compilation_manager.py", 1),
+        TestFile("python/sgl_jax/test/test_kernel_utils.py", 1),
+        TestFile("python/sgl_jax/test/speculative/test_spec_info.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/models/test_mimo_v2_nextn.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/kernels/gdn/test_gated_delta.py", 1),
+        TestFile("python/sgl_jax/test/kernels/gdn/test_ragged_gated_delta_rule_ref.py", 1),
+        TestFile("python/sgl_jax/test/mem_cache/test_req_to_token_pool.py", 1),
+        TestFile("python/sgl_jax/test/mem_cache/test_hybrid_req_to_token_pool.py", 1),
+        TestFile("python/sgl_jax/test/mem_cache/test_swa_allocator.py", 1),
+        TestFile("python/sgl_jax/test/mem_cache/test_swa_radix_cache.py", 1),
+        TestFile("python/sgl_jax/test/mem_cache/test_radix_cache.py", 1),
+        TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 1),
@@ -652,6 +697,27 @@ if __name__ == "__main__":
         type=int,
         help="Use auto load balancing. The number of parts.",
     )
+    arg_parser.add_argument(
+        "--reruns",
+        type=int,
+        default=0,
+        help="Number of times to retry a failed test file (0 = no retry). For pytest runner, also enables per-test retry via pytest-rerunfailures.",
+    )
+    arg_parser.add_argument(
+        "--reruns-delay",
+        type=float,
+        default=10,
+        help="Delay in seconds between reruns (default: 10).",
+    )
+    arg_parser.add_argument(
+        "--only-rerun",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Only rerun tests matching these error patterns (e.g. TimeoutError ConnectionError). "
+        "Passed to pytest-rerunfailures --only-rerun. Only effective for pytest runner files; "
+        "file-level retry for unittest runner is not filtered by this option.",
+    )
     args = arg_parser.parse_args()
     print(f"{args=}")
 
@@ -664,5 +730,11 @@ if __name__ == "__main__":
 
     print("The running tests are ", [f.name for f in files])
 
-    exit_code = run_unittest_files(files, args.timeout_per_file)
+    exit_code = run_unittest_files(
+        files,
+        args.timeout_per_file,
+        reruns=args.reruns,
+        reruns_delay=args.reruns_delay,
+        only_rerun=args.only_rerun,
+    )
     exit(exit_code)

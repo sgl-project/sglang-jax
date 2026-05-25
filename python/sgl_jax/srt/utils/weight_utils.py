@@ -141,13 +141,17 @@ class WeightLoader:
             # Use original count for replication logic
             self.num_kv_heads = model_config.get_total_num_kv_heads()
             self.hidden_size = model_config.hidden_size
-            self.head_dim_original = getattr(
-                model_config, "head_dim", self.hidden_size // self.num_heads
-            )
+            # Read head_dim / v_head_dim from hf_text_config rather than model_config:
+            # patch_model_config writes mc.head_dim for KV-cache / MemoryPools sizing,
+            # but the loader needs the per-layer truth for split-QKV weight slicing.
+            # hf_text_config stays unpatched so split-QKV slicing is correct for
+            # hybrid-attention models.
+            hf_cfg = getattr(model_config, "hf_text_config", model_config)
+            self.head_dim_original = getattr(hf_cfg, "head_dim", self.hidden_size // self.num_heads)
 
             self.head_dim_pad = (self.head_dim_original + 127) // 128 * 128 - self.head_dim_original
             self.head_dim = self.head_dim_original
-            self.v_head_dim = getattr(model_config, "v_head_dim", self.head_dim_original)
+            self.v_head_dim = getattr(hf_cfg, "v_head_dim", self.head_dim_original)
         if hasattr(self.mesh, "shape") and "tensor" in self.mesh.shape:
             self.sharding_size = self.mesh.shape["tensor"]
         else:
@@ -552,8 +556,11 @@ class WeightLoader:
 
         head_dim = config.head_dim
         v_head_dim = getattr(config, "v_head_dim", head_dim)
-        num_heads = config.num_attention_heads
-        num_kv_heads = config.num_key_value_heads
+        full_num_heads = config.num_attention_heads
+        full_num_kv_heads = config.num_key_value_heads
+        swa_num_heads = getattr(config, "swa_num_attention_heads", full_num_heads)
+        swa_num_kv_heads = getattr(config, "swa_num_key_value_heads", full_num_kv_heads)
+        hybrid_layer_pattern = getattr(config, "hybrid_layer_pattern", None)
 
         quant_cfg = getattr(config, "quantization_config", None)
         block_size = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
@@ -561,6 +568,17 @@ class WeightLoader:
         tp_sharding = NamedSharding(self.mesh, P(None, "tensor"))
 
         for layer_idx in sorted(fused_qkv_buffers.keys()):
+            # Hybrid SWA/full-attn models (e.g. MiMo-V2.5) can have different
+            # num_kv_heads per layer; pick the correct head counts based on
+            # hybrid_layer_pattern (1=SWA, 0=full).
+            is_swa = (
+                hybrid_layer_pattern is not None
+                and layer_idx < len(hybrid_layer_pattern)
+                and hybrid_layer_pattern[layer_idx] == 1
+            )
+            num_heads = swa_num_heads if is_swa else full_num_heads
+            num_kv_heads = swa_num_kv_heads if is_swa else full_num_kv_heads
+
             buf = fused_qkv_buffers[layer_idx]
             fused_weight = buf["weight"]  # numpy, [total_qkv, hidden], FP8
             fused_scale = buf["scale"]  # numpy, [total_blocks, in_blocks], f32
@@ -699,8 +717,15 @@ class WeightLoader:
         # Try config value first, then smaller divisors (descending)
         kv_candidates = sorted(set(kv_candidates), reverse=True)
 
-        # TP candidates: all divisors of num_heads (covers any quantization-time TP)
-        tp_candidates = sorted(d for d in range(1, num_heads + 1) if num_heads % d == 0)
+        # TP candidates: all divisors of num_heads, descending.  Prefer the
+        # largest TP that matches because the Q/K/V split must reflect the
+        # actual quantization-time sharding.  When per_shard_total is a
+        # multiple of block_size, smaller TP values also satisfy the
+        # dimension check but produce an incorrect Q/K/V split.
+        tp_candidates = sorted(
+            (d for d in range(1, num_heads + 1) if num_heads % d == 0),
+            reverse=True,
+        )
 
         for orig_kv in kv_candidates:
             for tp in tp_candidates:
@@ -2557,6 +2582,35 @@ class WeightLoader:
                 v_bias = jnp.reshape(v_bias, (self.num_kv_heads * v_head_dim_padded,))
 
             splits = [q_bias, k_bias, v_bias]
+        elif "scale" in hf_key and weight.ndim == 1:
+            # Per-channel weight_scale (e.g. compressed-tensors W8A16): 1-D
+            # shape [Q_out + K_out + V_out,]. Splits along the single axis with
+            # the same Q/K/V offsets the bias branch uses; applies per-head pad
+            # the same way if mapping.head_dim_padding is set. Falls through to
+            # the 2-D scale branch below for block-quant scales (ndim == 2).
+            q_dim = self.num_heads * self.head_dim_original
+            k_dim = self.num_kv_heads * self.head_dim_original
+            v_dim = self.num_kv_heads * v_head_dim
+
+            q_scale = weight[:q_dim]
+            k_scale = weight[q_dim : q_dim + k_dim]
+            v_scale = weight[q_dim + k_dim : q_dim + k_dim + v_dim]
+
+            if mapping.head_dim_padding and self.head_dim_pad > 0:
+                q_scale = jnp.reshape(q_scale, (self.num_heads, self.head_dim_original))
+                q_scale = jnp.pad(q_scale, ((0, 0), (0, self.head_dim_pad)))
+                q_scale = jnp.reshape(q_scale, (self.num_heads * self.head_dim,))
+
+                k_scale = jnp.reshape(k_scale, (self.num_kv_heads, self.head_dim_original))
+                k_scale = jnp.pad(k_scale, ((0, 0), (0, self.head_dim_pad)))
+                k_scale = jnp.reshape(k_scale, (self.num_kv_heads * self.head_dim,))
+
+            if mapping.head_dim_padding and v_head_dim_pad > 0:
+                v_scale = jnp.reshape(v_scale, (self.num_kv_heads, v_head_dim))
+                v_scale = jnp.pad(v_scale, ((0, 0), (0, v_head_dim_pad)))
+                v_scale = jnp.reshape(v_scale, (self.num_kv_heads * v_head_dim_padded,))
+
+            splits = [q_scale, k_scale, v_scale]
         elif "scale" in hf_key and weight.ndim == 2:
             # Block-quant scale: split along block dimension, not element dimension.
             # The fused QKV scale has shape [total_blocks, in_blocks] where blocks
@@ -2768,10 +2822,9 @@ class WeightLoader:
         elif padding_strategy == "zero":
             target_heads_total = total_kv_heads * num_replicas
 
-            if step_size == 1:
-                target_len = target_heads_total
-            else:
-                target_len = target_heads_total * self.head_dim
+            target_len = (
+                target_heads_total if step_size == 1 else target_heads_total * self.head_dim
+            )
 
             current_len = weight.shape[target_axis]
             padding_len = target_len - current_len

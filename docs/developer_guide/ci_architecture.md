@@ -68,8 +68,8 @@ Testing follows a progressive strategy:
 | unit-test-4-tpu | 4x TPU | - | All unit test pass|
 | performance-test-1-tpu (including cache miss check) | 1x TPU | - | Latency, Throughput|
 | performance-test-4-tpu (including cache miss check) | 4x TPU | - | Latency, Throughput|
-| accurancy-test-1-tpu | 1x TPU | - | Model Evaluation  |
-| accurancy-test-4-tpu | 4x TPU | - | Model Evaluation  |
+| accuracy-test-1-tpu | 1x TPU | - | Model Evaluation  |
+| accuracy-test-4-tpu | 4x TPU | - | Model Evaluation  |
 | pallas-kernel-benchmark | 1x TPU | - | Speed |
 | e2e-test-1-tpu | 1x TPU | - | Accuracy |
 | e2e-test-4-tpu | 4x TPU | - | Accuracy |
@@ -96,8 +96,8 @@ Coming soon
 | unit-test-4-tpu | 4x TPU | - | All unit test pass|
 | performance-test-1-tpu (including cache miss check) | 1x TPU | - | Latency, Throughput|
 | performance-test-4-tpu (including cache miss check) | 4x TPU | - | Latency, Throughput|
-| accurancy-test-1-tpu | 1x TPU | - | Model Evaluation  |
-| accurancy-test-4-tpu | 4x TPU | - | Model Evaluation  |
+| accuracy-test-1-tpu | 1x TPU | - | Model Evaluation  |
+| accuracy-test-4-tpu | 4x TPU | - | Model Evaluation  |
 | pallas-kernel-benchmark | 1x TPU | - | Speed |
 | e2e-test-1-tpu | 1x TPU | - | Accuracy |
 | e2e-test-4-tpu | 4x TPU | - | Accuracy |
