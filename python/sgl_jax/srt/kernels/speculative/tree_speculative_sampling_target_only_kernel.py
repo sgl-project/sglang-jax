@@ -48,12 +48,11 @@ def _tree_speculative_sampling_target_only_kernel(
     coin = uniform_samples_ref[offset + cur_index]
     last_accepted_retrive_idx = retrive_index_ref[offset]
     num_accepted_tokens = 0
-    o_accept_index_ref.at[bid, 0].set(last_accepted_retrive_idx)
 
     def init_accept_index():
         def body(i, _):
             o_accept_index_ref.at[bid, i].set(-1)
-            return ()
+            return None
 
         jax.lax.fori_loop(
             0,
@@ -63,32 +62,22 @@ def _tree_speculative_sampling_target_only_kernel(
             unroll=num_spec_tokens,
         )
 
-    # init accept_index to -1
-    init_accept_index()
+    def init_predicts():
+        def body(i, _):
+            o_predicts_ref.at[offset + i].set(-1)
+            return None
 
-    def probs_cumsum(arr):
-        csum_arr = jnp.empty(arr.shape, dtype=arr.dtype)
-        sum = jnp.array(0, dtype=arr.dtype)
-
-        def body(i, state):
-            sum, csum_arr = state
-            new_sum = sum + jax.lax.dynamic_slice(arr, (i,), (1,))
-            csum_arr.at[i].set(new_sum)
-            return sum, csum_arr
-
-        _, csum_arr = jax.lax.fori_loop(
+        jax.lax.fori_loop(
             0,
-            arr.shape[0],
+            num_draft_tokens,
             body,
-            (sum, csum_arr),
+            None,
+            unroll=num_draft_tokens,
         )
-        return csum_arr
 
-    def _sampling_from_prob(probs, threshold):
-        valid_probs = jnp.where(probs > 0, probs, 0)
-        cumsum_probs = probs_cumsum(valid_probs)
-        selected_idx = jax.lax.argmax(cumsum_probs > threshold, axis=0, index_dtype=jnp.int32)
-        return selected_idx
+    init_accept_index()
+    init_predicts()
+    o_accept_index_ref.at[bid, 0].set(last_accepted_retrive_idx)
 
     def body(i, state):
         (
@@ -125,11 +114,13 @@ def _tree_speculative_sampling_target_only_kernel(
                 ) = state
                 draft_index = retrive_index_ref[offset + cur_index]
                 draft_token_id = candidates_ref[offset + cur_index]
+                aligned_token_id = (draft_token_id // 128) * 128
+                token_offset = draft_token_id - aligned_token_id
                 sync_copy(
-                    target_probs_ref.at[cur_prob_offset, pl.ds(draft_token_id, 128)],
+                    target_probs_ref.at[cur_prob_offset, pl.ds(aligned_token_id, 128)],
                     target_probs_buffer_ref.at[0],
                 )
-                target_prob_single = target_probs_buffer_ref[0, 0]
+                target_prob_single = target_probs_buffer_ref[0, token_offset]
                 prob_acc += target_prob_single
 
                 def on_true(state):
@@ -175,17 +166,17 @@ def _tree_speculative_sampling_target_only_kernel(
                     ) = state
                     # FIXME: leverage draft probs
                     sync_copy(
-                        target_probs_ref.at[cur_prob_offset, pl.ds(draft_token_id, 128)],
+                        target_probs_ref.at[cur_prob_offset, pl.ds(aligned_token_id, 128)],
                         target_probs_buffer_ref.at[0],
                     )
                     sync_copy(
-                        draft_probs_ref.at[cur_prob_offset, pl.ds(draft_token_id, 128)],
+                        draft_probs_ref.at[cur_prob_offset, pl.ds(aligned_token_id, 128)],
                         draft_probs_buffer_ref.at[0],
                     )
-                    draft_probs_buffer_ref.at[0, 0].set(target_probs_buffer_ref[0, 0])
+                    draft_probs_buffer_ref.at[0, token_offset].set(target_probs_buffer_ref[0, token_offset])
                     sync_copy(
                         draft_probs_buffer_ref.at[0],
-                        draft_probs_ref.at[cur_prob_offset, pl.ds(draft_token_id, 128)],
+                        draft_probs_ref.at[cur_prob_offset, pl.ds(aligned_token_id, 128)],
                     )
 
                     cur_index = retrive_next_sibling_ref[offset + cur_index]
@@ -301,7 +292,7 @@ def _tree_speculative_sampling_target_only_kernel(
         last_accepted_retrive_idx,
         _,
     ) = jax.lax.fori_loop(
-        0,
+        1,
         num_spec_tokens,
         body,
         (
@@ -335,10 +326,43 @@ def _tree_speculative_sampling_target_only_kernel(
     )
 
     relu_q_minus_p_vec = jnp.maximum(q_vec_ref[0] - p_vec_ref[0], 0)
-    print(f"{relu_q_minus_p_vec.shape=}")
-    sum_relu_q_minus_p = jnp.sum(relu_q_minus_p_vec)
+    valid_probs = jnp.where(relu_q_minus_p_vec > 0, relu_q_minus_p_vec, 0)
+    q_vec_ref.at[0].set(valid_probs)
+    sum_relu_q_minus_p = jnp.sum(valid_probs)
     u = coin * sum_relu_q_minus_p
-    sampled_id = _sampling_from_prob(relu_q_minus_p_vec, u)
+
+    vocab_size = q_vec_ref.shape[1]
+    num_chunks = vocab_size // 128
+
+    def sample_chunk(chunk_idx, state):
+        chunk_start = chunk_idx * 128
+        sync_copy(q_vec_ref.at[0, pl.ds(chunk_start, 128)], target_probs_buffer_ref.at[0])
+
+        def sample_elem(j, state):
+            running_sum, selected_idx, found, last_valid = state
+            elem = target_probs_buffer_ref[0, j]
+            idx = chunk_start + j
+            running_sum = running_sum + elem
+            should_select = (~found) & (running_sum > u)
+            selected_idx = jnp.where(should_select, idx, selected_idx)
+            found = found | should_select
+            last_valid = jnp.where(elem > 0, idx, last_valid)
+            return running_sum, selected_idx, found, last_valid
+
+        return jax.lax.fori_loop(0, 128, sample_elem, state)
+
+    _, sampled_id, found, last_valid = jax.lax.fori_loop(
+        0,
+        num_chunks,
+        sample_chunk,
+        (
+            jnp.array(0, dtype=dtype),
+            jnp.int32(0),
+            jnp.bool_(False),
+            jnp.int32(vocab_size - 1),
+        ),
+    )
+    sampled_id = jnp.where(found, sampled_id, last_valid)
     o_predicts_ref.at[last_accepted_retrive_idx].set(sampled_id)
 
 
@@ -434,7 +458,6 @@ def tree_speculative_sampling_target_only_pallas_call(
     bs = candidates.shape[0]
     draft_token_num = retrive_index.shape[1]
     num_spec_tokens = accept_index.shape[1]
-    vocab_size = target_probs.shape[1]
 
     (
         candidates,
@@ -453,6 +476,8 @@ def tree_speculative_sampling_target_only_pallas_call(
         target_probs,
         draft_probs,
     )
+
+    vocab_size = target_probs.shape[1]
 
     scalar_prefetches = (
         candidates,
