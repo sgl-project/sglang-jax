@@ -1838,6 +1838,7 @@ class Scheduler(
                     precompile_cache_loc_paddings,
                     self.page_size,
                     self.server_args.enable_static_lora,
+                    draft_token_num=self.draft_worker.speculative_num_draft_tokens,
                 )
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch

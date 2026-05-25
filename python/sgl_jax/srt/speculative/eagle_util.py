@@ -518,7 +518,7 @@ class EagleDraftInput:
         # (= total_bs / dp). Hardcoding 1 here drops dp=1 multi-req.
         per_dp_bs = model_worker_batch.per_dp_bs_size
         total_tok = len(model_worker_batch.input_ids)
-        per_dp_tok = total_tok // dp_size if dp_size > 0 else total_tok
+        per_dp_tok = total_tok // dp_size
         extend_seq_lens = model_worker_batch.extend_seq_lens
         flat_idx = 0  # index into self.verified_id (cross-rank flat)
         for dp_rank in range(dp_size):
@@ -701,12 +701,28 @@ class EagleDraftInput:
 
         self.accept_length_cpu = np.asarray(accept_length_cpu_host, dtype=np.int32)
 
+    def _ensure_host(self):
+        """Move device arrays to host (numpy) to avoid variable-shape device ops.
+
+        Spec decode postprocessing (filter_batch, merge_batch, split/concat)
+        operates on per-request arrays whose size varies with real_bs. Keeping
+        these as jax.Array triggers implicit JIT compilation for each new shape.
+        Converting to numpy first and re-uploading at bucket-padded size in
+        _scatter_spec_info_to_dp_slots eliminates those persistent cache misses.
+        """
+        device_fields = ("topk_p", "topk_index", "hidden_states", "verified_id", "accept_length")
+        to_copy = []
+        for f in device_fields:
+            v = getattr(self, f, None)
+            if v is not None and hasattr(v, "copy_to_host_async"):
+                jax.copy_to_host_async(v)
+                to_copy.append(f)
+        for f in to_copy:
+            setattr(self, f, np.asarray(getattr(self, f)))
+
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True):
         new_indices = np.asarray(new_indices)
-        # Verify path produces a pre-trimmed next_draft_input so len matches
-        # and truncate is a no-op. Other paths (draft_extend) leave self at
-        # full per-rank size and need fancy-index; the length check is the
-        # real guard, has_been_filtered is kept for backward signalling.
+        self._ensure_host()
         if has_been_filtered and len(new_indices) == len(self.topk_p):
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
@@ -723,7 +739,6 @@ class EagleDraftInput:
                 self.allocate_lens = np.asarray(self.allocate_lens)[new_indices]
 
     def merge_batch(self, spec_info: EagleDraftInput):
-        # FIXME(pc) need support overlap here
         if self.hidden_states is None:
             self.hidden_states = spec_info.hidden_states
             self.verified_id = spec_info.verified_id
@@ -732,10 +747,12 @@ class EagleDraftInput:
             return
         if spec_info.hidden_states is None:
             return
-        self.hidden_states = jnp.concatenate([self.hidden_states, spec_info.hidden_states], axis=0)
-        self.verified_id = jnp.concatenate([self.verified_id, spec_info.verified_id], axis=0)
-        self.topk_p = jnp.concatenate([self.topk_p, spec_info.topk_p])
-        self.topk_index = jnp.concatenate([self.topk_index, spec_info.topk_index])
+        self._ensure_host()
+        spec_info._ensure_host()
+        self.hidden_states = np.concatenate([self.hidden_states, spec_info.hidden_states], axis=0)
+        self.verified_id = np.concatenate([self.verified_id, spec_info.verified_id], axis=0)
+        self.topk_p = np.concatenate([self.topk_p, spec_info.topk_p])
+        self.topk_index = np.concatenate([self.topk_index, spec_info.topk_index])
         self.allocate_lens = np.concatenate([self.allocate_lens, spec_info.allocate_lens])
 
 

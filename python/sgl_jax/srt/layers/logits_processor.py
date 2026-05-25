@@ -202,7 +202,8 @@ class LogitsMetadata:
             logits_indices=device_array(batch.logits_indices, sharding=sharding),
             accept_lens=(
                 device_array(batch.spec_info_padded.accept_length, sharding=sharding)
-                if batch.spec_info_padded is not None
+                if batch.forward_mode.is_draft_extend()
+                and batch.spec_info_padded is not None
                 and hasattr(batch.spec_info_padded, "accept_length")
                 and batch.spec_info_padded.accept_length is not None
                 else None

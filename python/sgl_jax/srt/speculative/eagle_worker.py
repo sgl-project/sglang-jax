@@ -4,6 +4,7 @@ import time
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from tqdm import tqdm
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
@@ -211,6 +212,17 @@ class EAGLEWorker(BaseSpecWorker):
                 model_worker_batch.speculative_eagle_topk = self.topk
                 model_worker_batch.speculative_num_draft_tokens = self.speculative_num_draft_tokens
                 model_worker_batch.speculative_num_steps = self.speculative_num_steps
+                # Pad out_cache_loc to bs * draft_token_num so verify/draft_extend
+                # forward see the same shape runtime _get_spec_decode_mwb_dp emits.
+                ocl_target = bs * self.speculative_num_draft_tokens
+                if model_worker_batch.out_cache_loc.shape[0] < ocl_target:
+                    pad_len = ocl_target - model_worker_batch.out_cache_loc.shape[0]
+                    model_worker_batch.out_cache_loc = np.concatenate(
+                        [
+                            np.asarray(model_worker_batch.out_cache_loc, dtype=np.int32),
+                            np.full(pad_len, -1, dtype=np.int32),
+                        ]
+                    )
                 self.forward_batch_speculative_generation(model_worker_batch)
 
         end_time = time.perf_counter()

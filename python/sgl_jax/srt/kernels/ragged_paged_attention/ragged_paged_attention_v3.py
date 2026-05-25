@@ -1634,6 +1634,7 @@ def get_vmem_limit():
         "skip_kv_mask",
         "disable_semaphore_checks",
         "debug_mode",
+        "mask_aligned_to_cu_kv",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache_fused"),
 )
@@ -1668,6 +1669,7 @@ def ragged_paged_attention(
     skip_kv_mask: bool = False,
     disable_semaphore_checks: bool = True,
     debug_mode: bool = False,
+    mask_aligned_to_cu_kv: bool = False,
 ):
     """Ragged paged attention with fused KV cache.
 
@@ -1759,12 +1761,9 @@ def ragged_paged_attention(
     if out_dtype is None:
         out_dtype = jnp.float32 if q.dtype == jnp.float32 else jnp.bfloat16
 
-    # When page_size>=256 the dynamic mask slice in _fetch_mask fails
-    # Mosaic's tiling(8) proof; under that condition the host pads each
-    # mask row to the page-aligned kv_len (= cu_kv_lens delta). Derive
-    # the gate here from kv_cache shape (static) so it survives jit
-    # tracing without an extra kwarg from the backend.
-    mask_aligned_to_cu_kv = int(page_size) >= 256
+    # mask_aligned_to_cu_kv: when True the kernel uses cu_kv_lens deltas
+    # (page-aligned) as mask row widths; the host must have padded each row
+    # accordingly. target_verify always pads; prefill does not.
 
     # Prepare custom mask.
     if custom_mask is not None:
