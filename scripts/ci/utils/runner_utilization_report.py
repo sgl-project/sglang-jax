@@ -160,6 +160,8 @@ def get_runners(repo, online_only=False):
             [
                 "api",
                 f"/repos/{repo}/actions/runners",
+                "--method",
+                "GET",
                 "--paginate",
                 "--jq",
                 ".runners[]",
@@ -697,11 +699,11 @@ def format_report(report_data, hours):
     failed_jobs = [j for j in all_jobs if j["conclusion"] == "failure"]
     if failed_jobs:
         failed_jobs_sorted = sorted(failed_jobs, key=lambda j: j["duration"], reverse=True)
-        lines.append("| Workflow | Job | Conclusion | Duration | Runner Label | Link |")
-        lines.append("|---|---|---|---|---|---|")
+        lines.append("| Workflow | Job | Duration | Runner Label | Link |")
+        lines.append("|---|---|---|---|---|")
         for job in failed_jobs_sorted[:20]:
             lines.append(
-                f"| {job['workflow']} | {job['job_name']} | {job['conclusion']} | {_format_duration(job['duration'])} | {job['label']} | [Run]({job['url']}) |"
+                f"| {job['workflow']} | {job['job_name']} | {_format_duration(job['duration'])} | {job['label']} | [Run]({job['url']}) |"
             )
     else:
         lines.append("No failed jobs in this period.")
@@ -711,10 +713,14 @@ def format_report(report_data, hours):
     # Hourly Distribution
     lines.append("## Hourly Distribution (UTC)")
     lines.append("")
-    lines.append("| Hour | Jobs Started |")
-    lines.append("|---|---|")
-    for h in range(24):
-        lines.append(f"| {h:02d}:00 | {hourly_buckets.get(h, 0)} |")
+    active_hours = [(h, hourly_buckets[h]) for h in range(24) if hourly_buckets.get(h, 0) > 0]
+    if active_hours:
+        lines.append("| Hour | Jobs Started |")
+        lines.append("|---|---|")
+        for h, count in active_hours:
+            lines.append(f"| {h:02d}:00 | {count} |")
+    else:
+        lines.append("No jobs started in this period.")
 
     lines.append("")
 
@@ -788,6 +794,55 @@ def format_report(report_data, hours):
     return "\n".join(lines)
 
 
+def format_slack_summary(report_data, hours):
+    """Format a compact plain-text summary for Slack (no markdown tables)."""
+    results = report_data["per_label"]
+    fleet_status = report_data["fleet_status"]
+    recommendations = []
+
+    lines = [f"*Runner Utilization Report (Past {hours} Hours)*", ""]
+
+    for label in sorted(set(list(results.keys()) + list(fleet_status.keys()))):
+        parts = [f"• *{label}*:"]
+        fs = fleet_status.get(label)
+        if fs:
+            parts.append(f"{fs['total']} runners ({fs['online']} online, {fs['busy']} busy)")
+        data = results.get(label)
+        if data:
+            parts.append(f"{data['job_count']} jobs")
+            util = data["utilization_pct"]
+            if util is not None:
+                parts.append(f"utilization {util:.1f}%")
+            if data["wait_p95"] > 0:
+                parts.append(f"wait P95 {_format_duration(data['wait_p95'])}")
+            rate = (
+                f"{data['success_count'] / data['total_concluded'] * 100:.0f}%"
+                if data["total_concluded"] > 0
+                else "N/A"
+            )
+            parts.append(f"success rate {rate}")
+        lines.append(" | ".join(parts))
+
+    for label, data in sorted(results.items()):
+        if data["wait_p95"] > 600:
+            recommendations.append(
+                f"⚠ {label}: P95 queue wait {_format_duration(data['wait_p95'])}"
+            )
+        if data["total_concluded"] > 5 and data["failure_count"] / data["total_concluded"] > 0.2:
+            recommendations.append(
+                f"⚠ {label}: {data['failure_count']}/{data['total_concluded']} jobs failed"
+            )
+
+    if recommendations:
+        lines.append("")
+        lines.extend(recommendations)
+    else:
+        lines.append("")
+        lines.append("✓ No issues detected")
+
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate runner utilization report")
     parser.add_argument(
@@ -798,6 +853,7 @@ def main():
         "--filter", type=str, dest="filter", help="Filter runner labels (substring match)"
     )
     parser.add_argument("--output", type=str, help="Output file path (default: stdout)")
+    parser.add_argument("--slack-summary", type=str, help="Write Slack summary to this file")
     args = parser.parse_args()
 
     if args.hours < 1:
@@ -817,6 +873,12 @@ def main():
         print(f"Report written to {args.output}")
     else:
         print(report)
+
+    if args.slack_summary:
+        slack = format_slack_summary(report_data, hours=args.hours)
+        with open(args.slack_summary, "w") as f:
+            f.write(slack)
+        print(f"Slack summary written to {args.slack_summary}")
 
     # Write to GitHub Actions step summary if available
     step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
