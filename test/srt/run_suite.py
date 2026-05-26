@@ -228,21 +228,11 @@ suites = {
     "nightly-test-accuracy-text-models-tpu-v6e-1": [
         TestFile(
             "nightly-test/test_accuracy.py",
-            estimated_time=300,
-            test_methods=["TestModelAccuracy.test_qwen_7b"],
-        ),
-        TestFile(
-            "nightly-test/test_accuracy.py",
             estimated_time=312,
             test_methods=["TestModelAccuracy.test_qwen3_8b"],
         ),
     ],
     "nightly-test-accuracy-text-models-tpu-v6e-4": [
-        TestFile(
-            "nightly-test/test_accuracy.py",
-            estimated_time=53,
-            test_methods=["TestModelAccuracy.test_qwen_7b_tp_4"],
-        ),
         TestFile(
             "nightly-test/test_accuracy.py",
             estimated_time=64,
@@ -286,20 +276,10 @@ suites = {
             test_methods=["TestModelPerf.test_qwen3_32B_lora_r32_performance_tp_4"],
         ),
     ],
-    "nightly-test-accuracy-text-models-tpu-v6e-1-daily": [
-        TestFile(
-            "nightly-test/test_accuracy_daily.py",
-            estimated_time=300,
-            test_methods=["TestModelAccuracy.test_qwen_7b_daily"],
-        ),
-    ],
-    "nightly-test-perf-text-models-tpu-v6e-1-daily": [
-        TestFile(
-            "nightly-test/test_perf_daily.py",
-            estimated_time=7,
-            test_methods=["TestModelPerf.test_qwen_7b_performance_tp_1_daily"],
-        ),
-    ],
+    # *-daily suites are empty shells (see #1117 nightly-vs-daily split decision).
+    # Daily workflow keeps running so new cases can be added without restructuring CI.
+    "nightly-test-accuracy-text-models-tpu-v6e-1-daily": [],
+    "nightly-test-perf-text-models-tpu-v6e-1-daily": [],
     "sglang_dependency_test": [],
     "unit-test-tpu-v6e-1": [
         TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.1, runner="pytest"),

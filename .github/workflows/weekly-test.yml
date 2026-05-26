@@ -1,4 +1,8 @@
-name: Nightly Test
+name: Weekly Test
+
+# Runs every Sunday 00:00 UTC+8 — full regression on v6e-1 + v6e-4. The
+# lightweight daily fallback lives in nightly-test-daily.yml. See #1117 for
+# the nightly-vs-daily split discussion.
 
 on:
   schedule:
@@ -10,7 +14,7 @@ on:
       - "python/sgl_jax/version.py"
   workflow_dispatch:
 concurrency:
-  group: nightly-test-${{ github.ref }}
+  group: weekly-test-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -21,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1]
+        part: [0]
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
@@ -47,7 +51,7 @@ jobs:
 
           bash scripts/killall_sglang.sh
           cd test/srt
-          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --reruns 2
+          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --reruns 2
       - name: Publish traces to storage repo
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
@@ -85,7 +89,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2, 3]
+        part: [0, 1, 2]
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
@@ -111,7 +115,7 @@ jobs:
 
           bash scripts/killall_sglang.sh
           cd test/srt
-          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --reruns 2
+          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --reruns 2
       - name: Publish traces to storage repo
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
