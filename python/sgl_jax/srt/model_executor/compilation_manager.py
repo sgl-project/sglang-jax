@@ -112,17 +112,6 @@ class CompilationManager:
         self._precompile_decode(
             forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
         )
-        # Greedy sampling (temperature=0) has a different pytree footprint than
-        # the non-greedy default (`generate_for_precompile` vs
-        # `generate_for_precompile_all_greedy` toggle `is_all_greedy`/
-        # `need_top_k_sampling`/etc.). Without this pass, every greedy-temp
-        # batch shape triggers a fresh sampler JIT compile at runtime. Common
-        # eval harnesses (lmms-eval / vLLM evaluator) default to temperature=0
-        # for deterministic scoring, so this pass is essentially free for
-        # production paths and dramatically reduces cache_miss/step.
-        self._precompile_decode_greedy(
-            forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
-        )
         # Multimodal models additionally need the ViT and splice JITs warmed
         # up — they are NOT exercised by the text-only dummy batches above.
         if getattr(model_runner, "is_multimodal_model", False):
@@ -136,6 +125,13 @@ class CompilationManager:
             self._precompile_extend_with_input_embedding(
                 forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
             )
+        # Note: do NOT add a "greedy sampler precompile" pass here. The
+        # non-greedy and all-greedy `ModelWorkerSamplingInfo` factories
+        # produce identical pytree structure (only field values differ). The
+        # sampler itself branches on `apply_vocab_mask` etc. via `lax.cond`,
+        # which traces both branches into one graph. So an explicit greedy
+        # pass adds zero new cache entries — confirmed empirically (a prior
+        # attempt finished in <1s with no JIT compile events).
 
     def _precompile_visual_encode(self, model_runner: ModelRunner):
         """AOT-compile `jitted_visual_encode` for every power-of-two patch
@@ -334,80 +330,6 @@ class CompilationManager:
             end_time - start_time,
         )
 
-    def _precompile_decode_greedy(
-        self,
-        forward_fn: Callable,
-        model_runner: ModelRunner,
-        mesh,
-        prepare_lora_fn: Callable | None,
-        future_token_ids_map,
-    ):
-        """Warm the sampler for greedy (`temperature=0`) decode batches.
-
-        The default `_precompile_decode` uses `generate_for_precompile` which
-        sets `is_all_greedy=False, need_top_k=True, need_min_p=True`. Eval
-        harnesses that fix `temperature=0` produce sampling_info with
-        `is_all_greedy=True` and the per-sampler-strategy booleans flipped —
-        the pytree footprint changes, so the sampler JIT misses on every new
-        batch shape. This pass mirrors `_precompile_decode` but with
-        `greedy=True` so both code paths land warm cache.
-        """
-        from sgl_jax.srt.managers.schedule_batch import ForwardMode
-        from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-        from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
-
-        start_time = time.perf_counter()
-        logger.info(
-            "[DECODE_GREEDY] Begin to precompile bs_paddings=%s",
-            self.bs_buckets,
-        )
-
-        with tqdm(
-            enumerate(self.bs_buckets),
-            desc="[DECODE_GREEDY] PRECOMPILE",
-            leave=False,
-            total=len(self.bs_buckets),
-        ) as pbar:
-            for i, bs_val in pbar:
-                pbar.set_postfix(bs=bs_val)
-                aligned_cache_loc_size = self.cache_loc_buckets[i]
-                batch = self._make_dummy_batch(
-                    bs_val,
-                    bs_val,
-                    ForwardMode.DECODE,
-                    aligned_cache_loc_size,
-                    dp_size=self.dp_size,
-                    per_dp_bs_size=bs_val // self.dp_size,
-                    greedy=True,
-                )
-                if prepare_lora_fn is not None:
-                    prepare_lora_fn(batch)
-                sampling_metadata = SamplingMetadata.from_model_worker_batch(
-                    batch, 0, mesh, self.vocab_size
-                )
-                batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
-                if future_token_ids_map is not None:
-                    from sgl_jax.srt.managers.utils import (
-                        resolve_future_token_ids,
-                        set_future_token_ids,
-                    )
-
-                    batch.forward_batch.input_ids = resolve_future_token_ids(
-                        batch.forward_batch.input_ids, future_token_ids_map, mesh
-                    )
-                result = forward_fn(
-                    batch,
-                    launch_done=None,
-                    skip_sample=False,
-                    sampling_metadata=sampling_metadata,
-                )
-                if future_token_ids_map is not None:
-                    _, next_token_ids, _ = result
-                    set_future_token_ids(future_token_ids_map, 0, next_token_ids, mesh)
-
-        end_time = time.perf_counter()
-        logger.info("[DECODE_GREEDY] Precompile finished in %.0f secs", end_time - start_time)
-
     def _precompile_extend(
         self,
         forward_fn: Callable,
@@ -543,7 +465,6 @@ class CompilationManager:
         dp_size: int = 1,
         per_dp_bs_size: int = 0,
         *,
-        greedy: bool = False,
         input_embedding=None,
         deepstack_visual_embedding=None,
     ):
@@ -573,18 +494,12 @@ class CompilationManager:
         extend_seq_lens = np.array([1] * bs) if mode == ForwardMode.EXTEND else None
         logits_indices = np.array([0] * bs) if mode == ForwardMode.EXTEND else None
 
-        # Sampler precompile coverage: by default we use the non-greedy variant
-        # (matches typical eval traffic with temperature > 0). Setting greedy=True
-        # routes through `generate_for_precompile_all_greedy` so the
-        # `is_all_greedy=True, need_top_k=False` sampler JIT cache key is also
-        # warmed — lmms-eval's `temperature=0` requests would otherwise hit a
-        # cold compile per batch shape.
-        if greedy or speculative_algorithm is not None:
+        if speculative_algorithm is None:
+            sampling_info = ModelWorkerSamplingInfo.generate_for_precompile(bs, self.vocab_size)
+        else:
             sampling_info = ModelWorkerSamplingInfo.generate_for_precompile_all_greedy(
                 bs, self.vocab_size
             )
-        else:
-            sampling_info = ModelWorkerSamplingInfo.generate_for_precompile(bs, self.vocab_size)
 
         return ModelWorkerBatch(
             bid=1,

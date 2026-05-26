@@ -163,16 +163,6 @@ def _vit_flash_attention_tpu(
     return jnp.transpose(out, (0, 2, 1, 3)).astype(orig_dtype)
 
 
-def _vit_splash_disabled() -> bool:
-    """Env-var bypass for ViT splash kernel: SGL_VIT_DISABLE_SPLASH=1 routes
-    TPU vision attention through the float32 einsum reference path. Used to
-    A/B-test whether degenerate-loop generation traces back to the splash
-    kernel block-boundary numerics."""
-    import os
-
-    return os.environ.get("SGL_VIT_DISABLE_SPLASH", "0") == "1"
-
-
 def _vision_attention(
     q: jax.Array,
     k: jax.Array,
@@ -212,7 +202,7 @@ def _vision_attention(
             return output
         # fall through to native einsum path below
 
-    if is_tpu_runtime() and segment_ids_1d is not None and not _vit_splash_disabled():
+    if is_tpu_runtime() and segment_ids_1d is not None:
         return _vit_flash_attention_tpu(q, k, v, scale, segment_ids_1d, mesh)
 
     B, T, N, H = q.shape
@@ -718,7 +708,7 @@ class Qwen3VLVisionModel(nnx.Module):
             n_real = jnp.asarray(n_real_images, dtype=jnp.int32)
             valid = seg_ids < n_real  # [T]
             seg_ids_for_kernel = jnp.where(valid, seg_ids, jnp.int32(-1))
-            if not is_tpu_runtime() or _vit_splash_disabled():
+            if not is_tpu_runtime():
                 attn_mask = (seg_ids[:, None] == seg_ids[None, :]) & valid[None, :]
 
         # ------------- pos_embed + RoPE (built from static grid_thw) -------------
