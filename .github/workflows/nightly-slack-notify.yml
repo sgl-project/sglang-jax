@@ -17,13 +17,17 @@ jobs:
   notify-failure:
     if: github.event.workflow_run.conclusion == 'failure' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       actions: read
+      contents: read
+      id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Check for failures
+      - name: Classify failures
+        id: classify
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -42,8 +46,93 @@ jobs:
           --commit-author "$COMMIT_AUTHOR"
           --slack-output slack_summary.txt
 
+      - name: AI bug analysis
+        id: ai_analysis
+        if: steps.classify.outputs.has_bugs == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          track_progress: false
+          prompt: |
+            # Nightly CI Bug Analysis
+
+            REPO: ${{ github.repository }}
+            RUN_ID: ${{ github.event.workflow_run.id || github.event.inputs.run_id }}
+
+            You are analyzing failed nightly CI jobs that have been
+            pre-classified as likely bugs (not timeouts, resource exhaustion,
+            or infrastructure issues).
+
+            The file `classification.json` in the working directory contains
+            the failure classification for all jobs. Focus ONLY on jobs where
+            `failure_type` is `"bug"`.
+
+            ## Investigation steps
+
+            1. Read `classification.json` to identify bug-type jobs.
+            2. Fetch failure logs:
+               `gh run view <RUN_ID> --log-failed`
+               Focus on tracebacks, assertion errors, and test failures.
+               If logs are large, grep for the actual failing assertion /
+               traceback / non-zero exit rather than reading everything.
+            3. Inspect the source code at HEAD to understand the failing
+               code paths if needed.
+            4. Summarize the root cause in 1-2 sentences per job.
+
+            ## Required output
+
+            Write a file `ai_bug_analysis.txt` with a concise plain-text
+            summary (max 800 chars total) suitable for inclusion in a Slack
+            notification. Use this format — one entry per bug-type job:
+
+            *<job_name>*: <1-2 sentence root cause and suggested fix>
+
+            No markdown headers, no code blocks, no bullet points.
+            Keep it terse — this goes into a Slack notification with a
+            3000 character limit.
+
+            ## Discipline
+
+            - Do not invent facts. If evidence is unavailable, say so.
+            - Do not push code changes.
+            - English output throughout.
+          claude_args: |
+            --model claude-opus-4-7
+            --allowedTools "Read,Grep,Glob,Bash(gh run view:*),Bash(gh api:*),Bash(cat:*),Bash(echo:*),Write"
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          API_TIMEOUT_MS: "3000000"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          ANTHROPIC_MODEL: claude-opus-4-7
+          ANTHROPIC_SMALL_FAST_MODEL: claude-opus-4-7
+          ANTHROPIC_DEFAULT_SONNET_MODEL: claude-sonnet-4-6
+          ANTHROPIC_DEFAULT_OPUS_MODEL: claude-opus-4-7
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: claude-opus-4-7
+          CLAUDE_CODE_LOG_LEVEL: debug
+
+      - name: Finalize summary with AI analysis
+        if: steps.ai_analysis.conclusion == 'success'
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id || github.event.inputs.run_id }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name || 'Manual Check' }}
+          RUN_URL: ${{ github.event.workflow_run.html_url || format('https://github.com/{0}/actions/runs/{1}', github.repository, github.event.inputs.run_id) }}
+          COMMIT_SHA: ${{ github.event.workflow_run.head_sha || 'N/A' }}
+          COMMIT_AUTHOR: ${{ github.event.workflow_run.head_commit.author.name || github.event.workflow_run.actor.login || 'unknown' }}
+        run: >
+          python3 scripts/ci/slack_notify.py
+          --repo "$REPO"
+          --run-id "$RUN_ID"
+          --workflow-name "$WORKFLOW_NAME"
+          --run-url "$RUN_URL"
+          --commit-sha "$COMMIT_SHA"
+          --commit-author "$COMMIT_AUTHOR"
+          --from-classification classification.json
+          --ai-analysis ai_bug_analysis.txt
+          --slack-output slack_summary.txt
+
       - name: Post to Slack
-        if: success()
+        if: always() && steps.classify.conclusion == 'success'
         continue-on-error: true
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
@@ -61,3 +150,14 @@ jobs:
             '{"blocks":[{"type":"section","text":{"type":"mrkdwn","text":$text}}]}' | \
             curl --fail-with-body -X POST -H 'Content-type: application/json' \
               -d @- "$SLACK_WEBHOOK_URL"
+
+      - name: Upload classification artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-failure-classification-${{ github.run_number }}
+          path: |
+            classification.json
+            ai_bug_analysis.txt
+          retention-days: 14
+          if-no-files-found: ignore
