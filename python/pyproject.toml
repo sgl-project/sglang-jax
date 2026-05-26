@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=64.0", "wheel"]
+requires = ["setuptools>=80", "setuptools-scm[simple]>=9.2", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang-jax"
-version = "0.0.2"
+dynamic = ["version"]
 description = "JAX backend for SGL"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
@@ -71,6 +71,11 @@ multimodal = [
     "qwix",
     "soundfile",
 ]
+
+[tool.setuptools_scm]
+root = ".."
+fallback_version = "0.0.0.dev0"
+version_file = "sgl_jax/_version.py"
 
 [tool.setuptools.packages.find]
 exclude = [

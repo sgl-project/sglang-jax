@@ -1,0 +1,116 @@
+name: Release Tag (Validate then Push Tag)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Target version string without v prefix (e.g. 0.0.3, 0.0.3rc0, 0.0.3.post1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  IMAGE: lmsysorg/sglang-jax
+
+jobs:
+  validate-and-tag:
+    if: github.repository == 'sgl-project/sglang-jax'
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate PEP 440 version string
+        run: |
+          python -m pip install --upgrade packaging
+          python -c "from packaging.version import Version; v = Version('${{ inputs.version }}'); print('parsed:', v)"
+
+      - name: Verify HEAD is on main history
+        run: |
+          set -euo pipefail
+          git fetch origin main --depth=0 || git fetch origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Current commit $GITHUB_SHA is not an ancestor of origin/main"
+            exit 1
+          fi
+
+      - name: Verify tag does not already exist
+        run: |
+          set -euo pipefail
+          TAG="v${{ inputs.version }}"
+          if git rev-parse --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists locally"
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists on origin"
+            exit 1
+          fi
+
+      - name: Build wheel (validate, do not publish)
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          cd python
+          cp ../README.md ../LICENSE .
+          python -m pip install --upgrade pip build
+          python -m build
+          ls -la dist
+          test -f "dist/sglang_jax-${{ inputs.version }}-py3-none-any.whl" || \
+            test -f "dist/sglang_jax-${{ inputs.version }}.tar.gz"
+
+      - name: Smoke test wheel
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install --upgrade pip
+          /tmp/venv/bin/pip install python/dist/sglang_jax-${{ inputs.version }}-py3-none-any.whl
+          /tmp/venv/bin/python -c "import sgl_jax; print('sgl_jax version:', sgl_jax.__version__)"
+          /tmp/venv/bin/python -c "import sgl_jax; assert sgl_jax.__version__ == '${{ inputs.version }}', sgl_jax.__version__"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (validate, do not push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ${{ env.IMAGE }}:validate-${{ inputs.version }}
+          build-args: |
+            SETUPTOOLS_SCM_PRETEND_VERSION=${{ inputs.version }}
+
+      - name: Smoke test Docker image
+        run: |
+          set -euo pipefail
+          docker run --rm "${IMAGE}:validate-${{ inputs.version }}" \
+            python -c "import sgl_jax; print('sgl_jax version:', sgl_jax.__version__); assert sgl_jax.__version__ == '${{ inputs.version }}', sgl_jax.__version__"
+
+      - name: Benchmark regression check (placeholder)
+        run: |
+          echo "TODO: implement benchmark regression check on TPU runners"
+
+      - name: Create and push annotated tag
+        run: |
+          set -euo pipefail
+          TAG="v${{ inputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "sglang-jax ${TAG}"
+          git push origin "${TAG}"

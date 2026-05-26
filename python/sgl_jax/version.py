@@ -1,2 +1,1 @@
-# Note that it should be consistent with pyproject.toml
-__version__ = "0.0.2"
+from sgl_jax._version import __version__  # noqa: F401

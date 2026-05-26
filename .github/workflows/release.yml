@@ -1,0 +1,97 @@
+name: Release (Publish Artifacts)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to re-publish (e.g. v0.0.3rc0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  metadata:
+    if: github.repository == 'sgl-project/sglang-jax'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.compute.outputs.tag }}
+      version: ${{ steps.compute.outputs.version }}
+      is_prerelease: ${{ steps.compute.outputs.is_prerelease }}
+      update_latest: ${{ steps.compute.outputs.update_latest }}
+    steps:
+      - name: Compute tag / version / flags
+        id: compute
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          if [[ ! "${TAG}" =~ ^v.+ ]]; then
+            echo "::error::Tag '${TAG}' does not start with 'v'"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          if echo "${VERSION}" | grep -qE 'rc[0-9]+$'; then
+            IS_PRERELEASE=true
+            UPDATE_LATEST=false
+          else
+            IS_PRERELEASE=false
+            UPDATE_LATEST=true
+          fi
+          {
+            echo "tag=${TAG}"
+            echo "version=${VERSION}"
+            echo "is_prerelease=${IS_PRERELEASE}"
+            echo "update_latest=${UPDATE_LATEST}"
+          } >> "$GITHUB_OUTPUT"
+
+  publish-pypi:
+    needs: metadata
+    uses: ./.github/workflows/release-pypi.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.metadata.outputs.version }}
+
+  publish-docker:
+    needs: metadata
+    uses: ./.github/workflows/release-docker.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.metadata.outputs.version }}
+      update_latest: ${{ needs.metadata.outputs.update_latest == 'true' }}
+
+  github-release:
+    needs: [metadata, publish-pypi, publish-docker]
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.metadata.outputs.tag }}
+
+      - name: Generate changelog with git-cliff
+        id: changelog
+        uses: orhun/git-cliff-action@v3
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: CHANGES.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.metadata.outputs.tag }}
+          name: sglang-jax ${{ needs.metadata.outputs.tag }}
+          body: ${{ steps.changelog.outputs.content }}
+          prerelease: ${{ needs.metadata.outputs.is_prerelease == 'true' }}
+          fail_on_unmatched_files: false
