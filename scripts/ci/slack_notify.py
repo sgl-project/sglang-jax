@@ -8,54 +8,10 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "utils"))
+from failure_classifier import FAILURE_TYPES, REPORTABLE_CONCLUSIONS, classify_failure
+
 _NON_RETRYABLE_PATTERNS = ("401", "403", "404", "422", "not found")
-
-_RESOURCE_EXHAUSTION_PATTERNS = [
-    "resource_exhausted",
-    "outofmemoryerror",
-    "memoryerror",
-    "oom",
-    "killed",
-    "signal 9",
-    "cannot allocate memory",
-    "resource temporarily unavailable",
-    "xla::runtime::xlaruntimeerror",
-]
-
-_TIMEOUT_PATTERNS = [
-    "the operation was cancelled",
-    "the runner has received a shutdown signal",
-    "timeout after",
-    "timeouterror",
-    "deadline exceeded",
-    "timed out",
-]
-
-_INFRASTRUCTURE_PATTERNS = [
-    "unable to connect",
-    "connection refused",
-    "connection reset",
-    "connectionerror",
-    "503 service unavailable",
-    "502 bad gateway",
-    "500 internal server error",
-    "serviceunavailable",
-    "unavailable",
-    "httperror",
-    "google.api_core.exceptions",
-    "preempted",
-    "was preempted",
-    "tpu is not healthy",
-    "could not find device",
-    "failed to create tpu",
-]
-
-_FAILURE_EMOJI = {
-    "timeout": ":hourglass:",
-    "resource_exhaustion": ":boom:",
-    "infrastructure": ":cloud:",
-    "bug": ":beetle:",
-}
 
 
 def run_gh_command(args, max_retries=5):
@@ -86,7 +42,7 @@ def run_gh_command(args, max_retries=5):
 
 
 def get_failed_jobs(repo, run_id):
-    """Query GitHub API for jobs with conclusion=failure in the given run."""
+    """Query GitHub API for jobs with reportable conclusions in the given run."""
     failed = []
     page = 1
     while True:
@@ -105,7 +61,7 @@ def get_failed_jobs(repo, run_id):
         data = json.loads(output)
         jobs = data.get("jobs", [])
         for job in jobs:
-            if job.get("conclusion") == "failure":
+            if job.get("conclusion") in REPORTABLE_CONCLUSIONS:
                 failed.append(
                     {
                         "name": job["name"],
@@ -136,37 +92,11 @@ def fetch_job_logs(repo, job_id, max_lines=500):
         return ""
 
 
-def classify_failure(log_text):
-    """Classify failure type from job log text.
-
-    Returns one of: 'timeout', 'resource_exhaustion', 'infrastructure', 'bug'.
-    Priority: resource_exhaustion > timeout > infrastructure > bug (default).
-    """
-    if not log_text:
-        return "bug"
-
-    log_lower = log_text.lower()
-
-    for pattern in _RESOURCE_EXHAUSTION_PATTERNS:
-        if pattern in log_lower:
-            return "resource_exhaustion"
-
-    for pattern in _TIMEOUT_PATTERNS:
-        if pattern in log_lower:
-            return "timeout"
-
-    for pattern in _INFRASTRUCTURE_PATTERNS:
-        if pattern in log_lower:
-            return "infrastructure"
-
-    return "bug"
-
-
 def classify_jobs(repo, failed_jobs):
     """Fetch logs and classify each failed job. Mutates jobs in-place."""
     for job in failed_jobs:
         log_text = fetch_job_logs(repo, job["id"])
-        job["failure_type"] = classify_failure(log_text)
+        job["failure_type"] = classify_failure(log_text, job.get("conclusion"))
         print(f"  {job['name']}: {job['failure_type']}")
 
 
@@ -181,8 +111,10 @@ def format_slack_summary(workflow_name, run_url, commit_sha, author, failed_jobs
     lines.append("")
     lines.append(f"*Failed jobs ({len(failed_jobs)}):*")
     for job in failed_jobs:
-        emoji = _FAILURE_EMOJI.get(job["failure_type"], ":question:")
-        lines.append(f"• {emoji} <{job['html_url']}|{job['name']}> [{job['failure_type']}]")
+        ft = FAILURE_TYPES.get(job["failure_type"], FAILURE_TYPES["bug"])
+        safe_name = job["name"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        safe_name = safe_name.replace("|", "/")
+        lines.append(f"• {ft['emoji']} <{job['html_url']}|{safe_name}> [{ft['label']}]")
 
     if ai_analysis:
         lines.append("")
