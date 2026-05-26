@@ -112,11 +112,30 @@ class CompilationManager:
         self._precompile_decode(
             forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
         )
+        # Greedy sampling (temperature=0) has a different pytree footprint than
+        # the non-greedy default (`generate_for_precompile` vs
+        # `generate_for_precompile_all_greedy` toggle `is_all_greedy`/
+        # `need_top_k_sampling`/etc.). Without this pass, every greedy-temp
+        # batch shape triggers a fresh sampler JIT compile at runtime. Common
+        # eval harnesses (lmms-eval / vLLM evaluator) default to temperature=0
+        # for deterministic scoring, so this pass is essentially free for
+        # production paths and dramatically reduces cache_miss/step.
+        self._precompile_decode_greedy(
+            forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
+        )
         # Multimodal models additionally need the ViT and splice JITs warmed
         # up — they are NOT exercised by the text-only dummy batches above.
         if getattr(model_runner, "is_multimodal_model", False):
             self._precompile_visual_encode(model_runner)
             self._precompile_splice(model_runner)
+            # Multimodal-extend LLM JIT: same `jitted_run_model` as text-only
+            # extend, but the orchestrator pre-populates `input_embedding` so
+            # the pytree footprint of `forward_batch` differs (jax.Array leaf
+            # instead of None). Without this pass, the first multimodal
+            # request per batch shape cold-compiles `jitted_run_model`.
+            self._precompile_extend_with_input_embedding(
+                forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
+            )
 
     def _precompile_visual_encode(self, model_runner: ModelRunner):
         """AOT-compile `jitted_visual_encode` for every power-of-two patch
@@ -223,6 +242,171 @@ class CompilationManager:
 
         end_time = time.perf_counter()
         logger.info("[SPLICE] Precompile finished in %.0f secs", end_time - start_time)
+
+    def _precompile_extend_with_input_embedding(
+        self,
+        forward_fn: Callable,
+        model_runner: ModelRunner,
+        mesh,
+        prepare_lora_fn: Callable | None,
+        future_token_ids_map,
+    ):
+        """Warm `jitted_run_model` for the multimodal-extend pytree footprint.
+
+        The orchestrator (`run_model_wrapper`) populates
+        `forward_batch.input_embedding` (jax.Array leaf) when a request
+        carries pixel_values; the LLM JIT then sees a different pytree
+        footprint than the text-only `input_embedding=None` case covered by
+        `_precompile_extend`. Without this pass each multimodal batch shape
+        cold-compiles `jitted_run_model` on first request — surfaced as
+        ~1 cache_miss per Prefill batch in production runs.
+        """
+        import jax.numpy as jnp
+
+        from sgl_jax.srt.managers.schedule_batch import ForwardMode
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+        from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
+
+        # Read hidden dims from the loaded model — same fields the splice
+        # precompile uses, so we keep the helpers consistent.
+        text_config = getattr(model_runner.model, "text_config", None)
+        vision_config = getattr(model_runner.model, "vision_config", None)
+        if text_config is None or vision_config is None:
+            logger.warning(
+                "[EXTEND_WITH_INPUT_EMBEDDING] model missing text_config / "
+                "vision_config — skip precompile"
+            )
+            return
+        hidden = int(text_config.hidden_size)
+        n_deepstack = len(vision_config.deepstack_visual_indexes)
+        deepstack_dim = hidden * n_deepstack
+
+        start_time = time.perf_counter()
+        bs = self.max_padded_batch_size
+        logger.info(
+            "[EXTEND_WITH_INPUT_EMBEDDING] Begin to precompile bs=%d token_paddings=%s",
+            bs,
+            self.token_buckets,
+        )
+
+        pairs = list(itertools.product([bs], self.token_buckets))
+        with tqdm(pairs, desc="[EXTEND_WITH_INPUT_EMBEDDING] PRECOMPILE", leave=False) as pbar:
+            for bs_val, num_tokens in pbar:
+                pbar.set_postfix(bs=bs_val, tokens=num_tokens)
+                if bs_val > num_tokens:
+                    continue
+                input_embedding = jnp.zeros((num_tokens, hidden), dtype=jnp.bfloat16)
+                deepstack_visual_embedding = jnp.zeros(
+                    (num_tokens, deepstack_dim), dtype=jnp.bfloat16
+                )
+                batch = self._make_dummy_batch(
+                    bs_val,
+                    num_tokens,
+                    ForwardMode.EXTEND,
+                    self.cache_loc_buckets[-1],
+                    dp_size=self.dp_size,
+                    per_dp_bs_size=bs_val // self.dp_size,
+                    input_embedding=input_embedding,
+                    deepstack_visual_embedding=deepstack_visual_embedding,
+                )
+                if prepare_lora_fn is not None:
+                    prepare_lora_fn(batch)
+                sampling_metadata = SamplingMetadata.from_model_worker_batch(
+                    batch, 0, mesh, self.vocab_size
+                )
+                batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
+                if future_token_ids_map is not None:
+                    from sgl_jax.srt.managers.utils import resolve_future_token_ids
+
+                    batch.forward_batch.input_ids = resolve_future_token_ids(
+                        batch.forward_batch.input_ids, future_token_ids_map, mesh
+                    )
+                forward_fn(
+                    batch,
+                    launch_done=None,
+                    skip_sample=False,
+                    sampling_metadata=sampling_metadata,
+                )
+
+        end_time = time.perf_counter()
+        logger.info(
+            "[EXTEND_WITH_INPUT_EMBEDDING] Precompile finished in %.0f secs",
+            end_time - start_time,
+        )
+
+    def _precompile_decode_greedy(
+        self,
+        forward_fn: Callable,
+        model_runner: ModelRunner,
+        mesh,
+        prepare_lora_fn: Callable | None,
+        future_token_ids_map,
+    ):
+        """Warm the sampler for greedy (`temperature=0`) decode batches.
+
+        The default `_precompile_decode` uses `generate_for_precompile` which
+        sets `is_all_greedy=False, need_top_k=True, need_min_p=True`. Eval
+        harnesses that fix `temperature=0` produce sampling_info with
+        `is_all_greedy=True` and the per-sampler-strategy booleans flipped —
+        the pytree footprint changes, so the sampler JIT misses on every new
+        batch shape. This pass mirrors `_precompile_decode` but with
+        `greedy=True` so both code paths land warm cache.
+        """
+        from sgl_jax.srt.managers.schedule_batch import ForwardMode
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+        from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
+
+        start_time = time.perf_counter()
+        logger.info(
+            "[DECODE_GREEDY] Begin to precompile bs_paddings=%s",
+            self.bs_buckets,
+        )
+
+        with tqdm(
+            enumerate(self.bs_buckets),
+            desc="[DECODE_GREEDY] PRECOMPILE",
+            leave=False,
+            total=len(self.bs_buckets),
+        ) as pbar:
+            for i, bs_val in pbar:
+                pbar.set_postfix(bs=bs_val)
+                aligned_cache_loc_size = self.cache_loc_buckets[i]
+                batch = self._make_dummy_batch(
+                    bs_val,
+                    bs_val,
+                    ForwardMode.DECODE,
+                    aligned_cache_loc_size,
+                    dp_size=self.dp_size,
+                    per_dp_bs_size=bs_val // self.dp_size,
+                    greedy=True,
+                )
+                if prepare_lora_fn is not None:
+                    prepare_lora_fn(batch)
+                sampling_metadata = SamplingMetadata.from_model_worker_batch(
+                    batch, 0, mesh, self.vocab_size
+                )
+                batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
+                if future_token_ids_map is not None:
+                    from sgl_jax.srt.managers.utils import (
+                        resolve_future_token_ids,
+                        set_future_token_ids,
+                    )
+
+                    batch.forward_batch.input_ids = resolve_future_token_ids(
+                        batch.forward_batch.input_ids, future_token_ids_map, mesh
+                    )
+                result = forward_fn(
+                    batch,
+                    launch_done=None,
+                    skip_sample=False,
+                    sampling_metadata=sampling_metadata,
+                )
+                if future_token_ids_map is not None:
+                    _, next_token_ids, _ = result
+                    set_future_token_ids(future_token_ids_map, 0, next_token_ids, mesh)
+
+        end_time = time.perf_counter()
+        logger.info("[DECODE_GREEDY] Precompile finished in %.0f secs", end_time - start_time)
 
     def _precompile_extend(
         self,
@@ -358,6 +542,10 @@ class CompilationManager:
         speculative_algorithm=None,
         dp_size: int = 1,
         per_dp_bs_size: int = 0,
+        *,
+        greedy: bool = False,
+        input_embedding=None,
+        deepstack_visual_embedding=None,
     ):
         import jax.numpy as jnp
 
@@ -385,12 +573,18 @@ class CompilationManager:
         extend_seq_lens = np.array([1] * bs) if mode == ForwardMode.EXTEND else None
         logits_indices = np.array([0] * bs) if mode == ForwardMode.EXTEND else None
 
-        if speculative_algorithm is None:
-            sampling_info = ModelWorkerSamplingInfo.generate_for_precompile(bs, self.vocab_size)
-        else:
+        # Sampler precompile coverage: by default we use the non-greedy variant
+        # (matches typical eval traffic with temperature > 0). Setting greedy=True
+        # routes through `generate_for_precompile_all_greedy` so the
+        # `is_all_greedy=True, need_top_k=False` sampler JIT cache key is also
+        # warmed — lmms-eval's `temperature=0` requests would otherwise hit a
+        # cold compile per batch shape.
+        if greedy or speculative_algorithm is not None:
             sampling_info = ModelWorkerSamplingInfo.generate_for_precompile_all_greedy(
                 bs, self.vocab_size
             )
+        else:
+            sampling_info = ModelWorkerSamplingInfo.generate_for_precompile(bs, self.vocab_size)
 
         return ModelWorkerBatch(
             bid=1,
@@ -428,6 +622,14 @@ class CompilationManager:
             # non-recurrent backends are unaffected.
             recurrent_indices=(np.zeros(bs, dtype=np.int32) if self.has_recurrent_state else None),
             has_initial_state=(np.zeros(bs, dtype=np.bool_) if self.has_recurrent_state else None),
+            # Multimodal-extend LLM JIT precompile coverage: when these are
+            # populated (Fix A — `_precompile_extend_with_input_embedding`),
+            # `run_model_wrapper` skips the orchestrator's visual encode/splice
+            # and feeds `jitted_run_model` a forward_batch with `input_embedding`
+            # already set — exactly the cache key that multimodal extends hit
+            # at runtime.
+            input_embedding=input_embedding,
+            deepstack_visual_embedding=deepstack_visual_embedding,
         )
 
     # ---- Lazy compilation tracking ----
