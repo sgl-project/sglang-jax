@@ -60,6 +60,9 @@ TUNED_BLOCK_SIZES_V3: dict[str, dict[tuple, tuple[int, int, int, int]]] = {
         # The earlier silent-fail in exp-2l37yy8ak4 was JAX-state pollution
         # from p mnt=4096/8192's data-generator bug, not q=32 or the patch.
         ("m", "bfloat16", "bfloat16", 32, 2, 256, 256, 2048): (32, 512, 32, 512),
+        # Mixed at mnt={4096,8192}: same winner, both +75%. exp-t42ncjjeyb.
+        ("m", "bfloat16", "bfloat16", 32, 2, 256, 256, 4096): (32, 512, 32, 512),
+        ("m", "bfloat16", "bfloat16", 32, 2, 256, 256, 8192): (32, 512, 32, 512),
     },
 }
 
