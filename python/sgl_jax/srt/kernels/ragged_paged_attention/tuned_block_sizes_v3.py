@@ -59,6 +59,18 @@ TUNED_BLOCK_SIZES_V3: dict[str, dict[tuple, tuple[int, int, int, int]]] = {
         # to bq=32 bkv=512 by +75%. Heuristic's bq=min(MAX_BQ=32, max_q//2)
         # gives bq=4 when max_q=8 (post page-alignment), 8× too small.
         ("p", "bfloat16", "bfloat16", 32, 2, 256, 256, 2048): (32, 512, 32, 512),
+        # Mixed at small mnt buckets {8..1024}. Server precompiles these at
+        # warmup for chunked-prefill / mixed-batch decode. Winners shift with
+        # mnt: very small bq tracks mnt, mid range hits MAX_BQ=32 + bkv=256,
+        # large range bumps bkv to 512. exp-t316iu0l5w.
+        ("m", "bfloat16", "bfloat16", 32, 2, 256, 256, 8): (8, 256, 8, 256),
+        ("m", "bfloat16", "bfloat16", 32, 2, 256, 256, 16): (16, 256, 16, 256),
+        ("m", "bfloat16", "bfloat16", 32, 2, 256, 256, 32): (32, 256, 32, 256),
+        ("m", "bfloat16", "bfloat16", 32, 2, 256, 256, 64): (32, 256, 32, 256),
+        ("m", "bfloat16", "bfloat16", 32, 2, 256, 256, 128): (32, 256, 32, 256),
+        ("m", "bfloat16", "bfloat16", 32, 2, 256, 256, 256): (32, 256, 32, 256),
+        ("m", "bfloat16", "bfloat16", 32, 2, 256, 256, 512): (32, 512, 32, 512),
+        ("m", "bfloat16", "bfloat16", 32, 2, 256, 256, 1024): (32, 512, 32, 512),
         # Mixed at mnt=2048: same +75% pattern as prefill (bq=4→32, bkv=1024
         # →512). Verified 2026-05-27 on exp-6h1zm7mqq6 (isolated m-stage).
         # The earlier silent-fail in exp-2l37yy8ak4 was JAX-state pollution
