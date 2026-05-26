@@ -108,26 +108,11 @@ jobs:
           fetch-depth: 0
           ref: ${{ needs.metadata.outputs.dry_run == 'true' && github.ref || needs.metadata.outputs.tag }}
 
-      - name: Generate changelog with git-cliff
-        id: changelog
-        uses: orhun/git-cliff-action@v3
-        with:
-          config: cliff.toml
-          args: ${{ needs.metadata.outputs.dry_run == 'true' && '--unreleased --strip header' || '--latest --strip header' }}
-        env:
-          OUTPUT: CHANGES.md
-
-      - name: Dry-run changelog preview
+      - name: Dry-run notice
         if: ${{ needs.metadata.outputs.dry_run == 'true' }}
         run: |
           echo "::notice::Dry-run mode: GitHub Release will NOT be created."
-          {
-            echo "## Changelog preview for ${{ needs.metadata.outputs.tag }}"
-            echo
-            cat <<'CHANGELOG'
-          ${{ steps.changelog.outputs.content }}
-          CHANGELOG
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Would create release for ${{ needs.metadata.outputs.tag }} (prerelease=${{ needs.metadata.outputs.is_prerelease }})." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create GitHub Release
         if: ${{ needs.metadata.outputs.dry_run != 'true' }}
@@ -135,6 +120,6 @@ jobs:
         with:
           tag_name: ${{ needs.metadata.outputs.tag }}
           name: sglang-jax ${{ needs.metadata.outputs.tag }}
-          body: ${{ steps.changelog.outputs.content }}
+          generate_release_notes: true
           prerelease: ${{ needs.metadata.outputs.is_prerelease == 'true' }}
           fail_on_unmatched_files: false
