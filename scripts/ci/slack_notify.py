@@ -3,101 +3,10 @@
 import argparse
 import json
 import os
-import random
-import subprocess
 import sys
-import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "utils"))
-from failure_classifier import FAILURE_TYPES, REPORTABLE_CONCLUSIONS, classify_failure
-
-_NON_RETRYABLE_PATTERNS = ("401", "403", "404", "422", "not found")
-
-
-def run_gh_command(args, max_retries=5):
-    """Run a gh CLI command with exponential backoff retry on transient failure."""
-    for attempt in range(max_retries):
-        try:
-            return subprocess.run(
-                ["gh"] + args, capture_output=True, text=True, check=True, timeout=120
-            ).stdout
-        except subprocess.TimeoutExpired:
-            if attempt == max_retries - 1:
-                raise
-            wait = (2**attempt) + random.uniform(0, 1)
-            print(f"Retry {attempt + 1}/{max_retries} in {wait:.1f}s: command timed out")
-            time.sleep(wait)
-        except subprocess.CalledProcessError as e:
-            err_lower = str(e.stderr).lower()
-            if "rate limit" not in err_lower and any(
-                p in err_lower for p in _NON_RETRYABLE_PATTERNS
-            ):
-                raise
-            if attempt == max_retries - 1:
-                raise
-            wait = (2**attempt) + random.uniform(0, 1)
-            print(f"Retry {attempt + 1}/{max_retries} in {wait:.1f}s: {e.stderr.strip()}")
-            time.sleep(wait)
-    raise RuntimeError("run_gh_command: exhausted retries without raising")
-
-
-def get_failed_jobs(repo, run_id):
-    """Query GitHub API for jobs with reportable conclusions in the given run."""
-    failed = []
-    page = 1
-    while True:
-        output = run_gh_command(
-            [
-                "api",
-                f"repos/{repo}/actions/runs/{run_id}/jobs",
-                "--method",
-                "GET",
-                "-f",
-                "per_page=100",
-                "-f",
-                f"page={page}",
-            ]
-        )
-        data = json.loads(output)
-        jobs = data.get("jobs", [])
-        for job in jobs:
-            if job.get("conclusion") in REPORTABLE_CONCLUSIONS:
-                failed.append(
-                    {
-                        "name": job["name"],
-                        "id": job["id"],
-                        "html_url": job["html_url"],
-                        "conclusion": job["conclusion"],
-                    }
-                )
-        if len(jobs) < 100:
-            break
-        page += 1
-    return failed
-
-
-def fetch_job_logs(repo, job_id, max_lines=500):
-    """Fetch logs for a single job, truncated to last max_lines lines."""
-    try:
-        output = run_gh_command(
-            ["api", f"repos/{repo}/actions/jobs/{job_id}/logs"],
-            max_retries=3,
-        )
-        lines = output.splitlines()
-        if len(lines) > max_lines:
-            lines = lines[-max_lines:]
-        return "\n".join(lines)
-    except Exception as e:
-        print(f"Warning: failed to fetch logs for job {job_id}: {e}")
-        return ""
-
-
-def classify_jobs(repo, failed_jobs):
-    """Fetch logs and classify each failed job. Mutates jobs in-place."""
-    for job in failed_jobs:
-        log_text = fetch_job_logs(repo, job["id"])
-        job["failure_type"] = classify_failure(log_text, job.get("conclusion"))
-        print(f"  {job['name']}: {job['failure_type']}")
+from failure_classifier import FAILURE_TYPES, classify_jobs, get_failed_jobs
 
 
 def format_slack_summary(workflow_name, run_url, commit_sha, author, failed_jobs, ai_analysis=""):

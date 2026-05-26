@@ -26,15 +26,9 @@ import sys
 from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "utils"))
-from failure_classifier import REPORTABLE_CONCLUSIONS, classify_failure
+from failure_classifier import classify_run
 
 ELIGIBLE_WORKFLOWS = frozenset(["PR Test", "Nightly Test", "Nightly Test Daily", "TPU Multi Test"])
-
-_BISECT_CLASSIFICATION_MAP = {
-    "timeout": "infrastructure",
-    "resource_exhaustion": "infrastructure",
-    "infrastructure": "infrastructure",
-}
 
 
 def run_gh(args: List[str]) -> str:
@@ -335,89 +329,27 @@ def main() -> int:
     return 0
 
 
-def _fetch_job_log_tail(repo: str, job_id: str, max_lines: int = 300) -> str:
-    """Fetch the last max_lines of a job's log. Returns empty string on failure."""
-    try:
-        output = run_gh(["api", f"repos/{repo}/actions/jobs/{job_id}/logs"])
-        lines = output.splitlines()
-        if len(lines) > max_lines:
-            lines = lines[-max_lines:]
-        return "\n".join(lines)
-    except RuntimeError:
-        return ""
-
-
-def _preclassify_run(repo: str, run_id: str) -> Optional[str]:
-    """Pre-classify failed jobs to skip AI for obvious non-bug failures.
-
-    Returns a skip reason string if ALL failures are non-bug (timeout,
-    resource_exhaustion, infrastructure). Returns None if any bug-type
-    failure exists and AI analysis is needed.
-    """
-    try:
-        raw = run_gh(
-            [
-                "api",
-                f"repos/{repo}/actions/runs/{run_id}/jobs",
-                "--paginate",
-                "--jq",
-                '.jobs[] | select(.conclusion != null and .conclusion != "success" '
-                'and .conclusion != "skipped" and .conclusion != "cancelled") '
-                "| {name, id: (.id|tostring), conclusion}",
-            ]
-        )
-    except RuntimeError:
-        return None
-
-    if not raw.strip():
-        return None
-
-    failed_jobs = []
-    for line in raw.strip().splitlines():
-        if not line.strip():
-            continue
-        try:
-            failed_jobs.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-
-    if not failed_jobs:
-        return None
-
-    classifications = {}
-    for job in failed_jobs:
-        log_text = _fetch_job_log_tail(repo, job["id"])
-        ft = classify_failure(log_text, job.get("conclusion"))
-        classifications[job["name"]] = ft
-        print(f"  preclassify: {job['name']} → {ft}")
-
-    bug_jobs = [name for name, ft in classifications.items() if ft == "bug"]
-    if bug_jobs:
-        return None
-
-    type_summary = ", ".join(f"{name} ({ft})" for name, ft in classifications.items())
-    return (
-        f"All {len(classifications)} failed job(s) are non-bug failures "
-        f"(pre-classified by deterministic pattern matching): {type_summary}. "
-        f"AI analysis skipped."
-    )
-
-
 def _try_preclassify_and_skip(repo: str, run_id: str, run_url: str, issue_number: str) -> bool:
     """Attempt pre-classification. If all failures are non-bug, write skip and return True."""
     print("Pre-classifying failed jobs...")
-    skip_reason = _preclassify_run(repo, run_id)
-    if skip_reason:
-        print(f"Skipping AI: {skip_reason}")
-        write_skip_result(
-            skip_reason,
-            skip_type="no_eligible",
-            run_id=run_id,
-            run_url=run_url,
-            issue_number=issue_number,
-        )
-        return True
-    return False
+    failed_jobs, has_bugs = classify_run(repo, run_id)
+    if not failed_jobs or has_bugs:
+        return False
+    type_summary = ", ".join(f"{j['name']} ({j['failure_type']})" for j in failed_jobs)
+    skip_reason = (
+        f"All {len(failed_jobs)} failed job(s) are non-bug failures "
+        f"(pre-classified by deterministic pattern matching): {type_summary}. "
+        f"AI analysis skipped."
+    )
+    print(f"Skipping AI: {skip_reason}")
+    write_skip_result(
+        skip_reason,
+        skip_type="no_eligible",
+        run_id=run_id,
+        run_url=run_url,
+        issue_number=issue_number,
+    )
+    return True
 
 
 if __name__ == "__main__":
