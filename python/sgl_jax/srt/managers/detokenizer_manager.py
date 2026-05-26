@@ -299,6 +299,8 @@ class DetokenizerManager:
             output_hidden_states=recv_obj.output_hidden_states,
             cache_miss_count=recv_obj.cache_miss_count,
             output_routed_experts=output_routed_experts,
+            spec_verify_ct=recv_obj.spec_verify_ct,
+            spec_accepted_tokens=recv_obj.spec_accepted_tokens,
         )
 
 

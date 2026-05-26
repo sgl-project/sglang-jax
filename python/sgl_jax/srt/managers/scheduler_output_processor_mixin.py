@@ -873,6 +873,8 @@ class SchedulerOutputProcessorMixin:
                 output_hidden_states_for_mm,
                 cache_miss_count,
                 output_routed_experts,
+                spec_verify_ct=spec_verify_ct or None,
+                spec_accepted_tokens=spec_accepted_tokens or None,
             )
             if self._comm_backend is not None:
                 self._comm_backend.send_pyobj(out)

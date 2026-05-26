@@ -1007,6 +1007,12 @@ class TokenizerManager:
                         "cached_tokens": recv_obj.cached_tokens[i],
                     }
                 )
+                if getattr(recv_obj, "spec_verify_ct", None):
+                    vct = recv_obj.spec_verify_ct[i]
+                    meta_info["spec_verify_ct"] = vct
+                    meta_info["spec_accept_length"] = (
+                        recv_obj.spec_accepted_tokens[i] / vct if vct else 0.0
+                    )
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
