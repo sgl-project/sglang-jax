@@ -8,7 +8,6 @@ python/sgl_jax/srt/kernels/ragged_paged_attention/tuned_block_sizes_v3.py.
 Usage:
     python benchmark/kernels/flash_attention/get_block_spec_config_v3.py
     python benchmark/kernels/flash_attention/get_block_spec_config_v3.py --stages d
-    python benchmark/kernels/flash_attention/get_block_spec_config_v3.py --quick
     python benchmark/kernels/flash_attention/get_block_spec_config_v3.py --shape mimo-v2-pro
 
 For multi-worker dispatch (each worker tunes one stage), set FALCON_RANK and
@@ -369,9 +368,6 @@ def _grid(args):
         head_combos = [(16, 2)]
         decode_mnt = [32, 64, 128, 256, 512]
         prefill_mnt = [2048, 4096, 8192]
-        if args.quick:
-            decode_mnt = [64]
-            prefill_mnt = [2048]
         return page_sizes, head_dims, head_combos, decode_mnt, prefill_mnt
 
     page_sizes = [128, 256]
@@ -399,14 +395,8 @@ def _grid(args):
         (32, 16),
         (32, 32),
     ]
-    if args.quick:
-        page_sizes = [256]
-        head_combos = [(32, 1)]
     decode_mnt = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
     prefill_mnt = [512, 1024, 2048, 4096, 8192]
-    if args.quick:
-        decode_mnt = [64]
-        prefill_mnt = [2048]
     return page_sizes, head_dims, head_combos, decode_mnt, prefill_mnt
 
 
@@ -451,7 +441,6 @@ def main():
         help="comma list mapping FALCON_RANK→stage, e.g. 'd,p,m' (overrides --stages)",
     )
     parser.add_argument("--tries", type=int, default=1)
-    parser.add_argument("--quick", action="store_true", help="smoke-test grid (1 combo per stage)")
     parser.add_argument(
         "--shape",
         default="default",
