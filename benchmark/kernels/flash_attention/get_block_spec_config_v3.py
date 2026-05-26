@@ -8,7 +8,10 @@ python/sgl_jax/srt/kernels/ragged_paged_attention/tuned_block_sizes_v3.py.
 Usage:
     python benchmark/kernels/flash_attention/get_block_spec_config_v3.py
     python benchmark/kernels/flash_attention/get_block_spec_config_v3.py --stages d
-    python benchmark/kernels/flash_attention/get_block_spec_config_v3.py --shape mimo-v2-pro
+    # Narrow grid (e.g. just MiMo-V2-Pro per-shard shape) for fast validation:
+    python benchmark/kernels/flash_attention/get_block_spec_config_v3.py \
+        --page-sizes 256 --head-dims 192 --head-combos 16:2 \
+        --decode-mnt 32,64,128,256,512 --prefill-mnt 2048,4096,8192
 
 For multi-worker dispatch (each worker tunes one stage), set FALCON_RANK and
 pass --rank-to-stage so rank 0->d, rank 1->p, rank 2->m:
@@ -358,45 +361,58 @@ def sweep(
     return best, best_time, heuristic, heuristic_time
 
 
-def _grid(args):
-    if args.shape == "mimo-v2-pro":
-        # Real per-shard shape for MiMo-V2-Pro on v7x-32 (TP=32):
-        # q_heads_per_shard=16, kv_heads_per_shard=2, head_dim=192, page=256.
-        # bench BSZ = {32,64,128,256,512}; chunked-prefill bucket = {2048,4096,8192}.
-        page_sizes = [256]
-        head_dims = [192]
-        head_combos = [(16, 2)]
-        decode_mnt = [32, 64, 128, 256, 512]
-        prefill_mnt = [2048, 4096, 8192]
-        return page_sizes, head_dims, head_combos, decode_mnt, prefill_mnt
+_DEFAULT_PAGE_SIZES = (128, 256)
+_DEFAULT_HEAD_DIMS = (128,)
+_DEFAULT_HEAD_COMBOS = (
+    (1, 1),
+    (2, 1),
+    (2, 2),
+    (4, 1),
+    (4, 2),
+    (4, 4),
+    (8, 1),
+    (8, 2),
+    (8, 4),
+    (8, 8),
+    (16, 1),
+    (16, 2),
+    (16, 4),
+    (16, 8),
+    (16, 16),
+    (32, 1),
+    (32, 2),
+    (32, 4),
+    (32, 8),
+    (32, 16),
+    (32, 32),
+)
+_DEFAULT_DECODE_MNT = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
+_DEFAULT_PREFILL_MNT = (512, 1024, 2048, 4096, 8192)
 
-    page_sizes = [128, 256]
-    head_dims = [128]
-    head_combos = [
-        (1, 1),
-        (2, 1),
-        (2, 2),
-        (4, 1),
-        (4, 2),
-        (4, 4),
-        (8, 1),
-        (8, 2),
-        (8, 4),
-        (8, 8),
-        (16, 1),
-        (16, 2),
-        (16, 4),
-        (16, 8),
-        (16, 16),
-        (32, 1),
-        (32, 2),
-        (32, 4),
-        (32, 8),
-        (32, 16),
-        (32, 32),
-    ]
-    decode_mnt = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
-    prefill_mnt = [512, 1024, 2048, 4096, 8192]
+
+def _csv_ints(s: str) -> list[int]:
+    return [int(x) for x in s.split(",") if x.strip()]
+
+
+def _csv_head_combos(s: str) -> list[tuple[int, int]]:
+    out = []
+    for item in s.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        q, kv = item.split(":")
+        out.append((int(q), int(kv)))
+    return out
+
+
+def _grid(args):
+    page_sizes = _csv_ints(args.page_sizes) if args.page_sizes else list(_DEFAULT_PAGE_SIZES)
+    head_dims = _csv_ints(args.head_dims) if args.head_dims else list(_DEFAULT_HEAD_DIMS)
+    head_combos = (
+        _csv_head_combos(args.head_combos) if args.head_combos else list(_DEFAULT_HEAD_COMBOS)
+    )
+    decode_mnt = _csv_ints(args.decode_mnt) if args.decode_mnt else list(_DEFAULT_DECODE_MNT)
+    prefill_mnt = _csv_ints(args.prefill_mnt) if args.prefill_mnt else list(_DEFAULT_PREFILL_MNT)
     return page_sizes, head_dims, head_combos, decode_mnt, prefill_mnt
 
 
@@ -442,10 +458,25 @@ def main():
     )
     parser.add_argument("--tries", type=int, default=1)
     parser.add_argument(
-        "--shape",
-        default="default",
-        choices=("default", "mimo-v2-pro"),
-        help="grid preset; mimo-v2-pro pins per-shard shape from MiMo-V2-Pro on v7x-32",
+        "--page-sizes", default="", help="comma list, e.g. '128,256'; empty = full default grid"
+    )
+    parser.add_argument(
+        "--head-dims", default="", help="comma list, e.g. '128,192'; empty = full default grid"
+    )
+    parser.add_argument(
+        "--head-combos",
+        default="",
+        help="comma list of q:kv pairs, e.g. '16:2,4:1'; empty = full default grid",
+    )
+    parser.add_argument(
+        "--decode-mnt",
+        default="",
+        help="comma list of decode max_num_tokens; empty = full default grid",
+    )
+    parser.add_argument(
+        "--prefill-mnt",
+        default="",
+        help="comma list of prefill/mixed max_num_tokens; empty = full default grid",
     )
     parser.add_argument("--max-context-len", type=int, default=40960)
     parser.add_argument("--max-kv-cache-tokens", type=int, default=600000)
@@ -466,7 +497,7 @@ def main():
     device = get_device_name()
     print(f"# Device: {device}")
     print(f"# {jax.devices()}")
-    print(f"# stages={stages} shape={args.shape}")
+    print(f"# stages={stages}")
     print()
 
     rows = []
