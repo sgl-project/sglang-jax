@@ -27,7 +27,16 @@ logger = logging.getLogger(__name__)
 TUNED_BLOCK_SIZES_V3: dict[str, dict[tuple, tuple[int, int, int, int]]] = {
     "TPU v5": {},
     "TPU v6e": {},
-    "TPU v7": {},
+    "TPU v7": {
+        # MiMo-V2-Pro decode (q=16 kv=2 hd=192→256 ps=256). Tuned 2026-05-26
+        # on tpuv7x-64-node, exp-kc4leh9wnt. Heuristic picked bkv=1024 here
+        # but bkv=2048 wins by +25-28% across all measured BSZ.
+        ("d", "bfloat16", "bfloat16", 16, 2, 256, 256, 32): (1, 2048, 1, 2048),
+        ("d", "bfloat16", "bfloat16", 16, 2, 256, 256, 64): (1, 2048, 1, 2048),
+        ("d", "bfloat16", "bfloat16", 16, 2, 256, 256, 128): (1, 2048, 1, 2048),
+        ("d", "bfloat16", "bfloat16", 16, 2, 256, 256, 256): (1, 2048, 1, 2048),
+        ("d", "bfloat16", "bfloat16", 16, 2, 256, 256, 512): (1, 2048, 1, 2048),
+    },
 }
 
 

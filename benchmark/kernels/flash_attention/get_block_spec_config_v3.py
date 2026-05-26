@@ -32,6 +32,7 @@ from utils import create_decode_uniform_data, create_prefill_uniform_data
 from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
     RpaCase,
     get_default_block_sizes,
+    get_vmem_estimate_bytes,
     get_vmem_limit,
     ragged_paged_attention,
 )
@@ -45,6 +46,38 @@ _STAGE_TO_RPA_CASE = {
     "p": RpaCase.PREFILL,
     "m": RpaCase.MIXED,
 }
+
+# Match the v3 heuristic's vmem accounting: budget = vmem_limit × fraction.
+# vmem_limit defaults to pltpu.get_tpu_info().vmem_capacity_bytes // 2
+# (~32MB on v7x where capacity is 64MB). Both can be overridden via CLI to
+# let the tuner explore beyond the heuristic's conservative window.
+_DEFAULT_VMEM_BUDGET_FRACTION = 0.30
+
+
+def _fits_vmem(
+    bq_sz: int,
+    bkv_sz: int,
+    bkv_csz: int,
+    q_head_num: int,
+    kv_head_num: int,
+    head_dim: int,
+    dtype,
+    vmem_limit_bytes: int,
+    vmem_budget_fraction: float,
+) -> bool:
+    """Cheap pre-filter using the same estimator the v3 heuristic uses."""
+    est = get_vmem_estimate_bytes(
+        kv_head_num,
+        q_head_num // kv_head_num,
+        head_dim,
+        bq_sz,
+        bkv_sz,
+        dtype,
+        dtype,
+        use_custom_mask=False,
+        bkv_csz=bkv_csz,
+    )
+    return est <= int(vmem_limit_bytes * vmem_budget_fraction)
 
 
 def _bq_candidates(max_q: int, stage: str) -> list[int]:
@@ -314,11 +347,38 @@ def sweep(
     max_kv_cache_tokens: int,
     dtype=jnp.bfloat16,
     tries: int = 1,
+    vmem_limit_bytes: int | None = None,
+    vmem_budget_fraction: float = _DEFAULT_VMEM_BUDGET_FRACTION,
 ):
     """Returns (best_4tuple, best_time, heuristic_4tuple, heuristic_time)."""
     kv_packing = get_dtype_packing(dtype)
     max_kv = max_context_len
-    candidates = _enumerate_block_sizes(stage, max_num_tokens, max_kv, page_size, kv_packing)
+    raw_candidates = _enumerate_block_sizes(stage, max_num_tokens, max_kv, page_size, kv_packing)
+
+    if vmem_limit_bytes is None:
+        vmem_limit_bytes = get_vmem_limit()
+    candidates = [
+        bs
+        for bs in raw_candidates
+        if _fits_vmem(
+            bs[0],
+            bs[1],
+            bs[3],
+            q_head_num,
+            kv_head_num,
+            head_dim,
+            dtype,
+            vmem_limit_bytes,
+            vmem_budget_fraction,
+        )
+    ]
+    dropped = len(raw_candidates) - len(candidates)
+    if dropped:
+        print(
+            f"# [vmem-filter] stage={stage} ps={page_size} q={q_head_num} kv={kv_head_num} "
+            f"hd={head_dim} mnt={max_num_tokens}: pruned {dropped}/{len(raw_candidates)} "
+            f"candidates over {int(vmem_budget_fraction*100)}% × {vmem_limit_bytes} bytes"
+        )
 
     heuristic = _heuristic_candidate(
         stage,
@@ -330,7 +390,8 @@ def sweep(
         max_context_len,
         dtype,
     )
-    # Make sure the heuristic point is benchmarked even if not in grid.
+    # Make sure the heuristic point is benchmarked even if not in grid
+    # or filtered out (heuristic was already vmem-shrunk).
     if heuristic not in candidates:
         candidates = [heuristic] + candidates
 
@@ -458,6 +519,22 @@ def main():
     )
     parser.add_argument("--tries", type=int, default=1)
     parser.add_argument(
+        "--vmem-limit-bytes",
+        type=int,
+        default=0,
+        help="override pltpu vmem capacity//2 (0 = auto). On v7x default is ~32MB.",
+    )
+    parser.add_argument(
+        "--vmem-budget-fraction",
+        type=float,
+        default=_DEFAULT_VMEM_BUDGET_FRACTION,
+        help=(
+            "fraction of vmem_limit used as the pre-filter / shrink budget. "
+            "Heuristic uses 0.30 (conservative). Bump to ~0.50 for tuner sweeps "
+            "to explore larger blocks that compiled-but-spilly heuristic skips."
+        ),
+    )
+    parser.add_argument(
         "--page-sizes", default="", help="comma list, e.g. '128,256'; empty = full default grid"
     )
     parser.add_argument(
@@ -517,6 +594,8 @@ def main():
                             args.max_context_len,
                             args.max_kv_cache_tokens,
                             tries=args.tries,
+                            vmem_limit_bytes=args.vmem_limit_bytes or None,
+                            vmem_budget_fraction=args.vmem_budget_fraction,
                         )
                     except Exception as e:  # noqa: BLE001
                         print(
