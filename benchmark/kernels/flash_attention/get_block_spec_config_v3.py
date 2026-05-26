@@ -401,7 +401,7 @@ def sweep(
 
 
 _DEFAULT_PAGE_SIZES = (128, 256)
-_DEFAULT_HEAD_DIMS = (128,)
+_DEFAULT_HEAD_DIMS = (128, 192)
 _DEFAULT_HEAD_COMBOS = (
     (1, 1),
     (2, 1),
@@ -473,6 +473,21 @@ def _resolve_stages(args) -> list[str]:
     return [s.strip() for s in args.stages.split(",") if s.strip()]
 
 
+def _parse_shard(s: str) -> tuple[int, int]:
+    """Parse --shard "RANK,TOTAL" or "auto,TOTAL" (rank from FALCON env)."""
+    if not s:
+        return (0, 1)
+    a, b = s.split(",")
+    total = int(b)
+    if a == "auto":
+        rank = int(os.environ.get("FALCON_RANK", os.environ.get("FALCON_JAX_PROCESS_ID", "0")))
+    else:
+        rank = int(a)
+    if not (0 <= rank < total):
+        raise SystemExit(f"--shard rank={rank} out of [0,{total})")
+    return rank, total
+
+
 def _simplified_key_for_table(stage: str, q_h: int, kv_h: int, hd: int, ps: int, mnt: int) -> tuple:
     """Match the normalization done by tuned_block_sizes.get_simplified_key."""
     return (
@@ -529,6 +544,14 @@ def main():
     parser.add_argument("--max-context-len", type=int, default=40960)
     parser.add_argument("--max-kv-cache-tokens", type=int, default=600000)
     parser.add_argument(
+        "--shard",
+        default="",
+        help=(
+            "Split the outer (page,hd,q,kv,mnt) grid across N workers. "
+            "Format: 'RANK,TOTAL' or 'auto,TOTAL' (rank from FALCON_RANK)."
+        ),
+    )
+    parser.add_argument(
         "--write-threshold-pct",
         type=float,
         default=10.0,
@@ -543,48 +566,55 @@ def main():
 
     page_sizes, head_dims, head_combos, decode_mnt, prefill_mnt = _grid(args)
     device = get_device_name()
+    shard_rank, shard_total = _parse_shard(args.shard)
     print(f"# Device: {device}")
     print(f"# {jax.devices()}")
-    print(f"# stages={stages}")
+    print(f"# stages={stages} shard={shard_rank}/{shard_total}")
     print()
 
-    rows = []
+    # Build the outer (stage, ps, hd, q, kv, mnt) cartesian and slice by shard.
+    outer = []
     for stage in stages:
         mnt_list = decode_mnt if stage == "d" else prefill_mnt
         for ps, hd in itertools.product(page_sizes, head_dims):
             for q_h, kv_h in head_combos:
                 for mnt in mnt_list:
-                    try:
-                        best, best_t, heur, heur_t = sweep(
-                            stage,
-                            ps,
-                            q_h,
-                            kv_h,
-                            hd,
-                            mnt,
-                            args.max_context_len,
-                            args.max_kv_cache_tokens,
-                            tries=args.tries,
-                            vmem_limit_bytes=args.vmem_limit_bytes or None,
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        print(
-                            f"# SKIP stage={stage} ps={ps} q={q_h} kv={kv_h} "
-                            f"hd={hd} mnt={mnt}: {e}"
-                        )
-                        continue
-                    if best is None or heur_t == inf:
-                        continue
-                    delta_pct = (heur_t - best_t) / heur_t * 100.0
-                    table_key = _simplified_key_for_table(stage, q_h, kv_h, hd, ps, mnt)
-                    rows.append((table_key, best, best_t, heur, heur_t, delta_pct))
-                    win = "WIN " if delta_pct >= args.write_threshold_pct else "skip"
-                    print(
-                        f"# [{win}] {table_key}: "
-                        f"heur={heur} {heur_t*1000:.4f}ms "
-                        f"best={best} {best_t*1000:.4f}ms "
-                        f"Δ={delta_pct:+.1f}%"
-                    )
+                    outer.append((stage, ps, hd, q_h, kv_h, mnt))
+    my_work = outer[shard_rank::shard_total]
+    print(
+        f"# outer-grid total={len(outer)} mine={len(my_work)} (every {shard_total}-th starting at {shard_rank})"
+    )
+
+    rows = []
+    for stage, ps, hd, q_h, kv_h, mnt in my_work:
+        try:
+            best, best_t, heur, heur_t = sweep(
+                stage,
+                ps,
+                q_h,
+                kv_h,
+                hd,
+                mnt,
+                args.max_context_len,
+                args.max_kv_cache_tokens,
+                tries=args.tries,
+                vmem_limit_bytes=args.vmem_limit_bytes or None,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"# SKIP stage={stage} ps={ps} q={q_h} kv={kv_h} hd={hd} mnt={mnt}: {e}")
+            continue
+        if best is None or heur_t == inf:
+            continue
+        delta_pct = (heur_t - best_t) / heur_t * 100.0
+        table_key = _simplified_key_for_table(stage, q_h, kv_h, hd, ps, mnt)
+        rows.append((table_key, best, best_t, heur, heur_t, delta_pct))
+        win = "WIN " if delta_pct >= args.write_threshold_pct else "skip"
+        print(
+            f"# [{win}] {table_key}: "
+            f"heur={heur} {heur_t*1000:.4f}ms "
+            f"best={best} {best_t*1000:.4f}ms "
+            f"Δ={delta_pct:+.1f}%"
+        )
 
     print()
     print(
