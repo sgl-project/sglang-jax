@@ -22,15 +22,41 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Check for failures and notify
-        shell: bash
+      - name: Check for failures
         env:
           GH_TOKEN: ${{ github.token }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           REPO: ${{ github.repository }}
-          RUN_ID: ${{ github.event.workflow_run.id || github.event.inputs.run_id }}
-          WORKFLOW_NAME: ${{ github.event.workflow_run.name || 'Manual Check' }}
-          RUN_URL: ${{ github.event.workflow_run.html_url || format('https://github.com/{0}/actions/runs/{1}', github.repository, github.event.inputs.run_id) }}
-          COMMIT_SHA: ${{ github.event.workflow_run.head_sha || 'N/A' }}
-          COMMIT_AUTHOR: ${{ github.event.workflow_run.head_commit.author.name || github.event.workflow_run.actor.login || 'unknown' }}
-        run: python3 scripts/ci/slack_notify.py
+        run: |
+          RUN_ID="${{ github.event.workflow_run.id || github.event.inputs.run_id }}"
+          WORKFLOW_NAME="${{ github.event.workflow_run.name || 'Manual Check' }}"
+          RUN_URL="${{ github.event.workflow_run.html_url || format('https://github.com/{0}/actions/runs/{1}', github.repository, github.event.inputs.run_id) }}"
+          COMMIT_SHA="${{ github.event.workflow_run.head_sha || 'N/A' }}"
+          COMMIT_AUTHOR="${{ github.event.workflow_run.head_commit.author.name || github.event.workflow_run.actor.login || 'unknown' }}"
+          python3 scripts/ci/slack_notify.py \
+            --repo "$REPO" \
+            --run-id "$RUN_ID" \
+            --workflow-name "$WORKFLOW_NAME" \
+            --run-url "$RUN_URL" \
+            --commit-sha "$COMMIT_SHA" \
+            --commit-author "$COMMIT_AUTHOR" \
+            --slack-output slack_summary.txt
+
+      - name: Post to Slack
+        if: success()
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "SLACK_WEBHOOK_URL not set, skipping."
+            exit 0
+          fi
+          SUMMARY=$(cat slack_summary.txt)
+          if [ -z "$SUMMARY" ]; then
+            echo "No failures detected, skipping Slack notification."
+            exit 0
+          fi
+          jq -n --arg text "$SUMMARY" \
+            '{"blocks":[{"type":"section","text":{"type":"mrkdwn","text":$text}}]}' | \
+            curl --fail-with-body -X POST -H 'Content-type: application/json' \
+              -d @- "$SLACK_WEBHOOK_URL"
