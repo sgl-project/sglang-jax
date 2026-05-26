@@ -33,11 +33,6 @@ def _make_engine(device_indexes: list[int]) -> Engine:
         device="tpu",  # use proxy when running in Pathways
         device_indexes=device_indexes,
         enable_single_process=True,
-        # Diagnostic (paired with memory_pool change): keep precompile disabled so the
-        # only remaining jit on the init path that could hit /xla-cache is the KV
-        # cache allocation jit. Combined with the device_put rewrite there, no jit
-        # call should hit the persistent compilation cache during init.
-        disable_precompile=True,
         skip_server_warmup=True,
         random_seed=3,
         node_rank=0,
