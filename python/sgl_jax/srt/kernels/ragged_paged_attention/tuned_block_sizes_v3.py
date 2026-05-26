@@ -34,14 +34,30 @@ TUNED_BLOCK_SIZES_V3: dict[str, dict[tuple, tuple[int, int, int, int]]] = {
     "TPU v5": {},
     "TPU v6e": {},
     "TPU v7": {
-        # Awaiting full-grid sharded tuner output (exps submitted 2026-05-26,
-        # branch dev/rpa-v3-on-fmv2, 36 shards across d/p/m).
+        # MiMo-V2-Pro per-shard shape: q_heads=32 kv_heads=2 head_dim=192→256
+        # page_size=256. Per-device shape derived from tp_size=32, dp_size=8
+        # so attention TP = tp/dp = 4 → q=128/4=32, kv=8/4=2.
+        # Tuned 2026-05-27 on tpuv7x-64-node, exp-2l37yy8ak4 with patched
+        # kernel fd69b77c9 (unaliased m/l and bo/bq scratch to dodge XLA
+        # MSA assertion).
         #
-        # Earlier MiMo-V2-Pro-targeted entries with q_h=16 were removed:
-        # MiMo on v7x-32 actually uses attention TP = tp_size/dp_size = 32/8 = 4,
-        # so per-device q_heads = 128/4 = 32 (not 16). All q_h=16 entries were
-        # never hit by the server — full sweep will produce correct (32, 2)
-        # entries plus coverage for many other shapes.
+        # Decode (mnt = BSZ): heuristic bkv=1024 loses to bkv=2048 by
+        # ~18-25% across BSZ {4..512}. BSZ {1,2} skipped (delta <10%).
+        ("d", "bfloat16", "bfloat16", 32, 2, 256, 256, 4): (1, 2048, 1, 2048),
+        ("d", "bfloat16", "bfloat16", 32, 2, 256, 256, 8): (1, 2048, 1, 2048),
+        ("d", "bfloat16", "bfloat16", 32, 2, 256, 256, 16): (1, 2048, 1, 2048),
+        ("d", "bfloat16", "bfloat16", 32, 2, 256, 256, 32): (1, 2048, 1, 2048),
+        ("d", "bfloat16", "bfloat16", 32, 2, 256, 256, 64): (1, 2048, 1, 2048),
+        ("d", "bfloat16", "bfloat16", 32, 2, 256, 256, 128): (1, 2048, 1, 2048),
+        ("d", "bfloat16", "bfloat16", 32, 2, 256, 256, 256): (1, 2048, 1, 2048),
+        ("d", "bfloat16", "bfloat16", 32, 2, 256, 256, 512): (1, 2048, 1, 2048),
+        # Prefill at chunk_prefill_size=2048: heuristic bq=4 bkv=1024 loses
+        # to bq=32 bkv=512 by +75%. Heuristic's bq=min(MAX_BQ=32, max_q//2)
+        # gives bq=4 when max_q=8 (post page-alignment), 8× too small.
+        ("p", "bfloat16", "bfloat16", 32, 2, 256, 256, 2048): (32, 512, 32, 512),
+        # Mixed (m) entries deliberately omitted — mixed stage hit a silent
+        # failure path in the tuner (heuristic candidate itself raised in
+        # benchmark) when q=32. Tracked separately; rerun pending.
     },
 }
 
