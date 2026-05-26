@@ -99,9 +99,23 @@ def _bkv_candidates(page_size: int, kv_packing: int, max_kv: int) -> list[int]:
     return out
 
 
-def _csz_candidates(sz: int, alignment: int = 1) -> list[int]:
+def _csz_candidates(sz: int, alignment: int = 1, mode: str = "all") -> list[int]:
+    """Enumerate compute-chunk sizes for a given block size.
+
+    mode:
+      "same" — only csz == sz (disables nested attention loop, simplest).
+              Used as a fast first pass when full sweep is too expensive.
+      "half" — {sz, sz/2} (alignment-respecting).
+      "all"  — every divisor of sz that respects alignment (default).
+    """
     if sz <= 1:
         return [1]
+    if mode == "same":
+        return [sz]
+    if mode == "half":
+        cand = [sz, max(alignment, sz // 2)]
+        return sorted({c for c in cand if sz % c == 0})
+    # "all" (default)
     out = set()
     v = sz
     while v >= max(alignment, 1):
@@ -120,13 +134,14 @@ def _enumerate_block_sizes(
     max_kv: int,
     page_size: int,
     kv_packing: int,
+    csz_mode: str = "all",
 ) -> list[tuple[int, int, int, int]]:
     bkv_align = max(page_size, kv_packing)
     out = []
     for bq in _bq_candidates(max_q, stage):
         for bkv in _bkv_candidates(page_size, kv_packing, max_kv):
-            for bq_csz in _csz_candidates(bq, alignment=1):
-                for bkv_csz in _csz_candidates(bkv, alignment=bkv_align):
+            for bq_csz in _csz_candidates(bq, alignment=1, mode=csz_mode):
+                for bkv_csz in _csz_candidates(bkv, alignment=bkv_align, mode=csz_mode):
                     out.append((bq, bkv, bq_csz, bkv_csz))
     return out
 
@@ -349,11 +364,14 @@ def sweep(
     tries: int = 1,
     vmem_limit_bytes: int | None = None,
     vmem_budget_fraction: float = _DEFAULT_VMEM_BUDGET_FRACTION,
+    csz_mode: str = "all",
 ):
     """Returns (best_4tuple, best_time, heuristic_4tuple, heuristic_time)."""
     kv_packing = get_dtype_packing(dtype)
     max_kv = max_context_len
-    raw_candidates = _enumerate_block_sizes(stage, max_num_tokens, max_kv, page_size, kv_packing)
+    raw_candidates = _enumerate_block_sizes(
+        stage, max_num_tokens, max_kv, page_size, kv_packing, csz_mode=csz_mode
+    )
 
     if vmem_limit_bytes is None:
         vmem_limit_bytes = get_vmem_limit()
@@ -535,6 +553,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--csz-mode",
+        default="all",
+        choices=("all", "half", "same"),
+        help=(
+            "compute-chunk size enumeration policy. 'all' = every divisor, "
+            "'half' = {sz, sz/2}, 'same' = csz==sz only. 'same' shrinks p/m "
+            "candidate count ~10× — useful for a fast first pass."
+        ),
+    )
+    parser.add_argument(
         "--page-sizes", default="", help="comma list, e.g. '128,256'; empty = full default grid"
     )
     parser.add_argument(
@@ -596,6 +624,7 @@ def main():
                             tries=args.tries,
                             vmem_limit_bytes=args.vmem_limit_bytes or None,
                             vmem_budget_fraction=args.vmem_budget_fraction,
+                            csz_mode=args.csz_mode,
                         )
                     except Exception as e:  # noqa: BLE001
                         print(
