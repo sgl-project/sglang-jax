@@ -15,6 +15,7 @@ on:
 
 jobs:
   notify-failure:
+    if: github.event.workflow_run.conclusion == 'failure' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -26,20 +27,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: |
-          RUN_ID="${{ github.event.workflow_run.id || github.event.inputs.run_id }}"
-          WORKFLOW_NAME="${{ github.event.workflow_run.name || 'Manual Check' }}"
-          RUN_URL="${{ github.event.workflow_run.html_url || format('https://github.com/{0}/actions/runs/{1}', github.repository, github.event.inputs.run_id) }}"
-          COMMIT_SHA="${{ github.event.workflow_run.head_sha || 'N/A' }}"
-          COMMIT_AUTHOR="${{ github.event.workflow_run.head_commit.author.name || github.event.workflow_run.actor.login || 'unknown' }}"
-          python3 scripts/ci/slack_notify.py \
-            --repo "$REPO" \
-            --run-id "$RUN_ID" \
-            --workflow-name "$WORKFLOW_NAME" \
-            --run-url "$RUN_URL" \
-            --commit-sha "$COMMIT_SHA" \
-            --commit-author "$COMMIT_AUTHOR" \
-            --slack-output slack_summary.txt
+          RUN_ID: ${{ github.event.workflow_run.id || github.event.inputs.run_id }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name || 'Manual Check' }}
+          RUN_URL: ${{ github.event.workflow_run.html_url || format('https://github.com/{0}/actions/runs/{1}', github.repository, github.event.inputs.run_id) }}
+          COMMIT_SHA: ${{ github.event.workflow_run.head_sha || 'N/A' }}
+          COMMIT_AUTHOR: ${{ github.event.workflow_run.head_commit.author.name || github.event.workflow_run.actor.login || 'unknown' }}
+        run: >
+          python3 scripts/ci/slack_notify.py
+          --repo "$REPO"
+          --run-id "$RUN_ID"
+          --workflow-name "$WORKFLOW_NAME"
+          --run-url "$RUN_URL"
+          --commit-sha "$COMMIT_SHA"
+          --commit-author "$COMMIT_AUTHOR"
+          --slack-output slack_summary.txt
 
       - name: Post to Slack
         if: success()
