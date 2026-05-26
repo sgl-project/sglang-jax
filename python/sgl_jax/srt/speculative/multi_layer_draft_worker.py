@@ -178,6 +178,7 @@ class MultiLayerDraftWorker(EagleDraftWorker):
             )
             mr = self.runner(i)
             mr.attn_backend.forward_metadata = metadata_per_layer[i][i]
+            forward_batch.attn_backend = mr.attn_backend
             forward_batch.bid = model_worker_batch.bid
             logits_output, _, _ = mr.forward(forward_batch, logits_metadata=logits_metadata)
 
