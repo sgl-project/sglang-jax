@@ -47,11 +47,15 @@ _STAGE_TO_RPA_CASE = {
     "m": RpaCase.MIXED,
 }
 
-# Match the v3 heuristic's vmem accounting: budget = vmem_limit × fraction.
-# vmem_limit defaults to pltpu.get_tpu_info().vmem_capacity_bytes // 2
-# (~32MB on v7x where capacity is 64MB). Both can be overridden via CLI to
-# let the tuner explore beyond the heuristic's conservative window.
-_DEFAULT_VMEM_BUDGET_FRACTION = 0.30
+
+def _default_vmem_limit() -> int:
+    """Full hardware vmem capacity (v7x ≈ 64MB). v2-style: let compiler clamp."""
+    try:
+        from jax.experimental.pallas import tpu as _pltpu
+
+        return _pltpu.get_tpu_info().vmem_capacity_bytes
+    except Exception:
+        return 120 * 1024 * 1024  # v2's hardcoded fallback
 
 
 def _fits_vmem(
@@ -63,9 +67,9 @@ def _fits_vmem(
     head_dim: int,
     dtype,
     vmem_limit_bytes: int,
-    vmem_budget_fraction: float,
 ) -> bool:
-    """Cheap pre-filter using the same estimator the v3 heuristic uses."""
+    """Pre-filter using the same estimator the v3 heuristic uses, with the
+    full declared vmem_limit_bytes as the hard cap (no budget fraction)."""
     est = get_vmem_estimate_bytes(
         kv_head_num,
         q_head_num // kv_head_num,
@@ -77,7 +81,7 @@ def _fits_vmem(
         use_custom_mask=False,
         bkv_csz=bkv_csz,
     )
-    return est <= int(vmem_limit_bytes * vmem_budget_fraction)
+    return est <= vmem_limit_bytes
 
 
 def _bq_candidates(max_q: int, stage: str) -> list[int]:
@@ -89,7 +93,7 @@ def _bq_candidates(max_q: int, stage: str) -> list[int]:
 
 def _bkv_candidates(page_size: int, kv_packing: int, max_kv: int) -> list[int]:
     alignment = max(page_size, kv_packing)
-    raw = [256, 512, 1024, 2048, 4096, 8192, 16384]
+    raw = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
     out = []
     for v in raw:
         v = max(alignment, (v // alignment) * alignment)
@@ -99,50 +103,18 @@ def _bkv_candidates(page_size: int, kv_packing: int, max_kv: int) -> list[int]:
     return out
 
 
-def _csz_candidates(sz: int, alignment: int = 1, mode: str = "all") -> list[int]:
-    """Enumerate compute-chunk sizes for a given block size.
-
-    mode:
-      "same" — only csz == sz (disables nested attention loop, simplest).
-              Used as a fast first pass when full sweep is too expensive.
-      "half" — {sz, sz/2} (alignment-respecting).
-      "all"  — every divisor of sz that respects alignment (default).
-    """
-    if sz <= 1:
-        return [1]
-    if mode == "same":
-        return [sz]
-    if mode == "half":
-        cand = [sz, max(alignment, sz // 2)]
-        return sorted({c for c in cand if sz % c == 0})
-    # "all" (default)
-    out = set()
-    v = sz
-    while v >= max(alignment, 1):
-        out.add(v)
-        if v == 1:
-            break
-        v //= 2
-    out.add(max(alignment, 1))
-    out = {c for c in out if sz % c == 0}
-    return sorted(out)
-
-
 def _enumerate_block_sizes(
     stage: str,
     max_q: int,
     max_kv: int,
     page_size: int,
     kv_packing: int,
-    csz_mode: str = "all",
 ) -> list[tuple[int, int, int, int]]:
-    bkv_align = max(page_size, kv_packing)
+    """csz==sz for both dims (nested attention loop disabled, matches v2)."""
     out = []
     for bq in _bq_candidates(max_q, stage):
         for bkv in _bkv_candidates(page_size, kv_packing, max_kv):
-            for bq_csz in _csz_candidates(bq, alignment=1, mode=csz_mode):
-                for bkv_csz in _csz_candidates(bkv, alignment=bkv_align, mode=csz_mode):
-                    out.append((bq, bkv, bq_csz, bkv_csz))
+            out.append((bq, bkv, bq, bkv))
     return out
 
 
@@ -363,31 +335,19 @@ def sweep(
     dtype=jnp.bfloat16,
     tries: int = 1,
     vmem_limit_bytes: int | None = None,
-    vmem_budget_fraction: float = _DEFAULT_VMEM_BUDGET_FRACTION,
-    csz_mode: str = "all",
 ):
     """Returns (best_4tuple, best_time, heuristic_4tuple, heuristic_time)."""
     kv_packing = get_dtype_packing(dtype)
     max_kv = max_context_len
-    raw_candidates = _enumerate_block_sizes(
-        stage, max_num_tokens, max_kv, page_size, kv_packing, csz_mode=csz_mode
-    )
+    raw_candidates = _enumerate_block_sizes(stage, max_num_tokens, max_kv, page_size, kv_packing)
 
     if vmem_limit_bytes is None:
-        vmem_limit_bytes = get_vmem_limit()
+        vmem_limit_bytes = _default_vmem_limit()
     candidates = [
         bs
         for bs in raw_candidates
         if _fits_vmem(
-            bs[0],
-            bs[1],
-            bs[3],
-            q_head_num,
-            kv_head_num,
-            head_dim,
-            dtype,
-            vmem_limit_bytes,
-            vmem_budget_fraction,
+            bs[0], bs[1], bs[3], q_head_num, kv_head_num, head_dim, dtype, vmem_limit_bytes
         )
     ]
     dropped = len(raw_candidates) - len(candidates)
@@ -395,7 +355,7 @@ def sweep(
         print(
             f"# [vmem-filter] stage={stage} ps={page_size} q={q_head_num} kv={kv_head_num} "
             f"hd={head_dim} mnt={max_num_tokens}: pruned {dropped}/{len(raw_candidates)} "
-            f"candidates over {int(vmem_budget_fraction*100)}% × {vmem_limit_bytes} bytes"
+            f"candidates over {vmem_limit_bytes} bytes"
         )
 
     heuristic = _heuristic_candidate(
@@ -540,26 +500,9 @@ def main():
         "--vmem-limit-bytes",
         type=int,
         default=0,
-        help="override pltpu vmem capacity//2 (0 = auto). On v7x default is ~32MB.",
-    )
-    parser.add_argument(
-        "--vmem-budget-fraction",
-        type=float,
-        default=_DEFAULT_VMEM_BUDGET_FRACTION,
         help=(
-            "fraction of vmem_limit used as the pre-filter / shrink budget. "
-            "Heuristic uses 0.30 (conservative). Bump to ~0.50 for tuner sweeps "
-            "to explore larger blocks that compiled-but-spilly heuristic skips."
-        ),
-    )
-    parser.add_argument(
-        "--csz-mode",
-        default="all",
-        choices=("all", "half", "same"),
-        help=(
-            "compute-chunk size enumeration policy. 'all' = every divisor, "
-            "'half' = {sz, sz/2}, 'same' = csz==sz only. 'same' shrinks p/m "
-            "candidate count ~10× — useful for a fast first pass."
+            "override hardware vmem capacity (0 = auto, full pltpu capacity). "
+            "v2 style: give pallas the full vmem, let hardware/compiler clamp."
         ),
     )
     parser.add_argument(
@@ -623,8 +566,6 @@ def main():
                             args.max_kv_cache_tokens,
                             tries=args.tries,
                             vmem_limit_bytes=args.vmem_limit_bytes or None,
-                            vmem_budget_fraction=args.vmem_budget_fraction,
-                            csz_mode=args.csz_mode,
                         )
                     except Exception as e:  # noqa: BLE001
                         print(
