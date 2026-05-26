@@ -33,6 +33,7 @@ def _make_engine(device_indexes: list[int]) -> Engine:
         device="tpu",  # use proxy when running in Pathways
         device_indexes=device_indexes,
         enable_single_process=True,
+        disable_precompile=True,
         skip_server_warmup=True,
         random_seed=3,
         node_rank=0,
