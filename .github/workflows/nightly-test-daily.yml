@@ -56,10 +56,19 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite nightly-test-perf-text-models-tpu-v6e-1-daily
 
+  multi-host-test-mimo-flash-daily:
+    if: github.repository == 'sgl-project/sglang-jax'
+    uses: ./.github/workflows/multi-host-test.yml
+    permissions:
+      contents: read
+      id-token: write
+    secrets: inherit
+
   nightly-test-daily-finish:
     needs: [
       nightly-test-accuracy-text-models-1-tpu-daily,
       nightly-test-perf-text-models-1-tpu-daily,
+      multi-host-test-mimo-flash-daily,
     ]
     if: always() && github.repository == 'sgl-project/sglang-jax'
     runs-on: ubuntu-latest
@@ -69,12 +78,14 @@ jobs:
           echo "=== Daily Test Results ==="
           echo "accuracy-1-tpu-daily: ${{ needs.nightly-test-accuracy-text-models-1-tpu-daily.result }}"
           echo "perf-text-1-tpu-daily: ${{ needs.nightly-test-perf-text-models-1-tpu-daily.result }}"
+          echo "multi-host-mimo-flash-daily: ${{ needs.multi-host-test-mimo-flash-daily.result }}"
           echo ""
 
           has_failure=false
           for job_result in \
             "accuracy-1-tpu-daily=${{ needs.nightly-test-accuracy-text-models-1-tpu-daily.result }}" \
-            "perf-text-1-tpu-daily=${{ needs.nightly-test-perf-text-models-1-tpu-daily.result }}"; do
+            "perf-text-1-tpu-daily=${{ needs.nightly-test-perf-text-models-1-tpu-daily.result }}" \
+            "multi-host-mimo-flash-daily=${{ needs.multi-host-test-mimo-flash-daily.result }}"; do
             job_name="${job_result%%=*}"
             result="${job_result#*=}"
             if [ "$result" != "success" ]; then

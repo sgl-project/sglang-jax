@@ -22,7 +22,7 @@ on:
       node_pool:
         description: "Existing GKE node pool to verify."
         required: true
-        default: "v6e-4x4-on-demand-np"
+        default: "sgl-jax-ci-4x4-np"
         type: string
       namespace:
         description: "Namespace for Kubernetes RBAC checks."
@@ -41,6 +41,39 @@ on:
         type: string
       repo_ref:
         description: "Git ref to test. Defaults to current workflow SHA."
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      project_id:
+        required: false
+        type: string
+      cluster_name:
+        required: false
+        type: string
+      cluster_location:
+        required: false
+        type: string
+      workload_identity_provider:
+        required: false
+        type: string
+      node_pool:
+        required: false
+        type: string
+        default: "sgl-jax-ci-4x4-np"
+      namespace:
+        required: false
+        type: string
+        default: "default"
+      bucket_name:
+        required: false
+        type: string
+        default: "model-storage-sglang"
+      service_account_name:
+        required: false
+        type: string
+        default: "gcs-account"
+      repo_ref:
         required: false
         type: string
 
