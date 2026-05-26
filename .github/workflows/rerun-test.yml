@@ -41,9 +41,6 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           JAX_COMPILATION_CACHE_DIR: /xla-cache
-          JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES: "0"
-          JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "0"
-          JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           SUITE: ${{ inputs.suite }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
