@@ -31,6 +31,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes_v3 import (
+    get_tuned_block_sizes_v3,
+)
 from sgl_jax.srt.kernels.ragged_paged_attention.util import (
     align_to,
     cdiv,
@@ -1970,7 +1973,8 @@ def ragged_paged_attention(
 
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:
-            return get_default_block_sizes(
+            tuned = get_tuned_block_sizes_v3(
+                case.symbol,
                 q.dtype,
                 kv_cache_fused_processed.dtype,
                 actual_num_q_heads,
@@ -1978,13 +1982,25 @@ def ragged_paged_attention(
                 head_dim,
                 page_size,
                 max_num_tokens,
-                max_num_seqs,
-                pages_per_seq,
-                case=case,
-                vmem_limit_bytes=vmem_limit_bytes,
-                use_custom_mask=not use_causal_mask,
-                sliding_window=sliding_window,
             )
+            if tuned is not None:
+                block_sizes = tuned
+            else:
+                return get_default_block_sizes(
+                    q.dtype,
+                    kv_cache_fused_processed.dtype,
+                    actual_num_q_heads,
+                    actual_num_kv_heads,
+                    head_dim,
+                    page_size,
+                    max_num_tokens,
+                    max_num_seqs,
+                    pages_per_seq,
+                    case=case,
+                    vmem_limit_bytes=vmem_limit_bytes,
+                    use_custom_mask=not use_causal_mask,
+                    sliding_window=sliding_window,
+                )
 
         return {
             "bq_sz": block_sizes[0],
