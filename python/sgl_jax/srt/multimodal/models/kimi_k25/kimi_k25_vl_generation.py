@@ -5,7 +5,8 @@ import jax.numpy as jnp
 from flax import nnx
 import numpy as np
 
-from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.configs.model_config import AttentionArch, ModelConfig
+from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
 from sgl_jax.srt.layers.embeddings import ParallelLMHead
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -14,10 +15,11 @@ from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Model
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
+
 logger = logging.getLogger(__name__)
 
 
-class DeepseekV3_Model(DeepseekV3Model):
+class KimiDeepseekV3Model(DeepseekV3Model):
     
     def __init__(
         self,
@@ -89,18 +91,19 @@ class KimiK25ForConditionalGeneration(nnx.Module):
 
         self.config = config
         self.text_config = get_hf_text_config(config) or config
-        self.dtype = dtype
+        self.dtype = dtype or jnp.bfloat16
         self.mesh = mesh
 
-        self.model = DeepseekV3_Model(self.text_config, mesh=mesh, dtype=self.dtype)
+        self.model = KimiDeepseekV3Model(self.text_config, mesh=mesh, dtype=self.dtype)
 
-        self.lm_head = ParallelLMHead(
-            self.text_config.vocab_size,
-            self.text_config.hidden_size,
-            dtype=dtype,
-            param_dtype=dtype,
-            kernel_axes=("tensor", None),
-        )
+        if not getattr(self.text_config, "tie_word_embeddings", False):
+            self.lm_head = ParallelLMHead(
+                self.text_config.vocab_size,
+                self.text_config.hidden_size,
+                dtype=self.dtype,
+                param_dtype=dtype,
+                kernel_axes=("tensor", None),
+            )
 
         self.logits_processor = LogitsProcessor(self.text_config.vocab_size, mesh=mesh)
 
@@ -111,7 +114,7 @@ class KimiK25ForConditionalGeneration(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         token_to_kv_pool = memory_pools.token_to_kv_pool
-        hidden_states, layers_kv_fused, layers_callback_flag = self.model(
+        hidden_states, layers_kv_fused, layers_topk_ids = self.model(
             forward_batch, token_to_kv_pool
         )
 
@@ -120,7 +123,7 @@ class KimiK25ForConditionalGeneration(nnx.Module):
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
 
-        return output, layers_kv_fused, layers_callback_flag, None
+        return output, layers_kv_fused, True, layers_topk_ids
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
@@ -280,9 +283,6 @@ class KimiK25ForConditionalGeneration(nnx.Module):
                 sharding=(None,),
                 transpose=False,
             )
-
-        # Expert weights (aggregated loading via create_moe_weights_mapping)
-        from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 
         metadata = get_global_expert_location_metadata()
         phy_to_log = None
