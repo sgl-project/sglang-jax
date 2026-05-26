@@ -23,31 +23,25 @@ from sgl_jax.srt.kernels.ragged_paged_attention.util import get_tpu_version
 
 logger = logging.getLogger(__name__)
 
+# Track which (stage, key) combos we've already warned about, so each unique
+# lookup miss prints at most once per process. Helps diagnose "tuned table
+# was added but server still falls back to heuristic" bugs (usually a shape
+# mismatch — e.g., wrong q_heads_per_shard).
+_WARNED_MISSES: set[tuple] = set()
+
 
 TUNED_BLOCK_SIZES_V3: dict[str, dict[tuple, tuple[int, int, int, int]]] = {
     "TPU v5": {},
     "TPU v6e": {},
     "TPU v7": {
-        # MiMo-V2-Pro decode (q=16 kv=2 hd=192→256 ps=256). Tuned 2026-05-26
-        # on tpuv7x-64-node, exp-kc4leh9wnt (verified again under v2-style
-        # tuner with vmem=64MB capacity, exp-zsf74pkuju, same winner).
-        # Heuristic picked bkv=1024 here but bkv=2048 wins by +25-28%.
-        ("d", "bfloat16", "bfloat16", 16, 2, 256, 256, 32): (1, 2048, 1, 2048),
-        ("d", "bfloat16", "bfloat16", 16, 2, 256, 256, 64): (1, 2048, 1, 2048),
-        ("d", "bfloat16", "bfloat16", 16, 2, 256, 256, 128): (1, 2048, 1, 2048),
-        ("d", "bfloat16", "bfloat16", 16, 2, 256, 256, 256): (1, 2048, 1, 2048),
-        ("d", "bfloat16", "bfloat16", 16, 2, 256, 256, 512): (1, 2048, 1, 2048),
-        # MiMo-V2-Pro prefill at chunk_prefill_size=2048. Tuned 2026-05-26 on
-        # tpuv7x-64-node, exp-c56k3t0hr8 (v2-style tuner, vmem=64MB capacity).
-        # Heuristic picks bq=4 but bq=32 wins by +83% — heuristic's MAX_BQ_SZ
-        # cap of 32 is the right ceiling, but the heuristic itself takes
-        # max_q//2 which gives bq=4 here.
-        ("p", "bfloat16", "bfloat16", 16, 2, 256, 256, 2048): (32, 1024, 32, 1024),
-        # MiMo-V2-Pro mixed (ragged batch). Tuned 2026-05-26 on tpuv7x-64-node,
-        # exp-w8p6857gg8. Same +83% pattern as prefill across all 3 chunk sizes.
-        ("m", "bfloat16", "bfloat16", 16, 2, 256, 256, 2048): (32, 1024, 32, 1024),
-        ("m", "bfloat16", "bfloat16", 16, 2, 256, 256, 4096): (32, 1024, 32, 1024),
-        ("m", "bfloat16", "bfloat16", 16, 2, 256, 256, 8192): (32, 1024, 32, 1024),
+        # Awaiting full-grid sharded tuner output (exps submitted 2026-05-26,
+        # branch dev/rpa-v3-on-fmv2, 36 shards across d/p/m).
+        #
+        # Earlier MiMo-V2-Pro-targeted entries with q_h=16 were removed:
+        # MiMo on v7x-32 actually uses attention TP = tp_size/dp_size = 32/8 = 4,
+        # so per-device q_heads = 128/4 = 32 (not 16). All q_h=16 entries were
+        # never hit by the server — full sweep will produce correct (32, 2)
+        # entries plus coverage for many other shapes.
     },
 }
 
@@ -89,4 +83,14 @@ def get_tuned_block_sizes_v3(
         return None
 
     key = (stage, *signature)
-    return table.get(key)
+    hit = table.get(key)
+    if hit is None and key not in _WARNED_MISSES:
+        _WARNED_MISSES.add(key)
+        logger.info(
+            "RPA v3 tuned-block-size LOOKUP MISS device=%s key=%s "
+            "(falling back to heuristic). Add this key to TUNED_BLOCK_SIZES_V3 "
+            "to enable tuning for this shape.",
+            device_name,
+            key,
+        )
+    return hit
