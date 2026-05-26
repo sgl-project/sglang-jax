@@ -105,9 +105,13 @@ def get_jobs_for_run(repo, run_id):
     )
 
 
+_RUNNER_LABEL_MAP = {"cpu-runner": "arc-runner-cpu"}
+
+
 def _meaningful_labels(label_dicts):
     """Extract meaningful labels from a list of {"name": ...} dicts."""
-    return {d["name"] for d in label_dicts} - DEFAULT_LABELS_TO_IGNORE - GITHUB_HOSTED_LABELS
+    raw = {d["name"] for d in label_dicts} - DEFAULT_LABELS_TO_IGNORE - GITHUB_HOSTED_LABELS
+    return {_RUNNER_LABEL_MAP.get(l, l) for l in raw}
 
 
 def get_runners(repo, online_only=False):
@@ -122,15 +126,11 @@ def get_runners(repo, online_only=False):
         for runner in runners:
             if not _meaningful_labels(runner.get("labels", [])):
                 name = runner.get("name", "")
-                m = re.match(r"^(arc-runner-v6e-\d+)-", name)
+                m = re.match(r"^(arc-runner-(?:v6e-\d+|cpu))-", name)
                 inferred = (
                     m.group(1)
                     if m
-                    else (
-                        "arc-runner-cpu"
-                        if ("cpu-runner" in name or name.startswith("runnerdeploy-"))
-                        else None
-                    )
+                    else ("arc-runner-cpu" if name.startswith("runnerdeploy-") else None)
                 )
                 if inferred:
                     runner.setdefault("labels", []).append({"name": inferred})
@@ -193,6 +193,12 @@ def _format_duration(seconds):
     return f"{m:.1f}m" if m < 60 else f"{m / 60:.1f}h"
 
 
+def _success_bar(rate_pct):
+    """Unicode progress bar for success rate: ██████░░░░ 62%."""
+    filled = int(max(0.0, min(100.0, rate_pct)) / 10)
+    return "█" * filled + "░" * (10 - filled)
+
+
 def calculate_utilization(repo, hours=24, runner_filter=None):
     """Fetch runs/jobs, aggregate per-label utilization and concurrency metrics."""
     window_end = datetime.now(timezone.utc)
@@ -222,7 +228,7 @@ def calculate_utilization(repo, hours=24, runner_filter=None):
     fleet_status = dict(fleet_status)
 
     fetch_failures, total_runs = 0, len(runs)
-    label_intervals = defaultdict(list)
+    labels_with_jobs = set()
     label_jobs = defaultdict(list)
     label_queue_waits = defaultdict(list)
     label_job_durations = defaultdict(list)
@@ -258,9 +264,7 @@ def calculate_utilization(repo, hours=24, runner_filter=None):
             for job in jobs:
                 if job.get("status") != "completed":
                     continue
-                meaningful = (
-                    set(job.get("labels", [])) - DEFAULT_LABELS_TO_IGNORE - GITHUB_HOSTED_LABELS
-                )
+                meaningful = _meaningful_labels([{"name": l} for l in job.get("labels", [])])
                 if not meaningful:
                     continue
                 if runner_filter and not any(runner_filter in l for l in meaningful):
@@ -282,7 +286,7 @@ def calculate_utilization(repo, hours=24, runner_filter=None):
                 duration_s = (eff_end - eff_start).total_seconds()
                 conclusion = job.get("conclusion", "unknown")
                 for lbl in meaningful:
-                    label_intervals[lbl].append((eff_start, eff_end))
+                    labels_with_jobs.add(lbl)
                     label_jobs[lbl].append(job)
                     label_job_durations[lbl].append(duration_s)
                     label_conclusions[lbl].append(conclusion)
@@ -300,22 +304,17 @@ def calculate_utilization(repo, hours=24, runner_filter=None):
                     )
 
     fetch_failure_pct = (fetch_failures / total_runs * 100) if total_runs > 0 else 0.0
-    window_seconds = (window_end - window_start).total_seconds()
 
     results = {}
-    for label in sorted(set(label_intervals) | set(label_runner_count)):
+    for label in sorted(labels_with_jobs | set(label_runner_count)):
         if runner_filter and runner_filter not in label:
             continue
-        intervals = label_intervals.get(label, [])
         num_runners = label_runner_count.get(label, 0)
-        total_job_s = sum((e - s).total_seconds() for s, e in intervals)
-        cap_s = num_runners * window_seconds if num_runners > 0 else 0.0
         waits = sorted(label_queue_waits.get(label, []))
         durations = sorted(label_job_durations.get(label, []))
         conclusions = label_conclusions.get(label, [])
         results[label] = {
             "num_runners": num_runners,
-            "utilization_pct": (total_job_s / cap_s * 100) if cap_s > 0 else None,
             "job_count": len(label_jobs.get(label, [])),
             "concurrency": calculate_concurrency_metrics(
                 label_jobs.get(label, []),
@@ -326,6 +325,7 @@ def calculate_utilization(repo, hours=24, runner_filter=None):
             "wait_p95": _percentile(waits, 95),
             "duration_p50": _percentile(durations, 50),
             "duration_p95": _percentile(durations, 95),
+            "duration_max": durations[-1] if durations else 0.0,
             "success_count": conclusions.count("success"),
             "failure_count": conclusions.count("failure"),
             "total_concluded": len(conclusions),
@@ -339,30 +339,55 @@ def calculate_utilization(repo, hours=24, runner_filter=None):
             "labels": sorted(label_data.keys()),
         }
 
+    # Per-workflow failure counts
+    wf_failure_counts = defaultdict(int)
+    for job in failed_jobs:
+        wf_failure_counts[job["workflow"]] += 1
+    wf_aggregates_with_failures = {}
+    for wf_name, a in wf_aggregates.items():
+        wf_aggregates_with_failures[wf_name] = {
+            **a,
+            "failure_count": wf_failure_counts[wf_name],
+        }
+
+    # Recurring failures: group by job name
+    job_failure_counts = defaultdict(lambda: {"count": 0, "labels": set()})
+    for job in failed_jobs:
+        jn = job["job_name"]
+        job_failure_counts[jn]["count"] += 1
+        job_failure_counts[jn]["labels"].add(job["label"])
+    recurring_failures = [
+        {"job_name": jn, "failures": d["count"], "label": ", ".join(sorted(d["labels"]))}
+        for jn, d in job_failure_counts.items()
+        if d["count"] >= 2
+    ]
+    recurring_failures.sort(key=lambda x: x["failures"], reverse=True)
+
     return {
         "per_label": results,
         "fleet_status": fleet_status,
         "fetch_failure_pct": fetch_failure_pct,
         "failed_jobs": failed_jobs,
         "workflow_stats": dict(workflow_stats),
-        "wf_aggregates": wf_aggregates,
+        "wf_aggregates": wf_aggregates_with_failures,
+        "recurring_failures": recurring_failures,
     }
 
 
 def _generate_recommendations(results, fleet_status, wf_aggregates):
     """Generate recommendation strings shared by full report and Slack summary."""
     recs = []
-    grand_total = sum(a["total_duration"] for a in wf_aggregates.values())
+    total_jobs = sum(a["total_jobs"] for a in wf_aggregates.values())
     for label, d in sorted(results.items()):
-        util, conc = d["utilization_pct"], d["concurrency"]
+        conc = d["concurrency"]
         tc, fc = d["total_concluded"], d["failure_count"]
-        if util is not None and util > 80:
+        nr = d["num_runners"]
+        if nr > 0 and conc["peak_concurrent"] > nr * 2:
             recs.append(
-                f"**`{label}`**: High utilization ({util:.1f}%). Consider adding more runners."
+                f"**`{label}`**: Peak concurrency ({conc['peak_concurrent']}) "
+                f"far exceeds runner count ({nr}). Consider scaling."
             )
-        elif util is not None and util < 10 and d["job_count"] > 0:
-            recs.append(f"**`{label}`**: Low utilization ({util:.1f}%). May be over-provisioned.")
-        if conc["peak_queue"] is not None and conc["peak_queue"] > 0:
+        elif conc["peak_queue"] is not None and conc["peak_queue"] > 0:
             recs.append(
                 f"**`{label}`**: Peak queue depth {conc['peak_queue']}. Jobs waited for runners."
             )
@@ -375,25 +400,24 @@ def _generate_recommendations(results, fleet_status, wf_aggregates):
     for label, s in sorted(fleet_status.items()):
         if s["offline"] > 0:
             recs.append(f"**`{label}`**: {s['offline']} runner(s) offline.")
-    if grand_total > 0:
-        for wf, a in sorted(
-            wf_aggregates.items(), key=lambda x: x[1]["total_duration"], reverse=True
-        ):
-            if a["total_duration"] > 0.5 * grand_total:
-                pct = a["total_duration"] / grand_total * 100
+    if total_jobs > 0:
+        for wf, a in sorted(wf_aggregates.items(), key=lambda x: x[1]["total_jobs"], reverse=True):
+            if a["total_jobs"] > 0.5 * total_jobs:
+                pct = a["total_jobs"] / total_jobs * 100
                 recs.append(
-                    f"Workflow **`{wf}`** accounts for {pct:.0f}% of runner time "
-                    f"({_format_duration(a['total_duration'])} of {_format_duration(grand_total)})."
+                    f"Workflow **`{wf}`** accounts for {pct:.0f}% of all jobs "
+                    f"({a['total_jobs']} / {total_jobs})."
                 )
     return recs
 
 
 def format_report(report_data, hours):
-    """Format utilization results as a Markdown report (5 sections)."""
+    """Format utilization results as a Markdown report."""
     results = report_data["per_label"]
     fleet_status = report_data["fleet_status"]
     wf_aggregates = report_data["wf_aggregates"]
     failed_jobs = report_data["failed_jobs"]
+    recurring_failures = report_data.get("recurring_failures", [])
     lines = [f"# Runner Utilization Report (Past {hours} Hours)", ""]
     lines.append(f"_Generated at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_")
     lines.append("")
@@ -414,7 +438,8 @@ def format_report(report_data, hours):
         lines.append("|---|---|---|---|---|---|")
         for label, s in sorted(fleet_status.items()):
             lines.append(
-                f"| `{label}` | {s['total']} | {s['online']} | {s['offline']} | {s['busy']} | {s['idle']} |"
+                f"| `{label}` | {s['total']} | {s['online']} | {s['offline']} "
+                f"| {s['busy']} | {s['idle']} |"
             )
     else:
         lines.append("No runner data available (admin token required).")
@@ -427,49 +452,99 @@ def format_report(report_data, hours):
     lines.append("## Utilization Summary")
     lines.append("")
     lines.append(
-        "| Runner Label | Runners | Jobs | Utilization | Peak Conc "
-        "| Queue P95* | Duration P50 | Duration P95 | Success Rate |"
+        "| Runner Label | Runners | Jobs | Failed | Success Rate "
+        "| Peak Jobs | Queue Wait (p95) | Run Time (p95) |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|")
     for label, d in sorted(results.items()):
         nr = d["num_runners"] or "N/A"
-        util = f"{d['utilization_pct']:.1f}%" if d["utilization_pct"] is not None else "N/A"
         tc = d["total_concluded"]
-        rate = f"{d['success_count'] / tc * 100:.1f}%" if tc > 0 else "N/A"
+        if tc > 0:
+            pct = d["success_count"] / tc * 100
+            rate = f"{_success_bar(pct)} {pct:.1f}%"
+        else:
+            rate = "N/A"
         lines.append(
-            f"| `{label}` | {nr} | {d['job_count']} | {util} "
+            f"| `{label}` | {nr} | {d['job_count']} "
+            f"| {d['failure_count']} | {rate} "
             f"| {d['concurrency']['peak_concurrent']} | {_format_duration(d['wait_p95'])} "
-            f"| {_format_duration(d['duration_p50'])} | {_format_duration(d['duration_p95'])} | {rate} |"
+            f"| {_format_duration(d['duration_p95'])} |"
         )
     lines.append("")
-    lines.append("_* Queue P95 is computed among jobs that waited (excludes 0s waits)._")
+    lines.append("_Queue Wait (p95) is computed among jobs that waited (excludes 0s waits)._")
+    lines.append("")
+
+    # Duration Distribution
+    lines.append("## Duration Distribution")
+    lines.append("")
+    lines.append("| Runner Label | Jobs | p50 | p95 | Max |")
+    lines.append("|---|---|---|---|---|")
+    for label, d in sorted(results.items()):
+        lines.append(
+            f"| `{label}` | {d['job_count']} | {_format_duration(d['duration_p50'])} "
+            f"| {_format_duration(d['duration_p95'])} | {_format_duration(d['duration_max'])} |"
+        )
     lines.append("")
 
     # Top 10 Workflows
     lines.append("## Top 10 Workflows by Runner Time")
     lines.append("")
-    lines.append("| # | Workflow | Jobs | Total Time | Avg Duration | Runner Labels |")
-    lines.append("|---|---|---|---|---|---|")
+    lines.append(
+        "| # | Workflow | Jobs | Failed | Success Rate "
+        "| Total Time | Avg Duration | Runner Labels |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|")
     sorted_wfs = sorted(wf_aggregates.items(), key=lambda x: x[1]["total_duration"], reverse=True)
     for rank, (wf, a) in enumerate(sorted_wfs[:10], start=1):
         avg = a["total_duration"] / a["total_jobs"] if a["total_jobs"] > 0 else 0
+        fc = a.get("failure_count", 0)
+        if a["total_jobs"] > 0:
+            pct = (a["total_jobs"] - fc) / a["total_jobs"] * 100
+            rate = f"{_success_bar(pct)} {pct:.0f}%"
+        else:
+            rate = "N/A"
         lines.append(
-            f"| {rank} | {wf} | {a['total_jobs']} | {_format_duration(a['total_duration'])} "
+            f"| {rank} | {wf} | {a['total_jobs']} | {fc} | {rate} "
+            f"| {_format_duration(a['total_duration'])} "
             f"| {_format_duration(avg)} | {', '.join(a['labels'])} |"
         )
     lines.append("")
 
-    # Failed Jobs (max 5)
+    # Recurring Failures
+    if recurring_failures:
+        lines.append("## Recurring Failures")
+        lines.append("")
+        lines.append("_Jobs that failed 2+ times in this period, sorted by failure count._")
+        lines.append("")
+        lines.append("| Job Name | Failures | Runner Label |")
+        lines.append("|---|---|---|")
+        for rf in recurring_failures[:10]:
+            lines.append(f"| {rf['job_name']} | {rf['failures']} | `{rf['label']}` |")
+        lines.append("")
+
+    # Failed Jobs (collapsible, max 20)
     lines.append("## Failed Jobs")
     lines.append("")
     if failed_jobs:
+        sorted_failures = sorted(failed_jobs, key=lambda j: j["duration"], reverse=True)[:20]
+        total_failed = len(failed_jobs)
+        if total_failed > len(sorted_failures):
+            summary_text = (
+                f"Top {len(sorted_failures)} of {total_failed} failed jobs " f"(click to expand)"
+            )
+        else:
+            summary_text = f"{total_failed} failed jobs (click to expand)"
+        lines.append(f"<details><summary>{summary_text}</summary>")
+        lines.append("")
         lines.append("| Workflow | Job | Duration | Runner Label | Link |")
         lines.append("|---|---|---|---|---|")
-        for j in sorted(failed_jobs, key=lambda j: j["duration"], reverse=True)[:5]:
+        for j in sorted_failures:
             lines.append(
                 f"| {j['workflow']} | {j['job_name']} | {_format_duration(j['duration'])} "
                 f"| {j['label']} | [Run]({j['url']}) |"
             )
+        lines.append("")
+        lines.append("</details>")
     else:
         lines.append("No failed jobs in this period.")
     lines.append("")
@@ -478,6 +553,12 @@ def format_report(report_data, hours):
     lines.append("## Recommendations")
     lines.append("")
     recs = _generate_recommendations(results, fleet_status, wf_aggregates)
+    if recurring_failures:
+        for rf in recurring_failures[:3]:
+            recs.append(
+                f"**`{rf['job_name']}`**: Recurring failure "
+                f"({rf['failures']} failures in {hours}h)."
+            )
     for r in recs:
         lines.append(f"- {r}")
     if not recs:
@@ -486,76 +567,101 @@ def format_report(report_data, hours):
     return "\n".join(lines)
 
 
+def _slack_section(text, max_len=3000):
+    """Create a Slack section block, truncating text to Block Kit's limit."""
+    if len(text) > max_len:
+        text = text[: max_len - 8] + "\n…"
+        if text.count("```") % 2 == 1:
+            text += "\n```"
+    return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+
+
 def format_slack_summary(report_data, hours, run_url=""):
-    """Format a compact Slack mrkdwn summary."""
+    """Format a Slack Block Kit JSON payload with monospace tables."""
     results = report_data["per_label"]
     fleet_status = report_data["fleet_status"]
     wf_aggregates = report_data["wf_aggregates"]
-    lines = [f"*Runner Utilization Report (Past {hours} Hours)*"]
-    lines.append("")
-    lines.append("*Fleet Status*")
-    if fleet_status:
-        for label, s in sorted(fleet_status.items()):
-            lines.append(
-                f"• `{label}`: {s['total']} runners ({s['online']} online, {s['busy']} busy)"
-            )
-    else:
-        lines.append("Fleet data unavailable (admin token required)")
-    if not results:
-        lines += ["", "No runner activity in this period."]
-        if run_url:
-            lines += ["", f"<{run_url}|View full report>"]
-        return "\n".join(lines)
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    lines.append("")
-    lines.append("*Utilization*")
-    lines.append(
-        "• "
-        + " | ".join(
-            (
-                f"`{l}`: {d['utilization_pct']:.1f}%"
-                if d["utilization_pct"] is not None
-                else f"`{l}`: N/A"
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": "Runner Utilization Report"}},
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"{now_str} · Past {hours} hours"}],
+        },
+        {"type": "divider"},
+    ]
+
+    if fleet_status:
+        hdr = f"{'Runner':<20s} {'Total':>5s} {'Online':>6s} {'Busy':>4s} {'Idle':>4s}"
+        rows = [hdr]
+        for label, s in sorted(fleet_status.items()):
+            rows.append(
+                f"{label:<20s} {s['total']:>5d} {s['online']:>6d} "
+                f"{s['busy']:>4d} {s['idle']:>4d}"
             )
-            for l, d in sorted(results.items())
-        )
+        blocks.append(_slack_section("*Fleet Status*\n```" + "\n".join(rows) + "```"))
+
+    if not results:
+        blocks.append(_slack_section("No runner activity in this period."))
+        if run_url:
+            blocks.append(_slack_view_button(run_url))
+        return json.dumps({"blocks": blocks})
+
+    hdr = (
+        f"{'Runner':<20s} {'Jobs':>4s} {'Failed':>6s} {'Success':>7s} "
+        f"{'Peak Jobs':>9s} {'Queue Wait(p95)':>15s} {'Run Time(p95)':>13s}"
     )
-    lines.append("")
-    lines.append("*Queue Wait (P95)*")
-    lines.append(
-        "• "
-        + " | ".join(
-            f"`{l}`: {_format_duration(d['wait_p95'])}" for l, d in sorted(results.items())
+    rows = [hdr]
+    for label, d in sorted(results.items()):
+        tc = d["total_concluded"]
+        rate = f"{d['success_count'] / tc * 100:.0f}%" if tc > 0 else "N/A"
+        fc = d["failure_count"]
+        rows.append(
+            f"{label:<20s} {d['job_count']:>4d} {fc:>6d} {rate:>7s} "
+            f"{d['concurrency']['peak_concurrent']:>9d} "
+            f"{_format_duration(d['wait_p95']):>15s} "
+            f"{_format_duration(d['duration_p95']):>13s}"
         )
-    )
-    lines.append("")
-    lines.append("*Success Rate*")
-    rate_parts = []
-    for l, d in sorted(results.items()):
-        if d["total_concluded"] > 0:
-            p = f"`{l}`: {d['success_count'] / d['total_concluded'] * 100:.1f}%"
-            if d["failure_count"] > 0:
-                p += f" ({d['failure_count']} failures)"
-            rate_parts.append(p)
-        else:
-            rate_parts.append(f"`{l}`: N/A")
-    lines.append("• " + " | ".join(rate_parts))
+    blocks.append(_slack_section("*Job Summary*\n```" + "\n".join(rows) + "```"))
 
     recs = _generate_recommendations(results, fleet_status, wf_aggregates)
-    lines.append("")
+    recurring_failures = report_data.get("recurring_failures", [])
+
+    if recurring_failures:
+        rf_lines = [
+            f"• `{rf['job_name']}`: {rf['failures']}x ({rf['label']})"
+            for rf in recurring_failures[:5]
+        ]
+        blocks.append({"type": "divider"})
+        blocks.append(_slack_section(":repeat: *Recurring Failures*\n" + "\n".join(rf_lines)))
+
     if recs:
-        lines.append("*Recommendations*")
+        blocks.append({"type": "divider"})
+        rec_lines = []
         for r in recs:
-            lines.append(f"• {r.replace('**`', '*`').replace('`**', '`*')}")
-    else:
-        lines.append("No issues detected.")
+            line = r.replace("**`", "`").replace("`**", "`")
+            rec_lines.append(f"• {line}")
+        blocks.append(_slack_section(":warning: *Recommendations*\n" + "\n".join(rec_lines)))
+
     if run_url:
-        lines += ["", f"<{run_url}|View full report>"]
-    text = "\n".join(lines)
-    # Slack Block Kit section text has a 3000 character limit
-    if len(text) > 2900:
-        text = text[:2900].rsplit("\n", 1)[0] + "\n… (truncated)"
-    return text
+        blocks.append(_slack_view_button(run_url))
+
+    return json.dumps({"blocks": blocks})
+
+
+def _slack_view_button(url):
+    """Create a Slack actions block with a 'View full report' button."""
+    return {
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "View full report"},
+                "url": url,
+            }
+        ],
+    }
 
 
 def main():

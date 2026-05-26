@@ -22,6 +22,10 @@ on:
 
 run-name: "rerun-test: ${{ inputs.suite }} [${{ inputs.ref }}]"
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   rerun:
     runs-on: ${{ inputs.runner }}
@@ -40,11 +44,17 @@ jobs:
         timeout-minutes: 120
         env:
           SGLANG_JAX_IS_IN_CI: true
-          SGLANG_JAX_MODEL_CACHE: /models/model_scope
           SUITE: ${{ inputs.suite }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
+          RUNNER_LABEL: ${{ inputs.runner }}
         run: |
+          if [[ "$RUNNER_LABEL" == *cpu* ]]; then
+            export USE_DEVICE_TYPE=cpu
+          else
+            export JAX_COMPILATION_CACHE_DIR=/xla-cache
+            export SGLANG_JAX_MODEL_CACHE=/models/model_scope
+          fi
           bash scripts/killall_sglang.sh 2>/dev/null || true
           python test/srt/run_suite.py --suite "$SUITE"
 
