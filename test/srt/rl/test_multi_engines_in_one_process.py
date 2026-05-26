@@ -62,19 +62,22 @@ class TestMultiEnginesInOneProcess(CustomTestCase):
         return outputs
 
     def test_01_multi_engine_modes_cache_miss(self):
+        # Diagnostic (#1216 experiment E): drop Engine A entirely. Only create
+        # Engine B on devices [2,3] with the same warm /xla-cache that
+        # populated entries for [2,3] in earlier runs. If B no longer crashes,
+        # the trigger requires Engine A's programs to be active on libtpu
+        # while B does deserialize_executable -- not deserialize alone.
         print(
-            "=== test_01_multi_engine_modes_cache_miss: engineA=[0,1], engineB=[2,3] ===",
+            "=== test_01_multi_engine_modes_cache_miss [exp E]: engineB=[2,3] only ===",
             flush=True,
         )
-        engine_a = _make_engine(device_indexes=[0, 1])
         engine_b = _make_engine(device_indexes=[2, 3])
         try:
-            prefill_output = self._run_generate(engine_a, max_new_tokens=1)
-            decode_output = self._run_generate(engine_a, max_new_tokens=2)
+            prefill_output = self._run_generate(engine_b, max_new_tokens=1)
+            decode_output = self._run_generate(engine_b, max_new_tokens=2)
             assert prefill_output["meta_info"]["cache_miss_count"] == 0
             assert decode_output["meta_info"]["cache_miss_count"] == 0
         finally:
-            engine_a.shutdown()
             engine_b.shutdown()
 
     def test_02_multi_engine_modes(self):
