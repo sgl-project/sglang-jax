@@ -1834,7 +1834,17 @@ def ragged_paged_attention(
             q.dtype,
         )
 
-        bo_double_buf = bq_double_buf
+        # bo_double_buf was previously aliased to bq_double_buf as a vmem-saving
+        # optimization. The kernel body reads bq and writes bo separately, so
+        # the alias was perf-only, not correctness. Disabling it because XLA
+        # MSA on certain (stage=decode, page_size=128) layouts emits
+        # "Conflicting pending required assignment" CHECK failures when two
+        # scratch entries point at the same VMEM object. Cost: an extra buffer
+        # of shape (2, kv_heads, bq, *q.shape[2:]), only KB on typical configs.
+        bo_double_buf = pltpu.VMEM(
+            (2, actual_num_kv_heads, bq_sz, *q.shape[2:]),
+            q.dtype,
+        )
 
         if use_causal_mask:
             bkvmask_double_buf = None
@@ -1848,7 +1858,11 @@ def ragged_paged_attention(
             (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
             out_dtype,
         )
-        m_scratch = l_scratch
+        # See bo_double_buf note above — unalias to avoid XLA MSA conflict.
+        m_scratch = pltpu.VMEM(
+            (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
+            out_dtype,
+        )
 
         acc_scratch = pltpu.VMEM(
             (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim),
