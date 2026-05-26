@@ -2443,11 +2443,20 @@ class WeightLoader:
     ):
         processed_weight = hf_weight
 
-        # Handle multi-dimensional transpose (transpose_axes) or 2D transpose
+        # Diagnostic (#1216 experiment D): do transpose on host (numpy) instead
+        # of jnp.transpose. Hypothesis: jnp.transpose on a jax.Array dispatches
+        # as jit_transpose, which on warm /xla-cache calls deserialize_executable
+        # and corrupts libtpu state when another engine's programs are active.
+        # Using np.transpose forces the transpose to run on host (CPU), avoiding
+        # the persistent compilation cache entirely. If Engine B no longer
+        # crashes here but at a later jit op, the revised hypothesis is
+        # confirmed and any deserialize-during-active-programs is the trigger.
         if mapping.transpose_axes is not None and not hf_key.endswith(".bias"):
-            processed_weight = jnp.transpose(processed_weight, mapping.transpose_axes)
+            processed_weight = jnp.asarray(
+                np.transpose(np.asarray(processed_weight), mapping.transpose_axes)
+            )
         elif mapping.transpose and not hf_key.endswith(".bias"):
-            processed_weight = jnp.transpose(processed_weight, (1, 0))
+            processed_weight = jnp.asarray(np.transpose(np.asarray(processed_weight), (1, 0)))
 
         if isinstance(mapping.target_path, list):
             self._handle_split_weight(params, hf_key, processed_weight, mapping)
