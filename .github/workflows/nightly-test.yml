@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1 , 2, 3]
+        part: [0, 1]
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
@@ -47,7 +47,7 @@ jobs:
 
           bash scripts/killall_sglang.sh
           cd test/srt
-          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --reruns 2
+          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --reruns 2
       - name: Publish traces to storage repo
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
@@ -85,7 +85,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1 , 2, 3 , 4, 5]
+        part: [0, 1, 2, 3]
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
@@ -111,7 +111,7 @@ jobs:
 
           bash scripts/killall_sglang.sh
           cd test/srt
-          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 6 --reruns 2
+          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --reruns 2
       - name: Publish traces to storage repo
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
@@ -124,10 +124,6 @@ jobs:
   nightly-test-perf-text-models-1-tpu:
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: arc-runner-v6e-1
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1 , 2, 3, 4, 5, 6, 7]
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
@@ -156,7 +152,7 @@ jobs:
 
           bash scripts/killall_sglang.sh
           cd test/srt
-          python3 run_suite.py --suite nightly-test-perf-text-models-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 8
+          python3 run_suite.py --suite nightly-test-perf-text-models-tpu-v6e-1
 
       - name: Publish traces to storage repo
         env:
@@ -319,159 +315,6 @@ jobs:
               python3 scripts/ci/publish.py --data-type perf --source-dir ./test/nightly_test_output
 
 
-  nightly-test-perf-trace-text-models-1-tpu:
-    if: github.repository == 'sgl-project/sglang-jax'
-    runs-on: arc-runner-v6e-1
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1 , 2, 3, 4, 5, 6, 7]
-    env:
-      TZ: Asia/Shanghai
-      JAX_COMPILATION_CACHE_DIR: /xla-cache
-      SGLANG_JAX_MODEL_CACHE: /models/model_scope
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Setup Python environment
-        uses: ./.github/actions/setup-venv
-      - name: Run performance test for text models
-        timeout-minutes: 120
-        env:
-
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
-          JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
-        run: |
-          export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-          export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/trace/$OUTPUT_DIR_NAME"
-          echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
-          mkdir -p $PERF_OUTPUT_DIR
-
-
-
-          bash scripts/killall_sglang.sh
-          cd test/srt
-          python3 run_suite.py --suite nightly-test-perf-trace-text-models-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 8
-
-      - name: Publish traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/publish.py --data-type trace --source-dir ./test/nightly_test_output
-
-
-  nightly-test-perf-trace-text-models-4-tpu-part1:
-    if: github.repository == 'sgl-project/sglang-jax'
-    runs-on: arc-runner-v6e-4
-    env:
-      TZ: Asia/Shanghai
-      JAX_COMPILATION_CACHE_DIR: /xla-cache
-      SGLANG_JAX_MODEL_CACHE: /models/model_scope
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Python environment
-        uses: ./.github/actions/setup-venv
-      - name: Run performance test trace for text models
-        timeout-minutes: 365
-        env:
-
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
-          JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
-        run: |
-          export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-          export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/trace/$OUTPUT_DIR_NAME"
-          echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
-          mkdir -p $PERF_OUTPUT_DIR
-
-
-
-          bash scripts/killall_sglang.sh
-          cd test/srt
-          python3 run_suite.py --suite  nightly-test-perf-trace-text-models-tpu-v6e-4-part1
-
-      - name: Publish traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/publish.py --data-type trace --source-dir ./test/nightly_test_output
-
-
-  nightly-test-perf-trace-text-models-4-tpu-part2:
-      if: github.repository == 'sgl-project/sglang-jax'
-      runs-on: arc-runner-v6e-4
-      env:
-        TZ: Asia/Shanghai
-        JAX_COMPILATION_CACHE_DIR: /xla-cache
-        SGLANG_JAX_MODEL_CACHE: /models/model_scope
-      steps:
-        - name: Checkout code
-          uses: actions/checkout@v4
-
-        - name: Setup Python environment
-          uses: ./.github/actions/setup-venv
-        - name: Run performance test trace for text models
-          timeout-minutes: 230
-          env:
-
-            TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-            PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-            HF_TOKEN: ${{ secrets.HF_TOKEN }}
-            HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
-            JAX_DEBUG_LOG_MODULES: jax._src.compilation_cache_utils
-          run: |
-            export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-            export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/trace/$OUTPUT_DIR_NAME"
-            echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
-            mkdir -p $PERF_OUTPUT_DIR
-
-
-
-            bash scripts/killall_sglang.sh
-            cd test/srt
-            python3 run_suite.py --suite  nightly-test-perf-trace-text-models-tpu-v6e-4-part2
-
-        - name: Publish traces to storage repo
-          env:
-            GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-            GITHUB_RUN_ID: ${{ github.run_id }}
-            GITHUB_RUN_NUMBER: ${{ github.run_number }}
-          run: |
-            python3 scripts/ci/publish.py --data-type trace --source-dir ./test/nightly_test_output
-
-        - name: Generate CSV Entry and publish
-          env:
-            GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-            GITHUB_RUN_ID: ${{ github.run_id }}
-            GITHUB_RUN_NUMBER: ${{ github.run_number }}
-          if: always()
-          run: |
-            mkdir -p ./test
-            SHA=${{ github.sha }}
-            AUTHOR=$(git log -1 --pretty=%an)
-            MSG=$(git log -1 --pretty=%B | tr -d ',' | head -n 1)
-            RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-            FILE="./meta/trace/"$OUTPUT_DIR_NAME"/nightly_report.csv"
-            mkdir -p ./meta/trace/$OUTPUT_DIR_NAME
-            if [ ! -f "$FILE" ]; then
-              echo "SHA,Author,Commit_Msg,Run_URL" > $FILE
-            fi
-            echo "$SHA,$AUTHOR,$MSG,$RUN_URL" >> $FILE
-            echo "CSV line added: $SHA, $AUTHOR, $MSG"
-            python3 scripts/ci/publish.py --data-type bench --source-dir ./meta
-
   nightly-test-finish:
     needs: [
       nightly-test-accuracy-text-models-1-tpu,
@@ -480,9 +323,6 @@ jobs:
       nightly-test-perf-text-models-4-tpu-part1,
       nightly-test-perf-text-models-4-tpu-part2,
       nightly-test-perf-text-models-4-tpu-part3,
-      nightly-test-perf-trace-text-models-1-tpu,
-      nightly-test-perf-trace-text-models-4-tpu-part1,
-      nightly-test-perf-trace-text-models-4-tpu-part2,
     ]
     if: always() && github.repository == 'sgl-project/sglang-jax'
     runs-on: ubuntu-latest
@@ -496,9 +336,6 @@ jobs:
           echo "perf-text-4-tpu-part1: ${{ needs.nightly-test-perf-text-models-4-tpu-part1.result }}"
           echo "perf-text-4-tpu-part2: ${{ needs.nightly-test-perf-text-models-4-tpu-part2.result }}"
           echo "perf-text-4-tpu-part3: ${{ needs.nightly-test-perf-text-models-4-tpu-part3.result }}"
-          echo "perf-trace-1-tpu: ${{ needs.nightly-test-perf-trace-text-models-1-tpu.result }}"
-          echo "perf-trace-4-tpu-part1: ${{ needs.nightly-test-perf-trace-text-models-4-tpu-part1.result }}"
-          echo "perf-trace-4-tpu-part2: ${{ needs.nightly-test-perf-trace-text-models-4-tpu-part2.result }}"
           echo ""
 
           has_failure=false
@@ -508,10 +345,7 @@ jobs:
             "perf-text-1-tpu=${{ needs.nightly-test-perf-text-models-1-tpu.result }}" \
             "perf-text-4-tpu-part1=${{ needs.nightly-test-perf-text-models-4-tpu-part1.result }}" \
             "perf-text-4-tpu-part2=${{ needs.nightly-test-perf-text-models-4-tpu-part2.result }}" \
-            "perf-text-4-tpu-part3=${{ needs.nightly-test-perf-text-models-4-tpu-part3.result }}" \
-            "perf-trace-1-tpu=${{ needs.nightly-test-perf-trace-text-models-1-tpu.result }}" \
-            "perf-trace-4-tpu-part1=${{ needs.nightly-test-perf-trace-text-models-4-tpu-part1.result }}" \
-            "perf-trace-4-tpu-part2=${{ needs.nightly-test-perf-trace-text-models-4-tpu-part2.result }}"; do
+            "perf-text-4-tpu-part3=${{ needs.nightly-test-perf-text-models-4-tpu-part3.result }}"; do
             job_name="${job_result%%=*}"
             result="${job_result#*=}"
             if [ "$result" != "success" ]; then

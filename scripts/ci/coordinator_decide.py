@@ -20,7 +20,6 @@ def detect_labels(event_name, pr_labels_json):
         "run_full": False,
         "requires_4tpu": False,
         "run_perf": False,
-        "run_perf_trace": False,
         "run_accuracy_extra": False,
     }
 
@@ -38,7 +37,6 @@ def detect_labels(event_name, pr_labels_json):
         "test:full": "run_full",
         "test:multi-chip": "requires_4tpu",
         "test:perf": "run_perf",
-        "test:perf-trace": "run_perf_trace",
         "test:accuracy-extra": "run_accuracy_extra",
     }
     for label_name, flag_name in label_to_flag.items():

@@ -25,7 +25,6 @@ OPTIONAL_JOBS = [
     ("multi-chip-extra-test-4-tpu", "R_MULTI_CHIP", ["requires_4tpu", "run_full"]),
     ("accuracy-extra-test-1-tpu", "R_ACC_EXTRA", ["run_accuracy_extra", "run_full"]),
     ("perf-extra-test-1-tpu", "R_PERF_EXTRA", ["run_perf", "run_full"]),
-    ("perf-trace-test-1-tpu", "R_PERF_TRACE", ["run_perf_trace", "run_full"]),
 ]
 
 PALLAS_JOBS = [
@@ -55,7 +54,6 @@ def check_jobs(env=None):
         "run_full": get("RUN_FULL"),
         "run_accuracy_extra": get("RUN_ACCURACY_EXTRA"),
         "run_perf": get("RUN_PERF"),
-        "run_perf_trace": get("RUN_PERF_TRACE"),
     }
 
     for flag_name, jobs in MANDATORY_JOBS.items():
@@ -102,7 +100,6 @@ def print_summary():
     print(f"performance-test-1-tpu: {get('R_PERF_1')}")
     print(f"performance-test-4-tpu: {get('R_PERF_4')}")
     print(f"perf-extra-test-1-tpu: {get('R_PERF_EXTRA')}")
-    print(f"perf-trace-test-1-tpu: {get('R_PERF_TRACE')}")
     print("--- Independent ---")
     print(f"pallas-kernel-benchmark: {get('R_PALLAS')}")
     print()
