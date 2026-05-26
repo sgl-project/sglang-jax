@@ -390,7 +390,16 @@ def sweep(
                 max_context_len,
                 tries,
             )
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            # The heuristic candidate is the production baseline; if even it
+            # raises, the workload itself is broken (e.g., data-gen OOM) and
+            # the whole sweep is meaningless. Surface the trace.
+            if bs == heuristic:
+                print(
+                    f"# heuristic-candidate FAILURE stage={stage} ps={page_size} "
+                    f"q={q_head_num} kv={kv_head_num} hd={head_dim} mnt={max_num_tokens}: "
+                    f"{type(e).__name__}: {e}"
+                )
             continue
         if bs == heuristic:
             heuristic_time = t
@@ -604,6 +613,13 @@ def main():
             print(f"# SKIP stage={stage} ps={ps} q={q_h} kv={kv_h} hd={hd} mnt={mnt}: {e}")
             continue
         if best is None or heur_t == inf:
+            # Don't silently drop — heur_t==inf means every candidate (incl.
+            # heuristic) raised inside benchmark. Surface the diagnostic so
+            # the operator knows to investigate (data-gen OOM, etc).
+            print(
+                f"# DROP stage={stage} ps={ps} q={q_h} kv={kv_h} hd={hd} mnt={mnt}: "
+                f"best={best} heur_t={heur_t} — all candidates failed in benchmark"
+            )
             continue
         delta_pct = (heur_t - best_t) / heur_t * 100.0
         table_key = _simplified_key_for_table(stage, q_h, kv_h, hd, ps, mnt)

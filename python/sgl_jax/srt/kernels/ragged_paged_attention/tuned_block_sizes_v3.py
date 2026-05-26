@@ -51,6 +51,10 @@ TUNED_BLOCK_SIZES_V3: dict[str, dict[tuple, tuple[int, int, int, int]]] = {
         ("d", "bfloat16", "bfloat16", 32, 2, 256, 256, 128): (1, 2048, 1, 2048),
         ("d", "bfloat16", "bfloat16", 32, 2, 256, 256, 256): (1, 2048, 1, 2048),
         ("d", "bfloat16", "bfloat16", 32, 2, 256, 256, 512): (1, 2048, 1, 2048),
+        # Large-mnt decode entries. Server actually pads decode max_q to 1024
+        # or 2048 buckets at warmup (despite BSZ being smaller), so these are
+        # the keys most prefill-heavy workloads actually look up.
+        ("d", "bfloat16", "bfloat16", 32, 2, 256, 256, 1024): (1, 2048, 1, 2048),
         # Prefill at chunk_prefill_size=2048: heuristic bq=4 bkv=1024 loses
         # to bq=32 bkv=512 by +75%. Heuristic's bq=min(MAX_BQ=32, max_q//2)
         # gives bq=4 when max_q=8 (post page-alignment), 8× too small.
