@@ -33,7 +33,6 @@ def _make_engine(device_indexes: list[int]) -> Engine:
         device="tpu",  # use proxy when running in Pathways
         device_indexes=device_indexes,
         enable_single_process=True,
-        disable_precompile=True,
         skip_server_warmup=True,
         random_seed=3,
         node_rank=0,
@@ -64,11 +63,14 @@ class TestMultiEnginesInOneProcess(CustomTestCase):
 
     def test_01_multi_engine_modes_cache_miss(self):
         print(
-            "=== test_01_multi_engine_modes_cache_miss: engineA=[0,1], engineB=[2,3] ===",
+            "=== test_01_multi_engine_modes_cache_miss: SERIAL engineA=[0,1] then engineB=[2,3] (experiment for #1216) ===",
             flush=True,
         )
+        # EXPERIMENT for #1216: original test creates both engines simultaneously,
+        # which crashes with FAILED_PRECONDITION. Disable_precompile didn't help.
+        # Now testing: does engineB init succeed if engineA is fully shut down first?
+        # If yes → coexistence is the issue; if no → cross-engine TPU runtime state leak.
         engine_a = _make_engine(device_indexes=[0, 1])
-        engine_b = _make_engine(device_indexes=[2, 3])
         try:
             prefill_output = self._run_generate(engine_a, max_new_tokens=1)
             decode_output = self._run_generate(engine_a, max_new_tokens=2)
@@ -76,6 +78,11 @@ class TestMultiEnginesInOneProcess(CustomTestCase):
             assert decode_output["meta_info"]["cache_miss_count"] == 0
         finally:
             engine_a.shutdown()
+
+        engine_b = _make_engine(device_indexes=[2, 3])
+        try:
+            pass
+        finally:
             engine_b.shutdown()
 
     def test_02_multi_engine_modes(self):
