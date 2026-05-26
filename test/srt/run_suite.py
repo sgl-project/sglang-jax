@@ -46,13 +46,20 @@ def run_with_timeout(
     return ret_value[0]
 
 
-def reap_process_group(pgid: int) -> None:
+def reap_process_group(pgid: int, max_wait: float = 5.0) -> None:
     try:
         os.killpg(pgid, signal.SIGKILL)
-        print(f"reap_process_group: pgid={pgid} had survivors, sent SIGKILL", flush=True)
     except ProcessLookupError:
-        pass
-    time.sleep(2)
+        return
+    print(f"reap_process_group: pgid={pgid} had survivors, sent SIGKILL", flush=True)
+
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
 
 
 def cleanup_model_cache():
