@@ -11,6 +11,11 @@ on:
         description: "Whether to also tag the image as :latest (false for rcN)"
         required: true
         type: boolean
+      dry_run:
+        description: "If true, build the image but do not log in to or push to Docker Hub"
+        required: false
+        default: false
+        type: boolean
 
 env:
   IMAGE: lmsysorg/sglang-jax
@@ -30,6 +35,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
+        if: ${{ ! inputs.dry_run }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
@@ -56,7 +62,14 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/amd64
-          push: true
+          push: ${{ ! inputs.dry_run }}
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
             SETUPTOOLS_SCM_PRETEND_VERSION=${{ inputs.version }}
+
+      - name: Dry-run notice
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "::notice::Dry-run mode: built image but skipped Docker Hub login and push."
+          echo "Tags that would have been pushed:" >> "$GITHUB_STEP_SUMMARY"
+          echo '${{ steps.tags.outputs.tags }}' >> "$GITHUB_STEP_SUMMARY"

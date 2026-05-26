@@ -7,6 +7,11 @@ on:
         description: "Target version string without v prefix (e.g. 0.0.3, 0.0.3rc0, 0.0.3.post1)"
         required: true
         type: string
+      dry_run:
+        description: "If true, skip ancestor check and tag push (validate-only experiment)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -36,6 +41,7 @@ jobs:
           python -c "from packaging.version import Version; v = Version('${{ inputs.version }}'); print('parsed:', v)"
 
       - name: Verify HEAD is on main history
+        if: ${{ ! inputs.dry_run }}
         run: |
           set -euo pipefail
           git fetch origin main --depth=0 || git fetch origin main
@@ -107,6 +113,7 @@ jobs:
           echo "TODO: implement benchmark regression check on TPU runners"
 
       - name: Create and push annotated tag
+        if: ${{ ! inputs.dry_run }}
         run: |
           set -euo pipefail
           TAG="v${{ inputs.version }}"
@@ -114,3 +121,9 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "${TAG}" -m "sglang-jax ${TAG}"
           git push origin "${TAG}"
+
+      - name: Dry-run summary
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "::notice::Dry-run mode: ancestor check skipped, tag v${{ inputs.version }} NOT pushed."
+          echo "Validate-only run completed successfully on ref ${GITHUB_REF}." >> "$GITHUB_STEP_SUMMARY"
