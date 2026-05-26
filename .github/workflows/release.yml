@@ -30,6 +30,14 @@ jobs:
       update_latest: ${{ steps.compute.outputs.update_latest }}
       dry_run: ${{ steps.compute.outputs.dry_run }}
     steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install packaging
+        run: python -m pip install --upgrade packaging
+
       - name: Compute tag / version / flags
         id: compute
         run: |
@@ -46,11 +54,22 @@ jobs:
             exit 1
           fi
           VERSION="${TAG#v}"
-          if echo "${VERSION}" | grep -qE 'rc[0-9]+$'; then
-            IS_PRERELEASE=true
+          # PEP 440 validation + prerelease detection.
+          # Covers aN / bN / rcN / .devN as prereleases; .postN is a post-release (not pre).
+          IS_PRERELEASE="$(VERSION="${VERSION}" python -c '
+          import os, sys
+          from packaging.version import Version, InvalidVersion
+          v_str = os.environ["VERSION"]
+          try:
+              v = Version(v_str)
+          except InvalidVersion as e:
+              sys.stderr.write(f"::error::Invalid PEP 440 version {v_str!r}: {e}\n")
+              sys.exit(1)
+          print("true" if v.is_prerelease else "false")
+          ')"
+          if [[ "${IS_PRERELEASE}" == "true" ]]; then
             UPDATE_LATEST=false
           else
-            IS_PRERELEASE=false
             UPDATE_LATEST=true
           fi
           {

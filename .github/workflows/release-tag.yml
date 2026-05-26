@@ -44,7 +44,6 @@ jobs:
         if: ${{ ! inputs.dry_run }}
         run: |
           set -euo pipefail
-          git fetch origin main --depth=0 || git fetch origin main
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
             echo "::error::Current commit $GITHUB_SHA is not an ancestor of origin/main"
             exit 1
@@ -73,8 +72,7 @@ jobs:
           python -m pip install --upgrade pip build
           python -m build
           ls -la dist
-          test -f "dist/sglang_jax-${{ inputs.version }}-py3-none-any.whl" || \
-            test -f "dist/sglang_jax-${{ inputs.version }}.tar.gz"
+          test -f "dist/sglang_jax-${{ inputs.version }}-py3-none-any.whl"
 
       - name: Smoke test wheel
         env:
