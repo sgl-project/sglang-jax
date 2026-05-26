@@ -442,13 +442,15 @@ class MHATokenToKVPool(KVCache):
         with self.mesh:
             self.kv_buffer = []
             for _ in range(self.layer_num):
-                kv_buf = jax.jit(
-                    lambda: jnp.zeros(
-                        shape=fused_buffer_shape,
-                        dtype=self.dtype,
-                    ),
-                    out_shardings=self.kv_sharding,
-                )()
+                # Diagnostic: replace jax.jit(...)() with jax.device_put to bypass
+                # JAX persistent compilation cache deserialization. If
+                # test_multi_engines_in_one_process passes with this change, the
+                # FAILED_PRECONDITION crash is caused by the cached executable
+                # deserialization path of this jit, not by the allocation itself.
+                kv_buf = jax.device_put(
+                    jnp.zeros(shape=fused_buffer_shape, dtype=self.dtype),
+                    self.kv_sharding,
+                )
 
                 self.kv_buffer.append(kv_buf)
 
