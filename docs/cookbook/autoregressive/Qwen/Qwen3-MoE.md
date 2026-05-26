@@ -4,7 +4,7 @@ title: "Qwen3-MoE"
 
 # Qwen3-MoE on SGL-JAX
 
-> **Starter recipe** — derived from the HuggingFace model card; not yet empirically validated on TPU. Tune values for your hardware and PR-back tested numbers.
+> **30B-A3B: Validated** on TPU v6e-16 (build `b2daa46d`, 2026-05-26). See §4 for measured numbers. The 235B-A22B production tier remains Starter — same launch path with larger `--tp-size` / `--ep-size`, unmeasured.
 
 ## 1. Model Introduction
 
@@ -56,7 +56,7 @@ Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md)
   --model-path Qwen/Qwen3-30B-A3B \
   --trust-remote-code \
   --tp-size 16 --ep-size 16 \
-  --moe-backend fused \
+  --moe-backend epmoe \
   --device tpu \
   --dtype bfloat16 \
   --mem-fraction-static 0.9 \
@@ -65,6 +65,8 @@ Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md)
   --max-running-requests 256 \
   --skip-server-warmup
 ```
+
+> Note: 30B-A3B uses `--moe-backend epmoe`, not `fused`. The fused MoE kernel requires `intermediate_size % 512 == 0`; Qwen3-30B-A3B's per-expert FFN inner dim is 768 (not a multiple of 512), so launching with `--moe-backend fused` raises `ValueError: Expected intermediate_size=768 to be aligned to bf=512`. See §2.4 MoE Backend.
 
 #### Multi-host (GKE Indexed Job) — TPU v6e-64 (Qwen3-235B-A22B)
 
@@ -80,7 +82,9 @@ For temporary v6e experiments, advanced users can adapt [`../../deployment/skypi
 ### 2.4 Configuration Tips
 
 **MoE Backend:**
-- `--moe-backend fused` is the recommended choice at EP ≥ 16 (both 30B and 235B configs above). Switch to `epmoe` only when EP ≤ 8.
+- `--moe-backend fused` is the throughput-optimal choice at EP ≥ 16, **but it requires the per-expert FFN intermediate size to be a multiple of 512** (`fused_moe/v1/kernel.py` block-factor alignment).
+- Qwen3-30B-A3B has `moe_intermediate_size=768` which is **not** aligned, so it must use `--moe-backend epmoe` even at EP=16. Qwen3-235B-A22B has `moe_intermediate_size=1536` which **is** aligned, so it can use `fused`.
+- For EP ≤ 8 use `epmoe` regardless.
 
 **Memory Management:**
 - `--mem-fraction-static 0.9` is appropriate for the 30B-A3B config; raise to `0.92` for 235B-A22B to make room for the much larger weight set.
@@ -215,11 +219,50 @@ To see the full set of `--reasoning-parser` / `--tool-call-parser` keys availabl
 
 ### 4.1 Speed
 
-> **Layout B — methodology + command template.** No measured numbers yet; PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` to upgrade to Validated.
+> **Layout B — measured baseline.** TPU v6e-16 (4 nodes × 4 chips, TP=16, EP=16), build `b2daa46d` (2026-05-26). sgl-jax-only; no vLLM-on-TPU comparison.
 
-**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.1](Qwen3.md#41-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Qwen3-MoE checkpoint, remove the vLLM half if not comparing).
+**Test Environment**
 
-**Test Results** — _Pending._
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-16 (4 nodes × 4 chips) |
+| Model | Qwen/Qwen3-30B-A3B (BF16, MoE A3B) |
+| Tensor Parallelism | 16 |
+| Expert Parallelism | 16 |
+| Tested build | `b2daa46d` (2026-05-26) |
+
+**Benchmark Command**
+
+```bash
+python3 -m sgl_jax.bench_serving \
+  --backend sglang \
+  --model Qwen/Qwen3-30B-A3B \
+  --tokenizer Qwen/Qwen3-30B-A3B \
+  --dataset-name random --random-input-len 1024 --random-output-len 1024 \
+  --num-prompts 100 --max-concurrency 16 \
+  --host 127.0.0.1 --port 30000
+```
+
+**Test Results**
+
+```
+============ Serving Benchmark Result ============
+Successful requests:                     100
+Benchmark duration (s):                  35.53
+Total input tokens:                      50561
+Total generated tokens:                  52444
+Request throughput (req/s):              2.81
+Input token throughput (tok/s):          1423.18
+Output token throughput (tok/s):         1476.18
+Peak output token throughput (tok/s):    1744.00
+Total token throughput (tok/s):          2899.37
+Mean E2E Latency (ms):                   5223.28
+Mean TTFT (ms):                          75.77
+Mean TPOT (ms):                          9.88
+Median TPOT (ms):                        9.97
+Mean ITL (ms):                           9.83
+==================================================
+```
 
 ### 4.2 Accuracy
 
@@ -231,7 +274,7 @@ To see the full set of `--reasoning-parser` / `--tool-call-parser` keys availabl
 | Model | Qwen/Qwen3-30B-A3B or Qwen3-235B-A22B (BF16) |
 | Tensor Parallelism | 16 / 64 |
 | Expert Parallelism | 16 / 64 |
-| Tested build | _Pending_ |
+| Tested build | `b2daa46d` (2026-05-26, 30B-A3B only) |
 
 **Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-16-qwen3-30b-a3b).
 
@@ -250,13 +293,18 @@ evalscope eval \
 
 Recommended additional datasets: AIME 2025, MATH, GPQA Diamond.
 
-**Test Results** — _Pending. Run and PR back._
+**Test Results**
+
+| Dataset | Subset | Samples | Score | Notes |
+|---|---|---|---|---|
+| gsm8k | main | 200 | **0.980** | thinking-on, `temperature=0.7`, `top_p=0.95`, `max_tokens=8192` (Qwen3-30B-A3B) |
 
 ## 5. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| MoE throughput plateau at EP ≥ 16 | Wrong `--moe-backend` | Switch to `--moe-backend fused`. `epmoe` is for EP ≤ 8. |
+| `ValueError: Expected intermediate_size=768 to be aligned to bf=512` at startup (30B-A3B) | `--moe-backend fused` requires `moe_intermediate_size % 512 == 0`; Qwen3-30B-A3B has 768 | Switch to `--moe-backend epmoe`. See §2.4 MoE Backend. |
+| MoE throughput plateau at EP ≥ 16 (235B-A22B only) | Using `--moe-backend epmoe` instead of `fused` on a config that allows `fused` | Verify `moe_intermediate_size % 512 == 0` (235B-A22B has 1536 ✅), then switch to `--moe-backend fused`. |
 | OOM at startup (235B-A22B) | `--mem-fraction-static` too high | Lower to 0.9. Verify `--tp-size 64` matches v6e-64 chip count (8 × 8 = 64). |
 | Tool calls return empty arguments | `--tool-call-parser` not set | Add `--tool-call-parser qwen25`. |
 | No `reasoning_content` in response | `--reasoning-parser` not set | Add `--reasoning-parser qwen3`. |

@@ -389,6 +389,18 @@ Qwen3-32B:
 
 SGL-JAX wins consistently on this hardware across all measured cells: ~1.5–2.2× output throughput, ~1.4–2.0× faster TTFT, ~1.6–2.4× lower ITL.
 
+**Build verification (2026-05-25, sglang-jax `de29d9f0`)** — single-cell smoke against the current main, not a refresh of the sweep above. Qwen3-32B, ISL=1024 OSL=1024 c=16 (100 prompts):
+
+```
+Output token throughput (tok/s):         833.80
+Peak output token throughput (tok/s):    1008.00
+Mean TTFT (ms):                          104.53
+Mean TPOT (ms):                          16.89
+Mean E2E Latency (ms):                   8948.78
+```
+
+Lower than the 1977 tok/s c=64 table cell because c=16 leaves the batch under-filled — included only to confirm the recipe still launches and decodes cleanly on the current build. The Sept-2025 sweep above remains the canonical SGL-JAX-vs-vLLM comparison.
+
 ### 4.2 Accuracy — GSM8K (thinking-on)
 
 **Test Environment**
@@ -396,9 +408,9 @@ SGL-JAX wins consistently on this hardware across all measured cells: ~1.5–2.2
 | Field | Value |
 |---|---|
 | Hardware | TPU v6e-4 (single host, 4 chips) |
-| Model | Qwen/Qwen3-8B (BF16) |
+| Model | Qwen/Qwen3-8B and Qwen/Qwen3-32B (BF16) |
 | Tensor Parallelism | 4 |
-| Tested build | sglang-jax `fe092bf` (2026-05-23) |
+| Tested build | Qwen3-8B: sglang-jax `fe092bf` (2026-05-23); Qwen3-32B: sglang-jax `de29d9f0` (2026-05-25) |
 
 **Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4).
 
@@ -421,6 +433,7 @@ evalscope eval \
 | Model | Dataset | Metric | Subset | Num | Score |
 |:---|:---|:---|:---|:---|:---|
 | Qwen3-8B | gsm8k | AverageAccuracy | main | 500 | 0.944 |
+| Qwen3-32B | gsm8k | AverageAccuracy | main | 200 | 0.975 |
 
 > Run **with thinking-on** for full reasoning capacity. Thinking-off would yield lower accuracy but ~10× faster wall-clock per question.
 

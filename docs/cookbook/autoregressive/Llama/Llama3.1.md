@@ -4,7 +4,7 @@ title: "Llama 3.1"
 
 # Llama 3.1 on SGL-JAX
 
-> **Starter recipe** — derived from the HuggingFace model card; not yet empirically validated on TPU. Tune values for your hardware and PR-back tested numbers.
+> **Validated** on TPU v6e-4 (build `de29d9f0`, 2026-05-25). See §4 for measured numbers. Phi-3 / InternLM3 aliases below remain Starter — same launch path but unmeasured.
 
 ## 1. Model Introduction
 
@@ -54,6 +54,8 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
   --device tpu \
   --dtype bfloat16 \
   --mem-fraction-static 0.88 \
+  --page-size 128 \
+  --max-running-requests 64 \
   --skip-server-warmup \
   --host 0.0.0.0 --port 30000
 ```
@@ -64,6 +66,10 @@ Swap `--model-path` to `microsoft/Phi-3.5-mini-instruct` or `internlm/internlm3-
 
 **Memory Management:**
 - `--mem-fraction-static 0.88` is the TPU default. Raise to `0.9` for higher concurrency on a dedicated host.
+
+**Paging / concurrency (mandatory):**
+- `--page-size 128` is **mandatory**. Without it the attention backend defaults to `page_size=1` and the `Max running requests` constraint chain collapses `Final max_running_requests` to 1 — at concurrency=16 the bench serializes and output throughput drops ~9× (validated 2026-05-25: 156 tok/s without flag → 1449 tok/s with). Same constraint applies to the Phi-3 / InternLM3 aliases.
+- `--max-running-requests 64` pairs with the page-size flag; raise/lower to match your `--max-concurrency` workload.
 
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
@@ -84,11 +90,49 @@ See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model
 
 ### 4.1 Speed
 
-> **Layout B — methodology + command template.** No measured numbers yet; PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` to upgrade to Validated.
+> **Layout B — measured baseline.** Single-host TPU v6e-4, build `de29d9f0` (2026-05-25). Numbers are sgl-jax-only; vLLM-on-TPU comparison is not run.
 
-**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.1](../Qwen/Qwen3.md#41-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the Llama checkpoint).
+**Test Environment**
 
-**Test Results** — _Pending._
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-4 (single host, 4 chips) |
+| Model | meta-llama/Llama-3.1-8B-Instruct (BF16) |
+| Tensor Parallelism | 4 |
+| Tested build | `de29d9f0` (2026-05-25) |
+
+**Benchmark Command**
+
+```bash
+python3 -m sgl_jax.bench_serving \
+  --backend sglang \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --tokenizer meta-llama/Llama-3.1-8B-Instruct \
+  --dataset-name random --random-input-len 512 --random-output-len 512 \
+  --num-prompts 100 --max-concurrency 16 \
+  --host 127.0.0.1 --port 30000
+```
+
+**Test Results**
+
+```
+============ Serving Benchmark Result ============
+Successful requests:                     100
+Benchmark duration (s):                  17.82
+Total input tokens:                      26497
+Total generated tokens:                  25820
+Request throughput (req/s):              5.61
+Input token throughput (tok/s):          1486.90
+Output token throughput (tok/s):         1448.91
+Peak output token throughput (tok/s):    1693.00
+Total token throughput (tok/s):          2935.81
+Mean E2E Latency (ms):                   2574.53
+Mean TTFT (ms):                          35.33
+Mean TPOT (ms):                          9.94
+Median TPOT (ms):                        9.84
+Mean ITL (ms):                           9.87
+==================================================
+```
 
 ### 4.2 Accuracy
 
@@ -99,7 +143,7 @@ See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model
 | Hardware | TPU v6e-4 (single host, 4 chips) |
 | Model | meta-llama/Llama-3.1-8B-Instruct (BF16) |
 | Tensor Parallelism | 4 |
-| Tested build | _Pending_ |
+| Tested build | `de29d9f0` (2026-05-25) |
 
 **Deployment Command** — same as [§2.3](#single-host-docker--tpu-v6e-4).
 
@@ -112,12 +156,17 @@ evalscope eval \
   --api-key EMPTY \
   --eval-type service \
   --datasets gsm8k \
-  --eval-batch-size 8
+  --eval-batch-size 16 \
+  --limit 200
 ```
 
 Recommended additional datasets: MMLU, HumanEval, IFEval.
 
-**Test Results** — _Pending. Run and PR back._
+**Test Results**
+
+| Dataset | Subset | Samples | Score |
+|---|---|---|---|
+| gsm8k | main | 200 | **0.825** |
 
 ## 5. Troubleshooting
 
@@ -126,6 +175,7 @@ Recommended additional datasets: MMLU, HumanEval, IFEval.
 | OOM at startup | Weights + KV exceed budget at chosen `--mem-fraction-static` | Lower to 0.85. Verify `--tp-size 4` matches v6e-4 chip count. |
 | First request takes ~4 min | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR` across restarts (host volume mount in Docker). |
 | Phi-3 / InternLM3 fails to load | Missing `--trust-remote-code` | Add it to the launch command; both aliases ship custom modeling code. |
+| Bench shows ~150 tok/s output and ~50s TTFT at concurrency=16 | `--page-size` defaulted to 1 → `Final max_running_requests: 1` (visible in launch log), requests serialize | Add `--page-size 128 --max-running-requests 64` to the launch command. See §2.4. |
 
 ## Additional Resources
 
