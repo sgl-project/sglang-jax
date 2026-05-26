@@ -38,7 +38,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server ...
 **Cause**: The HF config's `architectures` field doesn't match any class registered by `python/sgl_jax/srt/models/registry.py`.
 
 **Fix**:
-- Confirm your model is in the supported list — see the cookbook [autoregressive index](autoregressive/index.md) or [`python/sgl_jax/srt/models/`](https://github.com/sgl-project/sglang-jax/tree/main/python/sgl_jax/srt/models).
+- Confirm your model is in the supported list — see the cookbook [autoregressive index](autoregressive/index.md), [diffusion index](diffusion/index.md), or [`python/sgl_jax/srt/models/`](https://github.com/sgl-project/sglang-jax/tree/main/python/sgl_jax/srt/models).
 - Some Qwen-derived models (MiMo-7B → Qwen2, MiMo-V2.5-Pro → MiMo-V2) reuse base classes via inheritance — the HF config's `architectures` field still has to match the actual class name SGL-JAX registers, not the inherited one. If your model's config lists a class SGL-JAX doesn't recognise, override `--json-model-override-args '{"architectures": ["<RegisteredClass>"]}'`.
 
 ## Multi-node

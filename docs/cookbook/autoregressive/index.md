@@ -4,7 +4,7 @@ title: "Autoregressive Models"
 
 # Autoregressive Model Recipes
 
-End-to-end serving recipes for text-only autoregressive LLMs on SGL-JAX, organized by vendor.
+End-to-end serving recipes for autoregressive models on SGL-JAX, organized by vendor. This includes text-only LLMs and vision-language decoders whose output is still generated token by token.
 
 ## Status legend
 
@@ -72,6 +72,7 @@ End-to-end serving recipes for text-only autoregressive LLMs on SGL-JAX, organiz
 | ✅ | Qwen-7B-Chat | [`Qwen/Qwen.md`](Qwen/Qwen.md) | v6e-4 | dense |
 | 🧪 | Qwen3-8B / Qwen3-32B | [`Qwen/Qwen3.md`](Qwen/Qwen3.md) | v6e-4 | dense + reasoning (`qwen3`) + tool (`qwen25`) |
 | 🚧 | Qwen3-MoE (30B-A3B / 235B-A22B) | [`Qwen/Qwen3-MoE.md`](Qwen/Qwen3-MoE.md) | v6e-16 / v6e-64 | MoE + reasoning (`qwen3`) + tool (`qwen25`) |
+| 🚧 | Qwen2.5-VL (3B / 7B / 32B / 72B) | [`Qwen/Qwen2.5-VL.md`](Qwen/Qwen2.5-VL.md) | v6e-4 for 3B/7B/32B; 72B pending | vision-language autoregressive decoder |
 | 📝 | Qwen2 / Qwen2-MoE | _no recipe — same family runtime path_ | — | dense / MoE |
 
 ### Xiaomi — `Xiaomi/`
@@ -90,8 +91,9 @@ A model that generates text one token at a time, conditioning on its own previou
 
 - **Dense LLMs** — Qwen / Qwen3 / Llama / Gemma 2 / MiMo-7B / Grok-2.
 - **MoE LLMs** — Qwen3-MoE / DeepSeek V2/V3/R1 / GLM-4.5 / GLM-5 / Ling 2.5 / Ring 2.5 / Ling 2.6 / MiMo-V2-Flash / MiMo-V2.5-Pro / Kimi-Linear.
+- **Vision-language decoders** — Qwen2.5-VL ingests image / video inputs, but the answer is still produced by an autoregressive generation stage.
 
-Diffusion / TTS / VLM models live in [`../multimodal/`](../multimodal/index.md).
+Diffusion image/video generation models live in [`../diffusion/`](../diffusion/index.md).
 
 ## Picking a starting recipe to clone for a new model
 
@@ -100,6 +102,7 @@ Diffusion / TTS / VLM models live in [`../multimodal/`](../multimodal/index.md).
 | Single-host dense model | [`Qwen/Qwen.md`](Qwen/Qwen.md) ✅ or [`Llama/Llama3.1.md`](Llama/Llama3.1.md) 🚧 |
 | Dense model with benchmark comparison | [`Qwen/Qwen3.md`](Qwen/Qwen3.md) 🧪 |
 | Single-host MoE with backend choice | [`Xiaomi/MiMo-V2-Flash.md`](Xiaomi/MiMo-V2-Flash.md) 🧪 |
+| Vision-language chat | [`Qwen/Qwen2.5-VL.md`](Qwen/Qwen2.5-VL.md) 🚧 |
 | Large multi-node MoE with GKE manifest | [`Xiaomi/MiMo-V2.5-Pro.md`](Xiaomi/MiMo-V2.5-Pro.md) 🧪 |
 | Multi-node dense | [`Grok/Grok2.md`](Grok/Grok2.md) 🚧 (+ [`../deployment/gke-indexed-job.md`](../deployment/gke-indexed-job.md)) |
 | Linear-attention model with recurrent state | [`Moonshotai/Kimi-Linear.md`](Moonshotai/Kimi-Linear.md) ✅ or [`InclusionAI/Ling-2.6.md`](InclusionAI/Ling-2.6.md) 🚧 |

@@ -38,7 +38,8 @@
                     "pages": [
                       "autoregressive/Qwen/Qwen",
                       "autoregressive/Qwen/Qwen3",
-                      "autoregressive/Qwen/Qwen3-MoE"
+                      "autoregressive/Qwen/Qwen3-MoE",
+                      "autoregressive/Qwen/Qwen2.5-VL"
                     ]
                   },
                   {
@@ -99,19 +100,14 @@
                 ]
               },
               {
-                "group": "Multimodal Models",
+                "group": "Diffusion Models",
                 "pages": [
-                  "multimodal/index",
-                  {
-                    "group": "Qwen",
-                    "pages": [
-                      "multimodal/Qwen/Qwen2.5-VL"
-                    ]
-                  },
+                  "diffusion/index",
                   {
                     "group": "Wan",
                     "pages": [
-                      "multimodal/Wan/Wan-2.x"
+                      "diffusion/Wan/Wan2.1",
+                      "diffusion/Wan/Wan2.2"
                     ]
                   }
                 ]

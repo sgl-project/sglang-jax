@@ -32,7 +32,7 @@ v6e (and every other generation) is 1:1 chip→device, so `--tp-size` matches ch
 
 | Slice name | Nodes | Chips/node | JAX devices | Used by |
 |---|---|---|---|---|
-| `v6e-4` | 1 | 4 | 4 | [Qwen-7B-Chat](../autoregressive/Qwen/Qwen.md), [Qwen3-8B / 32B](../autoregressive/Qwen/Qwen3.md) |
+| `v6e-4` | 1 | 4 | 4 | [Qwen-7B-Chat](../autoregressive/Qwen/Qwen.md), [Qwen3-8B / 32B](../autoregressive/Qwen/Qwen3.md), [Qwen2.5-VL](../autoregressive/Qwen/Qwen2.5-VL.md), [Wan 2.1](../diffusion/Wan/Wan2.1.md), [Wan 2.2](../diffusion/Wan/Wan2.2.md) |
 | `v6e-16` (`4x4`) | 4 | 4 | 16 | [MiMo-V2-Flash](../autoregressive/Xiaomi/MiMo-V2-Flash.md) (multi-node) |
 | `v6e-32` | 8 | 4 | 32 | [Grok-2](../autoregressive/Grok/Grok2.md) |
 | `v6e-64` (`4x4x4`) | 16 | 4 | 64 | [MiMo-V2.5-Pro](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md) |

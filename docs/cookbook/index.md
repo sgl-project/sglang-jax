@@ -12,8 +12,8 @@ End-to-end recipes for serving specific models on specific TPU (or GPU) topologi
 
 | Section | What's inside |
 |---|---|
-| [`autoregressive/`](autoregressive/index.md) | LLM recipes organized by vendor subdir (DeepSeek/ · GLM/ · Google/ · Grok/ · InclusionAI/ · Llama/ · Moonshotai/ · Qwen/ · Xiaomi/). One page per model, following sgl-cookbook vendor-naming convention. |
-| [`multimodal/`](multimodal/index.md) | Vision-language, audio, and text-to-video recipes (Qwen2.5-VL, Qwen3-Omni MoE, Wan 2.1/2.2 T2V, MiMo Audio). |
+| [`autoregressive/`](autoregressive/index.md) | Token-generating recipes organized by vendor subdir: text-only LLMs plus vision-language decoders such as Qwen2.5-VL. |
+| [`diffusion/`](diffusion/index.md) | Diffusion-style media generation recipes such as Wan 2.1/2.2 T2V. |
 | [`base/`](base/) | Cross-cutting references shared by every recipe: TPU topology table, launch flag reference. |
 | [`deployment/`](deployment/) | Launcher templates referenced by recipes: single-host Docker, primary multi-host GKE Indexed Job, and advanced SkyPilot v6e experiments. |
 | [`troubleshooting.md`](troubleshooting.md) | Common startup / multi-node / runtime failure modes across all recipes. |
@@ -42,7 +42,7 @@ Status prefix: ✅ validated · 🧪 partially validated · 🚧 starter (not ye
 
 | TPU | Topology | Recipes |
 |---|---|---|
-| v6e-4 | 2x2 | ✅ [Qwen-7B-Chat](autoregressive/Qwen/Qwen.md) · 🧪 [Qwen3-8B / 32B](autoregressive/Qwen/Qwen3.md) · 🚧 [Llama 3.1 8B](autoregressive/Llama/Llama3.1.md) · 🚧 [Gemma 2 9B / 27B](autoregressive/Google/Gemma2.md) · 🧪 [MiMo-7B](autoregressive/Xiaomi/MiMo-7B.md) · 🧪 [DeepSeek-V2-Lite](autoregressive/DeepSeek/DeepSeek-V2.md) |
+| v6e-4 | 2x2 | ✅ [Qwen-7B-Chat](autoregressive/Qwen/Qwen.md) · 🧪 [Qwen3-8B / 32B](autoregressive/Qwen/Qwen3.md) · 🚧 [Qwen2.5-VL 3B / 7B candidates](autoregressive/Qwen/Qwen2.5-VL.md) (`--tp-size 1`) · 🚧 [Qwen2.5-VL 32B](autoregressive/Qwen/Qwen2.5-VL.md) (`--tp-size 4`) · 🚧 [Llama 3.1 8B](autoregressive/Llama/Llama3.1.md) · 🚧 [Gemma 2 9B / 27B](autoregressive/Google/Gemma2.md) · 🧪 [MiMo-7B](autoregressive/Xiaomi/MiMo-7B.md) · 🧪 [DeepSeek-V2-Lite](autoregressive/DeepSeek/DeepSeek-V2.md) |
 | v7x-8 | single host (4 chips × 2 devices) | 🧪 [MiMo-V2-Flash](autoregressive/Xiaomi/MiMo-V2-Flash.md) |
 
 ### Multi-host
@@ -54,16 +54,21 @@ Status prefix: ✅ validated · 🧪 partially validated · 🚧 starter (not ye
 | v6e-64 | 4x4x4 | 16 | 🧪 [MiMo-V2.5-Pro](autoregressive/Xiaomi/MiMo-V2.5-Pro.md) · 🚧 [Qwen3-235B MoE](autoregressive/Qwen/Qwen3-MoE.md) · 🚧 [DeepSeek-V3](autoregressive/DeepSeek/DeepSeek-V3.md) · 🚧 [DeepSeek-R1](autoregressive/DeepSeek/DeepSeek-R1.md) · 🚧 [GLM-4.5](autoregressive/GLM/GLM-4.5.md) · 🚧 [Ling / Ring 2.5](autoregressive/InclusionAI/Ling2.5.md) · 🚧 [Ling-2.6](autoregressive/InclusionAI/Ling-2.6.md) |
 | v7x-16 | 2x2x4 | 4 | 🧪 [MiMo-V2.5-Pro](autoregressive/Xiaomi/MiMo-V2.5-Pro.md) · 🚧 [Ling / Ring 2.5](autoregressive/InclusionAI/Ling2.5.md) · 🚧 [Ling-2.6](autoregressive/InclusionAI/Ling-2.6.md) · 🚧 [DeepSeek-V3](autoregressive/DeepSeek/DeepSeek-V3.md) · 🚧 [DeepSeek-R1](autoregressive/DeepSeek/DeepSeek-R1.md) |
 
-### Multimodal (`--multimodal` server)
+### Diffusion (`--multimodal` server)
 
 | TPU | Topology | Recipes |
 |---|---|---|
-| v6e-4 | 2x2 | 🚧 [Qwen2.5-VL 3B / 7B candidates](multimodal/Qwen/Qwen2.5-VL.md) (`--tp-size 1`) · 🚧 [Qwen2.5-VL 32B](multimodal/Qwen/Qwen2.5-VL.md) (`--tp-size 4`) · 🚧 [Wan 2.1 T2V 1.3B / 14B](multimodal/Wan/Wan-2.x.md) (`--tp-size 2`) · 🚧 [Wan 2.2 T2V A14B](multimodal/Wan/Wan-2.x.md) (`--tp-size 1`) |
-| Pending | _varies_ | 🚧 Qwen2.5-VL 72B multi-host (needs a matching staged path + scheduler fix) |
+| v6e-4 | 2x2 | 🚧 [Wan 2.1 T2V 1.3B / 14B](diffusion/Wan/Wan2.1.md) (`--tp-size 2`) · 🚧 [Wan 2.2 T2V A14B](diffusion/Wan/Wan2.2.md) (`--tp-size 1`) |
+
+### Pending autoregressive paths
+
+| Scope | Recipes |
+|---|---|
+| Multi-host VL | 🚧 [Qwen2.5-VL 72B](autoregressive/Qwen/Qwen2.5-VL.md) (needs a matching staged path + scheduler fix) |
 
 For TPU generation/HBM/per-chip-device specs, see [`base/tpu-topology-reference.md`](base/tpu-topology-reference.md).
 
-Multimodal rows are constrained by SGL-JAX's built-in staged runtime. A larger TPU slice is not automatically used unless the selected model path supports that placement.
+Vision-language and diffusion rows are constrained by SGL-JAX's built-in staged runtime. A larger TPU slice is not automatically used unless the selected model path supports that placement.
 
 ## Adding a new recipe
 
@@ -76,5 +81,5 @@ Multimodal rows are constrained by SGL-JAX's built-in staged runtime. A larger T
 3. Place the new file under `autoregressive/<Vendor>/` (PascalCase, matching upstream [sgl-cookbook](https://github.com/sgl-project/sgl-cookbook/tree/main/docs/autoregressive) naming). Create a new vendor subdir if needed.
 4. Mark the top banner **Starter** until you have measured numbers; then upgrade to **Partially validated** or **Validated** based on the status legend.
 5. Fill in real `evalscope` and `bench_serving` outputs — do not leave `_Pending_` cells in a Validated recipe's claimed primary path.
-6. Add an entry to this index's *Hardware coverage* table and to [`autoregressive/index.md`](autoregressive/index.md).
+6. Add an entry to this index's *Hardware coverage* table and to [`autoregressive/index.md`](autoregressive/index.md) or [`diffusion/index.md`](diffusion/index.md).
 7. Cross-link tunable flags in §2.4 to [`base/launch-flags-reference.md`](base/launch-flags-reference.md) for non-obvious flags.

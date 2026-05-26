@@ -118,6 +118,6 @@ Without this the first request blocks for ~4 minutes while XLA/Pallas re-compile
 - **Speculative decoding** (`--speculative-algorithm`, ...) — no cookbook recipe today.
 - **Grammar / structured output** (`--grammar-backend`, ...) — covered by feature docs in `basic_usage/features/`.
 - **Quantization** (`--quantization`) — TPU recipes use natively quantized checkpoints (FP8 for MiMo) without re-quantization flags.
-- **Multimodal-only flags** — registered by `MultimodalServerArgs.add_cli_args`; will get their own page when multimodal recipes land.
+- **Staged multimodal runtime flags** — registered by `MultimodalServerArgs.add_cli_args`; currently used by autoregressive VL recipes and diffusion recipes.
 
 Run `--help` to see them in context.

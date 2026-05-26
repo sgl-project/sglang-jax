@@ -17,7 +17,7 @@ title: "Qwen2.5-VL"
 - [**Qwen/Qwen2.5-VL-32B-Instruct**](https://huggingface.co/Qwen/Qwen2.5-VL-32B-Instruct) — 32B; starter single-host path on v6e-4 with `--tp-size 4`.
 - [**Qwen/Qwen2.5-VL-72B-Instruct**](https://huggingface.co/Qwen/Qwen2.5-VL-72B-Instruct) — 72B; multi-host serving is pending.
 
-For the text-only Qwen3 dense recipes see [`../../autoregressive/Qwen/Qwen3.md`](../../autoregressive/Qwen/Qwen3.md).
+For the text-only Qwen3 dense recipes see [`Qwen3.md`](Qwen3.md).
 
 **Key Features**:
 
@@ -243,7 +243,7 @@ print(response.choices[0].message.content)
 
 > **Long video / large image set:** Make sure `--context-length` is large enough to fit the vision token count plus the text prompt and response. Each high-resolution image and each sampled video frame contributes a non-trivial number of vision tokens to the prefill.
 
-> Qwen2.5-VL is non-reasoning (no `<think>` blocks) and does not ship a native tool-call format. For reasoning workloads use [Qwen3](../../autoregressive/Qwen/Qwen3.md); for tool-calling workloads use a model with `--tool-call-parser` support (see [`../../autoregressive/Qwen/Qwen3.md` §3.3](../../autoregressive/Qwen/Qwen3.md#33-tool-calling)).
+> Qwen2.5-VL is non-reasoning (no `<think>` blocks) and does not ship a native tool-call format. For reasoning workloads use [Qwen3](Qwen3.md); for tool-calling workloads use a model with `--tool-call-parser` support (see [`Qwen3.md` §3.3](Qwen3.md#33-tool-calling)).
 
 ## 4. Benchmark
 
@@ -304,6 +304,6 @@ Recommended additional vision datasets: **MMMU Pro Vision**, **DocVQA**, **Chart
 ## Additional Resources
 
 - [Qwen2.5-VL model collection](https://huggingface.co/Qwen)
-- [`../../autoregressive/Qwen/Qwen3.md`](../../autoregressive/Qwen/Qwen3.md) — text-only Qwen3 dense recipe (Qwen3 series is the reasoning generation).
+- [`Qwen3.md`](Qwen3.md) — text-only Qwen3 dense recipe (Qwen3 series is the reasoning generation).
 - [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
