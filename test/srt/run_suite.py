@@ -2,14 +2,13 @@ import argparse
 import glob
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-
-from sgl_jax.srt.utils import kill_process_tree
 
 
 @dataclass
@@ -45,6 +44,15 @@ def run_with_timeout(
         raise RuntimeError()
 
     return ret_value[0]
+
+
+def reap_process_group(pgid: int) -> None:
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+        print(f"reap_process_group: pgid={pgid} had survivors, sent SIGKILL", flush=True)
+    except ProcessLookupError:
+        pass
+    time.sleep(2)
 
 
 def cleanup_model_cache():
@@ -120,8 +128,12 @@ def run_unittest_files(
                         stderr=sys.stderr,
                         env=os.environ,
                         cwd=os.path.dirname(filename),
+                        start_new_session=True,
                     )
-                    process.wait()
+                    try:
+                        process.wait()
+                    finally:
+                        reap_process_group(process.pid)
 
                     # If any test fails, return immediately
                     if process.returncode != 0:
@@ -169,8 +181,12 @@ def run_unittest_files(
                     stdout=sys.stdout,
                     stderr=sys.stderr,
                     env=os.environ,
+                    start_new_session=True,
                 )
-                process.wait()
+                try:
+                    process.wait()
+                finally:
+                    reap_process_group(process.pid)
 
             elapsed = time.perf_counter() - tic
             print(
@@ -207,8 +223,7 @@ def run_unittest_files(
                             break
             assert ret_code == 0, f"expected return code 0, but {filename} returned {ret_code}"
         except TimeoutError:
-            kill_process_tree(process.pid)
-            time.sleep(5)
+            reap_process_group(process.pid)
             print(
                 f"\nTimeout after {timeout_per_file} seconds when running {filename}\n",
                 flush=True,
