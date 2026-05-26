@@ -55,9 +55,11 @@ TUNED_BLOCK_SIZES_V3: dict[str, dict[tuple, tuple[int, int, int, int]]] = {
         # to bq=32 bkv=512 by +75%. Heuristic's bq=min(MAX_BQ=32, max_q//2)
         # gives bq=4 when max_q=8 (post page-alignment), 8× too small.
         ("p", "bfloat16", "bfloat16", 32, 2, 256, 256, 2048): (32, 512, 32, 512),
-        # Mixed (m) entries deliberately omitted — mixed stage hit a silent
-        # failure path in the tuner (heuristic candidate itself raised in
-        # benchmark) when q=32. Tracked separately; rerun pending.
+        # Mixed at mnt=2048: same +75% pattern as prefill (bq=4→32, bkv=1024
+        # →512). Verified 2026-05-27 on exp-6h1zm7mqq6 (isolated m-stage).
+        # The earlier silent-fail in exp-2l37yy8ak4 was JAX-state pollution
+        # from p mnt=4096/8192's data-generator bug, not q=32 or the patch.
+        ("m", "bfloat16", "bfloat16", 32, 2, 256, 256, 2048): (32, 512, 32, 512),
     },
 }
 
