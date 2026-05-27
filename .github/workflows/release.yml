@@ -64,7 +64,7 @@ jobs:
             echo "update_latest=${UPDATE_LATEST}"
           } >> "$GITHUB_OUTPUT"
 
-  build:
+  release:
     needs: metadata
     runs-on: ubuntu-latest
     environment: prod
@@ -113,42 +113,15 @@ jobs:
       - name: Smoke-test wheel + Docker image
         run: make test VERSION=${{ needs.metadata.outputs.version }}
 
-      - name: Save Docker image as tar.gz
-        run: |
-          set -euo pipefail
-          docker save "${IMAGE}:${{ needs.metadata.outputs.version }}" \
-            | gzip > /tmp/image.tar.gz
-          ls -lh /tmp/image.tar.gz
-
-      - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheel-dist
-          path: python/dist/*
-          retention-days: 1
-          if-no-files-found: error
-
-      - name: Upload Docker image artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-image
-          path: /tmp/image.tar.gz
-          retention-days: 1
-          if-no-files-found: error
-
       - name: Benchmark regression check (placeholder)
         run: |
           echo "TODO: implement benchmark regression check on TPU runners"
 
-  tag:
-    needs: [metadata, build]
-    runs-on: ubuntu-latest
-    environment: prod
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
         with:
-          fetch-depth: 0
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
 
       - name: Create and push annotated tag
         run: |
@@ -159,45 +132,7 @@ jobs:
           git tag -a "${TAG}" -m "sglang-jax ${TAG}"
           git push origin "${TAG}"
 
-  publish-pypi:
-    needs: [metadata, tag]
-    runs-on: ubuntu-latest
-    environment: prod
-    steps:
-      - name: Download wheel artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: wheel-dist
-          path: python/dist
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: python/dist
-          password: ${{ secrets.PYPI_TOKEN }}
-          skip-existing: true
-
-  publish-docker:
-    needs: [metadata, tag]
-    runs-on: ubuntu-latest
-    environment: prod
-    steps:
-      - name: Download Docker image artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: docker-image
-          path: /tmp
-
-      - name: Load Docker image
-        run: docker load < /tmp/image.tar.gz
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_TOKEN }}
-
-      - name: Push image
+      - name: Push Docker image
         run: |
           set -euo pipefail
           VERSION="${{ needs.metadata.outputs.version }}"
@@ -208,8 +143,15 @@ jobs:
             docker push "${IMAGE}:latest"
           fi
 
+      - name: Publish wheel to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python/dist
+          password: ${{ secrets.PYPI_TOKEN }}
+          skip-existing: true
+
   github-release:
-    needs: [metadata, publish-pypi, publish-docker]
+    needs: [metadata, release]
     runs-on: ubuntu-latest
     environment: prod
     steps:
