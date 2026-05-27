@@ -209,8 +209,11 @@ class FusedEPMoE(nnx.Module):
         if self.quantized_dtype is None:
             return
 
-        # Default quant_block_k to 256 if not explicitly set.
-        wsz = self.quant_block_k if self.quant_block_k is not None else 256
+        # Determine quant_block_k: None → per-channel, else block-wise.
+        if self.quant_block_k is not None:
+            wsz = self.quant_block_k
+        else:
+            wsz = None
         if hasattr(self, "quant_block_k"):
             del self.quant_block_k
         self.quant_block_k = wsz
@@ -219,24 +222,30 @@ class FusedEPMoE(nnx.Module):
             if is_static:
                 ep_scale_sharding = P(("data", "tensor"), None, None, None)
 
-                # Scale placeholder shapes are (E, K//block_k, 1, N) for both
-                # 1D sub-channel and 2D block-wise quantization.  In the 2D case,
-                # _expand_moe_block_scale() expands the compact (E, K//bk, N//bn)
-                # scales to the same (E, K//bk, 1, N) layout at weight-loading
-                # time, so the kernel always sees the unified 1D shape.
-                w1_scale_shape = (
-                    self.num_experts,
-                    self.hidden_size // wsz,
-                    1,
-                    self.intermediate_dim,
-                )
-                w3_scale_shape = w1_scale_shape
-                w2_scale_shape = (
-                    self.num_experts,
-                    self.intermediate_dim // wsz,
-                    1,
-                    self.hidden_size,
-                )
+                if wsz is None:
+                    # Per-channel: scale shape (E, 1, 1, N)
+                    w1_scale_shape = (
+                        self.num_experts, 1, 1, self.intermediate_dim,
+                    )
+                    w3_scale_shape = w1_scale_shape
+                    w2_scale_shape = (
+                        self.num_experts, 1, 1, self.hidden_size,
+                    )
+                else:
+                    # Block-wise: scale shape (E, K//block_k, 1, N)
+                    w1_scale_shape = (
+                        self.num_experts,
+                        self.hidden_size // wsz,
+                        1,
+                        self.intermediate_dim,
+                    )
+                    w3_scale_shape = w1_scale_shape
+                    w2_scale_shape = (
+                        self.num_experts,
+                        self.intermediate_dim // wsz,
+                        1,
+                        self.hidden_size,
+                    )
 
                 if hasattr(self, "w1_scale"):
                     del self.w1_scale
