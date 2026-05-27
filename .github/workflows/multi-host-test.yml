@@ -34,6 +34,11 @@ on:
         required: false
         default: "observability-storage-sglang"
         type: string
+      xla_cache_bucket:
+        description: "GCS bucket mounted at /xla-cache for JAX compilation cache."
+        required: false
+        default: "sglang-jax-ci-xla-cache"
+        type: string
       model_pvc:
         description: "PersistentVolumeClaim providing /models. Mount options come from the PV."
         required: false
@@ -74,6 +79,10 @@ on:
         required: false
         type: string
         default: "observability-storage-sglang"
+      xla_cache_bucket:
+        required: false
+        type: string
+        default: "sglang-jax-ci-xla-cache"
       model_pvc:
         required: false
         type: string
@@ -107,6 +116,7 @@ jobs:
       NODE_POOL: ${{ inputs.node_pool || vars.GKE_NODE_POOL || 'v6e-4x4-on-demand-np' }}
       NAMESPACE: ${{ inputs.namespace || 'default' }}
       BUCKET_NAME: ${{ inputs.bucket_name || 'observability-storage-sglang' }}
+      XLA_CACHE_BUCKET: ${{ inputs.xla_cache_bucket || 'sglang-jax-ci-xla-cache' }}
       MODEL_PVC: ${{ inputs.model_pvc || 'inference-model-storage-poc-tpu-hns-pvc' }}
       K8S_SERVICE_ACCOUNT: ${{ inputs.service_account_name || vars.GKE_SERVICE_ACCOUNT || 'default' }}
       REPO_REF: ${{ inputs.repo_ref || github.sha }}
@@ -118,7 +128,7 @@ jobs:
           set -euo pipefail
 
           missing=0
-          for name in PROJECT_ID CLUSTER_NAME CLUSTER_LOCATION WORKLOAD_IDENTITY_PROVIDER NODE_POOL NAMESPACE BUCKET_NAME MODEL_PVC K8S_SERVICE_ACCOUNT; do
+          for name in PROJECT_ID CLUSTER_NAME CLUSTER_LOCATION WORKLOAD_IDENTITY_PROVIDER NODE_POOL NAMESPACE BUCKET_NAME XLA_CACHE_BUCKET MODEL_PVC K8S_SERVICE_ACCOUNT; do
             if [[ -z "${!name}" ]]; then
               echo "::error::${name} is required. Set the workflow input or the matching repository variable."
               missing=1
@@ -337,7 +347,7 @@ jobs:
                   - name: SGLANG_JAX_MODEL_CACHE
                     value: "/models/model_scope"
                   - name: JAX_COMPILATION_CACHE_DIR
-                    value: "/tmp/jax_compilation_cache"
+                    value: "/xla-cache"
                   - name: HF_HUB_DOWNLOAD_TIMEOUT
                     value: "600"
                   ports:
@@ -362,15 +372,19 @@ jobs:
                     name: observability-storage
                   - mountPath: /dev/shm
                     name: dev-shm
-                  - mountPath: /tmp/jax_compilation_cache
-                    name: jax-cache
+                  - mountPath: /xla-cache
+                    name: xla-cache
                 volumes:
                 - name: dev-shm
                   emptyDir:
                     medium: Memory
                     sizeLimit: 64Gi
-                - name: jax-cache
-                  emptyDir: {}
+                - name: xla-cache
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    volumeAttributes:
+                      bucketName: ${XLA_CACHE_BUCKET}
+                      mountOptions: implicit-dirs
                 - name: gke-gcsfuse-cache
                   emptyDir:
                     medium: Memory
