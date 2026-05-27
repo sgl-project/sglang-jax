@@ -1,10 +1,11 @@
-"""Unit tests for WeightLoader._split_qkv_weight 1-D scale handling.
+"""Unit tests for WeightLoader._split_qkv_weight scale handling.
 
-Pre-fix, a 1-D per-channel `weight_scale` (HF shape `[Q_out+K_out+V_out,]`,
-as produced by compressed-tensors W8A16) fell through the bias / 2-D-scale
-branches into the 2-D weight else branch, where `weight[:q_dim, :]` on a
-1-D tensor raises IndexError. The fix adds a dedicated 1-D scale branch
-that splits along the single axis using the same Q/K/V offsets as bias.
+Covers the dedicated 1-D per-channel scale branch (compressed-tensors W8A16
+with HF shape [Q_out+K_out+V_out,]) and the 2-D non-block scale branch
+(compressed-tensors per-channel FP8 on Ling-2.6-1T with HF shape
+[Q_out+K_out+V_out, inner=1] and weight_block_size=None). Both must split
+on the same Q/K/V offsets as the bias branch and apply head_dim_padding
+the same way when set.
 """
 
 import jax.numpy as jnp
@@ -186,6 +187,114 @@ def test_pre_fix_else_branch_still_handles_2d_weight():
     q = captured["model.layers.0.self_attn.q_proj.weight_q"].value
     assert q.shape == (32, 32)
     assert jnp.array_equal(q, weight[:32])
+
+
+# ---------------------------------------------------------------------------
+# 2-D non-block scale branch (compressed-tensors per-channel FP8, Ling-2.6-1T)
+# ---------------------------------------------------------------------------
+
+
+class _DummyQuantCfg:
+    """quantization_config with weight_block_size=None — selects the new
+    element-wise fallback inside the 2-D scale branch."""
+
+    weight_block_size = None
+
+
+class _DummyModelConfig:
+    quantization_config = _DummyQuantCfg()
+
+
+def test_2d_non_block_scale_splits_at_correct_offsets():
+    """Ling-2.6-1T compressed-tensors per-channel FP8 stores QKV weight_scale
+    as 2-D shape [Q_out+K_out+V_out, 1] with weight_block_size=None. Should
+    fall back to element-wise axis-0 split on the same Q/K/V offsets as the
+    bias / 1-D branches, preserving the inner axis."""
+    loader, captured = _make_loader(num_heads=4, num_kv_heads=4, head_dim_original=8)
+    loader.model_config = _DummyModelConfig()
+    mapping = _qkv_mapping("weight_scale")
+
+    # 3 * 4 * 8 = 96 rows, inner = 1
+    weight = jnp.arange(96, dtype=jnp.float32).reshape(96, 1)
+
+    loader._split_qkv_weight(
+        params=None,
+        hf_key="model.layers.0.attention.query_key_value.weight_scale",
+        weight=weight,
+        mapping=mapping,
+    )
+
+    q = captured["model.layers.0.self_attn.q_proj.weight_scale"].value
+    k = captured["model.layers.0.self_attn.k_proj.weight_scale"].value
+    v = captured["model.layers.0.self_attn.v_proj.weight_scale"].value
+
+    assert q.shape == (32, 1)
+    assert k.shape == (32, 1)
+    assert v.shape == (32, 1)
+    assert jnp.array_equal(q, jnp.arange(0, 32, dtype=jnp.float32).reshape(32, 1))
+    assert jnp.array_equal(k, jnp.arange(32, 64, dtype=jnp.float32).reshape(32, 1))
+    assert jnp.array_equal(v, jnp.arange(64, 96, dtype=jnp.float32).reshape(32, 1))
+
+
+def test_2d_non_block_scale_gqa_offsets():
+    """GQA variant: num_kv_heads < num_heads. Same asymmetric offsets as the
+    1-D GQA case, with the inner axis preserved."""
+    loader, captured = _make_loader(num_heads=8, num_kv_heads=2, head_dim_original=4)
+    loader.model_config = _DummyModelConfig()
+    mapping = _qkv_mapping("weight_scale")
+
+    # Q: 8*4=32, K: 2*4=8, V: 2*4=8. Total: 48. Inner: 1.
+    weight = jnp.arange(48, dtype=jnp.float32).reshape(48, 1)
+
+    loader._split_qkv_weight(
+        params=None,
+        hf_key="model.layers.0.attention.query_key_value.weight_scale",
+        weight=weight,
+        mapping=mapping,
+    )
+
+    q = captured["model.layers.0.self_attn.q_proj.weight_scale"].value
+    k = captured["model.layers.0.self_attn.k_proj.weight_scale"].value
+    v = captured["model.layers.0.self_attn.v_proj.weight_scale"].value
+
+    assert q.shape == (32, 1)
+    assert k.shape == (8, 1)
+    assert v.shape == (8, 1)
+    assert jnp.array_equal(q, jnp.arange(0, 32, dtype=jnp.float32).reshape(32, 1))
+    assert jnp.array_equal(k, jnp.arange(32, 40, dtype=jnp.float32).reshape(8, 1))
+    assert jnp.array_equal(v, jnp.arange(40, 48, dtype=jnp.float32).reshape(8, 1))
+
+
+def test_2d_non_block_scale_head_dim_padding():
+    """Qwen-style head_dim=96 case: each per-head slice gets padded to 128
+    along axis 0 with the inner axis preserved. Validates that the 2-D
+    branch's reshape + pad + flatten mirrors the 1-D branch with an extra
+    inner dim."""
+    loader, captured = _make_loader(num_heads=2, num_kv_heads=2, head_dim_original=96)
+    loader.model_config = _DummyModelConfig()
+    mapping = _qkv_mapping("weight_scale", head_dim_padding=True)
+
+    # Unpadded: 3 * 2 * 96 = 576 rows, inner = 1
+    weight = jnp.arange(576, dtype=jnp.float32).reshape(576, 1)
+
+    loader._split_qkv_weight(
+        params=None,
+        hf_key="model.layers.0.attention.query_key_value.weight_scale",
+        weight=weight,
+        mapping=mapping,
+    )
+
+    q = captured["model.layers.0.self_attn.q_proj.weight_scale"].value
+    # Padded per-head 96 -> 128, 2 heads, inner 1 → (256, 1).
+    assert q.shape == (256, 1)
+
+    # Within each padded head, the first 96 elements (along the per-head axis)
+    # are the original slice and the last 32 are zero. Inner axis is preserved.
+    q_reshaped = q.reshape(2, 128, 1)
+    assert jnp.array_equal(q_reshaped[0, :96, 0], jnp.arange(0, 96, dtype=jnp.float32))
+    assert jnp.all(q_reshaped[0, 96:, 0] == 0)
+    assert jnp.array_equal(q_reshaped[1, :96, 0], jnp.arange(96, 192, dtype=jnp.float32))
+    assert jnp.all(q_reshaped[1, 96:, 0] == 0)
 
 
 if __name__ == "__main__":
