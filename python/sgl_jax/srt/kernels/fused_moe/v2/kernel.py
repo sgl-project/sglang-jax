@@ -328,6 +328,7 @@ def _fused_ep_moe_kernel(
     enable_bt_scatter_overlap: bool = True,
     cross_expert_prefetch_mode: str = "full",
     cross_expert_recv_lookahead: bool = False,
+    expert_argmax_to_end: bool = False,
     next_w2_prologue_priority: int = 1,
     w2_fetch_order: str = "after_w13",
     w2_fetch_priority: int = 1,
@@ -2056,10 +2057,45 @@ def _fused_ep_moe_kernel(
                 a2a_bank_id=a2a_bank_id,
             )
 
+        # When expert_argmax_to_end is enabled, find the local expert id with
+        # the largest recv size and remap the loop so it visits last. The
+        # earlier (smaller) experts' GMM compute then covers the recv DMA
+        # wait of the largest one.
+        if expert_argmax_to_end:
+            def _find_argmax(i, carry):
+                max_e, max_s = carry
+                e_id_global = my_id * local_num_experts + i
+                s = expert_sizes_x2_smem[bt_sem_id, 0, e_id_global]
+                better = s > max_s
+                return (
+                    jnp.where(better, i, max_e),
+                    jnp.where(better, s, max_s),
+                )
+            argmax_local_e_id, _ = lax.fori_loop(
+                jnp.int32(0), jnp.int32(local_num_experts),
+                _find_argmax, (jnp.int32(0), jnp.int32(0)),
+            )
+        else:
+            argmax_local_e_id = jnp.int32(0)
+
         init_carry = (jnp.int32(0), jnp.bool_(False), jnp.bool_(False))
 
-        def compute_expert_batch(local_e_id, carry):
+        def compute_expert_batch(iter_idx, carry):
             curr_se_block, bf0_w13_prefetched, recv_already_waited = carry
+
+            if expert_argmax_to_end:
+                is_last = iter_idx == jnp.int32(local_num_experts - 1)
+                local_e_id = jnp.where(
+                    is_last,
+                    argmax_local_e_id,
+                    jnp.where(
+                        iter_idx < argmax_local_e_id,
+                        iter_idx,
+                        iter_idx + jnp.int32(1),
+                    ),
+                )
+            else:
+                local_e_id = iter_idx
             e_sem_id_local = local_e_id
 
             for _ in range(se_before):
@@ -2270,6 +2306,7 @@ def jax_allreduce_metadata_by_bt(
         "ffn1_dequant_mode", "ffn1_dequant_chunk",
         "cast_ffn1_input_fp8", "cast_ffn2_input_fp8",
         "cross_expert_prefetch_mode", "cross_expert_recv_lookahead",
+        "expert_argmax_to_end",
         "next_w2_prologue_priority",
         "w2_fetch_order", "w2_fetch_priority",
         "skip_inter_bt_sync",
@@ -2334,6 +2371,7 @@ def fused_ep_moe_v2(
     cast_ffn2_input_fp8: bool = False,
     cross_expert_prefetch_mode: str = "full",
     cross_expert_recv_lookahead: bool = False,
+    expert_argmax_to_end: bool = False,
     next_w2_prologue_priority: int = 1,
     w2_fetch_order: str = "after_w13",
     w2_fetch_priority: int = 1,
@@ -2346,6 +2384,17 @@ def fused_ep_moe_v2(
         raise ValueError(
             f"Unsupported {cross_expert_prefetch_mode=}; "
             "expected one of 'none', 'full', or 'w13'."
+        )
+    if expert_argmax_to_end and cross_expert_prefetch_mode != "none":
+        raise ValueError(
+            "expert_argmax_to_end requires cross_expert_prefetch_mode='none' "
+            "(reorder-aware prefetch not yet implemented)."
+        )
+    if expert_argmax_to_end and cross_expert_recv_lookahead:
+        raise ValueError(
+            "expert_argmax_to_end is incompatible with "
+            "cross_expert_recv_lookahead — lookahead uses local_e_id+1 which "
+            "skips the reorder mapping."
         )
     if ffn1_dequant_mode not in ("full", "fchunk"):
         raise ValueError(
@@ -2523,6 +2572,8 @@ def fused_ep_moe_v2(
     scope_name += f"-xprefetch_{cross_expert_prefetch_mode}"
     if cross_expert_recv_lookahead:
         scope_name += "-xrecv_la"
+    if expert_argmax_to_end:
+        scope_name += "-argmax_end"
     if not pad_topk_to_128:
         scope_name += "-topk_no_pad"
     if route_smem_topk_only:
@@ -2682,6 +2733,7 @@ def fused_ep_moe_v2(
                 enable_bt_scatter_overlap=use_bt_scatter_bank,
                 cross_expert_prefetch_mode=cross_expert_prefetch_mode,
                 cross_expert_recv_lookahead=cross_expert_recv_lookahead,
+                expert_argmax_to_end=expert_argmax_to_end,
                 next_w2_prologue_priority=next_w2_prologue_priority,
                 w2_fetch_order=w2_fetch_order,
                 w2_fetch_priority=w2_fetch_priority,

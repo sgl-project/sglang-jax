@@ -21,6 +21,7 @@ Env vars:
   BENCH_SKIP_INTER_BT_SYNC — comma-separated 0/1 skip inter-BT sync barrier
   BENCH_INTERLEAVE_BT — comma-separated 0/1 interleave BT gather banking
   BENCH_CROSS_EXPERT_RECV_LOOKAHEAD — 1 to pre-wait next expert's recv after gather
+  BENCH_EXPERT_ARGMAX_TO_END — 1 to remap expert loop so argmax-size expert visits last (requires prefetch=none)
   BENCH_TUNE    — 1 to auto-generate bt/bf candidates
   BENCH_WARMUP  — warmup iterations (default: 2)
   BENCH_ITERS   — timed iterations (default: 5)
@@ -255,6 +256,9 @@ enable_bt_scatter_overlap = os.environ.get("BENCH_BT_SCATTER_OVERLAP", "1") == "
 cross_expert_prefetch_modes = parse_csv_str("BENCH_CROSS_EXPERT_PREFETCH", ["full"])
 cross_expert_recv_lookahead = os.environ.get(
     "BENCH_CROSS_EXPERT_RECV_LOOKAHEAD", "0"
+) == "1"
+expert_argmax_to_end = os.environ.get(
+    "BENCH_EXPERT_ARGMAX_TO_END", "0"
 ) == "1"
 next_w2_prologue_priorities = parse_csv_int("BENCH_NEXT_W2_PRIORITY", [1])
 w2_fetch_orders = parse_csv_str("BENCH_W2_FETCH_ORDER", ["after_w13"])
@@ -1070,6 +1074,7 @@ for num_tokens in token_candidates:
                 cast_ffn2_input_fp8=cast_ffn2_input_fp8,
                 cross_expert_prefetch_mode=xprefetch_mode,
                 cross_expert_recv_lookahead=cross_expert_recv_lookahead,
+                expert_argmax_to_end=expert_argmax_to_end,
                 next_w2_prologue_priority=next_w2_priority,
                 w2_fetch_order=w2_fetch_order,
                 w2_fetch_priority=w2_fetch_priority,
@@ -1160,6 +1165,7 @@ if check_correctness:
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
             use_jax_allreduce_metadata=not inkernel_metadata,
             cross_expert_recv_lookahead=cross_expert_recv_lookahead,
+            expert_argmax_to_end=expert_argmax_to_end,
         )
         ref_kwargs = {}
         if use_fp8:
