@@ -80,7 +80,7 @@ End-to-end serving recipes for autoregressive models on SGL-JAX, organized by ve
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
 | 🧪 | MiMo-V2-Flash | [`Xiaomi/MiMo-V2-Flash.md`](Xiaomi/MiMo-V2-Flash.md) | v7x-8 or v6e-16 | MoE + reasoning/tool (`mimo`) |
-| 🧪 | MiMo-V2.5-Pro | [`Xiaomi/MiMo-V2.5-Pro.md`](Xiaomi/MiMo-V2.5-Pro.md) | v7x-16 or v6e-64 | MoE + reasoning/tool (`mimo`) |
+| ✅ | MiMo-V2.5-Pro | [`Xiaomi/MiMo-V2.5-Pro.md`](Xiaomi/MiMo-V2.5-Pro.md) | v6e-64 (v7x-16 alternative) | MoE + reasoning/tool (`mimo`) |
 | 🧪 | MiMo-7B | [`Xiaomi/MiMo-7B.md`](Xiaomi/MiMo-7B.md) | v6e-4 | dense + reasoning/tool (`mimo`) |
 
 > Upgrade path: 🚧 → 🧪 requires real `evalscope` (accuracy) or `bench_serving` (throughput) output for at least one variant / hardware path. 🧪 → ✅ requires the recipe's claimed primary path to have complete **Test Environment → Deployment Command → Benchmark Command → Test Results** evidence without unresolved required cells. See [`Xiaomi/MiMo-V2-Flash.md` §4](Xiaomi/MiMo-V2-Flash.md#4-benchmark) for the canonical four-section form.
@@ -103,7 +103,7 @@ Diffusion image/video generation models live in [`../diffusion/`](../diffusion/i
 | Dense model with benchmark comparison | [`Qwen/Qwen3.md`](Qwen/Qwen3.md) 🧪 |
 | Single-host MoE with backend choice | [`Xiaomi/MiMo-V2-Flash.md`](Xiaomi/MiMo-V2-Flash.md) 🧪 |
 | Vision-language chat | [`Qwen/Qwen2.5-VL.md`](Qwen/Qwen2.5-VL.md) 🚧 |
-| Large multi-node MoE with GKE manifest | [`Xiaomi/MiMo-V2.5-Pro.md`](Xiaomi/MiMo-V2.5-Pro.md) 🧪 |
+| Large multi-node MoE with GKE manifest | [`Xiaomi/MiMo-V2.5-Pro.md`](Xiaomi/MiMo-V2.5-Pro.md) ✅ |
 | Multi-node dense | [`Grok/Grok2.md`](Grok/Grok2.md) 🚧 (+ [`../deployment/gke-indexed-job.md`](../deployment/gke-indexed-job.md)) |
 | Linear-attention model with recurrent state | [`Moonshotai/Kimi-Linear.md`](Moonshotai/Kimi-Linear.md) ✅ or [`InclusionAI/Ling-2.6.md`](InclusionAI/Ling-2.6.md) 🚧 |
 | Reasoning model (RL-tuned, `<think>` blocks) | [`InclusionAI/Ling2.5.md`](InclusionAI/Ling2.5.md) 🚧 (Ring-2.5) or [`DeepSeek/DeepSeek-R1.md`](DeepSeek/DeepSeek-R1.md) 🚧 |

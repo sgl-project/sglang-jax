@@ -4,7 +4,7 @@ title: "MiMo-V2.5-Pro"
 
 # MiMo-V2.5-Pro on SGL-JAX
 
-> **Partially validated recipe** — TPU v6e-64 path validated on sglang-jax `de29d9f0` (2026-05-27): server starts, thinking-on output correct, GSM8K accuracy 97.5% (200 examples, see §4.2), `bench_serving` numbers in §4.1. TPU v7x-16 path has historical AIME 2025 numbers (see §4.2 footnote); current-build rerun on v7x is still pending.
+> **Validated recipe** — TPU v6e-64 path validated on sglang-jax `de29d9f0` (2026-05-27): server starts, thinking-on output correct, GSM8K accuracy 97.5% (200 examples, see §4.2), `bench_serving` numbers in §4.1. TPU v7x-16 is a supported alternative hardware path (same launch shape, lower HBM-per-chip pressure); v6e-64 is the validation target for this recipe and v7x reruns are not required to keep the ✅ status.
 
 ## 1. Model Introduction
 
@@ -31,8 +31,8 @@ title: "MiMo-V2.5-Pro"
 
 | TPU | Topology | Chips per node | Nodes | Total chips | `--tp-size` | `--dp-size` | `--ep-size` | `--moe-backend` | Status | Notes |
 |---|---|---|---|---|---|---|---|---|---|---|
-| **v7x-16** | `2x2x4` | 4 | 4 | 16 | 32 | 4 | 32 | `fused` | 🧪 partial | v7x exposes 2 JAX devices/chip → 16 × 2 = 32; attention TP = `tp_size/dp_size` = 8. Historical AIME 2025 (see §4.2). |
-| **v6e-64** | `4x4x4` | 4 | 16 | 64 | 64 | 8 | 64 | `fused` | 🧪 partial | v6e is 1:1 chip↔device; lower HBM per chip — see §2.4 SWA Pool Sizing for tradeoff. GSM8K in §4.2; speed pending. |
+| **v6e-64** | `4x4x4` | 4 | 16 | 64 | 64 | 8 | 64 | `fused` | ✅ validated | Primary validation target. v6e is 1:1 chip↔device; lower HBM per chip — see §2.4 SWA Pool Sizing for tradeoff. GSM8K + bench_serving in §4. |
+| **v7x-16** | `2x2x4` | 4 | 4 | 16 | 32 | 4 | 32 | `fused` | alternative | Supported alternative hardware; same launch shape. v7x exposes 2 JAX devices/chip → 16 × 2 = 32; attention TP = `tp_size/dp_size` = 8. Historical AIME 2025 reference numbers in §4.2; not rerun on current build (not required for ✅). |
 
 MiMo-V2.5-Pro requires a full v7x-16 or v6e-64 slice; single-host configurations are not supported. All nodes must be in the same TPU slice and reach each other on the JAX init port (`5000` by default) and the TPU process port (`8471`).
 
