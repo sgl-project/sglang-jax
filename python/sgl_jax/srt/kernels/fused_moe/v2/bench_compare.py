@@ -447,7 +447,6 @@ for num_tokens in token_candidates:
             w1_scale=w1_scale_s, w2_scale=w2_scale_s, w3_scale=w3_scale_s,
             use_jax_allreduce_metadata=False,
             direct_scaled_dot=direct_scaled_dot,
-            decode_mode=v2_decode_mode,
         )
 
     log("  V2: compiling + running...")
