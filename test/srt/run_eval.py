@@ -85,11 +85,17 @@ def run_eval(args):
     else:
         max_tokens = 2048
 
+    top_p = getattr(args, "top_p", None)
+    chat_template_kwargs = getattr(args, "chat_template_kwargs", None)
+    extra_body = {"chat_template_kwargs": chat_template_kwargs} if chat_template_kwargs else None
+
     sampler = ChatCompletionSampler(
         model=args.model,
         max_tokens=max_tokens,
         base_url=base_url,
         temperature=getattr(args, "temperature", 0.0),
+        top_p=top_p,
+        extra_body=extra_body,
     )
 
     # Run eval

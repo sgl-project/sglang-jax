@@ -223,28 +223,37 @@ def _resolve_launch_profile(run: ModelRun, base_dir: Path) -> ModelRun:
 
 # Explicit suite registry. To add a new suite: insert a new entry below.
 SUITES: dict[str, MultiHostSuite] = {
-    "mimo-flash-pref-test": MultiHostSuite(
-        name="mimo-flash-pref-test",
+    "mimo-flash-accuracy-nightly-test": MultiHostSuite(
+        name="mimo-flash-accuracy-nightly-test",
         runs=[
             ModelRun(
                 launch_profile="launch_profiles/mimo-flash-v6e-4x4.yaml",
                 cases=[
-                    PerfCase(
-                        name="mimo-flash-benchmark",
-                        input_len=16384,
-                        output_len=1024,
-                        num_prompts=256,
-                        max_concurrency=64,
-                        request_rate=100,
-                        seed=12345,
-                        flush_cache=True,
-                    ),
                     AccuracyCase(
                         name="mimo-flash-gsm8k",
                         dataset="gsm8k",
                         model_id="XiaomiMiMo/MiMo-V2-Flash",
-                        eval_batch_size=32,
-                        generation_config={"temperature": 0.8, "top_p": 0.95},
+                        eval_batch_size=16,
+                        generation_config={
+                            "temperature": 1,
+                            "top_p": 0.95,
+                            "max_tokens": 131072,
+                            "chat_template_kwargs": {"enable_thinking": True},
+                        },
+                        score_threshold=0.94,
+                    ),
+                    AccuracyCase(
+                        name="mimo-flash-aime25",
+                        dataset="aime25",
+                        model_id="XiaomiMiMo/MiMo-V2-Flash",
+                        eval_batch_size=16,
+                        generation_config={
+                            "temperature": 1,
+                            "top_p": 0.95,
+                            "max_tokens": 131072,
+                            "chat_template_kwargs": {"enable_thinking": True},
+                        },
+                        score_threshold=0.85,
                     ),
                 ],
             ),

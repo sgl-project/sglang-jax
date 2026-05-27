@@ -1,0 +1,220 @@
+# Accuracy result schema (general — single-host, multi-host, or any future
+# accuracy test runner that wants to record results).
+#
+# Each accuracy case (gsm8k, aime25, ...) writes one JSON file matching this
+# schema to `${RESULTS_DIR}/<case>.json`. RESULTS_DIR is mounted from
+# `gs://observability-storage-sglang/<date>/<workload>/` in CI.
+#
+# Producers: any accuracy nightly runner. Today:
+#   - test/srt/multi_host/accuracy_case_runner.py (multi-host suites)
+# New runners that produce accuracy JSON SHOULD emit this schema and bump
+# `ACCURACY_RESULT_SCHEMA_VERSION` (with a changelog entry below) when they
+# need additional fields.
+# Consumer: dashboards / regression trackers that ingest the bucket.
+
+schema: accuracy_result
+version: 1.0.0
+status: stable
+
+description: |
+  Per-case nightly accuracy result. One JSON document per (workload, case).
+  Captures the score, the threshold it was gated against, the run config,
+  and provenance so the result is reproducible from CI metadata alone.
+
+# How the version field evolves. The Python constant
+# `ACCURACY_RESULT_SCHEMA_VERSION` in accuracy_case_runner.py MUST stay in
+# sync with the latest entry in `changelog` below.
+versioning:
+  policy: semver
+  rules:
+    - "PATCH (1.0.x): clarification or doc-only change. No field add/remove/retype."
+    - "MINOR (1.x.0): add new optional field. Existing consumers stay compatible."
+    - "MAJOR (x.0.0): remove / rename a field, change its type, or change required-ness of an existing field."
+  guarantees:
+    - "schema_version is always present and parseable as semver MAJOR.MINOR.PATCH."
+    - "type is always 'accuracy' for documents matching this schema."
+    - "Unknown future fields are safe to ignore — consumers MUST tolerate extras."
+
+fields:
+
+  # ---- Identity ----------------------------------------------------------
+  schema_version:
+    type: string
+    required: true
+    description: "Semver of this document. Must match a published version in `changelog`."
+    example: "1.0.0"
+
+  type:
+    type: string
+    required: true
+    enum: [accuracy]
+    description: "Document discriminator. Lets consumers route accuracy vs perf JSON in the same bucket."
+
+  case:
+    type: string
+    required: true
+    description: "Unique case name within a suite (matches `AccuracyCase.name`). Filename stem is `<case>.json`."
+    example: "mimo-flash-aime25"
+
+  dataset:
+    type: string
+    required: true
+    description: "Eval dataset name passed to `run_eval` (e.g. gsm8k, aime25, mmlu, humaneval)."
+    example: "aime25"
+
+  model_id:
+    type: string
+    required: true
+    description: "Model identifier requested at the OpenAI-compatible endpoint. Usually the HF repo path."
+    example: "XiaomiMiMo/MiMo-V2-Flash"
+
+  profile:
+    type: string
+    required: true
+    description: "Launch profile name (`LaunchProfile.name`). Encodes the parallelism plan (TP/DP/EP)."
+    example: "mimo_flash-tp16-dp4-ep16"
+
+  target:
+    type: string
+    required: true
+    description: "Hardware target tag from the launch profile. Used to slice results by topology."
+    example: "v6e-4x4"
+
+  # ---- Result ------------------------------------------------------------
+  score:
+    type: [number, "null"]
+    required: true
+    description: |
+      Primary metric for this dataset, as returned by `run_eval`. For pass/fail
+      datasets (gsm8k, aime25) this is mean accuracy in [0, 1]. Null only when
+      the eval ran but produced no score (treated as failure when a threshold
+      is set).
+    example: 0.933
+
+  score_threshold:
+    type: [number, "null"]
+    required: true
+    description: "Lower bound the case is gated against. Null = warn-only (no gating)."
+    example: 0.85
+
+  passed:
+    type: [boolean, "null"]
+    required: true
+    description: |
+      Gating outcome. `true` iff `score >= score_threshold`. Null when either
+      `score` or `score_threshold` is null (gating not applicable).
+    example: true
+
+  metrics:
+    type: object
+    required: true
+    description: |
+      Full metrics dict from `run_eval` / `aggregate_results`. Keys follow the
+      `simple_eval` convention `<name>` (mean) and `<name>:<stat>` (other
+      statistics, e.g. `score:std`). Always includes the primary `score`. Use
+      `score:std` together with `num_examples` (or len of single results) to
+      compute the standard error of `score`.
+    example:
+      score: 0.933
+      "score:std": 0.250
+
+  # ---- Timing ------------------------------------------------------------
+  started_at:
+    type: string
+    required: true
+    format: "RFC3339 UTC, suffix Z"
+    description: "Wall-clock start of `run_eval` on the runner pod."
+    example: "2026-05-27T18:30:12Z"
+
+  finished_at:
+    type: string
+    required: true
+    format: "RFC3339 UTC, suffix Z"
+    description: "Wall-clock finish of `run_eval`."
+    example: "2026-05-27T18:46:35Z"
+
+  duration_seconds:
+    type: number
+    required: true
+    description: "`finished_at - started_at` in seconds, rounded to 3 decimals."
+    example: 983.4
+
+  # ---- Run config --------------------------------------------------------
+  num_examples:
+    type: [integer, "null"]
+    required: true
+    description: |
+      Cap on dataset size for this run (`AccuracyCase.limit`). Null means
+      'use the full dataset'. The actual count of evaluated samples may be
+      smaller if the eval drops invalid prompts; consult `metrics` length in
+      future schema versions.
+    example: null
+
+  eval_batch_size:
+    type: integer
+    required: true
+    description: "Concurrency passed to the eval loop (`num_threads`)."
+    example: 16
+
+  generation_config:
+    type: object
+    required: true
+    description: |
+      Sampling parameters sent to the server (temperature, top_p, max_tokens,
+      chat_template_kwargs, ...). Empty object when the case relies on server
+      defaults.
+    example:
+      temperature: 1
+      top_p: 0.95
+      max_tokens: 131072
+      chat_template_kwargs: { enable_thinking: true }
+
+  # ---- Provenance --------------------------------------------------------
+  repo_ref:
+    type: [string, "null"]
+    required: true
+    description: |
+      Git ref the runner checked out. Sourced from env `REPO_REF` (CI input)
+      or `GITHUB_REF_NAME` (push event). Null when neither is set.
+    example: "feat/nightly-mimo-flash-1201"
+
+  commit_sha:
+    type: [string, "null"]
+    required: true
+    description: |
+      Full commit SHA of the runner workspace. Resolved from `GITHUB_SHA` /
+      `COMMIT_SHA` env first, otherwise `git rev-parse HEAD` from the runner
+      script's directory. Null only if neither path resolves.
+    example: "cd89026c1f3a..."
+
+  workload_name:
+    type: [string, "null"]
+    required: true
+    description: |
+      K8s Job name in the cluster (`gke-run-test-caces-<run-id>`). Lets ops
+      cross-reference pod logs and the result file.
+    example: "gke-run-test-caces-12345678"
+
+  github_run_id:
+    type: [string, "null"]
+    required: true
+    description: "GitHub Actions run ID. Null when not running under Actions."
+    example: "12345678"
+
+  github_run_url:
+    type: [string, "null"]
+    required: true
+    description: |
+      Direct link to the Actions run. Constructed from `GITHUB_SERVER_URL`,
+      `GITHUB_REPOSITORY`, `GITHUB_RUN_ID`. Null if any of those are missing.
+    example: "https://github.com/sgl-project/sglang-jax/actions/runs/12345678"
+
+# ---- History --------------------------------------------------------------
+changelog:
+  - version: 1.0.0
+    date: 2026-05-27
+    pr: "sgl-project/sglang-jax#1226"
+    notes: |
+      Initial accuracy result schema. Introduced alongside the MIMO-V2-Flash
+      multi-host nightly daily wiring. Replaces the prior unstructured
+      print-only output.

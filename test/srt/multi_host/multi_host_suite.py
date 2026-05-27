@@ -23,6 +23,7 @@ class AccuracyCase:
     generation_config: dict[str, Any] = field(default_factory=dict)
     limit: int | None = None
     timeout: int | None = None
+    score_threshold: float | None = None
 
 
 @dataclass(frozen=True)
