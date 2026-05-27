@@ -69,8 +69,5 @@ jobs:
             echo "SLACK_WEBHOOK_URL not set, skipping."
             exit 0
           fi
-          SUMMARY=$(cat slack_summary.txt)
-          jq -n --arg text "$SUMMARY" \
-            '{"blocks":[{"type":"section","text":{"type":"mrkdwn","text":$text}}]}' | \
-            curl --fail-with-body -X POST -H 'Content-type: application/json' \
-              -d @- "$SLACK_WEBHOOK_URL"
+          curl --fail-with-body -X POST -H 'Content-type: application/json' \
+            -d @slack_summary.txt "$SLACK_WEBHOOK_URL"
