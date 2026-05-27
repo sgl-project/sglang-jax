@@ -103,6 +103,10 @@ class IndexMaps:
         group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
         return (group_id, 0, 0, n_id)
 
+    def rhs_scale_block_index_map(self, n_id: jax.Array, gm_id: jax.Array, k_id: jax.Array):
+        group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
+        return (group_id, k_id, 0, n_id)
+
     def out_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
         is_last_gm = gm_id == (pl.num_programs(1) - 1)
         m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
@@ -142,10 +146,21 @@ def generate_block_specs(
             index_map.rhs_bias_index_map,
         )
     if cfgs.rhs_cfgs.has_scale:
-        rhs_scale_block_spec = pl.BlockSpec(
-            (None, None, 1, cfgs.tiles.tile_n),
-            index_map.rhs_scale_index_map,
-        )
+        rhs_block = cfgs.rhs_cfgs.quant_block_size
+        if rhs_block is not None and rhs_block < cfgs.dims.size_k:
+            assert cfgs.tiles.tile_k % rhs_block == 0, (
+                f"block-scale: tile_k={cfgs.tiles.tile_k} must divide rhs_block={rhs_block}"
+            )
+            num_scale_per_tile = cfgs.tiles.tile_k // rhs_block
+            rhs_scale_block_spec = pl.BlockSpec(
+                (None, num_scale_per_tile, 1, cfgs.tiles.tile_n),
+                index_map.rhs_scale_block_index_map,
+            )
+        else:
+            rhs_scale_block_spec = pl.BlockSpec(
+                (None, None, 1, cfgs.tiles.tile_n),
+                index_map.rhs_scale_index_map,
+            )
 
     rhs_block_spec = WeightsRef(
         weight=rhs_weight_spec,
@@ -208,13 +223,30 @@ def inner_kernel(
             mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
             tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
 
+        rhs_block = cfgs.rhs_cfgs.quant_block_size
+        is_block_rhs_scale = (
+            cfgs.rhs_cfgs.has_scale and rhs_block is not None and rhs_block < cfgs.dims.size_k
+        )
+
         if cfgs.lhs_cfgs.quant_dtype is None:
-            # Unquantized matmul path.
-            acc = jnp.matmul(
-                tiled_lhs,
-                tiled_rhs,
-                preferred_element_type=jnp.float32,
-            ).astype(acc_ref.dtype)
+            if is_block_rhs_scale:
+                # W8A16 block-wise weight scale: split K by rhs_block, each block × its scale.
+                acc = jnp.zeros((cfgs.tiles.tile_m, cfgs.tiles.tile_n), dtype=acc_ref.dtype)
+                for blk_i, start_k in enumerate(range(0, cfgs.tiles.tile_k, rhs_block)):
+                    end_k = min(cfgs.tiles.tile_k, start_k + rhs_block)
+                    block_acc = jnp.matmul(
+                        tiled_lhs[:, start_k:end_k],
+                        tiled_rhs[start_k:end_k, :],
+                        preferred_element_type=jnp.float32,
+                    ).astype(acc_ref.dtype)
+                    acc += block_acc * tiled_rhs_ref.scale[blk_i, 0, :].astype(acc_ref.dtype)
+            else:
+                # Unquantized matmul path.
+                acc = jnp.matmul(
+                    tiled_lhs,
+                    tiled_rhs,
+                    preferred_element_type=jnp.float32,
+                ).astype(acc_ref.dtype)
         else:
             # Quantized matmul path.
             lhs_q_dtype = cfgs.lhs_cfgs.quant_dtype
@@ -276,7 +308,7 @@ def inner_kernel(
             acc += acc_ref[...]
 
         if is_last_k_step:
-            if cfgs.rhs_cfgs.has_scale:
+            if cfgs.rhs_cfgs.has_scale and not is_block_rhs_scale:
                 acc *= tiled_rhs_ref.scale[...].astype(acc.dtype)
             if cfgs.rhs_cfgs.has_bias:
                 acc += tiled_rhs_ref.bias[...].astype(acc.dtype)
@@ -698,10 +730,14 @@ def validate_inputs(
     if rhs_bias is not None:
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
-        # TODO(kyuyeunk, wenxindong): Add support for subchannel quantization.
-        if rhs_scale.shape[1] != 1:
-            raise NotImplementedError("Only per-channel quantization is supported.")
-        assert rhs_scale.shape == (size_group, 1, 1, size_n)
+        num_k_blocks = rhs_scale.shape[1]
+        assert rhs_scale.shape == (size_group, num_k_blocks, 1, size_n), (
+            f"rhs_scale shape {rhs_scale.shape} != ({size_group}, {num_k_blocks}, 1, {size_n})"
+        )
+        if num_k_blocks > 1:
+            assert size_k % num_k_blocks == 0, (
+                f"block-scale: size_k={size_k} must divide num_k_blocks={num_k_blocks}"
+            )
 
     assert group_offset.shape == (1,)
 
@@ -805,6 +841,12 @@ def make_gmm_configs(
         else:
             if tpu_info.int8_ops_per_second > 0:
                 lhs_q_dtype = jnp.int8.dtype
+
+    if lhs_q_dtype is not None and rhs_scale is not None and rhs_scale.shape[1] > 1:
+        raise NotImplementedError(
+            "gmm_v2 block-wise rhs_scale + lhs activation quant not yet supported; "
+            "pass maybe_quantize_lhs=False for W8A16."
+        )
 
     lhs_cfgs = InputConfigs(
         quant_dtype=lhs_q_dtype,
@@ -936,6 +978,13 @@ def gmm_v2(
     rhs_scale_spec = rhs_bias_spec = None
     if rhs_scale is not None:
         rhs_scale = rhs_scale.astype(jnp.float32)
+        if rhs_scale.shape[1] > 1:
+            block_size = cfgs.rhs_cfgs.quant_block_size
+            num_k_tiles = pl.cdiv(dims.size_k, tiles.tile_k)
+            target_k_blocks = num_k_tiles * (tiles.tile_k // block_size)
+            if target_k_blocks > rhs_scale.shape[1]:
+                pad_k = target_k_blocks - rhs_scale.shape[1]
+                rhs_scale = jnp.pad(rhs_scale, ((0, 0), (0, pad_k), (0, 0), (0, 0)))
         rhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     if rhs_bias is not None:
         rhs_bias = rhs_bias.astype(jnp.float32)
@@ -1013,5 +1062,5 @@ def gmm_v2(
 
 
 def is_supported_by_gmm_v2(rhs_scale: jax.Array | None) -> bool:
-    # gmm_v2 does not support subchannel quantization.
-    return rhs_scale is None or rhs_scale.shape[1] == 1
+    # Supports per-channel (k_blocks=1) and block-wise (k_blocks>1, W8A16 path only).
+    return rhs_scale is None or rhs_scale.ndim == 4
