@@ -20,7 +20,7 @@ _TEST_SRT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file
 if _TEST_SRT not in sys.path:
     sys.path.insert(0, _TEST_SRT)
 
-from multi_host_suite import AccuracyCase
+from multi_host_suite import AccuracyCase, SuiteError
 from profile_loader import LaunchProfile
 
 ACCURACY_RESULT_SCHEMA_VERSION = "1.0.0"
@@ -150,14 +150,20 @@ def run_accuracy_case(case: AccuracyCase, profile: LaunchProfile) -> None:
     score = summary["score"]
     if case.score_threshold is not None:
         if score is None:
-            raise RuntimeError(
-                f"Accuracy case {case.name} produced no score; cannot evaluate "
-                f"against threshold={case.score_threshold}"
+            raise SuiteError(
+                kind="case",
+                message=(
+                    f"Accuracy case {case.name} produced no score; cannot evaluate "
+                    f"against threshold={case.score_threshold}"
+                ),
             )
         if score < case.score_threshold:
-            raise RuntimeError(
-                f"Accuracy case {case.name} score={score:.4f} below "
-                f"threshold={case.score_threshold:.4f}"
+            raise SuiteError(
+                kind="threshold",
+                message=(
+                    f"Accuracy case {case.name} score={score:.4f} below "
+                    f"threshold={case.score_threshold:.4f}"
+                ),
             )
         print(
             f"[multi-host-suite] Accuracy case {case.name} passed: "

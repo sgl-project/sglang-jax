@@ -94,6 +94,13 @@ on:
       repo_ref:
         required: false
         type: string
+    outputs:
+      failure_class:
+        description: "Classified failure kind (passed/infra/threshold/case-crash/readiness/unknown)."
+        value: ${{ jobs.run-test-caces.outputs.failure_class }}
+      should_retry:
+        description: "Whether the caller should retry this run on infra failure."
+        value: ${{ jobs.run-test-caces.outputs.should_retry }}
 
 concurrency:
   group: gke-run-test-caces-smoke-${{ github.ref }}
@@ -107,6 +114,9 @@ jobs:
   run-test-caces:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    outputs:
+      failure_class: ${{ steps.classify.outputs.class }}
+      should_retry: ${{ steps.classify.outputs.should_retry }}
     env:
       PROJECT_ID: ${{ inputs.project_id || vars.GCP_PROJECT_ID }}
       CLUSTER_NAME: ${{ inputs.cluster_name || vars.GKE_CLUSTER_NAME }}
@@ -465,6 +475,57 @@ jobs:
           kubectl get events --namespace "${NAMESPACE}" --sort-by='.lastTimestamp' \
             | grep -E "${WORKLOAD_NAME}|Evicted|DiskPressure|MemoryPressure|OOMKill|FailedScheduling" || true
           kubectl logs --namespace "${NAMESPACE}" --selector="job-name=${WORKLOAD_NAME}" --all-containers=true --prefix=true || true
+
+      - name: Classify multi-host failure
+        id: classify
+        if: failure()
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          # Read rank 0's main container exit code before Cleanup deletes the pod.
+          EXIT_CODE=$(kubectl get pod \
+            --selector="job-name=${WORKLOAD_NAME},batch.kubernetes.io/job-completion-index=0" \
+            --namespace "${NAMESPACE}" \
+            -o jsonpath='{.items[0].status.containerStatuses[?(@.name=="run-test-caces")].state.terminated.exitCode}' \
+            2>/dev/null || echo "")
+
+          # Fallback: if rank 0 was SIGKILL'd (137/143) by a peer rank dying first,
+          # scan all ranks for a tagged code (10/20/30) emitted by suite_runner.py.
+          if [[ -z "${EXIT_CODE}" || "${EXIT_CODE}" == "137" || "${EXIT_CODE}" == "143" ]]; then
+            ALL=$(kubectl get pods \
+              --selector="job-name=${WORKLOAD_NAME}" \
+              --namespace "${NAMESPACE}" \
+              -o jsonpath='{range .items[*]}{.status.containerStatuses[?(@.name=="run-test-caces")].state.terminated.exitCode}{"\n"}{end}' \
+              2>/dev/null || true)
+            for tagged in 30 20 10; do
+              if echo "${ALL}" | grep -qx "${tagged}"; then
+                EXIT_CODE="${tagged}"
+                break
+              fi
+            done
+          fi
+
+          case "${EXIT_CODE}" in
+            0)   CLASS="passed";     SHOULD_RETRY="false" ;;
+            10)  CLASS="infra";      SHOULD_RETRY="true"  ;;
+            20)  CLASS="threshold";  SHOULD_RETRY="false" ;;
+            30)  CLASS="case-crash"; SHOULD_RETRY="false" ;;
+            "")  CLASS="readiness";  SHOULD_RETRY="true"  ;;
+            *)   CLASS="unknown";    SHOULD_RETRY="false" ;;
+          esac
+
+          echo "exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
+          echo "class=${CLASS}" >> "$GITHUB_OUTPUT"
+          echo "should_retry=${SHOULD_RETRY}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Failure classification"
+            echo ""
+            echo "**Exit code:** \`${EXIT_CODE:-(none)}\`  "
+            echo "**Class:** \`${CLASS}\`  "
+            echo "**Auto-retry recommended:** \`${SHOULD_RETRY}\`"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
       - name: Surface results to step summary
         if: always()

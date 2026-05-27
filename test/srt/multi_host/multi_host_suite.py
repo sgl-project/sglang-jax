@@ -2,6 +2,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+class SuiteError(Exception):
+    """Tagged error consumed by suite_runner.py exit-code mapping."""
+
+    def __init__(self, kind: str, message: str):
+        super().__init__(message)
+        self.kind = kind
+
+
 @dataclass(frozen=True)
 class PerfCase:
     name: str

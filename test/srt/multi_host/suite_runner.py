@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,8 +23,15 @@ from multi_host_suite import (
     MultiHostSuite,
     PerfCase,
     RuntimeConfig,
+    SuiteError,
     dry_run_suite,
 )
+
+# Exit codes consumed by the multi-host CI workflow's Classify step.
+EXIT_OK = 0
+EXIT_INFRA = 10  # server / runtime infra failure → caller may retry
+EXIT_THRESHOLD = 20  # case finished but score below threshold → do not retry
+EXIT_CASE_CRASH = 30  # case raised unexpectedly → bug, do not retry
 from perf_case_runner import run_perf_case
 from profile_loader import LaunchProfile, build_other_server_args, load_profile
 
@@ -165,12 +173,22 @@ def run_model_run(model_run: ModelRun, runtime_cfg: RuntimeConfig) -> int:
             for case in model_run.cases:
                 try:
                     run_case(case, profile)
+                except SuiteError as exc:
+                    failed_cases.append((case.name, exc))
+                    _log(f"Case {case.name} failed ({exc.kind}): {exc}")
                 except Exception as exc:
                     failed_cases.append((case.name, exc))
-                    _log(f"Case {case.name} failed: {exc!r}")
+                    _log(f"Case {case.name} crashed: {exc!r}")
             if failed_cases:
-                exit_code = 1
-                _log(f"Run {profile.name} failed cases: " f"{[name for name, _ in failed_cases]}")
+                kinds = {getattr(exc, "kind", "case") for _, exc in failed_cases}
+                # Crash dominates threshold: a case that blew up means a bug
+                # worth surfacing, even if some other case also missed score.
+                exit_code = EXIT_THRESHOLD if kinds == {"threshold"} else EXIT_CASE_CRASH
+                _log(
+                    f"Run {profile.name} failed cases="
+                    f"{[name for name, _ in failed_cases]} "
+                    f"kinds={sorted(kinds)} → exit_code={exit_code}"
+                )
         else:
             workload_name = _get_env("WORKLOAD_NAME")
             headless_service_name = _get_env("HEADLESS_SERVICE_NAME")
@@ -179,9 +197,12 @@ def run_model_run(model_run: ModelRun, runtime_cfg: RuntimeConfig) -> int:
                 f"{int(_get_env('CONTROL_PORT'))}/status"
             )
             exit_code = wait_for_done(control_url, server_process)
-    except Exception:
-        exit_code = 1
-        raise
+    except Exception as exc:
+        # Don't re-raise — return exit_code so it lands as the container's
+        # exitCode (ranks vs SIGKILL) for the workflow Classify step to read.
+        _log(f"Infra error in run {profile.name}: {exc!r}")
+        _log(traceback.format_exc())
+        exit_code = EXIT_INFRA
     finally:
         if is_rank0:
             # Always publish — covers success, case failure, and popen_launch_server
