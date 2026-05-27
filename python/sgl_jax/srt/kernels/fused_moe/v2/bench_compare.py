@@ -100,7 +100,6 @@ V2_DIRECT_SCALED_DOT_TUNED = {
     512:  (16, 512, 16, 256, 16),
     8192: (128, 1024, 128, 256),
     16384: (128, 512, 80, 256, 160),
-    16384: (128, 1024, 128, 256),
 }
 
 token_candidates = parse_csv_int("BENCH_TOKENS", list(V1_TUNED.keys()))
