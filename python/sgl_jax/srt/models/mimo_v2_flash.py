@@ -576,6 +576,16 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         from concurrent.futures import ThreadPoolExecutor
 
         model_path = model_config.model_path
+        # Only useful on GCSFuse (cold random reads ~400ms); skip on block-device mounts.
+        try:
+            with open("/proc/mounts") as fp:
+                ms = [ln.split() for ln in fp]
+            mp = max((m for m in ms if model_path.startswith(m[1])), key=lambda m: len(m[1]))
+            if "fuse" not in mp[2]:
+                logger.info("model_path on %s mount, skipping GCSFuse warm-up", mp[2])
+                return
+        except Exception:  # noqa: BLE001
+            pass
         st_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
         if not st_files:
             return
