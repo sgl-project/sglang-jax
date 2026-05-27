@@ -35,10 +35,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install packaging
+        run: python -m pip install --upgrade packaging
+
       - name: Validate PEP 440 version string
-        run: |
-          python -m pip install --upgrade packaging
-          python -c "from packaging.version import Version; v = Version('${{ inputs.version }}'); print('parsed:', v)"
+        run: make validate-version VERSION=${{ inputs.version }}
 
       - name: Verify HEAD is on main history
         if: ${{ ! inputs.dry_run }}
@@ -62,49 +63,14 @@ jobs:
             exit 1
           fi
 
-      - name: Build wheel (validate, do not publish)
-        env:
-          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          cd python
-          cp ../README.md ../LICENSE .
-          python -m pip install --upgrade pip build
-          python -m build
-          ls -la dist
-          test -f "dist/sglang_jax-${{ inputs.version }}-py3-none-any.whl"
-
-      - name: Smoke test wheel
-        env:
-          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          python -m venv /tmp/venv
-          /tmp/venv/bin/pip install --upgrade pip
-          /tmp/venv/bin/pip install python/dist/sglang_jax-${{ inputs.version }}-py3-none-any.whl
-          /tmp/venv/bin/python -c "import sgl_jax; print('sgl_jax version:', sgl_jax.__version__)"
-          /tmp/venv/bin/python -c "import sgl_jax; assert sgl_jax.__version__ == '${{ inputs.version }}', sgl_jax.__version__"
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker image (validate, do not push)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64
-          push: false
-          load: true
-          tags: ${{ env.IMAGE }}:validate-${{ inputs.version }}
-          build-args: |
-            SETUPTOOLS_SCM_PRETEND_VERSION=${{ inputs.version }}
+      - name: Build wheel + smoke test (make smoke-wheel)
+        run: make smoke-wheel VERSION=${{ inputs.version }}
 
-      - name: Smoke test Docker image
-        run: |
-          set -euo pipefail
-          docker run --rm "${IMAGE}:validate-${{ inputs.version }}" \
-            python -c "import sgl_jax; print('sgl_jax version:', sgl_jax.__version__); assert sgl_jax.__version__ == '${{ inputs.version }}', sgl_jax.__version__"
+      - name: Build Docker + smoke test (make smoke-docker)
+        run: make smoke-docker VERSION=${{ inputs.version }}
 
       - name: Benchmark regression check (placeholder)
         run: |

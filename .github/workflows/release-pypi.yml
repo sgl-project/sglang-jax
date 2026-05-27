@@ -29,15 +29,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Build wheel and sdist
-        env:
-          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ inputs.version }}
-        run: |
-          cd python
-          cp ../README.md ../LICENSE .
-          python -m pip install --upgrade pip build
-          python -m build
-          ls -la dist
+      - name: Install packaging
+        run: python -m pip install --upgrade packaging
+
+      - name: Build wheel and sdist (make build-wheel)
+        run: make build-wheel VERSION=${{ inputs.version }}
 
       - name: Publish to PyPI
         if: ${{ ! inputs.dry_run }}

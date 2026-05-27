@@ -16,3 +16,56 @@ push: build
 	docker tag $(IMAGE_NAME):$(IMAGE_TAG) $(REMOTE_IMAGE)
 	docker push $(REMOTE_IMAGE)
 	@echo "Pushed image: $(REMOTE_IMAGE)"
+
+# Usage:
+#   make release VERSION=0.0.3rc0      # full validation chain
+#   make build-wheel VERSION=0.0.3rc0  # just build the wheel
+#   make smoke-docker VERSION=0.0.3rc0 # build docker image + smoke test it
+
+.PHONY: release validate-version build-wheel smoke-wheel build-docker smoke-docker require-version
+
+VERSION ?=
+RELEASE_IMAGE ?= lmsysorg/sglang-jax
+WHEEL ?= python/dist/sglang_jax-$(VERSION)-py3-none-any.whl
+RELEASE_DOCKER_TAG := $(RELEASE_IMAGE):$(VERSION)
+
+require-version:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "Error: VERSION is required, e.g. make $@ VERSION=0.0.3rc0"; \
+		exit 1; \
+	fi
+
+validate-version: require-version
+	@python -c "from packaging.version import Version, InvalidVersion; \
+import sys; \
+v = Version('$(VERSION)'); \
+print(f'parsed: {v} (is_prerelease={v.is_prerelease})')"
+
+build-wheel: validate-version
+	cd python && cp -f ../README.md ../LICENSE .
+	python -m pip install --upgrade pip build
+	cd python && SETUPTOOLS_SCM_PRETEND_VERSION=$(VERSION) python -m build
+	@test -f $(WHEEL) || (echo "Error: expected $(WHEEL) was not produced"; exit 1)
+	@echo "Built $(WHEEL)"
+
+smoke-wheel: build-wheel
+	python -m pip install --force-reinstall $(WHEEL)
+	python -c "import sgl_jax; \
+print('sgl_jax version:', sgl_jax.__version__); \
+assert sgl_jax.__version__ == '$(VERSION)', sgl_jax.__version__"
+
+build-docker: validate-version
+	docker buildx build \
+		--platform linux/amd64 \
+		--build-arg SETUPTOOLS_SCM_PRETEND_VERSION=$(VERSION) \
+		--load \
+		-t $(RELEASE_DOCKER_TAG) \
+		-f Dockerfile .
+
+smoke-docker: build-docker
+	docker run --rm $(RELEASE_DOCKER_TAG) python -c "import sgl_jax; \
+print('sgl_jax version:', sgl_jax.__version__); \
+assert sgl_jax.__version__ == '$(VERSION)', sgl_jax.__version__"
+
+release: smoke-wheel smoke-docker
+	@echo "Release validation passed for $(VERSION)"
