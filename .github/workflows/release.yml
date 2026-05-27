@@ -1,9 +1,6 @@
 name: Release
 
 on:
-  push:
-    paths:
-      - ".github/workflows/release.yml"
   workflow_dispatch:
     inputs:
       version:
@@ -19,7 +16,7 @@ env:
 
 jobs:
   metadata:
-    if: github.event_name == 'workflow_dispatch' && github.repository == 'sgl-project/sglang-jax'
+    if: github.repository == 'sgl-project/sglang-jax'
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.compute.outputs.tag }}
@@ -74,14 +71,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      # TEMP(experiment): disabled while testing from feat/release-pipeline
-      # - name: Verify HEAD is on main history
-      #   run: |
-      #     set -euo pipefail
-      #     if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-      #       echo "::error::Current commit $GITHUB_SHA is not an ancestor of origin/main"
-      #       exit 1
-      #     fi
+      - name: Verify HEAD is on main history
+        run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Current commit $GITHUB_SHA is not an ancestor of origin/main"
+            exit 1
+          fi
 
       - name: Verify tag does not already exist
         run: |
