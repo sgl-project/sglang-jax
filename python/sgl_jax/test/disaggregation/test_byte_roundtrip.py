@@ -1,0 +1,522 @@
+"""Stage 1 cross-pod integration script (manual, NOT in CI).
+
+Extends the Stage 0 byte-equality harness for the Stage 1 surface:
+
+  * Event-driven sender: ``send()`` registers a ZMQ callback and the
+    receiver acks completion via ``send_done``. No more optimistic
+    SUCCESS in Stage 0 style.
+  * Path A (D2H staging via :class:`QueueHostKVPool`) vs path B
+    (direct from HBM), selectable via ``--use-d2h-staging``. Both
+    paths produce byte-equal transfers.
+  * Pipelined concurrency within each cell: P fires ``ITERATIONS``
+    senders back-to-back without waiting for individual acks, D drains
+    them all, then P collects all acks and verifies states.
+  * Pool leak check (path A): ``available_size()`` must return to the
+    initial value once every transfer in the script completes.
+
+Usage:
+
+  Pod A (prefill, path B):
+    python -m sgl_jax.test.disaggregation.test_byte_roundtrip \\
+      --role prefill --my-host $(hostname -i) --ctl-port 31000 \\
+      --transfer-port 31001 --side-channel-port 31002
+
+  Pod B (decode, path B):
+    python -m sgl_jax.test.disaggregation.test_byte_roundtrip \\
+      --role decode --my-host $(hostname -i) --remote <pod-A-ip> \\
+      --ctl-port 31000 --transfer-port 31001
+
+  For path A add ``--use-d2h-staging`` on the prefill invocation; the
+  decoder picks the path up from the control-channel handshake.
+
+Exit 0 only if all cells produce byte-equal results AND (path A only)
+the host pool ends with no leaked buffers.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import socket
+import sys
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
+
+from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
+from sgl_jax.srt.disaggregation.jax_transfer.conn import (
+    JaxTransferKVManager,
+    JaxTransferKVReceiver,
+    JaxTransferKVSender,
+    PMetadata,
+)
+from sgl_jax.srt.disaggregation.jax_transfer.zmq_notifier import (
+    ZmqPullNotifier,
+)
+from sgl_jax.srt.disaggregation.jax_transfer_wrapper import (
+    get_or_create_wrapper,
+)
+from sgl_jax.srt.mem_cache.host_kv_pool import QueueHostKVPool
+
+
+PAGE_ELEMS = 4096
+PAGE_COUNTS: Tuple[int, ...] = (1, 16, 256)
+ITERATIONS = int(os.environ.get("PD_ROUNDTRIP_ITERS", "100"))
+POOL_SIZE = int(os.environ.get("PD_POOL_SIZE", "128"))
+
+
+@dataclass(frozen=True)
+class Cell:
+    dtype_name: str
+    dtype: jnp.dtype
+    page_count: int
+
+
+def _dtypes() -> List[Tuple[str, jnp.dtype]]:
+    out: List[Tuple[str, jnp.dtype]] = [
+        ("bf16", jnp.bfloat16),
+        ("fp16", jnp.float16),
+    ]
+    fp8 = getattr(jnp, "float8_e4m3fn", None)
+    if fp8 is not None:
+        out.append(("fp8_e4m3fn", fp8))
+    else:
+        print(
+            "[warn] jnp.float8_e4m3fn not available, skipping fp8 cell",
+            flush=True,
+        )
+    return out
+
+
+def _all_cells() -> List[Cell]:
+    return [
+        Cell(name, dt, pc)
+        for name, dt in _dtypes()
+        for pc in PAGE_COUNTS
+    ]
+
+
+def _device_sharding() -> NamedSharding:
+    devices = jax.local_devices()
+    mesh = Mesh(np.asarray(devices).reshape(len(devices)), axis_names=("x",))
+    return NamedSharding(mesh, P("x"))
+
+
+def _replicated_sharding() -> NamedSharding:
+    devices = jax.local_devices()
+    mesh = Mesh(np.asarray(devices[:1]).reshape(1), axis_names=("x",))
+    return NamedSharding(mesh, P())
+
+
+def _payload_numpy(seed: int, dtype_name: str, nelem: int) -> np.ndarray:
+    import ml_dtypes
+
+    name_to_np = {
+        "bf16": ml_dtypes.bfloat16,
+        "fp16": np.float16,
+    }
+    fp8 = getattr(ml_dtypes, "float8_e4m3fn", None)
+    if fp8 is not None:
+        name_to_np["fp8_e4m3fn"] = fp8
+
+    rng = np.random.default_rng(seed)
+    raw = rng.integers(0, 200, size=(nelem,), dtype=np.int32)
+    return raw.astype(name_to_np[dtype_name])
+
+
+def _make_payload(
+    seed: int,
+    dtype_name: str,
+    dtype: jnp.dtype,
+    nelem: int,
+    sharding: NamedSharding,
+) -> jax.Array:
+    np_ref = _payload_numpy(seed, dtype_name, nelem)
+    return jax.device_put(jnp.asarray(np_ref).astype(dtype), sharding)
+
+
+def _arr_host_bytes(arr: jax.Array) -> bytes:
+    """Concatenate per-shard host buffers, slicing each to its actual
+    size to dodge the jax 0.8.1 transfer metadata bug. See
+    ``_probe_transfer_readback.py`` for the diagnostic.
+    """
+
+    n_shards = len(arr.addressable_shards)
+    shard_size = arr.shape[0] // n_shards
+    parts: List[bytes] = []
+    for i in range(n_shards):
+        sub = arr.addressable_data(i)[:shard_size]
+        parts.append(np.asarray(jax.device_get(sub)).tobytes())
+    return b"".join(parts)
+
+
+# --- control channel --------------------------------------------------------
+
+
+def _accept_one(host: str, port: int) -> socket.socket:
+    listen = socket.socket()
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind((host, port))
+    listen.listen(1)
+    print(f"[ctl] waiting for D on {host}:{port}", flush=True)
+    conn, peer = listen.accept()
+    print(f"[ctl] D connected from {peer}", flush=True)
+    listen.close()
+    return conn
+
+
+def _connect(host: str, port: int, timeout_s: float = 120.0) -> socket.socket:
+    deadline = time.perf_counter() + timeout_s
+    last_err: Exception = RuntimeError("no attempt yet")
+    while time.perf_counter() < deadline:
+        try:
+            s = socket.socket()
+            s.settimeout(10.0)
+            s.connect((host, port))
+            s.settimeout(None)
+            return s
+        except (ConnectionRefusedError, socket.timeout) as e:
+            last_err = e
+            time.sleep(1.0)
+    raise TimeoutError(
+        f"could not connect to {host}:{port} within "
+        f"{timeout_s}s: {last_err}"
+    )
+
+
+def _read_line(sock: socket.socket, buf: bytearray) -> str:
+    sock.settimeout(180.0)
+    while b"\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise RuntimeError("control channel closed mid-stream")
+        buf.extend(chunk)
+    nl = buf.index(b"\n")
+    line = bytes(buf[:nl]).decode("utf-8")
+    del buf[: nl + 1]
+    return line
+
+
+# --- prefill / decode entries ----------------------------------------------
+
+
+def _prefill(args: argparse.Namespace) -> int:
+    wrapper = get_or_create_wrapper(args.my_host, args.transfer_port)
+    wrapper.start()
+    p_notifier = ZmqPullNotifier(
+        "prefill", args.my_host, args.side_channel_port
+    )
+    p_notifier.start()
+    sharding = _device_sharding()
+
+    print(
+        f"[P] wrapper {args.my_host}:{args.transfer_port} "
+        f"side_channel {args.side_channel_port} "
+        f"use_d2h={args.use_d2h_staging} "
+        f"pool_size={args.pool_size if args.use_d2h_staging else 'n/a'}",
+        flush=True,
+    )
+
+    conn = _accept_one(args.my_host, args.ctl_port)
+    handshake = (
+        f"{args.my_host} {args.transfer_port} "
+        f"{args.side_channel_port} {int(args.use_d2h_staging)}\n"
+    )
+    conn.sendall(handshake.encode("utf-8"))
+
+    failed_cells: List[Tuple[str, str]] = []
+    rx_buf = bytearray()
+    cells = _all_cells()
+    # Path A uses replicated sharding (matches the pool's
+    # partition_spec=P()) so D2H staging does not trigger a cross-chip
+    # gather collective. Path B keeps the sharded layout for parity
+    # with Stage 0.
+    payload_sharding = (
+        _replicated_sharding() if args.use_d2h_staging else sharding
+    )
+    leak_total = 0
+
+    mesh = Mesh(
+        np.asarray(jax.local_devices()).reshape(
+            len(jax.local_devices())
+        ),
+        axis_names=("x",),
+    )
+
+    for cell in cells:
+        nelem = cell.page_count * PAGE_ELEMS
+        # Per-cell pool + mgr for path A: pool dtype must match cell
+        # dtype, otherwise the ``.at[:n].set(staged)`` scatter
+        # implicitly down-casts and breaks byte equality. Pool buffers
+        # are sized to ``nelem`` exactly so D's spec matches with no
+        # zero padding.
+        host_pool: Optional[QueueHostKVPool] = None
+        if args.use_d2h_staging:
+            host_pool = QueueHostKVPool(
+                pool_size=args.pool_size,
+                max_tokens_per_buffer=nelem,
+                layer_num=1,
+                kv_head_per_rank=1,
+                head_dim=1,
+                dtype=cell.dtype,
+                mesh=mesh,
+                partition_spec=P(),
+            )
+        mgr = JaxTransferKVManager(wrapper, p_notifier, host_pool=host_pool)
+        initial_avail = host_pool.available_size() if host_pool else 0
+
+        senders: List[Tuple[str, JaxTransferKVSender]] = []
+        # Phase 1: dispatch all ITERATIONS at once (pipelined).
+        for i in range(ITERATIONS):
+            req_id = f"{cell.dtype_name}-{cell.page_count}-{i}"
+            seed = (
+                hash((cell.dtype_name, cell.page_count, i)) & 0xFFFFFFFF
+            )
+            sender = mgr.create_sender(req_id)
+            sender.init(kv_indices=None)
+            if args.use_d2h_staging:
+                payload_flat = _make_payload(
+                    seed, cell.dtype_name, cell.dtype, nelem,
+                    payload_sharding,
+                )
+                payload_flat.block_until_ready()
+                payload = payload_flat.reshape((nelem, 1, 1, 1))
+            else:
+                payload = _make_payload(
+                    seed, cell.dtype_name, cell.dtype, nelem,
+                    payload_sharding,
+                )
+                payload.block_until_ready()
+            sender.attach_payload(
+                payload, use_d2h_staging=args.use_d2h_staging
+            )
+            sender.send()
+            line = f"{req_id} {nelem} {cell.dtype_name} {seed}\n".encode(
+                "utf-8"
+            )
+            conn.sendall(line)
+            senders.append((req_id, sender))
+
+        # Phase 2: collect D acks (one per iter), assert state SUCCESS.
+        ok_count = 0
+        cell_aborted = False
+        for req_id, sender in senders:
+            ack = _read_line(conn, rx_buf).strip()
+            if ack != "OK":
+                print(
+                    f"[P] D reported {ack!r} for {req_id} in cell "
+                    f"{cell.dtype_name}/{cell.page_count}",
+                    flush=True,
+                )
+                failed_cells.append((cell.dtype_name, ack))
+                cell_aborted = True
+                break
+            deadline = time.perf_counter() + 5.0
+            while sender.poll() != KVPoll.SUCCESS:
+                if time.perf_counter() > deadline:
+                    raise RuntimeError(
+                        f"sender {req_id} stuck at "
+                        f"{sender.poll().value} after D acked"
+                    )
+                time.sleep(0.001)
+            ok_count += 1
+        if cell_aborted:
+            break
+        if host_pool is not None:
+            leaked = initial_avail - host_pool.available_size()
+            leak_total += leaked
+            print(
+                f"[P] cell {cell.dtype_name}/{cell.page_count}: "
+                f"{ok_count}/{ITERATIONS} leak={leaked}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[P] cell {cell.dtype_name}/{cell.page_count}: "
+                f"{ok_count}/{ITERATIONS}",
+                flush=True,
+            )
+
+    conn.close()
+    p_notifier.stop()
+    failed = bool(failed_cells) or leak_total != 0
+    total = len(cells) * ITERATIONS
+    print(
+        f"[P] done: failed_cells={failed_cells} leaked_total={leak_total} "
+        f"total_target={total}",
+        flush=True,
+    )
+    return 0 if not failed else 1
+
+
+def _decode(args: argparse.Namespace) -> int:
+    print(
+        f"[D] connecting to P ctl at "
+        f"{args.remote}:{args.ctl_port}",
+        flush=True,
+    )
+    ctl = _connect(args.remote, args.ctl_port)
+    rx_buf = bytearray()
+    handshake = _read_line(ctl, rx_buf)
+    p_host, p_transfer_port, p_side_channel_port, p_use_d2h = handshake.split()
+    p_transfer_addr = f"{p_host}:{p_transfer_port}"
+    p_side_channel_port_int = int(p_side_channel_port)
+    use_d2h = bool(int(p_use_d2h))
+    print(
+        f"[D] handshake: p_transfer={p_transfer_addr} "
+        f"p_side_channel={p_host}:{p_side_channel_port_int} "
+        f"use_d2h={use_d2h}",
+        flush=True,
+    )
+
+    bind_host = args.my_host or "0.0.0.0"
+    wrapper = get_or_create_wrapper(bind_host, args.transfer_port)
+    wrapper.start()
+    d_notifier = ZmqPullNotifier(
+        "decode", bind_host, args.side_channel_port
+    )
+    d_notifier.start()
+    mgr = JaxTransferKVManager(wrapper, d_notifier)
+    sharding = _device_sharding()
+    repl_sharding = _replicated_sharding()
+    name_to_dtype = {n: dt for n, dt in _dtypes()}
+
+    cells = _all_cells()
+    expected_total = len(cells) * ITERATIONS
+    successes = 0
+    failed_cells: List[str] = []
+
+    for cell in cells:
+        if failed_cells:
+            break
+        # Phase 1: read ITERATIONS metadata lines.
+        metas: List[Tuple[str, PMetadata, int, str, int]] = []
+        for _ in range(ITERATIONS):
+            line = _read_line(ctl, rx_buf)
+            toks = line.split()
+            if len(toks) != 4:
+                raise RuntimeError(f"bad metadata line: {line!r}")
+            req_id, nelem_s, dtype_name, seed_s = toks
+            nelem = int(nelem_s)
+            seed = int(seed_s)
+            dtype = name_to_dtype[dtype_name]
+            if use_d2h:
+                # Path A: P sized the host pool buffer to ``nelem``
+                # exactly (per-cell pool), so D pulls (nelem, 1, 1, 1)
+                # with replicated sharding.
+                spec = jax.ShapeDtypeStruct(
+                    (nelem, 1, 1, 1), dtype, sharding=repl_sharding
+                )
+            else:
+                spec = jax.ShapeDtypeStruct(
+                    (nelem,), dtype, sharding=sharding
+                )
+            metas.append(
+                (
+                    req_id,
+                    PMetadata(
+                        remote_addr=p_transfer_addr,
+                        uuid=req_id,
+                        spec=spec,
+                        p_side_channel_host=p_host,
+                        p_side_channel_port=p_side_channel_port_int,
+                    ),
+                    seed,
+                    dtype_name,
+                    nelem,
+                )
+            )
+
+        # Phase 2: dispatch all receivers, drain, byte-check, ack.
+        receivers: List[
+            Tuple[str, JaxTransferKVReceiver, int, str, int]
+        ] = []
+        for req_id, meta, seed, dtype_name, nelem in metas:
+            receiver = mgr.create_receiver(req_id)
+            receiver.init(meta)
+            receivers.append((req_id, receiver, seed, dtype_name, nelem))
+
+        cell_done = 0
+        for req_id, receiver, seed, dtype_name, nelem in receivers:
+            deadline = time.perf_counter() + 180.0
+            while True:
+                state = receiver.poll()
+                if state in (KVPoll.SUCCESS, KVPoll.FAILED):
+                    break
+                if time.perf_counter() > deadline:
+                    state = KVPoll.FAILED
+                    break
+                time.sleep(0.001)
+
+            if state != KVPoll.SUCCESS:
+                ctl.sendall(b"FAIL\n")
+                failed_cells.append(req_id)
+                print(f"[D] FAIL {req_id} state={state.value}", flush=True)
+                break
+
+            arr = receiver.result
+            assert arr is not None
+            got_bytes = _arr_host_bytes(arr)
+            ref_bytes = _payload_numpy(seed, dtype_name, nelem).tobytes()
+            if got_bytes != ref_bytes:
+                ctl.sendall(b"MISMATCH\n")
+                failed_cells.append(req_id)
+                path_label = "path A" if use_d2h else "path B"
+                print(f"[D] MISMATCH {req_id} ({path_label})", flush=True)
+                break
+            ctl.sendall(b"OK\n")
+            successes += 1
+            cell_done += 1
+        print(
+            f"[D] cell {cell.dtype_name}/{cell.page_count}: "
+            f"{cell_done}/{ITERATIONS}",
+            flush=True,
+        )
+
+    ctl.close()
+    d_notifier.stop()
+    failed = bool(failed_cells)
+    print(
+        f"[D] done: {successes}/{expected_total} iters, "
+        f"failed={failed_cells}",
+        flush=True,
+    )
+    return 0 if not failed else 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--role", required=True, choices=["prefill", "decode"]
+    )
+    ap.add_argument("--my-host", default="")
+    ap.add_argument("--remote", default="")
+    ap.add_argument("--ctl-port", type=int, default=31000)
+    ap.add_argument("--transfer-port", type=int, default=31001)
+    ap.add_argument("--side-channel-port", type=int, default=9600)
+    ap.add_argument("--use-d2h-staging", action="store_true")
+    ap.add_argument("--pool-size", type=int, default=POOL_SIZE)
+    args = ap.parse_args()
+
+    print(f"[init] role={args.role} jax={jax.__version__}", flush=True)
+    print(f"[init] local_devices={jax.local_devices()}", flush=True)
+
+    if args.role == "prefill":
+        if not args.my_host:
+            print("prefill needs --my-host", file=sys.stderr)
+            return 2
+        return _prefill(args)
+    if not args.remote:
+        print("decode needs --remote", file=sys.stderr)
+        return 2
+    return _decode(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

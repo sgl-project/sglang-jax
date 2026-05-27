@@ -192,6 +192,52 @@ class ServerArgs:
     expert_distribution_recorder_buffer_size: int = 100
     expert_distribution_recorder_output_file: str | None = None
 
+    # Prefill-Decode disaggregation (Stage 1+). Declared here so the CLI
+    # surface is stable across stages; consumed by the scheduler / mixin
+    # wiring in Stage 2.
+    disaggregation_mode: str = "null"
+    disaggregation_bootstrap_url: str | None = None
+    disaggregation_bootstrap_port: int = 8998
+    disaggregation_transfer_port: int = 30001
+    # Stage 4 H-E *intended* to flip this default to True ("D2H staging
+    # ON"), but the scheduler currently constructs the JaxTransferKV
+    # manager with ``host_pool=None`` and the model-specific
+    # ``QueueHostKVPool`` is not yet wired through. Flipping the default
+    # without that wiring would crash every prefill request with
+    # ``RuntimeError("use_d2h_staging=True requires a host_pool")``.
+    # Keep the default OFF until path A is integrated end-to-end; the
+    # ServerArg + CLI flag are already H-B/H-E ready so an operator
+    # can opt in once the pool is plumbed (see runbook §8 "known
+    # limitations").
+    disaggregation_enable_d2h: bool = False
+    disaggregation_side_channel_port: int = 9600
+    disaggregation_d2h_pool_size: int = 64
+    disaggregation_d2h_max_tokens: int | None = None
+    # Stage 4 H-E: jax_transfer channel parallelism. 1 is the
+    # Stage 0 default; sweeps on v6e DCN put the knee around 4
+    # channels per pair. Set to 0/None to keep wrapper's own default.
+    disaggregation_channel_number: int = 4
+    # Stage 3 multi-host: the per-host IP this process publishes to the
+    # bootstrap server. If None, resolved via
+    # sgl_jax.srt.disaggregation.host_ip.resolve_host_ip at scheduler
+    # boot time (HOSTNAME -> socket.gethostbyname fallback chain).
+    disaggregation_host_ip: str | None = None
+    # Stage 4 H-B: timeout matrix. Each phase has a default that's
+    # generous enough to absorb a normal cross-host transfer of a few
+    # GB but short enough to clean up orphans before they pile up. Set
+    # any value to <= 0 to disable that timeout (not recommended in
+    # production).
+    disaggregation_bootstrap_timeout_seconds: float = 5.0
+    disaggregation_pull_timeout_seconds: float = 30.0
+    disaggregation_ack_timeout_seconds: float = 60.0
+    disaggregation_orphan_reaper_interval_seconds: float = 5.0
+    # Stage 4 H-C: shared-secret auth across the three PD channels
+    # (bootstrap HTTP, transfer side channel, ZMQ). The environment
+    # variable ``SGL_JAX_PD_SHARED_SECRET`` overrides this at process
+    # start. ``None`` disables auth (current default for backward
+    # compatibility; production deployments should always set it).
+    disaggregation_shared_secret: str | None = None
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -283,6 +329,76 @@ class ServerArgs:
             self.expert_balance_output_file = os.path.join(
                 "debug_outputs", f"expert_balance_{timestamp}_{os.getpid()}.csv"
             )
+
+        # Disaggregation mode validation (Stage 2).
+        valid_modes = ("null", "prefill", "decode")
+        if self.disaggregation_mode not in valid_modes:
+            raise ValueError(
+                f"--disaggregation-mode must be one of {valid_modes}, "
+                f"got {self.disaggregation_mode!r}"
+            )
+        if self.disaggregation_mode != "null":
+            if self.disaggregation_bootstrap_url is None:
+                raise ValueError(
+                    "--disaggregation-bootstrap-url is required when "
+                    "--disaggregation-mode is 'prefill' or 'decode'"
+                )
+            # Stage 4 e2e FINDING-D: the PD KV gather pattern
+            # (per-request sharded gather over the KV pool) blows
+            # up XLA's collective-buffer planner when the gather
+            # axis is large. With page_size=1 the pool axis-0 is
+            # max_total_num_tokens (~400k for an 8B model on v6e),
+            # and a single jit_reshard intermediate hits multi-GB
+            # per chip. tpu-inference (production-tested same JAX
+            # API on TPU) and sglang both run PD with
+            # page_size >= 128. Enforce that here so PD deploys
+            # don't silently fall into the OOM cliff. Operators
+            # who really want page_size < 128 should not use PD
+            # mode.
+            if self.page_size < 128:
+                raise ValueError(
+                    f"--page-size={self.page_size} is below the "
+                    f"PD minimum of 128. With smaller pages the "
+                    f"per-request sharded KV gather can OOM the "
+                    f"XLA collective planner on TPU. Set "
+                    f"--page-size to 128, 256, or 512 for PD "
+                    f"deployments (the validated bucket; see "
+                    f"docs/operations/pd_e2e_matrix.md FINDING-D)."
+                )
+            # PD-mode warmup is one-sided (the dummy warmup request
+            # has no peer counterpart), so it gets stuck and the
+            # allocator memory-leak check trips. Auto-skip unless
+            # the operator explicitly wants warmup.
+            if not self.skip_server_warmup:
+                logger.info(
+                    "Auto-enabling --skip-server-warmup because "
+                    "disaggregation_mode=%s (warmup is one-sided "
+                    "in PD mode and would deadlock).",
+                    self.disaggregation_mode,
+                )
+                self.skip_server_warmup = True
+        else:
+            # null mode ignores the PD fields; warn so a misconfigured
+            # deployment isn't silently ignored.
+            pd_overrides = [
+                ("disaggregation_bootstrap_url",
+                 self.disaggregation_bootstrap_url, None),
+                # Default for d2h flipped to True in Stage 4 H-E; the
+                # override warning compares against the current
+                # default so "user did nothing" doesn't trigger it.
+                ("disaggregation_enable_d2h",
+                 self.disaggregation_enable_d2h,
+                 ServerArgs.disaggregation_enable_d2h),
+            ]
+            non_default = [
+                name for name, value, default in pd_overrides
+                if value != default
+            ]
+            if non_default:
+                logger.warning(
+                    "--disaggregation-mode=null ignores PD options: %s",
+                    ", ".join(non_default),
+                )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -1142,6 +1258,131 @@ class ServerArgs:
             "--enable-return-routed-experts",
             action="store_true",
             help="Enable returning routed experts of each layer with responses.",
+        )
+        parser.add_argument(
+            "--disaggregation-enable-d2h",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.disaggregation_enable_d2h,
+            help="Enable D2H staging on the prefill side: KV is copied into "
+            "a pinned-host buffer before remote pull. The current "
+            "default remains OFF until QueueHostKVPool is wired "
+            "end-to-end; use --disaggregation-enable-d2h only after "
+            "path A is fully plumbed.",
+        )
+        parser.add_argument(
+            "--disaggregation-side-channel-port",
+            type=int,
+            default=ServerArgs.disaggregation_side_channel_port,
+            help="ZMQ ROUTER port the prefill side binds for D->P pull-done "
+            "notifications. The decoder connects DEALER sockets to this "
+            "port per-ack. Default 9600.",
+        )
+        parser.add_argument(
+            "--disaggregation-mode",
+            type=str,
+            default=ServerArgs.disaggregation_mode,
+            choices=["null", "prefill", "decode"],
+            help="PD role of this engine. 'null' runs the normal "
+            "scheduler unchanged. 'prefill' / 'decode' route through "
+            "the PD-aware event loop and require --disaggregation-"
+            "bootstrap-url.",
+        )
+        parser.add_argument(
+            "--disaggregation-bootstrap-url",
+            type=str,
+            default=ServerArgs.disaggregation_bootstrap_url,
+            help="HTTP base URL of the central bootstrap server, e.g. "
+            "http://10.0.0.1:8998. Required when --disaggregation-"
+            "mode != null.",
+        )
+        parser.add_argument(
+            "--disaggregation-bootstrap-port",
+            type=int,
+            default=ServerArgs.disaggregation_bootstrap_port,
+            help="When the engine ALSO hosts the bootstrap server "
+            "(single-node deployments), this is the port it binds.",
+        )
+        parser.add_argument(
+            "--disaggregation-transfer-port",
+            type=int,
+            default=ServerArgs.disaggregation_transfer_port,
+            help="JaxTransferWrapper port the prefill side binds. "
+            "Reported to the bootstrap server on register.",
+        )
+        parser.add_argument(
+            "--disaggregation-d2h-pool-size",
+            type=int,
+            default=ServerArgs.disaggregation_d2h_pool_size,
+            help="QueueHostKVPool buffer count (path A only). Default 64.",
+        )
+        parser.add_argument(
+            "--disaggregation-d2h-max-tokens",
+            type=int,
+            default=ServerArgs.disaggregation_d2h_max_tokens,
+            help="Per-buffer token capacity for QueueHostKVPool. "
+            "Defaults to max_total_num_tokens / pool_size at engine "
+            "init time.",
+        )
+        parser.add_argument(
+            "--disaggregation-host-ip",
+            type=str,
+            default=ServerArgs.disaggregation_host_ip,
+            help="Stage 3 multi-host: the per-host IP this process "
+            "publishes to the bootstrap server (so the remote pull "
+            "goes over DCN). If omitted, resolved via $HOSTNAME -> "
+            "socket.gethostbyname fallback. Reject bind addresses "
+            "(0.0.0.0, 127.0.0.1).",
+        )
+        parser.add_argument(
+            "--disaggregation-bootstrap-timeout-seconds",
+            type=float,
+            default=ServerArgs.disaggregation_bootstrap_timeout_seconds,
+            help="Stage 4 H-B: bootstrap-server query timeout. <=0 to "
+            "disable.",
+        )
+        parser.add_argument(
+            "--disaggregation-pull-timeout-seconds",
+            type=float,
+            default=ServerArgs.disaggregation_pull_timeout_seconds,
+            help="Stage 4 H-B: decode-side pull timeout. A receiver "
+            "stuck in TRANSFERRING longer than this is reaped to "
+            "FAILED. <=0 to disable.",
+        )
+        parser.add_argument(
+            "--disaggregation-ack-timeout-seconds",
+            type=float,
+            default=ServerArgs.disaggregation_ack_timeout_seconds,
+            help="Stage 4 H-B: prefill-side ack timeout. A sender "
+            "whose ack is not received within this window is reaped "
+            "to FAILED and its host buffer / wrapper ref are "
+            "released. <=0 to disable.",
+        )
+        parser.add_argument(
+            "--disaggregation-orphan-reaper-interval-seconds",
+            type=float,
+            default=ServerArgs.disaggregation_orphan_reaper_interval_seconds,
+            help="Stage 4 H-B: how often the background reaper "
+            "scans for orphan senders/receivers.",
+        )
+        parser.add_argument(
+            "--disaggregation-shared-secret",
+            type=str,
+            default=ServerArgs.disaggregation_shared_secret,
+            help="Stage 4 H-C: shared secret applied to all three "
+            "PD channels (bootstrap HTTP, transfer pull side-channel, "
+            "ZMQ ack channel). The environment variable "
+            "SGL_JAX_PD_SHARED_SECRET overrides this if both are "
+            "set. None disables auth (default for backward "
+            "compatibility; production should always set it).",
+        )
+        parser.add_argument(
+            "--disaggregation-channel-number",
+            type=int,
+            default=ServerArgs.disaggregation_channel_number,
+            help="Stage 4 H-E: parallel jax_transfer channels per "
+            "(P, D) pair. The Stage 0 default of 1 leaves DCN "
+            "throughput on the table; 4 is the validated knee on "
+            "v6e — bump for higher-BW interconnects.",
         )
 
     @classmethod
