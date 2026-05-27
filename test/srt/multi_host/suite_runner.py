@@ -240,6 +240,7 @@ SUITES: dict[str, MultiHostSuite] = {
                             "max_tokens": 131072,
                             "chat_template_kwargs": {"enable_thinking": True},
                         },
+                        score_threshold=0.94,
                     ),
                     AccuracyCase(
                         name="mimo-flash-aime25",
@@ -252,6 +253,7 @@ SUITES: dict[str, MultiHostSuite] = {
                             "max_tokens": 131072,
                             "chat_template_kwargs": {"enable_thinking": True},
                         },
+                        score_threshold=0.85,
                     ),
                 ],
             ),

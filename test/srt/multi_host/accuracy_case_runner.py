@@ -52,14 +52,33 @@ def run_accuracy_case(case: AccuracyCase, profile: LaunchProfile) -> None:
             "target": profile.target,
             "dataset": case.dataset,
             "model_id": case.model_id,
+            "score_threshold": case.score_threshold,
             **(metrics if isinstance(metrics, dict) else {}),
         }
         out_path = Path(results_dir) / f"{case.name}.json"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(summary, indent=2, sort_keys=True, default=float))
 
-    print(
-        f"[multi-host-suite] Accuracy case {case.name} finished "
-        "(warn-only mode, accuracy not gated)",
-        flush=True,
-    )
+    score = metrics.get("score") if isinstance(metrics, dict) else None
+    if case.score_threshold is not None:
+        if score is None:
+            raise RuntimeError(
+                f"Accuracy case {case.name} produced no score; cannot evaluate "
+                f"against threshold={case.score_threshold}"
+            )
+        if score < case.score_threshold:
+            raise RuntimeError(
+                f"Accuracy case {case.name} score={score:.4f} below "
+                f"threshold={case.score_threshold:.4f}"
+            )
+        print(
+            f"[multi-host-suite] Accuracy case {case.name} passed: "
+            f"score={score:.4f} >= threshold={case.score_threshold:.4f}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[multi-host-suite] Accuracy case {case.name} finished "
+            f"(no threshold set, score={score})",
+            flush=True,
+        )
