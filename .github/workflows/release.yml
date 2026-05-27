@@ -123,15 +123,6 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_TOKEN }}
 
-      - name: Create and push annotated tag
-        run: |
-          set -euo pipefail
-          TAG="${{ needs.metadata.outputs.tag }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "${TAG}" -m "sglang-jax ${TAG}"
-          git push origin "${TAG}"
-
       - name: Push Docker image
         run: |
           set -euo pipefail
@@ -149,6 +140,15 @@ jobs:
           packages-dir: python/dist
           password: ${{ secrets.PYPI_TOKEN }}
           skip-existing: true
+
+      - name: Create and push annotated tag
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.metadata.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "sglang-jax ${TAG}"
+          git push origin "${TAG}"
 
   github-release:
     needs: [metadata, release]
