@@ -1,6 +1,9 @@
 name: Release
 
 on:
+  push:
+    paths:
+      - ".github/workflows/release.yml"
   workflow_dispatch:
     inputs:
       version:
@@ -16,7 +19,7 @@ env:
 
 jobs:
   metadata:
-    if: github.repository == 'sgl-project/sglang-jax'
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'sgl-project/sglang-jax'
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.compute.outputs.tag }}
