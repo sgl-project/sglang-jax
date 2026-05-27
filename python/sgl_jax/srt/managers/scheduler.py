@@ -162,6 +162,15 @@ class Scheduler(
         ):
             jax.config.update("jax_compilation_cache_dir", "")
             jit_cache_dir = None
+            # jax.config.update alone does not take effect once the
+            # compilation_cache module's _cache_initialized flag is set
+            # by an earlier sibling scheduler in the same process; that
+            # flag is one-shot. cc.reset_cache() is the only public API
+            # that clears it, forcing the next cache lookup to re-read
+            # the (now-empty) cache_dir config and stay disabled.
+            from jax.experimental.compilation_cache import compilation_cache as cc
+
+            cc.reset_cache()
         if jit_cache_dir is not None:
             jax.config.update("jax_compilation_cache_dir", jit_cache_dir)
             jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
