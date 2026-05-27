@@ -30,9 +30,14 @@ on:
         default: "default"
         type: string
       bucket_name:
-        description: "GCS bucket mounted at /models for model cache."
+        description: "GCS bucket mounted at /observability for results."
         required: false
-        default: "model-storage-sglang"
+        default: "observability-storage-sglang"
+        type: string
+      model_pvc:
+        description: "PersistentVolumeClaim providing /models. Mount options come from the PV."
+        required: false
+        default: "inference-model-storage-poc-tpu-hns-pvc"
         type: string
       service_account_name:
         description: "Kubernetes service account for GCSFuse access."
@@ -68,7 +73,11 @@ on:
       bucket_name:
         required: false
         type: string
-        default: "model-storage-sglang"
+        default: "observability-storage-sglang"
+      model_pvc:
+        required: false
+        type: string
+        default: "inference-model-storage-poc-tpu-hns-pvc"
       service_account_name:
         required: false
         type: string
@@ -97,7 +106,8 @@ jobs:
       SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
       NODE_POOL: ${{ inputs.node_pool || vars.GKE_NODE_POOL || 'v6e-4x4-on-demand-np' }}
       NAMESPACE: ${{ inputs.namespace || 'default' }}
-      BUCKET_NAME: ${{ inputs.bucket_name || 'model-storage-sglang' }}
+      BUCKET_NAME: ${{ inputs.bucket_name || 'observability-storage-sglang' }}
+      MODEL_PVC: ${{ inputs.model_pvc || 'inference-model-storage-poc-tpu-hns-pvc' }}
       K8S_SERVICE_ACCOUNT: ${{ inputs.service_account_name || vars.GKE_SERVICE_ACCOUNT || 'default' }}
       REPO_REF: ${{ inputs.repo_ref || github.sha }}
       WORKLOAD_NAME: gke-run-test-caces-${{ github.run_id }}
@@ -108,7 +118,7 @@ jobs:
           set -euo pipefail
 
           missing=0
-          for name in PROJECT_ID CLUSTER_NAME CLUSTER_LOCATION WORKLOAD_IDENTITY_PROVIDER NODE_POOL NAMESPACE BUCKET_NAME K8S_SERVICE_ACCOUNT; do
+          for name in PROJECT_ID CLUSTER_NAME CLUSTER_LOCATION WORKLOAD_IDENTITY_PROVIDER NODE_POOL NAMESPACE BUCKET_NAME MODEL_PVC K8S_SERVICE_ACCOUNT; do
             if [[ -z "${!name}" ]]; then
               echo "::error::${name} is required. Set the workflow input or the matching repository variable."
               missing=1
@@ -125,6 +135,7 @@ jobs:
           echo "node_pool=${NODE_POOL}"
           echo "namespace=${NAMESPACE}"
           echo "bucket=${BUCKET_NAME}"
+          echo "model_pvc=${MODEL_PVC}"
           echo "repo_ref=${REPO_REF}"
 
       - name: Authenticate to Google Cloud
@@ -361,19 +372,17 @@ jobs:
                 - name: jax-cache
                   emptyDir: {}
                 - name: gke-gcsfuse-cache
-                  emptyDir: {}
+                  emptyDir:
+                    medium: Memory
                 - name: model-storage
-                  csi:
-                    driver: gcsfuse.csi.storage.gke.io
+                  persistentVolumeClaim:
+                    claimName: ${MODEL_PVC}
                     readOnly: true
-                    volumeAttributes:
-                      bucketName: ${BUCKET_NAME}
-                      mountOptions: implicit-dirs,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:-1,metadata-cache:type-cache-max-size-mb:-1,file-cache:max-size-mb:0,file-system:kernel-list-cache-ttl-secs:-1,read_ahead_kb=1024
                 - name: observability-storage
                   csi:
                     driver: gcsfuse.csi.storage.gke.io
                     volumeAttributes:
-                      bucketName: observability-storage-sglang
+                      bucketName: ${BUCKET_NAME}
                       mountOptions: implicit-dirs
           EOF
 

@@ -18,7 +18,7 @@ server_args:
   - --dtype
   - bfloat16
   - --mem-fraction-static
-  - "0.95"
+  - "0.92"
   - --swa-full-tokens-ratio
   - "0.2"
   - --skip-server-warmup
