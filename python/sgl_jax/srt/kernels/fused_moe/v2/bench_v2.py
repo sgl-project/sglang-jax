@@ -842,6 +842,7 @@ if use_fp8:
             amax = jnp.max(jnp.abs(w_f32), axis=1, keepdims=True)
             scale = jnp.maximum(amax / 448.0, jnp.float32(1e-12))
             w_q = (w_f32 / scale).astype(jnp.float8_e4m3fn)
+            scale = scale[:, :, None, :]  # (E, 1, N) -> (E, 1, 1, N)
             return w_q, scale.astype(jnp.float32)
     else:
         @jax.jit
