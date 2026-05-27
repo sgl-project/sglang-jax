@@ -598,10 +598,8 @@ class Grok1Attention(nnx.Module):
         attn_output = attn_ret[0] if isinstance(attn_ret, tuple) else attn_ret
 
         # Project output
-        o_target = (
-            NamedSharding(self.mesh, P(("data", "tensor"), None))
-            if self.enable_sequence_parallel
-            else NamedSharding(self.mesh, P("data", None))
+        o_target = make_reduce_sharding(
+            attn_output, self.mesh, enable_sp=self.enable_sequence_parallel
         )
         output, _ = self.o_proj(attn_output, out_sharding=o_target)
 
