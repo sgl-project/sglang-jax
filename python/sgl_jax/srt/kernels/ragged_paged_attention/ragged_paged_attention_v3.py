@@ -1996,6 +1996,7 @@ def ragged_paged_attention(
                 head_dim,
                 page_size,
                 max_num_tokens,
+                sliding_window=sliding_window,
             )
             if tuned is not None:
                 block_sizes = tuned

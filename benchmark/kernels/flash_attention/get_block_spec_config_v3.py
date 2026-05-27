@@ -230,6 +230,7 @@ def _benchmark_one(
     block_sizes,
     max_context_len,
     tries: int,
+    sliding_window: int | None = None,
 ):
     inputs, rpa_case, chunk_prefill_size = _make_inputs(
         stage,
@@ -275,6 +276,7 @@ def _benchmark_one(
             custom_mask=None,
             causal=1,
             sm_scale=sm_scale,
+            sliding_window=sliding_window,
             chunk_prefill_size=chunk_prefill_size,
             vmem_limit_bytes=get_vmem_limit(),
             **block_kwargs,
@@ -324,10 +326,13 @@ def _heuristic_candidate(
     max_num_tokens: int,
     max_context_len: int,
     dtype=jnp.bfloat16,
+    sliding_window: int | None = None,
 ) -> tuple[int, int, int, int]:
     """Return the (bq, bkv, bq_csz, bkv_csz) tuple the v3 heuristic would pick.
 
     This is the baseline we must beat to be worth writing into the tuned table.
+    sliding_window flows through so the heuristic's SWA branch is exercised
+    when applicable (DECODE case picks bkv = sliding_window after page-align).
     """
     from sgl_jax.srt.utils import cdiv
 
@@ -345,6 +350,7 @@ def _heuristic_candidate(
         pages_per_seq,
         case=_STAGE_TO_RPA_CASE[stage],
         vmem_limit_bytes=get_vmem_limit(),
+        sliding_window=sliding_window,
     )
     return (block["bq_sz"], block["bkv_sz"], block["bq_csz"], block["bkv_csz"])
 
@@ -361,6 +367,7 @@ def sweep(
     dtype=jnp.bfloat16,
     tries: int = 1,
     vmem_limit_bytes: int | None = None,
+    sliding_window: int | None = None,
 ):
     """Returns (best_4tuple, best_time, heuristic_4tuple, heuristic_time)."""
     kv_packing = get_dtype_packing(dtype)
@@ -393,6 +400,7 @@ def sweep(
         max_num_tokens,
         max_context_len,
         dtype,
+        sliding_window=sliding_window,
     )
     # Make sure the heuristic point is benchmarked even if not in grid
     # or filtered out (heuristic was already vmem-shrunk).
@@ -415,6 +423,7 @@ def sweep(
                 bs,
                 max_context_len,
                 tries,
+                sliding_window=sliding_window,
             )
         except Exception as e:  # noqa: BLE001
             # The heuristic candidate is the production baseline; if even it
@@ -523,10 +532,23 @@ def _parse_shard(s: str) -> tuple[int, int]:
     return rank, total
 
 
-def _simplified_key_for_table(stage: str, q_h: int, kv_h: int, hd: int, ps: int, mnt: int) -> tuple:
-    """Match the normalization done by tuned_block_sizes.get_simplified_key."""
+def _simplified_key_for_table(
+    stage: str,
+    q_h: int,
+    kv_h: int,
+    hd: int,
+    ps: int,
+    mnt: int,
+    sliding_window: int | None = None,
+) -> tuple:
+    """Match the normalization done by tuned_block_sizes_v3.get_tuned_block_sizes_v3.
+
+    sliding_window is part of the key (None for full attention). SWA layers
+    need their own entries because bkv≈sliding_window is usually optimal.
+    """
     return (
         stage,
+        sliding_window,
         "bfloat16",
         "bfloat16",
         next_power_of_2(q_h),
@@ -579,6 +601,16 @@ def main():
     parser.add_argument("--max-context-len", type=int, default=40960)
     parser.add_argument("--max-kv-cache-tokens", type=int, default=600000)
     parser.add_argument(
+        "--sliding-window",
+        type=int,
+        default=0,
+        help=(
+            "0 = full attention (None). Positive int = tune SWA workload "
+            "with that sliding-window size. Emitted entries are bucketed by "
+            "sliding_window so SWA layers won't hit non-SWA entries."
+        ),
+    )
+    parser.add_argument(
         "--shard",
         default="",
         help=(
@@ -621,6 +653,7 @@ def main():
     )
 
     rows = []
+    sw_arg = args.sliding_window if args.sliding_window > 0 else None
     for stage, ps, hd, q_h, kv_h, mnt in my_work:
         # Outer-level SMEM prune: scalar_prefetches (page_indices dominates)
         # must fit v7x's 1MB SMEM. Independent of block-config choice.
@@ -644,6 +677,7 @@ def main():
                 args.max_kv_cache_tokens,
                 tries=args.tries,
                 vmem_limit_bytes=args.vmem_limit_bytes or None,
+                sliding_window=sw_arg,
             )
         except Exception as e:  # noqa: BLE001
             print(f"# SKIP stage={stage} ps={ps} q={q_h} kv={kv_h} hd={hd} mnt={mnt}: {e}")
@@ -658,7 +692,7 @@ def main():
             )
             continue
         delta_pct = (heur_t - best_t) / heur_t * 100.0
-        table_key = _simplified_key_for_table(stage, q_h, kv_h, hd, ps, mnt)
+        table_key = _simplified_key_for_table(stage, q_h, kv_h, hd, ps, mnt, sliding_window=sw_arg)
         rows.append((table_key, best, best_t, heur, heur_t, delta_pct))
         win = "WIN " if delta_pct >= args.write_threshold_pct else "skip"
         print(
