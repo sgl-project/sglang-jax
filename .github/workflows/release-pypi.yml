@@ -7,11 +7,6 @@ on:
         description: "Version string without v prefix (e.g. 0.0.3, 0.0.3rc0, 0.0.3.post1)"
         required: true
         type: string
-      dry_run:
-        description: "If true, build the wheel but do not publish to PyPI"
-        required: false
-        default: false
-        type: boolean
 
 jobs:
   publish:
@@ -36,16 +31,8 @@ jobs:
         run: make build-wheel VERSION=${{ inputs.version }}
 
       - name: Publish to PyPI
-        if: ${{ ! inputs.dry_run }}
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: python/dist
           password: ${{ secrets.PYPI_TOKEN }}
           skip-existing: true
-
-      - name: Dry-run notice
-        if: ${{ inputs.dry_run }}
-        run: |
-          echo "::notice::Dry-run mode: built wheel but skipped PyPI upload."
-          echo "Built artifacts in python/dist:" >> "$GITHUB_STEP_SUMMARY"
-          ls python/dist >> "$GITHUB_STEP_SUMMARY"

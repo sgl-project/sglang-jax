@@ -7,14 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to re-publish (e.g. v0.0.3rc0). Use any plausible tag name in dry-run mode."
+        description: "Existing tag to re-publish (e.g. v0.0.3rc0)."
         required: true
         type: string
-      dry_run:
-        description: "If true, build artifacts but skip PyPI/Docker publish and GitHub Release creation"
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: write
@@ -28,7 +23,6 @@ jobs:
       version: ${{ steps.compute.outputs.version }}
       is_prerelease: ${{ steps.compute.outputs.is_prerelease }}
       update_latest: ${{ steps.compute.outputs.update_latest }}
-      dry_run: ${{ steps.compute.outputs.dry_run }}
     steps:
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -44,10 +38,8 @@ jobs:
           set -euo pipefail
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             TAG="${{ inputs.tag }}"
-            DRY_RUN="${{ inputs.dry_run }}"
           else
             TAG="${GITHUB_REF_NAME}"
-            DRY_RUN="false"
           fi
           if [[ ! "${TAG}" =~ ^v.+ ]]; then
             echo "::error::Tag '${TAG}' does not start with 'v'"
@@ -77,7 +69,6 @@ jobs:
             echo "version=${VERSION}"
             echo "is_prerelease=${IS_PRERELEASE}"
             echo "update_latest=${UPDATE_LATEST}"
-            echo "dry_run=${DRY_RUN}"
           } >> "$GITHUB_OUTPUT"
 
   publish-pypi:
@@ -86,7 +77,6 @@ jobs:
     secrets: inherit
     with:
       version: ${{ needs.metadata.outputs.version }}
-      dry_run: ${{ needs.metadata.outputs.dry_run == 'true' }}
 
   publish-docker:
     needs: metadata
@@ -95,7 +85,6 @@ jobs:
     with:
       version: ${{ needs.metadata.outputs.version }}
       update_latest: ${{ needs.metadata.outputs.update_latest == 'true' }}
-      dry_run: ${{ needs.metadata.outputs.dry_run == 'true' }}
 
   github-release:
     needs: [metadata, publish-pypi, publish-docker]
@@ -106,16 +95,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ needs.metadata.outputs.dry_run == 'true' && github.ref || needs.metadata.outputs.tag }}
-
-      - name: Dry-run notice
-        if: ${{ needs.metadata.outputs.dry_run == 'true' }}
-        run: |
-          echo "::notice::Dry-run mode: GitHub Release will NOT be created."
-          echo "Would create release for ${{ needs.metadata.outputs.tag }} (prerelease=${{ needs.metadata.outputs.is_prerelease }})." >> "$GITHUB_STEP_SUMMARY"
+          ref: ${{ needs.metadata.outputs.tag }}
 
       - name: Create GitHub Release
-        if: ${{ needs.metadata.outputs.dry_run != 'true' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.metadata.outputs.tag }}

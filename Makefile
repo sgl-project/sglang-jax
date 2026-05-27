@@ -1,28 +1,8 @@
-IMAGE_NAME ?= sglang-jax
-TIMESTAMP := $(shell date +%Y%m%d-%H%M%S)
-USERNAME := $(shell whoami)
-IMAGE_TAG := $(TIMESTAMP)-$(USERNAME)
-
-REGISTRY := asia-northeast1-docker.pkg.dev/tpu-service-473302/sglang-project
-REMOTE_IMAGE := $(REGISTRY)/$(IMAGE_NAME):$(IMAGE_TAG)
-
-.PHONY: build push
-
-build:
-	docker build --platform linux/amd64 -t $(IMAGE_NAME):$(IMAGE_TAG) .
-	@echo "Built image: $(IMAGE_NAME):$(IMAGE_TAG)"
-
-push: build
-	docker tag $(IMAGE_NAME):$(IMAGE_TAG) $(REMOTE_IMAGE)
-	docker push $(REMOTE_IMAGE)
-	@echo "Pushed image: $(REMOTE_IMAGE)"
-
 # Usage:
-#   make release VERSION=0.0.3rc0      # full validation chain
-#   make build-wheel VERSION=0.0.3rc0  # just build the wheel
-#   make smoke-docker VERSION=0.0.3rc0 # build docker image + smoke test it
+#   make build VERSION=0.0.3rc0  # build wheel + docker image (no tests)
+#   make test  VERSION=0.0.3rc0  # smoke-test the built wheel + image
 
-.PHONY: release validate-version build-wheel smoke-wheel build-docker smoke-docker require-version
+.PHONY: build test validate-version build-wheel smoke-wheel build-docker smoke-docker require-version
 
 VERSION ?=
 RELEASE_IMAGE ?= lmsysorg/sglang-jax
@@ -48,12 +28,6 @@ build-wheel: validate-version
 	@test -f $(WHEEL) || (echo "Error: expected $(WHEEL) was not produced"; exit 1)
 	@echo "Built $(WHEEL)"
 
-smoke-wheel: build-wheel
-	python -m pip install --force-reinstall $(WHEEL)
-	python -c "import sgl_jax; \
-print('sgl_jax version:', sgl_jax.__version__); \
-assert sgl_jax.__version__ == '$(VERSION)', sgl_jax.__version__"
-
 build-docker: validate-version
 	docker buildx build \
 		--platform linux/amd64 \
@@ -62,10 +36,19 @@ build-docker: validate-version
 		-t $(RELEASE_DOCKER_TAG) \
 		-f Dockerfile .
 
-smoke-docker: build-docker
+smoke-wheel: validate-version
+	python -m pip install --force-reinstall $(WHEEL)
+	python -c "import sgl_jax; \
+print('sgl_jax version:', sgl_jax.__version__); \
+assert sgl_jax.__version__ == '$(VERSION)', sgl_jax.__version__"
+
+smoke-docker: validate-version
 	docker run --rm $(RELEASE_DOCKER_TAG) python -c "import sgl_jax; \
 print('sgl_jax version:', sgl_jax.__version__); \
 assert sgl_jax.__version__ == '$(VERSION)', sgl_jax.__version__"
 
-release: smoke-wheel smoke-docker
-	@echo "Release validation passed for $(VERSION)"
+build: build-wheel build-docker
+	@echo "Built wheel and docker image for $(VERSION)"
+
+test: smoke-wheel smoke-docker
+	@echo "Smoke tests passed for $(VERSION)"
