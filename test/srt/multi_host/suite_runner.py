@@ -223,8 +223,8 @@ def _resolve_launch_profile(run: ModelRun, base_dir: Path) -> ModelRun:
 
 # Explicit suite registry. To add a new suite: insert a new entry below.
 SUITES: dict[str, MultiHostSuite] = {
-    "mimo-flash-pref-test": MultiHostSuite(
-        name="mimo-flash-pref-test",
+    "mimo-flash-accuracy-nightly-test": MultiHostSuite(
+        name="mimo-flash-accuracy-nightly-test",
         runs=[
             ModelRun(
                 launch_profile="launch_profiles/mimo-flash-v6e-4x4.yaml",
