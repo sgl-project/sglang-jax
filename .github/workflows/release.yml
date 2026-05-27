@@ -1,18 +1,18 @@
-name: Release (Publish Artifacts)
+name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Existing tag to re-publish (e.g. v0.0.3rc0)."
+      version:
+        description: "Version string without v prefix (e.g. 0.0.3, 0.0.3rc0, 0.0.3.post1)"
         required: true
         type: string
 
 permissions:
   contents: write
+
+env:
+  IMAGE: lmsysorg/sglang-jax
 
 jobs:
   metadata:
@@ -32,22 +32,12 @@ jobs:
       - name: Install packaging
         run: python -m pip install --upgrade packaging
 
-      - name: Compute tag / version / flags
+      - name: Compute version metadata
         id: compute
         run: |
           set -euo pipefail
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            TAG="${{ inputs.tag }}"
-          else
-            TAG="${GITHUB_REF_NAME}"
-          fi
-          if [[ ! "${TAG}" =~ ^v.+ ]]; then
-            echo "::error::Tag '${TAG}' does not start with 'v'"
-            exit 1
-          fi
-          VERSION="${TAG#v}"
-          # PEP 440 validation + prerelease detection.
-          # Covers aN / bN / rcN / .devN as prereleases; .postN is a post-release (not pre).
+          VERSION="${{ inputs.version }}"
+          TAG="v${VERSION}"
           IS_PRERELEASE="$(VERSION="${VERSION}" python -c '
           import os, sys
           from packaging.version import Version, InvalidVersion
@@ -71,20 +61,148 @@ jobs:
             echo "update_latest=${UPDATE_LATEST}"
           } >> "$GITHUB_OUTPUT"
 
-  publish-pypi:
+  build:
     needs: metadata
-    uses: ./.github/workflows/release-pypi.yml
-    secrets: inherit
-    with:
-      version: ${{ needs.metadata.outputs.version }}
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify HEAD is on main history
+        run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Current commit $GITHUB_SHA is not an ancestor of origin/main"
+            exit 1
+          fi
+
+      - name: Verify tag does not already exist
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.metadata.outputs.tag }}"
+          if git rev-parse --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists locally"
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists on origin"
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install packaging
+        run: python -m pip install --upgrade packaging
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build wheel + Docker image
+        run: make build VERSION=${{ needs.metadata.outputs.version }}
+
+      - name: Smoke-test wheel + Docker image
+        run: make test VERSION=${{ needs.metadata.outputs.version }}
+
+      - name: Save Docker image as tar.gz
+        run: |
+          set -euo pipefail
+          docker save "${IMAGE}:${{ needs.metadata.outputs.version }}" \
+            | gzip > /tmp/image.tar.gz
+          ls -lh /tmp/image.tar.gz
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-dist
+          path: python/dist/*
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/image.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Benchmark regression check (placeholder)
+        run: |
+          echo "TODO: implement benchmark regression check on TPU runners"
+
+  tag:
+    needs: [metadata, build]
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create and push annotated tag
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.metadata.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "sglang-jax ${TAG}"
+          git push origin "${TAG}"
+
+  publish-pypi:
+    needs: [metadata, tag]
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-dist
+          path: python/dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python/dist
+          password: ${{ secrets.PYPI_TOKEN }}
+          skip-existing: true
 
   publish-docker:
-    needs: metadata
-    uses: ./.github/workflows/release-docker.yml
-    secrets: inherit
-    with:
-      version: ${{ needs.metadata.outputs.version }}
-      update_latest: ${{ needs.metadata.outputs.update_latest == 'true' }}
+    needs: [metadata, tag]
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Load Docker image
+        run: docker load < /tmp/image.tar.gz
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Push image
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.metadata.outputs.version }}"
+          docker tag "${IMAGE}:${VERSION}" "${IMAGE}:v${VERSION}"
+          docker push "${IMAGE}:v${VERSION}"
+          if [[ "${{ needs.metadata.outputs.update_latest }}" == "true" ]]; then
+            docker tag "${IMAGE}:${VERSION}" "${IMAGE}:latest"
+            docker push "${IMAGE}:latest"
+          fi
 
   github-release:
     needs: [metadata, publish-pypi, publish-docker]
