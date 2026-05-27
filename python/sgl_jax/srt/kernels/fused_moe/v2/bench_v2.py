@@ -234,7 +234,8 @@ warmup = int(os.environ.get("BENCH_WARMUP", "2"))
 iters = int(os.environ.get("BENCH_ITERS", "5"))
 check_correctness = os.environ.get("BENCH_CHECK", "0") == "1"
 use_fp8 = os.environ.get("BENCH_FP8", "0") == "1"
-quant_block_k = int(os.environ.get("BENCH_QBK", "128"))
+_qbk_str = os.environ.get("BENCH_QBK", "128")
+quant_block_k = None if _qbk_str.lower() == "none" else int(_qbk_str)
 tune_mode = os.environ.get("BENCH_TUNE", "0") == "1"
 use_wall = os.environ.get("BENCH_WALL", "0") == "1"
 use_split = os.environ.get("BENCH_SPLIT", "0") == "1"
@@ -533,9 +534,11 @@ def _estimate_vmem_bytes_v2(
     b_w3_scale = 0
     b_w2_scale = 0
     if use_fp8:
-        b_w1_scale = 2 * t_packing * (h_per_t // quant_block_k) * bf * 4
+        _n_sg = 1 if quant_block_k is None else h_per_t // quant_block_k
+        _n_sg2 = 1 if quant_block_k is None else bf // quant_block_k
+        b_w1_scale = 2 * t_packing * _n_sg * bf * 4
         b_w3_scale = b_w1_scale
-        b_w2_scale = 2 * t_packing * (bf // quant_block_k) * h_per_t * 4
+        b_w2_scale = 2 * t_packing * _n_sg2 * h_per_t * 4
 
     # Dequant scratch (fp8 + not direct_scaled_dot)
     b_w1_dq = 0
@@ -824,22 +827,39 @@ qbk_arg = None
 if use_fp8:
     log(f"quantizing weights to fp8 (quant_block_k={quant_block_k})...")
 
-    @jax.jit
-    @jax.shard_map(
-        mesh=mesh,
-        in_specs=(P(("data", "tensor")),),
-        out_specs=(P(("data", "tensor")), P(("data", "tensor"))),
-        check_vma=False,
-    )
-    def quantize_shard_map(w):
-        local_w = w
-        E_loc, K_dim, N_dim = local_w.shape
-        w_f32 = local_w.astype(jnp.float32).reshape(E_loc, K_dim // quant_block_k, quant_block_k, N_dim)
-        amax = jnp.max(jnp.abs(w_f32), axis=2, keepdims=True)
-        scale = jnp.maximum(amax / 448.0, jnp.float32(1e-12))
-        w_q = (w_f32 / scale).astype(jnp.float8_e4m3fn)
-        w_q = w_q.reshape(E_loc, K_dim, N_dim)
-        return w_q, scale.astype(jnp.float32)
+    if quant_block_k is None:
+        @jax.jit
+        @jax.shard_map(
+            mesh=mesh,
+            in_specs=(P(("data", "tensor")),),
+            out_specs=(P(("data", "tensor")), P(("data", "tensor"))),
+            check_vma=False,
+        )
+        def quantize_shard_map(w):
+            local_w = w
+            E_loc, K_dim, N_dim = local_w.shape
+            w_f32 = local_w.astype(jnp.float32)
+            amax = jnp.max(jnp.abs(w_f32), axis=1, keepdims=True)
+            scale = jnp.maximum(amax / 448.0, jnp.float32(1e-12))
+            w_q = (w_f32 / scale).astype(jnp.float8_e4m3fn)
+            return w_q, scale.astype(jnp.float32)
+    else:
+        @jax.jit
+        @jax.shard_map(
+            mesh=mesh,
+            in_specs=(P(("data", "tensor")),),
+            out_specs=(P(("data", "tensor")), P(("data", "tensor"))),
+            check_vma=False,
+        )
+        def quantize_shard_map(w):
+            local_w = w
+            E_loc, K_dim, N_dim = local_w.shape
+            w_f32 = local_w.astype(jnp.float32).reshape(E_loc, K_dim // quant_block_k, quant_block_k, N_dim)
+            amax = jnp.max(jnp.abs(w_f32), axis=2, keepdims=True)
+            scale = jnp.maximum(amax / 448.0, jnp.float32(1e-12))
+            w_q = (w_f32 / scale).astype(jnp.float8_e4m3fn)
+            w_q = w_q.reshape(E_loc, K_dim, N_dim)
+            return w_q, scale.astype(jnp.float32)
 
     w1, w1_scale_s = quantize_shard_map(w1)
     w2, w2_scale_s = quantize_shard_map(w2)
