@@ -148,6 +148,20 @@ class Scheduler(
             server_args.model_sub_dir = stage_sub_dir
         # set jit cache
         jit_cache_dir = os.getenv("JAX_COMPILATION_CACHE_DIR", None)
+        device_indexes = server_args.device_indexes
+        # libtpu (tpu-v6e + libtpu 0.0.30) crashes during JAX persistent
+        # compilation-cache use when the device subset does not start at
+        # device 0 (e.g. device_indexes=[2, 3]). Disable the cache for
+        # such schedulers and override any cache config a sibling
+        # scheduler may have set in the same process. See
+        # sgl-project/sglang-jax#1216.
+        if (
+            jit_cache_dir is not None
+            and device_indexes is not None
+            and min(device_indexes, default=0) > 0
+        ):
+            jax.config.update("jax_compilation_cache_dir", "")
+            jit_cache_dir = None
         if jit_cache_dir is not None:
             jax.config.update("jax_compilation_cache_dir", jit_cache_dir)
             jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)

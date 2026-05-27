@@ -134,6 +134,7 @@ jobs:
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
+          JAX_COMPILATION_CACHE_DIR: /xla-cache
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
