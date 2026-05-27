@@ -40,6 +40,14 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         # MiMo V2 Pro: E=384, H=6144, I=2048, top_k=8, fp8 e4m3, ep=8
         # Decode configs (tuned on bench-4 single-host v7x-16, 2026-05-21)
         ('bfloat16', 'float8_e4m3fn', 512, 384, 8, 6144, 2048, 8, False, False): (64, 1024, 32, 256, 32),
+        # Ling 2.6-1T: E=256, H=8192, I=2048, top_k=8, fp8 e4m3 per-channel, ep=32
+        # Tuned 2026-05-27
+        ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 8192, 2048, 32, False, False): (8, 256, 8, 256, 8),
+        ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 8192, 2048, 32, False, False): (8, 256, 8, 256, 8),
+        ('bfloat16', 'float8_e4m3fn', 256, 256, 8, 8192, 2048, 32, False, False): (8, 256, 16, 256, 16),
+        ('bfloat16', 'float8_e4m3fn', 512, 256, 8, 8192, 2048, 32, False, False): (16, 1024, 32, 256, 32),
+        ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 8192, 2048, 32, False, False): (128, 512, 160, 256, 160),
+        ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 8192, 2048, 32, False, False): (128, 512, 80, 256, 160),
     },
     "*": {},
 }
