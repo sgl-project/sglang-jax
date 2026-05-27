@@ -213,11 +213,7 @@ class Grok1MLP(nnx.Module):
         gate, _ = self.gate_proj(x, out_sharding=NamedSharding(self.mesh, P("data", "tensor")))
         up, _ = self.up_proj(x, out_sharding=NamedSharding(self.mesh, P("data", "tensor")))
         x, _ = self.act_fn(gate, up)
-        down_target = (
-            NamedSharding(self.mesh, P(("data", "tensor"), None))
-            if self.enable_sequence_parallel
-            else NamedSharding(self.mesh, P("data", None))
-        )
+        down_target = make_reduce_sharding(x, self.mesh, enable_sp=self.enable_sequence_parallel)
         x, _ = self.down_proj(x, out_sharding=down_target)
         return x
 
