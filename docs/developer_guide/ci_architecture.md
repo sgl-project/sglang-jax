@@ -122,11 +122,11 @@ and posts analysis results on the associated PR.
 ### Nightly Testing
 Coming soon
 <!--
-#### Comprehensive Nightly Tests (`nightly-test.yml`)
-*Schedule:* Daily at midnight UTC
+#### Comprehensive Weekly Tests (`weekly-test.yml`)
+*Schedule:* Weekly, Sunday 00:00 UTC+8
 
 *Trigger Conditions:*
-- Cron schedule: `0 0 * * *`
+- Cron schedule: `0 16 * * 0`
 - Push to `main` when `version.py` changes
 - Manual dispatch
 

@@ -12,9 +12,6 @@ on:
       run_perf:
         description: "Run extra performance tests (label test:perf)"
         value: ${{ jobs.decide.outputs.run_perf }}
-      run_perf_trace:
-        description: "Run performance trace tests (label test:perf-trace)"
-        value: ${{ jobs.decide.outputs.run_perf_trace }}
       run_accuracy_extra:
         description: "Run extra accuracy tests (label test:accuracy-extra)"
         value: ${{ jobs.decide.outputs.run_accuracy_extra }}
@@ -32,7 +29,6 @@ jobs:
       run_full: ${{ steps.decide.outputs.run_full }}
       requires_4tpu: ${{ steps.decide.outputs.requires_4tpu }}
       run_perf: ${{ steps.decide.outputs.run_perf }}
-      run_perf_trace: ${{ steps.decide.outputs.run_perf_trace }}
       run_accuracy_extra: ${{ steps.decide.outputs.run_accuracy_extra }}
       run_main_test: ${{ steps.decide.outputs.run_main_test }}
       run_pallas_bench: ${{ steps.decide.outputs.run_pallas_bench }}

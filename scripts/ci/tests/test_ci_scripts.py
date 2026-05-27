@@ -52,10 +52,6 @@ class TestDetectLabels(unittest.TestCase):
         flags = detect_labels("pull_request", '["test:perf"]')
         self.assertTrue(flags["run_perf"])
 
-    def test_perf_trace_label(self):
-        flags = detect_labels("pull_request", '["test:perf-trace"]')
-        self.assertTrue(flags["run_perf_trace"])
-
     def test_accuracy_extra_label(self):
         flags = detect_labels("pull_request", '["test:accuracy-extra"]')
         self.assertTrue(flags["run_accuracy_extra"])
@@ -118,7 +114,6 @@ def _make_env(**overrides):
         "REQUIRES_4TPU": "false",
         "RUN_ACCURACY_EXTRA": "false",
         "RUN_PERF": "false",
-        "RUN_PERF_TRACE": "false",
         "R_UNIT_1": "success",
         "R_UNIT_4": "success",
         "R_CPU": "success",
@@ -131,7 +126,6 @@ def _make_env(**overrides):
         "R_MULTI_CHIP": "skipped",
         "R_ACC_EXTRA": "skipped",
         "R_PERF_EXTRA": "skipped",
-        "R_PERF_TRACE": "skipped",
         "R_PALLAS": "skipped",
     }
     base.update(overrides)
@@ -184,7 +178,6 @@ class TestCheckJobs(unittest.TestCase):
                 R_MULTI_CHIP="failure",
                 R_ACC_EXTRA="success",
                 R_PERF_EXTRA="success",
-                R_PERF_TRACE="success",
             )
         )
         self.assertEqual(len(failures), 1)
@@ -197,14 +190,12 @@ class TestCheckJobs(unittest.TestCase):
                 R_MULTI_CHIP="failure",
                 R_ACC_EXTRA="failure",
                 R_PERF_EXTRA="failure",
-                R_PERF_TRACE="failure",
             )
         )
         failed_names = [f[0] for f in failures]
         self.assertIn("multi-chip-extra-test-4-tpu", failed_names)
         self.assertIn("accuracy-extra-test-1-tpu", failed_names)
         self.assertIn("perf-extra-test-1-tpu", failed_names)
-        self.assertIn("perf-trace-test-1-tpu", failed_names)
 
     def test_pallas_failure(self):
         failures = check_jobs(_make_env(RUN_PALLAS_BENCH="true", R_PALLAS="failure"))
@@ -270,7 +261,6 @@ class TestCheckJobs(unittest.TestCase):
                 R_MULTI_CHIP="skipped",
                 R_ACC_EXTRA="skipped",
                 R_PERF_EXTRA="skipped",
-                R_PERF_TRACE="skipped",
             )
         )
         self.assertEqual(failures, [])
@@ -355,7 +345,6 @@ class TestYAMLConsistency(unittest.TestCase):
                 "RUN_FULL",
                 "RUN_ACCURACY_EXTRA",
                 "RUN_PERF",
-                "RUN_PERF_TRACE",
             ]
         )
 
