@@ -2612,36 +2612,82 @@ class WeightLoader:
 
             splits = [q_scale, k_scale, v_scale]
         elif "scale" in hf_key and weight.ndim == 2:
-            # Block-quant scale: split along block dimension, not element dimension.
-            # The fused QKV scale has shape [total_blocks, in_blocks] where blocks
-            # are computed per Q/K/V segment independently.
+            # 2-D scale in a fused QKV weight. Two formats land here:
+            #   (a) block-quant scale [total_blocks, in_blocks] — split along
+            #       block dimension (the original case this branch was written
+            #       for; introduced in #978 for MiMo-V2.5-Pro day0 support).
+            #   (b) channel-wise / per-tensor scale stored as 2-D, e.g.
+            #       compressed-tensors W8A16 on Ling-2.6-1T where some scales
+            #       arrive shaped [Q_out+K_out+V_out, inner] instead of 1-D.
+            # Distinguish by whether the quantization_config has weight_block_size.
             import math
 
             quant_cfg = getattr(self.model_config, "quantization_config", None)
-            block_size = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
+            weight_block_size = getattr(quant_cfg, "weight_block_size", None) if quant_cfg else None
 
-            q_dim = self.num_heads * self.head_dim_original
-            k_dim = self.num_kv_heads * self.head_dim_original
+            if weight_block_size is None:
+                # Path (b): element-wise split along axis 0, same Q/K/V offsets
+                # as the 1-D branch above. Padding mirrors the 1-D path with an
+                # extra inner axis preserved.
+                logger.warning(
+                    "Splitting 2-D non-block scale %s shape=%s element-wise "
+                    "(quant_cfg has no weight_block_size)",
+                    hf_key,
+                    weight.shape,
+                )
+                q_dim = self.num_heads * self.head_dim_original
+                k_dim = self.num_kv_heads * self.head_dim_original
+                v_dim = self.num_kv_heads * v_head_dim
 
-            q_blocks = math.ceil(q_dim / block_size)
-            k_blocks = math.ceil(k_dim / block_size)
-            # V gets remaining blocks (may include padding to head_dim_original)
-            v_blocks = weight.shape[0] - q_blocks - k_blocks
+                q_scale = weight[:q_dim, :]
+                k_scale = weight[q_dim : q_dim + k_dim, :]
+                v_scale = weight[q_dim + k_dim : q_dim + k_dim + v_dim, :]
 
-            logger.info(
-                "Splitting QKV scale %s shape=%s into Q=%d K=%d V=%d blocks",
-                hf_key,
-                weight.shape,
-                q_blocks,
-                k_blocks,
-                v_blocks,
-            )
+                if mapping.head_dim_padding and self.head_dim_pad > 0:
+                    inner = weight.shape[1]
+                    q_scale = jnp.reshape(q_scale, (self.num_heads, self.head_dim_original, inner))
+                    q_scale = jnp.pad(q_scale, ((0, 0), (0, self.head_dim_pad), (0, 0)))
+                    q_scale = jnp.reshape(q_scale, (self.num_heads * self.head_dim, inner))
 
-            q_scale = weight[:q_blocks, :]
-            k_scale = weight[q_blocks : q_blocks + k_blocks, :]
-            v_scale = weight[q_blocks + k_blocks :, :]
+                    k_scale = jnp.reshape(
+                        k_scale, (self.num_kv_heads, self.head_dim_original, inner)
+                    )
+                    k_scale = jnp.pad(k_scale, ((0, 0), (0, self.head_dim_pad), (0, 0)))
+                    k_scale = jnp.reshape(k_scale, (self.num_kv_heads * self.head_dim, inner))
 
-            splits = [q_scale, k_scale, v_scale]
+                if mapping.head_dim_padding and v_head_dim_pad > 0:
+                    inner = weight.shape[1]
+                    v_scale = jnp.reshape(v_scale, (self.num_kv_heads, v_head_dim, inner))
+                    v_scale = jnp.pad(v_scale, ((0, 0), (0, v_head_dim_pad), (0, 0)))
+                    v_scale = jnp.reshape(v_scale, (self.num_kv_heads * v_head_dim_padded, inner))
+
+                splits = [q_scale, k_scale, v_scale]
+            else:
+                # Path (a): block-quant scale, original behavior.
+                block_size = int(weight_block_size[0])
+
+                q_dim = self.num_heads * self.head_dim_original
+                k_dim = self.num_kv_heads * self.head_dim_original
+
+                q_blocks = math.ceil(q_dim / block_size)
+                k_blocks = math.ceil(k_dim / block_size)
+                # V gets remaining blocks (may include padding to head_dim_original)
+                v_blocks = weight.shape[0] - q_blocks - k_blocks
+
+                logger.info(
+                    "Splitting QKV scale %s shape=%s into Q=%d K=%d V=%d blocks",
+                    hf_key,
+                    weight.shape,
+                    q_blocks,
+                    k_blocks,
+                    v_blocks,
+                )
+
+                q_scale = weight[:q_blocks, :]
+                k_scale = weight[q_blocks : q_blocks + k_blocks, :]
+                v_scale = weight[q_blocks + k_blocks :, :]
+
+                splits = [q_scale, k_scale, v_scale]
         else:
             q_dim = self.num_heads * self.head_dim_original
             k_dim = self.num_kv_heads * self.head_dim_original
