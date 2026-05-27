@@ -248,6 +248,7 @@ direct_scaled_dot_ffn2_modes = parse_csv_bool(
 )
 cast_ffn1_input_fp8 = os.environ.get("BENCH_CAST_FFN1_INPUT_FP8", "0") == "1"
 cast_ffn2_input_fp8 = os.environ.get("BENCH_CAST_FFN2_INPUT_FP8", "0") == "1"
+enable_act_quant = os.environ.get("BENCH_ACT_QUANT", "0") == "1"
 ffn1_dequant_modes = parse_csv_str("BENCH_FFN1_DEQUANT_MODE", ["full"])
 ffn1_dequant_chunks = parse_csv_int_or_none("BENCH_FFN1_DEQUANT_CHUNK")
 inkernel_metadata = os.environ.get("BENCH_INKERNEL_MD", "1") == "1"
@@ -303,7 +304,7 @@ if invalid_w2_fetch_orders:
         f"Unsupported BENCH_W2_FETCH_ORDER values {invalid_w2_fetch_orders}; "
         "expected one of after_w13 or before_w13."
     )
-valid_routing_modes = {"random", "deterministic"}
+valid_routing_modes = {"random", "deterministic", "hot_expert"}
 if routing_mode not in valid_routing_modes:
     raise ValueError(
         f"Unsupported BENCH_ROUTING_MODE={routing_mode!r}; "
@@ -817,6 +818,32 @@ def make_deterministic_topk(num_tokens, top_k, num_experts):
     return topk_weights, topk_ids
 
 
+def make_hot_expert_topk(num_tokens, top_k, num_experts, hot_frac=0.1, hot_load=0.7):
+    """Hot-expert routing: hot_load fraction of (token, k) slots route to
+    hot_frac fraction of experts; rest uniformly to the cold tail."""
+    local_tokens = num_tokens // num_devices
+    num_hot = max(1, int(num_experts * hot_frac))
+    per_device_ids = []
+    per_device_weights = []
+    rng = np.random.default_rng(42)
+    for i, dev in enumerate(jax.local_devices()):
+        is_hot = rng.random((local_tokens, top_k)) < hot_load
+        hot_ids = rng.integers(0, num_hot, size=(local_tokens, top_k), dtype=np.int32)
+        cold_ids = rng.integers(num_hot, num_experts, size=(local_tokens, top_k), dtype=np.int32)
+        ids_np = np.where(is_hot, hot_ids, cold_ids).astype(np.int32)
+        ids = jnp.array(ids_np)
+        weights = jnp.full((local_tokens, top_k), 1.0 / top_k, dtype=jnp.float32)
+        per_device_ids.append(jax.device_put(ids, dev))
+        per_device_weights.append(jax.device_put(weights, dev))
+    topk_ids = jax.make_array_from_single_device_arrays(
+        (num_tokens, top_k), ep_sharding, per_device_ids,
+    )
+    topk_weights = jax.make_array_from_single_device_arrays(
+        (num_tokens, top_k), ep_sharding, per_device_weights,
+    )
+    return topk_weights, topk_ids
+
+
 log("creating weight arrays...")
 w1 = make_sharded(k2, (E, d, f), jnp.bfloat16, 0.01)
 w2 = make_sharded(k3, (E, f, d), jnp.bfloat16, 0.01)
@@ -901,6 +928,8 @@ for num_tokens in token_candidates:
     tokens = make_sharded(k1, (num_tokens, d), jnp.bfloat16)
     if routing_mode == "deterministic":
         topk_wts, topk_idx = make_deterministic_topk(num_tokens, top_k, E)
+    elif routing_mode == "hot_expert":
+        topk_wts, topk_idx = make_hot_expert_topk(num_tokens, top_k, E)
     else:
         gating_local_shape = (num_tokens // num_devices, E)
         gating_per_dev = []
@@ -1055,6 +1084,7 @@ for num_tokens in token_candidates:
                 ffn1_dequant_chunk=ffn1_dequant_chunk,
                 cast_ffn1_input_fp8=cast_ffn1_input_fp8,
                 cast_ffn2_input_fp8=cast_ffn2_input_fp8,
+                enable_act_quant=enable_act_quant,
                 cross_expert_prefetch_mode=xprefetch_mode,
                 next_w2_prologue_priority=next_w2_priority,
                 w2_fetch_order=w2_fetch_order,
@@ -1139,6 +1169,7 @@ if check_correctness:
             ffn1_dequant_chunk=ffn1_dequant_chunks[0],
             cast_ffn1_input_fp8=cast_ffn1_input_fp8,
             cast_ffn2_input_fp8=cast_ffn2_input_fp8,
+            enable_act_quant=enable_act_quant,
             w2_fetch_order=w2_fetch_orders[0],
             w2_fetch_priority=w2_fetch_priorities[0],
             skip_inter_bt_sync=skip_inter_bt_sync_modes[0],
