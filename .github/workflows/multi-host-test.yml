@@ -237,12 +237,14 @@ jobs:
           fi
 
       - name: Run multi-host test cases
+        id: run-tests
         shell: bash
         run: |
           set -euo pipefail
 
           HEADLESS_SERVICE_NAME="${WORKLOAD_NAME}-headless"
           RESULTS_DATE="$(date +'%Y-%m-%d')"
+          echo "results_date=${RESULTS_DATE}" >> "$GITHUB_OUTPUT"
           TPU_PROCESS_ADDRESSES="${WORKLOAD_NAME}-0.${HEADLESS_SERVICE_NAME}:8471,${WORKLOAD_NAME}-1.${HEADLESS_SERVICE_NAME}:8471,${WORKLOAD_NAME}-2.${HEADLESS_SERVICE_NAME}:8471,${WORKLOAD_NAME}-3.${HEADLESS_SERVICE_NAME}:8471"
           TPU_WORKER_HOSTNAMES="${WORKLOAD_NAME}-0.${HEADLESS_SERVICE_NAME},${WORKLOAD_NAME}-1.${HEADLESS_SERVICE_NAME},${WORKLOAD_NAME}-2.${HEADLESS_SERVICE_NAME},${WORKLOAD_NAME}-3.${HEADLESS_SERVICE_NAME}"
 
@@ -463,6 +465,77 @@ jobs:
           kubectl get events --namespace "${NAMESPACE}" --sort-by='.lastTimestamp' \
             | grep -E "${WORKLOAD_NAME}|Evicted|DiskPressure|MemoryPressure|OOMKill|FailedScheduling" || true
           kubectl logs --namespace "${NAMESPACE}" --selector="job-name=${WORKLOAD_NAME}" --all-containers=true --prefix=true || true
+
+      - name: Surface results to step summary
+        if: always()
+        shell: bash
+        env:
+          RESULTS_DATE: ${{ steps.run-tests.outputs.results_date }}
+        run: |
+          set -uo pipefail
+
+          summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          if [[ -z "${RESULTS_DATE:-}" ]]; then
+            {
+              echo "## Multi-host test results"
+              echo ""
+              echo "_No results captured — Run multi-host step did not reach result-publish phase._"
+            } >> "${summary}"
+            exit 0
+          fi
+
+          PREFIX="gs://${BUCKET_NAME}/${RESULTS_DATE}/${WORKLOAD_NAME}/"
+
+          if ! gsutil ls "${PREFIX}" >/dev/null 2>&1; then
+            {
+              echo "## Multi-host test results"
+              echo ""
+              echo "**Workload:** \`${WORKLOAD_NAME}\`"
+              echo ""
+              echo "_No JSON results uploaded to \`${PREFIX}\` — see Diagnose step._"
+            } >> "${summary}"
+            exit 0
+          fi
+
+          tmpdir="$(mktemp -d)"
+          gsutil -m cp -r "${PREFIX}*" "${tmpdir}/" >/dev/null 2>&1 || true
+
+          {
+            echo "## Multi-host test results"
+            echo ""
+            echo "**Workload:** \`${WORKLOAD_NAME}\`  "
+            echo "**Bucket:** \`${PREFIX}\`"
+            echo ""
+          } >> "${summary}"
+
+          accuracy_files=()
+          for f in "${tmpdir}"/*.json; do
+            [[ -f "$f" ]] || continue
+            if jq -e '.type == "accuracy"' "$f" >/dev/null 2>&1; then
+              accuracy_files+=("$f")
+            fi
+          done
+
+          if (( ${#accuracy_files[@]} > 0 )); then
+            {
+              echo "### Accuracy"
+              echo ""
+              echo "| Case | Dataset | Score | Threshold | Passed | Examples | Duration |"
+              echo "|---|---|---|---|---|---|---|"
+              for f in "${accuracy_files[@]}"; do
+                jq -r '
+                  def score_fmt: if . == null then "—" else (. * 10000 | round / 10000 | tostring) end;
+                  def num_fmt: if . == null then "—" else tostring end;
+                  def pass_fmt: if . == null then "—" elif . then "✅" else "❌" end;
+                  "| \(.case) | \(.dataset) | \(.score | score_fmt) | \(.score_threshold | num_fmt) | \(.passed | pass_fmt) | \(.num_examples | num_fmt) | \(.duration_seconds)s |"
+                ' "$f"
+              done
+              echo ""
+            } >> "${summary}"
+          fi
+
+          rm -rf "${tmpdir}"
 
       - name: Cleanup TPU workload smoke test
         if: always()
