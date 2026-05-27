@@ -76,9 +76,21 @@ TUNED_BLOCK_SIZES_V3: dict[str, dict[tuple, tuple[int, int, int, int]]] = {
         ("m", None, "bfloat16", "bfloat16", 32, 2, 256, 256, 4096): (32, 512, 32, 512),
         ("m", None, "bfloat16", "bfloat16", 32, 2, 256, 256, 8192): (32, 512, 32, 512),
         # ===== MiMo-V2-Pro SWA (sliding-window) layers =====
-        # sliding_window=128 (= MiMo attention_chunk_size). Pending: tuner
-        # run with --sliding-window 128. Until then SWA lookup misses fall
-        # back to heuristic (which uses bkv≈sliding_window after page align).
+        # sliding_window=128 (= MiMo attention_chunk_size). Tuned 2026-05-27,
+        # exp-szoo9187lg. Heuristic picks bkv=256 (page-aligned sliding_window
+        # of 128); tuner finds bkv=512 wins +3-8% across all mnt buckets.
+        # mnt=4 skipped (heur == best). Note bkv can't be < page_size=256 —
+        # kernel asserts bkv_sz % page_size == 0.
+        # p/m stages SMEM-pruned (page_indices > 1MB) — fall back to heuristic
+        # (bkv=1024) on lookup miss.
+        ("d", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 8): (1, 512, 1, 512),
+        ("d", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 16): (1, 512, 1, 512),
+        ("d", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 32): (1, 512, 1, 512),
+        ("d", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 64): (1, 512, 1, 512),
+        ("d", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 128): (1, 512, 1, 512),
+        ("d", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 256): (1, 512, 1, 512),
+        ("d", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 512): (1, 512, 1, 512),
+        ("d", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 1024): (1, 512, 1, 512),
     },
 }
 
