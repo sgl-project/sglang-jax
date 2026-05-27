@@ -350,6 +350,18 @@ jobs:
                     value: "/xla-cache"
                   - name: HF_HUB_DOWNLOAD_TIMEOUT
                     value: "600"
+                  - name: REPO_REF
+                    value: "${REPO_REF}"
+                  - name: GITHUB_SHA
+                    value: "${{ github.sha }}"
+                  - name: GITHUB_REF_NAME
+                    value: "${{ github.ref_name }}"
+                  - name: GITHUB_RUN_ID
+                    value: "${{ github.run_id }}"
+                  - name: GITHUB_REPOSITORY
+                    value: "${{ github.repository }}"
+                  - name: GITHUB_SERVER_URL
+                    value: "${{ github.server_url }}"
                   ports:
                   - containerPort: 30000
                     name: http

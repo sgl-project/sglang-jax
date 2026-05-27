@@ -2,7 +2,10 @@
 
 import json
 import os
+import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +15,83 @@ if _TEST_SRT not in sys.path:
 
 from multi_host_suite import AccuracyCase
 from profile_loader import LaunchProfile
+
+ACCURACY_RESULT_SCHEMA_VERSION = "1"
+
+
+def _utc_iso(ts: float) -> str:
+    return (
+        datetime.fromtimestamp(ts, tz=timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _detect_commit_sha() -> str | None:
+    explicit = os.environ.get("GITHUB_SHA") or os.environ.get("COMMIT_SHA")
+    if explicit:
+        return explicit
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            timeout=5,
+        )
+        return out.stdout.strip() or None
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+
+def _build_github_run_url() -> str | None:
+    server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    if repo and run_id:
+        return f"{server}/{repo}/actions/runs/{run_id}"
+    return None
+
+
+def _build_summary(
+    case: AccuracyCase,
+    profile: LaunchProfile,
+    metrics: dict | None,
+    started_at: float,
+    finished_at: float,
+) -> dict:
+    score = metrics.get("score") if isinstance(metrics, dict) else None
+    passed: bool | None
+    if case.score_threshold is None or score is None:
+        passed = None
+    else:
+        passed = score >= case.score_threshold
+
+    return {
+        "schema_version": ACCURACY_RESULT_SCHEMA_VERSION,
+        "type": "accuracy",
+        "case": case.name,
+        "dataset": case.dataset,
+        "model_id": case.model_id,
+        "profile": profile.name,
+        "target": profile.target,
+        "score": score,
+        "score_threshold": case.score_threshold,
+        "passed": passed,
+        "metrics": metrics if isinstance(metrics, dict) else {},
+        "started_at": _utc_iso(started_at),
+        "finished_at": _utc_iso(finished_at),
+        "duration_seconds": round(finished_at - started_at, 3),
+        "num_examples": case.limit,
+        "eval_batch_size": case.eval_batch_size,
+        "generation_config": dict(case.generation_config or {}),
+        "repo_ref": os.environ.get("REPO_REF") or os.environ.get("GITHUB_REF_NAME"),
+        "commit_sha": _detect_commit_sha(),
+        "workload_name": os.environ.get("WORKLOAD_NAME"),
+        "github_run_id": os.environ.get("GITHUB_RUN_ID"),
+        "github_run_url": _build_github_run_url(),
+    }
 
 
 def run_accuracy_case(case: AccuracyCase, profile: LaunchProfile) -> None:
@@ -41,25 +121,26 @@ def run_accuracy_case(case: AccuracyCase, profile: LaunchProfile) -> None:
         f"limit={case.limit}",
         flush=True,
     )
+
+    started_at = time.time()
     metrics = run_eval(args)
+    finished_at = time.time()
+
+    summary = _build_summary(case, profile, metrics, started_at, finished_at)
 
     results_dir = os.environ.get("RESULTS_DIR")
     if results_dir:
-        summary = {
-            "type": "accuracy",
-            "case": case.name,
-            "profile": profile.name,
-            "target": profile.target,
-            "dataset": case.dataset,
-            "model_id": case.model_id,
-            "score_threshold": case.score_threshold,
-            **(metrics if isinstance(metrics, dict) else {}),
-        }
         out_path = Path(results_dir) / f"{case.name}.json"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(summary, indent=2, sort_keys=True, default=float))
+        print(f"[multi-host-suite] Wrote accuracy summary to {out_path}", flush=True)
+    else:
+        print(
+            f"[multi-host-suite] RESULTS_DIR unset; skipping accuracy summary write",
+            flush=True,
+        )
 
-    score = metrics.get("score") if isinstance(metrics, dict) else None
+    score = summary["score"]
     if case.score_threshold is not None:
         if score is None:
             raise RuntimeError(
