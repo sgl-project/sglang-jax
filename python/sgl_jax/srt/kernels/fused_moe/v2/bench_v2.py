@@ -20,6 +20,7 @@ Env vars:
   BENCH_W2_FETCH_PRIORITY — comma-separated 0/1 priority for current-expert W2 DMA
   BENCH_SKIP_INTER_BT_SYNC — comma-separated 0/1 skip inter-BT sync barrier
   BENCH_INTERLEAVE_BT — comma-separated 0/1 interleave BT gather banking
+  BENCH_CROSS_EXPERT_RECV_LOOKAHEAD — 1 to pre-wait next expert's recv after gather
   BENCH_TUNE    — 1 to auto-generate bt/bf candidates
   BENCH_WARMUP  — warmup iterations (default: 2)
   BENCH_ITERS   — timed iterations (default: 5)
@@ -252,6 +253,9 @@ ffn1_dequant_chunks = parse_csv_int_or_none("BENCH_FFN1_DEQUANT_CHUNK")
 inkernel_metadata = os.environ.get("BENCH_INKERNEL_MD", "1") == "1"
 enable_bt_scatter_overlap = os.environ.get("BENCH_BT_SCATTER_OVERLAP", "1") == "1"
 cross_expert_prefetch_modes = parse_csv_str("BENCH_CROSS_EXPERT_PREFETCH", ["full"])
+cross_expert_recv_lookahead = os.environ.get(
+    "BENCH_CROSS_EXPERT_RECV_LOOKAHEAD", "0"
+) == "1"
 next_w2_prologue_priorities = parse_csv_int("BENCH_NEXT_W2_PRIORITY", [1])
 w2_fetch_orders = parse_csv_str("BENCH_W2_FETCH_ORDER", ["after_w13"])
 w2_fetch_priorities = parse_csv_int("BENCH_W2_FETCH_PRIORITY", [1])
@@ -302,7 +306,7 @@ if invalid_w2_fetch_orders:
         f"Unsupported BENCH_W2_FETCH_ORDER values {invalid_w2_fetch_orders}; "
         "expected one of after_w13 or before_w13."
     )
-valid_routing_modes = {"random", "deterministic"}
+valid_routing_modes = {"random", "deterministic", "hot_expert"}
 if routing_mode not in valid_routing_modes:
     raise ValueError(
         f"Unsupported BENCH_ROUTING_MODE={routing_mode!r}; "
@@ -814,6 +818,34 @@ def make_deterministic_topk(num_tokens, top_k, num_experts):
     return topk_weights, topk_ids
 
 
+def make_hot_expert_topk(num_tokens, top_k, num_experts, hot_frac=0.1, hot_load=0.7):
+    """Hot expert routing: hot_load fraction of (token,k) slots route to
+    hot_frac fraction of experts, the rest uniformly to the cold tail.
+    Reproduces real-router routing imbalance in micro-bench.
+    """
+    local_tokens = num_tokens // num_devices
+    num_hot = max(1, int(num_experts * hot_frac))
+    per_device_ids = []
+    per_device_weights = []
+    rng = np.random.default_rng(42)
+    for i, dev in enumerate(jax.local_devices()):
+        is_hot = rng.random((local_tokens, top_k)) < hot_load
+        hot_ids = rng.integers(0, num_hot, size=(local_tokens, top_k), dtype=np.int32)
+        cold_ids = rng.integers(num_hot, num_experts, size=(local_tokens, top_k), dtype=np.int32)
+        ids_np = np.where(is_hot, hot_ids, cold_ids).astype(np.int32)
+        ids = jnp.array(ids_np)
+        weights = jnp.full((local_tokens, top_k), 1.0 / top_k, dtype=jnp.float32)
+        per_device_ids.append(jax.device_put(ids, dev))
+        per_device_weights.append(jax.device_put(weights, dev))
+    topk_ids = jax.make_array_from_single_device_arrays(
+        (num_tokens, top_k), ep_sharding, per_device_ids,
+    )
+    topk_weights = jax.make_array_from_single_device_arrays(
+        (num_tokens, top_k), ep_sharding, per_device_weights,
+    )
+    return topk_weights, topk_ids
+
+
 log("creating weight arrays...")
 w1 = make_sharded(k2, (E, d, f), jnp.bfloat16, 0.01)
 w2 = make_sharded(k3, (E, f, d), jnp.bfloat16, 0.01)
@@ -880,6 +912,8 @@ for num_tokens in token_candidates:
     tokens = make_sharded(k1, (num_tokens, d), jnp.bfloat16)
     if routing_mode == "deterministic":
         topk_wts, topk_idx = make_deterministic_topk(num_tokens, top_k, E)
+    elif routing_mode == "hot_expert":
+        topk_wts, topk_idx = make_hot_expert_topk(num_tokens, top_k, E)
     else:
         gating_local_shape = (num_tokens // num_devices, E)
         gating_per_dev = []
@@ -1035,6 +1069,7 @@ for num_tokens in token_candidates:
                 cast_ffn1_input_fp8=cast_ffn1_input_fp8,
                 cast_ffn2_input_fp8=cast_ffn2_input_fp8,
                 cross_expert_prefetch_mode=xprefetch_mode,
+                cross_expert_recv_lookahead=cross_expert_recv_lookahead,
                 next_w2_prologue_priority=next_w2_priority,
                 w2_fetch_order=w2_fetch_order,
                 w2_fetch_priority=w2_fetch_priority,
@@ -1124,6 +1159,7 @@ if check_correctness:
             interleave_bt=interleave_bt_modes[0],
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
             use_jax_allreduce_metadata=not inkernel_metadata,
+            cross_expert_recv_lookahead=cross_expert_recv_lookahead,
         )
         ref_kwargs = {}
         if use_fp8:

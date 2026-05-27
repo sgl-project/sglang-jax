@@ -327,6 +327,7 @@ def _fused_ep_moe_kernel(
     use_jax_allreduce_metadata: bool = False,
     enable_bt_scatter_overlap: bool = True,
     cross_expert_prefetch_mode: str = "full",
+    cross_expert_recv_lookahead: bool = False,
     next_w2_prologue_priority: int = 1,
     w2_fetch_order: str = "after_w13",
     w2_fetch_priority: int = 1,
@@ -2055,20 +2056,28 @@ def _fused_ep_moe_kernel(
                 a2a_bank_id=a2a_bank_id,
             )
 
-        init_carry = (jnp.int32(0), jnp.bool_(False))
+        init_carry = (jnp.int32(0), jnp.bool_(False), jnp.bool_(False))
 
         def compute_expert_batch(local_e_id, carry):
-            curr_se_block, bf0_w13_prefetched = carry
+            curr_se_block, bf0_w13_prefetched, recv_already_waited = carry
             e_sem_id_local = local_e_id
 
             for _ in range(se_before):
                 run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
                 curr_se_block += 1
 
-            wait_a2a_scatter_recv(
-                bt_sem_id=bt_sem_id, e_sem_id=e_sem_id_local,
-                local_e_id=local_e_id, a2a_bank_id=a2a_bank_id,
-            )
+            if cross_expert_recv_lookahead:
+                @pl.when(jnp.logical_not(recv_already_waited))
+                def _():
+                    wait_a2a_scatter_recv(
+                        bt_sem_id=bt_sem_id, e_sem_id=e_sem_id_local,
+                        local_e_id=local_e_id, a2a_bank_id=a2a_bank_id,
+                    )
+            else:
+                wait_a2a_scatter_recv(
+                    bt_sem_id=bt_sem_id, e_sem_id=e_sem_id_local,
+                    local_e_id=local_e_id, a2a_bank_id=a2a_bank_id,
+                )
             next_bf0_w13_prefetched = expert_ffn(
                 bt_sem_id, e_sem_id_local, local_e_id,
                 bf0_w13_prefetched, a2a_bank_id,
@@ -2083,12 +2092,30 @@ def _fused_ep_moe_kernel(
                 run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
                 curr_se_block += 1
 
-            return (curr_se_block, next_bf0_w13_prefetched)
+            # Pre-wait next expert's recv so its sem stall overlaps with
+            # gather DMA in flight and the next-expert weight prefetch.
+            next_recv_waited = jnp.bool_(False)
+            if cross_expert_recv_lookahead:
+                next_e_id_raw = local_e_id + jnp.int32(1)
+                has_next = next_e_id_raw < jnp.int32(local_num_experts)
+                safe_next_e_id = jnp.minimum(
+                    next_e_id_raw, jnp.int32(local_num_experts - 1)
+                )
+
+                @pl.when(has_next)
+                def _():
+                    wait_a2a_scatter_recv(
+                        bt_sem_id=bt_sem_id, e_sem_id=safe_next_e_id,
+                        local_e_id=safe_next_e_id, a2a_bank_id=a2a_bank_id,
+                    )
+                next_recv_waited = has_next
+
+            return (curr_se_block, next_bf0_w13_prefetched, next_recv_waited)
 
         final_carry = lax.fori_loop(
             0, local_num_experts, compute_expert_batch, init_carry, unroll=False,
         )
-        final_se_block, _ = final_carry
+        final_se_block, _, _ = final_carry
 
         def cleanup_body(block_idx, _):
             run_shared_expert_slice(block_idx, bt_id, bt_sem_id, out_buf_id)
@@ -2242,7 +2269,8 @@ def jax_allreduce_metadata_by_bt(
         "direct_scaled_dot_ffn1", "direct_scaled_dot_ffn2",
         "ffn1_dequant_mode", "ffn1_dequant_chunk",
         "cast_ffn1_input_fp8", "cast_ffn2_input_fp8",
-        "cross_expert_prefetch_mode", "next_w2_prologue_priority",
+        "cross_expert_prefetch_mode", "cross_expert_recv_lookahead",
+        "next_w2_prologue_priority",
         "w2_fetch_order", "w2_fetch_priority",
         "skip_inter_bt_sync",
         "interleave_bt",
@@ -2305,6 +2333,7 @@ def fused_ep_moe_v2(
     cast_ffn1_input_fp8: bool = False,
     cast_ffn2_input_fp8: bool = False,
     cross_expert_prefetch_mode: str = "full",
+    cross_expert_recv_lookahead: bool = False,
     next_w2_prologue_priority: int = 1,
     w2_fetch_order: str = "after_w13",
     w2_fetch_priority: int = 1,
@@ -2492,6 +2521,8 @@ def fused_ep_moe_v2(
     if cast_ffn1_input_fp8 or cast_ffn2_input_fp8:
         scope_name += f"-castf1_{int(cast_ffn1_input_fp8)}_f2_{int(cast_ffn2_input_fp8)}"
     scope_name += f"-xprefetch_{cross_expert_prefetch_mode}"
+    if cross_expert_recv_lookahead:
+        scope_name += "-xrecv_la"
     if not pad_topk_to_128:
         scope_name += "-topk_no_pad"
     if route_smem_topk_only:
@@ -2650,6 +2681,7 @@ def fused_ep_moe_v2(
                 use_jax_allreduce_metadata=use_jax_allreduce_metadata,
                 enable_bt_scatter_overlap=use_bt_scatter_bank,
                 cross_expert_prefetch_mode=cross_expert_prefetch_mode,
+                cross_expert_recv_lookahead=cross_expert_recv_lookahead,
                 next_w2_prologue_priority=next_w2_prologue_priority,
                 w2_fetch_order=w2_fetch_order,
                 w2_fetch_priority=w2_fetch_priority,
