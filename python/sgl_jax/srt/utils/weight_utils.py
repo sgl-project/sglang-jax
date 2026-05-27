@@ -2629,7 +2629,7 @@ class WeightLoader:
                 # Path (b): element-wise split along axis 0, same Q/K/V offsets
                 # as the 1-D branch above. Padding mirrors the 1-D path with an
                 # extra inner axis preserved.
-                logger.warning(
+                logger.info(
                     "Splitting 2-D non-block scale %s shape=%s element-wise "
                     "(quant_cfg has no weight_block_size)",
                     hf_key,
