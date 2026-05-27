@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 460" width="940" height="460">
+<defs>
+  <marker id="arr-navy" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#1e3a5f"/></marker>
+</defs>
+<rect x="0" y="0" width="940" height="460" fill="#ffffff"/>
+
+<text x="470" y="42" fill="#1e40af" font-size="24" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Quantization Pipeline</text>
+
+<!-- Row 1: Three-tier config resolution -->
+<rect x="40" y="75" width="180" height="80" rx="8" fill="#dbeafe" stroke="#1e3a5f" stroke-width="2"/>
+<text x="130" y="103" fill="#1e40af" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">YAML Config</text>
+<text x="130" y="125" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">11 built-in</text>
+<text x="130" y="143" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">configs</text>
+
+<path d="M 220 115 L 268 115" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arr-navy)"/>
+
+<rect x="270" y="75" width="280" height="80" rx="8" fill="#d1fae5" stroke="#047857" stroke-width="2"/>
+<text x="410" y="98" fill="#047857" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Three-Tier Resolution</text>
+<text x="290" y="118" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">1. User YAML</text>
+<text x="290" y="134" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">2. HF quantization_config</text>
+<text x="290" y="150" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">3. Auto-detect (fp8)</text>
+
+<path d="M 550 115 L 598 115" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arr-navy)"/>
+
+<rect x="600" y="75" width="280" height="80" rx="8" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+<text x="740" y="103" fill="#b45309" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">QuantizationConfig</text>
+<text x="740" y="125" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">linear_rules (regex match)</text>
+<text x="740" y="143" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">→ skip / quant_method</text>
+
+<!-- Down to Pipeline -->
+<path d="M 740 155 L 740 195" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arr-navy)"/>
+
+<!-- Row 2: Quantization Pipeline strip -->
+<rect x="40" y="200" width="840" height="70" rx="8" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
+<text x="460" y="225" fill="#7c3aed" font-size="14" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Quantization Pipeline</text>
+<text x="460" y="252" fill="#64748b" font-size="12" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">eval_shape → apply_moe_quantization → apply_linear_quantization → load_weights</text>
+
+<!-- Branches downward -->
+<path d="M 280 270 L 280 305" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arr-navy)"/>
+<path d="M 660 270 L 660 305" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arr-navy)"/>
+
+<!-- Row 3: QuantizedLinear & Pallas Kernel -->
+<rect x="140" y="310" width="280" height="95" rx="8" fill="#fce7f3" stroke="#be185d" stroke-width="2"/>
+<text x="280" y="334" fill="#be185d" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">QuantizedLinear</text>
+<text x="280" y="357" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">from_linear (static)</text>
+<text x="280" y="375" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">or dynamic quantize</text>
+<text x="280" y="393" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">shard_map wrapping</text>
+
+<!-- Lateral call -->
+<path d="M 420 357 L 518 357" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arr-navy)"/>
+<text x="469" y="349" fill="#64748b" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">forward</text>
+
+<rect x="520" y="310" width="280" height="95" rx="8" fill="#d1fae5" stroke="#047857" stroke-width="2"/>
+<text x="660" y="334" fill="#047857" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Pallas Kernel</text>
+<text x="660" y="357" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">xla_quantized_matmul</text>
+<text x="660" y="375" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">per-channel / blockwise</text>
+<text x="660" y="393" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">3-tier tuning fallback</text>
+
+<!-- Footer note -->
+<rect x="40" y="420" width="840" height="28" rx="6" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
+<text x="460" y="438" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Config priority: explicit CLI &gt; HF config &gt; auto-detect; weight formats: INT8 / FP8 / INT4</text>
+</svg>

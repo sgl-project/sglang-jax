@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 540" width="1100" height="540">
+<defs>
+  <marker id="arr-navy" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#1e3a5f"/></marker>
+</defs>
+<rect x="0" y="0" width="1100" height="540" fill="#ffffff"/>
+
+<text x="550" y="42" fill="#1e40af" font-size="24" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Pallas Kernel Catalog</text>
+
+<!-- Attention -->
+<rect x="40" y="75" width="320" height="180" rx="8" fill="#d1fae5" stroke="#047857" stroke-width="2"/>
+<text x="200" y="100" fill="#047857" font-size="14" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Attention</text>
+<rect x="60" y="115" width="280" height="125" rx="6" fill="#ffffff" stroke="#a7f3d0" stroke-width="1"/>
+<text x="75" y="135" fill="#475569" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">RPA v1 (Prefill)</text>
+<text x="75" y="155" fill="#475569" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">RPA v3 (Prefill + Decode)</text>
+<text x="75" y="175" fill="#475569" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">KV Cache Update</text>
+<text x="75" y="195" fill="#475569" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">MLA v2</text>
+<text x="75" y="225" fill="#94a3b8" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">srt/kernels/attention/</text>
+
+<!-- MoE / MatMul -->
+<rect x="390" y="75" width="320" height="180" rx="8" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+<text x="550" y="100" fill="#b45309" font-size="14" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">MoE / MatMul</text>
+<rect x="410" y="115" width="280" height="125" rx="6" fill="#ffffff" stroke="#fcd34d" stroke-width="1"/>
+<text x="425" y="135" fill="#475569" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">Fused MoE Pipeline</text>
+<text x="425" y="155" fill="#475569" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">GMM v1 (indexed)</text>
+<text x="425" y="175" fill="#475569" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">GMM v2 (emit_pipeline)</text>
+<text x="425" y="195" fill="#475569" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">Quantized Matmul</text>
+<text x="425" y="225" fill="#94a3b8" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">srt/kernels/moe/ · matmul/</text>
+
+<!-- Speculative / Other -->
+<rect x="740" y="75" width="320" height="180" rx="8" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
+<text x="900" y="100" fill="#7c3aed" font-size="14" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Speculative / Other</text>
+<rect x="760" y="115" width="280" height="125" rx="6" fill="#ffffff" stroke="#ddd6fe" stroke-width="1"/>
+<text x="775" y="135" fill="#475569" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">build_eagle_tree_structure</text>
+<text x="775" y="155" fill="#475569" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">verify_tree_greedy</text>
+<text x="775" y="175" fill="#475569" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">tree_speculative_sampling_target_only</text>
+<text x="775" y="195" fill="#475569" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">Simple GLA</text>
+<text x="775" y="225" fill="#94a3b8" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">srt/kernels/speculative/ · linear/</text>
+
+<!-- Caller relationships title -->
+<text x="40" y="295" fill="#1e40af" font-size="14" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">Caller Relationships</text>
+<path d="M 40 305 L 1060 305" fill="none" stroke="#cbd5e1" stroke-width="1"/>
+
+<!-- Caller relationships table -->
+<g font-family='"Cascadia Code", "Fira Code", monospace' font-size="12">
+  <text x="60" y="333" fill="#047857">FlashAttentionBackend</text>
+  <text x="290" y="333" fill="#1e3a5f">→</text>
+  <text x="320" y="333" fill="#374151">RPA v1 / v3, KV Cache Update</text>
+
+  <text x="60" y="358" fill="#047857">MLAAttentionBackend</text>
+  <text x="290" y="358" fill="#1e3a5f">→</text>
+  <text x="320" y="358" fill="#374151">MLA v2</text>
+
+  <text x="60" y="383" fill="#b45309">FusedMoE Layer</text>
+  <text x="290" y="383" fill="#1e3a5f">→</text>
+  <text x="320" y="383" fill="#374151">Fused MoE Pipeline, GMM v1 / v2</text>
+
+  <text x="60" y="408" fill="#b45309">QuantizedLinear</text>
+  <text x="290" y="408" fill="#1e3a5f">→</text>
+  <text x="320" y="408" fill="#374151">Quantized Matmul (xla_quantized_matmul_local)</text>
+
+  <text x="60" y="433" fill="#7c3aed">EAGLEWorker</text>
+  <text x="290" y="433" fill="#1e3a5f">→</text>
+  <text x="320" y="433" fill="#374151">build_eagle_tree_structure, verify_tree_greedy,</text>
+  <text x="320" y="450" fill="#374151">tree_speculative_sampling_target_only</text>
+
+  <text x="60" y="478" fill="#7c3aed">LinearAttentionBackend</text>
+  <text x="290" y="478" fill="#1e3a5f">→</text>
+  <text x="320" y="478" fill="#374151">Simple GLA (Gated Linear Attention)</text>
+</g>
+
+<!-- Footer note -->
+<rect x="40" y="500" width="1020" height="28" rx="6" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
+<text x="550" y="518" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">All Kernels decorated with @pl.kernel, compiled via Pallas BlockSpec on TPU; falls back to JAX on CPU</text>
+</svg>

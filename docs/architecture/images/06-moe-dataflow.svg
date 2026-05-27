@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 760" width="940" height="760">
+<defs>
+  <marker id="arr-navy" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#1e3a5f"/></marker>
+  <marker id="arr-green" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#166534"/></marker>
+  <marker id="arr-amber" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#92400e"/></marker>
+  <marker id="arr-gray" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#6b7280"/></marker>
+</defs>
+<rect x="0" y="0" width="940" height="760" fill="#ffffff"/>
+
+<text x="470" y="38" fill="#1e40af" font-size="22" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">MoE Data Flow</text>
+
+<!-- Input -->
+<rect x="350" y="65" width="240" height="48" rx="8" fill="#f3f4f6" stroke="#374151" stroke-width="2"/>
+<text x="470" y="85" fill="#111827" font-size="14" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">hidden_states</text>
+<text x="470" y="103" fill="#6b7280" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">(num_tokens, hidden_size)</text>
+
+<!-- arrow input -> Gate -->
+<path d="M 470 113 L 470 142" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arr-navy)"/>
+
+<!-- Gate -->
+<rect x="320" y="145" width="300" height="62" rx="8" fill="#dbeafe" stroke="#1e3a5f" stroke-width="2"/>
+<text x="470" y="170" fill="#1e40af" font-size="15" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">GateLogit</text>
+<text x="470" y="190" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">linear + softmax / sigmoid / tanh</text>
+
+<!-- arrow Gate -> TopK -->
+<path d="M 470 207 L 470 240" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arr-navy)"/>
+<text x="585" y="227" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">router_logits</text>
+
+<!-- TopK -->
+<rect x="320" y="243" width="300" height="80" rx="8" fill="#dbeafe" stroke="#1e3a5f" stroke-width="2"/>
+<text x="470" y="268" fill="#1e40af" font-size="15" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">TopK (4 variants)</text>
+<text x="470" y="287" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">plain / biased / grouped / biased+grouped</text>
+<text x="470" y="305" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">renormalize · routed_scaling</text>
+
+<!-- EPLB sidebar -->
+<rect x="700" y="243" width="200" height="80" rx="8" fill="#f3f4f6" stroke="#4b5563" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="800" y="268" fill="#374151" font-size="14" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">EPLB remap</text>
+<text x="800" y="287" fill="#6b7280" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">logical → physical</text>
+<text x="800" y="305" fill="#6b7280" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">expert id (optional)</text>
+<path d="M 700 283 L 622 283" fill="none" stroke="#6b7280" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arr-gray)"/>
+
+<!-- arrow TopK -> branch label -->
+<path d="M 470 323 L 470 352" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arr-navy)"/>
+<text x="585" y="345" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">(topk_weights, topk_ids)</text>
+
+<!-- Implementation route splitter -->
+<rect x="280" y="355" width="380" height="40" rx="8" fill="#fafafa" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="3 2"/>
+<text x="470" y="380" fill="#374151" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Implementation Route (MoEBackend)</text>
+
+<!-- branch split arrows -->
+<path d="M 380 395 L 200 432" fill="none" stroke="#166534" stroke-width="2" marker-end="url(#arr-green)"/>
+<path d="M 560 395 L 740 432" fill="none" stroke="#92400e" stroke-width="2" marker-end="url(#arr-amber)"/>
+
+<!-- ============== EPMoE branch (left) ============== -->
+<rect x="40" y="435" width="320" height="220" rx="10" fill="#dcfce7" stroke="#166534" stroke-width="2"/>
+<text x="200" y="460" fill="#15803d" font-size="16" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">EPMoE (GMM-based)</text>
+
+<!-- EPMoE stages -->
+<rect x="65" y="475" width="270" height="34" rx="6" fill="#ffffff" stroke="#166534" stroke-width="1.5"/>
+<text x="200" y="497" fill="#15803d" font-size="12" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">_permute  (argsort + bincount)</text>
+
+<path d="M 200 509 L 200 522" fill="none" stroke="#166534" stroke-width="2" marker-end="url(#arr-green)"/>
+
+<rect x="65" y="525" width="270" height="34" rx="6" fill="#ffffff" stroke="#166534" stroke-width="1.5"/>
+<text x="200" y="547" fill="#15803d" font-size="12" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">GMM × 3 + SwiGLU</text>
+
+<path d="M 200 559 L 200 572" fill="none" stroke="#166534" stroke-width="2" marker-end="url(#arr-green)"/>
+
+<rect x="65" y="575" width="270" height="34" rx="6" fill="#ffffff" stroke="#166534" stroke-width="1.5"/>
+<text x="200" y="597" fill="#15803d" font-size="12" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">_unpermute  (einsum BKE,BK→BE)</text>
+
+<path d="M 200 609 L 200 622" fill="none" stroke="#166534" stroke-width="2" marker-end="url(#arr-green)"/>
+
+<rect x="65" y="625" width="270" height="22" rx="6" fill="#bbf7d0" stroke="#166534" stroke-width="1.5"/>
+<text x="200" y="641" fill="#14532d" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">psum("tensor") · psum("expert")</text>
+
+<!-- ============== FusedEPMoE branch (right) ============== -->
+<rect x="580" y="435" width="320" height="220" rx="10" fill="#fef3c7" stroke="#92400e" stroke-width="2"/>
+<text x="740" y="460" fill="#b45309" font-size="16" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">FusedEPMoE (Pallas mega-kernel)</text>
+
+<!-- single big box for fused stages -->
+<rect x="605" y="475" width="270" height="170" rx="8" fill="#ffffff" stroke="#92400e" stroke-width="1.5" stroke-dasharray="2 2"/>
+<text x="740" y="495" fill="#92400e" font-size="12" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">single Pallas kernel</text>
+
+<rect x="620" y="508" width="240" height="28" rx="5" fill="#fef3c7" stroke="#92400e" stroke-width="1"/>
+<text x="740" y="526" fill="#b45309" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">HBM ring-buffer A2A scatter</text>
+
+<rect x="620" y="544" width="240" height="28" rx="5" fill="#fef3c7" stroke="#92400e" stroke-width="1"/>
+<text x="740" y="562" fill="#b45309" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">dynamic FFN (gate / up / down)</text>
+
+<rect x="620" y="580" width="240" height="28" rx="5" fill="#fef3c7" stroke="#92400e" stroke-width="1"/>
+<text x="740" y="598" fill="#b45309" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">+ shared expert (in-kernel)</text>
+
+<rect x="620" y="616" width="240" height="22" rx="5" fill="#fde68a" stroke="#92400e" stroke-width="1"/>
+<text x="740" y="632" fill="#7c2d12" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">A2A gather + topk-weighted combine</text>
+
+<!-- merge arrows -->
+<path d="M 200 655 L 380 695" fill="none" stroke="#166534" stroke-width="2" marker-end="url(#arr-green)"/>
+<path d="M 740 655 L 560 695" fill="none" stroke="#92400e" stroke-width="2" marker-end="url(#arr-amber)"/>
+
+<!-- Output -->
+<rect x="350" y="700" width="240" height="48" rx="8" fill="#ede9fe" stroke="#5b21b6" stroke-width="2"/>
+<text x="470" y="720" fill="#5b21b6" font-size="14" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">output</text>
+<text x="470" y="738" fill="#7c3aed" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">(num_tokens, hidden_size)</text>
+
+</svg>

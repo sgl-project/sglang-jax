@@ -1,0 +1,130 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 680" width="1200" height="680">
+<defs>
+  <marker id="arr-navy" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#1e3a5f"/></marker>
+  <marker id="arr-amber" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#b45309"/></marker>
+  <marker id="arr-green" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#047857"/></marker>
+</defs>
+<rect x="0" y="0" width="1200" height="680" fill="#ffffff"/>
+
+<text x="600" y="42" fill="#1e40af" font-size="26" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Scheduler Event Loop</text>
+
+<!-- ============ Normal Mode ============ -->
+<rect x="40" y="70" width="500" height="590" rx="8" fill="none" stroke="#1e3a5f" stroke-width="2" stroke-dasharray="8 4"/>
+<text x="290" y="93" fill="#1e40af" font-size="16" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Normal Mode</text>
+
+<!-- 1 recv_requests -->
+<rect x="120" y="115" width="340" height="56" rx="8" fill="#dbeafe" stroke="#1e3a5f" stroke-width="2"/>
+<text x="290" y="138" fill="#1e40af" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">1. recv_requests()</text>
+<text x="290" y="158" fill="#1e40af" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">process_input_requests()</text>
+
+<path d="M 290 171 L 290 195" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arr-navy)"/>
+
+<!-- paused? diamond -->
+<polygon points="290,197 360,232 290,267 220,232" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+<text x="290" y="237" fill="#b45309" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">paused?</text>
+
+<path d="M 360 232 L 410 232" fill="none" stroke="#b45309" stroke-width="2" marker-end="url(#arr-amber)"/>
+<text x="385" y="222" fill="#b45309" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">yes</text>
+<text x="412" y="237" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">continue</text>
+
+<path d="M 290 267 L 290 290" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arr-navy)"/>
+<text x="295" y="282" fill="#1e3a5f" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">no</text>
+
+<!-- 2 get_next_batch_to_run -->
+<rect x="120" y="293" width="340" height="50" rx="8" fill="#a7f3d0" stroke="#047857" stroke-width="2"/>
+<text x="290" y="323" fill="#047857" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">2. get_next_batch_to_run()</text>
+
+<path d="M 290 343 L 290 365" fill="none" stroke="#047857" stroke-width="2" marker-end="url(#arr-green)"/>
+
+<!-- batch? diamond -->
+<polygon points="290,367 360,402 290,437 220,402" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+<text x="290" y="407" fill="#b45309" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">batch?</text>
+
+<!-- no → check_memory -->
+<path d="M 360 402 L 408 402" fill="none" stroke="#b45309" stroke-width="2" marker-end="url(#arr-amber)"/>
+<text x="384" y="392" fill="#b45309" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">no</text>
+<rect x="410" y="385" width="100" height="38" rx="6" fill="#f1f5f9" stroke="#64748b" stroke-width="1"/>
+<text x="460" y="400" fill="#64748b" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">check_memory</text>
+<text x="460" y="414" fill="#64748b" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">reset ratio</text>
+
+<path d="M 290 437 L 290 460" fill="none" stroke="#047857" stroke-width="2" marker-end="url(#arr-green)"/>
+<text x="295" y="452" fill="#047857" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">yes</text>
+
+<!-- 3 run_batch -->
+<rect x="120" y="463" width="340" height="48" rx="8" fill="#a7f3d0" stroke="#047857" stroke-width="2"/>
+<text x="290" y="492" fill="#047857" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">3. run_batch()</text>
+
+<path d="M 290 511 L 290 530" fill="none" stroke="#047857" stroke-width="2" marker-end="url(#arr-green)"/>
+
+<!-- 4 process_batch_result -->
+<rect x="120" y="533" width="340" height="48" rx="8" fill="#a7f3d0" stroke="#047857" stroke-width="2"/>
+<text x="290" y="562" fill="#047857" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">4. process_batch_result()</text>
+
+<text x="290" y="608" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">last_batch = batch</text>
+
+<!-- Loop back -->
+<path d="M 120 600 L 70 600 L 70 143 L 120 143" fill="none" stroke="#1e3a5f" stroke-width="2" stroke-dasharray="8 4" marker-end="url(#arr-navy)"/>
+<text x="80" y="370" fill="#1e3a5f" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Lo</text>
+<text x="80" y="384" fill="#1e3a5f" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">op</text>
+
+<!-- Normal mode footer note -->
+<rect x="80" y="630" width="420" height="22" rx="6" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
+<text x="290" y="645" fill="#64748b" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Prefill Batch prioritized over Decode Batch · check_memory() when idle</text>
+
+<!-- ============ Overlap Mode ============ -->
+<rect x="580" y="70" width="580" height="590" rx="8" fill="none" stroke="#047857" stroke-width="2" stroke-dasharray="8 4"/>
+<text x="870" y="93" fill="#047857" font-size="16" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Overlap Mode</text>
+
+<!-- Time axis -->
+<text x="610" y="125" fill="#64748b" font-size="12" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">Time →</text>
+<path d="M 660 130 L 1130 130" fill="none" stroke="#cbd5e1" stroke-width="1"/>
+
+<!-- TPU row -->
+<text x="615" y="170" fill="#16a34a" font-size="14" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">TPU</text>
+<rect x="660" y="155" width="225" height="50" rx="8" fill="#bbf7d0" stroke="#16a34a" stroke-width="2"/>
+<text x="772" y="186" fill="#16a34a" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">run_batch(N)</text>
+
+<rect x="900" y="155" width="225" height="50" rx="8" fill="#bbf7d0" stroke="#16a34a" stroke-width="2"/>
+<text x="1012" y="186" fill="#16a34a" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">run_batch(N+1)</text>
+
+<!-- Time separators -->
+<path d="M 885 150 L 885 290" fill="none" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4 3"/>
+<path d="M 1125 150 L 1125 290" fill="none" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4 3"/>
+
+<!-- Host row -->
+<text x="615" y="252" fill="#2563eb" font-size="14" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">Host</text>
+<rect x="660" y="232" width="107" height="48" rx="8" fill="#bfdbfe" stroke="#2563eb" stroke-width="2"/>
+<text x="713" y="252" fill="#2563eb" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">process</text>
+<text x="713" y="269" fill="#2563eb" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">(N-1)</text>
+
+<rect x="775" y="232" width="107" height="48" rx="8" fill="#bfdbfe" stroke="#2563eb" stroke-width="2"/>
+<text x="828" y="252" fill="#2563eb" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">build</text>
+<text x="828" y="269" fill="#2563eb" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">(N+1)</text>
+
+<rect x="900" y="232" width="107" height="48" rx="8" fill="#bfdbfe" stroke="#2563eb" stroke-width="2"/>
+<text x="953" y="252" fill="#2563eb" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">process</text>
+<text x="953" y="269" fill="#2563eb" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">(N)</text>
+
+<rect x="1015" y="232" width="107" height="48" rx="8" fill="#bfdbfe" stroke="#2563eb" stroke-width="2"/>
+<text x="1068" y="252" fill="#2563eb" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">build</text>
+<text x="1068" y="269" fill="#2563eb" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">(N+2)</text>
+
+<!-- Pipeline notes -->
+<rect x="600" y="320" width="540" height="135" rx="8" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
+<text x="615" y="340" fill="#047857" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">Pipeline Notes</text>
+<text x="615" y="362" fill="#374151" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">· While TPU runs run_batch(N), Host processes the previous round in parallel</text>
+<text x="630" y="380" fill="#374151" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">process_batch_result(N-1) and build the next batch</text>
+<text x="615" y="402" fill="#374151" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">· Future Token IDs: run_batch() returns negative-index tokens immediately</text>
+<text x="630" y="420" fill="#374151" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">real result resolved next round via resolve_future_token_ids()</text>
+<text x="615" y="442" fill="#374151" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">· First Batch uses DUMMY_FIRST virtual batch to bootstrap the pipeline</text>
+
+<!-- get_next_batch_to_run decision -->
+<rect x="600" y="470" width="540" height="170" rx="8" fill="#f0fdf4" stroke="#e2e8f0" stroke-width="1"/>
+<text x="615" y="490" fill="#047857" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">get_next_batch_to_run() decision logic</text>
+<text x="615" y="514" fill="#374151" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">1. Handle chunked_req (split off pending part, await next round)</text>
+<text x="615" y="536" fill="#374151" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">2. Merge previous Prefill Batch into running_batch (merge_batch)</text>
+<text x="615" y="558" fill="#374151" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">3. Try get_new_batch_prefill() → return Prefill Batch (priority)</text>
+<text x="615" y="580" fill="#374151" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">4. Otherwise try update_running_batch() → return Decode Batch or None</text>
+<text x="615" y="610" fill="#475569" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">Pre-step: retract_decode evicts some Decode requests on OOM</text>
+<text x="615" y="628" fill="#475569" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">requeued to waiting_queue for rescheduling</text>
+</svg>

@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 1680" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#15803d"/>
+    </marker>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0e7490"/>
+    </marker>
+    <style>
+      .title    { font-size: 22px; font-weight: 800; fill: #0f172a; }
+      .subtitle { font-size: 13px; fill: #475569; }
+      .modTitle { font-size: 15px; font-weight: 700; fill: #0f172a; }
+      .modSub   { font-size: 13px; fill: #1e293b; }
+      .modPath  { font-size: 11.5px; fill: #475569; font-family: 'SF Mono', Menlo, Consolas, monospace; }
+      .code     { font-size: 13px; fill: #0f172a; font-family: 'SF Mono', Menlo, Consolas, monospace; }
+      .codeKey  { font-size: 13px; fill: #b45309; font-family: 'SF Mono', Menlo, Consolas, monospace; font-weight: 700; }
+      .edge     { font-size: 12px; fill: #1e293b; font-weight: 600; }
+      .note     { font-size: 11.5px; fill: #64748b; font-style: italic; }
+      .tag      { font-size: 10.5px; font-weight: 700; fill: #ffffff; }
+    </style>
+  </defs>
+
+  <!-- title -->
+  <text x="40" y="40" class="title">3-Level Batch Conversion Flow</text>
+  <text x="40" y="62" class="subtitle">Full data conversion chain: ScheduleBatch → ModelWorkerBatch → ForwardBatch</text>
+
+  <!-- ============== STEP 1: ScheduleBatch ============== -->
+  <g>
+    <rect x="40" y="100" width="1320" height="180" rx="10" fill="#ede9fe" stroke="#6d28d9" stroke-width="2"/>
+    <rect x="40" y="100" width="1320" height="28" rx="10" fill="#6d28d9"/>
+    <text x="56" y="120" class="tag">LEVEL 1 · ScheduleBatch (Scheduler)</text>
+    <text x="56" y="152" class="modTitle">ScheduleBatch</text>
+    <text x="56" y="172" class="modPath">managers/schedule_batch.py</text>
+
+    <rect x="56" y="188" width="1208" height="78" rx="6" fill="#f5f3ff" stroke="#a78bfa"/>
+    <text x="72" y="210" class="code">Batch built by Scheduler, contains:</text>
+    <text x="72" y="230" class="modSub"><tspan class="codeKey">• reqs: List[Req]</tspan> — list of request objects</text>
+    <text x="72" y="250" class="modSub"><tspan class="codeKey">• input_ids, positions, req_pool_indices</tspan> — numpy arrays</text>
+    <text x="72" y="270" class="note">Host-side data structure used for scheduling decisions and KV Cache management</text>
+  </g>
+
+  <path d="M 700 280 L 700 310" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+  <text x="712" y="302" class="edge">Scheduler → ModelWorker</text>
+
+  <!-- ============== STEP 2: ModelWorkerBatch ============== -->
+  <g>
+    <rect x="40" y="318" width="1320" height="240" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <rect x="40" y="318" width="1320" height="28" rx="10" fill="#15803d"/>
+    <text x="56" y="338" class="tag">LEVEL 2 · ModelWorkerBatch (TP Worker)</text>
+    <text x="56" y="370" class="modTitle">ModelWorkerBatch.from_schedule_batch(schedule_batch)</text>
+    <text x="56" y="390" class="modPath">managers/schedule_batch.py</text>
+
+    <rect x="56" y="406" width="1208" height="138" rx="6" fill="#f0fdf4" stroke="#86efac"/>
+    <text x="72" y="428" class="code">Conversion operations:</text>
+    <text x="72" y="448" class="modSub"><tspan class="codeKey">• Add sampling_info: SamplingBatchInfo</tspan> — sampling params (temperature, top_p, top_k, ...)</text>
+    <text x="72" y="468" class="modSub"><tspan class="codeKey">• Add lora_ids: List[str]</tspan> — LoRA Adapter IDs</text>
+    <text x="72" y="488" class="modSub"><tspan class="codeKey">• Add capture_hidden_mode: CaptureHiddenMode</tspan> — Hidden State capture mode</text>
+    <text x="72" y="508" class="modSub"><tspan class="codeKey">• Add input_embedding / deepstack_visual_embedding</tspan> — Multimodal inputs</text>
+    <text x="72" y="528" class="note">Still Host-side numpy arrays, but now contains all params required for model execution</text>
+    <text x="72" y="548" class="note">TP Worker holds ModelWorkerBatch, used to invoke ModelRunner</text>
+  </g>
+
+  <path d="M 700 558 L 700 588" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+  <text x="712" y="580" class="edge">ModelWorker → ModelRunner</text>
+
+  <!-- ============== STEP 3: ForwardBatch ============== -->
+  <g>
+    <rect x="40" y="596" width="1320" height="280" rx="10" fill="#cffafe" stroke="#0e7490" stroke-width="2"/>
+    <rect x="40" y="596" width="1320" height="28" rx="10" fill="#0e7490"/>
+    <text x="56" y="616" class="tag">LEVEL 3 · ForwardBatch (ModelRunner)</text>
+    <text x="56" y="648" class="modTitle">ForwardBatch.init_new(batch, model_runner)</text>
+    <text x="56" y="668" class="modPath">model_executor/forward_batch_info.py</text>
+
+    <rect x="56" y="684" width="1208" height="178" rx="6" fill="#ecfeff" stroke="#67e8f9"/>
+    <text x="72" y="706" class="code">Convert to JAX pytree (device-side data structure):</text>
+    <text x="72" y="726" class="modSub"><tspan class="codeKey">• input_ids: jax.Array</tspan> — converted from numpy to JAX Array, transferred to device</text>
+    <text x="72" y="746" class="modSub"><tspan class="codeKey">• positions: jax.Array</tspan> — Position IDs</text>
+    <text x="72" y="766" class="modSub"><tspan class="codeKey">• req_to_token_pool: ReqToTokenPool</tspan> — KV Cache index map (Host-side)</text>
+    <text x="72" y="786" class="modSub"><tspan class="codeKey">• attn_backend: AttentionBackend</tspan> — Attention impl (FlashAttention / MLA / Native)</text>
+    <text x="72" y="806" class="modSub"><tspan class="codeKey">• sampling_info: SamplingBatchInfo</tspan> — sampling params</text>
+    <text x="72" y="826" class="note">Note: <tspan class="code">memory_pools</tspan> is not a ForwardBatch field; ModelRunner passes it to JIT separately (donate_argnames)</text>
+    <text x="72" y="846" class="note">Registered with @register_pytree_node_class, can be passed directly to JIT-compiled functions</text>
+    <text x="72" y="866" class="note">Device data (JAX Array) and Host metadata (numpy) coexist, unified via pytree mechanism</text>
+  </g>
+
+  <path d="M 700 876 L 700 906" stroke="#0e7490" stroke-width="2.5" fill="none" marker-end="url(#arrowBlue)"/>
+  <text x="712" y="898" class="edge">Pass to JIT-compiled model</text>
+
+  <!-- ============== STEP 4: Model Forward ============== -->
+  <g>
+    <rect x="40" y="914" width="1320" height="140" rx="10" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+    <rect x="40" y="914" width="1320" height="28" rx="10" fill="#b45309"/>
+    <text x="56" y="934" class="tag">STEP 4 · Model Forward</text>
+    <text x="56" y="966" class="modTitle">model(forward_batch.input_ids, forward_batch.positions, forward_batch)</text>
+    <text x="56" y="986" class="modPath">models/*.py (e.g. llama.py, qwen2.py)</text>
+    <text x="56" y="1006" class="modSub">• JIT-compiled model function, accepts ForwardBatch as parameter</text>
+    <text x="56" y="1026" class="modSub">• Model computes layer-by-layer, reads/writes KV Cache via <tspan class="codeKey">forward_batch.attn_backend.forward()</tspan></text>
+    <text x="56" y="1046" class="modSub">• Returns <tspan class="codeKey">logits: jax.Array</tspan> (shape: [batch_size, vocab_size])</text>
+  </g>
+
+  <!-- Footer notes -->
+  <g>
+    <rect x="40" y="1090" width="1320" height="550" rx="10" fill="#e0e7ff" stroke="#4f46e5" stroke-width="2"/>
+    <rect x="40" y="1090" width="1320" height="28" rx="10" fill="#4f46e5"/>
+    <text x="56" y="1110" class="tag">Key Design Notes</text>
+
+    <text x="56" y="1142" class="modTitle">Why three levels of Batch?</text>
+    <text x="56" y="1162" class="modSub">• <tspan class="codeKey">ScheduleBatch</tspan>: Scheduler view, focuses on request management and KV Cache allocation</text>
+    <text x="56" y="1180" class="modSub">• <tspan class="codeKey">ModelWorkerBatch</tspan>: TP Worker view, adds sampling params and LoRA info needed for model execution</text>
+    <text x="56" y="1198" class="modSub">• <tspan class="codeKey">ForwardBatch</tspan>: ModelRunner view, converted to JAX pytree, can be passed directly to JIT-compiled functions</text>
+
+    <text x="56" y="1226" class="modTitle">JAX pytree Mechanism</text>
+    <text x="56" y="1246" class="modSub">• JAX requires JIT inputs to be pytrees (nested dict/list/tuple + JAX Array/numpy)</text>
+    <text x="56" y="1264" class="modSub">• ForwardBatch is registered as a pytree via <tspan class="code">@register_pytree_node_class</tspan></text>
+    <text x="56" y="1282" class="modSub">• Implements <tspan class="code">tree_flatten()</tspan> and <tspan class="code">tree_unflatten()</tspan> to define serialization/deserialization</text>
+
+    <text x="56" y="1310" class="modTitle">Host-Device Data Transfer</text>
+    <text x="56" y="1330" class="modSub">• numpy array → JAX Array: automatically transferred to device (TPU)</text>
+    <text x="56" y="1348" class="modSub">• <tspan class="codeKey">req_to_token_pool</tspan> stays on Host (numpy) since Scheduler needs to read/write frequently</text>
+    <text x="56" y="1366" class="modSub">• <tspan class="codeKey">memory_pools</tspan> on device (JAX Array), passed to JIT by ModelRunner via donate_argnames</text>
+
+    <text x="56" y="1394" class="modTitle">Shape Bucketing</text>
+    <text x="56" y="1414" class="modSub">• All arrays padded to predefined bucket sizes (e.g. [32, 64, 128, 256, ...])</text>
+    <text x="56" y="1432" class="modSub">• Avoids re-JIT compilation when batch size changes</text>
+    <text x="56" y="1450" class="modSub">• <tspan class="code">real_bs</tspan> field records actual batch size for masking invalid data</text>
+
+    <text x="56" y="1478" class="modTitle">Attention Backend Abstraction</text>
+    <text x="56" y="1498" class="modSub">• ForwardBatch holds reference to <tspan class="codeKey">attn_backend</tspan></text>
+    <text x="56" y="1516" class="modSub">• Model layer calls <tspan class="code">attn_backend.forward(layer, q, k, v, forward_batch)</tspan></text>
+    <text x="56" y="1534" class="modSub">• Backend reads/writes KV Cache, performs Attention computation (FlashAttention / MLA / Native)</text>
+
+    <text x="56" y="1562" class="modTitle">Data Flow Summary</text>
+    <text x="56" y="1582" class="modSub">Scheduler (Host) → TP Worker (Host) → ModelRunner (Host → TPU) → Model (TPU)</text>
+    <text x="56" y="1600" class="modSub">Each level adds info needed by that layer, ultimately forming a directly executable device-side structure</text>
+    <text x="56" y="1618" class="modSub">This layered design separates concerns: each component only handles its own data conversion</text>
+  </g>
+</svg>

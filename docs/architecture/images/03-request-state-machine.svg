@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 660" width="1320" height="660">
+<defs>
+  <marker id="arr-navy" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#1e3a5f"/></marker>
+  <marker id="arr-green" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#047857"/></marker>
+  <marker id="arr-amber" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#b45309"/></marker>
+  <marker id="arr-purple" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#6d28d9"/></marker>
+  <marker id="arr-red" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#dc2626"/></marker>
+</defs>
+<rect x="0" y="0" width="1320" height="660" fill="#ffffff"/>
+
+<text x="660" y="42" fill="#1e40af" font-size="24" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Request State Machine</text>
+
+<!-- GRAMMAR_QUEUE above WAITING -->
+<text x="180" y="90" fill="#6d28d9" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">handle_generate_request()</text>
+<text x="180" y="106" fill="#64748b" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">grammar required, not cached</text>
+<path d="M 180 113 L 180 138" fill="none" stroke="#6d28d9" stroke-width="2" marker-end="url(#arr-purple)"/>
+
+<rect x="80" y="140" width="200" height="55" rx="8" fill="#ede9fe" stroke="#6d28d9" stroke-width="2"/>
+<text x="180" y="175" fill="#6d28d9" font-size="14" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">GRAMMAR_QUEUE</text>
+
+<!-- Entrypoint direct to WAITING -->
+<text x="450" y="90" fill="#1e3a5f" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">handle_generate_request()</text>
+<text x="450" y="106" fill="#64748b" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">no grammar / grammar cached</text>
+<path d="M 450 113 L 450 313" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arr-navy)"/>
+
+<!-- GRAMMAR_QUEUE → WAITING (down then right) -->
+<path d="M 180 195 L 180 343 L 348 343" fill="none" stroke="#6d28d9" stroke-width="2" marker-end="url(#arr-purple)"/>
+<rect x="65" y="225" width="230" height="44" rx="6" fill="#faf5ff" stroke="#ddd6fe" stroke-width="1"/>
+<text x="180" y="241" fill="#6d28d9" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">grammar compiled</text>
+<text x="180" y="258" fill="#6d28d9" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">move_ready_grammar_requests()</text>
+
+<!-- WAITING -->
+<rect x="350" y="315" width="200" height="55" rx="8" fill="#dbeafe" stroke="#1e3a5f" stroke-width="2"/>
+<text x="450" y="350" fill="#1e3a5f" font-size="14" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">WAITING</text>
+
+<!-- PREFILLING -->
+<rect x="640" y="315" width="200" height="55" rx="8" fill="#a7f3d0" stroke="#047857" stroke-width="2"/>
+<text x="740" y="350" fill="#047857" font-size="14" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">PREFILLING</text>
+
+<!-- WAITING → PREFILLING -->
+<path d="M 550 343 L 638 343" fill="none" stroke="#047857" stroke-width="2" marker-end="url(#arr-green)"/>
+<rect x="555" y="296" width="170" height="38" rx="6" fill="#ecfdf5" stroke="#a7f3d0" stroke-width="1"/>
+<text x="640" y="312" fill="#047857" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">get_new_batch_prefill()</text>
+<text x="640" y="326" fill="#047857" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">selected by PrefillAdder</text>
+
+<!-- DECODING -->
+<rect x="930" y="315" width="200" height="55" rx="8" fill="#a7f3d0" stroke="#047857" stroke-width="2"/>
+<text x="1030" y="350" fill="#047857" font-size="14" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">DECODING</text>
+
+<!-- PREFILLING → DECODING -->
+<path d="M 840 343 L 928 343" fill="none" stroke="#047857" stroke-width="2" marker-end="url(#arr-green)"/>
+<rect x="845" y="296" width="120" height="38" rx="6" fill="#ecfdf5" stroke="#a7f3d0" stroke-width="1"/>
+<text x="905" y="312" fill="#047857" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">merge_batch()</text>
+<text x="905" y="326" fill="#047857" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">merge into running_batch</text>
+
+<!-- FINISHED -->
+<rect x="1200" y="315" width="100" height="55" rx="8" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+<text x="1250" y="350" fill="#b45309" font-size="14" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">FINISHED</text>
+
+<!-- DECODING → FINISHED -->
+<path d="M 1130 343 L 1198 343" fill="none" stroke="#b45309" stroke-width="2" marker-end="url(#arr-amber)"/>
+<rect x="1135" y="296" width="60" height="38" rx="6" fill="#fffbeb" stroke="#fde68a" stroke-width="1"/>
+<text x="1165" y="312" fill="#b45309" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">check_</text>
+<text x="1165" y="326" fill="#b45309" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">finished()</text>
+
+<!-- PREFILLING → CHUNKED_PREFILL -->
+<path d="M 740 370 L 740 425" fill="none" stroke="#047857" stroke-width="2" stroke-dasharray="8 4" marker-end="url(#arr-green)"/>
+<text x="752" y="400" fill="#047857" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">is_chunked &gt; 0</text>
+
+<!-- CHUNKED_PREFILL -->
+<rect x="640" y="430" width="200" height="60" rx="8" fill="#d1fae5" stroke="#047857" stroke-width="2" stroke-dasharray="8 4"/>
+<text x="740" y="455" fill="#047857" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">CHUNKED_PREFILL</text>
+<text x="740" y="476" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Continue next round / done → Decode</text>
+
+<!-- CHUNKED_PREFILL → WAITING (release old slots, requeue) -->
+<path d="M 640 460 L 450 460 L 450 372" fill="none" stroke="#047857" stroke-width="2" stroke-dasharray="8 4" marker-end="url(#arr-green)"/>
+<text x="540" y="478" fill="#047857" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">requeued for continuation</text>
+<text x="540" y="492" fill="#94a3b8" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">release old slots</text>
+
+<!-- abort_request() side note -->
+<rect x="930" y="425" width="200" height="42" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-width="1" stroke-dasharray="6 4"/>
+<text x="1030" y="442" fill="#dc2626" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">abort_request()</text>
+<text x="1030" y="458" fill="#dc2626" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">any state → FINISH_ABORT</text>
+
+<!-- abort → FINISHED -->
+<path d="M 1130 446 L 1250 446 L 1250 372" fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arr-red)"/>
+
+<!-- DECODING → WAITING (retract_decode OOM) -->
+<path d="M 1030 370 L 1030 540 L 450 540 L 450 372" fill="none" stroke="#dc2626" stroke-width="2" marker-end="url(#arr-red)"/>
+<text x="740" y="558" fill="#dc2626" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">retract_decode() — OOM · reset_for_retract() → requeue</text>
+
+<!-- Bottom Finish Reason note -->
+<rect x="80" y="585" width="700" height="60" rx="8" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
+<text x="100" y="605" fill="#1e40af" font-size="12" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">Finish Reason</text>
+<text x="100" y="625" fill="#374151" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">FINISH_MATCHED_TOKEN (EOS / stop_token_ids) · FINISH_LENGTH (max_tokens)</text>
+<text x="100" y="641" fill="#374151" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">FINISH_MATCHED_STR (stop strings) · FINISH_ABORT (abort / OOM)</text>
+
+<!-- Legend -->
+<rect x="800" y="585" width="490" height="60" rx="8" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
+<path d="M 820 605 L 860 605" stroke="#047857" stroke-width="2" fill="none" marker-end="url(#arr-green)"/>
+<text x="870" y="609" fill="#374151" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">Normal transition</text>
+<path d="M 820 628 L 860 628" stroke="#047857" stroke-width="2" stroke-dasharray="6 4" fill="none" marker-end="url(#arr-green)"/>
+<text x="870" y="632" fill="#374151" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">Conditional branch</text>
+<path d="M 1030 605 L 1070 605" stroke="#dc2626" stroke-width="2" fill="none" marker-end="url(#arr-red)"/>
+<text x="1080" y="609" fill="#374151" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">Exception / interrupt</text>
+<path d="M 1030 628 L 1070 628" stroke="#6d28d9" stroke-width="2" fill="none" marker-end="url(#arr-purple)"/>
+<text x="1080" y="632" fill="#374151" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">grammar path</text>
+</svg>

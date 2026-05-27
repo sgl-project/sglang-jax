@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 480" width="900" height="480">
+<defs>
+  <marker id="arr-navy" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#1e3a5f"/></marker>
+</defs>
+<rect x="0" y="0" width="900" height="480" fill="#ffffff"/>
+
+<text x="450" y="42" fill="#1e40af" font-size="24" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Model Class Hierarchy</text>
+
+<!-- ForCausalLM -->
+<rect x="280" y="75" width="220" height="50" rx="8" fill="#dbeafe" stroke="#1e3a5f" stroke-width="2"/>
+<text x="390" y="105" fill="#1e40af" font-size="16" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">ForCausalLM</text>
+
+<path d="M 390 125 L 390 150" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arr-navy)"/>
+
+<!-- Model -->
+<rect x="280" y="153" width="220" height="50" rx="8" fill="#d1fae5" stroke="#047857" stroke-width="2"/>
+<text x="390" y="183" fill="#047857" font-size="16" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Model</text>
+
+<path d="M 390 203 L 390 228" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arr-navy)"/>
+
+<!-- DecoderLayer × N -->
+<rect x="240" y="231" width="300" height="50" rx="8" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+<text x="390" y="261" fill="#b45309" font-size="16" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">DecoderLayer × N</text>
+
+<!-- Branch to Attention and MLP/MoE -->
+<path d="M 320 281 L 230 320" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arr-navy)"/>
+<path d="M 460 281 L 550 320" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arr-navy)"/>
+
+<!-- Attention -->
+<rect x="80" y="323" width="280" height="105" rx="8" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
+<text x="220" y="348" fill="#7c3aed" font-size="14" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Attention</text>
+<text x="220" y="370" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Q/K/V/O LinearBase</text>
+<text x="220" y="389" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">RotaryEmbedding</text>
+<text x="220" y="408" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">RadixAttention</text>
+
+<!-- MLP / MoE -->
+<rect x="420" y="323" width="280" height="105" rx="8" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
+<text x="560" y="348" fill="#7c3aed" font-size="14" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">MLP / MoE</text>
+<text x="560" y="370" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">gate_proj + up_proj</text>
+<text x="560" y="389" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">down_proj</text>
+<text x="560" y="408" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">or GateLogit + TopK + EPMoE</text>
+
+<!-- Side Components: dashed + horizontal connection to ForCausalLM -->
+<path d="M 500 100 L 700 100" fill="none" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4 3"/>
+<rect x="700" y="75" width="180" height="125" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="790" y="98" fill="#64748b" font-size="12" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Side Components</text>
+<rect x="715" y="115" width="150" height="75" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+<text x="790" y="135" fill="#475569" font-size="12" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">ParallelLMHead</text>
+<text x="790" y="155" fill="#475569" font-size="12" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">LogitsProcessor</text>
+<text x="790" y="175" fill="#475569" font-size="12" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Sampler</text>
+
+<!-- Footer note -->
+<rect x="40" y="445" width="820" height="28" rx="6" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
+<text x="450" y="463" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">DecoderLayer list wrapped in nnx.data([...]) to prevent NNX auto-flattening</text>
+</svg>

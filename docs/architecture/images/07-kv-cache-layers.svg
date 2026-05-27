@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 480" width="940" height="480">
+<defs>
+  <marker id="arr-navy" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#1e3a5f"/></marker>
+</defs>
+<rect x="0" y="0" width="940" height="480" fill="#ffffff"/>
+
+<text x="470" y="42" fill="#1e40af" font-size="22" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">KV Cache Four-Layer Architecture</text>
+
+<!-- Layer 1 -->
+<rect x="60" y="75" width="540" height="60" rx="8" fill="#dbeafe" stroke="#1e3a5f" stroke-width="2"/>
+<text x="80" y="98" fill="#1e40af" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">Layer 1 · Coordination</text>
+<text x="80" y="118" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">common.alloc_token_slots · evict_from_tree_cache</text>
+
+<path d="M 330 135 L 330 153" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arr-navy)"/>
+
+<!-- Layer 2 -->
+<rect x="60" y="155" width="540" height="60" rx="8" fill="#d1fae5" stroke="#047857" stroke-width="2"/>
+<text x="80" y="178" fill="#047857" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">Layer 2 · Prefix Cache</text>
+<text x="80" y="198" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">RadixCache · SWARadixCache · ChunkCache · match_prefix · evict</text>
+
+<path d="M 330 215 L 330 233" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arr-navy)"/>
+
+<!-- Layer 3 -->
+<rect x="60" y="235" width="540" height="80" rx="8" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+<text x="80" y="258" fill="#b45309" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">Layer 3 · Allocator</text>
+<text x="80" y="278" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">TokenToKVPoolAllocator · PagedTokenToKVPoolAllocator</text>
+<text x="80" y="296" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">SWATokenToKVPoolAllocator</text>
+
+<path d="M 330 315 L 330 333" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arr-navy)"/>
+
+<!-- Layer 4 -->
+<rect x="60" y="335" width="540" height="95" rx="8" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
+<text x="80" y="358" fill="#7c3aed" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">Layer 4 · Memory Pool</text>
+<text x="80" y="378" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">MHATokenToKVPool · MLATokenToKVPool · SWAKVPool</text>
+<text x="80" y="396" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">RecurrentStatePool · ReqToTokenPool</text>
+<text x="80" y="416" fill="#475569" font-size="10" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">jnp.zeros([num_pages, page_size, ...]) on TPU HBM</text>
+
+<!-- RadixTree Node annotation -->
+<rect x="640" y="155" width="260" height="195" rx="8" fill="#f8fafc" stroke="#64748b" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="770" y="180" fill="#64748b" font-size="13" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">RadixTree Node</text>
+<rect x="660" y="195" width="220" height="105" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+<text x="675" y="215" fill="#475569" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">key:         RadixKey</text>
+<text x="675" y="232" fill="#475569" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">value:       kv_indices</text>
+<text x="675" y="249" fill="#475569" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">children:    dict</text>
+<text x="675" y="266" fill="#475569" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">lock_ref:    int</text>
+<text x="675" y="283" fill="#475569" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="start">last_access: float</text>
+<text x="770" y="320" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">LRU Eviction</text>
+<text x="770" y="338" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">leaf nodes first</text>
+
+<!-- Dashed connector Layer 2 → RadixTree Node -->
+<path d="M 600 185 L 640 230" fill="none" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4 3"/>
+
+<!-- Footer note -->
+<rect x="60" y="445" width="820" height="28" rx="6" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
+<text x="470" y="463" fill="#64748b" font-size="11" font-family='"Cascadia Code", "Fira Code", monospace' text-anchor="middle">Page Size set by server_args.page_size (default 1) · Project currently runs on TPU only</text>
+</svg>

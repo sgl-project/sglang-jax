@@ -1,0 +1,171 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 1920" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#15803d"/>
+    </marker>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0e7490"/>
+    </marker>
+    <marker id="arrowPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/>
+    </marker>
+    <style>
+      .title    { font-size: 22px; font-weight: 800; fill: #0f172a; }
+      .subtitle { font-size: 13px; fill: #475569; }
+      .modTitle { font-size: 15px; font-weight: 700; fill: #0f172a; }
+      .modSub   { font-size: 13px; fill: #1e293b; }
+      .modPath  { font-size: 11.5px; fill: #475569; font-family: 'SF Mono', Menlo, Consolas, monospace; }
+      .code     { font-size: 13px; fill: #0f172a; font-family: 'SF Mono', Menlo, Consolas, monospace; }
+      .codeKey  { font-size: 13px; fill: #b45309; font-family: 'SF Mono', Menlo, Consolas, monospace; font-weight: 700; }
+      .edge     { font-size: 12px; fill: #1e293b; font-weight: 600; }
+      .note     { font-size: 11.5px; fill: #64748b; font-style: italic; }
+      .tag      { font-size: 10.5px; font-weight: 700; fill: #ffffff; }
+    </style>
+  </defs>
+
+  <!-- title -->
+  <text x="40" y="40" class="title">Multimodal Request Flow (Qwen2.5-VL vision example)</text>
+  <text x="40" y="62" class="subtitle">GlobalScheduler → 2-Stage Pipeline (ViT → AR/Generation) → Detokenizer</text>
+
+  <!-- ============== STEP 1: HTTP Request ============== -->
+  <g>
+    <rect x="40" y="100" width="1320" height="100" rx="10" fill="#ede9fe" stroke="#6d28d9" stroke-width="2"/>
+    <rect x="40" y="100" width="1320" height="28" rx="10" fill="#6d28d9"/>
+    <text x="56" y="120" class="tag">STEP 1 · HTTP Request</text>
+    <text x="56" y="152" class="modTitle">POST /v1/chat/completions</text>
+    <text x="56" y="172" class="modPath">multimodal/entrypoint/http_server.py</text>
+    <text x="56" y="190" class="modSub">Receives multimodal chat request: <tspan class="codeKey">messages (with image_url/base64), sampling_params, ...</tspan></text>
+  </g>
+
+  <path d="M 700 200 L 700 230" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ============== STEP 2: Tokenization ============== -->
+  <g>
+    <rect x="40" y="238" width="1320" height="120" rx="10" fill="#ede9fe" stroke="#6d28d9" stroke-width="2"/>
+    <rect x="40" y="238" width="1320" height="28" rx="10" fill="#6d28d9"/>
+    <text x="56" y="258" class="tag">STEP 2 · Multimodal Tokenization</text>
+    <text x="56" y="290" class="modTitle">MultimodalTokenizer.generate()</text>
+    <text x="56" y="310" class="modPath">multimodal/manager/multimodal_tokenizer.py</text>
+    <text x="56" y="330" class="modSub">• Convert prompt to token IDs</text>
+    <text x="56" y="350" class="modSub">• Build <tspan class="codeKey">TokenizedGenerateMMReqInput</tspan>, send to GlobalScheduler over ZMQ</text>
+  </g>
+
+  <path d="M 700 358 L 700 388" stroke="#15803d" stroke-width="2.5" fill="none" marker-end="url(#arrowGreen)"/>
+  <text x="712" y="380" class="edge">ZMQ PUSH →</text>
+
+  <!-- ============== STEP 3: GlobalScheduler ============== -->
+  <g>
+    <rect x="40" y="396" width="1320" height="180" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <rect x="40" y="396" width="1320" height="28" rx="10" fill="#15803d"/>
+    <text x="56" y="416" class="tag">STEP 3 · GlobalScheduler Receives Request</text>
+    <text x="56" y="448" class="modTitle">GlobalScheduler.event_loop()</text>
+    <text x="56" y="468" class="modPath">multimodal/manager/global_scheduler.py</text>
+    <text x="56" y="488" class="modSub">• Identify request type via <tspan class="codeKey">TypeBasedDispatcher</tspan></text>
+    <text x="56" y="508" class="modSub">• Call <tspan class="codeKey">convert_request()</tspan> to create a <tspan class="codeKey">Req</tspan> object</text>
+    <text x="56" y="528" class="modSub">• Add request to <tspan class="codeKey">req_store</tspan> (rid → ReqTrackingState mapping)</text>
+    <text x="56" y="548" class="modSub">• Push request into Stage 0's <tspan class="codeKey">in_queue</tspan></text>
+    <text x="56" y="568" class="note">ReqTrackingState tracks the current Stage index of the request</text>
+  </g>
+
+  <path d="M 700 576 L 700 606" stroke="#0e7490" stroke-width="2.5" fill="none" marker-end="url(#arrowBlue)"/>
+  <text x="712" y="598" class="edge">Queue.put() →</text>
+
+  <!-- ============== STEP 4: Stage 0 - ViT ============== -->
+  <g>
+    <rect x="40" y="614" width="1320" height="180" rx="10" fill="#cffafe" stroke="#0e7490" stroke-width="2"/>
+    <rect x="40" y="614" width="1320" height="28" rx="10" fill="#0e7490"/>
+    <text x="56" y="634" class="tag">STEP 4 · Stage 0 - ViT Encoder</text>
+    <text x="56" y="666" class="modTitle">VitScheduler.event_loop_normal()</text>
+    <text x="56" y="686" class="modPath">multimodal/manager/scheduler/vit_scheduler.py</text>
+    <text x="56" y="706" class="modSub">• Fetch requests via <tspan class="codeKey">communication_backend.recv_requests()</tspan> (i.e. in_queue)</text>
+    <text x="56" y="726" class="modSub">• Run ViT model to extract image embeddings: <tspan class="code">Qwen2_5_VL_VisionModel</tspan></text>
+    <text x="56" y="746" class="modSub">• <tspan class="codeKey">vit_worker.forward(req)</tspan> updates req in place (attaches visual features)</text>
+    <text x="56" y="766" class="modSub">• Forward via <tspan class="codeKey">communication_backend.send_pyobj(req)</tspan> (i.e. out_queue)</text>
+    <text x="56" y="786" class="note">Independent Device Mesh, pipelined in parallel with the AR Stage</text>
+  </g>
+
+  <path d="M 700 794 L 700 824" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+  <text x="712" y="816" class="edge">GlobalScheduler forwards →</text>
+
+  <!-- ============== STEP 5: Stage 1 - AR Generation ============== -->
+  <g>
+    <rect x="40" y="832" width="1320" height="200" rx="10" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+    <rect x="40" y="832" width="1320" height="28" rx="10" fill="#b45309"/>
+    <text x="56" y="852" class="tag">STEP 5 · Stage 1 - AR (Autoregressive Generation)</text>
+    <text x="56" y="884" class="modTitle">Scheduler.event_loop_normal()  (via auto_regressive alias)</text>
+    <text x="56" y="904" class="modPath">srt/managers/scheduler.py (reuses text engine Scheduler)</text>
+    <text x="56" y="924" class="modSub">• Fetch requests with visual features via <tspan class="codeKey">communication_backend.recv_requests()</tspan></text>
+    <text x="56" y="944" class="modSub">• Concatenate visual token embeddings with text token embeddings</text>
+    <text x="56" y="964" class="modSub">• Enter <tspan class="code">Qwen2_5_VL_Generation</tspan> text decoding: Prefill → Decode loop</text>
+    <text x="56" y="984" class="modSub">• Sample next text token each step until EOS / max_tokens</text>
+    <text x="56" y="1004" class="modSub">• Emit generated token IDs via <tspan class="codeKey">send_pyobj()</tspan> (i.e. out_queue)</text>
+    <text x="56" y="1024" class="note">Reuses LLM Continuous Batching, KV Cache, and sampling stack</text>
+  </g>
+
+  <path d="M 700 1032 L 700 1062" stroke="#15803d" stroke-width="2.5" fill="none" marker-end="url(#arrowGreen)"/>
+  <text x="712" y="1054" class="edge">GlobalScheduler collects →</text>
+
+  <!-- ============== STEP 6: GlobalScheduler Output ============== -->
+  <g>
+    <rect x="40" y="1070" width="1320" height="140" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <rect x="40" y="1070" width="1320" height="28" rx="10" fill="#15803d"/>
+    <text x="56" y="1090" class="tag">STEP 6 · GlobalScheduler Collects Output</text>
+    <text x="56" y="1122" class="modTitle">GlobalScheduler reads results from Stage 1 out_queue</text>
+    <text x="56" y="1142" class="modPath">multimodal/manager/global_scheduler.py</text>
+    <text x="56" y="1162" class="modSub">• Remove request from <tspan class="codeKey">req_store</tspan></text>
+    <text x="56" y="1182" class="modSub">• Build <tspan class="codeKey">BatchTokenIDOut</tspan> and send to Detokenizer over ZMQ</text>
+    <text x="56" y="1202" class="note">Stage 1 is configured with final_output=true, marking the Pipeline endpoint</text>
+  </g>
+
+  <path d="M 700 1210 L 700 1240" stroke="#6d28d9" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+  <text x="712" y="1232" class="edge">ZMQ PUSH →</text>
+
+  <!-- ============== STEP 7: Detokenizer ============== -->
+  <g>
+    <rect x="40" y="1248" width="1320" height="120" rx="10" fill="#ede9fe" stroke="#6d28d9" stroke-width="2"/>
+    <rect x="40" y="1248" width="1320" height="28" rx="10" fill="#6d28d9"/>
+    <text x="56" y="1268" class="tag">STEP 7 · Multimodal Detokenizer</text>
+    <text x="56" y="1300" class="modTitle">MultimodalDetokenizer.event_loop()</text>
+    <text x="56" y="1320" class="modPath">multimodal/manager/multimodal_detokenizer.py</text>
+    <text x="56" y="1340" class="modSub">• Receive token IDs and incrementally decode them to text</text>
+    <text x="56" y="1360" class="modSub">• Return result to TokenizerManager and finally to client via HTTP response</text>
+  </g>
+
+  <!-- Footer notes -->
+  <g>
+    <rect x="40" y="1400" width="1320" height="500" rx="10" fill="#e0e7ff" stroke="#4f46e5" stroke-width="2"/>
+    <rect x="40" y="1400" width="1320" height="28" rx="10" fill="#4f46e5"/>
+    <text x="56" y="1420" class="tag">Key Design Notes</text>
+
+    <text x="56" y="1452" class="modTitle">Stage Pipeline Architecture</text>
+    <text x="56" y="1472" class="modSub">• Each Stage owns its own Scheduler, Model Executor, and Device Mesh</text>
+    <text x="56" y="1490" class="modSub">• Stages talk via <tspan class="code">communication_backend</tspan> (backed by queue.Queue, simplified as in_queue / out_queue)</text>
+    <text x="56" y="1508" class="modSub">• GlobalScheduler handles request routing and inter-Stage data forwarding</text>
+    <text x="56" y="1526" class="modSub">• Each Stage runs in its own thread for Pipeline parallelism</text>
+
+    <text x="56" y="1554" class="modTitle">Differences from the Text Engine</text>
+    <text x="56" y="1574" class="modSub">• Text: single Scheduler + autoregressive loop (Prefill → Decode → Decode → ...)</text>
+    <text x="56" y="1592" class="modSub">• Multimodal (Qwen2.5-VL): one-shot ViT extraction → concat with text → AR Stage reuses LLM stack</text>
+    <text x="56" y="1610" class="modSub">• Other Pipelines (e.g. T2I): ViT → Diffusion (fixed steps) → VAE, cannot fold into AR loop</text>
+
+    <text x="56" y="1638" class="modTitle">YAML-Driven Configuration</text>
+    <text x="56" y="1658" class="modSub">• Stage Pipeline defined by YAML files (multimodal/models/static_configs/*.yaml)</text>
+    <text x="56" y="1676" class="modSub">• Each model has its own Pipeline config (Qwen2.5-VL: 2-Stage; Wan T2I: 3-Stage)</text>
+    <text x="56" y="1694" class="modSub">• Config includes: Scheduler type, device count, model path, final_output flag, etc.</text>
+
+    <text x="56" y="1722" class="modTitle">ReqTrackingState</text>
+    <text x="56" y="1742" class="modSub">• GlobalScheduler maintains <tspan class="codeKey">req_store: Dict[rid, ReqTrackingState]</tspan></text>
+    <text x="56" y="1760" class="modSub">• Tracks the current Stage index (current_stage) for each request</text>
+    <text x="56" y="1778" class="modSub">• Supports Abort propagation: send AbortReq to current Stage and clean up resources</text>
+
+    <text x="56" y="1806" class="modTitle">Radix Cache Disabled</text>
+    <text x="56" y="1826" class="modSub">• Visual Token sequences in multimodal requests rarely repeat; Prefix sharing is minimal</text>
+    <text x="56" y="1844" class="modSub">• Enabling Radix Cache adds lookup overhead and memory fragmentation</text>
+    <text x="56" y="1862" class="modSub">• Multimodal AR Stage uses lighter strategies like ChunkCache to manage KV Cache</text>
+    <text x="56" y="1880" class="modSub">• Text engine still defaults to Radix Cache; toggle via server_args</text>
+  </g>
+</svg>

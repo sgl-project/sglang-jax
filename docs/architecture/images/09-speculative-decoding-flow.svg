@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 2200" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#15803d"/>
+    </marker>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0e7490"/>
+    </marker>
+    <marker id="arrowPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/>
+    </marker>
+    <marker id="arrowOrange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b45309"/>
+    </marker>
+    <style>
+      .title    { font-size: 22px; font-weight: 800; fill: #0f172a; }
+      .subtitle { font-size: 13px; fill: #475569; }
+      .stepTitle { font-size: 15px; font-weight: 700; fill: #0f172a; }
+      .stepSub  { font-size: 13px; fill: #1e293b; }
+      .code     { font-size: 12px; fill: #0f172a; font-family: 'SF Mono', Menlo, Consolas, monospace; }
+      .codeKey  { font-size: 12px; fill: #b45309; font-family: 'SF Mono', Menlo, Consolas, monospace; font-weight: 700; }
+      .edge     { font-size: 12px; fill: #1e293b; font-weight: 600; }
+      .note     { font-size: 11.5px; fill: #64748b; font-style: italic; }
+      .tag      { font-size: 10.5px; font-weight: 700; fill: #ffffff; }
+    </style>
+  </defs>
+
+  <!-- Title -->
+  <text x="40" y="40" class="title">EAGLE Speculative Decoding Full Data Flow</text>
+  <text x="40" y="62" class="subtitle">Draft-Verify cycle: Target Prefill → Draft K steps → Tree build → Target Verify → Token accept → Draft Extend</text>
+
+  <!-- ============== STEP 1: Target Prefill ============== -->
+  <g>
+    <rect x="40" y="100" width="1320" height="140" rx="10" fill="#dbeafe" stroke="#0284c7" stroke-width="2"/>
+    <rect x="40" y="100" width="1320" height="28" rx="10" fill="#0284c7"/>
+    <text x="56" y="120" class="tag">STEP 1 · Target Prefill (Initialization)</text>
+    <text x="56" y="152" class="stepTitle">Target model Prefills the full Prompt</text>
+    <text x="56" y="172" class="stepSub">• Target model runs Prefill Forward and emits the first Token</text>
+    <text x="56" y="190" class="stepSub">• Initialize <tspan class="codeKey">EagleDraftInput</tspan>: <tspan class="code">verified_id = first_token, hidden_states = target_hidden[-1]</tspan></text>
+    <text x="56" y="208" class="stepSub">• Draft and Target share <tspan class="code">req_to_token_pool</tspan> and <tspan class="code">token_to_kv_pool</tspan></text>
+    <text x="56" y="226" class="note">Draft model shares Target's Embedding and LM Head; Hidden States serve as Draft input (note: EAGLE3 does not share lm_head, see eagle_worker.py:70-71)</text>
+  </g>
+
+  <path d="M 700 240 L 700 270" stroke="#15803d" stroke-width="2.5" fill="none" marker-end="url(#arrowGreen)"/>
+  <text x="712" y="262" class="edge">enter Draft-Verify loop →</text>
+
+  <!-- ============== STEP 2: Draft Phase (K steps) ============== -->
+  <g>
+    <rect x="40" y="278" width="1320" height="220" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <rect x="40" y="278" width="1320" height="28" rx="10" fill="#15803d"/>
+    <text x="56" y="298" class="tag">STEP 2 · Draft Phase (K-step generation)</text>
+    <text x="56" y="330" class="stepTitle">EAGLEWorker.draft() — loop speculative_num_steps times</text>
+    <text x="56" y="350" class="stepSub">• Each step:</text>
+    <text x="76" y="370" class="code">draft_input.prepare_for_decode()  # pre-allocate KV Cache</text>
+    <text x="76" y="390" class="code">logits = draft_worker.forward(draft_input)  # Draft model Forward</text>
+    <text x="76" y="410" class="code">topk_p, topk_index = topk_probs_from_logits(logits, topk=self.topk)  # Top-K sampling</text>
+    <text x="76" y="430" class="code">draft_input.topk_p = topk_p; draft_input.topk_index = topk_index</text>
+    <text x="56" y="450" class="stepSub">• Accumulate Top-K candidates from all steps into <tspan class="codeKey">all_draft_tokens</tspan> and <tspan class="codeKey">all_draft_probs</tspan></text>
+    <text x="56" y="470" class="stepSub">• Draft model uses <tspan class="code">DRAFT_EXTEND</tspan> ForwardMode; each step writes its own KV Cache</text>
+    <text x="56" y="490" class="note">Draft model is lightweight (typically 1-2B params); K-step Forward total is far less than one Target Forward</text>
+  </g>
+
+  <path d="M 700 498 L 700 528" stroke="#0e7490" stroke-width="2.5" fill="none" marker-end="url(#arrowBlue)"/>
+
+  <!-- ============== STEP 3: Tree Construction ============== -->
+  <g>
+    <rect x="40" y="536" width="1320" height="200" rx="10" fill="#cffafe" stroke="#0e7490" stroke-width="2"/>
+    <rect x="40" y="536" width="1320" height="28" rx="10" fill="#0e7490"/>
+    <text x="56" y="556" class="tag">STEP 3 · Tree Construction (LCRS structure)</text>
+    <text x="56" y="588" class="stepTitle">build_tree_kernel_efficient() — two-phase Tree build</text>
+    <text x="56" y="608" class="stepSub">• Phase 1: build LCRS pointers via Pallas Kernel <tspan class="code">build_eagle_tree_structure()</tspan></text>
+    <text x="76" y="628" class="code">tree_mask, position_ids, retrieve_indices = build_eagle_tree_structure(...)</text>
+    <text x="76" y="648" class="stepSub">- <tspan class="codeKey">tree_mask</tspan>: Tree Attention Mask, lets each node see its ancestor path</text>
+    <text x="76" y="668" class="stepSub">- <tspan class="codeKey">position_ids</tspan>: position of each node in the sequence (Root=0, children increment)</text>
+    <text x="76" y="688" class="stepSub">- <tspan class="codeKey">retrieve_indices</tspan>: mapping from Draft KV Cache indices to Tree nodes</text>
+    <text x="56" y="708" class="stepSub">• Phase 2: extract corresponding KV from Draft KV Cache and rearrange into Tree layout</text>
+    <text x="56" y="726" class="note">LCRS (Left-Child Right-Sibling): each node stores pointers to first child and next sibling</text>
+  </g>
+
+  <path d="M 700 736 L 700 766" stroke="#7c3aed" stroke-width="2.5" fill="none" marker-end="url(#arrowPurple)"/>
+  <text x="712" y="758" class="edge">Tree feeds Target →</text>
+
+  <!-- ============== STEP 4: Target Verify ============== -->
+  <g>
+    <rect x="40" y="774" width="1320" height="180" rx="10" fill="#f3e8ff" stroke="#7c3aed" stroke-width="2"/>
+    <rect x="40" y="774" width="1320" height="28" rx="10" fill="#7c3aed"/>
+    <text x="56" y="794" class="tag">STEP 4 · Target Verify (one Forward verifies the entire Tree)</text>
+    <text x="56" y="826" class="stepTitle">EAGLEWorker.verify() — Target model verification</text>
+    <text x="56" y="846" class="stepSub">• Build <tspan class="codeKey">EagleVerifyInput</tspan>: contains Tree Mask, Draft Tokens, Draft Probs</text>
+    <text x="56" y="866" class="code">target_logits = target_worker.forward(verify_input)  # TARGET_VERIFY ForwardMode</text>
+    <text x="56" y="886" class="stepSub">• Target model verifies all branches in one Forward via Tree Attention Mask</text>
+    <text x="56" y="906" class="stepSub">• Each Tree node receives Logits output from the Target model</text>
+    <text x="56" y="924" class="stepSub">• Returns Target Hidden States (consumed by next Draft round)</text>
+    <text x="56" y="942" class="note">Tree Attention Mask ensures each node sees only the path from Root to itself, preserving causality</text>
+  </g>
+
+  <path d="M 700 954 L 700 984" stroke="#b45309" stroke-width="2.5" fill="none" marker-end="url(#arrowOrange)"/>
+
+  <!-- ============== STEP 5: Token Acceptance (Branching) ============== -->
+  <g>
+    <rect x="40" y="992" width="1320" height="280" rx="10" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+    <rect x="40" y="992" width="1320" height="28" rx="10" fill="#b45309"/>
+    <text x="56" y="1012" class="tag">STEP 5 · Token Acceptance (Greedy / Stochastic)</text>
+
+    <!-- Greedy Path -->
+    <rect x="60" y="1040" width="620" height="210" rx="8" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <text x="76" y="1060" class="stepTitle">Greedy Verify (default)</text>
+    <text x="76" y="1080" class="stepSub">• Pallas Kernel: <tspan class="code">verify_tree_greedy()</tspan></text>
+    <text x="76" y="1100" class="code">target_token = argmax(target_logits)</text>
+    <text x="76" y="1120" class="code">if target_token == draft_token:</text>
+    <text x="96" y="1140" class="code">accept, continue verifying next node along Tree path</text>
+    <text x="76" y="1160" class="code">else:</text>
+    <text x="96" y="1180" class="code">reject, truncate Tree, use target_token as Bonus Token</text>
+    <text x="76" y="1200" class="stepSub">• Verify node-by-node along Tree path starting from Root</text>
+    <text x="76" y="1220" class="stepSub">• Returns <tspan class="codeKey">accept_length</tspan> and the accepted Token sequence</text>
+    <text x="76" y="1238" class="note">Greedy mode: strict match, no distribution drift</text>
+
+    <!-- Stochastic Path -->
+    <rect x="700" y="1040" width="640" height="210" rx="8" fill="#fce7f3" stroke="#be185d" stroke-width="2"/>
+    <text x="716" y="1060" class="stepTitle">Stochastic Verify (optional)</text>
+    <text x="716" y="1080" class="stepSub">• Pallas Kernel: <tspan class="code">tree_speculative_sampling_target_only()</tspan></text>
+    <text x="716" y="1100" class="code">if p_target(draft_token) &gt; threshold_single:</text>
+    <text x="736" y="1120" class="code">accept (fast path)</text>
+    <text x="716" y="1140" class="code">elif cumulative_p &gt; threshold_acc:</text>
+    <text x="736" y="1160" class="code">accept (cumulative probability check)</text>
+    <text x="716" y="1180" class="code">else:</text>
+    <text x="736" y="1200" class="code">reject, residual = relu(q_draft - p_target)</text>
+    <text x="736" y="1220" class="code">resample Bonus Token from residual distribution</text>
+    <text x="716" y="1238" class="note">When threshold_acc=1.0, reduces to strict Rejection Sampling (unbiased)</text>
+  </g>
+
+  <path d="M 700 1272 L 700 1302" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ============== STEP 6: KV Cache Management ============== -->
+  <g>
+    <rect x="40" y="1310" width="1320" height="160" rx="10" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
+    <rect x="40" y="1310" width="1320" height="28" rx="10" fill="#7c3aed"/>
+    <text x="56" y="1330" class="tag">STEP 6 · KV Cache Management</text>
+    <text x="56" y="1362" class="stepTitle">Trim un-accepted KV Cache entries</text>
+    <text x="56" y="1382" class="stepSub">• Draft and Target share the same <tspan class="code">token_to_kv_pool</tspan></text>
+    <text x="56" y="1402" class="stepSub">• Trim indices in <tspan class="code">req_to_token_pool</tspan> based on <tspan class="codeKey">accept_length</tspan></text>
+    <text x="56" y="1422" class="code">new_seq_len = old_seq_len + accept_length</text>
+    <text x="56" y="1442" class="stepSub">• Un-accepted Draft KV Cache is freed (reclaimed by Allocator)</text>
+    <text x="56" y="1460" class="note">Shared Pool avoids KV data copies between Draft and Target, saving memory and bandwidth</text>
+  </g>
+
+  <path d="M 700 1470 L 700 1500" stroke="#15803d" stroke-width="2.5" fill="none" marker-end="url(#arrowGreen)"/>
+
+  <!-- ============== STEP 7: Draft Extend ============== -->
+  <g>
+    <rect x="40" y="1508" width="1320" height="160" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <rect x="40" y="1508" width="1320" height="28" rx="10" fill="#15803d"/>
+    <text x="56" y="1528" class="tag">STEP 7 · Draft Extend (update Draft state)</text>
+    <text x="56" y="1560" class="stepTitle">EAGLEWorker.draft_extend_after_verify()</text>
+    <text x="56" y="1580" class="stepSub">• Update <tspan class="codeKey">EagleDraftInput</tspan>:</text>
+    <text x="76" y="1600" class="code">draft_input.verified_id = last_accepted_token</text>
+    <text x="76" y="1620" class="code">draft_input.hidden_states = target_hidden_states[-1]</text>
+    <text x="76" y="1640" class="code">draft_input.accept_length = accept_length</text>
+    <text x="56" y="1660" class="stepSub">• Draft model runs one <tspan class="code">DRAFT_EXTEND</tspan> Forward over all accepted Tokens</text>
+  </g>
+
+  <path d="M 700 1668 L 700 1698" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ============== STEP 8: Loop or Finish ============== -->
+  <g>
+    <rect x="40" y="1706" width="1320" height="120" rx="10" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+    <rect x="40" y="1706" width="1320" height="28" rx="10" fill="#b45309"/>
+    <text x="56" y="1726" class="tag">STEP 8 · Loop or Finish</text>
+    <text x="56" y="1758" class="stepTitle">Check if sequence is complete</text>
+    <text x="56" y="1778" class="stepSub">• If EOS Token reached or max_new_tokens hit → end generation</text>
+    <text x="56" y="1798" class="stepSub">• Otherwise return to STEP 2, start next Draft-Verify round</text>
+    <text x="56" y="1816" class="note">Each round accepts 1~K Tokens (avg 2-3), boosting throughput 2-3x</text>
+  </g>
+
+  <!-- Loop back arrow -->
+  <path d="M 1360 1766 L 1380 1766 L 1380 380 L 700 380" stroke="#15803d" stroke-width="2.5" fill="none" marker-end="url(#arrowGreen)" stroke-dasharray="6,3"/>
+  <text x="1390" y="1070" class="edge" fill="#15803d" transform="rotate(90 1390 1070)">loop →</text>
+
+  <!-- Footer notes -->
+  <g>
+    <rect x="40" y="1860" width="1320" height="300" rx="10" fill="#e0e7ff" stroke="#4f46e5" stroke-width="2"/>
+    <rect x="40" y="1860" width="1320" height="28" rx="10" fill="#4f46e5"/>
+    <text x="56" y="1880" class="tag">Key Design Notes</text>
+
+    <text x="56" y="1912" class="stepTitle">Why a Tree instead of a linear sequence?</text>
+    <text x="56" y="1932" class="stepSub">• Draft model emits Top-K candidates per step (instead of just Top-1), forming a branching Tree</text>
+    <text x="56" y="1950" class="stepSub">• Tree Attention Mask lets the Target model verify all branches in one Forward, raising the chance at least one path is accepted</text>
+    <text x="56" y="1968" class="stepSub">• E.g., K=4 steps with Top-5 each → up to 5^4=625 leaves (pruned to ~20 nodes in practice)</text>
+
+    <text x="56" y="1996" class="stepTitle">Benefits of a shared KV Cache Pool</text>
+    <text x="56" y="2016" class="stepSub">• Draft and Target use the same <tspan class="code">token_to_kv_pool</tspan>, avoiding KV data copies between models</text>
+    <text x="56" y="2034" class="stepSub">• After Verify, indices in <tspan class="code">req_to_token_pool</tspan> are trimmed and un-accepted KV is reclaimed by the Allocator</text>
+    <text x="56" y="2052" class="stepSub">• Saves memory bandwidth and reduces Host-Device sync overhead</text>
+
+    <text x="56" y="2080" class="stepTitle">EAGLE Algorithm Highlights</text>
+    <text x="56" y="2100" class="stepSub">• Draft model shares Target's Embedding and LM Head, reducing parameter count</text>
+    <text x="56" y="2118" class="stepSub">• Draft uses Target's Hidden States as extra input, improving candidate quality</text>
+    <text x="56" y="2136" class="stepSub">• Supports both Greedy (strict match) and Stochastic (probabilistic accept) verification</text>
+  </g>
+</svg>
