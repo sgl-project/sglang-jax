@@ -1608,9 +1608,11 @@ def get_default_block_sizes(
 
 def get_vmem_limit():
     try:
-        # Use half of VMEM capacity as default to approximate the scoped VMEM limit.
-        # The compiler's scoped VMEM allocation is typically ~50% of total capacity.
-        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes // 2
+        # Use full VMEM capacity. Pallas kernels don't run concurrently with
+        # other XLA HLO ops, so the Pallas vmem budget and XLA scoped_vmem
+        # budget don't sum — leaving headroom here just caps the tuner.
+        # v2 hardcodes 100MB (hardware clamps to capacity) with no issue.
+        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
     except Exception:
         vmem_limit_bytes = DEFAULT_VMEM_LIMIT_BYTES
     return vmem_limit_bytes
