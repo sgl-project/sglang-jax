@@ -37,6 +37,20 @@ if not hasattr(np, "float8_e5m2"):
     np.float8_e5m2 = ml_dtypes.float8_e5m2
 
 
+# safetensors header stores tensor dtype as a string. Map to jax dtype.
+# Kept in one place because multiple callers used to inline the same dict.
+_SAFETENSORS_DTYPE_TO_JAX: dict[str, jnp.dtype] = {
+    "BF16": jnp.bfloat16,
+    "F16": jnp.float16,
+    "F32": jnp.float32,
+    "I64": jnp.int64,
+    "I32": jnp.int32,
+    "BOOL": jnp.bool_,
+    "F8_E4M3": jnp.float8_e4m3fn,
+    "F8_E5M2": jnp.float8_e5m2,
+}
+
+
 def _reinterpret_dtype_if_needed(data: np.ndarray, target_dtype: jnp.dtype) -> np.ndarray:
     if data.dtype == np.uint8:
         if target_dtype == jnp.float8_e4m3fn:
@@ -1018,29 +1032,36 @@ class WeightLoader:
             iterator = tqdm(weights_files, desc="Scanning Metadata", unit="file")
 
             for st_file in iterator:
-                # Parse safetensors header for byte offsets (for bulk MoE reads)
+                # Read the safetensors header directly: 8-byte length prefix +
+                # JSON header that lists {dtype, shape, data_offsets} per tensor.
+                # That's all we need — do NOT use safe_open here. safe_open mmaps
+                # the entire file, and on GCSFuse a single page fault triggers a
+                # chunked-download (download-chunk-size-mb), so scanning 34 files
+                # winds up downloading the full ~30GB model just to read metadata.
                 with open(st_file, "rb") as raw_f:
                     header_size = struct.unpack("<Q", raw_f.read(8))[0]
                     raw_header = json.loads(raw_f.read(header_size))
                 data_section_offset = 8 + header_size
 
-                with safe_open(st_file, framework="flax", device="cpu") as f:
-                    for key in f.keys():  # noqa: SIM118
-                        slice_info = f.get_slice(key)
-                        info = {
-                            "file": st_file,
-                            "shape": tuple(slice_info.get_shape()),
-                            "dtype": slice_info.get_dtype(),
-                        }
-                        # Add byte offset info for direct reads
-                        if key in raw_header:
-                            offsets = raw_header[key].get("data_offsets")
-                            if offsets:
-                                info["byte_offset"] = data_section_offset + offsets[0]
-                                info["byte_size"] = offsets[1] - offsets[0]
-                        if key not in weight_info:
-                            weight_info[key] = []
-                        weight_info[key].append(info)
+                for key, meta in raw_header.items():
+                    if key == "__metadata__":
+                        continue
+                    info = {
+                        "file": st_file,
+                        "shape": tuple(meta["shape"]),
+                        # Keep dtype as the safetensors string — downstream
+                        # consumers (_create_lazy_tensors, MoE bulk_read) all
+                        # already look up _SAFETENSORS_DTYPE_TO_JAX by string,
+                        # and st_dtype.startswith("F8_") in MoE path needs str.
+                        "dtype": meta["dtype"],
+                    }
+                    offsets = meta.get("data_offsets")
+                    if offsets:
+                        info["byte_offset"] = data_section_offset + offsets[0]
+                        info["byte_size"] = offsets[1] - offsets[0]
+                    if key not in weight_info:
+                        weight_info[key] = []
+                    weight_info[key].append(info)
 
             # Serialize the result
             serialized_data = pickle.dumps(weight_info)
@@ -1093,18 +1114,7 @@ class WeightLoader:
         for info in infos:
             shape = info["shape"]
             st_dtype = info["dtype"]
-
-            dtype_map = {
-                "BF16": jnp.bfloat16,
-                "F16": jnp.float16,
-                "F32": jnp.float32,
-                "I64": jnp.int64,
-                "I32": jnp.int32,
-                "BOOL": jnp.bool_,
-                "F8_E4M3": jnp.float8_e4m3fn,
-                "F8_E5M2": jnp.float8_e5m2,
-            }
-            target_dtype = dtype_map.get(st_dtype, jnp.float32)
+            target_dtype = _SAFETENSORS_DTYPE_TO_JAX.get(st_dtype, jnp.float32)
 
             filename = info["file"]
 
@@ -1168,17 +1178,7 @@ class WeightLoader:
         global_shape = tuple(global_shape)
 
         st_dtype = sorted_infos[0]["dtype"]
-        dtype_map = {
-            "BF16": jnp.bfloat16,
-            "F16": jnp.float16,
-            "F32": jnp.float32,
-            "I64": jnp.int64,
-            "I32": jnp.int32,
-            "BOOL": jnp.bool_,
-            "F8_E4M3": jnp.float8_e4m3fn,
-            "F8_E5M2": jnp.float8_e5m2,
-        }
-        target_dtype = dtype_map.get(st_dtype, jnp.float32)
+        target_dtype = _SAFETENSORS_DTYPE_TO_JAX.get(st_dtype, jnp.float32)
 
         if target_sharding is None:
             sharding = jax.sharding.NamedSharding(self.mesh, P())
@@ -1265,17 +1265,7 @@ class WeightLoader:
         sorted_first_infos = sorted(first_infos, key=lambda x: x["file"])
 
         st_dtype = sorted_first_infos[0]["dtype"]
-        dtype_map = {
-            "BF16": jnp.bfloat16,
-            "F16": jnp.float16,
-            "F32": jnp.float32,
-            "I64": jnp.int64,
-            "I32": jnp.int32,
-            "BOOL": jnp.bool_,
-            "F8_E4M3": jnp.float8_e4m3fn,
-            "F8_E5M2": jnp.float8_e5m2,
-        }
-        target_dtype = dtype_map.get(st_dtype, jnp.float32)
+        target_dtype = _SAFETENSORS_DTYPE_TO_JAX.get(st_dtype, jnp.float32)
 
         for hf_key in expected_hf_keys:
             infos = weight_infos[hf_key]
@@ -1400,17 +1390,7 @@ class WeightLoader:
         single_expert_shape = info["shape"]
         st_dtype = info["dtype"]
 
-        dtype_map = {
-            "BF16": jnp.bfloat16,
-            "F16": jnp.float16,
-            "F32": jnp.float32,
-            "I64": jnp.int64,
-            "I32": jnp.int32,
-            "BOOL": jnp.bool_,
-            "F8_E4M3": jnp.float8_e4m3fn,
-            "F8_E5M2": jnp.float8_e5m2,
-        }
-        target_dtype = dtype_map.get(st_dtype, jnp.float32)
+        target_dtype = _SAFETENSORS_DTYPE_TO_JAX.get(st_dtype, jnp.float32)
 
         num_logical_experts = len(expected_hf_keys)
         physical_to_logical_map = self._normalize_physical_to_logical_map(
