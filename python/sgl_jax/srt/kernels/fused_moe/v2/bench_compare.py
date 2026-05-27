@@ -38,11 +38,8 @@ def log(msg):
 jax.distributed.initialize()
 log(f"initialized: {jax.device_count()} devices, {jax.process_index()}")
 
-sys.path.insert(0, "/tmp/tpu_logs/v2")
-from kernel import fused_ep_moe_v2, FusedMoEBlockConfig
-
-sys.path.insert(0, "/tmp/tpu_logs/v1")
-import v1_kernel
+from sgl_jax.srt.kernels.fused_moe.v2.kernel import fused_ep_moe_v2, FusedMoEBlockConfig
+from sgl_jax.srt.kernels.fused_moe.v1 import kernel as v1_kernel
 v1_fused_ep_moe = v1_kernel.fused_ep_moe
 V1BlockConfig = v1_kernel.FusedMoEBlockConfig
 
