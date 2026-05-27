@@ -1,7 +1,7 @@
 """Accuracy case runner: drives run_eval against a given server URL.
 
 The summary JSON written to ``${RESULTS_DIR}/<case>.json`` follows the schema
-documented in ``test/srt/eval/schemas/accuracy_result.v1.yaml`` (shared across
+documented in ``test/srt/schemas/accuracy_result.v1.yaml`` (shared across
 single-host and multi-host accuracy nightlies). Bump
 ``ACCURACY_RESULT_SCHEMA_VERSION`` (and add a matching changelog entry to the
 schema file) whenever the document shape changes.
