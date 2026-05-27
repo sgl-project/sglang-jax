@@ -13,7 +13,7 @@ from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 
 # Re-export for backward compatibility: external code imports from this module.
-from sgl_jax.srt.layers.fused_moe import FusedEPMoE  # noqa: F401
+from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2  # noqa: F401
 from sgl_jax.srt.layers.gate import GateLogit, TopK  # noqa: F401
 from sgl_jax.srt.utils.parallel_utils import should_scatter
 from sgl_jax.srt.utils.profiling_utils import named_scope

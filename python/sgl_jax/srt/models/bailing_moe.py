@@ -18,6 +18,7 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import (
     EPMoE,
     FusedEPMoE,
+    FusedEPMoEV2,
     GateLogit,
     TopK,
     create_moe_weights_mapping,
@@ -308,7 +309,7 @@ class BailingMoEDecoderLayer(nnx.Module):
             )
 
             self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
-            self.use_fused = self.moe_backend == MoEBackend.FUSED
+            self.use_fused = self.moe_backend in (MoEBackend.FUSED, MoEBackend.FUSED_V2)
             moe_shared_expert_intermediate_size = getattr(
                 config,
                 "moe_shared_expert_intermediate_size",
@@ -324,7 +325,26 @@ class BailingMoEDecoderLayer(nnx.Module):
                 layer_id=layer_id,
             )
 
-            if self.use_fused:
+            if self.moe_backend == MoEBackend.FUSED_V2:
+                self.mlp = FusedEPMoEV2(
+                    hidden_size=config.hidden_size,
+                    num_experts=config.num_experts,
+                    num_experts_per_tok=config.num_experts_per_tok,
+                    intermediate_dim=config.moe_intermediate_size,
+                    mesh=mesh,
+                    activation="silu",
+                    ep_size=config.ep_size,
+                    weight_dtype=dtype,
+                    dtype=dtype,
+                    layer_id=layer_id,
+                    renormalize_topk_logits=config.norm_topk_prob,
+                    use_grouped_topk=config.n_group > 0,
+                    num_groups=config.n_group,
+                    top_k_groups=config.topk_group,
+                    num_shared_experts=0,
+                    quantization_config=getattr(config, "quantization_config", None),
+                )
+            elif self.use_fused:
                 self.mlp = FusedEPMoE(
                     hidden_size=config.hidden_size,
                     num_experts=config.num_experts,
@@ -358,7 +378,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                     quantization_config=getattr(config, "quantization_config", None),
                 )
 
-            if num_shared_experts > 0 and not self.use_fused:
+            if num_shared_experts > 0 and self.moe_backend != MoEBackend.FUSED:
                 self.shared_experts = BailingMoEMLP(
                     hidden_size=config.hidden_size,
                     intermediate_size=moe_shared_expert_intermediate_size * num_shared_experts,
@@ -698,7 +718,7 @@ class BailingMoEForCausalLM(nnx.Module):
 
             num_logical_experts = getattr(self.config, "num_experts", 256)
             moe_backend = getattr(self.config, "moe_backend", "epmoe")
-            use_fused = moe_backend == "fused"
+            use_fused = moe_backend in ("fused", "fused_v2")
 
             BLOCK_SIZE = 256
             hidden_size = self.config.hidden_size
@@ -765,11 +785,20 @@ class BailingMoEForCausalLM(nnx.Module):
 
                     if use_fused:
                         in_dim = inter_size if is_w2 else hidden_size
-                        num_blocks = in_dim // BLOCK_SIZE
+                        # Per-channel when no weight_block_size in quant config
+                        _wbs = getattr(
+                            getattr(self.config, "quantization_config", None),
+                            "weight_block_size", None,
+                        )
+                        is_per_channel = _wbs is None
+                        if is_per_channel:
+                            num_blocks = 1
+                        else:
+                            num_blocks = in_dim // BLOCK_SIZE
                         # Use physical experts count for reshape (after redundant expert cloning)
                         scale_reshape = (num_physical_experts, 1, 1, out_dim)
                         logger.info("scale_reshape: %s", scale_reshape)
-                        scale_repeat = (1, num_blocks)
+                        scale_repeat = None if is_per_channel else (1, num_blocks)
 
                         scale_sharding = None
                         if mapping.sharding:
@@ -819,7 +848,8 @@ class BailingMoEForCausalLM(nnx.Module):
 
             num_shared = getattr(self.config, "num_shared_experts", 0)
             if num_shared > 0:
-                if use_fused:
+                use_fused_shared = moe_backend == "fused"
+                if use_fused_shared:
                     shared_map = [
                         ("gate_proj", "w1_shared"),
                         ("up_proj", "w3_shared"),
