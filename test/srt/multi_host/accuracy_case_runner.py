@@ -28,6 +28,8 @@ def run_accuracy_case(case: AccuracyCase, profile: LaunchProfile) -> None:
         num_threads=case.eval_batch_size,
         temperature=gen.get("temperature", 0.0),
         max_tokens=gen.get("max_tokens", 2048),
+        top_p=gen.get("top_p"),
+        chat_template_kwargs=gen.get("chat_template_kwargs"),
     )
 
     print(
@@ -35,6 +37,7 @@ def run_accuracy_case(case: AccuracyCase, profile: LaunchProfile) -> None:
         f"name={case.name}, dataset={case.dataset}, "
         f"num_threads={args.num_threads}, "
         f"temperature={args.temperature}, max_tokens={args.max_tokens}, "
+        f"top_p={args.top_p}, chat_template_kwargs={args.chat_template_kwargs}, "
         f"limit={case.limit}",
         flush=True,
     )
