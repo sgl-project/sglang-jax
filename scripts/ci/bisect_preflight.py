@@ -25,6 +25,9 @@ import subprocess
 import sys
 from typing import Dict, List, Optional, Tuple
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "utils"))
+from failure_classifier import classify_run
+
 ELIGIBLE_WORKFLOWS = frozenset(["PR Test", "Nightly Test", "Nightly Test Daily", "TPU Multi Test"])
 
 
@@ -242,6 +245,8 @@ def main() -> int:
                 issue_number=issue_number,
             )
             return 0
+        if _try_preclassify_and_skip(repo, run_id, info.get("html_url", "none"), issue_number):
+            return 0
         write_outputs(
             {
                 "eligible": "true",
@@ -294,6 +299,8 @@ def main() -> int:
 
     if found:
         print(f"Found eligible run: {found['id']} ({found['name']})")
+        if _try_preclassify_and_skip(repo, found["id"], found["html_url"], issue_number):
+            return 0
         write_outputs(
             {
                 "eligible": "true",
@@ -320,6 +327,84 @@ def main() -> int:
         issue_number=issue_number,
     )
     return 0
+
+
+def _post_classification_comment(
+    repo: str, run_id: str, run_url: str, issue_number: str, failed_jobs: list
+) -> None:
+    """Post a PR comment summarizing pre-classified failures."""
+    if not issue_number:
+        print("No issue_number — skipping comment")
+        return
+
+    marker = f"<!-- ci-auto-bisect:run_id={run_id} -->"
+    try:
+        existing = run_gh(
+            [
+                "api",
+                f"repos/{repo}/issues/{issue_number}/comments",
+                "--paginate",
+                "--jq",
+                ".[].body",
+            ]
+        )
+        if marker in existing:
+            print(f"Comment for run {run_id} already exists — skipping")
+            return
+    except RuntimeError:
+        return
+
+    github_emoji = {
+        "timeout": "⏳",
+        "infrastructure": "☁️",
+        "resource_exhaustion": "\U0001f4a5",
+        "bug": "\U0001fab2",
+    }
+    lines = [marker]
+    lines.append(f"## CI Auto Bisect — run {run_id}\n")
+    lines.append(f"**[View run]({run_url})**\n")
+    lines.append("All failures classified as non-code issues (AI analysis skipped):\n")
+    for job in failed_jobs:
+        emoji = github_emoji.get(job["failure_type"], "")
+        lines.append(
+            f"- {emoji} **{job['name']}** — {job['failure_type']}" f" ([view]({job['html_url']}))"
+        )
+    lines.append("\n_Re-run the workflow if the issue was transient._")
+
+    body = "\n".join(lines)
+    try:
+        run_gh(["issue", "comment", issue_number, "--repo", repo, "--body", body])
+        print(f"Posted classification comment on #{issue_number}")
+    except RuntimeError as e:
+        print(f"Warning: failed to post comment: {e}")
+
+
+def _try_preclassify_and_skip(repo: str, run_id: str, run_url: str, issue_number: str) -> bool:
+    """Attempt pre-classification. If all failures are non-bug, write skip and return True."""
+    print("Pre-classifying failed jobs...")
+    try:
+        failed_jobs, needs_ai = classify_run(repo, run_id)
+    except Exception as exc:
+        print(f"Warning: pre-classification failed ({exc}), proceeding to AI analysis")
+        return False
+    if not failed_jobs or needs_ai:
+        return False
+    _post_classification_comment(repo, run_id, run_url, issue_number, failed_jobs)
+    type_summary = ", ".join(f"{j['name']} ({j['failure_type']})" for j in failed_jobs)
+    skip_reason = (
+        f"All {len(failed_jobs)} failed job(s) are non-bug failures "
+        f"(pre-classified by deterministic pattern matching): {type_summary}. "
+        f"AI analysis skipped."
+    )
+    print(f"Skipping AI: {skip_reason}")
+    write_skip_result(
+        skip_reason,
+        skip_type="no_eligible",
+        run_id=run_id,
+        run_url=run_url,
+        issue_number=issue_number,
+    )
+    return True
 
 
 if __name__ == "__main__":
