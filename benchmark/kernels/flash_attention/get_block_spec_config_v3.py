@@ -84,6 +84,32 @@ def _fits_vmem(
     return est <= vmem_limit_bytes
 
 
+# v7x SMEM capacity (hardware-fixed, 1MB per core). The scalar prefetches
+# (page_indices is by far the largest) must fit here — this is independent
+# of block-config choice, depends only on (mnt, pages_per_seq).
+_SMEM_CAP_BYTES = 1 * 1024 * 1024
+
+
+def _smem_estimate_bytes(mnt: int, pages_per_seq: int) -> int:
+    """Rough scalar-prefetch SMEM footprint for our v3 tuner data-gen.
+
+    page_indices dominates: shape [mnt × pages_per_seq] i32 (padded layout).
+    Other scalar_prefetches (kv_lens / cu_q_lens / cu_kv_lens / distribution
+    / init_*) are each O(mnt) i32 — bundled overhead estimate of ~10× mnt.
+    Result is a conservative upper bound.
+    """
+    page_indices = mnt * pages_per_seq * 4
+    other = 10 * mnt * 4
+    return page_indices + other
+
+
+def _fits_smem(mnt: int, page_size: int, max_context_len: int) -> tuple[bool, int]:
+    """Returns (fits, estimated_bytes). 10% margin under SMEM cap."""
+    pages_per_seq = max(1, (max_context_len + page_size - 1) // page_size)
+    est = _smem_estimate_bytes(mnt, pages_per_seq)
+    return est <= int(_SMEM_CAP_BYTES * 0.9), est
+
+
 def _bq_candidates(max_q: int, stage: str) -> list[int]:
     if stage == "d":
         return [1]
@@ -596,6 +622,16 @@ def main():
 
     rows = []
     for stage, ps, hd, q_h, kv_h, mnt in my_work:
+        # Outer-level SMEM prune: scalar_prefetches (page_indices dominates)
+        # must fit v7x's 1MB SMEM. Independent of block-config choice.
+        fits, est = _fits_smem(mnt, ps, args.max_context_len)
+        if not fits:
+            print(
+                f"# [smem-prune] stage={stage} ps={ps} q={q_h} kv={kv_h} hd={hd} "
+                f"mnt={mnt}: scalar prefetch est={est/1024:.0f}KB > "
+                f"{int(_SMEM_CAP_BYTES*0.9)/1024:.0f}KB (90% of 1MB SMEM)"
+            )
+            continue
         try:
             best, best_t, heur, heur_t = sweep(
                 stage,
