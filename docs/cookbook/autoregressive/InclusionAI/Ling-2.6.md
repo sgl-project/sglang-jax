@@ -28,12 +28,12 @@ For the previous Ling 2.5 hybrid linear-attention generation see [`Ling2.5.md`](
 
 ## 2. Deployment
 
-### 2.1 Hardware Matrix (starter target)
+### 2.1 Hardware Matrix
 
-| Model | TPU | Topology | Nodes | Chips | `--tp-size` | `--ep-size` | Notes |
-|---|---|---|---|---|---|---|---|
-| Ling-2.6-1T | v6e-64 | 8x8 | 16 | 64 | 64 | 64 | Trillion-scale; multi-host mandatory |
-| Ling-2.6-1T | v7x-16 | 4x4 | 4  | 16 | 32 | 32 | v7x exposes 2 JAX devices per chip → `--tp-size 32` |
+| Model | TPU | Topology | Nodes | Chips | `--tp-size` | `--ep-size` | Status | Notes |
+|---|---|---|---|---|---|---|---|---|
+| Ling-2.6-1T | v6e-64 | 8x8 | 16 | 64 | 64 | 64 | 🚧 starter | Trillion-scale; multi-host mandatory |
+| Ling-2.6-1T | v7x-16 | 4x4 | 4  | 16 | 32 | 32 | 🚧 starter | v7x exposes 2 JAX devices per chip → `--tp-size 32` |
 
 See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 

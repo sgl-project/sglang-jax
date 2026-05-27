@@ -437,7 +437,7 @@ sgl-cookbook 仍是结构最完整、写法最规范的参考样本。
 ## 8. 迁移路径与状态
 
 **P0(已完成)**:
-1. ✅ 新建 `docs/cookbook/index.md`、`cookbook/autoregressive/index.md`、`cookbook/multimodal/index.md`
+1. ✅ 新建 cookbook 入口、autoregressive 入口和早期多模态入口；后续结构已重构为 `autoregressive/` + `diffusion/`
 2. ✅ 把 `docs/basic_usage/{qwen, mimo_v2_flash, mimo_v2.5_pro}.md` 迁入 `cookbook/autoregressive/`,原路径保留 stub 重定向
 3. ✅ `docs/basic_usage/grok2-skypilot-serving.md` 拆为 `cookbook/autoregressive/grok2.md` + `cookbook/deployment/skypilot.md`
 4. ✅ 抽出 `cookbook/base/tpu-topology-reference.md` 与 `cookbook/base/launch-flags-reference.md`

@@ -8,7 +8,7 @@
 
 每篇 recipe 是一个 markdown 文件,位于 `docs/cookbook/<task-type>/<model-name>.md`:
 
-- `<task-type>` ∈ `autoregressive` / `multimodal`
+- `<task-type>` ∈ `autoregressive` / `diffusion`
 - `<model-name>` 是扁平模型名,如 `mimo-v2-flash` / `qwen3-moe`
 
 文件主体 5 节固定结构:
@@ -326,7 +326,7 @@
 - Starter 顶部: `> **Starter recipe** — Not yet empirically validated on TPU. Tune values for your hardware and PR-back tested numbers.`
 - Partially validated 顶部: `> **Partially validated recipe** — <verified variant / hardware path> has measured results; <remaining scope> is still pending.`
 - Validated 顶部: `> **Validated recipe** — empirically validated on <hardware> with sglang-jax <hash> (<date>).`
-- 在 `autoregressive/index.md` 或 `multimodal/index.md` 中同步 status: 🚧 / 🧪 / ✅
+- 在 `autoregressive/index.md` 或 `diffusion/index.md` 中同步 status: 🚧 / 🧪 / ✅
 
 ---
 
@@ -432,7 +432,7 @@ docs/cookbook/
 ├── autoregressive/
 │   ├── index.md
 │   └── <model>.md                  # 单篇 recipe(本文档定义其结构)
-├── multimodal/
+├── diffusion/
 │   ├── index.md
 │   └── <model>.md
 ├── base/
@@ -446,4 +446,4 @@ docs/cookbook/
 └── troubleshooting.md              # 跨 recipe 通用问题
 ```
 
-一级分类按 task type;第二层用扁平模型名;deployment / base / troubleshooting 为横切共用,所有 recipe 引用之。
+一级分类按 generation type;autoregressive 覆盖 text-only LLM 和 VL token decoder,diffusion 覆盖 image/video denoising 模型。第二层用扁平模型名;deployment / base / troubleshooting 为横切共用,所有 recipe 引用之。

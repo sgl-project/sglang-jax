@@ -4,7 +4,7 @@ title: "GKE Indexed Job"
 
 # GKE Indexed Job Launcher
 
-Generic GKE template for launching a multi-host TPU slice serving SGL-JAX. The pattern (Indexed Job + headless Service) is what [MiMo-V2.5-Pro §4.4](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md#44-gke-indexed-job--headless-service) uses end-to-end — this page distills the reusable parts so other recipes can reference it instead of pasting a full manifest.
+Generic GKE template for launching a multi-host TPU slice serving SGL-JAX. This page is the **single source of truth** for the Indexed Job + headless Service pattern — recipes reference it instead of pasting a full manifest, and fill in only their model-specific fields (`<JOB>`, `<ACCELERATOR>`, `<TOPOLOGY>`, `<LAUNCH_FLAGS>`).
 
 ## Why Indexed Job + headless Service
 

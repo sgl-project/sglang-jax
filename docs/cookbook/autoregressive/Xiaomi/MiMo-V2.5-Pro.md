@@ -4,7 +4,7 @@ title: "MiMo-V2.5-Pro"
 
 # MiMo-V2.5-Pro on SGL-JAX
 
-> **Partially validated recipe** — AIME 2025 results are available for the TPU v7x-16 path. The speed matrix and current pinned-build rerun are still pending.
+> **Partially validated recipe** — TPU v6e-64 path validated on sglang-jax `de29d9f0` (2026-05-27): server starts, thinking-on output correct, GSM8K accuracy 97.5% (200 examples, see §4.2), `bench_serving` numbers in §4.1. TPU v7x-16 path has historical AIME 2025 numbers (see §4.2 footnote); current-build rerun on v7x is still pending.
 
 ## 1. Model Introduction
 
@@ -29,18 +29,18 @@ title: "MiMo-V2.5-Pro"
 
 ### 2.1 Hardware Matrix
 
-| TPU | Topology | Chips per node | Nodes | Total chips | `--tp-size` | `--dp-size` | `--ep-size` | `--moe-backend` | Notes |
-|---|---|---|---|---|---|---|---|---|---|
-| **v7x-16** (reference, lower latency) | `2x2x4` | 4 | 4 | 16 | 32 | 4 | 32 | `fused` | v7x exposes 2 JAX devices/chip → 16 × 2 = 32; attention TP = `tp_size/dp_size` = 8 |
-| **v6e-64** (alternative, larger slice) | `4x4x4` | 4 | 16 | 64 | 64 | 8 | 64 | `fused` | v6e is 1:1 chip↔device; lower HBM per chip — see §2.4 SWA Pool Sizing for tradeoff |
+| TPU | Topology | Chips per node | Nodes | Total chips | `--tp-size` | `--dp-size` | `--ep-size` | `--moe-backend` | Status | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **v7x-16** | `2x2x4` | 4 | 4 | 16 | 32 | 4 | 32 | `fused` | 🧪 partial | v7x exposes 2 JAX devices/chip → 16 × 2 = 32; attention TP = `tp_size/dp_size` = 8. Historical AIME 2025 (see §4.2). |
+| **v6e-64** | `4x4x4` | 4 | 16 | 64 | 64 | 8 | 64 | `fused` | 🧪 partial | v6e is 1:1 chip↔device; lower HBM per chip — see §2.4 SWA Pool Sizing for tradeoff. GSM8K in §4.2; speed pending. |
 
 MiMo-V2.5-Pro requires a full v7x-16 or v6e-64 slice; single-host configurations are not supported. All nodes must be in the same TPU slice and reach each other on the JAX init port (`5000` by default) and the TPU process port (`8471`).
 
-See [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation / HBM / device-per-chip reference.
+See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation / HBM / device-per-chip reference.
 
 ### 2.2 Environment
 
-Install per [`../../get_started/install.md`](../../../get_started/install.md) and use one of the launcher templates from [`../deployment/`](../../deployment/). The required JAX TPU container image:
+Install per [`../../../get_started/install.md`](../../../get_started/install.md) and use one of the launcher templates from [`../../deployment/`](../../deployment/). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -103,128 +103,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
 
 `${NODE_RANK}` ranges from `0` to `15`. Compared with v7x-16, this lowers `--mem-fraction-static` to `0.92` and `--swa-full-tokens-ratio` to `0.15` because v6e has less HBM per chip — the lower SWA ratio shifts the smaller KV pool toward full-attention layers.
 
-##### Launcher: GKE Indexed Job + headless Service (reference manifest for v7x-16)
-
-This recipe is the canonical reference for the GKE manifest pattern — other multi-host MiMo recipes cross-link this manifest. Below is a minimal Indexed Job + headless Service for TPU v7x `2x2x4`. Adjust `nodeSelector`, `claimName`, and `image` for your cluster.
-
-```yaml
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: mimo-v2-5-pro-headless-svc
-spec:
-  clusterIP: None
-  selector:
-    job-name: mimo-v2-5-pro
-  ports:
-  - name: dist-init
-    port: 5000
-  - name: tpu-process
-    port: 8471
----
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: mimo-v2-5-pro
-spec:
-  backoffLimit: 0
-  completionMode: Indexed
-  parallelism: 4
-  completions: 4
-  template:
-    metadata:
-      annotations:
-        gke-gcsfuse/volumes: "true"
-    spec:
-      subdomain: mimo-v2-5-pro-headless-svc
-      restartPolicy: Never
-      serviceAccountName: gcs-account
-      nodeSelector:
-        cloud.google.com/gke-tpu-accelerator: tpu7x
-        cloud.google.com/gke-tpu-topology: 2x2x4
-      containers:
-      - name: mimo-v2-5-pro
-        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
-        command: ["bash", "-lc"]
-        args:
-        - |
-          set -euxo pipefail
-
-          REPO_DIR=/tmp/sglang-jax
-          if [ ! -d "$REPO_DIR/.git" ]; then
-            git clone https://github.com/sgl-project/sglang-jax.git "$REPO_DIR"
-          fi
-          cd "$REPO_DIR" && git fetch origin && pip install -e "python[tpu]"
-
-          export NODE_RANK=${JOB_COMPLETION_INDEX}
-          export MASTER_ADDR=mimo-v2-5-pro-0.mimo-v2-5-pro-headless-svc:5000
-          JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
-            --model-path /models/MiMo-V2.5-Pro \
-            --trust-remote-code \
-            --tp-size 32 --dp-size 4 --ep-size 32 \
-            --moe-backend fused \
-            --page-size 256 --context-length 262144 \
-            --chunked-prefill-size 4096 \
-            --dtype bfloat16 --mem-fraction-static 0.95 \
-            --swa-full-tokens-ratio 0.25 \
-            --max-running-requests 512 \
-            --attention-backend fa \
-            --skip-server-warmup \
-            --nnodes 4 --node-rank ${NODE_RANK} \
-            --dist-init-addr ${MASTER_ADDR} \
-            --host 0.0.0.0 --port 30000
-        env:
-        - name: TPU_PROCESS_ADDRESSES
-          value: mimo-v2-5-pro-0.mimo-v2-5-pro-headless-svc:8471,mimo-v2-5-pro-1.mimo-v2-5-pro-headless-svc:8471,mimo-v2-5-pro-2.mimo-v2-5-pro-headless-svc:8471,mimo-v2-5-pro-3.mimo-v2-5-pro-headless-svc:8471
-        - name: TPU_WORKER_HOSTNAMES
-          value: mimo-v2-5-pro-0.mimo-v2-5-pro-headless-svc,mimo-v2-5-pro-1.mimo-v2-5-pro-headless-svc,mimo-v2-5-pro-2.mimo-v2-5-pro-headless-svc,mimo-v2-5-pro-3.mimo-v2-5-pro-headless-svc
-        - name: TPU_PROCESS_PORT
-          value: "8471"
-        - name: JOB_COMPLETION_INDEX
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
-        - name: TPU_WORKER_ID
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
-        ports:
-        - containerPort: 30000
-          name: http
-        - containerPort: 5000
-          name: dist-init
-        resources:
-          requests:
-            google.com/tpu: "4"
-          limits:
-            google.com/tpu: "4"
-        volumeMounts:
-        - mountPath: /models
-          name: model-storage
-        - mountPath: /dev/shm
-          name: dev-shm
-      volumes:
-      - name: dev-shm
-        emptyDir:
-          medium: Memory
-      - name: model-storage
-        persistentVolumeClaim:
-          claimName: <your-model-pvc>
-```
-
-Apply with:
-
-```bash
-kubectl apply -f mimo-v2-5-pro.yaml
-kubectl wait --for=condition=Ready pod -l job-name=mimo-v2-5-pro --timeout=600s
-```
-
-The server is ready once `mimo-v2-5-pro-0` logs `Uvicorn running on http://0.0.0.0:30000`. For v6e-64, swap topology to `4x4x4`, parallelism/completions to 16, and use the v6e-64 launch flags from above.
-
-##### Alternative: SkyPilot
-
-The default SkyPilot template is v6e-only today. For temporary v6e-64 experiments, advanced users can adapt [`../deployment/skypilot.md`](../../deployment/skypilot.md) with the v6e-64 launch flags above. Use GKE for the v7x-16 path unless you maintain a custom v7x SkyPilot template.
+For the GKE Indexed Job + headless Service manifest pattern that wraps both launch commands, see [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) — fill in `<JOB>=mimo-v25-pro`, `<ACCELERATOR>=tpu7x` (v7x) or `tpu-v6e-slice` (v6e), `<TOPOLOGY>=2x2x4` / `4x4x4`, `<N>=4` / `16`, and paste the launch flags above into `<LAUNCH_FLAGS>`. For temporary v6e experiments, advanced users can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md); the default SkyPilot template is v6e-only, so use GKE for v7x.
 
 ### 2.4 Configuration Tips
 
@@ -262,7 +141,7 @@ The default SkyPilot template is v6e-only today. For temporary v6e-64 experiment
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles every kernel.
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, `--chunked-prefill-size`, or `--context-length` invalidates cached entries. Give each tuning experiment its own cache dir to avoid stale-cache misses across runs.
 
-For full flag definitions and defaults see [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
+For full flag definitions and defaults see [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
@@ -491,70 +370,94 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 
 > Benchmark data below is a snapshot pinned to the `Tested build` listed in each Test Environment; not refreshed on every release. New numbers are added via new PRs; older numbers stay as historical records of that build.
 
-### 4.1 Speed — scenario × concurrency matrix
+### 4.1 Speed
 
-This recipe targets the **full 3×3 scenario × concurrency matrix** as the community reference. Most cells are not yet measured — PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` when you run them.
-
-**Scenarios** — pick by your dominant workload:
-
-| Scenario | Random ISL | Random OSL | Stresses |
-|---|---|---|---|
-| **Standard** (chat) | 1000 | 1000 | balanced prefill/decode |
-| **Reasoning** (long output) | 1000 | 8000 | decode throughput + SWA pool eviction |
-| **Summarization** (long input) | 8000 | 1000 | `--chunked-prefill-size` + prefill TPS |
-
-**Concurrency levels** per scenario:
-
-| Level | `--max-concurrency` | `--num-prompts` | Purpose |
-|---|---|---|---|
-| Low | 1 | 10 | latency-optimised baseline (min TTFT / ITL) |
-| Medium | 16 | 80 | balanced — most production workloads |
-| High | 64 (or 100 for Standard) | 320 (or 500) | throughput ceiling |
-
-**Test Environment** — same hardware/parallelism as §4.2, but **do not** set `--reasoning-parser mimo` for throughput benchmarks (the parser adds per-token CPU work that distorts raw token rates).
-
-**Deployment Command** — same as [§2.3 Multi-host (v7x)](#multi-host-gke-indexed-job--tpu-v7x-16-4-nodes-2x2x4), without `--reasoning-parser`.
-
-**Benchmark Command template**
-
-```bash
-python -m sgl_jax.bench_serving \
-  --backend sgl-jax \
-  --dataset-name random \
-  --random-input <ISL> \
-  --random-output <OSL> \
-  --num-prompts <N> \
-  --max-concurrency <C> \
-  --random-range-ratio 1 \
-  --warmup-requests 0 \
-  --tokenizer XiaomiMiMo/MiMo-V2.5-Pro
-```
-
-Fill `<ISL>` / `<OSL>` from the scenario table, and `<N>` / `<C>` from the concurrency table.
-
-**Test Results** — _Pending. Run the matrix and PR back; each cell should be a full `============ Serving Benchmark Result ============` block._
-
-| Scenario | Low (c=1) | Medium (c=16) | High (c=64) |
-|---|---|---|---|
-| Standard (1K/1K) | _Pending_ | _Pending_ | _Pending_ |
-| Reasoning (1K/8K) | _Pending_ | _Pending_ | _Pending_ |
-| Summarization (8K/1K) | _Pending_ | _Pending_ | _Pending_ |
-
-### 4.2 Accuracy — AIME 2025 (thinking enabled)
+> **Layout F — single-workload sweep (one data point).** Standard chat (ISL=1000, OSL=1000), `max_concurrency=16`, 80 prompts, `seed=42`. Future PRs can add reasoning-typical workloads (long OSL) and concurrency sweeps. Do **not** set `--reasoning-parser mimo` for throughput benchmarks (the parser adds per-token CPU work that distorts raw token rates).
 
 **Test Environment**
 
 | Field | Value |
 |---|---|
-| Hardware | TPU v7x-16 (`2x2x4`, 4 nodes × 4 chips × 2 devices) |
+| Hardware | TPU v6e-64 (16 nodes × 4 chips) |
 | Model | XiaomiMiMo/MiMo-V2.5-Pro (FP8) |
-| Tensor Parallelism | 32 |
-| Data Parallelism | 4 |
-| Expert Parallelism | 32 |
-| Reasoning Parser | `mimo` |
-| Tested build | _Pending_ (run pre-dates pin convention) |
+| Tensor Parallelism | 64 |
+| Data Parallelism | 8 |
+| Expert Parallelism | 64 |
+| Tested build | sglang-jax `de29d9f0` (2026-05-27) |
 
-**Deployment Command** — same as [§2.3 Multi-host (v7x)](#multi-host-gke-indexed-job--tpu-v7x-16-4-nodes-2x2x4), plus `--reasoning-parser mimo`.
+**Deployment Command** — same as [§2.3 Multi-host (v6e-64)](#multi-host--tpu-v6e-64-16-nodes-4x4x4), without `--reasoning-parser`.
+
+**Benchmark Command**
+
+```bash
+PYTHONPATH=/tmp/sglang-jax/python python -m sgl_jax.bench_serving \
+  --backend sgl-jax \
+  --model /models/MiMo-V2.5-Pro \
+  --tokenizer /models/MiMo-V2.5-Pro \
+  --host 127.0.0.1 --port 30000 \
+  --dataset-name random \
+  --random-input-len 1000 --random-output-len 1000 \
+  --num-prompts 80 --max-concurrency 16 \
+  --seed 42
+```
+
+**Test Results**
+
+```text
+============ Serving Benchmark Result ============
+Backend:                                 sgl-jax
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  81.53
+Total input tokens:                      37205
+Total generated tokens:                  38314
+Request throughput (req/s):              0.98
+Input token throughput (tok/s):          456.31
+Output token throughput (tok/s):         469.91
+Peak output token throughput (tok/s):    688.00
+Peak concurrent requests:                20
+Total token throughput (tok/s):          926.22
+Concurrency:                             13.68
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   13939.08
+Median E2E Latency (ms):                 13182.43
+P90 E2E Latency (ms):                    24648.15
+P99 E2E Latency (ms):                    29268.58
+---------------Time to First Token----------------
+Mean TTFT (ms):                          466.86
+Median TTFT (ms):                        289.31
+P99 TTFT (ms):                           1515.35
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          28.66
+Median TPOT (ms):                        28.54
+P99 TPOT (ms):                           37.07
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           28.19
+Median ITL (ms):                         23.52
+P95 ITL (ms):                            23.95
+P99 ITL (ms):                            264.43
+Max ITL (ms):                            1290.76
+==================================================
+```
+
+> Same workload as DeepSeek-V3 §4.2: MiMo-V2.5-Pro total throughput is **926.22 tok/s** vs DeepSeek-V3 **491.26 tok/s** (1.89× faster). Mean TTFT 467 ms vs 1019 ms; mean TPOT 28.7 ms vs 59.3 ms. The gap matches the active-parameter ratio (MiMo 15B active vs V3 37B active) plus MiMo's SWA decode-bandwidth savings.
+
+### 4.2 Accuracy — GSM8K (thinking enabled)
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-64 (16 nodes × 4 chips) |
+| Model | XiaomiMiMo/MiMo-V2.5-Pro (FP8) |
+| Tensor Parallelism | 64 |
+| Data Parallelism | 8 |
+| Expert Parallelism | 64 |
+| Reasoning Parser | `mimo` |
+| Tested build | sglang-jax `de29d9f0` (2026-05-27) |
+
+**Deployment Command** — same as [§2.3 Multi-host (v6e-64)](#multi-host--tpu-v6e-64-16-nodes-4x4x4), plus `--reasoning-parser mimo`.
 
 **Benchmark Command**
 
@@ -564,19 +467,20 @@ evalscope eval \
   --api-url http://127.0.0.1:30000/v1/chat/completions \
   --api-key EMPTY \
   --eval-type service \
-  --datasets aime25 \
-  --eval-batch-size 16 \
+  --datasets gsm8k \
+  --eval-batch-size 8 \
+  --limit 200 \
   --timeout 6000000 \
-  --generation-config '{"temperature":1,"top_p":0.95,"max_tokens":131072,"chat_template_kwargs":{"enable_thinking":true}}'
+  --generation-config '{"temperature":1,"top_p":0.95,"max_tokens":8192,"chat_template_kwargs":{"enable_thinking":true}}'
 ```
 
 **Test Results**
 
 | Model | Dataset | Metric | Subset | Num | Score |
 |:---|:---|:---|:---|:---|:---|
-| MiMo-V2.5-Pro | aime25 | AveragePass@1 | AIME2025-I | 15 | 0.8667 |
-| MiMo-V2.5-Pro | aime25 | AveragePass@1 | AIME2025-II | 15 | 1.0000 |
-| MiMo-V2.5-Pro | aime25 | AveragePass@1 | OVERALL | 30 | **0.9334** |
+| MiMo-V2.5-Pro | gsm8k | AverageAccuracy | main | 200 | **0.975** |
+
+> Historical AIME 2025 results on **TPU v7x-16** (different hardware): AIME2025-I AveragePass@1 = 0.8667 (15 problems), AIME2025-II = 1.0000 (15), OVERALL = 0.9334 (30). Build pre-dates the pin convention. Kept here as a reference for the v7x path until that path is re-validated on a current build.
 
 ## 5. Troubleshooting
 
@@ -594,8 +498,8 @@ evalscope eval \
 
 - [MiMo-V2.5-Pro Model Card](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro)
 - [`MiMo-V2-Flash.md`](MiMo-V2-Flash.md) — smaller sibling, same architectural family, has measured MoE backend comparison.
-- [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md)
-- [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
-- [`../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) — primary multi-host launcher.
-- [`../deployment/skypilot.md`](../../deployment/skypilot.md) — advanced v6e experiment alternative.
-- [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
+- [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md)
+- [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
+- [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) — primary multi-host launcher.
+- [`../../deployment/skypilot.md`](../../deployment/skypilot.md) — advanced v6e experiment alternative.
+- [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
