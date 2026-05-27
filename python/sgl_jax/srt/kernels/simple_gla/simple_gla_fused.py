@@ -90,6 +90,7 @@ def _decode_simple_gla_kernel(
         for n in range(N):
             bank = n % 2
             wait gather(token n) on sem_gather[bank]
+            if n >= 2: wait scatter(token n-2) on sem_scatter[bank]
             for each head h in 0..H-1:
                 materialise h_in_buf[bank, h] as fp32 scratch (masked by
                     has_init AND pool_idx != 0)
@@ -97,7 +98,6 @@ def _decode_simple_gla_kernel(
                 o_ref[n, h, :] = sum(q * h_new, axis=K) * scale
                 stage h_to_scatter (masked to 0 when pool_idx == 0) into
                     h_out_buf[bank, h]
-            if n >= 2: wait scatter(token n-2) on sem_scatter[bank]
             start scatter(token n) → buf  via sem_scatter[bank]
             if n+2 < N: start gather(token n+2) → h_in_buf[bank]
 
@@ -157,7 +157,14 @@ def _decode_simple_gla_kernel(
         # 1) Wait for this token's gather to land.
         pltpu.make_async_copy(_buf_in_slice(n), h_in_buf.at[bank], sem_gather.at[bank]).wait()
 
-        # 2) Per-head 2D compute.
+        # 2) Wait for prior scatter on this bank (token n-2) before
+        #    reusing h_out_buf[bank] as the next scatter source.
+        if n >= 2:
+            pltpu.make_async_copy(
+                h_out_buf.at[bank], _buf_out_slice(n - 2), sem_scatter.at[bank]
+            ).wait()
+
+        # 3) Per-head 2D compute.
         for h in range(H):
             decay_h = jnp.exp(g_gamma_ref[h].astype(jnp.float32))  # scalar
 
@@ -179,16 +186,10 @@ def _decode_simple_gla_kernel(
             h_to_scatter_h = jnp.where(scatter_mask, h_new_h, 0.0)
             h_out_buf.at[bank, h][...] = h_to_scatter_h.astype(h_out_buf.dtype)
 
-        # 4) Wait for prior scatter on this bank (token n-2) to drain.
-        if n >= 2:
-            pltpu.make_async_copy(
-                h_out_buf.at[bank], _buf_out_slice(n - 2), sem_scatter.at[bank]
-            ).wait()
-
-        # 5) Start scatter for this token (H heads at once — single DMA).
+        # 4) Start scatter for this token (H heads at once — single DMA).
         pltpu.make_async_copy(h_out_buf.at[bank], _buf_out_slice(n), sem_scatter.at[bank]).start()
 
-        # 6) Pre-issue gather for token (n + 2) using h_in_buf[bank]
+        # 5) Pre-issue gather for token (n + 2) using h_in_buf[bank]
         #    (consumed by step 2 above).
         if n + 2 < N:
             pltpu.make_async_copy(
@@ -239,6 +240,9 @@ def _launch_decode_simple_gla(
       I-3: ``disable_semaphore_checks=True`` is required because the
            kernel uses raw ``make_async_copy`` for the async double-buffer
            pipeline. Pattern matches ``ragged_paged_attention_v3.py``.
+      I-4: Only a single K tile is supported for DECODE. The output block
+           does not reduce partial sums across K programs, so ``K > 128``
+           must fail fast in the launcher.
     """
     interpret = get_interpret()
 
@@ -246,7 +250,7 @@ def _launch_decode_simple_gla(
     V = v.shape[-1]
     BK = min(K, 128)
     BV = min(V, 128)
-    assert K % BK == 0
+    assert K == BK, f"decode_simple_gla_fused only supports K <= 128; got K={K}"
     assert V % BV == 0
 
     # In-launcher pre-flatten — see I-1 above.
