@@ -1,10 +1,15 @@
-# Multi-host accuracy result schema
+# Accuracy result schema (general — single-host, multi-host, or any future
+# accuracy test runner that wants to record results).
 #
 # Each accuracy case (gsm8k, aime25, ...) writes one JSON file matching this
 # schema to `${RESULTS_DIR}/<case>.json`. RESULTS_DIR is mounted from
 # `gs://observability-storage-sglang/<date>/<workload>/` in CI.
 #
-# Producer: test/srt/multi_host/accuracy_case_runner.py
+# Producers: any accuracy nightly runner. Today:
+#   - test/srt/multi_host/accuracy_case_runner.py (multi-host suites)
+# New runners that produce accuracy JSON SHOULD emit this schema and bump
+# `ACCURACY_RESULT_SCHEMA_VERSION` (with a changelog entry below) when they
+# need additional fields.
 # Consumer: dashboards / regression trackers that ingest the bucket.
 
 schema: accuracy_result
