@@ -418,12 +418,14 @@ jobs:
             --selector="job-name=${WORKLOAD_NAME}" \
             --namespace "${NAMESPACE}" \
             --timeout=45m
-          kubectl logs --selector="job-name=${WORKLOAD_NAME}" \
-            --namespace "${NAMESPACE}" \
-            --all-containers=true \
+          # Stream rank 0's main container only — other ranks' logs are
+          # SPMD duplicates, sidecars are mount noise. Diagnose step
+          # dumps everything on failure.
+          kubectl logs --namespace "${NAMESPACE}" \
+            --selector="job-name=${WORKLOAD_NAME},batch.kubernetes.io/job-completion-index=0" \
+            --container=run-test-caces \
             --prefix=true \
-            --follow=true \
-            --max-log-requests=8
+            --follow=true
 
           # Wait for Job to reach a terminal state (Complete or Failed). Plain
           # `kubectl wait --for=condition=complete` only matches success and
