@@ -225,57 +225,19 @@ def run_unittest_files(
 
 
 suites = {
-    "nightly-test-accuracy-text-models-tpu-v6e-1": [
-        TestFile(
-            "nightly-test/test_accuracy.py",
-            estimated_time=312,
-            test_methods=["TestModelAccuracy.test_qwen3_8b"],
-        ),
-    ],
-    "nightly-test-accuracy-text-models-tpu-v6e-4": [
-        TestFile(
-            "nightly-test/test_accuracy.py",
-            estimated_time=64,
-            test_methods=["TestModelAccuracy.test_qwen3_8b_tp_4"],
-        ),
-        TestFile(
-            "nightly-test/test_accuracy.py",
-            estimated_time=50,
-            test_methods=["TestModelAccuracy.test_bailing_moe_tp_2_ep2"],
-        ),
-        TestFile(
-            "nightly-test/test_accuracy.py",
-            estimated_time=62,
-            test_methods=["TestModelAccuracy.test_QWEN3_30B_A3B_tp_2_ep_2"],
-        ),
-    ],
+    # nightly-test/test_accuracy.py + nightly-test/test_perf.py were deleted in
+    # #1226 — every case there had been red on weekly-test.yml for months
+    # (Qwen3-8B gsm8k stale 0.86 threshold, tp=2/ep=2/dp=1 mesh_shape mismatch
+    # on 4-chip, etc.). Coverage will be rebuilt under #1117 alongside the
+    # nightly-vs-daily split. The suite keys are kept as empty shells so the
+    # weekly-test.yml jobs continue to schedule (and can host new cases as
+    # they're added) without restructuring CI.
+    "nightly-test-accuracy-text-models-tpu-v6e-1": [],
+    "nightly-test-accuracy-text-models-tpu-v6e-4": [],
     "nightly-test-perf-text-models-tpu-v6e-1": [],
-    "nightly-test-perf-text-models-tpu-v6e-4-part1": [
-        TestFile(
-            "nightly-test/test_perf.py",
-            estimated_time=8,
-            test_methods=["TestModelPerf.test_qwen3_8b_performance_tp_4"],
-        ),
-    ],
-    "nightly-test-perf-text-models-tpu-v6e-4-part2": [
-        TestFile(
-            "nightly-test/test_perf.py",
-            estimated_time=30,
-            test_methods=["TestModelPerf.test_QWEN3_MOE_30B_performance_tp_2_ep_2"],
-        ),
-    ],
-    "nightly-test-perf-text-models-tpu-v6e-4-part3": [
-        TestFile(
-            "nightly-test/test_perf.py",
-            estimated_time=20,
-            test_methods=["TestModelPerf.test_bailing_moe_performance_tp_2_ep_2"],
-        ),
-        TestFile(
-            "nightly-test/test_perf.py",
-            estimated_time=45,
-            test_methods=["TestModelPerf.test_qwen3_32B_lora_r32_performance_tp_4"],
-        ),
-    ],
+    "nightly-test-perf-text-models-tpu-v6e-4-part1": [],
+    "nightly-test-perf-text-models-tpu-v6e-4-part2": [],
+    "nightly-test-perf-text-models-tpu-v6e-4-part3": [],
     # *-daily suites are empty shells (see #1117 nightly-vs-daily split decision).
     # Daily workflow keeps running so new cases can be added without restructuring CI.
     "nightly-test-accuracy-text-models-tpu-v6e-1-daily": [],
