@@ -259,6 +259,13 @@ class MultiLayerDraftWorker(EagleDraftWorker):
             self.mesh, layer0_out.next_token_logits, layer0_out.hidden_states
         )
         layer0_out.next_token_logits = rep_logits
+        dp_size = model_worker_batch.dp_size
+        if dp_size > 1:
+            per_dp_tokens = rep_hidden.shape[0] // dp_size
+            per_dp_bs = last_idx.shape[0] // dp_size
+            last_idx = last_idx.copy()
+            for k in range(1, dp_size):
+                last_idx[k * per_dp_bs : (k + 1) * per_dp_bs] += k * per_dp_tokens
         layer0_out.hidden_states = rep_hidden[last_idx]
         model_worker_batch.spec_info_padded.hidden_states = hidden_states
         model_worker_batch.spec_info_padded.allocate_lens = np.asarray(model_worker_batch.seq_lens)[
