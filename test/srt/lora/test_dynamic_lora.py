@@ -225,7 +225,7 @@ class TestLoRA(CustomTestCase):
         process_no_lora = popen_launch_server(
             base_path,
             base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=1200,
             other_args=server_args_no_lora,
         )
 
@@ -253,7 +253,7 @@ class TestLoRA(CustomTestCase):
         process_lora = popen_launch_server(
             base_path,
             base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=1200,
             other_args=server_args_lora,
         )
 
