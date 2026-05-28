@@ -203,7 +203,7 @@ def full_benchmark():
     max_kv_cache_tokens_config = [600000]
     all_combinations = []
     config_of_modes = {}
-    max_context_len = 40960
+    max_context_len = 16384
     for mode in bench_modes:
         for q_head_num in q_head_num_config:
             for kv_head_num in kv_head_num_config:
@@ -343,7 +343,7 @@ class TestPerformance(CustomTestCase):
             },
         }
         test_cases = test_cases_for_different_devices[get_device_name()]
-        max_context_len = 40960
+        max_context_len = 16384
         for case, baseline in test_cases.items():
             (
                 mode,

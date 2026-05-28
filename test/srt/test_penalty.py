@@ -55,9 +55,11 @@ class TestPenalty(CustomTestCase):
                 "--attention-backend",
                 "fa",
                 "--page-size",
-                "64",
+                "256",
                 "--max-running-requests",
                 "64",
+                "--context-length",
+                "16384",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
