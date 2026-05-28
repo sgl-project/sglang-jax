@@ -4,7 +4,10 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sgl_jax.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
+    SWATokenToKVPoolAllocator,
+)
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 
@@ -65,3 +68,35 @@ class ChunkCache(BasePrefixCache):
 
     def pretty_print(self):
         return ""
+
+
+class SWAChunkCache(ChunkCache):
+    """ChunkCache with support for sliding window attention.
+
+    Used when disable_radix_cache=True and the model is a hybrid SWA model.
+    """
+
+    def __init__(
+        self,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: SWATokenToKVPoolAllocator,
+        page_size: int,
+        sliding_window_size: int,
+    ):
+        super().__init__(req_to_token_pool, token_to_kv_pool_allocator, page_size)
+        self.sliding_window_size = sliding_window_size
+
+    def supports_swa(self) -> bool:
+        return True
+
+    def full_evictable_size(self, dp_rank: int = 0) -> int:
+        return 0
+
+    def swa_evictable_size(self, dp_rank: int = 0) -> int:
+        return 0
+
+    def full_protected_size(self, dp_rank: int = 0) -> int:
+        return 0
+
+    def swa_protected_size(self, dp_rank: int = 0) -> int:
+        return 0

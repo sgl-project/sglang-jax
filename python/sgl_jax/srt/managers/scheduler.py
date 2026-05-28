@@ -66,7 +66,7 @@ from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixi
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
 from sgl_jax.srt.managers.utils import validate_input_length
-from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
+from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
@@ -518,13 +518,21 @@ class Scheduler(
         self.req_to_token_pool, self.token_to_kv_pool_allocator = self.tp_worker.get_memory_pool()
 
         if self.is_hybrid:
-            self.tree_cache = SWARadixCache(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                sliding_window_size=self.sliding_window_size,
-                page_size=self.page_size,
-                disable=server_args.disable_radix_cache,
-            )
+            if server_args.disable_radix_cache:
+                self.tree_cache = SWAChunkCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    page_size=self.page_size,
+                    sliding_window_size=self.sliding_window_size,
+                )
+            else:
+                self.tree_cache = SWARadixCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    sliding_window_size=self.sliding_window_size,
+                    page_size=self.page_size,
+                    disable=False,
+                )
         elif server_args.chunked_prefill_size is not None and server_args.disable_radix_cache:
             self.tree_cache = ChunkCache(
                 req_to_token_pool=self.req_to_token_pool,
@@ -1557,6 +1565,11 @@ class Scheduler(
                 len(self.running_batch.reqs_info[dp_rank].reqs) + len(adder.can_run_list[dp_rank])
                 >= self.per_dp_max_running_requests
             ):
+                continue
+
+            # Skip DP ranks with an ongoing chunked request to avoid
+            # creating a second chunked req on the same rank.
+            if self.chunked_reqs[dp_rank] is not None:
                 continue
 
             # Check LoRA constraint: ensure we don't exceed max_loras_per_batch
