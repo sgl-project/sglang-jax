@@ -34,6 +34,12 @@ class TestQwen25Detector(CustomTestCase):
         # format strictly requires "<tool_call>\n" as the bot_token.
         self.assertFalse(d.has_tool_call("<tool_call>{...}</tool_call>"))
 
+    def test_detect_and_parse_no_tool_call(self):
+        text = "just a normal answer with no tool"
+        result = Qwen25Detector().detect_and_parse(text, [C.weather_tool()])
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.calls, [])
+
     def test_detect_and_parse_single_call(self):
         text = (
             "thinking done\n"
@@ -60,12 +66,6 @@ class TestQwen25Detector(CustomTestCase):
         self.assertEqual(len(result.calls), 2)
         self.assertEqual(json.loads(result.calls[0].parameters), {"location": "Beijing"})
         self.assertEqual(json.loads(result.calls[1].parameters), {"x": 7})
-
-    def test_detect_and_parse_no_tool_call(self):
-        text = "just a normal answer with no tool"
-        result = Qwen25Detector().detect_and_parse(text, [C.weather_tool()])
-        self.assertEqual(result.normal_text, text)
-        self.assertEqual(result.calls, [])
 
     def test_detect_and_parse_unknown_function(self):
         text = '<tool_call>\n{"name": "mystery", "arguments": {"x": 1}}\n</tool_call>'

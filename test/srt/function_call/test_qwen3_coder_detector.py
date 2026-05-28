@@ -140,8 +140,8 @@ class TestQwen3CoderDetector(CustomTestCase):
         )
         result = Qwen3CoderDetector().detect_and_parse(text, [C.bash_tool()])
         self.assertEqual(result.calls, [])
-        # _extract consumes the <tool_call> block; unknown function is dropped
-        # but surrounding text is preserved.
+        # parse_base_json drops calls for unknown function names;
+        # normal text (before/after the block) is still captured by _extract.
         self.assertIn("before", result.normal_text)
 
     def test_safe_val_html_unescape(self):

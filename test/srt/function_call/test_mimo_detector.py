@@ -135,6 +135,9 @@ class TestMiMoDetector(CustomTestCase):
         self.assertEqual(result.calls, [])
         self.assertIn("<function=mystery>", result.normal_text)
         self.assertTrue(result.normal_text.startswith("before\n"))
+        # MiMo only collects text before the first <tool_call>; trailing
+        # text after the last </tool_call> is intentionally not captured.
+        self.assertNotIn("after", result.normal_text)
 
     def test_detect_and_parse_param_types(self):
         text = (

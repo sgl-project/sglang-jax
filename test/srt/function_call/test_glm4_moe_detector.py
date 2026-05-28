@@ -65,11 +65,6 @@ class TestGlm4MoeDetector(CustomTestCase):
     def test_streaming_split_chunks(self):
         det = Glm4MoeDetector()
         tools = [C.bash_tool()]
-
-        r1 = det.parse_streaming_increment("plain text. ", tools)
-        self.assertEqual(r1.normal_text, "plain text. ")
-        self.assertEqual(r1.calls, [])
-
         chunks = [
             "<tool_call>execute_bash\n",
             "<arg_key>command</arg_key>\n",
@@ -88,6 +83,25 @@ class TestGlm4MoeDetector(CustomTestCase):
         self.assertEqual(json.loads(joined), {"command": "ls"})
         self.assertNotIn("<tool_call>", out_normal)
         self.assertNotIn("</tool_call>", out_normal)
+
+    def test_streaming_normal_text_then_call(self):
+        det = Glm4MoeDetector()
+        tools = [C.bash_tool()]
+        r1 = det.parse_streaming_increment("plain text. ", tools)
+        self.assertEqual(r1.normal_text, "plain text. ")
+        self.assertEqual(r1.calls, [])
+
+        r2 = det.parse_streaming_increment(
+            "<tool_call>execute_bash\n"
+            "<arg_key>command</arg_key>\n"
+            "<arg_value>ls</arg_value>\n"
+            "</tool_call>",
+            tools,
+        )
+        names = [c.name for c in r2.calls if c.name]
+        self.assertIn("execute_bash", names)
+        self.assertNotIn("<tool_call>", r2.normal_text)
+        self.assertNotIn("</tool_call>", r2.normal_text)
 
     def test_detect_and_parse_malformed_skipped(self):
         text = (
