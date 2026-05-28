@@ -212,19 +212,7 @@ class FlashAttention(AttentionBackend):
         page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
 
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
-            # convert custom_mask from bool to int32, because dma not support bool type
-            if batch.spec_info_padded.custom_mask is not None:
-                if batch.spec_info_padded.custom_mask.dtype == jnp.bool:
-                    # FIXME(pc) rm this dtype convert
-                    logger.warning(
-                        "batch.spec_info_padded.custom_mask type is  %s, it may make performance very low",
-                        batch.spec_info_padded.custom_mask.dtype,
-                    )
-                    metadata.custom_mask = batch.spec_info_padded.custom_mask.astype(jnp.int32)
-                else:
-                    metadata.custom_mask = batch.spec_info_padded.custom_mask
-            else:
-                metadata.custom_mask = None
+            metadata.custom_mask = batch.spec_info_padded.custom_mask
         else:
             metadata.custom_mask = None
 
