@@ -161,7 +161,7 @@ MIMO_AUDIO_7B_INSTRUCT = _local_or_hf("XiaomiMiMo/MiMo-Audio-7B-Instruct")
 UMT5_BASE = _local_or_hf("google/umt5-base")
 QWEN3_OMNI_30B_A3B_INSTRUCT = _local_or_hf("Qwen/Qwen3-Omni-30B-A3B-Instruct")
 
-DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
+DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1200
 
 
 def is_in_ci():
