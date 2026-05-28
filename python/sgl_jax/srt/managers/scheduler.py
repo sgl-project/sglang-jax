@@ -1702,7 +1702,7 @@ class Scheduler(
             return batch
 
         # Check if decode out of memory
-        if not batch.check_decode_mem() or (
+        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             old_ratio = self.new_token_ratio
@@ -1719,13 +1719,22 @@ class Scheduler(
                 else:
                     self.send_to_tokenizer.send_pyobj(abort_out)
 
-            logger.info(
-                "KV cache pool is full. Retract requests. #retracted_reqs: %d, #aborted_reqs: %d, #new_token_ratio: %.4f -> %.4f",
-                num_retracted_reqs,
-                len(reqs_to_abort),
-                old_ratio,
-                self.new_token_ratio,
-            )
+            if kv_full_retract_flag:
+                logger.warning(
+                    "KV cache pool is full. Retract requests."
+                    " #retracted_reqs: %d, #aborted_reqs: %d,"
+                    " #new_token_ratio: %.4f -> %.4f",
+                    num_retracted_reqs,
+                    len(reqs_to_abort),
+                    old_ratio,
+                    self.new_token_ratio,
+                )
+            else:
+                logger.info(
+                    "Testing retraction." " #retracted_reqs: %d, #aborted_reqs: %d",
+                    num_retracted_reqs,
+                    len(reqs_to_abort),
+                )
 
             self._extend_requests_to_queue(retracted_reqs, is_retracted=True)
         else:

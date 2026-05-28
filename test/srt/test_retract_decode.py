@@ -1,8 +1,10 @@
 """Integration tests for the retract / release_kv_cache path.
 
-SGLANG_TEST_RETRACT=1 forces retract on batch_size > 10. Pass criterion:
-the worker stays alive (process.poll() is None) -- a leak would trip
-scheduler.check_memory() and SIGQUIT.
+SGLANG_TEST_RETRACT=1 forces retract every TEST_RETRACT_INTERVAL (default 3)
+forward steps. TEST_RETRACT_NO_PREFILL_BS caps prefill admission to bound
+the retract-prefill loop. Pass criterion: the worker stays alive
+(process.poll() is None) -- a leak would trip scheduler.check_memory()
+and SIGQUIT.
 """
 
 import time
@@ -67,6 +69,7 @@ class _BaseRetractDecode(CustomTestCase):
             other_args=launch_args,
             env={
                 "SGLANG_TEST_RETRACT": "1",
+                "SGLANG_TEST_RETRACT_NO_PREFILL_BS": "6",
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
         )
