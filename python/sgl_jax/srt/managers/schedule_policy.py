@@ -367,7 +367,9 @@ class PrefillAdder:
             self.rem_chunk_tokens_list[dp_rank] if self.rem_chunk_tokens_list is not None else None
         )
         alloc = min(extend_input_len, rem_chunk) if rem_chunk is not None else extend_input_len
-        return max(alloc, self.tree_cache.sliding_window_size) + self.page_size
+        return (
+            self.ceil_paged_tokens(max(alloc, self.tree_cache.sliding_window_size)) + self.page_size
+        )
 
     @property
     def rem_total_tokens(self):

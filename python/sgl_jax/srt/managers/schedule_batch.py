@@ -1357,6 +1357,9 @@ class ScheduleBatch:
                     if isinstance(self.tree_cache, ChunkCache):
                         # ChunkCache/SWAChunkCache: no tree-node overlap concern,
                         # evict on every decode step to prevent SWA exhaustion.
+                        # TODO(PD-disagg): evicting at decode_batch_idx==0 may
+                        # conflict with KV transfer in a future PD disaggregation
+                        # pipeline; revisit when implementing PD.
                         if req.decode_batch_idx % evict_interval == 0:
                             self._evict_swa(
                                 req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
