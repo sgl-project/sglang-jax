@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 
+import pytest
+
 from sgl_jax.srt.server_args import ServerArgs
 
 
@@ -77,3 +79,15 @@ def test_pd_cli_flags_round_trip_through_parser():
     assert args.disaggregation_host_ip == "10.0.0.10"
     assert args.disaggregation_pull_timeout_seconds == 45.0
     assert args.disaggregation_ack_timeout_seconds == 90.0
+
+
+def test_pd_shared_secret_env_overrides_args(monkeypatch):
+    monkeypatch.setenv("SGL_JAX_PD_SHARED_SECRET", "env-secret")
+    args = _make_args(disaggregation_shared_secret="cli-secret")
+    assert args.disaggregation_shared_secret == "env-secret"
+
+
+@pytest.mark.parametrize("bad_host_ip", ["0.0.0.0", "127.0.0.1"])
+def test_pd_host_ip_rejects_bind_and_loopback_addresses(bad_host_ip):
+    with pytest.raises(ValueError, match="disaggregation-host-ip"):
+        _make_args(disaggregation_host_ip=bad_host_ip)

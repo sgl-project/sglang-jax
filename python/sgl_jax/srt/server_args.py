@@ -2,6 +2,7 @@
 
 import argparse
 import dataclasses
+import ipaddress
 import json
 import logging
 import os
@@ -27,6 +28,26 @@ from sgl_jax.srt.utils.common_utils import (
 logger = logging.getLogger(__name__)
 
 GRAMMAR_BACKEND_CHOICES = ["llguidance", "none"]
+_REJECTED_PD_HOST_ALIASES = frozenset({"localhost"})
+
+
+def _validate_disaggregation_host_ip(host_ip: str) -> str:
+    if host_ip in _REJECTED_PD_HOST_ALIASES:
+        raise ValueError(
+            "--disaggregation-host-ip must be a routable address; "
+            f"got loopback alias {host_ip!r}"
+        )
+    try:
+        addr = ipaddress.ip_address(host_ip)
+    except ValueError:
+        return host_ip
+    if addr.is_loopback or addr.is_unspecified:
+        kind = "loopback" if addr.is_loopback else "bind/unspecified"
+        raise ValueError(
+            "--disaggregation-host-ip must be a routable address; "
+            f"got {kind} address {host_ip!r}"
+        )
+    return host_ip
 
 
 @dataclasses.dataclass
@@ -230,6 +251,14 @@ class ServerArgs:
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
+
+        from sgl_jax.srt.disaggregation.pd_auth import resolve_secret
+
+        self.disaggregation_shared_secret = resolve_secret(self.disaggregation_shared_secret)
+        if self.disaggregation_host_ip is not None:
+            self.disaggregation_host_ip = _validate_disaggregation_host_ip(
+                self.disaggregation_host_ip
+            )
 
         # update device
         if self.device:

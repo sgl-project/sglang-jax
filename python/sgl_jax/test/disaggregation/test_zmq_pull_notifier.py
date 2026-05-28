@@ -98,6 +98,30 @@ def test_single_callback_fires(p_notifier, d_notifier):
     assert p_notifier.pending_count() == 0
 
 
+def test_single_callback_fires_with_shared_secret():
+    shared_secret = "pd-secret"
+    p_notifier = ZmqPullNotifier("prefill", "127.0.0.1", _free_port(), shared_secret=shared_secret)
+    d_notifier = ZmqPullNotifier("decode", "127.0.0.1", _free_port(), shared_secret=shared_secret)
+    p_notifier.start()
+    d_notifier.start()
+    try:
+        received: list[bytes] = []
+        event = threading.Event()
+
+        def cb(uuid: bytes) -> None:
+            received.append(uuid)
+            event.set()
+
+        p_notifier.register_callback(b"req-auth", cb)
+        d_notifier.send_done(b"req-auth", "127.0.0.1", p_notifier.port)
+        assert event.wait(timeout=2.0)
+        assert received == [b"req-auth"]
+        assert p_notifier.pending_count() == 0
+    finally:
+        d_notifier.stop()
+        p_notifier.stop()
+
+
 def test_unregistered_uuid_does_not_crash_listener(p_notifier, d_notifier):
     d_notifier.send_done(b"nobody", "127.0.0.1", p_notifier.port)
     # Listener should remain alive — register a fresh callback and
