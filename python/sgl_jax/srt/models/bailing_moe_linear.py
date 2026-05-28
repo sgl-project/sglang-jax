@@ -24,6 +24,7 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import (
     EPMoE,
     FusedEPMoE,
+    FusedEPMoEV2,
     GateLogit,
     TopK,
     create_moe_weights_mapping,
@@ -436,9 +437,28 @@ class BailingMoELinearDecoderLayer(nnx.Module):
             layer_id=layer_id,
         )
 
-        moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
-        self.use_fused = moe_backend == MoEBackend.FUSED or moe_backend == "fused"
-        if self.use_fused:
+        self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
+        self.use_fused = self.moe_backend in (MoEBackend.FUSED, MoEBackend.FUSED_V2)
+        if self.moe_backend == MoEBackend.FUSED_V2:
+            self.mlp = FusedEPMoEV2(
+                hidden_size=config.hidden_size,
+                num_experts=num_experts,
+                num_experts_per_tok=config.num_experts_per_tok,
+                intermediate_dim=config.moe_intermediate_size,
+                mesh=mesh,
+                activation="silu",
+                ep_size=getattr(config, "ep_size", 1),
+                weight_dtype=dtype,
+                dtype=dtype,
+                layer_id=layer_id,
+                renormalize_topk_logits=getattr(config, "norm_topk_prob", False),
+                use_grouped_topk=getattr(config, "n_group", 0) > 0,
+                num_groups=getattr(config, "n_group", 0),
+                top_k_groups=getattr(config, "topk_group", 0),
+                num_shared_experts=0,
+                quantization_config=getattr(config, "quantization_config", None),
+            )
+        elif self.moe_backend == MoEBackend.FUSED:
             self.mlp = FusedEPMoE(
                 hidden_size=config.hidden_size,
                 num_experts=num_experts,
@@ -1063,7 +1083,15 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
                     is_w2 = target_base.endswith("w2")
                     out_dim = hidden_size if is_w2 else inter_size
                     in_dim = inter_size if is_w2 else hidden_size
-                    num_blocks = in_dim // BLOCK_SIZE
+                    # Per-channel when no weight_block_size in quant config:
+                    # scale shape is [E, 1, 1, out_dim] with no K-tiling.
+                    _wbs = getattr(
+                        getattr(self.config, "quantization_config", None),
+                        "weight_block_size",
+                        None,
+                    )
+                    is_per_channel = _wbs is None
+                    num_blocks = 1 if is_per_channel else in_dim // BLOCK_SIZE
                     # Mirror the fused weight sharding (("data", "tensor"), ...)
                     # promoted to 4D for the [E, K_blocks, 1, out_dim] scale.
                     fused_weight_shard = wm.sharding[0] if wm.sharding else ("data", "tensor")
@@ -1072,7 +1100,7 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
                         sharding=(fused_weight_shard, None, None, None),
                         transpose=False,
                         reshape=(num_physical_experts, 1, 1, out_dim),
-                        repeat=(1, num_blocks),
+                        repeat=None if is_per_channel else (1, num_blocks),
                         physical_to_logical_map=wm.physical_to_logical_map,
                     )
                 else:
