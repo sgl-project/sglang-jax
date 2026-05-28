@@ -19,6 +19,13 @@ DEFAULT_ENGINE_CONFIG = {
     "dtype": "bfloat16",
     "max_running_requests": 64,
     "page_size": 64,
+    # Cap context length so max_kv = 4096 (= 64 pages × 64 page_size) instead
+    # of the model's 128K HF default. Forces decode heuristic to pick
+    # bkv_sz = min(min_bkv_sz_to_peak=16384, max_kv=4096) = 4096, matching
+    # the pre-get_vmem_limit-full-capacity behavior so the bf16 attention
+    # reduction order — and thus the hardcoded logprob baselines — stays
+    # stable. Prompts here are 8 tokens; 4096 is plenty.
+    "context_length": 4096,
     "max_total_tokens": 257536,
     "precompile_token_paddings": [8192],
     "precompile_bs_paddings": [1, 64],
