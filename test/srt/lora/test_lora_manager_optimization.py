@@ -8,6 +8,7 @@ from sgl_jax.srt.lora.constants import BASE_LORA_ID, BASE_LORA_SLOT
 from sgl_jax.srt.lora.lora_manager import LoRAManager
 from sgl_jax.srt.lora.lora_memory_pool import EMPTY_SLOT, LoRAMemoryPool
 from sgl_jax.srt.lora.lora_registry import LoRARef, LoRARegistry
+from sgl_jax.srt.lora.utils import LoRABatchPlan
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 
 
@@ -140,6 +141,73 @@ class TestLoRAManagerOptimization(unittest.TestCase):
         with self.assertRaises(ValueError):
             LoRARef(lora_id=BASE_LORA_ID, lora_name="reserved")
 
+    def test_memory_pool_zero_buffer_slot_clears_selected_module_layer(self):
+        pool = LoRAMemoryPool(
+            max_loras_per_batch=1,
+            max_lora_rank=2,
+            num_layers=2,
+            target_modules={"q_proj"},
+            mesh=self.mock_mesh,
+            dtype=jnp.float32,
+            hidden_size=4,
+            num_attention_heads=1,
+        )
+        pool.A_buffer = {"q_proj": [jnp.ones((2, 2, 4), dtype=jnp.float32) for _ in range(2)]}
+        pool.B_buffer = {"q_proj": [jnp.ones((2, 4, 2), dtype=jnp.float32) for _ in range(2)]}
+
+        pool._zero_buffer_slot(buffer_id=1, module_name="q_proj", layer_id=0)
+
+        self.assertTrue(jnp.all(pool.A_buffer["q_proj"][0][1] == 0))
+        self.assertTrue(jnp.all(pool.B_buffer["q_proj"][0][1] == 0))
+        self.assertTrue(jnp.all(pool.A_buffer["q_proj"][1][1] == 1))
+        self.assertTrue(jnp.all(pool.B_buffer["q_proj"][1][1] == 1))
+
+    def test_lora_batch_plan_validates_slot_metadata(self):
+        plan = LoRABatchPlan(
+            weight_indices=[0, 2, 1],
+            ranks_by_slot=[0, 8, 16],
+            scalings_by_slot=[0.0, 0.5, 1.0],
+        )
+
+        self.assertEqual(plan.ranks_for_requests(), (0, 16, 8))
+        self.assertEqual(plan.scalings_for_requests(), (0.0, 1.0, 0.5))
+
+        with self.assertRaises(ValueError):
+            LoRABatchPlan(weight_indices=[3], ranks_by_slot=[0, 8], scalings_by_slot=[0.0, 1.0])
+        with self.assertRaises(ValueError):
+            LoRABatchPlan(weight_indices=[-1], ranks_by_slot=[0, 8], scalings_by_slot=[0.0, 1.0])
+        with self.assertRaises(ValueError):
+            LoRABatchPlan(weight_indices=[1], ranks_by_slot=[0, -8], scalings_by_slot=[0.0, 1.0])
+        with self.assertRaises(ValueError):
+            LoRABatchPlan(weight_indices=[1], ranks_by_slot=[0, 8], scalings_by_slot=[0.0])
+        with self.assertRaises(ValueError):
+            LoRABatchPlan(weight_indices=[1], ranks_by_slot=[0, 8], scalings_by_slot=[0.0, -1.0])
+        with self.assertRaises(ValueError):
+            LoRABatchPlan(
+                weight_indices=[1],
+                ranks_by_slot=[0, 8],
+                scalings_by_slot=[0.0, float("inf")],
+            )
+        with self.assertRaises(ValueError):
+            LoRABatchPlan(
+                weight_indices=[1],
+                ranks_by_slot=[0, 8],
+                scalings_by_slot=[0.0, float("nan")],
+            )
+
+        empty_plan = LoRABatchPlan(weight_indices=[], ranks_by_slot=[], scalings_by_slot=[])
+        self.assertEqual(empty_plan.ranks_for_requests(), ())
+
+        static_plan = LoRABatchPlan.for_static_lora(
+            batch_size=3,
+            num_lora_slots=4,
+            rank=8,
+            scaling=0.25,
+        )
+        self.assertEqual(static_plan.weight_indices, (0, 0, 0))
+        self.assertEqual(static_plan.ranks_by_slot, (8, 8, 8, 8))
+        self.assertEqual(static_plan.scalings_by_slot, (0.25, 0.25, 0.25, 0.25))
+
     @patch("sgl_jax.srt.lora.lora_manager.LoRAMemoryPool")
     def test_manager_conditional_update(self, MockPoolClass):
         """Test that LoRAManager conditionally calls update_lora_info."""
@@ -162,28 +230,162 @@ class TestLoRAManagerOptimization(unittest.TestCase):
 
         # Manually set attributes needed for prepare_lora_batch
         manager.memory_pool = mock_pool_instance
-        manager.loras = {}
+        mock_lora = MagicMock()
+        mock_lora.config.r = 8
+        mock_lora.scaling = 0.75
+        manager.loras = {"lora1": mock_lora}
         manager.max_loras_per_batch = 4
+        manager.num_lora_slots = 5
         manager.lora_backend = MagicMock()
         manager.update_lora_info = MagicMock()
 
         # Test case 1: memory_pool returns True (new weights)
         mock_pool_instance.prepare_lora_batch.return_value = True
+        mock_pool_instance.get_buffer_id.return_value = 1
 
         batch = MagicMock(spec=ModelWorkerBatch)
         batch.lora_ids = ["lora1"]
 
         manager.prepare_lora_batch(batch)
 
+        manager.lora_backend.prepare_lora_batch.assert_called_once()
+        call_kwargs = manager.lora_backend.prepare_lora_batch.call_args.kwargs
+        self.assertIs(call_kwargs["model_worker_batch"], batch)
+        self.assertEqual(
+            call_kwargs["batch_plan"],
+            LoRABatchPlan(
+                weight_indices=[1],
+                ranks_by_slot=[0, 8, 0, 0, 0],
+                scalings_by_slot=[0.0, 0.75, 0.0, 0.0, 0.0],
+            ),
+        )
         manager.update_lora_info.assert_called_once()
         manager.update_lora_info.reset_mock()
+        manager.lora_backend.prepare_lora_batch.reset_mock()
 
         # Test case 2: memory_pool returns False (no new weights)
         mock_pool_instance.prepare_lora_batch.return_value = False
 
         manager.prepare_lora_batch(batch)
 
+        manager.lora_backend.prepare_lora_batch.assert_called_once()
         manager.update_lora_info.assert_not_called()
+
+    @patch("sgl_jax.srt.lora.lora_manager.LoRAMemoryPool")
+    def test_manager_normalizes_lora_ids_without_mutating_batch(self, MockPoolClass):
+        mock_pool_instance = MockPoolClass.return_value
+        mock_pool_instance.target_modules = {"q_proj"}
+        mock_pool_instance.prepare_lora_batch.return_value = False
+        mock_pool_instance.get_buffer_id.side_effect = lambda uid: 0 if uid == BASE_LORA_ID else 1
+
+        with patch.object(LoRAManager, "init_state"):
+            manager = LoRAManager(
+                base_model=None,
+                base_hf_config=MagicMock(
+                    num_hidden_layers=1, hidden_size=128, num_attention_heads=4
+                ),
+                max_loras_per_batch=4,
+                dtype=jnp.float32,
+                mesh=self.mock_mesh,
+            )
+
+        mock_lora = MagicMock()
+        mock_lora.config.r = 8
+        mock_lora.scaling = 0.75
+        manager.memory_pool = mock_pool_instance
+        manager.loras = {"lora1": mock_lora}
+        manager.max_loras_per_batch = 4
+        manager.num_lora_slots = 5
+        manager.lora_backend = MagicMock()
+
+        batch = MagicMock(spec=ModelWorkerBatch)
+        batch.lora_ids = [None, "lora1"]
+
+        manager.prepare_lora_batch(batch)
+
+        self.assertEqual(batch.lora_ids, [None, "lora1"])
+        mock_pool_instance.prepare_lora_batch.assert_called_once_with(
+            cur_uids=[BASE_LORA_ID, "lora1"],
+            lora_adapters=manager.loras,
+        )
+        self.assertEqual(
+            manager.lora_backend.prepare_lora_batch.call_args.kwargs["batch_plan"],
+            LoRABatchPlan(
+                weight_indices=[0, 1],
+                ranks_by_slot=[0, 8, 0, 0, 0],
+                scalings_by_slot=[0.0, 0.75, 0.0, 0.0, 0.0],
+            ),
+        )
+
+    @patch("sgl_jax.srt.lora.lora_manager.LoRAMemoryPool")
+    def test_manager_rejects_unknown_dynamic_lora(self, MockPoolClass):
+        mock_pool_instance = MockPoolClass.return_value
+        mock_pool_instance.target_modules = {"q_proj"}
+
+        with patch.object(LoRAManager, "init_state"):
+            manager = LoRAManager(
+                base_model=None,
+                base_hf_config=MagicMock(
+                    num_hidden_layers=1, hidden_size=128, num_attention_heads=4
+                ),
+                max_loras_per_batch=4,
+                dtype=jnp.float32,
+                mesh=self.mock_mesh,
+            )
+
+        manager.memory_pool = mock_pool_instance
+        manager.loras = {}
+        manager.max_lora_rank = 8
+        manager.lora_backend = MagicMock()
+
+        batch = MagicMock(spec=ModelWorkerBatch)
+        batch.lora_ids = ["missing-lora"]
+
+        with self.assertRaisesRegex(ValueError, "not loaded"):
+            manager.prepare_lora_batch(batch)
+
+        mock_pool_instance.prepare_lora_batch.assert_not_called()
+        manager.lora_backend.prepare_lora_batch.assert_not_called()
+
+    @patch("sgl_jax.srt.lora.lora_manager.LoRAMemoryPool")
+    def test_manager_static_lora_builds_static_plan(self, MockPoolClass):
+        mock_pool_instance = MockPoolClass.return_value
+        mock_pool_instance.target_modules = {"q_proj"}
+        server_args = MagicMock(enable_static_lora=True, lora_scaling=0.25)
+
+        with patch.object(LoRAManager, "init_state"):
+            manager = LoRAManager(
+                base_model=None,
+                base_hf_config=MagicMock(
+                    num_hidden_layers=1, hidden_size=128, num_attention_heads=4
+                ),
+                max_loras_per_batch=4,
+                max_lora_rank=8,
+                dtype=jnp.float32,
+                mesh=self.mock_mesh,
+                server_args=server_args,
+            )
+
+        manager.memory_pool = mock_pool_instance
+        manager.loras = {}
+        manager.max_lora_rank = 8
+        manager.lora_backend = MagicMock()
+
+        batch = MagicMock(spec=ModelWorkerBatch)
+        batch.lora_ids = [None, None]
+
+        manager.prepare_lora_batch(batch)
+
+        manager.lora_backend.prepare_lora_batch.assert_called_once()
+        self.assertEqual(
+            manager.lora_backend.prepare_lora_batch.call_args.kwargs["batch_plan"],
+            LoRABatchPlan(
+                weight_indices=[0, 0],
+                ranks_by_slot=[8, 8, 8, 8],
+                scalings_by_slot=[0.25, 0.25, 0.25, 0.25],
+            ),
+        )
+        mock_pool_instance.prepare_lora_batch.assert_not_called()
 
 
 if __name__ == "__main__":

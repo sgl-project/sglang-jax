@@ -1,31 +1,85 @@
-from collections.abc import Iterable
+import math
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
-import jax
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
-from jax.tree_util import register_pytree_node_class
 
 
-@register_pytree_node_class
-@dataclass
-class LoRABatchInfo:
-    # scaling of each lora adapter, in shape (num_tokens,)
-    scalings: jax.Array
+@dataclass(frozen=True)
+class LoRABatchPlan:
+    """CPU-side LoRA assignment plan for one scheduler batch.
 
-    # (num_tokens,)
-    token_lora_indices: jax.Array
+    weight_indices is request-granular and points at device-memory LoRA slots.
+    ranks_by_slot and scalings_by_slot are slot-granular metadata. Keeping these
+    together makes the indexing contract explicit before a backend expands it to
+    token-granular arrays.
+    """
 
-    # (num_tokens,)
-    lora_ranks: jax.Array
+    weight_indices: tuple[int, ...]
+    ranks_by_slot: tuple[int, ...]
+    scalings_by_slot: tuple[float, ...]
 
-    def tree_flatten(self):
-        return ((self.scalings, self.token_lora_indices, self.lora_ranks), None)
+    def __init__(
+        self,
+        weight_indices: Sequence[int],
+        ranks_by_slot: Sequence[int],
+        scalings_by_slot: Sequence[float],
+    ):
+        object.__setattr__(self, "weight_indices", tuple(int(idx) for idx in weight_indices))
+        object.__setattr__(self, "ranks_by_slot", tuple(int(rank) for rank in ranks_by_slot))
+        object.__setattr__(
+            self,
+            "scalings_by_slot",
+            tuple(float(scaling) for scaling in scalings_by_slot),
+        )
+        self._validate()
+
+    def _validate(self):
+        if len(self.ranks_by_slot) != len(self.scalings_by_slot):
+            raise ValueError(
+                "LoRA rank and scaling metadata must have the same slot count: "
+                f"{len(self.ranks_by_slot)} != {len(self.scalings_by_slot)}"
+            )
+
+        num_slots = len(self.ranks_by_slot)
+        for request_idx, slot in enumerate(self.weight_indices):
+            if slot < 0 or slot >= num_slots:
+                raise ValueError(
+                    f"LoRA request {request_idx} references slot {slot}, "
+                    f"but only {num_slots} slots are available"
+                )
+
+        for slot, rank in enumerate(self.ranks_by_slot):
+            if rank < 0:
+                raise ValueError(f"LoRA slot {slot} has negative rank {rank}")
+
+        for slot, scaling in enumerate(self.scalings_by_slot):
+            if not math.isfinite(scaling):
+                raise ValueError(f"LoRA slot {slot} has non-finite scaling {scaling}")
+            if scaling < 0:
+                raise ValueError(f"LoRA slot {slot} has negative scaling {scaling}")
 
     @classmethod
-    def tree_unflatten(cls, aux_data, children):
-        return cls(*children)
+    def for_static_lora(
+        cls,
+        batch_size: int,
+        num_lora_slots: int,
+        rank: int,
+        scaling: float,
+    ) -> "LoRABatchPlan":
+        return cls(
+            weight_indices=(0,) * batch_size,
+            ranks_by_slot=(rank,) * num_lora_slots,
+            scalings_by_slot=(scaling,) * num_lora_slots,
+        )
+
+    def ranks_for_requests(self) -> tuple[int, ...]:
+        return tuple(self.ranks_by_slot[slot] for slot in self.weight_indices)
+
+    def scalings_for_requests(self) -> tuple[float, ...]:
+        return tuple(self.scalings_by_slot[slot] for slot in self.weight_indices)
 
 
 class LoRAType(Enum):
@@ -40,9 +94,15 @@ def get_target_module_name(full_module_name: str, target_modules: set[str]) -> s
     If there is a target module name in target_modules that can match full_module_name, return this name
     Else raise ValueError.
     """
-    for target_module in target_modules:
+    ordered_target_modules = sorted(target_modules, key=lambda name: (-len(name), name))
+    for target_module in ordered_target_modules:
+        if full_module_name == target_module or full_module_name.endswith(f".{target_module}"):
+            return target_module
+
+    for target_module in ordered_target_modules:
         if target_module in full_module_name:
             return target_module
+
     raise ValueError(f"Cannot find target module name for {full_module_name} in {target_modules}")
 
 

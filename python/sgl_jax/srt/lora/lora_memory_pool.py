@@ -408,9 +408,9 @@ class LoRAMemoryPool:
                     return buffer_id
 
             raise ValueError(
-                "No available buffer slots. Max %d LoRA adapters per batch exceeded; %d total slots are available.",
-                self.max_loras_per_batch,
-                self.num_lora_slots,
+                "No available buffer slots. "
+                f"Max {self.max_loras_per_batch} LoRA adapters per batch exceeded; "
+                f"{self.num_lora_slots} total slots are available."
             )
 
         has_new_weights = False
@@ -453,51 +453,15 @@ class LoRAMemoryPool:
             lora_adapter: LoRA adapter object (None for base model)
         """
 
-        def get_ab_zero_matrix_shape(module_name: str):
-            _, max_lora_rank, input_dim = self._get_lora_a_shape(module_name)
-            a_zero_matrix_shape = (max_lora_rank, input_dim)
-            _, output_dim, max_lora_rank = self._get_lora_b_shape(module_name)
-            b_zero_matrix_shape = (output_dim, max_lora_rank)
-            return a_zero_matrix_shape, b_zero_matrix_shape
-
         with jax.set_mesh(self.mesh):
             if is_base_lora_id(uid):
                 # Base model: zero out the buffer slot
                 logger.debug("Loading base model (zeros) into buffer slot %d", buffer_id)
-                for module_name in self.target_modules:
-                    for layer_id in range(self.num_layers):
-                        a_shape, b_shape = get_ab_zero_matrix_shape(module_name)
-                        # Zero out A buffer
-                        self.A_buffer[module_name][layer_id] = (
-                            self.A_buffer[module_name][layer_id]
-                            .at[buffer_id]
-                            .set(jnp.zeros(a_shape, dtype=self.dtype))
-                        )
-                        # Zero out B buffer
-                        self.B_buffer[module_name][layer_id] = (
-                            self.B_buffer[module_name][layer_id]
-                            .at[buffer_id]
-                            .set(jnp.zeros(b_shape, dtype=self.dtype))
-                        )
+                self._zero_buffer_slot(buffer_id)
                 return
 
             if lora_adapter is None:
-                logger.warning("LoRA adapter %s is None, loading zeros", uid)
-                # Treat as base model if adapter is None
-                for module_name in self.target_modules:
-                    a_shape, b_shape = get_ab_zero_matrix_shape(module_name)
-                    for layer_id in range(self.num_layers):
-                        self.A_buffer[module_name][layer_id] = (
-                            self.A_buffer[module_name][layer_id]
-                            .at[buffer_id]
-                            .set(jnp.zeros(a_shape, dtype=self.dtype))
-                        )
-                        self.B_buffer[module_name][layer_id] = (
-                            self.B_buffer[module_name][layer_id]
-                            .at[buffer_id]
-                            .set(jnp.zeros(b_shape, dtype=self.dtype))
-                        )
-                return
+                raise ValueError(f"LoRA adapter {uid!r} is not loaded")
 
             logger.info(
                 "Loading LoRA adapter %s into buffer slot %d (num_layers=%d, target_modules=%s)",
@@ -516,7 +480,6 @@ class LoRAMemoryPool:
 
                 # Process each target module
                 for module_name in self.target_modules:
-                    a_shape, b_shape = get_ab_zero_matrix_shape(module_name)
                     # Extract and load weights for this module
                     lora_a, lora_b = self._extract_module_weights(
                         layer_weights, layer_id, module_name
@@ -561,16 +524,7 @@ class LoRAMemoryPool:
                             module_name,
                             layer_id,
                         )
-                        self.A_buffer[module_name][layer_id] = (
-                            self.A_buffer[module_name][layer_id]
-                            .at[buffer_id]
-                            .set(jnp.zeros(a_shape, dtype=self.dtype))
-                        )
-                        self.B_buffer[module_name][layer_id] = (
-                            self.B_buffer[module_name][layer_id]
-                            .at[buffer_id]
-                            .set(jnp.zeros(b_shape, dtype=self.dtype))
-                        )
+                        self._zero_buffer_slot(buffer_id, module_name, layer_id)
 
             # Log summary of loaded weights
             logger.info(
@@ -578,6 +532,47 @@ class LoRAMemoryPool:
                 uid,
                 loaded_modules_count,
             )
+
+    def _zero_buffer_slot(
+        self,
+        buffer_id: int,
+        module_name: str | None = None,
+        layer_id: int | None = None,
+    ):
+        """Write zero LoRA weights for one slot, optionally scoped to one module/layer."""
+        if buffer_id < 0 or buffer_id >= self.num_lora_slots:
+            raise ValueError(
+                f"LoRA buffer slot {buffer_id} is out of range for {self.num_lora_slots} slots"
+            )
+        if module_name is not None and module_name not in self.target_modules:
+            raise ValueError(
+                f"Unknown LoRA target module {module_name!r}; "
+                f"available modules: {sorted(self.target_modules)}"
+            )
+        if layer_id is not None and (layer_id < 0 or layer_id >= self.num_layers):
+            raise ValueError(
+                f"LoRA layer_id {layer_id} is out of range for {self.num_layers} layers"
+            )
+
+        module_names = [module_name] if module_name is not None else self.target_modules
+        layer_ids = [layer_id] if layer_id is not None else range(self.num_layers)
+
+        for cur_module_name in module_names:
+            a_shape, b_shape = self._get_zero_matrix_shapes(cur_module_name)
+            zero_a = jnp.zeros(a_shape, dtype=self.dtype)
+            zero_b = jnp.zeros(b_shape, dtype=self.dtype)
+            for cur_layer_id in layer_ids:
+                self.A_buffer[cur_module_name][cur_layer_id] = (
+                    self.A_buffer[cur_module_name][cur_layer_id].at[buffer_id].set(zero_a)
+                )
+                self.B_buffer[cur_module_name][cur_layer_id] = (
+                    self.B_buffer[cur_module_name][cur_layer_id].at[buffer_id].set(zero_b)
+                )
+
+    def _get_zero_matrix_shapes(self, module_name: str) -> tuple[tuple[int, int], tuple[int, int]]:
+        _, a_rank, input_dim = self._get_lora_a_shape(module_name)
+        _, output_dim, b_rank = self._get_lora_b_shape(module_name)
+        return (a_rank, input_dim), (output_dim, b_rank)
 
     def _extract_module_weights(
         self,
@@ -884,7 +879,10 @@ class LoRAMemoryPool:
 
     def get_buffer_id(self, lora_uid: str | None) -> int:
         """Get buffer slot ID for a given LoRA adapter ID."""
-        return self.uid_to_buffer_id[lora_uid]
+        try:
+            return self.uid_to_buffer_id[lora_uid]
+        except KeyError as exc:
+            raise KeyError(f"LoRA adapter {lora_uid!r} is not loaded in the memory pool") from exc
 
     def get_array(self, module_name: str, layer_id: int, is_lora_a: bool) -> jax.Array:
         """

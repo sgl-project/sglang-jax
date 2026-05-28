@@ -21,6 +21,7 @@ import numpy as np
 from jax.sharding import NamedSharding
 
 from sgl_jax.srt.lora.backend.base_backend import BaseLoRABackend
+from sgl_jax.srt.lora.utils import LoRABatchPlan
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -125,7 +126,7 @@ class BgmvLoRABackend(BaseLoRABackend):
                            a lora_b module for q, with shape (1, num_lora, output_dim_q, r)
                            and a combined lora_b module for kv, with shape (2, num_lora, output_dim_kv, r)
             output_slices: a fixed tuple which has three items, (output_dim_q, output_dim_kv, output_dim_kv)
-            base_output: (s, 2 * output_dim)
+            base_output: base layer output with shape (s, output_dim_q + 2 * output_dim_kv)
             lora_a_output_sharding: lora_a_output sharding
             lora_b_output_sharding: lora_b_output sharding
             scalings: vector with shape (s,), alpha/rank
@@ -178,7 +179,7 @@ class BgmvLoRABackend(BaseLoRABackend):
         Args:
             x: input matrix with shape (s, input_dim), here s is the sum of all sequence lengths
             gate_up_lora_a: lora_a module for gate_up_proj, with shape (num_lora, 2 * r, input_dim)
-            gate_up_lora_b: lora_b module for qkv.
+            gate_up_lora_b: lora_b module for gate_up_proj.
                         If passed in as a tensor, its shape should be (num_lora, 2 * output_dim, r)
                         If passed in as a tuple, it should contain two tensors with shape (num_lora, output_dim, r)
             base_output: (s, 2 * output_dim)
@@ -190,7 +191,9 @@ class BgmvLoRABackend(BaseLoRABackend):
             result with shape (s, 2 * output_dim)
         """
         if isinstance(gate_up_lora_b, tuple):
-            gate_up_lora_b_concated = jnp.concat([gate_up_lora_b[0], gate_up_lora_b[1]], axis=1)
+            gate_up_lora_b_concated = jnp.concatenate(
+                [gate_up_lora_b[0], gate_up_lora_b[1]], axis=1
+            )
         else:
             gate_up_lora_b_concated = gate_up_lora_b
 
@@ -214,35 +217,48 @@ class BgmvLoRABackend(BaseLoRABackend):
     def prepare_lora_batch(
         self,
         model_worker_batch: ModelWorkerBatch,
-        weight_indices: list[int],  # [bs,]
-        lora_ranks: list[int],  # [<=max_lora_per_batch,]
-        scalings: list[float],  # [<=max_lora_per_batch,]
+        batch_plan: LoRABatchPlan,
     ):
-        lora_ranks_bs = []
-        scalings_bs = []
-        for indice in weight_indices:
-            lora_ranks_bs.append(lora_ranks[indice])
-            scalings_bs.append(scalings[indice])
+        weight_indices = np.array(batch_plan.weight_indices, dtype=np.int32)
+        lora_ranks_bs = np.array(batch_plan.ranks_for_requests(), dtype=np.int32)
+        scalings_bs = np.array(batch_plan.scalings_for_requests(), dtype=np.float32)
 
-        assert len(model_worker_batch.seq_lens) == len(weight_indices)
-        assert len(model_worker_batch.seq_lens) == len(lora_ranks_bs)
-        assert len(model_worker_batch.seq_lens) == len(scalings_bs)
+        if len(model_worker_batch.seq_lens) != len(weight_indices):
+            raise ValueError(
+                "LoRA batch plan must have one weight index per request: "
+                f"{len(weight_indices)} != {len(model_worker_batch.seq_lens)}"
+            )
 
         target_len = model_worker_batch.input_ids.shape[0]
 
         if model_worker_batch.forward_mode == ForwardMode.EXTEND:
-            scalings_cpu = np.repeat(
-                np.array(scalings_bs, dtype=np.float32), model_worker_batch.extend_seq_lens
-            )
+            if model_worker_batch.extend_seq_lens is None:
+                raise ValueError("LoRA EXTEND batch requires extend_seq_lens")
 
-            lora_token_indices_cpu = np.repeat(
-                np.array(weight_indices, dtype=np.int32), model_worker_batch.extend_seq_lens
-            )
-            lora_ranks_cpu = np.repeat(
-                np.array(lora_ranks_bs, dtype=np.int32), model_worker_batch.extend_seq_lens
-            )
+            extend_seq_lens = np.asarray(model_worker_batch.extend_seq_lens, dtype=np.int64)
+            if len(extend_seq_lens) != len(weight_indices):
+                raise ValueError(
+                    "LoRA EXTEND batch must have one extend length per request: "
+                    f"{len(extend_seq_lens)} != {len(weight_indices)}"
+                )
+            if np.any(extend_seq_lens < 0):
+                raise ValueError(
+                    "LoRA EXTEND batch has negative extend length: "
+                    f"{extend_seq_lens.tolist()}"
+                )
 
-            num_to_pad = target_len - np.sum(model_worker_batch.extend_seq_lens)
+            extend_token_len = int(np.sum(extend_seq_lens))
+            if extend_token_len > target_len:
+                raise ValueError(
+                    "LoRA EXTEND token metadata exceeds target token length: "
+                    f"sum(extend_seq_lens)={extend_token_len}, target_len={target_len}"
+                )
+
+            scalings_cpu = np.repeat(scalings_bs, extend_seq_lens)
+            lora_token_indices_cpu = np.repeat(weight_indices, extend_seq_lens)
+            lora_ranks_cpu = np.repeat(lora_ranks_bs, extend_seq_lens)
+
+            num_to_pad = target_len - extend_token_len
 
             padded_scalings_cpu = scalings_cpu
             padded_lora_token_indices_cpu = lora_token_indices_cpu
@@ -259,9 +275,17 @@ class BgmvLoRABackend(BaseLoRABackend):
                     lora_ranks_cpu, [0, num_to_pad], mode="constant", constant_values=0
                 )
         elif model_worker_batch.forward_mode == ForwardMode.DECODE:
-            padded_scalings_cpu = np.array(scalings_bs, dtype=np.float32)
-            padded_lora_token_indices_cpu = np.array(weight_indices, dtype=np.int32)
-            padded_lora_ranks_cpu = np.array(lora_ranks_bs, dtype=np.int32)
+            padded_scalings_cpu = scalings_bs
+            padded_lora_token_indices_cpu = weight_indices
+            padded_lora_ranks_cpu = lora_ranks_bs
+        else:
+            raise ValueError(f"Unsupported forward mode for LoRA: {model_worker_batch.forward_mode}")
+
+        if len(padded_scalings_cpu) != target_len:
+            raise ValueError(
+                "LoRA token metadata length must match input_ids length: "
+                f"{len(padded_scalings_cpu)} != {target_len}"
+            )
 
         model_worker_batch.lora_scalings = padded_scalings_cpu
         model_worker_batch.lora_token_indices = padded_lora_token_indices_cpu
@@ -365,10 +389,7 @@ def bgmv_expand_slice(
     pad_right = output_array.shape[-1] - (slice_offset + slice_size)
     outputs = jnp.pad(outputs, ((0, 0), (pad_left, pad_right)), mode="constant", constant_values=0)
 
-    if output_array is not None:
-        return output_array + outputs
-    else:
-        return outputs
+    return output_array + outputs
 
 
 def bgmv_jax(

@@ -15,8 +15,9 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.lora.backend.bgmv_backend import BgmvLoRABackend
-from sgl_jax.srt.lora.layers import LoRALinear
+from sgl_jax.srt.lora.layers import LoRALinear, _restore_base_output_for_rank_zero
 from sgl_jax.srt.lora.utils import (
+    LoRABatchPlan,
     get_lora_a_output_sharding,
     get_lora_b_output_sharding,
 )
@@ -44,6 +45,11 @@ class FakeLoRABackend:
         return base_output + 100
 
 
+class FakeBaseLayer:
+    def __call__(self, x):
+        return x, None
+
+
 class BatchComposition(Enum):
     UNIFORM = "uniform"
     MIXED = "mixed"
@@ -54,6 +60,57 @@ class BatchComposition(Enum):
 class BatchMode(Enum):
     PREFILL = "prefill"
     DECODE = "decode"
+
+
+class TestRankZeroOutputRestore(unittest.TestCase):
+    def test_supports_missing_ranks_and_broadcast(self):
+        base_output = jnp.arange(24, dtype=jnp.float32).reshape(2, 3, 4)
+        lora_output = base_output + 100
+
+        unchanged = _restore_base_output_for_rank_zero(base_output, lora_output, None)
+        np.testing.assert_array_equal(np.asarray(unchanged), np.asarray(lora_output))
+
+        ranks = jnp.array([[8, 0, 8], [0, 8, 0]], dtype=jnp.int32)
+        output = _restore_base_output_for_rank_zero(base_output, lora_output, ranks)
+
+        expected = np.array(lora_output)
+        expected[0, 1] = np.asarray(base_output[0, 1])
+        expected[1, 0] = np.asarray(base_output[1, 0])
+        expected[1, 2] = np.asarray(base_output[1, 2])
+        np.testing.assert_array_equal(np.asarray(output), expected)
+
+    def test_supports_1d_ranks_for_2d_output(self):
+        base_output = jnp.arange(12, dtype=jnp.float32).reshape(3, 4)
+        lora_output = base_output + 100
+        ranks = jnp.array([8, 0, 16], dtype=jnp.int32)
+
+        output = _restore_base_output_for_rank_zero(base_output, lora_output, ranks)
+
+        expected = np.array(lora_output)
+        expected[1] = np.asarray(base_output[1])
+        np.testing.assert_array_equal(np.asarray(output), expected)
+
+    def test_supports_all_zero_and_all_nonzero_ranks(self):
+        base_output = jnp.arange(12, dtype=jnp.float32).reshape(3, 4)
+        lora_output = base_output + 100
+
+        all_zero = _restore_base_output_for_rank_zero(
+            base_output, lora_output, jnp.zeros((3,), dtype=jnp.int32)
+        )
+        all_nonzero = _restore_base_output_for_rank_zero(
+            base_output, lora_output, jnp.ones((3,), dtype=jnp.int32)
+        )
+
+        np.testing.assert_array_equal(np.asarray(all_zero), np.asarray(base_output))
+        np.testing.assert_array_equal(np.asarray(all_nonzero), np.asarray(lora_output))
+
+    def test_rejects_unbroadcastable_rank_shape(self):
+        base_output = jnp.arange(12, dtype=jnp.float32).reshape(3, 4)
+        lora_output = base_output + 100
+        ranks = jnp.ones((1, 1, 1), dtype=jnp.int32)
+
+        with self.assertRaisesRegex(ValueError, "broadcastable"):
+            _restore_base_output_for_rank_zero(base_output, lora_output, ranks)
 
 
 def reference_lora_a_gemm(
@@ -301,6 +358,16 @@ class TestBgmvLoRABackend(CustomTestCase):
             np.asarray(output[lora_rows]), np.asarray(base_output[lora_rows] + 100)
         )
 
+    def test_lora_linear_requires_batch_context(self):
+        layer = LoRALinear(base_layer=FakeBaseLayer(), lora_backend=FakeLoRABackend())
+        layer.A_buffer = jnp.empty((0,), dtype=jnp.float32)
+        layer.B_buffer = jnp.empty((0,), dtype=jnp.float32)
+        layer.lora_a_output_sharding = None
+        layer.lora_b_output_sharding = None
+
+        with self.assertRaisesRegex(RuntimeError, "LoraBatchContext"):
+            layer(jnp.ones((2, self.input_dim), dtype=jnp.float32))
+
     def get_lora_batch_info_on_device(self, batch: ModelWorkerBatch):
         (
             lora_scalings,
@@ -401,7 +468,11 @@ class TestBgmvLoRABackend(CustomTestCase):
             return_output_logprob_only=False,
             top_logprobs_nums=1,
             token_ids_logprobs=None,
-            extend_seq_lens=np.array(seq_lengths, dtype=np.int32),
+            extend_seq_lens=(
+                np.array(seq_lengths, dtype=np.int32)
+                if forward_mode == ForwardMode.EXTEND
+                else None
+            ),
             extend_prefix_lens=None,
             extend_logprob_start_lens=None,
             extend_input_logprob_token_ids=None,
@@ -477,21 +548,16 @@ class TestBgmvLoRABackend(CustomTestCase):
         scalings = [0] * len(self.lora_configs)
         lora_name_to_idx = {}
 
-        # no_lora_count=1
-
-        for i, lora_name in enumerate(unique_loras):
-            # if lora_name == "_NO_LORA_":
-            lora_name_to_idx[lora_name] = i
-            # else:
-            #    lora_name_to_idx[lora_name] = no_lora_count
-            #    no_lora_count+=1
+        for slot, lora_name in enumerate(unique_loras):
+            lora_name_to_idx[lora_name] = slot
+            rank = self.lora_configs[lora_name][0]
+            lora_ranks[slot] = rank
+            scalings[slot] = 0.0 if rank == 0 else 0.5 + 0.25 * slot
 
         for i, lora_name in enumerate(normalized_assignments):
             weight_indices[i] = lora_name_to_idx[lora_name]
-            lora_ranks[weight_indices[i]] = self.lora_configs[lora_name][0]
-            scalings[weight_indices[i]] = 1.0
 
-        scalings_seq = [1.0 for _ in normalized_assignments]
+        scalings_seq = [scalings[weight_indices[i]] for i in range(len(normalized_assignments))]
 
         weights = {}
         for lora_name in unique_loras:
@@ -537,7 +603,9 @@ class TestBgmvLoRABackend(CustomTestCase):
 
                 max_rank = max(self.lora_configs[name][0] for name in weights.keys())
                 backend = BgmvLoRABackend(max_loras_per_batch=len(weights), max_lora_rank=max_rank)
-                backend.prepare_lora_batch(model_worker_batch, weight_indices, lora_ranks, scalings)
+                backend.prepare_lora_batch(
+                    model_worker_batch, LoRABatchPlan(weight_indices, lora_ranks, scalings)
+                )
                 lora_scalings_device, lora_token_indces_device = self.get_lora_batch_info_on_device(
                     model_worker_batch
                 )
@@ -648,7 +716,9 @@ class TestBgmvLoRABackend(CustomTestCase):
 
                 max_rank = max(self.lora_configs[name][0] for name in weights.keys())
                 backend = BgmvLoRABackend(max_loras_per_batch=len(weights), max_lora_rank=max_rank)
-                backend.prepare_lora_batch(model_worker_batch, weight_indices, lora_ranks, scalings)
+                backend.prepare_lora_batch(
+                    model_worker_batch, LoRABatchPlan(weight_indices, lora_ranks, scalings)
+                )
                 lora_scalings_device, lora_token_indces_device = self.get_lora_batch_info_on_device(
                     model_worker_batch
                 )
@@ -728,7 +798,9 @@ class TestBgmvLoRABackend(CustomTestCase):
 
                 max_rank = max(self.lora_configs[name][0] for name in weights.keys())
                 backend = BgmvLoRABackend(max_loras_per_batch=len(weights), max_lora_rank=max_rank)
-                backend.prepare_lora_batch(model_worker_batch, weight_indices, lora_ranks, scalings)
+                backend.prepare_lora_batch(
+                    model_worker_batch, LoRABatchPlan(weight_indices, lora_ranks, scalings)
+                )
                 lora_scalings_device, lora_token_indces_device = self.get_lora_batch_info_on_device(
                     model_worker_batch
                 )
@@ -809,7 +881,9 @@ class TestBgmvLoRABackend(CustomTestCase):
 
                 max_rank = max(self.lora_configs[name][0] for name in weights.keys())
                 backend = BgmvLoRABackend(max_loras_per_batch=len(weights), max_lora_rank=max_rank)
-                backend.prepare_lora_batch(model_worker_batch, weight_indices, lora_ranks, scalings)
+                backend.prepare_lora_batch(
+                    model_worker_batch, LoRABatchPlan(weight_indices, lora_ranks, scalings)
+                )
                 lora_scalings_device, lora_token_indces_device = self.get_lora_batch_info_on_device(
                     model_worker_batch
                 )
@@ -862,6 +936,162 @@ class TestBgmvLoRABackend(CustomTestCase):
                     err_msg=f"QKV missing k_proj failed for {composition.value}, {mode.value}, batch_size={batch_size}",
                     strict=True,
                 )
+
+    def test_lora_a_gemm_applies_non_unit_scaling(self):
+        backend = BgmvLoRABackend(max_loras_per_batch=2, max_lora_rank=2)
+        x = jnp.array(
+            [
+                [1.0, 2.0, 3.0, 4.0],
+                [2.0, 0.0, 1.0, 3.0],
+                [0.0, 1.0, 0.0, 2.0],
+            ],
+            dtype=jnp.float32,
+        )
+        weights = jnp.array(
+            [
+                [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+                [[0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+            ],
+            dtype=jnp.float32,
+        )
+        token_indices = jnp.array([0, 1, 1], dtype=jnp.int32)
+        scalings = jnp.array([0.5, 2.0, 3.0], dtype=jnp.float32)
+
+        output = backend.run_lora_a_gemm(
+            x=x,
+            weights=weights,
+            sharding=NamedSharding(self.mesh, PartitionSpec()),
+            scalings=scalings,
+            token_indices=token_indices,
+        )
+
+        expected = np.array(
+            [
+                [0.5, 1.0],
+                [2.0, 6.0],
+                [0.0, 6.0],
+            ],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(np.asarray(output), expected, rtol=1e-5, atol=1e-5)
+
+    def test_prepare_lora_batch_rejects_extend_token_overflow(self):
+        backend = BgmvLoRABackend(max_loras_per_batch=2, max_lora_rank=8)
+        model_worker_batch = self.create_model_worker_batch(
+            np.zeros((4, self.input_dim), dtype=np.float32),
+            [2, 2],
+            BatchMode.PREFILL,
+        )
+        model_worker_batch.input_ids = np.arange(3, dtype=np.int32)
+
+        with self.assertRaisesRegex(ValueError, "exceeds target token length"):
+            backend.prepare_lora_batch(
+                model_worker_batch,
+                LoRABatchPlan(
+                    weight_indices=[0, 1],
+                    ranks_by_slot=[0, 8],
+                    scalings_by_slot=[0.0, 1.0],
+                ),
+            )
+
+    def test_prepare_lora_batch_rejects_negative_extend_length(self):
+        backend = BgmvLoRABackend(max_loras_per_batch=2, max_lora_rank=8)
+        model_worker_batch = self.create_model_worker_batch(
+            np.zeros((4, self.input_dim), dtype=np.float32),
+            [2, 2],
+            BatchMode.PREFILL,
+        )
+        model_worker_batch.extend_seq_lens = np.array([2, -1], dtype=np.int32)
+
+        with self.assertRaisesRegex(ValueError, "negative extend length"):
+            backend.prepare_lora_batch(
+                model_worker_batch,
+                LoRABatchPlan(
+                    weight_indices=[0, 1],
+                    ranks_by_slot=[0, 8],
+                    scalings_by_slot=[0.0, 1.5],
+                ),
+            )
+
+    def test_prepare_lora_batch_pads_extend_metadata(self):
+        backend = BgmvLoRABackend(max_loras_per_batch=2, max_lora_rank=8)
+        model_worker_batch = self.create_model_worker_batch(
+            np.zeros((5, self.input_dim), dtype=np.float32),
+            [1, 2],
+            BatchMode.PREFILL,
+        )
+        model_worker_batch.input_ids = np.arange(5, dtype=np.int32)
+
+        backend.prepare_lora_batch(
+            model_worker_batch,
+            LoRABatchPlan(
+                weight_indices=[0, 1],
+                ranks_by_slot=[0, 8],
+                scalings_by_slot=[0.0, 1.5],
+            ),
+        )
+
+        np.testing.assert_array_equal(
+            model_worker_batch.lora_scalings,
+            np.array([0.0, 1.5, 1.5, 0.0, 0.0], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            model_worker_batch.lora_token_indices,
+            np.array([0, 1, 1, 0, 0], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            model_worker_batch.lora_ranks,
+            np.array([0, 8, 8, 0, 0], dtype=np.int32),
+        )
+
+    def test_prepare_lora_batch_decode_metadata(self):
+        backend = BgmvLoRABackend(max_loras_per_batch=3, max_lora_rank=16)
+        model_worker_batch = self.create_model_worker_batch(
+            np.zeros((3, self.input_dim), dtype=np.float32),
+            [1, 1, 1],
+            BatchMode.DECODE,
+        )
+
+        backend.prepare_lora_batch(
+            model_worker_batch,
+            LoRABatchPlan(
+                weight_indices=[0, 2, 1],
+                ranks_by_slot=[0, 8, 16],
+                scalings_by_slot=[0.0, 0.5, 1.25],
+            ),
+        )
+
+        np.testing.assert_array_equal(
+            model_worker_batch.lora_scalings,
+            np.array([0.0, 1.25, 0.5], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            model_worker_batch.lora_token_indices,
+            np.array([0, 2, 1], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            model_worker_batch.lora_ranks,
+            np.array([0, 16, 8], dtype=np.int32),
+        )
+
+    def test_prepare_lora_batch_rejects_decode_metadata_length_mismatch(self):
+        backend = BgmvLoRABackend(max_loras_per_batch=2, max_lora_rank=8)
+        model_worker_batch = self.create_model_worker_batch(
+            np.zeros((2, self.input_dim), dtype=np.float32),
+            [1, 1],
+            BatchMode.DECODE,
+        )
+        model_worker_batch.input_ids = np.arange(3, dtype=np.int32)
+
+        with self.assertRaisesRegex(ValueError, "metadata length"):
+            backend.prepare_lora_batch(
+                model_worker_batch,
+                LoRABatchPlan(
+                    weight_indices=[0, 1],
+                    ranks_by_slot=[0, 8],
+                    scalings_by_slot=[0.0, 1.0],
+                ),
+            )
 
 
 if __name__ == "__main__":
