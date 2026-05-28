@@ -67,30 +67,11 @@ jobs:
       id-token: write
     secrets: inherit
 
-  unit-test-cpu-daily:
-    if: github.repository == 'sgl-project/sglang-jax'
-    runs-on: arc-runner-cpu
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Setup Python environment
-        uses: ./.github/actions/setup-venv
-        with:
-          install-target: python[cpu]
-      - name: Run unit test CPU suite
-        timeout-minutes: 30
-        env:
-          SGLANG_JAX_IS_IN_CI: true
-          USE_DEVICE_TYPE: cpu
-        run: |
-          python3 test/srt/run_suite.py --suite unit-test-cpu
-
   nightly-test-daily-finish:
     needs: [
       nightly-test-accuracy-text-models-1-tpu-daily,
       nightly-test-perf-text-models-1-tpu-daily,
       multi-host-test-mimo-flash-daily,
-      unit-test-cpu-daily,
     ]
     if: always() && github.repository == 'sgl-project/sglang-jax'
     runs-on: ubuntu-latest
@@ -101,15 +82,13 @@ jobs:
           echo "accuracy-1-tpu-daily: ${{ needs.nightly-test-accuracy-text-models-1-tpu-daily.result }}"
           echo "perf-text-1-tpu-daily: ${{ needs.nightly-test-perf-text-models-1-tpu-daily.result }}"
           echo "multi-host-mimo-flash-daily: ${{ needs.multi-host-test-mimo-flash-daily.result }}"
-          echo "unit-test-cpu-daily: ${{ needs.unit-test-cpu-daily.result }}"
           echo ""
 
           has_failure=false
           for job_result in \
             "accuracy-1-tpu-daily=${{ needs.nightly-test-accuracy-text-models-1-tpu-daily.result }}" \
             "perf-text-1-tpu-daily=${{ needs.nightly-test-perf-text-models-1-tpu-daily.result }}" \
-            "multi-host-mimo-flash-daily=${{ needs.multi-host-test-mimo-flash-daily.result }}" \
-            "unit-test-cpu-daily=${{ needs.unit-test-cpu-daily.result }}"; do
+            "multi-host-mimo-flash-daily=${{ needs.multi-host-test-mimo-flash-daily.result }}"; do
             job_name="${job_result%%=*}"
             result="${job_result#*=}"
             if [ "$result" != "success" ]; then

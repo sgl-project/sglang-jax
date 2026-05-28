@@ -262,6 +262,9 @@ suites = {
         TestFile("test/srt/lora/test_bgmv_backend.py", 7),
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 5.5),
         TestFile("python/sgl_jax/test/kernels/simple_gla_fused_test.py", 1, runner="pytest"),
+        TestFile("python/sgl_jax/test/layers/test_gdn_backend.py", 0.6),
+        TestFile("python/sgl_jax/test/layers/test_merged_column_parallel_linear.py", 0.1),
+        TestFile("python/sgl_jax/test/layers/test_qwen3_5_gated_delta_net.py", 0.5),
     ],
     # CPU-only unit tests — moved off arc-runner-v6e-1 to a dedicated
     # CPU runner so they don't consume TPU capacity. Either pure
@@ -293,9 +296,6 @@ suites = {
         TestFile("test/srt/openai_server/basic/test_serving_chat.py", 0.1),
         TestFile("test/srt/openai_server/basic/test_serving_completions.py", 0.1),
         TestFile("test/srt/test_reasoning_parser.py", 0.1),
-        TestFile("python/sgl_jax/test/layers/test_gdn_backend.py", 0.6),
-        TestFile("python/sgl_jax/test/layers/test_merged_column_parallel_linear.py", 0.1),
-        TestFile("python/sgl_jax/test/layers/test_qwen3_5_gated_delta_net.py", 0.5),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 0.4),
