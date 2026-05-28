@@ -35,6 +35,8 @@ class GlmMoeDsaConfig(PretrainedConfig):
     model_type = "glm_moe_dsa"
 
 
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     cls.model_type: cls
     for cls in [
@@ -44,6 +46,11 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
         Qwen3_5HybridConfig,
     ]
 }
+
+if "glm_moe_dsa" not in CONFIG_MAPPING:
+    with contextlib.suppress(Exception):
+        from transformers.models.auto.tokenization_auto import TOKENIZER_MAPPING
+        TOKENIZER_MAPPING._reverse_config_mapping['GlmMoeDsaConfig'] = 'gpt2'
 
 # Register local configs; suppress() defers to stock on a name clash (fine for
 # bailing/kimi which don't clash, and for the glm stub where stock is preferable).
@@ -283,6 +290,9 @@ def get_tokenizer(
         if os.path.isdir(sub_dir_path):
             tokenizer_name = sub_dir_path
         # else: use the root path, tokenizer might be in model root
+
+
+
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
