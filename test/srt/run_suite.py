@@ -288,6 +288,9 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
         TestFile("test/srt/function_call/test_qwen3_coder_detector.py", 0.1),
         TestFile("test/srt/function_call/test_glm4_moe_detector.py", 0.1),
+        TestFile("test/srt/function_call/test_qwen25_detector.py", 0.1),
+        TestFile("test/srt/function_call/test_mimo_detector.py", 0.1),
+        TestFile("test/srt/function_call/test_glm47_detector.py", 0.1),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 0.4),
@@ -338,8 +341,6 @@ suites = {
         TestFile("test/srt/openai_server/features/test_ebnf.py", 2),
         TestFile("test/srt/openai_server/features/test_json_mode.py", 2),
         TestFile("test/srt/openai_server/features/test_structural_tag.py", 2),
-        TestFile("test/srt/function_call/test_mimo_detector.py", 0.1),
-        TestFile("test/srt/function_call/test_glm47_detector.py", 0.1),
         TestFile("test/srt/test_reasoning_parser.py", 0.1),
         TestFile("test/srt/test_srt_engine.py", 1),
         TestFile("test/srt/test_logprobs.py", 3),

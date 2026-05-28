@@ -11,29 +11,18 @@ Run with:
 """
 
 import json
+import unittest
 
-from sgl_jax.srt.entrypoints.openai.protocol import Function, Tool
 from sgl_jax.srt.function_call.qwen25_detector import Qwen25Detector
 from sgl_jax.test.test_utils import CustomTestCase
+from sgl_jax.test.tool_parser_test_config import ToolParserTestConfig as C
 
+try:
+    from importlib.util import find_spec
 
-def _tool(name: str, properties: dict | None = None) -> Tool:
-    return Tool(
-        type="function",
-        function=Function(
-            name=name,
-            description=f"{name} tool",
-            parameters={"type": "object", "properties": properties or {}},
-        ),
-    )
-
-
-def _weather_tool() -> Tool:
-    return _tool("get_weather", {"location": {"type": "string"}})
-
-
-def _square_tool() -> Tool:
-    return _tool("square", {"x": {"type": "number"}})
+    _HAS_LLGUIDANCE = find_spec("llguidance") is not None
+except Exception:
+    _HAS_LLGUIDANCE = False
 
 
 class TestQwen25Detector(CustomTestCase):
@@ -52,7 +41,7 @@ class TestQwen25Detector(CustomTestCase):
             '{"name": "get_weather", "arguments": {"location": "Beijing"}}\n'
             "</tool_call>"
         )
-        result = Qwen25Detector().detect_and_parse(text, [_weather_tool()])
+        result = Qwen25Detector().detect_and_parse(text, [C.weather_tool()])
         self.assertEqual(result.normal_text, "thinking done")
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_weather")
@@ -67,20 +56,20 @@ class TestQwen25Detector(CustomTestCase):
             '{"name": "square", "arguments": {"x": 7}}\n'
             "</tool_call>"
         )
-        result = Qwen25Detector().detect_and_parse(text, [_weather_tool(), _square_tool()])
+        result = Qwen25Detector().detect_and_parse(text, [C.weather_tool(), C.square_tool()])
         self.assertEqual(len(result.calls), 2)
         self.assertEqual(json.loads(result.calls[0].parameters), {"location": "Beijing"})
         self.assertEqual(json.loads(result.calls[1].parameters), {"x": 7})
 
     def test_detect_and_parse_no_tool_call(self):
         text = "just a normal answer with no tool"
-        result = Qwen25Detector().detect_and_parse(text, [_weather_tool()])
+        result = Qwen25Detector().detect_and_parse(text, [C.weather_tool()])
         self.assertEqual(result.normal_text, text)
         self.assertEqual(result.calls, [])
 
     def test_detect_and_parse_unknown_function(self):
-        text = "<tool_call>\n" '{"name": "mystery", "arguments": {"x": 1}}\n' "</tool_call>"
-        result = Qwen25Detector().detect_and_parse(text, [_weather_tool()])
+        text = '<tool_call>\n{"name": "mystery", "arguments": {"x": 1}}\n</tool_call>'
+        result = Qwen25Detector().detect_and_parse(text, [C.weather_tool()])
         # Unknown function: parse_base_json logs a warning and drops it.
         self.assertEqual(result.calls, [])
 
@@ -93,13 +82,13 @@ class TestQwen25Detector(CustomTestCase):
             '{"name": "square", "arguments": {"x": 9}}\n'
             "</tool_call>"
         )
-        result = Qwen25Detector().detect_and_parse(text, [_square_tool()])
+        result = Qwen25Detector().detect_and_parse(text, [C.square_tool()])
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "square")
 
     def test_streaming_split_chunks(self):
         det = Qwen25Detector()
-        tools = [_square_tool()]
+        tools = [C.square_tool()]
         chunks = [
             "<tool_call>\n",
             '{"name": "squ',
@@ -121,12 +110,12 @@ class TestQwen25Detector(CustomTestCase):
 
     def test_streaming_normal_text_then_call(self):
         det = Qwen25Detector()
-        tools = [_square_tool()]
+        tools = [C.square_tool()]
         r1 = det.parse_streaming_increment("plain text. ", tools)
         self.assertEqual(r1.normal_text, "plain text. ")
         self.assertEqual(r1.calls, [])
         r2 = det.parse_streaming_increment(
-            "<tool_call>\n" '{"name": "square", "arguments": {"x": 3}}\n' "</tool_call>",
+            '<tool_call>\n{"name": "square", "arguments": {"x": 3}}\n</tool_call>',
             tools,
         )
         names = [c.name for c in r2.calls if c.name]
@@ -141,21 +130,20 @@ class TestQwen25Detector(CustomTestCase):
         self.assertTrue(info.begin.startswith('<tool_call>\n{"name":"get_weather"'))
 
     def test_build_ebnf_contains_tool_name(self):
-        grammar = Qwen25Detector().build_ebnf([_weather_tool(), _square_tool()])
+        grammar = Qwen25Detector().build_ebnf([C.weather_tool(), C.square_tool()])
         self.assertIn("get_weather", grammar)
         self.assertIn("square", grammar)
 
+    @unittest.skipUnless(_HAS_LLGUIDANCE, "llguidance not installed")
     def test_build_ebnf_compiles(self):
         """Compile the grammar with llguidance to catch escape/syntax bugs
         that a substring check would miss (a malformed grammar would still
         contain the tool name but raise GrammarError at request time)."""
         from llguidance import grammar_from
 
-        grammar = Qwen25Detector().build_ebnf([_weather_tool(), _square_tool()])
+        grammar = Qwen25Detector().build_ebnf([C.weather_tool(), C.square_tool()])
         grammar_from("lark", grammar)
 
 
 if __name__ == "__main__":
-    import unittest
-
     unittest.main()
