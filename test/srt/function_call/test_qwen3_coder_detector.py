@@ -9,7 +9,7 @@ Covers the Qwen 3 Coder tool-call format:
     </tool_call>
 
 Run with:
-    python -m unittest test.srt.function_call.test_qwen3_coder_detector
+    python test/srt/function_call/test_qwen3_coder_detector.py
 """
 
 import json
@@ -23,7 +23,7 @@ try:
     from importlib.util import find_spec
 
     _HAS_LLGUIDANCE = find_spec("llguidance") is not None
-except Exception:
+except (ImportError, ValueError):
     _HAS_LLGUIDANCE = False
 
 

@@ -7,7 +7,7 @@ Covers the Qwen 2.5 / Qwen 3 / Ling-2.6 tool-call format:
     </tool_call>
 
 Run with:
-    python -m unittest test.srt.function_call.test_qwen25_detector
+    python test/srt/function_call/test_qwen25_detector.py
 """
 
 import json
@@ -21,7 +21,7 @@ try:
     from importlib.util import find_spec
 
     _HAS_LLGUIDANCE = find_spec("llguidance") is not None
-except Exception:
+except (ImportError, ValueError):
     _HAS_LLGUIDANCE = False
 
 

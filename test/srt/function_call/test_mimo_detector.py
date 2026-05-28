@@ -9,7 +9,7 @@ Covers the MiMo tool-call format:
     </tool_call>
 
 Run with:
-    python -m unittest test.srt.function_call.test_mimo_detector
+    python test/srt/function_call/test_mimo_detector.py
 """
 
 import json

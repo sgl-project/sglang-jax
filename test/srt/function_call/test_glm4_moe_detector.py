@@ -8,7 +8,7 @@ Covers the GLM-4.5 / GLM-4.6 tool-call format:
     </tool_call>
 
 Run with:
-    python -m unittest test.srt.function_call.test_glm4_moe_detector
+    python test/srt/function_call/test_glm4_moe_detector.py
 """
 
 import json

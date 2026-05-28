@@ -5,7 +5,7 @@ Covers the GLM-4.7 / GLM-5 tool-call format (no newline separators):
     <tool_call>get_weather<arg_key>city</arg_key><arg_value>Beijing</arg_value></tool_call>
 
 Run with:
-    python -m unittest test.srt.function_call.test_glm47_detector
+    python test/srt/function_call/test_glm47_detector.py
 """
 
 import json
