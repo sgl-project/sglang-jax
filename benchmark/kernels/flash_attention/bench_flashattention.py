@@ -343,7 +343,6 @@ class TestPerformance(CustomTestCase):
             },
         }
         test_cases = test_cases_for_different_devices[get_device_name()]
-        max_context_len = 16384
         for case, baseline in test_cases.items():
             (
                 mode,
@@ -354,6 +353,13 @@ class TestPerformance(CustomTestCase):
                 head_dim,
                 max_kv_cache_tokens,
             ) = case
+            # Decode test data uses random seq_lens in [1025, 2048] (see
+            # create_decode_uniform_data); a 2K page-table cap matches the
+            # working set and keeps the decode heuristic from sizing bkv_sz
+            # for a ~40K context that never materializes. Prefill chunks up
+            # to 2048 per sub-seq and prefill heuristic hardcaps bkv_sz at
+            # 1024 regardless, so 16K is a no-op cap there.
+            max_context_len = 2048 if mode == "decode" else 16384
             res = benchmark_backend(
                 mode,
                 max_context_len,
