@@ -8,6 +8,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
+from sgl_jax.srt.utils.parallel_utils import make_reduce_sharding
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
 
@@ -441,15 +442,12 @@ class FusedEPMoE(nnx.Module):
         hidden_states: jax.Array,
         topk_weights: jax.Array,
         topk_ids: jax.Array,
-        token_valid_mask: jax.Array | None = None,
         *,
         block_config: FusedMoEBlockConfig | None = None,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
         """Forward pass through the fused MoE layer."""
         assert hidden_states.ndim == 2
-        if token_valid_mask is not None:
-            topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
 
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
@@ -507,6 +505,7 @@ class FusedEPMoE(nnx.Module):
             tp_axis_name="tensor",
         )
 
-        if out_sharding is not None:
-            output = jax.sharding.reshard(output, out_sharding)
+        if out_sharding is None:
+            out_sharding = make_reduce_sharding(hidden_states, self.mesh, enable_sp=False)
+        output = jax.sharding.reshard(output, out_sharding)
         return output
