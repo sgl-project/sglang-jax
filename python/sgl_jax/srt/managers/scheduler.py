@@ -404,6 +404,12 @@ class Scheduler(
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
 
+        # Note: the multimodal patch bucket ladder is installed by
+        # ModelRunner.initialize_jit (only when the loaded model exposes
+        # `encode_visual` / `splice_embeds`). That's the right hook point
+        # because the multimodal detection needs the model class, not a CLI
+        # flag — `--multimodal` is not required for VLMs like Qwen3-VL.
+
         # Init pause/continue state
         self._engine_paused = False
 

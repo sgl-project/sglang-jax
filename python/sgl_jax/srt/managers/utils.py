@@ -48,7 +48,7 @@ def resolve_future_token_ids(input_ids, future_token_ids_map, mesh):
     input_ids_global = jax.sharding.reshard(input_ids, NamedSharding(mesh, P()))
     input_ids_global = jnp.where(
         input_ids_global < 0,
-        future_token_ids_map[jnp.clip(-input_ids_global, a_min=0)],
+        future_token_ids_map[jnp.clip(-input_ids_global, min=0)],
         input_ids_global,
     )
     return jax.sharding.reshard(input_ids_global, NamedSharding(mesh, P("data")))

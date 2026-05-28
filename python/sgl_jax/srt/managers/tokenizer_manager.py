@@ -59,6 +59,7 @@ from sgl_jax.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    has_valid_data,
 )
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
@@ -159,6 +160,7 @@ class TokenizerManager:
         self._cond = asyncio.Condition()
 
         self.mm_processor = None
+        self._init_mm_processor_if_supported()
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -295,6 +297,15 @@ class TokenizerManager:
         # Tokenize
         input_text = obj.text
         input_ids = obj.input_ids
+        mm_inputs = None
+
+        # Multimodal fast path: if image_data present and a mm_processor is loaded,
+        # let the processor expand placeholder tokens AND produce mm_inputs in one go.
+        if self._has_multimodal_data(obj) and self.mm_processor is not None:
+            mm_input_ids, mm_inputs = self._process_multimodal_data(obj, input_text or "")
+            if mm_input_ids is not None:
+                input_ids = mm_input_ids
+
         if input_ids is None and input_text is not None:
             if self.tokenizer is None:
                 raise ValueError(
@@ -303,7 +314,7 @@ class TokenizerManager:
             encoded = self.tokenizer(input_text)
             input_ids = encoded["input_ids"]
         self._validate_one_request(obj, input_ids)
-        return self._create_tokenized_object(obj, input_text, input_ids)
+        return self._create_tokenized_object(obj, input_text, input_ids, mm_inputs=mm_inputs)
 
     def _validate_one_request(
         self, obj: GenerateReqInput | EmbeddingReqInput, input_ids: list[int]
@@ -337,11 +348,91 @@ class TokenizerManager:
                 f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
             )
 
+    # ------------------------------------------------------------------
+    # Multimodal processor wiring (pilot #256: Qwen3-VL Dense)
+    # ------------------------------------------------------------------
+    def _init_mm_processor_if_supported(self) -> None:
+        """Lazy-init `self.mm_processor` for known VLM architectures.
+
+        Pilot scope: Qwen3-VL Dense only. Extend the dispatch table here when
+        adding more VLMs to the standard LLM pipeline (#254).
+        """
+        if self.model_config is None:
+            return
+        archs = getattr(self.model_config.hf_config, "architectures", None) or []
+        if "Qwen3VLForConditionalGeneration" not in archs:
+            return
+        try:
+            from sgl_jax.srt.multimodal.processors.qwen3_vl import Qwen3VLProcessor
+
+            vision_cfg = getattr(self.model_config.hf_config, "vision_config", None)
+            spatial_merge = getattr(vision_cfg, "spatial_merge_size", 2) if vision_cfg else 2
+            self.mm_processor = Qwen3VLProcessor(
+                model_path=self.server_args.model_path,
+                spatial_merge_size=spatial_merge,
+                trust_remote_code=self.server_args.trust_remote_code,
+            )
+            logger.info("Loaded Qwen3VLProcessor for %s", self.server_args.model_path)
+        except Exception as e:
+            # Loud failure: silent fallback degrades VLMs to text-only and produces
+            # garbage outputs without any signal in normal logs (cf. MMMU 36% vs 70%).
+            raise RuntimeError(
+                "Failed to initialize Qwen3VLProcessor for VLM architecture "
+                f"{archs}. The server cannot serve image requests without it. "
+                "Check that PyTorch / HF processor deps are installed."
+            ) from e
+
+    def _has_multimodal_data(self, obj: GenerateReqInput | EmbeddingReqInput) -> bool:
+        # Make video/audio failures loud — this pipeline only implements images
+        # right now (see PR #1189 scope). Silently dropping them would route
+        # the request through the text-only path and produce nonsense output.
+        if has_valid_data(getattr(obj, "video_data", None)) or has_valid_data(
+            getattr(obj, "audio_data", None)
+        ):
+            raise NotImplementedError(
+                "video_data / audio_data is not supported by this multimodal "
+                "pipeline yet — only image_data is implemented (PR #1189)."
+            )
+        image_data = getattr(obj, "image_data", None)
+        if image_data is None:
+            return False
+        if isinstance(image_data, (list, tuple)):
+            return len(image_data) > 0
+        return True
+
+    def _process_multimodal_data(
+        self, obj: GenerateReqInput, input_text: str
+    ) -> tuple[list[int] | None, dict | None]:
+        """Run the mm processor; returns (input_ids, mm_inputs_dict).
+
+        Returns (None, None) if no mm data or mm_processor unavailable.
+
+        If `input_text` is empty but the request carries pre-tokenized
+        `input_ids` (the path that openai/serving_chat takes for
+        is_multimodal=False), we decode them back to text so the HF processor
+        can do its own placeholder expansion.
+        """
+        if not self._has_multimodal_data(obj):
+            return None, None
+        if self.mm_processor is None:
+            raise ValueError(
+                "Multimodal inputs provided but no mm_processor is loaded. "
+                "Check model architecture and trust_remote_code."
+            )
+        if not input_text and obj.input_ids is not None and self.tokenizer is not None:
+            input_text = self.tokenizer.decode(obj.input_ids, skip_special_tokens=False)
+        image_data = obj.image_data
+        if not isinstance(image_data, (list, tuple)):
+            image_data = [image_data]
+        out = self.mm_processor.process(text=input_text, image_data=list(image_data))
+        return out.get("input_ids"), out.get("mm_inputs")
+
     def _create_tokenized_object(
         self,
         obj: GenerateReqInput,
         input_text: str,
         input_ids: list[int],
+        mm_inputs: dict | None = None,
     ) -> TokenizedGenerateReqInput:
         """Create a tokenized request object from common parameters."""
         # Parse sampling parameters
@@ -382,6 +473,9 @@ class TokenizerManager:
             tokenized_obj.return_logprob = False
             obj.return_output_logprob_only = True
             tokenized_obj.return_output_logprob_only = True
+
+        if mm_inputs is not None:
+            tokenized_obj.mm_inputs = mm_inputs
 
         return tokenized_obj
 

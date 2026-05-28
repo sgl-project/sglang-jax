@@ -1,5 +1,6 @@
 """ModelRunner runs the forward passes of the models."""
 
+import dataclasses
 import logging
 from functools import partial
 
@@ -221,6 +222,50 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             with LoraBatchContext.set_batch(forward_batch):
                 return model(forward_batch, memory_pools, logits_metadata)
 
+        # Multimodal three-JIT split: when the model exposes `encode_visual`
+        # and `splice_embeds`, run the visual pipeline in two dedicated JITs
+        # before the LLM JIT. The LLM JIT cache key then becomes purely a
+        # function of (seq_len_bucket, ...) — `pixel_values` and
+        # `N_padded_tokens` never participate, so text-only and multimodal
+        # extends share the same LLM JIT cache entry. See
+        # docs/design/qwen3vl_three_jit_split.md.
+        is_multimodal_model = hasattr(self.model, "encode_visual") and hasattr(
+            self.model, "splice_embeds"
+        )
+
+        @partial(
+            jax.jit,
+            static_argnames=["model_state_def", "image_grid_thw", "n_real_images"],
+        )
+        def jitted_visual_encode(
+            model_def,
+            model_state_def,
+            model_state_leaves,
+            pixel_values,
+            image_grid_thw,
+            cu_seqlens,
+            n_real_images,
+        ):
+            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model = nnx.merge(model_def, model_state)
+            return model.encode_visual(pixel_values, image_grid_thw, cu_seqlens, n_real_images)
+
+        @partial(jax.jit, static_argnames=["model_state_def"])
+        def jitted_splice_embeds(
+            model_def,
+            model_state_def,
+            model_state_leaves,
+            input_ids,
+            vision_main,
+            vision_deepstack,
+            placeholder_positions,
+        ):
+            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model = nnx.merge(model_def, model_state)
+            return model.splice_embeds(
+                input_ids, vision_main, vision_deepstack, placeholder_positions
+            )
+
         # Capture base RNG key as a constant in the JIT closure.
         # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
         # the eager jax.random.split that would serialize the host-device pipeline.
@@ -249,6 +294,51 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         def run_model_wrapper(forward_batch, logits_metadata):
             memory_pools = self.memory_pools
+            # Three-JIT orchestration: if multimodal model and extend with
+            # pixel_values, run the two visual JITs and splice input_embedding
+            # into forward_batch BEFORE entering the LLM JIT. The model's
+            # in-class fallback (see Qwen3VLForConditionalGeneration.__call__)
+            # no-ops when input_embedding is already set.
+            if (
+                is_multimodal_model
+                and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+                and forward_batch.pixel_values is not None
+                and forward_batch.input_embedding is None
+            ):
+                vision_main, vision_deepstack = jitted_visual_encode(
+                    model_def,
+                    model_state_def,
+                    self.model_state_leaves,
+                    forward_batch.pixel_values,
+                    forward_batch.image_grid_thw,
+                    forward_batch.cu_seqlens,
+                    forward_batch.n_real_images,
+                )
+                input_embedding, deepstack = jitted_splice_embeds(
+                    model_def,
+                    model_state_def,
+                    self.model_state_leaves,
+                    forward_batch.input_ids,
+                    vision_main,
+                    vision_deepstack,
+                    forward_batch.placeholder_positions,
+                )
+                # CRITICAL: clear ALL visual fields before entering the LLM
+                # JIT. Otherwise pixel_values shape (per-image bucket) and
+                # image_grid_thw (static aux varying per request) leak into
+                # the LLM JIT cache key, defeating the cache-sharing goal
+                # of the three-jit split. After this clear, the LLM JIT
+                # sees an identical pytree footprint to text-only extends.
+                forward_batch = dataclasses.replace(
+                    forward_batch,
+                    input_embedding=input_embedding,
+                    deepstack_visual_embedding=deepstack,
+                    pixel_values=None,
+                    image_grid_thw=None,
+                    cu_seqlens=None,
+                    n_real_images=0,
+                    placeholder_positions=None,
+                )
             return jitted_run_model(
                 model_def,
                 model_state_def,
@@ -259,6 +349,45 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
 
         self.jitted_run_model = run_model_wrapper
+        self.is_multimodal_model = is_multimodal_model
+        # Exposed so CompilationManager can drive the new precompile passes
+        # without needing to know about the orchestrator internals.
+        if is_multimodal_model:
+            self.jitted_visual_encode = partial(
+                jitted_visual_encode, model_def, model_state_def, self.model_state_leaves
+            )
+            self.jitted_splice_embeds = partial(
+                jitted_splice_embeds, model_def, model_state_def, self.model_state_leaves
+            )
+
+            # Install the power-of-two patch bucket ladder driven by
+            # chunked_prefill_size + vision spatial_merge_size, replacing the
+            # hardcoded (256, 1024, 4096) fallback. Done HERE (rather than in
+            # scheduler.__init__) so detection doesn't depend on the
+            # `--multimodal` CLI flag — VLM models like Qwen3-VL expose
+            # `encode_visual`/`splice_embeds` regardless of that flag.
+            chunked_prefill_size = self.server_args.chunked_prefill_size
+            if chunked_prefill_size is not None and chunked_prefill_size > 0:
+                from sgl_jax.srt.managers.schedule_batch import (
+                    compute_patch_buckets,
+                    set_multimodal_patch_buckets,
+                )
+
+                vision_config = getattr(self.model_config.hf_config, "vision_config", None)
+                spatial_merge_size = (
+                    getattr(vision_config, "spatial_merge_size", 2)
+                    if vision_config is not None
+                    else 2
+                )
+                patch_buckets = compute_patch_buckets(chunked_prefill_size, spatial_merge_size)
+                set_multimodal_patch_buckets(patch_buckets)
+                logger.info(
+                    "Multimodal patch bucket ladder set to %s "
+                    "(chunked_prefill_size=%d, spatial_merge_size=%d)",
+                    patch_buckets,
+                    chunked_prefill_size,
+                    spatial_merge_size,
+                )
 
         self.jitted_sampler = partial(
             jitted_sampler,

@@ -261,13 +261,18 @@ class QWen3DecoderLayer(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
+        post_residual_addition: jax.Array | None = None,
     ):
         layer_callback_flag = []
         if residual is None:
             residual = hidden_states
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states += residual
+            if post_residual_addition is not None:
+                hidden_states = hidden_states + post_residual_addition
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 

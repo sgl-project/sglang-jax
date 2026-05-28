@@ -2162,6 +2162,35 @@ class ScheduleBatch:
             top_logprobs_nums = None
             token_ids_logprobs = None
 
+        # Multimodal vision tensors (bucket-padded; None for text-only batches).
+        # Use `all_reqs` (flattened in DP-rank order, matching the packing in
+        # _merge_input_and_positions) instead of `self.reqs` — the latter is a
+        # dp=1-only shim and asserts on dp_size > 1.
+        mm_tensors = _collect_mm_tensors(all_reqs, input_ids_cpu)
+        pixel_values_cpu = image_grid_thw_cpu = placeholder_positions_cpu = cu_seqlens_cpu = (
+            n_real_images_cpu
+        ) = None
+        if mm_tensors is not None:
+            (
+                pixel_values_cpu,
+                image_grid_thw_cpu,
+                placeholder_positions_cpu,
+                cu_seqlens_cpu,
+                n_real_images_cpu,
+            ) = mm_tensors
+
+        # Compute MRoPE positions for VLM models. Without this, image tokens
+        # get 1D linear positions instead of 3D (t, h, w) coordinates, which
+        # destroys the spatial signal that Qwen3-VL needs to count / locate
+        # multiple objects (single-circle prompts still work, but multi-object
+        # layouts get hallucinated as repeating grids).
+        mrope_positions_cpu = _compute_mrope_positions_for_batch(
+            self.reqs_info,
+            self.forward_mode,
+            per_dp_token_padding,
+            self.dp_size,
+        )
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -2176,7 +2205,7 @@ class ScheduleBatch:
             token_ids_logprobs=token_ids_logprobs,
             sampling_info=sampling_info,
             positions=positions_cpu,
-            mrope_positions=None,
+            mrope_positions=mrope_positions_cpu,
             cache_loc=cache_loc_cpu,
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
@@ -2198,6 +2227,11 @@ class ScheduleBatch:
             deepstack_visual_embedding=None,
             recurrent_indices=recurrent_indices_cpu,
             has_initial_state=has_initial_state_cpu,
+            pixel_values=pixel_values_cpu,
+            image_grid_thw=image_grid_thw_cpu,
+            placeholder_positions=placeholder_positions_cpu,
+            cu_seqlens=cu_seqlens_cpu,
+            n_real_images=n_real_images_cpu,
         )
 
     def get_spec_model_worker_batch(
@@ -2272,12 +2306,10 @@ class ScheduleBatch:
                 positions_cpu[: len(batch_positions)] = batch_positions
 
         mrope_positions_cpu = _compute_mrope_positions_for_batch(
-            self.reqs,
+            [self.reqs_info[0]],
             self.forward_mode,
-            seq_lens_cpu,
             len(input_ids_cpu),
-            extend_prefix_lens,
-            extend_seq_lens,
+            1,
         )
 
         cache_loc_flat = np.array([], dtype=np.int32)
@@ -2564,6 +2596,208 @@ def _extract_mm_value(mm_inputs: Any, key: str):
     return getattr(mm_inputs, key, None)
 
 
+def _collect_mm_inputs(reqs: list) -> list | None:
+    """Legacy: list-of-dict mm_inputs (deprecated for monolithic VLM path).
+
+    Kept for callers that still want a per-req dict view. The monolithic VLM
+    code path uses `_collect_mm_tensors` below instead.
+    """
+    if not reqs:
+        return None
+    has_any = False
+    out = []
+    for r in reqs:
+        mm = getattr(r, "mm_inputs", None)
+        out.append(mm)
+        if mm is not None:
+            has_any = True
+    return out if has_any else None
+
+
+# Bucket sizes for vision input padding. Each bucket value is in "raw patches"
+# (one patch = one Conv3D input slot, before spatial merging). The default
+# fallback covers typical image sizes from ~256x256 to ~1024x1024 at
+# patch_size=16 + spatial_merge=2. Picked first bucket >= n_real_patches.
+#
+# `compute_patch_buckets` derives a power-of-two ladder from
+# `chunked_prefill_size * spatial_merge_unit` to align the ViT JIT cache key
+# with the scheduler's max-tokens budget. Used by both the runtime padder
+# (_collect_mm_tensors) and CompilationManager's visual-encode precompile pass.
+_MM_PATCH_BUCKETS_FALLBACK = (256, 1024, 4096)
+# Bucket sizes for "how many images in one batch". Most requests carry 1 image.
+_MM_IMAGE_BUCKETS = (1, 2, 4, 8)
+# Patches per LLM image token. For Qwen3-VL, spatial_merge_size=2 -> 4 patches
+# collapse to one image_token via the ViT PatchMerger.
+_MM_PATCHES_PER_TOKEN = 4
+# Pixel-feature dim = in_channels * temporal_patch_size * patch_size**2.
+# For Qwen3-VL Dense this is 3*2*16*16 = 1536. We fix it here for the pad shape.
+_MM_PIXEL_FEATURE_DIM = 1536
+
+
+def compute_patch_buckets(
+    chunked_prefill_size: int,
+    spatial_merge_size: int,
+    min_patches: int = 16,
+) -> tuple[int, ...]:
+    """Power-of-two ladder for vision-patch JIT cache keys.
+
+    Matches the tpu-inference pattern: visual_tokens <= chunked_prefill_size
+    (image tokens are LLM input tokens), so patches <= chunked_prefill_size *
+    spatial_merge_size**2. We return every power of two in
+    [next_pow2(min_patches), next_pow2(max_patches)] so any padded
+    `n_padded_patches` chosen by `_collect_mm_tensors` falls on one of the
+    AOT-compiled bucket sizes.
+
+    Examples:
+        chunked_prefill_size=4096, spatial_merge_size=2 (Qwen3-VL):
+            max_patches = 16384
+            returns (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
+        chunked_prefill_size=2048, spatial_merge_size=2:
+            max_patches = 8192
+            returns (16, 32, ..., 8192)
+    """
+    if chunked_prefill_size <= 0:
+        return _MM_PATCH_BUCKETS_FALLBACK
+    spatial_merge_unit = spatial_merge_size**2
+    max_patches = chunked_prefill_size * spatial_merge_unit
+    min_shift = max(1, (min_patches - 1).bit_length())
+    max_shift = max(min_shift, (max_patches - 1).bit_length())
+    return tuple(1 << i for i in range(min_shift, max_shift + 1))
+
+
+# Active patch-bucket tuple. Computed once at startup from
+# server_args.chunked_prefill_size (see ScheduleBatch.set_multimodal_patch_buckets).
+# Defaults to the fallback so non-multimodal codepaths keep working before
+# any multimodal request arrives.
+_MM_PATCH_BUCKETS: tuple[int, ...] = _MM_PATCH_BUCKETS_FALLBACK
+
+
+def set_multimodal_patch_buckets(buckets: tuple[int, ...]) -> None:
+    """Install a runtime-derived patch bucket ladder. Called once at startup."""
+    global _MM_PATCH_BUCKETS
+    _MM_PATCH_BUCKETS = buckets
+
+
+def get_multimodal_patch_buckets() -> tuple[int, ...]:
+    """Read-only accessor for the active patch bucket ladder."""
+    return _MM_PATCH_BUCKETS
+
+
+def _pick_bucket(value: int, buckets: tuple[int, ...]) -> int:
+    """Smallest bucket >= value, or value itself if larger than max bucket.
+
+    Falling through (value > max bucket) makes the ViT input shape
+    request-dependent — every new size triggers a fresh jit compile. Log a
+    warning so the recompile is visible instead of silent.
+    """
+    for b in buckets:
+        if b >= value:
+            return b
+    logger.warning(
+        "Multimodal bucket overflow: value=%d exceeds max bucket=%d — "
+        "falling back to value itself. This triggers a fresh jit compile. "
+        "Consider adding a larger bucket or reducing image resolution.",
+        value,
+        buckets[-1] if buckets else 0,
+    )
+    return value
+
+
+def _collect_mm_tensors(
+    reqs: list,
+    input_ids: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Build bucket-padded vision tensors from per-req mm_inputs.
+
+    Args:
+        reqs: list of Req objects in the batch (may include reqs without mm).
+        input_ids: padded `[padded_seq]` token id array of the whole batch (already
+            packed by ScheduleBatch — same one fed into ForwardBatch.input_ids).
+        The image placeholder token id is read from the first non-empty
+        `req.mm_inputs["im_token_id"]` (populated by the CPU mm processor).
+
+    Returns:
+        (pixel_values, image_grid_thw, placeholder_positions, cu_seqlens,
+         n_real_images), or None if no req carries any image. Shapes:
+          pixel_values:          [N_padded_patches, _MM_PIXEL_FEATURE_DIM]
+          image_grid_thw:        [N_padded_images, 3]
+          placeholder_positions: [N_padded_image_tokens]   (= N_padded_patches // 4)
+          cu_seqlens:            [N_padded_images + 1]     (int32, block-diagonal bounds)
+          n_real_images:         [] int32 scalar
+    """
+    image_token_id = None
+    pieces = []
+    thw_pieces = []
+    for r in reqs:
+        mm = getattr(r, "mm_inputs", None)
+        if mm is None:
+            continue
+        if image_token_id is None:
+            image_token_id = (
+                mm.get("im_token_id") if isinstance(mm, dict) else getattr(mm, "im_token_id", None)
+            )
+        items = mm.get("mm_items") if isinstance(mm, dict) else getattr(mm, "mm_items", None)
+        if not items:
+            continue
+        for item in items:
+            if not item.is_image():
+                continue
+            feat = np.asarray(item.feature)
+            if feat.ndim != 2 or feat.shape[1] != _MM_PIXEL_FEATURE_DIM:
+                continue
+            pieces.append(feat)
+            for thw in item.model_specific_data.get("image_grid_thw", []):
+                thw_pieces.append((int(thw[0]), int(thw[1]), int(thw[2])))
+
+    if not pieces or image_token_id is None:
+        return None
+
+    pixel_real = np.concatenate(pieces, axis=0).astype(np.float32, copy=False)
+    grid_real = np.asarray(thw_pieces, dtype=np.int32)
+    n_real_patches = int(pixel_real.shape[0])
+    n_real_images = int(grid_real.shape[0])
+
+    # Pad pixel_values + grid_thw to bucket sizes.
+    n_padded_patches = _pick_bucket(n_real_patches, _MM_PATCH_BUCKETS)
+    n_padded_images = _pick_bucket(n_real_images, _MM_IMAGE_BUCKETS)
+
+    pixel_padded = np.zeros((n_padded_patches, _MM_PIXEL_FEATURE_DIM), dtype=pixel_real.dtype)
+    pixel_padded[:n_real_patches] = pixel_real
+
+    grid_padded = np.zeros((n_padded_images, 3), dtype=np.int32)
+    grid_padded[:n_real_images] = grid_real
+
+    # Per-image patch counts (t*h*w); padded images contribute 0.
+    patches_per_image = grid_real[:, 0] * grid_real[:, 1] * grid_real[:, 2]
+    cu_seqlens = np.zeros(n_padded_images + 1, dtype=np.int32)
+    cu_seqlens[1 : n_real_images + 1] = np.cumsum(patches_per_image)
+    # Padded segments repeat the last real cumulative count -> zero-length segments.
+    cu_seqlens[n_real_images + 1 :] = cu_seqlens[n_real_images]
+
+    # placeholder_positions: where to scatter ViT outputs into padded input_ids.
+    # The number of *real* image tokens in this batch equals
+    # sum(t*h*w / spatial_merge^2) for each real image = n_real_patches // 4.
+    n_padded_image_tokens = n_padded_patches // _MM_PATCHES_PER_TOKEN
+    n_real_image_tokens = n_real_patches // _MM_PATCHES_PER_TOKEN
+    real_positions = np.where(input_ids == image_token_id)[0].astype(np.int32)
+    if real_positions.size < n_real_image_tokens:
+        # Defensive: should not happen if processor/grid_thw are consistent.
+        n_real_image_tokens = int(real_positions.size)
+    # Sink position = last index of padded input_ids; that slot is a padding
+    # token in the LLM, so overwriting it with zero ViT output has no effect.
+    sink_pos = int(input_ids.shape[0]) - 1
+    positions_padded = np.full(n_padded_image_tokens, sink_pos, dtype=np.int32)
+    positions_padded[:n_real_image_tokens] = real_positions[:n_real_image_tokens]
+
+    return (
+        pixel_padded,
+        grid_padded,
+        positions_padded,
+        cu_seqlens,
+        np.asarray(n_real_images, dtype=np.int32),
+    )
+
+
 def _as_int_scalar(value: Any, default: int = 0) -> int:
     if value is None:
         return default
@@ -2575,82 +2809,125 @@ def _as_int_scalar(value: Any, default: int = 0) -> int:
     return int(value)
 
 
-def _compute_mrope_positions_for_batch(
+def _mrope_positions_for_rank(
     reqs: list[Req],
     forward_mode: ForwardMode,
-    seq_lens_cpu: np.ndarray,
-    input_ids_len: int,
-    extend_prefix_lens: np.ndarray | None,
-    extend_seq_lens: np.ndarray | None,
-) -> np.ndarray | None:
-    mm_inputs_list = [getattr(req, "mm_inputs", None) for req in reqs]
-    has_mrope = any(
-        _extract_mm_value(mm, "mrope_positions") is not None
-        or _extract_mm_value(mm, "mrope_position_delta") is not None
-        for mm in mm_inputs_list
-    )
-    if not has_mrope:
-        return None
-
+    seq_lens: np.ndarray,
+    prefix_lens: list[int] | np.ndarray | None,
+    extend_lens: list[int] | np.ndarray | None,
+) -> np.ndarray:
+    """Per-DP-rank mrope_positions. Returns shape [3, sum_tokens_in_rank]."""
     if forward_mode.is_decode():
-        mrope_positions_list = []
-        for batch_idx, mm_inputs in enumerate(mm_inputs_list):
-            base_pos = int(seq_lens_cpu[batch_idx]) - 1
+        chunks = []
+        for batch_idx, req in enumerate(reqs):
+            mm_inputs = getattr(req, "mm_inputs", None)
+            base_pos = int(seq_lens[batch_idx]) - 1
             delta = _extract_mm_value(mm_inputs, "mrope_position_delta")
             if delta is not None:
                 base_pos += _as_int_scalar(delta)
-            mrope_positions_list.append(
-                np.full((3, 1), base_pos, dtype=np.int32),
-            )
-        mrope_positions = (
-            np.concatenate(mrope_positions_list, axis=1)
-            if mrope_positions_list
-            else np.zeros((3, 0), dtype=np.int32)
-        )
-    else:
-        if extend_prefix_lens is None or extend_seq_lens is None:
-            return None
-        mrope_positions_list = []
-        for batch_idx, mm_inputs in enumerate(mm_inputs_list):
-            extend_len = int(extend_seq_lens[batch_idx])
-            prefix_len = int(extend_prefix_lens[batch_idx])
-            if extend_len <= 0:
-                mrope_positions_list.append(np.zeros((3, 0), dtype=np.int32))
-                continue
+            chunks.append(np.full((3, 1), base_pos, dtype=np.int32))
+        return np.concatenate(chunks, axis=1) if chunks else np.zeros((3, 0), dtype=np.int32)
 
-            mm_positions = _extract_mm_value(mm_inputs, "mrope_positions")
-            if mm_positions is None:
-                positions = np.arange(prefix_len, prefix_len + extend_len, dtype=np.int32)
-                mrope_positions_list.append(
-                    np.broadcast_to(positions.reshape(1, -1), (3, extend_len))
-                )
-                continue
+    if prefix_lens is None or extend_lens is None:
+        return np.zeros((3, 0), dtype=np.int32)
 
+    chunks = []
+    for batch_idx, req in enumerate(reqs):
+        mm_inputs = getattr(req, "mm_inputs", None)
+        extend_len = int(extend_lens[batch_idx])
+        prefix_len = int(prefix_lens[batch_idx])
+        if extend_len <= 0:
+            chunks.append(np.zeros((3, 0), dtype=np.int32))
+            continue
+
+        delta_val = _as_int_scalar(_extract_mm_value(mm_inputs, "mrope_position_delta"))
+        mm_positions = _extract_mm_value(mm_inputs, "mrope_positions")
+
+        end = prefix_len + extend_len
+        # Split into in-prompt slice (from mm_positions, if any) and past-prompt
+        # suffix (linear positions + delta). When the extend window crosses
+        # the prompt boundary we previously silently truncated to the prompt
+        # length and zero-padded; that misroped the past-prompt tokens.
+        if mm_positions is not None:
             mm_positions = np.asarray(mm_positions)
-            chunk = mm_positions[:, prefix_len : prefix_len + extend_len]
-            if chunk.size == 0:
-                delta = _extract_mm_value(mm_inputs, "mrope_position_delta")
-                if delta is not None:
-                    delta_val = _as_int_scalar(delta)
-                    positions = (
-                        np.arange(prefix_len, prefix_len + extend_len, dtype=np.int32) + delta_val
-                    )
-                else:
-                    positions = np.arange(prefix_len, prefix_len + extend_len, dtype=np.int32)
-                chunk = np.broadcast_to(positions.reshape(1, -1), (3, extend_len))
-            mrope_positions_list.append(chunk.astype(np.int32, copy=False))
+            prompt_len = mm_positions.shape[1]
+        else:
+            prompt_len = 0
 
-        mrope_positions = (
-            np.concatenate(mrope_positions_list, axis=1)
-            if mrope_positions_list
-            else np.zeros((3, 0), dtype=np.int32)
+        parts = []
+        in_prompt_start = min(prefix_len, prompt_len)
+        in_prompt_end = min(end, prompt_len)
+        if in_prompt_end > in_prompt_start:
+            parts.append(mm_positions[:, in_prompt_start:in_prompt_end])
+
+        past_start = max(prefix_len, prompt_len)
+        if end > past_start:
+            past_positions = np.arange(past_start, end, dtype=np.int32) + delta_val
+            parts.append(np.broadcast_to(past_positions.reshape(1, -1), (3, end - past_start)))
+
+        if len(parts) == 1:
+            chunk = parts[0]
+        elif parts:
+            chunk = np.concatenate(parts, axis=1)
+        else:
+            chunk = np.zeros((3, 0), dtype=np.int32)
+        chunks.append(chunk.astype(np.int32, copy=False))
+
+    return np.concatenate(chunks, axis=1) if chunks else np.zeros((3, 0), dtype=np.int32)
+
+
+def _compute_mrope_positions_for_batch(
+    reqs_info: list,
+    forward_mode: ForwardMode,
+    per_dp_token_size: int,
+    dp_size: int,
+) -> np.ndarray | None:
+    """Build mrope_positions in the per-DP-padded layout matching positions_cpu.
+
+    Returns shape [3, per_dp_token_size * dp_size] aligned with positions_cpu,
+    or None if no req in the batch carries mrope info.
+
+    Each DP rank's mrope positions are written into its slot
+    [dp_rank * per_dp_token_size, dp_rank * per_dp_token_size + dp_token_count);
+    the rest of the slot stays zero-padded just like positions_cpu.
+    """
+    has_mrope = False
+    for info in reqs_info:
+        if not info.reqs:
+            continue
+        for req in info.reqs:
+            mm = getattr(req, "mm_inputs", None)
+            if mm is not None and (
+                _extract_mm_value(mm, "mrope_positions") is not None
+                or _extract_mm_value(mm, "mrope_position_delta") is not None
+            ):
+                has_mrope = True
+                break
+        if has_mrope:
+            break
+    if not has_mrope:
+        return None
+
+    total_token_size = per_dp_token_size * dp_size
+    out = np.zeros((3, total_token_size), dtype=np.int32)
+
+    for dp_rank, info in enumerate(reqs_info):
+        if not info.reqs:
+            continue
+        dp_pos = _mrope_positions_for_rank(
+            info.reqs,
+            forward_mode,
+            info.seq_lens,
+            info.prefix_lens,
+            info.extend_lens,
         )
+        if dp_pos.shape[1] == 0:
+            continue
+        dst = dp_rank * per_dp_token_size
+        write_len = min(dp_pos.shape[1], per_dp_token_size)
+        out[:, dst : dst + write_len] = dp_pos[:, :write_len]
 
-    pad_len = input_ids_len - mrope_positions.shape[1]
-    if pad_len > 0:
-        pad = np.zeros((3, pad_len), dtype=mrope_positions.dtype)
-        mrope_positions = np.concatenate([mrope_positions, pad], axis=1)
-    return mrope_positions
+    return out
 
 
 @dataclasses.dataclass
@@ -2881,6 +3158,24 @@ class ModelWorkerBatch:
 
     # MRoPE position information [3, total_tokens]
     mrope_positions: np.ndarray | None = None
+
+    # ---- Multimodal (vision) inputs, all bucket-padded to fixed shapes ----
+    # pixel_values: flattened patches [N_padded_patches, C*Tp*P*P], pad with 0
+    pixel_values: np.ndarray | None = None
+    # image_grid_thw: per-image (t,h,w) [N_padded_images, 3], pad with (0,0,0)
+    image_grid_thw: np.ndarray | None = None
+    # placeholder_positions: indices in (padded) input_ids where image tokens go,
+    # length = N_padded_image_tokens = N_padded_patches // spatial_merge_size^2.
+    # The first n_real_image_tokens entries are real; the remainder point to a
+    # sink position (last padding slot) that will be overwritten with zero ViT
+    # output but is itself a padding token that won't affect the LLM forward.
+    placeholder_positions: np.ndarray | None = None
+    # Block-diagonal attention boundaries (cumulative patch counts per image).
+    # Length N_padded_images + 1. Entries beyond n_real_images repeat the last
+    # real boundary, so padded image segments are empty.
+    cu_seqlens: np.ndarray | None = None
+    # n_real_images: int32 scalar -- used inside ViT segment-id construction.
+    n_real_images: np.ndarray | None = None
 
     # Recurrent state indices for hybrid recurrent models
     recurrent_indices: np.ndarray | None = None

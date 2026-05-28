@@ -40,16 +40,27 @@ def compute_mrope_positions(
     image_index, video_index = 0, 0
 
     for _ in range(remain_images + remain_videos):
-        ed_image = (
-            input_tokens.index(image_token_id, st)
-            if remain_images > 0 and image_token_id in input_tokens[st:]
-            else len(input_tokens) + 1
-        )
-        ed_video = (
-            input_tokens.index(video_token_id, st)
-            if remain_videos > 0 and video_token_id in input_tokens[st:]
-            else len(input_tokens) + 1
-        )
+        # The original `x in input_tokens[st:]` guard slices and scans the
+        # tail of `input_tokens` on every iteration (O(N) per check, O(N^2)
+        # over the loop). For a 30k-token prompt with several images this
+        # adds up to noticeable CPU time before scheduling. Use try/except
+        # around `.index()` instead — single pass per call, same semantics.
+        try:
+            ed_image = (
+                input_tokens.index(image_token_id, st)
+                if remain_images > 0
+                else len(input_tokens) + 1
+            )
+        except ValueError:
+            ed_image = len(input_tokens) + 1
+        try:
+            ed_video = (
+                input_tokens.index(video_token_id, st)
+                if remain_videos > 0
+                else len(input_tokens) + 1
+            )
+        except ValueError:
+            ed_video = len(input_tokens) + 1
 
         if ed_image < ed_video:
             t, h, w = image_grid_thw[image_index]

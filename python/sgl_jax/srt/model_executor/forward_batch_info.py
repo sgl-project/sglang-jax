@@ -201,6 +201,27 @@ class ForwardBatch:
     apply_for_deepstack: bool = False
     deepstack_visual_embedding: jax.Array | None = None
 
+    # ---- Multimodal (vision) tensors ----
+    # pixel_values: [N_padded_patches, C*Tp*P*P]  -- flattened image patches (child)
+    pixel_values: jax.Array | None = None
+    # placeholder_positions: [N_padded_image_tokens]  -- where to scatter ViT
+    # outputs into input_embeds. Real entries point at image_token_id positions;
+    # padded entries point at a sink (last padding slot) and get overwritten by
+    # ViT's zero output (no observable effect because that slot is a padding token).
+    placeholder_positions: jax.Array | None = None
+    # cu_seqlens: [N_padded_images + 1] int32 -- block-diagonal attention bounds.
+    # Entries beyond n_real_images repeat the last real cumsum, giving padded
+    # segments zero length and thus no contribution to the segment-id mask.
+    cu_seqlens: jax.Array | None = None
+    # image_grid_thw: tuple of (t, h, w) per REAL image (no padding rows).
+    # Lives in aux_data because the ViT iterates over these as Python ints to
+    # build RoPE / pos_embed; any change in grids triggers (correctly) a new jit
+    # cache entry. Length == n_real_images.
+    image_grid_thw: tuple[tuple[int, int, int], ...] | None = None
+    # n_real_images: Python int (aux_data) -- bounds for "valid segment" check
+    # inside the ViT attention mask.
+    n_real_images: int = 0
+
     # Recurrent state indices [batch_size]
     recurrent_indices: jax.Array | None = None
 
@@ -226,6 +247,9 @@ class ForwardBatch:
             self.apply_for_deepstack,
             self.deepstack_visual_embedding,
             self.recurrent_indices,
+            self.pixel_values,
+            self.placeholder_positions,
+            self.cu_seqlens,
         )
 
         aux_data = {
@@ -234,6 +258,8 @@ class ForwardBatch:
             "spec_algorithm": self.spec_algorithm,
             "capture_hidden_mode": self.capture_hidden_mode,
             "deterministic": self.deterministic,
+            "image_grid_thw": self.image_grid_thw,
+            "n_real_images": self.n_real_images,
         }
         return (children, aux_data)
 
@@ -246,6 +272,8 @@ class ForwardBatch:
         obj.spec_algorithm = aux_data["spec_algorithm"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
         obj.deterministic = aux_data.get("deterministic", True)
+        obj.image_grid_thw = aux_data.get("image_grid_thw")
+        obj.n_real_images = aux_data.get("n_real_images", 0)
         obj.trace_request_ids = None
         obj.trace_request_objects = None
 
@@ -270,6 +298,9 @@ class ForwardBatch:
         obj.apply_for_deepstack = children[17]
         obj.deepstack_visual_embedding = children[18]
         obj.recurrent_indices = children[19]
+        obj.pixel_values = children[20]
+        obj.placeholder_positions = children[21]
+        obj.cu_seqlens = children[22]
         return obj
 
     def __repr__(self) -> str:
@@ -391,6 +422,30 @@ class ForwardBatch:
                 sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
             )
 
+        # ---- Multimodal vision tensors ----
+        # Numpy/host-only: image_grid_thw and n_real_images stay on host so the
+        # ViT can iterate over grid_thw as Python ints (jit specializes).
+        # Device-side bucket-padded tensors are replicated; ViT runs replicated.
+        repl = NamedSharding(model_runner.mesh, PartitionSpec())
+        pixel_values = None
+        placeholder_positions = None
+        cu_seqlens = None
+        image_grid_thw_static: tuple[tuple[int, int, int], ...] | None = None
+        n_real_images_int: int = 0
+        if batch.pixel_values is not None:
+            (pixel_values,) = device_array((batch.pixel_values,), sharding=repl)
+            pixel_values = pixel_values.astype(jnp.bfloat16)
+        if batch.placeholder_positions is not None:
+            (placeholder_positions,) = device_array((batch.placeholder_positions,), sharding=repl)
+        if batch.cu_seqlens is not None:
+            (cu_seqlens,) = device_array((batch.cu_seqlens,), sharding=repl)
+        if batch.n_real_images is not None:
+            n_real_images_int = int(batch.n_real_images)
+        if batch.image_grid_thw is not None and n_real_images_int > 0:
+            # Only keep the real entries — padded rows (0,0,0) would break RoPE.
+            real_rows = batch.image_grid_thw[:n_real_images_int]
+            image_grid_thw_static = tuple((int(r[0]), int(r[1]), int(r[2])) for r in real_rows)
+
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
@@ -417,6 +472,11 @@ class ForwardBatch:
             deepstack_visual_embedding=deepstack_visual_embedding,
             expert_location_metadata=expert_location_metadata,
             recurrent_indices=recurrent_indices,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw_static,
+            placeholder_positions=placeholder_positions,
+            cu_seqlens=cu_seqlens,
+            n_real_images=n_real_images_int,
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)
