@@ -50,13 +50,25 @@ class ModelWorkerClient:
         self.future_token_ids_map = jax.device_put(self.future_token_ids_map, sharding)
         # Launch threads
         self.input_queue = Queue()
+        # output_queue carries the async (jax.Array) handles from the forward
+        # worker; the new resolve thread drains it, blocks on materialization
+        # (np.asarray / _value), and pushes ready Python values to resolved_queue.
+        # This keeps materialization off the scheduler's critical path: while
+        # scheduler does build_batch / process other work, resolve thread is
+        # waiting for TPU forward to finish in parallel.
         self.output_queue = Queue()
+        self.resolved_queue = Queue()
         # JAX handles device execution automatically, no need for explicit streams
         self.forward_thread = threading.Thread(
             target=self.forward_thread_func,
             daemon=bool(server_args.enable_single_process),
         )
         self.forward_thread.start()
+        self.resolve_thread = threading.Thread(
+            target=self.resolve_thread_func,
+            daemon=bool(server_args.enable_single_process),
+        )
+        self.resolve_thread.start()
         self.parent_process = psutil.Process().parent()
         replicated_sharding = NamedSharding(mesh, PartitionSpec())
         self.async_gather_fn = jax.jit(lambda x: x, out_shardings=replicated_sharding)
@@ -102,6 +114,8 @@ class ModelWorkerClient:
                 forward_metadata,
             ) = self.input_queue.get()
             if not model_worker_batch:
+                # Signal the resolve thread to shut down too.
+                self.output_queue.put(None)
                 break
 
             # Resolve future tokens in the input
@@ -128,46 +142,101 @@ class ModelWorkerClient:
                 next_token_ids,
                 self.mesh,
             )
-            self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
+
+            # Kick off async D2H copies HERE in the worker thread, immediately
+            # after forward, so the PCIe transfer overlaps with the rest of the
+            # worker loop (set_future_token_ids dispatch + queue handoff) and
+            # whatever the scheduler thread is doing before it reads from us.
+            # The scheduler's resolve_last_batch_result then just materializes
+            # the results without firing the copies itself, shrinking the
+            # critical-path block on `np.asarray(jax.Array)._value`.
+            async_next_logprobs = (
+                jax.copy_to_host_async(logits_output.next_token_logprobs)
+                if logits_output.next_token_logprobs is not None
+                else None
+            )
+            async_input_logprobs = (
+                jax.copy_to_host_async(logits_output.input_token_logprobs)
+                if logits_output.input_token_logprobs is not None
+                else None
+            )
+            async_hidden_states = (
+                jax.copy_to_host_async(logits_output.hidden_states)
+                if logits_output.hidden_states is not None
+                else None
+            )
+            async_next_tokens = jax.copy_to_host_async(next_token_ids)
+
+            self.output_queue.put(
+                (
+                    None,
+                    logits_output,
+                    cache_miss_count,
+                    {
+                        "next_token_ids": async_next_tokens,
+                        "next_token_logprobs": async_next_logprobs,
+                        "input_token_logprobs": async_input_logprobs,
+                        "hidden_states": async_hidden_states,
+                    },
+                )
+            )
+
+    def resolve_thread_func(self):
+        try:
+            self.resolve_thread_func_()
+        except Exception:
+            traceback = get_exception_traceback()
+            logger.error("ResolveThread hit an exception: %s", traceback)
+            self.parent_process.send_signal(signal.SIGQUIT)
+
+    def resolve_thread_func_(self):
+        """Drain output_queue, materialize JAX async handles to host (block on
+        TPU forward completion + D2H copy), push ready Python values to
+        resolved_queue.
+
+        This runs on its own thread so the materialization wait (np.asarray /
+        _value) does NOT sit on the scheduler's critical path. By the time the
+        scheduler calls resolve_last_batch_result, the data is typically already
+        sitting in resolved_queue (materialized during scheduler's build_batch /
+        other host work).
+        """
+        while True:
+            entry = self.output_queue.get()
+            if entry is None:
+                # Forward thread signaled shutdown.
+                self.resolved_queue.put(None)
+                break
+            _, logits_output, cache_miss_count, async_handles = entry
+
+            # Materialize. This blocks on TPU forward completion + the queued
+            # D2H copy (kicked off in forward_thread_func_). Per-array waits
+            # serialize, but the underlying transfers ran in parallel.
+            if async_handles["next_token_logprobs"] is not None:
+                logits_output.next_token_logprobs = np.asarray(
+                    async_handles["next_token_logprobs"]
+                ).tolist()
+            if async_handles["input_token_logprobs"] is not None:
+                logits_output.input_token_logprobs = np.asarray(
+                    async_handles["input_token_logprobs"]
+                ).tolist()
+            if async_handles["hidden_states"] is not None:
+                logits_output.hidden_states = np.asarray(async_handles["hidden_states"])
+            next_token_ids = np.asarray(async_handles["next_token_ids"]).tolist()
+
+            self.resolved_queue.put((logits_output, next_token_ids, cache_miss_count))
 
     def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
         """
-        This function is called to resolve the last batch result and
-        wait for the current batch to be launched. Used in overlap mode.
+        Pull the next materialized result from the resolve thread.
 
-        Uses jax.copy_to_host_async to start all device-to-host copies in
-        parallel, then materializes them. This lets the four arrays we need
-        overlap on PCIe rather than serializing the per-array sync that
-        jax.device_get does.
+        The forward thread queues the async (jax.Array) handles, and the
+        resolve thread materializes them in parallel with whatever the
+        scheduler is doing. By the time this is called, the materialization
+        has typically already completed, so the queue.get() returns quickly
+        with no wait on _value / TPU sync.
         """
-        _, logits_output, next_token_ids, cache_miss_count = self.output_queue.get()
-        # Step 1: kick off async D2H copies for everything we need
-        async_next_logprobs = (
-            jax.copy_to_host_async(logits_output.next_token_logprobs)
-            if logits_output.next_token_logprobs is not None
-            else None
-        )
-        async_input_logprobs = (
-            jax.copy_to_host_async(logits_output.input_token_logprobs)
-            if logits_output.input_token_logprobs is not None
-            else None
-        )
-        async_hidden_states = (
-            jax.copy_to_host_async(logits_output.hidden_states)
-            if logits_output.hidden_states is not None
-            else None
-        )
-        async_next_tokens = jax.copy_to_host_async(next_token_ids)
-
-        # Step 2: materialize. The first np.asarray waits for that array's
-        # copy; the others have been making progress in parallel.
-        if async_next_logprobs is not None:
-            logits_output.next_token_logprobs = np.asarray(async_next_logprobs).tolist()
-        if async_input_logprobs is not None:
-            logits_output.input_token_logprobs = np.asarray(async_input_logprobs).tolist()
-        if async_hidden_states is not None:
-            logits_output.hidden_states = np.asarray(async_hidden_states)
-        next_token_ids = np.asarray(async_next_tokens).tolist()
+        result = self.resolved_queue.get()
+        logits_output, next_token_ids, cache_miss_count = result
 
         if launch_done is not None:
             launch_done.wait()
