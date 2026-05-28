@@ -8,7 +8,6 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
-from sgl_jax.srt.utils.parallel_utils import make_reduce_sharding
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
 
@@ -506,6 +505,6 @@ class FusedEPMoE(nnx.Module):
         )
 
         if out_sharding is None:
-            out_sharding = make_reduce_sharding(hidden_states, self.mesh, enable_sp=False)
+            out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * output.ndim)))
         output = jax.sharding.reshard(output, out_sharding)
         return output

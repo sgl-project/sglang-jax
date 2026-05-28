@@ -16,7 +16,6 @@ from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 # Re-export for backward compatibility: external code imports from this module.
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE  # noqa: F401
 from sgl_jax.srt.layers.gate import GateLogit, TopK  # noqa: F401
-from sgl_jax.srt.utils.parallel_utils import make_reduce_sharding
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor,
@@ -412,12 +411,8 @@ class EPMoE(nnx.Module):
         *,
         out_sharding: jax.sharding.NamedSharding | None = None,
     ) -> jax.Array:
-        # Default to plain-DP target when caller does not express intent,
-        # mirroring LinearBase's "no out_sharding => standard TP" convention.
-        # SP-aware callers pass an explicit out_sharding (typically built via
-        # make_reduce_sharding) to opt in.
         if out_sharding is None:
-            out_sharding = make_reduce_sharding(hidden_states, self.mesh, enable_sp=False)
+            out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * hidden_states.ndim)))
         # Translate the caller's target sharding (on self.mesh: data,tensor)
         # into shard_map out_specs (on self.moe_mesh: expert,tensor). Only
         # 'tensor' is shared between the two meshes; everything else is
