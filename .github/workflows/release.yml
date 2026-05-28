@@ -34,21 +34,31 @@ jobs:
 
       - name: Compute version metadata
         id: compute
+        env:
+          RAW_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${{ inputs.version }}"
-          TAG="v${VERSION}"
-          IS_PRERELEASE="$(VERSION="${VERSION}" python -c '
+          VERSION="$(python - <<'PY'
           import os, sys
-          from packaging.version import Version, InvalidVersion
-          v_str = os.environ["VERSION"]
+          from packaging.version import InvalidVersion, Version
+
+          v_str = os.environ["RAW_VERSION"].strip()
           try:
-              v = Version(v_str)
+              print(str(Version(v_str)))
           except InvalidVersion as e:
               sys.stderr.write(f"::error::Invalid PEP 440 version {v_str!r}: {e}\n")
               sys.exit(1)
+          PY
+          )"
+          TAG="v${VERSION}"
+          IS_PRERELEASE="$(VERSION="${VERSION}" python - <<'PY'
+          import os
+          from packaging.version import Version
+
+          v = Version(os.environ["VERSION"])
           print("true" if v.is_prerelease else "false")
-          ')"
+          PY
+          )"
           if [[ "${IS_PRERELEASE}" == "true" ]]; then
             UPDATE_LATEST=false
           else
@@ -80,16 +90,23 @@ jobs:
           fi
 
       - name: Verify tag does not already exist
+        id: tag-check
         run: |
           set -euo pipefail
           TAG="${{ needs.metadata.outputs.tag }}"
-          if git rev-parse --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
-            echo "::error::Tag ${TAG} already exists locally"
-            exit 1
+          EXISTING_SHA="$(git ls-remote --tags origin "refs/tags/${TAG}^{}" | awk '{print $1}')"
+          if [[ -z "${EXISTING_SHA}" ]]; then
+            EXISTING_SHA="$(git ls-remote --tags origin "refs/tags/${TAG}" | awk '{print $1}')"
           fi
-          if git ls-remote --exit-code --tags origin "${TAG}" >/dev/null 2>&1; then
-            echo "::error::Tag ${TAG} already exists on origin"
-            exit 1
+          if [[ -n "${EXISTING_SHA}" ]]; then
+            if [[ "${EXISTING_SHA}" != "${GITHUB_SHA}" ]]; then
+              echo "::error::Tag ${TAG} exists on origin but points at ${EXISTING_SHA}, not ${GITHUB_SHA}"
+              exit 1
+            fi
+            echo "Tag ${TAG} already exists on origin and points at ${GITHUB_SHA}; skipping tag creation."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Set up Python
@@ -138,6 +155,7 @@ jobs:
           skip-existing: true
 
       - name: Create and push annotated tag
+        if: steps.tag-check.outputs.exists != 'true'
         run: |
           set -euo pipefail
           TAG="${{ needs.metadata.outputs.tag }}"
