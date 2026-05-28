@@ -829,5 +829,13 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
         return output, {"token_to_kv_pool": layers_kv_fused}, True, layers_topk_ids
 
+    def get_embed_and_head(self):
+        embed = self.model.embed_tokens.embedding.value
+        if not getattr(self.config, "tie_word_embeddings", True):
+            head = self.lm_head.embedding.value
+        else:
+            head = embed
+        return embed, head
+
 
 EntryClass = [MiMoV2FlashForCausalLM]

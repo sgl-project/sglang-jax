@@ -25,6 +25,17 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 logger = logging.getLogger(__name__)
 
 
+def _per_dp_cumsum(lens, dp_size: int, per_dp_bs: int) -> np.ndarray:
+    """`(dp*(per_dp_bs+1),)` row-wise cumsum with leading 0 per DP rank.
+
+    At dp=1 reduces to `[0, *cumsum(lens)]`. Replaces the previous
+    ``if dp>1: 2D else: 1D`` branches (review #1108).
+    """
+    cu = np.zeros((dp_size, per_dp_bs + 1), dtype=np.int32)
+    cu[:, 1:] = np.cumsum(np.asarray(lens, dtype=np.int32).reshape(dp_size, per_dp_bs), axis=1)
+    return cu.ravel()
+
+
 @register_pytree_node_class
 @dataclass
 class FlashAttentionMetadata:
@@ -202,95 +213,118 @@ class FlashAttention(AttentionBackend):
 
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
             # convert custom_mask from bool to int32, because dma not support bool type
-            if batch.spec_info.custom_mask.dtype == jnp.bool:
+            if batch.spec_info_padded.custom_mask.dtype == jnp.bool:
                 # FIXME(pc) rm this dtype convert
                 logger.warning(
-                    "batch.spec_info.custom_mask type is  %s, it may make performance very low",
-                    batch.spec_info.custom_mask.dtype,
+                    "batch.spec_info_padded.custom_mask type is  %s, it may make performance very low",
+                    batch.spec_info_padded.custom_mask.dtype,
                 )
-                metadata.custom_mask = batch.spec_info.custom_mask.astype(jnp.int32)
+                metadata.custom_mask = batch.spec_info_padded.custom_mask.astype(jnp.int32)
             else:
-                metadata.custom_mask = batch.spec_info.custom_mask
+                metadata.custom_mask = batch.spec_info_padded.custom_mask
         else:
             metadata.custom_mask = None
 
+        dp_size = batch.dp_size
+        per_dp_bs = batch.per_dp_bs_size if dp_size > 1 else len(batch.seq_lens)
         if batch.forward_mode.is_target_verify():
             padded_batch_size = len(batch.seq_lens)
-            real_batch_size = batch.real_bs
-            q_lens = np.array([batch.spec_info.draft_token_num] * real_batch_size, dtype=np.int32)
-            extend_seq_lens = np.pad(q_lens, (0, padded_batch_size - real_batch_size))
+            extend_seq_lens = np.zeros(padded_batch_size, dtype=np.int32)
+            extend_seq_lens[batch.logits_indices_selector] = batch.spec_info_padded.draft_token_num
         else:
             extend_seq_lens = batch.extend_seq_lens
-        cu_q_lens = np.concatenate(
-            [
-                np.array([0], dtype=np.int32),
-                np.cumsum(extend_seq_lens),
-            ]
-        )
+        cu_q_lens = _per_dp_cumsum(extend_seq_lens, dp_size, per_dp_bs)
 
         seq_lens = np.copy(batch.seq_lens)
 
         if batch.forward_mode.is_target_verify():
             seq_lens += extend_seq_lens
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
+            # Verify mask must be (a) DP-segmented per rank when dp>1 so each
+            # rank's P("data") shard sees its own slots, and (b) padded so each
+            # row width = aligned_seq_lens (= cu_kv_lens delta). The RPA kernel
+            # always takes the cu_kv_lens-aligned path now (#1089 used to gate
+            # on page_size>=256, which broke dp=1 + smaller pages — Mosaic
+            # could not prove tiling(8) on the unaligned slice). dp=1 reduces
+            # to a single rank chunk; dp>1 keeps the per-rank repack from
+            # #1108 P1-7.
+            if metadata.custom_mask is not None:
+                q = batch.spec_info_padded.draft_token_num
+                cm = np.asarray(jax.device_get(metadata.custom_mask))
+                # Pin per-rank mask target from the pre-repacking mask capacity
+                # (tree_mask_capacity from build_tree, already bucket-stable).
+                cm_total = len(cm)
+                per_rank_mask_target = ((cm_total // dp_size + 7) // 8) * 8 or 8
+                # cm is DP-slot-ordered (build_tree got verified_seq_len = mwb.seq_lens-1
+                # over total_bs). Per-slot cm length = q*(verified_seq_len[s]+q); for pad
+                # slots verified_seq_len=-1 → q*(q-1).
+                cm_kl = np.where(seq_lens > 0, seq_lens, q - 1).astype(np.int64)
+                cm_off = np.concatenate([[0], np.cumsum(q * cm_kl)])
+                row_width = aligned_seq_lens
+                rank_chunks: list[np.ndarray] = []
+                for r in range(dp_size):
+                    parts = []
+                    for j in range(per_dp_bs):
+                        s = r * per_dp_bs + j
+                        kla = int(row_width[s])
+                        if seq_lens[s] > 0:
+                            kl = int(seq_lens[s])
+                            row = cm[cm_off[s] : cm_off[s] + q * kl].reshape(q, kl)
+                            parts.append(np.pad(row, ((0, 0), (0, kla - kl))).reshape(-1))
+                        elif kla > 0:
+                            parts.append(np.zeros(q * kla, dtype=cm.dtype))
+                    rank_chunks.append(
+                        np.concatenate(parts) if parts else np.zeros(0, dtype=cm.dtype)
+                    )
+                max_len = max(max((len(c) for c in rank_chunks), default=0), per_rank_mask_target)
+                packed = np.concatenate(
+                    [np.pad(c, (0, max_len - len(c))) for c in rank_chunks]
+                ).astype(np.int32)
+                metadata.custom_mask = device_array(
+                    packed,
+                    sharding=NamedSharding(self.mesh, P("data")),
+                )
         else:
             aligned_seq_lens = (
                 (batch.seq_lens + self.page_size - 1) // self.page_size
             ) * self.page_size
-        cu_kv_lens = np.concatenate(
-            [
-                np.array([0], dtype=np.int32),
-                np.cumsum(aligned_seq_lens),
-            ]
-        )
+        cu_kv_lens = _per_dp_cumsum(aligned_seq_lens, dp_size, per_dp_bs)
 
         if batch.forward_mode == ForwardMode.DRAFT_EXTEND:
-            # Reconstruct page_indices properly respecting ragged allocation
-            page_indices_list = []
-            offset = 0
-            allocate_lens = batch.spec_info.allocate_lens
-            # Ensure it's accessible as array
+            # Truncate each req's page list from allocate_len → seq_len, keeping
+            # the DP-segmented layout from padding_for_decode (rank r's pages
+            # at [r*per_dp_pg : ...]). page_indices (line 212) is already
+            # cache_loc[::page_size]//page_size, so re-gather from it per-rank.
+            allocate_lens = batch.spec_info_padded.allocate_lens
             if hasattr(allocate_lens, "device"):
                 allocate_lens = jax.device_get(allocate_lens)
+            allocate_lens = np.asarray(allocate_lens)
+            sel = np.asarray(batch.logits_indices_selector)
+            # allocate_lens here is global-flat (real_bs,) (cur_allocate_lens via
+            # verify); sel is DP-slot indices, only used for rank_of/aligned_seq.
+            assert len(allocate_lens) == len(sel), (len(allocate_lens), len(sel))
+            full_pg = page_indices.shape[0]
+            assert full_pg % dp_size == 0, (full_pg, dp_size)
+            per_dp_pg = full_pg // dp_size
+            alloc_pg = cdiv(allocate_lens.astype(np.int64), self.page_size)
+            need_pg = (aligned_seq_lens[sel] // self.page_size).astype(np.int64)
+            rank_of = (sel // per_dp_bs).astype(np.int64)
+            new_pi = np.zeros(full_pg, dtype=np.int32)
+            src_off = np.zeros(dp_size, dtype=np.int64)
+            dst_off = np.zeros(dp_size, dtype=np.int64)
+            for k in range(len(sel)):
+                r = int(rank_of[k])
+                n = int(need_pg[k])
+                s = r * per_dp_pg + src_off[r]
+                d = r * per_dp_pg + dst_off[r]
+                new_pi[d : d + n] = page_indices[s : s + n]
+                src_off[r] += int(alloc_pg[k])
+                dst_off[r] += n
+            page_indices = new_pi
 
-            num_pages_per_seq = aligned_seq_lens // self.page_size
-
-            for i in range(batch.real_bs):
-                alloc_len = (
-                    (int(allocate_lens[i]) + self.page_size - 1) // self.page_size
-                ) * self.page_size
-                needed_pages = int(num_pages_per_seq[i])
-
-                if needed_pages > 0:
-                    # Get the slice of cache_loc for this request
-                    # We assume batch.cache_loc is ordered and packed according to allocate_lens
-                    req_cache_loc = batch.cache_loc[offset : offset + alloc_len]
-
-                    # Select the first token of each page
-                    # The tokens are at indices 0, page_size, 2*page_size...
-                    # We need `needed_pages` entries.
-
-                    indices = np.arange(needed_pages) * self.page_size
-                    selected = req_cache_loc[indices]
-                    page_indices_list.extend(selected // self.page_size)
-
-                offset += alloc_len
-
-            page_indices = np.pad(
-                np.array(page_indices_list, dtype=np.int32),
-                (0, page_indices.shape[0] - len(page_indices_list)),
-            )
-
-        num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32).reshape(
-            1,
-        )
-        # Construct distribution for V2 kernel: [decode_end, prefill_end, mixed_end]
-
-        # All sequences are prefill mode
-        distribution = np.array([0, num_seqs.item(), num_seqs.item()], dtype=np.int32)
-
-        cu_q_lens = np.array(cu_q_lens)
-        cu_kv_lens = np.array(cu_kv_lens)
+        seq_2d = np.asarray(batch.seq_lens).reshape(dp_size, per_dp_bs)
+        local_n = np.sum(seq_2d > 0, axis=1, dtype=np.int32)
+        distribution = np.column_stack([np.zeros_like(local_n), local_n, local_n]).ravel()
         page_indices = np.array(page_indices)
         seq_lens = np.array(seq_lens)
         (
@@ -303,6 +337,23 @@ class FlashAttention(AttentionBackend):
             (cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
             sharding=(NamedSharding(self.mesh, P("data"))),
         )
+        # Hybrid SWA targets need swa_page_indices for TARGET_VERIFY too,
+        # otherwise SWA layers index the swa sub-pool with full-pool page ids.
+        swa_mapping = getattr(self, "swa_index_mapping", None)
+        if swa_mapping is not None:
+            full_loc = (page_indices.astype(np.int64) * self.page_size).astype(np.int32)
+            if isinstance(swa_mapping, list):
+                full_2d = full_loc.reshape(dp_size, -1)
+                swa_2d = np.empty_like(full_2d)
+                for r in range(dp_size):
+                    swa_2d[r] = np.asarray(swa_mapping[r])[full_2d[r]]
+                swa_loc = swa_2d.ravel()
+            else:
+                swa_loc = np.asarray(swa_mapping)[full_loc]
+            metadata.swa_page_indices = device_array(
+                (swa_loc // self.page_size).astype(np.int32),
+                sharding=NamedSharding(self.mesh, P("data")),
+            )
         return metadata
 
     def get_eagle_multi_step_metadata(self, batch: ModelWorkerBatch):
@@ -317,34 +368,50 @@ class FlashAttention(AttentionBackend):
         cu_kv_lens = []
         seq_lens = np.copy(batch.seq_lens)
 
-        # Vectorized preparation
-        real_bs = batch.real_bs
-        current_seq_lens = batch.seq_lens[:real_bs]
-        allocate_lens = batch.spec_info.allocate_lens[:real_bs]
+        # Vectorized preparation. selector maps global-flat req k → DP-padded
+        # slot s_k; cache_loc/page_indices are laid out in valid-slot order
+        # (== selector order), so the per-req gather below stays aligned.
+        sel = np.asarray(batch.logits_indices_selector)
+        current_seq_lens = np.asarray(batch.seq_lens)[sel]
+        allocate_lens = np.asarray(batch.spec_info_padded.allocate_lens)[sel]
 
         draft_allocs = allocate_lens - current_seq_lens
 
         alloc_tokens = current_seq_lens + draft_allocs
         alloc_pages = cdiv(alloc_tokens, self.page_size)
 
-        # src_starts (offset2) is constant across steps
-        src_starts = np.concatenate(([0], np.cumsum(alloc_pages)[:-1]))
-
         full_size = len(original_selected_cache_locs)
+        dp_size = batch.dp_size
+        per_dp_bs = batch.per_dp_bs_size if dp_size > 1 else len(batch.seq_lens)
+        assert full_size % dp_size == 0, (full_size, dp_size)
+        # cache_loc is DP-segmented (padding_for_decode); src_starts must point
+        # into rank r's section [r*per_dp_src_pages : ...], and result_locs
+        # must be written DP-segmented so the P("data") shard gives each rank
+        # its own draft page_indices (otherwise rank>0 reads page 0 → accept~1).
+        per_dp_src_pages = full_size // dp_size
+        TARGET_PADDING = 16384
+        assert TARGET_PADDING % dp_size == 0
+        per_dp_dst_pages = TARGET_PADDING // dp_size
+        rank_of_req = (sel // per_dp_bs).astype(np.int64)
+
+        def _dp_starts(pages, per_dp_base):
+            starts = np.zeros(len(pages), dtype=np.int64)
+            for r in range(dp_size):
+                m = rank_of_req == r
+                if not np.any(m):
+                    continue
+                c = np.cumsum(pages[m])
+                starts[m] = r * per_dp_base + np.concatenate(([0], c[:-1]))
+            return starts
+
+        src_starts = _dp_starts(alloc_pages, per_dp_src_pages)
         seq_lens_list = []
+        valid_slot = np.asarray(batch.seq_lens) > 0
         for speculative_step_id in range(batch.speculative_num_steps):
-            seq_lens = batch.seq_lens + (speculative_step_id)
-            seq_lens[batch.real_bs :] = 0
+            seq_lens = np.where(valid_slot, batch.seq_lens + speculative_step_id, 0)
             seq_lens_list.append(seq_lens)
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
-            cu_kv_lens.append(
-                np.concatenate(
-                    [
-                        np.array([0], dtype=np.int32),
-                        np.cumsum(aligned_seq_lens),
-                    ]
-                )
-            )
+            cu_kv_lens.append(_per_dp_cumsum(aligned_seq_lens, dp_size, per_dp_bs))
 
             # Vectorized calculation of spec_pages
             step_spec_tokens = (
@@ -352,48 +419,30 @@ class FlashAttention(AttentionBackend):
             )
             step_spec_pages = cdiv(step_spec_tokens, self.page_size)
 
-            total_spec_pages = np.sum(step_spec_pages)
-            dst_starts = np.concatenate(([0], np.cumsum(step_spec_pages)[:-1]))
+            total_spec_pages = int(np.sum(step_spec_pages))
+            dst_starts = _dp_starts(step_spec_pages, per_dp_dst_pages)
+            flat_dst_cum = np.concatenate(([0], np.cumsum(step_spec_pages)[:-1]))
 
-            # Vectorized Gather
             repeats = step_spec_pages
-            gather_indices = np.repeat(src_starts, repeats) + (
-                np.arange(total_spec_pages) - np.repeat(dst_starts, repeats)
-            )
-
+            local_off = np.arange(total_spec_pages) - np.repeat(flat_dst_cum, repeats)
+            gather_indices = np.repeat(src_starts, repeats) + local_off
+            write_indices = np.repeat(dst_starts, repeats) + local_off
             gathered_locs = original_selected_cache_locs[gather_indices]
 
-            # Reconstruct the full array (sparse/padded)
-            result_locs = np.zeros(full_size, dtype=original_selected_cache_locs.dtype)
-            result_locs[:total_spec_pages] = gathered_locs
-
-            page_indices_cur_step = (result_locs // self.page_size).astype(np.int32)
-
-            # FIXME Handle padding, this will be move to precompile
-            TARGET_PADDING = 16384
-            if page_indices_cur_step.shape[0] < TARGET_PADDING:
-                padding_size = TARGET_PADDING - page_indices_cur_step.shape[0]
-                # Use np.pad to keep it on CPU/Numpy until device_array call
-                page_indices_cur_step = np.pad(page_indices_cur_step, (0, padding_size))
-
-            page_indices.append(page_indices_cur_step)
+            result_locs = np.zeros(TARGET_PADDING, dtype=original_selected_cache_locs.dtype)
+            result_locs[write_indices] = gathered_locs
+            page_indices.append((result_locs // self.page_size).astype(np.int32))
 
         if batch.spec_algorithm.is_none():
             raise RuntimeError("should not reach here")
-        else:
-            assert isinstance(batch.spec_info, EagleDraftInput)
-            # it is same across every step
-            cu_q_lens = np.arange(
-                0,
-                len(batch.seq_lens) * batch.speculative_eagle_topk + 1,
-                step=batch.speculative_eagle_topk,
-                dtype=np.int32,
-            )
-        num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32).reshape(
-            1,
-        )
-
-        distribution = np.array([0, 0, num_seqs.item()], dtype=np.int32)
+        assert isinstance(batch.spec_info_padded, EagleDraftInput)
+        topk = batch.speculative_eagle_topk
+        cu_q_lens = np.tile(np.arange(0, per_dp_bs * topk + 1, topk, dtype=np.int32), dp_size)
+        seq_2d = np.asarray(batch.seq_lens).reshape(dp_size, per_dp_bs)
+        local_n = np.sum(seq_2d > 0, axis=1, dtype=np.int32)
+        distribution = np.column_stack(
+            [np.zeros_like(local_n), np.zeros_like(local_n), local_n]
+        ).ravel()
         metadata = []
         for i in range(batch.speculative_num_steps):
             metadata_tmp = FlashAttentionMetadata()
@@ -500,7 +549,11 @@ class FlashAttention(AttentionBackend):
             P(self.attention_data_partition_axis),  # cu_q_lens
             P(self.attention_data_partition_axis),  # cu_kv_lens
             P(self.attention_data_partition_axis),  # distribution
-            P(),  # custom_mask
+            (
+                P(self.attention_data_partition_axis)
+                if self.forward_metadata.custom_mask is not None
+                else P()
+            ),  # custom_mask: DP-segmented per-rank (cu_seq_mask_lens is rank-local)
             (
                 P(self.kv_partition_axis) if attention_sink is not None else P()
             ),  # attention sink: (num_q_heads,), sharded by heads
@@ -511,6 +564,11 @@ class FlashAttention(AttentionBackend):
             P(
                 self.attention_data_partition_axis, None, self.kv_partition_axis, None, None
             ),  # updated kv_cache_fused (head interleaved) - 3D: [total_tokens, num_kv_heads*2, head_dim]
+        )
+
+        mask_aligned_to_cu_kv = (
+            self.forward_metadata.custom_mask is not None
+            and forward_batch.forward_mode.is_target_verify()
         )
 
         def _ragged_paged_attention_with_fused_kv(*args):
@@ -531,6 +589,7 @@ class FlashAttention(AttentionBackend):
                 xai_temperature_len=(
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
                 ),
+                mask_aligned_to_cu_kv=mask_aligned_to_cu_kv,
             )
 
             return result, updated_kv_cache_fused

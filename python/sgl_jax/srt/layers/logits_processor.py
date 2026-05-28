@@ -201,10 +201,11 @@ class LogitsMetadata:
             extend_seq_lens=device_array(batch.extend_seq_lens, sharding=sharding),
             logits_indices=device_array(batch.logits_indices, sharding=sharding),
             accept_lens=(
-                device_array(batch.spec_info.accept_length, sharding=sharding)
-                if batch.spec_info is not None
-                and hasattr(batch.spec_info, "accept_length")
-                and batch.spec_info.accept_length is not None
+                device_array(batch.spec_info_padded.accept_length, sharding=sharding)
+                if batch.forward_mode.is_draft_extend()
+                and batch.spec_info_padded is not None
+                and hasattr(batch.spec_info_padded, "accept_length")
+                and batch.spec_info_padded.accept_length is not None
                 else None
             ),
             extend_seq_lens_cpu=extend_seq_lens_cpu,

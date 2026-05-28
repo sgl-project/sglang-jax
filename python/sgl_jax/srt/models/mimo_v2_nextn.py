@@ -146,6 +146,9 @@ class MiMoV2ModelNextN(nnx.Module):
     ) -> tuple[jax.Array, list[jax.Array]]:
         embed = self.embed_tokens(forward_batch.input_ids)
         hidden_in = forward_batch.spec_info.hidden_states
+        emb_sh = jax.typeof(embed).sharding
+        if isinstance(emb_sh, jax.sharding.NamedSharding):
+            hidden_in = jax.sharding.reshard(hidden_in, emb_sh)
         hidden_states, _ = self.eh_proj(
             jnp.concatenate((self.enorm(embed), self.hnorm(hidden_in)), axis=-1)
         )
@@ -180,6 +183,7 @@ class MiMoV2MTPForCausalLM(nnx.Module):
         )
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
         self._fused_qkv_buffers: dict[int, dict] = {}
+        self._uses_fused_mtp_qkv = False
         self.hot_token_ids = None
 
     def __call__(
@@ -192,7 +196,7 @@ class MiMoV2MTPForCausalLM(nnx.Module):
         output = self.logits_processor(
             hidden_states, self.lm_head, logits_metadata, aux_hidden_states=None
         )
-        return output, layers_kv_fused, []
+        return output, layers_kv_fused, True, None
 
     def load_weights(self, model_config: ModelConfig):
         self.loader = WeightLoader(
@@ -204,17 +208,27 @@ class MiMoV2MTPForCausalLM(nnx.Module):
         if self.loader.is_static_quant:
             attn = self.model.mtp_block.self_attn
             head_dim, v_head_dim = attn.head_dim, attn.v_head_dim
-            # dequant_fused_qkv reads full-attn config fields; the MTP block uses
-            # SWA dims, so derive the split config from the actual layer.
-            mtp_qkv_config = SimpleNamespace(
-                head_dim=head_dim,
-                v_head_dim=v_head_dim,
-                num_attention_heads=attn.q_head_num,
-                num_key_value_heads=attn.k_head_num,
-            )
-            self.loader.dequant_fused_qkv(
-                self._fused_qkv_buffers, [self.model.mtp_block], mtp_qkv_config
-            )
+            if self._uses_fused_mtp_qkv:
+                # dequant_fused_qkv reads full-attn config fields; the MTP block uses
+                # SWA dims, so derive the split config from the actual layer.
+                mtp_qkv_config = SimpleNamespace(
+                    head_dim=head_dim,
+                    v_head_dim=v_head_dim,
+                    num_attention_heads=attn.q_head_num,
+                    num_key_value_heads=attn.k_head_num,
+                )
+                self.loader.dequant_fused_qkv(
+                    self._fused_qkv_buffers, [self.model.mtp_block], mtp_qkv_config
+                )
+            else:
+                self.loader.dequant_fp8_layers(
+                    [self.model.mtp_block],
+                    specs=[
+                        ("self_attn.q_proj", head_dim),
+                        ("self_attn.k_proj", head_dim),
+                        ("self_attn.v_proj", v_head_dim),
+                    ],
+                )
             self.loader.dequant_fp8_layers(
                 [self.model.mtp_block],
                 specs=[
@@ -275,14 +289,21 @@ class MiMoV2MTPForCausalLM(nnx.Module):
         }
 
         qkv_key = f"{prefix}.self_attn.qkv_proj"
-        if is_fp8 and not self.loader.is_quant_ignored(qkv_key):
+        has_fused_qkv = (
+            self.loader.has_weight_on_disk(f"{qkv_key}.weight")
+            if hasattr(self.loader, "has_weight_on_disk")
+            else True
+        )
+        self._uses_fused_mtp_qkv = has_fused_qkv
+
+        if has_fused_qkv and is_fp8 and not self.loader.is_quant_ignored(qkv_key):
             mappings[f"{qkv_key}.weight"] = WeightMapping(
                 target_path="__FUSED_QKV_WEIGHT__0", sharding=(None, None), transpose=False
             )
             mappings[f"{qkv_key}.weight_scale_inv"] = WeightMapping(
                 target_path="__FUSED_QKV_SCALE__0", sharding=(None, None), transpose=False
             )
-        else:
+        elif has_fused_qkv:
             mappings[f"{qkv_key}.weight"] = WeightMapping(
                 target_path=[
                     f"{block}.self_attn.q_proj.weight",
@@ -294,6 +315,28 @@ class MiMoV2MTPForCausalLM(nnx.Module):
                 head_dim_padding=False,
                 kv_head_padding=True,
             )
+        else:
+            for proj, head_dim_padding in [
+                ("q_proj", True),
+                ("k_proj", True),
+                ("v_proj", False),
+            ]:
+                hf_key = f"{prefix}.self_attn.{proj}"
+                ignored = self.loader.is_quant_ignored(hf_key)
+                weight_suffix = "weight" if (not is_fp8 or ignored) else "weight_q"
+                mappings[f"{hf_key}.weight"] = WeightMapping(
+                    target_path=f"{block}.self_attn.{proj}.{weight_suffix}",
+                    sharding=(None, "tensor"),
+                    transpose=True,
+                    head_dim_padding=head_dim_padding,
+                    kv_head_padding=not is_fp8,
+                )
+                if is_fp8 and not ignored:
+                    mappings[f"{hf_key}.weight_scale_inv"] = WeightMapping(
+                        target_path=f"{block}.self_attn.{proj}.weight_scale",
+                        sharding=(None, None),
+                        transpose=False,
+                    )
 
         for proj, sharding in [
             ("gate_proj", (None, "tensor")),

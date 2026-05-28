@@ -142,8 +142,21 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTPForCausalLM"
 
-        if is_draft_model and self.hf_config.architectures[0] == "MiMoV2ForCausalLM":
+        if is_draft_model and self.hf_config.architectures[0] in (
+            "MiMoV2ForCausalLM",
+            "MiMoV2FlashForCausalLM",
+        ):
             self.hf_config.architectures[0] = "MiMoV2MTPForCausalLM"
+            # Each draft runner is a single SWA layer; without this the KV pool
+            # sizes for all 70 target layers and OOMs.
+            self.hf_config.num_hidden_layers = 1
+            if self.quantization_config is not None:
+                # eh_proj / o_proj are BF16 in model_mtp.safetensors (no
+                # weight_scale_inv); keep them as plain LinearBase so mappings
+                # can target `.weight` instead of `.weight_q`.
+                ignored = list(self.quantization_config.ignored_layers or [])
+                ignored.extend(["model.eh_proj", "model.mtp_block.self_attn.o_proj"])
+                self.quantization_config.ignored_layers = ignored
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
         self.is_multimodal = False

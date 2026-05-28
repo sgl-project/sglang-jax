@@ -321,10 +321,28 @@ class Scheduler(
         )
 
         # launch draft worker
+        self._spec_multi_layer = False
         if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
-            from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker
+            # Multi-layer vs single-layer is a model property (how many MTP heads
+            # the target ships), not a CLI-algorithm property. NEXTN with a single
+            # MTP head behaves exactly like EAGLE (same head run N times).
+            # DeepSeek-style configs expose num_nextn_predict_layers; MiMo-style
+            # configs don't, so fall back to --speculative-num-steps under NEXTN
+            # (one MTP weight set per step).
+            n_mtp = getattr(self.tp_worker.model_config.hf_config, "num_nextn_predict_layers", None)
+            if n_mtp is None and self.spec_algorithm.is_nextn():
+                n_mtp = server_args.speculative_num_steps
+            self._spec_multi_layer = n_mtp is not None and n_mtp > 1
+            if self._spec_multi_layer:
+                from sgl_jax.srt.speculative.multi_layer_eagle_worker import (
+                    MultiLayerEAGLEWorker as _SpecWorkerCls,
+                )
+            else:
+                from sgl_jax.srt.speculative.eagle_worker import (
+                    EAGLEWorker as _SpecWorkerCls,
+                )
 
-            self.draft_worker = EAGLEWorker(
+            self.draft_worker = _SpecWorkerCls(
                 server_args=server_args,
                 target_worker=self.tp_worker,
             )
@@ -1825,24 +1843,46 @@ class Scheduler(
                 next_token_ids = np.array(jax.device_get(next_token_ids_device))
                 self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
         else:
-            model_worker_batch = batch.get_spec_model_worker_batch(
-                precompile_token_paddings,
-                precompile_bs_paddings,
-                precompile_cache_loc_paddings,
-                self.page_size,
-                self.server_args.enable_static_lora,
-            )
+            if batch.forward_mode.is_extend():
+                # Spec extend always uses the padded mwb so target and draft
+                # see identical shapes regardless of dp_size / multi-layer
+                # (#1090 + #1053 P1-5b assert dp>1 spec extend must go here).
+                model_worker_batch = batch.get_model_worker_batch(
+                    precompile_token_paddings,
+                    precompile_bs_paddings,
+                    precompile_cache_loc_paddings,
+                    self.page_size,
+                    self.server_args.enable_static_lora,
+                )
+            else:
+                model_worker_batch = batch.get_spec_model_worker_batch(
+                    precompile_token_paddings,
+                    precompile_bs_paddings,
+                    precompile_cache_loc_paddings,
+                    self.page_size,
+                    self.server_args.enable_static_lora,
+                    draft_token_num=self.draft_worker.speculative_num_draft_tokens,
+                )
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch
             )
-            info = batch.reqs_info[0]
-            if batch_output.accept_lens is not None:
-                # Decode
-                info.seq_lens = info.seq_lens + batch_output.accept_lens
-            else:
-                # Prefill
-                info.seq_lens = info.seq_lens + 1
-            info.spec_info = batch_output.next_draft_input
+            per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
+                batch_output.next_draft_input, model_worker_batch.real_bs_per_dp
+            )
+            for r, s in enumerate(per_rank_spec):
+                batch.reqs_info[r].spec_info = s
+            accept = batch_output.accept_lens
+            if accept is not None:
+                accept = np.asarray(jax.device_get(accept))
+            per_dp_bs = model_worker_batch.per_dp_bs_size
+            for dp_rank, info in enumerate(batch.reqs_info):
+                if info.seq_lens is None or len(info.seq_lens) == 0:
+                    continue
+                if accept is not None:
+                    off = dp_rank * per_dp_bs
+                    info.seq_lens = info.seq_lens + accept[off : off + len(info.seq_lens)]
+                else:
+                    info.seq_lens = info.seq_lens + 1
             next_token_ids = np.asarray(jax.device_get(batch_output.next_token_ids))
             self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
             logits_output = batch_output.logits_output

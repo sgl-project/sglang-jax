@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import jax
 import numpy as np
-from jax import numpy as jnp
 from jax._src import mesh as mesh_lib
 
 from sgl_jax.global_config import global_config
@@ -1418,6 +1417,25 @@ class ScheduleBatch:
 
         self.maybe_evict_swa()
 
+        # prepare_for_decode requires cross-rank-flat allocate_lens
+        # (asserts shape[0] == batch_size); rebuild via _concat, run it, then
+        # split allocate_lens back to per-rank.
+        if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+            for info in self.reqs_info:
+                if not info.reqs:
+                    info.input_ids = None
+                    info.output_ids = None
+                    info.seq_lens = None
+                    info.out_cache_loc = None
+                    info.seq_lens_sum = 0
+            flat_spec = self._concat_spec_info_per_rank([info.spec_info for info in self.reqs_info])
+            flat_spec.prepare_for_decode(self)
+            real_bs_per_dp = [len(info.reqs) if info.reqs else 0 for info in self.reqs_info]
+            per_rank_spec = self._split_spec_info_per_rank(flat_spec, real_bs_per_dp)
+            for r, s in enumerate(per_rank_spec):
+                self.reqs_info[r].spec_info = s
+            return
+
         # Process each DP rank
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
@@ -1434,13 +1452,6 @@ class ScheduleBatch:
                 continue
 
             bs = len(reqs)
-
-            # Handle spec decoding if enabled
-            if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
-                # if spec decoding is used, the decode batch is prepared inside
-                # `forward_batch_speculative_generation` after running draft models.
-                draft_input: EagleDraftInput = info.spec_info
-                draft_input.prepare_for_decode(self)
 
             if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
                 continue  # Skip to next DP rank
@@ -1522,7 +1533,7 @@ class ScheduleBatch:
         if chunked_req_to_exclude is None:
             chunked_req_to_exclude = {}
 
-        # Unified DP filtering logic (works for all dp_size including 1)
+        # Unified DP filtering logic (works for all dp_size including 1).
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
 
@@ -1588,15 +1599,6 @@ class ScheduleBatch:
             else:
                 info.seq_lens_sum = 0
 
-            # Filter speculative decoding arrays manually (if present)
-            if info.spec_info is not None and info.spec_info.topk_p is not None:
-                keep_indices_jax = jnp.asarray(keep_indices_dp, dtype=jnp.int32)
-                info.spec_info.topk_p = info.spec_info.topk_p[keep_indices_jax]
-                info.spec_info.topk_index = info.spec_info.topk_index[keep_indices_jax]
-                info.spec_info.hidden_states = info.spec_info.hidden_states[keep_indices_jax]
-                info.spec_info.verified_id = info.spec_info.verified_id[keep_indices_jax]
-                info.spec_info.allocate_lens = info.spec_info.allocate_lens[keep_indices_jax]
-
             # Filter logprob lists
             if info.top_logprobs_nums is not None:
                 info.top_logprobs_nums = [info.top_logprobs_nums[i] for i in keep_indices_dp]
@@ -1606,9 +1608,8 @@ class ScheduleBatch:
             if info.sampling_info is not None:
                 info.sampling_info.filter_batch(np.array(keep_indices_dp))
 
-            # Filter spec_info (method call)
+            # Filter spec_info (per-rank EagleDraftInput; handles all 5 spec arrays).
             if info.spec_info is not None:
-                # Note: has_been_filtered logic matches original implementation
                 if chunked_req_to_exclude is not None and len(chunked_req_to_exclude) > 0:
                     has_been_filtered = False
                 else:
@@ -2046,6 +2047,237 @@ class ScheduleBatch:
             grammars=[req.grammar for req in all_reqs] if self.has_grammar else None,
         )
 
+    def _get_spec_decode_mwb_dp(
+        self, bs_paddings: list, enable_static_lora: bool, draft_token_num: int = 1
+    ) -> ModelWorkerBatch:
+        """DP-aware spec-decode ModelWorkerBatch (#1053 P1-5b).
+
+        Reuses the nospec ``_merge_*`` helpers for per-rank seq_lens /
+        req_pool_indices / sampling_info. ``spec_info`` is global (DP-padded
+        order, see ``EagleDraftInput`` docstring) and lives only on
+        ``reqs_info[0]``. ``input_ids``/``positions``/``cache_loc`` are
+        placeholders — ``EagleDraftWorker.padding_for_decode`` rebuilds them.
+        """
+        # Pin total_bs to the largest precompile bucket so every cell shares
+        # one jit cache entry regardless of runtime bs. Without this, each
+        # smaller bucket (bs_paddings[i] < bs_paddings[-1]) triggers a fresh
+        # trace the first time it's hit. precompile is expected to include a
+        # largest bucket that is a multiple of dp_size; falling back to a
+        # smaller bucket would split the cache key, so assert instead.
+        if not bs_paddings:
+            total_bs = self.dp_size
+        else:
+            max_bs_per_dp = 0
+            for dp_rank in range(self.dp_size):
+                info = self.reqs_info[dp_rank]
+                if info.reqs is not None:
+                    max_bs_per_dp = max(max_bs_per_dp, len(info.reqs))
+            max_bs_per_dp = max(max_bs_per_dp, 1)
+            total_bs, _ = pad_to_bucket(max_bs_per_dp * self.dp_size, bs_paddings)
+            assert total_bs % self.dp_size == 0, (
+                f"padded total_bs={total_bs} is not divisible by dp_size="
+                f"{self.dp_size}; bs_paddings={bs_paddings}"
+            )
+        per_dp_bs = total_bs // self.dp_size
+        self.per_dp_bs_size = per_dp_bs
+        (
+            req_pool_indices_cpu,
+            seq_lens_cpu,
+            _ext_prefix,
+            _ext_seq,
+            _ext_logprob,
+            _logits_idx,
+            real_bs,
+            real_bs_per_dp,
+            logits_indices_selector,
+        ) = self._merge_batch_metadata(per_dp_bs, total_bs)
+        sampling_info = self._merge_sampling_info(per_dp_bs, total_bs)
+        # Concat per-rank spec_info into a cross-rank-flat EagleDraftInput,
+        # then scatter into DP-padded (total_bs, ...) slots so spec_info[i]
+        # aligns with seq_lens[i]. Returns a new object — does not mutate
+        # the per-rank cross-round state on reqs_info[r].spec_info.
+        flat_spec = self._concat_spec_info_per_rank([info.spec_info for info in self.reqs_info])
+        spec_info = self._scatter_spec_info_to_dp_slots(
+            flat_spec, logits_indices_selector, total_bs
+        )
+        # Per-rank out_cache_loc chunks (set in spec prepare_for_decode) have
+        # variable length (∝ accept_len). DP-segment: pad each to max_len with
+        # -1 so the P("data") shard in ForwardBatch.init_new gives rank r its
+        # own slots (fa_backend doesn't use it, but native_backend would).
+        ocl_chunks = [
+            (
+                np.asarray(i.out_cache_loc, dtype=np.int32)
+                if i.out_cache_loc is not None and len(i.out_cache_loc) > 0
+                else np.empty(0, dtype=np.int32)
+            )
+            for i in self.reqs_info
+        ]
+        # Pad each rank's out_cache_loc to per_dp_bs * draft_token_num so the
+        # merged shape is stable across runtime bs. max_chunk_len defensive.
+        max_chunk_len = max((len(c) for c in ocl_chunks), default=0)
+        target_per_rank_ocl = max(per_dp_bs * draft_token_num, max_chunk_len)
+        out_cache_loc = (
+            np.concatenate(
+                [
+                    np.pad(c, (0, target_per_rank_ocl - len(c)), constant_values=-1)
+                    for c in ocl_chunks
+                ]
+            )
+            if target_per_rank_ocl > 0
+            else np.empty(0, dtype=np.int32)
+        )
+        return ModelWorkerBatch(
+            bid=acc_global_bid(),
+            forward_mode=self.forward_mode,
+            input_ids=np.empty(0, dtype=np.int32),
+            real_input_ids_len=0,
+            req_pool_indices=req_pool_indices_cpu,
+            seq_lens=seq_lens_cpu,
+            out_cache_loc=out_cache_loc,
+            return_logprob=self.return_logprob,
+            return_output_logprob_only=self.return_output_logprob_only,
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            sampling_info=sampling_info,
+            positions=np.empty(0, dtype=np.int32),
+            cache_loc=np.empty(0, dtype=np.int32),
+            extend_prefix_lens=None,
+            extend_seq_lens=None,
+            extend_logprob_start_lens=None,
+            extend_input_logprob_token_ids=None,
+            logits_indices=None,
+            lora_ids=(
+                ["0"] * total_bs
+                if enable_static_lora
+                else [r.lora_id for i in self.reqs_info for r in (i.reqs or [])]
+                + ["0"] * (total_bs - real_bs)
+            ),
+            real_bs=real_bs,
+            real_bs_per_dp=real_bs_per_dp,
+            dp_size=self.dp_size,
+            per_dp_bs_size=per_dp_bs,
+            logits_indices_selector=logits_indices_selector,
+            capture_hidden_mode=getattr(spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL),
+            launch_done=self.launch_done,
+            spec_info_padded=spec_info,
+            spec_algorithm=self.spec_algorithm,
+            tree_cache=self.tree_cache,
+            mrope_positions=None,
+        )
+
+    @staticmethod
+    def _scatter_spec_info_to_dp_slots(flat, selector: np.ndarray, total_bs: int):
+        """Scatter global-flat spec_info arrays into DP-padded ``(total_bs, …)``.
+
+        ``selector[k]`` is the DP-padded slot of the k-th global-flat req
+        (== ``logits_indices_selector``). Returns a new ``EagleDraftInput``;
+        the cross-round flat state on ``reqs_info[r].spec_info`` is unchanged.
+        """
+
+        def _scatter1(arr):
+            if arr is None:
+                return None
+            a = np.asarray(arr)
+            out = np.zeros((total_bs,) + a.shape[1:], dtype=a.dtype)
+            out[selector] = a
+            return out
+
+        return type(flat)(
+            topk_p=_scatter1(flat.topk_p),
+            topk_index=_scatter1(flat.topk_index),
+            hidden_states=_scatter1(flat.hidden_states),
+            verified_id=_scatter1(flat.verified_id),
+            allocate_lens=_scatter1(flat.allocate_lens),
+            capture_hidden_mode=flat.capture_hidden_mode,
+            accept_length=flat.accept_length,
+            accept_length_cpu=flat.accept_length_cpu,
+        )
+
+    @staticmethod
+    def _split_spec_info_per_rank(flat, real_bs_per_dp: list[int]) -> list:
+        """Slice a cross-rank-flat EagleDraftInput into per-rank EagleDraftInputs.
+
+        ``flat`` layout is ``[rank0 reqs ++ rank1 reqs ++ …]`` with total length
+        ``sum(real_bs_per_dp)``. Empty ranks (``real_bs == 0``) yield ``None``.
+        Used at forward output boundary to write back ``reqs_info[r].spec_info``.
+        """
+        if flat is None:
+            return [None] * len(real_bs_per_dp)
+
+        flat._ensure_host()
+
+        per_req_fields = (
+            "topk_p",
+            "topk_index",
+            "hidden_states",
+            "verified_id",
+            "allocate_lens",
+            "accept_length",
+            "accept_length_cpu",
+        )
+
+        out = []
+        offset = 0
+        for n in real_bs_per_dp:
+            if n == 0:
+                out.append(None)
+                continue
+            kwargs = {"capture_hidden_mode": flat.capture_hidden_mode}
+            for f in per_req_fields:
+                v = getattr(flat, f, None)
+                kwargs[f] = None if v is None else v[offset : offset + n]
+            out.append(type(flat)(**kwargs))
+            offset += n
+        return out
+
+    @staticmethod
+    def _concat_spec_info_per_rank(per_rank: list):
+        """Concat per-rank EagleDraftInputs into a single cross-rank-flat one.
+
+        ``None`` entries are skipped. Returns ``None`` if every entry is ``None``.
+        Used at forward input boundary (``_get_spec_decode_mwb_dp``) to build the
+        flat shape ``_scatter_spec_info_to_dp_slots`` expects.
+        """
+        nonempty = [s for s in per_rank if s is not None]
+        if not nonempty:
+            return None
+
+        per_req_fields = (
+            "topk_p",
+            "topk_index",
+            "hidden_states",
+            "verified_id",
+            "allocate_lens",
+            "accept_length",
+            "accept_length_cpu",
+        )
+
+        kwargs = {"capture_hidden_mode": nonempty[0].capture_hidden_mode}
+        for f in per_req_fields:
+            vals = [getattr(s, f, None) for s in nonempty]
+            nonnull = [v for v in vals if v is not None]
+            if not nonnull:
+                kwargs[f] = None
+                continue
+            # All nonempty ranks should agree on which optional fields they
+            # carry — they came from the same per-rank verify split. A partial
+            # mix means the concat length would silently drift from
+            # ``sum(real_bs_per_dp)``; fail loudly instead.
+            assert len(nonnull) == len(nonempty), (
+                f"_concat_spec_info_per_rank: field {f!r} is None on "
+                f"{len(nonempty) - len(nonnull)}/{len(nonempty)} nonempty rank(s); "
+                "all-or-nothing required"
+            )
+            if len(nonnull) == 1:
+                kwargs[f] = nonnull[0]
+                continue
+            if isinstance(nonnull[0], np.ndarray):
+                kwargs[f] = np.concatenate(nonnull, axis=0)
+            else:
+                nonnull = [np.asarray(v) for v in nonnull]
+                kwargs[f] = np.concatenate(nonnull, axis=0)
+        return type(nonempty[0])(**kwargs)
+
     def get_model_worker_batch(
         self,
         token_paddings: list,
@@ -2188,7 +2420,10 @@ class ScheduleBatch:
             real_bs_per_dp=real_bs_per_dp,
             logits_indices_selector=logits_indices_selector,
             capture_hidden_mode=(
-                CaptureHiddenMode.FULL if self.return_hidden_states else CaptureHiddenMode.NULL
+                CaptureHiddenMode.FULL
+                if self.return_hidden_states
+                or (self.spec_algorithm is not None and not self.spec_algorithm.is_none())
+                else CaptureHiddenMode.NULL
             ),
             dp_size=self.dp_size,
             per_dp_bs_size=per_dp_bs_padding,
@@ -2198,6 +2433,7 @@ class ScheduleBatch:
             deepstack_visual_embedding=None,
             recurrent_indices=recurrent_indices_cpu,
             has_initial_state=has_initial_state_cpu,
+            spec_algorithm=self.spec_algorithm,
         )
 
     def get_spec_model_worker_batch(
@@ -2207,189 +2443,12 @@ class ScheduleBatch:
         cache_loc_paddings: list,
         page_size: int,
         enable_static_lora: bool = False,
+        draft_token_num: int = 1,
     ) -> ModelWorkerBatch:
-        if self.forward_mode.is_decode_or_idle():
-            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
-        else:
-            extend_seq_lens = np.array(self.extend_lens, dtype=np.int32)
-            extend_prefix_lens = np.array(self.prefix_lens, dtype=np.int32)
-            extend_logprob_start_lens = self.extend_logprob_start_lens
-        logits_indices = None
-        if self.forward_mode.is_extend() and extend_seq_lens is not None:
-            if len(extend_seq_lens) > 0:
-                logits_indices = np.cumsum(extend_seq_lens, dtype=np.int32) - 1
-            else:
-                logits_indices = np.array([], dtype=np.int32)
-
-        acc_global_bid()
-
-        if self.input_ids is None:
-            input_ids_cpu = np.empty(0, dtype=np.int32)
-        else:
-            input_ids_cpu = self.input_ids.flatten()
-
-        real_input_ids_len = len(input_ids_cpu)
-        out_cache_loc_cpu = self.out_cache_loc
-        seq_lens_cpu = self.seq_lens
-        real_bs = len(seq_lens_cpu)
-        self.per_dp_bs_size = real_bs
-        req_pool_indices_cpu = self.req_pool_indices
-        token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
-        # FIXME @pc, move this to eagle_worker
-        # If enable spec inference, use positions in spec info firstly
-        if self.spec_info is not None and getattr(self.spec_info, "positions", None) is not None:
-            positions_cpu = self.spec_info.positions
-        else:
-            positions_cpu = None
-
-        # Calculate positions after padding
-        if self.forward_mode.is_extend():
-            # For prefill: create positions for each token in sequences
-            # Calculate total tokens without padding first
-            if positions_cpu is None:
-                lengths = seq_lens_cpu - self.prefix_lens
-                if len(lengths) > 0:
-                    repeats = lengths
-                    total_len = np.sum(repeats)
-                    # Generate range [0, 1, ... len-1] for each sequence
-                    block_starts = np.concatenate(([0], np.cumsum(repeats)[:-1]))
-                    shifts = np.repeat(block_starts, repeats)
-                    ranges = np.arange(total_len) - shifts
-                    # Add prefix_len to each range
-                    positions_cpu = np.repeat(self.prefix_lens, repeats) + ranges
-                    positions_cpu = positions_cpu.astype(seq_lens_cpu.dtype)
-                else:
-                    positions_cpu = np.array([], dtype=seq_lens_cpu.dtype)
-        else:
-            if positions_cpu is None:
-                # For decode: each sequence contributes one token at the next position (seq_len)
-                # Create positions for actual tokens (one per sequence at seq_len)
-                batch_positions = np.maximum(0, seq_lens_cpu - 1)
-                # Create positions array matching the length of input_ids (including padding)
-                positions_cpu = np.zeros(len(batch_positions), dtype=batch_positions.dtype)
-                # Fill in the actual positions for the real tokens
-                # positions = positions.at[: len(batch_positions)].set(batch_positions)
-                positions_cpu[: len(batch_positions)] = batch_positions
-
-        mrope_positions_cpu = _compute_mrope_positions_for_batch(
-            self.reqs,
-            self.forward_mode,
-            seq_lens_cpu,
-            len(input_ids_cpu),
-            extend_prefix_lens,
-            extend_seq_lens,
-        )
-
-        cache_loc_flat = np.array([], dtype=np.int32)
-
-        if len(seq_lens_cpu) > 0:
-            seq_lens = seq_lens_cpu
-            if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
-                if self.forward_mode == ForwardMode.TARGET_VERIFY:
-                    seq_lens = seq_lens_cpu + self.spec_info.draft_token_num
-                elif self.forward_mode == ForwardMode.DECODE:
-                    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
-
-                    seq_lens = seq_lens_cpu + EagleDraftInput.ALLOC_LEN_PER_DECODE
-            # Filter out empty sequences
-            valid_mask = seq_lens > 0
-            if np.any(valid_mask):
-                valid_indices = np.where(valid_mask)[0]
-                valid_seq_lens = seq_lens[valid_mask]
-                # Calculate aligned lengths for all valid sequences at once
-                if (
-                    self.forward_mode == ForwardMode.DECODE
-                    and not self.spec_algorithm.is_none()
-                    and self.spec_info.allocate_lens is not None
-                ):
-                    # Explicitly convert to numpy to avoid JAX device synchronization overhead
-                    allocated_len_cpu = np.array(self.spec_info.allocate_lens)
-                    allocated_len = allocated_len_cpu[: len(self.reqs)]
-                    aligned_lengths = ((allocated_len + page_size - 1) // page_size) * page_size
-                    alread_allocated_lens = allocated_len
-                else:
-                    aligned_lengths = ((valid_seq_lens + page_size - 1) // page_size) * page_size
-                    alread_allocated_lens = valid_seq_lens
-                total_aligned_length = np.sum(aligned_lengths)
-
-                # Pre-allocate the result array
-                cache_loc_flat = np.zeros(total_aligned_length, dtype=np.int32)
-
-                # Vectorized filling of cache_loc_flat
-                # Calculate destination offsets for each block (where each block starts in cache_loc_flat)
-                dst_offsets = np.concatenate(([0], np.cumsum(aligned_lengths)[:-1]))
-
-                # We need to copy 'alread_allocated_lens' elements for each request
-                repeats = alread_allocated_lens
-                total_elements = np.sum(repeats)
-
-                if total_elements > 0:
-                    # 1. Generate Source Indices (row, col) for token_indices_with_all_reqs
-                    row_indices = np.repeat(valid_indices, repeats)
-
-                    # Generate col indices: 0..len-1 for each row
-                    # Using the shift trick: global_range - block_start_offsets
-                    block_starts = np.concatenate(([0], np.cumsum(repeats)[:-1]))
-                    shifts = np.repeat(block_starts, repeats)
-                    col_indices = np.arange(total_elements) - shifts
-
-                    # Extract source data
-                    source_data = token_indices_with_all_reqs[row_indices, col_indices]
-
-                    # 2. Generate Destination Indices for cache_loc_flat
-                    # Base offset for each block + local col index
-                    dst_base_offsets = np.repeat(dst_offsets, repeats)
-                    dst_indices = dst_base_offsets + col_indices
-
-                    # Assign
-                    cache_loc_flat[dst_indices] = source_data
-
-        if precision_tracer.get_trace_active():
-            self._generate_trace_info(real_bs, bid)
-        # Extract lora_ids from requests
-        lora_ids = [req.lora_id for req in self.reqs]
-
-        return ModelWorkerBatch(
-            bid=bid,
-            forward_mode=self.forward_mode,
-            input_ids=input_ids_cpu,
-            real_input_ids_len=real_input_ids_len,
-            req_pool_indices=req_pool_indices_cpu,
-            seq_lens=seq_lens_cpu,
-            out_cache_loc=out_cache_loc_cpu,
-            return_logprob=self.return_logprob,
-            return_output_logprob_only=self.return_output_logprob_only,
-            top_logprobs_nums=self.top_logprobs_nums,
-            token_ids_logprobs=self.token_ids_logprobs,
-            sampling_info=self._merge_sampling_info(real_bs, real_bs),
-            positions=positions_cpu,
-            mrope_positions=mrope_positions_cpu,
-            cache_loc=cache_loc_flat,
-            extend_prefix_lens=(extend_prefix_lens if self.forward_mode.is_extend() else None),
-            extend_seq_lens=(extend_seq_lens if self.forward_mode.is_extend() else None),
-            extend_logprob_start_lens=extend_logprob_start_lens,
-            extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
-            logits_indices=logits_indices,
-            lora_ids=lora_ids,
-            real_bs=real_bs,
-            real_bs_per_dp=[real_bs],
-            dp_size=self.dp_size,
-            per_dp_bs_size=real_bs,
-            logits_indices_selector=np.arange(real_bs, dtype=np.int32),
-            capture_hidden_mode=(
-                CaptureHiddenMode.FULL
-                if self.return_hidden_states
-                else (
-                    getattr(self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL)
-                    if self.spec_info
-                    else CaptureHiddenMode.NULL
-                )
-            ),
-            launch_done=self.launch_done,
-            spec_info=self.spec_info,
-            spec_algorithm=self.spec_algorithm,
-            tree_cache=self.tree_cache,
-        )
+        assert (
+            self.forward_mode.is_decode_or_idle()
+        ), "spec extend must use get_model_worker_batch, only decode reaches here"
+        return self._get_spec_decode_mwb_dp(bs_paddings, enable_static_lora, draft_token_num)
 
     def _generate_trace_info(self, real_bs: int, bid: int) -> list[str]:
         """Generate trace information for requests (unified for all dp_size >= 1)."""
@@ -2865,7 +2924,11 @@ class ModelWorkerBatch:
     # Pre-initialized ForwardBatch for overlap scheduling optimization
     forward_batch: Any | None = None
 
-    spec_info: EagleDraftInput | EagleVerifyInput | None = None
+    # Cross-rank-flat (or scatter-padded under dp>1) spec input at forward
+    # entry. Forward internals may mutate it through EagleVerifyInput before
+    # returning a fresh EagleDraftInput. Scheduler-persisted per-rank spec
+    # state lives on ScheduleBatch.reqs_info[r].spec_info.
+    spec_info_padded: EagleDraftInput | EagleVerifyInput | None = None
     spec_algorithm: SpeculativeAlgorithm = None
     speculative_num_steps: int = 0
     speculative_eagle_topk: int = 0

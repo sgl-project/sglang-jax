@@ -243,23 +243,42 @@ class SchedulerOutputProcessorMixin:
             cache_miss_count,
         )
 
-        batch.spec_info = result.next_draft_input
+        if result.next_draft_input is not None:
+            real_bs_per_dp = [len(info.reqs) if info.reqs else 0 for info in batch.reqs_info]
+            per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
+                result.next_draft_input, real_bs_per_dp
+            )
+            for r, s in enumerate(per_rank_spec):
+                batch.reqs_info[r].spec_info = s
 
     def _resolve_spec_decode_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> list[list[int]]:
-        """Resolve the padding next token ids for speculative decoding with overlap."""
+        """Resolve per-req accepted token lists from the verify output.
 
-        next_token_ids = result.next_token_ids
-        accept_lens = result.accept_lens.tolist()
-        result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
-        predict_tokens = []
+        Returns a list of length ``per_dp_bs * dp_size`` (DP-padded order),
+        with ``[]`` at padding slots, so the per-rank slice in
+        ``process_batch_result_decode`` works for any ``dp_size``.
+        """
+        next_token_ids = np.asarray(jax.device_get(result.next_token_ids))
+        accept_lens = np.asarray(jax.device_get(result.accept_lens)).tolist()
         stride = self.draft_worker.speculative_num_draft_tokens
-        for i, req in enumerate(batch.reqs):
-            predict_tokens.append(next_token_ids[i * stride : i * stride + accept_lens[i]])
-            req.spec_verify_ct += 1
-            req.spec_accepted_tokens += accept_lens[i]
-
+        per_dp_bs = batch.per_dp_bs_size
+        total_bs = per_dp_bs * batch.dp_size
+        predict_tokens: list[list[int]] = [[] for _ in range(total_bs)]
+        n_real = 0
+        total_accepted = 0
+        for dp_rank, info in enumerate(batch.reqs_info):
+            base = dp_rank * per_dp_bs
+            for j, req in enumerate(info.reqs or []):
+                i = base + j
+                a = accept_lens[i]
+                predict_tokens[i] = next_token_ids[i * stride : i * stride + a].tolist()
+                req.spec_verify_ct += 1
+                req.spec_accepted_tokens += a
+                total_accepted += a
+                n_real += 1
+        result.num_accepted_tokens = total_accepted - n_real
         return predict_tokens
 
     def process_batch_result_decode(
@@ -350,8 +369,11 @@ class SchedulerOutputProcessorMixin:
                 if req.finished():
                     self.maybe_collect_routed_experts(req)
                     if batch.spec_algorithm is not None and batch.spec_algorithm.is_eagle():
-                        cur_allocate_len = info.spec_info.allocate_lens[i]
-                        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+                        cur_allocate_len = int(info.spec_info.allocate_lens[i])
+                        actual_token_len = len(req.origin_input_ids) + max(
+                            len(req.output_ids) - 1, 0
+                        )
+                        all_token_len = actual_token_len
                         if self.page_size > 1:
                             all_token_len = cdiv(all_token_len, self.page_size) * self.page_size
                         kv_indices = self.req_to_token_pool.req_to_token[
@@ -366,6 +388,16 @@ class SchedulerOutputProcessorMixin:
                         ), f"redundant kv indices {len(kv_indices)=} should less than {EagleDraftInput.ALLOC_LEN_PER_DECODE=}"
 
                         self.token_to_kv_pool_allocator.free(kv_indices, dp_rank)
+                        # Spec decode allocates via EagleDraftInput.prepare_for_decode,
+                        # not ScheduleBatch.prepare_for_decode, so kv_committed_len is
+                        # never bumped past prefill. cache_finished_req would then
+                        # free only the prefill page and leak every decode-allocated
+                        # page (visible on idle check_memory at bs=1). Use the
+                        # *unaligned* actual token count: ChunkCache.cache_finished_req
+                        # does NOT filter 0-valued req_to_token entries, so a
+                        # page-aligned length would free the page-0 sentinel.
+                        req.kv_committed_len = actual_token_len
+                        req.kv_allocated_len = actual_token_len
                     # End trace for finished request
                     if precision_tracer.get_trace_active():
                         precision_tracer.set_request_status_to_completed(req.rid)

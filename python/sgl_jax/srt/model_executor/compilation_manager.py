@@ -256,6 +256,16 @@ class CompilationManager:
             ModelWorkerSamplingInfo,
         )
         from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
+        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        # Runtime ScheduleBatch.spec_algorithm is always SpeculativeAlgorithm
+        # enum (.from_string(None) -> .NONE). Default to .NONE so the dummy
+        # batch's pytree aux matches and precompile shares the cache key with
+        # the no-spec runtime path.
+        if speculative_algorithm is None:
+            spec_algorithm_value = SpeculativeAlgorithm.NONE
+        else:
+            spec_algorithm_value = speculative_algorithm
 
         valid_input_ids = np.array([1] * bs, dtype=jnp.int32)
         invalid_input_ids = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
@@ -305,11 +315,11 @@ class CompilationManager:
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL if self.multimodal else CaptureHiddenMode.NULL
             ),
-            spec_algorithm=speculative_algorithm,
+            spec_algorithm=spec_algorithm_value,
             lora_ids=lora_ids,
             dp_size=dp_size,
             per_dp_bs_size=per_dp_bs_size,
-            real_bs_per_dp=[bs] * dp_size,
+            real_bs_per_dp=[per_dp_bs_size] * dp_size,
             logits_indices_selector=np.arange(bs, dtype=np.int32),
             # Hybrid recurrent backends (e.g. KDA) require these per-batch
             # arrays even at precompile time; slot 0 is RecurrentStatePool's
