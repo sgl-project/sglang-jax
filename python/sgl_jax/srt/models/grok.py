@@ -625,6 +625,7 @@ class Grok1DecoderLayer(nnx.Module):
         # Self-attention
         rope_theta = getattr(config, "rope_theta", 10000)
         enable_sequence_parallel = getattr(config, "enable_sequence_parallel", False)
+        self.enable_sequence_parallel = enable_sequence_parallel
         block_input_sharding = NamedSharding(mesh, P()) if enable_sequence_parallel else None
         self.self_attn = Grok1Attention(
             config=config,
@@ -730,6 +731,9 @@ class Grok1DecoderLayer(nnx.Module):
         deferred_norm: RMSNorm | None = None,
         dispatch_info: ExpertLocationMetadata | None = None,
     ) -> tuple[jax.Array, jax.Array, RMSNorm, jax.Array, jax.Array | None]:
+        reduce_sharding = make_reduce_sharding(
+            hidden_states, self.mesh, enable_sp=self.enable_sequence_parallel
+        )
 
         # Self Attention block (matching PyTorch logic exactly)
         if deferred_norm is not None:
@@ -756,6 +760,9 @@ class Grok1DecoderLayer(nnx.Module):
             token_to_kv_pool=token_to_kv_pool,
         )
 
+        # Align residual with attn output sharding before the fused add inside dual_rmsnorm_forward.
+        residual = jax.sharding.reshard(residual, reduce_sharding)
+
         # # Apply post-attention norm and pre-MoE norm (matching PyTorch fused_dual_residual_rmsnorm)
         assert self.post_attn_norm.scale is not None
         assert self.pre_moe_norm.scale is not None
@@ -775,6 +782,8 @@ class Grok1DecoderLayer(nnx.Module):
                 hidden_states,
                 dispatch_info=dispatch_info,
             )
+
+        residual = jax.sharding.reshard(residual, reduce_sharding)
 
         # Return with deferred post-MoE norm (matching PyTorch)
         return (
