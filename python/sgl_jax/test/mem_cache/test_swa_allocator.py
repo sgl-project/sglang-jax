@@ -699,6 +699,8 @@ class TestSWAOverlapSafety(CustomTestCase):
                 # for the cached portion (len_{k-1} after iter k-1's process).
                 req.prefix_indices = full_row[:cumulative].copy()
                 req.extend_batch_idx = k
+                # Sync batch-level prefix_lens (used by maybe_evict_swa)
+                batch.reqs_info[0].prefix_lens = [cumulative]
 
                 batch.maybe_evict_swa()
 
