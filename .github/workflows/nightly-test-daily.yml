@@ -18,6 +18,9 @@ concurrency:
   group: nightly-test-daily-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
 
   nightly-test-accuracy-text-models-1-tpu-daily:
