@@ -1353,34 +1353,47 @@ class ScheduleBatch:
                 if not info.reqs:
                     continue
                 for req in info.reqs:
-                    if req.decode_batch_idx % evict_interval == 1:
-                        self._evict_swa(
-                            req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
-                        )
+                    if isinstance(self.tree_cache, ChunkCache):
+                        # ChunkCache/SWAChunkCache: no tree-node overlap concern,
+                        # evict on every decode step to prevent SWA exhaustion.
+                        # TODO(PD-disagg): evicting at decode_batch_idx==0 may
+                        # conflict with KV transfer in a future PD disaggregation
+                        # pipeline; revisit when implementing PD.
+                        if req.decode_batch_idx % evict_interval == 0:
+                            self._evict_swa(
+                                req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
+                            )
+                    else:
+                        # SWARadixCache: skip decode_batch_idx==0 in overlap mode
+                        # because the previous extend batch may still be running.
+                        if req.decode_batch_idx % evict_interval == 1:
+                            self._evict_swa(
+                                req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
+                            )
             return
 
         if self.forward_mode is None or not self.forward_mode.is_extend():
             return
 
-        # Only do per-request SWA eviction during extend for ChunkCache.
-        # For SWARadixCache, extend-time ownership stays with the tree and
-        # eviction is deferred to tree insert / tree-pressure handling.
+        # For SWARadixCache with active tree, extend-time SWA ownership stays
+        # with the tree — eviction is deferred to tree insert / pressure handling.
+        # ChunkCache and SWAChunkCache need direct per-request eviction.
         if not isinstance(self.tree_cache, ChunkCache):
             return
 
         chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
         for dp_rank, info in enumerate(self.reqs_info):
-            if not info.reqs:
+            if not info.reqs or not info.prefix_lens:
                 continue
-            for req in info.reqs:
-                pre_len = len(req.prefix_indices)
-                if (
-                    self.enable_overlap
-                    and req.is_chunked > 0
-                    and chunked_prefill_size is not None
-                    and chunked_prefill_size > 0
-                ):
-                    pre_len -= chunked_prefill_size
+            for idx, req in enumerate(info.reqs):
+                pre_len = info.prefix_lens[idx]
+                if self.enable_overlap:
+                    # In overlap mode, the previous extend batch is still running
+                    # when we schedule/evict, so skip the first two extend batches.
+                    if req.extend_batch_idx < 2:
+                        continue
+                    if chunked_prefill_size is not None and chunked_prefill_size > 0:
+                        pre_len -= chunked_prefill_size
                 self._evict_swa(req, pre_len, sliding_window_size, page_size, dp_rank)
 
     def _evict_swa(
