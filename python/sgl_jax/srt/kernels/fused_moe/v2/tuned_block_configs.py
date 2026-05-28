@@ -54,7 +54,10 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
 # fmt: on
 
 DEFAULT_V2_BLOCK_CONFIG = FusedMoEBlockConfig(
-    bt=32, bf=512, btc=32, bse=256,
+    bt=32,
+    bf=512,
+    btc=32,
+    bse=256,
 )
 
 

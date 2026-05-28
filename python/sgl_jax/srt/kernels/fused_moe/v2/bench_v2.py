@@ -26,6 +26,7 @@ Env vars:
   BENCH_CHECK   — 1 to run correctness check (single-host only)
   BENCH_D/F/E/TOPK — model dims (default: MiMo V2 Pro)
 """
+
 from __future__ import annotations
 
 import gzip
@@ -39,9 +40,9 @@ import sys
 import time
 from typing import Any
 
-import numpy as np
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 
 t0 = time.time()
@@ -56,6 +57,7 @@ def log(msg):
 # ---------------------------------------------------------------------------
 # Trace timing (mirrors benchmark/utils.py)
 # ---------------------------------------------------------------------------
+
 
 def _load_trace(trace_root: str) -> dict[str, Any]:
     trace_dir = pathlib.Path(trace_root) / "plugins" / "profile"
@@ -81,8 +83,9 @@ def _extract_durations_ms(trace: dict[str, Any]) -> list[float]:
     Matches events by kernel name regex (same approach as v1 bench),
     extracts device_duration_ps for accurate on-device timing.
     """
-    matched = [e for e in trace.get("traceEvents", [])
-               if "name" in e and KERNEL_NAME_RE.match(e["name"])]
+    matched = [
+        e for e in trace.get("traceEvents", []) if "name" in e and KERNEL_NAME_RE.match(e["name"])
+    ]
     if not matched:
         return []
     by_pid: dict[int, list[dict[str, Any]]] = {}
@@ -166,6 +169,7 @@ def split_timeit(run_fn, warmup: int, iters: int) -> tuple[list[float], list[flo
 # Env parsing helpers
 # ---------------------------------------------------------------------------
 
+
 def parse_csv_int(env_key: str, default: list[int]) -> list[int]:
     v = os.environ.get(env_key)
     if v is None:
@@ -216,7 +220,7 @@ def align_local_tokens_for_v2(local_num_tokens: int) -> int:
 jax.distributed.initialize()
 log(f"initialized: {jax.device_count()} devices, {jax.process_count()} procs")
 
-from kernel import fused_ep_moe_v2, ref_moe, FusedMoEBlockConfig
+from kernel import FusedMoEBlockConfig, fused_ep_moe_v2, ref_moe
 
 P = jax.sharding.PartitionSpec
 num_devices = jax.device_count()
@@ -241,10 +245,12 @@ use_wall = os.environ.get("BENCH_WALL", "0") == "1"
 use_split = os.environ.get("BENCH_SPLIT", "0") == "1"
 direct_scaled_dot = os.environ.get("BENCH_DIRECT_SCALED_DOT", "0") == "1"
 direct_scaled_dot_ffn1_modes = parse_csv_bool(
-    "BENCH_DIRECT_SCALED_DOT_FFN1", [direct_scaled_dot],
+    "BENCH_DIRECT_SCALED_DOT_FFN1",
+    [direct_scaled_dot],
 )
 direct_scaled_dot_ffn2_modes = parse_csv_bool(
-    "BENCH_DIRECT_SCALED_DOT_FFN2", [direct_scaled_dot],
+    "BENCH_DIRECT_SCALED_DOT_FFN2",
+    [direct_scaled_dot],
 )
 cast_ffn1_input_fp8 = os.environ.get("BENCH_CAST_FFN1_INPUT_FP8", "0") == "1"
 cast_ffn2_input_fp8 = os.environ.get("BENCH_CAST_FFN2_INPUT_FP8", "0") == "1"
@@ -258,10 +264,12 @@ next_w2_prologue_priorities = parse_csv_int("BENCH_NEXT_W2_PRIORITY", [1])
 w2_fetch_orders = parse_csv_str("BENCH_W2_FETCH_ORDER", ["after_w13"])
 w2_fetch_priorities = parse_csv_int("BENCH_W2_FETCH_PRIORITY", [1])
 skip_inter_bt_sync_modes = parse_csv_bool(
-    "BENCH_SKIP_INTER_BT_SYNC", [True],
+    "BENCH_SKIP_INTER_BT_SYNC",
+    [True],
 )
 interleave_bt_modes = parse_csv_bool(
-    "BENCH_INTERLEAVE_BT", [True],
+    "BENCH_INTERLEAVE_BT",
+    [True],
 )
 valid_ffn1_dequant_modes = {"full", "fchunk"}
 invalid_ffn1_dequant_modes = [
@@ -274,8 +282,7 @@ if invalid_ffn1_dequant_modes:
     )
 valid_cross_expert_prefetch_modes = {"none", "full", "w13"}
 invalid_modes = [
-    mode for mode in cross_expert_prefetch_modes
-    if mode not in valid_cross_expert_prefetch_modes
+    mode for mode in cross_expert_prefetch_modes if mode not in valid_cross_expert_prefetch_modes
 ]
 if invalid_modes:
     raise ValueError(
@@ -284,10 +291,7 @@ if invalid_modes:
     )
 invalid_priorities = [
     priority
-    for priority in (
-        list(next_w2_prologue_priorities)
-        + list(w2_fetch_priorities)
-    )
+    for priority in (list(next_w2_prologue_priorities) + list(w2_fetch_priorities))
     if priority not in (0, 1)
 ]
 if invalid_priorities:
@@ -296,9 +300,7 @@ if invalid_priorities:
         "TPU DMA priority supports only 0 or 1."
     )
 valid_w2_fetch_orders = {"after_w13", "before_w13"}
-invalid_w2_fetch_orders = [
-    mode for mode in w2_fetch_orders if mode not in valid_w2_fetch_orders
-]
+invalid_w2_fetch_orders = [mode for mode in w2_fetch_orders if mode not in valid_w2_fetch_orders]
 if invalid_w2_fetch_orders:
     raise ValueError(
         f"Unsupported BENCH_W2_FETCH_ORDER values {invalid_w2_fetch_orders}; "
@@ -353,12 +355,8 @@ disable_expert_store = all_disable or os.environ.get("DISABLE_EXPERT_STORE", "0"
 disable_expert_stage_writeback = (
     all_disable or os.environ.get("DISABLE_EXPERT_STAGE_WRITEBACK", "0") == "1"
 )
-disable_expert_store_dma = (
-    all_disable or os.environ.get("DISABLE_EXPERT_STORE_DMA", "0") == "1"
-)
-disable_expert_store_wait = (
-    all_disable or os.environ.get("DISABLE_EXPERT_STORE_WAIT", "0") == "1"
-)
+disable_expert_store_dma = all_disable or os.environ.get("DISABLE_EXPERT_STORE_DMA", "0") == "1"
+disable_expert_store_wait = all_disable or os.environ.get("DISABLE_EXPERT_STORE_WAIT", "0") == "1"
 disable_acc_and_store = all_disable or os.environ.get("DISABLE_ACC_AND_STORE", "0") == "1"
 disable_acc_load = all_disable or os.environ.get("DISABLE_ACC_LOAD", "0") == "1"
 disable_acc_compute = all_disable or os.environ.get("DISABLE_ACC_COMPUTE", "0") == "1"
@@ -399,23 +397,16 @@ if active_ablation:
 if direct_scaled_dot:
     log("direct_scaled_dot=True (fp8 dot per quant group, scale after dot)")
 if cast_ffn1_input_fp8 or cast_ffn2_input_fp8:
-    log(
-        "input cast controls: "
-        f"ffn1_fp8={cast_ffn1_input_fp8} ffn2_fp8={cast_ffn2_input_fp8}"
-    )
-if (
-    direct_scaled_dot_ffn1_modes != [direct_scaled_dot]
-    or direct_scaled_dot_ffn2_modes != [direct_scaled_dot]
-):
+    log("input cast controls: " f"ffn1_fp8={cast_ffn1_input_fp8} ffn2_fp8={cast_ffn2_input_fp8}")
+if direct_scaled_dot_ffn1_modes != [direct_scaled_dot] or direct_scaled_dot_ffn2_modes != [
+    direct_scaled_dot
+]:
     log(
         "direct_scaled_dot hybrid sweep: "
         f"ffn1={direct_scaled_dot_ffn1_modes} ffn2={direct_scaled_dot_ffn2_modes}"
     )
 if ffn1_dequant_modes != ["full"] or ffn1_dequant_chunks != [None]:
-    log(
-        "ffn1_dequant sweep: "
-        f"mode={ffn1_dequant_modes} chunk={ffn1_dequant_chunks}"
-    )
+    log("ffn1_dequant sweep: " f"mode={ffn1_dequant_modes} chunk={ffn1_dequant_chunks}")
 if inkernel_metadata:
     log("inkernel_metadata=True (in-kernel ICI allgather, no JAX lax.all_gather)")
 if enable_bt_scatter_overlap:
@@ -425,10 +416,7 @@ log(
     f"{cross_expert_prefetch_modes} next_w2_priority={next_w2_prologue_priorities}"
 )
 if w2_fetch_orders != ["after_w13"] or w2_fetch_priorities != [1]:
-    log(
-        "w2_fetch sweep: "
-        f"order={w2_fetch_orders} priority={w2_fetch_priorities}"
-    )
+    log("w2_fetch sweep: " f"order={w2_fetch_orders} priority={w2_fetch_priorities}")
 if skip_inter_bt_sync_modes != [True]:
     log(f"skip_inter_bt_sync sweep: {skip_inter_bt_sync_modes}")
 if interleave_bt_modes != [True]:
@@ -563,26 +551,31 @@ def _estimate_vmem_bytes_v2(
     # Scoped metadata temporaries (run_scoped, only one path active)
     local_num_experts = num_experts // ep_size
     b_scoped = (
-        bt * padded_top_k * 4          # t2e_routing
+        bt * padded_top_k * 4  # t2e_routing
         + ep_size * padded_num_experts * 4  # d2e_count
-        + 2 * padded_num_experts * 4    # expert_offsets
-        + padded_num_experts * 4        # expert_starts
-        + padded_num_experts * 4        # expert_sizes
+        + 2 * padded_num_experts * 4  # expert_offsets
+        + padded_num_experts * 4  # expert_starts
+        + padded_num_experts * 4  # expert_sizes
     )
 
     # Semaphore overhead (conservative flat estimate)
     num_bt_banks = num_bt if use_gather_bank else (2 if use_bt_scatter_bank else 1)
     b_sems = (
-        2 * 4           # x_stage + y_store (1 each)
+        2 * 4  # x_stage + y_store (1 each)
         + smem_banks * 10 * 4  # local_sems
-        + 3 * (num_bt_banks * local_num_experts * 4 if (use_bt_scatter_bank or use_gather_bank) else local_num_experts * 4)
+        + 3
+        * (
+            num_bt_banks * local_num_experts * 4
+            if (use_bt_scatter_bank or use_gather_bank)
+            else local_num_experts * 4
+        )
         + (num_bt_banks * 4 if use_gather_bank else 4)  # a2a_gather
-        + 3 * 4         # a2a_acc + md_send + md_recv + barrier
+        + 3 * 4  # a2a_acc + md_send + md_recv + barrier
     )
 
     # SMEM (not VMEM, but allocated alongside — counts toward compiler budget)
     b_smem = (
-        smem_banks * bt * padded_top_k * 4     # t2e_routing smem
+        smem_banks * bt * padded_top_k * 4  # t2e_routing smem
         + smem_banks * ep_size * padded_num_experts * 4  # d2e_count smem
         + smem_banks * 2 * padded_num_experts * 4  # expert_offsets smem
         + smem_banks * padded_num_experts * 4  # expert_starts smem
@@ -590,12 +583,26 @@ def _estimate_vmem_bytes_v2(
     )
 
     total = (
-        b_a2a_g_acc + b_topk_w + b_topk_id + b_output
-        + b_w1 + b_w3 + b_w2
-        + b_w1_scale + b_w3_scale + b_w2_scale
-        + b_w1_dq + b_w3_dq + b_w2_dq
-        + b_gate_acc + b_up_acc + b_x + b_y_acc + b_y_stage
-        + b_scoped + b_sems
+        b_a2a_g_acc
+        + b_topk_w
+        + b_topk_id
+        + b_output
+        + b_w1
+        + b_w3
+        + b_w2
+        + b_w1_scale
+        + b_w3_scale
+        + b_w2_scale
+        + b_w1_dq
+        + b_w3_dq
+        + b_w2_dq
+        + b_gate_acc
+        + b_up_acc
+        + b_x
+        + b_y_acc
+        + b_y_stage
+        + b_scoped
+        + b_sems
     )
 
     if verbose:
@@ -643,10 +650,13 @@ def generate_tune_candidates(
 ):
     effective_budget = int(vmem_budget * vmem_headroom)
 
-    bf_list = sorted(set(
-        v for v in [128, 256, 512, 1024, 2048]
-        if v <= intermediate_size and intermediate_size % v == 0
-    ))
+    bf_list = sorted(
+        set(
+            v
+            for v in [128, 256, 512, 1024, 2048]
+            if v <= intermediate_size and intermediate_size % v == 0
+        )
+    )
 
     bt_list = []
     for p_val in [2, 4]:
@@ -675,10 +685,13 @@ def generate_tune_candidates(
         exp_ceil8 = _align_to(int(math.ceil(expected)), 8)
         # 1.25x expected covers routing imbalance
         exp_hi8 = _align_to(int(math.ceil(expected * 1.25)), 8)
-        bts_cands = sorted({
-            v for v in [bt, lo, hi, hi * 2, exp_floor8, exp_ceil8, exp_hi8]
-            if 0 < v <= max_bts and v % 8 == 0
-        })
+        bts_cands = sorted(
+            {
+                v
+                for v in [bt, lo, hi, hi * 2, exp_floor8, exp_ceil8, exp_hi8]
+                if 0 < v <= max_bts and v % 8 == 0
+            }
+        )
         if not bts_cands:
             bts_cands = [bt]
 
@@ -690,12 +703,17 @@ def generate_tune_candidates(
             for bf in bf_list:
                 for btc in btc_cands:
                     bc = FusedMoEBlockConfig(
-                        bt=bt, bf=bf, btc=btc, bse=bse, bts=bts_val,
+                        bt=bt,
+                        bf=bf,
+                        btc=btc,
+                        bse=bse,
+                        bts=bts_val,
                     )
                     num_tokens_total = local_num_tokens * ep_size
                     try:
                         bc_eff = bc.effective_for(
-                            num_tokens=num_tokens_total, ep_size=ep_size,
+                            num_tokens=num_tokens_total,
+                            ep_size=ep_size,
                         )
                     except ValueError:
                         continue
@@ -706,12 +724,16 @@ def generate_tune_candidates(
                     seen.add(key)
 
                     est = _estimate_vmem_bytes_v2(
-                        bt=bc_eff.bt, bf=bc_eff.bf, btc=bc_eff.btc,
-                        bse=bc_eff.bse, bts=bc_eff.bts,
+                        bt=bc_eff.bt,
+                        bf=bc_eff.bf,
+                        btc=bc_eff.btc,
+                        bse=bc_eff.bse,
+                        bts=bc_eff.bts,
                         hidden_size=hidden_size,
                         intermediate_size=intermediate_size,
                         num_experts=num_experts,
-                        top_k=top_k, ep_size=ep_size,
+                        top_k=top_k,
+                        ep_size=ep_size,
                         num_tokens=num_tokens_total,
                         use_fp8=use_fp8,
                         quant_block_k=quant_block_k,
@@ -777,7 +799,9 @@ ep_sharding = jax.sharding.NamedSharding(mesh, P(("data", "tensor")))
 log(f"model: E={E} d={d} f={f} k={top_k} ep={ep_size} fp8={use_fp8}")
 if routing_mode != "random":
     log(f"routing_mode={routing_mode}")
-log(f"sweep: tokens={token_candidates} bt={bt_candidates} bf={bf_candidates} btc={btc_candidates} bts={bts_candidates}")
+log(
+    f"sweep: tokens={token_candidates} bt={bt_candidates} bf={bf_candidates} btc={btc_candidates} bts={bts_candidates}"
+)
 
 # --- Create weight arrays (shared across token counts) ---
 key = jax.random.key(42)
@@ -790,7 +814,8 @@ def make_sharded(rng_key, shape, dtype, scale=1.0):
     for i, dev in enumerate(jax.local_devices()):
         shard_key = jax.random.fold_in(rng_key, jax.process_index() * len(jax.local_devices()) + i)
         shard = jax.device_put(
-            jax.random.normal(shard_key, local_shape, dtype=dtype) * scale, dev,
+            jax.random.normal(shard_key, local_shape, dtype=dtype) * scale,
+            dev,
         )
         per_device_arrays.append(shard)
     return jax.make_array_from_single_device_arrays(shape, ep_sharding, per_device_arrays)
@@ -810,10 +835,14 @@ def make_deterministic_topk(num_tokens, top_k, num_experts):
         per_device_ids.append(jax.device_put(ids, dev))
         per_device_weights.append(jax.device_put(weights, dev))
     topk_ids = jax.make_array_from_single_device_arrays(
-        (num_tokens, top_k), ep_sharding, per_device_ids,
+        (num_tokens, top_k),
+        ep_sharding,
+        per_device_ids,
     )
     topk_weights = jax.make_array_from_single_device_arrays(
-        (num_tokens, top_k), ep_sharding, per_device_weights,
+        (num_tokens, top_k),
+        ep_sharding,
+        per_device_weights,
     )
     return topk_weights, topk_ids
 
@@ -836,10 +865,14 @@ def make_hot_expert_topk(num_tokens, top_k, num_experts, hot_frac=0.1, hot_load=
         per_device_ids.append(jax.device_put(ids, dev))
         per_device_weights.append(jax.device_put(weights, dev))
     topk_ids = jax.make_array_from_single_device_arrays(
-        (num_tokens, top_k), ep_sharding, per_device_ids,
+        (num_tokens, top_k),
+        ep_sharding,
+        per_device_ids,
     )
     topk_weights = jax.make_array_from_single_device_arrays(
-        (num_tokens, top_k), ep_sharding, per_device_weights,
+        (num_tokens, top_k),
+        ep_sharding,
+        per_device_weights,
     )
     return topk_weights, topk_ids
 
@@ -855,6 +888,7 @@ if use_fp8:
     log(f"quantizing weights to fp8 (quant_block_k={quant_block_k})...")
 
     if quant_block_k is None:
+
         @jax.jit
         @jax.shard_map(
             mesh=mesh,
@@ -871,7 +905,9 @@ if use_fp8:
             w_q = (w_f32 / scale).astype(jnp.float8_e4m3fn)
             scale = scale[:, :, None, :]  # (E, 1, N) -> (E, 1, 1, N)
             return w_q, scale.astype(jnp.float32)
+
     else:
+
         @jax.jit
         @jax.shard_map(
             mesh=mesh,
@@ -882,7 +918,9 @@ if use_fp8:
         def quantize_shard_map(w):
             local_w = w
             E_loc, K_dim, N_dim = local_w.shape
-            w_f32 = local_w.astype(jnp.float32).reshape(E_loc, K_dim // quant_block_k, quant_block_k, N_dim)
+            w_f32 = local_w.astype(jnp.float32).reshape(
+                E_loc, K_dim // quant_block_k, quant_block_k, N_dim
+            )
             amax = jnp.max(jnp.abs(w_f32), axis=2, keepdims=True)
             scale = jnp.maximum(amax / 448.0, jnp.float32(1e-12))
             w_q = (w_f32 / scale).astype(jnp.float8_e4m3fn)
@@ -907,7 +945,12 @@ for num_tokens in token_candidates:
         local_nt = num_tokens // ep_size
         padded_local_nt = align_local_tokens_for_v2(local_nt)
         tune_configs = generate_tune_candidates(
-            f, d, padded_local_nt, ep_size, E, top_k,
+            f,
+            d,
+            padded_local_nt,
+            ep_size,
+            E,
+            top_k,
             use_fp8=use_fp8,
             quant_block_k=quant_block_k,
             direct_scaled_dot=direct_scaled_dot,
@@ -921,7 +964,10 @@ for num_tokens in token_candidates:
         block_configs_to_try = [
             FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse, bts=bts)
             for bt, bf, btc, bts in itertools.product(
-                bt_candidates, bf_candidates, btc_candidates, bts_candidates,
+                bt_candidates,
+                bf_candidates,
+                btc_candidates,
+                bts_candidates,
             )
         ]
 
@@ -935,11 +981,16 @@ for num_tokens in token_candidates:
         gating_per_dev = []
         for i, dev in enumerate(jax.local_devices()):
             shard_key = jax.random.fold_in(k5, jax.process_index() * len(jax.local_devices()) + i)
-            gating_per_dev.append(jax.device_put(
-                jax.random.normal(shard_key, gating_local_shape, dtype=jnp.float32), dev,
-            ))
+            gating_per_dev.append(
+                jax.device_put(
+                    jax.random.normal(shard_key, gating_local_shape, dtype=jnp.float32),
+                    dev,
+                )
+            )
         gating = jax.make_array_from_single_device_arrays(
-            (num_tokens, E), ep_sharding, gating_per_dev,
+            (num_tokens, E),
+            ep_sharding,
+            gating_per_dev,
         )
         _, topk_idx = lax.top_k(gating, top_k)
         topk_logits = jnp.take_along_axis(gating, topk_idx, axis=-1)
@@ -1045,11 +1096,19 @@ for num_tokens in token_candidates:
 
         def run_fn():
             return fused_ep_moe_v2(
-                mesh, tokens, w1, w2, w3,
-                topk_wts, topk_idx, top_k,
+                mesh,
+                tokens,
+                w1,
+                w2,
+                w3,
+                topk_wts,
+                topk_idx,
+                top_k,
                 block_config=bc,
                 quant_block_k=qbk_arg,
-                w1_scale=w1_scale_s, w2_scale=w2_scale_s, w3_scale=w3_scale_s,
+                w1_scale=w1_scale_s,
+                w2_scale=w2_scale_s,
+                w3_scale=w3_scale_s,
                 disable_a2a=disable_a2a,
                 disable_a2a_scatter=disable_a2a_scatter,
                 disable_a2a_scatter_local_copy=disable_a2a_scatter_local_copy,
@@ -1102,16 +1161,27 @@ for num_tokens in token_candidates:
                     d_avg = np.mean(dispatch_times)
                     w_avg = np.mean(wait_times)
                     wall_avg = d_avg + w_avg
-                    log(f"  {tag_resolved}: wall={wall_avg:.3f}ms = dispatch={d_avg:.3f}ms + wait={w_avg:.3f}ms")
+                    log(
+                        f"  {tag_resolved}: wall={wall_avg:.3f}ms = dispatch={d_avg:.3f}ms + wait={w_avg:.3f}ms"
+                    )
                     log(f"    dispatch: {[round(t, 3) for t in dispatch_times]}")
                     log(f"    wait:     {[round(t, 3) for t in wait_times]}")
-                    results.append((num_tokens, tag_resolved, wall_avg, [d + w for d, w in zip(dispatch_times, wait_times)]))
+                    results.append(
+                        (
+                            num_tokens,
+                            tag_resolved,
+                            wall_avg,
+                            [d + w for d, w in zip(dispatch_times, wait_times)],
+                        )
+                    )
             else:
                 times = timeit_fn(run_fn, warmup=warmup, iters=iters)
                 if jax.process_index() == 0:
                     if times:
                         avg = np.mean(times)
-                        log(f"  {tag_resolved}: {avg:.3f} ms ({timing_label}) | samples={[round(t, 3) for t in times]}")
+                        log(
+                            f"  {tag_resolved}: {avg:.3f} ms ({timing_label}) | samples={[round(t, 3) for t in times]}"
+                        )
                         results.append((num_tokens, tag_resolved, avg, times))
                     else:
                         log(f"  {tag_resolved}: no timing data")
@@ -1140,28 +1210,47 @@ if check_correctness:
         log("SKIP correctness check in multi-host mode (use single-host ep=8)")
     else:
         log("computing reference...")
-        bc0 = FusedMoEBlockConfig(bt=bt_candidates[0], bf=bf_candidates[0], btc=btc_candidates[0], bse=bse, bts=bts_candidates[0])
+        bc0 = FusedMoEBlockConfig(
+            bt=bt_candidates[0],
+            bf=bf_candidates[0],
+            btc=btc_candidates[0],
+            bse=bse,
+            bts=bts_candidates[0],
+        )
         nt0 = token_candidates[0]
         tokens_c = make_sharded(k1, (nt0, d), jnp.bfloat16)
         gating_c_local = (nt0 // num_devices, E)
         gating_c_dev = []
         for i, dev in enumerate(jax.local_devices()):
             sk = jax.random.fold_in(k5, jax.process_index() * len(jax.local_devices()) + i)
-            gating_c_dev.append(jax.device_put(
-                jax.random.normal(sk, gating_c_local, dtype=jnp.float32), dev,
-            ))
+            gating_c_dev.append(
+                jax.device_put(
+                    jax.random.normal(sk, gating_c_local, dtype=jnp.float32),
+                    dev,
+                )
+            )
         gating_c = jax.make_array_from_single_device_arrays(
-            (nt0, E), ep_sharding, gating_c_dev,
+            (nt0, E),
+            ep_sharding,
+            gating_c_dev,
         )
         _, tidx = lax.top_k(gating_c, top_k)
         twts = jax.nn.softmax(jnp.take_along_axis(gating_c, tidx, axis=-1), axis=-1)
 
         result = fused_ep_moe_v2(
-            mesh, tokens_c, w1, w2, w3,
-            twts, tidx, top_k,
+            mesh,
+            tokens_c,
+            w1,
+            w2,
+            w3,
+            twts,
+            tidx,
+            top_k,
             block_config=bc0,
             quant_block_k=qbk_arg,
-            w1_scale=w1_scale_s, w2_scale=w2_scale_s, w3_scale=w3_scale_s,
+            w1_scale=w1_scale_s,
+            w2_scale=w2_scale_s,
+            w3_scale=w3_scale_s,
             direct_scaled_dot=direct_scaled_dot,
             direct_scaled_dot_ffn1=direct_scaled_dot_ffn1_modes[0],
             direct_scaled_dot_ffn2=direct_scaled_dot_ffn2_modes[0],
@@ -1184,8 +1273,13 @@ if check_correctness:
             ref_kwargs["w2_scale"] = jax.device_get(w2_scale_s)
             ref_kwargs["w3_scale"] = jax.device_get(w3_scale_s)
         ref = ref_moe(
-            jax.device_get(tokens_c), jax.device_get(w1), jax.device_get(w2), jax.device_get(w3),
-            jax.device_get(twts), jax.device_get(tidx), top_k,
+            jax.device_get(tokens_c),
+            jax.device_get(w1),
+            jax.device_get(w2),
+            jax.device_get(w3),
+            jax.device_get(twts),
+            jax.device_get(tidx),
+            top_k,
             **ref_kwargs,
         )
         result_f32 = jax.device_get(

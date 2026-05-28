@@ -210,10 +210,7 @@ class FusedEPMoE(nnx.Module):
             return
 
         # Determine quant_block_k: None → per-channel, else block-wise.
-        if self.quant_block_k is not None:
-            wsz = self.quant_block_k
-        else:
-            wsz = None
+        wsz = self.quant_block_k if self.quant_block_k is not None else None
         if hasattr(self, "quant_block_k"):
             del self.quant_block_k
         self.quant_block_k = wsz
@@ -225,11 +222,17 @@ class FusedEPMoE(nnx.Module):
                 if wsz is None:
                     # Per-channel: scale shape (E, 1, 1, N)
                     w1_scale_shape = (
-                        self.num_experts, 1, 1, self.intermediate_dim,
+                        self.num_experts,
+                        1,
+                        1,
+                        self.intermediate_dim,
                     )
                     w3_scale_shape = w1_scale_shape
                     w2_scale_shape = (
-                        self.num_experts, 1, 1, self.hidden_size,
+                        self.num_experts,
+                        1,
+                        1,
+                        self.hidden_size,
                     )
                 else:
                     # Block-wise: scale shape (E, K//block_k, 1, N)
@@ -542,10 +545,7 @@ class FusedEPMoEV2(FusedEPMoE):
         *,
         block_config=None,
     ) -> jax.Array:
-        from sgl_jax.srt.kernels.fused_moe.v2.kernel import (
-            FusedMoEBlockConfig as V2BlockConfig,
-            fused_ep_moe_v2,
-        )
+        from sgl_jax.srt.kernels.fused_moe.v2.kernel import fused_ep_moe_v2
         from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
             get_tuned_fused_moe_v2_block_config,
         )

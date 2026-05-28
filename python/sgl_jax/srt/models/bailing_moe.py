@@ -788,13 +788,11 @@ class BailingMoEForCausalLM(nnx.Module):
                         # Per-channel when no weight_block_size in quant config
                         _wbs = getattr(
                             getattr(self.config, "quantization_config", None),
-                            "weight_block_size", None,
+                            "weight_block_size",
+                            None,
                         )
                         is_per_channel = _wbs is None
-                        if is_per_channel:
-                            num_blocks = 1
-                        else:
-                            num_blocks = in_dim // BLOCK_SIZE
+                        num_blocks = 1 if is_per_channel else in_dim // BLOCK_SIZE
                         # Use physical experts count for reshape (after redundant expert cloning)
                         scale_reshape = (num_physical_experts, 1, 1, out_dim)
                         logger.info("scale_reshape: %s", scale_reshape)

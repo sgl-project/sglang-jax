@@ -11,20 +11,20 @@ Env vars:
   BENCH_ITERS   — timed iterations (default: 10)
   BENCH_D/F/E/TOPK — model dims (default: MiMo V2 Pro)
 """
+
 from __future__ import annotations
 
-import os
 import gzip
 import json
+import os
 import pathlib
 import re
-import sys
 import time
 from typing import Any
 
-import numpy as np
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 
 t0 = time.time()
@@ -38,8 +38,9 @@ def log(msg):
 jax.distributed.initialize()
 log(f"initialized: {jax.device_count()} devices, {jax.process_index()}")
 
-from sgl_jax.srt.kernels.fused_moe.v2.kernel import fused_ep_moe_v2, FusedMoEBlockConfig
 from sgl_jax.srt.kernels.fused_moe.v1 import kernel as v1_kernel
+from sgl_jax.srt.kernels.fused_moe.v2.kernel import FusedMoEBlockConfig, fused_ep_moe_v2
+
 v1_fused_ep_moe = v1_kernel.fused_ep_moe
 V1BlockConfig = v1_kernel.FusedMoEBlockConfig
 
@@ -72,32 +73,33 @@ def parse_csv_int(env_key: str, default: list[int]) -> list[int]:
         return default
     return [int(x.strip()) for x in v.split(",")]
 
+
 # Tuned configs per token count
 # V1: from tuned_block_configs.py (bt, bf, bd1, bd2, bts, btc, bfc, bd1c, bd2c, bse)
 V1_TUNED = {
-    64:   (2, 2048, 2048, 2048, 4, 4, 2048, 2048, 2048, 2048),
-    128:  (4, 2048, 2048, 2048, 8, 8, 2048, 2048, 2048, 2048),
-    256:  (8, 2048, 2048, 2048, 8, 8, 2048, 2048, 2048, 2048),
-    512:  (16, 2048, 2048, 2048, 16, 16, 2048, 2048, 2048, 2048),
+    64: (2, 2048, 2048, 2048, 4, 4, 2048, 2048, 2048, 2048),
+    128: (4, 2048, 2048, 2048, 8, 8, 2048, 2048, 2048, 2048),
+    256: (8, 2048, 2048, 2048, 8, 8, 2048, 2048, 2048, 2048),
+    512: (16, 2048, 2048, 2048, 16, 16, 2048, 2048, 2048, 2048),
     8192: (128, 1024, 2048, 2048, 64, 64, 1024, 2048, 2048, 1024),
     16384: (128, 1024, 512, 512, 128, 128, 1024, 512, 512, 1024),
 }
 # V2: from v2 tune sweep at ep=32 fp8.
 # Tuple layout accepts either (bt, bf, btc, bse) or (bt, bf, btc, bse, bts).
 V2_TUNED = {
-    64:   (8, 512, 8, 256, 8),
-    128:  (8, 256, 8, 256, 8),
-    256:  (8, 512, 8, 256, 8),
-    512:  (16, 256, 16, 256, 16),
+    64: (8, 512, 8, 256, 8),
+    128: (8, 256, 8, 256, 8),
+    256: (8, 512, 8, 256, 8),
+    512: (16, 256, 16, 256, 16),
     8192: (128, 1024, 128, 256),
     16384: (128, 1024, 128, 256),
 }
 
 V2_DIRECT_SCALED_DOT_TUNED = {
-    64:   (8, 512, 8, 256, 8),
-    128:  (8, 512, 8, 256, 8),
-    256:  (8, 512, 16, 256, 16),
-    512:  (16, 512, 16, 256, 16),
+    64: (8, 512, 8, 256, 8),
+    128: (8, 512, 8, 256, 8),
+    256: (8, 512, 16, 256, 16),
+    512: (16, 512, 16, 256, 16),
     8192: (128, 1024, 128, 256),
     16384: (128, 512, 80, 256, 160),
 }
@@ -107,7 +109,9 @@ token_candidates = parse_csv_int("BENCH_TOKENS", list(V1_TUNED.keys()))
 ep_sharding = jax.sharding.NamedSharding(mesh, P(("data", "tensor")))
 
 log(f"model: E={E} d={d} f={f} k={top_k} ep={ep_size} fp8={use_fp8}")
-log(f"tokens={token_candidates} warmup={warmup} iters={iters} timing={'trace' if use_trace else 'wall'}")
+log(
+    f"tokens={token_candidates} warmup={warmup} iters={iters} timing={'trace' if use_trace else 'wall'}"
+)
 log("metadata modes: V1=jax_out_of_kernel V2=in_kernel")
 if direct_scaled_dot:
     log("direct_scaled_dot=True")
@@ -121,7 +125,8 @@ def make_sharded(rng_key, shape, dtype, scale=1.0):
     for i, dev in enumerate(jax.local_devices()):
         shard_key = jax.random.fold_in(rng_key, jax.process_index() * len(jax.local_devices()) + i)
         shard = jax.device_put(
-            jax.random.normal(shard_key, local_shape, dtype=dtype) * scale, dev,
+            jax.random.normal(shard_key, local_shape, dtype=dtype) * scale,
+            dev,
         )
         per_device_arrays.append(shard)
     return jax.make_array_from_single_device_arrays(shape, ep_sharding, per_device_arrays)
@@ -167,7 +172,9 @@ if use_fp8:
     def quantize_shard_map(w):
         local_w = w
         E_loc, K_dim, N_dim = local_w.shape
-        w_f32 = local_w.astype(jnp.float32).reshape(E_loc, K_dim // quant_block_k, quant_block_k, N_dim)
+        w_f32 = local_w.astype(jnp.float32).reshape(
+            E_loc, K_dim // quant_block_k, quant_block_k, N_dim
+        )
         amax = jnp.max(jnp.abs(w_f32), axis=2, keepdims=True)
         scale = jnp.maximum(amax / 448.0, jnp.float32(1e-12))
         w_q = (w_f32 / scale).astype(jnp.float8_e4m3fn)
@@ -214,10 +221,11 @@ def _load_trace(trace_root: str) -> dict[str, Any]:
     return combined
 
 
-def _extract_pallas_durations_ms(trace: dict[str, Any], kernel_name_re: re.Pattern[str]) -> list[float]:
+def _extract_pallas_durations_ms(
+    trace: dict[str, Any], kernel_name_re: re.Pattern[str]
+) -> list[float]:
     matched = [
-        e for e in trace.get("traceEvents", [])
-        if "name" in e and kernel_name_re.match(e["name"])
+        e for e in trace.get("traceEvents", []) if "name" in e and kernel_name_re.match(e["name"])
     ]
     if not matched:
         return []
@@ -374,11 +382,16 @@ for num_tokens in token_candidates:
     gating_per_dev = []
     for i, dev in enumerate(jax.local_devices()):
         shard_key = jax.random.fold_in(k5, jax.process_index() * len(jax.local_devices()) + i)
-        gating_per_dev.append(jax.device_put(
-            jax.random.normal(shard_key, gating_local_shape, dtype=jnp.float32), dev,
-        ))
+        gating_per_dev.append(
+            jax.device_put(
+                jax.random.normal(shard_key, gating_local_shape, dtype=jnp.float32),
+                dev,
+            )
+        )
     gating = jax.make_array_from_single_device_arrays(
-        (num_tokens, E), ep_sharding, gating_per_dev,
+        (num_tokens, E),
+        ep_sharding,
+        gating_per_dev,
     )
     _, topk_idx = lax.top_k(gating, top_k)
     topk_logits = jnp.take_along_axis(gating, topk_idx, axis=-1)
@@ -386,20 +399,32 @@ for num_tokens in token_candidates:
 
     # --- V1 (tuned config) ---
     bt, bf, bd1, bd2, bts, btc, bfc, bd1c, bd2c, bse = V1_TUNED[num_tokens]
-    v1_bc = V1BlockConfig(bt=bt, bf=bf, bd1=bd1, bd2=bd2, btc=btc, bfc=bfc,
-                          bd1c=bd1c, bd2c=bd2c, bse=bse, bts=bts)
-    v1_bc_eff = v1_bc.effective_for(num_tokens=num_tokens, ep_size=ep_size,
-                                     dtype=jnp.bfloat16, quant_block_k=qbk_arg)
-    log(f"  V1 tuned: bt={v1_bc_eff.bt},bf={v1_bc_eff.bf},bd1={v1_bc_eff.bd1},"
-        f"bts={v1_bc_eff.bts},btc={v1_bc_eff.btc},bse={v1_bc_eff.bse}")
+    v1_bc = V1BlockConfig(
+        bt=bt, bf=bf, bd1=bd1, bd2=bd2, btc=btc, bfc=bfc, bd1c=bd1c, bd2c=bd2c, bse=bse, bts=bts
+    )
+    v1_bc_eff = v1_bc.effective_for(
+        num_tokens=num_tokens, ep_size=ep_size, dtype=jnp.bfloat16, quant_block_k=qbk_arg
+    )
+    log(
+        f"  V1 tuned: bt={v1_bc_eff.bt},bf={v1_bc_eff.bf},bd1={v1_bc_eff.bd1},"
+        f"bts={v1_bc_eff.bts},btc={v1_bc_eff.btc},bse={v1_bc_eff.bse}"
+    )
 
     def run_v1(bc=v1_bc):
         return v1_fused_ep_moe(
-            mesh, tokens, w1, w2, w3,
-            topk_wts, topk_idx, top_k,
+            mesh,
+            tokens,
+            w1,
+            w2,
+            w3,
+            topk_wts,
+            topk_idx,
+            top_k,
             block_config=bc,
             quant_block_k=qbk_arg,
-            w1_scale=w1_scale_s, w2_scale=w2_scale_s, w3_scale=w3_scale_s,
+            w1_scale=w1_scale_s,
+            w2_scale=w2_scale_s,
+            w3_scale=w3_scale_s,
             disable_all_reduce_metadata=False,
             use_jax_allreduce_metadata=True,
         )
@@ -407,7 +432,10 @@ for num_tokens in token_candidates:
     log("  V1: compiling + running...")
     if use_trace:
         v1_trace = trace_timeit(
-            run_v1, warmup, iters, re.compile(r"fused-moe-k_.*"),
+            run_v1,
+            warmup,
+            iters,
+            re.compile(r"fused-moe-k_.*"),
             f"v1_call_tokens_{num_tokens}",
             include_preceding_hlo_categories=("all-gather",),
         )
@@ -434,17 +462,27 @@ for num_tokens in token_candidates:
     pad_local = aligned_local_nt - local_nt_raw
     padded_nt = (local_nt_raw + pad_local) * ep_size if pad_local > 0 else num_tokens
     v2_bc_eff = v2_bc.effective_for(num_tokens=padded_nt, ep_size=ep_size)
-    log(f"  V2 tuned: bt={v2_bc_eff.bt},bf={v2_bc_eff.bf},"
+    log(
+        f"  V2 tuned: bt={v2_bc_eff.bt},bf={v2_bc_eff.bf},"
         f"btc={v2_bc_eff.btc},bts={v2_bc_eff.bts},bse={v2_bc_eff.bse}"
-        f"{' (padded ' + str(num_tokens) + '->' + str(padded_nt) + ')' if pad_local > 0 else ''}")
+        f"{' (padded ' + str(num_tokens) + '->' + str(padded_nt) + ')' if pad_local > 0 else ''}"
+    )
 
     def run_v2(bc=v2_bc):
         return fused_ep_moe_v2(
-            mesh, tokens, w1, w2, w3,
-            topk_wts, topk_idx, top_k,
+            mesh,
+            tokens,
+            w1,
+            w2,
+            w3,
+            topk_wts,
+            topk_idx,
+            top_k,
             block_config=bc,
             quant_block_k=qbk_arg,
-            w1_scale=w1_scale_s, w2_scale=w2_scale_s, w3_scale=w3_scale_s,
+            w1_scale=w1_scale_s,
+            w2_scale=w2_scale_s,
+            w3_scale=w3_scale_s,
             use_jax_allreduce_metadata=False,
             direct_scaled_dot=direct_scaled_dot,
         )
@@ -452,7 +490,10 @@ for num_tokens in token_candidates:
     log("  V2: compiling + running...")
     if use_trace:
         v2_trace = trace_timeit(
-            run_v2, warmup, iters, re.compile(r"fused-moe-v2-k_.*"),
+            run_v2,
+            warmup,
+            iters,
+            re.compile(r"fused-moe-v2-k_.*"),
             f"v2_call_tokens_{num_tokens}",
         )
         v2_times = v2_trace["fair"]
@@ -474,8 +515,7 @@ for num_tokens in token_candidates:
             v1_pallas_avg = np.mean(v1_pallas_times)
             v2_pallas_avg = np.mean(v2_pallas_times)
             log(
-                f"  pallas-only diagnostic: V1={v1_pallas_avg:.3f} ms "
-                f"V2={v2_pallas_avg:.3f} ms"
+                f"  pallas-only diagnostic: V1={v1_pallas_avg:.3f} ms " f"V2={v2_pallas_avg:.3f} ms"
             )
         diff = v2_avg - v1_avg
         pct = (v2_avg / v1_avg - 1) * 100

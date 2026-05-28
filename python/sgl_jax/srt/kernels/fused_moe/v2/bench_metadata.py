@@ -11,15 +11,15 @@ Env vars:
   BENCH_WARMUP  — warmup iterations (default: 3)
   BENCH_ITERS   — timed iterations (default: 20)
 """
+
 from __future__ import annotations
 
 import os
 import time
 
-import numpy as np
 import jax
 import jax.numpy as jnp
-from jax import lax
+import numpy as np
 
 t0 = time.time()
 
@@ -57,11 +57,16 @@ def make_topk_ids(num_tokens):
     per_device = []
     for i, dev in enumerate(jax.local_devices()):
         sk = jax.random.fold_in(key, jax.process_index() * len(jax.local_devices()) + i)
-        per_device.append(jax.device_put(
-            jax.random.randint(sk, local_shape, 0, E, dtype=jnp.int32), dev,
-        ))
+        per_device.append(
+            jax.device_put(
+                jax.random.randint(sk, local_shape, 0, E, dtype=jnp.int32),
+                dev,
+            )
+        )
     return jax.make_array_from_single_device_arrays(
-        (num_tokens, top_k), ep_sharding, per_device,
+        (num_tokens, top_k),
+        ep_sharding,
+        per_device,
     )
 
 
@@ -78,7 +83,12 @@ for num_tokens in token_candidates:
     )
     def metadata_fn(topk_ids):
         starts, sizes, d2e_counts = jax_allreduce_metadata_by_bt(
-            topk_ids, padded_num_experts, bt, num_devices, "data", "tensor",
+            topk_ids,
+            padded_num_experts,
+            bt,
+            num_devices,
+            "data",
+            "tensor",
         )
         return starts, sizes, d2e_counts
 
@@ -109,7 +119,9 @@ for num_tokens in token_candidates:
         d_arr = np.array(dispatch_times)
         w_arr = np.array(wait_times)
         wall_arr = d_arr + w_arr
-        log(f"  metadata: wall={np.mean(wall_arr):.3f}ms = dispatch={np.mean(d_arr):.3f}ms + wait={np.mean(w_arr):.3f}ms")
+        log(
+            f"  metadata: wall={np.mean(wall_arr):.3f}ms = dispatch={np.mean(d_arr):.3f}ms + wait={np.mean(w_arr):.3f}ms"
+        )
         log(f"    dispatch: {[round(t, 3) for t in dispatch_times]}")
         log(f"    wait:     {[round(t, 3) for t in wait_times]}")
         log(f"    wall:     {[round(t, 3) for t in wall_arr.tolist()]}")

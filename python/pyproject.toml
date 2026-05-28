@@ -135,8 +135,21 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # Pallas kernels: Python for-loops are statically unrolled at trace time,
 # so closures capturing loop variables is intentional and correct.
+# F841/SIM10x are also waived for v2/kernel.py: dimension-extracted locals
+# (hidden_size, num_bt_banks, ...) are kept inline as readable shape
+# documentation even when the current control flow doesn't consume them,
+# and the if/else cascades mirror the kernel block layout so a ternary
+# rewrite would obscure intent.
 "sgl_jax/srt/kernels/fused_moe/v1/kernel.py" = ["B023"]
+"sgl_jax/srt/kernels/fused_moe/v2/kernel.py" = ["B023", "F841", "SIM102", "SIM108"]
 "sgl_jax/srt/kernels/mla/v2/kernel.py" = ["B023"]
+# Multi-host bench / debug scripts call jax.distributed.initialize() before
+# importing kernel modules so process-rank prefixes apply to all logs;
+# this requires module-level imports below the init line.
+"sgl_jax/srt/kernels/fused_moe/v2/bench_compare.py" = ["B023", "E402"]
+"sgl_jax/srt/kernels/fused_moe/v2/bench_metadata.py" = ["E402"]
+"sgl_jax/srt/kernels/fused_moe/v2/bench_v2.py" = ["B023", "E402", "F841"]
+"sgl_jax/srt/kernels/fused_moe/v2/test_debug.py" = ["E402"]
 
 [tool.ruff.format]
 docstring-code-format = true
