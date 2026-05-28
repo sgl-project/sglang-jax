@@ -416,10 +416,12 @@ class PrefillAdder:
             _rem_tokens = min(
                 _rem_tokens, int(self.rem_swa_tokens_for_dp(dp_rank)) - self.page_size
             )
-        if _rem_tokens <= 0 and self.is_hybrid:
-            return req
+        if _rem_tokens <= 0:
+            if self.is_hybrid:
+                return req
+            _rem_tokens = self.rem_chunk_tokens_list[dp_rank]
         truncated = req.extend_input_len > _rem_tokens
-        req.extend_input_len = min(req.extend_input_len, max(_rem_tokens, 0))
+        req.extend_input_len = min(req.extend_input_len, _rem_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list[dp_rank].append(req)
         self._update_prefill_budget(
