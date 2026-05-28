@@ -626,7 +626,14 @@ class Grok1DecoderLayer(nnx.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         enable_sequence_parallel = getattr(config, "enable_sequence_parallel", False)
         self.enable_sequence_parallel = enable_sequence_parallel
-        block_input_sharding = NamedSharding(mesh, P()) if enable_sequence_parallel else None
+        # Don't force-replicate inputs at sub-module entry: when SP is on, the
+        # caller hands us hidden_states already on the SP-scattered layout, and
+        # downstream LinearBase / FusedEPMoE rely on the same axis being carried
+        # all the way through (matches qwen3_moe / mimo_v2_flash). An explicit
+        # reshard to P() here would drop that alignment and force the fused MoE
+        # kernel to consume hidden_states on a different physical layout than
+        # topk arrays, which is what triggered the v8/v10 TPU HandleFatalError.
+        block_input_sharding = None
         self.self_attn = Grok1Attention(
             config=config,
             hidden_size=self.hidden_size,
