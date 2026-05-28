@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import threading
 import zlib
-from typing import Any, Dict, Optional
+from typing import Any
 
 import jax
 
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 _GLOBAL_LOCK = threading.Lock()
-_GLOBAL_WRAPPER: Optional["JaxTransferWrapper"] = None
+_GLOBAL_WRAPPER: JaxTransferWrapper | None = None
 
 
 def _uuid_to_int(uuid: str) -> int:
@@ -44,13 +44,12 @@ def _uuid_to_int(uuid: str) -> int:
     across processes and Python versions, which is what we need for
     cross-pod pull/register pairing.
 
-    Stage 0 limitation: 32 bits gives a birthday-bound collision risk at
-    ~65k concurrent uuids. Acceptable for a single P-D pair with bounded
-    in-flight requests; Stage 1+ should widen this (e.g.
-    ``hashlib.blake2s(uuid.encode(), digest_size=8)``) or require int
-    uuids upstream. The :py:meth:`JaxTransferWrapper.register_pull`
-    duplicate check raises on str-side collisions, but cannot detect a
-    crc32 collision between two distinct str uuids — Stage 1 fixes that.
+    32 bits gives a birthday-bound collision risk at roughly 65k
+    concurrent uuids. That is acceptable for a bounded number of
+    in-flight transfers, but a wider hash would reduce the risk further.
+    The :py:meth:`JaxTransferWrapper.register_pull` duplicate check
+    catches repeated string uuids, but it cannot detect a ``crc32``
+    collision between two distinct strings.
     """
 
     return zlib.crc32(uuid.encode("utf-8")) & 0xFFFFFFFF
@@ -72,15 +71,13 @@ class JaxTransferWrapper:
         self._port = port
         self._channel_number = channel_number
         self._init_lock = threading.Lock()
-        self._server: Optional[Any] = None
+        self._server: Any | None = None
         self._started = False
-        # _pending is touched from the main thread (register_pull) and
-        # the ZMQ listener thread (release via on_done callback). Stage
-        # 0 had no listener so the dict was implicitly single-threaded;
-        # Stage 1 adds the listener and so adds the lock.
+        # ``_pending`` is mutated from ``register_pull`` and from the
+        # side-channel ack path, so access is serialized with a lock.
         self._pending_lock = threading.Lock()
-        self._pending: Dict[str, jax.Array] = {}
-        self._links: Dict[str, Any] = {}
+        self._pending: dict[str, jax.Array] = {}
+        self._links: dict[str, Any] = {}
 
     @property
     def host_ip(self) -> str:
@@ -129,8 +126,7 @@ class JaxTransferWrapper:
             )
             self._started = True
             logger.info(
-                "JaxTransferWrapper started at %s "
-                "(channel_number=%d, jax_version=%s)",
+                "JaxTransferWrapper started at %s " "(channel_number=%d, jax_version=%s)",
                 server_addr,
                 self._channel_number,
                 jax.__version__,
@@ -156,8 +152,7 @@ class JaxTransferWrapper:
 
         if not self._started:
             raise RuntimeError(
-                "JaxTransferWrapper.start() must be called before "
-                "register_pull()"
+                "JaxTransferWrapper.start() must be called before " "register_pull()"
             )
         with self._pending_lock:
             if uuid in self._pending:
@@ -172,13 +167,9 @@ class JaxTransferWrapper:
             self._server.await_pull(_uuid_to_int(uuid), data)
             self._pending[uuid] = data
         try:
-            from sgl_jax.srt.disaggregation.metrics import (
-                PD_TRANSFER_BYTES_TOTAL,
-            )
+            from sgl_jax.srt.disaggregation.metrics import PD_TRANSFER_BYTES_TOTAL
 
-            PD_TRANSFER_BYTES_TOTAL.labels(
-                direction="net", role="prefill"
-            ).inc(int(data.nbytes))
+            PD_TRANSFER_BYTES_TOTAL.labels(direction="net", role="prefill").inc(int(data.nbytes))
         except Exception:  # noqa: BLE001
             pass
 
@@ -186,7 +177,7 @@ class JaxTransferWrapper:
         self,
         uuid: str,
         spec: jax.ShapeDtypeStruct,
-        remote_addr: Optional[str] = None,
+        remote_addr: str | None = None,
     ) -> jax.Array:
         """Pull a previously registered buffer from ``remote_addr``.
 
@@ -202,9 +193,7 @@ class JaxTransferWrapper:
                 "for every ShapeDtypeStruct."
             )
         if not self._started:
-            raise RuntimeError(
-                "JaxTransferWrapper.start() must be called before pull()"
-            )
+            raise RuntimeError("JaxTransferWrapper.start() must be called before pull()")
         if remote_addr is None:
             raise ValueError(
                 "JaxTransferWrapper.pull requires remote_addr; the "
@@ -250,9 +239,7 @@ def get_or_create_wrapper(
     global _GLOBAL_WRAPPER
     with _GLOBAL_LOCK:
         if _GLOBAL_WRAPPER is None:
-            _GLOBAL_WRAPPER = JaxTransferWrapper(
-                host_ip, port, channel_number
-            )
+            _GLOBAL_WRAPPER = JaxTransferWrapper(host_ip, port, channel_number)
             return _GLOBAL_WRAPPER
         existing = _GLOBAL_WRAPPER
         if (existing.host_ip, existing.port) != (host_ip, port):

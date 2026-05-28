@@ -1,4 +1,4 @@
-"""Contract tests for ``JaxTransferWrapper`` (Stage 0, CPU).
+"""Contract tests for ``JaxTransferWrapper`` on CPU.
 
 The underlying ``jax.experimental.transfer`` is shimmed out via
 ``sys.modules`` so these tests run on any JAX install without a TPU
@@ -53,9 +53,7 @@ def _shim_transfer_module(fake_server):
 
     fake_mod = types.ModuleType("jax.experimental.transfer")
     fake_mod.start_transfer_server = mock.MagicMock(return_value=fake_server)
-    return mock.patch.dict(
-        sys.modules, {"jax.experimental.transfer": fake_mod}
-    )
+    return mock.patch.dict(sys.modules, {"jax.experimental.transfer": fake_mod})
 
 
 def test_pull_rejects_spec_without_sharding():
@@ -69,32 +67,29 @@ def test_pull_rejects_spec_without_sharding():
 def test_pull_requires_remote_addr():
     fake_server = mock.MagicMock()
     fake_server.connect.return_value = mock.MagicMock()
-    with _shim_transfer_module(fake_server), mock.patch.object(
-        jtw_mod.jax, "local_devices", return_value=[mock.MagicMock()]
+    with (
+        _shim_transfer_module(fake_server),
+        mock.patch.object(jtw_mod.jax, "local_devices", return_value=[mock.MagicMock()]),
     ):
         wrapper = JaxTransferWrapper("127.0.0.1", 31001)
         wrapper.start()
-    spec = jax.ShapeDtypeStruct(
-        (4,), jnp.bfloat16, sharding=_device_sharding()
-    )
+    spec = jax.ShapeDtypeStruct((4,), jnp.bfloat16, sharding=_device_sharding())
     with pytest.raises(ValueError, match="remote_addr"):
         wrapper.pull("req-0", spec, remote_addr=None)
 
 
 def test_start_is_idempotent_and_logs_jax_version(caplog):
     fake_server = mock.MagicMock()
-    with _shim_transfer_module(fake_server) as patched_modules, \
-        mock.patch.object(
-            jtw_mod.jax, "local_devices", return_value=[mock.MagicMock()]
-        ):
+    with (
+        _shim_transfer_module(fake_server) as patched_modules,
+        mock.patch.object(jtw_mod.jax, "local_devices", return_value=[mock.MagicMock()]),
+    ):
         wrapper = JaxTransferWrapper("127.0.0.1", 31002, channel_number=2)
         with caplog.at_level(logging.INFO, logger=jtw_mod.logger.name):
             s1 = wrapper.start()
             s2 = wrapper.start()
             s3 = wrapper.start()
-        mock_start = sys.modules[
-            "jax.experimental.transfer"
-        ].start_transfer_server
+        mock_start = sys.modules["jax.experimental.transfer"].start_transfer_server
         del patched_modules
 
     assert s1 is fake_server
@@ -103,11 +98,7 @@ def test_start_is_idempotent_and_logs_jax_version(caplog):
     assert mock_start.call_count == 1
     assert wrapper.is_started
 
-    matching_records = [
-        r
-        for r in caplog.records
-        if "JaxTransferWrapper started" in r.getMessage()
-    ]
+    matching_records = [r for r in caplog.records if "JaxTransferWrapper started" in r.getMessage()]
     assert len(matching_records) == 1, [r.getMessage() for r in caplog.records]
     msg = matching_records[0].getMessage()
     assert "jax_version=" in msg
@@ -122,17 +113,16 @@ def test_register_pull_before_start_raises():
 
 def test_pull_before_start_raises():
     wrapper = JaxTransferWrapper("127.0.0.1", 31004)
-    spec = jax.ShapeDtypeStruct(
-        (4,), jnp.bfloat16, sharding=_device_sharding()
-    )
+    spec = jax.ShapeDtypeStruct((4,), jnp.bfloat16, sharding=_device_sharding())
     with pytest.raises(RuntimeError, match="start"):
         wrapper.pull("req-0", spec, remote_addr="1.2.3.4:1")
 
 
 def test_register_pull_keeps_data_alive_until_release():
     fake_server = mock.MagicMock()
-    with _shim_transfer_module(fake_server), mock.patch.object(
-        jtw_mod.jax, "local_devices", return_value=[mock.MagicMock()]
+    with (
+        _shim_transfer_module(fake_server),
+        mock.patch.object(jtw_mod.jax, "local_devices", return_value=[mock.MagicMock()]),
     ):
         wrapper = JaxTransferWrapper("127.0.0.1", 31005)
         wrapper.start()
@@ -150,8 +140,9 @@ def test_register_pull_keeps_data_alive_until_release():
 
 def test_register_pull_rejects_duplicate_uuid():
     fake_server = mock.MagicMock()
-    with _shim_transfer_module(fake_server), mock.patch.object(
-        jtw_mod.jax, "local_devices", return_value=[mock.MagicMock()]
+    with (
+        _shim_transfer_module(fake_server),
+        mock.patch.object(jtw_mod.jax, "local_devices", return_value=[mock.MagicMock()]),
     ):
         wrapper = JaxTransferWrapper("127.0.0.1", 31006)
         wrapper.start()
@@ -165,7 +156,7 @@ def test_register_pull_rejects_duplicate_uuid():
     assert wrapper._pending["dup"] is arr1
     assert fake_server.await_pull.call_count == 1
 
-    # After release the same uuid is re-usable.
+    # After release the same uuid is reusable.
     wrapper.release("dup")
     wrapper.register_pull("dup", arr2)
     assert wrapper._pending["dup"] is arr2

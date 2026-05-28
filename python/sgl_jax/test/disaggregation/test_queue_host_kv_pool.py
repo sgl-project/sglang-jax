@@ -129,9 +129,7 @@ def test_get_put_buffer_low_level():
 def test_copy_from_device_byte_equal_for_prefix():
     pool = _make_pool(pool_size=2, max_tokens_per_buffer=8)
     rng = np.random.default_rng(0)
-    src_np = rng.integers(
-        0, 200, size=(4, 2, 2, 8), dtype=np.int32
-    ).astype(np.float32)
+    src_np = rng.integers(0, 200, size=(4, 2, 2, 8), dtype=np.int32).astype(np.float32)
     device_kv = jnp.asarray(src_np)
     staged: StagedData = pool.copy_from_device(device_kv)
 
@@ -141,9 +139,7 @@ def test_copy_from_device_byte_equal_for_prefix():
     # zeros from preallocation.
     got = np.asarray(jax.device_get(staged.array))
     np.testing.assert_array_equal(got[:4], src_np)
-    np.testing.assert_array_equal(
-        got[4:], np.zeros((4, 2, 2, 8), dtype=np.float32)
-    )
+    np.testing.assert_array_equal(got[4:], np.zeros((4, 2, 2, 8), dtype=np.float32))
 
     # Pool's internal slot is updated; getting that buffer back should
     # yield the same content. Drain the rest of the queue first so the

@@ -26,12 +26,8 @@ import pytest
 from jax.sharding import Mesh, PartitionSpec
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
-from sgl_jax.srt.disaggregation.jax_transfer.conn import (
-    JaxTransferKVManager,
-)
-from sgl_jax.srt.disaggregation.jax_transfer.zmq_notifier import (
-    ZmqPullNotifier,
-)
+from sgl_jax.srt.disaggregation.jax_transfer.conn import JaxTransferKVManager
+from sgl_jax.srt.disaggregation.jax_transfer.zmq_notifier import ZmqPullNotifier
 from sgl_jax.srt.mem_cache.host_kv_pool import QueueHostKVPool
 
 
@@ -121,7 +117,7 @@ def test_path_b_sender_transitions_only_after_ack(notifiers):
     assert _wait_until(lambda: sender.poll() == KVPoll.SUCCESS)
     assert "req-PATH-B" not in wrapper._pending
     assert wrapper.release.call_count == 1
-    # M7: sender pruned from manager after SUCCESS.
+    # Sender is pruned from the manager after SUCCESS.
     assert "req-PATH-B" not in mgr._senders
     record = mgr.get_terminal_record("req-PATH-B", role="prefill")
     assert record is not None
@@ -173,9 +169,7 @@ def test_sender_fail_cancels_pending_callback(notifiers):
 
     sender = mgr.create_sender("req-fail")
     sender.init(kv_indices=None)
-    sender.attach_payload(
-        jnp.zeros(4, dtype=jnp.float32), use_d2h_staging=False
-    )
+    sender.attach_payload(jnp.zeros(4, dtype=jnp.float32), use_d2h_staging=False)
     sender.send()
     assert sender.poll() == KVPoll.TRANSFERRING
     assert p_notifier.pending_count() == 1
@@ -212,9 +206,9 @@ def test_attach_payload_rejects_double_attach(notifiers):
         sender.attach_payload(payload, use_d2h_staging=False)
 
 
-# Regression tests for the Stage 1 review C1 / C2 races. Both use a
-# wrapper substitute whose ``register_pull`` blocks on a barrier so we
-# can deterministically drive the listener-vs-main race.
+# Regression tests for the sender/ack races. Both use a wrapper
+# substitute whose ``register_pull`` blocks on a barrier so we can
+# deterministically drive the listener-vs-main race.
 
 
 def _barrier_wrapper(barrier_event: threading.Event):
@@ -238,11 +232,12 @@ def _barrier_wrapper(barrier_event: threading.Event):
 
 
 def test_send_ack_race_safe(notifiers):
-    """C1 regression: ack arriving while ``send`` is mid-handoff must
-    not leave the sender wedged. The fix holds ``_state_lock`` around
-    register_callback + producer_handoff + transition; the listener's
-    ``_on_ack`` blocks on that lock until ``send`` finishes, then
-    transitions to SUCCESS.
+    """An ack arriving mid-handoff must not wedge the sender.
+
+    ``send()`` holds ``_state_lock`` around callback registration,
+    producer handoff, and the state transition. The listener's
+    ``_on_ack`` blocks on that lock until ``send()`` finishes, then
+    transitions the sender to SUCCESS.
     """
 
     p_notifier, d_notifier = notifiers
@@ -250,11 +245,9 @@ def test_send_ack_race_safe(notifiers):
     wrapper = _barrier_wrapper(barrier)
     mgr = JaxTransferKVManager(wrapper, p_notifier)
 
-    sender = mgr.create_sender("req-C1")
+    sender = mgr.create_sender("req-race")
     sender.init(kv_indices=None)
-    sender.attach_payload(
-        jnp.zeros(4, dtype=jnp.float32), use_d2h_staging=False
-    )
+    sender.attach_payload(jnp.zeros(4, dtype=jnp.float32), use_d2h_staging=False)
 
     # Run ``send`` on a background thread so the main thread can fire
     # the ack while ``send`` is blocked inside ``producer_handoff``.
@@ -272,7 +265,7 @@ def test_send_ack_race_safe(notifiers):
     # blocks on the barrier).
     assert _wait_until(lambda: p_notifier.pending_count() == 1)
     # Fire the ack now, before ``send`` releases the state lock.
-    d_notifier.send_done(b"req-C1", "127.0.0.1", p_notifier.port)
+    d_notifier.send_done(b"req-race", "127.0.0.1", p_notifier.port)
     # Listener thread pops the callback and tries to acquire
     # ``_state_lock``; it must block because ``send`` is still
     # holding it.
@@ -284,13 +277,15 @@ def test_send_ack_race_safe(notifiers):
     assert send_done.wait(timeout=3.0)
     assert _wait_until(lambda: sender.poll() == KVPoll.SUCCESS)
     assert wrapper.release.call_count == 1
-    assert "req-C1" not in mgr._senders
+    assert "req-race" not in mgr._senders
 
 
 def test_fail_owns_cleanup_when_callback_still_registered(notifiers):
-    """C2 regression: when ``fail`` runs BEFORE the listener pops the
-    callback, ``unregister_callback`` returns the callback → ``fail``
-    owns cleanup → ``on_done`` runs exactly once (buffer returned).
+    """If ``fail()`` wins the callback race, it owns cleanup.
+
+    When the listener has not popped the callback yet,
+    ``unregister_callback()`` returns it and ``fail()`` must run
+    ``on_done()`` exactly once.
     """
 
     p_notifier, _ = notifiers
@@ -298,7 +293,7 @@ def test_fail_owns_cleanup_when_callback_still_registered(notifiers):
     pool = _make_host_pool(pool_size=2, max_tokens=8)
     mgr = JaxTransferKVManager(wrapper, p_notifier, host_pool=pool)
 
-    sender = mgr.create_sender("req-C2a")
+    sender = mgr.create_sender("req-fail-owns-cleanup")
     sender.init(kv_indices=None)
     device_kv = jnp.ones((4, 1, 1, 4), dtype=jnp.float32)
     sender.attach_payload(device_kv, use_d2h_staging=True)
@@ -315,11 +310,10 @@ def test_fail_owns_cleanup_when_callback_still_registered(notifiers):
 
 
 def test_fail_after_listener_popped_skips_cleanup(notifiers):
-    """C2 regression: when ``fail`` runs AFTER the listener popped
-    the callback (but before ``_on_ack`` finished cleanup),
-    ``unregister_callback`` returns ``None`` → ``fail`` MUST skip
-    cleanup so the in-flight ``_on_ack`` owns it. Otherwise both
-    would call ``on_done`` and the pool would raise ``double free``.
+    """If the listener already owns the callback, ``fail()`` skips cleanup.
+
+    Once the listener pops the callback, the in-flight ``_on_ack`` path
+    must be the only owner of ``on_done()``.
     """
 
     p_notifier, _ = notifiers
@@ -327,7 +321,7 @@ def test_fail_after_listener_popped_skips_cleanup(notifiers):
     pool = _make_host_pool(pool_size=2, max_tokens=8)
     mgr = JaxTransferKVManager(wrapper, p_notifier, host_pool=pool)
 
-    sender = mgr.create_sender("req-C2b")
+    sender = mgr.create_sender("req-ack-owns-cleanup")
     sender.init(kv_indices=None)
     device_kv = jnp.ones((4, 1, 1, 4), dtype=jnp.float32)
     sender.attach_payload(device_kv, use_d2h_staging=True)
@@ -335,7 +329,7 @@ def test_fail_after_listener_popped_skips_cleanup(notifiers):
 
     # Listener thread pops the callback (simulated by manual pop —
     # same dict op the listener uses internally).
-    cb = p_notifier.unregister_callback(b"req-C2b")
+    cb = p_notifier.unregister_callback(b"req-ack-owns-cleanup")
     assert cb is not None
 
     # ``fail`` runs while the popped callback is still in flight.
@@ -347,7 +341,7 @@ def test_fail_after_listener_popped_skips_cleanup(notifiers):
     assert wrapper.release.call_count == 0
 
     # Now run the popped callback as the listener would have done.
-    cb(b"req-C2b")
+    cb(b"req-ack-owns-cleanup")
     # ``_on_ack`` runs cleanup exactly once.
     assert pool.available_size() == pool.total_size()
     assert wrapper.release.call_count == 1
@@ -365,9 +359,7 @@ def test_late_ack_from_old_transfer_id_does_not_complete_reused_req(notifiers):
 
     sender1 = mgr.create_sender("req-reuse")
     sender1.init(kv_indices=None, transfer_id="req-reuse#old")
-    sender1.attach_payload(
-        jnp.arange(4, dtype=jnp.float32), use_d2h_staging=False
-    )
+    sender1.attach_payload(jnp.arange(4, dtype=jnp.float32), use_d2h_staging=False)
     sender1.send()
     sender1.fail(reason="test")
 
@@ -381,74 +373,56 @@ def test_late_ack_from_old_transfer_id_does_not_complete_reused_req(notifiers):
 
     # A stale ack for the OLD transfer attempt must not terminate the
     # current sender.
-    d_notifier.send_done(
-        b"req-reuse#old", "127.0.0.1", p_notifier.port
-    )
+    d_notifier.send_done(b"req-reuse#old", "127.0.0.1", p_notifier.port)
     time.sleep(0.05)
     assert sender2.poll() == KVPoll.TRANSFERRING
     assert "req-reuse#new" in wrapper._pending
 
     # The matching ack still completes the current transfer.
-    d_notifier.send_done(
-        b"req-reuse#new", "127.0.0.1", p_notifier.port
-    )
+    d_notifier.send_done(b"req-reuse#new", "127.0.0.1", p_notifier.port)
     assert _wait_until(lambda: sender2.poll() == KVPoll.SUCCESS)
     assert "req-reuse#new" not in wrapper._pending
 
 
-def test_late_ack_after_success_is_classified_as_retired(
-    notifiers, caplog
-):
+def test_late_ack_after_success_is_classified_as_retired(notifiers, caplog):
     p_notifier, d_notifier = notifiers
     wrapper = _mock_wrapper()
     mgr = JaxTransferKVManager(wrapper, p_notifier)
 
     sender = mgr.create_sender("req-late-success")
     sender.init(kv_indices=None)
-    sender.attach_payload(
-        jnp.arange(4, dtype=jnp.float32), use_d2h_staging=False
-    )
+    sender.attach_payload(jnp.arange(4, dtype=jnp.float32), use_d2h_staging=False)
     sender.send()
 
-    d_notifier.send_done(
-        b"req-late-success", "127.0.0.1", p_notifier.port
-    )
+    d_notifier.send_done(b"req-late-success", "127.0.0.1", p_notifier.port)
     assert _wait_until(lambda: sender.poll() == KVPoll.SUCCESS)
 
     with caplog.at_level(
         logging.INFO,
         logger="sgl_jax.srt.disaggregation.jax_transfer.zmq_notifier",
     ):
-        d_notifier.send_done(
-            b"req-late-success", "127.0.0.1", p_notifier.port
-        )
+        d_notifier.send_done(b"req-late-success", "127.0.0.1", p_notifier.port)
         assert _wait_until(
             lambda: any(
-                "retired transfer" in rec.getMessage()
-                and "req-late-success" in rec.getMessage()
+                "retired transfer" in rec.getMessage() and "req-late-success" in rec.getMessage()
                 for rec in caplog.records
             )
         )
 
     assert not any(
-        "no registered callback" in rec.getMessage()
-        and "req-late-success" in rec.getMessage()
+        "no registered callback" in rec.getMessage() and "req-late-success" in rec.getMessage()
         for rec in caplog.records
     )
 
 
-def test_late_ack_after_fail_is_classified_as_retired(
-    notifiers, caplog
-):
+def test_late_ack_after_fail_is_classified_as_retired(notifiers, caplog):
     p_notifier, d_notifier = notifiers
     wrapper = _mock_wrapper()
     mgr = JaxTransferKVManager(wrapper, p_notifier)
 
     sender = mgr.create_sender("req-late-fail")
     sender.init(kv_indices=None)
-    sender.attach_payload(
-        jnp.arange(4, dtype=jnp.float32), use_d2h_staging=False
-    )
+    sender.attach_payload(jnp.arange(4, dtype=jnp.float32), use_d2h_staging=False)
     sender.send()
     sender.fail(reason="test")
 
@@ -456,20 +430,16 @@ def test_late_ack_after_fail_is_classified_as_retired(
         logging.INFO,
         logger="sgl_jax.srt.disaggregation.jax_transfer.zmq_notifier",
     ):
-        d_notifier.send_done(
-            b"req-late-fail", "127.0.0.1", p_notifier.port
-        )
+        d_notifier.send_done(b"req-late-fail", "127.0.0.1", p_notifier.port)
         assert _wait_until(
             lambda: any(
-                "retired transfer" in rec.getMessage()
-                and "req-late-fail" in rec.getMessage()
+                "retired transfer" in rec.getMessage() and "req-late-fail" in rec.getMessage()
                 for rec in caplog.records
             )
         )
 
     assert not any(
-        "no registered callback" in rec.getMessage()
-        and "req-late-fail" in rec.getMessage()
+        "no registered callback" in rec.getMessage() and "req-late-fail" in rec.getMessage()
         for rec in caplog.records
     )
 
@@ -481,9 +451,7 @@ def test_new_sender_attempt_clears_old_terminal_record(notifiers):
 
     sender1 = mgr.create_sender("req-retry")
     sender1.init(kv_indices=None)
-    sender1.attach_payload(
-        jnp.arange(4, dtype=jnp.float32), use_d2h_staging=False
-    )
+    sender1.attach_payload(jnp.arange(4, dtype=jnp.float32), use_d2h_staging=False)
     sender1.send()
     d_notifier.send_done(b"req-retry", "127.0.0.1", p_notifier.port)
     assert _wait_until(lambda: sender1.poll() == KVPoll.SUCCESS)
@@ -501,9 +469,7 @@ def test_sender_abort_failure_exception_and_clear(notifiers):
 
     sender = mgr.create_sender("req-abort")
     sender.init(kv_indices=None)
-    sender.attach_payload(
-        jnp.arange(4, dtype=jnp.float32), use_d2h_staging=False
-    )
+    sender.attach_payload(jnp.arange(4, dtype=jnp.float32), use_d2h_staging=False)
     sender.send()
     sender.abort()
 

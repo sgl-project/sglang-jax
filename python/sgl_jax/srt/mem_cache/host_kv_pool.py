@@ -18,7 +18,7 @@ import abc
 import logging
 import threading
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -28,9 +28,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 logger = logging.getLogger(__name__)
 
 
-def _make_host_sharding(
-    mesh: Mesh, partition_spec: PartitionSpec
-) -> NamedSharding:
+def _make_host_sharding(mesh: Mesh, partition_spec: PartitionSpec) -> NamedSharding:
     """Build a host-side sharding.
 
     Tries ``memory_kind="pinned_host"`` first (TPU-only); falls back to
@@ -89,7 +87,7 @@ class HostKVPool(abc.ABC):
     """
 
     @abc.abstractmethod
-    def alloc(self, num_tokens: int) -> Optional[HostBufferHandle]:
+    def alloc(self, num_tokens: int) -> HostBufferHandle | None:
         """Reserve a buffer big enough for ``num_tokens`` tokens.
 
         Returns ``None`` if the pool is empty or if ``num_tokens``
@@ -103,7 +101,7 @@ class HostKVPool(abc.ABC):
         """Return ``handle``'s buffer to the pool."""
 
     @abc.abstractmethod
-    def get_buffer(self) -> Tuple[int, HostBufferHandle]:
+    def get_buffer(self) -> tuple[int, HostBufferHandle]:
         """Low-level: pull one buffer regardless of token count."""
 
     @abc.abstractmethod
@@ -158,8 +156,7 @@ class QueueHostKVPool(HostKVPool):
             raise ValueError(f"pool_size must be positive, got {pool_size}")
         if max_tokens_per_buffer <= 0:
             raise ValueError(
-                f"max_tokens_per_buffer must be positive, "
-                f"got {max_tokens_per_buffer}"
+                f"max_tokens_per_buffer must be positive, " f"got {max_tokens_per_buffer}"
             )
         self._pool_size = pool_size
         self._max_tokens_per_buffer = max_tokens_per_buffer
@@ -180,11 +177,11 @@ class QueueHostKVPool(HostKVPool):
         )
 
         self._lock = threading.Lock()
-        self._buffers: List[jax.Array] = self._allocate_buffers()
-        self._free_ids: List[int] = list(range(pool_size))
+        self._buffers: list[jax.Array] = self._allocate_buffers()
+        self._free_ids: list[int] = list(range(pool_size))
 
-    def _allocate_buffers(self) -> List[jax.Array]:
-        buffers: List[jax.Array] = []
+    def _allocate_buffers(self) -> list[jax.Array]:
+        buffers: list[jax.Array] = []
         zeros = jnp.zeros(self._buffer_shape, dtype=self._dtype)
         for _ in range(self._pool_size):
             buffers.append(jax.device_put(zeros, self._host_sharding))
@@ -196,13 +193,11 @@ class QueueHostKVPool(HostKVPool):
     # HostKVPool ABC
     # ------------------------------------------------------------------
 
-    def alloc(self, num_tokens: int) -> Optional[HostBufferHandle]:
+    def alloc(self, num_tokens: int) -> HostBufferHandle | None:
         if num_tokens > self._max_tokens_per_buffer:
             return None
         if num_tokens <= 0:
-            raise ValueError(
-                f"num_tokens must be positive, got {num_tokens}"
-            )
+            raise ValueError(f"num_tokens must be positive, got {num_tokens}")
         with self._lock:
             if not self._free_ids:
                 return None
@@ -222,12 +217,11 @@ class QueueHostKVPool(HostKVPool):
     def free(self, handle: HostBufferHandle) -> None:
         self._release(handle.buffer_id)
 
-    def get_buffer(self) -> Tuple[int, HostBufferHandle]:
+    def get_buffer(self) -> tuple[int, HostBufferHandle]:
         with self._lock:
             if not self._free_ids:
                 raise RuntimeError(
-                    "QueueHostKVPool is empty; caller should have "
-                    "checked available_size() first"
+                    "QueueHostKVPool is empty; caller should have " "checked available_size() first"
                 )
             buffer_id = self._free_ids.pop(0)
         try:
@@ -254,9 +248,7 @@ class QueueHostKVPool(HostKVPool):
             )
         handle = self.alloc(num_tokens)
         if handle is None:
-            raise RuntimeError(
-                "QueueHostKVPool exhausted; alloc returned None"
-            )
+            raise RuntimeError("QueueHostKVPool exhausted; alloc returned None")
         staged_device = jax.device_put(device_kv, self._host_sharding)
         updated = handle.buffer.at[:num_tokens].set(staged_device)
         updated.block_until_ready()
@@ -264,13 +256,11 @@ class QueueHostKVPool(HostKVPool):
         # see the latest content; .at[].set() returns a new array.
         self._buffers[handle.buffer_id] = updated
         try:
-            from sgl_jax.srt.disaggregation.metrics import (
-                PD_TRANSFER_BYTES_TOTAL,
-            )
+            from sgl_jax.srt.disaggregation.metrics import PD_TRANSFER_BYTES_TOTAL
 
-            PD_TRANSFER_BYTES_TOTAL.labels(
-                direction="d2h", role="prefill"
-            ).inc(int(device_kv.nbytes))
+            PD_TRANSFER_BYTES_TOTAL.labels(direction="d2h", role="prefill").inc(
+                int(device_kv.nbytes)
+            )
         except Exception:  # noqa: BLE001
             pass
         return StagedData(buffer_id=handle.buffer_id, array=updated)
@@ -287,13 +277,10 @@ class QueueHostKVPool(HostKVPool):
     def _release(self, buffer_id: int) -> None:
         with self._lock:
             if buffer_id in self._free_ids:
-                raise RuntimeError(
-                    f"double free of buffer_id={buffer_id}"
-                )
+                raise RuntimeError(f"double free of buffer_id={buffer_id}")
             if not (0 <= buffer_id < self._pool_size):
                 raise ValueError(
-                    f"buffer_id={buffer_id} outside pool range "
-                    f"[0, {self._pool_size})"
+                    f"buffer_id={buffer_id} outside pool range " f"[0, {self._pool_size})"
                 )
             self._free_ids.append(buffer_id)
         try:

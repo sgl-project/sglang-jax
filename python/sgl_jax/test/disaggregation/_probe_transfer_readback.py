@@ -30,10 +30,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.disaggregation.jax_transfer_wrapper import (
-    get_or_create_wrapper,
-)
-
+from sgl_jax.srt.disaggregation.jax_transfer_wrapper import get_or_create_wrapper
 
 NELEM = 4096
 UUID = "probe-0"
@@ -72,7 +69,7 @@ def _producer(args):
     conn, _ = listen.accept()
     addr_msg = f"{args.my_host}:{args.transfer_port}"
     conn.sendall((addr_msg + "\n").encode("utf-8"))
-    print(f"[P] sent addr, waiting for DONE", flush=True)
+    print("[P] sent addr, waiting for DONE", flush=True)
     conn.settimeout(300.0)
     ack = conn.recv(64).decode().strip()
     print(f"[P] D acked: {ack!r}", flush=True)
@@ -121,8 +118,7 @@ def _consumer(args):
             print(f"[probe] PASS {label}: {v!r}", flush=True)
         except Exception as e:
             print(
-                f"[probe] FAIL {label}: {type(e).__name__}: "
-                f"{str(e)[:200]}",
+                f"[probe] FAIL {label}: {type(e).__name__}: " f"{str(e)[:200]}",
                 flush=True,
             )
 

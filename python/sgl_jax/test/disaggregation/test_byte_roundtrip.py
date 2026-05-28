@@ -1,10 +1,9 @@
-"""Stage 1 cross-pod integration script (manual, NOT in CI).
+"""Cross-pod integration script for manual PD transfer validation.
 
-Extends the Stage 0 byte-equality harness for the Stage 1 surface:
+Exercises the current sender/receiver contract:
 
   * Event-driven sender: ``send()`` registers a ZMQ callback and the
-    receiver acks completion via ``send_done``. No more optimistic
-    SUCCESS in Stage 0 style.
+    receiver acks completion via ``send_done``.
   * Path A (D2H staging via :class:`QueueHostKVPool`) vs path B
     (direct from HBM), selectable via ``--use-d2h-staging``. Both
     paths produce byte-equal transfers.
@@ -41,7 +40,6 @@ import socket
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -56,17 +54,12 @@ from sgl_jax.srt.disaggregation.jax_transfer.conn import (
     JaxTransferKVSender,
     PMetadata,
 )
-from sgl_jax.srt.disaggregation.jax_transfer.zmq_notifier import (
-    ZmqPullNotifier,
-)
-from sgl_jax.srt.disaggregation.jax_transfer_wrapper import (
-    get_or_create_wrapper,
-)
+from sgl_jax.srt.disaggregation.jax_transfer.zmq_notifier import ZmqPullNotifier
+from sgl_jax.srt.disaggregation.jax_transfer_wrapper import get_or_create_wrapper
 from sgl_jax.srt.mem_cache.host_kv_pool import QueueHostKVPool
 
-
 PAGE_ELEMS = 4096
-PAGE_COUNTS: Tuple[int, ...] = (1, 16, 256)
+PAGE_COUNTS: tuple[int, ...] = (1, 16, 256)
 ITERATIONS = int(os.environ.get("PD_ROUNDTRIP_ITERS", "100"))
 POOL_SIZE = int(os.environ.get("PD_POOL_SIZE", "128"))
 
@@ -78,8 +71,8 @@ class Cell:
     page_count: int
 
 
-def _dtypes() -> List[Tuple[str, jnp.dtype]]:
-    out: List[Tuple[str, jnp.dtype]] = [
+def _dtypes() -> list[tuple[str, jnp.dtype]]:
+    out: list[tuple[str, jnp.dtype]] = [
         ("bf16", jnp.bfloat16),
         ("fp16", jnp.float16),
     ]
@@ -94,12 +87,8 @@ def _dtypes() -> List[Tuple[str, jnp.dtype]]:
     return out
 
 
-def _all_cells() -> List[Cell]:
-    return [
-        Cell(name, dt, pc)
-        for name, dt in _dtypes()
-        for pc in PAGE_COUNTS
-    ]
+def _all_cells() -> list[Cell]:
+    return [Cell(name, dt, pc) for name, dt in _dtypes() for pc in PAGE_COUNTS]
 
 
 def _device_sharding() -> NamedSharding:
@@ -149,7 +138,7 @@ def _arr_host_bytes(arr: jax.Array) -> bytes:
 
     n_shards = len(arr.addressable_shards)
     shard_size = arr.shape[0] // n_shards
-    parts: List[bytes] = []
+    parts: list[bytes] = []
     for i in range(n_shards):
         sub = arr.addressable_data(i)[:shard_size]
         parts.append(np.asarray(jax.device_get(sub)).tobytes())
@@ -181,13 +170,10 @@ def _connect(host: str, port: int, timeout_s: float = 120.0) -> socket.socket:
             s.connect((host, port))
             s.settimeout(None)
             return s
-        except (ConnectionRefusedError, socket.timeout) as e:
+        except (TimeoutError, ConnectionRefusedError) as e:
             last_err = e
             time.sleep(1.0)
-    raise TimeoutError(
-        f"could not connect to {host}:{port} within "
-        f"{timeout_s}s: {last_err}"
-    )
+    raise TimeoutError(f"could not connect to {host}:{port} within " f"{timeout_s}s: {last_err}")
 
 
 def _read_line(sock: socket.socket, buf: bytearray) -> str:
@@ -209,9 +195,7 @@ def _read_line(sock: socket.socket, buf: bytearray) -> str:
 def _prefill(args: argparse.Namespace) -> int:
     wrapper = get_or_create_wrapper(args.my_host, args.transfer_port)
     wrapper.start()
-    p_notifier = ZmqPullNotifier(
-        "prefill", args.my_host, args.side_channel_port
-    )
+    p_notifier = ZmqPullNotifier("prefill", args.my_host, args.side_channel_port)
     p_notifier.start()
     sharding = _device_sharding()
 
@@ -230,22 +214,17 @@ def _prefill(args: argparse.Namespace) -> int:
     )
     conn.sendall(handshake.encode("utf-8"))
 
-    failed_cells: List[Tuple[str, str]] = []
+    failed_cells: list[tuple[str, str]] = []
     rx_buf = bytearray()
     cells = _all_cells()
     # Path A uses replicated sharding (matches the pool's
     # partition_spec=P()) so D2H staging does not trigger a cross-chip
-    # gather collective. Path B keeps the sharded layout for parity
-    # with Stage 0.
-    payload_sharding = (
-        _replicated_sharding() if args.use_d2h_staging else sharding
-    )
+    # gather collective. Path B keeps the existing sharded layout.
+    payload_sharding = _replicated_sharding() if args.use_d2h_staging else sharding
     leak_total = 0
 
     mesh = Mesh(
-        np.asarray(jax.local_devices()).reshape(
-            len(jax.local_devices())
-        ),
+        np.asarray(jax.local_devices()).reshape(len(jax.local_devices())),
         axis_names=("x",),
     )
 
@@ -256,7 +235,7 @@ def _prefill(args: argparse.Namespace) -> int:
         # implicitly down-casts and breaks byte equality. Pool buffers
         # are sized to ``nelem`` exactly so D's spec matches with no
         # zero padding.
-        host_pool: Optional[QueueHostKVPool] = None
+        host_pool: QueueHostKVPool | None = None
         if args.use_d2h_staging:
             host_pool = QueueHostKVPool(
                 pool_size=args.pool_size,
@@ -271,35 +250,35 @@ def _prefill(args: argparse.Namespace) -> int:
         mgr = JaxTransferKVManager(wrapper, p_notifier, host_pool=host_pool)
         initial_avail = host_pool.available_size() if host_pool else 0
 
-        senders: List[Tuple[str, JaxTransferKVSender]] = []
+        senders: list[tuple[str, JaxTransferKVSender]] = []
         # Phase 1: dispatch all ITERATIONS at once (pipelined).
         for i in range(ITERATIONS):
             req_id = f"{cell.dtype_name}-{cell.page_count}-{i}"
-            seed = (
-                hash((cell.dtype_name, cell.page_count, i)) & 0xFFFFFFFF
-            )
+            seed = hash((cell.dtype_name, cell.page_count, i)) & 0xFFFFFFFF
             sender = mgr.create_sender(req_id)
             sender.init(kv_indices=None)
             if args.use_d2h_staging:
                 payload_flat = _make_payload(
-                    seed, cell.dtype_name, cell.dtype, nelem,
+                    seed,
+                    cell.dtype_name,
+                    cell.dtype,
+                    nelem,
                     payload_sharding,
                 )
                 payload_flat.block_until_ready()
                 payload = payload_flat.reshape((nelem, 1, 1, 1))
             else:
                 payload = _make_payload(
-                    seed, cell.dtype_name, cell.dtype, nelem,
+                    seed,
+                    cell.dtype_name,
+                    cell.dtype,
+                    nelem,
                     payload_sharding,
                 )
                 payload.block_until_ready()
-            sender.attach_payload(
-                payload, use_d2h_staging=args.use_d2h_staging
-            )
+            sender.attach_payload(payload, use_d2h_staging=args.use_d2h_staging)
             sender.send()
-            line = f"{req_id} {nelem} {cell.dtype_name} {seed}\n".encode(
-                "utf-8"
-            )
+            line = f"{req_id} {nelem} {cell.dtype_name} {seed}\n".encode()
             conn.sendall(line)
             senders.append((req_id, sender))
 
@@ -321,8 +300,7 @@ def _prefill(args: argparse.Namespace) -> int:
             while sender.poll() != KVPoll.SUCCESS:
                 if time.perf_counter() > deadline:
                     raise RuntimeError(
-                        f"sender {req_id} stuck at "
-                        f"{sender.poll().value} after D acked"
+                        f"sender {req_id} stuck at " f"{sender.poll().value} after D acked"
                     )
                 time.sleep(0.001)
             ok_count += 1
@@ -338,8 +316,7 @@ def _prefill(args: argparse.Namespace) -> int:
             )
         else:
             print(
-                f"[P] cell {cell.dtype_name}/{cell.page_count}: "
-                f"{ok_count}/{ITERATIONS}",
+                f"[P] cell {cell.dtype_name}/{cell.page_count}: " f"{ok_count}/{ITERATIONS}",
                 flush=True,
             )
 
@@ -348,8 +325,7 @@ def _prefill(args: argparse.Namespace) -> int:
     failed = bool(failed_cells) or leak_total != 0
     total = len(cells) * ITERATIONS
     print(
-        f"[P] done: failed_cells={failed_cells} leaked_total={leak_total} "
-        f"total_target={total}",
+        f"[P] done: failed_cells={failed_cells} leaked_total={leak_total} " f"total_target={total}",
         flush=True,
     )
     return 0 if not failed else 1
@@ -357,8 +333,7 @@ def _prefill(args: argparse.Namespace) -> int:
 
 def _decode(args: argparse.Namespace) -> int:
     print(
-        f"[D] connecting to P ctl at "
-        f"{args.remote}:{args.ctl_port}",
+        f"[D] connecting to P ctl at " f"{args.remote}:{args.ctl_port}",
         flush=True,
     )
     ctl = _connect(args.remote, args.ctl_port)
@@ -378,9 +353,7 @@ def _decode(args: argparse.Namespace) -> int:
     bind_host = args.my_host or "0.0.0.0"
     wrapper = get_or_create_wrapper(bind_host, args.transfer_port)
     wrapper.start()
-    d_notifier = ZmqPullNotifier(
-        "decode", bind_host, args.side_channel_port
-    )
+    d_notifier = ZmqPullNotifier("decode", bind_host, args.side_channel_port)
     d_notifier.start()
     mgr = JaxTransferKVManager(wrapper, d_notifier)
     sharding = _device_sharding()
@@ -390,13 +363,13 @@ def _decode(args: argparse.Namespace) -> int:
     cells = _all_cells()
     expected_total = len(cells) * ITERATIONS
     successes = 0
-    failed_cells: List[str] = []
+    failed_cells: list[str] = []
 
     for cell in cells:
         if failed_cells:
             break
         # Phase 1: read ITERATIONS metadata lines.
-        metas: List[Tuple[str, PMetadata, int, str, int]] = []
+        metas: list[tuple[str, PMetadata, int, str, int]] = []
         for _ in range(ITERATIONS):
             line = _read_line(ctl, rx_buf)
             toks = line.split()
@@ -410,13 +383,9 @@ def _decode(args: argparse.Namespace) -> int:
                 # Path A: P sized the host pool buffer to ``nelem``
                 # exactly (per-cell pool), so D pulls (nelem, 1, 1, 1)
                 # with replicated sharding.
-                spec = jax.ShapeDtypeStruct(
-                    (nelem, 1, 1, 1), dtype, sharding=repl_sharding
-                )
+                spec = jax.ShapeDtypeStruct((nelem, 1, 1, 1), dtype, sharding=repl_sharding)
             else:
-                spec = jax.ShapeDtypeStruct(
-                    (nelem,), dtype, sharding=sharding
-                )
+                spec = jax.ShapeDtypeStruct((nelem,), dtype, sharding=sharding)
             metas.append(
                 (
                     req_id,
@@ -434,9 +403,7 @@ def _decode(args: argparse.Namespace) -> int:
             )
 
         # Phase 2: dispatch all receivers, drain, byte-check, ack.
-        receivers: List[
-            Tuple[str, JaxTransferKVReceiver, int, str, int]
-        ] = []
+        receivers: list[tuple[str, JaxTransferKVReceiver, int, str, int]] = []
         for req_id, meta, seed, dtype_name, nelem in metas:
             receiver = mgr.create_receiver(req_id)
             receiver.init(meta)
@@ -474,8 +441,7 @@ def _decode(args: argparse.Namespace) -> int:
             successes += 1
             cell_done += 1
         print(
-            f"[D] cell {cell.dtype_name}/{cell.page_count}: "
-            f"{cell_done}/{ITERATIONS}",
+            f"[D] cell {cell.dtype_name}/{cell.page_count}: " f"{cell_done}/{ITERATIONS}",
             flush=True,
         )
 
@@ -483,8 +449,7 @@ def _decode(args: argparse.Namespace) -> int:
     d_notifier.stop()
     failed = bool(failed_cells)
     print(
-        f"[D] done: {successes}/{expected_total} iters, "
-        f"failed={failed_cells}",
+        f"[D] done: {successes}/{expected_total} iters, " f"failed={failed_cells}",
         flush=True,
     )
     return 0 if not failed else 1
@@ -492,9 +457,7 @@ def _decode(args: argparse.Namespace) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--role", required=True, choices=["prefill", "decode"]
-    )
+    ap.add_argument("--role", required=True, choices=["prefill", "decode"])
     ap.add_argument("--my-host", default="")
     ap.add_argument("--remote", default="")
     ap.add_argument("--ctl-port", type=int, default=31000)

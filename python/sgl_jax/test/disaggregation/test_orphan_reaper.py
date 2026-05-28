@@ -1,4 +1,4 @@
-"""Stage 4 H-B: orphan reaper + per-phase timeout.
+"""Orphan reaper and per-phase timeout tests.
 
 Drives ``JaxTransferKVManager.reap_once(now)`` with a hand-stepped
 clock so the tests stay deterministic. No real ZMQ / transfer
@@ -9,15 +9,12 @@ calls directly, and we stub the dependencies they touch.
 
 from __future__ import annotations
 
-from typing import Optional
 from unittest import mock
 
 import pytest
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
-from sgl_jax.srt.disaggregation.jax_transfer.conn import (
-    JaxTransferKVManager,
-)
+from sgl_jax.srt.disaggregation.jax_transfer.conn import JaxTransferKVManager
 
 
 def _make_mgr(ack_timeout=10.0, pull_timeout=5.0):
@@ -25,7 +22,9 @@ def _make_mgr(ack_timeout=10.0, pull_timeout=5.0):
     notifier = mock.MagicMock()
     notifier.unregister_callback.return_value = None
     return JaxTransferKVManager(
-        wrapper, notifier, host_pool=None,
+        wrapper,
+        notifier,
+        host_pool=None,
         ack_timeout_seconds=ack_timeout,
         pull_timeout_seconds=pull_timeout,
         reaper_interval_seconds=60.0,  # avoid background thread
@@ -136,9 +135,7 @@ def test_graceful_shutdown_force_fails_after_timeout():
     sender._transfer_started_at = 0.0
     sender._status = mock.MagicMock()
 
-    aborted_s, aborted_r = mgr.graceful_shutdown(
-        drain_timeout_seconds=0.05
-    )
+    aborted_s, aborted_r = mgr.graceful_shutdown(drain_timeout_seconds=0.05)
     assert aborted_s == 1
     assert sender.state == KVPoll.FAILED
     record = mgr.get_terminal_record("s1", role="prefill")
@@ -148,11 +145,11 @@ def test_graceful_shutdown_force_fails_after_timeout():
 
 
 def test_receiver_fail_is_lock_protected_against_concurrent_poll():
-    """Stage 4 review I1: receiver.fail() called from the reaper
-    while poll() is mid-flight must not produce illegal
-    transitions. We simulate the race by force-failing the receiver
-    BEFORE the second-leg poll runs; the poll must observe the
-    state flip and bail out without re-transitioning to SUCCESS.
+    """A concurrent ``fail()`` must not produce illegal transitions.
+
+    Simulate the race by force-failing the receiver before the second
+    poll runs; that poll must observe the state flip and bail out
+    without re-transitioning to SUCCESS.
     """
 
     mgr = _make_mgr()
@@ -199,5 +196,3 @@ def test_receiver_abort_failure_exception_and_clear():
     receiver.clear()
     assert mgr.get_terminal_record("r-abort", role="decode") is None
     receiver.clear()
-
-

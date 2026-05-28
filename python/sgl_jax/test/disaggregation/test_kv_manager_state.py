@@ -1,4 +1,4 @@
-"""Exhaustive ``KVPoll`` state-machine tests (Stage 0).
+"""Exhaustive ``KVPoll`` state-machine tests.
 
 Covers every (current, next) pair across all five states. Legal pairs
 must succeed; everything else must raise ``ValueError``. ``SUCCESS`` and
@@ -19,7 +19,6 @@ from sgl_jax.srt.disaggregation.base.kv_manager import (
     is_legal_transition,
 )
 
-
 ALL_STATES = list(KVPoll)
 ALL_PAIRS = list(itertools.product(ALL_STATES, ALL_STATES))
 
@@ -30,20 +29,23 @@ def test_state_space_size():
 
 
 def test_legal_transitions_set_matches_rfc():
-    assert LEGAL_TRANSITIONS == frozenset(
-        {
-            (KVPoll.BOOTSTRAPPING, KVPoll.WAITING_FOR_INPUT),
-            (KVPoll.WAITING_FOR_INPUT, KVPoll.TRANSFERRING),
-            (KVPoll.TRANSFERRING, KVPoll.SUCCESS),
-            (KVPoll.BOOTSTRAPPING, KVPoll.FAILED),
-            (KVPoll.WAITING_FOR_INPUT, KVPoll.FAILED),
-            (KVPoll.TRANSFERRING, KVPoll.FAILED),
-        }
+    assert (
+        frozenset(
+            {
+                (KVPoll.BOOTSTRAPPING, KVPoll.WAITING_FOR_INPUT),
+                (KVPoll.WAITING_FOR_INPUT, KVPoll.TRANSFERRING),
+                (KVPoll.TRANSFERRING, KVPoll.SUCCESS),
+                (KVPoll.BOOTSTRAPPING, KVPoll.FAILED),
+                (KVPoll.WAITING_FOR_INPUT, KVPoll.FAILED),
+                (KVPoll.TRANSFERRING, KVPoll.FAILED),
+            }
+        )
+        == LEGAL_TRANSITIONS
     )
 
 
 def test_terminal_states():
-    assert TERMINAL_STATES == frozenset({KVPoll.SUCCESS, KVPoll.FAILED})
+    assert frozenset({KVPoll.SUCCESS, KVPoll.FAILED}) == TERMINAL_STATES
 
 
 @pytest.mark.parametrize(("current", "next_state"), ALL_PAIRS)
@@ -63,9 +65,7 @@ def test_exhaustive_transitions(current: KVPoll, next_state: KVPoll):
 
 @pytest.mark.parametrize("terminal", list(TERMINAL_STATES))
 @pytest.mark.parametrize("target", ALL_STATES)
-def test_terminal_states_reject_all_outgoing(
-    terminal: KVPoll, target: KVPoll
-):
+def test_terminal_states_reject_all_outgoing(terminal: KVPoll, target: KVPoll):
     holder = StateHolder(initial=terminal)
     with pytest.raises(ValueError, match="illegal KVPoll transition"):
         holder._transition_to(target)

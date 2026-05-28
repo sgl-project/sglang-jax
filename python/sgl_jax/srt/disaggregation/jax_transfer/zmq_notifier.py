@@ -1,10 +1,9 @@
 """D→P pull-done side channel.
 
 Decouples the prefill side from blocking on transfer completion. The
-Stage 0 sender optimistically advanced to ``SUCCESS`` right after
-``register_pull`` returned; in Stage 1 the sender waits for an explicit
-ack from the decoder before transitioning. The transport is ZMQ
-``DEALER → ROUTER`` carrying ``msgpack({"uuid": bytes})``.
+sender waits for an explicit ack from the decoder before transitioning to
+``SUCCESS``. The transport is ZMQ ``DEALER → ROUTER`` carrying
+``msgpack({"uuid": bytes})``.
 
 Threading model:
   * P side: ROUTER socket bound in :meth:`start`. A daemon listener
@@ -16,8 +15,8 @@ Threading model:
   * D side: A fresh DEALER socket per ``send_done`` call (no pool, no
     persistent connection). The send is fire-and-forget — if the P
     side has already torn down or hasn't bound yet, the ack is lost.
-    Recovery from lost acks is intentionally out of scope (Stage 4
-    hardening adds end-to-end timeouts).
+    Recovery from lost acks is intentionally handled by the higher-level
+    timeout and cleanup logic.
 
 Process-wide ZMQ context: ``zmq.Context.instance()``. Tests spinning
 up multiple notifiers on different ports share the context safely.
@@ -30,7 +29,7 @@ import logging
 import threading
 import time
 from collections import OrderedDict
-from typing import Callable, Dict, Optional, Set
+from collections.abc import Callable
 
 import msgpack
 import zmq
@@ -64,26 +63,22 @@ class ZmqPullNotifier:
         host: str,
         port: int,
         *,
-        shared_secret: Optional[str] = None,
+        shared_secret: str | None = None,
     ) -> None:
         if role not in ("prefill", "decode"):
-            raise ValueError(
-                f"role must be 'prefill' or 'decode', got {role!r}"
-            )
+            raise ValueError(f"role must be 'prefill' or 'decode', got {role!r}")
         self._role = role
         self._host = host
         self._port = port
         self._shared_secret = shared_secret
         self._ctx = zmq.Context.instance()
-        self._router: Optional[zmq.Socket] = None
+        self._router: zmq.Socket | None = None
         self._stop_event = threading.Event()
-        self._listener_thread: Optional[threading.Thread] = None
+        self._listener_thread: threading.Thread | None = None
         self._callbacks_lock = threading.Lock()
-        self._callbacks: Dict[bytes, PullDoneCallback] = {}
-        self._dispatching: Set[bytes] = set()
-        self._retired: OrderedDict[bytes, RetiredTransferInfo] = (
-            OrderedDict()
-        )
+        self._callbacks: dict[bytes, PullDoneCallback] = {}
+        self._dispatching: set[bytes] = set()
+        self._retired: OrderedDict[bytes, RetiredTransferInfo] = OrderedDict()
         self._max_retired = 4096
         self._started = False
 
@@ -128,7 +123,9 @@ class ZmqPullNotifier:
         self._started = True
         logger.info(
             "ZmqPullNotifier started role=%s addr=%s:%d",
-            self._role, self._host, self._port,
+            self._role,
+            self._host,
+            self._port,
         )
 
     def stop(self) -> None:
@@ -144,8 +141,7 @@ class ZmqPullNotifier:
                 # ROUTER socket from this thread is undefined behavior
                 # because pyzmq sockets are not thread-safe, but we
                 # log loudly and continue — leaving the listener
-                # running would leak the socket and the port. Stage 1
-                # review I3.
+                # running would leak the socket and the port.
                 logger.warning(
                     "ZmqPullNotifier listener at port %d did not stop "
                     "within 3s; closing socket from main thread, which "
@@ -162,9 +158,7 @@ class ZmqPullNotifier:
     # P side
     # ------------------------------------------------------------------
 
-    def register_callback(
-        self, uuid: bytes, cb: PullDoneCallback
-    ) -> None:
+    def register_callback(self, uuid: bytes, cb: PullDoneCallback) -> None:
         """Register ``cb`` to fire when an ack for ``uuid`` arrives.
 
         Raises ``RuntimeError`` if the same uuid is already registered;
@@ -173,21 +167,17 @@ class ZmqPullNotifier:
         """
 
         if self._role != "prefill":
-            raise RuntimeError(
-                "register_callback is only valid on prefill notifiers"
-            )
+            raise RuntimeError("register_callback is only valid on prefill notifiers")
         if not self._started:
             raise RuntimeError("call start() before register_callback")
         with self._callbacks_lock:
             self._dispatching.discard(uuid)
             self._retired.pop(uuid, None)
             if uuid in self._callbacks:
-                raise RuntimeError(
-                    f"uuid={uuid!r} already has a pending callback"
-                )
+                raise RuntimeError(f"uuid={uuid!r} already has a pending callback")
             self._callbacks[uuid] = cb
 
-    def unregister_callback(self, uuid: bytes) -> Optional[PullDoneCallback]:
+    def unregister_callback(self, uuid: bytes) -> PullDoneCallback | None:
         with self._callbacks_lock:
             return self._callbacks.pop(uuid, None)
 
@@ -195,9 +185,7 @@ class ZmqPullNotifier:
         with self._callbacks_lock:
             return len(self._callbacks)
 
-    def mark_retired(
-        self, uuid: bytes, *, state: str, reason: str
-    ) -> None:
+    def mark_retired(self, uuid: bytes, *, state: str, reason: str) -> None:
         """Remember that ``uuid`` reached a terminal state.
 
         This keeps a small bounded record after the live callback is
@@ -221,23 +209,18 @@ class ZmqPullNotifier:
     # D side
     # ------------------------------------------------------------------
 
-    def send_done(
-        self, uuid: bytes, target_host: str, target_port: int
-    ) -> None:
+    def send_done(self, uuid: bytes, target_host: str, target_port: int) -> None:
         """D→P: tell the prefill side ``uuid`` has been pulled.
 
         Fire-and-forget. Uses a fresh DEALER socket per call. The
         wrapper holds the ZMQ context, so socket creation is cheap.
 
-        When ``shared_secret`` is set the message carries an
-        ``hmac`` field; the prefill listener rejects messages without
-        a valid tag (Stage 4 H-C).
+        When ``shared_secret`` is set the message carries an ``hmac``
+        field; the prefill listener rejects messages without a valid tag.
         """
 
         if self._role != "decode":
-            raise RuntimeError(
-                "send_done is only valid on decode notifiers"
-            )
+            raise RuntimeError("send_done is only valid on decode notifiers")
         if not self._started:
             raise RuntimeError("call start() before send_done")
         payload = {"uuid": uuid}
@@ -272,8 +255,8 @@ class ZmqPullNotifier:
             # ROUTER prefix: [identity, payload]
             if len(frames) < 2:
                 logger.warning(
-                    "ZmqPullNotifier got malformed frame "
-                    "(len=%d), dropping", len(frames),
+                    "ZmqPullNotifier got malformed frame " "(len=%d), dropping",
+                    len(frames),
                 )
                 continue
             payload = frames[-1]
@@ -281,9 +264,7 @@ class ZmqPullNotifier:
                 msg = msgpack.unpackb(payload, raw=True)
                 uuid = msg[b"uuid"]
             except (msgpack.UnpackException, KeyError, TypeError) as e:
-                logger.warning(
-                    "ZmqPullNotifier failed to decode payload: %s", e
-                )
+                logger.warning("ZmqPullNotifier failed to decode payload: %s", e)
                 continue
             if self._shared_secret is not None:
                 from sgl_jax.srt.disaggregation.pd_auth import verify_tag
@@ -291,22 +272,20 @@ class ZmqPullNotifier:
                 candidate = msg.get(b"hmac") if isinstance(msg, dict) else None
                 if not verify_tag(self._shared_secret, uuid, candidate):
                     logger.warning(
-                        "ZmqPullNotifier dropping uuid=%r with "
-                        "missing/invalid HMAC", uuid,
+                        "ZmqPullNotifier dropping uuid=%r with " "missing/invalid HMAC",
+                        uuid,
                     )
                     try:
                         from sgl_jax.srt.disaggregation.metrics import (
                             PD_TRANSFER_FAILURES_TOTAL,
                         )
 
-                        PD_TRANSFER_FAILURES_TOTAL.labels(
-                            reason="auth", role="prefill"
-                        ).inc()
+                        PD_TRANSFER_FAILURES_TOTAL.labels(reason="auth", role="prefill").inc()
                     except Exception:  # noqa: BLE001
                         pass
                     continue
             dispatching = False
-            retired: Optional[RetiredTransferInfo] = None
+            retired: RetiredTransferInfo | None = None
             with self._callbacks_lock:
                 cb = self._callbacks.pop(uuid, None)
                 if cb is not None:
@@ -335,17 +314,14 @@ class ZmqPullNotifier:
                     )
                     continue
                 logger.warning(
-                    "ZmqPullNotifier received uuid=%r with no "
-                    "registered callback; dropping",
+                    "ZmqPullNotifier received uuid=%r with no " "registered callback; dropping",
                     uuid,
                 )
                 continue
             try:
                 cb(uuid)
             except Exception:
-                logger.exception(
-                    "ZmqPullNotifier callback for uuid=%r raised", uuid
-                )
+                logger.exception("ZmqPullNotifier callback for uuid=%r raised", uuid)
             finally:
                 with self._callbacks_lock:
                     self._dispatching.discard(uuid)

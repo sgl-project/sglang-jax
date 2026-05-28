@@ -1,8 +1,8 @@
-"""Stage 1 smoke coverage for PD-related ServerArgs and CLI flags.
+"""Smoke coverage for PD-related ServerArgs and CLI flags.
 
-This file intentionally stays narrower than the fuller Stage 2
-validation suite. Its goal is just to keep the Stage 1 CLI/config
-surface reviewable on its own.
+This file intentionally stays narrower than the fuller end-to-end
+validation suite. Its goal is to keep the CLI/config surface reviewable
+on its own.
 """
 
 from __future__ import annotations

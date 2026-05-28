@@ -12,9 +12,7 @@ import time
 
 import pytest
 
-from sgl_jax.srt.disaggregation.jax_transfer.zmq_notifier import (
-    ZmqPullNotifier,
-)
+from sgl_jax.srt.disaggregation.jax_transfer.zmq_notifier import ZmqPullNotifier
 
 
 def _free_port() -> int:
@@ -136,9 +134,10 @@ def test_concurrent_100_acks(p_notifier, d_notifier):
                 seen.append(uuid)
                 if len(seen) == n:
                     done.set()
+
         return cb
 
-    uuids = [f"req-{i:03d}".encode("utf-8") for i in range(n)]
+    uuids = [f"req-{i:03d}".encode() for i in range(n)]
     for u in uuids:
         p_notifier.register_callback(u, make_cb())
 

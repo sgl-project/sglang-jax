@@ -1,4 +1,4 @@
-"""Stage 4 H-A: PD metrics module.
+"""PD metrics module.
 
 The real prometheus_client may or may not be installed depending on
 the deployment image. ``metrics.py`` must not crash either way and
@@ -8,8 +8,6 @@ sockets.
 """
 
 from __future__ import annotations
-
-import pytest
 
 from sgl_jax.srt.disaggregation import metrics as M
 
@@ -26,9 +24,7 @@ def test_state_transition_counter_accepts_labels():
 def test_transfer_bytes_counter_directions():
     for direction in ("d2h", "h2d", "net"):
         for role in ("prefill", "decode"):
-            M.PD_TRANSFER_BYTES_TOTAL.labels(
-                direction=direction, role=role
-            ).inc(1024)
+            M.PD_TRANSFER_BYTES_TOTAL.labels(direction=direction, role=role).inc(1024)
 
 
 def test_transfer_duration_phases():
@@ -45,12 +41,16 @@ def test_transfer_inflight_inc_dec():
 
 def test_transfer_failures_reasons():
     for reason in (
-        "timeout", "peer_crash", "network", "auth",
-        "bootstrap_lookup", "receiver_init", "shutdown", "other",
+        "timeout",
+        "peer_crash",
+        "network",
+        "auth",
+        "bootstrap_lookup",
+        "receiver_init",
+        "shutdown",
+        "other",
     ):
-        M.PD_TRANSFER_FAILURES_TOTAL.labels(
-            reason=reason, role="decode"
-        ).inc()
+        M.PD_TRANSFER_FAILURES_TOTAL.labels(reason=reason, role="decode").inc()
 
 
 def test_host_pool_helpers_balance():

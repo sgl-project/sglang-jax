@@ -1,4 +1,4 @@
-"""PD Prometheus metrics (Stage 4 H-A).
+"""PD Prometheus metrics.
 
 All metric names follow the RFC schema. If ``prometheus_client`` is
 not installed the module installs no-op stubs so production code can
@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Optional
+from contextlib import suppress
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ except ImportError:  # noqa: BLE001
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        def labels(self, *args, **kwargs) -> "_Noop":
+        def labels(self, *args, **kwargs) -> _Noop:
             return self
 
         def inc(self, amount: float = 1.0) -> None:
@@ -124,9 +124,9 @@ class _DurationTimer:
 
     def __init__(self, metric) -> None:
         self._metric = metric
-        self._start: Optional[float] = None
+        self._start: float | None = None
 
-    def __enter__(self) -> "_DurationTimer":
+    def __enter__(self) -> _DurationTimer:
         import time as _time
 
         self._start = _time.perf_counter()
@@ -148,9 +148,7 @@ def time_phase(phase: str, role: str) -> _DurationTimer:
     """Return a context manager that records a phase duration into
     :data:`PD_TRANSFER_DURATION_SECONDS` with the given labels."""
 
-    return _DurationTimer(
-        PD_TRANSFER_DURATION_SECONDS.labels(phase=phase, role=role)
-    )
+    return _DurationTimer(PD_TRANSFER_DURATION_SECONDS.labels(phase=phase, role=role))
 
 
 # Process-wide counter of (pool name -> currently allocated) so we
@@ -166,17 +164,13 @@ def host_pool_alloc(pool_name: str, count: int = 1) -> None:
     with _pool_in_use_lock:
         new = _pool_in_use.get(pool_name, 0) + count
         _pool_in_use[pool_name] = new
-    try:
+    with suppress(Exception):
         PD_HOST_POOL_USED_BUFFERS.labels(pool_name=pool_name).set(new)
-    except Exception:  # noqa: BLE001
-        pass
 
 
 def host_pool_free(pool_name: str, count: int = 1) -> None:
     with _pool_in_use_lock:
         new = max(0, _pool_in_use.get(pool_name, 0) - count)
         _pool_in_use[pool_name] = new
-    try:
+    with suppress(Exception):
         PD_HOST_POOL_USED_BUFFERS.labels(pool_name=pool_name).set(new)
-    except Exception:  # noqa: BLE001
-        pass

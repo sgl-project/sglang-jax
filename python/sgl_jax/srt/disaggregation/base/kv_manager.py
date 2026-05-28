@@ -13,7 +13,6 @@ from __future__ import annotations
 import abc
 import enum
 import logging
-from typing import FrozenSet, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -28,12 +27,10 @@ class KVPoll(enum.Enum):
     FAILED = "failed"
 
 
-TERMINAL_STATES: FrozenSet[KVPoll] = frozenset(
-    {KVPoll.SUCCESS, KVPoll.FAILED}
-)
+TERMINAL_STATES: frozenset[KVPoll] = frozenset({KVPoll.SUCCESS, KVPoll.FAILED})
 
 
-LEGAL_TRANSITIONS: FrozenSet[Tuple[KVPoll, KVPoll]] = frozenset(
+LEGAL_TRANSITIONS: frozenset[tuple[KVPoll, KVPoll]] = frozenset(
     {
         (KVPoll.BOOTSTRAPPING, KVPoll.WAITING_FOR_INPUT),
         (KVPoll.WAITING_FOR_INPUT, KVPoll.TRANSFERRING),
@@ -58,15 +55,16 @@ class StateHolder:
     backend (current and future) is expected to use it directly.
 
     ``role`` is one of ``"prefill"`` / ``"decode"`` and feeds the
-    ``role`` label on Stage 4 PD metrics. ``None`` means the holder is
-    used outside of a sender/receiver and no metric will be emitted.
+    metrics label used by sender/receiver state transitions. ``None``
+    means the holder is used outside of a sender/receiver and no metric
+    will be emitted.
     """
 
     def __init__(
         self,
         initial: KVPoll = KVPoll.BOOTSTRAPPING,
         *,
-        role: Optional[str] = None,
+        role: str | None = None,
     ) -> None:
         self._state: KVPoll = initial
         self._role = role
@@ -76,22 +74,19 @@ class StateHolder:
         return self._state
 
     @property
-    def role(self) -> Optional[str]:
+    def role(self) -> str | None:
         return self._role
 
     def _transition_to(self, next_state: KVPoll) -> None:
         if not is_legal_transition(self._state, next_state):
             raise ValueError(
-                f"illegal KVPoll transition: "
-                f"{self._state.value} -> {next_state.value}"
+                f"illegal KVPoll transition: " f"{self._state.value} -> {next_state.value}"
             )
         from_state = self._state
         self._state = next_state
         if self._role is not None:
             try:
-                from sgl_jax.srt.disaggregation.metrics import (
-                    PD_STATE_TRANSITION_TOTAL,
-                )
+                from sgl_jax.srt.disaggregation.metrics import PD_STATE_TRANSITION_TOTAL
 
                 PD_STATE_TRANSITION_TOTAL.labels(
                     from_state=from_state.value,
@@ -106,32 +101,29 @@ class KVManager(abc.ABC):
     """Per-process factory that produces sender/receiver handles."""
 
     @abc.abstractmethod
-    def create_sender(self, req_id: str) -> "KVSender":
-        ...
+    def create_sender(self, req_id: str) -> KVSender: ...
 
     @abc.abstractmethod
-    def create_receiver(self, req_id: str) -> "KVReceiver":
-        ...
+    def create_receiver(self, req_id: str) -> KVReceiver: ...
 
 
 class KVSender(abc.ABC):
     """Prefill-side per-request handle."""
 
     @abc.abstractmethod
-    def init(self, kv_indices, transfer_id: Optional[str] = None) -> None:
-        ...
+    def init(self, kv_indices, transfer_id: str | None = None) -> None: ...
 
     @abc.abstractmethod
-    def send(self) -> None:
-        ...
+    def send(self) -> None: ...
 
     @abc.abstractmethod
-    def poll(self) -> KVPoll:
-        ...
+    def poll(self) -> KVPoll: ...
 
+    @abc.abstractmethod
     def clear(self) -> None:
         """Drop backend-local retained terminal state."""
 
+    @abc.abstractmethod
     def abort(self) -> None:
         """Abort the current transfer."""
 
@@ -145,16 +137,16 @@ class KVReceiver(abc.ABC):
     """Decode-side per-request handle."""
 
     @abc.abstractmethod
-    def init(self, p_metadata) -> None:
-        ...
+    def init(self, p_metadata) -> None: ...
 
     @abc.abstractmethod
-    def poll(self) -> KVPoll:
-        ...
+    def poll(self) -> KVPoll: ...
 
+    @abc.abstractmethod
     def clear(self) -> None:
         """Drop backend-local retained terminal state."""
 
+    @abc.abstractmethod
     def abort(self) -> None:
         """Abort the current transfer."""
 
