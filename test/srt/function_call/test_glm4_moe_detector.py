@@ -12,6 +12,7 @@ Run with:
 """
 
 import json
+import unittest
 
 from sgl_jax.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sgl_jax.test.test_utils import CustomTestCase
@@ -76,13 +77,17 @@ class TestGlm4MoeDetector(CustomTestCase):
             "</tool_call>",
         ]
         out_calls = []
+        out_normal = ""
         for ch in chunks:
             r = det.parse_streaming_increment(ch, tools)
+            out_normal += r.normal_text
             out_calls.extend(r.calls)
         names = [c.name for c in out_calls if c.name]
         self.assertEqual(names, ["execute_bash"])
         joined = "".join(c.parameters for c in out_calls)
         self.assertEqual(json.loads(joined), {"command": "ls"})
+        self.assertNotIn("<tool_call>", out_normal)
+        self.assertNotIn("</tool_call>", out_normal)
 
     def test_detect_and_parse_malformed_skipped(self):
         text = (
@@ -107,13 +112,16 @@ class TestGlm4MoeDetector(CustomTestCase):
         self.assertEqual(result.calls, [])
 
     def test_detect_and_parse_literal_newline(self):
-        """GLM4 MOE also supports literal \\n characters as separators."""
+        # "\\n" in a regular Python string is two characters: backslash + 'n',
+        # NOT an actual newline.  This exercises the \\n branch of the regex
+        # r"(?:\\n|\n)" which matches the literal two-char sequence.
         text = (
             "<tool_call>execute_bash\\n"
             "<arg_key>command</arg_key>\\n"
             "<arg_value>ls</arg_value>\\n"
             "</tool_call>"
         )
+        self.assertNotIn("\n", text)  # Verify no actual newlines
         result = Glm4MoeDetector().detect_and_parse(text, [C.bash_tool()])
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "execute_bash")
@@ -143,6 +151,4 @@ class TestGlm4MoeDetector(CustomTestCase):
 
 
 if __name__ == "__main__":
-    import unittest
-
     unittest.main()

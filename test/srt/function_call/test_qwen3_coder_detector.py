@@ -13,10 +13,18 @@ Run with:
 """
 
 import json
+import unittest
 
 from sgl_jax.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sgl_jax.test.test_utils import CustomTestCase
 from sgl_jax.test.tool_parser_test_config import ToolParserTestConfig as C
+
+try:
+    from importlib.util import find_spec
+
+    _HAS_LLGUIDANCE = find_spec("llguidance") is not None
+except Exception:
+    _HAS_LLGUIDANCE = False
 
 
 class TestQwen3CoderDetector(CustomTestCase):
@@ -28,6 +36,7 @@ class TestQwen3CoderDetector(CustomTestCase):
     def test_detect_and_parse_no_tool_call(self):
         text = "just a normal answer with no tool"
         result = Qwen3CoderDetector().detect_and_parse(text, [C.bash_tool()])
+        # Qwen3Coder._extract does not strip normal_text (unlike GLM4's .strip()).
         self.assertEqual(result.normal_text, text)
         self.assertEqual(result.calls, [])
 
@@ -69,7 +78,6 @@ class TestQwen3CoderDetector(CustomTestCase):
         det = Qwen3CoderDetector()
         tools = [C.bash_tool()]
         chunks = [
-            "plain text. ",
             "<tool_call>\n",
             "<function=execute_bash>\n",
             "<parameter=command>ls</parameter>\n",
@@ -86,8 +94,24 @@ class TestQwen3CoderDetector(CustomTestCase):
         self.assertEqual(names, ["execute_bash"])
         joined = "".join(c.parameters for c in out_calls)
         self.assertEqual(json.loads(joined), {"command": "ls"})
-        self.assertNotIn("<tool_call>", out_normal)
         self.assertNotIn("</tool_call>", out_normal)
+
+    def test_streaming_normal_text_then_call(self):
+        det = Qwen3CoderDetector()
+        tools = [C.bash_tool()]
+        r1 = det.parse_streaming_increment("plain text. ", tools)
+        self.assertEqual(r1.normal_text, "plain text. ")
+        self.assertEqual(r1.calls, [])
+
+        r2 = det.parse_streaming_increment(
+            "<tool_call>\n<function=execute_bash>\n"
+            "<parameter=command>ls</parameter>\n</function>\n</tool_call>",
+            tools,
+        )
+        names = [c.name for c in r2.calls if c.name]
+        self.assertIn("execute_bash", names)
+        self.assertNotIn("<tool_call>", r2.normal_text)
+        self.assertNotIn("</tool_call>", r2.normal_text)
 
     def test_detect_and_parse_malformed_skipped(self):
         text = (
@@ -106,14 +130,19 @@ class TestQwen3CoderDetector(CustomTestCase):
 
     def test_detect_and_parse_unknown_function(self):
         text = (
+            "before\n"
             "<tool_call>\n"
             "<function=mystery>\n"
             "<parameter=x>1</parameter>\n"
             "</function>\n"
-            "</tool_call>"
+            "</tool_call>\n"
+            "after"
         )
         result = Qwen3CoderDetector().detect_and_parse(text, [C.bash_tool()])
         self.assertEqual(result.calls, [])
+        # _extract consumes the <tool_call> block; unknown function is dropped
+        # but surrounding text is preserved.
+        self.assertIn("before", result.normal_text)
 
     def test_safe_val_html_unescape(self):
         text = (
@@ -128,11 +157,31 @@ class TestQwen3CoderDetector(CustomTestCase):
         args = json.loads(result.calls[0].parameters)
         self.assertEqual(args["command"], 'echo "hi" && ls')
 
+    def test_detect_and_parse_param_types(self):
+        text = (
+            "<tool_call>\n"
+            "<function=do_thing>\n"
+            "<parameter=n>42</parameter>\n"
+            "<parameter=ratio>3.14</parameter>\n"
+            "<parameter=flag>true</parameter>\n"
+            '<parameter=obj>{"k": 1}</parameter>\n'
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = Qwen3CoderDetector().detect_and_parse(text, [C.typed_tool()])
+        self.assertEqual(len(result.calls), 1)
+        args = json.loads(result.calls[0].parameters)
+        self.assertEqual(args["n"], 42)
+        self.assertEqual(args["ratio"], 3.14)
+        self.assertIs(args["flag"], True)
+        self.assertEqual(args["obj"], {"k": 1})
+
     def test_build_ebnf_contains_tool_name(self):
         grammar = Qwen3CoderDetector().build_ebnf([C.bash_tool(), C.weather_tool()])
         self.assertIn("execute_bash", grammar)
         self.assertIn("get_weather", grammar)
 
+    @unittest.skipUnless(_HAS_LLGUIDANCE, "llguidance not installed")
     def test_build_ebnf_compiles(self):
         from llguidance import grammar_from
 
@@ -141,6 +190,4 @@ class TestQwen3CoderDetector(CustomTestCase):
 
 
 if __name__ == "__main__":
-    import unittest
-
     unittest.main()
