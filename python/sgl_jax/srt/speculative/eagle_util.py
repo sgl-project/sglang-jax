@@ -1030,9 +1030,12 @@ class EagleVerifyInput:
                 rng=rng,
             )
 
-        predict = np.asarray(jax.device_get(predict))
-        accept_index = np.asarray(jax.device_get(accept_index))
-        accept_length = np.asarray(jax.device_get(accept_length))
+        for arr in (predict, accept_index, accept_length):
+            if hasattr(arr, "copy_to_host_async"):
+                arr.copy_to_host_async()
+        predict = np.asarray(predict)
+        accept_index = np.asarray(accept_index)
+        accept_length = np.asarray(accept_length)
 
         accept_length = accept_length + 1
         accept_index = accept_index.flatten()

@@ -155,11 +155,18 @@ class EagleDraftWorker(BaseDraftWorker):
                 )
             )
             rep = NamedSharding(self.mesh, P())
-            draft_tokens = jax.device_put(jnp.asarray(draft_tokens_np), rep)
-            position = jax.device_put(jnp.asarray(position), rep)
-            retrive_index = jax.device_put(jnp.asarray(retrive_index), rep)
-            retrive_next_token = jax.device_put(jnp.asarray(retrive_next_token), rep)
-            retrive_next_sibling = jax.device_put(jnp.asarray(retrive_next_sibling), rep)
+            draft_tokens, position, retrive_index, retrive_next_token, retrive_next_sibling = (
+                jax.device_put(
+                    (
+                        jnp.asarray(draft_tokens_np),
+                        jnp.asarray(position),
+                        jnp.asarray(retrive_index),
+                        jnp.asarray(retrive_next_token),
+                        jnp.asarray(retrive_next_sibling),
+                    ),
+                    rep,
+                )
+            )
             tree_mask = None
         else:
             max_seq_len = int(np.max(verified_seq_lens)) if verified_seq_lens.size > 0 else 1
@@ -282,7 +289,9 @@ class EagleDraftWorker(BaseDraftWorker):
             logits_metadata=logits_metadata,
         )
         sel = np.asarray(model_worker_batch.logits_indices_selector)
-        accept_host = np.asarray(jax.device_get(batch_output.accept_lens))
+        if hasattr(batch_output.accept_lens, "copy_to_host_async"):
+            batch_output.accept_lens.copy_to_host_async()
+        accept_host = np.asarray(batch_output.accept_lens)
         select_index = sel * (self.speculative_num_steps + 1) + accept_host[sel] - 1
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, draft_logits_output.next_token_logits, draft_logits_output.hidden_states
@@ -505,42 +514,33 @@ class EagleDraftWorker(BaseDraftWorker):
         return 1 << (max_seq_len - 1).bit_length()
 
     def copy_model_worker_batch_to_cpu(self, model_worker_batch: ModelWorkerBatch):
-        model_worker_batch.input_ids = np.array(
-            jax.device_get(model_worker_batch.input_ids), dtype=model_worker_batch.input_ids.dtype
-        )
-        model_worker_batch.seq_lens = np.array(
-            jax.device_get(model_worker_batch.seq_lens), dtype=model_worker_batch.seq_lens.dtype
-        )
-        model_worker_batch.out_cache_loc = np.array(
-            jax.device_get(model_worker_batch.out_cache_loc),
-            dtype=model_worker_batch.out_cache_loc.dtype,
-        )
-        model_worker_batch.positions = np.array(
-            jax.device_get(model_worker_batch.positions), dtype=model_worker_batch.positions.dtype
-        )
-        model_worker_batch.req_pool_indices = np.array(
-            jax.device_get(model_worker_batch.req_pool_indices),
-            dtype=model_worker_batch.req_pool_indices.dtype,
-        )
-        model_worker_batch.cache_loc = np.array(
-            jax.device_get(model_worker_batch.cache_loc), dtype=model_worker_batch.cache_loc.dtype
-        )
-        model_worker_batch.extend_prefix_lens = (
-            np.array(
-                jax.device_get(model_worker_batch.extend_prefix_lens),
-                dtype=model_worker_batch.extend_prefix_lens.dtype,
-            )
-            if model_worker_batch.extend_prefix_lens is not None
-            else None
-        )
-        model_worker_batch.extend_seq_lens = (
-            np.array(
-                jax.device_get(model_worker_batch.extend_seq_lens),
-                dtype=model_worker_batch.extend_seq_lens.dtype,
-            )
-            if model_worker_batch.extend_seq_lens is not None
-            else None
-        )
+        mwb = model_worker_batch
+        fields = [
+            "input_ids",
+            "seq_lens",
+            "out_cache_loc",
+            "positions",
+            "req_pool_indices",
+            "cache_loc",
+        ]
+        optional = ["extend_prefix_lens", "extend_seq_lens"]
+
+        for name in fields:
+            arr = getattr(mwb, name)
+            if hasattr(arr, "copy_to_host_async"):
+                arr.copy_to_host_async()
+        for name in optional:
+            arr = getattr(mwb, name)
+            if arr is not None and hasattr(arr, "copy_to_host_async"):
+                arr.copy_to_host_async()
+
+        for name in fields:
+            arr = getattr(mwb, name)
+            setattr(mwb, name, np.asarray(arr))
+        for name in optional:
+            arr = getattr(mwb, name)
+            if arr is not None:
+                setattr(mwb, name, np.asarray(arr))
 
     def get_padding_bs(self, real_bs: int) -> int:
         self.precompile_bs_paddings.sort()

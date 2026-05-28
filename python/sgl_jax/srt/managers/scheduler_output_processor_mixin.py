@@ -260,8 +260,12 @@ class SchedulerOutputProcessorMixin:
         with ``[]`` at padding slots, so the per-rank slice in
         ``process_batch_result_decode`` works for any ``dp_size``.
         """
-        next_token_ids = np.asarray(jax.device_get(result.next_token_ids))
-        accept_lens = np.asarray(jax.device_get(result.accept_lens)).tolist()
+        if hasattr(result.next_token_ids, "copy_to_host_async"):
+            result.next_token_ids.copy_to_host_async()
+        if hasattr(result.accept_lens, "copy_to_host_async"):
+            result.accept_lens.copy_to_host_async()
+        next_token_ids = np.asarray(result.next_token_ids)
+        accept_lens = np.asarray(result.accept_lens).tolist()
         stride = self.draft_worker.speculative_num_draft_tokens
         per_dp_bs = batch.per_dp_bs_size
         total_bs = per_dp_bs * batch.dp_size
