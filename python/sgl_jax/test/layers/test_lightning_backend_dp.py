@@ -348,9 +348,20 @@ class TestDPDecode:
         k_np = rng.standard_normal((B, 1, H, K)).astype(np.float32)
         v_np = rng.standard_normal((B, 1, H, K)).astype(np.float32)
 
-        # Different initial states per DP shard
+        # Distinct initial states per DP shard. Shard 1's h0 is 2x larger
+        # so the post-step state magnitudes are distinguishable; iid
+        # same-scale draws would land within rtol=0.1 and the magnitude
+        # assertion below would degenerate into a no-op.
+        #
+        # ``_make_mock_pool`` with ``dp_size=2`` allocates a
+        # (B_per_rank + 1)-slot local buffer per rank; the first
+        # B_per_rank entries of ``h0_np`` go to rank 0's local slots
+        # [1..B_per_rank] and the next B_per_rank entries go to rank 1's
+        # local slots [1..B_per_rank]. Per-rank batch indices must
+        # therefore be LOCAL (e.g. [1, 2] for B_per_rank=2), matching
+        # ``test_decode_dp2_tp2_matches_tp4``.
         h0_shard0 = rng.standard_normal((2, H, K, K)).astype(np.float32)
-        h0_shard1 = rng.standard_normal((2, H, K, K)).astype(np.float32)
+        h0_shard1 = rng.standard_normal((2, H, K, K)).astype(np.float32) * 2.0
         h0_np = np.concatenate([h0_shard0, h0_shard1], axis=0)
 
         mesh_dp = create_device_mesh(ici_parallelism=[2, 2], dcn_parallelism=[1, 1])
@@ -361,15 +372,19 @@ class TestDPDecode:
                 num_hidden_layers=80,
                 num_heads=H,
             )
-            rec_indices = np.arange(1, B + 1, dtype=np.int32)
+            # Default ``recurrent_indices=None`` → [1, ..., B_per_rank] per rank.
+            local_indices = np.arange(1, B // 2 + 1, dtype=np.int32)
             pool, _ = _make_mock_pool(
-                _LAYER_ID, jnp.array(h0_np), rec_indices, dp_size=2, mesh=mesh_dp
+                _LAYER_ID, jnp.array(h0_np), local_indices, dp_size=2, mesh=mesh_dp
             )
+            # Batch-side indices: tile per-rank local indices so each rank's
+            # shard receives its own [1, 2] (within local-buffer bounds).
+            batch_rec_indices = np.tile(local_indices, 2)
 
             batch = SimpleNamespace(
                 forward_mode=ForwardMode.DECODE,
                 seq_lens=np.ones(B, dtype=np.int32),
-                recurrent_indices=rec_indices,
+                recurrent_indices=batch_rec_indices,
                 has_initial_state=np.ones(B, dtype=np.bool_),
                 dp_size=2,
                 per_dp_bs_size=B // 2,
@@ -385,17 +400,17 @@ class TestDPDecode:
             v = jnp.array(v_np).reshape(B, H, K)
 
             out, pu = backend(q, k, v, layer=layer, forward_batch=fb, recurrent_state_pool=pool)
-            state = _extract_state(pu, rec_indices)
+            state = _extract_state(pu, local_indices, dp_size=2)
 
-        # Verify each request's output reflects its distinct initial state
-        # Requests 0,1 (shard 0) should differ from requests 2,3 (shard 1)
+        # Verify each request's output reflects its distinct initial state.
+        # state_np shape is (B, H, K, K) with the first 2 rows belonging to
+        # DP rank 0 (h0_shard0) and the last 2 to rank 1 (h0_shard1 = 2×).
         state_np = np.array(state)
-
-        # State magnitude should reflect initial state scale
         shard0_mag = np.abs(state_np[:2]).mean()
         shard1_mag = np.abs(state_np[2:]).mean()
 
-        # Shard 1 had 2x larger h0 → should have noticeably different magnitude
+        # Shard 1 had 2× larger h0 → post-step magnitudes should differ
+        # noticeably (>10%). Catches state leakage between DP shards.
         assert not np.allclose(
             shard0_mag, shard1_mag, rtol=0.1
         ), "DP shards should have distinct state magnitudes"
