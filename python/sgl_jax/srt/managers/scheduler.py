@@ -1680,7 +1680,9 @@ class Scheduler(
 
         # Check if decode out of memory
         if not batch.check_decode_mem() or (
-            TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
+            TEST_RETRACT
+            and batch.batch_size() > 10
+            and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             old_ratio = self.new_token_ratio
 
