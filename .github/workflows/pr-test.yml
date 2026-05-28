@@ -96,7 +96,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0]
+        part: [0, 1, 2]
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -113,7 +113,7 @@ jobs:
           HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
           bash scripts/killall_sglang.sh
-          python test/srt/run_suite.py --suite e2e-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
+          python test/srt/run_suite.py --suite e2e-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
 
   e2e-test-4-tpu:
