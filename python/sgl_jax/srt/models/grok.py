@@ -313,10 +313,10 @@ class Grok1MoE(nnx.Module):
             hidden_states, self.mesh, enable_sp=self.enable_sequence_parallel
         )
 
-        # Router computation with soft capping
-        router_logits, _ = self.gate(
-            hidden_states, out_sharding=NamedSharding(self.mesh, P("data", None))
-        )
+        # Router computation with soft capping. Match the gate output to the
+        # experts' token-dim sharding so router_logits / topk arrays land on the
+        # same axis as ``hidden_states`` going into the fused MoE kernel.
+        router_logits, _ = self.gate(hidden_states, out_sharding=experts_out_sharding)
 
         # Apply soft capping for stability (matching sglang implementation)
         if self.router_logit_softcapping != 0:
