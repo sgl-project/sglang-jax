@@ -291,24 +291,31 @@ def get_tokenizer(
             tokenizer_name = sub_dir_path
         # else: use the root path, tokenizer might be in model root
 
-    # Workaround: Intercept TokenizersBackend to prevent loading failure in transformers < 5.0
+    # Workaround: Intercept TokenizersBackend and list-type extra_special_tokens
+    # to prevent loading failure in transformers < 5.0
     import json
     tokenizer_config_path = os.path.join(tokenizer_name, "tokenizer_config.json")
     if os.path.exists(tokenizer_config_path):
         try:
             with open(tokenizer_config_path, "r", encoding="utf-8") as f:
                 config_data = json.load(f)
+            is_patched = False
             if config_data.get("tokenizer_class") == "TokenizersBackend":
-                config_data["tokenizer_class"] = "PreTrainedTokenizerFast"
+                config_data.pop("tokenizer_class", None)
+                is_patched = True
+            if "extra_special_tokens" in config_data and isinstance(config_data["extra_special_tokens"], list):
+                config_data.pop("extra_special_tokens", None)
+                is_patched = True
+            if is_patched:
                 with open(tokenizer_config_path, "w", encoding="utf-8") as f:
                     json.dump(config_data, f, indent=2)
                 warnings.warn(
-                    f"Patched tokenizer_class from TokenizersBackend to PreTrainedTokenizerFast in {tokenizer_config_path} to maintain compatibility with your transformers library version.",
+                    f"Patched tokenizer_config.json in {tokenizer_config_path} to maintain compatibility with your transformers library version.",
                     stacklevel=2,
                 )
         except Exception as e:
             warnings.warn(
-                f"Failed to dynamically patch TokenizersBackend in tokenizer_config.json: {e}",
+                f"Failed to dynamically patch tokenizer_config.json: {e}",
                 stacklevel=2,
             )
 
