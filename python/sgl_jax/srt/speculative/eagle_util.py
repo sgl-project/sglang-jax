@@ -295,6 +295,40 @@ def build_tree_mask_for_draft_decode(
     return jnp.asarray(concatenated, dtype=jnp.int32)
 
 
+def build_chain_verify_inputs(
+    verified_id: np.ndarray,
+    token_list: np.ndarray,
+    seq_lens: np.ndarray,
+    num_verify_tokens: int,
+    batch_size: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build verify inputs for topk=1 (linear chain) without tree mask.
+
+    When topk=1 the draft tree is a simple chain, so causal attention is
+    equivalent to the tree mask.  Skipping ``build_eagle_tree_structure``
+    avoids allocating the O(bs * context_len * draft_token_num) mask buffer
+    that causes HBM OOM on memory-constrained chips.
+    """
+    n = num_verify_tokens
+    draft_tokens = np.empty(batch_size * n, dtype=np.int32)
+    positions = np.empty(batch_size * n, dtype=np.int32)
+    retrive_index = np.empty((batch_size, n), dtype=np.int32)
+    retrive_next_token = np.full((batch_size, n), -1, dtype=np.int32)
+    retrive_next_sibling = np.full((batch_size, n), -1, dtype=np.int32)
+
+    for bid in range(batch_size):
+        off = bid * n
+        draft_tokens[off] = verified_id[bid]
+        draft_tokens[off + 1 : off + n] = token_list[bid, : n - 1]
+        for tid in range(n):
+            positions[off + tid] = seq_lens[bid] + tid
+            retrive_index[bid, tid] = off + tid
+            if tid < n - 1:
+                retrive_next_token[bid, tid] = tid + 1
+
+    return positions, retrive_index, retrive_next_token, retrive_next_sibling, draft_tokens
+
+
 def build_tree_kernel_efficient(
     verified_id: jax.Array,
     score_list: jax.Array,
@@ -744,8 +778,8 @@ class EagleVerifyInput:
     #: device ``(b*draft_token_num,)`` — flattened draft tokens to verify.
     draft_token: jax.Array
     #: device ``(sum(q_i*kv_i),)`` — tree attention mask; shape participates
-    #: in the JIT cache key.
-    custom_mask: jax.Array
+    #: in the JIT cache key.  ``None`` when topk=1 (chain mode uses causal).
+    custom_mask: jax.Array | None
     #: device ``(b*draft_token_num,)`` — verify positions (follows
     #: ``ForwardBatch`` host/device convention).
     positions: jax.Array

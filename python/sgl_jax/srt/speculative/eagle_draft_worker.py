@@ -20,6 +20,7 @@ from sgl_jax.srt.speculative.base_worker import BaseDraftWorker, replicate_to_me
 from sgl_jax.srt.speculative.eagle_util import (
     EagleDraftInput,
     EagleVerifyInput,
+    build_chain_verify_inputs,
     build_tree_kernel_efficient,
     build_tree_mask_for_draft_decode,
 )
@@ -136,29 +137,55 @@ class EagleDraftWorker(BaseDraftWorker):
         self.padding_for_decode(model_worker_batch)
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
         verified_seq_lens = model_worker_batch.seq_lens - 1
-        max_seq_len = int(np.max(verified_seq_lens)) if verified_seq_lens.size > 0 else 1
-        max_context_len = self._pick_context_len(max_seq_len)
-        (
-            tree_mask,
-            position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            draft_tokens,
-        ) = build_tree_kernel_efficient(
-            model_worker_batch.spec_info_padded.verified_id,
-            score_list,
-            token_list,
-            parents_list,
-            verified_seq_lens,
-            np.sum(verified_seq_lens),
-            self.topk,
-            self.speculative_num_draft_tokens,
-            max_context_len,
-            model_worker_batch.seq_lens.shape[0],
-            model_worker_batch.speculative_num_steps,
-            self.mesh,
-        )
+        bs = model_worker_batch.seq_lens.shape[0]
+
+        if self.topk == 1:
+            token_list_cpu = np.asarray(jax.device_get(token_list))
+            verified_id_cpu = np.asarray(
+                jax.device_get(model_worker_batch.spec_info_padded.verified_id)
+            )
+            seq_lens_cpu = np.asarray(verified_seq_lens)
+            (position, retrive_index, retrive_next_token, retrive_next_sibling, draft_tokens_np) = (
+                build_chain_verify_inputs(
+                    verified_id_cpu,
+                    token_list_cpu,
+                    seq_lens_cpu,
+                    self.speculative_num_draft_tokens,
+                    bs,
+                )
+            )
+            rep = NamedSharding(self.mesh, P())
+            draft_tokens = jax.device_put(jnp.asarray(draft_tokens_np), rep)
+            position = jax.device_put(jnp.asarray(position), rep)
+            retrive_index = jax.device_put(jnp.asarray(retrive_index), rep)
+            retrive_next_token = jax.device_put(jnp.asarray(retrive_next_token), rep)
+            retrive_next_sibling = jax.device_put(jnp.asarray(retrive_next_sibling), rep)
+            tree_mask = None
+        else:
+            max_seq_len = int(np.max(verified_seq_lens)) if verified_seq_lens.size > 0 else 1
+            max_context_len = self._pick_context_len(max_seq_len)
+            (
+                tree_mask,
+                position,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                draft_tokens,
+            ) = build_tree_kernel_efficient(
+                model_worker_batch.spec_info_padded.verified_id,
+                score_list,
+                token_list,
+                parents_list,
+                verified_seq_lens,
+                np.sum(verified_seq_lens),
+                self.topk,
+                self.speculative_num_draft_tokens,
+                max_context_len,
+                bs,
+                model_worker_batch.speculative_num_steps,
+                self.mesh,
+            )
+
         model_worker_batch.spec_info_padded = EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
