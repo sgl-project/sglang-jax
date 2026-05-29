@@ -145,6 +145,38 @@ def _arr_host_bytes(arr: jax.Array) -> bytes:
     return b"".join(parts)
 
 
+def _dtype_itemsize(dtype: jnp.dtype) -> int:
+    return np.dtype(dtype).itemsize
+
+
+def _print_cell_result(
+    *,
+    level: str,
+    path_name: str,
+    dtype_name: str,
+    page_count: int,
+    num_iters: int,
+    itemsize: int,
+    elapsed_s: float,
+) -> None:
+    bytes_per_iter = page_count * PAGE_ELEMS * itemsize
+    total_bytes = bytes_per_iter * num_iters
+    throughput_mib_s = total_bytes / max(elapsed_s, 1e-9) / (1024**2)
+    print(
+        "[RESULT] "
+        f"level={level} "
+        f"path={path_name} "
+        f"dtype={dtype_name} "
+        f"pages={page_count} "
+        f"iters={num_iters} "
+        f"bytes_per_iter={bytes_per_iter} "
+        f"total_bytes={total_bytes} "
+        f"elapsed_ms={elapsed_s * 1e3:.1f} "
+        f"throughput_mib_s={throughput_mib_s:.2f}",
+        flush=True,
+    )
+
+
 # --- control channel --------------------------------------------------------
 
 
@@ -230,6 +262,7 @@ def _prefill(args: argparse.Namespace) -> int:
 
     for cell in cells:
         nelem = cell.page_count * PAGE_ELEMS
+        cell_t0 = time.perf_counter()
         # Per-cell pool + mgr for path A: pool dtype must match cell
         # dtype, otherwise the ``.at[:n].set(staged)`` scatter
         # implicitly down-casts and breaks byte equality. Pool buffers
@@ -319,6 +352,15 @@ def _prefill(args: argparse.Namespace) -> int:
                 f"[P] cell {cell.dtype_name}/{cell.page_count}: " f"{ok_count}/{ITERATIONS}",
                 flush=True,
             )
+        _print_cell_result(
+            level="manager",
+            path_name="path-a" if args.use_d2h_staging else "path-b",
+            dtype_name=cell.dtype_name,
+            page_count=cell.page_count,
+            num_iters=ok_count,
+            itemsize=_dtype_itemsize(cell.dtype),
+            elapsed_s=time.perf_counter() - cell_t0,
+        )
 
     conn.close()
     p_notifier.stop()
@@ -368,6 +410,7 @@ def _decode(args: argparse.Namespace) -> int:
     for cell in cells:
         if failed_cells:
             break
+        cell_t0 = time.perf_counter()
         # Phase 1: read ITERATIONS metadata lines.
         metas: list[tuple[str, PMetadata, int, str, int]] = []
         for _ in range(ITERATIONS):
@@ -443,6 +486,15 @@ def _decode(args: argparse.Namespace) -> int:
         print(
             f"[D] cell {cell.dtype_name}/{cell.page_count}: " f"{cell_done}/{ITERATIONS}",
             flush=True,
+        )
+        _print_cell_result(
+            level="manager",
+            path_name="path-a" if use_d2h else "path-b",
+            dtype_name=cell.dtype_name,
+            page_count=cell.page_count,
+            num_iters=cell_done,
+            itemsize=_dtype_itemsize(cell.dtype),
+            elapsed_s=time.perf_counter() - cell_t0,
         )
 
     ctl.close()
