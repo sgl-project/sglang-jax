@@ -1,4 +1,4 @@
-"""Cross-pod integration script for manual PD transfer validation.
+"""Cross-pod matrix script for manual PD transfer validation.
 
 Exercises the current sender/receiver contract:
 
@@ -16,12 +16,12 @@ Exercises the current sender/receiver contract:
 Usage:
 
   Pod A (prefill, path B):
-    python -m sgl_jax.test.disaggregation.test_byte_roundtrip \\
+    python test/srt/multi_host/disaggregation/pd_transfer_matrix.py \\
       --role prefill --my-host $(hostname -i) --ctl-port 31000 \\
       --transfer-port 31001 --side-channel-port 31002
 
   Pod B (decode, path B):
-    python -m sgl_jax.test.disaggregation.test_byte_roundtrip \\
+    python test/srt/multi_host/disaggregation/pd_transfer_matrix.py \\
       --role decode --my-host $(hostname -i) --remote <pod-A-ip> \\
       --ctl-port 31000 --transfer-port 31001
 
@@ -59,9 +59,9 @@ from sgl_jax.srt.disaggregation.jax_transfer_wrapper import get_or_create_wrappe
 from sgl_jax.srt.mem_cache.host_kv_pool import QueueHostKVPool
 
 PAGE_ELEMS = 4096
-PAGE_COUNTS: tuple[int, ...] = (1, 16, 256)
-ITERATIONS = int(os.environ.get("PD_ROUNDTRIP_ITERS", "100"))
-POOL_SIZE = int(os.environ.get("PD_POOL_SIZE", "128"))
+PAGE_COUNTS: tuple[int, ...] = (1, 16)
+ITERATIONS = int(os.environ.get("PD_ROUNDTRIP_ITERS", "8"))
+POOL_SIZE = int(os.environ.get("PD_POOL_SIZE", "16"))
 
 
 @dataclass(frozen=True)

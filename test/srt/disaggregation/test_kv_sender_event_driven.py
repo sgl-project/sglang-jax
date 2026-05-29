@@ -306,7 +306,7 @@ def test_fail_owns_cleanup_when_callback_still_registered(notifiers):
     assert sender.poll() == KVPoll.FAILED
     assert pool.available_size() == pool.total_size()
     assert wrapper.release.call_count == 1
-    assert "req-C2a" not in mgr._senders
+    assert "req-fail-owns-cleanup" not in mgr._senders
 
 
 def test_fail_after_listener_popped_skips_cleanup(notifiers):

@@ -4,15 +4,15 @@ Run on D side after a pull. Tries several extraction strategies and
 prints which ones work vs which raise. Lives next to the round-trip test
 so we can keep it as a reproducer for the JAX 0.8.1 transfer behavior.
 
-Usage (on a pair of pods, like test_byte_roundtrip):
+Usage (on a pair of pods, like pd_transfer_matrix.py):
 
   Pod A:
-    python -m sgl_jax.test.disaggregation._probe_transfer_readback \\
+    python test/srt/multi_host/disaggregation/pd_transfer_probe.py \\
       --role producer --my-host $(hostname -i) --ctl-port 31000 \\
       --transfer-port 31001
 
   Pod B:
-    python -m sgl_jax.test.disaggregation._probe_transfer_readback \\
+    python test/srt/multi_host/disaggregation/pd_transfer_probe.py \\
       --role consumer --my-host $(hostname -i) --remote <pod-A-ip> \\
       --ctl-port 31000 --transfer-port 31001
 """

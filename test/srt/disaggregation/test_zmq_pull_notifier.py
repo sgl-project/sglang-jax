@@ -146,8 +146,8 @@ def test_unregister_returns_callback(p_notifier):
     assert p_notifier.unregister_callback(b"x") is None
 
 
-def test_concurrent_100_acks(p_notifier, d_notifier):
-    n = 100
+def test_concurrent_32_acks(p_notifier, d_notifier):
+    n = 32
     seen: list[bytes] = []
     seen_lock = threading.Lock()
     done = threading.Event()

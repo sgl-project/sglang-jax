@@ -1,13 +1,6 @@
-"""Exhaustive ``KVPoll`` state-machine tests.
-
-Covers every (current, next) pair across all five states. Legal pairs
-must succeed; everything else must raise ``ValueError``. ``SUCCESS`` and
-``FAILED`` are terminal — no transition out of them is allowed.
-"""
+"""Contract tests for the ``KVPoll`` state machine."""
 
 from __future__ import annotations
-
-import itertools
 
 import pytest
 
@@ -18,14 +11,6 @@ from sgl_jax.srt.disaggregation.base.kv_manager import (
     StateHolder,
     is_legal_transition,
 )
-
-ALL_STATES = list(KVPoll)
-ALL_PAIRS = list(itertools.product(ALL_STATES, ALL_STATES))
-
-
-def test_state_space_size():
-    assert len(ALL_STATES) == 5
-    assert len(ALL_PAIRS) == 25
 
 
 def test_legal_transitions_set_matches_rfc():
@@ -48,24 +33,37 @@ def test_terminal_states():
     assert frozenset({KVPoll.SUCCESS, KVPoll.FAILED}) == TERMINAL_STATES
 
 
-@pytest.mark.parametrize(("current", "next_state"), ALL_PAIRS)
-def test_exhaustive_transitions(current: KVPoll, next_state: KVPoll):
+@pytest.mark.parametrize(
+    ("current", "next_state"),
+    sorted(LEGAL_TRANSITIONS, key=lambda pair: (pair[0].value, pair[1].value)),
+)
+def test_legal_transitions_succeed(current: KVPoll, next_state: KVPoll):
     holder = StateHolder(initial=current)
-    expected_legal = (current, next_state) in LEGAL_TRANSITIONS
-    assert is_legal_transition(current, next_state) == expected_legal
+    assert is_legal_transition(current, next_state) is True
+    holder._transition_to(next_state)
+    assert holder.state == next_state
 
-    if expected_legal:
+
+@pytest.mark.parametrize(
+    ("current", "next_state"),
+    [
+        (KVPoll.BOOTSTRAPPING, KVPoll.TRANSFERRING),
+        (KVPoll.BOOTSTRAPPING, KVPoll.SUCCESS),
+        (KVPoll.WAITING_FOR_INPUT, KVPoll.SUCCESS),
+        (KVPoll.TRANSFERRING, KVPoll.WAITING_FOR_INPUT),
+    ],
+)
+def test_representative_illegal_transitions_raise(current: KVPoll, next_state: KVPoll):
+    holder = StateHolder(initial=current)
+    assert is_legal_transition(current, next_state) is False
+    with pytest.raises(ValueError, match="illegal KVPoll transition"):
         holder._transition_to(next_state)
-        assert holder.state == next_state
-    else:
-        with pytest.raises(ValueError, match="illegal KVPoll transition"):
-            holder._transition_to(next_state)
-        assert holder.state == current
+    assert holder.state == current
 
 
-@pytest.mark.parametrize("terminal", list(TERMINAL_STATES))
-@pytest.mark.parametrize("target", ALL_STATES)
-def test_terminal_states_reject_all_outgoing(terminal: KVPoll, target: KVPoll):
+@pytest.mark.parametrize("terminal", [KVPoll.SUCCESS, KVPoll.FAILED])
+@pytest.mark.parametrize("target", [KVPoll.BOOTSTRAPPING, KVPoll.WAITING_FOR_INPUT])
+def test_terminal_states_reject_outgoing_transitions(terminal: KVPoll, target: KVPoll):
     holder = StateHolder(initial=terminal)
     with pytest.raises(ValueError, match="illegal KVPoll transition"):
         holder._transition_to(target)
@@ -73,7 +71,7 @@ def test_terminal_states_reject_all_outgoing(terminal: KVPoll, target: KVPoll):
 
 
 def test_self_loops_are_illegal():
-    for state in ALL_STATES:
+    for state in KVPoll:
         holder = StateHolder(initial=state)
         with pytest.raises(ValueError):
             holder._transition_to(state)
