@@ -500,7 +500,7 @@ class Glm5DecoderLayer(nnx.Module):
             attention_bias=getattr(config, "attention_bias", False),
             dtype=dtype,
             mesh=mesh,
-            use_absorbed=getattr(config, "use_absorbed_mla", True),
+            use_absorbed=True,
         )
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
@@ -767,13 +767,9 @@ class Glm5ForCausalLM(nnx.Module):
         weight_mappings = self._create_glm5_weight_mappings(model_config)
         loader.load_weights_from_safetensors(weight_mappings)
 
-        has_absorbed = False
         for layer in self.model.layers:
-            if getattr(layer.self_attn, "use_absorbed", False):
-                layer.self_attn.post_load_weights()
-                has_absorbed = True
-        if has_absorbed:
-            logger.info("Absorbed MLA weights split successfully!")
+            layer.self_attn.post_load_weights()
+        logger.info("Absorbed MLA weights split successfully!")
 
         # Skipping scale inversion for BF16
         logger.info("Skipping scale inversion for BF16 model.")
