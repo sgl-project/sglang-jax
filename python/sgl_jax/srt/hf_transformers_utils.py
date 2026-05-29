@@ -1,6 +1,7 @@
 """Utilities for Huggingface Transformers."""
 
 import contextlib
+import logging
 import os
 import threading
 import warnings
@@ -23,6 +24,8 @@ from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
 from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
 from sgl_jax.srt.utils.common_utils import is_remote_url, lru_cache_frozenset
+
+logger = logging.getLogger(__name__)
 
 
 class GlmMoeDsaConfig(PretrainedConfig):
@@ -212,13 +215,15 @@ def _ensure_fastokens_patched():
 
         fastokens.patch_transformers()
         _FASTOKENS_PATCHED = True
+        logger.info("fastokens backend enabled - transformers patched successfully")
 
 
 def _raise_fastokens_load_error(tokenizer_name: str, error: Exception):
     raise RuntimeError(
         f"fastokens failed to load tokenizer for {tokenizer_name!r}. "
-        "This model's tokenizer may not be supported by fastokens. "
-        "Use tokenizer_backend='huggingface' to use the default backend."
+        "This model's tokenizer may not be supported by fastokens — "
+        "see https://github.com/crusoecloud/fastokens. "
+        "Re-run without --tokenizer-backend=fastokens to use the default backend."
     ) from error
 
 
@@ -276,23 +281,28 @@ def get_tokenizer(
             clean_up_tokenization_spaces=False,
             **kwargs,
         )
-    except TypeError as e:
+    except Exception as e:
         if tokenizer_backend == "fastokens":
             _raise_fastokens_load_error(tokenizer_name, e)
 
-        # The LLaMA tokenizer causes a protobuf error in some environments.
-        err_msg = (
-            "Failed to load the tokenizer. If you are using a LLaMA V1 model "
-            f"consider using '{_FAST_LLAMA_TOKENIZER}' instead of the "
-            "original tokenizer."
-        )
-        raise RuntimeError(err_msg) from e
-    except ValueError as e:
+        if isinstance(e, TypeError):
+            # The LLaMA tokenizer causes a protobuf error in some environments.
+            err_msg = (
+                "Failed to load the tokenizer. If you are using a LLaMA V1 model "
+                f"consider using '{_FAST_LLAMA_TOKENIZER}' instead of the "
+                "original tokenizer."
+            )
+            raise RuntimeError(err_msg) from e
+
         # If the error pertains to the tokenizer class not existing or not
         # currently being imported, suggest using the --trust-remote-code flag.
-        if not trust_remote_code and (
-            "does not exist or is not currently imported." in str(e)
-            or "requires you to execute the tokenizer file" in str(e)
+        if (
+            isinstance(e, ValueError)
+            and not trust_remote_code
+            and (
+                "does not exist or is not currently imported." in str(e)
+                or "requires you to execute the tokenizer file" in str(e)
+            )
         ):
             err_msg = (
                 "Failed to load the tokenizer. If the tokenizer is a custom "
@@ -302,13 +312,6 @@ def get_tokenizer(
             )
             raise RuntimeError(err_msg) from e
 
-        if tokenizer_backend == "fastokens":
-            _raise_fastokens_load_error(tokenizer_name, e)
-
-        raise e
-    except (OSError, RuntimeError) as e:
-        if tokenizer_backend == "fastokens":
-            _raise_fastokens_load_error(tokenizer_name, e)
         raise
 
     if not isinstance(tokenizer, PreTrainedTokenizerFast):

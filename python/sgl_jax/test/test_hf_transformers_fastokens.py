@@ -60,7 +60,7 @@ class TestFastokensBackend(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 RuntimeError,
-                "Use tokenizer_backend='huggingface' to use the default backend",
+                "Re-run without --tokenizer-backend=fastokens to use the default backend",
             ),
         ):
             hf_transformers_utils.get_tokenizer(
