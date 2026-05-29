@@ -301,32 +301,43 @@ def build_chain_verify_inputs(
     seq_lens: np.ndarray,
     num_verify_tokens: int,
     batch_size: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> np.ndarray:
     """Build verify inputs for topk=1 (linear chain) without tree mask.
 
+    Returns a single ``(5, bs*n)`` int32 buffer packing all 5 outputs
+    [draft_tokens, positions, retrive_index, retrive_next_token,
+    retrive_next_sibling] so the caller can do **one** ``device_put``
+    instead of five — under multi-host setup each independent P() replicated
+    output triggers a separate allgather (~1.5ms each).
+
     When topk=1 the draft tree is a simple chain, so causal attention is
-    equivalent to the tree mask.  Skipping ``build_eagle_tree_structure``
-    avoids allocating the O(bs * context_len * draft_token_num) mask buffer
-    that causes HBM OOM on memory-constrained chips.
+    equivalent to the tree mask.
     """
     n = num_verify_tokens
-    draft_tokens = np.empty(batch_size * n, dtype=np.int32)
-    positions = np.empty(batch_size * n, dtype=np.int32)
-    retrive_index = np.empty((batch_size, n), dtype=np.int32)
-    retrive_next_token = np.full((batch_size, n), -1, dtype=np.int32)
-    retrive_next_sibling = np.full((batch_size, n), -1, dtype=np.int32)
+    bs = batch_size
+    out = np.empty((5, bs * n), dtype=np.int32)
 
-    for bid in range(batch_size):
-        off = bid * n
-        draft_tokens[off] = verified_id[bid]
-        draft_tokens[off + 1 : off + n] = token_list[bid, : n - 1]
-        for tid in range(n):
-            positions[off + tid] = seq_lens[bid] + tid
-            retrive_index[bid, tid] = off + tid
-            if tid < n - 1:
-                retrive_next_token[bid, tid] = tid + 1
+    # row 0: draft_tokens (bs*n,)
+    out[0].reshape(bs, n)[:, 0] = verified_id
+    out[0].reshape(bs, n)[:, 1:] = token_list[:, : n - 1]
 
-    return positions, retrive_index, retrive_next_token, retrive_next_sibling, draft_tokens
+    # row 1: positions (bs*n,) = seq_lens[bid] + tid
+    tid_range = np.arange(n, dtype=np.int32)
+    out[1] = (seq_lens.astype(np.int32)[:, None] + tid_range[None, :]).reshape(-1)
+
+    # row 2: retrive_index (bs, n) flattened: bid*n + tid
+    out[2] = np.arange(bs * n, dtype=np.int32)
+
+    # row 3: retrive_next_token (bs, n) flattened: chain → tid+1, last is -1
+    next_token_row = np.empty(n, dtype=np.int32)
+    next_token_row[: n - 1] = np.arange(1, n, dtype=np.int32)
+    next_token_row[n - 1] = -1
+    out[3] = np.broadcast_to(next_token_row, (bs, n)).reshape(-1)
+
+    # row 4: retrive_next_sibling: chain has no siblings, all -1
+    out[4].fill(-1)
+
+    return out
 
 
 def build_tree_kernel_efficient(

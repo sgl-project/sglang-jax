@@ -145,28 +145,18 @@ class EagleDraftWorker(BaseDraftWorker):
                 jax.device_get(model_worker_batch.spec_info_padded.verified_id)
             )
             seq_lens_cpu = np.asarray(verified_seq_lens)
-            (position, retrive_index, retrive_next_token, retrive_next_sibling, draft_tokens_np) = (
-                build_chain_verify_inputs(
-                    verified_id_cpu,
-                    token_list_cpu,
-                    seq_lens_cpu,
-                    self.speculative_num_draft_tokens,
-                    bs,
-                )
+            n = self.speculative_num_draft_tokens
+            packed_np = build_chain_verify_inputs(
+                verified_id_cpu, token_list_cpu, seq_lens_cpu, n, bs
             )
-            rep = NamedSharding(self.mesh, P())
-            draft_tokens, position, retrive_index, retrive_next_token, retrive_next_sibling = (
-                jax.device_put(
-                    (
-                        jnp.asarray(draft_tokens_np),
-                        jnp.asarray(position),
-                        jnp.asarray(retrive_index),
-                        jnp.asarray(retrive_next_token),
-                        jnp.asarray(retrive_next_sibling),
-                    ),
-                    rep,
-                )
-            )
+            # One allgather instead of five: pack into a single (5, bs*n) buffer,
+            # device_put once, then slice on device (replicated views are free).
+            packed = jax.device_put(jnp.asarray(packed_np), NamedSharding(self.mesh, P()))
+            draft_tokens = packed[0]
+            position = packed[1]
+            retrive_index = packed[2].reshape(bs, n)
+            retrive_next_token = packed[3].reshape(bs, n)
+            retrive_next_sibling = packed[4].reshape(bs, n)
             tree_mask = None
         else:
             max_seq_len = int(np.max(verified_seq_lens)) if verified_seq_lens.size > 0 else 1
