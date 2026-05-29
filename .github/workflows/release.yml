@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Canonical PEP 440 tag with 'v' prefix (e.g. v0.0.3rc0). Must already exist on origin unless dry_run is true."
+        description: "Tag created by release-tag.yml (e.g. v0.0.3rc0). Must already exist on origin unless dry_run is true."
         required: true
         type: string
       dry_run:

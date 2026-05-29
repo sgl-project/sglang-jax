@@ -21,6 +21,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   validate-and-tag:
@@ -101,3 +102,16 @@ jobs:
         run: |
           echo "::notice::Dry-run mode: tag ${{ steps.version.outputs.tag }} was NOT pushed."
           echo "Validate-only run completed successfully on ref ${GITHUB_REF}." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Trigger publish workflow
+        if: ${{ ! inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          gh workflow run release.yml \
+            --repo "${{ github.repository }}" \
+            --ref "${TAG}" \
+            -f tag="${TAG}" \
+            -f dry_run=false
