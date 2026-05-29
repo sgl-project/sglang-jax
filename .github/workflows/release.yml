@@ -20,6 +20,17 @@ on:
         required: false
         default: false
         type: boolean
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag to publish from (must already exist on origin)"
+        required: true
+        type: string
+      dry_run:
+        description: "If true, build artifacts but skip publish"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write

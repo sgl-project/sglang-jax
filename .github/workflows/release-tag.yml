@@ -3,7 +3,7 @@ name: Release Tag (Validate then Push Tag)
 on:
   # TODO(remove-before-merge): branch push trigger is only here so the workflow
   # appears in the Actions UI on feat/release-pipeline. Delete this `push` block
-  # before merging — release-tag.yml should only run via workflow_dispatch.
+  # before merging — release-tag.yml should only run via workflow_dispatch or workflow_call.
   push:
     branches:
       - feat/release-pipeline
@@ -18,15 +18,32 @@ on:
         required: false
         default: false
         type: boolean
+  workflow_call:
+    inputs:
+      version:
+        description: "Target version string without v prefix"
+        required: true
+        type: string
+      dry_run:
+        description: "If true, skip tag push after validation"
+        required: false
+        default: false
+        type: boolean
+    outputs:
+      tag:
+        description: "The annotated tag that was pushed (e.g. v0.0.3rc0)"
+        value: ${{ jobs.validate-and-tag.outputs.tag }}
+      version:
+        description: "Canonical PEP 440 version (e.g. 0.0.3rc0)"
+        value: ${{ jobs.validate-and-tag.outputs.version }}
 
 permissions:
   contents: write
-  actions: write
 
 jobs:
   validate-and-tag:
-    # TODO(remove-before-merge): drop this condition together with the `push` trigger above.
-    if: github.repository == 'sgl-project/sglang-jax' && github.event_name == 'workflow_dispatch'
+    # TODO(remove-before-merge): drop the event_name guard together with the `push` trigger above.
+    if: github.repository == 'sgl-project/sglang-jax' && github.event_name != 'push'
     runs-on: ubuntu-latest
     environment: prod
     outputs:
@@ -102,16 +119,3 @@ jobs:
         run: |
           echo "::notice::Dry-run mode: tag ${{ steps.version.outputs.tag }} was NOT pushed."
           echo "Validate-only run completed successfully on ref ${GITHUB_REF}." >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Trigger publish workflow
-        if: ${{ ! inputs.dry_run }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          TAG="${{ steps.version.outputs.tag }}"
-          gh workflow run release.yml \
-            --repo "${{ github.repository }}" \
-            --ref "${TAG}" \
-            -f tag="${TAG}" \
-            -f dry_run=false
