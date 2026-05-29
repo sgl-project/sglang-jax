@@ -1,0 +1,18 @@
+# INT8 dynamic mixed quantization config
+# - Linear layers use per-channel quantization.
+# - MoE weights use 128x128 block quantization.
+
+quantization:
+  is_static_checkpoint: false
+  weight_block_size: [128, 128]
+
+  linear:
+    rules:
+      - module_path: '.*'
+        weight_dtype: 'int8'
+        activation_dtype: null
+        weight_block_size: null
+
+  moe:
+    weight_dtype: 'int8'
+    activation_dtype: null

@@ -1,0 +1,18 @@
+# INT8 dynamic block weight quantization config
+# - Uses online requantization (not static checkpoint loading)
+# - Uses 128x128 block scales for linear layers
+# - MoE section is still required by the current parser even for dense models
+
+quantization:
+  is_static_checkpoint: false
+  weight_block_size: [128, 128]
+
+  linear:
+    rules:
+      - module_path: '.*'
+        weight_dtype: 'int8'
+        activation_dtype: null
+
+  moe:
+    weight_dtype: 'int8'
+    activation_dtype: null

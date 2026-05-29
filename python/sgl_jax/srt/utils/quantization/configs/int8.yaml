@@ -1,0 +1,15 @@
+# INT8 weight-only quantization config
+# Works for both linear and MoE models
+# Uses per-channel weight quantization
+
+quantization:
+  # Quantization rules for linear layers (attention, MLP, embeddings)
+  linear:
+    rules:
+      - module_path: '.*'
+        weight_dtype: 'int8'
+
+  # MoE-specific settings (experts weights)
+  moe:
+    weight_dtype: 'int8'
+    activation_dtype: null

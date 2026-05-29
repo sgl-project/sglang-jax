@@ -1,0 +1,114 @@
+"""
+Usage:
+python -m unittest test_moe_eval_accuracy_large.TestMoEEvalAccuracyLarge.test_mmlu
+"""
+
+import unittest
+from types import SimpleNamespace
+
+from run_eval import run_eval
+
+from sgl_jax.srt.utils import kill_process_tree
+from sgl_jax.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    QWEN3_MOE_30B,
+    CustomTestCase,
+    is_in_ci,
+    popen_launch_server,
+    write_github_step_summary,
+)
+
+
+class TestMoEEvalAccuracyLarge(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = QWEN3_MOE_30B
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--skip-server-warmup",
+                "--dist-init-addr",
+                "0.0.0.0:10011",
+                "--tp-size",
+                "4",
+                "--random-seed",
+                "3",
+                "--mem-fraction-static",
+                "0.8",
+                "--max-prefill-tokens",
+                "8192",
+                "--download-dir",
+                "/dev/shm/",
+                "--dtype",
+                "bfloat16",
+                "--attention-backend",
+                "fa",
+                "--precompile-bs-paddings",
+                "64",
+                "--precompile-token-paddings",
+                "8192",
+                "--chunked-prefill-size",
+                "-1",
+                "--max-running-requests",
+                "64",
+                "--page-size",
+                "128",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_mmlu(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mmlu",
+            num_examples=200,
+            num_threads=32,
+        )
+
+        metrics = run_eval(args)
+        self.assertGreater(metrics["score"], 0.764)
+
+        if is_in_ci():
+            write_github_step_summary(f"### test_mmlu\n" f'{metrics["score"]=:.4f}\n')
+
+    def test_human_eval(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="humaneval",
+            num_examples=None,
+            num_threads=1024,
+        )
+
+        metrics = run_eval(args)
+        self.assertGreater(metrics["score"], 0.40)
+
+        if is_in_ci():
+            write_github_step_summary(f"### test_human_eval\n" f'{metrics["score"]=:.4f}\n')
+
+    def test_mgsm_en(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mgsm_en",
+            num_examples=None,
+            num_threads=1024,
+        )
+
+        metrics = run_eval(args)
+        self.assertGreater(metrics["score"], 0.61)
+
+        if is_in_ci():
+            write_github_step_summary(f"### test_mgsm_en\n" f'{metrics["score"]=:.4f}\n')
+
+
+if __name__ == "__main__":
+    unittest.main()

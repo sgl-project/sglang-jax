@@ -1,0 +1,227 @@
+"""Unified quantization configuration.
+
+Quantization settings are explicit - no fallbacks between components.
+Config files should specify both linear (for linear layers) and moe sections.
+Linear models will use linear rules only; MoE models will use both.
+"""
+
+import os
+from dataclasses import dataclass
+from numbers import Integral
+
+import jax.numpy as jnp
+import yaml
+
+# Map string dtype names to JAX numpy dtypes
+DTYPE_MAP = {
+    "int8": jnp.int8,
+    "float8_e4m3fn": jnp.float8_e4m3fn,
+    "float8_e5m2": jnp.float8_e5m2,
+    "bfloat16": jnp.bfloat16,
+    "float32": jnp.float32,
+    None: None,
+}
+
+# Path to built-in quantization config files
+BUILTIN_CONFIG_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "utils", "quantization", "configs"
+)
+
+
+def _str_to_dtype(dtype_str: str | None) -> jnp.dtype | None:
+    """Convert a string dtype name to a JAX numpy dtype."""
+    if dtype_str is None:
+        return None
+    if dtype_str not in DTYPE_MAP:
+        raise ValueError(f"Unsupported dtype: {dtype_str}. Supported: {list(DTYPE_MAP.keys())}")
+    return DTYPE_MAP[dtype_str]
+
+
+def _resolve_config_path(config_path: str) -> str:
+    """Resolve a config path, checking both absolute and built-in locations."""
+    # If it's an absolute path or exists as-is, use it directly
+    if os.path.isabs(config_path) or os.path.exists(config_path):
+        if os.path.exists(config_path):
+            return config_path
+        raise FileNotFoundError(f"Quantization config file not found: {config_path}")
+
+    # Try looking in the built-in configs directory
+    builtin_path = os.path.join(BUILTIN_CONFIG_PATH, config_path)
+    if os.path.exists(builtin_path):
+        return builtin_path
+
+    raise FileNotFoundError(
+        f"Quantization config file not found: {config_path}. "
+        f"Searched in current directory and {BUILTIN_CONFIG_PATH}"
+    )
+
+
+def normalize_weight_block_size(
+    weight_block_size: list[int] | tuple[int, int] | None,
+) -> tuple[int, int] | None:
+    """Validate and canonicalize ``weight_block_size`` to ``(block_n, block_k)``.
+
+    The YAML parser can hand us either lists or tuples. Downstream code assumes
+    a stable 2-tuple of positive integers, so we normalize once here and let
+    callers share the same validation rules.
+    """
+    if weight_block_size is None:
+        return None
+    if not isinstance(weight_block_size, (list, tuple)) or len(weight_block_size) != 2:
+        raise ValueError(
+            "quantization.weight_block_size must be a 2-element list/tuple "
+            f"[block_n, block_k], got {weight_block_size!r}"
+        )
+    block_n, block_k = weight_block_size
+    if not isinstance(block_n, Integral) or not isinstance(block_k, Integral):
+        raise ValueError(
+            "quantization.weight_block_size values must be integers, " f"got {weight_block_size!r}"
+        )
+    block_n = int(block_n)
+    block_k = int(block_k)
+    if block_n <= 0 or block_k <= 0:
+        raise ValueError(
+            "quantization.weight_block_size values must be > 0, " f"got {weight_block_size!r}"
+        )
+    return (block_n, block_k)
+
+
+@dataclass
+class QuantizationConfig:
+    """Quantization configuration with explicit settings (no fallbacks).
+
+    Attributes:
+        linear_rules: List of quantization rules for linear layers
+        moe_weight_dtype: Dtype for MoE weight quantization (None = no quantization)
+        moe_activation_dtype: Dtype for MoE activation quantization (None = no quantization)
+        is_static_checkpoint: Whether the checkpoint is static (true for checkpoints quantized offline, false for on-the-fly quantization)
+        ignored_layers: Optional list of layer name patterns to exclude from quantization
+        weight_block_size: Optional block sizes for block quantization (e.g., [128, 128])
+    """
+
+    linear_rules: list[dict] | None = None
+    moe_weight_dtype: jnp.dtype | None = None
+    moe_activation_dtype: jnp.dtype | None = None
+    is_static_checkpoint: bool = False
+    ignored_layers: list[str] | None = None
+    weight_block_size: tuple[int, int] | None = None
+    allow_narrow_n_blockwise: bool = False
+
+    def to_dict(self) -> dict:
+        # Required by transformers.PretrainedConfig.to_json_string when this
+        # object is attached as hf_config.quantization_config and the config is
+        # repr'd (e.g. inside JAX_EXPLAIN_CACHE_MISSES diagnostics).
+        return {
+            "linear_rules": self.linear_rules,
+            "moe_weight_dtype": (
+                str(self.moe_weight_dtype) if self.moe_weight_dtype is not None else None
+            ),
+            "moe_activation_dtype": (
+                str(self.moe_activation_dtype) if self.moe_activation_dtype is not None else None
+            ),
+            "is_static_checkpoint": self.is_static_checkpoint,
+            "ignored_layers": self.ignored_layers,
+            "weight_block_size": (
+                list(self.weight_block_size) if self.weight_block_size is not None else None
+            ),
+            "allow_narrow_n_blockwise": self.allow_narrow_n_blockwise,
+        }
+
+    @classmethod
+    def from_yaml(cls, yaml_path: str) -> "QuantizationConfig":
+        """Load quantization config from a YAML file.
+
+        Expected YAML format:
+        ```yaml
+        quantization:
+          linear:
+            rules:
+              - module_path: '.*'
+                weight_dtype: 'int8'
+                activation_dtype: 'int8'  # optional, null for weight-only
+                scale_policy: 'per_channel'  # optional, default per_channel
+
+          moe:
+            weight_dtype: 'int8'
+            activation_dtype: null  # null = no activation quantization
+        ```
+        """
+        resolved_path = _resolve_config_path(yaml_path)
+
+        with open(resolved_path) as f:
+            cfg = yaml.safe_load(f)
+
+        if "quantization" not in cfg:
+            raise ValueError(
+                f"Invalid quantization config format in {resolved_path}. "
+                "Expected 'quantization' key at top level."
+            )
+
+        quant = cfg["quantization"]
+        ignored_layers = quant.get("ignored_layers")
+
+        # Parse linear rules (required)
+        linear_section = quant.get("linear", {})
+        linear_rules = linear_section.get("rules")
+        if not linear_rules:
+            raise ValueError(
+                f"No linear rules found in {resolved_path}. "
+                "The 'quantization.linear.rules' section is required."
+            )
+
+        # Parse MoE settings (required)
+        moe_section = quant.get("moe", {})
+        if not moe_section:
+            raise ValueError(
+                f"No moe section found in {resolved_path}. "
+                "The 'quantization.moe' section is required."
+            )
+        moe_weight_dtype = _str_to_dtype(moe_section.get("weight_dtype"))
+        moe_activation_dtype = _str_to_dtype(moe_section.get("activation_dtype"))
+        is_static_checkpoint = quant.get("is_static_checkpoint", False)
+        weight_block_size = normalize_weight_block_size(quant.get("weight_block_size"))
+        allow_narrow_n_blockwise = quant.get("allow_narrow_n_blockwise", False)
+
+        return cls(
+            linear_rules=linear_rules,
+            moe_weight_dtype=moe_weight_dtype,
+            moe_activation_dtype=moe_activation_dtype,
+            is_static_checkpoint=is_static_checkpoint,
+            ignored_layers=ignored_layers,
+            weight_block_size=weight_block_size,
+            allow_narrow_n_blockwise=allow_narrow_n_blockwise,
+        )
+
+    @classmethod
+    def from_path(cls, config_path: str | None) -> "QuantizationConfig | None":
+        """Load quantization config from a path.
+
+        Args:
+            config_path: Path to the YAML config file, or None to disable quantization.
+
+        Returns:
+            QuantizationConfig if config_path is specified, None otherwise
+        """
+        if config_path is None:
+            return None
+        return cls.from_yaml(config_path)
+
+    def get_moe_weight_dtype(self) -> jnp.dtype | None:
+        """Get the dtype for MoE weight quantization."""
+        return self.moe_weight_dtype
+
+    def get_moe_activation_dtype(self) -> jnp.dtype | None:
+        """Get the dtype for MoE activation quantization."""
+        return self.moe_activation_dtype
+
+    def get_linear_rules(self) -> list[dict]:
+        """Get the quantization rules for linear layer quantization."""
+        return self.linear_rules or []
+
+    def has_moe_quantization(self) -> bool:
+        """Check if MoE quantization is configured."""
+        return self.moe_weight_dtype is not None or self.moe_activation_dtype is not None
+
+    def has_linear_quantization(self) -> bool:
+        """Check if linear layer quantization is configured."""
+        return bool(self.linear_rules)

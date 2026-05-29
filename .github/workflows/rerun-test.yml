@@ -1,0 +1,71 @@
+name: Rerun Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'Test suite name (from run_suite.py)'
+        required: true
+        type: string
+      runner:
+        description: 'Runner label (arc-runner-v6e-1, arc-runner-v6e-4, arc-runner-cpu)'
+        required: true
+        type: string
+      ref:
+        description: 'Git ref to checkout (PR branch)'
+        required: true
+        type: string
+      pr_number:
+        description: 'PR number for status comments'
+        required: false
+        type: string
+
+run-name: "rerun-test: ${{ inputs.suite }} [${{ inputs.ref }}]"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  rerun:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+        with:
+          install-target: ${{ contains(inputs.runner, 'cpu') && 'python[cpu]' || 'python[all]' }}
+
+      - name: Run test suite
+        timeout-minutes: 120
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+          SUITE: ${{ inputs.suite }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DOWNLOAD_TIMEOUT: 300
+          RUNNER_LABEL: ${{ inputs.runner }}
+        run: |
+          if [[ "$RUNNER_LABEL" == *cpu* ]]; then
+            export USE_DEVICE_TYPE=cpu
+          else
+            export JAX_COMPILATION_CACHE_DIR=/xla-cache
+            export SGLANG_JAX_MODEL_CACHE=/models/model_scope
+          fi
+          bash scripts/killall_sglang.sh 2>/dev/null || true
+          python test/srt/run_suite.py --suite "$SUITE"
+
+      - name: Comment result on PR
+        if: always() && inputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          SUITE: ${{ inputs.suite }}
+          STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh pr comment "$PR_NUMBER" \
+            --body "> **Rerun test** [$SUITE]($RUN_URL): **$STATUS**"

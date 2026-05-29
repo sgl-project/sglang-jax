@@ -1,0 +1,73 @@
+name: Runner Utilization Report
+
+on:
+  schedule:
+    - cron: '0 8 * * *'  # Daily at 8 AM UTC
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: 'Time window in hours'
+        required: false
+        default: '24'
+        type: string
+      filter:
+        description: 'Filter runner labels (e.g., arc-runner-v6e-1, arc-runner-v6e-4)'
+        required: false
+        type: string
+
+jobs:
+  report:
+    name: Generate Report
+    if: github.repository == 'sgl-project/sglang-jax'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Generate Utilization Report
+        id: report
+        timeout-minutes: 30
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_LIST_TOKEN || secrets.GITHUB_TOKEN }}
+          RUNNER_FILTER: ${{ inputs.filter || '' }}
+          REPORT_HOURS: ${{ inputs.hours || '24' }}
+          REPO: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          if ! [[ "$REPORT_HOURS" =~ ^[0-9]+$ ]]; then
+            echo "Error: hours must be numeric, got: $REPORT_HOURS"
+            exit 1
+          fi
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if [ -n "$RUNNER_FILTER" ]; then
+            python scripts/ci/utils/runner_utilization_report.py \
+              --repo "$REPO" --hours "$REPORT_HOURS" --filter "$RUNNER_FILTER" \
+              --output report.md --slack-output slack_summary.txt --run-url "$RUN_URL"
+          else
+            python scripts/ci/utils/runner_utilization_report.py \
+              --repo "$REPO" --hours "$REPORT_HOURS" \
+              --output report.md --slack-output slack_summary.txt --run-url "$RUN_URL"
+          fi
+
+      - name: Post to Slack
+        if: success()
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "SLACK_WEBHOOK_URL not set, skipping."
+            exit 0
+          fi
+          curl --fail-with-body -X POST -H 'Content-type: application/json' \
+            -d @slack_summary.txt "$SLACK_WEBHOOK_URL"

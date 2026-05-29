@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 850 720" width="850" height="720">
+  <defs>
+    <style>
+      .layer-box { fill: #f0f8ff; stroke: #4a90e2; stroke-width: 2; }
+      .component-box { fill: #ffffff; stroke: #333; stroke-width: 1.5; }
+      .primary-box { fill: #e3f2fd; stroke: #2196f3; stroke-width: 2; }
+      .todo-box { fill: #fff3e0; stroke: #ff9800; stroke-width: 1.5; stroke-dasharray: 5,5; }
+      .title { font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: #333; text-anchor: middle; }
+      .subtitle { font-family: Arial, sans-serif; font-size: 11px; fill: #666; text-anchor: middle; }
+      .layer-title { font-family: Arial, sans-serif; font-size: 16px; font-weight: bold; fill: #2c3e50; }
+      .arrow { stroke: #4a90e2; stroke-width: 2; fill: none; marker-end: url(#arrowhead); }
+      .bullet { font-family: Arial, sans-serif; font-size: 10px; fill: #555; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <polygon points="0 0, 10 3, 0 6" fill="#4a90e2" />
+    </marker>
+  </defs>
+
+  <!-- Layer 1: API Layer -->
+  <rect class="layer-box" x="50" y="20" width="750" height="100" rx="5"/>
+  <text class="layer-title" x="70" y="45">API Layer</text>
+
+  <rect class="component-box" x="250" y="55" width="350" height="55" rx="3"/>
+  <text class="title" x="425" y="78">OpenAI-Compatible Endpoints</text>
+  <text class="subtitle" x="425" y="95">/v1/chat/completions</text>
+
+  <!-- Arrow 1 -->
+  <path class="arrow" d="M 425 120 L 425 150" />
+
+  <!-- Layer 2: Constraint Processing -->
+  <rect class="layer-box" x="50" y="150" width="750" height="110" rx="5"/>
+  <text class="layer-title" x="70" y="175">Constraint Processing Layer</text>
+
+  <!-- Expanded sampling params box to fit text with proper padding -->
+  <rect class="component-box" x="200" y="190" width="450" height="60" rx="3"/>
+  <text class="title" x="425" y="210">SamplingParams</text>
+  <text class="bullet" x="220" y="225">• Constraint validation &amp; mutual exclusivity check</text>
+  <text class="bullet" x="220" y="238">• Parameter normalization</text>
+
+  <!-- Arrow 2 -->
+  <path class="arrow" d="M 425 270 L 425 300" />
+
+  <!-- Layer 3: Grammar Backend -->
+  <rect class="layer-box" x="50" y="290" width="750" height="190" rx="5"/>
+  <text class="layer-title" x="70" y="315">Grammar Backend Layer</text>
+
+  <!-- Center the three boxes: total width 480px, starting at 135 to be perfectly centered -->
+  <!-- llguidance (default) -->
+  <rect class="primary-box" x="135" y="335" width="160" height="55" rx="3"/>
+  <text class="title" x="215" y="358">llguidance</text>
+  <text class="subtitle" x="215" y="375" style="fill: #2196f3; font-weight: bold;">(default)</text>
+
+  <!-- Outlines (TODO) -->
+  <rect class="todo-box" x="315" y="335" width="160" height="55" rx="3"/>
+  <text class="title" x="395" y="358">[TODO]</text>
+  <text class="subtitle" x="395" y="375">Outlines</text>
+
+  <!-- XGrammar (TODO) -->
+  <rect class="todo-box" x="495" y="335" width="160" height="55" rx="3"/>
+  <text class="title" x="575" y="358">[TODO]</text>
+  <text class="subtitle" x="575" y="375">XGrammar</text>
+
+  <!-- BaseGrammarBackend -->
+  <rect class="component-box" x="120" y="410" width="610" height="60" rx="3"/>
+  <text class="title" x="425" y="430">BaseGrammarBackend (Unified Interface)</text>
+  <text class="bullet" x="140" y="447">• Async dispatch with ThreadPoolExecutor</text>
+  <text class="bullet" x="480" y="447">• Dispatch: JSON Schema / EBNF / Regex / Structural</text>
+  <text class="bullet" x="140" y="461">• In-memory caching (schema → grammar object)</text>
+
+  <!-- Arrow 3 -->
+  <path class="arrow" d="M 425 480 L 425 510" />
+
+  <!-- Layer 4: Execution -->
+  <rect class="layer-box" x="50" y="510" width="750" height="190" rx="5"/>
+  <text class="layer-title" x="70" y="535">Execution Layer</text>
+
+  <rect class="component-box" x="120" y="555" width="610" height="135" rx="3"/>
+  <text class="title" x="425" y="575">Per-Step Token Generation</text>
+
+  <text class="bullet" x="140" y="600">1. Grammar → Vocab Mask (CPU bitmask)</text>
+  <text class="bullet" x="140" y="620">2. Move mask to TPU</text>
+  <text class="bullet" x="140" y="640">3. Apply mask to logits (TPU kernel: -inf for invalid)</text>
+  <text class="bullet" x="140" y="660">4. Sample next token</text>
+  <text class="bullet" x="140" y="680">5. Grammar state update: accept_token()</text>
+
+  <!-- Data Flow Label -->
+  <text class="subtitle" x="750" y="15" style="font-size: 12px; fill: #4a90e2; text-anchor: end;">Data Flow ↓</text>
+</svg>

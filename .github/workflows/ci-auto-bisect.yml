@@ -1,0 +1,256 @@
+name: CI Auto Bisect
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Failed workflow run ID to analyze'
+        required: true
+        type: string
+      issue_number:
+        description: 'Issue number to comment results on (optional)'
+        required: false
+        type: string
+  workflow_run:
+    workflows: ["PR Test", "Nightly Test", "Nightly Test Daily", "TPU Multi Test"]
+    types: [completed]
+  repository_dispatch:
+    types: [analysis_request]
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: ci-auto-bisect-${{ inputs.run_id || github.event.client_payload.run_id || github.event.workflow_run.id || github.event.comment.id || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+  id-token: write
+
+jobs:
+  auto-bisect:
+    if: >-
+      github.repository == 'sgl-project/sglang-jax'
+      && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'failure')
+      && (github.event_name != 'issue_comment' || (
+           github.event.issue.pull_request != null
+           && startsWith(github.event.comment.body, '/auto-bisect')
+           && contains(fromJSON('["OWNER","COLLABORATOR"]'), github.event.comment.author_association)
+         ))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - id: parse_comment
+        if: github.event_name == 'issue_comment'
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: python3 scripts/ci/parse_bisect_comment.py
+
+      - id: preflight
+        if: github.event_name != 'issue_comment' || steps.parse_comment.outputs.valid == 'true'
+        env:
+          RUN_ID: ${{ inputs.run_id || github.event.client_payload.run_id || github.event.workflow_run.id || steps.parse_comment.outputs.run_id }}
+          ISSUE_NUMBER: ${{ inputs.issue_number || github.event.client_payload.issue_number || github.event.workflow_run.pull_requests[0].number || github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: python3 scripts/ci/bisect_preflight.py
+
+      - name: React to /auto-bisect comment
+        if: always() && github.event_name == 'issue_comment' && steps.parse_comment.outputs.valid == 'true'
+        run: |
+          if [ "${{ steps.preflight.outputs.eligible }}" = "true" ]; then
+            REACTION="+1"
+          elif [ "${{ steps.preflight.outputs.skip_type }}" = "error" ]; then
+            REACTION="confused"
+          else
+            REACTION="eyes"
+          fi
+          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -f content="$REACTION" --silent
+
+      - id: bisect
+        if: steps.preflight.outputs.eligible == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          track_progress: false
+          prompt: |
+            # sgl-jax CI Auto Bisect
+
+            REPO: ${{ github.repository }}
+            RUN_ID: ${{ steps.preflight.outputs.run_id }}
+            ISSUE_NUMBER: ${{ steps.preflight.outputs.issue_number }}
+
+            RUN_ID is a validated failed workflow run in the auto-bisect
+            allowlist (PR Test / Nightly Test / Nightly Test Daily / TPU Multi
+            Test). Do not re-validate or resolve it.
+
+            The base repo's `main` is checked out in the current working
+            directory. Note that this is *not* the source tree at the failing
+            run's commit — for PR-specific or fork diffs, use the GitHub
+            compare API rather than the local tree.
+
+            `gh` is authenticated for the repo.
+
+            ## Your job
+
+            Investigate the failed workflow run referenced by RUN_ID, classify
+            the root cause, and emit machine-readable results.
+
+            ## Investigation steps
+
+            1. Pull failure logs and metadata. Do not hard-truncate; grep for
+               the actual failing assertion / traceback / non-zero exit if
+               logs are large:
+               - `gh run view <RUN_ID> --log-failed`
+               - `gh run view <RUN_ID> --json headSha,headBranch,event,htmlUrl,displayTitle,conclusion`
+            2. If `headSha` is non-empty, inspect the change via the GitHub
+               compare API (this works even when `<headSha>` lives on a fork
+               that isn't fetched into the local checkout):
+               - For the single failing commit:
+                 `gh api repos/${{ github.repository }}/compare/<headSha>~1...<headSha>`
+               - For the full PR delta vs `main`:
+                 `gh api repos/${{ github.repository }}/compare/main...<headSha>`
+               The response includes commit metadata, the file list, and the
+               unified patch for each file. Pipe through `jq` to project just
+               what you need.
+               If `headSha` is empty (e.g. workflow_dispatch with no associated
+               commit), state this explicitly in `evidence` and do **not**
+               guess `code_regression`.
+            3. Use `Read` / `Grep` / `Glob` against the working tree (which is
+               `main` HEAD) to verify hypotheses about callers, helpers, or
+               test fixtures. Do not assume the working tree reflects the
+               failing commit's state — for that, rely on the compare API.
+
+            ## Classification
+
+            Pick exactly one of:
+
+            - `code_regression` — a specific code change in the run's commit
+              (or its parents on the same branch) clearly explains the failure.
+            - `flaky_test` — failure pattern is non-deterministic (intermittent
+              timeout, ordering-sensitive assertion, known-flaky markers, retry
+              succeeded elsewhere) with no code change implicated.
+            - `infrastructure` — runner/network/registry/cache/quota issue,
+              e.g. GCS 5xx, TPU pre-emption, runner OOM, GitHub API outage.
+            - `environment` — toolchain/dependency drift, e.g. upstream package
+              published a breaking version, base image changed, secret rotated.
+            - `not_applicable` — no eligible failed run exists for analysis
+              (used by the preflight step; the agent should never produce this).
+
+            `confidence` ∈ {low, medium, high}. Use `low` when only one signal
+            supports the classification; reserve `high` for cases where the
+            failure log + diff + source tree all converge on the same cause.
+
+            ## Comment verbosity
+
+            Scale detail to classification:
+
+            - `infrastructure` or `flaky_test`: keep the PR comment brief —
+              1–2 sentence root cause, the key log line, and a suggested
+              action. No diff analysis needed.
+            - `code_regression` or `environment`: be thorough — cite the
+              specific commit/diff hunk, the failing assertion or traceback,
+              and the causal chain.
+
+            ## Required outputs
+
+            1. **Write `analysis_result.json` in the working directory** with
+               this exact shape (no extra top-level keys):
+
+               ```json
+               {
+                 "run_id": "<string>",
+                 "run_url": "<string>",
+                 "classification": "code_regression|flaky_test|infrastructure|environment|not_applicable",
+                 "confidence": "low|medium|high",
+                 "failed_jobs": ["<job name>", "..."],
+                 "root_cause": "<one-paragraph explanation>",
+                 "evidence": "<concrete log excerpts / diff hunks / file:line references>",
+                 "suggested_fix": "<actionable next step, or 'none' for flaky/infra>"
+               }
+               ```
+
+            2. **Append a markdown report to `$GITHUB_STEP_SUMMARY`** covering:
+               classification, confidence, run URL, failed jobs, root cause,
+               evidence, suggested fix.
+
+            3. **Echo step outputs** so downstream steps can gate on them:
+
+               ```
+               echo "classification=<value>" >> "$GITHUB_OUTPUT"
+               echo "confidence=<value>"     >> "$GITHUB_OUTPUT"
+               ```
+
+            4. **Comment on the associated PR**.
+
+               First, **resolve the target ISSUE_NUMBER**:
+
+               - If `ISSUE_NUMBER` is already non-empty from the workflow
+                 inputs/event, use it as-is and skip the fork lookup.
+               - If `ISSUE_NUMBER` is empty but `headSha` is non-empty (the
+                 fork-PR scenario — GitHub's privacy design empties
+                 `workflow_run.pull_requests` for fork-originated triggers),
+                 reverse-look up the associated PR via:
+
+                     gh api repos/${{ github.repository }}/commits/<headSha>/pulls
+
+                 - If exactly one open PR is returned, set `ISSUE_NUMBER` to
+                   its `.number`.
+                 - If zero or multiple PRs are returned, skip commenting (still
+                   emit artifact + step summary) and state in `evidence` why
+                   no comment was posted.
+
+               Then, **if `ISSUE_NUMBER` is non-empty**, post results to that
+               issue with an HTML marker so re-runs can be deduplicated:
+
+               - First, list existing comments via
+                 `gh api repos/${{ github.repository }}/issues/<ISSUE_NUMBER>/comments --paginate`
+                 and check whether any comment body already contains the marker
+                 `<!-- ci-auto-bisect:run_id=<RUN_ID> -->`.
+               - If a marker for this RUN_ID already exists, skip posting (or
+                 update the existing comment via `gh api ... -X PATCH` if you
+                 have new findings).
+               - Otherwise, post a new comment via
+                 `gh issue comment <ISSUE_NUMBER> --body ...`. The body **must**
+                 include the marker on its own line, e.g.:
+
+                 ```
+                 <!-- ci-auto-bisect:run_id=<RUN_ID> -->
+                 ## CI Auto Bisect — run <RUN_ID>
+                 ...
+                 ```
+
+            ## Discipline
+
+            - Do not invent facts. If a piece of evidence is unavailable, say
+              so in `evidence` rather than fabricating.
+            - Do not push code changes; do not edit files outside
+              `analysis_result.json`.
+            - English output throughout.
+          claude_args: |
+            --model claude-opus-4-7
+            --allowedTools "Read,Grep,Glob,Bash(gh run view:*),Bash(gh api:*),Bash(gh issue view:*),Bash(gh issue comment:*),Bash(echo:*),Write"
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          API_TIMEOUT_MS: "3000000"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          ANTHROPIC_MODEL: claude-opus-4-7
+          ANTHROPIC_SMALL_FAST_MODEL: claude-opus-4-7
+          ANTHROPIC_DEFAULT_SONNET_MODEL: claude-sonnet-4-6
+          ANTHROPIC_DEFAULT_OPUS_MODEL: claude-opus-4-7
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: claude-opus-4-7
+          CLAUDE_CODE_LOG_LEVEL: debug
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-auto-bisect-${{ github.run_number }}
+          path: analysis_result.json
+          retention-days: 14
+          if-no-files-found: ignore

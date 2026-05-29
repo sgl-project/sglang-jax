@@ -1,0 +1,19 @@
+name: 📚 Documentation
+description: Report an issue related to docs
+title: "[Docs]: "
+labels: ["Documentation"]
+
+body:
+- type: checkboxes
+  attributes:
+    label: Checklist
+    options:
+    - label: 1. Make sure you already searched for relevant issues and documentations.
+    - label: 2. Please use English, otherwise it will be closed.
+- type: textarea
+  attributes:
+    label: Documentation Issues or Suggested Changes
+    description: |
+      A clear explanation of why this documentation change is needed. Describe the problem, gap, or improvement you are proposing.
+  validations:
+    required: true

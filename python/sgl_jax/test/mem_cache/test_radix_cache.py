@@ -1,0 +1,700 @@
+# cd python && USE_DEVICE_TYPE=cpu python -m pytest sgl_jax/test/test_radix_cache.py -v
+# specific shard information can be appended -s
+
+import os
+
+# Set up multi-device simulation for tensor parallelism
+if os.environ.get("USE_DEVICE_TYPE") == "cpu":
+    os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
+    # Set JAX to use CPU for testing with simulated devices
+    os.environ["JAX_PLATFORMS"] = "cpu"
+
+import unittest
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from sgl_jax.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sgl_jax.srt.mem_cache.radix_cache import (
+    RadixCache,
+    RadixKey,
+    TreeNode,
+    _key_match_page_size1,
+    _key_match_paged,
+)
+from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+from sgl_jax.test.test_utils import CustomTestCase
+
+mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
+jax.sharding.set_mesh(mesh)
+
+
+class TestRadixCache(CustomTestCase):
+    def setUp(self):
+        self.devices = jax.devices()
+        self.kv_head_num = 32
+        self.head_dim = 128
+        self.layer_num = 24
+        self.max_seq_len = 2048
+        self.dtype = jnp.bfloat16
+        self.pool_size = 8192
+
+    def _create_auto_device_setup(self):
+        # create memory pool
+        req_pool = ReqToTokenPool(
+            size=1024,
+            max_context_len=self.max_seq_len,
+            dtype=np.int32,
+        )
+
+        # create KV cache
+        kv_cache = MHATokenToKVPool(
+            size=self.pool_size,
+            page_size=1,
+            dtype=self.dtype,
+            head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            layer_num=self.layer_num,
+            mesh=mesh,
+        )
+
+        # create allocator
+        allocator = TokenToKVPoolAllocator(
+            # size=self.pool_size, dtype=self.dtype, kvcache=kv_cache
+            size=self.pool_size,
+            kvcache=kv_cache,
+        )
+
+        return req_pool, allocator
+
+    def _create_radix_cache(self, req_pool, allocator, **kwargs):
+        cache = RadixCache(
+            req_to_token_pool=req_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=kwargs.get("page_size", 1),
+            disable=kwargs.get("disable", False),
+            enable_kv_cache_events=kwargs.get("enable_kv_cache_events", False),
+            kv_head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            layer_num=self.layer_num,
+            max_seq_len=self.max_seq_len,
+            dtype=self.dtype,
+        )
+        return cache
+
+    def test_tree_node_basic(self):
+        node = TreeNode()
+        self.assertIsNotNone(node.id)
+        self.assertEqual(node.lock_ref, 0)
+        self.assertTrue(node.evicted)  # value is None
+        self.assertFalse(node.backuped)  # host_value is None
+
+        # test comparison operation
+        node2 = TreeNode()
+        # node created earlier, so should be less than node2
+        self.assertTrue(node < node2)
+
+    def test_key_match_functions(self):
+        # test key matching function
+        # test page_size=1 matching
+        key1 = RadixKey([1, 2, 3, 4, 5], None)
+        key2 = RadixKey([1, 2, 6, 7, 8], None)
+        result = _key_match_page_size1(key1, key2)
+        self.assertEqual(result, 2)  # first two elements match
+
+        # test paged matching
+        key1 = RadixKey([1, 2, 3, 4, 5, 6], None)
+        key2 = RadixKey([1, 2, 3, 4, 7, 8], None)
+        result = _key_match_paged(key1, key2, page_size=2)
+        self.assertEqual(result, 4)  # first two pages match
+
+    def test_disabled_cache(self):
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator, disable=True)
+
+        # test disabled cache behavior
+        key = [1, 2, 3, 4, 5]
+        match_result = cache.match_prefix(key)
+        self.assertEqual(len(match_result.device_indices), 0)
+
+        insert_result = cache.insert(key)
+        self.assertEqual(insert_result, 0)
+
+    def test_basic_insert_and_match(self):
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # test insert
+        key1 = [1, 2, 3, 4, 5]
+        prefix_len = cache.insert(key1)
+        self.assertEqual(prefix_len, 0)  # new inserted, no prefix
+
+        # test match
+        match_result = cache.match_prefix(key1)
+        self.assertEqual(len(match_result.device_indices), len(key1))
+
+        # test partial match
+        key2 = [1, 2, 3]
+        match_result = cache.match_prefix(key2)
+        self.assertEqual(len(match_result.device_indices), len(key2))
+
+        # test no match
+        key3 = [6, 7, 8]
+        match_result = cache.match_prefix(key3)
+        self.assertEqual(len(match_result.device_indices), 0)
+
+    def test_basic_insert_with_value(self):
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        key = [1, 2, 3, 4, 5]
+        value = [9, 8, 7, 6, 5]
+        prefix_len = cache.insert(key, value)
+        self.assertEqual(prefix_len, 0)
+
+        key2 = [1, 2, 3]
+        match_result = cache.match_prefix(key2)
+        self.assertEqual(len(match_result.device_indices), len(key2))
+        value2 = match_result.device_indices
+        self.assertEqual(value2.tolist(), value[: len(key2)])
+
+    def test_prefix_extension(self):
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # insert short sequence
+        key1 = [1, 2, 3]
+        cache.insert(key1)
+
+        # insert long sequence (contains previous prefix)
+        key2 = [1, 2, 3, 4, 5]
+        prefix_len = cache.insert(key2)
+        self.assertEqual(prefix_len, 3)  # matched 3 tokens
+
+        # verify both sequences can be correctly matched
+        match_result1 = cache.match_prefix(key1)
+        self.assertEqual(len(match_result1.device_indices), len(key1))
+
+        match_result2 = cache.match_prefix(key2)
+        self.assertEqual(len(match_result2.device_indices), len(key2))
+
+    def test_lock_reference_counting(self):
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # insert data
+        key = [1, 2, 3, 4, 5]
+        cache.insert(key)
+
+        # get leaf node
+        match_result = cache.match_prefix(key)
+        last_node = match_result.last_device_node
+
+        # test increase lock reference
+        initial_protected = cache.protected_size()
+        initial_evictable = cache.evictable_size()
+
+        cache.inc_lock_ref(last_node)
+
+        # verify size change
+        self.assertGreaterEqual(cache.protected_size(), initial_protected)
+        self.assertLessEqual(cache.evictable_size(), initial_evictable)
+
+        # test decrease lock reference
+        cache.dec_lock_ref(last_node)
+
+        # verify restored to initial state
+        self.assertEqual(cache.protected_size(), initial_protected)
+        self.assertEqual(cache.evictable_size(), initial_evictable)
+
+    def test_paged_cache(self):
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator, page_size=4)
+
+        # test page aligned sequence
+        key1 = [1, 2, 3, 4, 5, 6, 7, 8]  # 8 tokens, aligned to 8
+        cache.insert(key1)
+
+        match_result = cache.match_prefix(key1)
+        self.assertEqual(len(match_result.device_indices), 8)
+
+        # test non-page aligned sequence (should be truncated)
+        key2 = [1, 2, 3, 4, 5, 6, 7]  # 7 tokens, should be truncated to 4
+        match_result = cache.match_prefix(key2)
+        self.assertEqual(len(match_result.device_indices), 4)
+
+    def test_eviction(self):
+        req_pool, allocator = self._create_auto_device_setup()
+
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # insert multiple sequences
+        keys = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+
+        for key in keys:
+            cache.insert(key)
+
+        initial_size = cache.total_size()
+        self.assertGreater(initial_size, 0)
+
+        # execute eviction
+        cache.evict(5)  # evict 5 tokens
+
+        # verify size reduced (possibly not reduced to 5, because of protected nodes)
+        final_size = cache.total_size()
+        self.assertLessEqual(final_size, initial_size)
+
+    def test_empty_key_handling(self):
+        req_pool, allocator = self._create_auto_device_setup()
+
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # test empty key
+        empty_key = []
+        match_result = cache.match_prefix(empty_key)
+        self.assertEqual(len(match_result.device_indices), 0)
+
+        insert_result = cache.insert(empty_key)
+        self.assertEqual(insert_result, 0)
+
+    def test_pretty_print(self):
+        req_pool, allocator = self._create_auto_device_setup()
+
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # insert some data
+        cache.insert([1, 2, 3])
+        cache.insert([1, 2, 4])
+
+        # test print (should not throw exception)
+        try:
+            cache.pretty_print()
+        except Exception as e:
+            self.fail(f"pretty_print() raised an exception: {e}")
+
+    def test_reset_functionality(self):
+        req_pool, allocator = self._create_auto_device_setup()
+
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # insert data
+        cache.insert([1, 2, 3])
+        cache.insert([4, 5, 6])
+
+        self.assertGreater(cache.total_size(), 0)
+
+        # reset
+        cache.reset()
+
+        # verify reset state
+        self.assertEqual(cache.root_node.lock_ref, 1)
+        self.assertEqual(cache.evictable_size(), 0)
+        self.assertEqual(cache.protected_size(), 0)
+        self.assertEqual(cache.total_size(), 0)
+
+    def test_empty_match_consistency(self):
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # test empty key matching
+        empty_key = []
+        match_result = cache.match_prefix(empty_key)
+        device_indices = match_result.device_indices
+
+        # verify empty array metadata
+        self.assertIsInstance(device_indices, np.ndarray)
+        self.assertEqual(device_indices.dtype, np.int32)
+        self.assertEqual(len(device_indices), 0)
+
+        # test no match
+        no_match_key = [999, 888, 777]
+        match_result = cache.match_prefix(no_match_key)
+        device_indices = match_result.device_indices
+
+        self.assertIsInstance(device_indices, np.ndarray)
+        self.assertEqual(device_indices.dtype, np.int32)
+        self.assertEqual(len(device_indices), 0)
+
+    def test_extra_key_namespace_isolation(self):
+        """Test that same tokens with different extra_keys don't share cache"""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # Insert same token sequence with extra_key="lora_a"
+        key = [1, 2, 3, 4, 5]
+        value_a = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, "lora_a"), value_a)
+
+        # Insert same token sequence with extra_key="lora_b"
+        value_b = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, "lora_b"), value_b)
+
+        # Match with extra_key="lora_a" should return value_a
+        match_a = cache.match_prefix(RadixKey(key, "lora_a"))
+        self.assertEqual(len(match_a.device_indices), len(key))
+        np.testing.assert_array_equal(match_a.device_indices, value_a)
+
+        # Match with extra_key="lora_b" should return value_b
+        match_b = cache.match_prefix(RadixKey(key, "lora_b"))
+        self.assertEqual(len(match_b.device_indices), len(key))
+        np.testing.assert_array_equal(match_b.device_indices, value_b)
+
+        # Verify values are different (different cache namespaces)
+        self.assertFalse(np.array_equal(value_a, value_b))
+
+    def test_extra_key_same_namespace_sharing(self):
+        """Test that same tokens with same extra_key do share cache"""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # Insert with extra_key="lora_x"
+        key = [10, 20, 30]
+        cache.insert(RadixKey(key, "lora_x"))
+
+        # Match with same extra_key should hit cache
+        match = cache.match_prefix(RadixKey(key, "lora_x"))
+        self.assertEqual(len(match.device_indices), len(key))
+
+        # Insert longer sequence with same extra_key should reuse prefix
+        longer_key = [10, 20, 30, 40, 50]
+        prefix_len = cache.insert(RadixKey(longer_key, "lora_x"))
+        self.assertEqual(prefix_len, 3)  # Reused 3 tokens from cache
+
+    def test_extra_key_none_default_namespace(self):
+        """Test that None extra_key creates its own default namespace"""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # Insert with extra_key=None
+        key = [100, 200, 300]
+        value_none = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, None), value_none)
+
+        # Insert with extra_key="some_key"
+        value_some = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, "some_key"), value_some)
+
+        # Match with None should return value_none
+        match_none = cache.match_prefix(RadixKey(key, None))
+        np.testing.assert_array_equal(match_none.device_indices, value_none)
+
+        # Match with "some_key" should return value_some
+        match_some = cache.match_prefix(RadixKey(key, "some_key"))
+        np.testing.assert_array_equal(match_some.device_indices, value_some)
+
+    def test_radix_key_backward_compatibility(self):
+        """Test that plain list still works for backward compatibility"""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # Insert with plain list (should use extra_key=None)
+        key = [5, 10, 15]
+        prefix_len = cache.insert(key)
+        self.assertEqual(prefix_len, 0)
+
+        # Match with plain list
+        match = cache.match_prefix(key)
+        self.assertEqual(len(match.device_indices), len(key))
+
+        # Match with RadixKey(key, None) should return same result
+        match_radix = cache.match_prefix(RadixKey(key, None))
+        np.testing.assert_array_equal(match.device_indices, match_radix.device_indices)
+
+    def test_radix_key_slicing(self):
+        """Test that RadixKey slicing preserves extra_key"""
+        key = RadixKey([1, 2, 3, 4, 5], "test_key")
+
+        # Test slicing
+        sliced = key[2:]
+        self.assertEqual(sliced.token_ids, [3, 4, 5])
+        self.assertEqual(sliced.extra_key, "test_key")
+
+        # Test single index access returns RadixKey
+        single = key[0]
+        self.assertEqual(single.token_ids, [1])
+        self.assertEqual(single.extra_key, "test_key")
+
+    def test_dp_rank_namespace_isolation(self):
+        """Test that same tokens with different dp_ranks don't share cache"""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # Insert same token sequence with dp_rank=0
+        key = [1, 2, 3, 4, 5]
+        value_rank0 = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, None, 0), value_rank0)
+
+        # Insert same token sequence with dp_rank=1
+        value_rank1 = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, None, 1), value_rank1)
+
+        # Match with dp_rank=0 should return value_rank0
+        match_rank0 = cache.match_prefix(RadixKey(key, None, 0))
+        self.assertEqual(len(match_rank0.device_indices), len(key))
+        np.testing.assert_array_equal(match_rank0.device_indices, value_rank0)
+
+        # Match with dp_rank=1 should return value_rank1
+        match_rank1 = cache.match_prefix(RadixKey(key, None, 1))
+        self.assertEqual(len(match_rank1.device_indices), len(key))
+        np.testing.assert_array_equal(match_rank1.device_indices, value_rank1)
+
+        # Verify values are different (different cache namespaces)
+        self.assertFalse(np.array_equal(value_rank0, value_rank1))
+
+    def test_dp_rank_none_shared_namespace(self):
+        """Test that dp_rank=None creates a shared namespace"""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # Insert with dp_rank=None
+        key = [10, 20, 30]
+        cache.insert(RadixKey(key, None, None))
+
+        # Match with dp_rank=None should hit cache
+        match = cache.match_prefix(RadixKey(key, None, None))
+        self.assertEqual(len(match.device_indices), len(key))
+
+        # Insert longer sequence with dp_rank=None should reuse prefix
+        longer_key = [10, 20, 30, 40, 50]
+        prefix_len = cache.insert(RadixKey(longer_key, None, None))
+        self.assertEqual(prefix_len, 3)  # Reused 3 tokens from cache
+
+    def test_dp_rank_none_vs_explicit_rank(self):
+        """Test that dp_rank=None and dp_rank=0 are different namespaces"""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # Insert with dp_rank=None
+        key = [100, 200, 300]
+        value_none = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, None, None), value_none)
+
+        # Insert with dp_rank=0
+        value_rank0 = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, None, 0), value_rank0)
+
+        # Match with None should return value_none
+        match_none = cache.match_prefix(RadixKey(key, None, None))
+        np.testing.assert_array_equal(match_none.device_indices, value_none)
+
+        # Match with 0 should return value_rank0
+        match_rank0 = cache.match_prefix(RadixKey(key, None, 0))
+        np.testing.assert_array_equal(match_rank0.device_indices, value_rank0)
+
+        # Verify they are different
+        self.assertFalse(np.array_equal(value_none, value_rank0))
+
+    def test_combined_extra_key_and_dp_rank(self):
+        """Test that extra_key and dp_rank work together for dual isolation"""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        key = [7, 8, 9]
+
+        # Create 4 different cache namespaces
+        value_lora_a_rank0 = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, "lora_a", 0), value_lora_a_rank0)
+
+        value_lora_a_rank1 = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, "lora_a", 1), value_lora_a_rank1)
+
+        value_lora_b_rank0 = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, "lora_b", 0), value_lora_b_rank0)
+
+        value_lora_b_rank1 = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, "lora_b", 1), value_lora_b_rank1)
+
+        # Verify each combination returns its own value
+        match = cache.match_prefix(RadixKey(key, "lora_a", 0))
+        np.testing.assert_array_equal(match.device_indices, value_lora_a_rank0)
+
+        match = cache.match_prefix(RadixKey(key, "lora_a", 1))
+        np.testing.assert_array_equal(match.device_indices, value_lora_a_rank1)
+
+        match = cache.match_prefix(RadixKey(key, "lora_b", 0))
+        np.testing.assert_array_equal(match.device_indices, value_lora_b_rank0)
+
+        match = cache.match_prefix(RadixKey(key, "lora_b", 1))
+        np.testing.assert_array_equal(match.device_indices, value_lora_b_rank1)
+
+        # Verify all values are different
+        values = [value_lora_a_rank0, value_lora_a_rank1, value_lora_b_rank0, value_lora_b_rank1]
+        for i, v1 in enumerate(values):
+            for v2 in values[i + 1 :]:
+                self.assertFalse(np.array_equal(v1, v2))
+
+    def test_dp_rank_preserves_on_slicing(self):
+        """Test that RadixKey slicing preserves both extra_key and dp_rank"""
+        key = RadixKey([1, 2, 3, 4, 5], "test_key", 2)
+
+        # Test slicing
+        sliced = key[2:]
+        self.assertEqual(sliced.token_ids, [3, 4, 5])
+        self.assertEqual(sliced.extra_key, "test_key")
+        self.assertEqual(sliced.dp_rank, 2)
+
+        # Test single index access returns RadixKey with dp_rank
+        single = key[0]
+        self.assertEqual(single.token_ids, [1])
+        self.assertEqual(single.extra_key, "test_key")
+        self.assertEqual(single.dp_rank, 2)
+
+
+class MockRequest:
+    """mock request object for testing cache request functionality"""
+
+    def __init__(
+        self,
+        req_pool_idx,
+        origin_input_ids,
+        output_ids,
+        fill_ids,
+        prefix_indices,
+        last_node,
+        extra_key=None,
+        dp_rank=None,
+    ):
+        self.req_pool_idx = req_pool_idx
+        self.origin_input_ids = origin_input_ids
+        self.output_ids = output_ids
+        self.fill_ids = fill_ids
+        self.prefix_indices = prefix_indices
+        self.last_node = last_node
+        self.extra_key = extra_key
+        self.dp_rank = dp_rank
+        self.rid = "mock-req"
+        # Match legacy length formula so cache_finished_req frees the same range.
+        self.kv_committed_len = len(origin_input_ids) + max(len(output_ids) - 1, 0)
+        self.kv_allocated_len = self.kv_committed_len
+        self.kv_committed_freed = False
+        self.kv_overallocated_freed = False
+        # Mirrors prepare_for_extend: page-aligned matched-prefix length at
+        # extend time. Tests construct mock reqs without going through extend,
+        # so default to len(prefix_indices) (== matched prefix in the simple
+        # mock setup; no unaligned tail because tests use page_size=1).
+        self.cache_protected_len = len(prefix_indices)
+
+    def pop_committed_kv_cache(self) -> int:
+        assert not self.kv_committed_freed
+        self.kv_committed_freed = True
+        return self.kv_committed_len
+
+    def pop_overallocated_kv_cache(self):
+        assert not self.kv_overallocated_freed
+        self.kv_overallocated_freed = True
+        return self.kv_committed_len, self.kv_allocated_len
+
+
+class TestRadixCacheWithRequests(CustomTestCase):
+    """test RadixCache with request related functionality"""
+
+    def setUp(self):
+        """set up test environment"""
+        self.devices = jax.devices()
+        self.kv_head_num = 32
+        self.head_dim = 128
+        self.layer_num = 24
+        self.max_seq_len = 2048
+        self.dtype = jnp.bfloat16
+        self.pool_size = 8192
+
+        self.req_pool = ReqToTokenPool(
+            size=1024,
+            max_context_len=self.max_seq_len,
+            dtype=np.int32,
+        )
+
+        # use tensor axis for single device (but not actually sharded)
+        kv_cache = MHATokenToKVPool(
+            size=self.pool_size,
+            page_size=1,
+            dtype=self.dtype,
+            head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            layer_num=self.layer_num,
+            mesh=mesh,
+            # use default kv_partition_axis="tensor"
+        )
+
+        self.allocator = TokenToKVPoolAllocator(
+            # size=self.pool_size, dtype=self.dtype, kvcache=kv_cache
+            size=self.pool_size,
+            kvcache=kv_cache,
+        )
+
+        self.cache = RadixCache(
+            req_to_token_pool=self.req_pool,
+            token_to_kv_pool_allocator=self.allocator,
+            page_size=1,
+            kv_head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            layer_num=self.layer_num,
+            max_seq_len=self.max_seq_len,
+            dtype=self.dtype,
+        )
+
+    def test_cache_finished_req_disabled(self):
+        """test cache finished request disabled"""
+        # create disabled cache
+        disabled_cache = RadixCache(
+            req_to_token_pool=self.req_pool,
+            token_to_kv_pool_allocator=self.allocator,
+            disable=True,
+            page_size=1,
+            kv_head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            layer_num=self.layer_num,
+            max_seq_len=self.max_seq_len,
+            dtype=self.dtype,
+        )
+
+        # create mock request
+        mock_req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=[1, 2, 3],
+            output_ids=[4, 5],
+            fill_ids=[1, 2, 3, 4],
+            prefix_indices=jnp.array([1, 2, 3]),
+            last_node=disabled_cache.root_node,
+        )
+
+        # should execute normally without throwing exception
+        try:
+            disabled_cache.cache_finished_req(mock_req)
+        except Exception as e:
+            self.fail(f"cache_finished_req raised an exception: {e}")
+
+    def test_cache_unfinished_req_disabled(self):
+        disabled_cache = RadixCache(
+            req_to_token_pool=self.req_pool,
+            token_to_kv_pool_allocator=self.allocator,
+            disable=True,
+            page_size=1,
+            kv_head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            layer_num=self.layer_num,
+            max_seq_len=self.max_seq_len,
+            dtype=self.dtype,
+        )
+
+        # create mock request
+        mock_req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=[1, 2, 3],
+            output_ids=[4],
+            fill_ids=[1, 2, 3, 4],
+            prefix_indices=jnp.array([1, 2, 3]),
+            last_node=disabled_cache.root_node,
+        )
+
+        # should execute normally without throwing exception
+        try:
+            disabled_cache.cache_unfinished_req(mock_req)
+        except Exception as e:
+            self.fail(f"cache_unfinished_req raised an exception: {e}")
+
+
+if __name__ == "__main__":
+    unittest.main()

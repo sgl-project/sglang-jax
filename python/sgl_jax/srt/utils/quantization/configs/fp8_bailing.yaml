@@ -1,0 +1,20 @@
+# FP8 weight-only quantization with MoE gate in full precision
+# - MoE gate (router) is NOT quantized for numerical stability
+# - All other layers: FP8 weights only, NO activation quantization
+# - Reference: https://arxiv.org/pdf/2101.03961
+
+quantization:
+  # Quantization rules for linear layers
+  linear:
+    rules:
+      # All layers EXCEPT MoE gate, experts, and logits_processor - full W8A8
+      # MoE gate: completely excluded (no weight, no activation quantization)
+      # logits_processor: excluded for accuracy
+      - module_path: '^(?!.*(moe_gate|shared_experts|block_sparse_moe|router|logits_processor|mlp/(wi_0|wi_1|wo|w1|w2|w3|w1_shared|w2_shared|w3_shared)(/|$))).*$'
+        weight_dtype: 'float8_e4m3fn'
+        activation_dtype: 'float8_e4m3fn'
+
+  # MoE experts: FP8 weights only, NO activation quantization
+  moe:
+    weight_dtype: 'float8_e4m3fn'
+    activation_dtype: null

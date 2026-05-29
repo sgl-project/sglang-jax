@@ -1,0 +1,877 @@
+import json
+import logging
+import os
+from enum import Enum, IntEnum, auto
+
+import jax.numpy as jnp
+from transformers import PretrainedConfig
+
+from sgl_jax.srt.configs.quantization_config import QuantizationConfig
+from sgl_jax.srt.hf_transformers_utils import (
+    download_from_hf,
+    get_config,
+    get_context_length,
+    get_generation_config,
+    get_hf_text_config,
+)
+from sgl_jax.srt.server_args import ServerArgs
+from sgl_jax.srt.utils.common_utils import get_bool_env_var
+
+logger = logging.getLogger(__name__)
+
+
+class AttentionArch(IntEnum):
+    MLA = auto()
+    MHA = auto()
+
+
+class ModelImpl(str, Enum):
+    AUTO = "auto"
+    SGLANG = "sglang"
+    TRANSFORMERS = "transformers"
+
+
+class MoEBackend(str, Enum):
+    """Backend for Mixture of Experts computation."""
+
+    EPMOE = "epmoe"  # Native Expert Parallel MoE (default)
+    FUSED = "fused"  # Fused Kernel (TPU-optimized)
+    AUTO = "auto"  # Automatically select based on ep_size
+
+
+class ModelConfig:
+    def __init__(
+        self,
+        model_path: str,
+        trust_remote_code: bool = True,
+        revision: str | None = None,
+        context_length: int | None = None,
+        model_override_args: str = "{}",
+        is_embedding: bool | None = None,
+        dtype: str = "auto",
+        override_config_file: str | None = None,
+        is_draft_model: bool = False,
+        model_impl: str | ModelImpl = ModelImpl.AUTO,
+        quantization: str | None = None,
+        quantization_config_path: str | None = None,
+        model_layer_nums: int | None = None,
+        multimodal: bool = False,
+        moe_backend: str | MoEBackend = MoEBackend.AUTO,
+        model_sub_dir: str | None = None,
+    ) -> None:
+
+        self.model_path = model_path
+        self.model_sub_dir = model_sub_dir
+        self.revision = revision
+        self.model_impl = model_impl
+        self.quantization = quantization
+        self.quantization_config_path = quantization_config_path
+        # Create unified quantization config from path
+        self.quantization_config = QuantizationConfig.from_path(quantization_config_path)
+        # if ep_size > 1, use ep moe, else use fused moe
+        # TODO: support ep moe with ETP
+        self.ep_size = 1
+
+        # Process MoE backend selection
+        self.moe_backend = MoEBackend(moe_backend) if isinstance(moe_backend, str) else moe_backend
+
+        # Auto-select backend based on ep_size
+        if self.moe_backend == MoEBackend.AUTO:
+            # If ep_size > 1, use EPMoE (expert parallelism across devices)
+            # Otherwise use Fused kernel (single-device TPU optimization)
+            self.moe_backend = MoEBackend.EPMOE if self.ep_size > 1 else MoEBackend.FUSED
+        # Parse args
+        self.maybe_pull_model_tokenizer_from_remote()
+        self.model_override_args = json.loads(model_override_args)
+        kwargs = {}
+        if override_config_file and override_config_file.strip():
+            kwargs["_configuration_file"] = override_config_file.strip()
+        if multimodal:
+            self.model_path = download_from_hf(self.model_path, allow_patterns=None)
+        if multimodal and self.model_sub_dir is not None:
+            if self.model_sub_dir:
+                self.model_path = os.path.join(self.model_path, self.model_sub_dir)
+            config_path = self.model_path
+
+        config_path = self.model_path
+
+        self.hf_config = get_config(
+            config_path,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            model_override_args=self.model_override_args,
+            **kwargs,
+        )
+
+        # Unify quantization config handling:
+        # 1. User provided config path -> use it
+        # 2. HF model has fp8 dict config -> auto-convert to QuantizationConfig
+        # 3. Otherwise -> None
+        # After this, quantization_config is always QuantizationConfig or None
+        self.quantization_config = self._resolve_quantization_config()
+
+        # Attach unified quantization config to hf_config so models can access it.
+        # Only set when non-None: HuggingFace's to_dict() calls
+        # self.quantization_config.to_dict() without a None guard, so assigning
+        # None here would crash any repr() on the config (e.g. inside JAX tracing).
+        if self.quantization_config is not None:
+            self.hf_config.quantization_config = self.quantization_config
+
+        self.hf_generation_config = get_generation_config(
+            config_path,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
+
+        self.hf_text_config = get_hf_text_config(self.hf_config)
+        self.sliding_window = getattr(self.hf_text_config, "sliding_window", None)
+
+        if not getattr(self.hf_config, "architectures", None):
+            raise ValueError(
+                f"Invalid model config for {model_path!r}: missing `architectures`. "
+                "Check that the model path points to a valid Hugging Face model directory."
+            )
+
+        if is_draft_model and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
+            self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
+
+        if is_draft_model and self.hf_config.architectures[0] == "LlamaForCausalLM":
+            self.hf_config.architectures[0] = "LlamaForCausalLMEagle3"
+
+        if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
+            self.hf_config.architectures[0] = "MiMoMTPForCausalLM"
+
+        if is_draft_model and self.hf_config.architectures[0] in (
+            "MiMoV2ForCausalLM",
+            "MiMoV2FlashForCausalLM",
+        ):
+            self.hf_config.architectures[0] = "MiMoV2MTPForCausalLM"
+            # Each draft runner is a single SWA layer; without this the KV pool
+            # sizes for all 70 target layers and OOMs.
+            self.hf_config.num_hidden_layers = 1
+            if self.quantization_config is not None:
+                # eh_proj / o_proj are BF16 in model_mtp.safetensors (no
+                # weight_scale_inv); keep them as plain LinearBase so mappings
+                # can target `.weight` instead of `.weight_q`.
+                ignored = list(self.quantization_config.ignored_layers or [])
+                ignored.extend(["model.eh_proj", "model.mtp_block.self_attn.o_proj"])
+                self.quantization_config.ignored_layers = ignored
+        # Check model type
+        self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
+        self.is_multimodal = False
+        self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
+
+        # Derive context length
+        derived_context_len = get_context_length(self.hf_text_config)
+        if context_length is not None:
+            if context_length > derived_context_len:
+                if get_bool_env_var("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="True"):
+                    logger.warning(
+                        "Warning: User-specified context_length (%s) is greater than the derived context_length (%s). This may lead to incorrect model outputs or CUDA errors.",
+                        context_length,
+                        derived_context_len,
+                    )
+                    self.context_len = context_length
+                else:
+                    raise ValueError(
+                        f"User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config. To allow overriding this maximum, set the env var SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
+                    )
+            else:
+                self.context_len = context_length
+        else:
+            self.context_len = derived_context_len
+
+        # Unify the config keys for hf_text_config
+        self.head_dim = getattr(
+            self.hf_text_config,
+            "head_dim",
+            self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
+        )
+
+        self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", self.head_dim)
+        self.attention_arch = AttentionArch.MHA
+
+        self._apply_model_specific_config()
+        self.num_attention_heads = self.hf_text_config.num_attention_heads
+        self.num_key_value_heads = getattr(self.hf_text_config, "num_key_value_heads", None)
+
+        # for Dbrx and MPT models
+        if self.hf_config.model_type in ["dbrx", "mpt"]:
+            self.num_key_value_heads = getattr(self.hf_config.attn_config, "kv_n_heads", None)
+
+        if self.num_key_value_heads is None:
+            self.num_key_value_heads = self.num_attention_heads
+        self.hidden_size = self.hf_text_config.hidden_size
+        self.num_hidden_layers = self.hf_text_config.num_hidden_layers
+        self.vocab_size = self.hf_text_config.vocab_size
+        self.final_logit_softcapping = getattr(self.hf_text_config, "final_logit_softcapping", None)
+
+        # Override num_hidden_layers if model_layer_nums is specified
+        if model_layer_nums is not None:
+            if model_layer_nums <= 0:
+                raise ValueError(f"model_layer_nums must be positive, got {model_layer_nums}")
+            if model_layer_nums > self.num_hidden_layers:
+                logger.warning(
+                    "model_layer_nums (%s) is greater than the original num_hidden_layers (%s). Using original value.",
+                    model_layer_nums,
+                    self.num_hidden_layers,
+                )
+            elif model_layer_nums != self.num_hidden_layers:
+                self.num_hidden_layers = model_layer_nums
+                # Also update hf_config to ensure consistency across all components
+                self.hf_config.num_hidden_layers = model_layer_nums
+
+        # Cache attributes
+        self.hf_eos_token_id = self.get_hf_eos_token_id()
+
+        config = self.hf_config
+
+        # multimodal
+        self.image_token_id = getattr(config, "image_token_id", None) or getattr(
+            config, "image_token_index", None
+        )
+
+    def _resolve_quantization_config(self) -> QuantizationConfig | None:
+        """Resolve and unify quantization config from multiple sources.
+
+        Priority:
+        1. User-provided quantization_config_path (highest)
+        2. HF model's quantization_config (auto-detect fp8)
+        3. None (no quantization)
+
+        Returns:
+            Unified QuantizationConfig object or None
+        """
+        # 1. If user provided a config path, use it (already loaded in __init__)
+        if self.quantization_config is not None:
+            logger.info("Using user-provided quantization config")
+            # Check if HF model also has fp8 config
+            hf_quant_config = getattr(self.hf_config, "quantization_config", None)
+            if isinstance(hf_quant_config, dict) and hf_quant_config.get("quant_method") == "fp8":
+                logger.info("Model has fp8 checkpoint, setting is_static_checkpoint=True")
+                self.quantization_config.is_static_checkpoint = True
+            return self.quantization_config
+
+        # 2. Check if HF model has quantization config
+        hf_quant_config = getattr(self.hf_config, "quantization_config", None)
+        # If it's already a QuantizationConfig object (from previous instantiation or cache)
+        if isinstance(hf_quant_config, QuantizationConfig):
+            return hf_quant_config
+
+        # If it's a dict (from HF config.json), try to convert it
+        if isinstance(hf_quant_config, dict):
+            quant_method = hf_quant_config.get("quant_method")
+
+            if quant_method == "fp8":
+                logger.info("Auto-detected FP8 model. Creating QuantizationConfig for static fp8.")
+                ignored_layers = hf_quant_config.get("ignored_layers")
+                weight_block_size = hf_quant_config.get("weight_block_size")
+                if isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2:
+                    weight_block_size = (int(weight_block_size[0]), int(weight_block_size[1]))
+                else:
+                    weight_block_size = None
+                quant_config = QuantizationConfig(
+                    is_static_checkpoint=True,
+                    linear_rules=[
+                        {
+                            "module_path": ".*",
+                            "weight_dtype": "float8_e4m3fn",
+                            "activation_dtype": None,
+                        }
+                    ],
+                    moe_weight_dtype=jnp.float8_e4m3fn,
+                    moe_activation_dtype=None,
+                    ignored_layers=ignored_layers,
+                    weight_block_size=weight_block_size,
+                )
+                return quant_config
+
+            elif quant_method == "compressed-tensors":
+                # Check if it's float-quantized (fp8)
+                format_type = hf_quant_config.get("format")
+                if format_type == "float-quantized":
+                    logger.info(
+                        "Auto-detected compressed-tensors FP8 model. "
+                        "Creating QuantizationConfig for static fp8."
+                    )
+
+                    def is_dynamic_fp8_act(cfg):
+                        if not cfg:
+                            return False
+                        dynamic = cfg.get("dynamic", False)
+                        type_ = cfg.get("type", "")
+                        num_bits = cfg.get("num_bits", 0)
+                        return dynamic is True and type_ == "float" and num_bits == 8
+
+                    # Check for 'input_activations' at the top level or in config_groups
+                    found_act_config = False
+
+                    # Direct check
+                    if "input_activations" in hf_quant_config and is_dynamic_fp8_act(
+                        hf_quant_config["input_activations"]
+                    ):
+                        found_act_config = True
+
+                    # Check config_groups
+                    if not found_act_config and "config_groups" in hf_quant_config:
+                        groups = hf_quant_config["config_groups"]
+                        if isinstance(groups, dict):
+                            for group in groups.values():
+                                if "input_activations" in group and is_dynamic_fp8_act(
+                                    group["input_activations"]
+                                ):
+                                    found_act_config = True
+                                    break
+
+                    if found_act_config:
+                        # Align with sglang `CompressedTensorsW8A16Fp8`: log the
+                        # checkpoint's dynamic activation config but skip enabling
+                        # it — we run weight-only FP8 (BF16 activations).
+                        logger.info(
+                            "Detected dynamic per-token FP8 activation in checkpoint, "
+                            "but using weight-only mode (W8A16) for this run"
+                        )
+
+                    # Detect weight strategy from config_groups (per-channel vs block).
+                    # Ling-2.6-1T uses strategy="channel" → weight_block_size=None.
+                    weight_strategy = None
+                    weight_block_size = None
+                    if "config_groups" in hf_quant_config and isinstance(
+                        hf_quant_config["config_groups"], dict
+                    ):
+                        for group in hf_quant_config["config_groups"].values():
+                            weights_cfg = group.get("weights") if isinstance(group, dict) else None
+                            if not weights_cfg:
+                                continue
+                            weight_strategy = weights_cfg.get("strategy")
+                            block_structure = weights_cfg.get("block_structure")
+                            if (
+                                weight_strategy == "block"
+                                and isinstance(block_structure, (list, tuple))
+                                and len(block_structure) == 2
+                            ):
+                                weight_block_size = (
+                                    int(block_structure[0]),
+                                    int(block_structure[1]),
+                                )
+                            break
+                    logger.info(
+                        "Compressed-tensors weight strategy=%s, weight_block_size=%s",
+                        weight_strategy,
+                        weight_block_size,
+                    )
+                    if weight_strategy not in (None, "channel", "block", "tensor"):
+                        raise NotImplementedError(
+                            f"Unsupported compressed-tensors weight strategy: "
+                            f"{weight_strategy!r}"
+                        )
+
+                    # Read ignore list (e.g. router gates, lm_head, MTP layer).
+                    ignored_layers = hf_quant_config.get("ignore") or []
+                    if ignored_layers:
+                        logger.info(
+                            "Loaded %d ignored layer entries from compressed-tensors config",
+                            len(ignored_layers),
+                        )
+
+                    quant_config = QuantizationConfig(
+                        is_static_checkpoint=True,
+                        linear_rules=[
+                            {
+                                "module_path": ".*",
+                                "weight_dtype": "float8_e4m3fn",
+                                "activation_dtype": None,
+                            }
+                        ],
+                        moe_weight_dtype=jnp.float8_e4m3fn,
+                        moe_activation_dtype=None,
+                        ignored_layers=list(ignored_layers),
+                        weight_block_size=weight_block_size,
+                    )
+                    return quant_config
+                else:
+                    logger.warning(
+                        "compressed-tensors format '%s' is not yet supported. "
+                        "Quantization will be disabled.",
+                        format_type,
+                    )
+                    return None
+
+            else:
+                logger.warning(
+                    "HF model has quantization method '%s' which is not yet supported. "
+                    "Quantization will be disabled.",
+                    quant_method,
+                )
+                return None
+
+        # 3. No quantization config found
+        logger.info("No quantization config found in HF config or user config")
+        return None
+
+    def _apply_model_specific_config(self) -> None:
+        """Invoke the model class's optional `patch_model_config` hook so model
+        files can own their own config overrides (attention_arch, head_dim,
+        MLA-specific dims, etc.) instead of a centralized if/elif chain here.
+
+        Runs during ModelConfig construction — before ModelRunner reads
+        `attention_arch` for backend selection — so patches land in time.
+        Import is lazy because model modules import ModelConfig back.
+        """
+        from sgl_jax.srt.models.registry import ModelRegistry
+
+        try:
+            model_cls, _ = ModelRegistry.resolve_model_cls(self.hf_config.architectures)
+        except ValueError:
+            return
+        patch = getattr(model_cls, "patch_model_config", None)
+        if patch is not None:
+            patch(self)
+
+    @staticmethod
+    def from_server_args(
+        server_args: ServerArgs,
+        model_path: str = None,
+        model_revision: str = None,
+        **kwargs,
+    ):
+        model_sub_dir = getattr(server_args, "model_sub_dir", None)
+        return ModelConfig(
+            model_path=model_path or server_args.model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=model_revision or server_args.revision,
+            context_length=server_args.context_length,
+            model_override_args=server_args.json_model_override_args,
+            is_embedding=server_args.is_embedding,
+            dtype=server_args.dtype,
+            quantization=server_args.quantization,
+            quantization_config_path=server_args.quantization_config_path,
+            model_impl=server_args.model_impl,
+            model_layer_nums=server_args.model_layer_nums,
+            multimodal=server_args.multimodal,
+            moe_backend=server_args.moe_backend,
+            model_sub_dir=model_sub_dir,
+            **kwargs,
+        )
+
+    # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
+    def get_total_num_kv_heads(self) -> int:
+        """Returns the total number of KV heads (original, not replicated)."""
+        # Use original value if it was stored during replication configuration
+        if hasattr(self, "_original_hf_num_key_value_heads"):
+            return self._original_hf_num_key_value_heads
+        # For GPTBigCode & Falcon:
+        # NOTE: for falcon, when new_decoder_architecture is True, the
+        # multi_query flag is ignored and we use n_head_kv for the number of
+        # KV heads.
+        falcon_model_types = ["falcon", "RefinedWeb", "RefinedWebModel"]
+        new_decoder_arch_falcon = self.hf_config.model_type in falcon_model_types and getattr(
+            self.hf_config, "new_decoder_architecture", False
+        )
+        if not new_decoder_arch_falcon and getattr(self.hf_text_config, "multi_query", False):
+            # Multi-query attention, only one KV head.
+            # Currently, tensor parallelism is not supported in this case.
+            return 1
+
+        # For DBRX and MPT
+        if self.hf_config.model_type in ["mpt"]:
+            if "kv_n_heads" in self.hf_config.attn_config:
+                return self.hf_config.attn_config["kv_n_heads"]
+            return self.hf_config.num_attention_heads
+        if self.hf_config.model_type in ["dbrx"]:
+            return getattr(
+                self.hf_config.attn_config,
+                "kv_n_heads",
+                self.hf_config.num_attention_heads,
+            )
+
+        attributes = [
+            # For Falcon:
+            "n_head_kv",
+            "num_kv_heads",
+            # For LLaMA-2:
+            "num_key_value_heads",
+            # For ChatGLM:
+            "multi_query_group_num",
+        ]
+        for attr in attributes:
+            num_kv_heads = getattr(self.hf_text_config, attr, None)
+            if num_kv_heads is not None:
+                return num_kv_heads
+
+        # For non-grouped-query attention models, the number of KV heads is
+        # equal to the number of attention heads.
+        return self.hf_text_config.num_attention_heads
+
+    def get_num_kv_heads(self, tensor_parallel_size) -> int:
+        """Returns the number of KV heads per TP size."""
+        from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
+
+        total_num_kv_heads = self.get_total_num_kv_heads()
+        return get_num_kv_heads_by_tp(total_num_kv_heads, tensor_parallel_size)
+
+    def needs_kv_head_replication(self, tensor_parallel_size: int) -> bool:
+        """Returns True if KV heads need to be replicated across devices."""
+        total_num_kv_heads = self.get_total_num_kv_heads()
+        return tensor_parallel_size > total_num_kv_heads
+
+    def get_num_kv_head_replicas(self, tensor_parallel_size: int) -> int:
+        """Returns the number of replicas for each original KV head."""
+        total_num_kv_heads = self.get_total_num_kv_heads()
+        if tensor_parallel_size > total_num_kv_heads:
+            return (tensor_parallel_size + total_num_kv_heads - 1) // total_num_kv_heads
+        else:
+            return 1
+
+    def get_total_num_kv_heads_with_replication(self, tensor_parallel_size: int) -> int:
+        """Returns the total number of KV heads after replication."""
+        total_num_kv_heads = self.get_total_num_kv_heads()
+        if tensor_parallel_size > total_num_kv_heads:
+            # When replication is needed, total becomes tensor_parallel_size
+            # because each device gets 1 head and there are tp_size devices
+            return tensor_parallel_size
+        else:
+            # No replication needed, return original
+            return total_num_kv_heads
+
+    def configure_for_tensor_parallel(self, tensor_parallel_size: int):
+        """Configure model config for tensor parallel execution with KV head replication."""
+        # Get per-device KV head count
+        kv_heads_per_device = self.get_num_kv_heads(tensor_parallel_size)
+
+        # Store original values for reference (only once)
+        if not hasattr(self, "_original_num_key_value_heads"):
+            self._original_num_key_value_heads = self.num_key_value_heads
+
+        # Handle cases where HF config doesn't have num_key_value_heads (MHA models)
+        if hasattr(self.hf_text_config, "num_key_value_heads"):
+            if not hasattr(self, "_original_hf_num_key_value_heads"):
+                self._original_hf_num_key_value_heads = self.hf_text_config.num_key_value_heads
+        else:
+            # For MHA models without this attribute, it equals num_attention_heads
+            if not hasattr(self, "_original_hf_num_key_value_heads"):
+                self._original_hf_num_key_value_heads = self.hf_text_config.num_attention_heads
+
+        # CRITICAL: Set to TOTAL count for global sharding
+        # JAX tensor parallel will automatically shard this across devices
+        total_kv_heads = kv_heads_per_device * tensor_parallel_size
+        self.num_key_value_heads = total_kv_heads
+
+        # Only set HF config if the attribute exists, otherwise create it
+        if hasattr(self.hf_text_config, "num_key_value_heads"):
+            self.hf_text_config.num_key_value_heads = total_kv_heads
+        else:
+            # For MHA models, dynamically add the attribute
+            self.hf_text_config.num_key_value_heads = total_kv_heads
+
+        # Handle swa_num_key_value_heads if present (e.g. MiMo models)
+        if hasattr(self.hf_text_config, "swa_num_key_value_heads"):
+            if not hasattr(self, "_original_swa_num_key_value_heads"):
+                self._original_swa_num_key_value_heads = self.hf_text_config.swa_num_key_value_heads
+            from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
+
+            swa_kv_heads_per_device = get_num_kv_heads_by_tp(
+                self._original_swa_num_key_value_heads, tensor_parallel_size
+            )
+            self.hf_text_config.swa_num_key_value_heads = (
+                swa_kv_heads_per_device * tensor_parallel_size
+            )
+
+    def get_original_kv_head_id(self, tp_rank: int, tensor_parallel_size: int) -> int:
+        """Determine which original KV head this device should use."""
+        from sgl_jax.srt.utils.jax_utils import get_original_kv_head_id
+
+        total_num_kv_heads = self.get_total_num_kv_heads()
+        return get_original_kv_head_id(tp_rank, total_num_kv_heads, tensor_parallel_size)
+
+    def is_gqa_model(self) -> bool:
+        """Returns True if this is a Grouped Query Attention model."""
+        return self.get_total_num_kv_heads() < self.num_attention_heads
+
+    def get_kv_padding_strategy(self) -> str:
+        """Returns the padding strategy for KV heads."""
+        if self.is_gqa_model():
+            # GQA models should replicate existing kv heads to maintain attention semantics
+            return "replicate"
+        else:
+            # MHA models can use zero padding since all heads are equivalent
+            return "zero"
+
+    def log_kv_heads_info(self, tensor_parallel_size: int):
+        """Log KV heads configuration information during initialization."""
+        original_kv_heads = self.get_total_num_kv_heads()
+        kv_heads_per_device = self.get_num_kv_heads(tensor_parallel_size)
+        needs_replication = self.needs_kv_head_replication(tensor_parallel_size)
+        padding_strategy = self.get_kv_padding_strategy()
+
+        model_type = "GQA" if self.is_gqa_model() else "MHA"
+
+        if needs_replication:
+            num_replicas = self.get_num_kv_head_replicas(tensor_parallel_size)
+            logger.info(
+                "KV heads replication enabled for %s model: original_kv_heads=%s, tp_size=%s, each device gets %s head(s), each original head replicated %s times, padding_strategy=%s",
+                model_type,
+                original_kv_heads,
+                tensor_parallel_size,
+                kv_heads_per_device,
+                num_replicas,
+                padding_strategy,
+            )
+        else:
+            logger.info(
+                "KV heads distribution for %s model: original_kv_heads=%s, tp_size=%s, each device gets %s head(s), no replication needed, padding_strategy=%s",
+                model_type,
+                original_kv_heads,
+                tensor_parallel_size,
+                kv_heads_per_device,
+                padding_strategy,
+            )
+
+    def validate_tensor_parallel_config(self, tensor_parallel_size: int):
+        """Validate tensor parallel configuration constraints."""
+        # Query heads must be divisible by tensor parallel size
+        assert self.num_attention_heads % tensor_parallel_size == 0, (
+            f"Number of attention heads ({self.num_attention_heads}) must be divisible by "
+            f"tensor parallel size ({tensor_parallel_size}). "
+            f"Got remainder: {self.num_attention_heads % tensor_parallel_size}"
+        )
+
+    # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
+    def _parse_quant_hf_config(self):
+        quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if quant_cfg is None:
+            # compressed-tensors uses a "compression_config" key
+            quant_cfg = getattr(self.hf_config, "compression_config", None)
+        if quant_cfg is None:
+            # check if is modelopt model -- modelopt doesn't have corresponding field
+            # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
+            # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
+            is_local = os.path.exists(self.model_path)
+            modelopt_quant_config = {"quant_method": "modelopt"}
+            if not is_local:
+                from huggingface_hub import HfApi
+
+                hf_api = HfApi()
+                if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
+                    quant_cfg = modelopt_quant_config
+            elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
+                quant_config_file = os.path.join(self.model_path, "hf_quant_config.json")
+                with open(quant_config_file) as f:
+                    quant_config_dict = json.load(f)
+                json_quant_configs = quant_config_dict["quantization"]
+                quant_algo = json_quant_configs.get("quant_algo", None)
+                if quant_algo == "MIXED_PRECISION":
+                    quant_cfg = {"quant_method": "w4afp8"}
+                else:
+                    quant_cfg = modelopt_quant_config
+        return quant_cfg
+
+    def get_hf_eos_token_id(self) -> set[int] | None:
+        eos_ids = getattr(self.hf_config, "eos_token_id", None)
+        if eos_ids:
+            # it can be either int or list of int
+            eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
+        if eos_ids is None:
+            eos_ids = set()
+        if self.hf_generation_config:
+            generation_eos_ids = getattr(self.hf_generation_config, "eos_token_id", None)
+            if generation_eos_ids:
+                generation_eos_ids = (
+                    {generation_eos_ids}
+                    if isinstance(generation_eos_ids, int)
+                    else set(generation_eos_ids)
+                )
+                eos_ids = eos_ids | generation_eos_ids
+        return eos_ids
+
+    def maybe_pull_model_tokenizer_from_remote(self) -> None:
+        """
+        Pull the model config files to a temporary
+        directory in case of remote.
+
+        Args:
+            model: The model name or path.
+
+        """
+        from sgl_jax.srt.utils.common_utils import is_remote_url
+
+        if is_remote_url(self.model_path):
+            raise ValueError(
+                f"Remote URLs are not supported in JAX implementation. "
+                f"Please use a local path or HuggingFace model name instead: {self.model_path}"
+            )
+
+
+_STR_DTYPE_TO_JAX_DTYPE = {
+    "half": jnp.float16,
+    "float16": jnp.float16,
+    "float": jnp.float32,
+    "float32": jnp.float32,
+    "bfloat16": jnp.bfloat16,
+}
+
+
+def _get_and_verify_dtype(
+    config: PretrainedConfig,
+    dtype: str | jnp.dtype,
+) -> jnp.dtype:
+    config_dtype = getattr(config, "dtype", None)
+    if config_dtype is None:
+        config_dtype = getattr(config, "torch_dtype", None)
+    if isinstance(config_dtype, str):
+        config_dtype = _STR_DTYPE_TO_JAX_DTYPE.get(config_dtype)
+    elif config_dtype is not None:
+        config_dtype = _STR_DTYPE_TO_JAX_DTYPE.get(str(config_dtype).replace("torch.", ""), None)
+
+    if config_dtype is None:
+        config_dtype = jnp.float32
+
+    if isinstance(dtype, str):
+        dtype = dtype.lower()
+        if dtype == "auto":
+            jax_dtype = config_dtype
+            if config_dtype != jnp.bfloat16:
+                logger.warning(
+                    "Model dtype is %s. On TPU, using non-bfloat16 models may reduce performance.",
+                    config_dtype,
+                )
+        else:
+            if dtype not in _STR_DTYPE_TO_JAX_DTYPE:
+                raise ValueError(f"Unknown dtype: {dtype}")
+            jax_dtype = _STR_DTYPE_TO_JAX_DTYPE[dtype]
+    elif isinstance(dtype, jnp.dtype):
+        jax_dtype = dtype
+    else:
+        raise ValueError(f"Unknown dtype: {dtype}")
+
+    # Verify the dtype.
+    if jax_dtype != config_dtype:
+        if jax_dtype == jnp.float32:
+            # Upcasting to float32 is allowed.
+            logger.info("Upcasting %s to %s.", config_dtype, jax_dtype)
+            pass
+        elif config_dtype == jnp.float32:
+            # Downcasting from float32 to float16 or bfloat16 is allowed.
+            logger.info("Downcasting %s to %s.", config_dtype, jax_dtype)
+            pass
+        else:
+            # Casting between float16 and bfloat16 is allowed with a warning.
+            logger.warning("Casting %s to %s.", config_dtype, jax_dtype)
+    return jax_dtype
+
+
+def is_generation_model(model_architectures: list[str], is_embedding: bool = False):
+    # We have two ways to determine whether a model is a generative model.
+    # 1. Check the model architecture
+    # 2. check the `is_embedding` server args
+
+    if (
+        "LlamaEmbeddingModel" in model_architectures
+        or "MistralModel" in model_architectures
+        or "LlamaForSequenceClassification" in model_architectures
+        or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
+        or "InternLM2ForRewardModel" in model_architectures
+        or "Qwen2ForRewardModel" in model_architectures
+        or "Qwen2ForSequenceClassification" in model_architectures
+        or "CLIPModel" in model_architectures
+        or "BertModel" in model_architectures
+        or "Contriever" in model_architectures
+        or "BertForSequenceClassification" in model_architectures
+        or "XLMRobertaModel" in model_architectures
+        or "XLMRobertaForSequenceClassification" in model_architectures
+    ):
+        return False
+    else:
+        return not is_embedding
+
+
+multimodal_model_archs = [
+    "CLIPModel",
+    "DeepseekVL2ForCausalLM",
+    "Gemma3ForConditionalGeneration",
+    "Gemma3nForConditionalGeneration",
+    "Grok1VForCausalLM",
+    "Grok1AForCausalLM",
+    "LlavaLlamaForCausalLM",
+    "Llama4ForConditionalGeneration",
+    "LlavaMistralForCausalLM",
+    "LlavaQwenForCausalLM",
+    "LlavaForConditionalGeneration",
+    "LlavaVidForCausalLM",
+    "MiniCPMO",
+    "MiniCPMV",
+    "Mistral3ForConditionalGeneration",
+    "MultiModalityCausalLM",
+    "MllamaForConditionalGeneration",
+    "Qwen2AudioForConditionalGeneration",
+    "Qwen2VLForConditionalGeneration",
+    "Qwen2_5_VLForConditionalGeneration",
+    "KimiVLForConditionalGeneration",
+    "InternVLChatModel",
+    "Phi4MMForCausalLM",
+    "VILAForConditionalGeneration",
+]
+
+
+# Models that require attention_mask for padding token handling
+# These are typically Encoder-only or Embedding models
+ENCODER_ONLY_MODELS = [
+    # UMT5 Encoder variants
+    "UMT5EncoderModel",
+    "T5EncoderModel",
+    # BERT family
+    "BertModel",
+    "BertForSequenceClassification",
+    "XLMRobertaModel",
+    "XLMRobertaForSequenceClassification",
+    # CLIP components
+    "CLIPTextModel",
+    "CLIPVisionModel",
+    # Other Encoders
+    "Contriever",
+    # Embedding models
+    "LlamaEmbeddingModel",
+    "MistralModel",
+    "LlamaForSequenceClassification",
+    "LlamaForSequenceClassificationWithNormal_Weights",
+    "InternLM2ForRewardModel",
+    "Qwen2ForRewardModel",
+    "Qwen2ForSequenceClassification",
+]
+
+
+def need_attention_mask(model_architectures: list[str], is_embedding: bool = False) -> bool:
+    """
+    Determine if a model needs attention_mask for handling padding tokens.
+
+    Args:
+        model_architectures: List of model architecture names from HF config
+        is_embedding: Whether --is-embedding flag is set
+
+    Returns:
+        True if the model needs attention_mask (Encoder-only or Embedding models)
+    """
+    if is_embedding:
+        return True
+
+    return any(arch in ENCODER_ONLY_MODELS for arch in model_architectures)
+
+
+class MockModelConfig(ModelConfig):
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        num_kv_heads: int,
+        context_len: int,
+        num_hidden_layers: int,
+    ):
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.num_kv_heads = num_kv_heads
+        self.context_len = context_len
+        self.num_hidden_layers = num_hidden_layers
+
+    def get_num_kv_heads(self, tensor_parallel_size) -> int:
+        return self.num_kv_heads

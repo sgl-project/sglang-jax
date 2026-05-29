@@ -1,0 +1,104 @@
+default_stages: [pre-commit, pre-push, manual]
+
+default_language_version:
+  python: python3.12
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-symlinks
+      - id: destroyed-symlinks
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-toml
+      - id: check-ast
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: check-shebang-scripts-are-executable
+      - id: detect-private-key
+      - id: debug-statements
+      - id: no-commit-to-branch
+  - repo: https://github.com/PyCQA/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: ["--profile=black"]
+        exclude: ^python/sgl_jax/test/run_eval\.py$
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.13.3
+    hooks:
+      # Ruff is lint-only; formatting is handled by Black.
+      # Do not add ruff-format to avoid conflicts with Black.
+      - id: ruff-check
+        args: [--output-format, github, --fix]
+        files: ^(python/|benchmark/|docs/|examples/)
+        exclude: \.ipynb$
+  - repo: https://github.com/psf/black
+    rev: 24.10.0
+    hooks:
+      - id: black-jupyter
+        args: ["--config", "python/pyproject.toml"]
+        # Black is the only formatter; keep Ruff formatting disabled.
+        # exclude: >
+        #   (?x)^(
+        #     python/sgl_jax/srt/entrypoints/openai/serving_rerank\.py|
+        #     python/sgl_jax/srt/entrypoints/openai/serving_score\.py|
+        #     python/sgl_jax/srt/managers/detokenizer_manager\.py|
+        #     python/sgl_jax/srt/model_loader/__init__\.py|
+        #     python/sgl_jax/srt/managers/tp_worker\.py|
+        #     python/sgl_jax/srt/managers/scheduler_output_processor_mixin\.py|
+        #     python/sgl_jax/srt/managers/scheduler\.py|
+        #     python/sgl_jax/srt/server_args\.py
+        #   )$
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+        additional_dependencies: ['tomli']
+        args: ['--toml', 'python/pyproject.toml', '-L', 'cann']
+        exclude: test/srt/test_reasoning_parser.py # Exclude the test file that is expected to fail
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v18.1.8
+    hooks:
+    - id: clang-format
+      types_or: [c++, cuda]
+      args: [--style=file, --verbose]
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.8.1
+    hooks:
+      - id: nbstripout
+        args:
+          - '--keep-output'
+          - '--extra-keys=metadata.kernelspec metadata.language_info.version'
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: 9f70dc58c23dfcca1b97af99eaeee3140a807c7e
+    hooks:
+      - id: mypy
+        additional_dependencies: [
+          # package list reference: python/sgl_jax/check_env.py, python/pyproject.toml
+          jax,
+          flax
+          # jaxlib,
+          # triton,
+          # transformers,
+          # numpy,
+          # aiohttp,
+          # fastapi,
+          # huggingface_hub,
+          # modelscope,
+          # orjson,
+          # packaging,
+          # psutil,
+          # pydantic,
+          # python-multipart,
+          # pyzmq,
+          # uvicorn,
+          # uvloop,
+          # openai,
+          # tiktoken,
+        ]
+        args: ["--config", "python/pyproject.toml"]
+        pass_filenames: false

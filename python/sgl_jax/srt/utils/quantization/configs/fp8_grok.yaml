@@ -1,0 +1,19 @@
+# FP8 quantization for Grok MoE model
+# - MoE gate (router) is NOT quantized for numerical stability
+# - All other layers: FP8 W8A8
+# - Uses per-channel weight quantization + dynamic per-token activation quantization
+# - Reference: https://arxiv.org/pdf/2101.03961
+
+quantization:
+  # Quantization rules for linear layers
+  linear:
+    rules:
+      # All layers EXCEPT MoE gate, experts, and logits_processor
+      - module_path: '^(?!.*(block_sparse_moe/gate|block_sparse_moe/experts|logits_processor)).*$'
+        weight_dtype: 'float8_e4m3fn'
+        activation_dtype: 'float8_e4m3fn'
+
+  # MoE experts: FP8 weights only, NO activation quantization
+  moe:
+    weight_dtype: 'float8_e4m3fn'
+    activation_dtype: 'float8_e4m3fn'

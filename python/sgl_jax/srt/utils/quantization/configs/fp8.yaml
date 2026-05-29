@@ -1,0 +1,15 @@
+# FP8 weight-only quantization config
+# Works for both linear and MoE models
+# Uses per-channel weight quantization
+
+quantization:
+  # Quantization rules for linear layers (attention, MLP, embeddings)
+  linear:
+    rules:
+      - module_path: '.*'
+        weight_dtype: 'float8_e4m3fn'
+
+  # MoE-specific settings (experts weights)
+  moe:
+    weight_dtype: 'float8_e4m3fn'
+    activation_dtype: null

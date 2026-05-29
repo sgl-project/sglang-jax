@@ -1,0 +1,40 @@
+model_arch: MiMo-Audio
+# MiMo Audio multimodal model with audio encoder, LLM backbone, and audio decoder
+# Note: This model requires two separate HuggingFace repos:
+#   - xiaomi/MiMo-Audio-Tokenizer (for audio encoder/decoder)
+#   - xiaomi/MiMo-7B-RL or xiaomi/MiMo-Audio (for LLM backbone)
+stage_args:
+  # Stage 0: Audio Encoder - encode input audio to discrete tokens
+  - stage_id: 0
+    runtime:
+      num_tpus: 2
+      max_batch_size: 1
+      device_kind: tpu
+    scheduler: audio_encoder
+    scheduler_params: {}
+    model_class: MiMoAudioTokenizer
+    model_path: XiaomiMiMo/MiMo-Audio-Tokenizer
+    final_output: false
+
+  # Stage 1: LLM Backbone - process text + audio tokens, generate response
+  - stage_id: 1
+    runtime:
+      num_tpus: 2
+      max_batch_size: 1
+      device_kind: tpu
+    scheduler: audio_backbone
+    scheduler_params: {}
+    model_class: MiMoAudioForCausalLM
+    final_output: true
+
+  # # Stage 2: Audio Decoder + Vocoder - decode audio tokens to waveform
+  # - stage_id: 2
+  #   runtime:
+  #     num_tpus: 1
+  #     max_batch_size: 1
+  #     device_kind: cpu
+  #   scheduler: audio_decoder
+  #   scheduler_params: {}
+  #   model_class: MiMoAudioTokenizer
+  #   model_path: XiaomiMiMo/MiMo-Audio-Tokenizer
+  #   final_output: true
