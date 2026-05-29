@@ -1,9 +1,9 @@
-name: Release Tag (Validate then Push Tag)
+name: Tag (Validate then Push Tag)
 
 on:
   # TODO(remove-before-merge): branch push trigger is only here so the workflow
   # appears in the Actions UI on feat/release-pipeline. Delete this `push` block
-  # before merging — release-tag.yml should only run via workflow_dispatch or workflow_call.
+  # before merging — tag.yml should only run via workflow_dispatch or workflow_call.
   push:
     branches:
       - feat/release-pipeline

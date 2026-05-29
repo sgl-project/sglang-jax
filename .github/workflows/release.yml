@@ -1,33 +1,27 @@
-name: Release (Publish Artifacts)
+name: Release
+
+# Single user-facing entry point for the two-phase release flow.
+# Phase 1 (tag job)     -> validates and pushes the annotated tag via tag.yml.
+# Phase 2 (publish job) -> publishes wheel + image + GitHub Release via publish.yml.
+#
+# tag.yml and publish.yml remain individually dispatchable for advanced
+# recovery flows (e.g. re-publishing from an existing tag without re-tagging).
 
 on:
   # TODO(remove-before-merge): branch push trigger is only here so the workflow
-  # appears in the Actions UI on feat/release-pipeline. Delete this `branches`
-  # entry before merging — release.yml should only run via tag push or workflow_dispatch.
+  # appears in the Actions UI on feat/release-pipeline. Delete this `push` block
+  # before merging — release.yml should only run via workflow_dispatch.
   push:
     branches:
       - feat/release-pipeline
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Tag created by release-tag.yml (e.g. v0.0.3rc0). Must already exist on origin unless dry_run is true."
+      version:
+        description: "Target version string without v prefix (e.g. 0.0.3, 0.0.3rc0, 0.0.3.post1)"
         required: true
         type: string
       dry_run:
-        description: "If true, build artifacts but skip PyPI/Docker publish and GitHub Release creation"
-        required: false
-        default: false
-        type: boolean
-  workflow_call:
-    inputs:
-      tag:
-        description: "Tag to publish from (must already exist on origin)"
-        required: true
-        type: string
-      dry_run:
-        description: "If true, build artifacts but skip publish"
+        description: "If true, build and validate but skip tag push and publish"
         required: false
         default: false
         type: boolean
@@ -35,101 +29,21 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref }}
-  cancel-in-progress: false
-
 jobs:
-  metadata:
-    # TODO(remove-before-merge): drop the branch-push guard together with the `branches` trigger above.
-    if: github.repository == 'sgl-project/sglang-jax' && !(github.event_name == 'push' && github.ref_type == 'branch')
-    runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.compute.outputs.tag }}
-      version: ${{ steps.compute.outputs.version }}
-      is_prerelease: ${{ steps.compute.outputs.is_prerelease }}
-      update_latest: ${{ steps.compute.outputs.update_latest }}
-      dry_run: ${{ steps.compute.outputs.dry_run }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install packaging
-        run: python -m pip install --upgrade packaging
-
-      - name: Compute tag / version / flags
-        id: compute
-        env:
-          INPUT_TAG: ${{ inputs.tag }}
-          INPUT_DRY_RUN: ${{ inputs.dry_run }}
-        run: |
-          set -euo pipefail
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            TAG="${INPUT_TAG}"
-            DRY_RUN="${INPUT_DRY_RUN}"
-          else
-            TAG="${GITHUB_REF_NAME}"
-            DRY_RUN="false"
-          fi
-          if [[ "${DRY_RUN}" == "true" ]]; then
-            python scripts/ci/release_metadata.py from-tag --tag "${TAG}" --dry-run
-          else
-            python scripts/ci/release_metadata.py from-tag --tag "${TAG}"
-          fi
-
-      - name: Verify tag exists
-        if: ${{ steps.compute.outputs.dry_run != 'true' }}
-        run: |
-          set -euo pipefail
-          git ls-remote --exit-code --tags "https://github.com/${{ github.repository }}.git" "refs/tags/${{ steps.compute.outputs.tag }}" >/dev/null
-
-  publish-pypi:
-    needs: metadata
-    uses: ./.github/workflows/release-pypi.yml
+  tag:
+    # TODO(remove-before-merge): drop the event_name guard together with the `push` trigger above.
+    if: github.repository == 'sgl-project/sglang-jax' && github.event_name != 'push'
+    uses: ./.github/workflows/tag.yml
     secrets: inherit
     with:
-      tag: ${{ needs.metadata.outputs.tag }}
-      version: ${{ needs.metadata.outputs.version }}
-      dry_run: ${{ needs.metadata.outputs.dry_run == 'true' }}
+      version: ${{ inputs.version }}
+      dry_run: ${{ inputs.dry_run }}
 
-  publish-docker:
-    needs: metadata
-    uses: ./.github/workflows/release-docker.yml
+  publish:
+    needs: tag
+    if: ${{ ! inputs.dry_run }}
+    uses: ./.github/workflows/publish.yml
     secrets: inherit
     with:
-      tag: ${{ needs.metadata.outputs.tag }}
-      version: ${{ needs.metadata.outputs.version }}
-      update_latest: ${{ needs.metadata.outputs.update_latest == 'true' }}
-      dry_run: ${{ needs.metadata.outputs.dry_run == 'true' }}
-
-  github-release:
-    needs: [metadata, publish-pypi, publish-docker]
-    runs-on: ubuntu-latest
-    environment: prod
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ needs.metadata.outputs.dry_run == 'true' && github.ref || needs.metadata.outputs.tag }}
-
-      - name: Create GitHub Release
-        if: ${{ needs.metadata.outputs.dry_run != 'true' }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.metadata.outputs.tag }}
-          name: sglang-jax ${{ needs.metadata.outputs.tag }}
-          generate_release_notes: true
-          prerelease: ${{ needs.metadata.outputs.is_prerelease == 'true' }}
-          fail_on_unmatched_files: false
-
-      - name: Dry-run summary
-        if: ${{ needs.metadata.outputs.dry_run == 'true' }}
-        run: |
-          echo "::notice::Dry-run mode: GitHub Release will NOT be created."
-          echo "Publish dry-run completed for ${{ needs.metadata.outputs.tag }}." >> "$GITHUB_STEP_SUMMARY"
+      tag: ${{ needs.tag.outputs.tag }}
+      dry_run: false
