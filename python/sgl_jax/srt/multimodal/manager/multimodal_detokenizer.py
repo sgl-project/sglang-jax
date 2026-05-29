@@ -86,17 +86,20 @@ class MultimodalDetokenizer(DetokenizerManager):
         if req.data_type == DataType.AUDIO:
             return [req]
 
-        sample = req.output[0]
-        if sample.ndim == 3:
-            # for images, dim t is missing
-            sample = sample.unsqueeze(1)
-        frames = []
-        for x in sample:
-            frames.append((np.clip(x / 2 + 0.5, 0, 1) * 255).astype(np.uint8))
+        sample = req.output[0]  # Remove batch dim
+        if sample.ndim == 3 and sample.shape[0] in (1, 3, 4):
+            # Image with channels-first [C, H, W] -> [H, W, C]
+            sample = np.transpose(sample, (1, 2, 0))
+            frames = [(np.clip(sample / 2 + 0.5, 0, 1) * 255).astype(np.uint8)]
+        else:
+            if sample.ndim == 3:
+                sample = np.expand_dims(sample, 1)
+            frames = []
+            for x in sample:
+                frames.append((np.clip(x / 2 + 0.5, 0, 1) * 255).astype(np.uint8))
 
         # Save outputs if requested
         if req.save_output:
-            # if req.output_file_name:
             if req.data_type == DataType.VIDEO:
                 req.output_file_name = req.rid + ".mp4"
                 imageio.mimsave(

@@ -126,6 +126,12 @@ class VaeScheduler(SchedulerProfilerMixin):
         if hasattr(self.model_config, "shift_factor"):
             req.latents += self.model_config.shift_factor
         req.latents = jax.device_get(req.latents)
+
+        # Skip temporal padding for 4D image latents (FLUX)
+        if req.latents.ndim == 4:
+            return
+
+        # Existing 5D temporal padding for video models
         latents_t_padding = 0
         if self.server_args.precompile_frame_paddings is not None and hasattr(
             self.model_config, "scale_factor_temporal"
@@ -155,7 +161,10 @@ class VaeScheduler(SchedulerProfilerMixin):
             output, cache_miss = self.vae_worker.forward(req)
             if cache_miss > 0:
                 logger.info("VAE forward pass cache miss: %s", cache_miss)
-            req.output = jax.device_get(output[:, : req.num_frames, :, :, :])
+            if output.ndim == 4:
+                req.output = jax.device_get(output)
+            else:
+                req.output = jax.device_get(output[:, : req.num_frames, :, :, :])
             req.latents = None
             self.forward_ct += 1
             self._profile_batch_predicate(None)

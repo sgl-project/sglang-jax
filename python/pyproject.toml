@@ -70,6 +70,7 @@ multimodal = [
     "msgpack==1.0.0",
     "qwix",
     "soundfile",
+    "sentencepiece",
 ]
 
 [tool.setuptools.packages.find]

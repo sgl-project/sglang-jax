@@ -26,10 +26,16 @@ class DiffusionModelWorker:
         mesh: jax.sharding.Mesh = None,
         model_class=None,
         stage_sub_dir: str | None = None,
+        scheduler: str | None = None,
     ):
         self.mesh = mesh
+        self.scheduler = scheduler
         self.model_runner = DiffusionModelRunner(
-            server_args, self.mesh, model_class=model_class, stage_sub_dir=stage_sub_dir
+            server_args,
+            self.mesh,
+            model_class=model_class,
+            stage_sub_dir=stage_sub_dir,
+            scheduler=self.scheduler,
         )
         self.initialize()
         self.precompile_width_heights = server_args.precompile_width_heights
@@ -86,9 +92,13 @@ class DiffusionModelWorker:
                     pbar.set_postfix(wh=wh, t=t)
                     embeds = np.random.random((2, 512, self.model_config.text_dim))
                     embeds = device_array(embeds, sharding=NamedSharding(self.mesh, P()))
+                    # FLUX needs pooled_embeds for CLIP pooled projections
+                    pooled = np.random.random((1, 768)).astype(np.float32)
+                    pooled = device_array(pooled, sharding=NamedSharding(self.mesh, P()))
                     req = Req(
                         prompt_embeds=embeds[0],
                         negative_prompt_embeds=embeds[1],
+                        pooled_embeds=[pooled],
                         do_classifier_free_guidance=True,
                         width=width,
                         height=height,

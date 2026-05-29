@@ -30,6 +30,8 @@ def resolve_tokenizer_subdir(model_path: str, tokenizer_path: str | None = None)
             return "tokenizer_2"
         return ""
 
+    if "flux" in model_path.lower():
+        return "tokenizer"
     if "diffusers" in model_path.lower():
         return "tokenizer"
 

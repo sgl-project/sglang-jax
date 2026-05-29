@@ -129,6 +129,8 @@ jobs:
         uses: actions/checkout@v5
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
+        with:
+          install-target: python[all,multimodal]
       - name: Run e2e test
         timeout-minutes: 120
         shell: bash

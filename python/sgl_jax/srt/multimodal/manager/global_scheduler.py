@@ -236,7 +236,9 @@ class GlobalScheduler:
 
         req = Req(
             rid=input.rid,
+            prompt=input.prompt,
             input_ids=input.input_ids,
+            negative_prompt=input.negative_prompt,
             negative_input_ids=input.negative_input_ids,
             num_outputs_per_prompt=input.n,
             width=int(size_str.split("*")[0]),
