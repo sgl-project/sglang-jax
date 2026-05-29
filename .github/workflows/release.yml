@@ -8,12 +8,6 @@ name: Release
 # recovery flows (e.g. re-publishing from an existing tag without re-tagging).
 
 on:
-  # TODO(remove-before-merge): branch push trigger is only here so the workflow
-  # appears in the Actions UI on feat/release-pipeline. Delete this `push` block
-  # before merging — release.yml should only run via workflow_dispatch.
-  push:
-    branches:
-      - feat/release-pipeline
   workflow_dispatch:
     inputs:
       version:
@@ -31,8 +25,7 @@ permissions:
 
 jobs:
   tag:
-    # TODO(remove-before-merge): drop the event_name guard together with the `push` trigger above.
-    if: github.repository == 'sgl-project/sglang-jax' && github.event_name != 'push'
+    if: github.repository == 'sgl-project/sglang-jax'
     uses: ./.github/workflows/tag.yml
     secrets: inherit
     with:

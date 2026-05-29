@@ -1,12 +1,6 @@
 name: Tag (Validate then Push Tag)
 
 on:
-  # TODO(remove-before-merge): branch push trigger is only here so the workflow
-  # appears in the Actions UI on feat/release-pipeline. Delete this `push` block
-  # before merging — tag.yml should only run via workflow_dispatch or workflow_call.
-  push:
-    branches:
-      - feat/release-pipeline
   workflow_dispatch:
     inputs:
       version:
@@ -42,8 +36,7 @@ permissions:
 
 jobs:
   validate-and-tag:
-    # TODO(remove-before-merge): drop the event_name guard together with the `push` trigger above.
-    if: github.repository == 'sgl-project/sglang-jax' && github.event_name != 'push'
+    if: github.repository == 'sgl-project/sglang-jax'
     runs-on: ubuntu-latest
     environment: prod
     outputs:
@@ -72,10 +65,7 @@ jobs:
           python scripts/ci/release_metadata.py from-version --version "${RAW_VERSION}"
 
       - name: Verify HEAD is on main history
-        # TODO(remove-before-merge): always-false guard skips this check while we
-        # exercise the pipeline from feat/release-pipeline. Restore to `! inputs.dry_run`
-        # before merging so non-main commits can never be tagged.
-        if: false
+        if: ${{ ! inputs.dry_run }}
         run: |
           set -euo pipefail
           git fetch origin main
