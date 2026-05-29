@@ -2318,9 +2318,11 @@ def _fused_ep_moe_kernel(
 
         init_carry = (jnp.int32(0), jnp.bool_(False))
 
-        # Prefetch the first SE weight block before the expert loop so block 0's
-        # DMA is already in flight when the first run_shared_expert_slice waits.
+        # Wait for this BT's SE tokens (prefetched in the previous BT / pre-loop)
+        # and prefetch the first SE weight block before the expert loop so
+        # block 0's DMA is already in flight when run_shared_expert_slice waits.
         if se_total_blocks > 0:
+            wait_fetch_se_tokens(bt_id)
             start_fetch_se_weights(jnp.int32(0), jnp.int32(0), bt_sem_id)
 
         def compute_expert_batch(local_e_id, carry):
