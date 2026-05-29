@@ -2125,20 +2125,69 @@ def _fused_ep_moe_kernel(
             return
         bt_start = bt_id * bt
         bt_sem_id = bt_bank_id(bt_id)
-        for p_id in range(t_packing):
-            pltpu.make_async_copy(
-                src_ref=tokens_hbm.at[pl.ds(bt_start, bt), p_id, pl.ds(0, h_per_t)],
-                dst_ref=b_se_tokens_vmem.at[bt_sem_id, 0, pl.ds(0, bt), p_id, pl.ds(0, h_per_t)],
-                sem=local_sems.at[bt_sem_id, 0],
-            ).start()
+        # Copy the whole token block (bt, in_packing, h_per_in) in one DMA — no
+        # scalar packing index on the HBM ref (that breaks DMA tiling).
+        pltpu.make_async_copy(
+            src_ref=tokens_hbm.at[pl.ds(bt_start, bt)],
+            dst_ref=b_se_tokens_vmem.at[bt_sem_id, pl.ds(0, bt)],
+            sem=local_sems.at[bt_sem_id, 0],
+        ).start()
 
     def wait_fetch_se_tokens(bt_id):
         if w1_shared_hbm is None or disable_shared_expert:
             return
         bt_sem_id = bt_bank_id(bt_id)
-        for _ in range(t_packing):
-            ref = b_se_tokens_vmem.at[bt_sem_id, 0, pl.ds(0, bt), 0, pl.ds(0, h_per_t)]
-            pltpu.make_async_copy(src_ref=ref, dst_ref=ref, sem=local_sems.at[bt_sem_id, 0]).wait()
+        ref = b_se_tokens_vmem.at[bt_sem_id, pl.ds(0, bt)]
+        pltpu.make_async_copy(src_ref=ref, dst_ref=ref, sem=local_sems.at[bt_sem_id, 0]).wait()
+
+    def start_fetch_se_weights(block_id, slot, bt_sem_id):
+        if w1_shared_hbm is None or disable_shared_expert:
+            return
+        base = 10 + slot * 3
+        # DMA one bse-block per in_packing chunk into the packed se_w slot
+        # (mirrors start_fetch_w1: dst .at[slot, p]).
+        for p_id in range(in_packing):
+            pltpu.make_async_copy(
+                src_ref=w1_shared_hbm.at[
+                    pl.ds(p_id * h_per_in, h_per_in), pl.ds(block_id * bse, bse)
+                ],
+                dst_ref=b_se_w1_x2_vmem.at[slot, p_id],
+                sem=local_sems.at[bt_sem_id, base],
+            ).start()
+            pltpu.make_async_copy(
+                src_ref=w3_shared_hbm.at[
+                    pl.ds(p_id * h_per_in, h_per_in), pl.ds(block_id * bse, bse)
+                ],
+                dst_ref=b_se_w3_x2_vmem.at[slot, p_id],
+                sem=local_sems.at[bt_sem_id, base + 1],
+            ).start()
+            pltpu.make_async_copy(
+                src_ref=w2_shared_hbm.at[
+                    pl.ds(block_id * bse, bse), pl.ds(p_id * h_per_in, h_per_in)
+                ],
+                dst_ref=b_se_w2_x2_vmem.at[slot, p_id],
+                sem=local_sems.at[bt_sem_id, base + 2],
+            ).start()
+
+    def wait_fetch_se_weights(slot, bt_sem_id):
+        if w1_shared_hbm is None or disable_shared_expert:
+            return
+        base = 10 + slot * 3
+        pltpu.make_async_copy(
+            src_ref=b_se_w1_x2_vmem.at[slot],
+            dst_ref=b_se_w1_x2_vmem.at[slot],
+            sem=local_sems.at[bt_sem_id, base],
+        ).wait()
+        pltpu.make_async_copy(
+            src_ref=b_se_w3_x2_vmem.at[slot],
+            dst_ref=b_se_w3_x2_vmem.at[slot],
+            sem=local_sems.at[bt_sem_id, base + 1],
+        ).wait()
+        pltpu.make_async_copy(
+            src_ref=b_se_w2_x2_vmem.at[slot],
+            dst_ref=b_se_w2_x2_vmem.at[slot],
+            sem=local_sems.at[bt_sem_id, base + 2],
+        ).wait()
 
     def run_shared_expert_slice(block_id, bt_id, bt_sem_id, out_buf_id):
         if w1_shared_hbm is None or disable_shared_expert:
@@ -2146,28 +2195,37 @@ def _fused_ep_moe_kernel(
 
         @pl.when(block_id < se_total_blocks)
         def _():
+            slot = block_id % 2
+            # Prefetch next block's weights so its DMA overlaps this block's
+            # compute (and the interleaved expert FFN).
+            next_block = block_id + jnp.int32(1)
+
+            @pl.when(next_block < se_total_blocks)
+            def _():
+                start_fetch_se_weights(next_block, next_block % 2, bt_sem_id)
+
+            wait_fetch_se_weights(slot, bt_sem_id)
+
             gate_acc = jnp.zeros((bt, bse), dtype=jnp.float32)
             up_acc = jnp.zeros((bt, bse), dtype=jnp.float32)
 
-            for p_id in range(t_packing):
-                t_slice = b_se_tokens_vmem[bt_sem_id, 0, pl.ds(0, bt), p_id, pl.ds(0, h_per_t)]
-                w1_slice = w1_shared_hbm.at[
-                    pl.ds(p_id * h_per_t, h_per_t), pl.ds(block_id * bse, bse)
-                ]
-                w3_slice = w3_shared_hbm.at[
-                    pl.ds(p_id * h_per_t, h_per_t), pl.ds(block_id * bse, bse)
-                ]
-                gate_acc += jnp.dot(t_slice, w1_slice[...], preferred_element_type=jnp.float32)
-                up_acc += jnp.dot(t_slice, w3_slice[...], preferred_element_type=jnp.float32)
+            # Per-p dots over the packed (in_packing, h_per_in) view (cf. routed
+            # FFN1's b_x_vmem[..., p, ...] @ b_w1_x2_vmem[slot, p, ...]).
+            for p_id in range(in_packing):
+                t_slice = b_se_tokens_vmem[bt_sem_id, pl.ds(0, bt), p_id, pl.ds(0, h_per_in)]
+                w1_tile = b_se_w1_x2_vmem[slot, p_id]
+                w3_tile = b_se_w3_x2_vmem[slot, p_id]
+                gate_acc += jnp.dot(t_slice, w1_tile, preferred_element_type=jnp.float32)
+                up_acc += jnp.dot(t_slice, w3_tile, preferred_element_type=jnp.float32)
 
             act = activation_fn(gate_acc, up_acc, act_fn)
 
-            for p_id in range(t_packing):
-                w2_slice = w2_shared_hbm.at[
-                    pl.ds(block_id * bse, bse), pl.ds(p_id * h_per_t, h_per_t)
+            for p_id in range(in_packing):
+                w2_tile = b_se_w2_x2_vmem[slot, p_id]
+                partial = jnp.dot(act, w2_tile, preferred_element_type=jnp.float32)
+                se_ref = b_se_acc_vmem.at[
+                    out_buf_id, pl.ds(0, bt), pl.ds(p_id * h_per_in, h_per_in)
                 ]
-                partial = jnp.dot(act, w2_slice[...], preferred_element_type=jnp.float32)
-                se_ref = b_se_acc_vmem.at[out_buf_id, pl.ds(0, bt), pl.ds(p_id * h_per_t, h_per_t)]
 
                 @pl.when(block_id == 0)
                 def _(se_ref=se_ref, partial=partial):
@@ -2260,6 +2318,11 @@ def _fused_ep_moe_kernel(
 
         init_carry = (jnp.int32(0), jnp.bool_(False))
 
+        # Prefetch the first SE weight block before the expert loop so block 0's
+        # DMA is already in flight when the first run_shared_expert_slice waits.
+        if se_total_blocks > 0:
+            start_fetch_se_weights(jnp.int32(0), jnp.int32(0), bt_sem_id)
+
         def compute_expert_batch(local_e_id, carry):
             curr_se_block, bf0_w13_prefetched = carry
             e_sem_id_local = local_e_id
@@ -2345,7 +2408,7 @@ def _fused_ep_moe_kernel(
     # ===== Kernel start =====
     sync_barrier()
 
-    if enable_act_quant:
+    if enable_act_quant and not os.environ.get("SGLJAX_SKIP_PREQUANT"):
         # Standalone prequant: bf16 tokens -> fp8 + per-token f32 scale.
         # Scale is embedded into the last fp8 column via bitcast (4 fp8 bytes
         # == 1 f32). FFN1 reads it back out via the matching bitcast.
@@ -2653,12 +2716,6 @@ def fused_ep_moe_v2(
             )
         if w1_scale is None:
             raise ValueError("enable_act_quant requires fp8 weights (w1_scale not None).")
-        if w1_shared is not None:
-            raise NotImplementedError(
-                "enable_act_quant currently does not support shared experts; "
-                "the SE path reads tokens_hbm directly with t_* shapes that "
-                "diverge from in_* when act_quant is on."
-            )
     if direct_scaled_dot_ffn1 is None:
         direct_scaled_dot_ffn1 = direct_scaled_dot
     if direct_scaled_dot_ffn2 is None:
@@ -2950,20 +3007,29 @@ def fused_ep_moe_v2(
         pltpu.VMEM((bts, out_packing, h_per_out), out_dtype),  # y_stage
         # VMEM: per-token activation scale (act_quant only)
         (None if not enable_act_quant else pltpu.VMEM((bts, 128), jnp.float32)),  # x_scale
-        # VMEM: shared expert
+        # VMEM: shared expert. Packed (in_packing, h_per_in) layout mirrors the
+        # routed token/weight buffers (per-p dots are legal; cf. b_x_vmem). The
+        # token block is DMA'd whole (no scalar packing index on HBM); se_w* are
+        # double-buffered (slot = block_id % 2) for prefetch.
         (
             None
             if w1_shared is None
-            else pltpu.VMEM((smem_banks, 2, bt, t_packing, h_per_t), t_dtype)
+            else pltpu.VMEM((smem_banks, bt, in_packing, h_per_in), in_dtype)
         ),  # se_tokens
         (
-            None if w1_shared is None else pltpu.VMEM((2, t_packing, h_per_t, bse), w1.dtype)
+            None
+            if w1_shared is None
+            else pltpu.VMEM((2, in_packing, h_per_in, bse), w1_shared.dtype)
         ),  # se_w1
         (
-            None if w3_shared is None else pltpu.VMEM((2, t_packing, h_per_t, bse), w3.dtype)
+            None
+            if w3_shared is None
+            else pltpu.VMEM((2, in_packing, h_per_in, bse), w3_shared.dtype)
         ),  # se_w3
         (
-            None if w2_shared is None else pltpu.VMEM((2, t_packing, bse, h_per_t), w2.dtype)
+            None
+            if w2_shared is None
+            else pltpu.VMEM((2, in_packing, bse, h_per_in), w2_shared.dtype)
         ),  # se_w2
         (
             None if w1_shared is None else pltpu.VMEM((smem_banks, bt, hidden_size), jnp.float32)
@@ -2971,7 +3037,7 @@ def fused_ep_moe_v2(
         # Semaphores
         pltpu.SemaphoreType.DMA((1,)),  # x_stage
         pltpu.SemaphoreType.DMA((1,)),  # y_store
-        pltpu.SemaphoreType.DMA((smem_banks, 10)),  # local_sems
+        pltpu.SemaphoreType.DMA((smem_banks, 16)),  # local_sems (10-15 = SE weights)
         (
             pltpu.SemaphoreType.DMA((num_bt_banks, expert_buffer_count))
             if use_bt_banking

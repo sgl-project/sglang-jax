@@ -217,7 +217,8 @@ def align_local_tokens_for_v2(local_num_tokens: int) -> int:
 # Main
 # ---------------------------------------------------------------------------
 
-jax.distributed.initialize()
+if os.environ.get("BENCH_SINGLE_HOST", "0") != "1":
+    jax.distributed.initialize()
 log(f"initialized: {jax.device_count()} devices, {jax.process_count()} procs")
 
 from kernel import FusedMoEBlockConfig, fused_ep_moe_v2, ref_moe
@@ -234,6 +235,8 @@ E = int(os.environ.get("BENCH_E", "384"))
 top_k = int(os.environ.get("BENCH_TOPK", "8"))
 routing_mode = os.environ.get("BENCH_ROUTING_MODE", "random")
 bse = int(os.environ.get("BENCH_BSE", "256"))
+use_shared_expert = os.environ.get("BENCH_SHARED", "0") == "1"
+se_inter = int(os.environ.get("BENCH_SE_INTER", str(f)))
 warmup = int(os.environ.get("BENCH_WARMUP", "2"))
 iters = int(os.environ.get("BENCH_ITERS", "5"))
 check_correctness = os.environ.get("BENCH_CHECK", "0") == "1"
@@ -882,6 +885,24 @@ w1 = make_sharded(k2, (E, d, f), jnp.bfloat16, 0.01)
 w2 = make_sharded(k3, (E, f, d), jnp.bfloat16, 0.01)
 w3 = make_sharded(k4, (E, d, f), jnp.bfloat16, 0.01)
 
+# Shared expert weights are dense (all tokens) and replicated across devices.
+w1_shared = w2_shared = w3_shared = None
+if use_shared_expert:
+    log(f"creating shared expert weights (se_inter={se_inter}, replicated)...")
+    repl_sharding = jax.sharding.NamedSharding(mesh, P())
+
+    def make_replicated(rng_key, shape, dtype, scale=1.0):
+        arrs = [
+            jax.device_put(jax.random.normal(rng_key, shape, dtype=dtype) * scale, dev)
+            for dev in jax.local_devices()
+        ]
+        return jax.make_array_from_single_device_arrays(shape, repl_sharding, arrs)
+
+    ks1, ks2, ks3 = jax.random.split(jax.random.fold_in(key, 777), 3)
+    w1_shared = make_replicated(ks1, (d, se_inter), jnp.bfloat16, 0.01)
+    w3_shared = make_replicated(ks2, (d, se_inter), jnp.bfloat16, 0.01)
+    w2_shared = make_replicated(ks3, (se_inter, d), jnp.bfloat16, 0.01)
+
 w1_scale_s = w2_scale_s = w3_scale_s = None
 qbk_arg = None
 if use_fp8:
@@ -1109,6 +1130,9 @@ for num_tokens in token_candidates:
                 w1_scale=w1_scale_s,
                 w2_scale=w2_scale_s,
                 w3_scale=w3_scale_s,
+                w1_shared=w1_shared,
+                w2_shared=w2_shared,
+                w3_shared=w3_shared,
                 disable_a2a=disable_a2a,
                 disable_a2a_scatter=disable_a2a_scatter,
                 disable_a2a_scatter_local_copy=disable_a2a_scatter_local_copy,
@@ -1251,6 +1275,9 @@ if check_correctness:
             w1_scale=w1_scale_s,
             w2_scale=w2_scale_s,
             w3_scale=w3_scale_s,
+            w1_shared=w1_shared,
+            w2_shared=w2_shared,
+            w3_shared=w3_shared,
             direct_scaled_dot=direct_scaled_dot,
             direct_scaled_dot_ffn1=direct_scaled_dot_ffn1_modes[0],
             direct_scaled_dot_ffn2=direct_scaled_dot_ffn2_modes[0],
@@ -1272,6 +1299,10 @@ if check_correctness:
             ref_kwargs["w1_scale"] = jax.device_get(w1_scale_s)
             ref_kwargs["w2_scale"] = jax.device_get(w2_scale_s)
             ref_kwargs["w3_scale"] = jax.device_get(w3_scale_s)
+        if use_shared_expert:
+            ref_kwargs["w1_shared"] = jax.device_get(w1_shared)
+            ref_kwargs["w2_shared"] = jax.device_get(w2_shared)
+            ref_kwargs["w3_shared"] = jax.device_get(w3_shared)
         ref = ref_moe(
             jax.device_get(tokens_c),
             jax.device_get(w1),
