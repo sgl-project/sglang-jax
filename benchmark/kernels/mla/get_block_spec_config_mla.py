@@ -474,8 +474,8 @@ def main():
     parser.add_argument(
         "--vmem-limit-bytes",
         type=int,
-        default=100 * (1 << 20),
-        help="kernel vmem_limit_bytes; default matches mla_backend.py",
+        default=None,
+        help="kernel vmem_limit_bytes; default = 90%% of hardware VMEM capacity",
     )
     parser.add_argument(
         "--shard",
@@ -524,6 +524,12 @@ def main():
     my_work = outer[shard_rank::shard_total]
     print(f"# outer-grid total={len(outer)} mine={len(my_work)}")
     print()
+
+    if args.vmem_limit_bytes is None:
+        from jax.experimental.pallas import tpu as pltpu
+
+        args.vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+    print(f"# vmem_limit_bytes={args.vmem_limit_bytes} ({args.vmem_limit_bytes / (1<<20):.1f} MiB)")
 
     dtype = jnp.bfloat16
     q_dtype_name = jnp.dtype(dtype).name

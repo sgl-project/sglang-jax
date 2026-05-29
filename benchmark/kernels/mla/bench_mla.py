@@ -95,14 +95,11 @@ def benchmark_backend(
             nq = (1, 1, _DEFAULT_MIXED_BLOCK[1])
         dbs = _DEFAULT_DECODE_DBS
 
-    # NB: no donate_argnames at this outer wrapper — the inner
-    # mla_ragged_paged_attention already donates cache_kv (and pallas_call
-    # input_output_aliases keeps the buffer alive across iters). Doubling up
-    # here deletes the captured ref between iterations.
-    # Match production / tuner vmem budget (mla_backend.py:96 default: 100 MiB).
-    # If we don't pass this, pallas falls back to the hardware scoped VMEM
-    # limit (~32 MiB on v7x), which OOMs the tuned configs.
-    vmem_limit_bytes = 100 * (1 << 20)
+    # Match production vmem budget: query actual hardware capacity (× 0.9
+    # headroom), same as mla_backend.py does at construction time.
+    from jax.experimental.pallas import tpu as pltpu
+
+    vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
 
     @functools.partial(
         jax.jit,
