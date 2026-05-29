@@ -242,6 +242,11 @@ suites = {
     # Daily workflow keeps running so new cases can be added without restructuring CI.
     "nightly-test-accuracy-text-models-tpu-v6e-1-daily": [],
     "nightly-test-perf-text-models-tpu-v6e-1-daily": [],
+    # Infra smoke tests (#1207): radix-cache consistency, request logger, bench-serving self-check.
+    # Paths relative to test/srt/ (CI invokes via `cd test/srt && python3 run_suite.py`).
+    "nightly-infra-smoke-tpu-v6e-1": [
+        TestFile("test_nightly_infra_smoke.py", 15),
+    ],
     "sglang_dependency_test": [],
     "unit-test-tpu-v6e-1": [
         TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.3, runner="pytest"),
@@ -296,6 +301,7 @@ suites = {
         TestFile("test/srt/openai_server/basic/test_serving_chat.py", 0.1),
         TestFile("test/srt/openai_server/basic/test_serving_completions.py", 0.1),
         TestFile("test/srt/test_reasoning_parser.py", 0.1),
+        TestFile("test/srt/test_server_info.py", 0.1),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 0.4),
