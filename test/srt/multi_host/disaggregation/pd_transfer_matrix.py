@@ -59,9 +59,18 @@ from sgl_jax.srt.disaggregation.jax_transfer_wrapper import get_or_create_wrappe
 from sgl_jax.srt.mem_cache.host_kv_pool import QueueHostKVPool
 
 PAGE_ELEMS = 4096
-PAGE_COUNTS: tuple[int, ...] = (1, 16)
 ITERATIONS = int(os.environ.get("PD_ROUNDTRIP_ITERS", "8"))
 POOL_SIZE = int(os.environ.get("PD_POOL_SIZE", "16"))
+
+
+def _page_counts() -> tuple[int, ...]:
+    raw = os.environ.get("PD_PAGE_COUNTS")
+    if not raw:
+        return (1, 16)
+    counts = tuple(int(part.strip()) for part in raw.split(",") if part.strip())
+    if not counts or any(count <= 0 for count in counts):
+        raise ValueError(f"invalid PD_PAGE_COUNTS={raw!r}")
+    return counts
 
 
 @dataclass(frozen=True)
@@ -88,7 +97,7 @@ def _dtypes() -> list[tuple[str, jnp.dtype]]:
 
 
 def _all_cells() -> list[Cell]:
-    return [Cell(name, dt, pc) for name, dt in _dtypes() for pc in PAGE_COUNTS]
+    return [Cell(name, dt, pc) for name, dt in _dtypes() for pc in _page_counts()]
 
 
 def _device_sharding() -> NamedSharding:
@@ -168,6 +177,7 @@ def _print_cell_result(
         f"path={path_name} "
         f"dtype={dtype_name} "
         f"pages={page_count} "
+        f"tokens={page_count * 128} "
         f"iters={num_iters} "
         f"bytes_per_iter={bytes_per_iter} "
         f"total_bytes={total_bytes} "
