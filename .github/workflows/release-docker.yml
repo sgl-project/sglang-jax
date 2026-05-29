@@ -60,13 +60,13 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build and publish image
+      - name: Build image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
           platforms: linux/amd64
-          push: ${{ ! inputs.dry_run }}
+          push: false
           load: true
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
@@ -77,3 +77,15 @@ jobs:
           set -euo pipefail
           docker run --rm "${IMAGE}:v${{ inputs.version }}" \
             python -c "import sgl_jax; print('sgl_jax version:', sgl_jax.__version__); assert sgl_jax.__version__ == '${{ inputs.version }}', sgl_jax.__version__"
+
+      - name: Push image
+        if: ${{ ! inputs.dry_run }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            SETUPTOOLS_SCM_PRETEND_VERSION=${{ inputs.version }}
