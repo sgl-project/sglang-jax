@@ -1,17 +1,17 @@
-import math
-
 import jax
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.global_config import global_config
 
 
 def should_scatter(dim_size: int, num_devices: int) -> bool:
-    """Return True if a row-parallel output should be reduce-scattered on `dim`.
-
-    Requires the per-device slice to be at least ``tpu_scatter_min_local_size``
-    and the full dimension to divide evenly across devices (a hard requirement
-    of ``psum_scatter(..., tiled=True)``).
+    """Return True if a row-parallel output should be reduce-scattered on the
+    token dim. ``num_devices`` must be the total number of devices participating
+    in the scatter (i.e. the product of mesh axes named in the partition spec —
+    for ``("data", "tensor")`` that is ``data * tensor``, not ``tensor`` alone).
+    Requires per-device slice to be at least ``tpu_scatter_min_local_size`` and
+    the dim to divide evenly across all participating devices.
     """
     if num_devices <= 1:
         return False
@@ -21,40 +21,31 @@ def should_scatter(dim_size: int, num_devices: int) -> bool:
     )
 
 
-def prepare_scattered_spec_if_needed(
-    out_specs: P,
-    scatter_dim: int,
-    scatter_axis: str,
-    full_dim_size: int,
+def make_reduce_sharding(
+    arr: jax.Array,
     mesh: jax.sharding.Mesh,
-) -> tuple[P, bool]:
-    """Stack ``scatter_axis`` onto ``out_specs[scatter_dim]`` if scatter fires.
+    *,
+    scatter_dim: int = 0,
+    enable_sp: bool = True,
+) -> NamedSharding:
+    """Output sharding for a row-parallel reduce on the 'tensor' mesh axis.
 
-    The decision uses the *local* shard size — ``full_dim_size`` divided by
-    however many mesh axes already partition ``scatter_dim``.
+    The contracted dim consumes 'tensor' upstream; this function only
+    describes where the result lands:
+      - SP:  ``scatter_dim`` carries ('data', 'tensor') -> psum_scatter
+      - DP:  ``scatter_dim`` carries 'data'             -> plain psum
+    All other dims are replicated.
 
-    In the cases like DP attention, there's existing DP sharding on the sequences dimension. This
-    will influence sequence parallel behavior
-
-    Returns ``(new_out_specs, did_combine)``.
+    SP triggers only when ``enable_sp`` is True and
+    ``arr.shape[scatter_dim]`` clears the per-device threshold across the
+    full scatter axis ``data * tensor`` (see ``should_scatter``). Pass
+    ``enable_sp=False`` to force DP regardless of size.
     """
-    existing = out_specs[scatter_dim]
-    if existing is None:
-        existing_factor = 1
-    elif isinstance(existing, tuple):
-        existing_factor = math.prod(mesh.shape[a] for a in existing)
+    scatter_devices = mesh.shape["data"] * mesh.shape["tensor"]
+    if enable_sp and should_scatter(arr.shape[scatter_dim], scatter_devices):
+        axes: str | tuple[str, ...] = ("data", "tensor")
     else:
-        existing_factor = mesh.shape[existing]
-
-    if not should_scatter(full_dim_size // existing_factor, mesh.shape[scatter_axis]):
-        return out_specs, False
-
-    if existing is None:
-        combined: tuple[str, ...] | str = scatter_axis
-    elif isinstance(existing, tuple):
-        combined = existing + (scatter_axis,)
-    else:
-        combined = (existing, scatter_axis)
-
-    new_out_specs = P(*(combined if i == scatter_dim else axis for i, axis in enumerate(out_specs)))
-    return new_out_specs, True
+        axes = "data"
+    spec: list[str | tuple[str, ...] | None] = [None] * arr.ndim
+    spec[scatter_dim] = axes
+    return NamedSharding(mesh, P(*spec))

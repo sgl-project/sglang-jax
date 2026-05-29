@@ -3,7 +3,7 @@
 import jax
 from flax import nnx
 from jax import numpy as jnp
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
@@ -455,19 +455,9 @@ class FusedEPMoE(nnx.Module):
         topk_ids: jax.Array,
         *,
         block_config: FusedMoEBlockConfig | None = None,
+        out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
-        """
-        Forward pass through the fused MoE layer.
-
-        Args:
-            hidden_states: Input tokens, shape (num_tokens, hidden_size) or
-                          (batch_size, seq_len, hidden_size)
-            topk_weights: Pre-computed top-k weights
-            topk_ids: Pre-computed top-k expert IDs
-
-        Returns:
-            MoE layer output, same shape as hidden_states
-        """
+        """Forward pass through the fused MoE layer."""
         assert hidden_states.ndim == 2
 
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
@@ -526,7 +516,9 @@ class FusedEPMoE(nnx.Module):
             tp_axis_name="tensor",
         )
 
-        output = jax.sharding.reshard(output, NamedSharding(self.mesh, P("data", None)))
+        if out_sharding is None:
+            out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * output.ndim)))
+        output = jax.sharding.reshard(output, out_sharding)
         return output
 
 

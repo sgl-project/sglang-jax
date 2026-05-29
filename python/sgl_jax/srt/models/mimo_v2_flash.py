@@ -6,6 +6,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
@@ -19,6 +20,7 @@ from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK, create_moe_weights_ma
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.utils.parallel_utils import make_reduce_sharding
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -61,11 +63,16 @@ class MiMoV2MLP(nnx.Module):
         )
         self.act_fn = jax.nn.silu
 
-    def __call__(self, hidden_states: jax.Array):
+    def __call__(
+        self,
+        hidden_states: jax.Array,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ):
         a1, _ = self.gate_proj(hidden_states)
         a2, _ = self.up_proj(hidden_states)
         intermediate_parallel = a2 * self.act_fn(a1)
-        output, _ = self.down_proj(intermediate_parallel)
+        output, _ = self.down_proj(intermediate_parallel, out_sharding=out_sharding)
         return output
 
 
@@ -79,6 +86,7 @@ class MiMoV2Moe(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
     ):
         self.layer_id = layer_id
+        self.mesh = mesh
 
         num_experts = getattr(config, "n_routed_experts", getattr(config, "num_experts", 8))
         num_experts_per_tok = getattr(config, "num_experts_per_tok", 2)
@@ -151,14 +159,35 @@ class MiMoV2Moe(nnx.Module):
                 quantization_config=getattr(config, "quantization_config", None),
             )
 
-    def __call__(self, hidden_states: jax.Array, forward_batch: ForwardBatch):
+    def __call__(
+        self,
+        hidden_states: jax.Array,
+        forward_batch: ForwardBatch,
+        *,
+        out_sharding: jax.sharding.NamedSharding,
+    ):
         router_logits = self.moe_gate(hidden_states)
         correction_bias = self.correction_bias.value if self.correction_bias is not None else None
         topk_weights, topk_ids = self.topk(router_logits, correction_bias=correction_bias)
         if self.use_fused:
-            token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+            token_valid_mask = forward_batch.get_token_valid_mask(
+                hidden_states.shape[0],
+                out_sharding=NamedSharding(self.mesh, P(out_sharding.spec[0])),
+            )
             topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
-        mlp_output = self.experts(hidden_states, topk_weights, topk_ids)
+            mlp_output = self.experts(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                out_sharding=out_sharding,
+            )
+        else:
+            mlp_output = self.experts(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                out_sharding=out_sharding,
+            )
         return mlp_output, topk_ids
 
 
@@ -183,6 +212,7 @@ class MiMoV2Attention(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
     ):
         self.layer_id = layer_id
+        self.mesh = mesh
         self.hidden_size = hidden_size
         self.head_dim = head_dim or hidden_size // num_heads
         self.q_head_num = num_heads
@@ -267,6 +297,8 @@ class MiMoV2Attention(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
@@ -313,7 +345,7 @@ class MiMoV2Attention(nnx.Module):
                 attn_output = attn_output[..., : self.v_head_dim]
                 attn_output = attn_output.reshape(-1, expected_v_head_dim)
 
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output, out_sharding=out_sharding)
         return output, kv_fused
 
 
@@ -327,11 +359,15 @@ class MiMoV2DecoderLayer(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
     ):
         self.layer_id = layer_id
+        self.mesh = mesh
         self.hidden_size = config.hidden_size
+        self.enable_sequence_parallel = getattr(config, "enable_sequence_parallel", False)
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         attention_value_scale = getattr(config, "attention_value_scale", None)
+
+        self.is_layer_sparse = self._is_moe_layer(config)
 
         if self._is_swa_layer(config):
             self.self_attn = MiMoV2Attention(
@@ -370,8 +406,6 @@ class MiMoV2DecoderLayer(nnx.Module):
                 mesh=mesh,
             )
 
-        self.is_layer_sparse = self._is_moe_layer(config)
-
         if self.is_layer_sparse:
             self.mlp = MiMoV2Moe(
                 config=config,
@@ -407,32 +441,37 @@ class MiMoV2DecoderLayer(nnx.Module):
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
+        reduce_sharding = make_reduce_sharding(
+            hidden_states, self.mesh, enable_sp=self.enable_sequence_parallel
+        )
+
+        if residual is not None:
             hidden_states += residual
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states, kv_fused = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
+            out_sharding=reduce_sharding,
         )
-
-        hidden_states += residual
+        hidden_states += jax.sharding.reshard(residual, reduce_sharding)
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
+        topk_ids = None
         if self.is_layer_sparse:
-            mlp_output, topk_ids = self.mlp(hidden_states, forward_batch)
+            hidden_states, topk_ids = self.mlp(
+                hidden_states,
+                forward_batch,
+                out_sharding=reduce_sharding,
+            )
         else:
-            mlp_output = self.mlp(hidden_states)
-            topk_ids = None
+            hidden_states = self.mlp(hidden_states, out_sharding=reduce_sharding)
+        residual = jax.sharding.reshard(residual, reduce_sharding)
 
-        hidden_states = mlp_output
         return hidden_states, residual, kv_fused, topk_ids
 
     def _is_moe_layer(self, config) -> bool:
