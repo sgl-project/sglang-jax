@@ -1,5 +1,7 @@
 """Fused Expert-Parallel MoE layer using Pallas kernel."""
 
+import os
+
 import jax
 from flax import nnx
 from jax import numpy as jnp
@@ -105,6 +107,15 @@ class FusedEPMoE(nnx.Module):
         self.disable_all_reduce_metadata = disable_all_reduce_metadata
         self.disable_sync_barrier = disable_sync_barrier
         self.use_jax_allreduce_metadata = use_jax_allreduce_metadata
+
+        # Scatter-time activation quant (bf16->fp8 before the ICI scatter) for the
+        # v2 fused kernel — resolved ONCE here at init via env toggle; default OFF.
+        # Only FusedEPMoEV2.__call__ consumes it. Requires fp8 weights
+        # (direct_scaled_dot). The kernel rejects act_quant only when an *in-kernel*
+        # shared expert is fused in (w*_shared is not None); bailing_moe_linear builds
+        # FusedEPMoEV2 with num_shared_experts=0 (shared expert runs externally), so
+        # Ling-2.6-1T works with SGLANG_FUSED_MOE_V2_ACT_QUANT=1.
+        self.enable_act_quant = os.getenv("SGLANG_FUSED_MOE_V2_ACT_QUANT", "0") == "1"
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -598,6 +609,7 @@ class FusedEPMoEV2(FusedEPMoE):
             w2_shared=w2_shared_val,
             w3_shared=w3_shared_val,
             direct_scaled_dot=direct_scaled_dot,
+            enable_act_quant=self.enable_act_quant,
             skip_inter_bt_sync=True,
             dp_axis_name="data",
             tp_axis_name="tensor",
