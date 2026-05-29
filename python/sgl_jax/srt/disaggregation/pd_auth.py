@@ -6,7 +6,6 @@ import hmac
 import os
 from hashlib import sha256
 
-
 _ENV_VAR = "SGL_JAX_PD_SHARED_SECRET"
 
 
