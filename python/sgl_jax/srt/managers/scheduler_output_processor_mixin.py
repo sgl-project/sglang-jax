@@ -27,6 +27,47 @@ logger = logging.getLogger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = 50
 
 
+def _input_logprob_lens_per_dp(batch: ScheduleBatch) -> list[int] | None:
+    if not batch.forward_mode.is_extend():
+        return None
+
+    lens_per_dp = []
+    for info in batch.reqs_info:
+        extend_lens = info.extend_lens or []
+        start_lens = info.extend_logprob_start_lens or []
+        lens_per_dp.append(
+            sum(
+                max(extend_len - start_len, 0)
+                for extend_len, start_len in zip(extend_lens, start_lens)
+            )
+        )
+    return lens_per_dp
+
+
+def _materialize_input_token_logprobs(input_token_logprobs, lens_per_dp: list[int] | None = None):
+    input_shape = getattr(input_token_logprobs, "shape", None)
+    if input_shape is not None and len(input_shape) != 1:
+        raise RuntimeError(
+            "input_token_logprobs must be a 1-D scalar logprob array before "
+            f"host transfer; got shape {input_shape}. This would expose "
+            "full-vocab logprob rows in meta_info and can exhaust host RAM."
+        )
+    host_logprobs = np.asarray(jax.device_get(input_token_logprobs))
+
+    values = host_logprobs.astype(float).tolist()
+    if lens_per_dp:
+        valid_len = sum(lens_per_dp)
+        if len(values) != valid_len and len(values) % len(lens_per_dp) == 0:
+            per_dp_token_size = len(values) // len(lens_per_dp)
+            compact_values = []
+            offset = 0
+            for dp_valid_len in lens_per_dp:
+                compact_values.extend(values[offset : offset + dp_valid_len])
+                offset += per_dp_token_size
+            values = compact_values
+    return tuple(values)
+
+
 class SchedulerOutputProcessorMixin:
     """
     This class implements the output processing logic for Scheduler.
@@ -52,7 +93,11 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: threading.Event | None = None,
     ):
-        skip_stream_req = None
+        # On dp>1 each dp rank can have its own chunked-in-flight req, so this
+        # must hold up to `dp_size` reqs, not just one. A single-Req variable
+        # (the pre-DP design) silently leaked unchunked reqs into stream_output
+        # with `input_token_logprobs_val` still None, crashing the consumer.
+        skip_stream_reqs: set = set()
 
         assert self.is_generation
         (
@@ -84,8 +129,9 @@ class SchedulerOutputProcessorMixin:
                         logits_output.next_token_logprobs
                     ).astype(float)
                 if logits_output.input_token_logprobs is not None:
-                    logits_output.input_token_logprobs = tuple(
-                        jax.device_get(logits_output.input_token_logprobs).astype(float)
+                    logits_output.input_token_logprobs = _materialize_input_token_logprobs(
+                        logits_output.input_token_logprobs,
+                        _input_logprob_lens_per_dp(batch),
                     )
         hidden_state_offset = 0
         per_dp_bs_size = batch.per_dp_bs_size
@@ -199,10 +245,9 @@ class SchedulerOutputProcessorMixin:
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
-                    # There is only at most one request being currently chunked.
-                    # Because this request does not finish prefill,
-                    # we don't want to stream the request currently being chunked.
-                    skip_stream_req = req
+                    # On dp>1, multiple reqs (one per dp rank) can be chunked
+                    # in the same batch; collect all so stream_output skips them.
+                    skip_stream_reqs.add(id(req))
 
                     # Incrementally update input logprobs.
                     if req.return_logprob:
@@ -239,7 +284,7 @@ class SchedulerOutputProcessorMixin:
             all_reqs,
             batch.return_logprob,
             batch.return_output_logprob_only,
-            skip_stream_req,
+            skip_stream_reqs,
             cache_miss_count,
         )
 
@@ -655,13 +700,18 @@ class SchedulerOutputProcessorMixin:
         reqs: list[Req],
         return_logprob: bool,
         return_output_logprob_only: bool,
-        skip_req: Req | None = None,
+        skip_reqs: set | Req | None = None,
         cache_miss_count: int = None,
     ):
-        """Stream the output to detokenizer."""
+        """Stream the output to detokenizer.
+
+        `skip_reqs` accepts either a `set` of `id(req)` to skip, or a single
+        `Req` (back-compat). A set is required on dp>1 because more than one
+        req can be mid-chunked in the same batch.
+        """
         assert self.is_generation
         self.stream_output_generation(
-            reqs, return_logprob, return_output_logprob_only, skip_req, cache_miss_count
+            reqs, return_logprob, return_output_logprob_only, skip_reqs, cache_miss_count
         )
 
     def stream_output_generation(
@@ -669,9 +719,15 @@ class SchedulerOutputProcessorMixin:
         reqs: list[Req],
         return_logprob: bool,
         return_output_logprob_only: bool,
-        skip_req: Req | None = None,
+        skip_reqs: set | Req | None = None,
         cache_miss_count: int = None,
     ):
+        if skip_reqs is None:
+            skip_ids: set = set()
+        elif isinstance(skip_reqs, set):
+            skip_ids = skip_reqs
+        else:
+            skip_ids = {id(skip_reqs)}
         rids = []
         finished_reasons: list[BaseFinishReason] = []
 
@@ -723,7 +779,7 @@ class SchedulerOutputProcessorMixin:
             ) = output_token_ids_logprobs_idx = None
 
         for req in reqs:
-            if req is skip_req:
+            if id(req) in skip_ids:
                 continue
 
             if req.finished():
