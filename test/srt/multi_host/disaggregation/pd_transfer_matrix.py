@@ -58,9 +58,13 @@ from sgl_jax.srt.disaggregation.jax_transfer.zmq_notifier import ZmqPullNotifier
 from sgl_jax.srt.disaggregation.jax_transfer_wrapper import get_or_create_wrapper
 from sgl_jax.srt.mem_cache.host_kv_pool import QueueHostKVPool
 
-PAGE_ELEMS = 4096
+PAGE_SIZE_TOKENS = int(os.environ.get("PD_PAGE_SIZE_TOKENS", "128"))
 ITERATIONS = int(os.environ.get("PD_ROUNDTRIP_ITERS", "8"))
 POOL_SIZE = int(os.environ.get("PD_POOL_SIZE", "16"))
+KV_LAYER_NUM = int(os.environ.get("PD_KV_LAYER_NUM", "36"))
+KV_HEADS_PER_RANK = int(os.environ.get("PD_KV_HEADS_PER_RANK", "2"))
+KV_HEAD_DIM = int(os.environ.get("PD_KV_HEAD_DIM", "128"))
+KV_PACKING = int(os.environ.get("PD_KV_PACKING", "2"))
 
 
 def _page_counts() -> tuple[int, ...]:
@@ -100,6 +104,18 @@ def _all_cells() -> list[Cell]:
     return [Cell(name, dt, pc) for name, dt in _dtypes() for pc in _page_counts()]
 
 
+def _payload_shape(num_tokens: int) -> tuple[int, int, int, int]:
+    # The current path-A host-pool contract is 4-D, so fold K/V packing
+    # into the last dimension while keeping the logical bytes/token close
+    # to the real per-rank KV payload.
+    return (
+        num_tokens,
+        KV_LAYER_NUM,
+        KV_HEADS_PER_RANK,
+        KV_HEAD_DIM * KV_PACKING,
+    )
+
+
 def _device_sharding() -> NamedSharding:
     devices = jax.local_devices()
     mesh = Mesh(np.asarray(devices).reshape(len(devices)), axis_names=("x",))
@@ -112,7 +128,7 @@ def _replicated_sharding() -> NamedSharding:
     return NamedSharding(mesh, P())
 
 
-def _payload_numpy(seed: int, dtype_name: str, nelem: int) -> np.ndarray:
+def _payload_numpy(seed: int, dtype_name: str, num_tokens: int) -> np.ndarray:
     import ml_dtypes
 
     name_to_np = {
@@ -124,7 +140,7 @@ def _payload_numpy(seed: int, dtype_name: str, nelem: int) -> np.ndarray:
         name_to_np["fp8_e4m3fn"] = fp8
 
     rng = np.random.default_rng(seed)
-    raw = rng.integers(0, 200, size=(nelem,), dtype=np.int32)
+    raw = rng.integers(0, 200, size=_payload_shape(num_tokens), dtype=np.int32)
     return raw.astype(name_to_np[dtype_name])
 
 
@@ -132,10 +148,10 @@ def _make_payload(
     seed: int,
     dtype_name: str,
     dtype: jnp.dtype,
-    nelem: int,
+    num_tokens: int,
     sharding: NamedSharding,
 ) -> jax.Array:
-    np_ref = _payload_numpy(seed, dtype_name, nelem)
+    np_ref = _payload_numpy(seed, dtype_name, num_tokens)
     return jax.device_put(jnp.asarray(np_ref).astype(dtype), sharding)
 
 
@@ -168,7 +184,9 @@ def _print_cell_result(
     itemsize: int,
     elapsed_s: float,
 ) -> None:
-    bytes_per_iter = page_count * PAGE_ELEMS * itemsize
+    bytes_per_iter = (
+        np.prod(_payload_shape(page_count * PAGE_SIZE_TOKENS), dtype=np.int64) * itemsize
+    )
     total_bytes = bytes_per_iter * num_iters
     throughput_mib_s = total_bytes / max(elapsed_s, 1e-9) / (1024**2)
     print(
@@ -177,7 +195,7 @@ def _print_cell_result(
         f"path={path_name} "
         f"dtype={dtype_name} "
         f"pages={page_count} "
-        f"tokens={page_count * 128} "
+        f"tokens={page_count * PAGE_SIZE_TOKENS} "
         f"iters={num_iters} "
         f"bytes_per_iter={bytes_per_iter} "
         f"total_bytes={total_bytes} "
@@ -271,7 +289,7 @@ def _prefill(args: argparse.Namespace) -> int:
     )
 
     for cell in cells:
-        nelem = cell.page_count * PAGE_ELEMS
+        num_tokens = cell.page_count * PAGE_SIZE_TOKENS
         cell_t0 = time.perf_counter()
         # Per-cell pool + mgr for path A: pool dtype must match cell
         # dtype, otherwise the ``.at[:n].set(staged)`` scatter
@@ -282,10 +300,10 @@ def _prefill(args: argparse.Namespace) -> int:
         if args.use_d2h_staging:
             host_pool = QueueHostKVPool(
                 pool_size=args.pool_size,
-                max_tokens_per_buffer=nelem,
-                layer_num=1,
-                kv_head_per_rank=1,
-                head_dim=1,
+                max_tokens_per_buffer=num_tokens,
+                layer_num=KV_LAYER_NUM,
+                kv_head_per_rank=KV_HEADS_PER_RANK,
+                head_dim=KV_HEAD_DIM * KV_PACKING,
                 dtype=cell.dtype,
                 mesh=mesh,
                 partition_spec=P(),
@@ -305,23 +323,23 @@ def _prefill(args: argparse.Namespace) -> int:
                     seed,
                     cell.dtype_name,
                     cell.dtype,
-                    nelem,
+                    num_tokens,
                     payload_sharding,
                 )
                 payload_flat.block_until_ready()
-                payload = payload_flat.reshape((nelem, 1, 1, 1))
+                payload = payload_flat
             else:
                 payload = _make_payload(
                     seed,
                     cell.dtype_name,
                     cell.dtype,
-                    nelem,
+                    num_tokens,
                     payload_sharding,
                 )
                 payload.block_until_ready()
             sender.attach_payload(payload, use_d2h_staging=args.use_d2h_staging)
             sender.send()
-            line = f"{req_id} {nelem} {cell.dtype_name} {seed}\n".encode()
+            line = f"{req_id} {num_tokens} {cell.dtype_name} {seed}\n".encode()
             conn.sendall(line)
             senders.append((req_id, sender))
 
@@ -429,16 +447,15 @@ def _decode(args: argparse.Namespace) -> int:
             if len(toks) != 4:
                 raise RuntimeError(f"bad metadata line: {line!r}")
             req_id, nelem_s, dtype_name, seed_s = toks
-            nelem = int(nelem_s)
+            num_tokens = int(nelem_s)
             seed = int(seed_s)
             dtype = name_to_dtype[dtype_name]
             if use_d2h:
-                # Path A: P sized the host pool buffer to ``nelem``
-                # exactly (per-cell pool), so D pulls (nelem, 1, 1, 1)
-                # with replicated sharding.
-                spec = jax.ShapeDtypeStruct((nelem, 1, 1, 1), dtype, sharding=repl_sharding)
+                spec = jax.ShapeDtypeStruct(
+                    _payload_shape(num_tokens), dtype, sharding=repl_sharding
+                )
             else:
-                spec = jax.ShapeDtypeStruct((nelem,), dtype, sharding=sharding)
+                spec = jax.ShapeDtypeStruct(_payload_shape(num_tokens), dtype, sharding=sharding)
             metas.append(
                 (
                     req_id,
@@ -451,19 +468,19 @@ def _decode(args: argparse.Namespace) -> int:
                     ),
                     seed,
                     dtype_name,
-                    nelem,
+                    num_tokens,
                 )
             )
 
         # Phase 2: dispatch all receivers, drain, byte-check, ack.
         receivers: list[tuple[str, JaxTransferKVReceiver, int, str, int]] = []
-        for req_id, meta, seed, dtype_name, nelem in metas:
+        for req_id, meta, seed, dtype_name, num_tokens in metas:
             receiver = mgr.create_receiver(req_id)
             receiver.init(meta)
-            receivers.append((req_id, receiver, seed, dtype_name, nelem))
+            receivers.append((req_id, receiver, seed, dtype_name, num_tokens))
 
         cell_done = 0
-        for req_id, receiver, seed, dtype_name, nelem in receivers:
+        for req_id, receiver, seed, dtype_name, num_tokens in receivers:
             deadline = time.perf_counter() + 180.0
             while True:
                 state = receiver.poll()
@@ -483,7 +500,7 @@ def _decode(args: argparse.Namespace) -> int:
             arr = receiver.result
             assert arr is not None
             got_bytes = _arr_host_bytes(arr)
-            ref_bytes = _payload_numpy(seed, dtype_name, nelem).tobytes()
+            ref_bytes = _payload_numpy(seed, dtype_name, num_tokens).tobytes()
             if got_bytes != ref_bytes:
                 ctl.sendall(b"MISMATCH\n")
                 failed_cells.append(req_id)
