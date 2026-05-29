@@ -1,11 +1,15 @@
-"""MiMo-V2.5-Pro multi-layer MTP draft worker (#1053 P1-4).
+"""Multi-layer NEXTN/MTP draft worker (#1053 P1-4).
 
-Differs from ``EagleDraftWorker`` in that the N draft steps each use a
-*different* draft model runner (one per ``mtp_layer_idx``), with hidden
-states flowing layer→layer (layer i's output hidden becomes layer i+1's
-``spec_info.hidden_states``). Everything else — padding, tree build,
-verify-input construction, replicate helpers — is reused from
-``EagleDraftWorker``.
+The N draft steps each use a *different* draft model runner (one per
+``mtp_layer_idx``). Per the NEXTN training recipe (DeepSeek/MiMo), every
+layer i takes ``(embed(tok_{t+i}), target_hidden_t)`` — i.e. each layer
+sees the **target** model's hidden, not the previous MTP layer's output.
+So ``draft_extend`` forwards each layer once with the same target hidden
+and a per-layer rotated ``input_ids`` (shift+append previous topk), and
+``draft_forward`` does no model forward — it just reads the per-layer
+topk that ``draft_extend`` already stored. Chain-style hidden passing
+(layer i+1 ← layer i output) is only correct for archs like Step3p5MTP;
+see GPU sglang ``multi_layer_eagle_worker_v2.chain_mtp_hidden_states``.
 """
 
 from __future__ import annotations
@@ -17,8 +21,6 @@ import logging
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -35,10 +37,8 @@ from sgl_jax.srt.speculative.eagle_draft_worker import (
     select_top_k_tokens,
     topk_probs_from_logits,
     update_eagle_lists,
-    update_forward_batch_info,
 )
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
-from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +132,10 @@ class MultiLayerDraftWorker(EagleDraftWorker):
     # ---- per-layer overrides ------------------------------------------------
 
     def draft_forward(self, model_worker_batch: ModelWorkerBatch):
+        # dext already forwarded each MTP layer once and stored per-layer topk
+        # in spec_info.topk_{p,index} with shape (bs, num_steps, topk). We only
+        # feed those through select_top_k_tokens to assemble the tree lists —
+        # no model forward here (mirrors GPU multi_layer_eagle_worker_v2).
         topk_p = model_worker_batch.spec_info_padded.topk_p
         topk_index = model_worker_batch.spec_info_padded.topk_index
         hidden_states = model_worker_batch.spec_info_padded.hidden_states
@@ -143,51 +147,34 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         )
         parents_list = jnp.empty((bs, self.topk + 1 + step_min_1 * self.topk))
         scores = None
-        positions_base = device_array(
-            np.repeat(model_worker_batch.seq_lens, self.topk),
-            sharding=NamedSharding(self.mesh, P()),
-        )
-        logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh)
-
-        # Per-layer attention metadata: each layer has its own KV pool, so
-        # page_indices differ; positions/seq_lens are shared so we only need
-        # the i-th step's metadata from layer i.
-        metadata_per_layer = [
-            w.model_runner.attn_backend.get_eagle_multi_step_metadata(model_worker_batch)
-            for w in self._workers
-        ]
-
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
-        forward_batch.out_cache_loc = np.empty((1,))
-        forward_batch.cache_loc = np.empty((1,))
-        forward_batch.spec_info = EagleDraftInput()
-        forward_batch.spec_info.hidden_states = jnp.empty((bs * self.topk, hidden_states.shape[1]))
-
         for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
+            _, hidden_states, scores, tree_info = select_top_k_tokens(
+                i, topk_p[:, i], topk_index[:, i], hidden_states, scores, self.topk
             )
             score_list, token_list, parents_list = update_eagle_lists(
                 i, score_list, token_list, parents_list, tree_info, self.topk
             )
-            if i == self.speculative_num_steps - 1:
-                break
-
-            forward_batch = update_forward_batch_info(
-                forward_batch, i, input_ids, hidden_states, positions_base
-            )
-            mr = self.runner(i)
-            mr.attn_backend.forward_metadata = metadata_per_layer[i][i]
-            forward_batch.attn_backend = mr.attn_backend
-            forward_batch.bid = model_worker_batch.bid
-            logits_output, _, _ = mr.forward(forward_batch, logits_metadata=logits_metadata)
-
-            topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
-            if self.hot_token_ids is not None:
-                topk_index = self.hot_token_ids[topk_index]
-            hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
-
         return score_list, token_list, parents_list
+
+    @staticmethod
+    def _rotate_ids(mwb: ModelWorkerBatch, last_tok: np.ndarray, sel_pos: np.ndarray) -> None:
+        """In-place left-shift each req's input_ids by 1, then write last_tok[slot]
+        at position sel_pos[slot]. Mirrors GPU rotate_input_ids_triton."""
+        dp = mwb.dp_size
+        per_dp_bs = mwb.per_dp_bs_size
+        per_dp_tok = len(mwb.input_ids) // dp
+        ext = mwb.extend_seq_lens
+        for r in range(dp):
+            pt = r * per_dp_tok
+            for j in range(per_dp_bs):
+                s = r * per_dp_bs + j
+                el = int(ext[s])
+                if el == 0:
+                    continue
+                seg = mwb.input_ids[pt : pt + el]
+                seg[:-1] = seg[1:]
+                seg[int(sel_pos[s])] = last_tok[s]
+                pt += el
 
     def draft_extend_for_prefill(
         self,
@@ -197,10 +184,15 @@ class MultiLayerDraftWorker(EagleDraftWorker):
     ) -> None:
         """Prefill-extend across all MTP layers.
 
-        Layer 0 consumes the target's full-prefix hidden_states; layer i>0
-        consumes layer i-1's output hidden. Each layer writes its own
-        prefix KV. Only layer 0's topk/hidden are kept as the next-round
-        draft state (draft step 0 starts from layer 0).
+        NEXTN (DeepSeek/MiMo) trains each MTP layer i with input
+        ``(embed(tok_{t+i}), target_hidden_t)`` — every layer sees the *target*
+        hidden, not the previous MTP layer's output. So per layer we keep
+        ``hidden = target_hidden_states`` and only rotate ``input_ids`` (shift
+        by 1, append previous layer's topk) so layer i's last-logit position is
+        ``(topk_{i-1}, target_hidden_{last})``. Each layer's topk goes into
+        ``spec_info.topk_index[:, i]`` and ``draft_forward`` does no model
+        forward. Mirrors GPU sglang ``multi_layer_eagle_worker_v2`` for
+        non-chain archs (chain is only for Step3p5MTP).
         """
         sel = np.asarray(model_worker_batch.logits_indices_selector)
         verified_id_np = np.asarray(jax.device_get(next_token_ids))[sel]
@@ -232,10 +224,12 @@ class MultiLayerDraftWorker(EagleDraftWorker):
             )
 
         layer0_out = None
-        cur_hidden = hidden_states
+        all_topk_p, all_topk_index = [], []
+        ext = model_worker_batch.extend_seq_lens
+        sel_pos = np.clip(ext - 1, 0, None).astype(np.int64)
         for i, w in enumerate(self._workers):
             mr = w.model_runner
-            model_worker_batch.spec_info_padded.hidden_states = cur_hidden
+            model_worker_batch.spec_info_padded.hidden_states = hidden_states
             forward_batch = ForwardBatch.init_new(model_worker_batch, mr)
             forward_batch.return_logprob = False
             mr.attn_backend.forward_metadata = mr.attn_backend.get_eagle_forward_metadata(
@@ -248,17 +242,19 @@ class MultiLayerDraftWorker(EagleDraftWorker):
                     model_worker_batch, self.mesh
                 ),
             )
-            cur_hidden = logits_output.hidden_states
             if i == 0:
                 layer0_out = logits_output
+            tp, ti = topk_probs_from_logits(
+                replicate_to_mesh(self.mesh, logits_output.next_token_logits), self.topk
+            )
+            all_topk_p.append(np.asarray(jax.device_get(tp)))
+            all_topk_index.append(np.asarray(jax.device_get(ti)))
+            if i < len(self._workers) - 1:
+                self._rotate_ids(model_worker_batch, all_topk_index[-1][:, 0], sel_pos)
 
-        # Next-round draft state = layer 0's last-token hidden + topk (draft step 0
-        # starts from layer 0 with target's last hidden, so we cache layer 0's
-        # output here so step 0 can be skipped).
-        rep_logits, rep_hidden = replicate_to_mesh(
-            self.mesh, layer0_out.next_token_logits, layer0_out.hidden_states
-        )
-        layer0_out.next_token_logits = rep_logits
+        # spec_info.hidden_states is only consumed by select_top_k_tokens (shape
+        # bookkeeping at topk=1); keep layer0's last-token hidden for that.
+        rep_hidden = replicate_to_mesh(self.mesh, layer0_out.hidden_states)
         dp_size = model_worker_batch.dp_size
         if dp_size > 1:
             per_dp_tokens = rep_hidden.shape[0] // dp_size
@@ -266,33 +262,21 @@ class MultiLayerDraftWorker(EagleDraftWorker):
             last_idx = last_idx.copy()
             for k in range(1, dp_size):
                 last_idx[k * per_dp_bs : (k + 1) * per_dp_bs] += k * per_dp_tokens
-        layer0_out.hidden_states = rep_hidden[last_idx]
-        model_worker_batch.spec_info_padded.hidden_states = hidden_states
-        model_worker_batch.spec_info_padded.allocate_lens = np.asarray(model_worker_batch.seq_lens)[
-            sel
-        ]
-        # Restore real_bs verified_id so split_spec_info_per_rank can cut on
-        # real_bs_per_dp without slicing past the valid region.
-        model_worker_batch.spec_info_padded.verified_id = verified_id_np
-        self.capture_for_decode(layer0_out, model_worker_batch.spec_info_padded, sel=sel)
+        si = model_worker_batch.spec_info_padded
+        si.hidden_states = np.asarray(jax.device_get(rep_hidden))[last_idx][sel]
+        si.topk_p = np.stack(all_topk_p, axis=1)[sel]
+        si.topk_index = np.stack(all_topk_index, axis=1)[sel]
+        si.allocate_lens = np.asarray(model_worker_batch.seq_lens)[sel]
+        si.verified_id = verified_id_np
 
     def draft_extend_for_decode(
         self, model_worker_batch: ModelWorkerBatch, batch_output: GenerationBatchResult
     ) -> None:
-        """Decode-extend across all MTP layers (each updates its own KV).
-
-        Same chaining as prefill: layer 0 consumes target verify hidden,
-        layer i>0 consumes layer i-1's output. Only layer 0's topk/hidden
-        become the next-round draft state.
-        """
+        """Decode-extend across all MTP layers; see draft_extend_for_prefill."""
         if batch_output.next_draft_input.verified_id.shape[0] <= 0:
             return
         target_hidden = batch_output.logits_output.hidden_states
 
-        # prepare_for_extend_after_verify mutates mwb.seq_lens / input_ids /
-        # spec_info in place — call it once (semantics are layer-independent),
-        # then per layer only swap hidden_states + recompute forward_metadata
-        # against that layer's KV pool.
         draft_input = EagleDraftInput(
             hidden_states=target_hidden, allocate_lens=batch_output.allocate_lens
         )
@@ -305,46 +289,39 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         if mwb.input_ids.shape[0] <= 0:
             return
 
-        layer0_logits = None
-        cur_hidden = target_hidden
+        sel = np.asarray(model_worker_batch.logits_indices_selector)
+        accept_host = np.asarray(jax.device_get(batch_output.accept_lens))
+        assert (accept_host[sel] >= 1).all(), f"accept_length < 1: {accept_host[sel]}"
+        sel_pos = np.clip(accept_host - 1, 0, None).astype(np.int64)
+        mwb.input_ids = np.asarray(jax.device_get(mwb.input_ids)).copy()
+
+        layer0_hidden = None
+        all_topk_p, all_topk_index = [], []
         for i, w in enumerate(self._workers):
             mr = w.model_runner
-            mwb.spec_info_padded.hidden_states = cur_hidden
+            mwb.spec_info_padded.hidden_states = target_hidden
             mr.attn_backend.forward_metadata = mr.attn_backend.get_eagle_forward_metadata(mwb)
             forward_batch = ForwardBatch.init_new(mwb, mr)
             logits_output, _, _ = mr.forward(forward_batch, logits_metadata=logits_metadata)
             if i == 0:
-                layer0_logits = logits_output
-            cur_hidden = logits_output.hidden_states
+                layer0_hidden = replicate_to_mesh(self.mesh, logits_output.hidden_states)
+            tp, ti = topk_probs_from_logits(
+                replicate_to_mesh(self.mesh, logits_output.next_token_logits), self.topk
+            )
+            all_topk_p.append(np.asarray(jax.device_get(tp)))
+            all_topk_index.append(np.asarray(jax.device_get(ti)))
+            if i < len(self._workers) - 1:
+                self._rotate_ids(mwb, all_topk_index[-1][:, 0], sel_pos)
 
-        # logits_indices_selector maps global-flat req k → DP-padded slot s_k.
-        # rep_logits/rep_hidden are DP-padded (total_bs, …)/(total_bs*(steps+1), …);
-        # keep topk_probs_from_logits running on device with the padded shape
-        # (varying real_bs gather on device would generate a fresh trace per
-        # warmup batch size — see #1090). Gather to real_bs on host.
-        sel = np.asarray(model_worker_batch.logits_indices_selector)
-        accept_host = np.asarray(jax.device_get(batch_output.accept_lens))
-        assert (accept_host[sel] >= 1).all(), f"accept_length < 1: {accept_host[sel]}"
         select_index = sel * (self.speculative_num_steps + 1) + accept_host[sel] - 1
-        rep_logits, rep_hidden = replicate_to_mesh(
-            self.mesh, layer0_logits.next_token_logits, layer0_logits.hidden_states
-        )
-        topk_p, topk_index = topk_probs_from_logits(rep_logits, self.topk)
-        jax.copy_to_host_async(topk_p)
-        jax.copy_to_host_async(topk_index)
-        jax.copy_to_host_async(rep_hidden)
         verified_id_arr = batch_output.next_draft_input.verified_id
         if hasattr(verified_id_arr, "copy_to_host_async"):
             jax.copy_to_host_async(verified_id_arr)
-        topk_p = np.asarray(topk_p)[sel]
-        topk_index = np.asarray(topk_index)[sel]
-        hidden = np.asarray(rep_hidden)[select_index]
-        verified_id = np.asarray(verified_id_arr)[select_index]
-        batch_output.next_draft_input.hidden_states = hidden
-        batch_output.next_draft_input.topk_p = topk_p
-        batch_output.next_draft_input.topk_index = topk_index
-        batch_output.next_draft_input.verified_id = verified_id
+        batch_output.next_draft_input.hidden_states = np.asarray(jax.device_get(layer0_hidden))[
+            select_index
+        ]
+        batch_output.next_draft_input.topk_p = np.stack(all_topk_p, axis=1)[sel]
+        batch_output.next_draft_input.topk_index = np.stack(all_topk_index, axis=1)[sel]
+        batch_output.next_draft_input.verified_id = np.asarray(verified_id_arr)[select_index]
         batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
-        # accept_lens stays DP-padded (total_bs,) — scheduler per-rank seq_lens
-        # update and _resolve_spec_decode_token_ids both index by DP slot.
         batch_output.accept_lens = accept_host
