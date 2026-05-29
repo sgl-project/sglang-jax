@@ -1,0 +1,62 @@
+name: Release PyPI
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Git tag to publish from (e.g. v0.0.3rc0)"
+        required: true
+        type: string
+      version:
+        description: "Version string without v prefix (e.g. 0.0.3rc0)"
+        required: true
+        type: string
+      dry_run:
+        description: "If true, build but do not publish"
+        required: true
+        type: boolean
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sglang-jax'
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.dry_run && github.ref || inputs.tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel and sdist
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          cd python
+          cp ../README.md ../LICENSE .
+          python -m pip install --upgrade pip build
+          python -m build
+          ls -la dist
+          test -f "dist/sglang_jax-${{ inputs.version }}-py3-none-any.whl"
+
+      - name: Smoke test wheel
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install --upgrade pip
+          /tmp/venv/bin/pip install "python/dist/sglang_jax-${{ inputs.version }}-py3-none-any.whl"
+          /tmp/venv/bin/python -c "import sgl_jax; print('sgl_jax version:', sgl_jax.__version__); assert sgl_jax.__version__ == '${{ inputs.version }}', sgl_jax.__version__"
+
+      - name: Publish to PyPI
+        if: ${{ ! inputs.dry_run }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python/dist
+          password: ${{ secrets.PYPI_TOKEN }}
+          skip-existing: true

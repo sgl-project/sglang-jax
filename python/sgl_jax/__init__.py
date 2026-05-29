@@ -1,1 +1,1 @@
-from sgl_jax._version import __version__  # noqa: F401
+from sgl_jax.version import __version__  # noqa: F401

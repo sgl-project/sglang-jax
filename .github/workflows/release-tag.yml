@@ -1,0 +1,93 @@
+name: Release Tag (Validate then Push Tag)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Target version string without v prefix (e.g. 0.0.3, 0.0.3rc0, 0.0.3.post1)"
+        required: true
+        type: string
+      dry_run:
+        description: "If true, skip tag push after validation"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-tag:
+    if: github.repository == 'sgl-project/sglang-jax'
+    runs-on: ubuntu-latest
+    environment: prod
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install packaging
+        run: python -m pip install --upgrade packaging
+
+      - name: Compute canonical version
+        id: version
+        env:
+          RAW_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          python scripts/ci/release_metadata.py from-version --version "${RAW_VERSION}"
+
+      - name: Verify HEAD is on main history
+        if: ${{ ! inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Current commit $GITHUB_SHA is not an ancestor of origin/main"
+            exit 1
+          fi
+
+      - name: Verify tag does not already exist
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          if git rev-parse --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists locally"
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists on origin"
+            exit 1
+          fi
+
+      - name: Release validation
+        run: make release VERSION=${{ steps.version.outputs.version }}
+
+      - name: Benchmark regression check (placeholder)
+        run: |
+          echo "TODO: implement benchmark regression check on TPU runners"
+
+      - name: Create and push annotated tag
+        if: ${{ ! inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "sglang-jax ${TAG}"
+          git push origin "${TAG}"
+
+      - name: Dry-run summary
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "::notice::Dry-run mode: tag ${{ steps.version.outputs.tag }} was NOT pushed."
+          echo "Validate-only run completed successfully on ref ${GITHUB_REF}." >> "$GITHUB_STEP_SUMMARY"
