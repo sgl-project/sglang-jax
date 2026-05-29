@@ -3,7 +3,7 @@
 import jax
 from flax import nnx
 from jax import numpy as jnp
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
@@ -209,8 +209,12 @@ class FusedEPMoE(nnx.Module):
         if self.quantized_dtype is None:
             return
 
-        # Determine quant_block_k: None → per-channel, else block-wise.
-        wsz = self.quant_block_k if self.quant_block_k is not None else None
+        # HOTFIX: PR #1255 added a per-channel (wsz=None) path here, but the v1
+        # kernel validator at v1/kernel.py:_validate_fused_ep_moe_args still
+        # rejects quant_block_k=None when w*_scale is provided. Fall back to
+        # the legacy 256-block default so per-channel scales are replicated to
+        # (E, K//256, 1, N) at load time (see bailing_moe_linear.py hotfix).
+        wsz = self.quant_block_k if self.quant_block_k is not None else 256
         if hasattr(self, "quant_block_k"):
             del self.quant_block_k
         self.quant_block_k = wsz
