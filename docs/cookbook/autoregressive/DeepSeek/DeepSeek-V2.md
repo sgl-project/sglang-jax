@@ -4,7 +4,7 @@ title: "DeepSeek V2"
 
 # DeepSeek V2 on SGL-JAX
 
-> **Partially validated recipe** — DeepSeek-V2-Lite / V2-Lite-Chat has TPU v6e-4 speed and GSM8K results. Full DeepSeek-V2 multi-host validation is still pending.
+> **Partially validated recipe** — DeepSeek-V2-Lite / V2-Lite-Chat has TPU v6e-4 speed and GSM8K results. **DeepSeek-V2 (236B) on v6e-32 is validated for sanity + bench but requires a one-line `gate.py` patch** as of `d9c98c80` (upstream bug: `routed_scaling_factor` is nested inside the `renormalize` branch, so V2's `norm_topk_prob=False` + `routed_scaling_factor=16.0` combination silently skips scaling and produces garbage output without the patch). The patch and full audit trail: [`../../2026-05-21-recipe-command-audit/deepseek-v2-32-r2-epmoe-patched/NOTES.md`](../../2026-05-21-recipe-command-audit/deepseek-v2-32-r2-epmoe-patched/NOTES.md). Until that fix lands upstream, apply the in-manifest patch shown there before deploying V2 full.
 
 ## 1. Model Introduction
 
@@ -74,15 +74,17 @@ Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md)
   --model-path deepseek-ai/DeepSeek-V2 \
   --trust-remote-code \
   --tp-size 32 --ep-size 32 \
-  --moe-backend fused \
+  --moe-backend epmoe \
   --device tpu \
   --dtype bfloat16 \
-  --mem-fraction-static 0.92 \
+  --mem-fraction-static 0.9 \
   --chunked-prefill-size 2048 \
   --page-size 128 \
   --max-running-requests 256 \
   --skip-server-warmup
 ```
+
+> **Requires the `gate.py` patch as of `d9c98c80`** (one-line dedent moving `routed_scaling_factor *=` outside the `if self.renormalize:` block — DS-V2 is the only validated DeepSeek config with `norm_topk_prob=False` and `routed_scaling_factor > 1`). Apply via the in-manifest python heredoc shown in [`../../2026-05-21-recipe-command-audit/deepseek-v2-32-r2-epmoe-patched/manifest.yaml`](../../2026-05-21-recipe-command-audit/deepseek-v2-32-r2-epmoe-patched/manifest.yaml). Until upstream lands the fix.
 
 For temporary v6e experiments, advanced users can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
@@ -90,7 +92,11 @@ For temporary v6e experiments, advanced users can adapt [`../../deployment/skypi
 
 **MoE Backend:**
 - `--moe-backend epmoe` for `--ep-size ≤ 8` (V2-Lite).
-- `--moe-backend fused` for `--ep-size ≥ 16` (V2 multi-host).
+- `--moe-backend epmoe` for V2 full on v6e-32 (after applying the gate.py patch — see banner). The fused backend requires `total_tokens % (ep_size × t_packing == 64)` at EP=32, which forces `--max-running-requests 64` and caps concurrency; epmoe has no such alignment constraint and is the path validated in `2026-05-21-recipe-command-audit/deepseek-v2-32-r2-epmoe-patched/`.
+- `--moe-backend fused` for V3 / R1 on v6e-64 (validated separately — different `norm_topk_prob=True` config doesn't hit the gate.py bug).
+
+**Upstream gate.py bug (V2-specific):**
+- DS-V2 has `norm_topk_prob=False` and `routed_scaling_factor=16.0`. The current `gate.py:104-108` nests `routed_scaling_factor *=` inside `if self.renormalize:`, so the 16× scaling is silently skipped. Symptom: server boots clean, every prompt returns degenerate token loops (`，\n\n`, `& & &`). Fix: move the scaling block outside the renormalize branch (one-line dedent). See [`../../2026-05-21-recipe-command-audit/deepseek-v2-32-r2-epmoe-patched/NOTES.md`](../../2026-05-21-recipe-command-audit/deepseek-v2-32-r2-epmoe-patched/NOTES.md).
 
 **MLA:**
 - DeepSeek's MLA runs on the default `--attention-backend fa` (FlashAttention Pallas) — no override needed.
@@ -145,7 +151,24 @@ Mean TPOT (ms):                          7.41
 ==================================================
 ```
 
-V2 multi-host: _Pending — run on v6e-32 and PR back._
+V2 multi-host: Layout B (random 1024→1024, N=100, c=16) on v6e-32, build `d9c98c80` + gate.py patch, `--moe-backend epmoe`:
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sgl-jax
+Max request concurrency:                 16
+Successful requests:                     100
+Benchmark duration (s):                  142.03
+Request throughput (req/s):              0.70
+Input token throughput (tok/s):          720.96
+Output token throughput (tok/s):         720.96
+Peak output token throughput (tok/s):    912.00
+Total token throughput (tok/s):          1441.92
+Mean E2E Latency (ms):                   21075.12
+Mean TTFT (ms):                          1537.69
+Mean TPOT (ms):                          19.10
+==================================================
+```
 
 ### 4.2 Accuracy
 
@@ -190,7 +213,9 @@ V2 multi-host accuracy: _Pending — run on v6e-32 and PR back._
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| MoE throughput plateau (V2) | Wrong `--moe-backend` for EP size | Use `--moe-backend fused` at EP ≥ 16; `epmoe` only at EP ≤ 8 (V2-Lite). |
+| MoE throughput plateau (V2) | Wrong `--moe-backend` for EP size | Use `--moe-backend epmoe` for V2 full on v6e-32 (validated path, no alignment quirks); `--moe-backend fused` requires `--max-running-requests 64` (caps concurrency). V2-Lite uses `epmoe` at EP=4. |
+| V2 full @ v6e-32: every prompt returns garbage (`& & & ...`, `，\n\n\n...`, token salad) | Upstream `gate.py` bug — `routed_scaling_factor` nested inside `if self.renormalize:`; V2's `norm_topk_prob=False` + `routed_scaling_factor=16.0` makes the 16× scaling silently skipped | Patch `gate.py:104-108` to move scaling outside the renormalize branch. See [`../../2026-05-21-recipe-command-audit/deepseek-v2-32-r2-epmoe-patched/NOTES.md`](../../2026-05-21-recipe-command-audit/deepseek-v2-32-r2-epmoe-patched/NOTES.md) for the in-manifest patch heredoc. |
+| V2 full @ v6e-32, `fused`: `num_tokens=N not aligned to ep_size=32` or `local_num_tokens=K not aligned to t_packing=2` | Fused EP MoE kernel requires `total_tokens % (ep_size × 2) == 0` (= 64 at EP=32) | Pin `--max-running-requests 64` (sanity passes, but caps concurrency vs `epmoe` which auto-caps to 102 from MLA). |
 | OOM at startup (V2) | `--mem-fraction-static 0.92` too high | Lower to 0.9. Verify `--tp-size 32` matches v6e-32 chip count. |
 | Multi-node hang at init | `--dist-init-addr` unreachable from non-rank-0 nodes | Verify the rank-0 internal IP and that the chosen port is open. |
 | First request takes ~4 min per node | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR`; mount a shared PVC across nodes for amortized compilation. |

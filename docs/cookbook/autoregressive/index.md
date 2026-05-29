@@ -49,7 +49,7 @@ End-to-end serving recipes for autoregressive models on SGL-JAX, organized by ve
 
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
-| 🚧 | Ling / Ring 2.5 (1T) | [`InclusionAI/Ling2.5.md`](InclusionAI/Ling2.5.md) | v6e-64 / v7x-16 candidate | MoE + hybrid linear attn |
+| 🚧 | Ling / Ring 2.5 (1T) | [`InclusionAI/Ling-2.5.md`](InclusionAI/Ling-2.5.md) | v6e-64 / v7x-16 candidate | MoE + hybrid linear attn |
 | 🚧 | Ling 2.6 (1T / flash) | [`InclusionAI/Ling-2.6.md`](InclusionAI/Ling-2.6.md) | v6e-64 / v7x-16 | MoE + linear attn |
 
 ### Llama — `Llama/`
@@ -106,7 +106,7 @@ Diffusion image/video generation models live in [`../diffusion/`](../diffusion/i
 | Large multi-node MoE with GKE manifest | [`Xiaomi/MiMo-V2.5-Pro.md`](Xiaomi/MiMo-V2.5-Pro.md) ✅ |
 | Multi-node dense | [`Grok/Grok2.md`](Grok/Grok2.md) 🚧 (+ [`../deployment/gke-indexed-job.md`](../deployment/gke-indexed-job.md)) |
 | Linear-attention model with recurrent state | [`Moonshotai/Kimi-Linear.md`](Moonshotai/Kimi-Linear.md) ✅ or [`InclusionAI/Ling-2.6.md`](InclusionAI/Ling-2.6.md) 🚧 |
-| Reasoning model (RL-tuned, `<think>` blocks) | [`InclusionAI/Ling2.5.md`](InclusionAI/Ling2.5.md) 🚧 (Ring-2.5) or [`DeepSeek/DeepSeek-R1.md`](DeepSeek/DeepSeek-R1.md) 🚧 |
+| Reasoning model (RL-tuned, `<think>` blocks) | [`InclusionAI/Ling-2.5.md`](InclusionAI/Ling-2.5.md) 🚧 (Ring-2.5) or [`DeepSeek/DeepSeek-R1.md`](DeepSeek/DeepSeek-R1.md) 🚧 |
 
 ## Parser key reference
 

@@ -72,7 +72,7 @@
                   {
                     "group": "InclusionAI",
                     "pages": [
-                      "autoregressive/InclusionAI/Ling2.5",
+                      "autoregressive/InclusionAI/Ling-2.5",
                       "autoregressive/InclusionAI/Ling-2.6"
                     ]
                   },

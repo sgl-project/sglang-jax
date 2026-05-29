@@ -422,6 +422,38 @@
 - §5 Troubleshooting 上升为必填(dev build 风险大)
 - 顶部 banner 改用 dev-pinned 标识
 
+### F. Base model (no instruct/chat training)
+
+适用判定:HF model card 明示是 base / pretrain-only;repo 不含 chat template (`tokenizer_config.json` 无 `chat_template`);xAI Grok-1 / Grok-2、Qwen-Base 系列、Llama-Base 系列、DeepSeek-V2-Lite (base 而非 -Chat)、研究 checkpoint 都属此类。
+
+**§1 Model Introduction**
+
+- 顶部 banner 后第一句必须包含 "**base model — not instruction-tuned**" 字样,让用户秒判模型类型
+- Key Features 列一条 "Base model, not chat-tuned — has no chat template; use the raw `/v1/completions` endpoint, not `/v1/chat/completions`"
+- 若同家族有 instruct 版本(如 DeepSeek-V2-Lite-Chat),写明并推荐 instruct 版本作为 chat 用例首选
+- "Recommended Generation Parameters" 标注 "base-model text completion" 而非通用 chat 默认
+
+**§3 Invocation**
+
+- §3.1 改名为 "Basic Text Completion (base model)",用 `/v1/completions` + `prompt:` 字段,不用 `/v1/chat/completions` + `messages:`
+- §3.1 末尾必带 callout: "Why not `/v1/chat/completions`? Base model has no chat template — sending `messages` would either fail or produce garbage. For chat-style usage, fine-tune on instruction data or use the instruct sibling if it exists."
+- §3.2 Reasoning / §3.3 Tool Calling 一律省略(base 模型无这两个能力);用一行"无 reasoning / tool-call 能力,见 [instruct 模型] 替代"打发
+
+**§4 Benchmark**
+
+- §4.1 Accuracy 必须用 **completion-style dataset**(MMLU / HellaSwag / BBH / WinoGrande / ARC),禁止用 chat-format dataset(GSM8K few-shot prompt / MT-Bench / 任何含 system-user-assistant 轮次的格式)
+- evalscope `--api-url` 必须指 `http://.../v1/completions`,不能指 `/v1/chat/completions`
+- `--generation-config` 用 `{"temperature": 0, "max_tokens": 4, "top_k": 1}` 做 deterministic 抽取(MMLU/HellaSwag 是单字母答案),避免 base model 不停 EOS 触发"自问自答"导致 evalscope 末数提取被骗
+- 如果硬要测 GSM8K 类 reasoning dataset,必须用 `sglang.test.few_shot_gsm8k`(raw completions + 自带 stop tokens),不能走 evalscope `/v1/chat/completions` 路径
+- 若 accuracy 暂时无法在 base-model-correct 路径上跑通,Test Results 标 `Pending — needs raw-completions rerun`,不要贴 chat-completions 路径上跑出的低分(那是 eval artifact 不是模型能力)
+
+**§5 Troubleshooting** 必带条目:
+
+- "`/v1/chat/completions` returns empty / nonsense" → "No chat template on base model. Use `/v1/completions` with raw prompt instead"
+- "GSM8K / chat-format dataset accuracy collapses to single digits on evalscope" → "Base model + chat-completions endpoint + few-shot prompt 三方踩坑:模型不停 EOS,继续 in-context 接龙自问自答,evalscope 用"最后一个数字"提取规则被骗。改 `/v1/completions` + completion-style dataset,或 `sglang.test.few_shot_gsm8k`"
+
+**反例**(踩过的真实坑):Grok-2 在 cookbook 早期被误当成 chat model,§3.1 走 `/v1/chat/completions` + §4.1 跑 GSM8K few-shot,测出 17%/20% 远低于同档模型 ~97%。诊断后真凶是 evalscope 提取规则被 base model 的"自问自答"骗;模型实际答对了。详 `2026-05-21-recipe-command-audit.md` D-NEW-Grok2。
+
 ---
 
 ## 附录:Cookbook 整体目录结构

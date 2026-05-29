@@ -4,7 +4,7 @@ title: "Kimi-Linear"
 
 # Kimi-Linear on SGL-JAX
 
-> **Validated recipe** — empirically validated on TPU v6e-16 (sglang-jax `b2daa46d`, 2026-05-25). Multi-host scaling to v6e-32 still pending.
+> **Validated recipe** — empirically validated on TPU v6e-16 (sglang-jax `b2daa46d`, 2026-05-25) and TPU v6e-32 (sglang-jax `d9c98c80`, 2026-05-29).
 
 ## 1. Model Introduction
 
@@ -50,6 +50,25 @@ Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md)
   --model-path moonshotai/Kimi-Linear-48B-A3B-Instruct \
   --trust-remote-code \
   --tp-size 16 \
+  --recurrent-state-memory-ratio 0.9 \
+  --disable-radix-cache \
+  --device tpu \
+  --dtype bfloat16 \
+  --mem-fraction-static 0.9 \
+  --chunked-prefill-size 2048 \
+  --page-size 128 \
+  --max-running-requests 256 \
+  --skip-server-warmup
+```
+
+#### Multi-host (GKE Indexed Job) — TPU v6e-32 (recommended production)
+
+Same template with `<TOPOLOGY>=4x8`, `parallelism: 8`, `completions: 8`, and `--tp-size 32`:
+
+```bash
+  --model-path moonshotai/Kimi-Linear-48B-A3B-Instruct \
+  --trust-remote-code \
+  --tp-size 32 \
   --recurrent-state-memory-ratio 0.9 \
   --disable-radix-cache \
   --device tpu \
@@ -133,25 +152,14 @@ print()
 
 **Benchmark Command** — adapt the driver from [`Qwen3.md` §4.1](../Qwen/Qwen3.md#41-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `moonshotai/Kimi-Linear-48B-A3B-Instruct`, remove the vLLM half).
 
-**Test Results** — Kimi-Linear-48B-A3B-Instruct (TPU v6e-16):
+**Test Results** — Kimi-Linear-48B-A3B-Instruct, Layout B (`bench_serving` random 1024→1024, N=100, max-concurrency 16):
 
-```
-============ Serving Benchmark Result ============
-Backend:                                 sgl-jax
-Successful requests:                     100
-Benchmark duration (s):                  148.28
-Request throughput (req/s):              0.67
-Input token throughput (tok/s):          690.57
-Output token throughput (tok/s):         690.57
-Peak output token throughput (tok/s):    832.00
-Total token throughput (tok/s):          1381.14
-Mean E2E Latency (ms):                   21854.88
-Mean TTFT (ms):                          607.66
-Mean TPOT (ms):                          20.77
-==================================================
-```
+| Hardware | Build | Duration (s) | Total throughput (tok/s) | Output throughput (tok/s) | Mean TPOT (ms) | Mean TTFT (ms) |
+|---|---|---:|---:|---:|---:|---:|
+| TPU v6e-16 | `b2daa46d` | 148.28 | 1381.14 | 690.57 | 20.77 | 607.66 |
+| TPU v6e-32 | `d9c98c80` | 140.55 | 1457.14 | 728.57 | 19.72 | 526.89 |
 
-v6e-32 multi-host: _Pending — run and PR back._
+v6e-32 delivers ~5% throughput / 13% TTFT improvement over v6e-16. Scaling is sublinear because Kimi-Linear's sparse 3B-activated MoE caps the per-token chip utilization — the production recommendation for v6e-32 is driven by HBM headroom for long-context recurrent state, not raw token throughput.
 
 ### 4.2 Accuracy
 
@@ -159,13 +167,13 @@ v6e-32 multi-host: _Pending — run and PR back._
 
 | Field | Value |
 |---|---|
-| Hardware | TPU v6e-16 (4 nodes × 4 chips) |
+| Hardware | TPU v6e-16 (4 nodes × 4 chips) and TPU v6e-32 (8 nodes × 4 chips) |
 | Model | moonshotai/Kimi-Linear-48B-A3B-Instruct (BF16) |
-| Tensor Parallelism | 16 |
+| Tensor Parallelism | 16 (v6e-16) / 32 (v6e-32) |
 | Recurrent State Memory Ratio | 0.9 |
-| Tested build | sglang-jax `b2daa46d` (2026-05-25) |
+| Tested build | sglang-jax `b2daa46d` (v6e-16, 2026-05-25) / `d9c98c80` (v6e-32, 2026-05-29) |
 
-**Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-16).
+**Deployment Command** — see [§2.3](#multi-host-gke-indexed-job--tpu-v6e-16) (v6e-16) or [§2.3](#multi-host-gke-indexed-job--tpu-v6e-32-recommended-production) (v6e-32).
 
 **Benchmark Command** — example for GSM8K:
 
@@ -174,18 +182,22 @@ evalscope eval \
   --model moonshotai/Kimi-Linear-48B-A3B-Instruct \
   --api-url http://127.0.0.1:30000/v1/chat/completions \
   --api-key EMPTY \
-  --eval-type service \
+  --eval-type openai_api \
   --datasets gsm8k \
-  --eval-batch-size 8
+  --limit 200 \
+  --generation-config temperature=0,max_tokens=2048
 ```
 
 Recommended additional datasets: MMLU, GPQA Diamond, RULER (to exercise long-context linear-attention).
 
-**Test Results** — Kimi-Linear-48B-A3B-Instruct (TPU v6e-16, sglang-jax `b2daa46d`):
+**Test Results** — Kimi-Linear-48B-A3B-Instruct:
 
-| Model | Dataset | Limit | Score |
-|:---|:---|:---|:---|
-| Kimi-Linear-48B-A3B-Instruct | gsm8k main | 200 | **0.925** |
+| Model | Hardware | Build | Dataset | Limit | Score |
+|:---|:---|:---|:---|:---|:---|
+| Kimi-Linear-48B-A3B-Instruct | TPU v6e-16 | `b2daa46d` | gsm8k main | 200 | **0.925** |
+| Kimi-Linear-48B-A3B-Instruct | TPU v6e-32 | `d9c98c80` | gsm8k main | 200 | **0.935** |
+
+Within the ±2.3 pp sampling-noise band at limit=200; v6e-32 doubling TP does not regress accuracy.
 
 ## 5. Troubleshooting
 

@@ -194,11 +194,35 @@ Benchmark 数据是**测试时快照**,不随 release 实时刷新。
 | Validated 升级后旧数据是否回填 | 不强制;旧数据保留作为版本快照,新数据通过新 PR 添加 |
 | Test Environment quantization 与 §1 variant 不一致 | factual bug,必须修;不能保留 |
 
+### 3.7 Base model 写作约束(关键)
+
+凡是 HF model card 明示 base / pretrain-only、`tokenizer_config.json` 无 `chat_template` 的模型(Grok-1/2、Qwen-Base、Llama-Base、DeepSeek-V2-Lite base、研究 checkpoint 等):
+
+| 场景 | 规则 |
+|---|---|
+| §1 顶部 | 第一句必须出现 "**base model — not instruction-tuned**" 字样 |
+| §3.1 Basic Invocation | 必须用 `/v1/completions`(raw prompt),禁止用 `/v1/chat/completions`(messages) |
+| §3.1 末尾 callout | "Why not `/v1/chat/completions`? Base model has no chat template — sending `messages` would either fail or produce garbage" |
+| §3.2 Reasoning / §3.3 Tool Calling | 一律省略,base 模型无这两个能力;一行引用 instruct 模型作为替代 |
+| §4.1 Accuracy dataset | 必须 completion-style(MMLU / HellaSwag / BBH / ARC),禁止 chat-format(GSM8K few-shot / MT-Bench);若必测 GSM8K 类,改用 `sglang.test.few_shot_gsm8k` 而非 evalscope chat-completions |
+| §4.1 evalscope `--api-url` | 必须 `http://.../v1/completions`,禁止 `/v1/chat/completions` |
+| §4.1 `--generation-config` | 用 `{"temperature": 0, "max_tokens": 4, "top_k": 1}` 做 deterministic 字母抽取;防 base model 不停 EOS 触发 evalscope 提取规则被骗 |
+| §5 Troubleshooting | 必带 2 条:"`/v1/chat/completions` returns garbage" + "evalscope 末数提取被自问自答骗" |
+
+**反例 / 教训**:Grok-2 早期被误当 chat model,§3.1 走 chat-completions + §4.1 跑 GSM8K few-shot,测出 17%/20% 远低于同档 ~97%。诊断后真凶是 base model 不停 EOS + evalscope "扫最后一个数字"提取规则双方互坑;模型实际答对了。详细裁剪规则见 [`cookbook-recipe-design.md` §6.F Base model](cookbook-recipe-design.md#f-base-model-no-instructchat-training);踩坑过程见 [`2026-05-21-recipe-command-audit.md` D-NEW-Grok2](2026-05-21-recipe-command-audit.md)。
+
+**判断流程**(写新 recipe 第一步):
+
+1. 打开目标 HF model card,找"base / pretrain / instruct / chat / SFT / RLHF"等关键词
+2. 看 `tokenizer_config.json` 有无 `chat_template` 字段(无 → 100% base)
+3. 看 repo 文件名是否带 `-Chat` / `-Instruct` / `-IT` 后缀(无 → 大概率 base,需进一步确认)
+4. 确认 base → 套用 `cookbook-recipe-design.md` §6.F 裁剪规则;确认 instruct → 走标准 5 节模板
+
 ---
 
 ## 4. Final Review Checklist (PR 合入前)
 
-32 项强制 review,按类别整理:
+34 项强制 review,按类别整理:
 
 ### 命令格式
 1. ✅ entrypoint 统一 `python -m sgl_jax.launch_server`
@@ -247,6 +271,10 @@ Benchmark 数据是**测试时快照**,不随 release 实时刷新。
 ### 状态一致性
 31. ✅ Starter recipe 顶部 banner 存在;Validated 移除该 banner
 32. ✅ `autoregressive/index.md` 中 status 列(✅/🚧/📝)与 recipe 实际状态匹配
+
+### Base model 专项(对应 §3.7)
+33. ✅ 已确认模型 type(base / instruct / chat / reasoning),写入 §1 顶部
+34. ✅ 若 base 模型:§3.1 走 `/v1/completions`、§4.1 走 completion-style dataset、§4.1 evalscope `--api-url` 指 `/v1/completions`、§5 Troubleshooting 含 2 条 base 必带条目(详 §3.7 规则)
 
 ---
 

@@ -4,13 +4,13 @@ title: "Grok-1"
 
 # Grok-1 on SGL-JAX
 
-> **Starter recipe** — derived from the Grok-1 release format and SGL-JAX multi-host launch path; not yet empirically validated on TPU. Tune values for your hardware and PR back tested numbers.
+> **🚫 Not yet runnable on TPU** — pretest 2026-05-29 found the upstream [xai-org/grok-1](https://huggingface.co/xai-org/grok-1) release ships native JAX `ckpt-0/*` (multi-shard distributed array dump), not safetensors. `sgl-jax`'s weight loader is built around `model.safetensors.index.json` + per-key `WeightMapping` — there's no `ckpt-0/*` path in `python/sgl_jax/srt/models/grok.py`. Community PyTorch conversions (e.g., [hpcai-tech/grok-1](https://huggingface.co/hpcai-tech/grok-1)) target HF `transformers` naming and aren't a drop-in match either. Recipe stays as a starter template; see [`../../2026-05-21-recipe-command-audit/grok-1-32/NOTES.md`](../../2026-05-21-recipe-command-audit/grok-1-32/NOTES.md) for the unblocking plan (safetensors mirror with `Grok1ForCausalLM` key naming + HF tokenizer).
 
 ## 1. Model Introduction
 
 [**xai-org/grok-1**](https://huggingface.co/xai-org/grok-1) is xAI's first open-weight release (2024-03-17) — a **314B-parameter Mixture-of-Experts** model with 8 experts (2 active per token, ~86B active parameters). Released under the Apache 2.0 license and intended as a base model — **not fine-tuned for instruction following or chat**. SGL-JAX serves it on TPU v6e-32 (8 nodes × 4 chips) with tensor + expert parallelism.
 
-For the chat-tuned successor see [`Grok2.md`](Grok2.md).
+For the larger MoE base release see [`Grok2.md`](Grok2.md) — xAI did not release a chat / instruct variant for either Grok-1 or Grok-2.
 
 **Key Features**:
 
@@ -139,7 +139,7 @@ resp = client.completions.create(
 print(resp.choices[0].text)
 ```
 
-> **Why not `/v1/chat/completions`?** Grok-1 has no chat template — sending `messages` would either fail (no template registered) or produce garbage (raw `system`/`user`/`assistant` tokens fed in without the model knowing what they mean). For chat-style usage, fine-tune Grok-1 on instruction data or use [`Grok2.md`](Grok2.md) (chat-tuned) instead.
+> **Why not `/v1/chat/completions`?** Grok-1 has no chat template — sending `messages` would either fail (no template registered) or produce garbage (raw `system`/`user`/`assistant` tokens fed in without the model knowing what they mean). For chat-style usage, fine-tune Grok-1 on instruction data; xAI's larger [`Grok2.md`](Grok2.md) is also a base model and is not a chat-ready alternative.
 
 > Grok-1 has no native reasoning or tool-calling formats. For those workloads use a model with `--reasoning-parser` / `--tool-call-parser` support (see [`MiMo-V2.5-Pro.md` §3.2 / §3.3](../Xiaomi/MiMo-V2.5-Pro.md) or [`Qwen3.md` §3.2 / §3.3](../Qwen/Qwen3.md)).
 
@@ -208,6 +208,7 @@ evalscope eval \
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Tokenizer load fails at startup | `--tokenizer-path` missing or unreachable | Add `--tokenizer-path <community-grok-1-tokenizer>`; if HF rate-limited, set `HF_TOKEN` env on every node. |
+| Weights load fails — `model.safetensors.index.json` not found | Upstream `xai-org/grok-1` ships JAX `ckpt-0/*` only; sgl-jax requires safetensors | No fix as of `d9c98c80` — a safetensors mirror with `Grok1ForCausalLM` tensor key naming must be produced first. See [`../../2026-05-21-recipe-command-audit/grok-1-32/NOTES.md`](../../2026-05-21-recipe-command-audit/grok-1-32/NOTES.md). |
 | `/v1/chat/completions` returns empty / nonsense | No chat template on base model | Use `/v1/completions` with raw prompt instead; see [§3.1](#31-basic-text-completion-base-model). |
 | Weights load fails — checkpoint format | `ckpt-0/*` not a recognized safetensors layout | Verify you downloaded with `--include 'ckpt-0/*'` per §2.2 and pointed `--model-path` at the parent directory. |
 | MoE throughput plateau | Wrong `--moe-backend` | Stay on `--moe-backend fused` for v6e-32 / EP=8. `epmoe` is the reference path and is slower in practice. |
@@ -220,7 +221,7 @@ evalscope eval \
 - [Grok-1 Model Card on HuggingFace](https://huggingface.co/xai-org/grok-1)
 - [Grok-1 GitHub repo (xai-org/grok-1)](https://github.com/xai-org/grok-1) — reference Python implementation
 - [xAI Open Release announcement](https://x.ai/news/grok-os)
-- [`Grok2.md`](Grok2.md) — chat-tuned successor (different license, dense not MoE)
+- [`Grok2.md`](Grok2.md) — xAI's larger ~269B MoE base release (also not instruction-tuned; same `Grok1ForCausalLM` runtime, different checkpoint format and license)
 - [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) — primary multi-host launcher template.
 - [`../../deployment/skypilot.md`](../../deployment/skypilot.md) — advanced v6e experiment alternative.
 - [`MiMo-V2.5-Pro.md`](../Xiaomi/MiMo-V2.5-Pro.md) — GKE Indexed Job manifest reference (adapt for Grok-1).
