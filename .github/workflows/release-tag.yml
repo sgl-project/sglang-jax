@@ -1,6 +1,12 @@
 name: Release Tag (Validate then Push Tag)
 
 on:
+  # TODO(remove-before-merge): branch push trigger is only here so the workflow
+  # appears in the Actions UI on feat/release-pipeline. Delete this `push` block
+  # before merging — release-tag.yml should only run via workflow_dispatch.
+  push:
+    branches:
+      - feat/release-pipeline
   workflow_dispatch:
     inputs:
       version:
@@ -18,7 +24,8 @@ permissions:
 
 jobs:
   validate-and-tag:
-    if: github.repository == 'sgl-project/sglang-jax'
+    # TODO(remove-before-merge): drop this condition together with the `push` trigger above.
+    if: github.repository == 'sgl-project/sglang-jax' && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: prod
     outputs:

@@ -1,7 +1,12 @@
 name: Release (Publish Artifacts)
 
 on:
+  # TODO(remove-before-merge): branch push trigger is only here so the workflow
+  # appears in the Actions UI on feat/release-pipeline. Delete this `branches`
+  # entry before merging — release.yml should only run via tag push or workflow_dispatch.
   push:
+    branches:
+      - feat/release-pipeline
     tags:
       - "v*"
   workflow_dispatch:
@@ -25,7 +30,8 @@ concurrency:
 
 jobs:
   metadata:
-    if: github.repository == 'sgl-project/sglang-jax'
+    # TODO(remove-before-merge): drop the branch-push guard together with the `branches` trigger above.
+    if: github.repository == 'sgl-project/sglang-jax' && !(github.event_name == 'push' && github.ref_type == 'branch')
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.compute.outputs.tag }}
