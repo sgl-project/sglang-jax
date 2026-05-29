@@ -93,16 +93,21 @@ class MLAAttentionBackend(AttentionBackend):
         page_size: int = 1,
         mesh: jax.sharding.Mesh = None,
         attention_data_partition_axis: str = "data",
-        vmem_limit_bytes: int = 100 * (1 << 20),
-        num_kv_pages_per_block: tuple[int, int, int] = (3, 1, 1),
-        num_queries_per_block: tuple[int, int, int] = (1, 16, 16),
+        vmem_limit_bytes: int | None = None,
+        # Default block params to None so the kernel's auto-tuned-table
+        # lookup path triggers (see kernel.py mla_ragged_paged_attention
+        # entry). Callers (e.g. accuracy tests) can still pass explicit
+        # tuples to bypass lookup.
+        num_kv_pages_per_block: tuple[int, int, int] | None = None,
+        num_queries_per_block: tuple[int, int, int] | None = None,
         # decode_batch_size: kernel-internal microbatch for the BATCHED_DECODE
         # branch. The v2 kernel runs `floor(num_decode_seqs / decode_batch_size)
         # * decode_batch_size` requests through a batched path (q_len=1, q-tile
         # of size `decode_batch_size`) to keep the MXU busy on MLA's MQA-on-
         # latent decode (single q row per seq otherwise underutilizes the q
         # axis); the remainder falls back to per-seq decode.
-        # TODO(tuner): hardcoded 4, matches upstream — should be autotuned.
+        # When num_kv_pages_per_block is None, the kernel's lookup path also
+        # overrides this with the tuned value if the "decode" entry hits.
         decode_batch_size: int = 4,
     ):
         assert page_size > 1, (
@@ -119,6 +124,10 @@ class MLAAttentionBackend(AttentionBackend):
         self.page_size = page_size
         self.mesh = mesh
         self.attention_data_partition_axis = attention_data_partition_axis
+        if vmem_limit_bytes is None:
+            from jax.experimental.pallas import tpu as pltpu
+
+            vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
         self.vmem_limit_bytes = vmem_limit_bytes
         self.num_kv_pages_per_block = num_kv_pages_per_block
         self.num_queries_per_block = num_queries_per_block

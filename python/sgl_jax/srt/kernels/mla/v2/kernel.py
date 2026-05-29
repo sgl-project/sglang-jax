@@ -1409,16 +1409,69 @@ def mla_ragged_paged_attention(
       The output of attention and the updated kv cache.
     """
     if num_kv_pages_per_block is None or num_queries_per_block is None:
-        raise ValueError("num_kv_pages_per_block and num_queries_per_block must be specified.")
-    if isinstance(num_kv_pages_per_block, int):
-        num_kv_pages_per_blocks = [num_kv_pages_per_block for _ in range(3)]
-    else:
-        num_kv_pages_per_blocks = num_kv_pages_per_block
+        # Look up the auto-tuned block-size table when caller (e.g. the
+        # production attention backend) hasn't specified block params.
+        # The kernel runs three pallas_calls (BATCHED_DECODE, DECODE-tail,
+        # MIXED) but only uses slot[0] (shared by BATCHED_DECODE+DECODE-tail)
+        # and slot[2] (MIXED). slot[1] (PREFILL) is dead code; we fill a
+        # placeholder. The "decode" tuned entry also carries
+        # `decode_batch_size`, which overrides the caller's value if hit.
+        from sgl_jax.srt.kernels.mla.v2.tuned_block_sizes import (
+            get_tuned_block_sizes_mla,
+        )
 
-    if isinstance(num_queries_per_block, int):
-        num_queries_per_blocks = [num_queries_per_block for _ in range(3)]
+        actual_num_q_heads = ql_nope.shape[1]
+        actual_lkv_dim = ql_nope.shape[2]  # = kv_lora_rank (unpadded)
+        actual_r_dim = q_pe.shape[2]  # = qk_rope_head_dim (unpadded)
+        _, page_size_per_kv_packing, kv_packing_, _ = cache_kv.shape
+        page_size_lookup = page_size_per_kv_packing * kv_packing_
+        max_num_tokens_lookup = ql_nope.shape[0]
+
+        tuned_d = get_tuned_block_sizes_mla(
+            "decode",
+            ql_nope.dtype,
+            cache_kv.dtype,
+            actual_num_q_heads,
+            actual_lkv_dim,
+            actual_r_dim,
+            page_size_lookup,
+            max_num_tokens_lookup,
+        )
+        tuned_m = get_tuned_block_sizes_mla(
+            "mixed",
+            ql_nope.dtype,
+            cache_kv.dtype,
+            actual_num_q_heads,
+            actual_lkv_dim,
+            actual_r_dim,
+            page_size_lookup,
+            max_num_tokens_lookup,
+        )
+        # Fallback hardcoded defaults match the historical
+        # mla_backend.py:97-106 defaults — same numbers that prod was using
+        # before the tuned table existed.
+        if tuned_d is not None:
+            bkv_p_d, bq_d, dbs_lookup = tuned_d
+            decode_batch_size = dbs_lookup
+        else:
+            bkv_p_d, bq_d = 3, 1
+        if tuned_m is not None:
+            bkv_p_m, bq_m = tuned_m
+        else:
+            bkv_p_m, bq_m = 1, 16
+
+        num_kv_pages_per_blocks = (bkv_p_d, 1, bkv_p_m)  # slot[1] is dead
+        num_queries_per_blocks = (bq_d, 1, bq_m)
     else:
-        num_queries_per_blocks = num_queries_per_block
+        if isinstance(num_kv_pages_per_block, int):
+            num_kv_pages_per_blocks = [num_kv_pages_per_block for _ in range(3)]
+        else:
+            num_kv_pages_per_blocks = num_kv_pages_per_block
+
+        if isinstance(num_queries_per_block, int):
+            num_queries_per_blocks = [num_queries_per_block for _ in range(3)]
+        else:
+            num_queries_per_blocks = num_queries_per_block
 
     static_validate_inputs(
         ql_nope,
