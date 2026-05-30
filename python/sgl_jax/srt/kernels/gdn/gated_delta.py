@@ -78,6 +78,20 @@ def _gated_delta_step(
 # ---------------------------------------------------------------------------
 
 
+def _scatter_idx0_safe(buf: jax.Array, state_indices: jax.Array, val: jax.Array) -> jax.Array:
+    """``buf.at[state_indices].set(val)`` with an ``idx == 0`` no-op guard.
+
+    Padded requests carry ``state_indices == 0`` (the per-DP-rank dummy
+    slot). Without this guard the scatter overwrites the dummy with
+    padded-request garbage, leaking back as initial state on the next
+    forward. Mirrors KDA's ``set_ssm_state``/``set_conv_state`` keep_mask.
+    """
+    val = val.astype(buf.dtype)
+    keep = (state_indices == 0).reshape((-1,) + (1,) * (buf.ndim - 1))
+    safe_val = jnp.where(keep, buf[state_indices], val)
+    return buf.at[state_indices].set(safe_val)
+
+
 def jax_causal_conv1d_prefill(
     x: jax.Array,  # [D, T]  packed activations
     weight: jax.Array,  # [D, kernel_size]  depthwise weight
@@ -229,7 +243,7 @@ def jax_causal_conv1d_prefill(
     # The fixture-only `conv_state is None` path returns the per-request
     # slice as-is for tests that don't construct a pool.
     if conv_state is not None:
-        new_conv_state = conv_state.at[state_indices].set(final_state.astype(conv_state.dtype))
+        new_conv_state = _scatter_idx0_safe(conv_state, state_indices, final_state)
     else:
         new_conv_state = final_state
     return y, new_conv_state
@@ -242,6 +256,7 @@ def jax_causal_conv1d_update(
     weight: jax.Array,  # [D, kernel_size]
     bias: jax.Array | None = None,  # [D]
     activation: str | None = None,
+    has_initial_state: jax.Array | None = None,  # [B] bool
 ) -> tuple[jax.Array, jax.Array]:
     """Single-token causal conv1d update.
 
@@ -254,11 +269,13 @@ def jax_causal_conv1d_update(
     updated. Doing the scatter inside the kernel keeps the same shape
     contract when this ref is later replaced by a Pallas kernel.
 
-    No ``has_initial_state`` mask here: decode always runs after at least
-    one extend chunk, so every slot's conv state is valid by invariant
-    (same lifecycle argument as :func:`decode_gated_delta_rule_ref`).
-    Brand-new prefills are routed through :func:`jax_causal_conv1d_prefill`,
-    which *does* honor ``has_initial_state``.
+    ``has_initial_state``: ``[B]`` bool, optional. ``True`` when the
+    slot already holds valid conv state, ``False`` for brand-new
+    decode (e.g. mixed prefill/decode batches). When ``False``, the
+    gathered state is zeroed before forming the rolling window so
+    stale data doesn't leak in. Production decode after at least one
+    prefill chunk is always continuing, so callers on that path may
+    pass ``None`` (treated as all-``True``).
     """
     assert x.ndim == 2, f"x must be [B, D], got shape {x.shape}"
     B, D = x.shape
@@ -270,6 +287,11 @@ def jax_causal_conv1d_update(
     assert state_indices.shape == (B,), f"state_indices {state_indices.shape} != expected ({B},)"
 
     state = conv_state[state_indices]  # [B, D, K-1]
+    if has_initial_state is not None and kernel > 1:
+        assert has_initial_state.shape == (
+            B,
+        ), f"has_initial_state {has_initial_state.shape} != expected ({B},)"
+        state = jnp.where(has_initial_state[:, None, None], state, jnp.zeros_like(state))
     # Rolling buffer: [state(kernel-1), x_new] → window of length kernel.
     window = jnp.concatenate([state, x[..., None]], axis=-1)  # [B, D, K]
     y = jnp.einsum("bdk,dk->bd", window, weight.astype(x.dtype))
@@ -284,7 +306,7 @@ def jax_causal_conv1d_update(
     new_state = window[..., 1:]  # drop oldest
 
     # Scatter the per-request new state back into the full pool table.
-    new_conv_state = conv_state.at[state_indices].set(new_state.astype(conv_state.dtype))
+    new_conv_state = _scatter_idx0_safe(conv_state, state_indices, new_state)
     return y, new_conv_state
 
 
@@ -439,9 +461,7 @@ def ragged_gated_delta_rule_ref(
     # ``[num_blocks, ...]`` table. Cast to the pool's dtype (the scan
     # carries fp32; the pool is typically fp32 too, but
     # ``SGLANG_JAX_RECURRENT_STATE_DTYPE=bfloat16`` can override).
-    new_recurrent_state = recurrent_state.at[state_indices].set(
-        new_state_buf.astype(recurrent_state.dtype)
-    )
+    new_recurrent_state = _scatter_idx0_safe(recurrent_state, state_indices, new_state_buf)
     return new_recurrent_state, output
 
 
@@ -458,6 +478,7 @@ def decode_gated_delta_rule_ref(
     n_v: int,
     d_k: int,
     d_v: int,
+    has_initial_state: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Decode-only gated delta-rule (parallel single-step across the batch).
 
@@ -467,9 +488,12 @@ def decode_gated_delta_rule_ref(
     ``cu_seqlens=arange(B+1)`` (which would serialise B independent steps
     as a ``T=B`` scan). Numerically equivalent to that path; just faster.
 
-    Decode always runs after at least one extend, so every slot already
-    holds valid recurrent state — there is no ``has_initial_state`` mask
-    here (the equivalent argument would always be all-``True``).
+    ``has_initial_state``: ``[B]`` bool, optional. ``True`` when the
+    slot already holds valid recurrent state, ``False`` for brand-new
+    decode (mixed prefill/decode batches). When ``False``, the gathered
+    state is zeroed before the recurrence step. Production decode after
+    at least one prefill chunk is always continuing, so callers on that
+    path may pass ``None`` (treated as all-``True``).
 
     Args:
         mixed_qkv: Post-conv tokens of shape
@@ -513,10 +537,14 @@ def decode_gated_delta_rule_ref(
     g = -A * jax.nn.softplus(a.astype(jnp.float32) + dt_bias_f32)
 
     state = recurrent_state[state_indices].astype(jnp.float32)
+    if has_initial_state is not None:
+        B = state.shape[0]
+        assert has_initial_state.shape == (
+            B,
+        ), f"has_initial_state {has_initial_state.shape} != expected ({B},)"
+        state = jnp.where(has_initial_state[:, None, None, None], state, jnp.zeros_like(state))
     new_state, out = _gated_delta_step(state, q_h, k_h, v_h, g, beta)
 
     # Scatter the per-request new state back into the full pool table.
-    new_recurrent_state = recurrent_state.at[state_indices].set(
-        new_state.astype(recurrent_state.dtype)
-    )
+    new_recurrent_state = _scatter_idx0_safe(recurrent_state, state_indices, new_state)
     return new_recurrent_state, out.astype(mixed_qkv.dtype)

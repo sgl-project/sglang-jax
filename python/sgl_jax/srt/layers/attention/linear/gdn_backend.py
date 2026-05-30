@@ -2,12 +2,17 @@
 
 Inherits :class:`LinearRecurrentAttnBackend` for shared metadata
 (``cu_q_lens`` / ``recurrent_indices`` / ``has_initial_state``) and
-pytree boilerplate. Owns the (fused) conv1d weight + delta-rule params
-(``A_log``, ``dt_bias``); the parent layer hands in ``mixed_qkv``
-(a per-device block-concat ``[Q | K | V]`` of size ``conv_dim``
-channels) plus ``b``, ``a``, and a :class:`RecurrentStatePool`. State
-(conv + recurrent) is fetched from the pool internally via the base
-class's :meth:`get_layer_cache` helper.
+pytree boilerplate. **Stateless** — owns no weights. The parent
+``RadixLinearAttention`` carries the fused ``conv1d`` weight container
+plus the ``A_log`` / ``dt_bias`` recurrence params; this backend reads
+them off ``layer.*`` at call time.
+
+The parent hands in already-sliced ``q`` / ``k`` / ``v`` (per
+decision #4 — the slice happens in the model layer). The backend
+re-concatenates them along the channel axis to feed the depthwise
+``conv1d``; XLA collapses the slice→concat into a single slice of
+the upstream ``in_proj_qkvz`` activation, so this rebuild adds no
+HBM traffic.
 
 Sharding pattern: the conv + recurrence pipeline runs inside
 :func:`jax.shard_map` with explicit ``in_specs`` / ``out_specs``, with
@@ -20,9 +25,10 @@ inference. Returns ``(core_attn_out, new_conv, new_rec)`` shaped for
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import jax
 import jax.numpy as jnp
-from flax import nnx
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.gdn import (
@@ -34,7 +40,11 @@ from sgl_jax.srt.kernels.gdn import (
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
 )
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+
+if TYPE_CHECKING:
+    from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
+    from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
+    from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 def _mesh_tp_size(mesh: jax.sharding.Mesh) -> int:
@@ -50,11 +60,12 @@ def _mesh_tp_size(mesh: jax.sharding.Mesh) -> int:
 class GDNAttnBackend(LinearRecurrentAttnBackend):
     """Gated-DeltaNet attention backend.
 
-    Owns the conv1d weight + delta-rule params; dispatches conv1d + ragged
-    delta-rule (extend) or single-step delta-rule (decode) under
-    ``jax.shard_map``. Reads ``cu_q_lens`` / ``recurrent_indices`` /
-    ``has_initial_state`` from ``self.forward_metadata``, populated by
-    the base class's :meth:`get_forward_metadata` before each forward.
+    Carries only shape metadata; weights live on the parent
+    :class:`RadixLinearAttention`. Dispatches conv1d + ragged delta-rule
+    (extend) or single-step delta-rule (decode) under ``jax.shard_map``.
+    Reads ``cu_q_lens`` / ``recurrent_indices`` / ``has_initial_state``
+    from ``self.forward_metadata``, populated by the base class's
+    :meth:`get_forward_metadata` before each forward.
     """
 
     def __init__(
@@ -65,7 +76,6 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         head_v_dim: int,
         conv_kernel_size: int,
         mesh: jax.sharding.Mesh,
-        dtype: jnp.dtype = jnp.bfloat16,
     ):
         super().__init__(mesh=mesh)
         self.num_k_heads = num_k_heads
@@ -106,63 +116,28 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 f"of num_k_heads={num_k_heads} (GQA repeat factor)."
             )
 
-        # Depthwise conv1d weight (HF stores [conv_dim, 1, K]; we squeeze).
-        # Sharded on the conv_dim axis so each TP rank owns its own channels
-        # — consistent with how `RecurrentStatePool` shards conv_state.
-        #
-        # IMPORTANT — per-shard channel layout is a *loader contract*, not a
-        # property of this Param. The shard_map calls below use
-        # ``in_specs=P("tensor", None)``, which slices axis 0 into TP
-        # contiguous chunks. For the conv1d to line up with ``mixed_qkv``,
-        # each rank's local rows must be the per-shard block-concat
-        # ``[q_tp | k_tp | v_tp]`` (the same convention
-        # :class:`MergedColumnParallelLinear` produces for ``in_proj_qkv``).
-        # The HF checkpoint stores conv1d as a single
-        # ``[global_q | global_k | global_v]`` block along ``conv_dim`` — a
-        # naive ``device_put`` with ``P("tensor", None)`` would give rank 0
-        # mostly Q channels and rank N-1 mostly V, which silently mismatches
-        # the per-shard activation layout and produces wrong outputs at
-        # TP > 1 with no crash.
-        #
-        # The model loader (CUDA sglang reference:
-        # ``mamba_v2_sharded_weight_loader`` in
-        # ``sglang/srt/layers/attention/mamba/mamba.py``) must therefore
-        # stripe-rearrange the HF tensor so each rank's local rows are
-        # ``[Q[rank * key_dim/TP : (rank+1) * key_dim/TP]
-        #    | K[rank * key_dim/TP : (rank+1) * key_dim/TP]
-        #    | V[rank * value_dim/TP : (rank+1) * value_dim/TP]]``
-        # before placement. ``in_proj_qkv`` follows the same convention.
-        #
-        # A TP > 1 numerical test against an fp32 reference is the canary
-        # for getting this wrong — at TP = 1 the two layouts coincide and
-        # bugs hide.
-        self.conv1d_weight = nnx.Param(jnp.zeros((self.conv_dim, conv_kernel_size), dtype=dtype))
-        # Delta-rule params, sharded per-head. Storage dtypes follow the HF
-        # Qwen3.5 checkpoint exactly:
-        #   A_log:   fp32 (the recurrence's ``-exp(A_log)`` factor is
-        #            numerically sensitive — checkpoint is fp32 and the
-        #            gating kernel reads it as such).
-        #   dt_bias: model dtype (bf16). The gating kernel upcasts to fp32
-        #            internally for ``softplus(a + dt_bias)``; storing fp32
-        #            here would only force a load-time cast and double the
-        #            param footprint with no numerical benefit.
-        self.A_log = nnx.Param(jnp.zeros((num_v_heads,), dtype=jnp.float32))
-        self.dt_bias = nnx.Param(jnp.ones((num_v_heads,), dtype=dtype))
-
     # ------------------------------------------------------------------
     # Dispatch
     # ------------------------------------------------------------------
 
     def __call__(
         self,
+        q: jax.Array,  # [T, key_dim]   sliced from in_proj_qkvz upstream
+        k: jax.Array,  # [T, key_dim]
+        v: jax.Array,  # [T, value_dim]
+        a: jax.Array,  # [T, num_v_heads]
+        b: jax.Array,  # [T, num_v_heads]
+        layer: RadixLinearAttention,
         forward_batch: ForwardBatch,
-        mixed_qkv: jax.Array,  # [T, conv_dim]                  (None, "tensor")
-        b: jax.Array,  # [T, n_v]                       (None, "tensor")
-        a: jax.Array,  # [T, n_v]                       (None, "tensor")
-        recurrent_state_pool,
-        layer_id: int,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        recurrent_state_pool: RecurrentStatePool,
+        **kwargs,  # absorb mixed_qkv=None forwarded by HybridLinearAttnBackend
+    ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
         """Dispatch by ``forward_batch.forward_mode``.
+
+        Per decision #4 the slice happens in the model layer and the
+        backend re-concatenates ``[q | k | v]`` along the channel axis
+        before the depthwise conv1d — XLA collapses slice→concat to a
+        single slice of the upstream activation, zero extra HBM traffic.
 
         Fetches per-layer ``(recurrent_state, conv_state)`` from the pool
         via the base class's :meth:`get_layer_cache`. ``conv_state`` is the
@@ -170,20 +145,45 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         single fused conv1d, so it needs exactly one conv buffer per layer
         (vs. KDA, which keeps q/k/v conv states as three list entries).
 
-        Returns ``(core_attn_out, new_conv_state, new_rec_state)`` where
-        ``new_conv_state`` and ``new_rec_state`` are the full pool tables
-        with this layer's per-request slots updated (scatter happens
-        inside the kernel — see :func:`ragged_gated_delta_rule_ref` /
-        :func:`jax_causal_conv1d_prefill` and the decode-path equivalents).
-        Caller writes these back onto the pool (e.g. via
-        ``RecurrentStatePool.replace_buffer``).
+        Returns ``(core_attn_out, (new_rec_state, [new_conv_state]))``
+        matching the linear-backend contract consumed by
+        ``RadixLinearAttention``.
         """
-        recurrent_state, conv_states = self.get_layer_cache(recurrent_state_pool, layer_id)
+        mixed_qkv = jnp.concatenate([q, k, v], axis=-1)  # [T, conv_dim]
+
+        conv1d_weight = layer.conv1d.weight.value
+        A_log = layer.A_log.value
+        dt_bias = layer.dt_bias.value
+
+        recurrent_state, conv_states = self.get_layer_cache(recurrent_state_pool, layer.layer_id)
         conv_state = conv_states[0]
 
         if forward_batch.forward_mode.is_decode():
-            return self.forward_decode(mixed_qkv, conv_state, recurrent_state, b, a)
-        return self.forward_extend(mixed_qkv, conv_state, recurrent_state, b, a)
+            out, new_conv, new_rec = self.forward_decode(
+                mixed_qkv,
+                conv_state,
+                recurrent_state,
+                b,
+                a,
+                conv1d_weight,
+                A_log,
+                dt_bias,
+            )
+        else:
+            out, new_conv, new_rec = self.forward_extend(
+                mixed_qkv,
+                conv_state,
+                recurrent_state,
+                b,
+                a,
+                conv1d_weight,
+                A_log,
+                dt_bias,
+            )
+        # Flatten head dim into channel dim to match KDA's contract
+        # (model layer reshapes back to [T, n_v, d_v] before output norm).
+        out = out.reshape(out.shape[0], -1)
+        return out, (new_rec, [new_conv])
 
     # ------------------------------------------------------------------
     # Decode fast path
@@ -196,10 +196,14 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         recurrent_state_in: jax.Array,
         b: jax.Array,
         a: jax.Array,
+        conv1d_weight: jax.Array,
+        A_log: jax.Array,
+        dt_bias: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """One token per request — single conv1d update + parallel single
         recurrence step across the batch, all inside a shard_map."""
         state_indices = self.forward_metadata.recurrent_indices
+        has_initial_state = self.forward_metadata.has_initial_state
         tp = _mesh_tp_size(self.mesh)
         n_kq_tp = self.num_k_heads // tp
         n_v_tp = self.num_v_heads // tp
@@ -216,6 +220,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             b_l,
             a_l,
             state_indices_l,
+            has_initial_state_l,
         ):
             conv_out, new_conv = jax_causal_conv1d_update(
                 mixed_qkv_l,
@@ -224,6 +229,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 conv_weight_l,
                 bias=None,
                 activation="silu",
+                has_initial_state=has_initial_state_l,
             )
             new_rec, out = decode_gated_delta_rule_ref(
                 conv_out,
@@ -237,6 +243,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 n_v=n_v_tp,
                 d_k=d_k,
                 d_v=d_v,
+                has_initial_state=has_initial_state_l,
             )
             return out, new_conv, new_rec
 
@@ -244,32 +251,34 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             _decode_local,
             mesh=self.mesh,
             in_specs=(
-                P(None, "tensor"),  # mixed_qkv
-                P(None, "tensor", None),  # conv_state
-                P(None, "tensor", None, None),  # recurrent_state
+                P("data", "tensor"),  # mixed_qkv
+                P("data", "tensor", None),  # conv_state
+                P("data", "tensor", None, None),  # recurrent_state
                 P("tensor", None),  # conv1d weight
                 P("tensor"),  # A_log
                 P("tensor"),  # dt_bias
-                P(None, "tensor"),  # b
-                P(None, "tensor"),  # a
-                P(),  # state_indices (replicated)
+                P("data", "tensor"),  # b
+                P("data", "tensor"),  # a
+                P("data"),  # state_indices (sharded by data — one slice per DP rank)
+                P("data"),  # has_initial_state (sharded by data)
             ),
             out_specs=(
-                P(None, "tensor", None),  # out [B, n_v, d_v]
-                P(None, "tensor", None),  # new_conv_state [num_blocks, conv_dim, K-1]
-                P(None, "tensor", None, None),  # new_rec_state [num_blocks, n_v, d_k, d_v]
+                P("data", "tensor", None),  # out [B, n_v, d_v]
+                P("data", "tensor", None),  # new_conv_state [num_blocks, conv_dim, K-1]
+                P("data", "tensor", None, None),  # new_rec_state [num_blocks, n_v, d_k, d_v]
             ),
             check_vma=False,
         )(
             mixed_qkv,
             conv_state_in,
             recurrent_state_in,
-            self.conv1d_weight.value,
-            self.A_log.value,
-            self.dt_bias.value,
+            conv1d_weight,
+            A_log,
+            dt_bias,
             b,
             a,
             state_indices,
+            has_initial_state,
         )
 
     # ------------------------------------------------------------------
@@ -283,6 +292,9 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         recurrent_state_in: jax.Array,
         b: jax.Array,
         a: jax.Array,
+        conv1d_weight: jax.Array,
+        A_log: jax.Array,
+        dt_bias: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Packed ragged batch through ``ragged_gated_delta_rule_ref``."""
         meta = self.forward_metadata
@@ -344,31 +356,31 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             _extend_local,
             mesh=self.mesh,
             in_specs=(
-                P(None, "tensor"),  # mixed_qkv
-                P(None, "tensor", None),  # conv_state
-                P(None, "tensor", None, None),  # recurrent_state
+                P("data", "tensor"),  # mixed_qkv
+                P("data", "tensor", None),  # conv_state
+                P("data", "tensor", None, None),  # recurrent_state
                 P("tensor", None),  # conv1d weight
                 P("tensor"),  # A_log
                 P("tensor"),  # dt_bias
-                P(None, "tensor"),  # b
-                P(None, "tensor"),  # a
-                P(),  # cu_seqlens (replicated)
-                P(),  # state_indices (replicated)
-                P(),  # has_initial_state (replicated)
+                P("data", "tensor"),  # b
+                P("data", "tensor"),  # a
+                P("data"),  # cu_seqlens (sharded by data — one slice per DP rank)
+                P("data"),  # state_indices (sharded by data)
+                P("data"),  # has_initial_state (sharded by data)
             ),
             out_specs=(
-                P(None, "tensor", None),  # out [T, n_v, d_v]
-                P(None, "tensor", None),  # new_conv_state [num_blocks, conv_dim, K-1]
-                P(None, "tensor", None, None),  # new_rec_state [num_blocks, n_v, d_k, d_v]
+                P("data", "tensor", None),  # out [T, n_v, d_v]
+                P("data", "tensor", None),  # new_conv_state [num_blocks, conv_dim, K-1]
+                P("data", "tensor", None, None),  # new_rec_state [num_blocks, n_v, d_k, d_v]
             ),
             check_vma=False,
         )(
             mixed_qkv,
             conv_state_in,
             recurrent_state_in,
-            self.conv1d_weight.value,
-            self.A_log.value,
-            self.dt_bias.value,
+            conv1d_weight,
+            A_log,
+            dt_bias,
             b,
             a,
             cu_seqlens,

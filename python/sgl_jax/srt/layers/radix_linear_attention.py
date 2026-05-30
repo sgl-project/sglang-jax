@@ -25,6 +25,7 @@ class RadixLinearAttention(nnx.Module):
         q_conv1d: LinearBase | None = None,
         k_conv1d: LinearBase | None = None,
         v_conv1d: LinearBase | None = None,
+        conv1d: LinearBase | None = None,
         bias: jax.Array | None = None,
         activation=None,
         A_log: nnx.Param | None = None,
@@ -47,11 +48,20 @@ class RadixLinearAttention(nnx.Module):
         self.q_conv1d = q_conv1d
         self.k_conv1d = k_conv1d
         self.v_conv1d = v_conv1d
+        # GDN uses a single fused conv1d over concat(q,k,v); KDA uses the three
+        # split slots above. The two are mutually exclusive per layer.
+        self.conv1d = conv1d
         self.bias = nnx.data(bias) if bias is not None else None
         self.activation = activation
         self.A_log = A_log
         self.dt_bias = dt_bias
         self.scale = scale if scale is not None else head_v_dim**-0.5
+        assert not (
+            self.conv1d is not None
+            and (
+                self.q_conv1d is not None or self.k_conv1d is not None or self.v_conv1d is not None
+            )
+        ), "RadixLinearAttention: fused `conv1d` is mutually exclusive with q/k/v_conv1d"
 
     def __call__(
         self,

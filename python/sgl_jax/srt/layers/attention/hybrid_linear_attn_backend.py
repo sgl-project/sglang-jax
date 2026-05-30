@@ -247,6 +247,18 @@ def attn_backend_wrapper(
         from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 
         linear_attn_backend = KDAAttnBackend(mesh=runner.mesh)
+    elif runner.qwen3_5_hybrid_config is not None:
+        from sgl_jax.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+
+        text_cfg = runner.qwen3_5_hybrid_config.text_config
+        linear_attn_backend = GDNAttnBackend(
+            num_k_heads=text_cfg.linear_num_key_heads,
+            num_v_heads=text_cfg.linear_num_value_heads,
+            head_k_dim=text_cfg.linear_key_head_dim,
+            head_v_dim=text_cfg.linear_value_head_dim,
+            conv_kernel_size=text_cfg.linear_conv_kernel_dim,
+            mesh=runner.mesh,
+        )
     elif runner.lightning_config is not None:
         from sgl_jax.srt.layers.attention.linear.lightning_backend import (
             LightningAttnBackend,
