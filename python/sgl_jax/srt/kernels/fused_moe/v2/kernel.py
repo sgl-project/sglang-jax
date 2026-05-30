@@ -2289,10 +2289,54 @@ def _fused_ep_moe_kernel(
                     )
 
 
+    # ===== Per-BT prequant (overlaps quantize VPU/DMA with the per-BT metadata
+    # allreduce). Reuses b_y_stage (bf16 input) + b_x (fp8 output) staging.
+    # Gated to no in-kernel SE (SE-first also reuses b_x; the shared sequencing
+    # currently breaks — see SE+prequant). Needs bt<=bts.
+    use_per_bt_prequant = (
+        enable_act_quant
+        and w1_shared_hbm is None
+        and bt <= bts
+        and not os.environ.get("SGLJAX_SKIP_PREQUANT")
+    )
+
+    def prequant_bt(bt_id):
+        if not use_per_bt_prequant:
+            return
+        bt_start = bt_id * bt
+        pltpu.make_async_copy(
+            src_ref=tokens_hbm.at[pl.ds(bt_start, bt)],
+            dst_ref=b_y_stage_vmem.at[pl.ds(0, bt)],
+            sem=x_stage_sem.at[0],
+        ).start()
+        pltpu.make_async_copy(
+            src_ref=b_y_stage_vmem.at[pl.ds(0, bt)],
+            dst_ref=b_y_stage_vmem.at[pl.ds(0, bt)],
+            sem=x_stage_sem.at[0],
+        ).wait()
+        chunk_f32 = b_y_stage_vmem[pl.ds(0, bt)].reshape(bt, hidden_size).astype(jnp.float32)
+        x_amax = jnp.max(jnp.abs(chunk_f32), axis=-1, keepdims=True)
+        x_scale = jnp.maximum(x_amax / jnp.float32(448.0), jnp.float32(1e-12))
+        q = (chunk_f32 / x_scale).astype(jnp.float8_e4m3fn)
+        b_x_vmem[pl.ds(0, bt)] = q.reshape(bt, t_packing, h_per_t)
+        b_x_vmem.bitcast(jnp.float32).at[pl.ds(0, bt), 0, h_per_t - 1][...] = x_scale.reshape(bt)
+        pltpu.make_async_copy(
+            src_ref=b_x_vmem.at[pl.ds(0, bt)],
+            dst_ref=tokens_fp8_hbm.at[pl.ds(bt_start, bt)],
+            sem=y_store_sem.at[0],
+        ).start()
+        pltpu.make_async_copy(
+            src_ref=b_x_vmem.at[pl.ds(0, bt)],
+            dst_ref=b_x_vmem.at[pl.ds(0, bt)],
+            sem=y_store_sem.at[0],
+        ).wait()
+
     # ===== run_bt =====
 
     if num_bt >= 1:
         start_fetch_topk(bt_id=jnp.int32(0))
+        if use_per_bt_prequant:
+            prequant_bt(jnp.int32(0))
 
     def run_bt(bt_id, e_sem_id, *, skip_post_gather=False):
         bt_start = bt_id * bt
@@ -2305,6 +2349,8 @@ def _fused_ep_moe_kernel(
         @pl.when(next_bt_id < num_bt)
         def _():
             start_fetch_topk(bt_id=next_bt_id)
+            if use_per_bt_prequant:
+                prequant_bt(next_bt_id)
 
         current_bt_scatter_prefetched = jnp.logical_and(
             can_bt_scatter_overlap, bt_id > jnp.int32(0)
@@ -2448,7 +2494,7 @@ def _fused_ep_moe_kernel(
     # ===== Kernel start =====
     sync_barrier()
 
-    if enable_act_quant and not os.environ.get("SGLJAX_SKIP_PREQUANT"):
+    if enable_act_quant and not use_per_bt_prequant and not os.environ.get("SGLJAX_SKIP_PREQUANT"):
         # Standalone prequant: bf16 tokens -> fp8 + per-token f32 scale.
         # Scale is embedded into the last fp8 column via bitcast (4 fp8 bytes
         # == 1 f32). FFN1 reads it back out via the matching bitcast.
