@@ -272,9 +272,7 @@ suites = {
         TestFile("test/srt/lora/test_bgmv_backend.py", 7),
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 5.5),
         TestFile("python/sgl_jax/test/kernels/simple_gla_fused_test.py", 1, runner="pytest"),
-        TestFile("python/sgl_jax/test/layers/test_gdn_backend.py", 0.6),
         TestFile("python/sgl_jax/test/layers/test_merged_column_parallel_linear.py", 0.1),
-        TestFile("python/sgl_jax/test/layers/test_qwen3_5_gated_delta_net.py", 0.5),
     ],
     # CPU-only unit tests — moved off arc-runner-v6e-1 to a dedicated
     # CPU runner so they don't consume TPU capacity. Either pure
@@ -294,8 +292,6 @@ suites = {
         TestFile("python/sgl_jax/test/test_kernel_utils.py", 1),
         TestFile("python/sgl_jax/test/speculative/test_spec_info.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/models/test_mimo_v2_nextn.py", 0.2, runner="pytest"),
-        TestFile("python/sgl_jax/test/kernels/gdn/test_gated_delta.py", 1),
-        TestFile("python/sgl_jax/test/kernels/gdn/test_ragged_gated_delta_rule_ref.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_hybrid_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_swa_allocator.py", 1),
@@ -321,6 +317,8 @@ suites = {
         TestFile("python/sgl_jax/test/layers/test_lightning_backend_dp.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/test_kda_attention.py", 6.5),
         TestFile("python/sgl_jax/test/test_kda_attention_dp.py", 6),
+        TestFile("python/sgl_jax/test/test_gdn_attention.py", 6.5),
+        TestFile("python/sgl_jax/test/test_gdn_attention_dp.py", 6),
         TestFile("python/sgl_jax/test/layers/test_lightning_backend.py", 8, runner="pytest"),
         TestFile("test/srt/test_moe_block_quant_e2e.py", 1.5, runner="pytest"),
     ],

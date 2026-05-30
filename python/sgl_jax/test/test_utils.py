@@ -813,3 +813,13 @@ class KDAAttnBackendForTest:
 
     def __setattr__(self, name, value):
         setattr(self._backend, name, value)
+
+
+class GDNAttnBackendForTest(KDAAttnBackendForTest):
+    """Test wrapper for GDNAttnBackend with the same ``pool=`` translation.
+
+    Identical contract to :class:`KDAAttnBackendForTest`. Kept as a distinct
+    class for symmetry with the GDN test files (mirrors the KDA naming)
+    and to make ``test_gdn_attention*.py`` self-contained without leaking
+    KDA-specific imports.
+    """
