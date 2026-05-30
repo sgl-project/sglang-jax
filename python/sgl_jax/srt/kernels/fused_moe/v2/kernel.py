@@ -2291,14 +2291,21 @@ def _fused_ep_moe_kernel(
 
     # ===== Per-BT prequant (overlaps quantize VPU/DMA with the per-BT metadata
     # allreduce). Reuses b_y_stage (bf16 input) + b_x (fp8 output) staging.
-    # Gated to no in-kernel SE (SE-first also reuses b_x; the shared sequencing
-    # currently breaks — see SE+prequant). Needs bt<=bts.
+    # Compatible with in-kernel SE: prequant_bt(next) at the top of run_bt stores
+    # to HBM before SE-first(curr) reloads b_x, so b_x is shared sequentially.
+    # The quantize is pq-chunked so its f32 temp stays ~1MB (fits alongside SE).
+    # Needs bt<=bts.
     use_per_bt_prequant = (
         enable_act_quant
-        and w1_shared_hbm is None
         and bt <= bts
         and not os.environ.get("SGLJAX_SKIP_PREQUANT")
     )
+
+    # Chunk the quantize so the f32 intermediate stays small (a single (bt, hidden)
+    # f32 temp is ~4MB at bt=128 and overflows VMEM when combined with in-kernel SE;
+    # pq_chunk-sized temps are ~1MB, matching the standalone prequant).
+    pbt_chunk = min(32, bt) if use_per_bt_prequant else 0
+    num_pbt_chunks = bt // pbt_chunk if pbt_chunk else 0
 
     def prequant_bt(bt_id):
         if not use_per_bt_prequant:
@@ -2314,12 +2321,20 @@ def _fused_ep_moe_kernel(
             dst_ref=b_y_stage_vmem.at[pl.ds(0, bt)],
             sem=x_stage_sem.at[0],
         ).wait()
-        chunk_f32 = b_y_stage_vmem[pl.ds(0, bt)].reshape(bt, hidden_size).astype(jnp.float32)
-        x_amax = jnp.max(jnp.abs(chunk_f32), axis=-1, keepdims=True)
-        x_scale = jnp.maximum(x_amax / jnp.float32(448.0), jnp.float32(1e-12))
-        q = (chunk_f32 / x_scale).astype(jnp.float8_e4m3fn)
-        b_x_vmem[pl.ds(0, bt)] = q.reshape(bt, t_packing, h_per_t)
-        b_x_vmem.bitcast(jnp.float32).at[pl.ds(0, bt), 0, h_per_t - 1][...] = x_scale.reshape(bt)
+        for c in range(num_pbt_chunks):
+            off = c * pbt_chunk
+            chunk_f32 = (
+                b_y_stage_vmem[pl.ds(off, pbt_chunk)]
+                .reshape(pbt_chunk, hidden_size)
+                .astype(jnp.float32)
+            )
+            x_amax = jnp.max(jnp.abs(chunk_f32), axis=-1, keepdims=True)
+            x_scale = jnp.maximum(x_amax / jnp.float32(448.0), jnp.float32(1e-12))
+            q = (chunk_f32 / x_scale).astype(jnp.float8_e4m3fn)
+            b_x_vmem[pl.ds(off, pbt_chunk)] = q.reshape(pbt_chunk, t_packing, h_per_t)
+            b_x_vmem.bitcast(jnp.float32).at[pl.ds(off, pbt_chunk), 0, h_per_t - 1][...] = (
+                x_scale.reshape(pbt_chunk)
+            )
         pltpu.make_async_copy(
             src_ref=b_x_vmem.at[pl.ds(0, bt)],
             dst_ref=tokens_fp8_hbm.at[pl.ds(bt_start, bt)],
