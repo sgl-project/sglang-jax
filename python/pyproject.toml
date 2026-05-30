@@ -50,6 +50,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
 ]
+fastokens = [
+    "fastokens>=0.1.1,<0.2.0",
+]
 tpu = [
     "jax[tpu]==0.8.1",
 ]
@@ -61,6 +64,7 @@ cpu = [
 ]
 all = [
     "jax[tpu]==0.8.1",
+    "fastokens>=0.1.1,<0.2.0",
 ]
 multimodal = [
     "torch",
