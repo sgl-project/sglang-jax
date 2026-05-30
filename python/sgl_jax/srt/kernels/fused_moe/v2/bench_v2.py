@@ -1357,7 +1357,8 @@ if check_correctness:
         max_err = np.max(np.abs(result_f32 - ref_f32))
         rel_err = float(max_err / (np.max(np.abs(ref_f32)) + 1e-6))
         log(f"max_abs_err={max_err:.4f}, rel_err={rel_err:.6f}")
-        if rel_err > 0.05:
+        bench_tol = float(os.environ.get("BENCH_TOL", "0.05"))
+        if rel_err > bench_tol:
             log("FAIL: relative error too high")
             sys.exit(1)
         log("PASS")

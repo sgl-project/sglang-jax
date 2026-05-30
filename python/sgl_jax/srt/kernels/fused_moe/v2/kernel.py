@@ -2241,35 +2241,39 @@ def _fused_ep_moe_kernel(
             s1 = b_w1_scale_x2_vmem[slot, 0, 0, 0, pl.ds(0, bse)].reshape(1, bse)
             s3 = b_w3_scale_x2_vmem[slot, 0, 0, 0, pl.ds(0, bse)].reshape(1, bse)
 
+            # FFN1: fp8 x fp8 MXU dot, scale (per-token x per-channel) applied
+            # once after summing the t_packing chunks (scales are p-independent).
             gate_acc = jnp.zeros((bt, bse), dtype=jnp.float32)
             up_acc = jnp.zeros((bt, bse), dtype=jnp.float32)
-            # Dequant-inline bf16 dot: (token_fp8*ts) @ (w_fp8*chan_scale).
             for p_id in range(t_packing):
-                x = (b_x_vmem[pl.ds(0, bt), p_id, pl.ds(0, h_per_t)].astype(jnp.float32) * ts).astype(
-                    jnp.bfloat16
+                x = b_x_vmem[pl.ds(0, bt), p_id, pl.ds(0, h_per_t)]
+                gate_acc += jnp.dot(
+                    x, b_w1_x2_vmem[slot, p_id, pl.ds(0, h_per_t), pl.ds(0, bse)],
+                    preferred_element_type=jnp.float32,
                 )
-                w1 = (
-                    b_w1_x2_vmem[slot, p_id, pl.ds(0, h_per_t), pl.ds(0, bse)].astype(jnp.float32)
-                    * s1
-                ).astype(jnp.bfloat16)
-                w3 = (
-                    b_w3_x2_vmem[slot, p_id, pl.ds(0, h_per_t), pl.ds(0, bse)].astype(jnp.float32)
-                    * s3
-                ).astype(jnp.bfloat16)
-                gate_acc += jnp.dot(x, w1, preferred_element_type=jnp.float32)
-                up_acc += jnp.dot(x, w3, preferred_element_type=jnp.float32)
+                up_acc += jnp.dot(
+                    x, b_w3_x2_vmem[slot, p_id, pl.ds(0, h_per_t), pl.ds(0, bse)],
+                    preferred_element_type=jnp.float32,
+                )
+            gate_acc = gate_acc * (ts * s1)
+            up_acc = up_acc * (ts * s3)
 
-            act = activation_fn(gate_acc, up_acc, act_fn).astype(jnp.bfloat16)  # (bt, bse)
+            act = activation_fn(gate_acc, up_acc, act_fn)  # (bt, bse) f32
+            # Quantize act per-token to fp8 for the fp8 FFN2 dot.
+            act_amax = jnp.max(jnp.abs(act), axis=-1, keepdims=True)  # (bt, 1)
+            act_sc = jnp.maximum(act_amax / jnp.float32(448.0), jnp.float32(1e-12))
+            act_fp8 = (act / act_sc).astype(jnp.float8_e4m3fn)
 
             for p_id in range(out_packing):
                 s2 = b_w2_scale_x2_vmem[
                     slot, p_id, 0, 0, pl.ds(0, h_per_out)
                 ].reshape(1, h_per_out)
-                w2 = (
-                    b_w2_x2_vmem[slot, p_id, pl.ds(0, bse), pl.ds(0, h_per_out)].astype(jnp.float32)
-                    * s2
-                ).astype(jnp.bfloat16)
-                partial = jnp.dot(act, w2, preferred_element_type=jnp.float32)
+                d2 = jnp.dot(
+                    act_fp8,
+                    b_w2_x2_vmem[slot, p_id, pl.ds(0, bse), pl.ds(0, h_per_out)],
+                    preferred_element_type=jnp.float32,
+                )
+                partial = d2 * (act_sc * s2)
                 out_ref = b_output_x2_vmem.at[
                     out_buf_id, pl.ds(0, bt), pl.ds(p_id * h_per_out, h_per_out)
                 ]
