@@ -147,6 +147,9 @@ def ref_moe(
     w1_shared=None,
     w2_shared=None,
     w3_shared=None,
+    w1_shared_scale=None,
+    w2_shared_scale=None,
+    w3_shared_scale=None,
     quant_block_k=None,
     w1_scale=None,
     w2_scale=None,
@@ -188,10 +191,14 @@ def ref_moe(
             output = output.at[t_id].add(out[0] * weight)
 
     if w1_shared is not None:
-        gate_se = tokens_f32 @ w1_shared.astype(jnp.float32)
-        up_se = tokens_f32 @ w3_shared.astype(jnp.float32)
+        def _deq_se(w, sc):
+            wf = w.astype(jnp.float32)
+            return wf if sc is None else wf * jnp.asarray(sc).astype(jnp.float32)
+
+        gate_se = tokens_f32 @ _deq_se(w1_shared, w1_shared_scale)
+        up_se = tokens_f32 @ _deq_se(w3_shared, w3_shared_scale)
         act_se = activation_fn(gate_se, up_se, act_fn)
-        out_se = act_se @ w2_shared.astype(jnp.float32)
+        out_se = act_se @ _deq_se(w2_shared, w2_shared_scale)
         output = output + out_se
 
     return output.astype(tokens.dtype)
@@ -261,6 +268,9 @@ def _fused_ep_moe_kernel(
     w1_shared_hbm,  # None | (hidden_size, se_intermediate_size)
     w3_shared_hbm,  # None | (hidden_size, se_intermediate_size)
     w2_shared_hbm,  # None | (se_intermediate_size, hidden_size)
+    w1_shared_scale_hbm,  # None | (1, se_intermediate_size) fp32 per-channel
+    w3_shared_scale_hbm,  # None | (1, se_intermediate_size) fp32 per-channel
+    w2_shared_scale_hbm,  # None | (1, hidden_size) fp32 per-channel
     metadata_starts_hbm,  # None | (num_bt, 1, padded_num_experts) int32
     metadata_sizes_hbm,  # None | (num_bt, 1, padded_num_experts) int32
     metadata_d2e_counts_hbm,  # None | (num_bt, num_devices, 1, padded_num_experts) int32
@@ -2059,15 +2069,15 @@ def _fused_ep_moe_kernel(
 
             out_offset = pl.multiple_of(out_offset, 16)
 
-            if w1_shared_hbm is not None and not disable_shared_expert:
-                se_tile = b_se_acc_vmem[
-                    out_buf_id, pl.ds(out_offset, acc_bt), pl.ds(0, hidden_size)
-                ]
-                output_tile = output_tile.reshape(acc_bt, hidden_size) + se_tile
-
             target = b_output_x2_vmem.at[
                 out_buf_id, pl.ds(out_offset, acc_bt), pl.ds(0, hidden_size)
             ]
+            if w1_shared_hbm is not None and not disable_shared_expert:
+                # SE wrote its dense output into b_output during the SE-first
+                # phase; add the routed gather result on top.
+                se_tile = target[...].astype(jnp.float32)
+                output_tile = output_tile.reshape(acc_bt, hidden_size) + se_tile
+
             if not disable_acc_store_vmem:
                 target[...] = output_tile.reshape(acc_bt, hidden_size).astype(output_hbm.dtype)
 
@@ -2120,74 +2130,97 @@ def _fused_ep_moe_kernel(
 
     # ===== Shared expert (reads weights directly from HBM refs) =====
 
-    def start_fetch_se_tokens(bt_id):
+    # ===== Shared expert (fp8, reuses routed VMEM buffers) =====
+    # SE runs BEFORE the routed expert loop, during the scatter-recv window, so
+    # it can borrow b_x (token), b_w1/w3/w2_x2 (weights) and b_output (accum)
+    # which the experts have not touched yet. Requires act_quant (fp8 token from
+    # tokens_fp8_hbm, 4-chunk t_packing layout matching the routed weight bufs).
+    se_h_per_t = h_per_t  # SE uses the fp8 t_* view (== routed)
+
+    def setup_se_token(bt_id):
         if w1_shared_hbm is None or disable_shared_expert:
             return
         bt_start = bt_id * bt
-        bt_sem_id = bt_bank_id(bt_id)
-        # Copy the whole token block (bt, in_packing, h_per_in) in one DMA — no
-        # scalar packing index on the HBM ref (that breaks DMA tiling).
+        # DMA the fp8 token block into b_x (reuse), extract the embedded per-token
+        # scale into b_x_scale, and zero the scale column so it doesn't pollute.
         pltpu.make_async_copy(
-            src_ref=tokens_hbm.at[pl.ds(bt_start, bt)],
-            dst_ref=b_se_tokens_vmem.at[bt_sem_id, pl.ds(0, bt)],
-            sem=local_sems.at[bt_sem_id, 0],
+            src_ref=tokens_fp8_hbm.at[pl.ds(bt_start, bt)],
+            dst_ref=b_x_vmem.at[pl.ds(0, bt)],
+            sem=local_sems.at[0, 0],
         ).start()
+        pltpu.make_async_copy(
+            src_ref=b_x_vmem.at[pl.ds(0, bt)],
+            dst_ref=b_x_vmem.at[pl.ds(0, bt)],
+            sem=local_sems.at[0, 0],
+        ).wait()
+        scale_f32 = b_x_vmem.bitcast(jnp.float32)[pl.ds(0, bt), 0, se_h_per_t - 1]
+        b_x_scale_vmem.at[pl.ds(0, bt), pl.ds(0, 1)][...] = scale_f32[:, jnp.newaxis]
+        b_x_vmem.at[pl.ds(0, bt), pl.ds(0, t_packing), se_h_per_t - 1][...] = jnp.zeros(
+            (bt, t_packing), jnp.float8_e4m3fn
+        )
 
-    def wait_fetch_se_tokens(bt_id):
-        if w1_shared_hbm is None or disable_shared_expert:
-            return
-        bt_sem_id = bt_bank_id(bt_id)
-        ref = b_se_tokens_vmem.at[bt_sem_id, pl.ds(0, bt)]
-        pltpu.make_async_copy(src_ref=ref, dst_ref=ref, sem=local_sems.at[bt_sem_id, 0]).wait()
-
-    def start_fetch_se_weights(block_id, slot, bt_sem_id):
+    def start_fetch_se_weights(block_id, slot):
         if w1_shared_hbm is None or disable_shared_expert:
             return
         base = 10 + slot * 3
-        # DMA one bse-block per in_packing chunk into the packed se_w slot
-        # (mirrors start_fetch_w1: dst .at[slot, p]).
-        for p_id in range(in_packing):
+        # w1/w3: (hidden, se_inter) fp8 -> b_w*_x2[slot, p, :, :bse] (t_packing chunks).
+        for p_id in range(t_packing):
             pltpu.make_async_copy(
-                src_ref=w1_shared_hbm.at[
-                    pl.ds(p_id * h_per_in, h_per_in), pl.ds(block_id * bse, bse)
-                ],
-                dst_ref=b_se_w1_x2_vmem.at[slot, p_id],
-                sem=local_sems.at[bt_sem_id, base],
+                src_ref=w1_shared_hbm.at[pl.ds(p_id * h_per_t, h_per_t), pl.ds(block_id * bse, bse)],
+                dst_ref=b_w1_x2_vmem.at[slot, p_id, pl.ds(0, h_per_t), pl.ds(0, bse)],
+                sem=local_sems.at[0, base],
             ).start()
             pltpu.make_async_copy(
-                src_ref=w3_shared_hbm.at[
-                    pl.ds(p_id * h_per_in, h_per_in), pl.ds(block_id * bse, bse)
-                ],
-                dst_ref=b_se_w3_x2_vmem.at[slot, p_id],
-                sem=local_sems.at[bt_sem_id, base + 1],
+                src_ref=w3_shared_hbm.at[pl.ds(p_id * h_per_t, h_per_t), pl.ds(block_id * bse, bse)],
+                dst_ref=b_w3_x2_vmem.at[slot, p_id, pl.ds(0, h_per_t), pl.ds(0, bse)],
+                sem=local_sems.at[0, base + 1],
             ).start()
+        # w2: (se_inter, hidden) fp8 -> b_w2_x2[slot, p, :bse, :] (out_packing chunks).
+        for p_id in range(out_packing):
             pltpu.make_async_copy(
                 src_ref=w2_shared_hbm.at[
-                    pl.ds(block_id * bse, bse), pl.ds(p_id * h_per_in, h_per_in)
+                    pl.ds(block_id * bse, bse), pl.ds(p_id * h_per_out, h_per_out)
                 ],
-                dst_ref=b_se_w2_x2_vmem.at[slot, p_id],
-                sem=local_sems.at[bt_sem_id, base + 2],
+                dst_ref=b_w2_x2_vmem.at[slot, p_id, pl.ds(0, bse), pl.ds(0, h_per_out)],
+                sem=local_sems.at[0, base + 2],
+            ).start()
+        # Per-channel scales -> reuse routed scale bufs at index 0 (broadcast over p).
+        pltpu.make_async_copy(
+            src_ref=w1_shared_scale_hbm.at[pl.ds(0, 1), pl.ds(block_id * bse, bse)],
+            dst_ref=b_w1_scale_x2_vmem.at[slot, 0, 0, pl.ds(0, 1), pl.ds(0, bse)],
+            sem=local_sems.at[0, base],
+        ).start()
+        pltpu.make_async_copy(
+            src_ref=w3_shared_scale_hbm.at[pl.ds(0, 1), pl.ds(block_id * bse, bse)],
+            dst_ref=b_w3_scale_x2_vmem.at[slot, 0, 0, pl.ds(0, 1), pl.ds(0, bse)],
+            sem=local_sems.at[0, base + 1],
+        ).start()
+        # w2 per-channel scale is over hidden (out channels), split across the
+        # out_packing chunks of b_w2_scale_x2 (last dim = h_per_out).
+        for p_id in range(out_packing):
+            pltpu.make_async_copy(
+                src_ref=w2_shared_scale_hbm.at[
+                    pl.ds(0, 1), pl.ds(p_id * h_per_out, h_per_out)
+                ],
+                dst_ref=b_w2_scale_x2_vmem.at[slot, p_id, 0, pl.ds(0, 1), pl.ds(0, h_per_out)],
+                sem=local_sems.at[0, base + 2],
             ).start()
 
-    def wait_fetch_se_weights(slot, bt_sem_id):
+    def wait_fetch_se_weights(slot):
         if w1_shared_hbm is None or disable_shared_expert:
             return
         base = 10 + slot * 3
-        pltpu.make_async_copy(
-            src_ref=b_se_w1_x2_vmem.at[slot],
-            dst_ref=b_se_w1_x2_vmem.at[slot],
-            sem=local_sems.at[bt_sem_id, base],
-        ).wait()
-        pltpu.make_async_copy(
-            src_ref=b_se_w3_x2_vmem.at[slot],
-            dst_ref=b_se_w3_x2_vmem.at[slot],
-            sem=local_sems.at[bt_sem_id, base + 1],
-        ).wait()
-        pltpu.make_async_copy(
-            src_ref=b_se_w2_x2_vmem.at[slot],
-            dst_ref=b_se_w2_x2_vmem.at[slot],
-            sem=local_sems.at[bt_sem_id, base + 2],
-        ).wait()
+        # Wait on the EXACT regions written by the DMAs (only :bse / :h_per_out
+        # columns), else the sem is under-signaled and the wait hangs.
+        for ref, s in (
+            (b_w1_x2_vmem.at[slot, :, :, pl.ds(0, bse)], base),
+            (b_w3_x2_vmem.at[slot, :, :, pl.ds(0, bse)], base + 1),
+            (b_w2_x2_vmem.at[slot, :, pl.ds(0, bse), :], base + 2),
+            (b_w1_scale_x2_vmem.at[slot, 0, 0, :, pl.ds(0, bse)], base),
+            (b_w3_scale_x2_vmem.at[slot, 0, 0, :, pl.ds(0, bse)], base + 1),
+            (b_w2_scale_x2_vmem.at[slot, :, 0, :, :], base + 2),
+        ):
+            pltpu.make_async_copy(src_ref=ref, dst_ref=ref, sem=local_sems.at[0, s]).wait()
 
     def run_shared_expert_slice(block_id, bt_id, bt_sem_id, out_buf_id):
         if w1_shared_hbm is None or disable_shared_expert:
@@ -2196,50 +2229,66 @@ def _fused_ep_moe_kernel(
         @pl.when(block_id < se_total_blocks)
         def _():
             slot = block_id % 2
-            # Prefetch next block's weights so its DMA overlaps this block's
-            # compute (and the interleaved expert FFN).
             next_block = block_id + jnp.int32(1)
 
             @pl.when(next_block < se_total_blocks)
             def _():
-                start_fetch_se_weights(next_block, next_block % 2, bt_sem_id)
+                start_fetch_se_weights(next_block, next_block % 2)
 
-            wait_fetch_se_weights(slot, bt_sem_id)
+            wait_fetch_se_weights(slot)
+
+            ts = b_x_scale_vmem[pl.ds(0, bt), pl.ds(0, 1)]  # (bt, 1) per-token scale
+            s1 = b_w1_scale_x2_vmem[slot, 0, 0, 0, pl.ds(0, bse)].reshape(1, bse)
+            s3 = b_w3_scale_x2_vmem[slot, 0, 0, 0, pl.ds(0, bse)].reshape(1, bse)
 
             gate_acc = jnp.zeros((bt, bse), dtype=jnp.float32)
             up_acc = jnp.zeros((bt, bse), dtype=jnp.float32)
+            # Dequant-inline bf16 dot: (token_fp8*ts) @ (w_fp8*chan_scale).
+            for p_id in range(t_packing):
+                x = (b_x_vmem[pl.ds(0, bt), p_id, pl.ds(0, h_per_t)].astype(jnp.float32) * ts).astype(
+                    jnp.bfloat16
+                )
+                w1 = (
+                    b_w1_x2_vmem[slot, p_id, pl.ds(0, h_per_t), pl.ds(0, bse)].astype(jnp.float32)
+                    * s1
+                ).astype(jnp.bfloat16)
+                w3 = (
+                    b_w3_x2_vmem[slot, p_id, pl.ds(0, h_per_t), pl.ds(0, bse)].astype(jnp.float32)
+                    * s3
+                ).astype(jnp.bfloat16)
+                gate_acc += jnp.dot(x, w1, preferred_element_type=jnp.float32)
+                up_acc += jnp.dot(x, w3, preferred_element_type=jnp.float32)
 
-            # Per-p dots over the packed (in_packing, h_per_in) view (cf. routed
-            # FFN1's b_x_vmem[..., p, ...] @ b_w1_x2_vmem[slot, p, ...]).
-            for p_id in range(in_packing):
-                t_slice = b_se_tokens_vmem[bt_sem_id, pl.ds(0, bt), p_id, pl.ds(0, h_per_in)]
-                w1_tile = b_se_w1_x2_vmem[slot, p_id]
-                w3_tile = b_se_w3_x2_vmem[slot, p_id]
-                gate_acc += jnp.dot(t_slice, w1_tile, preferred_element_type=jnp.float32)
-                up_acc += jnp.dot(t_slice, w3_tile, preferred_element_type=jnp.float32)
+            act = activation_fn(gate_acc, up_acc, act_fn).astype(jnp.bfloat16)  # (bt, bse)
 
-            act = activation_fn(gate_acc, up_acc, act_fn)
-
-            for p_id in range(in_packing):
-                w2_tile = b_se_w2_x2_vmem[slot, p_id]
-                partial = jnp.dot(act, w2_tile, preferred_element_type=jnp.float32)
-                se_ref = b_se_acc_vmem.at[
-                    out_buf_id, pl.ds(0, bt), pl.ds(p_id * h_per_in, h_per_in)
+            for p_id in range(out_packing):
+                s2 = b_w2_scale_x2_vmem[
+                    slot, p_id, 0, 0, pl.ds(0, h_per_out)
+                ].reshape(1, h_per_out)
+                w2 = (
+                    b_w2_x2_vmem[slot, p_id, pl.ds(0, bse), pl.ds(0, h_per_out)].astype(jnp.float32)
+                    * s2
+                ).astype(jnp.bfloat16)
+                partial = jnp.dot(act, w2, preferred_element_type=jnp.float32)
+                out_ref = b_output_x2_vmem.at[
+                    out_buf_id, pl.ds(0, bt), pl.ds(p_id * h_per_out, h_per_out)
                 ]
 
                 @pl.when(block_id == 0)
-                def _(se_ref=se_ref, partial=partial):
-                    se_ref[...] = partial
+                def _(out_ref=out_ref, partial=partial):
+                    out_ref[...] = partial.astype(output_hbm.dtype)
 
                 @pl.when(block_id > 0)
-                def _(se_ref=se_ref, partial=partial):
-                    se_ref[...] = se_ref[...] + partial
+                def _(out_ref=out_ref, partial=partial):
+                    out_ref[...] = (out_ref[...].astype(jnp.float32) + partial).astype(
+                        output_hbm.dtype
+                    )
+
 
     # ===== run_bt =====
 
     if num_bt >= 1:
         start_fetch_topk(bt_id=jnp.int32(0))
-        start_fetch_se_tokens(bt_id=jnp.int32(0))
 
     def run_bt(bt_id, e_sem_id, *, skip_post_gather=False):
         bt_start = bt_id * bt
@@ -2252,7 +2301,6 @@ def _fused_ep_moe_kernel(
         @pl.when(next_bt_id < num_bt)
         def _():
             start_fetch_topk(bt_id=next_bt_id)
-            start_fetch_se_tokens(next_bt_id)
 
         current_bt_scatter_prefetched = jnp.logical_and(
             can_bt_scatter_overlap, bt_id > jnp.int32(0)
@@ -2281,11 +2329,6 @@ def _fused_ep_moe_kernel(
         if not skip_post_gather:
             wait_store_output(bt_id=bt_id - 2)
 
-        se_per_expert = (
-            max(2, cdiv(se_total_blocks, local_num_experts)) if se_total_blocks > 0 else 2
-        )
-        se_before = se_per_expert // 2
-        se_after = se_per_expert - se_before
         next_bt_sem_id = bt_bank_id(next_bt_id)
         next_bt_start = next_bt_id * bt
         next_a2a_bank_id = a2a_bank_for_bt(next_bt_id)
@@ -2316,22 +2359,24 @@ def _fused_ep_moe_kernel(
                 a2a_bank_id=a2a_bank_id,
             )
 
-        init_carry = (jnp.int32(0), jnp.bool_(False))
+        init_carry = jnp.bool_(False)
 
-        # Wait for this BT's SE tokens (prefetched in the previous BT / pre-loop)
-        # and prefetch the first SE weight block before the expert loop so
-        # block 0's DMA is already in flight when run_shared_expert_slice waits.
+        # ===== SE-first phase: compute all shared-expert blocks BEFORE the
+        # routed expert loop, overlapping the scatter-recv / metadata window.
+        # Reuses b_x / b_w*_x2 / b_output (free until the expert loop). =====
         if se_total_blocks > 0:
-            wait_fetch_se_tokens(bt_id)
-            start_fetch_se_weights(jnp.int32(0), jnp.int32(0), bt_sem_id)
+            setup_se_token(bt_id)
+            start_fetch_se_weights(jnp.int32(0), jnp.int32(0))
+
+            def _se_body(block_id, _):
+                run_shared_expert_slice(block_id, bt_id, bt_sem_id, out_buf_id)
+                return None
+
+            lax.fori_loop(0, se_total_blocks, _se_body, None)
 
         def compute_expert_batch(local_e_id, carry):
-            curr_se_block, bf0_w13_prefetched = carry
+            bf0_w13_prefetched = carry
             e_sem_id_local = local_e_id
-
-            for _ in range(se_before):
-                run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
-                curr_se_block += 1
 
             wait_a2a_scatter_recv(
                 bt_sem_id=bt_sem_id,
@@ -2354,26 +2399,15 @@ def _fused_ep_moe_kernel(
                 gather_bank_id=gather_bank_id,
             )
 
-            for _ in range(se_after):
-                run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
-                curr_se_block += 1
+            return next_bf0_w13_prefetched
 
-            return (curr_se_block, next_bf0_w13_prefetched)
-
-        final_carry = lax.fori_loop(
+        lax.fori_loop(
             0,
             local_num_experts,
             compute_expert_batch,
             init_carry,
             unroll=False,
         )
-        final_se_block, _ = final_carry
-
-        def cleanup_body(block_idx, _):
-            run_shared_expert_slice(block_idx, bt_id, bt_sem_id, out_buf_id)
-            return None
-
-        lax.fori_loop(final_se_block, se_total_blocks, cleanup_body, None)
 
         if not skip_post_gather:
             wait_a2a_scatter_send_batch(a2a_bank_id=a2a_bank_id)
@@ -2675,6 +2709,9 @@ def fused_ep_moe_v2(
     w1_shared: jax.Array | None = None,
     w2_shared: jax.Array | None = None,
     w3_shared: jax.Array | None = None,
+    w1_shared_scale: jax.Array | None = None,
+    w2_shared_scale: jax.Array | None = None,
+    w3_shared_scale: jax.Array | None = None,
     quant_block_k: int | None = None,
     w1_scale: jax.Array | None = None,
     w2_scale: jax.Array | None = None,
@@ -2718,6 +2755,14 @@ def fused_ep_moe_v2(
             )
         if w1_scale is None:
             raise ValueError("enable_act_quant requires fp8 weights (w1_scale not None).")
+    if w1_shared is not None:
+        if not enable_act_quant:
+            raise ValueError(
+                "in-kernel shared expert requires enable_act_quant=True "
+                "(SE reuses the fp8 routed token/weight VMEM buffers)."
+            )
+        if w1_shared_scale is None:
+            raise ValueError("in-kernel shared expert requires fp8 w*_shared + w*_shared_scale.")
     if direct_scaled_dot_ffn1 is None:
         direct_scaled_dot_ffn1 = direct_scaled_dot
     if direct_scaled_dot_ffn2 is None:
@@ -3009,33 +3054,13 @@ def fused_ep_moe_v2(
         pltpu.VMEM((bts, out_packing, h_per_out), out_dtype),  # y_stage
         # VMEM: per-token activation scale (act_quant only)
         (None if not enable_act_quant else pltpu.VMEM((bts, 128), jnp.float32)),  # x_scale
-        # VMEM: shared expert. Packed (in_packing, h_per_in) layout mirrors the
-        # routed token/weight buffers (per-p dots are legal; cf. b_x_vmem). The
-        # token block is DMA'd whole (no scalar packing index on HBM); se_w* are
-        # double-buffered (slot = block_id % 2) for prefetch.
-        (
-            None
-            if w1_shared is None
-            else pltpu.VMEM((smem_banks, bt, in_packing, h_per_in), in_dtype)
-        ),  # se_tokens
-        (
-            None
-            if w1_shared is None
-            else pltpu.VMEM((2, in_packing, h_per_in, bse), w1_shared.dtype)
-        ),  # se_w1
-        (
-            None
-            if w3_shared is None
-            else pltpu.VMEM((2, in_packing, h_per_in, bse), w3_shared.dtype)
-        ),  # se_w3
-        (
-            None
-            if w2_shared is None
-            else pltpu.VMEM((2, in_packing, bse, h_per_in), w2_shared.dtype)
-        ),  # se_w2
-        (
-            None if w1_shared is None else pltpu.VMEM((smem_banks, bt, hidden_size), jnp.float32)
-        ),  # se_acc
+        # Shared expert reuses routed VMEM (b_x / b_w*_x2 / b_output), so the
+        # dedicated SE buffers are gone — pass None for all five.
+        None,  # se_tokens (reuses b_x)
+        None,  # se_w1 (reuses b_w1_x2)
+        None,  # se_w3 (reuses b_w3_x2)
+        None,  # se_w2 (reuses b_w2_x2)
+        None,  # se_acc (reuses b_output)
         # Semaphores
         pltpu.SemaphoreType.DMA((1,)),  # x_stage
         pltpu.SemaphoreType.DMA((1,)),  # y_store
@@ -3143,6 +3168,9 @@ def fused_ep_moe_v2(
                     None if w1_shared is None else hbm_spec,  # w1_shared
                     None if w3_shared is None else hbm_spec,  # w3_shared
                     None if w2_shared is None else hbm_spec,  # w2_shared
+                    None if w1_shared_scale is None else hbm_spec,  # w1_shared_scale
+                    None if w3_shared_scale is None else hbm_spec,  # w3_shared_scale
+                    None if w2_shared_scale is None else hbm_spec,  # w2_shared_scale
                     None if not needs_jax_allreduce else hbm_spec,  # metadata_starts
                     None if not needs_jax_allreduce else hbm_spec,  # metadata_sizes
                     None if not needs_jax_allreduce else hbm_spec,  # metadata_d2e_counts
@@ -3180,6 +3208,9 @@ def fused_ep_moe_v2(
             None if w1_shared is None else P(),  # w1_shared
             None if w3_shared is None else P(),  # w3_shared
             None if w2_shared is None else P(),  # w2_shared
+            None if w1_shared_scale is None else P(),  # w1_shared_scale
+            None if w3_shared_scale is None else P(),  # w3_shared_scale
+            None if w2_shared_scale is None else P(),  # w2_shared_scale
         ),
         out_specs=P((dp_axis_name, tp_axis_name)),
         check_vma=False,
@@ -3201,6 +3232,9 @@ def fused_ep_moe_v2(
         w1_shared=None,
         w3_shared=None,
         w2_shared=None,
+        w1_shared_scale=None,
+        w3_shared_scale=None,
+        w2_shared_scale=None,
     ):
         if pad_local > 0:
             tokens = jnp.pad(tokens, ((0, pad_local), (0, 0), (0, 0)))
@@ -3274,6 +3308,21 @@ def fused_ep_moe_v2(
                 if w2_shared is None
                 else pltpu.with_memory_space_constraint(w2_shared, pltpu.HBM)
             ),
+            (
+                None
+                if w1_shared_scale is None
+                else pltpu.with_memory_space_constraint(w1_shared_scale, pltpu.HBM)
+            ),
+            (
+                None
+                if w3_shared_scale is None
+                else pltpu.with_memory_space_constraint(w3_shared_scale, pltpu.HBM)
+            ),
+            (
+                None
+                if w2_shared_scale is None
+                else pltpu.with_memory_space_constraint(w2_shared_scale, pltpu.HBM)
+            ),
             md_starts_arg,
             md_sizes_arg,
             md_d2e_arg,
@@ -3315,4 +3364,7 @@ def fused_ep_moe_v2(
         w1_shared,
         w3_shared,
         w2_shared,
+        w1_shared_scale,
+        w3_shared_scale,
+        w2_shared_scale,
     )
