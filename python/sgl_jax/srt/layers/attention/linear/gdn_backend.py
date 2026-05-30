@@ -134,10 +134,15 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
     ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
         """Dispatch by ``forward_batch.forward_mode``.
 
-        Per decision #4 the slice happens in the model layer and the
-        backend re-concatenates ``[q | k | v]`` along the channel axis
-        before the depthwise conv1d — XLA collapses slice→concat to a
-        single slice of the upstream activation, zero extra HBM traffic.
+        Per decision #4 the slice happens in the model layer; the backend
+        rebuilds ``mixed_qkv`` as the per-rank ``[q_d | k_d | v_d]`` block so
+        each TP shard sees its own head-striped channels (matching the
+        rank-major conv1d weight stripe). A plain ``concatenate([q,k,v])`` is
+        WRONG under TP>1: q/k/v have unequal per-device widths, so a concat
+        along the tensor-sharded axis yields the logical ``[Q|K|V]`` layout
+        (device 0 = all of Q, etc.), scrambling the depthwise-conv channels.
+        Reshaping each into ``[T, tp, *]`` rank-blocks before the concat keeps
+        the striping; it collapses to a plain ``[Q|K|V]`` at tp=1.
 
         Fetches per-layer ``(recurrent_state, conv_state)`` from the pool
         via the base class's :meth:`get_layer_cache`. ``conv_state`` is the
@@ -149,7 +154,16 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         matching the linear-backend contract consumed by
         ``RadixLinearAttention``.
         """
-        mixed_qkv = jnp.concatenate([q, k, v], axis=-1)  # [T, conv_dim]
+        tp = _mesh_tp_size(self.mesh)
+        T = q.shape[0]
+        k_tp = self.key_dim // tp
+        v_tp = self.value_dim // tp
+        # Per-rank head-blocks -> concat -> flatten: device d gets [q_d|k_d|v_d].
+        mixed_qkv = jnp.concatenate(
+            [q.reshape(T, tp, k_tp), k.reshape(T, tp, k_tp), v.reshape(T, tp, v_tp)],
+            axis=-1,
+        ).reshape(T, self.conv_dim)
+        mixed_qkv = jax.sharding.reshard(mixed_qkv, P("data", "tensor"))
 
         conv1d_weight = layer.conv1d.weight.value
         A_log = layer.A_log.value
