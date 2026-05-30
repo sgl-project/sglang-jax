@@ -29,6 +29,7 @@ import logging
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -581,11 +582,6 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
             )
         self.logits_processor = LogitsProcessor(text_cfg.vocab_size, mesh=mesh)
 
-        # Fused-projection CPU staging buffers drained by the P3 weight loader.
-        # {layer_idx: {hf_source: {"weight": np.ndarray}}}.
-        self._fused_qkvz_buffers: dict[int, dict] = {}
-        self._fused_ba_buffers: dict[int, dict] = {}
-
     def __call__(
         self,
         forward_batch: ForwardBatch,
@@ -609,17 +605,154 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
             layers_topk_ids,
         )
 
+    # ------------------------------------------------------------------
+    # Weight loading
+    # ------------------------------------------------------------------
+    def _put(self, arr, spec):
+        """Host array -> sharded bf16 device array under the model mesh."""
+        return jax.device_put(
+            jnp.asarray(arr, dtype=self.dtype), NamedSharding(self.mesh, P(*spec))
+        )
+
+    @staticmethod
+    def _read_host(fm, weight_info, hf_key):
+        """Read a full HF tensor to a host numpy array (no device replication)."""
+        info = weight_info[hf_key][0]
+        return np.asarray(fm.get_handle(info["file"]).get_slice(hf_key)[:])
+
+    def _load_gdn_layer(self, fm, weight_info, layer_idx, tp):
+        """GDN fused projections + conv1d stripe (the only TP>1-sensitive path).
+
+        in_proj_qkvz / in_proj_ba are stored component-major ([Q|K|V|Z], [B|A]);
+        the model layer reshards the sliced q/k/v/z/a/b at runtime. The conv1d
+        weight is stripe-rearranged to rank-major [q_d|k_d|v_d] so the GDN
+        backend's contiguous P("tensor", None) shard_map sees its head shard.
+        """
+        src = f"model.language_model.layers.{layer_idx}.linear_attn"
+        gdn = self.language_model.model.layers[layer_idx].self_attn
+
+        # in_proj_qkvz = concat([in_proj_qkv=[Q|K|V], in_proj_z]) -> [hidden, 2k+2v]
+        qkv = self._read_host(fm, weight_info, f"{src}.in_proj_qkv.weight")  # [2k+v, hidden]
+        z = self._read_host(fm, weight_info, f"{src}.in_proj_z.weight")  # [v, hidden]
+        qkvz = np.concatenate([qkv, z], axis=0).T  # [hidden, 2k+2v], component-major
+        gdn.in_proj_qkvz.weight.value = self._put(qkvz, (None, "tensor"))
+
+        # in_proj_ba = concat([in_proj_b, in_proj_a]) -> [hidden, 2*n_v]
+        b = self._read_host(fm, weight_info, f"{src}.in_proj_b.weight")  # [n_v, hidden]
+        a = self._read_host(fm, weight_info, f"{src}.in_proj_a.weight")
+        ba = np.concatenate([b, a], axis=0).T  # [hidden, 2*n_v]
+        gdn.in_proj_ba.weight.value = self._put(ba, (None, "tensor"))
+
+        # conv1d: HF [conv_dim, 1, K] -> [conv_dim, K] -> rank-major stripe.
+        conv = self._read_host(fm, weight_info, f"{src}.conv1d.weight")
+        conv = conv.reshape(conv.shape[0], conv.shape[-1])  # [conv_dim, K]
+        conv = self._stripe_conv(conv, gdn, tp)
+        gdn.conv1d.weight.value = self._put(conv, ("tensor", None))
+
+    @staticmethod
+    def _stripe_conv(conv, gdn, tp):
+        """[conv_dim, K] component-major [Q|K|V] -> rank-major [q_d|k_d|v_d]."""
+        if tp <= 1:
+            return conv
+        kd = gdn.key_dim
+        q_blk, k_blk, v_blk = conv[:kd], conv[kd : 2 * kd], conv[2 * kd :]
+        k_tp = (gdn.num_k_heads // tp) * gdn.head_k_dim
+        v_tp = (gdn.num_v_heads // tp) * gdn.head_v_dim
+        blocks = []
+        for r in range(tp):
+            blocks.append(q_blk[r * k_tp : (r + 1) * k_tp])
+            blocks.append(k_blk[r * k_tp : (r + 1) * k_tp])
+            blocks.append(v_blk[r * v_tp : (r + 1) * v_tp])
+        return np.concatenate(blocks, axis=0)
+
+    def _load_moe_gate_up(self, fm, weight_info, layer_idx):
+        """experts.gate_up_proj [E, 2*inter, hidden] -> w1/w3 [E, hidden, inter]."""
+        src = f"model.language_model.layers.{layer_idx}.mlp.experts.gate_up_proj"
+        block = self.language_model.model.layers[layer_idx].mlp
+        gu = self._read_host(fm, weight_info, src)  # [E, 2*inter, hidden]
+        inter = gu.shape[1] // 2
+        gate = gu[:, :inter, :]  # [E, inter, hidden]  (w1)
+        up = gu[:, inter:, :]  # [E, inter, hidden]   (w3)
+        w1 = np.transpose(gate, (0, 2, 1))  # [E, hidden, inter]
+        w3 = np.transpose(up, (0, 2, 1))
+        block.experts.w1.value = self._put(w1, (("data", "tensor"), None, None))
+        block.experts.w3.value = self._put(w3, (("data", "tensor"), None, None))
+
     def load_weights(self, model_config: ModelConfig):
-        # Real loader (GDN 4->2 concat + conv1d stripe + MoE pre-fused split)
-        # lands in P3 (Task P3.4).
-        raise NotImplementedError("Qwen3.5 weight loader lands in P3.")
+        from sgl_jax.srt.utils.weight_utils import (
+            SequentialSafetensorManager,
+            WeightLoader,
+        )
+
+        hf_config = model_config.hf_config
+        tc = hf_config.text_config
+        interval = int(tc.full_attention_interval)
+        num_layers = int(tc.num_hidden_layers)
+        gdn_layers = [i for i in range(num_layers) if ((i + 1) % interval) != 0]
+
+        mappings, visual_skip, mtp_skip = _create_qwen3_5_weight_mappings(hf_config)
+
+        # Keys handled manually (concat / stripe / split) — excluded from the
+        # shared loader, which handles every other (simple) weight.
+        special = set()
+        for i in gdn_layers:
+            s = f"model.language_model.layers.{i}.linear_attn"
+            special.update(
+                {
+                    f"{s}.in_proj_qkv.weight",
+                    f"{s}.in_proj_z.weight",
+                    f"{s}.in_proj_b.weight",
+                    f"{s}.in_proj_a.weight",
+                    f"{s}.conv1d.weight",
+                }
+            )
+        for i in range(num_layers):
+            special.add(f"model.language_model.layers.{i}.mlp.experts.gate_up_proj")
+
+        simple = {k: v for k, v in mappings.items() if k not in special}
+
+        loader = WeightLoader(self, model_config, self.mesh, dtype=self.dtype)
+        loader.load_weights_from_safetensors(simple)
+
+        weight_info = loader._scan_weight_info()
+        tp = self.mesh.shape.get("tensor", 1)
+        with SequentialSafetensorManager() as fm:
+            for i in gdn_layers:
+                self._load_gdn_layer(fm, weight_info, i, tp)
+            for i in range(num_layers):
+                self._load_moe_gate_up(fm, weight_info, i)
+
+        self._log_load_summary(mappings, weight_info, visual_skip, mtp_skip)
+
+    @staticmethod
+    def _log_load_summary(mappings, weight_info, visual_skip, mtp_skip):
+        import re as _re
+
+        ckpt = set(weight_info.keys())
+        consumed = {k for k in mappings if k in ckpt}
+        skip_pats = list(visual_skip) + list(mtp_skip)
+        skipped = {k for k in ckpt if any(_re.match(p, k) for p in skip_pats)}
+        unexpected = ckpt - consumed - skipped
+        logger.info(
+            "WeightLoader summary: consumed=%d, skipped=%d, missing=%d, unexpected=%d",
+            len(consumed),
+            len(skipped),
+            len([k for k in mappings if k not in ckpt]),
+            len(unexpected),
+        )
+        if unexpected:
+            raise RuntimeError(
+                f"Unexpected ckpt keys (no mapping, no skip prefix): "
+                f"{sorted(unexpected)[:10]} (total {len(unexpected)})"
+            )
 
 
 # =============================================================================
-# Weight mapping table (HF source key -> JAX target). The fused-projection
-# sentinels (__FUSED_QKVZ_* / __FUSED_BA_*) and the conv1d stripe + MoE
-# gate_up split are made functional by the P3 WeightLoader changes; here the
-# table is pure data so every HF text key is accounted for (coverage test).
+# Weight mapping table (HF source key -> JAX target). "Simple" entries are
+# consumed by the shared WeightLoader; the 5 GDN-fused / conv1d / MoE gate_up
+# keys are handled manually in load_weights (concat / stripe / split) and their
+# target_path here is only a marker. Every HF text key is a mapping key so the
+# coverage test + load summary account for all of them.
 # =============================================================================
 _VISUAL_SKIP_PATTERNS = [r"^model\.visual\..+"]
 _MTP_SKIP_PATTERNS = [r"^mtp\..+"]
@@ -747,10 +880,12 @@ def _create_qwen3_5_weight_mappings(hf_config):
             sharding=(("data", "tensor"), None, None),
             transpose=False,
         )
+        # HF down_proj [E, hidden, inter] -> w2 [E, inter, hidden] (transpose last 2).
         mappings[f"{src}.mlp.experts.down_proj"] = WeightMapping(
             target_path=f"{dst}.mlp.experts.w2",
             sharding=(("data", "tensor"), None, None),
             transpose=False,
+            transpose_axes=(0, 2, 1),
         )
         mappings[f"{src}.mlp.shared_expert.gate_proj.weight"] = WeightMapping(
             target_path=f"{dst}.mlp.shared_experts.gate_proj.weight",
