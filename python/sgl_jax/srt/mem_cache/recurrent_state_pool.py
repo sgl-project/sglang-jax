@@ -36,6 +36,12 @@ class LinearRecurrentStateParams:
     head_dim: int
     conv_kernel_size: int
     dtype: RecurrentStateDType
+    # GDN/Mamba have asymmetric K vs V projection widths (e.g.
+    # Qwen3.5 GDN: num_k_heads=16/head_k_dim=128 vs num_v_heads=32/head_v_dim=128).
+    # When None (KDA / Lightning / Bailing), RecurrentStatePool falls back to
+    # treating K dim = V dim.
+    num_k_heads: int | None = None
+    head_k_dim: int | None = None
 
 
 def recurrent_state_dtype() -> RecurrentStateDType:

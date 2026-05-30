@@ -22,6 +22,7 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
 
 from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
 from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
+from sgl_jax.srt.configs.qwen3_5 import Qwen3_5HybridConfig
 from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
 from sgl_jax.srt.utils.common_utils import is_remote_url, lru_cache_frozenset
 
@@ -38,12 +39,18 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
         BailingHybridConfig,
         KimiLinearConfig,
         GlmMoeDsaConfig,
+        Qwen3_5HybridConfig,
     ]
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
         AutoConfig.register(name, cls)
+
+# Override HF's stock ``Qwen3_5MoeConfig`` registration (transformers >=5.3)
+# with our hybrid alias subclass; needed because the suppress(ValueError) loop
+# above silently skips already-registered entries.
+AutoConfig.register("qwen3_5_moe", Qwen3_5HybridConfig, exist_ok=True)
 
 
 _UNSET = object()

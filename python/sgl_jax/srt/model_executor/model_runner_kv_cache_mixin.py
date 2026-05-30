@@ -105,6 +105,8 @@ def _per_req_state_bytes_from_config(cfg, tp_size: int) -> int:
         tp_size=tp_size,
         temporal_dtype_bytes=jnp.dtype(state_params.dtype.temporal).itemsize,
         conv_dtype_bytes=jnp.dtype(state_params.dtype.conv).itemsize,
+        num_k_heads=state_params.num_k_heads,
+        head_k_dim=state_params.head_k_dim,
     )
 
 
@@ -154,6 +156,8 @@ def _build_hybrid_pools(
         dp_size=dp_size,
         temporal_dtype=state_params.dtype.temporal,
         conv_dtype=state_params.dtype.conv,
+        num_k_heads=state_params.num_k_heads,
+        head_k_dim=state_params.head_k_dim,
     )
     hybrid_pool = HybridReqToTokenPool(
         size=max_num_reqs,
@@ -616,10 +620,18 @@ class ModelRunnerKVCacheMixin:
         return get_bailing_hybrid_config(self.model_config.hf_config)
 
     @property
+    def qwen3_5_hybrid_config(self: ModelRunner):
+        from sgl_jax.srt.configs.qwen3_5 import get_qwen3_5_hybrid_config
+
+        return get_qwen3_5_hybrid_config(self.model_config.hf_config)
+
+    @property
     def linear_recurrent_config(self: ModelRunner):
         """Return linear recurrent config if the model has linear attention, else None."""
         if self.kimi_linear_config is not None:
             return self.kimi_linear_config
+        if self.qwen3_5_hybrid_config is not None:
+            return self.qwen3_5_hybrid_config.text_config
         return self.lightning_config
 
     def _kv_pool_layer_count(self: ModelRunner):
