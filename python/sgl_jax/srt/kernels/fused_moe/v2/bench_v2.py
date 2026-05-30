@@ -954,6 +954,33 @@ if use_fp8:
     qbk_arg = quant_block_k
     log("fp8 quantization done")
 
+# Shared-expert fp8 quant (per-channel, replicated). The in-kernel SE reuses the
+# routed fp8 weight/token/output VMEM buffers, so SE weights must also be fp8.
+w1_shared_scale = w2_shared_scale = w3_shared_scale = None
+if use_shared_expert and use_fp8 and quant_block_k is None:
+    log("quantizing shared-expert weights to fp8 (per-channel, replicated)...")
+    repl_sharding2 = jax.sharding.NamedSharding(mesh, P())
+
+    def _quant_repl_pc(w):
+        # w: (K, N) -> fp8 (K, N) + per-channel scale (1, N) over the K axis.
+        w_f32 = w.astype(jnp.float32)
+        amax = jnp.max(jnp.abs(w_f32), axis=0, keepdims=True)  # (1, N)
+        scale = jnp.maximum(amax / 448.0, jnp.float32(1e-12))
+        w_q = (w_f32 / scale).astype(jnp.float8_e4m3fn)
+        return w_q, scale.astype(jnp.float32)
+
+    def _repl(x):
+        arrs = [jax.device_put(x, dev) for dev in jax.local_devices()]
+        return jax.make_array_from_single_device_arrays(x.shape, repl_sharding2, arrs)
+
+    w1s_q, w1s_sc = _quant_repl_pc(jax.device_get(w1_shared))
+    w3s_q, w3s_sc = _quant_repl_pc(jax.device_get(w3_shared))
+    w2s_q, w2s_sc = _quant_repl_pc(jax.device_get(w2_shared))
+    w1_shared, w1_shared_scale = _repl(np.asarray(w1s_q)), _repl(np.asarray(w1s_sc))
+    w3_shared, w3_shared_scale = _repl(np.asarray(w3s_q)), _repl(np.asarray(w3s_sc))
+    w2_shared, w2_shared_scale = _repl(np.asarray(w2s_q)), _repl(np.asarray(w2s_sc))
+    log("shared-expert fp8 quantization done")
+
 log("weights ready")
 
 # --- Sweep ---
@@ -1133,6 +1160,9 @@ for num_tokens in token_candidates:
                 w1_shared=w1_shared,
                 w2_shared=w2_shared,
                 w3_shared=w3_shared,
+                w1_shared_scale=w1_shared_scale,
+                w2_shared_scale=w2_shared_scale,
+                w3_shared_scale=w3_shared_scale,
                 disable_a2a=disable_a2a,
                 disable_a2a_scatter=disable_a2a_scatter,
                 disable_a2a_scatter_local_copy=disable_a2a_scatter_local_copy,
@@ -1278,6 +1308,9 @@ if check_correctness:
             w1_shared=w1_shared,
             w2_shared=w2_shared,
             w3_shared=w3_shared,
+            w1_shared_scale=w1_shared_scale,
+            w2_shared_scale=w2_shared_scale,
+            w3_shared_scale=w3_shared_scale,
             direct_scaled_dot=direct_scaled_dot,
             direct_scaled_dot_ffn1=direct_scaled_dot_ffn1_modes[0],
             direct_scaled_dot_ffn2=direct_scaled_dot_ffn2_modes[0],
@@ -1303,6 +1336,10 @@ if check_correctness:
             ref_kwargs["w1_shared"] = jax.device_get(w1_shared)
             ref_kwargs["w2_shared"] = jax.device_get(w2_shared)
             ref_kwargs["w3_shared"] = jax.device_get(w3_shared)
+            if w1_shared_scale is not None:
+                ref_kwargs["w1_shared_scale"] = jax.device_get(w1_shared_scale)
+                ref_kwargs["w2_shared_scale"] = jax.device_get(w2_shared_scale)
+                ref_kwargs["w3_shared_scale"] = jax.device_get(w3_shared_scale)
         ref = ref_moe(
             jax.device_get(tokens_c),
             jax.device_get(w1),
