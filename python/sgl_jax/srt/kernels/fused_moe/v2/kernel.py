@@ -2710,6 +2710,13 @@ def fused_ep_moe_v2(
     disable_output_store: bool = False,
     use_jax_allreduce_metadata: bool = False,
     enable_bt_scatter_overlap: bool = True,
+    # In-kernel shared-expert switch: pass fp8 w*_shared (+ w*_shared_scale) to
+    # run the shared expert INSIDE this kernel (SE-first, reuses routed VMEM,
+    # requires enable_act_quant). Leave them None to run the shared expert
+    # EXTERNALLY (a separate dense MLP). Both are ~equal speed (SE is MXU-bound
+    # dense FFN, ~85us @ 512 local tokens; in-kernel +81us); external keeps bf16
+    # precision, in-kernel is fp8. Default = external (None). disable_shared_expert
+    # also forces the external path even if weights are passed.
     w1_shared: jax.Array | None = None,
     w2_shared: jax.Array | None = None,
     w3_shared: jax.Array | None = None,
@@ -2759,7 +2766,7 @@ def fused_ep_moe_v2(
             )
         if w1_scale is None:
             raise ValueError("enable_act_quant requires fp8 weights (w1_scale not None).")
-    if w1_shared is not None:
+    if w1_shared is not None and not disable_shared_expert:
         if not enable_act_quant:
             raise ValueError(
                 "in-kernel shared expert requires enable_act_quant=True "
