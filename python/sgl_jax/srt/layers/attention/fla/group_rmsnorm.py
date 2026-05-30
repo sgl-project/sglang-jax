@@ -32,11 +32,12 @@ class GroupRMSNorm(nnx.Module):
             raise ValueError("hidden_size must be divisible by num_groups")
         if mesh is not None:
             tp_size = mesh.shape.get("tensor", 1)
-            if tp_size < num_groups:
+            if num_groups % tp_size != 0:
                 raise ValueError(
-                    "GroupRMSNorm requires tensor parallel size to be at least "
-                    f"num_groups to keep each RMS group intact, got tensor "
-                    f"parallel size={tp_size}, num_groups={num_groups}."
+                    "GroupRMSNorm requires the tensor parallel size to divide "
+                    "num_groups so every shard holds whole RMS groups (the RMS "
+                    "reduction is over group_size, which is never sharded), got "
+                    f"tensor parallel size={tp_size}, num_groups={num_groups}."
                 )
 
         self.hidden_size = hidden_size
