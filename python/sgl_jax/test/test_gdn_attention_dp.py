@@ -43,6 +43,37 @@ def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.nda
     return rng.standard_normal(shape).astype(np.float32) * scale
 
 
+def _stripe_conv_fixture(
+    arr: np.ndarray,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    tp: int,
+    axis: int,
+) -> np.ndarray:
+    # Mirrors qwen3_5.Qwen3_5MoeForConditionalGeneration._stripe_conv. The production
+    # loader rearranges the on-disk [Q|K|V] component-major conv1d weight into a
+    # rank-major [q_0|k_0|v_0|q_1|k_1|v_1|...] block layout so that contiguous
+    # P("tensor", None) sharding hands each rank the per-shard [q_d|k_d|v_d] slice
+    # the GDN backend's mixed_qkv reshape expects (gdn_backend.py:138-145). The DP
+    # fixture builds its weight + conv state on the host in [Q|K|V] layout (the
+    # form the reference recurrence consumes); on TP>1 we apply the same stripe
+    # before handing them to the device sharded buffer. Identity at tp<=1.
+    if tp <= 1:
+        return arr
+    key_dim = num_k_heads * head_k_dim
+    k_tp = (num_k_heads // tp) * head_k_dim
+    v_tp = (num_v_heads // tp) * head_v_dim
+    q_blk, k_blk, v_blk = np.split(arr, [key_dim, 2 * key_dim], axis=axis)
+    blocks = []
+    for r in range(tp):
+        blocks.append(np.take(q_blk, range(r * k_tp, (r + 1) * k_tp), axis=axis))
+        blocks.append(np.take(k_blk, range(r * k_tp, (r + 1) * k_tp), axis=axis))
+        blocks.append(np.take(v_blk, range(r * v_tp, (r + 1) * v_tp), axis=axis))
+    return np.concatenate(blocks, axis=axis)
+
+
 # Reference baselines duplicated from test_gdn_attention.py — keep in sync.
 
 
@@ -181,9 +212,14 @@ def ref_gdn_attention(
     d_v = layer.head_v_dim
 
     mixed_qkv = jnp.concatenate([q, k, v], axis=-1)
+    # On TP>1 the layer's on-device conv1d weight is rank-major stripe-rearranged;
+    # the reference operates host-side over the unsharded [Q|K|V] mixed_qkv, so it
+    # reads the unmodified [Q|K|V] weight stashed by the fixture. tp=1 path falls
+    # back to the layer weight (identity stripe — same array).
+    ref_weight = getattr(layer, "_ref_conv_weight_qkv", layer.conv1d.weight.value)
     mixed_qkv, new_conv_state = ref_fused_short_convolution(
         mixed_qkv,
-        layer.conv1d.weight.value,
+        ref_weight,
         initial_conv_state,
         cu_seqlens,
         forward_mode,
@@ -298,14 +334,28 @@ def create_test_data(
 
     # 3. Layer (RadixLinearAttention) with sharded random params.
     rng = np.random.default_rng(seed)
+    tp_size = int(mesh.shape.get("tensor", 1))
     conv_sharding = NamedSharding(mesh, P("tensor", None))
     head_sharding = NamedSharding(mesh, P("tensor"))
 
     def normal(shape, scale=0.1):
         return jnp.asarray(_scaled_randn(rng, shape, scale), dtype=dtype)
 
-    def conv_weight():
-        return jax.device_put(normal((conv_dim, conv_kernel_size), scale=1.0), conv_sharding)
+    # Build a single [conv_dim, K] random weight in component-major [Q|K|V] layout
+    # on the host; stripe-rearrange a copy for the device buffer when TP>1 so the
+    # sharded slice on each rank matches the backend's per-shard [q_d|k_d|v_d]
+    # mixed_qkv (see _stripe_conv_fixture docstring).
+    conv_qkv_host = np.asarray(normal((conv_dim, conv_kernel_size), scale=1.0))
+    conv_dev_host = _stripe_conv_fixture(
+        conv_qkv_host,
+        num_k_heads,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
+        tp_size,
+        axis=0,
+    )
+    conv_dev = jax.device_put(jnp.asarray(conv_dev_host, dtype=dtype), conv_sharding)
 
     layer = RadixLinearAttention(
         layer_id=layer_id,
@@ -315,7 +365,7 @@ def create_test_data(
         head_q_dim=head_k_dim,
         head_k_dim=head_k_dim,
         head_v_dim=head_v_dim,
-        conv1d=SimpleNamespace(weight=SimpleNamespace(value=conv_weight())),
+        conv1d=SimpleNamespace(weight=SimpleNamespace(value=conv_dev)),
         activation="silu",
         A_log=SimpleNamespace(
             value=jax.device_put(
@@ -327,6 +377,9 @@ def create_test_data(
         ),
         scale=head_k_dim**-0.5,
     )
+    # Stash the unmodified [Q|K|V] host weight for the reference path; it operates
+    # unsharded and cannot un-stripe the on-device buffer. Test-only attribute.
+    layer._ref_conv_weight_qkv = jnp.asarray(conv_qkv_host, dtype=dtype)
 
     # 4. Per-rank random data + initial state (host NumPy; resharded later).
     q_global = np.zeros((global_input_size, key_dim), dtype=np.float32)
@@ -380,9 +433,21 @@ def create_test_data(
                 and bool(has_initial_state_per_rank[dp_rank][i])
             )
             ssm_i_dev = _scaled_randn(rank_rng, (num_v_heads, head_k_dim, head_v_dim))
-            conv_i_dev = _scaled_randn(rank_rng, (pool.proj_size, conv_kernel_size - 1))
+            # Per-request conv state: build in [Q|K|V] layout for the reference,
+            # then stripe for the device pool buffer (TP>1).
+            conv_i_host = _scaled_randn(rank_rng, (pool.proj_size, conv_kernel_size - 1))
+            conv_i_striped = _stripe_conv_fixture(
+                conv_i_host,
+                num_k_heads,
+                num_v_heads,
+                head_k_dim,
+                head_v_dim,
+                tp_size,
+                axis=0,
+            )
             ssm_i_ref = ssm_i_dev if req_has_initial_state else np.zeros_like(ssm_i_dev)
-            conv_i_ref = conv_i_dev if req_has_initial_state else np.zeros_like(conv_i_dev)
+            conv_i_ref = conv_i_host if req_has_initial_state else np.zeros_like(conv_i_host)
+            conv_i_dev = conv_i_striped
 
             # Per-rank local slot index: 1..slots_per_rank.
             local_slot = i + 1
@@ -725,7 +790,21 @@ class TestGDNAttentionDP(CustomTestCase):
             )
 
         ref_ssm_per_rank = {r: s for r, (s, _) in ref_states.items()}
-        ref_conv_per_rank = {r: c for r, (_, c) in ref_states.items()}
+        # Reference produces final_conv in [Q|K|V] layout; the pool buffer holds
+        # it striped on TP>1. Stripe per-rank along the channel axis (axis=1 of
+        # [num_seqs, conv_dim, K-1]) before the per-rank pool comparison.
+        ref_conv_per_rank = {
+            r: _stripe_conv_fixture(
+                c,
+                self.NUM_K_HEADS,
+                self.NUM_V_HEADS,
+                self.HEAD_K_DIM,
+                self.HEAD_V_DIM,
+                tp_size,
+                axis=1,
+            )
+            for r, (_, c) in ref_states.items()
+        }
         assert_pool_state_per_rank(
             rec_buf,
             conv_buf_list[0],
@@ -793,14 +872,6 @@ class TestGDNAttentionDP(CustomTestCase):
             tp_size=1,
         )
 
-    @unittest.skip(
-        # dp=2, tp=2 mixes DP and TP — fused conv1d stripe assumption
-        # interacts with DP sharding in a way the current fixture doesn't
-        # mirror. Re-enable when the P2 weight loader lands and we can
-        # exercise the stripe-aware fixture across both axes.
-        "GDN mixed DP+TP requires the P2 stripe-aware weight loader; "
-        "tracked together with the pure-TP probe."
-    )
     def test_extend_dp2_tp2(self):
         self._run_test(
             "prefill",
@@ -939,15 +1010,6 @@ class TestGDNAttentionDP(CustomTestCase):
                 err_prefix=f"decode round {step}",
             )
 
-    @unittest.skip(
-        # Production weight loader stripe-rearranges the fused conv1d weight
-        # so each TP rank sees per-shard [Q_local | K_local | V_local]
-        # (plan §P1.4 lines 113-138). Fixture skips that rearrange — TP > 1
-        # with leading-chunk sharding silently mis-routes channels. Re-enable
-        # when stripe-aware fixture lands with the P2 weight loader.
-        "GDN test fixture does not stripe-rearrange conv1d weight; pure-TP "
-        "correctness covered when the P2 weight loader lands."
-    )
     def test_extend_dp1_tp4_pure_tp(self):
         """Pure-TP probe: dp=1, tp=4. Catches in_proj_qkvz / in_proj_ba /
         conv1d.weight slicing bugs that DP would mask. Asserts a single
