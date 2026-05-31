@@ -190,13 +190,14 @@ class EAGLEWorker(BaseSpecWorker):
                     dp_size=dp_size,
                     per_dp_bs_size=per_dp_bs,
                 )
+                num_steps = self.speculative_num_steps
+                topk_shape = (bs, num_steps, self.topk) if num_steps > 1 else (bs, self.topk)
                 spec_info = EagleDraftInput(
-                    # FIXME(pc) dtype should according to serverargs
                     topk_p=jnp.ones(
-                        (bs, self.topk),
+                        topk_shape,
                         dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32,
                     ),
-                    topk_index=jnp.ones((bs, self.topk), dtype=jnp.int32),
+                    topk_index=jnp.ones(topk_shape, dtype=jnp.int32),
                     hidden_states=jnp.ones(
                         (bs, self.draft_worker.model_config.hidden_size),
                         dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32,

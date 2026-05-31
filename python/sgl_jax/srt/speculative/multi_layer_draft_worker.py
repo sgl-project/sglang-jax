@@ -272,7 +272,17 @@ class MultiLayerDraftWorker(EagleDraftWorker):
     def draft_extend_for_decode(
         self, model_worker_batch: ModelWorkerBatch, batch_output: GenerationBatchResult
     ) -> None:
-        """Decode-extend across all MTP layers; see draft_extend_for_prefill."""
+        """Decode-extend across all MTP layers — fused single JIT."""
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            draft_extend_for_decode_fused,
+        )
+
+        return draft_extend_for_decode_fused(self, model_worker_batch, batch_output)
+
+    def _draft_extend_for_decode_original(
+        self, model_worker_batch: ModelWorkerBatch, batch_output: GenerationBatchResult
+    ) -> None:
+        """Original per-layer implementation (kept for reference/fallback)."""
         if batch_output.next_draft_input.verified_id.shape[0] <= 0:
             return
         target_hidden = batch_output.logits_output.hidden_states
@@ -295,6 +305,18 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         sel_pos = np.clip(accept_host - 1, 0, None).astype(np.int64)
         mwb.input_ids = np.asarray(jax.device_get(mwb.input_ids)).copy()
 
+        from sgl_jax.srt.speculative.draft_extend_capture import (
+            _call_count as _capture_call_id,
+        )
+        from sgl_jax.srt.speculative.draft_extend_capture import (
+            maybe_capture_decode_entry,
+            maybe_capture_golden_output,
+            maybe_capture_kv_after,
+        )
+
+        _cur_capture_id = _capture_call_id
+        maybe_capture_decode_entry(mwb, batch_output, accept_host, sel_pos, self._workers)
+
         layer0_hidden = None
         all_topk_p, all_topk_index = [], []
         for i, w in enumerate(self._workers):
@@ -313,6 +335,17 @@ class MultiLayerDraftWorker(EagleDraftWorker):
             if i < len(self._workers) - 1:
                 self._rotate_ids(mwb, all_topk_index[-1][:, 0], sel_pos)
 
+        maybe_capture_kv_after(
+            _cur_capture_id,
+            self._workers,
+            (
+                np.asarray(mwb.cache_loc)
+                if not isinstance(mwb.cache_loc, np.ndarray)
+                else mwb.cache_loc
+            ),
+            self.page_size,
+        )
+
         select_index = sel * (self.speculative_num_steps + 1) + accept_host[sel] - 1
         verified_id_arr = batch_output.next_draft_input.verified_id
         if hasattr(verified_id_arr, "copy_to_host_async"):
@@ -325,3 +358,6 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         batch_output.next_draft_input.verified_id = np.asarray(verified_id_arr)[select_index]
         batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
         batch_output.accept_lens = accept_host
+        maybe_capture_golden_output(
+            _cur_capture_id, batch_output, batch_output.allocate_lens, accept_host
+        )
