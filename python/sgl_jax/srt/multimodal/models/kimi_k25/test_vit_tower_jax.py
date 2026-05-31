@@ -380,10 +380,6 @@ def main():
     config.model_path = '/dsk/models/kimi-bf16/'
     config.model_class = Kimi_K25_VisionModel
 
-    model = Kimi_K25_VisionModel(  
-        config,
-    )  
-
     devices = jax.devices()  
     mesh = jax.sharding.Mesh(np.array(devices), axis_names=("tensor",))  
   

@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO)
   
 model_path = "/dsk/models/kimi-bf16/"  
   
-# 1. Build mesh â€” jax.devices() returns TPU cores on a TPU machine  
+# 1. Build mesh - jax.devices() returns TPU cores on a TPU machine  
 devices = jax.devices()  
 mesh = jax.sharding.Mesh(np.array(devices), axis_names=("tensor",))  
   
@@ -29,7 +29,7 @@ with jax.set_mesh(mesh):
 before = model.vision_tower.encoder.blocks[0].attn.qkv_proj.kernel.value.mean().item()  
 print(f"Before weight loading, blocks[0].attn.qkv_proj.kernel mean: {before}")
 
-# 5. Load weights — reads on CPU, shards to TPU  
+# 5. Load weights - reads on CPU, shards to TPU  
 model.load_weights(config)  
   
 # 6. Verify values changed  

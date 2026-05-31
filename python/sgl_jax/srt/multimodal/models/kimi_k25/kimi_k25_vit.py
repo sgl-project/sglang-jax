@@ -1,8 +1,6 @@
 import logging
 import math
-from collections.abc import Callable
-from functools import partial
-from typing import Literal, TypedDict
+
 
 import jax
 import jax.experimental.pallas as pl
@@ -152,6 +150,7 @@ class Rope2DPosEmbRepeated(nnx.Module):
         self.max_height = max_height
         self.max_width = max_width
         self.theta_base = theta_base
+        self.freqs_cis = self._precompute_freqs_cis()
 
     def _precompute_freqs_cis(self) -> jax.Array:
         N = self.max_height * self.max_width
@@ -183,7 +182,7 @@ class Rope2DPosEmbRepeated(nnx.Module):
         self,
         grid_thws: jax.Array,
     ) -> jax.Array:
-        freqs_cis = self._precompute_freqs_cis()
+        freqs_cis = self.freqs_cis
 
         shapes = grid_thws.tolist()
         assert all(
@@ -258,14 +257,23 @@ def align_to(x, a):
     return pl.cdiv(x, a) * a
 
 
+def apply_2d_rope(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
+    x_real = x[..., 0::2]
+    x_imag = x[..., 1::2]
+    x_rot_real = x_real * cos[:, None, :] - x_imag * sin[:, None, :]
+    x_rot_imag = x_real * sin[:, None, :] + x_imag * cos[:, None, :]
+    return jnp.stack([x_rot_real, x_rot_imag], axis=-1).reshape(x.shape)
+
+
 class KimiK25VisionAttention(nnx.Module):
     def __init__(
         self,
         config: KimiK25ModelVitConfig,
         dtype: jnp.dtype,
-        mesh: Mesh = None,
+        mesh: Mesh,
         rngs: nnx.Rngs = None,
     ):
+        assert mesh is not None, "KimiK25VisionAttention requires a sharding Mesh"
         self.mesh = mesh
         self.hidden_size = config.vt_hidden_size
         self.num_heads = config.vt_num_attention_heads
@@ -289,10 +297,12 @@ class KimiK25VisionAttention(nnx.Module):
         position_embeddings: jax.Array,
     ) -> jax.Array:
         sum_seq_len, D = hidden_states.shape
+        jax.debug.print("--- VisionAttention Input hidden_states mean: {}", hidden_states.mean())
 
         # Project to Q, K, V
         qkv = self.qkv_proj(hidden_states)
         q, k, v = jnp.split(qkv, 3, axis=-1)
+        jax.debug.print("--- VisionAttention Projected Q mean: {}, K mean: {}, V mean: {}", q.mean(), k.mean(), v.mean())
 
         # Reshape: [S, D] -> [S, N, H_D]
         q = q.reshape(sum_seq_len, self.num_heads, self.head_dim)
@@ -301,18 +311,9 @@ class KimiK25VisionAttention(nnx.Module):
 
         # Apply 2D RoPE
         cos_emb, sin_emb = position_embeddings[0], position_embeddings[1]
-
-        q_real = q[..., 0::2]
-        q_imag = q[..., 1::2]
-        q_rot_real = q_real * cos_emb[:, None, :] - q_imag * sin_emb[:, None, :]
-        q_rot_imag = q_real * sin_emb[:, None, :] + q_imag * cos_emb[:, None, :]
-        q = jnp.stack([q_rot_real, q_rot_imag], axis=-1).reshape(sum_seq_len, self.num_heads, self.head_dim)
-
-        k_real = k[..., 0::2]
-        k_imag = k[..., 1::2]
-        k_rot_real = k_real * cos_emb[:, None, :] - k_imag * sin_emb[:, None, :]
-        k_rot_imag = k_real * sin_emb[:, None, :] + k_imag * cos_emb[:, None, :]
-        k = jnp.stack([k_rot_real, k_rot_imag], axis=-1).reshape(sum_seq_len, self.num_heads, self.head_dim)
+        q = apply_2d_rope(q, cos_emb, sin_emb)
+        k = apply_2d_rope(k, cos_emb, sin_emb)
+        jax.debug.print("--- VisionAttention after RoPE Q mean: {}, K mean: {}", q.mean(), k.mean())
 
         # TPU Path: Segmented TPU Pallas FlashAttention
         
@@ -323,8 +324,6 @@ class KimiK25VisionAttention(nnx.Module):
         pad_k = k
         pad_v = v
         
-        seg_q = None
-        seg_kv = None
         segment_ids = None
         
         if sum_seq_len != align_seq_len:
@@ -345,58 +344,42 @@ class KimiK25VisionAttention(nnx.Module):
         pad_q = jnp.transpose(pad_q, (1, 0, 2))[None, ...]
         pad_k = jnp.transpose(pad_k, (1, 0, 2))[None, ...]
         pad_v = jnp.transpose(pad_v, (1, 0, 2))[None, ...]
+        jax.debug.print("--- VisionAttention pad_q shape: {}, pad_k shape: {}, pad_v shape: {}", pad_q.shape, pad_k.shape, pad_v.shape)
 
         # Execute TPU Pallas FlashAttention kernel
-        if self.mesh is not None:
-            def local_flash_attention(q, k, v, *seg_args):
-                local_seg_ids = None
-                if len(seg_args) == 2:
-                    local_seg_ids = SegmentIds(q=seg_args[0], kv=seg_args[1])
-                return flash_attention(
-                    q,
-                    k,
-                    v,
-                    segment_ids=local_seg_ids,
-                    causal=False,
-                    sm_scale=self.scale,
-                )
-
-            seg_q = segment_ids.q if segment_ids is not None else None
-            seg_kv = segment_ids.kv if segment_ids is not None else None
-
-            in_specs = (
-                jax.sharding.PartitionSpec(None, None, None, None),
-                jax.sharding.PartitionSpec(None, None, None, None),
-                jax.sharding.PartitionSpec(None, None, None, None),
-            )
-            args = (pad_q, pad_k, pad_v)
-            if seg_q is not None and seg_kv is not None:
-                in_specs = in_specs + (
-                    jax.sharding.PartitionSpec(None, None),
-                    jax.sharding.PartitionSpec(None, None),
-                )
-                args = args + (seg_q, seg_kv)
-
-            output = jax.shard_map(
-                local_flash_attention,
-                mesh=self.mesh,
-                in_specs=in_specs,
-                out_specs=jax.sharding.PartitionSpec(None, None, None, None),
-                check_vma=False,
-            )(*args)
-        else:
-            output = flash_attention(
-                pad_q,
-                pad_k,
-                pad_v,
+        def local_flash_attention(q, k, v, segment_ids):
+            return flash_attention(
+                q,
+                k,
+                v,
                 segment_ids=segment_ids,
                 causal=False,
                 sm_scale=self.scale,
             )
 
+        in_specs = (
+            jax.sharding.PartitionSpec(None, None, None, None),
+            jax.sharding.PartitionSpec(None, None, None, None),
+            jax.sharding.PartitionSpec(None, None, None, None),
+            SegmentIds(
+                q=jax.sharding.PartitionSpec(None, None),
+                kv=jax.sharding.PartitionSpec(None, None)
+            ) if segment_ids is not None else None
+        )
+
+        output = jax.shard_map(
+            local_flash_attention,
+            mesh=self.mesh,
+            in_specs=in_specs,
+            out_specs=jax.sharding.PartitionSpec(None, None, None, None),
+            check_vma=False,
+        )(pad_q, pad_k, pad_v, segment_ids)
+        jax.debug.print("--- VisionAttention output (before transpose/reshape) mean: {}", output.mean())
+
         # Reshape back: [B=1, H, S, H_D] -> [S, H, H_D] -> slice back to sum_seq_len -> [S, D]
         output = jnp.transpose(output[0], (1, 0, 2))
         output = output[:sum_seq_len, :, :].reshape(sum_seq_len, D)
+        jax.debug.print("--- VisionAttention output (final) mean: {}", output.mean())
 
         return output
 
@@ -451,22 +434,18 @@ class KimiK25VisionBlock(nnx.Module):
         norm_eps: float = 1e-6,
         rngs: nnx.Rngs = None,
     ):
-
-        self.attn = KimiK25VisionAttention(config, dtype, mesh, rngs) # TODO: Investigate the working of the Attention with RoPE
-
+        self.attn = KimiK25VisionAttention(config, dtype, mesh, rngs)
         self.mlp = KimiK25VisionMLP(config, dtype, mesh, rngs)
 
         _rngs = rngs or nnx.Rngs(0)
         self.pre_norm = nnx.LayerNorm(config.vt_hidden_size, param_dtype=dtype, rngs=_rngs)
-
-        self.proj = nnx.Linear( # TODO: Add activation function too
+        self.proj = nnx.Linear(
             config.vt_hidden_size,
             config.vt_hidden_size,
             use_bias=True,
             param_dtype=dtype,
             rngs=_rngs,
         )
-
         self.post_norm = nnx.LayerNorm(config.vt_hidden_size, param_dtype=dtype, rngs=_rngs)
 
     def __call__(
@@ -476,20 +455,21 @@ class KimiK25VisionBlock(nnx.Module):
         max_seqlen: int,
         rope_freqs_cis: jax.Array
     ):
+        # 1. Attention Stage (Norm -> Attn -> WO projection -> Residual)
         residual = hidden_states
         hidden_states = self.pre_norm(hidden_states)
-
         hidden_states = self.attn(
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=rope_freqs_cis,
         )
-
+        hidden_states = self.proj(hidden_states) # WO projection
         hidden_states = residual + hidden_states
 
+        # 2. MLP Stage (Norm -> MLP -> Residual)
         residual = hidden_states
         hidden_states = self.post_norm(hidden_states)
-        hidden_states = self.proj(hidden_states)
+        hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states
@@ -600,6 +580,7 @@ class VisionTower(nnx.Module):
         )
 
         return hidden_states
+
 
 class Kimi_K25_MultiModalProjector(nnx.Module):
 
