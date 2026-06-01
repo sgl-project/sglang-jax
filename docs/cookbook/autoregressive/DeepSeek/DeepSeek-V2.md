@@ -10,8 +10,6 @@ title: "DeepSeek V2"
 
 [**deepseek-ai/DeepSeek-V2-Lite**](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite) is the single-host "Lite" tier of DeepSeek's second-generation MoE decoder built on **MLA** (Multi-head Latent Attention) — 15.7B total / 2.4B activated; minimal MoE that fits a single TPU v6e-4 host.
 
-For the 671B V3 flagship see [`DeepSeek-V3.md`](DeepSeek-V3.md). For the reasoning-tuned R1 see [`DeepSeek-R1.md`](DeepSeek-R1.md).
-
 **Architectural notes**:
 
 - **MLA** — uses the FlashAttention Pallas MLA kernel by default; no extra flag needed.
@@ -58,13 +56,12 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
   --host 0.0.0.0 --port 30000
 ```
 
-> **`--page-size` mandatory for MLA**: DeepSeek's MLA backend asserts `page_size > 1` (the MLA v2 kernel packs KV slots and infers effective page size from `cache_kv.shape[1] * kv_packing`). The default `--page-size 1` will hit `AssertionError: MLA attention backend does not support page_size=1` at startup. Use 64 (or any power-of-2 ≥ 2). Same constraint applies to DeepSeek-R1 / V3.
+> **`--page-size` mandatory for MLA**: DeepSeek's MLA backend asserts `page_size > 1` (the MLA v2 kernel packs KV slots and infers effective page size from `cache_kv.shape[1] * kv_packing`). The default `--page-size 1` will hit `AssertionError: MLA attention backend does not support page_size=1` at startup. Use 64 (or any power-of-2 ≥ 2).
 
 ### 2.4 Configuration Tips
 
 **MoE Backend:**
 - `--moe-backend epmoe` for `--ep-size ≤ 8` (V2-Lite).
-- `--moe-backend fused` for V3 / R1 on v6e-64 (validated separately).
 
 **MLA:**
 - DeepSeek's MLA runs on the default `--attention-backend fa` (FlashAttention Pallas) — no override needed.
@@ -147,7 +144,7 @@ Recommended additional datasets: MMLU, GPQA Diamond, HumanEval.
 
 > **Layout B — single-workload latency baseline.** Measured on V2-Lite v6e-4 with `bench_serving` random 512→128, max-concurrency 8, sglang-jax 0.1.0.
 
-**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the DeepSeek-V2 checkpoint, remove the vLLM half).
+**Benchmark Command** — `bench_serving` driver with `--dataset-name random --random-input-len 512 --random-output-len 128 --num-prompts 100 --max-concurrency 8 --backend sgl-jax --model deepseek-ai/DeepSeek-V2-Lite --tokenizer deepseek-ai/DeepSeek-V2-Lite --host 127.0.0.1 --port 30000`.
 
 **Test Results** — V2-Lite (TPU v6e-4):
 
@@ -178,7 +175,5 @@ Mean TPOT (ms):                          7.41
 ## Additional Resources
 
 - [DeepSeek-V2-Lite model card](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite)
-- [`DeepSeek-V3.md`](DeepSeek-V3.md) — 671B V3 flagship.
-- [`DeepSeek-R1.md`](DeepSeek-R1.md) — reasoning-tuned V3 derivative.
 - [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

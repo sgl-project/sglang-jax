@@ -158,7 +158,7 @@ print(resp.choices[0].text)
 
 > **Why not `/v1/chat/completions`?** Grok-2 has no chat template — sending `messages` either fails (no template registered) or wraps the prompt in a community-grafted template the model wasn't trained on. The community-template path looks superficially OK on single-turn sanity prompts but silently degrades accuracy on chat-format eval datasets: the model doesn't emit EOS at the end of a short answer and continues in-context with self-generated follow-ups (see §5 troubleshooting; per design §6.F base models skip §4 Accuracy entirely).
 
-> Grok-2 has no hybrid reasoning or native tool-calling format. For those workloads use a model with `--reasoning-parser` / `--tool-call-parser` support (e.g., [Qwen3](../Qwen/Qwen3.md), [MiMo-V2.5-Pro](../Xiaomi/MiMo-V2.5-Pro.md)).
+> Grok-2 has no hybrid reasoning or native tool-calling format. For those workloads, see the **Parser key reference** in [`../index.md`](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
 
 ## 4. Benchmark
 
@@ -168,7 +168,7 @@ print(resp.choices[0].text)
 
 ### 4.1 Speed — single workload (low-concurrency latency baseline)
 
-> **Layout F — single-workload sweep (one data point).** Standard chat (ISL=1000, OSL=1000), `max_concurrency=16`, 80 prompts, `seed=42`. Same workload as DeepSeek-V3 / MiMo-V2.5-Pro / Ling-2.6-1T §4 for cross-model comparison.
+> **Layout F — single-workload sweep (one data point).** Standard chat (ISL=1000, OSL=1000), `max_concurrency=16`, 80 prompts, `seed=42`.
 
 **Test Environment**
 
@@ -235,7 +235,7 @@ Max ITL (ms):                            1270.39
 ==================================================
 ```
 
-> Cross-model context (same workload): MiMo-V2.5-Pro 926 tok/s (TPOT 29 ms), DeepSeek-V3 491 (59 ms), Ling-2.6-1T 254 (104 ms), **Grok-2 140 (186 ms)**. Grok-2 is the slowest in this cohort — the `--moe-backend epmoe` fallback (because `fused` crashes on this mesh, see §5) inherently underutilizes 64 chips when only 8 experts exist (vs Ling-2.6's 256 experts saturating EP).
+> Grok-2 throughput on this v6e-64 mesh is bottlenecked by small-EP MoE underutilization: with only 8 experts on 64 chips, the `--moe-backend epmoe` fallback (forced because `fused` crashes on this mesh, see §5) leaves most chips idle per token. This is a known limitation of the current FusedEPMoE design (assumes large-EP); Grok-2's 8-expert layout sits below that assumption.
 
 ## 5. Troubleshooting
 

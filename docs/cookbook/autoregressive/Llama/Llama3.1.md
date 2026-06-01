@@ -10,7 +10,7 @@ title: "Llama 3.1"
 
 [**meta-llama/Llama-3.1-8B-Instruct**](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) is Meta's 8B dense decoder from the Llama 3.1 release — comfortable single-host fit on TPU v6e-4 (BF16 ~16 GB).
 
-For the 70B size (multi-host required) see [`Llama3.3-70B.md`](Llama3.3-70B.md). For Llama 4 see the upstream sgl-cookbook (`Llama/Llama4.md`).
+For Llama 4 see the upstream sgl-cookbook (`Llama/Llama4.md`).
 
 **Recommended Generation Parameters**: `temperature=0.6`, `top_p=0.9`, `max_tokens=1024` (Llama 3 Instruct defaults).
 
@@ -65,7 +65,6 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
 
 **Tensor Parallelism:**
 - `--tp-size 4` matches v6e-4's 4 chips (v6e is 1:1 chip↔device). For v6e-8 use `--tp-size 8`. Llama 3.1 8B's GQA `num_kv_heads=8` constrains tensor axis to be a divisor of 8 — values 1/2/4/8 are safe.
-- For multi-host scaling (e.g., Llama 3.3 70B) see [`Llama3.3-70B.md`](Llama3.3-70B.md).
 
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
@@ -95,7 +94,7 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-> Llama 3 Instruct is non-reasoning and has no native tool-call format. For those workloads choose a model with `--reasoning-parser` / `--tool-call-parser` support (e.g., [Qwen3](../Qwen/Qwen3.md), [MiMo-V2.5-Pro](../Xiaomi/MiMo-V2.5-Pro.md)).
+> Llama 3 Instruct is non-reasoning and has no native tool-call format. For those workloads, see the **Parser key reference** in [`../index.md`](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
 
 ## 4. Benchmark
 
@@ -192,6 +191,5 @@ Mean ITL (ms):                           9.87
 ## Additional Resources
 
 - [Llama 3.1 8B-Instruct model card](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)
-- [`Llama3.3-70B.md`](Llama3.3-70B.md) — 70B multi-host sibling.
 - [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

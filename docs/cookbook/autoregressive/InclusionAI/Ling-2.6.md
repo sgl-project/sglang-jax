@@ -15,8 +15,6 @@ title: "Ling 2.6"
 - **Linear / delta attention** in place of standard softmax attention — most of the long-context benefit shows up here.
 - **Hybrid recurrent state pool** — budgeted against the KV cache via `--recurrent-state-memory-ratio` (default `0.9`).
 
-For Moonshot AI's separate linear-attention model see [`Kimi-Linear.md`](../Moonshotai/Kimi-Linear.md).
-
 **Recommended Generation Parameters**: see the Ling-2.6 model card for authoritative defaults. As a starter: `temperature=0.7`, `top_p=0.95`, `max_tokens=2048+` (give room if you enable reasoning mode).
 
 **License**: see the [Ling-2.6 model card](https://huggingface.co/inclusionAI/Ling-2.6-1T) for the authoritative license terms.
@@ -88,10 +86,10 @@ For temporary v6e experiments, advanced users can adapt [`../../deployment/skypi
 
 **FP8 Quantization (compressed-tensors):**
 - Ling-2.6 ships compressed-tensors FP8 with `strategy="channel"` (per-output channel weight scales, dynamic per-token activation). The runtime auto-detects this — no `--quantization` flag needed. `--dtype bfloat16` controls runtime compute dtype, not weight residency.
-- This is **not** DeepSeek-V3 block-wise FP8 — the loader path is different (`weight_block_size=None`). Builds before `d9c98c80` lack the channel-wise QKV split path and crash at weight load.
+- This uses compressed-tensors channel-wise FP8, distinct from block-wise FP8 quantization (`weight_block_size=None` in HF config). Builds before `d9c98c80` lack the channel-wise QKV split path and crash at weight load.
 
 **Reasoning Mode:**
-- If the Ling-2.6 checkpoint emits `<think>...</think>` blocks (verify per model card; some reasoning-tuned variants do, base instruct variants do not), add `--reasoning-parser deepseek-r1` to the launch command — that's the generic `<think>` parser, since no `ling-2-6` or `bailing` parser key is registered. The streaming Python client from [`Qwen3.md` §3.2](../Qwen/Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) applies directly once the parser is set.
+- If the Ling-2.6 checkpoint emits `<think>...</think>` blocks (verify per model card; some reasoning-tuned variants do, base instruct variants do not), add `--reasoning-parser deepseek-r1` to the launch command — that's the generic `<think>` parser, since no `ling-2-6` or `bailing` parser key is registered. See §3.2 for the streaming Python client that splits `reasoning_content` from `content`.
 
 **Context Length:**
 - Default `--context-length` is the model's native 256K (`262144`); pin lower to your workload's longest prompt + output if you want more KV/recurrent slots.
@@ -284,7 +282,7 @@ Max ITL (ms):                            1293.91
 ==================================================
 ```
 
-> At the same workload (ISL=1000, OSL=1000, c=16), DeepSeek-V3 hits 491 tok/s and MiMo-V2.5-Pro hits 926 tok/s on the same v6e-64 hardware. Ling-2.6-1T's lower throughput reflects its much larger total parameter count (1T vs 671B / 309B) plus the GLA recurrent state pool overhead — decode is bound by the linear attention chunk kernel.
+> Ling-2.6-1T throughput on this v6e-64 mesh is bound by the GLA recurrent state pool overhead and the linear-attention chunk kernel at decode — the trillion-parameter total weight (vs Ling-2.6's hybrid linear / full attention layers) leaves narrow per-chip activation headroom on v6e (32 GB/chip).
 
 ## 5. Troubleshooting
 
@@ -303,6 +301,5 @@ Max ITL (ms):                            1293.91
 ## Additional Resources
 
 - [Ling-2.6-1T model card](https://huggingface.co/inclusionAI/Ling-2.6-1T)
-- [`Kimi-Linear.md`](../Moonshotai/Kimi-Linear.md) — Moonshot AI's separate linear-attention model.
 - [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

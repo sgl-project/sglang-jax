@@ -10,7 +10,7 @@ title: "Llama 3.3 70B"
 
 [**meta-llama/Llama-3.3-70B-Instruct**](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct) is Meta's 70B dense decoder from the Llama 3.3 release — multi-host serving required at BF16.
 
-For the 8B size (single-host) see [`Llama3.1.md`](Llama3.1.md). For Llama 4 see the upstream sgl-cookbook (`Llama/Llama4.md`).
+For Llama 4 see the upstream sgl-cookbook (`Llama/Llama4.md`).
 
 **Key Features**:
 
@@ -113,7 +113,7 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-> Llama 3 Instruct is non-reasoning and has no native tool-call format. For those workloads choose a model with `--reasoning-parser` / `--tool-call-parser` support (e.g., [Qwen3](../Qwen/Qwen3.md), [MiMo-V2.5-Pro](../Xiaomi/MiMo-V2.5-Pro.md)).
+> Llama 3 Instruct is non-reasoning and has no native tool-call format. For those workloads, see the **Parser key reference** in [`../index.md`](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
 
 ## 4. Benchmark
 
@@ -211,6 +211,5 @@ Mean ITL (ms):                           16.30
 ## Additional Resources
 
 - [Llama 3.3 70B model card](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct)
-- [`Llama3.1.md`](Llama3.1.md) — 8B single-host sibling.
 - [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

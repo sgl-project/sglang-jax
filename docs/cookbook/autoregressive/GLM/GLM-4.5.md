@@ -73,7 +73,7 @@ For temporary v6e experiments, advanced users can adapt [`../../deployment/skypi
 **Reasoning + Tool Calling (GLM-4.5 parsers):**
 - Add `--reasoning-parser glm45` to expose `reasoning_content` separately from `content`.
 - Add `--tool-call-parser glm45` to parse the GLM-4.5 tool-call format into OpenAI-compatible `tool_calls`.
-- The streaming Python client pattern from [`Qwen3.md` §3.2](../Qwen/Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) / [§3.3](../Qwen/Qwen3.md#33-tool-calling) applies directly — only the parser names change.
+- See §3.2 / §3.3 for the streaming Python client + Handling Tool Call Results pattern.
 
 **Throughput vs Latency:**
 - `--page-size 128` reduces KV page-table overhead at MoE scale.

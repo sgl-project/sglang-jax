@@ -72,7 +72,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
   --host 0.0.0.0 --port 30000
 ```
 
-Do not reuse the Wan 2.1 command for Wan 2.2. Wan 2.2's current built-in path uses CPU text encoding and a different `--tp-size`.
+Do not reuse commands from other Wan releases for Wan 2.2 — Wan 2.2's current built-in path uses CPU text encoding and its own `--tp-size` value.
 
 VAE tiling is enabled by default in the multimodal server (`vae_tiling=True` in `MultimodalServerArgs`) and there is no `--no-vae-tiling` flag to disable it today.
 
@@ -110,7 +110,7 @@ VAE tiling is enabled by default in the multimodal server (`vae_tiling=True` in 
 **Memory management:**
 
 - `--mem-fraction-static 0.88` is the starter value for Wan 2.2 A14B on v6e-4.
-- Wan 2.2 A14B's dual transformer doubles the DiT weight footprint versus a single-transformer 14B Wan 2.1 path. If startup OOMs, lower `--mem-fraction-static` first; increasing `--tp-size` alone is not the right fix.
+- Wan 2.2 A14B's dual transformer loads both high-noise and low-noise transformers at startup, so plan capacity from the full resident footprint. If startup OOMs, lower `--mem-fraction-static` first; increasing `--tp-size` alone is not the right fix.
 
 **Compilation cache hygiene:**
 
@@ -241,5 +241,5 @@ This is a single-shot smoke datapoint, not a throughput sweep. Throughput sweeps
 
 - [Wan-AI model collection](https://huggingface.co/Wan-AI)
 - [Wan2.2-T2V-A14B-Diffusers model card](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers)
-- [`Wan2.1.md`](Wan2.1.md) - companion Wan 2.1 recipe.
-- [`../../autoregressive/Qwen/Qwen2.5-VL.md`](../../autoregressive/Qwen/Qwen2.5-VL.md) - companion vision-language autoregressive recipe.
+- [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
+- [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

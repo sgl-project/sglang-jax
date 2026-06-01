@@ -10,8 +10,6 @@ title: "DeepSeek V3"
 
 [**deepseek-ai/DeepSeek-V3**](https://huggingface.co/deepseek-ai/DeepSeek-V3) is DeepSeek's 671B / 37B-activated MoE flagship — built on **MLA** (Multi-head Latent Attention) with 256 routed experts and 1 shared expert per MoE layer. The official checkpoint uses FP8 block-wise weights (`block_size=128`); `--dtype bfloat16` controls runtime compute/output dtype, not BF16 weight residency. Multi-host serving is required.
 
-For the V2 generation (V2 / V2-Lite) see [`DeepSeek-V2.md`](DeepSeek-V2.md). For the reasoning-tuned R1 derivative see [`DeepSeek-R1.md`](DeepSeek-R1.md).
-
 **Architectural notes**:
 
 - **MLA** — uses the FlashAttention Pallas MLA kernel by default; no extra flag needed.
@@ -134,7 +132,7 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-> DeepSeek V3 is non-reasoning and has no native tool-call format. For reasoning use [`DeepSeek-R1.md`](DeepSeek-R1.md); for tool-call workloads choose a model with `--tool-call-parser` support (e.g., [Qwen3](../Qwen/Qwen3.md), [MiMo-V2.5-Pro](../Xiaomi/MiMo-V2.5-Pro.md)).
+> DeepSeek V3 is non-reasoning and has no native tool-call format. For those workloads, see the **Parser key reference** in [`../index.md`](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
 
 ## 4. Benchmark
 
@@ -256,7 +254,5 @@ Max ITL (ms):                            2517.66
 
 - [DeepSeek-V3 model card](https://huggingface.co/deepseek-ai/DeepSeek-V3)
 - [SGLang DeepSeek V3 guide](https://docs.sglang.io/docs/basic_usage/deepseek_v3)
-- [`DeepSeek-V2.md`](DeepSeek-V2.md) — V2 / V2-Lite generation.
-- [`DeepSeek-R1.md`](DeepSeek-R1.md) — reasoning-tuned V3 derivative.
 - [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

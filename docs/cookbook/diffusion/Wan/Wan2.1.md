@@ -67,7 +67,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
   --host 0.0.0.0 --port 30000
 ```
 
-Swap to a different Wan release at your own risk; Wan 2.2 has a different built-in stage layout and `--tp-size`.
+Swap to a different Wan release at your own risk; other Wan releases have different built-in stage layouts and `--tp-size`.
 
 VAE tiling is enabled by default in the multimodal server (`vae_tiling=True` in `MultimodalServerArgs`) and there is no `--no-vae-tiling` flag to disable it today.
 
@@ -235,5 +235,5 @@ This is a single-shot smoke datapoint, not a throughput sweep. Throughput sweeps
 
 - [Wan-AI model collection](https://huggingface.co/Wan-AI)
 - [Wan2.1-T2V-14B-Diffusers model card](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers)
-- [`Wan2.2.md`](Wan2.2.md) - companion Wan 2.2 recipe.
-- [`../../autoregressive/Qwen/Qwen2.5-VL.md`](../../autoregressive/Qwen/Qwen2.5-VL.md) - companion vision-language autoregressive recipe.
+- [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
+- [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

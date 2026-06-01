@@ -10,8 +10,6 @@ title: "Kimi-Linear"
 
 [**moonshotai/Kimi-Linear-48B-A3B-Instruct**](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct) is Moonshot AI's linear-attention decoder built on **Kimi Delta Attention** with a hybrid recurrent state pool — a 48B MoE with 3B activated parameters, instruction-tuned. It is the only checkpoint currently released in the Kimi-Linear series.
 
-For other linear-attention models in the cookbook see [`Ling-2.6.md`](../InclusionAI/Ling-2.6.md) (InclusionAI's trillion-scale linear-attention MoE).
-
 **Key Features**:
 
 - **Sparse MoE, 48B total / 3B activated**: Only 3B parameters fire per token — MoE economy with single-expert-class latency. Instruction-tuned chat model.
@@ -161,7 +159,7 @@ for chunk in stream:
 print()
 ```
 
-> Kimi-Linear-Instruct ships with a chat template but no native reasoning or tool-call format. For reasoning / tool-call workloads, use a model with `--reasoning-parser` / `--tool-call-parser` support — see [`Qwen3.md` §3.2 / §3.3](../Qwen/Qwen3.md) or [`MiMo-V2.5-Pro.md` §3.2 / §3.3](../Xiaomi/MiMo-V2.5-Pro.md).
+> Kimi-Linear-Instruct ships with a chat template but no native reasoning or tool-call format. For reasoning / tool-call workloads, pick a model with `--reasoning-parser` / `--tool-call-parser` support — see the **Parser key reference** table in [`../index.md`](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
 
 ## 4. Benchmark
 
@@ -209,7 +207,7 @@ Within the ±2.3 pp sampling-noise band at limit=200; v6e-32 doubling TP does no
 
 > **Layout B — single-workload latency baseline.** Measured on Kimi-Linear-48B-A3B-Instruct v6e-16 with `bench_serving` random 1024→1024, max-concurrency 16, sglang-jax 0.1.0.
 
-**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `moonshotai/Kimi-Linear-48B-A3B-Instruct`, remove the vLLM half).
+**Benchmark Command** — `bench_serving` driver: `python3 -m sgl_jax.bench_serving --backend sgl-jax --model moonshotai/Kimi-Linear-48B-A3B-Instruct --tokenizer moonshotai/Kimi-Linear-48B-A3B-Instruct --dataset-name random --random-input-len 1024 --random-output-len 1024 --num-prompts 100 --max-concurrency 16 --host 127.0.0.1 --port 30000`.
 
 **Test Results** — Kimi-Linear-48B-A3B-Instruct, Layout B (`bench_serving` random 1024→1024, N=100, max-concurrency 16):
 
@@ -234,6 +232,5 @@ v6e-32 delivers ~5% throughput / 13% TTFT improvement over v6e-16. Scaling is su
 ## Additional Resources
 
 - [Kimi-Linear model card](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct)
-- [`Ling-2.6.md`](../InclusionAI/Ling-2.6.md) — InclusionAI's trillion-scale linear-attention MoE.
 - [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

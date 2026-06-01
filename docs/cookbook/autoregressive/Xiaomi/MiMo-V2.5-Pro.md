@@ -119,7 +119,7 @@ For the GKE Indexed Job + headless Service manifest pattern that wraps both laun
 
 **MoE Backend Selection:**
 - `--moe-backend fused` is the right pick for this recipe (EP ≥ 16) — fused Pallas kernel wins on large EP shapes.
-- For smaller single-host MoE setups (EP ≤ 8), `epmoe` actually wins; see the measured tradeoff in [`MiMo-V2-Flash.md` §4.2](MiMo-V2-Flash.md#42-speed--single-workload-configuration-sweep).
+- For smaller single-host MoE setups (EP ≤ 8), `epmoe` actually wins.
 
 **Speculative Decoding (NEXTN / MTP):**
 - MiMo-V2.5-Pro ships an MTP draft head; enable speculative decoding via:
@@ -496,8 +496,6 @@ Max ITL (ms):                            1290.76
 ==================================================
 ```
 
-> Same workload as DeepSeek-V3 §4.2: MiMo-V2.5-Pro total throughput is **926.22 tok/s** vs DeepSeek-V3 **491.26 tok/s** (1.89× faster). Mean TTFT 467 ms vs 1019 ms; mean TPOT 28.7 ms vs 59.3 ms. The gap matches the active-parameter ratio (MiMo 15B active vs V3 37B active) plus MiMo's SWA decode-bandwidth savings.
-
 ## 5. Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -513,7 +511,6 @@ Max ITL (ms):                            1290.76
 ## Additional Resources
 
 - [MiMo-V2.5-Pro Model Card](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro)
-- [`MiMo-V2-Flash.md`](MiMo-V2-Flash.md) — smaller sibling, same architectural family, has measured MoE backend comparison.
 - [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md)
 - [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) — primary multi-host launcher.

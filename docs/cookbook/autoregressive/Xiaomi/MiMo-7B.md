@@ -10,14 +10,12 @@ title: "MiMo-7B"
 
 [**XiaomiMiMo/MiMo-7B-RL**](https://huggingface.co/XiaomiMiMo/MiMo-7B-RL) is Xiaomi's RL-tuned 7B-parameter dense decoder trained with reasoning-oriented objectives — built on the Qwen 2 base architecture. Fits comfortably on a single TPU v6e-4 host.
 
-For the larger Xiaomi MoE models, see [`MiMo-V2-Flash.md`](MiMo-V2-Flash.md) and [`MiMo-V2.5-Pro.md`](MiMo-V2.5-Pro.md) — these are different architectures (256-expert MoE with hybrid attention), not just larger MiMo-7B variants.
-
 **Key Features**:
 
 - **Compact 7B dense decoder**: BF16 weights ~14 GB — fits comfortably on a single TPU v6e-4 host. Lowest-cost reasoning-capable model in the cookbook.
 - **RL-tuned for reasoning**: Reinforcement-learning post-training maximizes chain-of-thought quality on math benchmarks; default choice for reasoning workloads. GSM8K **0.920** (§4.1).
 - **Hybrid Reasoning**: thinking-on (default) and thinking-off via `chat_template_kwargs.enable_thinking` per-request — use `--reasoning-parser mimo` to expose `reasoning_content` (§3.2).
-- **OpenAI-compatible tool calling**: `--tool-call-parser mimo` exposes `tool_calls` on the response — same parser key as MiMo-V2.5-Pro; see §3.3 for streaming + multi-turn examples.
+- **OpenAI-compatible tool calling**: `--tool-call-parser mimo` exposes `tool_calls` on the response — see §3.3 for streaming + multi-turn examples.
 
 **Recommended Generation Parameters**: `temperature=0.7`, `top_p=0.95`, `max_tokens=2048+` (give room for reasoning).
 
@@ -65,7 +63,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
 - `--mem-fraction-static 0.88` is the TPU default. Raise to `0.9` for dedicated serving / higher concurrency.
 
 **Tool Calling:**
-- MiMo-7B-RL shares the `mimo` tool-call parser format with MiMo-V2.5-Pro. Add `--tool-call-parser mimo` when using the OpenAI tools API. See [`MiMo-V2.5-Pro.md` §3.3](MiMo-V2.5-Pro.md#33-tool-calling) for the request/response pattern.
+- MiMo-7B-RL uses the `mimo` tool-call parser format. Add `--tool-call-parser mimo` when using the OpenAI tools API. See [§3.3](#33-tool-calling) for the request/response pattern.
 
 **Reasoning Parser:**
 - MiMo-7B-RL uses `--reasoning-parser mimo` (alias of the `qwen3` reasoning parser — same `<think>...</think>` format + `enable_thinking` switch). Append to the §2.3 launch command to expose `reasoning_content` separated from `content`.
@@ -400,6 +398,5 @@ Max ITL (ms):                            38.99
 ## Additional Resources
 
 - [MiMo-7B-RL model card](https://huggingface.co/XiaomiMiMo/MiMo-7B-RL)
-- [`MiMo-V2-Flash.md`](MiMo-V2-Flash.md) and [`MiMo-V2.5-Pro.md`](MiMo-V2.5-Pro.md) — larger Xiaomi MoE models (different architecture).
 - [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

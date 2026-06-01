@@ -100,7 +100,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
 
 - **GKE Indexed Job + headless Service** — adapt [`../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md). Differences from the template: `<JOB>=mimo-v2-flash`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `<N>=4`, `<MODEL_PATH>=XiaomiMiMo/MiMo-V2-Flash`, `<HTTP_PORT>=30000`, plus the launch flags above. `${NODE_RANK}` comes from `${JOB_COMPLETION_INDEX}`.
 
-For an end-to-end GKE manifest with the same template applied, see [`MiMo-V2.5-Pro.md` §2.3 Multi-host](MiMo-V2.5-Pro.md#23-launch) — substitute the model path and TP/DP/EP from above. For temporary v6e experiments, advanced users can adapt [`../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags.
+For temporary v6e experiments, advanced users can adapt [`../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags.
 
 ### 2.4 Configuration Tips
 
@@ -481,7 +481,6 @@ The fused MoE tuned-config table covers the EP=8 shapes (server logs report `Usi
 ## Additional Resources
 
 - [MiMo-V2-Flash Model Card](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash)
-- [`MiMo-V2.5-Pro.md`](MiMo-V2.5-Pro.md) — larger sibling model, same architectural family.
 - [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md)
 - [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

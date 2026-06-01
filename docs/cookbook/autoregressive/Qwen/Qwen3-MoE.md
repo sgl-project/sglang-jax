@@ -85,7 +85,7 @@ For temporary v6e experiments, advanced users can adapt [`../../deployment/skypi
 
 **Hybrid Reasoning / Tool Calling:**
 - Qwen3-MoE shares the hybrid reasoning (`--reasoning-parser qwen3`) and tool-call (`--tool-call-parser qwen25`) format with dense Qwen3. Append both flags to the §2.3 launch command to expose `reasoning_content` and OpenAI-compatible `tool_calls` on the response.
-- Full streaming Python examples (thinking-on + thinking-off, streaming tool-call accumulator, multi-turn Handling Tool Call Results) live in [`Qwen3.md` §3.2](Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) and [§3.3](Qwen3.md#33-tool-calling) — substitute the Qwen3-30B-A3B model path and the §2.3 launch flags above.
+- See §3.2 / §3.3 for the full streaming Python client (thinking-on / thinking-off, streaming tool-call accumulator, multi-turn Handling Tool Call Results) with the Qwen3-30B-A3B model path inlined.
 
 **Throughput vs Latency:**
 - `--page-size 128` reduces KV page-table overhead at MoE scale. Default `1` is much slower at high concurrency.

@@ -8,7 +8,7 @@ title: "Qwen3"
 
 ## 1. Model Introduction
 
-[**Qwen/Qwen3-8B**](https://huggingface.co/Qwen/Qwen3-8B) (8B) and [**Qwen/Qwen3-32B**](https://huggingface.co/Qwen/Qwen3-32B) (32B) are Alibaba's dense decoder LLMs from the Qwen3 series — strong general-purpose models with hybrid reasoning support, deployable on a single TPU v6e-4 host. SGL-JAX serves both with tensor parallelism. For the Qwen3 MoE variants (30B-A3B / 235B-A22B) see [`Qwen3-MoE.md`](Qwen3-MoE.md).
+[**Qwen/Qwen3-8B**](https://huggingface.co/Qwen/Qwen3-8B) (8B) and [**Qwen/Qwen3-32B**](https://huggingface.co/Qwen/Qwen3-32B) (32B) are Alibaba's dense decoder LLMs from the Qwen3 series — strong general-purpose models with hybrid reasoning support, deployable on a single TPU v6e-4 host. SGL-JAX serves both with tensor parallelism.
 
 **Key Features**:
 
@@ -469,7 +469,5 @@ Lower than the 1977 tok/s c=64 table cell because c=16 leaves the batch under-fi
 
 - [Qwen Model Cards](https://huggingface.co/Qwen)
 - [`../../performance/qwen3_benchmark.md`](../../../performance/qwen3_benchmark.md) — full benchmark report with charts.
-- [`Qwen.md`](Qwen.md) — first-generation Qwen-7B-Chat recipe.
-- [`Qwen3-MoE.md`](Qwen3-MoE.md) — Qwen3 MoE variants (30B-A3B / 235B-A22B).
 - [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
