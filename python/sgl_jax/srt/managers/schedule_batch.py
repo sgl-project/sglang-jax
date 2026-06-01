@@ -240,6 +240,11 @@ class Req:
         # 3: last token
         self.surr_offset = None  # Surrounding offset to defeat the cleanup algorithm
         self.read_offset = None
+        # Incremental-detokenize cache: holds origin_input_ids_unpadded[surr_offset:]
+        # + output_ids_through_stop, extended in place each step so we never
+        # re-concatenate the full prompt (keeps it O(new tokens), not O(prompt)).
+        self.surr_and_decode_ids = None
+        self.cur_decode_ids_len = 0
         self.decoded_text = ""
 
         # Prefix info
@@ -437,16 +442,35 @@ class Req:
         self.kv_overallocated_freed = True
         return self.kv_committed_len, self.kv_allocated_len
 
+    @property
+    def output_ids_through_stop(self) -> list[int]:
+        # Truncate at the stop position so detokenize never emits ids past the
+        # finish point (e.g. the extra delayed token under the overlap schedule).
+        if self.finished_len is not None:
+            return self.output_ids[: self.finished_len]
+        return self.output_ids
+
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
         first_iter = self.surr_offset is None or self.read_offset is None
 
+        output_ids = self.output_ids_through_stop
+
         if first_iter:
             self.read_offset = len(self.origin_input_ids_unpadded)
             self.surr_offset = max(self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0)
+            # Build the surrounding+decode buffer once; subsequent calls only
+            # append the newly generated tail in place, so we never rebuild the
+            # full (prompt + output) list — the high-concurrency hotspot.
+            self.surr_and_decode_ids = (
+                self.origin_input_ids_unpadded[self.surr_offset :] + output_ids
+            )
+            self.cur_decode_ids_len = len(output_ids)
+        else:
+            self.surr_and_decode_ids.extend(output_ids[self.cur_decode_ids_len :])
+            self.cur_decode_ids_len = len(output_ids)
 
-        all_ids = self.origin_input_ids_unpadded + self.output_ids
-        return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
+        return self.surr_and_decode_ids, self.read_offset - self.surr_offset
 
     def check_finished(self, new_accepted_len: int = 1):
         if self.finished():
