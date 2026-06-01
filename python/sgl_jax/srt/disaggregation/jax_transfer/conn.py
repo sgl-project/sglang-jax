@@ -167,12 +167,19 @@ class JaxTransferKVManager(CommonKVManager):
                 )
             pool = self._host_pool
             buffer_ids: list[int] = []
-            for name, arr in payload.items():
-                sub = f"{uuid}:{name}"
-                staged: StagedData = pool.copy_from_device(arr)
-                self._wrapper.register_pull(sub, staged.array)
-                sub_uuids.append(sub)
-                buffer_ids.append(staged.buffer_id)
+            try:
+                for name, arr in payload.items():
+                    sub = f"{uuid}:{name}"
+                    staged: StagedData = pool.copy_from_device(arr)
+                    self._wrapper.register_pull(sub, staged.array)
+                    sub_uuids.append(sub)
+                    buffer_ids.append(staged.buffer_id)
+            except Exception:
+                for sub_uuid in sub_uuids:
+                    self._wrapper.release(sub_uuid)
+                for bid in buffer_ids:
+                    pool.put_buffer(bid)
+                raise
 
             def _on_done() -> None:
                 for _bid in buffer_ids:
@@ -183,10 +190,15 @@ class JaxTransferKVManager(CommonKVManager):
             )
 
         # path B: direct from HBM
-        for name, arr in payload.items():
-            sub = f"{uuid}:{name}"
-            self._wrapper.register_pull(sub, arr)
-            sub_uuids.append(sub)
+        try:
+            for name, arr in payload.items():
+                sub = f"{uuid}:{name}"
+                self._wrapper.register_pull(sub, arr)
+                sub_uuids.append(sub)
+        except Exception:
+            for sub_uuid in sub_uuids:
+                self._wrapper.release(sub_uuid)
+            raise
         return TransferStatus(
             uuid=uuid, sub_uuids=tuple(sub_uuids), on_done=lambda: None
         )
@@ -533,7 +545,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                             reason="pull_init", role="decode"
                         ).inc()
                     self._mgr._prune_receiver(self._req_id)
-                    raise
+                    return self.state
             return self.state
 
         if state == KVPoll.TRANSFERRING:
@@ -577,7 +589,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                             reason="ack_send", role="decode"
                         ).inc()
                     self._mgr._prune_receiver(self._req_id)
-                    raise
+                    return self.state
             self._mgr._prune_receiver(self._req_id)
         return self.state
 
