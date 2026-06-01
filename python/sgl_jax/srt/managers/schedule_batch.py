@@ -1937,7 +1937,16 @@ class ScheduleBatch:
             total_cache_loc_size = cache_loc_paddings[bs_index]
 
         per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
-        cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
+        # View into the persistent buffer; intentionally NOT re-zeroed per step.
+        # Safe because:
+        #  - padding slots are never read on-device: attention kernels (RPA v3 /
+        #    MLA v2 / native) bound page reads by cu_kv_lens / seq_lens, and every
+        #    real-request page slot lands on a written position.
+        #  - every buffer value is a valid in-bounds KV slot index (init is
+        #    np.zeros + only valid slots are ever written), so even SWA's
+        #    host-side mapping[cache_loc] lookup (flashattention_backend) can't go
+        #    OOB. This REQUIRES the init buffer to be np.zeros, not np.empty.
+        cache_loc_cpu = self.req_to_token_pool.cache_loc_host_buf[:total_cache_loc_size]
 
         offset_bs = 0
         req_to_token = self.req_to_token_pool.req_to_token

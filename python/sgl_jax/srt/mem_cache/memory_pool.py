@@ -85,6 +85,17 @@ class ReqToTokenPool:
         # Use simple list to manage free slots
         self.free_slots = list(range(size))
 
+        # Persistent host scratch buffer reused by
+        # ScheduleBatch._merge_cache_loc to avoid a fresh np.zeros every step.
+        # Allocated once at startup via init_cache_loc_host_buffer (its size is
+        # only known after the precompile cache_loc buckets are computed).
+        self.cache_loc_host_buf = None
+
+    def init_cache_loc_host_buffer(self, size: int):
+        """Pre-allocate the persistent cache_loc host buffer (called once at
+        init by tp_worker with the largest cache_loc precompile bucket)."""
+        self.cache_loc_host_buf = np.zeros(size, dtype=np.int32)
+
     def tree_flatten(self):
         children = (self.req_to_token,)
         aux_data = {
@@ -105,6 +116,10 @@ class ReqToTokenPool:
         obj.free_slots = aux_data["free_slots"]
 
         obj.req_to_token = children[0]
+        # Host scratch buffer is transient host memory, not model state, so it
+        # is not carried through the pytree. The live serving pool keeps its
+        # init-time buffer; _merge_cache_loc never runs on a reconstructed pool.
+        obj.cache_loc_host_buf = None
 
         return obj
 
