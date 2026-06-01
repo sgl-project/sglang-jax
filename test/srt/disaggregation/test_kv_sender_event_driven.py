@@ -103,19 +103,19 @@ def test_path_b_sender_transitions_only_after_ack(notifiers):
 
     sender = mgr.create_sender("req-PATH-B")
     sender.init(kv_indices=None)
-    payload = jnp.arange(4, dtype=jnp.float32)
+    payload = {"kv": jnp.arange(4, dtype=jnp.float32)}
     sender.attach_payload(payload, use_d2h_staging=False)
     sender.send()
 
     assert sender.poll() == KVPoll.TRANSFERRING
-    assert "req-PATH-B" in wrapper._pending
+    assert "req-PATH-B:kv" in wrapper._pending
     # No ack yet — sender stays TRANSFERRING.
     time.sleep(0.05)
     assert sender.poll() == KVPoll.TRANSFERRING
 
     d_notifier.send_done(b"req-PATH-B", "127.0.0.1", p_notifier.port)
     assert _wait_until(lambda: sender.poll() == KVPoll.SUCCESS)
-    assert "req-PATH-B" not in wrapper._pending
+    assert "req-PATH-B:kv" not in wrapper._pending
     assert wrapper.release.call_count == 1
     # Sender is pruned from the manager after SUCCESS.
     assert "req-PATH-B" not in mgr._senders
@@ -135,7 +135,7 @@ def test_path_a_sender_releases_host_buffer_on_ack(notifiers):
     sender = mgr.create_sender("req-PATH-A")
     sender.init(kv_indices=None)
     device_kv = jnp.ones((4, 1, 1, 4), dtype=jnp.float32)
-    sender.attach_payload(device_kv, use_d2h_staging=True)
+    sender.attach_payload({"kv": device_kv}, use_d2h_staging=True)
     sender.send()
 
     assert sender.poll() == KVPoll.TRANSFERRING
@@ -157,7 +157,7 @@ def test_path_a_requires_host_pool(notifiers):
     sender = mgr.create_sender("req-no-pool")
     sender.init(kv_indices=None)
     payload = jnp.ones((4, 1, 1, 4), dtype=jnp.float32)
-    sender.attach_payload(payload, use_d2h_staging=True)
+    sender.attach_payload({"kv": payload}, use_d2h_staging=True)
     with pytest.raises(RuntimeError, match="host_pool"):
         sender.send()
 
@@ -169,7 +169,7 @@ def test_sender_fail_cancels_pending_callback(notifiers):
 
     sender = mgr.create_sender("req-fail")
     sender.init(kv_indices=None)
-    sender.attach_payload(jnp.zeros(4, dtype=jnp.float32), use_d2h_staging=False)
+    sender.attach_payload({"kv": jnp.zeros(4, dtype=jnp.float32)}, use_d2h_staging=False)
     sender.send()
     assert sender.poll() == KVPoll.TRANSFERRING
     assert p_notifier.pending_count() == 1
@@ -200,7 +200,7 @@ def test_attach_payload_rejects_double_attach(notifiers):
 
     sender = mgr.create_sender("req-double")
     sender.init(kv_indices=None)
-    payload = jnp.zeros(4, dtype=jnp.float32)
+    payload = {"kv": jnp.zeros(4, dtype=jnp.float32)}
     sender.attach_payload(payload, use_d2h_staging=False)
     with pytest.raises(RuntimeError, match="already attached"):
         sender.attach_payload(payload, use_d2h_staging=False)
@@ -247,7 +247,7 @@ def test_send_ack_race_safe(notifiers):
 
     sender = mgr.create_sender("req-race")
     sender.init(kv_indices=None)
-    sender.attach_payload(jnp.zeros(4, dtype=jnp.float32), use_d2h_staging=False)
+    sender.attach_payload({"kv": jnp.zeros(4, dtype=jnp.float32)}, use_d2h_staging=False)
 
     # Run ``send`` on a background thread so the main thread can fire
     # the ack while ``send`` is blocked inside ``producer_handoff``.
@@ -296,7 +296,7 @@ def test_fail_owns_cleanup_when_callback_still_registered(notifiers):
     sender = mgr.create_sender("req-fail-owns-cleanup")
     sender.init(kv_indices=None)
     device_kv = jnp.ones((4, 1, 1, 4), dtype=jnp.float32)
-    sender.attach_payload(device_kv, use_d2h_staging=True)
+    sender.attach_payload({"kv": device_kv}, use_d2h_staging=True)
     sender.send()
     in_use_initial = pool.total_size() - pool.available_size()
     assert in_use_initial == 1
@@ -324,7 +324,7 @@ def test_fail_after_listener_popped_skips_cleanup(notifiers):
     sender = mgr.create_sender("req-ack-owns-cleanup")
     sender.init(kv_indices=None)
     device_kv = jnp.ones((4, 1, 1, 4), dtype=jnp.float32)
-    sender.attach_payload(device_kv, use_d2h_staging=True)
+    sender.attach_payload({"kv": device_kv}, use_d2h_staging=True)
     sender.send()
 
     # Listener thread pops the callback (simulated by manual pop —
@@ -359,14 +359,14 @@ def test_late_ack_from_old_transfer_id_does_not_complete_reused_req(notifiers):
 
     sender1 = mgr.create_sender("req-reuse")
     sender1.init(kv_indices=None, transfer_id="req-reuse#old")
-    sender1.attach_payload(jnp.arange(4, dtype=jnp.float32), use_d2h_staging=False)
+    sender1.attach_payload({"kv": jnp.arange(4, dtype=jnp.float32)}, use_d2h_staging=False)
     sender1.send()
     sender1.fail(reason="test")
 
     sender2 = mgr.create_sender("req-reuse")
     sender2.init(kv_indices=None, transfer_id="req-reuse#new")
     sender2.attach_payload(
-        jnp.arange(4, dtype=jnp.float32) + 100,
+        {"kv": jnp.arange(4, dtype=jnp.float32) + 100},
         use_d2h_staging=False,
     )
     sender2.send()
@@ -376,12 +376,12 @@ def test_late_ack_from_old_transfer_id_does_not_complete_reused_req(notifiers):
     d_notifier.send_done(b"req-reuse#old", "127.0.0.1", p_notifier.port)
     time.sleep(0.05)
     assert sender2.poll() == KVPoll.TRANSFERRING
-    assert "req-reuse#new" in wrapper._pending
+    assert "req-reuse#new:kv" in wrapper._pending
 
     # The matching ack still completes the current transfer.
     d_notifier.send_done(b"req-reuse#new", "127.0.0.1", p_notifier.port)
     assert _wait_until(lambda: sender2.poll() == KVPoll.SUCCESS)
-    assert "req-reuse#new" not in wrapper._pending
+    assert "req-reuse#new:kv" not in wrapper._pending
 
 
 def test_late_ack_after_success_is_classified_as_retired(notifiers, caplog):
@@ -391,7 +391,7 @@ def test_late_ack_after_success_is_classified_as_retired(notifiers, caplog):
 
     sender = mgr.create_sender("req-late-success")
     sender.init(kv_indices=None)
-    sender.attach_payload(jnp.arange(4, dtype=jnp.float32), use_d2h_staging=False)
+    sender.attach_payload({"kv": jnp.arange(4, dtype=jnp.float32)}, use_d2h_staging=False)
     sender.send()
 
     d_notifier.send_done(b"req-late-success", "127.0.0.1", p_notifier.port)
@@ -422,7 +422,7 @@ def test_late_ack_after_fail_is_classified_as_retired(notifiers, caplog):
 
     sender = mgr.create_sender("req-late-fail")
     sender.init(kv_indices=None)
-    sender.attach_payload(jnp.arange(4, dtype=jnp.float32), use_d2h_staging=False)
+    sender.attach_payload({"kv": jnp.arange(4, dtype=jnp.float32)}, use_d2h_staging=False)
     sender.send()
     sender.fail(reason="test")
 
@@ -451,7 +451,7 @@ def test_new_sender_attempt_clears_old_terminal_record(notifiers):
 
     sender1 = mgr.create_sender("req-retry")
     sender1.init(kv_indices=None)
-    sender1.attach_payload(jnp.arange(4, dtype=jnp.float32), use_d2h_staging=False)
+    sender1.attach_payload({"kv": jnp.arange(4, dtype=jnp.float32)}, use_d2h_staging=False)
     sender1.send()
     d_notifier.send_done(b"req-retry", "127.0.0.1", p_notifier.port)
     assert _wait_until(lambda: sender1.poll() == KVPoll.SUCCESS)
@@ -469,7 +469,7 @@ def test_sender_abort_failure_exception_and_clear(notifiers):
 
     sender = mgr.create_sender("req-abort")
     sender.init(kv_indices=None)
-    sender.attach_payload(jnp.arange(4, dtype=jnp.float32), use_d2h_staging=False)
+    sender.attach_payload({"kv": jnp.arange(4, dtype=jnp.float32)}, use_d2h_staging=False)
     sender.send()
     sender.abort()
 
@@ -485,3 +485,83 @@ def test_sender_abort_failure_exception_and_clear(notifiers):
     sender.clear()
     assert mgr.get_terminal_record("req-abort", role="prefill") is None
     sender.clear()
+
+
+def test_multi_entry_payload_registers_all_sub_uuids(notifiers):
+    p_notifier, d_notifier = notifiers
+    wrapper = _mock_wrapper()
+    mgr = JaxTransferKVManager(wrapper, p_notifier)
+
+    sender = mgr.create_sender("req-multi")
+    sender.init(kv_indices=None)
+    sender.attach_payload(
+        {
+            "kv": jnp.zeros(4, dtype=jnp.float32),
+            "temporal": jnp.ones(8, dtype=jnp.float32),
+        },
+        use_d2h_staging=False,
+    )
+    sender.send()
+
+    assert sender.poll() == KVPoll.TRANSFERRING
+    assert "req-multi:kv" in wrapper._pending
+    assert "req-multi:temporal" in wrapper._pending
+    assert wrapper.register_pull.call_count == 2
+
+    d_notifier.send_done(b"req-multi", "127.0.0.1", p_notifier.port)
+    assert _wait_until(lambda: sender.poll() == KVPoll.SUCCESS)
+    assert "req-multi:kv" not in wrapper._pending
+    assert "req-multi:temporal" not in wrapper._pending
+    assert wrapper.release.call_count == 2
+
+
+def test_multi_entry_fail_releases_all_sub_uuids(notifiers):
+    p_notifier, _ = notifiers
+    wrapper = _mock_wrapper()
+    mgr = JaxTransferKVManager(wrapper, p_notifier)
+
+    sender = mgr.create_sender("req-multi-fail")
+    sender.init(kv_indices=None)
+    sender.attach_payload(
+        {
+            "kv": jnp.zeros(4, dtype=jnp.float32),
+            "conv": jnp.ones(2, dtype=jnp.float32),
+            "temporal": jnp.ones(8, dtype=jnp.float32),
+        },
+        use_d2h_staging=False,
+    )
+    sender.send()
+
+    assert sender.poll() == KVPoll.TRANSFERRING
+    assert wrapper.register_pull.call_count == 3
+
+    sender.fail()
+    assert sender.poll() == KVPoll.FAILED
+    assert wrapper.release.call_count == 3
+    assert len(wrapper._pending) == 0
+
+
+def test_empty_payload_rejected(notifiers):
+    p_notifier, _ = notifiers
+    wrapper = _mock_wrapper()
+    mgr = JaxTransferKVManager(wrapper, p_notifier)
+
+    sender = mgr.create_sender("req-empty")
+    sender.init(kv_indices=None)
+    with pytest.raises(ValueError, match="non-empty"):
+        sender.attach_payload({}, use_d2h_staging=False)
+
+
+def test_entry_name_with_colon_rejected(notifiers):
+    p_notifier, _ = notifiers
+    wrapper = _mock_wrapper()
+    mgr = JaxTransferKVManager(wrapper, p_notifier)
+
+    sender = mgr.create_sender("req-colon")
+    sender.init(kv_indices=None)
+    sender.attach_payload(
+        {"bad:name": jnp.zeros(4, dtype=jnp.float32)},
+        use_d2h_staging=False,
+    )
+    with pytest.raises(ValueError, match="must not contain ':'"):
+        sender.send()
