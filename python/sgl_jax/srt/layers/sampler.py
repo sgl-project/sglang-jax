@@ -93,7 +93,7 @@ class Sampler(nnx.Module):
             (
                 next_token_top_logprobs_val,
                 next_token_top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, sampling_metadata.top_logprobs_nums)
+            ) = get_top_logprobs(logprobs, sampling_metadata.top_logprobs_nums, self.mesh)
 
         # Set token_ids_logprobs if needed.
         # Device side returns the full logprobs[B, vocab]; host slices
@@ -217,9 +217,13 @@ class Sampler(nnx.Module):
         return batch_next_token_ids, logprobs, new_logits_output
 
 
-def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int]):
+def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int], mesh: Mesh = None):
     # Return device-side dense `[B, max_k]`. Per-req trimming to k_i is
     # done on host in tp_worker after device_get.
+    # Replicate the vocab (tensor) axis first so the `[B, max_k]` output isn't
+    # left tensor-sharded on max_k, which fails when max_k < tp.
+    if mesh is not None:
+        logprobs = jax.sharding.reshard(logprobs, NamedSharding(mesh, P("data", None)))
     max_k = max(top_logprobs_nums)
     values, indices = jax.lax.top_k(logprobs, max_k)
     return values, indices

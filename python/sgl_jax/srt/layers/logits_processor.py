@@ -444,12 +444,14 @@ class LogitsProcessor(nnx.Module):
                 input_logprobs, logits_metadata
             )
 
-            # Get the logprob of top-k tokens
+            # Get the logprob of top-k tokens. Shared impl lives in sampler;
+            # local import avoids a top-level cycle (sampler imports this module).
             if logits_metadata.extend_return_top_logprob:
-                (
-                    input_top_logprobs_val,
-                    input_top_logprobs_idx,
-                ) = self.get_top_logprobs(input_logprobs, logits_metadata)
+                from sgl_jax.srt.layers.sampler import get_top_logprobs
+
+                input_top_logprobs_val, input_top_logprobs_idx = get_top_logprobs(
+                    input_logprobs, logits_metadata.top_logprobs_nums, self.mesh
+                )
             else:
                 input_top_logprobs_val = input_top_logprobs_idx = None
 
@@ -475,16 +477,6 @@ class LogitsProcessor(nnx.Module):
                 input_token_ids_logprobs_val=input_token_ids_logprobs_val,
                 input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
             )
-
-    @staticmethod
-    def get_top_logprobs(all_logprobs: jax.Array, logits_metadata: LogitsMetadata):
-        # Return device-side dense `[total_pruned_tokens, max_k]` tensors.
-        # XLA can't stack ragged per-req lists; per-req slicing is done on
-        # host in tp_worker after device_get, using
-        # `extend_logprob_pruned_lens_cpu` and `top_logprobs_nums`.
-        max_k = max(logits_metadata.top_logprobs_nums)
-        values, indices = jax.lax.top_k(all_logprobs, max_k)
-        return values, indices
 
     def compute_temp_top_p_normalized_logprobs(
         self, last_logits: jax.Array, logits_metadata: LogitsMetadata
