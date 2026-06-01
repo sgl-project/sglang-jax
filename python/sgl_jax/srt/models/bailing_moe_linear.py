@@ -466,6 +466,10 @@ class BailingMoELinearDecoderLayer(nnx.Module):
                 num_shared_experts=num_shared_experts if use_inkernel_se else 0,
                 moe_shared_expert_intermediate_size=moe_shared_expert_intermediate_size,
                 quantization_config=getattr(config, "quantization_config", None),
+                # Opt in to in-kernel activation quantization (fp8 token, Mode 1,
+                # the -19%/-8% lever). Default on for fused_v2; auto-no-ops on bf16
+                # checkpoints (guarded by fp8-weight presence in FusedEPMoEV2).
+                enable_act_quant=getattr(config, "moe_fused_act_quant", True),
             )
         elif self.moe_backend == MoEBackend.FUSED:
             self.mlp = FusedEPMoE(
