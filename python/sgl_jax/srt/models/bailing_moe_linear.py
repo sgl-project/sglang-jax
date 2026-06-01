@@ -1050,7 +1050,15 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
         # HF shared-expert weights to the FusedEPMoEV2 `w*_shared` params. Other
         # backends keep the external DeepseekV3MLP mapping.
         num_shared = getattr(self.config, "num_shared_experts", 0)
-        use_fused_shared = moe_backend == "fused_v2" and num_shared > 0
+        # Must mirror use_inkernel_se in the layer ctor: only map SE weights to the
+        # in-kernel w*_shared params when the shared expert is actually folded into
+        # the kernel. With --no-moe-fused-shared-experts the SE is external
+        # (DeepseekV3MLP), so fall through to the external mapping below.
+        use_fused_shared = (
+            moe_backend == "fused_v2"
+            and num_shared > 0
+            and getattr(self.config, "moe_fused_shared_experts", True)
+        )
         moe_mappings = create_moe_weights_mapping(
             prefix=prefix,
             target_prefix=target,
