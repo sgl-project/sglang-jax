@@ -25,6 +25,33 @@ from jax.sharding import PartitionSpec as P
 logger = logging.getLogger(__name__)
 
 
+def _device_rotate_input_ids(input_ids, ext_lens, sel_pos, new_tokens):
+    """Device-side per-req rotate for topk=1, exact mirror of the host
+    ``MultiLayerDraftWorker._rotate_ids``:
+
+      seg[:-1] = seg[1:]      # left-shift, KEEP last column (= prev last token)
+      seg[sel_pos] = new_token
+      padding reqs (ext_lens == 0) are left untouched
+
+    input_ids is the flat (bs * tokens_per_req,) buffer; every req occupies a
+    fixed ``tokens_per_req`` segment (real reqs have extend_seq_lens ==
+    tokens_per_req, padding reqs have 0). The last column is the captured-logit
+    position, so it must be copy-last (NOT jnp.roll, which wraps the first token
+    into the last column and diverges on partial accept).
+    """
+    bs = ext_lens.shape[0]
+    tokens_per_req = input_ids.shape[0] // bs
+    ids_2d = input_ids.reshape(bs, tokens_per_req)
+    shifted_2d = jnp.concatenate([ids_2d[:, 1:], ids_2d[:, -1:]], axis=1)
+    shifted_2d = shifted_2d.at[jnp.arange(bs), sel_pos].set(
+        new_tokens,
+        out_sharding=jax.typeof(shifted_2d).sharding,
+    )
+    pad_mask = (ext_lens == 0)[:, None]
+    shifted_2d = jnp.where(pad_mask, ids_2d, shifted_2d)
+    return shifted_2d.reshape(-1)
+
+
 def _build_fused_draft_extend_jit(num_layers: int, topk: int):
     """Build the fused JIT. Called once, result cached on draft_worker."""
     assert topk == 1, "Fused draft extend only supports topk=1"
@@ -86,22 +113,11 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
             all_topk_p.append(topk_p)
             all_topk_index.append(topk_idx)
 
-            # Device-side rotate for topk=1:
-            # 1. Left-shift each req's token segment by 1
-            # 2. Write new token at sel_pos within each req
+            # Device-side rotate for topk=1 (shared with offline equivalence
+            # test; exact mirror of host _rotate_ids).
             if i < num_layers - 1:
                 ext_lens = all_forward_batches[0].extend_seq_lens
-                bs = ext_lens.shape[0]
-                tokens_per_req = input_ids.shape[0] // bs
-                # Reshape to (bs, tokens_per_req), roll each row left by 1
-                ids_2d = input_ids.reshape(bs, tokens_per_req)
-                shifted_2d = jnp.roll(ids_2d, -1, axis=1)
-                # Write new token at sel_pos within each req
-                shifted_2d = shifted_2d.at[jnp.arange(bs), sel_pos].set(
-                    topk_idx[:, 0],
-                    out_sharding=jax.typeof(shifted_2d).sharding,
-                )
-                input_ids = shifted_2d.reshape(-1)
+                input_ids = _device_rotate_input_ids(input_ids, ext_lens, sel_pos, topk_idx[:, 0])
 
         return (
             layer0_hidden,

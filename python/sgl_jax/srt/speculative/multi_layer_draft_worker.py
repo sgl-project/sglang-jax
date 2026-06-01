@@ -141,11 +141,11 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         hidden_states = model_worker_batch.spec_info_padded.hidden_states
         bs = model_worker_batch.seq_lens.shape[0]
         step_min_1 = self.speculative_num_steps - 1
-        score_list = jnp.empty((bs, 1 + step_min_1 * self.topk, self.topk))
-        token_list = jnp.empty(
+        score_list = jnp.zeros((bs, 1 + step_min_1 * self.topk, self.topk))
+        token_list = jnp.zeros(
             (bs, self.topk + step_min_1 * self.topk * self.topk), dtype=jnp.int32
         )
-        parents_list = jnp.empty((bs, self.topk + 1 + step_min_1 * self.topk))
+        parents_list = jnp.zeros((bs, self.topk + 1 + step_min_1 * self.topk))
         scores = None
         for i in range(self.speculative_num_steps):
             _, hidden_states, scores, tree_info = select_top_k_tokens(
