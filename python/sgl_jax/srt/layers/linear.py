@@ -99,13 +99,28 @@ class LinearBase(nnx.Module):
             self.mesh,
             P("data", *([None] * (x.ndim - 2)), self.kernel_axes[-1]),
         )
+
+        preferred_dtype = self.params_dtype
+        try:
+            # Check if running on TPU v7x (Ironwood)
+            devs = jax.devices()
+            if len(devs) > 0 and devs[0].platform == "tpu":
+                device_kind = getattr(devs[0], "device_kind", "")
+                if "7x" in device_kind or device_kind == "TPU7x":
+                    preferred_dtype = jnp.float32
+        except Exception:
+            pass
+
         out = lax.dot_general(
             x,
             self.weight.value,
             (((x.ndim - 1,), (0,)), ((), ())),
-            preferred_element_type=self.params_dtype,
+            preferred_element_type=preferred_dtype,
             out_sharding=target,
         )
+        if preferred_dtype != self.params_dtype:
+            out = out.astype(self.params_dtype)
+
         if self.skip_bias_add:
             return out, self.bias
         if self.bias is not None:
