@@ -20,7 +20,11 @@ logger = logging.getLogger(__name__)
 
 # Key (without device_name):
 #   (tokens_dtype, weight_dtype, num_tokens, num_experts, top_k,
-#    hidden_size, intermediate_size, ep_size, use_shared_expert, use_grouped_topk)
+#    hidden_size, intermediate_size, ep_size, use_shared_expert, use_grouped_topk,
+#    enable_act_quant)
+# enable_act_quant is the last field (Mode 1 fp8-token vs Mode 2 bf16-token want
+# different configs, esp. for shared-expert prefill). Lookup falls back to the
+# legacy 10-field key (no enable_act_quant) for pre-existing entries.
 #
 # Value: (bt, bf, btc, bse, bts)
 # fmt: off
@@ -42,12 +46,24 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'float8_e4m3fn', 512, 384, 8, 6144, 2048, 8, False, False): (64, 1024, 32, 256, 32),
         # Ling 2.6-1T: E=256, H=8192, I=2048, top_k=8, fp8 e4m3 per-channel, ep=32
         # Tuned 2026-05-27
-        ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 8192, 2048, 32, False, False): (8, 256, 8, 256, 8),
-        ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 8192, 2048, 32, False, False): (8, 256, 8, 256, 8),
-        ('bfloat16', 'float8_e4m3fn', 256, 256, 8, 8192, 2048, 32, False, False): (8, 256, 16, 256, 16),
-        ('bfloat16', 'float8_e4m3fn', 512, 256, 8, 8192, 2048, 32, False, False): (16, 1024, 32, 256, 32),
-        ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 8192, 2048, 32, False, False): (128, 512, 160, 256, 160),
-        ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 8192, 2048, 32, False, False): (128, 512, 80, 256, 160),
+        ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 8192, 2048, 32, False, True): (8, 256, 8, 256, 8),
+        ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 8192, 2048, 32, False, True): (8, 256, 8, 256, 8),
+        ('bfloat16', 'float8_e4m3fn', 256, 256, 8, 8192, 2048, 32, False, True): (8, 256, 16, 256, 16),
+        ('bfloat16', 'float8_e4m3fn', 512, 256, 8, 8192, 2048, 32, False, True): (16, 1024, 32, 256, 32),
+        ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 8192, 2048, 32, False, True): (128, 512, 160, 256, 160),
+        ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 8192, 2048, 32, False, True): (128, 512, 80, 256, 160),
+        # Ling 2.6-1T with in-kernel shared expert, act_quant ON (Mode 1: fp8 token
+        # x fp8 weight). 11-field key (last = enable_act_quant); use_grouped_topk=True
+        # because Ling routes with n_group=8. Tuned 2026-05-31. SE-on vs no-SE: same
+        # routed shape, bse maxed (per-block SE weight-DMA is the dominant SE cost).
+        # act-OFF (W8A16, bf16 token) is a different VMEM regime, not tuned here ->
+        # falls back to the legacy key / DEFAULT.
+        ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 8192, 2048, 32, True, True, True): (8, 256, 8, 128, 8),
+        ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 8192, 2048, 32, True, True, True): (8, 512, 16, 128, 16),
+        ('bfloat16', 'float8_e4m3fn', 256, 256, 8, 8192, 2048, 32, True, True, True): (8, 256, 16, 128, 16),
+        ('bfloat16', 'float8_e4m3fn', 512, 256, 8, 8192, 2048, 32, True, True, True): (16, 1024, 32, 1024, 32),
+        ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 8192, 2048, 32, True, True, True): (128, 512, 80, 512, 160),
+        ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 8192, 2048, 32, True, True, True): (128, 512, 80, 512, 160),
     },
     "*": {},
 }
@@ -73,6 +89,7 @@ def get_simplified_key(
     ep_size: int,
     use_shared_expert: bool,
     use_grouped_topk: bool,
+    enable_act_quant: bool = False,
 ) -> tuple:
     if ep_size <= 0:
         raise ValueError(f"Expected {ep_size=} to be > 0.")
@@ -94,6 +111,7 @@ def get_simplified_key(
         ep_size,
         bool(use_shared_expert),
         bool(use_grouped_topk),
+        bool(enable_act_quant),
     )
 
 
@@ -109,6 +127,7 @@ def get_tuned_fused_moe_v2_block_config(
     ep_size: int,
     use_shared_expert: bool = False,
     use_grouped_topk: bool = False,
+    enable_act_quant: bool = False,
 ) -> FusedMoEBlockConfig:
     keys = get_simplified_key(
         dtype=dtype,
@@ -121,15 +140,25 @@ def get_tuned_fused_moe_v2_block_config(
         ep_size=ep_size,
         use_shared_expert=use_shared_expert,
         use_grouped_topk=use_grouped_topk,
+        enable_act_quant=enable_act_quant,
     )
     device_name = keys[0]
-    table_key = keys[1:]
+    table_key = keys[1:]  # includes enable_act_quant (last element)
+    # Backward compatible: prefer the act_quant-specific key, then fall back to
+    # the legacy key (without enable_act_quant) so pre-existing entries still hit.
+    table_key_legacy = table_key[:-1]
 
-    cfg_tuple = None
-    if device_name in TUNED_BLOCK_CONFIGS:
-        cfg_tuple = TUNED_BLOCK_CONFIGS[device_name].get(table_key)
+    def _lookup(k):
+        cfg = None
+        if device_name in TUNED_BLOCK_CONFIGS:
+            cfg = TUNED_BLOCK_CONFIGS[device_name].get(k)
+        if cfg is None:
+            cfg = TUNED_BLOCK_CONFIGS.get("*", {}).get(k)
+        return cfg
+
+    cfg_tuple = _lookup(table_key)
     if cfg_tuple is None:
-        cfg_tuple = TUNED_BLOCK_CONFIGS.get("*", {}).get(table_key)
+        cfg_tuple = _lookup(table_key_legacy)
 
     if cfg_tuple is None:
         return DEFAULT_V2_BLOCK_CONFIG

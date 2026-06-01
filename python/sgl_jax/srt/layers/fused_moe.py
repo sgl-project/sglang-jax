@@ -595,6 +595,7 @@ class FusedEPMoEV2(FusedEPMoE):
                 ep_size=self.ep_size,
                 use_shared_expert=self.w1_shared is not None,
                 use_grouped_topk=self.use_grouped_topk,
+                enable_act_quant=enable_act_quant,
             )
 
         direct_scaled_dot = w1_scale is not None
