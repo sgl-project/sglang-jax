@@ -14,8 +14,6 @@ import abc
 import enum
 import logging
 
-import jax
-
 logger = logging.getLogger(__name__)
 
 
@@ -158,23 +156,3 @@ class KVReceiver(abc.ABC):
         ...
 
 
-class TransferBackend(abc.ABC):
-    """Leaf-level tensor publish / pull / release."""
-
-    @abc.abstractmethod
-    def register_pull(self, uuid: str, data: jax.Array) -> None:
-        """Make ``data`` available for remote pull under ``uuid``."""
-
-    @abc.abstractmethod
-    def pull(
-        self,
-        uuid: str,
-        spec: jax.ShapeDtypeStruct,
-        *,
-        remote_addr: str,
-    ) -> jax.Array:
-        """Pull a tensor from ``remote_addr`` keyed by ``uuid``."""
-
-    @abc.abstractmethod
-    def release(self, uuid: str) -> None:
-        """Drop the internal reference for ``uuid``."""

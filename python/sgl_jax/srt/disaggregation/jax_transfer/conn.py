@@ -1,13 +1,11 @@
 """Event-driven ``JaxTransferKVManager`` backend.
 
-``JaxTransferKVManager`` is a thin façade that composes a domain-agnostic
-:class:`RequestTransportCore` (lifecycle, reaper, terminal records) with
-a :class:`JaxTransferBackend` (``jax.experimental.transfer`` publish /
-pull / release).
+``JaxTransferKVManager`` extends :class:`CommonKVManager` with
+the ``jax.experimental.transfer`` engine (via :class:`JaxTransferWrapper`).
 
 ``producer_handoff`` is the single prefill-side entry point. It selects
 between direct device pulls and host staging, registers the payload with
-the transport backend, and returns a cleanup hook for the sender.
+the wrapper, and returns a cleanup hook for the sender.
 
 Senders remain in ``TRANSFERRING`` until the decode side explicitly
 acknowledges completion over the ZMQ side channel. Receivers send that
@@ -24,15 +22,13 @@ from dataclasses import dataclass
 import jax
 
 from sgl_jax.srt.disaggregation.base.kv_manager import (
-    KVManager,
     KVPoll,
     KVReceiver,
     KVSender,
     StateHolder,
-    TransferBackend,
 )
 from sgl_jax.srt.disaggregation.common.core import (
-    RequestTransportCore,
+    CommonKVManager,
     TerminalTransferRecord,
 )
 from sgl_jax.srt.disaggregation.common.metrics import (
@@ -44,34 +40,7 @@ from sgl_jax.srt.disaggregation.jax_transfer.wrapper import JaxTransferWrapper
 from sgl_jax.srt.mem_cache.host_kv_pool import HostKVPool, StagedData
 
 
-class JaxTransferBackend(TransferBackend):
-    """Thin wrapper around :class:`JaxTransferWrapper`."""
-
-    def __init__(self, wrapper: JaxTransferWrapper) -> None:
-        self._wrapper = wrapper
-
-    @property
-    def wrapper(self) -> JaxTransferWrapper:
-        return self._wrapper
-
-    def register_pull(self, uuid: str, data: jax.Array) -> None:
-        self._wrapper.register_pull(uuid, data)
-
-    def pull(
-        self,
-        uuid: str,
-        spec: jax.ShapeDtypeStruct,
-        *,
-        remote_addr: str,
-    ) -> jax.Array:
-        return self._wrapper.pull(uuid, spec, remote_addr=remote_addr)
-
-    def release(self, uuid: str) -> None:
-        self._wrapper.release(uuid)
-
-
 __all__ = [
-    "JaxTransferBackend",
     "JaxTransferKVManager",
     "JaxTransferKVReceiver",
     "JaxTransferKVSender",
@@ -115,12 +84,11 @@ class TransferStatus:
     on_done: Callable[[], None]
 
 
-class JaxTransferKVManager(KVManager):
-    """Process-level KV transfer manager (façade).
+class JaxTransferKVManager(CommonKVManager):
+    """Concrete KV transfer manager for ``jax.experimental.transfer``.
 
-    Composes:
-    * :class:`RequestTransportCore` — request lifecycle, reaper, shutdown
-    * :class:`TransferBackend` — tensor publish / pull / release
+    Extends :class:`CommonKVManager` (lifecycle, reaper, shutdown) with:
+    * :class:`JaxTransferWrapper` — tensor publish / pull / release
     * :class:`ZmqPullNotifier` — pull-done side channel
     * (optional) :class:`HostKVPool` — path-A D2H staging
     """
@@ -135,27 +103,18 @@ class JaxTransferKVManager(KVManager):
         pull_timeout_seconds: float = 30.0,
         reaper_interval_seconds: float = 5.0,
     ) -> None:
-        self._wrapper = wrapper
-        self._backend: TransferBackend = JaxTransferBackend(wrapper)
-        self._zmq_notifier = zmq_notifier
-        self._host_pool = host_pool
-        self._core = RequestTransportCore(
+        super().__init__(
             ack_timeout_seconds=ack_timeout_seconds,
             pull_timeout_seconds=pull_timeout_seconds,
             reaper_interval_seconds=reaper_interval_seconds,
         )
+        self._wrapper = wrapper
+        self._zmq_notifier = zmq_notifier
+        self._host_pool = host_pool
 
     # ------------------------------------------------------------------
     # Component access
     # ------------------------------------------------------------------
-
-    @property
-    def core(self) -> RequestTransportCore:
-        return self._core
-
-    @property
-    def backend(self) -> TransferBackend:
-        return self._backend
 
     @property
     def wrapper(self) -> JaxTransferWrapper:
@@ -168,14 +127,6 @@ class JaxTransferKVManager(KVManager):
     @property
     def host_pool(self) -> HostKVPool | None:
         return self._host_pool
-
-    @property
-    def _senders(self) -> dict[str, JaxTransferKVSender]:
-        return self._core._senders  # type: ignore[return-value]
-
-    @property
-    def _receivers(self) -> dict[str, JaxTransferKVReceiver]:
-        return self._core._receivers  # type: ignore[return-value]
 
     # ------------------------------------------------------------------
     # KV-domain: prefill-side handoff (path A / path B)
@@ -191,7 +142,7 @@ class JaxTransferKVManager(KVManager):
         """Register ``payload`` entries for remote pull under sub-uuids.
 
         Each entry in ``payload`` is registered as
-        ``f"{uuid}:{entry_name}"`` with the backend. Path A stages
+        ``f"{uuid}:{entry_name}"`` with the wrapper. Path A stages
         each entry to a host buffer first; path B registers HBM arrays
         directly. The returned :class:`TransferStatus` aggregates all
         sub-uuids and chains cleanup hooks.
@@ -219,7 +170,7 @@ class JaxTransferKVManager(KVManager):
             for name, arr in payload.items():
                 sub = f"{uuid}:{name}"
                 staged: StagedData = pool.copy_from_device(arr)
-                self._backend.register_pull(sub, staged.array)
+                self._wrapper.register_pull(sub, staged.array)
                 sub_uuids.append(sub)
                 buffer_ids.append(staged.buffer_id)
 
@@ -234,7 +185,7 @@ class JaxTransferKVManager(KVManager):
         # path B: direct from HBM
         for name, arr in payload.items():
             sub = f"{uuid}:{name}"
-            self._backend.register_pull(sub, arr)
+            self._wrapper.register_pull(sub, arr)
             sub_uuids.append(sub)
         return TransferStatus(
             uuid=uuid, sub_uuids=tuple(sub_uuids), on_done=lambda: None
@@ -246,65 +197,13 @@ class JaxTransferKVManager(KVManager):
 
     def create_sender(self, req_id: str) -> JaxTransferKVSender:
         sender = JaxTransferKVSender(self, req_id)
-        self._core.register_sender(req_id, sender)
+        self.register_sender(req_id, sender)
         return sender
 
     def create_receiver(self, req_id: str) -> JaxTransferKVReceiver:
         receiver = JaxTransferKVReceiver(self, req_id)
-        self._core.register_receiver(req_id, receiver)
+        self.register_receiver(req_id, receiver)
         return receiver
-
-    # ------------------------------------------------------------------
-    # Lifecycle delegation — keeps callers unchanged
-    # ------------------------------------------------------------------
-
-    def _prune_sender(self, req_id: str) -> None:
-        self._core.prune_sender(req_id)
-
-    def _prune_receiver(self, req_id: str) -> None:
-        self._core.prune_receiver(req_id)
-
-    def _clear_terminal_record(self, req_id: str, *, role: str) -> None:
-        self._core.clear_terminal_record(req_id, role=role)
-
-    def record_terminal(
-        self,
-        req_id: str,
-        *,
-        role: str,
-        transfer_id: str,
-        state: KVPoll,
-        reason: str,
-    ) -> None:
-        self._core.record_terminal(
-            req_id,
-            role=role,
-            transfer_id=transfer_id,
-            state=state,
-            reason=reason,
-        )
-
-    def get_terminal_record(
-        self, req_id: str, *, role: str
-    ) -> TerminalTransferRecord | None:
-        return self._core.get_terminal_record(req_id, role=role)
-
-    def start_reaper(self) -> None:
-        self._core.start_reaper()
-
-    def stop_reaper(self) -> None:
-        self._core.stop_reaper()
-
-    def reap_once(self, now: float) -> tuple[list[str], list[str]]:
-        return self._core.reap_once(now)
-
-    def inflight_count(self) -> tuple[int, int]:
-        return self._core.inflight_count()
-
-    def graceful_shutdown(
-        self, drain_timeout_seconds: float = 30.0
-    ) -> tuple[int, int]:
-        return self._core.graceful_shutdown(drain_timeout_seconds)
 
 
 class JaxTransferKVSender(KVSender, StateHolder):
@@ -421,7 +320,7 @@ class JaxTransferKVSender(KVSender, StateHolder):
             claimed = self._mgr.zmq_notifier.unregister_callback(callback_uuid)
             if claimed is not None and self._status is not None:
                 for sub_uuid in self._status.sub_uuids:
-                    self._mgr.backend.release(sub_uuid)
+                    self._mgr.wrapper.release(sub_uuid)
                 self._status.on_done()
             self._transition_to(KVPoll.FAILED)
             self._close_ack_timer()
@@ -449,7 +348,7 @@ class JaxTransferKVSender(KVSender, StateHolder):
                 try:
                     if self._status is not None:
                         for sub_uuid in self._status.sub_uuids:
-                            self._mgr.backend.release(sub_uuid)
+                            self._mgr.wrapper.release(sub_uuid)
                         self._status.on_done()
                 except Exception:
                     if self.state == KVPoll.TRANSFERRING:
@@ -610,7 +509,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                     results: dict[str, jax.Array] = {}
                     for name, spec in self._metadata.specs.items():
                         sub_uuid = f"{self._metadata.uuid}:{name}"
-                        results[name] = self._mgr.backend.pull(
+                        results[name] = self._mgr.wrapper.pull(
                             sub_uuid,
                             spec,
                             remote_addr=self._metadata.remote_addr,

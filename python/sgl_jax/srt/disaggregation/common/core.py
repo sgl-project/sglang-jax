@@ -1,9 +1,13 @@
-"""Domain-agnostic request-level transport lifecycle.
+"""Shared KV manager implementation for PD disaggregation backends.
 
-``RequestTransportCore`` manages sender / receiver registries, bounded
-terminal-record bookkeeping, an orphan reaper, and graceful shutdown.
-It knows nothing about KV caches, host staging, or JAX arrays — those
-concerns belong to domain adapters and transport backends.
+``CommonKVManager`` extends the base :class:`KVManager` ABC with
+sender / receiver registries, bounded terminal-record bookkeeping,
+an orphan reaper, and graceful shutdown. It knows nothing about KV
+caches, host staging, or JAX arrays — those concerns belong to
+concrete backend subclasses (e.g. ``JaxTransferKVManager``).
+
+Follows the same three-layer pattern as sglang:
+``BaseKVManager`` → ``CommonKVManager`` → ``<Backend>KVManager``.
 """
 
 from __future__ import annotations
@@ -14,7 +18,7 @@ from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass
 
-from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
+from sgl_jax.srt.disaggregation.base.kv_manager import KVManager, KVPoll
 from sgl_jax.srt.disaggregation.common.metrics import PD_TRANSFER_INFLIGHT
 
 
@@ -28,11 +32,12 @@ class TerminalTransferRecord:
     terminal_at: float
 
 
-class RequestTransportCore:
-    """Process-level lifecycle manager for request-scoped transfers.
+class CommonKVManager(KVManager):
+    """Shared lifecycle manager for request-scoped transfers.
 
-    Participants (senders / receivers) are registered by ``req_id`` and
-    must expose two duck-type members used by the reaper and graceful
+    Subclasses must implement :meth:`create_sender` and
+    :meth:`create_receiver`. Participants (senders / receivers) must
+    expose two duck-type members used by the reaper and graceful
     shutdown:
 
     * ``transfer_started_at -> float | None``
@@ -72,7 +77,7 @@ class RequestTransportCore:
             if req_id in self._senders:
                 raise ValueError(f"sender for req_id={req_id!r} already exists")
             self._senders[req_id] = sender
-        self.clear_terminal_record(req_id, role="prefill")
+        self._clear_terminal_record(req_id, role="prefill")
         with suppress(Exception):
             PD_TRANSFER_INFLIGHT.labels(role="prefill").inc()
 
@@ -81,18 +86,18 @@ class RequestTransportCore:
             if req_id in self._receivers:
                 raise ValueError(f"receiver for req_id={req_id!r} already exists")
             self._receivers[req_id] = receiver
-        self.clear_terminal_record(req_id, role="decode")
+        self._clear_terminal_record(req_id, role="decode")
         with suppress(Exception):
             PD_TRANSFER_INFLIGHT.labels(role="decode").inc()
 
-    def prune_sender(self, req_id: str) -> None:
+    def _prune_sender(self, req_id: str) -> None:
         with self._senders_lock:
             removed = self._senders.pop(req_id, None)
         if removed is not None:
             with suppress(Exception):
                 PD_TRANSFER_INFLIGHT.labels(role="prefill").dec()
 
-    def prune_receiver(self, req_id: str) -> None:
+    def _prune_receiver(self, req_id: str) -> None:
         with self._receivers_lock:
             removed = self._receivers.pop(req_id, None)
         if removed is not None:
@@ -103,7 +108,7 @@ class RequestTransportCore:
     # Terminal records
     # ------------------------------------------------------------------
 
-    def clear_terminal_record(self, req_id: str, *, role: str) -> None:
+    def _clear_terminal_record(self, req_id: str, *, role: str) -> None:
         key = (req_id, role)
         with self._terminal_records_lock:
             self._terminal_records.pop(key, None)
@@ -154,7 +159,7 @@ class RequestTransportCore:
         self._reaper_stop.clear()
         self._reaper_thread = threading.Thread(
             target=self._reaper_loop,
-            name="RequestTransportCore-Reaper",
+            name="CommonKVManager-Reaper",
             daemon=True,
         )
         self._reaper_thread.start()

@@ -1,8 +1,6 @@
-"""Tests for the transport layer: KVPoll state machine, TransferBackend ABC, and RequestTransportCore."""
+"""Tests for the transport layer: KVPoll state machine and CommonKVManager."""
 
 from __future__ import annotations
-
-from unittest import mock
 
 import pytest
 
@@ -11,14 +9,12 @@ from sgl_jax.srt.disaggregation.base.kv_manager import (
     TERMINAL_STATES,
     KVPoll,
     StateHolder,
-    TransferBackend,
     is_legal_transition,
 )
 from sgl_jax.srt.disaggregation.common.core import (
-    RequestTransportCore,
+    CommonKVManager,
     TerminalTransferRecord,
 )
-from sgl_jax.srt.disaggregation.jax_transfer.conn import JaxTransferBackend
 
 
 # ------------------------------------------------------------------
@@ -91,54 +87,7 @@ def test_self_loops_are_illegal():
 
 
 # ------------------------------------------------------------------
-# TransferBackend ABC + JaxTransferBackend (from test_transfer_backend)
-# ------------------------------------------------------------------
-
-
-def test_abc_cannot_be_instantiated():
-    with pytest.raises(TypeError):
-        TransferBackend()  # type: ignore[abstract]
-
-
-def test_jax_backend_delegates_register_pull():
-    wrapper = mock.MagicMock()
-    backend = JaxTransferBackend(wrapper)
-    data = mock.MagicMock()
-    backend.register_pull("uuid-1", data)
-    wrapper.register_pull.assert_called_once_with("uuid-1", data)
-
-
-def test_jax_backend_delegates_pull():
-    wrapper = mock.MagicMock()
-    backend = JaxTransferBackend(wrapper)
-    spec = mock.MagicMock()
-    backend.pull("uuid-2", spec, remote_addr="10.0.0.1:30000")
-    wrapper.pull.assert_called_once_with(
-        "uuid-2", spec, remote_addr="10.0.0.1:30000"
-    )
-
-
-def test_jax_backend_delegates_release():
-    wrapper = mock.MagicMock()
-    backend = JaxTransferBackend(wrapper)
-    backend.release("uuid-3")
-    wrapper.release.assert_called_once_with("uuid-3")
-
-
-def test_jax_backend_exposes_wrapper():
-    wrapper = mock.MagicMock()
-    backend = JaxTransferBackend(wrapper)
-    assert backend.wrapper is wrapper
-
-
-def test_jax_backend_is_transfer_backend():
-    wrapper = mock.MagicMock()
-    backend = JaxTransferBackend(wrapper)
-    assert isinstance(backend, TransferBackend)
-
-
-# ------------------------------------------------------------------
-# RequestTransportCore (from test_request_transport_core)
+# CommonKVManager (from test_request_transport_core)
 # ------------------------------------------------------------------
 
 
@@ -155,8 +104,18 @@ class _MockParticipant:
         self.fail_reason = reason
 
 
+class _TestKVManager(CommonKVManager):
+    """Concrete subclass for testing (CommonKVManager is abstract)."""
+
+    def create_sender(self, req_id):
+        raise NotImplementedError
+
+    def create_receiver(self, req_id):
+        raise NotImplementedError
+
+
 def _make_core(ack_timeout=10.0, pull_timeout=5.0):
-    return RequestTransportCore(
+    return _TestKVManager(
         ack_timeout_seconds=ack_timeout,
         pull_timeout_seconds=pull_timeout,
         reaper_interval_seconds=60.0,
@@ -171,7 +130,7 @@ def test_register_and_prune_sender():
     p = _MockParticipant()
     core.register_sender("req-1", p)
     assert core.inflight_count() == (1, 0)
-    core.prune_sender("req-1")
+    core._prune_sender("req-1")
     assert core.inflight_count() == (0, 0)
 
 
@@ -180,7 +139,7 @@ def test_register_and_prune_receiver():
     p = _MockParticipant()
     core.register_receiver("req-1", p)
     assert core.inflight_count() == (0, 1)
-    core.prune_receiver("req-1")
+    core._prune_receiver("req-1")
     assert core.inflight_count() == (0, 0)
 
 
@@ -200,8 +159,8 @@ def test_duplicate_receiver_raises():
 
 def test_prune_nonexistent_is_no_op():
     core = _make_core()
-    core.prune_sender("ghost")
-    core.prune_receiver("ghost")
+    core._prune_sender("ghost")
+    core._prune_receiver("ghost")
 
 
 # Terminal records
@@ -233,7 +192,7 @@ def test_clear_terminal_record():
         state=KVPoll.FAILED,
         reason="timeout",
     )
-    core.clear_terminal_record("req-1", role="decode")
+    core._clear_terminal_record("req-1", role="decode")
     assert core.get_terminal_record("req-1", role="decode") is None
 
 
