@@ -31,7 +31,6 @@ End-to-end serving recipes for autoregressive models on SGL-JAX, organized by ve
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
 | 🧪 | GLM-4.5 / GLM-4.5-Air | [`GLM/GLM-4.5.md`](GLM/GLM-4.5.md) | v6e-32 / v6e-64 | MoE + reasoning/tool (`glm45`) |
-| 📝 | GLM-5 | _planned; placeholder kept out of public navigation until model details are public_ | _Pending_ | MoE (+ DSA variant) + tool (`glm47`) |
 
 ### Google — `Google/`
 
@@ -89,7 +88,7 @@ End-to-end serving recipes for autoregressive models on SGL-JAX, organized by ve
 A model that generates text one token at a time, conditioning on its own previous outputs. Includes:
 
 - **Dense LLMs** — Qwen / Qwen3 / Llama / Gemma 2 / MiMo-7B / Grok-2.
-- **MoE LLMs** — Qwen3-MoE / DeepSeek V2/V3/R1 / GLM-4.5 / GLM-5 / Ling 2.6 / MiMo-V2-Flash / MiMo-V2.5-Pro / Kimi-Linear.
+- **MoE LLMs** — Qwen3-MoE / DeepSeek V2/V3/R1 / GLM-4.5 / Ling 2.6 / MiMo-V2-Flash / MiMo-V2.5-Pro / Kimi-Linear.
 - **Vision-language decoders** — Qwen2.5-VL ingests image / video inputs, but the answer is still produced by an autoregressive generation stage.
 
 Diffusion image/video generation models live in [`../diffusion/`](../diffusion/index.md).
@@ -113,13 +112,12 @@ Reasoning models that emit `<think>` blocks need `--reasoning-parser <key>` at l
 
 | Parser key | Reasoning | Tool-call | Where used in cookbook |
 |---|---|---|---|
-| `deepseek-r1` | ✓ (`<think>...</think>`) | — | [DeepSeek-R1](DeepSeek/DeepSeek-R1.md), Ring 2.5 / Ling 2.6 reasoning variants (use as `<think>` parser) |
+| `deepseek-r1` | ✓ (`<think>...</think>`) | — | [DeepSeek-R1](DeepSeek/DeepSeek-R1.md), Ling 2.6 reasoning variants (use as `<think>` parser) |
 | `qwen3` | ✓ (`<think>...</think>` + `enable_thinking` switch) | — | [Qwen3](Qwen/Qwen3.md), [Qwen3-MoE](Qwen/Qwen3-MoE.md) |
 | `qwen25` | — | ✓ | Qwen3 / Qwen3-MoE tool-calling |
 | `qwen3_coder` | — | ✓ | Qwen3-Coder variants |
 | `mimo` | ✓ (alias of `qwen3` parser) | ✓ | [MiMo-V2-Flash](Xiaomi/MiMo-V2-Flash.md), [MiMo-V2.5-Pro](Xiaomi/MiMo-V2.5-Pro.md), [MiMo-7B](Xiaomi/MiMo-7B.md) |
 | `glm45` | ✓ (`<think>...</think>`) | ✓ | [GLM-4.5 / 4.5-Air](GLM/GLM-4.5.md) |
-| `glm47` | — | ✓ | GLM-5 planned tool-calling variants |
 | `kimi` | ✓ (`◁think▷...◁/think▷`) | — | Reserved for Kimi reasoning variants; Kimi-Linear-Instruct is not reasoning |
 
 Run `python -m sgl_jax.launch_server --help` against your checkout to see the full registered set — these keys are the cookbook-relevant subset.

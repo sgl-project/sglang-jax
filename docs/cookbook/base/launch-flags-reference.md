@@ -96,7 +96,6 @@ grep -n 'add_argument' python/sgl_jax/srt/server_args.py
 | `mimo` (reasoning + tool) | [`mimo-v2.5-pro.md`](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md) · [`mimo-v2-flash.md`](../autoregressive/Xiaomi/MiMo-V2-Flash.md) · [`mimo-7b.md`](../autoregressive/Xiaomi/MiMo-7B.md) |
 | `deepseek-r1` (reasoning) | [`deepseek-v3.md`](../autoregressive/DeepSeek/DeepSeek-V3.md) (R1 / V3.2-Speciale) |
 | `glm45` (reasoning + tool) | [`glm4-moe.md`](../autoregressive/GLM/GLM-4.5.md) (GLM-4.5 / 4.6) |
-| `glm47` (tool) | [`glm5-moe.md`](../autoregressive/GLM/GLM-5.md) (GLM-5 family) |
 | `qwen3` (reasoning), `qwen25` / `qwen3_coder` (tool) | _no Qwen recipe currently sets these — pick by model card on a per-checkpoint basis_ |
 | `kimi` (reasoning) | _no Kimi recipe currently sets this_ |
 

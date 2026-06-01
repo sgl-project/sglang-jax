@@ -15,8 +15,6 @@ title: "GLM-4.5"
 - [**zai-org/GLM-4.5**](https://huggingface.co/zai-org/GLM-4.5) — 355B total / 32B activated; multi-host on v6e-64.
 - [**zai-org/GLM-4.5-Air**](https://huggingface.co/zai-org/GLM-4.5-Air) — 106B total / 12B activated; multi-host on v6e-32.
 
-For the newer GLM-5 family with DeepSeek-style sparse attention — runtime supports `Glm5ForCausalLM` / `GlmMoeDsaForCausalLM`, but no public release pin yet (see the Planned entry in [`../index.md`](../index.md#glm--glm)).
-
 **Recommended Generation Parameters**:
 
 - General: `temperature=0.6`, `top_p=0.95`, `max_tokens=1024`.
