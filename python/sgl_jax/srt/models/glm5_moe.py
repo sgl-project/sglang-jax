@@ -28,6 +28,26 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 logger = logging.getLogger(__name__)
 
 
+_USE_FP32_ACCUM_FOR_TPU_V7X = None
+
+
+def _get_preferred_dtype(params_dtype) -> jnp.dtype:
+    global _USE_FP32_ACCUM_FOR_TPU_V7X
+    if _USE_FP32_ACCUM_FOR_TPU_V7X is not None:
+        return jnp.float32 if _USE_FP32_ACCUM_FOR_TPU_V7X else params_dtype
+
+    _USE_FP32_ACCUM_FOR_TPU_V7X = False
+    try:
+        devs = jax.devices()
+        if len(devs) > 0 and devs[0].platform == "tpu":
+            device_kind = getattr(devs[0], "device_kind", "")
+            if "7x" in device_kind or device_kind == "TPU7x":
+                _USE_FP32_ACCUM_FOR_TPU_V7X = True
+    except Exception:
+        pass
+    return jnp.float32 if _USE_FP32_ACCUM_FOR_TPU_V7X else params_dtype
+
+
 class GlmNorm(nnx.Module):
     def __init__(self, dim: int, dtype: jnp.dtype = jnp.bfloat16):
         self.weight = nnx.Param(jnp.ones((dim,), dtype=dtype))
@@ -119,14 +139,31 @@ class GlmDsaIndexer(nnx.Module):
         h_matrix = get_hadamard_matrix(128)
         h_matrix = h_matrix * (128**-0.5)
 
-        query = jnp.einsum("thd,de->the", query, h_matrix)
-        key = jnp.einsum("td,de->te", key, h_matrix)
+        preferred_dtype = _get_preferred_dtype(hidden_states.dtype)
+        query = jax.lax.dot_general(
+            query,
+            h_matrix,
+            (((2,), (0,)), ((), ())),
+            preferred_element_type=preferred_dtype,
+        ).astype(hidden_states.dtype)
+
+        key = jax.lax.dot_general(
+            key,
+            h_matrix,
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=preferred_dtype,
+        ).astype(hidden_states.dtype)
 
         # 2. Compute Logits (simplified dense dot product)
         key_replicated = jax.sharding.reshard(
             key, jax.sharding.NamedSharding(self.mesh, P(None, None))
         )
-        logits = jnp.einsum("ijk,lk->ijl", query, key_replicated)
+        logits = jax.lax.dot_general(
+            query,
+            key_replicated,
+            (((2,), (1,)), ((), ())),
+            preferred_element_type=preferred_dtype,
+        ).astype(hidden_states.dtype)
 
         # 3. Apply weights_proj
         weights, _ = self.weights_proj(hidden_states)
@@ -335,7 +372,16 @@ class Glm5Attention(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ) -> tuple[jax.Array, jax.Array]:
-        ql_nope = jnp.einsum("thd,rhd->thr", q_nope, self.w_uk.value)
+        preferred_dtype = _get_preferred_dtype(q_nope.dtype)
+        # "thd,rhd->thr"
+        ql_nope = jax.lax.dot_general(
+            q_nope,
+            self.w_uk.value,
+            (((2,), (2,)), ((1,), (1,))),
+            preferred_element_type=preferred_dtype,
+        )
+        ql_nope = ql_nope.transpose(1, 0, 2).astype(q_nope.dtype)
+
         c_kv_3d = compressed[:, None, :]
         attn_output, kv_fused = self.attn_mqa(
             ql_nope,
@@ -346,7 +392,14 @@ class Glm5Attention(nnx.Module):
             q_rope=q_rope,
             k_rope=k_rope,
         )
-        o_v = jnp.einsum("thr,rhd->thd", attn_output, self.w_uv.value)
+        # "thr,rhd->thd"
+        o_v = jax.lax.dot_general(
+            attn_output,
+            self.w_uv.value,
+            (((2,), (0,)), ((1,), (1,))),
+            preferred_element_type=preferred_dtype,
+        )
+        o_v = o_v.transpose(1, 0, 2).astype(q_nope.dtype)
         attn_output = o_v.reshape(-1, self.num_heads * self.v_head_dim)
         return attn_output, kv_fused
 
