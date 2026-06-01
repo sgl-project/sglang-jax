@@ -445,7 +445,11 @@ class BailingMoELinearDecoderLayer(nnx.Module):
         moe_shared_expert_intermediate_size = getattr(
             config, "moe_shared_expert_intermediate_size", config.moe_intermediate_size
         )
-        use_inkernel_se = self.moe_backend == MoEBackend.FUSED_V2 and num_shared_experts > 0
+        use_inkernel_se = (
+            self.moe_backend == MoEBackend.FUSED_V2
+            and num_shared_experts > 0
+            and getattr(config, "moe_fused_shared_experts", True)
+        )
         self.use_inkernel_se = use_inkernel_se
         if self.moe_backend == MoEBackend.FUSED_V2:
             self.mlp = FusedEPMoEV2(

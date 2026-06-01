@@ -136,6 +136,10 @@ class ServerArgs:
     # Kernel backend
     attention_backend: str | None = "fa"
     moe_backend: str = "epmoe"
+    # Fused MoE v2 controlled-experiment toggles (only affect the fused_v2 backend;
+    # see add_argument help below).
+    moe_fused_act_quant: bool = True
+    moe_fused_shared_experts: bool = True
     disable_jax_allreduce_metadata: bool = False
 
     grammar_backend: str | None = None
@@ -962,6 +966,28 @@ class ServerArgs:
             choices=["epmoe", "fused", "fused_v2", "auto"],
             default=ServerArgs.moe_backend,
             help="The backend to use for MoE models.",
+        )
+
+        parser.add_argument(
+            "--moe-fused-act-quant",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.moe_fused_act_quant,
+            help=(
+                "Fused MoE v2: enable in-kernel activation quantization (fp8-token, Mode 1). "
+                "Only affects fp8-weight models on the fused_v2 backend. Default on; pass "
+                "--no-moe-fused-act-quant to run the base (no act-quant) kernel for A/B."
+            ),
+        )
+
+        parser.add_argument(
+            "--moe-fused-shared-experts",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.moe_fused_shared_experts,
+            help=(
+                "Fused MoE v2: fold the shared expert into the kernel (in-kernel SE). "
+                "Default on; pass --no-moe-fused-shared-experts to run routed experts only "
+                "in the kernel and compute the shared expert externally (output unchanged)."
+            ),
         )
 
         parser.add_argument(

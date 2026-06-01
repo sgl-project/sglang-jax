@@ -308,6 +308,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.model_config.hf_config.use_jax_allreduce_metadata = (
             not self.server_args.disable_jax_allreduce_metadata
         )
+        # Fused MoE v2 controlled-experiment toggles (read by the MoE layer ctor).
+        self.model_config.hf_config.moe_fused_act_quant = self.server_args.moe_fused_act_quant
+        self.model_config.hf_config.moe_fused_shared_experts = (
+            self.server_args.moe_fused_shared_experts
+        )
         # Pick MLA forward path at server start. Only `fa` selects absorbed
         # (the MLA Pallas kernel); `fa_mha` and `native` both decompress latent
         # KV via kv_b_proj and run standard attention. Read by

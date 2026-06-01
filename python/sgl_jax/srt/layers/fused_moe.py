@@ -573,12 +573,11 @@ class FusedEPMoEV2(FusedEPMoE):
         w2_shared_scale = (
             self.w2_shared_scale.value[:, 0, :] if self.w2_shared_scale is not None else None
         )
-        # In-kernel act-quant (fp8 token, Mode 1) needs fp8 weights. Honor the
-        # explicit opt-in OR the quant-config signal, then guard on fp8 (w1_scale
-        # present) so bf16 models stay in Mode 2/3 instead of hitting the kernel gate.
-        enable_act_quant = (
-            self.enable_act_quant_cfg or self.activation_quantized_dtype is not None
-        ) and (w1_scale is not None)
+        # In-kernel act-quant (fp8 token, Mode 1) needs fp8 weights. The
+        # server-arg / config flag (enable_act_quant_cfg, default on) is now the
+        # authoritative switch so --no-moe-fused-act-quant cleanly disables it for
+        # controlled A/B; still gated on fp8 (w1_scale present) so bf16 stays Mode 2/3.
+        enable_act_quant = self.enable_act_quant_cfg and (w1_scale is not None)
 
         if block_config is None:
             block_config = get_tuned_fused_moe_v2_block_config(
