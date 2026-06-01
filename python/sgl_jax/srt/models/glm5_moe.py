@@ -139,31 +139,14 @@ class GlmDsaIndexer(nnx.Module):
         h_matrix = get_hadamard_matrix(128)
         h_matrix = h_matrix * (128**-0.5)
 
-        preferred_dtype = _get_preferred_dtype(hidden_states.dtype)
-        query = jax.lax.dot_general(
-            query,
-            h_matrix,
-            (((2,), (0,)), ((), ())),
-            preferred_element_type=preferred_dtype,
-        ).astype(hidden_states.dtype)
-
-        key = jax.lax.dot_general(
-            key,
-            h_matrix,
-            (((1,), (0,)), ((), ())),
-            preferred_element_type=preferred_dtype,
-        ).astype(hidden_states.dtype)
+        query = jnp.einsum("thd,de->the", query, h_matrix)
+        key = jnp.einsum("td,de->te", key, h_matrix)
 
         # 2. Compute Logits (simplified dense dot product)
         key_replicated = jax.sharding.reshard(
             key, jax.sharding.NamedSharding(self.mesh, P(None, None))
         )
-        logits = jax.lax.dot_general(
-            query,
-            key_replicated,
-            (((2,), (1,)), ((), ())),
-            preferred_element_type=preferred_dtype,
-        ).astype(hidden_states.dtype)
+        logits = jnp.einsum("ijk,lk->ijl", query, key_replicated)
 
         # 3. Apply weights_proj
         weights, _ = self.weights_proj(hidden_states)
