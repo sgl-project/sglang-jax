@@ -50,6 +50,7 @@ class FusedMoEBlockConfig:
         ep_size: int,
         dtype: jnp.dtype,
         quant_block_k: int | None = None,
+        intermediate_size: int | None = None,
     ) -> FusedMoEBlockConfig:
         """Return the *effective* config after applying kernel override rules.
 
@@ -96,12 +97,41 @@ class FusedMoEBlockConfig:
             bfc = max(bfc, min_bfc)
             bfc -= bfc % min_bfc
 
-        bse = self.bf if self.bse is None else self.bse
+        bf = self.bf
+        if intermediate_size is not None and intermediate_size % bf != 0:
+            # Joint search: each bf candidate must also admit a feasible bfc,
+            # since quant_block_k can make some (bf, bfc) pairs impossible.
+            reduced = False
+            for bf_candidate in range(bf - 128, 0, -128):
+                if intermediate_size % bf_candidate != 0:
+                    continue
+                bfc_candidate = min(bfc, bf_candidate)
+                while bfc_candidate > 128 and (
+                    bf_candidate % bfc_candidate != 0
+                    or (quant_block_k is not None and bfc_candidate % quant_block_k != 0)
+                ):
+                    bfc_candidate -= 128
+                if (
+                    bf_candidate % bfc_candidate == 0
+                    and (quant_block_k is None or bfc_candidate % quant_block_k == 0)
+                ):
+                    bf = bf_candidate
+                    bfc = bfc_candidate
+                    reduced = True
+                    break
+            if not reduced:
+                quant_info = f" with {quant_block_k=}" if quant_block_k is not None else ""
+                raise ValueError(
+                    f"Cannot find a valid bf (multiple of 128) that divides "
+                    f"{intermediate_size=} with a feasible bfc{quant_info}."
+                )
+
+        bse = bf if self.bse is None else self.bse
 
         return FusedMoEBlockConfig(
             bt=bt,
             bts=bts,
-            bf=self.bf,
+            bf=bf,
             bd1=self.bd1,
             bd2=self.bd2,
             btc=btc,
@@ -3320,11 +3350,11 @@ def fused_ep_moe(
                 "disable_sync_barrier is only supported with disable_a2a=True or ep_size=1."
             )
 
+    num_experts, intermediate_size, _ = w2.shape
     if block_config is None:
         from .tuned_block_configs import get_tuned_fused_moe_block_config
 
         num_tokens, hidden_size = tokens.shape
-        num_experts, intermediate_size, _ = w2.shape
         block_config = get_tuned_fused_moe_block_config(
             num_tokens=num_tokens,
             num_experts=num_experts,
@@ -3342,6 +3372,7 @@ def fused_ep_moe(
         ep_size=ep_size,
         dtype=tokens.dtype,
         quant_block_k=quant_block_k,
+        intermediate_size=intermediate_size,
     )
     _validate_fused_ep_moe_args(
         mesh=mesh,

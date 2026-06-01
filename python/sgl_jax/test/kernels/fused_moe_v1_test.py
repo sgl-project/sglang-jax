@@ -895,6 +895,176 @@ class MoEKernelTest(jtu.JaxTestCase):
             bse=512,
         )
 
+    def test_effective_for_bf_auto_reduction(self):
+        """bf auto-reduces when intermediate_size is not aligned to default bf."""
+        cfg = FusedMoEBlockConfig(
+            bt=32,
+            bf=512,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=512,
+            bd1c=1024,
+            bd2c=1024,
+            bse=512,
+        )
+        eff = cfg.effective_for(
+            num_tokens=256,
+            ep_size=1,
+            dtype=jnp.bfloat16,
+            intermediate_size=768,
+        )
+        self.assertEqual(eff.bf, 384)
+        self.assertEqual(eff.bfc, 384)
+        self.assertEqual(768 % eff.bf, 0)
+        self.assertEqual(eff.bf % eff.bfc, 0)
+
+    def test_effective_for_bf_no_reduction_when_aligned(self):
+        """bf stays unchanged when intermediate_size is already aligned."""
+        cfg = FusedMoEBlockConfig(
+            bt=32,
+            bf=512,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=512,
+            bd1c=1024,
+            bd2c=1024,
+            bse=512,
+        )
+        eff = cfg.effective_for(
+            num_tokens=256,
+            ep_size=1,
+            dtype=jnp.bfloat16,
+            intermediate_size=1024,
+        )
+        self.assertEqual(eff.bf, 512)
+        self.assertEqual(eff.bfc, 512)
+
+    def test_effective_for_bf_reduction_with_quant(self):
+        """bf auto-reduces while preserving quantization alignment on bfc."""
+        cfg = FusedMoEBlockConfig(
+            bt=32,
+            bf=512,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=512,
+            bd1c=1024,
+            bd2c=1024,
+            bse=512,
+        )
+        eff = cfg.effective_for(
+            num_tokens=256,
+            ep_size=1,
+            dtype=jnp.float8_e4m3fn,
+            intermediate_size=768,
+            quant_block_k=128,
+        )
+        self.assertEqual(eff.bf, 384)
+        self.assertEqual(768 % eff.bf, 0)
+        self.assertEqual(eff.bf % eff.bfc, 0)
+        self.assertEqual(eff.bfc % 128, 0)
+
+    def test_effective_for_bf_skips_candidate_when_bfc_infeasible(self):
+        """bf=384 is skipped because quant_block_k=256 makes bfc infeasible; falls back to bf=256."""
+        cfg = FusedMoEBlockConfig(
+            bt=32,
+            bf=512,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=512,
+            bd1c=1024,
+            bd2c=1024,
+            bse=512,
+        )
+        # intermediate_size=768: 768%384==0 but 384 has no bfc satisfying
+        # bf%bfc==0 AND bfc%256==0 (384%256!=0, 128%256!=0).
+        # Must skip 384 and pick bf=256 (768%256==0, bfc=256, 256%256==0).
+        eff = cfg.effective_for(
+            num_tokens=256,
+            ep_size=1,
+            dtype=jnp.float8_e4m3fn,
+            intermediate_size=768,
+            quant_block_k=256,
+        )
+        self.assertEqual(eff.bf, 256)
+        self.assertEqual(768 % eff.bf, 0)
+        self.assertEqual(eff.bf % eff.bfc, 0)
+        self.assertEqual(eff.bfc % 256, 0)
+
+    def test_effective_for_bf_reduction_with_small_bfc(self):
+        """bf reduces correctly when original config has bfc < bf."""
+        cfg = FusedMoEBlockConfig(
+            bt=32,
+            bf=512,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=256,
+            bd1c=1024,
+            bd2c=1024,
+            bse=512,
+        )
+        eff = cfg.effective_for(
+            num_tokens=256,
+            ep_size=1,
+            dtype=jnp.bfloat16,
+            intermediate_size=768,
+        )
+        self.assertEqual(eff.bf, 384)
+        self.assertEqual(768 % eff.bf, 0)
+        # bfc=min(256,384)=256, but 384%256!=0, so must reduce to 128
+        self.assertEqual(eff.bfc, 128)
+        self.assertEqual(eff.bf % eff.bfc, 0)
+
+    def test_effective_for_raises_when_no_valid_bf(self):
+        """Raises when no bf candidate has a feasible bfc under quant constraints."""
+        cfg = FusedMoEBlockConfig(
+            bt=32,
+            bf=512,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=512,
+            bd1c=1024,
+            bd2c=1024,
+            bse=512,
+        )
+        # intermediate_size=384: bf=384 fails (no bfc with 384%bfc==0 and bfc%256==0),
+        # bf=256 fails (384%256!=0), bf=128 fails (128%256!=0) → no solution.
+        with self.assertRaises(ValueError):
+            cfg.effective_for(
+                num_tokens=256,
+                ep_size=1,
+                dtype=jnp.float8_e4m3fn,
+                intermediate_size=384,
+                quant_block_k=256,
+            )
+
+    def test_effective_for_bse_auto_derived_after_reduction(self):
+        """bse auto-derives from reduced bf when bse is None."""
+        cfg = FusedMoEBlockConfig(
+            bt=32,
+            bf=512,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=512,
+            bd1c=1024,
+            bd2c=1024,
+            bse=None,
+        )
+        eff = cfg.effective_for(
+            num_tokens=256,
+            ep_size=1,
+            dtype=jnp.bfloat16,
+            intermediate_size=768,
+        )
+        self.assertEqual(eff.bf, 384)
+        self.assertEqual(eff.bse, 384)
+
 
 if __name__ == "__main__":
     absltest.main(testLoader=jtu.JaxTestLoader())

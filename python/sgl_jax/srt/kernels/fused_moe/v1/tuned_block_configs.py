@@ -167,7 +167,6 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 2048, 512, 32, True, True): (128, 512, 2048, 2048, 128, 128, 512, 2048, 2048, 256),
     },
     # MiMoV2Flash: 256 experts, top_k=8, H=4096, I=2048, ep=16, no shared expert, no grouped topk
-    # Tuned on v6e-16 (4x4 topology) with vmem_limit=96MB, 2026-04-08
     "TPU v6e": {
         ('bfloat16', 'bfloat16', 32, 256, 8, 4096, 2048, 16, False, False): (2, 2048, 2048, 2048, 32, 32, 2048, 2048, 2048, 2048),
         ('bfloat16', 'bfloat16', 64, 256, 8, 4096, 2048, 16, False, False): (4, 2048, 2048, 2048, 64, 64, 2048, 2048, 2048, 2048),
@@ -180,8 +179,7 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'bfloat16', 8192, 256, 8, 4096, 2048, 16, False, False): (512, 1024, 1024, 1024, 256, 256, 1024, 1024, 1024, 1024),
         ('bfloat16', 'bfloat16', 16384, 256, 8, 4096, 2048, 16, False, False): (512, 1024, 1024, 1024, 256, 256, 1024, 1024, 1024, 1024),
         ('bfloat16', 'bfloat16', 32768, 256, 8, 4096, 2048, 16, False, False): (256, 1024, 4096, 4096, 128, 128, 1024, 4096, 4096, 1024),
-        # FP8 (float8_e4m3fn weights, bfloat16 activations), updated for 2D block-wise quant
-        # (block_k=128, block_n=128) on v6e-16, 2026-04-11.
+        # FP8 (float8_e4m3fn weights, bfloat16 activations), 2D block-wise quant (block_k=128, block_n=128)
         ('bfloat16', 'float8_e4m3fn', 32, 256, 8, 4096, 2048, 16, False, False): (2, 2048, 4096, 4096, 2, 2, 2048, 4096, 4096, 2048),
         ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 4096, 2048, 16, False, False): (4, 2048, 4096, 4096, 32, 32, 2048, 4096, 4096, 2048),
         ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 4096, 2048, 16, False, False): (8, 2048, 4096, 4096, 32, 32, 2048, 4096, 4096, 2048),
@@ -193,7 +191,6 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 4096, 2048, 16, False, False): (512, 512, 2048, 2048, 256, 256, 512, 2048, 2048, 512),
         ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 4096, 2048, 16, False, False): (512, 512, 2048, 2048, 256, 256, 512, 2048, 2048, 512),
         # 384 experts, top_k=8, H=6144, I=2048, ep=64, FP8 block quant (128x128)
-        # Tuned on v6e-64 (8x8 topology) with vmem_limit=96MB, 2026-04-21
         ('bfloat16', 'float8_e4m3fn', 128, 384, 8, 6144, 2048, 64, False, False): (2, 2048, 2048, 2048, 32, 32, 2048, 2048, 2048, 2048),
         ('bfloat16', 'float8_e4m3fn', 256, 384, 8, 6144, 2048, 64, False, False): (4, 2048, 2048, 2048, 64, 64, 2048, 2048, 2048, 2048),
         ('bfloat16', 'float8_e4m3fn', 512, 384, 8, 6144, 2048, 64, False, False): (8, 2048, 2048, 2048, 32, 32, 2048, 2048, 2048, 2048),
@@ -202,6 +199,17 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'float8_e4m3fn', 4096, 384, 8, 6144, 2048, 64, False, False): (64, 1024, 2048, 2048, 256, 256, 1024, 2048, 2048, 1024),
         ('bfloat16', 'float8_e4m3fn', 8192, 384, 8, 6144, 2048, 64, False, False): (64, 1024, 2048, 2048, 256, 256, 1024, 2048, 2048, 1024),
         ('bfloat16', 'float8_e4m3fn', 16384, 384, 8, 6144, 2048, 64, False, False): (64, 1024, 2048, 2048, 256, 256, 1024, 2048, 2048, 1024),
+        # Qwen3-MoE: 128 experts, top_k=8, H=2048, I=768, ep=4, no shared expert, no grouped topk
+        ('bfloat16', 'bfloat16', 16, 128, 8, 2048, 768, 4, False, False): (4, 768, 2048, 2048, 8, 8, 768, 2048, 2048, 768),
+        ('bfloat16', 'bfloat16', 32, 128, 8, 2048, 768, 4, False, False): (8, 768, 2048, 2048, 8, 8, 768, 2048, 2048, 768),
+        ('bfloat16', 'bfloat16', 64, 128, 8, 2048, 768, 4, False, False): (16, 768, 2048, 2048, 16, 16, 768, 2048, 2048, 768),
+        ('bfloat16', 'bfloat16', 128, 128, 8, 2048, 768, 4, False, False): (32, 768, 2048, 2048, 32, 32, 768, 2048, 2048, 768),
+        ('bfloat16', 'bfloat16', 256, 128, 8, 2048, 768, 4, False, False): (64, 768, 2048, 2048, 64, 64, 768, 2048, 2048, 768),
+        ('bfloat16', 'bfloat16', 512, 128, 8, 2048, 768, 4, False, False): (128, 768, 2048, 2048, 128, 128, 768, 2048, 2048, 768),
+        ('bfloat16', 'bfloat16', 1024, 128, 8, 2048, 768, 4, False, False): (256, 768, 2048, 2048, 256, 256, 768, 2048, 2048, 768),
+        ('bfloat16', 'bfloat16', 2048, 128, 8, 2048, 768, 4, False, False): (512, 768, 2048, 2048, 128, 128, 768, 2048, 2048, 768),
+        ('bfloat16', 'bfloat16', 4096, 128, 8, 2048, 768, 4, False, False): (512, 768, 2048, 2048, 128, 128, 768, 2048, 2048, 768),
+        ('bfloat16', 'bfloat16', 8192, 128, 8, 2048, 768, 4, False, False): (512, 768, 2048, 2048, 128, 128, 768, 2048, 2048, 768),
     },
     # Fallback for any device kind.
     "*": {},
