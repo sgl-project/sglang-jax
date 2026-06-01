@@ -119,10 +119,22 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
                 ext_lens = all_forward_batches[0].extend_seq_lens
                 input_ids = _device_rotate_input_ids(input_ids, ext_lens, sel_pos, topk_idx[:, 0])
 
+        # Force P() replicated sharding on outputs that must be cross-process
+        # consistent. Without this, donate_argnames may let XLA alias output
+        # buffers with donated P("data")-sharded pool buffers, silently making
+        # np.asarray() return per-process-different values.
+        stacked_p = jnp.stack(all_topk_p, axis=1)
+        stacked_idx = jnp.stack(all_topk_index, axis=1)
+        if mesh is not None:
+            rep = NamedSharding(mesh, P())
+            layer0_hidden = jax.lax.with_sharding_constraint(layer0_hidden, rep)
+            stacked_p = jax.lax.with_sharding_constraint(stacked_p, rep)
+            stacked_idx = jax.lax.with_sharding_constraint(stacked_idx, rep)
+
         return (
             layer0_hidden,
-            jnp.stack(all_topk_p, axis=1),
-            jnp.stack(all_topk_index, axis=1),
+            stacked_p,
+            stacked_idx,
             tuple(all_pool_updates),
         )
 
