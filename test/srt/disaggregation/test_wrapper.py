@@ -23,8 +23,8 @@ import pytest
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.disaggregation import jax_transfer_wrapper as jtw_mod
-from sgl_jax.srt.disaggregation.jax_transfer_wrapper import (
+from sgl_jax.srt.disaggregation.jax_transfer import wrapper as jtw_mod
+from sgl_jax.srt.disaggregation.jax_transfer.wrapper import (
     JaxTransferWrapper,
     _uuid_to_int,
     get_or_create_wrapper,
@@ -179,6 +179,6 @@ def test_singleton_rejects_rebinding():
 def test_uuid_str_to_int_is_stable_and_in_range():
     assert _uuid_to_int("req-0") == _uuid_to_int("req-0")
     assert _uuid_to_int("req-0") != _uuid_to_int("req-1")
-    for s in ("a", "abc", "req-12345", "🦫"):
+    for s in ("a", "abc", "req-12345", "\U0001f9ab"):
         v = _uuid_to_int(s)
         assert 0 <= v < (1 << 32)

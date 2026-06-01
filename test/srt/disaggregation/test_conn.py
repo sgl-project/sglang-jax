@@ -1,14 +1,13 @@
-"""Sender event-driven state-machine test.
+"""Tests for JaxTransferKVManager, sender event-driven lifecycle, and orphan reaper.
 
-Wires a real :class:`ZmqPullNotifier` pair (P + D in-process) to a
+Sender tests wire a real :class:`ZmqPullNotifier` pair (P + D in-process) to a
 mocked :class:`JaxTransferWrapper`, verifying the sender transitions
 from ``TRANSFERRING`` to ``SUCCESS`` only after the decoder sends the
 ack — and that the wrapper's ``release`` + the manager's lifecycle
 prune both fire exactly once.
 
-Path A (D2H staging) is exercised via a real :class:`QueueHostKVPool`
-(allocated on CPU jax). Path B (direct from HBM) is exercised with a
-plain ``jnp.array`` payload.
+Reaper tests drive ``JaxTransferKVManager.reap_once(now)`` with a hand-stepped
+clock so the tests stay deterministic.
 """
 
 from __future__ import annotations
@@ -26,8 +25,8 @@ import pytest
 from jax.sharding import Mesh, PartitionSpec
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
+from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
 from sgl_jax.srt.disaggregation.jax_transfer.conn import JaxTransferKVManager
-from sgl_jax.srt.disaggregation.jax_transfer.zmq_notifier import ZmqPullNotifier
 from sgl_jax.srt.mem_cache.host_kv_pool import QueueHostKVPool
 
 
@@ -50,10 +49,6 @@ def _wait_until(predicate, timeout_s: float = 2.0) -> bool:
 
 
 def _mock_wrapper():
-    """Wrapper substitute that records register_pull / release without
-    touching the real jax.experimental.transfer API.
-    """
-
     w = mock.MagicMock()
     w.is_started = True
     w._pending = {}
@@ -94,6 +89,11 @@ def notifiers():
     yield p, d
     d.stop()
     p.stop()
+
+
+# ------------------------------------------------------------------
+# Sender event-driven lifecycle (from test_kv_sender_event_driven)
+# ------------------------------------------------------------------
 
 
 def test_path_b_sender_transitions_only_after_ack(notifiers):
@@ -206,9 +206,7 @@ def test_attach_payload_rejects_double_attach(notifiers):
         sender.attach_payload(payload, use_d2h_staging=False)
 
 
-# Regression tests for the sender/ack races. Both use a wrapper
-# substitute whose ``register_pull`` blocks on a barrier so we can
-# deterministically drive the listener-vs-main race.
+# Regression tests for the sender/ack races.
 
 
 def _barrier_wrapper(barrier_event: threading.Event):
@@ -217,9 +215,6 @@ def _barrier_wrapper(barrier_event: threading.Event):
     w._pending = {}
 
     def register_pull(uuid, data):
-        # Hold for a moment so the test thread can fire the ack
-        # before ``send`` returns and transitions the sender to
-        # TRANSFERRING.
         barrier_event.wait(timeout=5.0)
         w._pending[uuid] = data
 
@@ -232,14 +227,6 @@ def _barrier_wrapper(barrier_event: threading.Event):
 
 
 def test_send_ack_race_safe(notifiers):
-    """An ack arriving mid-handoff must not wedge the sender.
-
-    ``send()`` holds ``_state_lock`` around callback registration,
-    producer handoff, and the state transition. The listener's
-    ``_on_ack`` blocks on that lock until ``send()`` finishes, then
-    transitions the sender to SUCCESS.
-    """
-
     p_notifier, d_notifier = notifiers
     barrier = threading.Event()
     wrapper = _barrier_wrapper(barrier)
@@ -249,8 +236,6 @@ def test_send_ack_race_safe(notifiers):
     sender.init(kv_indices=None)
     sender.attach_payload({"kv": jnp.zeros(4, dtype=jnp.float32)}, use_d2h_staging=False)
 
-    # Run ``send`` on a background thread so the main thread can fire
-    # the ack while ``send`` is blocked inside ``producer_handoff``.
     send_done = threading.Event()
 
     def run_send():
@@ -260,19 +245,10 @@ def test_send_ack_race_safe(notifiers):
     send_thread = threading.Thread(target=run_send)
     send_thread.start()
 
-    # Wait for ``send`` to be inside ``register_pull`` (callback is
-    # registered first under the state lock; producer_handoff then
-    # blocks on the barrier).
     assert _wait_until(lambda: p_notifier.pending_count() == 1)
-    # Fire the ack now, before ``send`` releases the state lock.
     d_notifier.send_done(b"req-race", "127.0.0.1", p_notifier.port)
-    # Listener thread pops the callback and tries to acquire
-    # ``_state_lock``; it must block because ``send`` is still
-    # holding it.
     assert _wait_until(lambda: p_notifier.pending_count() == 0)
 
-    # Release ``send``'s barrier; it finishes the transition to
-    # TRANSFERRING, releases the lock, and ``_on_ack`` proceeds.
     barrier.set()
     assert send_done.wait(timeout=3.0)
     assert _wait_until(lambda: sender.poll() == KVPoll.SUCCESS)
@@ -281,13 +257,6 @@ def test_send_ack_race_safe(notifiers):
 
 
 def test_fail_owns_cleanup_when_callback_still_registered(notifiers):
-    """If ``fail()`` wins the callback race, it owns cleanup.
-
-    When the listener has not popped the callback yet,
-    ``unregister_callback()`` returns it and ``fail()`` must run
-    ``on_done()`` exactly once.
-    """
-
     p_notifier, _ = notifiers
     wrapper = _mock_wrapper()
     pool = _make_host_pool(pool_size=2, max_tokens=8)
@@ -302,7 +271,6 @@ def test_fail_owns_cleanup_when_callback_still_registered(notifiers):
     assert in_use_initial == 1
 
     sender.fail()
-    # ``fail`` claimed cleanup → buffer returned, wrapper released.
     assert sender.poll() == KVPoll.FAILED
     assert pool.available_size() == pool.total_size()
     assert wrapper.release.call_count == 1
@@ -310,12 +278,6 @@ def test_fail_owns_cleanup_when_callback_still_registered(notifiers):
 
 
 def test_fail_after_listener_popped_skips_cleanup(notifiers):
-    """If the listener already owns the callback, ``fail()`` skips cleanup.
-
-    Once the listener pops the callback, the in-flight ``_on_ack`` path
-    must be the only owner of ``on_done()``.
-    """
-
     p_notifier, _ = notifiers
     wrapper = _mock_wrapper()
     pool = _make_host_pool(pool_size=2, max_tokens=8)
@@ -327,32 +289,20 @@ def test_fail_after_listener_popped_skips_cleanup(notifiers):
     sender.attach_payload({"kv": device_kv}, use_d2h_staging=True)
     sender.send()
 
-    # Listener thread pops the callback (simulated by manual pop —
-    # same dict op the listener uses internally).
     cb = p_notifier.unregister_callback(b"req-ack-owns-cleanup")
     assert cb is not None
 
-    # ``fail`` runs while the popped callback is still in flight.
     sender.fail()
     assert sender.poll() == KVPoll.FAILED
-    # Buffer is NOT yet returned because ``fail`` ceded cleanup.
     assert pool.available_size() == pool.total_size() - 1
-    # ``wrapper.release`` has NOT been called by fail either.
     assert wrapper.release.call_count == 0
 
-    # Now run the popped callback as the listener would have done.
     cb(b"req-ack-owns-cleanup")
-    # ``_on_ack`` runs cleanup exactly once.
     assert pool.available_size() == pool.total_size()
     assert wrapper.release.call_count == 1
 
 
 def test_late_ack_from_old_transfer_id_does_not_complete_reused_req(notifiers):
-    """Lifecycle regression: if a logical request id is reused for a
-    new transfer attempt, a stale ack for the OLD transfer id must not
-    complete the new sender.
-    """
-
     p_notifier, d_notifier = notifiers
     wrapper = _mock_wrapper()
     mgr = JaxTransferKVManager(wrapper, p_notifier)
@@ -371,14 +321,11 @@ def test_late_ack_from_old_transfer_id_does_not_complete_reused_req(notifiers):
     )
     sender2.send()
 
-    # A stale ack for the OLD transfer attempt must not terminate the
-    # current sender.
     d_notifier.send_done(b"req-reuse#old", "127.0.0.1", p_notifier.port)
     time.sleep(0.05)
     assert sender2.poll() == KVPoll.TRANSFERRING
     assert "req-reuse#new:kv" in wrapper._pending
 
-    # The matching ack still completes the current transfer.
     d_notifier.send_done(b"req-reuse#new", "127.0.0.1", p_notifier.port)
     assert _wait_until(lambda: sender2.poll() == KVPoll.SUCCESS)
     assert "req-reuse#new:kv" not in wrapper._pending
@@ -399,7 +346,7 @@ def test_late_ack_after_success_is_classified_as_retired(notifiers, caplog):
 
     with caplog.at_level(
         logging.INFO,
-        logger="sgl_jax.srt.disaggregation.jax_transfer.zmq_notifier",
+        logger="sgl_jax.srt.disaggregation.common.zmq_notifier",
     ):
         d_notifier.send_done(b"req-late-success", "127.0.0.1", p_notifier.port)
         assert _wait_until(
@@ -428,7 +375,7 @@ def test_late_ack_after_fail_is_classified_as_retired(notifiers, caplog):
 
     with caplog.at_level(
         logging.INFO,
-        logger="sgl_jax.srt.disaggregation.jax_transfer.zmq_notifier",
+        logger="sgl_jax.srt.disaggregation.common.zmq_notifier",
     ):
         d_notifier.send_done(b"req-late-fail", "127.0.0.1", p_notifier.port)
         assert _wait_until(
@@ -565,3 +512,175 @@ def test_entry_name_with_colon_rejected(notifiers):
     )
     with pytest.raises(ValueError, match="must not contain ':'"):
         sender.send()
+
+
+# ------------------------------------------------------------------
+# Orphan reaper and per-phase timeout (from test_orphan_reaper)
+# ------------------------------------------------------------------
+
+
+def _make_mgr(ack_timeout=10.0, pull_timeout=5.0):
+    wrapper = mock.MagicMock()
+    notifier = mock.MagicMock()
+    notifier.unregister_callback.return_value = None
+    return JaxTransferKVManager(
+        wrapper,
+        notifier,
+        host_pool=None,
+        ack_timeout_seconds=ack_timeout,
+        pull_timeout_seconds=pull_timeout,
+        reaper_interval_seconds=60.0,
+    )
+
+
+def test_reap_once_does_nothing_when_no_inflight():
+    mgr = _make_mgr()
+    s, r = mgr.reap_once(now=1000.0)
+    assert s == [] and r == []
+
+
+def test_reap_once_skips_senders_in_bootstrapping():
+    mgr = _make_mgr()
+    sender = mgr.create_sender("req-1")
+    s, r = mgr.reap_once(now=10000.0)
+    assert s == [] and r == []
+    assert sender.state == KVPoll.BOOTSTRAPPING
+
+
+def test_reap_once_force_fails_orphan_sender(monkeypatch):
+    mgr = _make_mgr(ack_timeout=10.0)
+    sender = mgr.create_sender("req-orphan")
+    sender._transition_to(KVPoll.WAITING_FOR_INPUT)
+    sender._transition_to(KVPoll.TRANSFERRING)
+    sender._transfer_started_at = 0.0
+    sender._status = mock.MagicMock()
+
+    s, r = mgr.reap_once(now=10.0 + 0.001)
+    assert s == ["req-orphan"]
+    assert r == []
+    assert sender.state == KVPoll.FAILED
+    record = mgr.get_terminal_record("req-orphan", role="prefill")
+    assert record is not None
+    assert record.state == KVPoll.FAILED
+    assert record.reason == "timeout"
+
+
+def test_reap_once_force_fails_orphan_receiver():
+    mgr = _make_mgr(pull_timeout=5.0)
+    receiver = mgr.create_receiver("req-stuck")
+    receiver._transition_to(KVPoll.WAITING_FOR_INPUT)
+    receiver._transition_to(KVPoll.TRANSFERRING)
+    receiver._transfer_started_at = 100.0
+
+    s, r = mgr.reap_once(now=105.001)
+    assert s == []
+    assert r == ["req-stuck"]
+    assert receiver.state == KVPoll.FAILED
+    record = mgr.get_terminal_record("req-stuck", role="decode")
+    assert record is not None
+    assert record.state == KVPoll.FAILED
+    assert record.reason == "timeout"
+
+
+def test_reap_once_below_threshold_is_no_op():
+    mgr = _make_mgr(ack_timeout=10.0, pull_timeout=5.0)
+    sender = mgr.create_sender("s1")
+    sender._transition_to(KVPoll.WAITING_FOR_INPUT)
+    sender._transition_to(KVPoll.TRANSFERRING)
+    sender._transfer_started_at = 0.0
+    sender._status = mock.MagicMock()
+
+    receiver = mgr.create_receiver("r1")
+    receiver._transition_to(KVPoll.WAITING_FOR_INPUT)
+    receiver._transition_to(KVPoll.TRANSFERRING)
+    receiver._transfer_started_at = 0.0
+
+    s, r = mgr.reap_once(now=4.0)
+    assert s == []
+    assert r == []
+
+
+def test_reaper_disabled_timeouts():
+    mgr = _make_mgr(ack_timeout=0.0, pull_timeout=0.0)
+    sender = mgr.create_sender("s1")
+    sender._transition_to(KVPoll.WAITING_FOR_INPUT)
+    sender._transition_to(KVPoll.TRANSFERRING)
+    sender._transfer_started_at = 0.0
+
+    s, r = mgr.reap_once(now=1_000_000.0)
+    assert s == [] and r == []
+
+
+def test_inflight_count_reflects_active():
+    mgr = _make_mgr()
+    assert mgr.inflight_count() == (0, 0)
+    mgr.create_sender("a")
+    mgr.create_receiver("b")
+    mgr.create_receiver("c")
+    assert mgr.inflight_count() == (1, 2)
+
+
+def test_graceful_shutdown_drains_when_clean():
+    mgr = _make_mgr()
+    aborted_s, aborted_r = mgr.graceful_shutdown(drain_timeout_seconds=0.1)
+    assert (aborted_s, aborted_r) == (0, 0)
+
+
+def test_graceful_shutdown_force_fails_after_timeout():
+    mgr = _make_mgr()
+    sender = mgr.create_sender("s1")
+    sender._transition_to(KVPoll.WAITING_FOR_INPUT)
+    sender._transition_to(KVPoll.TRANSFERRING)
+    sender._transfer_started_at = 0.0
+    sender._status = mock.MagicMock()
+
+    aborted_s, aborted_r = mgr.graceful_shutdown(drain_timeout_seconds=0.05)
+    assert aborted_s == 1
+    assert sender.state == KVPoll.FAILED
+    record = mgr.get_terminal_record("s1", role="prefill")
+    assert record is not None
+    assert record.state == KVPoll.FAILED
+    assert record.reason == "shutdown"
+
+
+def test_receiver_fail_is_lock_protected_against_concurrent_poll():
+    mgr = _make_mgr()
+    receiver = mgr.create_receiver("r-race")
+    receiver._metadata = mock.MagicMock()
+    receiver._metadata.uuid = "r-race"
+    receiver._metadata.p_side_channel_host = "127.0.0.1"
+    receiver._metadata.p_side_channel_port = 9601
+    receiver._metadata.remote_addr = "127.0.0.1:30001"
+    receiver._metadata.spec = mock.MagicMock()
+
+    receiver._transition_to(KVPoll.WAITING_FOR_INPUT)
+    receiver._transition_to(KVPoll.TRANSFERRING)
+    receiver._transfer_started_at = 0.0
+    fake_arr = mock.MagicMock()
+    fake_arr.is_ready.return_value = True
+    receiver._result = fake_arr
+
+    receiver.fail(reason="timeout")
+    assert receiver.state == KVPoll.FAILED
+
+    final = receiver.poll()
+    assert final == KVPoll.FAILED
+
+
+def test_receiver_abort_failure_exception_and_clear():
+    mgr = _make_mgr()
+    receiver = mgr.create_receiver("r-abort")
+
+    receiver.abort()
+    assert receiver.state == KVPoll.FAILED
+    record = mgr.get_terminal_record("r-abort", role="decode")
+    assert record is not None
+    assert record.state == KVPoll.FAILED
+    assert record.reason == "abort"
+
+    with pytest.raises(RuntimeError, match="abort"):
+        receiver.failure_exception()
+
+    receiver.clear()
+    assert mgr.get_terminal_record("r-abort", role="decode") is None
+    receiver.clear()

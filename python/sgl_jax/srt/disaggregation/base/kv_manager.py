@@ -14,6 +14,8 @@ import abc
 import enum
 import logging
 
+import jax
+
 logger = logging.getLogger(__name__)
 
 
@@ -86,7 +88,7 @@ class StateHolder:
         self._state = next_state
         if self._role is not None:
             try:
-                from sgl_jax.srt.disaggregation.metrics import PD_STATE_TRANSITION_TOTAL
+                from sgl_jax.srt.disaggregation.common.metrics import PD_STATE_TRANSITION_TOTAL
 
                 PD_STATE_TRANSITION_TOTAL.labels(
                     from_state=from_state.value,
@@ -154,3 +156,25 @@ class KVReceiver(abc.ABC):
     def failure_exception(self) -> None:
         """Raise the terminal transfer failure as an exception."""
         ...
+
+
+class TransferBackend(abc.ABC):
+    """Leaf-level tensor publish / pull / release."""
+
+    @abc.abstractmethod
+    def register_pull(self, uuid: str, data: jax.Array) -> None:
+        """Make ``data`` available for remote pull under ``uuid``."""
+
+    @abc.abstractmethod
+    def pull(
+        self,
+        uuid: str,
+        spec: jax.ShapeDtypeStruct,
+        *,
+        remote_addr: str,
+    ) -> jax.Array:
+        """Pull a tensor from ``remote_addr`` keyed by ``uuid``."""
+
+    @abc.abstractmethod
+    def release(self, uuid: str) -> None:
+        """Drop the internal reference for ``uuid``."""

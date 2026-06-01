@@ -29,24 +29,49 @@ from sgl_jax.srt.disaggregation.base.kv_manager import (
     KVReceiver,
     KVSender,
     StateHolder,
-)
-from sgl_jax.srt.disaggregation.jax_transfer.zmq_notifier import ZmqPullNotifier
-from sgl_jax.srt.disaggregation.jax_transfer_wrapper import JaxTransferWrapper
-from sgl_jax.srt.disaggregation.metrics import (
-    PD_TRANSFER_FAILURES_TOTAL,
-    time_phase,
-)
-from sgl_jax.srt.disaggregation.transport.backend import (
-    JaxTransferBackend,
     TransferBackend,
 )
-from sgl_jax.srt.disaggregation.transport.core import (
+from sgl_jax.srt.disaggregation.common.core import (
     RequestTransportCore,
     TerminalTransferRecord,
 )
+from sgl_jax.srt.disaggregation.common.metrics import (
+    PD_TRANSFER_FAILURES_TOTAL,
+    time_phase,
+)
+from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
+from sgl_jax.srt.disaggregation.jax_transfer.wrapper import JaxTransferWrapper
 from sgl_jax.srt.mem_cache.host_kv_pool import HostKVPool, StagedData
 
+
+class JaxTransferBackend(TransferBackend):
+    """Thin wrapper around :class:`JaxTransferWrapper`."""
+
+    def __init__(self, wrapper: JaxTransferWrapper) -> None:
+        self._wrapper = wrapper
+
+    @property
+    def wrapper(self) -> JaxTransferWrapper:
+        return self._wrapper
+
+    def register_pull(self, uuid: str, data: jax.Array) -> None:
+        self._wrapper.register_pull(uuid, data)
+
+    def pull(
+        self,
+        uuid: str,
+        spec: jax.ShapeDtypeStruct,
+        *,
+        remote_addr: str,
+    ) -> jax.Array:
+        return self._wrapper.pull(uuid, spec, remote_addr=remote_addr)
+
+    def release(self, uuid: str) -> None:
+        self._wrapper.release(uuid)
+
+
 __all__ = [
+    "JaxTransferBackend",
     "JaxTransferKVManager",
     "JaxTransferKVReceiver",
     "JaxTransferKVSender",

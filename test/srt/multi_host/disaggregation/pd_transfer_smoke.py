@@ -34,8 +34,8 @@ from pd_transfer_matrix import (
 )
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
 from sgl_jax.srt.disaggregation.jax_transfer.conn import JaxTransferKVManager, PMetadata
-from sgl_jax.srt.disaggregation.jax_transfer.zmq_notifier import ZmqPullNotifier
-from sgl_jax.srt.disaggregation.jax_transfer_wrapper import get_or_create_wrapper
+from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
+from sgl_jax.srt.disaggregation.jax_transfer.wrapper import get_or_create_wrapper
 from sgl_jax.srt.mem_cache.host_kv_pool import QueueHostKVPool
 
 REQ_ID = "pd-smoke"
@@ -92,7 +92,7 @@ def _prefill(args: argparse.Namespace) -> int:
         )
         payload_flat.block_until_ready()
         payload = payload_flat.reshape((NUM_ELEMS, 1, 1, 1)) if args.use_d2h_staging else payload_flat
-        sender.attach_payload(payload, use_d2h_staging=args.use_d2h_staging)
+        sender.attach_payload({"kv": payload}, use_d2h_staging=args.use_d2h_staging)
         sender.send()
         status = _read_line(ctl, rx_buf).strip()
         if status != "PASS":
@@ -134,7 +134,7 @@ def _decode(args: argparse.Namespace) -> int:
             PMetadata(
                 remote_addr=p_transfer_addr,
                 uuid=REQ_ID,
-                spec=spec,
+                specs={"kv": spec},
                 p_side_channel_host=p_host,
                 p_side_channel_port=int(p_side_channel_port),
             )
@@ -143,7 +143,7 @@ def _decode(args: argparse.Namespace) -> int:
         if state != KVPoll.SUCCESS or receiver.result is None:
             ctl.sendall(f"FAIL state={state.value}\n".encode())
             return 1
-        got = _arr_host_bytes(receiver.result)
+        got = _arr_host_bytes(receiver.result["kv"])
         expected = _payload_numpy(SEED, DTYPE_NAME, NUM_ELEMS).tobytes()
         if got != expected:
             ctl.sendall(b"FAIL bytes-mismatch\n")

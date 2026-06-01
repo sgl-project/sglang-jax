@@ -276,7 +276,7 @@ class ZmqPullNotifier:
                         uuid,
                     )
                     try:
-                        from sgl_jax.srt.disaggregation.metrics import (
+                        from sgl_jax.srt.disaggregation.common.metrics import (
                             PD_TRANSFER_FAILURES_TOTAL,
                         )
 

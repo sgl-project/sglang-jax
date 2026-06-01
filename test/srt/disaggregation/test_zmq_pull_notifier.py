@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from sgl_jax.srt.disaggregation.jax_transfer.zmq_notifier import ZmqPullNotifier
+from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
 
 
 def _free_port() -> int:

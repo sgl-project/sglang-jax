@@ -203,7 +203,7 @@ class QueueHostKVPool(HostKVPool):
                 return None
             buffer_id = self._free_ids.pop(0)
         try:
-            from sgl_jax.srt.disaggregation.metrics import host_pool_alloc
+            from sgl_jax.srt.disaggregation.common.metrics import host_pool_alloc
 
             host_pool_alloc(self._pool_name, 1)
         except Exception:  # noqa: BLE001
@@ -225,7 +225,7 @@ class QueueHostKVPool(HostKVPool):
                 )
             buffer_id = self._free_ids.pop(0)
         try:
-            from sgl_jax.srt.disaggregation.metrics import host_pool_alloc
+            from sgl_jax.srt.disaggregation.common.metrics import host_pool_alloc
 
             host_pool_alloc(self._pool_name, 1)
         except Exception:  # noqa: BLE001
@@ -256,7 +256,7 @@ class QueueHostKVPool(HostKVPool):
         # see the latest content; .at[].set() returns a new array.
         self._buffers[handle.buffer_id] = updated
         try:
-            from sgl_jax.srt.disaggregation.metrics import PD_TRANSFER_BYTES_TOTAL
+            from sgl_jax.srt.disaggregation.common.metrics import PD_TRANSFER_BYTES_TOTAL
 
             PD_TRANSFER_BYTES_TOTAL.labels(direction="d2h", role="prefill").inc(
                 int(device_kv.nbytes)
@@ -284,7 +284,7 @@ class QueueHostKVPool(HostKVPool):
                 )
             self._free_ids.append(buffer_id)
         try:
-            from sgl_jax.srt.disaggregation.metrics import host_pool_free
+            from sgl_jax.srt.disaggregation.common.metrics import host_pool_free
 
             host_pool_free(self._pool_name, 1)
         except Exception:  # noqa: BLE001

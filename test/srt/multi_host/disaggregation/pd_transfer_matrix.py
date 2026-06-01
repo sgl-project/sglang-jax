@@ -54,8 +54,8 @@ from sgl_jax.srt.disaggregation.jax_transfer.conn import (
     JaxTransferKVSender,
     PMetadata,
 )
-from sgl_jax.srt.disaggregation.jax_transfer.zmq_notifier import ZmqPullNotifier
-from sgl_jax.srt.disaggregation.jax_transfer_wrapper import get_or_create_wrapper
+from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
+from sgl_jax.srt.disaggregation.jax_transfer.wrapper import get_or_create_wrapper
 from sgl_jax.srt.mem_cache.host_kv_pool import QueueHostKVPool
 
 PAGE_SIZE_TOKENS = int(os.environ.get("PD_PAGE_SIZE_TOKENS", "128"))
@@ -337,7 +337,7 @@ def _prefill(args: argparse.Namespace) -> int:
                     payload_sharding,
                 )
                 payload.block_until_ready()
-            sender.attach_payload(payload, use_d2h_staging=args.use_d2h_staging)
+            sender.attach_payload({"kv": payload}, use_d2h_staging=args.use_d2h_staging)
             sender.send()
             line = f"{req_id} {num_tokens} {cell.dtype_name} {seed}\n".encode()
             conn.sendall(line)
@@ -462,7 +462,7 @@ def _decode(args: argparse.Namespace) -> int:
                     PMetadata(
                         remote_addr=p_transfer_addr,
                         uuid=req_id,
-                        spec=spec,
+                        specs={"kv": spec},
                         p_side_channel_host=p_host,
                         p_side_channel_port=p_side_channel_port_int,
                     ),
@@ -497,7 +497,7 @@ def _decode(args: argparse.Namespace) -> int:
                 print(f"[D] FAIL {req_id} state={state.value}", flush=True)
                 break
 
-            arr = receiver.result
+            arr = receiver.result["kv"]
             assert arr is not None
             got_bytes = _arr_host_bytes(arr)
             ref_bytes = _payload_numpy(seed, dtype_name, num_tokens).tobytes()

@@ -15,7 +15,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
-from sgl_jax.srt.disaggregation.metrics import PD_TRANSFER_INFLIGHT
+from sgl_jax.srt.disaggregation.common.metrics import PD_TRANSFER_INFLIGHT
 
 
 @dataclass(frozen=True)

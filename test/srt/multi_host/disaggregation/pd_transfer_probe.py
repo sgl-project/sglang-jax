@@ -30,7 +30,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.disaggregation.jax_transfer_wrapper import get_or_create_wrapper
+from sgl_jax.srt.disaggregation.jax_transfer.wrapper import get_or_create_wrapper
 
 NELEM = 4096
 UUID = "probe-0"

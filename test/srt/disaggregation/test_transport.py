@@ -1,19 +1,145 @@
-"""Unit tests for ``RequestTransportCore``.
-
-Tests the lifecycle manager in isolation — no JAX, no ZMQ, no real
-transfer wrappers. Mock participants expose the duck-type contract
-(``transfer_started_at``, ``fail(reason=...)``) that the core relies on.
-"""
+"""Tests for the transport layer: KVPoll state machine, TransferBackend ABC, and RequestTransportCore."""
 
 from __future__ import annotations
 
+from unittest import mock
+
 import pytest
 
-from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
-from sgl_jax.srt.disaggregation.transport.core import (
+from sgl_jax.srt.disaggregation.base.kv_manager import (
+    LEGAL_TRANSITIONS,
+    TERMINAL_STATES,
+    KVPoll,
+    StateHolder,
+    TransferBackend,
+    is_legal_transition,
+)
+from sgl_jax.srt.disaggregation.common.core import (
     RequestTransportCore,
     TerminalTransferRecord,
 )
+from sgl_jax.srt.disaggregation.jax_transfer.conn import JaxTransferBackend
+
+
+# ------------------------------------------------------------------
+# KVPoll state machine (from test_kv_manager_state)
+# ------------------------------------------------------------------
+
+
+def test_legal_transitions_set_matches_rfc():
+    assert (
+        frozenset(
+            {
+                (KVPoll.BOOTSTRAPPING, KVPoll.WAITING_FOR_INPUT),
+                (KVPoll.WAITING_FOR_INPUT, KVPoll.TRANSFERRING),
+                (KVPoll.TRANSFERRING, KVPoll.SUCCESS),
+                (KVPoll.BOOTSTRAPPING, KVPoll.FAILED),
+                (KVPoll.WAITING_FOR_INPUT, KVPoll.FAILED),
+                (KVPoll.TRANSFERRING, KVPoll.FAILED),
+            }
+        )
+        == LEGAL_TRANSITIONS
+    )
+
+
+def test_terminal_states():
+    assert frozenset({KVPoll.SUCCESS, KVPoll.FAILED}) == TERMINAL_STATES
+
+
+@pytest.mark.parametrize(
+    ("current", "next_state"),
+    sorted(LEGAL_TRANSITIONS, key=lambda pair: (pair[0].value, pair[1].value)),
+)
+def test_legal_transitions_succeed(current: KVPoll, next_state: KVPoll):
+    holder = StateHolder(initial=current)
+    assert is_legal_transition(current, next_state) is True
+    holder._transition_to(next_state)
+    assert holder.state == next_state
+
+
+@pytest.mark.parametrize(
+    ("current", "next_state"),
+    [
+        (KVPoll.BOOTSTRAPPING, KVPoll.TRANSFERRING),
+        (KVPoll.BOOTSTRAPPING, KVPoll.SUCCESS),
+        (KVPoll.WAITING_FOR_INPUT, KVPoll.SUCCESS),
+        (KVPoll.TRANSFERRING, KVPoll.WAITING_FOR_INPUT),
+    ],
+)
+def test_representative_illegal_transitions_raise(current: KVPoll, next_state: KVPoll):
+    holder = StateHolder(initial=current)
+    assert is_legal_transition(current, next_state) is False
+    with pytest.raises(ValueError, match="illegal KVPoll transition"):
+        holder._transition_to(next_state)
+    assert holder.state == current
+
+
+@pytest.mark.parametrize("terminal", [KVPoll.SUCCESS, KVPoll.FAILED])
+@pytest.mark.parametrize("target", [KVPoll.BOOTSTRAPPING, KVPoll.WAITING_FOR_INPUT])
+def test_terminal_states_reject_outgoing_transitions(terminal: KVPoll, target: KVPoll):
+    holder = StateHolder(initial=terminal)
+    with pytest.raises(ValueError, match="illegal KVPoll transition"):
+        holder._transition_to(target)
+    assert holder.state == terminal
+
+
+def test_self_loops_are_illegal():
+    for state in KVPoll:
+        holder = StateHolder(initial=state)
+        with pytest.raises(ValueError):
+            holder._transition_to(state)
+
+
+# ------------------------------------------------------------------
+# TransferBackend ABC + JaxTransferBackend (from test_transfer_backend)
+# ------------------------------------------------------------------
+
+
+def test_abc_cannot_be_instantiated():
+    with pytest.raises(TypeError):
+        TransferBackend()  # type: ignore[abstract]
+
+
+def test_jax_backend_delegates_register_pull():
+    wrapper = mock.MagicMock()
+    backend = JaxTransferBackend(wrapper)
+    data = mock.MagicMock()
+    backend.register_pull("uuid-1", data)
+    wrapper.register_pull.assert_called_once_with("uuid-1", data)
+
+
+def test_jax_backend_delegates_pull():
+    wrapper = mock.MagicMock()
+    backend = JaxTransferBackend(wrapper)
+    spec = mock.MagicMock()
+    backend.pull("uuid-2", spec, remote_addr="10.0.0.1:30000")
+    wrapper.pull.assert_called_once_with(
+        "uuid-2", spec, remote_addr="10.0.0.1:30000"
+    )
+
+
+def test_jax_backend_delegates_release():
+    wrapper = mock.MagicMock()
+    backend = JaxTransferBackend(wrapper)
+    backend.release("uuid-3")
+    wrapper.release.assert_called_once_with("uuid-3")
+
+
+def test_jax_backend_exposes_wrapper():
+    wrapper = mock.MagicMock()
+    backend = JaxTransferBackend(wrapper)
+    assert backend.wrapper is wrapper
+
+
+def test_jax_backend_is_transfer_backend():
+    wrapper = mock.MagicMock()
+    backend = JaxTransferBackend(wrapper)
+    assert isinstance(backend, TransferBackend)
+
+
+# ------------------------------------------------------------------
+# RequestTransportCore (from test_request_transport_core)
+# ------------------------------------------------------------------
 
 
 class _MockParticipant:
@@ -37,9 +163,7 @@ def _make_core(ack_timeout=10.0, pull_timeout=5.0):
     )
 
 
-# ------------------------------------------------------------------
 # Registry
-# ------------------------------------------------------------------
 
 
 def test_register_and_prune_sender():
@@ -80,9 +204,7 @@ def test_prune_nonexistent_is_no_op():
     core.prune_receiver("ghost")
 
 
-# ------------------------------------------------------------------
 # Terminal records
-# ------------------------------------------------------------------
 
 
 def test_record_and_get_terminal():
@@ -146,9 +268,7 @@ def test_register_sender_clears_old_terminal():
     assert core.get_terminal_record("req-1", role="prefill") is None
 
 
-# ------------------------------------------------------------------
 # Reaper
-# ------------------------------------------------------------------
 
 
 def test_reap_once_no_inflight():
@@ -198,9 +318,7 @@ def test_disabled_timeouts():
     assert s == [] and r == []
 
 
-# ------------------------------------------------------------------
 # Inflight count
-# ------------------------------------------------------------------
 
 
 def test_inflight_count():
@@ -212,9 +330,7 @@ def test_inflight_count():
     assert core.inflight_count() == (1, 2)
 
 
-# ------------------------------------------------------------------
 # Graceful shutdown
-# ------------------------------------------------------------------
 
 
 def test_graceful_shutdown_no_inflight():
