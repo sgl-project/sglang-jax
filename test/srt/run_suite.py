@@ -242,6 +242,9 @@ suites = {
     # Daily workflow keeps running so new cases can be added without restructuring CI.
     "nightly-test-accuracy-text-models-tpu-v6e-1-daily": [],
     "nightly-test-perf-text-models-tpu-v6e-1-daily": [],
+    "nightly-test-openai-api-surface-tpu-v6e-1-daily": [
+        TestFile("openai_server/nightly/test_openai_api_surface.py", 10),
+    ],
     # Infra smoke tests (#1207): radix-cache consistency, request logger, bench-serving self-check.
     # Paths relative to test/srt/ (CI invokes via `cd test/srt && python3 run_suite.py`).
     "nightly-infra-smoke-tpu-v6e-1": [

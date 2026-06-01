@@ -241,7 +241,8 @@ class SchedulerOutputProcessorMixin:
                             )
 
                             self.abort_request(AbortReq(rid=req.rid))
-                        req.grammar.finished = req.finished()
+                        else:
+                            req.grammar.finished = req.finished()
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
@@ -501,7 +502,8 @@ class SchedulerOutputProcessorMixin:
                         )
 
                         self.abort_request(AbortReq(rid=req.rid))
-                    req.grammar.finished = req.finished()
+                    else:
+                        req.grammar.finished = req.finished()
                 if req.return_hidden_states and logits_output.hidden_states is not None:
                     # NOTE: hidden_states is not yet reordered through
                     # logits_indices_selector. Decode-mode hidden_states is

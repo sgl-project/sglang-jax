@@ -168,6 +168,8 @@ class FunctionCallParser:
             return ("structural_tag", strict_tag)
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
             json_schema = get_json_schema_constraint(self.tools, tool_choice)
+            if json_schema is None:
+                return None
             return ("json_schema", json_schema)
 
     def get_ebnf(self, tool_choice: ToolChoice | Literal["required"]) -> str | None:

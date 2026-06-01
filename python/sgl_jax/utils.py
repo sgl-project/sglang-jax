@@ -57,7 +57,7 @@ def convert_json_schema_to_str(json_schema: dict | str | type[BaseModel]) -> str
         If the schema is not a dictionary, a string or a Pydantic class.
     """
     if isinstance(json_schema, dict):
-        schema_str = json.dumps(json_schema)
+        schema_str = json.dumps(json_schema, sort_keys=True)
     elif isinstance(json_schema, str):
         schema_str = json_schema
     elif issubclass(json_schema, BaseModel):

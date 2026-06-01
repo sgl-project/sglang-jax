@@ -28,30 +28,35 @@ class GuidanceGrammar(BaseGrammarObject):
         llguidance_tokenizer: LLTokenizer,
         serialized_grammar: str,
     ):
-        """Initialize a guidance grammar.
-
-        Args:
-            llguidance_tokenizer: LLTokenizer instance
-            serialized_grammar: Serialized grammar string from llguidance
-        """
         super().__init__()
         self.llguidance_tokenizer = llguidance_tokenizer
         self.serialized_grammar = serialized_grammar
+        self.eos_token = self.llguidance_tokenizer.eos_token
 
-        # Create matcher from serialized grammar
         self.ll_matcher = LLMatcher(
             llguidance_tokenizer,
             serialized_grammar,
             log_level=int(os.environ.get("LLGUIDANCE_LOG_LEVEL", "1")),
         )
+        self._check_err()
 
         # Cached bitmask (reused across calls)
         self.bitmask: np.ndarray | None = None
 
+    def _check_err(self) -> None:
+        if self.ll_matcher.is_error():
+            raise ValueError(self.ll_matcher.get_error())
+
     def accept_token(self, token: int):
-        """Accept a token and update the grammar state."""
-        if not self.ll_matcher.consume_token(token):
+        if self.finished:
+            return
+        if self.ll_matcher.is_stopped() and token == self.eos_token:
             self.finished = True
+            return
+        self.ll_matcher.consume_token(token)
+        if self.ll_matcher.is_error():
+            self.finished = True
+            raise ValueError(self.ll_matcher.get_error())
 
     def allocate_vocab_mask(self, vocab_size: int, batch_size: int) -> np.ndarray:
         """Allocate a vocabulary bitmask."""
@@ -64,10 +69,6 @@ class GuidanceGrammar(BaseGrammarObject):
 
     def fill_vocab_mask(self, vocab_mask: np.ndarray, idx: int):
         """Fill the vocabulary bitmask for this grammar at batch index."""
-        if self.ll_matcher.is_stopped():
-            self.finished = True
-            return
-
         n_ll_cols = (int(self.llguidance_tokenizer.vocab_size) + 31) // 32
         sub_mask = vocab_mask[:, :n_ll_cols]
 
@@ -76,10 +77,12 @@ class GuidanceGrammar(BaseGrammarObject):
             sub_mask,
             idx,
         )
+        if self.ll_matcher.is_error():
+            logger.warning("Grammar error in fill_vocab_mask: %s", self.ll_matcher.get_error())
+            self.finished = True
 
     def is_terminated(self) -> bool:
-        """Check if the grammar has terminated."""
-        return self.ll_matcher.is_stopped()
+        return self.finished
 
     def copy(self):
         return GuidanceGrammar(
