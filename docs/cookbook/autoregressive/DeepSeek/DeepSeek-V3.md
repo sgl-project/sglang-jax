@@ -115,7 +115,24 @@ For full flag definitions see [`../../base/launch-flags-reference.md`](../../bas
 
 ### 3.1 Basic Chat Completion
 
-See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="deepseek-ai/DeepSeek-V3"` with the §1 recommended sampling parameters.
+For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md).
+
+Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://<rank0-ip>:30000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="deepseek-ai/DeepSeek-V3",
+    messages=[{"role": "user", "content": "Hello, who are you?"}],
+    temperature=0.6,
+    top_p=0.95,
+    max_tokens=1024,
+)
+print(resp.choices[0].message.content)
+```
 
 > DeepSeek V3 is non-reasoning and has no native tool-call format. For reasoning use [`DeepSeek-R1.md`](DeepSeek-R1.md); for tool-call workloads choose a model with `--tool-call-parser` support (e.g., [Qwen3](../Qwen/Qwen3.md), [MiMo-V2.5-Pro](../Xiaomi/MiMo-V2.5-Pro.md)).
 

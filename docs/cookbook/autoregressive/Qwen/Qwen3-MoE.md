@@ -17,6 +17,14 @@ title: "Qwen3-MoE"
 
 For the dense Qwen3 variants (8B / 32B) see [`Qwen3.md`](Qwen3.md).
 
+**Key Features**:
+
+- **Two MoE sizes**: 30B-A3B (3B active, multi-host on v6e-16) and 235B-A22B (22B active, multi-host on v6e-64) — pick by quality/compute budget.
+- **Hybrid Reasoning**: thinking-on (default) and thinking-off via `chat_template_kwargs.enable_thinking` per-request — use `--reasoning-parser qwen3` to expose `reasoning_content` (§3.2).
+- **OpenAI-compatible tool calling**: `--tool-call-parser qwen25` exposes `tool_calls` on the response — full streaming + multi-turn examples in §3.3.
+- **MoE backend selection matters**: 30B-A3B has `moe_intermediate_size=768` (not multiple of 512) — **must** use `--moe-backend epmoe`. 235B-A22B has 1536 and can use the higher-throughput `fused` backend at EP ≥ 16 (§2.4).
+- **Production-validated (30B-A3B)**: GSM8K **0.980** thinking-on on TPU v6e-16 (§4.1); ~2.8 req/s and ~1.5K output tok/s under random 1K→1K at concurrency 16 (§4.2).
+
 **Recommended Generation Parameters**:
 
 - Thinking-on (default): `temperature=0.7`, `top_p=0.95`, `max_tokens=2048+`.
@@ -108,7 +116,24 @@ For full flag definitions see [`../base/launch-flags-reference.md`](../../base/l
 
 ### 3.1 Basic Chat Completion
 
-See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="Qwen/Qwen3-30B-A3B"` (or `Qwen/Qwen3-235B-A22B`) with the §1 recommended sampling parameters; for thinking + content streaming see §3.2, for tool calling see §3.3.
+For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). For thinking + content streaming see §3.2, for tool calling see §3.3.
+
+Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP; thinking-off baseline):
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://<rank0-ip>:30000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="Qwen/Qwen3-30B-A3B",
+    messages=[{"role": "user", "content": "Hello, who are you?"}],
+    temperature=0.7,
+    top_p=0.8,
+    max_tokens=512,
+)
+print(resp.choices[0].message.content)
+```
 
 ### 3.2 Reasoning (thinking-on default, thinking-off optional)
 
@@ -144,6 +169,19 @@ for chunk in response:
             content_started = True
         print(delta.content, end="", flush=True)
 print()
+```
+
+**Output Example:**
+
+```text
+=============== Thinking =================
+The user wants 15% of 240. I should compute this directly:
+15% means 15 / 100 = 0.15.
+0.15 × 240 = 36.
+Let me double-check: 10% of 240 is 24, 5% of 240 is 12, so 15% = 24 + 12 = 36. ✓
+=============== Content =================
+
+15% of 240 is **36**.
 ```
 
 #### Thinking-off (instant answer)
@@ -209,6 +247,63 @@ for idx, tc in sorted(tool_calls_accumulator.items()):
     print(f"🔧 Tool Call: {tc['name']}")
     print(f"   Arguments: {tc['arguments']}")
 print()
+```
+
+**Output Example:**
+
+```text
+🔧 Tool Call: get_weather
+   Arguments: {"location": "Beijing", "unit": "celsius"}
+```
+
+#### Handling Tool Call Results (multi-turn)
+
+After the model returns a tool call, run the function locally and send the result back as a `tool` role message so the model can produce a natural-language answer:
+
+```python
+import json
+
+def get_weather(location, unit="celsius"):
+    return f"22°{unit[0].upper()} and sunny"
+
+first_idx = sorted(tool_calls_accumulator.keys())[0]
+first_call = tool_calls_accumulator[first_idx]
+args = json.loads(first_call["arguments"])
+tool_result = get_weather(**args)
+
+messages = [
+    {"role": "user", "content": "What's the weather in Beijing?"},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": first_call["name"],
+                "arguments": first_call["arguments"],
+            },
+        }],
+    },
+    {"role": "tool", "tool_call_id": "call_1", "content": tool_result},
+]
+
+final = client.chat.completions.create(
+    model="Qwen/Qwen3-30B-A3B",
+    messages=messages,
+)
+# On thinking-on hybrid models, the final response may put text in reasoning_content
+# alongside (or instead of) content — print both to avoid misleading None output.
+print("Reasoning:", final.choices[0].message.reasoning_content)
+print("Content:  ", final.choices[0].message.content)
+```
+
+**Output Example:**
+
+```text
+Reasoning: The weather tool returned 22°C and sunny — a pleasant day.
+I should present this clearly to the user.
+Content:   It's currently 22°C and sunny in Beijing.
 ```
 
 To see the full set of `--reasoning-parser` / `--tool-call-parser` keys available in your build, run `python -m sgl_jax.launch_server --help`.

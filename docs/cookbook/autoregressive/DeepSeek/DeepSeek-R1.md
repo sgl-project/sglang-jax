@@ -107,7 +107,24 @@ For full flag definitions see [`../../base/launch-flags-reference.md`](../../bas
 
 ### 3.1 Basic Chat Completion
 
-See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="deepseek-ai/DeepSeek-R1"` with the §1 recommended sampling parameters; for thinking + content streaming see §3.2.
+For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). For thinking + content streaming see §3.2.
+
+Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP; give `max_tokens` room for the thinking trace):
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://<rank0-ip>:30000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="deepseek-ai/DeepSeek-R1",
+    messages=[{"role": "user", "content": "If a train travels 60 km in 45 minutes, what is its average speed in km/h?"}],
+    temperature=0.6,
+    top_p=0.95,
+    max_tokens=8192,
+)
+print(resp.choices[0].message.content)
+```
 
 ### 3.2 Reasoning (thinking-enabled streaming)
 

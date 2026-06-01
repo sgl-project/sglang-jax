@@ -88,7 +88,24 @@ For full flag definitions and defaults see [`../base/launch-flags-reference.md`]
 
 ### 3.1 Basic Chat Completion
 
-See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="Qwen/Qwen-7B-Chat"` with the §1 recommended sampling parameters.
+For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md).
+
+Short Python OpenAI client example:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="Qwen/Qwen-7B-Chat",
+    messages=[{"role": "user", "content": "Hello, who are you?"}],
+    temperature=0.7,
+    top_p=0.95,
+    max_tokens=512,
+)
+print(resp.choices[0].message.content)
+```
 
 > Qwen-7B-Chat is a first-generation chat model without hybrid reasoning or native tool-calling formats. For reasoning / tool-call workloads use [Qwen3](Qwen3.md) or a later Qwen series.
 

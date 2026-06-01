@@ -97,7 +97,24 @@ For full flag definitions and defaults see [`../base/launch-flags-reference.md`]
 
 ### 3.1 Basic Chat Completion
 
-See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="Qwen/Qwen3-8B"` (or `Qwen/Qwen3-32B`) with the §1 recommended sampling parameters; for thinking + content streaming see §3.2, for tool calling see §3.3.
+For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). For thinking + content streaming see §3.2, for tool calling see §3.3.
+
+Short Python OpenAI client example (thinking-off baseline):
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="Qwen/Qwen3-8B",
+    messages=[{"role": "user", "content": "Hello, who are you?"}],
+    temperature=0.7,
+    top_p=0.8,
+    max_tokens=512,
+)
+print(resp.choices[0].message.content)
+```
 
 ### 3.2 Reasoning (thinking-on default, thinking-off optional)
 

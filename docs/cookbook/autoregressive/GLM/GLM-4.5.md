@@ -15,7 +15,7 @@ title: "GLM-4.5"
 - [**zai-org/GLM-4.5**](https://huggingface.co/zai-org/GLM-4.5) — 355B total / 32B activated; multi-host on v6e-64.
 - [**zai-org/GLM-4.5-Air**](https://huggingface.co/zai-org/GLM-4.5-Air) — 106B total / 12B activated; multi-host on v6e-32.
 
-For the newer GLM-5 family with DeepSeek-style sparse attention see [`GLM-5.md`](GLM-5.md).
+For the newer GLM-5 family with DeepSeek-style sparse attention — runtime supports `Glm5ForCausalLM` / `GlmMoeDsaForCausalLM`, but no public release pin yet (see the Planned entry in [`../index.md`](../index.md#glm--glm)).
 
 **Recommended Generation Parameters**:
 
@@ -108,7 +108,24 @@ For full flag definitions see [`../../base/launch-flags-reference.md`](../../bas
 
 ### 3.1 Basic Chat Completion
 
-See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="zai-org/GLM-4.5-Air"` (or `GLM-4.5`) with the §1 recommended sampling parameters.
+For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md).
+
+Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://<rank0-ip>:30000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="zai-org/GLM-4.5-Air",
+    messages=[{"role": "user", "content": "Hello, who are you?"}],
+    temperature=0.6,
+    top_p=0.95,
+    max_tokens=1024,
+)
+print(resp.choices[0].message.content)
+```
 
 ### 3.2 Reasoning (thinking streaming)
 
@@ -183,6 +200,47 @@ msg = response.choices[0].message
 for tc in (msg.tool_calls or []):
     print(f"🔧 Tool Call: {tc.function.name}")
     print(f"   Arguments: {tc.function.arguments}")
+```
+
+#### Handling Tool Call Results (multi-turn)
+
+After the model returns a tool call, run the function locally and send the result back as a `tool` role message so the model can produce a natural-language answer:
+
+```python
+import json
+
+def get_weather(location, unit="celsius"):
+    return f"22°{unit[0].upper()} and sunny"
+
+first_call = response.choices[0].message.tool_calls[0]
+args = json.loads(first_call.function.arguments)
+tool_result = get_weather(**args)
+
+messages = [
+    {"role": "user", "content": "What's the weather in Beijing?"},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": first_call.function.name,
+                "arguments": first_call.function.arguments,
+            },
+        }],
+    },
+    {"role": "tool", "tool_call_id": "call_1", "content": tool_result},
+]
+
+final = client.chat.completions.create(
+    model="zai-org/GLM-4.5-Air",
+    messages=messages,
+)
+# On thinking-on hybrid models, the final response may put text in reasoning_content
+# alongside (or instead of) content — print both to avoid misleading None output.
+print("Reasoning:", final.choices[0].message.reasoning_content)
+print("Content:  ", final.choices[0].message.content)
 ```
 
 To run reasoning and tool-calling together, pass both flags (`--reasoning-parser glm45 --tool-call-parser glm45`) and use the streaming pattern from §3.2 — `delta.reasoning_content`, `delta.content`, and `delta.tool_calls` will all appear on the same stream.
@@ -274,6 +332,5 @@ GLM-4.5 (355B): not tested in this audit pass; would need v6e-64.
 ## Additional Resources
 
 - [GLM-4.5 model collection](https://huggingface.co/zai-org)
-- [`GLM-5.md`](GLM-5.md) — newer GLM-5 family with DeepSeek-style sparse attention.
 - [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

@@ -18,6 +18,14 @@ title: "MiMo-7B"
 
 For the larger Xiaomi MoE models, see [`MiMo-V2-Flash.md`](MiMo-V2-Flash.md) and [`MiMo-V2.5-Pro.md`](MiMo-V2.5-Pro.md) — these are different architectures (256-expert MoE with hybrid attention), not just larger MiMo-7B variants.
 
+**Key Features**:
+
+- **Compact 7B dense decoder**: BF16 weights ~14 GB — fits comfortably on a single TPU v6e-4 host. Lowest-cost reasoning-capable model in the cookbook.
+- **RL-tuned for reasoning** (`MiMo-7B-RL`): Reinforcement-learning post-training maximizes chain-of-thought quality on math benchmarks; default choice for reasoning workloads. GSM8K **0.920** (§4.1).
+- **Hybrid Reasoning**: thinking-on (default) and thinking-off via `chat_template_kwargs.enable_thinking` per-request — use `--reasoning-parser mimo` to expose `reasoning_content` (§3.2).
+- **OpenAI-compatible tool calling**: `--tool-call-parser mimo` exposes `tool_calls` on the response — same parser key as MiMo-V2.5-Pro; see §3.3 for streaming + multi-turn examples.
+- **Three variants for different stages**: Base (pre-trained), SFT (instruction), RL (reasoning) — pick by training objective.
+
 **Recommended Generation Parameters**: `temperature=0.7`, `top_p=0.95`, `max_tokens=2048+` for RL/SFT variants (give room for reasoning).
 
 **License**: see the [HuggingFace model card](https://huggingface.co/XiaomiMiMo) for the authoritative license terms.
@@ -68,8 +76,10 @@ Swap `--model-path` to `MiMo-7B-Base` or `MiMo-7B-SFT` as needed.
 **Tool Calling:**
 - MiMo-7B shares the `mimo` tool-call parser format with MiMo-V2.5-Pro. Add `--tool-call-parser mimo` when using the OpenAI tools API. See [`MiMo-V2.5-Pro.md` §3.3](MiMo-V2.5-Pro.md#33-tool-calling) for the request/response pattern.
 
-**Reasoning (RL / SFT variants):**
-- Pass `extra_body={"chat_template_kwargs": {"enable_thinking": true}}` per-request to unlock chain-of-thought outputs (verify support per checkpoint via model card).
+**Reasoning Parser (RL / SFT variants):**
+- MiMo-7B uses `--reasoning-parser mimo` (alias of the `qwen3` reasoning parser — same `<think>...</think>` format + `enable_thinking` switch). Append to the §2.3 launch command to expose `reasoning_content` separated from `content`.
+- Pass `extra_body={"chat_template_kwargs": {"enable_thinking": true}}` per-request to unlock chain-of-thought outputs on RL / SFT variants (Base variant has no instruction tuning — no thinking mode).
+- See §3.2 for the streaming Python client showing the reasoning / content section split.
 
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
@@ -80,7 +90,24 @@ For full flag definitions see [`../base/launch-flags-reference.md`](../../base/l
 
 ### 3.1 Basic Chat Completion
 
-See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="XiaomiMiMo/MiMo-7B-RL"` (or `MiMo-7B-Base` / `MiMo-7B-SFT`) with the §1 recommended sampling parameters; for thinking + content streaming see §3.2, for tool calling see §3.3.
+For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). For thinking + content streaming see §3.2, for tool calling see §3.3.
+
+Short Python OpenAI client example:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="XiaomiMiMo/MiMo-7B-RL",
+    messages=[{"role": "user", "content": "Hello, who are you?"}],
+    temperature=0.7,
+    top_p=0.95,
+    max_tokens=2048,
+)
+print(resp.choices[0].message.content)
+```
 
 ### 3.2 Reasoning (thinking-on default, thinking-off optional)
 
@@ -116,6 +143,18 @@ for chunk in response:
             content_started = True
         print(delta.content, end="", flush=True)
 print()
+```
+
+**Output Example:**
+
+```text
+=============== Thinking =================
+The user is asking how many seconds in a day.
+A day has 24 hours. Each hour has 60 minutes. Each minute has 60 seconds.
+So: 24 × 60 × 60 = 24 × 3600 = 86400.
+=============== Content =================
+
+There are **86,400 seconds in a day**.
 ```
 
 #### Thinking-off (instant answer)
@@ -181,6 +220,68 @@ for idx, tc in sorted(tool_calls_accumulator.items()):
     print(f"🔧 Tool Call: {tc['name']}")
     print(f"   Arguments: {tc['arguments']}")
 print()
+```
+
+**Output Example:**
+
+```text
+=============== Thinking =================
+The user asked about Beijing weather. I should call get_weather with location="Beijing".
+The unit isn't specified — Beijing uses celsius, I'll go with that.
+=============== Content =================
+
+🔧 Tool Call: get_weather
+   Arguments: {"location": "Beijing", "unit": "celsius"}
+```
+
+#### Handling Tool Call Results (multi-turn)
+
+After the model returns a tool call, run the function locally and send the result back as a `tool` role message so the model can produce a natural-language answer:
+
+```python
+import json
+
+def get_weather(location, unit="celsius"):
+    return f"22°{unit[0].upper()} and sunny"
+
+first_idx = sorted(tool_calls_accumulator.keys())[0]
+first_call = tool_calls_accumulator[first_idx]
+args = json.loads(first_call["arguments"])
+tool_result = get_weather(**args)
+
+messages = [
+    {"role": "user", "content": "What's the weather in Beijing?"},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": first_call["name"],
+                "arguments": first_call["arguments"],
+            },
+        }],
+    },
+    {"role": "tool", "tool_call_id": "call_1", "content": tool_result},
+]
+
+final = client.chat.completions.create(
+    model="XiaomiMiMo/MiMo-7B-RL",
+    messages=messages,
+)
+# On thinking-on hybrid models, the final response may put text in reasoning_content
+# alongside (or instead of) content — print both to avoid misleading None output.
+print("Reasoning:", final.choices[0].message.reasoning_content)
+print("Content:  ", final.choices[0].message.content)
+```
+
+**Output Example:**
+
+```text
+Reasoning: The weather tool returned 22°C and sunny — a comfortable day for outdoor activities.
+I should give a concise natural-language answer.
+Content:   It's currently 22°C and sunny in Beijing.
 ```
 
 To see the full set of `--reasoning-parser` / `--tool-call-parser` keys available in your build, run `python -m sgl_jax.launch_server --help`.

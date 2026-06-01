@@ -17,6 +17,14 @@ title: "Gemma 2"
 - [**google/gemma-2-27b**](https://huggingface.co/google/gemma-2-27b) — base 27B pre-trained.
 - [**google/gemma-2-27b-it**](https://huggingface.co/google/gemma-2-27b-it) — 27B instruction-tuned; default chat choice.
 
+**Key Features**:
+
+- **Dense decoder, two sizes**: 9B and 27B — both fit on a single TPU v6e-4 host (BF16 ~18 GB / ~54 GB). No multi-host complexity.
+- **Hybrid Attention**: Alternating global (8K) and sliding-window (4K) layers — SGL-JAX manages two KV pools (global + sliding), giving stronger long-context behavior than uniform-attention models at the same parameter count.
+- **Soft-cap attention/logits**: Gemma 2's signature stability tweak — caps attention logits and output logits to reduce extreme activations.
+- **Instruction-tuned variants ready for chat**: `9b-it` / `27b-it` are post-trained chat models — non-reasoning, no native tool-call format.
+- **Open weights under Gemma Terms of Use**: see [Gemma model card](https://huggingface.co/google/gemma-2-9b).
+
 **Recommended Generation Parameters**: `temperature=0.7`, `top_p=0.95`, `top_k=64`, `max_tokens=1024` (Gemma 2 model-card defaults).
 
 **License**: see the [Gemma model card](https://huggingface.co/google/gemma-2-9b) for the authoritative Gemma Terms of Use.
@@ -108,7 +116,25 @@ For full flag definitions see [`../base/launch-flags-reference.md`](../../base/l
 
 ### 3.1 Basic Chat Completion
 
-See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="google/gemma-2-9b-it"` (or your chosen variant) with the §1 recommended sampling parameters — pass `top_k` via `extra_body={"top_k": 64}` since the OpenAI schema does not include it.
+For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Pass `top_k` via `extra_body={"top_k": 64}` since the OpenAI schema does not include it.
+
+Short Python OpenAI client example:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="google/gemma-2-9b-it",
+    messages=[{"role": "user", "content": "Hello, who are you?"}],
+    temperature=0.7,
+    top_p=0.95,
+    max_tokens=1024,
+    extra_body={"top_k": 64},
+)
+print(resp.choices[0].message.content)
+```
 
 > Gemma 2 is non-reasoning and has no native tool-call format. For those workloads choose a model with `--reasoning-parser` / `--tool-call-parser` support (e.g., [Qwen3](../Qwen/Qwen3.md), [MiMo-V2.5-Pro](../Xiaomi/MiMo-V2.5-Pro.md)).
 

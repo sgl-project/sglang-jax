@@ -71,6 +71,10 @@ Swap `--model-path` to `microsoft/Phi-3.5-mini-instruct` or `internlm/internlm3-
 - `--page-size 128` is **mandatory**. Without it the attention backend defaults to `page_size=1` and the `Max running requests` constraint chain collapses `Final max_running_requests` to 1 — at concurrency=16 the bench serializes and output throughput drops ~9× (validated 2026-05-25: 156 tok/s without flag → 1449 tok/s with). Same constraint applies to the Phi-3 / InternLM3 aliases.
 - `--max-running-requests 64` pairs with the page-size flag; raise/lower to match your `--max-concurrency` workload.
 
+**Tensor Parallelism:**
+- `--tp-size 4` matches v6e-4's 4 chips (v6e is 1:1 chip↔device). For v6e-8 use `--tp-size 8`. Llama 3.1 8B's GQA `num_kv_heads=8` constrains tensor axis to be a divisor of 8 — values 1/2/4/8 are safe.
+- For multi-host scaling (e.g., Llama 3.3 70B) see [`Llama3.3-70B.md`](Llama3.3-70B.md).
+
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
 
@@ -80,7 +84,24 @@ For full flag definitions see [`../../base/launch-flags-reference.md`](../../bas
 
 ### 3.1 Basic Chat Completion
 
-See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="meta-llama/Llama-3.1-8B-Instruct"` (or your chosen variant) with the §1 recommended sampling parameters.
+For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md).
+
+Short Python OpenAI client example:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    messages=[{"role": "user", "content": "Hello, who are you?"}],
+    temperature=0.6,
+    top_p=0.9,
+    max_tokens=1024,
+)
+print(resp.choices[0].message.content)
+```
 
 > Llama 3 Instruct is non-reasoning and has no native tool-call format. For those workloads choose a model with `--reasoning-parser` / `--tool-call-parser` support (e.g., [Qwen3](../Qwen/Qwen3.md), [MiMo-V2.5-Pro](../Xiaomi/MiMo-V2.5-Pro.md)).
 

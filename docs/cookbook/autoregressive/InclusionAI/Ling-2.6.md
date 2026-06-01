@@ -130,7 +130,24 @@ For full flag definitions see [`../../base/launch-flags-reference.md`](../../bas
 
 ### 3.1 Basic Chat Completion
 
-See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="inclusionAI/Ling-2.6-1T"` with the §1 recommended sampling parameters; for thinking + content streaming see §3.2.
+For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). For thinking + content streaming see §3.2.
+
+Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://<rank0-ip>:30000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="inclusionAI/Ling-2.6-1T",
+    messages=[{"role": "user", "content": "Hello, who are you?"}],
+    temperature=0.7,
+    top_p=0.95,
+    max_tokens=2048,
+)
+print(resp.choices[0].message.content)
+```
 
 ### 3.2 Reasoning (if supported by the checkpoint)
 

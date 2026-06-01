@@ -12,6 +12,14 @@ title: "Kimi-Linear"
 
 For other linear-attention models in the cookbook see [`Ling-2.6.md`](../InclusionAI/Ling-2.6.md) (InclusionAI's trillion-scale linear-attention MoE).
 
+**Key Features**:
+
+- **Sparse MoE, 48B total / 3B activated**: Only 3B parameters fire per token — MoE economy with single-expert-class latency. Instruction-tuned chat model.
+- **Kimi Delta Attention (linear attention)**: Replaces softmax attention with a linear-attention variant — prefill cost scales near-linearly with sequence length, big win on long prompts (see §3.2 long-context streaming).
+- **Hybrid recurrent state pool**: Linear-attention layers carry a recurrent state alongside the KV cache; `--recurrent-state-memory-ratio` (default 0.9) budgets recurrent vs KV HBM. **Requires `--disable-radix-cache`** (prefix sharing is unsafe with recurrent state).
+- **Long-context throughput focus**: Designed to amortize prefill on tens-of-thousands-of-token prompts — pair with streaming output for best perceived latency.
+- **Multi-host serving**: Validated on TPU v6e-16 (minimum) and v6e-32 (recommended); GSM8K **0.925 / 0.935** (§4.1).
+
 **Recommended Generation Parameters**: `temperature=0.6`, `top_p=0.95`, `max_tokens=1024` (Kimi defaults — verify against the model card).
 
 **License**: see the [Kimi-Linear model card](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct) for the authoritative license terms.
@@ -105,7 +113,24 @@ For full flag definitions see [`../base/launch-flags-reference.md`](../../base/l
 
 ### 3.1 Basic Chat Completion
 
-See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="moonshotai/Kimi-Linear-48B-A3B-Instruct"` and replace `127.0.0.1` with your rank-0 internal IP, with the §1 recommended sampling parameters; for long-context streaming see §3.2.
+For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). For long-context streaming see §3.2.
+
+Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://<rank0-ip>:30000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="moonshotai/Kimi-Linear-48B-A3B-Instruct",
+    messages=[{"role": "user", "content": "Hello, who are you?"}],
+    temperature=0.6,
+    top_p=0.95,
+    max_tokens=1024,
+)
+print(resp.choices[0].message.content)
+```
 
 ### 3.2 Long-Context Streaming
 

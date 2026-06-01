@@ -12,6 +12,14 @@ title: "Llama 3.3 70B"
 
 For the 8B size (single host + Phi-3 / InternLM3 alias support) see [`Llama3.1.md`](Llama3.1.md). For Llama 4 see the upstream sgl-cookbook (`Llama/Llama4.md`).
 
+**Key Features**:
+
+- **70B dense decoder, multi-host required**: BF16 weights ~140 GB — needs v6e-16 minimum (validated, see §4); v6e-32 recommended for production.
+- **Llama 3.3 Instruct**: Instruction-tuned chat model — strong general-purpose assistant; non-reasoning, no native tool-call format.
+- **Grouped-Query Attention (GQA)**: `num_kv_heads=8` shrinks the KV cache vs full MHA, leaving more HBM headroom for concurrency and longer prompts.
+- **128K context window**: Supports long-document inputs out of the box; pair with `--chunked-prefill-size 2048` to bound peak HBM on long prefills.
+- **Production-validated**: GSM8K **0.950** on TPU v6e-16 with sglang-jax 0.1.0 (§4.1).
+
 **Recommended Generation Parameters**: `temperature=0.6`, `top_p=0.9`, `max_tokens=1024` (Llama 3 Instruct defaults).
 
 **License**: see the [Llama model card](https://huggingface.co/meta-llama) for the authoritative Meta Llama Community License terms.
@@ -72,6 +80,10 @@ For temporary v6e experiments, advanced users can adapt [`../../deployment/skypi
 - `--chunked-prefill-size 2048` bounds peak HBM during prefill on long prompts.
 - `--max-running-requests 256` caps concurrent decodes; lower for tighter latency tails.
 
+**Tensor Parallelism:**
+- `--tp-size 16` on v6e-16 fully shards Llama 3.3 70B's GQA `num_kv_heads=8` (tensor axis must be a divisor of 8 — 16 maps cleanly: 2 chips per KV head). v6e-32 uses `--tp-size 32` (4 chips per KV head). All ranks must be in the same TPU slice; verify `--nnodes` matches the slice node count.
+- Multi-host coordination: every rank runs the same launch command; only `${NODE_RANK}` and `${MASTER_ADDR}` vary. Dispatch all ranks within seconds of each other (a >5-min stagger trips the JAX distributed RPC deadline).
+
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 - The cache is per-node; mount a shared PVC at the cache directory to amortize compilation across all 8 nodes.
@@ -82,7 +94,24 @@ For full flag definitions see [`../../base/launch-flags-reference.md`](../../bas
 
 ### 3.1 Basic Chat Completion
 
-See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model="meta-llama/Llama-3.3-70B-Instruct"` with the §1 recommended sampling parameters.
+For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md).
+
+Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://<rank0-ip>:30000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="meta-llama/Llama-3.3-70B-Instruct",
+    messages=[{"role": "user", "content": "Hello, who are you?"}],
+    temperature=0.6,
+    top_p=0.9,
+    max_tokens=1024,
+)
+print(resp.choices[0].message.content)
+```
 
 > Llama 3 Instruct is non-reasoning and has no native tool-call format. For those workloads choose a model with `--reasoning-parser` / `--tool-call-parser` support (e.g., [Qwen3](../Qwen/Qwen3.md), [MiMo-V2.5-Pro](../Xiaomi/MiMo-V2.5-Pro.md)).
 
