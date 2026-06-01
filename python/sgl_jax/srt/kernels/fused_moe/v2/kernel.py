@@ -191,6 +191,7 @@ def ref_moe(
             output = output.at[t_id].add(out[0] * weight)
 
     if w1_shared is not None:
+
         def _deq_se(w, sc):
             wf = w.astype(jnp.float32)
             return wf if sc is None else wf * jnp.asarray(sc).astype(jnp.float32)
@@ -2141,8 +2142,23 @@ def _fused_ep_moe_kernel(
         if w1_shared_hbm is None or disable_shared_expert:
             return
         bt_start = bt_id * bt
-        # DMA the fp8 token block into b_x (reuse), extract the embedded per-token
-        # scale into b_x_scale, and zero the scale column so it doesn't pollute.
+        if not enable_act_quant:
+            # bf16 token (Mode 2/3): DMA the bf16 token block straight into b_x
+            # (same (bt, t_packing, h_per_t) layout as tokens_hbm's reshape). No
+            # embedded scale, so nothing to extract or zero.
+            pltpu.make_async_copy(
+                src_ref=tokens_hbm.at[pl.ds(bt_start, bt)],
+                dst_ref=b_x_vmem.at[pl.ds(0, bt)],
+                sem=local_sems.at[0, 0],
+            ).start()
+            pltpu.make_async_copy(
+                src_ref=b_x_vmem.at[pl.ds(0, bt)],
+                dst_ref=b_x_vmem.at[pl.ds(0, bt)],
+                sem=local_sems.at[0, 0],
+            ).wait()
+            return
+        # fp8 token (Mode 1): DMA the fp8 token block into b_x (reuse), extract the
+        # embedded per-token scale into b_x_scale, and zero the scale column.
         pltpu.make_async_copy(
             src_ref=tokens_fp8_hbm.at[pl.ds(bt_start, bt)],
             dst_ref=b_x_vmem.at[pl.ds(0, bt)],
@@ -2166,12 +2182,16 @@ def _fused_ep_moe_kernel(
         # w1/w3: (hidden, se_inter) fp8 -> b_w*_x2[slot, p, :, :bse] (t_packing chunks).
         for p_id in range(t_packing):
             pltpu.make_async_copy(
-                src_ref=w1_shared_hbm.at[pl.ds(p_id * h_per_t, h_per_t), pl.ds(block_id * bse, bse)],
+                src_ref=w1_shared_hbm.at[
+                    pl.ds(p_id * h_per_t, h_per_t), pl.ds(block_id * bse, bse)
+                ],
                 dst_ref=b_w1_x2_vmem.at[slot, p_id, pl.ds(0, h_per_t), pl.ds(0, bse)],
                 sem=local_sems.at[0, base],
             ).start()
             pltpu.make_async_copy(
-                src_ref=w3_shared_hbm.at[pl.ds(p_id * h_per_t, h_per_t), pl.ds(block_id * bse, bse)],
+                src_ref=w3_shared_hbm.at[
+                    pl.ds(p_id * h_per_t, h_per_t), pl.ds(block_id * bse, bse)
+                ],
                 dst_ref=b_w3_x2_vmem.at[slot, p_id, pl.ds(0, h_per_t), pl.ds(0, bse)],
                 sem=local_sems.at[0, base + 1],
             ).start()
@@ -2184,42 +2204,47 @@ def _fused_ep_moe_kernel(
                 dst_ref=b_w2_x2_vmem.at[slot, p_id, pl.ds(0, bse), pl.ds(0, h_per_out)],
                 sem=local_sems.at[0, base + 2],
             ).start()
-        # Per-channel scales -> reuse routed scale bufs at index 0 (broadcast over p).
-        pltpu.make_async_copy(
-            src_ref=w1_shared_scale_hbm.at[pl.ds(0, 1), pl.ds(block_id * bse, bse)],
-            dst_ref=b_w1_scale_x2_vmem.at[slot, 0, 0, pl.ds(0, 1), pl.ds(0, bse)],
-            sem=local_sems.at[0, base],
-        ).start()
-        pltpu.make_async_copy(
-            src_ref=w3_shared_scale_hbm.at[pl.ds(0, 1), pl.ds(block_id * bse, bse)],
-            dst_ref=b_w3_scale_x2_vmem.at[slot, 0, 0, pl.ds(0, 1), pl.ds(0, bse)],
-            sem=local_sems.at[0, base + 1],
-        ).start()
-        # w2 per-channel scale is over hidden (out channels), split across the
-        # out_packing chunks of b_w2_scale_x2 (last dim = h_per_out).
-        for p_id in range(out_packing):
+        # Per-channel scales (fp8 SE only) -> reuse routed scale bufs at index 0.
+        # Skipped for bf16 SE weights (Mode 3) where w*_shared_scale_hbm is None.
+        if w1_shared_scale_hbm is not None:
             pltpu.make_async_copy(
-                src_ref=w2_shared_scale_hbm.at[
-                    pl.ds(0, 1), pl.ds(p_id * h_per_out, h_per_out)
-                ],
-                dst_ref=b_w2_scale_x2_vmem.at[slot, p_id, 0, pl.ds(0, 1), pl.ds(0, h_per_out)],
-                sem=local_sems.at[0, base + 2],
+                src_ref=w1_shared_scale_hbm.at[pl.ds(0, 1), pl.ds(block_id * bse, bse)],
+                dst_ref=b_w1_scale_x2_vmem.at[slot, 0, 0, pl.ds(0, 1), pl.ds(0, bse)],
+                sem=local_sems.at[0, base],
             ).start()
+            pltpu.make_async_copy(
+                src_ref=w3_shared_scale_hbm.at[pl.ds(0, 1), pl.ds(block_id * bse, bse)],
+                dst_ref=b_w3_scale_x2_vmem.at[slot, 0, 0, pl.ds(0, 1), pl.ds(0, bse)],
+                sem=local_sems.at[0, base + 1],
+            ).start()
+            # w2 per-channel scale is over hidden (out channels), split across the
+            # out_packing chunks of b_w2_scale_x2 (last dim = h_per_out).
+            for p_id in range(out_packing):
+                pltpu.make_async_copy(
+                    src_ref=w2_shared_scale_hbm.at[pl.ds(0, 1), pl.ds(p_id * h_per_out, h_per_out)],
+                    dst_ref=b_w2_scale_x2_vmem.at[slot, p_id, 0, pl.ds(0, 1), pl.ds(0, h_per_out)],
+                    sem=local_sems.at[0, base + 2],
+                ).start()
 
     def wait_fetch_se_weights(slot):
         if w1_shared_hbm is None or disable_shared_expert:
             return
         base = 10 + slot * 3
         # Wait on the EXACT regions written by the DMAs (only :bse / :h_per_out
-        # columns), else the sem is under-signaled and the wait hangs.
-        for ref, s in (
+        # columns), else the sem is under-signaled and the wait hangs. Scale waits
+        # are added only when SE weights are fp8 (else those sems never signal).
+        waits = [
             (b_w1_x2_vmem.at[slot, :, :, pl.ds(0, bse)], base),
             (b_w3_x2_vmem.at[slot, :, :, pl.ds(0, bse)], base + 1),
             (b_w2_x2_vmem.at[slot, :, pl.ds(0, bse), :], base + 2),
-            (b_w1_scale_x2_vmem.at[slot, 0, 0, :, pl.ds(0, bse)], base),
-            (b_w3_scale_x2_vmem.at[slot, 0, 0, :, pl.ds(0, bse)], base + 1),
-            (b_w2_scale_x2_vmem.at[slot, :, 0, :, :], base + 2),
-        ):
+        ]
+        if w1_shared_scale_hbm is not None:
+            waits += [
+                (b_w1_scale_x2_vmem.at[slot, 0, 0, :, pl.ds(0, bse)], base),
+                (b_w3_scale_x2_vmem.at[slot, 0, 0, :, pl.ds(0, bse)], base + 1),
+                (b_w2_scale_x2_vmem.at[slot, :, 0, :, :], base + 2),
+            ]
+        for ref, s in waits:
             pltpu.make_async_copy(src_ref=ref, dst_ref=ref, sem=local_sems.at[0, s]).wait()
 
     def run_shared_expert_slice(block_id, bt_id, bt_sem_id, out_buf_id):
@@ -2237,43 +2262,68 @@ def _fused_ep_moe_kernel(
 
             wait_fetch_se_weights(slot)
 
-            ts = b_x_scale_vmem[pl.ds(0, bt), pl.ds(0, 1)]  # (bt, 1) per-token scale
-            s1 = b_w1_scale_x2_vmem[slot, 0, 0, 0, pl.ds(0, bse)].reshape(1, bse)
-            s3 = b_w3_scale_x2_vmem[slot, 0, 0, 0, pl.ds(0, bse)].reshape(1, bse)
+            # SE reuses the routed token/weight VMEM buffers, so its precision is
+            # fixed by the routed path. Two static flags select the dot path:
+            #   se_tok_fp8: token in b_x is fp8 (enable_act_quant) with per-token scale
+            #   se_w_quant: SE weights are fp8 with per-channel scale
+            # Mode 1 (T,T): fp8 x fp8. Mode 2 (F,T): bf16 token, dequant fp8 weight.
+            # Mode 3 (F,F): bf16 x bf16. (T,F) is rejected at the outer gate.
+            se_tok_fp8 = enable_act_quant
+            se_w_quant = w1_shared_scale_hbm is not None
+            be_dtype = b_x_vmem.dtype  # bf16 in Mode 2/3 (dequant/dot target)
 
-            # FFN1: fp8 x fp8 MXU dot, scale (per-token x per-channel) applied
-            # once after summing the t_packing chunks (scales are p-independent).
+            if se_w_quant:
+                s1 = b_w1_scale_x2_vmem[slot, 0, 0, 0, pl.ds(0, bse)].reshape(1, bse)
+                s3 = b_w3_scale_x2_vmem[slot, 0, 0, 0, pl.ds(0, bse)].reshape(1, bse)
+
+            # ----- FFN1 (gate/up), accumulate over t_packing chunks -----
             gate_acc = jnp.zeros((bt, bse), dtype=jnp.float32)
             up_acc = jnp.zeros((bt, bse), dtype=jnp.float32)
             for p_id in range(t_packing):
                 x = b_x_vmem[pl.ds(0, bt), p_id, pl.ds(0, h_per_t)]
-                gate_acc += jnp.dot(
-                    x, b_w1_x2_vmem[slot, p_id, pl.ds(0, h_per_t), pl.ds(0, bse)],
-                    preferred_element_type=jnp.float32,
-                )
-                up_acc += jnp.dot(
-                    x, b_w3_x2_vmem[slot, p_id, pl.ds(0, h_per_t), pl.ds(0, bse)],
-                    preferred_element_type=jnp.float32,
-                )
-            gate_acc = gate_acc * (ts * s1)
-            up_acc = up_acc * (ts * s3)
+                w1 = b_w1_x2_vmem[slot, p_id, pl.ds(0, h_per_t), pl.ds(0, bse)]
+                w3 = b_w3_x2_vmem[slot, p_id, pl.ds(0, h_per_t), pl.ds(0, bse)]
+                if se_w_quant and not se_tok_fp8:
+                    # Mode 2: bf16 token x fp8 weight is not a legal MXU dot, so
+                    # dequant the weight to bf16 first (per-channel scale folded in).
+                    w1 = (w1.astype(jnp.float32) * s1).astype(be_dtype)
+                    w3 = (w3.astype(jnp.float32) * s3).astype(be_dtype)
+                gate_acc += jnp.dot(x, w1, preferred_element_type=jnp.float32)
+                up_acc += jnp.dot(x, w3, preferred_element_type=jnp.float32)
+            if se_tok_fp8 and se_w_quant:
+                # Mode 1: fp8 x fp8 dot -> apply per-token x per-channel scale after.
+                ts = b_x_scale_vmem[pl.ds(0, bt), pl.ds(0, 1)]
+                gate_acc = gate_acc * (ts * s1)
+                up_acc = up_acc * (ts * s3)
+            # Mode 2/3: the dot already yields the correctly-scaled f32 result.
 
             act = activation_fn(gate_acc, up_acc, act_fn)  # (bt, bse) f32
-            # Quantize act per-token to fp8 for the fp8 FFN2 dot.
-            act_amax = jnp.max(jnp.abs(act), axis=-1, keepdims=True)  # (bt, 1)
-            act_sc = jnp.maximum(act_amax / jnp.float32(448.0), jnp.float32(1e-12))
-            act_fp8 = (act / act_sc).astype(jnp.float8_e4m3fn)
+
+            # ----- FFN2 (down), accumulate into b_output -----
+            if se_tok_fp8 and se_w_quant:
+                # Mode 1: requant act per-token -> fp8 for the fp8 x fp8 dot.
+                act_amax = jnp.max(jnp.abs(act), axis=-1, keepdims=True)  # (bt, 1)
+                act_sc = jnp.maximum(act_amax / jnp.float32(448.0), jnp.float32(1e-12))
+                act_in = (act / act_sc).astype(jnp.float8_e4m3fn)
+            else:
+                act_in = act.astype(be_dtype)  # Mode 2/3: bf16 dot input
 
             for p_id in range(out_packing):
-                s2 = b_w2_scale_x2_vmem[
-                    slot, p_id, 0, 0, pl.ds(0, h_per_out)
-                ].reshape(1, h_per_out)
-                d2 = jnp.dot(
-                    act_fp8,
-                    b_w2_x2_vmem[slot, p_id, pl.ds(0, bse), pl.ds(0, h_per_out)],
-                    preferred_element_type=jnp.float32,
-                )
-                partial = d2 * (act_sc * s2)
+                w2 = b_w2_x2_vmem[slot, p_id, pl.ds(0, bse), pl.ds(0, h_per_out)]
+                if se_w_quant:
+                    s2 = b_w2_scale_x2_vmem[slot, p_id, 0, 0, pl.ds(0, h_per_out)].reshape(
+                        1, h_per_out
+                    )
+                if se_tok_fp8 and se_w_quant:
+                    d2 = jnp.dot(act_in, w2, preferred_element_type=jnp.float32)
+                    partial = d2 * (act_sc * s2)
+                elif se_w_quant:
+                    # Mode 2: dequant fp8 w2 -> bf16, then bf16 dot.
+                    w2b = (w2.astype(jnp.float32) * s2).astype(be_dtype)
+                    partial = jnp.dot(act_in, w2b, preferred_element_type=jnp.float32)
+                else:
+                    # Mode 3: bf16 x bf16.
+                    partial = jnp.dot(act_in, w2, preferred_element_type=jnp.float32)
                 out_ref = b_output_x2_vmem.at[
                     out_buf_id, pl.ds(0, bt), pl.ds(p_id * h_per_out, h_per_out)
                 ]
@@ -2288,7 +2338,6 @@ def _fused_ep_moe_kernel(
                         output_hbm.dtype
                     )
 
-
     # ===== Per-BT prequant (overlaps quantize VPU/DMA with the per-BT metadata
     # allreduce). Reuses b_y_stage (bf16 input) + b_x (fp8 output) staging.
     # Compatible with in-kernel SE: prequant_bt(next) at the top of run_bt stores
@@ -2296,9 +2345,7 @@ def _fused_ep_moe_kernel(
     # The quantize is pq-chunked so its f32 temp stays ~1MB (fits alongside SE).
     # Needs bt<=bts.
     use_per_bt_prequant = (
-        enable_act_quant
-        and bt <= bts
-        and not os.environ.get("SGLJAX_SKIP_PREQUANT")
+        enable_act_quant and bt <= bts and not os.environ.get("SGLJAX_SKIP_PREQUANT")
     )
 
     # Chunk the quantize so the f32 intermediate stays small (a single (bt, hidden)
@@ -2828,13 +2875,21 @@ def fused_ep_moe_v2(
         if w1_scale is None:
             raise ValueError("enable_act_quant requires fp8 weights (w1_scale not None).")
     if w1_shared is not None and not disable_shared_expert:
-        if not enable_act_quant:
+        # In-kernel SE reuses the routed token/weight VMEM buffers, so its
+        # precision follows the routed path. Three supported modes, auto-selected
+        # in the kernel from (enable_act_quant, w*_shared_scale presence):
+        #   Mode 1 (act_quant + scale): fp8 token x fp8 weight.
+        #   Mode 2 (no act_quant, scale): bf16 token x fp8 weight (dequant-first).
+        #   Mode 3 (no act_quant, no scale): bf16 token x bf16 weight.
+        # fp8 token + bf16 weight is the one unsupported combo.
+        if enable_act_quant and w1_shared_scale is None:
             raise ValueError(
-                "in-kernel shared expert requires enable_act_quant=True "
-                "(SE reuses the fp8 routed token/weight VMEM buffers)."
+                "fp8-token in-kernel shared expert (enable_act_quant=True) requires "
+                "fp8 w*_shared + w*_shared_scale."
             )
-        if w1_shared_scale is None:
-            raise ValueError("in-kernel shared expert requires fp8 w*_shared + w*_shared_scale.")
+        _se_scales = (w1_shared_scale, w2_shared_scale, w3_shared_scale)
+        if any(s is not None for s in _se_scales) and any(s is None for s in _se_scales):
+            raise ValueError("in-kernel shared expert w*_shared_scale must be all-set or all-None.")
     if direct_scaled_dot_ffn1 is None:
         direct_scaled_dot_ffn1 = direct_scaled_dot
     if direct_scaled_dot_ffn2 is None:
@@ -2874,6 +2929,11 @@ def fused_ep_moe_v2(
     bf = block_config.bf
     btc = block_config.btc
     bse = block_config.bse
+
+    if w1_shared is not None and not disable_shared_expert and bse > bf:
+        # SE writes its weight tiles into the [:bse] slice of the width-bf routed
+        # weight VMEM buffers; bse > bf would overflow them.
+        raise ValueError(f"in-kernel shared expert requires bse <= bf, got {bse=} {bf=}.")
 
     validate_fused_moe_block_config(
         num_tokens=num_tokens,
