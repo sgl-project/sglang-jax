@@ -65,14 +65,12 @@
                   {
                     "group": "Grok",
                     "pages": [
-                      "autoregressive/Grok/Grok1",
                       "autoregressive/Grok/Grok2"
                     ]
                   },
                   {
                     "group": "InclusionAI",
                     "pages": [
-                      "autoregressive/InclusionAI/Ling-2.5",
                       "autoregressive/InclusionAI/Ling-2.6"
                     ]
                   },
@@ -115,6 +113,7 @@
               {
                 "group": "Shared References",
                 "pages": [
+                  "base/basic-api-usage",
                   "base/tpu-topology-reference",
                   "base/launch-flags-reference"
                 ]

@@ -4,7 +4,7 @@ title: "DeepSeek R1"
 
 # DeepSeek R1 on SGL-JAX
 
-> **Validated recipe** — TPU v6e-64 path validated on sglang-jax `de29d9f0` (2026-05-26): server starts, reasoning_content streams correctly, GSM8K accuracy 98.0% (50 examples, thinking-on), `bench_serving` numbers in §4.2. TPU v7x path is still a starter target.
+> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, reasoning_content streams correctly, GSM8K accuracy 98.0% (50 examples, thinking-on), `bench_serving` numbers in §4.2. TPU v7x path is still a starter target.
 
 ## 1. Model Introduction
 
@@ -176,7 +176,7 @@ For non-streaming requests, the field appears on `response.choices[0].message.re
 | Data Parallelism | 8 |
 | Expert Parallelism | 64 |
 | Reasoning Parser | deepseek-r1 |
-| Tested build | sglang-jax `de29d9f0` (2026-05-26) |
+| Tested build | sglang-jax 0.1.0 |
 
 **Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-64).
 

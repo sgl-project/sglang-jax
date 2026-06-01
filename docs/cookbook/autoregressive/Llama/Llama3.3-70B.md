@@ -4,7 +4,7 @@ title: "Llama 3.3 70B"
 
 # Llama 3.3 70B on SGL-JAX
 
-> **Validated** on TPU v6e-16 (build `b2daa46d`, 2026-05-25). See §4 for measured numbers. v6e-32 / v6e-64 production tiers below remain Starter — same launch path with larger `--tp-size`, unmeasured.
+> **Validated recipe** — empirically validated on TPU v6e-16 with sglang-jax 0.1.0; see §4 for measured numbers. v6e-32 / v6e-64 production tiers below use the same launch path with larger `--tp-size` but are unmeasured.
 
 ## 1. Model Introduction
 
@@ -18,7 +18,7 @@ For the 8B size (single host + Phi-3 / InternLM3 alias support) see [`Llama3.1.m
 
 ## 2. Deployment
 
-### 2.1 Hardware Matrix (starter target)
+### 2.1 Hardware Matrix
 
 | Tier | Model | TPU | Topology | Nodes | Chips | `--tp-size` | Notes |
 |---|---|---|---|---|---|---|---|
@@ -90,9 +90,7 @@ See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Speed
-
-> **Layout B — measured baseline.** TPU v6e-16 (4 nodes × 4 chips, TP=16), build `b2daa46d` (2026-05-25). sgl-jax-only; no vLLM-on-TPU comparison.
+### 4.1 Accuracy
 
 **Test Environment**
 
@@ -101,7 +99,43 @@ See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model
 | Hardware | TPU v6e-16 (4 nodes × 4 chips) |
 | Model | meta-llama/Llama-3.3-70B-Instruct (BF16) |
 | Tensor Parallelism | 16 |
-| Tested build | `b2daa46d` (2026-05-25) |
+| Tested build | sglang-jax 0.1.0 |
+
+**Deployment Command** — same as [§2.3 v6e-16](#multi-host-gke-indexed-job--tpu-v6e-16-minimum).
+
+**Benchmark Command** — example for GSM8K:
+
+```bash
+evalscope eval \
+  --model meta-llama/Llama-3.3-70B-Instruct \
+  --api-url http://127.0.0.1:30000/v1/chat/completions \
+  --api-key EMPTY \
+  --eval-type service \
+  --datasets gsm8k \
+  --eval-batch-size 16 \
+  --limit 200
+```
+
+Recommended additional datasets: MMLU, GPQA Diamond, IFEval.
+
+**Test Results**
+
+| Dataset | Subset | Samples | Score |
+|---|---|---|---|
+| gsm8k | main | 200 | **0.950** |
+
+### 4.2 Speed
+
+> **Layout B — measured baseline.** TPU v6e-16 (4 nodes × 4 chips, TP=16), sglang-jax 0.1.0. sgl-jax-only; no vLLM-on-TPU comparison.
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-16 (4 nodes × 4 chips) |
+| Model | meta-llama/Llama-3.3-70B-Instruct (BF16) |
+| Tensor Parallelism | 16 |
+| Tested build | sglang-jax 0.1.0 |
 
 **Benchmark Command**
 
@@ -135,40 +169,6 @@ Median TPOT (ms):                        16.47
 Mean ITL (ms):                           16.30
 ==================================================
 ```
-
-### 4.2 Accuracy
-
-**Test Environment**
-
-| Field | Value |
-|---|---|
-| Hardware | TPU v6e-16 (4 nodes × 4 chips) |
-| Model | meta-llama/Llama-3.3-70B-Instruct (BF16) |
-| Tensor Parallelism | 16 |
-| Tested build | `b2daa46d` (2026-05-25) |
-
-**Deployment Command** — same as [§2.3 v6e-16](#multi-host-gke-indexed-job--tpu-v6e-16-minimum).
-
-**Benchmark Command** — example for GSM8K:
-
-```bash
-evalscope eval \
-  --model meta-llama/Llama-3.3-70B-Instruct \
-  --api-url http://127.0.0.1:30000/v1/chat/completions \
-  --api-key EMPTY \
-  --eval-type service \
-  --datasets gsm8k \
-  --eval-batch-size 16 \
-  --limit 200
-```
-
-Recommended additional datasets: MMLU, GPQA Diamond, IFEval.
-
-**Test Results**
-
-| Dataset | Subset | Samples | Score |
-|---|---|---|---|
-| gsm8k | main | 200 | **0.950** |
 
 ## 5. Troubleshooting
 

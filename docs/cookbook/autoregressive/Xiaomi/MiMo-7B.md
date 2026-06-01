@@ -24,7 +24,7 @@ For the larger Xiaomi MoE models, see [`MiMo-V2-Flash.md`](MiMo-V2-Flash.md) and
 
 ## 2. Deployment
 
-### 2.1 Hardware Matrix (starter target)
+### 2.1 Hardware Matrix
 
 | Tier | Model | TPU | Topology | Chips | `--tp-size` | Notes |
 |---|---|---|---|---|---|---|
@@ -189,7 +189,43 @@ To see the full set of `--reasoning-parser` / `--tool-call-parser` keys availabl
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Speed
+### 4.1 Accuracy — GSM8K
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-4 (single host, 4 chips) |
+| Model | XiaomiMiMo/MiMo-7B-RL (BF16) |
+| Tensor Parallelism | 4 |
+| Reasoning Parser | `mimo` (thinking-on per-request via `chat_template_kwargs.enable_thinking=true`) |
+| Tested build | sglang-jax 0.1.0 |
+
+**Deployment Command** — same as [§2.3](#single-host-docker--tpu-v6e-4) plus `--reasoning-parser mimo --tool-call-parser mimo`.
+
+**Benchmark Command**
+
+```bash
+evalscope eval \
+  --model XiaomiMiMo/MiMo-7B-RL \
+  --api-url http://127.0.0.1:30000/v1/chat/completions \
+  --api-key EMPTY \
+  --eval-type service \
+  --datasets gsm8k \
+  --eval-batch-size 8 \
+  --limit 500 \
+  --generation-config '{"chat_template_kwargs": {"enable_thinking": true}, "max_tokens": 4096}'
+```
+
+Recommended additional datasets for reasoning variants: AIME 2025, MATH.
+
+**Test Results**
+
+| Model | Dataset | Metric | Subset | Num | Score |
+|:---|:---|:---|:---|:---|:---|
+| MiMo-7B-RL | gsm8k | AverageAccuracy | main | 500 | 0.920 |
+
+### 4.2 Speed
 
 > **Layout B — single-workload latency baseline.**
 
@@ -200,7 +236,7 @@ To see the full set of `--reasoning-parser` / `--tool-call-parser` keys availabl
 | Hardware | TPU v6e-4 (single host, 4 chips) |
 | Model | XiaomiMiMo/MiMo-7B-RL (BF16) |
 | Tensor Parallelism | 4 |
-| Tested build | sglang-jax `fe092bf` (2026-05-22) |
+| Tested build | sglang-jax 0.1.0 |
 
 **Deployment Command** — same as [§2.3](#single-host-docker--tpu-v6e-4).
 
@@ -260,42 +296,6 @@ P99 ITL (ms):                            8.64
 Max ITL (ms):                            38.99
 ==================================================
 ```
-
-### 4.2 Accuracy — GSM8K
-
-**Test Environment**
-
-| Field | Value |
-|---|---|
-| Hardware | TPU v6e-4 (single host, 4 chips) |
-| Model | XiaomiMiMo/MiMo-7B-RL (BF16) |
-| Tensor Parallelism | 4 |
-| Reasoning Parser | `mimo` (thinking-on per-request via `chat_template_kwargs.enable_thinking=true`) |
-| Tested build | sglang-jax `fe092bf` (2026-05-22) |
-
-**Deployment Command** — same as [§2.3](#single-host-docker--tpu-v6e-4) plus `--reasoning-parser mimo --tool-call-parser mimo`.
-
-**Benchmark Command**
-
-```bash
-evalscope eval \
-  --model XiaomiMiMo/MiMo-7B-RL \
-  --api-url http://127.0.0.1:30000/v1/chat/completions \
-  --api-key EMPTY \
-  --eval-type service \
-  --datasets gsm8k \
-  --eval-batch-size 8 \
-  --limit 500 \
-  --generation-config '{"chat_template_kwargs": {"enable_thinking": true}, "max_tokens": 4096}'
-```
-
-Recommended additional datasets for reasoning variants: AIME 2025, MATH.
-
-**Test Results**
-
-| Model | Dataset | Metric | Subset | Num | Score |
-|:---|:---|:---|:---|:---|:---|
-| MiMo-7B-RL | gsm8k | AverageAccuracy | main | 500 | 0.920 |
 
 ## 5. Troubleshooting
 

@@ -4,7 +4,7 @@ title: "Ling 2.6"
 
 # Ling-2.6 on SGL-JAX
 
-> **Validated recipe** — TPU v6e-64 path validated on sglang-jax `d9c98c80` (primatrix `docs/cookbook-migration`, 2026-05-27): server starts, greedy + raw completion correct, GSM8K accuracy 98.5% (200 examples, see §4.2), `bench_serving` numbers in §4.1. Pin to `d9c98c80` (or any commit that includes the channel-wise FP8 QKV split fix); earlier builds crash at weight load. TPU v7x-16 path is still a starter target.
+> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, greedy + raw completion correct, GSM8K accuracy 98.5% (200 examples, see §4.1), `bench_serving` numbers in §4.2. Pin to sglang-jax 0.1.0 (or any commit that includes the channel-wise FP8 QKV split fix); earlier builds crash at weight load. TPU v7x-16 path is still a starter target.
 
 ## 1. Model Introduction
 
@@ -20,7 +20,7 @@ title: "Ling 2.6"
 - [**inclusionAI/Ling-2.6-1T**](https://huggingface.co/inclusionAI/Ling-2.6-1T) — full trillion-scale flagship; default focus of this page.
 - Smaller Ling-2.6 variants — adapt the §2.3 launch command after picking a checkpoint.
 
-For the previous Ling 2.5 hybrid linear-attention generation see [`Ling2.5.md`](Ling2.5.md). For Moonshot AI's separate linear-attention model see [`Kimi-Linear.md`](../Moonshotai/Kimi-Linear.md).
+For Moonshot AI's separate linear-attention model see [`Kimi-Linear.md`](../Moonshotai/Kimi-Linear.md).
 
 **Recommended Generation Parameters**: see the Ling-2.6 model card for authoritative defaults. As a starter: `temperature=0.7`, `top_p=0.95`, `max_tokens=2048+` (give room if you enable reasoning mode).
 
@@ -175,7 +175,45 @@ For non-streaming requests, the field appears on `response.choices[0].message.re
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Speed
+### 4.1 Accuracy — GSM8K
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-64 (16 nodes × 4 chips) |
+| Model | inclusionAI/Ling-2.6-1T (compressed-tensors FP8 native; runtime dtype bfloat16) |
+| Tensor Parallelism | 64 (effective tensor axis 8 via `--dp-size 8`) |
+| Data Parallelism | 8 |
+| Expert Parallelism | 64 |
+| Recurrent State Memory Ratio | 0.9 |
+| Tested build | sglang-jax 0.1.0 |
+
+**Deployment Command** — same as [§2.3 Multi-host (v6e-64)](#multi-host-gke-indexed-job--tpu-v6e-64).
+
+**Benchmark Command**
+
+```bash
+evalscope eval \
+  --model inclusionAI/Ling-2.6-1T \
+  --api-url http://127.0.0.1:30000/v1/chat/completions \
+  --api-key EMPTY \
+  --eval-type service \
+  --datasets gsm8k \
+  --eval-batch-size 8 \
+  --limit 200 \
+  --generation-config '{"temperature": 0.7, "top_p": 0.95, "max_tokens": 2048}'
+```
+
+**Test Results**
+
+| Model | Dataset | Metric | Subset | Num | Score |
+|:---|:---|:---|:---|:---|:---|
+| Ling-2.6-1T | gsm8k | AverageAccuracy | main | 200 | **0.985** |
+
+> Recommended additional datasets: AIME 2025, GPQA Diamond (reasoning); MMLU (general); RULER (long-context linear-attention).
+
+### 4.2 Speed
 
 > **Layout F — single-workload sweep (one data point).** Standard chat (ISL=1000, OSL=1000), `max_concurrency=16`, 80 prompts, `seed=42`. Future PRs can add long-context (OSL=4096+) and concurrency sweeps to validate the GLA long-context advantage.
 
@@ -188,7 +226,7 @@ For non-streaming requests, the field appears on `response.choices[0].message.re
 | Tensor Parallelism | 64 (effective tensor axis 8 via `--dp-size 8`) |
 | Data Parallelism | 8 |
 | Expert Parallelism | 64 |
-| Tested build | sglang-jax `d9c98c80` on `primatrix/docs/cookbook-migration` (2026-05-27) |
+| Tested build | sglang-jax 0.1.0 |
 
 **Deployment Command** — same as [§2.3 Multi-host (v6e-64)](#multi-host-gke-indexed-job--tpu-v6e-64).
 
@@ -248,44 +286,6 @@ Max ITL (ms):                            1293.91
 
 > At the same workload (ISL=1000, OSL=1000, c=16), DeepSeek-V3 hits 491 tok/s and MiMo-V2.5-Pro hits 926 tok/s on the same v6e-64 hardware. Ling-2.6-1T's lower throughput reflects its much larger total parameter count (1T vs 671B / 309B) plus the GLA recurrent state pool overhead — decode is bound by the linear attention chunk kernel.
 
-### 4.2 Accuracy — GSM8K
-
-**Test Environment**
-
-| Field | Value |
-|---|---|
-| Hardware | TPU v6e-64 (16 nodes × 4 chips) |
-| Model | inclusionAI/Ling-2.6-1T (compressed-tensors FP8 native; runtime dtype bfloat16) |
-| Tensor Parallelism | 64 (effective tensor axis 8 via `--dp-size 8`) |
-| Data Parallelism | 8 |
-| Expert Parallelism | 64 |
-| Recurrent State Memory Ratio | 0.9 |
-| Tested build | sglang-jax `d9c98c80` on `primatrix/docs/cookbook-migration` (2026-05-27) |
-
-**Deployment Command** — same as [§2.3 Multi-host (v6e-64)](#multi-host-gke-indexed-job--tpu-v6e-64).
-
-**Benchmark Command**
-
-```bash
-evalscope eval \
-  --model inclusionAI/Ling-2.6-1T \
-  --api-url http://127.0.0.1:30000/v1/chat/completions \
-  --api-key EMPTY \
-  --eval-type service \
-  --datasets gsm8k \
-  --eval-batch-size 8 \
-  --limit 200 \
-  --generation-config '{"temperature": 0.7, "top_p": 0.95, "max_tokens": 2048}'
-```
-
-**Test Results**
-
-| Model | Dataset | Metric | Subset | Num | Score |
-|:---|:---|:---|:---|:---|:---|
-| Ling-2.6-1T | gsm8k | AverageAccuracy | main | 200 | **0.985** |
-
-> Recommended additional datasets: AIME 2025, GPQA Diamond (reasoning); MMLU (general); RULER (long-context linear-attention).
-
 ## 5. Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -304,7 +304,6 @@ evalscope eval \
 
 - [Ling-2.6 model card](https://huggingface.co/inclusionAI/Ling-2.6-1T)
 - [InclusionAI HF collection](https://huggingface.co/inclusionAI) — sibling checkpoints.
-- [`Ling2.5.md`](Ling2.5.md) — Ling / Ring 2.5 hybrid linear-attention generation.
 - [`Kimi-Linear.md`](../Moonshotai/Kimi-Linear.md) — Moonshot AI's separate linear-attention model.
 - [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

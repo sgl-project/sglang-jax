@@ -4,7 +4,7 @@ title: "Wan 2.2 T2V"
 
 # Wan 2.2 Text-to-Video on SGL-JAX
 
-> **A14B-Diffusers: Validated** on TPU v6e-4 (build `de29d9f0`, 2026-05-26) for the §3.1 basic-usage smoke path (480*832 / 41 frames / default 50 steps, ~2 min 43 s wall-clock). Wan models do not have a numeric `evalscope` accuracy benchmark or a `bench_serving` driver — §4 is intentionally narrative.
+> **Partially validated recipe** — Wan 2.2 A14B-Diffusers validated on TPU v6e-4 with sglang-jax 0.1.0: §3.1 basic-usage smoke path (480*832 / 41 frames / default 50 steps, ~2 min 43 s wall-clock). Wan models do not have a numeric `evalscope` accuracy benchmark or a `bench_serving` driver — §4 is intentionally narrative.
 
 ## 1. Model Introduction
 
@@ -31,7 +31,7 @@ title: "Wan 2.2 T2V"
 
 ## 2. Deployment
 
-### 2.1 Hardware Matrix (starter targets)
+### 2.1 Hardware Matrix
 
 | Tier | Model | TPU | Topology | `--tp-size` | Notes |
 |---|---|---|---|---|---|
@@ -207,6 +207,8 @@ Video generation quality is typically evaluated subjectively (FVD, motion smooth
 
 ### 4.2 Speed
 
+> **Layout B — methodology + single-shot smoke datapoint.** Latency dominated by `num_inference_steps x DiT step time x num_frames`; benchmark each `(resolution, frame count, step count)` triple separately. One smoke wall-clock recorded; throughput sweeps require a custom driver (`bench_serving` does not cover the videos endpoint).
+
 Video diffusion latency is dominated by `num_inference_steps x DiT step time x num_frames`. Benchmark each `(resolution, frame count, step count)` triple separately.
 
 **Test Environment** - same as the §2.3 launch command for the checkpoint you measure.
@@ -217,7 +219,7 @@ Video diffusion latency is dominated by `num_inference_steps x DiT step time x n
 
 | Build | Variant | Hardware | `size` | `num_frames` | `num_inference_steps` | Concurrency | Wall-clock per request |
 |---|---|---|---|---|---|---|---|
-| `de29d9f0` (2026-05-26) | Wan2.2-T2V-A14B-Diffusers | TPU v6e-4 (TP=1, CPU text encoder) | `480*832` | 41 | default (50) | 1 | ~2 min 43 s |
+| sglang-jax 0.1.0 | Wan2.2-T2V-A14B-Diffusers | TPU v6e-4 (TP=1, CPU text encoder) | `480*832` | 41 | default (50) | 1 | ~2 min 43 s |
 
 This is a single-shot smoke datapoint, not a throughput sweep. Throughput sweeps require the custom driver above.
 

@@ -4,7 +4,7 @@ title: "GLM-4.5"
 
 # GLM-4.5 MoE on SGL-JAX
 
-> **Partially validated** — GLM-4.5-Air (106B) on v6e-32 is validated for sanity + GSM8K + bench, **but requires a 10-line patch to `python/sgl_jax/srt/models/glm4_moe.py`** as of `d9c98c80`: every `transpose=False` on the q/k/v/o, dense-MLP, and shared_experts `WeightMapping` blocks must flip to `transpose=True` (HF stores `[out, in]`, `LinearBase` expects `[in, out]` — compare every other validated recipe). Apply via the in-manifest patch heredoc shown in [`../../2026-05-21-recipe-command-audit/glm45-air-32-patched/manifest.yaml`](../../2026-05-21-recipe-command-audit/glm45-air-32-patched/manifest.yaml). GLM-4.5 (full 355B) on v6e-64 stays untested in this audit pass (v6e-64 nodepool released).
+> **Partially validated recipe** — GLM-4.5-Air (106B) validated on TPU v6e-32 with sglang-jax 0.1.0; sanity + GSM8K + bench all pass, **but requires a 10-line patch to `python/sgl_jax/srt/models/glm4_moe.py`** as of `d9c98c80`: every `transpose=False` on the q/k/v/o, dense-MLP, and shared_experts `WeightMapping` blocks must flip to `transpose=True` (HF stores `[out, in]`, `LinearBase` expects `[in, out]` — compare every other validated recipe). Apply via the in-manifest patch heredoc shown in [`../../2026-05-21-recipe-command-audit/glm45-air-32-patched/manifest.yaml`](../../2026-05-21-recipe-command-audit/glm45-air-32-patched/manifest.yaml). GLM-4.5 (full 355B) on v6e-64 remains Starter (v6e-64 nodepool released; not tested in this audit pass).
 
 ## 1. Model Introduction
 
@@ -26,7 +26,7 @@ For the newer GLM-5 family with DeepSeek-style sparse attention see [`GLM-5.md`]
 
 ## 2. Deployment
 
-### 2.1 Hardware Matrix (starter targets)
+### 2.1 Hardware Matrix
 
 | Model | TPU | Topology | Nodes | Chips | `--tp-size` | `--ep-size` | Notes |
 |---|---|---|---|---|---|---|---|
@@ -193,32 +193,7 @@ To see the full set of `--reasoning-parser` / `--tool-call-parser` keys availabl
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Speed
-
-> **Layout B — methodology + command template.** No measured numbers yet; PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` to upgrade to Validated.
-
-**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.1](../Qwen/Qwen3.md#41-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the GLM-4.5 checkpoint, remove the vLLM half).
-
-**Test Results** — GLM-4.5-Air, Layout B (`bench_serving` random 1024→1024, N=100, max-concurrency 16), v6e-32 + glm4_moe.py 10-mapping patch + `--moe-backend epmoe`, build `d9c98c80`:
-
-```
-============ Serving Benchmark Result ============
-Backend:                  sgl-jax
-Successful requests:      100
-Benchmark duration (s):   95.10
-Request throughput:       1.05 req/s
-Input throughput:         1076.76 tok/s
-Output throughput:        1076.76 tok/s
-Total throughput:         2153.51 tok/s
-Mean E2E Latency (ms):    14229.21
-Mean TTFT (ms):           576.77
-Mean TPOT (ms):           13.35
-==================================================
-```
-
-GLM-4.5 (355B): not tested in this audit pass; would need v6e-64.
-
-### 4.2 Accuracy
+### 4.1 Accuracy
 
 **Test Environment**
 
@@ -228,7 +203,7 @@ GLM-4.5 (355B): not tested in this audit pass; would need v6e-64.
 | Model | zai-org/GLM-4.5-Air (BF16) — full GLM-4.5 untested |
 | Tensor Parallelism | 32 (Air) / 64 (GLM-4.5) |
 | Expert Parallelism | 32 (Air) / 64 (GLM-4.5) |
-| Tested build | sglang-jax `d9c98c80` + glm4_moe.py 10-mapping transpose patch (Air on v6e-32, 2026-05-29) |
+| Tested build | sglang-jax 0.1.0 + glm4_moe.py 10-mapping transpose patch (Air on v6e-32) |
 
 **Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-32-glm-45-air).
 
@@ -249,13 +224,38 @@ evalscope eval \
 
 Recommended additional datasets: MMLU, GPQA Diamond, AIME 2025.
 
-**Test Results** — GLM-4.5-Air on v6e-32 (build `d9c98c80` + glm4_moe.py 10-mapping transpose patch):
+**Test Results** — GLM-4.5-Air on v6e-32 (sglang-jax 0.1.0 + glm4_moe.py 10-mapping transpose patch):
 
 | Model | Dataset | Limit | Score |
 |:---|:---|:---|:---|
 | GLM-4.5-Air | gsm8k main | 200 | **0.955** |
 
 GLM-4.5 (355B): not tested in this audit pass.
+
+### 4.2 Speed
+
+> **Layout B — methodology + command template.** No measured numbers yet; PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` to upgrade to Validated.
+
+**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the GLM-4.5 checkpoint, remove the vLLM half).
+
+**Test Results** — GLM-4.5-Air, Layout B (`bench_serving` random 1024→1024, N=100, max-concurrency 16), v6e-32 + glm4_moe.py 10-mapping patch + `--moe-backend epmoe`, sglang-jax 0.1.0:
+
+```
+============ Serving Benchmark Result ============
+Backend:                  sgl-jax
+Successful requests:      100
+Benchmark duration (s):   95.10
+Request throughput:       1.05 req/s
+Input throughput:         1076.76 tok/s
+Output throughput:        1076.76 tok/s
+Total throughput:         2153.51 tok/s
+Mean E2E Latency (ms):    14229.21
+Mean TTFT (ms):           576.77
+Mean TPOT (ms):           13.35
+==================================================
+```
+
+GLM-4.5 (355B): not tested in this audit pass; would need v6e-64.
 
 ## 5. Troubleshooting
 

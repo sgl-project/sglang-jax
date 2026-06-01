@@ -116,7 +116,7 @@ For an end-to-end GKE manifest with the same template applied, see [`MiMo-V2.5-P
 
 **MoE Backend Selection:**
 - This recipe uses `--moe-backend epmoe` on single-host v7x-8 and `--moe-backend fused` on multi-host v6e-16.
-- At EP ≤ 8 (single host) `epmoe` wins by ~18–26% on long-context throughput (see §4.1 sweep). At EP ≥ 16 the fused Pallas kernel wins.
+- At EP ≤ 8 (single host) `epmoe` wins by ~18–26% on long-context throughput (see §4.2 sweep). At EP ≥ 16 the fused Pallas kernel wins.
 - The fused MoE tuned-config table covers the EP=8 shapes (server logs report `Using tuned block config` for the precompiled buckets), so the gap is not a tuner-coverage issue — it's the kernel design balance at small EP.
 
 **Chunked Prefill Tuning:**
@@ -359,7 +359,45 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 
 > Benchmark data below is a snapshot pinned to the `Tested build` listed in each Test Environment; not refreshed on every release. New numbers are added via new PRs; older numbers stay as historical records of that build.
 
-### 4.1 Speed — single-workload configuration sweep
+### 4.1 Accuracy — GSM8K
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-16 (4 nodes × 4 chips) |
+| Model | XiaomiMiMo/MiMo-V2-Flash (FP8) |
+| Tensor Parallelism | 16 |
+| Data Parallelism | 4 |
+| Expert Parallelism | 16 |
+| Reasoning Parser | `mimo` |
+| Tested build | sglang-jax 0.1.0 |
+
+**Deployment Command** — same as [§2.3 Multi-host](#multi-host-gke-indexed-job--tpu-v6e-16-4-nodes), plus `--reasoning-parser mimo`.
+
+**Benchmark Command**
+
+```bash
+evalscope eval \
+  --model XiaomiMiMo/MiMo-V2-Flash \
+  --api-url http://127.0.0.1:30000/v1/chat/completions \
+  --api-key EMPTY \
+  --eval-type service \
+  --datasets gsm8k \
+  --eval-batch-size 32 \
+  --generation-config '{"max_tokens": 32768, "chat_template_kwargs": {"enable_thinking": true}}'
+```
+
+**Test Results**
+
+| Model | Dataset | Metric | Subset | Num | Score | Tested build |
+|:---|:---|:---|:---|:---|:---|:---|
+| MiMo-V2-Flash | gsm8k | AverageAccuracy | main | 1319 | 0.9401 | (pre-pin) |
+| MiMo-V2-Flash | gsm8k | AverageAccuracy | main | 200 | 0.9750 | sglang-jax 0.1.0 (smoke run, `max_tokens 8192`, no `--reasoning-parser` flag) |
+
+### 4.2 Speed — single-workload configuration sweep
+
+> **Layout F — single-workload configuration sweep.** One fixed cell (ISL=16384, OSL=1024, concurrency=64, 256 prompts), varying `--moe-backend` × `--chunked-prefill-size` × `--swa-full-tokens-ratio` × `--mem-fraction-static` on v7x-8.
 
 This recipe uses a **single-workload configuration sweep**: one fixed ISL/OSL/concurrency cell, varying `--moe-backend` × `--chunked-prefill-size` × `--swa-full-tokens-ratio` × `--mem-fraction-static` to pick the best v7x-8 single-host configuration.
 
@@ -372,7 +410,7 @@ This recipe uses a **single-workload configuration sweep**: one fixed ISL/OSL/co
 | Tensor Parallelism | 8 |
 | Expert Parallelism | 8 |
 | Data Parallelism | 1 (for this sweep only) |
-| Tested build | sglang-jax `b787fdef` (run pre-dates pin convention; approximately late 2025) |
+| Tested build | sglang-jax 0.1.0 (run pre-dates pin convention; approximately late 2025) |
 
 **Workload**: 256 prompts, ISL=16384, OSL=1024, concurrency=64 (single fixed cell).
 
@@ -404,49 +442,13 @@ python -m sgl_jax.bench_serving \
 
 The fused MoE tuned-config table covers the EP=8 shapes (server logs report `Using tuned block config` for the precompiled buckets), so the gap is not a tuner-coverage issue — it reflects the kernel design balance at small EP.
 
-**Multi-host v6e-16 (4 nodes × 4 chips, `--tp-size 16 --dp-size 4 --ep-size 16 --moe-backend fused`)** — sglang-jax `b2daa46d`, 100 prompts, ISL=1024, OSL=1024, concurrency=16:
+**Multi-host v6e-16 (4 nodes × 4 chips, `--tp-size 16 --dp-size 4 --ep-size 16 --moe-backend fused`)** — sglang-jax 0.1.0, 100 prompts, ISL=1024, OSL=1024, concurrency=16:
 
 | Output tok/s | Peak output tok/s | Mean TTFT | Mean TPOT | Median TPOT |
 |---|---|---|---|---|
 | 1034.44 | 1216.00 | 1093.50 ms | 13.29 ms | 13.33 ms |
 
 **Other workload cells**: _Pending_ — additional v6e-16 (ISL, OSL, concurrency) combinations not yet measured. PR the full `============ Serving Benchmark Result ============` block from `bench_serving` when measured.
-
-### 4.2 Accuracy — GSM8K
-
-**Test Environment**
-
-| Field | Value |
-|---|---|
-| Hardware | TPU v6e-16 (4 nodes × 4 chips) |
-| Model | XiaomiMiMo/MiMo-V2-Flash (FP8) |
-| Tensor Parallelism | 16 |
-| Data Parallelism | 4 |
-| Expert Parallelism | 16 |
-| Reasoning Parser | `mimo` |
-| Tested build | _Pending_ (run pre-dates pin convention) |
-
-**Deployment Command** — same as [§2.3 Multi-host](#multi-host-gke-indexed-job--tpu-v6e-16-4-nodes), plus `--reasoning-parser mimo`.
-
-**Benchmark Command**
-
-```bash
-evalscope eval \
-  --model XiaomiMiMo/MiMo-V2-Flash \
-  --api-url http://127.0.0.1:30000/v1/chat/completions \
-  --api-key EMPTY \
-  --eval-type service \
-  --datasets gsm8k \
-  --eval-batch-size 32 \
-  --generation-config '{"max_tokens": 32768, "chat_template_kwargs": {"enable_thinking": true}}'
-```
-
-**Test Results**
-
-| Model | Dataset | Metric | Subset | Num | Score | Tested build |
-|:---|:---|:---|:---|:---|:---|:---|
-| MiMo-V2-Flash | gsm8k | AverageAccuracy | main | 1319 | 0.9401 | (pre-pin) |
-| MiMo-V2-Flash | gsm8k | AverageAccuracy | main | 200 | 0.9750 | sglang-jax `b2daa46d` (smoke run, `max_tokens 8192`, no `--reasoning-parser` flag) |
 
 ## 5. Troubleshooting
 
@@ -457,7 +459,7 @@ evalscope eval \
 | Full-attention pool exhaustion | Long full-attention KV demand exceeds budget | Lower `--swa-full-tokens-ratio` (shifts pool toward full layers), or shorten `--context-length`. |
 | First request takes ~4 min | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR` across restarts (host volume mount in Docker; PVC in GKE). |
 | Multi-node hang at `jax.distributed.initialize` | `--dist-init-addr` unreachable | Verify rank-0 IP and port reachable from all nodes; check firewall on the JAX init port. |
-| `fused` MoE backend slower than `epmoe` on single-host v7x-8 | Expected — see §4.1 measurements | Use `--moe-backend epmoe` for EP ≤ 8; `fused` is the right pick at EP ≥ 16. |
+| `fused` MoE backend slower than `epmoe` on single-host v7x-8 | Expected — see §4.2 measurements | Use `--moe-backend epmoe` for EP ≤ 8; `fused` is the right pick at EP ≥ 16. |
 
 ## Additional Resources
 

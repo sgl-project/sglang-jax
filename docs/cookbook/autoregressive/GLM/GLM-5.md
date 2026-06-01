@@ -4,7 +4,7 @@ title: "GLM-5"
 
 # GLM-5 MoE on SGL-JAX
 
-> **Planned recipe** — GLM-5 is supported in the runtime (`Glm5ForCausalLM` / `GlmMoeDsaForCausalLM` are registered), but the public model release pins are not yet known. This placeholder stays out of public navigation until model details and validation data are available.
+> **Planned recipe** — placeholder for the unreleased GLM-5 model. The runtime registers `Glm5ForCausalLM` / `GlmMoeDsaForCausalLM`, but the public model release pins are not yet known. Stays out of public navigation until model details and validation data are available.
 
 ## 1. Model Introduction
 
@@ -23,7 +23,7 @@ For the GLM-4.5 family (without DSA, `glm45` tool-call format) see [`GLM-4.5.md`
 
 ## 2. Deployment
 
-### 2.1 Hardware Matrix (starter targets)
+### 2.1 Hardware Matrix
 
 | Model | TPU | Topology | Nodes | Chips | `--tp-size` | `--ep-size` | Notes |
 |---|---|---|---|---|---|---|---|
@@ -162,15 +162,7 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Speed
-
-> **Layout B — methodology + command template.** No measured numbers yet; hardware sizing pending GLM-5 public release.
-
-**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.1](../Qwen/Qwen3.md#41-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the GLM-5 checkpoint, remove the vLLM half).
-
-**Test Results** — _Pending._
-
-### 4.2 Accuracy
+### 4.1 Accuracy
 
 **Test Environment**
 
@@ -180,7 +172,7 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 | Model | _Pending_ (BF16) |
 | Tensor Parallelism | _Pending_ |
 | Expert Parallelism | _Pending_ |
-| Tested build | _Pending_ |
+| Tested build | sglang-jax 0.1.0 |
 
 **Deployment Command** — same as [§2.3](#multi-host-template).
 
@@ -199,6 +191,14 @@ evalscope eval \
 For DSA variants, add a long-context dataset (e.g. RULER 32K / 128K) to exercise the sparse-attention path.
 
 **Test Results** — _Pending. Run and PR back._
+
+### 4.2 Speed
+
+> **Layout B — methodology + command template.** No measured numbers yet; hardware sizing pending GLM-5 public release.
+
+**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the GLM-5 checkpoint, remove the vLLM half).
+
+**Test Results** — _Pending._
 
 ## 5. Troubleshooting
 

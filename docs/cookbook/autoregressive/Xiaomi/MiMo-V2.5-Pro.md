@@ -4,7 +4,7 @@ title: "MiMo-V2.5-Pro"
 
 # MiMo-V2.5-Pro on SGL-JAX
 
-> **Validated recipe** — TPU v6e-64 path validated on sglang-jax `de29d9f0` (2026-05-27): server starts, thinking-on output correct, GSM8K accuracy 97.5% (200 examples, see §4.2), `bench_serving` numbers in §4.1. TPU v7x-16 is a supported alternative hardware path (same launch shape, lower HBM-per-chip pressure); v6e-64 is the validation target for this recipe and v7x reruns are not required to keep the ✅ status.
+> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, thinking-on output correct, GSM8K accuracy 97.5% (200 examples, see §4.1), `bench_serving` numbers in §4.2. TPU v7x-16 is a supported alternative hardware path (same launch shape, lower HBM-per-chip pressure); v6e-64 is the validation target for this recipe and v7x reruns are not required to keep the ✅ status.
 
 ## 1. Model Introduction
 
@@ -29,12 +29,12 @@ title: "MiMo-V2.5-Pro"
 
 ### 2.1 Hardware Matrix
 
-| TPU | Topology | Chips per node | Nodes | Total chips | `--tp-size` | `--dp-size` | `--ep-size` | `--moe-backend` | Status | Notes |
-|---|---|---|---|---|---|---|---|---|---|---|
-| **v6e-64** | `4x4x4` | 4 | 16 | 64 | 64 | 8 | 64 | `fused` | ✅ validated | Primary validation target. v6e is 1:1 chip↔device; lower HBM per chip — see §2.4 SWA Pool Sizing for tradeoff. GSM8K + bench_serving in §4. |
-| **v7x-16** | `2x2x4` | 4 | 4 | 16 | 32 | 4 | 32 | `fused` | alternative | Supported alternative hardware; same launch shape. v7x exposes 2 JAX devices/chip → 16 × 2 = 32; attention TP = `tp_size/dp_size` = 8. Historical AIME 2025 reference numbers in §4.2; not rerun on current build (not required for ✅). |
+| Tier | TPU | Topology | Chips per node | Nodes | Total chips | `--tp-size` | `--dp-size` | `--ep-size` | `--moe-backend` | Status | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Primary production | **v6e-64** | `4x4x4` | 4 | 16 | 64 | 64 | 8 | 64 | `fused` | ✅ validated | Primary validation target. v6e is 1:1 chip↔device; lower HBM per chip — see §2.4 SWA Pool Sizing for tradeoff. GSM8K + bench_serving in §4. |
+| Alternative production | **v7x-16** | `2x2x4` | 4 | 4 | 16 | 32 | 4 | 32 | `fused` | alternative | Supported alternative hardware; same launch shape. v7x exposes 2 JAX devices/chip → 16 × 2 = 32; attention TP = `tp_size/dp_size` = 8. Historical AIME 2025 reference numbers in §4.1; not rerun on current build (not required for ✅). |
 
-MiMo-V2.5-Pro requires a full v7x-16 or v6e-64 slice; single-host configurations are not supported. All nodes must be in the same TPU slice and reach each other on the JAX init port (`5000` by default) and the TPU process port (`8471`).
+MiMo-V2.5-Pro ships a single supported deployment class — multi-host MoE on either v6e-64 (primary) or v7x-16 (alternative); single-host configurations are not supported. All nodes must be in the same TPU slice and reach each other on the JAX init port (`5000` by default) and the TPU process port (`8471`).
 
 See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation / HBM / device-per-chip reference.
 
@@ -119,7 +119,7 @@ For the GKE Indexed Job + headless Service manifest pattern that wraps both laun
 
 **MoE Backend Selection:**
 - `--moe-backend fused` is the right pick for this recipe (EP ≥ 16) — fused Pallas kernel wins on large EP shapes.
-- For smaller single-host MoE setups (EP ≤ 8), `epmoe` actually wins; see the measured tradeoff in [`MiMo-V2-Flash.md` §4.1](MiMo-V2-Flash.md#41-speed--single-workload-configuration-sweep).
+- For smaller single-host MoE setups (EP ≤ 8), `epmoe` actually wins; see the measured tradeoff in [`MiMo-V2-Flash.md` §4.2](MiMo-V2-Flash.md#42-speed--single-workload-configuration-sweep).
 
 **Speculative Decoding (NEXTN / MTP):**
 - MiMo-V2.5-Pro ships an MTP draft head; enable speculative decoding via:
@@ -370,7 +370,46 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 
 > Benchmark data below is a snapshot pinned to the `Tested build` listed in each Test Environment; not refreshed on every release. New numbers are added via new PRs; older numbers stay as historical records of that build.
 
-### 4.1 Speed
+### 4.1 Accuracy — GSM8K (thinking enabled)
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-64 (16 nodes × 4 chips) |
+| Model | XiaomiMiMo/MiMo-V2.5-Pro (FP8) |
+| Tensor Parallelism | 64 |
+| Data Parallelism | 8 |
+| Expert Parallelism | 64 |
+| Reasoning Parser | `mimo` |
+| Tested build | sglang-jax 0.1.0 |
+
+**Deployment Command** — same as [§2.3 Multi-host (v6e-64)](#multi-host--tpu-v6e-64-16-nodes-4x4x4), plus `--reasoning-parser mimo`.
+
+**Benchmark Command**
+
+```bash
+evalscope eval \
+  --model XiaomiMiMo/MiMo-V2.5-Pro \
+  --api-url http://127.0.0.1:30000/v1/chat/completions \
+  --api-key EMPTY \
+  --eval-type service \
+  --datasets gsm8k \
+  --eval-batch-size 8 \
+  --limit 200 \
+  --timeout 6000000 \
+  --generation-config '{"temperature":1,"top_p":0.95,"max_tokens":8192,"chat_template_kwargs":{"enable_thinking":true}}'
+```
+
+**Test Results**
+
+| Model | Dataset | Metric | Subset | Num | Score |
+|:---|:---|:---|:---|:---|:---|
+| MiMo-V2.5-Pro | gsm8k | AverageAccuracy | main | 200 | **0.975** |
+
+> Historical AIME 2025 results on **TPU v7x-16** (different hardware): AIME2025-I AveragePass@1 = 0.8667 (15 problems), AIME2025-II = 1.0000 (15), OVERALL = 0.9334 (30). Build pre-dates the pin convention. Kept here as a reference for the v7x path until that path is re-validated on a current build.
+
+### 4.2 Speed
 
 > **Layout F — single-workload sweep (one data point).** Standard chat (ISL=1000, OSL=1000), `max_concurrency=16`, 80 prompts, `seed=42`. Future PRs can add reasoning-typical workloads (long OSL) and concurrency sweeps. Do **not** set `--reasoning-parser mimo` for throughput benchmarks (the parser adds per-token CPU work that distorts raw token rates).
 
@@ -383,7 +422,7 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 | Tensor Parallelism | 64 |
 | Data Parallelism | 8 |
 | Expert Parallelism | 64 |
-| Tested build | sglang-jax `de29d9f0` (2026-05-27) |
+| Tested build | sglang-jax 0.1.0 |
 
 **Deployment Command** — same as [§2.3 Multi-host (v6e-64)](#multi-host--tpu-v6e-64-16-nodes-4x4x4), without `--reasoning-parser`.
 
@@ -442,45 +481,6 @@ Max ITL (ms):                            1290.76
 ```
 
 > Same workload as DeepSeek-V3 §4.2: MiMo-V2.5-Pro total throughput is **926.22 tok/s** vs DeepSeek-V3 **491.26 tok/s** (1.89× faster). Mean TTFT 467 ms vs 1019 ms; mean TPOT 28.7 ms vs 59.3 ms. The gap matches the active-parameter ratio (MiMo 15B active vs V3 37B active) plus MiMo's SWA decode-bandwidth savings.
-
-### 4.2 Accuracy — GSM8K (thinking enabled)
-
-**Test Environment**
-
-| Field | Value |
-|---|---|
-| Hardware | TPU v6e-64 (16 nodes × 4 chips) |
-| Model | XiaomiMiMo/MiMo-V2.5-Pro (FP8) |
-| Tensor Parallelism | 64 |
-| Data Parallelism | 8 |
-| Expert Parallelism | 64 |
-| Reasoning Parser | `mimo` |
-| Tested build | sglang-jax `de29d9f0` (2026-05-27) |
-
-**Deployment Command** — same as [§2.3 Multi-host (v6e-64)](#multi-host--tpu-v6e-64-16-nodes-4x4x4), plus `--reasoning-parser mimo`.
-
-**Benchmark Command**
-
-```bash
-evalscope eval \
-  --model XiaomiMiMo/MiMo-V2.5-Pro \
-  --api-url http://127.0.0.1:30000/v1/chat/completions \
-  --api-key EMPTY \
-  --eval-type service \
-  --datasets gsm8k \
-  --eval-batch-size 8 \
-  --limit 200 \
-  --timeout 6000000 \
-  --generation-config '{"temperature":1,"top_p":0.95,"max_tokens":8192,"chat_template_kwargs":{"enable_thinking":true}}'
-```
-
-**Test Results**
-
-| Model | Dataset | Metric | Subset | Num | Score |
-|:---|:---|:---|:---|:---|:---|
-| MiMo-V2.5-Pro | gsm8k | AverageAccuracy | main | 200 | **0.975** |
-
-> Historical AIME 2025 results on **TPU v7x-16** (different hardware): AIME2025-I AveragePass@1 = 0.8667 (15 problems), AIME2025-II = 1.0000 (15), OVERALL = 0.9334 (30). Build pre-dates the pin convention. Kept here as a reference for the v7x path until that path is re-validated on a current build.
 
 ## 5. Troubleshooting
 

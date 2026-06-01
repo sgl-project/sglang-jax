@@ -4,7 +4,7 @@ title: "Llama 3.1"
 
 # Llama 3.1 on SGL-JAX
 
-> **Validated** on TPU v6e-4 (build `de29d9f0`, 2026-05-25). See §4 for measured numbers. Phi-3 / InternLM3 aliases below remain Starter — same launch path but unmeasured.
+> **Validated recipe** — empirically validated on TPU v6e-4 with sglang-jax 0.1.0; see §4 for measured numbers. Phi-3 / InternLM3 aliases below use the same launch path but are unmeasured.
 
 ## 1. Model Introduction
 
@@ -24,7 +24,7 @@ For the 70B size (multi-host required) see [`Llama3.3-70B.md`](Llama3.3-70B.md).
 
 ## 2. Deployment
 
-### 2.1 Hardware Matrix (starter target)
+### 2.1 Hardware Matrix
 
 | Tier | Model | TPU | Topology | Chips | `--tp-size` | Notes |
 |---|---|---|---|---|---|---|
@@ -88,9 +88,7 @@ See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Speed
-
-> **Layout B — measured baseline.** Single-host TPU v6e-4, build `de29d9f0` (2026-05-25). Numbers are sgl-jax-only; vLLM-on-TPU comparison is not run.
+### 4.1 Accuracy
 
 **Test Environment**
 
@@ -99,7 +97,43 @@ See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model
 | Hardware | TPU v6e-4 (single host, 4 chips) |
 | Model | meta-llama/Llama-3.1-8B-Instruct (BF16) |
 | Tensor Parallelism | 4 |
-| Tested build | `de29d9f0` (2026-05-25) |
+| Tested build | sglang-jax 0.1.0 |
+
+**Deployment Command** — same as [§2.3](#single-host-docker--tpu-v6e-4).
+
+**Benchmark Command** — example for GSM8K:
+
+```bash
+evalscope eval \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --api-url http://127.0.0.1:30000/v1/chat/completions \
+  --api-key EMPTY \
+  --eval-type service \
+  --datasets gsm8k \
+  --eval-batch-size 16 \
+  --limit 200
+```
+
+Recommended additional datasets: MMLU, HumanEval, IFEval.
+
+**Test Results**
+
+| Dataset | Subset | Samples | Score |
+|---|---|---|---|
+| gsm8k | main | 200 | **0.825** |
+
+### 4.2 Speed
+
+> **Layout B — measured baseline.** Single-host TPU v6e-4, sglang-jax 0.1.0. Numbers are sgl-jax-only; vLLM-on-TPU comparison is not run.
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-4 (single host, 4 chips) |
+| Model | meta-llama/Llama-3.1-8B-Instruct (BF16) |
+| Tensor Parallelism | 4 |
+| Tested build | sglang-jax 0.1.0 |
 
 **Benchmark Command**
 
@@ -133,40 +167,6 @@ Median TPOT (ms):                        9.84
 Mean ITL (ms):                           9.87
 ==================================================
 ```
-
-### 4.2 Accuracy
-
-**Test Environment**
-
-| Field | Value |
-|---|---|
-| Hardware | TPU v6e-4 (single host, 4 chips) |
-| Model | meta-llama/Llama-3.1-8B-Instruct (BF16) |
-| Tensor Parallelism | 4 |
-| Tested build | `de29d9f0` (2026-05-25) |
-
-**Deployment Command** — same as [§2.3](#single-host-docker--tpu-v6e-4).
-
-**Benchmark Command** — example for GSM8K:
-
-```bash
-evalscope eval \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --api-url http://127.0.0.1:30000/v1/chat/completions \
-  --api-key EMPTY \
-  --eval-type service \
-  --datasets gsm8k \
-  --eval-batch-size 16 \
-  --limit 200
-```
-
-Recommended additional datasets: MMLU, HumanEval, IFEval.
-
-**Test Results**
-
-| Dataset | Subset | Samples | Score |
-|---|---|---|---|
-| gsm8k | main | 200 | **0.825** |
 
 ## 5. Troubleshooting
 

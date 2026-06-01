@@ -4,7 +4,7 @@ title: "Qwen-7B-Chat"
 
 # Qwen-7B-Chat on SGL-JAX
 
-> **Validated recipe** — empirically validated on TPU v6e-4 with sglang-jax `fe092bf` (2026-05-22).
+> **Validated recipe** — empirically validated on TPU v6e-4 with sglang-jax 0.1.0.
 >
 > First-generation Qwen recipe. For Qwen3-8B / Qwen3-32B see [`Qwen3.md`](Qwen3.md).
 
@@ -29,6 +29,8 @@ title: "Qwen-7B-Chat"
 | TPU | Topology | Chips | `--tp-size` | Notes |
 |---|---|---|---|---|
 | **v6e-4** (minimum and recommended) | 2x2 | 4 | 4 | Single host; v6e is 1:1 chip↔device |
+
+This recipe ships a single supported topology — Qwen-7B fits comfortably on v6e-4, and a larger slice provides no measurable benefit at 8K context. For larger Qwen sizes (8B / 32B) see [`Qwen3.md`](Qwen3.md).
 
 See [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
@@ -94,9 +96,43 @@ See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model
 
 > Benchmark data below is a snapshot pinned to the `Tested build` listed in each Test Environment; not refreshed on every release.
 
-### 4.1 Speed — single workload (low-concurrency latency baseline)
+### 4.1 Accuracy — GSM8K
 
-**Test Environment** — same as §4.2.
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-4 (single host, 4 chips) |
+| Model | Qwen/Qwen-7B-Chat (BF16) |
+| Tensor Parallelism | 4 |
+| Tested build | sglang-jax 0.1.0 |
+
+**Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4).
+
+**Benchmark Command**
+
+```bash
+evalscope eval \
+  --model Qwen/Qwen-7B-Chat \
+  --api-url http://127.0.0.1:30000/v1/chat/completions \
+  --api-key EMPTY \
+  --eval-type service \
+  --datasets gsm8k \
+  --eval-batch-size 8 \
+  --limit 500
+```
+
+**Test Results**
+
+| Model | Dataset | Metric | Subset | Num | Score |
+|:---|:---|:---|:---|:---|:---|
+| Qwen-7B-Chat | gsm8k | AverageAccuracy | main | 500 | 0.484 |
+
+### 4.2 Speed — single workload (low-concurrency latency baseline)
+
+> **Layout B — single-workload latency baseline.** `bench_serving` random 512→128, `max_concurrency=8`, 100 prompts on TPU v6e-4 (TP=4).
+
+**Test Environment** — same as §4.1.
 
 **Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4).
 
@@ -156,38 +192,6 @@ P99 ITL (ms):                            9.58
 Max ITL (ms):                            154.39
 ==================================================
 ```
-
-### 4.2 Accuracy — GSM8K
-
-**Test Environment**
-
-| Field | Value |
-|---|---|
-| Hardware | TPU v6e-4 (single host, 4 chips) |
-| Model | Qwen/Qwen-7B-Chat (BF16) |
-| Tensor Parallelism | 4 |
-| Tested build | sglang-jax `fe092bf` (2026-05-22) |
-
-**Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4).
-
-**Benchmark Command**
-
-```bash
-evalscope eval \
-  --model Qwen/Qwen-7B-Chat \
-  --api-url http://127.0.0.1:30000/v1/chat/completions \
-  --api-key EMPTY \
-  --eval-type service \
-  --datasets gsm8k \
-  --eval-batch-size 8 \
-  --limit 500
-```
-
-**Test Results**
-
-| Model | Dataset | Metric | Subset | Num | Score |
-|:---|:---|:---|:---|:---|:---|
-| Qwen-7B-Chat | gsm8k | AverageAccuracy | main | 500 | 0.484 |
 
 ## 5. Troubleshooting
 

@@ -10,10 +10,11 @@ End-to-end serving recipes for diffusion-style image and video generation models
 
 | Emoji | Meaning |
 |---|---|
-| ✅ | **Validated** — primary model / hardware path empirically tuned with reference numbers in §4 |
+| ✅ | **Validated** — primary model / hardware path empirically tuned with reference benchmark numbers in §4 |
 | 🧪 | **Partially validated** — at least one variant / hardware path has real benchmark output; other variants, matrix cells, or current-build reruns are still pending |
 | 🚧 | **Starter** — launch command derived from HF model card; not yet measured. PR back tested numbers to upgrade to 🧪 or ✅ |
-| 📝 | **Planned** — architecture supported by the runtime but no recipe yet |
+| 📝 | **Planned** — architecture supported by the runtime but no recipe yet (or model release pending) |
+| 🚫 | **Blocked** — runnable path blocked by an upstream weight format / HBM / runtime constraint; banner cites the root cause and unblocking plan |
 
 ## Recipes by vendor
 
@@ -21,8 +22,8 @@ End-to-end serving recipes for diffusion-style image and video generation models
 
 | Status | Model | Recipe | Min TPU | Modality | Endpoint |
 |---|---|---|---|---|---|
-| 🚧 | Wan 2.1 T2V (1.3B / 14B) | [`Wan/Wan2.1.md`](Wan/Wan2.1.md) | v6e-4 | Text-to-video diffusion | `/api/v1/videos/generation`, `/api/v1/images/generation` |
-| 🚧 | Wan 2.2 T2V A14B | [`Wan/Wan2.2.md`](Wan/Wan2.2.md) | v6e-4 | Text-to-video diffusion | `/api/v1/videos/generation`, `/api/v1/images/generation` |
+| 🧪 | Wan 2.1 T2V (1.3B / 14B) | [`Wan/Wan2.1.md`](Wan/Wan2.1.md) | v6e-4 | Text-to-video diffusion | `/api/v1/videos/generation`, `/api/v1/images/generation` |
+| 🧪 | Wan 2.2 T2V A14B | [`Wan/Wan2.2.md`](Wan/Wan2.2.md) | v6e-4 | Text-to-video diffusion | `/api/v1/videos/generation`, `/api/v1/images/generation` |
 
 > Upgrade path: 🚧 → 🧪 requires measured launch / quality / wall-clock output for at least one variant and hardware path. 🧪 → ✅ requires complete evidence for the recipe's claimed primary path.
 
@@ -56,6 +57,6 @@ Current cookbook-facing configuration summary:
 
 | Goal | Clone from |
 |---|---|
-| Text-to-video diffusion with Wan 2.1 | [`Wan/Wan2.1.md`](Wan/Wan2.1.md) 🚧 |
-| Text-to-video diffusion with Wan 2.2 | [`Wan/Wan2.2.md`](Wan/Wan2.2.md) 🚧 |
+| Text-to-video diffusion with Wan 2.1 | [`Wan/Wan2.1.md`](Wan/Wan2.1.md) 🧪 |
+| Text-to-video diffusion with Wan 2.2 | [`Wan/Wan2.2.md`](Wan/Wan2.2.md) 🧪 |
 | Text-to-image diffusion (prompt → image) | Use [`Wan/Wan2.1.md`](Wan/Wan2.1.md) or [`Wan/Wan2.2.md`](Wan/Wan2.2.md) as the current staged runtime pattern, then replace the model path and endpoint examples as needed |

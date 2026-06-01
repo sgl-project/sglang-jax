@@ -28,7 +28,7 @@ For the 671B V3 flagship see [`DeepSeek-V3.md`](DeepSeek-V3.md). For the reasoni
 
 ## 2. Deployment
 
-### 2.1 Hardware Matrix (starter targets)
+### 2.1 Hardware Matrix
 
 | Model | TPU | Topology | Nodes | Chips | `--tp-size` | `--ep-size` | Notes |
 |---|---|---|---|---|---|---|---|
@@ -127,50 +127,7 @@ See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Speed
-
-> **Layout B — single-workload latency baseline.** Measured on V2-Lite v6e-4 with `bench_serving` random 512→128, max-concurrency 8, build `de29d9f0`.
-
-**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.1](../Qwen/Qwen3.md#41-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the DeepSeek-V2 checkpoint, remove the vLLM half).
-
-**Test Results** — V2-Lite (TPU v6e-4):
-
-```
-============ Serving Benchmark Result ============
-Backend:                                 sgl-jax
-Successful requests:                     100
-Benchmark duration (s):                  14.65
-Request throughput (req/s):              6.83
-Input token throughput (tok/s):          3495.51
-Output token throughput (tok/s):         873.88
-Peak output token throughput (tok/s):    1022.00
-Total token throughput (tok/s):          4369.38
-Mean E2E Latency (ms):                   1136.32
-Mean TTFT (ms):                          194.98
-Mean TPOT (ms):                          7.41
-==================================================
-```
-
-V2 multi-host: Layout B (random 1024→1024, N=100, c=16) on v6e-32, build `d9c98c80` + gate.py patch, `--moe-backend epmoe`:
-
-```
-============ Serving Benchmark Result ============
-Backend:                                 sgl-jax
-Max request concurrency:                 16
-Successful requests:                     100
-Benchmark duration (s):                  142.03
-Request throughput (req/s):              0.70
-Input token throughput (tok/s):          720.96
-Output token throughput (tok/s):         720.96
-Peak output token throughput (tok/s):    912.00
-Total token throughput (tok/s):          1441.92
-Mean E2E Latency (ms):                   21075.12
-Mean TTFT (ms):                          1537.69
-Mean TPOT (ms):                          19.10
-==================================================
-```
-
-### 4.2 Accuracy
+### 4.1 Accuracy
 
 **Test Environment**
 
@@ -180,7 +137,7 @@ Mean TPOT (ms):                          19.10
 | Model | deepseek-ai/DeepSeek-V2-Lite-Chat or DeepSeek-V2-Chat (BF16) |
 | Tensor Parallelism | 4 (Lite) / 32 (V2) |
 | Expert Parallelism | 4 (Lite) / 32 (V2) |
-| Tested build | sglang-jax `de29d9f0` (2026-05-24) |
+| Tested build | sglang-jax 0.1.0 |
 
 > **Use the `-Chat` checkpoint for accuracy eval.** The base `DeepSeek-V2-Lite` ships without a chat template; evalscope's few-shot GSM8K prompt loops indefinitely against `/v1/chat/completions` (observed 0.014 score, `finish_reason: length`). The instruct-tuned `DeepSeek-V2-Lite-Chat` has the chat template and parses `\nThe answer is X` reliably.
 
@@ -200,7 +157,7 @@ evalscope eval \
 
 Recommended additional datasets: MMLU, GPQA Diamond, HumanEval.
 
-**Test Results** — V2-Lite-Chat (TPU v6e-4, sglang-jax `fe092bf`):
+**Test Results** — V2-Lite-Chat (TPU v6e-4, sglang-jax 0.1.0):
 
 | Model | Dataset | Limit | Score |
 |:---|:---|:---|:---|
@@ -208,6 +165,49 @@ Recommended additional datasets: MMLU, GPQA Diamond, HumanEval.
 | DeepSeek-V2-Lite (base, anti-pattern reference) | gsm8k | 500 | 0.014 (chat-completions endpoint loops on 4-shot prompt; do not use base for chat-completions eval) |
 
 V2 multi-host accuracy: _Pending — run on v6e-32 and PR back._
+
+### 4.2 Speed
+
+> **Layout B — single-workload latency baseline.** Measured on V2-Lite v6e-4 with `bench_serving` random 512→128, max-concurrency 8, sglang-jax 0.1.0.
+
+**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the DeepSeek-V2 checkpoint, remove the vLLM half).
+
+**Test Results** — V2-Lite (TPU v6e-4):
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sgl-jax
+Successful requests:                     100
+Benchmark duration (s):                  14.65
+Request throughput (req/s):              6.83
+Input token throughput (tok/s):          3495.51
+Output token throughput (tok/s):         873.88
+Peak output token throughput (tok/s):    1022.00
+Total token throughput (tok/s):          4369.38
+Mean E2E Latency (ms):                   1136.32
+Mean TTFT (ms):                          194.98
+Mean TPOT (ms):                          7.41
+==================================================
+```
+
+V2 multi-host: Layout B (random 1024→1024, N=100, c=16) on v6e-32, sglang-jax 0.1.0 + gate.py patch, `--moe-backend epmoe`:
+
+```
+============ Serving Benchmark Result ============
+Backend:                                 sgl-jax
+Max request concurrency:                 16
+Successful requests:                     100
+Benchmark duration (s):                  142.03
+Request throughput (req/s):              0.70
+Input token throughput (tok/s):          720.96
+Output token throughput (tok/s):         720.96
+Peak output token throughput (tok/s):    912.00
+Total token throughput (tok/s):          1441.92
+Mean E2E Latency (ms):                   21075.12
+Mean TTFT (ms):                          1537.69
+Mean TPOT (ms):                          19.10
+==================================================
+```
 
 ## 5. Troubleshooting
 

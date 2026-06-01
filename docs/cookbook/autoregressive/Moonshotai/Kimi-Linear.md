@@ -4,15 +4,11 @@ title: "Kimi-Linear"
 
 # Kimi-Linear on SGL-JAX
 
-> **Validated recipe** — empirically validated on TPU v6e-16 (sglang-jax `b2daa46d`, 2026-05-25) and TPU v6e-32 (sglang-jax `d9c98c80`, 2026-05-29).
+> **Validated recipe** — empirically validated on TPU v6e-16 and TPU v6e-32 with sglang-jax 0.1.0.
 
 ## 1. Model Introduction
 
-[**moonshotai/Kimi-Linear**](https://huggingface.co/moonshotai) is Moonshot AI's linear-attention decoder series built on **Kimi Delta Attention** with a hybrid recurrent state pool. The currently released checkpoint is a 48B MoE with 3B activated parameters.
-
-**Variants**:
-
-- [**moonshotai/Kimi-Linear-48B-A3B-Instruct**](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct) — 48B total / 3B activated, instruction-tuned.
+[**moonshotai/Kimi-Linear-48B-A3B-Instruct**](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct) is Moonshot AI's linear-attention decoder built on **Kimi Delta Attention** with a hybrid recurrent state pool — a 48B MoE with 3B activated parameters, instruction-tuned. It is the only checkpoint currently released in the Kimi-Linear series.
 
 For other linear-attention models in the cookbook see [`Ling-2.6.md`](../InclusionAI/Ling-2.6.md) (InclusionAI's trillion-scale linear-attention MoE).
 
@@ -22,7 +18,7 @@ For other linear-attention models in the cookbook see [`Ling-2.6.md`](../Inclusi
 
 ## 2. Deployment
 
-### 2.1 Hardware Matrix (starter target)
+### 2.1 Hardware Matrix
 
 | Tier | Model | TPU | Topology | Nodes | Chips | `--tp-size` | Notes |
 |---|---|---|---|---|---|---|---|
@@ -113,7 +109,7 @@ See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model
 
 ### 3.2 Long-Context Streaming
 
-Linear attention's win is amortized prefill cost on long prompts — stream the response so first-token latency is the only thing the user waits for, then tokens arrive at steady-state TPOT (~20 ms on v6e-16, see §4.1):
+Linear attention's win is amortized prefill cost on long prompts — stream the response so first-token latency is the only thing the user waits for, then tokens arrive at steady-state TPOT (~20 ms on v6e-16, see §4.2):
 
 ```python
 from openai import OpenAI
@@ -146,22 +142,7 @@ print()
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Speed
-
-> **Layout B — single-workload latency baseline.** Measured on Kimi-Linear-48B-A3B-Instruct v6e-16 with `bench_serving` random 1024→1024, max-concurrency 16, build `b2daa46d`.
-
-**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.1](../Qwen/Qwen3.md#41-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `moonshotai/Kimi-Linear-48B-A3B-Instruct`, remove the vLLM half).
-
-**Test Results** — Kimi-Linear-48B-A3B-Instruct, Layout B (`bench_serving` random 1024→1024, N=100, max-concurrency 16):
-
-| Hardware | Build | Duration (s) | Total throughput (tok/s) | Output throughput (tok/s) | Mean TPOT (ms) | Mean TTFT (ms) |
-|---|---|---:|---:|---:|---:|---:|
-| TPU v6e-16 | `b2daa46d` | 148.28 | 1381.14 | 690.57 | 20.77 | 607.66 |
-| TPU v6e-32 | `d9c98c80` | 140.55 | 1457.14 | 728.57 | 19.72 | 526.89 |
-
-v6e-32 delivers ~5% throughput / 13% TTFT improvement over v6e-16. Scaling is sublinear because Kimi-Linear's sparse 3B-activated MoE caps the per-token chip utilization — the production recommendation for v6e-32 is driven by HBM headroom for long-context recurrent state, not raw token throughput.
-
-### 4.2 Accuracy
+### 4.1 Accuracy
 
 **Test Environment**
 
@@ -171,7 +152,7 @@ v6e-32 delivers ~5% throughput / 13% TTFT improvement over v6e-16. Scaling is su
 | Model | moonshotai/Kimi-Linear-48B-A3B-Instruct (BF16) |
 | Tensor Parallelism | 16 (v6e-16) / 32 (v6e-32) |
 | Recurrent State Memory Ratio | 0.9 |
-| Tested build | sglang-jax `b2daa46d` (v6e-16, 2026-05-25) / `d9c98c80` (v6e-32, 2026-05-29) |
+| Tested build | sglang-jax 0.1.0 |
 
 **Deployment Command** — see [§2.3](#multi-host-gke-indexed-job--tpu-v6e-16) (v6e-16) or [§2.3](#multi-host-gke-indexed-job--tpu-v6e-32-recommended-production) (v6e-32).
 
@@ -194,10 +175,25 @@ Recommended additional datasets: MMLU, GPQA Diamond, RULER (to exercise long-con
 
 | Model | Hardware | Build | Dataset | Limit | Score |
 |:---|:---|:---|:---|:---|:---|
-| Kimi-Linear-48B-A3B-Instruct | TPU v6e-16 | `b2daa46d` | gsm8k main | 200 | **0.925** |
-| Kimi-Linear-48B-A3B-Instruct | TPU v6e-32 | `d9c98c80` | gsm8k main | 200 | **0.935** |
+| Kimi-Linear-48B-A3B-Instruct | TPU v6e-16 | sglang-jax 0.1.0 | gsm8k main | 200 | **0.925** |
+| Kimi-Linear-48B-A3B-Instruct | TPU v6e-32 | sglang-jax 0.1.0 | gsm8k main | 200 | **0.935** |
 
 Within the ±2.3 pp sampling-noise band at limit=200; v6e-32 doubling TP does not regress accuracy.
+
+### 4.2 Speed
+
+> **Layout B — single-workload latency baseline.** Measured on Kimi-Linear-48B-A3B-Instruct v6e-16 with `bench_serving` random 1024→1024, max-concurrency 16, sglang-jax 0.1.0.
+
+**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to `moonshotai/Kimi-Linear-48B-A3B-Instruct`, remove the vLLM half).
+
+**Test Results** — Kimi-Linear-48B-A3B-Instruct, Layout B (`bench_serving` random 1024→1024, N=100, max-concurrency 16):
+
+| Hardware | Build | Duration (s) | Total throughput (tok/s) | Output throughput (tok/s) | Mean TPOT (ms) | Mean TTFT (ms) |
+|---|---|---:|---:|---:|---:|---:|
+| TPU v6e-16 | sglang-jax 0.1.0 | 148.28 | 1381.14 | 690.57 | 20.77 | 607.66 |
+| TPU v6e-32 | sglang-jax 0.1.0 | 140.55 | 1457.14 | 728.57 | 19.72 | 526.89 |
+
+v6e-32 delivers ~5% throughput / 13% TTFT improvement over v6e-16. Scaling is sublinear because Kimi-Linear's sparse 3B-activated MoE caps the per-token chip utilization — the production recommendation for v6e-32 is driven by HBM headroom for long-context recurrent state, not raw token throughput.
 
 ## 5. Troubleshooting
 

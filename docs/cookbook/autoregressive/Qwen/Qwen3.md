@@ -4,7 +4,7 @@ title: "Qwen3"
 
 # Qwen3-8B / Qwen3-32B on SGL-JAX
 
-> **Partially validated recipe** — Qwen3-8B has TPU v6e-4 GSM8K results on sglang-jax `fe092bf` (2026-05-23). The speed matrix covers Qwen3-8B / Qwen3-32B on an older build; Qwen3-32B accuracy and current-build speed reruns are still pending.
+> **Partially validated recipe** — Qwen3-8B has TPU v6e-4 GSM8K results on sglang-jax 0.1.0. The speed matrix covers Qwen3-8B / Qwen3-32B on an older build; Qwen3-32B accuracy and current-build speed reruns are still pending.
 
 ## 1. Model Introduction
 
@@ -16,7 +16,7 @@ title: "Qwen3"
 - **Hybrid Reasoning**: Supports thinking-on (default) and thinking-off via `chat_template_kwargs.enable_thinking` per-request.
 - **Tool Calling**: OpenAI-compatible tool/function calling supported.
 - **Long Context**: 128K context window.
-- **Production-validated benchmarks**: §4.1 below has measured throughput vs vLLM on the same hardware.
+- **Production-validated benchmarks**: §4.2 below has measured throughput vs vLLM on the same hardware.
 
 **Recommended Generation Parameters**:
 
@@ -302,7 +302,7 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 
 > Benchmark data below is a snapshot pinned to the `Tested build` listed in each Test Environment; not refreshed on every release. The full archived ISL × OSL × batch matrix and chart images live in [`../../performance/qwen3_benchmark.md`](../../../performance/qwen3_benchmark.md) as a release-notes-style report.
 
-### 4.1 Speed — SGL-JAX vs vLLM
+### 4.1 Accuracy — GSM8K (thinking-on)
 
 **Test Environment**
 
@@ -311,7 +311,45 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 | Hardware | TPU v6e-4 (single host, 4 chips) |
 | Model | Qwen/Qwen3-8B and Qwen/Qwen3-32B (BF16) |
 | Tensor Parallelism | 4 |
-| Tested build | sglang-jax `main-10f32e49ab19f54fa393a2564c0ea0b6a78bc967` (2025-09-12); vLLM `main-5931b7e5d9acd4fd9eb42d56086c379fa2e2014e` |
+| Tested build | sglang-jax 0.1.0 |
+
+**Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4).
+
+**Benchmark Command**
+
+```bash
+evalscope eval \
+  --model Qwen/Qwen3-8B \
+  --api-url http://127.0.0.1:30000/v1/chat/completions \
+  --api-key EMPTY \
+  --eval-type service \
+  --datasets gsm8k \
+  --eval-batch-size 8 \
+  --limit 500 \
+  --generation-config '{"chat_template_kwargs": {"enable_thinking": true}, "temperature": 0.7, "top_p": 0.95, "max_tokens": 4096}'
+```
+
+**Test Results**
+
+| Model | Dataset | Metric | Subset | Num | Score |
+|:---|:---|:---|:---|:---|:---|
+| Qwen3-8B | gsm8k | AverageAccuracy | main | 500 | 0.944 |
+| Qwen3-32B | gsm8k | AverageAccuracy | main | 200 | 0.975 |
+
+> Run **with thinking-on** for full reasoning capacity. Thinking-off would yield lower accuracy but ~10× faster wall-clock per question.
+
+### 4.2 Speed — SGL-JAX vs vLLM
+
+> **Layout E — variant × workload sweep on single hardware.** Qwen3-8B and Qwen3-32B on TPU v6e-4 (TP=4), sgl-jax vs vLLM across ISL ∈ {1024, 4096, 8192} × OSL ∈ {1, 1024} × concurrency ∈ {8, 16, 32, 64, 128, 256}.
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-4 (single host, 4 chips) |
+| Model | Qwen/Qwen3-8B and Qwen/Qwen3-32B (BF16) |
+| Tensor Parallelism | 4 |
+| Tested build | sglang-jax 0.1.0 (older sweep, 2025-09-12, vs vLLM `main-5931b7e5d9acd4fd9eb42d56086c379fa2e2014e`) |
 
 Methodology: TTFT measured at `output_len=1` to isolate first-token latency; ITL / throughput measured at `output_len=1024`. Workload sweeps input lengths 1024 / 4096 / 8192 tokens × output lengths 1 / 1024 tokens × concurrency 8 / 16 / 32 / 64 / 128 / 256.
 
@@ -389,7 +427,7 @@ Qwen3-32B:
 
 SGL-JAX wins consistently on this hardware across all measured cells: ~1.5–2.2× output throughput, ~1.4–2.0× faster TTFT, ~1.6–2.4× lower ITL.
 
-**Build verification (2026-05-25, sglang-jax `de29d9f0`)** — single-cell smoke against the current main, not a refresh of the sweep above. Qwen3-32B, ISL=1024 OSL=1024 c=16 (100 prompts):
+**Build verification (sglang-jax 0.1.0)** — single-cell smoke against the current main, not a refresh of the sweep above. Qwen3-32B, ISL=1024 OSL=1024 c=16 (100 prompts):
 
 ```
 Output token throughput (tok/s):         833.80
@@ -401,49 +439,13 @@ Mean E2E Latency (ms):                   8948.78
 
 Lower than the 1977 tok/s c=64 table cell because c=16 leaves the batch under-filled — included only to confirm the recipe still launches and decodes cleanly on the current build. The Sept-2025 sweep above remains the canonical SGL-JAX-vs-vLLM comparison.
 
-### 4.2 Accuracy — GSM8K (thinking-on)
-
-**Test Environment**
-
-| Field | Value |
-|---|---|
-| Hardware | TPU v6e-4 (single host, 4 chips) |
-| Model | Qwen/Qwen3-8B and Qwen/Qwen3-32B (BF16) |
-| Tensor Parallelism | 4 |
-| Tested build | Qwen3-8B: sglang-jax `fe092bf` (2026-05-23); Qwen3-32B: sglang-jax `de29d9f0` (2026-05-25) |
-
-**Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4).
-
-**Benchmark Command**
-
-```bash
-evalscope eval \
-  --model Qwen/Qwen3-8B \
-  --api-url http://127.0.0.1:30000/v1/chat/completions \
-  --api-key EMPTY \
-  --eval-type service \
-  --datasets gsm8k \
-  --eval-batch-size 8 \
-  --limit 500 \
-  --generation-config '{"chat_template_kwargs": {"enable_thinking": true}, "temperature": 0.7, "top_p": 0.95, "max_tokens": 4096}'
-```
-
-**Test Results**
-
-| Model | Dataset | Metric | Subset | Num | Score |
-|:---|:---|:---|:---|:---|:---|
-| Qwen3-8B | gsm8k | AverageAccuracy | main | 500 | 0.944 |
-| Qwen3-32B | gsm8k | AverageAccuracy | main | 200 | 0.975 |
-
-> Run **with thinking-on** for full reasoning capacity. Thinking-off would yield lower accuracy but ~10× faster wall-clock per question.
-
 ## 5. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | OOM at startup with Qwen3-32B | `--mem-fraction-static 0.8` still too high for 32B + large `--max-running-requests` | Lower `--max-running-requests` to 128, or `--mem-fraction-static` to 0.75. Verify `--tp-size 4` matches v6e-4 chip count. |
 | First request takes ~4 min | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR` across restarts (host volume mount in Docker). |
-| Throughput plateaus below benchmark numbers | RadixAttention prefix caching helping (or not) | If reproducing the §4.1 vLLM comparison, ensure `--disable-radix-cache` is set. For production, leave it off — it's a free win on repeated prefixes. |
+| Throughput plateaus below benchmark numbers | RadixAttention prefix caching helping (or not) | If reproducing the §4.2 vLLM comparison, ensure `--disable-radix-cache` is set. For production, leave it off — it's a free win on repeated prefixes. |
 | Tool calls return empty arguments | `--tool-call-parser` not set | Add `--tool-call-parser qwen25` to the launch command. |
 
 ## Additional Resources

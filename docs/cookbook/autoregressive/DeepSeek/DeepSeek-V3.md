@@ -4,7 +4,7 @@ title: "DeepSeek V3"
 
 # DeepSeek V3 on SGL-JAX
 
-> **Validated recipe** — TPU v6e-64 path validated on sglang-jax `de29d9f0` (2026-05-26): server starts, greedy output correct, GSM8K accuracy 97.5% (200 examples), `bench_serving` numbers in §4.2. TPU v7x path is still a starter target.
+> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, greedy output correct, GSM8K accuracy 97.5% (200 examples), `bench_serving` numbers in §4.2. TPU v7x path is still a starter target.
 
 ## 1. Model Introduction
 
@@ -27,12 +27,12 @@ For the V2 generation (V2 / V2-Lite) see [`DeepSeek-V2.md`](DeepSeek-V2.md). For
 
 ### 2.1 Hardware Matrix
 
-| TPU | Topology | Nodes | Chips / JAX devices | `--tp-size` | `--dp-size` | Tensor axis | `--ep-size` | Status | Notes |
-|---|---|---|---|---|---|---|---|---|---|
-| v6e-64 | 8x8 | 16 | 64 | 64 | 8 | 8 | 64 | ✅ validated | `dp=8` is required for FP8 shared-expert block-quant compatibility (`2048/8=256 > 128 = block_size`); `dp=4` silently collapses. HBM is tight at `dp=8`; see §2.4 Memory Management. |
-| v7x-8 | 2x4 | 2 | 8 chips / 16 devices | 16 | 1 | 16 | 16 | 🚧 starter | v7x exposes 2 JAX devices per chip; topology matrix not yet validated for V3. Use lower concurrency. |
+| Tier | TPU | Topology | Nodes | Chips / JAX devices | `--tp-size` | `--dp-size` | Tensor axis | `--ep-size` | Status | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Minimum & recommended production | v6e-64 | 8x8 | 16 | 64 | 64 | 8 | 8 | 64 | ✅ validated | `dp=8` is required for FP8 shared-expert block-quant compatibility (`2048/8=256 > 128 = block_size`); `dp=4` silently collapses. HBM is tight at `dp=8`; see §2.4 Memory Management. |
+| Alternative (starter) | v7x-8 | 2x4 | 2 | 8 chips / 16 devices | 16 | 1 | 16 | 16 | 🚧 starter | v7x exposes 2 JAX devices per chip; topology matrix not yet validated for V3. Use lower concurrency. |
 
-V6e-64 is the minimum slice that fits the official FP8 checkpoint plus runtime overhead — no smaller TPU configuration is supported for V3. See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
+V6e-64 is the only currently validated production path; the v7x-8 row is a starter alternative pending validation. No smaller TPU configuration is supported for V3. See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
@@ -93,7 +93,7 @@ For temporary v6e experiments, advanced users can adapt [`../../deployment/skypi
 - The dense MLP block-quant scale `(144, 56)` for `gate_proj`/`up_proj` (first 3 layers) further requires `144 % tensor == 0`. Tensor axes 1/2/4/8/16 all satisfy this; tensor=32/64 do not. Combined with the shared-expert constraint above, **tensor=8 (i.e., `--dp-size 8`) is the only working option on v6e-64**.
 
 **MoE Backend:**
-- Use `--moe-backend epmoe` for V3 at the current `de29d9f0` build. EPMoE adds an "offline EPMoE scale → GMM layout" conversion step at load time and is slightly slower to load than `fused`, but it carries the accuracy-guard assertion that the `fused` kernel path is missing.
+- Use `--moe-backend epmoe` for V3 at the current sglang-jax 0.1.0 build. EPMoE adds an "offline EPMoE scale → GMM layout" conversion step at load time and is slightly slower to load than `fused`, but it carries the accuracy-guard assertion that the `fused` kernel path is missing.
 - `--moe-backend fused` was previously the recipe-default. In this audit it produced collapsed greedy output at `dp=4` (because of the shared-expert collapse described above) and has not been re-validated at `dp=8`. Until a `dp=8 fused` rerun is added, treat `epmoe` as the validated default.
 - Despite the historical hint that "epmoe is only for EP ≤ 8," it runs correctly at EP=64 on v6e-64 — the hint is a throughput recommendation, not a correctness limit.
 
@@ -134,7 +134,7 @@ See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model
 | Tensor Parallelism | 64 (effective tensor axis 8 via `--dp-size 8`) |
 | Data Parallelism | 8 |
 | Expert Parallelism | 64 |
-| Tested build | sglang-jax `de29d9f0` (2026-05-26) |
+| Tested build | sglang-jax 0.1.0 |
 
 **Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-64).
 

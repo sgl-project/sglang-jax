@@ -4,7 +4,7 @@ title: "Qwen3-MoE"
 
 # Qwen3-MoE on SGL-JAX
 
-> **30B-A3B: Validated** on TPU v6e-16 (build `b2daa46d`, 2026-05-26). See §4 for measured numbers. The 235B-A22B production tier remains Starter — same launch path with larger `--tp-size` / `--ep-size`, unmeasured.
+> **Partially validated recipe** — Qwen3-30B-A3B validated on TPU v6e-16 with sglang-jax 0.1.0; see §4 for measured numbers. The 235B-A22B production tier remains Starter — same launch path with larger `--tp-size` / `--ep-size`, unmeasured.
 
 ## 1. Model Introduction
 
@@ -26,7 +26,7 @@ For the dense Qwen3 variants (8B / 32B) see [`Qwen3.md`](Qwen3.md).
 
 ## 2. Deployment
 
-### 2.1 Hardware Matrix (starter targets)
+### 2.1 Hardware Matrix
 
 | Model | TPU | Topology | Nodes | Chips | `--tp-size` | `--ep-size` | Notes |
 |---|---|---|---|---|---|---|---|
@@ -217,9 +217,44 @@ To see the full set of `--reasoning-parser` / `--tool-call-parser` keys availabl
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Speed
+### 4.1 Accuracy
 
-> **Layout B — measured baseline.** TPU v6e-16 (4 nodes × 4 chips, TP=16, EP=16), build `b2daa46d` (2026-05-26). sgl-jax-only; no vLLM-on-TPU comparison.
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-16 (30B-A3B) / v6e-64 (235B-A22B) |
+| Model | Qwen/Qwen3-30B-A3B or Qwen3-235B-A22B (BF16) |
+| Tensor Parallelism | 16 / 64 |
+| Expert Parallelism | 16 / 64 |
+| Tested build | sglang-jax 0.1.0 (30B-A3B only) |
+
+**Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-16-qwen3-30b-a3b).
+
+**Benchmark Command** — example for GSM8K (with thinking-on for reasoning):
+
+```bash
+evalscope eval \
+  --model Qwen/Qwen3-30B-A3B \
+  --api-url http://127.0.0.1:30000/v1/chat/completions \
+  --api-key EMPTY \
+  --eval-type service \
+  --datasets gsm8k \
+  --eval-batch-size 8 \
+  --generation-config '{"chat_template_kwargs": {"enable_thinking": true}, "temperature": 0.7, "top_p": 0.95}'
+```
+
+Recommended additional datasets: AIME 2025, MATH, GPQA Diamond.
+
+**Test Results**
+
+| Dataset | Subset | Samples | Score | Notes |
+|---|---|---|---|---|
+| gsm8k | main | 200 | **0.980** | thinking-on, `temperature=0.7`, `top_p=0.95`, `max_tokens=8192` (Qwen3-30B-A3B) |
+
+### 4.2 Speed
+
+> **Layout B — measured baseline.** TPU v6e-16 (4 nodes × 4 chips, TP=16, EP=16), sglang-jax 0.1.0. sgl-jax-only; no vLLM-on-TPU comparison.
 
 **Test Environment**
 
@@ -229,7 +264,7 @@ To see the full set of `--reasoning-parser` / `--tool-call-parser` keys availabl
 | Model | Qwen/Qwen3-30B-A3B (BF16, MoE A3B) |
 | Tensor Parallelism | 16 |
 | Expert Parallelism | 16 |
-| Tested build | `b2daa46d` (2026-05-26) |
+| Tested build | sglang-jax 0.1.0 |
 
 **Benchmark Command**
 
@@ -263,41 +298,6 @@ Median TPOT (ms):                        9.97
 Mean ITL (ms):                           9.83
 ==================================================
 ```
-
-### 4.2 Accuracy
-
-**Test Environment**
-
-| Field | Value |
-|---|---|
-| Hardware | TPU v6e-16 (30B-A3B) / v6e-64 (235B-A22B) |
-| Model | Qwen/Qwen3-30B-A3B or Qwen3-235B-A22B (BF16) |
-| Tensor Parallelism | 16 / 64 |
-| Expert Parallelism | 16 / 64 |
-| Tested build | `b2daa46d` (2026-05-26, 30B-A3B only) |
-
-**Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-16-qwen3-30b-a3b).
-
-**Benchmark Command** — example for GSM8K (with thinking-on for reasoning):
-
-```bash
-evalscope eval \
-  --model Qwen/Qwen3-30B-A3B \
-  --api-url http://127.0.0.1:30000/v1/chat/completions \
-  --api-key EMPTY \
-  --eval-type service \
-  --datasets gsm8k \
-  --eval-batch-size 8 \
-  --generation-config '{"chat_template_kwargs": {"enable_thinking": true}, "temperature": 0.7, "top_p": 0.95}'
-```
-
-Recommended additional datasets: AIME 2025, MATH, GPQA Diamond.
-
-**Test Results**
-
-| Dataset | Subset | Samples | Score | Notes |
-|---|---|---|---|---|
-| gsm8k | main | 200 | **0.980** | thinking-on, `temperature=0.7`, `top_p=0.95`, `max_tokens=8192` (Qwen3-30B-A3B) |
 
 ## 5. Troubleshooting
 

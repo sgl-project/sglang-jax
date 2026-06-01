@@ -4,7 +4,7 @@ title: "Gemma 2"
 
 # Gemma 2 on SGL-JAX
 
-> **27B-it: Validated** on TPU v6e-4 (build `de29d9f0`, 2026-05-25). See §4 for measured numbers. The 9B / 9B-it sizes below remain Starter — same launch path with the same flags, unmeasured.
+> **Partially validated recipe** — Gemma 2 27B-it validated on TPU v6e-4 with sglang-jax 0.1.0; see §4 for measured numbers. The 9B / 9B-it sizes remain Starter — same launch path with the same flags, unmeasured.
 
 ## 1. Model Introduction
 
@@ -23,7 +23,7 @@ title: "Gemma 2"
 
 ## 2. Deployment
 
-### 2.1 Hardware Matrix (starter targets)
+### 2.1 Hardware Matrix
 
 | Tier | Model | TPU | Topology | Chips | `--tp-size` | Notes |
 |---|---|---|---|---|---|---|
@@ -116,9 +116,7 @@ See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model
 
 > Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
 
-### 4.1 Speed
-
-> **Layout B — measured baseline.** TPU v6e-4 (single host, 4 chips, TP=4), build `de29d9f0` (2026-05-25). sgl-jax-only; no vLLM-on-TPU comparison.
+### 4.1 Accuracy
 
 **Test Environment**
 
@@ -127,7 +125,43 @@ See [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Use `model
 | Hardware | TPU v6e-4 (single host, 4 chips) |
 | Model | google/gemma-2-27b-it (BF16) |
 | Tensor Parallelism | 4 |
-| Tested build | `de29d9f0` (2026-05-25) |
+| Tested build | sglang-jax 0.1.0 |
+
+**Deployment Command** — same as [§2.3 27B-it](#single-host-docker--tpu-v6e-4-gemma-2-27b-it).
+
+**Benchmark Command** — example for GSM8K:
+
+```bash
+evalscope eval \
+  --model google/gemma-2-27b-it \
+  --api-url http://127.0.0.1:30000/v1/chat/completions \
+  --api-key EMPTY \
+  --eval-type service \
+  --datasets gsm8k \
+  --eval-batch-size 16 \
+  --limit 200
+```
+
+Recommended additional datasets: MMLU, GPQA Diamond.
+
+**Test Results**
+
+| Dataset | Subset | Samples | Score |
+|---|---|---|---|
+| gsm8k | main | 200 | **0.865** |
+
+### 4.2 Speed
+
+> **Layout B — measured baseline.** TPU v6e-4 (single host, 4 chips, TP=4), sglang-jax 0.1.0. sgl-jax-only; no vLLM-on-TPU comparison.
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-4 (single host, 4 chips) |
+| Model | google/gemma-2-27b-it (BF16) |
+| Tensor Parallelism | 4 |
+| Tested build | sglang-jax 0.1.0 |
 
 **Benchmark Command**
 
@@ -163,40 +197,6 @@ Mean ITL (ms):                           14.48
 ```
 
 For Gemma 2 9B on the same host, expect roughly 2-3x higher output throughput at the same concurrency — PR back the measured block to upgrade.
-
-### 4.2 Accuracy
-
-**Test Environment**
-
-| Field | Value |
-|---|---|
-| Hardware | TPU v6e-4 (single host, 4 chips) |
-| Model | google/gemma-2-27b-it (BF16) |
-| Tensor Parallelism | 4 |
-| Tested build | `de29d9f0` (2026-05-25) |
-
-**Deployment Command** — same as [§2.3 27B-it](#single-host-docker--tpu-v6e-4-gemma-2-27b-it).
-
-**Benchmark Command** — example for GSM8K:
-
-```bash
-evalscope eval \
-  --model google/gemma-2-27b-it \
-  --api-url http://127.0.0.1:30000/v1/chat/completions \
-  --api-key EMPTY \
-  --eval-type service \
-  --datasets gsm8k \
-  --eval-batch-size 16 \
-  --limit 200
-```
-
-Recommended additional datasets: MMLU, GPQA Diamond.
-
-**Test Results**
-
-| Dataset | Subset | Samples | Score |
-|---|---|---|---|
-| gsm8k | main | 200 | **0.865** |
 
 ## 5. Troubleshooting
 

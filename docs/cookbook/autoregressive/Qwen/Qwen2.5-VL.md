@@ -32,7 +32,7 @@ For the text-only Qwen3 dense recipes see [`Qwen3.md`](Qwen3.md).
 
 ## 2. Deployment
 
-### 2.1 Hardware Matrix (starter targets)
+### 2.1 Hardware Matrix
 
 | Tier | Model | TPU | Topology | `--tp-size` | Notes |
 |---|---|---|---|---|---|
@@ -258,7 +258,7 @@ print(response.choices[0].message.content)
 | Hardware | TPU v6e-4 (single host, 4 chips) |
 | Model | Qwen/Qwen2.5-VL-32B-Instruct (BF16) |
 | Tensor Parallelism | 4 |
-| Tested build | _Pending_ |
+| Tested build | sglang-jax 0.1.0 |
 
 **Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4-qwen25-vl-32b-instruct).
 

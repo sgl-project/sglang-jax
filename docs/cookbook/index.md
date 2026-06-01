@@ -28,11 +28,13 @@ Every recipe follows the **same five-section template** so you can scan any page
 4. **Benchmark** — accuracy (`evalscope`) and throughput (`bench_serving`) commands with reference numbers.
 5. **Troubleshooting** — model-specific symptom → cause → fix table. Generic issues go to [`troubleshooting.md`](troubleshooting.md).
 
-Recipes carry one of three status banners at the top:
+Recipes carry one of five status banners at the top:
 
 - **Validated** — empirically tuned on hardware, with reference benchmark numbers.
 - **Partially validated** — at least one variant / hardware path has real benchmark output; other variants, matrix cells, or current-build reruns are still pending.
 - **Starter** — derived from HF model card, **not yet validated**. Treat as a starting command, tune and PR back tested values.
+- **Planned** — architecture supported by the runtime but no recipe yet (or model release pending).
+- **🚫 Blocked** — runnable path blocked by an upstream weight format / HBM / runtime constraint; banner cites the root cause and unblocking plan.
 
 ## Hardware coverage at a glance
 
@@ -42,23 +44,23 @@ Status prefix: ✅ validated · 🧪 partially validated · 🚧 starter (not ye
 
 | TPU | Topology | Recipes |
 |---|---|---|
-| v6e-4 | 2x2 | ✅ [Qwen-7B-Chat](autoregressive/Qwen/Qwen.md) · 🧪 [Qwen3-8B / 32B](autoregressive/Qwen/Qwen3.md) · 🚧 [Qwen2.5-VL 3B / 7B candidates](autoregressive/Qwen/Qwen2.5-VL.md) (`--tp-size 1`) · 🚧 [Qwen2.5-VL 32B](autoregressive/Qwen/Qwen2.5-VL.md) (`--tp-size 4`) · 🚧 [Llama 3.1 8B](autoregressive/Llama/Llama3.1.md) · 🚧 [Gemma 2 9B / 27B](autoregressive/Google/Gemma2.md) · 🧪 [MiMo-7B](autoregressive/Xiaomi/MiMo-7B.md) · 🧪 [DeepSeek-V2-Lite](autoregressive/DeepSeek/DeepSeek-V2.md) |
+| v6e-4 | 2x2 | ✅ [Qwen-7B-Chat](autoregressive/Qwen/Qwen.md) · 🧪 [Qwen3-8B / 32B](autoregressive/Qwen/Qwen3.md) · 🚧 [Qwen2.5-VL 3B / 7B candidates](autoregressive/Qwen/Qwen2.5-VL.md) (`--tp-size 1`) · 🚧 [Qwen2.5-VL 32B](autoregressive/Qwen/Qwen2.5-VL.md) (`--tp-size 4`) · ✅ [Llama 3.1 8B](autoregressive/Llama/Llama3.1.md) · 🧪 [Gemma 2 9B / 27B](autoregressive/Google/Gemma2.md) · 🧪 [MiMo-7B](autoregressive/Xiaomi/MiMo-7B.md) · 🧪 [DeepSeek-V2-Lite](autoregressive/DeepSeek/DeepSeek-V2.md) |
 | v7x-8 | single host (4 chips × 2 devices) | 🧪 [MiMo-V2-Flash](autoregressive/Xiaomi/MiMo-V2-Flash.md) |
 
 ### Multi-host
 
 | TPU | Topology | Nodes | Recipes |
 |---|---|---|---|
-| v6e-16 | 4x4 | 4 | 🧪 [MiMo-V2-Flash](autoregressive/Xiaomi/MiMo-V2-Flash.md) · 🚧 [Qwen3-30B-A3B MoE](autoregressive/Qwen/Qwen3-MoE.md) · ✅ [Kimi-Linear](autoregressive/Moonshotai/Kimi-Linear.md) |
-| v6e-32 | 4x8 | 8 | 🚧 [Grok-2](autoregressive/Grok/Grok2.md) · 🚧 [Grok-1](autoregressive/Grok/Grok1.md) · 🚧 [Llama 3.3 70B](autoregressive/Llama/Llama3.3-70B.md) · 🚧 [DeepSeek-V2](autoregressive/DeepSeek/DeepSeek-V2.md) · 🚧 [GLM-4.5-Air](autoregressive/GLM/GLM-4.5.md) |
-| v6e-64 | 4x4x4 | 16 | 🧪 [MiMo-V2.5-Pro](autoregressive/Xiaomi/MiMo-V2.5-Pro.md) · 🚧 [Qwen3-235B MoE](autoregressive/Qwen/Qwen3-MoE.md) · 🚧 [DeepSeek-V3](autoregressive/DeepSeek/DeepSeek-V3.md) · 🚧 [DeepSeek-R1](autoregressive/DeepSeek/DeepSeek-R1.md) · 🚧 [GLM-4.5](autoregressive/GLM/GLM-4.5.md) · 🚧 [Ling / Ring 2.5](autoregressive/InclusionAI/Ling2.5.md) · 🚧 [Ling-2.6](autoregressive/InclusionAI/Ling-2.6.md) |
-| v7x-16 | 2x2x4 | 4 | 🧪 [MiMo-V2.5-Pro](autoregressive/Xiaomi/MiMo-V2.5-Pro.md) · 🚧 [Ling / Ring 2.5](autoregressive/InclusionAI/Ling2.5.md) · 🚧 [Ling-2.6](autoregressive/InclusionAI/Ling-2.6.md) · 🚧 [DeepSeek-V3](autoregressive/DeepSeek/DeepSeek-V3.md) · 🚧 [DeepSeek-R1](autoregressive/DeepSeek/DeepSeek-R1.md) |
+| v6e-16 | 4x4 | 4 | 🧪 [MiMo-V2-Flash](autoregressive/Xiaomi/MiMo-V2-Flash.md) · 🧪 [Qwen3-30B-A3B MoE](autoregressive/Qwen/Qwen3-MoE.md) · ✅ [Kimi-Linear](autoregressive/Moonshotai/Kimi-Linear.md) |
+| v6e-32 | 4x8 | 8 | 🧪 [Grok-2](autoregressive/Grok/Grok2.md) · 🚧 [Llama 3.3 70B](autoregressive/Llama/Llama3.3-70B.md) · 🚧 [DeepSeek-V2](autoregressive/DeepSeek/DeepSeek-V2.md) · 🧪 [GLM-4.5-Air](autoregressive/GLM/GLM-4.5.md) |
+| v6e-64 | 4x4x4 | 16 | ✅ [MiMo-V2.5-Pro](autoregressive/Xiaomi/MiMo-V2.5-Pro.md) · 🚧 [Qwen3-235B MoE](autoregressive/Qwen/Qwen3-MoE.md) · ✅ [DeepSeek-V3](autoregressive/DeepSeek/DeepSeek-V3.md) · ✅ [DeepSeek-R1](autoregressive/DeepSeek/DeepSeek-R1.md) · 🧪 [GLM-4.5](autoregressive/GLM/GLM-4.5.md) · ✅ [Ling-2.6](autoregressive/InclusionAI/Ling-2.6.md) |
+| v7x-16 | 2x2x4 | 4 | ✅ [MiMo-V2.5-Pro](autoregressive/Xiaomi/MiMo-V2.5-Pro.md) · ✅ [Ling-2.6](autoregressive/InclusionAI/Ling-2.6.md) · ✅ [DeepSeek-V3](autoregressive/DeepSeek/DeepSeek-V3.md) · ✅ [DeepSeek-R1](autoregressive/DeepSeek/DeepSeek-R1.md) |
 
 ### Diffusion (`--multimodal` server)
 
 | TPU | Topology | Recipes |
 |---|---|---|
-| v6e-4 | 2x2 | 🚧 [Wan 2.1 T2V 1.3B / 14B](diffusion/Wan/Wan2.1.md) (`--tp-size 2`) · 🚧 [Wan 2.2 T2V A14B](diffusion/Wan/Wan2.2.md) (`--tp-size 1`) |
+| v6e-4 | 2x2 | 🧪 [Wan 2.1 T2V 1.3B / 14B](diffusion/Wan/Wan2.1.md) (`--tp-size 2`) · 🧪 [Wan 2.2 T2V A14B](diffusion/Wan/Wan2.2.md) (`--tp-size 1`) |
 
 ### Pending autoregressive paths
 
