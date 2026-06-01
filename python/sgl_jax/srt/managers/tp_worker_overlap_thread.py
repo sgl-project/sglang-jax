@@ -157,7 +157,7 @@ class ModelWorkerClient:
             if logits_output.hidden_states is not None
             else None
         )
-        async_next_tokens = jax.copy_to_host_async(next_token_ids)
+        next_token_ids = jax.device_get(next_token_ids).tolist()
 
         # Step 2: materialize. The first np.asarray waits for that array's
         # copy; the others have been making progress in parallel.
@@ -167,7 +167,6 @@ class ModelWorkerClient:
             logits_output.input_token_logprobs = np.asarray(async_input_logprobs).tolist()
         if async_hidden_states is not None:
             logits_output.hidden_states = np.asarray(async_hidden_states)
-        next_token_ids = np.asarray(async_next_tokens).tolist()
 
         if launch_done is not None:
             launch_done.wait()
