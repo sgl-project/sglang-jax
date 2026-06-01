@@ -69,7 +69,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
 
 Swap to a different Wan release at your own risk; other Wan releases have different built-in stage layouts and `--tp-size`.
 
-VAE tiling is enabled by default in the multimodal server (`vae_tiling=True` in `MultimodalServerArgs`) and there is no `--no-vae-tiling` flag to disable it today.
+VAE tiling is enabled by default in the multimodal server and there is no `--no-vae-tiling` flag to disable it today.
 
 > `--multimodal` is required. Without it, the text-only launcher boots and the `/api/v1/videos/generation` endpoint is not registered.
 
@@ -223,7 +223,7 @@ This is a single-shot smoke datapoint, not a throughput sweep. Throughput sweeps
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `/api/v1/videos/generation` returns 404 | `--multimodal` not set at launch | Add `--multimodal` to the launch command. |
-| `ValueError: invalid literal for int() with base 10: '480x832'` and `GlobalScheduler hit an exception` (server crashes) | Request body used `WIDTHxHEIGHT` (lowercase `x`); server parses `size` as `WIDTH*HEIGHT` (asterisk, see `multimodal/manager/global_scheduler.py:242-243`) | Send `"size": "480*832"` (asterisk-separated). Also restart the server — the GlobalScheduler exits on this exception. |
+| `ValueError: invalid literal for int() with base 10: '480x832'` and `GlobalScheduler hit an exception` (server crashes) | Request body used `WIDTHxHEIGHT` (lowercase `x`); server parses `size` as `WIDTH*HEIGHT` (asterisk-separated) | Send `"size": "480*832"` (asterisk-separated). Also restart the server — the GlobalScheduler exits on this exception. |
 | Response body is `{"success": true, "meta_info": {}}` with no `path`/`url` | Expected behavior — the videos / images endpoints persist the file to the server's `cwd` and only acknowledge success in the response | Locate the MP4 by the `Saved output to <uuid>.mp4` line in the server log, or run the server with a known `cwd` and mount that directory. |
 | First request blocks on every new resolution | Resolution not in `--precompile-width-heights` | Add the size you serve (`WIDTH*HEIGHT`) to `--precompile-width-heights` and relaunch. |
 | First request blocks on every new frame count | Frame count not in `--precompile-frame-paddings` | Add the frame count to `--precompile-frame-paddings` and relaunch. |

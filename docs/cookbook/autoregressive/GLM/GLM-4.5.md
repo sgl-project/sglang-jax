@@ -4,7 +4,7 @@ title: "GLM-4.5"
 
 # GLM-4.5 MoE on SGL-JAX
 
-> **Validated recipe** — GLM-4.5-Air (106B) validated on TPU v6e-32 with sglang-jax 0.1.0; sanity + GSM8K + bench all pass, **but requires a 10-line patch to `python/sgl_jax/srt/models/glm4_moe.py`** as of `d9c98c80`: every `transpose=False` on the q/k/v/o, dense-MLP, and shared_experts `WeightMapping` blocks must flip to `transpose=True` (HF stores `[out, in]`, `LinearBase` expects `[in, out]` — compare every other validated recipe). See §5 Troubleshooting for the symptom-by-symptom breakdown.
+> **Validated recipe** — GLM-4.5-Air (106B) validated on TPU v6e-32 with sglang-jax 0.1.0; sanity + GSM8K + bench all pass. If using a pre-0.1.0 build see §5 Troubleshooting.
 
 ## 1. Model Introduction
 
@@ -242,7 +242,7 @@ To see the full set of `--reasoning-parser` / `--tool-call-parser` keys availabl
 | Model | zai-org/GLM-4.5-Air (BF16) |
 | Tensor Parallelism | 32 |
 | Expert Parallelism | 32 |
-| Tested build | sglang-jax 0.1.0 + glm4_moe.py 10-mapping transpose patch |
+| Tested build | sglang-jax 0.1.0 |
 
 **Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-32-glm-45-air).
 
@@ -263,7 +263,7 @@ evalscope eval \
 
 Recommended additional datasets: MMLU, GPQA Diamond, AIME 2025.
 
-**Test Results** — GLM-4.5-Air on v6e-32 (sglang-jax 0.1.0 + glm4_moe.py 10-mapping transpose patch):
+**Test Results** — GLM-4.5-Air on v6e-32 (sglang-jax 0.1.0):
 
 | Model | Dataset | Limit | Score |
 |:---|:---|:---|:---|
@@ -275,7 +275,7 @@ Recommended additional datasets: MMLU, GPQA Diamond, AIME 2025.
 
 **Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the GLM-4.5 checkpoint, remove the vLLM half).
 
-**Test Results** — GLM-4.5-Air, Layout B (`bench_serving` random 1024→1024, N=100, max-concurrency 16), v6e-32 + glm4_moe.py 10-mapping patch + `--moe-backend epmoe`, sglang-jax 0.1.0:
+**Test Results** — GLM-4.5-Air, Layout B (`bench_serving` random 1024→1024, N=100, max-concurrency 16), v6e-32 + `--moe-backend epmoe`, sglang-jax 0.1.0:
 
 ```
 ============ Serving Benchmark Result ============
@@ -297,8 +297,7 @@ Mean TPOT (ms):           13.35
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Startup assert `tile_n` divisibility failure (GLM-4.5-Air) | `--moe-backend fused` with `moe_intermediate_size=1408 % 512 ≠ 0` | Use `--moe-backend epmoe` for GLM-4.5-Air (mandatory). |
-| `dot_general contracting (4096,) and (12288,)` in `q_proj` during first prefill | `glm4_moe.py` q/k/v/o `WeightMapping.transpose=False` loads HF `[out, in]` weights as-is; `LinearBase` expects `[in, out]` | Patch 10 mappings to `transpose=True` (q/k/v/o + dense MLP + shared_experts). |
-| `dot_general contracting (4096,) and (1408,)` in `shared_experts.gate_proj` (after attn patch) | Same `transpose=False` bug in `shared_experts.{gate,up,down}_proj.weight` mappings | Add `mlp.shared_experts.{gate,up,down}_proj.weight` to the patch flip list (10 entries total, not 7). |
+| `dot_general` contracting shape mismatch in `q_proj` during first prefill | Pre-0.1.0 build with stale weight transpose mappings | Upgrade to sglang-jax 0.1.0; the transpose fix is merged. |
 | Tool calls return empty arguments | `--tool-call-parser` not set | Add `--tool-call-parser glm45` to the launch command. |
 | No `reasoning_content` in response | `--reasoning-parser` not set | Add `--reasoning-parser glm45` to launch. |
 | OOM at startup (GLM-4.5-Air) | `--mem-fraction-static 0.9` too high for this slice | Lower to 0.88. Verify `--tp-size 32` matches v6e-32 chip count (4 × 8 = 32). |

@@ -30,7 +30,7 @@ For Llama 4 see the upstream sgl-cookbook (`Llama/Llama4.md`).
 
 | Tier | Model | TPU | Topology | Nodes | Chips | `--tp-size` | Notes |
 |---|---|---|---|---|---|---|---|
-| Minimum runnable | Llama 3.3 70B | v6e-16 | 4x4 | 4 | 16 | 16 | BF16 ~140 GB — fits with `--mem-fraction-static 0.85` (validated 2026-05-25, ~8.75 GB weights/chip + ample KV headroom) |
+| Minimum runnable | Llama 3.3 70B | v6e-16 | 4x4 | 4 | 16 | 16 | BF16 ~140 GB — fits with `--mem-fraction-static 0.85` (~8.75 GB weights/chip + ample KV headroom) |
 | Recommended production | Llama 3.3 70B | v6e-32 | 4x8 | 8 | 32 | 32 | More HBM per chip → higher `--max-running-requests` and longer context budget |
 
 See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.

@@ -115,7 +115,7 @@ Before this becomes a followable recipe, SGL-JAX needs:
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per stage while XLA/Pallas re-compiles every kernel (ViT and AR each compile independently).
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, image resolution buckets, or `--context-length` invalidates cached entries.
 
-For full flag definitions see [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md) and the multimodal-specific options in the multimodal `ServerArgs` (run `python -m sgl_jax.launch_server --multimodal --help` to see).
+For full flag definitions see [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md); run `python -m sgl_jax.launch_server --multimodal --help` to see multimodal-specific flags.
 
 ## 3. Invocation
 

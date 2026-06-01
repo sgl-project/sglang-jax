@@ -60,7 +60,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
 - `--mem-fraction-static 0.88` is the TPU default. Raise to `0.9` for higher concurrency on a dedicated host.
 
 **Paging / concurrency (mandatory):**
-- `--page-size 128` is **mandatory**. Without it the attention backend defaults to `page_size=1` and the `Max running requests` constraint chain collapses `Final max_running_requests` to 1 — at concurrency=16 the bench serializes and output throughput drops ~9× (validated 2026-05-25: 156 tok/s without flag → 1449 tok/s with).
+- `--page-size 128` is **mandatory**. Without it the attention backend defaults to `page_size=1` and the `Max running requests` constraint chain collapses `Final max_running_requests` to 1 — at concurrency=16 the bench serializes and output throughput drops ~9× (156 tok/s without flag → 1449 tok/s with).
 - `--max-running-requests 64` pairs with the page-size flag; raise/lower to match your `--max-concurrency` workload.
 
 **Tensor Parallelism:**

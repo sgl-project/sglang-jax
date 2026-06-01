@@ -75,7 +75,7 @@ For temporary v6e experiments, advanced users can adapt [`../../deployment/skypi
 ### 2.4 Configuration Tips
 
 **MoE Backend:**
-- `--moe-backend fused` is the throughput-optimal choice at EP ≥ 16, **but it requires the per-expert FFN intermediate size to be a multiple of 512** (`fused_moe/v1/kernel.py` block-factor alignment).
+- `--moe-backend fused` is the throughput-optimal choice at EP ≥ 16, **but it requires the per-expert FFN intermediate size to be a multiple of 512**.
 - Qwen3-30B-A3B has `moe_intermediate_size=768` which is **not** aligned, so it must use `--moe-backend epmoe` even at EP=16.
 - For EP ≤ 8 use `epmoe` regardless.
 

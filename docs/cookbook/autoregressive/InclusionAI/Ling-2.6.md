@@ -31,7 +31,7 @@ See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.m
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.md`](../../../get_started/install.md). **Build pin**: use sglang-jax `d9c98c80` or any later commit that includes the channel-wise FP8 `[out, 1]` QKV split fix; earlier builds crash at weight load with `TypeError: 'NoneType' object is not subscriptable` on Ling-2.6 (it's an upstream gap, not a Ling-specific bug — see §5 Troubleshooting). Multi-host required — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
+Install per [`../../../get_started/install.md`](../../../get_started/install.md). **Build pin**: use sglang-jax 0.1.0 or later — earlier builds crash at weight load on Ling-2.6's compressed-tensors FP8 QKV split (see §5 Troubleshooting). Multi-host required — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -79,14 +79,14 @@ For temporary v6e experiments, advanced users can adapt [`../../deployment/skypi
 - `--disable-radix-cache` is **required**, not optional. The server asserts on this at startup: `AssertionError: Hybrid recurrent state models require --disable-radix-cache (prefix sharing is unsafe with recurrent state)`.
 
 **Mesh / GLA Constraint:**
-- The GLA (linear attention) `GroupRMSNorm` uses `num_groups=8` and shards `num_groups` along the "tensor" mesh axis. **Effective tensor axis must be ≤ 8.** On v6e-64 that forces `--tp-size 64 --dp-size 8` (tensor axis = `tp/dp` = 8). Setting `--dp-size 1` builds tensor=64 and JIT trace crashes with `Sharding spec ('tensor',) implies that array axis 1 is partitioned 64 times, but does not evenly divide the dimension size 8`.
+- The GLA linear attention layer has a per-group RMSNorm with `num_groups=8`, sharded along the "tensor" mesh axis. **Effective tensor axis must be ≤ 8.** On v6e-64 that forces `--tp-size 64 --dp-size 8` (tensor axis = `tp/dp` = 8). Setting `--dp-size 1` builds tensor=64 and JIT trace crashes with `Sharding spec ('tensor',) implies that array axis 1 is partitioned 64 times, but does not evenly divide the dimension size 8`.
 
 **MoE Backend:**
 - `--moe-backend fused` for `--ep-size ≥ 16` (both configs above). The fused EP size = mesh `data * tensor` = 8 * 8 = 64 on v6e-64, matching `--ep-size 64`. Switch to `epmoe` only at EP ≤ 8.
 
 **FP8 Quantization (compressed-tensors):**
 - Ling-2.6 ships compressed-tensors FP8 with `strategy="channel"` (per-output channel weight scales, dynamic per-token activation). The runtime auto-detects this — no `--quantization` flag needed. `--dtype bfloat16` controls runtime compute dtype, not weight residency.
-- This uses compressed-tensors channel-wise FP8, distinct from block-wise FP8 quantization (`weight_block_size=None` in HF config). Builds before `d9c98c80` lack the channel-wise QKV split path and crash at weight load.
+- This uses compressed-tensors channel-wise FP8, distinct from block-wise FP8 quantization (`weight_block_size=None` in HF config). Builds before sglang-jax 0.1.0 lack the channel-wise QKV split path and crash at weight load.
 
 **Reasoning Mode:**
 - If the Ling-2.6 checkpoint emits `<think>...</think>` blocks (verify per model card; some reasoning-tuned variants do, base instruct variants do not), add `--reasoning-parser deepseek-r1` to the launch command — that's the generic `<think>` parser, since no `ling-2-6` or `bailing` parser key is registered. See §3.2 for the streaming Python client that splits `reasoning_content` from `content`.
@@ -288,9 +288,9 @@ Max ITL (ms):                            1293.91
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `TypeError: 'NoneType' object is not subscriptable` in `weight_utils.py:_split_qkv_weight` | Build pre-dates the channel-wise FP8 QKV split fix; checkpoint has `weight_block_size=None` (compressed-tensors `strategy="channel"`). | Pin sglang-jax to `d9c98c80` (primatrix `docs/cookbook-migration` branch) or any later commit that lands this fix. |
+| `TypeError: 'NoneType' object is not subscriptable` during QKV weight split at startup | Build pre-dates the channel-wise FP8 QKV split fix; checkpoint has `weight_block_size=None` (compressed-tensors `strategy="channel"`). | Pin sglang-jax to 0.1.0 or later. |
 | `AssertionError: Hybrid recurrent state models require --disable-radix-cache` at startup | Missing `--disable-radix-cache`. | Add `--disable-radix-cache` to the launch flags — it's mandatory for any hybrid recurrent state model, not optional. |
-| `ValueError: ... axis 1 is partitioned 64 times, but does not evenly divide the dimension size 8` from `group_rmsnorm.py` during JIT trace | Effective tensor axis (`tp_size / dp_size`) > GLA `num_groups=8`. | Set `--dp-size` such that `tp_size / dp_size <= 8`. On v6e-64 use `--dp-size 8`. |
+| `ValueError: ... axis 1 is partitioned 64 times, but does not evenly divide the dimension size 8` during JIT trace | Effective tensor axis (`tp_size / dp_size`) > GLA `num_groups=8`. | Set `--dp-size` such that `tp_size / dp_size <= 8`. On v6e-64 use `--dp-size 8`. |
 | `RESOURCE_EXHAUSTED: ... Used 31.37G of 31.25G hbm. Exceeded hbm capacity by ~130M` during EXTEND precompile | `--mem-fraction-static 0.92` overshoots HBM at `dp=8` mesh trace peak. | Drop `--mem-fraction-static` to `0.88` (current default). For more headroom also lower `--chunked-prefill-size` to 1024 or `--max-running-requests` to 128. |
 | OOM at startup | Recurrent state + KV exceed budget | Lower `--recurrent-state-memory-ratio` (e.g. to 0.7) and/or `--mem-fraction-static` to 0.85. |
 | Long-prompt requests stall | KV cache exhausted before recurrent state | Lower `--recurrent-state-memory-ratio` to give the KV cache more headroom. |
