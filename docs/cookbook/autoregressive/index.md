@@ -69,7 +69,7 @@ End-to-end serving recipes for autoregressive models on SGL-JAX, organized by ve
 |---|---|---|---|---|
 | ✅ | Qwen-7B-Chat | [`Qwen/Qwen.md`](Qwen/Qwen.md) | v6e-4 | dense |
 | ✅ | Qwen3-8B / Qwen3-32B | [`Qwen/Qwen3.md`](Qwen/Qwen3.md) | v6e-4 | dense + reasoning (`qwen3`) + tool (`qwen25`) |
-| 🧪 | Qwen3-30B-A3B | [`Qwen/Qwen3-MoE.md`](Qwen/Qwen3-MoE.md) | v6e-16 | MoE + reasoning (`qwen3`) + tool (`qwen25`) |
+| ✅ | Qwen3-30B-A3B | [`Qwen/Qwen3-MoE.md`](Qwen/Qwen3-MoE.md) | v6e-16 | MoE + reasoning (`qwen3`) + tool (`qwen25`) |
 | ✅ | Qwen2.5-VL (3B / 7B / 32B / 72B) | [`Qwen/Qwen2.5-VL.md`](Qwen/Qwen2.5-VL.md) | v6e-4 for 3B/7B/32B; 72B pending | vision-language autoregressive decoder |
 | 📝 | Qwen2 / Qwen2-MoE | _no recipe — same family runtime path_ | — | dense / MoE |
 
