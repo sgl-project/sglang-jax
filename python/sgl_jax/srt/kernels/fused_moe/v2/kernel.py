@@ -2930,10 +2930,14 @@ def fused_ep_moe_v2(
     btc = block_config.btc
     bse = block_config.bse
 
-    if w1_shared is not None and not disable_shared_expert and bse > bf:
+    if w1_shared is not None and not disable_shared_expert:
         # SE writes its weight tiles into the [:bse] slice of the width-bf routed
-        # weight VMEM buffers; bse > bf would overflow them.
-        raise ValueError(f"in-kernel shared expert requires bse <= bf, got {bse=} {bf=}.")
+        # weight buffers, and DMAs the full bt-token block into the bts-sized b_x
+        # staging buffer. Violating either overflows a VMEM buffer (device halt).
+        if bse > bf:
+            raise ValueError(f"in-kernel shared expert requires bse <= bf, got {bse=} {bf=}.")
+        if bt > bts:
+            raise ValueError(f"in-kernel shared expert requires bt <= bts, got {bt=} {bts=}.")
 
     validate_fused_moe_block_config(
         num_tokens=num_tokens,
