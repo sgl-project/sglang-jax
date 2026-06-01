@@ -1033,7 +1033,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             bse=512,
         )
         # intermediate_size=384: bf=384 fails (no bfc with 384%bfc==0 and bfc%256==0),
-        # bf=256 fails (384%256!=0), bf=128 fails (128%256!=0) → no solution.
+        # bf=256 fails (384%256!=0), bf=128 passes divisibility but bfc=128 fails quant (128%256!=0).
         with self.assertRaises(ValueError):
             cfg.effective_for(
                 num_tokens=256,

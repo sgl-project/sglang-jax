@@ -54,6 +54,10 @@ class FusedMoEBlockConfig:
     ) -> FusedMoEBlockConfig:
         """Return the *effective* config after applying kernel override rules.
 
+        If *intermediate_size* is given and ``self.bf`` does not divide it,
+        ``bf`` (and correspondingly ``bfc``) are jointly reduced to the largest
+        multiple of 128 that satisfies both divisibility constraints.
+
         Important: validate after overrides, because these overrides affect the
         actual compiled kernel shapes/scratch.
         """
@@ -3404,7 +3408,6 @@ def fused_ep_moe(
     num_devices = ep_size
 
     num_tokens, hidden_size = tokens.shape
-    num_experts, intermediate_size, _ = w2.shape
     local_num_experts = num_experts // ep_size
     se_inter_size = w2_shared.shape[0] if w2_shared is not None else 0
 
