@@ -267,6 +267,8 @@ class JaxTransferKVSender(KVSender, StateHolder):
         assert self._use_d2h_staging is not None
         callback_uuid = self.uuid.encode("utf-8")
         with self._state_lock:
+            # Register callback before producer_handoff so the ack can't
+            # arrive between data registration and callback registration.
             self._mgr.zmq_notifier.register_callback(callback_uuid, self._on_ack)
             try:
                 status = self._mgr.producer_handoff(
