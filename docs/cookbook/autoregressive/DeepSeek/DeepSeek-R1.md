@@ -240,7 +240,7 @@ evalscope eval \
 
 **Test Environment** — same hardware/build as §4.1.
 
-**Workload** — `bench_serving` with `--dataset-name random --random-input-len 1000 --random-output-len 1000 --num-prompts 80 --max-concurrency 16 --seed 42`. See `2026-05-21-recipe-command-audit/deepseek-r1/bench_serving.log` for the raw output.
+**Workload** — `bench_serving` with `--dataset-name random --random-input-len 1000 --random-output-len 1000 --num-prompts 80 --max-concurrency 16 --seed 42`.
 
 **Benchmark Command**
 

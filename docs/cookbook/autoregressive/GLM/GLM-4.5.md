@@ -4,7 +4,7 @@ title: "GLM-4.5"
 
 # GLM-4.5 MoE on SGL-JAX
 
-> **Validated recipe** — GLM-4.5-Air (106B) validated on TPU v6e-32 with sglang-jax 0.1.0; sanity + GSM8K + bench all pass, **but requires a 10-line patch to `python/sgl_jax/srt/models/glm4_moe.py`** as of `d9c98c80`: every `transpose=False` on the q/k/v/o, dense-MLP, and shared_experts `WeightMapping` blocks must flip to `transpose=True` (HF stores `[out, in]`, `LinearBase` expects `[in, out]` — compare every other validated recipe). Apply via the in-manifest patch heredoc shown in [`../../2026-05-21-recipe-command-audit/glm45-air-32-patched/manifest.yaml`](../../2026-05-21-recipe-command-audit/glm45-air-32-patched/manifest.yaml).
+> **Validated recipe** — GLM-4.5-Air (106B) validated on TPU v6e-32 with sglang-jax 0.1.0; sanity + GSM8K + bench all pass, **but requires a 10-line patch to `python/sgl_jax/srt/models/glm4_moe.py`** as of `d9c98c80`: every `transpose=False` on the q/k/v/o, dense-MLP, and shared_experts `WeightMapping` blocks must flip to `transpose=True` (HF stores `[out, in]`, `LinearBase` expects `[in, out]` — compare every other validated recipe). See §5 Troubleshooting for the symptom-by-symptom breakdown.
 
 ## 1. Model Introduction
 
@@ -297,7 +297,7 @@ Mean TPOT (ms):           13.35
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Startup assert `tile_n` divisibility failure (GLM-4.5-Air) | `--moe-backend fused` with `moe_intermediate_size=1408 % 512 ≠ 0` | Use `--moe-backend epmoe` for GLM-4.5-Air (mandatory). |
-| `dot_general contracting (4096,) and (12288,)` in `q_proj` during first prefill | `glm4_moe.py` q/k/v/o `WeightMapping.transpose=False` loads HF `[out, in]` weights as-is; `LinearBase` expects `[in, out]` | Patch 10 mappings to `transpose=True` (q/k/v/o + dense MLP + shared_experts). See [`../../2026-05-21-recipe-command-audit/glm45-air-32-patched/NOTES.md`](../../2026-05-21-recipe-command-audit/glm45-air-32-patched/NOTES.md) for the in-manifest heredoc. |
+| `dot_general contracting (4096,) and (12288,)` in `q_proj` during first prefill | `glm4_moe.py` q/k/v/o `WeightMapping.transpose=False` loads HF `[out, in]` weights as-is; `LinearBase` expects `[in, out]` | Patch 10 mappings to `transpose=True` (q/k/v/o + dense MLP + shared_experts). |
 | `dot_general contracting (4096,) and (1408,)` in `shared_experts.gate_proj` (after attn patch) | Same `transpose=False` bug in `shared_experts.{gate,up,down}_proj.weight` mappings | Add `mlp.shared_experts.{gate,up,down}_proj.weight` to the patch flip list (10 entries total, not 7). |
 | Tool calls return empty arguments | `--tool-call-parser` not set | Add `--tool-call-parser glm45` to the launch command. |
 | No `reasoning_content` in response | `--reasoning-parser` not set | Add `--reasoning-parser glm45` to launch. |
