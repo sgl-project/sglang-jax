@@ -148,9 +148,9 @@ def generate_block_specs(
     if cfgs.rhs_cfgs.has_scale:
         rhs_block = cfgs.rhs_cfgs.quant_block_size
         if rhs_block is not None and rhs_block < cfgs.dims.size_k:
-            assert cfgs.tiles.tile_k % rhs_block == 0, (
-                f"block-scale: tile_k={cfgs.tiles.tile_k} must divide rhs_block={rhs_block}"
-            )
+            assert (
+                cfgs.tiles.tile_k % rhs_block == 0
+            ), f"block-scale: tile_k={cfgs.tiles.tile_k} must divide rhs_block={rhs_block}"
             num_scale_per_tile = cfgs.tiles.tile_k // rhs_block
             rhs_scale_block_spec = pl.BlockSpec(
                 (None, num_scale_per_tile, 1, cfgs.tiles.tile_n),
@@ -731,13 +731,16 @@ def validate_inputs(
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
         num_k_blocks = rhs_scale.shape[1]
-        assert rhs_scale.shape == (size_group, num_k_blocks, 1, size_n), (
-            f"rhs_scale shape {rhs_scale.shape} != ({size_group}, {num_k_blocks}, 1, {size_n})"
-        )
+        assert rhs_scale.shape == (
+            size_group,
+            num_k_blocks,
+            1,
+            size_n,
+        ), f"rhs_scale shape {rhs_scale.shape} != ({size_group}, {num_k_blocks}, 1, {size_n})"
         if num_k_blocks > 1:
-            assert size_k % num_k_blocks == 0, (
-                f"block-scale: size_k={size_k} must divide num_k_blocks={num_k_blocks}"
-            )
+            assert (
+                size_k % num_k_blocks == 0
+            ), f"block-scale: size_k={size_k} must divide num_k_blocks={num_k_blocks}"
 
     assert group_offset.shape == (1,)
 
