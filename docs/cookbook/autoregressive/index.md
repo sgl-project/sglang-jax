@@ -30,7 +30,7 @@ End-to-end serving recipes for autoregressive models on SGL-JAX, organized by ve
 
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
-| 🧪 | GLM-4.5-Air (106B) | [`GLM/GLM-4.5.md`](GLM/GLM-4.5.md) | v6e-32 | MoE + reasoning/tool (`glm45`) |
+| ✅ | GLM-4.5-Air (106B) | [`GLM/GLM-4.5.md`](GLM/GLM-4.5.md) | v6e-32 | MoE + reasoning/tool (`glm45`) |
 
 ### Google — `Google/`
 
