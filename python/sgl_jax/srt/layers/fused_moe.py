@@ -567,6 +567,22 @@ class FusedEPMoEV2(FusedEPMoE):
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
         w2_shared_val = self.w2_shared.value if self.w2_shared is not None else None
 
+        # SE per-channel scales are stored 3D (1, 1, out); the v2 kernel reads them
+        # 2D (1, out). Squeeze here (not in quantize_weights, which the v1 path and
+        # the weight mapping consume in 3D form). None for bf16 SE weights (Mode 3).
+        w1_shared_scale = (
+            self.w1_shared_scale.value[:, 0, :] if self.w1_shared_scale is not None else None
+        )
+        w3_shared_scale = (
+            self.w3_shared_scale.value[:, 0, :] if self.w3_shared_scale is not None else None
+        )
+        w2_shared_scale = (
+            self.w2_shared_scale.value[:, 0, :] if self.w2_shared_scale is not None else None
+        )
+        # In-kernel SE token precision follows activation quantization: fp8 token
+        # (Mode 1) when act-quant is configured, else bf16 token (Mode 2/3).
+        enable_act_quant = self.activation_quantized_dtype is not None
+
         if block_config is None:
             block_config = get_tuned_fused_moe_v2_block_config(
                 num_tokens=hidden_states.shape[0],
@@ -608,6 +624,10 @@ class FusedEPMoEV2(FusedEPMoE):
             w1_shared=w1_shared_val,
             w2_shared=w2_shared_val,
             w3_shared=w3_shared_val,
+            w1_shared_scale=w1_shared_scale,
+            w2_shared_scale=w2_shared_scale,
+            w3_shared_scale=w3_shared_scale,
+            enable_act_quant=enable_act_quant,
             direct_scaled_dot=direct_scaled_dot,
             enable_act_quant=self.enable_act_quant,
             skip_inter_bt_sync=True,
