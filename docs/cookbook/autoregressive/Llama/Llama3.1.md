@@ -4,23 +4,17 @@ title: "Llama 3.1"
 
 # Llama 3.1 on SGL-JAX
 
-> **Validated recipe** — empirically validated on TPU v6e-4 with sglang-jax 0.1.0; see §4 for measured numbers. Phi-3 / InternLM3 aliases below use the same launch path but are unmeasured.
+> **Validated recipe** — empirically validated on TPU v6e-4 with sglang-jax 0.1.0; see §4 for measured numbers.
 
 ## 1. Model Introduction
 
-[**meta-llama/Llama-3.1-8B-Instruct**](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) is Meta's 8B dense decoder from the Llama 3.1 release — comfortable single-host fit. The same SGL-JAX runtime path also serves the Llama-compatible Phi-3 and InternLM3 8B checkpoints.
-
-**Variants** (pick by fine-tune):
-
-- [**meta-llama/Llama-3.1-8B-Instruct**](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) — 8B instruction-tuned; default chat choice.
-- [**microsoft/Phi-3.5-mini-instruct**](https://huggingface.co/microsoft/Phi-3.5-mini-instruct) — 3.8B Phi-3.5 variant; runs on the same Llama path.
-- [**internlm/internlm3-8b-instruct**](https://huggingface.co/internlm/internlm3-8b-instruct) — 8B InternLM3 variant; runs on the same Llama path.
+[**meta-llama/Llama-3.1-8B-Instruct**](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) is Meta's 8B dense decoder from the Llama 3.1 release — comfortable single-host fit on TPU v6e-4 (BF16 ~16 GB).
 
 For the 70B size (multi-host required) see [`Llama3.3-70B.md`](Llama3.3-70B.md). For Llama 4 see the upstream sgl-cookbook (`Llama/Llama4.md`).
 
 **Recommended Generation Parameters**: `temperature=0.6`, `top_p=0.9`, `max_tokens=1024` (Llama 3 Instruct defaults).
 
-**License**: see the [Llama model card](https://huggingface.co/meta-llama) for the authoritative Meta Llama Community License terms. Phi-3 / InternLM3 follow their own model-card licenses.
+**License**: see the [Llama model card](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) for the authoritative Meta Llama Community License terms.
 
 ## 2. Deployment
 
@@ -28,8 +22,8 @@ For the 70B size (multi-host required) see [`Llama3.3-70B.md`](Llama3.3-70B.md).
 
 | Tier | Model | TPU | Topology | Chips | `--tp-size` | Notes |
 |---|---|---|---|---|---|---|
-| Minimum runnable | Llama 3.1 8B / Phi-3.5 / InternLM3-8B | v6e-4 | 2x2 | 4 | 4 | BF16 ~16 GB — fits with headroom; lowest-cost single-host serving |
-| Recommended production | Llama 3.1 8B / Phi-3.5 / InternLM3-8B | v6e-8 | 2x4 | 8 | 8 | More HBM headroom for higher `--max-running-requests` / longer context — same single-host class, no multi-node coordination |
+| Minimum runnable | Llama 3.1 8B-Instruct | v6e-4 | 2x2 | 4 | 4 | BF16 ~16 GB — fits with headroom; lowest-cost single-host serving |
+| Recommended production | Llama 3.1 8B-Instruct | v6e-8 | 2x4 | 8 | 8 | More HBM headroom for higher `--max-running-requests` / longer context — same single-host class, no multi-node coordination |
 
 See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
@@ -60,15 +54,13 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
   --host 0.0.0.0 --port 30000
 ```
 
-Swap `--model-path` to `microsoft/Phi-3.5-mini-instruct` or `internlm/internlm3-8b-instruct` for the aliased variants.
-
 ### 2.4 Configuration Tips
 
 **Memory Management:**
 - `--mem-fraction-static 0.88` is the TPU default. Raise to `0.9` for higher concurrency on a dedicated host.
 
 **Paging / concurrency (mandatory):**
-- `--page-size 128` is **mandatory**. Without it the attention backend defaults to `page_size=1` and the `Max running requests` constraint chain collapses `Final max_running_requests` to 1 — at concurrency=16 the bench serializes and output throughput drops ~9× (validated 2026-05-25: 156 tok/s without flag → 1449 tok/s with). Same constraint applies to the Phi-3 / InternLM3 aliases.
+- `--page-size 128` is **mandatory**. Without it the attention backend defaults to `page_size=1` and the `Max running requests` constraint chain collapses `Final max_running_requests` to 1 — at concurrency=16 the bench serializes and output throughput drops ~9× (validated 2026-05-25: 156 tok/s without flag → 1449 tok/s with).
 - `--max-running-requests 64` pairs with the page-size flag; raise/lower to match your `--max-concurrency` workload.
 
 **Tensor Parallelism:**
@@ -195,14 +187,11 @@ Mean ITL (ms):                           9.87
 |---|---|---|
 | OOM at startup | Weights + KV exceed budget at chosen `--mem-fraction-static` | Lower to 0.85. Verify `--tp-size 4` matches v6e-4 chip count. |
 | First request takes ~4 min | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR` across restarts (host volume mount in Docker). |
-| Phi-3 / InternLM3 fails to load | Missing `--trust-remote-code` | Add it to the launch command; both aliases ship custom modeling code. |
 | Bench shows ~150 tok/s output and ~50s TTFT at concurrency=16 | `--page-size` defaulted to 1 → `Final max_running_requests: 1` (visible in launch log), requests serialize | Add `--page-size 128 --max-running-requests 64` to the launch command. See §2.4. |
 
 ## Additional Resources
 
-- [Llama model collection](https://huggingface.co/meta-llama)
-- [Phi-3 model card](https://huggingface.co/microsoft/Phi-3.5-mini-instruct)
-- [InternLM3 model card](https://huggingface.co/internlm/internlm3-8b-instruct)
+- [Llama 3.1 8B-Instruct model card](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)
 - [`Llama3.3-70B.md`](Llama3.3-70B.md) — 70B multi-host sibling.
 - [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

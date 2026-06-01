@@ -4,23 +4,18 @@ title: "GLM-4.5"
 
 # GLM-4.5 MoE on SGL-JAX
 
-> **Partially validated recipe** — GLM-4.5-Air (106B) validated on TPU v6e-32 with sglang-jax 0.1.0; sanity + GSM8K + bench all pass, **but requires a 10-line patch to `python/sgl_jax/srt/models/glm4_moe.py`** as of `d9c98c80`: every `transpose=False` on the q/k/v/o, dense-MLP, and shared_experts `WeightMapping` blocks must flip to `transpose=True` (HF stores `[out, in]`, `LinearBase` expects `[in, out]` — compare every other validated recipe). Apply via the in-manifest patch heredoc shown in [`../../2026-05-21-recipe-command-audit/glm45-air-32-patched/manifest.yaml`](../../2026-05-21-recipe-command-audit/glm45-air-32-patched/manifest.yaml). GLM-4.5 (full 355B) on v6e-64 remains Starter (v6e-64 nodepool released; not tested in this audit pass).
+> **Validated recipe** — GLM-4.5-Air (106B) validated on TPU v6e-32 with sglang-jax 0.1.0; sanity + GSM8K + bench all pass, **but requires a 10-line patch to `python/sgl_jax/srt/models/glm4_moe.py`** as of `d9c98c80`: every `transpose=False` on the q/k/v/o, dense-MLP, and shared_experts `WeightMapping` blocks must flip to `transpose=True` (HF stores `[out, in]`, `LinearBase` expects `[in, out]` — compare every other validated recipe). Apply via the in-manifest patch heredoc shown in [`../../2026-05-21-recipe-command-audit/glm45-air-32-patched/manifest.yaml`](../../2026-05-21-recipe-command-audit/glm45-air-32-patched/manifest.yaml).
 
 ## 1. Model Introduction
 
-[**zai-org/GLM-4.5**](https://huggingface.co/zai-org) is Zhipu AI's GLM-4.5 series — MoE decoder models with hybrid reasoning support and native tool calling. Two released sizes share the same architecture and parsers.
-
-**Variants** (pick by size):
-
-- [**zai-org/GLM-4.5**](https://huggingface.co/zai-org/GLM-4.5) — 355B total / 32B activated; multi-host on v6e-64.
-- [**zai-org/GLM-4.5-Air**](https://huggingface.co/zai-org/GLM-4.5-Air) — 106B total / 12B activated; multi-host on v6e-32.
+[**zai-org/GLM-4.5-Air**](https://huggingface.co/zai-org/GLM-4.5-Air) is Zhipu AI's GLM-4.5-Air — a 106B total / 12B activated MoE decoder with hybrid reasoning support and native tool calling; multi-host on v6e-32.
 
 **Recommended Generation Parameters**:
 
 - General: `temperature=0.6`, `top_p=0.95`, `max_tokens=1024`.
 - Reasoning (thinking-on): `temperature=0.6`, `top_p=0.95`, `max_tokens=4096+`.
 
-**License**: see the [GLM-4.5 model card](https://huggingface.co/zai-org/GLM-4.5) for the authoritative license terms.
+**License**: see the [GLM-4.5-Air model card](https://huggingface.co/zai-org/GLM-4.5-Air) for the authoritative license terms.
 
 ## 2. Deployment
 
@@ -29,13 +24,12 @@ title: "GLM-4.5"
 | Model | TPU | Topology | Nodes | Chips | `--tp-size` | `--ep-size` | Notes |
 |---|---|---|---|---|---|---|---|
 | GLM-4.5-Air (106B) | v6e-32 | 4x8 | 8  | 32 | 32 | 32 | BF16 ~210 GB |
-| GLM-4.5 (355B)     | v6e-64 | 8x8 | 16 | 64 | 64 | 64 | BF16 ~710 GB |
 
 See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.md`](../../../get_started/install.md). Multi-host required at both sizes — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
+Install per [`../../../get_started/install.md`](../../../get_started/install.md). Multi-host required — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
 
 | Hardware Platform               | Docker Image                                                       |
 |---|---|
@@ -44,7 +38,7 @@ Install per [`../../../get_started/install.md`](../../../get_started/install.md)
 
 ### 2.3 Launch
 
-GLM-4.5 is multi-host only at both released sizes.
+GLM-4.5-Air is multi-host only.
 
 #### Multi-host (GKE Indexed Job) — TPU v6e-32 (GLM-4.5-Air)
 
@@ -64,16 +58,7 @@ Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md)
   --skip-server-warmup
 ```
 
-> `--moe-backend epmoe` is mandatory for GLM-4.5-Air. The fused Pallas backend requires `moe_intermediate_size % 512 == 0`; GLM-4.5-Air's `moe_intermediate_size=1408` fails that alignment and crashes at startup (`tile_n` divisibility assert). GLM-4.5 (355B) at `moe_intermediate_size=1536` divides cleanly and can use `--moe-backend fused`.
-
-#### Multi-host (GKE Indexed Job) — TPU v6e-64 (GLM-4.5)
-
-Use `<JOB>=glm-4-5`, `<TOPOLOGY>=8x8`, `parallelism: 16`, and `completions: 16`; change the launch flags above to:
-
-```text
-  --tp-size 64 --ep-size 64 \
-  --moe-backend fused \
-```
+> `--moe-backend epmoe` is mandatory for GLM-4.5-Air. The fused Pallas backend requires `moe_intermediate_size % 512 == 0`; GLM-4.5-Air's `moe_intermediate_size=1408` fails that alignment and crashes at startup (`tile_n` divisibility assert).
 
 For temporary v6e experiments, advanced users can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
@@ -81,11 +66,9 @@ For temporary v6e experiments, advanced users can adapt [`../../deployment/skypi
 
 **MoE Backend:**
 - GLM-4.5-Air → `--moe-backend epmoe` (mandatory; `moe_intermediate_size=1408 % 512 ≠ 0` crashes fused).
-- GLM-4.5 (355B) → `--moe-backend fused` (`moe_intermediate_size=1536` divides 512 cleanly).
-- General rule: fused requires `moe_intermediate_size % 512 == 0` AND `EP ≥ 16`. Anything else uses `epmoe`.
 
 **Memory Management:**
-- `--mem-fraction-static 0.9` for GLM-4.5-Air on v6e-32. `0.92` for GLM-4.5 on v6e-64. Drop by 0.02 if you hit OOM at startup with high `--max-running-requests`.
+- `--mem-fraction-static 0.9` for GLM-4.5-Air on v6e-32. Drop by 0.02 if you hit OOM at startup with high `--max-running-requests`.
 
 **Reasoning + Tool Calling (GLM-4.5 parsers):**
 - Add `--reasoning-parser glm45` to expose `reasoning_content` separately from `content`.
@@ -255,11 +238,11 @@ To see the full set of `--reasoning-parser` / `--tool-call-parser` keys availabl
 
 | Field | Value |
 |---|---|
-| Hardware | TPU v6e-32 (Air, 8 nodes × 4 chips) / v6e-64 (GLM-4.5, untested) |
-| Model | zai-org/GLM-4.5-Air (BF16) — full GLM-4.5 untested |
-| Tensor Parallelism | 32 (Air) / 64 (GLM-4.5) |
-| Expert Parallelism | 32 (Air) / 64 (GLM-4.5) |
-| Tested build | sglang-jax 0.1.0 + glm4_moe.py 10-mapping transpose patch (Air on v6e-32) |
+| Hardware | TPU v6e-32 (Air, 8 nodes × 4 chips) |
+| Model | zai-org/GLM-4.5-Air (BF16) |
+| Tensor Parallelism | 32 |
+| Expert Parallelism | 32 |
+| Tested build | sglang-jax 0.1.0 + glm4_moe.py 10-mapping transpose patch |
 
 **Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-32-glm-45-air).
 
@@ -286,8 +269,6 @@ Recommended additional datasets: MMLU, GPQA Diamond, AIME 2025.
 |:---|:---|:---|:---|
 | GLM-4.5-Air | gsm8k main | 200 | **0.955** |
 
-GLM-4.5 (355B): not tested in this audit pass.
-
 ### 4.2 Speed
 
 > **Layout B — methodology + command template.** No measured numbers yet; PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` to upgrade to Validated.
@@ -311,24 +292,21 @@ Mean TPOT (ms):           13.35
 ==================================================
 ```
 
-GLM-4.5 (355B): not tested in this audit pass; would need v6e-64.
-
 ## 5. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| MoE throughput plateau at EP ≥ 16 with `moe_intermediate_size % 512 == 0` | Using `epmoe` when `fused` would work | Switch to `--moe-backend fused`. Required for GLM-4.5 (355B); does NOT work for GLM-4.5-Air. |
 | Startup assert `tile_n` divisibility failure (GLM-4.5-Air) | `--moe-backend fused` with `moe_intermediate_size=1408 % 512 ≠ 0` | Use `--moe-backend epmoe` for GLM-4.5-Air (mandatory). |
 | `dot_general contracting (4096,) and (12288,)` in `q_proj` during first prefill | `glm4_moe.py` q/k/v/o `WeightMapping.transpose=False` loads HF `[out, in]` weights as-is; `LinearBase` expects `[in, out]` | Patch 10 mappings to `transpose=True` (q/k/v/o + dense MLP + shared_experts). See [`../../2026-05-21-recipe-command-audit/glm45-air-32-patched/NOTES.md`](../../2026-05-21-recipe-command-audit/glm45-air-32-patched/NOTES.md) for the in-manifest heredoc. |
 | `dot_general contracting (4096,) and (1408,)` in `shared_experts.gate_proj` (after attn patch) | Same `transpose=False` bug in `shared_experts.{gate,up,down}_proj.weight` mappings | Add `mlp.shared_experts.{gate,up,down}_proj.weight` to the patch flip list (10 entries total, not 7). |
 | Tool calls return empty arguments | `--tool-call-parser` not set | Add `--tool-call-parser glm45` to the launch command. |
 | No `reasoning_content` in response | `--reasoning-parser` not set | Add `--reasoning-parser glm45` to launch. |
-| OOM at startup (GLM-4.5) | `--mem-fraction-static 0.92` too high for this slice | Lower to 0.9. Verify `--tp-size 64` matches v6e-64 chip count (8 × 8 = 64). |
+| OOM at startup (GLM-4.5-Air) | `--mem-fraction-static 0.9` too high for this slice | Lower to 0.88. Verify `--tp-size 32` matches v6e-32 chip count (4 × 8 = 32). |
 | Multi-node hang at init | `--dist-init-addr` unreachable from non-rank-0 nodes | Verify the rank-0 internal IP and that the chosen port is open. |
 | First request takes ~4 min per node | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR`; mount a shared PVC across nodes for amortized compilation. |
 
 ## Additional Resources
 
-- [GLM-4.5 model collection](https://huggingface.co/zai-org)
+- [GLM-4.5-Air model card](https://huggingface.co/zai-org/GLM-4.5-Air)
 - [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

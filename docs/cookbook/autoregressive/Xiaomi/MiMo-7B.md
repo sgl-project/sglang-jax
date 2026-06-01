@@ -4,31 +4,24 @@ title: "MiMo-7B"
 
 # MiMo-7B on SGL-JAX
 
-> **Partially validated recipe** — MiMo-7B-RL has TPU v6e-4 speed and GSM8K results. MiMo-7B-Base and MiMo-7B-SFT validation are still pending.
+> **Validated recipe** — MiMo-7B-RL has TPU v6e-4 speed and GSM8K results.
 
 ## 1. Model Introduction
 
-[**XiaomiMiMo/MiMo-7B**](https://huggingface.co/XiaomiMiMo) is Xiaomi's 7B-parameter dense decoder model trained with reasoning-oriented objectives — built on the Qwen 2 base architecture. Fits comfortably on a single TPU v6e-4 host.
-
-**Variants** (pick by training objective):
-
-- [**XiaomiMiMo/MiMo-7B-Base**](https://huggingface.co/XiaomiMiMo/MiMo-7B-Base) — base pre-trained.
-- [**XiaomiMiMo/MiMo-7B-SFT**](https://huggingface.co/XiaomiMiMo/MiMo-7B-SFT) — supervised fine-tuned for instruction following.
-- [**XiaomiMiMo/MiMo-7B-RL**](https://huggingface.co/XiaomiMiMo/MiMo-7B-RL) — RL-tuned for reasoning; default choice for chain-of-thought workloads.
+[**XiaomiMiMo/MiMo-7B-RL**](https://huggingface.co/XiaomiMiMo/MiMo-7B-RL) is Xiaomi's RL-tuned 7B-parameter dense decoder trained with reasoning-oriented objectives — built on the Qwen 2 base architecture. Fits comfortably on a single TPU v6e-4 host.
 
 For the larger Xiaomi MoE models, see [`MiMo-V2-Flash.md`](MiMo-V2-Flash.md) and [`MiMo-V2.5-Pro.md`](MiMo-V2.5-Pro.md) — these are different architectures (256-expert MoE with hybrid attention), not just larger MiMo-7B variants.
 
 **Key Features**:
 
 - **Compact 7B dense decoder**: BF16 weights ~14 GB — fits comfortably on a single TPU v6e-4 host. Lowest-cost reasoning-capable model in the cookbook.
-- **RL-tuned for reasoning** (`MiMo-7B-RL`): Reinforcement-learning post-training maximizes chain-of-thought quality on math benchmarks; default choice for reasoning workloads. GSM8K **0.920** (§4.1).
+- **RL-tuned for reasoning**: Reinforcement-learning post-training maximizes chain-of-thought quality on math benchmarks; default choice for reasoning workloads. GSM8K **0.920** (§4.1).
 - **Hybrid Reasoning**: thinking-on (default) and thinking-off via `chat_template_kwargs.enable_thinking` per-request — use `--reasoning-parser mimo` to expose `reasoning_content` (§3.2).
 - **OpenAI-compatible tool calling**: `--tool-call-parser mimo` exposes `tool_calls` on the response — same parser key as MiMo-V2.5-Pro; see §3.3 for streaming + multi-turn examples.
-- **Three variants for different stages**: Base (pre-trained), SFT (instruction), RL (reasoning) — pick by training objective.
 
-**Recommended Generation Parameters**: `temperature=0.7`, `top_p=0.95`, `max_tokens=2048+` for RL/SFT variants (give room for reasoning).
+**Recommended Generation Parameters**: `temperature=0.7`, `top_p=0.95`, `max_tokens=2048+` (give room for reasoning).
 
-**License**: see the [HuggingFace model card](https://huggingface.co/XiaomiMiMo) for the authoritative license terms.
+**License**: see the [MiMo-7B-RL model card](https://huggingface.co/XiaomiMiMo/MiMo-7B-RL) for the authoritative license terms.
 
 ## 2. Deployment
 
@@ -36,8 +29,8 @@ For the larger Xiaomi MoE models, see [`MiMo-V2-Flash.md`](MiMo-V2-Flash.md) and
 
 | Tier | Model | TPU | Topology | Chips | `--tp-size` | Notes |
 |---|---|---|---|---|---|---|
-| Minimum runnable | MiMo-7B (any variant) | v6e-4 | 2x2 | 4 | 4 | BF16 weights ~14 GB — fits with headroom; lowest-cost single-host serving |
-| Recommended production | MiMo-7B (any variant) | v6e-8 | 2x4 | 8 | 8 | More HBM headroom for higher `--max-running-requests` and longer reasoning outputs on RL variant |
+| Minimum runnable | MiMo-7B-RL | v6e-4 | 2x2 | 4 | 4 | BF16 weights ~14 GB — fits with headroom; lowest-cost single-host serving |
+| Recommended production | MiMo-7B-RL | v6e-8 | 2x4 | 8 | 8 | More HBM headroom for higher `--max-running-requests` and longer reasoning outputs |
 
 See [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
@@ -66,19 +59,17 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
   --host 0.0.0.0 --port 30000
 ```
 
-Swap `--model-path` to `MiMo-7B-Base` or `MiMo-7B-SFT` as needed.
-
 ### 2.4 Configuration Tips
 
 **Memory Management:**
 - `--mem-fraction-static 0.88` is the TPU default. Raise to `0.9` for dedicated serving / higher concurrency.
 
 **Tool Calling:**
-- MiMo-7B shares the `mimo` tool-call parser format with MiMo-V2.5-Pro. Add `--tool-call-parser mimo` when using the OpenAI tools API. See [`MiMo-V2.5-Pro.md` §3.3](MiMo-V2.5-Pro.md#33-tool-calling) for the request/response pattern.
+- MiMo-7B-RL shares the `mimo` tool-call parser format with MiMo-V2.5-Pro. Add `--tool-call-parser mimo` when using the OpenAI tools API. See [`MiMo-V2.5-Pro.md` §3.3](MiMo-V2.5-Pro.md#33-tool-calling) for the request/response pattern.
 
-**Reasoning Parser (RL / SFT variants):**
-- MiMo-7B uses `--reasoning-parser mimo` (alias of the `qwen3` reasoning parser — same `<think>...</think>` format + `enable_thinking` switch). Append to the §2.3 launch command to expose `reasoning_content` separated from `content`.
-- Pass `extra_body={"chat_template_kwargs": {"enable_thinking": true}}` per-request to unlock chain-of-thought outputs on RL / SFT variants (Base variant has no instruction tuning — no thinking mode).
+**Reasoning Parser:**
+- MiMo-7B-RL uses `--reasoning-parser mimo` (alias of the `qwen3` reasoning parser — same `<think>...</think>` format + `enable_thinking` switch). Append to the §2.3 launch command to expose `reasoning_content` separated from `content`.
+- Pass `extra_body={"chat_template_kwargs": {"enable_thinking": true}}` per-request to unlock chain-of-thought outputs.
 - See §3.2 for the streaming Python client showing the reasoning / content section split.
 
 **Compilation Cache Hygiene:**
@@ -111,7 +102,7 @@ print(resp.choices[0].message.content)
 
 ### 3.2 Reasoning (thinking-on default, thinking-off optional)
 
-MiMo-7B uses the `mimo` reasoning parser. Append `--reasoning-parser mimo` to the §2.3 launch command. Thinking-on is the default; turn it off per-request via `chat_template_kwargs`.
+MiMo-7B-RL uses the `mimo` reasoning parser. Append `--reasoning-parser mimo` to the §2.3 launch command. Thinking-on is the default; turn it off per-request via `chat_template_kwargs`.
 
 #### Thinking-on (default) — streaming with separated reasoning/content
 
@@ -170,7 +161,7 @@ print(response.choices[0].message.content)
 
 ### 3.3 Tool Calling
 
-MiMo-7B uses the `mimo` tool-call parser (same key as the reasoning parser). Append `--tool-call-parser mimo` to the §2.3 launch command. Pass `tools=[...]` per the OpenAI function-calling schema:
+MiMo-7B-RL uses the `mimo` tool-call parser (same key as the reasoning parser). Append `--tool-call-parser mimo` to the §2.3 launch command. Pass `tools=[...]` per the OpenAI function-calling schema:
 
 ```python
 from openai import OpenAI
@@ -403,12 +394,12 @@ Max ITL (ms):                            38.99
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Tool calls return empty arguments | `--tool-call-parser` not set | Add `--tool-call-parser mimo` to the launch command. |
-| No `reasoning_content` in response on RL/SFT variant | `--reasoning-parser` not set, or `enable_thinking` not passed | Add `--reasoning-parser mimo` to launch; pass `extra_body={"chat_template_kwargs":{"enable_thinking":true}}` per request. |
+| No `reasoning_content` in response | `--reasoning-parser` not set, or `enable_thinking` not passed | Add `--reasoning-parser mimo` to launch; pass `extra_body={"chat_template_kwargs":{"enable_thinking":true}}` per request. |
 | First request takes ~4 min | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR` across restarts. |
 
 ## Additional Resources
 
-- [MiMo-7B family on HuggingFace](https://huggingface.co/XiaomiMiMo)
+- [MiMo-7B-RL model card](https://huggingface.co/XiaomiMiMo/MiMo-7B-RL)
 - [`MiMo-V2-Flash.md`](MiMo-V2-Flash.md) and [`MiMo-V2.5-Pro.md`](MiMo-V2.5-Pro.md) — larger Xiaomi MoE models (different architecture).
 - [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

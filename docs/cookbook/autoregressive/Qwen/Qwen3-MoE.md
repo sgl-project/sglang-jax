@@ -4,33 +4,28 @@ title: "Qwen3-MoE"
 
 # Qwen3-MoE on SGL-JAX
 
-> **Partially validated recipe** — Qwen3-30B-A3B validated on TPU v6e-16 with sglang-jax 0.1.0; see §4 for measured numbers. The 235B-A22B production tier remains Starter — same launch path with larger `--tp-size` / `--ep-size`, unmeasured.
+> **Validated recipe** — Qwen3-30B-A3B validated on TPU v6e-16 with sglang-jax 0.1.0; see §4 for measured numbers.
 
 ## 1. Model Introduction
 
-[**Qwen/Qwen3-MoE**](https://huggingface.co/Qwen) is Alibaba's MoE variant of the Qwen3 series — sparse mixture-of-experts decoders with the same hybrid reasoning + tool-call format as dense Qwen3. Two released sizes: 30B-A3B (3B active) and 235B-A22B (22B active).
-
-**Variants** (pick by size):
-
-- [**Qwen/Qwen3-30B-A3B**](https://huggingface.co/Qwen/Qwen3-30B-A3B) — 30B total / 3B activated; multi-host on v6e-16.
-- [**Qwen/Qwen3-235B-A22B**](https://huggingface.co/Qwen/Qwen3-235B-A22B) — 235B total / 22B activated; multi-host on v6e-64.
+[**Qwen/Qwen3-30B-A3B**](https://huggingface.co/Qwen/Qwen3-30B-A3B) is Alibaba's MoE variant of the Qwen3 series — a sparse mixture-of-experts decoder with 30B total / 3B activated parameters and the same hybrid reasoning + tool-call format as dense Qwen3; multi-host on v6e-16.
 
 For the dense Qwen3 variants (8B / 32B) see [`Qwen3.md`](Qwen3.md).
 
 **Key Features**:
 
-- **Two MoE sizes**: 30B-A3B (3B active, multi-host on v6e-16) and 235B-A22B (22B active, multi-host on v6e-64) — pick by quality/compute budget.
+- **Compact MoE size**: 30B-A3B (3B active) — multi-host on v6e-16, lower compute budget than dense 32B at similar quality.
 - **Hybrid Reasoning**: thinking-on (default) and thinking-off via `chat_template_kwargs.enable_thinking` per-request — use `--reasoning-parser qwen3` to expose `reasoning_content` (§3.2).
 - **OpenAI-compatible tool calling**: `--tool-call-parser qwen25` exposes `tool_calls` on the response — full streaming + multi-turn examples in §3.3.
-- **MoE backend selection matters**: 30B-A3B has `moe_intermediate_size=768` (not multiple of 512) — **must** use `--moe-backend epmoe`. 235B-A22B has 1536 and can use the higher-throughput `fused` backend at EP ≥ 16 (§2.4).
-- **Production-validated (30B-A3B)**: GSM8K **0.980** thinking-on on TPU v6e-16 (§4.1); ~2.8 req/s and ~1.5K output tok/s under random 1K→1K at concurrency 16 (§4.2).
+- **MoE backend selection matters**: 30B-A3B has `moe_intermediate_size=768` (not multiple of 512) — **must** use `--moe-backend epmoe` (§2.4).
+- **Production-validated**: GSM8K **0.980** thinking-on on TPU v6e-16 (§4.1); ~2.8 req/s and ~1.5K output tok/s under random 1K→1K at concurrency 16 (§4.2).
 
 **Recommended Generation Parameters**:
 
 - Thinking-on (default): `temperature=0.7`, `top_p=0.95`, `max_tokens=2048+`.
 - Thinking-off (instant): `temperature=0.7`, `top_p=0.8`, `max_tokens=512`.
 
-**License**: see the [Qwen model cards](https://huggingface.co/Qwen) for authoritative license terms.
+**License**: see the [Qwen3-30B-A3B model card](https://huggingface.co/Qwen/Qwen3-30B-A3B) for authoritative license terms.
 
 ## 2. Deployment
 
@@ -39,7 +34,6 @@ For the dense Qwen3 variants (8B / 32B) see [`Qwen3.md`](Qwen3.md).
 | Model | TPU | Topology | Nodes | Chips | `--tp-size` | `--ep-size` | Notes |
 |---|---|---|---|---|---|---|---|
 | Qwen3-30B-A3B   | v6e-16 | 4x4 | 4  | 16 | 16 | 16 | BF16 ~60 GB  |
-| Qwen3-235B-A22B | v6e-64 | 8x8 | 16 | 64 | 64 | 64 | BF16 ~470 GB |
 
 See [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
@@ -54,7 +48,7 @@ Install per [`../../get_started/install.md`](../../../get_started/install.md). F
 
 ### 2.3 Launch
 
-Qwen3-MoE is multi-host only at both released sizes.
+Qwen3-30B-A3B is multi-host only.
 
 #### Multi-host (GKE Indexed Job) — TPU v6e-16 (Qwen3-30B-A3B)
 
@@ -76,31 +70,22 @@ Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md)
 
 > Note: 30B-A3B uses `--moe-backend epmoe`, not `fused`. The fused MoE kernel requires `intermediate_size % 512 == 0`; Qwen3-30B-A3B's per-expert FFN inner dim is 768 (not a multiple of 512), so launching with `--moe-backend fused` raises `ValueError: Expected intermediate_size=768 to be aligned to bf=512`. See §2.4 MoE Backend.
 
-#### Multi-host (GKE Indexed Job) — TPU v6e-64 (Qwen3-235B-A22B)
-
-Use `<TOPOLOGY>=8x8`, `parallelism: 16`, and `completions: 16`; change the launch flags above to:
-
-```text
-  --tp-size 64 --ep-size 64 \
-  --mem-fraction-static 0.92 \
-```
-
 For temporary v6e experiments, advanced users can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
 ### 2.4 Configuration Tips
 
 **MoE Backend:**
 - `--moe-backend fused` is the throughput-optimal choice at EP ≥ 16, **but it requires the per-expert FFN intermediate size to be a multiple of 512** (`fused_moe/v1/kernel.py` block-factor alignment).
-- Qwen3-30B-A3B has `moe_intermediate_size=768` which is **not** aligned, so it must use `--moe-backend epmoe` even at EP=16. Qwen3-235B-A22B has `moe_intermediate_size=1536` which **is** aligned, so it can use `fused`.
+- Qwen3-30B-A3B has `moe_intermediate_size=768` which is **not** aligned, so it must use `--moe-backend epmoe` even at EP=16.
 - For EP ≤ 8 use `epmoe` regardless.
 
 **Memory Management:**
-- `--mem-fraction-static 0.9` is appropriate for the 30B-A3B config; raise to `0.92` for 235B-A22B to make room for the much larger weight set.
+- `--mem-fraction-static 0.9` is appropriate for the 30B-A3B config.
 - Lower by 0.02 increments if you hit OOM at startup with high `--max-running-requests`.
 
 **Hybrid Reasoning / Tool Calling:**
 - Qwen3-MoE shares the hybrid reasoning (`--reasoning-parser qwen3`) and tool-call (`--tool-call-parser qwen25`) format with dense Qwen3. Append both flags to the §2.3 launch command to expose `reasoning_content` and OpenAI-compatible `tool_calls` on the response.
-- Full streaming Python examples (thinking-on + thinking-off, streaming tool-call accumulator, multi-turn Handling Tool Call Results) live in [`Qwen3.md` §3.2](Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) and [§3.3](Qwen3.md#33-tool-calling) — substitute the Qwen3-MoE model path and the §2.3 launch flags above.
+- Full streaming Python examples (thinking-on + thinking-off, streaming tool-call accumulator, multi-turn Handling Tool Call Results) live in [`Qwen3.md` §3.2](Qwen3.md#32-reasoning-thinking-on-default-thinking-off-optional) and [§3.3](Qwen3.md#33-tool-calling) — substitute the Qwen3-30B-A3B model path and the §2.3 launch flags above.
 
 **Throughput vs Latency:**
 - `--page-size 128` reduces KV page-table overhead at MoE scale. Default `1` is much slower at high concurrency.
@@ -318,11 +303,11 @@ To see the full set of `--reasoning-parser` / `--tool-call-parser` keys availabl
 
 | Field | Value |
 |---|---|
-| Hardware | TPU v6e-16 (30B-A3B) / v6e-64 (235B-A22B) |
-| Model | Qwen/Qwen3-30B-A3B or Qwen3-235B-A22B (BF16) |
-| Tensor Parallelism | 16 / 64 |
-| Expert Parallelism | 16 / 64 |
-| Tested build | sglang-jax 0.1.0 (30B-A3B only) |
+| Hardware | TPU v6e-16 |
+| Model | Qwen/Qwen3-30B-A3B (BF16) |
+| Tensor Parallelism | 16 |
+| Expert Parallelism | 16 |
+| Tested build | sglang-jax 0.1.0 |
 
 **Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-16-qwen3-30b-a3b).
 
@@ -338,8 +323,6 @@ evalscope eval \
   --eval-batch-size 8 \
   --generation-config '{"chat_template_kwargs": {"enable_thinking": true}, "temperature": 0.7, "top_p": 0.95}'
 ```
-
-Recommended additional datasets: AIME 2025, MATH, GPQA Diamond.
 
 **Test Results**
 
@@ -399,8 +382,7 @@ Mean ITL (ms):                           9.83
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `ValueError: Expected intermediate_size=768 to be aligned to bf=512` at startup (30B-A3B) | `--moe-backend fused` requires `moe_intermediate_size % 512 == 0`; Qwen3-30B-A3B has 768 | Switch to `--moe-backend epmoe`. See §2.4 MoE Backend. |
-| MoE throughput plateau at EP ≥ 16 (235B-A22B only) | Using `--moe-backend epmoe` instead of `fused` on a config that allows `fused` | Verify `moe_intermediate_size % 512 == 0` (235B-A22B has 1536 ✅), then switch to `--moe-backend fused`. |
-| OOM at startup (235B-A22B) | `--mem-fraction-static` too high | Lower to 0.9. Verify `--tp-size 64` matches v6e-64 chip count (8 × 8 = 64). |
+| OOM at startup | `--mem-fraction-static` too high | Lower by 0.02. Verify `--tp-size 16` matches v6e-16 chip count (4 × 4 = 16). |
 | Tool calls return empty arguments | `--tool-call-parser` not set | Add `--tool-call-parser qwen25`. |
 | No `reasoning_content` in response | `--reasoning-parser` not set | Add `--reasoning-parser qwen3`. |
 | Multi-node hang at init | `--dist-init-addr` unreachable | Verify the rank-0 internal IP and that the chosen port is open. |
@@ -408,7 +390,7 @@ Mean ITL (ms):                           9.83
 
 ## Additional Resources
 
-- [Qwen3 model collection](https://huggingface.co/Qwen)
+- [Qwen3-30B-A3B model card](https://huggingface.co/Qwen/Qwen3-30B-A3B)
 - [`Qwen3.md`](Qwen3.md) — dense Qwen3-8B / 32B recipe (same reasoning/tool-call format).
 - [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

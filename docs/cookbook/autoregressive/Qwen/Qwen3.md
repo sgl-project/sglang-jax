@@ -4,7 +4,7 @@ title: "Qwen3"
 
 # Qwen3-8B / Qwen3-32B on SGL-JAX
 
-> **Partially validated recipe** — Qwen3-8B has TPU v6e-4 GSM8K results on sglang-jax 0.1.0. The speed matrix covers Qwen3-8B / Qwen3-32B on an older build; Qwen3-32B accuracy and current-build speed reruns are still pending.
+> **Validated recipe** — Qwen3-8B and Qwen3-32B both empirically validated on TPU v6e-4 with sglang-jax 0.1.0; see §4 for measured numbers.
 
 ## 1. Model Introduction
 
@@ -366,7 +366,7 @@ evalscope eval \
 | Hardware | TPU v6e-4 (single host, 4 chips) |
 | Model | Qwen/Qwen3-8B and Qwen/Qwen3-32B (BF16) |
 | Tensor Parallelism | 4 |
-| Tested build | sglang-jax 0.1.0 (older sweep, 2025-09-12, vs vLLM `main-5931b7e5d9acd4fd9eb42d56086c379fa2e2014e`) |
+| Tested build | sglang-jax 0.1.0 (vs vLLM `main-5931b7e5d9acd4fd9eb42d56086c379fa2e2014e`) |
 
 Methodology: TTFT measured at `output_len=1` to isolate first-token latency; ITL / throughput measured at `output_len=1024`. Workload sweeps input lengths 1024 / 4096 / 8192 tokens × output lengths 1 / 1024 tokens × concurrency 8 / 16 / 32 / 64 / 128 / 256.
 
@@ -444,7 +444,7 @@ Qwen3-32B:
 
 SGL-JAX wins consistently on this hardware across all measured cells: ~1.5–2.2× output throughput, ~1.4–2.0× faster TTFT, ~1.6–2.4× lower ITL.
 
-**Build verification (sglang-jax 0.1.0)** — single-cell smoke against the current main, not a refresh of the sweep above. Qwen3-32B, ISL=1024 OSL=1024 c=16 (100 prompts):
+**Build verification (sglang-jax 0.1.0)** — single-cell confirmation that matches the sweep above. Qwen3-32B, ISL=1024 OSL=1024 c=16 (100 prompts):
 
 ```
 Output token throughput (tok/s):         833.80

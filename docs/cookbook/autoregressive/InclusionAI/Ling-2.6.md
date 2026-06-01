@@ -4,21 +4,16 @@ title: "Ling 2.6"
 
 # Ling-2.6 on SGL-JAX
 
-> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, greedy + raw completion correct, GSM8K accuracy 98.5% (200 examples, see §4.1), `bench_serving` numbers in §4.2. Pin to sglang-jax 0.1.0 (or any commit that includes the channel-wise FP8 QKV split fix); earlier builds crash at weight load. TPU v7x-16 path is still a starter target.
+> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, greedy + raw completion correct, GSM8K accuracy 98.5% (200 examples, see §4.1), `bench_serving` numbers in §4.2. Pin to sglang-jax 0.1.0 (or any commit that includes the channel-wise FP8 QKV split fix); earlier builds crash at weight load.
 
 ## 1. Model Introduction
 
-[**inclusionAI/Ling-2.6-1T**](https://huggingface.co/inclusionAI/Ling-2.6-1T) is InclusionAI's 1T-parameter Ling 2.6 release — a trillion-scale MoE built on **linear / delta attention** with a **hybrid recurrent state** pool that shares HBM with the KV cache. Smaller siblings (e.g. `Ling-2.6-flash`) are released under the same [InclusionAI HF collection](https://huggingface.co/inclusionAI).
+[**inclusionAI/Ling-2.6-1T**](https://huggingface.co/inclusionAI/Ling-2.6-1T) is InclusionAI's 1T-parameter Ling 2.6 release — a trillion-scale MoE built on **linear / delta attention** with a **hybrid recurrent state** pool that shares HBM with the KV cache.
 
 **Architectural distinguishers**:
 
 - **Linear / delta attention** in place of standard softmax attention — most of the long-context benefit shows up here.
 - **Hybrid recurrent state pool** — budgeted against the KV cache via `--recurrent-state-memory-ratio` (default `0.9`).
-
-**Variants**:
-
-- [**inclusionAI/Ling-2.6-1T**](https://huggingface.co/inclusionAI/Ling-2.6-1T) — full trillion-scale flagship; default focus of this page.
-- Smaller Ling-2.6 variants — adapt the §2.3 launch command after picking a checkpoint.
 
 For Moonshot AI's separate linear-attention model see [`Kimi-Linear.md`](../Moonshotai/Kimi-Linear.md).
 
@@ -33,7 +28,6 @@ For Moonshot AI's separate linear-attention model see [`Kimi-Linear.md`](../Moon
 | Model | TPU | Topology | Nodes | Chips | `--tp-size` | `--dp-size` | `--ep-size` | Status | Notes |
 |---|---|---|---|---|---|---|---|---|---|
 | Ling-2.6-1T | v6e-64 | 8x8 | 16 | 64 | 64 | 8 | 64 | ✅ validated | Trillion-scale; multi-host mandatory. `dp=8` required (GLA `num_groups=8` ≤ tensor axis); `--disable-radix-cache` required (hybrid recurrent state). |
-| Ling-2.6-1T | v7x-16 | 4x4 | 4  | 16 | 32 | 4 | 32 | 🚧 starter | v7x exposes 2 JAX devices per chip → `--tp-size 32`. Apply same `--dp-size`/`--disable-radix-cache` deltas. Not yet validated end-to-end. |
 
 See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
@@ -76,16 +70,6 @@ Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md)
 
 Mount a shared `JAX_COMPILATION_CACHE_DIR` on the same PVC as the model weights — first-time compile is ~9 minutes total (EXTEND ~7 min + DECODE ~2 min) at this build because the GLA chunk kernel has many distinct shape configurations; subsequent restarts with the same mesh shape skip almost all of that.
 
-#### Multi-host (GKE Indexed Job) — TPU v7x-16 (starter)
-
-Use GKE with `<ACCELERATOR>=tpu7x`, `<TOPOLOGY>=4x4`, `parallelism: 4`, and `completions: 4`. Change the launch flags above to:
-
-```text
-  --tp-size 32 --dp-size 4 --ep-size 32 \
-```
-
-Keep `--disable-radix-cache` and the rest of the v6e-64 starter values. Not yet validated end-to-end — open a PR with measured numbers when you run it.
-
 For temporary v6e experiments, advanced users can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
 ### 2.4 Configuration Tips
@@ -98,7 +82,6 @@ For temporary v6e experiments, advanced users can adapt [`../../deployment/skypi
 
 **Mesh / GLA Constraint:**
 - The GLA (linear attention) `GroupRMSNorm` uses `num_groups=8` and shards `num_groups` along the "tensor" mesh axis. **Effective tensor axis must be ≤ 8.** On v6e-64 that forces `--tp-size 64 --dp-size 8` (tensor axis = `tp/dp` = 8). Setting `--dp-size 1` builds tensor=64 and JIT trace crashes with `Sharding spec ('tensor',) implies that array axis 1 is partitioned 64 times, but does not evenly divide the dimension size 8`.
-- Same constraint on v7x-16: `--tp-size 32 --dp-size 4` → tensor axis = 8.
 
 **MoE Backend:**
 - `--moe-backend fused` for `--ep-size ≥ 16` (both configs above). The fused EP size = mesh `data * tensor` = 8 * 8 = 64 on v6e-64, matching `--ep-size 64`. Switch to `epmoe` only at EP ≤ 8.
@@ -309,7 +292,7 @@ Max ITL (ms):                            1293.91
 |---|---|---|
 | `TypeError: 'NoneType' object is not subscriptable` in `weight_utils.py:_split_qkv_weight` | Build pre-dates the channel-wise FP8 QKV split fix; checkpoint has `weight_block_size=None` (compressed-tensors `strategy="channel"`). | Pin sglang-jax to `d9c98c80` (primatrix `docs/cookbook-migration` branch) or any later commit that lands this fix. |
 | `AssertionError: Hybrid recurrent state models require --disable-radix-cache` at startup | Missing `--disable-radix-cache`. | Add `--disable-radix-cache` to the launch flags — it's mandatory for any hybrid recurrent state model, not optional. |
-| `ValueError: ... axis 1 is partitioned 64 times, but does not evenly divide the dimension size 8` from `group_rmsnorm.py` during JIT trace | Effective tensor axis (`tp_size / dp_size`) > GLA `num_groups=8`. | Set `--dp-size` such that `tp_size / dp_size <= 8`. On v6e-64 use `--dp-size 8`; on v7x-16 use `--dp-size 4`. |
+| `ValueError: ... axis 1 is partitioned 64 times, but does not evenly divide the dimension size 8` from `group_rmsnorm.py` during JIT trace | Effective tensor axis (`tp_size / dp_size`) > GLA `num_groups=8`. | Set `--dp-size` such that `tp_size / dp_size <= 8`. On v6e-64 use `--dp-size 8`. |
 | `RESOURCE_EXHAUSTED: ... Used 31.37G of 31.25G hbm. Exceeded hbm capacity by ~130M` during EXTEND precompile | `--mem-fraction-static 0.92` overshoots HBM at `dp=8` mesh trace peak. | Drop `--mem-fraction-static` to `0.88` (current default). For more headroom also lower `--chunked-prefill-size` to 1024 or `--max-running-requests` to 128. |
 | OOM at startup | Recurrent state + KV exceed budget | Lower `--recurrent-state-memory-ratio` (e.g. to 0.7) and/or `--mem-fraction-static` to 0.85. |
 | Long-prompt requests stall | KV cache exhausted before recurrent state | Lower `--recurrent-state-memory-ratio` to give the KV cache more headroom. |
@@ -319,8 +302,7 @@ Max ITL (ms):                            1293.91
 
 ## Additional Resources
 
-- [Ling-2.6 model card](https://huggingface.co/inclusionAI/Ling-2.6-1T)
-- [InclusionAI HF collection](https://huggingface.co/inclusionAI) — sibling checkpoints.
+- [Ling-2.6-1T model card](https://huggingface.co/inclusionAI/Ling-2.6-1T)
 - [`Kimi-Linear.md`](../Moonshotai/Kimi-Linear.md) — Moonshot AI's separate linear-attention model.
 - [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.

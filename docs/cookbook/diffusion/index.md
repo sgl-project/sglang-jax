@@ -22,8 +22,8 @@ End-to-end serving recipes for diffusion-style image and video generation models
 
 | Status | Model | Recipe | Min TPU | Modality | Endpoint |
 |---|---|---|---|---|---|
-| 🧪 | Wan 2.1 T2V (1.3B / 14B) | [`Wan/Wan2.1.md`](Wan/Wan2.1.md) | v6e-4 | Text-to-video diffusion | `/api/v1/videos/generation`, `/api/v1/images/generation` |
-| 🧪 | Wan 2.2 T2V A14B | [`Wan/Wan2.2.md`](Wan/Wan2.2.md) | v6e-4 | Text-to-video diffusion | `/api/v1/videos/generation`, `/api/v1/images/generation` |
+| ✅ | Wan 2.1 T2V-14B | [`Wan/Wan2.1.md`](Wan/Wan2.1.md) | v6e-4 | Text-to-video diffusion | `/api/v1/videos/generation`, `/api/v1/images/generation` |
+| ✅ | Wan 2.2 T2V A14B | [`Wan/Wan2.2.md`](Wan/Wan2.2.md) | v6e-4 | Text-to-video diffusion | `/api/v1/videos/generation`, `/api/v1/images/generation` |
 
 > Upgrade path: 🚧 → 🧪 requires measured launch / quality / wall-clock output for at least one variant and hardware path. 🧪 → ✅ requires complete evidence for the recipe's claimed primary path.
 
@@ -43,8 +43,8 @@ Current cookbook-facing configuration summary:
 
 | Family | User-facing TPU config | Cookbook implication |
 |---|---|---|
-| Wan 2.1 | v6e-4, `--tp-size 2` | current starter target |
-| Wan 2.2 | v6e-4, `--tp-size 1` | current starter target |
+| Wan 2.1 | v6e-4, `--tp-size 2` | validated path (T2V-14B) |
+| Wan 2.2 | v6e-4, `--tp-size 1` | validated path (T2V A14B) |
 
 ## Shared references
 
@@ -57,6 +57,6 @@ Current cookbook-facing configuration summary:
 
 | Goal | Clone from |
 |---|---|
-| Text-to-video diffusion with Wan 2.1 | [`Wan/Wan2.1.md`](Wan/Wan2.1.md) 🧪 |
-| Text-to-video diffusion with Wan 2.2 | [`Wan/Wan2.2.md`](Wan/Wan2.2.md) 🧪 |
+| Text-to-video diffusion with Wan 2.1 | [`Wan/Wan2.1.md`](Wan/Wan2.1.md) ✅ |
+| Text-to-video diffusion with Wan 2.2 | [`Wan/Wan2.2.md`](Wan/Wan2.2.md) ✅ |
 | Text-to-image diffusion (prompt → image) | Use [`Wan/Wan2.1.md`](Wan/Wan2.1.md) or [`Wan/Wan2.2.md`](Wan/Wan2.2.md) as the current staged runtime pattern, then replace the model path and endpoint examples as needed |

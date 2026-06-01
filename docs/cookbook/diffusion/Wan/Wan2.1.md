@@ -4,16 +4,11 @@ title: "Wan 2.1 T2V"
 
 # Wan 2.1 Text-to-Video on SGL-JAX
 
-> **Partially validated recipe** — Wan 2.1 14B-Diffusers validated on TPU v6e-4 with sglang-jax 0.1.0: §3.1 basic-usage smoke path (480*832 / 41 frames / default 50 steps, ~4 min wall-clock). Wan models do not have a numeric `evalscope` accuracy benchmark or a `bench_serving` driver — §4 is intentionally narrative. The 1.3B variant remains Starter — same launch path, smaller checkpoint, unmeasured.
+> **Validated recipe** — Wan 2.1 14B-Diffusers validated on TPU v6e-4 with sglang-jax 0.1.0: §3.1 basic-usage smoke path (480*832 / 41 frames / default 50 steps, ~4 min wall-clock). Wan models do not have a numeric `evalscope` accuracy benchmark or a `bench_serving` driver — §4 is intentionally narrative.
 
 ## 1. Model Introduction
 
-[**Wan-AI/Wan2.1-T2V**](https://huggingface.co/Wan-AI) is Alibaba's open text-to-video diffusion family. It generates short video clips from a text prompt by running a UMT5 text encoder, a 3D DiT denoiser, and a 3D VAE in sequence. SGL-JAX serves it through the multimodal pipeline (`--multimodal`), exposing the `POST /api/v1/videos/generation` endpoint.
-
-**Variants**:
-
-- [**Wan-AI/Wan2.1-T2V-1.3B-Diffusers**](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) - 1.3B; comfortable single-host fit on v6e-4.
-- [**Wan-AI/Wan2.1-T2V-14B-Diffusers**](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers) - 14B; current starter path runs on one v6e-4 host with `--tp-size 2`.
+[**Wan-AI/Wan2.1-T2V-14B-Diffusers**](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers) is Alibaba's 14B open text-to-video diffusion model. It generates short video clips from a text prompt by running a UMT5 text encoder, a 3D DiT denoiser, and a 3D VAE in sequence. SGL-JAX serves it through the multimodal pipeline (`--multimodal`), exposing the `POST /api/v1/videos/generation` endpoint. The current starter path runs on one v6e-4 host with `--tp-size 2`.
 
 **Architectural notes**:
 
@@ -35,7 +30,7 @@ title: "Wan 2.1 T2V"
 
 | Tier | Model | TPU | Topology | `--tp-size` | Notes |
 |---|---|---|---|---|---|
-| Starter target | Wan 2.1 1.3B / 14B | v6e-4 | 2x2 | 2 | Current built-in staging uses part of the host for text encoding and the rest for video stages |
+| Validated | Wan 2.1 14B | v6e-4 | 2x2 | 2 | Current built-in staging uses part of the host for text encoding and the rest for video stages |
 
 > Wan 2.1 runs through SGL-JAX's built-in staged multimodal runtime. Use the `--tp-size` shown for this model; moving to a larger TPU host or slice does not automatically make every stage use more devices.
 
@@ -72,7 +67,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
   --host 0.0.0.0 --port 30000
 ```
 
-Swap `--model-path` to `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` for the smaller Wan 2.1 variant. Do not reuse this command for Wan 2.2 because its built-in stage layout and `--tp-size` are different.
+Swap to a different Wan release at your own risk; Wan 2.2 has a different built-in stage layout and `--tp-size`.
 
 VAE tiling is enabled by default in the multimodal server (`vae_tiling=True` in `MultimodalServerArgs`) and there is no `--no-vae-tiling` flag to disable it today.
 

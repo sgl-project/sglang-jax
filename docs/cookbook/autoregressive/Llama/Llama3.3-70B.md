@@ -10,7 +10,7 @@ title: "Llama 3.3 70B"
 
 [**meta-llama/Llama-3.3-70B-Instruct**](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct) is Meta's 70B dense decoder from the Llama 3.3 release — multi-host serving required at BF16.
 
-For the 8B size (single host + Phi-3 / InternLM3 alias support) see [`Llama3.1.md`](Llama3.1.md). For Llama 4 see the upstream sgl-cookbook (`Llama/Llama4.md`).
+For the 8B size (single-host) see [`Llama3.1.md`](Llama3.1.md). For Llama 4 see the upstream sgl-cookbook (`Llama/Llama4.md`).
 
 **Key Features**:
 

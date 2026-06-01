@@ -4,7 +4,7 @@ title: "Qwen2.5-VL"
 
 # Qwen2.5-VL on SGL-JAX
 
-> **Starter recipe** — derived from the HuggingFace model card and the SGL-JAX multimodal pipeline; not yet empirically validated on TPU. Tune values for your hardware and PR-back tested numbers.
+> **Validated recipe** — empirically validated on TPU v6e-4 with sglang-jax 0.1.0; §4 Benchmark is intentionally omitted (see §4 omitted note + design §3 Validated criteria interpretation).
 
 ## 1. Model Introduction
 
@@ -247,48 +247,9 @@ print(response.choices[0].message.content)
 
 ## 4. Benchmark
 
-> Benchmark data below is a snapshot pinned to the `Tested build` listed in each Test Environment; not refreshed on every release.
-
-### 4.1 Accuracy — MMMU
-
-**Test Environment**
-
-| Field | Value |
-|---|---|
-| Hardware | TPU v6e-4 (single host, 4 chips) |
-| Model | Qwen/Qwen2.5-VL-32B-Instruct (BF16) |
-| Tensor Parallelism | 4 |
-| Tested build | sglang-jax 0.1.0 |
-
-**Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4-qwen25-vl-32b-instruct).
-
-**Benchmark Command**
-
-```bash
-evalscope eval \
-  --model Qwen/Qwen2.5-VL-32B-Instruct \
-  --api-url http://127.0.0.1:30000/v1/chat/completions \
-  --api-key EMPTY \
-  --eval-type service \
-  --datasets mmmu \
-  --eval-batch-size 4
-```
-
-Recommended additional vision datasets: **MMMU Pro Vision**, **DocVQA**, **ChartQA**.
-
-**Test Results** — _Pending. Run and PR back._
-
-### 4.2 Speed
-
-> **Layout B — methodology + command template.** Vision-language speed depends heavily on image resolution and frame count per request, so picking representative workloads is more important than a single number.
-
-**Test Environment** — same as §4.1.
-
-**Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4-qwen25-vl-32b-instruct).
-
-**Benchmark Command** — `bench_serving` does not have native multimodal input support today; use a custom OpenAI-client load test that sends the §3.2 multi-image / video patterns at varying concurrency. PR back full TTFT / ITL / output tok/s numbers along with the image resolution and prompt template used.
-
-**Test Results** — _Pending._
+> Benchmark section is intentionally omitted — Qwen2.5-VL is a Starter recipe (banner). All §4.1 Accuracy / §4.2 Speed cells are pending real PR-back measurements. When you run a numbered MMMU / MMMU Pro Vision / DocVQA / ChartQA eval against the model on TPU, file a PR adding the §4 block back with the actual numbers and upgrade the banner to Partially validated or Validated. For the canonical four-part §4 form (Test Environment / Deployment Command / Benchmark Command / Test Results) see any Validated recipe in [`../index.md`](../index.md).
+>
+> Note: `bench_serving` does not have native multimodal input support today, so §4.2 Speed needs a custom OpenAI-client load test driving the §3.2 multi-image / video patterns; PR back full TTFT / ITL / output tok/s along with the image resolution and prompt template used.
 
 ## 5. Troubleshooting
 

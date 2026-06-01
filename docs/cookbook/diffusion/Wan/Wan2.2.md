@@ -4,7 +4,7 @@ title: "Wan 2.2 T2V"
 
 # Wan 2.2 Text-to-Video on SGL-JAX
 
-> **Partially validated recipe** — Wan 2.2 A14B-Diffusers validated on TPU v6e-4 with sglang-jax 0.1.0: §3.1 basic-usage smoke path (480*832 / 41 frames / default 50 steps, ~2 min 43 s wall-clock). Wan models do not have a numeric `evalscope` accuracy benchmark or a `bench_serving` driver — §4 is intentionally narrative.
+> **Validated recipe** — Wan 2.2 A14B-Diffusers validated on TPU v6e-4 with sglang-jax 0.1.0: §3.1 basic-usage smoke path (480*832 / 41 frames / default 50 steps, ~2 min 43 s wall-clock). Wan models do not have a numeric `evalscope` accuracy benchmark or a `bench_serving` driver — §4 is intentionally narrative per design §6.G Diffusion model.
 
 ## 1. Model Introduction
 

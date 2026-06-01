@@ -4,7 +4,7 @@ title: "MiMo-V2-Flash"
 
 # MiMo-V2-Flash on SGL-JAX
 
-> **Partially validated recipe** — TPU v7x-8 configuration sweep and TPU v6e-16 smoke benchmark results are available. The full workload matrix and current pinned accuracy rerun are still pending.
+> **Validated recipe** — TPU v7x-8 single-workload configuration sweep (4-cell backend × prefill × SWA × mem) + TPU v6e-16 multi-host smoke benchmark + GSM8K 0.975 (200 examples, thinking-on) on sglang-jax 0.1.0; see §4 for measured numbers.
 
 ## 1. Model Introduction
 

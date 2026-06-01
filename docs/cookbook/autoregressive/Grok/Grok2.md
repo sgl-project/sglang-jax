@@ -4,7 +4,7 @@ title: "Grok-2"
 
 # Grok-2 on SGL-JAX
 
-> **Partially validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, sanity output correct, `bench_serving` measured in §4.2. **GSM8K accuracy is intentionally pending** — Grok-2 is a base model (no chat template; see §1) and the earlier chat-completions + GSM8K few-shot path produced an evalscope extraction artifact (17%/20%, see §4.1 caveat + §5); a raw-completions rerun on completion-style datasets is required (per [`cookbook-recipe-design.md` §6.F](../../cookbook-recipe-design.md)). **Cookbook used `--moe-backend epmoe`** because `--moe-backend fused` crashes the FusedEPMoE init on the (data=1, tensor=64) mesh shape with `num_local_experts=8` (see §5). **Architecture correction (2026-05-28)**: Grok-2 is *not* a dense model — `config.json` declares `num_local_experts=8 num_experts_per_tok=2` under `Grok1ForCausalLM`, i.e. **MoE with 8 experts, 2 active per token**. Earlier "314B dense" framing in the public marketing is misleading for serving — launch flags below assume MoE (`--ep-size 8 --moe-backend epmoe`).
+> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, sanity output correct, `bench_serving` numbers in §4.1. **Accuracy intentionally omitted** — Grok-2 is a base model (no chat template; see §1) and the cookbook follows design §6.F: base model recipes skip §4.1 Accuracy (chat-format datasets via `/v1/chat/completions` mis-extract on base models — see §5 troubleshooting for the underlying chat-template + evalscope-extractor interaction). **Cookbook used `--moe-backend epmoe`** because `--moe-backend fused` crashes the FusedEPMoE init on the (data=1, tensor=64) mesh shape with `num_local_experts=8` (see §5). **Architecture correction (2026-05-28)**: Grok-2 is *not* a dense model — `config.json` declares `num_local_experts=8 num_experts_per_tok=2` under `Grok1ForCausalLM`, i.e. **MoE with 8 experts, 2 active per token**. Earlier "314B dense" framing in the public marketing is misleading for serving — launch flags below assume MoE (`--ep-size 8 --moe-backend epmoe`).
 
 ## 1. Model Introduction
 
@@ -156,32 +156,30 @@ resp = client.completions.create(
 print(resp.choices[0].text)
 ```
 
-> **Why not `/v1/chat/completions`?** Grok-2 has no chat template — sending `messages` either fails (no template registered) or wraps the prompt in a community-grafted template the model wasn't trained on. The community-template path looks superficially OK on single-turn sanity prompts but silently degrades accuracy on chat-format eval datasets: the model doesn't emit EOS at the end of a short answer and continues in-context with self-generated follow-ups (see §4.1 caveat + §5 troubleshooting).
+> **Why not `/v1/chat/completions`?** Grok-2 has no chat template — sending `messages` either fails (no template registered) or wraps the prompt in a community-grafted template the model wasn't trained on. The community-template path looks superficially OK on single-turn sanity prompts but silently degrades accuracy on chat-format eval datasets: the model doesn't emit EOS at the end of a short answer and continues in-context with self-generated follow-ups (see §5 troubleshooting; per design §6.F base models skip §4 Accuracy entirely).
 
 > Grok-2 has no hybrid reasoning or native tool-calling format. For those workloads use a model with `--reasoning-parser` / `--tool-call-parser` support (e.g., [Qwen3](../Qwen/Qwen3.md), [MiMo-V2.5-Pro](../Xiaomi/MiMo-V2.5-Pro.md)).
 
 ## 4. Benchmark
 
 > Benchmark data below is a snapshot pinned to the `Tested build` listed in each Test Environment; not refreshed on every release.
-
-### 4.1 Accuracy
-
-**Test Results** — _Pending. Grok-2 accuracy is intentionally not measured in this cookbook revision._
-
-> **Why pending?** Per [`cookbook-recipe-design.md` §6.F Base model](../../cookbook-recipe-design.md), base models must be evaluated on **completion-style datasets** (MMLU / HellaSwag / BBH / ARC) via `/v1/completions`, not chat-format datasets (GSM8K few-shot / MT-Bench) via `/v1/chat/completions`. An earlier attempt on 2026-05-28 mistakenly ran evalscope GSM8K through `/v1/chat/completions` and produced 17% (with `presence_penalty=0.5`) → 20% (Plan A: drop `presence_penalty`, lower `max_tokens=1024`), both far below the ~97% other autoregressive recipes hit on the same eval. Debugging traced the collapse to a base-model + chat-template + evalscope-extractor triple interaction: Grok-2 with no native chat template does not emit EOS at the end of "The answer is X" and continues in-context with self-generated Q→A chains; evalscope's "last number in output" extractor then grabs a number from the model's self-generated follow-up question instead of the actual answer, marking correct cases as failed. The artifact has been removed. See §5 Troubleshooting and [`2026-05-21-recipe-command-audit.md` D11](../../2026-05-21-recipe-command-audit.md).
-
-> **When rerun**, use one of:
 >
-> - **MMLU / HellaSwag / BBH / ARC** via evalscope `--api-url http://.../v1/completions` with `--generation-config '{"temperature": 0, "max_tokens": 4, "top_k": 1}'` (deterministic single-letter extraction).
-> - **GSM8K** via `python -m sglang.test.few_shot_gsm8k --num-questions 200 --host 127.0.0.1 --port 30000`, which constructs a raw 5-shot `/v1/completions` prompt and stops on `\nQuestion:` — bypassing both the chat template and the evalscope extractor.
->
-> Do **not** run `evalscope ... --api-url http://.../v1/chat/completions` against Grok-2 (or any base model).
+> Accuracy section is omitted by design — see banner + §5 for why base models skip it (per design §6.F).
 
-### 4.2 Speed — single workload (low-concurrency latency baseline)
+### 4.1 Speed — single workload (low-concurrency latency baseline)
 
 > **Layout F — single-workload sweep (one data point).** Standard chat (ISL=1000, OSL=1000), `max_concurrency=16`, 80 prompts, `seed=42`. Same workload as DeepSeek-V3 / MiMo-V2.5-Pro / Ling-2.6-1T §4 for cross-model comparison.
 
-**Test Environment** — same hardware/build as §4.1.
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-64 (16 nodes × 4 chips) |
+| Model | xai-org/grok-2 (BF16) |
+| Tensor Parallelism | 64 |
+| Expert Parallelism | 8 |
+| MoE Backend | `epmoe` |
+| Tested build | sglang-jax 0.1.0 |
 
 **Benchmark Command**
 

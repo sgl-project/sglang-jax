@@ -22,7 +22,7 @@ End-to-end serving recipes for autoregressive models on SGL-JAX, organized by ve
 
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
-| 🧪 | DeepSeek-V2 / V2-Lite | [`DeepSeek/DeepSeek-V2.md`](DeepSeek/DeepSeek-V2.md) | v6e-4 (Lite) / v6e-32 (V2) | MoE + MLA |
+| ✅ | DeepSeek-V2-Lite | [`DeepSeek/DeepSeek-V2.md`](DeepSeek/DeepSeek-V2.md) | v6e-4 | MoE + MLA |
 | ✅ | DeepSeek-V3 | [`DeepSeek/DeepSeek-V3.md`](DeepSeek/DeepSeek-V3.md) | v6e-64 / v7x-16 | MoE + MLA |
 | ✅ | DeepSeek-R1 | [`DeepSeek/DeepSeek-R1.md`](DeepSeek/DeepSeek-R1.md) | v6e-64 / v7x-16 | MoE + MLA + reasoning (`deepseek-r1`) |
 
@@ -30,31 +30,31 @@ End-to-end serving recipes for autoregressive models on SGL-JAX, organized by ve
 
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
-| 🧪 | GLM-4.5 / GLM-4.5-Air | [`GLM/GLM-4.5.md`](GLM/GLM-4.5.md) | v6e-32 / v6e-64 | MoE + reasoning/tool (`glm45`) |
+| 🧪 | GLM-4.5-Air (106B) | [`GLM/GLM-4.5.md`](GLM/GLM-4.5.md) | v6e-32 | MoE + reasoning/tool (`glm45`) |
 
 ### Google — `Google/`
 
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
-| 🧪 | Gemma 2 (9B / 27B) | [`Google/Gemma2.md`](Google/Gemma2.md) | v6e-4 | dense (hybrid attn) |
+| ✅ | Gemma 2 27B-it | [`Google/Gemma2.md`](Google/Gemma2.md) | v6e-4 | dense (hybrid attn) |
 
 ### Grok — `Grok/`
 
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
-| 🧪 | Grok-2 | [`Grok/Grok2.md`](Grok/Grok2.md) | v6e-32 | dense |
+| ✅ | Grok-2 (base) | [`Grok/Grok2.md`](Grok/Grok2.md) | v6e-32 | MoE (8 experts, 2 active) |
 
 ### InclusionAI — `InclusionAI/`
 
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
-| ✅ | Ling 2.6 (1T / flash) | [`InclusionAI/Ling-2.6.md`](InclusionAI/Ling-2.6.md) | v6e-64 / v7x-16 | MoE + linear attn |
+| ✅ | Ling 2.6-1T | [`InclusionAI/Ling-2.6.md`](InclusionAI/Ling-2.6.md) | v6e-64 | MoE + linear attn |
 
 ### Llama — `Llama/`
 
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
-| ✅ | Llama 3.1 8B (+ Phi-3 / InternLM3 aliases) | [`Llama/Llama3.1.md`](Llama/Llama3.1.md) | v6e-4 | dense |
+| ✅ | Llama 3.1 8B-Instruct | [`Llama/Llama3.1.md`](Llama/Llama3.1.md) | v6e-4 | dense |
 | ✅ | Llama 3.3 70B | [`Llama/Llama3.3-70B.md`](Llama/Llama3.3-70B.md) | v6e-32 | dense |
 
 ### Moonshotai — `Moonshotai/`
@@ -68,18 +68,18 @@ End-to-end serving recipes for autoregressive models on SGL-JAX, organized by ve
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
 | ✅ | Qwen-7B-Chat | [`Qwen/Qwen.md`](Qwen/Qwen.md) | v6e-4 | dense |
-| 🧪 | Qwen3-8B / Qwen3-32B | [`Qwen/Qwen3.md`](Qwen/Qwen3.md) | v6e-4 | dense + reasoning (`qwen3`) + tool (`qwen25`) |
-| 🧪 | Qwen3-MoE (30B-A3B / 235B-A22B) | [`Qwen/Qwen3-MoE.md`](Qwen/Qwen3-MoE.md) | v6e-16 / v6e-64 | MoE + reasoning (`qwen3`) + tool (`qwen25`) |
-| 🚧 | Qwen2.5-VL (3B / 7B / 32B / 72B) | [`Qwen/Qwen2.5-VL.md`](Qwen/Qwen2.5-VL.md) | v6e-4 for 3B/7B/32B; 72B pending | vision-language autoregressive decoder |
+| ✅ | Qwen3-8B / Qwen3-32B | [`Qwen/Qwen3.md`](Qwen/Qwen3.md) | v6e-4 | dense + reasoning (`qwen3`) + tool (`qwen25`) |
+| 🧪 | Qwen3-30B-A3B | [`Qwen/Qwen3-MoE.md`](Qwen/Qwen3-MoE.md) | v6e-16 | MoE + reasoning (`qwen3`) + tool (`qwen25`) |
+| ✅ | Qwen2.5-VL (3B / 7B / 32B / 72B) | [`Qwen/Qwen2.5-VL.md`](Qwen/Qwen2.5-VL.md) | v6e-4 for 3B/7B/32B; 72B pending | vision-language autoregressive decoder |
 | 📝 | Qwen2 / Qwen2-MoE | _no recipe — same family runtime path_ | — | dense / MoE |
 
 ### Xiaomi — `Xiaomi/`
 
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
-| 🧪 | MiMo-V2-Flash | [`Xiaomi/MiMo-V2-Flash.md`](Xiaomi/MiMo-V2-Flash.md) | v7x-8 or v6e-16 | MoE + reasoning/tool (`mimo`) |
+| ✅ | MiMo-V2-Flash | [`Xiaomi/MiMo-V2-Flash.md`](Xiaomi/MiMo-V2-Flash.md) | v7x-8 or v6e-16 | MoE + reasoning/tool (`mimo`) |
 | ✅ | MiMo-V2.5-Pro | [`Xiaomi/MiMo-V2.5-Pro.md`](Xiaomi/MiMo-V2.5-Pro.md) | v6e-64 (v7x-16 alternative) | MoE + reasoning/tool (`mimo`) |
-| 🧪 | MiMo-7B | [`Xiaomi/MiMo-7B.md`](Xiaomi/MiMo-7B.md) | v6e-4 | dense + reasoning/tool (`mimo`) |
+| ✅ | MiMo-7B-RL | [`Xiaomi/MiMo-7B.md`](Xiaomi/MiMo-7B.md) | v6e-4 | dense + reasoning/tool (`mimo`) |
 
 > Upgrade path: 🚧 → 🧪 requires real `evalscope` (accuracy) or `bench_serving` (throughput) output for at least one variant / hardware path. 🧪 → ✅ requires the recipe's claimed primary path to have complete **Test Environment → Deployment Command → Benchmark Command → Test Results** evidence without unresolved required cells. See [`Xiaomi/MiMo-V2-Flash.md` §4](Xiaomi/MiMo-V2-Flash.md#4-benchmark) for the canonical four-section form.
 
@@ -87,8 +87,8 @@ End-to-end serving recipes for autoregressive models on SGL-JAX, organized by ve
 
 A model that generates text one token at a time, conditioning on its own previous outputs. Includes:
 
-- **Dense LLMs** — Qwen / Qwen3 / Llama / Gemma 2 / MiMo-7B / Grok-2.
-- **MoE LLMs** — Qwen3-MoE / DeepSeek V2/V3/R1 / GLM-4.5 / Ling 2.6 / MiMo-V2-Flash / MiMo-V2.5-Pro / Kimi-Linear.
+- **Dense LLMs** — Qwen / Qwen3 / Llama / Gemma 2 / MiMo-7B.
+- **MoE LLMs** — Qwen3-MoE / DeepSeek V2/V3/R1 / GLM-4.5 / Ling 2.6 / MiMo-V2-Flash / MiMo-V2.5-Pro / Kimi-Linear / Grok-2 (base).
 - **Vision-language decoders** — Qwen2.5-VL ingests image / video inputs, but the answer is still produced by an autoregressive generation stage.
 
 Diffusion image/video generation models live in [`../diffusion/`](../diffusion/index.md).
@@ -98,11 +98,12 @@ Diffusion image/video generation models live in [`../diffusion/`](../diffusion/i
 | Goal | Clone from |
 |---|---|
 | Single-host dense model | [`Qwen/Qwen.md`](Qwen/Qwen.md) ✅ or [`Llama/Llama3.1.md`](Llama/Llama3.1.md) ✅ |
-| Dense model with benchmark comparison | [`Qwen/Qwen3.md`](Qwen/Qwen3.md) 🧪 |
-| Single-host MoE with backend choice | [`Xiaomi/MiMo-V2-Flash.md`](Xiaomi/MiMo-V2-Flash.md) 🧪 |
-| Vision-language chat | [`Qwen/Qwen2.5-VL.md`](Qwen/Qwen2.5-VL.md) 🚧 |
+| Dense model with benchmark comparison | [`Qwen/Qwen3.md`](Qwen/Qwen3.md) ✅ |
+| Single-host MoE with backend choice | [`Xiaomi/MiMo-V2-Flash.md`](Xiaomi/MiMo-V2-Flash.md) ✅ |
+| Vision-language chat | [`Qwen/Qwen2.5-VL.md`](Qwen/Qwen2.5-VL.md) ✅ |
 | Large multi-node MoE with GKE manifest | [`Xiaomi/MiMo-V2.5-Pro.md`](Xiaomi/MiMo-V2.5-Pro.md) ✅ |
-| Multi-node dense | [`Grok/Grok2.md`](Grok/Grok2.md) 🧪 (+ [`../deployment/gke-indexed-job.md`](../deployment/gke-indexed-job.md)) |
+| Multi-node dense | [`Llama/Llama3.3-70B.md`](Llama/Llama3.3-70B.md) ✅ (+ [`../deployment/gke-indexed-job.md`](../deployment/gke-indexed-job.md)) |
+| Base model (no chat template, `/v1/completions` flow) | [`Grok/Grok2.md`](Grok/Grok2.md) ✅ |
 | Linear-attention model with recurrent state | [`Moonshotai/Kimi-Linear.md`](Moonshotai/Kimi-Linear.md) ✅ or [`InclusionAI/Ling-2.6.md`](InclusionAI/Ling-2.6.md) ✅ |
 | Reasoning model (RL-tuned, `<think>` blocks) | [`DeepSeek/DeepSeek-R1.md`](DeepSeek/DeepSeek-R1.md) ✅ |
 

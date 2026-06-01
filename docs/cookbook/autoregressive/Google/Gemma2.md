@@ -4,30 +4,23 @@ title: "Gemma 2"
 
 # Gemma 2 on SGL-JAX
 
-> **Partially validated recipe** — Gemma 2 27B-it validated on TPU v6e-4 with sglang-jax 0.1.0; see §4 for measured numbers. The 9B / 9B-it sizes remain Starter — same launch path with the same flags, unmeasured.
+> **Validated recipe** — Gemma 2 27B-it validated on TPU v6e-4 with sglang-jax 0.1.0; see §4 for measured numbers.
 
 ## 1. Model Introduction
 
-[**google/gemma-2**](https://huggingface.co/google) is Google's second-generation open Gemma series — dense decoder models with **hybrid attention** (alternating global 8K and sliding-window 4K layers) and soft-cap attention/logits. Both released sizes (9B and 27B) fit on a single TPU v6e-4 host.
-
-**Variants** (pick by size / fine-tune):
-
-- [**google/gemma-2-9b**](https://huggingface.co/google/gemma-2-9b) — base 9B pre-trained.
-- [**google/gemma-2-9b-it**](https://huggingface.co/google/gemma-2-9b-it) — 9B instruction-tuned.
-- [**google/gemma-2-27b**](https://huggingface.co/google/gemma-2-27b) — base 27B pre-trained.
-- [**google/gemma-2-27b-it**](https://huggingface.co/google/gemma-2-27b-it) — 27B instruction-tuned; default chat choice.
+[**google/gemma-2-27b-it**](https://huggingface.co/google/gemma-2-27b-it) is Google's instruction-tuned 27B Gemma 2 — a dense decoder with **hybrid attention** (alternating global 8K and sliding-window 4K layers) and soft-cap attention/logits. Fits on a single TPU v6e-4 host (BF16 ~54 GB).
 
 **Key Features**:
 
-- **Dense decoder, two sizes**: 9B and 27B — both fit on a single TPU v6e-4 host (BF16 ~18 GB / ~54 GB). No multi-host complexity.
+- **Dense decoder, single-host fit**: 27B in BF16 (~54 GB) on a single TPU v6e-4 host. No multi-host complexity.
 - **Hybrid Attention**: Alternating global (8K) and sliding-window (4K) layers — SGL-JAX manages two KV pools (global + sliding), giving stronger long-context behavior than uniform-attention models at the same parameter count.
 - **Soft-cap attention/logits**: Gemma 2's signature stability tweak — caps attention logits and output logits to reduce extreme activations.
-- **Instruction-tuned variants ready for chat**: `9b-it` / `27b-it` are post-trained chat models — non-reasoning, no native tool-call format.
-- **Open weights under Gemma Terms of Use**: see [Gemma model card](https://huggingface.co/google/gemma-2-9b).
+- **Instruction-tuned for chat**: `27b-it` is the post-trained chat model — non-reasoning, no native tool-call format.
+- **Open weights under Gemma Terms of Use**: see [Gemma model card](https://huggingface.co/google/gemma-2-27b-it).
 
 **Recommended Generation Parameters**: `temperature=0.7`, `top_p=0.95`, `top_k=64`, `max_tokens=1024` (Gemma 2 model-card defaults).
 
-**License**: see the [Gemma model card](https://huggingface.co/google/gemma-2-9b) for the authoritative Gemma Terms of Use.
+**License**: see the [Gemma model card](https://huggingface.co/google/gemma-2-27b-it) for the authoritative Gemma Terms of Use.
 
 ## 2. Deployment
 
@@ -35,9 +28,8 @@ title: "Gemma 2"
 
 | Tier | Model | TPU | Topology | Chips | `--tp-size` | Notes |
 |---|---|---|---|---|---|---|
-| Minimum runnable | Gemma 2 9B / 9B-it | v6e-4 | 2x2 | 4 | 4 | BF16 ~18 GB — fits with headroom; default `--mem-fraction-static 0.88` |
-| Minimum runnable | Gemma 2 27B / 27B-it | v6e-4 | 2x2 | 4 | 4 | BF16 ~54 GB — fits with `--mem-fraction-static 0.85` (validated 2026-05-25, ~13.5 GB weights/chip + dual KV pools) |
-| Recommended production (27B) | Gemma 2 27B-it | v6e-8 | 2x4 | 8 | 8 | More HBM headroom so the global + sliding KV pools both have room; raises `--max-running-requests` ceiling |
+| Minimum runnable | Gemma 2 27B-it | v6e-4 | 2x2 | 4 | 4 | BF16 ~54 GB — fits with `--mem-fraction-static 0.85` (validated 2026-05-25, ~13.5 GB weights/chip + dual KV pools) |
+| Recommended production | Gemma 2 27B-it | v6e-8 | 2x4 | 8 | 8 | More HBM headroom so the global + sliding KV pools both have room; raises `--max-running-requests` ceiling |
 
 See [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
@@ -51,23 +43,6 @@ Install per [`../../get_started/install.md`](../../../get_started/install.md) an
 | TPU v7x (Ironwood)              | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
 
 ### 2.3 Launch
-
-#### Single-host (Docker) — TPU v6e-4 (Gemma 2 9B-it)
-
-```bash
-JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
-  --model-path google/gemma-2-9b-it \
-  --trust-remote-code \
-  --tp-size 4 \
-  --device tpu \
-  --dtype bfloat16 \
-  --mem-fraction-static 0.88 \
-  --chunked-prefill-size 2048 \
-  --page-size 128 \
-  --max-running-requests 64 \
-  --skip-server-warmup \
-  --host 0.0.0.0 --port 30000
-```
 
 #### Single-host (Docker) — TPU v6e-4 (Gemma 2 27B-it)
 
@@ -86,17 +61,16 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
   --host 0.0.0.0 --port 30000
 ```
 
-The 27B variant uses a lower `--mem-fraction-static` than 9B to leave room for the dual (global + sliding) KV pools.
+The 27B-it `--mem-fraction-static 0.85` leaves room for the dual (global + sliding) KV pools.
 
 #### Multi-host
 
-Not needed at the 9B / 27B scale — both fit single-host on v6e-4.
+Not needed at the 27B scale — fits single-host on v6e-4.
 
 ### 2.4 Configuration Tips
 
 **Memory Management:**
-- 9B: `--mem-fraction-static 0.88` (TPU default). Raise to `0.9` for higher concurrency on a dedicated host.
-- 27B: `--mem-fraction-static 0.85` validated; ~13.5 GB weights/chip leaves enough HBM for both KV pools at `--max-running-requests 64`. Drop to `0.8` if you raise concurrency further and hit OOM.
+- 27B-it: `--mem-fraction-static 0.85` validated; ~13.5 GB weights/chip leaves enough HBM for both KV pools at `--max-running-requests 64`. Drop to `0.8` if you raise concurrency further and hit OOM.
 
 **Paging / concurrency (mandatory):**
 - `--page-size 128` is required. Without it (default = 1) the scheduler silently caps `Final max_running_requests: 1`, serializing all requests. `--max-running-requests 64` then sets the actual concurrency ceiling.
@@ -126,7 +100,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
 
 resp = client.chat.completions.create(
-    model="google/gemma-2-9b-it",
+    model="google/gemma-2-27b-it",
     messages=[{"role": "user", "content": "Hello, who are you?"}],
     temperature=0.7,
     top_p=0.95,
@@ -222,8 +196,6 @@ Mean ITL (ms):                           14.48
 ==================================================
 ```
 
-For Gemma 2 9B on the same host, expect roughly 2-3x higher output throughput at the same concurrency — PR back the measured block to upgrade.
-
 ## 5. Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -235,6 +207,6 @@ For Gemma 2 9B on the same host, expect roughly 2-3x higher output throughput at
 
 ## Additional Resources
 
-- [Gemma model collection](https://huggingface.co/google)
+- [Gemma 2 27B-it model card](https://huggingface.co/google/gemma-2-27b-it)
 - [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
 - [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues including the SWA pool exhaustion note.
