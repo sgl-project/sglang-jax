@@ -649,6 +649,8 @@ def generate_tune_candidates(
     vmem_headroom=0.95,
     max_configs=48,
     bse=256,
+    use_shared_expert=False,
+    se_inter=0,
     verbose=False,
 ):
     effective_budget = int(vmem_budget * vmem_headroom)
@@ -697,6 +699,10 @@ def generate_tune_candidates(
         )
         if not bts_cands:
             bts_cands = [bt]
+        if use_shared_expert:
+            # in-kernel SE DMAs the full bt-token block into the bts-sized staging
+            # buffer, so it requires bts >= bt.
+            bts_cands = [v for v in bts_cands if v >= bt] or [bt]
 
         for bts_val in bts_cands:
             btc_cands = _aligned_divisors(bts_val, 8)
@@ -704,57 +710,71 @@ def generate_tune_candidates(
                 continue
 
             for bf in bf_list:
+                # Sweep the shared-expert block size bse (<= bf, divides se_inter)
+                # only when SE is on; bse is irrelevant otherwise. Larger bse means
+                # fewer SE blocks -> less per-block SE weight-DMA overhead.
+                if use_shared_expert and se_inter > 0:
+                    bse_cands = sorted(
+                        {
+                            v
+                            for v in [128, 256, 512, 1024, 2048]
+                            if v <= bf and v <= se_inter and se_inter % v == 0
+                        }
+                    ) or [min(bf, se_inter)]
+                else:
+                    bse_cands = [bse]
                 for btc in btc_cands:
-                    bc = FusedMoEBlockConfig(
-                        bt=bt,
-                        bf=bf,
-                        btc=btc,
-                        bse=bse,
-                        bts=bts_val,
-                    )
-                    num_tokens_total = local_num_tokens * ep_size
-                    try:
-                        bc_eff = bc.effective_for(
-                            num_tokens=num_tokens_total,
+                    for bse_val in bse_cands:
+                        bc = FusedMoEBlockConfig(
+                            bt=bt,
+                            bf=bf,
+                            btc=btc,
+                            bse=bse_val,
+                            bts=bts_val,
+                        )
+                        num_tokens_total = local_num_tokens * ep_size
+                        try:
+                            bc_eff = bc.effective_for(
+                                num_tokens=num_tokens_total,
+                                ep_size=ep_size,
+                            )
+                        except ValueError:
+                            continue
+
+                        key = (bc_eff.bt, bc_eff.bf, bc_eff.btc, bc_eff.bts, bc_eff.bse)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+
+                        est = _estimate_vmem_bytes_v2(
+                            bt=bc_eff.bt,
+                            bf=bc_eff.bf,
+                            btc=bc_eff.btc,
+                            bse=bc_eff.bse,
+                            bts=bc_eff.bts,
+                            hidden_size=hidden_size,
+                            intermediate_size=intermediate_size,
+                            num_experts=num_experts,
+                            top_k=top_k,
                             ep_size=ep_size,
+                            num_tokens=num_tokens_total,
+                            use_fp8=use_fp8,
+                            quant_block_k=quant_block_k,
+                            direct_scaled_dot=direct_scaled_dot,
+                            interleave_bt=interleave_bt,
+                            enable_bt_scatter_overlap=enable_bt_scatter_overlap,
+                            verbose=verbose and first_verbose,
                         )
-                    except ValueError:
-                        continue
-
-                    key = (bc_eff.bt, bc_eff.bf, bc_eff.btc, bc_eff.bts)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-
-                    est = _estimate_vmem_bytes_v2(
-                        bt=bc_eff.bt,
-                        bf=bc_eff.bf,
-                        btc=bc_eff.btc,
-                        bse=bc_eff.bse,
-                        bts=bc_eff.bts,
-                        hidden_size=hidden_size,
-                        intermediate_size=intermediate_size,
-                        num_experts=num_experts,
-                        top_k=top_k,
-                        ep_size=ep_size,
-                        num_tokens=num_tokens_total,
-                        use_fp8=use_fp8,
-                        quant_block_k=quant_block_k,
-                        direct_scaled_dot=direct_scaled_dot,
-                        interleave_bt=interleave_bt,
-                        enable_bt_scatter_overlap=enable_bt_scatter_overlap,
-                        verbose=verbose and first_verbose,
-                    )
-                    first_verbose = False
-                    if est > effective_budget:
-                        log(
-                            f"  VMEM skip bt={bc_eff.bt},bf={bc_eff.bf},"
-                            f"btc={bc_eff.btc},bts={bc_eff.bts}: "
-                            f"{est/(1024*1024):.1f}MB > "
-                            f"{effective_budget/(1024*1024):.1f}MB"
-                        )
-                        continue
-                    configs.append(bc)
+                        first_verbose = False
+                        if est > effective_budget:
+                            log(
+                                f"  VMEM skip bt={bc_eff.bt},bf={bc_eff.bf},"
+                                f"btc={bc_eff.btc},bts={bc_eff.bts},bse={bc_eff.bse}: "
+                                f"{est/(1024*1024):.1f}MB > "
+                                f"{effective_budget/(1024*1024):.1f}MB"
+                            )
+                            continue
+                        configs.append(bc)
 
     if len(configs) <= max_configs:
         log(f"  tune: {len(configs)} configs (all pass VMEM filter)")
@@ -765,7 +785,7 @@ def generate_tune_candidates(
         bk = (cfg.bt, cfg.bts or cfg.bt)
         buckets.setdefault(bk, []).append(cfg)
     for bk in buckets:
-        buckets[bk].sort(key=lambda c: (c.bf, c.btc), reverse=True)
+        buckets[bk].sort(key=lambda c: (c.bf, c.bse, c.btc), reverse=True)
 
     selected = []
     selected_keys = set()
@@ -777,7 +797,7 @@ def generate_tune_candidates(
             if not bucket:
                 continue
             cfg = bucket.pop(0)
-            key = (cfg.bt, cfg.bf, cfg.btc, cfg.bts)
+            key = (cfg.bt, cfg.bf, cfg.btc, cfg.bts, cfg.bse)
             if key not in selected_keys:
                 selected_keys.add(key)
                 selected.append(cfg)
@@ -1005,6 +1025,8 @@ for num_tokens in token_candidates:
             interleave_bt=interleave_bt_modes[0],
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
             bse=bse,
+            use_shared_expert=use_shared_expert,
+            se_inter=se_inter,
             verbose=(num_tokens == token_candidates[0]),
         )
         block_configs_to_try = tune_configs
@@ -1087,7 +1109,7 @@ for num_tokens in token_candidates:
         bt, bf, btc, bts = bc.bt, bc.bf, bc.btc, bc.bts
         ffn1_mode_tag = "direct" if direct_ffn1 else ffn1_dequant_mode
         tag = (
-            f"bt={bt},bf={bf},btc={btc},bts={bts},"
+            f"bt={bt},bf={bf},btc={btc},bts={bts},bse={bc.bse},"
             f"xprefetch={xprefetch_mode},w2p={next_w2_priority},"
             f"w2order={w2_fetch_order},w2fp={w2_fetch_priority},"
             f"direct_f1={int(direct_ffn1)},direct_f2={int(direct_ffn2)},"
@@ -1112,7 +1134,7 @@ for num_tokens in token_candidates:
 
         tag_resolved = (
             f"bt={bc_resolved.bt},bf={bc_resolved.bf},"
-            f"btc={bc_resolved.btc},bts={bc_resolved.bts},"
+            f"btc={bc_resolved.btc},bts={bc_resolved.bts},bse={bc_resolved.bse},"
             f"xprefetch={xprefetch_mode},w2p={next_w2_priority},"
             f"w2order={w2_fetch_order},w2fp={w2_fetch_priority},"
             f"direct_f1={int(direct_ffn1)},direct_f2={int(direct_ffn2)},"
