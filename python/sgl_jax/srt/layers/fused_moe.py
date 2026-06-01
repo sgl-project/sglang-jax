@@ -67,6 +67,7 @@ class FusedEPMoE(nnx.Module):
         num_shared_experts: int = 0,
         moe_shared_expert_intermediate_size: int | None = None,
         quantization_config=None,
+        enable_act_quant: bool = False,
         # Profiling / ablation flags (primarily for microbenching).
         disable_a2a: bool = False,
         disable_dynamic_ffn1: bool = False,
@@ -134,6 +135,10 @@ class FusedEPMoE(nnx.Module):
         self.activation_quantized_dtype = (
             quantization_config.get_moe_activation_dtype() if quantization_config else None
         )
+        # Explicit opt-in to in-kernel activation quantization (fp8-token prequant +
+        # fp8xfp8 dots, the −19%/−8% lever). OR'd with the quant-config-derived
+        # signal; only takes effect for fp8-weight models (guarded in __call__).
+        self.enable_act_quant_cfg = enable_act_quant
 
         # Initialize weights.
         self.w1 = nnx.Param(
@@ -579,9 +584,12 @@ class FusedEPMoEV2(FusedEPMoE):
         w2_shared_scale = (
             self.w2_shared_scale.value[:, 0, :] if self.w2_shared_scale is not None else None
         )
-        # In-kernel SE token precision follows activation quantization: fp8 token
-        # (Mode 1) when act-quant is configured, else bf16 token (Mode 2/3).
-        enable_act_quant = self.activation_quantized_dtype is not None
+        # In-kernel act-quant (fp8 token, Mode 1) needs fp8 weights. Honor the
+        # explicit opt-in OR the quant-config signal, then guard on fp8 (w1_scale
+        # present) so bf16 models stay in Mode 2/3 instead of hitting the kernel gate.
+        enable_act_quant = (
+            self.enable_act_quant_cfg or self.activation_quantized_dtype is not None
+        ) and (w1_scale is not None)
 
         if block_config is None:
             block_config = get_tuned_fused_moe_v2_block_config(
