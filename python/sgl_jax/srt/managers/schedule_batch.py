@@ -1961,7 +1961,21 @@ class ScheduleBatch:
             total_cache_loc_size = cache_loc_paddings[bs_index]
 
         per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
-        cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
+        # Reuse a persistent host buffer instead of allocating a fresh
+        # np.zeros every step. A fresh allocation per step pays malloc/munmap
+        # churn plus first-touch page faults on every write; a resident buffer
+        # only needs a memset of the used prefix. Reuse is safe because the H2D
+        # copy (ForwardBatch.init_new -> device_array) runs synchronously on
+        # this (scheduler) thread before the next step rebuilds the buffer, and
+        # the resulting device array does not alias the host buffer afterwards.
+        # Sized to the largest padding bucket so every step's prefix fits.
+        max_cache_loc_size = cache_loc_paddings[-1]
+        cache_loc_buf = getattr(self.req_to_token_pool, "_cache_loc_host_buf", None)
+        if cache_loc_buf is None or cache_loc_buf.shape[0] < max_cache_loc_size:
+            cache_loc_buf = np.zeros(max_cache_loc_size, dtype=np.int32)
+            self.req_to_token_pool._cache_loc_host_buf = cache_loc_buf
+        cache_loc_cpu = cache_loc_buf[:total_cache_loc_size]
+        cache_loc_cpu.fill(0)
 
         offset_bs = 0
         req_to_token = self.req_to_token_pool.req_to_token
