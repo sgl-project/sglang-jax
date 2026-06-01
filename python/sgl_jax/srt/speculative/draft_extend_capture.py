@@ -132,12 +132,19 @@ def maybe_capture_kv_after(call_id, workers, cache_loc_np, page_size):
     out_dir = Path(CAPTURE_DIR)
     path = out_dir / f"draft_extend_{call_id}_kv_after.npz"
 
+    if len(cache_loc_np) == 0 or int(cache_loc_np.min()) < 0:
+        logger.info("[CAPTURE] Skipping KV-after #%d: invalid cache_loc", call_id)
+        return
     page_indices_device = cache_loc_np[::page_size] // page_size
     data = {}
-    for i, w in enumerate(workers):
-        mr = w.model_runner
-        kv_buf = mr.memory_pools.token_to_kv_pool.kv_buffer[0]
-        data[f"kv_layer{i}_after"] = _to_np(kv_buf[page_indices_device])
+    try:
+        for i, w in enumerate(workers):
+            mr = w.model_runner
+            kv_buf = mr.memory_pools.token_to_kv_pool.kv_buffer[0]
+            data[f"kv_layer{i}_after"] = _to_np(kv_buf[page_indices_device])
+    except Exception as e:
+        logger.warning("[CAPTURE] Skipping KV-after #%d: %s", call_id, e)
+        return
 
     _savez_via_tmp(path, data)
     logger.info("[CAPTURE] Saved KV-after to %s", path)

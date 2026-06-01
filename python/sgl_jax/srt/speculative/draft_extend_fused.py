@@ -31,6 +31,7 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
 
     @partial(
         jax.jit,
+        donate_argnames=["all_memory_pools"],
         static_argnames=["model_state_def", "num_layers"],
     )
     def fused_draft_extend(
