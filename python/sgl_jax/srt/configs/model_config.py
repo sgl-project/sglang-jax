@@ -265,7 +265,9 @@ class ModelConfig:
 
             if quant_method == "fp8":
                 logger.info("Auto-detected FP8 model. Creating QuantizationConfig for static fp8.")
-                ignored_layers = hf_quant_config.get("ignored_layers")
+                ignored_layers = hf_quant_config.get("ignored_layers") or hf_quant_config.get(
+                    "modules_to_not_convert"
+                )
                 weight_block_size = hf_quant_config.get("weight_block_size")
                 if isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2:
                     weight_block_size = (int(weight_block_size[0]), int(weight_block_size[1]))

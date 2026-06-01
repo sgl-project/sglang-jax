@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Sequence
 from functools import partial
 
@@ -14,6 +15,8 @@ from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_loc
 from sgl_jax.srt.utils.parallel_utils import prepare_scattered_spec_if_needed
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
+
+logger = logging.getLogger(__name__)
 
 
 class LinearBase(nnx.Module):
@@ -276,19 +279,13 @@ class QuantizedLinear(nnx.Module):
             tuple(weight_block_size) if weight_block_size is not None else None
         )
 
+        kernel_axes = linear.kernel_axes or (None, None)
         if is_static_input:
             # Static checkpoint already stores pre-quantized weights and scales.
             weight = linear.weight.value
 
             if isinstance(weight, jax.ShapeDtypeStruct):
                 in_features, out_features = map(int, weight.shape)
-                kernel_axes = linear.kernel_axes or (None, None)
-                wq_sharding = NamedSharding(linear.mesh, P(kernel_axes[1], kernel_axes[0]))
-                weight_q = jax.ShapeDtypeStruct(
-                    shape=(out_features, in_features),
-                    dtype=weight_dtype,
-                    sharding=wq_sharding,
-                )
 
                 if (
                     effective_weight_block_size is not None
@@ -298,6 +295,26 @@ class QuantizedLinear(nnx.Module):
                         effective_weight_block_size[1]
                     )
                     in_blocks = (in_features + block_k - 1) // block_k
+                    # Row-parallel block-wise layers shard the reduce axis, so
+                    # the in_blocks dimension of the [in_blocks, 1, n_out]
+                    # scale must also tile across TP. When it doesn't (e.g.
+                    # GLM-5.1 dense/shared down_proj: 96/16 blocks vs TP=64),
+                    # fall back to a replicated reduce axis for this layer
+                    # only. The original LinearBase keeps row-parallel.
+                    input_axis = kernel_axes[0]
+                    tp = linear.mesh.shape.get(input_axis, 1) if input_axis else 1
+                    if input_axis is not None and in_blocks % tp != 0:
+                        logger.warning(
+                            "QuantizedLinear %s [in=%d, out=%d]: in_blocks=%d not "
+                            "divisible by TP=%d on axis %r; replicating reduce axis",
+                            linear.name,
+                            in_features,
+                            out_features,
+                            in_blocks,
+                            tp,
+                            input_axis,
+                        )
+                        kernel_axes = (None, kernel_axes[1])
                     # Pre-expanded kernel-ready layout: [in_blocks, 1, n_out].
                     scale_sharding = NamedSharding(
                         linear.mesh, P(kernel_axes[0], None, kernel_axes[1])
@@ -312,6 +329,12 @@ class QuantizedLinear(nnx.Module):
                     weight_scale = jax.ShapeDtypeStruct(
                         shape=(out_features,), dtype=jnp.float32, sharding=scale_sharding
                     )
+                wq_sharding = NamedSharding(linear.mesh, P(kernel_axes[1], kernel_axes[0]))
+                weight_q = jax.ShapeDtypeStruct(
+                    shape=(out_features, in_features),
+                    dtype=weight_dtype,
+                    sharding=wq_sharding,
+                )
                 bias = linear.bias.value if linear.bias is not None else None
             else:
                 if weight.dtype != weight_dtype:
@@ -375,7 +398,7 @@ class QuantizedLinear(nnx.Module):
             bias=bias,
             activation_dtype=activation_dtype,
             mesh=linear.mesh,
-            kernel_axes=linear.kernel_axes,
+            kernel_axes=kernel_axes,
             skip_bias_add=linear.skip_bias_add,
             params_dtype=linear.params_dtype,
             weight_block_size=effective_weight_block_size,
