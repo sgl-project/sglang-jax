@@ -16,7 +16,6 @@ from sgl_jax.srt.disaggregation.common.core import (
     TerminalTransferRecord,
 )
 
-
 # ------------------------------------------------------------------
 # KVPoll state machine (from test_kv_manager_state)
 # ------------------------------------------------------------------

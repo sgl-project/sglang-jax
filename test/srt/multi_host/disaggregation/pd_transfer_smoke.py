@@ -22,7 +22,6 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
-
 from pd_transfer_matrix import (
     _accept_one,
     _arr_host_bytes,
@@ -85,9 +84,7 @@ def _prefill(args: argparse.Namespace) -> int:
         ctl.sendall(
             f"{args.my_host} {args.transfer_port} {args.side_channel_port} {int(args.use_d2h_staging)}\n".encode()
         )
-        payload_sharding = (
-            _replicated_sharding() if args.use_d2h_staging else _device_sharding()
-        )
+        payload_sharding = _replicated_sharding() if args.use_d2h_staging else _device_sharding()
         host_pool = _make_host_pool() if args.use_d2h_staging else None
         mgr = JaxTransferKVManager(wrapper, notifier, host_pool=host_pool)
         sender = mgr.create_sender(REQ_ID)
@@ -98,9 +95,7 @@ def _prefill(args: argparse.Namespace) -> int:
         )
         payload_flat.block_until_ready()
         payload = (
-            payload_flat.reshape((NUM_ELEMS, 1, 1, 1))
-            if args.use_d2h_staging
-            else payload_flat
+            payload_flat.reshape((NUM_ELEMS, 1, 1, 1)) if args.use_d2h_staging else payload_flat
         )
         sender.attach_payload({"kv": payload}, use_d2h_staging=args.use_d2h_staging)
         sender.send()
@@ -110,10 +105,7 @@ def _prefill(args: argparse.Namespace) -> int:
             return 1
         if _wait_for_terminal(sender, timeout_s=30.0) != KVPoll.SUCCESS:
             return 1
-        if (
-            host_pool is not None
-            and host_pool.available_size() != host_pool.total_size()
-        ):
+        if host_pool is not None and host_pool.available_size() != host_pool.total_size():
             print("[P] host pool leak detected", flush=True)
             return 1
         print("[P] PASS sender reached SUCCESS and cleanup completed", flush=True)

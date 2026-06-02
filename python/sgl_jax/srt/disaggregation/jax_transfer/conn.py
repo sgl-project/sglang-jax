@@ -39,7 +39,6 @@ from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
 from sgl_jax.srt.disaggregation.jax_transfer.wrapper import JaxTransferWrapper
 from sgl_jax.srt.mem_cache.host_kv_pool import HostKVPool, StagedData
 
-
 __all__ = [
     "JaxTransferKVManager",
     "JaxTransferKVReceiver",
@@ -152,9 +151,7 @@ class JaxTransferKVManager(CommonKVManager):
             raise ValueError("payload must be a non-empty dict")
         for name in payload:
             if ":" in name:
-                raise ValueError(
-                    f"entry name {name!r} must not contain ':'"
-                )
+                raise ValueError(f"entry name {name!r} must not contain ':'")
 
         sub_uuids: list[str] = []
 
@@ -185,9 +182,7 @@ class JaxTransferKVManager(CommonKVManager):
                 for _bid in buffer_ids:
                     pool.put_buffer(_bid)
 
-            return TransferStatus(
-                uuid=uuid, sub_uuids=tuple(sub_uuids), on_done=_on_done
-            )
+            return TransferStatus(uuid=uuid, sub_uuids=tuple(sub_uuids), on_done=_on_done)
 
         # path B: direct from HBM
         try:
@@ -199,9 +194,7 @@ class JaxTransferKVManager(CommonKVManager):
             for sub_uuid in sub_uuids:
                 self._wrapper.release(sub_uuid)
             raise
-        return TransferStatus(
-            uuid=uuid, sub_uuids=tuple(sub_uuids), on_done=lambda: None
-        )
+        return TransferStatus(uuid=uuid, sub_uuids=tuple(sub_uuids), on_done=lambda: None)
 
     # ------------------------------------------------------------------
     # ABC — factory methods
@@ -260,9 +253,7 @@ class JaxTransferKVSender(KVSender, StateHolder):
             self._transfer_id = transfer_id or self._req_id
             self._transition_to(KVPoll.WAITING_FOR_INPUT)
 
-    def attach_payload(
-        self, payload: dict[str, jax.Array], *, use_d2h_staging: bool
-    ) -> None:
+    def attach_payload(self, payload: dict[str, jax.Array], *, use_d2h_staging: bool) -> None:
         if self._payload is not None:
             raise RuntimeError(f"sender {self._req_id!r} payload already attached")
         if not payload:
@@ -313,8 +304,7 @@ class JaxTransferKVSender(KVSender, StateHolder):
         record = self._mgr.get_terminal_record(self._req_id, role="prefill")
         if record is None:
             raise RuntimeError(
-                f"Prefill transfer has no terminal record for "
-                f"req_id={self._req_id!r}"
+                f"Prefill transfer has no terminal record for " f"req_id={self._req_id!r}"
             )
         if record.state != KVPoll.FAILED:
             raise RuntimeError(
@@ -322,8 +312,7 @@ class JaxTransferKVSender(KVSender, StateHolder):
                 f"{self._req_id!r}; state={record.state.value}"
             )
         raise RuntimeError(
-            f"Prefill transfer failed for req_id={self._req_id!r}: "
-            f"{record.reason}"
+            f"Prefill transfer failed for req_id={self._req_id!r}: " f"{record.reason}"
         )
 
     def fail(self, *, reason: str = "sender_fail") -> None:
@@ -455,8 +444,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         record = self._mgr.get_terminal_record(self._req_id, role="decode")
         if record is None:
             raise RuntimeError(
-                f"Decode transfer has no terminal record for "
-                f"req_id={self._req_id!r}"
+                f"Decode transfer has no terminal record for " f"req_id={self._req_id!r}"
             )
         if record.state != KVPoll.FAILED:
             raise RuntimeError(
@@ -464,8 +452,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                 f"{self._req_id!r}; state={record.state.value}"
             )
         raise RuntimeError(
-            f"Decode transfer failed for req_id={self._req_id!r}: "
-            f"{record.reason}"
+            f"Decode transfer failed for req_id={self._req_id!r}: " f"{record.reason}"
         )
 
     def fail(self, *, reason: str = "receiver_fail") -> None:
@@ -478,9 +465,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                 return
             self._close_pull_timer()
             self._transfer_started_at = None
-            transfer_id = (
-                self._metadata.uuid if self._metadata is not None else self._req_id
-            )
+            transfer_id = self._metadata.uuid if self._metadata is not None else self._req_id
             self._mgr.record_terminal(
                 self._req_id,
                 role="decode",
@@ -494,10 +479,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
 
     def init(self, p_metadata: PMetadata) -> None:
         if not isinstance(p_metadata, PMetadata):
-            raise TypeError(
-                f"p_metadata must be PMetadata, got "
-                f"{type(p_metadata).__name__}"
-            )
+            raise TypeError(f"p_metadata must be PMetadata, got " f"{type(p_metadata).__name__}")
         self._metadata = p_metadata
         self._transition_to(KVPoll.WAITING_FOR_INPUT)
 
@@ -541,9 +523,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                         reason="pull_init",
                     )
                     with suppress(Exception):
-                        PD_TRANSFER_FAILURES_TOTAL.labels(
-                            reason="pull_init", role="decode"
-                        ).inc()
+                        PD_TRANSFER_FAILURES_TOTAL.labels(reason="pull_init", role="decode").inc()
                     self._mgr._prune_receiver(self._req_id)
                     return self.state
             return self.state
@@ -585,9 +565,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                         reason="ack_send",
                     )
                     with suppress(Exception):
-                        PD_TRANSFER_FAILURES_TOTAL.labels(
-                            reason="ack_send", role="decode"
-                        ).inc()
+                        PD_TRANSFER_FAILURES_TOTAL.labels(reason="ack_send", role="decode").inc()
                     self._mgr._prune_receiver(self._req_id)
                     return self.state
             self._mgr._prune_receiver(self._req_id)

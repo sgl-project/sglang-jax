@@ -57,9 +57,7 @@ class CommonKVManager(KVManager):
         self._receivers: dict[str, object] = {}
 
         self._terminal_records_lock = threading.Lock()
-        self._terminal_records: OrderedDict[
-            tuple[str, str], TerminalTransferRecord
-        ] = OrderedDict()
+        self._terminal_records: OrderedDict[tuple[str, str], TerminalTransferRecord] = OrderedDict()
         self._max_terminal_records = 4096
 
         self._ack_timeout_s = ack_timeout_seconds
@@ -137,9 +135,7 @@ class CommonKVManager(KVManager):
             while len(self._terminal_records) > self._max_terminal_records:
                 self._terminal_records.popitem(last=False)
 
-    def get_terminal_record(
-        self, req_id: str, *, role: str
-    ) -> TerminalTransferRecord | None:
+    def get_terminal_record(self, req_id: str, *, role: str) -> TerminalTransferRecord | None:
         key = (req_id, role)
         with self._terminal_records_lock:
             record = self._terminal_records.get(key)
@@ -222,9 +218,7 @@ class CommonKVManager(KVManager):
             nr = len(self._receivers)
         return ns, nr
 
-    def graceful_shutdown(
-        self, drain_timeout_seconds: float = 30.0
-    ) -> tuple[int, int]:
+    def graceful_shutdown(self, drain_timeout_seconds: float = 30.0) -> tuple[int, int]:
         """Drain in-flight transfers, then abort stragglers.
 
         Returns ``(num_aborted_senders, num_aborted_receivers)``.

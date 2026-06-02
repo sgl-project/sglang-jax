@@ -256,7 +256,9 @@ class QueueHostKVPool(HostKVPool):
         # see the latest content; .at[].set() returns a new array.
         self._buffers[handle.buffer_id] = updated
         try:
-            from sgl_jax.srt.disaggregation.common.metrics import PD_TRANSFER_BYTES_TOTAL
+            from sgl_jax.srt.disaggregation.common.metrics import (
+                PD_TRANSFER_BYTES_TOTAL,
+            )
 
             PD_TRANSFER_BYTES_TOTAL.labels(direction="d2h", role="prefill").inc(
                 int(device_kv.nbytes)

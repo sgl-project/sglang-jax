@@ -86,7 +86,9 @@ class StateHolder:
         self._state = next_state
         if self._role is not None:
             try:
-                from sgl_jax.srt.disaggregation.common.metrics import PD_STATE_TRANSITION_TOTAL
+                from sgl_jax.srt.disaggregation.common.metrics import (
+                    PD_STATE_TRANSITION_TOTAL,
+                )
 
                 PD_STATE_TRANSITION_TOTAL.labels(
                     from_state=from_state.value,
@@ -154,5 +156,3 @@ class KVReceiver(abc.ABC):
     def failure_exception(self) -> None:
         """Raise the terminal transfer failure as an exception."""
         ...
-
-

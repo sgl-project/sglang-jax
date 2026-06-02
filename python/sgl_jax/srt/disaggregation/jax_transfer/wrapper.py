@@ -167,7 +167,9 @@ class JaxTransferWrapper:
             self._server.await_pull(_uuid_to_int(uuid), data)
             self._pending[uuid] = data
         try:
-            from sgl_jax.srt.disaggregation.common.metrics import PD_TRANSFER_BYTES_TOTAL
+            from sgl_jax.srt.disaggregation.common.metrics import (
+                PD_TRANSFER_BYTES_TOTAL,
+            )
 
             PD_TRANSFER_BYTES_TOTAL.labels(direction="net", role="prefill").inc(int(data.nbytes))
         except Exception:  # noqa: BLE001

@@ -18,7 +18,6 @@ from sgl_jax.srt.mem_cache.host_kv_pool import (
 )
 from sgl_jax.srt.server_args import ServerArgs
 
-
 # ------------------------------------------------------------------
 # PD metrics (from test_metrics)
 # ------------------------------------------------------------------
