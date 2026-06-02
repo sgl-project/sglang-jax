@@ -115,9 +115,8 @@ class FusedMoEBlockConfig:
                     or (quant_block_k is not None and bfc_candidate % quant_block_k != 0)
                 ):
                     bfc_candidate -= 128
-                if (
-                    bf_candidate % bfc_candidate == 0
-                    and (quant_block_k is None or bfc_candidate % quant_block_k == 0)
+                if bf_candidate % bfc_candidate == 0 and (
+                    quant_block_k is None or bfc_candidate % quant_block_k == 0
                 ):
                     bf = bf_candidate
                     bfc = bfc_candidate
