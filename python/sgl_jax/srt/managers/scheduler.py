@@ -371,6 +371,7 @@ class Scheduler(
         self.per_dp_max_running_requests = self.max_running_requests // self.dp_size
 
         self.is_hybrid = self.tp_worker.is_hybrid
+        self.sliding_window_size = None
         if self.is_hybrid:
             self.sliding_window_size = self.tp_worker.sliding_window_size
             self.full_tokens_per_layer, self.swa_tokens_per_layer = (
