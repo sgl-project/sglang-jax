@@ -63,3 +63,25 @@ def test_fused_greedy_decode_predicate_accepts_only_fixed_bucket():
     batch = _Batch(32)
     batch.speculative_num_steps = 2
     assert not _can_use_fused_greedy_decode_step3(batch)
+
+
+def test_multi_layer_draft_worker_routes_fixed_greedy_path(monkeypatch):
+    from sgl_jax.srt.speculative import draft_extend_fused
+    from sgl_jax.srt.speculative.multi_layer_draft_worker import MultiLayerDraftWorker
+
+    calls = []
+
+    def fake_step3(worker, model_worker_batch, batch_output):
+        calls.append("step3")
+
+    def fake_fallback(worker, model_worker_batch, batch_output):
+        calls.append("fallback")
+
+    monkeypatch.setattr(draft_extend_fused, "draft_extend_for_decode_fused_step3", fake_step3)
+    monkeypatch.setattr(draft_extend_fused, "draft_extend_for_decode_fused", fake_fallback)
+
+    worker = object.__new__(MultiLayerDraftWorker)
+    batch = type("Batch", (), {"use_fused_greedy_decode_step3": True})()
+    worker.draft_extend_for_decode(batch, object())
+
+    assert calls == ["step3"]
