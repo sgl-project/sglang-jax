@@ -207,6 +207,24 @@ def device_array(*data, sharding=None, **kwargs) -> jax.Array:
     return jax.tree.map(_to_device, *data)
 
 
+def effective_axis(x, dim: int, expected: str):
+    """Return ``expected`` only when an array is exactly sharded that way.
+
+    Inside jax.jit the concrete Array sharding may be carried by the tracer
+    aval instead of x.sharding; shard_map still validates against that aval
+    sharding. This helper intentionally does not infer or simplify composite
+    axes; it only mirrors exact per-dimension axis matches for shard_map specs.
+    """
+    for sharding in (
+        getattr(x, "sharding", None),
+        getattr(getattr(x, "aval", None), "sharding", None),
+    ):
+        spec = getattr(sharding, "spec", None)
+        if spec is not None and len(spec) > dim:
+            return expected if spec[dim] == expected else None
+    return None
+
+
 _IS_TPU_RUNTIME_CACHED: bool | None = None
 
 

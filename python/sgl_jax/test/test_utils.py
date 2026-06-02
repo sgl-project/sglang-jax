@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import psutil
 import requests
@@ -28,6 +29,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.model_executor.model_runner import ModelRunner
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.utils.common_utils import get_bool_env_var, retry
+from sgl_jax.srt.utils.jax_utils import effective_axis
 
 _MODEL_CACHE_ENV = "SGLANG_JAX_MODEL_CACHE"
 _LOCAL_MODEL_LOG_ONCE: set[str] = set()
@@ -813,3 +815,63 @@ class KDAAttnBackendForTest:
 
     def __setattr__(self, name, value):
         setattr(self._backend, name, value)
+
+
+class TestEffectiveAxis(unittest.TestCase):
+    """Unit tests for `effective_axis` in jax_utils.
+
+    Helper returns the requested axis name only when the input is actually
+    sharded that way along the given dim; otherwise None. Used to derive
+    `shard_map` in_specs / out_specs from real per-dim sharding rather than
+    hard-coded partition specs that fail on JAX 0.9.1+ strict validation.
+    """
+
+    def setUp(self):
+        # Build a 2-axis mesh on whatever devices are available (CPU works
+        # fine for spec inspection — the helper only reads the spec, not the
+        # actual partitioning).
+        from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+        devices = jax.devices()
+        if len(devices) < 1:
+            self.skipTest("no JAX devices available")
+        self._P = P
+        self._NamedSharding = NamedSharding
+        # Flatten devices into a 1D "tensor" axis for the simple cases; the
+        # helper doesn't care about axis count beyond spec-length comparison.
+        self._mesh = Mesh(devices, ("tensor",))
+
+    def _shard(self, arr, spec):
+        return jax.device_put(arr, self._NamedSharding(self._mesh, spec))
+
+    def test_concrete_sharded_array_returns_axis_name(self):
+        x = self._shard(jnp.zeros((4,)), self._P("tensor"))
+        self.assertEqual(effective_axis(x, 0, "tensor"), "tensor")
+
+    def test_concrete_replicated_array_returns_none(self):
+        x = jax.device_put(jnp.zeros((4,)))
+        self.assertIsNone(effective_axis(x, 0, "tensor"))
+
+    def test_tracer_inside_jit_reads_aval_sharding(self):
+        x = self._shard(jnp.zeros((4,)), self._P("tensor"))
+
+        def f(x):
+            return effective_axis(x, 0, "tensor")
+
+        out = jax.jit(f)(x)
+        self.assertEqual(out, "tensor")
+
+    def test_other_dim_is_replicated_returns_none(self):
+        # 1D sharded array, dim 1 is out-of-range -> None
+        x = self._shard(jnp.zeros((4,)), self._P("tensor"))
+        self.assertIsNone(effective_axis(x, 1, "tensor"))
+
+    def test_axis_mismatch_returns_none(self):
+        # Array is on "tensor" but caller asks about "data" -> None
+        x = self._shard(jnp.zeros((4,)), self._P("tensor"))
+        self.assertIsNone(effective_axis(x, 0, "data"))
+
+    def test_p_none_spec_returns_none(self):
+        # Replicated dim, even if other dims are sharded
+        x = self._shard(jnp.zeros((4, 4)), self._P("tensor", None))
+        self.assertIsNone(effective_axis(x, 1, "tensor"))
