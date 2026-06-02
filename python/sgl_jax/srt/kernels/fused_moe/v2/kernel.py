@@ -352,15 +352,8 @@ def _fused_ep_moe_kernel(
     disable_output_store: bool = False,
     enable_bt_scatter_overlap: bool = True,
     cross_expert_prefetch_mode: str = "full",
-    next_w2_prologue_priority: int = 1,
-    w2_fetch_order: str = "after_w13",
-    w2_fetch_priority: int = 1,
-    skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
-    direct_scaled_dot_ffn1: bool = False,
-    direct_scaled_dot_ffn2: bool = False,
-    cast_ffn1_input_fp8: bool = False,
-    cast_ffn2_input_fp8: bool = False,
+    direct_scaled_dot: bool = False,
     bt: int,
     bf: int,
     btc: int,
@@ -437,12 +430,6 @@ def _fused_ep_moe_kernel(
     ffn2_qbk = bf if per_channel else quant_block_k
     n_sg = h_per_t // ffn1_qbk if ffn1_qbk is not None else 1
     n_sg2 = bf // ffn2_qbk if ffn2_qbk is not None else 1
-
-    def maybe_cast_ffn1_input(x):
-        return x.astype(jnp.float8_e4m3fn) if cast_ffn1_input_fp8 else x
-
-    def maybe_cast_ffn2_input(x):
-        return x.astype(jnp.float8_e4m3fn) if cast_ffn2_input_fp8 else x
 
     enable_cross_expert_prefetch = cross_expert_prefetch_mode != "none"
     full_cross_expert_prefetch = cross_expert_prefetch_mode == "full"
@@ -1141,30 +1128,20 @@ def _fused_ep_moe_kernel(
         return has_tokens_to_prefetch
 
     def start_fetch_w13_w2(local_e_id, slot, bf_id, *, include_w2=True):
-        if w2_fetch_order == "before_w13" and include_w2:
+        start_fetch_w1(local_e_id, slot, bf_id, priority=1)
+        start_fetch_w3(local_e_id, slot, bf_id, priority=1)
+        if include_w2:
             start_fetch_w2(
                 local_e_id,
                 slot,
                 bf_id,
-                priority=w2_fetch_priority,
+                priority=1,
             )
-            start_fetch_w1(local_e_id, slot, bf_id, priority=1)
-            start_fetch_w3(local_e_id, slot, bf_id, priority=1)
-        else:
-            start_fetch_w1(local_e_id, slot, bf_id, priority=1)
-            start_fetch_w3(local_e_id, slot, bf_id, priority=1)
-            if include_w2:
-                start_fetch_w2(
-                    local_e_id,
-                    slot,
-                    bf_id,
-                    priority=w2_fetch_priority,
-                )
 
     # ===== Dequant fp8 → bf16 in VMEM (after DMA wait, before dot) =====
 
     def dequant_w1(slot):
-        if w1_scale_hbm is None or direct_scaled_dot_ffn1:
+        if w1_scale_hbm is None or direct_scaled_dot:
             return
         for p in range(t_packing):
 
@@ -1182,7 +1159,7 @@ def _fused_ep_moe_kernel(
             lax.fori_loop(0, n_sg, _dq_w1, None, unroll=n_sg)
 
     def dequant_w3(slot):
-        if w3_scale_hbm is None or direct_scaled_dot_ffn1:
+        if w3_scale_hbm is None or direct_scaled_dot:
             return
         for p in range(t_packing):
 
@@ -1200,7 +1177,7 @@ def _fused_ep_moe_kernel(
             lax.fori_loop(0, n_sg, _dq_w3, None, unroll=n_sg)
 
     def dequant_w2(slot):
-        if w2_scale_hbm is None or direct_scaled_dot_ffn2:
+        if w2_scale_hbm is None or direct_scaled_dot:
             return
         for p in range(out_packing):
 
@@ -1305,7 +1282,7 @@ def _fused_ep_moe_kernel(
                             local_e_id,
                             0,
                             0,
-                            priority=next_w2_prologue_priority,
+                            priority=1,
                         )
                 else:
                     start_fetch_w13_w2(local_e_id, 0, 0)
@@ -1317,7 +1294,7 @@ def _fused_ep_moe_kernel(
 
                     next_bf_id = bf_id + 2
 
-                    if direct_scaled_dot_ffn1 and w1_scale_hbm is not None and bt <= 16:
+                    if direct_scaled_dot and w1_scale_hbm is not None and bt <= 16:
                         wait_fetch_w1(slot)
 
                         def _gate_only_btc(btc_id, ___):
@@ -1330,7 +1307,6 @@ def _fused_ep_moe_kernel(
                                         x_slice = b_x_vmem[
                                             pl.ds(btc_id * btc, btc), _pid, pl.ds(sg_off, ffn1_qbk)
                                         ]
-                                        x_slice = maybe_cast_ffn1_input(x_slice)
                                         w1_tile = b_w1_x2_vmem[
                                             slot, _pid, pl.ds(sg_off, ffn1_qbk), pl.ds(0, bf)
                                         ]
@@ -1367,7 +1343,6 @@ def _fused_ep_moe_kernel(
                                         x_slice = b_x_vmem[
                                             pl.ds(btc_id * btc, btc), _pid, pl.ds(sg_off, ffn1_qbk)
                                         ]
-                                        x_slice = maybe_cast_ffn1_input(x_slice)
                                         w3_tile = b_w3_x2_vmem[
                                             slot, _pid, pl.ds(sg_off, ffn1_qbk), pl.ds(0, bf)
                                         ]
@@ -1392,7 +1367,7 @@ def _fused_ep_moe_kernel(
 
                         lax.fori_loop(0, num_btc_per_bts, _up_only_btc, None)
 
-                    elif direct_scaled_dot_ffn1 and w1_scale_hbm is not None:
+                    elif direct_scaled_dot and w1_scale_hbm is not None:
                         wait_fetch_w1(slot)
                         wait_fetch_w3(slot)
 
@@ -1410,7 +1385,6 @@ def _fused_ep_moe_kernel(
                                             p_id,
                                             pl.ds(sg_off, ffn1_qbk),
                                         ]
-                                        x_slice = maybe_cast_ffn1_input(x_slice)
                                         w1_tile = b_w1_x2_vmem[
                                             slot,
                                             p_id,
@@ -1492,7 +1466,6 @@ def _fused_ep_moe_kernel(
                                     x_slice = b_x_vmem[
                                         pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
                                     ]
-                                    x_slice = maybe_cast_ffn1_input(x_slice)
                                     w1_tile = (
                                         b_w1_dq_vmem[p_id]
                                         if w1_scale_hbm is not None
@@ -1537,11 +1510,11 @@ def _fused_ep_moe_kernel(
 
                     # Act+down — accumulate in VMEM f32 across bf tiles
                     def act_down_btc(btc_id, ___):
-                        use_direct_w2 = direct_scaled_dot_ffn2 and w2_scale_hbm is not None
+                        use_direct_w2 = direct_scaled_dot and w2_scale_hbm is not None
                         if not use_direct_w2:
                             gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
                             up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
-                            act = maybe_cast_ffn2_input(activation_fn(gate, up_val, act_fn))
+                            act = activation_fn(gate, up_val, act_fn)
                         if not disable_dynamic_ffn2:
                             for p_id in range(out_packing):
                                 if use_direct_w2:
@@ -1557,7 +1530,6 @@ def _fused_ep_moe_kernel(
                                             pl.ds(sg_off, ffn2_qbk),
                                         ]
                                         act_slice = activation_fn(gate_slice, up_slice, act_fn)
-                                        act_slice = maybe_cast_ffn2_input(act_slice)
                                         w2_tile = b_w2_x2_vmem[
                                             slot,
                                             p_id,
@@ -2203,14 +2175,6 @@ def _fused_ep_moe_kernel(
                     gather_bank_id=gather_bank_id,
                 )
 
-            if skip_inter_bt_sync:
-                pass
-            else:
-
-                @pl.when(bt_id + 1 < num_bt)
-                def _():
-                    sync_barrier()
-
         return e_sem_id
 
     # ===== Kernel start =====
@@ -2365,15 +2329,7 @@ def _fused_ep_moe_kernel(
         "tp_axis_name",
         "quant_block_k",
         "direct_scaled_dot",
-        "direct_scaled_dot_ffn1",
-        "direct_scaled_dot_ffn2",
-        "cast_ffn1_input_fp8",
-        "cast_ffn2_input_fp8",
         "cross_expert_prefetch_mode",
-        "next_w2_prologue_priority",
-        "w2_fetch_order",
-        "w2_fetch_priority",
-        "skip_inter_bt_sync",
         "interleave_bt",
         "enable_act_quant",
     ],
@@ -2436,15 +2392,7 @@ def fused_ep_moe_v2(
     w3_scale: jax.Array | None = None,
     block_config: FusedMoEBlockConfig | None = None,
     direct_scaled_dot: bool = False,
-    direct_scaled_dot_ffn1: bool | None = None,
-    direct_scaled_dot_ffn2: bool | None = None,
-    cast_ffn1_input_fp8: bool = False,
-    cast_ffn2_input_fp8: bool = False,
     cross_expert_prefetch_mode: str = "full",
-    next_w2_prologue_priority: int = 1,
-    w2_fetch_order: str = "after_w13",
-    w2_fetch_priority: int = 1,
-    skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
     enable_act_quant: bool = False,
     dp_axis_name: str = "data",
@@ -2455,12 +2403,6 @@ def fused_ep_moe_v2(
             f"Unsupported {cross_expert_prefetch_mode=}; "
             "expected one of 'none', 'full', or 'w13'."
         )
-    if next_w2_prologue_priority not in (0, 1):
-        raise ValueError(f"Unsupported {next_w2_prologue_priority=}; expected 0 or 1.")
-    if w2_fetch_order not in ("after_w13", "before_w13"):
-        raise ValueError(f"Unsupported {w2_fetch_order=}; expected 'after_w13' or 'before_w13'.")
-    if w2_fetch_priority not in (0, 1):
-        raise ValueError(f"Unsupported {w2_fetch_priority=}; expected 0 or 1.")
     if enable_act_quant:
         if not direct_scaled_dot:
             raise ValueError(
@@ -2485,10 +2427,6 @@ def fused_ep_moe_v2(
         _se_scales = (w1_shared_scale, w2_shared_scale, w3_shared_scale)
         if any(s is not None for s in _se_scales) and any(s is None for s in _se_scales):
             raise ValueError("in-kernel shared expert w*_shared_scale must be all-set or all-None.")
-    if direct_scaled_dot_ffn1 is None:
-        direct_scaled_dot_ffn1 = direct_scaled_dot
-    if direct_scaled_dot_ffn2 is None:
-        direct_scaled_dot_ffn2 = direct_scaled_dot
 
     ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
     num_devices = ep_size
@@ -2643,20 +2581,13 @@ def fused_ep_moe_v2(
     use_bt_banking = use_bt_scatter_bank or use_gather_bank
     num_bt_banks = num_bt if use_gather_bank else (2 if use_bt_scatter_bank else 1)
     smem_banks = num_bt if use_gather_bank else 2
-    use_w1_dequant_scratch = w1_scale is not None and not direct_scaled_dot_ffn1
-    use_w3_dequant_scratch = w3_scale is not None and not direct_scaled_dot_ffn1
-    use_w2_dequant_scratch = w2_scale is not None and not direct_scaled_dot_ffn2
+    use_w1_dequant_scratch = w1_scale is not None and not direct_scaled_dot
+    use_w3_dequant_scratch = w3_scale is not None and not direct_scaled_dot
+    use_w2_dequant_scratch = w2_scale is not None and not direct_scaled_dot
 
     scope_name = f"fused-moe-v2-k_{top_k}-bt_{bt}_{bts}_{btc}-bf_{bf}"
-    if direct_scaled_dot_ffn1 and direct_scaled_dot_ffn2:
+    if direct_scaled_dot:
         scope_name += "-direct_scaled_dot"
-    elif direct_scaled_dot_ffn1 or direct_scaled_dot_ffn2:
-        scope_name += (
-            f"-direct_scaled_dot_f1_{int(direct_scaled_dot_ffn1)}"
-            f"_f2_{int(direct_scaled_dot_ffn2)}"
-        )
-    if cast_ffn1_input_fp8 or cast_ffn2_input_fp8:
-        scope_name += f"-castf1_{int(cast_ffn1_input_fp8)}_f2_{int(cast_ffn2_input_fp8)}"
     scope_name += f"-xprefetch_{cross_expert_prefetch_mode}"
     if not pad_topk_to_128:
         scope_name += "-topk_no_pad"
@@ -2676,12 +2607,6 @@ def fused_ep_moe_v2(
         scope_name += "-no_gather_remote"
     if use_bt_scatter_bank:
         scope_name += "-bt_scatter_overlap"
-    if cross_expert_prefetch_mode == "w13":
-        scope_name += f"-w2p_{next_w2_prologue_priority}"
-    if w2_fetch_order != "after_w13" or w2_fetch_priority != 1:
-        scope_name += f"-w2fetch_{w2_fetch_order}_p{w2_fetch_priority}"
-    if skip_inter_bt_sync:
-        scope_name += "-skip_inter_bt_sync"
     if interleave_bt:
         scope_name += "-interleave_bt"
     if w1_shared is not None:
@@ -2820,16 +2745,9 @@ def fused_ep_moe_v2(
                 disable_output_store=disable_output_store,
                 enable_bt_scatter_overlap=use_bt_scatter_bank,
                 cross_expert_prefetch_mode=cross_expert_prefetch_mode,
-                next_w2_prologue_priority=next_w2_prologue_priority,
-                w2_fetch_order=w2_fetch_order,
-                w2_fetch_priority=w2_fetch_priority,
-                skip_inter_bt_sync=skip_inter_bt_sync,
                 interleave_bt=interleave_bt,
                 enable_act_quant=enable_act_quant,
-                direct_scaled_dot_ffn1=direct_scaled_dot_ffn1,
-                direct_scaled_dot_ffn2=direct_scaled_dot_ffn2,
-                cast_ffn1_input_fp8=cast_ffn1_input_fp8,
-                cast_ffn2_input_fp8=cast_ffn2_input_fp8,
+                direct_scaled_dot=direct_scaled_dot,
                 bt=bt,
                 bf=bf,
                 btc=btc,

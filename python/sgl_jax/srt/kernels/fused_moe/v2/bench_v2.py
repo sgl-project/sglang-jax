@@ -13,10 +13,6 @@ Env vars:
   BENCH_FP8     — 1 to enable fp8 weights
   BENCH_QBK     — quant_block_k for fp8 (default: 128)
   BENCH_DIRECT_SCALED_DOT — 1 to use direct-scaled-dot for both FFN1/FFN2
-  BENCH_DIRECT_SCALED_DOT_FFN1/FFN2 — optional comma-separated 0/1 hybrid sweep
-  BENCH_W2_FETCH_ORDER — after_w13 or before_w13 for current-expert W2 DMA
-  BENCH_W2_FETCH_PRIORITY — comma-separated 0/1 priority for current-expert W2 DMA
-  BENCH_SKIP_INTER_BT_SYNC — comma-separated 0/1 skip inter-BT sync barrier
   BENCH_INTERLEAVE_BT — comma-separated 0/1 interleave BT gather banking
   BENCH_TUNE    — 1 to auto-generate bt/bf candidates
   BENCH_WARMUP  — warmup iterations (default: 2)
@@ -245,26 +241,9 @@ tune_mode = os.environ.get("BENCH_TUNE", "0") == "1"
 use_wall = os.environ.get("BENCH_WALL", "0") == "1"
 use_split = os.environ.get("BENCH_SPLIT", "0") == "1"
 direct_scaled_dot = os.environ.get("BENCH_DIRECT_SCALED_DOT", "0") == "1"
-direct_scaled_dot_ffn1_modes = parse_csv_bool(
-    "BENCH_DIRECT_SCALED_DOT_FFN1",
-    [direct_scaled_dot],
-)
-direct_scaled_dot_ffn2_modes = parse_csv_bool(
-    "BENCH_DIRECT_SCALED_DOT_FFN2",
-    [direct_scaled_dot],
-)
-cast_ffn1_input_fp8 = os.environ.get("BENCH_CAST_FFN1_INPUT_FP8", "0") == "1"
-cast_ffn2_input_fp8 = os.environ.get("BENCH_CAST_FFN2_INPUT_FP8", "0") == "1"
 enable_act_quant = os.environ.get("BENCH_ACT_QUANT", "0") == "1"
 enable_bt_scatter_overlap = os.environ.get("BENCH_BT_SCATTER_OVERLAP", "1") == "1"
 cross_expert_prefetch_modes = parse_csv_str("BENCH_CROSS_EXPERT_PREFETCH", ["full"])
-next_w2_prologue_priorities = parse_csv_int("BENCH_NEXT_W2_PRIORITY", [1])
-w2_fetch_orders = parse_csv_str("BENCH_W2_FETCH_ORDER", ["after_w13"])
-w2_fetch_priorities = parse_csv_int("BENCH_W2_FETCH_PRIORITY", [1])
-skip_inter_bt_sync_modes = parse_csv_bool(
-    "BENCH_SKIP_INTER_BT_SYNC",
-    [True],
-)
 interleave_bt_modes = parse_csv_bool(
     "BENCH_INTERLEAVE_BT",
     [True],
@@ -277,23 +256,6 @@ if invalid_modes:
     raise ValueError(
         f"Unsupported BENCH_CROSS_EXPERT_PREFETCH values {invalid_modes}; "
         "expected one of none, full, or w13."
-    )
-invalid_priorities = [
-    priority
-    for priority in (list(next_w2_prologue_priorities) + list(w2_fetch_priorities))
-    if priority not in (0, 1)
-]
-if invalid_priorities:
-    raise ValueError(
-        f"Unsupported DMA priority values {invalid_priorities}; "
-        "TPU DMA priority supports only 0 or 1."
-    )
-valid_w2_fetch_orders = {"after_w13", "before_w13"}
-invalid_w2_fetch_orders = [mode for mode in w2_fetch_orders if mode not in valid_w2_fetch_orders]
-if invalid_w2_fetch_orders:
-    raise ValueError(
-        f"Unsupported BENCH_W2_FETCH_ORDER values {invalid_w2_fetch_orders}; "
-        "expected one of after_w13 or before_w13."
     )
 valid_routing_modes = {"random", "deterministic", "hot_expert"}
 if routing_mode not in valid_routing_modes:
@@ -383,25 +345,9 @@ if active_ablation:
     log(f"ablation flags: {active_ablation}")
 if direct_scaled_dot:
     log("direct_scaled_dot=True (fp8 dot per quant group, scale after dot)")
-if cast_ffn1_input_fp8 or cast_ffn2_input_fp8:
-    log("input cast controls: " f"ffn1_fp8={cast_ffn1_input_fp8} ffn2_fp8={cast_ffn2_input_fp8}")
-if direct_scaled_dot_ffn1_modes != [direct_scaled_dot] or direct_scaled_dot_ffn2_modes != [
-    direct_scaled_dot
-]:
-    log(
-        "direct_scaled_dot hybrid sweep: "
-        f"ffn1={direct_scaled_dot_ffn1_modes} ffn2={direct_scaled_dot_ffn2_modes}"
-    )
 if enable_bt_scatter_overlap:
     log("bt_scatter_overlap=True (next-BT scatter HBM bank overlap)")
-log(
-    "cross_expert_prefetch="
-    f"{cross_expert_prefetch_modes} next_w2_priority={next_w2_prologue_priorities}"
-)
-if w2_fetch_orders != ["after_w13"] or w2_fetch_priorities != [1]:
-    log("w2_fetch sweep: " f"order={w2_fetch_orders} priority={w2_fetch_priorities}")
-if skip_inter_bt_sync_modes != [True]:
-    log(f"skip_inter_bt_sync sweep: {skip_inter_bt_sync_modes}")
+log(f"cross_expert_prefetch={cross_expert_prefetch_modes}")
 if interleave_bt_modes != [True]:
     log(f"interleave_bt sweep: {interleave_bt_modes}")
 
@@ -1051,12 +997,6 @@ for num_tokens in token_candidates:
         for bc_raw in block_configs_to_try
         for flags in itertools.product(
             cross_expert_prefetch_modes,
-            next_w2_prologue_priorities,
-            direct_scaled_dot_ffn1_modes,
-            direct_scaled_dot_ffn2_modes,
-            w2_fetch_orders,
-            w2_fetch_priorities,
-            skip_inter_bt_sync_modes,
             interleave_bt_modes,
         )
     ]
@@ -1065,24 +1005,13 @@ for num_tokens in token_candidates:
     for (
         bc,
         xprefetch_mode,
-        next_w2_priority,
-        direct_ffn1,
-        direct_ffn2,
-        w2_fetch_order,
-        w2_fetch_priority,
-        skip_inter_bt_sync,
         interleave_bt,
     ) in configs_to_try:
-        if xprefetch_mode != "w13" and next_w2_priority != next_w2_prologue_priorities[0]:
-            continue
         bt, bf, btc, bts = bc.bt, bc.bf, bc.btc, bc.bts
         tag = (
             f"bt={bt},bf={bf},btc={btc},bts={bts},bse={bc.bse},"
-            f"xprefetch={xprefetch_mode},w2p={next_w2_priority},"
-            f"w2order={w2_fetch_order},w2fp={w2_fetch_priority},"
-            f"direct_f1={int(direct_ffn1)},direct_f2={int(direct_ffn2)},"
-            f"cast_f1={int(cast_ffn1_input_fp8)},cast_f2={int(cast_ffn2_input_fp8)},"
-            f"skip_ibt={int(skip_inter_bt_sync)},"
+            f"xprefetch={xprefetch_mode},"
+            f"direct={int(direct_scaled_dot)},"
             f"ilv_bt={int(interleave_bt)}"
         )
 
@@ -1102,11 +1031,8 @@ for num_tokens in token_candidates:
         tag_resolved = (
             f"bt={bc_resolved.bt},bf={bc_resolved.bf},"
             f"btc={bc_resolved.btc},bts={bc_resolved.bts},bse={bc_resolved.bse},"
-            f"xprefetch={xprefetch_mode},w2p={next_w2_priority},"
-            f"w2order={w2_fetch_order},w2fp={w2_fetch_priority},"
-            f"direct_f1={int(direct_ffn1)},direct_f2={int(direct_ffn2)},"
-            f"cast_f1={int(cast_ffn1_input_fp8)},cast_f2={int(cast_ffn2_input_fp8)},"
-            f"skip_ibt={int(skip_inter_bt_sync)},"
+            f"xprefetch={xprefetch_mode},"
+            f"direct={int(direct_scaled_dot)},"
             f"ilv_bt={int(interleave_bt)}"
         )
         resolved_key = (
@@ -1115,12 +1041,7 @@ for num_tokens in token_candidates:
             bc_resolved.btc,
             bc_resolved.bts,
             xprefetch_mode,
-            next_w2_priority,
-            direct_ffn1,
-            direct_ffn2,
-            w2_fetch_order,
-            w2_fetch_priority,
-            skip_inter_bt_sync,
+            direct_scaled_dot,
             interleave_bt,
         )
         if resolved_key in seen_resolved_configs:
@@ -1176,16 +1097,8 @@ for num_tokens in token_candidates:
                 disable_acc_store_vmem=disable_acc_store_vmem,
                 disable_output_store=disable_output_store,
                 direct_scaled_dot=direct_scaled_dot,
-                direct_scaled_dot_ffn1=direct_ffn1,
-                direct_scaled_dot_ffn2=direct_ffn2,
-                cast_ffn1_input_fp8=cast_ffn1_input_fp8,
-                cast_ffn2_input_fp8=cast_ffn2_input_fp8,
                 enable_act_quant=enable_act_quant,
                 cross_expert_prefetch_mode=xprefetch_mode,
-                next_w2_prologue_priority=next_w2_priority,
-                w2_fetch_order=w2_fetch_order,
-                w2_fetch_priority=w2_fetch_priority,
-                skip_inter_bt_sync=skip_inter_bt_sync,
                 interleave_bt=interleave_bt,
                 enable_bt_scatter_overlap=enable_bt_scatter_overlap,
             )
@@ -1294,14 +1207,7 @@ if check_correctness:
             w2_shared_scale=w2_shared_scale,
             w3_shared_scale=w3_shared_scale,
             direct_scaled_dot=direct_scaled_dot,
-            direct_scaled_dot_ffn1=direct_scaled_dot_ffn1_modes[0],
-            direct_scaled_dot_ffn2=direct_scaled_dot_ffn2_modes[0],
-            cast_ffn1_input_fp8=cast_ffn1_input_fp8,
-            cast_ffn2_input_fp8=cast_ffn2_input_fp8,
             enable_act_quant=enable_act_quant,
-            w2_fetch_order=w2_fetch_orders[0],
-            w2_fetch_priority=w2_fetch_priorities[0],
-            skip_inter_bt_sync=skip_inter_bt_sync_modes[0],
             interleave_bt=interleave_bt_modes[0],
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
         )
