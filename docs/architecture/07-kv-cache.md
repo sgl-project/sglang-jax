@@ -36,14 +36,10 @@ Core files involved:
 ├─────────────────────────────────────────────────┤
 │  Allocator (Token / Paged / SWA)                │  ← free page/token tracking
 ├─────────────────────────────────────────────────┤
-│  Memory Pool (MHA / MLA / SWA KVPool)           │  ← device-side JAX arrays
+│  Memory Pool (MHA / MLA / SWA / HybridLinear KV)│  ← device-side JAX arrays
 │  + RecurrentStatePool (Mamba/GLA/KDA/GDN)       │  ← linear recurrent layer state
 └─────────────────────────────────────────────────┘
 ```
-
-**Hybrid Memory Pool design**:
-
-For hybrid-architecture models (such as Mamba, GLA, KDA, GDN), some layers use standard attention (requiring KV cache) while others use linear recurrent mechanisms (requiring recurrent state). `HybridReqToTokenPool` inherits from `ReqToTokenPool` and additionally manages slot allocation for the `recurrent_state_pool` on top of the parent's req→token mapping; the KV data itself is still managed by a parallel `MHATokenToKVPool` + Allocator. This way, a single request's req-pool index and recurrent slot are allocated/freed in one place, sparing the Scheduler from manual coordination.
 
 ![KV Cache allocation flow](images/07-kv-cache-allocation-flow.svg)
 
@@ -70,26 +66,32 @@ Compared to a standard trie (one node per token), the radix tree compresses unbr
 
 ## 7.2 Memory Pool
 
-The memory pool layer manages the actual memory resources on the device. Depending on the model architecture, sglang-jax provides multiple memory pool implementations and exposes them uniformly to the model via the `MemoryPools` wrapper:
+The memory pool layer manages on-device memory through three independent class hierarchies plus an aggregator:
 
-- **ReqToTokenPool**: Standard coordination layer, maintains the request-to-token-index mapping (host-side); used for pure Transformer models (Llama/Qwen/Gemma2, etc.)
-- **Traditional KV Cache Pool**: Stores Key-Value caches for standard attention layers
-  - MHATokenToKVPool (Multi-Head Attention)
-  - MLATokenToKVPool (Multi-Latent Attention)
-  - SWAKVPool (Sliding Window Attention)
-- **RecurrentStatePool**: Stores state for linear recurrent layers (Mamba/GLA/KDA/GDN)
-- **HybridReqToTokenPool**: Hybrid-architecture coordination layer, used only for hybrid recurrent models (Mamba/GLA, etc.); inherits from `ReqToTokenPool` and additionally manages recurrent slots
-- **`MemoryPools` wrapper**: Aggregates the above sub-pools and acts as the unified container received by model `__call__` (see §7.2.1)
+```text
+ReqToTokenPool                          KVCache (ABC)                       RecurrentStatePool       MemoryPools
+  └── HybridReqToTokenPool                ├── MHATokenToKVPool              (standalone)              (aggregator)
+                                          ├── MLATokenToKVPool
+                                          ├── SWAKVPool          ←── composes 2 MHATokenToKVPool
+                                          └── HybridLinearKVPool ←── composes 1 MHA/MLATokenToKVPool
+```
 
-Source: `mem_cache/memory_pool.py`, `mem_cache/recurrent_state_pool.py`
+`SWAKVPool` and `HybridLinearKVPool` are composition wrappers over inner MHA/MLA pools, not new storage layouts. `MemoryPools` bundles the active pools into one pytree and is passed across the JIT boundary via `donate_argnames=["memory_pools"]`.
 
-### 7.2.1 `MemoryPools` Wrapper
+`ModelRunner._init_pools()` produces one of two configurations depending on the model:
+
+| Configuration | ReqToTokenPool | KVCache pool | RecurrentStatePool | Allocator |
+|---|---|---|---|---|
+| **Standard** (Llama / Qwen / DeepSeek absorbed-MLA; Gemma2 SWA) | `ReqToTokenPool` | `MHA` / `MLA` / `SWAKVPool` | — | `PagedTokenToKVPoolAllocator` (default), `TokenToKVPoolAllocator` (page_size=1), `SWATokenToKVPoolAllocator` (SWA) |
+| **Hybrid** (Kimi-Linear — attention + linear recurrent) | `HybridReqToTokenPool` | `HybridLinearKVPool` (full-attn layers only) | `RecurrentStatePool` | `PagedTokenToKVPoolAllocator` |
+
+### 7.2.1 `MemoryPools`
 
 `MemoryPools` (`mem_cache/memory_pool.py`) aggregates the various KV / recurrent sub-pools that a single model may use into one pytree container, constructed with keyword arguments (e.g., `token_to_kv_pool`, `swa_kv_pool`, recurrent pool, etc.). It routes attribute names to the corresponding sub-pool via `__getattr__`, raising `AttributeError: MemoryPools has no pool '<name>'` if not found. `ModelRunner` now always holds a `MemoryPools` (non-hybrid models simply wrap it via `_build_non_hybrid_memory_pools`), and passes the entire `MemoryPools` to JIT as a `donate_argnames=["memory_pools"]` parameter. The model `__call__` retrieves the actual pool via `memory_pools.token_to_kv_pool` etc., and returns a `{"token_to_kv_pool": layers_kv_fused, ...}` dict that `self.memory_pools.replace_all(pool_updates)` writes back. Absorbed-MLA models like GLM-5 / DeepSeek V3 must extract the sub-pool from `MemoryPools` to correctly invoke the KV buffer interface.
 
-### 7.2.2 ReqToTokenPool (Standard Coordination Layer)
+### 7.2.2 ReqToTokenPool
 
-The request-to-token mapping pool, registered as `@register_pytree_node_class`. Used for ordinary Transformer models (Llama/Qwen/Gemma2, etc.), created by `ModelRunner` in `init_memory_pool()`. Hybrid recurrent models (Mamba/GLA) use `HybridReqToTokenPool` instead (`_build_hybrid_memory_pools()`).
+The request-to-token mapping pool, registered as `@register_pytree_node_class`. Used directly by standard models (`MHA` / `MLA` / `SWAKVPool` KV side); hybrid models swap it for `HybridReqToTokenPool` (the subclass; see §7.2.3), built by `_build_hybrid_pools()`.
 
 Maintained on the host (CPU numpy) rather than the device (JAX Array), because the Scheduler frequently reads/writes token indices on CPU for scheduling decisions (such as prefix matching, KV cache allocation, retract release); these are irregular random-access operations that would incur significant host-device sync overhead if placed device-side.
 
@@ -105,19 +107,60 @@ Maintained on the host (CPU numpy) rather than the device (JAX Array), because t
 | `alloc(reqs)` | Pop slots from the front of `free_slots`, supports chunked-prefill reuse |
 | `free(req)` | Return the slot and clear `req.req_pool_idx` |
 
-### 7.2.3 Traditional KV Cache Pool
+### 7.2.3 HybridReqToTokenPool
 
-The traditional KV cache pool stores Key-Value caches for standard attention layers. All implementations inherit from the `KVCache` abstract base class.
+`HybridReqToTokenPool` inherits from `ReqToTokenPool` and coordinates recurrent state slot allocation for **hybrid models** (attention + linear-recurrent layers). The parent class manages the req→token mapping table; the subclass additionally holds a `recurrent_state_pool` reference and per-DP `recurrent_free_slots` queues. The KV cache itself is managed on a parallel path by `HybridLinearKVPool` wrapping a single inner `MHA`/`MLATokenToKVPool` (see §7.2.4.5).
 
-#### 7.2.3.1 KVCache Abstract Base Class
+Hybrid linear-recurrent models (e.g., Kimi-Linear with KDA + MLA) contain both:
+
+- **Full-attention layers** — KV cache managed by `HybridLinearKVPool` (§7.2.4.5), which routes global `layer_id` to the inner pool's physical slot
+- **Linear-recurrent layers (KDA / Lightning)** — recurrent state managed by `RecurrentStatePool` (§7.2.5); these layers never touch the KV pool
+
+The lifecycles of req-pool slots and recurrent slots must be synchronized: `alloc(reqs)` first calls `super().alloc(reqs)` to obtain a req-pool slot, then takes a recurrent slot from `recurrent_free_slots[dp_rank]` and writes it to `req.recurrent_pool_idx`; `free(req)` reverses the process. KV slots are allocated independently along another path by the allocator (single `PagedTokenToKVPoolAllocator`), but indirectly tied to the same request via the ReqToTokenPool's req→token mapping, achieving "the same `req_pool_idx` consistent across KV / recurrent".
+
+**Core design**:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `recurrent_state_pool` | `RecurrentStatePool` | Reference to the recurrent state pool |
+| `dp_size` | `int` | Number of DP ranks |
+| `slots_per_rank` | `int` | `recurrent_state_pool.size // dp_size` |
+| `recurrent_free_slots` | `list[list[int]]` | Per-DP queue of free recurrent slots |
+| `req_index_to_recurrent_index_mapping` | `np.ndarray` | Fast lookup of `req_pool_idx → recurrent_pool_idx` |
+
+| Method | Description |
+|--------|-------------|
+| `alloc(reqs)` | First `super().alloc(reqs)` to get the req-pool slot; then for each new request, take a recurrent slot from `recurrent_free_slots[dp_rank]` and write it to `req.recurrent_pool_idx` |
+| `free(req)` | First return the recurrent slot to the corresponding DP rank queue and clear the mapping; then `super().free(req)` returns the req-pool slot |
+| `recurrent_available_size(dp_rank)` | Number of available recurrent slots for the specified DP rank |
+| `get_linear_recurrent_indices(req_pool_indices)` | Given an array of req-pool indices, return the corresponding recurrent slot index array |
+
+**Key design decisions**:
+
+1. **Unified slot index** — `req.req_pool_idx` maps to `recurrent_pool_idx` via `req_index_to_recurrent_index_mapping`, simplifying cross-view queries between KV and recurrent.
+2. **Per-DP free queues** — `recurrent_free_slots` are partitioned by DP rank, consistent with the allocator's capacity partitioning, preventing requests of different DP ranks from encroaching on each other's recurrent slots.
+3. **Separation of concerns** — KV slots are independently maintained in the allocator / KVCache pool; `HybridReqToTokenPool` does not hold KV buffers, only handles slot allocation for recurrent state.
+
+**Why coordinate recurrent at the ReqToTokenPool layer instead of the allocator layer?**
+
+- The allocator only manages free pages / tokens and has no awareness of request-level semantics
+- ReqToTokenPool is the bridge between requests and memory; it's the most natural place to attach recurrent slots
+- The Scheduler only needs to interact with HybridReqToTokenPool / Allocator; no awareness of recurrent pool details
+
+### 7.2.4 KVCache
+
+The KV cache layer stores Key-Value caches for attention layers. All concrete pools inherit from the `KVCache` abstract base class — four direct subclasses (`MHA`, `MLA`, `SWAKVPool`, `HybridLinearKVPool`); the last two are *composition wrappers* over the first two.
+
+#### 7.2.4.1 Abstract Base
 
 `KVCache` (`@register_pytree_node_class`) defines a unified interface for the KV cache buffer pool:
 
 - `get_fused_kv_buffer(layer_id)` — Get the fused KV buffer for a specified layer
+- `get_kv_buffer(layer_id)` — Split the fused buffer into separate `(k, v)` views (MLA uses this to expose `(c_kv, k_pe)`)
 - `set_kv_buffer(layer_id, loc, cache_k, cache_v, is_decode)` — Write KV data
-- `replace_kv_buffer(kv_buffer)` — Replace the internal reference with the updated buffer returned by forward (required by JAX's functional paradigm)
+- `replace_buffer(kv_buffer)` — Replace the internal reference with the updated buffer returned by forward (required by JAX's functional paradigm)
 
-#### 7.2.3.2 MHATokenToKVPool — Standard MHA KV Cache
+#### 7.2.4.2 MHATokenToKVPool
 
 The KV cache is organized by fixed-size pages rather than by token, in order to **eliminate inter-request memory fragmentation** — token-level allocation leaves many "unusable but unfreeable" holes due to varying request lengths, while pages are coarse-grained contiguous blocks that naturally produce no fragmentation when allocated/released. Pages are also the access granularity for attention kernels: Pallas / PagedAttention fetches one page of KV at a time, amortizing DMA launch overhead on TPU / GPU. The 5D layout described here is built on top of paged KV caches with K/V interleaving and sub-word packing layered on, sharing the same lineage as the PagedAttention idea proposed by vLLM.
 
@@ -152,7 +195,7 @@ merge_kv(k, v) → _set_fused_kv_buffer → update_fused_kv_cache_vectorized
     → input_output_aliases enables in-place HBM update
 ```
 
-#### 7.2.3.3 MLATokenToKVPool — MLA-Specific KV Cache
+#### 7.2.4.3 MLATokenToKVPool
 
 **4D buffer layout**:
 
@@ -168,13 +211,13 @@ Shape: (total_num_pages,
 | Feature | MHA Pool | MLA Pool |
 |---------|----------|----------|
 | Buffer dimensions | 5D | 4D |
-| Sharding strategy | `P(..., "tensor", ...)` | Fully replicated (no head axis) |
+| Sharding strategy | `P(..., "tensor", ...)` | `P("data", None, None, None)` — DP-partitioned on axis 0, no head shard |
 | KV write | `set_kv_buffer` + Pallas kernel | Not supported (MLA v2 kernel writes in place via `input_output_aliases`) |
 | Data read | `get_fused_kv_buffer` | `get_kv_buffer` splits into `(c_kv, k_pe)` views |
 
-#### 7.2.3.4 SWAKVPool — Hybrid SWA Dual Pool
+#### 7.2.4.4 SWAKVPool
 
-Wraps independent `full_kv_pool` (Full-Attention layers) and `swa_kv_pool` (SWA layers).
+Used by models that mix full-attention and sliding-window layers (e.g., Gemma2). Wraps two independent inner `MHATokenToKVPool` instances: `full_kv_pool` (Full-Attention layers) and `swa_kv_pool` (SWA layers). Despite the "SWA mix" naming, both layer types still do attention — this is a standard configuration, not the hybrid one in §7.2.4.5.
 
 **Core fields**:
 
@@ -187,7 +230,23 @@ The SWA layer's `set_kv_buffer` maps full-attention indices to SWA indices via `
 
 The current SWA uses a Full + SWA dual-pool structure, with `SWATokenToKVPoolAllocator` coordinating allocation across the two allocators to ensure that failure on either pool can roll back the other. See 7.3.4.
 
-### 7.2.4 RecurrentStatePool — State Management for Linear Recurrent Layers
+#### 7.2.4.5 HybridLinearKVPool
+
+Used by **hybrid models** that mix attention with linear-recurrent layers (e.g., Kimi-Linear: MLA + KDA). Wraps **one** inner `MHA`/`MLATokenToKVPool` sized only to the full-attention layers; linear-recurrent layers don't allocate KV slots — their state lives in `RecurrentStatePool` (§7.2.5), and req-pool slot coordination uses `HybridReqToTokenPool` (§7.2.3). The three classes together form the complete hybrid configuration.
+
+**Core fields**:
+
+| Field | Description |
+|-------|-------------|
+| `full_kv_pool` | Inner KV pool, `layer_num = len(full_attention_layer_ids)` |
+| `full_attention_layer_ids` | Global layer IDs that store KV |
+| `full_attention_layer_id_mapping` | `dict[global_id, physical_id]` for layer-ID translation |
+
+The model still iterates over a contiguous global `layer_id` range; every accessor calls `_to_physical(layer_id)` to translate to the inner pool's compacted index. Passing a non-full-attention layer ID raises `ValueError` — those layers must write to `RecurrentStatePool` instead.
+
+`replace_buffer(kv_buffer)` expects a **compacted** list of length `full_layer_nums` (not full-length like `SWAKVPool`), since KDA layers don't produce KV writebacks at all.
+
+### 7.2.5 RecurrentStatePool
 
 Source: `mem_cache/recurrent_state_pool.py`
 
@@ -249,66 +308,6 @@ Linear recurrent layer state differs fundamentally from attention's KV cache:
 3. **Different dtype needs** — Recurrent state needs higher precision (`float32`); KV cache typically uses `bfloat16`
 
 An independent `RecurrentStatePool` provides a cleaner abstraction and more flexible configuration space.
-
-### 7.2.5 HybridReqToTokenPool — Hybrid Architecture Coordination Layer
-
-`HybridReqToTokenPool` inherits from `ReqToTokenPool` and coordinates recurrent state slot allocation for hybrid-architecture models (attention + linear recurrent layers). The parent class manages the req→token mapping table; the subclass only additionally holds a `recurrent_state_pool` reference and per-DP `recurrent_free_slots` queues. The KV cache itself is managed by a parallel `MHATokenToKVPool` + Allocator, not inside `HybridReqToTokenPool`.
-
-Hybrid-architecture models (e.g., Mamba, GLA, KDA, GDN) contain both:
-
-- **Attention layers** — Need a KV cache (managed by `MHATokenToKVPool` + Allocator)
-- **Linear recurrent layers** — Need recurrent state (managed by `RecurrentStatePool`, with a reference held by `HybridReqToTokenPool`)
-
-The lifecycles of req-pool slots and recurrent slots must be synchronized: `alloc(reqs)` first calls `super().alloc(reqs)` to obtain a req-pool slot, then takes a recurrent slot from `recurrent_free_slots[dp_rank]` and writes it to `req.recurrent_pool_idx`; `free(req)` reverses the process. KV slots are allocated independently along another path by the allocator, but indirectly tied to the same request via the ReqToTokenPool's req→token mapping, achieving "the same `req_pool_idx` consistent across KV / recurrent".
-
-**Core design**:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `recurrent_state_pool` | `RecurrentStatePool` | Reference to the recurrent state pool |
-| `dp_size` | `int` | Number of DP ranks |
-| `slots_per_rank` | `int` | `recurrent_state_pool.size // dp_size` |
-| `recurrent_free_slots` | `list[list[int]]` | Per-DP queue of free recurrent slots |
-| `req_index_to_recurrent_index_mapping` | `np.ndarray` | Fast lookup of `req_pool_idx → recurrent_pool_idx` |
-
-| Method | Description |
-|--------|-------------|
-| `alloc(reqs)` | First `super().alloc(reqs)` to get the req-pool slot; then for each new request, take a recurrent slot from `recurrent_free_slots[dp_rank]` and write it to `req.recurrent_pool_idx` |
-| `free(req)` | First return the recurrent slot to the corresponding DP rank queue and clear the mapping; then `super().free(req)` returns the req-pool slot |
-| `recurrent_available_size(dp_rank)` | Number of available recurrent slots for the specified DP rank |
-| `get_linear_recurrent_indices(req_pool_indices)` | Given an array of req-pool indices, return the corresponding recurrent slot index array |
-
-**Key design decisions**:
-
-1. **Unified slot index** — `req.req_pool_idx` maps to `recurrent_pool_idx` via `req_index_to_recurrent_index_mapping`, simplifying cross-view queries between KV and recurrent.
-2. **Per-DP free queues** — `recurrent_free_slots` are partitioned by DP rank, consistent with the allocator's capacity partitioning, preventing requests of different DP ranks from encroaching on each other's recurrent slots.
-3. **Separation of concerns** — KV slots are independently maintained in the allocator / KVCache pool; `HybridReqToTokenPool` does not hold KV buffers, only handles slot allocation for recurrent state.
-
-**Why coordinate recurrent at the ReqToTokenPool layer instead of the allocator layer?**
-
-- The allocator only manages free pages / tokens and has no awareness of request-level semantics
-- ReqToTokenPool is the bridge between requests and memory; it's the most natural place to attach recurrent slots
-- The Scheduler only needs to interact with HybridReqToTokenPool / Allocator; no awareness of recurrent pool details
-
-**Usage example**:
-
-```python
-# Use in Scheduler
-if model.is_hybrid:
-    pool = HybridReqToTokenPool(
-        size=size,
-        max_context_len=max_seq_len,
-        dtype=np.int32,
-        recurrent_state_pool=recurrent_pool,
-        dp_size=dp_size,
-    )
-else:
-    pool = ReqToTokenPool(size=size, max_context_len=max_seq_len, dtype=np.int32)
-
-# alloc / free interfaces are identical to ReqToTokenPool; hybrid models gain a recurrent_pool_idx field
-pool.alloc(reqs)
-pool.free(req)
-```
 
 ---
 
@@ -594,7 +593,8 @@ The coordination layer combines the "evict" and "allocate" actions originally sc
 | `KVCache` | `mem_cache/memory_pool.py` | KV cache buffer pool abstract base class |
 | `MHATokenToKVPool` | `mem_cache/memory_pool.py` | MHA KV cache pool (5D fused buffer) |
 | `MLATokenToKVPool` | `mem_cache/memory_pool.py` | MLA KV cache pool (4D latent buffer) |
-| `SWAKVPool` | `mem_cache/memory_pool.py` | Hybrid SWA dual pool |
+| `SWAKVPool` | `mem_cache/memory_pool.py` | Hybrid SWA dual pool (wraps full + swa MHA pools; Gemma2-style) |
+| `HybridLinearKVPool` | `mem_cache/memory_pool.py` | Hybrid linear-recurrent KV wrapper (wraps 1 inner MHA/MLA pool, sized to full-attention layers only; global → physical `layer_id` translation; Kimi-Linear-style) |
 | `RecurrentStatePool` | `mem_cache/recurrent_state_pool.py` | State management for linear recurrent layers (Mamba/GLA/KDA/GDN) |
 | `MemoryPools` | `mem_cache/memory_pool.py` | Wrapper that aggregates multiple KV / recurrent sub-pools, the unified container received by model `__call__` |
 | `merge_kv()` | `mem_cache/memory_pool.py` | K/V tensor → 5D fused format |
