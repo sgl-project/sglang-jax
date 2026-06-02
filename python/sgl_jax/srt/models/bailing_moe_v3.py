@@ -60,8 +60,10 @@ class BailingMoeV3MLP(nnx.Module):
         intermediate_size: int,
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
+        swiglu_limit: float | None = None,
     ):
         super().__init__()
+        self.swiglu_limit = swiglu_limit
         self.gate_proj = LinearBase(
             input_size=hidden_size,
             output_size=intermediate_size,
@@ -93,7 +95,13 @@ class BailingMoeV3MLP(nnx.Module):
     def __call__(self, hidden_states: jax.Array) -> jax.Array:
         gate, _ = self.gate_proj(hidden_states)
         up, _ = self.up_proj(hidden_states)
-        output, _ = self.down_proj(jax.nn.silu(gate) * up)
+        gate = jax.nn.silu(gate)
+        if self.swiglu_limit is not None:
+            # Matches maxtext/src/MaxText/layers/linears.py:500-543:
+            # gate (post-silu) clamped single-sided, up clamped double-sided.
+            gate = jnp.clip(gate, max=self.swiglu_limit)
+            up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
+        output, _ = self.down_proj(gate * up)
         return output
 
 
@@ -419,6 +427,16 @@ class BailingMoeV3DecoderLayer(nnx.Module):
             )
 
             if self.use_fused:
+                if (
+                    config.expert_swiglu_limit(layer_idx) is not None
+                    or config.shared_expert_swiglu_limit(layer_idx) is not None
+                ):
+                    raise NotImplementedError(
+                        f"layer {layer_idx}: FusedEPMoE path does not yet implement "
+                        "SwiGLU clamp; fused kernel folds silu*up inside its fused "
+                        "moe op. Use the EPMoE backend (default) for Flash, or "
+                        "extend fused_moe to plumb the clamp before enabling fused."
+                    )
                 self.experts = FusedEPMoE(
                     hidden_size=config.hidden_size,
                     num_experts=config.num_experts,
@@ -450,6 +468,7 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                     dtype=dtype,
                     layer_id=layer_idx,
                     ep_size=getattr(config, "ep_size", 1),
+                    swiglu_limit=config.expert_swiglu_limit(layer_idx),
                 )
                 if config.num_shared_experts > 0:
                     self.shared_experts = BailingMoeV3MLP(
@@ -458,6 +477,7 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                         * config.num_shared_experts,
                         mesh=mesh,
                         dtype=dtype,
+                        swiglu_limit=config.shared_expert_swiglu_limit(layer_idx),
                     )
                 else:
                     self.shared_experts = None
@@ -834,22 +854,33 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                 reshape=(1, 1, self.config.num_attention_heads, 1),
             )
         else:
-            # MLA (Q-LoRA + KV-LoRA + head-wise gate).
-            mappings[f"{attn_src}.q_a_proj.weight"] = WeightMapping(
-                target_path=f"{attn_target}.q_a_proj.weight",
-                sharding=(None, None),
-                transpose=True,
-            )
-            mappings[f"{attn_src}.q_a_layernorm.weight"] = WeightMapping(
-                target_path=f"{attn_target}.q_a_layernorm.scale",
-                sharding=(None,),
-                transpose=False,
-            )
-            mappings[f"{attn_src}.q_b_proj.weight"] = WeightMapping(
-                target_path=f"{attn_target}.q_b_proj.weight",
-                sharding=(None, "tensor"),
-                transpose=True,
-            )
+            # MLA (Q[-LoRA] + KV-LoRA + head-wise gate).
+            # Q projection: Tiny (q_lora_rank=256) uses Q-LoRA (q_a_proj +
+            # q_a_layernorm + q_b_proj); Flash (q_lora_rank=null) uses a flat
+            # q_proj. Semantics aligned with the q-LoRA / flat-q switch in
+            # deepseek_v3.py::_create_weight_mappings.
+            if self.config.q_lora_rank is None:
+                mappings[f"{attn_src}.q_proj.weight"] = WeightMapping(
+                    target_path=f"{attn_target}.q_proj.weight",
+                    sharding=(None, "tensor"),
+                    transpose=True,
+                )
+            else:
+                mappings[f"{attn_src}.q_a_proj.weight"] = WeightMapping(
+                    target_path=f"{attn_target}.q_a_proj.weight",
+                    sharding=(None, None),
+                    transpose=True,
+                )
+                mappings[f"{attn_src}.q_a_layernorm.weight"] = WeightMapping(
+                    target_path=f"{attn_target}.q_a_layernorm.scale",
+                    sharding=(None,),
+                    transpose=False,
+                )
+                mappings[f"{attn_src}.q_b_proj.weight"] = WeightMapping(
+                    target_path=f"{attn_target}.q_b_proj.weight",
+                    sharding=(None, "tensor"),
+                    transpose=True,
+                )
             mappings[f"{attn_src}.kv_a_proj_with_mqa.weight"] = WeightMapping(
                 target_path=f"{attn_target}.kv_a_proj.weight",
                 sharding=(None, None),

@@ -56,6 +56,12 @@ class BailingMoeV3Config(PretrainedConfig):
         scoring_func="sigmoid",
         routed_scaling_factor=2.5,
         router_dtype="fp32",
+        # SwiGLU clamp (Ling3-Flash only — trained with maxtext's MoE block
+        # which clamps gate/up activations on the last few layers; see
+        # maxtext/src/MaxText/layers/moe.py:737-759 and configs/models/ling3-flash.yml.
+        # Tiny ckpt omits both; left as None → no clamp anywhere.)
+        expert_swiglu_limit_list=None,
+        share_expert_swiglu_limit_list=None,
         # MTP (skipped at inference for Ling3-Tiny)
         num_nextn_predict_layers=1,
         mtp_loss_scaling_factor=0,
@@ -127,6 +133,11 @@ class BailingMoeV3Config(PretrainedConfig):
         self.routed_scaling_factor = routed_scaling_factor
         self.router_dtype = router_dtype
 
+        # SwiGLU clamp (per-layer scalar; 0 / None / out-of-range = disabled).
+        # Spelling matches the HF config field name (`share_` not `shared_`).
+        self.expert_swiglu_limit_list = expert_swiglu_limit_list
+        self.share_expert_swiglu_limit_list = share_expert_swiglu_limit_list
+
         # MTP
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.mtp_loss_scaling_factor = mtp_loss_scaling_factor
@@ -191,3 +202,24 @@ class BailingMoeV3Config(PretrainedConfig):
         return [
             i for i in range(self.num_hidden_layers) if not self.is_kda_layer(i)
         ]
+
+    def _swiglu_limit(self, limit_list, layer_idx: int):
+        """Per-layer SwiGLU clamp lookup. Mirrors maxtext's get_swiglu_limit
+        (src/MaxText/layers/moe.py:52-65): None list / out-of-range idx / 0 → None
+        (disabled). Returned value is the clamp threshold to apply on both gate
+        (single-sided max) and up (double-sided [-v, v]) before they are multiplied.
+        """
+        if limit_list is None or layer_idx is None:
+            return None
+        if layer_idx < 0 or layer_idx >= len(limit_list):
+            return None
+        val = limit_list[layer_idx]
+        if not val:
+            return None
+        return val
+
+    def expert_swiglu_limit(self, layer_idx: int):
+        return self._swiglu_limit(self.expert_swiglu_limit_list, layer_idx)
+
+    def shared_expert_swiglu_limit(self, layer_idx: int):
+        return self._swiglu_limit(self.share_expert_swiglu_limit_list, layer_idx)
