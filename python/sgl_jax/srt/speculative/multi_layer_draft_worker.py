@@ -108,6 +108,19 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         for i, w in enumerate(self._workers):
             w.model_runner.initialize_jit()
 
+        # Share target's SWA index mapping with draft workers. The scheduler
+        # allocates KV pages via the target's SWATokenToKVPoolAllocator which
+        # maintains full_to_swa_index_mapping. Draft workers have independent
+        # allocators whose mappings stay at zero. Without this, draft SWA
+        # attention remaps all page indices to 0 → reads wrong KV data.
+        target_allocator = target_worker.model_runner.token_to_kv_pool_allocator
+        target_swa_mapping = getattr(target_allocator, "full_to_swa_index_mapping", None)
+        if target_swa_mapping is not None:
+            for w in self._workers:
+                object.__setattr__(
+                    w.model_runner.attn_backend, "swa_index_mapping", target_swa_mapping
+                )
+
         (
             self.precompile_token_paddings,
             self.precompile_bs_paddings,
