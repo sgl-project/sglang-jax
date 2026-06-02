@@ -6,6 +6,18 @@ title: "GKE Indexed Job"
 
 Generic GKE template for launching a multi-host TPU slice serving SGL-JAX. This page is the **single source of truth** for the Indexed Job + headless Service pattern — recipes reference it instead of pasting a full manifest, and fill in only their model-specific fields (`<JOB>`, `<ACCELERATOR>`, `<TOPOLOGY>`, `<LAUNCH_FLAGS>`).
 
+## When to use Indexed Job vs Deployment / StatefulSet
+
+Kubernetes ships three workload controllers that come up in serving discussions. They're **not** interchangeable for JAX multi-host TPU workloads:
+
+| Controller | Use for SGL-JAX multi-host? | Why |
+|---|---|---|
+| **Indexed Job** (this page) | ✅ Yes — cookbook default for both one-off benchmarks and long-running serving | Each pod gets a deterministic `${JOB_COMPLETION_INDEX}` — JAX requires this to derive a stable rank-0 / rank-N assignment via `--dist-init-addr` + `--node-rank`. Headless Service turns `<job>-<index>.<svc>` into stable DNS. With `backoffLimit: 16` and `restartPolicy: Never`, transient GKE blips don't lose the rank mapping (replacement pods keep the same index). |
+| **Deployment** | ❌ No (for JAX multi-host) | Deployment treats pods as interchangeable replicas — there's no built-in ordinal that JAX can read to assign rank-0. You'd have to invent your own rank-discovery scheme (init container that races on a configmap, leader-election sidecar, etc.) which defeats the simplicity of `JOB_COMPLETION_INDEX`. Deployment is the right choice for stateless single-host serving where every replica is equivalent — **not** for multi-host JAX. |
+| **StatefulSet** | ⚠️ Alternative for long-running serving — not shipped in this cookbook | Provides stable per-pod hostnames (`<sts>-0`, `<sts>-1`, …) and survives pod restarts without changing identities — closer to the "long-running service" mental model. To use it for JAX multi-host, derive `--node-rank` from `${HOSTNAME##*-}` (the trailing ordinal) instead of `${JOB_COMPLETION_INDEX}`. Same headless-Service / `TPU_PROCESS_ADDRESSES` plumbing applies. Will land as a separate template if there's demand; until then, Indexed Job + `backoffLimit: 16` covers both benchmark and steady-state serving cases. |
+
+The TL;DR: **Indexed Job is the cookbook default because JAX multi-host requires deterministic per-pod ordinals, and `backoffLimit: 16` plus a persistent JIT cache make it robust enough for long-running serving as well as one-off runs.**
+
 ## Why Indexed Job + headless Service
 
 Multi-host JAX needs:
