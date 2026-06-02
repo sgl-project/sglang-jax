@@ -84,8 +84,10 @@ class MiniMaxM2Attention(nnx.Module):
         # FP8 static checkpoint: from_linear derives the QuantizedLinear
         # placeholder shapes from LinearBase.output_size *before* load-time
         # kv_head_padding, so size k/v_proj for the padded head count up front.
+        # Replica count must match model_config.get_num_kv_head_replicas.
         tp = mesh.shape.get("tensor", 1)
-        self.kv_head_num = max(num_kv_heads, tp) if tp > num_kv_heads else num_kv_heads
+        replicas = (tp + num_kv_heads - 1) // num_kv_heads if tp > num_kv_heads else 1
+        self.kv_head_num = num_kv_heads * replicas
         self.q_head_num = num_heads
         self.scaling = self.head_dim**-0.5
 
