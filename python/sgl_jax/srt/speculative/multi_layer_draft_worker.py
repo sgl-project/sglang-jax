@@ -155,6 +155,11 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         topk_p = model_worker_batch.spec_info_padded.topk_p
         topk_index = model_worker_batch.spec_info_padded.topk_index
         hidden_states = model_worker_batch.spec_info_padded.hidden_states
+        if self.topk == 1:
+            if isinstance(topk_index, np.ndarray):
+                return None, np.asarray(topk_index[:, :, 0], dtype=np.int32), None
+            return None, topk_index[:, :, 0].astype(jnp.int32), None
+
         bs = model_worker_batch.seq_lens.shape[0]
         step_min_1 = self.speculative_num_steps - 1
         score_list = jnp.zeros((bs, 1 + step_min_1 * self.topk, self.topk))

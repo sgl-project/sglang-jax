@@ -195,6 +195,70 @@ def test_multi_layer_draft_worker_routes_fixed_greedy_path(monkeypatch):
     assert calls == ["step3"]
 
 
+def test_multi_layer_draft_forward_topk1_uses_linear_token_list_for_host_inputs(monkeypatch):
+    from sgl_jax.srt.speculative import multi_layer_draft_worker
+    from sgl_jax.srt.speculative.multi_layer_draft_worker import MultiLayerDraftWorker
+
+    def fail_select_top_k_tokens(*args, **kwargs):
+        raise AssertionError("topk=1 should bypass generic tree-list construction")
+
+    monkeypatch.setattr(multi_layer_draft_worker, "select_top_k_tokens", fail_select_top_k_tokens)
+
+    worker = object.__new__(MultiLayerDraftWorker)
+    worker.topk = 1
+    worker.speculative_num_steps = 3
+    batch = SimpleNamespace(
+        seq_lens=np.array([5, 7], dtype=np.int32),
+        spec_info_padded=SimpleNamespace(
+            topk_p=np.ones((2, 3, 1), dtype=np.float32),
+            topk_index=np.array([[[11], [12], [13]], [[21], [22], [23]]], dtype=np.int32),
+            hidden_states=np.ones((2, 4), dtype=np.float32),
+        ),
+    )
+
+    score_list, token_list, parents_list = worker.draft_forward(batch)
+
+    assert score_list is None
+    assert parents_list is None
+    assert isinstance(token_list, np.ndarray)
+    np.testing.assert_array_equal(
+        token_list,
+        np.array([[11, 12, 13], [21, 22, 23]], dtype=np.int32),
+    )
+
+
+def test_multi_layer_draft_forward_topk1_preserves_device_inputs(monkeypatch):
+    from sgl_jax.srt.speculative import multi_layer_draft_worker
+    from sgl_jax.srt.speculative.multi_layer_draft_worker import MultiLayerDraftWorker
+
+    def fail_select_top_k_tokens(*args, **kwargs):
+        raise AssertionError("topk=1 should bypass generic tree-list construction")
+
+    monkeypatch.setattr(multi_layer_draft_worker, "select_top_k_tokens", fail_select_top_k_tokens)
+
+    worker = object.__new__(MultiLayerDraftWorker)
+    worker.topk = 1
+    worker.speculative_num_steps = 3
+    batch = SimpleNamespace(
+        seq_lens=jnp.array([5, 7], dtype=jnp.int32),
+        spec_info_padded=SimpleNamespace(
+            topk_p=jnp.ones((2, 3, 1), dtype=jnp.float32),
+            topk_index=jnp.array([[[11], [12], [13]], [[21], [22], [23]]], dtype=jnp.int32),
+            hidden_states=jnp.ones((2, 4), dtype=jnp.float32),
+        ),
+    )
+
+    score_list, token_list, parents_list = worker.draft_forward(batch)
+
+    assert score_list is None
+    assert parents_list is None
+    assert isinstance(token_list, jax.Array)
+    np.testing.assert_array_equal(
+        np.asarray(token_list),
+        np.array([[11, 12, 13], [21, 22, 23]], dtype=np.int32),
+    )
+
+
 def test_step3_entrypoint_does_not_split_postprocess_before_fused_extend(monkeypatch):
     from sgl_jax.srt.speculative import draft_extend_fused
 
